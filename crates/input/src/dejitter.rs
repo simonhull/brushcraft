@@ -15,14 +15,28 @@
 //! slope between the least-delayed samples of the first and last quarter of the stroke (up to
 //! [`WINDOW`] samples). Only a fit spanning at least [`SEED_SPAN`] slots seeds later strokes, and
 //! it replaces the seed within a stroke only once it spans more slots than the seed's fit did:
-//! the slope's error falls with the square of the span. A first stroke with no seed passes
-//! receipt times through until [`MIN_FIT`] samples are in, then uses the fit of what it has so
-//! far, refined with every sample; those early fits are rough. A seed far from the stroke's mean
-//! interval (a harmonic, or a different device) is dropped for the stroke.
+//! the slope's error falls with the square of the span. A session of only short strokes (under
+//! [`SEED_SPAN`] slots) therefore stays unseeded; fits are not pooled across strokes. A first
+//! stroke with no seed passes receipt times through until [`MIN_FIT`] samples are in, then uses
+//! the fit of what it has so far, refined with every sample. Such a *young* fit is rough, so its
+//! envelope looks back over only half the samples (halving the lever of its period error), and
+//! it is not rise-limited.
+//!
+//! **Checking the seed.** Every stroke checks its seed: at [`SEED_CHECK`] samples against the
+//! mean interval (which rules out harmonics), and at 16, 32, 64 and every 64 samples after
+//! against its own fit, within the worst case of that fit's error. A seed that fails gives way to
+//! the stroke's own fit.
 //!
 //! **When the envelope moves.** When the least-delayed sample leaves the window, the envelope
 //! rises, but the output may rise by at most [`RISE`] of a period per sample beyond its usual
-//! step, so a sudden shift of the envelope is spread out rather than shown as a jump.
+//! step, so a small shift of the envelope is spread out rather than shown as a jump.
+//!
+//! **Losing the clock.** The rise limit must not hide a wrong period: with too short a period
+//! the line falls behind the truth by the error every sample. So the clock counts as *lost*, and
+//! the segment restarts from the sample without a seed, when the envelope sits more than the
+//! spread plus [`LOST`] of a period above the limited line, or when a seeded stroke gets
+//! [`ADRIFT`] samples in a row later behind the line than the seed's spread allows. This also
+//! covers a sustained change of rate mid-stroke.
 //!
 //! **Dropped samples.** Slots are sequential unless a drop is unambiguous. The *delay spread* is
 //! the largest residual above the line in the envelope window, and while a seed is in use at
@@ -36,6 +50,10 @@
 //! until the samples before it leave the envelope window, after which the output catches up at
 //! [`RISE`] of a period per sample. Measured Wayland pen data had a delay spread close to a full
 //! period and no drops at all.
+//!
+//! **How close to ideal.** With a seed, simulated strokes of up to 150 samples match an oracle
+//! that knows the exact period, to within 0.05 ms at the 99th percentile; longer strokes are held
+//! back by the short envelope window (p99 about 0.1–0.2 ms against the oracle's 0.03).
 //!
 //! A gap of more than [`MAX_GAP_PERIODS`] periods (or [`MAX_GAP_UNKNOWN`] with no period yet) is a
 //! stall: the fit restarts from the next sample. A receipt at or before the previous one says
@@ -60,17 +78,38 @@ const SEED_SPAN: f64 = 128.0;
 const MIN_FIT: usize = 4;
 /// More periods than this between two samples is a stall: the fit restarts.
 const MAX_GAP_PERIODS: f64 = 8.0;
-/// With no period yet, a gap longer than this (8 × the slowest plausible period) is a stall.
-const MAX_GAP_UNKNOWN: f64 = 0.4;
 /// Plausible pen sample periods: 2 kHz down to 20 Hz.
 const PERIODS: RangeInclusive<f64> = 0.0005..=0.05;
+/// With no period yet, a gap longer than [`MAX_GAP_PERIODS`] of the slowest plausible period is a
+/// stall.
+const MAX_GAP_UNKNOWN: f64 = MAX_GAP_PERIODS * *PERIODS.end();
 /// Samples after which a seeded stroke checks the seed against its own mean interval.
 const SEED_CHECK: usize = 8;
-/// The ratio of mean interval to seed within which the seed is kept. A delay spread of up to a
-/// period moves the mean of [`SEED_CHECK`] samples by at most a seventh; a harmonic doubles it.
+/// The ratio of mean interval to seed within which the seed is kept at [`SEED_CHECK`] samples.
+///
+/// A delay spread of up to a period moves the mean of [`SEED_CHECK`] samples by at most a seventh,
+/// but one long delay on the last sample moves it further, so this only rules out gross
+/// mismatches such as a harmonic (a ratio of 2 or ½). Finer ones are caught by the checks against
+/// the stroke's own fit and, when the period is too short, by [`LOST`].
 const SEED_AGREEMENT: RangeInclusive<f64> = 0.75..=1.33;
+/// Relative slack, on top of the spread's worst case, when the seed is checked against the
+/// stroke's own fit.
+const SEED_SLACK: f64 = 0.002;
 /// How far, as a fraction of the period, the output may rise above its usual step per sample.
+///
+/// Small: with the right period the envelope only rises when its least-delayed sample leaves the
+/// window, by about the spread over [`ENVELOPE`], and rising slowly keeps that from showing as a
+/// jump followed by a forced fall. It still outruns any plausible error in a learned period
+/// (well under a thousandth) by a wide margin.
 const RISE: f64 = 1.0 / 512.0;
+/// How far, as a fraction of the period, the envelope may sit above the rise-limited line.
+///
+/// Beyond this it is not a small shift to smooth but a clock the model has lost (a wrong period,
+/// or the rate changed), and the segment restarts without a seed.
+const LOST: f64 = 0.5;
+/// Samples in a row that land more than [`LOST`] of a period beyond the spread carried with the
+/// seed before a seeded line counts as lost. A real delay that long would have widened the spread.
+const ADRIFT: usize = 4;
 /// Suspect samples in a row that confirm a drop.
 const DROP_CONFIRM: usize = 8;
 /// Without a spread carried over from earlier strokes, residuals needed before the delay spread
@@ -125,7 +164,9 @@ struct Seed {
     period: f64,
     /// Slots the fit spanned: a later fit replaces the seed only when it spans more.
     span: f64,
-    /// The delay spread seen over the fit, in seconds.
+    /// The largest delay spread (residual above the line in the envelope window) seen over the
+    /// fit once it had settled, in seconds. Lets the next stroke infer drops before it has its
+    /// own spread, and bounds how late its samples can plausibly be.
     spread: f64,
 }
 
@@ -156,9 +197,13 @@ struct Segment {
     next_slot: f64,
     /// Suspect samples in a row at the end of `points`.
     suspects: usize,
+    /// Samples in a row received more than [`LOST`] of a period beyond the carried spread.
+    adrift: usize,
     /// The largest residual above the line in the envelope window, as of the last sample: the
     /// delay spread.
     spread: f64,
+    /// The largest spread seen once the fit was no longer young: what a seed learned here carries.
+    peak_spread: f64,
     /// The spread carried over with the seed, while the seed is in use.
     prior_spread: Option<f64>,
 }
@@ -172,6 +217,8 @@ enum Step {
     Raw,
     /// The sample's time on the recovered clock, seconds since the origin.
     Steady(f64),
+    /// The line no longer fits the samples: restart from this one, without the seed.
+    Lost,
 }
 
 impl Dejitter {
@@ -214,7 +261,7 @@ impl Dejitter {
 
     fn estimate(&mut self, received: Instant) -> Instant {
         let Some(segment) = self.segment.as_mut() else {
-            return self.restart(received);
+            return self.restart(received, self.seed);
         };
         // Before the origin: receipts went backwards, so the sample is not fed to the fit.
         let Some(at) = received
@@ -228,7 +275,8 @@ impl Dejitter {
             self.seed = Some(learned);
         }
         match step {
-            Step::Restart => self.restart(received),
+            Step::Restart => self.restart(received, self.seed),
+            Step::Lost => self.restart(received, None),
             Step::Raw => received,
             Step::Steady(t) => {
                 Duration::try_from_secs_f64(t.max(0.0)).map_or(received, |d| segment.origin + d)
@@ -236,16 +284,18 @@ impl Dejitter {
         }
     }
 
-    fn restart(&mut self, received: Instant) -> Instant {
+    fn restart(&mut self, received: Instant, seed: Option<Seed>) -> Instant {
         self.segment = Some(Segment {
             origin: received,
             points: VecDeque::from([Point { slot: 0.0, at: 0.0 }]),
-            period: self.seed.map_or(Period::Unknown, Period::Seeded),
+            period: seed.map_or(Period::Unknown, Period::Seeded),
             last_line: None,
             next_slot: 1.0,
             suspects: 0,
+            adrift: 0,
             spread: 0.0,
-            prior_spread: self.seed.map(|seed| seed.spread),
+            peak_spread: 0.0,
+            prior_spread: seed.map(|seed| seed.spread),
         });
         received
     }
@@ -262,11 +312,7 @@ impl Segment {
         if at <= last.at {
             let slot = self.next_slot;
             self.next_slot += 1.0;
-            return self
-                .period
-                .secs()
-                .and_then(|p| self.line(p, slot))
-                .map_or(Step::Raw, Step::Steady);
+            return self.period.secs().map_or(Step::Raw, |p| self.line(p, slot));
         }
         let max_gap = self
             .period
@@ -303,7 +349,20 @@ impl Segment {
         let Some(p) = self.period.secs() else {
             return Step::Raw;
         };
-        self.line(p, slot).map_or(Step::Raw, Step::Steady)
+        let step = self.line(p, slot);
+        // With a seed, the carried spread bounds how late a sample can be. Samples persistently
+        // later than that behind the line mean the line is falling behind: a wrong seed.
+        if let (Step::Steady(line), Some(spread)) = (step, self.prior_spread) {
+            self.adrift = if at - line > spread + LOST * p {
+                self.adrift + 1
+            } else {
+                0
+            };
+            if self.adrift >= ADRIFT {
+                return Step::Lost;
+            }
+        }
+        step
     }
 
     /// The line, as `(period, offset)`, and the delay spread, when the spread is known and
@@ -317,11 +376,14 @@ impl Segment {
             .iter()
             .rev()
             .skip(skip)
-            .take(ENVELOPE)
+            .take(self.envelope())
             .fold((0_usize, 0.0_f64), |(count, spread), p| {
                 (count + 1, spread.max(p.at - p.slot * period - offset))
             });
         self.spread = window;
+        if !self.young() {
+            self.peak_spread = self.peak_spread.max(window);
+        }
         let spread = match self.prior_spread {
             Some(prior) => prior.max(self.spread),
             None if count >= SPREAD_SAMPLES => self.spread,
@@ -374,20 +436,42 @@ impl Segment {
 
     /// Drops a seed that disagrees with the stroke's own mean interval: a harmonic, or another
     /// device.
+    ///
+    /// At [`SEED_CHECK`] samples by the mean interval; at 16, 32 and 64 samples and every 64
+    /// after by the stroke's own quarter slope, which can be off by at most twice the spread over
+    /// half the samples. A rejected seed gives way to the stroke's own fit.
     fn check_seed(&mut self) {
         let Period::Seeded(Seed { period: seed, .. }) = self.period else {
             return;
         };
-        if self.points.len() != SEED_CHECK {
-            return;
-        }
-        let (Some(first), Some(last)) = (self.points.front(), self.points.back()) else {
+        let count = self.points.len();
+        let agrees = if count == SEED_CHECK {
+            let (Some(first), Some(last)) = (self.points.front(), self.points.back()) else {
+                return;
+            };
+            let mean = (last.at - first.at) / (last.slot - first.slot);
+            SEED_AGREEMENT.contains(&(mean / seed))
+        } else if matches!(count, 16 | 32) || (count >= 64 && count.is_multiple_of(64)) {
+            let Some(fit) = quarter_slope(&self.points, seed) else {
+                return;
+            };
+            let spread = self
+                .prior_spread
+                .map_or(self.spread, |p| p.max(self.spread));
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a sample count of at most WINDOW"
+            )]
+            let tolerance = 4.0 * spread / count as f64 + SEED_SLACK * seed;
+            (fit - seed).abs() <= tolerance
+        } else {
             return;
         };
-        let mean = (last.at - first.at) / (last.slot - first.slot);
-        if !SEED_AGREEMENT.contains(&(mean / seed)) {
-            self.period = Period::Unknown;
+        if !agrees {
             self.prior_spread = None;
+            self.last_line = None;
+            self.period = Period::Unknown;
+            self.refit();
         }
     }
 
@@ -395,7 +479,7 @@ impl Segment {
     fn refit(&mut self) {
         let span = self.span();
         let guess = match self.period {
-            Period::Seeded(seed) if span >= SEED_SPAN && span > seed.span => seed.period,
+            Period::Seeded(seed) if span >= SEED_SPAN && span >= seed.span => seed.period,
             Period::Unknown if self.points.len() >= MIN_FIT => {
                 match (self.points.front(), self.points.back()) {
                     (Some(first), Some(last)) => (last.at - first.at) / (last.slot - first.slot),
@@ -417,7 +501,7 @@ impl Segment {
             Period::Fitted(period) if span >= SEED_SPAN => Some(Seed {
                 period,
                 span,
-                spread: self.spread,
+                spread: self.peak_spread.max(self.spread),
             }),
             Period::Fitted(_) | Period::Seeded(_) | Period::Unknown => None,
         }
@@ -437,20 +521,50 @@ impl Segment {
             .iter()
             .rev()
             .skip(skip)
-            .take(ENVELOPE)
+            .take(self.envelope())
             .map(|p| p.at - p.slot * period)
             .reduce(f64::min)
     }
 
     /// The time of `slot` on the line, rising at most [`RISE`] of a period faster than the clock
     /// since the last output.
-    fn line(&mut self, period: f64, slot: f64) -> Option<f64> {
-        let mut at = self.offset(period, 0)? + slot * period;
-        if let Some(last) = self.last_line {
-            at = at.min(last.at + (slot - last.slot) * period * (1.0 + RISE));
+    ///
+    /// A young fit (fitted here, over fewer than [`SEED_SPAN`] slots) is still converging and is
+    /// not limited. An envelope more than the spread plus [`LOST`] of a period above the limited
+    /// line means the model has lost the clock.
+    fn line(&mut self, period: f64, slot: f64) -> Step {
+        let Some(offset) = self.offset(period, 0) else {
+            return Step::Raw;
+        };
+        let mut at = offset + slot * period;
+        if let Some(last) = self.last_line.filter(|_| !self.young()) {
+            let limited = last.at + (slot - last.slot) * period * (1.0 + RISE);
+            // The envelope can rise by up to the spread when its least-delayed sample leaves.
+            let spread = self
+                .prior_spread
+                .map_or(self.spread, |prior| prior.max(self.spread));
+            if at - limited > spread + LOST * period {
+                return Step::Lost;
+            }
+            at = at.min(limited);
         }
         self.last_line = Some(Point { slot, at });
-        Some(at)
+        Step::Steady(at)
+    }
+
+    /// Whether the period was fitted here over fewer than [`SEED_SPAN`] slots.
+    fn young(&self) -> bool {
+        matches!(self.period, Period::Fitted(_)) && self.span() < SEED_SPAN
+    }
+
+    /// Samples the envelope looks back over: [`ENVELOPE`], or half the samples while the fit is
+    /// young, so that an early period error has half the lever.
+    fn envelope(&self) -> usize {
+        if self.young() {
+            (self.points.len() / 2).clamp(1, ENVELOPE)
+        } else {
+            ENVELOPE
+        }
     }
 }
 
@@ -458,18 +572,19 @@ impl Segment {
 /// picked as the lowest against a line of slope `guess`, refined once. `None` with fewer than four
 /// points.
 fn quarter_slope(points: &VecDeque<Point>, guess: f64) -> Option<f64> {
+    fn lowest<'a>(period: f64, part: impl Iterator<Item = &'a Point>) -> Option<Point> {
+        part.copied()
+            .min_by(|a, b| (a.at - a.slot * period).total_cmp(&(b.at - b.slot * period)))
+    }
+
     let quarter = points.len() / 4;
     if quarter == 0 {
         return None;
     }
-    let lowest = |period: f64, part: &mut dyn Iterator<Item = &Point>| {
-        part.copied()
-            .min_by(|a, b| (a.at - a.slot * period).total_cmp(&(b.at - b.slot * period)))
-    };
     let mut period = guess;
     for _ in 0..2 {
-        let first = lowest(period, &mut points.iter().take(quarter))?;
-        let last = lowest(period, &mut points.iter().rev().take(quarter))?;
+        let first = lowest(period, points.iter().take(quarter))?;
+        let last = lowest(period, points.iter().rev().take(quarter))?;
         if last.slot <= first.slot {
             return None;
         }
@@ -572,6 +687,24 @@ mod tests {
             Self { start, samples }
         }
 
+        /// Delivered in frames: each sample arrives at the first frame boundary after its time
+        /// plus a delay of up to 2 ms. The frames' phase is random.
+        fn batched(start: Instant, count: usize, frame: f64, rng: &mut Rng) -> Self {
+            let phase = rng.unit() * frame;
+            let samples = (0..count)
+                .scan(0.0, |truth: &mut f64, _| {
+                    let t = *truth;
+                    *truth += PERIOD;
+                    Some(t)
+                })
+                .map(|truth| {
+                    let ready = truth + phase + rng.unit() * 2.0 * MS;
+                    (truth, (ready / frame).ceil() * frame - phase)
+                })
+                .collect();
+            Self { start, samples }
+        }
+
         fn jittered(start: Instant, count: usize, delay: Delay, rng: &mut Rng) -> Self {
             Self::new(start, PERIOD, count, || delay.draw(rng), |_| false)
         }
@@ -663,8 +796,12 @@ mod tests {
         strokes: usize,
         /// Strokes whose RMS interval error beats the raw receipts' (or ties).
         no_worse: usize,
-        /// Strokes with an interval error over half a period: a sample in the wrong slot.
+        /// Strokes with an interval error over half a period where the oracle's step is not: a
+        /// sample in the wrong slot, not a forced step.
         slipped: usize,
+        /// Samples, and those more than a millisecond earlier than the truth.
+        samples: usize,
+        early: usize,
         /// Least lag over all samples, and greatest lag after the first sample.
         lag: (f64, f64),
         /// How far the lag after the first sample went beyond a period plus a millisecond, or the
@@ -687,7 +824,12 @@ mod tests {
             if rms(&filter) <= rms(&raw) + 1e-12 {
                 self.no_worse += 1;
             }
-            if filter.iter().any(|e| e.abs() > PERIOD / 2.0) {
+            let oracle = oracle_errors(run);
+            if filter
+                .iter()
+                .zip(&oracle)
+                .any(|(e, o)| e.abs() > PERIOD / 2.0 && o.abs() <= PERIOD / 2.0)
+            {
                 self.slipped += 1;
             }
             // The least delay of the samples so far whose receipt moved forward: a repeated
@@ -698,6 +840,10 @@ mod tests {
                     least_delay = least_delay.min(receipt - truth);
                 }
                 previous = receipt;
+                self.samples += 1;
+                if out - truth < -MS {
+                    self.early += 1;
+                }
                 self.lag.0 = self.lag.0.min(out - truth);
                 if i > 0 {
                     self.lag.1 = self.lag.1.max(out - truth);
@@ -718,7 +864,7 @@ mod tests {
         fn summary(&self) -> String {
             format!(
                 "filter med {:.3} p99 {:.3} ms | raw med {:.3} p99 {:.3} | oracle p99 {:.3} | \
-                 no worse {:.1}% | slipped {} | lag {:.3}..{:.3} ms",
+                 no worse {:.1}% | slipped {} | lag {:.3}..{:.3} ms | >1 ms early {:.2}%",
                 quantile_abs(&self.filter, 0.5) / MS,
                 quantile_abs(&self.filter, 0.99) / MS,
                 quantile_abs(&self.raw, 0.5) / MS,
@@ -728,7 +874,16 @@ mod tests {
                 self.slipped,
                 self.lag.0 / MS,
                 self.lag.1 / MS,
+                self.early_share() * 100.0,
             )
+        }
+
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "counts of a few hundred thousand"
+        )]
+        fn early_share(&self) -> f64 {
+            self.early as f64 / self.samples.max(1) as f64
         }
     }
 
@@ -817,6 +972,14 @@ mod tests {
                 if length >= 50 {
                     assert!(case.no_worse_share() >= 0.95, "worse than raw: {what}");
                 }
+                // The first fits are rough: a few early samples may run ahead of the truth.
+                assert!(case.lag.0 >= -4.0 * MS, "earlier than truth: {what}");
+                assert!(case.early_share() <= 0.02, "often early: {what}");
+                let (p99, raw) = (
+                    quantile_abs(&case.filter, 0.99),
+                    quantile_abs(&case.raw, 0.99),
+                );
+                assert!(p99 <= raw, "p99 worse than raw: {what}");
             }
         }
     }
@@ -1056,6 +1219,250 @@ mod tests {
         assert!((period - PERIOD).abs() < 0.01 * MS, "learned {period}");
     }
 
+    /// Runs `(true time, receipt)` pairs through `filter` as one stroke: the worst lag from
+    /// sample `from` on, and whether every output stayed at or before its receipt.
+    fn worst_lag(
+        filter: &mut Dejitter,
+        start: Instant,
+        samples: &[(f64, f64)],
+        from: usize,
+    ) -> (f64, bool) {
+        let mut worst = f64::INFINITY;
+        let mut honest = true;
+        for (i, &(truth, receipt)) in samples.iter().enumerate() {
+            let received = start + Duration::from_secs_f64(receipt);
+            let out = filter.push(received);
+            honest &= out <= received;
+            let lag = out.duration_since(start).as_secs_f64() - truth;
+            if i >= from {
+                worst = worst.min(lag);
+            }
+        }
+        filter.end_stroke();
+        (worst, honest)
+    }
+
+    /// Samples allowed for a lost clock to be noticed and the fit to restart and settle.
+    ///
+    /// Noticing takes up to [`ADRIFT`] samples after the line has fallen [`LOST`] of a period
+    /// plus the spread behind (about a dozen samples for a 1 ms period error); then a young fit
+    /// needs about 20 samples to settle to within a millisecond. Measured worst lag after it:
+    /// −0.6 ms.
+    const RELOCK: usize = 48;
+
+    #[test]
+    fn a_wrong_seed_does_not_drift() {
+        let base = Instant::now();
+        for device in [0.0048, 0.0068] {
+            for seed in 1..=50 {
+                let mut rng = Rng::new(seed);
+                let mut filter = Dejitter::new();
+                let warm = Stroke::new(base, device, 400, || rng.unit() * MS, |_| false);
+                drop(warm.run(&mut filter));
+                let start = base + Duration::from_secs(10);
+                let stroke = Stroke::jittered(start, 200, Delay::Uniform(PERIOD), &mut rng);
+                let (worst, honest) = worst_lag(&mut filter, start, &stroke.samples, RELOCK);
+                assert!(honest, "device {device}, seed {seed}: output after receipt");
+                assert!(worst >= -MS, "device {device}, seed {seed}: lag {worst}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rate_change_restarts_the_fit() {
+        let base = Instant::now();
+        for (before, after) in [(PERIOD, 0.008), (0.008, PERIOD)] {
+            for seed in 1..=50 {
+                let mut rng = Rng::new(seed);
+                let mut filter = Dejitter::new();
+                let warm = Stroke::new(base, before, 400, || rng.unit() * MS, |_| false);
+                drop(warm.run(&mut filter));
+                let mut previous = f64::NEG_INFINITY;
+                let samples: Vec<(f64, f64)> = (0..300_u32)
+                    .map(|i| {
+                        let truth = if i < 100 {
+                            f64::from(i) * before
+                        } else {
+                            100.0 * before + f64::from(i - 100) * after
+                        };
+                        previous = previous.max(truth + rng.unit() * MS);
+                        (truth, previous)
+                    })
+                    .collect();
+                let start = base + Duration::from_secs(10);
+                let (early, honest) = worst_lag(&mut filter, start, &samples[..100], 0);
+                assert!(honest, "seed {seed}: output after receipt");
+                assert!(
+                    early >= -0.05 * MS,
+                    "seed {seed}: lag {early} before the change"
+                );
+                let mut again = Dejitter::new();
+                drop(Stroke::new(base, before, 400, || rng.unit() * MS, |_| false).run(&mut again));
+                let (worst, still_honest) = worst_lag(&mut again, start, &samples, 100 + RELOCK);
+                assert!(still_honest, "seed {seed}: output after receipt");
+                assert!(
+                    worst >= -MS,
+                    "{before} to {after}, seed {seed}: lag {worst} after the change"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "prints adversarial results"]
+    fn adversarial_report() {
+        let base = Instant::now();
+        for device in [0.0048, 0.0068] {
+            let (mut all, mut settled) = (f64::INFINITY, f64::INFINITY);
+            for seed in 1..=50 {
+                let mut rng = Rng::new(seed);
+                let mut filter = Dejitter::new();
+                drop(
+                    Stroke::new(base, device, 400, || rng.unit() * MS, |_| false).run(&mut filter),
+                );
+                let start = base + Duration::from_secs(10);
+                let stroke = Stroke::jittered(start, 200, Delay::Uniform(PERIOD), &mut rng);
+                let mut copy = Dejitter::new();
+                drop(Stroke::new(base, device, 400, || 0.0, |_| false).run(&mut copy));
+                all = all.min(worst_lag(&mut filter, start, &stroke.samples, 0).0);
+                settled = settled.min(worst_lag(&mut copy, start, &stroke.samples, RELOCK).0);
+            }
+            println!(
+                "seed from {device} s, 5.8 ms stroke: worst lag {:.2} ms, after {RELOCK}: {:.2} ms",
+                all / MS,
+                settled / MS
+            );
+        }
+        for (before, after) in [(PERIOD, 0.008), (0.008, PERIOD)] {
+            let (mut all, mut settled) = (f64::INFINITY, f64::INFINITY);
+            for seed in 1..=50 {
+                let mut rng = Rng::new(seed);
+                let mut previous = f64::NEG_INFINITY;
+                let samples: Vec<(f64, f64)> = (0..300_u32)
+                    .map(|i| {
+                        let truth = if i < 100 {
+                            f64::from(i) * before
+                        } else {
+                            100.0 * before + f64::from(i - 100) * after
+                        };
+                        previous = previous.max(truth + rng.unit() * MS);
+                        (truth, previous)
+                    })
+                    .collect();
+                let start = base + Duration::from_secs(10);
+                for (from, worst) in [(0, &mut all), (100 + RELOCK, &mut settled)] {
+                    let mut filter = Dejitter::new();
+                    drop(Stroke::new(base, before, 400, || 0.0, |_| false).run(&mut filter));
+                    *worst = worst.min(worst_lag(&mut filter, start, &samples, from).0);
+                }
+            }
+            println!(
+                "rate {before} to {after} s at sample 100: worst lag {:.2} ms, after {RELOCK} more: {:.2} ms",
+                all / MS,
+                settled / MS
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "prints adversarial results"]
+    fn adversarial_report_receipts() {
+        let base = Instant::now();
+        // One spurious duplicate receipt at sample 50 with spread about a period.
+        let (mut worst, mut early, mut total) = (f64::INFINITY, 0_u32, 0_u32);
+        for seed in 1..=50 {
+            let mut rng = Rng::new(seed);
+            let delay = Delay::Uniform(PERIOD);
+            let mut filter = seeded(base, delay, &mut rng);
+            let start = base + Duration::from_secs(10);
+            let stroke = Stroke::jittered(start, 400, delay, &mut rng);
+            for (i, &(truth, receipt)) in stroke.samples.iter().enumerate() {
+                let out = filter.push(stroke.at(receipt));
+                if i == 50 {
+                    filter.push(stroke.at(receipt));
+                }
+                if i > 50 {
+                    let lag = out.duration_since(start).as_secs_f64() - truth;
+                    worst = worst.min(lag);
+                    total += 1;
+                    if lag < -PERIOD / 2.0 {
+                        early += 1;
+                    }
+                }
+            }
+            filter.end_stroke();
+        }
+        println!(
+            "spurious duplicate, spread ~P: worst lag {:.2} ms, {:.1}% of later samples > P/2 early",
+            worst / MS,
+            f64::from(early) * 100.0 / f64::from(total)
+        );
+        // Latency step: delay 0-1 ms, then 4-5 ms from sample 100.
+        let (mut worst_error, mut worst_lag_seen) = (0.0_f64, f64::INFINITY);
+        for seed in 1..=50 {
+            let mut rng = Rng::new(seed);
+            let mut filter = seeded(base, Delay::Uniform(MS), &mut rng);
+            let mut k = 0;
+            let start = base + Duration::from_secs(10);
+            let stroke = Stroke::new(
+                start,
+                PERIOD,
+                300,
+                || {
+                    k += 1;
+                    rng.unit() * MS + if k > 100 { 4.0 * MS } else { 0.0 }
+                },
+                |_| false,
+            );
+            let run = stroke.run(&mut filter);
+            worst_error = interval_errors(&run)
+                .iter()
+                .fold(worst_error, |a, e| a.max(e.abs()));
+            worst_lag_seen = run
+                .iter()
+                .fold(worst_lag_seen, |a, &(t, _, o)| a.min(o - t));
+        }
+        println!(
+            "latency step +4 ms: worst interval error {:.2} ms, worst lag {:.2} ms",
+            worst_error / MS,
+            worst_lag_seen / MS
+        );
+    }
+
+    /// Frame rates for the batched delivery model.
+    const FRAMES: [f64; 2] = [1.0 / 60.0, 1.0 / 144.0];
+
+    /// Seeded strokes of every length delivered in frames of `frame` seconds.
+    fn batched_cases(frame: f64) -> Vec<Pooled> {
+        let base = Instant::now();
+        let mut pooled: Vec<Pooled> = LENGTHS.iter().map(|_| Pooled::new()).collect();
+        for seed in 1..=SEEDS {
+            let mut rng = Rng::new(seed);
+            let mut filter = Dejitter::new();
+            drop(Stroke::batched(base, 400, frame, &mut rng).run(&mut filter));
+            for (n, (case, &length)) in (1..).zip(pooled.iter_mut().zip(&LENGTHS)) {
+                let start = base + Duration::from_secs(10 * n);
+                case.add(&Stroke::batched(start, length, frame, &mut rng).run(&mut filter));
+            }
+        }
+        pooled
+    }
+
+    #[test]
+    fn frame_batched_delivery() {
+        for frame in FRAMES {
+            for (case, length) in batched_cases(frame).iter().zip(LENGTHS) {
+                let what = format!("{frame} s frames, {length} samples: {}", case.summary());
+                assert!(case.no_worse_share() >= 0.99, "worse than raw: {what}");
+                assert!(case.lag.0 >= -0.05 * MS, "earlier than truth: {what}");
+                // Relaxed: never later than the longest possible delivery (a frame plus 2 ms),
+                // rather than a period plus 1 ms. At 60 Hz, frames of about three samples defeat
+                // the seeded line and the output falls back towards the receipt times.
+                assert!(case.lag.1 <= frame + 2.0 * MS + US, "late: {what}");
+            }
+        }
+    }
+
     #[test]
     #[ignore = "prints the results table"]
     fn report() {
@@ -1065,6 +1472,15 @@ mod tests {
             }
             for (case, length) in unseeded_cases(delay).iter().zip(LENGTHS) {
                 println!("unseeded {delay:?} N={length}: {}", case.summary());
+            }
+        }
+        for frame in FRAMES {
+            for (case, length) in batched_cases(frame).iter().zip(LENGTHS) {
+                println!(
+                    "batched {:.0} Hz N={length}: {}",
+                    1.0 / frame,
+                    case.summary()
+                );
             }
         }
     }
