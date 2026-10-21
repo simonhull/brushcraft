@@ -22,6 +22,51 @@ use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_pad_v2::{
 use super::State;
 use crate::{ControlId, Event, PadEvent, PadEventKind, Unit};
 
+/// A pad and the controls it announced, so they can all be destroyed with it.
+#[derive(Debug)]
+pub(super) struct Pad {
+    proxy: ZwpTabletPadV2,
+    groups: Vec<Group>,
+}
+
+/// A pad's group and its rings, strips and dials.
+#[derive(Debug)]
+struct Group {
+    proxy: ZwpTabletPadGroupV2,
+    rings: Vec<ZwpTabletPadRingV2>,
+    strips: Vec<ZwpTabletPadStripV2>,
+    dials: Vec<ZwpTabletPadDialV2>,
+}
+
+impl Pad {
+    pub(super) const fn new(proxy: ZwpTabletPadV2) -> Self {
+        Self {
+            proxy,
+            groups: Vec::new(),
+        }
+    }
+
+    /// Destroys the pad's controls, its groups, then the pad.
+    pub(super) fn destroy(self) {
+        for group in self.groups {
+            group.rings.iter().for_each(ZwpTabletPadRingV2::destroy);
+            group.strips.iter().for_each(ZwpTabletPadStripV2::destroy);
+            group.dials.iter().for_each(ZwpTabletPadDialV2::destroy);
+            group.proxy.destroy();
+        }
+        self.proxy.destroy();
+    }
+}
+
+/// The tracked group behind `proxy`, if its pad is still around.
+fn group_mut<'a>(state: &'a mut State, proxy: &ZwpTabletPadGroupV2) -> Option<&'a mut Group> {
+    state
+        .pads
+        .values_mut()
+        .flat_map(|pad| pad.groups.iter_mut())
+        .find(|group| group.proxy == *proxy)
+}
+
 /// Queues one pad event, stamped now.
 fn emit(state: &State, kind: PadEventKind) {
     state.emit(Event::Pad(PadEvent {
@@ -65,13 +110,27 @@ impl Dispatch<ZwpTabletPadV2, ()> for State {
                     },
                 );
             }
-            zwp_tablet_pad_v2::Event::Removed => proxy.destroy(),
+            zwp_tablet_pad_v2::Event::Group { pad_group } => {
+                if let Some(pad) = state.pads.get_mut(&proxy.id()) {
+                    pad.groups.push(Group {
+                        proxy: pad_group,
+                        rings: Vec::new(),
+                        strips: Vec::new(),
+                        dials: Vec::new(),
+                    });
+                }
+            }
+            zwp_tablet_pad_v2::Event::Removed => {
+                if let Some(pad) = state.pads.remove(&proxy.id()) {
+                    pad.destroy();
+                }
+            }
             _ => {}
         }
     }
 }
 
-/// Groups only announce their rings, strips and dials.
+/// Groups announce their rings, strips and dials, tracked so they're destroyed with the pad.
 impl Dispatch<ZwpTabletPadGroupV2, ()> for State {
     wayland_client::event_created_child!(Self, ZwpTabletPadGroupV2, [
         zwp_tablet_pad_group_v2::EVT_RING_OPCODE => (ZwpTabletPadRingV2, ()),
@@ -80,13 +139,26 @@ impl Dispatch<ZwpTabletPadGroupV2, ()> for State {
     ]);
 
     fn event(
-        _: &mut Self,
-        _: &ZwpTabletPadGroupV2,
-        _: zwp_tablet_pad_group_v2::Event,
+        state: &mut Self,
+        proxy: &ZwpTabletPadGroupV2,
+        event: zwp_tablet_pad_group_v2::Event,
         (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let Some(group) = group_mut(state, proxy) else {
+            return;
+        };
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "the protocol enum is non-exhaustive; the rest don't matter here"
+        )]
+        match event {
+            zwp_tablet_pad_group_v2::Event::Ring { ring } => group.rings.push(ring),
+            zwp_tablet_pad_group_v2::Event::Strip { strip } => group.strips.push(strip),
+            zwp_tablet_pad_group_v2::Event::Dial { dial } => group.dials.push(dial),
+            _ => {}
+        }
     }
 }
 

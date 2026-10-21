@@ -250,6 +250,8 @@ pub struct PadEvent {
 }
 
 /// Identifies one ring, strip or dial for as long as it exists.
+///
+/// Ids are allocated by the compositor and may be reused after a control is destroyed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ControlId(u32);
 
