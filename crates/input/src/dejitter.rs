@@ -35,8 +35,12 @@
 //! the line falls behind the truth by the error every sample. So the clock counts as *lost*, and
 //! the segment restarts from the sample without a seed, when the envelope sits more than the
 //! spread plus [`LOST`] of a period above the limited line, or when a seeded stroke gets
-//! [`ADRIFT`] samples in a row later behind the line than the seed's spread allows. This also
-//! covers a sustained change of rate mid-stroke.
+//! [`ADRIFT`] samples in a row later behind the line than the seed's spread allows. Speeding up
+//! mid-stroke is harmless (the line follows the receipts). Slowing down is caught on a seeded
+//! segment, at a cost of up to about 20 ms of early output before it re-locks. On a segment
+//! without a seed (a first stroke, or after such a restart) it is **not** caught: the envelope
+//! and the limited line fall behind together and the output can run ~100 ms early for the rest
+//! of the stroke. Pens don't change rate mid-stroke in practice, but this is a known gap.
 //!
 //! **Dropped samples.** Slots are sequential unless a drop is unambiguous. The *delay spread* is
 //! the largest residual above the line in the envelope window, and while a seed is in use at
@@ -1261,9 +1265,19 @@ mod tests {
                 drop(warm.run(&mut filter));
                 let start = base + Duration::from_secs(10);
                 let stroke = Stroke::jittered(start, 200, Delay::Uniform(PERIOD), &mut rng);
-                let (worst, honest) = worst_lag(&mut filter, start, &stroke.samples, RELOCK);
+                let samples = &stroke.samples;
+                let mut again = Dejitter::new();
+                let rewarm = Stroke::new(base, device, 400, || rng.unit() * MS, |_| false);
+                drop(rewarm.run(&mut again));
+                let (whole, _) = worst_lag(&mut again, start, samples, 0);
+                let (worst, honest) = worst_lag(&mut filter, start, samples, RELOCK);
                 assert!(honest, "device {device}, seed {seed}: output after receipt");
                 assert!(worst >= -MS, "device {device}, seed {seed}: lag {worst}");
+                // Measured worst over the whole stroke: −7.4 ms.
+                assert!(
+                    whole >= -10.0 * MS,
+                    "device {device}, seed {seed}: lag {whole}"
+                );
             }
         }
     }
@@ -1364,6 +1378,134 @@ mod tests {
         }
     }
 
+    /// Samples whose period changes: `(from sample, period)` pairs, delay uniform 0–1 ms,
+    /// delivered first in, first out.
+    fn piecewise(count: u32, rates: &[(u32, f64)], rng: &mut Rng) -> Vec<(f64, f64)> {
+        let (mut truth, mut previous) = (0.0, f64::NEG_INFINITY);
+        (0..count)
+            .map(|i| {
+                let t = truth;
+                let period = rates
+                    .iter()
+                    .rev()
+                    .find(|&&(from, _)| i >= from)
+                    .map_or(PERIOD, |&(_, period)| period);
+                truth += period;
+                previous = f64::max(previous, t + rng.unit() * MS);
+                (t, previous)
+            })
+            .collect()
+    }
+
+    /// A rate-change scenario and the worst lags it is held to: over the whole stroke, and from
+    /// [`RELOCK`] samples after each change.
+    struct RateChange {
+        name: &'static str,
+        seeded_first: bool,
+        rates: &'static [(u32, f64)],
+        worst: f64,
+        relocked: f64,
+    }
+
+    /// Rate changes, held to the bounds measured at this commit.
+    ///
+    /// Slowing down on a segment without a seed is NOT handled: the line drifts early and does
+    /// not re-lock within the stroke (see the module docs). The bounds are there so that it
+    /// cannot silently get worse.
+    const RATE_CHANGES: [RateChange; 4] = [
+        RateChange {
+            name: "fresh 5.8 to 8 ms",
+            seeded_first: false,
+            rates: &[(0, PERIOD), (100, 0.008)],
+            worst: 115.0 * MS,
+            relocked: 115.0 * MS,
+        },
+        RateChange {
+            name: "fresh 5.8 to 6.5 ms",
+            seeded_first: false,
+            rates: &[(0, PERIOD), (100, 0.0065)],
+            worst: 39.0 * MS,
+            relocked: 39.0 * MS,
+        },
+        RateChange {
+            name: "fresh 8 to 5.8 ms",
+            seeded_first: false,
+            rates: &[(0, 0.008), (100, PERIOD)],
+            worst: MS,
+            relocked: MS,
+        },
+        RateChange {
+            name: "seeded 5.8 to 8 to 10 ms",
+            seeded_first: true,
+            rates: &[(0, PERIOD), (100, 0.008), (200, 0.010)],
+            worst: 100.0 * MS,
+            relocked: 100.0 * MS,
+        },
+    ];
+
+    /// Worst lag over the whole stroke and after each change plus [`RELOCK`], over 50 seeds.
+    fn rate_change_lags(seeded_first: bool, rates: &[(u32, f64)]) -> (f64, f64, bool) {
+        let base = Instant::now();
+        let (mut all, mut settled, mut honest) = (f64::INFINITY, f64::INFINITY, true);
+        for seed in 1..=50 {
+            let mut rng = Rng::new(seed);
+            let samples = piecewise(300, rates, &mut rng);
+            let start = base + Duration::from_secs(10);
+            let mut filter = Dejitter::new();
+            if seeded_first {
+                drop(
+                    Stroke::new(base, PERIOD, 400, || rng.unit() * MS, |_| false).run(&mut filter),
+                );
+            }
+            let mut previous_out = None;
+            for (i, &(truth, receipt)) in samples.iter().enumerate() {
+                let received = start + Duration::from_secs_f64(receipt);
+                let out = filter.push(received);
+                honest &= out <= received && previous_out.is_none_or(|p| out >= p);
+                previous_out = Some(out);
+                let lag = out.duration_since(start).as_secs_f64() - truth;
+                all = all.min(lag);
+                let since_change = rates
+                    .iter()
+                    .filter_map(|&(from, _)| u32::try_from(i).ok()?.checked_sub(from))
+                    .min()
+                    .unwrap_or(u32::MAX);
+                if since_change as usize >= RELOCK {
+                    settled = settled.min(lag);
+                }
+            }
+        }
+        (all, settled, honest)
+    }
+
+    #[test]
+    fn a_rate_change_stays_within_measured_bounds() {
+        for case in RATE_CHANGES {
+            let (all, settled, honest) = rate_change_lags(case.seeded_first, case.rates);
+            let name = case.name;
+            assert!(honest, "{name}: output after receipt or backwards");
+            assert!(all >= -case.worst, "{name}: worst lag {all}");
+            assert!(
+                settled >= -case.relocked,
+                "{name}: lag {settled} after re-locking"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "prints adversarial results"]
+    fn adversarial_report_rates() {
+        for case in RATE_CHANGES {
+            let (all, settled, _) = rate_change_lags(case.seeded_first, case.rates);
+            let name = case.name;
+            println!(
+                "{name}: worst lag {:.2} ms, after {RELOCK}: {:.2} ms",
+                all / MS,
+                settled / MS
+            );
+        }
+    }
+
     #[test]
     #[ignore = "prints adversarial results"]
     fn adversarial_report_receipts() {
@@ -1455,10 +1597,16 @@ mod tests {
                 let what = format!("{frame} s frames, {length} samples: {}", case.summary());
                 assert!(case.no_worse_share() >= 0.99, "worse than raw: {what}");
                 assert!(case.lag.0 >= -0.05 * MS, "earlier than truth: {what}");
-                // Relaxed: never later than the longest possible delivery (a frame plus 2 ms),
-                // rather than a period plus 1 ms. At 60 Hz, frames of about three samples defeat
-                // the seeded line and the output falls back towards the receipt times.
-                assert!(case.lag.1 <= frame + 2.0 * MS + US, "late: {what}");
+                // At 144 Hz the filter must actually improve on the receipts. At 60 Hz, frames
+                // of about three samples defeat the seeded line and the output falls back
+                // towards the receipt times, so only no-worse and not-early are held.
+                if frame < 0.01 {
+                    let p99 = quantile_abs(&case.filter, 0.99);
+                    assert!(
+                        p99 < quantile_abs(&case.raw, 0.99),
+                        "no better than raw: {what}"
+                    );
+                }
             }
         }
     }
