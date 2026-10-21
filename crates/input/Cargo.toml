@@ -1,0 +1,20 @@
+[package]
+name = "input"
+description = "Pen input: native pen backends and a de-jitter filter, feeding the stroke engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle.workspace = true
+rustix.workspace = true
+wayland-backend.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true

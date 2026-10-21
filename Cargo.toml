@@ -11,8 +11,15 @@ publish = false
 [workspace.dependencies]
 geom = { path = "crates/geom" }
 store = { path = "crates/store" }
+input = { path = "crates/input" }
 anyhow = "1.0.100"
+raw-window-handle = "0.6.2"
+rustix = { version = "1.1.5", default-features = false, features = ["event", "pipe", "std"] }
 softbuffer = { version = "0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
+thiserror = "2.0.21"
+wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client"] }
 winit = { version = "=0.31.0-beta.3", default-features = false, features = ["wayland", "wayland-dlopen"] }
 
 [workspace.lints.rust]
