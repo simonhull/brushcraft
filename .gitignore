@@ -1,0 +1,6 @@
+/target
+# Benchmark projects run to several GB.
+*.bcrf
+# samply / perf output
+profile.json*
+perf.data*
