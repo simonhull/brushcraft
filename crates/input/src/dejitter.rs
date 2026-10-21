@@ -48,9 +48,7 @@ const RESLOT_ROUNDS: usize = 4;
 /// The bootstrap search covers periods within this fraction of its first guess…
 const SEARCH_SPAN: f64 = 0.3;
 /// …in this many steps each side.
-///
-/// Miri gets a coarse search: it checks the arithmetic, and the full one takes minutes there.
-const SEARCH_STEPS: i32 = if cfg!(miri) { 40 } else { 400 };
+const SEARCH_STEPS: i32 = 400;
 /// What the bootstrap search charges per sample it would call dropped (or doubled up), as a
 /// fraction of the period's phase spread.
 const DROP_PENALTY: f64 = 1.0;
@@ -485,8 +483,8 @@ mod tests {
         values[rank]
     }
 
-    /// Strokes per statistical test; Miri is too slow for 100.
-    const SEEDS: RangeInclusive<u64> = if cfg!(miri) { 1..=2 } else { 1..=100 };
+    /// Strokes per statistical test.
+    const SEEDS: RangeInclusive<u64> = 1..=100;
     /// Samples the fit gets to converge before it is judged.
     const CONVERGED: usize = 64;
     const PERIOD: f64 = 0.0058;
@@ -548,17 +546,11 @@ mod tests {
 
     #[test]
     fn never_after_receipt_and_never_backwards() {
-        // Miri checks for UB and arithmetic faults, not statistics: a short run is enough.
-        let (seeds, count) = if cfg!(miri) {
-            (1..=2, 300)
-        } else {
-            (1..=20, 2000)
-        };
-        for seed in seeds {
+        for seed in 1..=20 {
             let mut rng = Rng(seed);
             let period = rng.unit().mul_add(12.0 * MS, 3.0 * MS);
             let jitter = rng.unit() * 0.6 * period;
-            let stroke = Stroke::new(period, count, |_| rng.unit() * jitter, |i| i % 37 == 0);
+            let stroke = Stroke::new(period, 2000, |_| rng.unit() * jitter, |i| i % 37 == 0);
             let out = stroke.run(&mut Dejitter::new());
             for &(_, receipt, o) in &out {
                 assert!(
