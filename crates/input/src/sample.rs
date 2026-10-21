@@ -38,7 +38,7 @@ impl TryFrom<f32> for Unit {
 
     fn try_from(value: f32) -> Result<Self, OutOfRange> {
         if (0.0..=1.0).contains(&value) {
-            Ok(Self(value))
+            Ok(Self(value + 0.0))
         } else {
             Err(OutOfRange(value))
         }
@@ -61,7 +61,8 @@ impl Tilt {
             if v.is_nan() {
                 0.0
             } else {
-                v.clamp(-90.0, 90.0)
+                // `+ 0.0` turns -0.0 into 0.0, so an upright pen has azimuth 0, not π.
+                v.clamp(-90.0, 90.0) + 0.0
             }
         };
         Self {
@@ -152,9 +153,10 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// Whether the tip touches the surface in this phase.
+    /// Whether this sample belongs to a stroke: from the tip touching (`Down`) through lifting
+    /// (`Up`), inclusive.
     #[must_use]
-    pub const fn in_contact(self) -> bool {
+    pub const fn in_stroke(self) -> bool {
         matches!(self, Self::Down | Self::Drag | Self::Up)
     }
 }
@@ -191,15 +193,18 @@ impl Buttons {
 /// Identifies the window surface a sample belongs to.
 ///
 /// Compare it with the one `wayland::surface_id` returns for a window.
+///
+/// It is an address, so it is unique only among live surfaces and may be reused after one is
+/// destroyed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SurfaceId(usize);
 
 impl SurfaceId {
-    /// Wraps a surface's address. Only compared, never dereferenced.
+    /// Wraps an opaque surface identifier (a surface's address). Only compared, never
+    /// dereferenced.
     #[must_use]
-    #[expect(dead_code, reason = "used by the Wayland backend, Task 5")]
-    pub(crate) const fn from_addr(addr: usize) -> Self {
-        Self(addr)
+    pub const fn from_raw(raw: usize) -> Self {
+        Self(raw)
     }
 }
 
@@ -246,7 +251,15 @@ pub struct PadEvent {
 
 /// Identifies one ring, strip or dial for as long as it exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ControlId(pub(crate) u32);
+pub struct ControlId(u32);
+
+impl ControlId {
+    /// Wraps an opaque control identifier. Only compared, never interpreted.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+}
 
 /// What a pad reported.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -327,9 +340,38 @@ mod tests {
 
     #[test]
     fn upright_pen_points_straight_up() {
-        let t = Tilt::new(0.0, 0.0);
-        assert!((t.altitude() - FRAC_PI_2).abs() < 1e-12);
-        assert!(t.azimuth().abs() < 1e-12);
+        for t in [Tilt::new(0.0, 0.0), Tilt::new(-0.0, -0.0)] {
+            assert!((t.altitude() - FRAC_PI_2).abs() < 1e-12);
+            assert!(t.azimuth().abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn tilt_clamps_infinities() {
+        let t = Tilt::new(f64::INFINITY, f64::NEG_INFINITY);
+        assert_eq!((t.x(), t.y()), (90.0, -90.0));
+    }
+
+    #[test]
+    fn unit_accepts_its_endpoints() {
+        assert_eq!(Unit::try_from(0.0).unwrap(), Unit::ZERO);
+        assert_eq!(Unit::try_from(1.0).unwrap(), Unit::ONE);
+        assert!(Unit::try_from(-0.0).unwrap().get().is_sign_positive());
+    }
+
+    #[test]
+    fn only_down_through_up_are_in_a_stroke() {
+        let expected = [
+            (Phase::Enter, false),
+            (Phase::Hover, false),
+            (Phase::Down, true),
+            (Phase::Drag, true),
+            (Phase::Up, true),
+            (Phase::Leave, false),
+        ];
+        for (phase, in_stroke) in expected {
+            assert_eq!(phase.in_stroke(), in_stroke, "{phase:?}");
+        }
     }
 
     #[test]
