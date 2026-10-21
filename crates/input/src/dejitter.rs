@@ -819,32 +819,61 @@ mod tests {
                 }
             }
         }
-        let mut rng = Rng::new(1);
-        let stroke = Stroke::jittered(Instant::now(), 20, Delay::Uniform(4.0 * MS), &mut rng);
-        let mut filter = Dejitter::new();
-        for &(_, receipt, out) in stroke.run(&mut filter).iter().take(MIN_FIT - 1) {
-            assert!(
-                (out - receipt).abs() < US,
-                "before a period is known, output is receipt"
-            );
+    }
+
+    #[test]
+    fn outputs_receipt_before_a_period_exists() {
+        for delay in Delay::MODELS {
+            for seed in 1..=20 {
+                let mut rng = Rng::new(seed);
+                let stroke = Stroke::jittered(Instant::now(), 20, delay, &mut rng);
+                let mut filter = Dejitter::new();
+                let run = stroke.run(&mut filter);
+                for (i, &(_, receipt, out)) in run.iter().enumerate().take(MIN_FIT - 1) {
+                    assert!(
+                        (out - receipt).abs() < US,
+                        "{delay:?}, seed {seed}, sample {i}: output {out}, receipt {receipt}"
+                    );
+                }
+            }
         }
+    }
+
+    /// A seeded stroke of 400 slots with every `every`th dropped, delay uniform 0–2 ms, and its
+    /// interval errors.
+    fn dropping_stroke(seed: u64, every: usize) -> (Run, Vec<f64>) {
+        let delay = Delay::Uniform(2.0 * MS);
+        let base = Instant::now();
+        let mut rng = Rng::new(seed);
+        let mut filter = seeded(base, delay, &mut rng);
+        let start = base + Duration::from_secs(10);
+        let dropped = |i: usize| i % every == every - 1;
+        let stroke = Stroke::new(start, PERIOD, 400, || delay.draw(&mut rng), dropped);
+        let run = stroke.run(&mut filter);
+        let errors = interval_errors(&run);
+        (run, errors)
     }
 
     #[test]
     fn counts_dropped_samples() {
-        let delay = Delay::Uniform(2.0 * MS);
-        let base = Instant::now();
-        let mut slipped = 0;
+        let slipped = (1..=SEEDS)
+            .filter(|&seed| {
+                let (_, errors) = dropping_stroke(seed, 10);
+                errors.iter().any(|e| e.abs() > PERIOD / 2.0)
+            })
+            .count();
+        println!("{slipped} of {SEEDS} strokes slipped");
+        assert!(
+            slipped * 100 <= usize::try_from(SEEDS).unwrap(),
+            "{slipped} of {SEEDS} strokes slipped"
+        );
+    }
+
+    #[test]
+    fn recovers_after_a_drop() {
+        let mut checked = 0;
         for seed in 1..=SEEDS {
-            let mut rng = Rng::new(seed);
-            let mut filter = seeded(base, delay, &mut rng);
-            let start = base + Duration::from_secs(10);
-            let stroke = Stroke::new(start, PERIOD, 400, || delay.draw(&mut rng), |i| i % 10 == 9);
-            let run = stroke.run(&mut filter);
-            let errors = interval_errors(&run);
-            if errors.iter().any(|e| e.abs() > PERIOD / 2.0) {
-                slipped += 1;
-            }
+            let (run, errors) = dropping_stroke(seed, 40);
             // Delivered samples that follow a drop.
             let drops: Vec<usize> = run
                 .windows(2)
@@ -852,9 +881,11 @@ mod tests {
                 .filter(|(pair, _)| pair[1].0 - pair[0].0 > 1.5 * PERIOD)
                 .map(|(_, i)| i)
                 .collect();
+            // Slots 39, 79, …, 359 are followed by a sample; slot 399 ends the stroke.
+            assert_eq!(drops.len(), 9, "seed {seed}: drops found");
             for (k, &drop) in drops.iter().enumerate() {
                 let next = drops.get(k + 1).copied().unwrap_or(run.len());
-                for i in (drop + DROP_CONFIRM + 8).min(next)..next {
+                for i in (drop + DROP_CONFIRM + 8)..next {
                     // `errors[i - 1]` is the interval ending at sample `i`.
                     assert!(
                         errors[i - 1].abs() < 0.5 * MS,
@@ -862,13 +893,14 @@ mod tests {
                         i - drop,
                         errors[i - 1]
                     );
+                    checked += 1;
                 }
             }
         }
-        println!("{slipped} of {SEEDS} strokes slipped");
+        // 9 drops per stroke, each followed by 38 or more samples of which K + 8 are excused.
         assert!(
-            slipped * 100 <= SEEDS,
-            "{slipped} of {SEEDS} strokes slipped"
+            checked >= 9 * 20 * usize::try_from(SEEDS).unwrap(),
+            "only {checked} intervals checked"
         );
     }
 
@@ -933,6 +965,26 @@ mod tests {
             late,
             "after a 200 ms stall the sample stands on its own"
         );
+    }
+
+    #[test]
+    fn a_stall_restarts_without_a_period() {
+        let mut filter = Dejitter::new();
+        let start = Instant::now();
+        let at = |seconds: f64| start + Duration::from_secs_f64(seconds);
+        for receipt in [0.0, 0.0071, 0.0112] {
+            filter.push(at(receipt));
+        }
+        assert!(filter.period().is_none(), "no period from three samples");
+        // Past the 0.4 s stall limit for an unknown period.
+        for receipt in [0.5, 0.5061, 0.5113] {
+            assert_eq!(
+                filter.push(at(receipt)),
+                at(receipt),
+                "after a 0.5 s stall with no period the sample stands on its own"
+            );
+        }
+        assert!(filter.period().is_none(), "the stall restarted the fit");
     }
 
     #[test]
