@@ -192,7 +192,7 @@ impl Buttons {
 
 /// Identifies the window surface a sample belongs to.
 ///
-/// Compare it with the one `wayland::surface_id` returns for a window.
+/// Compare it with the one [`crate::wayland::surface_id`] returns for a window.
 ///
 /// It is an address, so it is unique only among live surfaces and may be reused after one is
 /// destroyed.

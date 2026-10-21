@@ -5,10 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 
 /// A bounded queue: `capacity` events before the producer starts dropping.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the Wayland backend, Task 5")
-)]
 pub(crate) fn channel<T>(capacity: usize) -> (Sender<T>, Events<T>) {
     let (tx, rx) = mpsc::sync_channel(capacity);
     let dropped = Arc::new(AtomicU64::new(0));
@@ -28,10 +24,6 @@ pub(crate) struct Disconnected;
 
 /// The producer's end. Never blocks.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the Wayland backend, Task 5")
-)]
 pub(crate) struct Sender<T> {
     tx: SyncSender<T>,
     dropped: Arc<AtomicU64>,
@@ -43,10 +35,6 @@ impl<T> Sender<T> {
     /// # Errors
     ///
     /// [`Disconnected`] once the [`Events`] end is dropped.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the Wayland backend, Task 5")
-    )]
     pub(crate) fn send(&self, event: T) -> Result<(), Disconnected> {
         match self.tx.try_send(event) {
             Ok(()) => Ok(()),

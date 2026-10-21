@@ -13,7 +13,7 @@ workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-raw-window-handle.workspace = true
+raw-window-handle = { workspace = true, features = ["std"] }
 rustix.workspace = true
 wayland-backend.workspace = true
 wayland-client.workspace = true
