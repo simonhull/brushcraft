@@ -7,7 +7,8 @@ if they disagree, raise it rather than drifting silently.
 ## Rules
 
 - **No AI attribution** in commits, PRs or release notes: no `Co-Authored-By`, no "Generated with" lines.
-- Workspace lints in the root `Cargo.toml` are the standard. Don't weaken them; a local
+- Workspace lints in the root `Cargo.toml` are the standard, and `clippy.toml` applies them to public and
+  private items alike. Don't weaken them; a local
   `#[expect(lint, reason = "…")]` needs a real reason (`#[allow]` is denied).
 - `unsafe_code` is denied workspace-wide. A crate that needs it overrides the lint in its own manifest with a
   justification, every block carries a `// SAFETY:` proof, and it is tested under `cargo +nightly miri test`.
@@ -21,6 +22,9 @@ if they disagree, raise it rather than drifting silently.
 
 - `scripts/check.sh`: everything CI runs.
 - `cargo nextest run`: tests. `cargo test --doc`: doctests.
+- `cargo fmt` uses the pinned nightly's rustfmt (unstable options in `rustfmt.toml`) through `RUSTFMT` in
+  `mise.toml`. Stable rustfmt gives different output: point your editor at `scripts/rustfmt`, and run
+  anything that needs nightly (fmt, Miri) via `cargo +$BRUSHCRAFT_NIGHTLY …` under mise.
 - Toolchain and cargo tools are pinned in `mise.toml`; bump `rust` there and `rust-version` in `Cargo.toml`
   together. Run cargo through mise (`mise exec -- cargo …` in a shell without `mise activate`), or you get
   rustup's default toolchain instead.

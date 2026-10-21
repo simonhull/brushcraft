@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# rustfmt from the pinned nightly, for the unstable options in rustfmt.toml. Selected via RUSTFMT in mise.toml.
+exec rustup run "${BRUSHCRAFT_NIGHTLY:?run through mise so BRUSHCRAFT_NIGHTLY is set}" rustfmt "$@"
