@@ -19,20 +19,20 @@ pub(crate) const fn to_f64(v: usize) -> f64 {
     v as f64
 }
 
-/// Which clock a sample's time is read from.
+/// How the time between two consecutive samples is read.
 #[derive(Debug, Clone, Copy)]
 enum Clock {
-    /// When the application received the event.
+    /// When the application received each event.
     Receipt,
-    /// The platform's own timestamp, if it reports one.
-    Device,
+    /// A pen sampling at a steady period (seconds): the model a de-jitter filter fits.
+    Steady(f64),
 }
 
 impl Clock {
-    fn seconds(self, sample: &Sample) -> Option<f64> {
+    fn step(self, a: &Sample, b: &Sample) -> f64 {
         match self {
-            Self::Receipt => Some(sample.received.as_secs_f64()),
-            Self::Device => sample.data.timestamp.map(|t| t.as_secs_f64()),
+            Self::Receipt => b.received.saturating_sub(a.received).as_secs_f64(),
+            Self::Steady(period) => period,
         }
     }
 }
@@ -47,22 +47,19 @@ pub(crate) fn write_csv(samples: &[Sample], path: &Path) -> Result<()> {
         v.map(|v| v.to_string()).unwrap_or_default()
     }
     let mut out = String::from(
-        "received_s,device_s,wakeup,x,y,contact,force,distance,tilt_x,tilt_y,altitude,azimuth,\
-         twist,tangential\n",
+        "received_s,wakeup,x,y,contact,force,tilt_x,tilt_y,altitude,azimuth,twist,tangential\n",
     );
     for s in samples {
         let d = &s.data;
         writeln!(
             out,
-            "{:.6},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{}",
+            "{:.6},{},{:.3},{:.3},{},{},{},{},{},{},{},{}",
             s.received.as_secs_f64(),
-            opt(d.timestamp.map(|t| format!("{:.3}", t.as_secs_f64()))),
             s.wakeup,
             s.x,
             s.y,
             u8::from(s.contact),
             opt(d.force.map(|f| format!("{:.6}", f.normalized(None)))),
-            opt(d.distance.map(|v| format!("{v:.6}"))),
             opt(d.tilt.map(|t| t.x)),
             opt(d.tilt.map(|t| t.y)),
             opt(d.angle.map(|a| format!("{:.6}", a.altitude))),
@@ -89,9 +86,10 @@ fn steps<'a>(strokes: &[&'a [Sample]]) -> impl Iterator<Item = (&'a Sample, &'a 
         .flat_map(|stroke| stroke.iter().zip(stroke.iter().skip(1)))
 }
 
-fn intervals(strokes: &[&[Sample]], clock: Clock) -> Vec<f64> {
+/// Sorted receipt intervals between consecutive samples within strokes.
+fn intervals(strokes: &[&[Sample]]) -> Vec<f64> {
     let mut dts: Vec<f64> = steps(strokes)
-        .filter_map(|(a, b)| Some(clock.seconds(b)? - clock.seconds(a)?))
+        .map(|(a, b)| Clock::Receipt.step(a, b))
         .filter(|dt| *dt < STROKE_GAP_S)
         .collect();
     dts.sort_by(f64::total_cmp);
@@ -120,21 +118,21 @@ fn std_dev(values: &[f64]) -> f64 {
 /// Median relative change between consecutive speeds (each a 3-step moving average), in percent.
 ///
 /// The pen's real speed changes little from one sample to the next, so this mostly measures
-/// timing noise in `clock`. `None` if `clock` has no times.
+/// timing noise in `clock`. `None` if no stroke is long enough.
 fn speed_noise(strokes: &[&[Sample]], clock: Clock) -> Option<f64> {
     let mut changes = Vec::new();
     for stroke in strokes {
-        let speeds = stroke
+        let speeds: Vec<Option<f64>> = stroke
             .windows(2)
             .map(|pair| match pair {
                 [a, b] => {
-                    let dt = clock.seconds(b)? - clock.seconds(a)?;
+                    let dt = clock.step(a, b);
                     let step = (b.x - a.x).hypot(b.y - a.y);
-                    Some((dt > 0.0 && step >= MIN_STEP_PX).then(|| step / dt))
+                    (dt > 0.0 && step >= MIN_STEP_PX).then(|| step / dt)
                 }
-                _ => Some(None),
+                _ => None,
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect();
         let smoothed: Vec<Option<f64>> = speeds
             .windows(3)
             .map(|w| w.iter().copied().sum::<Option<f64>>().map(|sum| sum / 3.0))
@@ -206,24 +204,16 @@ pub(crate) fn summarise(samples: &[Sample]) -> Result<String, fmt::Error> {
         strokes.len()
     )?;
 
-    timing(
-        &mut out,
-        "receipt clock",
-        &intervals(&strokes, Clock::Receipt),
-    )?;
-    timing(
-        &mut out,
-        "device clock",
-        &intervals(&strokes, Clock::Device),
-    )?;
+    let dts = intervals(&strokes);
+    timing(&mut out, "receipt clock", &dts)?;
     let noise = |clock| {
         speed_noise(&strokes, clock).map_or_else(|| "n/a".to_owned(), |v| format!("{v:.1}%"))
     };
     writeln!(
         out,
-        "speed noise (median sample-to-sample change): receipt clock {}, device clock {}",
+        "speed noise (median sample-to-sample change): receipt clock {}, steady period {}",
         noise(Clock::Receipt),
-        noise(Clock::Device),
+        noise(Clock::Steady(percentile(&dts, 0.5))),
     )?;
 
     let mut per_wakeup = BTreeMap::<u64, usize>::new();
@@ -249,9 +239,6 @@ pub(crate) fn summarise(samples: &[Sample]) -> Result<String, fmt::Error> {
         s.data
             .angle
             .map(|a| format!("{:.6},{:.6}", a.altitude, a.azimuth))
-    })?;
-    coverage(&mut out, "hover distance", samples, |s| {
-        s.data.distance.map(|v| format!("{v:.6}"))
     })?;
     coverage(&mut out, "twist", samples, |s| {
         s.data.twist.map(|v| v.to_string())

@@ -1581,6 +1581,8 @@ dependencies = [
 [[package]]
 name = "winit-core"
 version = "0.31.0-beta.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8af6307236c51847199950c15cf80e0481a250bb96ce9132f5026df4ad3d0f9"
 dependencies = [
  "bitflags",
  "cursor-icon",
@@ -1633,6 +1635,8 @@ dependencies = [
 [[package]]
 name = "winit-wayland"
 version = "0.31.0-beta.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b64ceed06de0c45886eef05102106abe1413e703384e337bc57c7e95b71f803"
 dependencies = [
  "bitflags",
  "calloop",

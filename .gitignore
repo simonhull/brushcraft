@@ -4,6 +4,3 @@
 # samply / perf output
 profile.json*
 perf.data*
-# Standalone builds of vendored crates
-/vendor/*/target
-/vendor/*/Cargo.lock
