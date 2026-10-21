@@ -14,4 +14,4 @@ cargo nextest run --workspace --all-features --no-tests=warn
 cargo test --workspace --doc --all-features
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --all-features
 cargo deny check
-cargo machete
+cargo machete crates tools # vendor/ holds upstream crates we only patch

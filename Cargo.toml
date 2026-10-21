@@ -13,6 +13,14 @@ publish = false
 [workspace.dependencies]
 geom = { path = "crates/geom" }
 store = { path = "crates/store" }
+anyhow = "1.0.100"
+softbuffer = { version = "0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
+winit = { version = "=0.31.0-beta.3", default-features = false, features = ["wayland", "wayland-dlopen"] }
+
+# Pen timestamps, hover distance and fractional tilt on Wayland; see vendor/README.md.
+[patch.crates-io]
+winit-core = { path = "vendor/winit-core" }
+winit-wayland = { path = "vendor/winit-wayland" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

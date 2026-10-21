@@ -1,0 +1,15 @@
+[package]
+name = "pen-probe"
+description = "Records what the windowing layer delivers from a pen tablet, and summarises it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+softbuffer.workspace = true
+winit.workspace = true

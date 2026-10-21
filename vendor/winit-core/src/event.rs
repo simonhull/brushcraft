@@ -1240,6 +1240,16 @@ pub struct TabletToolData {
     /// **Web:** Has no mechanism to detect device support, so this will always be [`Some`] with
     /// default values unless browser support is lacking.
     pub angle: Option<TabletToolAngle>,
+    /// When the platform sampled the tool, from an unspecified monotonic epoch. Only differences
+    /// between samples are meaningful. [`None`] means the backend doesn't report one.
+    ///
+    /// ## Platform-specific
+    ///
+    /// **Wayland:** The `zwp_tablet_tool_v2.frame` time, with millisecond granularity.
+    pub timestamp: Option<std::time::Duration>,
+    /// Normalized distance of a hovering tool from the surface, in the range of 0 to 1. [`None`]
+    /// means backend or device has no support.
+    pub distance: Option<f64>,
 }
 
 impl TabletToolData {

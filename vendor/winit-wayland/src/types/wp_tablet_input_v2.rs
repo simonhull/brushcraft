@@ -1,6 +1,7 @@
 //! Handling of wp_tablet_input_v2.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use dpi::LogicalPosition;
 use sctk::compositor::SurfaceData;
@@ -28,7 +29,8 @@ use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_pad_strip_v2::ZwpTabl
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_pad_v2;
 use winit_core::event::{
     ButtonSource, ElementState, Force, PointerKind, PointerSource, TabletToolButton,
-    TabletToolData as CoreTabletToolData, TabletToolKind, TabletToolTilt, WindowEvent,
+    TabletToolAngle, TabletToolData as CoreTabletToolData, TabletToolKind, TabletToolTilt,
+    WindowEvent,
 };
 
 use crate::state::WinitState;
@@ -139,6 +141,8 @@ impl Dispatch2<ZwpTabletToolV2, WinitState> for TabletToolData {
             },
             ToolEvent::Tilt { tilt_x, tilt_y } => {
                 data.tool_state.tilt = Some(TabletToolTilt { x: tilt_x as i8, y: tilt_y as i8 });
+                // `tilt` is whole degrees; `angle` keeps the protocol's fractional precision.
+                data.tool_state.angle = Some(angle_from_tilt(tilt_x, tilt_y));
             },
             ToolEvent::Motion { x, y } => {
                 data.position = (x, y).into();
@@ -146,6 +150,9 @@ impl Dispatch2<ZwpTabletToolV2, WinitState> for TabletToolData {
             },
             ToolEvent::Pressure { pressure } => {
                 data.tool_state.force = Some(Force::Normalized(pressure as f64 / u16::MAX as f64));
+            },
+            ToolEvent::Distance { distance } => {
+                data.tool_state.distance = Some(f64::from(distance) / f64::from(u16::MAX));
             },
             ToolEvent::Rotation { degrees } => {
                 data.tool_state.twist = Some(degrees as u16);
@@ -171,7 +178,9 @@ impl Dispatch2<ZwpTabletToolV2, WinitState> for TabletToolData {
                 let event = TabletEvent::Button { button, state, serial: Some(serial) };
                 data.pending.push(event);
             },
-            ToolEvent::Frame { .. } => {
+            ToolEvent::Frame { time } => {
+                let timestamp = data.frame_clock.extend(time);
+                data.tool_state.timestamp = Some(timestamp);
                 let kind = data.ty;
                 for event in std::mem::take(&mut data.pending) {
                     if let TabletEvent::Enter { surface, serial } = &event {
@@ -290,6 +299,91 @@ pub(crate) struct TabletToolDataInner {
 
     /// The serial of the latest button event for the pointer
     pub(crate) latest_button_serial: Option<u32>,
+
+    /// Extends the 32-bit `frame` time past its wrap.
+    pub(crate) frame_clock: FrameClock,
+}
+
+/// Turns the protocol's wrapping 32-bit millisecond `frame` time into a non-wrapping
+/// [`Duration`].
+#[derive(Debug, Default)]
+pub(crate) struct FrameClock {
+    last: Option<u32>,
+    wraps: u64,
+}
+
+impl FrameClock {
+    fn extend(&mut self, time: u32) -> Duration {
+        if self.last.is_some_and(|last| time < last) {
+            self.wraps += 1;
+        }
+        self.last = Some(time);
+        Duration::from_millis((self.wraps << 32) | u64::from(time))
+    }
+}
+
+/// Converts tilt in degrees to [`TabletToolAngle`] at full precision.
+///
+/// See <https://www.w3.org/TR/pointerevents3/#converting-between-tiltx-tilty-and-altitudeangle-azimuthangle>.
+fn angle_from_tilt(tilt_x: f64, tilt_y: f64) -> TabletToolAngle {
+    use std::f64::consts::{FRAC_PI_2, PI, TAU};
+
+    // A tool lying flat along an axis: tan() is infinite, so take the azimuth from that axis.
+    if tilt_x.abs() >= 90. || tilt_y.abs() >= 90. {
+        let azimuth = if tilt_x >= 90. {
+            0.
+        } else if tilt_x <= -90. {
+            PI
+        } else if tilt_y >= 90. {
+            FRAC_PI_2
+        } else {
+            3. * FRAC_PI_2
+        };
+        return TabletToolAngle { altitude: 0., azimuth };
+    }
+
+    let tan_x = tilt_x.to_radians().tan();
+    let tan_y = tilt_y.to_radians().tan();
+    let azimuth = tan_y.atan2(tan_x).rem_euclid(TAU);
+    let altitude = 1f64.atan2(tan_x.hypot(tan_y));
+    TabletToolAngle { altitude, azimuth }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_clock_extends_past_wrap() {
+        let mut clock = FrameClock::default();
+        assert_eq!(clock.extend(u32::MAX - 1), Duration::from_millis(u64::from(u32::MAX) - 1));
+        assert_eq!(clock.extend(3), Duration::from_millis((1 << 32) + 3));
+        assert_eq!(clock.extend(10), Duration::from_millis((1 << 32) + 10));
+    }
+
+    #[test]
+    fn upright_tool_points_straight_up() {
+        let angle = angle_from_tilt(0., 0.);
+        assert_eq!(angle.altitude, std::f64::consts::FRAC_PI_2);
+        assert_eq!(angle.azimuth, 0.);
+    }
+
+    #[test]
+    fn angle_matches_whole_degree_conversion() {
+        for (x, y) in [(30, 0), (0, -45), (20, 35), (-60, 10), (90, 0), (0, -90)] {
+            let ours = angle_from_tilt(f64::from(x), f64::from(y));
+            let core = TabletToolTilt { x, y }.angle();
+            assert!((ours.altitude - core.altitude).abs() < 1e-9, "altitude for ({x}, {y})");
+            assert!((ours.azimuth - core.azimuth).abs() < 1e-9, "azimuth for ({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn angle_keeps_fractional_tilt() {
+        let a = angle_from_tilt(30.0, 0.);
+        let b = angle_from_tilt(30.5, 0.);
+        assert!(b.altitude < a.altitude, "half a degree more tilt must lower the altitude");
+    }
 }
 
 // Due to wayland using logical coordinates,
