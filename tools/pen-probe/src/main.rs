@@ -1,9 +1,12 @@
-//! Pen-input probe: records what winit delivers from a pen tablet and summarises it.
+//! Pen-input probe: records what winit and our own pen backend deliver from a pen tablet, from the
+//! same strokes, and summarises both.
 //!
 //! Draw on the window with the pen, then close it. Samples go to the CSV path given as the first
-//! argument (default `pen-samples.csv`), and a summary is printed to stdout. Method and results:
-//! `research/platform/pen-input-wayland.md` in the docs repo.
+//! argument (default `pen-samples.csv`), and a summary is printed to stdout. Our backend
+//! (`input::wayland`) runs where it can; without it the probe records winit alone. Method and
+//! results: `research/platform/pen-input-wayland.md` in the docs repo.
 
+mod ours;
 mod report;
 
 use std::io::Write as _;
@@ -13,6 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
+use input::Phase;
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::event::{
@@ -26,17 +30,64 @@ const BACKGROUND: u32 = 0x0018_1818;
 const INK: u32 = 0x00E8_E0D0;
 const MAX_RADIUS: f64 = 12.0;
 
-/// One pen sample as the application received it.
+/// Which path a sample came through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// winit's `PointerMoved` / `PointerButton`, on the event-loop thread.
+    Winit,
+    /// `input`'s Wayland backend, on its own thread.
+    Ours,
+}
+
+impl Source {
+    const ALL: [Self; 2] = [Self::Winit, Self::Ours];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Winit => "winit",
+            Self::Ours => "ours",
+        }
+    }
+}
+
+/// One pen sample as the probe records it.
 #[derive(Debug, Clone)]
 struct Sample {
-    /// When the event reached the application, since the probe started.
+    source: Source,
+    /// When it was received (winit: event-loop thread; ours: input thread), since the probe
+    /// started.
     received: Duration,
+    /// Our de-jittered time, since the probe started; `None` for winit samples and hover.
+    dejittered: Option<Duration>,
     /// Index of the event-loop wakeup that delivered this sample.
     wakeup: u64,
+    /// Position in physical pixels.
     x: f64,
     y: f64,
     contact: bool,
-    data: TabletToolData,
+    pressure: Option<f64>,
+    /// Tilt in degrees.
+    tilt: Option<(f64, f64)>,
+    distance: Option<f64>,
+    roll: Option<f64>,
+    /// Our phase; `None` for winit samples.
+    phase: Option<Phase>,
+    /// The compositor's millisecond timestamp; `None` for winit samples.
+    device_ms: Option<u32>,
+}
+
+/// Everything one run recorded.
+#[derive(Debug, Default)]
+struct Recording {
+    samples: Vec<Sample>,
+    /// Pad events from our backend (buttons, rings, strips, dials).
+    pads: usize,
+    /// Our samples over some other surface, left out.
+    elsewhere: usize,
+    /// Events our backend's queue dropped.
+    dropped: u64,
+    /// Why our backend didn't run or stopped badly, if it did.
+    note: Option<String>,
 }
 
 /// What the probe draws: stamped discs whose radius follows pressure.
@@ -94,16 +145,20 @@ fn span(centre: f64, radius: f64, len: usize) -> (usize, usize) {
 #[derive(Debug)]
 struct App {
     start: Instant,
-    done: mpsc::Sender<Result<Vec<Sample>>>,
+    done: mpsc::Sender<Result<Recording>>,
     surface: Option<Surface<OwnedDisplayHandle, Box<dyn Window>>>,
     canvas: Canvas,
+    /// winit's view of whether the tip is down.
     contact: bool,
     wakeup: u64,
-    samples: Vec<Sample>,
+    /// The window's scale factor, to put our logical positions in winit's physical pixels.
+    scale: f64,
+    backend: Option<ours::Ours>,
+    recording: Recording,
 }
 
 impl App {
-    fn new(done: mpsc::Sender<Result<Vec<Sample>>>) -> Self {
+    fn new(done: mpsc::Sender<Result<Recording>>) -> Self {
         Self {
             start: Instant::now(),
             done,
@@ -111,32 +166,103 @@ impl App {
             canvas: Canvas::new(0, 0),
             contact: false,
             wakeup: 0,
-            samples: Vec::new(),
+            scale: 1.0,
+            backend: None,
+            recording: Recording::default(),
         }
     }
 
-    /// Hands the recording (or the error that ended it) back to `main` and stops the loop.
+    /// Stops our backend, hands the recording (or the error that ended it) back to `main` and
+    /// stops the loop.
+    ///
+    /// The backend stops here, before the loop exits and the window is destroyed, as its docs
+    /// require.
     fn finish(&mut self, event_loop: &dyn ActiveEventLoop, result: Result<()>) {
-        let outcome = result.map(|()| std::mem::take(&mut self.samples));
+        self.drain();
+        if let Some(backend) = self.backend.take() {
+            self.recording.dropped = backend.dropped();
+            if let Err(e) = backend.stop() {
+                self.recording.note = Some(format!("our backend stopped with an error: {e}"));
+            }
+        }
+        let outcome = result.map(|()| std::mem::take(&mut self.recording));
         // `main` holds the receiver until the loop returns, so the send can't fail.
         drop(self.done.send(outcome));
         event_loop.exit();
     }
 
-    fn record(&mut self, x: f64, y: f64, data: TabletToolData) {
-        if self.contact {
-            let pressure = data.force.map_or(1.0, |f| f.normalized(None));
-            self.canvas.stamp(x, y, pressure.mul_add(MAX_RADIUS, 1.0));
+    /// Which source the canvas draws: ours when it runs, winit's otherwise.
+    const fn drawn(&self) -> Source {
+        if self.backend.is_some() {
+            Source::Ours
+        } else {
+            Source::Winit
         }
-        self.samples.push(Sample {
+    }
+
+    fn record(&mut self, sample: Sample) {
+        if sample.contact && sample.source == self.drawn() {
+            let pressure = sample.pressure.unwrap_or(1.0);
+            self.canvas
+                .stamp(sample.x, sample.y, pressure.mul_add(MAX_RADIUS, 1.0));
+            self.request_redraw();
+        }
+        self.recording.samples.push(sample);
+    }
+
+    fn winit_sample(&self, x: f64, y: f64, data: &TabletToolData) -> Sample {
+        Sample {
+            source: Source::Winit,
             received: self.start.elapsed(),
+            dejittered: None,
             wakeup: self.wakeup,
             x,
             y,
             contact: self.contact,
-            data,
-        });
-        self.request_redraw();
+            pressure: data.force.map(|f| f.normalized(None)),
+            tilt: data.tilt.map(|t| (f64::from(t.x), f64::from(t.y))),
+            distance: None,
+            roll: data.twist.map(f64::from),
+            phase: None,
+            device_ms: None,
+        }
+    }
+
+    fn our_sample(&self, s: &input::StrokeSample) -> Sample {
+        let since_start = |t: Instant| t.saturating_duration_since(self.start);
+        Sample {
+            source: Source::Ours,
+            received: since_start(s.received),
+            dejittered: s.phase.in_stroke().then(|| since_start(s.timestamp)),
+            wakeup: self.wakeup,
+            x: s.pos.x * self.scale,
+            y: s.pos.y * self.scale,
+            contact: s.phase.in_stroke(),
+            pressure: Some(f64::from(s.pressure.get())),
+            tilt: s.tilt.map(|t| (t.x(), t.y())),
+            distance: s.distance.map(|d| f64::from(d.get())),
+            roll: s.roll,
+            phase: Some(s.phase),
+            device_ms: Some(s.device_ms),
+        }
+    }
+
+    /// Records everything our backend has queued: samples over the probe window, and pad events.
+    fn drain(&mut self) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        let (events, surface) = (backend.drain(), backend.surface());
+        for event in events {
+            match event {
+                input::Event::Sample(s) if s.surface == surface => {
+                    let sample = self.our_sample(&s);
+                    self.record(sample);
+                }
+                input::Event::Sample(_) => self.recording.elsewhere += 1,
+                input::Event::Pad(_) => self.recording.pads += 1,
+            }
+        }
     }
 
     /// Copies the canvas to the window.
@@ -181,11 +307,12 @@ impl App {
             WindowEvent::CloseRequested => self.finish(event_loop, Ok(())),
             WindowEvent::RedrawRequested => self.redraw()?,
             WindowEvent::SurfaceResized(_) => self.request_redraw(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => self.scale = scale_factor,
             WindowEvent::PointerMoved {
                 position,
                 source: PointerSource::TabletTool { data, .. },
                 ..
-            } => self.record(position.x, position.y, data),
+            } => self.record(self.winit_sample(position.x, position.y, &data)),
             WindowEvent::PointerButton {
                 state,
                 position,
@@ -198,7 +325,7 @@ impl App {
                 ..
             } => {
                 self.contact = state == ElementState::Pressed;
-                self.record(position.x, position.y, data);
+                self.record(self.winit_sample(position.x, position.y, &data));
             }
             _ => {}
         }
@@ -223,6 +350,14 @@ impl ApplicationHandler for App {
             let window = event_loop.create_window(attributes)?;
             let context = Context::new(event_loop.owned_display_handle())
                 .map_err(|e| anyhow!("creating the softbuffer context: {e}"))?;
+            self.scale = window.scale_factor();
+            match ours::Ours::start(event_loop, window.as_ref()) {
+                Ok(backend) => self.backend = Some(backend),
+                Err(e) => {
+                    self.recording.note =
+                        Some(format!("our backend didn't start ({e}); winit only"));
+                }
+            }
             let surface =
                 Surface::new(&context, window).map_err(|e| anyhow!("creating the surface: {e}"))?;
             self.surface = Some(surface);
@@ -231,6 +366,10 @@ impl ApplicationHandler for App {
         if let Err(e) = result {
             self.finish(event_loop, Err(e));
         }
+    }
+
+    fn proxy_wake_up(&mut self, _: &dyn ActiveEventLoop) {
+        self.drain();
     }
 
     fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -251,12 +390,12 @@ fn main() -> Result<()> {
         .map_or_else(|| "pen-samples.csv".into(), PathBuf::from);
     let (done, outcome) = mpsc::channel();
     EventLoop::new()?.run_app(App::new(done))?;
-    let samples = outcome
+    let recording = outcome
         .recv()
         .context("the window closed without a recording")??;
-    report::write_csv(&samples, &output)?;
+    report::write_csv(&recording.samples, &output)?;
     let mut stdout = std::io::stdout().lock();
-    write!(stdout, "{}", report::summarise(&samples)?)?;
+    write!(stdout, "{}", report::summarise(&recording)?)?;
     writeln!(stdout, "csv: {}", output.display())?;
     Ok(())
 }

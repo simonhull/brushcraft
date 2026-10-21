@@ -760,6 +760,7 @@ name = "pen-probe"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "input",
  "softbuffer",
  "winit",
 ]

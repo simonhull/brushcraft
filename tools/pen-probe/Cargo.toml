@@ -11,5 +11,6 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+input.workspace = true
 softbuffer.workspace = true
 winit.workspace = true

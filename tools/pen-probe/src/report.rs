@@ -5,8 +5,9 @@ use std::fmt::{self, Write as _};
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
+use input::Phase;
 
-use crate::Sample;
+use crate::{Recording, Sample, Source};
 
 /// Intervals longer than this are breaks between strokes, not sample spacing.
 const STROKE_GAP_S: f64 = 0.1;
@@ -24,15 +25,19 @@ pub(crate) const fn to_f64(v: usize) -> f64 {
 enum Clock {
     /// When the application received each event.
     Receipt,
+    /// Our de-jitter filter's recovered sample times; only our in-stroke samples carry them.
+    Dejittered,
     /// A pen sampling at a steady period (seconds): the model a de-jitter filter fits.
     Steady(f64),
 }
 
 impl Clock {
-    fn step(self, a: &Sample, b: &Sample) -> f64 {
+    /// Seconds from `a` to `b` on this clock; `None` if either sample lacks it.
+    fn step(self, a: &Sample, b: &Sample) -> Option<f64> {
         match self {
-            Self::Receipt => b.received.saturating_sub(a.received).as_secs_f64(),
-            Self::Steady(period) => period,
+            Self::Receipt => Some(b.received.saturating_sub(a.received).as_secs_f64()),
+            Self::Dejittered => Some(b.dejittered?.saturating_sub(a.dejittered?).as_secs_f64()),
+            Self::Steady(period) => Some(period),
         }
     }
 }
@@ -47,31 +52,33 @@ pub(crate) fn write_csv(samples: &[Sample], path: &Path) -> Result<()> {
         v.map(|v| v.to_string()).unwrap_or_default()
     }
     let mut out = String::from(
-        "received_s,wakeup,x,y,contact,force,tilt_x,tilt_y,altitude,azimuth,twist,tangential\n",
+        "source,received_s,dejittered_s,wakeup,x,y,contact,pressure,tilt_x,tilt_y,distance,roll,\
+         phase,device_ms\n",
     );
     for s in samples {
-        let d = &s.data;
         writeln!(
             out,
-            "{:.6},{},{:.3},{:.3},{},{},{},{},{},{},{},{}",
+            "{},{:.6},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{}",
+            s.source.name(),
             s.received.as_secs_f64(),
+            opt(s.dejittered.map(|d| format!("{:.6}", d.as_secs_f64()))),
             s.wakeup,
             s.x,
             s.y,
             u8::from(s.contact),
-            opt(d.force.map(|f| format!("{:.6}", f.normalized(None)))),
-            opt(d.tilt.map(|t| t.x)),
-            opt(d.tilt.map(|t| t.y)),
-            opt(d.angle.map(|a| format!("{:.6}", a.altitude))),
-            opt(d.angle.map(|a| format!("{:.6}", a.azimuth))),
-            opt(d.twist),
-            opt(d.tangential_force),
+            opt(s.pressure.map(|p| format!("{p:.6}"))),
+            opt(s.tilt.map(|t| format!("{:.3}", t.0))),
+            opt(s.tilt.map(|t| format!("{:.3}", t.1))),
+            opt(s.distance.map(|d| format!("{d:.6}"))),
+            opt(s.roll.map(|r| format!("{r:.3}"))),
+            opt(s.phase.map(|p| format!("{p:?}"))),
+            opt(s.device_ms),
         )?;
     }
     std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))
 }
 
-/// In-contact samples grouped into strokes.
+/// In-contact samples grouped into strokes; `samples` must all come from one source.
 fn strokes(samples: &[Sample]) -> Vec<&[Sample]> {
     samples
         .chunk_by(|a, b| a.contact == b.contact)
@@ -86,10 +93,10 @@ fn steps<'a>(strokes: &[&'a [Sample]]) -> impl Iterator<Item = (&'a Sample, &'a 
         .flat_map(|stroke| stroke.iter().zip(stroke.iter().skip(1)))
 }
 
-/// Sorted receipt intervals between consecutive samples within strokes.
-fn intervals(strokes: &[&[Sample]]) -> Vec<f64> {
+/// Sorted intervals on `clock` between consecutive samples within strokes.
+fn intervals(strokes: &[&[Sample]], clock: Clock) -> Vec<f64> {
     let mut dts: Vec<f64> = steps(strokes)
-        .map(|(a, b)| Clock::Receipt.step(a, b))
+        .filter_map(|(a, b)| clock.step(a, b))
         .filter(|dt| *dt < STROKE_GAP_S)
         .collect();
     dts.sort_by(f64::total_cmp);
@@ -126,7 +133,7 @@ fn speed_noise(strokes: &[&[Sample]], clock: Clock) -> Option<f64> {
             .windows(2)
             .map(|pair| match pair {
                 [a, b] => {
-                    let dt = clock.step(a, b);
+                    let dt = clock.step(a, b)?;
                     let step = (b.x - a.x).hypot(b.y - a.y);
                     (dt > 0.0 && step >= MIN_STEP_PX).then(|| step / dt)
                 }
@@ -188,13 +195,18 @@ fn coverage(
     )
 }
 
-/// A human-readable summary of the recording.
+/// Speed noise on `clock`, formatted.
+fn noise(strokes: &[&[Sample]], clock: Clock) -> String {
+    speed_noise(strokes, clock).map_or_else(|| "n/a".to_owned(), |v| format!("{v:.1}%"))
+}
+
+/// Appends the block for one source's samples.
 ///
 /// # Errors
 ///
 /// Only if formatting fails, which writing to a `String` never does.
-pub(crate) fn summarise(samples: &[Sample]) -> Result<String, fmt::Error> {
-    let mut out = String::new();
+fn source_block(out: &mut String, source: Source, samples: &[Sample]) -> fmt::Result {
+    writeln!(out, "[{}]", source.name())?;
     let strokes = strokes(samples);
     let contact: usize = strokes.iter().map(|s| s.len()).sum();
     writeln!(
@@ -204,17 +216,31 @@ pub(crate) fn summarise(samples: &[Sample]) -> Result<String, fmt::Error> {
         strokes.len()
     )?;
 
-    let dts = intervals(&strokes);
-    timing(&mut out, "receipt clock", &dts)?;
-    let noise = |clock| {
-        speed_noise(&strokes, clock).map_or_else(|| "n/a".to_owned(), |v| format!("{v:.1}%"))
-    };
-    writeln!(
-        out,
-        "speed noise (median sample-to-sample change): receipt clock {}, steady period {}",
-        noise(Clock::Receipt),
-        noise(Clock::Steady(percentile(&dts, 0.5))),
-    )?;
+    let receipt = intervals(&strokes, Clock::Receipt);
+    timing(out, "receipt clock", &receipt)?;
+    let steady = Clock::Steady(percentile(&receipt, 0.5));
+    if source == Source::Ours {
+        timing(
+            out,
+            "de-jittered clock",
+            &intervals(&strokes, Clock::Dejittered),
+        )?;
+        writeln!(
+            out,
+            "speed noise (median sample-to-sample change): receipt {}, de-jittered {}, steady \
+             period {}",
+            noise(&strokes, Clock::Receipt),
+            noise(&strokes, Clock::Dejittered),
+            noise(&strokes, steady),
+        )?;
+    } else {
+        writeln!(
+            out,
+            "speed noise (median sample-to-sample change): receipt {}, steady period {}",
+            noise(&strokes, Clock::Receipt),
+            noise(&strokes, steady),
+        )?;
+    }
 
     let mut per_wakeup = BTreeMap::<u64, usize>::new();
     for sample in strokes.iter().flat_map(|s| s.iter()) {
@@ -229,22 +255,68 @@ pub(crate) fn summarise(samples: &[Sample]) -> Result<String, fmt::Error> {
     )?;
 
     let in_contact: Vec<Sample> = strokes.iter().flat_map(|s| s.iter()).cloned().collect();
-    coverage(&mut out, "pressure", &in_contact, |s| {
-        s.data.force.map(|f| format!("{:.6}", f.normalized(None)))
+    coverage(out, "pressure", &in_contact, |s| {
+        s.pressure.map(|p| format!("{p:.6}"))
     })?;
-    coverage(&mut out, "tilt", samples, |s| {
-        s.data.tilt.map(|t| format!("{},{}", t.x, t.y))
+    coverage(out, "tilt", samples, |s| {
+        s.tilt.map(|(x, y)| format!("{x:.3},{y:.3}"))
     })?;
-    coverage(&mut out, "angle", samples, |s| {
-        s.data
-            .angle
-            .map(|a| format!("{:.6},{:.6}", a.altitude, a.azimuth))
+    coverage(out, "distance", samples, |s| {
+        s.distance.map(|d| format!("{d:.6}"))
     })?;
-    coverage(&mut out, "twist", samples, |s| {
-        s.data.twist.map(|v| v.to_string())
-    })?;
-    coverage(&mut out, "tangential", samples, |s| {
-        s.data.tangential_force.map(|v| v.to_string())
-    })?;
+    coverage(out, "roll", samples, |s| s.roll.map(|r| format!("{r:.3}")))?;
+
+    if source == Source::Ours {
+        let mut phases = BTreeMap::<String, usize>::new();
+        for phase in samples.iter().filter_map(|s| s.phase) {
+            *phases.entry(phase_name(phase).to_owned()).or_default() += 1;
+        }
+        let phases: Vec<String> = phases.iter().map(|(p, n)| format!("{p} {n}")).collect();
+        writeln!(out, "phases: {}", phases.join(", "))?;
+    }
+    Ok(())
+}
+
+const fn phase_name(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Enter => "enter",
+        Phase::Hover => "hover",
+        Phase::Down => "down",
+        Phase::Drag => "drag",
+        Phase::Up => "up",
+        Phase::Leave => "leave",
+    }
+}
+
+/// A human-readable summary of the recording: a block per source.
+///
+/// # Errors
+///
+/// Only if formatting fails, which writing to a `String` never does.
+pub(crate) fn summarise(recording: &Recording) -> Result<String, fmt::Error> {
+    let mut out = String::new();
+    if let Some(note) = &recording.note {
+        writeln!(out, "note: {note}")?;
+    }
+    for source in Source::ALL {
+        let samples: Vec<Sample> = recording
+            .samples
+            .iter()
+            .filter(|s| s.source == source)
+            .cloned()
+            .collect();
+        let ran = source == Source::Ours && (recording.pads > 0 || recording.dropped > 0);
+        if samples.is_empty() && !ran {
+            continue;
+        }
+        source_block(&mut out, source, &samples)?;
+        if source == Source::Ours {
+            writeln!(
+                out,
+                "pad events: {}; dropped: {}; samples over other surfaces: {}",
+                recording.pads, recording.dropped, recording.elsewhere
+            )?;
+        }
+    }
     Ok(out)
 }
