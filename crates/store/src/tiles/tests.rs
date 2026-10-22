@@ -25,7 +25,7 @@ mod recovery;
 const EVAL: usize = size_of::<EvaluatedSlot>();
 
 /// The finest level the tests evaluate.
-const TOP: u8 = 8;
+pub(crate) const TOP: u8 = 8;
 
 /// The site the tests' ops carry.
 const SITE: u16 = 3;
@@ -61,7 +61,7 @@ impl Rng {
 
 /// One `set_correction` call.
 #[derive(Debug, Clone, Copy)]
-struct Edit {
+pub(crate) struct Edit {
     face: FaceId,
     level: Level,
     i: u32,
@@ -74,7 +74,7 @@ fn level(n: u8) -> Level {
 }
 
 /// The benchmark's sphere at its smallest: a cube, 6 faces.
-fn mesh() -> Arc<BaseMesh> {
+pub(crate) fn mesh() -> Arc<BaseMesh> {
     Arc::new(cube_sphere(1).unwrap())
 }
 
@@ -88,7 +88,7 @@ fn config(chunks: usize, chunk_slots: usize) -> StoreConfig {
 }
 
 /// Room for every tile of levels 1–8 of the cube, twice over.
-fn roomy() -> StoreConfig {
+pub(crate) fn roomy() -> StoreConfig {
     config(40, 16)
 }
 
@@ -98,7 +98,7 @@ fn roomy() -> StoreConfig {
 /// are written back. It is the cube's minimum budget rounded up to whole chunks: an evaluation
 /// pins at most two cone levels of nine tiles, which take five evaluated chunks, and one
 /// correction chunk goes beside them.
-fn tight() -> StoreConfig {
+pub(crate) fn tight() -> StoreConfig {
     config(6, 4)
 }
 
@@ -114,11 +114,11 @@ fn pinning() -> StoreConfig {
 /// A store over a new working file `name` in `dir`.
 fn new_store(dir: &TestDir, name: &str, mesh: &Arc<BaseMesh>, config: StoreConfig) -> TileStore {
     let file = ProjectFile::create(&dir.path(name), meta_for(mesh), Arc::clone(mesh)).unwrap();
-    TileStore::open(file, None, config).unwrap()
+    TileStore::open(file, config).unwrap()
 }
 
 /// Every tile of levels `from..=to`, coarse levels first.
-fn tiles(mesh: &BaseMesh, from: u8, to: u8) -> Vec<TileKey> {
+pub(crate) fn tiles(mesh: &BaseMesh, from: u8, to: u8) -> Vec<TileKey> {
     (from..=to)
         .flat_map(|l| {
             let level = level(l);
@@ -134,7 +134,7 @@ fn tiles(mesh: &BaseMesh, from: u8, to: u8) -> Vec<TileKey> {
 
 /// `count` random edits at levels `1..=top`, half of them on face or tile borders, where twins
 /// must stay equal.
-fn random_edits(mesh: &BaseMesh, top: u8, count: u32, seed: u64) -> Vec<Edit> {
+pub(crate) fn random_edits(mesh: &BaseMesh, top: u8, count: u32, seed: u64) -> Vec<Edit> {
     let mut rng = Rng(seed);
     (0..count)
         .map(|_| {
@@ -163,7 +163,7 @@ fn random_edits(mesh: &BaseMesh, top: u8, count: u32, seed: u64) -> Vec<Edit> {
 }
 
 /// Applies `edits` to the store (each with a fresh op) and to the oracle's map.
-fn apply(store: &mut TileStore, map: &mut CorrectionMap, edits: &[Edit]) {
+pub(crate) fn apply(store: &mut TileStore, map: &mut CorrectionMap, edits: &[Edit]) {
     for e in edits {
         let op = store.next_op().unwrap();
         store
@@ -175,7 +175,7 @@ fn apply(store: &mut TileStore, map: &mut CorrectionMap, edits: &[Edit]) {
 }
 
 /// The oracle: every level up to [`TOP`], evaluated densely.
-fn dense(mesh: &BaseMesh, map: &CorrectionMap) -> DenseEvaluation {
+pub(crate) fn dense(mesh: &BaseMesh, map: &CorrectionMap) -> DenseEvaluation {
     DenseEvaluation::new(mesh, level(TOP), map).unwrap()
 }
 
@@ -198,7 +198,12 @@ fn assert_tile(got: &[Vec3], want: impl Fn(u32, u32) -> Vec3, key: &TileKey, wha
 }
 
 /// Asserts that the store evaluates every tile of `keys` as the dense evaluation does.
-fn assert_positions(store: &mut TileStore, dense: &DenseEvaluation, keys: &[TileKey], what: &str) {
+pub(crate) fn assert_positions(
+    store: &mut TileStore,
+    dense: &DenseEvaluation,
+    keys: &[TileKey],
+    what: &str,
+) {
     for key in keys {
         let got = store.evaluate(*key).unwrap();
         let grid = dense.grid(key.face(), key.level()).unwrap();
@@ -483,7 +488,7 @@ fn sparse_on_disk_equals_explicit_zero() {
     let mut sparse = new_store(&dir, "sparse.bcp", &mesh, roomy());
     apply(&mut sparse, &mut map, &edits);
     sparse.save().unwrap();
-    let mut explicit = TileStore::open(explicit, None, tight()).unwrap();
+    let mut explicit = TileStore::open(explicit, tight()).unwrap();
     apply(&mut explicit, &mut CorrectionMap::new(), &edits);
     explicit.save().unwrap();
     assert_eq!(
@@ -525,7 +530,6 @@ fn save_reopen_evaluate() {
     let last_op = {
         let mut store = TileStore::open(
             ProjectFile::create(&path, meta_for(&mesh), Arc::clone(&mesh)).unwrap(),
-            None,
             tight(),
         )
         .unwrap();
@@ -548,7 +552,7 @@ fn save_reopen_evaluate() {
         store.next_op().unwrap()
     };
     let file = ProjectFile::open(&path).unwrap();
-    let mut store = TileStore::open(file, None, roomy()).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
     assert_eq!(
         store.next_op().unwrap(),
         last_op,
@@ -983,7 +987,7 @@ fn bad_requests_are_refused() {
     };
     assert!(
         matches!(
-            TileStore::open(file, None, reserved),
+            TileStore::open(file, reserved),
             Err(CacheError::ReservedSite)
         ),
         "reserved site"
@@ -1107,7 +1111,7 @@ fn a_budget_below_the_minimum_is_refused() {
         budget_bytes: minimum - 1,
         ..tight()
     };
-    let refused = TileStore::open(file, None, small);
+    let refused = TileStore::open(file, small);
     assert!(
         matches!(refused, Err(CacheError::BudgetTooSmall { minimum: m }) if m == minimum),
         "refused: {refused:?}"
@@ -1321,7 +1325,6 @@ fn a_failed_write_back_is_reported_and_keeps_the_tile() {
     let saved = {
         let mut store = TileStore::open(
             ProjectFile::create(&path, meta_for(&mesh), Arc::clone(&mesh)).unwrap(),
-            None,
             roomy(),
         )
         .unwrap();
@@ -1335,7 +1338,7 @@ fn a_failed_write_back_is_reported_and_keeps_the_tile() {
     // Opened at a save point, the file is read-only: edits stay in their slots, and writing
     // them back fails.
     let file = ProjectFile::open_at(&path, saved).unwrap();
-    let mut store = TileStore::open(file, None, roomy()).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
     let edit = random_edits(&mesh, 3, 1, 21);
     apply(&mut store, &mut CorrectionMap::new(), &edit);
     let dirty: Vec<TileKey> = store.unsaved.keys().copied().collect();

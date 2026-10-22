@@ -91,7 +91,7 @@ fn a_huge_stated_size_is_rejected_without_allocating() {
 }
 
 #[test]
-fn a_huge_unsaved_record_is_skipped_on_replay() {
+fn a_huge_stated_size_never_stops_recovery() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
     let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
@@ -103,15 +103,21 @@ fn a_huge_unsaved_record_is_skipped_on_replay() {
     payload[at..at + 4].copy_from_slice(&(1u32 << 30).to_le_bytes());
     f.append_raw(KIND_TILE, &payload).unwrap();
     f.write_displacement(key(3), op(3), &tile(3.0)).unwrap();
+    let saved = f.len();
+    // Before a save point, the record is stepped over; after the last one, it is discarded
+    // with the rest of the tail, and the walk over the tail steps over it too.
+    f.save().unwrap();
     let len = f.len();
+    f.append_raw(KIND_TILE, &payload).unwrap();
     drop(f);
+    assert!(saved < len, "the save point follows the record");
     let opened = ProjectFile::open(&path).unwrap();
     assert_eq!(
         opened.keys().copied().collect::<Vec<_>>(),
         vec![key(1), key(3)],
-        "skipped, and replay goes on"
+        "skipped, and recovery reaches the save point after it"
     );
-    assert_eq!(opened.len(), len, "nothing cut off");
+    assert_eq!(opened.len(), len, "the record after the save point cut off");
 }
 
 #[test]
@@ -379,8 +385,9 @@ fn a_damaged_middle_save_point_fails_open_and_earlier_ones_still_open() {
 fn a_damaged_last_save_point_is_cut_off_with_the_tail() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let (_, [_, _, s3]) = three(&path);
+    let (_, [_, s2, s3]) = three(&path);
     let mut f = ProjectFile::open(&path).unwrap();
+    let after_s2 = s2 + u64::try_from(HEAD + TAIL).unwrap() + f.index_len(s2).unwrap();
     f.write_displacement(key(9), op(50), &tile(2.0)).unwrap();
     drop(f);
     let mut bad = std::fs::read(&path).unwrap();
@@ -389,13 +396,13 @@ fn a_damaged_last_save_point_is_cut_off_with_the_tail() {
     let opened = ProjectFile::open(&path).unwrap();
     assert_eq!(
         state(&opened),
-        [(key(1), op(1)), (key(2), op(2)), (key(3), op(3))],
-        "S2 plus the tile S3 named, replayed"
+        [(key(1), op(1)), (key(2), op(2))],
+        "S2's state: the tile S3 named came after S2, and is discarded with it"
     );
     assert_eq!(
         std::fs::metadata(&path).unwrap().len(),
-        s3,
-        "no save point follows S3, so it and the unsaved tile are a torn tail"
+        after_s2,
+        "no save point follows S2: S3's tile, S3 and the unsaved tile are a torn tail"
     );
 }
 
@@ -579,21 +586,24 @@ fn an_entry_naming_another_keys_record_is_damage() {
 }
 
 #[test]
-fn an_unknown_record_kind_at_the_very_end_is_kept() {
+fn an_unknown_record_kind_after_the_last_save_point_is_discarded() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    three(&path);
+    let (good, _) = three(&path);
     let mut f = ProjectFile::open(&path).unwrap();
     f.append_raw(9, b"from a newer version").unwrap();
     drop(f);
-    let bytes = std::fs::read(&path).unwrap();
     let opened = ProjectFile::open(&path).unwrap();
     assert_eq!(
         state(&opened),
         [(key(1), op(1)), (key(2), op(2)), (key(3), op(3))],
-        "skipped"
+        "the last save point's state"
     );
-    assert_eq!(std::fs::read(&path).unwrap(), bytes, "not cut off");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        good,
+        "nothing after a save point survives an open, whatever its kind"
+    );
 }
 
 #[test]
@@ -753,7 +763,7 @@ fn a_writer_that_opened_before_an_in_place_compaction_writes_to_the_new_file() {
         old_inode,
         "the replaced file was let go"
     );
-    let mut f = ProjectFile::open_latest(file, Repair::Truncate).unwrap();
+    let mut f = ProjectFile::open_latest(file, Repair::Truncate, None).unwrap();
     f.write_displacement(key(9), op(9), &tile(9.0)).unwrap();
     f.save().unwrap();
     drop(f);
@@ -875,11 +885,11 @@ fn an_empty_first_save_is_a_parent() {
 /// A file's header and leading records with `meta`, and a `Mesh` record holding `raw` (canonical
 /// mesh bytes, compressed) under a stated size of `stated`: for files whose leading records lie.
 fn leading(meta: &Meta, raw: &[u8], stated: u32) -> Vec<u8> {
-    let good = leading_bytes(&crate::fixture::meta(), &mesh()).unwrap();
+    let header = leading_bytes(&crate::fixture::meta(), &[]).unwrap();
     let mut payload = stated.to_le_bytes().to_vec();
     payload.extend_from_slice(&compress(raw).unwrap());
     [
-        &good[..HEADER_LEN],
+        &header[..HEADER_LEN],
         &frame(KIND_META, &meta.to_payload()).unwrap(),
         &frame(KIND_MESH, &payload).unwrap(),
     ]

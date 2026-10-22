@@ -65,7 +65,7 @@ impl Stroke {
             site: 1,
         };
         config.budget_bytes = config.minimum_budget(&mesh).max(64 << 20);
-        let mut store = TileStore::open(file, None, config).expect("store");
+        let mut store = TileStore::open(file, config).expect("store");
         let mut writer = RecoveryWriter::new(&mut store).expect("writer");
         // Flush the empty start, so the measured call is a stroke end like any other.
         writer.finish(&mut store, Instant::now()).expect("flush");

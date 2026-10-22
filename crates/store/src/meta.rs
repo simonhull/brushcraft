@@ -110,6 +110,20 @@ impl Meta {
         }
     }
 
+    /// This meta with another role: the same project and mesh, so the mesh isn't hashed again.
+    /// A recovery file's meta is its project file's, with the save point it extends.
+    #[must_use]
+    pub const fn with_role(self, role: Role) -> Self {
+        Self { role, ..self }
+    }
+
+    /// This meta with another project id, over the same mesh: a project saved as a new
+    /// project keeps its mesh and gets an id of its own.
+    #[must_use]
+    pub(crate) const fn with_project(self, project: ProjectId) -> Self {
+        Self { project, ..self }
+    }
+
     /// The project the file belongs to.
     #[must_use]
     pub const fn project(&self) -> ProjectId {
@@ -270,6 +284,31 @@ mod tests {
             let long = [payload.as_slice(), &[0]].concat();
             assert_eq!(Meta::from_payload(&long), None, "{role:?}: a trailing byte");
         }
+    }
+
+    #[test]
+    fn a_new_role_or_project_keeps_the_mesh_hash() {
+        let mesh = geom::cube_sphere(2).unwrap();
+        let project = ProjectId::from_bits(9);
+        let meta = Meta::new(project, Role::Project, &mesh);
+        let role = Role::Recovery {
+            base: Some(SavePoint {
+                project,
+                offset: 512,
+                head: Some(op(3)),
+            }),
+        };
+        assert_eq!(
+            meta.with_role(role),
+            Meta::new(project, role, &mesh),
+            "as if made with the role"
+        );
+        let other = ProjectId::from_bits(10);
+        assert_eq!(
+            meta.with_project(other),
+            Meta::new(other, Role::Project, &mesh),
+            "as if made for the other project"
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ mod tiles;
 pub use codec::CodecError;
 pub use feed::{ChangeFeed, ConsumerId};
 pub use file::{
-    BaseFile, MAX_MESH_RAW, MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place,
+    MAX_MESH_RAW, MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place,
 };
 pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};

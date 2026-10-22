@@ -18,7 +18,7 @@ fn settle(writer: &mut RecoveryWriter, store: &mut TileStore) {
 /// tile of levels 1–[`TOP`] as the dense evaluation of `map` does.
 fn assert_save_point(path: &std::path::Path, offset: u64, mesh: &BaseMesh, map: &CorrectionMap) {
     let file = ProjectFile::open_at(path, offset).unwrap();
-    let mut store = TileStore::open(file, None, roomy()).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
     let what = format!("save point {offset}");
     assert_positions(&mut store, &dense(mesh, map), &tiles(mesh, 1, TOP), &what);
 }
@@ -308,12 +308,22 @@ fn dropping_the_writer_mid_flush_joins_promptly_and_the_file_reopens() {
             );
             drop(store);
             assert_save_point(&path, durable, &mesh, &saved);
-            // The latest state opens too: the save point, and whole records after it.
+            // The latest state is the last save point in the file, and nothing after it: the
+            // flush's records are discarded unless its save point was written (its sync was
+            // in flight, but the page cache has it).
+            let latest = if phase == "syncing save point" {
+                &later
+            } else {
+                &saved
+            };
             let file = ProjectFile::open(&path).unwrap();
-            let mut reopened = TileStore::open(file, None, roomy()).unwrap();
-            for key in tiles(&mesh, 1, TOP) {
-                reopened.evaluate(key).unwrap();
-            }
+            let mut reopened = TileStore::open(file, roomy()).unwrap();
+            assert_positions(
+                &mut reopened,
+                &dense(&mesh, latest),
+                &tiles(&mesh, 1, TOP),
+                &format!("{phase}: the latest save point"),
+            );
         }
         done.send(()).unwrap();
     });

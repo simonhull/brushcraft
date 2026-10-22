@@ -60,7 +60,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 #[cfg(test)]
 use std::io;
@@ -77,6 +77,7 @@ use thiserror::Error;
 use crate::deps::DepGraph;
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
+use crate::meta::{Meta, Role, SavePoint};
 use crate::op::{OpId, RESERVED_SITE};
 use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotId};
 use crate::prefetch::{Fetched, Job, Prefetcher, Source};
@@ -180,6 +181,10 @@ pub enum CacheError {
     /// on [`TileStore::save`]. The tile stays resident and dirty.
     #[error("writing a dirty correction tile back failed")]
     WriteBack(#[source] StoreError),
+    /// Writing the project file during a save failed: a tile, or the save point. The store is
+    /// unchanged (its working file still holds every edit), and the save can be tried again.
+    #[error("writing the project file during a save failed")]
+    Save(#[source] StoreError),
     /// Evaluation failed (not for a valid mesh).
     #[error("evaluation failed")]
     Eval(#[from] EvalError),
@@ -193,10 +198,20 @@ pub enum CacheError {
     /// The configured site is [`RESERVED_SITE`].
     #[error("site {RESERVED_SITE} is reserved")]
     ReservedSite,
-    /// The working file and the base under it (or the store and a file given to
-    /// [`TileStore::rebase`]) are over different base meshes: their meta's mesh hashes differ.
+    /// The working file and the base under it (or the store and a file given to a rebase or a
+    /// save) are over different base meshes: their meta's mesh hashes differ.
     #[error("the working file and its base are over different meshes")]
     MeshMismatch,
+    /// The working file isn't one that may be layered on the base given: a recovery file must
+    /// name, in its meta, the project and the save point (offset and head op) of its base, and
+    /// a file with no base must be a project file or a recovery file of a project never saved.
+    /// Or a save was asked to write into a file that isn't a project file.
+    #[error("the working file doesn't belong on this base")]
+    WrongBase,
+    /// A rebase was given a save that is out of date: the store was edited after the save was
+    /// made, so the save doesn't hold every edit. Save again.
+    #[error("the store was edited after the save it was to be rebased on")]
+    StaleSave,
     /// The configured budget is below [`StoreConfig::minimum_budget`] for the mesh.
     #[error("the budget is below the {minimum} bytes this mesh needs")]
     BudgetTooSmall {
@@ -247,10 +262,17 @@ pub enum Invariant {
     /// A dirty slot was to be freed without being written back.
     #[error("a dirty slot was to be freed")]
     FreedDirty,
-    /// [`TileStore::rebase`] found dirty correction tiles: edits not in the save it was to be
-    /// rebased on.
-    #[error("{0} dirty correction tiles at a rebase")]
-    DirtyAtRebase(usize),
+    /// A rebase found a tile the store could read (in its working file or its base) that the
+    /// save it was to be rebased on doesn't hold.
+    #[error("{0:?} is not in the save a rebase was given")]
+    NotInSave(TileKey),
+    /// A save found a tile edited since the last rebase that is neither dirty nor in the
+    /// working file: its edit is nowhere to copy from.
+    #[error("edited tile {0:?} is neither dirty nor in the working file")]
+    NothingToSave(TileKey),
+    /// A project file had no save point right after a save wrote one.
+    #[error("a project file had no save point after a save")]
+    NotSaved,
     /// A correction tile was located in a base the store doesn't have.
     #[error("a tile was located in a missing base")]
     MissingBase,
@@ -443,9 +465,12 @@ pub struct TileStore {
     /// The op of the latest edit of each dirty correction slot: the op its record is written
     /// with, by write-back or [`TileStore::save`].
     unsaved: HashMap<TileKey, OpId>,
-    /// Keys drained from the feed that [`TileStore::save`] hasn't written yet (left by a save
-    /// that failed part-way, so the next one finishes them).
-    to_save: VecDeque<TileKey>,
+    /// Every tile edited since the last rebase (or since the store opened), drained from the
+    /// feed by save's consumer: what the next save copies into the project file.
+    since_rebase: BTreeSet<TileKey>,
+    /// Counts the store's edits (every write a correction slot takes): a save records it, and
+    /// a rebase refuses a save made before the latest edit.
+    epoch: u64,
     /// The change feed: every key an edit changed, with its op.
     feed: ChangeFeed,
     /// Save's place in the feed.
@@ -629,21 +654,101 @@ pub(crate) struct Snapshot {
     pub(crate) slot: Box<CorrectionSlot>,
 }
 
+/// Proof that a save copied every tile edited since the last rebase into a project file, made
+/// only by [`TileStore::save_into`] and taken by [`TileStore::rebase`].
+///
+/// It holds the project file's new save point, as the base to rebase on, and the store's edit
+/// count when the save was made: a rebase refuses it if the store has been edited since, as
+/// those edits are in no save. There is no other way to make one, so a store can't be rebased
+/// past edits that were never saved.
+#[derive(Debug)]
+pub(crate) struct Saved {
+    /// The project file as of the save point the save wrote.
+    base: BaseFile,
+    /// The store's edit count when the save was made.
+    epoch: u64,
+}
+
+impl Saved {
+    /// The save point the save wrote: what the fresh working file to rebase on must name.
+    pub(crate) const fn save_point(&self) -> SavePoint {
+        self.base.save_point()
+    }
+}
+
+/// Checks that a working file with `working`'s meta may be layered on `base`.
+///
+/// Over a base, the working file must be a recovery file of the base's project naming the
+/// base's save point exactly: its project, its offset and its head op. A recovery file of an
+/// earlier or later save, or of another project, would be read through the wrong saved state.
+/// The base itself must be a project file. With no base, the working file must be a project
+/// file, or a recovery file of a project never saved; a recovery file that names a save point
+/// would be missing the state it extends.
+///
+/// # Errors
+///
+/// [`CacheError::WrongBase`].
+fn check_layers(working: &Meta, base: Option<&BaseFile>) -> Result<(), CacheError> {
+    let fits = match base {
+        None => matches!(
+            working.role(),
+            Role::Project | Role::Recovery { base: None }
+        ),
+        Some(base) => {
+            let point = base.save_point();
+            base.meta().role() == Role::Project
+                && working.project() == point.project
+                && working.role() == Role::Recovery { base: Some(point) }
+        }
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err(CacheError::WrongBase)
+    }
+}
+
 impl TileStore {
+    /// A store over `working`, the file it writes, with no base under it: a project file read
+    /// and written directly, or the recovery file of a project never saved, which holds all of
+    /// its work. The base mesh is the working file's.
+    ///
+    /// A project with a save is opened over its save point through [`crate::Project`], which
+    /// layers a recovery file on it.
+    ///
+    /// The op generator starts after the working file's newest head op of `config.site`, else
+    /// at sequence 0 of the site, so the store's edits are newer than everything it reads.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::ReservedSite`]; [`CacheError::WrongBase`] if `working` is a recovery file
+    /// that names a save point (it needs that save point under it);
+    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`];
+    /// [`CacheError::OpsExhausted`] if the file's head is the site's last op id;
+    /// [`CacheError::Store`] if the read buffers can't be made.
+    pub fn open(working: ProjectFile, config: StoreConfig) -> Result<Self, CacheError> {
+        Self::open_layered(working, None, config)
+    }
+
     /// A store over `working`, the file it writes, and `base`, the project file as of its last
     /// save, read where `working` has no record (`None` for a project never saved). The base
     /// mesh is the working file's.
     ///
-    /// The op generator starts after the newest head op of `config.site` in either file, else at
-    /// sequence 0 of the site, so the store's edits are newer than everything it reads.
+    /// The files must belong together (see [`check_layers`]): over a base, `working` is a
+    /// recovery file whose meta names the base's project and save point, offset and head op.
+    ///
+    /// The op generator starts after the newest head op of `config.site` in either file (all of
+    /// the base's file, records after its save point included), else at sequence 0 of the site,
+    /// so the store's edits are newer than everything it reads or might copy.
     ///
     /// # Errors
     ///
     /// [`CacheError::ReservedSite`]; [`CacheError::MeshMismatch`] if the base's mesh hash isn't
-    /// the working file's; [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`];
+    /// the working file's; [`CacheError::WrongBase`] if the files don't belong together;
+    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`];
     /// [`CacheError::OpsExhausted`] if a file's head is the site's last op id;
     /// [`CacheError::Store`] if the read buffers can't be made.
-    pub fn open(
+    pub(crate) fn open_layered(
         working: ProjectFile,
         base: Option<BaseFile>,
         config: StoreConfig,
@@ -654,10 +759,11 @@ impl TileStore {
         let mesh_hash = working.meta().mesh_hash();
         if base
             .as_ref()
-            .is_some_and(|base| base.mesh_hash() != mesh_hash)
+            .is_some_and(|base| base.meta().mesh_hash() != mesh_hash)
         {
             return Err(CacheError::MeshMismatch);
         }
+        check_layers(working.meta(), base.as_ref())?;
         let mesh = working.mesh();
         let headroom = Headroom::of(&mesh);
         let minimum = headroom.minimum_budget(config.chunk_bytes);
@@ -682,7 +788,8 @@ impl TileStore {
             evaluated: Pool::with_eviction_log(config.chunk_bytes),
             deps: DepGraph::new(),
             unsaved: HashMap::new(),
-            to_save: VecDeque::new(),
+            since_rebase: BTreeSet::new(),
+            epoch: 0,
             feed,
             save_consumer,
             streams: HashMap::new(),
@@ -699,34 +806,114 @@ impl TileStore {
         })
     }
 
-    /// Swaps in `base`, the project file's new save point, and `working`, a fresh working file
-    /// over it, after the project file has been saved; returns the working file it replaces.
+    /// Copies every tile edited since the last rebase (or since the store opened) into
+    /// `project`, saves it, and returns the proof a rebase needs: the new save point as a base,
+    /// and the store's edit count.
     ///
-    /// Every tile changed since the last save must be in the new save point: the old working
-    /// file's records are no longer read. Resident correction tiles are kept, as they are what
-    /// was just saved, and so are cached evaluations, which stay valid: nothing they read has
-    /// changed. Prefetches in flight are dropped (their workers stop and are joined), and later
-    /// ones read the new files. The op generator continues, past the base's head if that is
-    /// newer.
+    /// Each tile is copied from where its latest edit is: a dirty slot is encoded and written
+    /// with the op of its latest edit, else the working file's record is copied as it is,
+    /// keeping its original op. Save's consumer of the change feed is drained first; the tiles
+    /// it lists stay listed until a rebase, so a save that fails, or one followed by more edits,
+    /// is simply made again. Nothing in the store changes: dirty slots stay dirty until the
+    /// rebase, which is what makes the save's copies the saved state.
+    ///
+    /// A project being saved under a new name has its old save point copied in first (see
+    /// [`ProjectFile::copy_base`]); this adds the edits.
     ///
     /// # Errors
     ///
+    /// [`CacheError::WrongBase`] if `project` isn't a project file; [`CacheError::MeshMismatch`]
+    /// if it is over another mesh; [`CacheError::Save`] if a write to it, a read of the working
+    /// file, or its save point fails; [`CacheError::Internal`] for a broken slot, or an edited
+    /// tile that is nowhere to copy from.
+    pub(crate) fn save_into(&mut self, project: &mut ProjectFile) -> Result<Saved, CacheError> {
+        self.sync_pins()?;
+        if project.meta().role() != Role::Project {
+            return Err(CacheError::WrongBase);
+        }
+        if project.meta().mesh_hash() != self.mesh_hash {
+            return Err(CacheError::MeshMismatch);
+        }
+        self.drain_saves();
+        for key in &self.since_rebase {
+            let dirty = self
+                .corrections
+                .find(key)
+                .filter(|&id| self.corrections.is_dirty(id) == Some(true));
+            if let Some(id) = dirty {
+                let op = self
+                    .unsaved
+                    .get(key)
+                    .copied()
+                    .ok_or(Invariant::MissingOp(*key))?;
+                let slot = self.corrections.get(id).ok_or(Invariant::StaleHandle)?;
+                let tile = slot.to_tile().map_err(Invariant::CorrectionSlot)?;
+                project
+                    .write_displacement(*key, op, &tile)
+                    .map_err(CacheError::Save)?;
+            } else if !project
+                .copy_tile(&self.file, key)
+                .map_err(CacheError::Save)?
+            {
+                return Err(Invariant::NothingToSave(*key).into());
+            }
+        }
+        project.save().map_err(CacheError::Save)?;
+        let base = project
+            .base()
+            .map_err(CacheError::Save)?
+            .ok_or(Invariant::NotSaved)?;
+        Ok(Saved {
+            base,
+            epoch: self.epoch,
+        })
+    }
+
+    /// Swaps in the save point `saved` proves, as the base, and `working`, a fresh working file
+    /// over it; returns the working file it replaces.
+    ///
+    /// `saved` must be current: made by [`TileStore::save_into`] with no edit since. Then every
+    /// tile edited since the last rebase is in the new save point, and the old working file's
+    /// records are no longer needed. That is checked, not assumed: every tile of the old
+    /// working file and of the old base must be in the new save point. Dirty slots are clean
+    /// after the rebase (the save wrote them), and every other resident correction tile is kept,
+    /// as it is what was just saved; so are cached evaluations, which stay valid: nothing they
+    /// read has changed. Prefetches in flight are dropped (their workers stop and are joined),
+    /// and later ones read the new files. The op generator continues, past the base's head if
+    /// that is newer.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::StaleSave`] if the store was edited after `saved` was made;
     /// [`CacheError::MeshMismatch`] if either file isn't over the store's mesh;
-    /// [`CacheError::Internal`] with [`Invariant::DirtyAtRebase`] if a correction tile is dirty
-    /// (an edit the save missed: a bug in the caller); [`CacheError::OpsExhausted`] if the base's
+    /// [`CacheError::WrongBase`] if `working` isn't a recovery file naming `saved`'s save point;
+    /// [`CacheError::Internal`] with [`Invariant::NotInSave`] if a tile the store could read is
+    /// missing from the save (a bug in the save); [`CacheError::OpsExhausted`] if the base's
     /// head is the site's last op id. The store is unchanged then, and the files are dropped.
-    pub fn rebase(
+    pub(crate) fn rebase(
         &mut self,
-        base: BaseFile,
+        saved: Saved,
         working: ProjectFile,
     ) -> Result<ProjectFile, CacheError> {
         self.sync_pins()?;
-        if base.mesh_hash() != self.mesh_hash || working.meta().mesh_hash() != self.mesh_hash {
+        let Saved { base, epoch } = saved;
+        if epoch != self.epoch {
+            return Err(CacheError::StaleSave);
+        }
+        if base.meta().mesh_hash() != self.mesh_hash || working.meta().mesh_hash() != self.mesh_hash
+        {
             return Err(CacheError::MeshMismatch);
         }
-        // Every dirty slot has an op to be written with, so no op means no dirty slot.
-        if !self.unsaved.is_empty() {
-            return Err(Invariant::DirtyAtRebase(self.unsaved.len()).into());
+        check_layers(working.meta(), Some(&base))?;
+        let old_base = self.base.iter().flat_map(BaseFile::keys);
+        if let Some(missing) = self
+            .file
+            .keys()
+            .chain(old_base)
+            .chain(&self.since_rebase)
+            .find(|key| !base.contains(key))
+        {
+            return Err(Invariant::NotInSave(*missing).into());
         }
         let next_op = match self.next_op {
             Some(op) => {
@@ -735,11 +922,44 @@ impl TileStore {
             }
             None => None,
         };
+        // The save wrote every dirty slot as it is now (no edit since), so none is unsaved.
+        let dirty: Vec<TileKey> = self.unsaved.keys().copied().collect();
+        for key in dirty {
+            if let Some(id) = self.corrections.find(&key) {
+                self.corrections.set_dirty(id, false)?;
+            }
+        }
+        self.unsaved.clear();
+        self.since_rebase.clear();
         // The old workers read the old files; dropping them joins them and drops their results.
         self.prefetch = Prefetcher::new();
         self.next_op = next_op;
         self.base = Some(base);
         Ok(std::mem::replace(&mut self.file, working))
+    }
+
+    /// Moves every key save's consumer hasn't drained from the change feed into
+    /// [`TileStore::since_rebase`].
+    fn drain_saves(&mut self) {
+        let drained = self.feed.drain(self.save_consumer);
+        self.since_rebase
+            .extend(drained.into_iter().map(|(key, _)| key));
+    }
+
+    /// Whether the store holds edits no save has made part of a save point of the project
+    /// file: any edit since the last rebase, or since it opened.
+    pub(crate) fn has_unsaved_edits(&self) -> bool {
+        !self.since_rebase.is_empty() || self.feed.has_pending(self.save_consumer)
+    }
+
+    /// The working file the store reads first and writes.
+    pub(crate) const fn working(&self) -> &ProjectFile {
+        &self.file
+    }
+
+    /// The base under the working file, if the project has been saved.
+    pub(crate) const fn base(&self) -> Option<&BaseFile> {
+        self.base.as_ref()
     }
 
     /// A new op id for an edit: the site's next sequence number.
@@ -975,12 +1195,13 @@ impl TileStore {
         })
     }
 
-    /// Writes every correction tile edited since the last save to the working file and records
-    /// a save point. Returns its offset.
+    /// Writes every dirty correction tile to the working file and records a save point there.
+    /// Returns its offset.
     ///
-    /// The save consumer's keys are drained from the change feed; each one whose slot is still
-    /// dirty is written (a tile written back on eviction is in the file already). If a write
-    /// fails, the keys not written yet are kept for the next save.
+    /// This makes the working file hold every edit, as of a save point of its own; it doesn't
+    /// save the project (see [`crate::Project::save`]). Save's consumer of the change feed is
+    /// drained into the tiles the next project save copies. If a write fails, the tiles not
+    /// written yet stay dirty for the next save.
     ///
     /// # Errors
     ///
@@ -988,13 +1209,10 @@ impl TileStore {
     /// point's does.
     pub fn save(&mut self) -> Result<u64, CacheError> {
         self.sync_pins()?;
-        self.to_save.extend(
-            self.feed
-                .drain(self.save_consumer)
-                .into_iter()
-                .map(|(key, _)| key),
-        );
-        while let Some(&key) = self.to_save.front() {
+        self.drain_saves();
+        let mut dirty: Vec<TileKey> = self.unsaved.keys().copied().collect();
+        dirty.sort_unstable();
+        for key in dirty {
             if let Some(id) = self.corrections.find(&key)
                 && self.corrections.is_dirty(id) == Some(true)
             {
@@ -1002,7 +1220,6 @@ impl TileStore {
                 write_slot(&mut self.file, &mut self.unsaved, key, slot)?;
                 self.corrections.set_dirty(id, false)?;
             }
-            self.to_save.pop_front();
         }
         Ok(self.file.save()?)
     }
@@ -1613,6 +1830,7 @@ impl TileStore {
     ) -> Result<(), CacheError> {
         self.unsaved.insert(key, op);
         self.feed.push(key, op);
+        self.epoch += 1;
         self.corrections.set_dirty(id, true)?;
         Ok(())
     }
@@ -2143,4 +2361,4 @@ impl TileEdit<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

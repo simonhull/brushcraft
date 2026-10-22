@@ -22,7 +22,7 @@ use crate::codec::{
     CodecError, compress, decode_displacement_into, decompress, displacement_body_len,
     encode_displacement,
 };
-use crate::meta::{Meta, mesh_hash};
+use crate::meta::{Meta, SavePoint, mesh_hash};
 use crate::record::{
     HEAD, Head, KIND_INDEX, KIND_MESH, KIND_META, KIND_TILE, TAIL, frame, parse_head, verify,
 };
@@ -110,8 +110,9 @@ pub enum StoreError {
     /// and can't be written.
     #[error("the project file is open read-only")]
     ReadOnly,
-    /// The latest state ends before a torn tail from byte `offset`, which must be cut off, but
-    /// the file can't be written. It was left untouched.
+    /// Records follow the last save point from byte `offset` (a torn tail, or an operation that
+    /// never finished), which must be cut off, but the file can't be written. It was left
+    /// untouched.
     #[error("the project file needs its torn tail from byte {offset} cut off, but is read-only")]
     NeedsRepair {
         /// Where the torn tail starts.
@@ -277,23 +278,25 @@ fn open_writable(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
-/// Why replay stopped before the end of the file.
+/// Why the walk of the records after the last save point stopped (see
+/// [`ProjectFile::walk_tail`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
-    /// At an Index that verifies but didn't load as the base: damage.
+    /// At an Index that verifies but didn't load as the save point: damage.
     Index,
     /// At the end of the heads, or a record that doesn't verify.
     Other,
 }
 
-/// What opening at the latest state does with a torn tail.
+/// What opening at the latest state does with the records after the last save point (a torn
+/// tail, or an operation that never finished).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Repair {
-    /// Cut it off, so the file is writable again. Opens read-write.
+    /// Cut them off, so the file is writable again. Opens read-write.
     Truncate,
     /// Fail with [`StoreError::NeedsRepair`]: the file can't be written. Opens read-only.
     Refuse,
-    /// Leave it in place and open the state before it read-only, for compaction.
+    /// Leave them in place and open the save point read-only, for compaction.
     Ignore,
 }
 
@@ -374,6 +377,10 @@ pub struct ProjectFile {
     meta: Meta,
     /// The base mesh, from its `Mesh` record.
     mesh: Arc<BaseMesh>,
+    /// The `Mesh` record itself, framed and compressed: a file made over the same mesh (a
+    /// recovery file, a project saved under a new name) copies it rather than compressing the
+    /// mesh again.
+    mesh_record: Arc<[u8]>,
     /// The open file, which holds the lock. [`FileReader`]s hold it weakly, so dropping the
     /// `ProjectFile` closes the file and releases the lock (once any read in flight ends).
     file: Arc<File>,
@@ -430,7 +437,44 @@ impl ProjectFile {
     /// created then); [`StoreError::Io`], including when `path` already exists;
     /// [`StoreError::Locked`].
     pub fn create(path: &Path, meta: Meta, mesh: Arc<BaseMesh>) -> Result<Self, StoreError> {
-        let leading = leading_bytes(&meta, &mesh)?;
+        let record = mesh_record(&meta, &mesh)?;
+        Self::create_with(path, meta, mesh, record.into())
+    }
+
+    /// Creates a new file at `path`, as [`ProjectFile::create`] does, over `like`'s mesh: its
+    /// `Mesh` record is copied as it is, without compressing (or hashing) the mesh again.
+    /// `meta` must be over the same mesh (made from `like`'s meta with [`Meta::with_role`],
+    /// say).
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::create`]; [`StoreError::MeshMismatch`] if `meta`'s mesh hash isn't
+    /// `like`'s.
+    pub(crate) fn create_like(path: &Path, meta: Meta, like: &Self) -> Result<Self, StoreError> {
+        if meta.mesh_hash() != like.meta.mesh_hash() {
+            return Err(StoreError::MeshMismatch);
+        }
+        Self::create_with(
+            path,
+            meta,
+            Arc::clone(&like.mesh),
+            Arc::clone(&like.mesh_record),
+        )
+    }
+
+    /// Creates the file at `path` with `meta` and the framed `Mesh` record `mesh_record` of
+    /// `mesh`, which the caller has checked against `meta`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::create`].
+    fn create_with(
+        path: &Path,
+        meta: Meta,
+        mesh: Arc<BaseMesh>,
+        mesh_record: Arc<[u8]>,
+    ) -> Result<Self, StoreError> {
+        let leading = leading_bytes(&meta, &mesh_record)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -443,6 +487,7 @@ impl ProjectFile {
         Ok(Self {
             meta,
             mesh,
+            mesh_record,
             file: Arc::new(file),
             end: leading.len() as u64,
             live: BTreeMap::new(),
@@ -454,25 +499,34 @@ impl ProjectFile {
         })
     }
 
-    /// Opens the project at `path` at its latest state, recovering from a crash: the state is
-    /// the last good save point plus every complete record after it, and a torn tail is cut off.
+    /// Opens the file at `path` at its latest state, recovering from a crash: the state is the
+    /// last good save point, and whatever follows it is discarded.
+    ///
+    /// **A save point is the unit of durability.** Records after the last good save point
+    /// belong to an operation that never finished (a save, or a recovery flush, cut short):
+    /// replaying them could bring back half a stroke or half a save. So they are cut off, and
+    /// the file opens at the save point, as it was when that operation began. Records before a
+    /// good save point were complete when it was written; damage inside them is caught by their
+    /// checksums when they are read.
     ///
     /// The file must begin with its `Meta` and `Mesh` records, whose mesh must match the meta's
     /// hash. They are checked before anything else: damage there fails the open and leaves the
     /// file untouched, as a damaged header does. Recovery starts after them.
     ///
-    /// Where recovery stops before the end of the file, the rest is searched for a save point:
-    /// an Index that verifies, parses and has a plausible parent. Saves sync their tiles before
-    /// writing the Index, so everything before a good Index was durable: the stop was damage, and
-    /// the file is left as it is. So is a stop at an Index that verifies but doesn't load.
-    /// Otherwise the rest is a torn or unsynced tail of unsaved edits (even if some of its tile
-    /// records verify, since writeback may have kept a later write and lost an earlier one), and
-    /// is cut off.
+    /// Before anything is cut off, the records after the save point are walked while they
+    /// verify, and the rest searched for a save point: an Index that verifies, parses and has a
+    /// plausible parent. Saves sync their records before writing the Index, so everything
+    /// before a good Index was durable: finding one means the walk stopped at damage, not at a
+    /// torn tail, and the open fails, leaving the file as it is. So does an Index the walk
+    /// reaches that verifies but didn't load as the save point. Otherwise the rest is a torn or
+    /// unsynced tail (even if some of its records verify, since writeback may have kept a later
+    /// write and lost an earlier one), and is cut off.
     ///
     /// The file is opened read-write and locked exclusively. If it can't be opened for writing
     /// (no permission, or a read-only file system), it is opened read-only with a shared lock
-    /// instead, which works only if there is no torn tail to cut off. If the path was replaced
-    /// (by [`compact_in_place`]) between opening and locking, the new file is opened instead.
+    /// instead, which works only if nothing follows its last save point. If the path was
+    /// replaced (by [`compact_in_place`]) between opening and locking, the new file is opened
+    /// instead.
     ///
     /// # Errors
     ///
@@ -480,8 +534,36 @@ impl ProjectFile {
     /// [`StoreError::BadHeader`], [`StoreError::MissingMeta`], [`StoreError::MeshMismatch`],
     /// [`StoreError::BadMesh`], [`StoreError::Io`].
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_sharing(path, None)
+    }
+
+    /// Opens the file at `path` as [`ProjectFile::open`] does, sharing `like`'s base mesh if
+    /// the file's `Mesh` record is byte for byte `like`'s: a recovery file opened beside its
+    /// project, whose mesh is then neither decompressed nor parsed again. A file whose record
+    /// differs is read in full and checked as usual.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::open`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "restoring a recovery file beside its project (the next step) opens it so"
+        )
+    )]
+    pub(crate) fn open_sharing_mesh(path: &Path, like: &Self) -> Result<Self, StoreError> {
+        Self::open_sharing(path, Some(like))
+    }
+
+    /// [`ProjectFile::open`], sharing `like`'s mesh where its `Mesh` record matches.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::open`].
+    fn open_sharing(path: &Path, like: Option<&Self>) -> Result<Self, StoreError> {
         match open_locked(path, open_writable, Lock::Exclusive) {
-            Ok(file) => Self::open_latest(file, Repair::Truncate),
+            Ok(file) => Self::open_latest(file, Repair::Truncate, like),
             Err(StoreError::Io(e))
                 if matches!(
                     e.kind(),
@@ -491,6 +573,7 @@ impl ProjectFile {
                 Self::open_latest(
                     open_locked(path, open_readable, Lock::Shared)?,
                     Repair::Refuse,
+                    like,
                 )
             }
             Err(e) => Err(e),
@@ -498,23 +581,25 @@ impl ProjectFile {
     }
 
     /// Opens `file`, already locked, at its latest state, as [`ProjectFile::open`] does; `repair`
-    /// says what happens to a torn tail, and with it the access. `file` must be writable and
-    /// locked exclusively for [`Repair::Truncate`].
+    /// says what happens to a tail after the last save point, and with it the access. `file`
+    /// must be writable and locked exclusively for [`Repair::Truncate`]. The mesh is shared
+    /// with `like` where its `Mesh` record matches.
     ///
     /// # Errors
     ///
     /// As [`ProjectFile::open`].
-    fn open_latest(file: File, repair: Repair) -> Result<Self, StoreError> {
+    fn open_latest(file: File, repair: Repair, like: Option<&Self>) -> Result<Self, StoreError> {
         let access = repair.access();
         let len = file.metadata()?.len();
         check_header(&file, len)?;
-        let (meta, mesh, start) = read_leading(&file, len)?;
-        let heads = scan_heads(&file, start, len)?;
+        let leading = read_leading(&file, len, like)?;
+        let heads = scan_heads(&file, leading.end, len)?;
         let mut this = Self {
-            meta,
-            mesh,
+            meta: leading.meta,
+            mesh: leading.mesh,
+            mesh_record: leading.mesh_record,
             file: Arc::new(file),
-            end: start,
+            end: leading.end,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
             last_index: None,
@@ -522,11 +607,11 @@ impl ProjectFile {
             head: None,
             access,
         };
-        let replay_from = this.load_base(&heads, len)?;
-        let stop = this.replay(heads.get(replay_from..).unwrap_or_default())?;
+        let tail = this.load_base(&heads, len)?;
         if this.end < len {
-            if stop == Stop::Index || find_index(&this.file, this.end, len)?.is_some() {
-                return Err(StoreError::DamagedMidFile { offset: this.end });
+            let (stop, stopped_at) = this.walk_tail(heads.get(tail..).unwrap_or_default())?;
+            if stop == Stop::Index || find_index(&this.file, stopped_at, len)?.is_some() {
+                return Err(StoreError::DamagedMidFile { offset: stopped_at });
             }
             match repair {
                 Repair::Truncate => {
@@ -553,16 +638,17 @@ impl ProjectFile {
         let file = open_locked(path, open_readable, Lock::Shared)?;
         let len = file.metadata()?.len();
         check_header(&file, len)?;
-        let (meta, mesh, start) = read_leading(&file, len)?;
-        if index_offset < start || read_index(&file, index_offset, len)?.is_none() {
+        let leading = read_leading(&file, len, None)?;
+        if index_offset < leading.end || read_index(&file, index_offset, len)?.is_none() {
             return Err(StoreError::NotASavePoint(index_offset));
         }
         let chain = load_chain(&file, index_offset, len)?.ok_or(StoreError::Damaged {
             offset: index_offset,
         })?;
         Ok(Self {
-            meta,
-            mesh,
+            meta: leading.meta,
+            mesh: leading.mesh,
+            mesh_record: leading.mesh_record,
             file: Arc::new(file),
             end: len,
             live: chain.live,
@@ -574,8 +660,9 @@ impl ProjectFile {
         })
     }
 
-    /// Loads the last Index of `heads` whose record and parent chain are good, and returns the
-    /// position in `heads` of the first record after it (0 if there is none).
+    /// Loads the last Index of `heads` whose record and parent chain are good, moves `end` past
+    /// it, and returns the position in `heads` of the first record after it (0 if there is
+    /// none, and `end` stays after the leading records).
     ///
     /// # Errors
     ///
@@ -597,39 +684,27 @@ impl ProjectFile {
         Ok(0)
     }
 
-    /// Replays the records after the base Index while they verify, moving `end` past each one,
-    /// and says why it stopped. A record that verifies but doesn't parse (a tile key from a
-    /// newer version, say) is skipped, but an Index stops replay: any Index this late failed to
-    /// load as the base, whether or not it parses, and is damage.
+    /// Walks the records after the save point (`heads`, from `end` on) while they verify, and
+    /// says why it stopped and where. Nothing is loaded from them: they are about to be
+    /// discarded, and the walk only looks for proof that they are damage rather than a torn
+    /// tail. A record that verifies is stepped over, whatever its kind (a tile, or a kind from
+    /// a newer version), but an Index stops the walk: any Index this late failed to load as
+    /// the save point, whether or not it parses, and is damage.
     ///
     /// # Errors
     ///
     /// [`StoreError::Io`].
-    fn replay(&mut self, heads: &[(u64, Head)]) -> Result<Stop, StoreError> {
+    fn walk_tail(&self, heads: &[(u64, Head)]) -> Result<(Stop, u64), StoreError> {
+        let mut at = self.end;
         for &(offset, head) in heads {
             let raw = read_exact(&self.file, offset, head.total())?;
-            let Some((kind, payload)) = verify(&raw) else {
-                break;
-            };
-            let loc = Loc {
-                offset,
-                len: head.total(),
-            };
-            match kind {
-                KIND_TILE => {
-                    if let Some(tile) = parse_tile_payload(payload) {
-                        self.live.insert(tile.key, loc);
-                        self.pending.insert(tile.key, loc);
-                        self.head = self.head.max(Some(tile.op));
-                    }
-                }
-                KIND_INDEX => return Ok(Stop::Index),
-                // A kind from a newer version: skipped.
-                _ => {}
+            match verify(&raw) {
+                None => break,
+                Some((KIND_INDEX, _)) => return Ok((Stop::Index, offset)),
+                Some(_) => at = offset + head.total(),
             }
-            self.end = offset + head.total();
         }
-        Ok(Stop::Other)
+        Ok((Stop::Other, at))
     }
 
     /// Appends a tile record: `key`'s new content, written by `op`. The body is compressed.
@@ -842,7 +917,8 @@ impl ProjectFile {
     }
 
     /// This file as of its last save point, as a [`BaseFile`] for a tile store to read
-    /// corrections through, under a working file of its own.
+    /// corrections through, under a working file of its own; `None` if the file has no save
+    /// point (a project never saved has no base).
     ///
     /// Records written since the last save point are left out: the base is the saved state.
     /// Its locations are a snapshot, so writes and saves after this call don't change what it
@@ -854,23 +930,80 @@ impl ProjectFile {
     ///
     /// [`StoreError::Damaged`] if the last save point must be read again (records were written
     /// since it) and its chain no longer loads; [`StoreError::Io`].
-    pub fn base(&self) -> Result<BaseFile, StoreError> {
-        let (locations, head) = if self.pending.is_empty() {
+    pub(crate) fn base(&self) -> Result<Option<BaseFile>, StoreError> {
+        let Some(offset) = self.last_index else {
+            return Ok(None);
+        };
+        let (locations, saved_head) = if self.pending.is_empty() {
             (self.live.clone(), self.head)
-        } else if let Some(offset) = self.last_index {
+        } else {
             let len = self.file.metadata()?.len();
             let chain =
                 load_chain(&self.file, offset, len)?.ok_or(StoreError::Damaged { offset })?;
             (chain.live, chain.head)
-        } else {
-            (BTreeMap::new(), None)
         };
-        Ok(BaseFile {
+        Ok(Some(BaseFile {
             reader: self.reader(),
             locations: Arc::new(locations),
-            mesh_hash: self.meta.mesh_hash(),
-            head,
-        })
+            meta: self.meta,
+            save_point: SavePoint {
+                project: self.meta.project(),
+                offset,
+                head: saved_head,
+            },
+            head: self.head,
+        }))
+    }
+
+    /// Appends a copy of `from`'s latest record of `key`, as it is (not decoded or
+    /// recompressed), and records it as [`ProjectFile::write_tile`] does. Returns whether
+    /// `from` had one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if `from`'s record fails its checksum
+    /// or isn't a tile of `key`; [`StoreError::Io`].
+    pub(crate) fn copy_tile(&mut self, from: &Self, key: &TileKey) -> Result<bool, StoreError> {
+        let Some(Loc { offset, len }) = from.locate(key) else {
+            return Ok(false);
+        };
+        self.append_copy(key, &from.read_record(offset, len)?, offset)?;
+        Ok(true)
+    }
+
+    /// Appends a copy of every tile `base` holds, as [`ProjectFile::copy_tile`] does: the
+    /// saved state of another project, carried into this one.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::copy_tile`]; [`StoreError::Closed`] if `base`'s file has been dropped.
+    pub(crate) fn copy_base(&mut self, base: &BaseFile) -> Result<(), StoreError> {
+        for (key, &loc) in base.locations.iter() {
+            let raw = base.reader.read_record(loc)?;
+            self.append_copy(key, &raw, loc.offset)?;
+        }
+        Ok(())
+    }
+
+    /// Appends `raw`, a record read from byte `offset` of another file, as `key`'s latest
+    /// record, after checking that it is a tile of `key`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] (naming `offset`) if `raw` isn't a
+    /// whole tile record of `key`; [`StoreError::Io`].
+    fn append_copy(&mut self, key: &TileKey, raw: &[u8], offset: u64) -> Result<(), StoreError> {
+        if self.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly);
+        }
+        let op = tile_record(raw, key)
+            .ok_or(StoreError::Damaged { offset })?
+            .op;
+        let loc = self.append_record(raw)?;
+        self.live.insert(*key, loc);
+        self.pending.insert(*key, loc);
+        self.head = self.head.max(Some(op));
+        Ok(())
     }
 
     /// A reader for other threads. It reads this open file while it stays open, and doesn't keep
@@ -909,7 +1042,7 @@ impl ProjectFile {
     /// The caller must have synced every record written before this call (the tiles the Index
     /// names) and must sync again after it before the save point is durable. Until that second
     /// sync completes, a crash can lose the Index; opening the file then finds the previous
-    /// save point and replays the tiles after it.
+    /// save point and discards the tiles after it.
     ///
     /// # Errors
     ///
@@ -1045,8 +1178,9 @@ impl ProjectFile {
     ///
     /// Never: the fixture's meta is made for its mesh.
     fn fixture_start() -> u64 {
-        let leading = leading_bytes(&crate::fixture::meta(), &crate::fixture::mesh()).unwrap();
-        u64::try_from(leading.len()).unwrap()
+        let meta = crate::fixture::meta();
+        let record = mesh_record(&meta, &crate::fixture::mesh()).unwrap();
+        u64::try_from(leading_bytes(&meta, &record).unwrap().len()).unwrap()
     }
 
     /// Payload bytes of the Index at `offset`.
@@ -1095,6 +1229,23 @@ pub(crate) struct FileReader {
 }
 
 impl FileReader {
+    /// The whole record at `loc`, framing included, as it is in the file: for copying it into
+    /// another. Not checked here; the caller verifies it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Damaged`] if the file ends first, [`StoreError::Closed`] if the
+    /// [`ProjectFile`] has been dropped, [`StoreError::Io`].
+    pub(crate) fn read_record(&self, Loc { offset, len }: Loc) -> Result<Vec<u8>, StoreError> {
+        let file = self.file.upgrade().ok_or(StoreError::Closed)?;
+        match read_exact(&file, offset, len) {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                Err(StoreError::Damaged { offset })
+            }
+            other => Ok(other?),
+        }
+    }
+
     /// Reads the displacement tile of `key` recorded at `loc` straight into `slot`, and returns
     /// the edit that wrote it. Allocates nothing once `scratch` has grown to the largest record.
     ///
@@ -1204,18 +1355,21 @@ pub(crate) fn frame_displacement(
 /// [`ProjectFile::base`].
 ///
 /// It holds a reader of the open file, a frozen map of where each saved tile's record is, and
-/// what the store checks it against. It reads only while its [`ProjectFile`] stays open.
+/// what the store checks it against: the file's meta and the save point, which a working file
+/// layered on it must name. It reads only while its [`ProjectFile`] stays open.
 #[derive(Debug, Clone)]
-pub struct BaseFile {
+pub(crate) struct BaseFile {
     /// Reads the project file while its owner keeps it open.
     reader: FileReader,
     /// Each saved tile's record as of the save point. Records are never moved while the file
     /// is open, so these stay valid as the owner appends.
     locations: Arc<BTreeMap<TileKey, Loc>>,
-    /// The mesh hash of the file's meta: a store layers the base only over a working file of
-    /// the same mesh.
-    mesh_hash: u128,
-    /// The newest edit as of the save point: a store's op ids continue after it.
+    /// The project file's meta: its project, its role and its mesh.
+    meta: Meta,
+    /// The save point: the project, the Index's offset and the head op it recorded.
+    save_point: SavePoint,
+    /// The newest edit in the whole file when the base was made, records after the save point
+    /// included: a store's op ids continue after it, so no op is handed out twice in one file.
     head: Option<OpId>,
 }
 
@@ -1223,6 +1377,11 @@ impl BaseFile {
     /// Where `key`'s saved record is, if the save point has one.
     pub(crate) fn locate(&self, key: &TileKey) -> Option<Loc> {
         self.locations.get(key).copied()
+    }
+
+    /// Whether the save point holds a record of `key`.
+    pub(crate) fn contains(&self, key: &TileKey) -> bool {
+        self.locations.contains_key(key)
     }
 
     /// The reader the store's prefetch workers read the base through.
@@ -1247,20 +1406,24 @@ impl BaseFile {
         self.reader.read_displacement_into(key, loc, slot, scratch)
     }
 
-    /// The mesh hash of the project file's meta.
-    #[must_use]
-    pub const fn mesh_hash(&self) -> u128 {
-        self.mesh_hash
+    /// The project file's meta.
+    pub(crate) const fn meta(&self) -> &Meta {
+        &self.meta
     }
 
-    /// The newest edit as of the save point; `None` before any edit.
-    #[must_use]
-    pub const fn head(&self) -> Option<OpId> {
+    /// The save point the base is: what a recovery file layered on it names in its meta.
+    pub(crate) const fn save_point(&self) -> SavePoint {
+        self.save_point
+    }
+
+    /// The newest edit in the project file when the base was made, including any written after
+    /// the save point; `None` before any edit. Op ids for new edits start after it.
+    pub(crate) const fn head(&self) -> Option<OpId> {
         self.head
     }
 
     /// The saved tiles, in key order.
-    pub fn keys(&self) -> impl Iterator<Item = &TileKey> {
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &TileKey> {
         self.locations.keys()
     }
 }
@@ -1357,10 +1520,10 @@ fn decode_record_at(
 /// Writes a new project at `dst` holding `src`'s meta and mesh, its live tiles (raw records
 /// copied, not recompressed) and one full Index.
 ///
-/// `src` is recovered as by [`ProjectFile::open`], but never modified: a torn tail is left in
-/// place, not cut off. It is held with a shared lock, so it can't be open for writing. History
-/// before the latest state is dropped; which history to keep is decided with stroke history
-/// (M2). On error, `dst` may be left partly written.
+/// `src` is recovered as by [`ProjectFile::open`], but never modified: whatever follows its last
+/// save point is left in place (and not copied). It is held with a shared lock, so it can't be open
+/// for writing. History before the latest state is dropped; which history to keep is decided with
+/// stroke history (M2). On error, `dst` may be left partly written.
 ///
 /// # Errors
 ///
@@ -1370,6 +1533,7 @@ pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
     let from = ProjectFile::open_latest(
         open_locked(src, open_readable, Lock::Shared)?,
         Repair::Ignore,
+        None,
     )?;
     compact_into(&from, dst)
 }
@@ -1395,6 +1559,7 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
     let from = ProjectFile::open_latest(
         open_locked(&path, open_readable, Lock::Exclusive)?,
         Repair::Ignore,
+        None,
     )?;
     let permissions = from.file.metadata()?.permissions();
     let tmp = temp_sibling(&path)?;
@@ -1416,7 +1581,7 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
 ///
 /// As [`compact`].
 fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
-    let mut to = ProjectFile::create(dst, from.meta, Arc::clone(&from.mesh))?;
+    let mut to = ProjectFile::create_like(dst, from.meta, from)?;
     for (key, &Loc { offset, len }) in &from.live {
         let raw = from.read_record(offset, len)?;
         if tile_record(&raw, key).is_none() {
@@ -1458,7 +1623,7 @@ fn temp_sibling(path: &Path) -> Result<PathBuf, StoreError> {
 /// # Errors
 ///
 /// [`StoreError::Io`].
-fn sync_parent(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn sync_parent(path: &Path) -> Result<(), StoreError> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -1519,13 +1684,13 @@ fn check_header(file: &File, len: u64) -> Result<(), StoreError> {
     }
 }
 
-/// The header and leading records of a new file holding `meta` and `mesh`.
+/// The framed `Mesh` record of `mesh`: its canonical bytes' length, then the bytes compressed.
 ///
 /// # Errors
 ///
 /// [`StoreError::MeshMismatch`] if `meta` wasn't made for `mesh`; [`StoreError::TooLarge`] if
 /// the mesh's bytes exceed [`MAX_MESH_RAW`]; [`StoreError::Io`] if compression fails.
-fn leading_bytes(meta: &Meta, mesh: &BaseMesh) -> Result<Vec<u8>, StoreError> {
+fn mesh_record(meta: &Meta, mesh: &BaseMesh) -> Result<Vec<u8>, StoreError> {
     let raw = mesh.to_bytes();
     if mesh_hash(&raw) != meta.mesh_hash() {
         return Err(StoreError::MeshMismatch);
@@ -1534,21 +1699,47 @@ fn leading_bytes(meta: &Meta, mesh: &BaseMesh) -> Result<Vec<u8>, StoreError> {
         .ok()
         .filter(|&n| n <= MAX_MESH_RAW)
         .ok_or(StoreError::TooLarge)?;
-    let mut mesh_payload = raw_len.to_le_bytes().to_vec();
-    mesh_payload.extend_from_slice(&compress(&raw)?);
+    let mut payload = raw_len.to_le_bytes().to_vec();
+    payload.extend_from_slice(&compress(&raw)?);
+    frame(KIND_MESH, &payload).ok_or(StoreError::TooLarge)
+}
+
+/// The header and leading records of a new file holding `meta`, then `mesh_record` (made by
+/// [`mesh_record`] for a mesh `meta` was made for).
+///
+/// # Errors
+///
+/// [`StoreError::TooLarge`] if the meta doesn't fit a record (it does).
+fn leading_bytes(meta: &Meta, mesh_record: &[u8]) -> Result<Vec<u8>, StoreError> {
     let meta_record = frame(KIND_META, &meta.to_payload()).ok_or(StoreError::TooLarge)?;
-    let mesh_record = frame(KIND_MESH, &mesh_payload).ok_or(StoreError::TooLarge)?;
     let mut header = [0; HEADER_LEN];
     let (magic, rest) = header.split_at_mut(MAGIC.len());
     magic.copy_from_slice(&MAGIC);
     if let Some(version) = rest.get_mut(..2) {
         version.copy_from_slice(&VERSION.to_le_bytes());
     }
-    Ok([&header[..], &meta_record, &mesh_record].concat())
+    Ok([&header[..], &meta_record, mesh_record].concat())
+}
+
+/// A file's leading records, read and checked by [`read_leading`].
+struct Leading {
+    /// The file's identity.
+    meta: Meta,
+    /// The base mesh.
+    mesh: Arc<BaseMesh>,
+    /// The `Mesh` record as it is in the file, framing included.
+    mesh_record: Arc<[u8]>,
+    /// Where the records after them start.
+    end: u64,
 }
 
 /// Reads and checks the leading `Meta` and `Mesh` records: the file's identity and base mesh,
 /// and the offset where its other records start.
+///
+/// If the `Mesh` record is byte for byte `like`'s (a file made with
+/// [`ProjectFile::create_like`]) and the meta states `like`'s mesh hash, `like`'s mesh is
+/// shared: the record verified, so it holds what `like`'s held, and `like` checked that against
+/// the same hash. Otherwise the mesh is decompressed, hashed and parsed.
 ///
 /// # Errors
 ///
@@ -1556,12 +1747,26 @@ fn leading_bytes(meta: &Meta, mesh: &BaseMesh) -> Result<Vec<u8>, StoreError> {
 /// [`StoreError::BadHeader`] if either is damaged or doesn't parse (or states a mesh larger
 /// than [`MAX_MESH_RAW`]); [`StoreError::MeshMismatch`] if the mesh doesn't match the meta's
 /// hash; [`StoreError::BadMesh`] if it isn't a valid mesh; [`StoreError::Io`].
-fn read_leading(file: &File, len: u64) -> Result<(Meta, Arc<BaseMesh>, u64), StoreError> {
-    let (meta_payload, mesh_at) =
+fn read_leading(file: &File, len: u64, like: Option<&ProjectFile>) -> Result<Leading, StoreError> {
+    let (meta_record, mesh_at) =
         leading_record(file, FIRST_RECORD, len, KIND_META, MAX_META_PAYLOAD)?;
-    let meta = Meta::from_payload(&meta_payload).ok_or(StoreError::BadHeader)?;
-    let (mesh_payload, start) = leading_record(file, mesh_at, len, KIND_MESH, MAX_MESH_PAYLOAD)?;
-    let mut r = Reader::new(&mesh_payload);
+    let meta = verify(&meta_record)
+        .and_then(|(_, payload)| Meta::from_payload(payload))
+        .ok_or(StoreError::BadHeader)?;
+    let (mesh_record, end) = leading_record(file, mesh_at, len, KIND_MESH, MAX_MESH_PAYLOAD)?;
+    if let Some(like) = like
+        && like.meta.mesh_hash() == meta.mesh_hash()
+        && *like.mesh_record == *mesh_record
+    {
+        return Ok(Leading {
+            meta,
+            mesh: Arc::clone(&like.mesh),
+            mesh_record: Arc::clone(&like.mesh_record),
+            end,
+        });
+    }
+    let (_, payload) = verify(&mesh_record).ok_or(StoreError::BadHeader)?;
+    let mut r = Reader::new(payload);
     let raw_len = r
         .u32()
         .filter(|&n| n <= MAX_MESH_RAW)
@@ -1572,11 +1777,16 @@ fn read_leading(file: &File, len: u64) -> Result<(Meta, Arc<BaseMesh>, u64), Sto
         return Err(StoreError::MeshMismatch);
     }
     let mesh = BaseMesh::from_bytes(&raw).map_err(StoreError::BadMesh)?;
-    Ok((meta, Arc::new(mesh), start))
+    Ok(Leading {
+        meta,
+        mesh: Arc::new(mesh),
+        mesh_record: mesh_record.into(),
+        end,
+    })
 }
 
-/// The payload of the leading record at `offset`, which must be of `kind` with a payload of at
-/// most `max` bytes, and the offset of the record after it.
+/// The leading record at `offset`, framing included, which must be of `kind` with a payload of
+/// at most `max` bytes and must verify, and the offset of the record after it.
 ///
 /// # Errors
 ///
@@ -1604,8 +1814,8 @@ fn leading_record(
         return Err(StoreError::BadHeader);
     }
     let raw = read_exact(file, offset, head.total())?;
-    let (_, payload) = verify(&raw).ok_or(StoreError::BadHeader)?;
-    Ok((payload.to_vec(), end))
+    verify(&raw).ok_or(StoreError::BadHeader)?;
+    Ok((raw, end))
 }
 
 /// Every record head from `start` on, trusting lengths, up to the first that is invalid or runs
@@ -1945,19 +2155,32 @@ mod tests {
     }
 
     #[test]
-    fn unsaved_tiles_are_replayed_on_open() {
+    fn records_after_the_last_save_point_are_discarded_on_open() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
         let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(0.5)).unwrap();
         f.save().unwrap();
-        f.write_displacement(key(1, 0), op(2), &tile(0.75)).unwrap(); // no save
+        let saved = f.len();
+        // Whole records, but no save point: an operation that never finished.
+        f.write_displacement(key(1, 0), op(2), &tile(0.75)).unwrap();
+        f.write_displacement(key(2, 0), op(3), &tile(0.25)).unwrap();
         drop(f);
         let opened = ProjectFile::open(&path).unwrap();
         assert_eq!(
             opened.read_displacement(&key(1, 0)).unwrap(),
-            Some((op(2), tile(0.75))),
-            "replayed"
+            Some((op(1), tile(0.5))),
+            "the saved tile, not the later one"
+        );
+        assert!(
+            !opened.contains(&key(2, 0)),
+            "a tile written after it is gone"
+        );
+        assert_eq!(opened.head(), Some(op(1)), "the save point's head");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            saved,
+            "cut back to the save point"
         );
     }
 
@@ -2034,8 +2257,11 @@ mod tests {
     /// Every live tile: its op and content.
     type State = BTreeMap<TileKey, (OpId, CorrectionTile)>;
 
-    /// Writes a project with saves, overwrites and trailing unsaved tiles, recording after every
-    /// record the file length and the expected live state (key → (op, tile)).
+    /// Writes a project with saves, overwrites and trailing unsaved tiles; returns the states
+    /// an open can find.
+    ///
+    /// Recorded at creation and after every save point: the file length and the saved live
+    /// state (key → (op, tile)).
     fn scripted(path: &Path) -> Vec<(u64, State)> {
         let mut f = ProjectFile::create(path, meta(), mesh()).unwrap();
         let mut state = BTreeMap::new();
@@ -2048,7 +2274,6 @@ mod tests {
                 let at = key(k + u32::from(round % 2), 0);
                 f.write_displacement(at, op(seq), &t).unwrap();
                 state.insert(at, (op(seq), t));
-                log.push((f.len(), state.clone()));
             }
             if round < 5 {
                 f.save().unwrap(); // the last round stays unsaved
@@ -2065,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_anywhere_opens_with_the_last_complete_state() {
+    fn truncation_anywhere_opens_at_the_last_complete_save_point() {
         let dir = TestDir::new();
         let full = dir.path("full.bcrf");
         let log = scripted(&full);
@@ -2160,9 +2385,10 @@ mod tests {
         f.save().unwrap();
         f.append_raw(9, b"from a newer version").unwrap();
         f.write_displacement(key(2, 0), op(2), &tile(2.0)).unwrap();
-        f.save().unwrap();
-        f.append_raw(200, &[0; 64]).unwrap(); // unsaved, after the last index
+        f.append_raw(200, &[0; 64]).unwrap();
         f.write_displacement(key(3, 0), op(3), &tile(3.0)).unwrap();
+        f.save().unwrap();
+        let len = f.len();
         drop(f);
         let opened = ProjectFile::open(&path).unwrap();
         assert_eq!(
@@ -2170,6 +2396,7 @@ mod tests {
             3,
             "all three tiles, unknown records skipped"
         );
+        assert_eq!(opened.len(), len, "nothing cut off");
     }
 
     /// A project with three saves of five tiles each, and its bytes.
@@ -2274,20 +2501,21 @@ mod tests {
         let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
         f.save().unwrap();
-        // Unsaved, so replayed: a payload too short to hold a key, and a tile whose op is
+        // Before the next save point: a payload too short to hold a key, and a tile whose op is
         // `u64::MAX` (the reserved site, as no real op can be).
         f.append_raw(KIND_TILE, b"short").unwrap();
         let mut reserved = tile_payload(key(2, 0), op(2), b"", 0, &[]).unwrap();
         reserved[KEY_LEN..KEY_LEN + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         f.append_raw(KIND_TILE, &reserved).unwrap();
         f.write_displacement(key(3, 0), op(3), &tile(3.0)).unwrap();
+        f.save().unwrap();
         let len = f.len();
         drop(f);
         let opened = ProjectFile::open(&path).unwrap();
         assert_eq!(
             opened.keys().copied().collect::<Vec<_>>(),
             vec![key(1, 0), key(3, 0)],
-            "replay goes on past them"
+            "recovery goes on past them to the save point"
         );
         assert_eq!(opened.head(), Some(op(3)), "head op");
         assert_eq!(
@@ -2570,7 +2798,7 @@ mod tests {
         let mesh = Arc::new(geom::cube_sphere(2).unwrap());
         let project = crate::ProjectId::from_bits(42);
         let role = crate::Role::Recovery {
-            base: Some(crate::SavePoint {
+            base: Some(SavePoint {
                 project,
                 offset: 1234,
                 head: Some(op(9)),
