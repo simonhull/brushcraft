@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+description = "Project file, out-of-core tile paging, tile pool, cache budget and spatial index."
 
 [lints]
 workspace = true
 
 [dependencies]
+geom.workspace = true
+thiserror.workspace = true
+zstd.workspace = true

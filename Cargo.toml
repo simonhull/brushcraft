@@ -22,6 +22,7 @@ wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
 winit = { version = "=0.31.0-beta.3", default-features = false, features = ["wayland", "wayland-dlopen"] }
+zstd = { version = "=0.14.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
