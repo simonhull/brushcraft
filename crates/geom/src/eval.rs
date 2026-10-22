@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::frame::{Block, CornerAxes, frames};
 use crate::subdiv::{CornerRing, Padded, extraordinary, predict, ring_edge_point};
-use crate::topology::{corner_at, corner_coords, edge_to_grid};
+use crate::topology::{corner_at, edge_to_grid};
 use crate::{BaseMesh, FaceId, Level, Region, Vec3};
 
 /// Read access to evaluated positions.
@@ -76,6 +76,16 @@ struct Parent {
     corners: [Option<CornerRing>; 4],
 }
 
+/// The error for a position the source can't supply.
+fn missing(face: FaceId, level: Level, i: i64, j: i64) -> EvalError {
+    EvalError::Missing {
+        face,
+        level,
+        i: u32::try_from(i).unwrap_or(u32::MAX),
+        j: u32::try_from(j).unwrap_or(u32::MAX),
+    }
+}
+
 /// Gathers `region` (at the parent level) with its one-vertex ring and base-vertex rings.
 ///
 /// # Errors
@@ -89,17 +99,17 @@ fn gather(mesh: &BaseMesh, src: &impl PositionSource, region: Region) -> Result<
     let q = i64::from(region.quads());
     let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
     let face = region.face();
+    // Every read goes to the owner's copy, so all faces predict a shared vertex from the same
+    // inputs even if the source's twins disagree.
     let fetch = |f: FaceId, i: i64, j: i64| {
-        let missing = || EvalError::Missing {
-            face: f,
-            level,
-            i: u32::try_from(i).unwrap_or(u32::MAX),
-            j: u32::try_from(j).unwrap_or(u32::MAX),
+        let (Ok(ui), Ok(uj)) = (u32::try_from(i), u32::try_from(j)) else {
+            return Err(missing(f, level, i, j));
         };
-        let (Ok(i), Ok(j)) = (u32::try_from(i), u32::try_from(j)) else {
-            return Err(missing());
-        };
-        src.position(f, level, i, j).ok_or_else(missing)
+        let (g, gi, gj) = topology
+            .owner_copy(f, n, ui, uj)
+            .ok_or_else(|| missing(f, level, i, j))?;
+        src.position(g, level, gi, gj)
+            .ok_or_else(|| missing(g, level, i64::from(gi), i64::from(gj)))
     };
     let mut padded = Padded::filled(region.quads(), Vec3::NAN);
     for j in -1..=q + 1 {
@@ -122,13 +132,11 @@ fn gather(mesh: &BaseMesh, src: &impl PositionSource, region: Region) -> Result<
         let Some(ring) = topology.ring(face, corner_at(ui, uj, n)) else {
             continue;
         };
-        let Some(&(owner, owner_corner)) = ring.entries.first() else {
+        let Some(&(_, owner_corner)) = ring.entries.first() else {
             continue;
         };
-        // Fetched from the owner, the same way in every face, so it never relies on the source
-        // storing identical copies.
-        let (cx, cy) = corner_coords(owner_corner, n64);
-        let center = fetch(owner, cx, cy)?;
+        // Already read from the owner's copy, like every other input.
+        let center = padded.get(ci, cj);
         let mut edges = Vec::with_capacity(ring.entries.len());
         let mut diagonals = Vec::with_capacity(ring.entries.len());
         for &(g, c) in &ring.entries {

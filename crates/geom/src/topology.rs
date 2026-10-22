@@ -230,6 +230,51 @@ impl Topology {
             .collect()
     }
 
+    /// The owner's copy of face-grid vertex `(i, j)` of `face` (`n` quads per side): the lowest
+    /// face id holding it, and the lowest position within that face if the face holds it twice.
+    /// Every name of a vertex maps to the same copy, so reading positions through it never
+    /// depends on a source storing identical twins. `None` if `(i, j)` is outside the face or
+    /// `face` is not in this mesh.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "grid math keeps the conventions' names: n, (i, j) and (s, d)"
+    )]
+    pub(crate) fn owner_copy(
+        &self,
+        face: FaceId,
+        n: u32,
+        i: u32,
+        j: u32,
+    ) -> Option<(FaceId, u32, u32)> {
+        if i > n || j > n || !self.contains(face) {
+            return None;
+        }
+        let on = |x: u32| x == 0 || x == n;
+        let n64 = i64::from(n);
+        if on(i) && on(j) {
+            // Rings start at the owner.
+            let &(g, c) = self.ring(face, corner_at(i, j, n))?.entries.first()?;
+            let (gi, gj) = corner_coords(c, n64);
+            return Some((g, u32::try_from(gi).ok()?, u32::try_from(gj).ok()?));
+        }
+        if on(i) || on(j) {
+            let k = border_edge(i, j, n);
+            let across = self.across(face, k)?;
+            if across.face > face {
+                return Some((face, i, j));
+            }
+            let (s, _) = grid_to_edge(k, n64, i64::from(i), i64::from(j));
+            let (gi, gj) = edge_to_grid(across.edge, n64, n64 - s, 0);
+            let twin = (
+                across.face,
+                u32::try_from(gi).ok()?,
+                u32::try_from(gj).ok()?,
+            );
+            return Some(twin.min((face, i, j)));
+        }
+        Some((face, i, j))
+    }
+
     /// The same vertex in every face that holds it (itself first, unless it is a base vertex, whose
     /// ring starts at the owner). `None` if `face` is not in this mesh.
     #[expect(
@@ -439,6 +484,38 @@ mod tests {
     /// per face holding it, so positions are compared through their twins, never as tuples.
     fn same_vertex(t: &Topology, n: u32, a: (FaceId, u32, u32), b: (FaceId, u32, u32)) -> bool {
         t.face_twins(a.0, n, a.1, a.2).unwrap().contains(&b)
+    }
+
+    #[test]
+    fn every_twin_has_the_same_owner_copy() {
+        let mesh = cube_sphere(2).unwrap();
+        let t = mesh.topology();
+        let n = 4;
+        for face in mesh.faces() {
+            for j in 0..=n {
+                for i in 0..=n {
+                    let twins = t.face_twins(face, n, i, j).unwrap();
+                    let lowest = twins.iter().copied().min().unwrap();
+                    for (g, gi, gj) in twins {
+                        assert_eq!(
+                            t.owner_copy(g, n, gi, gj),
+                            Some(lowest),
+                            "{face:?} ({i}, {j}) via {g:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            t.owner_copy(FaceId::new(0), n, n + 1, 0),
+            None,
+            "outside the face"
+        );
+        assert_eq!(
+            t.owner_copy(FaceId::new(24), n, 1, 1),
+            None,
+            "not a face of this mesh"
+        );
     }
 
     #[test]

@@ -170,7 +170,7 @@ mod tests {
     use super::*;
     use crate::reference::{Poly, assert_same_points, pentagonal_prism};
     use crate::test_rng::Rng;
-    use crate::{Region, TileKey, cube_sphere, evaluate_region};
+    use crate::{Region, TileKey, Topology, cube_sphere, evaluate_region};
 
     fn all_points(eval: &DenseEvaluation, mesh: &BaseMesh, level: Level) -> Vec<Vec3> {
         mesh.faces()
@@ -376,6 +376,63 @@ mod tests {
                         assert!(
                             cos > 0.7,
                             "{face:?} L{l} ({i}, {j}): t is the owner's +i ({owner:?}, cos {cos})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A source whose non-owner copies of shared vertices disagree with the owner's, as stale
+    /// copies in a store could.
+    struct Perturbed<'a> {
+        dense: &'a DenseEvaluation,
+        topology: &'a Topology,
+    }
+
+    impl PositionSource for Perturbed<'_> {
+        fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+            let p = self.dense.position(face, level, i, j)?;
+            let owner = self
+                .topology
+                .copies(face, level, i, j)
+                .into_iter()
+                .map(|c| {
+                    let r = Region::of_tile(&c.key(level));
+                    (c.face, r.x0() + c.i, r.y0() + c.j)
+                })
+                .min()?;
+            if owner == (face, i, j) {
+                return Some(p);
+            }
+            let offset = 1e-3 * f32::from(u16::try_from(face.index() + 1).unwrap());
+            Some(p + Vec3::new(offset, offset, offset))
+        }
+    }
+
+    #[test]
+    fn prediction_reads_only_owner_copies() {
+        let mesh = cube_sphere(2).unwrap();
+        let dense =
+            DenseEvaluation::new(&mesh, Level::new(3).unwrap(), &CorrectionMap::new()).unwrap();
+        let src = Perturbed {
+            dense: &dense,
+            topology: mesh.topology(),
+        };
+        let c = Vec3::new(0.01, -0.02, 0.03);
+        for l in 1..=3 {
+            let level = Level::new(l).unwrap();
+            let n = level.face_quads();
+            for face in mesh.faces() {
+                let region = Region::whole_face(face, level);
+                let grid = evaluate_region(&mesh, &src, region, |_, _| c).unwrap();
+                let clean = evaluate_region(&mesh, &dense, region, |_, _| c).unwrap();
+                for j in 0..=n {
+                    for i in 0..=n {
+                        assert_eq!(
+                            grid.get(i, j).unwrap().to_bits(),
+                            clean.get(i, j).unwrap().to_bits(),
+                            "{face:?} L{l} ({i}, {j}): a non-owner copy leaked into the prediction"
                         );
                     }
                 }
