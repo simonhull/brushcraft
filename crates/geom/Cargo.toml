@@ -10,6 +10,7 @@ description = "Base mesh, Catmull–Clark subdivision, correction pyramid, tile 
 workspace = true
 
 [dependencies]
+bytemuck.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

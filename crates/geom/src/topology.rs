@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::mesh::fit;
-use crate::{Channel, FaceId, LayerId, Level, MeshError, TileKey, VertexId};
+use crate::{Channel, FaceId, LayerId, Level, MAX_VALENCE, MeshError, TileKey, VertexId};
 
 /// What lies across one edge of a face: the neighbour and the index of the same edge in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +64,7 @@ impl Topology {
     ///
     /// [`MeshError::DuplicateEdge`], [`MeshError::OpenEdge`], [`MeshError::VertexOutOfRange`],
     /// [`MeshError::IsolatedVertex`], [`MeshError::NonManifoldVertex`],
-    /// [`MeshError::LowValence`] or [`MeshError::TooLarge`].
+    /// [`MeshError::LowValence`], [`MeshError::HighValence`] or [`MeshError::TooLarge`].
     pub(crate) fn build(faces: &[[u32; 4]], vertex_count: u32) -> Result<Self, MeshError> {
         let mut directed: HashMap<(u32, u32), (u32, u8)> = HashMap::with_capacity(faces.len() * 4);
         for (f, quad) in faces.iter().enumerate() {
@@ -323,7 +323,8 @@ fn edges(quad: &[u32; 4]) -> impl Iterator<Item = (u32, u32)> + '_ {
 ///
 /// # Errors
 ///
-/// [`MeshError::IsolatedVertex`], [`MeshError::NonManifoldVertex`] or [`MeshError::LowValence`].
+/// [`MeshError::IsolatedVertex`], [`MeshError::NonManifoldVertex`], [`MeshError::LowValence`] or
+/// [`MeshError::HighValence`].
 fn ring(across: &[[Across; 4]], v: u32, incident: &[(FaceId, u8)]) -> Result<Ring, MeshError> {
     let vertex = VertexId::new(v);
     let &start = incident.first().ok_or(MeshError::IsolatedVertex(vertex))?;
@@ -347,6 +348,9 @@ fn ring(across: &[[Across; 4]], v: u32, incident: &[(FaceId, u8)]) -> Result<Rin
     }
     if entries.len() < 3 {
         return Err(MeshError::LowValence(vertex));
+    }
+    if entries.len() > MAX_VALENCE {
+        return Err(MeshError::HighValence(vertex));
     }
     let owner = entries
         .iter()

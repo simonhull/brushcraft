@@ -232,12 +232,11 @@ fn per_vertex<T>(
     grid: &Padded,
     corners: &[Option<CornerAxes<'_>>; 4],
     f: impl Fn(i64, i64, Local) -> T,
-) -> Vec<T> {
+) -> impl Iterator<Item = T> {
     let q = i64::from(block.quads);
     (0..=q)
-        .flat_map(|j| (0..=q).map(move |i| (i, j)))
-        .map(|(i, j)| f(i, j, derivatives(block, grid, corners, i, j)))
-        .collect()
+        .flat_map(move |j| (0..=q).map(move |i| (i, j)))
+        .map(move |(i, j)| f(i, j, derivatives(block, grid, corners, i, j)))
 }
 
 /// Frames for every vertex of a predicted block, row-major `(quads + 1)²`. `corners` holds the
@@ -254,6 +253,7 @@ pub(crate) fn frames(
         );
         Frame::from_local(local)
     })
+    .collect()
 }
 
 /// The unit normal, with [`Frame::from_local`]'s policy: the fallback frame's normal where finite
@@ -268,14 +268,30 @@ fn normal(local: Local) -> Vec3 {
     .unwrap_or(Frame::FALLBACK.n)
 }
 
-/// Unit normals for every vertex of a block of evaluated positions, row-major `(quads + 1)²`.
-/// Positions come from a source, so non-finite input is passed through as NaN, not asserted.
+/// Unit normals for every vertex of a block of evaluated positions, into `out`.
+///
+/// `out` holds `(quads + 1)²` values, row-major. Positions come from a source, so non-finite
+/// input is passed through as NaN, not asserted.
 pub(crate) fn normals(
     block: &Block<'_>,
     positions: &Padded,
     corners: &[Option<CornerAxes<'_>>; 4],
-) -> Vec<Vec3> {
-    per_vertex(block, positions, corners, |_, _, local| normal(local))
+    out: &mut [Vec3],
+) {
+    let q = usize::try_from(block.quads).unwrap_or(usize::MAX);
+    debug_assert_eq!(
+        Some(out.len()),
+        (q + 1).checked_pow(2),
+        "one normal per vertex"
+    );
+    for (slot, n) in out
+        .iter_mut()
+        .zip(per_vertex(block, positions, corners, |_, _, local| {
+            normal(local)
+        }))
+    {
+        *slot = n;
+    }
 }
 
 #[cfg(test)]

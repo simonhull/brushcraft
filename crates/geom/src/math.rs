@@ -3,7 +3,10 @@
 use core::ops::{Add, Mul, Neg, Sub};
 
 /// A 3D point or vector.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+///
+/// Plain data (`#[repr(C)]`, three `f32`s, 12 bytes): pool slots and GPU buffers hold it as is.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vec3 {
     /// X component.
     pub x: f32,
@@ -118,6 +121,27 @@ mod tests {
         assert_eq!(Vec3::NAN.normalized(), None, "NaN has no direction");
         let n = Vec3::new(3.0, 0.0, 4.0).normalized().unwrap();
         assert!((n.length() - 1.0).abs() < 1e-6, "unit length");
+    }
+
+    #[test]
+    fn is_plain_data() {
+        assert_eq!(size_of::<Vec3>(), 12, "three f32s, no padding");
+        assert_eq!(align_of::<Vec3>(), 4, "f32 alignment");
+        let v = Vec3::new(1.0, -2.0, 3.5);
+        let bytes: &[u8] = bytemuck::bytes_of(&v);
+        assert_eq!(
+            bytes,
+            [1.0_f32, -2.0, 3.5]
+                .iter()
+                .flat_map(|c| c.to_ne_bytes())
+                .collect::<Vec<_>>(),
+            "x, y, z in order"
+        );
+        assert_eq!(
+            <Vec3 as bytemuck::Zeroable>::zeroed(),
+            Vec3::ZERO,
+            "zeroed is the zero vector"
+        );
     }
 
     #[test]

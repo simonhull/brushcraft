@@ -5,6 +5,12 @@ use thiserror::Error;
 use crate::topology::{Topology, corner_at};
 use crate::{FaceId, Level, PositionSource, Vec3, VertexId};
 
+/// The most faces around one base vertex.
+///
+/// Prediction keeps a base vertex's ring in fixed arrays of this size, so evaluation doesn't
+/// allocate per corner; [`BaseMesh::from_polygons`] rejects a vertex with more.
+pub const MAX_VALENCE: usize = 32;
+
 /// A closed quad base mesh with its adjacency.
 #[derive(Debug, Clone)]
 pub struct BaseMesh {
@@ -76,6 +82,9 @@ pub enum MeshError {
     /// stencils and tangent frames need valence 3 or more.
     #[error("vertex {0} has fewer than three faces around it")]
     LowValence(VertexId),
+    /// A vertex with more than [`MAX_VALENCE`] faces around it.
+    #[error("vertex {0} has more than {MAX_VALENCE} faces around it")]
+    HighValence(VertexId),
     /// The faces are consistently oriented, but inward: the enclosed volume is not positive.
     #[error("the mesh is inside out (its faces point inward) or encloses no volume")]
     InsideOut,
@@ -101,7 +110,7 @@ impl BaseMesh {
     /// # Errors
     ///
     /// Any [`MeshError`]: non-quads, bad indices, degenerate faces, non-finite positions, low
-    /// valence, or a mesh that is not closed, manifold and consistently oriented outward.
+    /// or high valence, or a mesh that is not closed, manifold and consistently oriented outward.
     pub fn from_polygons<P: AsRef<[u32]>>(
         positions: Vec<Vec3>,
         polygons: &[P],
@@ -244,6 +253,7 @@ impl PositionSource for BaseMesh {
 mod tests {
     use super::*;
     use crate::cube_sphere;
+    use crate::reference::prism;
     use crate::topology::Across;
 
     fn unit_cube() -> (Vec<Vec3>, Vec<[u32; 4]>) {
@@ -343,6 +353,28 @@ mod tests {
                 Err(MeshError::LowValence(_))
             ),
             "valence-2 vertices"
+        );
+    }
+
+    #[test]
+    fn accepts_max_valence_and_rejects_more() {
+        let mesh = prism(MAX_VALENCE).subdivide().to_base_mesh();
+        let valence = mesh
+            .faces()
+            .flat_map(|f| (0..4).map(move |c| (f, c)))
+            .map(|(f, c)| mesh.topology().ring(f, c).unwrap().entries.len())
+            .max();
+        assert_eq!(valence, Some(MAX_VALENCE), "the caps' centres");
+        let Err(MeshError::HighValence(v)) = prism(MAX_VALENCE + 1).subdivide().try_to_base_mesh()
+        else {
+            panic!("valence {} is rejected", MAX_VALENCE + 1);
+        };
+        // Vertex `v` is not in a mesh, so find it among the polygon's positions: a cap centre.
+        let poly = prism(MAX_VALENCE + 1).subdivide();
+        let p = poly.positions[usize::try_from(v.index()).unwrap()];
+        assert!(
+            p[0].abs() < 1e-9 && p[1].abs() < 1e-9,
+            "{v} at {p:?} is a cap centre"
         );
     }
 

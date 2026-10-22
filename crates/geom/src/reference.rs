@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::{BaseMesh, Vec3};
+use crate::{BaseMesh, MeshError, Vec3};
 
 /// A point in `f64`.
 pub(crate) type P = [f64; 3];
@@ -131,13 +131,22 @@ impl Poly {
 
     /// This mesh, which must be all quads, as a base mesh (positions rounded to `f32`).
     pub(crate) fn to_base_mesh(&self) -> BaseMesh {
+        self.try_to_base_mesh().unwrap()
+    }
+
+    /// This mesh as a base mesh, or why `BaseMesh` rejects it.
+    ///
+    /// # Errors
+    ///
+    /// Any [`MeshError`] from [`BaseMesh::from_polygons`].
+    pub(crate) fn try_to_base_mesh(&self) -> Result<BaseMesh, MeshError> {
         let positions = self.positions.iter().copied().map(to_vec3).collect();
         let faces: Vec<Vec<u32>> = self
             .faces
             .iter()
             .map(|f| f.iter().map(|&v| u32::try_from(v).unwrap()).collect())
             .collect();
-        BaseMesh::from_polygons(positions, &faces).unwrap()
+        BaseMesh::from_polygons(positions, &faces)
     }
 
     /// A base mesh as a polygon mesh, with the same vertex and face numbering.
@@ -164,22 +173,29 @@ impl Poly {
     }
 }
 
-/// A pentagonal prism: two pentagons and five quads. One subdivision step gives a quad mesh with
-/// valence-5 vertices.
-pub(crate) fn pentagonal_prism() -> Poly {
+/// A prism over a regular `sides`-gon: two `sides`-gons and `sides` quads. One subdivision step
+/// gives a quad mesh with valence-`sides` vertices at the caps' centres.
+pub(crate) fn prism(sides: usize) -> Poly {
     let mut positions = Vec::new();
+    let n = u32::try_from(sides).unwrap();
     for z in [-1.0, 1.0] {
-        for k in 0..5 {
-            let a = std::f64::consts::TAU * f64::from(k) / 5.0;
+        for k in 0..n {
+            let a = std::f64::consts::TAU * f64::from(k) / f64::from(n);
             positions.push([a.cos(), a.sin(), z]);
         }
     }
-    let mut faces = vec![vec![4, 3, 2, 1, 0], vec![5, 6, 7, 8, 9]];
-    for i in 0..5 {
-        let j = (i + 1) % 5;
-        faces.push(vec![i, j, 5 + j, 5 + i]);
+    let mut faces = vec![(0..sides).rev().collect(), (sides..2 * sides).collect()];
+    for i in 0..sides {
+        let j = (i + 1) % sides;
+        faces.push(vec![i, j, sides + j, sides + i]);
     }
     Poly { positions, faces }
+}
+
+/// A pentagonal prism: two pentagons and five quads. One subdivision step gives a quad mesh with
+/// valence-5 vertices.
+pub(crate) fn pentagonal_prism() -> Poly {
+    prism(5)
 }
 
 /// Asserts that every point of `ours` is within `tol` of some point of `reference`, and that

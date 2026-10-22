@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::frame::{self, Block, CornerAxes, Frame, frames};
 use crate::subdiv::{CornerRing, Padded, extraordinary, predict, ring_edge_point};
 use crate::topology::{corner_at, edge_to_grid};
-use crate::{BaseMesh, Channel, FaceId, LayerId, Level, Region, TileKey, Vec3};
+use crate::{BaseMesh, Channel, FaceId, LayerId, Level, MAX_VALENCE, Region, TileKey, Vec3};
 
 /// Read access to evaluated positions.
 ///
@@ -80,6 +80,30 @@ pub enum EvalError {
         /// Row.
         j: u32,
     },
+    /// An output buffer doesn't hold exactly one value per block vertex.
+    #[error("the output buffer holds {got} values; the block has {expected} vertices")]
+    BufferSize {
+        /// Vertices in the block: `side²`.
+        expected: usize,
+        /// Length of the buffer given.
+        got: usize,
+    },
+}
+
+/// Checks that `out` holds exactly `expected` values.
+///
+/// # Errors
+///
+/// [`EvalError::BufferSize`] otherwise.
+const fn check_buffer(out: &[Vec3], expected: usize) -> Result<(), EvalError> {
+    if out.len() == expected {
+        Ok(())
+    } else {
+        Err(EvalError::BufferSize {
+            expected,
+            got: out.len(),
+        })
+    }
 }
 
 /// The parent level's block, ring and base-vertex rings.
@@ -151,23 +175,15 @@ fn gather(mesh: &BaseMesh, src: &impl PositionSource, region: Region) -> Result<
             continue;
         };
         // Already read from the owner's copy, like every other input.
-        let center = padded.get(ci, cj);
-        let mut edges = Vec::with_capacity(ring.entries.len());
-        let mut diagonals = Vec::with_capacity(ring.entries.len());
+        let mut corner = CornerRing::new(padded.get(ci, cj), owner_corner);
         for &(g, c) in &ring.entries {
             let point = |s: i64, d: i64| {
                 let (gi, gj) = edge_to_grid(c, n64, s, d);
                 fetch(g, gi, gj)
             };
-            edges.push(point(1, 0)?);
-            diagonals.push(point(1, 1)?);
+            corner.push(point(1, 0)?, point(1, 1)?);
         }
-        *slot = Some(CornerRing {
-            center,
-            edges,
-            diagonals,
-            owner_corner,
-        });
+        *slot = Some(corner);
     }
     Ok(Parent { padded, corners })
 }
@@ -213,16 +229,18 @@ pub fn predict_region(
     // point around it, computed from the ring alone so all copies agree.
     let edge_points = parent.corners.each_ref().map(|c| {
         c.as_ref().map(|ring| {
-            (0..ring.edges.len())
-                .map(|k| ring_edge_point(ring, k))
-                .collect::<Vec<_>>()
+            let mut points = [Vec3::NAN; MAX_VALENCE];
+            for (k, point) in points.iter_mut().enumerate().take(ring.edges().len()) {
+                *point = ring_edge_point(ring, k);
+            }
+            points
         })
     });
     let axes = std::array::from_fn(|c| {
         let ring = parent.corners.get(c)?.as_ref()?;
         Some(CornerAxes {
             center: extraordinary(ring),
-            points: edge_points.get(c)?.as_deref()?,
+            points: edge_points.get(c)?.as_ref()?.get(..ring.edges().len())?,
             owner_corner: ring.owner_corner,
         })
     });
@@ -278,18 +296,38 @@ impl Prediction {
     /// to each predicted position in its frame.
     #[must_use]
     pub fn apply(&self, corrections: impl Fn(u32, u32) -> Vec3) -> Grid {
+        Grid::from_parts(self.side(), self.positions(corrections).collect())
+    }
+
+    /// [`Prediction::apply`] into `out`, row-major `side²`, without allocating.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError::BufferSize`] unless `out` holds exactly `side²` values.
+    pub fn apply_into(
+        &self,
+        corrections: impl Fn(u32, u32) -> Vec3,
+        out: &mut [Vec3],
+    ) -> Result<(), EvalError> {
+        check_buffer(out, self.frames.len())?;
+        for (slot, p) in out.iter_mut().zip(self.positions(corrections)) {
+            *slot = p;
+        }
+        Ok(())
+    }
+
+    /// The final positions, row-major: one per frame.
+    fn positions(&self, corrections: impl Fn(u32, u32) -> Vec3) -> impl Iterator<Item = Vec3> {
         let side = self.side();
-        let data = (0..side)
-            .flat_map(|j| (0..side).map(move |i| (i, j)))
+        (0..side)
+            .flat_map(move |j| (0..side).map(move |i| (i, j)))
             .zip(&self.frames)
-            .map(|((i, j), frame)| {
+            .map(move |((i, j), frame)| {
                 frame.apply(
                     self.predicted.get(i64::from(i), i64::from(j)),
                     corrections(i, j),
                 )
             })
-            .collect();
-        Grid::from_parts(side, data)
     }
 }
 
@@ -338,6 +376,24 @@ pub fn parent_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>
     Ok(recorder.0.into_inner())
 }
 
+/// The tiles of `region`'s own level that [`normals`] reads.
+///
+/// Like [`parent_tiles`], these are base-layer displacement keys naming tile positions (the block,
+/// its one-vertex apron, and every face around a base vertex at the block's corners), recorded
+/// from the same gather [`normals`] runs, so a source holding just these tiles can compute
+/// `region`'s normals. At level 0 the keys are level-0 tiles, which `store` serves from the mesh.
+///
+/// # Errors
+///
+/// [`EvalError::Missing`] only if a read falls outside every tile, which no [`Region`] causes:
+/// the recorder answers every read that has a tile.
+pub fn normal_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>, EvalError> {
+    let recorder = Recorder::default();
+    // The same gather `normals` runs, so the list can't drift from the reads.
+    gather(mesh, &recorder, region)?;
+    Ok(recorder.0.into_inner())
+}
+
 /// Unit normals of `region`'s evaluated positions in `src` (same level).
 ///
 /// Every copy of a shared vertex gets the same bits. Away from base vertices the normal is
@@ -361,12 +417,33 @@ pub fn normals(
     src: &impl PositionSource,
     region: Region,
 ) -> Result<Grid, EvalError> {
+    let side = region.quads() + 1;
+    let count = usize::try_from(side * side).unwrap_or(usize::MAX);
+    let mut data = vec![Vec3::ZERO; count];
+    normals_into(mesh, src, region, &mut data)?;
+    Ok(Grid::from_parts(side, data))
+}
+
+/// [`normals`] into `out`, row-major `(quads + 1)²`.
+///
+/// # Errors
+///
+/// [`EvalError::BufferSize`] unless `out` holds exactly `(quads + 1)²` values, or
+/// [`EvalError::Missing`] as [`normals`].
+pub fn normals_into(
+    mesh: &BaseMesh,
+    src: &impl PositionSource,
+    region: Region,
+    out: &mut [Vec3],
+) -> Result<(), EvalError> {
+    let side = region.quads() + 1;
+    check_buffer(out, usize::try_from(side * side).unwrap_or(usize::MAX))?;
     let gathered = gather(mesh, src, region)?;
     // The level's own ring: the base vertex (the owner's copy) and its edge neighbours.
     let axes = gathered.corners.each_ref().map(|c| {
         c.as_ref().map(|ring| CornerAxes {
             center: ring.center,
-            points: &ring.edges,
+            points: ring.edges(),
             owner_corner: ring.owner_corner,
         })
     });
@@ -378,10 +455,8 @@ pub fn normals(
         y0: region.y0(),
         quads: region.quads(),
     };
-    Ok(Grid::from_parts(
-        region.quads() + 1,
-        frame::normals(&block, &gathered.padded, &axes),
-    ))
+    frame::normals(&block, &gathered.padded, &axes, out);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -874,6 +949,164 @@ mod tests {
             BTreeSet::from([3, 4, 5]),
             "every valence of the subdivided prism"
         );
+    }
+
+    /// Each region's normals come out bit-identical from only its `normal_tiles`, and each listed
+    /// tile is read.
+    fn assert_normal_tiles_suffice(mesh: &BaseMesh, dense: &DenseEvaluation, regions: &[Region]) {
+        for &region in regions {
+            let keys = normal_tiles(mesh, region).unwrap();
+            assert!(
+                keys.iter().all(|k| k.level() == region.level()
+                    && k.layer() == LayerId::BASE
+                    && k.channel() == Channel::DISPLACEMENT),
+                "{region:?}: base-layer displacement keys of the region's level: {keys:?}"
+            );
+            let want = normals(mesh, dense, region).unwrap();
+            let src = Only { dense, keys: &keys };
+            let got = normals(mesh, &src, region)
+                .unwrap_or_else(|e| panic!("{region:?} from {keys:?}: {e}"));
+            let bits = |g: &Grid| g.as_slice().iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "{region:?}: from its normal tiles");
+            for key in &keys {
+                let mut fewer = keys.clone();
+                fewer.remove(key);
+                let short = Only {
+                    dense,
+                    keys: &fewer,
+                };
+                assert!(
+                    matches!(
+                        normals(mesh, &short, region),
+                        Err(EvalError::Missing { .. })
+                    ),
+                    "{region:?}: {key:?} is listed but not read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normal_tiles_suffice() {
+        let top = level(8);
+        let whole_faces = |mesh: &BaseMesh| -> Vec<Region> {
+            [0, 1, 3]
+                .into_iter()
+                .flat_map(|l| mesh.faces().map(move |f| Region::whole_face(f, level(l))))
+                .collect()
+        };
+        {
+            // Every level-8 tile of the cube, and whole faces at levels 0, 1 and 3.
+            let mesh = cube_sphere(1).unwrap();
+            let map = random_corrections(&mesh, 8, 800, 5);
+            let dense = DenseEvaluation::new(&mesh, top, &map).unwrap();
+            let mut regions = tiles_where(&mesh, top, |_, _| true);
+            regions.extend(whole_faces(&mesh));
+            assert_normal_tiles_suffice(&mesh, &dense, &regions);
+        }
+        {
+            // Valence 3, 4 and 5: level-8 tiles at face corners, where the rings are read, an
+            // interior tile, and whole faces.
+            let mesh = pentagonal_prism().subdivide().to_base_mesh();
+            let map = random_corrections(&mesh, 8, 800, 6);
+            let dense = DenseEvaluation::new(&mesh, top, &map).unwrap();
+            let mut regions = tiles_where(&mesh, top, |tx, ty| {
+                ([0, 3].contains(&tx) && [0, 3].contains(&ty)) || (tx, ty) == (1, 2)
+            });
+            regions.extend(whole_faces(&mesh));
+            assert_normal_tiles_suffice(&mesh, &dense, &regions);
+        }
+    }
+
+    #[test]
+    fn normal_tiles_reach_every_face_around_a_valence_five_vertex() {
+        let mesh = pentagonal_prism().subdivide().to_base_mesh();
+        let t = mesh.topology();
+        let (face, ring) = mesh
+            .faces()
+            .flat_map(|f| (0..4).map(move |c| (f, c)))
+            .find_map(|(f, c)| {
+                let ring = t.ring(f, c)?;
+                (ring.entries.len() == 5).then(|| (f, ring.entries.clone()))
+            })
+            .expect("the subdivided prism has valence-5 vertices");
+        let keys = normal_tiles(&mesh, Region::whole_face(face, level(1))).unwrap();
+        for (g, _) in ring {
+            let key = TileKey::displacement(g, level(1), 0, 0).unwrap();
+            assert!(
+                keys.contains(&key),
+                "{face}'s level-1 normals read {g}: {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_into_matches_apply() {
+        let mesh = cube_sphere(1).unwrap();
+        let map = random_corrections(&mesh, 3, 200, 12);
+        let dense = DenseEvaluation::new(&mesh, level(3), &map).unwrap();
+        for face in mesh.faces() {
+            for l in 1..=3 {
+                let region = Region::whole_face(face, level(l));
+                let prediction = predict_region(&mesh, &dense, region).unwrap();
+                let c = block_corrections(&map, region);
+                let grid = prediction.apply(&c);
+                let side = usize::try_from(prediction.side()).unwrap();
+                let mut out = vec![Vec3::NAN; side * side];
+                prediction.apply_into(&c, &mut out).unwrap();
+                let bits = |v: &[Vec3]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&out), bits(grid.as_slice()), "{region:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn buffers_of_the_wrong_size_are_errors() {
+        let mesh = cube_sphere(1).unwrap();
+        let region = Region::whole_face(FaceId::new(1), level(2));
+        let prediction =
+            predict_region(&mesh, &mesh, Region::whole_face(FaceId::new(1), level(1))).unwrap();
+        for len in [8, 10, 0] {
+            let mut out = vec![Vec3::ZERO; len];
+            assert_eq!(
+                prediction.apply_into(|_, _| Vec3::ZERO, &mut out),
+                Err(EvalError::BufferSize {
+                    expected: 9,
+                    got: len
+                }),
+                "apply_into, {len} values"
+            );
+        }
+        let dense = DenseEvaluation::new(&mesh, level(2), &CorrectionMap::new()).unwrap();
+        for len in [24, 26] {
+            let mut out = vec![Vec3::ZERO; len];
+            assert_eq!(
+                normals_into(&mesh, &dense, region, &mut out),
+                Err(EvalError::BufferSize {
+                    expected: 25,
+                    got: len
+                }),
+                "normals_into, {len} values"
+            );
+        }
+    }
+
+    #[test]
+    fn normals_into_matches_normals() {
+        let mesh = pentagonal_prism().subdivide().to_base_mesh();
+        let map = random_corrections(&mesh, 3, 200, 13);
+        let dense = DenseEvaluation::new(&mesh, level(3), &map).unwrap();
+        for face in mesh.faces() {
+            for l in 0..=3 {
+                let region = Region::whole_face(face, level(l));
+                let grid = normals(&mesh, &dense, region).unwrap();
+                let side = usize::try_from(region.quads() + 1).unwrap();
+                let mut out = vec![Vec3::NAN; side * side];
+                normals_into(&mesh, &dense, region, &mut out).unwrap();
+                let bits = |v: &[Vec3]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&out), bits(grid.as_slice()), "{region:?}");
+            }
+        }
     }
 
     #[test]

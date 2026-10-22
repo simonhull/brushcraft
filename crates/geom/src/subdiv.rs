@@ -3,7 +3,7 @@
 //! Every stencil sums commutative pairs in a fixed grouping, so a neighbouring face computing the
 //! same vertex in its own orientation gets bit-identical results (spec, "Seams are exact").
 
-use crate::Vec3;
+use crate::{MAX_VALENCE, Vec3};
 
 /// A square block of one level's grid plus a one-vertex ring: indices `-1 ..= quads + 1` on both
 /// axes. Slots without a value (the ring's four corners) hold NaN.
@@ -61,14 +61,54 @@ impl Padded {
 
 /// The one-ring of a base vertex at one level, owner first (see `Topology`'s rings). Quad `k` is
 /// `(center, edges[k], diagonals[k], edges[k + 1])`.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Held in fixed arrays of [`MAX_VALENCE`] (the mesh rejects higher valences), so gathering a
+/// ring doesn't allocate.
+#[derive(Debug, Clone)]
 pub(crate) struct CornerRing {
     pub(crate) center: Vec3,
-    pub(crate) edges: Vec<Vec3>,
-    pub(crate) diagonals: Vec<Vec3>,
+    edges: [Vec3; MAX_VALENCE],
+    diagonals: [Vec3; MAX_VALENCE],
+    /// How many of `edges` and `diagonals` are the ring's.
+    valence: usize,
     /// The owner face's corner at this vertex: tells frames which ring points lie along the
     /// owner's axes.
     pub(crate) owner_corner: u8,
+}
+
+impl CornerRing {
+    /// A ring with no points yet.
+    pub(crate) const fn new(center: Vec3, owner_corner: u8) -> Self {
+        Self {
+            center,
+            edges: [Vec3::NAN; MAX_VALENCE],
+            diagonals: [Vec3::NAN; MAX_VALENCE],
+            valence: 0,
+            owner_corner,
+        }
+    }
+
+    /// Appends quad `k`'s edge and diagonal points. A ring holds at most [`MAX_VALENCE`];
+    /// `BaseMesh::from_polygons` guarantees no ring is longer.
+    pub(crate) fn push(&mut self, edge: Vec3, diagonal: Vec3) {
+        let k = self.valence;
+        debug_assert!(k < MAX_VALENCE, "valence above MAX_VALENCE");
+        if let (Some(e), Some(d)) = (self.edges.get_mut(k), self.diagonals.get_mut(k)) {
+            *e = edge;
+            *d = diagonal;
+            self.valence = k + 1;
+        }
+    }
+
+    /// The edge neighbours, in ring order.
+    pub(crate) fn edges(&self) -> &[Vec3] {
+        self.edges.get(..self.valence).unwrap_or_default()
+    }
+
+    /// The diagonal neighbours, in ring order.
+    pub(crate) fn diagonals(&self) -> &[Vec3] {
+        self.diagonals.get(..self.valence).unwrap_or_default()
+    }
 }
 
 /// Face point; `a`/`c` and `b`/`d` are the quad's diagonals.
@@ -93,19 +133,20 @@ pub(crate) fn vertex_point(v: Vec3, e: [Vec3; 4], d: [Vec3; 4]) -> Vec3 {
 /// Vertex point at a base vertex of any valence `n`:
 /// `V·(4n − 7)/(4n) + Σe·3/(2n²) + Σd·1/(4n²)`, summed in the ring's canonical order.
 pub(crate) fn extraordinary(ring: &CornerRing) -> Vec3 {
-    let n = f32::from(u16::try_from(ring.edges.len()).unwrap_or(u16::MAX));
+    let n = f32::from(u16::try_from(ring.edges().len()).unwrap_or(u16::MAX));
     let sum = |vs: &[Vec3]| vs.iter().fold(Vec3::ZERO, |s, v| s + *v);
     ring.center * ((4.0 * n - 7.0) / (4.0 * n))
-        + sum(&ring.edges) * (3.0 / (2.0 * n * n))
-        + sum(&ring.diagonals) * (1.0 / (4.0 * n * n))
+        + sum(ring.edges()) * (3.0 / (2.0 * n * n))
+        + sum(ring.diagonals()) * (1.0 / (4.0 * n * n))
 }
 
 /// The next level's edge point on the ring's edge `k`, from the ring alone. Bit-identical to the
 /// same point computed inside any face's grid (same pairs).
 pub(crate) fn ring_edge_point(ring: &CornerRing, k: usize) -> Vec3 {
-    let n = ring.edges.len().max(1);
-    let e = |x: usize| ring.edges.get(x % n).copied().unwrap_or(Vec3::NAN);
-    let d = |x: usize| ring.diagonals.get(x % n).copied().unwrap_or(Vec3::NAN);
+    let (edges, diagonals) = (ring.edges(), ring.diagonals());
+    let n = edges.len().max(1);
+    let e = |x: usize| edges.get(x % n).copied().unwrap_or(Vec3::NAN);
+    let d = |x: usize| diagonals.get(x % n).copied().unwrap_or(Vec3::NAN);
     // Quad k: (v, e_k, d_k, e_{k+1}); quad k − 1: (v, e_{k−1}, d_{k−1}, e_k).
     edge_point(
         ring.center,
@@ -208,6 +249,28 @@ mod tests {
     use super::*;
     use crate::test_rng::Rng;
 
+    /// A ring with owner corner 0 from its points.
+    fn ring_of(center: Vec3, edges: &[Vec3], diagonals: &[Vec3]) -> CornerRing {
+        let mut ring = CornerRing::new(center, 0);
+        for (&e, &d) in edges.iter().zip(diagonals) {
+            ring.push(e, d);
+        }
+        ring
+    }
+
+    #[test]
+    fn rings_hold_up_to_max_valence() {
+        let mut ring = CornerRing::new(Vec3::ZERO, 0);
+        for k in 0..MAX_VALENCE {
+            let x = f32::from(u8::try_from(k).unwrap());
+            ring.push(Vec3::new(x, 0.0, 0.0), Vec3::new(0.0, x, 0.0));
+        }
+        assert_eq!(ring.edges().len(), MAX_VALENCE, "edges");
+        assert_eq!(ring.diagonals().len(), MAX_VALENCE, "diagonals");
+        assert_eq!(ring.edges()[31].x, 31.0, "last edge");
+        assert_eq!(ring.diagonals()[31].y, 31.0, "last diagonal");
+    }
+
     /// A small grid coordinate as `f32`, exactly.
     fn coord(x: i64) -> f32 {
         f32::from(i16::try_from(x).unwrap())
@@ -282,12 +345,7 @@ mod tests {
         let center = random.vec3(1.0);
         let edges: Vec<Vec3> = (0..4).map(|_| random.vec3(1.0)).collect();
         let diagonals: Vec<Vec3> = (0..4).map(|_| random.vec3(1.0)).collect();
-        let ring = CornerRing {
-            center,
-            edges: edges.clone(),
-            diagonals: diagonals.clone(),
-            owner_corner: 0,
-        };
+        let ring = ring_of(center, &edges, &diagonals);
         let regular = vertex_point(
             center,
             [edges[0], edges[1], edges[2], edges[3]],
@@ -312,12 +370,11 @@ mod tests {
         }
         let g = |i, j| parent.get(i, j);
         // A regular vertex at block corner 0, as a ring starting at the quad towards +i, +j.
-        let ring = CornerRing {
-            center: g(0, 0),
-            edges: vec![g(1, 0), g(0, 1), g(-1, 0), g(0, -1)],
-            diagonals: vec![g(1, 1), g(-1, 1), g(-1, -1), g(1, -1)],
-            owner_corner: 0,
-        };
+        let ring = ring_of(
+            g(0, 0),
+            &[g(1, 0), g(0, 1), g(-1, 0), g(0, -1)],
+            &[g(1, 1), g(-1, 1), g(-1, -1), g(1, -1)],
+        );
         let child = predict(&parent, &[Some(ring.clone()), None, None, None]);
         assert_eq!(
             child.get(0, 0).to_bits(),
