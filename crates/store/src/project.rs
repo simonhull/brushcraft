@@ -26,17 +26,36 @@
 //! suffix 16 random ones, so the old and the new file of one project coexist during a save. It
 //! is created as `<name>.tmp`, synced, and renamed into place: a crash mid-create leaves at
 //! most a `.tmp` file, never a half-made file under a recovery file's name.
+//!
+//! # After a crash
+//!
+//! A project's recovery file outlives a crash, or a close that keeps it. [`find_recoveries`]
+//! lists the recovery files no running instance holds, each with the project file it extends
+//! and whether it can be layered back on it ([`CandidateStatus`]): only on the very save point
+//! it names, the project id, the save point's offset **and** its head op matching. Every save
+//! is kept as a save point, so a project saved since still takes it, on that earlier save point
+//! (the restored project then saves as a new file); a project file deleted, replaced or
+//! rewritten can't, and the file is listed so the app can say so, never layered silently.
+//! [`Project::restore`] opens a restorable one as the project, the recovered edits unsaved and
+//! the recovery file going on as its own.
+//!
+//! What a restore gets is the recovery file's last durable save point. Whatever was appended
+//! after it, a flush cut short or tiles of the stroke in progress written back to make room,
+//! is discarded: a save point is the unit of durability, and replaying the tail could bring
+//! back half a stroke. At worst, the stroke in progress is lost.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
 use geom::BaseMesh;
 use thiserror::Error;
 
-use crate::file::{ProjectFile, StoreError, sync_parent};
-use crate::meta::{Meta, ProjectId, Role};
+use crate::OpId;
+use crate::file::{BaseFile, ProjectFile, StoreError, sync_parent};
+use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
 use crate::tiles::{CacheError, Saved, StoreConfig, TileStore};
 
@@ -84,7 +103,8 @@ pub enum ProjectError {
     /// The recovery writer failed.
     #[error("the recovery writer failed")]
     Recovery(#[from] RecoveryError),
-    /// [`Project::save`] on a project never saved: it has no project file yet. Use
+    /// [`Project::save`] on a project with no path: never saved, so it has no project file yet,
+    /// or restored onto an earlier save point of a project file that has moved on since. Use
     /// [`Project::save_as`].
     #[error("the project has never been saved: it needs a path")]
     NoPath,
@@ -102,6 +122,80 @@ pub enum ProjectError {
     /// moving to a new recovery file couldn't read them. The rest of the edits are protected.
     #[error("the edits of {} tiles are not in the recovery file", .0.len())]
     Unprotected(Vec<geom::TileKey>),
+    /// [`Project::restore`] was given a recovery file that can't be layered on its project:
+    /// the status it was listed with, or the one found when the files were opened to restore
+    /// it. Nothing was written, but opening them may have cut off their torn tails, which
+    /// every open for writing does.
+    #[error("the recovery file can't be restored: {0:?}")]
+    NotRestorable(CandidateStatus),
+    /// [`Project::restore`] found another file under the candidate's path than the one listed:
+    /// another project's, or one on another save point. List again.
+    #[error("the recovery file changed since it was listed")]
+    CandidateChanged,
+}
+
+/// A recovery file found by [`find_recoveries`]: what the app shows to offer a restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryCandidate {
+    /// Where the recovery file is.
+    pub path: PathBuf,
+    /// The project it belongs to; for a damaged file, the id its name gives.
+    pub project: ProjectId,
+    /// The save point of the project file it is layered on; `None` for a project never saved,
+    /// or a damaged file.
+    pub base: Option<SavePoint>,
+    /// Where that project file was when the recovery file was made; `None` as for `base`.
+    pub base_path: Option<PathBuf>,
+    /// The newest edit a restore brings back: the recovery file's head op at its last durable
+    /// save point. `None` if it holds no edits (or is damaged): restoring it gives the save
+    /// point alone, or for a project never saved, an empty project.
+    pub last_edit: Option<OpId>,
+    /// When the recovery file was last written to.
+    pub modified: SystemTime,
+    /// Whether it can be restored, and if not, why.
+    pub status: CandidateStatus,
+}
+
+/// Whether a [`RecoveryCandidate`] can be restored ([`Project::restore`]), and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CandidateStatus {
+    /// The recovery file of a project never saved: it holds all of the project's work, and
+    /// restores on its own.
+    NeverSaved,
+    /// The project file is where the recovery file says, and its latest save point is the one
+    /// the recovery file names: the recovered edits layer on it, and the restored project
+    /// saves into the project file as usual.
+    Restorable,
+    /// The project file is where the recovery file says and still has the save point it names,
+    /// but has been saved since (by another instance, or by a save the crash cut short after
+    /// its save point was durable): the recovered edits layer on that earlier save point,
+    /// which every save keeps. Saving into the project file would mix them with the later
+    /// saves, so the restored project has no path and saves as a new file
+    /// ([`Project::save_as`]).
+    RestorableOnEarlierSave,
+    /// No project file of this project is where the recovery file says: it was moved, deleted,
+    /// or replaced by another project (or something else).
+    ProjectMissing,
+    /// The project file is there, but has no save point with the offset **and** head op the
+    /// recovery file names: it was rewritten (compacted, or replaced by another copy of the
+    /// project). The edits would be read through the wrong saved state.
+    SavePointMissing,
+    /// The project file is open in a running instance, which holds it: it can't be checked or
+    /// layered on now.
+    ProjectInUse,
+    /// The recovery file, or the project file it extends, can't be read: its leading records
+    /// are damaged, or it is damaged before a good save point.
+    Damaged,
+}
+
+/// Where a project's recovery file came from, which decides what happens to it if the project
+/// fails to start.
+#[derive(Debug)]
+enum Recovery {
+    /// Just made, empty: deleted if the project fails to start.
+    Fresh(PathBuf),
+    /// Restored after a crash, holding the user's work: kept whatever happens.
+    Restored(PathBuf),
 }
 
 /// An open project: the tile store over the project file's last save and a recovery file of
@@ -121,7 +215,9 @@ pub struct Project {
     /// The project file, held open (and locked) for saves; the store's base reads it. `None`
     /// for a project never saved.
     file: Option<ProjectFile>,
-    /// Where the project file is; `None` for a project never saved.
+    /// Where saves go: the project file's path. `None` for a project never saved, or one
+    /// restored onto an earlier save point of its project file, whose file is held (its base
+    /// reads it) but not saved into.
     path: Option<PathBuf>,
     /// Where the store's working file, the recovery file, is.
     recovery_path: PathBuf,
@@ -159,7 +255,7 @@ impl Project {
         let meta = Meta::new(ProjectId::random()?, Role::Recovery { base: None }, &mesh);
         let (working, recovery_path) = create_recovery(
             &config.recovery_dir,
-            meta,
+            meta.project(),
             |path| ProjectFile::create(path, meta, Arc::clone(&mesh)),
             #[cfg(test)]
             false,
@@ -167,7 +263,7 @@ impl Project {
         Self::start(
             TileStore::open(working, config.store),
             None,
-            recovery_path,
+            Recovery::Fresh(recovery_path),
             config,
         )
     }
@@ -184,17 +280,16 @@ impl Project {
     /// [`StoreError::Locked`]); [`ProjectError::NotAProject`]; [`ProjectError::NeverSaved`];
     /// as [`Project::new`] for the recovery file, the store and the writer.
     pub fn open(path: &Path, config: ProjectConfig) -> Result<Self, ProjectError> {
-        let project = ProjectFile::open(path)?;
+        let path = std::path::absolute(path)?;
+        let project = ProjectFile::open(&path)?;
         if project.meta().role() != Role::Project {
             return Err(ProjectError::NotAProject);
         }
         let base = project.base()?.ok_or(ProjectError::NeverSaved)?;
-        let meta = project.meta().with_role(Role::Recovery {
-            base: Some(base.save_point()),
-        });
+        let meta = project.meta().on_save_point(base.save_point(), &path);
         let (working, recovery_path) = create_recovery(
             &config.recovery_dir,
-            meta,
+            meta.project(),
             |at| ProjectFile::create_like(at, meta, &project),
             #[cfg(test)]
             false,
@@ -202,14 +297,104 @@ impl Project {
         let store = TileStore::open_layered(working, Some(base), config.store);
         Self::start(
             store,
-            Some((project, path.to_path_buf())),
-            recovery_path,
+            Some((project, path)),
+            Recovery::Fresh(recovery_path),
             config,
         )
     }
 
-    /// Starts the recovery writer on `store` and assembles the project; on error, deletes the
-    /// recovery file at `recovery_path`, which nothing was written to.
+    /// Restores the project of a recovery file found by [`find_recoveries`]: a
+    /// [`CandidateStatus::Restorable`] or [`CandidateStatus::RestorableOnEarlierSave`] one
+    /// layered on its project file at the save point it names, a
+    /// [`CandidateStatus::NeverSaved`] one on its own. The recovery file goes on as the
+    /// project's, its edits unsaved (the next save copies them), and is kept until the project
+    /// closes without keeping it.
+    ///
+    /// Everything the candidate was listed with is checked again under the locks a project
+    /// holds, as the files may have changed since: the project file is opened for writing (so
+    /// no other instance writes it meanwhile) and must hold the very save point the recovery
+    /// file names (project id, offset and head op). If that is its latest, the project saves
+    /// into it as usual; if it has been saved since, the restored project reads that earlier
+    /// save point, has no path ([`Project::path`] is `None`), and saves as a new file.
+    ///
+    /// The recovery file opens at its last durable save point; whatever followed it (a flush
+    /// cut short, tiles of the stroke in progress) is discarded.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::NotRestorable`] with the candidate's status if it is neither of the two,
+    /// or with the status the open files show if that has changed (the project file was saved,
+    /// moved or deleted since, or is open elsewhere); [`ProjectError::CandidateChanged`] if
+    /// another file is under the candidate's path; [`ProjectError::Store`] if either file
+    /// can't be opened (the recovery file is held by a running instance:
+    /// [`StoreError::Locked`]); [`ProjectError::Cache`] if the store refuses `config.store`;
+    /// [`ProjectError::Recovery`] if the writer's thread can't be started. The recovery file is
+    /// kept on error.
+    pub fn restore(
+        candidate: &RecoveryCandidate,
+        config: ProjectConfig,
+    ) -> Result<Self, ProjectError> {
+        let recovery = Recovery::Restored(candidate.path.clone());
+        match candidate.status {
+            CandidateStatus::NeverSaved => {
+                let working = ProjectFile::open(&candidate.path)?;
+                let fits = working.meta().project() == candidate.project
+                    && working.meta().role() == (Role::Recovery { base: None });
+                if !fits {
+                    return Err(ProjectError::CandidateChanged);
+                }
+                Self::start(
+                    TileStore::open(working, config.store),
+                    None,
+                    recovery,
+                    config,
+                )
+            }
+            CandidateStatus::Restorable | CandidateStatus::RestorableOnEarlierSave => {
+                let path = candidate
+                    .base_path
+                    .clone()
+                    .ok_or(ProjectError::NotRestorable(CandidateStatus::ProjectMissing))?;
+                let project = ProjectFile::open(&path).map_err(|e| match unavailable(&e) {
+                    Some(status) => ProjectError::NotRestorable(status),
+                    None => e.into(),
+                })?;
+                let working = ProjectFile::open_sharing_mesh(&candidate.path, &project)?;
+                let meta = working.meta();
+                let fits = meta.project() == candidate.project
+                    && meta.role()
+                        == (Role::Recovery {
+                            base: candidate.base,
+                        })
+                    && meta.base_path() == Some(path.as_path());
+                if !fits {
+                    return Err(ProjectError::CandidateChanged);
+                }
+                let (status, base) = standing(meta, &project)?;
+                let saves_into = match status {
+                    CandidateStatus::Restorable => Some(path),
+                    CandidateStatus::RestorableOnEarlierSave => None,
+                    status @ (CandidateStatus::NeverSaved
+                    | CandidateStatus::ProjectMissing
+                    | CandidateStatus::SavePointMissing
+                    | CandidateStatus::ProjectInUse
+                    | CandidateStatus::Damaged) => {
+                        return Err(ProjectError::NotRestorable(status));
+                    }
+                };
+                let store = TileStore::open_layered(working, base, config.store);
+                Self::start_with(store, Some(project), saves_into, recovery, config)
+            }
+            status @ (CandidateStatus::ProjectMissing
+            | CandidateStatus::SavePointMissing
+            | CandidateStatus::ProjectInUse
+            | CandidateStatus::Damaged) => Err(ProjectError::NotRestorable(status)),
+        }
+    }
+
+    /// Starts the recovery writer on `store` and assembles the project, its recovery file at
+    /// `recovery`; on error, deletes that file if it is a fresh one, which nothing was written
+    /// to, and keeps it if it was restored.
     ///
     /// # Errors
     ///
@@ -217,7 +402,25 @@ impl Project {
     fn start(
         opened: Result<TileStore, CacheError>,
         project: Option<(ProjectFile, PathBuf)>,
-        recovery_path: PathBuf,
+        recovery: Recovery,
+        config: ProjectConfig,
+    ) -> Result<Self, ProjectError> {
+        let (file, path) = project.unzip();
+        Self::start_with(opened, file, path, recovery, config)
+    }
+
+    /// [`Project::start`], with the project file and the path saves go to given apart: a
+    /// project restored onto an earlier save point holds its project file (its base reads it)
+    /// but saves only as a new file.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::start`].
+    fn start_with(
+        opened: Result<TileStore, CacheError>,
+        file: Option<ProjectFile>,
+        path: Option<PathBuf>,
+        recovery: Recovery,
         config: ProjectConfig,
     ) -> Result<Self, ProjectError> {
         let started = opened.map_err(ProjectError::from).and_then(|mut store| {
@@ -227,12 +430,14 @@ impl Project {
         let (writer, store) = match started {
             Ok(started) => started,
             Err(e) => {
-                // Best effort: the file is empty, and the error at hand is the one to report.
-                drop(fs::remove_file(&recovery_path));
+                if let Recovery::Fresh(fresh) = &recovery {
+                    // Best effort: the file is empty, and the error at hand is the one to report.
+                    drop(fs::remove_file(fresh));
+                }
                 return Err(e);
             }
         };
-        let (file, path) = project.unzip();
+        let (Recovery::Fresh(recovery_path) | Recovery::Restored(recovery_path)) = recovery;
         Ok(Self {
             writer: Some(writer),
             store,
@@ -259,7 +464,7 @@ impl Project {
     /// holds every edit; saving again works.
     pub fn save(&mut self) -> Result<(), ProjectError> {
         self.poll()?;
-        if self.file.is_none() {
+        if self.path.is_none() {
             return Err(ProjectError::NoPath);
         }
         self.finish_flushes()?;
@@ -284,8 +489,9 @@ impl Project {
     /// file, where the new project file is in place but the project goes on with the old one.
     pub fn save_as(&mut self, path: &Path) -> Result<(), ProjectError> {
         self.poll()?;
-        if fs::symlink_metadata(path).is_ok() {
-            return Err(ProjectError::Exists(path.to_path_buf()));
+        let path = std::path::absolute(path)?;
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(ProjectError::Exists(path));
         }
         self.finish_flushes()?;
         let meta = self
@@ -294,9 +500,9 @@ impl Project {
             .meta()
             .with_project(ProjectId::random()?)
             .with_role(Role::Project);
-        let tmp = temporary(path)?;
+        let tmp = temporary(&path)?;
         let mut project = ProjectFile::create_like(&tmp, meta, self.store.working())?;
-        let written = self.write_new_project(&mut project, &tmp, path);
+        let written = self.write_new_project(&mut project, &tmp, &path);
         let saved = match written {
             Ok(saved) => saved,
             Err(e) => {
@@ -305,10 +511,10 @@ impl Project {
                 return Err(e);
             }
         };
-        self.switch_recovery_to(saved, &project)?;
+        self.switch_recovery_to(saved, &project, &path)?;
         // The old project file closes here, and its lock goes with it.
         self.file = Some(project);
-        self.path = Some(path.to_path_buf());
+        self.path = Some(path);
         Ok(())
     }
 
@@ -370,7 +576,9 @@ impl Project {
         &mut self.store
     }
 
-    /// Where the project file is; `None` for a project never saved.
+    /// Where the project file saves go to is; `None` for a project never saved, or one
+    /// restored onto an earlier save point ([`CandidateStatus::RestorableOnEarlierSave`]),
+    /// which saves as a new file.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -480,10 +688,10 @@ impl Project {
     /// [`ProjectError::Recovery`] if the new writer's thread can't be started;
     /// [`ProjectError::Io`] or [`ProjectError::Store`] if the old file can't be deleted.
     fn roll_over(&mut self) -> Result<Vec<geom::TileKey>, ProjectError> {
-        let meta = *self.store.working().meta();
+        let meta = self.store.working().meta().clone();
         let (fresh, fresh_path) = create_recovery(
             &self.recovery_dir,
-            meta,
+            meta.project(),
             |at| ProjectFile::create_like(at, meta, self.store.working()),
             #[cfg(test)]
             std::mem::take(&mut self.fail_next_recovery),
@@ -515,15 +723,16 @@ impl Project {
     ///
     /// As [`Project::switch_recovery_to`]; [`ProjectError::NoPath`] if there is no project file.
     fn switch_recovery(&mut self, saved: Saved) -> Result<(), ProjectError> {
+        let path = self.path.clone().ok_or(ProjectError::NoPath)?;
         let project = self.file.take().ok_or(ProjectError::NoPath)?;
-        let switched = self.switch_recovery_to(saved, &project);
+        let switched = self.switch_recovery_to(saved, &project, &path);
         self.file = Some(project);
         switched
     }
 
-    /// Creates a fresh recovery file on the save point `saved` proves in `project`, rebases the
-    /// store onto it, and deletes the old recovery file, in that order: the old file goes only
-    /// once the new one is durable and in use.
+    /// Creates a fresh recovery file on the save point `saved` proves in `project`, the project
+    /// file at `path`, rebases the store onto it, and deletes the old recovery file, in that
+    /// order: the old file goes only once the new one is durable and in use.
     ///
     /// # Errors
     ///
@@ -534,13 +743,12 @@ impl Project {
         &mut self,
         saved: Saved,
         project: &ProjectFile,
+        path: &Path,
     ) -> Result<(), ProjectError> {
-        let meta = project.meta().with_role(Role::Recovery {
-            base: Some(saved.save_point()),
-        });
+        let meta = project.meta().on_save_point(saved.save_point(), path);
         let (fresh, fresh_path) = create_recovery(
             &self.recovery_dir,
-            meta,
+            meta.project(),
             |at| ProjectFile::create_like(at, meta, project),
             #[cfg(test)]
             std::mem::take(&mut self.fail_next_recovery),
@@ -582,7 +790,233 @@ impl Drop for Project {
     }
 }
 
-/// Creates a recovery file with `meta` in `dir` through `create`, under a fresh name (see the
+/// How long a recovery file's temporary file must have gone unwritten to be a crash's leftover.
+///
+/// [`find_recoveries`] removes `<name>.tmp` files older than this: an instance creating one
+/// writes and syncs it in well under it.
+const STALE_TEMPORARY: Duration = Duration::from_secs(60);
+
+/// Lists the recovery files in `dir` that no running instance holds, each with whether it can
+/// be restored ([`Project::restore`]) and, if not, why (see the module notes).
+///
+/// The list is ordered for choosing: projects with the most recently written recovery file
+/// first, and a project's files on one save point together, **the one with the newest last
+/// edit first** (then the most recently written). That one is the file to restore: a crash
+/// during a roll-over or a save can leave two files of one project on one save point, the new
+/// one possibly still empty, and the newest edit, not the newest write, says which holds the
+/// work.
+///
+/// Only files named as recovery files are looked at (`<project id>-<suffix>.bcrf`). A file a
+/// running instance holds is skipped: it is locked for writing, and a shared lock probe fails.
+/// Nothing listed is written, not even a torn tail cut off: each file is opened to look at,
+/// read-only, at its last durable save point, and so is the project file a recovery file
+/// names. A missing `dir` has no recovery files.
+///
+/// Temporary files a crash left mid-create (`<recovery file name>.tmp`, never renamed into
+/// place, so never holding edits) are removed, best effort: those unwritten for
+/// a minute and not locked by an instance still making them.
+///
+/// # Errors
+///
+/// [`ProjectError::Io`] if `dir` can't be listed, or a file's metadata read.
+pub fn find_recoveries(dir: &Path) -> Result<Vec<RecoveryCandidate>, ProjectError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some(made) = name.strip_suffix(".tmp")
+            && recovery_name(made).is_some()
+        {
+            sweep(&entry.path());
+            continue;
+        }
+        let Some(named) = recovery_name(name) else {
+            continue;
+        };
+        let modified = match entry.metadata().and_then(|meta| meta.modified()) {
+            Ok(modified) => modified,
+            // Deleted since it was listed: a project closed or saved meanwhile.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(candidate) = candidate(entry.path(), named, modified) {
+            found.push(candidate);
+        }
+    }
+    order(&mut found);
+    Ok(found)
+}
+
+/// Orders candidates as [`find_recoveries`] lists them.
+///
+/// By project, the one whose newest file was written last first; within a project, by save
+/// point (the latest first), and on one save point, the newest last edit first, then the newest
+/// write; then by path, so the order is total.
+fn order(found: &mut [RecoveryCandidate]) {
+    let mut newest: HashMap<ProjectId, SystemTime> = HashMap::new();
+    for candidate in &*found {
+        let at = newest
+            .entry(candidate.project)
+            .or_insert(candidate.modified);
+        *at = (*at).max(candidate.modified);
+    }
+    let offset = |c: &RecoveryCandidate| c.base.map(|point| point.offset);
+    found.sort_by(|a, b| {
+        let newest_of = |c: &RecoveryCandidate| newest.get(&c.project).copied();
+        newest_of(b)
+            .cmp(&newest_of(a))
+            .then_with(|| a.project.cmp(&b.project))
+            .then_with(|| offset(b).cmp(&offset(a)))
+            .then_with(|| b.last_edit.cmp(&a.last_edit))
+            .then_with(|| b.modified.cmp(&a.modified))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+/// Removes the temporary file at `path` if it is a crash's leftover.
+///
+/// It is one if unwritten for [`STALE_TEMPORARY`] and lockable, so no instance is still making
+/// it. Best effort: a file that can't be checked or removed is left for the next listing.
+fn sweep(path: &Path) {
+    let stale = fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= STALE_TEMPORARY);
+    if !stale {
+        return;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return;
+    };
+    // The lock is held across the removal, so an instance can't take the file meanwhile.
+    if file.try_lock().is_ok() {
+        drop(fs::remove_file(path));
+    }
+}
+
+/// The project id a recovery file's name gives, if `name` is one: `<32 hex digits>-<16 hex
+/// digits>.bcrf`, as [`create_recovery`] names them.
+fn recovery_name(name: &str) -> Option<ProjectId> {
+    let stem = name.strip_suffix(EXTENSION)?.strip_suffix('.')?;
+    let (id, suffix) = stem.split_once('-')?;
+    let hex = |s: &str, len| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex(id, 32) || !hex(suffix, 16) {
+        return None;
+    }
+    u128::from_str_radix(id, 16).ok().map(ProjectId::from_bits)
+}
+
+/// The candidate the recovery file at `path` makes, named for project `named`; `None` if a
+/// running instance holds it, or it is gone.
+///
+/// A file whose meta can't be read, or names another project than its name, or isn't a
+/// recovery file at all, is listed as [`CandidateStatus::Damaged`].
+fn candidate(path: PathBuf, named: ProjectId, modified: SystemTime) -> Option<RecoveryCandidate> {
+    let damaged = |at| RecoveryCandidate {
+        path: at,
+        project: named,
+        base: None,
+        base_path: None,
+        last_edit: None,
+        modified,
+        status: CandidateStatus::Damaged,
+    };
+    let file = match ProjectFile::inspect(&path) {
+        Ok(file) => file,
+        Err(StoreError::Locked) => return None,
+        Err(StoreError::Io(e)) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(damaged(path)),
+    };
+    let meta = file.meta();
+    let Role::Recovery { base } = meta.role() else {
+        return Some(damaged(path));
+    };
+    if meta.project() != named {
+        return Some(damaged(path));
+    }
+    let status = match meta.base_path() {
+        None if base.is_none() => CandidateStatus::NeverSaved,
+        None => CandidateStatus::ProjectMissing,
+        Some(at) => match ProjectFile::inspect(at) {
+            Ok(project) => standing(meta, &project).map_or(CandidateStatus::Damaged, |(s, _)| s),
+            Err(e) => unavailable(&e).unwrap_or(CandidateStatus::Damaged),
+        },
+    };
+    Some(RecoveryCandidate {
+        project: named,
+        base,
+        base_path: meta.base_path().map(Path::to_path_buf),
+        last_edit: file.head(),
+        modified,
+        status,
+        path,
+    })
+}
+
+/// How a recovery file with `meta`, layered on a save point, stands against `project`, the
+/// file at its base path, with the base to layer it on if it can be.
+///
+/// `project` must be a project file of the same project and mesh, else the project is
+/// missing. Then the save point `meta` names must be one of its save points, offset and head
+/// op alike: [`CandidateStatus::Restorable`] if it is the latest,
+/// [`CandidateStatus::RestorableOnEarlierSave`] if the project was saved since, and
+/// [`CandidateStatus::SavePointMissing`] if there is none.
+///
+/// # Errors
+///
+/// [`StoreError::Damaged`] if a save point of the project file no longer loads;
+/// [`StoreError::Io`].
+fn standing(
+    meta: &Meta,
+    project: &ProjectFile,
+) -> Result<(CandidateStatus, Option<BaseFile>), StoreError> {
+    let Role::Recovery { base: Some(point) } = meta.role() else {
+        return Ok((CandidateStatus::ProjectMissing, None));
+    };
+    let theirs = project.meta();
+    if theirs.role() != Role::Project
+        || theirs.project() != point.project
+        || theirs.mesh_hash() != meta.mesh_hash()
+    {
+        return Ok((CandidateStatus::ProjectMissing, None));
+    }
+    let latest = project.base()?;
+    if latest.as_ref().map(BaseFile::save_point) == Some(point) {
+        return Ok((CandidateStatus::Restorable, latest));
+    }
+    Ok(match project.base_at(point)? {
+        Some(base) => (CandidateStatus::RestorableOnEarlierSave, Some(base)),
+        None => (CandidateStatus::SavePointMissing, None),
+    })
+}
+
+/// The status a project file that failed to open with `e` gives its recovery file, if the
+/// failure says the project isn't available rather than damaged.
+///
+/// That is [`CandidateStatus::ProjectMissing`] for a file that isn't there, and
+/// [`CandidateStatus::ProjectInUse`] for one a running instance holds.
+fn unavailable(e: &StoreError) -> Option<CandidateStatus> {
+    if let StoreError::Io(io) = e
+        && io.kind() == io::ErrorKind::NotFound
+    {
+        Some(CandidateStatus::ProjectMissing)
+    } else if matches!(e, StoreError::Locked) {
+        Some(CandidateStatus::ProjectInUse)
+    } else {
+        None
+    }
+}
+
+/// Creates a recovery file of `project` in `dir` through `create`, under a fresh name (see the
 /// module notes), and returns it open with its path.
 ///
 /// `create` makes the file at the temporary path it is given, durable; it is then renamed into
@@ -594,13 +1028,13 @@ impl Drop for Project {
 /// done; `create`'s error.
 fn create_recovery(
     dir: &Path,
-    meta: Meta,
+    project: ProjectId,
     create: impl FnOnce(&Path) -> Result<ProjectFile, StoreError>,
     #[cfg(test)] fail: bool,
 ) -> Result<(ProjectFile, PathBuf), ProjectError> {
     fs::create_dir_all(dir)?;
     let suffix = ProjectId::random()?.to_bits() >> 64;
-    let name = format!("{}-{suffix:016x}.{EXTENSION}", meta.project());
+    let name = format!("{project}-{suffix:016x}.{EXTENSION}");
     let path = dir.join(&name);
     let tmp = dir.join(format!("{name}.tmp"));
     let file = create(&tmp)?;

@@ -23,7 +23,7 @@ use crate::codec::{
     CodecError, compress, decode_displacement_into, decompress, displacement_body_len,
     encode_displacement,
 };
-use crate::meta::{Meta, SavePoint, mesh_hash};
+use crate::meta::{MAX_BASE_PATH, Meta, SavePoint, mesh_hash};
 use crate::record::{
     HEAD, Head, KIND_INDEX, KIND_MESH, KIND_META, KIND_TILE, TAIL, frame, parse_head, verify,
 };
@@ -57,9 +57,13 @@ pub const MAX_RAW: u32 = 1 << 20;
 /// larger size, so a damaged or hostile file can't make them allocate more.
 pub const MAX_MESH_RAW: u32 = 64 << 20;
 
-/// The largest `Meta` record payload a reader accepts. A meta is at most 66 bytes; the rest is
-/// room for a later version's fields.
-const MAX_META_PAYLOAD: u32 = 1024;
+/// The largest `Meta` record payload a reader accepts. A meta is at most 70 bytes plus its base
+/// path's [`MAX_BASE_PATH`]; the rest is room for a later version's fields.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_BASE_PATH is 4096, far below u32::MAX"
+)]
+const MAX_META_PAYLOAD: u32 = 1024 + MAX_BASE_PATH as u32;
 
 /// The largest `Mesh` record payload a reader accepts: the stated size, then a zstd frame of at
 /// most [`MAX_MESH_RAW`] bytes, which zstd never expands by more than 1/128 plus a small
@@ -305,7 +309,7 @@ enum Repair {
     Truncate,
     /// Fail with [`StoreError::NeedsRepair`]: the file can't be written. Opens read-only.
     Refuse,
-    /// Leave them in place and open the save point read-only, for compaction.
+    /// Leave them in place and open the save point read-only, for compaction and inspection.
     Ignore,
 }
 
@@ -590,13 +594,6 @@ impl ProjectFile {
     /// # Errors
     ///
     /// As [`ProjectFile::open`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "restoring a recovery file beside its project (the next step) opens it so"
-        )
-    )]
     pub(crate) fn open_sharing_mesh(path: &Path, like: &Self) -> Result<Self, StoreError> {
         Self::open_sharing(path, Some(like))
     }
@@ -669,6 +666,23 @@ impl ProjectFile {
             }
         }
         Ok(this)
+    }
+
+    /// Opens the file at `path` to look at, never to write: read-only, with a shared lock, at
+    /// its latest save point as [`ProjectFile::open`] finds it, but with whatever follows that
+    /// save point left in place. Listing recovery files after a crash opens them so: a file a
+    /// running instance holds is locked, and one being restored isn't repaired by a look.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Locked`] if the file is open for writing; as [`ProjectFile::open`]
+    /// otherwise, except [`StoreError::NeedsRepair`].
+    pub(crate) fn inspect(path: &Path) -> Result<Self, StoreError> {
+        Self::open_latest(
+            open_locked(path, open_readable, Lock::Shared)?,
+            Repair::Ignore,
+            None,
+        )
     }
 
     /// Opens the project at `path` read-only, with a shared lock, at the save point (an Index)
@@ -1035,12 +1049,44 @@ impl ProjectFile {
         Ok(Some(BaseFile {
             reader: self.reader(),
             locations: Arc::new(locations),
-            meta: self.meta,
+            meta: self.meta.clone(),
             save_point: SavePoint {
                 project: self.meta.project(),
                 offset,
                 head: saved_head,
             },
+            head: self.head,
+        }))
+    }
+
+    /// The project file as of `point`, one of its save points, as a base to layer a recovery
+    /// file on ([`ProjectFile::base`] at the latest one); `None` if the file has no such save
+    /// point: none at `point`'s offset in the chain of its current state, or one whose project
+    /// or head op isn't `point`'s.
+    ///
+    /// Every save is kept as a save point, so a recovery file on a save the project has moved
+    /// past since still has its base. The base's head is the whole file's, as with
+    /// [`ProjectFile::base`], so a store's op ids continue after every op in the file.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Damaged`] if an Index of the current chain is; [`StoreError::Io`].
+    pub(crate) fn base_at(&self, point: SavePoint) -> Result<Option<BaseFile>, StoreError> {
+        if point.project != self.meta.project() || !self.save_points()?.contains(&point.offset) {
+            return Ok(None);
+        }
+        let len = self.file.metadata()?.len();
+        let chain = load_chain(&self.file, point.offset, len)?.ok_or(StoreError::Damaged {
+            offset: point.offset,
+        })?;
+        if chain.head != point.head {
+            return Ok(None);
+        }
+        Ok(Some(BaseFile {
+            reader: self.reader(),
+            locations: Arc::new(chain.live),
+            meta: self.meta.clone(),
+            save_point: point,
             head: self.head,
         }))
     }
@@ -1684,12 +1730,7 @@ fn decode_record_at(
 /// Any [`StoreError`] from reading `src` (a damaged live tile is [`StoreError::Damaged`]; one
 /// open for writing, [`StoreError::Locked`]) or writing `dst`, which must not exist.
 pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
-    let from = ProjectFile::open_latest(
-        open_locked(src, open_readable, Lock::Shared)?,
-        Repair::Ignore,
-        None,
-    )?;
-    compact_into(&from, dst)
+    compact_into(&ProjectFile::inspect(src)?, dst)
 }
 
 /// Compacts the project at `path` in place, as [`compact`] does.
@@ -1735,7 +1776,7 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
 ///
 /// As [`compact`].
 fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
-    let mut to = ProjectFile::create_like(dst, from.meta, from)?;
+    let mut to = ProjectFile::create_like(dst, from.meta.clone(), from)?;
     for (key, &Loc { offset, len }) in &from.live {
         let raw = from.read_record(offset, len)?;
         if tile_record(&raw, key).is_none() {
@@ -2959,7 +3000,7 @@ mod tests {
             }),
         };
         let meta = Meta::new(project, role, &mesh);
-        let mut f = ProjectFile::create(&path, meta, Arc::clone(&mesh)).unwrap();
+        let mut f = ProjectFile::create(&path, meta.clone(), Arc::clone(&mesh)).unwrap();
         assert_eq!(*f.meta(), meta, "as created");
         assert_eq!(f.keys().count(), 0, "no tiles");
         f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
@@ -3002,7 +3043,7 @@ mod tests {
         let path = dir.path("p.bcrf");
         let mesh = Arc::new(geom::cube_sphere(3).unwrap());
         let meta = fixture::meta_for(&mesh);
-        let mut f = ProjectFile::create(&path, meta, Arc::clone(&mesh)).unwrap();
+        let mut f = ProjectFile::create(&path, meta.clone(), Arc::clone(&mesh)).unwrap();
         for seq in 1..=10 {
             f.write_displacement(key(u32::try_from(seq % 3).unwrap(), 0), op(seq), &tile(1.0))
                 .unwrap();

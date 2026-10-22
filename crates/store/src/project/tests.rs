@@ -3,6 +3,9 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
+mod crash;
+mod restore;
+
 use geom::CorrectionMap;
 
 use super::*;
@@ -373,7 +376,7 @@ fn fail_and_roll_over(project: &mut Project, map: &mut CorrectionMap, seed: u64)
     while project.recovery_path() == old {
         project.poll().unwrap();
         assert!(
-            began.elapsed() < std::time::Duration::from_secs(30),
+            began.elapsed() < Duration::from_secs(30),
             "the roll-over happens"
         );
         std::thread::yield_now();
@@ -457,10 +460,7 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
     let failed = loop {
         match project.poll() {
             Ok(()) => {
-                assert!(
-                    began.elapsed() < std::time::Duration::from_secs(30),
-                    "the sync fails"
-                );
+                assert!(began.elapsed() < Duration::from_secs(30), "the sync fails");
                 std::thread::yield_now();
             }
             Err(e) => break e,

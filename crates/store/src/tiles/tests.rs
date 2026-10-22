@@ -174,6 +174,14 @@ pub(crate) fn apply(store: &mut TileStore, map: &mut CorrectionMap, edits: &[Edi
     }
 }
 
+/// Applies `edits` to the oracle's map alone: what a store over `mesh` that made them holds.
+pub(crate) fn record(mesh: &BaseMesh, map: &mut CorrectionMap, edits: &[Edit]) {
+    for e in edits {
+        map.set(mesh.topology(), e.face, e.level, e.i, e.j, e.c)
+            .unwrap();
+    }
+}
+
 /// The oracle: every level up to [`TOP`], evaluated densely.
 pub(crate) fn dense(mesh: &BaseMesh, map: &CorrectionMap) -> DenseEvaluation {
     DenseEvaluation::new(mesh, level(TOP), map).unwrap()

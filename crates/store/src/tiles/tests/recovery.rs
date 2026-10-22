@@ -712,7 +712,7 @@ fn a_roll_over_carries_every_edit_and_lists_what_it_cannot_read() {
         .write_all_at(&bytes[at..=at], loc.middle())
         .unwrap();
 
-    let meta = *store.file.meta();
+    let meta = store.file.meta().clone();
     let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
     let generation = store.generation();
     let (old, lost) = store.roll_over(fresh).unwrap();

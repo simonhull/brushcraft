@@ -751,6 +751,9 @@ impl TileStore {
     /// the base's file, records after its save point included), else at sequence 0 of the site,
     /// so the store's edits are newer than everything it reads or might copy.
     ///
+    /// The tiles a recovery file already holds (one restored after a crash) count as edits no
+    /// save has made part of the project file: the next save copies them.
+    ///
     /// # Errors
     ///
     /// [`CacheError::ReservedSite`]; [`CacheError::MeshMismatch`] if the base's mesh hash isn't
@@ -784,6 +787,11 @@ impl TileStore {
             config.site,
             [working.head(), base.as_ref().and_then(BaseFile::head)],
         )?;
+        // A recovery file holds only edits no save has: a restored one's are still to save.
+        let since_rebase = match working.meta().role() {
+            Role::Recovery { .. } => working.keys().copied().collect(),
+            Role::Project => BTreeSet::new(),
+        };
         let mut feed = ChangeFeed::new();
         let save_consumer = feed.subscribe();
         Ok(Self {
@@ -798,7 +806,7 @@ impl TileStore {
             evaluated: Pool::with_eviction_log(config.chunk_bytes),
             deps: DepGraph::new(),
             unsaved: HashMap::new(),
-            since_rebase: BTreeSet::new(),
+            since_rebase,
             epoch: 0,
             latest_edit: None,
             generation: 0,
@@ -837,7 +845,8 @@ impl TileStore {
     /// [`CacheError::WrongBase`] if `project` isn't a project file; [`CacheError::MeshMismatch`]
     /// if it is over another mesh; [`CacheError::Save`] if a write to it, a read of the working
     /// file, or its save point fails; [`CacheError::Internal`] for a broken slot, or an edited
-    /// tile that is nowhere to copy from.
+    /// tile that is nowhere to copy from, or a tile of the recovery file that wasn't copied
+    /// ([`Invariant::NotInSave`], checked before the save point is written).
     pub(crate) fn save_into(&mut self, project: &mut ProjectFile) -> Result<Saved, CacheError> {
         self.sync_pins()?;
         if project.meta().role() != Role::Project {
@@ -869,6 +878,16 @@ impl TileStore {
             {
                 return Err(Invariant::NothingToSave(*key).into());
             }
+        }
+        // Every tile of a recovery file is an edit since the last save point, so it must have
+        // been copied: a save point without one would lose it once the store is rebased.
+        let recovery = matches!(self.file.meta().role(), Role::Recovery { .. });
+        if let Some(missing) = self
+            .file
+            .keys()
+            .find(|key| recovery && !self.since_rebase.contains(key))
+        {
+            return Err(Invariant::NotInSave(*missing).into());
         }
         project.save().map_err(CacheError::Save)?;
         let base = project
