@@ -5,8 +5,15 @@
 //! it. A slot holds one tile, named by its [`TileKey`]. When every mapped slot is in use, the
 //! clock picks a victim among the unpinned ones, skipping those referenced since its last pass,
 //! and writes it back first if it is dirty.
+//!
+//! Chunks should be large: glibc serves an allocation from `mmap` (and so returns it to the OS
+//! when it is dropped) only above its mmap threshold, which adapts upwards to as much as 32 MiB.
+//! A smaller chunk may come from the heap and stay with the process after the pool gives it
+//! back to the budget. The default 64 MB chunk is above it; tests use small chunks knowingly.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 
 use bytemuck::Pod;
 use geom::TileKey;
@@ -15,6 +22,10 @@ use thiserror::Error;
 use crate::StoreError;
 
 /// Bytes the pools may use, shared by all of them.
+///
+/// A pool must always be used with the same `Budget`: it takes bytes from the budget it is given
+/// when it maps a chunk and gives them back to the budget it is given when it unmaps one, and
+/// can't tell two budgets apart.
 #[derive(Debug)]
 pub(crate) struct Budget {
     limit: usize,
@@ -50,18 +61,113 @@ impl Budget {
     }
 
     /// Gives back `bytes` taken earlier.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if more is given back than is in use: a pool was used with another
+    /// budget.
     fn give(&mut self, bytes: usize) {
+        debug_assert!(
+            bytes <= self.used,
+            "giving back {bytes} bytes of {} used: a pool changed budgets",
+            self.used
+        );
         self.used = self.used.saturating_sub(bytes);
     }
 }
 
-/// A slot handle. Valid until the slot is evicted or removed: the pool checks the generation on
-/// every use, so a stale handle finds nothing rather than another tile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SlotId {
+/// A handle to a slot of a [`Pool<T>`]. Valid until the slot is evicted or removed: the pool
+/// checks the generation on every use, so a stale handle finds nothing rather than another tile.
+///
+/// The slot type is part of the handle's type, so a handle from one pool can't index another
+/// pool of a different slot type. (`fn() -> T` keeps the handle `Send`, `Sync` and `Copy`
+/// whatever `T` is.)
+pub(crate) struct SlotId<T> {
+    /// The chunk the slot is in.
     chunk: u32,
+    /// The slot's index in its chunk.
     index: u32,
+    /// The slot's generation when the handle was made.
     generation: u32,
+    /// Ties the handle to its pool's slot type.
+    pool: PhantomData<fn() -> T>,
+}
+
+impl<T> SlotId<T> {
+    /// The handle of the slot at `pos` in its generation `generation`.
+    const fn new((chunk, index): Pos, generation: u32) -> Self {
+        Self {
+            chunk,
+            index,
+            generation,
+            pool: PhantomData,
+        }
+    }
+
+    /// The fields that identify the slot, for the trait impls.
+    const fn parts(&self) -> (u32, u32, u32) {
+        (self.chunk, self.index, self.generation)
+    }
+}
+
+/// Implemented by hand: deriving would require `T: Clone`.
+impl<T> Clone for SlotId<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// Implemented by hand: deriving would require `T: Copy`.
+impl<T> Copy for SlotId<T> {}
+
+/// Implemented by hand: deriving would require `T: PartialEq`.
+impl<T> PartialEq for SlotId<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+/// Implemented by hand: deriving would require `T: Eq`.
+impl<T> Eq for SlotId<T> {}
+
+/// Implemented by hand: deriving would require `T: Hash`.
+impl<T> Hash for SlotId<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+/// Implemented by hand: deriving would require `T: Debug`.
+impl<T> std::fmt::Debug for SlotId<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotId")
+            .field("chunk", &self.chunk)
+            .field("index", &self.index)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// Whether a slot's contents are current, as [`Pool::lookup`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Freshness {
+    /// The contents are current.
+    Fresh,
+    /// The tile was invalidated while the slot was pinned or dirty: the slot keeps its key and
+    /// generation (so handles stay valid) but its contents must be recomputed in place, then
+    /// marked with [`Pool::mark_fresh`].
+    Stale,
+}
+
+/// What [`Pool::invalidate`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Invalidated {
+    /// The key had no slot.
+    Absent,
+    /// The slot was unpinned and clean, and is free now.
+    Freed,
+    /// The slot is pinned or dirty, so it stays, marked [`Freshness::Stale`].
+    Marked,
 }
 
 /// Why a pool operation failed.
@@ -102,6 +208,8 @@ struct Meta {
     referenced: bool,
     /// Changed since it was last written back.
     dirty: bool,
+    /// Invalidated while it couldn't be freed: the contents are to be recomputed in place.
+    stale: bool,
 }
 
 /// A slot position: chunk and index in it.
@@ -156,21 +264,21 @@ impl<T: Pod> Pool<T> {
         self.chunks.iter().flatten().count() * self.chunk_bytes
     }
 
-    /// `key`'s slot, marking it referenced.
-    pub(crate) fn lookup(&mut self, key: &TileKey) -> Option<SlotId> {
+    /// `key`'s slot and whether its contents are current, marking it referenced.
+    pub(crate) fn lookup(&mut self, key: &TileKey) -> Option<(SlotId<T>, Freshness)> {
         let pos = *self.index.get(key)?;
         let meta = self.meta_mut(pos)?;
         meta.referenced = true;
-        let generation = meta.generation;
-        Some(SlotId {
-            chunk: pos.0,
-            index: pos.1,
-            generation,
-        })
+        let freshness = if meta.stale {
+            Freshness::Stale
+        } else {
+            Freshness::Fresh
+        };
+        Some((SlotId::new(pos, meta.generation), freshness))
     }
 
     /// The slot's contents, or `None` for a stale handle.
-    pub(crate) fn get(&self, id: SlotId) -> Option<&T> {
+    pub(crate) fn get(&self, id: SlotId<T>) -> Option<&T> {
         self.live(id)?;
         self.chunks
             .get(id.chunk as usize)?
@@ -179,7 +287,7 @@ impl<T: Pod> Pool<T> {
     }
 
     /// The slot's contents, or `None` for a stale handle.
-    pub(crate) fn get_mut(&mut self, id: SlotId) -> Option<&mut T> {
+    pub(crate) fn get_mut(&mut self, id: SlotId<T>) -> Option<&mut T> {
         self.live(id)?;
         self.chunks
             .get_mut(id.chunk as usize)?
@@ -200,7 +308,7 @@ impl<T: Pod> Pool<T> {
         key: TileKey,
         budget: &mut Budget,
         write_back: impl FnMut(TileKey, &T) -> Result<(), StoreError>,
-    ) -> Result<SlotId, PoolError> {
+    ) -> Result<SlotId<T>, PoolError> {
         if self.index.contains_key(&key) {
             return Err(PoolError::Present);
         }
@@ -217,6 +325,7 @@ impl<T: Pod> Pool<T> {
                 pins: 0,
                 referenced: true,
                 dirty: false,
+                stale: false,
             };
             meta.generation
         };
@@ -224,11 +333,7 @@ impl<T: Pod> Pool<T> {
             bytemuck::bytes_of_mut(slot).fill(0);
         }
         self.index.insert(key, pos);
-        Ok(SlotId {
-            chunk: pos.0,
-            index: pos.1,
-            generation,
-        })
+        Ok(SlotId::new(pos, generation))
     }
 
     /// Pins the slot: the clock and [`Pool::evict_all`] leave it alone until it is unpinned as
@@ -237,21 +342,59 @@ impl<T: Pod> Pool<T> {
     /// # Errors
     ///
     /// [`PoolError::Stale`].
-    pub(crate) fn pin(&mut self, id: SlotId) -> Result<(), PoolError> {
+    pub(crate) fn pin(&mut self, id: SlotId<T>) -> Result<(), PoolError> {
         let meta = self.live_mut(id).ok_or(PoolError::Stale)?;
         meta.pins += 1;
         Ok(())
     }
 
-    /// Undoes one [`Pool::pin`].
+    /// Undoes one [`Pool::pin`]. A [`Freshness::Stale`] slot loses its `referenced` mark, so it
+    /// is the clock's first victim once nothing pins it.
     ///
     /// # Errors
     ///
     /// [`PoolError::Stale`], [`PoolError::NotPinned`].
-    pub(crate) fn unpin(&mut self, id: SlotId) -> Result<(), PoolError> {
+    pub(crate) fn unpin(&mut self, id: SlotId<T>) -> Result<(), PoolError> {
         let meta = self.live_mut(id).ok_or(PoolError::Stale)?;
         meta.pins = meta.pins.checked_sub(1).ok_or(PoolError::NotPinned)?;
+        if meta.stale {
+            meta.referenced = false;
+        }
         Ok(())
+    }
+
+    /// Marks the slot's contents current again, after recomputing a [`Freshness::Stale`] slot in
+    /// place.
+    ///
+    /// # Errors
+    ///
+    /// [`PoolError::Stale`] for a stale handle (the slot was freed since).
+    pub(crate) fn mark_fresh(&mut self, id: SlotId<T>) -> Result<(), PoolError> {
+        self.live_mut(id).ok_or(PoolError::Stale)?.stale = false;
+        Ok(())
+    }
+
+    /// Invalidates `key`'s tile: its contents no longer follow from its inputs.
+    ///
+    /// An unpinned, clean slot is freed (its handles go stale). A pinned slot can't be, since a
+    /// reader holds it, and a dirty one isn't silently, since its changes would be lost: either
+    /// stays, keeping its key and generation, marked [`Freshness::Stale`] for [`Pool::lookup`] to
+    /// report, so the caller recomputes it in place (and writes back or discards a dirty one's
+    /// changes).
+    pub(crate) fn invalidate(&mut self, key: &TileKey) -> Invalidated {
+        let Some(&pos) = self.index.get(key) else {
+            return Invalidated::Absent;
+        };
+        let Some(meta) = self.meta_mut(pos) else {
+            return Invalidated::Absent;
+        };
+        if meta.pins > 0 || meta.dirty {
+            meta.stale = true;
+            return Invalidated::Marked;
+        }
+        self.release(pos);
+        self.free.push(pos);
+        Invalidated::Freed
     }
 
     /// Marks the slot as changed (to be written back before it is reused) or written back.
@@ -259,17 +402,17 @@ impl<T: Pod> Pool<T> {
     /// # Errors
     ///
     /// [`PoolError::Stale`].
-    pub(crate) fn set_dirty(&mut self, id: SlotId, dirty: bool) -> Result<(), PoolError> {
+    pub(crate) fn set_dirty(&mut self, id: SlotId<T>, dirty: bool) -> Result<(), PoolError> {
         self.live_mut(id).ok_or(PoolError::Stale)?.dirty = dirty;
         Ok(())
     }
 
     /// Whether the slot is dirty; `None` for a stale handle.
-    pub(crate) fn is_dirty(&self, id: SlotId) -> Option<bool> {
+    pub(crate) fn is_dirty(&self, id: SlotId<T>) -> Option<bool> {
         self.live(id).map(|meta| meta.dirty)
     }
 
-    /// Frees `key`'s slot without writing it back (invalidation); whether it had one.
+    /// Frees `key`'s slot without writing it back; whether it had one.
     ///
     /// # Errors
     ///
@@ -508,13 +651,13 @@ impl<T: Pod> Pool<T> {
     }
 
     /// The live slot's bookkeeping, or `None` if `id` is stale.
-    fn live(&self, id: SlotId) -> Option<&Meta> {
+    fn live(&self, id: SlotId<T>) -> Option<&Meta> {
         self.meta_of((id.chunk, id.index))
             .filter(|m| m.generation == id.generation && m.key.is_some())
     }
 
     /// As [`Pool::live`], mutably.
-    fn live_mut(&mut self, id: SlotId) -> Option<&mut Meta> {
+    fn live_mut(&mut self, id: SlotId<T>) -> Option<&mut Meta> {
         self.meta_mut((id.chunk, id.index))
             .filter(|m| m.generation == id.generation && m.key.is_some())
     }
@@ -551,10 +694,19 @@ mod tests {
     }
 
     /// Acquires `key` and stores `value` in its slot.
-    fn put(pool: &mut Pool<Small>, budget: &mut Budget, n: u32, value: u64) -> SlotId {
+    fn put(pool: &mut Pool<Small>, budget: &mut Budget, n: u32, value: u64) -> SlotId<Small> {
         let id = pool.acquire(key(n), budget, no_write_back).unwrap();
         *pool.get_mut(id).unwrap() = [value, u64::from(n)];
         id
+    }
+
+    /// A pinned handle in [`never_exceeds_the_budget`]'s workload: handles of the two pools are
+    /// different types.
+    enum Pinned {
+        /// In the correction pool.
+        Corrections(SlotId<CorrectionSlot>),
+        /// In the evaluated pool.
+        Evaluated(SlotId<EvaluatedSlot>),
     }
 
     #[test]
@@ -570,8 +722,7 @@ mod tests {
             rng ^= rng << 17;
             rng % n
         };
-        // Pinned slots: which pool, and the handle.
-        let mut pinned: Vec<(bool, SlotId)> = Vec::new();
+        let mut pinned: Vec<Pinned> = Vec::new();
         let (mut fulls, mut grown) = (0, 0);
         for step in 0..20_000 {
             let in_corrections = next(2) == 0;
@@ -602,29 +753,36 @@ mod tests {
                 6 | 7 => with_pool!(|pool| {
                     pool.lookup(&k);
                 }),
-                8 if pinned.len() < 6 => with_pool!(|pool| {
-                    if let Some(id) = pool.lookup(&k) {
-                        pool.pin(id).unwrap();
-                        pinned.push((in_corrections, id));
-                    }
-                }),
-                9 => {
-                    if let Some((in_c, id)) = pinned.pop() {
-                        if in_c {
-                            corrections.unpin(id).unwrap();
-                        } else {
-                            evaluated.unpin(id).unwrap();
-                        }
-                    }
+                8 if pinned.len() < 6 => {
+                    let handle = if in_corrections {
+                        corrections.lookup(&k).map(|(id, _)| {
+                            corrections.pin(id).unwrap();
+                            Pinned::Corrections(id)
+                        })
+                    } else {
+                        evaluated.lookup(&k).map(|(id, _)| {
+                            evaluated.pin(id).unwrap();
+                            Pinned::Evaluated(id)
+                        })
+                    };
+                    pinned.extend(handle);
                 }
+                9 => match pinned.pop() {
+                    Some(Pinned::Corrections(id)) => corrections.unpin(id).unwrap(),
+                    Some(Pinned::Evaluated(id)) => evaluated.unpin(id).unwrap(),
+                    None => {}
+                },
                 10 | 11 => with_pool!(|pool| {
-                    if let Some(id) = pool.lookup(&k) {
+                    if let Some((id, _)) = pool.lookup(&k) {
                         pool.set_dirty(id, next(2) == 0).unwrap();
                     }
                 }),
-                12 | 13 => with_pool!(|pool| match pool.remove(&k) {
+                12 => with_pool!(|pool| match pool.remove(&k) {
                     Ok(_) | Err(PoolError::Pinned | PoolError::Dirty) => {}
                     Err(e) => panic!("remove: {e}"),
+                }),
+                13 => with_pool!(|pool| {
+                    pool.invalidate(&k);
                 }),
                 14 if step % 7 == 0 => with_pool!(|pool| pool.evict_all(|_, _| Ok(())).unwrap()),
                 15 if step % 5 == 0 => with_pool!(|pool| {
@@ -644,11 +802,10 @@ mod tests {
                 corrections.bytes() + evaluated.bytes(),
                 "step {step}: the budget counts exactly the mapped chunks"
             );
-            for &(in_c, id) in &pinned {
-                let live = if in_c {
-                    corrections.get(id).is_some()
-                } else {
-                    evaluated.get(id).is_some()
+            for handle in &pinned {
+                let live = match *handle {
+                    Pinned::Corrections(id) => corrections.get(id).is_some(),
+                    Pinned::Evaluated(id) => evaluated.get(id).is_some(),
                 };
                 assert!(live, "step {step}: a pinned slot stays");
             }
@@ -659,7 +816,7 @@ mod tests {
     #[test]
     fn everything_pinned_is_full() {
         let (mut pool, mut budget) = small(4, 1);
-        let ids: Vec<SlotId> = (0..4).map(|n| put(&mut pool, &mut budget, n, 7)).collect();
+        let ids: Vec<SlotId<Small>> = (0..4).map(|n| put(&mut pool, &mut budget, n, 7)).collect();
         for &id in &ids {
             pool.pin(id).unwrap();
         }
@@ -671,14 +828,22 @@ mod tests {
             "nothing to evict"
         );
         for (n, &id) in (0..).zip(&ids) {
-            assert_eq!(pool.lookup(&key(n)), Some(id), "tile {n} kept its slot");
+            assert_eq!(
+                pool.lookup(&key(n)),
+                Some((id, Freshness::Fresh)),
+                "tile {n} kept its slot"
+            );
             assert_eq!(pool.get(id), Some(&[7, u64::from(n)]), "tile {n} unchanged");
         }
         assert!(
             pool.evict_all(no_write_back).is_ok(),
             "evict_all skips them"
         );
-        assert_eq!(pool.lookup(&key(0)), Some(ids[0]), "still there");
+        assert_eq!(
+            pool.lookup(&key(0)),
+            Some((ids[0], Freshness::Fresh)),
+            "still there"
+        );
         pool.unpin(ids[0]).unwrap();
         assert!(
             matches!(pool.unpin(ids[0]), Err(PoolError::NotPinned)),
@@ -707,7 +872,7 @@ mod tests {
             matches!(failed, Err(PoolError::WriteBack(_))),
             "error returned"
         );
-        let victim = pool.lookup(&key(0)).unwrap();
+        let (victim, _) = pool.lookup(&key(0)).unwrap();
         assert_eq!(pool.is_dirty(victim), Some(true), "still dirty");
         assert_eq!(pool.get(victim), Some(&[100, 0]), "still there");
 
@@ -726,7 +891,7 @@ mod tests {
             "each dirty victim once, clean ones never"
         );
         written.clear();
-        let id = pool.lookup(&key(19)).unwrap();
+        let (id, _) = pool.lookup(&key(19)).unwrap();
         pool.set_dirty(id, true).unwrap();
         pool.evict_all(|k, v: &Small| {
             written.push((k, *v));
@@ -770,9 +935,133 @@ mod tests {
     }
 
     #[test]
+    fn remove_refuses_pinned_and_dirty_slots() {
+        let (mut pool, mut budget) = small(4, 1);
+        let dirty = put(&mut pool, &mut budget, 0, 5);
+        pool.set_dirty(dirty, true).unwrap();
+        assert!(
+            matches!(pool.remove(&key(0)), Err(PoolError::Dirty)),
+            "a dirty slot's changes would be lost"
+        );
+        assert_eq!(pool.get(dirty), Some(&[5, 0]), "it stays as it was");
+        assert_eq!(pool.is_dirty(dirty), Some(true), "and dirty");
+        let pinned = put(&mut pool, &mut budget, 1, 6);
+        pool.pin(pinned).unwrap();
+        assert!(
+            matches!(pool.remove(&key(1)), Err(PoolError::Pinned)),
+            "a pinned slot is in use"
+        );
+        assert_eq!(pool.get(pinned), Some(&[6, 1]), "it stays too");
+        pool.set_dirty(dirty, false).unwrap();
+        assert!(pool.remove(&key(0)).unwrap(), "clean and unpinned: removed");
+    }
+
+    #[test]
+    fn invalidating_an_unpinned_clean_slot_frees_it() {
+        let (mut pool, mut budget) = small(2, 1);
+        assert_eq!(pool.invalidate(&key(0)), Invalidated::Absent, "no slot");
+        let a = put(&mut pool, &mut budget, 0, 1);
+        put(&mut pool, &mut budget, 1, 2);
+        assert_eq!(pool.invalidate(&key(0)), Invalidated::Freed, "freed");
+        assert_eq!(pool.lookup(&key(0)), None, "gone");
+        assert_eq!(pool.get(a), None, "its handle is stale");
+        let b = put(&mut pool, &mut budget, 2, 3);
+        assert_eq!(
+            (b.chunk, b.index),
+            (a.chunk, a.index),
+            "back on the free list"
+        );
+        assert_eq!(
+            pool.lookup(&key(1)).map(|(_, f)| f),
+            Some(Freshness::Fresh),
+            "the other tile wasn't touched"
+        );
+    }
+
+    #[test]
+    fn invalidating_a_pinned_slot_marks_it_stale_in_place() {
+        let (mut pool, mut budget) = small(4, 1);
+        let ids: Vec<SlotId<Small>> = (0..4).map(|n| put(&mut pool, &mut budget, n, 8)).collect();
+        pool.pin(ids[2]).unwrap();
+        pool.pin(ids[2]).unwrap();
+        assert_eq!(
+            pool.invalidate(&key(2)),
+            Invalidated::Marked,
+            "pinned: marked"
+        );
+        assert_eq!(
+            pool.lookup(&key(2)),
+            Some((ids[2], Freshness::Stale)),
+            "same key, same handle, reported stale"
+        );
+        assert_eq!(
+            pool.get(ids[2]),
+            Some(&[8, 2]),
+            "contents kept for the reader"
+        );
+        *pool.get_mut(ids[2]).unwrap() = [9, 2];
+        pool.mark_fresh(ids[2]).unwrap();
+        assert_eq!(
+            pool.lookup(&key(2)),
+            Some((ids[2], Freshness::Fresh)),
+            "recomputed in place"
+        );
+
+        // Stale again, then unpinned: the clock takes it first, although every slot was
+        // referenced and the hand starts at slot 0.
+        assert_eq!(
+            pool.invalidate(&key(2)),
+            Invalidated::Marked,
+            "still pinned"
+        );
+        pool.unpin(ids[2]).unwrap();
+        pool.unpin(ids[2]).unwrap();
+        let id = pool.acquire(key(9), &mut budget, no_write_back).unwrap();
+        assert_eq!(
+            (id.chunk, id.index),
+            (ids[2].chunk, ids[2].index),
+            "the stale slot is the first victim"
+        );
+        assert_eq!(pool.get(ids[2]), None, "its old handle is stale");
+        assert_eq!(
+            pool.lookup(&key(9)).map(|(_, f)| f),
+            Some(Freshness::Fresh),
+            "fresh"
+        );
+        for n in [0, 1, 3] {
+            assert!(pool.lookup(&key(n)).is_some(), "tile {n} kept");
+        }
+    }
+
+    #[test]
+    fn invalidating_a_dirty_slot_never_frees_it() {
+        let (mut pool, mut budget) = small(2, 1);
+        let id = put(&mut pool, &mut budget, 0, 4);
+        pool.set_dirty(id, true).unwrap();
+        assert_eq!(
+            pool.invalidate(&key(0)),
+            Invalidated::Marked,
+            "dirty: marked"
+        );
+        assert_eq!(pool.get(id), Some(&[4, 0]), "its changes kept");
+        assert_eq!(pool.is_dirty(id), Some(true), "still dirty");
+        assert_eq!(
+            pool.lookup(&key(0)),
+            Some((id, Freshness::Stale)),
+            "reported stale"
+        );
+        pool.set_dirty(id, false).unwrap();
+        assert_eq!(
+            pool.invalidate(&key(0)),
+            Invalidated::Freed,
+            "clean now: freed"
+        );
+    }
+
+    #[test]
     fn shrink_returns_chunks() {
         let (mut pool, mut budget) = small(2, 3);
-        let ids: Vec<SlotId> = (0..6).map(|n| put(&mut pool, &mut budget, n, 9)).collect();
+        let ids: Vec<SlotId<Small>> = (0..6).map(|n| put(&mut pool, &mut budget, n, 9)).collect();
         assert_eq!(pool.bytes(), budget.limit(), "filled");
         pool.set_dirty(ids[5], true).unwrap();
         pool.pin(ids[3]).unwrap();

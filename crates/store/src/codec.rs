@@ -87,6 +87,19 @@ pub(crate) fn decode_displacement_into(
     body: &[u8],
     slot: &mut CorrectionSlot,
 ) -> Result<(), CodecError> {
+    let decoded = fill_slot(header, body, slot);
+    if decoded.is_err() {
+        bytemuck::bytes_of_mut(slot).fill(0);
+    }
+    decoded
+}
+
+/// [`decode_displacement_into`] without clearing `slot` on error.
+///
+/// # Errors
+///
+/// As [`decode_displacement_into`].
+fn fill_slot(header: &[u8], body: &[u8], slot: &mut CorrectionSlot) -> Result<(), CodecError> {
     let Header { side, scale } = parse_header(header)?;
     let (n, ring) = counts(side)?;
     let (interior, border) = body
@@ -278,6 +291,21 @@ mod tests {
             decode_displacement(&header, &raw[1..]).is_err(),
             "short body"
         );
+        let mut slot = CorrectionSlot::zeroed();
+        for extra in [1, 2, 12, 64] {
+            slot.reset(9).unwrap();
+            let mut long = raw.clone();
+            long.resize(raw.len() + extra, 0);
+            assert_eq!(
+                decode_displacement_into(&header, &long, &mut slot),
+                Err(CodecError::Size),
+                "body {extra} bytes too long"
+            );
+            assert!(
+                slot.view().is_err(),
+                "{extra} too long: the slot holds no tile"
+            );
+        }
         assert!(decompress(b"not zstd", 100).is_err(), "not a zstd frame");
     }
 

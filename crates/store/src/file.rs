@@ -6,8 +6,8 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use geom::{Channel, CorrectionTile, TileKey};
 use thiserror::Error;
@@ -82,6 +82,9 @@ pub enum StoreError {
     /// Another open of the file holds a conflicting lock: one writer, or any number of readers.
     #[error("the project file is open elsewhere")]
     Locked,
+    /// The project file a reader was made from has been closed (its owner dropped).
+    #[error("the project file has been closed")]
+    Closed,
     /// A payload doesn't fit the format's length fields, or a tile body is larger than
     /// [`MAX_RAW`].
     #[error("record payload too large")]
@@ -314,8 +317,8 @@ struct TileRecord<'a> {
 /// An open project file.
 #[derive(Debug)]
 pub struct ProjectFile {
-    /// Shared with [`FileReader`]s: the lock, which belongs to the open file, is held until the
-    /// last of them is dropped.
+    /// The open file, which holds the lock. [`FileReader`]s hold it weakly, so dropping the
+    /// `ProjectFile` closes the file and releases the lock (once any read in flight ends).
     file: Arc<File>,
     /// Where the next record goes.
     end: u64,
@@ -690,7 +693,10 @@ impl ProjectFile {
         slot: &mut CorrectionSlot,
         scratch: &mut ReadScratch,
     ) -> Result<Option<OpId>, StoreError> {
-        check_displacement(key, key.side())?;
+        if let Err(e) = check_displacement(key, key.side()) {
+            bytemuck::bytes_of_mut(slot).fill(0);
+            return Err(e);
+        }
         let Some(loc) = self.locate(key) else {
             return Ok(None);
         };
@@ -702,7 +708,8 @@ impl ProjectFile {
         self.live.get(key).copied()
     }
 
-    /// A reader for other threads, sharing this open file (and its lock).
+    /// A reader for other threads. It reads this open file while it stays open, and doesn't keep
+    /// it (or its lock) open after this `ProjectFile` is dropped.
     #[cfg_attr(
         not(test),
         expect(
@@ -712,7 +719,7 @@ impl ProjectFile {
     )]
     pub(crate) fn reader(&self) -> FileReader {
         FileReader {
-            file: Arc::clone(&self.file),
+            file: Arc::downgrade(&self.file),
         }
     }
 
@@ -838,7 +845,9 @@ impl ProjectFile {
 /// Reads tiles of an open [`ProjectFile`] from any thread.
 ///
 /// It reads at locations the owner looked up ([`ProjectFile::locate`]). The file is append-only
-/// while open, so a location stays valid; the file's lock is held while any reader lives.
+/// while open, so a location stays valid. A reader doesn't keep the file open: once its
+/// [`ProjectFile`] is dropped, the file closes and its lock is released (after any read in
+/// flight, which holds the file for its duration), and reads fail with [`StoreError::Closed`].
 #[derive(Debug, Clone)]
 #[cfg_attr(
     not(test),
@@ -848,7 +857,8 @@ impl ProjectFile {
     )
 )]
 pub(crate) struct FileReader {
-    file: Arc<File>,
+    /// The owner's open file, upgraded for the length of each read.
+    file: Weak<File>,
 }
 
 impl FileReader {
@@ -859,8 +869,8 @@ impl FileReader {
     ///
     /// [`StoreError::Damaged`] if the record fails its checksum, isn't a tile of `key` or doesn't
     /// decompress; [`StoreError::NotDisplacement`], [`StoreError::WrongSide`],
-    /// [`StoreError::Codec`] as for [`ProjectFile::read_displacement`]; [`StoreError::Io`]. On
-    /// error `slot` holds no tile.
+    /// [`StoreError::Codec`] as for [`ProjectFile::read_displacement`]; [`StoreError::Closed`] if
+    /// the [`ProjectFile`] has been dropped; [`StoreError::Io`]. On error `slot` holds no tile.
     #[cfg_attr(
         not(test),
         expect(
@@ -875,8 +885,15 @@ impl FileReader {
         slot: &mut CorrectionSlot,
         scratch: &mut ReadScratch,
     ) -> Result<OpId, StoreError> {
-        check_displacement(key, key.side())?;
-        read_displacement_at(&self.file, key, loc, slot, scratch)
+        let file = check_displacement(key, key.side())
+            .and_then(|()| self.file.upgrade().ok_or(StoreError::Closed));
+        match file {
+            Ok(file) => read_displacement_at(&file, key, loc, slot, scratch),
+            Err(e) => {
+                bytemuck::bytes_of_mut(slot).fill(0);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -2017,6 +2034,72 @@ mod tests {
                 Err(StoreError::Damaged { .. })
             ),
             "the owner's read agrees"
+        );
+    }
+
+    #[test]
+    fn a_reader_lets_go_of_the_file_when_its_owner_drops() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path).unwrap();
+        f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
+        f.save().unwrap();
+        let loc = f.locate(&key(1, 0)).unwrap();
+        let reader = f.reader();
+        let clone = reader.clone();
+        drop(reader);
+        drop(f);
+        let reopened = ProjectFile::open(&path);
+        assert!(
+            reopened.is_ok(),
+            "the lock went with the owner: {reopened:?}"
+        );
+        let mut scratch = ReadScratch::new().unwrap();
+        let mut slot = bytemuck::zeroed_box::<CorrectionSlot>();
+        slot.reset(65).unwrap();
+        assert!(
+            matches!(
+                clone.read_displacement_into(&key(1, 0), loc, &mut slot, &mut scratch),
+                Err(StoreError::Closed)
+            ),
+            "a reader of a closed file reads nothing"
+        );
+        assert!(slot.view().is_err(), "and leaves no tile");
+    }
+
+    #[test]
+    fn a_body_that_decompresses_short_is_damaged() {
+        let dir = TestDir::new();
+        let mut f = ProjectFile::create(&dir.path("p.bcrf")).unwrap();
+        let k = small_key(1);
+        let (header, body) = encode_displacement(&small_tile(0.5)).unwrap();
+        // States the right size, but the frame holds one border value less.
+        let short = &body[..body.len() - 4];
+        let payload =
+            tile_payload(k, op(1), &header, body.len(), &compress(short).unwrap()).unwrap();
+        let loc = f.append(KIND_TILE, &payload).unwrap();
+        let mut scratch = ReadScratch::new().unwrap();
+        let mut slot = bytemuck::zeroed_box::<CorrectionSlot>();
+        assert!(
+            matches!(
+                f.reader()
+                    .read_displacement_into(&k, loc, &mut slot, &mut scratch),
+                Err(StoreError::Damaged { offset }) if offset == loc.offset
+            ),
+            "the reader rejects it"
+        );
+        assert!(slot.view().is_err(), "and leaves no tile");
+        f.live.insert(k, loc);
+        assert!(
+            matches!(
+                f.read_displacement(&k),
+                Err(StoreError::Damaged { offset }) if offset == loc.offset
+            ),
+            "so does the owner"
+        );
+        assert!(
+            matches!(f.read_tile(&k), Err(StoreError::Damaged { .. })),
+            "and the raw read"
         );
     }
 
