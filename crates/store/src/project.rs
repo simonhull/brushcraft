@@ -153,7 +153,8 @@ pub enum ProjectError {
     CandidateChanged,
     /// The call did what it was asked (a save, say: the project goes on with its new recovery
     /// file), but the old recovery file at `path` couldn't be deleted. It holds nothing the
-    /// project needs any more; until it is deleted, [`find_recoveries`] lists it, on the save
+    /// project needs any more. The project holds it until it closes, so no listing offers it
+    /// meanwhile; after that, until it is deleted, [`find_recoveries`] lists it, on the save
     /// point it was made on.
     #[error("the old recovery file {path:?} couldn't be deleted")]
     OldRecoveryKept {
@@ -275,6 +276,9 @@ pub struct Project {
     /// How long the next failed roll-over makes the project wait before trying again:
     /// [`ROLL_OVER_RETRY`], doubling up to a minute while the failures go on.
     retry_after: Duration,
+    /// Old recovery files that couldn't be deleted, held (and locked) until the project closes,
+    /// so no listing offers them while it runs (see [`Project::let_go`]).
+    held: Vec<ProjectFile>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename (see
     /// [`Unplaced::crash`]).
@@ -518,6 +522,7 @@ impl Project {
             unreported: BTreeSet::new(),
             retry_at: None,
             retry_after: ROLL_OVER_RETRY,
+            held: Vec::new(),
             #[cfg(test)]
             fail_next_recovery: false,
         })
@@ -555,8 +560,8 @@ impl Project {
                 self.switch_recovery(saved, &project, &path)
             });
         self.file = Some(project);
-        let old = switched?;
-        retire(&old)?;
+        let (old_path, old) = switched?;
+        self.let_go(&old_path, old)?;
         self.report()
     }
 
@@ -617,12 +622,12 @@ impl Project {
         };
         // The new project file lacks them whatever happens next, as `save` reports them.
         self.unreported.extend(saved.lost());
-        let old = self.switch_recovery(saved, &project, &path)?;
+        let (old_path, old) = self.switch_recovery(saved, &project, &path)?;
         // The switch has happened: the store reads the new project file, so the project holds
         // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
         self.path = Some(path);
-        retire(&old)?;
+        self.let_go(&old_path, old)?;
         self.report()
     }
 
@@ -864,7 +869,8 @@ impl Project {
     /// every edit from the store ([`TileStore::fill_roll_over`]: synced, a save point, synced),
     /// and only then renamed into place, so a crash meanwhile leaves no file under a recovery
     /// file's name that lacks the edits of the old one. Then the store swaps it in
-    /// ([`TileStore::roll_over`]), a new writer streams into it, and the old file is deleted.
+    /// ([`TileStore::roll_over`]), the old file is deleted, and only then unlocked
+    /// ([`Project::let_go`]), and a new writer streams into the new one.
     ///
     /// # Errors
     ///
@@ -895,21 +901,21 @@ impl Project {
                 return Err(e.into());
             }
         };
-        drop(old);
         self.unreported.extend(lost);
         if let Some(failed) = self.writer.take() {
             // It can only say that it needs a new file; closing releases its subscription.
             drop(failed.close(&mut self.store, Instant::now()));
         }
         let old_path = std::mem::replace(&mut self.recovery_path, fresh_path);
+        let retired = self.let_go(&old_path, old);
         self.writer = Some(RecoveryWriter::new(&mut self.store)?);
-        retire(&old_path)
+        retired
     }
 
     /// Creates a fresh recovery file on the save point `saved` proves in `project`, the project
-    /// file at `path`, and rebases the store onto the pair; returns the old recovery file's
-    /// path, for the caller to delete ([`retire`]) once it holds `project`: the old
-    /// file goes only once the new one is durable and in use.
+    /// file at `path`, and rebases the store onto the pair; returns the old recovery file, and
+    /// its path, for the caller to delete ([`Project::let_go`]) once it holds `project`: the
+    /// old file goes only once the new one is durable and in use.
     ///
     /// Once this returns, the switch has happened: the store reads `project` and writes the
     /// new recovery file. On error nothing has changed.
@@ -923,7 +929,7 @@ impl Project {
         saved: Saved,
         project: &ProjectFile,
         path: &Path,
-    ) -> Result<PathBuf, ProjectError> {
+    ) -> Result<(PathBuf, ProjectFile), ProjectError> {
         let meta = project.meta().on_save_point(saved.save_point(), path);
         let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
             ProjectFile::create_like(at, meta, project)
@@ -942,8 +948,25 @@ impl Project {
                 return Err(e.into());
             }
         };
-        drop(old);
-        Ok(std::mem::replace(&mut self.recovery_path, fresh_path))
+        Ok((std::mem::replace(&mut self.recovery_path, fresh_path), old))
+    }
+
+    /// Deletes the old recovery file `old`, at `path`, which the project has moved on from
+    /// ([`retire`]), while still holding it, and only then closes it.
+    ///
+    /// A recovery file is unlocked only once it is gone, so [`find_recoveries`] never finds a
+    /// running project's old file unheld and offers to restore it. One that can't be deleted is
+    /// held until the project closes (or is dropped): only then is it listed.
+    ///
+    /// # Errors
+    ///
+    /// As [`retire`].
+    fn let_go(&mut self, path: &Path, old: ProjectFile) -> Result<(), ProjectError> {
+        let retired = retire(path);
+        if retired.is_err() {
+            self.held.push(old);
+        }
+        retired
     }
 }
 
