@@ -17,6 +17,7 @@ mod meta;
 mod op;
 mod pool;
 mod prefetch;
+mod project;
 mod record;
 mod recovery;
 mod slot;
@@ -31,5 +32,6 @@ pub use file::{
 };
 pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
+pub use project::{Project, ProjectConfig, ProjectError, default_recovery_dir};
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 pub use tiles::{CacheError, Invariant, PinGuard, StoreConfig, TileEdit, TileStore};
