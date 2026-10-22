@@ -920,10 +920,29 @@ impl TileStore {
         let region = Region::of_tile(&key);
         let parents = parent_tiles(&self.mesh, region)?;
         let mut held = Vec::with_capacity(parents.len());
-        let computed = self.predict_into_scratch(key, region, &parents, &mut held);
+        // The tile is stored and recorded before its parents are unpinned: a parent evicted in
+        // between would take its node, and the edges to its own parents, out of the graph.
+        let computed = self
+            .predict_into_scratch(key, region, &parents, &mut held)
+            .and_then(|()| self.store_positions(key, &parents));
         let released = self.unpin_held(&held);
-        computed?;
+        let id = computed?;
         released?;
+        Ok(id)
+    }
+
+    /// Copies the positions in the scratch buffer into `key`'s slot (a new one, or its stale
+    /// one in place), marks it fresh and records it as predicted from `parents`, which the
+    /// caller still holds pinned.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Pool`] if no slot can be had.
+    fn store_positions(
+        &mut self,
+        key: TileKey,
+        parents: &BTreeSet<TileKey>,
+    ) -> Result<SlotId<EvaluatedSlot>, CacheError> {
         // A stale slot (pinned elsewhere, so still here) is overwritten in place: its handles
         // stay valid.
         let id = match self.evaluated.lookup(&key) {
@@ -934,7 +953,7 @@ impl TileStore {
         let slot = self.evaluated.get_mut(id).ok_or(PoolError::Stale)?;
         prefix_mut(&mut slot.positions, n)?.copy_from_slice(prefix(&self.scratch, n)?);
         self.evaluated.mark_fresh(id)?;
-        self.deps.record_positions(key, &parents);
+        self.deps.record_positions(key, parents);
         #[cfg(test)]
         self.log.positions.push(key);
         Ok(id)
@@ -998,13 +1017,17 @@ impl TileStore {
         // The tile's own block is among them; inserting it makes that plain.
         inputs.insert(key);
         let mut held = Vec::with_capacity(inputs.len());
-        let computed = self.normals_into_slot(key, region, &inputs, &mut held);
+        // Recorded while the inputs are pinned, as positions are (see `ensure_positions`).
+        let computed = self
+            .normals_into_slot(key, region, &inputs, &mut held)
+            .inspect(|_| {
+                self.deps.record_normals(key, &inputs);
+                #[cfg(test)]
+                self.log.normals.push(key);
+            });
         let released = self.unpin_held(&held);
         let id = computed?;
         released?;
-        self.deps.record_normals(key, &inputs);
-        #[cfg(test)]
-        self.log.normals.push(key);
         Ok(id)
     }
 

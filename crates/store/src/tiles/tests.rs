@@ -1060,6 +1060,9 @@ fn random_workload(seed: u64, steps: u32) {
             store.corrections.bytes() + store.evaluated.bytes(),
             "seed {seed} step {step} ({what}): the budget counts the pools' chunks"
         );
+        if let Err(broken) = store.deps.check_invariants() {
+            panic!("seed {seed} step {step} ({what}): dependency graph: {broken}");
+        }
     }
     drop(guards);
     drain_prefetch(&mut store);
@@ -1082,7 +1085,11 @@ fn random_workload(seed: u64, steps: u32) {
 
 #[test]
 fn random_workloads_respect_the_budget() {
-    random_workload(0x00B0_D6E7, 2_000);
+    // Seed 1 evicts a parent between its child's prediction and the child's slot: the window
+    // where recording the child after unpinning its parents lost the parent's ancestry.
+    for seed in [0x00B0_D6E7, 1] {
+        random_workload(seed, 2_000);
+    }
 }
 
 #[test]
