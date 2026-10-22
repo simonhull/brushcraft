@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+description = "Base mesh, Catmull–Clark subdivision, correction pyramid, tile math and quantization."
 
 [lints]
 workspace = true
 
 [dependencies]
+thiserror.workspace = true
