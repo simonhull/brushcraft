@@ -1,5 +1,5 @@
-//! The crash test, the one this milestone exists for: a real process, killed by
-//! `std::process::abort` mid-stroke or mid-flush, and its project restored by the next one.
+//! The crash test, the one this milestone exists for: a real process, killed mid-stroke or
+//! mid-flush, and its project restored by the next one.
 //!
 //! # How it runs
 //!
@@ -11,19 +11,26 @@
 //! [`DIR`] where; without them it does nothing.
 //!
 //! The child creates a project with its recovery files in that directory, saves it once (or
-//! never), makes N strokes, waiting after each until its flush is durable, and then crashes:
-//! either mid-stroke, after edits with no stroke end, or mid-flush, at a chosen phase of the
-//! flush of a stroke that ended. It runs under a shell's `ulimit -c 0`, so the abort leaves no
-//! core file.
+//! never), makes N strokes, waiting after each until its flush is durable, and then gets to
+//! where it is to crash: either mid-stroke, after edits with no stroke end, or mid-flush, at a
+//! chosen phase of the flush of a stroke that ended. There it prints [`READY`] and blocks for
+//! good, and the parent kills it with `SIGKILL`.
 //!
-//! The parent checks that the child died of `SIGABRT`, lists the recovery files, restores the
+//! `SIGKILL` is as abrupt for the files as an abort: the process runs nothing more, no drop and
+//! no flush, and keeps only what it wrote to the page cache. Unlike an abort, it leaves no core
+//! dump, so a run of the tests doesn't fill the system's crash log (or set off the desktop's
+//! crash notifications).
+//!
+//! The parent checks that the child died of `SIGKILL`, lists the recovery files, restores the
 //! one it finds, and checks the evaluation against the dense evaluation of exactly the edits
-//! that should have survived: every completed stroke, none of the aborted one. Then it saves
-//! the restored project and checks the project file holds them too.
+//! that should have survived: every completed stroke, none of the interrupted one. Then it
+//! saves the restored project and checks the project file holds them too.
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
@@ -39,62 +46,68 @@ const DIR: &str = "BRUSHCRAFT_CRASH_DIR";
 /// The child test's full path, as libtest names it.
 const CHILD_TEST: &str = "project::tests::crash::crash_child";
 
-/// The signal `std::process::abort` raises.
-const SIGABRT: i32 = 6;
+/// The line the child prints once it is where it is to crash, before it blocks for the kill.
+const READY: &str = "brushcraft crash child: ready to be killed";
+
+/// The signal [`std::process::Child::kill`] sends.
+const SIGKILL: i32 = 9;
+
+/// How long the parent waits for the child to get where it is to crash.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Edits per stroke.
 const EDITS: u32 = 60;
 
 /// Edits of the stroke the crash interrupts: enough for the tight budget to write some of its
 /// tiles back.
-const ABORTED_EDITS: u32 = 400;
+const INTERRUPTED_EDITS: u32 = 400;
 
 /// The seed of the stroke made before the save.
 const SAVED_SEED: u64 = 7;
 
 /// The seed of the stroke the crash interrupts.
-const ABORTED_SEED: u64 = 999;
+const INTERRUPTED_SEED: u64 = 999;
 
 /// The seed of the `k`th stroke after the save, counting from 0.
 fn seed(k: u32) -> u64 {
     100 + u64::from(k)
 }
 
-/// Where the child aborts.
+/// Where the child crashes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Abort {
+enum Crash {
     /// Mid-stroke: after the edits of one more stroke, with no stroke end.
     MidStroke,
-    /// Mid-flush: one more stroke ends, and the child aborts once its flush is in this phase
+    /// Mid-flush: one more stroke ends, and the child crashes once its flush is in this phase
     /// (by [`RecoveryWriter`]'s test name of it: `encoding`, `syncing tiles` or
     /// `syncing save point`).
     MidFlush(&'static str),
 }
 
-/// What the child does before it aborts.
+/// What the child does before it crashes.
 #[derive(Debug, Clone, Copy)]
 struct Scenario {
     /// Whether the project is saved (once, after one stroke) before the strokes.
     saved: bool,
     /// Strokes made after the save (or from the start), each flushed and durable.
     strokes: u32,
-    /// Where the child aborts.
-    abort: Abort,
+    /// Where the child crashes.
+    crash: Crash,
     /// Whether the child's store runs on the tight budget, writing dirty tiles back to the
     /// recovery file to make room, mid-stroke too.
     tight: bool,
 }
 
-/// `saved:strokes:abort:budget`, for the child's environment: `abort` is `stroke` or the
+/// `saved:strokes:crash:budget`, for the child's environment: `crash` is `stroke` or the
 /// flush phase, `budget` is `tight` or `roomy`.
 impl std::fmt::Display for Scenario {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let abort = match self.abort {
-            Abort::MidStroke => "stroke",
-            Abort::MidFlush(phase) => phase,
+        let crash = match self.crash {
+            Crash::MidStroke => "stroke",
+            Crash::MidFlush(phase) => phase,
         };
         let budget = if self.tight { "tight" } else { "roomy" };
-        write!(f, "{}:{}:{abort}:{budget}", self.saved, self.strokes)
+        write!(f, "{}:{}:{crash}:{budget}", self.saved, self.strokes)
     }
 }
 
@@ -108,11 +121,11 @@ impl FromStr for Scenario {
         let mut next = || parts.next().ok_or_else(bad);
         let saved = next()?.parse().ok().ok_or_else(bad)?;
         let strokes = next()?.parse().ok().ok_or_else(bad)?;
-        let abort = match next()? {
-            "stroke" => Abort::MidStroke,
-            "encoding" => Abort::MidFlush("encoding"),
-            "syncing tiles" => Abort::MidFlush("syncing tiles"),
-            "syncing save point" => Abort::MidFlush("syncing save point"),
+        let crash = match next()? {
+            "stroke" => Crash::MidStroke,
+            "encoding" => Crash::MidFlush("encoding"),
+            "syncing tiles" => Crash::MidFlush("syncing tiles"),
+            "syncing save point" => Crash::MidFlush("syncing save point"),
             _ => return Err(bad()),
         };
         let tight = match next()? {
@@ -123,7 +136,7 @@ impl FromStr for Scenario {
         Ok(Self {
             saved,
             strokes,
-            abort,
+            crash,
             tight,
         })
     }
@@ -138,18 +151,18 @@ impl Scenario {
         }
     }
 
-    /// Whether the aborted stroke's flush got as far as its save point: then the restore
+    /// Whether the interrupted stroke's flush got as far as its save point: then the restore
     /// holds that stroke too.
     ///
     /// A process crash, unlike a power cut, keeps what was written to the page cache, so
     /// whether the save point counts doesn't hang on its sync: it is in the file once the flush
     /// is syncing it, and not before.
     fn keeps_the_last_stroke(self) -> bool {
-        self.abort == Abort::MidFlush("syncing save point")
+        self.crash == Crash::MidFlush("syncing save point")
     }
 
     /// The edits a restore must hold: the saved stroke, every completed stroke, and the
-    /// aborted one only if its save point was written.
+    /// interrupted one only if its save point was written.
     fn survivors(self, mesh: &BaseMesh) -> CorrectionMap {
         let mut map = CorrectionMap::new();
         let mut strokes: Vec<(u64, u32)> = (0..self.strokes).map(|k| (seed(k), EDITS)).collect();
@@ -157,7 +170,7 @@ impl Scenario {
             strokes.insert(0, (SAVED_SEED, EDITS));
         }
         if self.keeps_the_last_stroke() {
-            strokes.push((ABORTED_SEED, ABORTED_EDITS));
+            strokes.push((INTERRUPTED_SEED, INTERRUPTED_EDITS));
         }
         for (seed, count) in strokes {
             record(mesh, &mut map, &random_edits(mesh, TOP, count, seed));
@@ -192,8 +205,17 @@ fn edit(project: &mut Project, count: u32, seed: u64) {
     apply_dabs(project.store(), &mut CorrectionMap::new(), &edits);
 }
 
-/// The crash test's child: runs the scenario in [`SCENARIO`] in the directory in [`DIR`],
-/// then aborts. Does nothing when they aren't set.
+/// Blocks the calling thread for good: the child waits there for its kill, running nothing
+/// more, as a crashed process would.
+fn wait_for_the_kill() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
+/// The crash test's child: runs the scenario in [`SCENARIO`] in the directory in [`DIR`] up
+/// to where it is to crash, prints [`READY`], and waits for the parent to kill it. Does nothing
+/// when they aren't set.
 #[test]
 #[ignore = "the crash test's child: the crash tests run it in a process of its own"]
 fn crash_child() {
@@ -213,9 +235,9 @@ fn crash_child() {
         project.end_stroke().unwrap();
         poll_until_idle(&mut project);
     }
-    edit(&mut project, ABORTED_EDITS, ABORTED_SEED);
-    match scenario.abort {
-        Abort::MidStroke => {
+    edit(&mut project, INTERRUPTED_EDITS, INTERRUPTED_SEED);
+    match scenario.crash {
+        Crash::MidStroke => {
             if scenario.tight {
                 assert!(
                     project.store().working().has_unsaved_tiles(),
@@ -223,7 +245,7 @@ fn crash_child() {
                 );
             }
         }
-        Abort::MidFlush(phase) => {
+        Crash::MidFlush(phase) => {
             project.end_stroke().unwrap();
             let writer = project.writer.as_mut().unwrap();
             while writer.phase() != phase {
@@ -232,29 +254,62 @@ fn crash_child() {
             }
         }
     }
-    std::process::abort();
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{READY}").unwrap();
+    stdout.flush().unwrap();
+    wait_for_the_kill();
 }
 
-/// Runs `scenario` in a child process, which aborts, then restores what it left and checks it.
+/// Runs `scenario` in a child process up to where it is to crash, kills it there with
+/// `SIGKILL`, then restores what it left and checks it.
 fn crash(scenario: Scenario) {
     let dir = TestDir::new();
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(r#"ulimit -c 0 && exec "$0" "$@""#)
-        .arg(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap())
         .args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
         .args(["--test-threads", "1"])
         .env(SCENARIO, scenario.to_string())
         .env(DIR, dir.path(""))
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    // Both pipes are read on threads of their own, so neither fills up and stalls the child,
+    // and a child that never gets there fails the test instead of hanging it.
+    let stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (ready, ready_seen) = mpsc::channel();
+    let out = std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            // After libtest's `test <name> ... `, on the same line.
+            if line.ends_with(READY) {
+                // The parent may have stopped waiting: then nothing listens.
+                ready.send(()).unwrap_or_default();
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    });
+    let err = std::thread::spawn(move || {
+        let mut text = String::new();
+        drop(stderr.read_to_string(&mut text));
+        text
+    });
+    let got_there = ready_seen.recv_timeout(CHILD_TIMEOUT);
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    let output = format!("{}\n{}", out.join().unwrap(), err.join().unwrap());
+    assert!(
+        got_there.is_ok(),
+        "{scenario:?}: the child never got where it was to crash ({status}); its output:\n\
+         {output}"
+    );
     assert_eq!(
-        output.status.signal(),
-        Some(SIGABRT),
-        "{scenario:?}: the child aborts ({}); its output:\n{}{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        status.signal(),
+        Some(SIGKILL),
+        "{scenario:?}: the child is killed ({status}); its output:\n{output}"
     );
     let mut listed = find_recoveries(&dir.path("recovery")).unwrap();
     assert_eq!(
@@ -314,7 +369,7 @@ fn a_crash_mid_stroke_restores_exactly_the_completed_strokes() {
         crash(Scenario {
             saved: true,
             strokes,
-            abort: Abort::MidStroke,
+            crash: Crash::MidStroke,
             tight: false,
         });
     }
@@ -326,7 +381,7 @@ fn a_never_saved_project_restores_from_its_recovery_file_alone() {
         crash(Scenario {
             saved: false,
             strokes,
-            abort: Abort::MidStroke,
+            crash: Crash::MidStroke,
             tight: false,
         });
     }
@@ -338,7 +393,7 @@ fn a_crash_discards_the_stroke_in_progress_written_back_to_make_room() {
         crash(Scenario {
             saved,
             strokes: 3,
-            abort: Abort::MidStroke,
+            crash: Crash::MidStroke,
             tight: true,
         });
     }
@@ -351,7 +406,7 @@ fn a_crash_mid_flush_restores_the_previous_or_the_new_stroke_never_a_mix() {
             crash(Scenario {
                 saved,
                 strokes: 2,
-                abort: Abort::MidFlush(phase),
+                crash: Crash::MidFlush(phase),
                 tight: false,
             });
         }
