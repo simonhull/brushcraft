@@ -333,7 +333,7 @@ fn dropping_the_writer_mid_flush_joins_promptly_and_the_file_reopens() {
 }
 
 #[test]
-fn a_failed_sync_is_reported_and_writes_no_save_point_over_it() {
+fn a_failed_sync_fails_the_writer_and_leaves_the_last_durable_save_point() {
     // The tile sync fails (the first of the flush), then the save point's (the second).
     for (pass, phase) in [(0, "syncing tiles"), (1, "syncing save point")] {
         let dir = TestDir::new();
@@ -343,6 +343,10 @@ fn a_failed_sync_is_reported_and_writes_no_save_point_over_it() {
         let mut writer = RecoveryWriter::new(&mut store).unwrap();
         let mut map = CorrectionMap::new();
         apply(&mut store, &mut map, &random_edits(&mesh, TOP, 60, 81));
+        writer.finish(&mut store, Instant::now()).unwrap();
+        let durable = writer.durable_save_point().unwrap();
+        let saved = map.clone();
+        apply(&mut store, &mut map, &random_edits(&mesh, TOP, 60, 82));
         let points = store.file.save_points().unwrap();
         writer.fail_syncs(pass, 1);
         writer.end_stroke(&mut store, Instant::now()).unwrap();
@@ -359,11 +363,16 @@ fn a_failed_sync_is_reported_and_writes_no_save_point_over_it() {
             matches!(error, RecoveryError::Sync(StoreError::Io(_))),
             "{phase}: reported as a sync failure: {error:?}"
         );
-        assert_eq!(writer.flushes(), 0, "{phase}: no flush completed");
+        assert!(writer.is_failed(), "{phase}: the writer is failed");
+        assert_eq!(
+            writer.flushes(),
+            1,
+            "{phase}: no flush completed after the first"
+        );
         assert_eq!(
             writer.durable_save_point(),
-            None,
-            "{phase}: no save point is durable"
+            Some(durable),
+            "{phase}: the last durable save point stands"
         );
         if pass == 0 {
             assert_eq!(
@@ -372,51 +381,107 @@ fn a_failed_sync_is_reported_and_writes_no_save_point_over_it() {
                 "no save point was written over tiles whose sync failed"
             );
         }
-        // The next stroke end flushes again, the failed flush's edits with it, with nothing new
-        // edited.
-        writer.end_stroke(&mut store, Instant::now()).unwrap();
-        settle(&mut writer, &mut store);
-        assert_eq!(writer.flushes(), 1, "{phase}: the retry is durable");
-        let offset = writer.durable_save_point().unwrap();
+        // Never again into this file: every trigger asks for a new one, and writes nothing.
+        let len = store.working_len();
+        let at_failure = map.clone();
+        apply(&mut store, &mut map, &random_edits(&mesh, TOP, 10, 83));
+        for (what, outcome) in [
+            ("end_stroke", writer.end_stroke(&mut store, Instant::now())),
+            ("finish", writer.finish(&mut store, Instant::now())),
+            (
+                "tick",
+                writer.tick(&mut store, Instant::now() + 2 * FLUSH_INTERVAL),
+            ),
+        ] {
+            assert!(
+                matches!(outcome, Err(RecoveryError::NeedsNewFile)),
+                "{phase}: {what}: {outcome:?}"
+            );
+        }
+        assert_eq!(store.working_len(), len, "{phase}: nothing more written");
         drop(writer);
         drop(store);
-        assert_save_point(&path, offset, &mesh, &map);
+        // The file opens at its last durable save point; if the failed sync was the save
+        // point's, at that save point, which reached the page cache (on a real failure it may
+        // not have reached the disk, and the open finds the one before).
+        assert_save_point(&path, durable, &mesh, &saved);
+        let file = ProjectFile::open(&path).unwrap();
+        let mut reopened = TileStore::open(file, roomy()).unwrap();
+        let latest = if pass == 0 { &saved } else { &at_failure };
+        assert_positions(
+            &mut reopened,
+            &dense(&mesh, latest),
+            &tiles(&mesh, 1, TOP),
+            &format!("{phase}: the latest save point"),
+        );
     }
 }
 
 #[test]
 fn a_failed_sync_surfaces_through_poll_and_finish() {
+    for through in ["finish", "poll"] {
+        let dir = TestDir::new();
+        let mesh = mesh();
+        let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+        let mut writer = RecoveryWriter::new(&mut store).unwrap();
+        apply(
+            &mut store,
+            &mut CorrectionMap::new(),
+            &random_edits(&mesh, TOP, 20, 91),
+        );
+        writer.fail_syncs(0, 1);
+        let outcome = if through == "finish" {
+            writer.finish(&mut store, Instant::now())
+        } else {
+            writer.end_stroke(&mut store, Instant::now()).unwrap();
+            let began = Instant::now();
+            loop {
+                match writer.poll(&mut store) {
+                    Ok(()) if !writer.is_idle() => {
+                        assert!(began.elapsed() < Duration::from_secs(30), "the flush ends");
+                        thread::yield_now();
+                    }
+                    other => break other,
+                }
+            }
+        };
+        assert!(
+            matches!(outcome, Err(RecoveryError::Sync(_))),
+            "{through} reports it: {outcome:?}"
+        );
+        assert!(writer.is_failed(), "{through}: failed");
+        let closed = writer.close(&mut store, Instant::now());
+        assert!(
+            matches!(closed, Err(RecoveryError::NeedsNewFile)),
+            "{through}: closing a failed writer says so: {closed:?}"
+        );
+        assert!(
+            store.streams.is_empty(),
+            "{through}: closing unsubscribes all the same"
+        );
+    }
+}
+
+#[test]
+fn a_failed_sync_with_a_flush_queued_does_not_spin() {
     let dir = TestDir::new();
     let mesh = mesh();
     let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
     let mut writer = RecoveryWriter::new(&mut store).unwrap();
-    apply(
-        &mut store,
-        &mut CorrectionMap::new(),
-        &random_edits(&mesh, TOP, 20, 91),
-    );
+    let mut map = CorrectionMap::new();
     writer.fail_syncs(0, 1);
-    let finished = writer.finish(&mut store, Instant::now());
-    assert!(
-        matches!(finished, Err(RecoveryError::Sync(_))),
-        "finish reports it: {finished:?}"
-    );
-    writer.fail_syncs(0, 1);
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 30, 91));
     writer.end_stroke(&mut store, Instant::now()).unwrap();
-    let began = Instant::now();
-    let polled = loop {
-        match writer.poll(&mut store) {
-            Ok(()) if !writer.is_idle() => {
-                assert!(began.elapsed() < Duration::from_secs(30), "the flush ends");
-                thread::yield_now();
-            }
-            other => break other,
-        }
-    };
-    assert!(
-        matches!(polled, Err(RecoveryError::Sync(_))),
-        "poll reports it: {polled:?}"
-    );
-    writer.close(&mut store, Instant::now()).unwrap();
-    assert!(store.streams.is_empty(), "closing unsubscribes");
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 30, 92));
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    assert!(!writer.is_idle(), "a flush in flight and one queued");
+    let mut steps = 0;
+    let mut failed = false;
+    while !writer.is_idle() {
+        steps += 1;
+        assert!(steps < 10, "the writer settles");
+        failed |= writer.step_blocking(&mut store).is_err();
+    }
+    assert!(failed && writer.is_failed(), "the sync failed the writer");
+    assert_eq!(writer.phase(), "failed", "and the queued flush was dropped");
 }

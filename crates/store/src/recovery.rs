@@ -40,19 +40,24 @@
 //!
 //! # Failure
 //!
-//! An error in any phase is returned by the call that met it, and the flush is abandoned:
-//! the edits it held stay in the store's flush mark (or, if already appended, in the file
-//! waiting for a save point), and the next trigger tries again. A failed sync is reported as
-//! [`RecoveryError::Sync`]. After one, the kernel may have dropped the unsynced pages, so the
-//! records appended since the last durable save point may not be on disk although the store
-//! counts them as written; the caller should treat the working file as suspect.
+//! An error in any phase is returned by the call that met it, and the flush is abandoned, along
+//! with any flush queued behind it: the edits it held stay in the store's flush mark (or, if
+//! already appended, in the file waiting for a save point), and the next trigger tries again.
+//!
+//! A failed sync is different, and final for the file. After one, the kernel may have dropped
+//! the unsynced pages, so the records appended since the last durable save point may not be on
+//! disk although the store counts them as written, and a later sync that succeeds proves
+//! nothing about them. So the writer stops writing to the file: it is **failed**, it never
+//! writes another save point there, and every trigger returns [`RecoveryError::NeedsNewFile`].
+//! The file stays at its last durable save point. The owner ([`crate::Project`]) rolls over to
+//! a new recovery file, copying every edit into it from the store, and starts a new writer.
 //!
 //! # Shutdown
 //!
 //! Dropping the writer stops its thread and joins it: the thread checks a stop flag between
 //! tiles, so it returns after at most the tile or sync in hand. A flush in flight is abandoned;
-//! the file holds whole records and save points only, and reopens to the last durable save point
-//! plus whatever complete records follow it.
+//! the file reopens at its last save point, and what the flush had appended after it is
+//! discarded.
 
 use std::io;
 use std::sync::Arc;
@@ -91,6 +96,10 @@ pub enum RecoveryError {
     /// The writer thread has stopped (it panicked): no flush can be finished.
     #[error("the recovery writer's thread has stopped")]
     Stopped,
+    /// A sync of the working file failed earlier, so the writer no longer writes to it (see
+    /// the module notes): the edits need a new recovery file and a new writer.
+    #[error("the recovery file failed to sync: the edits need a new one")]
+    NeedsNewFile,
     /// A reply arrived that the flush in flight wasn't waiting for: a bug in the writer.
     #[error("the recovery writer's thread replied out of step")]
     OutOfStep,
@@ -113,6 +122,8 @@ enum Phase {
         /// Where the save point starts.
         offset: u64,
     },
+    /// A sync failed: no flush will be made into this file again (see the module notes).
+    Failed,
 }
 
 /// What the owner asks of the writer thread.
@@ -280,7 +291,7 @@ impl RecoveryWriter {
     /// Any [`RecoveryError`] of the step that failed; the flush is abandoned (see the module
     /// notes).
     pub fn poll(&mut self, store: &mut TileStore) -> Result<(), RecoveryError> {
-        while self.phase != Phase::Idle {
+        while !matches!(self.phase, Phase::Idle | Phase::Failed) {
             let reply = match self.replies.try_recv() {
                 Ok(reply) => reply,
                 Err(TryRecvError::Empty) => return Ok(()),
@@ -301,7 +312,7 @@ impl RecoveryWriter {
     pub fn finish(&mut self, store: &mut TileStore, now: Instant) -> Result<(), RecoveryError> {
         self.poll(store)?;
         self.trigger(store, now)?;
-        while self.phase != Phase::Idle {
+        while !matches!(self.phase, Phase::Idle | Phase::Failed) {
             self.wait_step(store)?;
         }
         Ok(())
@@ -319,10 +330,17 @@ impl RecoveryWriter {
         finished
     }
 
-    /// Whether no flush is in flight or queued.
+    /// Whether no flush is in flight or queued: true once failed, too, as no flush will be.
     #[must_use]
     pub const fn is_idle(&self) -> bool {
-        matches!(self.phase, Phase::Idle) && self.queued.is_none()
+        matches!(self.phase, Phase::Idle | Phase::Failed) && self.queued.is_none()
+    }
+
+    /// Whether a sync has failed, so the writer no longer writes to its file (see the module
+    /// notes).
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
+        matches!(self.phase, Phase::Failed)
     }
 
     /// The offset of the latest durable save point in the working file, for
@@ -352,6 +370,9 @@ impl RecoveryWriter {
     ///
     /// As [`RecoveryWriter::start`].
     fn trigger(&mut self, store: &mut TileStore, now: Instant) -> Result<(), RecoveryError> {
+        if self.phase == Phase::Failed {
+            return Err(RecoveryError::NeedsNewFile);
+        }
         if self.phase == Phase::Idle {
             self.start(store, now)
         } else {
@@ -473,16 +494,21 @@ impl RecoveryWriter {
             .or(Err(RecoveryError::Stopped))
     }
 
-    /// Passes `outcome` through; on error the flush in flight is abandoned, and the next trigger
-    /// flushes even with no new edits, to confirm what it held.
+    /// Passes `outcome` through. On error the flush in flight and any queued after it are
+    /// abandoned, and the next trigger flushes even with no new edits, to confirm what it held;
+    /// a failed sync fails the writer for good (see the module notes).
     ///
     /// # Errors
     ///
     /// `outcome`'s.
     fn settle(&mut self, outcome: Result<(), RecoveryError>) -> Result<(), RecoveryError> {
-        if outcome.is_err() {
-            self.phase = Phase::Idle;
+        if let Err(e) = &outcome {
+            self.queued = None;
             self.unconfirmed = true;
+            self.phase = match (self.phase, e) {
+                (Phase::Failed, _) | (_, RecoveryError::Sync(_)) => Phase::Failed,
+                _ => Phase::Idle,
+            };
         }
         outcome
     }
@@ -505,20 +531,21 @@ impl RecoveryWriter {
     ///
     /// As [`RecoveryWriter::poll`].
     pub(crate) fn step_blocking(&mut self, store: &mut TileStore) -> Result<(), RecoveryError> {
-        if self.phase == Phase::Idle {
+        if matches!(self.phase, Phase::Idle | Phase::Failed) {
             return Ok(());
         }
         self.wait_step(store)
     }
 
-    /// The phase of the flush in flight, by name: `idle`, `encoding`, `syncing tiles` or
-    /// `syncing save point`.
+    /// The phase of the flush in flight, by name: `idle`, `encoding`, `syncing tiles`,
+    /// `syncing save point` or `failed`.
     pub(crate) const fn phase(&self) -> &'static str {
         match self.phase {
             Phase::Idle => "idle",
             Phase::Encoding => "encoding",
             Phase::SyncingTiles { .. } => "syncing tiles",
             Phase::SyncingSavePoint { .. } => "syncing save point",
+            Phase::Failed => "failed",
         }
     }
 
