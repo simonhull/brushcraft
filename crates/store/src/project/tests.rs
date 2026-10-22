@@ -847,3 +847,26 @@ fn a_failing_roll_over_backs_off_and_a_save_tries_at_once() {
     project.close(false).unwrap();
     assert_project_file(&path, &map, "every edit saved");
 }
+
+/// Placing a file never replaces one: not one there before, nor one made after a check for it
+/// would have passed. Both files are left as they are.
+#[test]
+fn a_placed_file_never_replaces_another() {
+    let dir = TestDir::new();
+    let (tmp, path) = (dir.path("new.tmp"), dir.path("p.bcrf"));
+    fs::write(&tmp, b"new").unwrap();
+    fs::write(&path, b"someone else's").unwrap();
+    let placed = place_new(&tmp, &path);
+    assert!(
+        placed
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::AlreadyExists),
+        "{placed:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"someone else's", "not replaced");
+    assert_eq!(fs::read(&tmp).unwrap(), b"new", "nor removed");
+    fs::remove_file(&path).unwrap();
+    place_new(&tmp, &path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new", "placed");
+    assert!(!tmp.exists(), "under its new name only");
+}

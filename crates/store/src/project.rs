@@ -26,7 +26,7 @@
 //!
 //! A recovery file is named `<project id>-<suffix>.bcrf`, the id as 32 hex digits and the
 //! suffix 16 random ones, so the old and the new file of one project coexist during a save. It
-//! is created as `<name>.tmp`, synced, and renamed into place: a crash mid-create leaves at
+//! is created as `<name>.tmp`, synced, and moved into place: a crash mid-create leaves at
 //! most a `.tmp` file, never a half-made file under a recovery file's name. A roll-over's new
 //! file is filled with every edit and saved before the rename, so it never has its name while
 //! it lacks the edits of the file it replaces; a save's new file is empty by rights (the save
@@ -535,12 +535,15 @@ impl Project {
     /// with that one: every tile of the last save point copied (as records, not re-encoded),
     /// then the edits since, then a save point. The old project file isn't written to.
     ///
-    /// The file is written as a temporary file beside `path` and renamed into place once its
-    /// save point is durable, so `path` never names a half-written project.
+    /// The file is written as a temporary file beside `path` and moved into place once its
+    /// save point is durable, so `path` never names a half-written project. The move never
+    /// replaces a file (see [`place_new`]), not even one made at `path` while the project was
+    /// being written.
     ///
     /// # Errors
     ///
-    /// [`ProjectError::Exists`] if `path` names a file already; [`ProjectError::Recovery`] if
+    /// [`ProjectError::Exists`] if `path` names a file already, or does by the time the new
+    /// file is to be moved there (it is removed then); [`ProjectError::Recovery`] if
     /// the recovery writer can't finish its flushes; [`ProjectError::Store`] or
     /// [`ProjectError::Cache`] if writing the new file fails (the temporary file is removed);
     /// [`ProjectError::Io`] if the rename does; as [`Project::save`] for the fresh recovery
@@ -599,7 +602,13 @@ impl Project {
             project.copy_base(base)?;
         }
         let saved = self.store.save_into(project)?;
-        fs::rename(tmp, path)?;
+        place_new(tmp, path).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                ProjectError::Exists(path.to_path_buf())
+            } else {
+                e.into()
+            }
+        })?;
         sync_parent(path)?;
         Ok(saved)
     }
@@ -1194,10 +1203,7 @@ impl Unplaced {
             return Err(io::Error::other("a crash before the rename, for the test").into());
         }
         let placed = (|| {
-            if fs::symlink_metadata(&self.path).is_ok() {
-                return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
-            }
-            fs::rename(&self.tmp, &self.path)?;
+            place_new(&self.tmp, &self.path)?;
             sync_parent(&self.path)?;
             Ok::<_, ProjectError>(())
         })();
@@ -1265,6 +1271,40 @@ fn create_placed(
     let (file, names) = create_recovery(dir, project, create)?;
     let path = names.place()?;
     Ok((file, path))
+}
+
+/// Gives the file at `tmp` the name `path`, if nothing has that name, and takes the name `tmp`
+/// away: a rename that never replaces a file.
+///
+/// A hard link fails if `path` exists, however late it was made; a check before a rename
+/// leaves a window in which a file made at `path` would be replaced. On a file system without
+/// hard links, it falls back to that check and a rename. The name `tmp` is removed best effort:
+/// a leftover is a second name of the placed file, which only takes a name.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::AlreadyExists`] if `path` names a file; the I/O error of the link or the
+/// rename.
+fn place_new(tmp: &Path, path: &Path) -> io::Result<()> {
+    match fs::hard_link(tmp, path) {
+        Ok(()) => {
+            // Best effort: the file is in place either way.
+            drop(fs::remove_file(tmp));
+            Ok(())
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            fs::rename(tmp, path)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// A temporary path beside `path`, for a project file written before it is renamed there:
