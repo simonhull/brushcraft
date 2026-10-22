@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::frame::{Block, CornerAxes, frames};
+use crate::frame::{Block, CornerAxes, Frame, frames};
 use crate::subdiv::{CornerRing, Padded, extraordinary, predict, ring_edge_point};
 use crate::topology::{corner_at, edge_to_grid};
 use crate::{BaseMesh, FaceId, Level, Region, Vec3};
@@ -56,6 +56,10 @@ pub enum EvalError {
     /// Level 0 is the base mesh; it has nothing to predict from.
     #[error("level 0 has no parent; its positions come from the base mesh")]
     LevelZero,
+    /// The region doesn't start and end on even grid lines, so it has no exact parent block.
+    /// [`Region::new`] never makes one above level 0.
+    #[error("the region doesn't halve exactly into a parent block")]
+    NoExactParent,
     /// The parent level's position wasn't available from the source.
     #[error("position of face {face:?} level {level} vertex ({i}, {j}) is not available")]
     Missing {
@@ -157,21 +161,32 @@ fn gather(mesh: &BaseMesh, src: &impl PositionSource, region: Region) -> Result<
     Ok(Parent { padded, corners })
 }
 
-/// Evaluates `region` (level ≥ 1): predicts it from the parent level's positions in `src`, then
-/// applies `corrections(i, j)` (block-local coordinates, `0..=quads`) in each vertex's tangent
-/// frame.
+/// A block's predicted positions and tangent frames, before corrections: what a brush needs to
+/// project its deltas into frames and to re-apply corrections without predicting again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prediction {
+    region: Region,
+    predicted: Padded,
+    /// Row-major, `(quads + 1)²`.
+    frames: Vec<Frame>,
+}
+
+/// Predicts `region` (level ≥ 1) from the parent level's positions in `src`, with each vertex's
+/// tangent frame.
 ///
 /// # Errors
 ///
-/// [`EvalError::LevelZero`] for a level-0 region, or [`EvalError::Missing`] if `src` lacks a
-/// parent position.
-pub fn evaluate_region(
+/// [`EvalError::LevelZero`] for a level-0 region, [`EvalError::NoExactParent`] for a region that
+/// doesn't halve exactly, or [`EvalError::Missing`] if `src` lacks a parent position.
+pub fn predict_region(
     mesh: &BaseMesh,
     src: &impl PositionSource,
     region: Region,
-    corrections: impl Fn(u32, u32) -> Vec3,
-) -> Result<Grid, EvalError> {
-    let parent_region = region.parent().ok_or(EvalError::LevelZero)?;
+) -> Result<Prediction, EvalError> {
+    if region.level() == Level::ZERO {
+        return Err(EvalError::LevelZero);
+    }
+    let parent_region = region.parent().ok_or(EvalError::NoExactParent)?;
     let parent = gather(mesh, src, parent_region)?;
     let predicted = predict(&parent.padded, &parent.corners);
     let axes = parent.corners.each_ref().map(|c| {
@@ -191,15 +206,76 @@ pub fn evaluate_region(
         quads: region.quads(),
     };
     let frames = frames(&block, &predicted, &axes);
-    let side = region.quads() + 1;
-    let data = (0..side)
-        .flat_map(|j| (0..side).map(move |i| (i, j)))
-        .zip(&frames)
-        .map(|((i, j), frame)| {
-            frame.apply(predicted.get(i64::from(i), i64::from(j)), corrections(i, j))
-        })
-        .collect();
-    Ok(Grid::from_parts(side, data))
+    Ok(Prediction {
+        region,
+        predicted,
+        frames,
+    })
+}
+
+impl Prediction {
+    /// The block predicted.
+    #[must_use]
+    pub const fn region(&self) -> Region {
+        self.region
+    }
+
+    /// Vertices per side.
+    #[must_use]
+    pub const fn side(&self) -> u32 {
+        self.region.quads() + 1
+    }
+
+    /// The predicted position at block vertex `(i, j)`, or `None` outside the block.
+    #[must_use]
+    pub fn predicted(&self, i: u32, j: u32) -> Option<Vec3> {
+        let side = self.side();
+        (i < side && j < side).then(|| self.predicted.get(i64::from(i), i64::from(j)))
+    }
+
+    /// The tangent frame at block vertex `(i, j)`, or `None` outside the block.
+    #[must_use]
+    pub fn frame(&self, i: u32, j: u32) -> Option<Frame> {
+        let side = self.side();
+        if i >= side || j >= side {
+            return None;
+        }
+        self.frames
+            .get(usize::try_from(j * side + i).ok()?)
+            .copied()
+    }
+
+    /// The final positions: `corrections(i, j)` (block-local coordinates, `0..=quads`) applied
+    /// to each predicted position in its frame.
+    #[must_use]
+    pub fn apply(&self, corrections: impl Fn(u32, u32) -> Vec3) -> Grid {
+        let side = self.side();
+        let data = (0..side)
+            .flat_map(|j| (0..side).map(move |i| (i, j)))
+            .zip(&self.frames)
+            .map(|((i, j), frame)| {
+                frame.apply(
+                    self.predicted.get(i64::from(i), i64::from(j)),
+                    corrections(i, j),
+                )
+            })
+            .collect();
+        Grid::from_parts(side, data)
+    }
+}
+
+/// Evaluates `region` (level ≥ 1): [`predict_region`], then [`Prediction::apply`].
+///
+/// # Errors
+///
+/// As [`predict_region`].
+pub fn evaluate_region(
+    mesh: &BaseMesh,
+    src: &impl PositionSource,
+    region: Region,
+    corrections: impl Fn(u32, u32) -> Vec3,
+) -> Result<Grid, EvalError> {
+    Ok(predict_region(mesh, src, region)?.apply(corrections))
 }
 
 #[cfg(test)]
@@ -251,6 +327,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn prediction_and_application_split_evaluation() {
+        let mesh = cube_sphere(1).unwrap();
+        let level = Level::new(1).unwrap();
+        let region = Region::whole_face(FaceId::new(2), level);
+        let prediction = predict_region(&mesh, &Base(&mesh), region).unwrap();
+        let c = |i: u32, j: u32| {
+            Vec3::new(
+                0.01 * f32::from(u16::try_from(i).unwrap()),
+                0.02,
+                -0.01 * f32::from(u16::try_from(j).unwrap()),
+            )
+        };
+        let whole = evaluate_region(&mesh, &Base(&mesh), region, c).unwrap();
+        let applied = prediction.apply(c);
+        let bits = |g: &Grid| g.as_slice().iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&applied), bits(&whole), "evaluate = predict + apply");
+        assert_eq!(prediction.side(), 3, "side");
+        for j in 0..3 {
+            for i in 0..3 {
+                let (p, f) = (
+                    prediction.predicted(i, j).unwrap(),
+                    prediction.frame(i, j).unwrap(),
+                );
+                assert_eq!(
+                    applied.get(i, j).unwrap().to_bits(),
+                    f.apply(p, c(i, j)).to_bits(),
+                    "({i}, {j})"
+                );
+            }
+        }
+        assert_eq!(prediction.predicted(3, 0), None, "outside: position");
+        assert_eq!(prediction.frame(0, 3), None, "outside: frame");
     }
 
     #[test]

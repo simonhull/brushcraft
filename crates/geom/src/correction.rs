@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::{TILE_QUADS, Vec3};
+use crate::{FaceId, TILE_QUADS, Vec3};
 
 /// Largest quantized magnitude.
 const Q_MAX: f32 = 32767.0;
@@ -37,6 +37,9 @@ pub enum CorrectionError {
         /// Vertices per side.
         side: u32,
     },
+    /// The face isn't in the mesh.
+    #[error("face {0:?} is not in the mesh")]
+    UnknownFace(FaceId),
     /// A component is NaN or infinite.
     #[error("correction is not finite")]
     NotFinite,

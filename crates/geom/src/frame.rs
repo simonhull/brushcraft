@@ -8,12 +8,9 @@ use crate::{FaceId, Vec3};
 /// `b = n × t`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Frame {
-    /// Tangent.
-    pub t: Vec3,
-    /// Bitangent.
-    pub b: Vec3,
-    /// Normal.
-    pub n: Vec3,
+    t: Vec3,
+    b: Vec3,
+    n: Vec3,
 }
 
 impl Frame {
@@ -49,6 +46,24 @@ impl Frame {
             b: n.cross(t),
             n,
         }
+    }
+
+    /// Tangent: along the owner's grid u direction.
+    #[must_use]
+    pub const fn t(&self) -> Vec3 {
+        self.t
+    }
+
+    /// Bitangent: `n × t`.
+    #[must_use]
+    pub const fn b(&self) -> Vec3 {
+        self.b
+    }
+
+    /// Normal.
+    #[must_use]
+    pub const fn n(&self) -> Vec3 {
+        self.n
     }
 
     /// `position + t·c.x + b·c.y + n·c.z`, in that order (the order is part of the seam

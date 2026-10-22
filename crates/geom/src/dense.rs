@@ -29,7 +29,11 @@ impl CorrectionMap {
         self.tiles.get(key)
     }
 
-    /// Stores a tile, returning the one it replaced.
+    /// Stores a tile as it is, returning the one it replaced.
+    ///
+    /// Unlike [`CorrectionMap::set`], this doesn't keep twins in sync: the tile's border vertices
+    /// are also held by neighbouring tiles, and the caller must store matching values there
+    /// (as loading a consistent set of tiles does), or the copies evaluate differently.
     pub fn insert(&mut self, key: TileKey, tile: CorrectionTile) -> Option<CorrectionTile> {
         self.tiles.insert(key, tile)
     }
@@ -39,9 +43,9 @@ impl CorrectionMap {
     ///
     /// # Errors
     ///
-    /// [`CorrectionError::NotFinite`] if `c` isn't finite (nothing is written then);
-    /// [`CorrectionError::OutOfTile`] if the vertex is outside the face or `face` is not in
-    /// `topology`.
+    /// [`CorrectionError::NotFinite`] if `c` isn't finite, [`CorrectionError::UnknownFace`] if
+    /// `face` is not in `topology`, or [`CorrectionError::OutOfTile`] if the vertex is outside
+    /// the face. Nothing is written then.
     pub fn set(
         &mut self,
         topology: &Topology,
@@ -53,6 +57,9 @@ impl CorrectionMap {
     ) -> Result<(), CorrectionError> {
         if !c.is_finite() {
             return Err(CorrectionError::NotFinite);
+        }
+        if !topology.contains(face) {
+            return Err(CorrectionError::UnknownFace(face));
         }
         let copies = topology.copies(face, level, i, j);
         if copies.is_empty() {
@@ -438,6 +445,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn set_rejects_bad_vertices_without_writing() {
+        let mesh = cube_sphere(1).unwrap();
+        let t = mesh.topology();
+        let level = Level::new(2).unwrap();
+        let mut map = CorrectionMap::new();
+        let c = Vec3::new(0.1, 0.0, 0.0);
+        assert_eq!(
+            map.set(t, FaceId::new(6), level, 1, 1, c),
+            Err(CorrectionError::UnknownFace(FaceId::new(6))),
+            "unknown face"
+        );
+        assert_eq!(
+            map.set(t, FaceId::new(0), level, 5, 1, c),
+            Err(CorrectionError::OutOfTile {
+                i: 5,
+                j: 1,
+                side: 5
+            }),
+            "outside the face"
+        );
+        assert_eq!(
+            map.set(t, FaceId::new(0), level, 0, 1, Vec3::NAN),
+            Err(CorrectionError::NotFinite),
+            "not finite"
+        );
+        assert!(map.tiles.is_empty(), "nothing written");
     }
 
     #[test]
