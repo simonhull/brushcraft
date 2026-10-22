@@ -685,69 +685,214 @@ fn corrections_take_chunks_back_from_evaluated_tiles() {
     }
 }
 
-#[test]
-fn a_dirty_correction_tile_outranks_an_evaluated_chunk() {
-    let config = config(10, 4);
-    let dir = TestDir::new();
-    let mesh = mesh();
-    let mut store = new_store(&dir, "work.bcp", &mesh, config);
-    let all = tiles(&mesh, 1, TOP);
+/// A store over `config` whose budget is spent and whose correction slots all hold dirty tiles.
+///
+/// Every tile of levels 1–8 is evaluated, then the pools are arranged directly so that the
+/// correction pool holds `correction_chunks` chunks and the evaluated pool the rest of the
+/// budget. The next correction load finds no free slot, no room for a chunk and no clean victim.
+fn spent_on_dirty_corrections(
+    dir: &TestDir,
+    mesh: &Arc<BaseMesh>,
+    config: StoreConfig,
+    correction_chunks: usize,
+) -> TileStore {
+    let name = format!("{}-{correction_chunks}.bcp", config.budget_bytes);
+    let mut store = new_store(dir, &name, mesh, config);
+    let all = tiles(mesh, 1, TOP);
     for key in &all {
         store.evaluate(*key).unwrap();
     }
-    // Fill the correction pool, then edit every tile in it: the next correction tile would
-    // evict a dirty one.
-    let mut candidates = all.iter().copied();
-    let mut absent = |from: &TileStore| {
-        candidates
-            .find(|key| from.corrections.find(key).is_none())
-            .unwrap()
-    };
-    while store.corrections.has_free_slot() || store.budget.fits(store.corrections.chunk_bytes()) {
-        let key = absent(&store);
-        store.correction(key).unwrap();
-    }
-    let resident: Vec<TileKey> = all
+    let chunk = store.corrections.chunk_bytes();
+    // Nothing is dirty yet: giving correction chunks back writes nothing.
+    let target = store.budget.used() + correction_chunks * chunk - store.corrections.bytes();
+    store
+        .corrections
+        .shrink_to(&mut store.budget, target, nothing_to_write)
+        .unwrap();
+    assert_eq!(
+        store.corrections.bytes(),
+        correction_chunks * chunk,
+        "correction chunks"
+    );
+    // The evaluated pool takes the rest: slots of uncached tiles, freed again at once.
+    let mut spare: Vec<TileKey> = all
         .iter()
-        .filter(|key| store.corrections.find(key).is_some())
+        .filter(|key| store.evaluated.find(key).is_none())
         .copied()
         .collect();
-    let op = store.next_op().unwrap();
-    for key in &resident {
-        let region = Region::of_tile(key);
-        let (i, j) = (region.x0() + 1, region.y0() + 1);
+    let mut taken = Vec::new();
+    while store.budget.fits(chunk) {
+        let key = spare.pop().unwrap();
         store
-            .set_correction(
-                key.face(),
-                key.level(),
-                i,
-                j,
-                Vec3::new(0.001, 0.0, 0.0),
-                op,
-            )
+            .evaluated
+            .acquire(key, &mut store.budget, nothing_to_write)
+            .unwrap();
+        taken.push(key);
+    }
+    for key in taken {
+        store.evaluated.remove(&key).unwrap();
+    }
+    store.note_evictions();
+    fill_and_dirty_corrections(&mut store, &all);
+    assert_eq!(
+        store.corrections.bytes() + store.evaluated.bytes(),
+        config.budget_bytes,
+        "the budget is spent"
+    );
+    store
+}
+
+/// Loads correction tiles into every free correction slot, then dirties every resident one
+/// with a new op: the next load finds neither a free slot nor a clean victim.
+fn fill_and_dirty_corrections(store: &mut TileStore, all: &[TileKey]) {
+    let mut absent: Vec<TileKey> = all
+        .iter()
+        .filter(|key| store.corrections.find(key).is_none())
+        .copied()
+        .collect();
+    while store.corrections.has_free_slot() {
+        store.correction(absent.pop().unwrap()).unwrap();
+    }
+    let op = store.next_op().unwrap();
+    dirty_every_resident_correction(store, all, op);
+}
+
+/// What a correction load did for its slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Made {
+    /// Took an evaluated chunk back and mapped a correction chunk, writing nothing.
+    Room,
+    /// Wrote one dirty tile back and took its slot.
+    WroteOne,
+}
+
+/// Loads a correction tile that isn't resident, and says what the store did for its slot.
+fn load_one(store: &mut TileStore, all: &[TileKey]) -> Made {
+    let key = *all
+        .iter()
+        .find(|key| store.corrections.find(key).is_none())
+        .unwrap();
+    let (corrections, evaluated, dirty) = (
+        store.corrections.bytes(),
+        store.evaluated.bytes(),
+        store.unsaved.len(),
+    );
+    let chunk = store.corrections.chunk_bytes();
+    store.correction(key).unwrap();
+    let after = (
+        store.corrections.bytes(),
+        store.evaluated.bytes(),
+        store.unsaved.len(),
+    );
+    if after == (corrections + chunk, evaluated - chunk, dirty) {
+        Made::Room
+    } else {
+        assert_eq!(
+            after,
+            (corrections, evaluated, dirty - 1),
+            "neither a chunk taken nor one tile written"
+        );
+        Made::WroteOne
+    }
+}
+
+#[test]
+fn a_correction_load_takes_a_clean_tile_before_an_evaluated_chunk() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = spent_on_dirty_corrections(&dir, &mesh, config(10, 4), 1);
+    assert!(
+        store.may_take_evaluated_chunk(),
+        "an evaluated chunk could go"
+    );
+    let clean = *store.unsaved.keys().next().unwrap();
+    store.save().unwrap();
+    let op = store.next_op().unwrap();
+    let dirty: Vec<TileKey> = tiles(&mesh, 1, TOP)
+        .into_iter()
+        .filter(|key| *key != clean && store.corrections.find(key).is_some())
+        .collect();
+    for key in &dirty {
+        store
+            .edit_tile(*key, op, |edit| edit.set(1, 1, Vec3::new(0.002, 0.0, 0.0)))
+            .unwrap()
             .unwrap();
     }
-    assert!(store.corrections.victim_is_dirty(), "the victim is dirty");
-    assert!(
-        store.evaluated.has_unpinned_chunk(),
-        "evaluated chunks can go"
-    );
     let (written, corrections, evaluated) = (
         store.file.len(),
         store.corrections.bytes(),
         store.evaluated.bytes(),
     );
-    let next = absent(&store);
+    let next = tiles(&mesh, 1, TOP)
+        .into_iter()
+        .find(|key| store.corrections.find(key).is_none())
+        .unwrap();
     store.correction(next).unwrap();
-    assert_eq!(store.file.len(), written, "nothing was written back");
     assert!(
-        store.corrections.bytes() > corrections && store.evaluated.bytes() < evaluated,
-        "an evaluated chunk became a correction chunk"
+        store.corrections.find(&clean).is_none(),
+        "the clean tile went"
     );
-    assert!(store.bytes() <= config.budget_bytes, "within the budget");
-    for key in &resident {
+    assert_eq!(store.file.len(), written, "nothing written back");
+    assert_eq!(
+        (store.corrections.bytes(), store.evaluated.bytes()),
+        (corrections, evaluated),
+        "no chunk changed hands"
+    );
+    for key in &dirty {
         let id = store.corrections.find(key).unwrap();
         assert_eq!(store.corrections.is_dirty(id), Some(true), "{key:?} kept");
+    }
+}
+
+#[test]
+fn corrections_take_evaluated_chunks_up_to_a_quarter_of_the_budget() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    // Ten chunks: corrections take evaluated chunks while they hold one or two, not three.
+    let mut store = spent_on_dirty_corrections(&dir, &mesh, config(10, 4), 1);
+    let all = tiles(&mesh, 1, TOP);
+    let mut made = Vec::new();
+    for _ in 0..4 {
+        fill_and_dirty_corrections(&mut store, &all);
+        made.push(load_one(&mut store, &all));
+    }
+    assert_eq!(
+        made,
+        [Made::Room, Made::Room, Made::WroteOne, Made::WroteOne],
+        "chunks while under a quarter, then one write-back per load"
+    );
+    let chunk = store.corrections.chunk_bytes();
+    assert_eq!(
+        store.corrections.bytes(),
+        3 * chunk,
+        "three correction chunks"
+    );
+}
+
+#[test]
+fn corrections_leave_the_evaluated_pool_its_floor() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let all = tiles(&mesh, 1, TOP);
+    // The cube's evaluated floor is six chunks: five for an evaluation's pins, and one more.
+    for (chunks, want) in [(7, Made::WroteOne), (8, Made::Room)] {
+        let mut store = spent_on_dirty_corrections(&dir, &mesh, config(chunks, 4), 1);
+        let chunk = store.corrections.chunk_bytes();
+        assert_eq!(
+            store.headroom.evaluated_floor(chunk),
+            6 * chunk,
+            "the floor"
+        );
+        assert!(
+            4 * store.corrections.bytes() < store.budget.limit(),
+            "{chunks} chunks: under a quarter, so only the floor decides"
+        );
+        assert_eq!(
+            load_one(&mut store, &all),
+            want,
+            "{chunks} chunks: {} evaluated",
+            store.evaluated.bytes() / chunk
+        );
     }
 }
 

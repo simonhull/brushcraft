@@ -3,14 +3,18 @@
 //! Slots are carved from chunks, each one zeroed allocation (lazily backed by the OS), mapped
 //! only while a shared [`Budget`] allows another whole chunk, so the pools' memory never exceeds
 //! it. A slot holds one tile, named by its [`TileKey`]. When every mapped slot is in use, the
-//! clock picks a victim among the unpinned ones, skipping those referenced since its last pass,
-//! and writes it back first if it is dirty.
+//! clock picks a victim among the unpinned ones (or the clean ones, for
+//! [`Pool::acquire_clean`]), skipping those referenced since its last pass, and writes it back
+//! first if it is dirty. Every chunk is charged the configured chunk size, whatever its slot type,
+//! and a pool asked to shrink gives back its cheapest chunks first: the fewest dirty slots, then
+//! the fewest in use.
 //!
 //! Chunks should be large: glibc serves an allocation from `mmap` (and so returns it to the OS
 //! when it is dropped) only above its mmap threshold, which adapts upwards to as much as 32 MiB.
 //! A smaller chunk may come from the heap and stay with the process after the pool gives it
 //! back to the budget. The default 64 MB chunk is above it; tests use small chunks knowingly.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
@@ -231,8 +235,10 @@ type Pos = (u32, u32);
 
 /// A budgeted pool of `T` slots. Single-threaded: it belongs to the thread that owns the cache.
 pub(crate) struct Pool<T: Pod> {
-    /// Bytes per chunk: whole slots only, so a chunk's allocation is exactly this.
+    /// Bytes the budget is charged per chunk: the configured chunk size (see [`Pool::layout`]).
+    /// A chunk's allocation is its whole slots, which may be a little less.
     chunk_bytes: usize,
+    /// Slots per chunk: as many as fit in `chunk_bytes`, at least one.
     per_chunk: u32,
     /// Slot storage; `None` for a chunk given back. Its metadata stays, so generations survive.
     chunks: Vec<Option<Vec<T>>>,
@@ -266,14 +272,20 @@ impl<T: Pod> std::fmt::Debug for Pool<T> {
 
 impl<T: Pod> Pool<T> {
     /// How a pool asked for chunks of `chunk_bytes` lays them out: slots per chunk (as many as
-    /// fit, at least one) and the bytes a chunk of them really takes.
+    /// fit, at least one) and the bytes the budget is charged per chunk.
+    ///
+    /// The charge is `chunk_bytes` itself (or one slot, if that is larger), whatever the slots
+    /// leave unused at the chunk's end: so pools of different slot types are charged alike, and
+    /// a chunk one pool gives back is exactly the room another needs for a chunk.
     pub(crate) fn layout(chunk_bytes: usize) -> (u32, usize) {
         let size = size_of::<T>().max(1);
-        let per_chunk = u32::try_from((chunk_bytes / size).max(1)).unwrap_or(u32::MAX);
-        (per_chunk, size * per_chunk as usize)
+        let charged = chunk_bytes.max(size);
+        let per_chunk = u32::try_from(charged / size).unwrap_or(u32::MAX);
+        (per_chunk, charged)
     }
 
-    /// An empty pool whose chunks hold as many slots as fit in `chunk_bytes`, at least one.
+    /// An empty pool whose chunks hold as many slots as fit in `chunk_bytes`, at least one, and
+    /// are charged as [`Pool::layout`] says.
     pub(crate) fn new(chunk_bytes: usize) -> Self {
         let (per_chunk, chunk_bytes) = Self::layout(chunk_bytes);
         Self {
@@ -309,7 +321,7 @@ impl<T: Pod> Pool<T> {
             .unwrap_or_default()
     }
 
-    /// Bytes per chunk: what mapping one more chunk takes from the budget.
+    /// Bytes the budget is charged per chunk: what mapping one more chunk takes from it.
     pub(crate) const fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
     }
@@ -326,6 +338,7 @@ impl<T: Pod> Pool<T> {
 
     /// Whether a mapped chunk has a free slot: [`Pool::acquire`] then needs no new chunk and
     /// evicts nothing.
+    #[cfg(test)]
     pub(crate) fn has_free_slot(&self) -> bool {
         !self.free.is_empty()
     }
@@ -339,34 +352,6 @@ impl<T: Pod> Pool<T> {
                     .get(chunk as usize)
                     .is_some_and(|slots| slots.iter().all(|m| m.pins == 0))
         })
-    }
-
-    /// Whether the clock's next victim is dirty, without moving the clock: what an
-    /// [`Pool::acquire`] that has to evict would write back.
-    ///
-    /// The clock takes the first unpinned, unreferenced slot from its hand; if every unpinned
-    /// slot is referenced, its first sweep clears them all and its second takes the first
-    /// unpinned slot from the hand. `false` if no slot can be evicted.
-    pub(crate) fn victim_is_dirty(&self) -> bool {
-        let total = u64::from(self.chunk_count()) * u64::from(self.per_chunk);
-        let mut first_unpinned = None;
-        for step in 0..total {
-            let pos = self.pos_of((self.hand + step) % total);
-            if !self.is_mapped(pos.0) {
-                continue;
-            }
-            let Some(meta) = self.meta_of(pos) else {
-                continue;
-            };
-            if meta.pins > 0 || meta.key.is_none() {
-                continue;
-            }
-            if !meta.referenced {
-                return meta.dirty;
-            }
-            first_unpinned.get_or_insert(meta.dirty);
-        }
-        first_unpinned.unwrap_or(false)
     }
 
     /// Whether `key` has a pinned slot.
@@ -618,8 +603,8 @@ impl<T: Pod> Pool<T> {
         Ok(())
     }
 
-    /// Gives chunks back until `budget.used() <= bytes` or nothing more can go: from the highest
-    /// mapped chunk down, each chunk without pinned slots is emptied (dirty slots written back
+    /// Gives chunks back until `budget.used() <= bytes` or nothing more can go, the cheapest to
+    /// lose first (see [`Pool::give_back_cost`]): each chunk is emptied (dirty slots written back
     /// first) and unmapped. Chunks holding pinned slots stay.
     ///
     /// # Errors
@@ -631,17 +616,14 @@ impl<T: Pod> Pool<T> {
         bytes: usize,
         mut write_back: impl FnMut(TileKey, &T) -> Result<(), W>,
     ) -> Result<(), PoolError<W>> {
-        for chunk in (0..self.chunk_count()).rev() {
-            if budget.used() <= bytes {
+        while budget.used() > bytes {
+            // Ties go to the highest chunk, so the pool keeps its low chunks.
+            let cheapest = (0..self.chunk_count())
+                .filter_map(|chunk| Some((self.give_back_cost(chunk)?, Reverse(chunk))))
+                .min();
+            let Some((_, Reverse(chunk))) = cheapest else {
                 break;
-            }
-            let pinned = self
-                .meta
-                .get(chunk as usize)
-                .is_some_and(|slots| slots.iter().any(|m| m.pins > 0));
-            if pinned || !self.is_mapped(chunk) {
-                continue;
-            }
+            };
             self.evict_chunk(chunk, &mut write_back)?;
             self.free.retain(|&(c, _)| c != chunk);
             if let Some(storage) = self.chunks.get_mut(chunk as usize) {
@@ -650,6 +632,26 @@ impl<T: Pod> Pool<T> {
             }
         }
         Ok(())
+    }
+
+    /// What giving `chunk` back would cost, to compare chunks by: first its dirty slots (each a
+    /// write now, and a read later if the tile is wanted again), then its slots in use (holding
+    /// a current tile, or referenced since the clock last passed). `None` if the chunk isn't
+    /// mapped or holds a pinned slot, so it can't go.
+    fn give_back_cost(&self, chunk: u32) -> Option<(usize, usize)> {
+        if !self.is_mapped(chunk) {
+            return None;
+        }
+        let slots = self.meta.get(chunk as usize)?;
+        if slots.iter().any(|m| m.pins > 0) {
+            return None;
+        }
+        let dirty = slots.iter().filter(|m| m.dirty).count();
+        let in_use = slots
+            .iter()
+            .filter(|m| m.key.is_some() && (m.referenced || !m.stale))
+            .count();
+        Some((dirty, in_use))
     }
 
     /// Maps a chunk if the budget allows one, reusing the lowest unmapped chunk's place, and puts
@@ -1159,33 +1161,6 @@ mod tests {
     }
 
     #[test]
-    fn the_victim_is_seen_before_it_is_taken() {
-        let (mut pool, mut budget) = small(4, 1);
-        assert!(!pool.victim_is_dirty(), "an empty pool has no victim");
-        for n in 0..4 {
-            let id = put(&mut pool, &mut budget, n, 1);
-            pool.set_dirty(id, n == 1 || n == 3).unwrap();
-        }
-        // Every slot is referenced: the clock clears them and takes slot 0, which is clean.
-        assert!(!pool.victim_is_dirty(), "slot 0 is next");
-        let mut written = Vec::new();
-        pool.acquire(key(10), &mut budget, |k, _: &Small| {
-            written.push(k);
-            Ok::<_, StoreError>(())
-        })
-        .unwrap();
-        assert!(written.is_empty(), "and was taken clean");
-        // Slots 1–3 are unreferenced now and the hand is past slot 0: slot 1, dirty, is next.
-        assert!(pool.victim_is_dirty(), "slot 1 is next");
-        pool.acquire(key(11), &mut budget, |k, _: &Small| {
-            written.push(k);
-            Ok::<_, StoreError>(())
-        })
-        .unwrap();
-        assert_eq!(written, vec![key(1)], "and was written back");
-    }
-
-    #[test]
     fn a_clean_acquire_never_writes_back() {
         let (mut pool, mut budget) = small(2, 1);
         let dirty = put(&mut pool, &mut budget, 0, 1);
@@ -1358,6 +1333,71 @@ mod tests {
         put(&mut quiet, &mut quiet_budget, 0, 1);
         put(&mut quiet, &mut quiet_budget, 1, 1);
         assert!(quiet.drain_evicted().is_empty(), "no log unless asked for");
+    }
+
+    /// The keys `pool` holds, sorted.
+    fn resident(pool: &Pool<Small>) -> Vec<TileKey> {
+        let mut keys: Vec<TileKey> = pool.index.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn shrinking_gives_back_the_chunk_with_fewest_dirty_tiles_first() {
+        let (mut pool, mut budget) = small(2, 3);
+        let ids: Vec<SlotId<Small>> = (0..6).map(|n| put(&mut pool, &mut budget, n, 1)).collect();
+        // Chunk 0: no dirty tile; chunk 1: one; chunk 2: both. Every slot is in use, so only
+        // the dirty tiles tell the chunks apart: the highest goes last, not first.
+        for &n in &[2, 4, 5] {
+            pool.set_dirty(ids[n], true).unwrap();
+        }
+        let chunk = pool.chunk_bytes();
+        let mut written = Vec::new();
+        let mut write = |k: TileKey, _: &Small| {
+            written.push(k);
+            Ok::<_, StoreError>(())
+        };
+        pool.shrink_to(&mut budget, 2 * chunk, &mut write).unwrap();
+        assert_eq!(
+            resident(&pool),
+            (2..6).map(key).collect::<Vec<_>>(),
+            "chunk 0"
+        );
+        pool.shrink_to(&mut budget, chunk, &mut write).unwrap();
+        assert_eq!(resident(&pool), vec![key(4), key(5)], "then chunk 1");
+        pool.shrink_to(&mut budget, 0, &mut write).unwrap();
+        assert_eq!(
+            written,
+            vec![key(2), key(4), key(5)],
+            "no write, one, then two"
+        );
+    }
+
+    #[test]
+    fn shrinking_gives_back_the_chunk_with_fewest_tiles_in_use_first() {
+        let (mut pool, mut budget) = small(2, 3);
+        let ids: Vec<SlotId<Small>> = (0..6).map(|n| put(&mut pool, &mut budget, n, 1)).collect();
+        // Chunk 0: two stale tiles, unreferenced once unpinned; chunk 1: one tile and a free
+        // slot; chunk 2: two current tiles.
+        for &n in &[0, 1] {
+            pool.pin(ids[n]).unwrap();
+            assert_eq!(
+                pool.invalidate(&key(u32::try_from(n).unwrap())),
+                Invalidated::Marked
+            );
+            pool.unpin(ids[n]).unwrap();
+        }
+        assert_eq!(pool.invalidate(&key(3)), Invalidated::Freed, "a free slot");
+        let chunk = pool.chunk_bytes();
+        pool.shrink_to(&mut budget, 2 * chunk, no_write_back)
+            .unwrap();
+        assert_eq!(
+            resident(&pool),
+            vec![key(2), key(4), key(5)],
+            "chunk 0 first"
+        );
+        pool.shrink_to(&mut budget, chunk, no_write_back).unwrap();
+        assert_eq!(resident(&pool), vec![key(4), key(5)], "then chunk 1");
     }
 
     #[test]

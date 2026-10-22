@@ -25,18 +25,13 @@
 //!
 //! # Budget
 //!
-//! The two pools share one byte budget, granted in whole chunks. When one pool needs a slot and
-//! has none to reuse (all of its slots are pinned) while the budget is spent, the store takes
-//! whole chunks back from the pools: evaluated chunks first, since they are only a cache and cheap
-//! to recompute, then correction chunks, whose dirty slots are written back to the working file
-//! first. A chunk holding a pinned slot can't be given back, so the request fails only when no
-//! chunk without a pin is left.
-//!
-//! Within the budget the pools rebalance towards corrections. When a correction tile needs a
-//! slot and the correction pool would have to evict a dirty one (a write to the working file
-//! now, and a read back if the tile is wanted again), it first takes an evaluated chunk without
-//! pins back, if there is one, and maps a correction chunk in its place: an evaluated tile is
-//! recomputed from resident tiles without any I/O. A clean victim is evicted as before.
+//! The two pools share one byte budget, granted in whole chunks, and each is charged the same
+//! [`StoreConfig::chunk_bytes`] per chunk, so a chunk one pool gives back is exactly the room the
+//! other needs. [`TileStore`]'s memory policy orders what a pool that needs a slot takes: its own
+//! free slots and new chunks first, then what is cheapest to lose. In short, a clean correction
+//! tile is read again if it is wanted, an evaluated tile is recomputed from resident tiles without
+//! any I/O, and a dirty correction tile costs a write now and a read later; chunks move between
+//! the pools only within limits that keep each pool enough to work with.
 //!
 //! A budget of [`StoreConfig::minimum_budget`] is enough for every evaluation and edit when
 //! nothing else is pinned, and [`TileStore::open`] refuses less. An evaluation pins at most `E`
@@ -82,9 +77,13 @@ use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreConfig {
     /// Bytes the two pools may hold together. The pools never exceed it. At least
-    /// [`StoreConfig::minimum_budget`] for the store's mesh.
+    /// [`StoreConfig::minimum_budget`] for the store's mesh. How the pools share it is the
+    /// store's memory policy (see [`TileStore`]): corrections take evaluated chunks only up to a
+    /// quarter of it, and never below the evaluated pool's floor.
     pub budget_bytes: usize,
-    /// Bytes per pool chunk: [`StoreConfig::DEFAULT_CHUNK_BYTES`] in the app, smaller in tests.
+    /// Bytes per pool chunk, the unit both pools grow and shrink by and are charged in (whole
+    /// slots fill it, the rest of a chunk is charged unused):
+    /// [`StoreConfig::DEFAULT_CHUNK_BYTES`] in the app, smaller in tests.
     pub chunk_bytes: usize,
     /// The site (machine or session) the store's op ids carry; any but [`RESERVED_SITE`].
     pub site: u16,
@@ -136,6 +135,13 @@ impl Headroom {
             evaluated: 2 * width,
             corrections: width,
         }
+    }
+
+    /// The least the evaluated pool keeps when corrections take its chunks (see [`TileStore`]):
+    /// the chunks that hold an evaluation's pins, and one more for the cache besides.
+    fn evaluated_floor(self, chunk_bytes: usize) -> usize {
+        let (per_chunk, charged) = Pool::<EvaluatedSlot>::layout(chunk_bytes);
+        (self.evaluated.div_ceil(per_chunk as usize) + 1) * charged
     }
 
     /// The least budget, in chunks of `chunk_bytes`, that holds this headroom however the
@@ -355,6 +361,38 @@ struct EvalLog {
 /// [`TileStore::save`], and not written back on eviction) are lost with it. Until M0b3's
 /// recovery writer keeps them, call [`TileStore::save`] before dropping a store whose edits
 /// matter.
+///
+/// # Memory policy
+///
+/// The pools share [`StoreConfig::budget_bytes`] and grow by whole chunks of
+/// [`StoreConfig::chunk_bytes`] while the budget allows another; once it is spent, memory moves
+/// between them only a chunk at a time. A correction tile that needs a slot (to be read, edited,
+/// or evaluated from) takes the first of:
+///
+/// 1. a free correction slot, or a new chunk if the budget allows one;
+/// 2. the slot of a clean correction tile, the clock's pick: it is read again if it is wanted;
+/// 3. an evaluated chunk taken back, while the correction pool holds less than a quarter of the
+///    budget and the evaluated pool keeps its floor without that chunk (the chunks one evaluation
+///    pins, see [`StoreConfig::minimum_budget`], plus one for the cache). Of the evaluated chunks
+///    without a pin, the one with the fewest tiles in use goes (current, or referenced since the
+///    clock last passed); its tiles are recomputed when next wanted;
+/// 4. the slot of one dirty correction tile, written back to the working file first: one write per
+///    slot taken, never a batch;
+/// 5. only when every correction slot is pinned, chunks taken back from the pools (below).
+///
+/// The quarter and the floor keep dirty corrections from crowding out the evaluated cache that
+/// every evaluation reads; past them, dirty tiles are written back one at a time.
+///
+/// A prefetched tile takes only a free slot, a new chunk or a clean tile's slot, and is dropped
+/// otherwise: prefetch never takes an evaluated chunk or writes a tile back. An evaluated tile
+/// takes a free slot, a new chunk or the clock's victim (evaluated tiles are never dirty), and
+/// only when every evaluated slot is pinned, chunks taken back from the pools.
+///
+/// Chunks are taken back (for a pool whose slots are all pinned, and by
+/// [`TileStore::shrink_to`]) evaluated chunks first, then correction chunks, the cheapest of
+/// each pool first: the correction chunk with the fewest dirty tiles (each written back before
+/// the chunk goes), the evaluated chunk with the fewest tiles in use. A chunk holding a pinned
+/// slot stays.
 pub struct TileStore {
     /// The prefetch workers. Declared first, so they are stopped and joined (when the store is
     /// dropped) before anything else goes, the working file included.
@@ -864,7 +902,8 @@ impl TileStore {
     }
 
     /// Gives chunks back until the pools hold at most `bytes` or only chunks with pinned slots
-    /// are left: evaluated chunks first, then correction chunks (dirty tiles written back).
+    /// are left: evaluated chunks first, then correction chunks (dirty tiles written back), the
+    /// cheapest of each pool first (see the memory policy).
     ///
     /// # Errors
     ///
@@ -1112,26 +1151,33 @@ impl TileStore {
         Ok(id)
     }
 
-    /// A fresh slot for `key`'s correction tile: taking an evaluated chunk back rather than
-    /// writing a dirty correction tile back, and taking chunks back from the pools if the
-    /// correction pool is full (see the module notes).
+    /// A fresh slot for `key`'s correction tile, as the memory policy orders it (see
+    /// [`TileStore`]): a free slot, a new chunk, a clean victim, an evaluated chunk taken back,
+    /// one dirty victim written back, and only when every correction slot is pinned, chunks
+    /// taken back from the pools.
     ///
     /// # Errors
     ///
     /// [`CacheError::Full`]; [`CacheError::WriteBack`] if a dirty tile's write-back fails.
     fn acquire_correction(&mut self, key: TileKey) -> Result<SlotId<CorrectionSlot>, CacheError> {
-        let chunk = self.corrections.chunk_bytes();
-        let evicts_dirty = !self.corrections.has_free_slot()
-            && !self.budget.fits(chunk)
-            && self.corrections.victim_is_dirty();
-        if evicts_dirty && self.evaluated.has_unpinned_chunk() {
-            // Rebalancing (see the module notes): evaluated chunks only, so nothing is written.
-            let target = self.budget.limit().saturating_sub(chunk);
+        match self.corrections.acquire_clean(key, &mut self.budget) {
+            Err(PoolError::Full) => {}
+            other => return Ok(other?),
+        }
+        if self.may_take_evaluated_chunk() {
+            let target = self
+                .budget
+                .limit()
+                .saturating_sub(self.corrections.chunk_bytes());
             let shrunk = self
                 .evaluated
                 .shrink_to(&mut self.budget, target, nothing_to_write);
             self.note_evictions();
             shrunk?;
+            match self.corrections.acquire_clean(key, &mut self.budget) {
+                Err(PoolError::Full) => {}
+                other => return Ok(other?),
+            }
         }
         for attempt in 0..2 {
             let (file, unsaved) = (&mut self.file, &mut self.unsaved);
@@ -1147,6 +1193,18 @@ impl TileStore {
             }
         }
         Err(CacheError::Full)
+    }
+
+    /// Whether a correction acquire that found no free or clean slot may take an evaluated
+    /// chunk back rather than write a dirty tile back: while the correction pool holds less
+    /// than a quarter of the budget, and the evaluated pool keeps its floor (its share of the
+    /// minimum budget plus one chunk) without the chunk, and has a chunk without pins to give.
+    fn may_take_evaluated_chunk(&self) -> bool {
+        let chunk = self.evaluated.chunk_bytes();
+        let floor = self.headroom.evaluated_floor(chunk);
+        self.corrections.bytes().saturating_mul(4) < self.budget.limit()
+            && self.evaluated.bytes().saturating_sub(chunk) >= floor
+            && self.evaluated.has_unpinned_chunk()
     }
 
     /// A fresh slot for `key`'s evaluated tile, taking chunks back from the pools if the
@@ -1188,7 +1246,8 @@ impl TileStore {
 
     /// Gives chunks without pinned slots back until the pools hold at most `bytes`: evaluated
     /// chunks first (a cache, cheap to recompute), then correction chunks, whose dirty tiles are
-    /// written back to the working file first.
+    /// written back to the working file first; the cheapest of each pool first (see
+    /// [`TileStore`]'s memory policy).
     ///
     /// # Errors
     ///
