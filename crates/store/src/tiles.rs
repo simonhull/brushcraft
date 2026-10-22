@@ -613,8 +613,8 @@ impl TileStore {
     /// Sets the correction at face-grid vertex `(i, j)` of `face` at `level` to `c`, as edit
     /// `op`: in every copy of the vertex (one per tile holding it, in every face sharing it).
     ///
-    /// Each copy's slot becomes dirty, and its key goes to the change feed with `op` unless it
-    /// is there with `op` already (dirty since an earlier edit of the same op). Every cached
+    /// Each copy's slot becomes dirty, and its key goes to the change feed with `op` (once per
+    /// op until a consumer drains it, see [`ChangeFeed::push`]). Every cached
     /// evaluation that followed from those tiles is dropped (pinned ones are recomputed in
     /// place on their next [`TileStore::evaluate`]); a tile nothing has been computed from since
     /// it was last dropped is skipped, so repeated edits of one tile between evaluations walk
@@ -1237,8 +1237,8 @@ impl TileStore {
     }
 
     /// Records that `key`'s correction slot `id` was changed by `op`: dirty, to be written with
-    /// `op`, and on the change feed with it, unless it is there with `op` already (it was dirty
-    /// with `op` before, and a dirty slot's key stays in the feed until it is written).
+    /// `op`, and pushed to the change feed with it (the feed skips the push if no consumer has
+    /// drained the same key and op yet).
     ///
     /// # Errors
     ///
@@ -1249,9 +1249,8 @@ impl TileStore {
         id: SlotId<CorrectionSlot>,
         op: OpId,
     ) -> Result<(), CacheError> {
-        if self.unsaved.insert(key, op) != Some(op) {
-            self.feed.push(key, op);
-        }
+        self.unsaved.insert(key, op);
+        self.feed.push(key, op);
         self.corrections.set_dirty(id, true)?;
         Ok(())
     }

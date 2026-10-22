@@ -16,13 +16,21 @@ pub struct ConsumerId(usize);
 /// Consumers subscribe at the feed's current end. Each [`ChangeFeed::drain`] returns every key
 /// pushed since that consumer's last drain, once, with its latest op. Entries every consumer has
 /// passed are dropped, so memory is bounded by the slowest consumer's lag.
+///
+/// A push that repeats the key and op of an entry no consumer has drained yet is skipped: every
+/// consumer would read the two as one anyway. Once any consumer has drained the entry, the push
+/// is kept, so that consumer sees the key again.
 #[derive(Debug, Default)]
 pub struct ChangeFeed {
+    /// The pushed keys with their ops, oldest first, from the slowest consumer's cursor on.
     entries: VecDeque<(TileKey, OpId)>,
     /// Sequence number of `entries[0]`.
     first: u64,
     /// Per consumer ever subscribed: the sequence number it reads next (`None`: unsubscribed).
     cursors: Vec<Option<u64>>,
+    /// Per key in `entries`: the op and sequence number of its latest entry, for skipping
+    /// repeated pushes.
+    last: HashMap<TileKey, (OpId, u64)>,
 }
 
 impl ChangeFeed {
@@ -33,12 +41,23 @@ impl ChangeFeed {
     }
 
     /// Records that `key` was changed by `op`. With no consumers, nothing is kept.
+    ///
+    /// Skipped if `key`'s latest entry has the same `op` and is ahead of every consumer's cursor:
+    /// no consumer has drained it, so each one's next drain reports the key with `op` either way.
     pub fn push(&mut self, key: TileKey, op: OpId) {
-        if self.cursors.iter().any(Option::is_some) {
-            self.entries.push_back((key, op));
-        } else {
+        let Some(newest) = self.cursors.iter().flatten().max().copied() else {
             self.first += 1;
+            return;
+        };
+        if self
+            .last
+            .get(&key)
+            .is_some_and(|&(last_op, seq)| last_op == op && seq >= newest)
+        {
+            return;
         }
+        self.last.insert(key, (op, self.end()));
+        self.entries.push_back((key, op));
     }
 
     /// A new consumer, starting at the feed's current end.
@@ -98,7 +117,17 @@ impl ChangeFeed {
             .min()
             .copied()
             .unwrap_or_else(|| self.end());
-        while self.first < oldest && self.entries.pop_front().is_some() {
+        while self.first < oldest {
+            let Some((key, _)) = self.entries.pop_front() else {
+                break;
+            };
+            if self
+                .last
+                .get(&key)
+                .is_some_and(|&(_, seq)| seq == self.first)
+            {
+                self.last.remove(&key);
+            }
             self.first += 1;
         }
     }
@@ -191,6 +220,35 @@ mod tests {
         assert_eq!(feed.backlog(), 2, "held for the slow one");
         feed.unsubscribe(slow);
         assert_eq!(feed.backlog(), 0, "nobody left behind");
+    }
+
+    #[test]
+    fn a_repeated_push_is_skipped_only_until_a_consumer_drains_it() {
+        let mut feed = ChangeFeed::new();
+        let a = feed.subscribe();
+        let b = feed.subscribe();
+        let op = OpId::new(0, 1).unwrap();
+        feed.push(key(1), op);
+        feed.push(key(1), op);
+        assert_eq!(feed.backlog(), 1, "undrained by anyone: one entry");
+        assert_eq!(feed.drain(b), vec![(key(1), op)], "b sees the first push");
+        feed.push(key(1), op);
+        assert_eq!(
+            feed.drain(b),
+            vec![(key(1), op)],
+            "b drained the first, so the repeat is kept for it"
+        );
+        assert_eq!(
+            feed.drain(a),
+            vec![(key(1), op)],
+            "a, which drained neither, sees the key once"
+        );
+        feed.push(key(1), op);
+        feed.push(key(1), op);
+        assert_eq!(feed.backlog(), 1, "a fresh entry dedupes again");
+        assert_eq!(feed.drain(a), vec![(key(1), op)], "a sees it");
+        assert_eq!(feed.drain(b), vec![(key(1), op)], "and so does b");
+        assert!(feed.last.is_empty(), "drained entries leave no trace");
     }
 
     #[test]
