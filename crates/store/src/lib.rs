@@ -12,5 +12,5 @@ mod record;
 mod test_dir;
 
 pub use codec::CodecError;
-pub use file::{ProjectFile, StoreError, TileBytes};
+pub use file::{ProjectFile, StoreError, TileBytes, compact};
 pub use op::{MAX_SEQ, OpId};

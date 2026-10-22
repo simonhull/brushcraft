@@ -332,7 +332,16 @@ impl ProjectFile {
     /// [`StoreError::TooLarge`], [`StoreError::Io`].
     fn append(&mut self, kind: u8, payload: &[u8]) -> Result<Loc, StoreError> {
         let record = frame(kind, payload).ok_or(StoreError::TooLarge)?;
-        self.file.write_all_at(&record, self.end)?;
+        self.append_record(&record)
+    }
+
+    /// Writes an already framed record at the end.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`].
+    fn append_record(&mut self, record: &[u8]) -> Result<Loc, StoreError> {
+        self.file.write_all_at(record, self.end)?;
         let loc = Loc {
             offset: self.end,
             len: record.len() as u64,
@@ -351,17 +360,8 @@ impl ProjectFile {
         let Some(&Loc { offset, len }) = self.live.get(key) else {
             return Ok(None);
         };
-        let damaged = StoreError::Damaged { offset };
-        let raw = match read_exact(&self.file, offset, len) {
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(damaged),
-            other => other?,
-        };
-        let tile = match verify(&raw) {
-            Some((KIND_TILE, payload)) => parse_tile_payload(payload),
-            _ => None,
-        }
-        .filter(|tile| tile.key == *key)
-        .ok_or(damaged)?;
+        let raw = self.read_record(offset, len)?;
+        let tile = tile_record(&raw, key).ok_or(StoreError::Damaged { offset })?;
         let body = decompress(tile.packed, tile.raw_len)
             .ok()
             .ok_or(StoreError::Damaged { offset })?;
@@ -370,6 +370,20 @@ impl ProjectFile {
             header: tile.header.to_vec(),
             body,
         }))
+    }
+
+    /// The `len` bytes of the record at `offset`, which the live map promises exist.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Damaged`] if the file ends first, [`StoreError::Io`].
+    fn read_record(&self, offset: u64, len: u64) -> Result<Vec<u8>, StoreError> {
+        match read_exact(&self.file, offset, len) {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                Err(StoreError::Damaged { offset })
+            }
+            other => Ok(other?),
+        }
     }
 
     /// `key`'s latest displacement tile and the edit that wrote it; `None` if absent.
@@ -496,6 +510,51 @@ impl ProjectFile {
     fn last_index_len(&self) -> Option<u64> {
         self.index_len(self.last_index?).ok()
     }
+
+    /// Frames and appends an arbitrary record.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::append`].
+    fn append_raw(&mut self, kind: u8, payload: &[u8]) -> Result<(), StoreError> {
+        self.append(kind, payload).map(drop)
+    }
+}
+
+/// Writes a new project at `dst` holding only `src`'s live tiles (raw records copied, not
+/// recompressed) and one full Index.
+///
+/// `src` is opened as by [`ProjectFile::open`], so a torn tail is cut off it first. History before
+/// the latest state is dropped; which history to keep is decided with stroke history (M2). On
+/// error, `dst` may be left partly written.
+///
+/// # Errors
+///
+/// Any [`StoreError`] from reading `src` (a damaged live tile is [`StoreError::Damaged`]) or
+/// writing `dst`, which must not exist.
+pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
+    let from = ProjectFile::open(src)?;
+    let mut to = ProjectFile::create(dst)?;
+    for (key, &Loc { offset, len }) in &from.live {
+        let raw = from.read_record(offset, len)?;
+        if tile_record(&raw, key).is_none() {
+            return Err(StoreError::Damaged { offset });
+        }
+        let loc = to.append_record(&raw)?;
+        to.live.insert(*key, loc);
+    }
+    to.head = from.head;
+    to.save()?;
+    Ok(())
+}
+
+/// The tile in a raw record, if the record verifies and holds a tile of `key`.
+fn tile_record<'a>(raw: &'a [u8], key: &TileKey) -> Option<TileRecord<'a>> {
+    match verify(raw) {
+        Some((KIND_TILE, payload)) => parse_tile_payload(payload),
+        _ => None,
+    }
+    .filter(|tile| tile.key == *key)
 }
 
 /// Checks the file header.
@@ -733,7 +792,9 @@ fn parse_index_payload(payload: &[u8]) -> Option<Index> {
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
-    use geom::{FaceId, Level, Vec3};
+    use std::path::Path;
+
+    use geom::{Channel, FaceId, LayerId, Level, Vec3};
 
     use super::*;
     use crate::test_dir::TestDir;
@@ -867,5 +928,205 @@ mod tests {
             opened.read_displacement(&key(2, 0)).unwrap().is_some(),
             "others still readable"
         );
+    }
+    /// Every live tile: its op and content.
+    type State = BTreeMap<TileKey, (OpId, CorrectionTile)>;
+
+    /// Writes a project with saves, overwrites and trailing unsaved tiles, recording after every
+    /// record the file length and the expected live state (key → (op, tile)).
+    fn scripted(path: &Path) -> Vec<(u64, State)> {
+        let mut f = ProjectFile::create(path).unwrap();
+        let mut state = BTreeMap::new();
+        let mut log = vec![(f.len(), state.clone())];
+        let mut seq = 0;
+        for round in 0..6u16 {
+            for k in 0..5u32 {
+                seq += 1;
+                let t = tile(f32::from(round) + 0.1 * f32::from(u16::try_from(k).unwrap()));
+                let at = key(k + u32::from(round % 2), 0);
+                f.write_displacement(at, op(seq), &t).unwrap();
+                state.insert(at, (op(seq), t));
+                log.push((f.len(), state.clone()));
+            }
+            if round < 5 {
+                f.save().unwrap(); // the last round stays unsaved
+                log.push((f.len(), state.clone()));
+            }
+        }
+        log
+    }
+
+    fn state_of(f: &ProjectFile) -> State {
+        f.keys()
+            .map(|k| (*k, f.read_displacement(k).unwrap().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn truncation_anywhere_opens_with_the_last_complete_state() {
+        let dir = TestDir::new();
+        let full = dir.path("full.bcrf");
+        let log = scripted(&full);
+        let bytes = std::fs::read(&full).unwrap();
+        let mut cuts: Vec<u64> = log.iter().map(|(len, _)| *len).collect();
+        let mut x = 0x9E37_79B9_u64;
+        for _ in 0..60 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            cuts.push(HEADER_LEN as u64 + x % (bytes.len() as u64 - HEADER_LEN as u64));
+        }
+        for cut in cuts {
+            let (good_len, want) = log.iter().rev().find(|(len, _)| *len <= cut).unwrap();
+            let kept = &bytes[..usize::try_from(cut).unwrap()];
+            // A crash can also leave the file at its full length with the unwritten blocks zeroed.
+            let zero_filled = [kept, &vec![0; bytes.len() - kept.len()]].concat();
+            for (variant, contents) in [("cut", kept.to_vec()), ("zero-filled", zero_filled)] {
+                let path = dir.path("cut.bcrf");
+                std::fs::write(&path, &contents).unwrap();
+                let mut f = ProjectFile::open(&path).unwrap();
+                assert_eq!(&state_of(&f), want, "{variant} at {cut}");
+                // The torn tail is gone and the file is writable again.
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().len(),
+                    *good_len,
+                    "tail cut off: {variant} at {cut}"
+                );
+                f.write_displacement(key(99, 0), op(10_000), &tile(9.0))
+                    .unwrap();
+                f.save().unwrap();
+                drop(f);
+                let reopened = ProjectFile::open(&path).unwrap();
+                let mut want = want.clone();
+                want.insert(key(99, 0), (op(10_000), tile(9.0)));
+                assert_eq!(
+                    state_of(&reopened),
+                    want,
+                    "written after the {variant} at {cut}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_save_point_opens_to_its_own_state() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path).unwrap();
+        let mut snapshots = Vec::new();
+        for round in 0..40u16 {
+            f.write_displacement(
+                key(u32::from(round % 7), 0),
+                op(u64::from(round) + 1),
+                &tile(f32::from(round)),
+            )
+            .unwrap();
+            let point = f.save().unwrap();
+            snapshots.push((point, state_of(&f)));
+        }
+        assert_eq!(
+            f.save_points().unwrap(),
+            snapshots.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            "chain"
+        );
+        for (point, want) in &snapshots {
+            let mut old = ProjectFile::open_at(&path, *point).unwrap();
+            assert_eq!(&state_of(&old), want, "save point {point}");
+            assert!(
+                matches!(
+                    old.write_displacement(key(0, 0), op(1), &tile(0.0)),
+                    Err(StoreError::ReadOnly)
+                ),
+                "read-only"
+            );
+        }
+        assert!(
+            matches!(
+                ProjectFile::open_at(&path, 17),
+                Err(StoreError::NotASavePoint(17))
+            ),
+            "not an index"
+        );
+    }
+
+    #[test]
+    fn unknown_record_kinds_are_skipped() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path).unwrap();
+        f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
+        f.save().unwrap();
+        f.append_raw(9, b"from a newer version").unwrap();
+        f.write_displacement(key(2, 0), op(2), &tile(2.0)).unwrap();
+        f.save().unwrap();
+        f.append_raw(200, &[0; 64]).unwrap(); // unsaved, after the last index
+        f.write_displacement(key(3, 0), op(3), &tile(3.0)).unwrap();
+        drop(f);
+        let opened = ProjectFile::open(&path).unwrap();
+        assert_eq!(
+            opened.keys().count(),
+            3,
+            "all three tiles, unknown records skipped"
+        );
+    }
+
+    #[test]
+    fn other_layers_and_channels_round_trip_through_save_open_and_compaction() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let odd = TileKey::new(
+            LayerId::new(3),
+            Channel::from_raw(7),
+            FaceId::new(5),
+            Level::new(4).unwrap(),
+            0,
+            0,
+        )
+        .unwrap();
+        let mut f = ProjectFile::create(&path).unwrap();
+        f.write_tile(odd, op(1), b"future header", b"future body")
+            .unwrap();
+        f.write_displacement(key(1, 0), op(2), &tile(1.0)).unwrap();
+        f.save().unwrap();
+        drop(f);
+        let compacted = dir.path("c.bcrf");
+        compact(&path, &compacted).unwrap();
+        for p in [&path, &compacted] {
+            let opened = ProjectFile::open(p).unwrap();
+            let t = opened.read_tile(&odd).unwrap().unwrap();
+            assert_eq!(
+                (t.op, t.header.as_slice(), t.body.as_slice()),
+                (op(1), &b"future header"[..], &b"future body"[..]),
+                "{p:?}"
+            );
+            assert_eq!(opened.head(), Some(op(2)), "head op {p:?}");
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_the_latest_state_and_shrinks_the_file() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path).unwrap();
+        for seq in 1..=100u16 {
+            f.write_displacement(
+                key(u32::from(seq % 4), 0),
+                op(u64::from(seq)),
+                &tile(f32::from(seq)),
+            )
+            .unwrap();
+            f.save().unwrap();
+        }
+        let before = state_of(&f);
+        let big = f.len();
+        drop(f);
+        let out = dir.path("c.bcrf");
+        compact(&path, &out).unwrap();
+        let c = ProjectFile::open(&out).unwrap();
+        assert_eq!(state_of(&c), before, "same latest state");
+        assert!(
+            c.len() < big / 10,
+            "only live records kept: {} vs {big}",
+            c.len()
+        );
+        assert_eq!(c.save_points().unwrap().len(), 1, "one full index");
     }
 }
