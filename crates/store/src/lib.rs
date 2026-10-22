@@ -25,4 +25,4 @@ pub use feed::{ChangeFeed, ConsumerId};
 pub use file::{MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
 pub use pool::PoolError;
-pub use tiles::{CacheError, PinGuard, StoreConfig, TileStore};
+pub use tiles::{CacheError, PinGuard, StoreConfig, TileEdit, TileStore};

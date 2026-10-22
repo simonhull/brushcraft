@@ -163,6 +163,14 @@ impl DepGraph {
         self.nodes.get(key).is_some_and(|node| node.has_normals)
     }
 
+    /// Whether anything recorded reads `key`'s positions: a tile predicted from them, or normals
+    /// computed from them.
+    pub(crate) fn is_read(&self, key: &TileKey) -> bool {
+        self.nodes
+            .get(key)
+            .is_some_and(|node| !node.readers.is_empty() || !node.normal_readers.is_empty())
+    }
+
     /// The tiles `key`'s positions were last predicted from (level 0 left out), if its node is
     /// still in the graph: what [`geom::parent_tiles`] would list again.
     pub(crate) fn parents(&self, key: &TileKey) -> Option<&[TileKey]> {

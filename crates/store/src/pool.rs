@@ -332,6 +332,16 @@ impl<T: Pod> Pool<T> {
         Some((SlotId::new(pos, meta.generation), freshness))
     }
 
+    /// Whether `key`'s slot is current, without marking it referenced; `None` if it has none.
+    pub(crate) fn freshness(&self, key: &TileKey) -> Option<Freshness> {
+        let meta = self.meta_of(*self.index.get(key)?)?;
+        Some(if meta.stale {
+            Freshness::Stale
+        } else {
+            Freshness::Fresh
+        })
+    }
+
     /// `key`'s slot, without marking it referenced: for bookkeeping passes (saving) that
     /// shouldn't count as use.
     pub(crate) fn find(&self, key: &TileKey) -> Option<SlotId<T>> {

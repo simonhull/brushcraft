@@ -969,6 +969,269 @@ fn cold_evaluation_in_any_order_fits_the_minimum_budget() {
     });
 }
 
+/// One tile and edits of it, in its own coordinates.
+type TileBatch = (TileKey, Vec<(u32, u32, Vec3)>);
+
+/// `count` tiles of levels 1–8 picked with `seed`, each with `per_tile` edits in its own
+/// coordinates (a third of them on its border, where copies in other tiles follow).
+fn tile_batches(mesh: &BaseMesh, count: u32, per_tile: u32, seed: u64) -> Vec<TileBatch> {
+    let all = tiles(mesh, 1, TOP);
+    let mut rng = Rng(seed);
+    (0..count)
+        .map(|_| {
+            let key = all[rng.below(u32::try_from(all.len()).unwrap()) as usize];
+            let side = key.side();
+            let amplitude = 0.5 / f32::from(u16::try_from(key.level().face_quads()).unwrap());
+            let edits = (0..per_tile)
+                .map(|_| {
+                    let (mut i, mut j) = (rng.below(side), rng.below(side));
+                    if rng.below(3) == 0 {
+                        if rng.below(2) == 0 {
+                            i = [0, side - 1][rng.below(2) as usize];
+                        } else {
+                            j = [0, side - 1][rng.below(2) as usize];
+                        }
+                    }
+                    (i, j, rng.vec3(amplitude))
+                })
+                .collect();
+            (key, edits)
+        })
+        .collect()
+}
+
+/// Applies `batches` to the store with [`TileStore::edit_tile`], a fresh op each, and to the
+/// oracle's map.
+fn apply_batches(store: &mut TileStore, map: &mut CorrectionMap, batches: &[TileBatch]) {
+    for (key, writes) in batches {
+        let region = Region::of_tile(key);
+        let op = store.next_op().unwrap();
+        store
+            .edit_tile(*key, op, |edit| {
+                for &(i, j, c) in writes {
+                    edit.set(i, j, c).unwrap();
+                }
+            })
+            .unwrap();
+        for &(i, j, c) in writes {
+            let (fi, fj) = (region.x0() + i, region.y0() + j);
+            map.set(store.mesh.topology(), key.face(), key.level(), fi, fj, c)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn editing_a_tile_equals_setting_its_vertices() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut one_by_one = new_store(&dir, "one.bcp", &mesh, roomy());
+    let mut batched = new_store(&dir, "batched.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    for (key, edits) in tile_batches(&mesh, 60, 25, 18) {
+        let region = Region::of_tile(&key);
+        let op = one_by_one.next_op().unwrap();
+        assert_eq!(
+            batched.next_op().unwrap(),
+            op,
+            "the stores hand out the same ops"
+        );
+        for &(i, j, c) in &edits {
+            let (fi, fj) = (region.x0() + i, region.y0() + j);
+            one_by_one
+                .set_correction(key.face(), key.level(), fi, fj, c, op)
+                .unwrap();
+            map.set(mesh.topology(), key.face(), key.level(), fi, fj, c)
+                .unwrap();
+        }
+        let touched = batched
+            .edit_tile(key, op, |edit| {
+                for &(i, j, c) in &edits {
+                    edit.set(i, j, c).unwrap();
+                }
+                assert_eq!(
+                    edit.get(0, 0).unwrap(),
+                    {
+                        let (i, j) = (region.x0(), region.y0());
+                        map.get(key.face(), key.level(), i, j)
+                    },
+                    "reads its own writes"
+                );
+                edit.touched.len()
+            })
+            .unwrap();
+        assert!(touched >= 1, "{key:?}");
+        batched.deps.check_invariants().unwrap();
+    }
+    let edited: BTreeSet<TileKey> = one_by_one.unsaved.keys().copied().collect();
+    assert_eq!(
+        edited,
+        batched.unsaved.keys().copied().collect(),
+        "the same tiles are dirty"
+    );
+    let feed = |store: &mut TileStore| -> BTreeSet<(TileKey, OpId)> {
+        store.feed.drain(store.save_consumer).into_iter().collect()
+    };
+    assert_eq!(feed(&mut one_by_one), feed(&mut batched), "and on the feed");
+    for key in &edited {
+        one_by_one.correction(*key).unwrap();
+        batched.correction(*key).unwrap();
+        assert_eq!(
+            slot_resident(&one_by_one, key),
+            slot_resident(&batched, key),
+            "{key:?}: the same bits"
+        );
+    }
+    let dense = dense(&mesh, &map);
+    assert_positions(&mut batched, &dense, &tiles(&mesh, 1, TOP), "batched");
+}
+
+#[test]
+fn a_tile_edited_by_one_op_goes_to_the_feed_once() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let key = tiles(&mesh, TOP, TOP)[5];
+    let region = Region::of_tile(&key);
+    let op = store.next_op().unwrap();
+    for n in 0..50 {
+        let (i, j) = (region.x0() + 1 + n, region.y0() + 7);
+        store
+            .set_correction(
+                key.face(),
+                key.level(),
+                i,
+                j,
+                Vec3::new(0.001, 0.0, 0.0),
+                op,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.feed.backlog(),
+        1,
+        "one interior tile, one op: one entry"
+    );
+    store
+        .edit_tile(key, op, |edit| edit.set(3, 3, Vec3::ZERO))
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.feed.backlog(), 1, "batched or not");
+    let next = store.next_op().unwrap();
+    store
+        .edit_tile(key, next, |edit| edit.set(3, 4, Vec3::ZERO))
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.feed.backlog(), 2, "a new op is a new entry");
+    store.save().unwrap();
+    store
+        .edit_tile(key, next, |edit| edit.set(3, 5, Vec3::ZERO))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.feed.drain(store.save_consumer),
+        vec![(key, next)],
+        "written by the save, so clean: the same op goes to the feed again"
+    );
+}
+
+#[test]
+fn edits_between_evaluations_invalidate_once() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    let key = tiles(&mesh, TOP, TOP)[37];
+    let region = Region::of_tile(&key);
+    store.normals(key).unwrap();
+    store.log = EvalLog::default();
+    // One op throughout, as a brush stroke: the store is evaluated between its dabs.
+    let op = store.next_op().unwrap();
+    let mut rng = Rng(19);
+    let mut dab = |into: &mut TileStore, oracle: &mut CorrectionMap| {
+        for _ in 0..40 {
+            let (i, j) = (
+                region.x0() + 1 + rng.below(63),
+                region.y0() + 1 + rng.below(63),
+            );
+            let c = rng.vec3(0.001);
+            into.set_correction(key.face(), key.level(), i, j, c, op)
+                .unwrap();
+            oracle
+                .set(mesh.topology(), key.face(), key.level(), i, j, c)
+                .unwrap();
+        }
+    };
+    dab(&mut store, &mut map);
+    assert_eq!(
+        store.log.invalidations, 1,
+        "the first edit drops the tile's evaluations; the rest find nothing to drop"
+    );
+    assert_normals(
+        &mut store,
+        &mesh,
+        &dense(&mesh, &map),
+        &[key],
+        "after a dab",
+    );
+    dab(&mut store, &mut map);
+    assert_eq!(store.log.invalidations, 2, "evaluated since: dropped again");
+    let dense = dense(&mesh, &map);
+    assert_positions(&mut store, &dense, &[key], "after the second dab, same op");
+    assert_normals(
+        &mut store,
+        &mesh,
+        &dense,
+        &[key],
+        "after the second dab, same op",
+    );
+    store
+        .edit_tile(key, op, |edit| {
+            for n in 0..64 {
+                edit.set(n, n, Vec3::ZERO).unwrap();
+            }
+        })
+        .unwrap();
+    assert_eq!(store.log.invalidations, 3, "a whole tile edit drops once");
+}
+
+#[test]
+fn a_copy_that_fails_to_write_keeps_its_written_twins_invalidated() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    // A vertex on a face edge, on a tile border: four copies.
+    let (face, level, i, j) = (FaceId::new(1), level(TOP), 64, 0);
+    let copies = mesh.topology().copies(face, level, i, j);
+    assert_eq!(copies.len(), 4, "four copies");
+    for copy in &copies {
+        store.evaluate(copy.key(level)).unwrap();
+    }
+    let (first, broken) = (copies[0].key(level), copies[2].key(level));
+    store.correction(broken).unwrap();
+    let id = store.corrections.find(&broken).unwrap();
+    store.corrections.get_mut(id).unwrap().side = 0;
+    let op = store.next_op().unwrap();
+    let c = Vec3::new(0.002, 0.0, 0.0);
+    assert!(
+        store.set_correction(face, level, i, j, c, op).is_err(),
+        "the broken copy fails the edit"
+    );
+    assert_eq!(
+        store
+            .correction(first)
+            .unwrap()
+            .get(copies[0].i, copies[0].j),
+        Some(c),
+        "the first copy was written"
+    );
+    assert_ne!(
+        store.evaluated.freshness(&first),
+        Some(Freshness::Fresh),
+        "and its evaluation dropped"
+    );
+}
+
 /// Polls until every prefetch request is answered; returns how many tiles were installed.
 ///
 /// Fails the test if that takes more than ten seconds: the reads are a few kilobytes each.
@@ -1158,12 +1421,32 @@ fn dropping_a_store_with_queued_work_returns_promptly() {
 /// Most tiles the budget workload holds pinned at once.
 const WORKLOAD_PINS: usize = 3;
 
+/// Asserts what holds after every step of [`random_workload`]: the pools are within the budget,
+/// which counts exactly their chunks, and the dependency graph is whole.
+fn check_workload_step(store: &TileStore, config: StoreConfig, what: &str) {
+    assert!(
+        store.bytes() <= config.budget_bytes,
+        "{what}: {} bytes in a budget of {}",
+        store.bytes(),
+        config.budget_bytes
+    );
+    assert_eq!(
+        store.bytes(),
+        store.corrections.bytes() + store.evaluated.bytes(),
+        "{what}: the budget counts the pools' chunks"
+    );
+    if let Err(broken) = store.deps.check_invariants() {
+        panic!("{what}: dependency graph: {broken}");
+    }
+}
+
 /// Runs `steps` random store operations, chosen with `seed`, under a budget of a few chunks.
 ///
-/// The operations: evaluations, normals, edits, pins and unpins (at most [`WORKLOAD_PINS`]
-/// tiles at once), prefetches and polls, saves, evictions and shrinks. After every operation the
-/// pools are within the budget and the budget counts exactly their chunks; at the end every tile
-/// of levels 1–8 evaluates as the dense evaluation of the same edits does, bit for bit.
+/// The operations: evaluations, normals, edits (single vertices and tile batches), pins and unpins
+/// (at most [`WORKLOAD_PINS`] tiles at once), prefetches and polls, saves, evictions and shrinks.
+/// After every operation the pools are within the budget, the budget counts exactly their chunks
+/// and the dependency graph is whole; at the end every tile of levels 1–8 evaluates as the dense
+/// evaluation of the same edits does, bit for bit.
 fn random_workload(seed: u64, steps: u32) {
     let config = pinning();
     let dir = TestDir::new();
@@ -1187,9 +1470,14 @@ fn random_workload(seed: u64, steps: u32) {
                 store.normals(pick(&mut rng)).unwrap();
                 "normals"
             }
-            40..62 => {
+            40..52 => {
                 apply(&mut store, &mut map, &[edits.next().unwrap()]);
                 "set_correction"
+            }
+            52..62 => {
+                let batch = tile_batches(&mesh, 1, 1 + rng.below(8), rng.next_u64());
+                apply_batches(&mut store, &mut map, &batch);
+                "edit_tile"
             }
             62..70 => {
                 let pinned: usize = guards.iter().map(|g| g.keys().len()).sum();
@@ -1233,20 +1521,7 @@ fn random_workload(seed: u64, steps: u32) {
                 "shrink_to"
             }
         };
-        assert!(
-            store.bytes() <= config.budget_bytes,
-            "seed {seed} step {step} ({what}): {} bytes in a budget of {}",
-            store.bytes(),
-            config.budget_bytes
-        );
-        assert_eq!(
-            store.bytes(),
-            store.corrections.bytes() + store.evaluated.bytes(),
-            "seed {seed} step {step} ({what}): the budget counts the pools' chunks"
-        );
-        if let Err(broken) = store.deps.check_invariants() {
-            panic!("seed {seed} step {step} ({what}): dependency graph: {broken}");
-        }
+        check_workload_step(&store, config, &format!("seed {seed} step {step} ({what})"));
     }
     drop(guards);
     drain_prefetch(&mut store);

@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use geom::{
     BaseMesh, Channel, CorrectionError, CorrectionView, EvalError, FaceId, LayerId, Level,
-    PositionSource, Region, TileKey, Vec3, normal_tiles, normals_into, parent_tiles,
+    MAX_COPIES, PositionSource, Region, TileKey, Vec3, normal_tiles, normals_into, parent_tiles,
     predict_region,
 };
 use thiserror::Error;
@@ -254,6 +254,8 @@ struct EvalLog {
     file_reads: Vec<TileKey>,
     /// Prefetched correction tiles installed.
     prefetched: usize,
+    /// Invalidations run (dependency cascades walked) for edited tiles.
+    invalidations: usize,
     /// Parent lists read back from the dependency graph. (Counted through `&self`, as the
     /// lists are looked up, hence the cells.)
     parents_reused: Cell<usize>,
@@ -513,9 +515,14 @@ impl TileStore {
 
     /// Sets the correction at face-grid vertex `(i, j)` of `face` at `level` to `c`, as edit
     /// `op`: in every copy of the vertex (one per tile holding it, in every face sharing it).
-    /// Each copy's slot becomes dirty and its key goes to the change feed with `op`; every cached
-    /// evaluation that followed from those tiles is dropped (pinned ones are recomputed in place
-    /// on their next [`TileStore::evaluate`]).
+    ///
+    /// Each copy's slot becomes dirty, and its key goes to the change feed with `op` unless it
+    /// is there with `op` already (dirty since an earlier edit of the same op). Every cached
+    /// evaluation that followed from those tiles is dropped (pinned ones are recomputed in
+    /// place on their next [`TileStore::evaluate`]); a tile nothing has been computed from since
+    /// it was last dropped is skipped, so repeated edits of one tile between evaluations walk
+    /// its dependencies once. To edit many vertices of one tile, [`TileStore::edit_tile`] does
+    /// the bookkeeping once for all of them.
     ///
     /// # Errors
     ///
@@ -523,6 +530,8 @@ impl TileStore {
     /// [`CorrectionError::LevelZero`], [`CorrectionError::UnknownFace`] or
     /// [`CorrectionError::OutOfTile`], before anything is written; [`CacheError::Store`] or
     /// [`CacheError::Pool`] if a copy's tile can't be loaded, also before anything is written.
+    /// Should writing a copy fail all the same (a broken slot), the copies written before it
+    /// are kept, and their evaluations dropped, before the error is returned.
     pub fn set_correction(
         &mut self,
         face: FaceId,
@@ -551,29 +560,80 @@ impl TileStore {
         }
         // Every copy is loaded and pinned before any is written, so a failed load leaves the
         // twins agreeing.
-        let mut held = Vec::with_capacity(copies.len());
-        let loaded = copies.iter().try_for_each(|copy| {
+        let mut held = [None; MAX_COPIES];
+        let loaded = copies.iter().zip(&mut held).try_for_each(|(copy, place)| {
             let id = self.load_correction(copy.key(level))?;
             self.corrections.pin(id)?;
-            held.push(id);
+            *place = Some(id);
             Ok::<_, CacheError>(())
         });
-        let written = loaded.and_then(|()| {
-            for (copy, &id) in copies.iter().zip(&held) {
-                let key = copy.key(level);
-                let slot = self.corrections.get_mut(id).ok_or(PoolError::Stale)?;
-                slot.view_mut()?.set(copy.i, copy.j, c)?;
-                self.unsaved.insert(key, op);
-                self.corrections.set_dirty(id, true)?;
-                self.feed.push(key, op);
+        let mut written = 0;
+        let outcome = loaded.and_then(|()| {
+            for (copy, &id) in copies.iter().zip(held.iter().flatten()) {
+                self.write_correction(copy.key(level), id, (copy.i, copy.j), c, op)?;
+                written += 1;
             }
             Ok(())
         });
-        let released = held.iter().try_for_each(|&id| self.corrections.unpin(id));
-        written?;
+        let released = held
+            .iter()
+            .flatten()
+            .try_for_each(|&id| self.corrections.unpin(id));
+        // The copies written are invalidated even if a later one failed.
+        self.invalidate_edited(copies.iter().take(written).map(|copy| copy.key(level)));
+        outcome?;
         released?;
-        self.invalidate(copies.iter().map(|copy| copy.key(level)));
         Ok(())
+    }
+
+    /// Edits `key`'s corrections as edit `op`: `f` sets vertices through a [`TileEdit`], and
+    /// its result is returned.
+    ///
+    /// This is [`TileStore::set_correction`] for many vertices of one tile, with the bookkeeping
+    /// done once per tile instead of once per vertex: each tile written (the edited one, and the
+    /// neighbours holding copies of its border vertices) is loaded and pinned when first
+    /// touched, marked dirty and put on the change feed at its first write, and its evaluations
+    /// are dropped once, when `f` returns. Errors of single writes go to `f`.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::NotATile`]; [`CacheError::Store`] or [`CacheError::Pool`] if the tile's
+    /// corrections can't be loaded (nothing is written then); [`CacheError::Pool`] if a slot
+    /// handle went stale when the tiles are unpinned (not with a consistent pool).
+    pub fn edit_tile<R>(
+        &mut self,
+        key: TileKey,
+        op: OpId,
+        f: impl FnOnce(&mut TileEdit<'_>) -> R,
+    ) -> Result<R, CacheError> {
+        self.sync_pins()?;
+        self.poll()?;
+        self.check_key(&key)?;
+        let id = self.load_correction(key)?;
+        self.corrections.pin(id)?;
+        let mut edit = TileEdit {
+            store: self,
+            key,
+            op,
+            touched: vec![Touched {
+                key,
+                id,
+                written: false,
+            }],
+        };
+        let result = f(&mut edit);
+        let touched = edit.touched;
+        let released = touched
+            .iter()
+            .try_for_each(|tile| self.corrections.unpin(tile.id));
+        self.invalidate_edited(
+            touched
+                .iter()
+                .filter(|tile| tile.written)
+                .map(|tile| tile.key),
+        );
+        released?;
+        Ok(result)
     }
 
     /// `key`'s evaluated positions, row-major `side²`: cached, else computed coarse to fine
@@ -1027,10 +1087,75 @@ impl TileStore {
         }
     }
 
+    /// Writes `c` at `(i, j)` of `key`'s correction slot `id` (resident and pinned) as edit `op`,
+    /// and marks the slot written (see [`TileStore::mark_written`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Pool`] for a stale handle; [`CacheError::Correction`] if the slot doesn't
+    /// hold a valid tile or `(i, j)` is outside it (neither happens for a loaded slot and a
+    /// copy's coordinates).
+    fn write_correction(
+        &mut self,
+        key: TileKey,
+        id: SlotId<CorrectionSlot>,
+        (i, j): (u32, u32),
+        c: Vec3,
+        op: OpId,
+    ) -> Result<(), CacheError> {
+        let slot = self.corrections.get_mut(id).ok_or(PoolError::Stale)?;
+        slot.view_mut()?.set(i, j, c)?;
+        self.mark_written(key, id, op)
+    }
+
+    /// Records that `key`'s correction slot `id` was changed by `op`: dirty, to be written with
+    /// `op`, and on the change feed with it, unless it is there with `op` already (it was dirty
+    /// with `op` before, and a dirty slot's key stays in the feed until it is written).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Pool`] for a stale handle.
+    fn mark_written(
+        &mut self,
+        key: TileKey,
+        id: SlotId<CorrectionSlot>,
+        op: OpId,
+    ) -> Result<(), CacheError> {
+        if self.unsaved.insert(key, op) != Some(op) {
+            self.feed.push(key, op);
+        }
+        self.corrections.set_dirty(id, true)?;
+        Ok(())
+    }
+
+    /// Drops the evaluations that followed from the `edited` tiles' corrections (see
+    /// [`TileStore::invalidate`]), skipping each tile nothing can have followed from: one whose
+    /// own positions aren't current and that nothing recorded reads.
+    ///
+    /// Anything computed from a tile's corrections is computed from its positions, and its
+    /// positions only from the tile being evaluated, which makes them current. So once a tile's
+    /// evaluations are dropped, edits of it have nothing more to drop until it is evaluated
+    /// again, however many there are and whatever their ops.
+    fn invalidate_edited(&mut self, edited: impl IntoIterator<Item = TileKey>) {
+        let reached: Vec<TileKey> = edited
+            .into_iter()
+            .filter(|key| {
+                self.evaluated.freshness(key) == Some(Freshness::Fresh) || self.deps.is_read(key)
+            })
+            .collect();
+        if !reached.is_empty() {
+            self.invalidate(reached);
+        }
+    }
+
     /// Drops every evaluation that followed from the `edited` tiles' corrections: positions
     /// through the recorded parents, transitively, and normals that read any of them. A pinned
     /// tile keeps its slot, marked stale, and is recomputed in place on its next evaluation.
     fn invalidate(&mut self, edited: impl IntoIterator<Item = TileKey>) {
+        #[cfg(test)]
+        {
+            self.log.invalidations += 1;
+        }
         let cascade = self.deps.cascade(edited);
         for key in cascade.normals {
             self.deps.drop_normals(key);
@@ -1328,6 +1453,147 @@ impl TileStore {
             keep_first(&mut outcome, self.evaluated.unpin(id));
         }
         outcome
+    }
+}
+
+/// A tile [`TileEdit`] has touched: loaded and pinned, perhaps written.
+#[derive(Debug, Clone, Copy)]
+struct Touched {
+    /// The tile.
+    key: TileKey,
+    /// Its correction slot, pinned until the edit ends.
+    id: SlotId<CorrectionSlot>,
+    /// Whether a copy in it was written (it is dirty and on the feed).
+    written: bool,
+}
+
+/// One tile's corrections being edited as one op: what [`TileStore::edit_tile`] hands its
+/// closure.
+///
+/// Coordinates are the tile's own, `0..side` on each axis. Setting a vertex on the tile's border
+/// sets every copy of it, in the neighbouring tiles of this face and of the faces across the
+/// border too, so twins never disagree. The tiles written stay pinned until the edit ends; then
+/// each one's evaluations are dropped, once.
+pub struct TileEdit<'a> {
+    /// The store, borrowed for the edit.
+    store: &'a mut TileStore,
+    /// The tile edited.
+    key: TileKey,
+    /// The op every write is recorded with.
+    op: OpId,
+    /// The tiles holding copies touched so far, the edited tile first. A handful (a border
+    /// vertex's copies lie in the tile's neighbours), so a linear search finds them.
+    touched: Vec<Touched>,
+}
+
+impl std::fmt::Debug for TileEdit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TileEdit")
+            .field("key", &self.key)
+            .field("op", &self.op)
+            .field("touched", &self.touched.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TileEdit<'_> {
+    /// The tile being edited.
+    #[must_use]
+    pub const fn key(&self) -> TileKey {
+        self.key
+    }
+
+    /// The correction at `(i, j)` of the tile, as stored (interior values quantized).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Correction`] with [`CorrectionError::OutOfTile`].
+    pub fn get(&self, i: u32, j: u32) -> Result<Vec3, CacheError> {
+        let side = self.key.side();
+        let own = self.touched.first().ok_or(PoolError::Stale)?;
+        let slot = self.store.corrections.get(own.id).ok_or(PoolError::Stale)?;
+        let value = slot.view()?.get(i, j);
+        Ok(value.ok_or(CorrectionError::OutOfTile { i, j, side })?)
+    }
+
+    /// Sets the correction at `(i, j)` of the tile to `c`, in every copy of the vertex.
+    ///
+    /// An interior vertex has one copy and is written in place. A border vertex's copies are
+    /// all loaded (and pinned) before any is written.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`] or
+    /// [`CorrectionError::OutOfTile`], before anything is written; [`CacheError::Store`] or
+    /// [`CacheError::Pool`] if a neighbouring tile holding a copy can't be loaded, also before
+    /// anything of this vertex is written.
+    pub fn set(&mut self, i: u32, j: u32, c: Vec3) -> Result<(), CacheError> {
+        if !c.is_finite() {
+            return Err(CorrectionError::NotFinite.into());
+        }
+        let side = self.key.side();
+        if i >= side || j >= side {
+            return Err(CorrectionError::OutOfTile { i, j, side }.into());
+        }
+        let inside = 1..side - 1;
+        if inside.contains(&i) && inside.contains(&j) {
+            return self.write(0, (i, j), c);
+        }
+        let level = self.key.level();
+        let region = Region::of_tile(&self.key);
+        let copies = self.store.mesh.topology().copies(
+            self.key.face(),
+            level,
+            region.x0() + i,
+            region.y0() + j,
+        );
+        let mut at = [0; MAX_COPIES];
+        for (copy, place) in copies.iter().zip(&mut at) {
+            *place = self.touch(copy.key(level))?;
+        }
+        for (copy, &n) in copies.iter().zip(&at) {
+            self.write(n, (copy.i, copy.j), c)?;
+        }
+        Ok(())
+    }
+
+    /// The index in `touched` of `key`'s tile, loaded and pinned if it is new.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::load_correction`]; [`CacheError::Pool`] for a stale handle.
+    fn touch(&mut self, key: TileKey) -> Result<usize, CacheError> {
+        if let Some(n) = self.touched.iter().position(|tile| tile.key == key) {
+            return Ok(n);
+        }
+        let id = self.store.load_correction(key)?;
+        self.store.corrections.pin(id)?;
+        self.touched.push(Touched {
+            key,
+            id,
+            written: false,
+        });
+        Ok(self.touched.len() - 1)
+    }
+
+    /// Writes `c` at `(i, j)` of touched tile `n`, marking the tile written at its first write.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::write_correction`].
+    fn write(&mut self, n: usize, (i, j): (u32, u32), c: Vec3) -> Result<(), CacheError> {
+        let tile = self.touched.get_mut(n).ok_or(PoolError::Stale)?;
+        let slot = self
+            .store
+            .corrections
+            .get_mut(tile.id)
+            .ok_or(PoolError::Stale)?;
+        slot.view_mut()?.set(i, j, c)?;
+        if !tile.written {
+            tile.written = true;
+            self.store.mark_written(tile.key, tile.id, self.op)?;
+        }
+        Ok(())
     }
 }
 
