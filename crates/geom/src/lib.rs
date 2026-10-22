@@ -12,3 +12,5 @@ pub use key::{
     Channel, FaceId, LayerId, Level, LevelOutOfRange, MAX_LEVEL, Region, TILE_QUADS, TileKey,
     TileOutOfRange,
 };
+mod correction;
+pub use correction::{CorrectionError, CorrectionTile};
