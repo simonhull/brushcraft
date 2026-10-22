@@ -365,11 +365,13 @@ impl Project {
     /// closes without keeping it.
     ///
     /// Everything the candidate was listed with is checked again under the locks a project
-    /// holds, as the files may have changed since: the project file is opened for writing (so
-    /// no other instance writes it meanwhile) and must hold the very save point the recovery
-    /// file names (project id, offset and head op). If that is its latest, the project saves
-    /// into it as usual; if it has been saved since, the restored project reads that earlier
-    /// save point, has no path ([`Project::path`] is `None`), and saves as a new file.
+    /// holds, as the files may have changed since: the project file must hold the very save
+    /// point the recovery file names (project id, offset and head op). If that is its latest,
+    /// the project file is opened for writing (so no other instance writes it meanwhile), and
+    /// the project saves into it as usual. If it has been saved since, the project file is held
+    /// read-only, with a shared lock, as it is never written: the restored project reads that
+    /// earlier save point, has no path ([`Project::path`] is `None`), and saves as a new file.
+    /// Other readers may open the project file meanwhile, but no instance can write it.
     ///
     /// The recovery file opens at its last durable save point; whatever followed it (a flush
     /// cut short, tiles of the stroke in progress) is discarded. The project's ops start past
@@ -411,11 +413,10 @@ impl Project {
                     .base_path
                     .clone()
                     .ok_or(ProjectError::NotRestorable(CandidateStatus::ProjectMissing))?;
-                let project = ProjectFile::open(&path).map_err(|e| match unavailable(&e) {
-                    Some(status) => ProjectError::NotRestorable(status),
-                    None => e.into(),
-                })?;
-                let working = ProjectFile::open_sharing_mesh(&candidate.path, &project)?;
+                // Looked at first, read-only: a restore onto an earlier save point never writes
+                // the project file, and holds it shared, as any reader does.
+                let looked = ProjectFile::inspect(&path).map_err(not_restorable)?;
+                let working = ProjectFile::open_sharing_mesh(&candidate.path, &looked)?;
                 let meta = working.meta();
                 let fits = meta.project() == candidate.project
                     && meta.role()
@@ -426,17 +427,26 @@ impl Project {
                 if !fits {
                     return Err(ProjectError::CandidateChanged);
                 }
-                let (status, base) = standing(meta, &project)?;
-                let saves_into = match status {
-                    CandidateStatus::Restorable => Some(path),
-                    CandidateStatus::RestorableOnEarlierSave => None,
-                    status @ (CandidateStatus::NeverSaved
-                    | CandidateStatus::ProjectMissing
-                    | CandidateStatus::SavePointMissing
-                    | CandidateStatus::ProjectInUse
-                    | CandidateStatus::Damaged) => {
-                        return Err(ProjectError::NotRestorable(status));
+                let (project, base, saves_into) = match standing(meta, &looked)? {
+                    (CandidateStatus::RestorableOnEarlierSave, base) => (looked, base, None),
+                    (CandidateStatus::Restorable, base) => {
+                        // Saved into, so held for writing: opened again, its lock released
+                        // first, and checked again, as it may have been saved meanwhile. Then
+                        // it is held for writing all the same, but saved only as a new file.
+                        drop(base);
+                        drop(looked);
+                        let project = ProjectFile::open(&path).map_err(not_restorable)?;
+                        match standing(working.meta(), &project)? {
+                            (CandidateStatus::Restorable, rechecked) => {
+                                (project, rechecked, Some(path))
+                            }
+                            (CandidateStatus::RestorableOnEarlierSave, rechecked) => {
+                                (project, rechecked, None)
+                            }
+                            (status, _) => return Err(ProjectError::NotRestorable(status)),
+                        }
                     }
+                    (status, _) => return Err(ProjectError::NotRestorable(status)),
                 };
                 let earlier = recovery_heads(&config.recovery_dir, candidate.project);
                 let store = past(
@@ -1231,6 +1241,16 @@ fn standing(
         Some(base) => (CandidateStatus::RestorableOnEarlierSave, Some(base)),
         None => (CandidateStatus::SavePointMissing, None),
     })
+}
+
+/// The error a restore reports for a project file that failed to open with `e`:
+/// [`ProjectError::NotRestorable`] if the project isn't available ([`unavailable`]), else the
+/// failure itself.
+fn not_restorable(e: StoreError) -> ProjectError {
+    match unavailable(&e) {
+        Some(status) => ProjectError::NotRestorable(status),
+        None => e.into(),
+    }
 }
 
 /// The status a project file that failed to open with `e` gives its recovery file, if the

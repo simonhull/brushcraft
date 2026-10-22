@@ -674,7 +674,9 @@ impl ProjectFile {
     /// Opens the file at `path` to look at, never to write: read-only, with a shared lock, at
     /// its latest save point as [`ProjectFile::open`] finds it, but with whatever follows that
     /// save point left in place. Listing recovery files after a crash opens them so: a file a
-    /// running instance holds is locked, and one being restored isn't repaired by a look.
+    /// running instance holds is locked, and one being restored isn't repaired by a look. A
+    /// project restored onto an earlier save point holds its project file so, as it never
+    /// writes it.
     ///
     /// # Errors
     ///

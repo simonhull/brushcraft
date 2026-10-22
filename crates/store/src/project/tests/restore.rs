@@ -205,6 +205,15 @@ fn a_project_saved_since_restores_onto_the_earlier_save_point_and_saves_as_new()
     // same: the status is checked again.
     let mut restored = Project::restore(&stale, config(&dir)).unwrap();
     assert_eq!(restored.path(), None, "saves only as a new file");
+    // Never written, the project file is held read-only: readers share it, writers can't.
+    let reader = ProjectFile::open_at(&path, stale.base.unwrap().offset);
+    assert!(reader.is_ok(), "a reader opens it: {reader:?}");
+    drop(reader);
+    let writer = ProjectFile::open(&path).map(drop);
+    assert!(
+        matches!(writer, Err(StoreError::Locked)),
+        "a writer can't: {writer:?}"
+    );
     let mesh = mesh();
     assert_positions(
         restored.store(),
