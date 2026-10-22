@@ -10,9 +10,10 @@
 //!
 //! A correction tile is read from the working file if it has a record there, else from the base
 //! (the project file as of its last save), else it is all zero. The working file is the only one
-//! the store writes: write-back and [`TileStore::save`] append to it, and the base is read-only
-//! to the store. After the project file is saved, [`TileStore::rebase`] swaps in the new save
-//! point as the base and a fresh working file, keeping every resident tile.
+//! the store writes: write-back, streaming (see [`crate::RecoveryWriter`]) and
+//! [`TileStore::save`] append to it, and the base is read-only to the store. After the project file
+//! is saved, [`TileStore::rebase`] swaps in the new save point as the base and a fresh working
+//! file, keeping every resident tile.
 //!
 //! # Evaluation
 //!
@@ -75,7 +76,7 @@ use thiserror::Error;
 
 use crate::deps::DepGraph;
 use crate::feed::{ChangeFeed, ConsumerId};
-use crate::file::{BaseFile, Loc, ProjectFile, ReadScratch, StoreError};
+use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
 use crate::op::{OpId, RESERVED_SITE};
 use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotId};
 use crate::prefetch::{Fetched, Job, Prefetcher, Source};
@@ -381,9 +382,9 @@ struct EvalLog {
 /// tile.
 ///
 /// Dropping the store doesn't write anything: edits in dirty correction slots (since the last
-/// [`TileStore::save`], and not written back on eviction) are lost with it. Until M0b3's
-/// recovery writer keeps them, call [`TileStore::save`] before dropping a store whose edits
-/// matter.
+/// [`TileStore::save`] or recovery flush, and not written back on eviction) are lost with it. A
+/// [`crate::RecoveryWriter`] streams them into the working file as the user works; without one,
+/// call [`TileStore::save`] before dropping a store whose edits matter.
 ///
 /// # Memory policy
 ///
@@ -449,6 +450,13 @@ pub struct TileStore {
     feed: ChangeFeed,
     /// Save's place in the feed.
     save_consumer: ConsumerId,
+    /// The flush mark of each streaming consumer (the recovery writer): the keys it has drained
+    /// from the feed whose latest edit it hasn't yet seen reach the working file. A key leaves
+    /// the mark only once the store finds the tile in the working file at its latest edit (see
+    /// [`TileStore::snapshot_dirty`]); until then every snapshot copies it again, so a flush
+    /// that fails part-way loses nothing. Separate from the slots' dirty flag, which every
+    /// writer of the working file clears, and from save's place in the feed.
+    streams: HashMap<ConsumerId, BTreeSet<TileKey>>,
     /// The next op [`TileStore::next_op`] hands out; `None` once the site's ids are used up.
     next_op: Option<OpId>,
     /// Shared with the [`PinGuard`]s: the pin sets they have released.
@@ -478,6 +486,7 @@ impl std::fmt::Debug for TileStore {
             .field("corrections", &self.corrections)
             .field("evaluated", &self.evaluated)
             .field("unsaved", &self.unsaved.len())
+            .field("streams", &self.streams.len())
             .field("pin_sets", &self.pin_sets.len())
             .field("prefetching", &self.prefetch.pending())
             .finish_non_exhaustive()
@@ -607,6 +616,19 @@ fn first_op(site: u16, heads: impl IntoIterator<Item = Option<OpId>>) -> Result<
     .ok_or(CacheError::OpsExhausted)
 }
 
+/// A copy of a dirty correction slot, taken for a streaming consumer by
+/// [`TileStore::snapshot_dirty`]: what the recovery writer encodes off the owner thread.
+#[derive(Debug)]
+pub(crate) struct Snapshot {
+    /// The tile.
+    pub(crate) key: TileKey,
+    /// The op of the tile's latest edit when the copy was taken: the record's op, and what
+    /// [`TileStore::append_streamed`] compares against to tell whether the slot changed since.
+    pub(crate) op: OpId,
+    /// The slot's contents, boxed so the hand-off moves a pointer, not 26.9 KB.
+    pub(crate) slot: Box<CorrectionSlot>,
+}
+
 impl TileStore {
     /// A store over `working`, the file it writes, and `base`, the project file as of its last
     /// save, read where `working` has no record (`None` for a project never saved). The base
@@ -663,6 +685,7 @@ impl TileStore {
             to_save: VecDeque::new(),
             feed,
             save_consumer,
+            streams: HashMap::new(),
             next_op: Some(next_op),
             pins: Rc::default(),
             pin_sets: HashMap::new(),
@@ -982,6 +1005,155 @@ impl TileStore {
             self.to_save.pop_front();
         }
         Ok(self.file.save()?)
+    }
+
+    /// Subscribes a streaming consumer (the recovery writer) to the change feed, with an empty
+    /// flush mark: it streams the edits made from now on.
+    pub(crate) fn subscribe_stream(&mut self) -> ConsumerId {
+        let id = self.feed.subscribe();
+        self.streams.insert(id, BTreeSet::new());
+        id
+    }
+
+    /// Removes a streaming consumer and its flush mark; entries only it was holding leave the
+    /// feed.
+    pub(crate) fn unsubscribe_stream(&mut self, id: ConsumerId) {
+        self.feed.unsubscribe(id);
+        self.streams.remove(&id);
+    }
+
+    /// Whether streaming consumer `id` has edits to flush: keys pushed to the feed since its last
+    /// snapshot, or keys of its flush mark still unconfirmed.
+    pub(crate) fn has_unflushed(&self, id: ConsumerId) -> bool {
+        self.feed.has_pending(id) || self.streams.get(&id).is_some_and(|mark| !mark.is_empty())
+    }
+
+    /// Copies, for streaming consumer `id`, every correction slot whose latest edit isn't in the
+    /// working file yet: the keys of its flush mark, with those the feed has pushed since its
+    /// last call added, that are resident and dirty, each with the op of its latest edit.
+    ///
+    /// A key of the mark whose slot is clean or not resident is in the working file already (a
+    /// slot leaves the pool only once written back, and only a write clears it), so it leaves
+    /// the mark without a copy. The rest stay in the mark until
+    /// [`TileStore::append_streamed`] appends them, or finds them written by someone else.
+    ///
+    /// This is the drawing thread's share of a flush: a copy of each slot, no encoding or I/O.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] if a dirty slot has no op (every slot marked dirty gets one
+    /// first) or a handle went stale. The mark keeps every key then.
+    pub(crate) fn snapshot_dirty(&mut self, id: ConsumerId) -> Result<Vec<Snapshot>, CacheError> {
+        let drained = self.feed.drain(id);
+        let Some(mark) = self.streams.get_mut(&id) else {
+            return Ok(Vec::new());
+        };
+        mark.extend(drained.into_iter().map(|(key, _)| key));
+        let (corrections, unsaved) = (&self.corrections, &self.unsaved);
+        let mut snapshots = Vec::with_capacity(mark.len());
+        let mut written = Vec::new();
+        for &key in mark.iter() {
+            let Some(slot_id) = corrections.find(&key) else {
+                written.push(key);
+                continue;
+            };
+            if corrections.is_dirty(slot_id) != Some(true) {
+                written.push(key);
+                continue;
+            }
+            let op = unsaved
+                .get(&key)
+                .copied()
+                .ok_or(Invariant::MissingOp(key))?;
+            let mut copy = bytemuck::zeroed_box::<CorrectionSlot>();
+            *copy = *corrections.get(slot_id).ok_or(Invariant::StaleHandle)?;
+            snapshots.push(Snapshot {
+                key,
+                op,
+                slot: copy,
+            });
+        }
+        for key in &written {
+            mark.remove(key);
+        }
+        Ok(snapshots)
+    }
+
+    /// Appends streaming consumer `id`'s encoded `tiles` to the working file: each one whose slot
+    /// is still resident and dirty. A slot unchanged since its snapshot (last edited by the
+    /// record's op) is clean once its record is appended, and leaves the mark.
+    ///
+    /// A slot edited again since its snapshot is appended all the same, so the save point after
+    /// this append holds every edit up to the snapshot, but stays dirty and in the mark: its
+    /// newer edit isn't in the file, and whatever writes the slot next (the next flush, a save,
+    /// or a write-back to make room) appends it after this record. Reads of a dirty tile come
+    /// from its slot, never the file, meanwhile.
+    ///
+    /// A tile whose slot is clean or gone is skipped: someone else (a save, or a write-back to
+    /// make room) wrote it after the snapshot, at an edit at least as new, and an older record
+    /// appended after that one would replace it. It leaves the mark.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::WriteBack`] if an append fails: that tile and those after it stay dirty
+    /// and in the mark. [`CacheError::Internal`] for a stale handle.
+    pub(crate) fn append_streamed(
+        &mut self,
+        id: ConsumerId,
+        tiles: &[FramedTile],
+    ) -> Result<(), CacheError> {
+        for tile in tiles {
+            let key = tile.key();
+            let dirty = self
+                .corrections
+                .find(&key)
+                .filter(|&found| self.corrections.is_dirty(found) == Some(true));
+            let confirmed = match dirty {
+                None => true,
+                Some(found) => {
+                    self.file
+                        .append_framed(tile)
+                        .map_err(CacheError::WriteBack)?;
+                    let unchanged = self.unsaved.get(&key) == Some(&tile.op());
+                    if unchanged {
+                        self.unsaved.remove(&key);
+                        self.corrections.set_dirty(found, false)?;
+                    }
+                    unchanged
+                }
+            };
+            if confirmed && let Some(mark) = self.streams.get_mut(&id) {
+                mark.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    /// A handle that syncs the working file from another thread.
+    pub(crate) fn working_syncer(&self) -> FileSyncer {
+        self.file.syncer()
+    }
+
+    /// Where the working file's next record goes: it moves with every append, so a caller can
+    /// tell whether anything was written since it last looked.
+    pub(crate) const fn working_len(&self) -> u64 {
+        self.file.len()
+    }
+
+    /// Whether the working file has tiles written since its last save point.
+    pub(crate) fn has_unsaved_tiles(&self) -> bool {
+        self.file.has_unsaved_tiles()
+    }
+
+    /// Appends a save point to the working file naming every tile written to it so far, without
+    /// syncing (see [`ProjectFile::write_save_point`]), and returns its offset. Dirty slots are
+    /// not written: their edits are in no save point yet.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] if the write fails.
+    pub(crate) fn write_save_point(&mut self) -> Result<u64, CacheError> {
+        Ok(self.file.write_save_point()?)
     }
 
     /// Frees every unpinned slot of both pools, writing dirty correction tiles back first.

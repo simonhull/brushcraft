@@ -14,3 +14,10 @@ bytemuck.workspace = true
 geom.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "recovery"
+harness = false

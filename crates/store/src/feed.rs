@@ -97,6 +97,17 @@ impl ChangeFeed {
         order
     }
 
+    /// Whether `id`'s next [`ChangeFeed::drain`] would return anything: a key was pushed since
+    /// its last drain. `false` for an unknown or unsubscribed id.
+    #[must_use]
+    pub fn has_pending(&self, id: ConsumerId) -> bool {
+        self.cursors
+            .get(id.0)
+            .copied()
+            .flatten()
+            .is_some_and(|cursor| cursor < self.end())
+    }
+
     /// Entries held for the slowest consumer.
     #[must_use]
     pub fn backlog(&self) -> usize {
@@ -191,11 +202,14 @@ mod tests {
         feed.push(key(1), OpId::new(0, 1).unwrap());
         feed.push(key(1), OpId::new(0, 2).unwrap());
         let late = feed.subscribe();
+        assert!(feed.has_pending(a), "a has the pushes waiting");
         assert_eq!(
             feed.drain(a),
             vec![(key(1), OpId::new(0, 2).unwrap())],
             "latest op, once"
         );
+        assert!(!feed.has_pending(a), "a drained everything");
+        assert!(!feed.has_pending(late), "late has nothing waiting");
         assert!(feed.drain(late).is_empty(), "nothing before subscribing");
         feed.unsubscribe(late);
         feed.push(key(2), OpId::new(0, 3).unwrap());

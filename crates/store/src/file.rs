@@ -679,6 +679,24 @@ impl ProjectFile {
         self.write_tile(key, op, &header, &body)
     }
 
+    /// Appends a tile record framed elsewhere (by [`frame_displacement`], on another thread),
+    /// and records it as [`ProjectFile::write_tile`] does: `key`'s latest record, written since
+    /// the last save point, with its op counted towards the head.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ReadOnly`], [`StoreError::Io`].
+    pub(crate) fn append_framed(&mut self, tile: &FramedTile) -> Result<(), StoreError> {
+        if self.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly);
+        }
+        let loc = self.append_record(&tile.record)?;
+        self.live.insert(tile.key, loc);
+        self.pending.insert(tile.key, loc);
+        self.head = self.head.max(Some(tile.op));
+        Ok(())
+    }
+
     /// Frames `payload` and writes it at the end.
     ///
     /// # Errors
@@ -878,6 +896,41 @@ impl ProjectFile {
         }
         // Tiles are durable before the Index that names them.
         self.file.sync_data()?;
+        let (coverage, loc) = self.append_index()?;
+        self.file.sync_data()?;
+        self.commit_index(coverage, loc);
+        Ok(loc.offset)
+    }
+
+    /// Appends a save point naming the tiles written so far, without syncing anything, and
+    /// returns its offset: [`ProjectFile::save`] for a caller that syncs on another thread
+    /// (through a [`FileSyncer`]).
+    ///
+    /// The caller must have synced every record written before this call (the tiles the Index
+    /// names) and must sync again after it before the save point is durable. Until that second
+    /// sync completes, a crash can lose the Index; opening the file then finds the previous
+    /// save point and replays the tiles after it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`].
+    pub(crate) fn write_save_point(&mut self) -> Result<u64, StoreError> {
+        if self.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly);
+        }
+        let (coverage, loc) = self.append_index()?;
+        self.commit_index(coverage, loc);
+        Ok(loc.offset)
+    }
+
+    /// Appends the next Index: full the first time and every [`FULL_EVERY`]th, otherwise a
+    /// delta of the tiles written since the last one. Returns its coverage and location, for
+    /// [`ProjectFile::commit_index`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::TooLarge`], [`StoreError::Io`].
+    fn append_index(&mut self) -> Result<(Coverage, Loc), StoreError> {
         let coverage = if self.last_index.is_none() || self.deltas + 1 >= FULL_EVERY {
             Coverage::Full
         } else {
@@ -889,14 +942,32 @@ impl ProjectFile {
         };
         let payload = index_payload(coverage, self.last_index, self.head, entries)?;
         let loc = self.append(KIND_INDEX, &payload)?;
-        self.file.sync_data()?;
+        Ok((coverage, loc))
+    }
+
+    /// Makes the Index at `loc` the latest save point: the parent of the next, with nothing
+    /// written since.
+    fn commit_index(&mut self, coverage: Coverage, loc: Loc) {
         self.last_index = Some(loc.offset);
         self.deltas = match coverage {
             Coverage::Full => 0,
             Coverage::Delta => self.deltas + 1,
         };
         self.pending.clear();
-        Ok(loc.offset)
+    }
+
+    /// Whether tiles have been written since the last save point (or, before the first, at
+    /// all): what the next save point would name.
+    pub(crate) fn has_unsaved_tiles(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// A handle that syncs this file from another thread while it stays open (see
+    /// [`FileSyncer`]).
+    pub(crate) fn syncer(&self) -> FileSyncer {
+        FileSyncer {
+            file: Arc::downgrade(&self.file),
+        }
     }
 
     /// The save points of the current state's chain, oldest first.
@@ -991,6 +1062,11 @@ impl ProjectFile {
             .into())
     }
 
+    /// The tiles written since the last save point, in key order: what the next one names.
+    pub(crate) fn unsaved_keys(&self) -> Vec<TileKey> {
+        self.pending.keys().copied().collect()
+    }
+
     /// Payload bytes of the last Index.
     fn last_index_len(&self) -> Option<u64> {
         self.index_len(self.last_index?).ok()
@@ -1045,6 +1121,82 @@ impl FileReader {
             }
         }
     }
+}
+
+/// Syncs an open [`ProjectFile`] from another thread: the recovery writer's way of making
+/// appended records durable without blocking the thread that owns the file.
+///
+/// Like a [`FileReader`], it holds the file weakly and doesn't keep it (or its lock) open after
+/// its [`ProjectFile`] is dropped; a sync in flight holds the file until it returns.
+#[derive(Debug, Clone)]
+pub(crate) struct FileSyncer {
+    /// The owner's open file, upgraded for the length of each sync.
+    file: Weak<File>,
+}
+
+impl FileSyncer {
+    /// Makes every record written to the file so far durable (`fdatasync`): their data, and the
+    /// file length that reaches them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Closed`] if the [`ProjectFile`] has been dropped; [`StoreError::Io`] if the
+    /// sync fails, after which what was written since the last good sync may not be on disk.
+    pub(crate) fn sync_data(&self) -> Result<(), StoreError> {
+        let file = self.file.upgrade().ok_or(StoreError::Closed)?;
+        file.sync_data()?;
+        Ok(())
+    }
+}
+
+/// A tile record, compressed and framed, ready for [`ProjectFile::append_framed`]: the
+/// encoding [`ProjectFile::write_displacement`] does, done ahead of the append (on the recovery
+/// writer's thread).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FramedTile {
+    /// The tile.
+    key: TileKey,
+    /// The edit the record is written with.
+    op: OpId,
+    /// The whole record, framing and checksum included.
+    record: Vec<u8>,
+}
+
+impl FramedTile {
+    /// The tile the record holds.
+    pub(crate) const fn key(&self) -> TileKey {
+        self.key
+    }
+
+    /// The edit the record is written with.
+    pub(crate) const fn op(&self) -> OpId {
+        self.op
+    }
+}
+
+/// Encodes, compresses and frames the displacement tile in `slot` as `key`'s record, written
+/// by `op`: the record [`ProjectFile::write_displacement`] would append.
+///
+/// # Errors
+///
+/// [`StoreError::NotDisplacement`] if `key` is of another channel, [`StoreError::WrongSide`] if
+/// the slot's side isn't the key's, [`StoreError::Codec`] if the slot holds no valid tile,
+/// [`StoreError::TooLarge`], [`StoreError::Io`] if compression fails.
+pub(crate) fn frame_displacement(
+    key: TileKey,
+    op: OpId,
+    slot: &CorrectionSlot,
+) -> Result<FramedTile, StoreError> {
+    let tile = slot.to_tile().map_err(CodecError::from)?;
+    check_displacement(&key, tile.side())?;
+    let (header, body) = encode_displacement(&tile)?;
+    if !u32::try_from(body.len()).is_ok_and(|n| n <= MAX_RAW) {
+        return Err(StoreError::TooLarge);
+    }
+    let packed = compress(&body)?;
+    let payload = tile_payload(key, op, &header, body.len(), &packed)?;
+    let record = frame(KIND_TILE, &payload).ok_or(StoreError::TooLarge)?;
+    Ok(FramedTile { key, op, record })
 }
 
 /// A project file as of a save point, lent to a [`crate::TileStore`] as the read-only layer under

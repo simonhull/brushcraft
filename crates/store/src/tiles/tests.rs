@@ -19,6 +19,7 @@ use crate::test_dir::TestDir;
 
 mod differential;
 mod layered;
+mod recovery;
 
 /// Bytes of one evaluated slot: test chunks are sized in these.
 const EVAL: usize = size_of::<EvaluatedSlot>();

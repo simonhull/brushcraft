@@ -1,0 +1,110 @@
+//! The drawing thread's share of a recovery flush: [`RecoveryWriter::end_stroke`] after a stroke
+//! that dirtied 50 level-8 correction tiles. That is the snapshot (one 26.9 KB slot copy per
+//! tile) and the hand-off to the writer thread; encoding, compression and syncing happen there,
+//! outside the measurement.
+
+#![expect(
+    clippy::expect_used,
+    reason = "benchmark setup; a failure here should abort the run"
+)]
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
+use store::{Meta, ProjectFile, ProjectId, RecoveryWriter, Role, StoreConfig, TileStore};
+
+/// Tiles the stroke dirties.
+const TILES: u16 = 50;
+
+fn main() {
+    divan::main();
+}
+
+/// A store over a fresh working file with [`TILES`] dirty level-8 tiles, and its recovery writer.
+///
+/// The writer is subscribed before the edits. The file's directory is removed on drop, after the
+/// writer (which abandons its flush) and the store.
+struct Stroke {
+    /// The writer, dropped first: it joins its thread.
+    writer: RecoveryWriter,
+    /// The store, holding the dirty tiles.
+    store: TileStore,
+    /// The directory holding the working file.
+    dir: PathBuf,
+}
+
+impl Stroke {
+    /// Makes the store, the writer and the stroke.
+    ///
+    /// # Panics
+    ///
+    /// If the fixed setup is rejected, or the temporary directory can't be made.
+    fn new() -> Self {
+        /// Distinguishes this process's directories.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "brushcraft-bench-recovery-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        let mesh = Arc::new(cube_sphere(1).expect("cube"));
+        let meta = Meta::new(
+            ProjectId::from_bits(1),
+            Role::Recovery { base: None },
+            &mesh,
+        );
+        let file =
+            ProjectFile::create(&dir.join("recovery.bcrf"), meta, Arc::clone(&mesh)).expect("file");
+        let mut config = StoreConfig {
+            budget_bytes: 0,
+            chunk_bytes: 4 << 20,
+            site: 1,
+        };
+        config.budget_bytes = config.minimum_budget(&mesh).max(64 << 20);
+        let mut store = TileStore::open(file, None, config).expect("store");
+        let mut writer = RecoveryWriter::new(&mut store).expect("writer");
+        // Flush the empty start, so the measured call is a stroke end like any other.
+        writer.finish(&mut store, Instant::now()).expect("flush");
+        let level = Level::new(8).expect("level");
+        let per_side = u16::try_from(level.tiles_per_side()).expect("tiles per side");
+        let keys = mesh.faces().flat_map(|face: FaceId| {
+            (0..per_side).flat_map(move |ty| {
+                (0..per_side)
+                    .map(move |tx| TileKey::displacement(face, level, tx, ty).expect("key"))
+            })
+        });
+        let op = store.next_op().expect("op");
+        for key in keys.take(usize::from(TILES)) {
+            store
+                .edit_tile(key, op, |edit| edit.set(5, 7, Vec3::new(1e-4, 0.0, 0.0)))
+                .expect("edit")
+                .expect("set");
+        }
+        Self { writer, store, dir }
+    }
+}
+
+impl Drop for Stroke {
+    fn drop(&mut self) {
+        drop(std::fs::remove_dir_all(&self.dir));
+    }
+}
+
+/// `end_stroke` with 50 dirty level-8 tiles: the snapshot and the hand-off only.
+///
+/// # Panics
+///
+/// If the setup or the call fails, which would be a bug in the crate.
+#[divan::bench(sample_count = 200, sample_size = 1)]
+fn end_stroke_50_tiles(bencher: divan::Bencher<'_, '_>) {
+    bencher.with_inputs(Stroke::new).bench_local_refs(|stroke| {
+        stroke
+            .writer
+            .end_stroke(&mut stroke.store, Instant::now())
+            .expect("end stroke");
+    });
+}

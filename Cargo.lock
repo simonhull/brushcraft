@@ -1183,6 +1183,7 @@ name = "store"
 version = "0.0.0"
 dependencies = [
  "bytemuck",
+ "divan",
  "geom",
  "thiserror 2.0.21",
  "zstd",
