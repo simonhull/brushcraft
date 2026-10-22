@@ -8,6 +8,14 @@ if [[ -z ${BRUSHCRAFT_UNDER_MISE:-} ]]; then
   BRUSHCRAFT_UNDER_MISE=1 exec mise exec -- "$0" "$@"
 fi
 
+# Competitor product names stay out of this repo; research that cites them lives in brushcraft-docs.
+# The bracket keeps this line from matching itself.
+if hits=$(git grep -n -i 'competitor-name' -- . ':!Cargo.lock'); then
+  echo "$hits"
+  echo "error: competitor product name found; describe behaviour or our own design instead (see CLAUDE.md)" >&2
+  exit 1
+fi
+
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features --no-tests=warn

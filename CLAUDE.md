@@ -17,6 +17,9 @@ if they disagree, raise it rather than drifting silently.
   through `[workspace.dependencies]`.
 - Performance claims need a `divan` benchmark before and after. Profile with `samply` before optimizing.
 - Never commit benchmark projects (`*.bcrf`); they are gigabytes.
+- No competitor product names in this repo (code, comments, docs, commit messages); describe behaviour or our
+  own design instead. Research and specs that cite other products live in `~/Code/brushcraft-docs`.
+  `scripts/check.sh` enforces it.
 
 ## Commands
 
