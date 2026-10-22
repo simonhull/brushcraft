@@ -16,6 +16,8 @@ use geom::{
 use super::*;
 use crate::test_dir::TestDir;
 
+mod differential;
+
 /// Bytes of one evaluated slot: test chunks are sized in these.
 const EVAL: usize = size_of::<EvaluatedSlot>();
 
