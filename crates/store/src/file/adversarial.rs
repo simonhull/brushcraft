@@ -222,3 +222,124 @@ fn index_entries_must_point_before_their_index() {
         );
     }
 }
+
+/// Every live tile and the op that wrote it.
+fn state(f: &ProjectFile) -> Vec<(TileKey, OpId)> {
+    f.keys()
+        .map(|k| (*k, f.read_tile(k).unwrap().unwrap().op))
+        .collect()
+}
+
+/// The names in `dir`'s directory, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn one_writer_or_many_readers() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (good, [s1, ..]) = three(&path);
+    let writer = ProjectFile::open(&path).unwrap();
+    assert!(
+        matches!(ProjectFile::open(&path), Err(StoreError::Locked)),
+        "a second writer"
+    );
+    assert!(
+        matches!(ProjectFile::open_at(&path, s1), Err(StoreError::Locked)),
+        "a reader while a writer is open"
+    );
+    assert!(
+        matches!(compact(&path, &dir.path("c.bcrf")), Err(StoreError::Locked)),
+        "compaction while a writer is open"
+    );
+    assert!(
+        !dir.path("c.bcrf").exists(),
+        "nothing written when the source is locked"
+    );
+    drop(writer);
+    let a = ProjectFile::open_at(&path, s1).unwrap();
+    let b = ProjectFile::open_at(&path, s1).unwrap();
+    assert!(
+        matches!(ProjectFile::open(&path), Err(StoreError::Locked)),
+        "a writer while readers are open"
+    );
+    drop((a, b));
+    drop(ProjectFile::open(&path).unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), good, "never modified");
+}
+
+#[test]
+fn a_file_that_cannot_be_written_opens_read_only_if_its_tail_is_clean() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (good, _) = three(&path);
+    let want = state(&ProjectFile::open(&path).unwrap());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if OpenOptions::new().write(true).open(&path).is_ok() {
+        // Running with the power to ignore permissions (root): nothing to test.
+        return;
+    }
+    let mut f = ProjectFile::open(&path).unwrap();
+    assert_eq!(state(&f), want, "the latest state");
+    assert!(
+        matches!(
+            f.write_displacement(key(9), op(9), &tile(9.0)),
+            Err(StoreError::ReadOnly)
+        ),
+        "no writes"
+    );
+    assert!(matches!(f.save(), Err(StoreError::ReadOnly)), "no saves");
+    drop(f);
+    let torn = [good.as_slice(), &[KIND_TILE, 0, 0, 0, 100, 0, 0, 0]].concat();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&path, &torn).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let end = u64::try_from(good.len()).unwrap();
+    assert!(
+        matches!(ProjectFile::open(&path), Err(StoreError::NeedsRepair { offset }) if offset == end),
+        "a torn tail it can't cut off"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), torn, "left untouched");
+}
+
+#[test]
+fn compacting_in_place_replaces_the_file() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut f = ProjectFile::create(&path).unwrap();
+    for seq in 1..=40 {
+        f.write_displacement(key(u32::try_from(seq % 3).unwrap()), op(seq), &tile(1.0))
+            .unwrap();
+        f.save().unwrap();
+    }
+    let want = state(&f);
+    let big = f.len();
+    assert!(
+        matches!(compact_in_place(&path), Err(StoreError::Locked)),
+        "not while open for writing"
+    );
+    assert_eq!(
+        names(dir.path("").as_path()),
+        ["p.bcrf"],
+        "no temporary file left"
+    );
+    drop(f);
+    compact_in_place(&path).unwrap();
+    assert_eq!(
+        names(dir.path("").as_path()),
+        ["p.bcrf"],
+        "renamed over the original"
+    );
+    let c = ProjectFile::open(&path).unwrap();
+    assert_eq!(state(&c), want, "same latest state");
+    assert!(c.len() < big / 10, "only live records kept");
+    assert_eq!(c.save_points().unwrap().len(), 1, "one full index");
+}

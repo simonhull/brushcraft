@@ -2,10 +2,11 @@
 //! a chain.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use geom::{CorrectionTile, TileKey};
 use thiserror::Error;
@@ -64,9 +65,20 @@ pub enum StoreError {
     /// `open_at` was given an offset that isn't a good Index.
     #[error("byte {0} is not a save point")]
     NotASavePoint(u64),
-    /// The file was opened at an earlier save point and can't be written.
-    #[error("opened read-only at an earlier save point")]
+    /// The file was opened read-only (at an earlier save point, or without write permission)
+    /// and can't be written.
+    #[error("the project file is open read-only")]
     ReadOnly,
+    /// The latest state ends before a torn tail from byte `offset`, which must be cut off, but
+    /// the file can't be written. It was left untouched.
+    #[error("the project file needs its torn tail from byte {offset} cut off, but is read-only")]
+    NeedsRepair {
+        /// Where the torn tail starts.
+        offset: u64,
+    },
+    /// Another open of the file holds a conflicting lock: one writer, or any number of readers.
+    #[error("the project file is open elsewhere")]
+    Locked,
     /// A payload doesn't fit the format's length fields, or a tile body is larger than
     /// [`MAX_RAW`].
     #[error("record payload too large")]
@@ -97,19 +109,49 @@ struct Loc {
 /// Whether a [`ProjectFile`] accepts writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Access {
-    /// Opened at the latest state: writes append.
+    /// Opened at the latest state: writes append. Holds the file's exclusive lock.
     ReadWrite,
-    /// Opened at an earlier save point.
+    /// Opened at an earlier save point, or without write permission. Holds a shared lock.
     ReadOnly,
+}
+
+impl Access {
+    /// Takes the lock this access holds: exclusive to write, shared to read.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Locked`] if a conflicting lock is held, [`StoreError::Io`].
+    fn lock(self, file: &File) -> Result<(), StoreError> {
+        let locked = match self {
+            Self::ReadWrite => file.try_lock(),
+            Self::ReadOnly => file.try_lock_shared(),
+        };
+        locked.map_err(|e| match e {
+            TryLockError::WouldBlock => StoreError::Locked,
+            TryLockError::Error(e) => e.into(),
+        })
+    }
 }
 
 /// What opening at the latest state does with a torn tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Repair {
-    /// Cut it off, so the file is writable again.
+    /// Cut it off, so the file is writable again. Opens read-write.
     Truncate,
-    /// Leave the file untouched and open it read-only.
-    Leave,
+    /// Fail with [`StoreError::NeedsRepair`]: the file can't be written. Opens read-only.
+    Refuse,
+    /// Leave it in place and open the state before it read-only, for compaction.
+    Ignore,
+}
+
+impl Repair {
+    /// The access an open with this repair has.
+    const fn access(self) -> Access {
+        match self {
+            Self::Truncate => Access::ReadWrite,
+            Self::Refuse | Self::Ignore => Access::ReadOnly,
+        }
+    }
 }
 
 /// Whether an Index lists every live tile or only those changed since its parent.
@@ -178,17 +220,19 @@ pub struct ProjectFile {
 }
 
 impl ProjectFile {
-    /// Creates a new, empty project at `path`.
+    /// Creates a new, empty project at `path`, open read-write. The file and its directory entry
+    /// are durable when this returns.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`], including when `path` already exists.
+    /// [`StoreError::Io`], including when `path` already exists; [`StoreError::Locked`].
     pub fn create(path: &Path) -> Result<Self, StoreError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)?;
+        Access::ReadWrite.lock(&file)?;
         let mut header = [0; HEADER_LEN];
         let (magic, rest) = header.split_at_mut(MAGIC.len());
         magic.copy_from_slice(&MAGIC);
@@ -197,6 +241,7 @@ impl ProjectFile {
         }
         file.write_all_at(&header, 0)?;
         file.sync_all()?;
+        sync_parent(path)?;
         Ok(Self {
             file,
             end: FIRST_RECORD,
@@ -218,27 +263,39 @@ impl ProjectFile {
     /// rest is a torn or unsynced tail of unsaved edits (even if some of its tile records verify,
     /// since writeback may have kept a later write and lost an earlier one), and is cut off.
     ///
+    /// The file is opened read-write and locked exclusively. If it can't be opened for writing
+    /// (no permission, or a read-only file system), it is opened read-only with a shared lock
+    /// instead, which works only if there is no torn tail to cut off.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::DamagedMidFile`], [`StoreError::BadHeader`], [`StoreError::Io`].
+    /// [`StoreError::DamagedMidFile`], [`StoreError::NeedsRepair`], [`StoreError::Locked`],
+    /// [`StoreError::BadHeader`], [`StoreError::Io`].
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        Self::open_latest(path, Repair::Truncate)
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => Self::open_latest(file, Repair::Truncate),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                Self::open_latest(File::open(path)?, Repair::Refuse)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
-    /// Opens the project at `path` at its latest state, as [`ProjectFile::open`] does; `repair`
-    /// says whether a torn tail is cut off or the file is left untouched and opened read-only.
+    /// Opens `file` at its latest state, as [`ProjectFile::open`] does; `repair` says what
+    /// happens to a torn tail, and with it the access and lock. `file` must be writable for
+    /// [`Repair::Truncate`].
     ///
     /// # Errors
     ///
     /// As [`ProjectFile::open`].
-    fn open_latest(path: &Path, repair: Repair) -> Result<Self, StoreError> {
-        let (file, access) = match repair {
-            Repair::Truncate => (
-                OpenOptions::new().read(true).write(true).open(path)?,
-                Access::ReadWrite,
-            ),
-            Repair::Leave => (File::open(path)?, Access::ReadOnly),
-        };
+    fn open_latest(file: File, repair: Repair) -> Result<Self, StoreError> {
+        let access = repair.access();
+        access.lock(&file)?;
         let len = file.metadata()?.len();
         check_header(&file, len)?;
         let heads = scan_heads(&file, len)?;
@@ -258,22 +315,29 @@ impl ProjectFile {
             if find_index(&this.file, this.end, len)?.is_some() {
                 return Err(StoreError::DamagedMidFile { offset: this.end });
             }
-            if repair == Repair::Truncate {
-                this.file.set_len(this.end)?;
-                this.file.sync_all()?;
+            match repair {
+                Repair::Truncate => {
+                    this.file.set_len(this.end)?;
+                    this.file.sync_all()?;
+                }
+                Repair::Refuse => return Err(StoreError::NeedsRepair { offset: this.end }),
+                Repair::Ignore => {}
             }
         }
         Ok(this)
     }
 
-    /// Opens the project at `path` read-only, at the save point (an Index) at byte `index_offset`.
+    /// Opens the project at `path` read-only, with a shared lock, at the save point (an Index)
+    /// at byte `index_offset`.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotASavePoint`] if no good Index starts there, [`StoreError::Damaged`] if
-    /// its parent chain is, [`StoreError::BadHeader`], [`StoreError::Io`].
+    /// its parent chain is, [`StoreError::Locked`] if the file is open for writing,
+    /// [`StoreError::BadHeader`], [`StoreError::Io`].
     pub fn open_at(path: &Path, index_offset: u64) -> Result<Self, StoreError> {
         let file = File::open(path)?;
+        Access::ReadOnly.lock(&file)?;
         let len = file.metadata()?.len();
         check_header(&file, len)?;
         if index_offset < FIRST_RECORD || read_index(&file, index_offset, len)?.is_none() {
@@ -623,15 +687,58 @@ impl ProjectFile {
 /// recompressed) and one full Index.
 ///
 /// `src` is recovered as by [`ProjectFile::open`], but never modified: a torn tail is left in
-/// place, not cut off. History before the latest state is dropped; which history to keep is
-/// decided with stroke history (M2). On error, `dst` may be left partly written.
+/// place, not cut off. It is held with a shared lock, so it can't be open for writing. History
+/// before the latest state is dropped; which history to keep is decided with stroke history
+/// (M2). On error, `dst` may be left partly written.
 ///
 /// # Errors
 ///
-/// Any [`StoreError`] from reading `src` (a damaged live tile is [`StoreError::Damaged`]) or
-/// writing `dst`, which must not exist.
+/// Any [`StoreError`] from reading `src` (a damaged live tile is [`StoreError::Damaged`]; one
+/// open for writing, [`StoreError::Locked`]) or writing `dst`, which must not exist.
 pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
-    let from = ProjectFile::open_latest(src, Repair::Leave)?;
+    let from = open_source(src)?;
+    compact_into(&from, dst)
+}
+
+/// Compacts the project at `path` in place, as [`compact`] does.
+///
+/// It compacts into a temporary file in the same directory, then renames that over `path`. The
+/// source stays locked until the rename, so no writer slips in between, and the directory is
+/// synced after it, so the swap is durable. On error, `path` is unchanged and the temporary file
+/// removed.
+///
+/// # Errors
+///
+/// As [`compact`].
+pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
+    let from = open_source(path)?;
+    let tmp = temp_sibling(path)?;
+    let swapped = compact_into(&from, &tmp).and_then(|()| {
+        std::fs::rename(&tmp, path)?;
+        sync_parent(path)
+    });
+    if swapped.is_err() {
+        // Best effort: gone already if the rename succeeded.
+        drop(std::fs::remove_file(&tmp));
+    }
+    swapped
+}
+
+/// Opens a compaction source: its latest state, read-only, a torn tail left in place.
+///
+/// # Errors
+///
+/// As [`ProjectFile::open`], but never [`StoreError::NeedsRepair`].
+fn open_source(path: &Path) -> Result<ProjectFile, StoreError> {
+    ProjectFile::open_latest(File::open(path)?, Repair::Ignore)
+}
+
+/// Writes `from`'s live tiles and one full Index to a new project at `dst`.
+///
+/// # Errors
+///
+/// As [`compact`].
+fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
     let mut to = ProjectFile::create(dst)?;
     for (key, &Loc { offset, len }) in &from.live {
         let raw = from.read_record(offset, len)?;
@@ -643,6 +750,43 @@ pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
     }
     to.head = from.head;
     to.save()?;
+    Ok(())
+}
+
+/// A path for a temporary file next to `path`, unique within this process and among processes.
+///
+/// # Errors
+///
+/// [`StoreError::Io`] if `path` has no file name.
+fn temp_sibling(path: &Path) -> Result<PathBuf, StoreError> {
+    /// Distinguishes this process's temporary files.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the project path has no file name",
+        )
+    })?;
+    let mut tmp = name.to_os_string();
+    tmp.push(format!(
+        ".compact-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    Ok(path.with_file_name(tmp))
+}
+
+/// Syncs the directory holding `path`, making a new or renamed entry in it durable.
+///
+/// # Errors
+///
+/// [`StoreError::Io`].
+fn sync_parent(path: &Path) -> Result<(), StoreError> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -1182,6 +1326,7 @@ mod tests {
             snapshots.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
             "chain"
         );
+        drop(f); // save points are opened with a shared lock
         for (point, want) in &snapshots {
             let mut old = ProjectFile::open_at(&path, *point).unwrap();
             assert_eq!(&state_of(&old), want, "save point {point}");
