@@ -1323,12 +1323,16 @@ impl TileStore {
     /// Anything computed from a tile's corrections is computed from its positions, and its
     /// positions only from the tile being evaluated, which makes them current. So once a tile's
     /// evaluations are dropped, edits of it have nothing more to drop until it is evaluated
-    /// again, however many there are and whatever their ops.
+    /// again, however many there are and whatever their ops. While the dependency graph holds
+    /// an untracked node, nothing is skipped: the cascade takes such a node to follow from
+    /// every coarser edit, recorded or not (see [`crate::deps`]).
     fn invalidate_edited(&mut self, edited: impl IntoIterator<Item = TileKey>) {
         let reached: Vec<TileKey> = edited
             .into_iter()
             .filter(|key| {
-                self.evaluated.freshness(key) == Some(Freshness::Fresh) || self.deps.is_read(key)
+                self.evaluated.freshness(key) == Some(Freshness::Fresh)
+                    || self.deps.is_read(key)
+                    || self.deps.has_untracked()
             })
             .collect();
         if !reached.is_empty() {

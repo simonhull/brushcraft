@@ -1480,6 +1480,33 @@ fn edits_between_evaluations_invalidate_once() {
 }
 
 #[test]
+fn an_unread_edit_still_reaches_untracked_tiles() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    // A tile recorded after its parent's node went: the parent's ancestry is unknown.
+    let (fine, parent) = (tiles(&mesh, 4, 4)[0], tiles(&mesh, 3, 3)[0]);
+    store.deps.record_positions(fine, &[parent]);
+    assert!(store.deps.has_untracked(), "the parent is untracked");
+    // Never evaluated, read by nothing recorded: skipped, but for the untracked node.
+    let coarse = tiles(&mesh, 2, 2)[0];
+    assert!(
+        store.deps.cascade([coarse]).positions.contains(&fine),
+        "an edit of it reaches the untracked node's reader"
+    );
+    store.log = EvalLog::default();
+    let op = store.next_op().unwrap();
+    store
+        .edit_tile(coarse, op, |edit| {
+            edit.set(1, 1, Vec3::new(0.001, 0.0, 0.0))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.log.invalidations, 1, "the cascade ran");
+    assert_eq!(store.deps.parents(&fine), None, "and dropped the reader");
+}
+
+#[test]
 fn a_copy_that_fails_to_write_keeps_its_written_twins_invalidated() {
     let dir = TestDir::new();
     let mesh = mesh();

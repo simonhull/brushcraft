@@ -163,6 +163,12 @@ impl DepGraph {
         self.nodes.get(key).is_some_and(|node| node.has_normals)
     }
 
+    /// Whether any node is untracked (see the module notes): an edit at any level may then
+    /// reach tiles nothing records it as reaching, so no edit can be skipped as unread.
+    pub(crate) fn has_untracked(&self) -> bool {
+        !self.untracked.is_empty()
+    }
+
     /// Whether anything recorded reads `key`'s positions: a tile predicted from them, or normals
     /// computed from them.
     pub(crate) fn is_read(&self, key: &TileKey) -> bool {
