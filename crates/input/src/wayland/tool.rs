@@ -31,6 +31,8 @@ pub(super) struct ToolState {
     buttons: Buttons,
     /// Phase changes seen since the last frame, in order.
     pending: Vec<Phase>,
+    /// The device time of the last frame, for samples synthesised between frames.
+    device_ms: u32,
     dejitter: Dejitter,
 }
 
@@ -98,11 +100,29 @@ impl ToolState {
         self.pending.push(Phase::Enter);
     }
 
+    /// The tool was removed: closes what it left open, an `Up` if it was in contact and a `Leave`
+    /// if it was over a surface, so no stroke stays open.
+    fn removed(&mut self, received: Instant) -> Vec<StrokeSample> {
+        if self.surface.is_none() {
+            return Vec::new();
+        }
+        // A `proximity_out` still waiting for its frame already closes everything.
+        if self.pending.last() != Some(&Phase::Leave) {
+            if self.contact {
+                self.contact = false;
+                self.pending.push(Phase::Up);
+            }
+            self.pending.push(Phase::Leave);
+        }
+        self.frame(self.device_ms, received)
+    }
+
     /// Turns the frame's accumulated changes into samples.
     ///
     /// A frame with phase changes yields one sample per change; one with only axis or button
     /// changes yields a `Drag` (in contact) or `Hover` sample.
     fn frame(&mut self, device_ms: u32, received: Instant) -> Vec<StrokeSample> {
+        self.device_ms = device_ms;
         let mut phases = std::mem::take(&mut self.pending);
         if phases.is_empty() && self.changed {
             phases.push(if self.contact {
@@ -202,7 +222,14 @@ impl Dispatch<ZwpTabletToolV2, ()> for State {
     ) {
         let received = Instant::now();
         if matches!(event, zwp_tablet_tool_v2::Event::Removed) {
-            state.tools.remove(&proxy.id());
+            let samples = state
+                .tools
+                .remove(&proxy.id())
+                .map(|(_, mut tool)| tool.removed(received))
+                .unwrap_or_default();
+            for sample in samples {
+                state.emit(Event::Sample(sample));
+            }
             proxy.destroy();
             return;
         }
@@ -363,6 +390,46 @@ mod tests {
         );
         assert_eq!(phases(&samples), [Phase::Hover]);
         assert_eq!(samples.first().map(|s| s.buttons), Some(Buttons::SECONDARY));
+    }
+
+    #[test]
+    fn removal_mid_stroke_closes_it() {
+        let mut tool = hovering();
+        frame(&mut tool, [E::Down { serial: 1 }]);
+        frame(&mut tool, [E::Motion { x: 5.0, y: 6.0 }]);
+        let samples = tool.removed(Instant::now());
+        assert_eq!(phases(&samples), [Phase::Up, Phase::Leave]);
+        for s in &samples {
+            assert_eq!(s.surface, SURFACE);
+            assert_eq!(s.pos, Position { x: 5.0, y: 6.0 });
+            assert_eq!(s.device_ms, 7, "the last frame's device time");
+        }
+        assert!(!tool.contact);
+        assert_eq!(tool.surface, None);
+    }
+
+    #[test]
+    fn removal_while_hovering_leaves() {
+        let mut tool = hovering();
+        assert_eq!(phases(&tool.removed(Instant::now())), [Phase::Leave]);
+    }
+
+    #[test]
+    fn removal_after_proximity_out_leaves_once() {
+        let mut tool = hovering();
+        assert_eq!(tool.apply(E::Up, Instant::now()), Vec::new());
+        assert_eq!(tool.apply(E::ProximityOut, Instant::now()), Vec::new());
+        assert_eq!(
+            phases(&tool.removed(Instant::now())),
+            [Phase::Up, Phase::Leave],
+            "the pending phases, nothing added"
+        );
+    }
+
+    #[test]
+    fn removal_out_of_proximity_yields_nothing() {
+        let mut tool = ToolState::default();
+        assert_eq!(tool.removed(Instant::now()), Vec::new());
     }
 
     #[test]

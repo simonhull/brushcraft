@@ -192,7 +192,7 @@ impl Buttons {
 
 /// Identifies the window surface a sample belongs to.
 ///
-/// Compare it with the one [`crate::wayland::surface_id`] returns for a window.
+/// Compare it with the one `input::wayland::surface_id` returns for a window (Linux only).
 ///
 /// It is an address, so it is unique only among live surfaces and may be reused after one is
 /// destroyed.
@@ -202,8 +202,9 @@ pub struct SurfaceId(usize);
 impl SurfaceId {
     /// Wraps an opaque surface identifier (a surface's address). Only compared, never
     /// dereferenced.
+    #[cfg(target_os = "linux")]
     #[must_use]
-    pub const fn from_raw(raw: usize) -> Self {
+    pub(crate) const fn from_raw(raw: usize) -> Self {
         Self(raw)
     }
 }
@@ -257,8 +258,9 @@ pub struct ControlId(u32);
 
 impl ControlId {
     /// Wraps an opaque control identifier. Only compared, never interpreted.
+    #[cfg(target_os = "linux")]
     #[must_use]
-    pub const fn from_raw(raw: u32) -> Self {
+    pub(crate) const fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
 }

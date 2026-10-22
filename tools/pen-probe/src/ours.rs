@@ -39,11 +39,23 @@ mod linux {
         /// # Errors
         ///
         /// If `window` has no Wayland surface, or the backend can't start.
+        #[expect(
+            unsafe_code,
+            reason = "PenBackend::spawn requires stopping the backend before destroying windows"
+        )]
         pub(crate) fn start(event_loop: &dyn ActiveEventLoop, window: &dyn Window) -> Result<Self> {
             let surface = wayland::surface_id(&window).context("finding the window's surface")?;
             let proxy = event_loop.create_proxy();
-            let backend =
-                PenBackend::spawn(event_loop.owned_display_handle(), move || proxy.wake_up())?;
+            // SAFETY: `spawn` needs every window on this connection to outlive the backend. The
+            // probe's one window lives in `App::surface`, and the backend (this `Ours`) in
+            // `App::backend`: `App::finish` (main.rs) stops the backend before the loop exits, and
+            // should it not run, `App` declares `backend` before `surface`, so the backend drops
+            // (joining its thread) before the window. What remains is winit destroying surfaces of
+            // its own, such as fallback decoration subsurfaces, as a pen enters them: the residual
+            // race `spawn`'s `# Safety` section describes, accepted for a diagnostic tool.
+            let backend = unsafe {
+                PenBackend::spawn(event_loop.owned_display_handle(), move || proxy.wake_up())
+            }?;
             Ok(Self { backend, surface })
         }
 

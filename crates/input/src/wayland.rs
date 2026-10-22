@@ -10,6 +10,7 @@ mod tool;
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use raw_window_handle::{
@@ -44,25 +45,25 @@ pub enum BackendError {
     #[error("not a Wayland display or window")]
     NotWayland,
     /// The windowing layer couldn't provide a handle.
-    #[error("no display or window handle: {0}")]
+    #[error("no display or window handle")]
     Handle(#[from] HandleError),
     /// The compositor doesn't support graphics tablets.
     #[error("the compositor doesn't offer zwp_tablet_manager_v2")]
     NoTabletManager,
     /// Listing the compositor's globals failed.
-    #[error("listing Wayland globals: {0}")]
+    #[error("listing Wayland globals")]
     Globals(#[from] GlobalError),
     /// Binding a global failed.
-    #[error("binding a Wayland global: {0}")]
-    Bind(BindError),
+    #[error("binding a Wayland global")]
+    Bind(#[source] BindError),
     /// Dispatching events failed.
-    #[error("dispatching Wayland events: {0}")]
+    #[error("dispatching Wayland events")]
     Dispatch(#[from] DispatchError),
     /// The connection failed.
-    #[error("Wayland connection: {0}")]
+    #[error("the Wayland connection failed")]
     Wayland(#[from] WaylandError),
     /// A system call failed.
-    #[error("input thread: {0}")]
+    #[error("a system call on the input thread failed")]
     Io(#[from] std::io::Error),
     /// The input thread panicked.
     #[error("the input thread panicked")]
@@ -102,6 +103,8 @@ pub struct PenBackend {
 struct InputThread {
     /// Signalled (made readable) to tell the thread to exit.
     stop: Arc<OwnedFd>,
+    /// Set by the thread as it exits, before its last `wake`.
+    exited: Arc<AtomicBool>,
     handle: Option<JoinHandle<Result<(), BackendError>>>,
 }
 
@@ -112,21 +115,31 @@ impl PenBackend {
     /// does, which is what raw-window-handle's contract asks for. With winit, pass
     /// `event_loop.owned_display_handle()`.
     ///
-    /// `wake` runs on the input thread after each event is queued; use it to wake the
-    /// application's event loop. It must not block waiting on the thread that drops the
-    /// `PenBackend`: dropping joins the input thread, so that would deadlock.
+    /// `wake` runs on the input thread after each event is queued, and once more if the thread
+    /// stops on an error; use it to wake the application's event loop, and check
+    /// [`is_running`](Self::is_running) there. It must not block waiting on the thread that drops
+    /// the `PenBackend`: dropping joins the input thread, so that would deadlock.
     ///
     /// The backend binds its own tablet seats on its own event queue, so a second `spawn` on the
     /// same connection gets its own seats and events; each backend destroys its objects when it
     /// stops.
     ///
-    /// Stop the backend before destroying windows. It shares the connection with the windowing
-    /// library, and in this mode (a "guest" on a foreign `wl_display`) wayland-backend may read the
-    /// user data of a proxy the windowing library owns, such as the surface a pen enters. If that
-    /// surface is destroyed at the same moment, for example a window or its decoration subsurface
-    /// torn down as the pen enters it, the read can race the teardown. Stopping first closes the
-    /// window for windows the application destroys; what remains (surfaces the windowing library
-    /// destroys on its own) is inherent to sharing a connection this way.
+    /// # Safety
+    ///
+    /// No `wl_surface` on `display`'s connection may be destroyed while the backend runs: stop
+    /// (or drop) the backend before destroying any window.
+    ///
+    /// The backend shares the connection with the windowing library as a "guest" on its
+    /// `wl_display`. In that mode, when wayland-backend dispatches an event whose argument is an
+    /// object the windowing library owns (the `wl_surface` in a tool's `proximity_in`), it reads
+    /// that object's user data on our thread. If the windowing library destroys the surface at the
+    /// same moment, that read is a use-after-free.
+    ///
+    /// Stopping first covers every window the application destroys, but the windowing library may
+    /// destroy surfaces of its own while the backend runs (winit tears down the subsurfaces of its
+    /// fallback client-side decorations, for example). A caller that can't rule that out, which
+    /// with winit means every caller, accepts that residual race; it needs a surface destroyed
+    /// in the instant a pen enters it.
     ///
     /// # Errors
     ///
@@ -136,9 +149,9 @@ impl PenBackend {
         unsafe_code,
         reason = "attaching to the application's wl_display is input's one FFI boundary"
     )]
-    pub fn spawn<D, W>(display: D, wake: W) -> Result<Self, BackendError>
+    pub unsafe fn spawn<D, W>(display: D, wake: W) -> Result<Self, BackendError>
     where
-        D: HasDisplayHandle + Send + Sync + 'static,
+        D: HasDisplayHandle + Send + 'static,
         W: Fn() + Send + 'static,
     {
         let RawDisplayHandle::Wayland(raw) = display.display_handle()?.as_raw() else {
@@ -151,18 +164,24 @@ impl PenBackend {
         // the `Worker` is built, `display` is a parameter and so is dropped after every local, and
         // `connect` drops its other temporaries before returning. From then on `display` lives in
         // the `Worker` beside `conn` and the queue, whose fields drop in declaration order,
-        // `_display` last, whether the thread finishes or never starts. If `PenBackend` is
-        // leaked, the thread keeps the `Worker` alive, so leaking can't break this either.
+        // `_display` last, after `Worker::drop` has used the connection for the last time, whether
+        // the thread finishes, panics or never starts. If `PenBackend` is leaked, the thread
+        // keeps the `Worker` alive, so leaking can't break this either. `display` only has to be
+        // `Send`: it moves to the input thread and is never shared. The other hazard of guest mode
+        // (reading the user data of the windowing library's objects as they are destroyed) is the
+        // caller's to rule out, per this function's `# Safety` section.
         let backend = unsafe { Backend::from_foreign_display(raw.display.as_ptr().cast()) };
         let conn = Connection::from_backend(backend);
         let (queue, state, events) = connect(&conn, Box::new(wake))?;
 
         let stop = Arc::new(eventfd(0, EventfdFlags::CLOEXEC)?);
+        let exited = Arc::new(AtomicBool::new(false));
         let worker = Worker {
             queue,
             state,
             conn,
             stop: Arc::clone(&stop),
+            exited: Arc::clone(&exited),
             _display: display,
         };
         let thread = thread::Builder::new()
@@ -171,6 +190,7 @@ impl PenBackend {
         Ok(Self {
             thread: InputThread {
                 stop,
+                exited,
                 handle: Some(thread),
             },
             events,
@@ -181,6 +201,17 @@ impl PenBackend {
     #[must_use]
     pub const fn events(&self) -> &Events<Event> {
         &self.events
+    }
+
+    /// Whether the input thread is still reading events.
+    ///
+    /// It turns false when the thread stops on its own, from a Wayland or system error or a panic
+    /// in `wake`; [`stop`](Self::stop) then reports why. On an error the thread calls `wake` once
+    /// more after this has turned false, so checking it on each wake catches a dead thread. A
+    /// panic gives no such wake: this turns false as the thread unwinds, seen on the next check.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.thread.is_running()
     }
 
     /// Stops the input thread and reports how it ended, handing back the queue.
@@ -199,6 +230,16 @@ impl PenBackend {
 }
 
 impl InputThread {
+    /// Whether the thread is neither exiting nor finished.
+    fn is_running(&self) -> bool {
+        // `exited` is set before the error-exit wake, which `is_finished` alone could race.
+        !self.exited.load(Ordering::Acquire)
+            && self
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+    }
+
     /// Signals the thread to stop and joins it, once.
     ///
     /// # Errors
@@ -272,29 +313,34 @@ fn retry_later<T>(result: Result<T, WaylandError>) -> Result<(), WaylandError> {
 /// What the input thread owns.
 ///
 /// Fields drop in declaration order, so the queue and `conn` (the backend's only holders) go
-/// before `_display`, which keeps the `wl_display` they point into alive.
+/// before `_display`, which keeps the `wl_display` they point into alive. `Drop::drop` runs before
+/// any field is dropped, so its use of the connection is covered too.
 struct Worker<D> {
     queue: EventQueue<State>,
     state: State,
     conn: Connection,
     /// An eventfd that [`PenBackend`] signals to stop the thread.
     stop: Arc<OwnedFd>,
+    /// Set as the thread exits, for [`PenBackend::is_running`].
+    exited: Arc<AtomicBool>,
     /// Held only so it drops last: it keeps the `wl_display` alive.
     _display: D,
 }
 
 impl<D> Worker<D> {
-    /// Dispatches until stopped, then destroys our protocol objects.
+    /// Dispatches until stopped; dropping `self` then destroys our protocol objects.
     ///
     /// # Errors
     ///
     /// A Wayland or system error that ended the thread early.
     fn run(mut self) -> Result<(), BackendError> {
         let result = self.pump();
-        // Guest-mode backends must clean up their objects before going away; best effort, since
-        // the connection may be what failed.
-        self.state.destroy_all();
-        drop(self.conn.flush());
+        if result.is_err() {
+            // Nobody asked us to stop: wake the application so it notices, after `is_running` has
+            // turned false.
+            self.exited.store(true, Ordering::Release);
+            (self.state.wake)();
+        }
         result
     }
 
@@ -331,6 +377,18 @@ impl<D> Worker<D> {
     }
 }
 
+/// Runs however the worker ends: a normal stop, an error, a panic in `wake`, or a thread that
+/// never started.
+impl<D> Drop for Worker<D> {
+    fn drop(&mut self) {
+        self.exited.store(true, Ordering::Release);
+        // Guest-mode backends must clean up their objects before going away; best effort, since
+        // the connection may be what failed.
+        self.state.destroy_all();
+        drop(self.conn.flush());
+    }
+}
+
 impl<D> std::fmt::Debug for Worker<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
@@ -345,8 +403,8 @@ struct State {
     sender: Sender<Event>,
     /// Boxed so the many `Dispatch` impls below stay non-generic; called once per event.
     wake: Box<dyn Fn() + Send>,
-    /// Tablet seats by their `wl_seat` global's name, so a removed seat can be found.
-    seats: HashMap<u32, ZwpTabletSeatV2>,
+    /// Seats by their `wl_seat` global's name, so a removed seat can be found.
+    seats: HashMap<u32, Seat>,
     tablets: HashMap<ObjectId, ZwpTabletV2>,
     tools: HashMap<ObjectId, (ZwpTabletToolV2, tool::ToolState)>,
     pads: HashMap<ObjectId, pad::Pad>,
@@ -373,14 +431,14 @@ impl State {
     }
 
     fn add_seat(&mut self, registry: &WlRegistry, name: u32, version: u32, qh: &QueueHandle<Self>) {
-        let seat: WlSeat = registry.bind(name, version.min(1), qh, ());
-        let tablet_seat = self.manager.get_tablet_seat(&seat, qh, ());
-        self.seats.insert(name, tablet_seat);
+        let seat: WlSeat = registry.bind(name, version.min(SEAT_RELEASE_VERSION), qh, ());
+        let tablet = self.manager.get_tablet_seat(&seat, qh, ());
+        self.seats.insert(name, Seat { seat, tablet });
     }
 
     fn remove_seat(&mut self, name: u32) {
-        if let Some(tablet_seat) = self.seats.remove(&name) {
-            tablet_seat.destroy();
+        if let Some(seat) = self.seats.remove(&name) {
+            seat.destroy();
         }
     }
 
@@ -394,6 +452,25 @@ impl State {
             .for_each(|(_, tablet)| tablet.destroy());
         self.seats.drain().for_each(|(_, seat)| seat.destroy());
         self.manager.destroy();
+    }
+}
+
+/// The first `wl_seat` version with a destructor (`release`); older seats can only be abandoned.
+const SEAT_RELEASE_VERSION: u32 = 5;
+
+/// A `wl_seat` we bound and the tablet seat we got for it.
+struct Seat {
+    seat: WlSeat,
+    tablet: ZwpTabletSeatV2,
+}
+
+impl Seat {
+    /// Destroys the tablet seat, then releases the `wl_seat` if its version allows.
+    fn destroy(self) {
+        self.tablet.destroy();
+        if self.seat.version() >= SEAT_RELEASE_VERSION {
+            self.seat.release();
+        }
     }
 }
 
@@ -438,7 +515,8 @@ impl Dispatch<WlRegistry, GlobalListContents> for State {
     }
 }
 
-/// Seats are bound only to ask for their tablet seat; their own events don't matter here.
+/// Seats are bound only to ask for their tablet seat; their own events (`capabilities`, and `name`
+/// from version 2; versions 3 to 5 add none) don't matter here.
 impl Dispatch<WlSeat, ()> for State {
     fn event(
         _: &mut Self,
