@@ -208,25 +208,28 @@ impl Topology {
     /// Every stored copy of face-grid vertex `(i, j)` of `face` at `level`: one per tile holding
     /// it, in every face that shares it. Empty if `(i, j)` is outside the face or `face` is not
     /// in this mesh.
+    ///
+    /// The copies are returned inline, so finding them never allocates: an edit sets every copy
+    /// of each vertex it touches, so this runs once per edited vertex.
     #[must_use]
-    pub fn copies(&self, face: FaceId, level: Level, i: u32, j: u32) -> Vec<VertexCopy> {
+    pub fn copies(&self, face: FaceId, level: Level, i: u32, j: u32) -> Copies {
+        let mut copies = Copies::default();
         let n = level.face_quads();
         if i > n || j > n {
-            return Vec::new();
+            return copies;
         }
-        self.face_twins(face, n, i, j)
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(|(f, fi, fj)| {
-                tile_copies(level, fi, fj).map(move |(tx, ty, li, lj)| VertexCopy {
+        for (f, fi, fj) in self.face_twins(face, n, i, j).unwrap_or_default() {
+            for (tx, ty, li, lj) in tile_copies(level, fi, fj) {
+                copies.0.push(VertexCopy {
                     face: f,
                     tx,
                     ty,
                     i: li,
                     j: lj,
-                })
-            })
-            .collect()
+                });
+            }
+        }
+        copies
     }
 
     /// The owner's copy of face-grid vertex `(i, j)` of `face` (`n` quads per side): the lowest
@@ -280,35 +283,160 @@ impl Topology {
         clippy::many_single_char_names,
         reason = "grid math keeps the conventions' names: n, (i, j) and (s, d)"
     )]
-    fn face_twins(&self, face: FaceId, n: u32, i: u32, j: u32) -> Option<Vec<(FaceId, u32, u32)>> {
+    fn face_twins(&self, face: FaceId, n: u32, i: u32, j: u32) -> Option<Twins> {
         let on = |x: u32| x == 0 || x == n;
         let n64 = i64::from(n);
+        let mut twins = Twins::new((face, i, j));
         if on(i) && on(j) {
             let ring = self.ring(face, corner_at(i, j, n))?;
-            return ring
-                .entries
-                .iter()
-                .map(|&(g, c)| {
-                    let (gi, gj) = corner_coords(c, n64);
-                    Some((g, u32::try_from(gi).ok()?, u32::try_from(gj).ok()?))
-                })
-                .collect();
+            for &(g, c) in &ring.entries {
+                let (gi, gj) = corner_coords(c, n64);
+                twins.push((g, u32::try_from(gi).ok()?, u32::try_from(gj).ok()?));
+            }
+            return Some(twins);
         }
         if on(i) || on(j) {
             let k = border_edge(i, j, n);
             let (s, _) = grid_to_edge(k, n64, i64::from(i), i64::from(j));
             let across = self.across(face, k)?;
             let (gi, gj) = edge_to_grid(across.edge, n64, n64 - s, 0);
-            return Some(vec![
-                (face, i, j),
-                (
-                    across.face,
-                    u32::try_from(gi).ok()?,
-                    u32::try_from(gj).ok()?,
-                ),
-            ]);
+            twins.push((face, i, j));
+            twins.push((
+                across.face,
+                u32::try_from(gi).ok()?,
+                u32::try_from(gj).ok()?,
+            ));
+            return Some(twins);
         }
-        self.contains(face).then(|| vec![(face, i, j)])
+        self.contains(face).then(|| {
+            twins.push((face, i, j));
+            twins
+        })
+    }
+}
+
+/// The most copies one grid vertex has: one per face around a base vertex (at most
+/// [`MAX_VALENCE`]), or four where a vertex lies on a tile corner (inside a face, or on a face
+/// edge: two faces × two tiles).
+pub const MAX_COPIES: usize = if MAX_VALENCE > 4 { MAX_VALENCE } else { 4 };
+
+/// At most `N` values of `T`, held inline: the fixed-capacity list behind [`Copies`] and the
+/// face twins it is built from.
+///
+/// `T` is plain data, so the unused tail is filled with a copy of a placeholder value instead of
+/// being left uninitialized.
+#[derive(Debug, Clone, Copy)]
+struct Inline<T: Copy, const N: usize> {
+    /// Values in use: a prefix of `items`.
+    len: usize,
+    /// The values, then placeholders.
+    items: [T; N],
+}
+
+impl<T: Copy, const N: usize> Inline<T, N> {
+    /// An empty list whose unused places hold `placeholder`.
+    const fn new(placeholder: T) -> Self {
+        Self {
+            len: 0,
+            items: [placeholder; N],
+        }
+    }
+
+    /// Appends `value`.
+    ///
+    /// The capacities here are bounds the mesh enforces ([`MAX_VALENCE`] is checked when a mesh
+    /// is built), so a full list is a broken invariant: debug builds panic, release builds drop
+    /// the value.
+    fn push(&mut self, value: T) {
+        debug_assert!(self.len < N, "more than {N} copies of one vertex");
+        if let Some(place) = self.items.get_mut(self.len) {
+            *place = value;
+            self.len += 1;
+        }
+    }
+
+    /// The values in use.
+    fn as_slice(&self) -> &[T] {
+        self.items.get(..self.len).unwrap_or_default()
+    }
+}
+
+/// The faces and face-grid positions holding one vertex, as [`Topology::face_twins`] finds them.
+type Twins = Inline<(FaceId, u32, u32), MAX_VALENCE>;
+
+impl Default for Twins {
+    fn default() -> Self {
+        Self::new((FaceId::new(0), 0, 0))
+    }
+}
+
+impl IntoIterator for Twins {
+    type IntoIter = std::iter::Take<std::array::IntoIter<(FaceId, u32, u32), MAX_VALENCE>>;
+    type Item = (FaceId, u32, u32);
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter().take(self.len)
+    }
+}
+
+/// Every stored copy of one grid vertex, as [`Topology::copies`] returns them: at most
+/// [`MAX_COPIES`], held inline so that finding them never allocates.
+///
+/// It dereferences to a slice of [`VertexCopy`], and iterates by value or by reference.
+#[derive(Clone, Copy)]
+pub struct Copies(Inline<VertexCopy, MAX_COPIES>);
+
+impl Default for Copies {
+    /// No copies: what a vertex outside its face has.
+    fn default() -> Self {
+        let placeholder = VertexCopy {
+            face: FaceId::new(0),
+            tx: 0,
+            ty: 0,
+            i: 0,
+            j: 0,
+        };
+        Self(Inline::new(placeholder))
+    }
+}
+
+impl std::ops::Deref for Copies {
+    type Target = [VertexCopy];
+
+    fn deref(&self) -> &[VertexCopy] {
+        self.0.as_slice()
+    }
+}
+
+impl std::fmt::Debug for Copies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for Copies {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for Copies {}
+
+impl IntoIterator for Copies {
+    type IntoIter = std::iter::Take<std::array::IntoIter<VertexCopy, MAX_COPIES>>;
+    type Item = VertexCopy;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.items.into_iter().take(self.0.len)
+    }
+}
+
+impl<'a> IntoIterator for &'a Copies {
+    type IntoIter = std::slice::Iter<'a, VertexCopy>;
+    type Item = &'a VertexCopy;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -486,7 +614,10 @@ mod tests {
     /// Whether two face-grid positions name the same vertex. A vertex on a face border has one name
     /// per face holding it, so positions are compared through their twins, never as tuples.
     fn same_vertex(t: &Topology, n: u32, a: (FaceId, u32, u32), b: (FaceId, u32, u32)) -> bool {
-        t.face_twins(a.0, n, a.1, a.2).unwrap().contains(&b)
+        t.face_twins(a.0, n, a.1, a.2)
+            .unwrap()
+            .as_slice()
+            .contains(&b)
     }
 
     #[test]
@@ -498,7 +629,7 @@ mod tests {
             for j in 0..=n {
                 for i in 0..=n {
                     let twins = t.face_twins(face, n, i, j).unwrap();
-                    let lowest = twins.iter().copied().min().unwrap();
+                    let lowest = twins.as_slice().iter().copied().min().unwrap();
                     for (g, gi, gj) in twins {
                         assert_eq!(
                             t.owner_copy(g, n, gi, gj),
@@ -643,6 +774,39 @@ mod tests {
         assert!(
             t.copies(FaceId::new(6), level, 1, 1).is_empty(),
             "not a face of this mesh"
+        );
+    }
+
+    #[test]
+    fn a_corner_of_the_highest_valence_has_every_copy_inline() {
+        // Subdividing a prism with MAX_VALENCE-gon caps puts a vertex of that valence at each
+        // cap's centre.
+        let mesh = crate::reference::prism(MAX_VALENCE)
+            .subdivide()
+            .to_base_mesh();
+        let t = mesh.topology();
+        let level = Level::new(8).unwrap();
+        let n = level.face_quads();
+        let most = mesh
+            .faces()
+            .flat_map(|face| [(0, 0), (n, 0), (0, n), (n, n)].map(|(i, j)| (face, i, j)))
+            .map(|(face, i, j)| t.copies(face, level, i, j).len())
+            .max()
+            .unwrap();
+        assert_eq!(
+            most, MAX_COPIES,
+            "one copy per face around the cap's centre"
+        );
+        let edge = t.copies(FaceId::new(0), level, 64, 0);
+        assert_eq!(
+            edge.len(),
+            4,
+            "a face edge on a tile border: 2 faces × 2 tiles"
+        );
+        assert_eq!(
+            edge.iter().copied().collect::<Vec<_>>(),
+            edge.into_iter().collect::<Vec<_>>(),
+            "by reference and by value alike"
         );
     }
 
