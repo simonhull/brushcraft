@@ -15,7 +15,10 @@ pub use key::{
     TileOutOfRange, VertexId,
 };
 mod correction;
+#[expect(dead_code, reason = "used by evaluation (M0a Task 8)")]
+mod frame;
 pub use correction::{CorrectionError, CorrectionTile};
+pub use frame::Frame;
 mod mesh;
 mod sphere;
 #[cfg_attr(
