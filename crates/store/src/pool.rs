@@ -248,7 +248,7 @@ pub(crate) struct Pool<T: Pod> {
     free: Vec<Pos>,
     /// Where each tile's slot is.
     index: HashMap<TileKey, Pos>,
-    /// Slots pinned at least once.
+    /// Slots with at least one pin.
     pinned: usize,
     /// Where the clock resumes, as a flat position (`chunk × per_chunk + index`).
     hand: u64,
@@ -331,7 +331,7 @@ impl<T: Pod> Pool<T> {
         self.per_chunk
     }
 
-    /// Slots pinned at least once.
+    /// Slots with at least one pin.
     pub(crate) const fn pinned_slots(&self) -> usize {
         self.pinned
     }
