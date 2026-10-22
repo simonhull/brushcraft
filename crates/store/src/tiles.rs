@@ -158,6 +158,8 @@ struct EvalLog {
     /// Correction tiles the owner thread looked up in the working file, in order (prefetch
     /// workers' reads aren't counted).
     file_reads: Vec<TileKey>,
+    /// Prefetched correction tiles installed.
+    prefetched: usize,
 }
 
 /// A project held out of core: the base mesh, the working file, budgeted pools of correction and
@@ -670,6 +672,10 @@ impl TileStore {
             Err(e) => return Err(e),
         };
         *self.corrections.get_mut(id).ok_or(PoolError::Stale)? = *tile;
+        #[cfg(test)]
+        {
+            self.log.prefetched += 1;
+        }
         Ok(true)
     }
 
