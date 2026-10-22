@@ -209,11 +209,20 @@ pub fn predict_region(
 ) -> Result<Prediction, EvalError> {
     let parent = gather(mesh, src, parent_region(region)?)?;
     let predicted = predict(&parent.padded, &parent.corners);
-    let axes = parent.corners.each_ref().map(|c| {
-        c.as_ref().map(|ring| CornerAxes {
+    // Frames at base vertices use the predicted level's ring: the vertex point and every edge
+    // point around it, computed from the ring alone so all copies agree.
+    let edge_points = parent.corners.each_ref().map(|c| {
+        c.as_ref().map(|ring| {
+            (0..ring.edges.len())
+                .map(|k| ring_edge_point(ring, k))
+                .collect::<Vec<_>>()
+        })
+    });
+    let axes = std::array::from_fn(|c| {
+        let ring = parent.corners.get(c)?.as_ref()?;
+        Some(CornerAxes {
             center: extraordinary(ring),
-            e0: ring_edge_point(ring, 0),
-            e1: ring_edge_point(ring, 1),
+            points: edge_points.get(c)?.as_deref()?,
             owner_corner: ring.owner_corner,
         })
     });
@@ -331,28 +340,33 @@ pub fn parent_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>
 
 /// Unit normals of `region`'s evaluated positions in `src` (same level).
 ///
-/// They come from owner-oriented derivatives: central differences, one-sided at base vertices
-/// along the owner's edges. Every copy of a shared vertex gets the same bits.
+/// Every copy of a shared vertex gets the same bits. Away from base vertices the normal is
+/// `du × dv` from central differences in the owner's orientation. At a base vertex `v` (a face
+/// corner) with edge neighbours `e_0 … e_{n−1}` at this level, it is the ring normal
+/// `Σ_k (e_k − v) × (e_{k+1} − v)`, summed over the whole ring from the owner face, wrapping.
+/// [`Prediction`]'s frames use the same rules.
 ///
-/// Non-finite positions give NaN normals; finite but degenerate ones give [`Frame`]'s fallback
-/// normal, as frames do.
+/// Non-finite positions give NaN normals. Finite but degenerate ones (a zero cross product or
+/// ring sum) give the fallback normal `(0, 0, 1)`, as frames do.
+///
+/// Like prediction, this reads the region, its one-vertex apron and the rings of the base
+/// vertices at its corners, so all must be resident in `src`. At valence 5 or more, a ring
+/// includes faces that touch only the vertex, outside the apron.
 ///
 /// # Errors
 ///
-/// [`EvalError::Missing`] if `src` lacks a position of the region or its apron.
+/// [`EvalError::Missing`] if `src` lacks a position of the region, its apron or a corner's ring.
 pub fn normals(
     mesh: &BaseMesh,
     src: &impl PositionSource,
     region: Region,
 ) -> Result<Grid, EvalError> {
     let gathered = gather(mesh, src, region)?;
-    // At this level the ring's first two edge vertices lie one step along the owner's outgoing
-    // and incoming edges: the one-sided derivatives' far ends.
+    // The level's own ring: the base vertex (the owner's copy) and its edge neighbours.
     let axes = gathered.corners.each_ref().map(|c| {
         c.as_ref().map(|ring| CornerAxes {
             center: ring.center,
-            e0: ring.edges.first().copied().unwrap_or(Vec3::NAN),
-            e1: ring.edges.get(1).copied().unwrap_or(Vec3::NAN),
+            points: &ring.edges,
             owner_corner: ring.owner_corner,
         })
     });
@@ -378,6 +392,7 @@ mod tests {
     use super::*;
     use crate::reference::pentagonal_prism;
     use crate::test_rng::Rng;
+    use crate::topology::edge_to_grid;
     use crate::{CorrectionMap, DenseEvaluation, FaceId, Level, Region, cube_sphere};
 
     fn level(l: u8) -> Level {
@@ -693,16 +708,26 @@ mod tests {
 
     #[test]
     fn normals_of_twins_are_bit_identical() {
-        let mesh = cube_sphere(2).unwrap();
+        assert_normals_of_twins_are_bit_identical(&cube_sphere(2).unwrap(), 21);
+        // Valence 3, 4 and 5: the ring sum's canonical order matters at every valence.
+        assert_normals_of_twins_are_bit_identical(
+            &pentagonal_prism().subdivide().to_base_mesh(),
+            22,
+        );
+    }
+
+    /// Normals at levels 0–3 under random corrections: unit length, bit-identical across every
+    /// copy of a shared vertex, and the same from a sub-block as from the whole face.
+    fn assert_normals_of_twins_are_bit_identical(mesh: &BaseMesh, seed: u64) {
         let t = mesh.topology();
-        let map = random_corrections(&mesh, 3, 400, 21);
-        let dense = DenseEvaluation::new(&mesh, level(3), &map).unwrap();
+        let map = random_corrections(mesh, 3, 400, seed);
+        let dense = DenseEvaluation::new(mesh, level(3), &map).unwrap();
         for l in 0..=3 {
             let level = level(l);
             let n = level.face_quads();
             let grids: Vec<Grid> = mesh
                 .faces()
-                .map(|f| normals(&mesh, &dense, Region::whole_face(f, level)).unwrap())
+                .map(|f| normals(mesh, &dense, Region::whole_face(f, level)).unwrap())
                 .collect();
             let at = |f: FaceId, i: u32, j: u32| grids[f.index() as usize].get(i, j).unwrap();
             for face in mesh.faces() {
@@ -729,7 +754,7 @@ mod tests {
                     let half = n / 2;
                     for (x0, y0) in [(0, 0), (half, 0), (0, half), (half, half)] {
                         let r = Region::new(face, level, x0, y0, half).unwrap();
-                        let block = normals(&mesh, &dense, r).unwrap();
+                        let block = normals(mesh, &dense, r).unwrap();
                         for j in 0..=half {
                             for i in 0..=half {
                                 assert_eq!(
@@ -745,11 +770,17 @@ mod tests {
         }
     }
 
-    /// At level 3 the normals are within 0.99 of radial.
+    /// Whether `(i, j)` is a corner of a face with `n` quads per side: a base vertex.
+    fn is_corner(i: u32, j: u32, n: u32) -> bool {
+        (i == 0 || i == n) && (j == 0 || j == n)
+    }
+
+    /// Normals of the unedited cube sphere against radial directions, at every level 0–3.
     ///
-    /// Coarser levels are only checked to point outward: the one-sided derivatives at valence-3
-    /// base vertices tilt the normal by about 32°, 15° and 8° at levels 0, 1 and 2, halving
-    /// each level as a first-order difference should.
+    /// Base vertices take the ring normal, which is radial to within `cos > 0.9999` (measured:
+    /// above 0.9999999). Elsewhere the central differences reach 0.9987, 0.9981 and 0.9978 at
+    /// levels 1–3: the Catmull–Clark surface of a cube sphere isn't a sphere, so radial isn't
+    /// its exact normal there.
     #[test]
     fn normals_of_a_sphere_point_outward() {
         let mesh = cube_sphere(2).unwrap();
@@ -757,7 +788,6 @@ mod tests {
         for l in 0..=3 {
             let level = level(l);
             let n = level.face_quads();
-            let bound = if l == 3 { 0.99 } else { 0.8 };
             for face in mesh.faces() {
                 let grid = normals(&mesh, &dense, Region::whole_face(face, level)).unwrap();
                 for j in 0..=n {
@@ -765,11 +795,85 @@ mod tests {
                         let p = dense.position(face, level, i, j).unwrap();
                         let normal = grid.get(i, j).unwrap();
                         let cos = normal.dot(p.normalized().unwrap());
+                        let bound = if is_corner(i, j, n) { 0.9999 } else { 0.997 };
                         assert!(cos > bound, "{face} L{l} ({i}, {j}): cos {cos}");
                     }
                 }
             }
         }
+    }
+
+    /// Predicted frames at base vertices take the ring normal of the predicted level: radial on
+    /// the unedited sphere.
+    #[test]
+    fn frames_at_base_vertices_of_a_sphere_point_outward() {
+        let mesh = cube_sphere(2).unwrap();
+        let parents = DenseEvaluation::new(&mesh, level(2), &CorrectionMap::new()).unwrap();
+        for l in 1..=3 {
+            let n = level(l).face_quads();
+            for face in mesh.faces() {
+                let prediction =
+                    predict_region(&mesh, &parents, Region::whole_face(face, level(l))).unwrap();
+                for (i, j) in [(0, 0), (n, 0), (n, n), (0, n)] {
+                    let p = prediction.predicted(i, j).unwrap();
+                    let normal = prediction.frame(i, j).unwrap().n();
+                    let cos = normal.dot(p.normalized().unwrap());
+                    assert!(cos > 0.9999, "{face} L{l} ({i}, {j}): cos {cos}");
+                }
+            }
+        }
+    }
+
+    /// At every base vertex, each copy's normal is exactly the ring normal of the dense positions,
+    /// summed from the owner: `Σ_k (e_k − v) × (e_{k+1} − v)` over the level's edge neighbours.
+    #[test]
+    fn normals_at_base_vertices_are_the_ring_normal() {
+        let mesh = pentagonal_prism().subdivide().to_base_mesh();
+        let t = mesh.topology();
+        let map = random_corrections(&mesh, 2, 200, 31);
+        let dense = DenseEvaluation::new(&mesh, level(2), &map).unwrap();
+        let mut valences = BTreeSet::new();
+        for l in 0..=2 {
+            let level = level(l);
+            let n = level.face_quads();
+            let n64 = i64::from(n);
+            for face in mesh.faces() {
+                let grid = normals(&mesh, &dense, Region::whole_face(face, level)).unwrap();
+                for (i, j) in [(0, 0), (n, 0), (n, n), (0, n)] {
+                    let ring = &t.ring(face, corner_at(i, j, n)).unwrap().entries;
+                    valences.insert(ring.len());
+                    let (owner, owner_corner) = ring[0];
+                    let at = |g: FaceId, c: u8, s: i64| {
+                        let (gi, gj) = edge_to_grid(c, n64, s, 0);
+                        dense
+                            .position(
+                                g,
+                                level,
+                                u32::try_from(gi).unwrap(),
+                                u32::try_from(gj).unwrap(),
+                            )
+                            .unwrap()
+                    };
+                    let v = at(owner, owner_corner, 0);
+                    let edges: Vec<Vec3> = ring.iter().map(|&(g, c)| at(g, c, 1)).collect();
+                    let sum = (0..edges.len()).fold(Vec3::ZERO, |sum, k| {
+                        let next = edges[(k + 1) % edges.len()];
+                        sum + (edges[k] - v).cross(next - v)
+                    });
+                    let want = sum.normalized().unwrap();
+                    assert_eq!(
+                        grid.get(i, j).unwrap().to_bits(),
+                        want.to_bits(),
+                        "{face} L{l} ({i}, {j}), ring {ring:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            valences,
+            BTreeSet::from([3, 4, 5]),
+            "every valence of the subdivided prism"
+        );
     }
 
     #[test]

@@ -35,7 +35,14 @@ impl Frame {
         if !(du.is_finite() && dv.is_finite()) {
             return Self::NAN;
         }
-        let Some(n) = du.cross(dv).normalized() else {
+        Self::from_tangent_and_normal(du, du.cross(dv))
+    }
+
+    /// The frame from a tangent direction `du` and an unnormalized normal, both computed from
+    /// finite inputs: `n` the normal normalized, `t` `du` projected onto its plane, or
+    /// [`Frame::FALLBACK`] where either is degenerate.
+    fn from_tangent_and_normal(du: Vec3, normal: Vec3) -> Self {
+        let Some(n) = normal.normalized() else {
             return Self::FALLBACK;
         };
         let Some(t) = (du - n * du.dot(n)).normalized() else {
@@ -45,6 +52,15 @@ impl Frame {
             t,
             b: n.cross(t),
             n,
+        }
+    }
+
+    /// The frame for a vertex's [`Local`] axes.
+    fn from_local(local: Local) -> Self {
+        match local {
+            Local::Derivatives { du, dv } => Self::from_derivatives(du, dv),
+            Local::Ring { du, normal } => Self::from_tangent_and_normal(du, normal),
+            Local::NonFinite => Self::NAN,
         }
     }
 
@@ -74,17 +90,78 @@ impl Frame {
     }
 }
 
-/// The next level's points around a base vertex, for one-sided derivatives there.
+/// A base vertex and its ring of edge neighbours at one level, for the frame and normal there.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct CornerAxes {
-    /// The vertex point.
+pub(crate) struct CornerAxes<'a> {
+    /// The base vertex.
     pub(crate) center: Vec3,
-    /// The edge point along the owner's outgoing edge.
-    pub(crate) e0: Vec3,
-    /// The edge point along the owner's incoming edge.
-    pub(crate) e1: Vec3,
+    /// Its edge neighbours in the ring's canonical order (owner first, see `CornerRing`):
+    /// `points[0]` lies along the owner's outgoing edge, `points[1]` along its incoming edge.
+    pub(crate) points: &'a [Vec3],
     /// The owner face's corner at this vertex.
     pub(crate) owner_corner: u8,
+}
+
+impl CornerAxes<'_> {
+    /// The owner's first-edge direction and the ring normal, or [`Local::NonFinite`] if any input
+    /// isn't finite.
+    fn local(&self) -> Local {
+        let finite = self.center.is_finite() && self.points.iter().all(|p| p.is_finite());
+        let (Some(&e0), Some(&e1), true) = (self.points.first(), self.points.get(1), finite) else {
+            return Local::NonFinite;
+        };
+        Local::Ring {
+            du: self.first_edge(e0, e1),
+            normal: self.ring_normal(),
+        }
+    }
+
+    /// The one-sided derivative along the owner's u axis, from its edge neighbours `e0` (along
+    /// its outgoing edge) and `e1` (along its incoming edge).
+    fn first_edge(&self, e0: Vec3, e1: Vec3) -> Vec3 {
+        let v = self.center;
+        debug_assert!(self.owner_corner < 4, "a corner index is 0–3");
+        match self.owner_corner & 3 {
+            0 => e0 - v,
+            1 => v - e1,
+            2 => v - e0,
+            _ => e1 - v,
+        }
+    }
+
+    /// `Σ_k (e_k − v) × (e_{k+1} − v)` over the whole ring, `k` from the owner, wrapping. Every
+    /// copy of the vertex sums the same terms in the same order, so all get the same bits.
+    fn ring_normal(&self) -> Vec3 {
+        let v = self.center;
+        let next = self.points.iter().cycle().skip(1);
+        self.points
+            .iter()
+            .zip(next)
+            .fold(Vec3::ZERO, |sum, (&a, &b)| sum + (a - v).cross(b - v))
+    }
+}
+
+/// What a vertex's frame and normal are built from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Local {
+    /// Derivatives along the owner's u and v: the normal is `du × dv`.
+    Derivatives { du: Vec3, dv: Vec3 },
+    /// At a base vertex, from finite inputs: the owner's first-edge direction and the
+    /// unnormalized ring normal.
+    Ring { du: Vec3, normal: Vec3 },
+    /// At a base vertex whose ring isn't finite (or isn't known).
+    NonFinite,
+}
+
+impl Local {
+    /// Whether the inputs were finite: frames assert it, normals pass NaN through.
+    const fn is_finite(&self) -> bool {
+        match self {
+            Self::Derivatives { du, dv } => du.is_finite() && dv.is_finite(),
+            Self::Ring { .. } => true,
+            Self::NonFinite => false,
+        }
+    }
 }
 
 /// Where a block sits, so derivatives at shared vertices can be taken in the owner's orientation.
@@ -99,8 +176,9 @@ pub(crate) struct Block<'a> {
     pub(crate) quads: u32,
 }
 
-/// `(du, dv)` at block vertex `(i, j)` of `grid`, in the owner's orientation. `corners[c]` holds
-/// block corner `c`'s axes when it is a base vertex.
+/// The [`Local`] axes at block vertex `(i, j)` of `grid`, in the owner's orientation: central
+/// differences, or the ring at a base vertex. `corners[c]` holds block corner `c`'s ring when it
+/// is a base vertex.
 #[expect(
     clippy::many_single_char_names,
     reason = "grid math keeps the conventions' names: n, c, (i, j) and the axes (u, v)"
@@ -108,16 +186,16 @@ pub(crate) struct Block<'a> {
 fn derivatives(
     block: &Block<'_>,
     grid: &Padded,
-    corners: &[Option<CornerAxes>; 4],
+    corners: &[Option<CornerAxes<'_>>; 4],
     i: i64,
     j: i64,
-) -> (Vec3, Vec3) {
+) -> Local {
     let n = block.face_quads;
     let (Ok(fi), Ok(fj)) = (
         u32::try_from(i64::from(block.x0) + i),
         u32::try_from(i64::from(block.y0) + j),
     ) else {
-        return (Vec3::NAN, Vec3::NAN);
+        return Local::NonFinite;
     };
     let on = |x: u32| x == 0 || x == n;
     if on(fi) && on(fj) {
@@ -130,9 +208,8 @@ fn derivatives(
         };
         return corners
             .get(c)
-            .copied()
-            .flatten()
-            .map_or((Vec3::NAN, Vec3::NAN), corner_derivatives);
+            .and_then(Option::as_ref)
+            .map_or(Local::NonFinite, CornerAxes::local);
     }
     let own = [(1, 0), (0, 1)];
     let [u, v] = if on(fi) || on(fj) {
@@ -146,65 +223,49 @@ fn derivatives(
     };
     let du = grid.get(i + u.0, j + u.1) - grid.get(i - u.0, j - u.1);
     let dv = grid.get(i + v.0, j + v.1) - grid.get(i - v.0, j - v.1);
-    (du, dv)
+    Local::Derivatives { du, dv }
 }
 
-/// One-sided derivatives at a base vertex, along the owner's two edges.
-fn corner_derivatives(c: CornerAxes) -> (Vec3, Vec3) {
-    let CornerAxes {
-        center: v,
-        e0,
-        e1,
-        owner_corner,
-    } = c;
-    debug_assert!(owner_corner < 4, "a corner index is 0–3");
-    match owner_corner & 3 {
-        0 => (e0 - v, e1 - v),
-        1 => (v - e1, e0 - v),
-        2 => (v - e0, v - e1),
-        _ => (e1 - v, v - e0),
-    }
-}
-
-/// `f(i, j, du, dv)` for every vertex of a block, row-major `(quads + 1)²`.
+/// `f(i, j, local)` for every vertex of a block, row-major `(quads + 1)²`.
 fn per_vertex<T>(
     block: &Block<'_>,
     grid: &Padded,
-    corners: &[Option<CornerAxes>; 4],
-    f: impl Fn(i64, i64, Vec3, Vec3) -> T,
+    corners: &[Option<CornerAxes<'_>>; 4],
+    f: impl Fn(i64, i64, Local) -> T,
 ) -> Vec<T> {
     let q = i64::from(block.quads);
     (0..=q)
         .flat_map(|j| (0..=q).map(move |i| (i, j)))
-        .map(|(i, j)| {
-            let (du, dv) = derivatives(block, grid, corners, i, j);
-            f(i, j, du, dv)
-        })
+        .map(|(i, j)| f(i, j, derivatives(block, grid, corners, i, j)))
         .collect()
 }
 
-/// Frames for every vertex of a predicted block, row-major `(quads + 1)²`.
+/// Frames for every vertex of a predicted block, row-major `(quads + 1)²`. `corners` holds the
+/// predicted rings at base-vertex block corners.
 pub(crate) fn frames(
     block: &Block<'_>,
     predicted: &Padded,
-    corners: &[Option<CornerAxes>; 4],
+    corners: &[Option<CornerAxes<'_>>; 4],
 ) -> Vec<Frame> {
-    per_vertex(block, predicted, corners, |i, j, du, dv| {
+    per_vertex(block, predicted, corners, |i, j, local| {
         debug_assert!(
-            du.is_finite() && dv.is_finite(),
-            "derivatives at ({i}, {j}) of {block:?} are not finite"
+            local.is_finite(),
+            "frame inputs at ({i}, {j}) of {block:?} are not finite"
         );
-        Frame::from_derivatives(du, dv)
+        Frame::from_local(local)
     })
 }
 
-/// The unit normal `du × dv`, with [`Frame::from_derivatives`]'s policy: the fallback frame's
-/// normal where finite derivatives are degenerate, NaN where either isn't finite.
-fn normal(du: Vec3, dv: Vec3) -> Vec3 {
-    if !(du.is_finite() && dv.is_finite()) {
-        return Vec3::NAN;
+/// The unit normal, with [`Frame::from_local`]'s policy: the fallback frame's normal where finite
+/// inputs are degenerate, NaN where any isn't finite.
+fn normal(local: Local) -> Vec3 {
+    match local {
+        Local::Derivatives { du, dv } if du.is_finite() && dv.is_finite() => du.cross(dv),
+        Local::Ring { normal, .. } => normal,
+        Local::Derivatives { .. } | Local::NonFinite => return Vec3::NAN,
     }
-    du.cross(dv).normalized().unwrap_or(Frame::FALLBACK.n)
+    .normalized()
+    .unwrap_or(Frame::FALLBACK.n)
 }
 
 /// Unit normals for every vertex of a block of evaluated positions, row-major `(quads + 1)²`.
@@ -212,9 +273,9 @@ fn normal(du: Vec3, dv: Vec3) -> Vec3 {
 pub(crate) fn normals(
     block: &Block<'_>,
     positions: &Padded,
-    corners: &[Option<CornerAxes>; 4],
+    corners: &[Option<CornerAxes<'_>>; 4],
 ) -> Vec<Vec3> {
-    per_vertex(block, positions, corners, |_, _, du, dv| normal(du, dv))
+    per_vertex(block, positions, corners, |_, _, local| normal(local))
 }
 
 #[cfg(test)]
@@ -255,20 +316,80 @@ mod tests {
     #[test]
     fn normals_follow_the_frame_policy() {
         let (du, dv) = (Vec3::new(2.0, 0.1, 0.0), Vec3::new(0.0, 3.0, 0.2));
+        let local = |a, b| Local::Derivatives { du: a, dv: b };
         assert_eq!(
-            normal(du, dv),
+            normal(local(du, dv)),
             Frame::from_derivatives(du, dv).n,
             "same normal as the frame"
         );
         assert_eq!(
-            normal(Vec3::ZERO, dv),
+            normal(local(Vec3::ZERO, dv)),
             Frame::FALLBACK.n,
             "degenerate: fallback"
         );
         assert!(
-            !normal(Vec3::NAN, dv).is_finite(),
+            !normal(local(Vec3::NAN, dv)).is_finite(),
             "non-finite: NaN, not the fallback"
         );
+    }
+
+    /// A valence-3 ring around the origin, in the z = 0 plane, counter-clockwise from +x.
+    fn flat_ring() -> [Vec3; 3] {
+        [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-0.5, 0.8, 0.0),
+            Vec3::new(-0.5, -0.8, 0.0),
+        ]
+    }
+
+    #[test]
+    fn ring_frames_take_the_ring_normal_and_the_owners_first_edge() {
+        let points = flat_ring();
+        for (owner_corner, t) in [(0, 1.0), (2, -1.0)] {
+            let axes = CornerAxes {
+                center: Vec3::ZERO,
+                points: &points,
+                owner_corner,
+            };
+            let f = Frame::from_local(axes.local());
+            assert_eq!(f.n, Vec3::new(0.0, 0.0, 1.0), "corner {owner_corner}: n");
+            assert_eq!(f.t, Vec3::new(t, 0.0, 0.0), "corner {owner_corner}: t");
+            assert_eq!(normal(axes.local()), f.n, "corner {owner_corner}: normal");
+        }
+    }
+
+    #[test]
+    fn ring_frames_follow_the_frame_policy() {
+        let points = flat_ring();
+        let collapsed = [Vec3::ZERO; 3];
+        let degenerate = CornerAxes {
+            center: Vec3::ZERO,
+            points: &collapsed,
+            owner_corner: 0,
+        };
+        assert_eq!(
+            Frame::from_local(degenerate.local()),
+            Frame::FALLBACK,
+            "degenerate: fallback frame"
+        );
+        assert_eq!(
+            normal(degenerate.local()),
+            Frame::FALLBACK.n,
+            "degenerate: fallback normal"
+        );
+        let mut far = points;
+        far[2] = Vec3::NAN;
+        let nan = CornerAxes {
+            center: Vec3::ZERO,
+            points: &far,
+            owner_corner: 0,
+        };
+        assert_eq!(nan.local(), Local::NonFinite, "a NaN anywhere in the ring");
+        assert!(
+            !Frame::from_local(nan.local()).n.is_finite(),
+            "NaN frame, not the fallback"
+        );
+        assert!(!normal(nan.local()).is_finite(), "NaN normal");
     }
 
     #[test]
