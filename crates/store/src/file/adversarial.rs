@@ -103,19 +103,22 @@ fn a_huge_stated_size_never_stops_recovery() {
     payload[at..at + 4].copy_from_slice(&(1u32 << 30).to_le_bytes());
     f.append_raw(KIND_TILE, &payload).unwrap();
     f.write_displacement(key(3), op(3), &tile(3.0)).unwrap();
-    let saved = f.len();
     // Before a save point, the record is stepped over; after the last one, it is discarded
     // with the rest of the tail, and the walk over the tail steps over it too.
-    f.save().unwrap();
+    let point = f.save().unwrap();
     let len = f.len();
     f.append_raw(KIND_TILE, &payload).unwrap();
     drop(f);
-    assert!(saved < len, "the save point follows the record");
     let opened = ProjectFile::open(&path).unwrap();
+    assert_eq!(
+        opened.save_points().unwrap().last(),
+        Some(&point),
+        "recovery reaches the save point after the record"
+    );
     assert_eq!(
         opened.keys().copied().collect::<Vec<_>>(),
         vec![key(1), key(3)],
-        "skipped, and recovery reaches the save point after it"
+        "skipped, and the tiles before and after it are read"
     );
     assert_eq!(opened.len(), len, "the record after the save point cut off");
 }

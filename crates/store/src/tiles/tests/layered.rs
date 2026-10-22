@@ -301,7 +301,7 @@ fn a_stale_save_or_another_mesh_is_refused() {
         matches!(foreign, Err(CacheError::MeshMismatch)),
         "another mesh's working file: {foreign:?}"
     );
-    // The save is still good; a rebase on it goes through.
+    // The refused rebase took its save; a new save, and a rebase on it, go through.
     drop(save_and_rebase(&mut store, &mut project, &dir, "r4.bcrf"));
     assert_positions(&mut store, &dense(&mesh, &map), &all, "rebased");
     drop(store);
@@ -589,6 +589,95 @@ fn a_tile_lost_to_a_save_does_not_block_the_saves_after_it() {
     let file = ProjectFile::open(&dir.path("p.bcrf")).unwrap();
     let mut reopened = TileStore::open(file, roomy()).unwrap();
     assert_positions(&mut reopened, &dense(&mesh, &want), &all, "saved after");
+}
+
+/// A store with `edits` made over a saved project, written to its working file: what the
+/// broken invariants below are made from. Returns the project file and the store.
+fn edited_over_a_save(dir: &TestDir, mesh: &Arc<BaseMesh>) -> (ProjectFile, TileStore) {
+    let mut map = CorrectionMap::new();
+    let project = saved_project(
+        dir,
+        "p.bcrf",
+        mesh,
+        &mut map,
+        &random_edits(mesh, 3, 20, 81),
+    );
+    let working = recovery(dir, "r1.bcrf", &project);
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), roomy()).unwrap();
+    apply(&mut store, &mut map, &random_edits(mesh, 3, 20, 82));
+    store.save().unwrap();
+    store.evict_all().unwrap();
+    (project, store)
+}
+
+#[test]
+fn a_tile_of_the_recovery_file_left_out_of_a_save_is_not_in_the_save() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut project, mut store) = edited_over_a_save(&dir, &mesh);
+    store.drain_saves();
+    let left_out = *store.since_rebase.first().unwrap();
+    store.since_rebase.remove(&left_out);
+    let saved = store.save_into(&mut project);
+    assert!(
+        matches!(
+            saved,
+            Err(CacheError::Internal(Invariant::NotInSave(key))) if key == left_out
+        ),
+        "{saved:?}"
+    );
+}
+
+#[test]
+fn a_rebase_onto_a_save_without_an_edited_tile_is_refused() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut project, mut store) = edited_over_a_save(&dir, &mesh);
+    let saved = store.save_into(&mut project).unwrap();
+    // A tile neither saved nor lost: one of the next level, never edited.
+    let unsaved = tiles(&mesh, 4, 4)[0];
+    store.since_rebase.insert(unsaved);
+    let len = store.working_len();
+    let refused = store.rebase(saved, recovery(&dir, "r2.bcrf", &project));
+    assert!(
+        matches!(
+            refused,
+            Err(CacheError::Internal(Invariant::NotInSave(key))) if key == unsaved
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(store.working_len(), len, "still on the old working file");
+}
+
+#[test]
+fn an_edited_tile_with_nothing_to_copy_is_nothing_to_save() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut project, mut store) = edited_over_a_save(&dir, &mesh);
+    // Listed as edited, but neither dirty nor in the working file.
+    let nowhere = tiles(&mesh, 4, 4)[0];
+    store.since_rebase.insert(nowhere);
+    let saved = store.save_into(&mut project);
+    assert!(
+        matches!(
+            saved,
+            Err(CacheError::Internal(Invariant::NothingToSave(key))) if key == nowhere
+        ),
+        "{saved:?}"
+    );
+}
+
+#[test]
+fn a_project_file_with_no_save_point_is_not_saved() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let never =
+        ProjectFile::create(&dir.path("never.bcrf"), meta_for(&mesh), Arc::clone(&mesh)).unwrap();
+    let base = saved_base(&never);
+    assert!(
+        matches!(base, Err(CacheError::Internal(Invariant::NotSaved))),
+        "{base:?}"
+    );
 }
 
 #[test]

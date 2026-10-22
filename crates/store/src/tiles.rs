@@ -743,6 +743,19 @@ pub(crate) struct Filled {
     stamp: Stamp,
 }
 
+/// `project` as of the save point a save has just written to it.
+///
+/// # Errors
+///
+/// [`CacheError::Save`] if the save point can't be read; [`CacheError::Internal`] with
+/// [`Invariant::NotSaved`] if `project` has none, which a save that went through rules out.
+fn saved_base(project: &ProjectFile) -> Result<BaseFile, CacheError> {
+    project
+        .base()
+        .map_err(CacheError::Save)?
+        .ok_or_else(|| Invariant::NotSaved.into())
+}
+
 /// Checks that a working file with `working`'s meta may be layered on `base`.
 ///
 /// Over a base, the working file must be a recovery file of the base's project naming the
@@ -977,10 +990,7 @@ impl TileStore {
             return Err(Invariant::NotInSave(*missing).into());
         }
         project.save().map_err(CacheError::Save)?;
-        let base = project
-            .base()
-            .map_err(CacheError::Save)?
-            .ok_or(Invariant::NotSaved)?;
+        let base = saved_base(project)?;
         Ok(Saved {
             base,
             stamp: self.last_write,
