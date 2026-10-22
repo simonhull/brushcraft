@@ -5,21 +5,22 @@ use std::collections::HashMap;
 use crate::mesh::fit;
 use crate::{BaseMesh, MeshError, Vec3};
 
-/// Largest `splits` whose lattice coordinates (`|x| ≤ splits`) fit an `i16`, and so convert to
-/// `f32` exactly.
-const MAX_SPLITS: u32 = 16383;
+/// Largest `splits` whose `6·splits²` faces fit 32-bit ids (6 · 26 754² = 4 294 659 096). Its
+/// lattice coordinates, `|x| ≤ splits`, then also fit an `i16`, so they convert to `f32` exactly.
+const MAX_SPLITS: u16 = 26_754;
 
 /// A cube with each side split `splits × splits`, projected onto the unit sphere: `6·splits²`
 /// quads, all outward-facing. Corners have valence 3, every other vertex valence 4.
 ///
 /// # Errors
 ///
-/// [`MeshError::Empty`] for `splits == 0`; [`MeshError::TooLarge`] for `splits` above 16383.
+/// [`MeshError::Empty`] for `splits == 0`; [`MeshError::TooLarge`] for `splits` above 26 754.
 pub fn cube_sphere(splits: u32) -> Result<BaseMesh, MeshError> {
-    if splits > MAX_SPLITS {
-        return Err(MeshError::TooLarge);
-    }
-    let half: i32 = fit(splits)?;
+    let half = u16::try_from(splits)
+        .ok()
+        .filter(|&s| s <= MAX_SPLITS)
+        .map(i32::from)
+        .ok_or(MeshError::TooLarge)?;
     // (normal, u, v) with u × v = normal, so quads in (u, v) order face outward.
     let sides: [([i32; 3], [i32; 3], [i32; 3]); 6] = [
         ([1, 0, 0], [0, 1, 0], [0, 0, 1]),
@@ -83,11 +84,37 @@ mod tests {
             2402,
             "Euler: V = F + 2 for a closed quad sphere"
         );
-        for v in 0..mesh.vertex_count() {
+        for v in mesh.vertices() {
             assert!(
                 (mesh.position(v).unwrap().length() - 1.0).abs() < 1e-6,
                 "on the sphere"
             );
         }
+    }
+
+    #[test]
+    fn every_face_points_outward() {
+        let mesh = cube_sphere(5).unwrap();
+        for f in mesh.faces() {
+            let [p0, p1, p2, p3] = [0, 1, 2, 3].map(|c| mesh.corner_position(f, c).unwrap());
+            let centroid = (p0 + p1 + p2 + p3) * 0.25;
+            let normal = (p1 - p0).cross(p3 - p0);
+            assert!(normal.dot(centroid) > 0.0, "face {f:?} points inward");
+        }
+    }
+
+    #[test]
+    fn rejects_sizes_past_32_bit_ids() {
+        assert_eq!(cube_sphere(0).unwrap_err(), MeshError::Empty, "no faces");
+        assert_eq!(
+            cube_sphere(26_755).unwrap_err(),
+            MeshError::TooLarge,
+            "6·26 755² faces overflow u32"
+        );
+        assert_eq!(
+            cube_sphere(u32::MAX).unwrap_err(),
+            MeshError::TooLarge,
+            "far too large"
+        );
     }
 }

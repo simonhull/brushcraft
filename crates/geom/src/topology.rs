@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::mesh::fit;
-use crate::{FaceId, Level, MeshError, TileKey};
+use crate::{FaceId, Level, MeshError, TileKey, VertexId};
 
 /// What lies across one edge of a face: the neighbour and the index of the same edge in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,15 +63,19 @@ impl Topology {
     ///
     /// # Errors
     ///
-    /// [`MeshError::DuplicateEdge`], [`MeshError::OpenEdge`], [`MeshError::IsolatedVertex`],
-    /// [`MeshError::NonManifoldVertex`] or [`MeshError::TooLarge`].
+    /// [`MeshError::DuplicateEdge`], [`MeshError::OpenEdge`], [`MeshError::VertexOutOfRange`],
+    /// [`MeshError::IsolatedVertex`], [`MeshError::NonManifoldVertex`],
+    /// [`MeshError::LowValence`] or [`MeshError::TooLarge`].
     pub(crate) fn build(faces: &[[u32; 4]], vertex_count: u32) -> Result<Self, MeshError> {
         let mut directed: HashMap<(u32, u32), (u32, u8)> = HashMap::with_capacity(faces.len() * 4);
         for (f, quad) in faces.iter().enumerate() {
             let f: u32 = fit(f)?;
             for (k, (a, b)) in (0u8..).zip(edges(quad)) {
                 if directed.insert((a, b), (f, k)).is_some() {
-                    return Err(MeshError::DuplicateEdge { from: a, to: b });
+                    return Err(MeshError::DuplicateEdge {
+                        from: VertexId::new(a),
+                        to: VertexId::new(b),
+                    });
                 }
             }
         }
@@ -83,9 +87,10 @@ impl Topology {
                     edge: 0,
                 }; 4];
                 for (slot, (a, b)) in out.iter_mut().zip(edges(quad)) {
-                    let &(g, m) = directed
-                        .get(&(b, a))
-                        .ok_or(MeshError::OpenEdge { from: a, to: b })?;
+                    let &(g, m) = directed.get(&(b, a)).ok_or_else(|| MeshError::OpenEdge {
+                        from: VertexId::new(a),
+                        to: VertexId::new(b),
+                    })?;
                     *slot = Across {
                         face: FaceId::new(g),
                         edge: m,
@@ -97,12 +102,18 @@ impl Topology {
 
         let vertices: usize = fit(vertex_count)?;
         let mut incident: Vec<Vec<(FaceId, u8)>> = vec![Vec::new(); vertices];
-        for (f, quad) in faces.iter().enumerate() {
-            let f = FaceId::new(fit(f)?);
-            for (c, v) in (0u8..).zip(quad) {
+        for (face, quad) in faces.iter().enumerate() {
+            let f = FaceId::new(fit(face)?);
+            for (c, &v) in (0u8..).zip(quad) {
+                // `BaseMesh::from_polygons` already checked the indices; this guards direct
+                // callers.
                 incident
-                    .get_mut(fit::<usize, _>(*v)?)
-                    .ok_or(MeshError::TooLarge)?
+                    .get_mut(fit::<usize, _>(v)?)
+                    .ok_or_else(|| MeshError::VertexOutOfRange {
+                        face,
+                        vertex: VertexId::new(v),
+                        count: vertices,
+                    })?
                     .push((f, c));
             }
         }
@@ -119,24 +130,31 @@ impl Topology {
 
     /// Number of faces.
     #[must_use]
-    pub fn face_count(&self) -> usize {
-        self.across.len()
+    pub fn face_count(&self) -> u32 {
+        // `build` checked that every face index fits a `u32`.
+        u32::try_from(self.across.len()).unwrap_or(u32::MAX)
     }
 
-    /// What lies across edge `k` of `face`, or `None` if `face` is not in this mesh.
+    /// Whether `face` is a face of this mesh.
+    #[must_use]
+    pub fn contains(&self, face: FaceId) -> bool {
+        face.index() < self.face_count()
+    }
+
+    /// What lies across edge `k` (0–3) of `face`, or `None` if either is out of range.
     pub(crate) fn across(&self, face: FaceId, k: u8) -> Option<Across> {
         self.across
             .get(usize::try_from(face.index()).ok()?)?
-            .get(usize::from(k & 3))
+            .get(usize::from(k))
             .copied()
     }
 
-    /// The ring around corner `corner` of `face`.
+    /// The ring around corner `corner` (0–3) of `face`, or `None` if either is out of range.
     pub(crate) fn ring(&self, face: FaceId, corner: u8) -> Option<&Ring> {
         let v = self
             .corner_vertex
             .get(usize::try_from(face.index()).ok()?)?
-            .get(usize::from(corner & 3))?;
+            .get(usize::from(corner))?;
         self.rings.get(usize::try_from(*v).ok()?)
     }
 
@@ -161,10 +179,11 @@ impl Topology {
         let n = i64::from(n);
         let inside = |x: i64| (0..=n).contains(&x);
         match (inside(i), inside(j)) {
-            (true, true) => {
-                self.across(face, 0)?;
-                Some((face, u32::try_from(i).ok()?, u32::try_from(j).ok()?))
-            }
+            (true, true) => self.contains(face).then_some((
+                face,
+                u32::try_from(i).ok()?,
+                u32::try_from(j).ok()?,
+            )),
             (false, false) => None,
             _ => {
                 let edge = if j < 0 {
@@ -249,8 +268,7 @@ impl Topology {
                 ),
             ]);
         }
-        self.across(face, 0)?;
-        Some(vec![(face, i, j)])
+        self.contains(face).then(|| vec![(face, i, j)])
     }
 }
 
@@ -265,9 +283,10 @@ fn edges(quad: &[u32; 4]) -> impl Iterator<Item = (u32, u32)> + '_ {
 ///
 /// # Errors
 ///
-/// [`MeshError::IsolatedVertex`] or [`MeshError::NonManifoldVertex`].
+/// [`MeshError::IsolatedVertex`], [`MeshError::NonManifoldVertex`] or [`MeshError::LowValence`].
 fn ring(across: &[[Across; 4]], v: u32, incident: &[(FaceId, u8)]) -> Result<Ring, MeshError> {
-    let &start = incident.first().ok_or(MeshError::IsolatedVertex(v))?;
+    let vertex = VertexId::new(v);
+    let &start = incident.first().ok_or(MeshError::IsolatedVertex(vertex))?;
     let mut entries = Vec::with_capacity(incident.len());
     let mut at = start;
     for _ in 0..incident.len() {
@@ -277,26 +296,32 @@ fn ring(across: &[[Across; 4]], v: u32, incident: &[(FaceId, u8)]) -> Result<Rin
             .ok()
             .and_then(|f| across.get(f))
             .and_then(|a| a.get(usize::from(incoming)))
-            .ok_or(MeshError::NonManifoldVertex(v))?;
+            .ok_or(MeshError::NonManifoldVertex(vertex))?;
         at = (next.face, next.edge);
         if at == start {
             break;
         }
     }
     if at != start || entries.len() != incident.len() {
-        return Err(MeshError::NonManifoldVertex(v));
+        return Err(MeshError::NonManifoldVertex(vertex));
+    }
+    if entries.len() < 3 {
+        return Err(MeshError::LowValence(vertex));
     }
     let owner = entries
         .iter()
         .enumerate()
         .min_by_key(|(_, (f, _))| *f)
         .map_or(0, |(k, _)| k);
+    // `incident` is filled in face order, so the walk already starts at the owner and this is a
+    // no-op today; it keeps the canonical order independent of how `incident` was built.
     entries.rotate_left(owner);
     Ok(Ring { entries })
 }
 
 /// Grid position of edge parameters `(s, d)` on edge `k` of a face with `n` quads per side.
 pub(crate) const fn edge_to_grid(k: u8, n: i64, s: i64, d: i64) -> (i64, i64) {
+    debug_assert!(k < 4, "an edge index is 0–3");
     match k & 3 {
         0 => (s, d),
         1 => (n - d, s),
@@ -307,6 +332,7 @@ pub(crate) const fn edge_to_grid(k: u8, n: i64, s: i64, d: i64) -> (i64, i64) {
 
 /// Edge parameters `(s, d)` of grid position `(i, j)` relative to edge `k`.
 pub(crate) const fn grid_to_edge(k: u8, n: i64, i: i64, j: i64) -> (i64, i64) {
+    debug_assert!(k < 4, "an edge index is 0–3");
     match k & 3 {
         0 => (i, j),
         1 => (j, n - i),
@@ -317,6 +343,7 @@ pub(crate) const fn grid_to_edge(k: u8, n: i64, i: i64, j: i64) -> (i64, i64) {
 
 /// Grid position of corner `c`.
 pub(crate) const fn corner_coords(c: u8, n: i64) -> (i64, i64) {
+    debug_assert!(c < 4, "a corner index is 0–3");
     match c & 3 {
         0 => (0, 0),
         1 => (n, 0),
@@ -355,6 +382,7 @@ pub(crate) const fn border_edge(i: u32, j: u32, n: u32) -> u8 {
     expect(dead_code, reason = "used by owner-oriented frames (M0a Task 7)")
 )]
 pub(crate) const fn owner_axes(k: u8, m: u8) -> [(i64, i64); 2] {
+    debug_assert!(k < 4 && m < 4, "edge indices are 0–3");
     // The neighbour's +i and +j as (Δs', Δd') along its edge m.
     let (u_s, u_d) = match m & 3 {
         0 => (1, 0),
@@ -378,6 +406,7 @@ pub(crate) const fn owner_axes(k: u8, m: u8) -> [(i64, i64); 2] {
     expect(dead_code, reason = "used by owner-oriented frames (M0a Task 7)")
 )]
 const fn edge_step(k: u8, ds: i64, dd: i64) -> (i64, i64) {
+    debug_assert!(k < 4, "an edge index is 0–3");
     match k & 3 {
         0 => (ds, dd),
         1 => (-dd, ds),
@@ -416,7 +445,7 @@ fn tile_copies(level: Level, i: u32, j: u32) -> impl Iterator<Item = (u16, u16, 
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use super::*;
-    use crate::{FaceId, Level, cube_sphere};
+    use crate::{BaseMesh, FaceId, Level, cube_sphere};
 
     /// Whether two face-grid positions name the same vertex. A vertex on a face border has one name
     /// per face holding it, so positions are compared through their twins, never as tuples.
@@ -434,8 +463,33 @@ mod tests {
         }
     }
 
+    /// Where face-grid point `(i, j)` of `face` lies on the bilinear patch through its corners.
+    ///
+    /// An `f64` oracle independent of the edge maps: two names of one vertex land on the same
+    /// point (within rounding), because adjacent faces share their edge's two corners.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "grid math keeps the conventions' names: n, (i, j) and (u, v)"
+    )]
+    fn bilinear(mesh: &BaseMesh, n: u32, face: FaceId, i: u32, j: u32) -> [f64; 3] {
+        let corner = |c: u8| {
+            let p = mesh.corner_position(face, c).unwrap();
+            [p.x, p.y, p.z].map(f64::from)
+        };
+        let (u, v) = (f64::from(i) / f64::from(n), f64::from(j) / f64::from(n));
+        let weights = [(1.0 - u) * (1.0 - v), u * (1.0 - v), u * v, (1.0 - u) * v];
+        (0u8..).zip(weights).fold([0.0; 3], |acc, (c, w)| {
+            let p = corner(c);
+            [acc[0] + w * p[0], acc[1] + w * p[1], acc[2] + w * p[2]]
+        })
+    }
+
+    fn same_point(a: [f64; 3], b: [f64; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-12)
+    }
+
     #[test]
-    fn locate_crosses_edges_and_comes_back() {
+    fn locate_lands_one_step_inside_the_neighbour() {
         let mesh = cube_sphere(2).unwrap();
         let t = mesh.topology();
         let n = 8;
@@ -445,22 +499,26 @@ mod tests {
                     .locate(face, n, i, j)
                     .expect("one step out lands in a neighbour");
                 assert_ne!(g, face, "a different face");
-                // One step back from the located vertex must reach f's border (f is one of its
-                // faces).
-                let back = (-1i64..=1)
-                    .flat_map(|di| (-1i64..=1).map(move |dj| (di, dj)))
-                    .filter(|(di, dj)| (di + dj).abs() == 1)
-                    .filter_map(|(di, dj)| t.locate(g, n, i64::from(gi) + di, i64::from(gj) + dj))
-                    .filter(|&(h, hi, hj)| {
-                        t.face_twins(h, n, hi, hj)
-                            .unwrap()
-                            .iter()
-                            .any(|(f, _, _)| *f == face)
-                    })
-                    .count();
+                // The point on f's border that (i, j) steps out from.
+                let clamp = |x: i64| u32::try_from(x.clamp(0, i64::from(n))).unwrap();
+                let border = bilinear(&mesh, n, face, clamp(i), clamp(j));
+                let located = bilinear(&mesh, n, g, gi, gj);
                 assert!(
-                    back > 0,
-                    "a neighbour of the located vertex is back on {face:?}"
+                    !same_point(located, border),
+                    "{face:?} ({i}, {j}): not on the shared edge"
+                );
+                // Exactly one grid step back from the located vertex reaches that border point.
+                let back = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                    .into_iter()
+                    .filter_map(|(di, dj)| {
+                        Some((gi.checked_add_signed(di)?, gj.checked_add_signed(dj)?))
+                    })
+                    .filter(|&(hi, hj)| hi <= n && hj <= n)
+                    .filter(|&(hi, hj)| same_point(bilinear(&mesh, n, g, hi, hj), border))
+                    .count();
+                assert_eq!(
+                    back, 1,
+                    "{face:?} ({i}, {j}) → {g:?} ({gi}, {gj}): one step back to f's border"
                 );
             }
             assert_eq!(
@@ -476,32 +534,47 @@ mod tests {
         let mesh = cube_sphere(1).unwrap();
         let t = mesh.topology();
         let level = Level::new(7).unwrap(); // 2×2 tiles of 64 per face
-        let face = FaceId::new(0);
-        assert_eq!(t.copies(face, level, 30, 40).len(), 1, "interior: one copy");
-        assert_eq!(
-            t.copies(face, level, 64, 40).len(),
-            2,
-            "tile border inside a face: two tiles"
+        let (n, tq) = (level.face_quads(), level.tile_quads());
+        let cases = [
+            ((30, 40), 1, "interior: one copy"),
+            ((64, 40), 2, "tile border inside a face: two tiles"),
+            ((64, 64), 4, "tile corner: four tiles"),
+            ((0, 40), 2, "face edge: two faces"),
+            ((0, 64), 4, "face edge on a tile border: 2 faces × 2 tiles"),
+            (
+                (128, 64),
+                4,
+                "far face edge on a tile border: 2 faces × 2 tiles",
+            ),
+            ((0, 0), 3, "cube corner: valence 3"),
+            ((128, 128), 3, "far cube corner: valence 3"),
+        ];
+        for face in mesh.faces() {
+            for ((i, j), count, what) in cases {
+                let want = bilinear(&mesh, n, face, i, j);
+                let copies = t.copies(face, level, i, j);
+                assert_eq!(copies.len(), count, "{face:?} ({i}, {j}): {what}");
+                let mut tiles: Vec<_> = copies.iter().map(|c| (c.face, c.tx, c.ty)).collect();
+                tiles.sort_unstable();
+                tiles.dedup();
+                assert_eq!(tiles.len(), count, "{face:?} ({i}, {j}): one copy per tile");
+                for c in &copies {
+                    assert!(c.i <= tq && c.j <= tq, "{c:?}: inside its tile");
+                    let (fi, fj) = (u32::from(c.tx) * tq + c.i, u32::from(c.ty) * tq + c.j);
+                    assert!(
+                        same_point(bilinear(&mesh, n, c.face, fi, fj), want),
+                        "{face:?} ({i}, {j}): {c:?} is a different point ({what})"
+                    );
+                }
+            }
+        }
+        assert!(
+            t.copies(FaceId::new(0), level, 129, 0).is_empty(),
+            "outside the face"
         );
-        assert_eq!(
-            t.copies(face, level, 64, 64).len(),
-            4,
-            "tile corner: four tiles"
-        );
-        assert_eq!(
-            t.copies(face, level, 0, 40).len(),
-            2,
-            "face edge: two faces"
-        );
-        assert_eq!(
-            t.copies(face, level, 0, 64).len(),
-            4,
-            "face edge on a tile border: 2 faces × 2 tiles"
-        );
-        assert_eq!(
-            t.copies(face, level, 0, 0).len(),
-            3,
-            "cube corner: valence 3"
+        assert!(
+            t.copies(FaceId::new(6), level, 1, 1).is_empty(),
+            "not a face of this mesh"
         );
     }
 

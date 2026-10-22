@@ -11,6 +11,30 @@ pub const MAX_LEVEL: u8 = 12;
 /// Levels up to this one keep a face's whole grid in one tile.
 const WHOLE_FACE_LEVEL: u8 = 6;
 
+/// A base-mesh vertex, by its index in the position list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VertexId(u32);
+
+impl VertexId {
+    /// The vertex at `index` in the base mesh's position list.
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    /// Its index in the base mesh's position list.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for VertexId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A base-mesh face, by its index in the face list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FaceId(u32);

@@ -140,23 +140,22 @@ impl Poly {
         BaseMesh::from_polygons(positions, &faces).unwrap()
     }
 
-    /// A base mesh as a polygon mesh. Vertices are matched by position, so `mesh` must not have two
-    /// vertices at the same place.
+    /// A base mesh as a polygon mesh, with the same vertex and face numbering.
     pub(crate) fn from_base_mesh(mesh: &BaseMesh) -> Self {
-        let points: Vec<Vec3> = (0..mesh.vertex_count())
-            .map(|v| mesh.position(v).unwrap())
-            .collect();
-        let positions = points
-            .iter()
-            .map(|p| [f64::from(p.x), f64::from(p.y), f64::from(p.z)])
+        let positions = mesh
+            .vertices()
+            .map(|v| {
+                let p = mesh.position(v).unwrap();
+                [f64::from(p.x), f64::from(p.y), f64::from(p.z)]
+            })
             .collect();
         let faces = mesh
             .faces()
             .map(|f| {
                 (0..4)
                     .map(|c| {
-                        let p = mesh.corner_position(f, c).unwrap();
-                        points.iter().position(|&q| q == p).unwrap()
+                        let v = mesh.corner_vertex(f, c).unwrap();
+                        usize::try_from(v.index()).unwrap()
                     })
                     .collect()
             })
@@ -223,9 +222,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cube_corner_moves_to_five_ninths() {
-        // Textbook value: (Q + 2R) / 3 = ((1/3) + 2·(2/3)) / 3 = 5/9 per coordinate.
+    /// The cube `[−1, 1]³`, faces outward.
+    fn textbook_cube() -> Poly {
         let positions = vec![
             [-1.0, -1.0, -1.0],
             [1.0, -1.0, -1.0],
@@ -246,13 +244,60 @@ mod tests {
         ]
         .map(Vec::from)
         .to_vec();
-        let once = Poly { positions, faces }.subdivide();
+        Poly { positions, faces }
+    }
+
+    #[test]
+    fn cube_corner_moves_to_five_ninths() {
+        // Textbook value: (Q + 2R) / 3 = ((1/3) + 2·(2/3)) / 3 = 5/9 per coordinate.
+        let once = textbook_cube().subdivide();
         for (got, want) in once.positions[6].iter().zip([5.0 / 9.0; 3]) {
             assert!(
                 (got - want).abs() < 1e-12,
                 "corner (1, 1, 1) moves to 5/9: got {got}"
             );
         }
+    }
+
+    #[test]
+    fn cube_edge_points_average_ends_and_face_centres() {
+        let cube = textbook_cube();
+        let once = cube.subdivide();
+        let centre = |f: &[usize]| {
+            f.iter()
+                .fold([0.0; 3], |s, &v| add(s, cube.positions[v]))
+                .map(|x| x / 4.0)
+        };
+        // Each undirected edge with its two faces, found here independently of `subdivide`.
+        let mut found = 0;
+        for (fi, f) in cube.faces.iter().enumerate() {
+            for k in 0..4 {
+                let (a, b) = (f[k], f[(k + 1) % 4]);
+                let other = cube
+                    .faces
+                    .iter()
+                    .enumerate()
+                    .find(|&(gi, g)| gi != fi && g.contains(&a) && g.contains(&b))
+                    .map(|(_, g)| g)
+                    .unwrap();
+                let want = add(
+                    add(cube.positions[a], cube.positions[b]),
+                    add(centre(f), centre(other)),
+                )
+                .map(|x| x / 4.0);
+                let matches = once
+                    .positions
+                    .iter()
+                    .filter(|p| p.iter().zip(want).all(|(x, y)| (x - y).abs() < 1e-12))
+                    .count();
+                assert_eq!(
+                    matches, 1,
+                    "edge {a}–{b}: one edge point at (a + b + F1 + F2) / 4"
+                );
+                found += 1;
+            }
+        }
+        assert_eq!(found, 24, "each of the 12 edges seen from both faces");
     }
 
     #[test]

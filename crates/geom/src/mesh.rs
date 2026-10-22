@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 use crate::topology::Topology;
-use crate::{FaceId, Vec3};
+use crate::{FaceId, Vec3, VertexId};
 
 /// A closed quad base mesh with its adjacency.
 #[derive(Debug, Clone)]
@@ -32,8 +32,8 @@ pub enum MeshError {
     VertexOutOfRange {
         /// Face index.
         face: usize,
-        /// The vertex index.
-        vertex: u32,
+        /// The vertex.
+        vertex: VertexId,
         /// Number of vertices.
         count: usize,
     },
@@ -45,16 +45,16 @@ pub enum MeshError {
     },
     /// A position is NaN or infinite.
     #[error("vertex {0} is not finite")]
-    NotFinite(usize),
+    NotFinite(VertexId),
     /// An edge is used twice in the same direction.
     #[error(
         "edge {from}→{to} is used twice in the same direction (non-manifold, or a flipped face)"
     )]
     DuplicateEdge {
         /// Start vertex.
-        from: u32,
+        from: VertexId,
         /// End vertex.
-        to: u32,
+        to: VertexId,
     },
     /// An edge has no face on its other side.
     #[error(
@@ -62,16 +62,23 @@ pub enum MeshError {
     )]
     OpenEdge {
         /// Start vertex.
-        from: u32,
+        from: VertexId,
         /// End vertex.
-        to: u32,
+        to: VertexId,
     },
     /// A vertex no face uses.
     #[error("vertex {0} is not on any face")]
-    IsolatedVertex(u32),
+    IsolatedVertex(VertexId),
     /// The faces around a vertex don't form one fan.
     #[error("the faces around vertex {0} don't form a single fan")]
-    NonManifoldVertex(u32),
+    NonManifoldVertex(VertexId),
+    /// A vertex with fewer than three faces around it, as in a two-quad pillow. Subdivision
+    /// stencils and tangent frames need valence 3 or more.
+    #[error("vertex {0} has fewer than three faces around it")]
+    LowValence(VertexId),
+    /// The faces are consistently oriented, but inward: the enclosed volume is not positive.
+    #[error("the mesh is inside out (its faces point inward) or encloses no volume")]
+    InsideOut,
     /// More faces or vertices than 32-bit ids hold.
     #[error("too many faces or vertices for 32-bit ids")]
     TooLarge,
@@ -93,8 +100,8 @@ impl BaseMesh {
     ///
     /// # Errors
     ///
-    /// Any [`MeshError`]: non-quads, bad indices, degenerate faces, non-finite positions, or a mesh
-    /// that is not closed, manifold and consistently oriented.
+    /// Any [`MeshError`]: non-quads, bad indices, degenerate faces, non-finite positions, low
+    /// valence, or a mesh that is not closed, manifold and consistently oriented outward.
     pub fn from_polygons<P: AsRef<[u32]>>(
         positions: Vec<Vec3>,
         polygons: &[P],
@@ -102,8 +109,12 @@ impl BaseMesh {
         if polygons.is_empty() {
             return Err(MeshError::Empty);
         }
-        if let Some(bad) = positions.iter().position(|p| !p.is_finite()) {
-            return Err(MeshError::NotFinite(bad));
+        let vertex_count: u32 = fit(positions.len())?;
+        if let Some(bad) = (0..vertex_count)
+            .zip(&positions)
+            .find_map(|(v, p)| (!p.is_finite()).then_some(v))
+        {
+            return Err(MeshError::NotFinite(VertexId::new(bad)));
         }
         let count = positions.len();
         let faces = polygons
@@ -117,13 +128,10 @@ impl BaseMesh {
                         sides: p.len(),
                     });
                 };
-                if let Some(&vertex) = quad
-                    .iter()
-                    .find(|&&v| usize::try_from(v).map_or(true, |v| v >= count))
-                {
+                if let Some(&vertex) = quad.iter().find(|&&v| v >= vertex_count) {
                     return Err(MeshError::VertexOutOfRange {
                         face,
-                        vertex,
+                        vertex: VertexId::new(vertex),
                         count,
                     });
                 }
@@ -140,13 +148,32 @@ impl BaseMesh {
             .collect::<Result<Vec<_>, _>>()?;
         // Face ids are `u32`, so the face count must fit one too; `face_count` relies on it.
         fit::<u32, _>(faces.len())?;
-        let vertex_count = fit(count)?;
         let topology = Topology::build(&faces, vertex_count)?;
-        Ok(Self {
+        let mesh = Self {
             positions,
             faces,
             topology,
-        })
+        };
+        if mesh.signed_volume() <= 0.0 {
+            return Err(MeshError::InsideOut);
+        }
+        Ok(mesh)
+    }
+
+    /// Six times the enclosed volume, in `f64`: positive when the faces point outward. Each quad
+    /// contributes the two triangles `(p0, p1, p2)` and `(p0, p2, p3)` as tetrahedra with the
+    /// origin.
+    fn signed_volume(&self) -> f64 {
+        let wide = |p: Vec3| [f64::from(p.x), f64::from(p.y), f64::from(p.z)];
+        let triple = |[ax, ay, az]: [f64; 3], [bx, by, bz]: [f64; 3], [cx, cy, cz]: [f64; 3]| {
+            ax * (by * cz - bz * cy) + ay * (bz * cx - bx * cz) + az * (bx * cy - by * cx)
+        };
+        self.faces()
+            .filter_map(|f| {
+                let [p0, p1, p2, p3] = [0, 1, 2, 3].map(|c| self.corner_position(f, c).map(wide));
+                Some(triple(p0?, p1?, p2?) + triple(p0?, p2?, p3?))
+            })
+            .sum()
     }
 
     /// Number of faces.
@@ -168,17 +195,30 @@ impl BaseMesh {
         (0..self.face_count()).map(FaceId::new)
     }
 
-    /// A vertex's position.
-    #[must_use]
-    pub fn position(&self, vertex: u32) -> Option<Vec3> {
-        self.positions.get(usize::try_from(vertex).ok()?).copied()
+    /// Every vertex id.
+    pub fn vertices(&self) -> impl Iterator<Item = VertexId> {
+        (0..self.vertex_count()).map(VertexId::new)
     }
 
-    /// The position of corner `corner` of `face`.
+    /// A vertex's position, or `None` if `vertex` is not in this mesh.
+    #[must_use]
+    pub fn position(&self, vertex: VertexId) -> Option<Vec3> {
+        self.positions
+            .get(usize::try_from(vertex.index()).ok()?)
+            .copied()
+    }
+
+    /// The vertex at corner `corner` (0–3) of `face`, or `None` if either is out of range.
+    #[must_use]
+    pub fn corner_vertex(&self, face: FaceId, corner: u8) -> Option<VertexId> {
+        let quad = self.faces.get(usize::try_from(face.index()).ok()?)?;
+        quad.get(usize::from(corner)).copied().map(VertexId::new)
+    }
+
+    /// The position of corner `corner` (0–3) of `face`, or `None` if either is out of range.
     #[must_use]
     pub fn corner_position(&self, face: FaceId, corner: u8) -> Option<Vec3> {
-        let quad = self.faces.get(usize::try_from(face.index()).ok()?)?;
-        self.position(*quad.get(usize::from(corner & 3))?)
+        self.position(self.corner_vertex(face, corner)?)
     }
 
     /// Adjacency.
@@ -192,6 +232,8 @@ impl BaseMesh {
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use super::*;
+    use crate::cube_sphere;
+    use crate::topology::Across;
 
     fn unit_cube() -> (Vec<Vec3>, Vec<[u32; 4]>) {
         let p = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
@@ -265,5 +307,155 @@ mod tests {
             ),
             "repeated vertex"
         );
+    }
+
+    #[test]
+    fn rejects_an_inside_out_mesh() {
+        let (v, mut f) = unit_cube();
+        for quad in &mut f {
+            quad.reverse();
+        }
+        assert_eq!(
+            BaseMesh::from_polygons(v, &f).unwrap_err(),
+            MeshError::InsideOut,
+            "all faces reversed"
+        );
+    }
+
+    #[test]
+    fn rejects_a_two_quad_pillow() {
+        let (v, _) = unit_cube();
+        let pillow = [[0u32, 1, 2, 3], [3, 2, 1, 0]];
+        assert!(
+            matches!(
+                BaseMesh::from_polygons(v[..4].to_vec(), &pillow),
+                Err(MeshError::LowValence(_))
+            ),
+            "valence-2 vertices"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_indices_positions_and_connectivity() {
+        let (v, f) = unit_cube();
+        assert_eq!(
+            BaseMesh::from_polygons(v.clone(), &[[0u32; 4]; 0]).unwrap_err(),
+            MeshError::Empty,
+            "no faces"
+        );
+
+        let mut out_of_range = f.clone();
+        out_of_range[1] = [4, 5, 6, 8];
+        assert_eq!(
+            BaseMesh::from_polygons(v.clone(), &out_of_range).unwrap_err(),
+            MeshError::VertexOutOfRange {
+                face: 1,
+                vertex: VertexId::new(8),
+                count: 8
+            },
+            "vertex 8 of 8"
+        );
+
+        let mut nan = v.clone();
+        nan[5] = Vec3::NAN;
+        assert_eq!(
+            BaseMesh::from_polygons(nan, &f).unwrap_err(),
+            MeshError::NotFinite(VertexId::new(5)),
+            "NaN position"
+        );
+
+        let mut extra = v.clone();
+        extra.push(Vec3::ZERO);
+        assert_eq!(
+            BaseMesh::from_polygons(extra, &f).unwrap_err(),
+            MeshError::IsolatedVertex(VertexId::new(8)),
+            "unused vertex"
+        );
+
+        // Two cubes touching at one vertex: cube B's corner 0 is cube A's corner 6.
+        let mut pinched = v.clone();
+        pinched.extend(v.iter().skip(1).map(|&p| p + Vec3::new(2.0, 2.0, 2.0)));
+        let b = |k: u32| if k == 0 { 6 } else { k + 7 };
+        let mut faces = f.clone();
+        faces.extend(f.iter().map(|q| q.map(b)));
+        assert_eq!(
+            BaseMesh::from_polygons(pinched, &faces).unwrap_err(),
+            MeshError::NonManifoldVertex(VertexId::new(6)),
+            "two fans at one vertex"
+        );
+
+        // A third face on edge 0→3, which face 0 already uses in that direction.
+        let mut fin = v;
+        fin.extend([Vec3::new(-2.0, -1.0, -2.0), Vec3::new(-2.0, 1.0, -2.0)]);
+        let mut finned = f;
+        finned.push([0, 3, 9, 8]);
+        assert!(
+            matches!(
+                BaseMesh::from_polygons(fin, &finned),
+                Err(MeshError::DuplicateEdge { .. })
+            ),
+            "three faces on one edge"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_corners() {
+        let (v, f) = unit_cube();
+        let mesh = BaseMesh::from_polygons(v, &f).unwrap();
+        let face = FaceId::new(0);
+        assert!(mesh.corner_position(face, 3).is_some(), "corner 3 exists");
+        assert_eq!(mesh.corner_position(face, 4), None, "no corner 4");
+        assert_eq!(mesh.corner_position(FaceId::new(6), 0), None, "no face 6");
+        assert!(
+            mesh.topology().ring(face, 4).is_none(),
+            "no ring at corner 4"
+        );
+        assert_eq!(mesh.topology().across(face, 4), None, "no edge 4");
+    }
+
+    /// Checks every ring of `mesh`: it starts at its lowest face id, steps across each entry's
+    /// incoming edge to the next (cyclically), and every entry's corner is the ring's vertex.
+    fn assert_rings_are_canonical(mesh: &BaseMesh) {
+        let t = mesh.topology();
+        for face in mesh.faces() {
+            for corner in 0..4 {
+                let vertex = mesh.corner_vertex(face, corner).unwrap();
+                let ring = &t.ring(face, corner).unwrap().entries;
+                let lowest = ring.iter().map(|&(g, _)| g).min().unwrap();
+                assert_eq!(
+                    ring[0].0, lowest,
+                    "ring of vertex {vertex} starts at its owner"
+                );
+                assert!(
+                    ring.contains(&(face, corner)),
+                    "ring of vertex {vertex} holds ({face:?}, {corner})"
+                );
+                for (k, &(f, c)) in ring.iter().enumerate() {
+                    let (g, m) = ring[(k + 1) % ring.len()];
+                    assert_eq!(
+                        t.across(f, (c + 3) & 3),
+                        Some(Across { face: g, edge: m }),
+                        "vertex {vertex}: ({f:?}, {c}) steps to ({g:?}, {m})"
+                    );
+                    assert_eq!(
+                        mesh.corner_vertex(g, m),
+                        Some(vertex),
+                        "entry ({g:?}, {m}) is at vertex {vertex}"
+                    );
+                    assert_eq!(
+                        mesh.corner_position(g, m),
+                        mesh.position(vertex),
+                        "entry ({g:?}, {m}) is at vertex {vertex}'s position"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rings_start_at_the_owner_and_walk_across_incoming_edges() {
+        let (v, f) = unit_cube();
+        assert_rings_are_canonical(&BaseMesh::from_polygons(v, &f).unwrap());
+        assert_rings_are_canonical(&cube_sphere(3).unwrap());
     }
 }
