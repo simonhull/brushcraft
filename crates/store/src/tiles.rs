@@ -47,6 +47,8 @@
 //! An edit pins correction slots only, at most one cone width of them, which the minimum's
 //! correction chunks hold once every evaluated chunk is taken back.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
@@ -252,6 +254,15 @@ struct EvalLog {
     file_reads: Vec<TileKey>,
     /// Prefetched correction tiles installed.
     prefetched: usize,
+    /// Parent lists read back from the dependency graph. (Counted through `&self`, as the
+    /// lists are looked up, hence the cells.)
+    parents_reused: Cell<usize>,
+    /// Parent lists listed with `parent_tiles`.
+    parents_listed: Cell<usize>,
+    /// Normal input lists read back from the dependency graph.
+    normal_inputs_reused: Cell<usize>,
+    /// Normal input lists listed with `normal_tiles`.
+    normal_inputs_listed: Cell<usize>,
 }
 
 /// A project held out of core: the base mesh, the working file, budgeted pools of correction and
@@ -1107,17 +1118,55 @@ impl TileStore {
         matches!(self.evaluated.lookup(key), Some((_, Freshness::Fresh)))
     }
 
-    /// The tiles `key`'s positions are predicted from, level 0 (the mesh) left out, in key order.
+    /// The tiles `key`'s positions are predicted from, level 0 (the mesh) left out, in key order:
+    /// as the dependency graph recorded them if `key` still has a node, else from
+    /// [`parent_tiles`].
     ///
     /// # Errors
     ///
     /// [`CacheError::Eval`] (not for a valid key).
     fn parents_of(&self, key: TileKey) -> Result<Vec<TileKey>, CacheError> {
+        if let Some(parents) = self.deps.parents(&key) {
+            #[cfg(test)]
+            self.log
+                .parents_reused
+                .set(self.log.parents_reused.get() + 1);
+            return Ok(parents.to_vec());
+        }
+        #[cfg(test)]
+        self.log
+            .parents_listed
+            .set(self.log.parents_listed.get() + 1);
         let parents = parent_tiles(&self.mesh, Region::of_tile(&key))?;
         Ok(parents
             .into_iter()
             .filter(|parent| parent.level() != Level::ZERO)
             .collect())
+    }
+
+    /// The tiles `key`'s normals are computed from, the tile itself included: as the dependency
+    /// graph recorded them if `key` still has a node that lists them, else from
+    /// [`normal_tiles`].
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] (not for a valid key).
+    fn normal_inputs_of(&self, key: TileKey) -> Result<BTreeSet<TileKey>, CacheError> {
+        if let Some(inputs) = self.deps.normal_inputs(&key) {
+            #[cfg(test)]
+            self.log
+                .normal_inputs_reused
+                .set(self.log.normal_inputs_reused.get() + 1);
+            return Ok(inputs.iter().copied().collect());
+        }
+        #[cfg(test)]
+        self.log
+            .normal_inputs_listed
+            .set(self.log.normal_inputs_listed.get() + 1);
+        let mut inputs = normal_tiles(&self.mesh, Region::of_tile(&key))?;
+        // The tile's own block is among them; inserting it makes that plain.
+        inputs.insert(key);
+        Ok(inputs)
     }
 
     /// Makes every tile of one cone level current, building those that aren't from `below` (the
@@ -1219,12 +1268,9 @@ impl TileStore {
         {
             return Ok(id);
         }
-        let region = Region::of_tile(&key);
-        let mut inputs = normal_tiles(&self.mesh, region)?;
-        // The tile's own block is among them; inserting it makes that plain.
-        inputs.insert(key);
+        let inputs = self.normal_inputs_of(key)?;
         let held = self.pin_current(inputs)?;
-        let computed = self.normals_from(key, region, &held);
+        let computed = self.normals_from(key, Region::of_tile(&key), &held);
         let released = self.unpin_held(&held);
         let id = computed?;
         released?;

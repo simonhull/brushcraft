@@ -15,6 +15,12 @@
 //!
 //! Level-0 tiles are the base mesh, which never changes, so they are never recorded.
 //!
+//! Which tiles a tile reads is structural: it depends on the mesh and the tile's place, never on
+//! the values. So the lists stay with a node after the values they produced are dropped (a stale
+//! tile's parents, a tile's normal inputs once its normals are invalidated), and the store reads
+//! them back instead of listing the tiles again ([`DepGraph::parents`],
+//! [`DepGraph::normal_inputs`]).
+//!
 //! # Recording order
 //!
 //! A tile's positions must be recorded while its parents' nodes still hold their own parents:
@@ -42,9 +48,11 @@ struct Node {
     /// The parent tiles its positions were predicted from (level ≥ 1 only); `None` while they
     /// haven't been recorded (a node made for a tile only because something reads it).
     parents: Option<Vec<TileKey>>,
-    /// The same-level tiles its normals were computed from; `None` while the slot holds no
-    /// current normals.
+    /// The same-level tiles its normals are computed from; `None` until they are first recorded.
+    /// Kept when the normals are dropped: the list is structural.
     normal_inputs: Option<Vec<TileKey>>,
+    /// The slot holds normals computed from `normal_inputs`, which list it as a normal reader.
+    has_normals: bool,
     /// Tiles whose positions were predicted from this one's.
     readers: BTreeSet<TileKey>,
     /// Tiles whose normals were computed from this one's positions.
@@ -145,30 +153,47 @@ impl DepGraph {
         for &input in &inputs {
             self.node(input).normal_readers.insert(key);
         }
-        self.nodes.entry(key).or_default().normal_inputs = Some(inputs);
+        let node = self.node(key);
+        node.normal_inputs = Some(inputs);
+        node.has_normals = true;
     }
 
     /// Whether `key`'s slot holds current normals.
     pub(crate) fn has_normals(&self, key: &TileKey) -> bool {
-        self.nodes
-            .get(key)
-            .is_some_and(|node| node.normal_inputs.is_some())
+        self.nodes.get(key).is_some_and(|node| node.has_normals)
     }
 
-    /// Forgets `key`'s normals: the slot's normals are no longer current.
+    /// The tiles `key`'s positions were last predicted from (level 0 left out), if its node is
+    /// still in the graph: what [`geom::parent_tiles`] would list again.
+    pub(crate) fn parents(&self, key: &TileKey) -> Option<&[TileKey]> {
+        self.nodes.get(key)?.parents.as_deref()
+    }
+
+    /// The tiles `key`'s normals were last computed from, if its node is still in the graph,
+    /// current or not: what [`geom::normal_tiles`] would list again, with the tile itself.
+    pub(crate) fn normal_inputs(&self, key: &TileKey) -> Option<&[TileKey]> {
+        self.nodes.get(key)?.normal_inputs.as_deref()
+    }
+
+    /// Forgets `key`'s normals: the slot's normals are no longer current. The list of their
+    /// inputs stays, for [`DepGraph::normal_inputs`].
     pub(crate) fn drop_normals(&mut self, key: TileKey) {
-        let Some(inputs) = self
-            .nodes
-            .get_mut(&key)
-            .and_then(|node| node.normal_inputs.take())
-        else {
+        let Some(own) = self.nodes.get_mut(&key).filter(|node| node.has_normals) else {
             return;
         };
-        for input in inputs {
-            if let Some(node) = self.nodes.get_mut(&input) {
-                node.normal_readers.remove(&key);
+        own.has_normals = false;
+        let inputs = own.normal_inputs.take().unwrap_or_default();
+        for input in &inputs {
+            if let Some(read) = self.nodes.get_mut(input) {
+                read.normal_readers.remove(&key);
             }
+        }
+        for &input in &inputs {
             self.collect(input);
+        }
+        // Back in place, unless `key` was among its own inputs and its node went.
+        if let Some(node) = self.nodes.get_mut(&key) {
+            node.normal_inputs = Some(inputs);
         }
     }
 
@@ -295,17 +320,19 @@ impl DepGraph {
                     format!("{reader:?} doesn't list its parent {key:?}")
                 })?;
             }
-            for input in n.normal_inputs.iter().flatten() {
+            for input in n.normal_inputs.iter().flatten().filter(|_| n.has_normals) {
                 let readers = &node(input, key, "normal input")?.normal_readers;
                 check(readers.contains(key), || {
                     format!("{input:?} doesn't list its normal reader {key:?}")
                 })?;
             }
             for reader in &n.normal_readers {
-                let inputs = &node(reader, key, "normal reader")?.normal_inputs;
-                check(inputs.iter().flatten().any(|i| i == key), || {
-                    format!("{reader:?} doesn't list its normal input {key:?}")
-                })?;
+                let reader_node = node(reader, key, "normal reader")?;
+                let inputs = reader_node.normal_inputs.iter().flatten();
+                check(
+                    reader_node.has_normals && inputs.into_iter().any(|i| i == key),
+                    || format!("{reader:?} doesn't list its normal input {key:?}"),
+                )?;
             }
         }
         Ok(())

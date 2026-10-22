@@ -359,6 +359,65 @@ fn edits_after_evaluation_invalidate_exactly() {
         readers.len(),
         "each recomputed once"
     );
+    assert_eq!(
+        (
+            store.log.normal_inputs_reused.get(),
+            store.log.normal_inputs_listed.get()
+        ),
+        (readers.len() - 1, 1),
+        "the neighbours' inputs were read back from the graph; the edited tile left it"
+    );
+}
+
+#[test]
+fn structural_lists_are_read_back_from_the_graph() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 17));
+    let finest = tiles(&mesh, TOP, TOP);
+    for key in tiles(&mesh, 1, TOP) {
+        store.evaluate(key).unwrap();
+    }
+    for key in &finest {
+        store.normals(*key).unwrap();
+    }
+    // Levels 4–7 go, as eviction would take them, then one finest tile: their nodes stay, read
+    // by the cached finest tiles and by the neighbours' normals.
+    let gone = finest[21];
+    for key in tiles(&mesh, 4, TOP - 1).into_iter().chain([gone]) {
+        assert!(store.evaluated.remove(&key).unwrap(), "{key:?} was cached");
+        store.deps.left_pool(key);
+    }
+    store.deps.check_invariants().unwrap();
+    store.log = EvalLog::default();
+    let dense = dense(&mesh, &map);
+    assert_positions(&mut store, &dense, &[gone], "rebuilt from levels 3 up");
+    assert_normals(&mut store, &mesh, &dense, &[gone], "rebuilt");
+    assert!(
+        store.log.positions.len() > 4,
+        "levels 4–8 were evaluated again: {:?}",
+        store.log.positions
+    );
+    assert_eq!(
+        store.log.parents_listed.get(),
+        0,
+        "every parent list was read back from the graph"
+    );
+    assert!(
+        store.log.parents_reused.get() >= store.log.positions.len(),
+        "one per tile built at least: {}",
+        store.log.parents_reused.get()
+    );
+    assert_eq!(
+        (
+            store.log.normal_inputs_reused.get(),
+            store.log.normal_inputs_listed.get()
+        ),
+        (1, 0),
+        "and the normal inputs"
+    );
 }
 
 #[test]
