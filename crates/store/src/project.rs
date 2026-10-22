@@ -18,7 +18,9 @@
 //! ([`TileStore::save_into`]), and saves it. Then a **fresh** recovery file is created on the new
 //! save point, the store is rebased onto the pair, and only then, with the new recovery file
 //! durable, is the old one deleted. A crash at any point leaves a recovery file that matches a
-//! save point of the project file: the old one until the new one is in place.
+//! save point of the project file: the old one until the new one is in place. Once the store is
+//! rebased, the save has happened, whatever follows: deleting the old file is best effort, and a
+//! failure to is reported ([`ProjectError::OldRecoveryKept`]), never fatal.
 //!
 //! # Recovery file names
 //!
@@ -132,6 +134,18 @@ pub enum ProjectError {
     /// another project's, or one on another save point. List again.
     #[error("the recovery file changed since it was listed")]
     CandidateChanged,
+    /// The call did what it was asked (a save, say: the project goes on with its new recovery
+    /// file), but the old recovery file at `path` couldn't be deleted. It holds nothing the
+    /// project needs any more; until it is deleted, [`find_recoveries`] lists it, on the save
+    /// point it was made on.
+    #[error("the old recovery file {path:?} couldn't be deleted")]
+    OldRecoveryKept {
+        /// Where the old recovery file is.
+        path: PathBuf,
+        /// Why it couldn't be deleted.
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// A recovery file found by [`find_recoveries`]: what the app shows to offer a restore.
@@ -461,16 +475,24 @@ impl Project {
     /// hold the tiles without a save point; saving again writes them again); as
     /// [`Project::new`] for the fresh recovery file. A save that fails after the project file's
     /// save point is written leaves the project open on the old recovery file, which still
-    /// holds every edit; saving again works.
+    /// holds every edit; saving again works. [`ProjectError::OldRecoveryKept`] if the save
+    /// went through, but the old recovery file couldn't be deleted.
     pub fn save(&mut self) -> Result<(), ProjectError> {
         self.poll()?;
         if self.path.is_none() {
             return Err(ProjectError::NoPath);
         }
         self.finish_flushes()?;
-        let project = self.file.as_mut().ok_or(ProjectError::NoPath)?;
-        let saved = self.store.save_into(project)?;
-        self.switch_recovery(saved)
+        let path = self.path.clone().ok_or(ProjectError::NoPath)?;
+        let mut project = self.file.take().ok_or(ProjectError::NoPath)?;
+        let switched = self
+            .store
+            .save_into(&mut project)
+            .map_err(ProjectError::from)
+            .and_then(|saved| self.switch_recovery(saved, &project, &path));
+        self.file = Some(project);
+        let old = switched?;
+        retire(&old)
     }
 
     /// Saves the project as a new project file at `path`, with a new project id, and goes on
@@ -487,6 +509,9 @@ impl Project {
     /// [`ProjectError::Cache`] if writing the new file fails (the temporary file is removed);
     /// [`ProjectError::Io`] if the rename does; as [`Project::save`] for the fresh recovery
     /// file, where the new project file is in place but the project goes on with the old one.
+    /// Once the store is rebased onto the new file, the project goes on with it, its path and
+    /// its id, whatever happens next: [`ProjectError::OldRecoveryKept`] if the old recovery file
+    /// couldn't be deleted.
     pub fn save_as(&mut self, path: &Path) -> Result<(), ProjectError> {
         self.poll()?;
         let path = std::path::absolute(path)?;
@@ -511,11 +536,12 @@ impl Project {
                 return Err(e);
             }
         };
-        self.switch_recovery_to(saved, &project, &path)?;
-        // The old project file closes here, and its lock goes with it.
+        let old = self.switch_recovery(saved, &project, &path)?;
+        // The switch has happened: the store reads the new project file, so the project holds
+        // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
         self.path = Some(path);
-        Ok(())
+        retire(&old)
     }
 
     /// Fills `project`, the new file being written at `tmp`, with the last save point's tiles
@@ -726,35 +752,24 @@ impl Project {
         Ok(lost)
     }
 
-    /// After a save into the project file the project holds: [`Project::switch_recovery_to`]
-    /// that file.
-    ///
-    /// # Errors
-    ///
-    /// As [`Project::switch_recovery_to`]; [`ProjectError::NoPath`] if there is no project file.
-    fn switch_recovery(&mut self, saved: Saved) -> Result<(), ProjectError> {
-        let path = self.path.clone().ok_or(ProjectError::NoPath)?;
-        let project = self.file.take().ok_or(ProjectError::NoPath)?;
-        let switched = self.switch_recovery_to(saved, &project, &path);
-        self.file = Some(project);
-        switched
-    }
-
     /// Creates a fresh recovery file on the save point `saved` proves in `project`, the project
-    /// file at `path`, rebases the store onto it, and deletes the old recovery file, in that
-    /// order: the old file goes only once the new one is durable and in use.
+    /// file at `path`, and rebases the store onto the pair; returns the old recovery file's
+    /// path, for the caller to delete ([`retire`]) once it holds `project`: the old
+    /// file goes only once the new one is durable and in use.
+    ///
+    /// Once this returns, the switch has happened: the store reads `project` and writes the
+    /// new recovery file. On error nothing has changed.
     ///
     /// # Errors
     ///
     /// As [`create_recovery`]; [`ProjectError::Cache`] if the rebase is refused (the new file is
-    /// deleted again); [`ProjectError::Io`] or [`ProjectError::Store`] if the old file can't be
-    /// deleted (the project goes on with the new one).
-    fn switch_recovery_to(
+    /// deleted again).
+    fn switch_recovery(
         &mut self,
         saved: Saved,
         project: &ProjectFile,
         path: &Path,
-    ) -> Result<(), ProjectError> {
+    ) -> Result<PathBuf, ProjectError> {
         let meta = project.meta().on_save_point(saved.save_point(), path);
         let (fresh, fresh_path) = create_recovery(
             &self.recovery_dir,
@@ -772,11 +787,36 @@ impl Project {
             }
         };
         drop(old);
-        let old_path = std::mem::replace(&mut self.recovery_path, fresh_path);
-        fs::remove_file(&old_path)?;
-        sync_parent(&old_path)?;
-        Ok(())
+        Ok(std::mem::replace(&mut self.recovery_path, fresh_path))
     }
+}
+
+/// Deletes the old recovery file at `old`, which its project has moved on from, and syncs its
+/// directory.
+///
+/// Best effort: the project needs nothing in it, so a failure is reported, never fatal; a file
+/// already gone is fine.
+///
+/// # Errors
+///
+/// [`ProjectError::OldRecoveryKept`] if it can't be deleted, or the deletion made durable.
+fn retire(old: &Path) -> Result<(), ProjectError> {
+    let kept = |source| ProjectError::OldRecoveryKept {
+        path: old.to_path_buf(),
+        source,
+    };
+    match fs::remove_file(old) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(kept(e)),
+    }
+    sync_parent(old).map_err(|e| {
+        if let StoreError::Io(io) = e {
+            kept(io)
+        } else {
+            kept(io::Error::other(e))
+        }
+    })
 }
 
 /// Test-only controls.

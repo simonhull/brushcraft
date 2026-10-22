@@ -277,6 +277,63 @@ fn a_save_that_cannot_make_its_recovery_file_keeps_the_old_one() {
     assert_project_file(&path, &map, "every edit saved");
 }
 
+/// A save as whose old recovery file can't be deleted: the session goes on with the new project
+/// file, its path and its id, and the failure is reported, not fatal.
+///
+/// The old file is deleted from outside first: a file already gone is no failure at all. Then
+/// a directory takes its name, which no file deletion removes.
+#[test]
+fn a_save_as_that_cannot_delete_the_old_recovery_file_goes_on_with_the_new_file() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let all = tiles(&mesh, 1, TOP);
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 100, 101);
+    for (n, blocked) in [false, true].into_iter().enumerate() {
+        let old = project.recovery_path().to_path_buf();
+        let id = project.id();
+        fs::remove_file(&old).unwrap();
+        if blocked {
+            fs::create_dir_all(&old).unwrap();
+        }
+        let path = dir.path(&format!("p{n}.bcrf"));
+        let saved = project.save_as(&path);
+        if blocked {
+            assert!(
+                matches!(&saved, Err(ProjectError::OldRecoveryKept { path: at, .. }) if *at == old),
+                "{saved:?}"
+            );
+            fs::remove_dir(&old).unwrap();
+        } else {
+            saved.unwrap();
+        }
+        assert_eq!(project.path(), Some(path.as_path()), "{n}: the new path");
+        assert_ne!(project.id(), id, "{n}: a new id");
+        assert_ne!(project.recovery_path(), old, "{n}: a new recovery file");
+        assert!(!project.has_unsaved_edits(), "{n}: saved");
+        // Every tile read again, through the new project file.
+        project.store().evict_all().unwrap();
+        assert_positions(
+            project.store(),
+            &dense(&mesh, &map),
+            &all,
+            "after the save as",
+        );
+        stroke(&mut project, &mut map, 40, 102 + n as u64);
+        project.save().unwrap();
+    }
+    let path = project.path().unwrap().to_path_buf();
+    let id = project.id();
+    project.close(false).unwrap();
+    assert_eq!(
+        ProjectFile::open(&path).unwrap().meta().project(),
+        id,
+        "the project file is the project's"
+    );
+    assert_project_file(&path, &map, "every edit saved");
+}
+
 #[test]
 fn close_keeps_the_recovery_file_only_when_asked() {
     let dir = TestDir::new();
