@@ -564,7 +564,8 @@ impl Project {
     /// [`ProjectError::Exists`] if `path` names a file already, or does by the time the new
     /// file is to be moved there (it is removed then); [`ProjectError::Recovery`] if
     /// the recovery writer can't finish its flushes; [`ProjectError::Store`] or
-    /// [`ProjectError::Cache`] if writing the new file fails (the temporary file is removed);
+    /// [`ProjectError::Cache`] if creating or writing the new file fails (the temporary file is
+    /// removed);
     /// [`ProjectError::Io`] if the rename does; as [`Project::save`] for the fresh recovery
     /// file, where the new project file is in place but the project goes on with the old one.
     /// Once the store is rebased onto the new file, the project goes on with it, its path and
@@ -584,7 +585,17 @@ impl Project {
             .with_project(ProjectId::random()?)
             .with_role(Role::Project);
         let tmp = temporary(&path)?;
-        let mut project = ProjectFile::create_like(&tmp, meta, self.store.working())?;
+        let mut project = match ProjectFile::create_like(&tmp, meta, self.store.working()) {
+            Ok(project) => project,
+            Err(e) => {
+                // Made, then failed: removed, best effort. A file already there isn't this
+                // save's, and is left alone.
+                if !matches!(&e, StoreError::Io(io) if io.kind() == io::ErrorKind::AlreadyExists) {
+                    drop(fs::remove_file(&tmp));
+                }
+                return Err(e.into());
+            }
+        };
         let written = self.write_new_project(&mut project, &tmp, &path);
         let saved = match written {
             Ok(saved) => saved,
@@ -594,13 +605,13 @@ impl Project {
                 return Err(e);
             }
         };
-        let lost = saved.lost().clone();
+        // The new project file lacks them whatever happens next, as `save` reports them.
+        self.unreported.extend(saved.lost());
         let old = self.switch_recovery(saved, &project, &path)?;
         // The switch has happened: the store reads the new project file, so the project holds
         // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
         self.path = Some(path);
-        self.unreported.extend(lost);
         retire(&old)?;
         self.report()
     }
