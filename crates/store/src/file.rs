@@ -166,6 +166,14 @@ pub(crate) struct Loc {
     len: u64,
 }
 
+#[cfg(test)]
+impl Loc {
+    /// The byte halfway through the record: for tests that damage one.
+    pub(crate) const fn middle(self) -> u64 {
+        self.offset + self.len / 2
+    }
+}
+
 /// Whether a [`ProjectFile`] accepts writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Access {
@@ -1046,11 +1054,30 @@ impl ProjectFile {
     /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if `from`'s record fails its checksum
     /// or isn't a tile of `key`; [`StoreError::Io`].
     pub(crate) fn copy_tile(&mut self, from: &Self, key: &TileKey) -> Result<bool, StoreError> {
-        let Some(Loc { offset, len }) = from.locate(key) else {
+        let Some(raw) = from.read_tile_record(key)? else {
             return Ok(false);
         };
-        self.append_copy(key, &from.read_record(offset, len)?, offset)?;
+        self.append_copy(key, &raw)?;
         Ok(true)
+    }
+
+    /// `key`'s latest record, framing included, after checking that it verifies and is a tile
+    /// of `key`; `None` if the tile is absent. For [`ProjectFile::append_copy`] into another
+    /// file.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Damaged`] if the record fails its checksum or isn't a tile of `key`;
+    /// [`StoreError::Io`].
+    pub(crate) fn read_tile_record(&self, key: &TileKey) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(Loc { offset, len }) = self.locate(key) else {
+            return Ok(None);
+        };
+        let raw = self.read_record(offset, len)?;
+        if tile_record(&raw, key).is_none() {
+            return Err(StoreError::Damaged { offset });
+        }
+        Ok(Some(raw))
     }
 
     /// Appends a copy of every tile `base` holds, as [`ProjectFile::copy_tile`] does: the
@@ -1062,24 +1089,27 @@ impl ProjectFile {
     pub(crate) fn copy_base(&mut self, base: &BaseFile) -> Result<(), StoreError> {
         for (key, &loc) in base.locations.iter() {
             let raw = base.reader.read_record(loc)?;
-            self.append_copy(key, &raw, loc.offset)?;
+            if tile_record(&raw, key).is_none() {
+                return Err(StoreError::Damaged { offset: loc.offset });
+            }
+            self.append_copy(key, &raw)?;
         }
         Ok(())
     }
 
-    /// Appends `raw`, a record read from byte `offset` of another file, as `key`'s latest
-    /// record, after checking that it is a tile of `key`.
+    /// Appends `raw`, a tile record of `key` read from another file and checked there, as
+    /// `key`'s latest record.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] (naming `offset`) if `raw` isn't a
-    /// whole tile record of `key`; [`StoreError::Io`].
-    fn append_copy(&mut self, key: &TileKey, raw: &[u8], offset: u64) -> Result<(), StoreError> {
+    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if `raw` isn't a whole tile record of
+    /// `key` after all; [`StoreError::Io`].
+    pub(crate) fn append_copy(&mut self, key: &TileKey, raw: &[u8]) -> Result<(), StoreError> {
         if self.access == Access::ReadOnly {
             return Err(StoreError::ReadOnly);
         }
         let op = tile_record(raw, key)
-            .ok_or(StoreError::Damaged { offset })?
+            .ok_or(StoreError::Damaged { offset: self.end })?
             .op;
         let loc = self.append_record(raw)?;
         self.note(*key, op, loc);

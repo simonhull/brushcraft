@@ -4,6 +4,8 @@
 //! made while a flush is in flight reach the next one; a drop mid-flush is prompt and leaves a
 //! file that opens; a failed sync is reported and leaves no save point.
 
+use std::os::unix::fs::FileExt;
+
 use super::*;
 use crate::recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 
@@ -675,4 +677,61 @@ fn a_broken_slot_is_reported_and_the_rest_still_flush() {
     drop(writer);
     drop(store);
     assert_save_point(&path, offset, &mesh, &map);
+}
+
+#[test]
+fn a_roll_over_carries_every_edit_and_lists_what_it_cannot_read() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 80, 111));
+    writer.finish(&mut store, Instant::now()).unwrap();
+    // Some edits only in the file (written back), some dirty.
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 40, 112));
+    store.evict_all().unwrap();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 40, 113));
+    let dirty: Vec<TileKey> = store.unsaved.keys().copied().collect();
+    assert!(!dirty.is_empty(), "some tiles dirty");
+    // One tile only in the file, its record damaged by an outside write.
+    let damaged = *store
+        .file
+        .keys()
+        .find(|key| store.corrections.find(key).is_none())
+        .unwrap();
+    let loc = store.file.locate(&damaged).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = usize::try_from(loc.middle()).unwrap();
+    bytes[at] ^= 0x40;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .write_all_at(&bytes[at..=at], loc.middle())
+        .unwrap();
+
+    let meta = *store.file.meta();
+    let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
+    let generation = store.generation();
+    let (old, lost) = store.roll_over(fresh).unwrap();
+    drop(old);
+    assert_eq!(lost, [damaged], "the damaged tile is lost, and listed");
+    assert!(
+        store.unsaved.is_empty(),
+        "every dirty slot is in the new file"
+    );
+    assert_ne!(
+        store.generation(),
+        generation,
+        "a flush in flight is abandoned"
+    );
+    writer.close(&mut store, Instant::now()).unwrap();
+    drop(store);
+    let file = ProjectFile::open(&dir.path("fresh.bcrf")).unwrap();
+    assert!(!file.contains(&damaged), "left out");
+    for key in &dirty {
+        assert!(file.contains(key), "{key:?}: a dirty slot carried across");
+    }
 }

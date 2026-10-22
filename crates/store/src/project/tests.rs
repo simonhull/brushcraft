@@ -362,3 +362,82 @@ fn the_default_recovery_dir_follows_xdg() {
         assert!(dir.ends_with("brushcraft/recovery"), "{dir:?}");
     }
 }
+
+/// Fails the writer's next sync, makes a stroke, and polls until the project has rolled over
+/// to a new recovery file; returns the old one's path.
+fn fail_and_roll_over(project: &mut Project, map: &mut CorrectionMap, seed: u64) -> PathBuf {
+    let old = project.recovery_path().to_path_buf();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    stroke(project, map, 80, seed);
+    let began = Instant::now();
+    while project.recovery_path() == old {
+        project.poll().unwrap();
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(30),
+            "the roll-over happens"
+        );
+        std::thread::yield_now();
+    }
+    old
+}
+
+#[test]
+fn a_failed_sync_rolls_over_to_a_new_recovery_file() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 80, 71);
+    let old = fail_and_roll_over(&mut project, &mut map, 72);
+    assert!(!old.exists(), "the failed file is gone");
+    let names = recovery_files(&dir);
+    assert_eq!(names.len(), 1, "one recovery file: {names:?}");
+    assert!(
+        !project.writer.as_ref().unwrap().is_failed(),
+        "a new writer"
+    );
+    assert_eq!(
+        project.store().working().meta().role(),
+        Role::Recovery { base: None },
+        "on the same base"
+    );
+    // Edits go on into the new file.
+    stroke(&mut project, &mut map, 40, 73);
+    let path = project.recovery_path().to_path_buf();
+    project.close(true).unwrap();
+    let file = ProjectFile::open(&path).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "every edit, the failed flush's too",
+    );
+}
+
+#[test]
+fn a_saved_project_rolls_over_on_its_save_point_and_saves_after() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 80, 81);
+    project.save_as(&path).unwrap();
+    let role = project.store().working().meta().role();
+    stroke(&mut project, &mut map, 80, 82);
+    fail_and_roll_over(&mut project, &mut map, 83);
+    assert_eq!(
+        project.store().working().meta().role(),
+        role,
+        "the new file names the same save point"
+    );
+    assert!(
+        project.has_unsaved_edits(),
+        "nothing saved by the roll-over"
+    );
+    project.save().unwrap();
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "saved after the roll-over");
+    assert_eq!(recovery_files(&dir), Vec::<String>::new(), "all deleted");
+}

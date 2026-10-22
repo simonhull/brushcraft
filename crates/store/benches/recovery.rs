@@ -1,7 +1,15 @@
-//! The drawing thread's share of a recovery flush: [`RecoveryWriter::end_stroke`] after a stroke
-//! that dirtied 50 level-8 correction tiles. That is the snapshot (one 26.9 KB slot copy per
-//! tile) and the hand-off to the writer thread; encoding, compression and syncing happen there,
-//! outside the measurement.
+//! The drawing thread's share of a recovery flush of a stroke that dirtied 50 level-8 correction
+//! tiles, in its two parts:
+//!
+//! - [`RecoveryWriter::end_stroke`]: the snapshot (one 26.9 KB slot copy per tile) and the hand-off
+//!   to the writer thread. Encoding, compression and syncing happen there, outside the measurement.
+//! - [`RecoveryWriter::poll`] once the writer thread has encoded the batch: appending the 50 framed
+//!   records to the working file (page-cache writes) and asking for the sync.
+//!
+//! The working file is under [`std::env::temp_dir`]. Where that is `/tmp` on tmpfs (as on the
+//! dev box), syncs are free, so a sync reply can come back within the measured `poll`, which
+//! then also writes the save point; on a disk, the sync takes longer and the measurement is the
+//! appends alone.
 
 #![expect(
     clippy::expect_used,
@@ -107,4 +115,31 @@ fn end_stroke_50_tiles(bencher: divan::Bencher<'_, '_>) {
             .end_stroke(&mut stroke.store, Instant::now())
             .expect("end stroke");
     });
+}
+
+/// How long the `poll` bench gives the writer thread to encode the batch before measuring:
+/// far longer than 50 tiles take (a few milliseconds).
+const ENCODE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `poll` after the writer thread has encoded the stroke's 50 tiles: appending their records
+/// to the working file and asking for the sync.
+///
+/// # Panics
+///
+/// If the setup or the call fails, which would be a bug in the crate.
+#[divan::bench(sample_count = 50, sample_size = 1)]
+fn poll_appends_50_records(bencher: divan::Bencher<'_, '_>) {
+    bencher
+        .with_inputs(|| {
+            let mut stroke = Stroke::new();
+            stroke
+                .writer
+                .end_stroke(&mut stroke.store, Instant::now())
+                .expect("end stroke");
+            std::thread::sleep(ENCODE_WAIT);
+            stroke
+        })
+        .bench_local_refs(|stroke| {
+            stroke.writer.poll(&mut stroke.store).expect("poll");
+        });
 }

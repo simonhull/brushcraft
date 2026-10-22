@@ -951,6 +951,96 @@ impl TileStore {
         Ok(std::mem::replace(&mut self.file, working))
     }
 
+    /// Swaps in `fresh`, a new working file on the same base, after the working file failed to
+    /// sync, carrying every edit across; returns the old working file and the tiles that
+    /// couldn't be (lost).
+    ///
+    /// Every tile of the old working file and every dirty slot is written to `fresh`, read
+    /// through the store: a dirty slot as it is, with the op of its latest edit; any other tile
+    /// as the old file's record, copied after its checksum is checked. A clean resident tile
+    /// whose record no longer reads is written from its slot, labelled with the newest edit
+    /// (its own op can't be read back). A tile that can be read neither way, or a broken slot,
+    /// is lost: listed, and left out. Then `fresh` is saved (synced, a save point, synced
+    /// again) and becomes the working file. Every slot written is clean, streaming consumers'
+    /// marks are emptied (all they held is in `fresh`), and the generation moves on, so a flush
+    /// started before is abandoned. The base and the tiles to save into the project are
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::MeshMismatch`] or [`CacheError::WrongBase`] if `fresh` isn't over the
+    /// store's mesh, or doesn't name the same base as the working file; [`CacheError::WriteBack`]
+    /// if writing or saving `fresh` fails. The store is unchanged then.
+    pub(crate) fn roll_over(
+        &mut self,
+        mut fresh: ProjectFile,
+    ) -> Result<(ProjectFile, Vec<TileKey>), CacheError> {
+        self.sync_pins()?;
+        if fresh.meta().mesh_hash() != self.mesh_hash {
+            return Err(CacheError::MeshMismatch);
+        }
+        if fresh.meta().role() != self.file.meta().role()
+            || fresh.meta().project() != self.file.meta().project()
+        {
+            return Err(CacheError::WrongBase);
+        }
+        check_layers(fresh.meta(), self.base.as_ref())?;
+        let keys: BTreeSet<TileKey> = self
+            .file
+            .keys()
+            .copied()
+            .chain(self.unsaved.keys().copied())
+            .collect();
+        let mut lost = Vec::new();
+        let mut cleaned = Vec::new();
+        for key in keys {
+            let resident = self.corrections.find(&key);
+            let dirty = resident.filter(|&id| self.corrections.is_dirty(id) == Some(true));
+            let from_slot = match dirty {
+                Some(_) => self.unsaved.get(&key).copied(),
+                None => match self.file.read_tile_record(&key) {
+                    Ok(Some(raw)) => {
+                        fresh
+                            .append_copy(&key, &raw)
+                            .map_err(CacheError::WriteBack)?;
+                        continue;
+                    }
+                    // Unreadable (or, impossibly, gone): only the slot holds it now.
+                    Ok(None) | Err(_) if resident.is_some() => self.latest_edit,
+                    Ok(None) | Err(_) => None,
+                },
+            };
+            let tile = resident
+                .and_then(|id| self.corrections.get(id))
+                .and_then(|slot| slot.to_tile().ok());
+            let (Some(op), Some(tile)) = (from_slot, tile) else {
+                lost.push(key);
+                continue;
+            };
+            fresh
+                .write_displacement(key, op, &tile)
+                .map_err(CacheError::WriteBack)?;
+            if let Some(id) = dirty {
+                cleaned.push((key, id));
+            }
+        }
+        fresh.save().map_err(CacheError::WriteBack)?;
+        for (key, id) in cleaned {
+            self.corrections.set_dirty(id, false)?;
+            self.unsaved.remove(&key);
+        }
+        let marks: Vec<ConsumerId> = self.streams.keys().copied().collect();
+        for id in marks {
+            if let Some(mark) = self.streams.get_mut(&id) {
+                mark.clear();
+            }
+        }
+        self.generation += 1;
+        // The workers' jobs name records of the old file.
+        self.prefetch = Prefetcher::new();
+        Ok((std::mem::replace(&mut self.file, fresh), lost))
+    }
+
     /// Moves every key save's consumer hasn't drained from the change feed into
     /// [`TileStore::since_rebase`].
     fn drain_saves(&mut self) {
