@@ -3,8 +3,19 @@
 //! [`TileStore`] owns the base mesh, the working [`ProjectFile`], two budgeted pools (correction
 //! tiles and evaluated tiles), the change feed and an op generator. Correction tiles are loaded
 //! from the file on demand (an absent tile is all zero) and edited in their slots; evaluated
-//! tiles are computed on demand from their parent tiles, recursively up to the base mesh, and
-//! cached. Edits drop exactly the evaluations that followed from them (see [`crate::deps`]).
+//! tiles are computed on demand from their parent tiles and cached. Edits drop exactly the
+//! evaluations that followed from them (see [`crate::deps`]).
+//!
+//! # Evaluation
+//!
+//! A tile is evaluated coarse to fine, never recursively. The store lists the tile's dependency
+//! cone: the tile, then the parents of every tile of the level above, level by level, down to
+//! the first level whose tiles are all cached (or level 1, predicted from the base mesh). It
+//! pins that level, then builds each finer level tile by tile from the pinned level below,
+//! pinning each tile it makes and unpinning the level below once the level is done. At most two
+//! levels of the cone are pinned at once, and no level is wider than [`geom::cone_width`], so an
+//! evaluation pins at most twice that many evaluated tiles, whatever its depth. Normals are
+//! evaluated the same way, from the cone of the tiles they read.
 //!
 //! Everything here belongs to one thread: the one calling the store. Pins are held by
 //! [`PinGuard`]s, which may be dropped anywhere on that thread; the store applies the unpins at
@@ -20,9 +31,24 @@
 //! to recompute, then correction chunks, whose dirty slots are written back to the working file
 //! first. A chunk holding a pinned slot can't be given back, so the request fails only when no
 //! chunk without a pin is left.
+//!
+//! A budget of [`StoreConfig::minimum_budget`] is enough for every evaluation and edit when
+//! nothing else is pinned, and [`TileStore::open`] refuses less. An evaluation pins at most `E`
+//! evaluated slots (two cone levels) and no correction slot:
+//!
+//! - The evaluated pool needs a chunk only when every one of its slots is pinned, so it holds fewer
+//!   than `⌈E / per chunk⌉` chunks then, and the minimum leaves room for one more besides a
+//!   correction chunk. Taking correction chunks back stops as soon as that room is there, so the
+//!   correction pool keeps a chunk, however the evaluated pins are spread.
+//! - The correction pool so always has a slot to reuse: none of its slots is pinned. (Its first
+//!   chunk is mapped by an evaluation's first build, which loads a correction tile before it asks
+//!   for an evaluated slot.)
+//!
+//! An edit pins correction slots only, at most one cone width of them, which the minimum's
+//! correction chunks hold once every evaluated chunk is taken back.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -46,7 +72,8 @@ use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 /// How a [`TileStore`] is set up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreConfig {
-    /// Bytes the two pools may hold together. The pools never exceed it.
+    /// Bytes the two pools may hold together. The pools never exceed it. At least
+    /// [`StoreConfig::minimum_budget`] for the store's mesh.
     pub budget_bytes: usize,
     /// Bytes per pool chunk: [`StoreConfig::DEFAULT_CHUNK_BYTES`] in the app, smaller in tests.
     pub chunk_bytes: usize,
@@ -58,6 +85,60 @@ impl StoreConfig {
     /// The default chunk: 64 MiB, large enough that the allocator maps each chunk on its own
     /// and gives it back to the OS when it is dropped (see the pool's notes).
     pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
+
+    /// The least [`StoreConfig::budget_bytes`] a store over `mesh` with these chunks works
+    /// with: enough that no evaluation, normals computation or edit runs out of room while
+    /// nothing else is pinned.
+    ///
+    /// That is the larger of
+    ///
+    /// - evaluated chunks for twice the mesh's [`geom::cone_width`] (the two cone levels an
+    ///   evaluation holds pinned, see the module notes) plus one correction chunk, and
+    /// - correction chunks for one cone width of tiles (an edit holds every tile it writes a copy
+    ///   of pinned: at most the tile's neighbourhood, which the cone width bounds).
+    ///
+    /// Pins taken with [`TileStore::pin`] come on top. With the default chunks the minimum is two
+    /// or three chunks for a mesh of thousands of faces; it grows with the mesh's face
+    /// neighbourhoods, never with the evaluated level.
+    ///
+    /// Computed from the mesh's face rings, in time linear in its faces: [`TileStore::open`] runs
+    /// it once.
+    #[must_use]
+    pub fn minimum_budget(&self, mesh: &BaseMesh) -> usize {
+        Headroom::of(mesh).minimum_budget(self.chunk_bytes)
+    }
+}
+
+/// The most slots of each pool the store pins for its own work: what [`StoreConfig`]'s minimum
+/// is made of, and what [`TileStore::pin`] counts besides the tiles asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Headroom {
+    /// Evaluated slots one evaluation pins at most: two levels of its cone.
+    evaluated: usize,
+    /// Correction slots one edit pins at most: the tiles holding copies of its vertices.
+    corrections: usize,
+}
+
+impl Headroom {
+    /// The headroom for evaluating and editing `mesh`.
+    fn of(mesh: &BaseMesh) -> Self {
+        let width = geom::cone_width(mesh);
+        Self {
+            evaluated: 2 * width,
+            corrections: width,
+        }
+    }
+
+    /// The least budget, in chunks of `chunk_bytes`, that holds this headroom however the
+    /// evaluated pins are spread (see the module notes).
+    fn minimum_budget(self, chunk_bytes: usize) -> usize {
+        let (per_evaluated, evaluated) = Pool::<EvaluatedSlot>::layout(chunk_bytes);
+        let (per_correction, correction) = Pool::<CorrectionSlot>::layout(chunk_bytes);
+        let chunks = |slots: usize, per: u32| slots.div_ceil(per as usize);
+        let evaluating = chunks(self.evaluated, per_evaluated) * evaluated + correction;
+        let editing = chunks(self.corrections, per_correction) * correction;
+        evaluating.max(editing)
+    }
 }
 
 /// Why a [`TileStore`] operation failed.
@@ -83,6 +164,12 @@ pub enum CacheError {
     /// The configured site is [`RESERVED_SITE`].
     #[error("site {RESERVED_SITE} is reserved")]
     ReservedSite,
+    /// The configured budget is below [`StoreConfig::minimum_budget`] for the mesh.
+    #[error("the budget is below the {minimum} bytes this mesh needs")]
+    BudgetTooSmall {
+        /// The least budget the mesh works with.
+        minimum: usize,
+    },
     /// Every op id of this site has been handed out.
     #[error("the op ids of this site are used up")]
     OpsExhausted,
@@ -144,8 +231,13 @@ impl Drop for PinGuard {
 /// The slots one pinned tile holds: its evaluated tile and its correction tile.
 type Pinned = (SlotId<EvaluatedSlot>, SlotId<CorrectionSlot>);
 
-/// Evaluated tiles an evaluation pinned, with their keys: what its [`Resident`] source reads.
+/// Evaluated tiles an evaluation pinned, with their keys, in key order: what its [`Resident`]
+/// source reads.
 type Held = Vec<(TileKey, SlotId<EvaluatedSlot>)>;
+
+/// One level of a dependency cone: each tile, with the parents it is predicted from (left empty
+/// for the coarsest level when its tiles are all cached, since nothing is built there).
+type ConeLevel = BTreeMap<TileKey, Vec<TileKey>>;
 
 /// What the store computed and read, for tests that count re-evaluations and file reads.
 #[cfg(test)]
@@ -178,6 +270,8 @@ pub struct TileStore {
     file: ProjectFile,
     /// The bytes both pools may hold.
     budget: Budget,
+    /// What the store pins for its own work, besides [`TileStore::pin`]'s tiles.
+    headroom: Headroom,
     /// Correction tiles, loaded from the file or zero, and edited in place.
     corrections: Pool<CorrectionSlot>,
     /// Evaluated positions and normals, a cache.
@@ -209,6 +303,9 @@ pub struct TileStore {
     /// What was computed, for the tests.
     #[cfg(test)]
     log: EvalLog,
+    /// A correction tile whose reads from the working file fail, for tests of error paths.
+    #[cfg(test)]
+    unreadable: Option<TileKey>,
 }
 
 impl std::fmt::Debug for TileStore {
@@ -234,7 +331,7 @@ struct Resident<'a> {
     mesh: &'a BaseMesh,
     /// The evaluated pool.
     pool: &'a Pool<EvaluatedSlot>,
-    /// The pinned tiles; a dozen at most, so a linear search beats hashing.
+    /// The pinned tiles, in key order.
     tiles: &'a [(TileKey, SlotId<EvaluatedSlot>)],
 }
 
@@ -245,7 +342,8 @@ impl PositionSource for Resident<'_> {
         if level == Level::ZERO {
             return self.mesh.position(face, level, li, lj);
         }
-        let &(_, id) = self.tiles.iter().find(|(k, _)| *k == key)?;
+        let at = self.tiles.binary_search_by_key(&key, |&(k, _)| k).ok()?;
+        let &(_, id) = self.tiles.get(at)?;
         let index = usize::try_from(lj * key.side() + li).ok()?;
         self.pool.get(id)?.positions.get(index).copied()
     }
@@ -320,7 +418,8 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::ReservedSite`]; [`CacheError::OpsExhausted`] if the file's head is the
+    /// [`CacheError::ReservedSite`]; [`CacheError::BudgetTooSmall`] below
+    /// [`StoreConfig::minimum_budget`]; [`CacheError::OpsExhausted`] if the file's head is the
     /// site's last op id; [`CacheError::Store`] if the read buffers can't be made.
     pub fn open(
         mesh: Arc<BaseMesh>,
@@ -329,6 +428,11 @@ impl TileStore {
     ) -> Result<Self, CacheError> {
         if config.site == RESERVED_SITE {
             return Err(CacheError::ReservedSite);
+        }
+        let headroom = Headroom::of(&mesh);
+        let minimum = headroom.minimum_budget(config.chunk_bytes);
+        if config.budget_bytes < minimum {
+            return Err(CacheError::BudgetTooSmall { minimum });
         }
         let next_op = match file.head() {
             Some(head) if head.site() == config.site => {
@@ -343,6 +447,7 @@ impl TileStore {
             mesh,
             file,
             budget: Budget::new(config.budget_bytes),
+            headroom,
             corrections: Pool::new(config.chunk_bytes),
             evaluated: Pool::with_eviction_log(config.chunk_bytes),
             deps: DepGraph::new(),
@@ -358,6 +463,8 @@ impl TileStore {
             read_scratch: ReadScratch::new()?,
             #[cfg(test)]
             log: EvalLog::default(),
+            #[cfg(test)]
+            unreadable: None,
         })
     }
 
@@ -458,15 +565,16 @@ impl TileStore {
         Ok(())
     }
 
-    /// `key`'s evaluated positions, row-major `side²`: cached, else computed from its parent
-    /// tiles (each evaluated the same way, up to the base mesh) and its corrections.
+    /// `key`'s evaluated positions, row-major `side²`: cached, else computed coarse to fine
+    /// from the base mesh, or from the finest level of its cone that is cached (see the module
+    /// notes), with its corrections.
     ///
     /// # Errors
     ///
-    /// [`CacheError::NotATile`]; [`CacheError::Pool`] with [`PoolError::Full`] if the slots
-    /// pinned at once (pins, and the parents of each level being evaluated) don't fit the
-    /// budget; [`CacheError::Store`] if a correction tile can't be read; [`CacheError::Eval`]
-    /// (not for a valid mesh).
+    /// [`CacheError::NotATile`]; [`CacheError::Pool`] with [`PoolError::Full`] if the pins
+    /// taken with [`TileStore::pin`] leave too little of the budget for the evaluation's own
+    /// (never without such pins); [`CacheError::Store`] if a correction tile can't be read;
+    /// [`CacheError::Eval`] (not for a valid mesh).
     pub fn evaluate(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
         self.sync_pins()?;
         self.poll()?;
@@ -496,9 +604,12 @@ impl TileStore {
     /// dropped.
     ///
     /// The request is first counted against the budget: the chunks needed to hold its tiles
-    /// besides every slot pinned already. If that is more than the budget, nothing is evicted or
-    /// pinned. Evaluation can still run out of room (it pins parent tiles while it works); then
-    /// the pins this call took are released and the pins held before are untouched.
+    /// besides every slot pinned already, plus the slots an evaluation pins while it works (two
+    /// levels of a cone, see [`StoreConfig::minimum_budget`]). If that is more than the budget,
+    /// nothing is evicted or pinned. The count packs slots into chunks, so pins spread over
+    /// more chunks than that can still leave an evaluation short of room; then, as when a
+    /// correction tile can't be read, the pins this call took are released and the pins held
+    /// before are untouched.
     ///
     /// # Errors
     ///
@@ -716,8 +827,8 @@ impl TileStore {
     ///
     /// As [`TileStore::evaluate`]; nothing stays pinned then.
     fn pin_one(&mut self, key: TileKey) -> Result<Pinned, CacheError> {
-        let evaluated = self.ensure_positions(key)?;
-        self.evaluated.pin(evaluated)?;
+        let held = self.pin_current(BTreeSet::from([key]))?;
+        let evaluated = held.first().map(|&(_, id)| id).ok_or(PoolError::Stale)?;
         let correction = self.load_correction(key).and_then(|id| {
             self.corrections.pin(id)?;
             Ok(id)
@@ -732,20 +843,28 @@ impl TileStore {
     }
 
     /// Whether pinning `keys` fits the budget: the chunks each pool needs to hold its pinned
-    /// slots besides these tiles, plus one slot per tile, against the budget. Slots are counted
-    /// as if packed into chunks; pins spread over chunks can still run a pool out of room later.
+    /// slots besides these tiles, one slot per tile, and the store's own headroom (an
+    /// evaluation's pins, and the correction slot it loads), against the budget. Slots are
+    /// counted as if packed into chunks; pins spread over chunks can still run a pool out of
+    /// room later.
     ///
     /// # Errors
     ///
     /// [`CacheError::OverBudget`].
     fn check_pin_budget(&self, keys: &BTreeSet<TileKey>) -> Result<(), CacheError> {
-        /// Bytes of chunks `pool` needs for its pinned slots outside `keys`, plus one per key.
-        fn chunks_needed<T: bytemuck::Pod>(pool: &Pool<T>, keys: &BTreeSet<TileKey>) -> usize {
+        /// Bytes of chunks `pool` needs for its pinned slots outside `keys`, one per key, and
+        /// `headroom` more.
+        fn chunks_needed<T: bytemuck::Pod>(
+            pool: &Pool<T>,
+            keys: &BTreeSet<TileKey>,
+            headroom: usize,
+        ) -> usize {
             let pinned_here = keys.iter().filter(|key| pool.is_pinned(key)).count();
-            let slots = pool.pinned_slots().saturating_sub(pinned_here) + keys.len();
+            let slots = pool.pinned_slots().saturating_sub(pinned_here) + keys.len() + headroom;
             slots.div_ceil(pool.per_chunk() as usize) * pool.chunk_bytes()
         }
-        let needed = chunks_needed(&self.evaluated, keys) + chunks_needed(&self.corrections, keys);
+        let needed = chunks_needed(&self.evaluated, keys, self.headroom.evaluated)
+            + chunks_needed(&self.corrections, keys, 1);
         if needed > self.budget.limit() {
             return Err(CacheError::OverBudget {
                 tiles: keys.len(),
@@ -788,10 +907,16 @@ impl TileStore {
         #[cfg(test)]
         self.log.file_reads.push(key);
         let slot = self.corrections.get_mut(id).ok_or(PoolError::Stale)?;
-        let filled = match self
+        let read = self
             .file
-            .read_displacement_into(&key, slot, &mut self.read_scratch)
-        {
+            .read_displacement_into(&key, slot, &mut self.read_scratch);
+        #[cfg(test)]
+        let read = if self.unreadable == Some(key) {
+            Err(io::Error::other("an unreadable tile, for the test").into())
+        } else {
+            read
+        };
+        let filled = match read {
             Ok(Some(_)) => Ok(()),
             Ok(None) => slot.reset(key.side()).map_err(CacheError::from),
             Err(e) => Err(e.into()),
@@ -907,8 +1032,7 @@ impl TileStore {
         }
     }
 
-    /// The slot of `key`'s current positions: cached and fresh, else computed (into a new slot,
-    /// or in place over a stale one).
+    /// The slot of `key`'s current positions: cached and fresh, else evaluated coarse to fine.
     ///
     /// # Errors
     ///
@@ -917,23 +1041,147 @@ impl TileStore {
         if let Some((id, Freshness::Fresh)) = self.evaluated.lookup(&key) {
             return Ok(id);
         }
-        let region = Region::of_tile(&key);
-        let parents = parent_tiles(&self.mesh, region)?;
-        let mut held = Vec::with_capacity(parents.len());
-        // The tile is stored and recorded before its parents are unpinned: a parent evicted in
-        // between would take its node, and the edges to its own parents, out of the graph.
-        let computed = self
-            .predict_into_scratch(key, region, &parents, &mut held)
-            .and_then(|()| self.store_positions(key, &parents));
-        let released = self.unpin_held(&held);
-        let id = computed?;
-        released?;
+        let held = self.pin_current(BTreeSet::from([key]))?;
+        let id = held.first().map(|&(_, id)| id).ok_or(PoolError::Stale)?;
+        self.unpin_held(&held)?;
         Ok(id)
     }
 
+    /// Makes every tile of `targets` (tiles of one level) current and pins it, evaluating its
+    /// dependency cone coarse to fine (see the module notes). Returns the tiles pinned, for the
+    /// caller to unpin with [`TileStore::unpin_held`]; nothing stays pinned on error.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate`].
+    fn pin_current(&mut self, targets: BTreeSet<TileKey>) -> Result<Held, CacheError> {
+        let cone = self.cone(targets)?;
+        let mut below = Held::new();
+        for level in cone.iter().rev() {
+            let built = self.pin_level(level, &below);
+            let released = self.unpin_held(&below);
+            below = built?;
+            if let Err(e) = released {
+                // Pinned slots are never freed, so this doesn't happen; this level's pins go
+                // too.
+                self.unpin_held(&below)?;
+                return Err(e);
+            }
+        }
+        Ok(below)
+    }
+
+    /// The dependency cone of `targets`, finest level first: the targets, then the parents of
+    /// every tile of the level above, down to the first level whose tiles are all current, or
+    /// to level 1 (predicted from the mesh). Each tile comes with its parents, except on a
+    /// current coarsest level.
+    ///
+    /// The parents of a current tile are listed with the rest of its level: a tile current now
+    /// may be evicted while the coarser levels are built, and is then rebuilt from them.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] (not for a valid key).
+    fn cone(&mut self, targets: BTreeSet<TileKey>) -> Result<Vec<ConeLevel>, CacheError> {
+        let mut cone = Vec::new();
+        let mut tiles = targets;
+        loop {
+            if tiles.iter().all(|key| self.is_current(key)) {
+                cone.push(tiles.into_iter().map(|key| (key, Vec::new())).collect());
+                return Ok(cone);
+            }
+            let level = tiles
+                .into_iter()
+                .map(|key| Ok((key, self.parents_of(key)?)))
+                .collect::<Result<ConeLevel, CacheError>>()?;
+            tiles = level.values().flatten().copied().collect();
+            cone.push(level);
+            if tiles.is_empty() {
+                return Ok(cone);
+            }
+        }
+    }
+
+    /// Whether `key`'s evaluated positions are cached and current.
+    fn is_current(&mut self, key: &TileKey) -> bool {
+        matches!(self.evaluated.lookup(key), Some((_, Freshness::Fresh)))
+    }
+
+    /// The tiles `key`'s positions are predicted from, level 0 (the mesh) left out, in key order.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] (not for a valid key).
+    fn parents_of(&self, key: TileKey) -> Result<Vec<TileKey>, CacheError> {
+        let parents = parent_tiles(&self.mesh, Region::of_tile(&key))?;
+        Ok(parents
+            .into_iter()
+            .filter(|parent| parent.level() != Level::ZERO)
+            .collect())
+    }
+
+    /// Makes every tile of one cone level current, building those that aren't from `below` (the
+    /// level under it, pinned), and pins it. Returns them pinned, in key order; nothing this call
+    /// pinned stays pinned on error.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate`].
+    fn pin_level(&mut self, level: &ConeLevel, below: &Held) -> Result<Held, CacheError> {
+        let mut held = Held::with_capacity(level.len());
+        let pinned = level.iter().try_for_each(|(&key, parents)| {
+            let id = match self.evaluated.lookup(&key) {
+                Some((id, Freshness::Fresh)) => id,
+                _ => self.build(key, parents, below)?,
+            };
+            self.evaluated.pin(id)?;
+            held.push((key, id));
+            Ok::<_, CacheError>(())
+        });
+        if let Err(e) = pinned {
+            self.unpin_held(&held)?;
+            return Err(e);
+        }
+        Ok(held)
+    }
+
+    /// Computes `key`'s positions from its `parents` (all pinned in `below`) and its
+    /// corrections, and stores them in its slot (see [`TileStore::store_positions`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate`].
+    fn build(
+        &mut self,
+        key: TileKey,
+        parents: &[TileKey],
+        below: &Held,
+    ) -> Result<SlotId<EvaluatedSlot>, CacheError> {
+        // Nothing acquires a slot between this load and the read below, so the correction slot
+        // needn't be pinned.
+        let correction = self.load_correction(key)?;
+        let corrections = self
+            .corrections
+            .get(correction)
+            .ok_or(PoolError::Stale)?
+            .view()?;
+        let source = Resident {
+            mesh: &self.mesh,
+            pool: &self.evaluated,
+            tiles: below,
+        };
+        let prediction = predict_region(&self.mesh, &source, Region::of_tile(&key))?;
+        let out = prefix_mut(&mut self.scratch, vertex_count(&key))?;
+        prediction.apply_into(|i, j| corrections.get(i, j).unwrap_or(Vec3::ZERO), out)?;
+        self.store_positions(key, parents)
+    }
+
     /// Copies the positions in the scratch buffer into `key`'s slot (a new one, or its stale
-    /// one in place), marks it fresh and records it as predicted from `parents`, which the
-    /// caller still holds pinned.
+    /// one in place), marks it fresh and records it as predicted from `parents`.
+    ///
+    /// The caller holds `parents` pinned: the tile is recorded before they can leave the pool,
+    /// so their nodes, and their own parent edges, are still in the dependency graph (see
+    /// [`crate::deps`]).
     ///
     /// # Errors
     ///
@@ -941,7 +1189,7 @@ impl TileStore {
     fn store_positions(
         &mut self,
         key: TileKey,
-        parents: &BTreeSet<TileKey>,
+        parents: &[TileKey],
     ) -> Result<SlotId<EvaluatedSlot>, CacheError> {
         // A stale slot (pinned elsewhere, so still here) is overwritten in place: its handles
         // stay valid.
@@ -959,49 +1207,8 @@ impl TileStore {
         Ok(id)
     }
 
-    /// Evaluates and pins each parent tile (level 0 is the mesh), loads `key`'s corrections,
-    /// predicts `region` and applies them into the scratch buffer. The pinned parents are in
-    /// `held` for the caller to unpin, even on error.
-    ///
-    /// # Errors
-    ///
-    /// As [`TileStore::evaluate`].
-    fn predict_into_scratch(
-        &mut self,
-        key: TileKey,
-        region: Region,
-        parents: &BTreeSet<TileKey>,
-        held: &mut Held,
-    ) -> Result<(), CacheError> {
-        for &parent in parents {
-            if parent.level() == Level::ZERO {
-                continue;
-            }
-            let id = self.ensure_positions(parent)?;
-            self.evaluated.pin(id)?;
-            held.push((parent, id));
-        }
-        // Nothing acquires a slot between this load and the read below, so the correction slot
-        // needn't be pinned.
-        let correction = self.load_correction(key)?;
-        let corrections = self
-            .corrections
-            .get(correction)
-            .ok_or(PoolError::Stale)?
-            .view()?;
-        let source = Resident {
-            mesh: &self.mesh,
-            pool: &self.evaluated,
-            tiles: held,
-        };
-        let prediction = predict_region(&self.mesh, &source, region)?;
-        let out = prefix_mut(&mut self.scratch, vertex_count(&key))?;
-        prediction.apply_into(|i, j| corrections.get(i, j).unwrap_or(Vec3::ZERO), out)?;
-        Ok(())
-    }
-
     /// The slot of `key`'s current positions and normals: cached, else the normals are computed
-    /// from the positions of its [`normal_tiles`], each evaluated and pinned.
+    /// from the positions of its [`normal_tiles`], made current together as one cone.
     ///
     /// # Errors
     ///
@@ -1016,45 +1223,33 @@ impl TileStore {
         let mut inputs = normal_tiles(&self.mesh, region)?;
         // The tile's own block is among them; inserting it makes that plain.
         inputs.insert(key);
-        let mut held = Vec::with_capacity(inputs.len());
-        // Recorded while the inputs are pinned, as positions are (see `ensure_positions`).
-        let computed = self
-            .normals_into_slot(key, region, &inputs, &mut held)
-            .inspect(|_| {
-                self.deps.record_normals(key, &inputs);
-                #[cfg(test)]
-                self.log.normals.push(key);
-            });
+        let held = self.pin_current(inputs)?;
+        let computed = self.normals_from(key, region, &held);
         let released = self.unpin_held(&held);
         let id = computed?;
         released?;
         Ok(id)
     }
 
-    /// Evaluates and pins each of `inputs` (which include `key`), computes `region`'s normals
-    /// and writes them into `key`'s slot, which it returns. The pinned tiles are in `held` for
-    /// the caller to unpin, even on error.
+    /// Computes `region`'s normals from `held` (`key`'s normal inputs, pinned), writes them into
+    /// `key`'s slot, which it returns, and records them while the inputs are still pinned (as
+    /// [`TileStore::store_positions`] records positions).
     ///
     /// # Errors
     ///
     /// As [`TileStore::evaluate`].
-    fn normals_into_slot(
+    fn normals_from(
         &mut self,
         key: TileKey,
         region: Region,
-        inputs: &BTreeSet<TileKey>,
-        held: &mut Held,
+        held: &Held,
     ) -> Result<SlotId<EvaluatedSlot>, CacheError> {
-        let mut own = None;
-        for &input in inputs {
-            let id = self.ensure_positions(input)?;
-            self.evaluated.pin(id)?;
-            held.push((input, id));
-            if input == key {
-                own = Some(id);
-            }
-        }
-        let own = own.ok_or(PoolError::Stale)?;
+        let own = held
+            .binary_search_by_key(&key, |&(k, _)| k)
+            .ok()
+            .and_then(|at| held.get(at))
+            .map(|&(_, id)| id)
+            .ok_or(PoolError::Stale)?;
         let n = vertex_count(&key);
         let source = Resident {
             mesh: &self.mesh,
@@ -1069,6 +1264,9 @@ impl TileStore {
         )?;
         let slot = self.evaluated.get_mut(own).ok_or(PoolError::Stale)?;
         prefix_mut(&mut slot.normals, n)?.copy_from_slice(prefix(&self.scratch, n)?);
+        self.deps.record_normals(key, held.iter().map(|(k, _)| k));
+        #[cfg(test)]
+        self.log.normals.push(key);
         Ok(own)
     }
 

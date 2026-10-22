@@ -248,12 +248,19 @@ impl<T: Pod> std::fmt::Debug for Pool<T> {
 }
 
 impl<T: Pod> Pool<T> {
-    /// An empty pool whose chunks hold as many slots as fit in `chunk_bytes`, at least one.
-    pub(crate) fn new(chunk_bytes: usize) -> Self {
+    /// How a pool asked for chunks of `chunk_bytes` lays them out: slots per chunk (as many as
+    /// fit, at least one) and the bytes a chunk of them really takes.
+    pub(crate) fn layout(chunk_bytes: usize) -> (u32, usize) {
         let size = size_of::<T>().max(1);
         let per_chunk = u32::try_from((chunk_bytes / size).max(1)).unwrap_or(u32::MAX);
+        (per_chunk, size * per_chunk as usize)
+    }
+
+    /// An empty pool whose chunks hold as many slots as fit in `chunk_bytes`, at least one.
+    pub(crate) fn new(chunk_bytes: usize) -> Self {
+        let (per_chunk, chunk_bytes) = Self::layout(chunk_bytes);
         Self {
-            chunk_bytes: size * per_chunk as usize,
+            chunk_bytes,
             per_chunk,
             chunks: Vec::new(),
             meta: Vec::new(),
@@ -309,7 +316,7 @@ impl<T: Pod> Pool<T> {
 
     /// Bytes of the mapped chunks: what the budget counts for this pool.
     pub(crate) fn bytes(&self) -> usize {
-        self.chunks.iter().flatten().count() * self.chunk_bytes
+        self.mapped_chunks() * self.chunk_bytes
     }
 
     /// `key`'s slot and whether its contents are current, marking it referenced.
@@ -672,6 +679,11 @@ impl<T: Pod> Pool<T> {
         if let Some(key) = key {
             self.index.remove(&key);
         }
+    }
+
+    /// Chunks mapped now.
+    fn mapped_chunks(&self) -> usize {
+        self.chunks.iter().flatten().count()
     }
 
     /// Chunks ever mapped (mapped now or not).

@@ -90,8 +90,9 @@ fn roomy() -> StoreConfig {
 /// Six chunks of four evaluated slots (or fifteen correction slots).
 ///
 /// About a sixth of the cube's 156 tiles fit, so evaluation evicts constantly and dirty tiles
-/// are written back. A cold level-8 evaluation pins about four parents per level at its peak, so
-/// this is close to the least that evaluates every tile.
+/// are written back. It is the cube's minimum budget rounded up to whole chunks: an evaluation
+/// pins at most two cone levels of nine tiles, which take five evaluated chunks, and one
+/// correction chunk goes beside them.
 fn tight() -> StoreConfig {
     config(6, 4)
 }
@@ -585,27 +586,44 @@ fn pins_survive_pressure() {
 
 #[test]
 fn corrections_take_chunks_back_from_evaluated_tiles() {
-    // Chunks of one evaluated slot or three correction slots, five of them.
-    let config = config(5, 1);
+    // Chunks of one evaluated slot or three correction slots: the cube's minimum is eighteen
+    // evaluated chunks and a correction chunk.
+    let config = config(19, 1);
     let dir = TestDir::new();
     let mesh = mesh();
     let mut store = new_store(&dir, "work.bcp", &mesh, config);
-    let faces: Vec<TileKey> = tiles(&mesh, 1, 1);
-    // Three pinned faces fill the first correction chunk and three evaluated chunks.
-    let guard = store.pin(&faces[..3]).unwrap();
-    assert_eq!(
-        store.corrections.bytes(),
-        store.corrections.chunk_bytes(),
-        "one correction chunk"
+    let all = tiles(&mesh, 1, 3);
+    for key in &all {
+        store.evaluate(*key).unwrap();
+    }
+    assert!(
+        store.bytes() + store.corrections.chunk_bytes() > config.budget_bytes,
+        "the evaluated pool has spent the budget"
     );
-    let dense = dense(&mesh, &CorrectionMap::new());
-    // The fourth face's evaluated slot takes the second correction chunk back; the fifth face's
-    // correction tile then finds the correction pool pinned full and the budget spent, with the
-    // fourth face's evaluated chunk the only one to give: without taking it, the evaluated pool
-    // would starve the corrections.
-    assert_positions(&mut store, &dense, &faces[3..], "faces 4–6");
+    // Every correction slot pinned: the next correction tile has no slot to reuse.
+    let resident: Vec<SlotId<CorrectionSlot>> = all
+        .iter()
+        .filter_map(|key| store.corrections.find(key))
+        .collect();
+    for &id in &resident {
+        store.corrections.pin(id).unwrap();
+    }
+    let (corrections, evaluated) = (store.corrections.bytes(), store.evaluated.bytes());
+    let fresh = tiles(&mesh, 4, 4)[0];
+    assert!(store.corrections.find(&fresh).is_none(), "not resident yet");
+    store.correction(fresh).unwrap();
+    assert!(
+        store.corrections.bytes() > corrections && store.evaluated.bytes() < evaluated,
+        "an evaluated chunk was taken back for a correction chunk"
+    );
     assert!(store.bytes() <= config.budget_bytes, "within the budget");
-    drop(guard);
+    for &id in &resident {
+        assert!(
+            store.corrections.get(id).is_some(),
+            "pinned corrections stay"
+        );
+        store.corrections.unpin(id).unwrap();
+    }
 }
 
 #[test]
@@ -721,20 +739,57 @@ fn bad_requests_are_refused() {
 }
 
 #[test]
-fn a_pin_that_runs_out_of_room_releases_only_its_own_pins() {
+fn a_pin_without_room_for_its_evaluation_is_refused_up_front() {
     let dir = TestDir::new();
     let mesh = mesh();
     let mut store = new_store(&dir, "work.bcp", &mesh, tight());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 100, 15));
     let finest = tiles(&mesh, TOP, TOP);
     let held = store.pin(&finest[..1]).unwrap();
     let id = store.evaluated.find(&finest[0]).unwrap();
-    // Within the budget counted as packed slots, but each tile's evaluation pins its parents
-    // too, and there isn't room for both.
-    let wanted: Vec<TileKey> = finest.iter().skip(1).step_by(9).copied().collect();
+    let resident: Vec<TileKey> = tiles(&mesh, 1, TOP)
+        .into_iter()
+        .filter(|key| store.evaluated.find(key).is_some())
+        .collect();
+    let (bytes, written) = (store.bytes(), store.file.len());
+    // Two tiles fit the budget as slots, but not with the room their evaluation pins besides.
+    let wanted = [finest[9], finest[40]];
     let refused = store.pin(&wanted);
     assert!(
-        matches!(refused, Err(CacheError::Pool(PoolError::Full))),
-        "ran out of room: {refused:?}"
+        matches!(refused, Err(CacheError::OverBudget { .. })),
+        "refused before evaluating: {refused:?}"
+    );
+    assert_eq!(store.bytes(), bytes, "no chunk mapped or given back");
+    assert_eq!(store.file.len(), written, "nothing written back");
+    for key in &resident {
+        assert!(store.evaluated.find(key).is_some(), "{key:?} not evicted");
+    }
+    assert_eq!(store.evaluated.find(&finest[0]), Some(id), "in its slot");
+    assert!(store.evaluated.is_pinned(&finest[0]), "and pinned");
+    drop(held);
+}
+
+#[test]
+fn a_pin_that_fails_part_way_releases_only_its_own_pins() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, _) = store_on_disk(&dir, "work.bcp", &mesh, pinning(), 100, 16);
+    let finest = tiles(&mesh, TOP, TOP);
+    let held = store.pin(&finest[..1]).unwrap();
+    let id = store.evaluated.find(&finest[0]).unwrap();
+    let on_disk = finest
+        .iter()
+        .skip(1)
+        .find(|key| store.file.contains(key))
+        .copied()
+        .unwrap();
+    store.unreadable = Some(on_disk);
+    let wanted = [finest[1].min(on_disk), finest[1].max(on_disk)];
+    let refused = store.pin(&wanted);
+    assert!(
+        matches!(refused, Err(CacheError::Store(_))),
+        "the unreadable tile fails the pin: {refused:?}"
     );
     assert_eq!(
         (
@@ -746,6 +801,31 @@ fn a_pin_that_runs_out_of_room_releases_only_its_own_pins() {
     );
     assert_eq!(store.evaluated.find(&finest[0]), Some(id), "in its slot");
     drop(held);
+}
+
+#[test]
+fn a_budget_below_the_minimum_is_refused() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let minimum = tight().minimum_budget(&mesh);
+    assert!(
+        minimum <= tight().budget_bytes,
+        "the tests' tight budget is at least the minimum"
+    );
+    assert!(
+        minimum > config(5, 4).budget_bytes,
+        "and a chunk less is not"
+    );
+    let file = ProjectFile::create(&dir.path("small.bcp")).unwrap();
+    let small = StoreConfig {
+        budget_bytes: minimum - 1,
+        ..tight()
+    };
+    let refused = TileStore::open(Arc::clone(&mesh), file, small);
+    assert!(
+        matches!(refused, Err(CacheError::BudgetTooSmall { minimum: m }) if m == minimum),
+        "refused: {refused:?}"
+    );
 }
 
 #[test]
@@ -783,6 +863,51 @@ fn shrinking_gives_back_evaluated_chunks_before_corrections() {
     );
     let dense = dense(&mesh, &map);
     assert_positions(&mut store, &dense, &all, "after shrinking to nothing");
+}
+
+/// Evaluates every tile of levels 1–8 cold, in a random order, on a new store with `config`.
+///
+/// The order and a few edits come from `seed`; every fifth tile's normals are computed too. The
+/// dependency graph is checked after every step, and the positions against the dense evaluation
+/// at the end if `check_dense`.
+fn random_order_evaluation(config: StoreConfig, seed: u64, check_dense: bool) {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 20, seed));
+    let mut order = tiles(&mesh, 1, TOP);
+    let mut rng = Rng(seed);
+    for n in (1..order.len()).rev() {
+        order.swap(n, rng.below(u32::try_from(n + 1).unwrap()) as usize);
+    }
+    for (n, key) in order.iter().enumerate() {
+        if let Err(e) = store.evaluate(*key) {
+            panic!("seed {seed}: evaluating {key:?}: {e:?}");
+        }
+        if n % 5 == 0
+            && let Err(e) = store.normals(*key)
+        {
+            panic!("seed {seed}: normals of {key:?}: {e:?}");
+        }
+        if let Err(broken) = store.deps.check_invariants() {
+            panic!("seed {seed}: after {key:?}: dependency graph: {broken}");
+        }
+    }
+    if check_dense {
+        let dense = dense(&mesh, &map);
+        assert_positions(&mut store, &dense, &order, &format!("seed {seed}"));
+    }
+}
+
+#[test]
+fn cold_evaluation_in_any_order_fits_the_minimum_budget() {
+    // Each seed has a store of its own, so they run side by side.
+    thread::scope(|scope| {
+        for seed in 1..=40 {
+            scope.spawn(move || random_order_evaluation(tight(), seed, seed % 10 == 0));
+        }
+    });
 }
 
 /// Polls until every prefetch request is answered; returns how many tiles were installed.
