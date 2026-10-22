@@ -15,6 +15,22 @@ use crate::tiles::tests::{
     tiles,
 };
 
+/// Asserts that a save went through with nothing to report: crash protection runs, every edit
+/// is protected, and the old recovery file was deleted.
+fn assert_saved(saved: Result<SaveOutcome, ProjectError>) {
+    let outcome = saved.unwrap();
+    assert!(
+        outcome.protection.is_active() && outcome.unprotected.is_empty() && outcome.kept.is_empty(),
+        "{outcome:?}"
+    );
+}
+
+/// Whether `e` says crash protection paused because of an I/O error: a recovery file that
+/// couldn't be put in place.
+fn paused_by_io(e: &ProjectError) -> bool {
+    matches!(e, ProjectError::ProtectionPaused(cause) if matches!(**cause, ProjectError::Io(_)))
+}
+
 /// A configuration with room for every tile, and recovery files in `dir`'s `recovery`.
 fn config(dir: &TestDir) -> ProjectConfig {
     ProjectConfig {
@@ -74,7 +90,7 @@ fn new_edit_save_as_close_open_evaluates_as_dense() {
         "a save needs a path first"
     );
     let path = dir.path("p.bcrf");
-    project.save_as(&path).unwrap();
+    assert_saved(project.save_as(&path));
     assert!(!project.has_unsaved_edits(), "all saved");
     assert_eq!(project.path(), Some(path.as_path()), "the new path");
     project.close(false).unwrap();
@@ -111,11 +127,11 @@ fn each_save_is_a_save_point_that_opens_to_its_state() {
     let mut map = CorrectionMap::new();
     let mut states = Vec::new();
     stroke(&mut project, &mut map, 120, 11);
-    project.save_as(&path).unwrap();
+    assert_saved(project.save_as(&path));
     states.push(map.clone());
     for seed in [12, 13] {
         stroke(&mut project, &mut map, 120, seed);
-        project.save().unwrap();
+        assert_saved(project.save());
         states.push(map.clone());
     }
     project.close(false).unwrap();
@@ -141,15 +157,15 @@ fn a_save_starts_an_empty_recovery_file_on_its_save_point() {
     let path = dir.path("p.bcrf");
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     let id = project.id();
-    let first = project.recovery_path().to_path_buf();
+    let first = project.recovery_path().unwrap().to_path_buf();
     let mut map = CorrectionMap::new();
     stroke(&mut project, &mut map, 100, 21);
-    project.save_as(&path).unwrap();
+    assert_saved(project.save_as(&path));
     let new_id = project.id();
     assert_ne!(new_id, id, "a saved-as project has an id of its own");
     stroke(&mut project, &mut map, 100, 22);
-    project.save().unwrap();
-    let recovery = project.recovery_path().to_path_buf();
+    assert_saved(project.save());
+    let recovery = project.recovery_path().unwrap().to_path_buf();
     assert!(!first.exists(), "the first recovery file is gone");
     assert_eq!(
         recovery_files(&dir),
@@ -205,7 +221,7 @@ fn save_as_gives_a_new_id_and_leaves_the_old_file_untouched() {
     let mut map = CorrectionMap::new();
     let mut first = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut first, &mut map, 150, 31);
-    first.save_as(&old).unwrap();
+    assert_saved(first.save_as(&old));
     let saved = map.clone();
     first.close(false).unwrap();
     let old_bytes = fs::read(&old).unwrap();
@@ -217,13 +233,13 @@ fn save_as_gives_a_new_id_and_leaves_the_old_file_untouched() {
         matches!(project.save_as(&old), Err(ProjectError::Exists(_))),
         "an existing path is refused"
     );
-    project.save_as(&new).unwrap();
+    assert_saved(project.save_as(&new));
     assert_ne!(project.id(), old_id, "a new id");
     // The old file is no longer held: it opens elsewhere.
     assert_eq!(fs::read(&old).unwrap(), old_bytes, "the old file untouched");
     assert_project_file(&old, &saved, "the old file's state");
     stroke(&mut project, &mut map, 50, 33);
-    project.save().unwrap();
+    assert_saved(project.save());
     project.close(false).unwrap();
     assert_eq!(fs::read(&old).unwrap(), old_bytes, "still untouched");
     assert_project_file(&new, &map, "the new file holds every tile");
@@ -235,47 +251,199 @@ fn save_as_gives_a_new_id_and_leaves_the_old_file_untouched() {
     assert_eq!(names, Vec::<String>::new(), "no temporary file left");
 }
 
+/// A save whose new recovery file can't be put in place (a crash before its rename, as far as
+/// the file goes) goes through all the same: crash protection pauses, and the next save puts it
+/// back.
 #[test]
-fn a_save_that_cannot_make_its_recovery_file_keeps_the_old_one() {
+fn a_save_that_cannot_make_its_recovery_file_goes_through_and_pauses_protection() {
     let dir = TestDir::new();
     let mesh = mesh();
     let path = dir.path("p.bcrf");
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     let mut map = CorrectionMap::new();
     stroke(&mut project, &mut map, 100, 41);
-    project.save_as(&path).unwrap();
+    assert_saved(project.save_as(&path));
     stroke(&mut project, &mut map, 100, 42);
-    let old = project.recovery_path().to_path_buf();
-    let old_name = old.file_name().unwrap().to_str().unwrap().to_owned();
+    let old = project.recovery_path().unwrap().to_path_buf();
 
-    // A crash after the new recovery file is written, before it is renamed into place.
     project.fail_next_recovery();
-    let failed = project.save();
-    assert!(matches!(failed, Err(ProjectError::Io(_))), "{failed:?}");
+    let outcome = project.save().unwrap();
+    assert!(
+        matches!(&outcome.protection, Protection::Paused(cause) if matches!(**cause, ProjectError::Io(_))),
+        "paused, and why: {outcome:?}"
+    );
+    assert!(
+        outcome.unprotected.is_empty() && outcome.kept.is_empty(),
+        "nothing else to report: {outcome:?}"
+    );
+    assert!(!project.has_unsaved_edits(), "saved");
+    assert_eq!(
+        project.file.as_ref().unwrap().save_points().unwrap().len(),
+        2,
+        "the save point is written"
+    );
+    assert!(!project.protection().is_active(), "the project says so");
+    assert_eq!(project.recovery_path(), None, "no recovery file");
+    assert!(!old.exists(), "the old one, all saved, is gone");
     let names = recovery_files(&dir);
-    assert!(old.exists(), "the old recovery file is kept");
     assert!(
-        names
-            .iter()
-            .all(|name| *name == old_name || is_temporary(name)),
-        "no new recovery file under a real name: {names:?}"
+        names.iter().all(|name| is_temporary(name)),
+        "no recovery file under a real name: {names:?}"
     );
-    assert!(project.has_unsaved_edits(), "still unsaved");
-    assert_eq!(project.recovery_path(), old, "still writing the old one");
-    // The old file still holds every edit, at a durable save point, over the project's
-    // previous save point.
-    let working = project.store().working();
-    assert!(working.keys().count() > 0, "the edits are still there");
 
-    // Editing and saving go on.
+    // Editing and saving go on, and the save puts protection back.
     stroke(&mut project, &mut map, 50, 43);
-    project.save().unwrap();
-    assert!(
-        !old.exists(),
-        "the old file goes once the new one is in place"
-    );
+    assert_saved(project.save());
+    assert!(project.protection().is_active(), "protected again");
+    assert!(project.recovery_path().is_some(), "with a recovery file");
     project.close(false).unwrap();
     assert_project_file(&path, &map, "every edit saved");
+}
+
+/// Makes a directory read-only for as long as it lives, and writable again when dropped, even
+/// by a failing test.
+#[derive(Debug)]
+struct Unwritable(PathBuf);
+
+impl Unwritable {
+    /// Makes `dir` read-only.
+    fn new(dir: &Path) -> Self {
+        set_mode(dir, 0o555);
+        Self(dir.to_path_buf())
+    }
+}
+
+/// Makes the directory writable again.
+impl Drop for Unwritable {
+    fn drop(&mut self) {
+        set_mode(&self.0, 0o755);
+    }
+}
+
+/// Sets `dir`'s permission bits to `mode`.
+fn set_mode(dir: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// The number of save points of the project file `project` holds.
+fn save_points(project: &Project) -> usize {
+    project.file.as_ref().unwrap().save_points().unwrap().len()
+}
+
+/// A recovery directory that can't be written stops no save, and protection resumes after.
+///
+/// Each save goes through with crash protection paused, and edits and saves go on. Once the
+/// directory can be written again, the next try puts protection back, holding every edit since
+/// the last save, and deletes the old recovery file the first save couldn't.
+#[test]
+fn saves_go_through_an_unwritable_recovery_dir_and_protection_resumes_after() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    let mut map = CorrectionMap::new();
+    stroke(&mut project, &mut map, 80, 171);
+    assert_saved(project.save_as(&path));
+    stroke(&mut project, &mut map, 80, 172);
+    let old = project.recovery_path().unwrap().to_path_buf();
+
+    let unwritable = Unwritable::new(&dir.path("recovery"));
+    let outcome = project.save().unwrap();
+    assert!(!outcome.protection.is_active(), "paused: {outcome:?}");
+    let kept: Vec<&Path> = outcome.kept.iter().map(|k| k.path.as_path()).collect();
+    assert_eq!(kept, [&old], "the old file can't be deleted: {outcome:?}");
+    assert!(outcome.unprotected.is_empty(), "{outcome:?}");
+    assert!(!project.has_unsaved_edits(), "saved");
+    assert_eq!(save_points(&project), 2, "the save point is written");
+    assert_eq!(project.recovery_path(), None, "no recovery file");
+    assert!(!project.protection().is_active(), "the project says so");
+    assert_eq!(
+        find_recoveries(&dir.path("recovery")).unwrap(),
+        [],
+        "the old file is held, so not offered"
+    );
+
+    stroke(&mut project, &mut map, 80, 173);
+    let again = project.save().unwrap();
+    assert!(
+        !again.protection.is_active() && again.kept.is_empty() && again.unprotected.is_empty(),
+        "saved again, still paused: {again:?}"
+    );
+    assert!(!project.has_unsaved_edits(), "saved again");
+    assert_eq!(save_points(&project), 3, "a save point more");
+
+    drop(unwritable);
+    stroke(&mut project, &mut map, 80, 174);
+    assert!(
+        !project.protection().is_active(),
+        "not tried before the wait is over"
+    );
+    project.tick(Instant::now() + ROLL_OVER_RETRY_MAX).unwrap();
+    assert!(project.protection().is_active(), "protected again");
+    let recovery = project.recovery_path().unwrap().to_path_buf();
+    assert_eq!(
+        recovery_files(&dir),
+        [recovery.file_name().unwrap().to_str().unwrap()],
+        "one recovery file: the old one is gone too"
+    );
+
+    // A crash now loses nothing: the new recovery file holds the edits since the last save.
+    drop(project);
+    let candidates = find_recoveries(&dir.path("recovery")).unwrap();
+    let [candidate] = candidates.as_slice() else {
+        panic!("one recovery file: {candidates:?}");
+    };
+    assert_eq!(
+        candidate.status,
+        CandidateStatus::Restorable,
+        "{candidate:?}"
+    );
+    let mut restored = Project::restore(candidate, config(&dir)).unwrap();
+    assert_positions(
+        restored.store(),
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "restored after protection resumed",
+    );
+    assert_saved(restored.save());
+    restored.close(false).unwrap();
+    assert_project_file(&path, &map, "every edit saved");
+}
+
+/// A save after a failed sync, with no roll-over possible, writes the project file.
+///
+/// The recovery writer has failed to sync, and the recovery directory can't be written, so no
+/// roll-over can be made: the project file is written all the same, and holds every edit, the
+/// failed flush's too.
+#[test]
+fn a_save_after_a_failed_sync_with_an_unwritable_recovery_dir_writes_the_project_file() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    let mut map = CorrectionMap::new();
+    stroke(&mut project, &mut map, 80, 181);
+    assert_saved(project.save_as(&path));
+    stroke_failing_its_sync(&mut project, &mut map, 80, 182);
+    let failed = project.recovery_path().unwrap().to_path_buf();
+
+    let unwritable = Unwritable::new(&dir.path("recovery"));
+    let outcome = project.save().unwrap();
+    assert!(!outcome.protection.is_active(), "paused: {outcome:?}");
+    let kept: Vec<&Path> = outcome.kept.iter().map(|k| k.path.as_path()).collect();
+    assert_eq!(
+        kept,
+        [&failed],
+        "the failed file can't be deleted: {outcome:?}"
+    );
+    assert!(!project.has_unsaved_edits(), "saved");
+    assert_eq!(save_points(&project), 2, "the save point is written");
+
+    drop(unwritable);
+    project.close(false).unwrap();
+    assert_eq!(recovery_files(&dir), Vec::<String>::new(), "all deleted");
+    assert_project_file(&path, &map, "every edit, the failed flush's too");
 }
 
 /// A save as whose old recovery file can't be deleted: the session goes on with the new project
@@ -292,7 +460,7 @@ fn a_save_as_that_cannot_delete_the_old_recovery_file_goes_on_with_the_new_file(
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 100, 101);
     for (n, blocked) in [false, true].into_iter().enumerate() {
-        let old = project.recovery_path().to_path_buf();
+        let old = project.recovery_path().unwrap().to_path_buf();
         let id = project.id();
         fs::remove_file(&old).unwrap();
         if blocked {
@@ -301,17 +469,24 @@ fn a_save_as_that_cannot_delete_the_old_recovery_file_goes_on_with_the_new_file(
         let path = dir.path(&format!("p{n}.bcrf"));
         let saved = project.save_as(&path);
         if blocked {
+            let outcome = saved.unwrap();
+            let kept: Vec<&Path> = outcome.kept.iter().map(|k| k.path.as_path()).collect();
+            assert_eq!(kept, [&old], "the old file is reported: {outcome:?}");
             assert!(
-                matches!(&saved, Err(ProjectError::OldRecoveryKept { path: at, .. }) if *at == old),
-                "{saved:?}"
+                outcome.protection.is_active() && outcome.unprotected.is_empty(),
+                "and nothing else: {outcome:?}"
             );
             fs::remove_dir(&old).unwrap();
         } else {
-            saved.unwrap();
+            assert_saved(saved);
         }
         assert_eq!(project.path(), Some(path.as_path()), "{n}: the new path");
         assert_ne!(project.id(), id, "{n}: a new id");
-        assert_ne!(project.recovery_path(), old, "{n}: a new recovery file");
+        assert_ne!(
+            project.recovery_path().unwrap(),
+            old,
+            "{n}: a new recovery file"
+        );
         assert!(!project.has_unsaved_edits(), "{n}: saved");
         // Every tile read again, through the new project file.
         project.store().evict_all().unwrap();
@@ -322,7 +497,7 @@ fn a_save_as_that_cannot_delete_the_old_recovery_file_goes_on_with_the_new_file(
             "after the save as",
         );
         stroke(&mut project, &mut map, 40, 102 + n as u64);
-        project.save().unwrap();
+        assert_saved(project.save());
     }
     let path = project.path().unwrap().to_path_buf();
     let id = project.id();
@@ -342,7 +517,7 @@ fn close_keeps_the_recovery_file_only_when_asked() {
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 80, 51);
-    let kept = project.recovery_path().to_path_buf();
+    let kept = project.recovery_path().unwrap().to_path_buf();
     project.close(true).unwrap();
     // A project never saved lives in its recovery file: it holds every edit.
     let file = ProjectFile::open(&kept).unwrap();
@@ -361,7 +536,7 @@ fn close_keeps_the_recovery_file_only_when_asked() {
     drop(store);
 
     let other = Project::new((*mesh).clone(), config(&dir)).unwrap();
-    let gone = other.recovery_path().to_path_buf();
+    let gone = other.recovery_path().unwrap().to_path_buf();
     other.close(false).unwrap();
     assert!(!gone.exists(), "deleted when not asked to keep it");
     assert!(kept.exists(), "another project's file is left alone");
@@ -376,7 +551,7 @@ fn dropping_a_project_closes_its_writer_and_keeps_the_recovery_file() {
     // Edits with no stroke end: the drop's close flushes them.
     let edits = random_edits(&mesh, TOP, 60, 61);
     apply(project.store(), &mut map, &edits);
-    let path = project.recovery_path().to_path_buf();
+    let path = project.recovery_path().unwrap().to_path_buf();
     drop(project);
     let file = ProjectFile::open(&path).unwrap();
     let mut store = TileStore::open(file, roomy()).unwrap();
@@ -402,7 +577,7 @@ fn only_a_saved_project_file_opens_as_a_project() {
         "no save point"
     );
     let project = Project::new((*mesh).clone(), config(&dir)).unwrap();
-    let recovery = project.recovery_path().to_path_buf();
+    let recovery = project.recovery_path().unwrap().to_path_buf();
     project.close(true).unwrap();
     assert!(
         matches!(
@@ -430,13 +605,13 @@ fn the_default_recovery_dir_follows_xdg() {
 /// Fails the writer's next sync, makes a stroke, and polls until the project has rolled over
 /// to a new recovery file; returns the old one's path.
 fn fail_and_roll_over(project: &mut Project, map: &mut CorrectionMap, seed: u64) -> PathBuf {
-    let old = project.recovery_path().to_path_buf();
+    let old = project.recovery_path().unwrap().to_path_buf();
     // The flushes of earlier strokes finish first, so the sync that fails is this stroke's.
     project.finish_flushes().unwrap();
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
     stroke(project, map, 80, seed);
     let began = Instant::now();
-    while project.recovery_path() == old {
+    while project.recovery_path().unwrap() == old {
         project.poll().unwrap();
         assert!(
             began.elapsed() < Duration::from_secs(30),
@@ -469,7 +644,7 @@ fn a_failed_sync_rolls_over_to_a_new_recovery_file() {
     );
     // Edits go on into the new file.
     stroke(&mut project, &mut map, 40, 73);
-    let path = project.recovery_path().to_path_buf();
+    let path = project.recovery_path().unwrap().to_path_buf();
     project.close(true).unwrap();
     let file = ProjectFile::open(&path).unwrap();
     let mut store = TileStore::open(file, roomy()).unwrap();
@@ -489,7 +664,7 @@ fn a_saved_project_rolls_over_on_its_save_point_and_saves_after() {
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 80, 81);
-    project.save_as(&path).unwrap();
+    assert_saved(project.save_as(&path));
     let role = project.store().working().meta().role();
     stroke(&mut project, &mut map, 80, 82);
     fail_and_roll_over(&mut project, &mut map, 83);
@@ -502,7 +677,7 @@ fn a_saved_project_rolls_over_on_its_save_point_and_saves_after() {
         project.has_unsaved_edits(),
         "nothing saved by the roll-over"
     );
-    project.save().unwrap();
+    assert_saved(project.save());
     project.close(false).unwrap();
     assert_project_file(&path, &map, "saved after the roll-over");
     assert_eq!(recovery_files(&dir), Vec::<String>::new(), "all deleted");
@@ -518,7 +693,7 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
     // That stroke's flush finishes first: its sync failing would roll over (and fail) in the
     // next stroke's end, not in the polls below.
     project.finish_flushes().unwrap();
-    let old = project.recovery_path().to_path_buf();
+    let old = project.recovery_path().unwrap().to_path_buf();
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
     project.fail_next_recovery();
     stroke(&mut project, &mut map, 60, 92);
@@ -532,12 +707,17 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
             Err(e) => break e,
         }
     };
-    assert!(matches!(failed, ProjectError::Io(_)), "{failed:?}");
+    assert!(paused_by_io(&failed), "{failed:?}");
+    assert!(!project.protection().is_active(), "paused");
     assert!(
         old.exists(),
         "the old file is kept until a new one is in place"
     );
-    assert_eq!(project.recovery_path(), old, "still on the old file");
+    assert_eq!(
+        project.recovery_path().unwrap(),
+        old,
+        "still on the old file"
+    );
     // What the crash before the rename left: the old file, and the new one under its temporary
     // name only, already holding every edit. No file under a real name lacks them.
     let names = recovery_files(&dir);
@@ -559,12 +739,16 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
     // The calls of the frame loop wait a while before they try again.
     project.poll().unwrap();
     project.tick(Instant::now()).unwrap();
-    assert_eq!(project.recovery_path(), old, "not tried again at once");
+    assert_eq!(
+        project.recovery_path().unwrap(),
+        old,
+        "not tried again at once"
+    );
     // The first call once the wait is over tries again, and gets there.
     project.tick(Instant::now() + ROLL_OVER_RETRY).unwrap();
-    assert_ne!(project.recovery_path(), old, "rolled over");
+    assert_ne!(project.recovery_path().unwrap(), old, "rolled over");
     assert!(!old.exists(), "and only then the old file goes");
-    let path = project.recovery_path().to_path_buf();
+    let path = project.recovery_path().unwrap().to_path_buf();
     project.close(true).unwrap();
     let file = ProjectFile::open(&path).unwrap();
     let mut store = TileStore::open(file, roomy()).unwrap();
@@ -601,10 +785,10 @@ fn a_close_whose_last_sync_fails_keeps_the_ended_stroke() {
         let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
         stroke(&mut project, &mut map, 80, 151);
         if saved {
-            project.save_as(&dir.path("p.bcrf")).unwrap();
+            assert_saved(project.save_as(&dir.path("p.bcrf")));
         }
         stroke_failing_its_sync(&mut project, &mut map, 80, 152);
-        let failed = project.recovery_path().to_path_buf();
+        let failed = project.recovery_path().unwrap().to_path_buf();
         project.close(true).unwrap();
         assert!(
             !failed.exists(),
@@ -634,7 +818,7 @@ fn a_close_whose_last_sync_fails_still_deletes_the_recovery_file() {
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 80, 161);
-    project.save_as(&path).unwrap();
+    assert_saved(project.save_as(&path));
     let saved = map.clone();
     stroke_failing_its_sync(&mut project, &mut map, 80, 162);
     project.close(false).unwrap();
@@ -678,7 +862,7 @@ fn with_an_unreadable_edit(dir: &TestDir) -> (Project, TileKey, CorrectionMap, C
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh).clone(), config(dir)).unwrap();
     stroke(&mut project, &mut map, 100, 121);
-    project.save_as(&dir.path("p.bcrf")).unwrap();
+    assert_saved(project.save_as(&dir.path("p.bcrf")));
     let mut want = map.clone();
     let top = tiles(&mesh, TOP, TOP);
     let (lost, kept) = (top[5], top[30]);
@@ -697,7 +881,7 @@ fn with_an_unreadable_edit(dir: &TestDir) -> (Project, TileKey, CorrectionMap, C
     project.finish_flushes().unwrap();
     project.store().evict_all().unwrap();
     let loc = project.store().working().locate(&lost).unwrap();
-    damage(project.recovery_path(), loc);
+    damage(project.recovery_path().unwrap(), loc);
     (project, lost, map, want)
 }
 
@@ -705,10 +889,11 @@ fn with_an_unreadable_edit(dir: &TestDir) -> (Project, TileKey, CorrectionMap, C
 fn a_tile_lost_to_a_save_is_reported_and_the_saves_after_it_go_through() {
     let dir = TestDir::new();
     let (mut project, lost, _, mut want) = with_an_unreadable_edit(&dir);
-    let saved = project.save();
+    let outcome = project.save().unwrap();
+    assert_eq!(outcome.unprotected, [lost], "{outcome:?}");
     assert!(
-        matches!(&saved, Err(ProjectError::Unprotected(tiles)) if *tiles == [lost]),
-        "{saved:?}"
+        outcome.protection.is_active() && outcome.kept.is_empty(),
+        "{outcome:?}"
     );
     assert!(!project.has_unsaved_edits(), "the save went through");
     let other = tiles(&mesh(), TOP, TOP)[40];
@@ -718,9 +903,9 @@ fn a_tile_lost_to_a_save_is_reported_and_the_saves_after_it_go_through() {
         other,
         Vec3::new(0.0, 0.25, 0.0),
     );
-    project.save().unwrap();
+    assert_saved(project.save());
     let copy = dir.path("copy.bcrf");
-    project.save_as(&copy).unwrap();
+    assert_saved(project.save_as(&copy));
     project.close(false).unwrap();
     for path in [dir.path("p.bcrf"), copy] {
         assert_project_file(&path, &want, "the lost tile at its last saved state");
@@ -731,7 +916,7 @@ fn a_tile_lost_to_a_save_is_reported_and_the_saves_after_it_go_through() {
 fn a_tile_lost_to_a_roll_over_is_reported_and_saves_go_through() {
     let dir = TestDir::new();
     let (mut project, lost, _, mut want) = with_an_unreadable_edit(&dir);
-    let old = project.recovery_path().to_path_buf();
+    let old = project.recovery_path().unwrap().to_path_buf();
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
     let other = tiles(&mesh(), TOP, TOP)[40];
     interior(
@@ -742,7 +927,7 @@ fn a_tile_lost_to_a_roll_over_is_reported_and_saves_go_through() {
     );
     let began = Instant::now();
     let mut reported = Vec::new();
-    while project.recovery_path() == old {
+    while project.recovery_path().unwrap() == old {
         match project.poll() {
             Ok(()) => {}
             Err(ProjectError::Unprotected(tiles)) => reported.extend(tiles),
@@ -755,7 +940,7 @@ fn a_tile_lost_to_a_roll_over_is_reported_and_saves_go_through() {
         std::thread::yield_now();
     }
     assert_eq!(reported, [lost], "the lost tile is reported");
-    project.save().unwrap();
+    assert_saved(project.save());
     project.close(false).unwrap();
     assert_project_file(
         &dir.path("p.bcrf"),
@@ -774,7 +959,7 @@ fn a_save_goes_through_and_then_reports_what_is_unprotected() {
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 100, 131);
-    project.save_as(&path).unwrap();
+    assert_saved(project.save_as(&path));
     let mut want = map.clone();
     let top = tiles(&mesh, TOP, TOP);
     let (broken, kept) = (top[5], top[30]);
@@ -801,10 +986,15 @@ fn a_save_goes_through_and_then_reports_what_is_unprotected() {
         .unwrap();
     break_slot(project.store(), &broken);
     project.end_stroke().unwrap();
-    let saved = project.save();
+    let outcome = project.save().unwrap();
+    assert_eq!(
+        outcome.unprotected,
+        [broken],
+        "reported once, by the save: {outcome:?}"
+    );
     assert!(
-        matches!(&saved, Err(ProjectError::Unprotected(tiles)) if *tiles == [broken]),
-        "reported once, after the save: {saved:?}"
+        outcome.protection.is_active() && outcome.kept.is_empty(),
+        "{outcome:?}"
     );
     assert!(!project.has_unsaved_edits(), "the save went through");
     project.poll().unwrap();
@@ -831,7 +1021,7 @@ fn a_save_goes_through_and_then_reports_what_is_unprotected() {
 fn a_roll_over_that_fails_after_losing_a_tile_still_reports_it() {
     let dir = TestDir::new();
     let (mut project, lost, _, mut want) = with_an_unreadable_edit(&dir);
-    let old = project.recovery_path().to_path_buf();
+    let old = project.recovery_path().unwrap().to_path_buf();
     // The working file stays open, unlinked; a directory takes its name, so it can't be
     // deleted.
     fs::remove_file(&old).unwrap();
@@ -858,14 +1048,18 @@ fn a_roll_over_that_fails_after_losing_a_tile_still_reports_it() {
         matches!(&failed, ProjectError::OldRecoveryKept { path, .. } if *path == old),
         "{failed:?}"
     );
-    assert_ne!(project.recovery_path(), old, "rolled over all the same");
+    assert_ne!(
+        project.recovery_path().unwrap(),
+        old,
+        "rolled over all the same"
+    );
     let next = project.poll();
     assert!(
         matches!(&next, Err(ProjectError::Unprotected(tiles)) if *tiles == [lost]),
         "the lost tile, reported next: {next:?}"
     );
     fs::remove_dir(&old).unwrap();
-    project.save().unwrap();
+    assert_saved(project.save());
     project.close(false).unwrap();
     assert_project_file(
         &dir.path("p.bcrf"),
@@ -884,8 +1078,8 @@ fn a_failing_roll_over_backs_off_and_a_save_tries_at_once() {
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 60, 141);
-    project.save_as(&path).unwrap();
-    let old = project.recovery_path().to_path_buf();
+    assert_saved(project.save_as(&path));
+    let old = project.recovery_path().unwrap().to_path_buf();
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
     project.fail_next_recovery();
     stroke(&mut project, &mut map, 60, 142);
@@ -899,17 +1093,25 @@ fn a_failing_roll_over_backs_off_and_a_save_tries_at_once() {
             Err(e) => break e,
         }
     };
-    assert!(matches!(first, ProjectError::Io(_)), "{first:?}");
+    assert!(paused_by_io(&first), "{first:?}");
     // Due again a second on: it fails a second time, and the wait doubles.
     project.fail_next_recovery();
     let again = Instant::now() + ROLL_OVER_RETRY;
     let second = project.tick(again);
-    assert!(matches!(second, Err(ProjectError::Io(_))), "{second:?}");
+    assert!(second.as_ref().is_err_and(paused_by_io), "{second:?}");
     project.tick(again + ROLL_OVER_RETRY).unwrap();
-    assert_eq!(project.recovery_path(), old, "a second isn't enough now");
+    assert_eq!(
+        project.recovery_path().unwrap(),
+        old,
+        "a second isn't enough now"
+    );
     // A save needs every edit in a recovery file: it doesn't wait.
-    project.save().unwrap();
-    assert_ne!(project.recovery_path(), old, "rolled over by the save");
+    assert_saved(project.save());
+    assert_ne!(
+        project.recovery_path().unwrap(),
+        old,
+        "rolled over by the save"
+    );
     project.close(false).unwrap();
     assert_project_file(&path, &map, "every edit saved");
 }

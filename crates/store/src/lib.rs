@@ -34,8 +34,8 @@ pub use file::{
 pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
 pub use project::{
-    CandidateStatus, Project, ProjectConfig, ProjectError, ROLL_OVER_RETRY, RecoveryCandidate,
-    default_recovery_dir, find_recoveries,
+    CandidateStatus, KeptRecovery, Project, ProjectConfig, ProjectError, Protection,
+    ROLL_OVER_RETRY, RecoveryCandidate, SaveOutcome, default_recovery_dir, find_recoveries,
 };
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 pub use tiles::{CacheError, Invariant, PinGuard, StoreConfig, TileEdit, TileStore};

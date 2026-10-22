@@ -20,7 +20,20 @@
 //! durable, is the old one deleted. A crash at any point leaves a recovery file that matches a
 //! save point of the project file: the old one until the new one is in place. Once the store is
 //! rebased, the save has happened, whatever follows: deleting the old file is best effort, and a
-//! failure to is reported ([`ProjectError::OldRecoveryKept`]), never fatal.
+//! failure to is reported ([`SaveOutcome::kept`]), never fatal.
+//!
+//! # Saving comes first
+//!
+//! **A save always succeeds if the project file can be written.** The recovery directory never
+//! stops one, full or read-only: the save copies every edit from the store, not from the recovery
+//! file, so a flush that fails on the way, or a roll-over that can't be made, is passed over, and
+//! the project file's save point is written first. If the fresh recovery file can't be made
+//! then, the store is rebased onto a **scratch** working file instead, unlinked in the system's
+//! temporary directory, and crash protection is **paused**: no recovery file holds the edits
+//! since the save, and no writer runs. The save says so ([`SaveOutcome::protection`]), and so
+//! does [`Project::protection`], for the app to show. The project keeps trying to put a recovery
+//! file in place, as a roll-over that failed does (see [`ROLL_OVER_RETRY`]), and once one is,
+//! protection runs again.
 //!
 //! # Recovery file names
 //!
@@ -136,9 +149,8 @@ pub enum ProjectError {
     NeverSaved,
     /// The latest edits of these tiles aren't in the recovery file: their slots were broken, or
     /// moving to a new recovery file couldn't read them. The rest of the edits are protected.
-    /// Reported by a save, they aren't in the project file either (the save couldn't read
-    /// them): it holds their last saved state. The call that reports them otherwise did what it
-    /// was asked; a save went through.
+    /// The call that reports them otherwise did what it was asked. A save reports them in its
+    /// outcome instead ([`SaveOutcome::unprotected`]), never as an error.
     #[error("the edits of {} tiles are not in the recovery file", .0.len())]
     Unprotected(Vec<geom::TileKey>),
     /// [`Project::restore`] was given a recovery file that can't be layered on its project:
@@ -151,11 +163,18 @@ pub enum ProjectError {
     /// another project's, or one on another save point. List again.
     #[error("the recovery file changed since it was listed")]
     CandidateChanged,
-    /// The call did what it was asked (a save, say: the project goes on with its new recovery
-    /// file), but the old recovery file at `path` couldn't be deleted. It holds nothing the
-    /// project needs any more. The project holds it until it closes, so no listing offers it
-    /// meanwhile; after that, until it is deleted, [`find_recoveries`] lists it, on the save
-    /// point it was made on.
+    /// Crash protection is paused: the try to put a new recovery file in place failed, for
+    /// this reason, so no recovery file takes the edits (see [`Project::protection`]). It is
+    /// tried again after [`ROLL_OVER_RETRY`], the wait doubling up to a minute while it keeps
+    /// failing, and at once by a save or a close.
+    #[error("crash protection is paused")]
+    ProtectionPaused(#[source] Arc<Self>),
+    /// The call did what it was asked (a roll-over, say: the project goes on with its new
+    /// recovery file), but the old recovery file at `path` couldn't be deleted. It holds nothing
+    /// the project needs any more. The project holds it, so no listing offers it meanwhile, and
+    /// tries again to delete it whenever crash protection is next put in place. Once the
+    /// project closes, until it is deleted, [`find_recoveries`] lists it, on the save point it
+    /// was made on. A save reports it in its outcome instead ([`SaveOutcome::kept`]).
     #[error("the old recovery file {path:?} couldn't be deleted")]
     OldRecoveryKept {
         /// Where the old recovery file is.
@@ -164,6 +183,67 @@ pub enum ProjectError {
         #[source]
         source: io::Error,
     },
+}
+
+/// An old recovery file a save couldn't delete: it holds nothing the project needs any more
+/// (see [`ProjectError::OldRecoveryKept`]).
+#[derive(Debug, Error)]
+#[error("the old recovery file {path:?} couldn't be deleted")]
+pub struct KeptRecovery {
+    /// Where the old recovery file is.
+    pub path: PathBuf,
+    /// Why it couldn't be deleted.
+    #[source]
+    pub source: io::Error,
+}
+
+/// The report of a call that deleted an old recovery file, and couldn't.
+impl From<KeptRecovery> for ProjectError {
+    fn from(kept: KeptRecovery) -> Self {
+        Self::OldRecoveryKept {
+            path: kept.path,
+            source: kept.source,
+        }
+    }
+}
+
+/// Whether a project's edits are protected against a crash: streamed into a recovery file (see
+/// the module notes).
+#[derive(Debug, Clone)]
+pub enum Protection {
+    /// A recovery writer streams every edit into the recovery file, a durable save point after
+    /// every stroke.
+    Active,
+    /// No recovery file takes the edits, for this reason: the last try to put one in place
+    /// failed (the recovery directory is full or read-only, say). A crash loses the edits since
+    /// the last durable save point of the last recovery file, or of the project file. The
+    /// project keeps trying, and the app shows that protection is paused meanwhile.
+    Paused(Arc<ProjectError>),
+}
+
+impl Protection {
+    /// Whether crash protection runs.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+/// What a save that went through ([`Project::save`], [`Project::save_as`]) has to report: the
+/// project file holds the new save point, whatever it says.
+#[derive(Debug)]
+#[must_use = "a save can pause crash protection, which the app shows"]
+pub struct SaveOutcome {
+    /// Whether crash protection runs after the save: [`Protection::Paused`] if no new recovery
+    /// file could be made on the save point, and none was put back in place before it.
+    pub protection: Protection,
+    /// Tiles whose latest edits are in no file, in key order: found unprotected before the save
+    /// (left out of a flush, or lost to a roll-over), or lost to it, its save point holding
+    /// their last saved state.
+    pub unprotected: Vec<geom::TileKey>,
+    /// Old recovery files that couldn't be deleted. The project holds them until it closes, so
+    /// no listing offers them meanwhile.
+    pub kept: Vec<KeptRecovery>,
 }
 
 /// A recovery file found by [`find_recoveries`]: what the app shows to offer a restore.
@@ -220,10 +300,10 @@ pub enum CandidateStatus {
     Damaged,
 }
 
-/// When [`Project::with_writer`] tries a failed writer's roll-over.
+/// When [`Project::resume`] tries to put crash protection back in place.
 #[derive(Debug, Clone, Copy)]
 enum Retry {
-    /// At once: for a save or a close, which need every edit in a recovery file.
+    /// At once: for a save or a close, which want every edit in a recovery file.
     Now,
     /// Only once the wait after the last failed try has passed, it being this instant now:
     /// for the frame loop's calls, which come every few milliseconds.
@@ -249,8 +329,10 @@ enum Recovery {
 /// (flushing what it can, as [`Project::close`] does) and keeps the recovery file, as a crash
 /// would.
 pub struct Project {
-    /// Streams the store's edits into the recovery file. `None` only once closed: it is taken
-    /// out by [`Project::close`] and the drop, which close it on the store.
+    /// Streams the store's edits into the recovery file. `None` while crash protection is
+    /// paused: a writer whose file failed to sync is closed at once, and none runs until a new
+    /// recovery file is in place ([`Project::resume`]). Also `None` once closed: it is taken out
+    /// by [`Project::close`] and the drop, which close it on the store.
     writer: Option<RecoveryWriter>,
     /// The tile store: the recovery file over the project file's last save point.
     store: TileStore,
@@ -261,24 +343,29 @@ pub struct Project {
     /// restored onto an earlier save point of its project file, whose file is held (its base
     /// reads it) but not saved into.
     path: Option<PathBuf>,
-    /// Where the store's working file, the recovery file, is.
-    recovery_path: PathBuf,
+    /// Where the store's working file, the recovery file, is; `None` while it is a scratch file
+    /// (see [`scratch`]), after a save that couldn't make its new recovery file.
+    recovery_path: Option<PathBuf>,
     /// The directory recovery files go in.
     recovery_dir: PathBuf,
     /// Tiles whose latest edits were found unprotected (left out of a flush, or lost to a
     /// roll-over or a save), waiting to be reported: by the next call that has no other error
     /// to return ([`Project::report`]). So a report never stops a call from doing its work.
     unreported: BTreeSet<geom::TileKey>,
-    /// When a failed writer's roll-over may be tried again; `None` to try at once. A frame loop
-    /// polls every few milliseconds, and a roll-over that keeps failing (a full disk, say) is
-    /// tried only this often; a save or a close tries at once.
+    /// Why crash protection is paused, if it is: the error of the last try to put a recovery
+    /// file in place. `None` while protection runs.
+    paused: Option<Arc<ProjectError>>,
+    /// When crash protection may be tried again; `None` to try at once. A frame loop polls
+    /// every few milliseconds, and a try that keeps failing (a full disk, say) is made only this
+    /// often; a save or a close tries at once.
     retry_at: Option<Instant>,
-    /// How long the next failed roll-over makes the project wait before trying again:
+    /// How long the next failed try makes the project wait before trying again:
     /// [`ROLL_OVER_RETRY`], doubling up to a minute while the failures go on.
     retry_after: Duration,
-    /// Old recovery files that couldn't be deleted, held (and locked) until the project closes,
-    /// so no listing offers them while it runs (see [`Project::let_go`]).
-    held: Vec<ProjectFile>,
+    /// Old recovery files that couldn't be deleted, with their paths, held (and locked) until
+    /// they are or the project closes, so no listing offers them while it runs (see
+    /// [`Project::let_go`]). Deleting them is tried again whenever protection is put in place.
+    held: Vec<(PathBuf, ProjectFile)>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename (see
     /// [`Unplaced::crash`]).
@@ -291,6 +378,7 @@ impl std::fmt::Debug for Project {
         f.debug_struct("Project")
             .field("path", &self.path)
             .field("recovery_path", &self.recovery_path)
+            .field("paused", &self.paused)
             .field("store", &self.store)
             .finish_non_exhaustive()
     }
@@ -517,9 +605,10 @@ impl Project {
             store,
             file,
             path,
-            recovery_path,
+            recovery_path: Some(recovery_path),
             recovery_dir: config.recovery_dir,
             unreported: BTreeSet::new(),
+            paused: None,
             retry_at: None,
             retry_after: ROLL_OVER_RETRY,
             held: Vec::new(),
@@ -531,25 +620,24 @@ impl Project {
     /// Saves the edits since the last save into the project file, as a new save point, and
     /// starts a fresh recovery file on it (see the module notes).
     ///
+    /// Saving comes first: the recovery directory never stops a save. If the fresh recovery
+    /// file can't be made, the save goes through all the same, and crash protection pauses
+    /// until one can ([`SaveOutcome::protection`]).
+    ///
     /// # Errors
     ///
-    /// [`ProjectError::NoPath`] for a project never saved; [`ProjectError::Recovery`] if the
-    /// recovery writer can't finish its flushes (nothing is saved then);
-    /// [`ProjectError::Cache`] if the save fails ([`CacheError::Save`]: the project file may
-    /// hold the tiles without a save point; saving again writes them again); as
-    /// [`Project::new`] for the fresh recovery file. A save that fails after the project file's
-    /// save point is written leaves the project open on the old recovery file, which still
-    /// holds every edit; saving again works. [`ProjectError::OldRecoveryKept`] if the save
-    /// went through, but the old recovery file couldn't be deleted. [`ProjectError::Unprotected`]
-    /// after the save went through, for tiles found unprotected before it or lost to it: a
-    /// report never stops a save.
-    pub fn save(&mut self) -> Result<(), ProjectError> {
-        self.advance()?;
-        if self.path.is_none() {
-            return Err(ProjectError::NoPath);
-        }
-        self.finish_flushes()?;
+    /// An error means the project isn't saved: it goes on as before, its edits unsaved, and
+    /// saving again works. [`ProjectError::NoPath`] for a project never saved, or restored onto
+    /// an earlier save point; [`ProjectError::Cache`] from installing prefetched tiles, or if
+    /// the save fails ([`CacheError::Save`]: the project file may hold the tiles without a save
+    /// point; saving again writes them again). Once the save point is written, only a store
+    /// that can't be moved onto it fails the save: [`ProjectError::Cache`] if the rebase is
+    /// refused, and the error of the fresh recovery file if no scratch file can be made in its
+    /// place either. The project file holds the save point then, but the project goes on over
+    /// the one before, and the next save saves its edits again.
+    pub fn save(&mut self) -> Result<SaveOutcome, ProjectError> {
         let path = self.path.clone().ok_or(ProjectError::NoPath)?;
+        let mut kept = self.prepare_save()?;
         let mut project = self.file.take().ok_or(ProjectError::NoPath)?;
         let switched = self
             .store
@@ -557,12 +645,11 @@ impl Project {
             .map_err(ProjectError::from)
             .and_then(|saved| {
                 self.unreported.extend(saved.lost());
-                self.switch_recovery(saved, &project, &path)
+                self.switch(saved, &project, &path)
             });
         self.file = Some(project);
-        let (old_path, old) = switched?;
-        self.let_go(&old_path, old)?;
-        self.report()
+        kept.extend(switched?);
+        Ok(self.outcome(kept))
     }
 
     /// Saves the project as a new project file at `path`, with a new project id, and goes on
@@ -572,27 +659,24 @@ impl Project {
     /// The file is written as a temporary file beside `path` and moved into place once its
     /// save point is durable, so `path` never names a half-written project. The move never
     /// replaces a file (a hard link, not a rename), not even one made at `path` while the
-    /// project was being written.
+    /// project was being written. Then the project moves onto it as [`Project::save`] does, and
+    /// the recovery directory no more stops it.
     ///
     /// # Errors
     ///
-    /// [`ProjectError::Exists`] if `path` names a file already, or does by the time the new
-    /// file is to be moved there (it is removed then); [`ProjectError::Recovery`] if
-    /// the recovery writer can't finish its flushes; [`ProjectError::Store`] or
-    /// [`ProjectError::Cache`] if creating or writing the new file fails (the temporary file is
-    /// removed);
-    /// [`ProjectError::Io`] if the rename does; as [`Project::save`] for the fresh recovery
-    /// file, where the new project file is in place but the project goes on with the old one.
-    /// Once the store is rebased onto the new file, the project goes on with it, its path and
-    /// its id, whatever happens next: [`ProjectError::OldRecoveryKept`] if the old recovery file
-    /// couldn't be deleted. [`ProjectError::Unprotected`] as for [`Project::save`].
-    pub fn save_as(&mut self, path: &Path) -> Result<(), ProjectError> {
-        self.advance()?;
+    /// An error means the project isn't saved as `path`: it goes on as before, with its old
+    /// project file, path and id. [`ProjectError::Exists`] if `path` names a file already, or
+    /// does by the time the new file is to be moved there (it is removed then);
+    /// [`ProjectError::Store`] or [`ProjectError::Cache`] if creating or writing the new file
+    /// fails (the temporary file is removed); [`ProjectError::Io`] if the rename does;
+    /// [`ProjectError::Cache`] from installing prefetched tiles. As [`Project::save`] once the
+    /// new file is in place: the project goes on with the old one then.
+    pub fn save_as(&mut self, path: &Path) -> Result<SaveOutcome, ProjectError> {
         let path = std::path::absolute(path)?;
         if fs::symlink_metadata(&path).is_ok() {
             return Err(ProjectError::Exists(path));
         }
-        self.finish_flushes()?;
+        let mut kept = self.prepare_save()?;
         let meta = self
             .store
             .working()
@@ -600,17 +684,7 @@ impl Project {
             .with_project(ProjectId::random()?)
             .with_role(Role::Project);
         let tmp = temporary(&path)?;
-        let mut project = match ProjectFile::create_like(&tmp, meta, self.store.working()) {
-            Ok(project) => project,
-            Err(e) => {
-                // Made, then failed: removed, best effort. A file already there isn't this
-                // save's, and is left alone.
-                if !matches!(&e, StoreError::Io(io) if io.kind() == io::ErrorKind::AlreadyExists) {
-                    drop(fs::remove_file(&tmp));
-                }
-                return Err(e.into());
-            }
-        };
+        let mut project = create_clean(&tmp, meta, self.store.working())?;
         let written = self.write_new_project(&mut project, &tmp, &path);
         let saved = match written {
             Ok(saved) => saved,
@@ -622,13 +696,12 @@ impl Project {
         };
         // The new project file lacks them whatever happens next, as `save` reports them.
         self.unreported.extend(saved.lost());
-        let (old_path, old) = self.switch_recovery(saved, &project, &path)?;
+        kept.extend(self.switch(saved, &project, &path)?);
         // The switch has happened: the store reads the new project file, so the project holds
         // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
         self.path = Some(path);
-        self.let_go(&old_path, old)?;
-        self.report()
+        Ok(self.outcome(kept))
     }
 
     /// Fills `project`, the new file being written at `tmp`, with the last save point's tiles
@@ -667,13 +740,17 @@ impl Project {
     ///
     /// The last flushes go through the roll-over as a save's do: a writer that has failed, or
     /// whose last sync fails, moves every edit to a new recovery file at once, and that is the
-    /// file kept (or deleted).
+    /// file kept (or deleted). So does a project whose crash protection is paused: it tries
+    /// once more to put a recovery file in place.
     ///
     /// # Errors
     ///
-    /// [`ProjectError::Recovery`] if the last flushes fail, or as [`Project::roll_over`] if
-    /// moving to a new recovery file does: the recovery file is kept then, whatever
-    /// `keep_recovery` says. [`ProjectError::Io`] or [`ProjectError::Store`] if it can't be
+    /// [`ProjectError::Recovery`] if the last flushes fail, or
+    /// [`ProjectError::ProtectionPaused`] if no new recovery file can be put in place: the
+    /// recovery file is kept then, whatever `keep_recovery` says, at its last durable save
+    /// point (a project paused since a save has none, and keeps nothing).
+    /// [`ProjectError::OldRecoveryKept`] if a roll-over on the way couldn't delete the file it
+    /// replaced. [`ProjectError::Io`] or [`ProjectError::Store`] if the recovery file can't be
     /// deleted. [`ProjectError::Unprotected`] once closed, if a kept recovery file lacks the
     /// latest edits of some tiles.
     pub fn close(mut self, keep_recovery: bool) -> Result<(), ProjectError> {
@@ -688,8 +765,10 @@ impl Project {
             finished?;
         }
         if !keep_recovery {
-            fs::remove_file(&self.recovery_path)?;
-            sync_parent(&self.recovery_path)?;
+            if let Some(path) = &self.recovery_path {
+                fs::remove_file(path)?;
+                sync_parent(path)?;
+            }
             // Nothing is kept to lack them.
             self.unreported.clear();
         }
@@ -716,10 +795,21 @@ impl Project {
         self.path.as_deref()
     }
 
-    /// Where the recovery file is: it changes with every save.
+    /// Where the recovery file is: it changes with every save, and every roll-over. `None`
+    /// while crash protection has been paused since a save, which left no recovery file.
     #[must_use]
-    pub fn recovery_path(&self) -> &Path {
-        &self.recovery_path
+    pub fn recovery_path(&self) -> Option<&Path> {
+        self.recovery_path.as_deref()
+    }
+
+    /// Whether the project's edits are protected against a crash, or protection is paused, and
+    /// why: for the app to show. Every call that advances the recovery writer can change it, a
+    /// save too.
+    #[must_use]
+    pub fn protection(&self) -> Protection {
+        self.paused.as_ref().map_or(Protection::Active, |cause| {
+            Protection::Paused(Arc::clone(cause))
+        })
     }
 
     /// The project's id: the project file's, or for a project never saved, its recovery
@@ -746,10 +836,11 @@ impl Project {
     ///
     /// [`ProjectError::Recovery`] if the recovery writer fails, unless the failure was a sync,
     /// which the project deals with by moving to a new recovery file holding every edit;
-    /// [`ProjectError::Cache`], [`ProjectError::Io`] or [`ProjectError::Store`] if moving to a
-    /// new recovery file fails (it is tried again after [`ROLL_OVER_RETRY`], then waits
-    /// doubling up to a minute while it keeps failing); [`ProjectError::Unprotected`] for tiles
-    /// whose edits aren't in the recovery file, once nothing else is to be reported.
+    /// [`ProjectError::ProtectionPaused`] if moving to a new recovery file fails (it is tried
+    /// again after [`ROLL_OVER_RETRY`], then waits doubling up to a minute while it keeps
+    /// failing); [`ProjectError::OldRecoveryKept`] if it moved, but couldn't delete the old
+    /// file; [`ProjectError::Unprotected`] for tiles whose edits aren't in the recovery file,
+    /// once nothing else is to be reported.
     pub fn end_stroke(&mut self) -> Result<(), ProjectError> {
         let now = Instant::now();
         self.with_writer(
@@ -760,7 +851,8 @@ impl Project {
     }
 
     /// Time passed, to `now`: flushes the edits of a long stroke at least once a second (see
-    /// [`RecoveryWriter::tick`]).
+    /// [`RecoveryWriter::tick`]), and tries to put paused crash protection back in place once
+    /// the wait since the last try has passed.
     ///
     /// # Errors
     ///
@@ -781,8 +873,7 @@ impl Project {
         self.report()
     }
 
-    /// [`Project::poll`] without the report: what a save starts with, before it saves, so a
-    /// report waits until the save is made.
+    /// [`Project::poll`] without the report.
     ///
     /// # Errors
     ///
@@ -793,9 +884,9 @@ impl Project {
         Ok(())
     }
 
-    /// Flushes every edit into the recovery file and waits until it is durable: what a save
-    /// starts with, so no flush is in flight while the store is rebased. A failed writer's
-    /// roll-over is tried at once.
+    /// Flushes every edit into the recovery file and waits until it is durable, so no flush is
+    /// in flight afterwards. A failed writer's roll-over, or paused protection, is tried at
+    /// once.
     ///
     /// # Errors
     ///
@@ -805,6 +896,41 @@ impl Project {
             |writer, store| writer.finish(store, Instant::now()),
             Retry::Now,
         )
+    }
+
+    /// What a save starts with: prefetched tiles installed, and every edit flushed into the
+    /// recovery file ([`Project::finish_flushes`]), so no flush is in flight while the store is
+    /// rebased. Returns the old recovery file a roll-over on the way couldn't delete, if any.
+    ///
+    /// Crash protection never stops a save, so the flushes' failure is passed over: the save
+    /// copies every edit from the store, not from the recovery file. A writer that fails here
+    /// abandons its flush (none is in flight then), and one that can't be replaced leaves
+    /// protection paused, which the save's outcome says if no fresh recovery file can be made
+    /// on its save point either.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::Cache`] from installing prefetched tiles.
+    fn prepare_save(&mut self) -> Result<Vec<KeptRecovery>, ProjectError> {
+        self.store.poll()?;
+        Ok(match self.finish_flushes() {
+            Err(ProjectError::OldRecoveryKept { path, source }) => {
+                vec![KeptRecovery { path, source }]
+            }
+            // Crash protection's, never the save's.
+            Ok(()) | Err(_) => Vec::new(),
+        })
+    }
+
+    /// The outcome of a save that went through, with `kept`, the old recovery files it couldn't
+    /// delete: the protection it leaves, and the tiles found unprotected since the last report,
+    /// which are forgotten.
+    fn outcome(&mut self, kept: Vec<KeptRecovery>) -> SaveOutcome {
+        SaveOutcome {
+            protection: self.protection(),
+            unprotected: std::mem::take(&mut self.unreported).into_iter().collect(),
+            kept,
+        }
     }
 
     /// Reports the tiles found unprotected since the last report, if any, and forgets them.
@@ -824,60 +950,100 @@ impl Project {
     ///
     /// Tiles the writer left out of its flushes (broken slots) wait to be reported
     /// ([`Project::report`]). If the writer has failed (a sync of the recovery file failed, see
-    /// [`crate::recovery`]), the project rolls over to a new recovery file holding every edit
-    /// ([`Project::roll_over`]), and the failure, dealt with, isn't returned. A roll-over that
-    /// fails is tried again by the next call, at once if `retry` says so, else only once a wait
-    /// has passed: [`ROLL_OVER_RETRY`] after the first failure, doubling up to a minute while
-    /// they go on. Until then the edits wait in memory.
+    /// [`crate::recovery`]), it is closed, and the project moves to a new recovery file holding
+    /// every edit ([`Project::resume`]); the failure, dealt with, isn't returned. With no
+    /// writer, crash protection is paused: `call` isn't run, and protection is tried again.
     ///
     /// # Errors
     ///
     /// `call`'s error, as [`ProjectError::Recovery`], unless the writer has failed; as
-    /// [`Project::roll_over`].
+    /// [`Project::resume`].
     fn with_writer(
         &mut self,
         call: impl FnOnce(&mut RecoveryWriter, &mut TileStore) -> Result<(), RecoveryError>,
         retry: Retry,
     ) -> Result<(), ProjectError> {
-        let writer = self.writer.as_mut().ok_or(RecoveryError::Stopped)?;
-        let outcome = call(writer, &mut self.store);
-        self.unreported.extend(writer.take_skipped());
-        if !writer.is_failed() {
-            return Ok(outcome?);
+        if let Some(writer) = self.writer.as_mut() {
+            let outcome = call(writer, &mut self.store);
+            self.unreported.extend(writer.take_skipped());
+            if !writer.is_failed() {
+                return Ok(outcome?);
+            }
         }
+        if let Some(failed) = self.writer.take() {
+            // It can only say that it needs a new file; closing releases its subscription.
+            drop(failed.close(&mut self.store, Instant::now()));
+        }
+        self.resume(retry)
+    }
+
+    /// Puts crash protection back in place, with no writer running: moves every edit to a new
+    /// recovery file and starts a writer on it ([`Project::roll_over`]), if a try is due.
+    ///
+    /// A try is due at once if `retry` says so, else only once the wait after the last failed
+    /// one has passed: [`ROLL_OVER_RETRY`] after the first failure, doubling up to a minute
+    /// while they go on. Until then the edits wait in memory, and in the working file.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::ProtectionPaused`] if the try fails, with why; protection stays paused.
+    /// [`ProjectError::OldRecoveryKept`] if it is back in place, but the file it replaced
+    /// couldn't be deleted.
+    fn resume(&mut self, retry: Retry) -> Result<(), ProjectError> {
         let now = match retry {
             Retry::Due(now) if self.retry_at.is_some_and(|at| now < at) => return Ok(()),
             Retry::Due(now) => now,
             Retry::Now => Instant::now(),
         };
-        let rolled = self.roll_over();
-        if self.writer.as_ref().is_some_and(RecoveryWriter::is_failed) {
-            self.retry_at = Some(now + self.retry_after);
-            self.retry_after = (self.retry_after * 2).min(ROLL_OVER_RETRY_MAX);
-        } else {
-            self.retry_at = None;
-            self.retry_after = ROLL_OVER_RETRY;
+        match self.roll_over() {
+            Err(cause) if self.writer.is_none() => Err(self.pause(cause, now)),
+            rolled => {
+                self.protected();
+                rolled
+            }
         }
-        rolled
     }
 
-    /// Moves the edits to a new recovery file after the writer failed to sync the current one.
-    /// The tiles that couldn't be carried across wait to be reported ([`Project::report`]),
-    /// whatever happens after the move.
+    /// Crash protection is paused, for `cause`, at `now`: the next try waits, longer than the
+    /// last did. Returns the error that says so.
+    fn pause(&mut self, cause: ProjectError, now: Instant) -> ProjectError {
+        let cause = Arc::new(cause);
+        self.paused = Some(Arc::clone(&cause));
+        self.retry_at = Some(now + self.retry_after);
+        self.retry_after = (self.retry_after * 2).min(ROLL_OVER_RETRY_MAX);
+        ProjectError::ProtectionPaused(cause)
+    }
+
+    /// Crash protection is in place: nothing is paused, a failure from now on is tried again at
+    /// once, and the old recovery files that couldn't be deleted are tried again.
+    fn protected(&mut self) {
+        self.paused = None;
+        self.retry_at = None;
+        self.retry_after = ROLL_OVER_RETRY;
+        // Best effort, as it was the first time: those still there are held on.
+        self.held.retain(|(path, _)| retire(path).is_err());
+    }
+
+    /// Moves the edits to a new recovery file and starts a writer on it: after the writer
+    /// failed to sync the current one, or while crash protection is paused. The tiles that
+    /// couldn't be carried across wait to be reported ([`Project::report`]), whatever happens
+    /// after the move.
     ///
     /// The new file names the same save point. It is made under its temporary name, filled with
     /// every edit from the store ([`TileStore::fill_roll_over`]: synced, a save point, synced),
     /// and only then renamed into place, so a crash meanwhile leaves no file under a recovery
     /// file's name that lacks the edits of the old one. Then the store swaps it in
     /// ([`TileStore::roll_over`]), the old file is deleted, and only then unlocked
-    /// ([`Project::let_go`]), and a new writer streams into the new one.
+    /// ([`Project::let_go`]), and a new writer streams into the new one. An old scratch file is
+    /// only closed, which deletes it.
     ///
     /// # Errors
     ///
-    /// As [`create_recovery`] and [`Unplaced::place`]; [`ProjectError::Cache`] if the store
-    /// can't write the new file. The new file is deleted then, and the project stays on the old
-    /// one, failed, to try again. [`ProjectError::Recovery`] if the new writer's thread can't
-    /// be started; [`ProjectError::OldRecoveryKept`] if the old file can't be deleted.
+    /// As [`Project::fresh_recovery`] for the new file; [`ProjectError::Cache`] if the store
+    /// can't write it. The new file is deleted then, and the project stays on the old one, with
+    /// no writer. [`ProjectError::Recovery`] if the new writer's thread can't be started: the
+    /// project goes on with the new file, with no writer. [`ProjectError::OldRecoveryKept`] if
+    /// the old file can't be deleted: the project goes on with the new file and its writer.
     fn roll_over(&mut self) -> Result<(), ProjectError> {
         let meta = self.store.working().meta().clone();
         let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
@@ -902,71 +1068,121 @@ impl Project {
             }
         };
         self.unreported.extend(lost);
-        if let Some(failed) = self.writer.take() {
-            // It can only say that it needs a new file; closing releases its subscription.
-            drop(failed.close(&mut self.store, Instant::now()));
-        }
-        let old_path = std::mem::replace(&mut self.recovery_path, fresh_path);
-        let retired = self.let_go(&old_path, old);
+        let retired = match self.recovery_path.replace(fresh_path) {
+            Some(old_path) => self.let_go(old_path, old),
+            // A scratch file, which no listing finds: closing it deletes it.
+            None => None,
+        };
         self.writer = Some(RecoveryWriter::new(&mut self.store)?);
-        retired
+        retired.map_or(Ok(()), |kept| Err(kept.into()))
     }
 
-    /// Creates a fresh recovery file on the save point `saved` proves in `project`, the project
-    /// file at `path`, and rebases the store onto the pair; returns the old recovery file, and
-    /// its path, for the caller to delete ([`Project::let_go`]) once it holds `project`: the
-    /// old file goes only once the new one is durable and in use.
-    ///
-    /// Once this returns, the switch has happened: the store reads `project` and writes the
-    /// new recovery file. On error nothing has changed.
+    /// Makes an empty recovery file with `meta` over `like`'s mesh, durable and in place: what
+    /// a save starts on its save point. Returns it open, with its path.
     ///
     /// # Errors
     ///
-    /// As [`create_recovery`] and [`Unplaced::place`]; [`ProjectError::Cache`] if the rebase is
-    /// refused (the new file is deleted again).
-    fn switch_recovery(
+    /// As [`create_recovery`] and [`Unplaced::place`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "it takes the test hook that fails a placement, which tests only have"
+        )
+    )]
+    fn fresh_recovery(
+        &mut self,
+        meta: Meta,
+        like: &ProjectFile,
+    ) -> Result<(ProjectFile, PathBuf), ProjectError> {
+        let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
+            ProjectFile::create_like(at, meta, like)
+        })?;
+        #[cfg(test)]
+        let names = names.crashing(std::mem::take(&mut self.fail_next_recovery));
+        Ok((fresh, names.place()?))
+    }
+
+    /// Moves the store onto the save point `saved` proves in `project`, the project file at
+    /// `path`, after a save: with a fresh recovery file on it, or if none can be made, a
+    /// scratch working file ([`scratch`]), crash protection paused. Then deletes the old
+    /// recovery file; returns it if it couldn't be.
+    ///
+    /// The fresh file is empty, and on the new save point: a crash from then on leaves it as a
+    /// valid recovery file of that save point, holding nothing since. So it is placed before the
+    /// rebase, not filled first as a roll-over's is; the old file goes only once the new one is
+    /// durable and in use. With a fresh file, a running writer goes on into it, and paused
+    /// protection runs again with a new writer. With a scratch file, the writer is closed.
+    ///
+    /// Once this returns, the switch has happened: the store reads `project` and writes the
+    /// new working file. On error nothing has changed.
+    ///
+    /// # Errors
+    ///
+    /// The fresh recovery file's error if no scratch file can be made either;
+    /// [`ProjectError::Cache`] if the rebase is refused (the new file is deleted again).
+    fn switch(
         &mut self,
         saved: Saved,
         project: &ProjectFile,
         path: &Path,
-    ) -> Result<(PathBuf, ProjectFile), ProjectError> {
+    ) -> Result<Option<KeptRecovery>, ProjectError> {
         let meta = project.meta().on_save_point(saved.save_point(), path);
-        let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
-            ProjectFile::create_like(at, meta, project)
-        })?;
-        #[cfg(test)]
-        let names = names.crashing(std::mem::take(&mut self.fail_next_recovery));
-        // Empty, and on the new save point: a crash from here on leaves it as a valid recovery
-        // file of that save point, holding nothing since. So it is placed before the rebase,
-        // not filled first as a roll-over's is.
-        let fresh_path = names.place()?;
-        let old = match self.store.rebase(saved, fresh) {
+        let (working, fresh_path, failed) = match self.fresh_recovery(meta.clone(), project) {
+            Ok((fresh, at)) => (fresh, Some(at), None),
+            Err(cause) => match scratch(meta, project) {
+                Ok(scratch) => (scratch, None, Some(cause)),
+                Err(_) => return Err(cause),
+            },
+        };
+        let old = match self.store.rebase(saved, working) {
             Ok(old) => old,
             Err(e) => {
-                // Best effort: the file is empty, and the error at hand is the one to report.
-                drop(fs::remove_file(&fresh_path));
+                if let Some(at) = &fresh_path {
+                    // Best effort: the file is empty, and the error at hand is the one to report.
+                    drop(fs::remove_file(at));
+                }
                 return Err(e.into());
             }
         };
-        Ok((std::mem::replace(&mut self.recovery_path, fresh_path), old))
+        let kept = match std::mem::replace(&mut self.recovery_path, fresh_path) {
+            Some(old_path) => self.let_go(old_path, old),
+            None => None,
+        };
+        match failed {
+            Some(cause) => {
+                if let Some(writer) = self.writer.take() {
+                    // Nothing it could write is protection now.
+                    drop(writer.close(&mut self.store, Instant::now()));
+                }
+                drop(self.pause(cause, Instant::now()));
+            }
+            None if self.writer.is_some() => self.protected(),
+            None => match RecoveryWriter::new(&mut self.store) {
+                Ok(writer) => {
+                    self.writer = Some(writer);
+                    self.protected();
+                }
+                Err(e) => drop(self.pause(e.into(), Instant::now())),
+            },
+        }
+        Ok(kept)
     }
 
     /// Deletes the old recovery file `old`, at `path`, which the project has moved on from
-    /// ([`retire`]), while still holding it, and only then closes it.
+    /// ([`retire`]), while still holding it, and only then closes it; returns it if it couldn't
+    /// be deleted.
     ///
     /// A recovery file is unlocked only once it is gone, so [`find_recoveries`] never finds a
     /// running project's old file unheld and offers to restore it. One that can't be deleted is
-    /// held until the project closes (or is dropped): only then is it listed.
-    ///
-    /// # Errors
-    ///
-    /// As [`retire`].
-    fn let_go(&mut self, path: &Path, old: ProjectFile) -> Result<(), ProjectError> {
-        let retired = retire(path);
-        if retired.is_err() {
-            self.held.push(old);
+    /// held until it is (tried again when protection is next put in place), or the project
+    /// closes (or is dropped): only then is it listed.
+    fn let_go(&mut self, path: PathBuf, old: ProjectFile) -> Option<KeptRecovery> {
+        let kept = retire(&path).err();
+        if kept.is_some() {
+            self.held.push((path, old));
         }
-        retired
+        kept
     }
 }
 
@@ -978,9 +1194,9 @@ impl Project {
 ///
 /// # Errors
 ///
-/// [`ProjectError::OldRecoveryKept`] if it can't be deleted, or the deletion made durable.
-fn retire(old: &Path) -> Result<(), ProjectError> {
-    let kept = |source| ProjectError::OldRecoveryKept {
+/// The [`KeptRecovery`] if it can't be deleted, or the deletion made durable.
+fn retire(old: &Path) -> Result<(), KeptRecovery> {
+    let kept = |source| KeptRecovery {
         path: old.to_path_buf(),
         source,
     };
@@ -994,6 +1210,42 @@ fn retire(old: &Path) -> Result<(), ProjectError> {
             kept(io)
         } else {
             kept(io::Error::other(e))
+        }
+    })
+}
+
+/// A scratch working file with `meta` over `like`'s mesh: what a save rebases the store onto
+/// when it can't make a fresh recovery file, so the store has a file to write tiles back to.
+///
+/// It is made in the system's temporary directory and unlinked at once, so it is only ever the
+/// project's open handle: no listing finds it, and nothing is left of it after a crash, or once
+/// it is closed. It is no crash protection, and doesn't pretend to be.
+///
+/// # Errors
+///
+/// [`ProjectError::Io`] if no random name can be drawn, or it can't be unlinked;
+/// [`ProjectError::Store`] if it can't be made. Nothing is left behind, best effort.
+fn scratch(meta: Meta, like: &ProjectFile) -> Result<ProjectFile, ProjectError> {
+    let suffix = ProjectId::random()?.to_bits() >> 64;
+    let at = std::env::temp_dir().join(format!(
+        "brushcraft-{}-{suffix:016x}.scratch",
+        meta.project()
+    ));
+    let file = create_clean(&at, meta, like)?;
+    fs::remove_file(&at)?;
+    Ok(file)
+}
+
+/// [`ProjectFile::create_like`] at `at`, removing the file again, best effort, if it was made
+/// but couldn't be set up. A file already at `at` isn't this call's, and is left alone.
+///
+/// # Errors
+///
+/// As [`ProjectFile::create_like`].
+fn create_clean(at: &Path, meta: Meta, like: &ProjectFile) -> Result<ProjectFile, StoreError> {
+    ProjectFile::create_like(at, meta, like).inspect_err(|e| {
+        if !matches!(e, StoreError::Io(io) if io.kind() == io::ErrorKind::AlreadyExists) {
+            drop(fs::remove_file(at));
         }
     })
 }

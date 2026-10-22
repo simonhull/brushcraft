@@ -228,7 +228,7 @@ fn crash_child() {
     if scenario.saved {
         edit(&mut project, EDITS, SAVED_SEED);
         project.end_stroke().unwrap();
-        project.save_as(&dir.join("p.bcrf")).unwrap();
+        assert_saved(project.save_as(&dir.join("p.bcrf")));
     }
     for k in 0..scenario.strokes {
         edit(&mut project, EDITS, seed(k));
@@ -349,9 +349,9 @@ fn crash(scenario: Scenario) {
 
     // What was restored saves: into the project file, or a first one.
     if scenario.saved {
-        project.save().unwrap();
+        assert_saved(project.save());
     } else {
-        project.save_as(&path).unwrap();
+        assert_saved(project.save_as(&path));
     }
     project.close(false).unwrap();
     let saved = format!("{scenario:?}: saved after the restore");

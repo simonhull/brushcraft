@@ -32,7 +32,7 @@ fn saved_and_dropped_apart(
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh()).clone(), config(dir)).unwrap();
     stroke(&mut project, &mut map, 80, seed);
-    project.save_as(path).unwrap();
+    assert_saved(project.save_as(path));
     let saved = map.clone();
     stroke(&mut project, &mut map, 80, seed + 1);
     drop(project);
@@ -59,7 +59,7 @@ fn a_running_instance_s_recovery_file_is_not_listed() {
     let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 60, 1);
     assert_eq!(found(&dir), [], "held by the running project");
-    let path = project.recovery_path().to_path_buf();
+    let path = project.recovery_path().unwrap().to_path_buf();
     let id = project.id();
     // Files that aren't recovery files by name are never opened.
     let recovery = dir.path("recovery");
@@ -112,7 +112,7 @@ fn a_restored_project_holds_its_edits_unsaved_and_saves_them() {
     let mut project = Project::restore(&candidate, config(&dir)).unwrap();
     assert_eq!(project.path(), Some(path.as_path()), "the project file");
     assert_eq!(
-        project.recovery_path(),
+        project.recovery_path().unwrap(),
         candidate.path,
         "goes on in the file"
     );
@@ -129,7 +129,7 @@ fn a_restored_project_holds_its_edits_unsaved_and_saves_them() {
     );
     assert_eq!(found(&dir), [], "held by the restored project");
     stroke(&mut project, &mut map, 40, 12);
-    project.save().unwrap();
+    assert_saved(project.save());
     project.close(false).unwrap();
     assert_project_file(&path, &map, "the recovered and the new edits, saved");
     assert_eq!(recovery_files(&dir), Vec::<String>::new(), "all closed");
@@ -158,7 +158,7 @@ fn a_project_file_replaced_by_another_project_is_missing() {
     let path = dir.path("p.bcrf");
     saved_and_dropped(&dir, &path, 30);
     let mut other = Project::new((*mesh()).clone(), config(&dir)).unwrap();
-    other.save_as(&dir.path("other.bcrf")).unwrap();
+    assert_saved(other.save_as(&dir.path("other.bcrf")));
     other.close(false).unwrap();
     fs::rename(dir.path("other.bcrf"), &path).unwrap();
     let candidate = only(&dir);
@@ -190,7 +190,7 @@ fn a_project_saved_since_restores_onto_the_earlier_save_point_and_saves_as_new()
     assert_not_restorable(&dir, &stale, CandidateStatus::ProjectInUse);
     let mut later = saved;
     stroke(&mut project, &mut later, 40, 42);
-    project.save().unwrap();
+    assert_saved(project.save());
     project.close(false).unwrap();
     let later_bytes = fs::read(&path).unwrap();
 
@@ -232,7 +232,7 @@ fn a_project_saved_since_restores_onto_the_earlier_save_point_and_saves_as_new()
         "the restored project holds its recovery file"
     );
     let copy = dir.path("copy.bcrf");
-    restored.save_as(&copy).unwrap();
+    assert_saved(restored.save_as(&copy));
     restored.close(false).unwrap();
     assert_project_file(&copy, &recovered, "saved as a new file");
     assert_eq!(
@@ -276,18 +276,18 @@ fn of_two_sessions_on_one_save_point_the_later_one_comes_first() {
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 60, 70);
-    project.save_as(&path).unwrap();
+    assert_saved(project.save_as(&path));
     let saved = map.clone();
     for seed in 71..75 {
         stroke(&mut project, &mut map, 60, seed);
     }
-    let first = project.recovery_path().to_path_buf();
+    let first = project.recovery_path().unwrap().to_path_buf();
     drop(project);
 
     let mut later = saved;
     let mut reopened = Project::open(&path, config(&dir)).unwrap();
     stroke(&mut reopened, &mut later, 60, 80);
-    let second = reopened.recovery_path().to_path_buf();
+    let second = reopened.recovery_path().unwrap().to_path_buf();
     drop(reopened);
 
     let listed = found(&dir);
@@ -317,6 +317,7 @@ fn stale_temporary_files_are_swept() {
     let project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
     let name = project
         .recovery_path()
+        .unwrap()
         .file_name()
         .unwrap()
         .to_str()
@@ -375,7 +376,7 @@ fn a_save_point_with_another_head_is_not_the_base() {
     let path = dir.path("p.bcrf");
     let map = saved_and_dropped(&dir, &path, 50);
     let mut project = Project::restore(&only(&dir), config(&dir)).unwrap();
-    project.save().unwrap();
+    assert_saved(project.save());
     project.close(false).unwrap();
     let head = ProjectFile::open(&path).unwrap().head();
     let seq = head.unwrap().seq();
@@ -414,7 +415,7 @@ fn a_save_point_with_another_head_is_not_the_base() {
 fn a_damaged_recovery_file_is_listed_damaged_and_not_restored() {
     let dir = TestDir::new();
     let project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
-    let path = project.recovery_path().to_path_buf();
+    let path = project.recovery_path().unwrap().to_path_buf();
     let id = project.id();
     drop(project);
     let mut bytes = fs::read(&path).unwrap();
