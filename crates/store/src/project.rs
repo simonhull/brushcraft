@@ -486,7 +486,7 @@ impl Project {
             meta,
             |at| ProjectFile::create_like(at, meta, self.store.working()),
             #[cfg(test)]
-            false,
+            std::mem::take(&mut self.fail_next_recovery),
         )?;
         let (old, lost) = match self.store.roll_over(fresh) {
             Ok(rolled) => rolled,

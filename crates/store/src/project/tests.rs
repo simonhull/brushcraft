@@ -441,3 +441,49 @@ fn a_saved_project_rolls_over_on_its_save_point_and_saves_after() {
     assert_project_file(&path, &map, "saved after the roll-over");
     assert_eq!(recovery_files(&dir), Vec::<String>::new(), "all deleted");
 }
+
+#[test]
+fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 91);
+    let old = project.recovery_path().to_path_buf();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    project.fail_next_recovery();
+    stroke(&mut project, &mut map, 60, 92);
+    let began = Instant::now();
+    let failed = loop {
+        match project.poll() {
+            Ok(()) => {
+                assert!(
+                    began.elapsed() < std::time::Duration::from_secs(30),
+                    "the sync fails"
+                );
+                std::thread::yield_now();
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(matches!(failed, ProjectError::Io(_)), "{failed:?}");
+    assert!(
+        old.exists(),
+        "the old file is kept until a new one is in place"
+    );
+    assert_eq!(project.recovery_path(), old, "still on the old file");
+    // The next call tries again, and gets there.
+    project.poll().unwrap();
+    assert_ne!(project.recovery_path(), old, "rolled over");
+    assert!(!old.exists(), "and only then the old file goes");
+    let path = project.recovery_path().to_path_buf();
+    project.close(true).unwrap();
+    let file = ProjectFile::open(&path).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "every edit",
+    );
+}
