@@ -13,7 +13,7 @@ use thiserror::Error;
 use crate::OpId;
 use crate::bytes::{KEY_LEN, Reader, put_key};
 use crate::codec::{CodecError, compress, decode_displacement, decompress, encode_displacement};
-use crate::record::{HEAD, Head, KIND_INDEX, KIND_TILE, frame, parse_head, verify};
+use crate::record::{HEAD, Head, KIND_INDEX, KIND_TILE, TAIL, frame, parse_head, verify};
 
 /// The file's first bytes.
 const MAGIC: [u8; 4] = *b"BCRF";
@@ -43,6 +43,13 @@ pub enum StoreError {
     #[error("the record at byte {offset} is damaged")]
     Damaged {
         /// Where the record starts.
+        offset: u64,
+    },
+    /// Recovery stopped at byte `offset`, but a good record follows: the file is damaged there,
+    /// not torn at its end. It was left untouched.
+    #[error("the project file is damaged at byte {offset}, before later good records")]
+    DamagedMidFile {
+        /// Where recovery stopped.
         offset: u64,
     },
     /// `open_at` was given an offset that isn't a good Index.
@@ -84,6 +91,15 @@ enum Access {
     ReadWrite,
     /// Opened at an earlier save point.
     ReadOnly,
+}
+
+/// What opening at the latest state does with a torn tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repair {
+    /// Cut it off, so the file is writable again.
+    Truncate,
+    /// Leave the file untouched and open it read-only.
+    Leave,
 }
 
 /// Whether an Index lists every live tile or only those changed since its parent.
@@ -173,11 +189,31 @@ impl ProjectFile {
     /// Opens the project at `path` at its latest state, recovering from a crash: the state is
     /// the last good save point plus every complete record after it, and a torn tail is cut off.
     ///
+    /// Where recovery stops before the end of the file, the rest is searched for a record that
+    /// verifies. If there is one, the stop was damage, not a torn tail, and the file is left as
+    /// it is.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::BadHeader`], [`StoreError::Io`].
+    /// [`StoreError::DamagedMidFile`], [`StoreError::BadHeader`], [`StoreError::Io`].
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::open_latest(path, Repair::Truncate)
+    }
+
+    /// Opens the project at `path` at its latest state, as [`ProjectFile::open`] does; `repair`
+    /// says whether a torn tail is cut off or the file is left untouched and opened read-only.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::open`].
+    fn open_latest(path: &Path, repair: Repair) -> Result<Self, StoreError> {
+        let (file, access) = match repair {
+            Repair::Truncate => (
+                OpenOptions::new().read(true).write(true).open(path)?,
+                Access::ReadWrite,
+            ),
+            Repair::Leave => (File::open(path)?, Access::ReadOnly),
+        };
         let len = file.metadata()?.len();
         check_header(&file, len)?;
         let heads = scan_heads(&file, len)?;
@@ -189,13 +225,18 @@ impl ProjectFile {
             last_index: None,
             deltas: 0,
             head: None,
-            access: Access::ReadWrite,
+            access,
         };
         let replay_from = this.load_base(&heads, len)?;
         this.replay(heads.get(replay_from..).unwrap_or_default())?;
         if this.end < len {
-            this.file.set_len(this.end)?;
-            this.file.sync_all()?;
+            if find_record(&this.file, this.end, len)?.is_some() {
+                return Err(StoreError::DamagedMidFile { offset: this.end });
+            }
+            if repair == Repair::Truncate {
+                this.file.set_len(this.end)?;
+                this.file.sync_all()?;
+            }
         }
         Ok(this)
     }
@@ -252,6 +293,8 @@ impl ProjectFile {
     }
 
     /// Replays the records after the base Index while they verify, moving `end` past each one.
+    /// A record that verifies but doesn't parse (a tile key from a newer version, say) is
+    /// skipped.
     ///
     /// # Errors
     ///
@@ -268,12 +311,11 @@ impl ProjectFile {
             };
             match kind {
                 KIND_TILE => {
-                    let Some(tile) = parse_tile_payload(payload) else {
-                        break;
-                    };
-                    self.live.insert(tile.key, loc);
-                    self.pending.insert(tile.key, loc);
-                    self.head = self.head.max(Some(tile.op));
+                    if let Some(tile) = parse_tile_payload(payload) {
+                        self.live.insert(tile.key, loc);
+                        self.pending.insert(tile.key, loc);
+                        self.head = self.head.max(Some(tile.op));
+                    }
                 }
                 // Any Index this late failed to load as the base.
                 KIND_INDEX => break,
@@ -526,16 +568,16 @@ impl ProjectFile {
 /// Writes a new project at `dst` holding only `src`'s live tiles (raw records copied, not
 /// recompressed) and one full Index.
 ///
-/// `src` is opened as by [`ProjectFile::open`], so a torn tail is cut off it first. History before
-/// the latest state is dropped; which history to keep is decided with stroke history (M2). On
-/// error, `dst` may be left partly written.
+/// `src` is recovered as by [`ProjectFile::open`], but never modified: a torn tail is left in
+/// place, not cut off. History before the latest state is dropped; which history to keep is
+/// decided with stroke history (M2). On error, `dst` may be left partly written.
 ///
 /// # Errors
 ///
 /// Any [`StoreError`] from reading `src` (a damaged live tile is [`StoreError::Damaged`]) or
 /// writing `dst`, which must not exist.
 pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
-    let from = ProjectFile::open(src)?;
+    let from = ProjectFile::open_latest(src, Repair::Leave)?;
     let mut to = ProjectFile::create(dst)?;
     for (key, &Loc { offset, len }) in &from.live {
         let raw = from.read_record(offset, len)?;
@@ -593,6 +635,49 @@ fn scan_heads(file: &File, len: u64) -> io::Result<Vec<(u64, Head)>> {
         offset += head.total();
     }
     Ok(heads)
+}
+
+/// The first offset in `[from, len)` where a whole record starts that verifies: a head of a known
+/// kind whose record ends by `len`, with a good checksum. `None` if there is none.
+///
+/// The range is read in windows, so a long tail costs one pass and little memory; a candidate
+/// longer than its window is read on its own.
+///
+/// # Errors
+///
+/// The I/O error of a read.
+fn find_record(file: &File, from: u64, len: u64) -> io::Result<Option<u64>> {
+    /// Candidate head positions per window.
+    const WINDOW: u64 = 1 << 20;
+    let mut start = from;
+    while start.saturating_add((HEAD + TAIL) as u64) <= len {
+        // Enough bytes for a head at each of the window's positions.
+        let buf = read_exact(file, start, (len - start).min(WINDOW + HEAD as u64 - 1))?;
+        for (at, bytes) in (start..).zip(buf.windows(HEAD)) {
+            let Some(head) = bytes
+                .try_into()
+                .ok()
+                .and_then(parse_head)
+                .filter(|h| matches!(h.kind, KIND_TILE | KIND_INDEX))
+                .filter(|h| at.saturating_add(h.total()) <= len)
+            else {
+                continue;
+            };
+            let in_buf = usize::try_from(at - start)
+                .ok()
+                .zip(usize::try_from(head.total()).ok())
+                .and_then(|(lo, n)| buf.get(lo..lo.checked_add(n)?));
+            let good = match in_buf {
+                Some(record) => verify(record).is_some(),
+                None => verify(&read_exact(file, at, head.total())?).is_some(),
+            };
+            if good {
+                return Ok(Some(at));
+            }
+        }
+        start = start.saturating_add(WINDOW);
+    }
+    Ok(None)
 }
 
 /// The head at `offset`, if it is valid and its record ends by `len`.
@@ -709,7 +794,7 @@ fn tile_payload(
 fn parse_tile_payload(payload: &[u8]) -> Option<TileRecord<'_>> {
     let mut r = Reader::new(payload);
     let key = r.key()?;
-    let op = OpId::from_bits(r.u64()?);
+    let op = OpId::from_bits(r.u64()?)?;
     let header_len = r.u16()?;
     let header = r.take(usize::from(header_len))?;
     let raw_len = usize::try_from(r.u32()?).ok()?;
@@ -764,7 +849,10 @@ fn parse_index_payload(payload: &[u8]) -> Option<Index> {
     };
     r.take(7)?;
     let parent = Some(r.u64()?).filter(|&p| p != NONE);
-    let head = Some(r.u64()?).filter(|&h| h != NONE).map(OpId::from_bits);
+    let head = match r.u64()? {
+        NONE => None,
+        bits => Some(OpId::from_bits(bits)?),
+    };
     let count = usize::try_from(r.u32()?).ok()?;
     if r.rest().len() != count.checked_mul(ENTRY_LEN)? {
         return None;
@@ -1067,6 +1155,128 @@ mod tests {
             opened.keys().count(),
             3,
             "all three tiles, unknown records skipped"
+        );
+    }
+
+    /// A project with three saves of five tiles each, and its bytes.
+    fn saved_three_times(path: &Path) -> Vec<u8> {
+        let mut f = ProjectFile::create(path).unwrap();
+        for seq in 1..=15u16 {
+            f.write_displacement(
+                key(u32::from(seq % 5), 0),
+                op(u64::from(seq)),
+                &tile(f32::from(seq)),
+            )
+            .unwrap();
+            if seq % 5 == 0 {
+                f.save().unwrap();
+            }
+        }
+        drop(f);
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn damage_before_later_records_fails_open_and_leaves_the_file() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let good = saved_three_times(&path);
+        // The first record's head: a reserved byte (the head no longer parses), then the low
+        // byte of its length (the scan runs off the record boundaries).
+        for (what, byte) in [
+            ("reserved byte", HEADER_LEN + 1),
+            ("length", HEADER_LEN + 4),
+        ] {
+            let mut bad = good.clone();
+            bad[byte] ^= 0x01;
+            std::fs::write(&path, &bad).unwrap();
+            let opened = ProjectFile::open(&path);
+            assert!(
+                matches!(
+                    opened,
+                    Err(StoreError::DamagedMidFile {
+                        offset: FIRST_RECORD
+                    })
+                ),
+                "{what}: {opened:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bad, "{what}: file untouched");
+        }
+    }
+
+    #[test]
+    fn a_torn_tail_is_still_cut_off() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let good = saved_three_times(&path);
+        let want = state_of(&ProjectFile::open(&path).unwrap());
+        // Half of a further tile record, then bytes that never were a record.
+        let record = frame(
+            KIND_TILE,
+            &tile_payload(key(7, 0), op(99), b"h", 3, &[1, 2, 3]).unwrap(),
+        )
+        .unwrap();
+        let torn = [
+            good.as_slice(),
+            &record[..record.len() / 2],
+            &[0xA5; 300][..],
+        ]
+        .concat();
+        std::fs::write(&path, &torn).unwrap();
+        let opened = ProjectFile::open(&path).unwrap();
+        assert_eq!(state_of(&opened), want, "the saved state");
+        assert_eq!(std::fs::read(&path).unwrap(), good, "the tail is cut off");
+    }
+
+    #[test]
+    fn tile_records_that_do_not_parse_are_skipped() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path).unwrap();
+        f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
+        f.save().unwrap();
+        // Unsaved, so replayed: a payload too short to hold a key, and a tile whose op is
+        // `u64::MAX` (the reserved site, as no real op can be).
+        f.append_raw(KIND_TILE, b"short").unwrap();
+        let mut reserved = tile_payload(key(2, 0), op(2), b"", 0, &[]).unwrap();
+        reserved[KEY_LEN..KEY_LEN + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        f.append_raw(KIND_TILE, &reserved).unwrap();
+        f.write_displacement(key(3, 0), op(3), &tile(3.0)).unwrap();
+        let len = f.len();
+        drop(f);
+        let opened = ProjectFile::open(&path).unwrap();
+        assert_eq!(
+            opened.keys().copied().collect::<Vec<_>>(),
+            vec![key(1, 0), key(3, 0)],
+            "replay goes on past them"
+        );
+        assert_eq!(opened.head(), Some(op(3)), "head op");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "nothing cut off"
+        );
+    }
+
+    #[test]
+    fn compaction_leaves_its_source_untouched() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let good = saved_three_times(&path);
+        let want = state_of(&ProjectFile::open(&path).unwrap());
+        let torn = [good.as_slice(), &[0x5A; 100][..]].concat();
+        std::fs::write(&path, &torn).unwrap();
+        let out = dir.path("c.bcrf");
+        compact(&path, &out).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            torn,
+            "source bytes unchanged"
+        );
+        assert_eq!(
+            state_of(&ProjectFile::open(&out).unwrap()),
+            want,
+            "the recovered state"
         );
     }
 
