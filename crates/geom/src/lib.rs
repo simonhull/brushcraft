@@ -4,6 +4,8 @@
 
 mod math;
 #[cfg(test)]
+mod reference;
+#[cfg(test)]
 mod test_rng;
 
 pub use math::Vec3;
