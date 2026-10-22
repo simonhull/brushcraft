@@ -652,7 +652,8 @@ impl ProjectFile {
         Ok(points)
     }
 
-    /// The newest edit in the current state.
+    /// The newest edit in the current state: the greatest [`OpId`] written, which is the newest
+    /// only while every edit comes from one site (see [`OpId`]'s ordering).
     #[must_use]
     pub const fn head(&self) -> Option<OpId> {
         self.head

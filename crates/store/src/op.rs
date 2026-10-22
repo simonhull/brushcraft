@@ -11,7 +11,11 @@ pub const RESERVED_SITE: u16 = u16::MAX;
 ///
 /// The site is the machine or session, any but [`RESERVED_SITE`]; the sequence number has 48
 /// bits. M0 uses one site; the site is in the format so streams from several machines can merge
-/// later. Ordered by site, then sequence.
+/// later.
+///
+/// Ordered by site first, then sequence, so the order says nothing about which of two sites'
+/// edits came first: a "head" (the greatest op id) is only meaningful within one site. Merging
+/// several sites needs an order of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OpId {
     site: u16,
