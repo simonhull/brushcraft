@@ -161,10 +161,6 @@ impl Topology {
     /// The face and grid position of face-grid point `(i, j)` of `face`, where the point may be one
     /// step outside the face across one edge. `None` for points outside on both axes (diagonal
     /// of a corner) or further out, and for faces not in this mesh.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by owner-oriented frames (M0a Tasks 6–8)")
-    )]
     #[expect(
         clippy::many_single_char_names,
         reason = "grid math keeps the conventions' names: n, (i, j) and (s, d)"
@@ -377,10 +373,6 @@ pub(crate) const fn border_edge(i: u32, j: u32, n: u32) -> u8 {
 
 /// Grid steps, in the grid of the face whose edge `k` this is, that match the neighbour's `+i` and
 /// `+j`; the neighbour's edge is `m`. Used to take derivatives in the owner's orientation.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by owner-oriented frames (M0a Task 7)")
-)]
 pub(crate) const fn owner_axes(k: u8, m: u8) -> [(i64, i64); 2] {
     debug_assert!(k < 4 && m < 4, "edge indices are 0–3");
     // The neighbour's +i and +j as (Δs', Δd') along its edge m.
@@ -401,10 +393,6 @@ pub(crate) const fn owner_axes(k: u8, m: u8) -> [(i64, i64); 2] {
 }
 
 /// A step `(Δs, Δd)` along edge `k`, as a grid step.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by owner-oriented frames (M0a Task 7)")
-)]
 const fn edge_step(k: u8, ds: i64, dd: i64) -> (i64, i64) {
     debug_assert!(k < 4, "an edge index is 0–3");
     match k & 3 {

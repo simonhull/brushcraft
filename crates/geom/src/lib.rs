@@ -15,16 +15,13 @@ pub use key::{
     TileOutOfRange, VertexId,
 };
 mod correction;
-#[expect(dead_code, reason = "used by evaluation (M0a Task 8)")]
+mod eval;
 mod frame;
 pub use correction::{CorrectionError, CorrectionTile};
+pub use eval::{EvalError, Grid, PositionSource, evaluate_region};
 pub use frame::Frame;
 mod mesh;
 mod sphere;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by evaluation (M0a Tasks 7–8)")
-)]
 mod subdiv;
 mod topology;
 pub use mesh::{BaseMesh, MeshError};
