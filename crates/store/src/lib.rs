@@ -7,11 +7,15 @@
     reason = "scaffolding for the record and file modules, added in the next commits"
 )]
 mod bytes;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by record framing, added in the next commit")
-)]
 mod crc;
 mod op;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the project file, added in a later commit"
+    )
+)]
+mod record;
 
 pub use op::{MAX_SEQ, OpId};
