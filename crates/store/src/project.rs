@@ -67,6 +67,13 @@ use crate::tiles::{CacheError, Saved, StoreConfig, TileStore};
 /// The extension of a recovery file (and of a project file).
 const EXTENSION: &str = "bcrf";
 
+/// How long a project waits before it tries a failed roll-over again (see
+/// [`Project::roll_over`]), the first time: the wait doubles with each failure in a row.
+pub const ROLL_OVER_RETRY: Duration = Duration::from_secs(1);
+
+/// The longest a project waits between two tries of a failing roll-over.
+const ROLL_OVER_RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// How a [`Project`] is set up.
 #[derive(Debug, Clone)]
 pub struct ProjectConfig {
@@ -208,6 +215,16 @@ pub enum CandidateStatus {
     Damaged,
 }
 
+/// When [`Project::with_writer`] tries a failed writer's roll-over.
+#[derive(Debug, Clone, Copy)]
+enum Retry {
+    /// At once: for a save or a close, which need every edit in a recovery file.
+    Now,
+    /// Only once the wait after the last failed try has passed, it being this instant now:
+    /// for the frame loop's calls, which come every few milliseconds.
+    Due(Instant),
+}
+
 /// Where a project's recovery file came from, which decides what happens to it if the project
 /// fails to start.
 #[derive(Debug)]
@@ -247,6 +264,13 @@ pub struct Project {
     /// roll-over or a save), waiting to be reported: by the next call that has no other error
     /// to return ([`Project::report`]). So a report never stops a call from doing its work.
     unreported: BTreeSet<geom::TileKey>,
+    /// When a failed writer's roll-over may be tried again; `None` to try at once. A frame loop
+    /// polls every few milliseconds, and a roll-over that keeps failing (a full disk, say) is
+    /// tried only this often; a save or a close tries at once.
+    retry_at: Option<Instant>,
+    /// How long the next failed roll-over makes the project wait before trying again:
+    /// [`ROLL_OVER_RETRY`], doubling up to a minute while the failures go on.
+    retry_after: Duration,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename (see
     /// [`Unplaced::crash`]).
@@ -463,6 +487,8 @@ impl Project {
             recovery_path,
             recovery_dir: config.recovery_dir,
             unreported: BTreeSet::new(),
+            retry_at: None,
+            retry_after: ROLL_OVER_RETRY,
             #[cfg(test)]
             fail_next_recovery: false,
         })
@@ -593,7 +619,7 @@ impl Project {
     /// lacks the latest edits of some tiles.
     pub fn close(mut self, keep_recovery: bool) -> Result<(), ProjectError> {
         // A failed writer rolls over first, so the file kept holds every edit.
-        self.with_writer(|_, _| Ok(()))?;
+        self.with_writer(|_, _| Ok(()), Retry::Now)?;
         if let Some(mut writer) = self.writer.take() {
             let finished = writer.finish(&mut self.store, Instant::now());
             self.unreported.extend(writer.take_skipped());
@@ -660,10 +686,15 @@ impl Project {
     /// [`ProjectError::Recovery`] if the recovery writer fails, unless the failure was a sync,
     /// which the project deals with by moving to a new recovery file holding every edit;
     /// [`ProjectError::Cache`], [`ProjectError::Io`] or [`ProjectError::Store`] if moving to a
-    /// new recovery file fails (the next call tries again); [`ProjectError::Unprotected`] for
-    /// tiles whose edits aren't in the recovery file, once nothing else is to be reported.
+    /// new recovery file fails (it is tried again after [`ROLL_OVER_RETRY`], then waits
+    /// doubling up to a minute while it keeps failing); [`ProjectError::Unprotected`] for tiles
+    /// whose edits aren't in the recovery file, once nothing else is to be reported.
     pub fn end_stroke(&mut self) -> Result<(), ProjectError> {
-        self.with_writer(|writer, store| writer.end_stroke(store, Instant::now()))?;
+        let now = Instant::now();
+        self.with_writer(
+            |writer, store| writer.end_stroke(store, now),
+            Retry::Due(now),
+        )?;
         self.report()
     }
 
@@ -674,7 +705,7 @@ impl Project {
     ///
     /// As [`Project::end_stroke`].
     pub fn tick(&mut self, now: Instant) -> Result<(), ProjectError> {
-        self.with_writer(|writer, store| writer.tick(store, now))?;
+        self.with_writer(|writer, store| writer.tick(store, now), Retry::Due(now))?;
         self.report()
     }
 
@@ -696,19 +727,23 @@ impl Project {
     ///
     /// As [`Project::with_writer`]; [`ProjectError::Cache`] from installing prefetched tiles.
     fn advance(&mut self) -> Result<(), ProjectError> {
-        self.with_writer(RecoveryWriter::poll)?;
+        self.with_writer(RecoveryWriter::poll, Retry::Due(Instant::now()))?;
         self.store.poll()?;
         Ok(())
     }
 
     /// Flushes every edit into the recovery file and waits until it is durable: what a save
-    /// starts with, so no flush is in flight while the store is rebased.
+    /// starts with, so no flush is in flight while the store is rebased. A failed writer's
+    /// roll-over is tried at once.
     ///
     /// # Errors
     ///
     /// As [`Project::with_writer`].
     fn finish_flushes(&mut self) -> Result<(), ProjectError> {
-        self.with_writer(|writer, store| writer.finish(store, Instant::now()))
+        self.with_writer(
+            |writer, store| writer.finish(store, Instant::now()),
+            Retry::Now,
+        )
     }
 
     /// Reports the tiles found unprotected since the last report, if any, and forgets them.
@@ -730,7 +765,9 @@ impl Project {
     /// ([`Project::report`]). If the writer has failed (a sync of the recovery file failed, see
     /// [`crate::recovery`]), the project rolls over to a new recovery file holding every edit
     /// ([`Project::roll_over`]), and the failure, dealt with, isn't returned. A roll-over that
-    /// fails is tried again by the next call.
+    /// fails is tried again by the next call, at once if `retry` says so, else only once a wait
+    /// has passed: [`ROLL_OVER_RETRY`] after the first failure, doubling up to a minute while
+    /// they go on. Until then the edits wait in memory.
     ///
     /// # Errors
     ///
@@ -739,15 +776,28 @@ impl Project {
     fn with_writer(
         &mut self,
         call: impl FnOnce(&mut RecoveryWriter, &mut TileStore) -> Result<(), RecoveryError>,
+        retry: Retry,
     ) -> Result<(), ProjectError> {
         let writer = self.writer.as_mut().ok_or(RecoveryError::Stopped)?;
         let outcome = call(writer, &mut self.store);
         self.unreported.extend(writer.take_skipped());
-        if writer.is_failed() {
-            self.roll_over()
-        } else {
-            Ok(outcome?)
+        if !writer.is_failed() {
+            return Ok(outcome?);
         }
+        let now = match retry {
+            Retry::Due(now) if self.retry_at.is_some_and(|at| now < at) => return Ok(()),
+            Retry::Due(now) => now,
+            Retry::Now => Instant::now(),
+        };
+        let rolled = self.roll_over();
+        if self.writer.as_ref().is_some_and(RecoveryWriter::is_failed) {
+            self.retry_at = Some(now + self.retry_after);
+            self.retry_after = (self.retry_after * 2).min(ROLL_OVER_RETRY_MAX);
+        } else {
+            self.retry_at = None;
+            self.retry_after = ROLL_OVER_RETRY;
+        }
+        rolled
     }
 
     /// Moves the edits to a new recovery file after the writer failed to sync the current one.

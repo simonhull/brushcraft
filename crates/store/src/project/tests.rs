@@ -556,8 +556,12 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
         "the temporary file, filled before its rename",
     );
     drop(temporary);
-    // The next call tries again, and gets there.
+    // The calls of the frame loop wait a while before they try again.
     project.poll().unwrap();
+    project.tick(Instant::now()).unwrap();
+    assert_eq!(project.recovery_path(), old, "not tried again at once");
+    // The first call once the wait is over tries again, and gets there.
+    project.tick(Instant::now() + ROLL_OVER_RETRY).unwrap();
     assert_ne!(project.recovery_path(), old, "rolled over");
     assert!(!old.exists(), "and only then the old file goes");
     let path = project.recovery_path().to_path_buf();
@@ -802,4 +806,44 @@ fn a_roll_over_that_fails_after_losing_a_tile_still_reports_it() {
         &want,
         "the lost tile at its last saved state",
     );
+}
+
+/// A roll-over that keeps failing is tried less and less often by the frame loop's calls, the
+/// wait doubling; a save tries at once.
+#[test]
+fn a_failing_roll_over_backs_off_and_a_save_tries_at_once() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 141);
+    project.save_as(&path).unwrap();
+    let old = project.recovery_path().to_path_buf();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    project.fail_next_recovery();
+    stroke(&mut project, &mut map, 60, 142);
+    let began = Instant::now();
+    let first = loop {
+        match project.poll() {
+            Ok(()) => {
+                assert!(began.elapsed() < Duration::from_secs(30), "the sync fails");
+                std::thread::yield_now();
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(matches!(first, ProjectError::Io(_)), "{first:?}");
+    // Due again a second on: it fails a second time, and the wait doubles.
+    project.fail_next_recovery();
+    let again = Instant::now() + ROLL_OVER_RETRY;
+    let second = project.tick(again);
+    assert!(matches!(second, Err(ProjectError::Io(_))), "{second:?}");
+    project.tick(again + ROLL_OVER_RETRY).unwrap();
+    assert_eq!(project.recovery_path(), old, "a second isn't enough now");
+    // A save needs every edit in a recovery file: it doesn't wait.
+    project.save().unwrap();
+    assert_ne!(project.recovery_path(), old, "rolled over by the save");
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "every edit saved");
 }
