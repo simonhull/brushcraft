@@ -404,20 +404,28 @@ pub fn normal_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>
 /// lists for a tile of the level above. A cache that evaluates a tile coarse to fine, holding
 /// one level's tiles while it builds the next, needs room for two such levels.
 ///
-/// The bound is the larger of two counts, one per kind of level:
+/// The bound is the larger of two counts, one per kind of level, both derived from the reads:
 ///
-/// - **Levels holding several tiles per face** (finer than `log2(TILE_QUADS)`): a cone's tiles
-///   there are a 3 × 3 block around the tile, across face edges where it reaches them, with the
-///   corner tiles of every face around a base vertex in place of the block's regular corner: at
-///   most `max(valence, 4) + 5`.
+/// - **Levels holding several tiles per face** (finer than `log2(TILE_QUADS)`): at most
+///   `max(valence, 4) + 5`. A tile's region starts and ends on even vertices, and the level below
+///   reads its half, plus a one-vertex apron and the rings of the base vertices at its corners: an
+///   odd range of vertices, which stays inside the tiles next to the region's own. So each level of
+///   a cone lies in a 3 × 3 block of tiles around the tile, across face edges where it reaches
+///   them. The reads reach at most one face corner, so at most one base vertex's ring: a face is at
+///   least two tiles wide at these levels, and the range reaches only one vertex past the tile's
+///   own. At a corner of valence `V`, the block's diagonal tile gives way to the corner tiles of
+///   all `V` faces around the vertex: those `V`, three more of the tile's own face, and one more
+///   along each of the two edges at the corner, so `V + 5` tiles. Away from corners, and at valence
+///   3, the block's nine is the most.
 /// - **Levels where a tile is a whole face**: [`parent_tiles`] of a face is every face sharing a
 ///   vertex with it, so each coarser level reaches one ring of faces further. A cone enters these
-///   levels at most one ring out from its tile's face and descends `log2(TILE_QUADS)` of them, so
-///   its widest level is at most the most faces within `log2(TILE_QUADS) + 1` rings of any face
-///   (never more than the mesh).
+///   levels at most one ring out from its tile's face, at level `log2(TILE_QUADS)`, and reaches one
+///   ring further at each level down to level 1: `log2(TILE_QUADS)` rings in all. Its widest level
+///   is so at most the most faces within `log2(TILE_QUADS)` rings of any face (never more than the
+///   mesh).
 ///
-/// The first is the count observed on every tile of meshes up to valence [`MAX_VALENCE`] (see the
-/// tests), not derived from the gather; the second follows from the face rings.
+/// Both counts are reached: the tests find cones exactly this wide on meshes of valence 3 to
+/// [`MAX_VALENCE`], and on a mesh large enough that the rings don't cover it.
 ///
 /// Computed with a breadth-first search from every face: run it once per mesh.
 #[must_use]
@@ -425,7 +433,7 @@ pub fn cone_width(mesh: &BaseMesh) -> usize {
     let topology = mesh.topology();
     let face_levels = TILE_QUADS.trailing_zeros();
     let tiled = topology.max_valence().max(4) + 5;
-    let whole_faces = topology.widest_neighbourhood(face_levels + 1);
+    let whole_faces = topology.widest_neighbourhood(face_levels);
     tiled.max(whole_faces)
 }
 
@@ -1097,33 +1105,55 @@ mod tests {
             cone_width(&cube),
             "the cube: a level-8 tile's normals read a 3 × 3 block"
         );
-        // Whole cones of every tile, on meshes with valence 3 to 8.
+        // Whole cones of every tile, on meshes with valence 3 to 8: small enough that the rings
+        // reach every face, so the widest cone is the whole mesh.
         let meshes = [
             cube_sphere(2).unwrap(),
             pentagonal_prism().subdivide().to_base_mesh(),
             prism(8).subdivide().to_base_mesh(),
         ];
         for mesh in &meshes {
-            let (widest, width) = (widest_cone(mesh, 1, 8, 1), cone_width(mesh));
-            assert!(
-                widest <= width,
-                "{} faces: a cone {widest} tiles wide, over the bound {width}",
+            assert_eq!(
+                widest_cone(mesh, 1, 8, 1),
+                cone_width(mesh),
+                "{} faces: the bound is reached",
                 mesh.face_count()
             );
         }
-        // The highest valence, where the multi-tile levels' count is what matters: their cones
-        // into the first two whole-face levels.
-        let mesh = prism(MAX_VALENCE).subdivide().to_base_mesh();
-        let tiled = widest_cone(&mesh, 7, 8, 5);
+        // The multi-tile levels' count, reached at every valence up to the highest.
+        for mesh in meshes
+            .iter()
+            .chain([&prism(MAX_VALENCE).subdivide().to_base_mesh()])
+        {
+            let valence = mesh.topology().max_valence();
+            assert_eq!(
+                widest_cone(mesh, 7, 8, 7),
+                valence.max(4) + 5,
+                "valence {valence}: the multi-tile levels"
+            );
+        }
+        // A mesh the rings don't cover: the whole-face levels' count is reached, in six rings
+        // (`log2(TILE_QUADS)`), not seven.
+        let large = cube_sphere(7).unwrap();
+        let topology = large.topology();
         assert!(
-            tiled <= cone_width(&mesh),
-            "valence {MAX_VALENCE}: {tiled} tiles, over {}",
-            cone_width(&mesh)
+            topology.widest_neighbourhood(7) < usize::try_from(large.face_count()).unwrap(),
+            "seven rings don't cover the mesh either"
         );
         assert_eq!(
-            cone_width(&mesh),
-            usize::try_from(mesh.face_count()).unwrap(),
-            "a small mesh's whole-face levels reach all of it"
+            widest_cone(&large, 7, 7, 1),
+            cone_width(&large),
+            "{} faces: the cones into the whole-face levels",
+            large.face_count()
+        );
+        assert_eq!(
+            cone_width(&large),
+            topology.widest_neighbourhood(6),
+            "six rings"
+        );
+        assert!(
+            topology.widest_neighbourhood(7) > cone_width(&large),
+            "seven would overcount"
         );
     }
 
