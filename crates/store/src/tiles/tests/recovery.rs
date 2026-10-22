@@ -27,6 +27,18 @@ fn assert_save_point(path: &std::path::Path, offset: u64, mesh: &BaseMesh, map: 
 /// and in the oracle's map; returns the op.
 fn edit_interior(store: &mut TileStore, map: &mut CorrectionMap, key: TileKey, c: Vec3) -> OpId {
     let op = store.next_op().unwrap();
+    edit_interior_as(store, map, key, c, op);
+    op
+}
+
+/// [`edit_interior`] as edit `op`.
+fn edit_interior_as(
+    store: &mut TileStore,
+    map: &mut CorrectionMap,
+    key: TileKey,
+    c: Vec3,
+    op: OpId,
+) {
     store
         .edit_tile(key, op, |edit| edit.set(5, 7, c))
         .unwrap()
@@ -41,7 +53,6 @@ fn edit_interior(store: &mut TileStore, map: &mut CorrectionMap, key: TileKey, c
         c,
     )
     .unwrap();
-    op
 }
 
 #[test]
@@ -90,6 +101,7 @@ fn records_appended_while_the_tiles_sync_are_synced_before_the_save_point() {
     let mut map = CorrectionMap::new();
     apply(&mut store, &mut map, &random_edits(&mesh, TOP, 60, 41));
     writer.end_stroke(&mut store, Instant::now()).unwrap();
+    let cut = map.clone();
     writer.step_blocking(&mut store).unwrap();
     assert_eq!(writer.phase(), "syncing tiles", "the records are appended");
     // More edits, all written back while the tiles sync: the file grows past what the sync
@@ -103,10 +115,15 @@ fn records_appended_while_the_tiles_sync_are_synced_before_the_save_point() {
         "the file grew during the sync, so it is synced again before the save point"
     );
     settle(&mut writer, &mut store);
-    let offset = writer.durable_save_point().unwrap();
+    let first = writer.durable_save_point().unwrap();
+    // The records written back belong to edits past the flush's cut: the next flush.
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    let second = writer.durable_save_point().unwrap();
     drop(writer);
     drop(store);
-    assert_save_point(&path, offset, &mesh, &map);
+    assert_save_point(&path, first, &mesh, &cut);
+    assert_save_point(&path, second, &mesh, &map);
 }
 
 #[test]
@@ -484,4 +501,116 @@ fn a_failed_sync_with_a_flush_queued_does_not_spin() {
     }
     assert!(failed && writer.is_failed(), "the sync failed the writer");
     assert_eq!(writer.phase(), "failed", "and the queued flush was dropped");
+}
+
+/// The reproduction of the bug a cut closes.
+///
+/// A flush snapshots tiles k and j at their edits, then edit X writes both while the flush is in
+/// flight, and j, unpinned, is written back to make room before the flush's save point. That save
+/// point must hold the state at the snapshot: k and j as of their earlier edits, neither at X.
+#[test]
+fn a_save_point_is_the_state_at_its_cut() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, pinning());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let (k, j) = (top[3], top[40]);
+    let mut map = CorrectionMap::new();
+    let k_op = edit_interior(&mut store, &mut map, k, Vec3::new(0.0, 0.0, 0.25));
+    let j_op = edit_interior(&mut store, &mut map, j, Vec3::new(0.0, 0.0, -0.25));
+    let guard = store.pin(&[k]).unwrap();
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    assert_eq!(writer.phase(), "encoding", "the snapshot is taken");
+    let cut = map.clone();
+    let x = store.next_op().unwrap();
+    edit_interior_as(&mut store, &mut map, k, Vec3::new(0.5, 0.0, 0.0), x);
+    edit_interior_as(&mut store, &mut map, j, Vec3::new(-0.5, 0.0, 0.0), x);
+    store.evict_all().unwrap();
+    assert!(
+        store.corrections.find(&j).is_none(),
+        "j was written back at X"
+    );
+    assert!(store.corrections.find(&k).is_some(), "k, pinned, stays");
+    while !writer.is_idle() {
+        writer.step_blocking(&mut store).unwrap();
+    }
+    let first = writer.durable_save_point().unwrap();
+    drop(guard);
+    // The next flush takes X.
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    while !writer.is_idle() {
+        writer.step_blocking(&mut store).unwrap();
+    }
+    let second = writer.durable_save_point().unwrap();
+    drop(writer);
+    drop(store);
+    let at_cut = ProjectFile::open_at(&path, first).unwrap();
+    for (key, op) in [(k, k_op), (j, j_op)] {
+        let (got, _) = at_cut.read_displacement(&key).unwrap().unwrap();
+        assert_eq!(got, op, "{key:?}: as of the cut, not X");
+    }
+    drop(at_cut);
+    assert_save_point(&path, first, &mesh, &cut);
+    assert_save_point(&path, second, &mesh, &map);
+}
+
+/// A crash simulation under a tight budget.
+///
+/// Strokes, with edits, evaluations and write-backs between every phase of each flush. Every save
+/// point equals its flush's snapshot, and the file cut at every record boundary opens at the last
+/// save point before the cut.
+#[test]
+fn every_save_point_is_its_snapshot_and_every_cut_opens_at_one() {
+    /// The finest level edited and checked: coarse, so every cut can be checked in full.
+    const LEVEL: u8 = 5;
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let check = tiles(&mesh, 1, LEVEL);
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, tight());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    let mut points = Vec::new();
+    let mut seed = 200;
+    for _ in 0..5 {
+        seed += 1;
+        apply(&mut store, &mut map, &random_edits(&mesh, LEVEL, 40, seed));
+        writer.end_stroke(&mut store, Instant::now()).unwrap();
+        let snapshot = map.clone();
+        while !writer.is_idle() {
+            seed += 1;
+            apply(&mut store, &mut map, &random_edits(&mesh, LEVEL, 6, seed));
+            for key in check.iter().step_by(5) {
+                store.evaluate(*key).unwrap();
+            }
+            writer.step_blocking(&mut store).unwrap();
+        }
+        points.push((writer.durable_save_point().unwrap(), snapshot));
+    }
+    drop(writer);
+    drop(store);
+    let ends = ProjectFile::record_ends(&path);
+    // Each save point's state, from where its record ends.
+    let points: Vec<(u64, CorrectionMap)> = points
+        .into_iter()
+        .map(|(offset, snapshot)| (*ends.iter().find(|&&end| end > offset).unwrap(), snapshot))
+        .collect();
+    let bytes = std::fs::read(&path).unwrap();
+    let empty = CorrectionMap::new();
+    let cut_path = dir.path("cut.bcrf");
+    for &cut in &ends {
+        let want = points
+            .iter()
+            .rev()
+            .find(|(end, _)| *end <= cut)
+            .map_or(&empty, |(_, snapshot)| snapshot);
+        std::fs::write(&cut_path, &bytes[..usize::try_from(cut).unwrap()]).unwrap();
+        let file = ProjectFile::open(&cut_path).unwrap();
+        let mut reopened = TileStore::open(file, roomy()).unwrap();
+        let dense = DenseEvaluation::new(&mesh, level(LEVEL), want).unwrap();
+        assert_positions(&mut reopened, &dense, &check, &format!("cut at {cut}"));
+    }
+    assert!(ends.len() > 100, "{} record boundaries", ends.len());
 }

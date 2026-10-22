@@ -471,6 +471,9 @@ pub struct TileStore {
     /// Counts the store's edits (every write a correction slot takes): a save records it, and
     /// a rebase refuses a save made before the latest edit.
     epoch: u64,
+    /// The newest op of any edit so far: where a recovery flush cuts (see
+    /// [`TileStore::open_cut`]).
+    latest_edit: Option<OpId>,
     /// The change feed: every key an edit changed, with its op.
     feed: ChangeFeed,
     /// Save's place in the feed.
@@ -790,6 +793,7 @@ impl TileStore {
             unsaved: HashMap::new(),
             since_rebase: BTreeSet::new(),
             epoch: 0,
+            latest_edit: None,
             feed,
             save_consumer,
             streams: HashMap::new(),
@@ -1306,9 +1310,11 @@ impl TileStore {
     /// or a write-back to make room) appends it after this record. Reads of a dirty tile come
     /// from its slot, never the file, meanwhile.
     ///
-    /// A tile whose slot is clean or gone is skipped: someone else (a save, or a write-back to
-    /// make room) wrote it after the snapshot, at an edit at least as new, and an older record
-    /// appended after that one would replace it. It leaves the mark.
+    /// A tile whose slot is clean or gone was written by someone else (a write-back to make
+    /// room) after the snapshot, at an edit at least as new. If that edit is at or before the
+    /// working file's cut, the record is the cut's state and the copy is skipped; if it is past
+    /// the cut, the copy is appended for the cut's save point, and the newer record stays the
+    /// latest (see [`ProjectFile::open_cut`]). Either way it leaves the mark.
     ///
     /// # Errors
     ///
@@ -1326,6 +1332,14 @@ impl TileStore {
                 .find(&key)
                 .filter(|&found| self.corrections.is_dirty(found) == Some(true));
             let confirmed = match dirty {
+                // Written since the snapshot by an edit past the cut: the cut still needs this
+                // copy, which goes to the cut's save point, not over the newer record.
+                None if self.file.is_past_cut(&key) => {
+                    self.file
+                        .append_framed(tile)
+                        .map_err(CacheError::WriteBack)?;
+                    true
+                }
                 None => true,
                 Some(found) => {
                     self.file
@@ -1344,6 +1358,16 @@ impl TileStore {
             }
         }
         Ok(())
+    }
+
+    /// Opens a cut in the working file at the newest edit so far: the next save point the
+    /// recovery writer writes names the state as of now, whatever is written back meanwhile
+    /// (see [`ProjectFile::open_cut`]). Called as a flush takes its snapshot.
+    ///
+    /// Op ids must grow with the edits (as [`TileStore::next_op`] hands them out) for the cut to
+    /// tell later edits from earlier ones.
+    pub(crate) fn open_cut(&mut self) {
+        self.file.open_cut(self.latest_edit);
     }
 
     /// A handle that syncs the working file from another thread.
@@ -1831,6 +1855,7 @@ impl TileStore {
         self.unsaved.insert(key, op);
         self.feed.push(key, op);
         self.epoch += 1;
+        self.latest_edit = self.latest_edit.max(Some(op));
         self.corrections.set_dirty(id, true)?;
         Ok(())
     }

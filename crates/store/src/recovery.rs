@@ -392,6 +392,7 @@ impl RecoveryWriter {
     fn start(&mut self, store: &mut TileStore, at: Instant) -> Result<(), RecoveryError> {
         self.queued = None;
         let owed = std::mem::take(&mut self.unconfirmed);
+        store.open_cut();
         let started = match store.snapshot_dirty(self.consumer) {
             Ok(snapshots) if !snapshots.is_empty() => self
                 .send(Request::Encode(snapshots))

@@ -5,6 +5,7 @@
 //! and synced when the file is created and never change. Recovery after a crash starts after
 //! them, and damage to them fails the open rather than being cut off as a torn tail.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
@@ -398,6 +399,40 @@ pub struct ProjectFile {
     head: Option<OpId>,
     /// Whether writes are accepted.
     access: Access,
+    /// The cut the next save point is written for, while one is open (see [`Cut`]).
+    cut: Option<Cut>,
+}
+
+/// A save point in the making: the state of the file as of an edit (the cut), which records
+/// appended since may have moved past.
+///
+/// A recovery flush snapshots the store's dirty tiles as of its latest edit, and its save point
+/// must name exactly that state: no more, or a crash could reopen half of a later stroke. But
+/// while the flush is in flight, a later edit's tile may be written back to make room, and land
+/// in the file before the save point. So the cut remembers, for each tile, where its record was
+/// before the first record past the cut was appended, and the save point names that one; the
+/// later records wait for the next save point. A record at or before the cut appended after
+/// one past it (the flush's own copy of a tile written back since) is the cut's state, and
+/// takes the remembered place instead.
+#[derive(Debug)]
+struct Cut {
+    /// The newest edit the cut holds; records of later edits are past it. `None`: before any
+    /// edit, so every record is past it.
+    at: Option<OpId>,
+    /// The head op of the cut's state: the file's newest edit at or before the cut.
+    head: Option<OpId>,
+    /// For each tile with a record past the cut, where its record at the cut is.
+    prior: BTreeMap<TileKey, Prior>,
+}
+
+/// Where a tile's record at a cut is, for each kind of Index the cut's save point may be.
+#[derive(Debug, Clone, Copy)]
+struct Prior {
+    /// Its latest record at the cut, for a full Index; `None` if it had none (it is left out).
+    live: Option<Loc>,
+    /// Its latest record written since the last save point at the cut, for a delta Index;
+    /// `None` if it had none (the parent's entry stands, so it is left out).
+    pending: Option<Loc>,
 }
 
 /// Leaves the mesh out (its size is enough) and counts the maps rather than listing them.
@@ -413,6 +448,7 @@ impl std::fmt::Debug for ProjectFile {
             .field("deltas", &self.deltas)
             .field("head", &self.head)
             .field("access", &self.access)
+            .field("cut", &self.cut.as_ref().map(|cut| cut.at))
             .finish_non_exhaustive()
     }
 }
@@ -496,6 +532,7 @@ impl ProjectFile {
             deltas: 0,
             head: None,
             access: Access::ReadWrite,
+            cut: None,
         })
     }
 
@@ -606,6 +643,7 @@ impl ProjectFile {
             deltas: 0,
             head: None,
             access,
+            cut: None,
         };
         let tail = this.load_base(&heads, len)?;
         if this.end < len {
@@ -657,6 +695,7 @@ impl ProjectFile {
             deltas: chain.deltas,
             head: chain.head,
             access: Access::ReadOnly,
+            cut: None,
         })
     }
 
@@ -731,9 +770,7 @@ impl ProjectFile {
         let packed = compress(body)?;
         let payload = tile_payload(key, op, header, body.len(), &packed)?;
         let loc = self.append(KIND_TILE, &payload)?;
-        self.live.insert(key, loc);
-        self.pending.insert(key, loc);
-        self.head = self.head.max(Some(op));
+        self.note(key, op, loc);
         Ok(())
     }
 
@@ -766,10 +803,55 @@ impl ProjectFile {
             return Err(StoreError::ReadOnly);
         }
         let loc = self.append_record(&tile.record)?;
-        self.live.insert(tile.key, loc);
-        self.pending.insert(tile.key, loc);
-        self.head = self.head.max(Some(tile.op));
+        self.note(tile.key, tile.op, loc);
         Ok(())
+    }
+
+    /// Records that `key`'s record written by `op` was appended at `loc`: its latest record,
+    /// written since the last save point, with `op` counted towards the head. While a cut is
+    /// open (see [`Cut`]), the first record of `key` past it leaves the cut its place before,
+    /// and a record at or before the cut after one past it is the cut's state, not the latest.
+    fn note(&mut self, key: TileKey, op: OpId, loc: Loc) {
+        if let Some(cut) = &mut self.cut {
+            if Some(op) > cut.at {
+                let before = Prior {
+                    live: self.live.get(&key).copied(),
+                    pending: self.pending.get(&key).copied(),
+                };
+                cut.prior.entry(key).or_insert(before);
+            } else {
+                cut.head = cut.head.max(Some(op));
+                if let Some(prior) = cut.prior.get_mut(&key) {
+                    *prior = Prior {
+                        live: Some(loc),
+                        pending: Some(loc),
+                    };
+                    return;
+                }
+            }
+        }
+        self.live.insert(key, loc);
+        self.pending.insert(key, loc);
+        self.head = self.head.max(Some(op));
+    }
+
+    /// Opens a cut at edit `at`: the next [`ProjectFile::write_save_point`] names the state as
+    /// of `at` (see [`Cut`]). Replaces any cut open already; records written before this call
+    /// are all at or before `at`, so nothing of the old cut carries over.
+    pub(crate) fn open_cut(&mut self, at: Option<OpId>) {
+        self.cut = Some(Cut {
+            at,
+            head: self.head,
+            prior: BTreeMap::new(),
+        });
+    }
+
+    /// Whether a record of `key` past the open cut has been appended: a copy of its tile as of
+    /// the cut must still be appended for the cut's save point to hold it.
+    pub(crate) fn is_past_cut(&self, key: &TileKey) -> bool {
+        self.cut
+            .as_ref()
+            .is_some_and(|cut| cut.prior.contains_key(key))
     }
 
     /// Frames `payload` and writes it at the end.
@@ -1000,9 +1082,7 @@ impl ProjectFile {
             .ok_or(StoreError::Damaged { offset })?
             .op;
         let loc = self.append_record(raw)?;
-        self.live.insert(*key, loc);
-        self.pending.insert(*key, loc);
-        self.head = self.head.max(Some(op));
+        self.note(*key, op, loc);
         Ok(())
     }
 
@@ -1018,7 +1098,8 @@ impl ProjectFile {
     /// [`ProjectFile::open_at`].
     ///
     /// The save point is an Index naming the live tiles: all of them the first time and every 16th
-    /// time, otherwise only those written since the last save.
+    /// time, otherwise only those written since the last save. It names the latest state: an
+    /// open cut is dropped.
     ///
     /// # Errors
     ///
@@ -1027,6 +1108,7 @@ impl ProjectFile {
         if self.access == Access::ReadOnly {
             return Err(StoreError::ReadOnly);
         }
+        self.cut = None;
         // Tiles are durable before the Index that names them.
         self.file.sync_data()?;
         let (coverage, loc) = self.append_index()?;
@@ -1037,7 +1119,8 @@ impl ProjectFile {
 
     /// Appends a save point naming the tiles written so far, without syncing anything, and
     /// returns its offset: [`ProjectFile::save`] for a caller that syncs on another thread
-    /// (through a [`FileSyncer`]).
+    /// (through a [`FileSyncer`]). If a cut is open, the save point names the state at the cut
+    /// (see [`Cut`]) and closes it; the records past it wait for the next save point.
     ///
     /// The caller must have synced every record written before this call (the tiles the Index
     /// names) and must sync again after it before the save point is durable. Until that second
@@ -1069,24 +1152,45 @@ impl ProjectFile {
         } else {
             Coverage::Delta
         };
-        let entries = match coverage {
+        let latest = match coverage {
             Coverage::Full => &self.live,
             Coverage::Delta => &self.pending,
         };
-        let payload = index_payload(coverage, self.last_index, self.head, entries)?;
+        let (entries, head) = match &self.cut {
+            Some(cut) if !cut.prior.is_empty() => {
+                let mut at_cut = latest.clone();
+                for (key, prior) in &cut.prior {
+                    let place = match coverage {
+                        Coverage::Full => prior.live,
+                        Coverage::Delta => prior.pending,
+                    };
+                    match place {
+                        Some(loc) => at_cut.insert(*key, loc),
+                        None => at_cut.remove(key),
+                    };
+                }
+                (Cow::Owned(at_cut), cut.head)
+            }
+            _ => (Cow::Borrowed(latest), self.head),
+        };
+        let payload = index_payload(coverage, self.last_index, head, &entries)?;
         let loc = self.append(KIND_INDEX, &payload)?;
         Ok((coverage, loc))
     }
 
-    /// Makes the Index at `loc` the latest save point: the parent of the next, with nothing
-    /// written since.
+    /// Makes the Index at `loc` the latest save point: the parent of the next. What it named
+    /// leaves `pending`; the records past a cut it was written for stay, for the next one, and
+    /// the cut closes.
     fn commit_index(&mut self, coverage: Coverage, loc: Loc) {
         self.last_index = Some(loc.offset);
         self.deltas = match coverage {
             Coverage::Full => 0,
             Coverage::Delta => self.deltas + 1,
         };
-        self.pending.clear();
+        match self.cut.take() {
+            Some(cut) => self.pending.retain(|key, _| cut.prior.contains_key(key)),
+            None => self.pending.clear(),
+        }
     }
 
     /// Whether tiles have been written since the last save point (or, before the first, at
@@ -1194,6 +1298,26 @@ impl ProjectFile {
             .ok_or(StoreError::Damaged { offset })?
             .len
             .into())
+    }
+
+    /// The lengths a crash between two records can leave the file at `path` with: the end of
+    /// its leading records, then the end of each record after them, in order.
+    ///
+    /// # Panics
+    ///
+    /// If the file can't be read or its leading records are bad.
+    pub(crate) fn record_ends(path: &Path) -> Vec<u64> {
+        let file = File::open(path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let leading = read_leading(&file, len, None).unwrap();
+        let heads = scan_heads(&file, leading.end, len).unwrap();
+        std::iter::once(leading.end)
+            .chain(
+                heads
+                    .into_iter()
+                    .map(|(offset, head)| offset + head.total()),
+            )
+            .collect()
     }
 
     /// The tiles written since the last save point, in key order: what the next one names.
