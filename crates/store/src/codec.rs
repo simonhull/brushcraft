@@ -5,6 +5,7 @@ use geom::{CorrectionError, CorrectionTile, Vec3};
 use thiserror::Error;
 
 use crate::bytes::Reader;
+use crate::slot::{CorrectionSlot, SIDE};
 
 /// zstd level: fast, and smooth correction data compresses well at it.
 const LEVEL: i32 = 3;
@@ -57,45 +58,69 @@ pub(crate) fn encode_displacement(tile: &CorrectionTile) -> Result<(Vec<u8>, Vec
     Ok((header, body))
 }
 
-/// Decodes [`encode_displacement`]'s output.
+/// Decodes [`encode_displacement`]'s output into a [`CorrectionTile`]. Readers decode into slots
+/// ([`decode_displacement_into`]); this is the tests' reference.
 ///
 /// # Errors
 ///
-/// [`CodecError::Size`] if the header or body length doesn't match the side; [`CodecError::Tile`]
-/// if the values are invalid (non-finite border, bad scale).
+/// As [`decode_displacement_into`].
+#[cfg(test)]
 pub(crate) fn decode_displacement(
     header: &[u8],
     body: &[u8],
 ) -> Result<CorrectionTile, CodecError> {
+    let mut slot: CorrectionSlot = bytemuck::Zeroable::zeroed();
+    decode_displacement_into(header, body, &mut slot)?;
+    Ok(slot.to_tile()?)
+}
+
+/// Decodes [`encode_displacement`]'s output straight into `slot`, without allocating, and
+/// validates it as [`CorrectionTile::from_parts`] does (see [`CorrectionSlot::validate`]).
+///
+/// # Errors
+///
+/// [`CodecError::Size`] if the header or body length doesn't match the side; [`CodecError::Tile`]
+/// if the values are invalid (side out of range, bad scale, `i16::MIN`, non-finite border, or a
+/// zero scale with a nonzero interior). On error the slot holds no tile.
+pub(crate) fn decode_displacement_into(
+    header: &[u8],
+    body: &[u8],
+    slot: &mut CorrectionSlot,
+) -> Result<(), CodecError> {
     let Header { side, scale } = parse_header(header)?;
     let (n, ring) = counts(side)?;
-    if body.len() != n * 6 + ring * 12 {
-        return Err(CodecError::Size);
+    let (interior, border) = body
+        .split_at_checked(n * 6)
+        .filter(|(_, border)| border.len() == ring * 12)
+        .ok_or(CodecError::Size)?;
+    slot.reset(side)?;
+    slot.scale = scale;
+    let interior_planes: [fn(&mut [i16; 3], i16); 3] =
+        [|q, v| q[0] = v, |q, v| q[1] = v, |q, v| q[2] = v];
+    let (deltas, _) = interior.as_chunks::<2>();
+    for (c, put) in interior_planes.iter().enumerate() {
+        let mut prev = 0i16;
+        for (q, delta) in slot
+            .interior
+            .iter_mut()
+            .zip(deltas.iter().skip(c * n).take(n))
+        {
+            prev = prev.wrapping_add(i16::from_le_bytes(*delta));
+            put(q, prev);
+        }
     }
-    let mut r = Reader::new(body);
-    let (ix, iy, iz) = (
-        delta_plane(&mut r, n)?,
-        delta_plane(&mut r, n)?,
-        delta_plane(&mut r, n)?,
-    );
-    let (bx, by, bz) = (
-        f32_plane(&mut r, ring)?,
-        f32_plane(&mut r, ring)?,
-        f32_plane(&mut r, ring)?,
-    );
-    let interior = ix
-        .into_iter()
-        .zip(iy)
-        .zip(iz)
-        .map(|((x, y), z)| [x, y, z])
-        .collect();
-    let border = bx
-        .into_iter()
-        .zip(by)
-        .zip(bz)
-        .map(|((x, y), z)| Vec3::new(x, y, z))
-        .collect();
-    Ok(CorrectionTile::from_parts(side, scale, interior, border)?)
+    let border_planes: [fn(&mut Vec3, f32); 3] = [|v, x| v.x = x, |v, y| v.y = y, |v, z| v.z = z];
+    let (values, _) = border.as_chunks::<4>();
+    for (c, put) in border_planes.iter().enumerate() {
+        for (v, bytes) in slot
+            .border
+            .iter_mut()
+            .zip(values.iter().skip(c * ring).take(ring))
+        {
+            put(v, f32::from_le_bytes(*bytes));
+        }
+    }
+    Ok(slot.validate()?)
 }
 
 /// A displacement channel header.
@@ -130,11 +155,13 @@ fn parse_header(header: &[u8]) -> Result<Header, CodecError> {
 ///
 /// # Errors
 ///
-/// [`CodecError::Tile`] if `side` is out of range.
+/// [`CodecError::Tile`] if `side` is out of range (below 2, or wider than the largest tile).
 fn counts(side: u32) -> Result<(usize, usize), CodecError> {
-    // Validates the side; the counts follow from it.
-    let empty = CorrectionTile::zero(side)?;
-    Ok((empty.interior().len(), empty.border().len()))
+    let n = usize::try_from(side)
+        .ok()
+        .filter(|n| (2..=SIDE).contains(n))
+        .ok_or(CorrectionError::BadSide(side))?;
+    Ok(((n - 2) * (n - 2), 4 * (n - 1)))
 }
 
 /// The side a displacement header states, and the uncompressed body length that side needs, so
@@ -148,30 +175,6 @@ pub(crate) fn displacement_body_len(header: &[u8]) -> Result<(u32, usize), Codec
     let side = parse_header(header)?.side;
     let (n, ring) = counts(side)?;
     Ok((side, n * 6 + ring * 12))
-}
-
-/// `n` delta-coded `i16`s, summed back to values.
-///
-/// # Errors
-///
-/// [`CodecError::Size`] if `r` runs out.
-fn delta_plane(r: &mut Reader<'_>, n: usize) -> Result<Vec<i16>, CodecError> {
-    let mut prev = 0i16;
-    (0..n)
-        .map(|_| {
-            prev = prev.wrapping_add(r.i16().ok_or(CodecError::Size)?);
-            Ok(prev)
-        })
-        .collect()
-}
-
-/// `n` exact `f32`s.
-///
-/// # Errors
-///
-/// [`CodecError::Size`] if `r` runs out.
-fn f32_plane(r: &mut Reader<'_>, n: usize) -> Result<Vec<f32>, CodecError> {
-    (0..n).map(|_| r.f32().ok_or(CodecError::Size)).collect()
 }
 
 /// zstd-compresses `raw`.
@@ -204,6 +207,8 @@ pub(crate) fn decompress(packed: &[u8], len: usize) -> std::io::Result<Vec<u8>> 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
+    use bytemuck::Zeroable;
+
     use super::*;
 
     #[test]
@@ -274,5 +279,76 @@ mod tests {
             "short body"
         );
         assert!(decompress(b"not zstd", 100).is_err(), "not a zstd frame");
+    }
+
+    /// A side-3 payload (one interior vertex, eight border ones): scale, interior x, border x0.
+    fn side3(scale: f32, x: i16, border_x: f32) -> (Vec<u8>, Vec<u8>) {
+        let mut header = 3u16.to_le_bytes().to_vec();
+        header.extend_from_slice(&scale.to_le_bytes());
+        let mut body = vec![0; 6 + 8 * 12];
+        body[..2].copy_from_slice(&x.to_le_bytes());
+        body[6..10].copy_from_slice(&border_x.to_le_bytes());
+        (header, body)
+    }
+
+    #[test]
+    fn decoding_into_a_slot_is_the_gate() {
+        let mut slot = CorrectionSlot::zeroed();
+        for (what, scale, x, border_x) in [
+            ("i16::MIN", 1.0, i16::MIN, 0.0),
+            ("NaN border", 1.0, 1, f32::NAN),
+            ("infinite border", 1.0, 1, f32::INFINITY),
+            ("negative scale", -1.0, 1, 0.0),
+            ("infinite scale", f32::INFINITY, 1, 0.0),
+            ("subnormal scale", f32::MIN_POSITIVE / 2.0, 1, 0.0),
+            ("zero scale, nonzero interior", 0.0, 1, 0.0),
+        ] {
+            let (header, body) = side3(scale, x, border_x);
+            slot.reset(3).unwrap();
+            assert!(
+                matches!(
+                    decode_displacement_into(&header, &body, &mut slot),
+                    Err(CodecError::Tile(CorrectionError::BadParts { side: 3 }))
+                ),
+                "{what} rejected"
+            );
+            assert!(slot.view().is_err(), "{what}: the slot holds no tile");
+            assert!(
+                decode_displacement(&header, &body).is_err(),
+                "{what}: the tile decoder agrees"
+            );
+        }
+        let (zero_header, zero_body) = side3(-0.0, 0, -0.0);
+        decode_displacement_into(&zero_header, &zero_body, &mut slot).unwrap();
+        assert_eq!(slot.scale.to_bits(), 0, "-0.0 scale stored as +0.0");
+        assert_eq!(slot.border[0].x.to_bits(), 0, "-0.0 border stored as +0.0");
+        let (good_header, good_body) = side3(0.5, 7, 1.5);
+        decode_displacement_into(&good_header, &good_body, &mut slot).unwrap();
+        assert_eq!(
+            slot.view().unwrap().get(1, 1),
+            Some(Vec3::new(3.5, 0.0, 0.0)),
+            "interior decoded"
+        );
+        assert_eq!(
+            slot.view().unwrap().get(0, 0),
+            Some(Vec3::new(1.5, 0.0, 0.0)),
+            "border"
+        );
+        let mut wide = 66u16.to_le_bytes().to_vec();
+        wide.extend_from_slice(&0f32.to_le_bytes());
+        assert!(
+            matches!(
+                decode_displacement_into(&wide, &[], &mut slot),
+                Err(CodecError::Tile(CorrectionError::BadSide(66)))
+            ),
+            "too wide"
+        );
+    }
+
+    #[test]
+    fn the_smallest_tile_decodes() {
+        let tile = CorrectionTile::from_values(2, &[Vec3::new(1.0, 2.0, 3.0); 4]).unwrap();
+        let (header, raw) = encode_displacement(&tile).unwrap();
+        assert_eq!(decode_displacement(&header, &raw).unwrap(), tile, "side 2");
     }
 }

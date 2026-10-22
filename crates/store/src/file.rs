@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geom::{Channel, CorrectionTile, TileKey};
@@ -14,10 +15,11 @@ use thiserror::Error;
 use crate::OpId;
 use crate::bytes::{KEY_LEN, Reader, put_key};
 use crate::codec::{
-    CodecError, compress, decode_displacement, decompress, displacement_body_len,
+    CodecError, compress, decode_displacement_into, decompress, displacement_body_len,
     encode_displacement,
 };
 use crate::record::{HEAD, Head, KIND_INDEX, KIND_TILE, TAIL, frame, parse_head, verify};
+use crate::slot::CorrectionSlot;
 
 /// The file's first bytes.
 const MAGIC: [u8; 4] = *b"BCRF";
@@ -111,9 +113,10 @@ pub struct TileBytes {
     pub body: Vec<u8>,
 }
 
-/// Where a record lives: its first byte and its whole length.
+/// Where a record lives: its first byte and its whole length. Records are never moved or
+/// overwritten while the file is open, so a location stays valid after later appends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Loc {
+pub(crate) struct Loc {
     offset: u64,
     len: u64,
 }
@@ -311,7 +314,9 @@ struct TileRecord<'a> {
 /// An open project file.
 #[derive(Debug)]
 pub struct ProjectFile {
-    file: File,
+    /// Shared with [`FileReader`]s: the lock, which belongs to the open file, is held until the
+    /// last of them is dropped.
+    file: Arc<File>,
     /// Where the next record goes.
     end: u64,
     live: BTreeMap<TileKey, Loc>,
@@ -353,7 +358,7 @@ impl ProjectFile {
         file.sync_all()?;
         sync_parent(path)?;
         Ok(Self {
-            file,
+            file: Arc::new(file),
             end: FIRST_RECORD,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -415,7 +420,7 @@ impl ProjectFile {
         check_header(&file, len)?;
         let heads = scan_heads(&file, len)?;
         let mut this = Self {
-            file,
+            file: Arc::new(file),
             end: FIRST_RECORD,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -461,7 +466,7 @@ impl ProjectFile {
             offset: index_offset,
         })?;
         Ok(Self {
-            file,
+            file: Arc::new(file),
             end: len,
             live: chain.live,
             pending: BTreeMap::new(),
@@ -665,23 +670,50 @@ impl ProjectFile {
         &self,
         key: &TileKey,
     ) -> Result<Option<(OpId, CorrectionTile)>, StoreError> {
-        check_displacement(key, key.side())?;
-        let check = |tile: &TileRecord<'_>| {
-            let (side, body_len) = displacement_body_len(tile.header)?;
-            check_displacement(key, side)?;
-            if tile.raw_len == body_len {
-                Ok(())
-            } else {
-                Err(CodecError::Size.into())
-            }
-        };
-        let Some(tile) = self.read_tile_checked(key, check)? else {
+        let mut slot = bytemuck::zeroed_box::<CorrectionSlot>();
+        let Some(op) = self.read_displacement_into(key, &mut slot, &mut ReadScratch::new()?)?
+        else {
             return Ok(None);
         };
-        Ok(Some((
-            tile.op,
-            decode_displacement(&tile.header, &tile.body)?,
-        )))
+        Ok(Some((op, slot.to_tile().map_err(CodecError::from)?)))
+    }
+
+    /// Reads `key`'s latest displacement tile straight into `slot`, as a [`FileReader`] does;
+    /// returns the edit that wrote it, or `None` (and leaves `slot` alone) if the tile is absent.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::read_displacement`]. On error `slot` holds no tile.
+    pub(crate) fn read_displacement_into(
+        &self,
+        key: &TileKey,
+        slot: &mut CorrectionSlot,
+        scratch: &mut ReadScratch,
+    ) -> Result<Option<OpId>, StoreError> {
+        check_displacement(key, key.side())?;
+        let Some(loc) = self.locate(key) else {
+            return Ok(None);
+        };
+        read_displacement_at(&self.file, key, loc, slot, scratch).map(Some)
+    }
+
+    /// Where `key`'s latest record is, if it has one.
+    pub(crate) fn locate(&self, key: &TileKey) -> Option<Loc> {
+        self.live.get(key).copied()
+    }
+
+    /// A reader for other threads, sharing this open file (and its lock).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "prefetch workers (next in M0b2) are the first users"
+        )
+    )]
+    pub(crate) fn reader(&self) -> FileReader {
+        FileReader {
+            file: Arc::clone(&self.file),
+        }
     }
 
     /// Makes every write so far durable and records a save point. Returns its offset, for
@@ -801,6 +833,137 @@ impl ProjectFile {
     fn append_raw(&mut self, kind: u8, payload: &[u8]) -> Result<(), StoreError> {
         self.append(kind, payload).map(drop)
     }
+}
+
+/// Reads tiles of an open [`ProjectFile`] from any thread.
+///
+/// It reads at locations the owner looked up ([`ProjectFile::locate`]). The file is append-only
+/// while open, so a location stays valid; the file's lock is held while any reader lives.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "prefetch workers (next in M0b2) are the first users"
+    )
+)]
+pub(crate) struct FileReader {
+    file: Arc<File>,
+}
+
+impl FileReader {
+    /// Reads the displacement tile of `key` recorded at `loc` straight into `slot`, and returns
+    /// the edit that wrote it. Allocates nothing once `scratch` has grown to the largest record.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Damaged`] if the record fails its checksum, isn't a tile of `key` or doesn't
+    /// decompress; [`StoreError::NotDisplacement`], [`StoreError::WrongSide`],
+    /// [`StoreError::Codec`] as for [`ProjectFile::read_displacement`]; [`StoreError::Io`]. On
+    /// error `slot` holds no tile.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "prefetch workers (next in M0b2) are the first users"
+        )
+    )]
+    pub(crate) fn read_displacement_into(
+        &self,
+        key: &TileKey,
+        loc: Loc,
+        slot: &mut CorrectionSlot,
+        scratch: &mut ReadScratch,
+    ) -> Result<OpId, StoreError> {
+        check_displacement(key, key.side())?;
+        read_displacement_at(&self.file, key, loc, slot, scratch)
+    }
+}
+
+/// Reusable buffers for reading tiles: the record, its decompressed body and a zstd context.
+/// One per reading thread.
+pub(crate) struct ReadScratch {
+    record: Vec<u8>,
+    raw: Vec<u8>,
+    zstd: zstd::bulk::Decompressor<'static>,
+}
+
+impl ReadScratch {
+    /// Empty buffers and a fresh zstd context.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] if zstd can't allocate its context.
+    pub(crate) fn new() -> Result<Self, StoreError> {
+        Ok(Self {
+            record: Vec::new(),
+            raw: Vec::new(),
+            zstd: zstd::bulk::Decompressor::new()?,
+        })
+    }
+}
+
+impl std::fmt::Debug for ReadScratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadScratch")
+            .field("record", &self.record.capacity())
+            .field("raw", &self.raw.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reads the displacement record of `key` at `loc` into `slot`: verifies it, checks the header's
+/// side and stated size before decompressing, then decodes and validates.
+///
+/// # Errors
+///
+/// As [`FileReader::read_displacement_into`]. On error `slot` holds no tile.
+fn read_displacement_at(
+    file: &File,
+    key: &TileKey,
+    loc: Loc,
+    slot: &mut CorrectionSlot,
+    scratch: &mut ReadScratch,
+) -> Result<OpId, StoreError> {
+    let read = decode_record_at(file, key, loc, slot, scratch);
+    if read.is_err() {
+        bytemuck::bytes_of_mut(slot).fill(0);
+    }
+    read
+}
+
+/// [`read_displacement_at`] without clearing `slot` on error.
+///
+/// # Errors
+///
+/// As [`read_displacement_at`].
+fn decode_record_at(
+    file: &File,
+    key: &TileKey,
+    Loc { offset, len }: Loc,
+    slot: &mut CorrectionSlot,
+    scratch: &mut ReadScratch,
+) -> Result<OpId, StoreError> {
+    let ReadScratch { record, raw, zstd } = scratch;
+    let damaged = StoreError::Damaged { offset };
+    record.resize(usize::try_from(len).or(Err(StoreError::TooLarge))?, 0);
+    match file.read_exact_at(record, offset) {
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(damaged),
+        other => other?,
+    }
+    let tile = tile_record(record, key).ok_or(damaged)?;
+    let (side, body_len) = displacement_body_len(tile.header)?;
+    check_displacement(key, side)?;
+    if tile.raw_len != body_len {
+        return Err(CodecError::Size.into());
+    }
+    raw.resize(body_len, 0);
+    match zstd.decompress_to_buffer(tile.packed, raw.as_mut_slice()) {
+        Ok(n) if n == body_len => {}
+        _ => return Err(StoreError::Damaged { offset }),
+    }
+    decode_displacement_into(tile.header, raw, slot)?;
+    Ok(tile.op)
 }
 
 /// Writes a new project at `dst` holding only `src`'s live tiles (raw records copied, not
@@ -1739,5 +1902,157 @@ mod tests {
             c.len()
         );
         assert_eq!(c.save_points().unwrap().len(), 1, "one full index");
+    }
+
+    fn small_key(face: u32) -> TileKey {
+        TileKey::displacement(FaceId::new(face), Level::new(3).unwrap(), 0, 0).unwrap()
+    }
+
+    fn small_tile(seed: f32) -> CorrectionTile {
+        let values: Vec<Vec3> = (0..9 * 9u16)
+            .map(|k| Vec3::new(seed * f32::from(k % 5), -seed, 0.25))
+            .collect();
+        CorrectionTile::from_values(9, &values).unwrap()
+    }
+
+    #[test]
+    fn a_reader_on_another_thread_reads_what_the_owner_does() {
+        let dir = TestDir::new();
+        let mut f = ProjectFile::create(&dir.path("p.bcrf")).unwrap();
+        let tiles = [(key(1, 0), tile(0.5)), (small_key(2), small_tile(0.125))];
+        for (seq, (k, t)) in (1..).zip(&tiles) {
+            f.write_displacement(*k, op(seq), t).unwrap();
+        }
+        f.save().unwrap();
+        let jobs: Vec<(TileKey, Loc)> = tiles
+            .iter()
+            .map(|(k, _)| (*k, f.locate(k).unwrap()))
+            .collect();
+        let reader = f.reader();
+        let read = std::thread::spawn(move || {
+            let mut scratch = ReadScratch::new().unwrap();
+            let mut slot = bytemuck::zeroed_box::<CorrectionSlot>();
+            jobs.iter()
+                .map(|(k, loc)| {
+                    let op = reader
+                        .read_displacement_into(k, *loc, &mut slot, &mut scratch)
+                        .unwrap();
+                    (op, slot.to_tile().unwrap())
+                })
+                .collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
+        for ((k, t), got) in tiles.iter().zip(read) {
+            let owner = f.read_displacement(k).unwrap().unwrap();
+            assert_eq!(got, owner, "{k:?}: reader and owner agree");
+            assert_eq!(&got.1, t, "{k:?}: the tile written");
+        }
+        let mut slot = bytemuck::zeroed_box::<CorrectionSlot>();
+        let mut scratch = ReadScratch::new().unwrap();
+        slot.reset(9).unwrap();
+        assert_eq!(
+            f.read_displacement_into(&small_key(3), &mut slot, &mut scratch)
+                .unwrap(),
+            None,
+            "absent"
+        );
+        assert_eq!(slot.side, 9, "an absent tile leaves the slot alone");
+    }
+
+    #[test]
+    fn a_damaged_record_read_through_a_reader_is_damaged() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path).unwrap();
+        f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
+        f.write_displacement(key(2, 0), op(2), &tile(2.0)).unwrap();
+        f.save().unwrap();
+        let loc = f.locate(&key(1, 0)).unwrap();
+        let reader = f.reader();
+        let mut scratch = ReadScratch::new().unwrap();
+        let mut slot = bytemuck::zeroed_box::<CorrectionSlot>();
+
+        // The record of another key at this location.
+        let other = f.locate(&key(2, 0)).unwrap();
+        assert!(
+            matches!(
+                reader.read_displacement_into(&key(1, 0), other, &mut slot, &mut scratch),
+                Err(StoreError::Damaged { offset }) if offset == other.offset
+            ),
+            "wrong key"
+        );
+        assert!(
+            matches!(
+                reader.read_displacement_into(&small_key(1), loc, &mut slot, &mut scratch),
+                Err(StoreError::Damaged { .. })
+            ),
+            "a key of another level"
+        );
+
+        reader
+            .read_displacement_into(&key(1, 0), loc, &mut slot, &mut scratch)
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = usize::try_from(loc.offset + loc.len / 2).unwrap();
+        bytes[at] ^= 0x10;
+        // The lock is advisory: an outside writer can still damage the file.
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(&bytes[at..=at], loc.offset + loc.len / 2)
+            .unwrap();
+        assert!(
+            matches!(
+                reader.read_displacement_into(&key(1, 0), loc, &mut slot, &mut scratch),
+                Err(StoreError::Damaged { offset }) if offset == loc.offset
+            ),
+            "flipped bit"
+        );
+        assert!(slot.view().is_err(), "a failed read leaves no tile");
+        assert!(
+            matches!(
+                f.read_displacement_into(&key(1, 0), &mut slot, &mut scratch),
+                Err(StoreError::Damaged { .. })
+            ),
+            "the owner's read agrees"
+        );
+    }
+
+    #[test]
+    fn locations_stay_valid_after_more_appends() {
+        let dir = TestDir::new();
+        let mut f = ProjectFile::create(&dir.path("p.bcrf")).unwrap();
+        f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
+        let first = f.locate(&key(1, 0)).unwrap();
+        let reader = f.reader();
+        for seq in 2..6 {
+            f.write_displacement(key(1, 0), op(seq), &tile(0.5))
+                .unwrap();
+            f.write_displacement(key(u32::try_from(seq).unwrap(), 0), op(seq), &tile(2.0))
+                .unwrap();
+            f.save().unwrap();
+        }
+        let mut scratch = ReadScratch::new().unwrap();
+        let mut slot = bytemuck::zeroed_box::<CorrectionSlot>();
+        assert_eq!(
+            reader
+                .read_displacement_into(&key(1, 0), first, &mut slot, &mut scratch)
+                .unwrap(),
+            op(1),
+            "the old record is still there"
+        );
+        assert_eq!(slot.to_tile().unwrap(), tile(1.0), "with its tile");
+        let latest = f.locate(&key(1, 0)).unwrap();
+        assert_ne!(latest, first, "a newer record");
+        assert_eq!(
+            reader
+                .read_displacement_into(&key(1, 0), latest, &mut slot, &mut scratch)
+                .unwrap(),
+            op(5),
+            "the newest edit"
+        );
+        assert_eq!(slot.to_tile().unwrap(), tile(0.5), "the newest tile");
     }
 }

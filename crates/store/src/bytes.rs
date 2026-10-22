@@ -59,11 +59,6 @@ impl<'a> Reader<'a> {
         self.array().map(u64::from_le_bytes)
     }
 
-    /// A little-endian `i16`.
-    pub(crate) fn i16(&mut self) -> Option<i16> {
-        self.array().map(i16::from_le_bytes)
-    }
-
     /// A little-endian `f32`, bit for bit.
     pub(crate) fn f32(&mut self) -> Option<f32> {
         self.array().map(f32::from_le_bytes)
