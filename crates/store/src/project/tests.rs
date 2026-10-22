@@ -537,6 +537,24 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
         "the old file is kept until a new one is in place"
     );
     assert_eq!(project.recovery_path(), old, "still on the old file");
+    // What the crash before the rename left: the old file, and the new one under its temporary
+    // name only, already holding every edit. No file under a real name lacks them.
+    let names = recovery_files(&dir);
+    let old_name = old.file_name().unwrap().to_str().unwrap();
+    let [first, second] = names.as_slice() else {
+        panic!("the old file and a temporary one: {names:?}");
+    };
+    let tmp = if first == old_name { second } else { first };
+    assert!(is_temporary(tmp), "the new file is temporary: {names:?}");
+    let filled = ProjectFile::open(&dir.path("recovery").join(tmp)).unwrap();
+    let mut temporary = TileStore::open(filled, roomy()).unwrap();
+    assert_positions(
+        &mut temporary,
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "the temporary file, filled before its rename",
+    );
+    drop(temporary);
     // The next call tries again, and gets there.
     project.poll().unwrap();
     assert_ne!(project.recovery_path(), old, "rolled over");

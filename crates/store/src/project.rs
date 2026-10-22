@@ -27,7 +27,10 @@
 //! A recovery file is named `<project id>-<suffix>.bcrf`, the id as 32 hex digits and the
 //! suffix 16 random ones, so the old and the new file of one project coexist during a save. It
 //! is created as `<name>.tmp`, synced, and renamed into place: a crash mid-create leaves at
-//! most a `.tmp` file, never a half-made file under a recovery file's name.
+//! most a `.tmp` file, never a half-made file under a recovery file's name. A roll-over's new
+//! file is filled with every edit and saved before the rename, so it never has its name while
+//! it lacks the edits of the file it replaces; a save's new file is empty by rights (the save
+//! holds every edit), and is renamed into place before the store moves to it.
 //!
 //! # After a crash
 //!
@@ -237,8 +240,9 @@ pub struct Project {
     recovery_path: PathBuf,
     /// The directory recovery files go in.
     recovery_dir: PathBuf,
-    /// Makes the next recovery file's creation fail after its temporary file is written and
-    /// synced, before the rename: a crash mid-create, for the tests.
+    /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
+    /// after its temporary file is written and synced, before the rename (see
+    /// [`Unplaced::crash`]).
     #[cfg(test)]
     fail_next_recovery: bool,
 }
@@ -267,13 +271,9 @@ impl Project {
     pub fn new(mesh: BaseMesh, config: ProjectConfig) -> Result<Self, ProjectError> {
         let mesh = Arc::new(mesh);
         let meta = Meta::new(ProjectId::random()?, Role::Recovery { base: None }, &mesh);
-        let (working, recovery_path) = create_recovery(
-            &config.recovery_dir,
-            meta.project(),
-            |path| ProjectFile::create(path, meta, Arc::clone(&mesh)),
-            #[cfg(test)]
-            false,
-        )?;
+        let (working, recovery_path) = create_placed(&config.recovery_dir, meta.project(), |at| {
+            ProjectFile::create(at, meta, Arc::clone(&mesh))
+        })?;
         Self::start(
             TileStore::open(working, config.store),
             None,
@@ -301,13 +301,9 @@ impl Project {
         }
         let base = project.base()?.ok_or(ProjectError::NeverSaved)?;
         let meta = project.meta().on_save_point(base.save_point(), &path);
-        let (working, recovery_path) = create_recovery(
-            &config.recovery_dir,
-            meta.project(),
-            |at| ProjectFile::create_like(at, meta, &project),
-            #[cfg(test)]
-            false,
-        )?;
+        let (working, recovery_path) = create_placed(&config.recovery_dir, meta.project(), |at| {
+            ProjectFile::create_like(at, meta, &project)
+        })?;
         let store = TileStore::open_layered(working, Some(base), config.store);
         Self::start(
             store,
@@ -711,28 +707,37 @@ impl Project {
         }
     }
 
-    /// Moves the edits to a new recovery file after the writer failed to sync the current one:
-    /// the new file (made as at a save: temporary file and rename) names the same save point,
-    /// takes every edit from the store ([`TileStore::roll_over`]: synced, a save point,
-    /// synced), and becomes the working file; a new writer streams into it, and the old file is
-    /// deleted. Returns the tiles that couldn't be carried across.
+    /// Moves the edits to a new recovery file after the writer failed to sync the current one,
+    /// and returns the tiles that couldn't be carried across.
+    ///
+    /// The new file names the same save point. It is made under its temporary name, filled with
+    /// every edit from the store ([`TileStore::fill_roll_over`]: synced, a save point, synced),
+    /// and only then renamed into place, so a crash meanwhile leaves no file under a recovery
+    /// file's name that lacks the edits of the old one. Then the store swaps it in
+    /// ([`TileStore::roll_over`]), a new writer streams into it, and the old file is deleted.
     ///
     /// # Errors
     ///
-    /// As [`create_recovery`]; [`ProjectError::Cache`] if the store can't write the new file
-    /// (it is deleted, and the project stays on the old one, failed, to try again);
-    /// [`ProjectError::Recovery`] if the new writer's thread can't be started;
-    /// [`ProjectError::Io`] or [`ProjectError::Store`] if the old file can't be deleted.
+    /// As [`create_recovery`] and [`Unplaced::place`]; [`ProjectError::Cache`] if the store
+    /// can't write the new file. The new file is deleted then, and the project stays on the old
+    /// one, failed, to try again. [`ProjectError::Recovery`] if the new writer's thread can't
+    /// be started; [`ProjectError::OldRecoveryKept`] if the old file can't be deleted.
     fn roll_over(&mut self) -> Result<Vec<geom::TileKey>, ProjectError> {
         let meta = self.store.working().meta().clone();
-        let (fresh, fresh_path) = create_recovery(
-            &self.recovery_dir,
-            meta.project(),
-            |at| ProjectFile::create_like(at, meta, self.store.working()),
-            #[cfg(test)]
-            std::mem::take(&mut self.fail_next_recovery),
-        )?;
-        let (old, lost) = match self.store.roll_over(fresh) {
+        let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
+            ProjectFile::create_like(at, meta, self.store.working())
+        })?;
+        #[cfg(test)]
+        let names = names.crashing(std::mem::take(&mut self.fail_next_recovery));
+        let filled = match self.store.fill_roll_over(fresh) {
+            Ok(filled) => filled,
+            Err(e) => {
+                names.discard();
+                return Err(e.into());
+            }
+        };
+        let fresh_path = names.place()?;
+        let (old, lost) = match self.store.roll_over(filled) {
             Ok(rolled) => rolled,
             Err(e) => {
                 // Best effort: the error at hand is the one to report.
@@ -747,8 +752,7 @@ impl Project {
         }
         self.writer = Some(RecoveryWriter::new(&mut self.store)?);
         let old_path = std::mem::replace(&mut self.recovery_path, fresh_path);
-        fs::remove_file(&old_path)?;
-        sync_parent(&old_path)?;
+        retire(&old_path)?;
         Ok(lost)
     }
 
@@ -762,8 +766,8 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// As [`create_recovery`]; [`ProjectError::Cache`] if the rebase is refused (the new file is
-    /// deleted again).
+    /// As [`create_recovery`] and [`Unplaced::place`]; [`ProjectError::Cache`] if the rebase is
+    /// refused (the new file is deleted again).
     fn switch_recovery(
         &mut self,
         saved: Saved,
@@ -771,13 +775,15 @@ impl Project {
         path: &Path,
     ) -> Result<PathBuf, ProjectError> {
         let meta = project.meta().on_save_point(saved.save_point(), path);
-        let (fresh, fresh_path) = create_recovery(
-            &self.recovery_dir,
-            meta.project(),
-            |at| ProjectFile::create_like(at, meta, project),
-            #[cfg(test)]
-            std::mem::take(&mut self.fail_next_recovery),
-        )?;
+        let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
+            ProjectFile::create_like(at, meta, project)
+        })?;
+        #[cfg(test)]
+        let names = names.crashing(std::mem::take(&mut self.fail_next_recovery));
+        // Empty, and on the new save point: a crash from here on leaves it as a valid recovery
+        // file of that save point, holding nothing since. So it is placed before the rebase,
+        // not filled first as a roll-over's is.
+        let fresh_path = names.place()?;
         let old = match self.store.rebase(saved, fresh) {
             Ok(old) => old,
             Err(e) => {
@@ -822,7 +828,7 @@ fn retire(old: &Path) -> Result<(), ProjectError> {
 /// Test-only controls.
 #[cfg(test)]
 impl Project {
-    /// Makes the next recovery file's creation fail once its temporary file is written and
+    /// Makes the next placement of a recovery file fail once its temporary file is written and
     /// synced, before the rename: what a crash mid-create leaves.
     pub(crate) const fn fail_next_recovery(&mut self) {
         self.fail_next_recovery = true;
@@ -1066,54 +1072,105 @@ fn unavailable(e: &StoreError) -> Option<CandidateStatus> {
     }
 }
 
-/// Creates a recovery file of `project` in `dir` through `create`, under a fresh name (see the
-/// module notes), and returns it open with its path.
+/// A recovery file's two names: the temporary one it is made (and filled) under, and the real
+/// one [`Unplaced::place`] moves it to (see the module notes).
+#[derive(Debug)]
+struct Unplaced {
+    /// Where the file is made: `<name>.tmp`.
+    tmp: PathBuf,
+    /// Its name once placed: `<project id>-<suffix>.bcrf`.
+    path: PathBuf,
+    /// Test hook: [`Unplaced::place`] fails as a crash before the rename would, and leaves the
+    /// temporary file behind as a crash does.
+    #[cfg(test)]
+    crash: bool,
+}
+
+impl Unplaced {
+    /// Moves the file to its real name, if nothing is there, and makes the move durable;
+    /// returns the real name.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::Io`] if a file has the name already, or the rename or the directory's
+    /// sync fails. The temporary file is removed then.
+    fn place(self) -> Result<PathBuf, ProjectError> {
+        #[cfg(test)]
+        if self.crash {
+            return Err(io::Error::other("a crash before the rename, for the test").into());
+        }
+        let placed = (|| {
+            if fs::symlink_metadata(&self.path).is_ok() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
+            }
+            fs::rename(&self.tmp, &self.path)?;
+            sync_parent(&self.path)?;
+            Ok::<_, ProjectError>(())
+        })();
+        match placed {
+            Ok(()) => Ok(self.path),
+            Err(e) => {
+                self.discard();
+                Err(e)
+            }
+        }
+    }
+
+    /// These names, with [`Unplaced::crash`] set to `crash`.
+    #[cfg(test)]
+    fn crashing(self, crash: bool) -> Self {
+        Self { crash, ..self }
+    }
+
+    /// Removes the temporary file: a creation given up. Best effort, as the error at hand is
+    /// the one to report; a leftover is swept by [`find_recoveries`].
+    fn discard(self) {
+        drop(fs::remove_file(&self.tmp));
+    }
+}
+
+/// Creates a recovery file of `project` in `dir` through `create`, under the temporary name of
+/// a fresh one (see the module notes), and returns it open, with its names for
+/// [`Unplaced::place`].
 ///
-/// `create` makes the file at the temporary path it is given, durable; it is then renamed into
-/// place and the directory synced. On error the temporary file is removed.
+/// `create` makes the file at the temporary path it is given, durable.
 ///
 /// # Errors
 ///
-/// [`ProjectError::Io`] if the directory can't be made, a random suffix drawn, or the rename
-/// done; `create`'s error.
+/// [`ProjectError::Io`] if the directory can't be made or a random suffix drawn; `create`'s
+/// error.
 fn create_recovery(
     dir: &Path,
     project: ProjectId,
     create: impl FnOnce(&Path) -> Result<ProjectFile, StoreError>,
-    #[cfg(test)] fail: bool,
-) -> Result<(ProjectFile, PathBuf), ProjectError> {
+) -> Result<(ProjectFile, Unplaced), ProjectError> {
     fs::create_dir_all(dir)?;
     let suffix = ProjectId::random()?.to_bits() >> 64;
     let name = format!("{project}-{suffix:016x}.{EXTENSION}");
-    let path = dir.join(&name);
-    let tmp = dir.join(format!("{name}.tmp"));
-    let file = create(&tmp)?;
-    let placed = (|| {
+    let names = Unplaced {
+        tmp: dir.join(format!("{name}.tmp")),
+        path: dir.join(&name),
         #[cfg(test)]
-        if fail {
-            return Err(io::Error::other("a crash before the rename, for the test").into());
-        }
-        if fs::symlink_metadata(&path).is_ok() {
-            return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
-        }
-        fs::rename(&tmp, &path)?;
-        sync_parent(&path)?;
-        Ok(())
-    })();
-    match placed {
-        Ok(()) => Ok((file, path)),
-        Err(e) => {
-            #[cfg(test)]
-            if fail {
-                // A crash leaves the synced temporary file behind: so does the test.
-                return Err(e);
-            }
-            drop(file);
-            // Best effort: the error at hand is the one to report.
-            drop(fs::remove_file(&tmp));
-            Err(e)
-        }
-    }
+        crash: false,
+    };
+    let file = create(&names.tmp)?;
+    Ok((file, names))
+}
+
+/// [`create_recovery`], then [`Unplaced::place`] at once: for a recovery file that starts
+/// empty and needs no filling. Returns it open, with its path.
+///
+/// # Errors
+///
+/// As [`create_recovery`] and [`Unplaced::place`].
+fn create_placed(
+    dir: &Path,
+    project: ProjectId,
+    create: impl FnOnce(&Path) -> Result<ProjectFile, StoreError>,
+) -> Result<(ProjectFile, PathBuf), ProjectError> {
+    let (file, names) = create_recovery(dir, project, create)?;
+    let path = names.place()?;
+    Ok((file, path))
 }
 
 /// A temporary path beside `path`, for a project file written before it is renamed there:

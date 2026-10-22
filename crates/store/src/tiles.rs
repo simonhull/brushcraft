@@ -223,7 +223,8 @@ pub enum CacheError {
     #[error("the working file is streamed by a recovery writer, which writes its save points")]
     Streaming,
     /// A rebase was given a save that is out of date: the store was edited after the save was
-    /// made, so the save doesn't hold every edit. Save again.
+    /// made, so the save doesn't hold every edit. Save again. Or a roll-over was given a new
+    /// working file filled before the latest edit.
     #[error("the store was edited after the save it was to be rebased on")]
     StaleSave,
     /// The configured budget is below [`StoreConfig::minimum_budget`] for the mesh.
@@ -713,6 +714,20 @@ impl Saved {
     }
 }
 
+/// A new working file [`TileStore::fill_roll_over`] has filled with every edit and saved,
+/// waiting for [`TileStore::roll_over`] to swap it in.
+#[derive(Debug)]
+pub(crate) struct Filled {
+    /// The new working file.
+    file: ProjectFile,
+    /// The tiles that couldn't be carried across.
+    lost: Vec<TileKey>,
+    /// The dirty slots written to it, clean once it is swapped in.
+    cleaned: Vec<(TileKey, SlotId<CorrectionSlot>)>,
+    /// The store's latest write when it was filled: a roll-over refuses it after a later one.
+    stamp: Stamp,
+}
+
 /// Checks that a working file with `working`'s meta may be layered on `base`.
 ///
 /// Over a base, the working file must be a recovery file of the base's project naming the
@@ -1000,30 +1015,24 @@ impl TileStore {
         Ok(std::mem::replace(&mut self.file, working))
     }
 
-    /// Swaps in `fresh`, a new working file on the same base, after the working file failed to
-    /// sync, carrying every edit across; returns the old working file and the tiles that
-    /// couldn't be (lost).
+    /// Fills `fresh`, a new working file on the same base, with every edit, after the working
+    /// file failed to sync: the first half of a roll-over, which changes nothing in the store.
+    /// [`TileStore::roll_over`] swaps it in, once the caller has given it its name.
     ///
     /// Every tile of the old working file and every dirty slot is written to `fresh`, read
-    /// through the store: a dirty slot as it is, with the op of its latest edit; any other tile
-    /// as the old file's record, copied after its checksum is checked. A clean resident tile
-    /// whose record no longer reads is written from its slot, labelled with the newest edit
+    /// through the store: a dirty slot as it is, with the op of its latest write; any other
+    /// tile as the old file's record, copied after its checksum is checked. A clean resident
+    /// tile whose record no longer reads is written from its slot, labelled with the newest edit
     /// (its own op can't be read back). A tile that can be read neither way, or a broken slot,
     /// is lost: listed, and left out. Then `fresh` is saved (synced, a save point, synced
-    /// again) and becomes the working file. Every slot written is clean, streaming consumers'
-    /// marks are emptied (all they held is in `fresh`), and the generation moves on, so a flush
-    /// started before is abandoned. The base and the tiles to save into the project are
-    /// unchanged.
+    /// again).
     ///
     /// # Errors
     ///
     /// [`CacheError::MeshMismatch`] or [`CacheError::WrongBase`] if `fresh` isn't over the
     /// store's mesh, or doesn't name the same base as the working file; [`CacheError::WriteBack`]
-    /// if writing or saving `fresh` fails. The store is unchanged then.
-    pub(crate) fn roll_over(
-        &mut self,
-        mut fresh: ProjectFile,
-    ) -> Result<(ProjectFile, Vec<TileKey>), CacheError> {
+    /// if writing or saving `fresh` fails.
+    pub(crate) fn fill_roll_over(&mut self, mut fresh: ProjectFile) -> Result<Filled, CacheError> {
         self.sync_pins()?;
         if fresh.meta().mesh_hash() != self.mesh_hash {
             return Err(CacheError::MeshMismatch);
@@ -1074,6 +1083,39 @@ impl TileStore {
             }
         }
         fresh.save().map_err(CacheError::WriteBack)?;
+        Ok(Filled {
+            file: fresh,
+            lost,
+            cleaned,
+            stamp: self.last_write,
+        })
+    }
+
+    /// Swaps in the working file [`TileStore::fill_roll_over`] filled; returns the old working
+    /// file and the tiles that couldn't be carried across (lost).
+    ///
+    /// Every slot written to the new file is clean, streaming consumers' marks are emptied (all
+    /// they held is in it), and the generation moves on, so a flush started before is
+    /// abandoned. The base and the tiles to save into the project are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::StaleSave`] if the store was written since `filled` was: the new file
+    /// doesn't hold those writes. The store is unchanged then, and the file is dropped.
+    /// [`CacheError::Internal`] for a stale handle.
+    pub(crate) fn roll_over(
+        &mut self,
+        filled: Filled,
+    ) -> Result<(ProjectFile, Vec<TileKey>), CacheError> {
+        let Filled {
+            file,
+            lost,
+            cleaned,
+            stamp,
+        } = filled;
+        if stamp != self.last_write {
+            return Err(CacheError::StaleSave);
+        }
         for (key, id) in cleaned {
             self.corrections.set_dirty(id, false)?;
             self.unsaved.remove(&key);
@@ -1087,7 +1129,7 @@ impl TileStore {
         self.generation += 1;
         // The workers' jobs name records of the old file.
         self.prefetch = Prefetcher::new();
-        Ok((std::mem::replace(&mut self.file, fresh), lost))
+        Ok((std::mem::replace(&mut self.file, file), lost))
     }
 
     /// Moves every key save's consumer hasn't drained from the change feed into

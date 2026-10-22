@@ -825,7 +825,8 @@ fn a_roll_over_carries_every_edit_and_lists_what_it_cannot_read() {
     let meta = store.file.meta().clone();
     let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
     let generation = store.generation();
-    let (old, lost) = store.roll_over(fresh).unwrap();
+    let filled = store.fill_roll_over(fresh).unwrap();
+    let (old, lost) = store.roll_over(filled).unwrap();
     drop(old);
     assert_eq!(lost, [damaged], "the damaged tile is lost, and listed");
     assert!(
