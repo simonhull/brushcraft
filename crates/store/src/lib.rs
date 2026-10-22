@@ -2,29 +2,15 @@
 //!
 //! No GPU or windowing code: everything here runs headless.
 
-#[expect(
-    dead_code,
-    reason = "scaffolding for the record and file modules, added in the next commits"
-)]
 mod bytes;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the project file, added in the next commit"
-    )
-)]
 mod codec;
 mod crc;
+mod file;
 mod op;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the project file, added in a later commit"
-    )
-)]
 mod record;
+#[cfg(test)]
+mod test_dir;
 
 pub use codec::CodecError;
+pub use file::{ProjectFile, StoreError, TileBytes};
 pub use op::{MAX_SEQ, OpId};
