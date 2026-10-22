@@ -373,6 +373,8 @@ fn the_default_recovery_dir_follows_xdg() {
 /// to a new recovery file; returns the old one's path.
 fn fail_and_roll_over(project: &mut Project, map: &mut CorrectionMap, seed: u64) -> PathBuf {
     let old = project.recovery_path().to_path_buf();
+    // The flushes of earlier strokes finish first, so the sync that fails is this stroke's.
+    project.finish_flushes().unwrap();
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
     stroke(project, map, 80, seed);
     let began = Instant::now();
@@ -455,6 +457,9 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
     let mut map = CorrectionMap::new();
     let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
     stroke(&mut project, &mut map, 60, 91);
+    // That stroke's flush finishes first: its sync failing would roll over (and fail) in the
+    // next stroke's end, not in the polls below.
+    project.finish_flushes().unwrap();
     let old = project.recovery_path().to_path_buf();
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
     project.fail_next_recovery();
