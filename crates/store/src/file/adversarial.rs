@@ -3,6 +3,8 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
+use std::os::unix::fs::MetadataExt;
+
 use geom::{FaceId, Level, Vec3};
 
 use super::*;
@@ -727,4 +729,138 @@ fn keys_differing_only_in_layer_or_channel_stay_apart() {
             );
         }
     }
+}
+
+#[test]
+fn a_writer_that_opened_before_an_in_place_compaction_writes_to_the_new_file() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    three(&path);
+    // As `open` does: open, then lock. The compaction runs in between.
+    let early = open_writable(&path).unwrap();
+    let old_inode = early.metadata().unwrap().ino();
+    compact_in_place(&path).unwrap();
+    let file = lock_at(&path, early, open_writable, Lock::Exclusive).unwrap();
+    assert_ne!(
+        file.metadata().unwrap().ino(),
+        old_inode,
+        "the replaced file was let go"
+    );
+    let mut f = ProjectFile::open_latest(file, Repair::Truncate).unwrap();
+    f.write_displacement(key(9), op(9), &tile(9.0)).unwrap();
+    f.save().unwrap();
+    drop(f);
+    let opened = ProjectFile::open(&path).unwrap();
+    assert_eq!(
+        state(&opened),
+        [
+            (key(1), op(1)),
+            (key(2), op(2)),
+            (key(3), op(3)),
+            (key(9), op(9))
+        ],
+        "the write landed in the file at the path"
+    );
+}
+
+#[test]
+fn in_place_compactions_cannot_interleave() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (good, [s1, ..]) = three(&path);
+    // What a running in-place compaction holds on its source.
+    let source = open_locked(&path, open_readable, Lock::Exclusive).unwrap();
+    assert!(
+        matches!(compact_in_place(&path), Err(StoreError::Locked)),
+        "a second in-place compaction"
+    );
+    assert!(
+        matches!(compact(&path, &dir.path("c.bcrf")), Err(StoreError::Locked)),
+        "a compaction to another file"
+    );
+    assert!(
+        matches!(ProjectFile::open(&path), Err(StoreError::Locked)),
+        "a writer"
+    );
+    assert!(
+        matches!(ProjectFile::open_at(&path, s1), Err(StoreError::Locked)),
+        "a reader"
+    );
+    drop(source);
+    let reader = ProjectFile::open_at(&path, s1).unwrap();
+    assert!(
+        matches!(compact_in_place(&path), Err(StoreError::Locked)),
+        "not while a reader is open either"
+    );
+    drop(reader);
+    assert_eq!(
+        names(dir.path("").as_path()),
+        ["p.bcrf"],
+        "no temporary file left"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), good, "untouched");
+}
+
+#[test]
+fn compacting_in_place_keeps_permissions_and_symlinks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    three(&path);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = dir.path("link.bcrf");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    compact_in_place(&link).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is still a link"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the project's mode"
+    );
+    assert_eq!(
+        ProjectFile::open(&path)
+            .unwrap()
+            .save_points()
+            .unwrap()
+            .len(),
+        1,
+        "the project itself was compacted"
+    );
+    assert_eq!(
+        names(dir.path("").as_path()),
+        ["link.bcrf", "p.bcrf"],
+        "no temporary file left"
+    );
+}
+
+#[test]
+fn an_empty_first_save_is_a_parent() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut f = ProjectFile::create(&path).unwrap();
+    let first = f.save().unwrap();
+    assert_eq!(first, FIRST_RECORD, "the first record");
+    f.write_displacement(key(1), op(1), &tile(1.0)).unwrap();
+    let second = f.save().unwrap();
+    drop(f);
+    let opened = ProjectFile::open(&path).unwrap();
+    assert_eq!(
+        opened.save_points().unwrap(),
+        [first, second],
+        "the chain reaches the first record"
+    );
+    assert_eq!(state(&opened), [(key(1), op(1))], "the latest state");
+    drop(opened);
+    assert_eq!(
+        ProjectFile::open_at(&path, first).unwrap().keys().count(),
+        0,
+        "the empty save"
+    );
 }
