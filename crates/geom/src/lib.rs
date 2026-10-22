@@ -18,6 +18,11 @@ mod correction;
 pub use correction::{CorrectionError, CorrectionTile};
 mod mesh;
 mod sphere;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by evaluation (M0a Tasks 7–8)")
+)]
+mod subdiv;
 mod topology;
 pub use mesh::{BaseMesh, MeshError};
 pub use sphere::cube_sphere;
