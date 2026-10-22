@@ -125,39 +125,23 @@ impl CorrectionSlot {
         Ok((interior, border))
     }
 
-    /// The gate for values written straight into the slot (the file decode): checks them by
-    /// [`CorrectionTile::from_parts`]'s rules (a valid side and scale, no `i16::MIN`, a finite
-    /// border, and a zero scale only with a zero interior) and turns `-0.0` into `+0.0` as it
-    /// does, so views, which trust their input, see only what a [`CorrectionTile`] could hold.
+    /// The gate for values written straight into the slot (the file decode): geom's
+    /// [`CorrectionViewMut::normalize_and_validate`], which turns `-0.0` into `+0.0` and checks
+    /// the rules every [`CorrectionTile`] keeps, so views, which trust their storage, see only
+    /// what a tile could hold.
     ///
     /// # Errors
     ///
     /// [`CorrectionError::BadSide`] or [`CorrectionError::BadParts`]; the slot is zeroed, so it
     /// holds no tile.
     pub(crate) fn validate(&mut self) -> Result<(), CorrectionError> {
-        let checked = self.parts().and_then(|(interior, border)| {
-            let ok = (self.scale != 0.0 || interior.iter().all(|q| *q == [0; 3]))
-                && interior.iter().flatten().all(|q| *q != i16::MIN)
-                && border.iter().all(|v| v.is_finite());
-            if ok {
-                Ok(border.len())
-            } else {
-                Err(CorrectionError::BadParts { side: self.side })
-            }
-        });
-        match checked {
-            Ok(ring) => {
-                self.scale += 0.0;
-                for v in self.border.iter_mut().take(ring) {
-                    *v = Vec3::new(v.x + 0.0, v.y + 0.0, v.z + 0.0);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                bytemuck::bytes_of_mut(self).fill(0);
-                Err(e)
-            }
+        let checked = self
+            .view_mut()
+            .and_then(|mut view| view.normalize_and_validate());
+        if checked.is_err() {
+            bytemuck::bytes_of_mut(self).fill(0);
         }
+        checked
     }
 }
 

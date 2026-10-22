@@ -179,9 +179,9 @@ impl DenseEvaluation {
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use super::*;
-    use crate::reference::{Poly, assert_same_points, pentagonal_prism};
+    use crate::reference::{Poly, assert_same_points, pentagonal_prism, prism};
     use crate::test_rng::Rng;
-    use crate::{Region, TileKey, Topology, cube_sphere, evaluate_region};
+    use crate::{MAX_VALENCE, Region, TileKey, Topology, cube_sphere, evaluate_region, normals};
 
     fn all_points(eval: &DenseEvaluation, mesh: &BaseMesh, level: Level) -> Vec<Vec3> {
         mesh.faces()
@@ -238,9 +238,22 @@ mod tests {
 
     #[test]
     fn twins_are_bit_identical_after_random_edits() {
-        let mesh = cube_sphere(2).unwrap();
+        assert_twins_are_bit_identical_after_random_edits(&cube_sphere(2).unwrap(), 11);
+    }
+
+    #[test]
+    fn twins_are_bit_identical_after_random_edits_at_max_valence() {
+        assert_twins_are_bit_identical_after_random_edits(
+            &prism(MAX_VALENCE).subdivide().to_base_mesh(),
+            12,
+        );
+    }
+
+    /// Random edits at levels 1–3, biased towards borders, then every copy of every vertex
+    /// evaluates to the same bits.
+    fn assert_twins_are_bit_identical_after_random_edits(mesh: &BaseMesh, seed: u64) {
         let top = Level::new(3).unwrap();
-        let mut rng = Rng::new(11);
+        let mut rng = Rng::new(seed);
         let mut map = CorrectionMap::new();
         for _ in 0..400 {
             let face = FaceId::new(rng.below(mesh.face_count()));
@@ -258,7 +271,7 @@ mod tests {
             map.set(mesh.topology(), face, level, i, j, rng.vec3(0.02))
                 .unwrap();
         }
-        let eval = DenseEvaluation::new(&mesh, top, &map).unwrap();
+        let eval = DenseEvaluation::new(mesh, top, &map).unwrap();
         for l in 1..=3 {
             let level = Level::new(l).unwrap();
             let n = level.face_quads();
@@ -281,6 +294,106 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// FNV-1a (64-bit) over the little-endian bits of `points`, in order.
+    fn fnv1a(points: impl IntoIterator<Item = Vec3>) -> u64 {
+        points
+            .into_iter()
+            .flat_map(Vec3::to_bits)
+            .flat_map(u32::to_le_bytes)
+            .fold(0xCBF2_9CE4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+            })
+    }
+
+    /// The hash of level 3 of `prism(n)` subdivided once, under fixed-seed random corrections at
+    /// levels 1–3: every face's positions, then every face's normals.
+    fn golden_hash(n: usize) -> u64 {
+        let mesh = prism(n).subdivide().to_base_mesh();
+        let top = Level::new(3).unwrap();
+        let mut rng = Rng::new(0x601D_0000 + u64::try_from(n).unwrap());
+        let mut map = CorrectionMap::new();
+        for _ in 0..200 {
+            let face = FaceId::new(rng.below(mesh.face_count()));
+            let level = Level::new(1 + u8::try_from(rng.below(3)).unwrap()).unwrap();
+            let side = level.face_quads() + 1;
+            let (i, j) = (rng.below(side), rng.below(side));
+            map.set(mesh.topology(), face, level, i, j, rng.vec3(0.02))
+                .unwrap();
+        }
+        let eval = DenseEvaluation::new(&mesh, top, &map).unwrap();
+        let positions = mesh
+            .faces()
+            .flat_map(|f| eval.grid(f, top).unwrap().as_slice().to_vec());
+        let normals = mesh.faces().flat_map(|f| {
+            normals(&mesh, &eval, Region::whole_face(f, top))
+                .unwrap()
+                .as_slice()
+                .to_vec()
+        });
+        fnv1a(positions.chain(normals))
+    }
+
+    /// [`golden_hash`] for valences 3 to 32, recorded from the evaluation as it stood when these
+    /// were pinned.
+    ///
+    /// To regenerate after a deliberate change to the arithmetic, run
+    /// `BRUSHCRAFT_PRINT_GOLDEN=1 cargo nextest run -p geom golden --no-capture`, check the
+    /// change was meant to move the bits, and paste the printed table here.
+    const GOLDEN: [u64; MAX_VALENCE - 2] = [
+        0x3B41_A5C9_D0F6_7E7D, // valence 3
+        0x1B49_B23D_CE92_CE00, // valence 4
+        0x4465_118A_B420_4844, // valence 5
+        0x2156_D801_BA78_EDF8, // valence 6
+        0x7160_A5A8_51D1_B46D, // valence 7
+        0x09DD_0649_C7D6_F284, // valence 8
+        0xE9F2_E185_744D_FEEC, // valence 9
+        0xD7AF_1F99_1FA2_BE93, // valence 10
+        0x543D_7A4F_9EE6_7695, // valence 11
+        0x2642_703D_1110_98CC, // valence 12
+        0x9938_7E0C_29F0_F906, // valence 13
+        0x9E20_FF64_C392_5683, // valence 14
+        0x6C19_4D25_B30F_36BD, // valence 15
+        0xCD0B_3FF1_3BBF_8C08, // valence 16
+        0x2732_B66C_30BC_4E7E, // valence 17
+        0x0A72_6CE0_F1F1_AD06, // valence 18
+        0x8F76_1DDA_91FA_56CE, // valence 19
+        0x2466_3B08_DCBD_E713, // valence 20
+        0x5F42_CA3B_35A9_4982, // valence 21
+        0x1898_1BC2_73A2_E60C, // valence 22
+        0xCB9A_EBF0_3F1B_25D4, // valence 23
+        0xB881_2109_5221_2331, // valence 24
+        0x4B40_B027_557A_ED9D, // valence 25
+        0x58D4_39B1_FF4E_C664, // valence 26
+        0x82CF_FAEE_77D3_2615, // valence 27
+        0xC3D2_48C9_A471_7772, // valence 28
+        0x0D7B_3977_3157_76D3, // valence 29
+        0x6F40_149E_1D76_4339, // valence 30
+        0x4843_2153_7435_F0DB, // valence 31
+        0x50D3_9623_FA69_568E, // valence 32
+    ];
+
+    /// Pins every summation order by the exact bits it produces at every valence the mesh accepts.
+    ///
+    /// The extraordinary vertex rule, frames and ring normals all sum in a canonical order. Twin
+    /// tests can't see an order change that every copy makes alike; this can.
+    #[test]
+    fn golden_bits_pin_the_summation_order() {
+        let hashes: Vec<(usize, u64)> = (3..=MAX_VALENCE).map(|n| (n, golden_hash(n))).collect();
+        if std::env::var_os("BRUSHCRAFT_PRINT_GOLDEN").is_some() {
+            println!("const GOLDEN: [u64; MAX_VALENCE - 2] = [");
+            for (n, hash) in &hashes {
+                let groups =
+                    [48, 32, 16, 0].map(|shift| format!("{:04X}", (hash >> shift) & 0xFFFF));
+                println!("    0x{}, // valence {n}", groups.join("_"));
+            }
+            println!("];");
+            return;
+        }
+        for ((n, hash), want) in hashes.into_iter().zip(GOLDEN) {
+            assert_eq!(hash, want, "valence {n}: 0x{hash:016X} != 0x{want:016X}");
         }
     }
 
