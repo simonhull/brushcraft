@@ -233,6 +233,8 @@ pub(crate) struct Pool<T: Pod> {
     free: Vec<Pos>,
     /// Where each tile's slot is.
     index: HashMap<TileKey, Pos>,
+    /// Slots pinned at least once.
+    pinned: usize,
     /// Where the clock resumes, as a flat position (`chunk × per_chunk + index`).
     hand: u64,
     /// Keys the pool freed on its own (the clock's victims, [`Pool::evict_all`],
@@ -272,6 +274,7 @@ impl<T: Pod> Pool<T> {
             meta: Vec::new(),
             free: Vec::new(),
             index: HashMap::new(),
+            pinned: 0,
             hand: 0,
             evicted: None,
         }
@@ -308,8 +311,8 @@ impl<T: Pod> Pool<T> {
     }
 
     /// Slots pinned at least once.
-    pub(crate) fn pinned_slots(&self) -> usize {
-        self.meta.iter().flatten().filter(|m| m.pins > 0).count()
+    pub(crate) const fn pinned_slots(&self) -> usize {
+        self.pinned
     }
 
     /// Whether a mapped chunk has a free slot: [`Pool::acquire`] then needs no new chunk and
@@ -468,6 +471,9 @@ impl<T: Pod> Pool<T> {
     pub(crate) fn pin(&mut self, id: SlotId<T>) -> Result<(), PoolError> {
         let meta = self.live_mut(id).ok_or(PoolError::Stale)?;
         meta.pins += 1;
+        if meta.pins == 1 {
+            self.pinned += 1;
+        }
         Ok(())
     }
 
@@ -482,6 +488,9 @@ impl<T: Pod> Pool<T> {
         meta.pins = meta.pins.checked_sub(1).ok_or(PoolError::NotPinned)?;
         if meta.stale {
             meta.referenced = false;
+        }
+        if meta.pins == 0 {
+            self.pinned -= 1;
         }
         Ok(())
     }
@@ -861,8 +870,14 @@ mod tests {
         Ok(())
     }
 
+    /// Slots of `pool` with pins, counted one by one: what its counter must say.
+    fn pinned_by_scan<T: Pod>(pool: &Pool<T>) -> usize {
+        pool.meta.iter().flatten().filter(|m| m.pins > 0).count()
+    }
+
     /// What holds after every step of [`never_exceeds_the_budget`]: the pools are within the
-    /// budget, which counts exactly their chunks, and pinned slots stay.
+    /// budget, which counts exactly their chunks, pinned slots stay, and the pinned counts are
+    /// right.
     fn check_step(
         step: u32,
         budget: &Budget,
@@ -888,6 +903,11 @@ mod tests {
             };
             assert!(live, "step {step}: a pinned slot stays");
         }
+        assert_eq!(
+            (corrections.pinned_slots(), evaluated.pinned_slots()),
+            (pinned_by_scan(corrections), pinned_by_scan(evaluated)),
+            "step {step}: the pinned counters"
+        );
     }
 
     #[test]

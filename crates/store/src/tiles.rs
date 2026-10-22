@@ -350,6 +350,11 @@ struct EvalLog {
 /// Tiles are named by base-layer displacement [`TileKey`]s of level 1 or more; an evaluated tile
 /// is named by the displacement tile at the same position. Level 0 is the base mesh, never a
 /// tile.
+///
+/// Dropping the store doesn't write anything: edits in dirty correction slots (since the last
+/// [`TileStore::save`], and not written back on eviction) are lost with it. Until M0b3's
+/// recovery writer keeps them, call [`TileStore::save`] before dropping a store whose edits
+/// matter.
 pub struct TileStore {
     /// The prefetch workers. Declared first, so they are stopped and joined (when the store is
     /// dropped) before anything else goes, the working file included.
