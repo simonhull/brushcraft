@@ -640,7 +640,7 @@ impl Worker {
             if self.stop.load(Ordering::Relaxed) {
                 return None;
             }
-            match frame_displacement(snapshot.key, snapshot.op, &snapshot.slot) {
+            match frame_displacement(snapshot.key, snapshot.op, snapshot.stamp, &snapshot.slot) {
                 Ok(tile) => framed.push(tile),
                 Err(_) => broken.push(snapshot.key),
             }

@@ -28,6 +28,7 @@ use crate::record::{
     HEAD, Head, KIND_INDEX, KIND_MESH, KIND_META, KIND_TILE, TAIL, frame, parse_head, verify,
 };
 use crate::slot::CorrectionSlot;
+use crate::stamp::Stamp;
 
 /// The file's first bytes.
 const MAGIC: [u8; 4] = *b"BCRF";
@@ -415,23 +416,25 @@ pub struct ProjectFile {
     cut: Option<Cut>,
 }
 
-/// A save point in the making: the state of the file as of an edit (the cut), which records
-/// appended since may have moved past.
+/// A save point in the making: the state of the file as of a write of the store (the cut),
+/// which records appended since may have moved past.
 ///
-/// A recovery flush snapshots the store's dirty tiles as of its latest edit, and its save point
-/// must name exactly that state: no more, or a crash could reopen half of a later stroke. But
-/// while the flush is in flight, a later edit's tile may be written back to make room, and land
-/// in the file before the save point. So the cut remembers, for each tile, where its record was
-/// before the first record past the cut was appended, and the save point names that one; the
-/// later records wait for the next save point. A record at or before the cut appended after
-/// one past it (the flush's own copy of a tile written back since) is the cut's state, and
-/// takes the remembered place instead.
+/// A recovery flush snapshots the store's dirty tiles as of its latest write, and its save
+/// point must name exactly that state: no more, or a crash could reopen half of a later stroke,
+/// or the later dabs of the stroke in progress. But while the flush is in flight, a later
+/// write's tile may be written back to make room, and land in the file before the save point.
+/// So the cut remembers, for each tile, where its record was before the first record past the
+/// cut was appended, and the save point names that one; the later records wait for the next
+/// save point. A record at or before the cut appended after one past it (the flush's own copy
+/// of a tile written back since) is the cut's state, and takes the remembered place instead.
+///
+/// Records are placed by their [`Stamp`], not their op: one stroke keeps one op across many
+/// dabs, and a cut during a long stroke falls between two dabs of the same op.
 #[derive(Debug)]
 struct Cut {
-    /// The newest edit the cut holds; records of later edits are past it. `None`: before any
-    /// edit, so every record is past it.
-    at: Option<OpId>,
-    /// The head op of the cut's state: the file's newest edit at or before the cut.
+    /// The newest write the cut holds; records of later writes (greater stamps) are past it.
+    at: Stamp,
+    /// The head op of the cut's state: the newest op of a record at or before the cut.
     head: Option<OpId>,
     /// For each tile with a record past the cut, where its record at the cut is.
     prior: BTreeMap<TileKey, Prior>,
@@ -782,6 +785,23 @@ impl ProjectFile {
         header: &[u8],
         body: &[u8],
     ) -> Result<(), StoreError> {
+        self.write_tile_stamped(key, op, Stamp::ZERO, header, body)
+    }
+
+    /// [`ProjectFile::write_tile`] for a tile store's write stamped `stamp`, which places the
+    /// record against an open cut (see [`Cut`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::write_tile`].
+    fn write_tile_stamped(
+        &mut self,
+        key: TileKey,
+        op: OpId,
+        stamp: Stamp,
+        header: &[u8],
+        body: &[u8],
+    ) -> Result<(), StoreError> {
         if self.access == Access::ReadOnly {
             return Err(StoreError::ReadOnly);
         }
@@ -792,7 +812,7 @@ impl ProjectFile {
         let packed = compress(body)?;
         let payload = tile_payload(key, op, header, body.len(), &packed)?;
         let loc = self.append(KIND_TILE, &payload)?;
-        self.note(key, op, loc);
+        self.note(key, op, stamp, loc);
         Ok(())
     }
 
@@ -808,14 +828,31 @@ impl ProjectFile {
         op: OpId,
         tile: &CorrectionTile,
     ) -> Result<(), StoreError> {
+        self.write_displacement_stamped(key, op, Stamp::ZERO, tile)
+    }
+
+    /// [`ProjectFile::write_displacement`] for a tile store's write stamped `stamp`, which
+    /// places the record against an open cut (see [`Cut`]): a dirty slot written back.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::write_displacement`].
+    pub(crate) fn write_displacement_stamped(
+        &mut self,
+        key: TileKey,
+        op: OpId,
+        stamp: Stamp,
+        tile: &CorrectionTile,
+    ) -> Result<(), StoreError> {
         check_displacement(&key, tile.side())?;
         let (header, body) = encode_displacement(tile)?;
-        self.write_tile(key, op, &header, &body)
+        self.write_tile_stamped(key, op, stamp, &header, &body)
     }
 
     /// Appends a tile record framed elsewhere (by [`frame_displacement`], on another thread),
     /// and records it as [`ProjectFile::write_tile`] does: `key`'s latest record, written since
-    /// the last save point, with its op counted towards the head.
+    /// the last save point, with its op counted towards the head, and placed against an open
+    /// cut by the stamp of the write it copies.
     ///
     /// # Errors
     ///
@@ -825,17 +862,18 @@ impl ProjectFile {
             return Err(StoreError::ReadOnly);
         }
         let loc = self.append_record(&tile.record)?;
-        self.note(tile.key, tile.op, loc);
+        self.note(tile.key, tile.op, tile.stamp, loc);
         Ok(())
     }
 
     /// Records that `key`'s record written by `op` was appended at `loc`: its latest record,
     /// written since the last save point, with `op` counted towards the head. While a cut is
-    /// open (see [`Cut`]), the first record of `key` past it leaves the cut its place before,
-    /// and a record at or before the cut after one past it is the cut's state, not the latest.
-    fn note(&mut self, key: TileKey, op: OpId, loc: Loc) {
+    /// open (see [`Cut`]), `stamp` places the record: the first record of `key` past the cut
+    /// leaves the cut its place before, and a record at or before the cut after one past it is
+    /// the cut's state, not the latest.
+    fn note(&mut self, key: TileKey, op: OpId, stamp: Stamp, loc: Loc) {
         if let Some(cut) = &mut self.cut {
-            if Some(op) > cut.at {
+            if stamp > cut.at {
                 let before = Prior {
                     live: self.live.get(&key).copied(),
                     pending: self.pending.get(&key).copied(),
@@ -857,10 +895,10 @@ impl ProjectFile {
         self.head = self.head.max(Some(op));
     }
 
-    /// Opens a cut at edit `at`: the next [`ProjectFile::write_save_point`] names the state as
-    /// of `at` (see [`Cut`]). Replaces any cut open already; records written before this call
-    /// are all at or before `at`, so nothing of the old cut carries over.
-    pub(crate) fn open_cut(&mut self, at: Option<OpId>) {
+    /// Opens a cut at the store's write `at`: the next [`ProjectFile::write_save_point`] names
+    /// the state as of `at` (see [`Cut`]). Replaces any cut open already; records written before
+    /// this call are all at or before `at`, so nothing of the old cut carries over.
+    pub(crate) fn open_cut(&mut self, at: Stamp) {
         self.cut = Some(Cut {
             at,
             head: self.head,
@@ -1158,7 +1196,7 @@ impl ProjectFile {
             .ok_or(StoreError::Damaged { offset: self.end })?
             .op;
         let loc = self.append_record(raw)?;
-        self.note(*key, op, loc);
+        self.note(*key, op, Stamp::ZERO, loc);
         Ok(())
     }
 
@@ -1509,6 +1547,9 @@ pub(crate) struct FramedTile {
     key: TileKey,
     /// The edit the record is written with.
     op: OpId,
+    /// The stamp of the store's write the record copies: what places it against an open cut,
+    /// and tells whether its slot was written again since.
+    stamp: Stamp,
     /// The whole record, framing and checksum included.
     record: Vec<u8>,
 }
@@ -1519,14 +1560,15 @@ impl FramedTile {
         self.key
     }
 
-    /// The edit the record is written with.
-    pub(crate) const fn op(&self) -> OpId {
-        self.op
+    /// The stamp of the store's write the record copies.
+    pub(crate) const fn stamp(&self) -> Stamp {
+        self.stamp
     }
 }
 
 /// Encodes, compresses and frames the displacement tile in `slot` as `key`'s record, written
-/// by `op`: the record [`ProjectFile::write_displacement`] would append.
+/// by `op`: the record [`ProjectFile::write_displacement`] would append. `stamp` is the store's
+/// write the slot was copied at.
 ///
 /// # Errors
 ///
@@ -1536,6 +1578,7 @@ impl FramedTile {
 pub(crate) fn frame_displacement(
     key: TileKey,
     op: OpId,
+    stamp: Stamp,
     slot: &CorrectionSlot,
 ) -> Result<FramedTile, StoreError> {
     let tile = slot.to_tile().map_err(CodecError::from)?;
@@ -1547,7 +1590,12 @@ pub(crate) fn frame_displacement(
     let packed = compress(&body)?;
     let payload = tile_payload(key, op, &header, body.len(), &packed)?;
     let record = frame(KIND_TILE, &payload).ok_or(StoreError::TooLarge)?;
-    Ok(FramedTile { key, op, record })
+    Ok(FramedTile {
+        key,
+        op,
+        stamp,
+        record,
+    })
 }
 
 /// A project file as of a save point, lent to a [`crate::TileStore`] as the read-only layer under

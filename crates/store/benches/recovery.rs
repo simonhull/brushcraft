@@ -85,10 +85,11 @@ impl Stroke {
                     .map(move |tx| TileKey::displacement(face, level, tx, ty).expect("key"))
             })
         });
-        let op = store.next_op().expect("op");
+        // One stroke: every tile is a dab of one op.
+        store.begin_op().expect("op");
         for key in keys.take(usize::from(TILES)) {
             store
-                .edit_tile(key, op, |edit| edit.set(5, 7, Vec3::new(1e-4, 0.0, 0.0)))
+                .edit_tile(key, |edit| edit.set(5, 7, Vec3::new(1e-4, 0.0, 0.0)))
                 .expect("edit")
                 .expect("set");
         }

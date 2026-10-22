@@ -597,6 +597,16 @@ impl Project {
         self.store.working().meta().project()
     }
 
+    /// A stroke begins: starts a new op in the store ([`TileStore::begin_op`]), which every
+    /// edit of the stroke is part of, however many dabs it takes, and returns it.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::Cache`] with [`CacheError::OpsExhausted`] if the site's ops are used up.
+    pub fn begin_stroke(&mut self) -> Result<OpId, ProjectError> {
+        Ok(self.store.begin_op()?)
+    }
+
     /// A stroke ended: flushes its edits to the recovery file in the background (see
     /// [`RecoveryWriter::end_stroke`]).
     ///

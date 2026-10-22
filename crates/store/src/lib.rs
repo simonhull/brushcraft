@@ -21,6 +21,7 @@ mod project;
 mod record;
 mod recovery;
 mod slot;
+mod stamp;
 #[cfg(test)]
 mod test_dir;
 mod tiles;

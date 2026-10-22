@@ -162,16 +162,29 @@ pub(crate) fn random_edits(mesh: &BaseMesh, top: u8, count: u32, seed: u64) -> V
         .collect()
 }
 
-/// Applies `edits` to the store (each with a fresh op) and to the oracle's map.
+/// Applies `edits` to the store (each as a new op) and to the oracle's map.
 pub(crate) fn apply(store: &mut TileStore, map: &mut CorrectionMap, edits: &[Edit]) {
     for e in edits {
-        let op = store.next_op().unwrap();
-        store
-            .set_correction(e.face, e.level, e.i, e.j, e.c, op)
-            .unwrap();
-        map.set(store.mesh.topology(), e.face, e.level, e.i, e.j, e.c)
-            .unwrap();
+        store.begin_op().unwrap();
+        dab(store, map, e);
     }
+}
+
+/// Applies `edits` to the store as dabs of the current op, as one stroke makes them, and to the
+/// oracle's map.
+pub(crate) fn apply_dabs(store: &mut TileStore, map: &mut CorrectionMap, edits: &[Edit]) {
+    for e in edits {
+        dab(store, map, e);
+    }
+}
+
+/// Applies `e` to the store as part of the current op, and to the oracle's map.
+fn dab(store: &mut TileStore, map: &mut CorrectionMap, e: &Edit) {
+    store
+        .set_correction(e.face, e.level, e.i, e.j, e.c)
+        .unwrap();
+    map.set(store.mesh.topology(), e.face, e.level, e.i, e.j, e.c)
+        .unwrap();
 }
 
 /// Applies `edits` to the oracle's map alone: what a store over `mesh` that made them holds.
@@ -557,12 +570,12 @@ fn save_reopen_evaluate() {
             store.file.len() - offset < 1024,
             "a save with no edits writes no tiles"
         );
-        store.next_op().unwrap()
+        store.begin_op().unwrap()
     };
     let file = ProjectFile::open(&path).unwrap();
     let mut store = TileStore::open(file, roomy()).unwrap();
     assert_eq!(
-        store.next_op().unwrap(),
+        store.begin_op().unwrap(),
         last_op,
         "ops continue right after the file's head"
     );
@@ -775,8 +788,7 @@ fn fill_and_dirty_corrections(store: &mut TileStore, all: &[TileKey]) {
     while store.corrections.has_free_slot() {
         store.correction(absent.pop().unwrap()).unwrap();
     }
-    let op = store.next_op().unwrap();
-    dirty_every_resident_correction(store, all, op);
+    dirty_every_resident_correction(store, all);
 }
 
 /// What a correction load did for its slot.
@@ -829,14 +841,14 @@ fn a_correction_load_takes_a_clean_tile_before_an_evaluated_chunk() {
     );
     let clean = *store.unsaved.keys().next().unwrap();
     store.save().unwrap();
-    let op = store.next_op().unwrap();
+    store.begin_op().unwrap();
     let dirty: Vec<TileKey> = tiles(&mesh, 1, TOP)
         .into_iter()
         .filter(|key| *key != clean && store.corrections.find(key).is_some())
         .collect();
     for key in &dirty {
         store
-            .edit_tile(*key, op, |edit| edit.set(1, 1, Vec3::new(0.002, 0.0, 0.0)))
+            .edit_tile(*key, |edit| edit.set(1, 1, Vec3::new(0.002, 0.0, 0.0)))
             .unwrap()
             .unwrap();
     }
@@ -1009,7 +1021,7 @@ fn bad_requests_are_refused() {
             "{key:?}"
         );
     }
-    let op = store.next_op().unwrap();
+    store.begin_op().unwrap();
     let refused = [
         (FaceId::new(0), Level::ZERO, 0, 0, Vec3::ZERO),
         (FaceId::new(9), level(1), 0, 0, Vec3::ZERO),
@@ -1025,7 +1037,7 @@ fn bad_requests_are_refused() {
     for (face, level, i, j, c) in refused {
         assert!(
             matches!(
-                store.set_correction(face, level, i, j, c, op),
+                store.set_correction(face, level, i, j, c),
                 Err(CacheError::Correction(_))
             ),
             "{face} {level} ({i}, {j})"
@@ -1244,9 +1256,9 @@ fn tile_batches(mesh: &BaseMesh, count: u32, per_tile: u32, seed: u64) -> Vec<Ti
 fn apply_batches(store: &mut TileStore, map: &mut CorrectionMap, batches: &[TileBatch]) {
     for (key, writes) in batches {
         let region = Region::of_tile(key);
-        let op = store.next_op().unwrap();
+        store.begin_op().unwrap();
         store
-            .edit_tile(*key, op, |edit| {
+            .edit_tile(*key, |edit| {
                 for &(i, j, c) in writes {
                     edit.set(i, j, c).unwrap();
                 }
@@ -1269,22 +1281,22 @@ fn editing_a_tile_equals_setting_its_vertices() {
     let mut map = CorrectionMap::new();
     for (key, edits) in tile_batches(&mesh, 60, 25, 18) {
         let region = Region::of_tile(&key);
-        let op = one_by_one.next_op().unwrap();
+        let op = one_by_one.begin_op().unwrap();
         assert_eq!(
-            batched.next_op().unwrap(),
+            batched.begin_op().unwrap(),
             op,
             "the stores hand out the same ops"
         );
         for &(i, j, c) in &edits {
             let (fi, fj) = (region.x0() + i, region.y0() + j);
             one_by_one
-                .set_correction(key.face(), key.level(), fi, fj, c, op)
+                .set_correction(key.face(), key.level(), fi, fj, c)
                 .unwrap();
             map.set(mesh.topology(), key.face(), key.level(), fi, fj, c)
                 .unwrap();
         }
         let touched = batched
-            .edit_tile(key, op, |edit| {
+            .edit_tile(key, |edit| {
                 for &(i, j, c) in &edits {
                     edit.set(i, j, c).unwrap();
                 }
@@ -1374,18 +1386,11 @@ fn a_tile_edited_by_one_op_goes_to_the_feed_once() {
     let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
     let key = tiles(&mesh, TOP, TOP)[5];
     let region = Region::of_tile(&key);
-    let op = store.next_op().unwrap();
+    store.begin_op().unwrap();
     for n in 0..50 {
         let (i, j) = (region.x0() + 1 + n, region.y0() + 7);
         store
-            .set_correction(
-                key.face(),
-                key.level(),
-                i,
-                j,
-                Vec3::new(0.001, 0.0, 0.0),
-                op,
-            )
+            .set_correction(key.face(), key.level(), i, j, Vec3::new(0.001, 0.0, 0.0))
             .unwrap();
     }
     assert_eq!(
@@ -1394,19 +1399,19 @@ fn a_tile_edited_by_one_op_goes_to_the_feed_once() {
         "one interior tile, one op: one entry"
     );
     store
-        .edit_tile(key, op, |edit| edit.set(3, 3, Vec3::ZERO))
+        .edit_tile(key, |edit| edit.set(3, 3, Vec3::ZERO))
         .unwrap()
         .unwrap();
     assert_eq!(store.feed.backlog(), 1, "batched or not");
-    let next = store.next_op().unwrap();
+    let next = store.begin_op().unwrap();
     store
-        .edit_tile(key, next, |edit| edit.set(3, 4, Vec3::ZERO))
+        .edit_tile(key, |edit| edit.set(3, 4, Vec3::ZERO))
         .unwrap()
         .unwrap();
     assert_eq!(store.feed.backlog(), 2, "a new op is a new entry");
     store.save().unwrap();
     store
-        .edit_tile(key, next, |edit| edit.set(3, 5, Vec3::ZERO))
+        .edit_tile(key, |edit| edit.set(3, 5, Vec3::ZERO))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1424,14 +1429,14 @@ fn a_consumer_that_drained_a_tile_sees_its_next_edit_of_the_same_op() {
     // A second consumer beside save, which drains nothing here.
     let other = store.feed.subscribe();
     let key = tiles(&mesh, TOP, TOP)[5];
-    let op = store.next_op().unwrap();
+    let op = store.begin_op().unwrap();
     store
-        .edit_tile(key, op, |edit| edit.set(3, 3, Vec3::new(0.001, 0.0, 0.0)))
+        .edit_tile(key, |edit| edit.set(3, 3, Vec3::new(0.001, 0.0, 0.0)))
         .unwrap()
         .unwrap();
     assert_eq!(store.feed.drain(other), vec![(key, op)], "the first dab");
     store
-        .edit_tile(key, op, |edit| edit.set(4, 4, Vec3::new(0.001, 0.0, 0.0)))
+        .edit_tile(key, |edit| edit.set(4, 4, Vec3::new(0.001, 0.0, 0.0)))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1457,7 +1462,7 @@ fn edits_between_evaluations_invalidate_once() {
     store.normals(key).unwrap();
     store.log = EvalLog::default();
     // One op throughout, as a brush stroke: the store is evaluated between its dabs.
-    let op = store.next_op().unwrap();
+    store.begin_op().unwrap();
     let mut rng = Rng(19);
     let mut dab = |into: &mut TileStore, oracle: &mut CorrectionMap| {
         for _ in 0..40 {
@@ -1466,7 +1471,7 @@ fn edits_between_evaluations_invalidate_once() {
                 region.y0() + 1 + rng.below(63),
             );
             let c = rng.vec3(0.001);
-            into.set_correction(key.face(), key.level(), i, j, c, op)
+            into.set_correction(key.face(), key.level(), i, j, c)
                 .unwrap();
             oracle
                 .set(mesh.topology(), key.face(), key.level(), i, j, c)
@@ -1497,7 +1502,7 @@ fn edits_between_evaluations_invalidate_once() {
         "after the second dab, same op",
     );
     store
-        .edit_tile(key, op, |edit| {
+        .edit_tile(key, |edit| {
             for n in 0..64 {
                 edit.set(n, n, Vec3::ZERO).unwrap();
             }
@@ -1522,11 +1527,9 @@ fn an_unread_edit_still_reaches_untracked_tiles() {
         "an edit of it reaches the untracked node's reader"
     );
     store.log = EvalLog::default();
-    let op = store.next_op().unwrap();
+    store.begin_op().unwrap();
     store
-        .edit_tile(coarse, op, |edit| {
-            edit.set(1, 1, Vec3::new(0.001, 0.0, 0.0))
-        })
+        .edit_tile(coarse, |edit| edit.set(1, 1, Vec3::new(0.001, 0.0, 0.0)))
         .unwrap()
         .unwrap();
     assert_eq!(store.log.invalidations, 1, "the cascade ran");
@@ -1545,10 +1548,10 @@ fn an_edit_that_panics_releases_its_pins() {
     for tile in &finest {
         store.evaluate(*tile).unwrap();
     }
-    let op = store.next_op().unwrap();
+    store.begin_op().unwrap();
     let c = Vec3::new(0.001, -0.002, 0.0);
     let edited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        store.edit_tile(key, op, |edit| {
+        store.edit_tile(key, |edit| {
             edit.set(0, 0, c).unwrap();
             panic!("the brush gave up");
         })
@@ -1599,9 +1602,9 @@ fn a_copy_that_fails_to_write_keeps_its_written_twins_invalidated() {
     store.correction(broken).unwrap();
     let id = store.corrections.find(&broken).unwrap();
     store.corrections.get_mut(id).unwrap().side = 0;
-    let op = store.next_op().unwrap();
+    store.begin_op().unwrap();
     let c = Vec3::new(0.002, 0.0, 0.0);
-    let failed = store.set_correction(face, level, i, j, c, op);
+    let failed = store.set_correction(face, level, i, j, c);
     assert!(
         matches!(
             failed,
@@ -1771,8 +1774,10 @@ fn a_tile_edited_after_its_prefetch_keeps_the_edit() {
     assert_positions(&mut store, &dense, &[rewritten, resident], "edited");
 }
 
-/// Dirties every resident correction tile of `store` with `op`, at an interior vertex of each.
-fn dirty_every_resident_correction(store: &mut TileStore, all: &[TileKey], op: OpId) {
+/// Dirties every resident correction tile of `store` with a new op, at an interior vertex of
+/// each.
+fn dirty_every_resident_correction(store: &mut TileStore, all: &[TileKey]) {
+    store.begin_op().unwrap();
     let resident: Vec<TileKey> = all
         .iter()
         .filter(|key| store.corrections.find(key).is_some())
@@ -1780,7 +1785,7 @@ fn dirty_every_resident_correction(store: &mut TileStore, all: &[TileKey], op: O
         .collect();
     for key in resident {
         store
-            .edit_tile(key, op, |edit| edit.set(1, 1, Vec3::new(0.001, 0.0, 0.0)))
+            .edit_tile(key, |edit| edit.set(1, 1, Vec3::new(0.001, 0.0, 0.0)))
             .unwrap()
             .unwrap();
     }
@@ -1806,8 +1811,7 @@ fn prefetch_never_takes_an_evaluated_chunk_or_writes_a_tile_back() {
     while store.corrections.has_free_slot() {
         store.correction(absent.pop().unwrap()).unwrap();
     }
-    let op = store.next_op().unwrap();
-    dirty_every_resident_correction(&mut store, &all, op);
+    dirty_every_resident_correction(&mut store, &all);
     assert!(
         store.evaluated.has_unpinned_chunk(),
         "an evaluated chunk could be taken"

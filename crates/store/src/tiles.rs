@@ -1,7 +1,7 @@
 //! The tile store: a project held out of core.
 //!
 //! [`TileStore`] owns the base mesh, the working [`ProjectFile`], two budgeted pools (correction
-//! tiles and evaluated tiles), the change feed and an op generator, and may borrow a
+//! tiles and evaluated tiles), the change feed and the op generator, and may borrow a
 //! [`BaseFile`] under the working file. Correction tiles are loaded on demand (see below) and
 //! edited in their slots; evaluated tiles are computed on demand from their parent tiles and
 //! cached. Edits drop exactly the evaluations that followed from them (see [`crate::deps`]).
@@ -25,6 +25,15 @@
 //! levels of the cone are pinned at once, and no level is wider than [`geom::cone_width`], so an
 //! evaluation pins at most twice that many evaluated tiles, whatever its depth. Normals are
 //! evaluated the same way, from the cone of the tiles they read.
+//!
+//! # Ops and writes
+//!
+//! The store issues the ops edits carry; callers never pass one in. [`TileStore::begin_op`]
+//! starts a new op, and every edit from then on is part of it, so one stroke keeps one op
+//! across all of its dabs, and ops only grow. Within the store, ops order nothing: every write
+//! a correction slot takes is stamped from a counter (see [`crate::stamp`]), and the stamps
+//! decide which slots a recovery flush may mark clean and which records its save point names.
+//! A flush in the middle of a stroke so cuts cleanly between two dabs of one op.
 //!
 //! Everything here belongs to one thread: the one calling the store. Pins are held by
 //! [`PinGuard`]s, which may be dropped anywhere on that thread; the store applies the unpins at
@@ -82,6 +91,7 @@ use crate::op::{OpId, RESERVED_SITE};
 use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotId};
 use crate::prefetch::{Fetched, Job, Prefetcher, Source};
 use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
+use crate::stamp::Stamp;
 
 /// How a [`TileStore`] is set up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,7 +407,7 @@ struct EvalLog {
 }
 
 /// A project held out of core: the base mesh, its files, budgeted pools of correction and
-/// evaluated tiles, the change feed and an op generator.
+/// evaluated tiles, the change feed and the op generator.
 ///
 /// The files are the working file and, under it, a base: the project file as of its last save.
 /// Corrections are read from the working file first, then the base, and an absent tile is zero
@@ -466,17 +476,17 @@ pub struct TileStore {
     evaluated: Pool<EvaluatedSlot>,
     /// What each cached evaluated tile was computed from.
     deps: DepGraph,
-    /// The op of the latest edit of each dirty correction slot: the op its record is written
-    /// with, by write-back or [`TileStore::save`].
-    unsaved: HashMap<TileKey, OpId>,
+    /// The latest write of each dirty correction slot: the op its record is written with, by
+    /// write-back or [`TileStore::save`], and its stamp.
+    unsaved: HashMap<TileKey, Dirty>,
     /// Every tile edited since the last rebase (or since the store opened), drained from the
     /// feed by save's consumer: what the next save copies into the project file.
     since_rebase: BTreeSet<TileKey>,
-    /// Counts the store's edits (every write a correction slot takes): a save records it, and
-    /// a rebase refuses a save made before the latest edit.
-    epoch: u64,
-    /// The newest op of any edit so far: where a recovery flush cuts (see
-    /// [`TileStore::open_cut`]).
+    /// The stamp of the latest write a correction slot took (see [`crate::stamp`]): where a
+    /// recovery flush cuts ([`TileStore::open_cut`]); a save records it, and a rebase refuses a
+    /// save made before a later write.
+    last_write: Stamp,
+    /// The newest op of any edit so far.
     latest_edit: Option<OpId>,
     /// Counts the working files the store has had: a rebase moves it on, so a recovery flush
     /// started before can tell it would finish in the wrong file.
@@ -492,8 +502,11 @@ pub struct TileStore {
     /// that fails part-way loses nothing. Separate from the slots' dirty flag, which every
     /// writer of the working file clears, and from save's place in the feed.
     streams: HashMap<ConsumerId, BTreeSet<TileKey>>,
-    /// The next op [`TileStore::next_op`] hands out; `None` once the site's ids are used up.
+    /// The next op [`TileStore::begin_op`] hands out; `None` once the site's ids are used up.
     next_op: Option<OpId>,
+    /// The op edits are made as: the one [`TileStore::begin_op`] last started, or `None` if
+    /// there is none (the store just opened, or was rebased), and the next edit starts one.
+    op: Option<OpId>,
     /// Shared with the [`PinGuard`]s: the pin sets they have released.
     pins: Rc<RefCell<PinTable>>,
     /// The slots of each live pin set.
@@ -608,25 +621,36 @@ fn keep_first<E: Into<CacheError>>(outcome: &mut Result<(), CacheError>, next: R
     }
 }
 
-/// Appends a dirty correction slot's tile to the working file, with the op of its latest edit
-/// (no save point), and forgets the op: the slot is clean once this returns.
+/// The latest write of a dirty correction slot: what its record is written with, and where that
+/// write stands among the store's writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Dirty {
+    /// The op of the edit that made the write: the op its record carries.
+    pub(crate) op: OpId,
+    /// The write's stamp: a flush's copy of the slot leaves it clean only if no write came
+    /// after (see [`TileStore::append_streamed`]).
+    pub(crate) stamp: Stamp,
+}
+
+/// Appends a dirty correction slot's tile to the working file, with the op of its latest write
+/// (no save point), and forgets the write: the slot is clean once this returns.
 ///
 /// # Errors
 ///
 /// [`CacheError::WriteBack`] if the file's write fails; [`CacheError::Internal`] if the slot has
-/// no recorded op (every slot marked dirty gets one first) or doesn't hold a valid tile.
+/// no recorded write (every slot marked dirty gets one first) or doesn't hold a valid tile.
 fn write_slot(
     file: &mut ProjectFile,
-    unsaved: &mut HashMap<TileKey, OpId>,
+    unsaved: &mut HashMap<TileKey, Dirty>,
     key: TileKey,
     slot: &CorrectionSlot,
 ) -> Result<(), CacheError> {
-    let op = unsaved
+    let Dirty { op, stamp } = unsaved
         .get(&key)
         .copied()
         .ok_or(Invariant::MissingOp(key))?;
     let tile = slot.to_tile().map_err(Invariant::CorrectionSlot)?;
-    file.write_displacement(key, op, &tile)
+    file.write_displacement_stamped(key, op, stamp, &tile)
         .map_err(CacheError::WriteBack)?;
     unsaved.remove(&key);
     Ok(())
@@ -657,9 +681,12 @@ fn first_op(site: u16, heads: impl IntoIterator<Item = Option<OpId>>) -> Result<
 pub(crate) struct Snapshot {
     /// The tile.
     pub(crate) key: TileKey,
-    /// The op of the tile's latest edit when the copy was taken: the record's op, and what
-    /// [`TileStore::append_streamed`] compares against to tell whether the slot changed since.
+    /// The op of the tile's latest write when the copy was taken: the record's op.
     pub(crate) op: OpId,
+    /// The stamp of that write: what places the record against the flush's cut, and what
+    /// [`TileStore::append_streamed`] compares against to tell whether the slot was written
+    /// since.
+    pub(crate) stamp: Stamp,
     /// The slot's contents, boxed so the hand-off moves a pointer, not 26.9 KB.
     pub(crate) slot: Box<CorrectionSlot>,
 }
@@ -667,16 +694,16 @@ pub(crate) struct Snapshot {
 /// Proof that a save copied every tile edited since the last rebase into a project file, made
 /// only by [`TileStore::save_into`] and taken by [`TileStore::rebase`].
 ///
-/// It holds the project file's new save point, as the base to rebase on, and the store's edit
-/// count when the save was made: a rebase refuses it if the store has been edited since, as
-/// those edits are in no save. There is no other way to make one, so a store can't be rebased
+/// It holds the project file's new save point, as the base to rebase on, and the store's latest
+/// write when the save was made: a rebase refuses it if the store has been written since, as
+/// those writes are in no save. There is no other way to make one, so a store can't be rebased
 /// past edits that were never saved.
 #[derive(Debug)]
 pub(crate) struct Saved {
     /// The project file as of the save point the save wrote.
     base: BaseFile,
-    /// The store's edit count when the save was made.
-    epoch: u64,
+    /// The stamp of the store's latest write when the save was made.
+    stamp: Stamp,
 }
 
 impl Saved {
@@ -807,13 +834,14 @@ impl TileStore {
             deps: DepGraph::new(),
             unsaved: HashMap::new(),
             since_rebase,
-            epoch: 0,
+            last_write: Stamp::ZERO,
             latest_edit: None,
             generation: 0,
             feed,
             save_consumer,
             streams: HashMap::new(),
             next_op: Some(next_op),
+            op: None,
             pins: Rc::default(),
             pin_sets: HashMap::new(),
             next_pin_set: 0,
@@ -828,7 +856,7 @@ impl TileStore {
 
     /// Copies every tile edited since the last rebase (or since the store opened) into
     /// `project`, saves it, and returns the proof a rebase needs: the new save point as a base,
-    /// and the store's edit count.
+    /// and the store's latest write.
     ///
     /// Each tile is copied from where its latest edit is: a dirty slot is encoded and written
     /// with the op of its latest edit, else the working file's record is copied as it is,
@@ -862,7 +890,7 @@ impl TileStore {
                 .find(key)
                 .filter(|&id| self.corrections.is_dirty(id) == Some(true));
             if let Some(id) = dirty {
-                let op = self
+                let Dirty { op, .. } = self
                     .unsaved
                     .get(key)
                     .copied()
@@ -896,14 +924,14 @@ impl TileStore {
             .ok_or(Invariant::NotSaved)?;
         Ok(Saved {
             base,
-            epoch: self.epoch,
+            stamp: self.last_write,
         })
     }
 
     /// Swaps in the save point `saved` proves, as the base, and `working`, a fresh working file
     /// over it; returns the working file it replaces.
     ///
-    /// `saved` must be current: made by [`TileStore::save_into`] with no edit since. Then every
+    /// `saved` must be current: made by [`TileStore::save_into`] with no write since. Then every
     /// tile edited since the last rebase is in the new save point, and the old working file's
     /// records are no longer needed. That is checked, not assumed: every tile of the old
     /// working file and of the old base must be in the new save point. Dirty slots are clean
@@ -911,11 +939,12 @@ impl TileStore {
     /// as it is what was just saved; so are cached evaluations, which stay valid: nothing they
     /// read has changed. Prefetches in flight are dropped (their workers stop and are joined),
     /// and later ones read the new files. The op generator continues, past the base's head if
-    /// that is newer.
+    /// that is newer, and the current op ends: the next edit starts a new one, so the edits
+    /// after a save point are newer than its head.
     ///
     /// # Errors
     ///
-    /// [`CacheError::StaleSave`] if the store was edited after `saved` was made;
+    /// [`CacheError::StaleSave`] if the store was written after `saved` was made;
     /// [`CacheError::MeshMismatch`] if either file isn't over the store's mesh;
     /// [`CacheError::WrongBase`] if `working` isn't a recovery file naming `saved`'s save point;
     /// [`CacheError::Internal`] with [`Invariant::NotInSave`] if a tile the store could read is
@@ -927,8 +956,8 @@ impl TileStore {
         working: ProjectFile,
     ) -> Result<ProjectFile, CacheError> {
         self.sync_pins()?;
-        let Saved { base, epoch } = saved;
-        if epoch != self.epoch {
+        let Saved { base, stamp } = saved;
+        if stamp != self.last_write {
             return Err(CacheError::StaleSave);
         }
         if base.meta().mesh_hash() != self.mesh_hash || working.meta().mesh_hash() != self.mesh_hash
@@ -966,6 +995,7 @@ impl TileStore {
         // The old workers read the old files; dropping them joins them and drops their results.
         self.prefetch = Prefetcher::new();
         self.next_op = next_op;
+        self.op = None;
         self.base = Some(base);
         Ok(std::mem::replace(&mut self.file, working))
     }
@@ -1016,7 +1046,7 @@ impl TileStore {
             let resident = self.corrections.find(&key);
             let dirty = resident.filter(|&id| self.corrections.is_dirty(id) == Some(true));
             let from_slot = match dirty {
-                Some(_) => self.unsaved.get(&key).copied(),
+                Some(_) => self.unsaved.get(&key).map(|write| write.op),
                 None => match self.file.read_tile_record(&key) {
                     Ok(Some(raw)) => {
                         fresh
@@ -1084,15 +1114,49 @@ impl TileStore {
         self.base.as_ref()
     }
 
-    /// A new op id for an edit: the site's next sequence number.
+    /// Starts a new op, the site's next sequence number, and returns it: every edit from now
+    /// on, [`TileStore::set_correction`] and [`TileStore::edit_tile`] alike, is part of it,
+    /// until the next call. A stroke begins one and keeps it across all of its dabs.
+    ///
+    /// Ops are issued here only, never passed in by a caller, so they only grow. An edit with
+    /// no op begun (the first after the store opens, or after a rebase) begins one itself.
+    ///
+    /// There is no way to make an edit as an op of the caller's choosing:
+    ///
+    /// ```compile_fail
+    /// # fn edit(store: &mut store::TileStore, key: geom::TileKey, op: store::OpId) {
+    /// store.edit_tile(key, op, |edit| edit.set(1, 1, geom::Vec3::ZERO));
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
-    /// [`CacheError::OpsExhausted`] past the last sequence number.
-    pub fn next_op(&mut self) -> Result<OpId, CacheError> {
+    /// [`CacheError::OpsExhausted`] past the site's last sequence number; the current op is
+    /// kept then.
+    pub fn begin_op(&mut self) -> Result<OpId, CacheError> {
         let op = self.next_op.ok_or(CacheError::OpsExhausted)?;
         self.next_op = op.next();
+        self.op = Some(op);
         Ok(op)
+    }
+
+    /// The op edits are made as now: the one [`TileStore::begin_op`] last started; `None` if
+    /// none is (the next edit begins one).
+    #[must_use]
+    pub const fn current_op(&self) -> Option<OpId> {
+        self.op
+    }
+
+    /// The op for an edit: the current one, or a new one if none is current.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::begin_op`].
+    fn edit_op(&mut self) -> Result<OpId, CacheError> {
+        match self.op {
+            Some(op) => Ok(op),
+            None => self.begin_op(),
+        }
     }
 
     /// Bytes the pools hold: whole chunks, never more than the budget.
@@ -1117,10 +1181,11 @@ impl TileStore {
         Ok(slot.view().map_err(Invariant::CorrectionSlot)?)
     }
 
-    /// Sets the correction at face-grid vertex `(i, j)` of `face` at `level` to `c`, as edit
-    /// `op`: in every copy of the vertex (one per tile holding it, in every face sharing it).
+    /// Sets the correction at face-grid vertex `(i, j)` of `face` at `level` to `c`, as part of
+    /// the current op (see [`TileStore::begin_op`]): in every copy of the vertex (one per tile
+    /// holding it, in every face sharing it).
     ///
-    /// Each copy's slot becomes dirty, and its key goes to the change feed with `op` (once per
+    /// Each copy's slot becomes dirty, and its key goes to the change feed with the op (once per
     /// op until a consumer drains it, see [`ChangeFeed::push`]). Every cached
     /// evaluation that followed from those tiles is dropped (pinned ones are recomputed in
     /// place on their next [`TileStore::evaluate`]); a tile nothing has been computed from since
@@ -1132,9 +1197,10 @@ impl TileStore {
     ///
     /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`],
     /// [`CorrectionError::LevelZero`], [`CorrectionError::UnknownFace`] or
-    /// [`CorrectionError::OutOfTile`], before anything is written; [`CacheError::Store`],
-    /// [`CacheError::Full`] or [`CacheError::WriteBack`] if a copy's tile can't be loaded, also
-    /// before anything is written. Should writing a copy fail all the same
+    /// [`CorrectionError::OutOfTile`], before anything is written;
+    /// [`CacheError::OpsExhausted`] if no op is current and none can be begun;
+    /// [`CacheError::Store`], [`CacheError::Full`] or [`CacheError::WriteBack`] if a copy's tile
+    /// can't be loaded, also before anything is written. Should writing a copy fail all the same
     /// ([`CacheError::Internal`]: a broken slot), the copies written before it are kept, and
     /// their evaluations dropped, before the error is returned.
     pub fn set_correction(
@@ -1144,7 +1210,6 @@ impl TileStore {
         i: u32,
         j: u32,
         c: Vec3,
-        op: OpId,
     ) -> Result<(), CacheError> {
         self.sync_pins()?;
         self.poll()?;
@@ -1167,6 +1232,7 @@ impl TileStore {
                 side,
             }));
         }
+        let op = self.edit_op()?;
         // Every copy is loaded and pinned before any is written, so a failed load leaves the
         // twins agreeing.
         let mut held = [None; MAX_COPIES];
@@ -1195,8 +1261,8 @@ impl TileStore {
         Ok(())
     }
 
-    /// Edits `key`'s corrections as edit `op`: `f` sets vertices through a [`TileEdit`], and
-    /// its result is returned.
+    /// Edits `key`'s corrections as part of the current op (see [`TileStore::begin_op`]): `f`
+    /// sets vertices through a [`TileEdit`], and its result is returned.
     ///
     /// This is [`TileStore::set_correction`] for many vertices of one tile, with the bookkeeping
     /// done once per tile instead of once per vertex: each tile written (the edited one, and the
@@ -1210,18 +1276,19 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::NotATile`]; [`CacheError::Store`], [`CacheError::Full`] or
-    /// [`CacheError::WriteBack`] if the tile's corrections can't be loaded (nothing is written
-    /// then); [`CacheError::Internal`] if a slot handle went stale.
+    /// [`CacheError::NotATile`]; [`CacheError::OpsExhausted`] if no op is current and none can
+    /// be begun; [`CacheError::Store`], [`CacheError::Full`] or [`CacheError::WriteBack`] if the
+    /// tile's corrections can't be loaded (nothing is written then); [`CacheError::Internal`] if
+    /// a slot handle went stale.
     pub fn edit_tile<R>(
         &mut self,
         key: TileKey,
-        op: OpId,
         f: impl FnOnce(&mut TileEdit<'_>) -> R,
     ) -> Result<R, CacheError> {
         self.sync_pins()?;
         self.poll()?;
         self.check_key(&key)?;
+        let op = self.edit_op()?;
         let id = self.load_correction(key)?;
         self.corrections.pin(id)?;
         let mut edit = TileEdit {
@@ -1375,7 +1442,8 @@ impl TileStore {
 
     /// Copies, for streaming consumer `id`, every correction slot whose latest edit isn't in the
     /// working file yet: the keys of its flush mark, with those the feed has pushed since its
-    /// last call added, that are resident and dirty, each with the op of its latest edit.
+    /// last call added, that are resident and dirty, each with the op and stamp of its latest
+    /// write.
     ///
     /// A key of the mark whose slot is clean or not resident is in the working file already (a
     /// slot leaves the pool only once written back, and only a write clears it), so it leaves
@@ -1413,7 +1481,7 @@ impl TileStore {
                 written.push(key);
                 continue;
             }
-            let Some(&op) = unsaved.get(&key) else {
+            let Some(&Dirty { op, stamp }) = unsaved.get(&key) else {
                 // A broken slot: dropped, so the rest still flush.
                 skipped.push(key);
                 written.push(key);
@@ -1424,6 +1492,7 @@ impl TileStore {
             snapshots.push(Snapshot {
                 key,
                 op,
+                stamp,
                 slot: copy,
             });
         }
@@ -1434,17 +1503,18 @@ impl TileStore {
     }
 
     /// Appends streaming consumer `id`'s encoded `tiles` to the working file: each one whose slot
-    /// is still resident and dirty. A slot unchanged since its snapshot (last edited by the
-    /// record's op) is clean once its record is appended, and leaves the mark.
+    /// is still resident and dirty. A slot unchanged since its snapshot (its latest write is the
+    /// one the record copies, by stamp) is clean once its record is appended, and leaves the
+    /// mark. Ops can't tell: a later dab of the same stroke writes the slot with the same op.
     ///
-    /// A slot edited again since its snapshot is appended all the same, so the save point after
+    /// A slot written again since its snapshot is appended all the same, so the save point after
     /// this append holds every edit up to the snapshot, but stays dirty and in the mark: its
     /// newer edit isn't in the file, and whatever writes the slot next (the next flush, a save,
     /// or a write-back to make room) appends it after this record. Reads of a dirty tile come
     /// from its slot, never the file, meanwhile.
     ///
     /// A tile whose slot is clean or gone was written by someone else (a write-back to make
-    /// room) after the snapshot, at an edit at least as new. If that edit is at or before the
+    /// room) after the snapshot, at a write at least as new. If that write is at or before the
     /// working file's cut, the record is the cut's state and the copy is skipped; if it is past
     /// the cut, the copy is appended for the cut's save point, and the newer record stays the
     /// latest (see [`ProjectFile::open_cut`]). Either way it leaves the mark.
@@ -1478,7 +1548,10 @@ impl TileStore {
                     self.file
                         .append_framed(tile)
                         .map_err(CacheError::WriteBack)?;
-                    let unchanged = self.unsaved.get(&key) == Some(&tile.op());
+                    let unchanged = self
+                        .unsaved
+                        .get(&key)
+                        .is_some_and(|write| write.stamp == tile.stamp());
                     if unchanged {
                         self.unsaved.remove(&key);
                         self.corrections.set_dirty(found, false)?;
@@ -1493,14 +1566,13 @@ impl TileStore {
         Ok(())
     }
 
-    /// Opens a cut in the working file at the newest edit so far: the next save point the
+    /// Opens a cut in the working file at the latest write so far: the next save point the
     /// recovery writer writes names the state as of now, whatever is written back meanwhile
     /// (see [`ProjectFile::open_cut`]). Called as a flush takes its snapshot.
     ///
-    /// Op ids must grow with the edits (as [`TileStore::next_op`] hands them out) for the cut to
-    /// tell later edits from earlier ones.
+    /// The cut is at a write stamp, not an op, so it falls between two dabs of one stroke.
     pub(crate) fn open_cut(&mut self) {
-        self.file.open_cut(self.latest_edit);
+        self.file.open_cut(self.last_write);
     }
 
     /// The working-file generation: moved on by every rebase.
@@ -1963,8 +2035,8 @@ impl TileStore {
         }
     }
 
-    /// Writes `c` at `(i, j)` of `key`'s correction slot `id` (resident and pinned) as edit `op`,
-    /// and marks the slot written (see [`TileStore::mark_written`]).
+    /// Writes `c` at `(i, j)` of `key`'s correction slot `id` (resident and pinned) as part of
+    /// `op`, and marks the slot written (see [`TileStore::mark_written`]).
     ///
     /// # Errors
     ///
@@ -1985,9 +2057,10 @@ impl TileStore {
         self.mark_written(key, id, op)
     }
 
-    /// Records that `key`'s correction slot `id` was changed by `op`: dirty, to be written with
-    /// `op`, and pushed to the change feed with it (the feed skips the push if no consumer has
-    /// drained the same key and op yet).
+    /// Records that `key`'s correction slot `id` was written as part of `op`: the write takes
+    /// the next stamp, and the slot is dirty, to be written with `op`, and pushed to the change
+    /// feed with it (the feed skips the push if no consumer has drained the same key and op
+    /// yet).
     ///
     /// # Errors
     ///
@@ -1998,9 +2071,15 @@ impl TileStore {
         id: SlotId<CorrectionSlot>,
         op: OpId,
     ) -> Result<(), CacheError> {
-        self.unsaved.insert(key, op);
+        self.last_write = self.last_write.next();
+        self.unsaved.insert(
+            key,
+            Dirty {
+                op,
+                stamp: self.last_write,
+            },
+        );
         self.feed.push(key, op);
-        self.epoch += 1;
         self.latest_edit = self.latest_edit.max(Some(op));
         self.corrections.set_dirty(id, true)?;
         Ok(())
@@ -2353,8 +2432,8 @@ struct Touched {
     written: bool,
 }
 
-/// One tile's corrections being edited as one op: what [`TileStore::edit_tile`] hands its
-/// closure.
+/// One tile's corrections being edited as part of the current op: what
+/// [`TileStore::edit_tile`] hands its closure.
 ///
 /// Coordinates are the tile's own, `0..side` on each axis. Setting a vertex on the tile's border
 /// sets every copy of it, in the neighbouring tiles of this face and of the faces across the

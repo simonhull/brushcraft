@@ -183,11 +183,13 @@ fn poll_until_idle(project: &mut Project) {
     }
 }
 
-/// Applies the `count` edits of the stroke with `seed` to the project's store.
+/// Begins the stroke with `seed` and applies its `count` edits to the project's store, as dabs
+/// of its one op.
 fn edit(project: &mut Project, count: u32, seed: u64) {
     let mesh = project.store().working().mesh();
     let edits = random_edits(&mesh, TOP, count, seed);
-    apply(project.store(), &mut CorrectionMap::new(), &edits);
+    project.begin_stroke().unwrap();
+    apply_dabs(project.store(), &mut CorrectionMap::new(), &edits);
 }
 
 /// The crash test's child: runs the scenario in [`SCENARIO`] in the directory in [`DIR`],

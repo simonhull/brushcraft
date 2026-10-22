@@ -10,7 +10,9 @@ use geom::CorrectionMap;
 
 use super::*;
 use crate::test_dir::TestDir;
-use crate::tiles::tests::{TOP, apply, assert_positions, dense, mesh, random_edits, roomy, tiles};
+use crate::tiles::tests::{
+    TOP, apply, apply_dabs, assert_positions, dense, mesh, random_edits, roomy, tiles,
+};
 
 /// A configuration with room for every tile, and recovery files in `dir`'s `recovery`.
 fn config(dir: &TestDir) -> ProjectConfig {
@@ -37,11 +39,12 @@ fn recovery_files(dir: &TestDir) -> Vec<String> {
     names
 }
 
-/// `count` random edits with `seed` applied to the project's store and to `map`, then a stroke
-/// end.
+/// One stroke: begun, `count` random edits with `seed` applied as its dabs to the project's store
+/// and to `map`, and ended.
 fn stroke(project: &mut Project, map: &mut CorrectionMap, count: u32, seed: u64) {
     let edits = random_edits(&project.store().working().mesh(), TOP, count, seed);
-    apply(project.store(), map, &edits);
+    project.begin_stroke().unwrap();
+    apply_dabs(project.store(), map, &edits);
     project.end_stroke().unwrap();
 }
 

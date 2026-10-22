@@ -253,7 +253,7 @@ fn a_rebase_keeps_evaluations_valid_and_bit_identical() {
     );
 
     // Editing goes on over the new base, with ops past every saved one.
-    let op = store.next_op().unwrap();
+    let op = store.begin_op().unwrap();
     assert!(Some(op) > project.head(), "{op:?} after the saved head");
     apply(&mut store, &mut map, &random_edits(&mesh, TOP, 60, 26));
     assert_positions(
@@ -546,7 +546,7 @@ fn ops_continue_after_the_base_head() {
     let working = recovery(&dir, "r.bcrf", &project);
     let mut store = TileStore::open_layered(working, Some(base_of(&project)), roomy()).unwrap();
     assert_eq!(
-        store.next_op().unwrap(),
+        store.begin_op().unwrap(),
         unsaved.next().unwrap(),
         "after the file's head, not only the save point's"
     );

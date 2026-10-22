@@ -127,8 +127,6 @@ struct Run<'a> {
     oracle: Option<DenseEvaluation>,
     /// Pins held.
     guards: Vec<PinGuard>,
-    /// The op of the latest edit, which the next edit may reuse (a stroke's dabs).
-    last_op: Option<OpId>,
     /// What was checked.
     stats: Stats,
 }
@@ -146,14 +144,12 @@ impl Run<'_> {
             .get_or_insert_with(|| DenseEvaluation::new(mesh, level(top), map).unwrap())
     }
 
-    /// The op for the next edit: the last one again, half the time.
-    fn op(&mut self, store: &mut TileStore) -> OpId {
-        let op = match self.last_op {
-            Some(op) if self.rng.below(2) == 0 => op,
-            _ => store.next_op().unwrap(),
-        };
-        self.last_op = Some(op);
-        op
+    /// Begins a new op for the next edit, or, half the time once one is current, leaves the
+    /// edit to the current op: another dab of the same stroke.
+    fn begin_or_keep_op(&mut self, store: &mut TileStore) {
+        if store.current_op().is_none() || self.rng.below(2) != 0 {
+            store.begin_op().unwrap();
+        }
     }
 
     /// Counts `result` as refused for lack of room if pins are held, and fails the test on any
@@ -205,8 +201,8 @@ impl Run<'_> {
     /// Sets one vertex's correction.
     fn set_correction(&mut self, store: &mut TileStore) {
         let e = self.edits.next().unwrap();
-        let op = self.op(store);
-        let set = store.set_correction(e.face, e.level, e.i, e.j, e.c, op);
+        self.begin_or_keep_op(store);
+        let set = store.set_correction(e.face, e.level, e.i, e.j, e.c);
         if self.allow_full(set, "set_correction").is_some() {
             self.map
                 .set(self.mesh.topology(), e.face, e.level, e.i, e.j, e.c)
@@ -220,9 +216,9 @@ impl Run<'_> {
     fn edit_tile(&mut self, store: &mut TileStore) {
         let count = 1 + self.rng.below(40);
         let (key, writes) = tile_batches(self.mesh, 1, count, self.rng.next_u64()).remove(0);
-        let op = self.op(store);
+        self.begin_or_keep_op(store);
         let seed = self.seed;
-        let edited = store.edit_tile(key, op, |edit| {
+        let edited = store.edit_tile(key, |edit| {
             let mut done = Vec::new();
             for &(i, j, c) in &writes {
                 match edit.set(i, j, c) {
@@ -415,7 +411,6 @@ fn run(mesh: &Arc<BaseMesh>, top: u8, config: StoreConfig, seed: u64, steps: u32
         map: CorrectionMap::new(),
         oracle: None,
         guards: Vec::new(),
-        last_op: None,
         stats: Stats::default(),
     };
     for step in 0..steps {
@@ -426,7 +421,6 @@ fn run(mesh: &Arc<BaseMesh>, top: u8, config: StoreConfig, seed: u64, steps: u32
             run.guards.clear();
             drop(store);
             store = open(ProjectFile::open(&path).unwrap());
-            run.last_op = None;
             run.stats.reopens += 1;
         }
         let at = format!("seed {seed} step {step} ({what})");

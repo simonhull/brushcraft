@@ -25,24 +25,18 @@ fn assert_save_point(path: &std::path::Path, offset: u64, mesh: &BaseMesh, map: 
     assert_positions(&mut store, &dense(mesh, map), &tiles(mesh, 1, TOP), &what);
 }
 
-/// Sets an interior vertex of `key` (a level-[`TOP`] tile) to `c` with a fresh op, in the store
+/// Sets an interior vertex of `key` (a level-[`TOP`] tile) to `c` as a new op, in the store
 /// and in the oracle's map; returns the op.
 fn edit_interior(store: &mut TileStore, map: &mut CorrectionMap, key: TileKey, c: Vec3) -> OpId {
-    let op = store.next_op().unwrap();
-    edit_interior_as(store, map, key, c, op);
+    let op = store.begin_op().unwrap();
+    dab_interior(store, map, key, c);
     op
 }
 
-/// [`edit_interior`] as edit `op`.
-fn edit_interior_as(
-    store: &mut TileStore,
-    map: &mut CorrectionMap,
-    key: TileKey,
-    c: Vec3,
-    op: OpId,
-) {
+/// [`edit_interior`] as part of the current op: another dab of the same stroke.
+fn dab_interior(store: &mut TileStore, map: &mut CorrectionMap, key: TileKey, c: Vec3) {
     store
-        .edit_tile(key, op, |edit| edit.set(5, 7, c))
+        .edit_tile(key, |edit| edit.set(5, 7, c))
         .unwrap()
         .unwrap();
     let region = Region::of_tile(&key);
@@ -139,9 +133,10 @@ fn a_long_stroke_flushes_about_once_a_second() {
     let start = Instant::now();
     let tick = Duration::from_millis(100);
     let mut flushed_at = Vec::new();
-    // Ten seconds of one stroke: a few dabs between ticks, a tick every 100 ms.
+    // Ten seconds of one stroke, one op: a few dabs between ticks, a tick every 100 ms.
+    store.begin_op().unwrap();
     for (n, dabs) in (1..=100u32).zip(edits.chunks(4)) {
-        apply(&mut store, &mut map, dabs);
+        apply_dabs(&mut store, &mut map, dabs);
         let now = start + tick * n;
         let before = writer.flushes();
         writer.tick(&mut store, now).unwrap();
@@ -230,7 +225,11 @@ fn edits_during_a_flush_land_in_the_next_one_never_lost_never_doubled() {
         Some(true),
         "edited after its snapshot: still dirty"
     );
-    assert_eq!(store.unsaved.get(&t), Some(&t_again), "with its newer edit");
+    assert_eq!(
+        store.unsaved.get(&t).map(|write| write.op),
+        Some(t_again),
+        "with its newer edit"
+    );
     let u_slot = store.corrections.find(&u).unwrap();
     assert_eq!(
         store.corrections.is_dirty(u_slot),
@@ -526,9 +525,9 @@ fn a_save_point_is_the_state_at_its_cut() {
     writer.end_stroke(&mut store, Instant::now()).unwrap();
     assert_eq!(writer.phase(), "encoding", "the snapshot is taken");
     let cut = map.clone();
-    let x = store.next_op().unwrap();
-    edit_interior_as(&mut store, &mut map, k, Vec3::new(0.5, 0.0, 0.0), x);
-    edit_interior_as(&mut store, &mut map, j, Vec3::new(-0.5, 0.0, 0.0), x);
+    store.begin_op().unwrap();
+    dab_interior(&mut store, &mut map, k, Vec3::new(0.5, 0.0, 0.0));
+    dab_interior(&mut store, &mut map, j, Vec3::new(-0.5, 0.0, 0.0));
     store.evict_all().unwrap();
     assert!(
         store.corrections.find(&j).is_none(),
@@ -556,6 +555,117 @@ fn a_save_point_is_the_state_at_its_cut() {
     drop(at_cut);
     assert_save_point(&path, first, &mesh, &cut);
     assert_save_point(&path, second, &mesh, &map);
+}
+
+/// Reproduction: one op across a flush.
+///
+/// A stroke's dab of `t` is snapshotted; a later dab of the same op writes `t` again before the
+/// flush appends its copy. The copy must not leave the slot clean (the ops match, but the slot
+/// has been written since), or the eviction that follows drops the later dab unwritten, and
+/// neither the store nor a save of it holds it.
+#[test]
+fn a_later_dab_of_the_snapshotted_op_survives_eviction_and_save() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let t = tiles(&mesh, TOP, TOP)[3];
+    let mut map = CorrectionMap::new();
+    let op = edit_interior(&mut store, &mut map, t, Vec3::new(0.0, 0.0, 0.25));
+    writer.tick(&mut store, Instant::now()).unwrap();
+    assert_eq!(writer.phase(), "encoding", "a flush mid-stroke");
+    let snapshot = map.clone();
+    dab_interior(&mut store, &mut map, t, Vec3::new(0.5, 0.0, 0.0));
+    assert_eq!(store.current_op(), Some(op), "the same stroke, the same op");
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(writer.phase(), "syncing tiles", "the copy is appended");
+    let slot = store.corrections.find(&t).unwrap();
+    assert_eq!(
+        store.corrections.is_dirty(slot),
+        Some(true),
+        "written since its snapshot: still dirty"
+    );
+    settle(&mut writer, &mut store);
+    let first = writer.durable_save_point().unwrap();
+    store.evict_all().unwrap();
+    let all = tiles(&mesh, 1, TOP);
+    assert_positions(&mut store, &dense(&mesh, &map), &all, "after the eviction");
+    // The save: the writer finishes its flushes, then the store saves the working file.
+    writer.close(&mut store, Instant::now()).unwrap();
+    store.save().unwrap();
+    drop(store);
+    assert_save_point(&path, first, &mesh, &snapshot);
+    let file = ProjectFile::open(&path).unwrap();
+    let mut reopened = TileStore::open(file, roomy()).unwrap();
+    assert_positions(&mut reopened, &dense(&mesh, &map), &all, "saved");
+}
+
+/// A tick during a long stroke cuts between two dabs of its one op.
+///
+/// Dabs go on while the flush is in flight, and are written back (to make room, under the tight
+/// budget, or all at once) before its save point is written. The save point holds exactly the
+/// dabs before the cut, to the dab, and the next one the rest.
+#[test]
+fn a_tick_mid_stroke_cuts_between_two_dabs_of_one_op() {
+    /// The finest level edited and checked: coarse, so every save point can be checked in full.
+    const LEVEL: u8 = 5;
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let check = tiles(&mesh, 1, LEVEL);
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, tight());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    let op = store.begin_op().unwrap();
+    let start = Instant::now();
+    let mut points = Vec::new();
+    let mut past_cut = false;
+    let mut seed = 300;
+    for second in 0..4u32 {
+        seed += 1;
+        apply_dabs(&mut store, &mut map, &random_edits(&mesh, LEVEL, 40, seed));
+        writer
+            .tick(&mut store, start + FLUSH_INTERVAL * second)
+            .unwrap();
+        assert_ne!(writer.phase(), "idle", "second {second}: the tick flushes");
+        let cut = map.clone();
+        while !writer.is_idle() {
+            seed += 1;
+            apply_dabs(&mut store, &mut map, &random_edits(&mesh, LEVEL, 6, seed));
+            for key in check.iter().step_by(5) {
+                store.evaluate(*key).unwrap();
+            }
+            if seed % 2 == 0 {
+                store.evict_all().unwrap();
+            }
+            past_cut |= check.iter().any(|key| store.file.is_past_cut(key));
+            writer.step_blocking(&mut store).unwrap();
+        }
+        points.push((writer.durable_save_point().unwrap(), cut));
+    }
+    assert_eq!(store.current_op(), Some(op), "one op throughout");
+    assert!(
+        past_cut,
+        "dabs after a cut reached the file before its save point"
+    );
+    writer.close(&mut store, Instant::now()).unwrap();
+    drop(store);
+    for (offset, cut) in &points {
+        let file = ProjectFile::open_at(&path, *offset).unwrap();
+        assert_eq!(
+            file.head(),
+            Some(op),
+            "save point {offset}: the stroke's op"
+        );
+        let mut at_cut = TileStore::open(file, roomy()).unwrap();
+        let dense = DenseEvaluation::new(&mesh, level(LEVEL), cut).unwrap();
+        assert_positions(&mut at_cut, &dense, &check, &format!("save point {offset}"));
+    }
+    let file = ProjectFile::open(&path).unwrap();
+    let mut closed = TileStore::open(file, roomy()).unwrap();
+    let dense = DenseEvaluation::new(&mesh, level(LEVEL), &map).unwrap();
+    assert_positions(&mut closed, &dense, &check, "the closed file");
 }
 
 /// A crash simulation under a tight budget.
