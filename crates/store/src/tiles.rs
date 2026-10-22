@@ -735,6 +735,10 @@ impl TileStore {
     /// touched, marked dirty and put on the change feed at its first write, and its evaluations
     /// are dropped once, when `f` returns. Errors of single writes go to `f`.
     ///
+    /// Should `f` panic, the same happens as the panic unwinds through this call: the touched
+    /// tiles are unpinned, and the evaluations of those written are dropped. The writes made
+    /// before the panic stay, dirty and on the change feed.
+    ///
     /// # Errors
     ///
     /// [`CacheError::NotATile`]; [`CacheError::Store`], [`CacheError::Full`] or
@@ -761,18 +765,9 @@ impl TileStore {
                 written: false,
             }],
         };
+        // Should `f` panic, the edit's drop finishes it all the same.
         let result = f(&mut edit);
-        let touched = edit.touched;
-        let released = touched
-            .iter()
-            .try_for_each(|tile| self.corrections.unpin(tile.id));
-        self.invalidate_edited(
-            touched
-                .iter()
-                .filter(|tile| tile.written)
-                .map(|tile| tile.key),
-        );
-        released?;
+        edit.finish()?;
         Ok(result)
     }
 
@@ -1677,8 +1672,9 @@ pub struct TileEdit<'a> {
     key: TileKey,
     /// The op every write is recorded with.
     op: OpId,
-    /// The tiles holding copies touched so far, the edited tile first. A handful (a border
-    /// vertex's copies lie in the tile's neighbours), so a linear search finds them.
+    /// The tiles holding copies touched so far, the edited tile first; empty once the edit is
+    /// finished. A handful (a border vertex's copies lie in the tile's neighbours), so a linear
+    /// search finds them.
     touched: Vec<Touched>,
 }
 
@@ -1692,7 +1688,40 @@ impl std::fmt::Debug for TileEdit<'_> {
     }
 }
 
+/// Finishes an edit whose closure panicked, so its tiles don't stay pinned and the evaluations
+/// of those it wrote don't stay cached. After a normal return the edit is finished already, and
+/// this does nothing.
+impl Drop for TileEdit<'_> {
+    fn drop(&mut self) {
+        // While unwinding there is no caller to report to, and the only error is a broken
+        // invariant: every touched tile is unpinned either way.
+        drop(self.finish());
+    }
+}
+
 impl TileEdit<'_> {
+    /// Ends the edit: unpins every touched tile and drops the evaluations that followed from
+    /// the tiles written. Touched tiles are forgotten, so a second call does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] if a touched slot's handle went stale (pinned slots are never
+    /// freed, so this doesn't happen); every tile is unpinned and invalidated either way.
+    fn finish(&mut self) -> Result<(), CacheError> {
+        let touched = std::mem::take(&mut self.touched);
+        let mut outcome = Ok(());
+        for tile in &touched {
+            keep_first(&mut outcome, self.store.corrections.unpin(tile.id));
+        }
+        self.store.invalidate_edited(
+            touched
+                .iter()
+                .filter(|tile| tile.written)
+                .map(|tile| tile.key),
+        );
+        outcome
+    }
+
     /// The tile being edited.
     #[must_use]
     pub const fn key(&self) -> TileKey {

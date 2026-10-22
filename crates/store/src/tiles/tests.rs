@@ -1507,6 +1507,56 @@ fn an_unread_edit_still_reaches_untracked_tiles() {
 }
 
 #[test]
+fn an_edit_that_panics_releases_its_pins() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    let finest = tiles(&mesh, TOP, TOP);
+    // A corner tile: the corner vertex's copies lie in tiles of three faces.
+    let key = finest[0];
+    for tile in &finest {
+        store.evaluate(*tile).unwrap();
+    }
+    let op = store.next_op().unwrap();
+    let c = Vec3::new(0.001, -0.002, 0.0);
+    let edited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.edit_tile(key, op, |edit| {
+            edit.set(0, 0, c).unwrap();
+            panic!("the brush gave up");
+        })
+    }));
+    let panic = edited.expect_err("the panic came through");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"the brush gave up"),
+        "the closure's own panic"
+    );
+    assert_eq!(
+        store.corrections.pinned_slots(),
+        0,
+        "no touched tile stays pinned"
+    );
+    let region = Region::of_tile(&key);
+    map.set(
+        mesh.topology(),
+        key.face(),
+        key.level(),
+        region.x0(),
+        region.y0(),
+        c,
+    )
+    .unwrap();
+    let dense = dense(&mesh, &map);
+    assert_positions(
+        &mut store,
+        &dense,
+        &finest,
+        "the write before the panic, evaluated",
+    );
+}
+
+#[test]
 fn a_copy_that_fails_to_write_keeps_its_written_twins_invalidated() {
     let dir = TestDir::new();
     let mesh = mesh();
