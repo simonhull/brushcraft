@@ -67,15 +67,8 @@ pub(crate) fn decode_displacement(
     header: &[u8],
     body: &[u8],
 ) -> Result<CorrectionTile, CodecError> {
-    let mut h = Reader::new(header);
-    let side = h.u16().ok_or(CodecError::Size)?;
-    let scale = h.f32().ok_or(CodecError::Size)?;
-    if !h.rest().is_empty() {
-        return Err(CodecError::Size);
-    }
-    // Validates `side >= 2`; the counts follow from it.
-    let empty = CorrectionTile::zero(u32::from(side))?;
-    let (n, ring) = (empty.interior().len(), empty.border().len());
+    let Header { side, scale } = parse_header(header)?;
+    let (n, ring) = counts(side)?;
     if body.len() != n * 6 + ring * 12 {
         return Err(CodecError::Size);
     }
@@ -102,12 +95,59 @@ pub(crate) fn decode_displacement(
         .zip(bz)
         .map(|((x, y), z)| Vec3::new(x, y, z))
         .collect();
-    Ok(CorrectionTile::from_parts(
-        u32::from(side),
-        scale,
-        interior,
-        border,
-    )?)
+    Ok(CorrectionTile::from_parts(side, scale, interior, border)?)
+}
+
+/// A displacement channel header.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Header {
+    /// Vertices per side.
+    side: u32,
+    /// The interior quantization step.
+    scale: f32,
+}
+
+/// Parses a displacement channel header.
+///
+/// # Errors
+///
+/// [`CodecError::Size`] if it isn't exactly `side: u16, scale: f32`.
+fn parse_header(header: &[u8]) -> Result<Header, CodecError> {
+    let mut h = Reader::new(header);
+    let side = h.u16().ok_or(CodecError::Size)?;
+    let scale = h.f32().ok_or(CodecError::Size)?;
+    if h.rest().is_empty() {
+        Ok(Header {
+            side: u32::from(side),
+            scale,
+        })
+    } else {
+        Err(CodecError::Size)
+    }
+}
+
+/// Interior and border vertex counts of a tile of `side`.
+///
+/// # Errors
+///
+/// [`CodecError::Tile`] if `side` is out of range.
+fn counts(side: u32) -> Result<(usize, usize), CodecError> {
+    // Validates the side; the counts follow from it.
+    let empty = CorrectionTile::zero(side)?;
+    Ok((empty.interior().len(), empty.border().len()))
+}
+
+/// The side a displacement header states, and the uncompressed body length that side needs, so
+/// a reader can check a record's stated size before decompressing it.
+///
+/// # Errors
+///
+/// [`CodecError::Size`] if the header is malformed, [`CodecError::Tile`] if its side is out of
+/// range.
+pub(crate) fn displacement_body_len(header: &[u8]) -> Result<(u32, usize), CodecError> {
+    let side = parse_header(header)?.side;
+    let (n, ring) = counts(side)?;
+    Ok((side, n * 6 + ring * 12))
 }
 
 /// `n` delta-coded `i16`s, summed back to values.

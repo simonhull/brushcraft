@@ -12,7 +12,10 @@ use thiserror::Error;
 
 use crate::OpId;
 use crate::bytes::{KEY_LEN, Reader, put_key};
-use crate::codec::{CodecError, compress, decode_displacement, decompress, encode_displacement};
+use crate::codec::{
+    CodecError, compress, decode_displacement, decompress, displacement_body_len,
+    encode_displacement,
+};
 use crate::record::{HEAD, Head, KIND_INDEX, KIND_TILE, TAIL, frame, parse_head, verify};
 
 /// The file's first bytes.
@@ -29,6 +32,12 @@ const FULL_EVERY: u32 = 16;
 const NONE: u64 = u64::MAX;
 /// Bytes per index entry: key, offset `u64`, len `u32`.
 const ENTRY_LEN: usize = KEY_LEN + 12;
+
+/// The largest decompressed tile body, in bytes (1 MiB). A displacement tile needs 26,886.
+///
+/// Readers reject a record that states a larger size, so a damaged or hostile file can't make
+/// them allocate more.
+pub const MAX_RAW: u32 = 1 << 20;
 
 /// Why a project file operation failed.
 #[derive(Debug, Error)]
@@ -58,7 +67,8 @@ pub enum StoreError {
     /// The file was opened at an earlier save point and can't be written.
     #[error("opened read-only at an earlier save point")]
     ReadOnly,
-    /// A payload doesn't fit the format's length fields.
+    /// A payload doesn't fit the format's length fields, or a tile body is larger than
+    /// [`MAX_RAW`].
     #[error("record payload too large")]
     TooLarge,
     /// A tile payload didn't encode or decode.
@@ -117,6 +127,19 @@ struct Index {
     head: Option<OpId>,
     /// Sorted by key; `None` marks a removed tile.
     entries: Vec<(TileKey, Option<Loc>)>,
+}
+
+impl Index {
+    /// Whether every entry lies between the header and `at`, where this Index starts: an Index
+    /// names only records written before it, and so bounds what loading them reads.
+    fn entries_precede(&self, at: u64) -> bool {
+        self.entries.iter().all(|(_, loc)| {
+            loc.is_none_or(|loc| {
+                loc.offset >= FIRST_RECORD
+                    && loc.offset.checked_add(loc.len).is_some_and(|end| end <= at)
+            })
+        })
+    }
 }
 
 /// The live map an Index and its parent chain describe.
@@ -334,7 +357,8 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`].
+    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`] (including a body larger than
+    /// [`MAX_RAW`]), [`StoreError::Io`].
     pub fn write_tile(
         &mut self,
         key: TileKey,
@@ -344,6 +368,10 @@ impl ProjectFile {
     ) -> Result<(), StoreError> {
         if self.access == Access::ReadOnly {
             return Err(StoreError::ReadOnly);
+        }
+        // Checked before compressing: no reader would accept it.
+        if !u32::try_from(body.len()).is_ok_and(|n| n <= MAX_RAW) {
+            return Err(StoreError::TooLarge);
         }
         let packed = compress(body)?;
         let payload = tile_payload(key, op, header, body.len(), &packed)?;
@@ -401,11 +429,26 @@ impl ProjectFile {
     /// [`StoreError::Damaged`] if the record fails its checksum or doesn't decode as a tile of
     /// `key`, [`StoreError::Io`].
     pub fn read_tile(&self, key: &TileKey) -> Result<Option<TileBytes>, StoreError> {
+        self.read_tile_checked(key, |_| Ok(()))
+    }
+
+    /// As [`ProjectFile::read_tile`], with `check` run on the parsed record before its body is
+    /// decompressed.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::read_tile`], and `check`'s error.
+    fn read_tile_checked(
+        &self,
+        key: &TileKey,
+        check: impl FnOnce(&TileRecord<'_>) -> Result<(), StoreError>,
+    ) -> Result<Option<TileBytes>, StoreError> {
         let Some(&Loc { offset, len }) = self.live.get(key) else {
             return Ok(None);
         };
         let raw = self.read_record(offset, len)?;
         let tile = tile_record(&raw, key).ok_or(StoreError::Damaged { offset })?;
+        check(&tile)?;
         let body = decompress(tile.packed, tile.raw_len)
             .ok()
             .ok_or(StoreError::Damaged { offset })?;
@@ -435,12 +478,21 @@ impl ProjectFile {
     /// # Errors
     ///
     /// As [`ProjectFile::read_tile`], and [`StoreError::Codec`] if the payload isn't a valid
-    /// displacement tile.
+    /// displacement tile. The stated body size is checked against the header's side before
+    /// decompressing.
     pub fn read_displacement(
         &self,
         key: &TileKey,
     ) -> Result<Option<(OpId, CorrectionTile)>, StoreError> {
-        let Some(tile) = self.read_tile(key)? else {
+        let check = |tile: &TileRecord<'_>| {
+            let (_, body_len) = displacement_body_len(tile.header)?;
+            if tile.raw_len == body_len {
+                Ok(())
+            } else {
+                Err(CodecError::Size.into())
+            }
+        };
+        let Some(tile) = self.read_tile_checked(key, check)? else {
             return Ok(None);
         };
         Ok(Some((
@@ -731,7 +783,8 @@ fn read_index(file: &File, offset: u64, len: u64) -> io::Result<Option<Index>> {
 /// The live map of the Index at `offset`, or `None` if any Index of its chain is bad.
 ///
 /// Follows parent links back to a full Index, then applies it and the deltas oldest first. A chain
-/// that ends without a full Index is bad.
+/// that ends without a full Index is bad, and so is one with an entry outside the records before
+/// its Index.
 ///
 /// # Errors
 ///
@@ -743,6 +796,9 @@ fn load_chain(file: &File, offset: u64, len: u64) -> io::Result<Option<Chain>> {
         let Some(index) = read_index(file, at, len)? else {
             return Ok(None);
         };
+        if !index.entries_precede(at) {
+            return Ok(None);
+        }
         let (coverage, parent) = (index.coverage, index.parent);
         chain.push(index);
         match (coverage, parent) {
@@ -772,7 +828,7 @@ fn load_chain(file: &File, offset: u64, len: u64) -> io::Result<Option<Chain>> {
 ///
 /// # Errors
 ///
-/// [`StoreError::TooLarge`] if the header or body exceeds its length field.
+/// [`StoreError::TooLarge`] if the header exceeds its length field or the body [`MAX_RAW`].
 fn tile_payload(
     key: TileKey,
     op: OpId,
@@ -781,7 +837,10 @@ fn tile_payload(
     packed: &[u8],
 ) -> Result<Vec<u8>, StoreError> {
     let header_len = u16::try_from(header.len()).or(Err(StoreError::TooLarge))?;
-    let raw_len = u32::try_from(raw_len).or(Err(StoreError::TooLarge))?;
+    let raw_len = u32::try_from(raw_len)
+        .ok()
+        .filter(|&n| n <= MAX_RAW)
+        .ok_or(StoreError::TooLarge)?;
     let mut out = Vec::with_capacity(KEY_LEN + 14 + header.len() + packed.len());
     put_key(&mut out, &key);
     out.extend_from_slice(&op.to_bits().to_le_bytes());
@@ -792,14 +851,15 @@ fn tile_payload(
     Ok(out)
 }
 
-/// Parses [`tile_payload`]'s output; `None` on any shortfall or an invalid key.
+/// Parses [`tile_payload`]'s output; `None` on any shortfall, an invalid key or a decompressed
+/// size over [`MAX_RAW`].
 fn parse_tile_payload(payload: &[u8]) -> Option<TileRecord<'_>> {
     let mut r = Reader::new(payload);
     let key = r.key()?;
     let op = OpId::from_bits(r.u64()?)?;
     let header_len = r.u16()?;
     let header = r.take(usize::from(header_len))?;
-    let raw_len = usize::try_from(r.u32()?).ok()?;
+    let raw_len = usize::try_from(r.u32().filter(|&n| n <= MAX_RAW)?).ok()?;
     Some(TileRecord {
         key,
         op,
@@ -880,6 +940,9 @@ fn parse_index_payload(payload: &[u8]) -> Option<Index> {
         entries,
     })
 }
+
+#[cfg(test)]
+mod adversarial;
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]

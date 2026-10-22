@@ -17,5 +17,5 @@ mod test_dir;
 
 pub use codec::CodecError;
 pub use feed::{ChangeFeed, ConsumerId};
-pub use file::{ProjectFile, StoreError, TileBytes, compact};
+pub use file::{MAX_RAW, ProjectFile, StoreError, TileBytes, compact};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
