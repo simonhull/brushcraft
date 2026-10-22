@@ -5,6 +5,7 @@
 mod bytes;
 mod codec;
 mod crc;
+mod feed;
 mod file;
 mod op;
 mod record;
@@ -12,5 +13,6 @@ mod record;
 mod test_dir;
 
 pub use codec::CodecError;
+pub use feed::{ChangeFeed, ConsumerId};
 pub use file::{ProjectFile, StoreError, TileBytes, compact};
 pub use op::{MAX_SEQ, OpId};

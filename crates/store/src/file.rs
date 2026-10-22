@@ -405,9 +405,11 @@ impl ProjectFile {
         )))
     }
 
-    /// Makes every write so far durable and records a save point: an Index naming the live tiles
-    /// (in full every [`FULL_EVERY`]th time and the first, else only those written since the last
-    /// save). Returns the save point's offset, for [`ProjectFile::open_at`].
+    /// Makes every write so far durable and records a save point. Returns its offset, for
+    /// [`ProjectFile::open_at`].
+    ///
+    /// The save point is an Index naming the live tiles: all of them the first time and every 16th
+    /// time, otherwise only those written since the last save.
     ///
     /// # Errors
     ///
