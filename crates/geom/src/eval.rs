@@ -27,11 +27,15 @@ pub trait PositionSource {
 /// A block of evaluated positions: `side²` vertices, row-major.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Grid {
+    /// Vertices per side.
     side: u32,
+    /// The `side²` positions, row-major.
     data: Vec<Vec3>,
 }
 
 impl Grid {
+    /// A grid of `side` vertices per side holding `data`, row-major; the caller makes `data`
+    /// `side²` long.
     pub(crate) const fn from_parts(side: u32, data: Vec<Vec3>) -> Self {
         Self { side, data }
     }
@@ -110,7 +114,10 @@ const fn check_buffer(out: &[Vec3], expected: usize) -> Result<(), EvalError> {
 
 /// The parent level's block, ring and base-vertex rings.
 struct Parent {
+    /// The block with its one-vertex ring, each vertex read from its owner's copy.
     padded: Padded,
+    /// Per block corner (`(0, 0)`, `(q, 0)`, `(q, q)`, `(0, q)`), the ring of the base vertex
+    /// there; `None` where the corner isn't a base vertex.
     corners: [Option<CornerRing>; 4],
 }
 
@@ -194,9 +201,13 @@ fn gather(mesh: &BaseMesh, src: &impl PositionSource, region: Region) -> Result<
 /// project its deltas into frames and to re-apply corrections without predicting again.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prediction {
+    /// The block predicted.
     region: Region,
+    /// The predicted positions of the block and its one-vertex ring (the frames' central
+    /// differences read the ring at the block's edges); ring slots that would need a missing
+    /// diagonal are NaN.
     predicted: Padded,
-    /// Row-major, `(quads + 1)²`.
+    /// Each vertex's tangent frame, row-major, `(quads + 1)²`.
     frames: Vec<Frame>,
 }
 

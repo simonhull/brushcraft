@@ -25,7 +25,9 @@ pub(crate) struct Disconnected;
 /// The producer's end. Never blocks.
 #[derive(Debug)]
 pub(crate) struct Sender<T> {
+    /// The bounded channel's sending end.
     tx: SyncSender<T>,
+    /// Events dropped because the queue was full, shared with the [`Events`] end.
     dropped: Arc<AtomicU64>,
 }
 
@@ -50,7 +52,9 @@ impl<T> Sender<T> {
 /// Events from a backend, in the order they happened.
 #[derive(Debug)]
 pub struct Events<T> {
+    /// The bounded channel's receiving end.
     rx: Receiver<T>,
+    /// Events the producer dropped because the queue was full.
     dropped: Arc<AtomicU64>,
 }
 

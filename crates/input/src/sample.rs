@@ -49,7 +49,9 @@ impl TryFrom<f32> for Unit {
 /// positive `x` leaning right and positive `y` leaning towards the user (screen down).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Tilt {
+    /// Degrees from upright about the vertical axis, positive leaning right.
     x: f64,
+    /// Degrees from upright about the horizontal axis, positive leaning towards the user.
     y: f64,
 }
 

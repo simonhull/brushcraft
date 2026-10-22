@@ -10,29 +10,41 @@ use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_tool_v2::{
 use super::{State, surface_of};
 use crate::{Buttons, Dejitter, Event, Phase, Position, StrokeSample, SurfaceId, Tilt, Tool, Unit};
 
-/// Linux input codes for pen barrel buttons.
+/// Linux input code of the first pen barrel button.
 const BTN_STYLUS: u32 = 0x14B;
+/// Linux input code of the second pen barrel button.
 const BTN_STYLUS2: u32 = 0x14C;
+/// Linux input code of the third pen barrel button.
 const BTN_STYLUS3: u32 = 0x149;
 
 /// One tool's state between frames.
 #[derive(Debug, Default)]
 pub(super) struct ToolState {
+    /// What kind of tool it is, as announced.
     kind: Tool,
+    /// The surface it is over; `None` out of proximity.
     surface: Option<SurfaceId>,
+    /// The latest position, surface-local.
     pos: Position,
+    /// Whether the tip touches the tablet.
     contact: bool,
     /// Whether an axis or button changed since the last frame.
     changed: bool,
+    /// The latest tip pressure.
     pressure: Unit,
+    /// The latest hover distance; `None` until the tool reports one.
     distance: Option<Unit>,
+    /// The latest tilt; `None` until the tool reports one.
     tilt: Option<Tilt>,
+    /// The latest barrel rotation in degrees; `None` until the tool reports one.
     roll: Option<f64>,
+    /// The barrel buttons held.
     buttons: Buttons,
     /// Phase changes seen since the last frame, in order.
     pending: Vec<Phase>,
     /// The device time of the last frame, for samples synthesised between frames.
     device_ms: u32,
+    /// Recovers the tool's steady sample clock from the frames' receipt times.
     dejitter: Dejitter,
 }
 
@@ -188,6 +200,7 @@ impl ToolState {
     }
 }
 
+/// The tool kind of a protocol tool type.
 const fn tool_kind(kind: Type) -> Tool {
     match kind {
         Type::Eraser => Tool::Eraser,
@@ -202,6 +215,7 @@ const fn tool_kind(kind: Type) -> Tool {
     }
 }
 
+/// The barrel button a Linux input code names; `None` for any other button.
 const fn button_bit(code: u32) -> Option<Buttons> {
     match code {
         BTN_STYLUS => Some(Buttons::PRIMARY),

@@ -18,9 +18,16 @@ const TINY: f32 = Q_MAX * f32::MIN_POSITIVE;
 /// keeps seams closed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorrectionTile {
+    /// Vertices per side, at least 2.
     side: u32,
+    /// What one quantization step of the interior is worth: a component decodes as `q × scale`.
+    /// `+0.0` while the interior is all zero, else finite, positive and normal.
     scale: f32,
+    /// The `(side − 2)²` interior vertices, row-major, quantized with `scale`.
     interior: Vec<[i16; 3]>,
+    /// The `4 × (side − 1)` border vertices, exact: once round the tile counter-clockwise from
+    /// `(0, 0)`, along the bottom row, up the right column, back along the top row and down the
+    /// left column.
     border: Vec<Vec3>,
 }
 
@@ -67,9 +74,13 @@ pub enum CorrectionError {
 /// [`CorrectionViewMut::normalize_and_validate`] run).
 #[derive(Debug, Clone, Copy)]
 pub struct CorrectionView<'a> {
+    /// Vertices per side, at least 2.
     side: u32,
+    /// The interior's quantization step, as [`CorrectionTile`]'s.
     scale: f32,
+    /// The interior, row-major, at least `(side − 2)²` values (any more are ignored).
     interior: &'a [[i16; 3]],
+    /// The border ring, in [`CorrectionTile`]'s order, at least `4 × (side − 1)` values.
     border: &'a [Vec3],
 }
 
@@ -80,9 +91,13 @@ pub struct CorrectionView<'a> {
 /// [`CorrectionViewMut::normalize_and_validate`] before anything reads them.
 #[derive(Debug)]
 pub struct CorrectionViewMut<'a> {
+    /// Vertices per side, at least 2.
     side: u32,
+    /// The interior's quantization step, grown in place when a write needs more range.
     scale: &'a mut f32,
+    /// The interior, row-major, re-quantized in place when the scale grows.
     interior: &'a mut [[i16; 3]],
+    /// The border ring, in [`CorrectionTile`]'s order.
     border: &'a mut [Vec3],
 }
 

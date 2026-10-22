@@ -18,6 +18,7 @@ pub(crate) fn put_key(out: &mut Vec<u8>, key: &TileKey) {
 /// A cursor over a byte slice; every read returns `None` past the end.
 #[derive(Debug, Clone)]
 pub(crate) struct Reader<'a> {
+    /// The bytes not read yet.
     rest: &'a [u8],
 }
 

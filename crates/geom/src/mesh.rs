@@ -14,8 +14,12 @@ pub const MAX_VALENCE: usize = 32;
 /// A closed quad base mesh with its adjacency.
 #[derive(Debug, Clone)]
 pub struct BaseMesh {
+    /// Level 0's vertex positions, by vertex index.
     positions: Vec<Vec3>,
+    /// Each face's four vertex indices, counter-clockwise seen from outside: corners 0–3, at
+    /// grid positions `(0, 0)`, `(n, 0)`, `(n, n)` and `(0, n)`.
     faces: Vec<[u32; 4]>,
+    /// How the faces fit together, built once from `faces`.
     topology: Topology,
 }
 

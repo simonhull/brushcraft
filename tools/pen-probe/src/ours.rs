@@ -16,6 +16,7 @@ pub(crate) struct Stopped {
     pub(crate) result: anyhow::Result<()>,
 }
 
+/// The Wayland backend.
 #[cfg(target_os = "linux")]
 mod linux {
     use anyhow::{Context as _, Result};
@@ -29,7 +30,9 @@ mod linux {
     /// `input`'s Wayland backend, and the probe window's surface on it.
     #[derive(Debug)]
     pub(crate) struct Ours {
+        /// The backend, reading on its own thread.
         backend: PenBackend,
+        /// The probe window's surface, which the samples recorded must be over.
         surface: SurfaceId,
     }
 
@@ -82,6 +85,7 @@ mod linux {
     }
 }
 
+/// No backend: every platform but Linux.
 #[cfg(not(target_os = "linux"))]
 mod other {
     use anyhow::{Result, bail};

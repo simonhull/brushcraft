@@ -213,11 +213,17 @@ pub struct TileOutOfRange {
 /// one layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TileKey {
+    /// The layer the tile belongs to.
     layer: LayerId,
+    /// What the tile holds in that layer.
     channel: Channel,
+    /// The face it lies on.
     face: FaceId,
+    /// Its subdivision level.
     level: Level,
+    /// Its column in the face's tile grid at `level`.
     tx: u16,
+    /// Its row in the face's tile grid at `level`.
     ty: u16,
 }
 
@@ -364,10 +370,15 @@ impl TileKey {
 /// A square block of one face's grid at one level: quads `x0 .. x0 + quads` by `y0 .. y0 + quads`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Region {
+    /// The face the block lies on.
     face: FaceId,
+    /// The level of the face grid.
     level: Level,
+    /// The block's first column on the face grid.
     x0: u32,
+    /// The block's first row on the face grid.
     y0: u32,
+    /// Quads per side of the block.
     quads: u32,
 }
 

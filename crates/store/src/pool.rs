@@ -31,7 +31,9 @@ use thiserror::Error;
 /// can't tell two budgets apart.
 #[derive(Debug)]
 pub(crate) struct Budget {
+    /// Bytes the pools may hold together.
     limit: usize,
+    /// Bytes the pools' mapped chunks hold now: never more than `limit`.
     used: usize,
 }
 
@@ -817,14 +819,18 @@ impl<T: Pod> Pool<T> {
         )
     }
 
+    /// The bookkeeping of the slot at `pos`, mapped or not; `None` past the chunks ever mapped.
     fn meta_of(&self, (chunk, index): Pos) -> Option<&Meta> {
         self.meta.get(chunk as usize)?.get(index as usize)
     }
 
+    /// As [`Pool::meta_of`], mutably.
     fn meta_mut(&mut self, (chunk, index): Pos) -> Option<&mut Meta> {
         self.meta.get_mut(chunk as usize)?.get_mut(index as usize)
     }
 
+    /// The contents of the slot at `pos`, whatever it holds; `None` if its chunk isn't mapped.
+    /// Unlike [`Pool::get`], no handle is checked: for the pool's own passes over its slots.
     fn slot(&self, (chunk, index): Pos) -> Option<&T> {
         self.chunks
             .get(chunk as usize)?
@@ -832,6 +838,7 @@ impl<T: Pod> Pool<T> {
             .get(index as usize)
     }
 
+    /// As [`Pool::slot`], mutably.
     fn slot_mut(&mut self, (chunk, index): Pos) -> Option<&mut T> {
         self.chunks
             .get_mut(chunk as usize)?

@@ -120,7 +120,9 @@ pub struct TileBytes {
 /// overwritten while the file is open, so a location stays valid after later appends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Loc {
+    /// The record's first byte, from the start of the file.
     offset: u64,
+    /// The record's length in bytes, framing included.
     len: u64,
 }
 
@@ -137,7 +139,9 @@ enum Access {
 /// A lock on the project file: exclusive to write (or replace) it, shared to read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lock {
+    /// One holder only: the writer, or the source of an in-place compaction.
     Exclusive,
+    /// Any number of readers, and no writer.
     Shared,
 }
 
@@ -268,15 +272,20 @@ impl Repair {
 /// Whether an Index lists every live tile or only those changed since its parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Coverage {
+    /// Every live tile: loading stops at this Index.
     Full,
+    /// Only the tiles changed since the parent Index: loading reads the parent chain first.
     Delta,
 }
 
 /// A parsed Index payload.
 #[derive(Debug)]
 struct Index {
+    /// Whether the entries are every live tile or a delta on the parent.
     coverage: Coverage,
+    /// The offset of the Index saved before this one, if any.
     parent: Option<u64>,
+    /// The file's head op when this Index was saved; `None` before any edit.
     head: Option<OpId>,
     /// Sorted by key; `None` marks a removed tile.
     entries: Vec<(TileKey, Option<Loc>)>,
@@ -298,19 +307,26 @@ impl Index {
 /// The live map an Index and its parent chain describe.
 #[derive(Debug)]
 struct Chain {
+    /// Each live tile's latest record.
     live: BTreeMap<TileKey, Loc>,
     /// Delta indexes after the chain's full one.
     deltas: u32,
+    /// The head op of the chain's newest Index.
     head: Option<OpId>,
 }
 
 /// A parsed Tile payload, borrowing the record.
 #[derive(Debug)]
 struct TileRecord<'a> {
+    /// The tile written.
     key: TileKey,
+    /// The edit that wrote it.
     op: OpId,
+    /// The channel header, stored uncompressed.
     header: &'a [u8],
+    /// The body's length once decompressed.
     raw_len: usize,
+    /// The zstd-compressed body.
     packed: &'a [u8],
 }
 
@@ -322,13 +338,17 @@ pub struct ProjectFile {
     file: Arc<File>,
     /// Where the next record goes.
     end: u64,
+    /// Each live tile's latest record, saved or not: what reads find.
     live: BTreeMap<TileKey, Loc>,
     /// Entries written since the last Index.
     pending: BTreeMap<TileKey, Loc>,
+    /// The offset of the latest Index, the parent of the next one; `None` until the first save.
     last_index: Option<u64>,
     /// Delta indexes since the last full one.
     deltas: u32,
+    /// The greatest op written (see [`ProjectFile::head`]).
     head: Option<OpId>,
+    /// Whether writes are accepted.
     access: Access,
 }
 
@@ -879,8 +899,11 @@ impl FileReader {
 /// Reusable buffers for reading tiles: the record, its decompressed body and a zstd context.
 /// One per reading thread.
 pub(crate) struct ReadScratch {
+    /// The record as read from the file, framing included; grown to the largest record read.
     record: Vec<u8>,
+    /// The decompressed body; grown to the largest body read.
     raw: Vec<u8>,
+    /// The decompression context, kept so each read needn't make one.
     zstd: zstd::bulk::Decompressor<'static>,
 }
 

@@ -13,6 +13,7 @@ use crate::{
 /// An in-memory, sparse set of correction tiles. Absent tiles are all zero.
 #[derive(Debug, Clone, Default)]
 pub struct CorrectionMap {
+    /// The tiles holding a correction, by key: base-layer displacement tiles above level 0.
     tiles: HashMap<TileKey, CorrectionTile>,
 }
 

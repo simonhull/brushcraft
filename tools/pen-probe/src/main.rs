@@ -32,8 +32,11 @@ use winit::event::{
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+/// The canvas colour, `0RGB`: near black.
 const BACKGROUND: u32 = 0x0018_1818;
+/// The colour strokes are drawn in, `0RGB`: a warm white.
 const INK: u32 = 0x00E8_E0D0;
+/// A stamp's radius in pixels at full pressure, besides the one pixel every stamp has.
 const MAX_RADIUS: f64 = 12.0;
 
 /// Which path a sample came through.
@@ -46,8 +49,10 @@ enum Source {
 }
 
 impl Source {
+    /// Every source, in the order reports list them.
     const ALL: [Self; 2] = [Self::Winit, Self::Ours];
 
+    /// The source's name on the command line and in the CSV.
     const fn name(self) -> &'static str {
         match self {
             Self::Winit => "winit",
@@ -59,9 +64,12 @@ impl Source {
 /// Which sources a run records, from `--source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Selection {
+    /// winit's samples only.
     Winit,
+    /// Our backend's samples only.
     #[default]
     Ours,
+    /// Both, side by side, to compare them.
     Both,
 }
 
@@ -75,6 +83,7 @@ impl Selection {
     }
 }
 
+/// What the probe prints when its arguments don't parse.
 const USAGE: &str = "usage: pen-probe [--source winit|ours|both] [CSV], or pen-probe --report CSV";
 
 /// What the command line asks for.
@@ -82,7 +91,9 @@ const USAGE: &str = "usage: pen-probe [--source winit|ours|both] [CSV], or pen-p
 enum Command {
     /// Open the window, record, then write `output` and print the summary.
     Record {
+        /// The sources to record.
         selection: Selection,
+        /// Where the CSV goes.
         output: PathBuf,
     },
     /// Print the summary of a CSV the probe wrote earlier.
@@ -158,6 +169,7 @@ fn flag_value(
 /// One pen sample as the probe records it.
 #[derive(Debug, Clone)]
 struct Sample {
+    /// The path it came through.
     source: Source,
     /// When it was received (winit: event-loop thread; ours: input thread), since the probe
     /// started.
@@ -166,14 +178,19 @@ struct Sample {
     dejittered: Option<Duration>,
     /// Index of the event-loop wakeup that delivered this sample.
     wakeup: u64,
-    /// Position in physical pixels.
+    /// Horizontal position in physical pixels, from the window's left edge.
     x: f64,
+    /// Vertical position in physical pixels, from the window's top edge.
     y: f64,
+    /// Whether the tip touched the tablet.
     contact: bool,
+    /// Tip pressure, `0` to `1`; `None` if the source didn't report it.
     pressure: Option<f64>,
     /// Tilt in degrees.
     tilt: Option<(f64, f64)>,
+    /// Hover distance, `0` to `1`; `None` if the source didn't report it.
     distance: Option<f64>,
+    /// Barrel rotation in degrees; `None` if the source didn't report it.
     roll: Option<f64>,
     /// Our phase; `None` for winit samples.
     phase: Option<Phase>,
@@ -199,8 +216,10 @@ struct OursCounts {
 struct Recording {
     /// Which sources were recorded.
     selection: Selection,
+    /// The samples of every recorded source, in the order they were recorded.
     samples: Vec<Sample>,
-    /// `None` when the recording was read back from a CSV, which doesn't carry them.
+    /// What our backend delivered besides samples. `None` when the recording was read back from a
+    /// CSV, which doesn't carry them.
     ours_counts: Option<OursCounts>,
     /// Why our backend didn't run or stopped badly, if it did.
     note: Option<String>,
@@ -209,12 +228,16 @@ struct Recording {
 /// What the probe draws: stamped discs whose radius follows pressure.
 #[derive(Debug)]
 struct Canvas {
+    /// Width in pixels: the window surface's.
     width: usize,
+    /// Height in pixels: the window surface's.
     height: usize,
+    /// The pixels, `0RGB`, row-major.
     pixels: Vec<u32>,
 }
 
 impl Canvas {
+    /// A blank canvas of `width × height` pixels.
     fn new(width: usize, height: usize) -> Self {
         Self {
             width,
@@ -223,6 +246,7 @@ impl Canvas {
         }
     }
 
+    /// Fills the disc of `radius` pixels around `(x, y)` with ink, clipped to the canvas.
     fn stamp(&mut self, x: f64, y: f64, radius: f64) {
         let r2 = radius * radius;
         let (x0, x1) = span(x, radius, self.width);
@@ -261,27 +285,36 @@ fn span(centre: f64, radius: f64, len: usize) -> (usize, usize) {
 /// The recording, and the error that ended the run early, if one did.
 type Outcome = (Recording, Result<()>);
 
+/// The probe's window and recording, driven by winit's event loop.
 #[derive(Debug)]
 struct App {
+    /// When the probe started: sample times count from here.
     start: Instant,
+    /// Where the recording goes back to `main` when the window closes.
     done: mpsc::Sender<Outcome>,
     /// Declared before `surface`, so it drops (stopping the input thread) before the window does:
     /// the backend must stop before the window is destroyed. The order is load-bearing.
     backend: Option<ours::Ours>,
+    /// The window and its software surface, once the loop can create them.
     surface: Option<Surface<OwnedDisplayHandle, Box<dyn Window>>>,
+    /// What the window shows.
     canvas: Canvas,
     /// winit's view of whether the tip is down.
     contact: bool,
     /// winit's view of which barrel buttons are held.
     buttons: Buttons,
+    /// Event-loop wakeups so far, to tell which samples one wakeup delivered together.
     wakeup: u64,
     /// The window's scale factor, to put our logical positions in winit's physical pixels.
     scale: f64,
+    /// What our backend delivered besides samples so far.
     ours_counts: OursCounts,
+    /// What has been recorded so far.
     recording: Recording,
 }
 
 impl App {
+    /// A probe recording the sources of `selection`, which sends its recording to `done`.
     fn new(selection: Selection, done: mpsc::Sender<Outcome>) -> Self {
         Self {
             start: Instant::now(),
@@ -333,6 +366,8 @@ impl App {
         }
     }
 
+    /// Records `sample` if its source is selected, and stamps it on the canvas if it touches
+    /// and its source is the one drawn.
     fn record(&mut self, sample: Sample) {
         if !self.recording.selection.records(sample.source) {
             return;
@@ -346,6 +381,7 @@ impl App {
         self.recording.samples.push(sample);
     }
 
+    /// A sample of winit's at `(x, y)` (physical pixels), received now.
     fn winit_sample(&self, x: f64, y: f64, contact: bool, data: &TabletToolData) -> Sample {
         Sample {
             source: Source::Winit,
@@ -365,6 +401,7 @@ impl App {
         }
     }
 
+    /// A sample of our backend's, in the probe's terms: times since the start, physical pixels.
     fn our_sample(&self, s: &input::StrokeSample) -> Sample {
         let since_start = |t: Instant| t.saturating_duration_since(self.start);
         Sample {
@@ -492,6 +529,7 @@ impl App {
         Ok(())
     }
 
+    /// Asks the window for a redraw, if it exists yet.
     fn request_redraw(&self) {
         if let Some(surface) = &self.surface {
             surface.window().request_redraw();

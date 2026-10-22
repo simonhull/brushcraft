@@ -126,9 +126,11 @@ const SPREAD_SAMPLES: usize = 16;
 /// [`end_stroke`](Self::end_stroke) when the pen lifts.
 #[derive(Debug, Default)]
 pub struct Dejitter {
+    /// The current run of samples on one clock line; `None` between strokes.
     segment: Option<Segment>,
     /// Learned from a long fit and carried across strokes.
     seed: Option<Seed>,
+    /// The last time [`push`](Self::push) returned, which the next output never precedes.
     last_out: Option<Instant>,
 }
 
@@ -153,6 +155,7 @@ enum Period {
 }
 
 impl Period {
+    /// The period in seconds, seeded or fitted; `None` while unknown.
     const fn secs(self) -> Option<f64> {
         match self {
             Self::Unknown => None,
@@ -177,8 +180,11 @@ struct Seed {
 /// The clock line with the delay spread above it, all in seconds.
 #[derive(Clone, Copy, Debug)]
 struct Clock {
+    /// Seconds per slot: the line's slope.
     period: f64,
+    /// Seconds since the segment's origin at slot 0: the line's lower envelope.
     offset: f64,
+    /// The delay spread: how far samples lie above the line, at most.
     spread: f64,
 }
 
@@ -192,8 +198,11 @@ impl Clock {
 /// A run of samples on one clock line.
 #[derive(Debug)]
 struct Segment {
+    /// The receipt time of the segment's first sample, which is slot 0 at time 0.
     origin: Instant,
+    /// The latest samples, oldest first: at most [`WINDOW`], for the fit and the envelope.
     points: VecDeque<Point>,
+    /// The period the line uses: unknown, seeded or fitted.
     period: Period,
     /// The last output on the line, for the rise limit.
     last_line: Option<Point>,
@@ -263,6 +272,9 @@ impl Dejitter {
         self.segment = None;
     }
 
+    /// The de-jittered time of a sample received at `received`, before [`push`](Self::push)
+    /// clamps it: the segment's line at the sample's slot, or the receipt time itself when the
+    /// segment starts again or has no line yet.
     fn estimate(&mut self, received: Instant) -> Instant {
         let Some(segment) = self.segment.as_mut() else {
             return self.restart(received, self.seed);
@@ -288,6 +300,9 @@ impl Dejitter {
         }
     }
 
+    /// Starts a new segment at the sample received at `received`, with `seed`'s period if
+    /// there is one, and returns the receipt time: a segment's first sample has nothing to go
+    /// on.
     fn restart(&mut self, received: Instant, seed: Option<Seed>) -> Instant {
         self.segment = Some(Segment {
             origin: received,
@@ -511,6 +526,7 @@ impl Segment {
         }
     }
 
+    /// Slots from the first sample kept to the last.
     fn span(&self) -> f64 {
         match (self.points.front(), self.points.back()) {
             (Some(first), Some(last)) => last.slot - first.slot,

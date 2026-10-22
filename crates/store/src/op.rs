@@ -18,7 +18,9 @@ pub const RESERVED_SITE: u16 = u16::MAX;
 /// several sites needs an order of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OpId {
+    /// The machine or session that made the edit.
     site: u16,
+    /// The edit's place in its site's sequence, counting up from 0.
     seq: u64,
 }
 

@@ -21,6 +21,7 @@ const STROKE_GAP_S: f64 = 0.1;
 /// Below this many pixels per sample, position quantization dominates the speed estimate.
 const MIN_STEP_PX: f64 = 2.0;
 
+/// `v` as a float, for counts and pixel coordinates.
 #[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^52")]
 pub(crate) const fn to_f64(v: usize) -> f64 {
     v as f64
@@ -134,20 +135,35 @@ pub(crate) fn read_csv(path: &Path) -> Result<Recording> {
 /// Where each field is in a CSV row; `buttons` is missing from older CSVs.
 #[derive(Debug)]
 struct Columns {
+    /// The `source` column.
     source: usize,
+    /// The `received_s` column.
     received: usize,
+    /// The `dejittered_s` column.
     dejittered: usize,
+    /// The `wakeup` column.
     wakeup: usize,
+    /// The `x` column.
     x: usize,
+    /// The `y` column.
     y: usize,
+    /// The `contact` column.
     contact: usize,
+    /// The `pressure` column.
     pressure: usize,
+    /// The `tilt_x` column.
     tilt_x: usize,
+    /// The `tilt_y` column.
     tilt_y: usize,
+    /// The `distance` column.
     distance: usize,
+    /// The `roll` column.
     roll: usize,
+    /// The `phase` column.
     phase: usize,
+    /// The `buttons` column; `None` in a CSV from before it was added.
     buttons: Option<usize>,
+    /// The `device_ms` column.
     device_ms: usize,
 }
 
@@ -306,6 +322,8 @@ fn intervals(strokes: &[&[&Sample]], clock: Clock) -> Vec<f64> {
     dts
 }
 
+/// The value at fraction `p` (`0` to `1`) of `sorted`, rounded to the nearest rank; NaN when
+/// it is empty.
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     #[expect(
         clippy::cast_possible_truncation,
@@ -316,10 +334,12 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted.get(i).copied().unwrap_or(f64::NAN)
 }
 
+/// The arithmetic mean; NaN when `values` is empty.
 fn mean(values: &[f64]) -> f64 {
     values.iter().sum::<f64>() / to_f64(values.len())
 }
 
+/// The population standard deviation; NaN when `values` is empty.
 fn std_dev(values: &[f64]) -> f64 {
     let m = mean(values);
     (values.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / to_f64(values.len())).sqrt()
@@ -512,6 +532,7 @@ fn source_block(out: &mut String, source: Source, samples: &[&Sample]) -> fmt::R
     Ok(())
 }
 
+/// How `phase` is written in the CSV and the report.
 const fn phase_name(phase: Phase) -> &'static str {
     match phase {
         Phase::Enter => "enter",

@@ -8,8 +8,11 @@ use crate::{FaceId, Vec3};
 /// `b = n × t`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Frame {
+    /// The tangent: along the owner's grid u direction, in the tangent plane.
     t: Vec3,
+    /// The bitangent: `n × t`.
     b: Vec3,
+    /// The unit surface normal.
     n: Vec3,
 }
 
@@ -145,10 +148,20 @@ impl CornerAxes<'_> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Local {
     /// Derivatives along the owner's u and v: the normal is `du × dv`.
-    Derivatives { du: Vec3, dv: Vec3 },
+    Derivatives {
+        /// The derivative along the owner's u axis.
+        du: Vec3,
+        /// The derivative along the owner's v axis.
+        dv: Vec3,
+    },
     /// At a base vertex, from finite inputs: the owner's first-edge direction and the
     /// unnormalized ring normal.
-    Ring { du: Vec3, normal: Vec3 },
+    Ring {
+        /// The direction of the owner's first edge out of the vertex: the frame's u axis.
+        du: Vec3,
+        /// The ring normal, summed over the whole ring, not normalized.
+        normal: Vec3,
+    },
     /// At a base vertex whose ring isn't finite (or isn't known).
     NonFinite,
 }
@@ -167,12 +180,17 @@ impl Local {
 /// Where a block sits, so derivatives at shared vertices can be taken in the owner's orientation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Block<'a> {
+    /// The mesh's topology, for finding each shared vertex's owner.
     pub(crate) topology: &'a Topology,
+    /// The face the block lies on.
     pub(crate) face: FaceId,
     /// Quads per side of the face at this level.
     pub(crate) face_quads: u32,
+    /// The block's first column on the face grid.
     pub(crate) x0: u32,
+    /// The block's first row on the face grid.
     pub(crate) y0: u32,
+    /// Quads per side of the block.
     pub(crate) quads: u32,
 }
 

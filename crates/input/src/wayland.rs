@@ -94,7 +94,9 @@ pub fn surface_id(window: &impl HasWindowHandle) -> Result<SurfaceId, BackendErr
 /// Dropping it stops the thread.
 #[derive(Debug)]
 pub struct PenBackend {
+    /// The input thread, stopped and joined when the backend is.
     thread: InputThread,
+    /// Where the thread's events arrive.
     events: Events<Event>,
 }
 
@@ -105,6 +107,7 @@ struct InputThread {
     stop: Arc<OwnedFd>,
     /// Set by the thread as it exits, before its last `wake`.
     exited: Arc<AtomicBool>,
+    /// The thread, with what ended it; `None` once joined.
     handle: Option<JoinHandle<Result<(), BackendError>>>,
 }
 
@@ -316,8 +319,11 @@ fn retry_later<T>(result: Result<T, WaylandError>) -> Result<(), WaylandError> {
 /// before `_display`, which keeps the `wl_display` they point into alive. `Drop::drop` runs before
 /// any field is dropped, so its use of the connection is covered too.
 struct Worker<D> {
+    /// The thread's own event queue on the connection, which dispatches into `state`.
     queue: EventQueue<State>,
+    /// Everything the dispatch tracks.
     state: State,
+    /// The connection to the compositor, wrapping the application's `wl_display`.
     conn: Connection,
     /// An eventfd that [`PenBackend`] signals to stop the thread.
     stop: Arc<OwnedFd>,
@@ -399,18 +405,24 @@ impl<D> std::fmt::Debug for Worker<D> {
 
 /// Everything the input thread tracks.
 struct State {
+    /// The tablet manager global, which gives each seat its tablet seat.
     manager: ZwpTabletManagerV2,
+    /// Where events go, for [`PenBackend`]'s [`Events`].
     sender: Sender<Event>,
     /// Boxed so the many `Dispatch` impls below stay non-generic; called once per event.
     wake: Box<dyn Fn() + Send>,
     /// Seats by their `wl_seat` global's name, so a removed seat can be found.
     seats: HashMap<u32, Seat>,
+    /// Tablets announced and not yet removed, by object id.
     tablets: HashMap<ObjectId, ZwpTabletV2>,
+    /// Tools announced and not yet removed, by object id, with what each is in the middle of.
     tools: HashMap<ObjectId, (ZwpTabletToolV2, tool::ToolState)>,
+    /// Pads announced and not yet removed, by object id, with their controls.
     pads: HashMap<ObjectId, pad::Pad>,
 }
 
 impl State {
+    /// Queues `event` for the consumer and wakes it; nothing happens once the consumer is gone.
     fn emit(&self, event: Event) {
         // A disconnected consumer just means nobody is listening any more.
         if self.sender.send(event).is_ok() {
@@ -418,6 +430,8 @@ impl State {
         }
     }
 
+    /// Binds every `wl_seat` global the registry listed at startup (later ones arrive as
+    /// registry events).
     fn bind_existing_seats(&mut self, globals: &GlobalList, qh: &QueueHandle<Self>) {
         let seats: Vec<(u32, u32)> = globals.contents().with_list(|list| {
             list.iter()
@@ -430,12 +444,15 @@ impl State {
         }
     }
 
+    /// Binds the `wl_seat` global `name` (at most at the version with a destructor) and asks for
+    /// its tablet seat, whose tablets, tools and pads then arrive as events.
     fn add_seat(&mut self, registry: &WlRegistry, name: u32, version: u32, qh: &QueueHandle<Self>) {
         let seat: WlSeat = registry.bind(name, version.min(SEAT_RELEASE_VERSION), qh, ());
         let tablet = self.manager.get_tablet_seat(&seat, qh, ());
         self.seats.insert(name, Seat { seat, tablet });
     }
 
+    /// Destroys the seat bound from global `name`, if we bound it: the global was removed.
     fn remove_seat(&mut self, name: u32) {
         if let Some(seat) = self.seats.remove(&name) {
             seat.destroy();
@@ -460,7 +477,9 @@ const SEAT_RELEASE_VERSION: u32 = 5;
 
 /// A `wl_seat` we bound and the tablet seat we got for it.
 struct Seat {
+    /// The bound seat.
     seat: WlSeat,
+    /// Its tablet seat.
     tablet: ZwpTabletSeatV2,
 }
 
@@ -485,6 +504,8 @@ impl std::fmt::Debug for State {
     }
 }
 
+/// The id events on `surface` carry: the address of its `wl_proxy`, the same address
+/// [`surface_id`] reads from a window handle.
 fn surface_of(surface: &WlSurface) -> SurfaceId {
     SurfaceId::from_raw(surface.id().as_ptr().addr())
 }

@@ -8,7 +8,9 @@ use crate::{Channel, FaceId, LayerId, Level, MAX_VALENCE, MeshError, TileKey, Ve
 /// What lies across one edge of a face: the neighbour and the index of the same edge in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Across {
+    /// The face across the edge.
     pub(crate) face: FaceId,
+    /// The index (0–3) of the shared edge in that face.
     pub(crate) edge: u8,
 }
 
@@ -16,14 +18,20 @@ pub(crate) struct Across {
 /// Each entry is a face and the corner of it at this vertex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Ring {
+    /// The faces around the vertex with their corners at it, in rotation order, the owner
+    /// first: as many as the vertex's valence.
     pub(crate) entries: Vec<(FaceId, u8)>,
 }
 
 /// How a closed quad mesh's faces fit together.
 #[derive(Debug, Clone)]
 pub struct Topology {
+    /// Per face, what lies across each of its edges (edge `k` runs from corner `k` to
+    /// `k + 1`).
     across: Vec<[Across; 4]>,
+    /// Per face, the base vertex at each of its corners.
     corner_vertex: Vec<[u32; 4]>,
+    /// Per base vertex, the faces around it.
     rings: Vec<Ring>,
 }
 

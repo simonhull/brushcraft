@@ -7,6 +7,8 @@ const TABLE: [u32; 256] = table();
     clippy::indexing_slicing,
     reason = "const evaluation: i < 256 is checked by the loop and at compile time"
 )]
+/// The lookup table, built at compile time: entry `b` is the CRC register after feeding byte
+/// `b` into a zero register, eight reflected shifts with the polynomial.
 const fn table() -> [u32; 256] {
     let mut table = [0u32; 256];
     let mut i = 0;

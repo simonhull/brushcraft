@@ -9,7 +9,9 @@ use crate::{MAX_VALENCE, Vec3};
 /// axes. Slots without a value (the ring's four corners) hold NaN.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Padded {
+    /// Quads per side of the block, without the ring.
     quads: u32,
+    /// The `(quads + 3)²` slots, row-major from `(-1, -1)`.
     data: Vec<Vec3>,
 }
 
@@ -28,6 +30,7 @@ impl Padded {
         self.quads
     }
 
+    /// Where `(i, j)` is in `data`; `None` outside the block and its ring.
     fn index(&self, i: i64, j: i64) -> Option<usize> {
         let side = i64::from(self.quads) + 3;
         let (pi, pj) = (i + 1, j + 1);
@@ -66,8 +69,12 @@ impl Padded {
 /// ring doesn't allocate.
 #[derive(Debug, Clone)]
 pub(crate) struct CornerRing {
+    /// The base vertex itself.
     pub(crate) center: Vec3,
+    /// The edge neighbours, one per face around the vertex, in ring order; NaN past `valence`.
     edges: [Vec3; MAX_VALENCE],
+    /// The diagonal neighbours (each face's vertex opposite the centre), in ring order; NaN past
+    /// `valence`.
     diagonals: [Vec3; MAX_VALENCE],
     /// How many of `edges` and `diagonals` are the ring's.
     valence: usize,

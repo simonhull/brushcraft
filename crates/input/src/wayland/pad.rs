@@ -25,20 +25,27 @@ use crate::{ControlId, Event, PadEvent, PadEventKind, Unit};
 /// A pad and the controls it announced, so they can all be destroyed with it.
 #[derive(Debug)]
 pub(super) struct Pad {
+    /// The pad itself.
     proxy: ZwpTabletPadV2,
+    /// The groups it announced, each with its controls.
     groups: Vec<Group>,
 }
 
 /// A pad's group and its rings, strips and dials.
 #[derive(Debug)]
 struct Group {
+    /// The group itself.
     proxy: ZwpTabletPadGroupV2,
+    /// The touch rings the group announced.
     rings: Vec<ZwpTabletPadRingV2>,
+    /// The touch strips the group announced.
     strips: Vec<ZwpTabletPadStripV2>,
+    /// The dials the group announced.
     dials: Vec<ZwpTabletPadDialV2>,
 }
 
 impl Pad {
+    /// A pad just announced, before any of its groups.
     pub(super) const fn new(proxy: ZwpTabletPadV2) -> Self {
         Self {
             proxy,
@@ -75,6 +82,8 @@ fn emit(state: &State, kind: PadEventKind) {
     }));
 }
 
+/// The id a ring, strip or dial is reported with: its protocol object id, unique among the
+/// connection's live objects.
 fn control(proxy: &impl Proxy) -> ControlId {
     ControlId::from_raw(proxy.id().protocol_id())
 }
