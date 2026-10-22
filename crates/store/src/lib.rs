@@ -11,7 +11,17 @@ mod crc;
 mod feed;
 mod file;
 mod op;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the tile cache (next in M0b2) is its first user")
+)]
+mod pool;
 mod record;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the tile cache (next in M0b2) is its first user")
+)]
+mod slot;
 #[cfg(test)]
 mod test_dir;
 

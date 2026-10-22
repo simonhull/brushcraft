@@ -10,6 +10,7 @@ description = "Project file, out-of-core tile paging, tile pool, cache budget an
 workspace = true
 
 [dependencies]
+bytemuck.workspace = true
 geom.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
