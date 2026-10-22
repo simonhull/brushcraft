@@ -140,6 +140,74 @@ impl Topology {
         face.index() < self.face_count()
     }
 
+    /// The most faces around any one base vertex.
+    pub(crate) fn max_valence(&self) -> usize {
+        self.rings
+            .iter()
+            .map(|ring| ring.entries.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The most faces any face has within `steps` steps of it, itself included, where one step
+    /// reaches every face sharing a vertex with those reached so far.
+    ///
+    /// A breadth-first search from every face, stopping early once a search reaches the whole
+    /// mesh: `O(faces × neighbourhood)`.
+    pub(crate) fn widest_neighbourhood(&self, steps: u32) -> usize {
+        let faces = self.corner_vertex.len();
+        // Which search last reached each face and vertex, so the marks needn't be cleared
+        // between searches.
+        let mut face_seen = vec![usize::MAX; faces];
+        let mut vertex_seen = vec![usize::MAX; self.rings.len()];
+        let (mut frontier, mut next) = (Vec::new(), Vec::new());
+        let mut widest = 0;
+        for start in 0..faces {
+            if let Some(mark) = face_seen.get_mut(start) {
+                *mark = start;
+            }
+            frontier.clear();
+            frontier.push(start);
+            let mut reached = 1;
+            for _ in 0..steps {
+                if reached == faces {
+                    break;
+                }
+                next.clear();
+                let corners = frontier
+                    .iter()
+                    .filter_map(|&f| self.corner_vertex.get(f))
+                    .flatten();
+                for &v in corners {
+                    let Ok(v) = usize::try_from(v) else { continue };
+                    match vertex_seen.get_mut(v) {
+                        Some(mark) if *mark != start => *mark = start,
+                        _ => continue,
+                    }
+                    let around = self.rings.get(v).map_or(&[][..], |r| &r.entries);
+                    for &(g, _) in around {
+                        let Ok(g) = usize::try_from(g.index()) else {
+                            continue;
+                        };
+                        if let Some(mark) = face_seen.get_mut(g)
+                            && *mark != start
+                        {
+                            *mark = start;
+                            next.push(g);
+                            reached += 1;
+                        }
+                    }
+                }
+                std::mem::swap(&mut frontier, &mut next);
+            }
+            widest = widest.max(reached);
+            if widest == faces {
+                break;
+            }
+        }
+        widest
+    }
+
     /// What lies across edge `k` (0–3) of `face`, or `None` if either is out of range.
     pub(crate) fn across(&self, face: FaceId, k: u8) -> Option<Across> {
         self.across

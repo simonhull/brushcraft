@@ -8,7 +8,9 @@ use thiserror::Error;
 use crate::frame::{self, Block, CornerAxes, Frame, frames};
 use crate::subdiv::{CornerRing, Padded, extraordinary, predict, ring_edge_point};
 use crate::topology::{corner_at, edge_to_grid};
-use crate::{BaseMesh, Channel, FaceId, LayerId, Level, MAX_VALENCE, Region, TileKey, Vec3};
+use crate::{
+    BaseMesh, Channel, FaceId, LayerId, Level, MAX_VALENCE, Region, TILE_QUADS, TileKey, Vec3,
+};
 
 /// Read access to evaluated positions.
 ///
@@ -392,6 +394,39 @@ pub fn normal_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>
     // The same gather `normals` runs, so the list can't drift from the reads.
     gather(mesh, &recorder, region)?;
     Ok(recorder.0.into_inner())
+}
+
+/// The widest level of any tile's dependency cone: the most tiles of one level that evaluating a
+/// tile's positions, or its normals, reads, directly or through the tiles it is predicted from.
+///
+/// The cone of a tile is its own level's tiles to evaluate (the tile, or for its normals the
+/// tiles of [`normal_tiles`]), then level by level down to level 1 every tile [`parent_tiles`]
+/// lists for a tile of the level above. A cache that evaluates a tile coarse to fine, holding
+/// one level's tiles while it builds the next, needs room for two such levels.
+///
+/// The bound is the larger of two counts, one per kind of level:
+///
+/// - **Levels holding several tiles per face** (finer than `log2(TILE_QUADS)`): a cone's tiles
+///   there are a 3 × 3 block around the tile, across face edges where it reaches them, with the
+///   corner tiles of every face around a base vertex in place of the block's regular corner: at
+///   most `max(valence, 4) + 5`.
+/// - **Levels where a tile is a whole face**: [`parent_tiles`] of a face is every face sharing a
+///   vertex with it, so each coarser level reaches one ring of faces further. A cone enters these
+///   levels at most one ring out from its tile's face and descends `log2(TILE_QUADS)` of them, so
+///   its widest level is at most the most faces within `log2(TILE_QUADS) + 1` rings of any face
+///   (never more than the mesh).
+///
+/// The first is the count observed on every tile of meshes up to valence [`MAX_VALENCE`] (see the
+/// tests), not derived from the gather; the second follows from the face rings.
+///
+/// Computed with a breadth-first search from every face: run it once per mesh.
+#[must_use]
+pub fn cone_width(mesh: &BaseMesh) -> usize {
+    let topology = mesh.topology();
+    let face_levels = TILE_QUADS.trailing_zeros();
+    let tiled = topology.max_valence().max(4) + 5;
+    let whole_faces = topology.widest_neighbourhood(face_levels + 1);
+    tiled.max(whole_faces)
 }
 
 /// Unit normals of `region`'s evaluated positions in `src` (same level).
@@ -1016,6 +1051,80 @@ mod tests {
             regions.extend(whole_faces(&mesh));
             assert_normal_tiles_suffice(&mesh, &dense, &regions);
         }
+    }
+
+    /// The widest level of the dependency cones of every tile of levels `from..=to` of `mesh`, and
+    /// of their normals' inputs, followed down to level `floor` (1 for whole cones).
+    fn widest_cone(mesh: &BaseMesh, from: u8, to: u8, floor: u8) -> usize {
+        let mut parents: HashMap<TileKey, BTreeSet<TileKey>> = HashMap::new();
+        let mut widest = 0;
+        for l in from..=to {
+            let per_side = u16::try_from(level(l).tiles_per_side()).unwrap();
+            for face in mesh.faces() {
+                for (tx, ty) in (0..per_side).flat_map(|ty| (0..per_side).map(move |tx| (tx, ty))) {
+                    let key = TileKey::displacement(face, level(l), tx, ty).unwrap();
+                    let mut inputs = normal_tiles(mesh, Region::of_tile(&key)).unwrap();
+                    inputs.insert(key);
+                    for mut cone in [BTreeSet::from([key]), inputs] {
+                        widest = widest.max(cone.len());
+                        while cone.first().is_some_and(|k| k.level() > level(floor)) {
+                            for t in &cone {
+                                parents.entry(*t).or_insert_with(|| {
+                                    parent_tiles(mesh, Region::of_tile(t)).unwrap()
+                                });
+                            }
+                            cone = cone
+                                .iter()
+                                .filter_map(|t| parents.get(t))
+                                .flatten()
+                                .copied()
+                                .collect();
+                            widest = widest.max(cone.len());
+                        }
+                    }
+                }
+            }
+        }
+        widest
+    }
+
+    #[test]
+    fn cone_width_bounds_every_cone() {
+        use crate::reference::prism;
+        let cube = cube_sphere(1).unwrap();
+        assert_eq!(
+            widest_cone(&cube, 1, 9, 1),
+            cone_width(&cube),
+            "the cube: a level-8 tile's normals read a 3 × 3 block"
+        );
+        // Whole cones of every tile, on meshes with valence 3 to 8.
+        let meshes = [
+            cube_sphere(2).unwrap(),
+            pentagonal_prism().subdivide().to_base_mesh(),
+            prism(8).subdivide().to_base_mesh(),
+        ];
+        for mesh in &meshes {
+            let (widest, width) = (widest_cone(mesh, 1, 8, 1), cone_width(mesh));
+            assert!(
+                widest <= width,
+                "{} faces: a cone {widest} tiles wide, over the bound {width}",
+                mesh.face_count()
+            );
+        }
+        // The highest valence, where the multi-tile levels' count is what matters: their cones
+        // into the first two whole-face levels.
+        let mesh = prism(MAX_VALENCE).subdivide().to_base_mesh();
+        let tiled = widest_cone(&mesh, 7, 8, 5);
+        assert!(
+            tiled <= cone_width(&mesh),
+            "valence {MAX_VALENCE}: {tiled} tiles, over {}",
+            cone_width(&mesh)
+        );
+        assert_eq!(
+            cone_width(&mesh),
+            usize::try_from(mesh.face_count()).unwrap(),
+            "a small mesh's whole-face levels reach all of it"
+        );
     }
 
     #[test]

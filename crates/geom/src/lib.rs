@@ -20,8 +20,8 @@ mod topology;
 pub use correction::{CorrectionError, CorrectionTile, CorrectionView, CorrectionViewMut};
 pub use dense::{CorrectionMap, DenseEvaluation};
 pub use eval::{
-    EvalError, Grid, PositionSource, Prediction, evaluate_region, normal_tiles, normals,
-    normals_into, parent_tiles, predict_region,
+    EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,
+    normals, normals_into, parent_tiles, predict_region,
 };
 pub use frame::Frame;
 pub use key::{
