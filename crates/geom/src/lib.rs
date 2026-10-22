@@ -15,7 +15,9 @@ pub use key::{
     TileOutOfRange, VertexId,
 };
 mod correction;
+mod dense;
 mod eval;
+pub use dense::{CorrectionMap, DenseEvaluation};
 mod frame;
 pub use correction::{CorrectionError, CorrectionTile};
 pub use eval::{EvalError, Grid, PositionSource, evaluate_region};
