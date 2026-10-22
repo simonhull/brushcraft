@@ -28,6 +28,7 @@ use std::thread::{self, JoinHandle};
 
 use geom::TileKey;
 
+use crate::OpId;
 use crate::file::{BaseFile, FileReader, Loc, ProjectFile, ReadScratch, StoreError};
 use crate::slot::CorrectionSlot;
 
@@ -62,13 +63,15 @@ pub(crate) struct Job {
     pub(crate) loc: Loc,
 }
 
-/// A worker's result: the job, and the decoded tile or why it couldn't be read.
+/// A worker's result: the job, and the decoded tile with the op its record carries, or why it
+/// couldn't be read.
 #[derive(Debug)]
 pub(crate) struct Fetched {
     /// The job this answers.
     pub(crate) job: Job,
-    /// The decoded tile, boxed so the channel moves a pointer, not the slot.
-    pub(crate) slot: Result<Box<CorrectionSlot>, StoreError>,
+    /// The op of the record read and the decoded tile, boxed so the channel moves a pointer,
+    /// not the slot.
+    pub(crate) slot: Result<(OpId, Box<CorrectionSlot>), StoreError>,
 }
 
 /// The queue the owner fills and the workers drain, behind the [`Shared`] mutex.
@@ -338,7 +341,7 @@ impl Worker {
             let read = reader.map_or(Err(StoreError::Closed), |reader| {
                 reader.read_displacement_into(&job.key, job.loc, &mut slot, &mut self.scratch)
             });
-            let slot = read.map(|_| slot);
+            let slot = read.map(|op| (op, slot));
             if self.send.send(Fetched { job, slot }).is_err() {
                 return;
             }

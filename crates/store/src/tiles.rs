@@ -487,8 +487,12 @@ pub struct TileStore {
     /// recovery flush cuts ([`TileStore::open_cut`]); a save records it, and a rebase refuses a
     /// save made before a later write.
     last_write: Stamp,
-    /// The newest op of any edit so far.
-    latest_edit: Option<OpId>,
+    /// The op of the record each clean resident correction slot holds, where it has one:
+    /// recorded when a slot is filled from a record, or cleaned by writing one. A clean slot
+    /// whose record can't be read back any more is written again labelled with this op (see
+    /// [`TileStore::fill_roll_over`]), never with one that didn't edit it. Entries of tiles
+    /// no longer resident are never read, and go at the next rebase or roll-over.
+    known_ops: HashMap<TileKey, OpId>,
     /// Counts the working files the store has had: a rebase moves it on, so a recovery flush
     /// started before can tell it would finish in the wrong file.
     generation: u64,
@@ -634,7 +638,9 @@ pub(crate) struct Dirty {
 }
 
 /// Appends a dirty correction slot's tile to the working file, with the op of its latest write
-/// (no save point), and forgets the write: the slot is clean once this returns.
+/// (no save point), and returns that op.
+///
+/// The write is forgotten: the slot is clean once this returns.
 ///
 /// # Errors
 ///
@@ -645,7 +651,7 @@ fn write_slot(
     unsaved: &mut HashMap<TileKey, Dirty>,
     key: TileKey,
     slot: &CorrectionSlot,
-) -> Result<(), CacheError> {
+) -> Result<OpId, CacheError> {
     let Dirty { op, stamp } = unsaved
         .get(&key)
         .copied()
@@ -654,7 +660,7 @@ fn write_slot(
     file.write_displacement_stamped(key, op, stamp, &tile)
         .map_err(CacheError::WriteBack)?;
     unsaved.remove(&key);
-    Ok(())
+    Ok(op)
 }
 
 /// The first op the store hands out for `site` after the files' `heads`: the next after the
@@ -850,7 +856,7 @@ impl TileStore {
             unsaved: HashMap::new(),
             since_rebase,
             last_write: Stamp::ZERO,
-            latest_edit: None,
+            known_ops: HashMap::new(),
             generation: 0,
             feed,
             save_consumer,
@@ -998,13 +1004,14 @@ impl TileStore {
             None => None,
         };
         // The save wrote every dirty slot as it is now (no edit since), so none is unsaved.
-        let dirty: Vec<TileKey> = self.unsaved.keys().copied().collect();
-        for key in dirty {
+        let dirty: Vec<(TileKey, Dirty)> = self.unsaved.drain().collect();
+        for (key, write) in dirty {
             if let Some(id) = self.corrections.find(&key) {
                 self.corrections.set_dirty(id, false)?;
+                self.known_ops.insert(key, write.op);
             }
         }
-        self.unsaved.clear();
+        self.prune_known_ops();
         self.since_rebase.clear();
         self.generation += 1;
         // The old workers read the old files; dropping them joins them and drops their results.
@@ -1022,10 +1029,11 @@ impl TileStore {
     /// Every tile of the old working file and every dirty slot is written to `fresh`, read
     /// through the store: a dirty slot as it is, with the op of its latest write; any other
     /// tile as the old file's record, copied after its checksum is checked. A clean resident
-    /// tile whose record no longer reads is written from its slot, labelled with the newest edit
-    /// (its own op can't be read back). A tile that can be read neither way, or a broken slot,
-    /// is lost: listed, and left out. Then `fresh` is saved (synced, a save point, synced
-    /// again).
+    /// tile whose record no longer reads is written from its slot, which holds what the record
+    /// did, labelled with the record's op as the store last knew it (see
+    /// [`TileStore::known_ops`]): never with an op that didn't edit it. A tile that can be read
+    /// neither way, or a broken slot, is lost: listed, and left out. Then `fresh` is saved
+    /// (synced, a save point, synced again).
     ///
     /// # Errors
     ///
@@ -1064,7 +1072,7 @@ impl TileStore {
                         continue;
                     }
                     // Unreadable (or, impossibly, gone): only the slot holds it now.
-                    Ok(None) | Err(_) if resident.is_some() => self.latest_edit,
+                    Ok(None) | Err(_) if resident.is_some() => self.known_ops.get(&key).copied(),
                     Ok(None) | Err(_) => None,
                 },
             };
@@ -1118,8 +1126,11 @@ impl TileStore {
         }
         for (key, id) in cleaned {
             self.corrections.set_dirty(id, false)?;
-            self.unsaved.remove(&key);
+            if let Some(write) = self.unsaved.remove(&key) {
+                self.known_ops.insert(key, write.op);
+            }
         }
+        self.prune_known_ops();
         let marks: Vec<ConsumerId> = self.streams.keys().copied().collect();
         for id in marks {
             if let Some(mark) = self.streams.get_mut(&id) {
@@ -1138,6 +1149,13 @@ impl TileStore {
         let drained = self.feed.drain(self.save_consumer);
         self.since_rebase
             .extend(drained.into_iter().map(|(key, _)| key));
+    }
+
+    /// Drops the [`TileStore::known_ops`] of tiles no longer resident.
+    fn prune_known_ops(&mut self) {
+        let corrections = &self.corrections;
+        self.known_ops
+            .retain(|key, _| corrections.find(key).is_some());
     }
 
     /// Whether the store holds edits no save has made part of a save point of the project
@@ -1454,8 +1472,9 @@ impl TileStore {
                 && self.corrections.is_dirty(id) == Some(true)
             {
                 let slot = self.corrections.get(id).ok_or(Invariant::StaleHandle)?;
-                write_slot(&mut self.file, &mut self.unsaved, key, slot)?;
+                let op = write_slot(&mut self.file, &mut self.unsaved, key, slot)?;
                 self.corrections.set_dirty(id, false)?;
+                self.known_ops.insert(key, op);
             }
         }
         Ok(self.file.save()?)
@@ -1597,6 +1616,7 @@ impl TileStore {
                     if unchanged {
                         self.unsaved.remove(&key);
                         self.corrections.set_dirty(found, false)?;
+                        self.known_ops.insert(key, tile.op());
                     }
                     unchanged
                 }
@@ -1669,7 +1689,7 @@ impl TileStore {
         evaluated?;
         let (file, unsaved) = (&mut self.file, &mut self.unsaved);
         self.corrections
-            .evict_all(|key, slot| write_slot(file, unsaved, key, slot))?;
+            .evict_all(|key, slot| write_slot(file, unsaved, key, slot).map(drop))?;
         Ok(())
     }
 
@@ -1736,10 +1756,10 @@ impl TileStore {
     pub fn poll(&mut self) -> Result<usize, CacheError> {
         let mut installed = 0;
         while let Some(Fetched { job, slot }) = self.prefetch.next() {
-            let Ok(slot) = slot else { continue };
+            let Ok((op, slot)) = slot else { continue };
             let current = self.locate(&job.key) == Some((job.source, job.loc));
             let outcome = if current {
-                self.install(job.key, &slot)
+                self.install(job.key, op, &slot)
             } else {
                 Ok(false)
             };
@@ -1758,15 +1778,20 @@ impl TileStore {
         self.prefetch.pending()
     }
 
-    /// Puts a prefetched correction tile, read at its latest record, into a fresh slot; whether
-    /// it did. A resident tile (every dirty tile is resident) is left alone, and so is the tile
-    /// when the correction pool has no slot to give without writing a dirty tile back or taking
-    /// memory from the evaluated pool (see [`Pool::acquire_clean`]).
+    /// Puts a prefetched correction tile, read at its latest record (written by `op`), into a
+    /// fresh slot; whether it did. A resident tile (every dirty tile is resident) is left alone,
+    /// and so is the tile when the correction pool has no slot to give without writing a dirty
+    /// tile back or taking memory from the evaluated pool (see [`Pool::acquire_clean`]).
     ///
     /// # Errors
     ///
     /// [`CacheError::Internal`] if the fresh slot's handle went stale (it doesn't).
-    fn install(&mut self, key: TileKey, tile: &CorrectionSlot) -> Result<bool, CacheError> {
+    fn install(
+        &mut self,
+        key: TileKey,
+        op: OpId,
+        tile: &CorrectionSlot,
+    ) -> Result<bool, CacheError> {
         if self.corrections.find(&key).is_some() {
             return Ok(false);
         }
@@ -1776,6 +1801,7 @@ impl TileStore {
             Err(e) => return Err(e.into()),
         };
         *self.corrections.get_mut(id).ok_or(Invariant::StaleHandle)? = *tile;
+        self.known_ops.insert(key, op);
         #[cfg(test)]
         {
             self.log.prefetched += 1;
@@ -1939,16 +1965,25 @@ impl TileStore {
             read
         };
         let filled = match read {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(op)) => Ok(Some(op)),
             Ok(None) => slot
                 .reset(key.side())
+                .map(|()| None)
                 .map_err(|e| Invariant::CorrectionSlot(e).into()),
             Err(e) => Err(e.into()),
         };
-        if let Err(e) = filled {
-            // The slot holds no tile: give it back (it is clean and unpinned).
-            self.corrections.remove(&key)?;
-            return Err(e);
+        match filled {
+            Ok(Some(op)) => {
+                self.known_ops.insert(key, op);
+            }
+            Ok(None) => {
+                self.known_ops.remove(&key);
+            }
+            Err(e) => {
+                // The slot holds no tile: give it back (it is clean and unpinned).
+                self.corrections.remove(&key)?;
+                return Err(e);
+            }
         }
         Ok(id)
     }
@@ -1984,7 +2019,7 @@ impl TileStore {
         for attempt in 0..2 {
             let (file, unsaved) = (&mut self.file, &mut self.unsaved);
             match self.corrections.acquire(key, &mut self.budget, |k, slot| {
-                write_slot(file, unsaved, k, slot)
+                write_slot(file, unsaved, k, slot).map(drop)
             }) {
                 Err(PoolError::Full) if attempt == 0 => {
                     if !self.make_room(self.corrections.chunk_bytes())? {
@@ -2064,7 +2099,7 @@ impl TileStore {
             let (file, unsaved) = (&mut self.file, &mut self.unsaved);
             self.corrections
                 .shrink_to(&mut self.budget, bytes, |key, slot| {
-                    write_slot(file, unsaved, key, slot)
+                    write_slot(file, unsaved, key, slot).map(drop)
                 })?;
         }
         Ok(())
@@ -2122,7 +2157,6 @@ impl TileStore {
             },
         );
         self.feed.push(key, op);
-        self.latest_edit = self.latest_edit.max(Some(op));
         self.corrections.set_dirty(id, true)?;
         Ok(())
     }

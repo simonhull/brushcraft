@@ -811,16 +811,7 @@ fn a_roll_over_carries_every_edit_and_lists_what_it_cannot_read() {
         .keys()
         .find(|key| store.corrections.find(key).is_none())
         .unwrap();
-    let loc = store.file.locate(&damaged).unwrap();
-    let mut bytes = std::fs::read(&path).unwrap();
-    let at = usize::try_from(loc.middle()).unwrap();
-    bytes[at] ^= 0x40;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .write_all_at(&bytes[at..=at], loc.middle())
-        .unwrap();
+    damage(&path, store.file.locate(&damaged).unwrap());
 
     let meta = store.file.meta().clone();
     let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
@@ -845,4 +836,60 @@ fn a_roll_over_carries_every_edit_and_lists_what_it_cannot_read() {
     for key in &dirty {
         assert!(file.contains(key), "{key:?}: a dirty slot carried across");
     }
+}
+
+/// Flips a bit in the middle of the record at `loc` of the file at `path`, from outside, as a
+/// bad sector would: the record fails its checksum.
+fn damage(path: &std::path::Path, loc: Loc) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let at = usize::try_from(loc.middle()).unwrap();
+    bytes[at] ^= 0x40;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .write_all_at(&bytes[at..=at], loc.middle())
+        .unwrap();
+}
+
+/// A clean resident tile whose record no longer reads is carried across a roll-over from its
+/// slot, labelled with the op of the record the slot holds: never a newer edit's, which never
+/// touched it.
+#[test]
+fn a_roll_over_labels_an_unreadable_clean_tile_with_its_own_op() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let (t, later) = (top[3], top[20]);
+    let mut map = CorrectionMap::new();
+    let own = edit_interior(&mut store, &mut map, t, Vec3::new(0.0, 0.0, 0.25));
+    writer.finish(&mut store, Instant::now()).unwrap();
+    let slot = store.corrections.find(&t).unwrap();
+    assert_eq!(
+        store.corrections.is_dirty(slot),
+        Some(false),
+        "flushed: clean"
+    );
+    let newest = edit_interior(&mut store, &mut map, later, Vec3::new(0.0, 0.25, 0.0));
+    assert!(newest > own, "a newer edit, of another tile");
+    damage(&path, store.file.locate(&t).unwrap());
+    assert!(
+        store.file.read_tile_record(&t).is_err(),
+        "t's record is damaged"
+    );
+
+    let meta = store.file.meta().clone();
+    let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
+    let filled = store.fill_roll_over(fresh).unwrap();
+    let (old, lost) = store.roll_over(filled).unwrap();
+    drop(old);
+    assert_eq!(lost, [], "nothing lost: the slot holds t");
+    let (op, _) = store.file.read_displacement(&t).unwrap().unwrap();
+    assert_eq!(op, own, "labelled with its own op");
+    store.evict_all().unwrap();
+    assert_positions(&mut store, &dense(&mesh, &map), &top, "carried across");
+    writer.close(&mut store, Instant::now()).unwrap();
 }

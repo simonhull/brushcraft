@@ -1560,6 +1560,11 @@ impl FramedTile {
         self.key
     }
 
+    /// The edit the record is written with.
+    pub(crate) const fn op(&self) -> OpId {
+        self.op
+    }
+
     /// The stamp of the store's write the record copies.
     pub(crate) const fn stamp(&self) -> Stamp {
         self.stamp
