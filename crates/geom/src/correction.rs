@@ -38,11 +38,14 @@ pub enum CorrectionError {
         side: u32,
     },
     /// The face isn't in the mesh.
-    #[error("face {0:?} is not in the mesh")]
+    #[error("face {0} is not in the mesh")]
     UnknownFace(FaceId),
     /// A component is NaN or infinite.
     #[error("correction is not finite")]
     NotFinite,
+    /// Level 0 is the base mesh; it has no corrections.
+    #[error("level 0 is the base mesh and has no corrections")]
+    LevelZero,
     /// Tiles have at least 2 vertices per side.
     #[error("a tile needs at least 2 vertices per side, got {0}")]
     BadSide(u32),
@@ -111,7 +114,8 @@ impl CorrectionTile {
     /// # Errors
     ///
     /// [`CorrectionError::BadSide`] or [`CorrectionError::BadParts`] if the lengths don't match
-    /// `side`, the scale is negative or not finite, or a border value is not finite.
+    /// `side`, the scale is negative, subnormal or not finite, the scale is zero but the interior
+    /// isn't (it would decode to zero), or a border value is not finite.
     pub fn from_parts(
         side: u32,
         scale: f32,
@@ -122,7 +126,8 @@ impl CorrectionTile {
         let ok = interior.len() == ni
             && border.len() == nb
             && scale.is_finite()
-            && scale >= 0.0
+            && (scale == 0.0 || scale >= f32::MIN_POSITIVE)
+            && (scale != 0.0 || interior.iter().all(|q| *q == [0; 3]))
             && border.iter().all(|v| v.is_finite())
             && interior.iter().flatten().all(|q| *q != i16::MIN);
         if ok {
@@ -443,6 +448,29 @@ mod tests {
             "above a full tile"
         );
         assert!(CorrectionTile::zero(65).is_ok(), "a full tile");
+    }
+
+    #[test]
+    fn from_parts_rejects_scales_that_lose_the_interior() {
+        let border = || vec![Vec3::ZERO; 8];
+        assert_eq!(
+            CorrectionTile::from_parts(3, 0.0, vec![[1, 0, 0]], border()),
+            Err(CorrectionError::BadParts { side: 3 }),
+            "zero scale with a nonzero interior would decode to zero"
+        );
+        assert_eq!(
+            CorrectionTile::from_parts(3, 1e-40, vec![[0; 3]], border()),
+            Err(CorrectionError::BadParts { side: 3 }),
+            "subnormal scale"
+        );
+        assert!(
+            CorrectionTile::from_parts(3, 0.0, vec![[0; 3]], border()).is_ok(),
+            "zero scale, zero interior"
+        );
+        assert!(
+            CorrectionTile::from_parts(3, f32::MIN_POSITIVE, vec![[1, 0, 0]], border()).is_ok(),
+            "smallest normal scale"
+        );
     }
 
     #[test]

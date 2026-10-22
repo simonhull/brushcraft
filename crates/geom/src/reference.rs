@@ -145,7 +145,7 @@ impl Poly {
         let positions = mesh
             .vertices()
             .map(|v| {
-                let p = mesh.position(v).unwrap();
+                let p = mesh.vertex_position(v).unwrap();
                 [f64::from(p.x), f64::from(p.y), f64::from(p.z)]
             })
             .collect();

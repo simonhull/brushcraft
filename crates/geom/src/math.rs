@@ -15,7 +15,7 @@ pub struct Vec3 {
 
 impl Vec3 {
     /// All components NaN: marks a slot with no value.
-    pub const NAN: Self = Self::new(f32::NAN, f32::NAN, f32::NAN);
+    pub(crate) const NAN: Self = Self::new(f32::NAN, f32::NAN, f32::NAN);
     /// The zero vector.
     pub const ZERO: Self = Self::new(0.0, 0.0, 0.0);
 

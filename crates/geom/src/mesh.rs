@@ -2,8 +2,8 @@
 
 use thiserror::Error;
 
-use crate::topology::Topology;
-use crate::{FaceId, Vec3, VertexId};
+use crate::topology::{Topology, corner_at};
+use crate::{FaceId, Level, PositionSource, Vec3, VertexId};
 
 /// A closed quad base mesh with its adjacency.
 #[derive(Debug, Clone)]
@@ -202,7 +202,7 @@ impl BaseMesh {
 
     /// A vertex's position, or `None` if `vertex` is not in this mesh.
     #[must_use]
-    pub fn position(&self, vertex: VertexId) -> Option<Vec3> {
+    pub fn vertex_position(&self, vertex: VertexId) -> Option<Vec3> {
         self.positions
             .get(usize::try_from(vertex.index()).ok()?)
             .copied()
@@ -218,13 +218,24 @@ impl BaseMesh {
     /// The position of corner `corner` (0–3) of `face`, or `None` if either is out of range.
     #[must_use]
     pub fn corner_position(&self, face: FaceId, corner: u8) -> Option<Vec3> {
-        self.position(self.corner_vertex(face, corner)?)
+        self.vertex_position(self.corner_vertex(face, corner)?)
     }
 
     /// Adjacency.
     #[must_use]
     pub const fn topology(&self) -> &Topology {
         &self.topology
+    }
+}
+
+/// Level 0: the base mesh's corners, `(0, 0)`, `(1, 0)`, `(1, 1)`, `(0, 1)` being corners 0–3.
+/// Every other level, and anything outside the base quad, is `None`.
+impl PositionSource for BaseMesh {
+    fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+        if level != Level::ZERO || i > 1 || j > 1 {
+            return None;
+        }
+        self.corner_position(face, corner_at(i, j, 1))
     }
 }
 
@@ -444,12 +455,38 @@ mod tests {
                     );
                     assert_eq!(
                         mesh.corner_position(g, m),
-                        mesh.position(vertex),
+                        mesh.vertex_position(vertex),
                         "entry ({g:?}, {m}) is at vertex {vertex}'s position"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn level_zero_positions_are_the_face_corners() {
+        let mesh = cube_sphere(2).unwrap();
+        let at = |face, level, i, j| mesh.position(face, level, i, j);
+        for face in mesh.faces() {
+            for (c, (i, j)) in [(0, (0, 0)), (1, (1, 0)), (2, (1, 1)), (3, (0, 1))] {
+                assert_eq!(
+                    at(face, Level::ZERO, i, j),
+                    mesh.corner_position(face, c),
+                    "{face} corner {c} at ({i}, {j})"
+                );
+            }
+            assert_eq!(at(face, Level::ZERO, 2, 0), None, "outside the base quad");
+            assert_eq!(
+                at(face, Level::new(1).unwrap(), 0, 0),
+                None,
+                "level 1 is not the mesh"
+            );
+        }
+        assert_eq!(
+            at(FaceId::new(24), Level::ZERO, 0, 0),
+            None,
+            "not a face of this mesh"
+        );
     }
 
     #[test]

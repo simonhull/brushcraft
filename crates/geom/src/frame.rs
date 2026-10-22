@@ -15,7 +15,7 @@ pub struct Frame {
 
 impl Frame {
     /// Used where the surface is degenerate. It is the same everywhere, so twins still agree.
-    pub const FALLBACK: Self = Self {
+    pub(crate) const FALLBACK: Self = Self {
         t: Vec3::new(1.0, 0.0, 0.0),
         b: Vec3::new(0.0, 1.0, 0.0),
         n: Vec3::new(0.0, 0.0, 1.0),
@@ -31,7 +31,7 @@ impl Frame {
     /// The frame from derivatives along u and v: [`Frame::FALLBACK`] where finite derivatives are
     /// degenerate, and all NaN where either derivative isn't finite.
     #[must_use]
-    pub fn from_derivatives(du: Vec3, dv: Vec3) -> Self {
+    pub(crate) fn from_derivatives(du: Vec3, dv: Vec3) -> Self {
         if !(du.is_finite() && dv.is_finite()) {
             return Self::NAN;
         }
@@ -166,24 +166,55 @@ fn corner_derivatives(c: CornerAxes) -> (Vec3, Vec3) {
     }
 }
 
+/// `f(i, j, du, dv)` for every vertex of a block, row-major `(quads + 1)²`.
+fn per_vertex<T>(
+    block: &Block<'_>,
+    grid: &Padded,
+    corners: &[Option<CornerAxes>; 4],
+    f: impl Fn(i64, i64, Vec3, Vec3) -> T,
+) -> Vec<T> {
+    let q = i64::from(block.quads);
+    (0..=q)
+        .flat_map(|j| (0..=q).map(move |i| (i, j)))
+        .map(|(i, j)| {
+            let (du, dv) = derivatives(block, grid, corners, i, j);
+            f(i, j, du, dv)
+        })
+        .collect()
+}
+
 /// Frames for every vertex of a predicted block, row-major `(quads + 1)²`.
 pub(crate) fn frames(
     block: &Block<'_>,
     predicted: &Padded,
     corners: &[Option<CornerAxes>; 4],
 ) -> Vec<Frame> {
-    let q = i64::from(block.quads);
-    (0..=q)
-        .flat_map(|j| (0..=q).map(move |i| (i, j)))
-        .map(|(i, j)| {
-            let (du, dv) = derivatives(block, predicted, corners, i, j);
-            debug_assert!(
-                du.is_finite() && dv.is_finite(),
-                "derivatives at ({i}, {j}) of {block:?} are not finite"
-            );
-            Frame::from_derivatives(du, dv)
-        })
-        .collect()
+    per_vertex(block, predicted, corners, |i, j, du, dv| {
+        debug_assert!(
+            du.is_finite() && dv.is_finite(),
+            "derivatives at ({i}, {j}) of {block:?} are not finite"
+        );
+        Frame::from_derivatives(du, dv)
+    })
+}
+
+/// The unit normal `du × dv`, with [`Frame::from_derivatives`]'s policy: the fallback frame's
+/// normal where finite derivatives are degenerate, NaN where either isn't finite.
+fn normal(du: Vec3, dv: Vec3) -> Vec3 {
+    if !(du.is_finite() && dv.is_finite()) {
+        return Vec3::NAN;
+    }
+    du.cross(dv).normalized().unwrap_or(Frame::FALLBACK.n)
+}
+
+/// Unit normals for every vertex of a block of evaluated positions, row-major `(quads + 1)²`.
+/// Positions come from a source, so non-finite input is passed through as NaN, not asserted.
+pub(crate) fn normals(
+    block: &Block<'_>,
+    positions: &Padded,
+    corners: &[Option<CornerAxes>; 4],
+) -> Vec<Vec3> {
+    per_vertex(block, positions, corners, |_, _, du, dv| normal(du, dv))
 }
 
 #[cfg(test)]
@@ -218,6 +249,25 @@ mod tests {
                 .n
                 .is_finite(),
             "so does infinity"
+        );
+    }
+
+    #[test]
+    fn normals_follow_the_frame_policy() {
+        let (du, dv) = (Vec3::new(2.0, 0.1, 0.0), Vec3::new(0.0, 3.0, 0.2));
+        assert_eq!(
+            normal(du, dv),
+            Frame::from_derivatives(du, dv).n,
+            "same normal as the frame"
+        );
+        assert_eq!(
+            normal(Vec3::ZERO, dv),
+            Frame::FALLBACK.n,
+            "degenerate: fallback"
+        );
+        assert!(
+            !normal(Vec3::NAN, dv).is_finite(),
+            "non-finite: NaN, not the fallback"
         );
     }
 

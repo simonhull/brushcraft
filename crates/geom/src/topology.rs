@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::mesh::fit;
-use crate::{FaceId, Level, MeshError, TileKey, VertexId};
+use crate::{Channel, FaceId, LayerId, Level, MeshError, TileKey, VertexId};
 
 /// What lies across one edge of a face: the neighbour and the index of the same edge in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,17 +44,16 @@ pub struct VertexCopy {
 }
 
 impl VertexCopy {
+    /// The tile of `layer`'s `channel` at `level` holding this copy.
+    #[must_use]
+    pub const fn key_in(&self, layer: LayerId, channel: Channel, level: Level) -> TileKey {
+        TileKey::new_unchecked(layer, channel, self.face, level, self.tx, self.ty)
+    }
+
     /// The base-layer displacement tile holding this copy.
     #[must_use]
     pub const fn key(&self, level: Level) -> TileKey {
-        TileKey::new_unchecked(
-            crate::LayerId::BASE,
-            crate::Channel::DISPLACEMENT,
-            self.face,
-            level,
-            self.tx,
-            self.ty,
-        )
+        self.key_in(LayerId::BASE, Channel::DISPLACEMENT, level)
     }
 }
 
@@ -641,6 +640,38 @@ mod tests {
             t.copies(FaceId::new(6), level, 1, 1).is_empty(),
             "not a face of this mesh"
         );
+    }
+
+    #[test]
+    fn copy_keys_name_any_layer_and_channel() {
+        let mesh = cube_sphere(1).unwrap();
+        let level = Level::new(8).unwrap();
+        let (layer, channel) = (LayerId::new(3), Channel::from_raw(5));
+        let copies = mesh.topology().copies(FaceId::new(2), level, 64, 0);
+        assert_eq!(
+            copies.len(),
+            4,
+            "face edge on a tile border: 2 faces × 2 tiles"
+        );
+        for c in copies {
+            let base = c.key(level);
+            assert_eq!(
+                base,
+                c.key_in(LayerId::BASE, Channel::DISPLACEMENT, level),
+                "key is key_in for the base layer's displacement"
+            );
+            let other = c.key_in(layer, channel, level);
+            assert_eq!(
+                (other.layer(), other.channel()),
+                (layer, channel),
+                "{c:?}: layer and channel"
+            );
+            assert_eq!(
+                (other.face(), other.level(), other.tx(), other.ty()),
+                (base.face(), base.level(), base.tx(), base.ty()),
+                "{c:?}: same tile position"
+            );
+        }
     }
 
     #[test]

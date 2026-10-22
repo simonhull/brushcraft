@@ -53,6 +53,12 @@ impl FaceId {
     }
 }
 
+impl fmt::Display for FaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "f{}", self.0)
+    }
+}
+
 /// A subdivision level, `0..=MAX_LEVEL`. Level 0 is the base mesh; each level halves the quads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Level(u8);
@@ -461,6 +467,11 @@ impl Region {
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn faces_display_with_a_prefix() {
+        assert_eq!(FaceId::new(7).to_string(), "f7", "face 7");
+    }
 
     #[test]
     fn level_sizes() {

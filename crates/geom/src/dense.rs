@@ -43,9 +43,10 @@ impl CorrectionMap {
     ///
     /// # Errors
     ///
-    /// [`CorrectionError::NotFinite`] if `c` isn't finite, [`CorrectionError::UnknownFace`] if
-    /// `face` is not in `topology`, or [`CorrectionError::OutOfTile`] if the vertex is outside
-    /// the face. Nothing is written then.
+    /// [`CorrectionError::NotFinite`] if `c` isn't finite, [`CorrectionError::LevelZero`] at
+    /// level 0 (the base mesh), [`CorrectionError::UnknownFace`] if `face` is not in `topology`,
+    /// or [`CorrectionError::OutOfTile`] if the vertex is outside the face. Nothing is written
+    /// then.
     pub fn set(
         &mut self,
         topology: &Topology,
@@ -57,6 +58,9 @@ impl CorrectionMap {
     ) -> Result<(), CorrectionError> {
         if !c.is_finite() {
             return Err(CorrectionError::NotFinite);
+        }
+        if level == Level::ZERO {
+            return Err(CorrectionError::LevelZero);
         }
         if !topology.contains(face) {
             return Err(CorrectionError::UnknownFace(face));
@@ -114,12 +118,12 @@ impl DenseEvaluation {
         finest: Level,
         corrections: &CorrectionMap,
     ) -> Result<Self, EvalError> {
-        // Level 0's grid is row-major (0,0), (1,0), (0,1), (1,1): corners 0, 1, 3, 2.
         let base = mesh
             .faces()
             .map(|f| {
-                let p = |c| mesh.corner_position(f, c).unwrap_or(Vec3::NAN);
-                Grid::from_parts(2, vec![p(0), p(1), p(3), p(2)])
+                let data = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    .map(|(i, j)| mesh.position(f, Level::ZERO, i, j).unwrap_or(Vec3::NAN));
+                Grid::from_parts(2, data.to_vec())
             })
             .collect();
         let mut eval = Self { levels: vec![base] };
@@ -472,6 +476,11 @@ mod tests {
             map.set(t, FaceId::new(0), level, 0, 1, Vec3::NAN),
             Err(CorrectionError::NotFinite),
             "not finite"
+        );
+        assert_eq!(
+            map.set(t, FaceId::new(0), Level::ZERO, 0, 1, c),
+            Err(CorrectionError::LevelZero),
+            "level 0 is the mesh"
         );
         assert!(map.tiles.is_empty(), "nothing written");
     }

@@ -86,7 +86,7 @@ mod tests {
         );
         for v in mesh.vertices() {
             assert!(
-                (mesh.position(v).unwrap().length() - 1.0).abs() < 1e-6,
+                (mesh.vertex_position(v).unwrap().length() - 1.0).abs() < 1e-6,
                 "on the sphere"
             );
         }
