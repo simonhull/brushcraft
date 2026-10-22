@@ -318,6 +318,71 @@ mod tests {
         }
     }
 
+    /// Frames, checked black-box through what corrections do.
+    ///
+    /// A unit `t` correction must move every vertex along its owner's grid `+i`, and a unit `n`
+    /// correction outward. Each face evaluates its shared vertices in the owner's orientation,
+    /// so this covers owner choice, the corner table, the ring's edge points and the `t`/`n`
+    /// construction.
+    #[test]
+    fn corrections_follow_the_owner_orientation() {
+        let mesh = cube_sphere(2).unwrap();
+        let t = mesh.topology();
+        let dense =
+            DenseEvaluation::new(&mesh, Level::new(2).unwrap(), &CorrectionMap::new()).unwrap();
+        for l in 1..=3 {
+            let level = Level::new(l).unwrap();
+            let n = level.face_quads();
+            let parent = dense.truncated(level.parent().unwrap());
+            let eval = |c: Vec3| -> Vec<Grid> {
+                mesh.faces()
+                    .map(|f| {
+                        evaluate_region(&mesh, &parent, Region::whole_face(f, level), |_, _| c)
+                            .unwrap()
+                    })
+                    .collect()
+            };
+            let (zero, along, normal) = (
+                eval(Vec3::ZERO),
+                eval(Vec3::new(1.0, 0.0, 0.0)),
+                eval(Vec3::new(0.0, 0.0, 1.0)),
+            );
+            let at = |grids: &[Grid], f: FaceId, i: u32, j: u32| {
+                grids[f.index() as usize].get(i, j).unwrap()
+            };
+            for face in mesh.faces() {
+                for j in 0..=n {
+                    for i in 0..=n {
+                        let p = at(&zero, face, i, j);
+                        let tangent = at(&along, face, i, j) - p;
+                        let outward = at(&normal, face, i, j) - p;
+                        assert!(
+                            outward.dot(p) > 0.5 * p.length(),
+                            "{face:?} L{l} ({i}, {j}): n points outward"
+                        );
+                        let owner = t
+                            .copies(face, level, i, j)
+                            .into_iter()
+                            .min_by_key(|c| c.face)
+                            .unwrap();
+                        let r = Region::of_tile(&owner.key(level));
+                        let (oi, oj) = (r.x0() + owner.i, r.y0() + owner.j);
+                        let step = if oi < n {
+                            at(&zero, owner.face, oi + 1, oj) - at(&zero, owner.face, oi, oj)
+                        } else {
+                            at(&zero, owner.face, oi, oj) - at(&zero, owner.face, oi - 1, oj)
+                        };
+                        let cos = tangent.dot(step) / (tangent.length() * step.length());
+                        assert!(
+                            cos > 0.7,
+                            "{face:?} L{l} ({i}, {j}): t is the owner's +i ({owner:?}, cos {cos})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_normal_correction_moves_outward() {
         let mesh = cube_sphere(2).unwrap();

@@ -23,10 +23,21 @@ impl Frame {
         b: Vec3::new(0.0, 1.0, 0.0),
         n: Vec3::new(0.0, 0.0, 1.0),
     };
+    /// A frame whose every component is NaN: what non-finite derivatives give, so a bug upstream
+    /// shows up in the output instead of being hidden behind [`Frame::FALLBACK`].
+    const NAN: Self = Self {
+        t: Vec3::NAN,
+        b: Vec3::NAN,
+        n: Vec3::NAN,
+    };
 
-    /// The frame from derivatives along u and v.
+    /// The frame from derivatives along u and v: [`Frame::FALLBACK`] where finite derivatives are
+    /// degenerate, and all NaN where either derivative isn't finite.
     #[must_use]
     pub fn from_derivatives(du: Vec3, dv: Vec3) -> Self {
+        if !(du.is_finite() && dv.is_finite()) {
+            return Self::NAN;
+        }
         let Some(n) = du.cross(dv).normalized() else {
             return Self::FALLBACK;
         };
@@ -151,6 +162,10 @@ pub(crate) fn frames(
         .flat_map(|j| (0..=q).map(move |i| (i, j)))
         .map(|(i, j)| {
             let (du, dv) = derivatives(block, predicted, corners, i, j);
+            debug_assert!(
+                du.is_finite() && dv.is_finite(),
+                "derivatives at ({i}, {j}) of {block:?} are not finite"
+            );
             Frame::from_derivatives(du, dv)
         })
         .collect()
@@ -178,10 +193,16 @@ mod tests {
             Frame::FALLBACK,
             "zero"
         );
-        assert_eq!(
-            Frame::from_derivatives(Vec3::NAN, Vec3::ZERO),
-            Frame::FALLBACK,
-            "NaN"
+        let nan = Frame::from_derivatives(Vec3::NAN, Vec3::new(0.0, 1.0, 0.0));
+        assert!(
+            !(nan.t.is_finite() || nan.b.is_finite() || nan.n.is_finite()),
+            "NaN propagates instead of falling back: {nan:?}"
+        );
+        assert!(
+            !Frame::from_derivatives(Vec3::new(1.0, 0.0, 0.0), Vec3::new(f32::INFINITY, 0.0, 0.0))
+                .n
+                .is_finite(),
+            "so does infinity"
         );
     }
 
