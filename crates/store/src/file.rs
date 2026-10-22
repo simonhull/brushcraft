@@ -802,6 +802,59 @@ impl ProjectFile {
         self.live.get(key).copied()
     }
 
+    /// Reads the displacement tile of `key` recorded at `loc` (which [`ProjectFile::locate`]
+    /// gave) straight into `slot`, as a [`FileReader`] does, and returns the edit that wrote it.
+    ///
+    /// # Errors
+    ///
+    /// As [`FileReader::read_displacement_into`], but never [`StoreError::Closed`]. On error
+    /// `slot` holds no tile.
+    pub(crate) fn read_at(
+        &self,
+        key: &TileKey,
+        loc: Loc,
+        slot: &mut CorrectionSlot,
+        scratch: &mut ReadScratch,
+    ) -> Result<OpId, StoreError> {
+        if let Err(e) = check_displacement(key, key.side()) {
+            bytemuck::bytes_of_mut(slot).fill(0);
+            return Err(e);
+        }
+        read_displacement_at(&self.file, key, loc, slot, scratch)
+    }
+
+    /// This file as of its last save point, as a [`BaseFile`] for a tile store to read
+    /// corrections through, under a working file of its own.
+    ///
+    /// Records written since the last save point are left out: the base is the saved state.
+    /// Its locations are a snapshot, so writes and saves after this call don't change what it
+    /// reads; a later save needs a new base. The base reads this open file
+    /// and doesn't keep it open: once this `ProjectFile` is dropped, reads through the base fail
+    /// with [`StoreError::Closed`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Damaged`] if the last save point must be read again (records were written
+    /// since it) and its chain no longer loads; [`StoreError::Io`].
+    pub fn base(&self) -> Result<BaseFile, StoreError> {
+        let (locations, head) = if self.pending.is_empty() {
+            (self.live.clone(), self.head)
+        } else if let Some(offset) = self.last_index {
+            let len = self.file.metadata()?.len();
+            let chain =
+                load_chain(&self.file, offset, len)?.ok_or(StoreError::Damaged { offset })?;
+            (chain.live, chain.head)
+        } else {
+            (BTreeMap::new(), None)
+        };
+        Ok(BaseFile {
+            reader: self.reader(),
+            locations: Arc::new(locations),
+            mesh_hash: self.meta.mesh_hash(),
+            head,
+        })
+    }
+
     /// A reader for other threads. It reads this open file while it stays open, and doesn't keep
     /// it (or its lock) open after this `ProjectFile` is dropped.
     pub(crate) fn reader(&self) -> FileReader {
@@ -991,6 +1044,72 @@ impl FileReader {
                 Err(e)
             }
         }
+    }
+}
+
+/// A project file as of a save point, lent to a [`crate::TileStore`] as the read-only layer under
+/// its working file: corrections the working file doesn't hold are read from here. Made by
+/// [`ProjectFile::base`].
+///
+/// It holds a reader of the open file, a frozen map of where each saved tile's record is, and
+/// what the store checks it against. It reads only while its [`ProjectFile`] stays open.
+#[derive(Debug, Clone)]
+pub struct BaseFile {
+    /// Reads the project file while its owner keeps it open.
+    reader: FileReader,
+    /// Each saved tile's record as of the save point. Records are never moved while the file
+    /// is open, so these stay valid as the owner appends.
+    locations: Arc<BTreeMap<TileKey, Loc>>,
+    /// The mesh hash of the file's meta: a store layers the base only over a working file of
+    /// the same mesh.
+    mesh_hash: u128,
+    /// The newest edit as of the save point: a store's op ids continue after it.
+    head: Option<OpId>,
+}
+
+impl BaseFile {
+    /// Where `key`'s saved record is, if the save point has one.
+    pub(crate) fn locate(&self, key: &TileKey) -> Option<Loc> {
+        self.locations.get(key).copied()
+    }
+
+    /// The reader the store's prefetch workers read the base through.
+    pub(crate) fn reader(&self) -> FileReader {
+        self.reader.clone()
+    }
+
+    /// Reads `key`'s displacement tile recorded at `loc` into `slot` (see
+    /// [`FileReader::read_displacement_into`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`FileReader::read_displacement_into`]; [`StoreError::Closed`] once the project file
+    /// is dropped. On error `slot` holds no tile.
+    pub(crate) fn read_at(
+        &self,
+        key: &TileKey,
+        loc: Loc,
+        slot: &mut CorrectionSlot,
+        scratch: &mut ReadScratch,
+    ) -> Result<OpId, StoreError> {
+        self.reader.read_displacement_into(key, loc, slot, scratch)
+    }
+
+    /// The mesh hash of the project file's meta.
+    #[must_use]
+    pub const fn mesh_hash(&self) -> u128 {
+        self.mesh_hash
+    }
+
+    /// The newest edit as of the save point; `None` before any edit.
+    #[must_use]
+    pub const fn head(&self) -> Option<OpId> {
+        self.head
+    }
+
+    /// The saved tiles, in key order.
+    pub fn keys(&self) -> impl Iterator<Item = &TileKey> {
+        self.locations.keys()
     }
 }
 

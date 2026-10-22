@@ -18,6 +18,7 @@ use crate::fixture::meta_for;
 use crate::test_dir::TestDir;
 
 mod differential;
+mod layered;
 
 /// Bytes of one evaluated slot: test chunks are sized in these.
 const EVAL: usize = size_of::<EvaluatedSlot>();
@@ -112,7 +113,7 @@ fn pinning() -> StoreConfig {
 /// A store over a new working file `name` in `dir`.
 fn new_store(dir: &TestDir, name: &str, mesh: &Arc<BaseMesh>, config: StoreConfig) -> TileStore {
     let file = ProjectFile::create(&dir.path(name), meta_for(mesh), Arc::clone(mesh)).unwrap();
-    TileStore::open(Arc::clone(mesh), file, config).unwrap()
+    TileStore::open(file, None, config).unwrap()
 }
 
 /// Every tile of levels `from..=to`, coarse levels first.
@@ -481,7 +482,7 @@ fn sparse_on_disk_equals_explicit_zero() {
     let mut sparse = new_store(&dir, "sparse.bcp", &mesh, roomy());
     apply(&mut sparse, &mut map, &edits);
     sparse.save().unwrap();
-    let mut explicit = TileStore::open(Arc::clone(&mesh), explicit, tight()).unwrap();
+    let mut explicit = TileStore::open(explicit, None, tight()).unwrap();
     apply(&mut explicit, &mut CorrectionMap::new(), &edits);
     explicit.save().unwrap();
     assert_eq!(
@@ -522,8 +523,8 @@ fn save_reopen_evaluate() {
     let mut map = CorrectionMap::new();
     let last_op = {
         let mut store = TileStore::open(
-            Arc::clone(&mesh),
             ProjectFile::create(&path, meta_for(&mesh), Arc::clone(&mesh)).unwrap(),
+            None,
             tight(),
         )
         .unwrap();
@@ -546,7 +547,7 @@ fn save_reopen_evaluate() {
         store.next_op().unwrap()
     };
     let file = ProjectFile::open(&path).unwrap();
-    let mut store = TileStore::open(Arc::clone(&mesh), file, roomy()).unwrap();
+    let mut store = TileStore::open(file, None, roomy()).unwrap();
     assert_eq!(
         store.next_op().unwrap(),
         last_op,
@@ -981,7 +982,7 @@ fn bad_requests_are_refused() {
     };
     assert!(
         matches!(
-            TileStore::open(Arc::clone(&mesh), file, reserved),
+            TileStore::open(file, None, reserved),
             Err(CacheError::ReservedSite)
         ),
         "reserved site"
@@ -1105,7 +1106,7 @@ fn a_budget_below_the_minimum_is_refused() {
         budget_bytes: minimum - 1,
         ..tight()
     };
-    let refused = TileStore::open(Arc::clone(&mesh), file, small);
+    let refused = TileStore::open(file, None, small);
     assert!(
         matches!(refused, Err(CacheError::BudgetTooSmall { minimum: m }) if m == minimum),
         "refused: {refused:?}"
@@ -1318,8 +1319,8 @@ fn a_failed_write_back_is_reported_and_keeps_the_tile() {
     let path = dir.path("work.bcp");
     let saved = {
         let mut store = TileStore::open(
-            Arc::clone(&mesh),
             ProjectFile::create(&path, meta_for(&mesh), Arc::clone(&mesh)).unwrap(),
+            None,
             roomy(),
         )
         .unwrap();
@@ -1333,7 +1334,7 @@ fn a_failed_write_back_is_reported_and_keeps_the_tile() {
     // Opened at a save point, the file is read-only: edits stay in their slots, and writing
     // them back fails.
     let file = ProjectFile::open_at(&path, saved).unwrap();
-    let mut store = TileStore::open(Arc::clone(&mesh), file, roomy()).unwrap();
+    let mut store = TileStore::open(file, None, roomy()).unwrap();
     let edit = random_edits(&mesh, 3, 1, 21);
     apply(&mut store, &mut CorrectionMap::new(), &edit);
     let dirty: Vec<TileKey> = store.unsaved.keys().copied().collect();

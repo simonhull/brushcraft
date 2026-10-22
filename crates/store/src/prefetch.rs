@@ -1,9 +1,10 @@
 //! Background prefetch: worker threads that read and decode correction tiles ahead of use.
 //!
-//! The tile store's owner thread looks up where each wanted tile's record lives and queues
-//! `(key, location)` jobs. A few worker threads, started on the first request, take jobs in
-//! priority order, read each record through a [`FileReader`] into a boxed [`CorrectionSlot`]
-//! with their own reusable buffers, and send the result back over a channel. The owner installs
+//! The tile store's owner thread looks up where each wanted tile's record lives (in the working
+//! file, or in the base under it) and queues `(key, source, location)` jobs. A few worker
+//! threads, started on the first request, take jobs in priority order, read each record through
+//! a [`FileReader`] of its source into a boxed [`CorrectionSlot`] with their own reusable
+//! buffers, and send the result back over a channel. The owner installs
 //! finished slots at its next [`crate::TileStore::poll`], checking first that each one is still
 //! wanted; the workers touch neither the pools nor the file's index, so the hot path takes no
 //! locks.
@@ -12,8 +13,12 @@
 //!
 //! Dropping the [`Prefetcher`] closes the queue and joins the workers. A worker checks the closed
 //! flag before every job and while it waits for one, so it stops after at most the read in hand,
-//! however much work is still queued. A worker whose file has been closed under it
-//! ([`StoreError::Closed`]) stops quietly too.
+//! however much work is still queued. A read whose file has been closed under it fails with
+//! [`StoreError::Closed`], which is sent back like any other error: the job is answered, and the
+//! worker goes on to the next.
+//!
+//! A prefetcher reads the files it was started with. The store makes a new one when it swaps its
+//! files ([`crate::TileStore::rebase`]), so no job or result outlives the files it was for.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZero;
@@ -23,7 +28,7 @@ use std::thread::{self, JoinHandle};
 
 use geom::TileKey;
 
-use crate::file::{FileReader, Loc, ProjectFile, ReadScratch, StoreError};
+use crate::file::{BaseFile, FileReader, Loc, ProjectFile, ReadScratch, StoreError};
 use crate::slot::CorrectionSlot;
 
 /// Most worker threads a prefetcher starts, however many cores there are.
@@ -36,11 +41,23 @@ const MAX_WORKERS: usize = 4;
 /// from allocating while the owner polls regularly.
 const MAX_SPARE: usize = 4 * MAX_WORKERS;
 
-/// One record to read: the tile and where its record was when the job was queued.
+/// Which of the store's files a record is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Source {
+    /// The working file, read first.
+    Working,
+    /// The base under it: the project file as of its last save.
+    Base,
+}
+
+/// One record to read: the tile, and which file its record was in and where when the job was
+/// queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Job {
     /// The correction tile.
     pub(crate) key: TileKey,
+    /// The file holding the record.
+    pub(crate) source: Source,
     /// Its latest record when the owner queued the job.
     pub(crate) loc: Loc,
 }
@@ -132,9 +149,9 @@ pub(crate) struct Prefetcher {
     send: Sender<Fetched>,
     /// Where finished jobs arrive.
     results: Receiver<Fetched>,
-    /// Every job queued or being read, by key, at the location it was asked for: a key is
-    /// queued again only if its record has moved since.
-    pending: HashMap<TileKey, Loc>,
+    /// Every job queued or being read, by key, at the file and location it was asked for: a key
+    /// is queued again only if its record has moved since.
+    pending: HashMap<TileKey, (Source, Loc)>,
 }
 
 impl Prefetcher {
@@ -162,7 +179,7 @@ impl Prefetcher {
     /// waiting it moves up with this request, and if a worker has it already it is left to
     /// finish. A job at a different location (the record moved since the earlier request) is
     /// queued anew; the earlier result will be found stale. Starts the workers if none run yet,
-    /// reading through `file`'s reader.
+    /// reading through readers of `working` and `base`.
     ///
     /// # Errors
     ///
@@ -170,14 +187,15 @@ impl Prefetcher {
     /// made. Nothing is queued then.
     pub(crate) fn request(
         &mut self,
-        file: &ProjectFile,
+        working: &ProjectFile,
+        base: Option<&BaseFile>,
         jobs: &[Job],
     ) -> Result<usize, StoreError> {
         if jobs.is_empty() {
             return Ok(0);
         }
         if self.workers.is_empty() {
-            self.start(file)?;
+            self.start(working, base)?;
         }
         let wanted: HashSet<TileKey> = jobs.iter().map(|job| job.key).collect();
         let mut new = 0;
@@ -194,12 +212,13 @@ impl Prefetcher {
             });
             // Pushed to the front in reverse, so the request's own order is kept.
             for &job in jobs.iter().rev() {
-                let asked = self.pending.insert(job.key, job.loc);
-                if asked == Some(job.loc) && !waiting.contains(&job.key) {
+                let at = (job.source, job.loc);
+                let asked = self.pending.insert(job.key, at);
+                if asked == Some(at) && !waiting.contains(&job.key) {
                     // A worker is reading it at this location already.
                     continue;
                 }
-                if asked != Some(job.loc) {
+                if asked != Some(at) {
                     new += 1;
                 }
                 queue.jobs.push_front(job);
@@ -213,7 +232,7 @@ impl Prefetcher {
     /// been asked for again at another location since).
     pub(crate) fn next(&mut self) -> Option<Fetched> {
         let fetched = self.results.try_recv().ok()?;
-        if self.pending.get(&fetched.job.key) == Some(&fetched.job.loc) {
+        if self.pending.get(&fetched.job.key) == Some(&(fetched.job.source, fetched.job.loc)) {
             self.pending.remove(&fetched.job.key);
         }
         Some(fetched)
@@ -228,12 +247,13 @@ impl Prefetcher {
     }
 
     /// Starts the workers: one per available core, at most [`MAX_WORKERS`], each with its own
-    /// read buffers and a reader of `file`. A worker that fails to start is skipped.
+    /// read buffers and readers of `working` and `base`. A worker that fails to start is
+    /// skipped.
     ///
     /// # Errors
     ///
     /// [`StoreError::Io`] if read buffers can't be made, or no worker started.
-    fn start(&mut self, file: &ProjectFile) -> Result<(), StoreError> {
+    fn start(&mut self, working: &ProjectFile, base: Option<&BaseFile>) -> Result<(), StoreError> {
         let count = thread::available_parallelism()
             .map_or(1, NonZero::get)
             .min(MAX_WORKERS);
@@ -241,7 +261,8 @@ impl Prefetcher {
         for n in 0..count {
             let worker = Worker {
                 shared: Arc::clone(&self.shared),
-                reader: file.reader(),
+                working: working.reader(),
+                base: base.map(BaseFile::reader),
                 scratch: ReadScratch::new()?,
                 send: self.send.clone(),
             };
@@ -293,8 +314,10 @@ impl Drop for Prefetcher {
 struct Worker {
     /// The queue it takes jobs from.
     shared: Arc<Shared>,
-    /// Reads the owner's file while it stays open.
-    reader: FileReader,
+    /// Reads the owner's working file while it stays open.
+    working: FileReader,
+    /// Reads the base under it while its project file stays open; `None` without a base.
+    base: Option<FileReader>,
     /// Record and decompression buffers, reused for every job.
     scratch: ReadScratch,
     /// Where results go.
@@ -302,20 +325,20 @@ struct Worker {
 }
 
 impl Worker {
-    /// Takes jobs until the queue closes, the file closes or the owner stops listening.
+    /// Takes jobs until the queue closes or the owner stops listening.
     fn run(mut self) {
         while let Some((job, spare)) = self.shared.next_job() {
             let mut slot = spare.unwrap_or_else(bytemuck::zeroed_box);
-            let slot = match self.reader.read_displacement_into(
-                &job.key,
-                job.loc,
-                &mut slot,
-                &mut self.scratch,
-            ) {
-                Ok(_) => Ok(slot),
-                Err(StoreError::Closed) => return,
-                Err(e) => Err(e),
+            let reader = match job.source {
+                Source::Working => Some(&self.working),
+                Source::Base => self.base.as_ref(),
             };
+            // A base job without a base reader can't be queued: the store queues base jobs
+            // only when it has a base, and starts its workers with it.
+            let read = reader.map_or(Err(StoreError::Closed), |reader| {
+                reader.read_displacement_into(&job.key, job.loc, &mut slot, &mut self.scratch)
+            });
+            let slot = read.map(|_| slot);
             if self.send.send(Fetched { job, slot }).is_err() {
                 return;
             }

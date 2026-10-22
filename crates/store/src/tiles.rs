@@ -1,10 +1,18 @@
 //! The tile store: a project held out of core.
 //!
 //! [`TileStore`] owns the base mesh, the working [`ProjectFile`], two budgeted pools (correction
-//! tiles and evaluated tiles), the change feed and an op generator. Correction tiles are loaded
-//! from the file on demand (an absent tile is all zero) and edited in their slots; evaluated
-//! tiles are computed on demand from their parent tiles and cached. Edits drop exactly the
-//! evaluations that followed from them (see [`crate::deps`]).
+//! tiles and evaluated tiles), the change feed and an op generator, and may borrow a
+//! [`BaseFile`] under the working file. Correction tiles are loaded on demand (see below) and
+//! edited in their slots; evaluated tiles are computed on demand from their parent tiles and
+//! cached. Edits drop exactly the evaluations that followed from them (see [`crate::deps`]).
+//!
+//! # Layered reads
+//!
+//! A correction tile is read from the working file if it has a record there, else from the base
+//! (the project file as of its last save), else it is all zero. The working file is the only one
+//! the store writes: write-back and [`TileStore::save`] append to it, and the base is read-only
+//! to the store. After the project file is saved, [`TileStore::rebase`] swaps in the new save
+//! point as the base and a fresh working file, keeping every resident tile.
 //!
 //! # Evaluation
 //!
@@ -67,10 +75,10 @@ use thiserror::Error;
 
 use crate::deps::DepGraph;
 use crate::feed::{ChangeFeed, ConsumerId};
-use crate::file::{ProjectFile, ReadScratch, StoreError};
+use crate::file::{BaseFile, Loc, ProjectFile, ReadScratch, StoreError};
 use crate::op::{OpId, RESERVED_SITE};
 use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotId};
-use crate::prefetch::{Fetched, Job, Prefetcher};
+use crate::prefetch::{Fetched, Job, Prefetcher, Source};
 use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 
 /// How a [`TileStore`] is set up.
@@ -184,6 +192,10 @@ pub enum CacheError {
     /// The configured site is [`RESERVED_SITE`].
     #[error("site {RESERVED_SITE} is reserved")]
     ReservedSite,
+    /// The working file and the base under it (or the store and a file given to
+    /// [`TileStore::rebase`]) are over different base meshes: their meta's mesh hashes differ.
+    #[error("the working file and its base are over different meshes")]
+    MeshMismatch,
     /// The configured budget is below [`StoreConfig::minimum_budget`] for the mesh.
     #[error("the budget is below the {minimum} bytes this mesh needs")]
     BudgetTooSmall {
@@ -234,6 +246,13 @@ pub enum Invariant {
     /// A dirty slot was to be freed without being written back.
     #[error("a dirty slot was to be freed")]
     FreedDirty,
+    /// [`TileStore::rebase`] found dirty correction tiles: edits not in the save it was to be
+    /// rebased on.
+    #[error("{0} dirty correction tiles at a rebase")]
+    DirtyAtRebase(usize),
+    /// A correction tile was located in a base the store doesn't have.
+    #[error("a tile was located in a missing base")]
+    MissingBase,
     /// A slot or buffer held fewer values than a tile has.
     #[error("a buffer of {got} values is shorter than a tile's {expected}")]
     ShortBuffer {
@@ -332,7 +351,7 @@ struct EvalLog {
     positions: Vec<TileKey>,
     /// Tiles whose normals were computed, in order.
     normals: Vec<TileKey>,
-    /// Correction tiles the owner thread looked up in the working file, in order (prefetch
+    /// Correction tiles the owner thread looked up in its files, in order (prefetch
     /// workers' reads aren't counted).
     file_reads: Vec<TileKey>,
     /// Prefetched correction tiles installed.
@@ -350,8 +369,12 @@ struct EvalLog {
     normal_inputs_listed: Cell<usize>,
 }
 
-/// A project held out of core: the base mesh, the working file, budgeted pools of correction and
+/// A project held out of core: the base mesh, its files, budgeted pools of correction and
 /// evaluated tiles, the change feed and an op generator.
+///
+/// The files are the working file and, under it, a base: the project file as of its last save.
+/// Corrections are read from the working file first, then the base, and an absent tile is zero
+/// (see the module notes). The store writes only the working file.
 ///
 /// Tiles are named by base-layer displacement [`TileKey`]s of level 1 or more; an evaluated tile
 /// is named by the displacement tile at the same position. Level 0 is the base mesh, never a
@@ -397,10 +420,15 @@ pub struct TileStore {
     /// The prefetch workers. Declared first, so they are stopped and joined (when the store is
     /// dropped) before anything else goes, the working file included.
     prefetch: Prefetcher,
-    /// The base mesh: level 0 and the topology.
+    /// The base mesh: level 0 and the topology. The working file's, and its base's.
     mesh: Arc<BaseMesh>,
-    /// The working file: correction tiles are read from it and written back to it.
+    /// The mesh hash every file the store reads must carry in its meta.
+    mesh_hash: u128,
+    /// The working file: correction tiles are read from it first, and written back to it.
     file: ProjectFile,
+    /// The project file as of its last save, read where the working file has no record; `None`
+    /// for a project never saved.
+    base: Option<BaseFile>,
     /// The bytes both pools may hold.
     budget: Budget,
     /// What the store pins for its own work, besides [`TileStore::pin`]'s tiles.
@@ -445,6 +473,7 @@ impl std::fmt::Debug for TileStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TileStore")
             .field("file", &self.file)
+            .field("base", &self.base.as_ref().map(|base| base.keys().count()))
             .field("budget", &self.budget)
             .field("corrections", &self.corrections)
             .field("evaluated", &self.evaluated)
@@ -559,40 +588,72 @@ fn write_slot(
     Ok(())
 }
 
+/// The first op the store hands out for `site` after the files' `heads`: the next after the
+/// greatest head of `site`, or sequence 0 of `site` if none is of it.
+///
+/// # Errors
+///
+/// [`CacheError::OpsExhausted`] if that head is the site's last op id.
+fn first_op(site: u16, heads: impl IntoIterator<Item = Option<OpId>>) -> Result<OpId, CacheError> {
+    let latest = heads
+        .into_iter()
+        .flatten()
+        .filter(|head| head.site() == site)
+        .max();
+    match latest {
+        Some(head) => head.next(),
+        None => OpId::new(site, 0),
+    }
+    .ok_or(CacheError::OpsExhausted)
+}
+
 impl TileStore {
-    /// A store over `file` (the working file) for `mesh`. The op generator starts after the
-    /// file's head op if that op is of `config.site`, else at sequence 0 of the site.
+    /// A store over `working`, the file it writes, and `base`, the project file as of its last
+    /// save, read where `working` has no record (`None` for a project never saved). The base
+    /// mesh is the working file's.
+    ///
+    /// The op generator starts after the newest head op of `config.site` in either file, else at
+    /// sequence 0 of the site, so the store's edits are newer than everything it reads.
     ///
     /// # Errors
     ///
-    /// [`CacheError::ReservedSite`]; [`CacheError::BudgetTooSmall`] below
-    /// [`StoreConfig::minimum_budget`]; [`CacheError::OpsExhausted`] if the file's head is the
-    /// site's last op id; [`CacheError::Store`] if the read buffers can't be made.
+    /// [`CacheError::ReservedSite`]; [`CacheError::MeshMismatch`] if the base's mesh hash isn't
+    /// the working file's; [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`];
+    /// [`CacheError::OpsExhausted`] if a file's head is the site's last op id;
+    /// [`CacheError::Store`] if the read buffers can't be made.
     pub fn open(
-        mesh: Arc<BaseMesh>,
-        file: ProjectFile,
+        working: ProjectFile,
+        base: Option<BaseFile>,
         config: StoreConfig,
     ) -> Result<Self, CacheError> {
         if config.site == RESERVED_SITE {
             return Err(CacheError::ReservedSite);
         }
+        let mesh_hash = working.meta().mesh_hash();
+        if base
+            .as_ref()
+            .is_some_and(|base| base.mesh_hash() != mesh_hash)
+        {
+            return Err(CacheError::MeshMismatch);
+        }
+        let mesh = working.mesh();
         let headroom = Headroom::of(&mesh);
         let minimum = headroom.minimum_budget(config.chunk_bytes);
         if config.budget_bytes < minimum {
             return Err(CacheError::BudgetTooSmall { minimum });
         }
-        let next_op = match file.head() {
-            Some(head) if head.site() == config.site => {
-                Some(head.next().ok_or(CacheError::OpsExhausted)?)
-            }
-            _ => OpId::new(config.site, 0),
-        };
+        let next_op = first_op(
+            config.site,
+            [working.head(), base.as_ref().and_then(BaseFile::head)],
+        )?;
         let mut feed = ChangeFeed::new();
         let save_consumer = feed.subscribe();
         Ok(Self {
             prefetch: Prefetcher::new(),
             mesh,
-            file,
+            mesh_hash,
+            file: working,
+            base,
             budget: Budget::new(config.budget_bytes),
             headroom,
             corrections: Pool::new(config.chunk_bytes),
@@ -602,7 +663,7 @@ impl TileStore {
             to_save: VecDeque::new(),
             feed,
             save_consumer,
-            next_op,
+            next_op: Some(next_op),
             pins: Rc::default(),
             pin_sets: HashMap::new(),
             next_pin_set: 0,
@@ -613,6 +674,49 @@ impl TileStore {
             #[cfg(test)]
             unreadable: None,
         })
+    }
+
+    /// Swaps in `base`, the project file's new save point, and `working`, a fresh working file
+    /// over it, after the project file has been saved; returns the working file it replaces.
+    ///
+    /// Every tile changed since the last save must be in the new save point: the old working
+    /// file's records are no longer read. Resident correction tiles are kept, as they are what
+    /// was just saved, and so are cached evaluations, which stay valid: nothing they read has
+    /// changed. Prefetches in flight are dropped (their workers stop and are joined), and later
+    /// ones read the new files. The op generator continues, past the base's head if that is
+    /// newer.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::MeshMismatch`] if either file isn't over the store's mesh;
+    /// [`CacheError::Internal`] with [`Invariant::DirtyAtRebase`] if a correction tile is dirty
+    /// (an edit the save missed: a bug in the caller); [`CacheError::OpsExhausted`] if the base's
+    /// head is the site's last op id. The store is unchanged then, and the files are dropped.
+    pub fn rebase(
+        &mut self,
+        base: BaseFile,
+        working: ProjectFile,
+    ) -> Result<ProjectFile, CacheError> {
+        self.sync_pins()?;
+        if base.mesh_hash() != self.mesh_hash || working.meta().mesh_hash() != self.mesh_hash {
+            return Err(CacheError::MeshMismatch);
+        }
+        // Every dirty slot has an op to be written with, so no op means no dirty slot.
+        if !self.unsaved.is_empty() {
+            return Err(Invariant::DirtyAtRebase(self.unsaved.len()).into());
+        }
+        let next_op = match self.next_op {
+            Some(op) => {
+                let after = first_op(op.site(), [working.head(), base.head()])?;
+                Some(op.max(after))
+            }
+            None => None,
+        };
+        // The old workers read the old files; dropping them joins them and drops their results.
+        self.prefetch = Prefetcher::new();
+        self.next_op = next_op;
+        self.base = Some(base);
+        Ok(std::mem::replace(&mut self.file, working))
     }
 
     /// A new op id for an edit: the site's next sequence number.
@@ -632,8 +736,8 @@ impl TileStore {
         self.budget.used()
     }
 
-    /// `key`'s correction tile: resident, else loaded from the working file, else all zero (an
-    /// absent tile is zero).
+    /// `key`'s correction tile: resident, else loaded from the working file, else from the base,
+    /// else all zero (an absent tile is zero).
     ///
     /// # Errors
     ///
@@ -909,8 +1013,9 @@ impl TileStore {
         Ok(())
     }
 
-    /// Asks the prefetch workers to read the correction tiles of `keys` from the working file in
-    /// the background, ahead of the store's use of them; returns how many reads were queued.
+    /// Asks the prefetch workers to read the correction tiles of `keys` in the background, ahead
+    /// of the store's use of them, each from the file a load would read (the working file, else
+    /// the base); returns how many reads were queued.
     ///
     /// Tiles already resident, absent from the file (all zero) or already on their way are
     /// skipped. This call's tiles are read before those of earlier calls still waiting, in the
@@ -931,22 +1036,25 @@ impl TileStore {
             .iter()
             .filter(|&&key| seen.insert(key) && self.corrections.find(&key).is_none())
             .filter_map(|&key| {
-                let loc = self.file.locate(&key)?;
-                Some(Job { key, loc })
+                let (source, loc) = self.locate(&key)?;
+                Some(Job { key, source, loc })
             })
             .collect();
-        Ok(self.prefetch.request(&self.file, &jobs)?)
+        Ok(self
+            .prefetch
+            .request(&self.file, self.base.as_ref(), &jobs)?)
     }
 
     /// Installs the correction tiles the prefetch workers have finished, and returns how many.
     ///
     /// A finished tile is installed only if it is still wanted and still current: not resident
     /// (a resident tile may have been edited since, and is what the store uses either way), and
-    /// its record still the latest (any write of the tile, by an edit's write-back or a save,
-    /// moves it). It goes into a free slot, a new chunk if the budget allows one, or the slot of
-    /// a clean correction tile: prefetch never takes a pinned slot, an evaluated chunk or a dirty
-    /// tile's slot, so it never writes anything back. Anything else is dropped, as is a tile a
-    /// worker couldn't read: a later load reads it again and reports the error.
+    /// its record still the one a load would read (any write of the tile, by an edit's
+    /// write-back or a save, moves it to the working file). It goes into a free slot, a new chunk
+    /// if the budget allows one, or the slot of a clean correction tile: prefetch never takes a
+    /// pinned slot, an evaluated chunk or a dirty tile's slot, so it never writes anything
+    /// back. Anything else is dropped, as is a tile a worker couldn't read: a later load reads
+    /// it again and reports the error.
     ///
     /// # Errors
     ///
@@ -956,7 +1064,7 @@ impl TileStore {
         let mut installed = 0;
         while let Some(Fetched { job, slot }) = self.prefetch.next() {
             let Ok(slot) = slot else { continue };
-            let current = self.file.locate(&job.key) == Some(job.loc);
+            let current = self.locate(&job.key) == Some((job.source, job.loc));
             let outcome = if current {
                 self.install(job.key, &slot)
             } else {
@@ -1108,7 +1216,20 @@ impl TileStore {
         }
     }
 
-    /// `key`'s correction slot: resident, else loaded from the file, else reset to zero.
+    /// Where a load of `key`'s correction tile reads it: its record in the working file, else in
+    /// the base; `None` if neither has one (the tile is zero).
+    fn locate(&self, key: &TileKey) -> Option<(Source, Loc)> {
+        self.file
+            .locate(key)
+            .map(|loc| (Source::Working, loc))
+            .or_else(|| {
+                let loc = self.base.as_ref()?.locate(key)?;
+                Some((Source::Base, loc))
+            })
+    }
+
+    /// `key`'s correction slot: resident, else loaded from the working file, else from the base,
+    /// else reset to zero.
     ///
     /// # Errors
     ///
@@ -1121,10 +1242,23 @@ impl TileStore {
         let id = self.acquire_correction(key)?;
         #[cfg(test)]
         self.log.file_reads.push(key);
+        let found = self.locate(&key);
         let slot = self.corrections.get_mut(id).ok_or(Invariant::StaleHandle)?;
-        let read = self
-            .file
-            .read_displacement_into(&key, slot, &mut self.read_scratch);
+        let scratch = &mut self.read_scratch;
+        let read = match (found, &self.base) {
+            (None, _) => Ok(None),
+            (Some((Source::Working, loc)), _) => {
+                self.file.read_at(&key, loc, slot, scratch).map(Some)
+            }
+            (Some((Source::Base, loc)), Some(base)) => {
+                base.read_at(&key, loc, slot, scratch).map(Some)
+            }
+            (Some((Source::Base, _)), None) => {
+                // The slot holds no tile: give it back (it is clean and unpinned).
+                self.corrections.remove(&key)?;
+                return Err(Invariant::MissingBase.into());
+            }
+        };
         #[cfg(test)]
         let read = if self.unreadable == Some(key) {
             Err(io::Error::other("an unreadable tile, for the test").into())
