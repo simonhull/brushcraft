@@ -8,7 +8,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use geom::{CorrectionTile, TileKey};
+use geom::{Channel, CorrectionTile, TileKey};
 use thiserror::Error;
 
 use crate::OpId;
@@ -46,8 +46,8 @@ pub enum StoreError {
     /// An I/O call failed.
     #[error("project file I/O failed")]
     Io(#[from] io::Error),
-    /// Not a BrushCraft project, or a version this build can't read.
-    #[error("not a BrushCraft project file (bad magic or version)")]
+    /// Not a BrushCraft project, or a version or flags this build can't read.
+    #[error("not a BrushCraft project file this build can read (bad magic, version or flags)")]
     BadHeader,
     /// A record's checksum or structure is wrong.
     #[error("the record at byte {offset} is damaged")]
@@ -55,8 +55,9 @@ pub enum StoreError {
         /// Where the record starts.
         offset: u64,
     },
-    /// Recovery stopped at byte `offset`, but a good save point (Index) follows: the file is
-    /// damaged there, not torn at its end. It was left untouched.
+    /// Recovery stopped at byte `offset`, but a good save point (Index) follows, or the Index
+    /// it stopped at verifies but doesn't load: the file is damaged there, not torn at its end.
+    /// It was left untouched.
     #[error("the project file is damaged at byte {offset}, before later good records")]
     DamagedMidFile {
         /// Where recovery stopped.
@@ -86,6 +87,17 @@ pub enum StoreError {
     /// A tile payload didn't encode or decode.
     #[error("tile payload didn't encode or decode")]
     Codec(#[from] CodecError),
+    /// A displacement read or write named a key of another channel.
+    #[error("channel {0} is not displacement")]
+    NotDisplacement(u8),
+    /// A displacement tile's side isn't the side of its key's level.
+    #[error("a displacement tile of side {tile} under a key of side {key}")]
+    WrongSide {
+        /// The key's side.
+        key: u32,
+        /// The tile's side.
+        tile: u32,
+    },
 }
 
 /// A tile record's contents, decompressed.
@@ -131,6 +143,15 @@ impl Access {
             TryLockError::Error(e) => e.into(),
         })
     }
+}
+
+/// Why replay stopped before the end of the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// At an Index that verifies but didn't load as the base: damage.
+    Index,
+    /// At the end of the heads, or a record that doesn't verify.
+    Other,
 }
 
 /// What opening at the latest state does with a torn tail.
@@ -257,11 +278,13 @@ impl ProjectFile {
     /// Opens the project at `path` at its latest state, recovering from a crash: the state is
     /// the last good save point plus every complete record after it, and a torn tail is cut off.
     ///
-    /// Where recovery stops before the end of the file, the rest is searched for an Index that
-    /// verifies. Saves sync their tiles before writing the Index, so everything before a good
-    /// Index was durable: the stop was damage, and the file is left as it is. Without one, the
-    /// rest is a torn or unsynced tail of unsaved edits (even if some of its tile records verify,
-    /// since writeback may have kept a later write and lost an earlier one), and is cut off.
+    /// Where recovery stops before the end of the file, the rest is searched for a save point:
+    /// an Index that verifies, parses and has a plausible parent. Saves sync their tiles before
+    /// writing the Index, so everything before a good Index was durable: the stop was damage, and
+    /// the file is left as it is. So is a stop at an Index that verifies but doesn't load.
+    /// Otherwise the rest is a torn or unsynced tail of unsaved edits (even if some of its tile
+    /// records verify, since writeback may have kept a later write and lost an earlier one), and
+    /// is cut off.
     ///
     /// The file is opened read-write and locked exclusively. If it can't be opened for writing
     /// (no permission, or a read-only file system), it is opened read-only with a shared lock
@@ -310,9 +333,9 @@ impl ProjectFile {
             access,
         };
         let replay_from = this.load_base(&heads, len)?;
-        this.replay(heads.get(replay_from..).unwrap_or_default())?;
+        let stop = this.replay(heads.get(replay_from..).unwrap_or_default())?;
         if this.end < len {
-            if find_index(&this.file, this.end, len)?.is_some() {
+            if stop == Stop::Index || find_index(&this.file, this.end, len)?.is_some() {
                 return Err(StoreError::DamagedMidFile { offset: this.end });
             }
             match repair {
@@ -381,14 +404,15 @@ impl ProjectFile {
         Ok(0)
     }
 
-    /// Replays the records after the base Index while they verify, moving `end` past each one.
-    /// A record that verifies but doesn't parse (a tile key from a newer version, say) is
-    /// skipped.
+    /// Replays the records after the base Index while they verify, moving `end` past each one,
+    /// and says why it stopped. A record that verifies but doesn't parse (a tile key from a
+    /// newer version, say) is skipped, but an Index stops replay: any Index this late failed to
+    /// load as the base, whether or not it parses, and is damage.
     ///
     /// # Errors
     ///
     /// [`StoreError::Io`].
-    fn replay(&mut self, heads: &[(u64, Head)]) -> Result<(), StoreError> {
+    fn replay(&mut self, heads: &[(u64, Head)]) -> Result<Stop, StoreError> {
         for &(offset, head) in heads {
             let raw = read_exact(&self.file, offset, head.total())?;
             let Some((kind, payload)) = verify(&raw) else {
@@ -406,14 +430,13 @@ impl ProjectFile {
                         self.head = self.head.max(Some(tile.op));
                     }
                 }
-                // Any Index this late failed to load as the base.
-                KIND_INDEX => break,
+                KIND_INDEX => return Ok(Stop::Index),
                 // A kind from a newer version: skipped.
                 _ => {}
             }
             self.end = offset + head.total();
         }
-        Ok(())
+        Ok(Stop::Other)
     }
 
     /// Appends a tile record: `key`'s new content, written by `op`. The body is compressed.
@@ -450,13 +473,15 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// As [`ProjectFile::write_tile`], and [`StoreError::Codec`] if the tile is too wide.
+    /// As [`ProjectFile::write_tile`]; [`StoreError::NotDisplacement`] if `key` is of another
+    /// channel, [`StoreError::WrongSide`] if the tile's side isn't the key's.
     pub fn write_displacement(
         &mut self,
         key: TileKey,
         op: OpId,
         tile: &CorrectionTile,
     ) -> Result<(), StoreError> {
+        check_displacement(&key, tile.side())?;
         let (header, body) = encode_displacement(tile)?;
         self.write_tile(key, op, &header, &body)
     }
@@ -541,15 +566,18 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// As [`ProjectFile::read_tile`], and [`StoreError::Codec`] if the payload isn't a valid
-    /// displacement tile. The stated body size is checked against the header's side before
-    /// decompressing.
+    /// As [`ProjectFile::read_tile`]; [`StoreError::Codec`] if the payload isn't a valid
+    /// displacement tile, [`StoreError::NotDisplacement`] if `key` is of another channel,
+    /// [`StoreError::WrongSide`] if the stored side isn't the key's. The side and the stated body
+    /// size are checked before decompressing.
     pub fn read_displacement(
         &self,
         key: &TileKey,
     ) -> Result<Option<(OpId, CorrectionTile)>, StoreError> {
+        check_displacement(key, key.side())?;
         let check = |tile: &TileRecord<'_>| {
-            let (_, body_len) = displacement_body_len(tile.header)?;
+            let (side, body_len) = displacement_body_len(tile.header)?;
+            check_displacement(key, side)?;
             if tile.raw_len == body_len {
                 Ok(())
             } else {
@@ -790,6 +818,24 @@ fn sync_parent(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Checks that `key` is a displacement key whose tiles have `side` vertices per side.
+///
+/// # Errors
+///
+/// [`StoreError::NotDisplacement`], [`StoreError::WrongSide`].
+fn check_displacement(key: &TileKey, side: u32) -> Result<(), StoreError> {
+    if key.channel() != Channel::DISPLACEMENT {
+        Err(StoreError::NotDisplacement(key.channel().raw()))
+    } else if side != key.side() {
+        Err(StoreError::WrongSide {
+            key: key.side(),
+            tile: side,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// The tile in a raw record, if the record verifies and holds a tile of `key`.
 fn tile_record<'a>(raw: &'a [u8], key: &TileKey) -> Option<TileRecord<'a>> {
     match verify(raw) {
@@ -803,7 +849,8 @@ fn tile_record<'a>(raw: &'a [u8], key: &TileKey) -> Option<TileRecord<'a>> {
 ///
 /// # Errors
 ///
-/// [`StoreError::BadHeader`] if it is short or has the wrong magic or version,
+/// [`StoreError::BadHeader`] if it is short or has the wrong magic or version, or flags or
+/// reserved bits this version doesn't know (a later version may set them to mean something),
 /// [`StoreError::Io`].
 fn check_header(file: &File, len: u64) -> Result<(), StoreError> {
     if len < FIRST_RECORD {
@@ -812,7 +859,11 @@ fn check_header(file: &File, len: u64) -> Result<(), StoreError> {
     let mut header = [0; HEADER_LEN];
     file.read_exact_at(&mut header, 0)?;
     let mut r = Reader::new(&header);
-    if r.take(MAGIC.len()) == Some(&MAGIC[..]) && r.u16() == Some(VERSION) {
+    if r.take(MAGIC.len()) == Some(&MAGIC[..])
+        && r.u16() == Some(VERSION)
+        && r.u16() == Some(0)
+        && r.u64() == Some(0)
+    {
         Ok(())
     } else {
         Err(StoreError::BadHeader)
@@ -835,8 +886,11 @@ fn scan_heads(file: &File, len: u64) -> io::Result<Vec<(u64, Head)>> {
     Ok(heads)
 }
 
-/// The first offset in `[from, len)` where a whole Index record starts that verifies: an Index head
-/// whose record ends by `len`, with a good checksum. `None` if there is none.
+/// The first offset in `[from, len)` where a save point starts (see [`save_point`]): proof that the
+/// file is damaged, not torn, at `from`. `None` if there is none.
+///
+/// Every byte offset is a candidate, so the checks beyond the checksum keep bytes inside another
+/// record from passing for one.
 ///
 /// The range is read in windows, so a long tail costs one pass and little memory; a candidate
 /// longer than its window is read on its own.
@@ -866,8 +920,8 @@ fn find_index(file: &File, from: u64, len: u64) -> io::Result<Option<u64>> {
                 .zip(usize::try_from(head.total()).ok())
                 .and_then(|(lo, n)| buf.get(lo..lo.checked_add(n)?));
             let good = match in_buf {
-                Some(record) => verify(record).is_some(),
-                None => verify(&read_exact(file, at, head.total())?).is_some(),
+                Some(record) => save_point(record, at).is_some(),
+                None => save_point(&read_exact(file, at, head.total())?, at).is_some(),
             };
             if good {
                 return Ok(Some(at));
@@ -905,7 +959,7 @@ fn read_exact(file: &File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// The Index at `offset`, if a whole record that verifies and parses as an Index starts there.
+/// The save point at `offset` (see [`save_point`]), if a whole one starts there.
 ///
 /// # Errors
 ///
@@ -917,11 +971,20 @@ fn read_index(file: &File, offset: u64, len: u64) -> io::Result<Option<Index>> {
     if head.kind != KIND_INDEX {
         return Ok(None);
     }
-    let raw = read_exact(file, offset, head.total())?;
-    Ok(match verify(&raw) {
-        Some((KIND_INDEX, payload)) => parse_index_payload(payload),
-        _ => None,
-    })
+    Ok(save_point(&read_exact(file, offset, head.total())?, offset))
+}
+
+/// The Index in `record`, which starts at byte `at`, if it is a save point: it verifies, parses
+/// as an Index, and has no parent or one between the first record and `at`.
+fn save_point(record: &[u8], at: u64) -> Option<Index> {
+    let index = match verify(record)? {
+        (KIND_INDEX, payload) => parse_index_payload(payload)?,
+        _ => return None,
+    };
+    let parent_ok = index
+        .parent
+        .is_none_or(|parent| (FIRST_RECORD..at).contains(&parent));
+    (at >= FIRST_RECORD && parent_ok).then_some(index)
 }
 
 /// The live map of the Index at `offset`, or `None` if any Index of its chain is bad.

@@ -181,6 +181,19 @@ mod tests {
     }
 
     #[test]
+    fn unsubscribing_drops_what_only_that_consumer_held() {
+        let mut feed = ChangeFeed::new();
+        let fast = feed.subscribe();
+        let slow = feed.subscribe();
+        feed.push(key(1), OpId::new(0, 1).unwrap());
+        feed.push(key(2), OpId::new(0, 2).unwrap());
+        assert_eq!(feed.drain(fast).len(), 2, "the fast consumer reads both");
+        assert_eq!(feed.backlog(), 2, "held for the slow one");
+        feed.unsubscribe(slow);
+        assert_eq!(feed.backlog(), 0, "nobody left behind");
+    }
+
+    #[test]
     fn no_consumers_keep_nothing() {
         let mut feed = ChangeFeed::new();
         feed.push(key(1), OpId::new(0, 1).unwrap());
