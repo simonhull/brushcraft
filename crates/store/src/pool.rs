@@ -12,14 +12,13 @@
 //! back to the budget. The default 64 MB chunk is above it; tests use small chunks knowingly.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
 use bytemuck::Pod;
 use geom::TileKey;
 use thiserror::Error;
-
-use crate::StoreError;
 
 /// Bytes the pools may use, shared by all of them.
 ///
@@ -174,9 +173,10 @@ pub(crate) enum Invalidated {
     Marked,
 }
 
-/// Why a pool operation failed.
+/// Why a pool operation failed. `W` is the error of the write-back the caller supplied, for
+/// the operations that may write a dirty slot back; the others can't fail that way.
 #[derive(Debug, Error)]
-pub enum PoolError {
+pub(crate) enum PoolError<W = Infallible> {
     /// Every slot is pinned and the budget allows no more chunks.
     #[error("every slot in the pool is pinned and the budget is spent")]
     Full,
@@ -197,7 +197,7 @@ pub enum PoolError {
     Dirty,
     /// Writing a dirty victim back failed; it keeps its slot.
     #[error("writing a dirty slot back failed")]
-    WriteBack(#[from] StoreError),
+    WriteBack(#[source] W),
 }
 
 /// One slot's bookkeeping.
@@ -207,6 +207,7 @@ struct Meta {
     key: Option<TileKey>,
     /// Bumped whenever the slot is freed, so older handles go stale.
     generation: u32,
+    /// Pins not yet undone.
     pins: u32,
     /// Used since the clock last passed.
     referenced: bool,
@@ -230,6 +231,7 @@ pub(crate) struct Pool<T: Pod> {
     meta: Vec<Vec<Meta>>,
     /// Free slots of mapped chunks.
     free: Vec<Pos>,
+    /// Where each tile's slot is.
     index: HashMap<TileKey, Pos>,
     /// Where the clock resumes, as a flat position (`chunk × per_chunk + index`).
     hand: u64,
@@ -424,12 +426,12 @@ impl<T: Pod> Pool<T> {
     /// [`PoolError::Present`] if `key` already has a slot; [`PoolError::Full`] if every slot is
     /// pinned and the budget allows no chunk; [`PoolError::WriteBack`] if the victim's write-back
     /// failed (it keeps its slot).
-    pub(crate) fn acquire(
+    pub(crate) fn acquire<W>(
         &mut self,
         key: TileKey,
         budget: &mut Budget,
-        write_back: impl FnMut(TileKey, &T) -> Result<(), StoreError>,
-    ) -> Result<SlotId<T>, PoolError> {
+        write_back: impl FnMut(TileKey, &T) -> Result<(), W>,
+    ) -> Result<SlotId<T>, PoolError<W>> {
         if self.index.contains_key(&key) {
             return Err(PoolError::Present);
         }
@@ -559,10 +561,10 @@ impl<T: Pod> Pool<T> {
     /// # Errors
     ///
     /// [`PoolError::WriteBack`]: that slot and those not reached yet keep their tiles.
-    pub(crate) fn evict_all(
+    pub(crate) fn evict_all<W>(
         &mut self,
-        mut write_back: impl FnMut(TileKey, &T) -> Result<(), StoreError>,
-    ) -> Result<(), PoolError> {
+        mut write_back: impl FnMut(TileKey, &T) -> Result<(), W>,
+    ) -> Result<(), PoolError<W>> {
         for chunk in 0..self.chunk_count() {
             self.evict_chunk(chunk, &mut write_back)?;
         }
@@ -576,12 +578,12 @@ impl<T: Pod> Pool<T> {
     /// # Errors
     ///
     /// [`PoolError::WriteBack`]: that slot keeps its tile and its chunk stays mapped.
-    pub(crate) fn shrink_to(
+    pub(crate) fn shrink_to<W>(
         &mut self,
         budget: &mut Budget,
         bytes: usize,
-        mut write_back: impl FnMut(TileKey, &T) -> Result<(), StoreError>,
-    ) -> Result<(), PoolError> {
+        mut write_back: impl FnMut(TileKey, &T) -> Result<(), W>,
+    ) -> Result<(), PoolError<W>> {
         for chunk in (0..self.chunk_count()).rev() {
             if budget.used() <= bytes {
                 break;
@@ -634,10 +636,10 @@ impl<T: Pod> Pool<T> {
     /// # Errors
     ///
     /// [`PoolError::Full`] after two full sweeps without a victim; [`PoolError::WriteBack`].
-    fn victim(
+    fn victim<W>(
         &mut self,
-        mut write_back: impl FnMut(TileKey, &T) -> Result<(), StoreError>,
-    ) -> Result<Pos, PoolError> {
+        mut write_back: impl FnMut(TileKey, &T) -> Result<(), W>,
+    ) -> Result<Pos, PoolError<W>> {
         let total = u64::from(self.chunk_count()) * u64::from(self.per_chunk);
         for _ in 0..2 * total {
             let flat = self.hand % total;
@@ -669,11 +671,11 @@ impl<T: Pod> Pool<T> {
     /// # Errors
     ///
     /// [`PoolError::WriteBack`].
-    fn evict_chunk(
+    fn evict_chunk<W>(
         &mut self,
         chunk: u32,
-        write_back: &mut impl FnMut(TileKey, &T) -> Result<(), StoreError>,
-    ) -> Result<(), PoolError> {
+        write_back: &mut impl FnMut(TileKey, &T) -> Result<(), W>,
+    ) -> Result<(), PoolError<W>> {
         for index in 0..self.per_chunk {
             let pos = (chunk, index);
             let evictable = self
@@ -694,11 +696,11 @@ impl<T: Pod> Pool<T> {
     /// # Errors
     ///
     /// [`PoolError::WriteBack`], leaving it dirty.
-    fn write_back_slot(
+    fn write_back_slot<W>(
         &mut self,
         pos: Pos,
-        write_back: &mut impl FnMut(TileKey, &T) -> Result<(), StoreError>,
-    ) -> Result<(), PoolError> {
+        write_back: &mut impl FnMut(TileKey, &T) -> Result<(), W>,
+    ) -> Result<(), PoolError<W>> {
         let Some(Meta {
             key: Some(key),
             dirty: true,
@@ -708,7 +710,7 @@ impl<T: Pod> Pool<T> {
             return Ok(());
         };
         if let Some(slot) = self.slot(pos) {
-            write_back(key, slot)?;
+            write_back(key, slot).map_err(PoolError::WriteBack)?;
         }
         if let Some(meta) = self.meta_mut(pos) {
             meta.dirty = false;
@@ -805,6 +807,7 @@ mod tests {
     use geom::{FaceId, Level};
 
     use super::*;
+    use crate::StoreError;
     use crate::slot::{CorrectionSlot, EvaluatedSlot};
 
     /// A small slot for the rule tests.
@@ -845,6 +848,48 @@ mod tests {
         Evaluated(SlotId<EvaluatedSlot>),
     }
 
+    /// A write-back for pools whose dirty slots may be dropped.
+    ///
+    /// # Errors
+    ///
+    /// Never.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "it is a pool write-back, whose signature returns a result"
+    )]
+    const fn write_nothing<T>(_: TileKey, _: &T) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// What holds after every step of [`never_exceeds_the_budget`]: the pools are within the
+    /// budget, which counts exactly their chunks, and pinned slots stay.
+    fn check_step(
+        step: u32,
+        budget: &Budget,
+        corrections: &Pool<CorrectionSlot>,
+        evaluated: &Pool<EvaluatedSlot>,
+        pinned: &[Pinned],
+    ) {
+        assert!(
+            budget.used() <= budget.limit(),
+            "step {step}: {} > {}",
+            budget.used(),
+            budget.limit()
+        );
+        assert_eq!(
+            budget.used(),
+            corrections.bytes() + evaluated.bytes(),
+            "step {step}: the budget counts exactly the mapped chunks"
+        );
+        for handle in pinned {
+            let live = match *handle {
+                Pinned::Corrections(id) => corrections.get(id).is_some(),
+                Pinned::Evaluated(id) => evaluated.get(id).is_some(),
+            };
+            assert!(live, "step {step}: a pinned slot stays");
+        }
+    }
+
     #[test]
     fn never_exceeds_the_budget() {
         let chunk = 4 * size_of::<EvaluatedSlot>();
@@ -878,7 +923,7 @@ mod tests {
                 0..=5 => with_pool!(|pool| {
                     if pool.lookup(&k).is_none() {
                         let before = pool.bytes();
-                        match pool.acquire(k, &mut budget, |_, _| Ok(())) {
+                        match pool.acquire(k, &mut budget, write_nothing) {
                             Ok(id) => assert!(pool.get(id).is_some(), "fresh handle is live"),
                             Err(PoolError::Full) => fulls += 1,
                             Err(e) => panic!("acquire: {e}"),
@@ -920,31 +965,14 @@ mod tests {
                 13 => with_pool!(|pool| {
                     pool.invalidate(&k);
                 }),
-                14 if step % 7 == 0 => with_pool!(|pool| pool.evict_all(|_, _| Ok(())).unwrap()),
+                14 if step % 7 == 0 => with_pool!(|pool| pool.evict_all(write_nothing).unwrap()),
                 15 if step % 5 == 0 => with_pool!(|pool| {
                     let target = usize::try_from(next(3)).unwrap() * chunk;
-                    pool.shrink_to(&mut budget, target, |_, _| Ok(())).unwrap();
+                    pool.shrink_to(&mut budget, target, write_nothing).unwrap();
                 }),
                 _ => {}
             }
-            assert!(
-                budget.used() <= budget.limit(),
-                "step {step}: {} > {}",
-                budget.used(),
-                budget.limit()
-            );
-            assert_eq!(
-                budget.used(),
-                corrections.bytes() + evaluated.bytes(),
-                "step {step}: the budget counts exactly the mapped chunks"
-            );
-            for handle in &pinned {
-                let live = match *handle {
-                    Pinned::Corrections(id) => corrections.get(id).is_some(),
-                    Pinned::Evaluated(id) => evaluated.get(id).is_some(),
-                };
-                assert!(live, "step {step}: a pinned slot stays");
-            }
+            check_step(step, &budget, &corrections, &evaluated, &pinned);
         }
         assert!(fulls > 0 && grown > 10, "the workload hit the budget");
     }
@@ -1016,7 +1044,7 @@ mod tests {
         for n in 10..20 {
             pool.acquire(key(n), &mut budget, |k, v: &Small| {
                 written.push((k, *v));
-                Ok(())
+                Ok::<_, StoreError>(())
             })
             .unwrap();
         }
@@ -1031,7 +1059,7 @@ mod tests {
         pool.set_dirty(id, true).unwrap();
         pool.evict_all(|k, v: &Small| {
             written.push((k, *v));
-            Ok(())
+            Ok::<_, StoreError>(())
         })
         .unwrap();
         assert_eq!(
@@ -1083,7 +1111,7 @@ mod tests {
         let mut written = Vec::new();
         pool.acquire(key(10), &mut budget, |k, _: &Small| {
             written.push(k);
-            Ok(())
+            Ok::<_, StoreError>(())
         })
         .unwrap();
         assert!(written.is_empty(), "and was taken clean");
@@ -1091,7 +1119,7 @@ mod tests {
         assert!(pool.victim_is_dirty(), "slot 1 is next");
         pool.acquire(key(11), &mut budget, |k, _: &Small| {
             written.push(k);
-            Ok(())
+            Ok::<_, StoreError>(())
         })
         .unwrap();
         assert_eq!(written, vec![key(1)], "and was written back");
@@ -1261,7 +1289,7 @@ mod tests {
         let mut written = Vec::new();
         pool.shrink_to(&mut budget, 0, |k, _: &Small| {
             written.push(k);
-            Ok(())
+            Ok::<_, StoreError>(())
         })
         .unwrap();
         assert_eq!(

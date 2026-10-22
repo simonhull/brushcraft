@@ -1153,6 +1153,49 @@ fn editing_a_tile_equals_setting_its_vertices() {
 }
 
 #[test]
+fn a_failed_write_back_is_reported_and_keeps_the_tile() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("work.bcp");
+    let saved = {
+        let mut store = TileStore::open(
+            Arc::clone(&mesh),
+            ProjectFile::create(&path).unwrap(),
+            roomy(),
+        )
+        .unwrap();
+        apply(
+            &mut store,
+            &mut CorrectionMap::new(),
+            &random_edits(&mesh, 3, 20, 20),
+        );
+        store.save().unwrap()
+    };
+    // Opened at a save point, the file is read-only: edits stay in their slots, and writing
+    // them back fails.
+    let file = ProjectFile::open_at(&path, saved).unwrap();
+    let mut store = TileStore::open(Arc::clone(&mesh), file, roomy()).unwrap();
+    let edit = random_edits(&mesh, 3, 1, 21);
+    apply(&mut store, &mut CorrectionMap::new(), &edit);
+    let dirty: Vec<TileKey> = store.unsaved.keys().copied().collect();
+    assert!(!dirty.is_empty(), "the edit made tiles dirty");
+    let evicted = store.evict_all();
+    assert!(
+        matches!(evicted, Err(CacheError::WriteBack(StoreError::ReadOnly))),
+        "evicting a dirty tile reports the write: {evicted:?}"
+    );
+    let saving = store.save();
+    assert!(
+        matches!(saving, Err(CacheError::WriteBack(StoreError::ReadOnly))),
+        "and so does saving it: {saving:?}"
+    );
+    for key in &dirty {
+        let id = store.corrections.find(key).unwrap();
+        assert_eq!(store.corrections.is_dirty(id), Some(true), "{key:?} kept");
+    }
+}
+
+#[test]
 fn a_tile_edited_by_one_op_goes_to_the_feed_once() {
     let dir = TestDir::new();
     let mesh = mesh();
@@ -1279,9 +1322,13 @@ fn a_copy_that_fails_to_write_keeps_its_written_twins_invalidated() {
     store.corrections.get_mut(id).unwrap().side = 0;
     let op = store.next_op().unwrap();
     let c = Vec3::new(0.002, 0.0, 0.0);
+    let failed = store.set_correction(face, level, i, j, c, op);
     assert!(
-        store.set_correction(face, level, i, j, c, op).is_err(),
-        "the broken copy fails the edit"
+        matches!(
+            failed,
+            Err(CacheError::Internal(Invariant::CorrectionSlot(_)))
+        ),
+        "the broken copy fails the edit as a broken invariant, not as rejected input: {failed:?}"
     );
     assert_eq!(
         store

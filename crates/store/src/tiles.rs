@@ -57,6 +57,8 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::convert::Infallible;
+#[cfg(test)]
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -68,7 +70,6 @@ use geom::{
 };
 use thiserror::Error;
 
-use crate::codec::CodecError;
 use crate::deps::DepGraph;
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{ProjectFile, ReadScratch, StoreError};
@@ -152,20 +153,25 @@ impl Headroom {
 /// Why a [`TileStore`] operation failed.
 #[derive(Debug, Error)]
 pub enum CacheError {
-    /// Reading or writing the working file failed.
+    /// Reading the working file, or recording a save point in it, failed.
     #[error("project file operation failed")]
     Store(#[from] StoreError),
-    /// A pool operation failed: [`PoolError::Full`] when every slot is pinned and no chunk can
-    /// be taken back, or a dirty slot's write-back failed.
-    #[error("tile pool operation failed")]
-    Pool(#[from] PoolError),
-    /// Evaluation failed.
+    /// No slot to be had: every slot of the pool that needs one is pinned, and no chunk without a
+    /// pin is left to take back. Only pins taken with [`TileStore::pin`] can crowd the store's
+    /// own work this far (see [`StoreConfig::minimum_budget`]).
+    #[error("every slot is pinned and no chunk can be taken back")]
+    Full,
+    /// Writing a dirty correction tile to the working file failed: when its slot was needed, or
+    /// on [`TileStore::save`]. The tile stays resident and dirty.
+    #[error("writing a dirty correction tile back failed")]
+    WriteBack(#[source] StoreError),
+    /// Evaluation failed (not for a valid mesh).
     #[error("evaluation failed")]
     Eval(#[from] EvalError),
-    /// A correction was rejected (not finite, level 0, unknown face, outside the face), or a
-    /// slot didn't hold a valid tile.
+    /// A correction was rejected: not finite, at level 0, on an unknown face, or outside the face
+    /// or tile. Nothing was written.
     #[error("correction rejected")]
-    Correction(#[from] CorrectionError),
+    Correction(#[source] CorrectionError),
     /// The key isn't a base-layer displacement tile above level 0 of a face of this mesh.
     #[error("{0:?} is not a base-layer displacement tile of this mesh above level 0")]
     NotATile(TileKey),
@@ -192,6 +198,71 @@ pub enum CacheError {
         /// The budget.
         budget: usize,
     },
+    /// The store found one of its own invariants broken: a bug in the store, never caused by
+    /// its input or the file's contents.
+    #[error("internal invariant broken")]
+    Internal(#[from] Invariant),
+}
+
+/// An invariant of [`TileStore`] found broken (see [`CacheError::Internal`]).
+#[derive(Debug, Error)]
+pub enum Invariant {
+    /// A dirty correction tile had no op to write it with.
+    #[error("dirty correction tile {0:?} has no op")]
+    MissingOp(TileKey),
+    /// A correction slot didn't hold a valid tile, or refused a write the store had checked.
+    #[error("a correction slot is broken")]
+    CorrectionSlot(#[source] CorrectionError),
+    /// A slot handle was used after its slot was freed.
+    #[error("a slot handle outlived its slot")]
+    StaleHandle,
+    /// A tile was given a second slot in one pool.
+    #[error("a tile was given a second slot")]
+    SecondSlot,
+    /// A slot was unpinned more often than it was pinned.
+    #[error("a slot was unpinned more often than pinned")]
+    NotPinned,
+    /// A pinned slot was to be freed.
+    #[error("a pinned slot was to be freed")]
+    FreedPinned,
+    /// A dirty slot was to be freed without being written back.
+    #[error("a dirty slot was to be freed")]
+    FreedDirty,
+    /// A slot or buffer held fewer values than a tile has.
+    #[error("a buffer of {got} values is shorter than a tile's {expected}")]
+    ShortBuffer {
+        /// Values a tile has.
+        expected: usize,
+        /// Values the buffer held.
+        got: usize,
+    },
+}
+
+/// No operation fails with [`Infallible`]: this lets `?` take pool results whose write-back
+/// can't fail.
+impl From<Infallible> for CacheError {
+    fn from(never: Infallible) -> Self {
+        match never {}
+    }
+}
+
+/// A pool's error, as the store reports it: [`CacheError::Full`], the write-back's own error,
+/// or a broken invariant.
+impl<W> From<PoolError<W>> for CacheError
+where
+    Self: From<W>,
+{
+    fn from(e: PoolError<W>) -> Self {
+        match e {
+            PoolError::Full => Self::Full,
+            PoolError::WriteBack(w) => w.into(),
+            PoolError::Present => Invariant::SecondSlot.into(),
+            PoolError::Stale => Invariant::StaleHandle.into(),
+            PoolError::NotPinned => Invariant::NotPinned.into(),
+            PoolError::Pinned => Invariant::FreedPinned.into(),
+            PoolError::Dirty => Invariant::FreedDirty.into(),
+        }
+    }
 }
 
 /// Pin sets whose guards have been dropped, waiting for the store to unpin them.
@@ -378,10 +449,10 @@ fn vertex_count(key: &TileKey) -> usize {
 ///
 /// # Errors
 ///
-/// [`EvalError::BufferSize`] if there are fewer (no slot or scratch buffer is smaller than the
+/// [`Invariant::ShortBuffer`] if there are fewer (no slot or scratch buffer is smaller than the
 /// largest tile, so this doesn't happen).
-fn prefix(values: &[Vec3], n: usize) -> Result<&[Vec3], EvalError> {
-    values.get(..n).ok_or(EvalError::BufferSize {
+fn prefix(values: &[Vec3], n: usize) -> Result<&[Vec3], Invariant> {
+    values.get(..n).ok_or(Invariant::ShortBuffer {
         expected: n,
         got: values.len(),
     })
@@ -392,11 +463,25 @@ fn prefix(values: &[Vec3], n: usize) -> Result<&[Vec3], EvalError> {
 /// # Errors
 ///
 /// As [`prefix`].
-fn prefix_mut(values: &mut [Vec3], n: usize) -> Result<&mut [Vec3], EvalError> {
+fn prefix_mut(values: &mut [Vec3], n: usize) -> Result<&mut [Vec3], Invariant> {
     let got = values.len();
     values
         .get_mut(..n)
-        .ok_or(EvalError::BufferSize { expected: n, got })
+        .ok_or(Invariant::ShortBuffer { expected: n, got })
+}
+
+/// The evaluated pool's write-back: evaluated slots are never dirty, so there is nothing to
+/// write.
+///
+/// # Errors
+///
+/// Never.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "it is the pools' write-back, whose signature returns a result"
+)]
+const fn nothing_to_write<T>(_: TileKey, _: &T) -> Result<(), Infallible> {
+    Ok(())
 }
 
 /// Records `next` in `outcome` unless `outcome` already holds an error: for cleanup loops that
@@ -412,21 +497,21 @@ fn keep_first<E: Into<CacheError>>(outcome: &mut Result<(), CacheError>, next: R
 ///
 /// # Errors
 ///
-/// [`StoreError::Io`] if the slot has no recorded op (every slot marked dirty gets one first,
-/// so this doesn't happen), [`StoreError::Codec`] if the slot doesn't hold a valid tile, or the
-/// file's write errors.
+/// [`CacheError::WriteBack`] if the file's write fails; [`CacheError::Internal`] if the slot has
+/// no recorded op (every slot marked dirty gets one first) or doesn't hold a valid tile.
 fn write_slot(
     file: &mut ProjectFile,
     unsaved: &mut HashMap<TileKey, OpId>,
     key: TileKey,
     slot: &CorrectionSlot,
-) -> Result<(), StoreError> {
+) -> Result<(), CacheError> {
     let op = unsaved
         .get(&key)
         .copied()
-        .ok_or_else(|| io::Error::other("a dirty correction tile has no op"))?;
-    let tile = slot.to_tile().map_err(CodecError::from)?;
-    file.write_displacement(key, op, &tile)?;
+        .ok_or(Invariant::MissingOp(key))?;
+    let tile = slot.to_tile().map_err(Invariant::CorrectionSlot)?;
+    file.write_displacement(key, op, &tile)
+        .map_err(CacheError::WriteBack)?;
     unsaved.remove(&key);
     Ok(())
 }
@@ -510,13 +595,14 @@ impl TileStore {
     /// # Errors
     ///
     /// [`CacheError::NotATile`]; [`CacheError::Store`] if the record can't be read;
-    /// [`CacheError::Pool`] if no slot can be had.
+    /// [`CacheError::Full`] or [`CacheError::WriteBack`] if no slot can be had.
     pub fn correction(&mut self, key: TileKey) -> Result<CorrectionView<'_>, CacheError> {
         self.sync_pins()?;
         self.poll()?;
         self.check_key(&key)?;
         let id = self.load_correction(key)?;
-        Ok(self.corrections.get(id).ok_or(PoolError::Stale)?.view()?)
+        let slot = self.corrections.get(id).ok_or(Invariant::StaleHandle)?;
+        Ok(slot.view().map_err(Invariant::CorrectionSlot)?)
     }
 
     /// Sets the correction at face-grid vertex `(i, j)` of `face` at `level` to `c`, as edit
@@ -534,10 +620,11 @@ impl TileStore {
     ///
     /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`],
     /// [`CorrectionError::LevelZero`], [`CorrectionError::UnknownFace`] or
-    /// [`CorrectionError::OutOfTile`], before anything is written; [`CacheError::Store`] or
-    /// [`CacheError::Pool`] if a copy's tile can't be loaded, also before anything is written.
-    /// Should writing a copy fail all the same (a broken slot), the copies written before it
-    /// are kept, and their evaluations dropped, before the error is returned.
+    /// [`CorrectionError::OutOfTile`], before anything is written; [`CacheError::Store`],
+    /// [`CacheError::Full`] or [`CacheError::WriteBack`] if a copy's tile can't be loaded, also
+    /// before anything is written. Should writing a copy fail all the same
+    /// ([`CacheError::Internal`]: a broken slot), the copies written before it are kept, and
+    /// their evaluations dropped, before the error is returned.
     pub fn set_correction(
         &mut self,
         face: FaceId,
@@ -550,19 +637,23 @@ impl TileStore {
         self.sync_pins()?;
         self.poll()?;
         if !c.is_finite() {
-            return Err(CorrectionError::NotFinite.into());
+            return Err(CacheError::Correction(CorrectionError::NotFinite));
         }
         if level == Level::ZERO {
-            return Err(CorrectionError::LevelZero.into());
+            return Err(CacheError::Correction(CorrectionError::LevelZero));
         }
         let topology = self.mesh.topology();
         if !topology.contains(face) {
-            return Err(CorrectionError::UnknownFace(face).into());
+            return Err(CacheError::Correction(CorrectionError::UnknownFace(face)));
         }
         let copies = topology.copies(face, level, i, j);
         if copies.is_empty() {
             let side = level.face_quads() + 1;
-            return Err(CorrectionError::OutOfTile { i, j, side }.into());
+            return Err(CacheError::Correction(CorrectionError::OutOfTile {
+                i,
+                j,
+                side,
+            }));
         }
         // Every copy is loaded and pinned before any is written, so a failed load leaves the
         // twins agreeing.
@@ -603,9 +694,9 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::NotATile`]; [`CacheError::Store`] or [`CacheError::Pool`] if the tile's
-    /// corrections can't be loaded (nothing is written then); [`CacheError::Pool`] if a slot
-    /// handle went stale when the tiles are unpinned (not with a consistent pool).
+    /// [`CacheError::NotATile`]; [`CacheError::Store`], [`CacheError::Full`] or
+    /// [`CacheError::WriteBack`] if the tile's corrections can't be loaded (nothing is written
+    /// then); [`CacheError::Internal`] if a slot handle went stale.
     pub fn edit_tile<R>(
         &mut self,
         key: TileKey,
@@ -648,16 +739,17 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::NotATile`]; [`CacheError::Pool`] with [`PoolError::Full`] if the pins
-    /// taken with [`TileStore::pin`] leave too little of the budget for the evaluation's own
-    /// (never without such pins); [`CacheError::Store`] if a correction tile can't be read;
-    /// [`CacheError::Eval`] (not for a valid mesh).
+    /// [`CacheError::NotATile`]; [`CacheError::Full`] if the pins taken with
+    /// [`TileStore::pin`] leave too little of the budget for the evaluation's own (never without
+    /// such pins); [`CacheError::Store`] if a correction tile can't be read;
+    /// [`CacheError::WriteBack`] if making room for one fails; [`CacheError::Eval`] (not for a
+    /// valid mesh).
     pub fn evaluate(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
         self.sync_pins()?;
         self.poll()?;
         self.check_key(&key)?;
         let id = self.ensure_positions(key)?;
-        let slot = self.evaluated.get(id).ok_or(PoolError::Stale)?;
+        let slot = self.evaluated.get(id).ok_or(Invariant::StaleHandle)?;
         Ok(prefix(&slot.positions, vertex_count(&key))?)
     }
 
@@ -673,7 +765,7 @@ impl TileStore {
         self.poll()?;
         self.check_key(&key)?;
         let id = self.ensure_normals(key)?;
-        let slot = self.evaluated.get(id).ok_or(PoolError::Stale)?;
+        let slot = self.evaluated.get(id).ok_or(Invariant::StaleHandle)?;
         Ok(prefix(&slot.normals, vertex_count(&key))?)
     }
 
@@ -727,7 +819,8 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Store`]; [`CacheError::Pool`] (not after a successful edit).
+    /// [`CacheError::WriteBack`] if a tile's write fails; [`CacheError::Store`] if the save
+    /// point's does.
     pub fn save(&mut self) -> Result<u64, CacheError> {
         self.sync_pins()?;
         self.to_save.extend(
@@ -740,7 +833,7 @@ impl TileStore {
             if let Some(id) = self.corrections.find(&key)
                 && self.corrections.is_dirty(id) == Some(true)
             {
-                let slot = self.corrections.get(id).ok_or(PoolError::Stale)?;
+                let slot = self.corrections.get(id).ok_or(Invariant::StaleHandle)?;
                 write_slot(&mut self.file, &mut self.unsaved, key, slot)?;
                 self.corrections.set_dirty(id, false)?;
             }
@@ -753,11 +846,10 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] with [`PoolError::WriteBack`]: that tile and those not reached yet
-    /// stay.
+    /// [`CacheError::WriteBack`]: that tile and those not reached yet stay.
     pub fn evict_all(&mut self) -> Result<(), CacheError> {
         self.sync_pins()?;
-        let evaluated = self.evaluated.evict_all(|_, _| Ok(()));
+        let evaluated = self.evaluated.evict_all(nothing_to_write);
         self.note_evictions();
         evaluated?;
         let (file, unsaved) = (&mut self.file, &mut self.unsaved);
@@ -789,8 +881,7 @@ impl TileStore {
     /// # Errors
     ///
     /// [`CacheError::NotATile`], before anything is queued; [`CacheError::Store`] if the
-    /// workers can't be started; [`CacheError::Pool`] as for [`TileStore::evaluate`] (a pin
-    /// guard's release).
+    /// workers can't be started.
     pub fn prefetch(&mut self, keys: &[TileKey]) -> Result<usize, CacheError> {
         self.sync_pins()?;
         for key in keys {
@@ -819,8 +910,8 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] with [`PoolError::WriteBack`] if making room wrote a dirty tile back
-    /// and that failed; the results not reached yet wait for the next poll.
+    /// [`CacheError::WriteBack`] if making room wrote a dirty tile back and that failed; the
+    /// results not reached yet wait for the next poll.
     pub fn poll(&mut self) -> Result<usize, CacheError> {
         let mut installed = 0;
         while let Some(Fetched { job, slot }) = self.prefetch.next() {
@@ -847,19 +938,22 @@ impl TileStore {
     }
 
     /// Puts a prefetched correction tile, read at its latest record, into a fresh slot; whether
-    /// it did. A resident tile ([`PoolError::Present`]; every dirty tile is resident) is left
-    /// alone, and a full pool ([`PoolError::Full`]) just drops the tile.
+    /// it did. A resident tile (every dirty tile is resident) is left alone, and a full pool
+    /// ([`CacheError::Full`]) just drops the tile.
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] with [`PoolError::WriteBack`], as for [`TileStore::poll`].
+    /// [`CacheError::WriteBack`], as for [`TileStore::poll`].
     fn install(&mut self, key: TileKey, tile: &CorrectionSlot) -> Result<bool, CacheError> {
+        if self.corrections.find(&key).is_some() {
+            return Ok(false);
+        }
         let id = match self.acquire_correction(key) {
             Ok(id) => id,
-            Err(CacheError::Pool(PoolError::Present | PoolError::Full)) => return Ok(false),
+            Err(CacheError::Full) => return Ok(false),
             Err(e) => return Err(e),
         };
-        *self.corrections.get_mut(id).ok_or(PoolError::Stale)? = *tile;
+        *self.corrections.get_mut(id).ok_or(Invariant::StaleHandle)? = *tile;
         #[cfg(test)]
         {
             self.log.prefetched += 1;
@@ -871,8 +965,8 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] if a pinned slot's handle went stale (pinned slots are never freed,
-    /// so this doesn't happen). Every released set is unpinned either way.
+    /// [`CacheError::Internal`] if a pinned slot's handle went stale (pinned slots are never
+    /// freed, so this doesn't happen). Every released set is unpinned either way.
     fn sync_pins(&mut self) -> Result<(), CacheError> {
         let released = std::mem::take(&mut self.pins.borrow_mut().released);
         let mut outcome = Ok(());
@@ -905,7 +999,10 @@ impl TileStore {
     /// As [`TileStore::evaluate`]; nothing stays pinned then.
     fn pin_one(&mut self, key: TileKey) -> Result<Pinned, CacheError> {
         let held = self.pin_current(BTreeSet::from([key]))?;
-        let evaluated = held.first().map(|&(_, id)| id).ok_or(PoolError::Stale)?;
+        let evaluated = held
+            .first()
+            .map(|&(_, id)| id)
+            .ok_or(Invariant::StaleHandle)?;
         let correction = self.load_correction(key).and_then(|id| {
             self.corrections.pin(id)?;
             Ok(id)
@@ -975,7 +1072,7 @@ impl TileStore {
     /// # Errors
     ///
     /// [`CacheError::Store`] if the record can't be read (the slot is freed again);
-    /// [`CacheError::Pool`] if no slot can be had.
+    /// [`CacheError::Full`] or [`CacheError::WriteBack`] if no slot can be had.
     fn load_correction(&mut self, key: TileKey) -> Result<SlotId<CorrectionSlot>, CacheError> {
         if let Some((id, _)) = self.corrections.lookup(&key) {
             return Ok(id);
@@ -983,7 +1080,7 @@ impl TileStore {
         let id = self.acquire_correction(key)?;
         #[cfg(test)]
         self.log.file_reads.push(key);
-        let slot = self.corrections.get_mut(id).ok_or(PoolError::Stale)?;
+        let slot = self.corrections.get_mut(id).ok_or(Invariant::StaleHandle)?;
         let read = self
             .file
             .read_displacement_into(&key, slot, &mut self.read_scratch);
@@ -995,7 +1092,9 @@ impl TileStore {
         };
         let filled = match read {
             Ok(Some(_)) => Ok(()),
-            Ok(None) => slot.reset(key.side()).map_err(CacheError::from),
+            Ok(None) => slot
+                .reset(key.side())
+                .map_err(|e| Invariant::CorrectionSlot(e).into()),
             Err(e) => Err(e.into()),
         };
         if let Err(e) = filled {
@@ -1012,7 +1111,7 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`].
+    /// [`CacheError::Full`]; [`CacheError::WriteBack`] if a dirty tile's write-back fails.
     fn acquire_correction(&mut self, key: TileKey) -> Result<SlotId<CorrectionSlot>, CacheError> {
         let chunk = self.corrections.chunk_bytes();
         let evicts_dirty = !self.corrections.has_free_slot()
@@ -1023,7 +1122,7 @@ impl TileStore {
             let target = self.budget.limit().saturating_sub(chunk);
             let shrunk = self
                 .evaluated
-                .shrink_to(&mut self.budget, target, |_, _| Ok(()));
+                .shrink_to(&mut self.budget, target, nothing_to_write);
             self.note_evictions();
             shrunk?;
         }
@@ -1034,13 +1133,13 @@ impl TileStore {
             }) {
                 Err(PoolError::Full) if attempt == 0 => {
                     if !self.make_room(self.corrections.chunk_bytes())? {
-                        return Err(PoolError::Full.into());
+                        return Err(CacheError::Full);
                     }
                 }
                 other => return Ok(other?),
             }
         }
-        Err(PoolError::Full.into())
+        Err(CacheError::Full)
     }
 
     /// A fresh slot for `key`'s evaluated tile, taking chunks back from the pools if the
@@ -1048,22 +1147,25 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`].
+    /// [`CacheError::Full`]; [`CacheError::WriteBack`] if taking a correction chunk back
+    /// writes a dirty tile back and that fails.
     fn acquire_evaluated(&mut self, key: TileKey) -> Result<SlotId<EvaluatedSlot>, CacheError> {
         for attempt in 0..2 {
             // Evaluated slots are never dirty: there is nothing to write back.
-            let acquired = self.evaluated.acquire(key, &mut self.budget, |_, _| Ok(()));
+            let acquired = self
+                .evaluated
+                .acquire(key, &mut self.budget, nothing_to_write);
             self.note_evictions();
             match acquired {
                 Err(PoolError::Full) if attempt == 0 => {
                     if !self.make_room(self.evaluated.chunk_bytes())? {
-                        return Err(PoolError::Full.into());
+                        return Err(CacheError::Full);
                     }
                 }
                 other => return Ok(other?),
             }
         }
-        Err(PoolError::Full.into())
+        Err(CacheError::Full)
     }
 
     /// Takes chunks back until another `need` bytes fit the budget; whether they do now.
@@ -1083,11 +1185,11 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] with [`PoolError::WriteBack`].
+    /// [`CacheError::WriteBack`].
     fn give_back(&mut self, bytes: usize) -> Result<(), CacheError> {
         let evaluated = self
             .evaluated
-            .shrink_to(&mut self.budget, bytes, |_, _| Ok(()));
+            .shrink_to(&mut self.budget, bytes, nothing_to_write);
         self.note_evictions();
         evaluated?;
         if self.budget.used() > bytes {
@@ -1112,9 +1214,8 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] for a stale handle; [`CacheError::Correction`] if the slot doesn't
-    /// hold a valid tile or `(i, j)` is outside it (neither happens for a loaded slot and a
-    /// copy's coordinates).
+    /// [`CacheError::Internal`] for a stale handle, or if the slot doesn't hold a valid tile or
+    /// `(i, j)` is outside it (neither happens for a loaded slot and a copy's coordinates).
     fn write_correction(
         &mut self,
         key: TileKey,
@@ -1123,8 +1224,10 @@ impl TileStore {
         c: Vec3,
         op: OpId,
     ) -> Result<(), CacheError> {
-        let slot = self.corrections.get_mut(id).ok_or(PoolError::Stale)?;
-        slot.view_mut()?.set(i, j, c)?;
+        let slot = self.corrections.get_mut(id).ok_or(Invariant::StaleHandle)?;
+        slot.view_mut()
+            .and_then(|mut view| view.set(i, j, c))
+            .map_err(Invariant::CorrectionSlot)?;
         self.mark_written(key, id, op)
     }
 
@@ -1134,7 +1237,7 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] for a stale handle.
+    /// [`CacheError::Internal`] for a stale handle.
     fn mark_written(
         &mut self,
         key: TileKey,
@@ -1198,7 +1301,10 @@ impl TileStore {
             return Ok(id);
         }
         let held = self.pin_current(BTreeSet::from([key]))?;
-        let id = held.first().map(|&(_, id)| id).ok_or(PoolError::Stale)?;
+        let id = held
+            .first()
+            .map(|&(_, id)| id)
+            .ok_or(Invariant::StaleHandle)?;
         self.unpin_held(&held)?;
         Ok(id)
     }
@@ -1357,8 +1463,9 @@ impl TileStore {
         let corrections = self
             .corrections
             .get(correction)
-            .ok_or(PoolError::Stale)?
-            .view()?;
+            .ok_or(Invariant::StaleHandle)?
+            .view()
+            .map_err(Invariant::CorrectionSlot)?;
         let source = Resident {
             mesh: &self.mesh,
             pool: &self.evaluated,
@@ -1379,7 +1486,7 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] if no slot can be had.
+    /// [`CacheError::Full`] if no slot can be had.
     fn store_positions(
         &mut self,
         key: TileKey,
@@ -1392,7 +1499,7 @@ impl TileStore {
             None => self.acquire_evaluated(key)?,
         };
         let n = vertex_count(&key);
-        let slot = self.evaluated.get_mut(id).ok_or(PoolError::Stale)?;
+        let slot = self.evaluated.get_mut(id).ok_or(Invariant::StaleHandle)?;
         prefix_mut(&mut slot.positions, n)?.copy_from_slice(prefix(&self.scratch, n)?);
         self.evaluated.mark_fresh(id)?;
         self.deps.record_positions(key, parents);
@@ -1440,7 +1547,7 @@ impl TileStore {
             .ok()
             .and_then(|at| held.get(at))
             .map(|&(_, id)| id)
-            .ok_or(PoolError::Stale)?;
+            .ok_or(Invariant::StaleHandle)?;
         let n = vertex_count(&key);
         let source = Resident {
             mesh: &self.mesh,
@@ -1453,7 +1560,7 @@ impl TileStore {
             region,
             prefix_mut(&mut self.scratch, n)?,
         )?;
-        let slot = self.evaluated.get_mut(own).ok_or(PoolError::Stale)?;
+        let slot = self.evaluated.get_mut(own).ok_or(Invariant::StaleHandle)?;
         prefix_mut(&mut slot.normals, n)?.copy_from_slice(prefix(&self.scratch, n)?);
         self.deps.record_normals(key, held.iter().map(|(k, _)| k));
         #[cfg(test)]
@@ -1465,7 +1572,7 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Pool`] if a handle went stale (pinned slots are never freed, so this
+    /// [`CacheError::Internal`] if a handle went stale (pinned slots are never freed, so this
     /// doesn't happen); every tile is unpinned either way.
     fn unpin_held(&mut self, held: &Held) -> Result<(), CacheError> {
         let mut outcome = Ok(());
@@ -1530,10 +1637,18 @@ impl TileEdit<'_> {
     /// [`CacheError::Correction`] with [`CorrectionError::OutOfTile`].
     pub fn get(&self, i: u32, j: u32) -> Result<Vec3, CacheError> {
         let side = self.key.side();
-        let own = self.touched.first().ok_or(PoolError::Stale)?;
-        let slot = self.store.corrections.get(own.id).ok_or(PoolError::Stale)?;
-        let value = slot.view()?.get(i, j);
-        Ok(value.ok_or(CorrectionError::OutOfTile { i, j, side })?)
+        let own = self.touched.first().ok_or(Invariant::StaleHandle)?;
+        let slot = self
+            .store
+            .corrections
+            .get(own.id)
+            .ok_or(Invariant::StaleHandle)?;
+        let value = slot.view().map_err(Invariant::CorrectionSlot)?.get(i, j);
+        value.ok_or(CacheError::Correction(CorrectionError::OutOfTile {
+            i,
+            j,
+            side,
+        }))
     }
 
     /// Sets the correction at `(i, j)` of the tile to `c`, in every copy of the vertex.
@@ -1544,16 +1659,20 @@ impl TileEdit<'_> {
     /// # Errors
     ///
     /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`] or
-    /// [`CorrectionError::OutOfTile`], before anything is written; [`CacheError::Store`] or
-    /// [`CacheError::Pool`] if a neighbouring tile holding a copy can't be loaded, also before
-    /// anything of this vertex is written.
+    /// [`CorrectionError::OutOfTile`], before anything is written; [`CacheError::Store`],
+    /// [`CacheError::Full`] or [`CacheError::WriteBack`] if a neighbouring tile holding a copy
+    /// can't be loaded, also before anything of this vertex is written.
     pub fn set(&mut self, i: u32, j: u32, c: Vec3) -> Result<(), CacheError> {
         if !c.is_finite() {
-            return Err(CorrectionError::NotFinite.into());
+            return Err(CacheError::Correction(CorrectionError::NotFinite));
         }
         let side = self.key.side();
         if i >= side || j >= side {
-            return Err(CorrectionError::OutOfTile { i, j, side }.into());
+            return Err(CacheError::Correction(CorrectionError::OutOfTile {
+                i,
+                j,
+                side,
+            }));
         }
         let inside = 1..side - 1;
         if inside.contains(&i) && inside.contains(&j) {
@@ -1581,7 +1700,7 @@ impl TileEdit<'_> {
     ///
     /// # Errors
     ///
-    /// As [`TileStore::load_correction`]; [`CacheError::Pool`] for a stale handle.
+    /// As [`TileStore::load_correction`]; [`CacheError::Internal`] for a stale handle.
     fn touch(&mut self, key: TileKey) -> Result<usize, CacheError> {
         if let Some(n) = self.touched.iter().position(|tile| tile.key == key) {
             return Ok(n);
@@ -1602,13 +1721,15 @@ impl TileEdit<'_> {
     ///
     /// As [`TileStore::write_correction`].
     fn write(&mut self, n: usize, (i, j): (u32, u32), c: Vec3) -> Result<(), CacheError> {
-        let tile = self.touched.get_mut(n).ok_or(PoolError::Stale)?;
+        let tile = self.touched.get_mut(n).ok_or(Invariant::StaleHandle)?;
         let slot = self
             .store
             .corrections
             .get_mut(tile.id)
-            .ok_or(PoolError::Stale)?;
-        slot.view_mut()?.set(i, j, c)?;
+            .ok_or(Invariant::StaleHandle)?;
+        slot.view_mut()
+            .and_then(|mut view| view.set(i, j, c))
+            .map_err(Invariant::CorrectionSlot)?;
         if !tile.written {
             tile.written = true;
             self.store.mark_written(tile.key, tile.id, self.op)?;
