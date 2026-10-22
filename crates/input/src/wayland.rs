@@ -93,10 +93,16 @@ pub fn surface_id(window: &impl HasWindowHandle) -> Result<SurfaceId, BackendErr
 /// Dropping it stops the thread.
 #[derive(Debug)]
 pub struct PenBackend {
+    thread: InputThread,
+    events: Events<Event>,
+}
+
+/// The input thread, joined when this is stopped or dropped.
+#[derive(Debug)]
+struct InputThread {
     /// Signalled (made readable) to tell the thread to exit.
     stop: Arc<OwnedFd>,
-    thread: Option<JoinHandle<Result<(), BackendError>>>,
-    events: Events<Event>,
+    handle: Option<JoinHandle<Result<(), BackendError>>>,
 }
 
 impl PenBackend {
@@ -163,8 +169,10 @@ impl PenBackend {
             .name("pen-input".into())
             .spawn(move || worker.run())?;
         Ok(Self {
-            stop,
-            thread: Some(thread),
+            thread: InputThread {
+                stop,
+                handle: Some(thread),
+            },
             events,
         })
     }
@@ -175,15 +183,22 @@ impl PenBackend {
         &self.events
     }
 
-    /// Stops the input thread and reports how it ended.
+    /// Stops the input thread and reports how it ended, handing back the queue.
+    ///
+    /// The thread has been joined when this returns, so the queue holds every event it delivered:
+    /// drain it to keep what arrived since the last drain.
     ///
     /// # Errors
     ///
-    /// The error that stopped the thread early, or [`BackendError::Panicked`].
-    pub fn stop(mut self) -> Result<(), BackendError> {
-        self.shutdown()
+    /// The error that stopped the thread early, or [`BackendError::Panicked`], beside the queue.
+    pub fn stop(self) -> (Events<Event>, Result<(), BackendError>) {
+        let Self { mut thread, events } = self;
+        let result = thread.shutdown();
+        (events, result)
     }
+}
 
+impl InputThread {
     /// Signals the thread to stop and joins it, once.
     ///
     /// # Errors
@@ -191,7 +206,7 @@ impl PenBackend {
     /// As [`PenBackend::stop`], or [`BackendError::Io`] if the stop signal can't be sent (the
     /// thread is then left running, detached, rather than joined forever).
     fn shutdown(&mut self) -> Result<(), BackendError> {
-        let Some(thread) = self.thread.take() else {
+        let Some(thread) = self.handle.take() else {
             return Ok(());
         };
         // An eventfd write adds to its counter, making it readable; it can't hit a closed reader.
@@ -200,7 +215,7 @@ impl PenBackend {
     }
 }
 
-impl Drop for PenBackend {
+impl Drop for InputThread {
     fn drop(&mut self) {
         // A failure was already visible as missing events; `stop` is there for callers who care.
         drop(self.shutdown());

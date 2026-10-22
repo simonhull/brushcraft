@@ -5,12 +5,26 @@ pub(crate) use linux::Ours;
 #[cfg(not(target_os = "linux"))]
 pub(crate) use other::Ours;
 
+/// What a stopped backend leaves behind.
+#[derive(Debug)]
+pub(crate) struct Stopped {
+    /// Events queued after the last drain, read once the input thread had been joined.
+    pub(crate) events: Vec<input::Event>,
+    /// Events the queue dropped over the whole run.
+    pub(crate) dropped: u64,
+    /// How the input thread ended.
+    pub(crate) result: anyhow::Result<()>,
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
+    use anyhow::{Context as _, Result};
     use input::wayland::{self, PenBackend};
     use input::{Event, SurfaceId};
     use winit::event_loop::ActiveEventLoop;
     use winit::window::Window;
+
+    use super::Stopped;
 
     /// `input`'s Wayland backend, and the probe window's surface on it.
     #[derive(Debug)]
@@ -24,16 +38,12 @@ mod linux {
         ///
         /// # Errors
         ///
-        /// Why the backend couldn't start, as a sentence for the summary.
-        pub(crate) fn start(
-            event_loop: &dyn ActiveEventLoop,
-            window: &dyn Window,
-        ) -> Result<Self, String> {
-            let surface = wayland::surface_id(&window).map_err(|e| e.to_string())?;
+        /// If `window` has no Wayland surface, or the backend can't start.
+        pub(crate) fn start(event_loop: &dyn ActiveEventLoop, window: &dyn Window) -> Result<Self> {
+            let surface = wayland::surface_id(&window).context("finding the window's surface")?;
             let proxy = event_loop.create_proxy();
             let backend =
-                PenBackend::spawn(event_loop.owned_display_handle(), move || proxy.wake_up())
-                    .map_err(|e| e.to_string())?;
+                PenBackend::spawn(event_loop.owned_display_handle(), move || proxy.wake_up())?;
             Ok(Self { backend, surface })
         }
 
@@ -47,27 +57,27 @@ mod linux {
             self.backend.events().try_iter().collect()
         }
 
-        /// Events the queue dropped because the probe fell behind.
-        pub(crate) fn dropped(&self) -> u64 {
-            self.backend.events().dropped()
-        }
-
-        /// Stops the input thread.
-        ///
-        /// # Errors
-        ///
-        /// What stopped the thread early, as a sentence for the summary.
-        pub(crate) fn stop(self) -> Result<(), String> {
-            self.backend.stop().map_err(|e| e.to_string())
+        /// Stops the input thread, then takes what it queued since the last drain and the final
+        /// drop count.
+        pub(crate) fn stop(self) -> Stopped {
+            let (events, result) = self.backend.stop();
+            Stopped {
+                events: events.try_iter().collect(),
+                dropped: events.dropped(),
+                result: result.map_err(anyhow::Error::from),
+            }
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 mod other {
+    use anyhow::{Result, bail};
     use input::{Event, SurfaceId};
     use winit::event_loop::ActiveEventLoop;
     use winit::window::Window;
+
+    use super::Stopped;
 
     /// No backend on this platform: this type has no values.
     #[derive(Debug)]
@@ -79,8 +89,8 @@ mod other {
         /// # Errors
         ///
         /// Always.
-        pub(crate) fn start(_: &dyn ActiveEventLoop, _: &dyn Window) -> Result<Self, String> {
-            Err("input has no backend on this platform".to_owned())
+        pub(crate) fn start(_: &dyn ActiveEventLoop, _: &dyn Window) -> Result<Self> {
+            bail!("input has no backend on this platform")
         }
 
         /// Never called: there are no values.
@@ -94,16 +104,7 @@ mod other {
         }
 
         /// Never called: there are no values.
-        pub(crate) const fn dropped(&self) -> u64 {
-            match *self {}
-        }
-
-        /// Never called: there are no values.
-        ///
-        /// # Errors
-        ///
-        /// Never.
-        pub(crate) const fn stop(self) -> Result<(), String> {
+        pub(crate) const fn stop(self) -> Stopped {
             match self {}
         }
     }

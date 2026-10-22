@@ -1,13 +1,15 @@
-//! Pen-input probe: records what winit and our own pen backend deliver from a pen tablet, from the
-//! same strokes, and summarises both.
+//! Pen-input probe: records what our own pen backend or winit delivers from a pen tablet, and
+//! summarises it.
 //!
-//! Usage: `pen-probe [--source winit|ours|both] [CSV]`.
+//! Usage: `pen-probe [--source winit|ours|both] [CSV]`, or `pen-probe --report CSV`.
 //!
 //! Draw on the window with the pen, then close it. Samples go to the CSV path (default
 //! `pen-samples.csv`), and a summary is printed to stdout. `--source` picks what is recorded:
 //! our backend (`input::wayland`, the default), winit, or both. Some compositors deliver tablet
-//! events to only one tablet binding per client, so `both` may see nothing from one of them.
-//! Method and results: `research/platform/pen-input-wayland.md` in the docs repo.
+//! events to only one tablet binding per client, so `both` usually sees nothing from one of them;
+//! compare the two by recording a run with each. `--report` recomputes the summary from a CSV the
+//! probe wrote, with no window. Method and results: `research/platform/pen-input-wayland.md` in
+//! the docs repo.
 
 mod ours;
 mod report;
@@ -73,36 +75,35 @@ impl Selection {
     }
 }
 
-/// The command line.
+const USAGE: &str = "usage: pen-probe [--source winit|ours|both] [CSV], or pen-probe --report CSV";
+
+/// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
-struct Args {
-    selection: Selection,
-    output: PathBuf,
+enum Command {
+    /// Open the window, record, then write `output` and print the summary.
+    Record {
+        selection: Selection,
+        output: PathBuf,
+    },
+    /// Print the summary of a CSV the probe wrote earlier.
+    Report(PathBuf),
 }
 
-impl Args {
+impl Command {
     /// Parses the arguments after the program name.
     ///
     /// # Errors
     ///
-    /// On an unknown flag or source, a missing `--source` value, or more than one path.
+    /// On an unknown flag or source, a flag without its value, more than one path, or `--report`
+    /// beside anything else.
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
-        let mut selection = Selection::default();
+        let mut selection = None;
+        let mut report = None;
         let mut output = None;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
-            let source = if arg == "--source" {
-                Some(
-                    args.next()
-                        .context("--source needs a value: winit, ours or both")?,
-                )
-            } else {
-                arg.to_str()
-                    .and_then(|a| a.strip_prefix("--source="))
-                    .map(OsString::from)
-            };
-            if let Some(source) = source {
-                selection = match source.to_str() {
+            if let Some(source) = flag_value(&arg, "--source", &mut args)? {
+                selection = Some(match source.to_str() {
                     Some("winit") => Selection::Winit,
                     Some("ours") => Selection::Ours,
                     Some("both") => Selection::Both,
@@ -110,23 +111,48 @@ impl Args {
                         "unknown source {}: expected winit, ours or both",
                         source.display()
                     ),
-                };
+                });
+            } else if let Some(csv) = flag_value(&arg, "--report", &mut args)? {
+                if report.replace(PathBuf::from(csv)).is_some() {
+                    bail!("more than one --report; {USAGE}");
+                }
             } else if arg.to_str().is_some_and(|a| a.starts_with('-')) {
-                bail!(
-                    "unknown option {}; usage: pen-probe [--source winit|ours|both] [CSV]",
-                    arg.display()
-                );
+                bail!("unknown option {}; {USAGE}", arg.display());
             } else if output.replace(PathBuf::from(arg)).is_some() {
-                bail!(
-                    "more than one output path; usage: pen-probe [--source winit|ours|both] [CSV]"
-                );
+                bail!("more than one output path; {USAGE}");
             }
         }
-        Ok(Self {
-            selection,
-            output: output.unwrap_or_else(|| "pen-samples.csv".into()),
-        })
+        match (report, selection, output) {
+            (Some(csv), None, None) => Ok(Self::Report(csv)),
+            (Some(_), _, _) => bail!("--report takes no other arguments; {USAGE}"),
+            (None, selection, output) => Ok(Self::Record {
+                selection: selection.unwrap_or_default(),
+                output: output.unwrap_or_else(|| "pen-samples.csv".into()),
+            }),
+        }
     }
+}
+
+/// The value of `flag` if `arg` is it, as `flag VALUE` (taking the next argument) or `flag=VALUE`.
+///
+/// # Errors
+///
+/// If `arg` is `flag` and no argument follows.
+fn flag_value(
+    arg: &OsString,
+    flag: &str,
+    rest: &mut impl Iterator<Item = OsString>,
+) -> Result<Option<OsString>> {
+    if arg == flag {
+        return rest
+            .next()
+            .with_context(|| format!("{flag} needs a value; {USAGE}"))
+            .map(Some);
+    }
+    Ok(arg
+        .to_str()
+        .and_then(|a| a.strip_prefix(flag)?.strip_prefix('='))
+        .map(OsString::from))
 }
 
 /// One pen sample as the probe records it.
@@ -157,18 +183,25 @@ struct Sample {
     device_ms: Option<u32>,
 }
 
+/// What our backend delivered besides samples over the probe window.
+#[derive(Debug, Clone, Copy, Default)]
+struct OursCounts {
+    /// Pad events (buttons, rings, strips, dials).
+    pads: usize,
+    /// Samples over some other surface, left out.
+    elsewhere: usize,
+    /// Events the queue dropped.
+    dropped: u64,
+}
+
 /// Everything one run recorded.
 #[derive(Debug, Default)]
 struct Recording {
     /// Which sources were recorded.
     selection: Selection,
     samples: Vec<Sample>,
-    /// Pad events from our backend (buttons, rings, strips, dials).
-    pads: usize,
-    /// Our samples over some other surface, left out.
-    elsewhere: usize,
-    /// Events our backend's queue dropped.
-    dropped: u64,
+    /// `None` when the recording was read back from a CSV, which doesn't carry them.
+    ours_counts: Option<OursCounts>,
     /// Why our backend didn't run or stopped badly, if it did.
     note: Option<String>,
 }
@@ -225,10 +258,16 @@ fn span(centre: f64, radius: f64, len: usize) -> (usize, usize) {
     )
 }
 
+/// The recording, and the error that ended the run early, if one did.
+type Outcome = (Recording, Result<()>);
+
 #[derive(Debug)]
 struct App {
     start: Instant,
-    done: mpsc::Sender<Result<Recording>>,
+    done: mpsc::Sender<Outcome>,
+    /// Declared before `surface`, so it drops (stopping the input thread) before the window does:
+    /// the backend must stop before the window is destroyed. The order is load-bearing.
+    backend: Option<ours::Ours>,
     surface: Option<Surface<OwnedDisplayHandle, Box<dyn Window>>>,
     canvas: Canvas,
     /// winit's view of whether the tip is down.
@@ -238,22 +277,23 @@ struct App {
     wakeup: u64,
     /// The window's scale factor, to put our logical positions in winit's physical pixels.
     scale: f64,
-    backend: Option<ours::Ours>,
+    ours_counts: OursCounts,
     recording: Recording,
 }
 
 impl App {
-    fn new(selection: Selection, done: mpsc::Sender<Result<Recording>>) -> Self {
+    fn new(selection: Selection, done: mpsc::Sender<Outcome>) -> Self {
         Self {
             start: Instant::now(),
             done,
+            backend: None,
             surface: None,
             canvas: Canvas::new(0, 0),
             contact: false,
             buttons: Buttons::default(),
             wakeup: 0,
             scale: 1.0,
-            backend: None,
+            ours_counts: OursCounts::default(),
             recording: Recording {
                 selection,
                 ..Recording::default()
@@ -269,14 +309,18 @@ impl App {
     fn finish(&mut self, event_loop: &dyn ActiveEventLoop, result: Result<()>) {
         self.drain();
         if let Some(backend) = self.backend.take() {
-            self.recording.dropped = backend.dropped();
-            if let Err(e) = backend.stop() {
-                self.recording.note = Some(format!("our backend stopped with an error: {e}"));
+            let surface = backend.surface();
+            let stopped = backend.stop();
+            self.record_ours(stopped.events, surface);
+            self.ours_counts.dropped = stopped.dropped;
+            if let Err(e) = stopped.result {
+                self.recording.note = Some(format!("our backend stopped with an error: {e:#}"));
             }
         }
-        let outcome = result.map(|()| std::mem::take(&mut self.recording));
+        self.recording.ours_counts = Some(self.ours_counts);
+        let recording = std::mem::take(&mut self.recording);
         // `main` holds the receiver until the loop returns, so the send can't fail.
-        drop(self.done.send(outcome));
+        drop(self.done.send((recording, result)));
         event_loop.exit();
     }
 
@@ -302,7 +346,7 @@ impl App {
         self.recording.samples.push(sample);
     }
 
-    fn winit_sample(&self, x: f64, y: f64, data: &TabletToolData) -> Sample {
+    fn winit_sample(&self, x: f64, y: f64, contact: bool, data: &TabletToolData) -> Sample {
         Sample {
             source: Source::Winit,
             received: self.start.elapsed(),
@@ -310,7 +354,7 @@ impl App {
             wakeup: self.wakeup,
             x,
             y,
-            contact: self.contact,
+            contact,
             pressure: data.force.map(|f| f.normalized(None)),
             tilt: data.tilt.map(|t| (f64::from(t.x), f64::from(t.y))),
             distance: None,
@@ -328,6 +372,7 @@ impl App {
             received: since_start(s.received),
             dejittered: s.phase.in_stroke().then(|| since_start(s.timestamp)),
             wakeup: self.wakeup,
+            // `scale` is the factor when the sample is drained, not when it was taken.
             x: s.pos.x * self.scale,
             y: s.pos.y * self.scale,
             contact: s.phase.in_stroke(),
@@ -341,20 +386,26 @@ impl App {
         }
     }
 
-    /// Records everything our backend has queued: samples over the probe window, and pad events.
+    /// Records everything our backend has queued.
     fn drain(&mut self) {
         let Some(backend) = &self.backend else {
             return;
         };
         let (events, surface) = (backend.drain(), backend.surface());
+        self.record_ours(events, surface);
+    }
+
+    /// Records our backend's `events`: samples over the probe window's `surface`, and counts of
+    /// the rest.
+    fn record_ours(&mut self, events: Vec<input::Event>, surface: input::SurfaceId) {
         for event in events {
             match event {
                 input::Event::Sample(s) if s.surface == surface => {
                     let sample = self.our_sample(&s);
                     self.record(sample);
                 }
-                input::Event::Sample(_) => self.recording.elsewhere += 1,
-                input::Event::Pad(_) => self.recording.pads += 1,
+                input::Event::Sample(_) => self.ours_counts.elsewhere += 1,
+                input::Event::Pad(_) => self.ours_counts.pads += 1,
             }
         }
     }
@@ -406,7 +457,7 @@ impl App {
                 position,
                 source: PointerSource::TabletTool { data, .. },
                 ..
-            } => self.record(self.winit_sample(position.x, position.y, &data)),
+            } => self.record(self.winit_sample(position.x, position.y, self.contact, &data)),
             WindowEvent::PointerButton {
                 state,
                 position,
@@ -417,17 +468,24 @@ impl App {
                 // winit's Wayland backend maps evdev codes as SDL does: BTN_STYLUS (our primary)
                 // arrives as `Contact`, like the tip, `Barrel` is BTN_STYLUS2 and `Other(1)` is
                 // BTN_STYLUS3. Other codes aren't barrel buttons.
-                match button {
-                    TabletToolButton::Contact => self.contact = pressed,
+                let contact = match button {
+                    // Both the touch and the release belong to the stroke, as our `Down` and
+                    // `Up` do.
+                    TabletToolButton::Contact => {
+                        self.contact = pressed;
+                        true
+                    }
                     TabletToolButton::Barrel => {
                         self.buttons = self.buttons.with(Buttons::SECONDARY, pressed);
+                        self.contact
                     }
                     TabletToolButton::Other(1) => {
                         self.buttons = self.buttons.with(Buttons::TERTIARY, pressed);
+                        self.contact
                     }
                     TabletToolButton::Other(_) => return Ok(()),
-                }
-                self.record(self.winit_sample(position.x, position.y, &data));
+                };
+                self.record(self.winit_sample(position.x, position.y, contact, &data));
             }
             _ => {}
         }
@@ -453,9 +511,12 @@ impl ApplicationHandler for App {
             let context = Context::new(event_loop.owned_display_handle())
                 .map_err(|e| anyhow!("creating the softbuffer context: {e}"))?;
             self.scale = window.scale_factor();
+            // The surface first: if it fails, the window is destroyed before any backend runs.
+            let surface =
+                Surface::new(&context, window).map_err(|e| anyhow!("creating the surface: {e}"))?;
             let selection = self.recording.selection;
             if selection.records(Source::Ours) {
-                match ours::Ours::start(event_loop, window.as_ref()) {
+                match ours::Ours::start(event_loop, surface.window().as_ref()) {
                     Ok(backend) => self.backend = Some(backend),
                     Err(e) => {
                         let rest = if selection.records(Source::Winit) {
@@ -464,12 +525,10 @@ impl ApplicationHandler for App {
                             "nothing recorded"
                         };
                         self.recording.note =
-                            Some(format!("our backend didn't start ({e}); {rest}"));
+                            Some(format!("our backend didn't start ({e:#}); {rest}"));
                     }
                 }
             }
-            let surface =
-                Surface::new(&context, window).map_err(|e| anyhow!("creating the surface: {e}"))?;
             self.surface = Some(surface);
             Ok(())
         })();
@@ -489,23 +548,39 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Runs the probe window, then writes the CSV and prints the summary.
+/// Runs the probe window, then writes the CSV and prints the summary; or, with `--report`, prints
+/// the summary of an earlier CSV.
 ///
 /// # Errors
 ///
-/// If the window can't be created or drawn, or the CSV or summary can't be written.
+/// If the window can't be created or drawn (after writing what was recorded), or a CSV can't be
+/// read or written.
 fn main() -> Result<()> {
-    let Args { selection, output } = Args::parse(std::env::args_os().skip(1))?;
+    let (selection, output) = match Command::parse(std::env::args_os().skip(1))? {
+        Command::Report(csv) => {
+            let recording = report::read_csv(&csv)?;
+            write!(
+                std::io::stdout().lock(),
+                "{}",
+                report::summarise(&recording)?
+            )?;
+            return Ok(());
+        }
+        Command::Record { selection, output } => (selection, output),
+    };
     let (done, outcome) = mpsc::channel();
-    EventLoop::new()?.run_app(App::new(selection, done))?;
-    let recording = outcome
-        .recv()
-        .context("the window closed without a recording")??;
+    let ran = EventLoop::new()?
+        .run_app(App::new(selection, done))
+        .context("running the event loop");
+    let Ok((recording, result)) = outcome.try_recv() else {
+        ran?;
+        bail!("the window closed without a recording");
+    };
     report::write_csv(&recording.samples, &output)?;
     let mut stdout = std::io::stdout().lock();
     write!(stdout, "{}", report::summarise(&recording)?)?;
     writeln!(stdout, "csv: {}", output.display())?;
-    Ok(())
+    result.and(ran)
 }
 
 #[cfg(test)]
@@ -520,38 +595,47 @@ mod tests {
     ///
     /// # Errors
     ///
-    /// As [`Args::parse`].
-    fn parse(args: &[&str]) -> Result<Args> {
-        Args::parse(args.iter().map(OsString::from))
+    /// As [`Command::parse`].
+    fn parse(args: &[&str]) -> Result<Command> {
+        Command::parse(args.iter().map(OsString::from))
+    }
+
+    fn record(selection: Selection, output: &str) -> Command {
+        Command::Record {
+            selection,
+            output: output.into(),
+        }
     }
 
     #[test]
     fn defaults_to_ours_and_the_default_path() {
         assert_eq!(
             parse(&[]).ok(),
-            Some(Args {
-                selection: Selection::Ours,
-                output: "pen-samples.csv".into(),
-            })
+            Some(record(Selection::Ours, "pen-samples.csv"))
         );
     }
 
     #[test]
     fn takes_a_source_in_either_form_and_a_path_either_side() {
-        let both = Args {
-            selection: Selection::Both,
-            output: "out.csv".into(),
-        };
-        assert_eq!(parse(&["--source", "both", "out.csv"]).ok(), Some(both));
-        let winit = Args {
-            selection: Selection::Winit,
-            output: "out.csv".into(),
-        };
-        assert_eq!(parse(&["out.csv", "--source=winit"]).ok(), Some(winit));
         assert_eq!(
-            parse(&["--source", "ours"]).ok().map(|a| a.selection),
-            Some(Selection::Ours)
+            parse(&["--source", "both", "out.csv"]).ok(),
+            Some(record(Selection::Both, "out.csv"))
         );
+        assert_eq!(
+            parse(&["out.csv", "--source=winit"]).ok(),
+            Some(record(Selection::Winit, "out.csv"))
+        );
+        assert_eq!(
+            parse(&["--source", "ours"]).ok(),
+            Some(record(Selection::Ours, "pen-samples.csv"))
+        );
+    }
+
+    #[test]
+    fn takes_a_report_path_in_either_form() {
+        let report = Some(Command::Report("run.csv".into()));
+        assert_eq!(parse(&["--report", "run.csv"]).ok(), report);
+        assert_eq!(parse(&["--report=run.csv"]).ok(), report);
     }
 
     #[test]
@@ -559,7 +643,12 @@ mod tests {
         parse(&["--source"]).unwrap_err();
         parse(&["--source", "mouse"]).unwrap_err();
         parse(&["--verbose"]).unwrap_err();
+        parse(&["--sourcewinit"]).unwrap_err();
         parse(&["a.csv", "b.csv"]).unwrap_err();
+        parse(&["--report"]).unwrap_err();
+        parse(&["--report", "a.csv", "b.csv"]).unwrap_err();
+        parse(&["--report", "a.csv", "--source", "ours"]).unwrap_err();
+        parse(&["--report", "a.csv", "--report", "b.csv"]).unwrap_err();
     }
 
     #[test]
