@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
+use crate::recovery::{RecoveryError, RecoveryWriter};
 
 /// A project file at `name` in `dir` holding `edits`, made through a store and saved, then
 /// reopened as a save would leave it: every record named by its last save point.
@@ -559,5 +560,56 @@ fn ops_continue_after_the_base_head() {
         slot_resident(&store, &key),
         slot_of(&flat_tile(&key, 0.5)),
         "the saved tile, not the one written after the save"
+    );
+}
+
+#[test]
+fn a_flush_in_flight_across_a_rebase_is_abandoned() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = saved_project(
+        &dir,
+        "p.bcrf",
+        &mesh,
+        &mut map,
+        &random_edits(&mesh, TOP, 40, 61),
+    );
+    let working = recovery(&dir, "r1.bcrf", &project);
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), roomy()).unwrap();
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 60, 62));
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    assert_eq!(writer.phase(), "encoding", "a flush in flight");
+    // A save that skipped finishing the flush first.
+    drop(save_and_rebase(&mut store, &mut project, &dir, "r2.bcrf"));
+    let len = store.working_len();
+    let mut outcome = Ok(());
+    while !writer.is_idle() {
+        if let Err(e) = writer.step_blocking(&mut store) {
+            outcome = Err(e);
+        }
+    }
+    assert!(
+        matches!(outcome, Err(RecoveryError::OutOfStep)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        store.working_len(),
+        len,
+        "nothing of the old flush in the new file"
+    );
+    assert_eq!(store.file.save_points().unwrap(), [], "and no save point");
+    assert!(
+        !writer.is_failed(),
+        "not a sync failure: the writer goes on"
+    );
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 10, 63));
+    writer.finish(&mut store, Instant::now()).unwrap();
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "after",
     );
 }

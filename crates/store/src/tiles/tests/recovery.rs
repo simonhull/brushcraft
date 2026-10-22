@@ -614,3 +614,65 @@ fn every_save_point_is_its_snapshot_and_every_cut_opens_at_one() {
     }
     assert!(ends.len() > 100, "{} record boundaries", ends.len());
 }
+
+#[test]
+fn a_store_save_is_refused_while_a_writer_streams() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let writer = RecoveryWriter::new(&mut store).unwrap();
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 101),
+    );
+    let len = store.working_len();
+    let saved = store.save();
+    assert!(matches!(saved, Err(CacheError::Streaming)), "{saved:?}");
+    assert_eq!(store.working_len(), len, "nothing written");
+    writer.close(&mut store, Instant::now()).unwrap();
+    store.save().unwrap();
+}
+
+#[test]
+fn a_broken_slot_is_reported_and_the_rest_still_flush() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let keys: Vec<TileKey> = tiles(&mesh, TOP, TOP).into_iter().step_by(9).collect();
+    let (no_op, invalid) = (keys[1], keys[3]);
+    // The oracle holds the edits of the good tiles only: the broken ones never reach the file.
+    let (mut map, mut lost) = (CorrectionMap::new(), CorrectionMap::new());
+    for (n, key) in keys.iter().enumerate() {
+        let c = Vec3::new(0.0, 0.0, 0.01 * f32::from(u16::try_from(n + 1).unwrap()));
+        let oracle = if [no_op, invalid].contains(key) {
+            &mut lost
+        } else {
+            &mut map
+        };
+        edit_interior(&mut store, oracle, *key, c);
+    }
+    store.unsaved.remove(&no_op);
+    let id = store.corrections.find(&invalid).unwrap();
+    store.corrections.get_mut(id).unwrap().side = 0;
+
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    assert_eq!(writer.flushes(), 1, "the flush completed");
+    let mut skipped = writer.take_skipped();
+    skipped.sort_unstable();
+    let mut want = vec![no_op, invalid];
+    want.sort_unstable();
+    assert_eq!(skipped, want, "both broken slots reported");
+    assert_eq!(writer.take_skipped(), [], "reported once");
+    // Not retried: the next stroke end has nothing to flush, and never stalls on them.
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    assert_eq!(writer.take_skipped(), [], "dropped from the mark");
+    let offset = writer.durable_save_point().unwrap();
+    drop(writer);
+    drop(store);
+    assert_save_point(&path, offset, &mesh, &map);
+}

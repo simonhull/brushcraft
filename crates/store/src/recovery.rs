@@ -66,6 +66,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use geom::TileKey;
 use thiserror::Error;
 
 use crate::feed::ConsumerId;
@@ -83,9 +84,6 @@ pub enum RecoveryError {
     /// working file.
     #[error("the tile store failed during a recovery flush")]
     Store(#[from] CacheError),
-    /// A tile copy didn't encode as a record (a broken slot: not for a store's own slots).
-    #[error("encoding a tile for the recovery file failed")]
-    Encode(#[source] StoreError),
     /// Syncing the working file failed. What was appended since the last durable save point may
     /// not be on disk.
     #[error("syncing the recovery file failed")]
@@ -139,8 +137,9 @@ enum Request {
 /// What the writer thread answers, one reply per request, in order.
 #[derive(Debug)]
 enum Reply {
-    /// The framed records, in snapshot order, or why one didn't encode.
-    Encoded(Result<Vec<FramedTile>, StoreError>),
+    /// The framed records, in snapshot order, and the tiles whose copies didn't encode (broken
+    /// slots), left out.
+    Encoded(Vec<FramedTile>, Vec<TileKey>),
     /// The sync completed, or why it failed.
     Synced(Result<(), StoreError>),
 }
@@ -202,6 +201,12 @@ pub struct RecoveryWriter {
     durable: Option<u64>,
     /// Flushes completed: save points made durable.
     flushes: u64,
+    /// The store's working-file generation when the flush in flight started: a rebase since
+    /// means the flush's records and save point would go to the wrong file.
+    generation: u64,
+    /// Tiles left out of a flush because their slots were broken, not yet reported (see
+    /// [`RecoveryWriter::take_skipped`]).
+    skipped: Vec<TileKey>,
     /// Test hooks shared with the writer thread.
     #[cfg(test)]
     hooks: Arc<Hooks>,
@@ -242,6 +247,8 @@ impl RecoveryWriter {
             last_flush: None,
             durable: None,
             flushes: 0,
+            generation: store.generation(),
+            skipped: Vec::new(),
             #[cfg(test)]
             hooks,
         })
@@ -356,6 +363,15 @@ impl RecoveryWriter {
         self.flushes
     }
 
+    /// The tiles left out of flushes since the last call because their correction slots were
+    /// broken (a dirty slot with no op, or one that doesn't hold a valid tile): their latest
+    /// edits are not in the recovery file. Each is dropped from the writer's flush mark when
+    /// found, so one bad slot never stalls the flushes of the rest; an edit of it later is
+    /// tried again.
+    pub fn take_skipped(&mut self) -> Vec<TileKey> {
+        std::mem::take(&mut self.skipped)
+    }
+
     /// Whether a trigger now would have anything to flush: edits not yet in the working file,
     /// tiles in it since its last save point (written back to make room), or a failed flush to
     /// confirm.
@@ -393,7 +409,8 @@ impl RecoveryWriter {
         self.queued = None;
         let owed = std::mem::take(&mut self.unconfirmed);
         store.open_cut();
-        let started = match store.snapshot_dirty(self.consumer) {
+        self.generation = store.generation();
+        let started = match store.snapshot_dirty(self.consumer, &mut self.skipped) {
             Ok(snapshots) if !snapshots.is_empty() => self
                 .send(Request::Encode(snapshots))
                 .map(|()| self.phase = Phase::Encoding),
@@ -433,14 +450,22 @@ impl RecoveryWriter {
     ///
     /// # Errors
     ///
-    /// [`RecoveryError::Encode`] or [`RecoveryError::Sync`] as the writer thread reports them;
+    /// [`RecoveryError::Sync`] as the writer thread reports it;
     /// [`RecoveryError::Store`] if an append or the save point's write fails;
     /// [`RecoveryError::Stopped`] if the next request can't be sent; [`RecoveryError::OutOfStep`]
-    /// for a reply the phase didn't ask for.
+    /// for a reply the phase didn't ask for, or if the store was rebased onto another working
+    /// file since the flush started (the flush is abandoned: its records and save point belong
+    /// to the old file).
     fn step(&mut self, store: &mut TileStore, reply: Reply) -> Result<(), RecoveryError> {
+        if store.generation() != self.generation {
+            return Err(RecoveryError::OutOfStep);
+        }
         match (self.phase, reply) {
-            (Phase::Encoding, Reply::Encoded(tiles)) => {
-                let tiles = tiles.map_err(RecoveryError::Encode)?;
+            (Phase::Encoding, Reply::Encoded(tiles, broken)) => {
+                for key in broken {
+                    store.drop_from_stream(self.consumer, &key);
+                    self.skipped.push(key);
+                }
                 store.append_streamed(self.consumer, &tiles)?;
                 self.request_tile_sync(store)
             }
@@ -591,7 +616,7 @@ impl Worker {
         while let Ok(request) = self.requests.recv() {
             let reply = match request {
                 Request::Encode(snapshots) => match self.encode(&snapshots) {
-                    Some(encoded) => Reply::Encoded(encoded),
+                    Some((framed, broken)) => Reply::Encoded(framed, broken),
                     None => return,
                 },
                 Request::Sync(syncer) => Reply::Synced(sync(
@@ -606,19 +631,21 @@ impl Worker {
         }
     }
 
-    /// Frames every snapshot as a tile record; `None` if the owner stopped the writer part-way.
-    fn encode(&self, snapshots: &[Snapshot]) -> Option<Result<Vec<FramedTile>, StoreError>> {
+    /// Frames every snapshot as a tile record, leaving out (and listing) any whose copy doesn't
+    /// encode; `None` if the owner stopped the writer part-way.
+    fn encode(&self, snapshots: &[Snapshot]) -> Option<(Vec<FramedTile>, Vec<TileKey>)> {
         let mut framed = Vec::with_capacity(snapshots.len());
+        let mut broken = Vec::new();
         for snapshot in snapshots {
             if self.stop.load(Ordering::Relaxed) {
                 return None;
             }
             match frame_displacement(snapshot.key, snapshot.op, &snapshot.slot) {
                 Ok(tile) => framed.push(tile),
-                Err(e) => return Some(Err(e)),
+                Err(_) => broken.push(snapshot.key),
             }
         }
-        Some(Ok(framed))
+        Some((framed, broken))
     }
 }
 

@@ -208,6 +208,10 @@ pub enum CacheError {
     /// Or a save was asked to write into a file that isn't a project file.
     #[error("the working file doesn't belong on this base")]
     WrongBase,
+    /// [`TileStore::save`] was called while a recovery writer streams the working file, which
+    /// writes its save points itself.
+    #[error("the working file is streamed by a recovery writer, which writes its save points")]
+    Streaming,
     /// A rebase was given a save that is out of date: the store was edited after the save was
     /// made, so the save doesn't hold every edit. Save again.
     #[error("the store was edited after the save it was to be rebased on")]
@@ -474,6 +478,9 @@ pub struct TileStore {
     /// The newest op of any edit so far: where a recovery flush cuts (see
     /// [`TileStore::open_cut`]).
     latest_edit: Option<OpId>,
+    /// Counts the working files the store has had: a rebase moves it on, so a recovery flush
+    /// started before can tell it would finish in the wrong file.
+    generation: u64,
     /// The change feed: every key an edit changed, with its op.
     feed: ChangeFeed,
     /// Save's place in the feed.
@@ -794,6 +801,7 @@ impl TileStore {
             since_rebase: BTreeSet::new(),
             epoch: 0,
             latest_edit: None,
+            generation: 0,
             feed,
             save_consumer,
             streams: HashMap::new(),
@@ -935,6 +943,7 @@ impl TileStore {
         }
         self.unsaved.clear();
         self.since_rebase.clear();
+        self.generation += 1;
         // The old workers read the old files; dropping them joins them and drops their results.
         self.prefetch = Prefetcher::new();
         self.next_op = next_op;
@@ -1209,9 +1218,15 @@ impl TileStore {
     ///
     /// # Errors
     ///
+    /// [`CacheError::Streaming`] while a recovery writer streams the working file: its save
+    /// points are cuts at its snapshots, and one made here could name later edits than a save
+    /// point the writer is about to write, so the durable state could go backwards.
     /// [`CacheError::WriteBack`] if a tile's write fails; [`CacheError::Store`] if the save
     /// point's does.
     pub fn save(&mut self) -> Result<u64, CacheError> {
+        if !self.streams.is_empty() {
+            return Err(CacheError::Streaming);
+        }
         self.sync_pins()?;
         self.drain_saves();
         let mut dirty: Vec<TileKey> = self.unsaved.keys().copied().collect();
@@ -1258,13 +1273,20 @@ impl TileStore {
     /// the mark without a copy. The rest stay in the mark until
     /// [`TileStore::append_streamed`] appends them, or finds them written by someone else.
     ///
+    /// A dirty slot with no op to write it with (a broken slot: every slot marked dirty gets
+    /// one first) is left out, dropped from the mark and listed in `skipped`, so it can't stall
+    /// the flushes of the rest.
+    ///
     /// This is the drawing thread's share of a flush: a copy of each slot, no encoding or I/O.
     ///
     /// # Errors
     ///
-    /// [`CacheError::Internal`] if a dirty slot has no op (every slot marked dirty gets one
-    /// first) or a handle went stale. The mark keeps every key then.
-    pub(crate) fn snapshot_dirty(&mut self, id: ConsumerId) -> Result<Vec<Snapshot>, CacheError> {
+    /// [`CacheError::Internal`] if a handle went stale. The mark keeps every key then.
+    pub(crate) fn snapshot_dirty(
+        &mut self,
+        id: ConsumerId,
+        skipped: &mut Vec<TileKey>,
+    ) -> Result<Vec<Snapshot>, CacheError> {
         let drained = self.feed.drain(id);
         let Some(mark) = self.streams.get_mut(&id) else {
             return Ok(Vec::new());
@@ -1282,10 +1304,12 @@ impl TileStore {
                 written.push(key);
                 continue;
             }
-            let op = unsaved
-                .get(&key)
-                .copied()
-                .ok_or(Invariant::MissingOp(key))?;
+            let Some(&op) = unsaved.get(&key) else {
+                // A broken slot: dropped, so the rest still flush.
+                skipped.push(key);
+                written.push(key);
+                continue;
+            };
             let mut copy = bytemuck::zeroed_box::<CorrectionSlot>();
             *copy = *corrections.get(slot_id).ok_or(Invariant::StaleHandle)?;
             snapshots.push(Snapshot {
@@ -1368,6 +1392,19 @@ impl TileStore {
     /// tell later edits from earlier ones.
     pub(crate) fn open_cut(&mut self) {
         self.file.open_cut(self.latest_edit);
+    }
+
+    /// The working-file generation: moved on by every rebase.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Drops `key` from streaming consumer `id`'s flush mark: its copy couldn't be flushed, and
+    /// is reported instead of tried again with every flush.
+    pub(crate) fn drop_from_stream(&mut self, id: ConsumerId, key: &TileKey) {
+        if let Some(mark) = self.streams.get_mut(&id) {
+            mark.remove(key);
+        }
     }
 
     /// A handle that syncs the working file from another thread.
