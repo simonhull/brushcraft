@@ -1268,6 +1268,26 @@ impl TileStore {
         Ok(op)
     }
 
+    /// Moves the op generator past every op of `heads` of the store's site, if it isn't already:
+    /// for heads of files the store doesn't read, but whose edits its own must be newer than
+    /// (other recovery files of the project, see [`crate::Project::open`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::OpsExhausted`] if one of them is the site's last op id; the generator is
+    /// unchanged then.
+    pub(crate) fn skip_ops_past(
+        &mut self,
+        heads: impl IntoIterator<Item = Option<OpId>>,
+    ) -> Result<(), CacheError> {
+        let Some(next) = self.next_op else {
+            return Ok(());
+        };
+        let after = first_op(next.site(), heads)?;
+        self.next_op = Some(next.max(after));
+        Ok(())
+    }
+
     /// The op edits are made as now: the one [`TileStore::begin_op`] last started; `None` if
     /// none is (the next edit begins one).
     #[must_use]

@@ -323,6 +323,11 @@ impl Project {
     /// The project file is opened for writing and locked, so no other instance can open it
     /// meanwhile; whatever followed its last save point (a save cut short) is discarded.
     ///
+    /// The project's ops start past the newest edit of every recovery file of the project in
+    /// the recovery directory, whatever save point it is on: a session's
+    /// edits are newer than every earlier session's, kept after a crash or not, so of two
+    /// recovery files on one save point the one with the newest last edit is the latest work.
+    ///
     /// # Errors
     ///
     /// [`ProjectError::Store`] if the file can't be opened (including
@@ -336,10 +341,14 @@ impl Project {
         }
         let base = project.base()?.ok_or(ProjectError::NeverSaved)?;
         let meta = project.meta().on_save_point(base.save_point(), &path);
+        let earlier = recovery_heads(&config.recovery_dir, meta.project());
         let (working, recovery_path) = create_placed(&config.recovery_dir, meta.project(), |at| {
             ProjectFile::create_like(at, meta, &project)
         })?;
-        let store = TileStore::open_layered(working, Some(base), config.store);
+        let store = past(
+            TileStore::open_layered(working, Some(base), config.store),
+            earlier,
+        );
         Self::start(
             store,
             Some((project, path)),
@@ -363,7 +372,8 @@ impl Project {
     /// save point, has no path ([`Project::path`] is `None`), and saves as a new file.
     ///
     /// The recovery file opens at its last durable save point; whatever followed it (a flush
-    /// cut short, tiles of the stroke in progress) is discarded.
+    /// cut short, tiles of the stroke in progress) is discarded. The project's ops start past
+    /// the newest edit of every recovery file of the project, as [`Project::open`]'s do.
     ///
     /// # Errors
     ///
@@ -388,8 +398,9 @@ impl Project {
                 if !fits {
                     return Err(ProjectError::CandidateChanged);
                 }
+                let earlier = recovery_heads(&config.recovery_dir, candidate.project);
                 Self::start(
-                    TileStore::open(working, config.store),
+                    past(TileStore::open(working, config.store), earlier),
                     None,
                     recovery,
                     config,
@@ -427,7 +438,11 @@ impl Project {
                         return Err(ProjectError::NotRestorable(status));
                     }
                 };
-                let store = TileStore::open_layered(working, base, config.store);
+                let earlier = recovery_heads(&config.recovery_dir, candidate.project);
+                let store = past(
+                    TileStore::open_layered(working, base, config.store),
+                    earlier,
+                );
                 Self::start_with(store, Some(project), saves_into, recovery, config)
             }
             status @ (CandidateStatus::ProjectMissing
@@ -960,6 +975,41 @@ impl Drop for Project {
     }
 }
 
+/// `opened`, its op generator moved past `heads` ([`TileStore::skip_ops_past`]).
+///
+/// # Errors
+///
+/// `opened`'s error; [`CacheError::OpsExhausted`] if a head is the site's last op id.
+fn past(
+    opened: Result<TileStore, CacheError>,
+    heads: Vec<Option<OpId>>,
+) -> Result<TileStore, CacheError> {
+    let mut store = opened?;
+    store.skip_ops_past(heads)?;
+    Ok(store)
+}
+
+/// The head ops of the recovery files of `project` in `dir`, on any save point: the newest
+/// edit each would restore, which a new session's ops must be newer than.
+///
+/// Best effort, and read-only: a missing or unreadable `dir` has none, and a file a running
+/// instance holds, or one that can't be read, is passed over. A file that can't be read is
+/// listed as damaged, with no last edit, so it never competes with this session's; one held
+/// is this session's own (a restored file), or another instance's, which only one restored
+/// onto an earlier save point can be, as the project file is locked.
+fn recovery_heads(dir: &Path, project: ProjectId) -> Vec<Option<OpId>> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_str().and_then(recovery_name) == Some(project))
+        .filter_map(|entry| ProjectFile::inspect(&entry.path()).ok())
+        .filter(|file| file.meta().project() == project)
+        .map(|file| file.head())
+        .collect()
+}
+
 /// How long a recovery file's temporary file must have gone unwritten to be a crash's leftover.
 ///
 /// [`find_recoveries`] removes `<name>.tmp` files older than this: an instance creating one
@@ -971,10 +1021,13 @@ const STALE_TEMPORARY: Duration = Duration::from_secs(60);
 ///
 /// The list is ordered for choosing: projects with the most recently written recovery file
 /// first, and a project's files on one save point together, **the one with the newest last
-/// edit first** (then the most recently written). That one is the file to restore: a crash
-/// during a roll-over or a save can leave two files of one project on one save point, the new
-/// one possibly still empty, and the newest edit, not the newest write, says which holds the
-/// work.
+/// edit first** (then the most recently written). That one is the file to restore. One project
+/// can leave several files on one save point: sessions that each opened it at that save point
+/// and crashed, or a crash mid-roll-over, which leaves the old file and the new one holding the
+/// same edits. Ops only grow across sessions, as every session's start past the newest edit of
+/// every recovery file of the project ([`Project::open`], [`Project::restore`]), so the newest
+/// last edit is the latest session's latest work. A write time can't say that: copying or
+/// touching a file moves it, and a clock can be set back.
 ///
 /// Only files named as recovery files are looked at (`<project id>-<suffix>.bcrf`). A file a
 /// running instance holds is skipped: it is locked for writing, and a shared lock probe fails.

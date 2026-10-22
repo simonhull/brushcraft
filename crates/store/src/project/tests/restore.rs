@@ -254,6 +254,54 @@ fn of_two_files_on_one_save_point_the_newest_edit_comes_first() {
     assert_eq!(listed[1].last_edit, None, "it holds no edits");
 }
 
+/// Two sessions on one save point, each crashing: the later one's file is listed first.
+///
+/// The second session opened the project file without restoring the first's recovery file. Its
+/// ops start past the first's, so its file, the latest work, comes first, though it holds fewer
+/// strokes.
+#[test]
+fn of_two_sessions_on_one_save_point_the_later_one_comes_first() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 70);
+    project.save_as(&path).unwrap();
+    let saved = map.clone();
+    for seed in 71..75 {
+        stroke(&mut project, &mut map, 60, seed);
+    }
+    let first = project.recovery_path().to_path_buf();
+    drop(project);
+
+    let mut later = saved;
+    let mut reopened = Project::open(&path, config(&dir)).unwrap();
+    stroke(&mut reopened, &mut later, 60, 80);
+    let second = reopened.recovery_path().to_path_buf();
+    drop(reopened);
+
+    let listed = found(&dir);
+    let paths: Vec<&Path> = listed.iter().map(|c| c.path.as_path()).collect();
+    assert_eq!(
+        paths,
+        [&second, &first],
+        "the later session first: {listed:?}"
+    );
+    assert!(
+        listed[0].last_edit > listed[1].last_edit,
+        "its last edit is the newer: {listed:?}"
+    );
+    assert_eq!(listed[0].base, listed[1].base, "on one save point");
+    let mut restored = Project::restore(&listed[0], config(&dir)).unwrap();
+    assert_positions(
+        restored.store(),
+        &dense(&mesh, &later),
+        &tiles(&mesh, 1, TOP),
+        "the save and the later session's one stroke",
+    );
+}
+
 #[test]
 fn stale_temporary_files_are_swept() {
     let dir = TestDir::new();
