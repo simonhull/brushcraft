@@ -172,7 +172,7 @@ pub(crate) enum Invalidated {
 
 /// Why a pool operation failed.
 #[derive(Debug, Error)]
-pub(crate) enum PoolError {
+pub enum PoolError {
     /// Every slot is pinned and the budget allows no more chunks.
     #[error("every slot in the pool is pinned and the budget is spent")]
     Full,
@@ -229,6 +229,10 @@ pub(crate) struct Pool<T: Pod> {
     index: HashMap<TileKey, Pos>,
     /// Where the clock resumes, as a flat position (`chunk × per_chunk + index`).
     hand: u64,
+    /// Keys the pool freed on its own (the clock's victims, [`Pool::evict_all`],
+    /// [`Pool::shrink_to`]) since [`Pool::drain_evicted`] last ran; `None` unless the pool was
+    /// made with [`Pool::with_eviction_log`].
+    evicted: Option<Vec<TileKey>>,
 }
 
 impl<T: Pod> std::fmt::Debug for Pool<T> {
@@ -256,7 +260,51 @@ impl<T: Pod> Pool<T> {
             free: Vec::new(),
             index: HashMap::new(),
             hand: 0,
+            evicted: None,
         }
+    }
+
+    /// As [`Pool::new`], and the pool logs the keys it evicts for [`Pool::drain_evicted`], so an
+    /// owner keeping bookkeeping per resident tile (the tile cache's dependency graph) can follow.
+    /// The owner must drain the log, or it grows with every eviction.
+    pub(crate) fn with_eviction_log(chunk_bytes: usize) -> Self {
+        Self {
+            evicted: Some(Vec::new()),
+            ..Self::new(chunk_bytes)
+        }
+    }
+
+    /// The keys evicted since the last call, oldest first: tiles the pool freed on its own, not
+    /// those the caller freed with [`Pool::invalidate`] or [`Pool::remove`]. Always empty for a
+    /// pool made without [`Pool::with_eviction_log`].
+    pub(crate) fn drain_evicted(&mut self) -> Vec<TileKey> {
+        self.evicted
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Bytes per chunk: what mapping one more chunk takes from the budget.
+    pub(crate) const fn chunk_bytes(&self) -> usize {
+        self.chunk_bytes
+    }
+
+    /// Slots per chunk.
+    pub(crate) const fn per_chunk(&self) -> u32 {
+        self.per_chunk
+    }
+
+    /// Slots pinned at least once.
+    pub(crate) fn pinned_slots(&self) -> usize {
+        self.meta.iter().flatten().filter(|m| m.pins > 0).count()
+    }
+
+    /// Whether `key` has a pinned slot.
+    pub(crate) fn is_pinned(&self, key: &TileKey) -> bool {
+        self.index
+            .get(key)
+            .and_then(|&pos| self.meta_of(pos))
+            .is_some_and(|m| m.pins > 0)
     }
 
     /// Bytes of the mapped chunks: what the budget counts for this pool.
@@ -275,6 +323,13 @@ impl<T: Pod> Pool<T> {
             Freshness::Fresh
         };
         Some((SlotId::new(pos, meta.generation), freshness))
+    }
+
+    /// `key`'s slot, without marking it referenced: for bookkeeping passes (saving) that
+    /// shouldn't count as use.
+    pub(crate) fn find(&self, key: &TileKey) -> Option<SlotId<T>> {
+        let pos = *self.index.get(key)?;
+        Some(SlotId::new(pos, self.meta_of(pos)?.generation))
     }
 
     /// The slot's contents, or `None` for a stale handle.
@@ -536,6 +591,7 @@ impl<T: Pod> Pool<T> {
                 continue;
             }
             self.write_back_slot(pos, &mut write_back)?;
+            self.log_eviction(pos);
             self.release(pos);
             return Ok(pos);
         }
@@ -559,6 +615,7 @@ impl<T: Pod> Pool<T> {
                 .is_some_and(|m| m.key.is_some() && m.pins == 0);
             if evictable {
                 self.write_back_slot(pos, write_back)?;
+                self.log_eviction(pos);
                 self.release(pos);
                 self.free.push(pos);
             }
@@ -591,6 +648,14 @@ impl<T: Pod> Pool<T> {
             meta.dirty = false;
         }
         Ok(())
+    }
+
+    /// Adds the key at `pos` to the eviction log, if the pool keeps one.
+    fn log_eviction(&mut self, pos: Pos) {
+        let key = self.meta_of(pos).and_then(|m| m.key);
+        if let (Some(log), Some(key)) = (self.evicted.as_mut(), key) {
+            log.push(key);
+        }
     }
 
     /// Frees the slot at `pos`: unkeyed, clean, a new generation. The caller puts it on the free
@@ -1056,6 +1121,36 @@ mod tests {
             Invalidated::Freed,
             "clean now: freed"
         );
+    }
+
+    #[test]
+    fn the_eviction_log_names_what_the_pool_freed_on_its_own() {
+        let chunk = 2 * size_of::<Small>();
+        let (mut pool, mut budget) = (Pool::<Small>::with_eviction_log(chunk), Budget::new(chunk));
+        for n in 0..2 {
+            pool.acquire(key(n), &mut budget, no_write_back).unwrap();
+        }
+        assert_eq!(
+            pool.invalidate(&key(1)),
+            Invalidated::Freed,
+            "freed by the caller"
+        );
+        pool.acquire(key(2), &mut budget, no_write_back).unwrap();
+        pool.acquire(key(3), &mut budget, no_write_back).unwrap();
+        assert_eq!(
+            pool.drain_evicted(),
+            vec![key(0)],
+            "the clock's victim only"
+        );
+        assert!(pool.drain_evicted().is_empty(), "drained");
+        pool.evict_all(no_write_back).unwrap();
+        let mut evicted = pool.drain_evicted();
+        evicted.sort_unstable();
+        assert_eq!(evicted, vec![key(2), key(3)], "evict_all");
+        let (mut quiet, mut quiet_budget) = small(1, 1);
+        put(&mut quiet, &mut quiet_budget, 0, 1);
+        put(&mut quiet, &mut quiet_budget, 1, 1);
+        assert!(quiet.drain_evicted().is_empty(), "no log unless asked for");
     }
 
     #[test]

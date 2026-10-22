@@ -8,24 +8,20 @@
 mod bytes;
 mod codec;
 mod crc;
+mod deps;
 mod feed;
 mod file;
 mod op;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the tile cache (next in M0b2) is its first user")
-)]
 mod pool;
 mod record;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the tile cache (next in M0b2) is its first user")
-)]
 mod slot;
 #[cfg(test)]
 mod test_dir;
+mod tiles;
 
 pub use codec::CodecError;
 pub use feed::{ChangeFeed, ConsumerId};
 pub use file::{MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
+pub use pool::PoolError;
+pub use tiles::{CacheError, PinGuard, StoreConfig, TileStore};

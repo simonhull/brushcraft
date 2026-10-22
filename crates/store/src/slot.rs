@@ -79,7 +79,9 @@ impl CorrectionSlot {
         )
     }
 
-    /// A slot holding a copy of `tile`.
+    /// A slot holding a copy of `tile`: how the tests build slots (the store fills slots from
+    /// the file or edits them in place).
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn from_tile(tile: &CorrectionTile) -> Self {
         let mut slot = Self::zeroed();

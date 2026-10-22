@@ -1,0 +1,784 @@
+//! The tile store against `geom`'s dense evaluation, the oracle: every tile bit for bit, with
+//! room to spare and under constant eviction, across edits, saves and pins.
+
+#![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use geom::{
+    BaseMesh, CorrectionMap, CorrectionTile, DenseEvaluation, FaceId, Level, Region, TileKey, Vec3,
+    cube_sphere, normal_tiles, normals,
+};
+
+use super::*;
+use crate::test_dir::TestDir;
+
+/// Bytes of one evaluated slot: test chunks are sized in these.
+const EVAL: usize = size_of::<EvaluatedSlot>();
+
+/// The finest level the tests evaluate.
+const TOP: u8 = 8;
+
+/// The site the tests' ops carry.
+const SITE: u16 = 3;
+
+/// Deterministic random numbers (splitmix64).
+struct Rng(u64);
+
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `0..n`; `n > 0`.
+    fn below(&mut self, n: u32) -> u32 {
+        u32::try_from(self.next_u64() % u64::from(n)).unwrap()
+    }
+
+    /// Uniform in `[-amplitude, amplitude)`, per component.
+    fn vec3(&mut self, amplitude: f32) -> Vec3 {
+        let mut signed =
+            || f32::from(u16::try_from(self.next_u64() >> 48).unwrap()) / 32768.0 - 1.0;
+        Vec3::new(
+            signed() * amplitude,
+            signed() * amplitude,
+            signed() * amplitude,
+        )
+    }
+}
+
+/// One `set_correction` call.
+#[derive(Debug, Clone, Copy)]
+struct Edit {
+    face: FaceId,
+    level: Level,
+    i: u32,
+    j: u32,
+    c: Vec3,
+}
+
+fn level(n: u8) -> Level {
+    Level::new(n).unwrap()
+}
+
+/// The benchmark's sphere at its smallest: a cube, 6 faces.
+fn mesh() -> Arc<BaseMesh> {
+    Arc::new(cube_sphere(1).unwrap())
+}
+
+/// A configuration with chunks of `chunk_slots` evaluated slots and a budget of `chunks` of them.
+fn config(chunks: usize, chunk_slots: usize) -> StoreConfig {
+    StoreConfig {
+        budget_bytes: chunks * chunk_slots * EVAL,
+        chunk_bytes: chunk_slots * EVAL,
+        site: SITE,
+    }
+}
+
+/// Room for every tile of levels 1–8 of the cube, twice over.
+fn roomy() -> StoreConfig {
+    config(40, 16)
+}
+
+/// Six chunks of four evaluated slots (or fifteen correction slots).
+///
+/// About a sixth of the cube's 156 tiles fit, so evaluation evicts constantly and dirty tiles
+/// are written back. A cold level-8 evaluation pins about four parents per level at its peak, so
+/// this is close to the least that evaluates every tile.
+fn tight() -> StoreConfig {
+    config(6, 4)
+}
+
+/// Chunks in [`pinning`]'s budget.
+const PINNING_CHUNKS: usize = 12;
+
+/// [`tight`] with room for a few pinned tiles, or for the normals' inputs (pinned while a
+/// normal tile is computed), besides an evaluation's own pins.
+fn pinning() -> StoreConfig {
+    config(PINNING_CHUNKS, 4)
+}
+
+/// A store over a new working file `name` in `dir`.
+fn new_store(dir: &TestDir, name: &str, mesh: &Arc<BaseMesh>, config: StoreConfig) -> TileStore {
+    let file = ProjectFile::create(&dir.path(name)).unwrap();
+    TileStore::open(Arc::clone(mesh), file, config).unwrap()
+}
+
+/// Every tile of levels `from..=to`, coarse levels first.
+fn tiles(mesh: &BaseMesh, from: u8, to: u8) -> Vec<TileKey> {
+    (from..=to)
+        .flat_map(|l| {
+            let level = level(l);
+            let per_side = u16::try_from(level.tiles_per_side()).unwrap();
+            mesh.faces().flat_map(move |face| {
+                (0..per_side).flat_map(move |ty| {
+                    (0..per_side).map(move |tx| TileKey::displacement(face, level, tx, ty).unwrap())
+                })
+            })
+        })
+        .collect()
+}
+
+/// `count` random edits at levels `1..=top`, half of them on face or tile borders, where twins
+/// must stay equal.
+fn random_edits(mesh: &BaseMesh, top: u8, count: u32, seed: u64) -> Vec<Edit> {
+    let mut rng = Rng(seed);
+    (0..count)
+        .map(|_| {
+            let face = FaceId::new(rng.below(mesh.face_count()));
+            let level = level(1 + u8::try_from(rng.below(u32::from(top))).unwrap());
+            let (n, tq) = (level.face_quads(), level.tile_quads());
+            let mut pick = || {
+                if rng.below(2) == 0 {
+                    let border = rng.below(level.tiles_per_side() + 1) * tq;
+                    (border + rng.below(3)).saturating_sub(1).min(n)
+                } else {
+                    rng.below(n + 1)
+                }
+            };
+            let (i, j) = (pick(), pick());
+            let amplitude = 0.5 / f32::from(u16::try_from(n).unwrap());
+            Edit {
+                face,
+                level,
+                i,
+                j,
+                c: rng.vec3(amplitude),
+            }
+        })
+        .collect()
+}
+
+/// Applies `edits` to the store (each with a fresh op) and to the oracle's map.
+fn apply(store: &mut TileStore, map: &mut CorrectionMap, edits: &[Edit]) {
+    for e in edits {
+        let op = store.next_op().unwrap();
+        store
+            .set_correction(e.face, e.level, e.i, e.j, e.c, op)
+            .unwrap();
+        map.set(store.mesh.topology(), e.face, e.level, e.i, e.j, e.c)
+            .unwrap();
+    }
+}
+
+/// The oracle: every level up to [`TOP`], evaluated densely.
+fn dense(mesh: &BaseMesh, map: &CorrectionMap) -> DenseEvaluation {
+    DenseEvaluation::new(mesh, level(TOP), map).unwrap()
+}
+
+/// Asserts that `got`, tile `key`'s values, equal `want`'s at the same face-grid vertices, bit
+/// for bit.
+fn assert_tile(got: &[Vec3], want: impl Fn(u32, u32) -> Vec3, key: &TileKey, what: &str) {
+    let region = Region::of_tile(key);
+    let side = key.side();
+    assert_eq!(got.len(), (side * side) as usize, "{what} {key:?}: length");
+    for j in 0..side {
+        for i in 0..side {
+            let have = got[(j * side + i) as usize];
+            assert_eq!(
+                have.to_bits(),
+                want(region.x0() + i, region.y0() + j).to_bits(),
+                "{what} {key:?} ({i}, {j})"
+            );
+        }
+    }
+}
+
+/// Asserts that the store evaluates every tile of `keys` as the dense evaluation does.
+fn assert_positions(store: &mut TileStore, dense: &DenseEvaluation, keys: &[TileKey], what: &str) {
+    for key in keys {
+        let got = store.evaluate(*key).unwrap();
+        let grid = dense.grid(key.face(), key.level()).unwrap();
+        assert_tile(got, |i, j| grid.get(i, j).unwrap(), key, what);
+    }
+}
+
+/// Asserts that the store's normals of every tile of `keys` are geom's normals of the dense
+/// evaluation.
+fn assert_normals(
+    store: &mut TileStore,
+    mesh: &BaseMesh,
+    dense: &DenseEvaluation,
+    keys: &[TileKey],
+    what: &str,
+) {
+    for key in keys {
+        let want = normals(mesh, dense, Region::of_tile(key)).unwrap();
+        let got = store.normals(*key).unwrap();
+        let region = Region::of_tile(key);
+        assert_tile(
+            got,
+            |i, j| want.get(i - region.x0(), j - region.y0()).unwrap(),
+            key,
+            what,
+        );
+    }
+}
+
+/// The level-[`TOP`] tile holding face-grid vertex `(i, j)` of `face`.
+fn tile_at(face: FaceId, i: u32, j: u32) -> TileKey {
+    TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level(TOP), i, j)
+        .unwrap()
+        .0
+}
+
+/// Applies the 300 random edits of the oracle test to a new store with `config`, then checks
+/// every tile of levels 1–8 against the dense evaluation. Returns the store for more checks.
+fn evaluation_equals_dense(config: StoreConfig) -> (TestDir, TileStore) {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 1));
+    let dense = dense(&mesh, &map);
+    let all = tiles(&mesh, 1, TOP);
+    assert_positions(&mut store, &dense, &all, "first pass");
+    // Again, coarse and fine interleaved the other way round: whatever was evicted is
+    // recomputed from what is left.
+    let reversed: Vec<TileKey> = all.iter().rev().copied().collect();
+    assert_positions(&mut store, &dense, &reversed, "second pass");
+    assert!(
+        store.bytes() <= config.budget_bytes,
+        "{} bytes in a budget of {}",
+        store.bytes(),
+        config.budget_bytes
+    );
+    (dir, store)
+}
+
+#[test]
+fn store_evaluation_equals_dense_with_room() {
+    let (_dir, store) = evaluation_equals_dense(roomy());
+    assert_eq!(
+        store.log.positions.len(),
+        tiles(&store.mesh, 1, TOP).len(),
+        "with room, each tile is evaluated once"
+    );
+    assert_eq!(
+        store.file.keys().count(),
+        0,
+        "nothing evicted, so nothing written back"
+    );
+}
+
+#[test]
+fn store_evaluation_equals_dense_under_pressure() {
+    let (_dir, store) = evaluation_equals_dense(tight());
+    let tiles = tiles(&store.mesh, 1, TOP).len();
+    assert!(
+        store.log.positions.len() > 2 * tiles,
+        "evaluated {} times for {tiles} tiles: evicting constantly",
+        store.log.positions.len()
+    );
+    assert!(
+        store.file.keys().count() > 50,
+        "dirty correction tiles were written back: {}",
+        store.file.keys().count()
+    );
+}
+
+#[test]
+fn normals_equal_geoms_normals_of_the_dense_evaluation() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    for config in [roomy(), pinning()] {
+        let mut store = new_store(&dir, &format!("{}.bcp", config.budget_bytes), &mesh, config);
+        let mut map = CorrectionMap::new();
+        apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 2));
+        let dense = dense(&mesh, &map);
+        let keys: Vec<TileKey> = [1, 6, 7, 8]
+            .iter()
+            .flat_map(|&l| tiles(&mesh, l, l))
+            .collect();
+        assert_normals(&mut store, &mesh, &dense, &keys, "normals");
+    }
+}
+
+#[test]
+fn edits_after_evaluation_invalidate_exactly() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 3));
+    let all = tiles(&mesh, 1, TOP);
+    let finest = tiles(&mesh, TOP, TOP);
+    for key in &all {
+        store.evaluate(*key).unwrap();
+    }
+    for key in &finest {
+        store.normals(*key).unwrap();
+    }
+    store.log = EvalLog::default();
+
+    // An interior vertex of one finest tile: its only copy.
+    let (face, i, j) = (FaceId::new(4), 64 + 17, 128 + 40);
+    let edited = tile_at(face, i, j);
+    let edit = Edit {
+        face,
+        level: level(TOP),
+        i,
+        j,
+        c: Vec3::new(0.001, -0.002, 0.0015),
+    };
+    apply(&mut store, &mut map, &[edit]);
+    let dense = dense(&mesh, &map);
+    assert_positions(&mut store, &dense, &all, "after the edit");
+    assert_normals(&mut store, &mesh, &dense, &finest, "after the edit");
+
+    assert_eq!(
+        store.log.positions,
+        vec![edited],
+        "only the edited tile's positions were recomputed"
+    );
+    let readers: BTreeSet<TileKey> = finest
+        .iter()
+        .filter(|key| {
+            normal_tiles(&mesh, Region::of_tile(key))
+                .unwrap()
+                .contains(&edited)
+        })
+        .copied()
+        .collect();
+    assert!(readers.len() > 1, "the edited tile has neighbours");
+    let recomputed: BTreeSet<TileKey> = store.log.normals.iter().copied().collect();
+    assert_eq!(
+        recomputed, readers,
+        "exactly the normals that read the edited tile were dropped"
+    );
+    assert_eq!(
+        store.log.normals.len(),
+        readers.len(),
+        "each recomputed once"
+    );
+}
+
+#[test]
+fn edits_at_a_coarse_level_reach_the_finest() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 4));
+    for key in tiles(&mesh, 1, TOP) {
+        store.evaluate(key).unwrap();
+    }
+    // The levels between go, as eviction would take them: the edit must still reach level 8
+    // through tiles that are no longer cached.
+    for key in tiles(&mesh, 4, TOP - 1) {
+        assert!(store.evaluated.remove(&key).unwrap(), "{key:?} was cached");
+        store.deps.left_pool(key);
+    }
+    store.log = EvalLog::default();
+    let edits: Vec<Edit> = random_edits(&mesh, 3, 40, 5)
+        .into_iter()
+        .filter(|e| e.level == level(3))
+        .collect();
+    assert!(!edits.is_empty(), "some edits at level 3");
+    apply(&mut store, &mut map, &edits);
+    let dense = dense(&mesh, &map);
+    let finest = tiles(&mesh, TOP, TOP);
+    assert_positions(&mut store, &dense, &finest, "level 8 after level-3 edits");
+    assert!(
+        store.log.positions.iter().any(|k| k.level() == level(TOP)),
+        "level-8 tiles were recomputed"
+    );
+}
+
+#[test]
+fn sparse_on_disk_equals_explicit_zero() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let all = tiles(&mesh, 1, TOP);
+    let edits = random_edits(&mesh, TOP, 120, 6);
+
+    // Explicit: every tile has a record, all zero, before the edits.
+    let mut explicit = ProjectFile::create(&dir.path("explicit.bcp")).unwrap();
+    let op = OpId::new(SITE, 0).unwrap();
+    for key in &all {
+        explicit
+            .write_displacement(*key, op, &CorrectionTile::zero(key.side()).unwrap())
+            .unwrap();
+    }
+    explicit.save().unwrap();
+
+    let mut map = CorrectionMap::new();
+    let mut sparse = new_store(&dir, "sparse.bcp", &mesh, roomy());
+    apply(&mut sparse, &mut map, &edits);
+    sparse.save().unwrap();
+    let mut explicit = TileStore::open(Arc::clone(&mesh), explicit, tight()).unwrap();
+    apply(&mut explicit, &mut CorrectionMap::new(), &edits);
+    explicit.save().unwrap();
+    assert_eq!(
+        explicit.file.keys().count(),
+        all.len(),
+        "every tile is on disk"
+    );
+    assert!(
+        sparse.file.keys().count() < all.len() / 2,
+        "most tiles are absent: {}",
+        sparse.file.keys().count()
+    );
+
+    let dense = dense(&mesh, &map);
+    for key in &all {
+        let a: Vec<u32> = sparse
+            .evaluate(*key)
+            .unwrap()
+            .iter()
+            .flat_map(|v| v.to_bits())
+            .collect();
+        let b: Vec<u32> = explicit
+            .evaluate(*key)
+            .unwrap()
+            .iter()
+            .flat_map(|v| v.to_bits())
+            .collect();
+        assert_eq!(a, b, "{key:?}: absent and zero tiles evaluate alike");
+    }
+    assert_positions(&mut sparse, &dense, &all, "sparse");
+}
+
+#[test]
+fn save_reopen_evaluate() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("work.bcp");
+    let mut map = CorrectionMap::new();
+    let last_op = {
+        let mut store = TileStore::open(
+            Arc::clone(&mesh),
+            ProjectFile::create(&path).unwrap(),
+            tight(),
+        )
+        .unwrap();
+        let edits = random_edits(&mesh, TOP, 300, 7);
+        let (first, second) = edits.split_at(150);
+        apply(&mut store, &mut map, first);
+        // Evaluation between edits evicts, writing dirty tiles back without a save point.
+        for key in tiles(&mesh, 1, TOP) {
+            store.evaluate(key).unwrap();
+        }
+        apply(&mut store, &mut map, second);
+        store.save().unwrap();
+        assert!(store.unsaved.is_empty(), "every dirty tile written");
+        let offset = store.file.len();
+        store.save().unwrap();
+        assert!(
+            store.file.len() - offset < 1024,
+            "a save with no edits writes no tiles"
+        );
+        store.next_op().unwrap()
+    };
+    let file = ProjectFile::open(&path).unwrap();
+    let mut store = TileStore::open(Arc::clone(&mesh), file, roomy()).unwrap();
+    assert_eq!(
+        store.next_op().unwrap(),
+        last_op,
+        "ops continue right after the file's head"
+    );
+    let dense = dense(&mesh, &map);
+    assert_positions(&mut store, &dense, &tiles(&mesh, 1, TOP), "reopened");
+}
+
+#[test]
+fn over_budget_pin_fails_without_touching_pins() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, pinning());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 100, 8));
+    let finest = tiles(&mesh, TOP, TOP);
+    let first: Vec<TileKey> = finest.iter().step_by(17).copied().collect();
+    let guard = store.pin(&first).unwrap();
+    let before: Vec<(SlotId<EvaluatedSlot>, Vec<Vec3>)> = first
+        .iter()
+        .map(|key| {
+            let (id, freshness) = store.evaluated.lookup(key).unwrap();
+            assert_eq!(freshness, Freshness::Fresh, "{key:?} fresh");
+            (id, store.evaluated.get(id).unwrap().positions.to_vec())
+        })
+        .collect();
+    let resident: Vec<TileKey> = tiles(&mesh, 1, TOP)
+        .into_iter()
+        .filter(|key| store.evaluated.find(key).is_some())
+        .collect();
+    let (bytes, written) = (store.bytes(), store.file.len());
+
+    let too_many: Vec<TileKey> = finest.iter().take(4 * PINNING_CHUNKS).copied().collect();
+    let refused = store.pin(&too_many);
+    assert!(
+        matches!(refused, Err(CacheError::OverBudget { .. })),
+        "refused: {refused:?}"
+    );
+    assert_eq!(store.bytes(), bytes, "no chunk mapped or given back");
+    assert_eq!(store.file.len(), written, "nothing written back");
+    for key in &resident {
+        assert!(store.evaluated.find(key).is_some(), "{key:?} not evicted");
+    }
+    for (key, (id, positions)) in first.iter().zip(&before) {
+        assert_eq!(
+            store.evaluated.lookup(key),
+            Some((*id, Freshness::Fresh)),
+            "{key:?} kept its slot"
+        );
+        assert!(store.evaluated.is_pinned(key), "{key:?} still pinned");
+        assert!(store.corrections.is_pinned(key), "its corrections too");
+        assert_eq!(
+            store.evaluated.get(*id).unwrap().positions.as_slice(),
+            positions.as_slice(),
+            "{key:?} unchanged"
+        );
+    }
+    assert_eq!(guard.keys(), first.as_slice(), "the guard names its tiles");
+    drop(guard);
+    store.evaluate(finest[0]).unwrap();
+    assert!(
+        first.iter().all(|key| !store.evaluated.is_pinned(key)),
+        "dropping the guard unpins at the next call"
+    );
+}
+
+#[test]
+fn pins_survive_pressure() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, pinning());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 200, 9));
+    let dense = dense(&mesh, &map);
+    let finest = tiles(&mesh, TOP, TOP);
+    let pinned = [finest[0], finest[33], finest[70]];
+    let guard = store.pin(&pinned).unwrap();
+    let ids: Vec<SlotId<EvaluatedSlot>> = pinned
+        .iter()
+        .map(|key| store.evaluated.find(key).unwrap())
+        .collect();
+    store.log = EvalLog::default();
+    assert_positions(&mut store, &dense, &tiles(&mesh, 1, TOP), "the other tiles");
+    assert!(
+        store.log.positions.len() > 100,
+        "under pressure: {} evaluations",
+        store.log.positions.len()
+    );
+    for (key, id) in pinned.iter().zip(&ids) {
+        assert_eq!(
+            store.evaluated.find(key),
+            Some(*id),
+            "{key:?} stayed in its slot"
+        );
+        assert!(
+            !store.log.positions.contains(key),
+            "{key:?} was never recomputed"
+        );
+    }
+    assert_positions(&mut store, &dense, &pinned, "pinned");
+    drop(guard);
+}
+
+#[test]
+fn corrections_take_chunks_back_from_evaluated_tiles() {
+    // Chunks of one evaluated slot or three correction slots, five of them.
+    let config = config(5, 1);
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    let faces: Vec<TileKey> = tiles(&mesh, 1, 1);
+    // Three pinned faces fill the first correction chunk and three evaluated chunks.
+    let guard = store.pin(&faces[..3]).unwrap();
+    assert_eq!(
+        store.corrections.bytes(),
+        store.corrections.chunk_bytes(),
+        "one correction chunk"
+    );
+    let dense = dense(&mesh, &CorrectionMap::new());
+    // The fourth face's evaluated slot takes the second correction chunk back; the fifth face's
+    // correction tile then finds the correction pool pinned full and the budget spent, with the
+    // fourth face's evaluated chunk the only one to give: without taking it, the evaluated pool
+    // would starve the corrections.
+    assert_positions(&mut store, &dense, &faces[3..], "faces 4–6");
+    assert!(store.bytes() <= config.budget_bytes, "within the budget");
+    drop(guard);
+}
+
+#[test]
+fn a_pinned_tile_is_recomputed_in_place() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 200, 10));
+    let (face, i, j) = (FaceId::new(2), 192 + 9, 64 + 50);
+    let fine = tile_at(face, i, j);
+    let coarse = TileKey::containing(
+        LayerId::BASE,
+        Channel::DISPLACEMENT,
+        face,
+        level(7),
+        i / 2,
+        j / 2,
+    )
+    .unwrap()
+    .0;
+    let guard = store.pin(&[fine, coarse]).unwrap();
+    store.normals(fine).unwrap();
+    let ids = [fine, coarse].map(|key| store.evaluated.find(&key).unwrap());
+
+    // An edit of the fine tile, and one a level up that changes both.
+    let edits = [
+        Edit {
+            face,
+            level: level(TOP),
+            i,
+            j,
+            c: Vec3::new(0.002, 0.001, -0.003),
+        },
+        Edit {
+            face,
+            level: level(6),
+            i: i / 4,
+            j: j / 4,
+            c: Vec3::new(-0.004, 0.003, 0.001),
+        },
+    ];
+    apply(&mut store, &mut map, &edits);
+    for (key, id) in [fine, coarse].iter().zip(ids) {
+        assert_eq!(
+            store.evaluated.lookup(key),
+            Some((id, Freshness::Stale)),
+            "{key:?}: marked stale in its slot"
+        );
+    }
+    let dense = dense(&mesh, &map);
+    assert_positions(&mut store, &dense, &[coarse, fine], "recomputed");
+    assert_normals(&mut store, &mesh, &dense, &[fine], "recomputed");
+    for (key, id) in [fine, coarse].iter().zip(ids) {
+        assert_eq!(
+            store.evaluated.lookup(key),
+            Some((id, Freshness::Fresh)),
+            "{key:?}: fresh in the same slot"
+        );
+    }
+    drop(guard);
+}
+
+#[test]
+fn bad_requests_are_refused() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let file = ProjectFile::create(&dir.path("reserved.bcp")).unwrap();
+    let reserved = StoreConfig {
+        site: RESERVED_SITE,
+        ..roomy()
+    };
+    assert!(
+        matches!(
+            TileStore::open(Arc::clone(&mesh), file, reserved),
+            Err(CacheError::ReservedSite)
+        ),
+        "reserved site"
+    );
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let base = TileKey::displacement(FaceId::new(0), Level::ZERO, 0, 0).unwrap();
+    let elsewhere = TileKey::displacement(FaceId::new(6), level(1), 0, 0).unwrap();
+    for key in [base, elsewhere] {
+        assert!(
+            matches!(store.evaluate(key), Err(CacheError::NotATile(_))),
+            "{key:?}"
+        );
+    }
+    let op = store.next_op().unwrap();
+    let refused = [
+        (FaceId::new(0), Level::ZERO, 0, 0, Vec3::ZERO),
+        (FaceId::new(9), level(1), 0, 0, Vec3::ZERO),
+        (FaceId::new(0), level(1), 3, 0, Vec3::ZERO),
+        (
+            FaceId::new(0),
+            level(1),
+            0,
+            0,
+            Vec3::new(f32::NAN, 0.0, 0.0),
+        ),
+    ];
+    for (face, level, i, j, c) in refused {
+        assert!(
+            matches!(
+                store.set_correction(face, level, i, j, c, op),
+                Err(CacheError::Correction(_))
+            ),
+            "{face} {level} ({i}, {j})"
+        );
+    }
+    assert_eq!(store.feed.backlog(), 0, "nothing pushed");
+    assert!(store.unsaved.is_empty(), "nothing dirty");
+}
+
+#[test]
+fn a_pin_that_runs_out_of_room_releases_only_its_own_pins() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, tight());
+    let finest = tiles(&mesh, TOP, TOP);
+    let held = store.pin(&finest[..1]).unwrap();
+    let id = store.evaluated.find(&finest[0]).unwrap();
+    // Within the budget counted as packed slots, but each tile's evaluation pins its parents
+    // too, and there isn't room for both.
+    let wanted: Vec<TileKey> = finest.iter().skip(1).step_by(9).copied().collect();
+    let refused = store.pin(&wanted);
+    assert!(
+        matches!(refused, Err(CacheError::Pool(PoolError::Full))),
+        "ran out of room: {refused:?}"
+    );
+    assert_eq!(
+        (
+            store.evaluated.pinned_slots(),
+            store.corrections.pinned_slots()
+        ),
+        (1, 1),
+        "only the first pin set's slots stay pinned"
+    );
+    assert_eq!(store.evaluated.find(&finest[0]), Some(id), "in its slot");
+    drop(held);
+}
+
+#[test]
+fn shrinking_gives_back_evaluated_chunks_before_corrections() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 11));
+    let all = tiles(&mesh, 1, TOP);
+    for key in &all {
+        store.evaluate(*key).unwrap();
+    }
+    let (corrections, evaluated) = (store.corrections.bytes(), store.evaluated.bytes());
+    assert!(
+        evaluated > store.evaluated.chunk_bytes(),
+        "several evaluated chunks"
+    );
+    let written = store.file.len();
+
+    store.shrink_to(store.bytes() - evaluated / 2).unwrap();
+    assert_eq!(
+        store.corrections.bytes(),
+        corrections,
+        "corrections untouched while evaluated chunks are left to give"
+    );
+    assert_eq!(store.file.len(), written, "so nothing written back");
+    assert!(store.evaluated.bytes() < evaluated, "evaluated chunks went");
+
+    store.shrink_to(0).unwrap();
+    assert_eq!(store.bytes(), 0, "everything unpinned goes");
+    assert!(
+        store.unsaved.is_empty(),
+        "dirty tiles were written back first"
+    );
+    let dense = dense(&mesh, &map);
+    assert_positions(&mut store, &dense, &all, "after shrinking to nothing");
+}
