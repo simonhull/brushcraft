@@ -2,10 +2,12 @@
 
 use thiserror::Error;
 
-use crate::Vec3;
+use crate::{TILE_QUADS, Vec3};
 
 /// Largest quantized magnitude.
 const Q_MAX: f32 = 32767.0;
+/// Interior magnitudes below this would need a subnormal scale; such interiors are stored as zero.
+const TINY: f32 = Q_MAX * f32::MIN_POSITIVE;
 
 /// One tile's corrections, `(t, b, n)` per vertex (`x`, `y`, `z`) in the tangent frame of the
 /// predicted surface.
@@ -89,12 +91,12 @@ impl CorrectionTile {
         let cells = (0..side)
             .flat_map(|j| (0..side).map(move |i| (i, j)))
             .zip(values);
-        tile.scale = cells
+        let peak = cells
             .clone()
             .filter(|((i, j), _)| matches!(tile.slot(*i, *j), Some(Slot::Interior(_))))
             .map(|(_, v)| max_abs(*v))
-            .fold(0.0, f32::max)
-            / Q_MAX;
+            .fold(0.0, f32::max);
+        tile.scale = if peak < TINY { 0.0 } else { peak / Q_MAX };
         cells
             .into_iter()
             .try_for_each(|((i, j), v)| tile.store(i, j, *v))?;
@@ -118,13 +120,14 @@ impl CorrectionTile {
             && border.len() == nb
             && scale.is_finite()
             && scale >= 0.0
-            && border.iter().all(|v| v.is_finite());
+            && border.iter().all(|v| v.is_finite())
+            && interior.iter().flatten().all(|q| *q != i16::MIN);
         if ok {
             Ok(Self {
                 side,
-                scale,
+                scale: scale + 0.0,
                 interior,
-                border,
+                border: border.into_iter().map(without_negative_zero).collect(),
             })
         } else {
             Err(CorrectionError::BadParts { side })
@@ -144,8 +147,12 @@ impl CorrectionTile {
     }
 
     /// The largest error per interior component after one quantization: half a step.
+    ///
+    /// This holds for tiles built by [`CorrectionTile::from_values`] or
+    /// [`CorrectionTile::from_parts`]. After [`CorrectionTile::set`] has grown the scale,
+    /// values are only guaranteed within one [`CorrectionTile::scale`].
     #[must_use]
-    pub fn max_error(&self) -> f32 {
+    pub const fn max_error(&self) -> f32 {
         self.scale * 0.5
     }
 
@@ -176,8 +183,15 @@ impl CorrectionTile {
         }
     }
 
-    /// Sets the correction at `(i, j)`. If an interior value doesn't fit the current scale, the
-    /// tile is re-quantized with a larger one (earlier values are then within one new step).
+    /// Sets the correction at `(i, j)`.
+    ///
+    /// If an interior value doesn't fit the current scale, the scale grows geometrically (doubling
+    /// until it fits; from zero it becomes exactly what the value needs) and the existing
+    /// interior is re-quantized. Each growth adds at most half the new step of error to earlier
+    /// values, so after any number of growths they are within one
+    /// final [`CorrectionTile::scale`] of what was stored, not within
+    /// [`CorrectionTile::max_error`]. Interior values below a tiny threshold on a zero-scale
+    /// tile are stored as zero.
     ///
     /// # Errors
     ///
@@ -189,7 +203,13 @@ impl CorrectionTile {
         if let Some(Slot::Interior(_)) = self.slot(i, j) {
             let needed = max_abs(c);
             if needed > Q_MAX * self.scale {
-                self.requantize(needed / Q_MAX);
+                if self.scale == 0.0 {
+                    if needed >= TINY {
+                        self.requantize(needed / Q_MAX);
+                    }
+                } else {
+                    self.requantize(grown_scale(self.scale, needed));
+                }
             }
         }
         self.store(i, j, c)
@@ -199,7 +219,8 @@ impl CorrectionTile {
     ///
     /// # Errors
     ///
-    /// [`CorrectionError::OutOfTile`].
+    /// [`CorrectionError::OutOfTile`] if `(i, j)` is outside the tile. The `get_mut` misses below
+    /// are unreachable: `slot` only returns indices inside the vectors `counts` sized.
     fn store(&mut self, i: u32, j: u32, value: Vec3) -> Result<(), CorrectionError> {
         let side = self.side;
         match self.slot(i, j) {
@@ -219,7 +240,8 @@ impl CorrectionTile {
                 *self
                     .border
                     .get_mut(index)
-                    .ok_or(CorrectionError::OutOfTile { i, j, side })? = value;
+                    .ok_or(CorrectionError::OutOfTile { i, j, side })? =
+                    without_negative_zero(value);
             }
             None => return Err(CorrectionError::OutOfTile { i, j, side }),
         }
@@ -265,9 +287,9 @@ impl CorrectionTile {
     ///
     /// # Errors
     ///
-    /// [`CorrectionError::BadSide`] below 2.
+    /// [`CorrectionError::BadSide`] below 2 or above `TILE_QUADS + 1`, the largest tile there is.
     fn counts(side: u32) -> Result<(usize, usize), CorrectionError> {
-        if side < 2 {
+        if !(2..=TILE_QUADS + 1).contains(&side) {
             return Err(CorrectionError::BadSide(side));
         }
         let to = |n: u32| {
@@ -277,6 +299,19 @@ impl CorrectionTile {
         };
         Ok((to((side - 2) * (side - 2))?, to(4 * (side - 1))?))
     }
+}
+
+/// Grows `scale` by the smallest power of two that makes `needed` fit.
+fn grown_scale(scale: f32, needed: f32) -> f32 {
+    (1..=128)
+        .map(|k| scale * 2.0_f32.powi(k))
+        .find(|grown| grown.is_finite() && grown * Q_MAX >= needed)
+        .unwrap_or(needed / Q_MAX)
+}
+
+/// Maps `-0.0` components to `+0.0`, so equal corrections have equal bits.
+fn without_negative_zero(v: Vec3) -> Vec3 {
+    Vec3::new(v.x + 0.0, v.y + 0.0, v.z + 0.0)
 }
 
 fn max_abs(v: Vec3) -> f32 {
@@ -309,18 +344,122 @@ mod tests {
     use crate::test_rng::Rng;
 
     #[test]
-    fn border_ring_indexes_every_border_vertex_once() {
-        let tile = CorrectionTile::zero(5).unwrap();
-        let mut seen = [false; 16];
-        for j in 0..5 {
-            for i in 0..5 {
-                if let Some(Slot::Border(k)) = tile.slot(i, j) {
-                    assert!(!seen[k], "border slot {k} used twice");
+    fn slots_are_a_bijection_onto_the_storage() {
+        for side in [2_u32, 3, 65] {
+            let tile = CorrectionTile::zero(side).unwrap();
+            let mut interior = vec![false; tile.interior.len()];
+            let mut border = vec![false; tile.border.len()];
+            for j in 0..side {
+                for i in 0..side {
+                    let (seen, k) = match tile.slot(i, j).unwrap() {
+                        Slot::Interior(k) => (&mut interior, k),
+                        Slot::Border(k) => (&mut border, k),
+                    };
+                    assert!(!seen[k], "side {side}: slot {k} used twice");
                     seen[k] = true;
                 }
             }
+            assert!(
+                interior.iter().all(|s| *s),
+                "side {side}: every interior slot used"
+            );
+            assert!(
+                border.iter().all(|s| *s),
+                "side {side}: every border slot used"
+            );
         }
-        assert!(seen.iter().all(|s| *s), "every border slot used");
+    }
+
+    #[test]
+    fn slots_are_laid_out_as_documented() {
+        let tile = CorrectionTile::zero(5).unwrap();
+        let last: u32 = 4;
+        let ring = |n: u32| Slot::Border(usize::try_from(n).unwrap());
+        assert_eq!(tile.slot(1, 1), Some(Slot::Interior(0)), "first interior");
+        assert_eq!(tile.slot(2, 1), Some(Slot::Interior(1)), "row-major");
+        assert_eq!(tile.slot(0, 0), Some(Slot::Border(0)), "corner 0");
+        assert_eq!(tile.slot(last, 0), Some(ring(last)), "corner 1");
+        assert_eq!(tile.slot(last, last), Some(ring(2 * last)), "corner 2");
+        assert_eq!(tile.slot(0, last), Some(ring(3 * last)), "corner 3");
+        assert_eq!(
+            tile.slot(last - 1, last),
+            Some(ring(2 * last + 1)),
+            "top row runs backwards"
+        );
+    }
+
+    #[test]
+    fn scale_comes_from_the_interior_only() {
+        let side = 5;
+        let mut values = vec![Vec3::new(1e3, 1e3, 1e3); 25];
+        for j in 1..4 {
+            for i in 1..4 {
+                values[j * 5 + i] = Vec3::new(1.0, 0.0, -0.5);
+            }
+        }
+        let tile = CorrectionTile::from_values(side, &values).unwrap();
+        assert_eq!(tile.scale(), 1.0 / 32767.0, "borders don't set the scale");
+        assert_eq!(tile.get(0, 0).unwrap().x, 1e3, "border exact");
+    }
+
+    #[test]
+    fn tiny_interiors_are_stored_as_zero() {
+        let values = vec![Vec3::new(1e-40, 0.0, 0.0); 9];
+        let tile = CorrectionTile::from_values(3, &values).unwrap();
+        assert_eq!(tile.scale(), 0.0, "no subnormal scale");
+        assert_eq!(tile.get(1, 1).unwrap(), Vec3::ZERO, "interior zero");
+    }
+
+    #[test]
+    fn negative_zero_is_normalised() {
+        let mut tile = CorrectionTile::zero(4).unwrap();
+        tile.set(0, 0, Vec3::new(-0.0, -0.0, -0.0)).unwrap();
+        assert_eq!(
+            tile.get(0, 0).unwrap().to_bits(),
+            [0; 3],
+            "border −0 becomes +0"
+        );
+        assert!(tile.is_zero(), "still zero");
+        let parts = CorrectionTile::from_parts(2, -0.0, vec![], vec![Vec3::new(-0.0, 0.0, 0.0); 4])
+            .unwrap();
+        assert_eq!(parts.scale().to_bits(), 0, "scale normalised");
+        assert_eq!(parts.border()[0].to_bits(), [0; 3], "border normalised");
+    }
+
+    #[test]
+    fn from_parts_rejects_i16_min_and_oversized_sides() {
+        let bad = vec![[i16::MIN, 0, 0]];
+        assert_eq!(
+            CorrectionTile::from_parts(3, 1.0, bad, vec![Vec3::ZERO; 8]),
+            Err(CorrectionError::BadParts { side: 3 }),
+            "−32768 is not a valid quantized value"
+        );
+        assert_eq!(
+            CorrectionTile::zero(66),
+            Err(CorrectionError::BadSide(66)),
+            "above a full tile"
+        );
+        assert!(CorrectionTile::zero(65).is_ok(), "a full tile");
+    }
+
+    #[test]
+    fn repeated_small_growth_does_not_drift() {
+        let mut tile = CorrectionTile::zero(9).unwrap();
+        let small = Vec3::new(0.01, 0.0, 0.0);
+        tile.set(2, 2, small).unwrap();
+        let mut v = 0.01_f32;
+        for _ in 0..100 {
+            v *= 1.0005;
+            tile.set(5, 5, Vec3::new(v, 0.0, 0.0)).unwrap();
+        }
+        assert!(
+            (tile.get(2, 2).unwrap().x - small.x).abs() <= tile.scale(),
+            "small value within one scale"
+        );
+        assert!(
+            (tile.get(5, 5).unwrap().x - v).abs() <= tile.scale(),
+            "latest value within one scale"
+        );
     }
 
     #[test]

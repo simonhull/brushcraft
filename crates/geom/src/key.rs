@@ -42,6 +42,8 @@ impl Level {
     /// The base mesh.
     pub const ZERO: Self = Self(0);
 
+    /// A level from its number.
+    ///
     /// # Errors
     ///
     /// [`LevelOutOfRange`] above [`MAX_LEVEL`].
@@ -190,6 +192,8 @@ pub struct TileKey {
 }
 
 impl TileKey {
+    /// A tile key, checked against the face's tile grid.
+    ///
     /// # Errors
     ///
     /// [`TileOutOfRange`] if `tx` or `ty` is not below `level.tiles_per_side()`.
@@ -380,16 +384,21 @@ impl Region {
         }
     }
 
-    /// The same area one level coarser, or `None` at level 0.
+    /// The same area one level coarser, or `None` at level 0 or if this block doesn't start and end
+    /// on even grid lines (so it can't be halved exactly).
     #[must_use]
     pub fn parent(self) -> Option<Self> {
         let level = self.level.parent()?;
+        if !(self.x0.is_multiple_of(2) && self.y0.is_multiple_of(2) && self.quads.is_multiple_of(2))
+        {
+            return None;
+        }
         Some(Self {
             face: self.face,
             level,
             x0: self.x0 / 2,
             y0: self.y0 / 2,
-            quads: (self.quads / 2).max(1),
+            quads: self.quads / 2,
         })
     }
 
@@ -462,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn containing_prefers_the_lower_tile_on_a_border() {
+    fn containing_prefers_the_higher_tile_on_a_border() {
         let level = Level::new(8).unwrap(); // 4×4 tiles of 64
         let (key, i, j) = TileKey::containing(
             LayerId::BASE,
@@ -489,6 +498,53 @@ mod tests {
             )
             .is_none(),
             "outside the face"
+        );
+    }
+
+    #[test]
+    fn containing_handles_the_far_edge_and_small_levels() {
+        let at = |level: u8, i, j| {
+            let level = Level::new(level).unwrap();
+            let (key, li, lj) = TileKey::containing(
+                LayerId::BASE,
+                Channel::DISPLACEMENT,
+                FaceId::new(0),
+                level,
+                i,
+                j,
+            )
+            .unwrap();
+            (key.tx(), key.ty(), li, lj)
+        };
+        assert_eq!(
+            at(8, 256, 10),
+            (3, 0, 64, 10),
+            "i = N: last tile, local coordinate 64"
+        );
+        assert_eq!(
+            at(4, 16, 7),
+            (0, 0, 16, 7),
+            "level <= 6: one tile covers the face, including its far edge"
+        );
+    }
+
+    #[test]
+    fn region_without_an_exact_parent_has_none() {
+        let key = TileKey::displacement(FaceId::new(0), Level::new(9).unwrap(), 3, 5).unwrap();
+        let mut region = Region::of_tile(&key);
+        let mut levels = 0;
+        while let Some(parent) = region.parent() {
+            region = parent;
+            levels += 1;
+        }
+        assert_eq!(
+            levels, 6,
+            "(192, 320, 64) halves six times, then x0 = 3 is odd"
+        );
+        assert_eq!(
+            (region.x0(), region.y0(), region.quads()),
+            (3, 5, 1),
+            "stopped at the odd block"
         );
     }
 
