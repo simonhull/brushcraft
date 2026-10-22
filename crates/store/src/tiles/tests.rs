@@ -187,6 +187,13 @@ fn dab(store: &mut TileStore, map: &mut CorrectionMap, e: &Edit) {
         .unwrap();
 }
 
+/// Breaks `key`'s resident correction slot: it no longer holds a valid tile, so it neither
+/// encodes nor saves.
+pub(crate) fn break_slot(store: &mut TileStore, key: &TileKey) {
+    let id = store.corrections.find(key).unwrap();
+    store.corrections.get_mut(id).unwrap().side = 0;
+}
+
 /// Flips a bit in the middle of the record at `loc` of the file at `path`, from outside, as a
 /// bad sector would: the record fails its checksum.
 pub(crate) fn damage(path: &std::path::Path, loc: Loc) {

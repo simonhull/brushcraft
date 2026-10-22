@@ -11,7 +11,8 @@ use geom::{CorrectionMap, Region, TileKey, Vec3};
 use super::*;
 use crate::test_dir::TestDir;
 use crate::tiles::tests::{
-    TOP, apply, apply_dabs, assert_positions, damage, dense, mesh, random_edits, roomy, tiles,
+    TOP, apply, apply_dabs, assert_positions, break_slot, damage, dense, mesh, random_edits, roomy,
+    tiles,
 };
 
 /// A configuration with room for every tile, and recovery files in `dir`'s `recovery`.
@@ -684,6 +685,116 @@ fn a_tile_lost_to_a_roll_over_is_reported_and_saves_go_through() {
         std::thread::yield_now();
     }
     assert_eq!(reported, [lost], "the lost tile is reported");
+    project.save().unwrap();
+    project.close(false).unwrap();
+    assert_project_file(
+        &dir.path("p.bcrf"),
+        &want,
+        "the lost tile at its last saved state",
+    );
+}
+
+/// A report waits for the save: tiles a flush left out (a broken slot) are reported after the
+/// save is made, never instead of it.
+#[test]
+fn a_save_goes_through_and_then_reports_what_is_unprotected() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 100, 131);
+    project.save_as(&path).unwrap();
+    let mut want = map.clone();
+    let top = tiles(&mesh, TOP, TOP);
+    let (broken, kept) = (top[5], top[30]);
+    interior(
+        &mut project,
+        &mut [&mut map],
+        broken,
+        Vec3::new(0.0, 0.0, 0.25),
+    );
+    interior(
+        &mut project,
+        &mut [&mut map, &mut want],
+        kept,
+        Vec3::new(0.25, 0.0, 0.0),
+    );
+    project.finish_flushes().unwrap();
+    // Edited again, its slot broken before the stroke ends: the flush leaves it out, and the
+    // save copies its last record instead.
+    project.begin_stroke().unwrap();
+    project
+        .store()
+        .edit_tile(broken, |edit| edit.set(5, 7, Vec3::new(0.0, 0.0, 0.5)))
+        .unwrap()
+        .unwrap();
+    break_slot(project.store(), &broken);
+    project.end_stroke().unwrap();
+    let saved = project.save();
+    assert!(
+        matches!(&saved, Err(ProjectError::Unprotected(tiles)) if *tiles == [broken]),
+        "reported once, after the save: {saved:?}"
+    );
+    assert!(!project.has_unsaved_edits(), "the save went through");
+    project.poll().unwrap();
+    project.close(false).unwrap();
+    // The broken tile's first edit was flushed, so the save copied that; its second is lost.
+    let mut first = want.clone();
+    let region = Region::of_tile(&broken);
+    first
+        .set(
+            mesh.topology(),
+            broken.face(),
+            broken.level(),
+            region.x0() + 5,
+            region.y0() + 7,
+            Vec3::new(0.0, 0.0, 0.25),
+        )
+        .unwrap();
+    assert_project_file(&path, &first, "every edit but the broken slot's last");
+}
+
+/// A roll-over that loses a tile and then fails (its old file can't be deleted) still reports
+/// the lost tile: with the next call, as the failure takes this one.
+#[test]
+fn a_roll_over_that_fails_after_losing_a_tile_still_reports_it() {
+    let dir = TestDir::new();
+    let (mut project, lost, _, mut want) = with_an_unreadable_edit(&dir);
+    let old = project.recovery_path().to_path_buf();
+    // The working file stays open, unlinked; a directory takes its name, so it can't be
+    // deleted.
+    fs::remove_file(&old).unwrap();
+    fs::create_dir_all(&old).unwrap();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    let other = tiles(&mesh(), TOP, TOP)[40];
+    interior(
+        &mut project,
+        &mut [&mut want],
+        other,
+        Vec3::new(0.0, 0.25, 0.0),
+    );
+    let began = Instant::now();
+    let failed = loop {
+        match project.poll() {
+            Ok(()) => {
+                assert!(began.elapsed() < Duration::from_secs(30), "the sync fails");
+                std::thread::yield_now();
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(&failed, ProjectError::OldRecoveryKept { path, .. } if *path == old),
+        "{failed:?}"
+    );
+    assert_ne!(project.recovery_path(), old, "rolled over all the same");
+    let next = project.poll();
+    assert!(
+        matches!(&next, Err(ProjectError::Unprotected(tiles)) if *tiles == [lost]),
+        "the lost tile, reported next: {next:?}"
+    );
+    fs::remove_dir(&old).unwrap();
     project.save().unwrap();
     project.close(false).unwrap();
     assert_project_file(

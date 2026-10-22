@@ -49,7 +49,7 @@
 //! is discarded: a save point is the unit of durability, and replaying the tail could bring
 //! back half a stroke. At worst, the stroke in progress is lost.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -243,6 +243,10 @@ pub struct Project {
     recovery_path: PathBuf,
     /// The directory recovery files go in.
     recovery_dir: PathBuf,
+    /// Tiles whose latest edits were found unprotected (left out of a flush, or lost to a
+    /// roll-over or a save), waiting to be reported: by the next call that has no other error
+    /// to return ([`Project::report`]). So a report never stops a call from doing its work.
+    unreported: BTreeSet<geom::TileKey>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename (see
     /// [`Unplaced::crash`]).
@@ -458,6 +462,7 @@ impl Project {
             path,
             recovery_path,
             recovery_dir: config.recovery_dir,
+            unreported: BTreeSet::new(),
             #[cfg(test)]
             fail_next_recovery: false,
         })
@@ -475,28 +480,29 @@ impl Project {
     /// [`Project::new`] for the fresh recovery file. A save that fails after the project file's
     /// save point is written leaves the project open on the old recovery file, which still
     /// holds every edit; saving again works. [`ProjectError::OldRecoveryKept`] if the save
-    /// went through, but the old recovery file couldn't be deleted.
+    /// went through, but the old recovery file couldn't be deleted. [`ProjectError::Unprotected`]
+    /// after the save went through, for tiles found unprotected before it or lost to it: a
+    /// report never stops a save.
     pub fn save(&mut self) -> Result<(), ProjectError> {
-        self.poll()?;
+        self.advance()?;
         if self.path.is_none() {
             return Err(ProjectError::NoPath);
         }
         self.finish_flushes()?;
         let path = self.path.clone().ok_or(ProjectError::NoPath)?;
         let mut project = self.file.take().ok_or(ProjectError::NoPath)?;
-        let mut lost = Vec::new();
         let switched = self
             .store
             .save_into(&mut project)
             .map_err(ProjectError::from)
             .and_then(|saved| {
-                lost.extend(saved.lost());
+                self.unreported.extend(saved.lost());
                 self.switch_recovery(saved, &project, &path)
             });
         self.file = Some(project);
         let old = switched?;
         retire(&old)?;
-        report(lost)
+        self.report()
     }
 
     /// Saves the project as a new project file at `path`, with a new project id, and goes on
@@ -515,9 +521,9 @@ impl Project {
     /// file, where the new project file is in place but the project goes on with the old one.
     /// Once the store is rebased onto the new file, the project goes on with it, its path and
     /// its id, whatever happens next: [`ProjectError::OldRecoveryKept`] if the old recovery file
-    /// couldn't be deleted.
+    /// couldn't be deleted. [`ProjectError::Unprotected`] as for [`Project::save`].
     pub fn save_as(&mut self, path: &Path) -> Result<(), ProjectError> {
-        self.poll()?;
+        self.advance()?;
         let path = std::path::absolute(path)?;
         if fs::symlink_metadata(&path).is_ok() {
             return Err(ProjectError::Exists(path));
@@ -540,14 +546,15 @@ impl Project {
                 return Err(e);
             }
         };
-        let lost = saved.lost().iter().copied().collect();
+        let lost = saved.lost().clone();
         let old = self.switch_recovery(saved, &project, &path)?;
         // The switch has happened: the store reads the new project file, so the project holds
         // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
         self.path = Some(path);
+        self.unreported.extend(lost);
         retire(&old)?;
-        report(lost)
+        self.report()
     }
 
     /// Fills `project`, the new file being written at `tmp`, with the last save point's tiles
@@ -582,18 +589,24 @@ impl Project {
     ///
     /// [`ProjectError::Recovery`] if the last flushes fail: the recovery file is kept then,
     /// whatever `keep_recovery` says. [`ProjectError::Io`] or [`ProjectError::Store`] if it
-    /// can't be deleted.
+    /// can't be deleted. [`ProjectError::Unprotected`] once closed, if a kept recovery file
+    /// lacks the latest edits of some tiles.
     pub fn close(mut self, keep_recovery: bool) -> Result<(), ProjectError> {
         // A failed writer rolls over first, so the file kept holds every edit.
         self.with_writer(|_, _| Ok(()))?;
-        if let Some(writer) = self.writer.take() {
-            writer.close(&mut self.store, Instant::now())?;
+        if let Some(mut writer) = self.writer.take() {
+            let finished = writer.finish(&mut self.store, Instant::now());
+            self.unreported.extend(writer.take_skipped());
+            let closed = writer.close(&mut self.store, Instant::now());
+            finished.and(closed)?;
         }
         if !keep_recovery {
             fs::remove_file(&self.recovery_path)?;
             sync_parent(&self.recovery_path)?;
+            // Nothing is kept to lack them.
+            self.unreported.clear();
         }
-        Ok(())
+        self.report()
     }
 
     /// Whether the project has edits no save holds: any edit since the last save, or, for a
@@ -646,11 +659,12 @@ impl Project {
     ///
     /// [`ProjectError::Recovery`] if the recovery writer fails, unless the failure was a sync,
     /// which the project deals with by moving to a new recovery file holding every edit;
-    /// [`ProjectError::Unprotected`] for tiles whose edits aren't in the recovery file;
     /// [`ProjectError::Cache`], [`ProjectError::Io`] or [`ProjectError::Store`] if moving to a
-    /// new recovery file fails.
+    /// new recovery file fails (the next call tries again); [`ProjectError::Unprotected`] for
+    /// tiles whose edits aren't in the recovery file, once nothing else is to be reported.
     pub fn end_stroke(&mut self) -> Result<(), ProjectError> {
-        self.with_writer(|writer, store| writer.end_stroke(store, Instant::now()))
+        self.with_writer(|writer, store| writer.end_stroke(store, Instant::now()))?;
+        self.report()
     }
 
     /// Time passed, to `now`: flushes the edits of a long stroke at least once a second (see
@@ -660,7 +674,8 @@ impl Project {
     ///
     /// As [`Project::end_stroke`].
     pub fn tick(&mut self, now: Instant) -> Result<(), ProjectError> {
-        self.with_writer(|writer, store| writer.tick(store, now))
+        self.with_writer(|writer, store| writer.tick(store, now))?;
+        self.report()
     }
 
     /// Advances the recovery writer's flush in flight and installs finished prefetches,
@@ -670,6 +685,17 @@ impl Project {
     ///
     /// As [`Project::end_stroke`]; [`ProjectError::Cache`] from installing prefetched tiles.
     pub fn poll(&mut self) -> Result<(), ProjectError> {
+        self.advance()?;
+        self.report()
+    }
+
+    /// [`Project::poll`] without the report: what a save starts with, before it saves, so a
+    /// report waits until the save is made.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::with_writer`]; [`ProjectError::Cache`] from installing prefetched tiles.
+    fn advance(&mut self) -> Result<(), ProjectError> {
         self.with_writer(RecoveryWriter::poll)?;
         self.store.poll()?;
         Ok(())
@@ -685,40 +711,48 @@ impl Project {
         self.with_writer(|writer, store| writer.finish(store, Instant::now()))
     }
 
-    /// Runs `call` on the recovery writer, then deals with what it found.
-    ///
-    /// If the writer has failed (a sync of the recovery file failed, see [`crate::recovery`]),
-    /// the project rolls over to a new recovery file holding every edit
-    /// ([`Project::roll_over`]); the failure is then dealt with, and isn't returned. Tiles the
-    /// writer left out of its flushes (broken slots), or the roll-over couldn't carry across,
-    /// are reported.
+    /// Reports the tiles found unprotected since the last report, if any, and forgets them.
     ///
     /// # Errors
     ///
-    /// `call`'s error, as [`ProjectError::Recovery`], unless a roll-over dealt with it; as
-    /// [`Project::roll_over`]; [`ProjectError::Unprotected`] for tiles whose edits aren't in the
-    /// recovery file.
+    /// [`ProjectError::Unprotected`] with those tiles, in key order.
+    fn report(&mut self) -> Result<(), ProjectError> {
+        if self.unreported.is_empty() {
+            return Ok(());
+        }
+        let tiles = std::mem::take(&mut self.unreported);
+        Err(ProjectError::Unprotected(tiles.into_iter().collect()))
+    }
+
+    /// Runs `call` on the recovery writer, then deals with what it found.
+    ///
+    /// Tiles the writer left out of its flushes (broken slots) wait to be reported
+    /// ([`Project::report`]). If the writer has failed (a sync of the recovery file failed, see
+    /// [`crate::recovery`]), the project rolls over to a new recovery file holding every edit
+    /// ([`Project::roll_over`]), and the failure, dealt with, isn't returned. A roll-over that
+    /// fails is tried again by the next call.
+    ///
+    /// # Errors
+    ///
+    /// `call`'s error, as [`ProjectError::Recovery`], unless the writer has failed; as
+    /// [`Project::roll_over`].
     fn with_writer(
         &mut self,
         call: impl FnOnce(&mut RecoveryWriter, &mut TileStore) -> Result<(), RecoveryError>,
     ) -> Result<(), ProjectError> {
         let writer = self.writer.as_mut().ok_or(RecoveryError::Stopped)?;
         let outcome = call(writer, &mut self.store);
-        let mut unprotected = writer.take_skipped();
+        self.unreported.extend(writer.take_skipped());
         if writer.is_failed() {
-            unprotected.extend(self.roll_over()?);
+            self.roll_over()
         } else {
-            outcome?;
-        }
-        if unprotected.is_empty() {
-            Ok(())
-        } else {
-            Err(ProjectError::Unprotected(unprotected))
+            Ok(outcome?)
         }
     }
 
-    /// Moves the edits to a new recovery file after the writer failed to sync the current one,
-    /// and returns the tiles that couldn't be carried across.
+    /// Moves the edits to a new recovery file after the writer failed to sync the current one.
+    /// The tiles that couldn't be carried across wait to be reported ([`Project::report`]),
+    /// whatever happens after the move.
     ///
     /// The new file names the same save point. It is made under its temporary name, filled with
     /// every edit from the store ([`TileStore::fill_roll_over`]: synced, a save point, synced),
@@ -732,7 +766,7 @@ impl Project {
     /// can't write the new file. The new file is deleted then, and the project stays on the old
     /// one, failed, to try again. [`ProjectError::Recovery`] if the new writer's thread can't
     /// be started; [`ProjectError::OldRecoveryKept`] if the old file can't be deleted.
-    fn roll_over(&mut self) -> Result<Vec<geom::TileKey>, ProjectError> {
+    fn roll_over(&mut self) -> Result<(), ProjectError> {
         let meta = self.store.working().meta().clone();
         let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
             ProjectFile::create_like(at, meta, self.store.working())
@@ -756,14 +790,14 @@ impl Project {
             }
         };
         drop(old);
+        self.unreported.extend(lost);
         if let Some(failed) = self.writer.take() {
             // It can only say that it needs a new file; closing releases its subscription.
             drop(failed.close(&mut self.store, Instant::now()));
         }
-        self.writer = Some(RecoveryWriter::new(&mut self.store)?);
         let old_path = std::mem::replace(&mut self.recovery_path, fresh_path);
-        retire(&old_path)?;
-        Ok(lost)
+        self.writer = Some(RecoveryWriter::new(&mut self.store)?);
+        retire(&old_path)
     }
 
     /// Creates a fresh recovery file on the save point `saved` proves in `project`, the project
@@ -804,20 +838,6 @@ impl Project {
         };
         drop(old);
         Ok(std::mem::replace(&mut self.recovery_path, fresh_path))
-    }
-}
-
-/// Reports `tiles`, whose latest edits a call found lost, as [`ProjectError::Unprotected`];
-/// nothing to report if there are none.
-///
-/// # Errors
-///
-/// [`ProjectError::Unprotected`] if `tiles` isn't empty.
-fn report(tiles: Vec<geom::TileKey>) -> Result<(), ProjectError> {
-    if tiles.is_empty() {
-        Ok(())
-    } else {
-        Err(ProjectError::Unprotected(tiles))
     }
 }
 

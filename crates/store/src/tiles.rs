@@ -892,9 +892,10 @@ impl TileStore {
     /// with the op of its latest write, else the working file's record is copied as it is,
     /// keeping its original op, else, if that record no longer reads, a clean resident slot
     /// (which holds what the record did) is written with the record's op as the store last knew
-    /// it. A tile none of these gives (a broken dirty slot, or an unreadable record of a tile not
-    /// resident) is lost: left out, so the new save point holds its last saved state, and listed
-    /// in the proof ([`Saved::lost`]), so one lost tile never blocks the saves after it. Save's
+    /// it. A tile whose latest edit none of these gives is lost, and listed in the proof
+    /// ([`Saved::lost`]), so one lost tile never blocks the saves after it: a broken dirty slot
+    /// is saved as the working file's record, if that reads, and a tile neither way left out,
+    /// at its last saved state. Save's
     /// consumer of the change feed is drained first; the tiles it lists stay listed until a
     /// rebase, so a save that fails, or one followed by more edits, is simply made again.
     /// Nothing in the store changes: dirty slots stay dirty until the rebase, which is what
@@ -923,29 +924,47 @@ impl TileStore {
         let mut lost = BTreeSet::new();
         for key in &self.since_rebase {
             let resident = self.corrections.find(key);
-            let from_slot = match resident.filter(|&id| self.corrections.is_dirty(id) == Some(true))
-            {
-                Some(_) => self.unsaved.get(key).map(|write| write.op),
-                None => match self.file.read_tile_record(key) {
-                    Ok(Some(raw)) => {
-                        project.append_copy(key, &raw).map_err(CacheError::Save)?;
-                        continue;
-                    }
-                    Ok(None) => return Err(Invariant::NothingToSave(*key).into()),
-                    // Unreadable: a clean resident slot still holds what it did.
-                    Err(_) => resident.and_then(|_| self.known_ops.get(key).copied()),
-                },
+            let tile = |id| {
+                self.corrections
+                    .get(id)
+                    .and_then(|slot| slot.to_tile().ok())
             };
-            let tile = resident
-                .and_then(|id| self.corrections.get(id))
-                .and_then(|slot| slot.to_tile().ok());
-            let (Some(op), Some(tile)) = (from_slot, tile) else {
+            let dirty = resident.filter(|&id| self.corrections.is_dirty(id) == Some(true));
+            // The dirty slot: the latest edit.
+            if let Some(id) = dirty {
+                let op = self.unsaved.get(key).map(|write| write.op);
+                if let (Some(op), Some(tile)) = (op, tile(id)) {
+                    project
+                        .write_displacement(*key, op, &tile)
+                        .map_err(CacheError::Save)?;
+                    continue;
+                }
+                // Broken: the latest edit is lost, and the record is the best left of it.
                 lost.insert(*key);
-                continue;
-            };
-            project
-                .write_displacement(*key, op, &tile)
-                .map_err(CacheError::Save)?;
+            }
+            // The working file's record.
+            match self.file.read_tile_record(key) {
+                Ok(Some(raw)) => {
+                    project.append_copy(key, &raw).map_err(CacheError::Save)?;
+                    continue;
+                }
+                Ok(None) if dirty.is_none() => {
+                    return Err(Invariant::NothingToSave(*key).into());
+                }
+                Ok(None) => continue,
+                Err(_) => {}
+            }
+            // The record is unreadable, but a clean resident slot holds what it did.
+            let clean = resident.filter(|_| dirty.is_none());
+            let op = clean.and_then(|_| self.known_ops.get(key).copied());
+            match (op, clean.and_then(tile)) {
+                (Some(op), Some(tile)) => project
+                    .write_displacement(*key, op, &tile)
+                    .map_err(CacheError::Save)?,
+                _ => {
+                    lost.insert(*key);
+                }
+            }
         }
         // Every tile of a recovery file is an edit since the last save point, so it must have
         // been copied: a save point without one would lose it once the store is rebased.
