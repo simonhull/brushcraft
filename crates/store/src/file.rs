@@ -45,8 +45,8 @@ pub enum StoreError {
         /// Where the record starts.
         offset: u64,
     },
-    /// Recovery stopped at byte `offset`, but a good record follows: the file is damaged there,
-    /// not torn at its end. It was left untouched.
+    /// Recovery stopped at byte `offset`, but a good save point (Index) follows: the file is
+    /// damaged there, not torn at its end. It was left untouched.
     #[error("the project file is damaged at byte {offset}, before later good records")]
     DamagedMidFile {
         /// Where recovery stopped.
@@ -189,9 +189,11 @@ impl ProjectFile {
     /// Opens the project at `path` at its latest state, recovering from a crash: the state is
     /// the last good save point plus every complete record after it, and a torn tail is cut off.
     ///
-    /// Where recovery stops before the end of the file, the rest is searched for a record that
-    /// verifies. If there is one, the stop was damage, not a torn tail, and the file is left as
-    /// it is.
+    /// Where recovery stops before the end of the file, the rest is searched for an Index that
+    /// verifies. Saves sync their tiles before writing the Index, so everything before a good
+    /// Index was durable: the stop was damage, and the file is left as it is. Without one, the
+    /// rest is a torn or unsynced tail of unsaved edits (even if some of its tile records verify,
+    /// since writeback may have kept a later write and lost an earlier one), and is cut off.
     ///
     /// # Errors
     ///
@@ -230,7 +232,7 @@ impl ProjectFile {
         let replay_from = this.load_base(&heads, len)?;
         this.replay(heads.get(replay_from..).unwrap_or_default())?;
         if this.end < len {
-            if find_record(&this.file, this.end, len)?.is_some() {
+            if find_index(&this.file, this.end, len)?.is_some() {
                 return Err(StoreError::DamagedMidFile { offset: this.end });
             }
             if repair == Repair::Truncate {
@@ -637,8 +639,8 @@ fn scan_heads(file: &File, len: u64) -> io::Result<Vec<(u64, Head)>> {
     Ok(heads)
 }
 
-/// The first offset in `[from, len)` where a whole record starts that verifies: a head of a known
-/// kind whose record ends by `len`, with a good checksum. `None` if there is none.
+/// The first offset in `[from, len)` where a whole Index record starts that verifies: an Index head
+/// whose record ends by `len`, with a good checksum. `None` if there is none.
 ///
 /// The range is read in windows, so a long tail costs one pass and little memory; a candidate
 /// longer than its window is read on its own.
@@ -646,7 +648,7 @@ fn scan_heads(file: &File, len: u64) -> io::Result<Vec<(u64, Head)>> {
 /// # Errors
 ///
 /// The I/O error of a read.
-fn find_record(file: &File, from: u64, len: u64) -> io::Result<Option<u64>> {
+fn find_index(file: &File, from: u64, len: u64) -> io::Result<Option<u64>> {
     /// Candidate head positions per window.
     const WINDOW: u64 = 1 << 20;
     let mut start = from;
@@ -658,7 +660,7 @@ fn find_record(file: &File, from: u64, len: u64) -> io::Result<Option<u64>> {
                 .try_into()
                 .ok()
                 .and_then(parse_head)
-                .filter(|h| matches!(h.kind, KIND_TILE | KIND_INDEX))
+                .filter(|h| h.kind == KIND_INDEX)
                 .filter(|h| at.saturating_add(h.total()) <= len)
             else {
                 continue;
@@ -1226,6 +1228,34 @@ mod tests {
         let opened = ProjectFile::open(&path).unwrap();
         assert_eq!(state_of(&opened), want, "the saved state");
         assert_eq!(std::fs::read(&path).unwrap(), good, "the tail is cut off");
+    }
+
+    #[test]
+    fn unsaved_writes_lost_out_of_order_are_cut_off() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        saved_three_times(&path);
+        let mut f = ProjectFile::open(&path).unwrap();
+        let want = state_of(&f);
+        let saved = f.len();
+        // Unsaved, so not synced: writeback may keep B and lose A.
+        f.write_displacement(key(7, 0), op(100), &tile(7.0))
+            .unwrap();
+        let a_end = f.len();
+        f.write_displacement(key(8, 0), op(101), &tile(8.0))
+            .unwrap();
+        drop(f);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let a = usize::try_from(saved).unwrap()..usize::try_from(a_end).unwrap();
+        bytes[a].fill(0);
+        std::fs::write(&path, &bytes).unwrap();
+        let opened = ProjectFile::open(&path).unwrap();
+        assert_eq!(state_of(&opened), want, "the last save, nothing after");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            saved,
+            "cut off at A, with B after it"
+        );
     }
 
     #[test]
