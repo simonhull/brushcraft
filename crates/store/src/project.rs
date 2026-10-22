@@ -125,6 +125,9 @@ pub enum ProjectError {
     NeverSaved,
     /// The latest edits of these tiles aren't in the recovery file: their slots were broken, or
     /// moving to a new recovery file couldn't read them. The rest of the edits are protected.
+    /// Reported by a save, they aren't in the project file either (the save couldn't read
+    /// them): it holds their last saved state. The call that reports them otherwise did what it
+    /// was asked; a save went through.
     #[error("the edits of {} tiles are not in the recovery file", .0.len())]
     Unprotected(Vec<geom::TileKey>),
     /// [`Project::restore`] was given a recovery file that can't be layered on its project:
@@ -481,14 +484,19 @@ impl Project {
         self.finish_flushes()?;
         let path = self.path.clone().ok_or(ProjectError::NoPath)?;
         let mut project = self.file.take().ok_or(ProjectError::NoPath)?;
+        let mut lost = Vec::new();
         let switched = self
             .store
             .save_into(&mut project)
             .map_err(ProjectError::from)
-            .and_then(|saved| self.switch_recovery(saved, &project, &path));
+            .and_then(|saved| {
+                lost.extend(saved.lost());
+                self.switch_recovery(saved, &project, &path)
+            });
         self.file = Some(project);
         let old = switched?;
-        retire(&old)
+        retire(&old)?;
+        report(lost)
     }
 
     /// Saves the project as a new project file at `path`, with a new project id, and goes on
@@ -532,12 +540,14 @@ impl Project {
                 return Err(e);
             }
         };
+        let lost = saved.lost().iter().copied().collect();
         let old = self.switch_recovery(saved, &project, &path)?;
         // The switch has happened: the store reads the new project file, so the project holds
         // it, and saves go to it. The old project file closes here, and its lock goes with it.
         self.file = Some(project);
         self.path = Some(path);
-        retire(&old)
+        retire(&old)?;
+        report(lost)
     }
 
     /// Fills `project`, the new file being written at `tmp`, with the last save point's tiles
@@ -794,6 +804,20 @@ impl Project {
         };
         drop(old);
         Ok(std::mem::replace(&mut self.recovery_path, fresh_path))
+    }
+}
+
+/// Reports `tiles`, whose latest edits a call found lost, as [`ProjectError::Unprotected`];
+/// nothing to report if there are none.
+///
+/// # Errors
+///
+/// [`ProjectError::Unprotected`] if `tiles` isn't empty.
+fn report(tiles: Vec<geom::TileKey>) -> Result<(), ProjectError> {
+    if tiles.is_empty() {
+        Ok(())
+    } else {
+        Err(ProjectError::Unprotected(tiles))
     }
 }
 

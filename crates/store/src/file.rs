@@ -1129,22 +1129,6 @@ impl ProjectFile {
         }))
     }
 
-    /// Appends a copy of `from`'s latest record of `key`, as it is (not decoded or
-    /// recompressed), and records it as [`ProjectFile::write_tile`] does. Returns whether
-    /// `from` had one.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if `from`'s record fails its checksum
-    /// or isn't a tile of `key`; [`StoreError::Io`].
-    pub(crate) fn copy_tile(&mut self, from: &Self, key: &TileKey) -> Result<bool, StoreError> {
-        let Some(raw) = from.read_tile_record(key)? else {
-            return Ok(false);
-        };
-        self.append_copy(key, &raw)?;
-        Ok(true)
-    }
-
     /// `key`'s latest record, framing included, after checking that it verifies and is a tile
     /// of `key`; `None` if the tile is absent. For [`ProjectFile::append_copy`] into another
     /// file.
@@ -1164,12 +1148,15 @@ impl ProjectFile {
         Ok(Some(raw))
     }
 
-    /// Appends a copy of every tile `base` holds, as [`ProjectFile::copy_tile`] does: the
-    /// saved state of another project, carried into this one.
+    /// Appends a copy of every tile `base` holds, each record as it is (not decoded or
+    /// recompressed), checked first: the saved state of another project, carried into this
+    /// one.
     ///
     /// # Errors
     ///
-    /// As [`ProjectFile::copy_tile`]; [`StoreError::Closed`] if `base`'s file has been dropped.
+    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if a record of `base` fails its
+    /// checksum or isn't a tile of its key; [`StoreError::Io`]; [`StoreError::Closed`] if
+    /// `base`'s file has been dropped.
     pub(crate) fn copy_base(&mut self, base: &BaseFile) -> Result<(), StoreError> {
         for (key, &loc) in base.locations.iter() {
             let raw = base.reader.read_record(loc)?;

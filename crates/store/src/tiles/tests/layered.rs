@@ -526,6 +526,71 @@ fn a_recovery_file_opened_beside_its_project_shares_the_mesh() {
     assert_eq!(theirs.mesh().to_bytes(), other.to_bytes(), "its own mesh");
 }
 
+/// A save that can't read a tile's latest edit lists the tile as lost and leaves it at its last
+/// saved state; the rebase and the saves after it go through.
+#[test]
+fn a_tile_lost_to_a_save_does_not_block_the_saves_after_it() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let all = tiles(&mesh, 1, TOP);
+    let mut saved = CorrectionMap::new();
+    let mut project = saved_project(
+        &dir,
+        "p.bcrf",
+        &mesh,
+        &mut saved,
+        &random_edits(&mesh, TOP, 40, 71),
+    );
+    let working = recovery(&dir, "r1.bcrf", &project);
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), roomy()).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let (lost, kept) = (top[5], top[30]);
+    // Interior vertices only: a lost tile's twins elsewhere would disagree with it.
+    let mut map = saved.clone();
+    apply_batches(
+        &mut store,
+        &mut map,
+        &[(lost, vec![(5, 7, Vec3::new(0.0, 0.0, 0.25))])],
+    );
+    let mut want = saved.clone();
+    for into in [&mut map, &mut want] {
+        apply_batches(
+            &mut store,
+            into,
+            &[(kept, vec![(9, 4, Vec3::new(0.25, 0.0, 0.0))])],
+        );
+    }
+    // In the working file only, its record damaged there.
+    store.save().unwrap();
+    store.evict_all().unwrap();
+    damage(&dir.path("r1.bcrf"), store.file.locate(&lost).unwrap());
+
+    let proof = store.save_into(&mut project).unwrap();
+    assert_eq!(
+        proof.lost().iter().copied().collect::<Vec<_>>(),
+        [lost],
+        "listed as lost"
+    );
+    store
+        .rebase(proof, recovery(&dir, "r2.bcrf", &project))
+        .unwrap();
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &want),
+        &all,
+        "its last saved state",
+    );
+    // The saves after it go through, the lost tile edited again too.
+    let more = random_edits(&mesh, TOP, 30, 72);
+    apply(&mut store, &mut want, &more);
+    drop(save_and_rebase(&mut store, &mut project, &dir, "r3.bcrf"));
+    drop(store);
+    drop(project);
+    let file = ProjectFile::open(&dir.path("p.bcrf")).unwrap();
+    let mut reopened = TileStore::open(file, roomy()).unwrap();
+    assert_positions(&mut reopened, &dense(&mesh, &want), &all, "saved after");
+}
+
 #[test]
 fn ops_continue_after_the_base_head() {
     let dir = TestDir::new();

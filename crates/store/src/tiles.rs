@@ -701,22 +701,31 @@ pub(crate) struct Snapshot {
 /// Proof that a save copied every tile edited since the last rebase into a project file, made
 /// only by [`TileStore::save_into`] and taken by [`TileStore::rebase`].
 ///
-/// It holds the project file's new save point, as the base to rebase on, and the store's latest
-/// write when the save was made: a rebase refuses it if the store has been written since, as
-/// those writes are in no save. There is no other way to make one, so a store can't be rebased
-/// past edits that were never saved.
+/// It holds the project file's new save point, as the base to rebase on, the store's latest
+/// write when the save was made (a rebase refuses it if the store has been written since, as
+/// those writes are in no save), and the tiles the save found lost: edited, but readable
+/// nowhere. There is no other way to make one, so a store can't be rebased past edits that
+/// were never saved, except those it has listed as lost.
 #[derive(Debug)]
 pub(crate) struct Saved {
     /// The project file as of the save point the save wrote.
     base: BaseFile,
     /// The stamp of the store's latest write when the save was made.
     stamp: Stamp,
+    /// The tiles edited since the last rebase whose latest edit couldn't be read (see
+    /// [`TileStore::save_into`]): the save point holds their last saved state.
+    lost: BTreeSet<TileKey>,
 }
 
 impl Saved {
     /// The save point the save wrote: what the fresh working file to rebase on must name.
     pub(crate) const fn save_point(&self) -> SavePoint {
         self.base.save_point()
+    }
+
+    /// The tiles whose latest edit the save couldn't read, and left out.
+    pub(crate) const fn lost(&self) -> &BTreeSet<TileKey> {
+        &self.lost
     }
 }
 
@@ -880,11 +889,16 @@ impl TileStore {
     /// and the store's latest write.
     ///
     /// Each tile is copied from where its latest edit is: a dirty slot is encoded and written
-    /// with the op of its latest edit, else the working file's record is copied as it is,
-    /// keeping its original op. Save's consumer of the change feed is drained first; the tiles
-    /// it lists stay listed until a rebase, so a save that fails, or one followed by more edits,
-    /// is simply made again. Nothing in the store changes: dirty slots stay dirty until the
-    /// rebase, which is what makes the save's copies the saved state.
+    /// with the op of its latest write, else the working file's record is copied as it is,
+    /// keeping its original op, else, if that record no longer reads, a clean resident slot
+    /// (which holds what the record did) is written with the record's op as the store last knew
+    /// it. A tile none of these gives (a broken dirty slot, or an unreadable record of a tile not
+    /// resident) is lost: left out, so the new save point holds its last saved state, and listed
+    /// in the proof ([`Saved::lost`]), so one lost tile never blocks the saves after it. Save's
+    /// consumer of the change feed is drained first; the tiles it lists stay listed until a
+    /// rebase, so a save that fails, or one followed by more edits, is simply made again.
+    /// Nothing in the store changes: dirty slots stay dirty until the rebase, which is what
+    /// makes the save's copies the saved state.
     ///
     /// A project being saved under a new name has its old save point copied in first (see
     /// [`ProjectFile::copy_base`]); this adds the edits.
@@ -892,10 +906,11 @@ impl TileStore {
     /// # Errors
     ///
     /// [`CacheError::WrongBase`] if `project` isn't a project file; [`CacheError::MeshMismatch`]
-    /// if it is over another mesh; [`CacheError::Save`] if a write to it, a read of the working
-    /// file, or its save point fails; [`CacheError::Internal`] for a broken slot, or an edited
-    /// tile that is nowhere to copy from, or a tile of the recovery file that wasn't copied
-    /// ([`Invariant::NotInSave`], checked before the save point is written).
+    /// if it is over another mesh; [`CacheError::Save`] if a write to it or its save point
+    /// fails; [`CacheError::Internal`] for an edited tile that has no record in the working file
+    /// and isn't dirty ([`Invariant::NothingToSave`]: every edit is in one or the other), or a
+    /// tile of the recovery file that wasn't copied ([`Invariant::NotInSave`], checked before
+    /// the save point is written).
     pub(crate) fn save_into(&mut self, project: &mut ProjectFile) -> Result<Saved, CacheError> {
         self.sync_pins()?;
         if project.meta().role() != Role::Project {
@@ -905,28 +920,32 @@ impl TileStore {
             return Err(CacheError::MeshMismatch);
         }
         self.drain_saves();
+        let mut lost = BTreeSet::new();
         for key in &self.since_rebase {
-            let dirty = self
-                .corrections
-                .find(key)
-                .filter(|&id| self.corrections.is_dirty(id) == Some(true));
-            if let Some(id) = dirty {
-                let Dirty { op, .. } = self
-                    .unsaved
-                    .get(key)
-                    .copied()
-                    .ok_or(Invariant::MissingOp(*key))?;
-                let slot = self.corrections.get(id).ok_or(Invariant::StaleHandle)?;
-                let tile = slot.to_tile().map_err(Invariant::CorrectionSlot)?;
-                project
-                    .write_displacement(*key, op, &tile)
-                    .map_err(CacheError::Save)?;
-            } else if !project
-                .copy_tile(&self.file, key)
-                .map_err(CacheError::Save)?
+            let resident = self.corrections.find(key);
+            let from_slot = match resident.filter(|&id| self.corrections.is_dirty(id) == Some(true))
             {
-                return Err(Invariant::NothingToSave(*key).into());
-            }
+                Some(_) => self.unsaved.get(key).map(|write| write.op),
+                None => match self.file.read_tile_record(key) {
+                    Ok(Some(raw)) => {
+                        project.append_copy(key, &raw).map_err(CacheError::Save)?;
+                        continue;
+                    }
+                    Ok(None) => return Err(Invariant::NothingToSave(*key).into()),
+                    // Unreadable: a clean resident slot still holds what it did.
+                    Err(_) => resident.and_then(|_| self.known_ops.get(key).copied()),
+                },
+            };
+            let tile = resident
+                .and_then(|id| self.corrections.get(id))
+                .and_then(|slot| slot.to_tile().ok());
+            let (Some(op), Some(tile)) = (from_slot, tile) else {
+                lost.insert(*key);
+                continue;
+            };
+            project
+                .write_displacement(*key, op, &tile)
+                .map_err(CacheError::Save)?;
         }
         // Every tile of a recovery file is an edit since the last save point, so it must have
         // been copied: a save point without one would lose it once the store is rebased.
@@ -946,6 +965,7 @@ impl TileStore {
         Ok(Saved {
             base,
             stamp: self.last_write,
+            lost,
         })
     }
 
@@ -955,7 +975,9 @@ impl TileStore {
     /// `saved` must be current: made by [`TileStore::save_into`] with no write since. Then every
     /// tile edited since the last rebase is in the new save point, and the old working file's
     /// records are no longer needed. That is checked, not assumed: every tile of the old
-    /// working file and of the old base must be in the new save point. Dirty slots are clean
+    /// working file and of the old base must be in the new save point, but for those the save
+    /// listed as lost ([`Saved::lost`]), whose last saved state the store reads from now on (a
+    /// lost tile's resident slot is dropped, if no pin holds it). Dirty slots are clean
     /// after the rebase (the save wrote them), and every other resident correction tile is kept,
     /// as it is what was just saved; so are cached evaluations, which stay valid: nothing they
     /// read has changed. Prefetches in flight are dropped (their workers stop and are joined),
@@ -977,7 +999,7 @@ impl TileStore {
         working: ProjectFile,
     ) -> Result<ProjectFile, CacheError> {
         self.sync_pins()?;
-        let Saved { base, stamp } = saved;
+        let Saved { base, stamp, lost } = saved;
         if stamp != self.last_write {
             return Err(CacheError::StaleSave);
         }
@@ -992,7 +1014,7 @@ impl TileStore {
             .keys()
             .chain(old_base)
             .chain(&self.since_rebase)
-            .find(|key| !base.contains(key))
+            .find(|key| !base.contains(key) && !lost.contains(key))
         {
             return Err(Invariant::NotInSave(*missing).into());
         }
@@ -1009,6 +1031,16 @@ impl TileStore {
             if let Some(id) = self.corrections.find(&key) {
                 self.corrections.set_dirty(id, false)?;
                 self.known_ops.insert(key, write.op);
+            }
+        }
+        for key in &lost {
+            // A lost tile's slot doesn't hold the saved state, and has nothing to write: it is
+            // dropped, or, if a pin holds it, kept clean until the pin goes.
+            if let Some(id) = self.corrections.find(key) {
+                self.corrections.set_dirty(id, false)?;
+                if !self.corrections.is_pinned(key) {
+                    self.corrections.remove(key)?;
+                }
             }
         }
         self.prune_known_ops();
@@ -1104,7 +1136,9 @@ impl TileStore {
     ///
     /// Every slot written to the new file is clean, streaming consumers' marks are emptied (all
     /// they held is in it), and the generation moves on, so a flush started before is
-    /// abandoned. The base and the tiles to save into the project are unchanged.
+    /// abandoned. The base is unchanged, and so are the tiles to save into the project, but for
+    /// the lost ones: they are in no file the store writes, so the next save leaves them at
+    /// their last saved state instead of failing to find them.
     ///
     /// # Errors
     ///
@@ -1123,6 +1157,11 @@ impl TileStore {
         } = filled;
         if stamp != self.last_write {
             return Err(CacheError::StaleSave);
+        }
+        // Drained first, so the feed can't bring a lost key back.
+        self.drain_saves();
+        for key in &lost {
+            self.since_rebase.remove(key);
         }
         for (key, id) in cleaned {
             self.corrections.set_dirty(id, false)?;

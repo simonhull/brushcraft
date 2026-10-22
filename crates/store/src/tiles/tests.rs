@@ -187,6 +187,21 @@ fn dab(store: &mut TileStore, map: &mut CorrectionMap, e: &Edit) {
         .unwrap();
 }
 
+/// Flips a bit in the middle of the record at `loc` of the file at `path`, from outside, as a
+/// bad sector would: the record fails its checksum.
+pub(crate) fn damage(path: &std::path::Path, loc: Loc) {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = std::fs::read(path).unwrap();
+    let at = usize::try_from(loc.middle()).unwrap();
+    bytes[at] ^= 0x40;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .write_all_at(&bytes[at..=at], loc.middle())
+        .unwrap();
+}
+
 /// Applies `edits` to the oracle's map alone: what a store over `mesh` that made them holds.
 pub(crate) fn record(mesh: &BaseMesh, map: &mut CorrectionMap, edits: &[Edit]) {
     for e in edits {

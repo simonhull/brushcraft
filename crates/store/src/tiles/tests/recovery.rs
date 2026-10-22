@@ -4,8 +4,6 @@
 //! made while a flush is in flight reach the next one; a drop mid-flush is prompt and leaves a
 //! file that opens; a failed sync is reported and leaves no save point.
 
-use std::os::unix::fs::FileExt;
-
 use super::*;
 use crate::recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 
@@ -836,20 +834,6 @@ fn a_roll_over_carries_every_edit_and_lists_what_it_cannot_read() {
     for key in &dirty {
         assert!(file.contains(key), "{key:?}: a dirty slot carried across");
     }
-}
-
-/// Flips a bit in the middle of the record at `loc` of the file at `path`, from outside, as a
-/// bad sector would: the record fails its checksum.
-fn damage(path: &std::path::Path, loc: Loc) {
-    let mut bytes = std::fs::read(path).unwrap();
-    let at = usize::try_from(loc.middle()).unwrap();
-    bytes[at] ^= 0x40;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .unwrap()
-        .write_all_at(&bytes[at..=at], loc.middle())
-        .unwrap();
 }
 
 /// A clean resident tile whose record no longer reads is carried across a roll-over from its

@@ -6,12 +6,12 @@
 mod crash;
 mod restore;
 
-use geom::CorrectionMap;
+use geom::{CorrectionMap, Region, TileKey, Vec3};
 
 use super::*;
 use crate::test_dir::TestDir;
 use crate::tiles::tests::{
-    TOP, apply, apply_dabs, assert_positions, dense, mesh, random_edits, roomy, tiles,
+    TOP, apply, apply_dabs, assert_positions, damage, dense, mesh, random_edits, roomy, tiles,
 };
 
 /// A configuration with room for every tile, and recovery files in `dir`'s `recovery`.
@@ -568,5 +568,127 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
         &dense(&mesh, &map),
         &tiles(&mesh, 1, TOP),
         "every edit",
+    );
+}
+
+/// One stroke of one dab: begun, `c` set at an interior vertex of `key` (one copy, so a tile
+/// lost to a save or a roll-over leaves no twin disagreeing) in the project's store and in
+/// each of `maps`, and ended.
+fn interior(project: &mut Project, maps: &mut [&mut CorrectionMap], key: TileKey, c: Vec3) {
+    project.begin_stroke().unwrap();
+    project
+        .store()
+        .edit_tile(key, |edit| edit.set(5, 7, c))
+        .unwrap()
+        .unwrap();
+    let region = Region::of_tile(&key);
+    let topology = project.store().working().mesh();
+    for map in maps.iter_mut() {
+        map.set(
+            topology.topology(),
+            key.face(),
+            key.level(),
+            region.x0() + 5,
+            region.y0() + 7,
+            c,
+        )
+        .unwrap();
+    }
+    project.end_stroke().unwrap();
+}
+
+/// A saved project with an edit readable nowhere.
+///
+/// Two tiles are edited since the save, written to the recovery file and evicted, and the
+/// first one's record there damaged. Returns the project, the damaged tile, the edits of every
+/// stroke, and the edits without the damaged tile's.
+fn with_an_unreadable_edit(dir: &TestDir) -> (Project, TileKey, CorrectionMap, CorrectionMap) {
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(dir)).unwrap();
+    stroke(&mut project, &mut map, 100, 121);
+    project.save_as(&dir.path("p.bcrf")).unwrap();
+    let mut want = map.clone();
+    let top = tiles(&mesh, TOP, TOP);
+    let (lost, kept) = (top[5], top[30]);
+    interior(
+        &mut project,
+        &mut [&mut map],
+        lost,
+        Vec3::new(0.0, 0.0, 0.25),
+    );
+    interior(
+        &mut project,
+        &mut [&mut map, &mut want],
+        kept,
+        Vec3::new(0.25, 0.0, 0.0),
+    );
+    project.finish_flushes().unwrap();
+    project.store().evict_all().unwrap();
+    let loc = project.store().working().locate(&lost).unwrap();
+    damage(project.recovery_path(), loc);
+    (project, lost, map, want)
+}
+
+#[test]
+fn a_tile_lost_to_a_save_is_reported_and_the_saves_after_it_go_through() {
+    let dir = TestDir::new();
+    let (mut project, lost, _, mut want) = with_an_unreadable_edit(&dir);
+    let saved = project.save();
+    assert!(
+        matches!(&saved, Err(ProjectError::Unprotected(tiles)) if *tiles == [lost]),
+        "{saved:?}"
+    );
+    assert!(!project.has_unsaved_edits(), "the save went through");
+    let other = tiles(&mesh(), TOP, TOP)[40];
+    interior(
+        &mut project,
+        &mut [&mut want],
+        other,
+        Vec3::new(0.0, 0.25, 0.0),
+    );
+    project.save().unwrap();
+    let copy = dir.path("copy.bcrf");
+    project.save_as(&copy).unwrap();
+    project.close(false).unwrap();
+    for path in [dir.path("p.bcrf"), copy] {
+        assert_project_file(&path, &want, "the lost tile at its last saved state");
+    }
+}
+
+#[test]
+fn a_tile_lost_to_a_roll_over_is_reported_and_saves_go_through() {
+    let dir = TestDir::new();
+    let (mut project, lost, _, mut want) = with_an_unreadable_edit(&dir);
+    let old = project.recovery_path().to_path_buf();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    let other = tiles(&mesh(), TOP, TOP)[40];
+    interior(
+        &mut project,
+        &mut [&mut want],
+        other,
+        Vec3::new(0.0, 0.25, 0.0),
+    );
+    let began = Instant::now();
+    let mut reported = Vec::new();
+    while project.recovery_path() == old {
+        match project.poll() {
+            Ok(()) => {}
+            Err(ProjectError::Unprotected(tiles)) => reported.extend(tiles),
+            Err(e) => panic!("{e:?}"),
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "the roll-over happens"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(reported, [lost], "the lost tile is reported");
+    project.save().unwrap();
+    project.close(false).unwrap();
+    assert_project_file(
+        &dir.path("p.bcrf"),
+        &want,
+        "the lost tile at its last saved state",
     );
 }
