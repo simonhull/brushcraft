@@ -1,5 +1,9 @@
-//! The project file: a header and append-only records (see `record`), with save points that form
-//! a chain.
+//! The project file: a header, a `Meta` and a `Mesh` record that make it self-contained, then
+//! append-only records (see `record`), with save points that form a chain.
+//!
+//! The two leading records are part of the file's identity, like the header: they are written
+//! and synced when the file is created and never change. Recovery after a crash starts after
+//! them, and damage to them fails the open rather than being cut off as a torn tail.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -9,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use geom::{Channel, CorrectionTile, TileKey};
+use geom::{BaseMesh, Channel, CorrectionTile, MeshError, TileKey};
 use thiserror::Error;
 
 use crate::OpId;
@@ -18,7 +22,10 @@ use crate::codec::{
     CodecError, compress, decode_displacement_into, decompress, displacement_body_len,
     encode_displacement,
 };
-use crate::record::{HEAD, Head, KIND_INDEX, KIND_TILE, TAIL, frame, parse_head, verify};
+use crate::meta::{Meta, mesh_hash};
+use crate::record::{
+    HEAD, Head, KIND_INDEX, KIND_MESH, KIND_META, KIND_TILE, TAIL, frame, parse_head, verify,
+};
 use crate::slot::CorrectionSlot;
 
 /// The file's first bytes.
@@ -27,7 +34,7 @@ const MAGIC: [u8; 4] = *b"BCRF";
 const VERSION: u16 = 1;
 /// File header bytes: magic, version `u16`, flags `u16`, reserved `u64`.
 pub(crate) const HEADER_LEN: usize = 16;
-/// Offset of the first record.
+/// Offset of the first record: the `Meta` record.
 const FIRST_RECORD: u64 = 16;
 /// Every this-many-th index is full; the rest are deltas.
 const FULL_EVERY: u32 = 16;
@@ -42,15 +49,46 @@ const ENTRY_LEN: usize = KEY_LEN + 12;
 /// them allocate more.
 pub const MAX_RAW: u32 = 1 << 20;
 
+/// The largest base mesh, in canonical bytes ([`BaseMesh::to_bytes`]): 64 MiB, room for about
+/// 2.8 million vertices and their faces.
+///
+/// Creating a file with a larger mesh fails, and readers reject a `Mesh` record that states a
+/// larger size, so a damaged or hostile file can't make them allocate more.
+pub const MAX_MESH_RAW: u32 = 64 << 20;
+
+/// The largest `Meta` record payload a reader accepts. A meta is at most 66 bytes; the rest is
+/// room for a later version's fields.
+const MAX_META_PAYLOAD: u32 = 1024;
+
+/// The largest `Mesh` record payload a reader accepts: the stated size, then a zstd frame of at
+/// most [`MAX_MESH_RAW`] bytes, which zstd never expands by more than 1/128 plus a small
+/// constant.
+const MAX_MESH_PAYLOAD: u32 = 4 + MAX_MESH_RAW + MAX_MESH_RAW / 128 + 1024;
+
 /// Why a project file operation failed.
 #[derive(Debug, Error)]
 pub enum StoreError {
     /// An I/O call failed.
     #[error("project file I/O failed")]
     Io(#[from] io::Error),
-    /// Not a BrushCraft project, or a version or flags this build can't read.
-    #[error("not a BrushCraft project file this build can read (bad magic, version or flags)")]
+    /// Not a BrushCraft project, or a version or flags this build can't read; or its leading
+    /// `Meta` or `Mesh` record is damaged, which is treated like a damaged header (the file is
+    /// left untouched).
+    #[error(
+        "not a BrushCraft project file this build can read (bad magic, version, flags, or a \
+         damaged meta or mesh record)"
+    )]
     BadHeader,
+    /// The file doesn't begin with a `Meta` record followed by a `Mesh` record.
+    #[error("the file doesn't begin with its meta and mesh records")]
+    MissingMeta,
+    /// The base mesh doesn't match the meta's mesh hash: in a file's leading records, or a mesh
+    /// and meta given to [`ProjectFile::create`].
+    #[error("the base mesh doesn't match the mesh hash of the file's meta")]
+    MeshMismatch,
+    /// The `Mesh` record matches its hash but isn't a valid base mesh.
+    #[error("the file's base mesh is not valid")]
+    BadMesh(#[source] MeshError),
     /// A record's checksum or structure is wrong.
     #[error("the record at byte {offset} is damaged")]
     Damaged {
@@ -331,8 +369,11 @@ struct TileRecord<'a> {
 }
 
 /// An open project file.
-#[derive(Debug)]
 pub struct ProjectFile {
+    /// The file's identity, from its `Meta` record.
+    meta: Meta,
+    /// The base mesh, from its `Mesh` record.
+    mesh: Arc<BaseMesh>,
     /// The open file, which holds the lock. [`FileReader`]s hold it weakly, so dropping the
     /// `ProjectFile` closes the file and releases the lock (once any read in flight ends).
     file: Arc<File>,
@@ -352,9 +393,30 @@ pub struct ProjectFile {
     access: Access,
 }
 
+/// Leaves the mesh out (its size is enough) and counts the maps rather than listing them.
+impl std::fmt::Debug for ProjectFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectFile")
+            .field("meta", &self.meta)
+            .field("mesh_faces", &self.mesh.face_count())
+            .field("end", &self.end)
+            .field("live", &self.live.len())
+            .field("pending", &self.pending.len())
+            .field("last_index", &self.last_index)
+            .field("deltas", &self.deltas)
+            .field("head", &self.head)
+            .field("access", &self.access)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ProjectFile {
-    /// Creates a new, empty project at `path`, open read-write. The file and its directory entry
-    /// are durable when this returns.
+    /// Creates a new project at `path`, open read-write, holding `meta` and `mesh` and no tiles.
+    /// The file and its directory entry are durable when this returns.
+    ///
+    /// The file begins with its header, then a `Meta` record (`meta`) and a `Mesh` record
+    /// (`mesh`, compressed), so it opens on its own. `meta` must have been made for `mesh`
+    /// ([`Meta::new`]); this is checked before the file is created.
     ///
     /// The file is created, then locked: in between, another open of the same path can find it
     /// without its header (and fail with [`StoreError::BadHeader`]) or lock it first (and this
@@ -363,26 +425,26 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`], including when `path` already exists; [`StoreError::Locked`].
-    pub fn create(path: &Path) -> Result<Self, StoreError> {
+    /// [`StoreError::MeshMismatch`] if `meta`'s mesh hash isn't `mesh`'s;
+    /// [`StoreError::TooLarge`] if the mesh's canonical bytes exceed [`MAX_MESH_RAW`] (nothing is
+    /// created then); [`StoreError::Io`], including when `path` already exists;
+    /// [`StoreError::Locked`].
+    pub fn create(path: &Path, meta: Meta, mesh: Arc<BaseMesh>) -> Result<Self, StoreError> {
+        let leading = leading_bytes(&meta, &mesh)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)?;
         Lock::Exclusive.take(&file)?;
-        let mut header = [0; HEADER_LEN];
-        let (magic, rest) = header.split_at_mut(MAGIC.len());
-        magic.copy_from_slice(&MAGIC);
-        if let Some(version) = rest.get_mut(..2) {
-            version.copy_from_slice(&VERSION.to_le_bytes());
-        }
-        file.write_all_at(&header, 0)?;
+        file.write_all_at(&leading, 0)?;
         file.sync_all()?;
         sync_parent(path)?;
         Ok(Self {
+            meta,
+            mesh,
             file: Arc::new(file),
-            end: FIRST_RECORD,
+            end: leading.len() as u64,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
             last_index: None,
@@ -394,6 +456,10 @@ impl ProjectFile {
 
     /// Opens the project at `path` at its latest state, recovering from a crash: the state is
     /// the last good save point plus every complete record after it, and a torn tail is cut off.
+    ///
+    /// The file must begin with its `Meta` and `Mesh` records, whose mesh must match the meta's
+    /// hash. They are checked before anything else: damage there fails the open and leaves the
+    /// file untouched, as a damaged header does. Recovery starts after them.
     ///
     /// Where recovery stops before the end of the file, the rest is searched for a save point:
     /// an Index that verifies, parses and has a plausible parent. Saves sync their tiles before
@@ -411,7 +477,8 @@ impl ProjectFile {
     /// # Errors
     ///
     /// [`StoreError::DamagedMidFile`], [`StoreError::NeedsRepair`], [`StoreError::Locked`],
-    /// [`StoreError::BadHeader`], [`StoreError::Io`].
+    /// [`StoreError::BadHeader`], [`StoreError::MissingMeta`], [`StoreError::MeshMismatch`],
+    /// [`StoreError::BadMesh`], [`StoreError::Io`].
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         match open_locked(path, open_writable, Lock::Exclusive) {
             Ok(file) => Self::open_latest(file, Repair::Truncate),
@@ -441,10 +508,13 @@ impl ProjectFile {
         let access = repair.access();
         let len = file.metadata()?.len();
         check_header(&file, len)?;
-        let heads = scan_heads(&file, len)?;
+        let (meta, mesh, start) = read_leading(&file, len)?;
+        let heads = scan_heads(&file, start, len)?;
         let mut this = Self {
+            meta,
+            mesh,
             file: Arc::new(file),
-            end: FIRST_RECORD,
+            end: start,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
             last_index: None,
@@ -477,18 +547,22 @@ impl ProjectFile {
     ///
     /// [`StoreError::NotASavePoint`] if no good Index starts there, [`StoreError::Damaged`] if
     /// its parent chain is, [`StoreError::Locked`] if the file is open for writing,
-    /// [`StoreError::BadHeader`], [`StoreError::Io`].
+    /// [`StoreError::BadHeader`], [`StoreError::MissingMeta`], [`StoreError::MeshMismatch`],
+    /// [`StoreError::BadMesh`], [`StoreError::Io`].
     pub fn open_at(path: &Path, index_offset: u64) -> Result<Self, StoreError> {
         let file = open_locked(path, open_readable, Lock::Shared)?;
         let len = file.metadata()?.len();
         check_header(&file, len)?;
-        if index_offset < FIRST_RECORD || read_index(&file, index_offset, len)?.is_none() {
+        let (meta, mesh, start) = read_leading(&file, len)?;
+        if index_offset < start || read_index(&file, index_offset, len)?.is_none() {
             return Err(StoreError::NotASavePoint(index_offset));
         }
         let chain = load_chain(&file, index_offset, len)?.ok_or(StoreError::Damaged {
             offset: index_offset,
         })?;
         Ok(Self {
+            meta,
+            mesh,
             file: Arc::new(file),
             end: len,
             live: chain.live,
@@ -795,6 +869,18 @@ impl ProjectFile {
         Ok(points)
     }
 
+    /// The file's identity, from its `Meta` record.
+    #[must_use]
+    pub const fn meta(&self) -> &Meta {
+        &self.meta
+    }
+
+    /// The base mesh, from its `Mesh` record.
+    #[must_use]
+    pub fn mesh(&self) -> Arc<BaseMesh> {
+        Arc::clone(&self.mesh)
+    }
+
     /// The newest edit in the current state: the greatest [`OpId`] written, which is the newest
     /// only while every edit comes from one site (see [`OpId`]'s ordering).
     #[must_use]
@@ -813,7 +899,8 @@ impl ProjectFile {
         self.live.contains_key(key)
     }
 
-    /// The file's length in bytes (for a read-only file, as opened).
+    /// The file's length in bytes (for a read-only file, as opened). A new file's length is
+    /// that of its header and leading records.
     #[must_use]
     #[expect(
         clippy::len_without_is_empty,
@@ -827,6 +914,17 @@ impl ProjectFile {
 /// Test-only access to the format's internals.
 #[cfg(test)]
 impl ProjectFile {
+    /// Where the first record after the leading `Meta` and `Mesh` records starts, in a file
+    /// made with the test fixture's meta and mesh.
+    ///
+    /// # Panics
+    ///
+    /// Never: the fixture's meta is made for its mesh.
+    fn fixture_start() -> u64 {
+        let leading = leading_bytes(&crate::fixture::meta(), &crate::fixture::mesh()).unwrap();
+        u64::try_from(leading.len()).unwrap()
+    }
+
     /// Payload bytes of the Index at `offset`.
     ///
     /// # Errors
@@ -985,8 +1083,8 @@ fn decode_record_at(
     Ok(tile.op)
 }
 
-/// Writes a new project at `dst` holding only `src`'s live tiles (raw records copied, not
-/// recompressed) and one full Index.
+/// Writes a new project at `dst` holding `src`'s meta and mesh, its live tiles (raw records
+/// copied, not recompressed) and one full Index.
 ///
 /// `src` is recovered as by [`ProjectFile::open`], but never modified: a torn tail is left in
 /// place, not cut off. It is held with a shared lock, so it can't be open for writing. History
@@ -1047,7 +1145,7 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
 ///
 /// As [`compact`].
 fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
-    let mut to = ProjectFile::create(dst)?;
+    let mut to = ProjectFile::create(dst, from.meta, Arc::clone(&from.mesh))?;
     for (key, &Loc { offset, len }) in &from.live {
         let raw = from.read_record(offset, len)?;
         if tile_record(&raw, key).is_none() {
@@ -1150,15 +1248,104 @@ fn check_header(file: &File, len: u64) -> Result<(), StoreError> {
     }
 }
 
-/// Every record head from the first record on, trusting lengths, up to the first that is invalid
-/// or runs past `len`.
+/// The header and leading records of a new file holding `meta` and `mesh`.
+///
+/// # Errors
+///
+/// [`StoreError::MeshMismatch`] if `meta` wasn't made for `mesh`; [`StoreError::TooLarge`] if
+/// the mesh's bytes exceed [`MAX_MESH_RAW`]; [`StoreError::Io`] if compression fails.
+fn leading_bytes(meta: &Meta, mesh: &BaseMesh) -> Result<Vec<u8>, StoreError> {
+    let raw = mesh.to_bytes();
+    if mesh_hash(&raw) != meta.mesh_hash() {
+        return Err(StoreError::MeshMismatch);
+    }
+    let raw_len = u32::try_from(raw.len())
+        .ok()
+        .filter(|&n| n <= MAX_MESH_RAW)
+        .ok_or(StoreError::TooLarge)?;
+    let mut mesh_payload = raw_len.to_le_bytes().to_vec();
+    mesh_payload.extend_from_slice(&compress(&raw)?);
+    let meta_record = frame(KIND_META, &meta.to_payload()).ok_or(StoreError::TooLarge)?;
+    let mesh_record = frame(KIND_MESH, &mesh_payload).ok_or(StoreError::TooLarge)?;
+    let mut header = [0; HEADER_LEN];
+    let (magic, rest) = header.split_at_mut(MAGIC.len());
+    magic.copy_from_slice(&MAGIC);
+    if let Some(version) = rest.get_mut(..2) {
+        version.copy_from_slice(&VERSION.to_le_bytes());
+    }
+    Ok([&header[..], &meta_record, &mesh_record].concat())
+}
+
+/// Reads and checks the leading `Meta` and `Mesh` records: the file's identity and base mesh,
+/// and the offset where its other records start.
+///
+/// # Errors
+///
+/// [`StoreError::MissingMeta`] if either record isn't where it belongs;
+/// [`StoreError::BadHeader`] if either is damaged or doesn't parse (or states a mesh larger
+/// than [`MAX_MESH_RAW`]); [`StoreError::MeshMismatch`] if the mesh doesn't match the meta's
+/// hash; [`StoreError::BadMesh`] if it isn't a valid mesh; [`StoreError::Io`].
+fn read_leading(file: &File, len: u64) -> Result<(Meta, Arc<BaseMesh>, u64), StoreError> {
+    let (meta_payload, mesh_at) =
+        leading_record(file, FIRST_RECORD, len, KIND_META, MAX_META_PAYLOAD)?;
+    let meta = Meta::from_payload(&meta_payload).ok_or(StoreError::BadHeader)?;
+    let (mesh_payload, start) = leading_record(file, mesh_at, len, KIND_MESH, MAX_MESH_PAYLOAD)?;
+    let mut r = Reader::new(&mesh_payload);
+    let raw_len = r
+        .u32()
+        .filter(|&n| n <= MAX_MESH_RAW)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(StoreError::BadHeader)?;
+    let raw = decompress(r.rest(), raw_len).or(Err(StoreError::BadHeader))?;
+    if mesh_hash(&raw) != meta.mesh_hash() {
+        return Err(StoreError::MeshMismatch);
+    }
+    let mesh = BaseMesh::from_bytes(&raw).map_err(StoreError::BadMesh)?;
+    Ok((meta, Arc::new(mesh), start))
+}
+
+/// The payload of the leading record at `offset`, which must be of `kind` with a payload of at
+/// most `max` bytes, and the offset of the record after it.
+///
+/// # Errors
+///
+/// [`StoreError::MissingMeta`] if the file ends before the record's head or the head is of
+/// another kind; [`StoreError::BadHeader`] if the head is malformed, the record states more
+/// than `max` bytes or runs past the end, or fails its checksum; [`StoreError::Io`].
+fn leading_record(
+    file: &File,
+    offset: u64,
+    len: u64,
+    kind: u8,
+    max: u32,
+) -> Result<(Vec<u8>, u64), StoreError> {
+    if offset.saturating_add(HEAD as u64) > len {
+        return Err(StoreError::MissingMeta);
+    }
+    let mut bytes = [0; HEAD];
+    file.read_exact_at(&mut bytes, offset)?;
+    let head = parse_head(bytes).ok_or(StoreError::BadHeader)?;
+    if head.kind != kind {
+        return Err(StoreError::MissingMeta);
+    }
+    let end = offset.saturating_add(head.total());
+    if head.len > max || end > len {
+        return Err(StoreError::BadHeader);
+    }
+    let raw = read_exact(file, offset, head.total())?;
+    let (_, payload) = verify(&raw).ok_or(StoreError::BadHeader)?;
+    Ok((payload.to_vec(), end))
+}
+
+/// Every record head from `start` on, trusting lengths, up to the first that is invalid or runs
+/// past `len`.
 ///
 /// # Errors
 ///
 /// The I/O error of a read.
-fn scan_heads(file: &File, len: u64) -> io::Result<Vec<(u64, Head)>> {
+fn scan_heads(file: &File, start: u64, len: u64) -> io::Result<Vec<(u64, Head)>> {
     let mut heads = Vec::new();
-    let mut offset = FIRST_RECORD;
+    let mut offset = start;
     while let Some(head) = read_head(file, offset, len)? {
         heads.push((offset, head));
         offset += head.total();
@@ -1439,6 +1626,7 @@ mod tests {
     use geom::{Channel, FaceId, LayerId, Level, Vec3};
 
     use super::*;
+    use crate::fixture::{self, mesh, meta};
     use crate::test_dir::TestDir;
 
     fn key(face: u32, tx: u16) -> TileKey {
@@ -1460,7 +1648,7 @@ mod tests {
     fn tiles_survive_save_and_reopen() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(0.5)).unwrap();
         f.write_displacement(key(2, 3), op(2), &tile(-0.25))
             .unwrap();
@@ -1489,7 +1677,7 @@ mod tests {
     fn unsaved_tiles_are_replayed_on_open() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(0.5)).unwrap();
         f.save().unwrap();
         f.write_displacement(key(1, 0), op(2), &tile(0.75)).unwrap(); // no save
@@ -1506,7 +1694,7 @@ mod tests {
     fn delta_indexes_stay_small_and_chain_correctly() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         for k in 0..200 {
             f.write_displacement(key(k, 0), op(u64::from(k) + 1), &tile(0.1))
                 .unwrap();
@@ -1550,13 +1738,14 @@ mod tests {
     fn a_damaged_old_tile_is_caught_when_read() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(0.5)).unwrap();
         f.write_displacement(key(2, 0), op(2), &tile(0.5)).unwrap();
         f.save().unwrap();
         drop(f);
         let mut bytes = std::fs::read(&path).unwrap();
-        bytes[HEADER_LEN + 40] ^= 0xFF; // inside the first tile's payload
+        let start = usize::try_from(ProjectFile::fixture_start()).unwrap();
+        bytes[start + 40] ^= 0xFF; // inside the first tile's payload
         std::fs::write(&path, &bytes).unwrap();
         let opened = ProjectFile::open(&path).unwrap();
         assert!(
@@ -1577,7 +1766,7 @@ mod tests {
     /// Writes a project with saves, overwrites and trailing unsaved tiles, recording after every
     /// record the file length and the expected live state (key → (op, tile)).
     fn scripted(path: &Path) -> Vec<(u64, State)> {
-        let mut f = ProjectFile::create(path).unwrap();
+        let mut f = ProjectFile::create(path, meta(), mesh()).unwrap();
         let mut state = BTreeMap::new();
         let mut log = vec![(f.len(), state.clone())];
         let mut seq = 0;
@@ -1612,9 +1801,10 @@ mod tests {
         let bytes = std::fs::read(&full).unwrap();
         let mut cuts: Vec<u64> = log.iter().map(|(len, _)| *len).collect();
         let mut x = 0x9E37_79B9_u64;
+        let start = ProjectFile::fixture_start();
         for _ in 0..60 {
             x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            cuts.push(HEADER_LEN as u64 + x % (bytes.len() as u64 - HEADER_LEN as u64));
+            cuts.push(start + x % (bytes.len() as u64 - start));
         }
         for cut in cuts {
             let (good_len, want) = log.iter().rev().find(|(len, _)| *len <= cut).unwrap();
@@ -1652,7 +1842,7 @@ mod tests {
     fn every_save_point_opens_to_its_own_state() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         let mut snapshots = Vec::new();
         for round in 0..40u16 {
             f.write_displacement(
@@ -1694,7 +1884,7 @@ mod tests {
     fn unknown_record_kinds_are_skipped() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
         f.save().unwrap();
         f.append_raw(9, b"from a newer version").unwrap();
@@ -1713,7 +1903,7 @@ mod tests {
 
     /// A project with three saves of five tiles each, and its bytes.
     fn saved_three_times(path: &Path) -> Vec<u8> {
-        let mut f = ProjectFile::create(path).unwrap();
+        let mut f = ProjectFile::create(path, meta(), mesh()).unwrap();
         for seq in 1..=15u16 {
             f.write_displacement(
                 key(u32::from(seq % 5), 0),
@@ -1734,12 +1924,11 @@ mod tests {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
         let good = saved_three_times(&path);
+        let start = ProjectFile::fixture_start();
+        let first = usize::try_from(start).unwrap();
         // The first record's head: a reserved byte (the head no longer parses), then the low
         // byte of its length (the scan runs off the record boundaries).
-        for (what, byte) in [
-            ("reserved byte", HEADER_LEN + 1),
-            ("length", HEADER_LEN + 4),
-        ] {
+        for (what, byte) in [("reserved byte", first + 1), ("length", first + 4)] {
             let mut bad = good.clone();
             bad[byte] ^= 0x01;
             std::fs::write(&path, &bad).unwrap();
@@ -1747,9 +1936,7 @@ mod tests {
             assert!(
                 matches!(
                     opened,
-                    Err(StoreError::DamagedMidFile {
-                        offset: FIRST_RECORD
-                    })
+                    Err(StoreError::DamagedMidFile { offset }) if offset == start
                 ),
                 "{what}: {opened:?}"
             );
@@ -1813,7 +2000,7 @@ mod tests {
     fn tile_records_that_do_not_parse_are_skipped() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
         f.save().unwrap();
         // Unsaved, so replayed: a payload too short to hold a key, and a tile whose op is
@@ -1874,7 +2061,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_tile(odd, op(1), b"future header", b"future body")
             .unwrap();
         f.write_displacement(key(1, 0), op(2), &tile(1.0)).unwrap();
@@ -1898,7 +2085,7 @@ mod tests {
     fn compaction_keeps_the_latest_state_and_shrinks_the_file() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         for seq in 1..=100u16 {
             f.write_displacement(
                 key(u32::from(seq % 4), 0),
@@ -1937,7 +2124,7 @@ mod tests {
     #[test]
     fn a_reader_on_another_thread_reads_what_the_owner_does() {
         let dir = TestDir::new();
-        let mut f = ProjectFile::create(&dir.path("p.bcrf")).unwrap();
+        let mut f = ProjectFile::create(&dir.path("p.bcrf"), meta(), mesh()).unwrap();
         let tiles = [(key(1, 0), tile(0.5)), (small_key(2), small_tile(0.125))];
         for (seq, (k, t)) in (1..).zip(&tiles) {
             f.write_displacement(*k, op(seq), t).unwrap();
@@ -1983,7 +2170,7 @@ mod tests {
     fn a_damaged_record_read_through_a_reader_is_damaged() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
         f.write_displacement(key(2, 0), op(2), &tile(2.0)).unwrap();
         f.save().unwrap();
@@ -2043,7 +2230,7 @@ mod tests {
     fn a_reader_lets_go_of_the_file_when_its_owner_drops() {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
         f.save().unwrap();
         let loc = f.locate(&key(1, 0)).unwrap();
@@ -2072,7 +2259,7 @@ mod tests {
     #[test]
     fn a_body_that_decompresses_short_is_damaged() {
         let dir = TestDir::new();
-        let mut f = ProjectFile::create(&dir.path("p.bcrf")).unwrap();
+        let mut f = ProjectFile::create(&dir.path("p.bcrf"), meta(), mesh()).unwrap();
         let k = small_key(1);
         let (header, body) = encode_displacement(&small_tile(0.5)).unwrap();
         // States the right size, but the frame holds one border value less.
@@ -2106,9 +2293,84 @@ mod tests {
     }
 
     #[test]
+    fn meta_and_mesh_survive_create_and_open() {
+        let dir = TestDir::new();
+        let path = dir.path("r.bcrf");
+        let mesh = Arc::new(geom::cube_sphere(2).unwrap());
+        let project = crate::ProjectId::from_bits(42);
+        let role = crate::Role::Recovery {
+            base: Some(crate::SavePoint {
+                project,
+                offset: 1234,
+                head: Some(op(9)),
+            }),
+        };
+        let meta = Meta::new(project, role, &mesh);
+        let mut f = ProjectFile::create(&path, meta, Arc::clone(&mesh)).unwrap();
+        assert_eq!(*f.meta(), meta, "as created");
+        assert_eq!(f.keys().count(), 0, "no tiles");
+        f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
+        let point = f.save().unwrap();
+        drop(f);
+        let opened = ProjectFile::open(&path).unwrap();
+        assert_eq!(*opened.meta(), meta, "the meta, reopened");
+        assert_eq!(
+            opened.mesh().to_bytes(),
+            mesh.to_bytes(),
+            "the mesh, reopened"
+        );
+        assert_eq!(opened.keys().count(), 1, "the tile");
+        drop(opened);
+        let old = ProjectFile::open_at(&path, point).unwrap();
+        assert_eq!(*old.meta(), meta, "the meta, at a save point");
+        assert_eq!(
+            old.mesh().to_bytes(),
+            mesh.to_bytes(),
+            "the mesh, at a save point"
+        );
+    }
+
+    #[test]
+    fn a_meta_made_for_another_mesh_creates_nothing() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let other = geom::cube_sphere(2).unwrap();
+        let created = ProjectFile::create(&path, fixture::meta_for(&other), mesh());
+        assert!(
+            matches!(created, Err(StoreError::MeshMismatch)),
+            "{created:?}"
+        );
+        assert!(!path.exists(), "no file");
+    }
+
+    #[test]
+    fn compaction_keeps_the_meta_and_the_mesh() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mesh = Arc::new(geom::cube_sphere(3).unwrap());
+        let meta = fixture::meta_for(&mesh);
+        let mut f = ProjectFile::create(&path, meta, Arc::clone(&mesh)).unwrap();
+        for seq in 1..=10 {
+            f.write_displacement(key(u32::try_from(seq % 3).unwrap(), 0), op(seq), &tile(1.0))
+                .unwrap();
+            f.save().unwrap();
+        }
+        drop(f);
+        let out = dir.path("c.bcrf");
+        compact(&path, &out).unwrap();
+        compact_in_place(&path).unwrap();
+        for p in [&out, &path] {
+            let c = ProjectFile::open(p).unwrap();
+            assert_eq!(*c.meta(), meta, "{p:?}: the meta");
+            assert_eq!(c.mesh().to_bytes(), mesh.to_bytes(), "{p:?}: the mesh");
+            assert_eq!(c.keys().count(), 3, "{p:?}: the tiles");
+        }
+    }
+
+    #[test]
     fn locations_stay_valid_after_more_appends() {
         let dir = TestDir::new();
-        let mut f = ProjectFile::create(&dir.path("p.bcrf")).unwrap();
+        let mut f = ProjectFile::create(&dir.path("p.bcrf"), meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
         let first = f.locate(&key(1, 0)).unwrap();
         let reader = f.reader();

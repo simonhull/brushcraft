@@ -8,6 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use geom::{FaceId, Level, Vec3};
 
 use super::*;
+use crate::fixture::{mesh, meta};
 use crate::test_dir::TestDir;
 
 fn key(face: u32) -> TileKey {
@@ -27,7 +28,7 @@ fn op(seq: u64) -> OpId {
 
 /// Saves S1 (full), S2 and S3 (deltas), one tile each; returns the bytes and the three offsets.
 fn three(path: &Path) -> (Vec<u8>, [u64; 3]) {
-    let mut f = ProjectFile::create(path).unwrap();
+    let mut f = ProjectFile::create(path, meta(), mesh()).unwrap();
     let mut points = [0; 3];
     for (seq, point) in (1..).zip(&mut points) {
         f.write_displacement(key(u32::try_from(seq).unwrap()), op(seq), &tile(1.0))
@@ -59,7 +60,7 @@ fn a_huge_stated_size_is_rejected_without_allocating() {
     // The 1 GiB claim, in a record a save point names.
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     f.write_displacement(key(1), op(1), &tile(1.0)).unwrap();
     let parent = f.save().unwrap();
     let offset = f.len();
@@ -93,7 +94,7 @@ fn a_huge_stated_size_is_rejected_without_allocating() {
 fn a_huge_unsaved_record_is_skipped_on_replay() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     f.write_displacement(key(1), op(1), &tile(1.0)).unwrap();
     f.save().unwrap();
     let packed = compress(&[0; 16]).unwrap();
@@ -117,7 +118,7 @@ fn a_huge_unsaved_record_is_skipped_on_replay() {
 fn bodies_over_the_cap_are_not_written() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     let cap = usize::try_from(MAX_RAW).unwrap();
     let before = f.len();
     assert!(
@@ -140,7 +141,7 @@ fn bodies_over_the_cap_are_not_written() {
 fn displacement_reads_check_the_stated_size_before_decompressing() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     let (header, raw) = encode_displacement(&tile(2.0)).unwrap();
     // A good header and frame, but a stated size the side doesn't need.
     let mut payload =
@@ -316,7 +317,7 @@ fn a_file_that_cannot_be_written_opens_read_only_if_its_tail_is_clean() {
 fn compacting_in_place_replaces_the_file() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     for seq in 1..=40 {
         f.write_displacement(key(u32::try_from(seq % 3).unwrap()), op(seq), &tile(1.0))
             .unwrap();
@@ -402,7 +403,7 @@ fn a_damaged_last_save_point_is_cut_off_with_the_tail() {
 fn full_indexes_are_the_first_and_every_sixteenth() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     let points: Vec<u64> = (1..=40)
         .map(|seq| {
             f.write_displacement(key(u32::try_from(seq % 5).unwrap()), op(seq), &tile(1.0))
@@ -430,7 +431,13 @@ fn a_checksummed_index_that_does_not_load_stops_recovery_as_damage() {
     let cases = [
         (
             "a delta whose parent is a tile",
-            index_payload(Coverage::Delta, Some(FIRST_RECORD), None, &BTreeMap::new()).unwrap(),
+            index_payload(
+                Coverage::Delta,
+                Some(ProjectFile::fixture_start()),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap(),
         ),
         (
             "a delta with no parent",
@@ -460,24 +467,24 @@ fn a_save_point_across_a_search_window_boundary_is_found() {
     for d in -12i64..=4 {
         let dir = TestDir::new();
         let path = dir.path("p.bcrf");
-        let mut f = ProjectFile::create(&path).unwrap();
-        f.append_raw(9, &[]).unwrap(); // 12 bytes at FIRST_RECORD
-        let target = 16 + (1i64 << 20) + d;
-        let filler = usize::try_from(target - 16 - 12 - 12).unwrap();
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
+        let start = i64::try_from(f.len()).unwrap();
+        f.append_raw(9, &[]).unwrap(); // 12 bytes at the first record
+        let target = start + (1i64 << 20) + d;
+        let filler = usize::try_from(target - start - 12 - 12).unwrap();
         f.append_raw(9, &vec![0x77; filler]).unwrap();
         let point = f.save().unwrap();
         assert_eq!(i64::try_from(point).unwrap(), target, "d {d}: placed");
         drop(f);
         let mut bad = std::fs::read(&path).unwrap();
-        bad[17] = 1; // a reserved byte of the first record's head
+        let first = usize::try_from(start).unwrap();
+        bad[first + 1] = 1; // a reserved byte of the first record's head
         std::fs::write(&path, &bad).unwrap();
         let opened = ProjectFile::open(&path);
         assert!(
             matches!(
                 opened,
-                Err(StoreError::DamagedMidFile {
-                    offset: FIRST_RECORD
-                })
+                Err(StoreError::DamagedMidFile { offset }) if i64::try_from(offset).unwrap() == start
             ),
             "d {d}: {opened:?}"
         );
@@ -637,7 +644,7 @@ fn displacement_tiles_must_fit_their_keys() {
 
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     let other = TileKey::new(
         LayerId::new(0),
         Channel::from_raw(1),
@@ -662,7 +669,7 @@ fn displacement_tiles_must_fit_their_keys() {
         ),
         "write a side-2 tile under a level-9 key"
     );
-    assert_eq!(f.len(), FIRST_RECORD, "nothing written");
+    assert_eq!(f.len(), ProjectFile::fixture_start(), "nothing written");
     // Stored anyway, as raw bytes: caught on read, before decompressing.
     let (header, body) = encode_displacement(&small).unwrap();
     f.write_tile(key(1), op(1), &header, &body).unwrap();
@@ -711,7 +718,7 @@ fn keys_differing_only_in_layer_or_channel_stay_apart() {
         keys[0],
         "layer 0, channel 0 is the base displacement key"
     );
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     for (n, k) in (0u8..).zip(&keys) {
         f.write_tile(*k, op(u64::from(n) + 1), &[n], b"x").unwrap();
     }
@@ -844,9 +851,9 @@ fn compacting_in_place_keeps_permissions_and_symlinks() {
 fn an_empty_first_save_is_a_parent() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
-    let mut f = ProjectFile::create(&path).unwrap();
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     let first = f.save().unwrap();
-    assert_eq!(first, FIRST_RECORD, "the first record");
+    assert_eq!(first, ProjectFile::fixture_start(), "the first record");
     f.write_displacement(key(1), op(1), &tile(1.0)).unwrap();
     let second = f.save().unwrap();
     drop(f);
@@ -863,4 +870,163 @@ fn an_empty_first_save_is_a_parent() {
         0,
         "the empty save"
     );
+}
+
+/// A file's header and leading records with `meta`, and a `Mesh` record holding `raw` (canonical
+/// mesh bytes, compressed) under a stated size of `stated`: for files whose leading records lie.
+fn leading(meta: &Meta, raw: &[u8], stated: u32) -> Vec<u8> {
+    let good = leading_bytes(&crate::fixture::meta(), &mesh()).unwrap();
+    let mut payload = stated.to_le_bytes().to_vec();
+    payload.extend_from_slice(&compress(raw).unwrap());
+    [
+        &good[..HEADER_LEN],
+        &frame(KIND_META, &meta.to_payload()).unwrap(),
+        &frame(KIND_MESH, &payload).unwrap(),
+    ]
+    .concat()
+}
+
+/// The length of `raw` as a mesh record's stated size.
+fn stated(raw: &[u8]) -> u32 {
+    u32::try_from(raw.len()).unwrap()
+}
+
+#[test]
+fn a_mesh_that_does_not_match_its_hash_is_rejected() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (good, [s1, ..]) = three(&path);
+    let start = usize::try_from(ProjectFile::fixture_start()).unwrap();
+    let raw = mesh().to_bytes();
+    let lying = meta().with_mesh_hash(meta().mesh_hash() ^ 1);
+    let bad = [
+        leading(&lying, &raw, stated(&raw)).as_slice(),
+        &good[start..],
+    ]
+    .concat();
+    assert_eq!(bad.len(), good.len(), "the same layout");
+    std::fs::write(&path, &bad).unwrap();
+    let latest = ProjectFile::open(&path);
+    assert!(
+        matches!(latest, Err(StoreError::MeshMismatch)),
+        "open: {latest:?}"
+    );
+    let saved = ProjectFile::open_at(&path, s1);
+    assert!(
+        matches!(saved, Err(StoreError::MeshMismatch)),
+        "open_at: {saved:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bad, "untouched");
+}
+
+#[test]
+fn a_mesh_record_that_is_no_valid_mesh_is_rejected() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut nan = mesh().to_bytes();
+    nan[4..8].copy_from_slice(&f32::NAN.to_le_bytes());
+    let honest = meta().with_mesh_hash(mesh_hash(&nan));
+    std::fs::write(&path, leading(&honest, &nan, stated(&nan))).unwrap();
+    let invalid = ProjectFile::open(&path);
+    assert!(
+        matches!(invalid, Err(StoreError::BadMesh(MeshError::NotFinite(_)))),
+        "{invalid:?}"
+    );
+    // A stated size over the cap is refused before decompressing.
+    let raw = mesh().to_bytes();
+    for size in [MAX_MESH_RAW + 1, u32::MAX] {
+        std::fs::write(&path, leading(&meta(), &raw, size)).unwrap();
+        let opened = ProjectFile::open(&path);
+        assert!(
+            matches!(opened, Err(StoreError::BadHeader)),
+            "stated {size}: {opened:?}"
+        );
+    }
+}
+
+#[test]
+fn a_file_without_its_meta_or_mesh_record_is_rejected() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (good, _) = three(&path);
+    let start = usize::try_from(ProjectFile::fixture_start()).unwrap();
+    let header = &good[..HEADER_LEN];
+    let meta_end = HEADER_LEN + HEAD + meta().to_payload().len() + TAIL;
+    let (meta_record, mesh_record) = (&good[HEADER_LEN..meta_end], &good[meta_end..start]);
+    let records = &good[start..];
+    for (what, bytes) in [
+        ("a header alone", header.to_vec()),
+        ("no mesh", [header, meta_record].concat()),
+        (
+            "no mesh, then tiles",
+            [header, meta_record, records].concat(),
+        ),
+        ("no meta", [header, mesh_record, records].concat()),
+        ("neither", [header, records].concat()),
+        (
+            "in the wrong order",
+            [header, mesh_record, meta_record, records].concat(),
+        ),
+    ] {
+        std::fs::write(&path, &bytes).unwrap();
+        let opened = ProjectFile::open(&path);
+        assert!(
+            matches!(opened, Err(StoreError::MissingMeta)),
+            "{what}: {opened:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{what}: untouched");
+    }
+}
+
+#[test]
+fn damage_in_the_leading_records_fails_open_and_is_never_cut_off() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (_, [s1, ..]) = three(&path);
+    // An unsaved tile after the last save: a torn tail if recovery ever began at the damage.
+    let mut f = ProjectFile::open(&path).unwrap();
+    f.write_displacement(key(9), op(50), &tile(2.0)).unwrap();
+    drop(f);
+    let good = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &good).unwrap();
+    assert!(ProjectFile::open(&path).is_ok(), "undamaged, it opens");
+    let start = usize::try_from(ProjectFile::fixture_start()).unwrap();
+    for byte in HEADER_LEN..start {
+        for bit in [0, 7] {
+            let mut bad = good.clone();
+            bad[byte] ^= 1 << bit;
+            std::fs::write(&path, &bad).unwrap();
+            let opened = ProjectFile::open(&path);
+            assert!(
+                matches!(
+                    opened,
+                    Err(StoreError::BadHeader | StoreError::MissingMeta | StoreError::MeshMismatch)
+                ),
+                "byte {byte} bit {bit}: {opened:?}"
+            );
+            assert!(
+                ProjectFile::open_at(&path, s1).is_err(),
+                "byte {byte} bit {bit}: open_at"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bad,
+                "byte {byte} bit {bit}: untouched"
+            );
+        }
+    }
+    // A file cut inside its leading records (it was never fully created) is left as it is too.
+    for cut in HEADER_LEN..start {
+        std::fs::write(&path, &good[..cut]).unwrap();
+        let opened = ProjectFile::open(&path);
+        assert!(
+            matches!(opened, Err(StoreError::BadHeader | StoreError::MissingMeta)),
+            "cut at {cut}: {opened:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            good[..cut],
+            "cut at {cut}: untouched"
+        );
+    }
 }

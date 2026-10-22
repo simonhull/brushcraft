@@ -403,7 +403,7 @@ fn run(mesh: &Arc<BaseMesh>, top: u8, config: StoreConfig, seed: u64, steps: u32
     let dir = TestDir::new();
     let path = dir.path("work.bcp");
     let open = |file: ProjectFile| TileStore::open(Arc::clone(mesh), file, config).unwrap();
-    let mut store = open(ProjectFile::create(&path).unwrap());
+    let mut store = open(ProjectFile::create(&path, meta_for(mesh), Arc::clone(mesh)).unwrap());
     let mut run = Run {
         mesh,
         top,

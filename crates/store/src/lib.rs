@@ -11,6 +11,9 @@ mod crc;
 mod deps;
 mod feed;
 mod file;
+#[cfg(test)]
+mod fixture;
+mod meta;
 mod op;
 mod pool;
 mod prefetch;
@@ -22,6 +25,9 @@ mod tiles;
 
 pub use codec::CodecError;
 pub use feed::{ChangeFeed, ConsumerId};
-pub use file::{MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place};
+pub use file::{
+    MAX_MESH_RAW, MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place,
+};
+pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
 pub use tiles::{CacheError, Invariant, PinGuard, StoreConfig, TileEdit, TileStore};

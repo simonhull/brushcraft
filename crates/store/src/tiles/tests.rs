@@ -14,6 +14,7 @@ use geom::{
 };
 
 use super::*;
+use crate::fixture::meta_for;
 use crate::test_dir::TestDir;
 
 mod differential;
@@ -110,7 +111,7 @@ fn pinning() -> StoreConfig {
 
 /// A store over a new working file `name` in `dir`.
 fn new_store(dir: &TestDir, name: &str, mesh: &Arc<BaseMesh>, config: StoreConfig) -> TileStore {
-    let file = ProjectFile::create(&dir.path(name)).unwrap();
+    let file = ProjectFile::create(&dir.path(name), meta_for(mesh), Arc::clone(mesh)).unwrap();
     TileStore::open(Arc::clone(mesh), file, config).unwrap()
 }
 
@@ -462,7 +463,12 @@ fn sparse_on_disk_equals_explicit_zero() {
     let edits = random_edits(&mesh, TOP, 120, 6);
 
     // Explicit: every tile has a record, all zero, before the edits.
-    let mut explicit = ProjectFile::create(&dir.path("explicit.bcp")).unwrap();
+    let mut explicit = ProjectFile::create(
+        &dir.path("explicit.bcp"),
+        meta_for(&mesh),
+        Arc::clone(&mesh),
+    )
+    .unwrap();
     let op = OpId::new(SITE, 0).unwrap();
     for key in &all {
         explicit
@@ -517,7 +523,7 @@ fn save_reopen_evaluate() {
     let last_op = {
         let mut store = TileStore::open(
             Arc::clone(&mesh),
-            ProjectFile::create(&path).unwrap(),
+            ProjectFile::create(&path, meta_for(&mesh), Arc::clone(&mesh)).unwrap(),
             tight(),
         )
         .unwrap();
@@ -963,7 +969,12 @@ fn a_pinned_tile_is_recomputed_in_place() {
 fn bad_requests_are_refused() {
     let dir = TestDir::new();
     let mesh = mesh();
-    let file = ProjectFile::create(&dir.path("reserved.bcp")).unwrap();
+    let file = ProjectFile::create(
+        &dir.path("reserved.bcp"),
+        meta_for(&mesh),
+        Arc::clone(&mesh),
+    )
+    .unwrap();
     let reserved = StoreConfig {
         site: RESERVED_SITE,
         ..roomy()
@@ -1088,7 +1099,8 @@ fn a_budget_below_the_minimum_is_refused() {
         minimum > config(5, 4).budget_bytes,
         "and a chunk less is not"
     );
-    let file = ProjectFile::create(&dir.path("small.bcp")).unwrap();
+    let file =
+        ProjectFile::create(&dir.path("small.bcp"), meta_for(&mesh), Arc::clone(&mesh)).unwrap();
     let small = StoreConfig {
         budget_bytes: minimum - 1,
         ..tight()
@@ -1307,7 +1319,7 @@ fn a_failed_write_back_is_reported_and_keeps_the_tile() {
     let saved = {
         let mut store = TileStore::open(
             Arc::clone(&mesh),
-            ProjectFile::create(&path).unwrap(),
+            ProjectFile::create(&path, meta_for(&mesh), Arc::clone(&mesh)).unwrap(),
             roomy(),
         )
         .unwrap();

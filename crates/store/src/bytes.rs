@@ -60,6 +60,11 @@ impl<'a> Reader<'a> {
         self.array().map(u64::from_le_bytes)
     }
 
+    /// A little-endian `u128`.
+    pub(crate) fn u128(&mut self) -> Option<u128> {
+        self.array().map(u128::from_le_bytes)
+    }
+
     /// A little-endian `f32`, bit for bit.
     pub(crate) fn f32(&mut self) -> Option<f32> {
         self.array().map(f32::from_le_bytes)

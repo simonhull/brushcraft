@@ -13,6 +13,10 @@ const OVERHEAD: u64 = (HEAD + TAIL) as u64;
 pub(crate) const KIND_TILE: u8 = 1;
 /// An index record (a save point).
 pub(crate) const KIND_INDEX: u8 = 2;
+/// A meta record: the file's identity (see `meta`). Always the first record.
+pub(crate) const KIND_META: u8 = 3;
+/// A mesh record: the base mesh, compressed. Always the second record.
+pub(crate) const KIND_MESH: u8 = 4;
 
 /// A record's head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

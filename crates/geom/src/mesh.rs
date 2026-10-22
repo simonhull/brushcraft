@@ -95,6 +95,10 @@ pub enum MeshError {
     /// More faces or vertices than 32-bit ids hold.
     #[error("too many faces or vertices for 32-bit ids")]
     TooLarge,
+    /// Bytes given to [`BaseMesh::from_bytes`] aren't a mesh's canonical encoding: too short for
+    /// the counts they state, or with bytes left over.
+    #[error("the bytes are not a canonical base mesh encoding")]
+    Malformed,
 }
 
 /// Converts an id or count between integer types, failing with [`MeshError::TooLarge`] when it
@@ -173,6 +177,61 @@ impl BaseMesh {
         Ok(mesh)
     }
 
+    /// The mesh's canonical bytes: what a project file stores, and what its mesh hash is computed
+    /// over.
+    ///
+    /// The layout, all little-endian: the vertex count as a `u32`, each vertex's position as three
+    /// `f32`s (x, y, z), the face count as a `u32`, then each face's four vertex indices as `u32`s,
+    /// corners 0–3. Vertices and faces keep their ids, so [`BaseMesh::from_bytes`] gives back the
+    /// same mesh and encoding it again gives the same bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.positions.len() * 12 + self.faces.len() * 16);
+        out.extend_from_slice(&self.vertex_count().to_le_bytes());
+        for p in &self.positions {
+            for c in [p.x, p.y, p.z] {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&self.face_count().to_le_bytes());
+        for v in self.faces.iter().flatten() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Decodes [`BaseMesh::to_bytes`]'s encoding and validates the mesh as
+    /// [`BaseMesh::from_polygons`] does.
+    ///
+    /// Each count is checked against the bytes that remain before anything is allocated for it,
+    /// so hostile input can't make this allocate more than a small multiple of its own length.
+    ///
+    /// # Errors
+    ///
+    /// [`MeshError::Malformed`] if the bytes are shorter than their counts need or longer than
+    /// the encoding; then any [`MeshError`] of [`BaseMesh::from_polygons`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MeshError> {
+        let (vertex_count, rest) = split_count(bytes)?;
+        let (position_words, rest) = split_words(rest, vertex_count, 3)?;
+        let (face_count, rest) = split_count(rest)?;
+        let (face_words, rest) = split_words(rest, face_count, 4)?;
+        if !rest.is_empty() {
+            return Err(MeshError::Malformed);
+        }
+        let floats: Vec<f32> = position_words
+            .iter()
+            .map(|&word| f32::from_le_bytes(word))
+            .collect();
+        let (xyz, _) = floats.as_chunks::<3>();
+        let positions = xyz.iter().map(|&[x, y, z]| Vec3::new(x, y, z)).collect();
+        let indices: Vec<u32> = face_words
+            .iter()
+            .map(|&word| u32::from_le_bytes(word))
+            .collect();
+        let (quads, _) = indices.as_chunks::<4>();
+        Self::from_polygons(positions, quads)
+    }
+
     /// Six times the enclosed volume, in `f64`: positive when the faces point outward. Each quad
     /// contributes the two triangles `(p0, p1, p2)` and `(p0, p2, p3)` as tetrahedra with the
     /// origin.
@@ -239,6 +298,32 @@ impl BaseMesh {
     pub const fn topology(&self) -> &Topology {
         &self.topology
     }
+}
+
+/// Splits a little-endian `u32` count off the front of `bytes`.
+///
+/// # Errors
+///
+/// [`MeshError::Malformed`] if fewer than four bytes are left; [`MeshError::TooLarge`] if the
+/// count doesn't fit in a `usize`.
+fn split_count(bytes: &[u8]) -> Result<(usize, &[u8]), MeshError> {
+    let (word, rest) = bytes.split_first_chunk::<4>().ok_or(MeshError::Malformed)?;
+    Ok((fit(u32::from_le_bytes(*word))?, rest))
+}
+
+/// Splits `count` items of `words` four-byte words each off the front of `bytes`, as words.
+///
+/// The length is checked against `bytes` before anything is read, so a count far larger than
+/// the input fails at once.
+///
+/// # Errors
+///
+/// [`MeshError::Malformed`] if `bytes` is shorter than the items need.
+fn split_words(bytes: &[u8], count: usize, words: usize) -> Result<(&[[u8; 4]], &[u8]), MeshError> {
+    let len = count.checked_mul(words * 4).ok_or(MeshError::Malformed)?;
+    let (items, rest) = bytes.split_at_checked(len).ok_or(MeshError::Malformed)?;
+    let (items, _) = items.as_chunks::<4>();
+    Ok((items, rest))
 }
 
 /// Level 0: the base mesh's corners, `(0, 0)`, `(1, 0)`, `(1, 1)`, `(0, 1)` being corners 0–3.
@@ -523,6 +608,81 @@ mod tests {
             None,
             "not a face of this mesh"
         );
+    }
+
+    #[test]
+    fn canonical_bytes_round_trip() {
+        for mesh in [cube_sphere(1).unwrap(), cube_sphere(3).unwrap()] {
+            let bytes = mesh.to_bytes();
+            assert_eq!(
+                bytes.len(),
+                8 + 12 * mesh.positions.len() + 16 * mesh.faces.len(),
+                "the documented layout"
+            );
+            let back = BaseMesh::from_bytes(&bytes).unwrap();
+            assert_eq!(back.positions, mesh.positions, "positions, bit for bit");
+            assert_eq!(back.faces, mesh.faces, "faces, in order");
+            assert_eq!(
+                back.to_bytes(),
+                bytes,
+                "encoding again gives the same bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_bytes_are_rejected_without_panicking_or_overallocating() {
+        let good = cube_sphere(1).unwrap().to_bytes();
+        let vertex_count = u32::from_le_bytes(good[..4].try_into().unwrap());
+        let faces_at = 4 + 12 * usize::try_from(vertex_count).unwrap();
+        // Counts promising far more than the input holds: refused before any allocation.
+        for (what, at, count) in [
+            ("vertices", 0, u32::MAX),
+            ("vertices, one too many", 0, vertex_count + 1),
+            ("faces", faces_at, u32::MAX),
+        ] {
+            let mut bad = good.clone();
+            bad[at..at + 4].copy_from_slice(&count.to_le_bytes());
+            assert_eq!(
+                BaseMesh::from_bytes(&bad).unwrap_err(),
+                MeshError::Malformed,
+                "{what}"
+            );
+        }
+        assert_eq!(
+            BaseMesh::from_bytes(&[good.as_slice(), &[0]].concat()).unwrap_err(),
+            MeshError::Malformed,
+            "a trailing byte"
+        );
+        for cut in 0..good.len() {
+            assert!(BaseMesh::from_bytes(&good[..cut]).is_err(), "cut at {cut}");
+        }
+        // Well-formed bytes that aren't a valid mesh: the mesh's own checks catch them.
+        let mut nan = good.clone();
+        nan[4..8].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(
+            BaseMesh::from_bytes(&nan).unwrap_err(),
+            MeshError::NotFinite(VertexId::new(0)),
+            "a NaN position"
+        );
+        let mut out_of_range = good;
+        out_of_range[faces_at + 4..faces_at + 8].copy_from_slice(&vertex_count.to_le_bytes());
+        assert!(
+            matches!(
+                BaseMesh::from_bytes(&out_of_range),
+                Err(MeshError::VertexOutOfRange { face: 0, .. })
+            ),
+            "an index past the vertices"
+        );
+        // Noise of every short length, from a fixed seed.
+        let mut rng = crate::test_rng::Rng::new(11);
+        for len in 0..512 {
+            let noise: Vec<u8> = (0..len).map(|_| rng.next_u64().to_le_bytes()[0]).collect();
+            assert!(
+                BaseMesh::from_bytes(&noise).is_err(),
+                "noise of {len} bytes"
+            );
+        }
     }
 
     #[test]
