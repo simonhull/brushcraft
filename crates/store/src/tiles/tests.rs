@@ -1522,6 +1522,81 @@ fn a_tile_edited_after_its_prefetch_keeps_the_edit() {
     assert_positions(&mut store, &dense, &[rewritten, resident], "edited");
 }
 
+/// Dirties every resident correction tile of `store` with `op`, at an interior vertex of each.
+fn dirty_every_resident_correction(store: &mut TileStore, all: &[TileKey], op: OpId) {
+    let resident: Vec<TileKey> = all
+        .iter()
+        .filter(|key| store.corrections.find(key).is_some())
+        .copied()
+        .collect();
+    for key in resident {
+        store
+            .edit_tile(key, op, |edit| edit.set(1, 1, Vec3::new(0.001, 0.0, 0.0)))
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[test]
+fn prefetch_never_takes_an_evaluated_chunk_or_writes_a_tile_back() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, _) = store_on_disk(&dir, "work.bcp", &mesh, config(10, 4), 300, 14);
+    let all = tiles(&mesh, 1, TOP);
+    for key in &all {
+        store.evaluate(*key).unwrap();
+    }
+    let chunk = store.corrections.chunk_bytes();
+    assert!(!store.budget.fits(chunk), "the budget is spent");
+    // Every correction slot in use and dirty: none can be had without a write-back.
+    let mut absent: Vec<TileKey> = all
+        .iter()
+        .filter(|key| !store.file.contains(key) && store.corrections.find(key).is_none())
+        .copied()
+        .collect();
+    while store.corrections.has_free_slot() {
+        store.correction(absent.pop().unwrap()).unwrap();
+    }
+    let op = store.next_op().unwrap();
+    dirty_every_resident_correction(&mut store, &all, op);
+    assert!(
+        store.evaluated.has_unpinned_chunk(),
+        "an evaluated chunk could be taken"
+    );
+    let on_disk: Vec<TileKey> = all
+        .iter()
+        .filter(|key| store.file.contains(key) && store.corrections.find(key).is_none())
+        .copied()
+        .collect();
+    let (written, corrections, evaluated) = (
+        store.file.len(),
+        store.corrections.bytes(),
+        store.evaluated.bytes(),
+    );
+    let dirty = store.unsaved.len();
+    assert_eq!(store.prefetch(&on_disk[..1]).unwrap(), 1, "queued");
+    assert_eq!(drain_prefetch(&mut store), 0, "dropped: no slot to spare");
+    assert_eq!(store.file.len(), written, "nothing written back");
+    assert_eq!(
+        (store.corrections.bytes(), store.evaluated.bytes()),
+        (corrections, evaluated),
+        "no chunk changed hands"
+    );
+    assert_eq!(store.unsaved.len(), dirty, "every dirty tile stays");
+
+    // Clean now: a prefetched tile takes a clean tile's slot, still without writing.
+    store.save().unwrap();
+    let saved = store.file.len();
+    assert_eq!(store.prefetch(&on_disk[1..2]).unwrap(), 1, "queued");
+    assert_eq!(drain_prefetch(&mut store), 1, "installed in a clean slot");
+    assert_eq!(store.file.len(), saved, "nothing written");
+    assert_eq!(
+        (store.corrections.bytes(), store.evaluated.bytes()),
+        (corrections, evaluated),
+        "still no chunk changed hands"
+    );
+}
+
 #[test]
 fn dropping_a_store_with_queued_work_returns_promptly() {
     let (done, finished) = mpsc::channel();

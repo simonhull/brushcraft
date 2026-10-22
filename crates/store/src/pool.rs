@@ -217,6 +217,15 @@ struct Meta {
     stale: bool,
 }
 
+/// Which slots the clock may take as its victim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Victims {
+    /// Any unpinned slot; a dirty one is written back first.
+    Any,
+    /// Unpinned clean slots only, so nothing is written back.
+    Clean,
+}
+
 /// A slot position: chunk and index in it.
 type Pos = (u32, u32);
 
@@ -435,13 +444,42 @@ impl<T: Pod> Pool<T> {
         budget: &mut Budget,
         write_back: impl FnMut(TileKey, &T) -> Result<(), W>,
     ) -> Result<SlotId<T>, PoolError<W>> {
+        self.acquire_with(key, budget, Victims::Any, write_back)
+    }
+
+    /// As [`Pool::acquire`], but the clock takes only a clean victim: nothing is written back.
+    ///
+    /// # Errors
+    ///
+    /// [`PoolError::Present`] if `key` already has a slot; [`PoolError::Full`] if every unpinned
+    /// slot is dirty and the budget allows no chunk.
+    pub(crate) fn acquire_clean(
+        &mut self,
+        key: TileKey,
+        budget: &mut Budget,
+    ) -> Result<SlotId<T>, PoolError> {
+        self.acquire_with(key, budget, Victims::Clean, |_, _| Ok(()))
+    }
+
+    /// [`Pool::acquire`] and [`Pool::acquire_clean`]: the clock takes its victim among `victims`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pool::acquire`].
+    fn acquire_with<W>(
+        &mut self,
+        key: TileKey,
+        budget: &mut Budget,
+        victims: Victims,
+        write_back: impl FnMut(TileKey, &T) -> Result<(), W>,
+    ) -> Result<SlotId<T>, PoolError<W>> {
         if self.index.contains_key(&key) {
             return Err(PoolError::Present);
         }
         let pos = match self.free.pop() {
             Some(pos) => pos,
             None if self.map_chunk(budget) => self.free.pop().ok_or(PoolError::Full)?,
-            None => self.victim(write_back)?,
+            None => self.victim(victims, write_back)?,
         };
         let generation = {
             let meta = self.meta_mut(pos).ok_or(PoolError::Full)?;
@@ -638,15 +676,17 @@ impl<T: Pod> Pool<T> {
         true
     }
 
-    /// The clock's victim: sweeping from the hand over mapped slots, skipping pinned ones and
-    /// clearing `referenced` on the first that have it, the first unpinned unreferenced slot,
-    /// written back if dirty and then freed (but not put on the free list).
+    /// The clock's victim: sweeping from the hand over mapped slots, skipping pinned ones (and
+    /// dirty ones, for [`Victims::Clean`]) and clearing `referenced` on the first that have it,
+    /// the first such slot unreferenced, written back if dirty and then freed (but not put on
+    /// the free list).
     ///
     /// # Errors
     ///
     /// [`PoolError::Full`] after two full sweeps without a victim; [`PoolError::WriteBack`].
     fn victim<W>(
         &mut self,
+        victims: Victims,
         mut write_back: impl FnMut(TileKey, &T) -> Result<(), W>,
     ) -> Result<Pos, PoolError<W>> {
         let total = u64::from(self.chunk_count()) * u64::from(self.per_chunk);
@@ -660,7 +700,7 @@ impl<T: Pod> Pool<T> {
             let Some(meta) = self.meta_mut(pos) else {
                 continue;
             };
-            if meta.pins > 0 || meta.key.is_none() {
+            if meta.pins > 0 || meta.key.is_none() || (victims == Victims::Clean && meta.dirty) {
                 continue;
             }
             if meta.referenced {
@@ -1143,6 +1183,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(written, vec![key(1)], "and was written back");
+    }
+
+    #[test]
+    fn a_clean_acquire_never_writes_back() {
+        let (mut pool, mut budget) = small(2, 1);
+        let dirty = put(&mut pool, &mut budget, 0, 1);
+        pool.set_dirty(dirty, true).unwrap();
+        put(&mut pool, &mut budget, 1, 2);
+        let id = pool.acquire_clean(key(2), &mut budget).unwrap();
+        assert_eq!(pool.lookup(&key(1)), None, "the clean tile was the victim");
+        assert_eq!(pool.get(dirty), Some(&[1, 0]), "the dirty one stays");
+        pool.set_dirty(id, true).unwrap();
+        assert!(
+            matches!(
+                pool.acquire_clean(key(3), &mut budget),
+                Err(PoolError::Full)
+            ),
+            "every unpinned slot dirty: full, nothing written"
+        );
+        assert_eq!(pool.is_dirty(dirty), Some(true), "still dirty");
+        assert_eq!(pool.is_dirty(id), Some(true), "both");
     }
 
     #[test]

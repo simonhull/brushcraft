@@ -907,16 +907,17 @@ impl TileStore {
     /// Installs the correction tiles the prefetch workers have finished, and returns how many.
     ///
     /// A finished tile is installed only if it is still wanted and still current: not resident
-    /// (a resident tile may have been edited since, and is what the store uses either way), its
-    /// record still the latest (any write of the tile, by an edit's write-back or a save, moves
-    /// it), and a slot to be had without failing (prefetch never takes a pinned slot). Anything
-    /// else is dropped, as is a tile a worker couldn't read: a later load reads it again and
-    /// reports the error.
+    /// (a resident tile may have been edited since, and is what the store uses either way), and
+    /// its record still the latest (any write of the tile, by an edit's write-back or a save,
+    /// moves it). It goes into a free slot, a new chunk if the budget allows one, or the slot of
+    /// a clean correction tile: prefetch never takes a pinned slot, an evaluated chunk or a dirty
+    /// tile's slot, so it never writes anything back. Anything else is dropped, as is a tile a
+    /// worker couldn't read: a later load reads it again and reports the error.
     ///
     /// # Errors
     ///
-    /// [`CacheError::WriteBack`] if making room wrote a dirty tile back and that failed; the
-    /// results not reached yet wait for the next poll.
+    /// [`CacheError::Internal`] if a fresh slot's handle went stale (it doesn't); the results not
+    /// reached yet wait for the next poll.
     pub fn poll(&mut self) -> Result<usize, CacheError> {
         let mut installed = 0;
         while let Some(Fetched { job, slot }) = self.prefetch.next() {
@@ -943,20 +944,21 @@ impl TileStore {
     }
 
     /// Puts a prefetched correction tile, read at its latest record, into a fresh slot; whether
-    /// it did. A resident tile (every dirty tile is resident) is left alone, and a full pool
-    /// ([`CacheError::Full`]) just drops the tile.
+    /// it did. A resident tile (every dirty tile is resident) is left alone, and so is the tile
+    /// when the correction pool has no slot to give without writing a dirty tile back or taking
+    /// memory from the evaluated pool (see [`Pool::acquire_clean`]).
     ///
     /// # Errors
     ///
-    /// [`CacheError::WriteBack`], as for [`TileStore::poll`].
+    /// [`CacheError::Internal`] if the fresh slot's handle went stale (it doesn't).
     fn install(&mut self, key: TileKey, tile: &CorrectionSlot) -> Result<bool, CacheError> {
         if self.corrections.find(&key).is_some() {
             return Ok(false);
         }
-        let id = match self.acquire_correction(key) {
+        let id = match self.corrections.acquire_clean(key, &mut self.budget) {
             Ok(id) => id,
-            Err(CacheError::Full) => return Ok(false),
-            Err(e) => return Err(e),
+            Err(PoolError::Full) => return Ok(false),
+            Err(e) => return Err(e.into()),
         };
         *self.corrections.get_mut(id).ok_or(Invariant::StaleHandle)? = *tile;
         #[cfg(test)]
