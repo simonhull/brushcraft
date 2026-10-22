@@ -67,8 +67,12 @@ use crate::tiles::{CacheError, Saved, StoreConfig, TileStore};
 /// The extension of a recovery file (and of a project file).
 const EXTENSION: &str = "bcrf";
 
-/// How long a project waits before it tries a failed roll-over again (see
-/// [`Project::roll_over`]), the first time: the wait doubles with each failure in a row.
+/// How long a project first waits to try again to move to a new recovery file.
+///
+/// The move follows a failed sync of the recovery file; if it fails too, it is tried again
+/// after this wait, which doubles with each failure in a row. [`Project::poll`],
+/// [`Project::tick`] and [`Project::end_stroke`] wait; [`Project::save`] and [`Project::close`]
+/// try at once.
 pub const ROLL_OVER_RETRY: Duration = Duration::from_secs(1);
 
 /// The longest a project waits between two tries of a failing roll-over.
@@ -537,8 +541,8 @@ impl Project {
     ///
     /// The file is written as a temporary file beside `path` and moved into place once its
     /// save point is durable, so `path` never names a half-written project. The move never
-    /// replaces a file (see [`place_new`]), not even one made at `path` while the project was
-    /// being written.
+    /// replaces a file (a hard link, not a rename), not even one made at `path` while the
+    /// project was being written.
     ///
     /// # Errors
     ///
