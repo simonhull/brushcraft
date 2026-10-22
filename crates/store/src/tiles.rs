@@ -32,6 +32,12 @@
 //! first. A chunk holding a pinned slot can't be given back, so the request fails only when no
 //! chunk without a pin is left.
 //!
+//! Within the budget the pools rebalance towards corrections. When a correction tile needs a
+//! slot and the correction pool would have to evict a dirty one (a write to the working file
+//! now, and a read back if the tile is wanted again), it first takes an evaluated chunk without
+//! pins back, if there is one, and maps a correction chunk in its place: an evaluated tile is
+//! recomputed from resident tiles without any I/O. A clean victim is evicted as before.
+//!
 //! A budget of [`StoreConfig::minimum_budget`] is enough for every evaluation and edit when
 //! nothing else is pinned, and [`TileStore::open`] refuses less. An evaluation pins at most `E`
 //! evaluated slots (two cone levels) and no correction slot:
@@ -1000,13 +1006,27 @@ impl TileStore {
         Ok(id)
     }
 
-    /// A fresh slot for `key`'s correction tile, taking chunks back from the pools if the
+    /// A fresh slot for `key`'s correction tile: taking an evaluated chunk back rather than
+    /// writing a dirty correction tile back, and taking chunks back from the pools if the
     /// correction pool is full (see the module notes).
     ///
     /// # Errors
     ///
     /// [`CacheError::Pool`].
     fn acquire_correction(&mut self, key: TileKey) -> Result<SlotId<CorrectionSlot>, CacheError> {
+        let chunk = self.corrections.chunk_bytes();
+        let evicts_dirty = !self.corrections.has_free_slot()
+            && !self.budget.fits(chunk)
+            && self.corrections.victim_is_dirty();
+        if evicts_dirty && self.evaluated.has_unpinned_chunk() {
+            // Rebalancing (see the module notes): evaluated chunks only, so nothing is written.
+            let target = self.budget.limit().saturating_sub(chunk);
+            let shrunk = self
+                .evaluated
+                .shrink_to(&mut self.budget, target, |_, _| Ok(()));
+            self.note_evictions();
+            shrunk?;
+        }
         for attempt in 0..2 {
             let (file, unsaved) = (&mut self.file, &mut self.unsaved);
             match self.corrections.acquire(key, &mut self.budget, |k, slot| {

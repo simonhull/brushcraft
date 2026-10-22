@@ -686,6 +686,72 @@ fn corrections_take_chunks_back_from_evaluated_tiles() {
 }
 
 #[test]
+fn a_dirty_correction_tile_outranks_an_evaluated_chunk() {
+    let config = config(10, 4);
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    let all = tiles(&mesh, 1, TOP);
+    for key in &all {
+        store.evaluate(*key).unwrap();
+    }
+    // Fill the correction pool, then edit every tile in it: the next correction tile would
+    // evict a dirty one.
+    let mut candidates = all.iter().copied();
+    let mut absent = |from: &TileStore| {
+        candidates
+            .find(|key| from.corrections.find(key).is_none())
+            .unwrap()
+    };
+    while store.corrections.has_free_slot() || store.budget.fits(store.corrections.chunk_bytes()) {
+        let key = absent(&store);
+        store.correction(key).unwrap();
+    }
+    let resident: Vec<TileKey> = all
+        .iter()
+        .filter(|key| store.corrections.find(key).is_some())
+        .copied()
+        .collect();
+    let op = store.next_op().unwrap();
+    for key in &resident {
+        let region = Region::of_tile(key);
+        let (i, j) = (region.x0() + 1, region.y0() + 1);
+        store
+            .set_correction(
+                key.face(),
+                key.level(),
+                i,
+                j,
+                Vec3::new(0.001, 0.0, 0.0),
+                op,
+            )
+            .unwrap();
+    }
+    assert!(store.corrections.victim_is_dirty(), "the victim is dirty");
+    assert!(
+        store.evaluated.has_unpinned_chunk(),
+        "evaluated chunks can go"
+    );
+    let (written, corrections, evaluated) = (
+        store.file.len(),
+        store.corrections.bytes(),
+        store.evaluated.bytes(),
+    );
+    let next = absent(&store);
+    store.correction(next).unwrap();
+    assert_eq!(store.file.len(), written, "nothing was written back");
+    assert!(
+        store.corrections.bytes() > corrections && store.evaluated.bytes() < evaluated,
+        "an evaluated chunk became a correction chunk"
+    );
+    assert!(store.bytes() <= config.budget_bytes, "within the budget");
+    for key in &resident {
+        let id = store.corrections.find(key).unwrap();
+        assert_eq!(store.corrections.is_dirty(id), Some(true), "{key:?} kept");
+    }
+}
+
+#[test]
 fn a_pinned_tile_is_recomputed_in_place() {
     let dir = TestDir::new();
     let mesh = mesh();

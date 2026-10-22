@@ -48,12 +48,16 @@ impl Budget {
         self.used
     }
 
+    /// Whether another `bytes` fit under the limit.
+    pub(crate) fn fits(&self, bytes: usize) -> bool {
+        self.used
+            .checked_add(bytes)
+            .is_some_and(|n| n <= self.limit)
+    }
+
     /// Takes `bytes` if they fit under the limit; whether they did.
     fn try_take(&mut self, bytes: usize) -> bool {
-        let fits = self
-            .used
-            .checked_add(bytes)
-            .is_some_and(|n| n <= self.limit);
+        let fits = self.fits(bytes);
         if fits {
             self.used += bytes;
         }
@@ -304,6 +308,51 @@ impl<T: Pod> Pool<T> {
     /// Slots pinned at least once.
     pub(crate) fn pinned_slots(&self) -> usize {
         self.meta.iter().flatten().filter(|m| m.pins > 0).count()
+    }
+
+    /// Whether a mapped chunk has a free slot: [`Pool::acquire`] then needs no new chunk and
+    /// evicts nothing.
+    pub(crate) fn has_free_slot(&self) -> bool {
+        !self.free.is_empty()
+    }
+
+    /// Whether a mapped chunk holds no pinned slot, so that [`Pool::shrink_to`] can give it back.
+    pub(crate) fn has_unpinned_chunk(&self) -> bool {
+        (0..self.chunk_count()).any(|chunk| {
+            self.is_mapped(chunk)
+                && self
+                    .meta
+                    .get(chunk as usize)
+                    .is_some_and(|slots| slots.iter().all(|m| m.pins == 0))
+        })
+    }
+
+    /// Whether the clock's next victim is dirty, without moving the clock: what an
+    /// [`Pool::acquire`] that has to evict would write back.
+    ///
+    /// The clock takes the first unpinned, unreferenced slot from its hand; if every unpinned
+    /// slot is referenced, its first sweep clears them all and its second takes the first
+    /// unpinned slot from the hand. `false` if no slot can be evicted.
+    pub(crate) fn victim_is_dirty(&self) -> bool {
+        let total = u64::from(self.chunk_count()) * u64::from(self.per_chunk);
+        let mut first_unpinned = None;
+        for step in 0..total {
+            let pos = self.pos_of((self.hand + step) % total);
+            if !self.is_mapped(pos.0) {
+                continue;
+            }
+            let Some(meta) = self.meta_of(pos) else {
+                continue;
+            };
+            if meta.pins > 0 || meta.key.is_none() {
+                continue;
+            }
+            if !meta.referenced {
+                return meta.dirty;
+            }
+            first_unpinned.get_or_insert(meta.dirty);
+        }
+        first_unpinned.unwrap_or(false)
     }
 
     /// Whether `key` has a pinned slot.
@@ -1019,6 +1068,33 @@ mod tests {
             ),
             "one slot per tile"
         );
+    }
+
+    #[test]
+    fn the_victim_is_seen_before_it_is_taken() {
+        let (mut pool, mut budget) = small(4, 1);
+        assert!(!pool.victim_is_dirty(), "an empty pool has no victim");
+        for n in 0..4 {
+            let id = put(&mut pool, &mut budget, n, 1);
+            pool.set_dirty(id, n == 1 || n == 3).unwrap();
+        }
+        // Every slot is referenced: the clock clears them and takes slot 0, which is clean.
+        assert!(!pool.victim_is_dirty(), "slot 0 is next");
+        let mut written = Vec::new();
+        pool.acquire(key(10), &mut budget, |k, _: &Small| {
+            written.push(k);
+            Ok(())
+        })
+        .unwrap();
+        assert!(written.is_empty(), "and was taken clean");
+        // Slots 1–3 are unreferenced now and the hand is past slot 0: slot 1, dirty, is next.
+        assert!(pool.victim_is_dirty(), "slot 1 is next");
+        pool.acquire(key(11), &mut budget, |k, _: &Small| {
+            written.push(k);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(written, vec![key(1)], "and was written back");
     }
 
     #[test]
