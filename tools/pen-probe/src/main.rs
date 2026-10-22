@@ -1,22 +1,26 @@
 //! Pen-input probe: records what winit and our own pen backend deliver from a pen tablet, from the
 //! same strokes, and summarises both.
 //!
-//! Draw on the window with the pen, then close it. Samples go to the CSV path given as the first
-//! argument (default `pen-samples.csv`), and a summary is printed to stdout. Our backend
-//! (`input::wayland`) runs where it can; without it the probe records winit alone. Method and
-//! results: `research/platform/pen-input-wayland.md` in the docs repo.
+//! Usage: `pen-probe [--source winit|ours|both] [CSV]`.
+//!
+//! Draw on the window with the pen, then close it. Samples go to the CSV path (default
+//! `pen-samples.csv`), and a summary is printed to stdout. `--source` picks what is recorded:
+//! our backend (`input::wayland`, the default), winit, or both. Some compositors deliver tablet
+//! events to only one tablet binding per client, so `both` may see nothing from one of them.
+//! Method and results: `research/platform/pen-input-wayland.md` in the docs repo.
 
 mod ours;
 mod report;
 
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, anyhow};
-use input::Phase;
+use anyhow::{Context as _, Result, anyhow, bail};
+use input::{Buttons, Phase};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::event::{
@@ -50,6 +54,81 @@ impl Source {
     }
 }
 
+/// Which sources a run records, from `--source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Selection {
+    Winit,
+    #[default]
+    Ours,
+    Both,
+}
+
+impl Selection {
+    /// Whether this run records `source`.
+    const fn records(self, source: Source) -> bool {
+        matches!(
+            (self, source),
+            (Self::Both, _) | (Self::Winit, Source::Winit) | (Self::Ours, Source::Ours)
+        )
+    }
+}
+
+/// The command line.
+#[derive(Debug, PartialEq, Eq)]
+struct Args {
+    selection: Selection,
+    output: PathBuf,
+}
+
+impl Args {
+    /// Parses the arguments after the program name.
+    ///
+    /// # Errors
+    ///
+    /// On an unknown flag or source, a missing `--source` value, or more than one path.
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
+        let mut selection = Selection::default();
+        let mut output = None;
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            let source = if arg == "--source" {
+                Some(
+                    args.next()
+                        .context("--source needs a value: winit, ours or both")?,
+                )
+            } else {
+                arg.to_str()
+                    .and_then(|a| a.strip_prefix("--source="))
+                    .map(OsString::from)
+            };
+            if let Some(source) = source {
+                selection = match source.to_str() {
+                    Some("winit") => Selection::Winit,
+                    Some("ours") => Selection::Ours,
+                    Some("both") => Selection::Both,
+                    _ => bail!(
+                        "unknown source {}: expected winit, ours or both",
+                        source.display()
+                    ),
+                };
+            } else if arg.to_str().is_some_and(|a| a.starts_with('-')) {
+                bail!(
+                    "unknown option {}; usage: pen-probe [--source winit|ours|both] [CSV]",
+                    arg.display()
+                );
+            } else if output.replace(PathBuf::from(arg)).is_some() {
+                bail!(
+                    "more than one output path; usage: pen-probe [--source winit|ours|both] [CSV]"
+                );
+            }
+        }
+        Ok(Self {
+            selection,
+            output: output.unwrap_or_else(|| "pen-samples.csv".into()),
+        })
+    }
+}
+
 /// One pen sample as the probe records it.
 #[derive(Debug, Clone)]
 struct Sample {
@@ -72,6 +151,8 @@ struct Sample {
     roll: Option<f64>,
     /// Our phase; `None` for winit samples.
     phase: Option<Phase>,
+    /// Barrel buttons held; never the tip.
+    buttons: Buttons,
     /// The compositor's millisecond timestamp; `None` for winit samples.
     device_ms: Option<u32>,
 }
@@ -79,6 +160,8 @@ struct Sample {
 /// Everything one run recorded.
 #[derive(Debug, Default)]
 struct Recording {
+    /// Which sources were recorded.
+    selection: Selection,
     samples: Vec<Sample>,
     /// Pad events from our backend (buttons, rings, strips, dials).
     pads: usize,
@@ -150,6 +233,8 @@ struct App {
     canvas: Canvas,
     /// winit's view of whether the tip is down.
     contact: bool,
+    /// winit's view of which barrel buttons are held.
+    buttons: Buttons,
     wakeup: u64,
     /// The window's scale factor, to put our logical positions in winit's physical pixels.
     scale: f64,
@@ -158,17 +243,21 @@ struct App {
 }
 
 impl App {
-    fn new(done: mpsc::Sender<Result<Recording>>) -> Self {
+    fn new(selection: Selection, done: mpsc::Sender<Result<Recording>>) -> Self {
         Self {
             start: Instant::now(),
             done,
             surface: None,
             canvas: Canvas::new(0, 0),
             contact: false,
+            buttons: Buttons::default(),
             wakeup: 0,
             scale: 1.0,
             backend: None,
-            recording: Recording::default(),
+            recording: Recording {
+                selection,
+                ..Recording::default()
+            },
         }
     }
 
@@ -201,6 +290,9 @@ impl App {
     }
 
     fn record(&mut self, sample: Sample) {
+        if !self.recording.selection.records(sample.source) {
+            return;
+        }
         if sample.contact && sample.source == self.drawn() {
             let pressure = sample.pressure.unwrap_or(1.0);
             self.canvas
@@ -224,6 +316,7 @@ impl App {
             distance: None,
             roll: data.twist.map(f64::from),
             phase: None,
+            buttons: self.buttons,
             device_ms: None,
         }
     }
@@ -243,6 +336,7 @@ impl App {
             distance: s.distance.map(|d| f64::from(d.get())),
             roll: s.roll,
             phase: Some(s.phase),
+            buttons: s.buttons,
             device_ms: Some(s.device_ms),
         }
     }
@@ -316,15 +410,23 @@ impl App {
             WindowEvent::PointerButton {
                 state,
                 position,
-                button:
-                    ButtonSource::TabletTool {
-                        button: TabletToolButton::Contact,
-                        data,
-                        ..
-                    },
+                button: ButtonSource::TabletTool { button, data, .. },
                 ..
             } => {
-                self.contact = state == ElementState::Pressed;
+                let pressed = state == ElementState::Pressed;
+                // winit's Wayland backend maps evdev codes as SDL does: BTN_STYLUS (our primary)
+                // arrives as `Contact`, like the tip, `Barrel` is BTN_STYLUS2 and `Other(1)` is
+                // BTN_STYLUS3. Other codes aren't barrel buttons.
+                match button {
+                    TabletToolButton::Contact => self.contact = pressed,
+                    TabletToolButton::Barrel => {
+                        self.buttons = self.buttons.with(Buttons::SECONDARY, pressed);
+                    }
+                    TabletToolButton::Other(1) => {
+                        self.buttons = self.buttons.with(Buttons::TERTIARY, pressed);
+                    }
+                    TabletToolButton::Other(_) => return Ok(()),
+                }
                 self.record(self.winit_sample(position.x, position.y, &data));
             }
             _ => {}
@@ -351,11 +453,19 @@ impl ApplicationHandler for App {
             let context = Context::new(event_loop.owned_display_handle())
                 .map_err(|e| anyhow!("creating the softbuffer context: {e}"))?;
             self.scale = window.scale_factor();
-            match ours::Ours::start(event_loop, window.as_ref()) {
-                Ok(backend) => self.backend = Some(backend),
-                Err(e) => {
-                    self.recording.note =
-                        Some(format!("our backend didn't start ({e}); winit only"));
+            let selection = self.recording.selection;
+            if selection.records(Source::Ours) {
+                match ours::Ours::start(event_loop, window.as_ref()) {
+                    Ok(backend) => self.backend = Some(backend),
+                    Err(e) => {
+                        let rest = if selection.records(Source::Winit) {
+                            "winit only"
+                        } else {
+                            "nothing recorded"
+                        };
+                        self.recording.note =
+                            Some(format!("our backend didn't start ({e}); {rest}"));
+                    }
                 }
             }
             let surface =
@@ -385,11 +495,9 @@ impl ApplicationHandler for App {
 ///
 /// If the window can't be created or drawn, or the CSV or summary can't be written.
 fn main() -> Result<()> {
-    let output = std::env::args_os()
-        .nth(1)
-        .map_or_else(|| "pen-samples.csv".into(), PathBuf::from);
+    let Args { selection, output } = Args::parse(std::env::args_os().skip(1))?;
     let (done, outcome) = mpsc::channel();
-    EventLoop::new()?.run_app(App::new(done))?;
+    EventLoop::new()?.run_app(App::new(selection, done))?;
     let recording = outcome
         .recv()
         .context("the window closed without a recording")??;
@@ -398,4 +506,68 @@ fn main() -> Result<()> {
     write!(stdout, "{}", report::summarise(&recording)?)?;
     writeln!(stdout, "csv: {}", output.display())?;
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "test functions are documented by their names; panicking is how they fail"
+)]
+mod tests {
+    use super::*;
+
+    /// Parses `args` as the arguments after the program name.
+    ///
+    /// # Errors
+    ///
+    /// As [`Args::parse`].
+    fn parse(args: &[&str]) -> Result<Args> {
+        Args::parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn defaults_to_ours_and_the_default_path() {
+        assert_eq!(
+            parse(&[]).ok(),
+            Some(Args {
+                selection: Selection::Ours,
+                output: "pen-samples.csv".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn takes_a_source_in_either_form_and_a_path_either_side() {
+        let both = Args {
+            selection: Selection::Both,
+            output: "out.csv".into(),
+        };
+        assert_eq!(parse(&["--source", "both", "out.csv"]).ok(), Some(both));
+        let winit = Args {
+            selection: Selection::Winit,
+            output: "out.csv".into(),
+        };
+        assert_eq!(parse(&["out.csv", "--source=winit"]).ok(), Some(winit));
+        assert_eq!(
+            parse(&["--source", "ours"]).ok().map(|a| a.selection),
+            Some(Selection::Ours)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_arguments() {
+        parse(&["--source"]).unwrap_err();
+        parse(&["--source", "mouse"]).unwrap_err();
+        parse(&["--verbose"]).unwrap_err();
+        parse(&["a.csv", "b.csv"]).unwrap_err();
+    }
+
+    #[test]
+    fn a_selection_records_its_sources() {
+        assert!(Selection::Ours.records(Source::Ours));
+        assert!(!Selection::Ours.records(Source::Winit));
+        assert!(Selection::Winit.records(Source::Winit));
+        assert!(!Selection::Winit.records(Source::Ours));
+        assert!(Source::ALL.into_iter().all(|s| Selection::Both.records(s)));
+    }
 }

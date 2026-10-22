@@ -5,9 +5,9 @@ use std::fmt::{self, Write as _};
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use input::Phase;
+use input::{Buttons, Phase};
 
-use crate::{Recording, Sample, Source};
+use crate::{Recording, Sample, Selection, Source};
 
 /// Intervals longer than this are breaks between strokes, not sample spacing.
 const STROKE_GAP_S: f64 = 0.1;
@@ -18,6 +18,17 @@ const MIN_STEP_PX: f64 = 2.0;
 #[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^52")]
 pub(crate) const fn to_f64(v: usize) -> f64 {
     v as f64
+}
+
+/// Held barrel buttons as a bit mask: 1 primary (`BTN_STYLUS`), 2 secondary (`BTN_STYLUS2`),
+/// 4 tertiary (`BTN_STYLUS3`); 0 for none.
+fn button_mask(buttons: Buttons) -> u8 {
+    [Buttons::PRIMARY, Buttons::SECONDARY, Buttons::TERTIARY]
+        .into_iter()
+        .zip([1, 2, 4])
+        .filter(|&(button, _)| buttons.contains(button))
+        .map(|(_, bit)| bit)
+        .sum()
 }
 
 /// How the time between two consecutive samples is read.
@@ -53,12 +64,12 @@ pub(crate) fn write_csv(samples: &[Sample], path: &Path) -> Result<()> {
     }
     let mut out = String::from(
         "source,received_s,dejittered_s,wakeup,x,y,contact,pressure,tilt_x,tilt_y,distance,roll,\
-         phase,device_ms\n",
+         phase,buttons,device_ms\n",
     );
     for s in samples {
         writeln!(
             out,
-            "{},{:.6},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{}",
+            "{},{:.6},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{}",
             s.source.name(),
             s.received.as_secs_f64(),
             opt(s.dejittered.map(|d| format!("{:.6}", d.as_secs_f64()))),
@@ -72,6 +83,7 @@ pub(crate) fn write_csv(samples: &[Sample], path: &Path) -> Result<()> {
             opt(s.distance.map(|d| format!("{d:.6}"))),
             opt(s.roll.map(|r| format!("{r:.3}"))),
             opt(s.phase.map(|p| format!("{p:?}"))),
+            button_mask(s.buttons),
             opt(s.device_ms),
         )?;
     }
@@ -266,6 +278,29 @@ fn source_block(out: &mut String, source: Source, samples: &[Sample]) -> fmt::Re
     })?;
     coverage(out, "roll", samples, |s| s.roll.map(|r| format!("{r:.3}")))?;
 
+    let held: Vec<u8> = samples
+        .iter()
+        .map(|s| button_mask(s.buttons))
+        .filter(|&mask| mask != 0)
+        .collect();
+    let sets: Vec<String> = held
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    writeln!(
+        out,
+        "buttons: {} of {} samples with any held; sets seen (mask): {}",
+        held.len(),
+        samples.len(),
+        if sets.is_empty() {
+            "none".to_owned()
+        } else {
+            sets.join(", ")
+        }
+    )?;
+
     if source == Source::Ours {
         let mut phases = BTreeMap::<String, usize>::new();
         for phase in samples.iter().filter_map(|s| s.phase) {
@@ -298,6 +333,14 @@ pub(crate) fn summarise(recording: &Recording) -> Result<String, fmt::Error> {
     if let Some(note) = &recording.note {
         writeln!(out, "note: {note}")?;
     }
+    if let Some(silent) = silent_source(recording) {
+        writeln!(
+            out,
+            "note: {} recorded nothing; only one tablet binding per client may receive events on \
+             this compositor",
+            silent.name()
+        )?;
+    }
     for source in Source::ALL {
         let samples: Vec<Sample> = recording
             .samples
@@ -319,4 +362,102 @@ pub(crate) fn summarise(recording: &Recording) -> Result<String, fmt::Error> {
         }
     }
     Ok(out)
+}
+
+/// With both sources recorded, the one that got no samples while the other got some.
+fn silent_source(recording: &Recording) -> Option<Source> {
+    if recording.selection != Selection::Both {
+        return None;
+    }
+    let count = |source| {
+        recording
+            .samples
+            .iter()
+            .filter(|s| s.source == source)
+            .count()
+    };
+    match (count(Source::Winit), count(Source::Ours)) {
+        (0, 1..) => Some(Source::Winit),
+        (1.., 0) => Some(Source::Ours),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "test functions are documented by their names; panicking is how they fail"
+)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn sample(source: Source, buttons: Buttons) -> Sample {
+        Sample {
+            source,
+            received: Duration::ZERO,
+            dejittered: None,
+            wakeup: 0,
+            x: 0.0,
+            y: 0.0,
+            contact: false,
+            pressure: None,
+            tilt: None,
+            distance: None,
+            roll: None,
+            phase: None,
+            buttons,
+            device_ms: None,
+        }
+    }
+
+    #[test]
+    fn button_masks_number_the_barrel_buttons() {
+        assert_eq!(button_mask(Buttons::default()), 0);
+        assert_eq!(button_mask(Buttons::PRIMARY), 1);
+        assert_eq!(button_mask(Buttons::SECONDARY), 2);
+        let all = Buttons::PRIMARY
+            .with(Buttons::SECONDARY, true)
+            .with(Buttons::TERTIARY, true);
+        assert_eq!(button_mask(all), 7);
+    }
+
+    #[test]
+    fn notes_a_silent_source_only_when_both_ran() {
+        let mut recording = Recording {
+            selection: Selection::Both,
+            samples: vec![sample(Source::Ours, Buttons::default())],
+            ..Recording::default()
+        };
+        assert_eq!(silent_source(&recording), Some(Source::Winit));
+        recording
+            .samples
+            .push(sample(Source::Winit, Buttons::default()));
+        assert_eq!(silent_source(&recording), None);
+        recording.selection = Selection::Ours;
+        recording.samples.retain(|s| s.source == Source::Ours);
+        assert_eq!(silent_source(&recording), None);
+    }
+
+    #[test]
+    fn summary_counts_held_buttons_and_their_sets() {
+        let recording = Recording {
+            samples: vec![
+                sample(Source::Ours, Buttons::default()),
+                sample(Source::Ours, Buttons::SECONDARY),
+                sample(
+                    Source::Ours,
+                    Buttons::SECONDARY.with(Buttons::PRIMARY, true),
+                ),
+                sample(Source::Ours, Buttons::SECONDARY),
+            ],
+            ..Recording::default()
+        };
+        let summary = summarise(&recording).expect("writing to a String can't fail");
+        assert!(
+            summary.contains("buttons: 3 of 4 samples with any held; sets seen (mask): 2, 3"),
+            "{summary}"
+        );
+    }
 }
