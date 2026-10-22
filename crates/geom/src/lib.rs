@@ -14,3 +14,9 @@ pub use key::{
 };
 mod correction;
 pub use correction::{CorrectionError, CorrectionTile};
+mod mesh;
+mod sphere;
+mod topology;
+pub use mesh::{BaseMesh, MeshError};
+pub use sphere::cube_sphere;
+pub use topology::{Topology, VertexCopy};
