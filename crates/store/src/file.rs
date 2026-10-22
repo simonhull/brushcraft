@@ -710,13 +710,6 @@ impl ProjectFile {
 
     /// A reader for other threads. It reads this open file while it stays open, and doesn't keep
     /// it (or its lock) open after this `ProjectFile` is dropped.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "prefetch workers (next in M0b2) are the first users"
-        )
-    )]
     pub(crate) fn reader(&self) -> FileReader {
         FileReader {
             file: Arc::downgrade(&self.file),
@@ -849,13 +842,6 @@ impl ProjectFile {
 /// [`ProjectFile`] is dropped, the file closes and its lock is released (after any read in
 /// flight, which holds the file for its duration), and reads fail with [`StoreError::Closed`].
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "prefetch workers (next in M0b2) are the first users"
-    )
-)]
 pub(crate) struct FileReader {
     /// The owner's open file, upgraded for the length of each read.
     file: Weak<File>,
@@ -871,13 +857,6 @@ impl FileReader {
     /// decompress; [`StoreError::NotDisplacement`], [`StoreError::WrongSide`],
     /// [`StoreError::Codec`] as for [`ProjectFile::read_displacement`]; [`StoreError::Closed`] if
     /// the [`ProjectFile`] has been dropped; [`StoreError::Io`]. On error `slot` holds no tile.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "prefetch workers (next in M0b2) are the first users"
-        )
-    )]
     pub(crate) fn read_displacement_into(
         &self,
         key: &TileKey,

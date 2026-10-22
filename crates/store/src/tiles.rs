@@ -8,7 +8,9 @@
 //!
 //! Everything here belongs to one thread: the one calling the store. Pins are held by
 //! [`PinGuard`]s, which may be dropped anywhere on that thread; the store applies the unpins at
-//! its next call.
+//! its next call. The one exception is prefetch: [`TileStore::prefetch`] hands record locations
+//! to worker threads (see [`crate::prefetch`]), which read and decode on their own and send the
+//! tiles back for [`TileStore::poll`] to install.
 //!
 //! # Budget
 //!
@@ -20,7 +22,7 @@
 //! chunk without a pin is left.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -38,6 +40,7 @@ use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{ProjectFile, ReadScratch, StoreError};
 use crate::op::{OpId, RESERVED_SITE};
 use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotId};
+use crate::prefetch::{Fetched, Job, Prefetcher};
 use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 
 /// How a [`TileStore`] is set up.
@@ -144,7 +147,7 @@ type Pinned = (SlotId<EvaluatedSlot>, SlotId<CorrectionSlot>);
 /// Evaluated tiles an evaluation pinned, with their keys: what its [`Resident`] source reads.
 type Held = Vec<(TileKey, SlotId<EvaluatedSlot>)>;
 
-/// What the store computed, for tests that count re-evaluations.
+/// What the store computed and read, for tests that count re-evaluations and file reads.
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct EvalLog {
@@ -152,6 +155,9 @@ struct EvalLog {
     positions: Vec<TileKey>,
     /// Tiles whose normals were computed, in order.
     normals: Vec<TileKey>,
+    /// Correction tiles the owner thread looked up in the working file, in order (prefetch
+    /// workers' reads aren't counted).
+    file_reads: Vec<TileKey>,
 }
 
 /// A project held out of core: the base mesh, the working file, budgeted pools of correction and
@@ -161,6 +167,9 @@ struct EvalLog {
 /// is named by the displacement tile at the same position. Level 0 is the base mesh, never a
 /// tile.
 pub struct TileStore {
+    /// The prefetch workers. Declared first, so they are stopped and joined (when the store is
+    /// dropped) before anything else goes, the working file included.
+    prefetch: Prefetcher,
     /// The base mesh: level 0 and the topology.
     mesh: Arc<BaseMesh>,
     /// The working file: correction tiles are read from it and written back to it.
@@ -209,6 +218,7 @@ impl std::fmt::Debug for TileStore {
             .field("evaluated", &self.evaluated)
             .field("unsaved", &self.unsaved.len())
             .field("pin_sets", &self.pin_sets.len())
+            .field("prefetching", &self.prefetch.pending())
             .finish_non_exhaustive()
     }
 }
@@ -327,6 +337,7 @@ impl TileStore {
         let mut feed = ChangeFeed::new();
         let save_consumer = feed.subscribe();
         Ok(Self {
+            prefetch: Prefetcher::new(),
             mesh,
             file,
             budget: Budget::new(config.budget_bytes),
@@ -374,6 +385,7 @@ impl TileStore {
     /// [`CacheError::Pool`] if no slot can be had.
     pub fn correction(&mut self, key: TileKey) -> Result<CorrectionView<'_>, CacheError> {
         self.sync_pins()?;
+        self.poll()?;
         self.check_key(&key)?;
         let id = self.load_correction(key)?;
         Ok(self.corrections.get(id).ok_or(PoolError::Stale)?.view()?)
@@ -401,6 +413,7 @@ impl TileStore {
         op: OpId,
     ) -> Result<(), CacheError> {
         self.sync_pins()?;
+        self.poll()?;
         if !c.is_finite() {
             return Err(CorrectionError::NotFinite.into());
         }
@@ -454,6 +467,7 @@ impl TileStore {
     /// (not for a valid mesh).
     pub fn evaluate(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
         self.sync_pins()?;
+        self.poll()?;
         self.check_key(&key)?;
         let id = self.ensure_positions(key)?;
         let slot = self.evaluated.get(id).ok_or(PoolError::Stale)?;
@@ -469,6 +483,7 @@ impl TileStore {
     /// As [`TileStore::evaluate`].
     pub fn normals(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
         self.sync_pins()?;
+        self.poll()?;
         self.check_key(&key)?;
         let id = self.ensure_normals(key)?;
         let slot = self.evaluated.get(id).ok_or(PoolError::Stale)?;
@@ -488,6 +503,7 @@ impl TileStore {
     /// [`CacheError::NotATile`]; [`CacheError::OverBudget`]; as [`TileStore::evaluate`].
     pub fn pin(&mut self, keys: &[TileKey]) -> Result<PinGuard, CacheError> {
         self.sync_pins()?;
+        self.poll()?;
         let keys: BTreeSet<TileKey> = keys.iter().copied().collect();
         for key in &keys {
             self.check_key(key)?;
@@ -570,6 +586,91 @@ impl TileStore {
         self.sync_pins()?;
         self.give_back(bytes)?;
         Ok(())
+    }
+
+    /// Asks the prefetch workers to read the correction tiles of `keys` from the working file in
+    /// the background, ahead of the store's use of them; returns how many reads were queued.
+    ///
+    /// Tiles already resident, absent from the file (all zero) or already on their way are
+    /// skipped. This call's tiles are read before those of earlier calls still waiting, in the
+    /// order given. They are installed by [`TileStore::poll`], which every method that reads
+    /// corrections calls first. The workers start on the first call that queues anything.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::NotATile`], before anything is queued; [`CacheError::Store`] if the
+    /// workers can't be started; [`CacheError::Pool`] as for [`TileStore::evaluate`] (a pin
+    /// guard's release).
+    pub fn prefetch(&mut self, keys: &[TileKey]) -> Result<usize, CacheError> {
+        self.sync_pins()?;
+        for key in keys {
+            self.check_key(key)?;
+        }
+        let mut seen = HashSet::with_capacity(keys.len());
+        let jobs: Vec<Job> = keys
+            .iter()
+            .filter(|&&key| seen.insert(key) && self.corrections.find(&key).is_none())
+            .filter_map(|&key| {
+                let loc = self.file.locate(&key)?;
+                Some(Job { key, loc })
+            })
+            .collect();
+        Ok(self.prefetch.request(&self.file, &jobs)?)
+    }
+
+    /// Installs the correction tiles the prefetch workers have finished, and returns how many.
+    ///
+    /// A finished tile is installed only if it is still wanted and still current: not resident
+    /// (a resident tile may have been edited since, and is what the store uses either way), its
+    /// record still the latest (any write of the tile, by an edit's write-back or a save, moves
+    /// it), and a slot to be had without failing (prefetch never takes a pinned slot). Anything
+    /// else is dropped, as is a tile a worker couldn't read: a later load reads it again and
+    /// reports the error.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Pool`] with [`PoolError::WriteBack`] if making room wrote a dirty tile back
+    /// and that failed; the results not reached yet wait for the next poll.
+    pub fn poll(&mut self) -> Result<usize, CacheError> {
+        let mut installed = 0;
+        while let Some(Fetched { job, slot }) = self.prefetch.next() {
+            let Ok(slot) = slot else { continue };
+            let current = self.file.locate(&job.key) == Some(job.loc);
+            let outcome = if current {
+                self.install(job.key, &slot)
+            } else {
+                Ok(false)
+            };
+            self.prefetch.recycle(slot);
+            if outcome? {
+                installed += 1;
+            }
+        }
+        Ok(installed)
+    }
+
+    /// Prefetch requests not yet answered: queued, being read, or finished and waiting for
+    /// [`TileStore::poll`].
+    #[must_use]
+    pub fn prefetching(&self) -> usize {
+        self.prefetch.pending()
+    }
+
+    /// Puts a prefetched correction tile, read at its latest record, into a fresh slot; whether
+    /// it did. A resident tile ([`PoolError::Present`]; every dirty tile is resident) is left
+    /// alone, and a full pool ([`PoolError::Full`]) just drops the tile.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Pool`] with [`PoolError::WriteBack`], as for [`TileStore::poll`].
+    fn install(&mut self, key: TileKey, tile: &CorrectionSlot) -> Result<bool, CacheError> {
+        let id = match self.acquire_correction(key) {
+            Ok(id) => id,
+            Err(CacheError::Pool(PoolError::Present | PoolError::Full)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        *self.corrections.get_mut(id).ok_or(PoolError::Stale)? = *tile;
+        Ok(true)
     }
 
     /// Applies the unpins of dropped [`PinGuard`]s.
@@ -678,6 +779,8 @@ impl TileStore {
             return Ok(id);
         }
         let id = self.acquire_correction(key)?;
+        #[cfg(test)]
+        self.log.file_reads.push(key);
         let slot = self.corrections.get_mut(id).ok_or(PoolError::Stale)?;
         let filled = match self
             .file

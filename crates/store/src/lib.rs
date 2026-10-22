@@ -13,6 +13,7 @@ mod feed;
 mod file;
 mod op;
 mod pool;
+mod prefetch;
 mod record;
 mod slot;
 #[cfg(test)]
