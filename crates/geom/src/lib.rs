@@ -7,3 +7,8 @@ mod math;
 mod test_rng;
 
 pub use math::Vec3;
+mod key;
+pub use key::{
+    Channel, FaceId, LayerId, Level, LevelOutOfRange, MAX_LEVEL, Region, TILE_QUADS, TileKey,
+    TileOutOfRange,
+};
