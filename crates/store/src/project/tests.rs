@@ -576,6 +576,72 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
     );
 }
 
+/// One stroke whose flush fails to sync.
+///
+/// Begun, `count` random edits with `seed` applied as its dabs to the project's store and to
+/// `map`, the writer's next sync made to fail, and ended. The flushes of earlier strokes finish
+/// first, so the sync that fails is this one's.
+fn stroke_failing_its_sync(project: &mut Project, map: &mut CorrectionMap, count: u32, seed: u64) {
+    project.finish_flushes().unwrap();
+    let edits = random_edits(&project.store().working().mesh(), TOP, count, seed);
+    project.begin_stroke().unwrap();
+    apply_dabs(project.store(), map, &edits);
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    project.end_stroke().unwrap();
+}
+
+/// A close whose last flush fails to sync rolls over first, so the recovery file it keeps
+/// holds the stroke that ended just before it: for a project never saved, and a saved one.
+#[test]
+fn a_close_whose_last_sync_fails_keeps_the_ended_stroke() {
+    for saved in [false, true] {
+        let dir = TestDir::new();
+        let mesh = mesh();
+        let mut map = CorrectionMap::new();
+        let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+        stroke(&mut project, &mut map, 80, 151);
+        if saved {
+            project.save_as(&dir.path("p.bcrf")).unwrap();
+        }
+        stroke_failing_its_sync(&mut project, &mut map, 80, 152);
+        let failed = project.recovery_path().to_path_buf();
+        project.close(true).unwrap();
+        assert!(
+            !failed.exists(),
+            "{saved}: the file that failed to sync is gone"
+        );
+        let candidates = find_recoveries(&dir.path("recovery")).unwrap();
+        let [candidate] = candidates.as_slice() else {
+            panic!("{saved}: one recovery file: {candidates:?}");
+        };
+        let mut restored = Project::restore(candidate, config(&dir)).unwrap();
+        assert_positions(
+            restored.store(),
+            &dense(&mesh, &map),
+            &tiles(&mesh, 1, TOP),
+            "every stroke, the one whose sync failed too",
+        );
+    }
+}
+
+/// A close that deletes the recovery file, whose last flush fails to sync, rolls over and then
+/// deletes the new file: nothing is left behind.
+#[test]
+fn a_close_whose_last_sync_fails_still_deletes_the_recovery_file() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 80, 161);
+    project.save_as(&path).unwrap();
+    let saved = map.clone();
+    stroke_failing_its_sync(&mut project, &mut map, 80, 162);
+    project.close(false).unwrap();
+    assert_eq!(recovery_files(&dir), Vec::<String>::new(), "all deleted");
+    assert_project_file(&path, &saved, "the project file holds the save");
+}
+
 /// One stroke of one dab: begun, `c` set at an interior vertex of `key` (one copy, so a tile
 /// lost to a save or a roll-over leaves no twin disagreeing) in the project's store and in
 /// each of `maps`, and ended.

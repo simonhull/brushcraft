@@ -624,20 +624,27 @@ impl Project {
     /// which the app asks for; this obeys the flag. Without it, edits since the last save are
     /// gone.
     ///
+    /// The last flushes go through the roll-over as a save's do: a writer that has failed, or
+    /// whose last sync fails, moves every edit to a new recovery file at once, and that is the
+    /// file kept (or deleted).
+    ///
     /// # Errors
     ///
-    /// [`ProjectError::Recovery`] if the last flushes fail: the recovery file is kept then,
-    /// whatever `keep_recovery` says. [`ProjectError::Io`] or [`ProjectError::Store`] if it
-    /// can't be deleted. [`ProjectError::Unprotected`] once closed, if a kept recovery file
-    /// lacks the latest edits of some tiles.
+    /// [`ProjectError::Recovery`] if the last flushes fail, or as [`Project::roll_over`] if
+    /// moving to a new recovery file does: the recovery file is kept then, whatever
+    /// `keep_recovery` says. [`ProjectError::Io`] or [`ProjectError::Store`] if it can't be
+    /// deleted. [`ProjectError::Unprotected`] once closed, if a kept recovery file lacks the
+    /// latest edits of some tiles.
     pub fn close(mut self, keep_recovery: bool) -> Result<(), ProjectError> {
-        // A failed writer rolls over first, so the file kept holds every edit.
-        self.with_writer(|_, _| Ok(()), Retry::Now)?;
+        let finished = self.finish_flushes();
         if let Some(mut writer) = self.writer.take() {
-            let finished = writer.finish(&mut self.store, Instant::now());
             self.unreported.extend(writer.take_skipped());
+            // Its flushes are done, or failed for good: closing releases its subscription.
             let closed = writer.close(&mut self.store, Instant::now());
-            finished.and(closed)?;
+            finished?;
+            closed?;
+        } else {
+            finished?;
         }
         if !keep_recovery {
             fs::remove_file(&self.recovery_path)?;
