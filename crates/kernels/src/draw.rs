@@ -13,6 +13,16 @@ use crate::math::{distance_squared, sqrt};
 /// to the `z` of the vertex's correction. A point exactly on the rim gets `0` and doesn't count.
 /// A `radius` that isn't positive and finite covers nothing: `out` is zeroed and the count is 0.
 ///
+/// The weight's argument is `t = sqrt(d²) / radius`, a quotient, not `d²` scaled by a
+/// precomputed `1 / radius²`, so every positive, finite radius gives the right falloff: a
+/// radius so large its square overflows (above about `1.8e19`) still fades to the rim, and one
+/// so small its reciprocal square overflows (below about `1e-19`) still gives full strength at
+/// the centre. Which points count as inside is decided on `d² < radius²`, so a radius whose
+/// square underflows to zero (below about `1e-23`) covers nothing, a point whose squared
+/// distance overflows (beyond about `1.8e19`) is outside whatever the radius, and below a
+/// radius of about `1e-19` the squared distances are subnormal and the falloff loses precision
+/// (about `1e-5` at `1e-20`). Models are nowhere near either end.
+///
 /// `positions` and `out` should have the same length. If they don't, only the shorter prefix is
 /// processed (the rest of `out` is left as it was); the kernel never panics.
 ///
@@ -42,13 +52,12 @@ pub fn draw<F: Falloff>(
         return 0;
     }
     let radius_squared = radius * radius;
-    let inv_radius_squared = radius_squared.recip();
     let mut inside = 0;
     for (&p, o) in pairs {
         let d2 = distance_squared(p, center);
         *o = if d2 < radius_squared {
             inside += 1;
-            strength * falloff.weight(sqrt(d2 * inv_radius_squared))
+            strength * falloff.weight(sqrt(d2) / radius)
         } else {
             0.0
         };
@@ -173,5 +182,40 @@ mod tests {
             );
             assert_eq!(out, [0.0; 2], "radius {radius} zeroes out");
         }
+    }
+
+    #[test]
+    fn a_tiny_radius_still_fades_from_the_centre() {
+        // 1e-20 squares to a normal float, but its reciprocal square would overflow. Half
+        // strength halfway out to 1e-4 only: the squared distances there are subnormal.
+        let radius = 1e-20_f32;
+        let positions = [[0.0; 3], [radius / 2.0, 0.0, 0.0], [radius * 2.0, 0.0, 0.0]];
+        let mut out = [9.0; 3];
+        let inside = draw(&Smoothstep, [0.0; 3], radius, 1.0, &positions, &mut out);
+        assert_eq!(inside, 2, "the centre and halfway");
+        assert!(
+            (out[0] - 1.0).abs() < 1e-7,
+            "full strength at the centre: {out:?}"
+        );
+        assert!((out[1] - 0.5).abs() < 1e-4, "half halfway: {out:?}");
+        assert!(out[2] == 0.0, "nothing outside: {out:?}");
+    }
+
+    #[test]
+    fn a_radius_whose_square_overflows_still_fades() {
+        // 1e20 squares to infinity; a tenth of the way out the falloff is 1 − (3t² − 2t³).
+        let radius = 1e20_f32;
+        let positions = [[0.0; 3], [radius / 10.0, 0.0, 0.0]];
+        let mut out = [9.0; 2];
+        let inside = draw(&Smoothstep, [0.0; 3], radius, 1.0, &positions, &mut out);
+        assert_eq!(inside, 2, "both inside");
+        assert!(
+            (out[0] - 1.0).abs() < 1e-7,
+            "full strength at the centre: {out:?}"
+        );
+        assert!(
+            (out[1] - 0.972).abs() < 1e-5,
+            "faded a tenth of the way: {out:?}"
+        );
     }
 }
