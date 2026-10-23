@@ -7,11 +7,14 @@
 //! on the surface by a raycast from the origin. Every dab is one [`sculpt::draw_step`], timed
 //! as a whole (the latency reported, p50 and p99) and by its phases (the means reported).
 //!
-//! The stroke runs warm: planning it ([`Plan::new`]) raycasts every dab's centre first, then
-//! evaluates every tile the dabs' spheres reach, positions and normals, so the steps find their
-//! tiles resident and evaluated (as an app's do, the view having drawn them). The index is
-//! loaded from the project's stored bounds, which evaluates nothing, so this warm-up is the
-//! stroke's own. What a cold region costs is `page-in`'s measure.
+//! The stroke runs warm: planning it ([`Plan::cold`]) raycasts every dab's centre first, then
+//! [`Plan::warm`] evaluates every tile the dabs' spheres reach, positions and normals, so the steps
+//! find their tiles resident and evaluated (as an app's do, the view having drawn them). The index
+//! is loaded from the project's stored bounds, which evaluates nothing, so this warm-up is the
+//! stroke's own (since 38eab39; before, building the index on open warmed it). Before the warm-up,
+//! `brush` times one dab where the stroke starts, cold, and reports it beside the warm stroke
+//! (`cold_first_dab_ms`): what a stroke's first dab costs over a region the view hasn't drawn.
+//! What a cold region costs in full is `page-in`'s measure.
 //!
 //! Loading the spatial index comes first, and is reported apart: from the bounds `generate`
 //! saved with the tiles, it evaluates no tile (a project without them has all 153,600 level-9
@@ -60,15 +63,30 @@ pub(crate) struct Plan {
 
 impl Plan {
     /// A stroke of `steps` dabs starting in `direction` from the origin, with a brush of
-    /// `size` (see the module notes).
+    /// `size` (see the module notes), warm: [`Plan::cold`], then [`Plan::warm`].
     ///
-    /// Finding the dabs' centres raycasts the path, and every tile a dab's sphere reaches is then
-    /// evaluated, positions and normals, together: the stroke runs warm.
+    /// # Errors
+    ///
+    /// As [`Plan::cold`] and [`Plan::warm`].
+    pub(crate) fn new(
+        project: &mut Project,
+        index: &SpatialIndex,
+        direction: Vec3,
+        size: Size,
+        steps: usize,
+    ) -> Result<Self> {
+        let plan = Self::cold(project, index, direction, size, steps)?;
+        plan.warm(project, index)?;
+        Ok(plan)
+    }
+
+    /// The stroke [`Plan::new`] plans, without the warm-up: finding the dabs' centres raycasts
+    /// the path, which evaluates the positions of the tiles the rays reach, and nothing more.
     ///
     /// # Errors
     ///
     /// If a tile can't be evaluated, or a raycast finds no surface.
-    pub(crate) fn new(
+    pub(crate) fn cold(
         project: &mut Project,
         index: &SpatialIndex,
         direction: Vec3,
@@ -86,24 +104,35 @@ impl Plan {
         let centres = path(direction, STEP_RADII * radius, steps)
             .map(|d| on_surface(index, store, d))
             .collect::<Result<Vec<_>>>()?;
-        let reached: BTreeSet<TileKey> = centres
+        Ok(Self { radius, centres })
+    }
+
+    /// Evaluates every tile a dab's sphere reaches, positions and normals, together: the stroke
+    /// then runs warm, as an app's does over tiles its view has drawn.
+    ///
+    /// # Errors
+    ///
+    /// If a tile can't be evaluated.
+    pub(crate) fn warm(&self, project: &mut Project, index: &SpatialIndex) -> Result<()> {
+        let reached: BTreeSet<TileKey> = self
+            .centres
             .iter()
-            .flat_map(|&centre| index.query_sphere(centre, radius))
+            .flat_map(|&centre| index.query_sphere(centre, self.radius))
             .collect();
         let reached: Vec<TileKey> = reached.into_iter().collect();
-        store
+        project
+            .store()
             .evaluate_many(&reached, Evaluation::Normals)
-            .context("warming the stroke's tiles")?;
-        Ok(Self { radius, centres })
+            .context("warming the stroke's tiles")
     }
 }
 
 /// Opens the project, loads its index and plans the stroke `options` asks for, reporting as
-/// `bench`.
+/// `bench`, without warming it ([`Plan::cold`]).
 ///
 /// # Errors
 ///
-/// As [`session::open`], [`session::load_index`] and [`Plan::new`].
+/// As [`session::open`], [`session::load_index`] and [`Plan::cold`].
 fn prepare<J: Write, H: Write>(
     options: &Options,
     paths: &Paths,
@@ -114,7 +143,7 @@ fn prepare<J: Write, H: Write>(
     let mut project = session::open(options, paths)?;
     let index = session::load_index(&mut project, level, bench, out)?;
     let direction = Rng::new(options.seed).direction();
-    let plan = Plan::new(
+    let plan = Plan::cold(
         &mut project,
         &index,
         direction,
@@ -140,6 +169,17 @@ pub(crate) fn run<J: Write, H: Write>(
         plan.centres.len(),
         plan.radius
     ))?;
+    // A dab where the stroke starts, before its tiles are evaluated: what the first dab of a
+    // stroke over a region the view hasn't drawn costs. Then the warm-up, and the stroke.
+    let cold = session::stroke(
+        &mut project,
+        &mut index,
+        plan.centres.get(..1).unwrap_or_default(),
+        plan.radius,
+        options.strength,
+    )?;
+    let cold_ms = cold.first().map_or(0.0, |dab| ms(dab.wall));
+    plan.warm(&mut project, &index)?;
     let dabs = session::stroke(
         &mut project,
         &mut index,
@@ -153,10 +193,14 @@ pub(crate) fn run<J: Write, H: Write>(
             .with("steps", dabs.len())
             .with("radius", f64::from(plan.radius))
             .with("footprint_target", options.footprint)
-            .with("budget_mib", options.budget_mib),
+            .with("budget_mib", options.budget_mib)
+            .with("cold_first_dab_ms", cold_ms),
         &dabs,
     ))?;
-    out.say(&format!("brush: {}", session::describe(&dabs)))?;
+    out.say(&format!(
+        "brush: {}; cold first dab {cold_ms:.2} ms",
+        session::describe(&dabs)
+    ))?;
     project.close(false).context("closing the project")?;
     Ok(())
 }
@@ -214,6 +258,7 @@ pub(crate) fn run_save<J: Write, H: Write>(
     out: &mut Output<J, H>,
 ) -> Result<()> {
     let (mut project, mut index, plan) = prepare(options, paths, "save", out)?;
+    plan.warm(&mut project, &index)?;
     // Every tile a dab can reach: the corrections that may change.
     let mut reached: Vec<TileKey> = plan
         .centres

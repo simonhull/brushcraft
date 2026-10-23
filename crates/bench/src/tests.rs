@@ -193,6 +193,10 @@ fn brush_times_a_stroke_after_loading_the_index() {
         "five steps: {stroke}"
     );
     assert!(number(stroke, "step_p99_ms") > 0.0, "a latency: {stroke}");
+    assert!(
+        number(stroke, "cold_first_dab_ms") > 0.0,
+        "a cold first dab: {stroke}"
+    );
     let vertices = number(stroke, "vertices_mean");
     assert!(
         (1500.0..6000.0).contains(&vertices),

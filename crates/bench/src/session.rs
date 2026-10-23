@@ -57,7 +57,7 @@ pub(crate) fn level(options: &Options) -> Result<Level> {
 ///
 /// A project `generate` made at this level keeps every bound, and loads without evaluating a
 /// tile. One saved without them (or at another level) has every tile evaluated, positions and
-/// normals: on the benchmark sphere that is 153,600 level-9 tiles, about fifteen seconds.
+/// normals: on the benchmark sphere that is 153,600 level-9 tiles, 14.3 s on a quiet dev box.
 ///
 /// # Errors
 ///
