@@ -565,16 +565,27 @@ fn max_abs(v: Vec3) -> f32 {
     v.x.abs().max(v.y.abs()).max(v.z.abs())
 }
 
-/// `x` in steps of `scale`, rounded and clamped to `±32767`; zero for a zero scale.
+/// `x` in steps of `scale`, rounded half away from zero and clamped to `±32767`; zero for a
+/// zero scale.
+///
+/// The same as `(x / scale).round().clamp(-Q_MAX, Q_MAX) as i16`, without [`f32::round`],
+/// which is a library call on targets without a rounding instruction (x86-64 before SSE4.1):
+/// clamping first changes nothing, as rounding is monotonic and the bounds are whole; the cast
+/// truncates toward zero, and the fraction left, `v - trunc(v)`, is exact for `|v| < 2²³`, so
+/// comparing it with `±0.5` decides the rounding exactly. (A NaN casts to 0 either way.) Checked
+/// against the library rounding for every `f32` at scale 1.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "rounded and clamped to ±32767 first"
+    reason = "clamped to ±32767 first; the cast truncates toward zero, as intended"
 )]
 fn quantize(x: f32, scale: f32) -> i16 {
     if scale <= 0.0 {
         return 0;
     }
-    (x / scale).round().clamp(-Q_MAX, Q_MAX) as i16
+    let v = (x / scale).clamp(-Q_MAX, Q_MAX);
+    let toward_zero = v as i16;
+    let fraction = v - f32::from(toward_zero);
+    toward_zero + i16::from(fraction >= 0.5) - i16::from(fraction <= -0.5)
 }
 
 /// A quantized interior value back in tangent-frame units.
@@ -591,6 +602,51 @@ fn decode(q: [i16; 3], scale: f32) -> Vec3 {
 mod tests {
     use super::*;
     use crate::test_rng::Rng;
+
+    /// What [`quantize`] must give: the library's rounding, then the clamp.
+    #[expect(clippy::cast_possible_truncation, reason = "rounded and clamped first")]
+    fn quantize_by_rounding(x: f32, scale: f32) -> i16 {
+        if scale <= 0.0 {
+            return 0;
+        }
+        (x / scale).round().clamp(-Q_MAX, Q_MAX) as i16
+    }
+
+    #[test]
+    fn quantize_rounds_half_away_from_zero_as_the_library_does() {
+        let mut values = vec![
+            0.0,
+            -0.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            Q_MAX,
+            Q_MAX + 0.5,
+            32_766.5,
+            65_535.0,
+        ];
+        // Each half, and the floats either side of it, across the whole range.
+        for k in (-32_768..=32_768).step_by(97).chain(-3..=3) {
+            #[expect(clippy::cast_precision_loss, reason = "|k| < 2^24 converts exactly")]
+            let half = k as f32 + 0.5;
+            values.extend([half, half.next_up(), half.next_down()]);
+        }
+        let mut rng = Rng::new(0x0071_7AB5);
+        values.extend((0..100_000).map(|_| rng.signed() * 40_000.0));
+        for scale in [1.0, 0.25, 3.0e-5, 1.0e-7, 7.0] {
+            for &v in &values {
+                let x = v * scale;
+                assert_eq!(
+                    quantize(x, scale),
+                    quantize_by_rounding(x, scale),
+                    "{x:e} at scale {scale:e}"
+                );
+            }
+        }
+        assert_eq!(quantize(1.0, 0.0), 0, "zero scale");
+    }
 
     #[test]
     fn slots_are_a_bijection_onto_the_storage() {
