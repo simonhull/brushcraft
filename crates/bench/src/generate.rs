@@ -29,7 +29,6 @@ use crate::noise::ValueNoise;
 use crate::paths::Paths;
 use crate::report::{Output, Record, mib, ms};
 use crate::session;
-use crate::surface::owns;
 use crate::sys::{Rss, reset_peak};
 
 /// How often, in tiles, the generator ticks the project ([`Project::tick`]).
@@ -226,7 +225,7 @@ fn sculpt_tile(
     let topology = store.mesh().topology();
     let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
     for ((i, j), &p) in grid.zip(positions.iter()) {
-        if owns(topology, &key, i, j) {
+        if topology.owns(&key, i, j) {
             writes.push((i, j, octave.push(noise, p)));
         }
     }

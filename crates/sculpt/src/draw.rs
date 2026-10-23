@@ -27,14 +27,14 @@
 //! its position and correction, and the copies agree bit for bit. Each of those tiles is a
 //! candidate, and its kernel finds the vertex within the radius with the same delta. Adding the
 //! delta once per copy would push the vertex once per tile that holds it, so exactly one copy
-//! edits it: the least of its copies (see [`owns`]). `edit_tile` then writes the new value into
-//! every copy.
+//! edits it: the least of its copies (see [`geom::Topology::owns`]). `edit_tile` then writes the
+//! new value into every copy.
 
 use std::collections::BTreeSet;
 use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
-use geom::{EvalError, Region, TileKey, Topology, Vec3, normal_tiles};
+use geom::{EvalError, Region, TileKey, Vec3, normal_tiles};
 use kernels::Smoothstep;
 use store::{CacheError, IndexError, Project, SpatialIndex, TileEdit, TileStore};
 use thiserror::Error;
@@ -296,7 +296,8 @@ pub fn draw_step(
 }
 
 /// The kernel phase: runs the draw kernel over the evaluated positions of every tile of `keys`
-/// (pinned, so cached), and keeps the deltas of the vertices each tile owns (see [`owns`]).
+/// (pinned, so cached), and keeps the deltas of the vertices each tile owns (see
+/// [`geom::Topology::owns`]).
 ///
 /// # Errors
 ///
@@ -325,7 +326,7 @@ fn run_kernel(
         found.reached.push(key);
         let topology = store.mesh().topology();
         for ((i, j), delta) in vertices(key.side()).zip(&mut deltas) {
-            if *delta != 0.0 && !owns(topology, &key, i, j) {
+            if *delta != 0.0 && !topology.owns(&key, i, j) {
                 *delta = 0.0;
             }
         }
@@ -352,26 +353,6 @@ fn add_deltas(edit: &mut TileEdit<'_>, deltas: &[f32]) -> Result<(), CacheError>
         }
     }
     Ok(())
-}
-
-/// Whether tile `key` owns its vertex `(i, j)`: whether the step edits the vertex through this
-/// tile, rather than through another tile holding a copy of it.
-///
-/// An interior vertex has one copy, and its tile owns it. A border vertex is owned by the least
-/// of its copies, ordered by face, tile row, tile column, then row and column within the tile:
-/// an order every copy computes alike, whichever tile asks.
-fn owns(topology: &Topology, key: &TileKey, i: u32, j: u32) -> bool {
-    let inner = 1..key.side() - 1;
-    if inner.contains(&i) && inner.contains(&j) {
-        return true;
-    }
-    let region = Region::of_tile(key);
-    let copies = topology.copies(key.face(), key.level(), region.x0() + i, region.y0() + j);
-    let least = copies
-        .iter()
-        .map(|copy| (copy.face.index(), copy.ty, copy.tx, copy.j, copy.i))
-        .min();
-    least.is_none_or(|least| least == (key.face().index(), key.ty(), key.tx(), j, i))
 }
 
 /// The tiles whose bounds an edit of the `reached` tiles may change, each once, in key order.

@@ -2,7 +2,7 @@
 //! a brush radius that covers a footprint, and the path a stroke follows.
 
 use anyhow::{Context as _, Result, anyhow};
-use geom::{BaseMesh, Level, Region, TileKey, Topology, Vec3};
+use geom::{BaseMesh, Level, TileKey, Vec3};
 use store::{Ray, SpatialIndex, TileStore};
 
 /// Every tile of `level` on `mesh` with an estimate of the direction of its centre from the
@@ -55,26 +55,6 @@ pub(crate) fn nearest_tiles(tiles: &[(TileKey, Vec3)], direction: Vec3, n: usize
         .take(n)
         .map(|(_, key)| key)
         .collect()
-}
-
-/// Whether tile `key` owns its vertex `(i, j)`: the one of the vertex's copies (one per tile
-/// holding it) that counts it, so a vertex on a tile border is counted, or written, once.
-///
-/// An interior vertex has one copy, and its tile owns it. A border vertex is owned by the least
-/// of its copies, ordered by face, tile row, tile column, then row and column within the tile:
-/// the order `sculpt`'s draw step uses, which every copy computes alike.
-pub(crate) fn owns(topology: &Topology, key: &TileKey, i: u32, j: u32) -> bool {
-    let inner = 1..key.side() - 1;
-    if inner.contains(&i) && inner.contains(&j) {
-        return true;
-    }
-    let region = Region::of_tile(key);
-    let copies = topology.copies(key.face(), key.level(), region.x0() + i, region.y0() + j);
-    let least = copies
-        .iter()
-        .map(|copy| (copy.face.index(), copy.ty, copy.tx, copy.j, copy.i))
-        .min();
-    least.is_none_or(|least| least == (key.face().index(), key.ty(), key.tx(), j, i))
 }
 
 /// Where the surface lies in `direction` from the origin, the centre of the closed benchmark

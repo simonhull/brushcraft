@@ -33,7 +33,7 @@ use crate::noise::Rng;
 use crate::paths::Paths;
 use crate::report::{Output, Record, mib, ms};
 use crate::session;
-use crate::surface::{calibrated_radius, on_surface, owns, path};
+use crate::surface::{calibrated_radius, on_surface, path};
 
 /// How far the brush moves each dab, in radii.
 const STEP_RADII: f32 = 0.1;
@@ -186,7 +186,7 @@ fn changed_vertices(
             let side = key.side();
             let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
             grid.zip(old.iter().zip(new))
-                .filter(|&((i, j), (a, b))| a != b && owns(topology, key, i, j))
+                .filter(|&((i, j), (a, b))| a != b && topology.owns(key, i, j))
                 .count()
         })
         .sum()

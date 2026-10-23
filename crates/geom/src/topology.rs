@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::mesh::fit;
-use crate::{Channel, FaceId, LayerId, Level, MAX_VALENCE, MeshError, TileKey, VertexId};
+use crate::{Channel, FaceId, LayerId, Level, MAX_VALENCE, MeshError, Region, TileKey, VertexId};
 
 /// What lies across one edge of a face: the neighbour and the index of the same edge in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +306,56 @@ impl Topology {
             }
         }
         copies
+    }
+
+    /// Whether tile `key` owns its vertex `(i, j)` (in the tile's own coordinates): whether, of
+    /// the vertex's copies (one per tile holding it, see [`Topology::copies`]), this is the one
+    /// that counts it, so that a vertex on a tile border is counted, or edited, exactly once.
+    ///
+    /// An interior vertex has one copy, and its tile owns it. A border vertex is owned by the
+    /// least of its copies, ordered by face, tile row, tile column, then row and column within
+    /// the tile: an order every copy computes alike, whichever tile asks. A vertex with no
+    /// copies (outside the tile, or of a face not in this mesh) is the asking tile's own.
+    ///
+    /// # Examples
+    ///
+    /// A cube corner is held by a tile of each of the three faces meeting there, and exactly
+    /// one of them owns it:
+    ///
+    /// ```
+    /// use geom::{FaceId, Level, TileKey, cube_sphere};
+    ///
+    /// let mesh = cube_sphere(1)?;
+    /// let topology = mesh.topology();
+    /// let level = Level::new(6)?;
+    /// let key = TileKey::displacement(FaceId::new(0), level, 0, 0)?;
+    /// assert!(
+    ///     topology.owns(&key, 5, 5),
+    ///     "an interior vertex is its tile's"
+    /// );
+    ///
+    /// let corner = topology.copies(FaceId::new(0), level, 0, 0);
+    /// assert_eq!(corner.len(), 3, "three faces meet at a cube corner");
+    /// let owners = corner
+    ///     .iter()
+    ///     .filter(|copy| topology.owns(&copy.key(level), copy.i, copy.j))
+    ///     .count();
+    /// assert_eq!(owners, 1, "one copy owns it");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn owns(&self, key: &TileKey, i: u32, j: u32) -> bool {
+        let inner = 1..key.side() - 1;
+        if inner.contains(&i) && inner.contains(&j) {
+            return true;
+        }
+        let region = Region::of_tile(key);
+        let copies = self.copies(key.face(), key.level(), region.x0() + i, region.y0() + j);
+        let least = copies
+            .iter()
+            .map(|copy| (copy.face.index(), copy.ty, copy.tx, copy.j, copy.i))
+            .min();
+        least.is_none_or(|least| least == (key.face().index(), key.ty(), key.tx(), j, i))
     }
 
     /// The owner's copy of face-grid vertex `(i, j)` of `face` (`n` quads per side): the lowest
