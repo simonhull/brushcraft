@@ -398,11 +398,14 @@ fn evaluating_many_equals_the_dense_evaluation_at_any_thread_count() {
     }
 }
 
-/// Wide batches near the minimum budget still find a correction slot to load into.
+/// Wide batches near the minimum budget leave the correction pool a chunk to load into.
 ///
-/// A batch whose cone pins every evaluated chunk fails and is halved. Without the
-/// correction floor (see [`TileStore::make_room`]) the failed batch takes every correction
-/// chunk back, and the one-tile batch it is halved to fails too, with nothing else pinned.
+/// A batch whose cone pins every evaluated chunk fails, and is halved. Without the correction
+/// floor (see [`TileStore::make_room`]) the failed batch takes every correction chunk back, and
+/// the one-tile batch it is halved to finds its coarsest level's pins in every evaluated chunk
+/// and no correction slot, and fails too, with nothing else pinned. The wide batch is run
+/// directly, so the test doesn't depend on how [`TileStore::batch_size`] sizes batches; then the
+/// public batched calls must go through.
 #[test]
 fn wide_batches_near_the_minimum_keep_a_correction_chunk() {
     let dir = TestDir::new();
@@ -411,12 +414,22 @@ fn wide_batches_near_the_minimum_keep_a_correction_chunk() {
     let finest = tiles(&mesh, TOP, TOP);
     let chunk = 4 * EVAL;
     let minimum = config(0, 4).minimum_budget(&mesh);
+    let mut refused = 0;
     for extra in 0..6 {
         let config = config(0, 4).with_budget_bytes(minimum + extra * chunk);
         let mut store = new_store(&dir, &format!("{extra}.bcp"), &mesh, config);
         let mut map = CorrectionMap::new();
         apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 21));
         let what = format!("{extra} chunks over the minimum");
+        match store.pin_current(finest.iter().copied().collect()) {
+            Ok(held) => store.unpin_held(&held).unwrap(),
+            Err(CacheError::Full) => refused += 1,
+            Err(e) => panic!("{what}: the wide batch: {e:?}"),
+        }
+        assert!(
+            store.corrections.bytes() >= store.corrections.chunk_bytes(),
+            "{what}: the correction pool kept a chunk"
+        );
         for _ in 0..2 {
             store
                 .evaluate_many(&all, Evaluation::Positions)
@@ -432,6 +445,7 @@ fn wide_batches_near_the_minimum_keep_a_correction_chunk() {
         let dense = dense(&mesh, &map);
         assert_positions(&mut store, &dense, &all, &what);
     }
+    assert!(refused > 0, "a wide batch ran out of room");
 }
 
 /// A batch is sized from the evaluated pool's reachable room: the budget less the correction
