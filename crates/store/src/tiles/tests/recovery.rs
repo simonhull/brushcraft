@@ -910,6 +910,106 @@ fn a_tile_left_out_of_a_flush_drops_what_was_evaluated_from_it() {
     assert_loads_as_built(&mut saved, level(TOP), "flushed after the broken tiles");
 }
 
+/// A tile left out of a flush while a pin holds its slot is filled again in place.
+///
+/// The slot is refilled from the tile's last record: an edit after the pin goes starts from what
+/// the file holds, never from the lost edit (whose quantization scale it would otherwise carry
+/// into the next save point).
+#[test]
+fn a_pinned_tile_left_out_of_a_flush_is_reloaded_in_place() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let keys: Vec<TileKey> = top.iter().copied().step_by(9).collect();
+    let no_op = keys[1];
+    let mut map = CorrectionMap::new();
+    for (n, key) in keys.iter().enumerate() {
+        let c = Vec3::new(0.0, 0.0, 0.01 * f32::from(u16::try_from(n + 1).unwrap()));
+        let mut lost = CorrectionMap::new();
+        let oracle = if *key == no_op { &mut lost } else { &mut map };
+        edit_interior(&mut store, oracle, *key, c);
+    }
+    // A large lost edit, so its quantization scale would show.
+    edit_interior(
+        &mut store,
+        &mut CorrectionMap::new(),
+        no_op,
+        Vec3::new(0.0, 0.0, 0.5),
+    );
+    let pin = store.pin(&[no_op]).unwrap();
+    store.unsaved.remove(&no_op);
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    assert_eq!(writer.take_skipped(), [no_op], "left out");
+    let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    edit_interior(&mut store, &mut map, keys[0], Vec3::new(0.0, 0.02, 0.0));
+    index.update(&mut store, &top).unwrap();
+    drop(pin);
+    // A small edit at the lost edit's vertex, after the pin goes.
+    edit_interior(&mut store, &mut map, no_op, Vec3::new(0.0, 0.0, 0.001));
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    let offset = writer.durable_save_point().unwrap();
+    drop(writer);
+    drop(store);
+    assert_save_point(&path, offset, &mesh, &map);
+    let file = ProjectFile::open_at(&path, offset).unwrap();
+    let mut saved = TileStore::open(file, roomy()).unwrap();
+    assert_loads_as_built(&mut saved, level(TOP), "flushed after the pinned lost tile");
+}
+
+/// A broken slot lost to a roll-over while a pin holds it is filled again in place.
+///
+/// It is refilled from the new file (which lacks the tile): no longer broken, and an edit after
+/// the pin goes starts from there.
+#[test]
+fn a_pinned_broken_slot_lost_to_a_roll_over_is_reloaded_in_place() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let top = tiles(&mesh, TOP, TOP);
+    let (broken, kept) = (top[5], top[30]);
+    let mut want = CorrectionMap::new();
+    edit_interior(
+        &mut store,
+        &mut CorrectionMap::new(),
+        broken,
+        Vec3::new(0.0, 0.0, 0.5),
+    );
+    edit_interior(&mut store, &mut want, kept, Vec3::new(0.25, 0.0, 0.0));
+    let pin = store.pin(&[broken]).unwrap();
+    let id = store.corrections.find(&broken).unwrap();
+    store.corrections.get_mut(id).unwrap().side = 0;
+    let meta = store.file.meta().clone();
+    let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
+    let filled = store.fill_roll_over(fresh).unwrap();
+    let (old, lost) = store.roll_over(filled).unwrap();
+    drop(old);
+    assert_eq!(lost, [broken], "listed as lost");
+    assert_eq!(
+        store
+            .corrections
+            .is_dirty(store.corrections.find(&broken).unwrap()),
+        Some(false),
+        "kept, clean, while pinned"
+    );
+    drop(pin);
+    edit_interior(&mut store, &mut want, broken, Vec3::new(0.0, 0.0, 0.001));
+    store.save().unwrap();
+    drop(store);
+    let file = ProjectFile::open(&dir.path("fresh.bcrf")).unwrap();
+    let mut reopened = TileStore::open(file, roomy()).unwrap();
+    assert_positions(
+        &mut reopened,
+        &dense(&mesh, &want),
+        &tiles(&mesh, 1, TOP),
+        "the edit after the pin, from the new file's state",
+    );
+}
+
 /// A roll-over to a new recovery file carries every edit across, dirty or only in the file, and
 /// lists the one tile whose damaged record it cannot read; a flush in flight is abandoned.
 #[test]

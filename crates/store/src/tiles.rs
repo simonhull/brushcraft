@@ -1455,8 +1455,9 @@ impl TileStore {
     /// records are no longer needed. That is checked, not assumed: every tile of the old
     /// working file and of the old base must be in the new save point, but for those the save
     /// listed as lost ([`Saved::lost`]), whose last saved state the store reads from now on (a
-    /// lost tile's resident slot is dropped, if no pin holds it, and every evaluation that
-    /// followed from it too, as it may have come from the lost edit). Dirty slots are clean
+    /// lost tile's resident slot is dropped, or, if a pin holds it, filled again in place from
+    /// the saved record, and every evaluation that followed from it is dropped too, as it may
+    /// have come from the lost edit). Dirty slots are clean
     /// after the rebase (the save wrote them), and every other resident correction tile is kept,
     /// as it is what was just saved; so are the other cached evaluations, which stay valid: nothing
     /// they read has changed. Prefetches in flight are dropped (their workers stop and are
@@ -1517,14 +1518,12 @@ impl TileStore {
                 self.known_ops.insert(key, write.op);
             }
         }
+        // A lost tile's slot doesn't hold the saved state, and has nothing to write: it is
+        // dropped, or, if a pin holds it, reloaded in place once the store reads the new files.
+        let mut pinned = Vec::new();
         for key in &lost {
-            // A lost tile's slot doesn't hold the saved state, and has nothing to write: it is
-            // dropped, or, if a pin holds it, kept clean until the pin goes.
-            if let Some(id) = self.corrections.find(key) {
-                self.corrections.set_dirty(id, false)?;
-                if !self.corrections.is_pinned(key) {
-                    self.corrections.remove(key)?;
-                }
+            if self.drop_lost_slot(key)? {
+                pinned.push(*key);
             }
         }
         // What was evaluated from a lost edit isn't the saved state the store reads from now on.
@@ -1538,7 +1537,11 @@ impl TileStore {
         self.next_op = next_op;
         self.op = None;
         self.base = Some(base);
-        Ok(std::mem::replace(&mut self.file, working))
+        let old = std::mem::replace(&mut self.file, working);
+        for key in &pinned {
+            self.reload_lost(key);
+        }
+        Ok(old)
     }
 
     /// Fills `fresh`, a new working file on the same base, with every edit, after the working
@@ -1655,8 +1658,9 @@ impl TileStore {
     /// abandoned. The base is unchanged, and so are the tiles to save into the project, but for
     /// the lost ones: they are in no file the store writes, so the next save leaves them at
     /// their last saved state instead of failing to find them. A lost tile's slot, if it has
-    /// one (a broken one), is dropped, or kept clean while a pin holds it, and every evaluation
-    /// that followed from a lost tile is dropped, as it may have come from the lost edit.
+    /// one (a broken one), is dropped, or, if a pin holds it, filled again in place from the
+    /// tile's last record, and every evaluation that followed from a lost tile is dropped, as it
+    /// may have come from the lost edit.
     ///
     /// # Errors
     ///
@@ -1679,15 +1683,13 @@ impl TileStore {
         }
         // Drained first, so the feed can't bring a lost key back.
         self.drain_saves();
+        // A lost tile's slot, if it has one, is broken: dropped as a rebase drops one, or, if a
+        // pin holds it, reloaded in place once the store reads the new file.
+        let mut pinned = Vec::new();
         for key in &lost {
             self.since_rebase.remove(key);
-            // A lost tile's slot, if it has one, is broken: dropped as a rebase drops one.
-            self.unsaved.remove(key);
-            if let Some(id) = self.corrections.find(key) {
-                self.corrections.set_dirty(id, false)?;
-                if !self.corrections.is_pinned(key) {
-                    self.corrections.remove(key)?;
-                }
+            if self.drop_lost_slot(key)? {
+                pinned.push(*key);
             }
         }
         // What was evaluated from a lost edit isn't what the store reads from now on.
@@ -1710,7 +1712,11 @@ impl TileStore {
         self.generation += 1;
         // The workers' jobs name records of the old file.
         self.prefetch = Prefetcher::new();
-        Ok((std::mem::replace(&mut self.file, file), lost))
+        let old = std::mem::replace(&mut self.file, file);
+        for key in &pinned {
+            self.reload_lost(key);
+        }
+        Ok((old, lost))
     }
 
     /// Moves every key save's consumer hasn't drained from the change feed into
@@ -2577,10 +2583,11 @@ impl TileStore {
     /// nothing evaluated later (and no bound recorded from it) describes a state no save point
     /// holds.
     ///
-    /// Each slot is marked clean and dropped, or, if a pin holds it, kept clean until the pin
-    /// goes, as a rebase keeps a lost tile's. The tile is read from the working file's record
-    /// from then on, else from the base: if the working file has no record of it, it is at its
-    /// last saved state again, and no longer among the tiles the next save copies.
+    /// Each slot is dropped, or, if a pin holds it, filled again in place from the tile's last
+    /// record (see [`TileStore::reload_lost`]), as a rebase does with a lost tile's. The tile is
+    /// read from the working file's record from then on, else from the base: if the working
+    /// file has no record of it, it is at its last saved state again, and no longer among the
+    /// tiles the next save copies.
     ///
     /// # Errors
     ///
@@ -2592,12 +2599,8 @@ impl TileStore {
         // Drained first, so the feed can't bring a lost key back among the tiles to save.
         self.drain_saves();
         for key in lost {
-            self.unsaved.remove(key);
-            if let Some(id) = self.corrections.find(key) {
-                self.corrections.set_dirty(id, false)?;
-                if !self.corrections.is_pinned(key) {
-                    self.corrections.remove(key)?;
-                }
+            if self.drop_lost_slot(key)? {
+                self.reload_lost(key);
             }
             if !self.file.contains(key) {
                 self.since_rebase.remove(key);
@@ -2605,6 +2608,64 @@ impl TileStore {
         }
         self.invalidate_edited(lost.iter().copied());
         Ok(())
+    }
+
+    /// Forgets a lost tile's latest write and drops its correction slot, if it has one: its
+    /// edit is in no file the store reads. Returns whether a pin holds the slot, which then
+    /// stays, marked clean, for [`TileStore::reload_lost`] to fill again from the tile's last
+    /// record once the store reads the files it is to read from.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] for a stale handle.
+    fn drop_lost_slot(&mut self, key: &TileKey) -> Result<bool, CacheError> {
+        self.unsaved.remove(key);
+        let Some(id) = self.corrections.find(key) else {
+            return Ok(false);
+        };
+        self.corrections.set_dirty(id, false)?;
+        if self.corrections.is_pinned(key) {
+            return Ok(true);
+        }
+        self.corrections.remove(key)?;
+        Ok(false)
+    }
+
+    /// Fills a lost tile's slot, kept because a pin holds it, again in place from the tile's
+    /// last record (the working file's, else the base's, else zero), as loading it would: what
+    /// the slot holds is then what the files hold, and an edit after the pin goes starts from
+    /// it, never from the lost edit. The slot stays clean.
+    ///
+    /// If the record can't be read, the slot is left holding no tile, as a failed load leaves
+    /// one: every read or edit of it fails until it leaves the pool (a clean slot, so dropping
+    /// it writes nothing), and the tile is read from its record again after that.
+    fn reload_lost(&mut self, key: &TileKey) {
+        let Some(id) = self.corrections.find(key) else {
+            return;
+        };
+        let fill = Fill {
+            key: *key,
+            id,
+            found: self.locate(key),
+        };
+        let Some(slot) = self.corrections.get_mut(id) else {
+            return;
+        };
+        let filled = fill_slot(
+            &self.file,
+            self.base.as_ref(),
+            &fill,
+            slot,
+            &mut self.read_scratch,
+        );
+        match filled {
+            Ok(Some(op)) => {
+                self.known_ops.insert(*key, op);
+            }
+            Ok(None) | Err(_) => {
+                self.known_ops.remove(key);
+            }
+        }
     }
 
     /// Appends, with one write, every bound edits changed that the working file lacks (not the

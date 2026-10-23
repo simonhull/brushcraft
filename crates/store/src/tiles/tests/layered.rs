@@ -583,6 +583,59 @@ fn a_tile_lost_to_a_save_drops_what_was_evaluated_from_it() {
     assert_loads_as_built(&mut reopened, level(TOP), "saved after the lost tile");
 }
 
+/// A tile lost to a save while a pin holds its slot is filled again in place.
+///
+/// The slot is refilled from the saved record: an edit after the pin goes starts from the saved
+/// state, never from the lost edit.
+#[test]
+fn a_pinned_tile_lost_to_a_save_is_reloaded_in_place() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let all = tiles(&mesh, 1, TOP);
+    let mut saved = CorrectionMap::new();
+    let mut project = saved_project(
+        &dir,
+        "p.bcrf",
+        &mesh,
+        &mut saved,
+        &random_edits(&mesh, TOP, 40, 91),
+    );
+    let working = recovery(&dir, "r1.bcrf", &project);
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), roomy()).unwrap();
+    let lost = tiles(&mesh, TOP, TOP)[5];
+    // A large edit, dirty with no op to write it with: the save loses it.
+    apply_batches(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &[(lost, vec![(5, 7, Vec3::new(0.0, 0.0, 0.5))])],
+    );
+    let pin = store.pin(&[lost]).unwrap();
+    store.unsaved.remove(&lost);
+    let proof = store.save_into(&mut project).unwrap();
+    assert_eq!(proof.lost().iter().copied().collect::<Vec<_>>(), [lost]);
+    store
+        .rebase(proof, recovery(&dir, "r2.bcrf", &project))
+        .unwrap();
+    drop(pin);
+    let mut want = saved.clone();
+    apply_batches(
+        &mut store,
+        &mut want,
+        &[(lost, vec![(5, 7, Vec3::new(0.0, 0.0, 0.001))])],
+    );
+    drop(save_and_rebase(&mut store, &mut project, &dir, "r3.bcrf"));
+    drop(store);
+    drop(project);
+    let file = ProjectFile::open(&dir.path("p.bcrf")).unwrap();
+    let mut reopened = TileStore::open(file, roomy()).unwrap();
+    assert_positions(
+        &mut reopened,
+        &dense(&mesh, &want),
+        &all,
+        "the edit after the pin, from the saved state",
+    );
+}
+
 /// A save that can't read a tile's latest edit lists the tile as lost and leaves it at its last
 /// saved state; the rebase and the saves after it go through.
 #[test]
