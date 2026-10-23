@@ -1039,10 +1039,12 @@ mod tests {
                 "slot {n}"
             );
         }
-        assert!(
-            pool.get_many_mut(&[ids[2], ids[6], ids[2]]).is_none(),
-            "a slot named twice is refused"
-        );
+        for twice in [ids[2], ids[4]] {
+            assert!(
+                pool.get_many_mut(&[twice, ids[6], twice]).is_none(),
+                "a slot named twice is refused, at a chunk's end or inside it"
+            );
+        }
         assert_eq!(
             pool.get_many_mut(&[]).map(|none| none.len()),
             Some(0),

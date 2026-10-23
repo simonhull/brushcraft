@@ -1440,6 +1440,41 @@ fn a_pin_that_fails_part_way_releases_only_its_own_pins() {
 }
 
 #[test]
+fn a_round_that_fails_part_way_keeps_only_the_tiles_before_the_failure() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, _) = store_on_disk(&dir, "work.bcp", &mesh, roomy(), 300, 5);
+    // Finest tiles on disk, in key order: one round of them, the second unreadable.
+    let mut wanted: Vec<TileKey> = tiles(&mesh, TOP, TOP)
+        .into_iter()
+        .filter(|key| store.file.contains(key))
+        .take(5)
+        .collect();
+    assert_eq!(wanted.len(), 5, "enough tiles on disk");
+    wanted.sort_unstable();
+    store.unreadable = Some(wanted[1]);
+    let refused = store.pin(&wanted);
+    assert!(
+        matches!(refused, Err(CacheError::Store(_))),
+        "the unreadable tile fails the pin: {refused:?}"
+    );
+    assert_eq!(store.corrections.pinned_slots(), 0, "nothing stays pinned");
+    let resident: Vec<bool> = wanted
+        .iter()
+        .map(|key| store.corrections.find(key).is_some())
+        .collect();
+    assert_eq!(
+        resident,
+        [true, false, false, false, false],
+        "as one tile at a time: the tile before the failure loaded, the rest given back"
+    );
+    assert!(
+        store.known_ops.contains_key(&wanted[0]),
+        "with its record's op"
+    );
+}
+
+#[test]
 fn a_budget_below_the_minimum_is_refused() {
     let dir = TestDir::new();
     let mesh = mesh();
@@ -1835,6 +1870,42 @@ fn edits_between_evaluations_invalidate_once() {
     assert_eq!(store.log.invalidations, 3, "a whole tile edit drops once");
 }
 
+/// Which vertices of a tile a test changes, so that a tile's first write falls in each of the
+/// places [`TileEdit::update`] and [`TileStore::update_tiles`] mark it written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pattern {
+    /// Any vertex: the first write is on border row 0.
+    Anywhere,
+    /// Interior vertices only: the tile is marked by an interior write alone.
+    InteriorOnly,
+    /// Nothing before row 5; in row 5 the interior and the last vertex (a border vertex, whose
+    /// copies lie in a neighbour); anything after. The first write is interior, and the border
+    /// write right after it marks the neighbour: the order of the two marks is checked.
+    InteriorThenBorder,
+}
+
+impl Pattern {
+    /// The pattern for test case `n`.
+    const fn of(n: u32) -> Self {
+        match n % 3 {
+            0 => Self::Anywhere,
+            1 => Self::InteriorOnly,
+            _ => Self::InteriorThenBorder,
+        }
+    }
+
+    /// Whether vertex `(i, j)` of a tile with `side` vertices a side may change.
+    const fn allows(self, side: u32, i: u32, j: u32) -> bool {
+        let last = side - 1;
+        let interior = i > 0 && i < last && j > 0 && j < last;
+        match self {
+            Self::Anywhere => true,
+            Self::InteriorOnly => interior,
+            Self::InteriorThenBorder => j > 5 || (j == 5 && (interior || i == last)),
+        }
+    }
+}
+
 /// Applies `change` to every vertex of `key`'s tile in row-major order, through `update` or
 /// through `get` and `set` vertex by vertex.
 ///
@@ -1886,9 +1957,13 @@ fn updating_a_tile_equals_getting_and_setting_each_vertex() {
             .collect();
         // Every few rounds, a value that isn't finite part-way through a row inside the tile.
         let poisoned = (round % 4 == 3).then_some((side / 2, side / 2));
+        let pattern = Pattern::of(round);
         let change = |i: u32, j: u32, c: Vec3| {
             if poisoned == Some((i, j)) {
                 return Some(Vec3::new(f32::NAN, 0.0, 0.0));
+            }
+            if !pattern.allows(side, i, j) {
+                return None;
             }
             let d = deltas[(j * side + i) as usize]?;
             Some(Vec3::new(c.x + d.x, c.y + d.y, c.z + d.z))
@@ -1928,13 +2003,24 @@ fn updating_a_tile_equals_getting_and_setting_each_vertex() {
 /// A change for [`updating_tiles_equals_updating_each_in_turn`], a pure function of its
 /// arguments.
 ///
-/// The round, the tile's place in the list and the vertex pick it. About half the vertices
-/// move; now and then one by a lot (so the scale grows part-way through a tile). In the
-/// `poisoned` round, tile 3 gets a value that isn't finite part-way through a row.
+/// The round, the tile's place in the list and the vertex pick it, the tiles all of the finest
+/// level. About half the vertices a [`Pattern`] allows move; now and then one by a lot (so the
+/// scale grows part-way through a tile). In the `poisoned` round, tile 3 gets a value that
+/// isn't finite part-way through row 5.
 fn tiles_change(round: u32, poisoned: bool, tile: usize, i: u32, j: u32, c: Vec3) -> Option<Vec3> {
     let tile = u32::try_from(tile).unwrap();
-    if poisoned && tile == 3 && (i, j) == (9, 7) {
+    if poisoned && tile == 3 && (i, j) == (9, 5) {
         return Some(Vec3::new(0.0, f32::INFINITY, 0.0));
+    }
+    // Poisoned, the tiles up to the failing one write no border, so no copy of theirs reaches
+    // a later tile: a later tile is marked only if the failure path marks it.
+    let pattern = if poisoned && tile <= 3 {
+        Pattern::InteriorOnly
+    } else {
+        Pattern::of(tile + round)
+    };
+    if !pattern.allows(level(TOP).tile_quads() + 1, i, j) {
+        return None;
     }
     let seed = u64::from(round) << 40 ^ u64::from(tile) << 24 ^ u64::from(j) << 12 ^ u64::from(i);
     let mut rng = Rng(seed);
@@ -2053,6 +2139,16 @@ fn updating_tiles_equals_updating_each_in_turn() {
                     bits,
                     slot_resident(reference, key),
                     "{name} workers, tile {n}"
+                );
+            } else if n == 4 {
+                assert_ne!(
+                    bits, before[n],
+                    "{name} workers: tile 4's interior was written"
+                );
+                assert_eq!(
+                    store.unsaved.get(key).map(|dirty| dirty.op),
+                    Some(op),
+                    "{name} workers, tile 4: so it is dirty"
                 );
             } else if bits != before[n] {
                 assert_eq!(
