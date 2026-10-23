@@ -151,7 +151,7 @@ pub(crate) fn add_dabs(record: Record, dabs: &[Dab]) -> Record {
     record
         .with("query_mean_ms", mean(|s| s.times.query))
         .with("pin_mean_ms", mean(|s| s.times.pin))
-        .with("kernel_mean_ms", mean(|s| s.times.kernel))
+        .with("brush_mean_ms", mean(|s| s.times.brush))
         .with("edit_mean_ms", mean(|s| s.times.edit))
         .with("neighbours_mean_ms", mean(|s| s.times.neighbours))
         .with("evaluate_mean_ms", mean(|s| s.times.evaluate))
@@ -182,7 +182,7 @@ pub(crate) fn describe(dabs: &[Dab]) -> String {
     let vertices = dabs.iter().map(|d| d.stats.vertices).sum::<usize>() / dabs.len();
     format!(
         "{} steps of about {vertices} vertices: p50 {:.2} ms, p99 {:.2} ms (max {:.2}); mean \
-         query {:.2}, pin {:.2}, kernel {:.2}, edit {:.2}, neighbours {:.2}, evaluate {:.2}, \
+         query {:.2}, pin {:.2}, brush {:.2}, edit {:.2}, neighbours {:.2}, evaluate {:.2}, \
          refit {:.2} ms",
         dabs.len(),
         spread.median,
@@ -190,7 +190,7 @@ pub(crate) fn describe(dabs: &[Dab]) -> String {
         spread.max,
         mean(|s| s.times.query),
         mean(|s| s.times.pin),
-        mean(|s| s.times.kernel),
+        mean(|s| s.times.brush),
         mean(|s| s.times.edit),
         mean(|s| s.times.neighbours),
         mean(|s| s.times.evaluate),

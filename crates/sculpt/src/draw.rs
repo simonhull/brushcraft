@@ -4,10 +4,10 @@
 //!
 //! 1. **Query**: the tiles whose boxes the brush's sphere touches, from the spatial index.
 //! 2. **Pin**: those tiles are evaluated and pinned, so they stay resident for the step.
-//! 3. **Kernel**: `kernels::draw` over each tile's evaluated positions, giving each vertex within
-//!    the radius its delta along the normal axis of its tangent frame. Every delta is computed
-//!    before any correction is written: an edit moves the positions of every tile holding a copy of
-//!    the vertex, and a later tile's kernel must see the surface as the step found it.
+//! 3. **Brush**: `brush::draw` over each tile's evaluated positions, giving each vertex within the
+//!    radius its delta along the normal axis of its tangent frame. Every delta is computed before
+//!    any correction is written: an edit moves the positions of every tile holding a copy of the
+//!    vertex, and a later tile's brush must see the surface as the step found it.
 //! 4. **Edit**: each delta is added to the `z` of its vertex's correction (read-modify-write, `c.z
 //!    += delta`) through [`TileStore::edit_tile`], which keeps seam twins in step.
 //! 5. **Neighbours**: the tiles whose bounds may have changed are listed. That is every tile
@@ -25,7 +25,7 @@
 //!
 //! A vertex on a tile's border is held by every tile that shares it, each with its own copy of
 //! its position and correction, and the copies agree bit for bit. Each of those tiles is a
-//! candidate, and its kernel finds the vertex within the radius with the same delta. Adding the
+//! candidate, and its brush finds the vertex within the radius with the same delta. Adding the
 //! delta once per copy would push the vertex once per tile that holds it, so exactly one copy
 //! edits it: the least of its copies (see [`geom::Topology::owns`]). `edit_tile` then writes the
 //! new value into every copy.
@@ -34,8 +34,8 @@ use std::collections::BTreeSet;
 use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
+use brush::Smoothstep;
 use geom::{EvalError, Region, TileKey, Vec3, normal_tiles};
-use kernels::Smoothstep;
 use store::{CacheError, IndexError, Project, SpatialIndex, TileEdit, TileStore};
 use thiserror::Error;
 
@@ -135,8 +135,8 @@ pub struct PhaseTimes {
     pub query: Duration,
     /// Evaluating and pinning those tiles.
     pub pin: Duration,
-    /// Running the kernel over their evaluated positions.
-    pub kernel: Duration,
+    /// Running the brush over their evaluated positions.
+    pub brush: Duration,
     /// Writing the deltas into the corrections.
     pub edit: Duration,
     /// Listing the tiles whose bounds the edits may change: those reached, and their
@@ -154,7 +154,7 @@ impl PhaseTimes {
     pub fn total(&self) -> Duration {
         self.query
             + self.pin
-            + self.kernel
+            + self.brush
             + self.edit
             + self.neighbours
             + self.evaluate
@@ -167,7 +167,7 @@ impl AddAssign for PhaseTimes {
     fn add_assign(&mut self, rhs: Self) {
         self.query += rhs.query;
         self.pin += rhs.pin;
-        self.kernel += rhs.kernel;
+        self.brush += rhs.brush;
         self.edit += rhs.edit;
         self.neighbours += rhs.neighbours;
         self.evaluate += rhs.evaluate;
@@ -179,7 +179,7 @@ impl AddAssign for PhaseTimes {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StepStats {
     /// Tiles the brush's sphere touches by their boxes: queried, pinned and run through the
-    /// kernel.
+    /// brush.
     pub candidates: usize,
     /// Tiles whose corrections the step edited: those owning a vertex it moved (each also
     /// writes the copies its neighbours hold of its border vertices).
@@ -203,9 +203,9 @@ struct TileDeltas {
     deltas: Vec<f32>,
 }
 
-/// What the kernel phase found: the deltas to write, and the tiles whose positions they move.
+/// What the brush phase found: the deltas to write, and the tiles whose positions they move.
 #[derive(Debug, Default)]
-struct KernelOutput {
+struct BrushOutput {
     /// The tiles owning a vertex to move, with their deltas, in key order.
     edits: Vec<TileDeltas>,
     /// Every tile holding a vertex within the radius, owned or a copy: the tiles whose positions
@@ -265,8 +265,8 @@ pub fn draw_step(
     let pins = store.pin(&candidates)?;
     times.pin = laps.lap();
 
-    let found = run_kernel(store, pins.keys(), params)?;
-    times.kernel = laps.lap();
+    let found = run_brush(store, pins.keys(), params)?;
+    times.brush = laps.lap();
 
     for tile in &found.edits {
         store.edit_tile(tile.key, |edit| add_deltas(edit, &tile.deltas))??;
@@ -295,24 +295,24 @@ pub fn draw_step(
     })
 }
 
-/// The kernel phase: runs the draw kernel over the evaluated positions of every tile of `keys`
+/// The brush phase: runs the draw brush over the evaluated positions of every tile of `keys`
 /// (pinned, so cached), and keeps the deltas of the vertices each tile owns (see
 /// [`geom::Topology::owns`]).
 ///
 /// # Errors
 ///
 /// As [`TileStore::evaluate`].
-fn run_kernel(
+fn run_brush(
     store: &mut TileStore,
     keys: &[TileKey],
     params: DrawParams,
-) -> Result<KernelOutput, CacheError> {
+) -> Result<BrushOutput, CacheError> {
     let center = [params.center.x, params.center.y, params.center.z];
-    let mut found = KernelOutput::default();
+    let mut found = BrushOutput::default();
     for &key in keys {
         let positions = store.evaluate(key)?;
         let mut deltas = vec![0.0; positions.len()];
-        let inside = kernels::draw(
+        let inside = brush::draw(
             &Smoothstep,
             center,
             params.radius,

@@ -1,7 +1,7 @@
-//! The draw kernel over one brush footprint: 50,000 positions, the M0 benchmark's 50k-vertex
-//! brush step. The kernel is the innermost part of that step's "≤ 2 ms p99" target.
+//! The draw brush over one footprint: 50,000 positions, the M0 benchmark's 50k-vertex
+//! brush step. The brush is the innermost part of that step's "≤ 2 ms p99" target.
 
-use kernels::{Smoothstep, draw};
+use brush::{Smoothstep, draw};
 
 fn main() {
     divan::main();

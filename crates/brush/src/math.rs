@@ -1,4 +1,4 @@
-//! The little vector and scalar math the kernels need, on plain arrays.
+//! The little vector and scalar math the brushes need, on plain arrays.
 //!
 //! `core` has no square root on stable Rust (`f32::sqrt` lives in `std`, which a GPU target
 //! doesn't have), so [`sqrt`] is our own: Newton steps on the reciprocal square root, which take
@@ -21,7 +21,7 @@ const SUBNORMAL_UNDO: f32 = 1.0 / 4096.0;
 
 /// The square root of `x`, to within a few units in the last place.
 ///
-/// `0` for zero and negative inputs (the kernels only take roots of squared distances), `x`
+/// `0` for zero and negative inputs (brushes only take roots of squared distances), `x`
 /// itself for `+∞` and NaN.
 ///
 /// It starts from the classic bit-level estimate of `1/√x` (halve the exponent by shifting the

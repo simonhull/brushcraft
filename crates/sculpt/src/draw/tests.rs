@@ -2,8 +2,8 @@
 //!
 //! The oracle doesn't go through tiles at all: it evaluates every face of the mesh in full,
 //! finds the deltas face by face, and writes them through a [`CorrectionMap`], which keeps twins
-//! in step on its own. Its deltas come from the same kernel (so they match bit for bit), and are
-//! checked against the smoothstep formula evaluated directly, in `f64`.
+//! in step on its own. Its deltas come from the same brush function (so they match bit for bit),
+//! and are checked against the smoothstep formula evaluated directly, in `f64`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -74,7 +74,7 @@ fn tiles(mesh: &BaseMesh, level: Level) -> Vec<TileKey> {
 
 /// The delta the draw brush gives a point at `p`, from the smoothstep formula in `f64`.
 ///
-/// `None` outside the brush. Inside is decided as the kernel decides it, on the
+/// `None` outside the brush. Inside is decided as the brush decides it, on the
 /// squared distance in `f32`, so a point on the rim is outside for both.
 fn formula(p: Vec3, params: DrawParams) -> Option<f64> {
     let center = params.center();
@@ -111,7 +111,7 @@ fn oracle_step(
         let grid = dense.grid(face, level).unwrap();
         let mut deltas = vec![0.0; grid.as_slice().len()];
         let c = params.center();
-        kernels::draw(
+        brush::draw(
             &Smoothstep,
             [c.x, c.y, c.z],
             params.radius(),
@@ -451,7 +451,7 @@ fn phase_times_add_up() {
     let mut times = PhaseTimes {
         query: ms(1),
         pin: ms(2),
-        kernel: ms(3),
+        brush: ms(3),
         edit: ms(4),
         neighbours: ms(5),
         evaluate: ms(6),

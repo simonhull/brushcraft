@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 bytemuck.workspace = true
 geom.workspace = true
-kernels.workspace = true
+brush.workspace = true
 store.workspace = true
 thiserror.workspace = true
 

@@ -71,6 +71,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "brush"
+version = "0.0.0"
+dependencies = [
+ "divan",
+]
+
+[[package]]
 name = "brushcraft-bench"
 version = "0.0.0"
 dependencies = [
@@ -596,13 +603,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernels"
-version = "0.0.0"
-dependencies = [
- "divan",
-]
-
-[[package]]
 name = "keyboard-types"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1057,10 +1057,10 @@ checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 name = "sculpt"
 version = "0.0.0"
 dependencies = [
+ "brush",
  "bytemuck",
  "divan",
  "geom",
- "kernels",
  "store",
  "thiserror 2.0.21",
 ]

@@ -1,4 +1,4 @@
-//! The draw kernel: push the surface out along its normal, strongest at the brush centre.
+//! The draw brush: push the surface out along its normal, strongest at the brush centre.
 
 use crate::falloff::Falloff;
 use crate::math::{distance_squared, sqrt};
@@ -24,10 +24,10 @@ use crate::math::{distance_squared, sqrt};
 /// (about `1e-5` at `1e-20`). Models are nowhere near either end.
 ///
 /// `positions` and `out` should have the same length. If they don't, only the shorter prefix is
-/// processed (the rest of `out` is left as it was); the kernel never panics.
+/// processed (the rest of `out` is left as it was); the brush never panics.
 ///
 /// ```
-/// use kernels::{Smoothstep, draw};
+/// use brush::{Smoothstep, draw};
 ///
 /// let positions = [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [2.0, 0.0, 0.0]];
 /// let mut out = [9.0; 3];
@@ -92,7 +92,7 @@ mod tests {
     }
 
     /// The draw delta at `p`, computed directly with `std`'s square root and the smoothstep
-    /// formula: the oracle the kernel is checked against.
+    /// formula: the oracle the brush is checked against.
     fn direct(p: [f32; 3], center: [f32; 3], radius: f32, strength: f32) -> Option<f32> {
         let [dx, dy, dz] = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
         let d = f64::from(dx * dx + dy * dy + dz * dz).sqrt();

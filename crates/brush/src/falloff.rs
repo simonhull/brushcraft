@@ -4,7 +4,7 @@
 ///
 /// `t` is the distance divided by the brush radius, so the brush covers `t` in `[0, 1]`. A
 /// falloff gives `1` at the centre and `0` at the rim and beyond, and is `0` for `t ≥ 1` (and
-/// for a NaN `t`), so a kernel may evaluate it for any vertex without checking first.
+/// for a NaN `t`), so a brush may evaluate it for any vertex without checking first.
 pub trait Falloff {
     /// The weight at normalised distance `t`: `1` at `t = 0`, `0` for `t ≥ 1`.
     fn weight(&self, t: f32) -> f32;

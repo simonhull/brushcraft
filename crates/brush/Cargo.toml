@@ -1,10 +1,10 @@
 [package]
-name = "kernels"
+name = "brush"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Brush kernels shared by the CPU and the GPU: no_std, generic, allocation-free."
+description = "Brush math (falloffs, per-vertex deformation) shared by the CPU and the GPU: no_std, generic, allocation-free."
 
 [lints]
 workspace = true

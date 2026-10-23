@@ -1,9 +1,9 @@
 //! Brushes: steps that edit a project's corrections through its store and spatial index.
 //!
 //! A brush stroke is a sequence of steps (dabs), each one a read-modify-write of the corrections
-//! near the brush. The per-vertex math lives in `kernels`, shared with the GPU; this crate does
+//! near the brush. The per-vertex math lives in `brush`, shared with the GPU; this crate does
 //! the rest of a step: finding the tiles the brush reaches through the [`store::SpatialIndex`],
-//! pinning and evaluating them, writing the kernel's deltas into the corrections through
+//! pinning and evaluating them, writing the brush's deltas into the corrections through
 //! [`store::TileStore::edit_tile`], and bringing the index back up to date.
 //!
 //! M0 has one brush, the [`draw_step`], to measure edit latency with. It runs on one thread: the
