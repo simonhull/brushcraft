@@ -189,6 +189,11 @@ struct Hooks {
     in_flight: std::sync::atomic::AtomicUsize,
     /// The most [`Hooks::in_flight`] has been.
     peak_in_flight: std::sync::atomic::AtomicUsize,
+    /// Holds the writer thread back while set: it takes no request until it is cleared, so a
+    /// test can act while a flush is certainly in flight, its next reply not yet sent.
+    paused: std::sync::Mutex<bool>,
+    /// Signalled when [`Hooks::paused`] is cleared.
+    unpaused: std::sync::Condvar,
 }
 
 #[cfg(test)]
@@ -219,6 +224,29 @@ impl Hooks {
     fn dropped(&self, snapshots: &[Snapshot]) {
         self.in_flight
             .fetch_sub(Self::bytes_of(snapshots), Ordering::SeqCst);
+    }
+
+    /// Holds the writer thread back, or lets it go. A poisoned lock is taken over as it is: it
+    /// guards a single flag.
+    fn pause(&self, paused: bool) {
+        *self
+            .paused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = paused;
+        self.unpaused.notify_all();
+    }
+
+    /// Blocks the writer thread for as long as it is held back.
+    fn wait_while_paused(&self) {
+        let paused = self
+            .paused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            self.unpaused
+                .wait_while(paused, |paused| *paused)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 }
 
@@ -639,6 +667,20 @@ impl RecoveryWriter {
         self.hooks.failing_encodes.store(fail, Ordering::SeqCst);
     }
 
+    /// Holds the writer thread back before it takes its next request, or lets it go.
+    ///
+    /// While it is held, a flush stays where the owner left it, with no reply to advance it,
+    /// however the threads are scheduled: a trigger then meets the flush in flight and queues
+    /// the next one. Dropping the writer lets the thread go.
+    pub(crate) fn pause(&self, paused: bool) {
+        self.hooks.pause(paused);
+    }
+
+    /// Whether a trigger has queued a flush behind the one in flight.
+    pub(crate) const fn is_queued(&self) -> bool {
+        self.queued.is_some()
+    }
+
     /// Blocks for one reply of the flush in flight and advances it, so a test can act between
     /// phases; does nothing when idle.
     ///
@@ -683,6 +725,8 @@ impl Drop for RecoveryWriter {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         drop(self.requests.take());
+        #[cfg(test)]
+        self.hooks.pause(false);
         if let Some(thread) = self.thread.take() {
             // A thread that panicked has nothing left to clean up; its panic was reported on
             // its own thread.
@@ -709,6 +753,8 @@ impl Worker {
     /// listening.
     fn run(self) {
         while let Ok(request) = self.requests.recv() {
+            #[cfg(test)]
+            self.hooks.wait_while_paused();
             let reply = match request {
                 Request::Encode(snapshots) => {
                     let encoded = self.encode(&snapshots);

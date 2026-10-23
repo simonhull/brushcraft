@@ -236,6 +236,9 @@ fn edits_during_a_flush_land_in_the_next_one_never_lost_never_doubled() {
     apply(&mut store, &mut map, &random_edits(&mesh, TOP, 40, 61));
     let stroke_a = map.clone();
     let snapshot: BTreeSet<TileKey> = store.unsaved.keys().copied().collect();
+    // Held back until the next stroke has ended, so that stroke end finds the flush still
+    // encoding however the threads are scheduled.
+    writer.pause(true);
     writer.end_stroke(&mut store, start).unwrap();
     assert_eq!(writer.phase(), "encoding", "the flush is in flight");
 
@@ -245,6 +248,9 @@ fn edits_during_a_flush_land_in_the_next_one_never_lost_never_doubled() {
     edit_interior(&mut store, &mut map, fresh, Vec3::new(0.0, 0.0, 0.001));
     // A stroke ends mid-flush: the next flush is queued.
     writer.end_stroke(&mut store, start).unwrap();
+    assert_eq!(writer.phase(), "encoding", "still in flight");
+    assert!(writer.is_queued(), "the next flush is queued");
+    writer.pause(false);
 
     writer.step_blocking(&mut store).unwrap();
     assert_eq!(writer.phase(), "syncing tiles", "the records are appended");
@@ -530,6 +536,10 @@ fn a_failed_sync_surfaces_through_poll_and_finish() {
 
 /// A sync that fails with a flush queued behind it settles the writer as failed in a few steps:
 /// the queued flush is dropped rather than retried against the failed file.
+///
+/// The writer thread is held back until the second stroke has ended, so that stroke end meets
+/// the first flush still encoding and queues the next. Unheld, the thread could encode and fail
+/// the sync before it, and the stroke end would report the failure with nothing queued.
 #[test]
 fn a_failed_sync_with_a_flush_queued_does_not_spin() {
     let dir = TestDir::new();
@@ -538,11 +548,14 @@ fn a_failed_sync_with_a_flush_queued_does_not_spin() {
     let mut writer = RecoveryWriter::new(&mut store).unwrap();
     let mut map = CorrectionMap::new();
     writer.fail_syncs(0, 1);
+    writer.pause(true);
     apply(&mut store, &mut map, &random_edits(&mesh, TOP, 30, 91));
     writer.end_stroke(&mut store, Instant::now()).unwrap();
     apply(&mut store, &mut map, &random_edits(&mesh, TOP, 30, 92));
     writer.end_stroke(&mut store, Instant::now()).unwrap();
-    assert!(!writer.is_idle(), "a flush in flight and one queued");
+    assert_eq!(writer.phase(), "encoding", "a flush in flight");
+    assert!(writer.is_queued(), "and one queued");
+    writer.pause(false);
     let mut steps = 0;
     let mut failed = false;
     while !writer.is_idle() {
@@ -551,7 +564,12 @@ fn a_failed_sync_with_a_flush_queued_does_not_spin() {
         failed |= writer.step_blocking(&mut store).is_err();
     }
     assert!(failed && writer.is_failed(), "the sync failed the writer");
+    assert_eq!(
+        steps, 2,
+        "the encoding and the failed sync, nothing retried"
+    );
     assert_eq!(writer.phase(), "failed", "and the queued flush was dropped");
+    assert!(!writer.is_queued(), "dropped, not kept for later");
 }
 
 /// The reproduction of the bug a cut closes.
