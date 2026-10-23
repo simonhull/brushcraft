@@ -10,10 +10,12 @@
 //!    the vertex, and a later tile's kernel must see the surface as the step found it.
 //! 4. **Edit**: each delta is added to the `z` of its vertex's correction (read-modify-write, `c.z
 //!    += delta`) through [`TileStore::edit_tile`], which keeps seam twins in step.
-//! 5. **Evaluate**: the tiles whose bounds may have changed are evaluated again, positions and
-//!    normals. That is every tile holding a vertex within the radius, whose positions moved, and
-//!    every tile whose normals read one of those, whose normal cones may have turned.
-//! 6. **Refit**: their bounds are recomputed and the index's tree refitted.
+//! 5. **Neighbours**: the tiles whose bounds may have changed are listed. That is every tile
+//!    holding a vertex within the radius, whose positions moved, and every tile whose normals read
+//!    one of those, whose normal cones may have turned: the tiles each reached tile's normals read,
+//!    gathered from the base mesh's topology.
+//! 6. **Evaluate**: those tiles are evaluated again, positions and normals.
+//! 7. **Refit**: their bounds are recomputed and the index's tree refitted.
 //!
 //! Corrections live in each vertex's tangent frame `(t, b, n)` of the predicted surface, so a
 //! push along the frame normal `n` is a change of the correction's `z` alone, with no frames to
@@ -137,6 +139,9 @@ pub struct PhaseTimes {
     pub kernel: Duration,
     /// Writing the deltas into the corrections.
     pub edit: Duration,
+    /// Listing the tiles whose bounds the edits may change: those reached, and their
+    /// neighbours whose normals read them.
+    pub neighbours: Duration,
     /// Evaluating the changed tiles again, positions and normals.
     pub evaluate: Duration,
     /// Recomputing their bounds and refitting the index.
@@ -147,7 +152,13 @@ impl PhaseTimes {
     /// The whole step: every phase together.
     #[must_use]
     pub fn total(&self) -> Duration {
-        self.query + self.pin + self.kernel + self.edit + self.evaluate + self.refit
+        self.query
+            + self.pin
+            + self.kernel
+            + self.edit
+            + self.neighbours
+            + self.evaluate
+            + self.refit
     }
 }
 
@@ -158,6 +169,7 @@ impl AddAssign for PhaseTimes {
         self.pin += rhs.pin;
         self.kernel += rhs.kernel;
         self.edit += rhs.edit;
+        self.neighbours += rhs.neighbours;
         self.evaluate += rhs.evaluate;
         self.refit += rhs.refit;
     }
@@ -262,6 +274,8 @@ pub fn draw_step(
     times.edit = laps.lap();
 
     let changed = bounds_changed(store.mesh(), &found.reached)?;
+    times.neighbours = laps.lap();
+
     for &key in &changed {
         store.evaluate(key)?;
         store.normals(key)?;

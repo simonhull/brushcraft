@@ -412,11 +412,13 @@ fn phase_times_add_up() {
         pin: ms(2),
         kernel: ms(3),
         edit: ms(4),
-        evaluate: ms(5),
-        refit: ms(6),
+        neighbours: ms(5),
+        evaluate: ms(6),
+        refit: ms(7),
     };
-    assert_eq!(times.total(), ms(21), "the phases together");
+    assert_eq!(times.total(), ms(28), "the phases together");
     times += times;
-    assert_eq!(times.total(), ms(42), "two steps together");
-    assert_eq!(times.refit, ms(12), "phase by phase");
+    assert_eq!(times.total(), ms(56), "two steps together");
+    assert_eq!(times.refit, ms(14), "phase by phase");
+    assert_eq!(times.neighbours, ms(10), "the neighbours too");
 }

@@ -205,12 +205,13 @@ fn report(all: &[StepStats]) {
         count(|stats| stats.tiles_updated),
     );
     eprintln!(
-        "  mean per step: query {:?}, pin {:?}, kernel {:?}, edit {:?}, evaluate {:?}, refit \
-         {:?}, total {:?}",
+        "  mean per step: query {:?}, pin {:?}, kernel {:?}, edit {:?}, neighbours {:?}, evaluate \
+         {:?}, refit {:?}, total {:?}",
         mean(times.query),
         mean(times.pin),
         mean(times.kernel),
         mean(times.edit),
+        mean(times.neighbours),
         mean(times.evaluate),
         mean(times.refit),
         mean(times.total()),
