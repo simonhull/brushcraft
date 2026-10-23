@@ -1326,20 +1326,22 @@ impl ProjectFile {
         if self.access == Access::ReadOnly {
             return Err(StoreError::ReadOnly);
         }
+        let size = |n: usize| u64::try_from(n).or(Err(StoreError::TooLarge));
         let mut buffer = Vec::new();
         let mut placed = Vec::new();
         for (key, kept) in bounds {
             let record =
                 frame(KIND_BOUNDS, &bounds_payload(&key, kept)).ok_or(StoreError::TooLarge)?;
-            placed.push((key, buffer.len() as u64, record.len() as u64));
+            placed.push((key, size(buffer.len())?, size(record.len())?));
             buffer.extend_from_slice(&record);
         }
         if buffer.is_empty() {
             return Ok(());
         }
         let start = self.end;
+        let written = size(buffer.len())?;
         self.file.write_all_at(&buffer, start)?;
-        self.end += buffer.len() as u64;
+        self.end += written;
         for (key, at, len) in placed {
             let loc = Loc {
                 offset: start + at,
