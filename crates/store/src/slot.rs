@@ -1,4 +1,10 @@
-//! Pool slot layouts: plain data, so the same bytes can be uploaded to a GPU storage buffer.
+//! Pool slot layouts: plain data, so a slot's bytes can be uploaded to a GPU storage buffer as
+//! they are.
+//!
+//! Only the prefixes a tile's side uses are meaningful: a recycled slot is cleared by what it
+//! holds, not zeroed, so past them is whatever an earlier, larger tile left (see
+//! [`CorrectionSlot::reset`] and [`EvaluatedSlot`]'s [`SlotData::clear`]). A reader, a shader
+//! included, must index a tile by its side and never read past it.
 
 use std::fmt;
 
