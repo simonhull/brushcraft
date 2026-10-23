@@ -79,9 +79,17 @@ pub(crate) fn mesh() -> Arc<BaseMesh> {
     Arc::new(cube_sphere(1).unwrap())
 }
 
-/// A configuration with chunks of `chunk_slots` evaluated slots and a budget of `chunks` of them.
+/// Evaluation workers of a store whose test isn't about how many there are: two, so that
+/// evaluation runs in parallel without every store of a test run starting a worker per
+/// hardware thread.
+pub(crate) const TEST_THREADS: Option<NonZeroUsize> = NonZeroUsize::new(2);
+
+/// A configuration with chunks of `chunk_slots` evaluated slots and a budget of `chunks` of
+/// them, and [`TEST_THREADS`] workers.
 fn config(chunks: usize, chunk_slots: usize) -> StoreConfig {
-    StoreConfig::new(chunks * chunk_slots * EVAL, SITE).with_chunk_bytes(chunk_slots * EVAL)
+    StoreConfig::new(chunks * chunk_slots * EVAL, SITE)
+        .with_chunk_bytes(chunk_slots * EVAL)
+        .with_threads(TEST_THREADS)
 }
 
 /// Room for every tile of levels 1–8 of the cube, twice over.

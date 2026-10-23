@@ -101,10 +101,12 @@ enum Reads {
 }
 
 /// The budgets a run is tried at: the mesh's minimum and a few chunks more, in chunks of four
-/// evaluated slots.
+/// evaluated slots, with [`TEST_THREADS`] workers.
 fn budgets(mesh: &BaseMesh, extra_chunks: &[usize]) -> Vec<StoreConfig> {
     let chunk = 4 * EVAL;
-    let base = StoreConfig::new(0, SITE).with_chunk_bytes(chunk);
+    let base = StoreConfig::new(0, SITE)
+        .with_chunk_bytes(chunk)
+        .with_threads(TEST_THREADS);
     let minimum = base.minimum_budget(mesh);
     extra_chunks
         .iter()
