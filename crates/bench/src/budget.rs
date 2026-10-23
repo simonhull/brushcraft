@@ -7,6 +7,10 @@
 //! view go and moves on. The store's budget (1 GiB unless told otherwise) is all it may use
 //! for tiles; the spec's target is RSS within budget + 512 MB throughout.
 //!
+//! The resident memory is reported two ways: sampled every 100 ms, a series that shows how it
+//! moves, and exactly, as the high-water mark (`VmHWM`) reset just before the walk and read
+//! just after it, which no spike between two samples escapes.
+//!
 //! The baseline is the process with the project open and its spatial index built, the store
 //! then emptied (`evict_all` + `shrink_to(0)`): everything but tiles. After the walk the store
 //! is emptied again, and the spec's target is RSS back within baseline + 64 MB.
@@ -24,7 +28,7 @@ use crate::paths::Paths;
 use crate::report::{Output, Record, mib, ms, to_f64};
 use crate::session;
 use crate::surface::{nearest_tiles, tile_directions};
-use crate::sys::{Rss, RssSampler};
+use crate::sys::{Rss, RssSampler, reset_peak};
 
 /// Empties the store: dirty tiles written back, every tile evicted, every chunk given back.
 ///
@@ -74,6 +78,7 @@ pub(crate) fn run<J: Write, H: Write>(
         options.view_tiles,
         mib(baseline.now)
     ))?;
+    reset_peak()?;
     let sampler = RssSampler::start()?;
     let start = Instant::now();
     let walked = walk(
@@ -86,6 +91,7 @@ pub(crate) fn run<J: Write, H: Write>(
         start,
     );
     let rss_samples = sampler.stop()?;
+    let exact = Rss::read()?.peak;
     let steps = walked?;
     let walk_time = start.elapsed();
     empty(project.store())?;
@@ -106,6 +112,8 @@ pub(crate) fn run<J: Write, H: Write>(
             .with("baseline_rss_mib", mib(baseline.now))
             .with("max_rss_mib", mib(most))
             .with("max_rss_over_budget_mib", mib_over(most, budget))
+            .with("max_rss_exact_mib", mib(exact))
+            .with("max_rss_exact_over_budget_mib", mib_over(exact, budget))
             .with("rss_after_empty_mib", mib(after.now))
             .with(
                 "after_empty_over_baseline_mib",
@@ -115,13 +123,14 @@ pub(crate) fn run<J: Write, H: Write>(
             .with("rss_samples_mib", series),
     )?;
     out.say(&format!(
-        "budget: {} RSS samples over {:.1} s; max {:.1} MiB ({:+.1} MiB against the {} MiB \
-         budget); after emptying {:.1} MiB ({:+.1} MiB against the baseline)",
+        "budget: peak RSS {:.1} MiB ({:+.1} MiB against the {} MiB budget); {} samples over \
+         {:.1} s, max {:.1} MiB; after emptying {:.1} MiB ({:+.1} MiB against the baseline)",
+        mib(exact),
+        mib_over(exact, budget),
+        options.budget_mib,
         rss_samples.len(),
         walk_time.as_secs_f64(),
         mib(most),
-        mib_over(most, budget),
-        options.budget_mib,
         mib(after.now),
         mib_over(after.now, baseline.now)
     ))?;

@@ -116,6 +116,10 @@ fn generate_writes_a_project_and_reports_it() {
         number(project, "vertices_written") > 90_000.0,
         "every vertex: {project}"
     );
+    assert!(
+        number(project, "max_rss_exact_mib") > 0.0,
+        "the peak: {project}"
+    );
     let bytes = std::fs::metadata(dir.project()).unwrap().len();
     assert!(
         (number(project, "file_bytes") - f64::from(u32::try_from(bytes).unwrap())).abs() < 0.5,
@@ -221,6 +225,11 @@ fn budget_walks_and_samples_rss() {
         "three moves of two steps: {walk}"
     );
     assert!(number(walk, "max_rss_mib") > 0.0, "sampled: {walk}");
+    // Tests share the process, and another's reset may come mid-walk: only that it is there.
+    assert!(
+        number(walk, "max_rss_exact_mib") > 0.0,
+        "the exact peak: {walk}"
+    );
     assert!(walk.contains("\"rss_samples_mib\":["), "the series: {walk}");
 }
 

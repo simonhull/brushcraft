@@ -64,6 +64,19 @@ impl Rss {
     }
 }
 
+/// Resets the process's resident high-water mark (`VmHWM`) to what is resident now.
+///
+/// It writes `5` to `/proc/self/clear_refs`, so the next [`Rss::read`]'s `peak` is the most
+/// resident since this call, exactly: no peak between two samples is missed.
+///
+/// # Errors
+///
+/// If `/proc/self/clear_refs` can't be written (a kernel before 4.0, or one without
+/// `CONFIG_PROC_PAGE_MONITOR`).
+pub(crate) fn reset_peak() -> Result<()> {
+    std::fs::write("/proc/self/clear_refs", "5").context("resetting VmHWM in /proc/self/clear_refs")
+}
+
 /// Drops `path`'s pages from the page cache (`posix_fadvise(DONTNEED)` over the whole file),
 /// so the next reads of it come from the disk: a cold read.
 ///
@@ -151,6 +164,25 @@ mod tests {
         assert!(Rss::parse("VmRSS: 1 kB\n").is_err(), "no high-water mark");
         let own = Rss::read().unwrap();
         assert!(own.now > 0 && own.peak >= own.now, "this process: {own:?}");
+    }
+
+    #[test]
+    fn resetting_the_peak_brings_it_down_to_now() {
+        // A peak well above what stays resident: 64 MiB touched, then freed.
+        let mut big = vec![1_u8; 64 << 20];
+        big.iter_mut().step_by(4096).for_each(|b| *b = 2);
+        drop(big);
+        let before = Rss::read().unwrap();
+        reset_peak().unwrap();
+        let after = Rss::read().unwrap();
+        assert!(
+            after.peak < before.peak,
+            "the high-water mark came down: {before:?} to {after:?}"
+        );
+        assert!(
+            after.peak >= after.now,
+            "still at least what is resident: {after:?}"
+        );
     }
 
     #[test]

@@ -13,6 +13,9 @@
 //! project ticked every [`TICK_EVERY`] tiles, as a frame loop would, so the recovery writer
 //! streams the edits as they are made. Then [`Project::save_as`] writes the project file and
 //! the recovery file is deleted.
+//!
+//! The peak resident memory reported is exact: the high-water mark (`VmHWM`), reset as the run
+//! starts and read once the project is closed.
 
 use std::io::Write;
 use std::time::Instant;
@@ -27,7 +30,7 @@ use crate::paths::Paths;
 use crate::report::{Output, Record, mib, ms};
 use crate::session;
 use crate::surface::owns;
-use crate::sys::Rss;
+use crate::sys::{Rss, reset_peak};
 
 /// How often, in tiles, the generator ticks the project ([`Project::tick`]).
 ///
@@ -103,6 +106,7 @@ pub(crate) fn run<J: Write, H: Write>(
     paths: &Paths,
     out: &mut Output<J, H>,
 ) -> Result<()> {
+    reset_peak()?;
     let start = Instant::now();
     if paths.project.exists() {
         if !options.force {
@@ -159,6 +163,7 @@ pub(crate) fn run<J: Write, H: Write>(
     project.close(false).context("closing the project")?;
     let bytes = std::fs::metadata(&paths.project)?.len();
     let rss = Rss::read()?;
+    let budget = u64::try_from(options.budget_bytes())?;
     let total_time = start.elapsed();
     out.record(
         &Record::new("generate", "project")
@@ -172,13 +177,14 @@ pub(crate) fn run<J: Write, H: Write>(
             .with("total_ms", ms(total_time))
             .with("file_bytes", bytes)
             .with("file_mib", mib(bytes))
-            .with("peak_rss_mib", mib(rss.peak))
+            .with("max_rss_exact_mib", mib(rss.peak))
+            .with("max_rss_exact_over_budget_mib", mib(rss.peak) - mib(budget))
             .with("budget_mib", options.budget_mib)
             .with("unprotected_tiles", unprotected),
     )?;
     out.say(&format!(
         "generate: {total} tiles, {vertices} vertices written in {:.1} s, saved in {:.1} s; \
-         file {:.1} MiB, peak RSS {:.1} MiB (budget {} MiB)",
+         file {:.1} MiB, peak RSS (VmHWM) {:.1} MiB (budget {} MiB)",
         sculpted.as_secs_f64(),
         saved.as_secs_f64(),
         mib(bytes),
