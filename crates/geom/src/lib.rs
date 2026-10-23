@@ -16,6 +16,7 @@ mod math;
 mod mesh;
 #[cfg(test)]
 mod reference;
+mod soa;
 mod sphere;
 mod subdiv;
 #[cfg(test)]

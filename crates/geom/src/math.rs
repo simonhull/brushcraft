@@ -54,7 +54,7 @@ impl Vec3 {
     #[must_use]
     pub fn normalized(self) -> Option<Self> {
         let len = self.length();
-        (len.is_finite() && len > f32::MIN_POSITIVE).then(|| self * len.recip())
+        normalizable(len).then(|| self * len.recip())
     }
 
     /// Whether every component is finite.
@@ -68,6 +68,12 @@ impl Vec3 {
     pub const fn to_bits(self) -> [u32; 3] {
         [self.x.to_bits(), self.y.to_bits(), self.z.to_bits()]
     }
+}
+
+/// Whether a vector of length `len` can be normalized: the length is finite and not too small
+/// to divide by. [`Vec3::normalized`] and its lane-by-lane form share this test.
+pub(crate) fn normalizable(len: f32) -> bool {
+    len.is_finite() && len > f32::MIN_POSITIVE
 }
 
 impl Add for Vec3 {

@@ -1,5 +1,9 @@
 //! Tangent frames for corrections, taken in each shared vertex's owner orientation.
 
+use core::ops::RangeInclusive;
+
+use crate::math::normalizable;
+use crate::soa::Vectors;
 use crate::subdiv::Padded;
 use crate::topology::{Topology, border_edge, owner_axes};
 use crate::{FaceId, Vec3};
@@ -294,21 +298,138 @@ fn per_vertex<T>(
         .map(move |(i, j)| f(i, j, derivatives(block, grid, corners, i, j)))
 }
 
+/// The block vertices strictly inside the face, as `(columns, rows)` in block coordinates (an
+/// empty range where there are none).
+///
+/// Their stencils are all the block's own central differences ([`Stencil::Axes`] with `+i` and
+/// `+j`), whose four reads lie in the padded block: rows of them can be walked as slices.
+fn inside_face(block: &Block<'_>) -> (RangeInclusive<i64>, RangeInclusive<i64>) {
+    let (n, q) = (i64::from(block.face_quads), i64::from(block.quads));
+    let span = |origin: u32| {
+        let origin = i64::from(origin);
+        (1 - origin).max(0)..=(n - 1 - origin).min(q)
+    };
+    (span(block.x0), span(block.y0))
+}
+
+/// The slots of `row` (a [`Padded::row`]) holding columns `columns`, each shifted by `shift`.
+///
+/// They are the reads of a run of vertices one step along the row (`shift` ±1), or straight
+/// across from it (`shift` 0, on the rows above and below).
+fn run_of<'a>(row: &'a [Vec3], columns: &RangeInclusive<i64>, shift: i64) -> &'a [Vec3] {
+    // Column `i` is at index `i + 1` of a padded row.
+    let slot = |i: i64| usize::try_from(i + shift + 1).ok();
+    slot(*columns.start())
+        .zip(slot(*columns.end()))
+        .and_then(|(first, last)| row.get(first..=last))
+        .unwrap_or_default()
+}
+
+/// Working space for [`frames_of_run`], one array per quantity of the frame formula, reused
+/// from row to row.
+#[derive(Debug, Default)]
+struct FrameRows {
+    /// The derivatives along the owner's u axis.
+    du: Vectors,
+    /// The derivatives along the owner's v axis.
+    dv: Vectors,
+    /// `du × dv`, then normalized: the normals.
+    n: Vectors,
+    /// The lengths `n` was normalized by.
+    n_lengths: Vec<f32>,
+    /// `du · n`: how far `du` leans out of the tangent plane.
+    along: Vec<f32>,
+    /// `du − n (du · n)`, then normalized: the tangents.
+    t: Vectors,
+    /// The lengths `t` was normalized by.
+    t_lengths: Vec<f32>,
+    /// `n × t`: the bitangents.
+    b: Vectors,
+}
+
+/// Frames from central differences for a run of consecutive vertices of one row, pushed onto
+/// `out` in order.
+///
+/// `[plus_u, minus_u, plus_v, minus_v]` hold each vertex's four reads, as [`central`] takes
+/// them. [`Frame::from_derivatives`]' formula runs a step at a time over the whole run, then
+/// each vertex's policy (NaN where an input isn't finite, the fallback where the normal or the
+/// tangent doesn't normalize) picks its frame: vertex `k` gets the bits
+/// `Frame::from_local(central(...))` gives for its reads.
+fn frames_of_run(reads: [&[Vec3]; 4], rows: &mut FrameRows, out: &mut Vec<Frame>) {
+    let [plus_u, minus_u, plus_v, minus_v] = reads;
+    rows.du.set_difference(plus_u, minus_u);
+    rows.dv.set_difference(plus_v, minus_v);
+    rows.n.set_cross(&rows.du, &rows.dv);
+    rows.n.normalize(&mut rows.n_lengths);
+    Vectors::dot_into(&rows.du, &rows.n, &mut rows.along);
+    rows.t.set_minus_scaled(&rows.du, &rows.n, &rows.along);
+    rows.t.normalize(&mut rows.t_lengths);
+    rows.b.set_cross(&rows.n, &rows.t);
+    let inputs = rows.du.points().zip(rows.dv.points());
+    let axes = rows.t.points().zip(rows.b.points()).zip(rows.n.points());
+    let lengths = rows.n_lengths.iter().zip(&rows.t_lengths);
+    out.extend(inputs.zip(axes).zip(lengths).map(
+        |(((du, dv), ((t, b), n)), (&n_length, &t_length))| {
+            // The common case first. A normal that normalizes had finite inputs: an infinite or
+            // NaN component of `du` or `dv` makes two components of `du × dv` infinite or NaN.
+            if normalizable(n_length) & normalizable(t_length) {
+                Frame { t, b, n }
+            } else if du.is_finite() && dv.is_finite() {
+                Frame::FALLBACK
+            } else {
+                Frame::NAN
+            }
+        },
+    ));
+}
+
 /// Frames for every vertex of a predicted block, row-major `(quads + 1)²`. `corners` holds the
 /// predicted rings at base-vertex block corners.
+///
+/// The vertices strictly inside the face go a row at a time through [`frames_of_run`]; the rest
+/// (on the face's border, where the owner's axes or a base vertex's ring apply) one by one. Both
+/// give a vertex the same bits.
 pub(crate) fn frames(
     block: &Block<'_>,
     predicted: &Padded,
     corners: &[Option<CornerAxes<'_>>; 4],
 ) -> Vec<Frame> {
-    per_vertex(block, predicted, corners, |i, j, local| {
+    let q = i64::from(block.quads);
+    let side = usize::try_from(q + 1).unwrap_or(0);
+    let mut out = Vec::with_capacity(side * side);
+    let one = |frames: &mut Vec<Frame>, i: i64, j: i64| {
+        let local = derivatives(block, predicted, corners, i, j);
         debug_assert!(
             local.is_finite(),
             "frame inputs at ({i}, {j}) of {block:?} are not finite"
         );
-        Frame::from_local(local)
-    })
-    .collect()
+        frames.push(Frame::from_local(local));
+    };
+    let (columns, rows) = inside_face(block);
+    let mut scratch = FrameRows::default();
+    for j in 0..=q {
+        if !rows.contains(&j) || columns.is_empty() {
+            (0..=q).for_each(|i| one(&mut out, i, j));
+            continue;
+        }
+        (0..*columns.start()).for_each(|i| one(&mut out, i, j));
+        let row = predicted.row(j);
+        let reads = [
+            run_of(row, &columns, 1),
+            run_of(row, &columns, -1),
+            run_of(predicted.row(j + 1), &columns, 0),
+            run_of(predicted.row(j - 1), &columns, 0),
+        ];
+        let run_start = out.len();
+        frames_of_run(reads, &mut scratch, &mut out);
+        debug_assert!(
+            out.get(run_start..)
+                .is_some_and(|run| run.iter().all(|f| f.n.is_finite())),
+            "frame inputs in row {j} of {block:?} are not finite"
+        );
+        (*columns.end() + 1..=q).for_each(|i| one(&mut out, i, j));
+    }
+    out
 }
 
 /// The unit normal, with [`Frame::from_local`]'s policy: the fallback frame's normal where finite
@@ -353,6 +474,7 @@ pub(crate) fn normals(
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use super::*;
+    use crate::test_rng::Rng;
 
     #[test]
     fn frames_are_orthonormal_and_right_handed() {
@@ -461,6 +583,47 @@ mod tests {
             "NaN frame, not the fallback"
         );
         assert!(!normal(nan.local()).is_finite(), "NaN normal");
+    }
+
+    /// Derivatives that exercise every branch of the frame policy: random, parallel, zero,
+    /// tiny, huge, infinite and NaN, and a normal that normalizes beside a tangent that doesn't.
+    fn awkward_derivatives(rng: &mut Rng, k: usize) -> (Vec3, Vec3) {
+        let du = rng.vec3(1.0);
+        match k % 10 {
+            7 => (Vec3::new(1e-39, 0.0, 0.0), Vec3::new(0.0, 1e20, 0.0)),
+            0 => (du, du * 2.0),
+            1 => (Vec3::ZERO, rng.vec3(1.0)),
+            2 => (Vec3::new(1e-30, 2e-30, 0.0), Vec3::new(0.0, 1e-30, 3e-30)),
+            3 => (Vec3::new(3e18, -2e19, 1e19), Vec3::new(-1e19, 2e19, 3e18)),
+            4 => (Vec3::new(f32::INFINITY, 0.0, 1.0), rng.vec3(1.0)),
+            5 => (du, Vec3::new(0.5, f32::NAN, 0.0)),
+            6 => (Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0)),
+            _ => (du, rng.vec3(1.0)),
+        }
+    }
+
+    /// The row kernel gives every vertex the bits of the one-vertex frame, whatever branch of
+    /// the policy it takes.
+    #[test]
+    fn runs_of_frames_match_one_vertex_frames() {
+        let mut rng = Rng::new(77);
+        for len in [0, 1, 7, 8, 9, 65, 200] {
+            let (du, dv): (Vec<Vec3>, Vec<Vec3>) =
+                (0..len).map(|k| awkward_derivatives(&mut rng, k)).unzip();
+            let zero = vec![Vec3::ZERO; len];
+            let mut out = Vec::new();
+            frames_of_run(
+                [&du, &zero, &dv, &zero],
+                &mut FrameRows::default(),
+                &mut out,
+            );
+            assert_eq!(out.len(), len, "one frame per vertex");
+            for (k, ((&u, &v), got)) in du.iter().zip(&dv).zip(&out).enumerate() {
+                let want = Frame::from_local(central([u, Vec3::ZERO, v, Vec3::ZERO]));
+                let bits = |f: &Frame| [f.t, f.b, f.n].map(Vec3::to_bits);
+                assert_eq!(bits(got), bits(&want), "vertex {k} of {len}: {u:?}, {v:?}");
+            }
+        }
     }
 
     #[test]

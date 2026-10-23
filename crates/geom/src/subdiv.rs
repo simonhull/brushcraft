@@ -36,6 +36,18 @@ impl Padded {
         self.data.len()
     }
 
+    /// Row `j` (`-1 ..= quads + 1`) with its ring: `quads + 3` slots, column `i` at index `i + 1`.
+    /// Empty outside the block and its ring.
+    pub(crate) fn row(&self, j: i64) -> &[Vec3] {
+        let side = usize::try_from(self.quads)
+            .unwrap_or(usize::MAX)
+            .saturating_add(3);
+        usize::try_from(j + 1)
+            .ok()
+            .and_then(|r| self.data.get(r * side..(r + 1) * side))
+            .unwrap_or_default()
+    }
+
     /// Where `(i, j)` is in `data`; `None` outside the block and its ring.
     fn index(&self, i: i64, j: i64) -> Option<usize> {
         let side = i64::from(self.quads) + 3;
