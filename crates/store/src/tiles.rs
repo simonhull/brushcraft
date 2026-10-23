@@ -98,9 +98,7 @@
 //! An edit pins correction slots only, at most one cone width of them, which the minimum's
 //! correction chunks hold once every evaluated chunk is taken back.
 
-#[cfg(test)]
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
@@ -808,6 +806,12 @@ impl std::fmt::Debug for TileStore {
 ///
 /// Each vertex is read from [`TileKey::containing`]'s tile, as [`PositionSource`] requires, so
 /// differing copies on tile borders can't open a seam.
+///
+/// A gather reads a block row by row, so nearly every read falls in the tile the read before
+/// it did: the source remembers that tile's positions, and finds a tile (a binary search of the
+/// pinned tiles, then a pool lookup) only when a read leaves it. The memory is a [`Cell`], so a
+/// source is `!Sync`: each task on the workers makes its own ([`Resident::new`]), which costs
+/// nothing.
 struct Resident<'a> {
     /// Level 0.
     mesh: &'a BaseMesh,
@@ -815,6 +819,39 @@ struct Resident<'a> {
     pool: &'a Pool<EvaluatedSlot>,
     /// The pinned tiles, in key order.
     tiles: &'a [(TileKey, SlotId<EvaluatedSlot>)],
+    /// The tile the last read above level 0 resolved to, and its positions.
+    last: Cell<Option<(TileKey, &'a [Vec3])>>,
+}
+
+impl<'a> Resident<'a> {
+    /// A source over `tiles`, pinned in `pool`, and `mesh` at level 0, remembering no tile yet.
+    const fn new(
+        mesh: &'a BaseMesh,
+        pool: &'a Pool<EvaluatedSlot>,
+        tiles: &'a [(TileKey, SlotId<EvaluatedSlot>)],
+    ) -> Self {
+        Self {
+            mesh,
+            pool,
+            tiles,
+            last: Cell::new(None),
+        }
+    }
+
+    /// The positions of pinned tile `key`, all `SIDE²` of its slot, or `None` if it isn't
+    /// pinned here.
+    fn positions(&self, key: TileKey) -> Option<&'a [Vec3]> {
+        if let Some((last, positions)) = self.last.get()
+            && last == key
+        {
+            return Some(positions);
+        }
+        let at = self.tiles.binary_search_by_key(&key, |&(k, _)| k).ok()?;
+        let &(_, id) = self.tiles.get(at)?;
+        let positions = self.pool.get(id)?.positions.as_slice();
+        self.last.set(Some((key, positions)));
+        Some(positions)
+    }
 }
 
 impl PositionSource for Resident<'_> {
@@ -824,10 +861,8 @@ impl PositionSource for Resident<'_> {
         if level == Level::ZERO {
             return self.mesh.position(face, level, li, lj);
         }
-        let at = self.tiles.binary_search_by_key(&key, |&(k, _)| k).ok()?;
-        let &(_, id) = self.tiles.get(at)?;
         let index = usize::try_from(lj * key.side() + li).ok()?;
-        self.pool.get(id)?.positions.get(index).copied()
+        self.positions(key)?.get(index).copied()
     }
 }
 
@@ -3362,11 +3397,7 @@ impl TileStore {
         scratch: &mut [Vec<Vec3>],
     ) -> Result<(), CacheError> {
         let mesh = &*self.mesh;
-        let source = Resident {
-            mesh,
-            pool: &self.evaluated,
-            tiles: below,
-        };
+        let evaluated = &self.evaluated;
         let pool = &self.corrections;
         let tasks: Vec<(TileKey, SlotId<CorrectionSlot>)> = round
             .iter()
@@ -3379,6 +3410,7 @@ impl TileStore {
                 .ok_or(Invariant::StaleHandle)?
                 .view()
                 .map_err(Invariant::CorrectionSlot)?;
+            let source = Resident::new(mesh, evaluated, below);
             let prediction = predict_region(mesh, &source, Region::of_tile(&key))?;
             let out = prefix_mut(out, vertex_count(&key))?;
             prediction.apply_into(|i, j| view.get(i, j).unwrap_or(Vec3::ZERO), out)?;
@@ -3518,13 +3550,9 @@ impl TileStore {
                 .try_for_each(|(round, inputs)| {
                     let mesh = &*self.mesh;
                     let pool = &self.evaluated;
-                    let source = Resident {
-                        mesh,
-                        pool,
-                        tiles: held,
-                    };
                     let compute = |&(key, since): &(TileKey, Option<&BTreeSet<TileKey>>),
                                    out: &mut Vec<Vec3>| {
+                        let source = Resident::new(mesh, pool, held);
                         let n = vertex_count(&key);
                         let out = prefix_mut(out, n)?;
                         let region = Region::of_tile(&key);
