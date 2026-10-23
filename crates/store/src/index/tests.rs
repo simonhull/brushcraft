@@ -329,3 +329,49 @@ fn level_zero_is_not_indexed() {
         "level 0 has no tiles: {err:?}"
     );
 }
+
+#[test]
+fn rays_along_the_seams_hit_as_brute_force_does() {
+    let mut fx = sphere();
+    let on_seam = fx
+        .index
+        .bvh()
+        .iter()
+        .filter(|(_, b)| b.aabb.min().x == 0.0 || b.aabb.max().x == 0.0)
+        .count();
+    assert!(
+        on_seam >= 8,
+        "the tiles along the x = 0 seams have a face of their box on that plane: {on_seam}"
+    );
+    let mut rng = Rng(13);
+    for k in 0..200 {
+        // Within the plane x = 0: from outside the sphere towards it, aimed off the centre.
+        let angle = rng.range(0.0, std::f32::consts::TAU);
+        let (sin, cos) = angle.sin_cos();
+        let origin = Vec3::new(0.0, 3.0 * cos, 3.0 * sin);
+        let aim = Vec3::new(
+            0.0,
+            -cos + rng.range(-0.2, 0.2),
+            -sin + rng.range(-0.2, 0.2),
+        );
+        let ray = Ray::new(origin, aim).unwrap();
+        let hit = fx.index.raycast(&mut fx.store, &ray).unwrap();
+        let brute = fx
+            .positions
+            .iter()
+            .filter_map(|(key, p)| intersect_tile(&ray, p, key.side()))
+            .reduce(f32::min);
+        let hit = hit.unwrap_or_else(|| panic!("seam ray {k} misses: {ray:?}"));
+        assert_eq!(Some(hit.t), brute, "seam ray {k}: the nearest quad hit");
+        let (_, positions) = fx
+            .positions
+            .iter()
+            .find(|(key, _)| *key == hit.key)
+            .unwrap();
+        assert_eq!(
+            intersect_tile(&ray, positions, hit.key.side()),
+            Some(hit.t),
+            "seam ray {k}: the tile named is one hit there"
+        );
+    }
+}

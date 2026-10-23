@@ -613,7 +613,7 @@ fn ray_entry_handles_inside_parallel_and_behind() {
     let boxed = Aabb::new(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)).unwrap();
     let entry = |origin: Vec3, direction: Vec3| {
         let ray = Ray::new(origin, direction).unwrap();
-        boxed.entry(&ray, ray.inverse_direction())
+        boxed.entry(&ray)
     };
     let x = Vec3::new(1.0, 0.0, 0.0);
     assert_eq!(entry(Vec3::new(0.5, 0.5, 0.5), x), Some(0.0), "from inside");
@@ -644,5 +644,85 @@ fn ray_entry_handles_inside_parallel_and_behind() {
     assert!(
         Ray::new(Vec3::new(f32::NAN, 0.0, 0.0), x).is_none(),
         "and a finite origin"
+    );
+}
+
+#[test]
+fn rays_along_a_face_an_edge_or_a_seam_enter_the_box() {
+    let boxed = Aabb::new(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)).unwrap();
+    let entry = |aabb: &Aabb, origin: Vec3, direction: Vec3| {
+        aabb.entry(&Ray::new(origin, direction).unwrap())
+    };
+    let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+    // Along each face: parallel to the face, the origin on its plane.
+    for (origin, direction, what) in [
+        (Vec3::new(-2.0, 0.0, 0.5), x, "on the low y face"),
+        (Vec3::new(-2.0, 1.0, 0.5), x, "on the high y face"),
+        (Vec3::new(-2.0, 0.5, 0.0), x, "on the low z face"),
+        (Vec3::new(-2.0, 0.5, 1.0), x, "on the high z face"),
+        (Vec3::new(0.0, -3.0, 0.5), y, "on the low x face"),
+        (Vec3::new(1.0, -3.0, 0.5), y, "on the high x face"),
+    ] {
+        let expected = if direction == x { 2.0 } else { 3.0 };
+        assert_eq!(entry(&boxed, origin, direction), Some(expected), "{what}");
+    }
+    // Along the edges, where two of the axes are parallel and on a plane.
+    for (origin, what) in [
+        (Vec3::new(-2.0, 0.0, 0.0), "the low-low edge"),
+        (Vec3::new(-2.0, 1.0, 1.0), "the high-high edge"),
+        (Vec3::new(-2.0, 0.0, 1.0), "a mixed edge"),
+    ] {
+        assert_eq!(entry(&boxed, origin, x), Some(2.0), "along {what}");
+    }
+    // From a corner, along an edge, and from a point on a face, across the box.
+    assert_eq!(
+        entry(&boxed, Vec3::ZERO, x),
+        Some(0.0),
+        "from the corner along an edge"
+    );
+    assert_eq!(
+        entry(&boxed, Vec3::new(0.5, 0.0, 0.5), Vec3::new(1.0, 0.0, 1.0)),
+        Some(0.0),
+        "diagonally within a face"
+    );
+    // Just off a face, parallel: a miss.
+    let off = 1.0 + f32::EPSILON;
+    assert_eq!(
+        entry(&boxed, Vec3::new(-2.0, off, 0.5), x),
+        None,
+        "just outside the high y face"
+    );
+    assert_eq!(
+        entry(&boxed, Vec3::new(-2.0, -1e-30, 0.5), x),
+        None,
+        "just outside the low y face"
+    );
+    // A seam: two boxes sharing the plane x = 0, and rays within that plane, which enter both.
+    let left = Aabb::new(Vec3::new(-1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 1.0)).unwrap();
+    let right = Aabb::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0)).unwrap();
+    for (origin, direction) in [
+        (Vec3::new(0.0, -2.0, 0.5), y),
+        (Vec3::new(0.0, -2.0, -2.0), Vec3::new(0.0, 1.0, 1.0)),
+        (Vec3::new(0.0, 3.0, 0.25), Vec3::new(0.0, -1.0, 0.1)),
+    ] {
+        let (a, b) = (
+            entry(&left, origin, direction),
+            entry(&right, origin, direction),
+        );
+        assert!(
+            a.is_some(),
+            "the seam ray from {origin:?} enters the left box"
+        );
+        assert_eq!(a, b, "and the right one at the same place");
+    }
+    // A tiny but nonzero direction component, on the plane: no NaN either.
+    assert_eq!(
+        entry(
+            &boxed,
+            Vec3::new(-2.0, 0.0, 0.5),
+            Vec3::new(1.0, 1e-40, 0.0)
+        ),
+        Some(2.0),
+        "a subnormal component along the low y face"
     );
 }

@@ -169,20 +169,29 @@ impl Aabb {
     }
 
     /// Where `ray` enters the box: the least `t ≥ 0` with `ray.at(t)` in it (0 if the origin
-    /// is inside), or `None` if the ray misses it. `inverse` is the component-wise reciprocal
-    /// of the ray's direction.
+    /// is inside), or `None` if the ray misses it. The box's faces count as inside, so a ray
+    /// running along a face, an edge or a seam between two boxes enters them.
     ///
     /// The slab test: along each axis the ray is between the box's two planes for an interval
-    /// of `t`, and it is in the box where all three intervals and `t ≥ 0` overlap. A direction
-    /// component of zero has an infinite reciprocal, which makes that axis's interval all of
-    /// `t` (the origin between the planes) or empty (outside them). A ray along one of the
-    /// box's planes is the one case that gives a NaN; `f32::min` and `f32::max` skip it, so
-    /// that axis doesn't constrain `t` then.
-    fn entry(&self, ray: &Ray, inverse: Vec3) -> Option<f32> {
+    /// of `t`, and it is in the box where all three intervals and `t ≥ 0` overlap. An axis the
+    /// ray runs parallel to (its direction component is zero) is decided apart: its interval
+    /// is all of `t` if the origin lies between the two planes, on either one included, and
+    /// empty otherwise, so the ray misses. Every other axis divides by a nonzero, finite
+    /// component, which never gives a NaN (at worst an infinity, for a component so small
+    /// the quotient overflows, and that still orders correctly).
+    fn entry(&self, ray: &Ray) -> Option<f32> {
         let (mut near, mut far) = (0.0_f32, f32::INFINITY);
         for a in Axis::ALL {
-            let t0 = (a.of(self.min) - a.of(ray.origin)) * a.of(inverse);
-            let t1 = (a.of(self.max) - a.of(ray.origin)) * a.of(inverse);
+            let (low, high) = (a.of(self.min), a.of(self.max));
+            let (origin, direction) = (a.of(ray.origin), a.of(ray.direction));
+            if direction == 0.0 {
+                if !(low..=high).contains(&origin) {
+                    return None;
+                }
+                continue;
+            }
+            let t0 = (low - origin) / direction;
+            let t1 = (high - origin) / direction;
             near = near.max(t0.min(t1));
             far = far.min(t0.max(t1));
         }
@@ -227,13 +236,6 @@ impl Ray {
     #[must_use]
     pub fn at(&self, t: f32) -> Vec3 {
         self.origin + self.direction * t
-    }
-
-    /// The component-wise reciprocal of the direction, for [`Aabb::entry`]: infinite along an
-    /// axis the ray is parallel to.
-    fn inverse_direction(&self) -> Vec3 {
-        let d = self.direction;
-        Vec3::new(d.x.recip(), d.y.recip(), d.z.recip())
     }
 }
 
@@ -646,11 +648,10 @@ impl Bvh {
         ray: &Ray,
         mut hit: impl FnMut(TileKey) -> Result<Option<f32>, E>,
     ) -> Result<Option<Hit>, E> {
-        let inverse = ray.inverse_direction();
         let mut heap = BinaryHeap::new();
         // Queues `what` if the ray enters its box `aabb`, keyed by where it does.
         let enter = |queue: &mut BinaryHeap<Candidate>, aabb: &Aabb, what| {
-            if let Some(entry) = aabb.entry(ray, inverse) {
+            if let Some(entry) = aabb.entry(ray) {
                 queue.push(Candidate { entry, what });
             }
         };
