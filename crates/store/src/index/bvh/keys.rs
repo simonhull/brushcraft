@@ -36,9 +36,12 @@ impl KeyTable {
     /// # Errors
     ///
     /// [`IndexError::MixedTiles`] for the first key whose layer, channel or level isn't the
-    /// first key's; [`IndexError::DuplicateTile`] for the first key listed a second time.
-    /// The caller keeps `keys` within [`super::MAX_TILES`], so every position fits a `u32`
-    /// below [`KeyTable::ABSENT`].
+    /// first key's; [`IndexError::TooManyTiles`] if the table would need more than
+    /// [`super::MAX_TILES`] slots (a key of a face so high that every tile of the faces before
+    /// it is more than a tree holds), refused before anything is allocated;
+    /// [`IndexError::DuplicateTile`] for the first key listed a second time. The caller keeps
+    /// `keys` within [`super::MAX_TILES`] too, so every position fits a `u32` below
+    /// [`KeyTable::ABSENT`].
     pub(super) fn new(keys: &[TileKey]) -> Result<Self, IndexError> {
         let Some(first) = keys.first() else {
             return Ok(Self::default());
@@ -55,10 +58,14 @@ impl KeyTable {
             usize::try_from(f).map_or(usize::MAX, |f| f.saturating_add(1))
         });
         let per_side = kind.2.tiles_per_side() as usize;
+        let len = faces.saturating_mul(per_side * per_side);
+        if len > super::MAX_TILES {
+            return Err(IndexError::TooManyTiles(len));
+        }
         let mut table = Self {
             kind: Some(kind),
             per_side,
-            slots: vec![Self::ABSENT; faces.saturating_mul(per_side * per_side)],
+            slots: vec![Self::ABSENT; len],
         };
         for (index, key) in (0..).zip(keys) {
             let slot = table.slot_mut(key).ok_or(IndexError::UnknownTile(*key))?;

@@ -338,6 +338,21 @@ fn a_duplicate_tile_is_refused() {
 }
 
 #[test]
+fn a_tile_of_a_huge_face_is_refused_not_allocated_for() {
+    let b = bounds(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0));
+    let level = Level::new(9).unwrap();
+    // 64 tiles a face at level 9: face 2^24 is the first whose faces up to it pass MAX_TILES.
+    for face in [u32::MAX, 1 << 24] {
+        let far = TileKey::displacement(FaceId::new(face), level, 0, 0).unwrap();
+        let err = Bvh::build(vec![(key(0), b), (far, b)]).unwrap_err();
+        assert!(
+            matches!(err, IndexError::TooManyTiles(n) if n > MAX_TILES),
+            "face {face}: every tile of the faces up to it is more than a tree holds: {err:?}"
+        );
+    }
+}
+
+#[test]
 fn tiles_of_another_level_layer_or_channel_are_refused() {
     let b = bounds(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0));
     let other_level = TileKey::displacement(FaceId::new(0), Level::new(8).unwrap(), 0, 0).unwrap();

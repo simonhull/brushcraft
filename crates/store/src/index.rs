@@ -39,7 +39,8 @@ pub enum IndexError {
     /// the first.
     #[error("{0:?} is not of the same level, layer and channel as the other tiles")]
     MixedTiles(TileKey),
-    /// A build was given more than [`MAX_TILES`] tiles: this many.
+    /// A build was given more than [`MAX_TILES`] tiles, or tiles of a face so high that the
+    /// tiles of every face up to it are more: this many.
     #[error("{0} tiles are more than an index holds")]
     TooManyTiles(usize),
     /// A refit or an update named a tile the index doesn't hold.
