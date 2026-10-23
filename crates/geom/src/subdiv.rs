@@ -48,6 +48,17 @@ impl Padded {
             .unwrap_or_default()
     }
 
+    /// Row `j` (`-1 ..= quads + 1`) with its ring, writable: as [`Padded::row`].
+    fn row_mut(&mut self, j: i64) -> &mut [Vec3] {
+        let side = usize::try_from(self.quads)
+            .unwrap_or(usize::MAX)
+            .saturating_add(3);
+        usize::try_from(j + 1)
+            .ok()
+            .and_then(|r| self.data.get_mut(r * side..(r + 1) * side))
+            .unwrap_or_default()
+    }
+
     /// Where `(i, j)` is in `data`; `None` outside the block and its ring.
     fn index(&self, i: i64, j: i64) -> Option<usize> {
         let side = i64::from(self.quads) + 3;
@@ -189,83 +200,75 @@ pub(crate) fn ring_edge_point(ring: &CornerRing, k: usize) -> Vec3 {
 /// at block corner `c` (0: `(0,0)`, 1: `(q,0)`, 2: `(q,q)`, 3: `(0,q)`) when that corner is one.
 /// Returns the block at level `l` (twice the quads) with its ring; ring slots that would need a
 /// missing diagonal are NaN.
+///
+/// Each child row is computed from two or three parent rows as slices: child row `2j`
+/// ([`vertex_row`]) from parent rows `j − 1`, `j` and `j + 1`, child row `2b + 1`
+/// ([`face_row`]) from parent rows `b` and `b + 1`. Every read lies in the padded parent block.
 pub(crate) fn predict(parent: &Padded, corners: &[Option<CornerRing>; 4]) -> Padded {
     let q = i64::from(parent.quads());
     let big = 2 * q;
     let mut out = Padded::filled(parent.quads() * 2, Vec3::NAN);
-    let g = |i: i64, j: i64| parent.get(i, j);
-    let outside = |x: i64| x < 0 || x > big;
-    for jj in -1..=big + 1 {
-        for ii in -1..=big + 1 {
-            if outside(ii) && outside(jj) {
-                continue;
-            }
-            let value = match (ii.rem_euclid(2) == 1, jj.rem_euclid(2) == 1) {
-                (false, false) => {
-                    let (i, j) = (ii / 2, jj / 2);
-                    corner_ring(corners, q, i, j).map_or_else(
-                        || {
-                            vertex_point(
-                                g(i, j),
-                                [g(i + 1, j), g(i, j + 1), g(i - 1, j), g(i, j - 1)],
-                                [
-                                    g(i + 1, j + 1),
-                                    g(i - 1, j + 1),
-                                    g(i - 1, j - 1),
-                                    g(i + 1, j - 1),
-                                ],
-                            )
-                        },
-                        extraordinary,
-                    )
-                }
-                (true, false) => {
-                    let (a, b) = ((ii - 1).div_euclid(2), jj / 2);
-                    edge_point(
-                        g(a, b),
-                        g(a + 1, b),
-                        g(a, b - 1),
-                        g(a + 1, b - 1),
-                        g(a, b + 1),
-                        g(a + 1, b + 1),
-                    )
-                }
-                (false, true) => {
-                    let (a, b) = (ii / 2, (jj - 1).div_euclid(2));
-                    edge_point(
-                        g(a, b),
-                        g(a, b + 1),
-                        g(a - 1, b),
-                        g(a - 1, b + 1),
-                        g(a + 1, b),
-                        g(a + 1, b + 1),
-                    )
-                }
-                (true, true) => {
-                    let (a, b) = ((ii - 1).div_euclid(2), (jj - 1).div_euclid(2));
-                    face_point(g(a, b), g(a + 1, b), g(a + 1, b + 1), g(a, b + 1))
-                }
-            };
-            out.set(ii, jj, value);
+    for j in 0..=q {
+        let rows = [parent.row(j - 1), parent.row(j), parent.row(j + 1)];
+        vertex_row(rows, out.row_mut(2 * j));
+    }
+    for b in -1..=q {
+        face_row([parent.row(b), parent.row(b + 1)], out.row_mut(2 * b + 1));
+    }
+    // The ring rows' end slots, diagonally off the block's corners, have no point.
+    for (i, j) in [(-1, -1), (big + 1, -1), (-1, big + 1), (big + 1, big + 1)] {
+        out.set(i, j, Vec3::NAN);
+    }
+    for (c, (i, j)) in [(0, 0), (big, 0), (big, big), (0, big)]
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(ring) = corners.get(c).and_then(Option::as_ref) {
+            out.set(i, j, extraordinary(ring));
         }
     }
     out
 }
 
-/// The base-vertex ring at block position `(i, j)`, if that is a block corner with one.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "grid math keeps the conventions' names: q, c and (i, j)"
-)]
-fn corner_ring(corners: &[Option<CornerRing>; 4], q: i64, i: i64, j: i64) -> Option<&CornerRing> {
-    let c = match (i, j) {
-        (0, 0) => 0,
-        (x, 0) if x == q => 1,
-        (x, y) if x == q && y == q => 2,
-        (0, y) if y == q => 3,
-        _ => return None,
-    };
-    corners.get(c)?.as_ref()
+/// Child row `2j` (padded, ring included) from parent rows `[j − 1, j, j + 1]` (padded): an edge
+/// point at every odd child column and a regular vertex point at every even one.
+///
+/// Child columns `2i − 1` and `2i` read the parent's columns `i − 1 ..= i + 1`, a three-wide
+/// window; the last child column reads the parent's last two. Base vertices get their own rule
+/// afterwards, in [`predict`].
+fn vertex_row([up, mid, down]: [&[Vec3]; 3], out: &mut [Vec3]) {
+    let (pairs, rest) = out.as_chunks_mut::<2>();
+    let windows = up
+        .array_windows::<3>()
+        .zip(mid.array_windows())
+        .zip(down.array_windows());
+    for ([edge, vertex], (([ul, uc, ur], [ml, mc, mr]), [dl, dc, dr])) in
+        pairs.iter_mut().zip(windows)
+    {
+        *edge = edge_point(*ml, *mc, *ul, *uc, *dl, *dc);
+        *vertex = vertex_point(*mc, [*mr, *dc, *ml, *uc], [*dr, *dl, *ul, *ur]);
+    }
+    let last = (up.last_chunk(), mid.last_chunk(), down.last_chunk());
+    if let ([edge], (Some([ul, ur]), Some([ml, mr]), Some([dl, dr]))) = (rest, last) {
+        *edge = edge_point(*ml, *mr, *ul, *ur, *dl, *dr);
+    }
+}
+
+/// Child row `2b + 1` (padded, ring included) from parent rows `[b, b + 1]` (padded): a face
+/// point at every odd child column and an edge point at every even one.
+///
+/// Child columns `2i − 1` and `2i` read the parent's columns `i − 1 ..= i + 1`, a three-wide
+/// window; the last child column reads the parent's last two.
+fn face_row([lo, hi]: [&[Vec3]; 2], out: &mut [Vec3]) {
+    let (pairs, rest) = out.as_chunks_mut::<2>();
+    let windows = lo.array_windows::<3>().zip(hi.array_windows());
+    for ([face, edge], ([ll, lc, lr], [hl, hc, hr])) in pairs.iter_mut().zip(windows) {
+        *face = face_point(*ll, *lc, *hc, *hl);
+        *edge = edge_point(*lc, *hc, *ll, *hl, *lr, *hr);
+    }
+    if let ([face], Some([ll, lr]), Some([hl, hr])) = (rest, lo.last_chunk(), hi.last_chunk()) {
+        *face = face_point(*ll, *lr, *hr, *hl);
+    }
 }
 
 #[cfg(test)]
