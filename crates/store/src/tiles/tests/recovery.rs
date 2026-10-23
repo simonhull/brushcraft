@@ -906,6 +906,51 @@ fn a_roll_over_carries_every_edit_and_lists_what_it_cannot_read() {
     }
 }
 
+/// A tile lost to a roll-over drops what was evaluated from its lost edit.
+///
+/// Afterwards the store evaluates the tile as no file it reads holds the edit, and an index
+/// refitted then saves bounds of that state.
+#[test]
+fn a_tile_lost_to_a_roll_over_drops_what_was_evaluated_from_it() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let top = tiles(&mesh, TOP, TOP);
+    let (lost, kept) = (top[5], top[30]);
+    let mut want = CorrectionMap::new();
+    edit_interior(
+        &mut store,
+        &mut CorrectionMap::new(),
+        lost,
+        Vec3::new(0.0, 0.0, 0.25),
+    );
+    edit_interior(&mut store, &mut want, kept, Vec3::new(0.25, 0.0, 0.0));
+    store.save().unwrap();
+    let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    // The clean slot goes; the evaluations made from it stay cached.
+    store.corrections.remove(&lost).unwrap();
+    damage(&path, store.file.locate(&lost).unwrap());
+    let meta = store.file.meta().clone();
+    let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
+    let filled = store.fill_roll_over(fresh).unwrap();
+    let (old, lost_tiles) = store.roll_over(filled).unwrap();
+    drop(old);
+    assert_eq!(lost_tiles, [lost], "listed as lost");
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &want),
+        &tiles(&mesh, 1, TOP),
+        "the lost tile and what reads it, without the lost edit",
+    );
+    index.update(&mut store, &top).unwrap();
+    store.save().unwrap();
+    drop(store);
+    let file = ProjectFile::open(&dir.path("fresh.bcrf")).unwrap();
+    let mut reopened = TileStore::open(file, roomy()).unwrap();
+    assert_loads_as_built(&mut reopened, level(TOP), "saved after the roll-over");
+}
+
 /// A clean resident tile whose record no longer reads is carried across a roll-over from its
 /// slot, labelled with the op of the record the slot holds: never a newer edit's, which never
 /// touched it.

@@ -1464,13 +1464,14 @@ impl TileStore {
     /// records are no longer needed. That is checked, not assumed: every tile of the old
     /// working file and of the old base must be in the new save point, but for those the save
     /// listed as lost ([`Saved::lost`]), whose last saved state the store reads from now on (a
-    /// lost tile's resident slot is dropped, if no pin holds it). Dirty slots are clean
+    /// lost tile's resident slot is dropped, if no pin holds it, and every evaluation that
+    /// followed from it too, as it may have come from the lost edit). Dirty slots are clean
     /// after the rebase (the save wrote them), and every other resident correction tile is kept,
-    /// as it is what was just saved; so are cached evaluations, which stay valid: nothing they
-    /// read has changed. Prefetches in flight are dropped (their workers stop and are joined),
-    /// and later ones read the new files. The op generator continues, past the base's head if
-    /// that is newer, and the current op ends: the next edit starts a new one, so the edits
-    /// after a save point are newer than its head.
+    /// as it is what was just saved; so are the other cached evaluations, which stay valid: nothing
+    /// they read has changed. Prefetches in flight are dropped (their workers stop and are
+    /// joined), and later ones read the new files. The op generator continues, past the base's
+    /// head if that is newer, and the current op ends: the next edit starts a new one, so the
+    /// edits after a save point are newer than its head.
     ///
     /// # Errors
     ///
@@ -1535,6 +1536,8 @@ impl TileStore {
                 }
             }
         }
+        // What was evaluated from a lost edit isn't the saved state the store reads from now on.
+        self.invalidate_edited(lost.iter().copied());
         self.prune_known_ops();
         self.since_rebase.clear();
         self.bounds.rebased();
@@ -1653,7 +1656,8 @@ impl TileStore {
     /// they held is in it), and the generation moves on, so a flush started before is
     /// abandoned. The base is unchanged, and so are the tiles to save into the project, but for
     /// the lost ones: they are in no file the store writes, so the next save leaves them at
-    /// their last saved state instead of failing to find them.
+    /// their last saved state instead of failing to find them. Every evaluation that followed
+    /// from a lost tile is dropped, as it may have come from the lost edit.
     ///
     /// # Errors
     ///
@@ -1679,6 +1683,8 @@ impl TileStore {
         for key in &lost {
             self.since_rebase.remove(key);
         }
+        // What was evaluated from a lost edit isn't what the store reads from now on.
+        self.invalidate_edited(lost.iter().copied());
         for (key, id) in cleaned {
             self.corrections.set_dirty(id, false)?;
             if let Some(write) = self.unsaved.remove(&key) {

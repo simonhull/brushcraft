@@ -2,6 +2,8 @@
 //! dense evaluation of every edit in both, and across a rebase onto a new save.
 
 use super::*;
+use crate::index::SpatialIndex;
+use crate::index::tests::assert_loads_as_built;
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
 
@@ -524,6 +526,61 @@ fn a_recovery_file_opened_beside_its_project_shares_the_mesh() {
     drop(ProjectFile::create(&dir.path("o.bcrf"), meta_for(&other), Arc::clone(&other)).unwrap());
     let theirs = ProjectFile::open_sharing_mesh(&dir.path("o.bcrf"), &project).unwrap();
     assert_eq!(theirs.mesh().to_bytes(), other.to_bytes(), "its own mesh");
+}
+
+/// A tile lost to a save drops what was evaluated from its lost edit.
+///
+/// After the rebase the store evaluates the saved state, and the bounds an index then records
+/// and saves are that state's.
+///
+/// The lost edit's tile was evaluated (by an index build) before its correction slot left the
+/// pool, as pools evict independently under a budget, so cached positions came from the edit
+/// the save couldn't read.
+#[test]
+fn a_tile_lost_to_a_save_drops_what_was_evaluated_from_it() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let all = tiles(&mesh, 1, TOP);
+    let top = tiles(&mesh, TOP, TOP);
+    let mut saved = CorrectionMap::new();
+    let mut project = saved_project(
+        &dir,
+        "p.bcrf",
+        &mesh,
+        &mut saved,
+        &random_edits(&mesh, TOP, 40, 81),
+    );
+    let working = recovery(&dir, "r1.bcrf", &project);
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), roomy()).unwrap();
+    let lost = top[5];
+    apply_batches(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &[(lost, vec![(5, 7, Vec3::new(0.0, 0.0, 0.25))])],
+    );
+    store.save().unwrap();
+    let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    // The clean slot goes; the evaluations made from it stay cached.
+    store.corrections.remove(&lost).unwrap();
+    damage(&dir.path("r1.bcrf"), store.file.locate(&lost).unwrap());
+    let proof = store.save_into(&mut project).unwrap();
+    assert_eq!(proof.lost().iter().copied().collect::<Vec<_>>(), [lost]);
+    store
+        .rebase(proof, recovery(&dir, "r2.bcrf", &project))
+        .unwrap();
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &saved),
+        &all,
+        "the lost tile and what reads it, at the saved state",
+    );
+    index.update(&mut store, &top).unwrap();
+    drop(save_and_rebase(&mut store, &mut project, &dir, "r3.bcrf"));
+    drop(store);
+    drop(project);
+    let file = ProjectFile::open(&dir.path("p.bcrf")).unwrap();
+    let mut reopened = TileStore::open(file, roomy()).unwrap();
+    assert_loads_as_built(&mut reopened, level(TOP), "saved after the lost tile");
 }
 
 /// A save that can't read a tile's latest edit lists the tile as lost and leaves it at its last
