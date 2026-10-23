@@ -1962,6 +1962,50 @@ impl TileStore {
         outcome
     }
 
+    /// `key`'s evaluated positions as cached, if they are current: no evaluation, and the read
+    /// doesn't count as a use of the tile (which [`TileStore::evaluate`] does, for eviction).
+    /// `None` if they aren't current; evaluate them first.
+    ///
+    /// With [`TileStore::par_map`], for reading many tiles' positions on the workers.
+    #[must_use]
+    pub fn cached_positions(&self, key: &TileKey) -> Option<&[Vec3]> {
+        let id = self.fresh_slot(key)?;
+        prefix(&self.evaluated.get(id)?.positions, vertex_count(key)).ok()
+    }
+
+    /// `key`'s unit normals as cached, if they are current, as [`TileStore::cached_positions`]
+    /// gives positions (current normals go with current positions). `None` if they aren't
+    /// current; compute them with [`TileStore::normals`] or [`TileStore::evaluate_many`] first.
+    #[must_use]
+    pub fn cached_normals(&self, key: &TileKey) -> Option<&[Vec3]> {
+        let id = self.fresh_slot(key)?;
+        if !self.deps.has_normals(key) {
+            return None;
+        }
+        prefix(&self.evaluated.get(id)?.normals, vertex_count(key)).ok()
+    }
+
+    /// `key`'s evaluated slot if its positions are current, found without counting as a use.
+    fn fresh_slot(&self, key: &TileKey) -> Option<SlotId<EvaluatedSlot>> {
+        (self.evaluated.freshness(key)? == Freshness::Fresh)
+            .then(|| self.evaluated.find(key))
+            .flatten()
+    }
+
+    /// `f` of every item of `items`, in order, computed on the store's evaluation workers
+    /// ([`StoreConfig::threads`]); a single item is computed on the calling thread.
+    ///
+    /// For per-tile work over what the store has cached (with
+    /// [`TileStore::cached_positions`] and [`TileStore::cached_normals`]) that is independent
+    /// tile by tile: the results come back in item order however the work was spread.
+    pub fn par_map<T: Sync, R: Send>(
+        &self,
+        items: &[T],
+        f: impl Fn(&T) -> R + Sync + Send,
+    ) -> Vec<R> {
+        map_parallel(&self.workers, items, f)
+    }
+
     /// `key`'s evaluated positions, row-major `side²`: cached, else computed coarse to fine
     /// from the base mesh, or from the finest level of its cone that is cached (see the module
     /// notes), with its corrections.

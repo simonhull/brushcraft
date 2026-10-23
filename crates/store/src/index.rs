@@ -151,6 +151,9 @@ impl TileBounds {
     }
 }
 
+/// A tile's cached positions and normals, which its bounds are computed from.
+type Cached<'a> = (&'a [Vec3], &'a [Vec3]);
+
 /// The spatial index over every tile of one level (see the module notes).
 #[derive(Debug, Clone)]
 pub struct SpatialIndex {
@@ -184,8 +187,8 @@ impl SpatialIndex {
         let mut tiles = Vec::with_capacity(total);
         for batch in keys.chunks(BUILD_BATCH) {
             store.evaluate_many(batch, Evaluation::Normals)?;
-            for &key in batch {
-                tiles.push((key, Self::bounds_of(store, key)?));
+            for bounds in Self::bounds_of_all(store, batch)? {
+                tiles.push(bounds);
                 progress(tiles.len(), total);
             }
         }
@@ -234,11 +237,55 @@ impl SpatialIndex {
     /// The index is unchanged on error.
     pub fn refit(&mut self, store: &mut TileStore, keys: &[TileKey]) -> Result<(), IndexError> {
         self.check_known(keys)?;
-        let changed = keys
-            .iter()
-            .map(|&key| Ok((key, Self::bounds_of(store, key)?)))
-            .collect::<Result<Vec<_>, IndexError>>()?;
+        let changed = Self::bounds_of_all(store, keys)?;
         self.bvh.refit(&changed)
+    }
+
+    /// The bounds of each of `keys`, in order, as [`SpatialIndex::bounds_of`] gives them.
+    ///
+    /// Each tile is made current as `bounds_of` makes it, one after another (a lookup for a
+    /// tile already current), and then the bounds, which are a box and a cone over each tile's
+    /// cached positions and normals, are computed on the store's workers
+    /// ([`TileStore::par_map`]). A tile that a later tile's evaluation pushed out of the cache
+    /// meanwhile is done on its own, with `bounds_of`. Either way the bounds are those of the
+    /// tile as the store evaluates it.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpatialIndex::bounds_of`], for the first tile that fails.
+    fn bounds_of_all(
+        store: &mut TileStore,
+        keys: &[TileKey],
+    ) -> Result<Vec<(TileKey, TileBounds)>, IndexError> {
+        for &key in keys {
+            store.evaluate(key)?;
+            store.normals(key)?;
+        }
+        let computed: Vec<Option<Result<TileBounds, IndexError>>> = {
+            let cache = &*store;
+            let cached: Vec<(TileKey, Option<Cached<'_>>)> = keys
+                .iter()
+                .map(|key| {
+                    let views = cache.cached_positions(key).zip(cache.cached_normals(key));
+                    (*key, views)
+                })
+                .collect();
+            cache.par_map(&cached, |&(key, views)| {
+                views.map(|(positions, normals)| {
+                    TileBounds::of_tile(positions, normals).ok_or(IndexError::NoBounds(key))
+                })
+            })
+        };
+        keys.iter()
+            .zip(computed)
+            .map(|(&key, bounds)| {
+                let bounds = match bounds {
+                    Some(bounds) => bounds?,
+                    None => Self::bounds_of(store, key)?,
+                };
+                Ok((key, bounds))
+            })
+            .collect()
     }
 
     /// Checks that every tile of `keys` is in the index.

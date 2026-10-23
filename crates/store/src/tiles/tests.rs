@@ -2067,6 +2067,33 @@ fn updating_tiles_equals_updating_each_in_turn() {
 }
 
 #[test]
+fn the_cache_is_read_only_while_current() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let key = tiles(&mesh, TOP, TOP)[7];
+    assert_eq!(store.cached_positions(&key), None, "nothing evaluated yet");
+    let positions = store.evaluate(key).unwrap().to_vec();
+    assert_eq!(store.cached_positions(&key), Some(positions.as_slice()));
+    assert_eq!(store.cached_normals(&key), None, "positions alone");
+    let normals = store.normals(key).unwrap().to_vec();
+    assert_eq!(store.cached_normals(&key), Some(normals.as_slice()));
+    store.begin_op().unwrap();
+    store
+        .edit_tile(key, |edit| edit.set(3, 3, Vec3::new(0.0, 0.0, 0.001)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.cached_positions(&key),
+        None,
+        "an edit makes them stale"
+    );
+    assert_eq!(store.cached_normals(&key), None, "and the normals");
+    let squares = store.par_map(&[1_u32, 2, 3, 4, 5], |&n| n * n);
+    assert_eq!(squares, [1, 4, 9, 16, 25], "in item order");
+}
+
+#[test]
 fn an_unread_edit_still_reaches_untracked_tiles() {
     let dir = TestDir::new();
     let mesh = mesh();
