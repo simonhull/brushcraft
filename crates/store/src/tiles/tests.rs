@@ -2162,6 +2162,68 @@ fn updating_tiles_equals_updating_each_in_turn() {
     drop(guards);
 }
 
+/// A tile of a run whose border fails before the row of its first interior write still has its
+/// interior pass applied: it is marked written, never left changed and clean.
+///
+/// Tile 1 of three pinned tiles gets a value that isn't finite at border vertex `(0, 2)` and a
+/// write at interior vertex `(4, 5)`, which the parallel pass makes before the border is
+/// reached; tile 2, after the failure, an interior write too.
+#[test]
+fn a_failed_update_still_marks_what_it_wrote() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let keys: Vec<TileKey> = tiles(&mesh, TOP, TOP).into_iter().take(3).collect();
+    let guard = store.pin(&keys).unwrap();
+    store.evaluate_many(&keys, Evaluation::Positions).unwrap();
+    let before: Vec<Vec<u8>> = keys.iter().map(|key| slot_resident(&store, key)).collect();
+    let op = store.begin_op().unwrap();
+    let outcome = store.update_tiles(&keys, |n, i, j, c| match (n, i, j) {
+        (1, 0, 2) => Some(Vec3::new(f32::NAN, 0.0, 0.0)),
+        (1 | 2, 4, 5) => Some(Vec3::new(c.x, c.y, c.z + 0.01)),
+        _ => None,
+    });
+    assert!(
+        matches!(
+            outcome,
+            Err(CacheError::Correction(CorrectionError::NotFinite))
+        ),
+        "{outcome:?}"
+    );
+    let fed: Vec<TileKey> = store
+        .feed
+        .drain(store.save_consumer)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    for (n, key) in keys.iter().enumerate() {
+        if slot_resident(&store, key) == before[n] {
+            assert!(
+                !store.unsaved.contains_key(key),
+                "tile {n}: unchanged, clean"
+            );
+            continue;
+        }
+        assert_eq!(
+            store.unsaved.get(key).map(|dirty| dirty.op),
+            Some(op),
+            "tile {n}: changed, so dirty in the op"
+        );
+        assert!(fed.contains(key), "tile {n}: changed, so on the feed");
+        assert_eq!(
+            store.cached_positions(key),
+            None,
+            "tile {n}: changed, so its evaluation is dropped"
+        );
+    }
+    assert_ne!(
+        slot_resident(&store, &keys[1]),
+        before[1],
+        "tile 1's interior pass was applied"
+    );
+    drop(guard);
+}
+
 #[test]
 fn the_cache_is_read_only_while_current() {
     let dir = TestDir::new();

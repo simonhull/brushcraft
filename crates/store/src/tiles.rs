@@ -1874,9 +1874,13 @@ impl TileStore {
     /// # Errors
     ///
     /// As [`TileStore::edit_tile`] and [`TileEdit::update`], for the first tile that fails, in
-    /// order: the tiles before it are edited, and it is left as [`TileEdit::update`] leaves a
-    /// tile. Tiles after it in its run may have had their interiors written; any that was is
-    /// marked written and its evaluations dropped, as for a whole edit.
+    /// order: the tiles before it are edited. A tile edited one at a time is left as
+    /// [`TileEdit::update`] leaves it; one of a run may have its whole interior pass applied
+    /// (every interior vertex up to the one the pass failed at, if any), even where a border
+    /// vertex earlier in row-major order failed. Tiles after it in its run may have had their
+    /// interiors written too. Every tile of the run whose interior was written is marked
+    /// written (dirty, on the change feed with the op) and its evaluations dropped, as for a
+    /// whole edit, each of them even if marking another fails; the first error is returned.
     pub fn update_tiles(
         &mut self,
         keys: &[TileKey],
@@ -1942,14 +1946,18 @@ impl TileStore {
         let mut outcome = Ok(());
         for (k, (&key, pass)) in run.iter().zip(interiors).enumerate() {
             if outcome.is_err() {
-                // Past the failing tile: one whose interior was written is marked and dropped.
+                // Past the failing tile: one whose interior was written is marked and dropped,
+                // each of them whatever marking another does, and the first error is kept.
                 if pass.first_row.is_some() {
                     #[expect(
                         clippy::redundant_closure_for_method_calls,
                         reason = "the method path names one edit lifetime; edit_tile's closure \
                                   must take any"
                     )]
-                    self.edit_tile(key, |edit| edit.mark_own_written())??;
+                    let marked = self
+                        .edit_tile(key, |edit| edit.mark_own_written())
+                        .and_then(std::convert::identity);
+                    keep_first(&mut outcome, marked);
                 }
                 continue;
             }
@@ -3985,8 +3993,30 @@ impl TileEdit<'_> {
     ///
     /// # Errors
     ///
-    /// As [`TileEdit::set`] for a border vertex; else the interior pass's error.
+    /// As [`TileEdit::set`] for a border vertex; else the interior pass's error. Whatever
+    /// fails, and wherever in row-major order, a tile whose interior the pass wrote is marked
+    /// written: its slot holds the pass's writes, before the failing vertex or not.
     fn update_border(
+        &mut self,
+        pass: InteriorPass,
+        f: impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+    ) -> Result<(), CacheError> {
+        let wrote = pass.first_row.is_some();
+        let mut outcome = self.border_writes(pass, f);
+        if outcome.is_err() && wrote {
+            keep_first(&mut outcome, self.mark_own_written());
+        }
+        outcome
+    }
+
+    /// [`TileEdit::update_border`]'s writes, in row-major order, stopping at the first that
+    /// fails; the tile is marked written at its first interior row only if no write before it
+    /// fails.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileEdit::update_border`].
+    fn border_writes(
         &mut self,
         pass: InteriorPass,
         mut f: impl FnMut(u32, u32, Vec3) -> Option<Vec3>,

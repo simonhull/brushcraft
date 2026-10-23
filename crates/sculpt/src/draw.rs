@@ -254,8 +254,9 @@ impl Laps {
 /// [`SculptError::Cache`] if the store can't pin the tiles the brush touches (more than its
 /// budget holds, for one), evaluate them or edit them; [`SculptError::Index`] if the index
 /// can't be updated; [`SculptError::Eval`] never, for a valid mesh. An error in the edit phase
-/// leaves the tiles edited as [`TileStore::update_tiles`] says, and the index not updated for
-/// them: rebuild it.
+/// leaves the tiles edited as [`TileStore::update_tiles`] says (the failing tile may have its
+/// whole interior pass applied, and is then marked dirty), and the index not updated for them:
+/// rebuild it.
 pub fn draw_step(
     project: &mut Project,
     index: &mut SpatialIndex,
