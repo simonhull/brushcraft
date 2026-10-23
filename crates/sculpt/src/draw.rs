@@ -4,10 +4,11 @@
 //!
 //! 1. **Query**: the tiles whose boxes the brush's sphere touches, from the spatial index.
 //! 2. **Pin**: those tiles are evaluated and pinned, so they stay resident for the step.
-//! 3. **Brush**: `brush::draw` over each tile's evaluated positions, giving each vertex within the
-//!    radius its delta along the normal axis of its tangent frame. Every delta is computed before
-//!    any correction is written: an edit moves the positions of every tile holding a copy of the
-//!    vertex, and a later tile's brush must see the surface as the step found it.
+//! 3. **Brush**: `brush::draw` over each tile's evaluated positions (the tiles on the store's
+//!    workers), giving each vertex within the radius its delta along the normal axis of its tangent
+//!    frame. Every delta is computed before any correction is written: an edit moves the positions
+//!    of every tile holding a copy of the vertex, and a later tile's brush must see the surface as
+//!    the step found it.
 //! 4. **Edit**: each delta is added to the `z` of its vertex's correction (read-modify-write, `c.z
 //!    += delta`) through [`TileStore::update_tiles`], which keeps seam twins in step and, the tiles
 //!    being pinned, writes their interiors in parallel.
@@ -301,6 +302,11 @@ pub fn draw_step(
 /// (pinned, so cached), and keeps the deltas of the vertices each tile owns (see
 /// [`geom::Topology::owns`]).
 ///
+/// Each tile is made current first, in order, as [`TileStore::evaluate`] makes it (a lookup,
+/// as it is pinned); then the tiles are brushed on the store's workers
+/// ([`TileStore::par_map`]) from their cached positions, each on its own, and gathered in key
+/// order. A tile whose positions aren't cached is brushed on its own afterwards.
+///
 /// # Errors
 ///
 /// As [`TileStore::evaluate`].
@@ -309,36 +315,91 @@ fn run_brush(
     keys: &[TileKey],
     params: DrawParams,
 ) -> Result<BrushOutput, CacheError> {
-    let center = [params.center.x, params.center.y, params.center.z];
-    let mut found = BrushOutput::default();
     for &key in keys {
-        let positions = store.evaluate(key)?;
-        let mut deltas = vec![0.0; positions.len()];
-        let inside = brush::draw(
-            &Smoothstep,
-            center,
-            params.radius,
-            params.strength,
-            bytemuck::cast_slice(positions),
-            &mut deltas,
-        );
-        if inside == 0 {
+        store.evaluate(key)?;
+    }
+    let brushed: Vec<Option<TileBrush>> = {
+        let cache = &*store;
+        let topology = cache.mesh().topology();
+        let cached: Vec<(TileKey, Option<&[Vec3]>)> = keys
+            .iter()
+            .map(|key| (*key, cache.cached_positions(key)))
+            .collect();
+        cache.par_map(&cached, |&(key, positions)| {
+            positions.map(|positions| brush_tile(topology, key, positions, params))
+        })
+    };
+    let mut found = BrushOutput::default();
+    for (&key, tile) in keys.iter().zip(brushed) {
+        let tile = tile.map_or_else(
+            || {
+                let positions = store.evaluate(key)?.to_vec();
+                Ok::<_, CacheError>(brush_tile(store.mesh().topology(), key, &positions, params))
+            },
+            Ok,
+        )?;
+        if !tile.reached {
             continue;
         }
         found.reached.push(key);
-        let topology = store.mesh().topology();
-        for ((i, j), delta) in vertices(key.side()).zip(&mut deltas) {
-            if *delta != 0.0 && !topology.owns(&key, i, j) {
-                *delta = 0.0;
-            }
-        }
-        let moved = deltas.iter().filter(|&&delta| delta != 0.0).count();
-        if moved > 0 {
-            found.vertices += moved;
-            found.edits.push(TileDeltas { key, deltas });
+        if tile.moved > 0 {
+            found.vertices += tile.moved;
+            found.edits.push(TileDeltas {
+                key,
+                deltas: tile.deltas,
+            });
         }
     }
     Ok(found)
+}
+
+/// What the brush does to one tile: see [`brush_tile`].
+#[derive(Debug)]
+struct TileBrush {
+    /// Whether a vertex of the tile is within the radius: its positions move.
+    reached: bool,
+    /// The deltas of the vertices the tile owns, one per vertex, row-major; zero elsewhere.
+    deltas: Vec<f32>,
+    /// How many of them aren't zero.
+    moved: usize,
+}
+
+/// Runs the draw brush over `positions`, tile `key`'s evaluated positions, and keeps the deltas
+/// of the vertices the tile owns (see [`geom::Topology::owns`]).
+fn brush_tile(
+    topology: &geom::Topology,
+    key: TileKey,
+    positions: &[Vec3],
+    params: DrawParams,
+) -> TileBrush {
+    let center = [params.center.x, params.center.y, params.center.z];
+    let mut deltas = vec![0.0; positions.len()];
+    let inside = brush::draw(
+        &Smoothstep,
+        center,
+        params.radius,
+        params.strength,
+        bytemuck::cast_slice(positions),
+        &mut deltas,
+    );
+    if inside == 0 {
+        return TileBrush {
+            reached: false,
+            deltas,
+            moved: 0,
+        };
+    }
+    for ((i, j), delta) in vertices(key.side()).zip(&mut deltas) {
+        if *delta != 0.0 && !topology.owns(&key, i, j) {
+            *delta = 0.0;
+        }
+    }
+    let moved = deltas.iter().filter(|&&delta| delta != 0.0).count();
+    TileBrush {
+        reached: true,
+        deltas,
+        moved,
+    }
 }
 
 /// The edit for vertex `(i, j)` of tile `edits[n]`, whose correction is `c`: its delta added
