@@ -626,16 +626,6 @@ struct EvalLog {
     normal_inputs_listed: Cell<usize>,
 }
 
-#[cfg(test)]
-impl EvalLog {
-    /// Every tile whose positions (`false`) were computed, in order, then every tile whose
-    /// normals (`true`) were: for comparing what two stores did.
-    fn computed(&self) -> impl Iterator<Item = (TileKey, bool)> + '_ {
-        let positions = self.positions.iter().map(|&key| (key, false));
-        positions.chain(self.normals.iter().map(|&key| (key, true)))
-    }
-}
-
 /// A project held out of core: the base mesh, its files, budgeted pools of correction and
 /// evaluated tiles, the change feed and the op generator.
 ///

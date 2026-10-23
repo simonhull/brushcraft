@@ -7,7 +7,7 @@ use geom::{BaseMesh, Vec3};
 
 use super::*;
 use crate::index::{Aabb, NormalCone};
-use crate::tiles::tests::{level, mesh, tiles};
+use crate::tiles::tests::{level, mesh, split_prism, tiles};
 
 /// Bounds with every kind of value a tile's bounds can hold: a negative zero, a tight cone.
 fn sample() -> TileBounds {
@@ -86,11 +86,13 @@ fn neighbourhoods(mesh: &BaseMesh, l: u8) -> BTreeMap<TileKey, BTreeSet<TileKey>
         .collect()
 }
 
-/// The meshes the neighbourhood tests walk: valence 3 (the cube) and 5 (the prism).
+/// The meshes the neighbourhood tests walk: valence 3 (the cube), 5 (the subdivided pentagonal
+/// prism) and 7 (the split heptagonal prism).
 fn meshes() -> Vec<BaseMesh> {
     vec![
         (*mesh()).clone(),
         geom::fixtures::subdivided_pentagonal_prism().unwrap(),
+        split_prism(7),
     ]
 }
 

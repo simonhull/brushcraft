@@ -139,6 +139,48 @@ fn new_store(dir: &TestDir, name: &str, mesh: &Arc<BaseMesh>, config: StoreConfi
     TileStore::open(file, config).unwrap()
 }
 
+/// A closed quad mesh with a valence-`n` vertex at the centre of each cap: an `n`-sided prism
+/// with each polygon split into quads around its centroid.
+pub(crate) fn split_prism(n: usize) -> BaseMesh {
+    let angle = |k: usize| {
+        let k = f32::from(u16::try_from(k).unwrap());
+        let n = f32::from(u16::try_from(n).unwrap());
+        2.0 * std::f32::consts::PI * k / n
+    };
+    let mut corners: Vec<Vec3> = Vec::new();
+    for z in [1.0, -1.0] {
+        corners.extend((0..n).map(|k| Vec3::new(angle(k).cos(), angle(k).sin(), z)));
+    }
+    let mut polygons: Vec<Vec<usize>> =
+        vec![(0..n).collect(), (0..n).rev().map(|k| n + k).collect()];
+    polygons.extend((0..n).map(|k| vec![k, n + k, n + (k + 1) % n, (k + 1) % n]));
+    // Each polygon becomes one quad per corner: the corner, its two edge midpoints and the
+    // centroid. Midpoints are shared between the two polygons of an edge.
+    let mut positions = corners.clone();
+    let mut midpoints: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut quads: Vec<[u32; 4]> = Vec::new();
+    for polygon in &polygons {
+        let sides = polygon.len();
+        let sum = polygon.iter().fold(Vec3::ZERO, |sum, &v| sum + corners[v]);
+        let centroid = positions.len();
+        positions.push(sum * (1.0 / f32::from(u16::try_from(sides).unwrap())));
+        let mids: Vec<usize> = (0..sides)
+            .map(|a| {
+                let (u, v) = (polygon[a], polygon[(a + 1) % sides]);
+                *midpoints.entry((u.min(v), u.max(v))).or_insert_with(|| {
+                    positions.push((corners[u] + corners[v]) * 0.5);
+                    positions.len() - 1
+                })
+            })
+            .collect();
+        for a in 0..sides {
+            let quad = [polygon[a], mids[a], centroid, mids[(a + sides - 1) % sides]];
+            quads.push(quad.map(|v| u32::try_from(v).unwrap()));
+        }
+    }
+    BaseMesh::from_polygons(positions, &quads).unwrap()
+}
+
 /// Every tile of levels `from..=to`, coarse levels first.
 pub(crate) fn tiles(mesh: &BaseMesh, from: u8, to: u8) -> Vec<TileKey> {
     (from..=to)

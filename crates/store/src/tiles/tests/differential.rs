@@ -12,12 +12,11 @@
 //!
 //! The same workload runs with its reads batched through [`TileStore::evaluate_many`] at one,
 //! two and every hardware thread: each run is checked against the oracle at every step, and the
-//! runs against each other (the tiles the store computed, in order, and every final bit). Those
-//! runs make no prefetches: a poll installs whichever prefetched tiles have arrived, so what
-//! the pools hold, and so which tiles are evaluated again, would hang on the prefetch workers'
-//! timing rather than on the evaluation workers' count.
+//! runs against each other: every final bit. Which tiles the store evaluated on the way, and in
+//! what order, isn't compared: the runs prefetch, and a poll installs whichever prefetched tiles
+//! have arrived, so what the pools hold, and so what is evaluated again, hangs on the prefetch
+//! workers' timing; the bits never do.
 
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use super::*;
@@ -65,48 +64,6 @@ impl std::ops::Add for Stats {
     }
 }
 
-/// A closed quad mesh with a valence-`n` vertex at the centre of each cap: an `n`-sided prism
-/// with each polygon split into quads around its centroid.
-fn split_prism(n: usize) -> BaseMesh {
-    let angle = |k: usize| {
-        let k = f32::from(u16::try_from(k).unwrap());
-        let n = f32::from(u16::try_from(n).unwrap());
-        2.0 * std::f32::consts::PI * k / n
-    };
-    let mut corners: Vec<Vec3> = Vec::new();
-    for z in [1.0, -1.0] {
-        corners.extend((0..n).map(|k| Vec3::new(angle(k).cos(), angle(k).sin(), z)));
-    }
-    let mut polygons: Vec<Vec<usize>> =
-        vec![(0..n).collect(), (0..n).rev().map(|k| n + k).collect()];
-    polygons.extend((0..n).map(|k| vec![k, n + k, n + (k + 1) % n, (k + 1) % n]));
-    // Each polygon becomes one quad per corner: the corner, its two edge midpoints and the
-    // centroid. Midpoints are shared between the two polygons of an edge.
-    let mut positions = corners.clone();
-    let mut midpoints: HashMap<(usize, usize), usize> = HashMap::new();
-    let mut quads: Vec<[u32; 4]> = Vec::new();
-    for polygon in &polygons {
-        let sides = polygon.len();
-        let sum = polygon.iter().fold(Vec3::ZERO, |sum, &v| sum + corners[v]);
-        let centroid = positions.len();
-        positions.push(sum * (1.0 / f32::from(u16::try_from(sides).unwrap())));
-        let mids: Vec<usize> = (0..sides)
-            .map(|a| {
-                let (u, v) = (polygon[a], polygon[(a + 1) % sides]);
-                *midpoints.entry((u.min(v), u.max(v))).or_insert_with(|| {
-                    positions.push((corners[u] + corners[v]) * 0.5);
-                    positions.len() - 1
-                })
-            })
-            .collect();
-        for a in 0..sides {
-            let quad = [polygon[a], mids[a], centroid, mids[(a + sides - 1) % sides]];
-            quads.push(quad.map(|v| u32::try_from(v).unwrap()));
-        }
-    }
-    BaseMesh::from_polygons(positions, &quads).unwrap()
-}
-
 /// How a run reads evaluated tiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reads {
@@ -140,8 +97,6 @@ struct Run<'a> {
     config: StoreConfig,
     /// How evaluated tiles are read.
     reads: Reads,
-    /// Whether the prefetch operation prefetches, or does nothing.
-    prefetches: bool,
     /// The seed, for messages.
     seed: u64,
     /// Every tile of levels 1 to `top`.
@@ -389,12 +344,8 @@ impl Run<'_> {
         }
     }
 
-    /// Prefetches up to nine tiles, and polls half the time; nothing in a run without
-    /// prefetches.
+    /// Prefetches up to nine tiles, and polls half the time.
     fn prefetch(&mut self, store: &mut TileStore) {
-        if !self.prefetches {
-            return;
-        }
         let count = 1 + self.rng.below(8);
         let keys: Vec<TileKey> = (0..count).map(|_| self.pick()).collect();
         store.prefetch(&keys).unwrap();
@@ -498,20 +449,16 @@ impl Run<'_> {
     }
 }
 
-/// What a run checked, and what the store did.
+/// What a run checked, and what the store ended with.
 struct Outcome {
     /// What was checked.
     stats: Stats,
-    /// Every tile whose positions (`false`) or normals (`true`) the store computed, in order,
-    /// across reopens.
-    computed: Vec<(TileKey, bool)>,
     /// Every tile's positions and normals at the end, as bits.
     bits: Vec<u32>,
 }
 
 /// Runs `steps` random operations, chosen with `seed`, on a new store over `mesh` with `config`,
-/// reading tiles as `reads` says, with prefetches or without; returns what was checked and what
-/// the store did.
+/// reading tiles as `reads` says; returns what was checked and what the store ended with.
 ///
 /// Every read is checked against the dense evaluation to level `top`, the budget and the
 /// dependency graph after every step, and every tile at the end.
@@ -520,7 +467,6 @@ fn run(
     top: u8,
     config: StoreConfig,
     reads: Reads,
-    prefetches: bool,
     seed: u64,
     steps: u32,
 ) -> Outcome {
@@ -533,7 +479,6 @@ fn run(
         top,
         config,
         reads,
-        prefetches,
         seed,
         all: tiles(mesh, 1, top),
         rng: Rng(seed),
@@ -544,14 +489,12 @@ fn run(
         index: None,
         stats: Stats::default(),
     };
-    let mut computed = Vec::new();
     for step in 0..steps {
         let what = run.step(&mut store);
         if what == "reopen" {
             // Save, drop, reopen: the file holds every edit.
             store.save().unwrap();
             run.guards.clear();
-            computed.extend(store.log.computed());
             drop(store);
             store = open(ProjectFile::open(&path).unwrap());
             run.stats.reopens += 1;
@@ -576,7 +519,6 @@ fn run(
         &run.all,
         &format!("seed {seed} at the end"),
     );
-    computed.extend(store.log.computed());
     let mut bits = Vec::new();
     for &key in &run.all {
         let positions = store.evaluate(key).unwrap().to_vec();
@@ -585,7 +527,6 @@ fn run(
     }
     Outcome {
         stats: run.stats,
-        computed,
         bits,
     }
 }
@@ -626,7 +567,7 @@ fn the_store_reads_as_the_dense_evaluation_at_every_step() {
             .map(|(seed, config)| {
                 let mesh = &mesh;
                 scope.spawn(move || {
-                    let outcome = run(mesh, 7, config, Reads::OneByOne, true, seed, 400);
+                    let outcome = run(mesh, 7, config, Reads::OneByOne, seed, 400);
                     assert_covered(outcome.stats, &format!("{} bytes", config.budget_bytes));
                     outcome.stats
                 })
@@ -661,7 +602,7 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
                     .map(|seed| {
                         scope.spawn(move || {
                             let seed = seed * 7919 + 13;
-                            run(mesh, top, config, reads, true, seed, steps).stats
+                            run(mesh, top, config, reads, seed, steps).stats
                         })
                     })
                     .collect();
@@ -698,9 +639,7 @@ fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
             .into_iter()
             .map(|threads| {
                 let config = config.with_threads(Some(threads));
-                // No prefetches: a poll installs whichever have arrived, so the pools (and
-                // what is evaluated again) would depend on the prefetch workers' timing.
-                run(&mesh, 7, config, Reads::Batched, false, seed, 400)
+                run(&mesh, 7, config, Reads::Batched, seed, 400)
             })
             .collect();
         let what = format!("{} bytes", config.budget_bytes);
@@ -708,10 +647,6 @@ fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
         assert_covered(first.stats, &what);
         total = total + first.stats;
         for (outcome, threads) in rest.iter().zip(thread_counts().into_iter().skip(1)) {
-            assert!(
-                outcome.computed == first.computed,
-                "{what}: {threads} threads computed other tiles, or in another order, than one"
-            );
             assert!(
                 outcome.bits == first.bits,
                 "{what}: {threads} threads ended with other bits than one"
