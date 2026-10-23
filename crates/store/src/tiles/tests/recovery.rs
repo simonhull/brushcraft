@@ -855,6 +855,61 @@ fn a_broken_slot_is_reported_and_the_rest_still_flush() {
     assert!(stats.evaluated > 0, "their bounds unknown: {stats:?}");
 }
 
+/// A tile a flush leaves out is lost as a save loses one: the store stops reading its lost edit
+/// and drops what was evaluated from it.
+///
+/// After the flush that leaves the broken tiles out, an index is built and an unrelated edit
+/// refitted: the bounds recorded then, flushed over the broken tiles' unknown markers, must be
+/// those of the state the save point holds, without the lost edits.
+#[test]
+fn a_tile_left_out_of_a_flush_drops_what_was_evaluated_from_it() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let keys: Vec<TileKey> = top.iter().copied().step_by(9).collect();
+    let (no_op, invalid) = (keys[1], keys[3]);
+    let mut map = CorrectionMap::new();
+    for (n, key) in keys.iter().enumerate() {
+        let c = Vec3::new(0.0, 0.0, 0.01 * f32::from(u16::try_from(n + 1).unwrap()));
+        let mut lost = CorrectionMap::new();
+        let oracle = if [no_op, invalid].contains(key) {
+            &mut lost
+        } else {
+            &mut map
+        };
+        edit_interior(&mut store, oracle, *key, c);
+    }
+    SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    store.unsaved.remove(&no_op);
+    let id = store.corrections.find(&invalid).unwrap();
+    store.corrections.get_mut(id).unwrap().side = 0;
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    assert_eq!(writer.take_skipped().len(), 2, "both left out");
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "the broken tiles at the state the save point holds",
+    );
+    // An index built now, and a refit after an unrelated edit, record what the store evaluates.
+    let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    edit_interior(&mut store, &mut map, keys[0], Vec3::new(0.0, 0.02, 0.0));
+    index.update(&mut store, &top).unwrap();
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    let offset = writer.durable_save_point().unwrap();
+    drop(writer);
+    drop(store);
+    assert_save_point(&path, offset, &mesh, &map);
+    let file = ProjectFile::open_at(&path, offset).unwrap();
+    let mut saved = TileStore::open(file, roomy()).unwrap();
+    assert_loads_as_built(&mut saved, level(TOP), "flushed after the broken tiles");
+}
+
 /// A roll-over to a new recovery file carries every edit across, dirty or only in the file, and
 /// lists the one tile whose damaged record it cannot read; a flush in flight is abandoned.
 #[test]
@@ -949,6 +1004,44 @@ fn a_tile_lost_to_a_roll_over_drops_what_was_evaluated_from_it() {
     let file = ProjectFile::open(&dir.path("fresh.bcrf")).unwrap();
     let mut reopened = TileStore::open(file, roomy()).unwrap();
     assert_loads_as_built(&mut reopened, level(TOP), "saved after the roll-over");
+}
+
+/// A broken slot lost to a roll-over is dropped: the store reads the tile as the new file holds
+/// it (without the lost edit), never from the broken slot.
+#[test]
+fn a_broken_slot_lost_to_a_roll_over_is_dropped() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let top = tiles(&mesh, TOP, TOP);
+    let (broken, kept) = (top[5], top[30]);
+    let mut want = CorrectionMap::new();
+    edit_interior(
+        &mut store,
+        &mut CorrectionMap::new(),
+        broken,
+        Vec3::new(0.0, 0.0, 0.25),
+    );
+    edit_interior(&mut store, &mut want, kept, Vec3::new(0.25, 0.0, 0.0));
+    // Dirty, but holding no valid tile: it can't be carried across.
+    let id = store.corrections.find(&broken).unwrap();
+    store.corrections.get_mut(id).unwrap().side = 0;
+    let meta = store.file.meta().clone();
+    let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
+    let filled = store.fill_roll_over(fresh).unwrap();
+    let (old, lost) = store.roll_over(filled).unwrap();
+    drop(old);
+    assert_eq!(lost, [broken], "listed as lost");
+    assert!(
+        store.corrections.find(&broken).is_none(),
+        "its slot dropped"
+    );
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &want),
+        &tiles(&mesh, 1, TOP),
+        "the broken tile as the new file holds it",
+    );
 }
 
 /// A clean resident tile whose record no longer reads is carried across a roll-over from its

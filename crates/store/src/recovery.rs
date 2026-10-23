@@ -15,8 +15,9 @@
 //!    save point names the bounds of the state the snapshot copies. This is all a stroke end costs
 //!    the drawing thread, and it grows with the edits since the last flush.
 //! 2. **Encoding** (writer): each copy is encoded, compressed and framed as a tile record, and the
-//!    records come back. A copy that doesn't encode is left out, and the bounds its edit could have
-//!    changed are appended as unknown, at the cut.
+//!    records come back. A copy that doesn't encode is left out (and lost in the store, as a save
+//!    loses a tile), and the bounds its edit could have changed are appended as unknown, at the
+//!    cut.
 //! 3. **Syncing tiles**: the owner appends the records to the working file
 //!    ([`TileStore::append_streamed`], page-cache writes), then asks the writer to `fdatasync` the
 //!    file. Appending a record clears its slot's dirty flag only if the slot is unchanged since the
@@ -416,8 +417,9 @@ impl RecoveryWriter {
     /// The tiles left out of flushes since the last call because their correction slots were
     /// broken (a dirty slot with no op, or one that doesn't hold a valid tile): their latest
     /// edits are not in the recovery file. Each is dropped from the writer's flush mark when
-    /// found, so one bad slot never stalls the flushes of the rest; an edit of it later is
-    /// tried again.
+    /// found, so one bad slot never stalls the flushes of the rest, and lost in the store as a
+    /// save loses a tile: its slot is dropped and what was evaluated from it too, and the store
+    /// reads the tile's last record from then on. An edit of it later is tried again.
     pub fn take_skipped(&mut self) -> Vec<TileKey> {
         std::mem::take(&mut self.skipped)
     }

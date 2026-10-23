@@ -1654,8 +1654,9 @@ impl TileStore {
     /// they held is in it), and the generation moves on, so a flush started before is
     /// abandoned. The base is unchanged, and so are the tiles to save into the project, but for
     /// the lost ones: they are in no file the store writes, so the next save leaves them at
-    /// their last saved state instead of failing to find them. Every evaluation that followed
-    /// from a lost tile is dropped, as it may have come from the lost edit.
+    /// their last saved state instead of failing to find them. A lost tile's slot, if it has
+    /// one (a broken one), is dropped, or kept clean while a pin holds it, and every evaluation
+    /// that followed from a lost tile is dropped, as it may have come from the lost edit.
     ///
     /// # Errors
     ///
@@ -1680,6 +1681,14 @@ impl TileStore {
         self.drain_saves();
         for key in &lost {
             self.since_rebase.remove(key);
+            // A lost tile's slot, if it has one, is broken: dropped as a rebase drops one.
+            self.unsaved.remove(key);
+            if let Some(id) = self.corrections.find(key) {
+                self.corrections.set_dirty(id, false)?;
+                if !self.corrections.is_pinned(key) {
+                    self.corrections.remove(key)?;
+                }
+            }
         }
         // What was evaluated from a lost edit isn't what the store reads from now on.
         self.invalidate_edited(lost.iter().copied());
@@ -2540,8 +2549,9 @@ impl TileStore {
         Ok(found)
     }
 
-    /// The bounds part of a recovery flush, at its cut: settles the writes so far, makes unknown
-    /// the bounds the `lost` tiles' edits could have changed (left out of the flush), and
+    /// The bounds part of a recovery flush, at its cut: loses the `lost` tiles, left out of the
+    /// flush (see [`TileStore::lose_left_out`]), settles the writes so far, makes unknown the
+    /// bounds the lost tiles' edits could have changed, and
     /// appends, with one write, every bound edits changed that the working file lacks, placed at
     /// the cut. Derived bounds stay out (see [`crate::bounds`]), so the cost grows with the edits
     /// since the last flush.
@@ -2555,9 +2565,46 @@ impl TileStore {
     /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if an
     /// append fails: the bounds are kept for the next flush.
     pub(crate) fn flush_bounds(&mut self, lost: &[TileKey]) -> Result<(), CacheError> {
+        self.lose_left_out(lost)?;
         self.bounds.settle(&self.mesh)?;
         self.bounds.forget(&self.mesh, lost.iter().copied())?;
         self.write_unflushed_bounds()
+    }
+
+    /// Loses the `lost` tiles a flush leaves out (broken slots), as a save loses a tile whose
+    /// latest edit it can't read (see [`TileStore::rebase`]): the store stops reading the edit
+    /// the recovery file doesn't hold, and drops every evaluation that followed from it, so
+    /// nothing evaluated later (and no bound recorded from it) describes a state no save point
+    /// holds.
+    ///
+    /// Each slot is marked clean and dropped, or, if a pin holds it, kept clean until the pin
+    /// goes, as a rebase keeps a lost tile's. The tile is read from the working file's record
+    /// from then on, else from the base: if the working file has no record of it, it is at its
+    /// last saved state again, and no longer among the tiles the next save copies.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] for a stale handle.
+    fn lose_left_out(&mut self, lost: &[TileKey]) -> Result<(), CacheError> {
+        if lost.is_empty() {
+            return Ok(());
+        }
+        // Drained first, so the feed can't bring a lost key back among the tiles to save.
+        self.drain_saves();
+        for key in lost {
+            self.unsaved.remove(key);
+            if let Some(id) = self.corrections.find(key) {
+                self.corrections.set_dirty(id, false)?;
+                if !self.corrections.is_pinned(key) {
+                    self.corrections.remove(key)?;
+                }
+            }
+            if !self.file.contains(key) {
+                self.since_rebase.remove(key);
+            }
+        }
+        self.invalidate_edited(lost.iter().copied());
+        Ok(())
     }
 
     /// Appends, with one write, every bound edits changed that the working file lacks (not the
@@ -2605,10 +2652,11 @@ impl TileStore {
         Ok(())
     }
 
-    /// Makes unknown, in the save point of the flush in flight too, every bound the `lost`
-    /// tiles' edits could have changed: their copies didn't encode, so the save point holds
-    /// their older state. The unknown bounds are appended placed at the flush's cut; the store's
-    /// own are made unknown as well, and the next flush writes them again.
+    /// Loses the `lost` tiles, whose copies didn't encode (see [`TileStore::lose_left_out`]),
+    /// and makes unknown, in the save point of the flush in flight too, every bound their edits
+    /// could have changed: the save point holds their older state. The unknown bounds are
+    /// appended placed at the flush's cut; the store's own are made unknown as well, and the
+    /// next flush writes them again.
     ///
     /// # Errors
     ///
@@ -2618,6 +2666,7 @@ impl TileStore {
         if lost.is_empty() {
             return Ok(());
         }
+        self.lose_left_out(lost)?;
         let stale = self.bounds.forget(&self.mesh, lost.iter().copied())?;
         let at = self.file.cut_at().unwrap_or(self.last_write);
         for key in stale {
