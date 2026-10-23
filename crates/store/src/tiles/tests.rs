@@ -1840,16 +1840,18 @@ fn drain_prefetch(store: &mut TileStore) -> usize {
     installed
 }
 
-/// The bytes of `key`'s latest record in the working file, decoded into a slot.
+/// The bytes of `key`'s latest record in the working file, decoded into a slot (see
+/// [`CorrectionSlot::tile_bytes`]).
 fn slot_in_file(store: &TileStore, key: &TileKey) -> Vec<u8> {
     let (_, tile) = store.file.read_displacement(key).unwrap().unwrap();
-    bytemuck::bytes_of(&CorrectionSlot::from_tile(&tile)).to_vec()
+    CorrectionSlot::from_tile(&tile).tile_bytes()
 }
 
-/// The bytes of `key`'s resident correction slot.
+/// The bytes of the tile `key`'s resident correction slot holds (see
+/// [`CorrectionSlot::tile_bytes`]).
 fn slot_resident(store: &TileStore, key: &TileKey) -> Vec<u8> {
     let id = store.corrections.find(key).unwrap();
-    bytemuck::bytes_of(store.corrections.get(id).unwrap()).to_vec()
+    store.corrections.get(id).unwrap().tile_bytes()
 }
 
 /// A store over a new working file `name` holding the correction tiles of `count` random edits

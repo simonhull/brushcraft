@@ -67,7 +67,7 @@ fn flat_tile(key: &TileKey, seed: f32) -> CorrectionTile {
 
 /// The bytes of `tile` in a correction slot, as [`slot_resident`] reads a resident one.
 fn slot_of(tile: &CorrectionTile) -> Vec<u8> {
-    bytemuck::bytes_of(&CorrectionSlot::from_tile(tile)).to_vec()
+    CorrectionSlot::from_tile(tile).tile_bytes()
 }
 
 /// Every tile of `keys`, evaluated, as bits.

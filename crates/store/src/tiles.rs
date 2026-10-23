@@ -110,7 +110,7 @@ use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
 use crate::meta::{Meta, Role, SavePoint};
 use crate::op::{OpId, RESERVED_SITE};
-use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotId};
+use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotData, SlotId};
 use crate::prefetch::{Fetched, Job, Prefetcher, Source};
 use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 use crate::stamp::Stamp;
@@ -2275,7 +2275,7 @@ impl TileStore {
     fn check_pin_budget(&self, keys: &BTreeSet<TileKey>) -> Result<(), CacheError> {
         /// Bytes of chunks `pool` needs for its pinned slots outside `keys`, one per key, and
         /// `headroom` more.
-        fn chunks_needed<T: bytemuck::Pod>(
+        fn chunks_needed<T: SlotData>(
             pool: &Pool<T>,
             keys: &BTreeSet<TileKey>,
             headroom: usize,

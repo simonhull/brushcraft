@@ -235,8 +235,31 @@ enum Victims {
 /// A slot position: chunk and index in it.
 type Pos = (u32, u32);
 
+/// Plain data a [`Pool`] keeps in its slots, and how a slot is cleared when it is handed out
+/// for another tile.
+///
+/// A recycled slot still holds its last tile's bytes. Zeroing all of them on every acquire is
+/// the simple rule, but it is most of the cost of paging tiles in: an evaluated slot is about
+/// 100 KB whatever its tile's level, a coarse tile uses a few hundred bytes of it, and on a
+/// freshly mapped chunk the zeroing faults in every page of every slot. So each slot type says
+/// what clearing means for it: enough that nothing of the previous tile can be read as the new
+/// one's.
+pub(crate) trait SlotData: Pod {
+    /// Clears a slot about to be handed out for a new tile, so that it reads as holding no
+    /// tile (or as zero, for a type that can't say so).
+    fn clear(&mut self);
+}
+
+/// Pools of plain arrays (the pool's own tests) are zeroed.
+#[cfg(test)]
+impl<T: Pod, const N: usize> SlotData for [T; N] {
+    fn clear(&mut self) {
+        bytemuck::bytes_of_mut(self).fill(0);
+    }
+}
+
 /// A budgeted pool of `T` slots. Single-threaded: it belongs to the thread that owns the cache.
-pub(crate) struct Pool<T: Pod> {
+pub(crate) struct Pool<T: SlotData> {
     /// Bytes the budget is charged per chunk: the configured chunk size (see [`Pool::layout`]).
     /// A chunk's allocation is its whole slots, which may be a little less.
     chunk_bytes: usize,
@@ -260,7 +283,7 @@ pub(crate) struct Pool<T: Pod> {
     evicted: Option<Vec<TileKey>>,
 }
 
-impl<T: Pod> std::fmt::Debug for Pool<T> {
+impl<T: SlotData> std::fmt::Debug for Pool<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pool")
             .field("chunk_bytes", &self.chunk_bytes)
@@ -272,7 +295,7 @@ impl<T: Pod> std::fmt::Debug for Pool<T> {
     }
 }
 
-impl<T: Pod> Pool<T> {
+impl<T: SlotData> Pool<T> {
     /// How a pool asked for chunks of `chunk_bytes` lays them out: slots per chunk (as many as
     /// fit, at least one) and the bytes the budget is charged per chunk.
     ///
@@ -417,8 +440,9 @@ impl<T: Pod> Pool<T> {
             .get_mut(id.index as usize)
     }
 
-    /// A zeroed slot for `key`, referenced and clean: a free slot, else one from a new chunk if
-    /// the budget allows it, else the clock's victim, which is written back first if it is dirty.
+    /// A cleared slot for `key` (see [`SlotData::clear`]), referenced and clean: a free slot, else
+    /// one from a new chunk if the budget allows it, else the clock's victim, which is written
+    /// back first if it is dirty.
     ///
     /// # Errors
     ///
@@ -481,7 +505,7 @@ impl<T: Pod> Pool<T> {
             meta.generation
         };
         if let Some(slot) = self.slot_mut(pos) {
-            bytemuck::bytes_of_mut(slot).fill(0);
+            slot.clear();
         }
         self.index.insert(key, pos);
         Ok(SlotId::new(pos, generation))
@@ -920,7 +944,7 @@ mod tests {
     }
 
     /// Slots of `pool` with pins, counted one by one: what its counter must say.
-    fn pinned_by_scan<T: Pod>(pool: &Pool<T>) -> usize {
+    fn pinned_by_scan<T: SlotData>(pool: &Pool<T>) -> usize {
         pool.meta.iter().flatten().filter(|m| m.pins > 0).count()
     }
 
