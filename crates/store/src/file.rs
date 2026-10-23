@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
+use std::ops::Deref;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,6 +217,48 @@ impl Lock {
     }
 }
 
+/// An open file holding a [`Lock`], which it releases when dropped, before it closes.
+///
+/// A lock belongs to the open file description, which every duplicate of the descriptor shares,
+/// and closing a descriptor releases it only once no duplicate is left. Spawning a process
+/// duplicates all of this process's descriptors into the child until its `exec` (close-on-exec
+/// closes them only then), so a file merely closed while another thread spawns stays locked for
+/// that moment, against this very process: reopening it fails with [`StoreError::Locked`].
+/// Unlocking releases the lock on the description itself, whichever descriptors still share it,
+/// so a dropped `LockedFile` is unlocked at once.
+#[derive(Debug)]
+struct LockedFile(File);
+
+impl LockedFile {
+    /// Takes `lock` on `file` without waiting.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lock::take`].
+    fn new(file: File, lock: Lock) -> Result<Self, StoreError> {
+        lock.take(&file)?;
+        Ok(Self(file))
+    }
+}
+
+impl Deref for LockedFile {
+    type Target = File;
+
+    /// The file, for reading, writing and syncing it.
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for LockedFile {
+    /// Unlocks the file, then closes it.
+    fn drop(&mut self) {
+        // Best effort: if unlocking fails, closing still releases the lock once no duplicate of
+        // the descriptor is left.
+        drop(self.0.unlock());
+    }
+}
+
 /// Opens `path` with `open` and takes `lock` on it (see [`lock_at`]).
 ///
 /// # Errors
@@ -225,7 +268,7 @@ fn open_locked(
     path: &Path,
     open: impl Fn(&Path) -> io::Result<File>,
     lock: Lock,
-) -> Result<File, StoreError> {
+) -> Result<LockedFile, StoreError> {
     lock_at(path, open(path)?, open, lock)
 }
 
@@ -245,14 +288,13 @@ fn lock_at(
     file: File,
     open: impl Fn(&Path) -> io::Result<File>,
     lock: Lock,
-) -> Result<File, StoreError> {
-    lock.take(&file)?;
+) -> Result<LockedFile, StoreError> {
+    let file = LockedFile::new(file, lock)?;
     if is_at(&file, path)? {
         return Ok(file);
     }
     drop(file);
-    let reopened = open(path)?;
-    lock.take(&reopened)?;
+    let reopened = LockedFile::new(open(path)?, lock)?;
     if is_at(&reopened, path)? {
         Ok(reopened)
     } else {
@@ -396,8 +438,8 @@ pub struct ProjectFile {
     /// mesh again.
     mesh_record: Arc<[u8]>,
     /// The open file, which holds the lock. [`FileReader`]s hold it weakly, so dropping the
-    /// `ProjectFile` closes the file and releases the lock (once any read in flight ends).
-    file: Arc<File>,
+    /// `ProjectFile` releases the lock and closes the file (once any read in flight ends).
+    file: Arc<LockedFile>,
     /// Where the next record goes.
     end: u64,
     /// Each live tile's latest record, saved or not: what reads find.
@@ -531,7 +573,7 @@ impl ProjectFile {
             .write(true)
             .create_new(true)
             .open(path)?;
-        Lock::Exclusive.take(&file)?;
+        let file = LockedFile::new(file, Lock::Exclusive)?;
         file.write_all_at(&leading, 0)?;
         file.sync_all()?;
         sync_parent(path)?;
@@ -633,7 +675,11 @@ impl ProjectFile {
     /// # Errors
     ///
     /// As [`ProjectFile::open`].
-    fn open_latest(file: File, repair: Repair, like: Option<&Self>) -> Result<Self, StoreError> {
+    fn open_latest(
+        file: LockedFile,
+        repair: Repair,
+        like: Option<&Self>,
+    ) -> Result<Self, StoreError> {
         let access = repair.access();
         let len = file.metadata()?.len();
         check_header(&file, len)?;
@@ -1452,7 +1498,7 @@ impl ProjectFile {
 #[derive(Debug, Clone)]
 pub(crate) struct FileReader {
     /// The owner's open file, upgraded for the length of each read.
-    file: Weak<File>,
+    file: Weak<LockedFile>,
 }
 
 impl FileReader {
@@ -1509,7 +1555,7 @@ impl FileReader {
 #[derive(Debug, Clone)]
 pub(crate) struct FileSyncer {
     /// The owner's open file, upgraded for the length of each sync.
-    file: Weak<File>,
+    file: Weak<LockedFile>,
 }
 
 impl FileSyncer {

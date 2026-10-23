@@ -286,6 +286,25 @@ fn one_writer_or_many_readers() {
     assert_eq!(std::fs::read(&path).unwrap(), good, "never modified");
 }
 
+/// A closed file is unlocked even while a duplicate of its descriptor lives on, as one does in a
+/// child this process is spawning until the child's `exec`: reopening it doesn't find it locked.
+#[test]
+fn a_closed_file_is_unlocked_though_its_descriptor_was_duplicated() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (_, [s1, ..]) = three(&path);
+    let writer = ProjectFile::open(&path).unwrap();
+    // Shares the open file description, and with it the lock, as a forked child's copy does.
+    let duplicate = writer.file.try_clone().unwrap();
+    drop(writer);
+    drop(ProjectFile::open(&path).unwrap());
+    let reader = ProjectFile::open_at(&path, s1).unwrap();
+    let shared = reader.file.try_clone().unwrap();
+    drop(reader);
+    drop(ProjectFile::open(&path).unwrap());
+    drop((duplicate, shared));
+}
+
 #[test]
 fn a_file_that_cannot_be_written_opens_read_only_if_its_tail_is_clean() {
     use std::os::unix::fs::PermissionsExt;
