@@ -147,19 +147,29 @@ pub(crate) fn calibrated_radius(
     Ok(high)
 }
 
-/// The directions of a stroke's `steps` dabs from the origin: along a circle about the `z`
-/// axis through `start`, each `step` (in radians of that circle) on from the one before.
+/// The unit directions of a stroke's `steps` dabs from the origin: along the great circle
+/// through `start` heading east (anticlockwise about the `z` axis), each `step` radians of arc
+/// on from the one before.
+///
+/// A great circle, not the circle of latitude through `start`: on the unit sphere each step
+/// is then `step` long wherever the stroke starts, where a turn about `z` by `step` covers
+/// only `step · cos(latitude)`, dabs bunching up towards the poles. At a pole, where east is
+/// undefined, the stroke heads along `y`.
 pub(crate) fn path(start: Vec3, step: f32, steps: usize) -> impl Iterator<Item = Vec3> {
+    let z = Vec3::new(0.0, 0.0, 1.0);
+    let from = start.normalized().unwrap_or(z);
+    // The circle turns about the axis at right angles to `from` in the plane of `from` and `z`,
+    // which moves `from` along `axis × from`: east.
+    let axis = (z - from * from.dot(z))
+        .normalized()
+        .unwrap_or_else(|| Vec3::new(-1.0, 0.0, 0.0));
+    let heading = axis.cross(from);
     (0_u32..).take(steps).map(move |k| {
         // Up to 2^24 steps convert exactly; strokes are hundreds.
         #[expect(clippy::cast_precision_loss, reason = "step counts are far below 2^24")]
         let angle = step * k as f32;
         let (sin, cos) = angle.sin_cos();
-        Vec3::new(
-            start.x * cos - start.y * sin,
-            start.x * sin + start.y * cos,
-            start.z,
-        )
+        from * cos + heading * sin
     })
 }
 
@@ -195,17 +205,50 @@ mod tests {
     }
 
     #[test]
-    fn the_path_turns_about_z() {
-        let start = Vec3::new(1.0, 0.0, 0.5);
-        let points: Vec<Vec3> = path(start, std::f32::consts::FRAC_PI_2, 3).collect();
+    fn the_path_heads_east_along_a_great_circle() {
+        let points: Vec<Vec3> =
+            path(Vec3::new(2.0, 0.0, 0.0), std::f32::consts::FRAC_PI_2, 3).collect();
         assert_eq!(points.len(), 3, "three dabs");
         assert!(
-            (points[1] - Vec3::new(0.0, 1.0, 0.5)).length() < 1e-6,
-            "a quarter turn"
+            (points[0] - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6,
+            "unit directions"
         );
         assert!(
-            (points[2] - Vec3::new(-1.0, 0.0, 0.5)).length() < 1e-6,
+            (points[1] - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-6,
+            "a quarter turn east, along the equator"
+        );
+        assert!(
+            (points[2] - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-6,
             "a half turn"
         );
+    }
+
+    #[test]
+    fn dabs_advance_evenly_at_any_latitude() {
+        let step = 0.01;
+        for start in [
+            Vec3::new(1.0, 0.0, 0.1),
+            Vec3::new(0.3, -0.2, 0.9),
+            Vec3::new(0.01, 0.0, -1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ] {
+            let points: Vec<Vec3> = path(start, step, 50).collect();
+            for pair in points.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                assert!((b.length() - 1.0).abs() < 1e-5, "{start:?}: unit {b:?}");
+                let arc = a.cross(b).length().atan2(a.dot(b));
+                assert!(
+                    (arc - step).abs() < 1e-4,
+                    "{start:?}: each dab {step} on, not {arc}"
+                );
+            }
+            let east = Vec3::new(0.0, 0.0, 1.0).cross(points[0]);
+            if east.length() > 1e-3 {
+                assert!(
+                    (points[1] - points[0]).dot(east) > 0.0,
+                    "{start:?}: heading east"
+                );
+            }
+        }
     }
 }

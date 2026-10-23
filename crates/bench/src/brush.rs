@@ -3,9 +3,14 @@
 //!
 //! The stroke starts at a random place on the surface (from the seed). The radius is set there
 //! to cover about `footprint` vertices (50,000 for the benchmark), and each dab moves a tenth
-//! of a radius along a circle about the `z` axis, its centre put on the surface by a raycast
-//! from the origin. Every dab is one [`sculpt::draw_step`], timed as a whole (the latency
-//! reported, p50 and p99) and by its phases (the means reported).
+//! of a radius of arc east along a great circle (see [`crate::surface::path`]), its centre put
+//! on the surface by a raycast from the origin. Every dab is one [`sculpt::draw_step`], timed
+//! as a whole (the latency reported, p50 and p99) and by its phases (the means reported).
+//!
+//! The stroke runs warm: planning it ([`Plan::new`]) raycasts every dab's centre first, which
+//! evaluates the tiles along the path, so the steps find most of their tiles resident and
+//! evaluated (as an app's do, the view having drawn them). What a cold region costs is
+//! `page-in`'s measure.
 //!
 //! Building the spatial index comes first, and is reported apart: on the benchmark sphere it
 //! evaluates all 153,600 level-9 tiles, about two minutes on one core.
@@ -54,6 +59,9 @@ pub(crate) struct Plan {
 impl Plan {
     /// A stroke of `steps` dabs starting in `direction` from the origin, with a brush of
     /// `size` (see the module notes).
+    ///
+    /// Finding the dabs' centres raycasts the path, which evaluates the tiles along it: the
+    /// stroke then runs warm.
     ///
     /// # Errors
     ///
