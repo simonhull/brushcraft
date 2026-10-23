@@ -103,7 +103,6 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
-use std::io;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -332,7 +331,7 @@ pub enum CacheError {
     Internal(#[from] Invariant),
     /// The evaluation worker threads couldn't be started (see [`StoreConfig::threads`]).
     #[error("starting the evaluation worker threads failed")]
-    Workers(#[source] io::Error),
+    Workers(#[source] rayon::ThreadPoolBuildError),
 }
 
 /// An invariant of [`TileStore`] found broken (see [`CacheError::Internal`]).
@@ -1083,7 +1082,7 @@ impl TileStore {
             .num_threads(config.worker_threads())
             .thread_name(|n| format!("tile-eval-{n}"))
             .build()
-            .map_err(|e| CacheError::Workers(io::Error::other(e)))?;
+            .map_err(CacheError::Workers)?;
         let mut feed = ChangeFeed::new();
         let save_consumer = feed.subscribe();
         Ok(Self {
@@ -2417,7 +2416,7 @@ impl TileStore {
         };
         #[cfg(test)]
         let read = if self.unreadable == Some(key) {
-            Err(io::Error::other("an unreadable tile, for the test").into())
+            Err(std::io::Error::other("an unreadable tile, for the test").into())
         } else {
             read
         };
