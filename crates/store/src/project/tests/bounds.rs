@@ -202,6 +202,63 @@ fn a_roll_over_carries_the_flushed_bounds_across() {
     restored.close(false).unwrap();
 }
 
+/// A roll-over carries the bounds still waiting for a flush into the new recovery file.
+///
+/// They were edited after the failed flush began; without them the project file's stale bounds
+/// would show through under the restored edit.
+#[test]
+fn a_roll_over_carries_the_bounds_waiting_for_a_flush() {
+    for refit in [true, false] {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+        let (mut index, _) = project.load_index(top(), |_, _| {}).unwrap();
+        let all = tiles(&mesh(), TOP, TOP);
+        assert_saved(project.save_as(&path));
+        // A flush that fails to sync, then, before the roll-over, an edit far off.
+        let old = project.recovery_path().unwrap().to_path_buf();
+        project.writer.as_ref().unwrap().fail_syncs(0, 1);
+        edit_interior(&mut project, &mut index, all[9], &[]);
+        project.store().begin_op().unwrap();
+        let later = all[60];
+        let region = Region::of_tile(&later);
+        project
+            .store()
+            .set_correction(
+                later.face(),
+                later.level(),
+                region.x0() + 5,
+                region.y0() + 7,
+                Vec3::new(0.0, 0.25, 0.0),
+            )
+            .unwrap();
+        if refit {
+            index.update(project.store(), &all).unwrap();
+        }
+        let began = Instant::now();
+        while project.recovery_path().unwrap() == old {
+            project.poll().unwrap();
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "the roll-over happens"
+            );
+            std::thread::yield_now();
+        }
+        drop(project);
+        let candidate = find_recoveries(&dir.path("recovery"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut restored = Project::restore(&candidate, config(&dir)).unwrap();
+        assert_loads_as_built(
+            restored.store(),
+            top(),
+            &format!("restored after the roll-over, refitted {refit}"),
+        );
+        restored.close(false).unwrap();
+    }
+}
+
 /// A bound an index records over an edit's unknown marker still waiting for a flush is flushed:
 /// the recovery file must not keep an older known bound under the newer edit.
 #[test]
