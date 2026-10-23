@@ -107,9 +107,9 @@ mod tests {
 
     /// The byte-at-a-time CRC, the definition [`crc32`] must match.
     fn bytewise(bytes: &[u8]) -> u32 {
-        !bytes
-            .iter()
-            .fold(!0u32, |crc, &b| byte_step((crc ^ u32::from(b)) & 0xFF) ^ (crc >> 8))
+        !bytes.iter().fold(!0u32, |crc, &b| {
+            byte_step((crc ^ u32::from(b)) & 0xFF) ^ (crc >> 8)
+        })
     }
 
     #[test]
@@ -118,7 +118,10 @@ mod tests {
             .map(|i| u8::try_from(i.wrapping_mul(2_654_435_761) >> 24).unwrap())
             .collect();
         for start in 0..9 {
-            for len in (0..=data.len() - start).step_by(7).chain([0, 1, 7, 8, 9, 15, 16, 17]) {
+            for len in (0..=data.len() - start)
+                .step_by(7)
+                .chain([0, 1, 7, 8, 9, 15, 16, 17])
+            {
                 let bytes = &data[start..start + len];
                 assert_eq!(crc32(bytes), bytewise(bytes), "start {start}, length {len}");
             }

@@ -1033,13 +1033,21 @@ mod tests {
         }
         for (n, &id) in (0_u32..).zip(&ids) {
             let bumped = u64::from([5, 0, 7, 3, 4].contains(&n));
-            assert_eq!(pool.get(id).unwrap()[0], u64::from(n) * 10 + bumped, "slot {n}");
+            assert_eq!(
+                pool.get(id).unwrap()[0],
+                u64::from(n) * 10 + bumped,
+                "slot {n}"
+            );
         }
         assert!(
             pool.get_many_mut(&[ids[2], ids[6], ids[2]]).is_none(),
             "a slot named twice is refused"
         );
-        assert_eq!(pool.get_many_mut(&[]).map(|none| none.len()), Some(0), "none");
+        assert_eq!(
+            pool.get_many_mut(&[]).map(|none| none.len()),
+            Some(0),
+            "none"
+        );
         pool.remove(&key(1)).unwrap();
         assert!(
             pool.get_many_mut(&[ids[0], ids[1]]).is_none(),
