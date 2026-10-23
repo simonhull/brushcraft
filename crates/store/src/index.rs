@@ -18,7 +18,7 @@ mod bvh;
 mod tests;
 
 pub use bvh::{Aabb, Bvh, Hit, MAX_TILES, Ray, SphereQuery};
-use geom::{BaseMesh, Level, TileKey, Vec3};
+use geom::{BaseMesh, Level, MAX_LEVEL, TILE_QUADS, TileKey, Vec3};
 use thiserror::Error;
 
 use crate::tiles::{CacheError, TileStore};
@@ -244,10 +244,21 @@ impl SpatialIndex {
     }
 }
 
+/// The most tiles per side of a face, at the deepest level: 64, which a tile coordinate (a
+/// `u16`) holds, as the assertion below checks at compile time.
+const MAX_TILES_PER_SIDE: u32 = (1 << MAX_LEVEL) / TILE_QUADS;
+const _: () = assert!(
+    MAX_TILES_PER_SIDE <= 0xFFFF,
+    "a face's tile coordinates fit a u16 at every level"
+);
+
 /// Every base-layer displacement tile of `level` on `mesh`, face by face.
 fn tiles_of(mesh: &BaseMesh, level: Level) -> impl Iterator<Item = TileKey> {
-    // At most 64 tiles per side, even at the deepest level.
-    let per_side = u16::try_from(level.tiles_per_side()).unwrap_or(u16::MAX);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "at most MAX_TILES_PER_SIDE tiles per side, which fits a u16 (asserted above)"
+    )]
+    let per_side = level.tiles_per_side() as u16;
     mesh.faces().flat_map(move |face| {
         (0..per_side).flat_map(move |ty| {
             (0..per_side).filter_map(move |tx| TileKey::displacement(face, level, tx, ty).ok())
