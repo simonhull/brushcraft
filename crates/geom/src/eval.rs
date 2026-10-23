@@ -352,8 +352,10 @@ impl<'a, S: PositionSource> Reader<'a, S> {
 
 /// Gathers `region` (at its own level) with its one-vertex ring and base-vertex rings.
 ///
-/// Every position is read through one [`Reader`], as the owner's copy: [`parent_tiles`] runs
-/// this with a recording source, so what it lists is exactly what is read here.
+/// Every position is read through one [`Reader`], as the owner's copy. The part of each row
+/// strictly inside the face, its own owner copies, is read as one [`PositionSource::row`]; the
+/// points on or past the face's border are located one by one. [`gathered_tiles`] lists the
+/// tiles these reads resolve to, and the tests check it against a recording of them.
 ///
 /// # Errors
 ///
