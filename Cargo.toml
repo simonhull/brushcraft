@@ -13,6 +13,7 @@ geom = { path = "crates/geom" }
 store = { path = "crates/store" }
 input = { path = "crates/input" }
 kernels = { path = "crates/kernels" }
+sculpt = { path = "crates/sculpt" }
 anyhow = "1.0.100"
 bytemuck = { version = "=1.25.2", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 divan = "0.1.21"

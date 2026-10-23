@@ -1047,6 +1047,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
+name = "sculpt"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "divan",
+ "geom",
+ "kernels",
+ "store",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

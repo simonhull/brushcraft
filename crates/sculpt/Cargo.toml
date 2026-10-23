@@ -1,0 +1,24 @@
+[package]
+name = "sculpt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Brushes: steps that edit a project's corrections through its store and spatial index."
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+geom.workspace = true
+kernels.workspace = true
+store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "draw_step"
+harness = false
