@@ -105,6 +105,11 @@ impl PositionSource for DenseEvaluation {
     fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
         self.grid(face, level)?.get(i, j)
     }
+
+    fn row(&self, face: FaceId, level: Level, i: u32, j: u32, out: &mut [Vec3]) -> Option<()> {
+        out.copy_from_slice(self.grid(face, level)?.row(i, j, out.len())?);
+        Some(())
+    }
 }
 
 impl DenseEvaluation {

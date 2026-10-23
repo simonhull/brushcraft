@@ -21,6 +21,22 @@ pub trait PositionSource {
     /// The evaluated position of face-grid vertex `(i, j)` of `face` at `level`, or `None` if it
     /// isn't available.
     fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3>;
+
+    /// The positions of `out.len()` consecutive vertices of row `j` of `face` at `level`, from
+    /// column `i`: `out[k]` is [`PositionSource::position`] of `(i + k, j)`. `None` if any isn't
+    /// available, leaving `out` partly written.
+    ///
+    /// Evaluation reads the inside of a face a row at a time through this. The default reads
+    /// the vertices one by one; a source that keeps rows contiguous can copy them instead, as
+    /// long as it answers each vertex as `position` would ([`TileKey::containing`] picks a
+    /// vertex's tile column from its column alone, so a run splits into whole slices at tile
+    /// borders).
+    fn row(&self, face: FaceId, level: Level, i: u32, j: u32, out: &mut [Vec3]) -> Option<()> {
+        for (slot, x) in out.iter_mut().zip(i..) {
+            *slot = self.position(face, level, x, j)?;
+        }
+        Some(())
+    }
 }
 
 /// A block of evaluated positions: `side²` vertices, row-major.
@@ -54,6 +70,19 @@ impl Grid {
         self.data
             .get(usize::try_from(j * self.side + i).ok()?)
             .copied()
+    }
+
+    /// The `len` positions of row `j` from column `i`, or `None` if they run off the block.
+    #[must_use]
+    pub fn row(&self, i: u32, j: u32, len: usize) -> Option<&[Vec3]> {
+        if i >= self.side || j >= self.side {
+            return None;
+        }
+        let start = usize::try_from(j * self.side + i).ok()?;
+        let in_row = usize::try_from(self.side - i).ok()?;
+        self.data
+            .get(start..start + len.min(in_row))
+            .filter(|r| r.len() == len)
     }
 
     /// All positions, row-major.
@@ -186,21 +215,30 @@ impl<'a, S: PositionSource> Reader<'a, S> {
             .ok_or_else(|| missing(g, self.level, i64::from(gi), i64::from(gj)))
     }
 
-    /// The position of face-grid vertex `(i, j)` of `face`, which the caller knows is its own
-    /// owner copy (strictly inside a face of the mesh): [`Reader::fetch`] without the lookup.
+    /// The positions of a run of row `j` of `face`, from column `i`, into `out`: vertices the
+    /// caller knows are their own owner copies (strictly inside a face of the mesh), read as one
+    /// [`PositionSource::row`] without the owner lookup.
     ///
     /// # Errors
     ///
-    /// [`EvalError::Missing`] if `(i, j)` is off the face or the source lacks the position.
-    fn fetch_own(&self, face: FaceId, i: i64, j: i64) -> Result<Vec3, EvalError> {
-        let missing = || missing(face, self.level, i, j);
-        let (ui, uj) = (u32::try_from(i), u32::try_from(j));
-        let (Ok(ui), Ok(uj)) = (ui, uj) else {
-            return Err(missing());
+    /// [`EvalError::Missing`] for the run's first vertex the source lacks (or that is off the
+    /// face), as reading them one by one would report.
+    fn own_row(&self, face: FaceId, i: i64, j: i64, out: &mut [Vec3]) -> Result<(), EvalError> {
+        let missing = |x: i64| missing(face, self.level, x, j);
+        let (Ok(ui), Ok(uj)) = (u32::try_from(i), u32::try_from(j)) else {
+            return Err(missing(i));
         };
-        self.src
-            .position(face, self.level, ui, uj)
-            .ok_or_else(missing)
+        if self.src.row(face, self.level, ui, uj, out).is_some() {
+            return Ok(());
+        }
+        // Find which vertex was missing, in order.
+        for (x, slot) in (i..).zip(out) {
+            *slot = u32::try_from(x)
+                .ok()
+                .and_then(|ux| self.src.position(face, self.level, ux, uj))
+                .ok_or_else(|| missing(x))?;
+        }
+        Ok(())
     }
 
     /// The tile a read of face-grid vertex `(i, j)` of `f` resolves to: [`TileKey::containing`]
@@ -330,22 +368,37 @@ pub(crate) fn gather(
     let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
     let face = region.face();
     let mut padded = Padded::filled(region.quads(), Vec3::NAN);
-    // Strictly inside a face of the mesh, a point is its own owner copy: read it straight away.
+    // A point on or past the face's border is located and read from its owner's copy.
+    let located = |slots: &mut [Vec3], first_x: i64, y: i64| -> Result<(), EvalError> {
+        for (x, slot) in (first_x..).zip(slots) {
+            if let Some((g, gi, gj)) = reader.topology.locate(face, reader.n, x, y) {
+                *slot = reader.fetch(g, i64::from(gi), i64::from(gj))?;
+            }
+        }
+        Ok(())
+    };
+    // Strictly inside a face of the mesh, a point is its own owner copy: those of a row are
+    // read as one run.
     let n = i64::from(reader.n);
-    let own = |x: i64| (1..n).contains(&x);
+    let (first, last) = (x0 - 1, x0 + q + 1);
+    let (inner_first, inner_last) = (first.max(1), last.min(n - 1));
     let on_mesh = reader.topology.contains(face);
     for j in -1..=q + 1 {
         let y = y0 + j;
-        for (x, slot) in (x0 - 1..).zip(padded.row_mut(j)) {
-            *slot = if on_mesh && own(x) && own(y) {
-                reader.fetch_own(face, x, y)?
-            } else {
-                match reader.topology.locate(face, reader.n, x, y) {
-                    Some((g, gi, gj)) => reader.fetch(g, i64::from(gi), i64::from(gj))?,
-                    None => Vec3::NAN,
-                }
-            };
-        }
+        let row = padded.row_mut(j);
+        let run = usize::try_from(inner_first - first)
+            .ok()
+            .zip(usize::try_from(inner_last - inner_first + 1).ok())
+            .filter(|_| on_mesh && (1..n).contains(&y));
+        let Some((start, len)) = run else {
+            located(row, first, y)?;
+            continue;
+        };
+        let (before, rest) = row.split_at_mut(start.min(row.len()));
+        let (inside, after) = rest.split_at_mut(len.min(rest.len()));
+        located(before, first, y)?;
+        reader.own_row(face, inner_first, y, inside)?;
+        located(after, inner_last + 1, y)?;
     }
     let mut corners: [Option<CornerRing>; 4] = [None, None, None, None];
     for (slot, (ci, cj)) in corners.iter_mut().zip([(0, 0), (q, 0), (q, q), (0, q)]) {

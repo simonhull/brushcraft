@@ -2830,3 +2830,63 @@ fn random_workloads_respect_the_budget_for_many_seeds() {
         random_workload(seed, 2_000);
     }
 }
+
+/// A row read through the pinned tiles gives every vertex what reading it alone gives.
+///
+/// Runs cross tile borders (whose columns belong to the next tile) and reach the face's far
+/// edge (whose column belongs to the last tile).
+#[test]
+fn resident_rows_read_as_single_vertices() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 100, 5));
+    let top = level(TOP);
+    let held = store
+        .pin_current(tiles(&mesh, TOP, TOP).into_iter().collect())
+        .unwrap();
+    let n = top.face_quads();
+    let tq = top.tile_quads();
+    // Each tile's copy of the column it shares with the next tile along its row holds a value
+    // no read may return: `TileKey::containing` gives that column to the next tile.
+    let side = usize::try_from(tq + 1).unwrap();
+    let planted = Vec3::new(1e9, -1e9, 1e9);
+    for &(key, id) in &held {
+        if u32::from(key.tx()) + 1 < top.tiles_per_side() {
+            let slot = store.evaluated.get_mut(id).unwrap();
+            for row in slot.positions[..side * side].chunks_mut(side) {
+                row[side - 1] = planted;
+            }
+        }
+    }
+    let source = Resident::new(&store.mesh, &store.evaluated, &held);
+    let runs = [
+        (0, n + 1),
+        (1, tq - 1),
+        (tq - 3, 6),
+        (tq - 1, 2),
+        (tq, 1),
+        (n - 3, 4),
+    ];
+    for face in mesh.faces() {
+        for j in [0, 1, tq - 1, tq, tq + 1, n / 2, n] {
+            for (i, len) in runs {
+                let mut row =
+                    vec![Vec3::new(f32::NAN, f32::NAN, f32::NAN); usize::try_from(len).unwrap()];
+                source.row(face, top, i, j, &mut row).unwrap();
+                for (x, got) in (i..).zip(&row) {
+                    let want = source.position(face, top, x, j).unwrap();
+                    assert_ne!(want, planted, "a single read takes the next tile's copy");
+                    assert_eq!(got.to_bits(), want.to_bits(), "{face:?} ({x}, {j})");
+                }
+            }
+        }
+    }
+    let mut past = [Vec3::ZERO; 2];
+    assert!(
+        source.row(FaceId::new(0), top, n, 0, &mut past).is_none(),
+        "a run off the face isn't available"
+    );
+    store.unpin_held(&held).unwrap();
+}

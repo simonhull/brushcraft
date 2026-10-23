@@ -864,6 +864,34 @@ impl PositionSource for Resident<'_> {
         let index = usize::try_from(lj * key.side() + li).ok()?;
         self.positions(key)?.get(index).copied()
     }
+
+    /// The run copied a tile at a time: [`TileKey::containing`] keeps a vertex in the tile of
+    /// its column, up to the column before the next tile's first (which it gives to that tile),
+    /// so each tile's part of the run is one slice of its row.
+    fn row(&self, face: FaceId, level: Level, i: u32, j: u32, out: &mut [Vec3]) -> Option<()> {
+        if level == Level::ZERO {
+            for (slot, x) in out.iter_mut().zip(i..) {
+                *slot = self.position(face, level, x, j)?;
+            }
+            return Some(());
+        }
+        let (mut x, mut rest) = (i, out);
+        while !rest.is_empty() {
+            let (key, li, lj) =
+                TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level, x, j)?;
+            let side = key.side();
+            // Up to the tile's last column, which belongs to the next tile (or, at the face's
+            // far edge, is this one's alone).
+            let span = (side - 1).saturating_sub(li).max(1);
+            let len = usize::try_from(span).ok()?.min(rest.len());
+            let start = usize::try_from(lj * side + li).ok()?;
+            let (part, tail) = rest.split_at_mut(len);
+            part.copy_from_slice(self.positions(key)?.get(start..start + len)?);
+            x += u32::try_from(len).ok()?;
+            rest = tail;
+        }
+        Some(())
+    }
 }
 
 /// `f` of every item of `items`, in order: on `workers` when there are several, on the calling
