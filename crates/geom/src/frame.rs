@@ -285,19 +285,6 @@ fn derivatives(
     }
 }
 
-/// `f(i, j, local)` for every vertex of a block, row-major `(quads + 1)²`.
-fn per_vertex<T>(
-    block: &Block<'_>,
-    grid: &Padded,
-    corners: &[Option<CornerAxes<'_>>; 4],
-    f: impl Fn(i64, i64, Local) -> T,
-) -> impl Iterator<Item = T> {
-    let q = i64::from(block.quads);
-    (0..=q)
-        .flat_map(move |j| (0..=q).map(move |i| (i, j)))
-        .map(move |(i, j)| f(i, j, derivatives(block, grid, corners, i, j)))
-}
-
 /// The block vertices strictly inside the face, as `(columns, rows)` in block coordinates (an
 /// empty range where there are none).
 ///
@@ -325,8 +312,52 @@ fn run_of<'a>(row: &'a [Vec3], columns: &RangeInclusive<i64>, shift: i64) -> &'a
         .unwrap_or_default()
 }
 
-/// Working space for [`frames_of_run`], one array per quantity of the frame formula, reused
-/// from row to row.
+/// A piece of a block's row, as [`row_parts`] hands them out.
+#[derive(Debug, Clone, Copy)]
+enum RowPart<'a> {
+    /// Vertex `(i, j)`, on the face's border: its stencil ([`stencil`]) is read alone.
+    Vertex(i64, i64),
+    /// A run of consecutive vertices of row `j`, strictly inside the face: each vertex's four
+    /// reads `[plus_u, minus_u, plus_v, minus_v]`, as [`central`] takes them.
+    Run {
+        /// The row.
+        j: i64,
+        /// The runs of reads, one slice per read, one entry per vertex.
+        reads: [&'a [Vec3]; 4],
+    },
+}
+
+/// A block's vertices in row-major order: in each row, a run of the vertices strictly inside the
+/// face, read from `grid` as slices, and single vertices before and after it.
+fn row_parts<'a>(block: &Block<'_>, grid: &'a Padded) -> impl Iterator<Item = RowPart<'a>> {
+    let q = i64::from(block.quads);
+    let (columns, rows) = inside_face(block);
+    (0..=q).flat_map(move |j| {
+        let inside = rows.contains(&j) && !columns.is_empty();
+        let (before, after) = if inside {
+            (0..*columns.start(), *columns.end() + 1..=q)
+        } else {
+            (0..q + 1, q + 1..=q)
+        };
+        let run = inside.then(|| {
+            let row = grid.row(j);
+            RowPart::Run {
+                j,
+                reads: [
+                    run_of(row, &columns, 1),
+                    run_of(row, &columns, -1),
+                    run_of(grid.row(j + 1), &columns, 0),
+                    run_of(grid.row(j - 1), &columns, 0),
+                ],
+            }
+        });
+        let vertex = move |i| RowPart::Vertex(i, j);
+        before.map(vertex).chain(run).chain(after.map(vertex))
+    })
+}
+
+/// Working space for [`frames_of_run`] and [`normals_of_run`], one array per quantity of the
+/// frame formula, reused from row to row.
 #[derive(Debug, Default)]
 struct FrameRows {
     /// The derivatives along the owner's u axis.
@@ -394,40 +425,29 @@ pub(crate) fn frames(
     predicted: &Padded,
     corners: &[Option<CornerAxes<'_>>; 4],
 ) -> Vec<Frame> {
-    let q = i64::from(block.quads);
-    let side = usize::try_from(q + 1).unwrap_or(0);
+    let side = usize::try_from(block.quads).map_or(0, |q| q + 1);
     let mut out = Vec::with_capacity(side * side);
-    let one = |frames: &mut Vec<Frame>, i: i64, j: i64| {
-        let local = derivatives(block, predicted, corners, i, j);
-        debug_assert!(
-            local.is_finite(),
-            "frame inputs at ({i}, {j}) of {block:?} are not finite"
-        );
-        frames.push(Frame::from_local(local));
-    };
-    let (columns, rows) = inside_face(block);
     let mut scratch = FrameRows::default();
-    for j in 0..=q {
-        if !rows.contains(&j) || columns.is_empty() {
-            (0..=q).for_each(|i| one(&mut out, i, j));
-            continue;
+    for part in row_parts(block, predicted) {
+        match part {
+            RowPart::Vertex(i, j) => {
+                let local = derivatives(block, predicted, corners, i, j);
+                debug_assert!(
+                    local.is_finite(),
+                    "frame inputs at ({i}, {j}) of {block:?} are not finite"
+                );
+                out.push(Frame::from_local(local));
+            }
+            RowPart::Run { j, reads } => {
+                let run_start = out.len();
+                frames_of_run(reads, &mut scratch, &mut out);
+                debug_assert!(
+                    out.get(run_start..)
+                        .is_some_and(|run| run.iter().all(|f| f.n.is_finite())),
+                    "frame inputs in row {j} of {block:?} are not finite"
+                );
+            }
         }
-        (0..*columns.start()).for_each(|i| one(&mut out, i, j));
-        let row = predicted.row(j);
-        let reads = [
-            run_of(row, &columns, 1),
-            run_of(row, &columns, -1),
-            run_of(predicted.row(j + 1), &columns, 0),
-            run_of(predicted.row(j - 1), &columns, 0),
-        ];
-        let run_start = out.len();
-        frames_of_run(reads, &mut scratch, &mut out);
-        debug_assert!(
-            out.get(run_start..)
-                .is_some_and(|run| run.iter().all(|f| f.n.is_finite())),
-            "frame inputs in row {j} of {block:?} are not finite"
-        );
-        (*columns.end() + 1..=q).for_each(|i| one(&mut out, i, j));
     }
     out
 }
@@ -444,10 +464,42 @@ pub(crate) fn normal(local: Local) -> Vec3 {
     .unwrap_or(Frame::FALLBACK.n)
 }
 
+/// Unit normals from central differences for a run of consecutive vertices of one row, into
+/// `out` in order (one slot per vertex).
+///
+/// `[plus_u, minus_u, plus_v, minus_v]` hold each vertex's four reads, as [`central`] takes
+/// them. `du × dv` is normalized over the whole run, then each vertex's policy applies: vertex
+/// `k` gets the bits `normal(central(...))` gives for its reads.
+fn normals_of_run<'o>(
+    reads: [&[Vec3]; 4],
+    rows: &mut FrameRows,
+    out: impl Iterator<Item = &'o mut Vec3>,
+) {
+    let [plus_u, minus_u, plus_v, minus_v] = reads;
+    rows.du.set_difference(plus_u, minus_u);
+    rows.dv.set_difference(plus_v, minus_v);
+    rows.n.set_cross(&rows.du, &rows.dv);
+    rows.n.normalize(&mut rows.n_lengths);
+    let normals = rows.n.points().zip(&rows.n_lengths);
+    let inputs = rows.du.points().zip(rows.dv.points());
+    // The run's own iterator first: `zip` stops on it without taking a slot past the run.
+    for (((n, &length), (du, dv)), slot) in normals.zip(inputs).zip(out) {
+        // As in `frames_of_run`: a normal that normalizes had finite inputs.
+        *slot = if normalizable(length) {
+            n
+        } else if du.is_finite() && dv.is_finite() {
+            Frame::FALLBACK.n
+        } else {
+            Vec3::NAN
+        };
+    }
+}
+
 /// Unit normals for every vertex of a block of evaluated positions, into `out`.
 ///
 /// `out` holds `(quads + 1)²` values, row-major. Positions come from a source, so non-finite
-/// input is passed through as NaN, not asserted.
+/// input is passed through as NaN, not asserted. The vertices strictly inside the face go a row
+/// at a time through [`normals_of_run`], the rest one by one; both give a vertex the same bits.
 pub(crate) fn normals(
     block: &Block<'_>,
     positions: &Padded,
@@ -460,13 +512,17 @@ pub(crate) fn normals(
         (q + 1).checked_pow(2),
         "one normal per vertex"
     );
-    for (slot, n) in out
-        .iter_mut()
-        .zip(per_vertex(block, positions, corners, |_, _, local| {
-            normal(local)
-        }))
-    {
-        *slot = n;
+    let mut slots = out.iter_mut();
+    let mut scratch = FrameRows::default();
+    for part in row_parts(block, positions) {
+        match part {
+            RowPart::Vertex(i, j) => {
+                if let Some(slot) = slots.next() {
+                    *slot = normal(derivatives(block, positions, corners, i, j));
+                }
+            }
+            RowPart::Run { reads, .. } => normals_of_run(reads, &mut scratch, slots.by_ref()),
+        }
     }
 }
 
@@ -623,6 +679,40 @@ mod tests {
                 let bits = |f: &Frame| [f.t, f.b, f.n].map(Vec3::to_bits);
                 assert_eq!(bits(got), bits(&want), "vertex {k} of {len}: {u:?}, {v:?}");
             }
+        }
+    }
+
+    /// The row kernel gives every vertex the bits of the one-vertex normal, whatever branch of
+    /// the policy it takes.
+    #[test]
+    fn runs_of_normals_match_one_vertex_normals() {
+        let mut rng = Rng::new(78);
+        for len in [0, 1, 7, 8, 9, 65, 200] {
+            let (du, dv): (Vec<Vec3>, Vec<Vec3>) =
+                (0..len).map(|k| awkward_derivatives(&mut rng, k)).unzip();
+            let zero = vec![Vec3::ZERO; len];
+            // One slot past the run: the caller's next slot, as `normals` hands them out.
+            let mut out = vec![Vec3::ZERO; len + 1];
+            let mut slots = out.iter_mut();
+            normals_of_run(
+                [&du, &zero, &dv, &zero],
+                &mut FrameRows::default(),
+                slots.by_ref(),
+            );
+            *slots.next().unwrap() = Vec3::new(9.0, 9.0, 9.0);
+            for (k, ((&u, &v), got)) in du.iter().zip(&dv).zip(&out).enumerate() {
+                let want = normal(central([u, Vec3::ZERO, v, Vec3::ZERO]));
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "vertex {k} of {len}: {u:?}, {v:?}"
+                );
+            }
+            assert_eq!(
+                out[len],
+                Vec3::new(9.0, 9.0, 9.0),
+                "the run took only its own slots"
+            );
         }
     }
 
