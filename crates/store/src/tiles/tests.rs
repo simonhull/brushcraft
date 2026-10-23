@@ -437,6 +437,43 @@ fn wide_batches_near_the_minimum_keep_a_correction_chunk() {
     }
 }
 
+/// A batch is sized from the evaluated pool's reachable room: the budget less the correction
+/// floor and the correction chunks its pinned and dirty slots fill.
+#[test]
+fn batches_are_sized_from_the_room_the_evaluated_pool_can_reach() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let config = roomy();
+    let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    let (per_evaluated, per_correction) = (
+        store.evaluated.per_chunk() as usize,
+        store.corrections.per_chunk() as usize,
+    );
+    let (chunk, headroom) = (config.chunk_bytes, store.headroom.evaluated);
+    let size = |held_chunks: usize| {
+        let chunks = (config.budget_bytes - (held_chunks + 1) * chunk) / chunk;
+        (chunks * per_evaluated - headroom) / BATCH_SHARE
+    };
+    assert_eq!(store.batch_size(0), size(0), "the floor alone");
+    // One more dirty tile than a correction chunk holds: two chunks' worth.
+    store.begin_op().unwrap();
+    for key in tiles(&mesh, TOP, TOP).into_iter().take(per_correction + 1) {
+        store
+            .edit_tile(key, |edit| edit.set(1, 1, Vec3::new(0.001, 0.0, 0.0)))
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(store.unsaved.len(), per_correction + 1, "dirty tiles");
+    let expected = size(2);
+    assert_eq!(
+        store.batch_size(0),
+        expected,
+        "the floor and two dirty chunks"
+    );
+    store.save().unwrap();
+    assert_eq!(store.batch_size(0), size(0), "clean again");
+}
+
 #[test]
 fn edits_after_evaluation_invalidate_exactly() {
     let dir = TestDir::new();

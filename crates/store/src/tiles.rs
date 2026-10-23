@@ -2236,14 +2236,25 @@ impl TileStore {
     }
 
     /// The targets the next batch of [`TileStore::in_batches`] takes: a [`BATCH_SHARE`] of the
-    /// evaluated slots the budget would hold besides those pinned, the `pending` targets still
-    /// to come (which [`TileStore::pin`] has counted on keeping room for) and an evaluation's
-    /// own headroom; at least one, at most [`MAX_BATCH`].
+    /// evaluated slots the pool can reach besides those pinned, the `pending` targets still to
+    /// come (which [`TileStore::pin`] has counted on keeping room for) and an evaluation's own
+    /// headroom; at least one, at most [`MAX_BATCH`].
     ///
-    /// It depends on the budget and the pins alone, never on the thread count, so the batches,
-    /// like the rounds, are the same whatever the workers.
+    /// The evaluated pool reaches the budget less what the correction pool keeps from it: the
+    /// correction floor (one chunk, see [`TileStore::make_room`]) and the chunks its pinned
+    /// slots, which can't go, and its dirty ones, which go only after a write, fill. Those are
+    /// counted as if packed into chunks, not by the chunks they sit in: where a tile sits
+    /// depends on when prefetched tiles were installed, and the count must not.
+    ///
+    /// It depends on the budget and the counts of pinned and dirty slots alone, never on the
+    /// thread count or where tiles sit, so the batches, like the rounds, are the same whatever
+    /// the workers.
     fn batch_size(&self, pending: usize) -> usize {
-        let chunks = self.budget.limit() / self.evaluated.chunk_bytes().max(1);
+        let held = self.corrections.pinned_slots() + self.unsaved.len();
+        let held_chunks = held.div_ceil(self.corrections.per_chunk() as usize);
+        let kept = (held_chunks + 1) * self.corrections.chunk_bytes();
+        let reachable = self.budget.limit().saturating_sub(kept);
+        let chunks = reachable / self.evaluated.chunk_bytes().max(1);
         let slots = chunks.saturating_mul(self.evaluated.per_chunk() as usize);
         let taken = self.evaluated.pinned_slots() + pending + self.headroom.evaluated;
         (slots.saturating_sub(taken) / BATCH_SHARE).clamp(1, MAX_BATCH)
