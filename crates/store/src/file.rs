@@ -1308,6 +1308,48 @@ impl ProjectFile {
         Ok(())
     }
 
+    /// Appends a bounds record for each of `bounds` (`None`: unknown), in order, framed into one
+    /// buffer and written with one write: each is its key's latest bounds record, placed against
+    /// an open cut by `stamp`, as [`ProjectFile::write_bounds`] places one.
+    ///
+    /// If the write fails, none of them is recorded (the bytes written past the end, if any, are
+    /// overwritten by the next append).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`].
+    pub(crate) fn write_bounds_many<'a>(
+        &mut self,
+        bounds: impl IntoIterator<Item = (TileKey, Option<&'a TileBounds>)>,
+        stamp: Stamp,
+    ) -> Result<(), StoreError> {
+        if self.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly);
+        }
+        let mut buffer = Vec::new();
+        let mut placed = Vec::new();
+        for (key, kept) in bounds {
+            let record =
+                frame(KIND_BOUNDS, &bounds_payload(&key, kept)).ok_or(StoreError::TooLarge)?;
+            placed.push((key, buffer.len() as u64, record.len() as u64));
+            buffer.extend_from_slice(&record);
+        }
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let start = self.end;
+        self.file.write_all_at(&buffer, start)?;
+        self.end += buffer.len() as u64;
+        for (key, at, len) in placed {
+            let loc = Loc {
+                offset: start + at,
+                len,
+            };
+            self.note(Name::Bounds(key), None, stamp, loc);
+        }
+        Ok(())
+    }
+
     /// Appends `raw`, a bounds record of `key` read from another file and checked there, as
     /// `key`'s latest bounds record.
     ///

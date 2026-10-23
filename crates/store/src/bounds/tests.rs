@@ -262,3 +262,26 @@ fn the_book_makes_unknown_what_a_write_changes() {
     assert!(book.changed(&all[0]).is_none(), "a rebase empties the book");
     assert!(!book.has_unflushed(), "and the flush list");
 }
+
+#[test]
+fn a_recorded_bound_is_flushed_only_over_an_edits_change() {
+    let mesh = mesh();
+    let all = tiles(&mesh, 8, 8);
+    let mut book = Book::default();
+    book.record(all[0], sample());
+    assert!(!book.has_unflushed(), "derived: no flush writes it");
+    assert_eq!(
+        book.unsaved().map(|(key, _)| *key).collect::<Vec<_>>(),
+        [all[0]],
+        "a save does"
+    );
+    book.set(all[1], None);
+    book.record(all[1], sample());
+    assert!(
+        book.is_unflushed(&all[1]),
+        "recorded over an edit's unknown marker: flushed, as the marker would have been"
+    );
+    book.saved(&all[0]);
+    book.saved(&all[1]);
+    assert_eq!(book.unsaved().count(), 0, "both saved");
+}

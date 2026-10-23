@@ -37,10 +37,13 @@
 //!
 //! # The spatial index
 //!
-//! The bounds of the spatial index are kept with the tiles, in both files (see
-//! [`crate::bounds`]): what the index records streams into the recovery file with the edits,
-//! and a save copies it into the project file. So [`Project::load_index`] after
-//! [`Project::open`] or [`Project::restore`] reads the index instead of evaluating every tile.
+//! The bounds of the spatial index are kept with the tiles (see [`crate::bounds`]). What edits
+//! change, and the index records over it, streams into the recovery file with the edits; a save
+//! copies every bound recorded since into the project file, those the index computed with no edit
+//! pending (a whole build, say) included, which the recovery file never holds. So
+//! [`Project::load_index`] after [`Project::open`] reads the index instead of evaluating every
+//! tile, and after [`Project::restore`] it evaluates at most the tiles whose bounds were derived
+//! after the last save: a crash costs their evaluation, never a stale bound.
 //!
 //! # Recovery file names
 //!
@@ -799,8 +802,8 @@ impl Project {
     /// ([`SpatialIndex::load`]): read from the recovery file where it has them, else from the
     /// project file's save point, and evaluated only for tiles neither holds (a project saved
     /// before bounds were kept, or edited since without a refit). What an index built, refitted
-    /// or loaded here computes is kept in turn, streamed into the recovery file with the edits
-    /// and saved with them.
+    /// or loaded here computes is kept in turn: streamed into the recovery file where it replaces
+    /// an edit's change, and saved into the project file by the next save.
     ///
     /// # Errors
     ///

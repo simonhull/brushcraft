@@ -2,10 +2,10 @@
 //! evaluating every tile.
 //!
 //! The spatial index ([`crate::SpatialIndex`]) holds a [`TileBounds`] for every tile of one level,
-//! the finest the store evaluates. Computing them means evaluating every tile, about two minutes
-//! of work on one core for the benchmark sphere. So the files keep them: a `Bounds` record per
-//! tile, named by save points like a tile record (see [`crate::ProjectFile`]), holding either the
-//! tile's bounds or the fact that they aren't known.
+//! the finest the store evaluates. Computing them means evaluating every tile: 14.3 s for the
+//! benchmark sphere on the dev box's workers, two minutes on one core. So the files keep them: a
+//! `Bounds` record per tile, named by save points like a tile record (see [`crate::ProjectFile`]),
+//! holding either the tile's bounds or the fact that they aren't known.
 //!
 //! # Derived data, never stale
 //!
@@ -23,11 +23,19 @@
 //!   [`readers`]) becomes unknown;
 //! - the spatial index records the bounds it computes, which are those of the store's current
 //!   state, and they replace whatever was there;
-//! - the bounds changed since the working file last received them go to it together, at the moment
-//!   a recovery flush cuts (or a save writes), so the save point names tiles and bounds of one
-//!   state;
+//! - the bounds edits changed since the working file last received them go to it together, at the
+//!   moment a recovery flush cuts (or a save writes), so the save point names tiles and bounds of
+//!   one state: the unknown markers a settle leaves, and the bounds recorded over them (a brush's
+//!   refit);
 //! - every bound changed since the last save of the project file stays in memory, to be copied into
 //!   it by the next save.
+//!
+//! A bound recorded where no edit is waiting to be flushed (most of what an index build, or a load
+//! that evaluates, records) is *derived*: the files already describe that tile's current state,
+//! known or unknown, so the recovery file doesn't need it, and a crash costs only its evaluation
+//! again. Derived bounds stay out of the recovery file, which so grows with edits, not with what
+//! the index computes, and a stroke end's cost on the drawing thread with them; they reach the
+//! project file at its next save.
 //!
 //! A tile whose latest edit is lost (a broken slot left out of a flush, a record that no longer
 //! reads) makes the bounds that edit could change unknown too: the save point holds the tile's
@@ -221,8 +229,12 @@ pub(crate) struct Book {
     /// Every bound changed since the store opened or was last rebased: its value now, `None` if
     /// unknown. What a save copies into the project file, and what reads find first.
     changed: BTreeMap<TileKey, Option<TileBounds>>,
-    /// The bounds of [`Book::changed`] the working file hasn't received since they last changed.
+    /// The bounds of [`Book::changed`] edits changed that the working file hasn't received since
+    /// (see the module notes): what the next flush writes.
     unflushed: BTreeSet<TileKey>,
+    /// The bounds of [`Book::changed`] whose latest change is derived (see the module notes): no
+    /// flush writes them; a save of the project file, or of the working file itself, does.
+    derived: BTreeSet<TileKey>,
     /// Counts the changes made to [`Book::changed`]: a save or a roll-over made before a later
     /// one doesn't hold it.
     changes: u64,
@@ -292,11 +304,26 @@ impl Book {
         Ok(stale)
     }
 
-    /// Sets `key`'s bound to `bounds` (`None`: unknown), and tracks its level.
+    /// Sets `key`'s bound to `bounds` (`None`: unknown), to be flushed, and tracks its level.
     pub(crate) fn set(&mut self, key: TileKey, bounds: Option<TileBounds>) {
         self.levels.insert(key.level());
         self.changed.insert(key, bounds);
         self.unflushed.insert(key);
+        self.derived.remove(&key);
+        self.changes += 1;
+    }
+
+    /// Records `bounds`, computed from the store's current state, as `key`'s bound: flushed if
+    /// an edit's change to it is waiting to be (it replaces that change, which the working file
+    /// must not miss), else derived, kept for the next save only (see the module notes).
+    pub(crate) fn record(&mut self, key: TileKey, bounds: TileBounds) {
+        if self.unflushed.contains(&key) {
+            self.set(key, Some(bounds));
+            return;
+        }
+        self.levels.insert(key.level());
+        self.changed.insert(key, Some(bounds));
+        self.derived.insert(key);
         self.changes += 1;
     }
 
@@ -320,7 +347,20 @@ impl Book {
             .filter_map(|key| Some((key, self.changed.get(key)?.as_ref())))
     }
 
-    /// Whether the working file lacks a bound's latest change.
+    /// The bounds a save of the working file itself writes, with their values, in key order:
+    /// those a flush would, and the derived ones.
+    pub(crate) fn unsaved(&self) -> impl Iterator<Item = (&TileKey, Option<&TileBounds>)> {
+        self.unflushed
+            .union(&self.derived)
+            .filter_map(|key| Some((key, self.changed.get(key)?.as_ref())))
+    }
+
+    /// Whether `key`'s latest change is waiting for a flush.
+    pub(crate) fn is_unflushed(&self, key: &TileKey) -> bool {
+        self.unflushed.contains(key)
+    }
+
+    /// Whether the working file lacks a bound's latest change made by an edit.
     pub(crate) fn has_unflushed(&self) -> bool {
         !self.unflushed.is_empty()
     }
@@ -330,7 +370,15 @@ impl Book {
         self.unflushed.remove(key);
     }
 
-    /// A new working file holds every changed bound as it is now (a roll-over filled it).
+    /// The working file has received `key`'s latest change in a save of its own: nothing of it
+    /// is waiting, derived or not.
+    pub(crate) fn saved(&mut self, key: &TileKey) {
+        self.unflushed.remove(key);
+        self.derived.remove(key);
+    }
+
+    /// A new working file holds every bound a flush would write, as it is now (a roll-over
+    /// filled it). Derived bounds stay derived: it doesn't hold them.
     pub(crate) fn all_flushed(&mut self) {
         self.unflushed.clear();
     }
@@ -340,6 +388,7 @@ impl Book {
     pub(crate) fn rebased(&mut self) {
         self.changed.clear();
         self.unflushed.clear();
+        self.derived.clear();
     }
 
     /// The changes counted so far, for telling whether a save is still current.

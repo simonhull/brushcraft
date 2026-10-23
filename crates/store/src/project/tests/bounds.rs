@@ -121,3 +121,127 @@ fn a_restored_project_loads_its_bounds_through_the_recovery_file() {
         opened.close(false).unwrap();
     }
 }
+
+/// The bounds an index computes without an edit pending stay out of the recovery file, so a
+/// stroke end costs what its edits do; an explicit save writes them into the project file.
+#[test]
+fn derived_bounds_skip_the_recovery_file_and_reach_the_saved_one() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let (_, loaded) = project.load_index(top(), |_, _| {}).unwrap();
+    assert_eq!(loaded.stored, 0, "nothing stored: every bound computed");
+    project.begin_stroke().unwrap();
+    project.end_stroke().unwrap();
+    poll_until_idle(&mut project);
+    assert_eq!(
+        project.store().working().bounds_locations().count(),
+        0,
+        "the recovery file holds none of them"
+    );
+    assert_saved(project.save_as(&path));
+    project.close(false).unwrap();
+    let mut opened = Project::open(&path, config(&dir)).unwrap();
+    let stats = assert_loads_as_built(opened.store(), top(), "saved");
+    assert_eq!(stats.evaluated, 0, "the save wrote every one");
+    opened.close(false).unwrap();
+}
+
+/// Sets an interior vertex of `key` (a level-[`TOP`] tile) as a stroke of its own, refitting
+/// `index` to `refit` before the stroke ends.
+fn edit_interior(project: &mut Project, index: &mut SpatialIndex, key: TileKey, refit: &[TileKey]) {
+    project.begin_stroke().unwrap();
+    let region = Region::of_tile(&key);
+    project
+        .store()
+        .set_correction(
+            key.face(),
+            key.level(),
+            region.x0() + 5,
+            region.y0() + 7,
+            Vec3::new(0.0, 0.0, 0.25),
+        )
+        .unwrap();
+    index.update(project.store(), refit).unwrap();
+    project.end_stroke().unwrap();
+}
+
+/// A roll-over carries the bounds the failed recovery file held into the new one: those flushed
+/// before the failure too, which hide the project file's stale bounds of the edited region.
+#[test]
+fn a_roll_over_carries_the_flushed_bounds_across() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let (mut index, _) = project.load_index(top(), |_, _| {}).unwrap();
+    let all = tiles(&mesh(), TOP, TOP);
+    assert_saved(project.save_as(&path));
+    edit_interior(&mut project, &mut index, all[9], &all);
+    poll_until_idle(&mut project);
+    // A second edit, far off, whose flush fails to sync: the project rolls over.
+    let old = project.recovery_path().unwrap().to_path_buf();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    edit_interior(&mut project, &mut index, all[60], &[]);
+    let began = Instant::now();
+    while project.recovery_path().unwrap() == old {
+        project.poll().unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "the roll-over happens"
+        );
+        std::thread::yield_now();
+    }
+    poll_until_idle(&mut project);
+    drop(project);
+    let candidate = find_recoveries(&dir.path("recovery"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut restored = Project::restore(&candidate, config(&dir)).unwrap();
+    assert_loads_as_built(restored.store(), top(), "restored after the roll-over");
+    restored.close(false).unwrap();
+}
+
+/// A bound an index records over an edit's unknown marker still waiting for a flush is flushed:
+/// the recovery file must not keep an older known bound under the newer edit.
+#[test]
+fn a_bound_recorded_over_a_pending_edit_is_flushed() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let (mut index, _) = project.load_index(top(), |_, _| {}).unwrap();
+    let mesh = mesh();
+    let all = tiles(&mesh, TOP, TOP);
+    // Saved, so the project file holds every bound; then an edit, refitted, streamed.
+    assert_saved(project.save_as(&path));
+    let key = all[9];
+    project.begin_stroke().unwrap();
+    let region = Region::of_tile(&key);
+    project
+        .store()
+        .set_correction(
+            key.face(),
+            key.level(),
+            region.x0() + 5,
+            region.y0() + 7,
+            Vec3::new(0.0, 0.0, 0.25),
+        )
+        .unwrap();
+    index.update(project.store(), &all).unwrap();
+    project.end_stroke().unwrap();
+    poll_until_idle(&mut project);
+    let flushed = project.store().working().bounds_locations().count();
+    assert!(
+        flushed > 0 && flushed < all.len(),
+        "the edited region's bounds, and only they, are flushed: {flushed}"
+    );
+    drop(project);
+    let candidate = find_recoveries(&dir.path("recovery"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut restored = Project::restore(&candidate, config(&dir)).unwrap();
+    let stats = assert_loads_as_built(restored.store(), top(), "restored");
+    assert_eq!(stats.evaluated, 0, "every bound kept: {stats:?}");
+    restored.close(false).unwrap();
+}

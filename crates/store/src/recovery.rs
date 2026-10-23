@@ -9,10 +9,11 @@
 //!
 //! 1. **Snapshot** (owner): [`TileStore::snapshot_dirty`] copies every correction slot edited since
 //!    the writer's last flush and not yet in the working file, a 26.9 KB copy each, and the batch
-//!    goes to the writer thread. At the same moment [`TileStore::flush_bounds`] appends the spatial
-//!    index's bounds changed since the last flush (a small record each), so the save point names
-//!    the bounds of the state the snapshot copies (see [`crate::bounds`]). This is all a stroke end
-//!    costs the drawing thread.
+//!    goes to the writer thread. At the same moment [`TileStore::flush_bounds`] appends, with one
+//!    write, the spatial index's bounds that edits changed since the last flush (65 bytes a tile;
+//!    the bounds an index computes with no edit pending stay out, see [`crate::bounds`]), so the
+//!    save point names the bounds of the state the snapshot copies. This is all a stroke end costs
+//!    the drawing thread, and it grows with the edits since the last flush.
 //! 2. **Encoding** (writer): each copy is encoded, compressed and framed as a tile record, and the
 //!    records come back. A copy that doesn't encode is left out, and the bounds its edit could have
 //!    changed are appended as unknown, at the cut.

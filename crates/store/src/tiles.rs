@@ -1441,11 +1441,12 @@ impl TileStore {
         // The bounds of the state the save point names: the lost tiles' edits aren't in it.
         self.bounds.settle(&self.mesh)?;
         self.bounds.forget(&self.mesh, lost.iter().copied())?;
-        for (key, bounds) in self.bounds.all_changed() {
-            project
-                .write_bounds(*key, bounds, Stamp::ZERO)
-                .map_err(CacheError::Save)?;
-        }
+        project
+            .write_bounds_many(
+                self.bounds.all_changed().map(|(key, kept)| (*key, kept)),
+                Stamp::ZERO,
+            )
+            .map_err(CacheError::Save)?;
         project.save().map_err(CacheError::Save)?;
         let base = saved_base(project)?;
         Ok(Saved {
@@ -1624,7 +1625,7 @@ impl TileStore {
         self.bounds.forget(&self.mesh, lost.iter().copied())?;
         let carried: BTreeSet<TileKey> =
             self.file.bounds_locations().map(|(key, _)| *key).collect();
-        for key in carried {
+        for &key in &carried {
             if self.bounds.changed(&key).is_none() {
                 let copied = match self.file.read_bounds_record(&key) {
                     Ok(Some(raw)) => fresh.append_bounds_copy(&key, &raw),
@@ -1634,11 +1635,18 @@ impl TileStore {
                 copied.map_err(CacheError::WriteBack)?;
             }
         }
-        for (key, bounds) in self.bounds.all_changed() {
-            fresh
-                .write_bounds(*key, bounds, Stamp::ZERO)
-                .map_err(CacheError::WriteBack)?;
-        }
+        // What the old file held, as it is now, and what a flush would write; not the derived
+        // bounds, which no recovery file holds.
+        let bounds = &self.bounds;
+        fresh
+            .write_bounds_many(
+                bounds
+                    .all_changed()
+                    .filter(|(key, _)| carried.contains(key) || bounds.is_unflushed(key))
+                    .map(|(key, kept)| (*key, kept)),
+                Stamp::ZERO,
+            )
+            .map_err(CacheError::WriteBack)?;
         fresh.save().map_err(CacheError::WriteBack)?;
         Ok(Filled {
             file: fresh,
@@ -2266,7 +2274,7 @@ impl TileStore {
                 self.known_ops.insert(key, op);
             }
         }
-        self.write_unflushed_bounds()?;
+        self.write_unsaved_bounds()?;
         Ok(self.file.save()?)
     }
 
@@ -2471,8 +2479,9 @@ impl TileStore {
     }
 
     /// Records `bounds`, computed from the store's current state (by the spatial index), as
-    /// the bounds the store keeps for those tiles: they go to the working file with the next
-    /// flush or save, and to the project file with the next save of it.
+    /// the bounds the store keeps for those tiles. Those replacing an edit's change still to be
+    /// flushed go to the working file with the next flush; the rest are derived, and go to the
+    /// project file with its next save (see [`crate::bounds`]).
     ///
     /// The writes since the last call are settled first (see [`crate::bounds`]), so the bounds
     /// they made unknown are replaced, not the other way round.
@@ -2487,7 +2496,7 @@ impl TileStore {
     ) -> Result<(), CacheError> {
         self.bounds.settle(&self.mesh)?;
         for &(key, tile) in bounds {
-            self.bounds.set(key, Some(tile));
+            self.bounds.record(key, tile);
         }
         Ok(())
     }
@@ -2543,7 +2552,9 @@ impl TileStore {
 
     /// The bounds part of a recovery flush, at its cut: settles the writes so far, makes unknown
     /// the bounds the `lost` tiles' edits could have changed (left out of the flush), and
-    /// appends every bound the working file lacks, placed at the cut.
+    /// appends, with one write, every bound edits changed that the working file lacks, placed at
+    /// the cut. Derived bounds stay out (see [`crate::bounds`]), so the cost grows with the edits
+    /// since the last flush.
     ///
     /// Called right after the flush's snapshot, on the owner thread, before any later write:
     /// the bounds appended are those of the state the snapshot copies, so the flush's save point
@@ -2552,31 +2563,54 @@ impl TileStore {
     /// # Errors
     ///
     /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if an
-    /// append fails: the bounds not appended are kept for the next flush.
+    /// append fails: the bounds are kept for the next flush.
     pub(crate) fn flush_bounds(&mut self, lost: &[TileKey]) -> Result<(), CacheError> {
         self.bounds.settle(&self.mesh)?;
         self.bounds.forget(&self.mesh, lost.iter().copied())?;
         self.write_unflushed_bounds()
     }
 
-    /// Appends every bound the working file lacks, at the latest write: the state they
-    /// describe. The writes must be settled.
+    /// Appends, with one write, every bound edits changed that the working file lacks (not the
+    /// derived ones, see [`crate::bounds`]), placed at the latest write: the state they
+    /// describe. Settles the writes first.
     ///
     /// # Errors
     ///
-    /// [`CacheError::WriteBack`] if an append fails: the bounds not appended stay unflushed.
+    /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if
+    /// the append fails: the bounds stay unflushed.
     fn write_unflushed_bounds(&mut self) -> Result<(), CacheError> {
         self.bounds.settle(&self.mesh)?;
-        let unflushed: Vec<(TileKey, Option<TileBounds>)> = self
-            .bounds
-            .unflushed()
-            .map(|(key, bounds)| (*key, bounds.copied()))
-            .collect();
-        for (key, bounds) in unflushed {
-            self.file
-                .write_bounds(key, bounds.as_ref(), self.last_write)
-                .map_err(CacheError::WriteBack)?;
-            self.bounds.flushed(&key);
+        let unflushed: Vec<TileKey> = self.bounds.unflushed().map(|(key, _)| *key).collect();
+        self.file
+            .write_bounds_many(
+                self.bounds.unflushed().map(|(key, kept)| (*key, kept)),
+                self.last_write,
+            )
+            .map_err(CacheError::WriteBack)?;
+        for key in &unflushed {
+            self.bounds.flushed(key);
+        }
+        Ok(())
+    }
+
+    /// Appends every bound a save of the working file itself writes (see [`Book::unsaved`]):
+    /// those a flush would, and the derived ones, with one write. Settles the writes first.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if
+    /// the append fails: the bounds stay as they were.
+    fn write_unsaved_bounds(&mut self) -> Result<(), CacheError> {
+        self.bounds.settle(&self.mesh)?;
+        let unsaved: Vec<TileKey> = self.bounds.unsaved().map(|(key, _)| *key).collect();
+        self.file
+            .write_bounds_many(
+                self.bounds.unsaved().map(|(key, kept)| (*key, kept)),
+                self.last_write,
+            )
+            .map_err(CacheError::WriteBack)?;
+        for key in &unsaved {
+            self.bounds.saved(key);
         }
         Ok(())
     }
