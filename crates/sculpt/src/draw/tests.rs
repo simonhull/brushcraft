@@ -52,6 +52,7 @@ fn project_over(dir: &TestDir, mesh: BaseMesh, level: Level) -> (Project, Spatia
             budget_bytes: 64 << 20,
             chunk_bytes: 1 << 20,
             site: 1,
+            threads: None,
         },
         recovery_dir: dir.0.join("recovery"),
     };

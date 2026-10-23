@@ -143,6 +143,7 @@ impl Fresh {
             budget_bytes: 0,
             chunk_bytes: 4 << 20,
             site: 1,
+            threads: None,
         };
         config.budget_bytes = config.minimum_budget(&mesh).max(256 << 20);
         let store = TileStore::open(file, config).expect("store");

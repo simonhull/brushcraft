@@ -24,6 +24,7 @@ pub(crate) fn config(options: &Options, paths: &Paths) -> ProjectConfig {
             budget_bytes: options.budget_bytes(),
             chunk_bytes: StoreConfig::DEFAULT_CHUNK_BYTES,
             site: SITE,
+            threads: None,
         },
         recovery_dir: paths.recovery.clone(),
     }

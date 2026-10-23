@@ -4,8 +4,13 @@
 //! evaluation, normals computation and correction read is checked bit for bit against `geom`'s
 //! dense evaluation of the same edits. The default suite runs one seed per budget on the cube;
 //! the ignored test runs many seeds on the cube and on a prism with a valence-7 vertex.
+//!
+//! The same workload runs with its reads batched through [`TileStore::evaluate_many`] at one,
+//! two and every hardware thread: each run is checked against the oracle at every step, and the
+//! runs against each other (the tiles the store computed, in order, and every final bit).
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 use super::*;
 
@@ -86,6 +91,15 @@ fn split_prism(n: usize) -> BaseMesh {
     BaseMesh::from_polygons(positions, &quads).unwrap()
 }
 
+/// How a run reads evaluated tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reads {
+    /// One tile at a time, with [`TileStore::evaluate`] and [`TileStore::normals`].
+    OneByOne,
+    /// Several tiles at a time, made current with [`TileStore::evaluate_many`] and then read.
+    Batched,
+}
+
 /// The budgets a run is tried at: the mesh's minimum and a few chunks more, in chunks of four
 /// evaluated slots.
 fn budgets(mesh: &BaseMesh, extra_chunks: &[usize]) -> Vec<StoreConfig> {
@@ -94,6 +108,7 @@ fn budgets(mesh: &BaseMesh, extra_chunks: &[usize]) -> Vec<StoreConfig> {
         budget_bytes: 0,
         chunk_bytes: chunk,
         site: SITE,
+        threads: None,
     };
     let minimum = base.minimum_budget(mesh);
     extra_chunks
@@ -113,6 +128,8 @@ struct Run<'a> {
     top: u8,
     /// The store's configuration.
     config: StoreConfig,
+    /// How evaluated tiles are read.
+    reads: Reads,
     /// The seed, for messages.
     seed: u64,
     /// Every tile of levels 1 to `top`.
@@ -165,14 +182,45 @@ impl Run<'_> {
         }
     }
 
-    /// Evaluates a tile (a pinned one, a third of the time) and checks it.
+    /// Picks up to eight tiles (of one level, else `evaluate_many` would take them level by
+    /// level anyway) and makes them current together with `what`; the tiles, if that went
+    /// through.
+    fn evaluate_many(&mut self, store: &mut TileStore, what: Evaluation) -> Option<Vec<TileKey>> {
+        let first = self.pick();
+        let count = 1 + self.rng.below(8);
+        let mut keys = vec![first];
+        keys.extend(
+            (1..count)
+                .map(|_| self.pick())
+                .filter(|key| key.level() == first.level()),
+        );
+        let evaluated = store.evaluate_many(&keys, what);
+        self.allow_full(evaluated, "evaluate_many").map(|()| keys)
+    }
+
+    /// Evaluates a tile (a pinned one, a third of the time) and checks it. Batched, a few
+    /// tiles of its level are made current with it first, and checked too.
     fn evaluate(&mut self, store: &mut TileStore) {
+        if self.reads == Reads::Batched {
+            for key in self
+                .evaluate_many(store, Evaluation::Positions)
+                .unwrap_or_default()
+            {
+                self.check_positions(store, key);
+            }
+            return;
+        }
         let key = if !self.guards.is_empty() && self.rng.below(3) == 0 {
             let n = self.rng.below(u32::try_from(self.guards.len()).unwrap()) as usize;
             self.guards[n].keys()[0]
         } else {
             self.pick()
         };
+        self.check_positions(store, key);
+    }
+
+    /// Reads a tile's positions and checks them.
+    fn check_positions(&mut self, store: &mut TileStore, key: TileKey) {
         let got = store.evaluate(key).map(<[Vec3]>::to_vec);
         if let Some(got) = self.allow_full(got, "evaluate") {
             let grid = self.oracle().grid(key.face(), key.level()).unwrap();
@@ -181,9 +229,24 @@ impl Run<'_> {
         }
     }
 
-    /// Computes a tile's normals and checks them.
+    /// Computes a tile's normals and checks them. Batched, a few tiles of its level are made
+    /// current with it first, and checked too.
     fn normals(&mut self, store: &mut TileStore) {
+        if self.reads == Reads::Batched {
+            for key in self
+                .evaluate_many(store, Evaluation::Normals)
+                .unwrap_or_default()
+            {
+                self.check_normals(store, key);
+            }
+            return;
+        }
         let key = self.pick();
+        self.check_normals(store, key);
+    }
+
+    /// Reads a tile's normals and checks them.
+    fn check_normals(&mut self, store: &mut TileStore, key: TileKey) {
         let got = store.normals(key).map(<[Vec3]>::to_vec);
         if let Some(got) = self.allow_full(got, "normals") {
             let region = Region::of_tile(&key);
@@ -322,8 +385,13 @@ impl Run<'_> {
         }
     }
 
-    /// Evaluates four tiles unchecked: fills the cache, and evicts.
+    /// Evaluates four tiles unchecked: fills the cache, and evicts. Batched, up to eight tiles
+    /// of one level, together.
     fn burst(&mut self, store: &mut TileStore) {
+        if self.reads == Reads::Batched {
+            self.evaluate_many(store, Evaluation::Positions);
+            return;
+        }
         for _ in 0..4 {
             let key = self.pick();
             let evaluated = store.evaluate(key).map(drop);
@@ -390,12 +458,30 @@ impl Run<'_> {
     }
 }
 
-/// Runs `steps` random operations, chosen with `seed`, on a new store over `mesh` with `config`;
-/// returns what was checked.
+/// What a run checked, and what the store did.
+struct Outcome {
+    /// What was checked.
+    stats: Stats,
+    /// Every tile whose positions (`false`) or normals (`true`) the store computed, in order,
+    /// across reopens.
+    computed: Vec<(TileKey, bool)>,
+    /// Every tile's positions and normals at the end, as bits.
+    bits: Vec<u32>,
+}
+
+/// Runs `steps` random operations, chosen with `seed`, on a new store over `mesh` with `config`,
+/// reading tiles as `reads` says; returns what was checked and what the store did.
 ///
 /// Every read is checked against the dense evaluation to level `top`, the budget and the
 /// dependency graph after every step, and every tile at the end.
-fn run(mesh: &Arc<BaseMesh>, top: u8, config: StoreConfig, seed: u64, steps: u32) -> Stats {
+fn run(
+    mesh: &Arc<BaseMesh>,
+    top: u8,
+    config: StoreConfig,
+    reads: Reads,
+    seed: u64,
+    steps: u32,
+) -> Outcome {
     let dir = TestDir::new();
     let path = dir.path("work.bcp");
     let open = |file: ProjectFile| TileStore::open(file, config).unwrap();
@@ -404,6 +490,7 @@ fn run(mesh: &Arc<BaseMesh>, top: u8, config: StoreConfig, seed: u64, steps: u32
         mesh,
         top,
         config,
+        reads,
         seed,
         all: tiles(mesh, 1, top),
         rng: Rng(seed),
@@ -413,12 +500,14 @@ fn run(mesh: &Arc<BaseMesh>, top: u8, config: StoreConfig, seed: u64, steps: u32
         guards: Vec::new(),
         stats: Stats::default(),
     };
+    let mut computed = Vec::new();
     for step in 0..steps {
         let what = run.step(&mut store);
         if what == "reopen" {
             // Save, drop, reopen: the file holds every edit.
             store.save().unwrap();
             run.guards.clear();
+            computed.extend(store.log.computed());
             drop(store);
             store = open(ProjectFile::open(&path).unwrap());
             run.stats.reopens += 1;
@@ -440,7 +529,18 @@ fn run(mesh: &Arc<BaseMesh>, top: u8, config: StoreConfig, seed: u64, steps: u32
         &run.all,
         &format!("seed {seed} at the end"),
     );
-    run.stats
+    computed.extend(store.log.computed());
+    let mut bits = Vec::new();
+    for &key in &run.all {
+        let positions = store.evaluate(key).unwrap().to_vec();
+        let normals = store.normals(key).unwrap();
+        bits.extend(positions.iter().chain(normals).flat_map(|v| v.to_bits()));
+    }
+    Outcome {
+        stats: run.stats,
+        computed,
+        bits,
+    }
 }
 
 /// Asserts that the runs together reached every kind of check.
@@ -464,8 +564,8 @@ fn the_store_reads_as_the_dense_evaluation_at_every_step() {
         for (seed, config) in (0x5EED..).zip(budgets(&mesh, &[0, 3])) {
             let mesh = &mesh;
             scope.spawn(move || {
-                let stats = run(mesh, 7, config, seed, 400);
-                assert_covered(stats, &format!("{} bytes", config.budget_bytes));
+                let outcome = run(mesh, 7, config, Reads::OneByOne, seed, 400);
+                assert_covered(outcome.stats, &format!("{} bytes", config.budget_bytes));
             });
         }
     });
@@ -488,7 +588,10 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
                 )]
                 let runs: Vec<_> = (1..=seeds)
                     .map(|seed| {
-                        scope.spawn(move || run(mesh, top, config, seed * 7919 + 13, steps))
+                        scope.spawn(move || {
+                            let seed = seed * 7919 + 13;
+                            run(mesh, top, config, Reads::OneByOne, seed, steps).stats
+                        })
                     })
                     .collect();
                 runs.into_iter()
@@ -503,5 +606,43 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
             total = total + stats;
         }
         assert_covered(total, &format!("{} faces", mesh.face_count()));
+    }
+}
+
+/// The thread counts the batched runs compare: one, two, and one per hardware thread.
+fn thread_counts() -> [NonZeroUsize; 3] {
+    let all = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+    [NonZeroUsize::MIN, NonZeroUsize::new(2).unwrap(), all]
+}
+
+#[test]
+fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
+    let mesh = mesh();
+    // The minimum budget, where batches are halved and rounds cut short, and room to spare,
+    // where the batches are wide.
+    for (seed, config) in (0xBA7C..).zip(budgets(&mesh, &[0, 40])) {
+        let outcomes: Vec<Outcome> = thread_counts()
+            .into_iter()
+            .map(|threads| {
+                let config = StoreConfig {
+                    threads: Some(threads),
+                    ..config
+                };
+                run(&mesh, 7, config, Reads::Batched, seed, 400)
+            })
+            .collect();
+        let what = format!("{} bytes", config.budget_bytes);
+        let (first, rest) = outcomes.split_first().unwrap();
+        assert_covered(first.stats, &what);
+        for (outcome, threads) in rest.iter().zip(thread_counts().into_iter().skip(1)) {
+            assert!(
+                outcome.computed == first.computed,
+                "{what}: {threads} threads computed other tiles, or in another order, than one"
+            );
+            assert!(
+                outcome.bits == first.bits,
+                "{what}: {threads} threads ended with other bits than one"
+            );
+        }
     }
 }

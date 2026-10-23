@@ -71,6 +71,7 @@ impl Stroke {
             budget_bytes: 0,
             chunk_bytes: 4 << 20,
             site: 1,
+            threads: None,
         };
         config.budget_bytes = config.minimum_budget(&mesh).max(64 << 20);
         let mut store = TileStore::open(file, config).expect("store");

@@ -4,6 +4,7 @@
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -84,6 +85,7 @@ fn config(chunks: usize, chunk_slots: usize) -> StoreConfig {
         budget_bytes: chunks * chunk_slots * EVAL,
         chunk_bytes: chunk_slots * EVAL,
         site: SITE,
+        threads: None,
     }
 }
 
@@ -352,6 +354,47 @@ fn normals_equal_geoms_normals_of_the_dense_evaluation() {
             .flat_map(|&l| tiles(&mesh, l, l))
             .collect();
         assert_normals(&mut store, &mesh, &dense, &keys, "normals");
+    }
+}
+
+#[test]
+fn evaluating_many_equals_the_dense_evaluation_at_any_thread_count() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let all = tiles(&mesh, 1, TOP);
+    let finest = tiles(&mesh, TOP, TOP);
+    let threads = [
+        1,
+        2,
+        thread::available_parallelism().map_or(1, NonZeroUsize::get),
+    ];
+    for (base, n) in [roomy(), tight()]
+        .into_iter()
+        .flat_map(|c| threads.map(|n| (c, n)))
+    {
+        let config = StoreConfig {
+            threads: NonZeroUsize::new(n),
+            ..base
+        };
+        let name = format!("{}-{n}.bcp", config.budget_bytes);
+        let mut store = new_store(&dir, &name, &mesh, config);
+        let mut map = CorrectionMap::new();
+        apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 4));
+        let dense = dense(&mesh, &map);
+        let what = format!("{} bytes, {n} threads", config.budget_bytes);
+        // Every level at once, then the finest level's normals: each tile evaluated from a cold
+        // cache in wide batches.
+        store.evaluate_many(&all, Evaluation::Positions).unwrap();
+        store.evaluate_many(&finest, Evaluation::Normals).unwrap();
+        assert_positions(&mut store, &dense, &all, &what);
+        assert_normals(&mut store, &mesh, &dense, &finest, &what);
+        // Pinned in batches, too.
+        let pinned: Vec<TileKey> = finest.iter().step_by(7).copied().collect();
+        match store.pin(&pinned) {
+            Ok(guard) => assert_positions(&mut store, &dense, guard.keys(), &what),
+            Err(CacheError::OverBudget { .. }) => assert_eq!(base, tight(), "{what}: refused"),
+            Err(e) => panic!("{what}: pin: {e:?}"),
+        }
     }
 }
 

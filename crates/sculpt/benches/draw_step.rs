@@ -80,6 +80,7 @@ impl Fresh {
                 budget_bytes: 2 << 30,
                 chunk_bytes: StoreConfig::DEFAULT_CHUNK_BYTES,
                 site: 1,
+                threads: None,
             },
             recovery_dir: dir.join("recovery"),
         };

@@ -26,6 +26,7 @@ fn store_over(dir: &TestDir, mesh: &Arc<BaseMesh>) -> TileStore {
         budget_bytes: 64 * chunk_bytes,
         chunk_bytes,
         site: 3,
+        threads: None,
     };
     config.budget_bytes = config.budget_bytes.max(config.minimum_budget(mesh));
     TileStore::open(file, config).unwrap()

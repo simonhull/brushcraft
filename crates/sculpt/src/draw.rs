@@ -14,7 +14,8 @@
 //!    holding a vertex within the radius, whose positions moved, and every tile whose normals read
 //!    one of those, whose normal cones may have turned: the tiles each reached tile's normals read,
 //!    gathered from the base mesh's topology.
-//! 6. **Evaluate**: those tiles are evaluated again, positions and normals.
+//! 6. **Evaluate**: those tiles are evaluated again, positions and normals, together through
+//!    [`TileStore::evaluate_many`], which builds them in parallel.
 //! 7. **Refit**: their bounds are recomputed and the index's tree refitted.
 //!
 //! Corrections live in each vertex's tangent frame `(t, b, n)` of the predicted surface, so a
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use brush::Smoothstep;
 use geom::{EvalError, Region, TileKey, Vec3, normal_tiles};
-use store::{CacheError, IndexError, Project, SpatialIndex, TileEdit, TileStore};
+use store::{CacheError, Evaluation, IndexError, Project, SpatialIndex, TileEdit, TileStore};
 use thiserror::Error;
 
 /// Why [`DrawParams::new`] refused its arguments.
@@ -276,10 +277,7 @@ pub fn draw_step(
     let changed = bounds_changed(store.mesh(), &found.reached)?;
     times.neighbours = laps.lap();
 
-    for &key in &changed {
-        store.evaluate(key)?;
-        store.normals(key)?;
-    }
+    store.evaluate_many(&changed, Evaluation::Normals)?;
     times.evaluate = laps.lap();
 
     index.update(store, &changed)?;

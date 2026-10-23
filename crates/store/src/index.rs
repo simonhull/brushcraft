@@ -21,7 +21,15 @@ pub use bvh::{Aabb, Bvh, Hit, MAX_TILES, Ray, SphereQuery};
 use geom::{BaseMesh, Level, MAX_LEVEL, TILE_QUADS, TileKey, Vec3};
 use thiserror::Error;
 
-use crate::tiles::{CacheError, TileStore};
+use crate::tiles::{CacheError, Evaluation, TileStore};
+
+/// Tiles [`SpatialIndex::build`] evaluates together before it reads their bounds.
+///
+/// Enough to keep the store's workers busy through [`TileStore::evaluate_many`]; few enough
+/// (about 100 MB of evaluated slots) that a budget of a few hundred megabytes keeps them cached
+/// until they are read. Under a smaller one, tiles evicted before they are read are evaluated
+/// again, one at a time.
+const BUILD_BATCH: usize = 1024;
 
 /// Why building or updating the spatial index failed.
 #[derive(Debug, Error)]
@@ -157,8 +165,10 @@ impl SpatialIndex {
     /// is evaluated once, positions and normals, and its bounds recorded. `progress(done,
     /// total)` is called after each tile.
     ///
-    /// For the benchmark's sphere at level 9 that is 153,600 tiles; the evaluations go through
-    /// the store's cache, so each parent tile is built once while its children are evaluated.
+    /// For the benchmark's sphere at level 9 that is 153,600 tiles. They are evaluated a
+    /// thousand or so at a time with [`TileStore::evaluate_many`], in parallel, then read back
+    /// from the store's cache; each parent tile is built once while its children are
+    /// evaluated.
     ///
     /// # Errors
     ///
@@ -172,9 +182,12 @@ impl SpatialIndex {
         let keys: Vec<TileKey> = tiles_of(store.mesh(), level).collect();
         let total = keys.len();
         let mut tiles = Vec::with_capacity(total);
-        for (done, key) in (1..).zip(keys) {
-            tiles.push((key, Self::bounds_of(store, key)?));
-            progress(done, total);
+        for batch in keys.chunks(BUILD_BATCH) {
+            store.evaluate_many(batch, Evaluation::Normals)?;
+            for &key in batch {
+                tiles.push((key, Self::bounds_of(store, key)?));
+                progress(tiles.len(), total);
+            }
         }
         Ok(Self {
             level,
@@ -195,7 +208,8 @@ impl SpatialIndex {
         Ok(TileBounds { aabb, cone })
     }
 
-    /// Re-evaluates the tiles `keys` (after edits) and refits the tree to their new bounds.
+    /// Re-evaluates the tiles `keys` (after edits), together with
+    /// [`TileStore::evaluate_many`], and refits the tree to their new bounds.
     ///
     /// # Errors
     ///
@@ -205,6 +219,7 @@ impl SpatialIndex {
         if let Some(&key) = keys.iter().find(|k| self.bvh.bounds(k).is_none()) {
             return Err(IndexError::UnknownTile(key));
         }
+        store.evaluate_many(keys, Evaluation::Normals)?;
         let changed = keys
             .iter()
             .map(|&key| Ok((key, Self::bounds_of(store, key)?)))

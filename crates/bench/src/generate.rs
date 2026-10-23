@@ -7,12 +7,13 @@
 //! feature about four quads of level `L` across. Each level halves the amplitude and doubles
 //! the frequency: fractal Brownian motion, one octave per level, as detail is sculpted.
 //!
-//! Everything goes through [`Project`], as the app's edits do: a stroke per level, each tile
-//! evaluated, then edited with [`store::TileStore::edit_tile`], each vertex written once
-//! through the tile that owns it (which writes its copies in the neighbouring tiles too), and the
-//! project ticked every [`TICK_EVERY`] tiles, as a frame loop would, so the recovery writer
-//! streams the edits as they are made. Then [`Project::save_as`] writes the project file and
-//! the recovery file is deleted.
+//! Everything goes through [`Project`], as the app's edits do: a stroke per level, its tiles
+//! taken [`TICK_EVERY`] at a time, each batch evaluated together (in parallel, with
+//! [`store::TileStore::evaluate_many`]), then each tile edited with
+//! [`store::TileStore::edit_tile`], each vertex written once through the tile that owns it
+//! (which writes its copies in the neighbouring tiles too), and the project ticked after every
+//! batch, as a frame loop would, so the recovery writer streams the edits as they are made. Then
+//! [`Project::save_as`] writes the project file and the recovery file is deleted.
 //!
 //! The peak resident memory reported is exact: the high-water mark (`VmHWM`), reset as the run
 //! starts and read once the project is closed.
@@ -22,7 +23,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
 use geom::{Level, TileKey, Vec3, cube_sphere};
-use store::Project;
+use store::{Evaluation, Project};
 
 use crate::cli::Options;
 use crate::noise::ValueNoise;
@@ -31,7 +32,8 @@ use crate::report::{Output, Record, mib, ms};
 use crate::session;
 use crate::sys::{Rss, reset_peak};
 
-/// How often, in tiles, the generator ticks the project ([`Project::tick`]).
+/// How many tiles the generator evaluates together, and how often, in tiles, it ticks the
+/// project ([`Project::tick`]).
 ///
 /// A tick, as the app's frame loop makes one, advances the recovery flush in flight and starts
 /// a new one once a second has passed, so a level's edits stream into the recovery file while
@@ -140,13 +142,10 @@ pub(crate) fn run<J: Write, H: Write>(
     for &level in &levels {
         let octave = Octave::new(options, level);
         project.begin_stroke()?;
-        for key in tiles_of(faces, level)? {
-            sculpt_tile(&mut project, noise, octave, key, &mut scratch)?;
-            vertices += u64::try_from(scratch.writes.len())?;
-            done += 1;
-            if done % TICK_EVERY == 0 {
-                project.tick(Instant::now())?;
-            }
+        for batch in tiles_of(faces, level)?.chunks(TICK_EVERY) {
+            vertices += sculpt_batch(&mut project, noise, octave, batch, &mut scratch)?;
+            done += batch.len();
+            project.tick(Instant::now())?;
             out.progress(&format!("level {level}"), done, total, start)?;
         }
         project.end_stroke()?;
@@ -193,46 +192,66 @@ pub(crate) fn run<J: Write, H: Write>(
     Ok(())
 }
 
-/// Buffers [`sculpt_tile`] reuses from tile to tile.
+/// Buffers [`sculpt_batch`] reuses from batch to batch.
 #[derive(Debug, Default)]
 struct Scratch {
-    /// The tile's evaluated positions, copied out of the store.
+    /// A tile's evaluated positions, copied out of the store.
     positions: Vec<Vec3>,
-    /// The writes: each owned vertex's `(i, j)` and its push.
-    writes: Vec<(u32, u32, f32)>,
+    /// The writes of each tile of the batch: each owned vertex's `(i, j)` and its push.
+    writes: Vec<Vec<(u32, u32, f32)>>,
 }
 
-/// Sculpts one tile with `octave`: evaluates it, works out the push of every vertex it owns
-/// (into `scratch.writes`), and writes them into its corrections' `z`.
+/// Sculpts a batch of tiles of one level with `octave`, and returns how many vertices it wrote.
+///
+/// The batch is evaluated together, the push of every vertex each tile owns is worked out from
+/// the positions as they were before any of the batch's edits, and then the pushes are written
+/// into the tiles' corrections' `z`, tile by tile.
+///
+/// Reading every tile before writing any gives what reading each tile just before its own edit
+/// gives: an edit writes the vertices its tile owns (and their copies in neighbouring tiles),
+/// never a vertex another tile owns, and a vertex's position follows from the level below and its
+/// own correction alone. It also saves re-evaluating each neighbour whose border copies an edit
+/// has just changed.
 ///
 /// # Errors
 ///
-/// If the tile can't be evaluated or edited.
-fn sculpt_tile(
+/// If a tile can't be evaluated or edited.
+fn sculpt_batch(
     project: &mut Project,
     noise: ValueNoise,
     octave: Octave,
-    key: TileKey,
+    keys: &[TileKey],
     scratch: &mut Scratch,
-) -> Result<()> {
-    let Scratch { positions, writes } = scratch;
-    let side = key.side();
+) -> Result<u64> {
+    let Scratch {
+        positions,
+        writes: batch,
+    } = scratch;
     let store = project.store();
-    // The positions are copied out: the topology is borrowed from the store too.
-    positions.clear();
-    positions.extend_from_slice(store.evaluate(key)?);
-    writes.clear();
-    let topology = store.mesh().topology();
-    let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
-    for ((i, j), &p) in grid.zip(positions.iter()) {
-        if topology.owns(&key, i, j) {
-            writes.push((i, j, octave.push(noise, p)));
+    store.evaluate_many(keys, Evaluation::Positions)?;
+    batch.resize_with(keys.len(), Vec::new);
+    for (&key, writes) in keys.iter().zip(batch.iter_mut()) {
+        // The positions are copied out: the topology is borrowed from the store too.
+        positions.clear();
+        positions.extend_from_slice(store.evaluate(key)?);
+        writes.clear();
+        let side = key.side();
+        let topology = store.mesh().topology();
+        let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
+        for ((i, j), &p) in grid.zip(positions.iter()) {
+            if topology.owns(&key, i, j) {
+                writes.push((i, j, octave.push(noise, p)));
+            }
         }
     }
-    store.edit_tile(key, |edit| {
-        writes
-            .iter()
-            .try_for_each(|&(i, j, z)| edit.set(i, j, Vec3::new(0.0, 0.0, z)))
-    })??;
-    Ok(())
+    let mut written = 0;
+    for (&key, writes) in keys.iter().zip(batch.iter()) {
+        store.edit_tile(key, |edit| {
+            writes
+                .iter()
+                .try_for_each(|&(i, j, z)| edit.set(i, j, Vec3::new(0.0, 0.0, z)))
+        })??;
+        written += u64::try_from(writes.len())?;
+    }
+    Ok(written)
 }

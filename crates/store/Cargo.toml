@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 bytemuck.workspace = true
 geom.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 
