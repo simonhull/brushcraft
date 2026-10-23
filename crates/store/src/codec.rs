@@ -77,6 +77,9 @@ pub(crate) fn decode_displacement(
 /// Decodes [`encode_displacement`]'s output straight into `slot`, without allocating, and
 /// validates it as [`CorrectionTile::from_parts`] does (see [`CorrectionSlot::validate`]).
 ///
+/// Every value of the prefixes the tile's side uses is written, so `slot` needn't be zeroed
+/// first; past them it keeps what it held (see [`CorrectionSlot::reset`]).
+///
 /// # Errors
 ///
 /// [`CodecError::Size`] if the header or body length doesn't match the side; [`CodecError::Tile`]
@@ -106,7 +109,8 @@ fn fill_slot(header: &[u8], body: &[u8], slot: &mut CorrectionSlot) -> Result<()
         .split_at_checked(n * 6)
         .filter(|(_, border)| border.len() == ring * 12)
         .ok_or(CodecError::Size)?;
-    slot.reset(side)?;
+    // Every value of the side's prefixes is written below: nothing need be zeroed first.
+    slot.side = side;
     slot.scale = scale;
     let interior_planes: [fn(&mut [i16; 3], i16); 3] =
         [|q, v| q[0] = v, |q, v| q[1] = v, |q, v| q[2] = v];
@@ -371,6 +375,35 @@ mod tests {
             ),
             "too wide"
         );
+    }
+
+    /// A decode writes every value of the side's prefixes, so a slot an earlier tile left
+    /// values in decodes to the same tile as a zeroed one.
+    #[test]
+    fn decoding_overwrites_everything_the_side_uses() {
+        let mut rng = 0x9E37_79B9_u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            f32::from(u16::try_from(rng >> 48).unwrap()) / 65536.0 - 0.5
+        };
+        for side in [2, 3, 9, 33, 65] {
+            let values: Vec<Vec3> = (0..side * side)
+                .map(|_| Vec3::new(next(), next(), next()))
+                .collect();
+            let tile = CorrectionTile::from_values(side, &values).unwrap();
+            let (header, raw) = encode_displacement(&tile).unwrap();
+            let mut clean = CorrectionSlot::zeroed();
+            decode_displacement_into(&header, &raw, &mut clean).unwrap();
+            // Every byte set, padding and values past any prefix included, to what no decoded
+            // value is: whatever the decode leaves unwritten shows.
+            let mut used = CorrectionSlot::zeroed();
+            bytemuck::bytes_of_mut(&mut used).fill(0x7F);
+            decode_displacement_into(&header, &raw, &mut used).unwrap();
+            assert_eq!(used.tile_bytes(), clean.tile_bytes(), "side {side}");
+            assert_eq!(used.to_tile().unwrap(), tile, "side {side}");
+        }
     }
 
     #[test]
