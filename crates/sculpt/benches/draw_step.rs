@@ -2,7 +2,8 @@
 //! enough to set up in a benchmark run.
 //!
 //! The mesh is the benchmark's sphere at 1,536 faces (`cube_sphere(16)`), edited at level 8:
-//! 24,576 tiles, 100 million vertices, more than the 2 GiB budget holds evaluated at once. The
+//! 24,576 tiles, 100 million vertices, 2.5 GB evaluated: more than the 2 GiB budget holds at
+//! once. The
 //! project and its spatial index are built once; the steps then run one after another in a
 //! single stroke, along a path on the surface, so each one finds the tiles the step before it
 //! edited still resident.
@@ -56,7 +57,11 @@ struct Fresh {
 }
 
 impl Fresh {
-    /// Makes the project, with a budget that holds every tile, and builds its index.
+    /// Makes the project, under a 2 GiB budget, and builds its index.
+    ///
+    /// The budget doesn't hold every tile evaluated (24,576 of 101 KB, 2.5 GB), so the build
+    /// evicts as it goes, as it would on the benchmark sphere; it holds a step's tiles many
+    /// times over, so the stroke's steps find what the steps before them evaluated.
     ///
     /// # Panics
     ///
