@@ -1,6 +1,5 @@
 //! Evaluating a block: gather the parent level, predict, build frames, apply corrections.
 
-use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use thiserror::Error;
@@ -485,17 +484,94 @@ pub fn evaluate_region(
     Ok(predict_region(mesh, src, region)?.apply(corrections))
 }
 
-/// A source that answers every read with zero and records the tile each read resolves to.
-#[derive(Debug, Default)]
-struct Recorder(RefCell<BTreeSet<TileKey>>);
+/// A source without positions: what [`gathered_tiles`] hands its [`Reader`], whose tile
+/// lookups read none.
+struct NoPositions;
 
-impl PositionSource for Recorder {
-    fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
-        let (key, _, _) =
-            TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level, i, j)?;
-        self.0.borrow_mut().insert(key);
-        Some(Vec3::ZERO)
+impl PositionSource for NoPositions {
+    fn position(&self, _: FaceId, _: Level, _: u32, _: u32) -> Option<Vec3> {
+        None
     }
+}
+
+/// The tiles [`gather`] reads for `region`: every tile it resolves a read to, through the
+/// owner copy and [`TileKey::containing`], without reading.
+///
+/// Only the reads that can leave the face are resolved one by one, exactly as [`gather`]
+/// resolves them (with the same [`Reader`]): the points of the padded block on or past the
+/// face's border, and the rings of base vertices at the block's corners. The rest, the points
+/// strictly inside the face, are each their own owner copy, and [`TileKey::containing`] picks
+/// a point's tile column from its column alone and its tile row from its row alone; so their
+/// tiles are every pairing of the tile columns their columns fall in with the tile rows their
+/// rows fall in, found from one point of each. That makes the listing cost the block's
+/// perimeter, not its area: a level-9 tile's normal inputs are about 270 lookups instead of
+/// 4,500. The tests check it against a recording of [`gather`]'s reads.
+///
+/// # Errors
+///
+/// [`EvalError::Missing`] where [`gather`] would miss a read with a source holding every tile
+/// (a point that resolves to no tile), which no [`Region`] causes.
+fn gathered_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>, EvalError> {
+    let reader = Reader::new(mesh, &NoPositions, region.level());
+    let face = region.face();
+    let n = i64::from(reader.n);
+    let q = i64::from(region.quads());
+    let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
+    let mut tiles = BTreeSet::new();
+    // The padded block is `-1..=q + 1` on each axis; the face's inside is `1..n`.
+    let (xs, ys) = ((x0 - 1, x0 + q + 1), (y0 - 1, y0 + q + 1));
+    let inner = |(a, b): (i64, i64)| (a.max(1), b.min(n - 1));
+    let ((xa, xb), (ya, yb)) = (inner(xs), inner(ys));
+    if xa <= xb && ya <= yb {
+        let mut columns: Vec<(i64, TileKey)> = Vec::new();
+        for x in xa..=xb {
+            let key = reader.tile(face, x, ya)?;
+            if columns
+                .last()
+                .is_none_or(|&(_, last)| last.tx() != key.tx())
+            {
+                columns.push((x, key));
+            }
+        }
+        let mut rows: Vec<(i64, TileKey)> = Vec::new();
+        for y in ya..=yb {
+            let key = reader.tile(face, xa, y)?;
+            if rows.last().is_none_or(|&(_, last)| last.ty() != key.ty()) {
+                rows.push((y, key));
+            }
+        }
+        for &(x, _) in &columns {
+            for &(y, _) in &rows {
+                tiles.insert(reader.tile(face, x, y)?);
+            }
+        }
+    }
+    // Everything else of the padded block: whole rows outside the face's inside, and in the
+    // rows inside it, the columns outside.
+    for y in ys.0..=ys.1 {
+        let row_inside = (1..n).contains(&y);
+        for x in xs.0..=xs.1 {
+            if row_inside && (1..n).contains(&x) {
+                continue;
+            }
+            if let Some(key) = reader.tile_at(face, x, y)? {
+                tiles.insert(key);
+            }
+        }
+    }
+    // The rings of base vertices at the block's corners, as `Reader::corner_ring` reads them.
+    for (ci, cj) in [(0, 0), (q, 0), (q, q), (0, q)] {
+        let Some(ring) = reader.ring(face, (x0 + ci, y0 + cj)) else {
+            continue;
+        };
+        for &(g, c) in &ring.entries {
+            for (s, d) in [(1, 0), (1, 1)] {
+                let (gi, gj) = edge_to_grid(c, n, s, d);
+                tiles.insert(reader.tile(g, gi, gj)?);
+            }
+        }
+    }
+    Ok(tiles)
 }
 
 /// The tiles of `region`'s parent level that predicting `region` reads.
@@ -510,28 +586,21 @@ impl PositionSource for Recorder {
 ///
 /// [`EvalError::LevelZero`] or [`EvalError::NoExactParent`].
 pub fn parent_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>, EvalError> {
-    let recorder = Recorder::default();
-    // The same gather `predict_region` runs, so the list can't drift from the reads.
-    gather(mesh, &recorder, parent_region(region)?)?;
-    Ok(recorder.0.into_inner())
+    gathered_tiles(mesh, parent_region(region)?)
 }
 
 /// The tiles of `region`'s own level that [`normals`] reads.
 ///
 /// Like [`parent_tiles`], these are base-layer displacement keys naming tile positions (the block,
-/// its one-vertex apron, and every face around a base vertex at the block's corners), recorded
-/// from the same gather [`normals`] runs, so a source holding just these tiles can compute
-/// `region`'s normals. At level 0 the keys are level-0 tiles, which `store` serves from the mesh.
+/// its one-vertex apron, and every face around a base vertex at the block's corners), the tiles
+/// of the gather [`normals`] runs, so a source holding just these tiles can compute `region`'s
+/// normals. At level 0 the keys are level-0 tiles, which `store` serves from the mesh.
 ///
 /// # Errors
 ///
-/// [`EvalError::Missing`] only if a read falls outside every tile, which no [`Region`] causes:
-/// the recorder answers every read that has a tile.
+/// [`EvalError::Missing`] only if a read falls outside every tile, which no [`Region`] causes.
 pub fn normal_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>, EvalError> {
-    let recorder = Recorder::default();
-    // The same gather `normals` runs, so the list can't drift from the reads.
-    gather(mesh, &recorder, region)?;
-    Ok(recorder.0.into_inner())
+    gathered_tiles(mesh, region)
 }
 
 /// The widest level of any tile's dependency cone: the most tiles of one level that evaluating a
@@ -1657,5 +1726,63 @@ mod tests {
             ),
             "the apron lies in neighbouring faces"
         );
+    }
+
+    /// A source that answers every read with zero and records the tile each read resolves to:
+    /// the oracle [`gathered_tiles`] is checked against.
+    #[derive(Debug, Default)]
+    struct Recorder(std::cell::RefCell<BTreeSet<TileKey>>);
+
+    impl PositionSource for Recorder {
+        fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+            let (key, _, _) =
+                TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level, i, j)?;
+            self.0.borrow_mut().insert(key);
+            Some(Vec3::ZERO)
+        }
+    }
+
+    /// The tiles [`gather`] reads for `region`, recorded read by read.
+    fn recorded_tiles(mesh: &BaseMesh, region: Region) -> BTreeSet<TileKey> {
+        let recorder = Recorder::default();
+        gather(mesh, &recorder, region).unwrap();
+        recorder.0.into_inner()
+    }
+
+    #[test]
+    fn gathered_tiles_are_the_tiles_gather_reads() {
+        use crate::reference::prism;
+        let meshes = [
+            cube_sphere(1).unwrap(),
+            cube_sphere(2).unwrap(),
+            pentagonal_prism().subdivide().to_base_mesh(),
+            prism(8).subdivide().to_base_mesh(),
+            prism(MAX_VALENCE).subdivide().to_base_mesh(),
+        ];
+        let mut rng = Rng::new(0x7115_5EAD);
+        for mesh in &meshes {
+            // Every tile of every level up to 8 (whole faces up to level 6, then 2 × 2 and
+            // 4 × 4 tiles a face), and random blocks at levels 1 to 8.
+            let mut regions: Vec<Region> = (0..=8)
+                .flat_map(|l| tiles_where(mesh, level(l), |_, _| true))
+                .collect();
+            for _ in 0..400 {
+                let l = level(u8::try_from(1 + rng.below(8)).unwrap());
+                let face = FaceId::new(rng.below(mesh.face_count()));
+                let half = l.face_quads() / 2;
+                let quads = 2 * (1 + rng.below(half));
+                let x0 = 2 * rng.below(half - quads / 2 + 1);
+                let y0 = 2 * rng.below(half - quads / 2 + 1);
+                regions.push(Region::new(face, l, x0, y0, quads).unwrap());
+            }
+            for region in regions {
+                assert_eq!(
+                    gathered_tiles(mesh, region).unwrap(),
+                    recorded_tiles(mesh, region),
+                    "{} faces, {region:?}",
+                    mesh.face_count()
+                );
+            }
+        }
     }
 }
