@@ -175,8 +175,9 @@ impl StoreConfig {
 ///
 /// The rounds are cut by this count alone, never by the thread count, so the store's pool
 /// operations come in the same order however many workers it has. Each round pins its tiles'
-/// correction slots while the workers read them (fewer, if the correction pool can't hold that
-/// many besides its pins), and holds a scratch buffer of one tile per tile of the round.
+/// correction slots while the workers read them (fewer, cut at the first tile after the first
+/// that would need a dirty tile written back or an evaluated chunk taken, see
+/// [`TileStore::load_round`]), and holds a scratch buffer of one tile per tile of the round.
 const ROUND: usize = 64;
 
 /// Target tiles [`TileStore::evaluate_many`] and [`TileStore::pin`] put in one batch at most.
@@ -449,6 +450,19 @@ enum Targets {
     Pinned,
     /// They are unpinned, and stay only as a cache ([`TileStore::evaluate_many`]).
     Released,
+}
+
+/// How [`TileStore::load_correction_as`] may get a slot for a correction tile that isn't
+/// resident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acquire {
+    /// As the memory policy orders it (see [`TileStore::acquire_correction`]): it may take an
+    /// evaluated chunk back or write a dirty tile back.
+    Any,
+    /// A free slot, a new chunk or a clean tile's slot only, as prefetch takes them: nothing is
+    /// written back and the evaluated pool keeps its chunks. A round's tiles after its first
+    /// load this way, so a round writes back no more than one tile at a time would.
+    Clean,
 }
 
 /// Evaluated tiles an evaluation pinned, with their keys, in key order: what its [`Resident`]
@@ -2345,10 +2359,28 @@ impl TileStore {
     /// [`CacheError::Store`] if the record can't be read (the slot is freed again);
     /// [`CacheError::Full`] or [`CacheError::WriteBack`] if no slot can be had.
     fn load_correction(&mut self, key: TileKey) -> Result<SlotId<CorrectionSlot>, CacheError> {
+        self.load_correction_as(key, Acquire::Any)
+    }
+
+    /// [`TileStore::load_correction`], getting a slot for a tile that isn't resident as
+    /// `acquire` allows.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::load_correction`]; with [`Acquire::Clean`], [`CacheError::Full`] when
+    /// no free slot, new chunk or clean tile's slot is to be had.
+    fn load_correction_as(
+        &mut self,
+        key: TileKey,
+        acquire: Acquire,
+    ) -> Result<SlotId<CorrectionSlot>, CacheError> {
         if let Some((id, _)) = self.corrections.lookup(&key) {
             return Ok(id);
         }
-        let id = self.acquire_correction(key)?;
+        let id = match acquire {
+            Acquire::Any => self.acquire_correction(key)?,
+            Acquire::Clean => self.corrections.acquire_clean(key, &mut self.budget)?,
+        };
         #[cfg(test)]
         self.log.file_reads.push(key);
         let found = self.locate(&key);
@@ -2820,19 +2852,32 @@ impl TileStore {
     }
 
     /// Loads and pins the correction tiles of the next round: the first [`ROUND`] tiles of
-    /// `tiles`, or as many of them as the correction pool holds besides its pins (at least the
-    /// first). Returns their slots, in order.
+    /// `tiles`, cut at the first that can't be had cheaply (at least the first). Returns their
+    /// slots, in order.
+    ///
+    /// The first tile gets its slot as the memory policy orders it, as one tile at a time
+    /// would. The others take a free slot, a new chunk or a clean tile's slot only
+    /// ([`Acquire::Clean`]): the round's pins keep the earlier tiles' slots from being reused,
+    /// so going further would write back dirty tiles, or take evaluated chunks, that a tile at
+    /// a time never would. The round is cut at the first refused instead, and that tile starts
+    /// the next round.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::load_correction`], for the first tile only; nothing stays pinned then.
+    /// As [`TileStore::load_correction`]: any error for the first tile, any but
+    /// [`CacheError::Full`] for the others; nothing stays pinned then.
     fn load_round(
         &mut self,
         tiles: &[(TileKey, &[TileKey])],
     ) -> Result<Vec<SlotId<CorrectionSlot>>, CacheError> {
         let mut ids = Vec::with_capacity(tiles.len().min(ROUND));
         for &(key, _) in tiles.iter().take(ROUND) {
-            let loaded = self.load_correction(key).and_then(|id| {
+            let acquire = if ids.is_empty() {
+                Acquire::Any
+            } else {
+                Acquire::Clean
+            };
+            let loaded = self.load_correction_as(key, acquire).and_then(|id| {
                 self.corrections.pin(id)?;
                 Ok(id)
             });

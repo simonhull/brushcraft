@@ -1153,6 +1153,53 @@ fn a_correction_load_takes_a_clean_tile_before_an_evaluated_chunk() {
     }
 }
 
+/// Loading corrections in rounds writes back no more dirty tiles than a tile at a time does.
+///
+/// A round loads its tiles after the first only into slots to be had without a write-back; a
+/// tile at a time unpins each tile before the next, so its slot can be reused.
+#[test]
+fn a_round_writes_back_no_more_than_a_tile_at_a_time() {
+    let mesh = mesh();
+    let (one_dir, round_dir) = (TestDir::new(), TestDir::new());
+    // Seven chunks: the evaluated pool is at its floor, so every load past the free and clean
+    // slots writes a dirty tile back.
+    let mut one = spent_on_dirty_corrections(&one_dir, &mesh, config(7, 4), 1);
+    let mut round = spent_on_dirty_corrections(&round_dir, &mesh, config(7, 4), 1);
+    let cold: Vec<(TileKey, &[TileKey])> = tiles(&mesh, TOP, TOP)
+        .into_iter()
+        .filter(|key| one.corrections.find(key).is_none())
+        .take(12)
+        .map(|key| (key, &[][..]))
+        .collect();
+    assert_eq!(cold.len(), 12, "enough tiles not resident");
+    let dirty = one.unsaved.len();
+    assert_eq!(round.unsaved.len(), dirty, "the stores start alike");
+
+    for &(key, _) in &cold {
+        let id = one.load_correction(key).unwrap();
+        one.corrections.pin(id).unwrap();
+        one.unpin_corrections(&[id]).unwrap();
+    }
+    let mut rounds = 0;
+    let mut rest = cold.as_slice();
+    while !rest.is_empty() {
+        let ids = round.load_round(rest).unwrap();
+        round.unpin_corrections(&ids).unwrap();
+        rest = &rest[ids.len()..];
+        rounds += 1;
+    }
+
+    let written = |store: &TileStore| dirty - store.unsaved.len();
+    assert!(written(&one) > 0, "a tile at a time writes back");
+    assert!(
+        written(&round) <= written(&one),
+        "rounds wrote back {} tiles, a tile at a time {}",
+        written(&round),
+        written(&one)
+    );
+    assert!(rounds > 1, "the rounds were cut short");
+}
+
 #[test]
 fn corrections_take_evaluated_chunks_up_to_a_quarter_of_the_budget() {
     let dir = TestDir::new();
