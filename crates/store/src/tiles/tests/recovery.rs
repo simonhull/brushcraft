@@ -6,6 +6,8 @@
 //! stays proportional to the tiles dirtied per interval.
 
 use super::*;
+use crate::index::SpatialIndex;
+use crate::index::tests::assert_loads_as_built;
 use crate::recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 
 /// Blocks until the writer has no flush in flight or queued, advancing it reply by reply.
@@ -706,9 +708,11 @@ fn a_tick_mid_stroke_cuts_between_two_dabs_of_one_op() {
 
 /// A crash simulation under a tight budget.
 ///
-/// Strokes, with edits, evaluations and write-backs between every phase of each flush. Every save
-/// point equals its flush's snapshot, and the file cut at every record boundary opens at the last
-/// save point before the cut.
+/// Strokes, with edits, evaluations, write-backs and refits of the spatial index between every
+/// phase of each flush. Every save point equals its flush's snapshot, and the file cut at every
+/// record boundary opens at the last save point before the cut, with bounds that load as the
+/// index built from its tiles: from the file alone (nothing evaluated) once a save point holds
+/// them, as the index is refitted before every stroke ends.
 #[test]
 fn every_save_point_is_its_snapshot_and_every_cut_opens_at_one() {
     /// The finest level edited and checked: coarse, so every cut can be checked in full.
@@ -719,12 +723,15 @@ fn every_save_point_is_its_snapshot_and_every_cut_opens_at_one() {
     let check = tiles(&mesh, 1, LEVEL);
     let mut store = new_store(&dir, "recovery.bcrf", &mesh, tight());
     let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut index = SpatialIndex::build(&mut store, level(LEVEL), |_, _| {}).unwrap();
+    let indexed = tiles(&mesh, LEVEL, LEVEL);
     let mut map = CorrectionMap::new();
     let mut points = Vec::new();
     let mut seed = 200;
     for _ in 0..5 {
         seed += 1;
         apply(&mut store, &mut map, &random_edits(&mesh, LEVEL, 40, seed));
+        index.update(&mut store, &indexed).unwrap();
         writer.end_stroke(&mut store, Instant::now()).unwrap();
         let snapshot = map.clone();
         while !writer.is_idle() {
@@ -733,6 +740,8 @@ fn every_save_point_is_its_snapshot_and_every_cut_opens_at_one() {
             for key in check.iter().step_by(5) {
                 store.evaluate(*key).unwrap();
             }
+            // Bounds of a state past the flush's cut: never in its save point.
+            index.update(&mut store, &indexed).unwrap();
             writer.step_blocking(&mut store).unwrap();
         }
         points.push((writer.durable_save_point().unwrap(), snapshot));
@@ -758,7 +767,15 @@ fn every_save_point_is_its_snapshot_and_every_cut_opens_at_one() {
         let file = ProjectFile::open(&cut_path).unwrap();
         let mut reopened = TileStore::open(file, roomy()).unwrap();
         let dense = DenseEvaluation::new(&mesh, level(LEVEL), want).unwrap();
-        assert_positions(&mut reopened, &dense, &check, &format!("cut at {cut}"));
+        let what = format!("cut at {cut}");
+        assert_positions(&mut reopened, &dense, &check, &what);
+        let stats = assert_loads_as_built(&mut reopened, level(LEVEL), &what);
+        let saved = points.first().is_some_and(|(end, _)| *end <= cut);
+        assert_eq!(
+            stats.evaluated == 0,
+            saved,
+            "{what}: every bound stored once a save point holds them, none before ({stats:?})"
+        );
     }
     assert!(ends.len() > 100, "{} record boundaries", ends.len());
 }
@@ -809,6 +826,8 @@ fn a_broken_slot_is_reported_and_the_rest_still_flush() {
         };
         edit_interior(&mut store, oracle, *key, c);
     }
+    // The bounds kept describe the broken tiles' edits, which never reach the file.
+    SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
     store.unsaved.remove(&no_op);
     let id = store.corrections.find(&invalid).unwrap();
     store.corrections.get_mut(id).unwrap().side = 0;
@@ -830,6 +849,10 @@ fn a_broken_slot_is_reported_and_the_rest_still_flush() {
     drop(writer);
     drop(store);
     assert_save_point(&path, offset, &mesh, &map);
+    let file = ProjectFile::open_at(&path, offset).unwrap();
+    let mut saved = TileStore::open(file, roomy()).unwrap();
+    let stats = assert_loads_as_built(&mut saved, level(TOP), "the broken tiles left out");
+    assert!(stats.evaluated > 0, "their bounds unknown: {stats:?}");
 }
 
 /// A roll-over to a new recovery file carries every edit across, dirty or only in the file, and

@@ -15,6 +15,30 @@ use crate::slot::EvaluatedSlot;
 use crate::test_dir::TestDir;
 use crate::tiles::StoreConfig;
 
+mod stored;
+
+/// The bounds of every tile of `index`, in its order, as bits: what "bit for bit" compares.
+pub(crate) fn index_bits(index: &SpatialIndex) -> Vec<(TileKey, [u32; TileBounds::BITS])> {
+    index
+        .bvh()
+        .iter()
+        .map(|(key, bounds)| (*key, bounds.to_bits()))
+        .collect()
+}
+
+/// Loads the index of `level` from what `store` keeps, checks it is, bit for bit, the index
+/// [`SpatialIndex::build`] makes of the store's state, and returns what the load found stored.
+pub(crate) fn assert_loads_as_built(store: &mut TileStore, level: Level, what: &str) -> LoadStats {
+    let (loaded, stats) = SpatialIndex::load(store, level, |_, _| {}).unwrap();
+    let built = SpatialIndex::build(store, level, |_, _| {}).unwrap();
+    assert!(
+        index_bits(&loaded) == index_bits(&built),
+        "{what}: the loaded index is the built one, bit for bit ({stats:?})"
+    );
+    assert_eq!(stats.stored + stats.evaluated, built.bvh().len(), "{what}");
+    stats
+}
+
 /// The level the store-backed tests index: whole-face tiles of 16 × 16 quads.
 const LEVEL: u8 = 4;
 

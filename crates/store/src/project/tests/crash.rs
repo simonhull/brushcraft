@@ -21,10 +21,17 @@
 //! dump, so a run of the tests doesn't fill the system's crash log (or set off the desktop's
 //! crash notifications).
 //!
+//! The child keeps a spatial index over the finest level, refitted before every stroke ends (and
+//! during the interrupted one), so its bounds stream into the recovery file with the edits. A
+//! child crashing mid-flush also edits and refits again while the flush is in flight: bounds of
+//! a state past the flush's cut, which its save point must not name.
+//!
 //! The parent checks that the child died of `SIGKILL`, lists the recovery files, restores the
 //! one it finds, and checks the evaluation against the dense evaluation of exactly the edits
-//! that should have survived: every completed stroke, none of the interrupted one. Then it
-//! saves the restored project and checks the project file holds them too.
+//! that should have survived: every completed stroke, none of the interrupted one. The index
+//! loaded from the restored files must be the one built from the restored tiles, bit for bit,
+//! without evaluating a tile. Then it saves the restored project and checks the project file
+//! holds them too.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::ExitStatusExt;
@@ -34,7 +41,14 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
+use crate::index::SpatialIndex;
+use crate::index::tests::assert_loads_as_built;
 use crate::tiles::tests::{record, tight};
+
+/// The level the child indexes: the tests' finest.
+fn top() -> Level {
+    Level::new(TOP).unwrap()
+}
 
 /// The variable holding the child's [`Scenario`]; the test binary is a crash test's child only
 /// when it is set.
@@ -67,6 +81,9 @@ const SAVED_SEED: u64 = 7;
 
 /// The seed of the stroke the crash interrupts.
 const INTERRUPTED_SEED: u64 = 999;
+
+/// The seed of the edits a child crashing mid-flush makes while the flush is in flight.
+const IN_FLIGHT_SEED: u64 = 555;
 
 /// The seed of the `k`th stroke after the save, counting from 0.
 fn seed(k: u32) -> u64 {
@@ -181,7 +198,7 @@ impl Scenario {
 
 /// Polls `project` until its recovery writer has nothing in flight or queued: the strokes so
 /// far are durable in the recovery file.
-fn poll_until_idle(project: &mut Project) {
+pub(super) fn poll_until_idle(project: &mut Project) {
     let began = Instant::now();
     loop {
         project.poll().unwrap();
@@ -196,13 +213,20 @@ fn poll_until_idle(project: &mut Project) {
     }
 }
 
-/// Begins the stroke with `seed` and applies its `count` edits to the project's store, as dabs
-/// of its one op.
-fn edit(project: &mut Project, count: u32, seed: u64) {
-    let mesh = project.store().working().mesh();
-    let edits = random_edits(&mesh, TOP, count, seed);
+/// Begins the stroke with `seed`, applies its `count` edits to the project's store, as dabs of
+/// its one op, and refits `index` to every tile of its level.
+fn edit(project: &mut Project, index: &mut SpatialIndex, count: u32, seed: u64) {
     project.begin_stroke().unwrap();
-    apply_dabs(project.store(), &mut CorrectionMap::new(), &edits);
+    edit_and_refit(project.store(), index, count, seed);
+}
+
+/// Applies `count` edits with `seed` to `store` as dabs of its current op, and refits `index`
+/// to every tile of its level: the bounds recorded are those of the edits' state.
+fn edit_and_refit(store: &mut TileStore, index: &mut SpatialIndex, count: u32, seed: u64) {
+    let mesh = store.working().mesh();
+    let edits = random_edits(&mesh, TOP, count, seed);
+    apply_dabs(store, &mut CorrectionMap::new(), &edits);
+    index.update(store, &tiles(&mesh, TOP, TOP)).unwrap();
 }
 
 /// Blocks the calling thread for good: the child waits there for its kill, running nothing
@@ -225,28 +249,38 @@ fn crash_child() {
     let scenario: Scenario = scenario.parse().unwrap();
     let dir = PathBuf::from(dir);
     let mut project = Project::new((*mesh()).clone(), scenario.config(&dir)).unwrap();
+    let (mut index, _) = project.load_index(top(), |_, _| {}).unwrap();
     if scenario.saved {
-        edit(&mut project, EDITS, SAVED_SEED);
+        edit(&mut project, &mut index, EDITS, SAVED_SEED);
         project.end_stroke().unwrap();
         assert_saved(project.save_as(&dir.join("p.bcrf")));
     }
     for k in 0..scenario.strokes {
-        edit(&mut project, EDITS, seed(k));
+        edit(&mut project, &mut index, EDITS, seed(k));
         project.end_stroke().unwrap();
         poll_until_idle(&mut project);
     }
-    edit(&mut project, INTERRUPTED_EDITS, INTERRUPTED_SEED);
+    edit(
+        &mut project,
+        &mut index,
+        INTERRUPTED_EDITS,
+        INTERRUPTED_SEED,
+    );
     match scenario.crash {
         Crash::MidStroke => {
             if scenario.tight {
                 assert!(
-                    project.store().working().has_unsaved_tiles(),
+                    project.store().working().has_unsaved_records(),
                     "the stroke in progress has tiles in the file past its save point"
                 );
             }
         }
         Crash::MidFlush(phase) => {
             project.end_stroke().unwrap();
+            // More edits and a refit while the flush is in flight, straight on the store (a
+            // project call would advance the flush).
+            project.store.begin_op().unwrap();
+            edit_and_refit(&mut project.store, &mut index, EDITS, IN_FLIGHT_SEED);
             let writer = project.writer.as_mut().unwrap();
             while writer.phase() != phase {
                 assert_ne!(writer.phase(), "idle", "the flush passes {phase}");
@@ -345,6 +379,15 @@ fn crash(scenario: Scenario) {
         project.has_unsaved_edits(),
         scenario.strokes > 0 || scenario.keeps_the_last_stroke(),
         "{scenario:?}: the recovered edits, and only they, are unsaved"
+    );
+    let loaded = assert_loads_as_built(project.store(), top(), &what);
+    // A project never saved, whose first flush never finished, has no save point to hold any.
+    let durable = scenario.saved || scenario.strokes > 0 || scenario.keeps_the_last_stroke();
+    assert_eq!(
+        loaded.evaluated == 0,
+        durable,
+        "{scenario:?}: every bound restored with its tiles, once a save point holds them \
+         ({loaded:?})"
     );
 
     // What was restored saves: into the project file, or a first one.

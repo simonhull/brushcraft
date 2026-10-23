@@ -3,12 +3,15 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
+mod bounds;
 mod crash;
 mod restore;
 
-use geom::{CorrectionMap, Region, TileKey, Vec3};
+use geom::{CorrectionMap, Level, Region, TileKey, Vec3};
 
 use super::*;
+use crate::index::SpatialIndex;
+use crate::index::tests::assert_loads_as_built;
 use crate::test_dir::TestDir;
 use crate::tiles::tests::{
     TOP, apply, apply_dabs, assert_positions, break_slot, damage, dense, mesh, random_edits, roomy,
@@ -63,6 +66,14 @@ fn stroke(project: &mut Project, map: &mut CorrectionMap, count: u32, seed: u64)
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), map, &edits);
     project.end_stroke().unwrap();
+}
+
+/// Asserts that the index loaded from the project file at `path`, at its latest save point, is
+/// the one built from its tiles: no bound it keeps is stale.
+fn assert_project_bounds(path: &Path, what: &str) {
+    let file = ProjectFile::open(path).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
+    assert_loads_as_built(&mut store, Level::new(TOP).unwrap(), what);
 }
 
 /// Asserts that the project file at `path`, opened at its latest save point, evaluates as the
@@ -854,8 +865,9 @@ fn interior(project: &mut Project, maps: &mut [&mut CorrectionMap], key: TileKey
 
 /// A saved project with an edit readable nowhere.
 ///
-/// Two tiles are edited since the save, written to the recovery file and evicted, and the
-/// first one's record there damaged. Returns the project, the damaged tile, the edits of every
+/// Two tiles are edited since the save, the spatial index built over the edits (so the bounds
+/// kept describe the lost edit too), written to the recovery file and evicted, and the first
+/// one's record there damaged. Returns the project, the damaged tile, the edits of every
 /// stroke, and the edits without the damaged tile's.
 fn with_an_unreadable_edit(dir: &TestDir) -> (Project, TileKey, CorrectionMap, CorrectionMap) {
     let mesh = mesh();
@@ -878,6 +890,7 @@ fn with_an_unreadable_edit(dir: &TestDir) -> (Project, TileKey, CorrectionMap, C
         kept,
         Vec3::new(0.25, 0.0, 0.0),
     );
+    SpatialIndex::build(project.store(), Level::new(TOP).unwrap(), |_, _| {}).unwrap();
     project.finish_flushes().unwrap();
     project.store().evict_all().unwrap();
     let loc = project.store().working().locate(&lost).unwrap();
@@ -909,6 +922,7 @@ fn a_tile_lost_to_a_save_is_reported_and_the_saves_after_it_go_through() {
     project.close(false).unwrap();
     for path in [dir.path("p.bcrf"), copy] {
         assert_project_file(&path, &want, "the lost tile at its last saved state");
+        assert_project_bounds(&path, "the lost tile's bounds unknown");
     }
 }
 
@@ -947,6 +961,7 @@ fn a_tile_lost_to_a_roll_over_is_reported_and_saves_go_through() {
         &want,
         "the lost tile at its last saved state",
     );
+    assert_project_bounds(&dir.path("p.bcrf"), "the lost tile's bounds unknown");
 }
 
 /// A report waits for the save: tiles a flush left out (a broken slot) are reported after the
@@ -1066,6 +1081,7 @@ fn a_roll_over_that_fails_after_losing_a_tile_still_reports_it() {
         &want,
         "the lost tile at its last saved state",
     );
+    assert_project_bounds(&dir.path("p.bcrf"), "the lost tile's bounds unknown");
 }
 
 /// A roll-over that keeps failing is tried less and less often by the frame loop's calls, the

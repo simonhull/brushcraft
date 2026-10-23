@@ -19,14 +19,17 @@ use geom::{BaseMesh, Channel, CorrectionTile, MeshError, TileKey};
 use thiserror::Error;
 
 use crate::OpId;
+use crate::bounds::{Kept, bounds_payload, parse_bounds_payload};
 use crate::bytes::{KEY_LEN, Reader, put_key};
 use crate::codec::{
     CodecError, compress, decode_displacement_into, decompress, displacement_body_len,
     encode_displacement,
 };
+use crate::index::TileBounds;
 use crate::meta::{MAX_BASE_PATH, Meta, SavePoint, mesh_hash};
 use crate::record::{
-    HEAD, Head, KIND_INDEX, KIND_MESH, KIND_META, KIND_TILE, TAIL, frame, parse_head, verify,
+    HEAD, Head, KIND_BOUNDS, KIND_INDEX, KIND_MESH, KIND_META, KIND_TILE, TAIL, frame, parse_head,
+    verify,
 };
 use crate::slot::CorrectionSlot;
 use crate::stamp::Stamp;
@@ -178,6 +181,50 @@ impl Loc {
     pub(crate) const fn middle(self) -> u64 {
         self.offset + self.len / 2
     }
+}
+
+/// What a save point names a record as: a tile's corrections, or the bounds of a tile of the
+/// spatial index's level (see [`crate::bounds`]). Each kind is keyed by its tile, and a tile can
+/// have one of each.
+///
+/// Tiles order before bounds, so a map keyed by names lists every tile first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Name {
+    /// The tile record of a key.
+    Tile(TileKey),
+    /// The bounds record of a key.
+    Bounds(TileKey),
+}
+
+impl Name {
+    /// The tile, if this names a tile record.
+    const fn tile(&self) -> Option<&TileKey> {
+        match self {
+            Self::Tile(key) => Some(key),
+            Self::Bounds(_) => None,
+        }
+    }
+
+    /// The tile, if this names a bounds record.
+    const fn bounds(&self) -> Option<&TileKey> {
+        match self {
+            Self::Bounds(key) => Some(key),
+            Self::Tile(_) => None,
+        }
+    }
+}
+
+/// Splits a map keyed by [`Name`] into its tile records and its bounds records.
+fn split_names(live: &BTreeMap<Name, Loc>) -> (BTreeMap<TileKey, Loc>, BTreeMap<TileKey, Loc>) {
+    let mut tiles = BTreeMap::new();
+    let mut bounds = BTreeMap::new();
+    for (name, &loc) in live {
+        match name {
+            Name::Tile(key) => tiles.insert(*key, loc),
+            Name::Bounds(key) => bounds.insert(*key, loc),
+        };
+    }
+    (tiles, bounds)
 }
 
 /// Whether a [`ProjectFile`] accepts writes.
@@ -366,7 +413,7 @@ impl Repair {
     }
 }
 
-/// Whether an Index lists every live tile or only those changed since its parent.
+/// Whether an Index lists every live tile and bound or only those changed since its parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Coverage {
     /// Every live tile: loading stops at this Index.
@@ -378,14 +425,15 @@ enum Coverage {
 /// A parsed Index payload.
 #[derive(Debug)]
 struct Index {
-    /// Whether the entries are every live tile or a delta on the parent.
+    /// Whether the entries are every live tile and bound, or a delta on the parent.
     coverage: Coverage,
     /// The offset of the Index saved before this one, if any.
     parent: Option<u64>,
     /// The file's head op when this Index was saved; `None` before any edit.
     head: Option<OpId>,
-    /// Sorted by key; `None` marks a removed tile.
-    entries: Vec<(TileKey, Option<Loc>)>,
+    /// Sorted by name (every tile record, then every bounds record); `None` marks a removed
+    /// one.
+    entries: Vec<(Name, Option<Loc>)>,
 }
 
 impl Index {
@@ -404,8 +452,8 @@ impl Index {
 /// The live map an Index and its parent chain describe.
 #[derive(Debug)]
 struct Chain {
-    /// Each live tile's latest record.
-    live: BTreeMap<TileKey, Loc>,
+    /// Each live tile's and bounds' latest record.
+    live: BTreeMap<Name, Loc>,
     /// Delta indexes after the chain's full one.
     deltas: u32,
     /// The head op of the chain's newest Index.
@@ -442,10 +490,10 @@ pub struct ProjectFile {
     file: Arc<LockedFile>,
     /// Where the next record goes.
     end: u64,
-    /// Each live tile's latest record, saved or not: what reads find.
-    live: BTreeMap<TileKey, Loc>,
+    /// Each live tile's and bounds' latest record, saved or not: what reads find.
+    live: BTreeMap<Name, Loc>,
     /// Entries written since the last Index.
-    pending: BTreeMap<TileKey, Loc>,
+    pending: BTreeMap<Name, Loc>,
     /// The offset of the latest Index, the parent of the next one; `None` until the first save.
     last_index: Option<u64>,
     /// Delta indexes since the last full one.
@@ -478,8 +526,8 @@ struct Cut {
     at: Stamp,
     /// The head op of the cut's state: the newest op of a record at or before the cut.
     head: Option<OpId>,
-    /// For each tile with a record past the cut, where its record at the cut is.
-    prior: BTreeMap<TileKey, Prior>,
+    /// For each tile or bounds with a record past the cut, where its record at the cut is.
+    prior: BTreeMap<Name, Prior>,
 }
 
 /// Where a tile's record at a cut is, for each kind of Index the cut's save point may be.
@@ -860,7 +908,7 @@ impl ProjectFile {
         let packed = compress(body)?;
         let payload = tile_payload(key, op, header, body.len(), &packed)?;
         let loc = self.append(KIND_TILE, &payload)?;
-        self.note(key, op, stamp, loc);
+        self.note(Name::Tile(key), Some(op), stamp, loc);
         Ok(())
     }
 
@@ -910,26 +958,26 @@ impl ProjectFile {
             return Err(StoreError::ReadOnly);
         }
         let loc = self.append_record(&tile.record)?;
-        self.note(tile.key, tile.op, tile.stamp, loc);
+        self.note(Name::Tile(tile.key), Some(tile.op), tile.stamp, loc);
         Ok(())
     }
 
-    /// Records that `key`'s record written by `op` was appended at `loc`: its latest record,
-    /// written since the last save point, with `op` counted towards the head. While a cut is
-    /// open (see [`Cut`]), `stamp` places the record: the first record of `key` past the cut
-    /// leaves the cut its place before, and a record at or before the cut after one past it is
-    /// the cut's state, not the latest.
-    fn note(&mut self, key: TileKey, op: OpId, stamp: Stamp, loc: Loc) {
+    /// Records that `name`'s record, written by `op` (a tile record) or by no op (a bounds
+    /// record), was appended at `loc`: its latest record, written since the last save point, with
+    /// `op` counted towards the head. While a cut is open (see [`Cut`]), `stamp` places the
+    /// record: the first record of `name` past the cut leaves the cut its place before, and a
+    /// record at or before the cut after one past it is the cut's state, not the latest.
+    fn note(&mut self, name: Name, op: Option<OpId>, stamp: Stamp, loc: Loc) {
         if let Some(cut) = &mut self.cut {
             if stamp > cut.at {
                 let before = Prior {
-                    live: self.live.get(&key).copied(),
-                    pending: self.pending.get(&key).copied(),
+                    live: self.live.get(&name).copied(),
+                    pending: self.pending.get(&name).copied(),
                 };
-                cut.prior.entry(key).or_insert(before);
+                cut.prior.entry(name).or_insert(before);
             } else {
-                cut.head = cut.head.max(Some(op));
-                if let Some(prior) = cut.prior.get_mut(&key) {
+                cut.head = cut.head.max(op);
+                if let Some(prior) = cut.prior.get_mut(&name) {
                     *prior = Prior {
                         live: Some(loc),
                         pending: Some(loc),
@@ -938,9 +986,9 @@ impl ProjectFile {
                 }
             }
         }
-        self.live.insert(key, loc);
-        self.pending.insert(key, loc);
-        self.head = self.head.max(Some(op));
+        self.live.insert(name, loc);
+        self.pending.insert(name, loc);
+        self.head = self.head.max(op);
     }
 
     /// Opens a cut at the store's write `at`: the next [`ProjectFile::write_save_point`] names
@@ -959,7 +1007,13 @@ impl ProjectFile {
     pub(crate) fn is_past_cut(&self, key: &TileKey) -> bool {
         self.cut
             .as_ref()
-            .is_some_and(|cut| cut.prior.contains_key(key))
+            .is_some_and(|cut| cut.prior.contains_key(&Name::Tile(*key)))
+    }
+
+    /// The write the open cut is at, if one is open: a record appended with this stamp is part
+    /// of the cut's save point.
+    pub(crate) fn cut_at(&self) -> Option<Stamp> {
+        self.cut.as_ref().map(|cut| cut.at)
     }
 
     /// Frames `payload` and writes it at the end.
@@ -1008,7 +1062,7 @@ impl ProjectFile {
         key: &TileKey,
         check: impl FnOnce(&TileRecord<'_>) -> Result<(), StoreError>,
     ) -> Result<Option<TileBytes>, StoreError> {
-        let Some(&Loc { offset, len }) = self.live.get(key) else {
+        let Some(&Loc { offset, len }) = self.live.get(&Name::Tile(*key)) else {
             return Ok(None);
         };
         let raw = self.read_record(offset, len)?;
@@ -1082,7 +1136,7 @@ impl ProjectFile {
 
     /// Where `key`'s latest record is, if it has one.
     pub(crate) fn locate(&self, key: &TileKey) -> Option<Loc> {
-        self.live.get(key).copied()
+        self.live.get(&Name::Tile(*key)).copied()
     }
 
     /// Reads the displacement tile of `key` recorded at `loc` (which [`ProjectFile::locate`]
@@ -1132,9 +1186,11 @@ impl ProjectFile {
                 load_chain(&self.file, offset, len)?.ok_or(StoreError::Damaged { offset })?;
             (chain.live, chain.head)
         };
+        let (locations, bounds) = split_names(&locations);
         Ok(Some(BaseFile {
             reader: self.reader(),
             locations: Arc::new(locations),
+            bounds: Arc::new(bounds),
             meta: self.meta.clone(),
             save_point: SavePoint {
                 project: self.meta.project(),
@@ -1168,9 +1224,11 @@ impl ProjectFile {
         if chain.head != point.head {
             return Ok(None);
         }
+        let (locations, bounds) = split_names(&chain.live);
         Ok(Some(BaseFile {
             reader: self.reader(),
-            locations: Arc::new(chain.live),
+            locations: Arc::new(locations),
+            bounds: Arc::new(bounds),
             meta: self.meta.clone(),
             save_point: point,
             head: self.head,
@@ -1196,13 +1254,16 @@ impl ProjectFile {
         Ok(Some(raw))
     }
 
-    /// Appends a copy of every tile `base` holds, each record as it is (not decoded or
-    /// recompressed), checked first: the saved state of another project, carried into this
-    /// one.
+    /// Appends a copy of every tile and every bound `base` holds, each record as it is (not
+    /// decoded or recompressed), checked first: the saved state of another project, carried
+    /// into this one.
+    ///
+    /// A bounds record that doesn't read is written as unknown instead: a bound is derived
+    /// data, which loading the index computes again, and must never stop a save.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if a record of `base` fails its
+    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if a tile record of `base` fails its
     /// checksum or isn't a tile of its key; [`StoreError::Io`]; [`StoreError::Closed`] if
     /// `base`'s file has been dropped.
     pub(crate) fn copy_base(&mut self, base: &BaseFile) -> Result<(), StoreError> {
@@ -1213,7 +1274,103 @@ impl ProjectFile {
             }
             self.append_copy(key, &raw)?;
         }
+        for (key, &loc) in base.bounds.iter() {
+            match base.reader.read_record(loc) {
+                Ok(raw) if bounds_record(&raw, key).is_some() => {
+                    self.append_bounds_copy(key, &raw)?;
+                }
+                Ok(_) | Err(StoreError::Damaged { .. }) => {
+                    self.write_bounds(*key, None, Stamp::ZERO)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
+    }
+
+    /// Appends `key`'s bound, `None` if unknown: its latest bounds record, placed against an
+    /// open cut by `stamp`, the store's write whose state it describes (see [`Cut`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ReadOnly`], [`StoreError::Io`].
+    pub(crate) fn write_bounds(
+        &mut self,
+        key: TileKey,
+        bounds: Option<&TileBounds>,
+        stamp: Stamp,
+    ) -> Result<(), StoreError> {
+        if self.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly);
+        }
+        let loc = self.append(KIND_BOUNDS, &bounds_payload(&key, bounds))?;
+        self.note(Name::Bounds(key), None, stamp, loc);
+        Ok(())
+    }
+
+    /// Appends `raw`, a bounds record of `key` read from another file and checked there, as
+    /// `key`'s latest bounds record.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if `raw` isn't a whole bounds record
+    /// of `key` after all; [`StoreError::Io`].
+    pub(crate) fn append_bounds_copy(
+        &mut self,
+        key: &TileKey,
+        raw: &[u8],
+    ) -> Result<(), StoreError> {
+        if self.access == Access::ReadOnly {
+            return Err(StoreError::ReadOnly);
+        }
+        if bounds_record(raw, key).is_none() {
+            return Err(StoreError::Damaged { offset: self.end });
+        }
+        let loc = self.append_record(raw)?;
+        self.note(Name::Bounds(*key), None, Stamp::ZERO, loc);
+        Ok(())
+    }
+
+    /// `key`'s latest bounds record, framing included, if it has one that verifies and is a
+    /// bounds record of `key`; `None` if it has none, or one that doesn't read. For copying it
+    /// into another file.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`].
+    pub(crate) fn read_bounds_record(&self, key: &TileKey) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(&Loc { offset, len }) = self.live.get(&Name::Bounds(*key)) else {
+            return Ok(None);
+        };
+        match self.read_record(offset, len) {
+            Ok(raw) => Ok(bounds_record(&raw, key).is_some().then_some(raw)),
+            Err(StoreError::Damaged { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Where `key`'s latest bounds record is, if it has one.
+    pub(crate) fn locate_bounds(&self, key: &TileKey) -> Option<Loc> {
+        self.live.get(&Name::Bounds(*key)).copied()
+    }
+
+    /// Where each tile's latest bounds record is, in key order.
+    pub(crate) fn bounds_locations(&self) -> impl Iterator<Item = (&TileKey, Loc)> {
+        self.live
+            .iter()
+            .filter_map(|(name, &loc)| Some((name.bounds()?, loc)))
+    }
+
+    /// The bounds the records at `entries` hold (see [`read_bounds_at`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`].
+    pub(crate) fn read_bounds(
+        &self,
+        entries: &[(TileKey, Loc)],
+    ) -> Result<Vec<Option<TileBounds>>, StoreError> {
+        Ok(read_bounds_at(&self.file, entries)?)
     }
 
     /// Appends `raw`, a tile record of `key` read from another file and checked there, as
@@ -1231,7 +1388,7 @@ impl ProjectFile {
             .ok_or(StoreError::Damaged { offset: self.end })?
             .op;
         let loc = self.append_record(raw)?;
-        self.note(*key, op, Stamp::ZERO, loc);
+        self.note(Name::Tile(*key), Some(op), Stamp::ZERO, loc);
         Ok(())
     }
 
@@ -1246,9 +1403,9 @@ impl ProjectFile {
     /// Makes every write so far durable and records a save point. Returns its offset, for
     /// [`ProjectFile::open_at`].
     ///
-    /// The save point is an Index naming the live tiles: all of them the first time and every 16th
-    /// time, otherwise only those written since the last save. It names the latest state: an
-    /// open cut is dropped.
+    /// The save point is an Index naming the live tiles and bounds: all of them the first time and
+    /// every 16th time, otherwise only those written since the last save. It names the latest
+    /// state: an open cut is dropped.
     ///
     /// # Errors
     ///
@@ -1266,8 +1423,8 @@ impl ProjectFile {
         Ok(loc.offset)
     }
 
-    /// Appends a save point naming the tiles written so far, without syncing anything, and
-    /// returns its offset: [`ProjectFile::save`] for a caller that syncs on another thread
+    /// Appends a save point naming the tiles and bounds written so far, without syncing anything,
+    /// and returns its offset: [`ProjectFile::save`] for a caller that syncs on another thread
     /// (through a [`FileSyncer`]). If a cut is open, the save point names the state at the cut
     /// (see [`Cut`]) and closes it; the records past it wait for the next save point.
     ///
@@ -1342,9 +1499,9 @@ impl ProjectFile {
         }
     }
 
-    /// Whether tiles have been written since the last save point (or, before the first, at
-    /// all): what the next save point would name.
-    pub(crate) fn has_unsaved_tiles(&self) -> bool {
+    /// Whether records (tiles or bounds) have been written since the last save point (or,
+    /// before the first, at all): what the next save point would name.
+    pub(crate) fn has_unsaved_records(&self) -> bool {
         !self.pending.is_empty()
     }
 
@@ -1400,13 +1557,14 @@ impl ProjectFile {
 
     /// The live tiles, in key order.
     pub fn keys(&self) -> impl Iterator<Item = &TileKey> {
-        self.live.keys()
+        // Tiles order first: the walk stops at the first bounds record.
+        self.live.keys().map_while(Name::tile)
     }
 
     /// Whether `key` has a live tile.
     #[must_use]
     pub fn contains(&self, key: &TileKey) -> bool {
-        self.live.contains_key(key)
+        self.live.contains_key(&Name::Tile(*key))
     }
 
     /// The file's length in bytes (for a read-only file, as opened). A new file's length is
@@ -1471,7 +1629,11 @@ impl ProjectFile {
 
     /// The tiles written since the last save point, in key order: what the next one names.
     pub(crate) fn unsaved_keys(&self) -> Vec<TileKey> {
-        self.pending.keys().copied().collect()
+        self.pending
+            .keys()
+            .filter_map(Name::tile)
+            .copied()
+            .collect()
     }
 
     /// Payload bytes of the last Index.
@@ -1652,6 +1814,8 @@ pub(crate) struct BaseFile {
     /// Each saved tile's record as of the save point. Records are never moved while the file
     /// is open, so these stay valid as the owner appends.
     locations: Arc<BTreeMap<TileKey, Loc>>,
+    /// Each saved bound's record as of the save point.
+    bounds: Arc<BTreeMap<TileKey, Loc>>,
     /// The project file's meta: its project, its role and its mesh.
     meta: Meta,
     /// The save point: the project, the Index's offset and the head op it recorded.
@@ -1713,6 +1877,29 @@ impl BaseFile {
     /// The saved tiles, in key order.
     pub(crate) fn keys(&self) -> impl Iterator<Item = &TileKey> {
         self.locations.keys()
+    }
+
+    /// Where `key`'s saved bounds record is, if the save point has one.
+    pub(crate) fn locate_bounds(&self, key: &TileKey) -> Option<Loc> {
+        self.bounds.get(key).copied()
+    }
+
+    /// Where each saved bound's record is, in key order.
+    pub(crate) fn bounds_locations(&self) -> impl Iterator<Item = (&TileKey, Loc)> {
+        self.bounds.iter().map(|(key, &loc)| (key, loc))
+    }
+
+    /// The bounds the records at `entries` hold (see [`read_bounds_at`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Closed`] once the project file is dropped; [`StoreError::Io`].
+    pub(crate) fn read_bounds(
+        &self,
+        entries: &[(TileKey, Loc)],
+    ) -> Result<Vec<Option<TileBounds>>, StoreError> {
+        let file = self.reader.file.upgrade().ok_or(StoreError::Closed)?;
+        Ok(read_bounds_at(&file, entries)?)
     }
 }
 
@@ -1805,8 +1992,8 @@ fn decode_record_at(
     Ok(tile.op)
 }
 
-/// Writes a new project at `dst` holding `src`'s meta and mesh, its live tiles (raw records
-/// copied, not recompressed) and one full Index.
+/// Writes a new project at `dst` holding `src`'s meta and mesh, its live tiles and bounds (raw
+/// records copied, not recompressed) and one full Index.
 ///
 /// `src` is recovered as by [`ProjectFile::open`], but never modified: whatever follows its last
 /// save point is left in place (and not copied). It is held with a shared lock, so it can't be open
@@ -1858,20 +2045,33 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
     swapped
 }
 
-/// Writes `from`'s live tiles and one full Index to a new project at `dst`.
+/// Writes `from`'s live tiles and bounds and one full Index to a new project at `dst`.
+///
+/// A bounds record that doesn't read is written as unknown, as [`ProjectFile::copy_base`] does.
 ///
 /// # Errors
 ///
 /// As [`compact`].
 fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
     let mut to = ProjectFile::create_like(dst, from.meta.clone(), from)?;
-    for (key, &Loc { offset, len }) in &from.live {
-        let raw = from.read_record(offset, len)?;
-        if tile_record(&raw, key).is_none() {
-            return Err(StoreError::Damaged { offset });
+    for (name, &Loc { offset, len }) in &from.live {
+        match name {
+            Name::Tile(key) => {
+                let raw = from.read_record(offset, len)?;
+                if tile_record(&raw, key).is_none() {
+                    return Err(StoreError::Damaged { offset });
+                }
+                let loc = to.append_record(&raw)?;
+                to.live.insert(*name, loc);
+            }
+            Name::Bounds(key) => match from.read_bounds_record(key)? {
+                Some(raw) => {
+                    let loc = to.append_record(&raw)?;
+                    to.live.insert(*name, loc);
+                }
+                None => to.write_bounds(*key, None, Stamp::ZERO)?,
+            },
         }
-        let loc = to.append_record(&raw)?;
-        to.live.insert(*key, loc);
     }
     to.head = from.head;
     to.save()?;
@@ -1932,6 +2132,91 @@ fn check_displacement(key: &TileKey, side: u32) -> Result<(), StoreError> {
         Ok(())
     }
 }
+
+/// The bound in a raw record, if the record verifies and holds a bound of `key`.
+fn bounds_record(raw: &[u8], key: &TileKey) -> Option<Kept> {
+    match verify(raw) {
+        Some((KIND_BOUNDS, payload)) => parse_bounds_payload(payload),
+        _ => None,
+    }
+    .filter(|(at, _)| at == key)
+    .map(|(_, kept)| kept)
+}
+
+/// The bounds the records at `entries` hold: for each, the record's bounds, or `None` if they
+/// are unknown or the record doesn't verify as a bounds record of its key.
+///
+/// A bound is derived data: one that doesn't read counts as unknown, and is computed again by
+/// whoever wanted it, so damage here is not an error. The records are read in file order, nearby
+/// ones together, in windows of up to [`BOUNDS_WINDOW`] bytes: a project's bounds are written a
+/// save at a time, so a whole level's usually take a few large reads, not one per tile.
+///
+/// # Errors
+///
+/// The I/O error of a read, but for a read past the end, which only damage causes.
+fn read_bounds_at(file: &File, entries: &[(TileKey, Loc)]) -> io::Result<Vec<Option<TileBounds>>> {
+    let mut found = vec![None; entries.len()];
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_unstable_by_key(|&n| entries.get(n).map(|(_, loc)| loc.offset));
+    let mut rest = order.as_slice();
+    while let Some((&first, _)) = rest.split_first() {
+        let Some(&(_, start)) = entries.get(first) else {
+            break;
+        };
+        // The window: every record after the first that starts close enough and ends within it.
+        let mut end = start.offset.saturating_add(start.len);
+        let mut taken = 1;
+        for &n in rest.iter().skip(1) {
+            let Some(&(_, loc)) = entries.get(n) else {
+                break;
+            };
+            let until = loc.offset.saturating_add(loc.len);
+            if loc.offset > end.saturating_add(BOUNDS_GAP) || until - start.offset > BOUNDS_WINDOW {
+                break;
+            }
+            end = end.max(until);
+            taken += 1;
+        }
+        let (group, after) = rest.split_at(taken);
+        rest = after;
+        let window = match read_exact(file, start.offset, end - start.offset) {
+            Ok(window) => window,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // Some record runs past the end: read each on its own.
+                for &n in group {
+                    if let (Some(&(key, loc)), Some(slot)) = (entries.get(n), found.get_mut(n)) {
+                        *slot = match read_exact(file, loc.offset, loc.len) {
+                            Ok(raw) => bounds_record(&raw, &key).and_then(Kept::bounds),
+                            Err(short) if short.kind() == io::ErrorKind::UnexpectedEof => None,
+                            Err(failed) => return Err(failed),
+                        };
+                    }
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        for &n in group {
+            if let (Some(&(key, loc)), Some(slot)) = (entries.get(n), found.get_mut(n)) {
+                let raw = usize::try_from(loc.offset - start.offset)
+                    .ok()
+                    .zip(usize::try_from(loc.len).ok())
+                    .and_then(|(lo, len)| window.get(lo..lo.checked_add(len)?));
+                *slot = raw
+                    .and_then(|raw| bounds_record(raw, &key))
+                    .and_then(Kept::bounds);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The most bytes [`read_bounds_at`] reads at once.
+const BOUNDS_WINDOW: u64 = 4 << 20;
+
+/// The widest gap between two bounds records that [`read_bounds_at`] reads through rather than
+/// starting a new read.
+const BOUNDS_GAP: u64 = 64 << 10;
 
 /// The tile in a raw record, if the record verifies and holds a tile of `key`.
 fn tile_record<'a>(raw: &'a [u8], key: &TileKey) -> Option<TileRecord<'a>> {
@@ -2307,21 +2592,30 @@ fn parse_tile_payload(payload: &[u8]) -> Option<TileRecord<'_>> {
     })
 }
 
-/// An Index payload: `full: u8 | reserved [u8; 7] | parent: u64 | head: u64 | count: u32 |
-/// count × (key | offset: u64 | len: u32)`, entries in key order.
+/// An Index payload, naming tile records and then bounds records.
+///
+/// `full: u8 | reserved [u8; 7] | parent: u64 | head: u64 | count: u32 | count × (key | offset:
+/// u64 | len: u32)`, the tile entries in key order; then, if any bounds record is named,
+/// `bounds: u32 | bounds × (key | offset: u64 | len: u32)`, the bounds entries in key order. An
+/// Index naming no bounds ends after its tile entries, as one written before bounds were kept
+/// does.
 ///
 /// # Errors
 ///
-/// [`StoreError::TooLarge`] if there are more than `u32::MAX` entries or a record is longer than
-/// `u32::MAX` bytes.
+/// [`StoreError::TooLarge`] if either section has more than `u32::MAX` entries or a record is
+/// longer than `u32::MAX` bytes.
 fn index_payload(
     coverage: Coverage,
     parent: Option<u64>,
     head: Option<OpId>,
-    entries: &BTreeMap<TileKey, Loc>,
+    entries: &BTreeMap<Name, Loc>,
 ) -> Result<Vec<u8>, StoreError> {
-    let count = u32::try_from(entries.len()).or(Err(StoreError::TooLarge))?;
-    let mut out = Vec::with_capacity(28 + entries.len() * ENTRY_LEN);
+    let tiles = entries
+        .keys()
+        .take_while(|name| name.tile().is_some())
+        .count();
+    let bounds = entries.len() - tiles;
+    let mut out = Vec::with_capacity(32 + entries.len() * ENTRY_LEN);
     out.push(match coverage {
         Coverage::Full => 1,
         Coverage::Delta => 0,
@@ -2329,8 +2623,13 @@ fn index_payload(
     out.extend_from_slice(&[0; 7]);
     out.extend_from_slice(&parent.unwrap_or(NONE).to_le_bytes());
     out.extend_from_slice(&head.map_or(NONE, OpId::to_bits).to_le_bytes());
-    out.extend_from_slice(&count.to_le_bytes());
-    for (key, loc) in entries {
+    let count = |n: usize| u32::try_from(n).or(Err(StoreError::TooLarge));
+    out.extend_from_slice(&count(tiles)?.to_le_bytes());
+    for (n, (name, loc)) in entries.iter().enumerate() {
+        if n == tiles {
+            out.extend_from_slice(&count(bounds)?.to_le_bytes());
+        }
+        let (Name::Tile(key) | Name::Bounds(key)) = name;
         put_key(&mut out, key);
         out.extend_from_slice(&loc.offset.to_le_bytes());
         let len = u32::try_from(loc.len).or(Err(StoreError::TooLarge))?;
@@ -2339,7 +2638,30 @@ fn index_payload(
     Ok(out)
 }
 
-/// Parses [`index_payload`]'s output; `None` on any shortfall, an invalid key or trailing bytes.
+/// Parses `count` Index entries of `r`, each named by `name` of its key.
+fn parse_entries(
+    r: &mut Reader<'_>,
+    count: usize,
+    name: fn(TileKey) -> Name,
+) -> Option<Vec<(Name, Option<Loc>)>> {
+    (0..count)
+        .map(|_| {
+            let key = r.key()?;
+            let offset = r.u64()?;
+            let len = r.u32()?;
+            Some((
+                name(key),
+                (len != 0).then_some(Loc {
+                    offset,
+                    len: len.into(),
+                }),
+            ))
+        })
+        .collect()
+}
+
+/// Parses [`index_payload`]'s output; `None` on any shortfall, an invalid key, a bounds section
+/// that is empty or doesn't fill the rest exactly, or a section's keys out of order.
 fn parse_index_payload(payload: &[u8]) -> Option<Index> {
     let mut r = Reader::new(payload);
     let coverage = match r.u8()? {
@@ -2353,25 +2675,21 @@ fn parse_index_payload(payload: &[u8]) -> Option<Index> {
         NONE => None,
         bits => Some(OpId::from_bits(bits)?),
     };
-    let count = usize::try_from(r.u32()?).ok()?;
-    if r.rest().len() != count.checked_mul(ENTRY_LEN)? {
-        return None;
+    let tiles = usize::try_from(r.u32()?).ok()?;
+    let mut entries = parse_entries(&mut r, tiles, Name::Tile)?;
+    if !r.rest().is_empty() {
+        let bounds = usize::try_from(r.u32()?).ok()?;
+        if bounds == 0 || r.rest().len() != bounds.checked_mul(ENTRY_LEN)? {
+            return None;
+        }
+        entries.extend(parse_entries(&mut r, bounds, Name::Bounds)?);
     }
-    let entries = (0..count)
-        .map(|_| {
-            let key = r.key()?;
-            let offset = r.u64()?;
-            let len = r.u32()?;
-            Some((
-                key,
-                (len != 0).then_some(Loc {
-                    offset,
-                    len: len.into(),
-                }),
-            ))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(Index {
+    // In order, so loading a chain applies each name's entries in the order they were made.
+    let ordered = entries.windows(2).all(|pair| match pair {
+        [(a, _), (b, _)] => a < b,
+        _ => true,
+    });
+    ordered.then_some(Index {
         coverage,
         parent,
         head,
@@ -2540,17 +2858,58 @@ mod tests {
     /// Every live tile: its op and content.
     type State = BTreeMap<TileKey, (OpId, CorrectionTile)>;
 
-    /// Writes a project with saves, overwrites and trailing unsaved tiles; returns the states
-    /// an open can find.
+    /// Every live bound, as bits (`None` if unknown).
+    type Bounded = BTreeMap<TileKey, Option<[u32; TileBounds::BITS]>>;
+
+    /// Bounds made from `seed`: a box around it and, for odd seeds, the cone of everything.
+    fn bound(seed: f32) -> TileBounds {
+        let at = Vec3::new(seed, -seed, 2.0 * seed);
+        let cone = if seed.to_bits() % 2 == 1 {
+            crate::index::NormalCone::EVERYTHING
+        } else {
+            crate::index::NormalCone::from_normals(&[Vec3::new(0.0, 0.0, 1.0)])
+        };
+        TileBounds {
+            aabb: crate::index::Aabb::new(at, at + Vec3::new(1.0, 1.0, 1.0)).unwrap(),
+            cone,
+        }
+    }
+
+    /// The live bounds of `f`, every record read and checked.
+    fn bounds_of(f: &ProjectFile) -> Bounded {
+        let entries: Vec<(TileKey, Loc)> =
+            f.bounds_locations().map(|(key, loc)| (*key, loc)).collect();
+        let read = f.read_bounds(&entries).unwrap();
+        entries
+            .iter()
+            .zip(read)
+            .map(|((key, _), bounds)| (*key, bounds.map(TileBounds::to_bits)))
+            .collect()
+    }
+
+    /// Writes a project with saves, overwrites and trailing unsaved tiles and bounds; returns
+    /// the states an open can find.
     ///
     /// Recorded at creation and after every save point: the file length and the saved live
-    /// state (key → (op, tile)).
-    fn scripted(path: &Path) -> Vec<(u64, State)> {
+    /// state (key → (op, tile)), and the saved bounds, known and unknown, each written before or
+    /// after the tiles of its round.
+    fn scripted(path: &Path) -> Vec<(u64, State, Bounded)> {
         let mut f = ProjectFile::create(path, meta(), mesh()).unwrap();
-        let mut state = BTreeMap::new();
-        let mut log = vec![(f.len(), state.clone())];
+        let (mut state, mut bounds) = (BTreeMap::new(), BTreeMap::new());
+        let mut log = vec![(f.len(), state.clone(), bounds.clone())];
         let mut seq = 0;
         for round in 0..6u16 {
+            let write_bounds = |file: &mut ProjectFile, saved: &mut Bounded| {
+                for k in 0..3u32 {
+                    let at = key(k + u32::from(round % 3), 0);
+                    let b = (k != u32::from(round) % 3).then(|| bound(f32::from(round + 1)));
+                    file.write_bounds(at, b.as_ref(), Stamp::ZERO).unwrap();
+                    saved.insert(at, b.map(TileBounds::to_bits));
+                }
+            };
+            if round % 2 == 0 {
+                write_bounds(&mut f, &mut bounds);
+            }
             for k in 0..5u32 {
                 seq += 1;
                 let t = tile(f32::from(round) + 0.1 * f32::from(u16::try_from(k).unwrap()));
@@ -2558,9 +2917,12 @@ mod tests {
                 f.write_displacement(at, op(seq), &t).unwrap();
                 state.insert(at, (op(seq), t));
             }
+            if round % 2 == 1 {
+                write_bounds(&mut f, &mut bounds);
+            }
             if round < 5 {
                 f.save().unwrap(); // the last round stays unsaved
-                log.push((f.len(), state.clone()));
+                log.push((f.len(), state.clone(), bounds.clone()));
             }
         }
         log
@@ -2578,7 +2940,9 @@ mod tests {
         let full = dir.path("full.bcrf");
         let log = scripted(&full);
         let bytes = std::fs::read(&full).unwrap();
-        let mut cuts: Vec<u64> = log.iter().map(|(len, _)| *len).collect();
+        let mut cuts: Vec<u64> = log.iter().map(|(len, _, _)| *len).collect();
+        // Every record boundary too: a crash between any two records.
+        cuts.extend(ProjectFile::record_ends(&full));
         let mut x = 0x9E37_79B9_u64;
         let start = ProjectFile::fixture_start();
         for _ in 0..60 {
@@ -2586,7 +2950,8 @@ mod tests {
             cuts.push(start + x % (bytes.len() as u64 - start));
         }
         for cut in cuts {
-            let (good_len, want) = log.iter().rev().find(|(len, _)| *len <= cut).unwrap();
+            let (good_len, want, want_bounds) =
+                log.iter().rev().find(|(len, _, _)| *len <= cut).unwrap();
             let kept = &bytes[..usize::try_from(cut).unwrap()];
             // A crash can also leave the file at its full length with the unwritten blocks zeroed.
             let zero_filled = [kept, &vec![0; bytes.len() - kept.len()]].concat();
@@ -2595,6 +2960,7 @@ mod tests {
                 std::fs::write(&path, &contents).unwrap();
                 let mut f = ProjectFile::open(&path).unwrap();
                 assert_eq!(&state_of(&f), want, "{variant} at {cut}");
+                assert_eq!(&bounds_of(&f), want_bounds, "{variant} at {cut}: bounds");
                 // The torn tail is gone and the file is writable again.
                 assert_eq!(
                     std::fs::metadata(&path).unwrap().len(),
@@ -2612,6 +2978,11 @@ mod tests {
                     state_of(&reopened),
                     want,
                     "written after the {variant} at {cut}"
+                );
+                assert_eq!(
+                    &bounds_of(&reopened),
+                    want_bounds,
+                    "bounds after the {variant} at {cut}"
                 );
             }
         }
@@ -2665,10 +3036,13 @@ mod tests {
         let path = dir.path("p.bcrf");
         let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
         f.write_displacement(key(1, 0), op(1), &tile(1.0)).unwrap();
+        f.write_bounds(key(1, 0), Some(&bound(1.0)), Stamp::ZERO)
+            .unwrap();
         f.save().unwrap();
         f.append_raw(9, b"from a newer version").unwrap();
         f.write_displacement(key(2, 0), op(2), &tile(2.0)).unwrap();
         f.append_raw(200, &[0; 64]).unwrap();
+        f.write_bounds(key(2, 0), None, Stamp::ZERO).unwrap();
         f.write_displacement(key(3, 0), op(3), &tile(3.0)).unwrap();
         f.save().unwrap();
         let len = f.len();
@@ -2679,7 +3053,59 @@ mod tests {
             3,
             "all three tiles, unknown records skipped"
         );
+        assert_eq!(
+            bounds_of(&opened),
+            BTreeMap::from([(key(1, 0), Some(bound(1.0).to_bits())), (key(2, 0), None)]),
+            "and both bounds"
+        );
         assert_eq!(opened.len(), len, "nothing cut off");
+    }
+
+    #[test]
+    fn an_index_names_its_bounds_strictly() {
+        let at = |offset| Loc { offset, len: 40 };
+        let entries = BTreeMap::from([
+            (Name::Tile(key(1, 0)), at(100)),
+            (Name::Tile(key(2, 0)), at(140)),
+            (Name::Bounds(key(1, 0)), at(180)),
+        ]);
+        let good = index_payload(Coverage::Full, None, None, &entries).unwrap();
+        let parsed = parse_index_payload(&good).unwrap();
+        assert_eq!(
+            parsed.entries,
+            entries
+                .iter()
+                .map(|(name, loc)| (*name, Some(*loc)))
+                .collect::<Vec<_>>(),
+            "both sections round trip"
+        );
+        let tiles_only: BTreeMap<Name, Loc> = entries
+            .iter()
+            .filter(|(name, _)| name.tile().is_some())
+            .map(|(name, loc)| (*name, *loc))
+            .collect();
+        let old = index_payload(Coverage::Full, None, None, &tiles_only).unwrap();
+        assert_eq!(
+            old.len(),
+            good.len() - 4 - ENTRY_LEN,
+            "no bounds, no section: the layout of an Index before bounds were kept"
+        );
+        assert!(parse_index_payload(&old).is_some(), "which still parses");
+        let empty_section = [old.as_slice(), &0_u32.to_le_bytes()].concat();
+        assert!(
+            parse_index_payload(&empty_section).is_none(),
+            "an empty bounds section"
+        );
+        assert!(
+            parse_index_payload(&good[..good.len() - 1]).is_none(),
+            "a short section"
+        );
+        // The two tile entries swapped: out of order.
+        let mut swapped = good;
+        let first = 28;
+        let (a, b) = swapped[first..first + 2 * ENTRY_LEN].split_at_mut(ENTRY_LEN);
+        a.swap_with_slice(b);
+        assert!(parse_index_payload(&swapped).is_none(), "keys out of order");
     }
 
     /// A project with three saves of five tiles each, and its bytes.
@@ -3060,7 +3486,7 @@ mod tests {
             "the reader rejects it"
         );
         assert!(slot.view().is_err(), "and leaves no tile");
-        f.live.insert(k, loc);
+        f.live.insert(Name::Tile(k), loc);
         assert!(
             matches!(
                 f.read_displacement(&k),

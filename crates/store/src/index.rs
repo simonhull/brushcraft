@@ -6,6 +6,11 @@
 //! edits move tiles. It is small (under 100 bytes a tile, see [`Bvh`]) and always resident; the
 //! tiles themselves are evaluated through the [`TileStore`] only when a query needs them.
 //!
+//! The store keeps every tile's bounds in its files, written with the tiles they describe (see
+//! [`crate::bounds`]): [`SpatialIndex::build`], [`SpatialIndex::refit`] and
+//! [`SpatialIndex::update`] record what they compute, and [`SpatialIndex::load`] builds the
+//! index from what is stored, evaluating only the tiles whose bounds aren't known.
+//!
 //! Two queries:
 //!
 //! - [`SpatialIndex::query_sphere`]: the tiles a brush's sphere touches, from the bounds alone;
@@ -15,7 +20,7 @@
 
 mod bvh;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use bvh::{Aabb, Bvh, Hit, MAX_TILES, Ray, SphereQuery};
 use geom::{BaseMesh, Level, MAX_LEVEL, TILE_QUADS, TileKey, Vec3};
@@ -79,6 +84,9 @@ impl NormalCone {
     /// How far below the least `cos` of the normals the bound is set, so rounding in the dot
     /// products never leaves one of them just outside the cone.
     const SLACK: f32 = 1e-5;
+    /// How far from 1 a stored axis's squared length may be: a normalised vector's is within a
+    /// few units in the last place, and anything further isn't an axis this code made.
+    const UNIT_SLACK: f32 = 1e-4;
 
     /// A cone holding every one of `normals`: its axis is their normalised mean, its half-angle
     /// that of the normal furthest from it.
@@ -121,6 +129,18 @@ impl NormalCone {
         self.cos_half_angle
     }
 
+    /// The cone with `axis` and `cos_half_angle` as a stored bound holds them, bit for bit;
+    /// `None` unless both are finite, the cosine is in `[-1, 1]` and the axis is a unit vector
+    /// (to within [`NormalCone::UNIT_SLACK`], as normalising leaves it).
+    pub(crate) fn from_parts(axis: Vec3, cos_half_angle: f32) -> Option<Self> {
+        let unit = (axis.dot(axis) - 1.0).abs() <= Self::UNIT_SLACK;
+        let valid = axis.is_finite() && unit && (-1.0..=1.0).contains(&cos_half_angle);
+        valid.then_some(Self {
+            axis,
+            cos_half_angle,
+        })
+    }
+
     /// Whether the direction of `n` lies in the cone. A zero or non-finite `n` has no
     /// direction, and lies in no cone.
     #[must_use]
@@ -140,6 +160,47 @@ pub struct TileBounds {
 }
 
 impl TileBounds {
+    /// How many `u32` [`TileBounds::to_bits`] gives.
+    pub(crate) const BITS: usize = 10;
+
+    /// The bounds as bits, in the order the project file stores them: the box's low corner and
+    /// high corner, the cone's axis (each `x`, `y`, `z`), then the cone's cosine.
+    pub(crate) fn to_bits(self) -> [u32; Self::BITS] {
+        let [min, max, axis] =
+            [self.aabb.min(), self.aabb.max(), self.cone.axis].map(Vec3::to_bits);
+        let cos = self.cone.cos_half_angle.to_bits();
+        let mut bits = [0; Self::BITS];
+        let all = min.into_iter().chain(max).chain(axis).chain([cos]);
+        for (slot, value) in bits.iter_mut().zip(all) {
+            *slot = value;
+        }
+        bits
+    }
+
+    /// The bounds [`TileBounds::to_bits`] gave these bits, bit for bit; `None` unless they make
+    /// a valid box ([`Aabb::new`]) and cone ([`NormalCone::from_parts`]).
+    pub(crate) fn from_bits(bits: [u32; Self::BITS]) -> Option<Self> {
+        let [
+            min_x,
+            min_y,
+            min_z,
+            max_x,
+            max_y,
+            max_z,
+            axis_x,
+            axis_y,
+            axis_z,
+            cos,
+        ] = bits.map(f32::from_bits);
+        Some(Self {
+            aabb: Aabb::new(
+                Vec3::new(min_x, min_y, min_z),
+                Vec3::new(max_x, max_y, max_z),
+            )?,
+            cone: NormalCone::from_parts(Vec3::new(axis_x, axis_y, axis_z), cos)?,
+        })
+    }
+
     /// The bounds of a tile with these evaluated `positions` and `normals`; `None` if no
     /// position is finite.
     #[must_use]
@@ -153,6 +214,16 @@ impl TileBounds {
 
 /// A tile's cached positions and normals, which its bounds are computed from.
 type Cached<'a> = (&'a [Vec3], &'a [Vec3]);
+
+/// What [`SpatialIndex::load`] found stored, and what it had to evaluate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LoadStats {
+    /// Tiles whose bounds were read from the store.
+    pub stored: usize,
+    /// Tiles evaluated because their bounds weren't stored, or a write since made them
+    /// unknown.
+    pub evaluated: usize,
+}
 
 /// The spatial index over every tile of one level (see the module notes).
 #[derive(Debug, Clone)]
@@ -173,10 +244,14 @@ impl SpatialIndex {
     /// from the store's cache; each parent tile is built once while its children are
     /// evaluated.
     ///
+    /// Every bound is recorded in the store, to be written with the next flush or save: a
+    /// project whose files hold them opens with [`SpatialIndex::load`] instead, which is what
+    /// to call for one that may.
+    ///
     /// # Errors
     ///
     /// [`IndexError::Cache`] if a tile can't be evaluated (level 0 isn't tiled, for one);
-    /// [`IndexError::NoBounds`] if a tile has no finite position.
+    /// [`IndexError::NoBounds`] if a tile has no finite position. Nothing is recorded then.
     pub fn build(
         store: &mut TileStore,
         level: Level,
@@ -192,10 +267,70 @@ impl SpatialIndex {
                 progress(tiles.len(), total);
             }
         }
+        store.record_bounds(&tiles)?;
         Ok(Self {
             level,
             bvh: Bvh::build(tiles)?,
         })
+    }
+
+    /// The index over every tile of `level`, from the bounds the store keeps in its files with
+    /// the tiles: the same index, bit for bit, as [`SpatialIndex::build`] makes of
+    /// the store's current state, without evaluating a tile whose bounds are stored. A tile
+    /// whose bounds aren't (a project saved before they were kept, an index never built, a
+    /// write that made them unknown) is evaluated as `build` does, and its bounds recorded.
+    /// `progress(done, total)` is called as tiles are read or evaluated.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Cache`] if the stored bounds can't be read or a tile can't be evaluated;
+    /// [`IndexError::NoBounds`] as for `build`.
+    pub fn load(
+        store: &mut TileStore,
+        level: Level,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<(Self, LoadStats), IndexError> {
+        let keys: Vec<TileKey> = tiles_of(store.mesh(), level).collect();
+        let total = keys.len();
+        let mut found = store.stored_bounds(&keys)?;
+        let missing: Vec<TileKey> = keys
+            .iter()
+            .zip(&found)
+            .filter(|(_, bounds)| bounds.is_none())
+            .map(|(key, _)| *key)
+            .collect();
+        let stats = LoadStats {
+            stored: total - missing.len(),
+            evaluated: missing.len(),
+        };
+        progress(stats.stored, total);
+        let mut computed = Vec::with_capacity(missing.len());
+        for batch in missing.chunks(BUILD_BATCH) {
+            store.evaluate_many(batch, Evaluation::Normals)?;
+            computed.extend(Self::bounds_of_all(store, batch)?);
+            progress(stats.stored + computed.len(), total);
+        }
+        store.record_bounds(&computed)?;
+        let mut computed = computed.into_iter();
+        for slot in found.iter_mut().filter(|bounds| bounds.is_none()) {
+            *slot = computed.next().map(|(_, bounds)| bounds);
+        }
+        let tiles = keys
+            .into_iter()
+            .zip(found)
+            .map(|(key, bounds)| {
+                bounds
+                    .map(|bounds| (key, bounds))
+                    .ok_or(IndexError::NoBounds(key))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            Self {
+                level,
+                bvh: Bvh::build(tiles)?,
+            },
+            stats,
+        ))
     }
 
     /// `key`'s bounds as the store evaluates it now.
@@ -224,7 +359,8 @@ impl SpatialIndex {
         self.refit(store, keys)
     }
 
-    /// Refits the tree to the bounds of the tiles `keys` as the store evaluates them now.
+    /// Refits the tree to the bounds of the tiles `keys` as the store evaluates them now, and
+    /// records them in the store, to be written with the next flush or save.
     ///
     /// For a caller that has made them current itself, with [`TileStore::evaluate_many`]: their
     /// positions and normals are then read from the store's cache. A tile that isn't current is
@@ -238,7 +374,8 @@ impl SpatialIndex {
     pub fn refit(&mut self, store: &mut TileStore, keys: &[TileKey]) -> Result<(), IndexError> {
         self.check_known(keys)?;
         let changed = Self::bounds_of_all(store, keys)?;
-        self.bvh.refit(&changed)
+        self.bvh.refit(&changed)?;
+        Ok(store.record_bounds(&changed)?)
     }
 
     /// The bounds of each of `keys`, in order, as [`SpatialIndex::bounds_of`] gives them.

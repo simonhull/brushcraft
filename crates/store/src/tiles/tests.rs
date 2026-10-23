@@ -63,14 +63,31 @@ impl Rng {
 /// One `set_correction` call.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Edit {
+    /// The face.
     face: FaceId,
-    level: Level,
+    /// The level.
+    pub(crate) level: Level,
+    /// The vertex column on the face's grid.
     i: u32,
+    /// The vertex row on the face's grid.
     j: u32,
+    /// The correction.
     c: Vec3,
 }
 
-fn level(n: u8) -> Level {
+impl Edit {
+    /// The tiles the edit writes: every one holding a copy of its vertex.
+    pub(crate) fn keys(&self, mesh: &BaseMesh) -> Vec<TileKey> {
+        mesh.topology()
+            .copies(self.face, self.level, self.i, self.j)
+            .iter()
+            .map(|copy| copy.key(self.level))
+            .collect()
+    }
+}
+
+/// Level `n`, which the tests know is valid.
+pub(crate) fn level(n: u8) -> Level {
     Level::new(n).unwrap()
 }
 

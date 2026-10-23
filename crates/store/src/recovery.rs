@@ -9,16 +9,20 @@
 //!
 //! 1. **Snapshot** (owner): [`TileStore::snapshot_dirty`] copies every correction slot edited since
 //!    the writer's last flush and not yet in the working file, a 26.9 KB copy each, and the batch
-//!    goes to the writer thread. This is all a stroke end costs the drawing thread.
+//!    goes to the writer thread. At the same moment [`TileStore::flush_bounds`] appends the spatial
+//!    index's bounds changed since the last flush (a small record each), so the save point names
+//!    the bounds of the state the snapshot copies (see [`crate::bounds`]). This is all a stroke end
+//!    costs the drawing thread.
 //! 2. **Encoding** (writer): each copy is encoded, compressed and framed as a tile record, and the
-//!    records come back.
+//!    records come back. A copy that doesn't encode is left out, and the bounds its edit could have
+//!    changed are appended as unknown, at the cut.
 //! 3. **Syncing tiles**: the owner appends the records to the working file
 //!    ([`TileStore::append_streamed`], page-cache writes), then asks the writer to `fdatasync` the
 //!    file. Appending a record clears its slot's dirty flag only if the slot is unchanged since the
 //!    snapshot; a slot edited meanwhile stays dirty, and the next flush takes it.
 //! 4. **Syncing the save point**: once that sync has completed, the owner appends a save point
-//!    naming every tile in the file, and asks for a second sync. When it completes, the save point
-//!    is durable: a crash from then on loses nothing up to the snapshot.
+//!    naming every tile (and bound) in the file, and asks for a second sync. When it completes, the
+//!    save point is durable: a crash from then on loses nothing up to the snapshot.
 //!
 //! The owner advances the phases in [`RecoveryWriter::poll`], which the app calls from its frame
 //! loop (and every trigger calls first); it never blocks there.
@@ -421,7 +425,7 @@ impl RecoveryWriter {
     /// tiles in it since its last save point (written back to make room), or a failed flush to
     /// confirm.
     fn has_work(&self, store: &TileStore) -> bool {
-        self.unconfirmed || store.has_unflushed(self.consumer) || store.has_unsaved_tiles()
+        self.unconfirmed || store.has_unflushed(self.consumer) || store.has_unsaved_records()
     }
 
     /// A trigger at `now`: starts a flush, or queues one if a flush is in flight (keeping the
@@ -455,14 +459,22 @@ impl RecoveryWriter {
         let owed = std::mem::take(&mut self.unconfirmed);
         store.open_cut();
         self.generation = store.generation();
-        let started = match store.snapshot_dirty(self.consumer, &mut self.skipped) {
+        let before = self.skipped.len();
+        let snapshot = store
+            .snapshot_dirty(self.consumer, &mut self.skipped)
+            .and_then(|snapshots| {
+                // The bounds of the snapshot's state, at the same cut.
+                store.flush_bounds(self.skipped.get(before..).unwrap_or_default())?;
+                Ok(snapshots)
+            });
+        let started = match snapshot {
             Ok(snapshots) if !snapshots.is_empty() => {
                 #[cfg(test)]
                 self.hooks.sent(&snapshots);
                 self.send(Request::Encode(snapshots))
                     .map(|()| self.phase = Phase::Encoding)
             }
-            Ok(_) if owed || store.has_unsaved_tiles() => self.request_tile_sync(store),
+            Ok(_) if owed || store.has_unsaved_records() => self.request_tile_sync(store),
             // Nothing to flush: the interval keeps running from the last real flush.
             Ok(_) => return Ok(()),
             Err(e) => Err(e.into()),
@@ -510,10 +522,11 @@ impl RecoveryWriter {
         }
         match (self.phase, reply) {
             (Phase::Encoding, Reply::Encoded(tiles, broken)) => {
-                for key in broken {
-                    store.drop_from_stream(self.consumer, &key);
-                    self.skipped.push(key);
+                for key in &broken {
+                    store.drop_from_stream(self.consumer, key);
+                    self.skipped.push(*key);
                 }
+                store.forget_bounds_at_cut(&broken)?;
                 store.append_streamed(self.consumer, &tiles)?;
                 self.request_tile_sync(store)
             }

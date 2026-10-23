@@ -11,7 +11,7 @@
 //! moves, and exactly, as the high-water mark (`VmHWM`) reset just before the walk and read
 //! just after it, which no spike between two samples escapes.
 //!
-//! The baseline is the process with the project open and its spatial index built, the store
+//! The baseline is the process with the project open and its spatial index loaded, the store
 //! then emptied (`evict_all` + `shrink_to(0)`): everything but tiles. After the walk the store
 //! is emptied again, and the spec's target is RSS back within baseline + 64 MB.
 
@@ -54,7 +54,7 @@ fn mib_over(bytes: u64, base: u64) -> f64 {
 ///
 /// # Errors
 ///
-/// If the project can't be opened, the index built, a view pinned or a step run, the resident
+/// If the project can't be opened, the index loaded, a view pinned or a step run, the resident
 /// memory read, or writing the report fails.
 pub(crate) fn run<J: Write, H: Write>(
     options: &Options,
@@ -64,7 +64,7 @@ pub(crate) fn run<J: Write, H: Write>(
     let level = session::level(options)?;
     let before_open = Rss::read()?;
     let mut project = session::open(options, paths)?;
-    let mut index = session::build_index(&mut project, level, "budget", out)?;
+    let mut index = session::load_index(&mut project, level, "budget", out)?;
     empty(project.store())?;
     std::thread::sleep(SETTLE);
     let baseline = Rss::read()?;

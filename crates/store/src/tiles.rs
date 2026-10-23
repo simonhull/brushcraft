@@ -15,6 +15,10 @@
 //! is saved, [`TileStore::rebase`] swaps in the new save point as the base and a fresh working
 //! file, keeping every resident tile.
 //!
+//! The spatial index's bounds layer the same way, with the bounds changed since the last save on
+//! top, in memory: the store keeps them consistent with the tiles across edits, flushes, saves and
+//! rebases (see [`crate::bounds`]).
+//!
 //! # Evaluation
 //!
 //! A tile is evaluated coarse to fine, never recursively. The store lists the tile's dependency
@@ -116,9 +120,11 @@ use rayon::iter::{
 use rayon::slice::{ParallelSlice, ParallelSliceMut};
 use thiserror::Error;
 
+use crate::bounds::Book;
 use crate::deps::DepGraph;
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
+use crate::index::TileBounds;
 use crate::meta::{Meta, Role, SavePoint};
 use crate::op::{OpId, RESERVED_SITE};
 use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotData, SlotId};
@@ -744,6 +750,10 @@ pub struct TileStore {
     /// Counts the working files the store has had: a rebase moves it on, so a recovery flush
     /// started before can tell it would finish in the wrong file.
     generation: u64,
+    /// The spatial index's bounds the store keeps in its files: which changed since the last
+    /// save, which the working file lacks, and which writes may have made stale (see
+    /// [`crate::bounds`]).
+    bounds: Book,
     /// The change feed: every key an edit changed, with its op.
     feed: ChangeFeed,
     /// Save's place in the feed.
@@ -1099,6 +1109,9 @@ pub(crate) struct Saved {
     /// The tiles edited since the last rebase whose latest edit couldn't be read (see
     /// [`TileStore::save_into`]): the save point holds their last saved state.
     lost: BTreeSet<TileKey>,
+    /// The bounds changes the store had counted when the save was made: a rebase refuses it
+    /// after a later one, which the save point doesn't hold.
+    bounds: u64,
 }
 
 impl Saved {
@@ -1125,6 +1138,44 @@ pub(crate) struct Filled {
     cleaned: Vec<(TileKey, SlotId<CorrectionSlot>)>,
     /// The store's latest write when it was filled: a roll-over refuses it after a later one.
     stamp: Stamp,
+    /// The bounds changes the store had counted when it was filled: a roll-over refuses it
+    /// after a later one, which the new file doesn't hold.
+    bounds: u64,
+}
+
+/// The bounds book of a store over `working` and `base`.
+///
+/// It tracks every level either file holds bounds of and, for a recovery file, holds its bounds
+/// as changed since the last save (no save has copied them into the project file yet). A bound of
+/// the recovery file that doesn't read counts as unknown.
+///
+/// # Errors
+///
+/// [`CacheError::Store`] if reading the recovery file's bounds fails.
+fn book_of(working: &ProjectFile, base: Option<&BaseFile>) -> Result<Book, CacheError> {
+    let mut levels: BTreeSet<Level> = working
+        .bounds_locations()
+        .map(|(key, _)| key.level())
+        .collect();
+    if let Some(base) = base {
+        levels.extend(base.bounds_locations().map(|(key, _)| key.level()));
+    }
+    let changed = match working.meta().role() {
+        Role::Recovery { .. } => {
+            let entries: Vec<(TileKey, Loc)> = working
+                .bounds_locations()
+                .map(|(key, loc)| (*key, loc))
+                .collect();
+            let read = working.read_bounds(&entries)?;
+            entries
+                .iter()
+                .zip(read)
+                .map(|((key, _), bounds)| (*key, bounds))
+                .collect()
+        }
+        Role::Project => BTreeMap::new(),
+    };
+    Ok(Book::new(levels, changed))
 }
 
 /// `project` as of the save point a save has just written to it.
@@ -1248,6 +1299,7 @@ impl TileStore {
             Role::Recovery { .. } => working.keys().copied().collect(),
             Role::Project => BTreeSet::new(),
         };
+        let bounds = book_of(&working, base.as_ref())?;
         let workers = rayon::ThreadPoolBuilder::new()
             .num_threads(config.worker_threads())
             .thread_name(|n| format!("tile-eval-{n}"))
@@ -1271,6 +1323,7 @@ impl TileStore {
             last_write: Stamp::ZERO,
             known_ops: HashMap::new(),
             generation: 0,
+            bounds,
             feed,
             save_consumer,
             streams: HashMap::new(),
@@ -1291,8 +1344,11 @@ impl TileStore {
     }
 
     /// Copies every tile edited since the last rebase (or since the store opened) into
-    /// `project`, saves it, and returns the proof a rebase needs: the new save point as a base,
-    /// and the store's latest write.
+    /// `project`, with every bound changed since, saves it, and returns the proof a rebase needs:
+    /// the new save point as a base, and the store's latest write and bounds change.
+    ///
+    /// The bounds written describe the state the save point names: a tile whose latest edit is
+    /// lost (below) has every bound its edit could change written as unknown.
     ///
     /// Each tile is copied from where its latest edit is: a dirty slot is encoded and written
     /// with the op of its latest write, else the working file's record is copied as it is,
@@ -1382,12 +1438,21 @@ impl TileStore {
         {
             return Err(Invariant::NotInSave(*missing).into());
         }
+        // The bounds of the state the save point names: the lost tiles' edits aren't in it.
+        self.bounds.settle(&self.mesh)?;
+        self.bounds.forget(&self.mesh, lost.iter().copied())?;
+        for (key, bounds) in self.bounds.all_changed() {
+            project
+                .write_bounds(*key, bounds, Stamp::ZERO)
+                .map_err(CacheError::Save)?;
+        }
         project.save().map_err(CacheError::Save)?;
         let base = saved_base(project)?;
         Ok(Saved {
             base,
             stamp: self.last_write,
             lost,
+            bounds: self.bounds.changes(),
         })
     }
 
@@ -1421,8 +1486,13 @@ impl TileStore {
         working: ProjectFile,
     ) -> Result<ProjectFile, CacheError> {
         self.sync_pins()?;
-        let Saved { base, stamp, lost } = saved;
-        if stamp != self.last_write {
+        let Saved {
+            base,
+            stamp,
+            lost,
+            bounds,
+        } = saved;
+        if stamp != self.last_write || bounds != self.bounds.changes() {
             return Err(CacheError::StaleSave);
         }
         if base.meta().mesh_hash() != self.mesh_hash || working.meta().mesh_hash() != self.mesh_hash
@@ -1467,6 +1537,7 @@ impl TileStore {
         }
         self.prune_known_ops();
         self.since_rebase.clear();
+        self.bounds.rebased();
         self.generation += 1;
         // The old workers read the old files; dropping them joins them and drops their results.
         self.prefetch = Prefetcher::new();
@@ -1487,7 +1558,9 @@ impl TileStore {
     /// did, labelled with the record's op as the store last knew it (see
     /// [`TileStore::known_ops`]): never with an op that didn't edit it. A tile that can be read
     /// neither way, or a broken slot, is lost: listed, and left out. Then `fresh` is saved
-    /// (synced, a save point, synced again).
+    /// (synced, a save point, synced again). Every bound of the old working file and every bound
+    /// changed since the last rebase go across too, as they are now; those a lost tile's edit could
+    /// change, as unknown.
     ///
     /// # Errors
     ///
@@ -1544,12 +1617,32 @@ impl TileStore {
                 cleaned.push((key, id));
             }
         }
+        self.bounds.settle(&self.mesh)?;
+        self.bounds.forget(&self.mesh, lost.iter().copied())?;
+        let carried: BTreeSet<TileKey> =
+            self.file.bounds_locations().map(|(key, _)| *key).collect();
+        for key in carried {
+            if self.bounds.changed(&key).is_none() {
+                let copied = match self.file.read_bounds_record(&key) {
+                    Ok(Some(raw)) => fresh.append_bounds_copy(&key, &raw),
+                    // A bound is derived: one that doesn't read goes across as unknown.
+                    Ok(None) | Err(_) => fresh.write_bounds(key, None, Stamp::ZERO),
+                };
+                copied.map_err(CacheError::WriteBack)?;
+            }
+        }
+        for (key, bounds) in self.bounds.all_changed() {
+            fresh
+                .write_bounds(*key, bounds, Stamp::ZERO)
+                .map_err(CacheError::WriteBack)?;
+        }
         fresh.save().map_err(CacheError::WriteBack)?;
         Ok(Filled {
             file: fresh,
             lost,
             cleaned,
             stamp: self.last_write,
+            bounds: self.bounds.changes(),
         })
     }
 
@@ -1576,8 +1669,9 @@ impl TileStore {
             lost,
             cleaned,
             stamp,
+            bounds,
         } = filled;
-        if stamp != self.last_write {
+        if stamp != self.last_write || bounds != self.bounds.changes() {
             return Err(CacheError::StaleSave);
         }
         // Drained first, so the feed can't bring a lost key back.
@@ -1598,6 +1692,8 @@ impl TileStore {
                 mark.clear();
             }
         }
+        // The new file holds every bound as it is now.
+        self.bounds.all_flushed();
         self.generation += 1;
         // The workers' jobs name records of the old file.
         self.prefetch = Prefetcher::new();
@@ -2129,8 +2225,9 @@ impl TileStore {
         })
     }
 
-    /// Writes every dirty correction tile to the working file and records a save point there.
-    /// Returns its offset.
+    /// Writes every dirty correction tile, and every spatial-index bound the working file lacks,
+    /// to the working file and records a save point there. Returns its
+    /// offset.
     ///
     /// This makes the working file hold every edit, as of a save point of its own; it doesn't
     /// save the project (see [`crate::Project::save`]). Save's consumer of the change feed is
@@ -2142,8 +2239,9 @@ impl TileStore {
     /// [`CacheError::Streaming`] while a recovery writer streams the working file: its save
     /// points are cuts at its snapshots, and one made here could name later edits than a save
     /// point the writer is about to write, so the durable state could go backwards.
-    /// [`CacheError::WriteBack`] if a tile's write fails; [`CacheError::Store`] if the save
-    /// point's does.
+    /// [`CacheError::WriteBack`] if a tile's or a bound's write fails; [`CacheError::Eval`] if
+    /// listing what the edits made stale fails (never, for tiles of the store's mesh);
+    /// [`CacheError::Store`] if the save point's write does.
     pub fn save(&mut self) -> Result<u64, CacheError> {
         if !self.streams.is_empty() {
             return Err(CacheError::Streaming);
@@ -2162,6 +2260,7 @@ impl TileStore {
                 self.known_ops.insert(key, op);
             }
         }
+        self.write_unflushed_bounds()?;
         Ok(self.file.save()?)
     }
 
@@ -2181,9 +2280,11 @@ impl TileStore {
     }
 
     /// Whether streaming consumer `id` has edits to flush: keys pushed to the feed since its last
-    /// snapshot, or keys of its flush mark still unconfirmed.
+    /// snapshot, or keys of its flush mark still unconfirmed; or bounds the working file lacks.
     pub(crate) fn has_unflushed(&self, id: ConsumerId) -> bool {
-        self.feed.has_pending(id) || self.streams.get(&id).is_some_and(|mark| !mark.is_empty())
+        self.feed.has_pending(id)
+            || self.streams.get(&id).is_some_and(|mark| !mark.is_empty())
+            || self.bounds.has_unflushed()
     }
 
     /// Copies, for streaming consumer `id`, every correction slot whose latest edit isn't in the
@@ -2346,20 +2447,155 @@ impl TileStore {
         self.file.len()
     }
 
-    /// Whether the working file has tiles written since its last save point.
-    pub(crate) fn has_unsaved_tiles(&self) -> bool {
-        self.file.has_unsaved_tiles()
+    /// Whether the working file has records (tiles or bounds) written since its last save
+    /// point.
+    pub(crate) fn has_unsaved_records(&self) -> bool {
+        self.file.has_unsaved_records()
     }
 
-    /// Appends a save point to the working file naming every tile written to it so far, without
-    /// syncing (see [`ProjectFile::write_save_point`]), and returns its offset. Dirty slots are
-    /// not written: their edits are in no save point yet.
+    /// Appends a save point to the working file naming every tile and bound written to it so far,
+    /// without syncing (see [`ProjectFile::write_save_point`]), and returns its offset. Dirty
+    /// slots are not written: their edits are in no save point yet.
     ///
     /// # Errors
     ///
     /// [`CacheError::Store`] if the write fails.
     pub(crate) fn write_save_point(&mut self) -> Result<u64, CacheError> {
         Ok(self.file.write_save_point()?)
+    }
+
+    /// Records `bounds`, computed from the store's current state (by the spatial index), as
+    /// the bounds the store keeps for those tiles: they go to the working file with the next
+    /// flush or save, and to the project file with the next save of it.
+    ///
+    /// The writes since the last call are settled first (see [`crate::bounds`]), so the bounds
+    /// they made unknown are replaced, not the other way round.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] if listing a written tile's readers fails (never, for tiles of the
+    /// store's mesh). Nothing is recorded then.
+    pub(crate) fn record_bounds(
+        &mut self,
+        bounds: &[(TileKey, TileBounds)],
+    ) -> Result<(), CacheError> {
+        self.bounds.settle(&self.mesh)?;
+        for &(key, tile) in bounds {
+            self.bounds.set(key, Some(tile));
+        }
+        Ok(())
+    }
+
+    /// The bounds the store keeps for each of `keys`, in order: `None` where none is known (none
+    /// was ever recorded, or a write since made it unknown), and the tile must be evaluated.
+    ///
+    /// Each is read as a correction tile is (see [`crate::bounds`]): the change since the last
+    /// save if there is one, else the working file's record, else the base's. Records are read
+    /// together, a file at a time; one that doesn't read counts as unknown.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::Store`] if a read
+    /// fails.
+    pub(crate) fn stored_bounds(
+        &mut self,
+        keys: &[TileKey],
+    ) -> Result<Vec<Option<TileBounds>>, CacheError> {
+        self.bounds.settle(&self.mesh)?;
+        let mut found = vec![None; keys.len()];
+        let (mut working, mut base) = (Vec::new(), Vec::new());
+        for (n, key) in keys.iter().enumerate() {
+            if let Some(changed) = self.bounds.changed(key) {
+                if let Some(slot) = found.get_mut(n) {
+                    *slot = changed.bounds();
+                }
+            } else if let Some(loc) = self.file.locate_bounds(key) {
+                working.push((n, (*key, loc)));
+            } else if let Some(loc) = self.base.as_ref().and_then(|b| b.locate_bounds(key)) {
+                base.push((n, (*key, loc)));
+            }
+        }
+        let entries = |at: &[(usize, (TileKey, Loc))]| -> Vec<(TileKey, Loc)> {
+            at.iter().map(|&(_, entry)| entry).collect()
+        };
+        let read_working = self.file.read_bounds(&entries(&working))?;
+        let read_base = match &self.base {
+            Some(file) if !base.is_empty() => file.read_bounds(&entries(&base))?,
+            _ => Vec::new(),
+        };
+        for ((n, _), bounds) in working
+            .iter()
+            .zip(read_working)
+            .chain(base.iter().zip(read_base))
+        {
+            if let Some(slot) = found.get_mut(*n) {
+                *slot = bounds;
+            }
+        }
+        Ok(found)
+    }
+
+    /// The bounds part of a recovery flush, at its cut: settles the writes so far, makes unknown
+    /// the bounds the `lost` tiles' edits could have changed (left out of the flush), and
+    /// appends every bound the working file lacks, placed at the cut.
+    ///
+    /// Called right after the flush's snapshot, on the owner thread, before any later write:
+    /// the bounds appended are those of the state the snapshot copies, so the flush's save point
+    /// names tiles and bounds of one state.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if an
+    /// append fails: the bounds not appended are kept for the next flush.
+    pub(crate) fn flush_bounds(&mut self, lost: &[TileKey]) -> Result<(), CacheError> {
+        self.bounds.settle(&self.mesh)?;
+        self.bounds.forget(&self.mesh, lost.iter().copied())?;
+        self.write_unflushed_bounds()
+    }
+
+    /// Appends every bound the working file lacks, at the latest write: the state they
+    /// describe. The writes must be settled.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::WriteBack`] if an append fails: the bounds not appended stay unflushed.
+    fn write_unflushed_bounds(&mut self) -> Result<(), CacheError> {
+        self.bounds.settle(&self.mesh)?;
+        let unflushed: Vec<(TileKey, Option<TileBounds>)> = self
+            .bounds
+            .unflushed()
+            .map(|(key, bounds)| (*key, bounds.copied()))
+            .collect();
+        for (key, bounds) in unflushed {
+            self.file
+                .write_bounds(key, bounds.as_ref(), self.last_write)
+                .map_err(CacheError::WriteBack)?;
+            self.bounds.flushed(&key);
+        }
+        Ok(())
+    }
+
+    /// Makes unknown, in the save point of the flush in flight too, every bound the `lost`
+    /// tiles' edits could have changed: their copies didn't encode, so the save point holds
+    /// their older state. The unknown bounds are appended placed at the flush's cut; the store's
+    /// own are made unknown as well, and the next flush writes them again.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if an
+    /// append fails.
+    pub(crate) fn forget_bounds_at_cut(&mut self, lost: &[TileKey]) -> Result<(), CacheError> {
+        if lost.is_empty() {
+            return Ok(());
+        }
+        let stale = self.bounds.forget(&self.mesh, lost.iter().copied())?;
+        let at = self.file.cut_at().unwrap_or(self.last_write);
+        for key in stale {
+            self.file
+                .write_bounds(key, None, at)
+                .map_err(CacheError::WriteBack)?;
+        }
+        Ok(())
     }
 
     /// Frees every unpinned slot of both pools, writing dirty correction tiles back first.
@@ -3006,6 +3242,7 @@ impl TileStore {
             },
         );
         self.feed.push(key, op);
+        self.bounds.note_write(key);
         self.corrections.set_dirty(id, true)?;
         Ok(())
     }

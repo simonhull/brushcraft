@@ -12,8 +12,9 @@
 //! evaluated (as an app's do, the view having drawn them). What a cold region costs is
 //! `page-in`'s measure.
 //!
-//! Building the spatial index comes first, and is reported apart: on the benchmark sphere it
-//! evaluates all 153,600 level-9 tiles, about two minutes on one core.
+//! Loading the spatial index comes first, and is reported apart: from the bounds `generate`
+//! saved with the tiles, it evaluates no tile (a project without them has all 153,600 level-9
+//! tiles evaluated).
 //!
 //! `save` then counts the vertices the stroke changed (each once, through the tile that owns
 //! it), saves the project with [`store::Project::save`], and reports the save's time and how
@@ -88,12 +89,12 @@ impl Plan {
     }
 }
 
-/// Opens the project, builds its index and plans the stroke `options` asks for, reporting as
+/// Opens the project, loads its index and plans the stroke `options` asks for, reporting as
 /// `bench`.
 ///
 /// # Errors
 ///
-/// As [`session::open`], [`session::build_index`] and [`Plan::new`].
+/// As [`session::open`], [`session::load_index`] and [`Plan::new`].
 fn prepare<J: Write, H: Write>(
     options: &Options,
     paths: &Paths,
@@ -102,7 +103,7 @@ fn prepare<J: Write, H: Write>(
 ) -> Result<(Project, SpatialIndex, Plan)> {
     let level = session::level(options)?;
     let mut project = session::open(options, paths)?;
-    let index = session::build_index(&mut project, level, bench, out)?;
+    let index = session::load_index(&mut project, level, bench, out)?;
     let direction = Rng::new(options.seed).direction();
     let plan = Plan::new(
         &mut project,
@@ -118,7 +119,7 @@ fn prepare<J: Write, H: Write>(
 ///
 /// # Errors
 ///
-/// If the project can't be opened, the index built or a step run, or writing the report fails.
+/// If the project can't be opened, the index loaded or a step run, or writing the report fails.
 pub(crate) fn run<J: Write, H: Write>(
     options: &Options,
     paths: &Paths,

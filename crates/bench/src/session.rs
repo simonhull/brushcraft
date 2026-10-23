@@ -1,4 +1,4 @@
-//! What the subcommands share: opening the project, building its spatial index, and running a
+//! What the subcommands share: opening the project, loading its spatial index, and running a
 //! stroke of draw steps.
 
 use std::io::Write;
@@ -50,30 +50,34 @@ pub(crate) fn level(options: &Options) -> Result<Level> {
     Ok(Level::new(options.level)?)
 }
 
-/// Builds the spatial index over every tile of `level`, reporting progress, and records how
-/// long it took (as `bench`'s `index` result). Returns the index.
+/// Loads the spatial index over every tile of `level` from the bounds the project keeps.
 ///
-/// Every tile of the level is evaluated once, positions and normals: on the benchmark sphere
-/// that is 153,600 level-9 tiles, about two minutes on one core.
+/// Reports progress, and records how long the index took to be ready (as `bench`'s `index`
+/// result), with how many tiles' bounds were read and how many evaluated. Returns the index.
+///
+/// A project `generate` made at this level keeps every bound, and loads without evaluating a
+/// tile. One saved without them (or at another level) has every tile evaluated, positions and
+/// normals: on the benchmark sphere that is 153,600 level-9 tiles, about fifteen seconds.
 ///
 /// # Errors
 ///
-/// If a tile can't be evaluated, or writing the report fails.
-pub(crate) fn build_index<J: Write, H: Write>(
+/// If the bounds can't be read or a tile can't be evaluated, or writing the report fails.
+pub(crate) fn load_index<J: Write, H: Write>(
     project: &mut Project,
     level: Level,
     bench: &str,
     out: &mut Output<J, H>,
 ) -> Result<SpatialIndex> {
-    out.say(&format!("building the spatial index over level {level}"))?;
+    out.say(&format!("loading the spatial index over level {level}"))?;
     let start = Instant::now();
     let mut reported = Ok(());
-    let index = SpatialIndex::build(project.store(), level, |done, total| {
-        if reported.is_ok() {
-            reported = out.progress("index", done, total, start);
-        }
-    })
-    .context("building the spatial index")?;
+    let (index, stats) = project
+        .load_index(level, |done, total| {
+            if reported.is_ok() {
+                reported = out.progress("index", done, total, start);
+            }
+        })
+        .context("loading the spatial index")?;
     reported?;
     let took = start.elapsed();
     let tiles = index.bvh().len();
@@ -81,12 +85,16 @@ pub(crate) fn build_index<J: Write, H: Write>(
         &Record::new(bench, "index")
             .with("level", u64::from(level.get()))
             .with("tiles", tiles)
-            .with("build_ms", ms(took))
+            .with("stored", stats.stored)
+            .with("evaluated", stats.evaluated)
+            .with("ready_ms", ms(took))
             .with("heap_mib", mib(u64::try_from(index.bvh().heap_bytes())?)),
     )?;
     out.say(&format!(
-        "index: {tiles} tiles in {:.1} s, {:.1} MiB",
+        "index: {tiles} tiles ready in {:.2} s ({} stored, {} evaluated), {:.1} MiB",
         took.as_secs_f64(),
+        stats.stored,
+        stats.evaluated,
         mib(u64::try_from(index.bvh().heap_bytes())?)
     ))?;
     Ok(index)

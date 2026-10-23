@@ -66,7 +66,7 @@ fn a_huge_stated_size_is_rejected_without_allocating() {
     let offset = f.len();
     f.append_raw(KIND_TILE, &payload).unwrap();
     let entries = BTreeMap::from([(
-        key(2),
+        Name::Tile(key(2)),
         Loc {
             offset,
             len: f.len() - offset,
@@ -159,8 +159,8 @@ fn displacement_reads_check_the_stated_size_before_decompressing() {
     payload[at..at + 4].copy_from_slice(&MAX_RAW.to_le_bytes());
     let loc = f.append(KIND_TILE, &payload).unwrap();
     let offset = loc.offset;
-    f.live.insert(key(1), loc);
-    f.pending.insert(key(1), loc);
+    f.live.insert(Name::Tile(key(1)), loc);
+    f.pending.insert(Name::Tile(key(1)), loc);
     f.save().unwrap();
     drop(f);
     let opened = ProjectFile::open(&path).unwrap();
@@ -217,7 +217,7 @@ fn index_entries_must_point_before_their_index() {
     ] {
         std::fs::write(&path, &good).unwrap();
         let mut f = ProjectFile::open(&path).unwrap();
-        let entries = BTreeMap::from([(key(1), loc)]);
+        let entries = BTreeMap::from([(Name::Tile(key(1)), loc)]);
         f.append_raw(
             KIND_INDEX,
             &index_payload(Coverage::Full, None, None, &entries).unwrap(),
@@ -587,8 +587,8 @@ fn an_entry_naming_another_keys_record_is_damage() {
     let path = dir.path("p.bcrf");
     let (_, [.., s3]) = three(&path);
     let mut f = ProjectFile::open(&path).unwrap();
-    let theirs = f.live[&key(2)];
-    let entries = BTreeMap::from([(key(1), theirs)]);
+    let theirs = f.live[&Name::Tile(key(2))];
+    let entries = BTreeMap::from([(Name::Tile(key(1)), theirs)]);
     f.append_raw(
         KIND_INDEX,
         &index_payload(Coverage::Delta, Some(s3), Some(op(3)), &entries).unwrap(),

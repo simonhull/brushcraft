@@ -35,6 +35,13 @@
 //! file in place, as a roll-over that failed does (see [`ROLL_OVER_RETRY`]), and once one is,
 //! protection runs again.
 //!
+//! # The spatial index
+//!
+//! The bounds of the spatial index are kept with the tiles, in both files (see
+//! [`crate::bounds`]): what the index records streams into the recovery file with the edits,
+//! and a save copies it into the project file. So [`Project::load_index`] after
+//! [`Project::open`] or [`Project::restore`] reads the index instead of evaluating every tile.
+//!
 //! # Recovery file names
 //!
 //! A recovery file is named `<project id>-<suffix>.bcrf`, the id as 32 hex digits and the
@@ -68,11 +75,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
-use geom::BaseMesh;
+use geom::{BaseMesh, Level};
 use thiserror::Error;
 
 use crate::OpId;
 use crate::file::{BaseFile, ProjectFile, StoreError, sync_parent};
+use crate::index::{IndexError, LoadStats, SpatialIndex};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
 use crate::tiles::{CacheError, Saved, StoreConfig, TileStore};
@@ -785,6 +793,24 @@ impl Project {
     /// The tile store, for edits and evaluation.
     pub const fn store(&mut self) -> &mut TileStore {
         &mut self.store
+    }
+
+    /// The spatial index over every tile of `level`, loaded from the bounds the project keeps
+    /// ([`SpatialIndex::load`]): read from the recovery file where it has them, else from the
+    /// project file's save point, and evaluated only for tiles neither holds (a project saved
+    /// before bounds were kept, or edited since without a refit). What an index built, refitted
+    /// or loaded here computes is kept in turn, streamed into the recovery file with the edits
+    /// and saved with them.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpatialIndex::load`].
+    pub fn load_index(
+        &mut self,
+        level: Level,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<(SpatialIndex, LoadStats), IndexError> {
+        SpatialIndex::load(&mut self.store, level, progress)
     }
 
     /// Where the project file saves go to is; `None` for a project never saved, or one

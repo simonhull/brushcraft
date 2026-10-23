@@ -5,14 +5,24 @@
 //! dense evaluation of the same edits. The default suite runs one seed per budget on the cube;
 //! the ignored test runs many seeds on the cube and on a prism with a valence-7 vertex.
 //!
+//! The spatial index rides along: now and then it is built or refitted over the finest level,
+//! which records its bounds in the store, and at every reopen it is loaded from the bounds the
+//! file keeps and checked, bit for bit, against one built from the reopened store. Edits at every
+//! level, saves and write-backs between them so check that what a save keeps is never stale.
+//!
 //! The same workload runs with its reads batched through [`TileStore::evaluate_many`] at one,
 //! two and every hardware thread: each run is checked against the oracle at every step, and the
-//! runs against each other (the tiles the store computed, in order, and every final bit).
+//! runs against each other (the tiles the store computed, in order, and every final bit). Those
+//! runs make no prefetches: a poll installs whichever prefetched tiles have arrived, so what
+//! the pools hold, and so which tiles are evaluated again, would hang on the prefetch workers'
+//! timing rather than on the evaluation workers' count.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use super::*;
+use crate::index::SpatialIndex;
+use crate::index::tests::assert_loads_as_built;
 
 /// How often each kind of check ran, so a run that never reaches one fails.
 #[derive(Debug, Default, Clone, Copy)]
@@ -31,6 +41,10 @@ struct Stats {
     full: usize,
     /// Saves followed by a drop and a reopen of the working file.
     reopens: usize,
+    /// Builds and refits of the spatial index.
+    indexed: usize,
+    /// Bounds a reopen's load read from the file rather than evaluated.
+    stored_bounds: usize,
 }
 
 impl std::ops::Add for Stats {
@@ -45,6 +59,8 @@ impl std::ops::Add for Stats {
             over_budget: self.over_budget + rhs.over_budget,
             full: self.full + rhs.full,
             reopens: self.reopens + rhs.reopens,
+            indexed: self.indexed + rhs.indexed,
+            stored_bounds: self.stored_bounds + rhs.stored_bounds,
         }
     }
 }
@@ -124,6 +140,8 @@ struct Run<'a> {
     config: StoreConfig,
     /// How evaluated tiles are read.
     reads: Reads,
+    /// Whether the prefetch operation prefetches, or does nothing.
+    prefetches: bool,
     /// The seed, for messages.
     seed: u64,
     /// Every tile of levels 1 to `top`.
@@ -138,6 +156,8 @@ struct Run<'a> {
     oracle: Option<DenseEvaluation>,
     /// Pins held.
     guards: Vec<PinGuard>,
+    /// The spatial index over level `top`, once built.
+    index: Option<SpatialIndex>,
     /// What was checked.
     stats: Stats,
 }
@@ -369,8 +389,12 @@ impl Run<'_> {
         }
     }
 
-    /// Prefetches up to nine tiles, and polls half the time.
+    /// Prefetches up to nine tiles, and polls half the time; nothing in a run without
+    /// prefetches.
     fn prefetch(&mut self, store: &mut TileStore) {
+        if !self.prefetches {
+            return;
+        }
         let count = 1 + self.rng.below(8);
         let keys: Vec<TileKey> = (0..count).map(|_| self.pick()).collect();
         store.prefetch(&keys).unwrap();
@@ -391,6 +415,24 @@ impl Run<'_> {
             let evaluated = store.evaluate(key).map(drop);
             self.allow_full(evaluated, "burst");
         }
+    }
+
+    /// Builds the spatial index over level `top`, or refits it to every tile of the level, so
+    /// the store records their bounds. Skipped while pins are held: the minimum budget has no
+    /// room to evaluate a whole level beside them.
+    fn index(&mut self, store: &mut TileStore) {
+        if !self.guards.is_empty() {
+            return;
+        }
+        let top = level(self.top);
+        match &mut self.index {
+            Some(index) => {
+                let keys = tiles(self.mesh, self.top, self.top);
+                index.update(store, &keys).unwrap();
+            }
+            None => self.index = Some(SpatialIndex::build(store, top, |_, _| {}).unwrap()),
+        }
+        self.stats.indexed += 1;
     }
 
     /// Runs one random operation; its name, for messages.
@@ -444,6 +486,10 @@ impl Run<'_> {
                 "shrink_to"
             }
             95..97 => "reopen",
+            97..99 => {
+                self.index(store);
+                "index"
+            }
             _ => {
                 self.burst(store);
                 "burst"
@@ -464,7 +510,8 @@ struct Outcome {
 }
 
 /// Runs `steps` random operations, chosen with `seed`, on a new store over `mesh` with `config`,
-/// reading tiles as `reads` says; returns what was checked and what the store did.
+/// reading tiles as `reads` says, with prefetches or without; returns what was checked and what
+/// the store did.
 ///
 /// Every read is checked against the dense evaluation to level `top`, the budget and the
 /// dependency graph after every step, and every tile at the end.
@@ -473,6 +520,7 @@ fn run(
     top: u8,
     config: StoreConfig,
     reads: Reads,
+    prefetches: bool,
     seed: u64,
     steps: u32,
 ) -> Outcome {
@@ -485,6 +533,7 @@ fn run(
         top,
         config,
         reads,
+        prefetches,
         seed,
         all: tiles(mesh, 1, top),
         rng: Rng(seed),
@@ -492,6 +541,7 @@ fn run(
         map: CorrectionMap::new(),
         oracle: None,
         guards: Vec::new(),
+        index: None,
         stats: Stats::default(),
     };
     let mut computed = Vec::new();
@@ -505,6 +555,9 @@ fn run(
             drop(store);
             store = open(ProjectFile::open(&path).unwrap());
             run.stats.reopens += 1;
+            let at = format!("seed {seed} step {step}, reopened");
+            run.stats.stored_bounds += assert_loads_as_built(&mut store, level(top), &at).stored;
+            run.index = None;
         }
         let at = format!("seed {seed} step {step} ({what})");
         assert!(
@@ -544,8 +597,17 @@ fn assert_covered(stats: Stats, what: &str) {
         "{what}: reads checked: {stats:?}"
     );
     assert!(
-        stats.pins > 0 && stats.reopens > 0,
-        "{what}: pins and reopens: {stats:?}"
+        stats.pins > 0 && stats.reopens > 0 && stats.indexed > 0,
+        "{what}: pins, reopens and index builds: {stats:?}"
+    );
+}
+
+/// Asserts that the runs together loaded bounds from a file: one coarse edit makes every bound
+/// of the level unknown, so a single run may never reopen with any stored.
+fn assert_bounds_stored(stats: Stats, what: &str) {
+    assert!(
+        stats.stored_bounds > 0,
+        "{what}: reopens loaded stored bounds: {stats:?}"
     );
 }
 
@@ -554,15 +616,27 @@ fn the_store_reads_as_the_dense_evaluation_at_every_step() {
     let mesh = mesh();
     // Level 7, where faces are already split into tiles, keeps the oracle cheap: it is evaluated
     // again after every edit.
-    thread::scope(|scope| {
-        for (seed, config) in (0x5EED..).zip(budgets(&mesh, &[0, 3])) {
-            let mesh = &mesh;
-            scope.spawn(move || {
-                let outcome = run(mesh, 7, config, Reads::OneByOne, seed, 400);
-                assert_covered(outcome.stats, &format!("{} bytes", config.budget_bytes));
-            });
-        }
+    let total = thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "every run is spawned before the first is joined"
+        )]
+        let runs: Vec<_> = (0x5EED..)
+            .zip(budgets(&mesh, &[0, 3]))
+            .map(|(seed, config)| {
+                let mesh = &mesh;
+                scope.spawn(move || {
+                    let outcome = run(mesh, 7, config, Reads::OneByOne, true, seed, 400);
+                    assert_covered(outcome.stats, &format!("{} bytes", config.budget_bytes));
+                    outcome.stats
+                })
+            })
+            .collect();
+        runs.into_iter()
+            .map(|run| run.join().unwrap())
+            .fold(Stats::default(), std::ops::Add::add)
     });
+    assert_bounds_stored(total, "every budget");
 }
 
 #[test]
@@ -587,7 +661,7 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
                     .map(|seed| {
                         scope.spawn(move || {
                             let seed = seed * 7919 + 13;
-                            run(mesh, top, config, reads, seed, steps).stats
+                            run(mesh, top, config, reads, true, seed, steps).stats
                         })
                     })
                     .collect();
@@ -603,6 +677,7 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
             total = total + stats;
         }
         assert_covered(total, &format!("{} faces, {reads:?}", mesh.face_count()));
+        assert_bounds_stored(total, &format!("{} faces, {reads:?}", mesh.face_count()));
     }
 }
 
@@ -617,17 +692,21 @@ fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
     let mesh = mesh();
     // The minimum budget, where batches are halved and rounds cut short, and room to spare,
     // where the batches are wide.
+    let mut total = Stats::default();
     for (seed, config) in (0xBA7C..).zip(budgets(&mesh, &[0, 1, 3, 40])) {
         let outcomes: Vec<Outcome> = thread_counts()
             .into_iter()
             .map(|threads| {
                 let config = config.with_threads(Some(threads));
-                run(&mesh, 7, config, Reads::Batched, seed, 400)
+                // No prefetches: a poll installs whichever have arrived, so the pools (and
+                // what is evaluated again) would depend on the prefetch workers' timing.
+                run(&mesh, 7, config, Reads::Batched, false, seed, 400)
             })
             .collect();
         let what = format!("{} bytes", config.budget_bytes);
         let (first, rest) = outcomes.split_first().unwrap();
         assert_covered(first.stats, &what);
+        total = total + first.stats;
         for (outcome, threads) in rest.iter().zip(thread_counts().into_iter().skip(1)) {
             assert!(
                 outcome.computed == first.computed,
@@ -639,4 +718,5 @@ fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
             );
         }
     }
+    assert_bounds_stored(total, "every budget");
 }

@@ -174,7 +174,7 @@ fn page_in_times_both_regions_cold_and_warm() {
 }
 
 #[test]
-fn brush_times_a_stroke_after_building_the_index() {
+fn brush_times_a_stroke_after_loading_the_index() {
     let dir = TempDir::new();
     generate(&dir);
     let printed = run_on(&dir.project(), "brush --level 6 --steps 5 --footprint 3000").unwrap();
@@ -182,6 +182,10 @@ fn brush_times_a_stroke_after_building_the_index() {
     assert!(
         (number(index, "tiles") - 24.0).abs() < 0.5,
         "every level-6 tile: {index}"
+    );
+    assert!(
+        number(index, "stored") > 23.5 && number(index, "evaluated") < 0.5,
+        "every bound saved by generate, none evaluated: {index}"
     );
     let stroke = line(&printed, "brush", "stroke");
     assert!(

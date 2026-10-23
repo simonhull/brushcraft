@@ -13,17 +13,20 @@
 //! [`store::TileStore::edit_tile`], each vertex written once through the tile that owns it
 //! (which writes its copies in the neighbouring tiles too), and the project ticked after every
 //! batch, as a frame loop would, so the recovery writer streams the edits as they are made. Then
-//! [`Project::save_as`] writes the project file and the recovery file is deleted.
+//! the spatial index is built over the finest level ([`SpatialIndex::build`]), which records
+//! every tile's bounds, and [`Project::save_as`] writes the project file, bounds included, so
+//! the other subcommands load the index instead of evaluating every tile. The recovery file is
+//! deleted.
 //!
 //! The peak resident memory reported is exact: the high-water mark (`VmHWM`), reset as the run
 //! starts and read once the project is closed.
 
 use std::io::Write;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use geom::{Level, TileKey, Vec3, cube_sphere};
-use store::{Evaluation, Project};
+use store::{Evaluation, Project, SpatialIndex};
 
 use crate::cli::Options;
 use crate::noise::ValueNoise;
@@ -151,6 +154,8 @@ pub(crate) fn run<J: Write, H: Write>(
         project.end_stroke()?;
     }
     let sculpted = start.elapsed();
+    let finest = levels.last().copied().context("no level to sculpt")?;
+    let (indexed, indexed_tiles) = build_index(&mut project, finest, out)?;
     out.say("saving")?;
     let saving = Instant::now();
     let outcome = project
@@ -171,6 +176,8 @@ pub(crate) fn run<J: Write, H: Write>(
             .with("tiles", total)
             .with("vertices_written", vertices)
             .with("sculpt_ms", ms(sculpted))
+            .with("index_ms", ms(indexed))
+            .with("index_tiles", indexed_tiles)
             .with("save_ms", ms(saved))
             .with("total_ms", ms(total_time))
             .with("file_bytes", bytes)
@@ -181,15 +188,41 @@ pub(crate) fn run<J: Write, H: Write>(
             .with("unprotected_tiles", unprotected),
     )?;
     out.say(&format!(
-        "generate: {total} tiles, {vertices} vertices written in {:.1} s, saved in {:.1} s; \
-         file {:.1} MiB, peak RSS (VmHWM) {:.1} MiB (budget {} MiB)",
+        "generate: {total} tiles, {vertices} vertices written in {:.1} s, index over \
+         {indexed_tiles} tiles built in {:.1} s, saved in {:.1} s; file {:.1} MiB, peak RSS \
+         (VmHWM) {:.1} MiB (budget {} MiB)",
         sculpted.as_secs_f64(),
+        indexed.as_secs_f64(),
         saved.as_secs_f64(),
         mib(bytes),
         mib(rss.peak),
         options.budget_mib
     ))?;
     Ok(())
+}
+
+/// Builds the spatial index over every tile of `level`, reporting progress, so the store
+/// records their bounds for the save to keep; returns how long it took and how many tiles.
+///
+/// # Errors
+///
+/// If a tile can't be evaluated, or writing the report fails.
+fn build_index<J: Write, H: Write>(
+    project: &mut Project,
+    level: Level,
+    out: &mut Output<J, H>,
+) -> Result<(Duration, usize)> {
+    out.say(&format!("building the spatial index over level {level}"))?;
+    let start = Instant::now();
+    let mut reported = Ok(());
+    let index = SpatialIndex::build(project.store(), level, |done, total| {
+        if reported.is_ok() {
+            reported = out.progress("index", done, total, start);
+        }
+    })
+    .context("building the spatial index")?;
+    reported?;
+    Ok((start.elapsed(), index.bvh().len()))
 }
 
 /// Buffers [`sculpt_batch`] reuses from batch to batch.

@@ -17,6 +17,9 @@ pub(crate) const KIND_INDEX: u8 = 2;
 pub(crate) const KIND_META: u8 = 3;
 /// A mesh record: the base mesh, compressed. Always the second record.
 pub(crate) const KIND_MESH: u8 = 4;
+/// A bounds record: one tile's bounds for the spatial index, or that they are unknown (see
+/// `bounds`).
+pub(crate) const KIND_BOUNDS: u8 = 5;
 
 /// A record's head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
