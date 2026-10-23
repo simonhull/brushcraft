@@ -115,6 +115,7 @@ use geom::{
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
+use rayon::slice::{ParallelSlice, ParallelSliceMut};
 use thiserror::Error;
 
 use crate::deps::DepGraph;
@@ -537,6 +538,53 @@ enum Acquire {
     Clean,
 }
 
+/// A correction tile being loaded that wasn't resident: its slot, taken (see
+/// [`TileStore::take_correction_slot`]) and not yet filled, and where its record is.
+#[derive(Debug, Clone, Copy)]
+struct Fill {
+    /// The tile.
+    key: TileKey,
+    /// Its slot, which [`fill_slot`] fills.
+    id: SlotId<CorrectionSlot>,
+    /// Where its latest record is: the working file, else the base; `None` for a tile never
+    /// written, which loads as zero.
+    found: Option<(Source, Loc)>,
+}
+
+/// What filling each slot of a round gave, in the round's order: the op of the record read, or
+/// `None` for a tile loaded as zero (see [`fill_slot`]).
+type FillOutcomes = Vec<Result<Option<OpId>, CacheError>>;
+
+/// Fills `slot` with `tile`'s tile: read from its record in `working` or `base`, with `scratch`'s
+/// buffers, or reset to zero where it has none. Returns the op of the record read.
+///
+/// Touches nothing but `slot` and `scratch`, so a round's tiles are filled on several threads
+/// at once (see [`TileStore::fill_round`]).
+///
+/// # Errors
+///
+/// [`CacheError::Store`] if the record can't be read or doesn't decode;
+/// [`CacheError::Internal`] for a record in a base the store doesn't have, or a slot that can't
+/// hold the tile's side. On error the slot holds no tile.
+fn fill_slot(
+    working: &ProjectFile,
+    base: Option<&BaseFile>,
+    tile: &Fill,
+    slot: &mut CorrectionSlot,
+    scratch: &mut ReadScratch,
+) -> Result<Option<OpId>, CacheError> {
+    let key = &tile.key;
+    match (tile.found, base) {
+        (None, _) => slot
+            .reset(key.side())
+            .map(|()| None)
+            .map_err(|e| Invariant::CorrectionSlot(e).into()),
+        (Some((Source::Working, loc)), _) => Ok(Some(working.read_at(key, loc, slot, scratch)?)),
+        (Some((Source::Base, loc)), Some(base)) => Ok(Some(base.read_at(key, loc, slot, scratch)?)),
+        (Some((Source::Base, _)), None) => Err(Invariant::MissingBase.into()),
+    }
+}
+
 /// Evaluated tiles an evaluation pinned, with their keys, in key order: what its [`Resident`]
 /// source reads.
 type Held = Vec<(TileKey, SlotId<EvaluatedSlot>)>;
@@ -641,9 +689,11 @@ impl EvalLog {
 ///
 /// - the evaluation scratch: one buffer of the largest tile's positions (about 50 KB) per tile of a
 ///   round, so about 3.2 MB at most (64 of them), kept for the store's life;
-/// - the buffers and zstd context the owner thread reads correction tiles with, and each prefetch
-///   worker's (at most four): a few hundred KB together, with the prefetched tiles waiting for
-///   [`TileStore::poll`] and the spare boxes the workers decode into, about 27 KB each;
+/// - the buffers and zstd context the owner thread reads correction tiles with, each evaluation
+///   worker's (made the first time a round's tiles are loaded on the workers) and each prefetch
+///   worker's (at most four): about 150 KB a thread, so a few MB with dozens of workers, with the
+///   prefetched tiles waiting for [`TileStore::poll`] and the spare boxes the workers decode
+///   into, about 27 KB each;
 /// - what each evaluation worker allocates while it predicts a tile or computes its normals: the
 ///   gathered parent block, the prediction and its tangent frames, a few tiles' worth (a few
 ///   hundred KB for the largest tiles), freed when the tile is done;
@@ -724,8 +774,12 @@ pub struct TileStore {
     scratch: Vec<Vec<Vec3>>,
     /// The evaluation workers (see the module notes).
     workers: rayon::ThreadPool,
-    /// Buffers for reading correction tiles.
+    /// Buffers for reading correction tiles on the owner thread.
     read_scratch: ReadScratch,
+    /// Buffers for reading correction tiles on the workers, one set per worker filling a round's
+    /// slots at once (see [`TileStore::fill_round`]). Made on demand, never more than there are
+    /// workers.
+    worker_read_scratch: Vec<ReadScratch>,
     /// What was computed, for the tests.
     #[cfg(test)]
     log: EvalLog,
@@ -1193,6 +1247,7 @@ impl TileStore {
             scratch: Vec::new(),
             workers,
             read_scratch: ReadScratch::new()?,
+            worker_read_scratch: Vec::new(),
             #[cfg(test)]
             log: EvalLog::default(),
             #[cfg(test)]
@@ -2472,57 +2527,92 @@ impl TileStore {
         if let Some((id, _)) = self.corrections.lookup(&key) {
             return Ok(id);
         }
+        let fill = self.take_correction_slot(key, acquire)?;
+        let slot = self
+            .corrections
+            .get_mut(fill.id)
+            .ok_or(Invariant::StaleHandle)?;
+        let filled = fill_slot(
+            &self.file,
+            self.base.as_ref(),
+            &fill,
+            slot,
+            &mut self.read_scratch,
+        );
+        #[cfg(test)]
+        let filled = self.as_tested(key, filled);
+        self.settle_fill(&fill, filled)?;
+        Ok(fill.id)
+    }
+
+    /// A slot for `key`'s correction tile, which isn't resident, taken as `acquire` allows, and
+    /// where its record is: the first half of loading it, which [`fill_slot`] and
+    /// [`TileStore::settle_fill`] finish.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::acquire_correction`] or, with [`Acquire::Clean`],
+    /// [`CacheError::Full`] when no free slot, new chunk or clean tile's slot is to be had.
+    fn take_correction_slot(&mut self, key: TileKey, acquire: Acquire) -> Result<Fill, CacheError> {
         let id = match acquire {
             Acquire::Any => self.acquire_correction(key)?,
             Acquire::Clean => self.corrections.acquire_clean(key, &mut self.budget)?,
         };
         #[cfg(test)]
         self.log.file_reads.push(key);
-        let found = self.locate(&key);
-        let slot = self.corrections.get_mut(id).ok_or(Invariant::StaleHandle)?;
-        let scratch = &mut self.read_scratch;
-        let read = match (found, &self.base) {
-            (None, _) => Ok(None),
-            (Some((Source::Working, loc)), _) => {
-                self.file.read_at(&key, loc, slot, scratch).map(Some)
-            }
-            (Some((Source::Base, loc)), Some(base)) => {
-                base.read_at(&key, loc, slot, scratch).map(Some)
-            }
-            (Some((Source::Base, _)), None) => {
-                // The slot holds no tile: give it back (it is clean and unpinned).
-                self.corrections.remove(&key)?;
-                return Err(Invariant::MissingBase.into());
-            }
-        };
-        #[cfg(test)]
-        let read = if self.unreadable == Some(key) {
-            Err(std::io::Error::other("an unreadable tile, for the test").into())
+        Ok(Fill {
+            key,
+            id,
+            found: self.locate(&key),
+        })
+    }
+
+    /// `filled`, the outcome of filling `key`'s slot, as the tests see it: an error for the
+    /// tile they made unreadable ([`TileStore::unreadable`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] for the unreadable tile; else `filled`'s.
+    #[cfg(test)]
+    fn as_tested(
+        &self,
+        key: TileKey,
+        filled: Result<Option<OpId>, CacheError>,
+    ) -> Result<Option<OpId>, CacheError> {
+        if self.unreadable == Some(key) {
+            Err(StoreError::from(std::io::Error::other("an unreadable tile, for the test")).into())
         } else {
-            read
-        };
-        let filled = match read {
-            Ok(Some(op)) => Ok(Some(op)),
-            Ok(None) => slot
-                .reset(key.side())
-                .map(|()| None)
-                .map_err(|e| Invariant::CorrectionSlot(e).into()),
-            Err(e) => Err(e.into()),
-        };
+            filled
+        }
+    }
+
+    /// The last half of loading a correction tile: records the op of the record its slot was
+    /// filled from (see [`TileStore::known_ops`]), or, if filling it failed, gives the slot back
+    /// (it is clean, and unpinned by the caller) and returns the error.
+    ///
+    /// # Errors
+    ///
+    /// `filled`'s error; [`CacheError::Internal`] if the slot can't be given back.
+    fn settle_fill(
+        &mut self,
+        fill: &Fill,
+        filled: Result<Option<OpId>, CacheError>,
+    ) -> Result<(), CacheError> {
         match filled {
             Ok(Some(op)) => {
-                self.known_ops.insert(key, op);
+                self.known_ops.insert(fill.key, op);
+                Ok(())
             }
             Ok(None) => {
-                self.known_ops.remove(&key);
+                self.known_ops.remove(&fill.key);
+                Ok(())
             }
             Err(e) => {
-                // The slot holds no tile: give it back (it is clean and unpinned).
-                self.corrections.remove(&key)?;
-                return Err(e);
+                // The slot holds no tile: give it back.
+                self.corrections.remove(&fill.key)?;
+                Err(e)
             }
         }
-        Ok(id)
     }
 
     /// A fresh slot for `key`'s correction tile, as the memory policy orders it (see
@@ -2966,26 +3056,131 @@ impl TileStore {
         tiles: &[(TileKey, &[TileKey])],
     ) -> Result<Vec<SlotId<CorrectionSlot>>, CacheError> {
         let mut ids = Vec::with_capacity(tiles.len().min(ROUND));
+        let mut fills = Vec::new();
         for &(key, _) in tiles.iter().take(ROUND) {
-            let acquire = if ids.is_empty() {
-                Acquire::Any
+            let taken = if let Some((id, _)) = self.corrections.lookup(&key) {
+                Ok(id)
             } else {
-                Acquire::Clean
+                let acquire = if ids.is_empty() {
+                    Acquire::Any
+                } else {
+                    Acquire::Clean
+                };
+                self.take_correction_slot(key, acquire).map(|fill| {
+                    fills.push(fill);
+                    fill.id
+                })
             };
-            let loaded = self.load_correction_as(key, acquire).and_then(|id| {
+            let pinned = taken.and_then(|id| {
                 self.corrections.pin(id)?;
                 Ok(id)
             });
-            match loaded {
+            match pinned {
                 Ok(id) => ids.push(id),
                 Err(CacheError::Full) if !ids.is_empty() => break,
                 Err(e) => {
+                    // A slot just taken and not pinned holds no tile: it goes with the rest.
                     self.unpin_corrections(&ids)?;
+                    self.give_back_fills(&fills)?;
                     return Err(e);
                 }
             }
         }
+        let outcomes = match self.fill_round(&fills) {
+            Ok(outcomes) => outcomes,
+            Err(e) => {
+                self.unpin_corrections(&ids)?;
+                self.give_back_fills(&fills)?;
+                return Err(e);
+            }
+        };
+        for (n, (fill, filled)) in fills.iter().zip(outcomes).enumerate() {
+            #[cfg(test)]
+            let filled = self.as_tested(fill.key, filled);
+            if filled.is_err() {
+                // As loading one tile at a time would have: the tiles before it stay loaded,
+                // and those after it, never loaded, give their slots back.
+                self.unpin_corrections(&ids)?;
+                let later = fills.get(n + 1..).unwrap_or_default();
+                self.give_back_fills(later)?;
+            }
+            self.settle_fill(fill, filled)?;
+        }
         Ok(ids)
+    }
+
+    /// Fills the slots of `fills` (taken and pinned by [`TileStore::load_round`]) from their
+    /// records, on the workers: each worker reads, checks and decodes a run of consecutive
+    /// tiles with read buffers of its own. Returns each tile's outcome, in the order of `fills`,
+    /// for [`TileStore::settle_fill`]; a single tile is filled on the calling thread.
+    ///
+    /// The workers only read the files and write the slots handed to them, each its own: what
+    /// lands in a slot is the same whichever worker fills it.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] if a handle went stale; [`CacheError::Store`] if a worker's read
+    /// buffers can't be made.
+    fn fill_round(&mut self, fills: &[Fill]) -> Result<FillOutcomes, CacheError> {
+        let ids: Vec<SlotId<CorrectionSlot>> = fills.iter().map(|fill| fill.id).collect();
+        let parts = fills.len().min(self.workers.current_num_threads());
+        if parts <= 1 {
+            let mut outcomes = Vec::with_capacity(fills.len());
+            for fill in fills {
+                let slot = self
+                    .corrections
+                    .get_mut(fill.id)
+                    .ok_or(Invariant::StaleHandle)?;
+                let scratch = &mut self.read_scratch;
+                outcomes.push(fill_slot(&self.file, self.base.as_ref(), fill, slot, scratch));
+            }
+            return Ok(outcomes);
+        }
+        while self.worker_read_scratch.len() < parts {
+            self.worker_read_scratch.push(ReadScratch::new()?);
+        }
+        let (file, base) = (&self.file, self.base.as_ref());
+        let scratch = self
+            .worker_read_scratch
+            .get_mut(..parts)
+            .ok_or(Invariant::StaleHandle)?;
+        let mut slots = self
+            .corrections
+            .get_many_mut(&ids)
+            .ok_or(Invariant::StaleHandle)?;
+        let run = fills.len().div_ceil(parts);
+        let runs: Vec<FillOutcomes> = self.workers.install(|| {
+            fills
+                .par_chunks(run)
+                .zip(slots.par_chunks_mut(run))
+                .zip(scratch.par_iter_mut())
+                .map(|((fills, slots), scratch)| {
+                    fills
+                        .iter()
+                        .zip(slots)
+                        .map(|(fill, slot)| fill_slot(file, base, fill, slot, scratch))
+                        .collect()
+                })
+                .collect()
+        });
+        Ok(runs.into_iter().flatten().collect())
+    }
+
+    /// Gives back the slots of `fills`, taken for tiles never loaded: each is unpinned if it is
+    /// pinned, and freed.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] for a stale handle (the slots are the caller's, so it doesn't
+    /// happen).
+    fn give_back_fills(&mut self, fills: &[Fill]) -> Result<(), CacheError> {
+        for fill in fills {
+            if self.corrections.is_pinned(&fill.key) {
+                self.corrections.unpin(fill.id)?;
+            }
+            self.corrections.remove(&fill.key)?;
+        }
+        Ok(())
     }
 
     /// Builds one round: predicts every tile of `round` on the workers, from `below` and its

@@ -431,6 +431,40 @@ impl<T: SlotData> Pool<T> {
             .get(id.index as usize)
     }
 
+    /// The contents of every slot of `ids`, in the same order, all borrowed mutably at once: for
+    /// filling several slots on several threads. `None` if a handle is stale or two name the
+    /// same slot.
+    ///
+    /// The slots are found in one walk over the chunks, in slot order, splitting each chunk's
+    /// slice at the slots wanted, so the borrows are disjoint by construction; a slot named twice
+    /// is behind the split by its second turn, and refused.
+    pub(crate) fn get_many_mut(&mut self, ids: &[SlotId<T>]) -> Option<Vec<&mut T>> {
+        if ids.iter().any(|&id| self.live(id).is_none()) {
+            return None;
+        }
+        let mut order: Vec<(Pos, usize)> = (0..)
+            .zip(ids)
+            .map(|(k, id)| ((id.chunk, id.index), k))
+            .collect();
+        order.sort_unstable();
+        let mut found: Vec<Option<&mut T>> = Vec::with_capacity(ids.len());
+        found.resize_with(ids.len(), || None);
+        let mut wanted = order.into_iter().peekable();
+        for (chunk, storage) in (0_u32..).zip(&mut self.chunks) {
+            let mut rest: &mut [T] = storage.as_deref_mut().unwrap_or_default();
+            // The index in the chunk of `rest`'s first slot.
+            let mut start = 0;
+            while let Some(((_, index), k)) = wanted.next_if(|&((c, _), _)| c == chunk) {
+                let at = usize::try_from(index.checked_sub(start)?).ok()?;
+                let (slot, tail) = std::mem::take(&mut rest).get_mut(at..)?.split_first_mut()?;
+                *found.get_mut(k)? = Some(slot);
+                rest = tail;
+                start = index + 1;
+            }
+        }
+        found.into_iter().collect()
+    }
+
     /// The slot's contents, or `None` for a stale handle.
     pub(crate) fn get_mut(&mut self, id: SlotId<T>) -> Option<&mut T> {
         self.live(id)?;
@@ -984,6 +1018,36 @@ mod tests {
     }
 
     #[test]
+    fn get_many_mut_borrows_each_slot_once_in_the_order_asked() {
+        let (mut pool, mut budget) = small(3, 3);
+        let ids: Vec<SlotId<Small>> = (0..8)
+            .map(|n| put(&mut pool, &mut budget, n, u64::from(n) * 10))
+            .collect();
+        // Out of slot order, across chunks.
+        let asked = [ids[5], ids[0], ids[7], ids[3], ids[4]];
+        let slots = pool.get_many_mut(&asked).unwrap();
+        let seen: Vec<u64> = slots.iter().map(|slot| slot[1]).collect();
+        assert_eq!(seen, [5, 0, 7, 3, 4], "each slot in the order asked");
+        for slot in slots {
+            slot[0] += 1;
+        }
+        for (n, &id) in (0_u32..).zip(&ids) {
+            let bumped = u64::from([5, 0, 7, 3, 4].contains(&n));
+            assert_eq!(pool.get(id).unwrap()[0], u64::from(n) * 10 + bumped, "slot {n}");
+        }
+        assert!(
+            pool.get_many_mut(&[ids[2], ids[6], ids[2]]).is_none(),
+            "a slot named twice is refused"
+        );
+        assert_eq!(pool.get_many_mut(&[]).map(|none| none.len()), Some(0), "none");
+        pool.remove(&key(1)).unwrap();
+        assert!(
+            pool.get_many_mut(&[ids[0], ids[1]]).is_none(),
+            "a stale handle is refused"
+        );
+    }
+
+    #[test]
     fn never_exceeds_the_budget() {
         let chunk = 4 * size_of::<EvaluatedSlot>();
         let mut budget = Budget::new(3 * chunk);
@@ -1084,7 +1148,7 @@ mod tests {
             ),
             "nothing to evict"
         );
-        for (n, &id) in (0..).zip(&ids) {
+        for (n, &id) in (0_u32..).zip(&ids) {
             assert_eq!(
                 pool.lookup(&key(n)),
                 Some((id, Freshness::Fresh)),
