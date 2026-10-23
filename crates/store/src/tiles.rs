@@ -2713,6 +2713,38 @@ impl TileStore {
         Ok(())
     }
 
+    /// Which of the tiles whose copies a flush couldn't encode (`broken`, each with the stamp of
+    /// the write its copy was taken at) are lost: those whose live slot is broken too (holds no
+    /// valid tile), or is still the copy that failed (dirty, its latest write the copy's). A
+    /// slot edited since holds a newer, valid tile: the failure (a transient compression error,
+    /// say) is no reason to drop it, and it stays dirty, in the flush mark, for the next flush
+    /// to try again. A slot clean or gone was written by someone else since, encoded: nothing is
+    /// lost.
+    pub(crate) fn left_out_at_reply(&self, broken: &[(TileKey, Stamp)]) -> Vec<TileKey> {
+        broken
+            .iter()
+            .filter(|&&(key, stamp)| {
+                let Some(id) = self
+                    .corrections
+                    .find(&key)
+                    .filter(|&id| self.corrections.is_dirty(id) == Some(true))
+                else {
+                    return false;
+                };
+                let invalid = self
+                    .corrections
+                    .get(id)
+                    .is_none_or(|slot| slot.to_tile().is_err());
+                let unchanged = self
+                    .unsaved
+                    .get(&key)
+                    .is_none_or(|write| write.stamp == stamp);
+                invalid || unchanged
+            })
+            .map(|&(key, _)| key)
+            .collect()
+    }
+
     /// Loses the `lost` tiles, whose copies didn't encode (see [`TileStore::lose_left_out`]),
     /// and makes unknown, in the save point of the flush in flight too, every bound their edits
     /// could have changed: the save point holds their older state. The unknown bounds are

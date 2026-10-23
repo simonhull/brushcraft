@@ -1010,6 +1010,60 @@ fn a_pinned_broken_slot_lost_to_a_roll_over_is_reloaded_in_place() {
     );
 }
 
+/// A copy that fails to encode loses its tile only if the slot is still what was copied.
+///
+/// Two tiles' copies fail as a transient compression error would. One is edited after the
+/// snapshot: its slot, valid and newer, stays dirty and reaches the next flush with both edits.
+/// The other, unchanged, is left out and reported.
+#[test]
+fn a_failed_encode_keeps_a_tile_edited_since_the_snapshot() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let (edited, unchanged) = (top[3], top[40]);
+    let mut map = CorrectionMap::new();
+    edit_interior(&mut store, &mut map, edited, Vec3::new(0.0, 0.0, 0.01));
+    edit_interior(
+        &mut store,
+        &mut CorrectionMap::new(),
+        unchanged,
+        Vec3::new(0.0, 0.01, 0.0),
+    );
+    writer.fail_encodes(2);
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    // After the snapshot, before its reply is handled.
+    store
+        .edit_tile(edited, |edit| edit.set(9, 4, Vec3::new(0.02, 0.0, 0.0)))
+        .unwrap()
+        .unwrap();
+    let region = Region::of_tile(&edited);
+    map.set(
+        mesh.topology(),
+        edited.face(),
+        edited.level(),
+        region.x0() + 9,
+        region.y0() + 4,
+        Vec3::new(0.02, 0.0, 0.0),
+    )
+    .unwrap();
+    settle(&mut writer, &mut store);
+    assert_eq!(
+        writer.take_skipped(),
+        [unchanged],
+        "only the unchanged tile is lost"
+    );
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    assert_eq!(writer.take_skipped(), [], "the edited tile flushes");
+    let offset = writer.durable_save_point().unwrap();
+    drop(writer);
+    drop(store);
+    assert_save_point(&path, offset, &mesh, &map);
+}
+
 /// A roll-over to a new recovery file carries every edit across, dirty or only in the file, and
 /// lists the one tile whose damaged record it cannot read; a flush in flight is abandoned.
 #[test]
