@@ -1232,6 +1232,12 @@ impl TileStore {
         !self.since_rebase.is_empty() || self.feed.has_pending(self.save_consumer)
     }
 
+    /// The base mesh the store's tiles subdivide: level 0 and the topology.
+    #[must_use]
+    pub fn mesh(&self) -> &BaseMesh {
+        &self.mesh
+    }
+
     /// The working file the store reads first and writes.
     pub(crate) const fn working(&self) -> &ProjectFile {
         &self.file

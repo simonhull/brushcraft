@@ -21,3 +21,7 @@ divan.workspace = true
 [[bench]]
 name = "recovery"
 harness = false
+
+[[bench]]
+name = "index"
+harness = false
