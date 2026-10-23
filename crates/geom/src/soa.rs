@@ -9,8 +9,7 @@
 //! Every operation does, on each vertex, exactly the `f32` operations `Vec3`'s does, in the same
 //! order and grouping, so vertex `k` of a result has the bits `Vec3` gives for vertex `k`'s
 //! inputs. Nothing is fused or reordered: Rust never contracts `a * b + c` into a fused
-//! multiply-add, and these loops never call `mul_add`. The generated code of the hot loops was
-//! checked for FMA instructions when this was written (M0c2 Task 4b).
+//! multiply-add, whatever the target, and these loops never call `mul_add`.
 
 use crate::Vec3;
 
@@ -125,14 +124,17 @@ mod tests {
     use crate::math::normalizable;
     use crate::test_rng::Rng;
 
-    /// Values that exercise every edge of the arithmetic: random, tiny, huge, zero, infinite, NaN.
+    /// Values that exercise every edge of the arithmetic: random, tiny, huge, zero, negative
+    /// zero, infinite, NaN.
     fn awkward(rng: &mut Rng, k: usize) -> Vec3 {
-        match k % 8 {
+        match k % 9 {
             0 => Vec3::ZERO,
             1 => Vec3::new(1e-30, -1e-25, 1e-38),
             2 => Vec3::new(3e18, -2e19, 1e19),
             3 => Vec3::new(f32::INFINITY, 0.0, 1.0),
             4 => Vec3::new(0.5, f32::NAN, 0.0),
+            5 => Vec3::new(-0.0, 0.5, -0.0),
+            6 => Vec3::new(-0.0, -0.0, -0.0),
             _ => rng.vec3(1.0),
         }
     }

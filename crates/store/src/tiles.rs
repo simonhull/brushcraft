@@ -865,10 +865,14 @@ impl PositionSource for Resident<'_> {
         self.positions(key)?.get(index).copied()
     }
 
-    /// The run copied a tile at a time: [`TileKey::containing`] keeps a vertex in the tile of
-    /// its column, up to the column before the next tile's first (which it gives to that tile),
-    /// so each tile's part of the run is one slice of its row.
+    /// The run copied a tile at a time, answering each vertex from the tile `position` would.
+    ///
+    /// [`TileKey::containing`] picks a vertex's tile column from its column alone: with `tq`
+    /// quads a tile, tile `tx` answers columns `tx·tq ..= tx·tq + tq − 1`, and its column `tq`
+    /// belongs to the next tile, except in the face's last tile, which answers it too. So each
+    /// tile's part of a run is one slice of its row.
     fn row(&self, face: FaceId, level: Level, i: u32, j: u32, out: &mut [Vec3]) -> Option<()> {
+        // Level 0 is the base mesh, not tiles: read one by one, as the trait's default does.
         if level == Level::ZERO {
             for (slot, x) in out.iter_mut().zip(i..) {
                 *slot = self.position(face, level, x, j)?;
@@ -880,8 +884,7 @@ impl PositionSource for Resident<'_> {
             let (key, li, lj) =
                 TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level, x, j)?;
             let side = key.side();
-            // Up to the tile's last column, which belongs to the next tile (or, at the face's
-            // far edge, is this one's alone).
+            // Up to column `tq - 1`, or just column `tq` in the face's last tile.
             let span = (side - 1).saturating_sub(li).max(1);
             let len = usize::try_from(span).ok()?.min(rest.len());
             let start = usize::try_from(lj * side + li).ok()?;

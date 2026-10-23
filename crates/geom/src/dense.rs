@@ -107,6 +107,9 @@ impl PositionSource for DenseEvaluation {
     }
 
     fn row(&self, face: FaceId, level: Level, i: u32, j: u32, out: &mut [Vec3]) -> Option<()> {
+        if out.is_empty() {
+            return Some(());
+        }
         out.copy_from_slice(self.grid(face, level)?.row(i, j, out.len())?);
         Some(())
     }
@@ -612,5 +615,47 @@ mod tests {
             "moved by the correction"
         );
         assert!((p1 - p0).dot(p0) > 0.0, "outward on a sphere");
+    }
+
+    /// A row read from the dense levels gives what single reads give, and refuses a run that
+    /// leaves the face; an empty run is available anywhere, as the trait's default says.
+    #[test]
+    fn rows_read_as_single_vertices() {
+        let mesh = cube_sphere(1).unwrap();
+        let level = Level::new(3).unwrap();
+        let eval = DenseEvaluation::new(&mesh, level, &CorrectionMap::new()).unwrap();
+        let n = level.face_quads();
+        for face in mesh.faces() {
+            for j in [0, 1, n / 2, n] {
+                for (i, len) in [(0, n + 1), (1, 3), (n - 2, 3), (n, 1)] {
+                    let mut row = vec![Vec3::ZERO; usize::try_from(len).unwrap()];
+                    eval.row(face, level, i, j, &mut row).unwrap();
+                    for (x, got) in (i..).zip(&row) {
+                        let want = eval.position(face, level, x, j).unwrap();
+                        assert_eq!(got.to_bits(), want.to_bits(), "{face:?} ({x}, {j})");
+                    }
+                }
+            }
+        }
+        let face = FaceId::new(0);
+        assert!(
+            eval.row(face, level, n, 0, &mut [Vec3::ZERO; 2]).is_none(),
+            "off the face"
+        );
+        assert!(
+            eval.row(face, level, 0, n + 1, &mut [Vec3::ZERO; 1])
+                .is_none(),
+            "past the last row"
+        );
+        assert!(
+            eval.row(face, level, n + 2, 0, &mut [Vec3::ZERO; 1])
+                .is_none(),
+            "past the last column"
+        );
+        assert!(
+            eval.row(FaceId::new(99), level, n + 5, n + 5, &mut [])
+                .is_some(),
+            "an empty run, anywhere"
+        );
     }
 }

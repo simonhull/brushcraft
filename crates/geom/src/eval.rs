@@ -23,14 +23,11 @@ pub trait PositionSource {
     fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3>;
 
     /// The positions of `out.len()` consecutive vertices of row `j` of `face` at `level`, from
-    /// column `i`: `out[k]` is [`PositionSource::position`] of `(i + k, j)`. `None` if any isn't
-    /// available, leaving `out` partly written.
+    /// column `i`: `out[k]` is exactly what [`PositionSource::position`] gives for `(i + k, j)`.
+    /// `None` if any isn't available, leaving `out` partly written; `Some` for an empty run.
     ///
     /// Evaluation reads the inside of a face a row at a time through this. The default reads
-    /// the vertices one by one; a source that keeps rows contiguous can copy them instead, as
-    /// long as it answers each vertex as `position` would ([`TileKey::containing`] picks a
-    /// vertex's tile column from its column alone, so a run splits into whole slices at tile
-    /// borders).
+    /// the vertices one by one; a source that keeps rows contiguous can copy them instead.
     fn row(&self, face: FaceId, level: Level, i: u32, j: u32, out: &mut [Vec3]) -> Option<()> {
         for (slot, x) in out.iter_mut().zip(i..) {
             *slot = self.position(face, level, x, j)?;
@@ -72,9 +69,13 @@ impl Grid {
             .copied()
     }
 
-    /// The `len` positions of row `j` from column `i`, or `None` if they run off the block.
-    #[must_use]
-    pub fn row(&self, i: u32, j: u32, len: usize) -> Option<&[Vec3]> {
+    /// The `len` positions of row `j` from column `i`, or `None` if a non-empty run leaves the
+    /// block. An empty run is `Some`, wherever it starts, as [`PositionSource::row`]'s default
+    /// gives.
+    pub(crate) fn row(&self, i: u32, j: u32, len: usize) -> Option<&[Vec3]> {
+        if len == 0 {
+            return Some(&[]);
+        }
         if i >= self.side || j >= self.side {
             return None;
         }
