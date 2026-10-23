@@ -108,7 +108,7 @@ pub(crate) struct CornerAxes<'a> {
 impl CornerAxes<'_> {
     /// The owner's first-edge direction and the ring normal, or [`Local::NonFinite`] if any input
     /// isn't finite.
-    fn local(&self) -> Local {
+    pub(crate) fn local(&self) -> Local {
         let finite = self.center.is_finite() && self.points.iter().all(|p| p.is_finite());
         let (Some(&e0), Some(&e1), true) = (self.points.first(), self.points.get(1), finite) else {
             return Local::NonFinite;
@@ -146,7 +146,7 @@ impl CornerAxes<'_> {
 
 /// What a vertex's frame and normal are built from.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Local {
+pub(crate) enum Local {
     /// Derivatives along the owner's u and v: the normal is `du × dv`.
     Derivatives {
         /// The derivative along the owner's u axis.
@@ -194,43 +194,46 @@ pub(crate) struct Block<'a> {
     pub(crate) quads: u32,
 }
 
-/// The [`Local`] axes at block vertex `(i, j)` of `grid`, in the owner's orientation: central
-/// differences, or the ring at a base vertex. `corners[c]` holds block corner `c`'s ring when it
-/// is a base vertex.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "grid math keeps the conventions' names: n, c, (i, j) and the axes (u, v)"
-)]
-fn derivatives(
-    block: &Block<'_>,
-    grid: &Padded,
-    corners: &[Option<CornerAxes<'_>>; 4],
-    i: i64,
-    j: i64,
-) -> Local {
+/// What the frame and normal at one block vertex read: the vertex's stencil.
+///
+/// Away from base vertices that is four grid neighbours, one step either way along the owner's
+/// two axes (never the vertex itself); at a base vertex, its ring. Which one is structural: it
+/// depends on the vertex's place on the face and the topology, never on positions. Partial
+/// normal updates ([`crate::eval::refresh_normals_into`]) use it to tell which vertices read a
+/// position that changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stencil {
+    /// A base vertex (a face corner) at block corner `c`, `0..4` in the order `(0, 0)`,
+    /// `(q, 0)`, `(q, q)`, `(0, q)`: it reads its ring.
+    Corner(usize),
+    /// Central differences along the grid steps `[u, v]`, the owner's `+i` and `+j` in this
+    /// block's grid: the vertex `(i, j)` reads `(i, j) ± u` and `(i, j) ± v`.
+    Axes([(i64, i64); 2]),
+    /// Off the face: there is nothing to read.
+    Outside,
+}
+
+/// The [`Stencil`] of block vertex `(i, j)`.
+pub(crate) fn stencil(block: &Block<'_>, i: i64, j: i64) -> Stencil {
     let n = block.face_quads;
     let (Ok(fi), Ok(fj)) = (
         u32::try_from(i64::from(block.x0) + i),
         u32::try_from(i64::from(block.y0) + j),
     ) else {
-        return Local::NonFinite;
+        return Stencil::Outside;
     };
     let on = |x: u32| x == 0 || x == n;
     if on(fi) && on(fj) {
         let q = i64::from(block.quads);
-        let c = match (i == q, j == q) {
+        return Stencil::Corner(match (i == q, j == q) {
             (false, false) => 0,
             (true, false) => 1,
             (true, true) => 2,
             (false, true) => 3,
-        };
-        return corners
-            .get(c)
-            .and_then(Option::as_ref)
-            .map_or(Local::NonFinite, CornerAxes::local);
+        });
     }
     let own = [(1, 0), (0, 1)];
-    let [u, v] = if on(fi) || on(fj) {
+    let axes = if on(fi) || on(fj) {
         let k = border_edge(fi, fj, n);
         match block.topology.across(block.face, k) {
             Some(across) if across.face < block.face => owner_axes(k, across.edge),
@@ -239,9 +242,43 @@ fn derivatives(
     } else {
         own
     };
-    let du = grid.get(i + u.0, j + u.1) - grid.get(i - u.0, j - u.1);
-    let dv = grid.get(i + v.0, j + v.1) - grid.get(i - v.0, j - v.1);
-    Local::Derivatives { du, dv }
+    Stencil::Axes(axes)
+}
+
+/// The derivatives from a [`Stencil::Axes`] stencil's four reads.
+///
+/// They are `du = plus_u − minus_u` and `dv = plus_v − minus_v`. Every caller computes them
+/// here, so a vertex gets the same bits however its reads were gathered.
+pub(crate) fn central([plus_u, minus_u, plus_v, minus_v]: [Vec3; 4]) -> Local {
+    Local::Derivatives {
+        du: plus_u - minus_u,
+        dv: plus_v - minus_v,
+    }
+}
+
+/// The [`Local`] axes at block vertex `(i, j)` of `grid`, in the owner's orientation: central
+/// differences, or the ring at a base vertex. `corners[c]` holds block corner `c`'s ring when it
+/// is a base vertex.
+fn derivatives(
+    block: &Block<'_>,
+    grid: &Padded,
+    corners: &[Option<CornerAxes<'_>>; 4],
+    i: i64,
+    j: i64,
+) -> Local {
+    match stencil(block, i, j) {
+        Stencil::Corner(c) => corners
+            .get(c)
+            .and_then(Option::as_ref)
+            .map_or(Local::NonFinite, CornerAxes::local),
+        Stencil::Axes([u, v]) => central([
+            grid.get(i + u.0, j + u.1),
+            grid.get(i - u.0, j - u.1),
+            grid.get(i + v.0, j + v.1),
+            grid.get(i - v.0, j - v.1),
+        ]),
+        Stencil::Outside => Local::NonFinite,
+    }
 }
 
 /// `f(i, j, local)` for every vertex of a block, row-major `(quads + 1)²`.
@@ -276,7 +313,7 @@ pub(crate) fn frames(
 
 /// The unit normal, with [`Frame::from_local`]'s policy: the fallback frame's normal where finite
 /// inputs are degenerate, NaN where any isn't finite.
-fn normal(local: Local) -> Vec3 {
+pub(crate) fn normal(local: Local) -> Vec3 {
     match local {
         Local::Derivatives { du, dv } if du.is_finite() && dv.is_finite() => du.cross(dv),
         Local::Ring { normal, .. } => normal,

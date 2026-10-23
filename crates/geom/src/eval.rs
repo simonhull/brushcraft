@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::frame::{self, Block, CornerAxes, Frame, frames};
+use crate::frame::{self, Block, CornerAxes, Frame, Stencil, frames};
 use crate::subdiv::{CornerRing, Padded, extraordinary, predict, ring_edge_point};
-use crate::topology::{corner_at, edge_to_grid};
+use crate::topology::{Ring, Topology, corner_at, edge_to_grid};
 use crate::{
     BaseMesh, Channel, FaceId, LayerId, Level, MAX_VALENCE, Region, TILE_QUADS, TileKey, Vec3,
 };
@@ -131,68 +131,195 @@ fn missing(face: FaceId, level: Level, i: i64, j: i64) -> EvalError {
     }
 }
 
+/// Reads one level's positions from a source the way evaluation does.
+///
+/// Every read goes to the vertex's owner copy, so all faces compute a shared vertex from the
+/// same inputs even if the source's twins disagree.
+///
+/// Both the full gather ([`gather`]) and the partial normal update ([`refresh_normals_into`])
+/// read through it, so a vertex's inputs are the same bits whichever computes it.
+struct Reader<'a, S> {
+    /// The mesh's topology: owner copies, neighbours across edges, base-vertex rings.
+    topology: &'a Topology,
+    /// Where positions come from.
+    src: &'a S,
+    /// The level read.
+    level: Level,
+    /// Quads per face side at `level`.
+    n: u32,
+}
+
+impl<'a, S: PositionSource> Reader<'a, S> {
+    /// A reader of `level` of `src` over `mesh`.
+    fn new(mesh: &'a BaseMesh, src: &'a S, level: Level) -> Self {
+        Self {
+            topology: mesh.topology(),
+            src,
+            level,
+            n: level.face_quads(),
+        }
+    }
+
+    /// The owner copy of face-grid vertex `(i, j)` of `f`.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError::Missing`] if `(i, j)` is off the face.
+    fn owner(&self, f: FaceId, i: i64, j: i64) -> Result<(FaceId, u32, u32), EvalError> {
+        let (Ok(ui), Ok(uj)) = (u32::try_from(i), u32::try_from(j)) else {
+            return Err(missing(f, self.level, i, j));
+        };
+        self.topology
+            .owner_copy(f, self.n, ui, uj)
+            .ok_or_else(|| missing(f, self.level, i, j))
+    }
+
+    /// The position of face-grid vertex `(i, j)` of `f`, read from its owner copy.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError::Missing`] if `(i, j)` is off the face or the source lacks the position.
+    fn fetch(&self, f: FaceId, i: i64, j: i64) -> Result<Vec3, EvalError> {
+        let (g, gi, gj) = self.owner(f, i, j)?;
+        self.src
+            .position(g, self.level, gi, gj)
+            .ok_or_else(|| missing(g, self.level, i64::from(gi), i64::from(gj)))
+    }
+
+    /// The tile a read of face-grid vertex `(i, j)` of `f` resolves to: [`TileKey::containing`]
+    /// of its owner copy, the tile a source answers it from.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError::Missing`] if `(i, j)` is off the face or no tile holds it.
+    fn tile(&self, f: FaceId, i: i64, j: i64) -> Result<TileKey, EvalError> {
+        let (g, gi, gj) = self.owner(f, i, j)?;
+        TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, g, self.level, gi, gj)
+            .map(|(key, _, _)| key)
+            .ok_or_else(|| missing(g, self.level, i64::from(gi), i64::from(gj)))
+    }
+
+    /// The position at point `(i, j)` of `face`'s grid, which may lie one step off the face
+    /// across an edge, or NaN where no vertex is there (diagonally off a corner): what a
+    /// [`Padded`] block holds at the point.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::fetch`].
+    fn at(&self, face: FaceId, i: i64, j: i64) -> Result<Vec3, EvalError> {
+        match self.topology.locate(face, self.n, i, j) {
+            Some((g, gi, gj)) => self.fetch(g, i64::from(gi), i64::from(gj)),
+            None => Ok(Vec3::NAN),
+        }
+    }
+
+    /// The tile [`Reader::at`] reads point `(i, j)` of `face`'s grid from, or `None` where it
+    /// reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::tile`].
+    fn tile_at(&self, face: FaceId, i: i64, j: i64) -> Result<Option<TileKey>, EvalError> {
+        self.topology
+            .locate(face, self.n, i, j)
+            .map(|(g, gi, gj)| self.tile(g, i64::from(gi), i64::from(gj)))
+            .transpose()
+    }
+
+    /// The ring around face-grid point `(fi, fj)` of `face` if it is a base vertex (a corner of
+    /// the face), with `center` as the vertex's own position, else `None`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::fetch`], for a ring point.
+    fn corner_ring(
+        &self,
+        face: FaceId,
+        (fi, fj): (i64, i64),
+        center: Vec3,
+    ) -> Result<Option<CornerRing>, EvalError> {
+        let Some(ring) = self.ring(face, (fi, fj)) else {
+            return Ok(None);
+        };
+        let Some(&(_, owner_corner)) = ring.entries.first() else {
+            return Ok(None);
+        };
+        let n64 = i64::from(self.n);
+        let mut corner = CornerRing::new(center, owner_corner);
+        for &(g, c) in &ring.entries {
+            let point = |s: i64, d: i64| {
+                let (gi, gj) = edge_to_grid(c, n64, s, d);
+                self.fetch(g, gi, gj)
+            };
+            corner.push(point(1, 0)?, point(1, 1)?);
+        }
+        Ok(Some(corner))
+    }
+
+    /// Whether a normal at base vertex `(fi, fj)` of `face` reads a tile `stale` names: the
+    /// tiles of its ring's edge points, which with the vertex itself are all a ring normal
+    /// reads. `false` if the point isn't a base vertex.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reader::tile`], for a ring point.
+    fn ring_reads(
+        &self,
+        face: FaceId,
+        (fi, fj): (i64, i64),
+        stale: impl Fn(&TileKey) -> bool,
+    ) -> Result<bool, EvalError> {
+        let Some(ring) = self.ring(face, (fi, fj)) else {
+            return Ok(false);
+        };
+        let n64 = i64::from(self.n);
+        for &(g, c) in &ring.entries {
+            let (gi, gj) = edge_to_grid(c, n64, 1, 0);
+            if stale(&self.tile(g, gi, gj)?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The topology's ring around face-grid point `(fi, fj)` of `face`, if it is a corner of
+    /// the face.
+    fn ring(&self, face: FaceId, (fi, fj): (i64, i64)) -> Option<&'a Ring> {
+        let n64 = i64::from(self.n);
+        let on = |x: i64| x == 0 || x == n64;
+        if !(on(fi) && on(fj)) {
+            return None;
+        }
+        let (ui, uj) = (u32::try_from(fi).ok()?, u32::try_from(fj).ok()?);
+        self.topology.ring(face, corner_at(ui, uj, self.n))
+    }
+}
+
 /// Gathers `region` (at its own level) with its one-vertex ring and base-vertex rings.
 ///
-/// Every position is read through one closure, as the owner's copy: [`parent_tiles`] runs this
-/// with a recording source, so what it lists is exactly what is read here.
+/// Every position is read through one [`Reader`], as the owner's copy: [`parent_tiles`] runs
+/// this with a recording source, so what it lists is exactly what is read here.
 ///
 /// # Errors
 ///
 /// [`EvalError::Missing`] if `src` lacks a needed position.
 fn gather(mesh: &BaseMesh, src: &impl PositionSource, region: Region) -> Result<Parent, EvalError> {
-    let topology = mesh.topology();
-    let level = region.level();
-    let n = level.face_quads();
-    let n64 = i64::from(n);
+    let reader = Reader::new(mesh, src, region.level());
     let q = i64::from(region.quads());
     let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
     let face = region.face();
-    // Every read goes to the owner's copy, so all faces predict a shared vertex from the same
-    // inputs even if the source's twins disagree.
-    let fetch = |f: FaceId, i: i64, j: i64| {
-        let (Ok(ui), Ok(uj)) = (u32::try_from(i), u32::try_from(j)) else {
-            return Err(missing(f, level, i, j));
-        };
-        let (g, gi, gj) = topology
-            .owner_copy(f, n, ui, uj)
-            .ok_or_else(|| missing(f, level, i, j))?;
-        src.position(g, level, gi, gj)
-            .ok_or_else(|| missing(g, level, i64::from(gi), i64::from(gj)))
-    };
     let mut padded = Padded::filled(region.quads(), Vec3::NAN);
     for j in -1..=q + 1 {
         for i in -1..=q + 1 {
-            if let Some((g, gi, gj)) = topology.locate(face, n, x0 + i, y0 + j) {
-                padded.set(i, j, fetch(g, i64::from(gi), i64::from(gj))?);
+            if let Some((g, gi, gj)) = reader.topology.locate(face, reader.n, x0 + i, y0 + j) {
+                padded.set(i, j, reader.fetch(g, i64::from(gi), i64::from(gj))?);
             }
         }
     }
     let mut corners: [Option<CornerRing>; 4] = [None, None, None, None];
-    let on = |x: i64| x == 0 || x == n64;
     for (slot, (ci, cj)) in corners.iter_mut().zip([(0, 0), (q, 0), (q, q), (0, q)]) {
-        let (fi, fj) = (x0 + ci, y0 + cj);
-        if !(on(fi) && on(fj)) {
-            continue;
-        }
-        let (Ok(ui), Ok(uj)) = (u32::try_from(fi), u32::try_from(fj)) else {
-            continue;
-        };
-        let Some(ring) = topology.ring(face, corner_at(ui, uj, n)) else {
-            continue;
-        };
-        let Some(&(_, owner_corner)) = ring.entries.first() else {
-            continue;
-        };
-        // Already read from the owner's copy, like every other input.
-        let mut corner = CornerRing::new(padded.get(ci, cj), owner_corner);
-        for &(g, c) in &ring.entries {
-            let point = |s: i64, d: i64| {
-                let (gi, gj) = edge_to_grid(c, n64, s, d);
-                fetch(g, gi, gj)
-            };
-            corner.push(point(1, 0)?, point(1, 1)?);
-        }
-        *slot = Some(corner);
+        // The centre was already read from the owner's copy, like every other input.
+        *slot = reader.corner_ring(face, (x0 + ci, y0 + cj), padded.get(ci, cj))?;
     }
     Ok(Parent { padded, corners })
 }
@@ -511,6 +638,121 @@ pub fn normals_into(
     };
     frame::normals(&block, &gathered.padded, &axes, out);
     Ok(())
+}
+
+/// Brings `region`'s normals in `out` up to date after positions outside the region changed.
+///
+/// Recomputes, in place, the normal of every vertex whose inputs include a position read from a
+/// tile `stale` names, and returns how many it recomputed.
+///
+/// `out` must hold the normals [`normals_into`] gave for the region from earlier positions
+/// that differ from `src`'s only in tiles `stale` names, and never at a vertex of the region
+/// itself. That is the case after an edit that moved vertices of neighbouring tiles but none of
+/// the region's own: a brush's neighbours, whose positions didn't change. Every normal is then
+/// the same bits a full [`normals_into`] from `src` gives.
+///
+/// Only the region's border can read a changed position. Inside, a vertex's central
+/// differences read its four grid neighbours, all vertices of the region; on the border they
+/// reach one vertex past it, into the apron, and at a base vertex (a face corner) the normal
+/// reads the vertex's whole ring, which at valence 5 or more reaches faces that touch the
+/// region only at the vertex. So the border vertices are visited, and each is recomputed if a
+/// read outside the region, or a ring point, resolves (through its owner copy, as every read
+/// does) to a tile `stale` names. Reads are resolved to [`TileKey::containing`]'s tile, as
+/// [`PositionSource`] answers them.
+///
+/// Only the positions of the vertices recomputed are read: their four neighbours, or their
+/// ring. Those must be resident in `src`.
+///
+/// # Errors
+///
+/// [`EvalError::BufferSize`] unless `out` holds exactly `(quads + 1)²` values, or
+/// [`EvalError::Missing`] if `src` lacks a position a recomputed normal reads.
+pub fn refresh_normals_into(
+    mesh: &BaseMesh,
+    src: &impl PositionSource,
+    region: Region,
+    stale: impl Fn(&TileKey) -> bool,
+    out: &mut [Vec3],
+) -> Result<usize, EvalError> {
+    let side = region.quads() + 1;
+    check_buffer(out, usize::try_from(side * side).unwrap_or(usize::MAX))?;
+    let reader = Reader::new(mesh, src, region.level());
+    let block = Block {
+        topology: mesh.topology(),
+        face: region.face(),
+        face_quads: region.level().face_quads(),
+        x0: region.x0(),
+        y0: region.y0(),
+        quads: region.quads(),
+    };
+    let face = region.face();
+    let q = i64::from(region.quads());
+    let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
+    let inside = |(i, j): (i64, i64)| (0..=q).contains(&i) && (0..=q).contains(&j);
+    let mut refreshed = 0;
+    for (i, j) in border(q) {
+        let local = match frame::stencil(&block, i, j) {
+            Stencil::Axes([u, v]) => {
+                let reads = [
+                    (i + u.0, j + u.1),
+                    (i - u.0, j - u.1),
+                    (i + v.0, j + v.1),
+                    (i - v.0, j - v.1),
+                ];
+                let mut changed = false;
+                for (a, b) in reads.into_iter().filter(|&read| !inside(read)) {
+                    if reader
+                        .tile_at(face, x0 + a, y0 + b)?
+                        .is_some_and(|key| stale(&key))
+                    {
+                        changed = true;
+                        break;
+                    }
+                }
+                if !changed {
+                    continue;
+                }
+                let mut values = [Vec3::NAN; 4];
+                for (value, (a, b)) in values.iter_mut().zip(reads) {
+                    *value = reader.at(face, x0 + a, y0 + b)?;
+                }
+                frame::central(values)
+            }
+            Stencil::Corner(_) => {
+                let at = (x0 + i, y0 + j);
+                if !reader.ring_reads(face, at, &stale)? {
+                    continue;
+                }
+                let center = reader.at(face, at.0, at.1)?;
+                match reader.corner_ring(face, at, center)? {
+                    Some(ring) => CornerAxes {
+                        center: ring.center,
+                        points: ring.edges(),
+                        owner_corner: ring.owner_corner,
+                    }
+                    .local(),
+                    None => frame::Local::NonFinite,
+                }
+            }
+            Stencil::Outside => continue,
+        };
+        let index = usize::try_from(j * i64::from(side) + i).unwrap_or(usize::MAX);
+        if let Some(slot) = out.get_mut(index) {
+            *slot = frame::normal(local);
+            refreshed += 1;
+        }
+    }
+    Ok(refreshed)
+}
+
+/// The border vertices of a block of `q` quads per side, each once: the bottom and top rows,
+/// then the left and right columns between them.
+fn border(q: i64) -> impl Iterator<Item = (i64, i64)> {
+    let rows = [0, q]
+        .into_iter()
+        .flat_map(move |j| (0..=q).map(move |i| (i, j)));
+    let columns = (1..q).flat_map(move |j| [(0, j), (q, j)]);
+    rows.chain(columns)
 }
 
 #[cfg(test)]
@@ -1257,6 +1499,145 @@ mod tests {
                 assert_eq!(bits(&out), bits(grid.as_slice()), "{region:?}");
             }
         }
+    }
+
+    /// `dense`, with every vertex read from a `stale` tile moved, except the vertices of
+    /// `region` itself: what positions look like after an edit of the region's neighbours.
+    struct Moved<'a> {
+        /// The positions before the edit.
+        dense: &'a DenseEvaluation,
+        /// The tiles whose vertices moved.
+        stale: &'a BTreeSet<TileKey>,
+        /// The region's own vertices, as owner copies: they never move.
+        own: BTreeSet<(FaceId, u32, u32)>,
+    }
+
+    impl<'a> Moved<'a> {
+        /// The positions of `dense` with the vertices of `stale` tiles moved, `region`'s kept.
+        fn new(
+            mesh: &BaseMesh,
+            dense: &'a DenseEvaluation,
+            stale: &'a BTreeSet<TileKey>,
+            region: Region,
+        ) -> Self {
+            let n = region.level().face_quads();
+            let own = (0..=region.quads())
+                .flat_map(|j| (0..=region.quads()).map(move |i| (i, j)))
+                .map(|(i, j)| {
+                    let (x, y) = (region.x0() + i, region.y0() + j);
+                    mesh.topology().owner_copy(region.face(), n, x, y).unwrap()
+                })
+                .collect();
+            Self { dense, stale, own }
+        }
+    }
+
+    impl PositionSource for Moved<'_> {
+        fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+            let p = self.dense.position(face, level, i, j)?;
+            let (key, _, _) =
+                TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level, i, j)?;
+            if !self.stale.contains(&key) || self.own.contains(&(face, i, j)) {
+                return Some(p);
+            }
+            // A different nudge per vertex, so no two reads cancel.
+            let h = (face.index() * 7919 + i * 131 + j * 31) % 97;
+            let step = 1e-3 * f32::from(u16::try_from(h + 1).unwrap()) / 97.0;
+            Some(p + Vec3::new(step, -0.5 * step, 0.25 * step))
+        }
+    }
+
+    /// Bit patterns of `values`, for comparing normals exactly.
+    fn bits(values: &[Vec3]) -> Vec<[u32; 3]> {
+        values.iter().map(|p| p.to_bits()).collect()
+    }
+
+    /// Asserts that refreshed normals equal a full recompute, for each region.
+    ///
+    /// Normals computed before the region's neighbours moved, refreshed after, equal a full
+    /// recompute after, bit for bit, whichever neighbours moved. Returns the vertices refreshed
+    /// and the vertices in all.
+    fn assert_refresh_equals_recompute(
+        mesh: &BaseMesh,
+        dense: &DenseEvaluation,
+        regions: &[Region],
+    ) -> (usize, usize) {
+        let (mut refreshed, mut total) = (0, 0);
+        for &region in regions {
+            let side = usize::try_from(region.quads() + 1).unwrap();
+            let own = TileKey::containing(
+                LayerId::BASE,
+                Channel::DISPLACEMENT,
+                region.face(),
+                region.level(),
+                region.x0() + 1,
+                region.y0() + 1,
+            )
+            .unwrap()
+            .0;
+            let mut neighbours = normal_tiles(mesh, region).unwrap();
+            neighbours.remove(&own);
+            // Every neighbour at once, then each on its own.
+            let sets = std::iter::once(neighbours.clone())
+                .chain(neighbours.iter().map(|&key| BTreeSet::from([key])));
+            for stale in sets {
+                let mut out = vec![Vec3::NAN; side * side];
+                normals_into(mesh, dense, region, &mut out).unwrap();
+                let moved = Moved::new(mesh, dense, &stale, region);
+                let mut want = vec![Vec3::NAN; side * side];
+                normals_into(mesh, &moved, region, &mut want).unwrap();
+                refreshed +=
+                    refresh_normals_into(mesh, &moved, region, |k| stale.contains(k), &mut out)
+                        .unwrap();
+                total += side * side;
+                assert_eq!(bits(&out), bits(&want), "{region:?}, {stale:?} moved");
+            }
+        }
+        (refreshed, total)
+    }
+
+    #[test]
+    fn refreshed_normals_equal_a_full_recompute() {
+        // Level-8 tiles at face corners (valence 3, 4 and 5), on face edges (their corners on
+        // the edge between two faces), and inside, and whole faces at levels 1 and 3.
+        let mesh = pentagonal_prism().subdivide().to_base_mesh();
+        let map = random_corrections(&mesh, 8, 800, 14);
+        let dense = DenseEvaluation::new(&mesh, level(8), &map).unwrap();
+        let mut regions = tiles_where(&mesh, level(8), |tx, ty| {
+            [0, 1, 3].contains(&tx) && [0, 2, 3].contains(&ty)
+        });
+        regions.extend(mesh.faces().map(|f| Region::whole_face(f, level(1))));
+        regions.extend(mesh.faces().map(|f| Region::whole_face(f, level(3))));
+        let (refreshed, total) = assert_refresh_equals_recompute(&mesh, &dense, &regions);
+        assert!(
+            refreshed > 0 && refreshed * 10 < total,
+            "only border vertices are recomputed: {refreshed} of {total}"
+        );
+    }
+
+    #[test]
+    fn refreshing_with_nothing_stale_changes_nothing() {
+        let mesh = pentagonal_prism().subdivide().to_base_mesh();
+        let dense = DenseEvaluation::new(&mesh, level(2), &CorrectionMap::new()).unwrap();
+        let region = Region::whole_face(FaceId::new(5), level(2));
+        let mut out = vec![Vec3::new(9.0, 9.0, 9.0); 25];
+        assert_eq!(
+            refresh_normals_into(&mesh, &dense, region, |_| false, &mut out),
+            Ok(0),
+            "nothing to recompute"
+        );
+        assert!(
+            out.iter().all(|&p| p == Vec3::new(9.0, 9.0, 9.0)),
+            "untouched"
+        );
+        assert_eq!(
+            refresh_normals_into(&mesh, &dense, region, |_| true, &mut out[..24]),
+            Err(EvalError::BufferSize {
+                expected: 25,
+                got: 24
+            }),
+            "a buffer of the wrong size"
+        );
     }
 
     #[test]

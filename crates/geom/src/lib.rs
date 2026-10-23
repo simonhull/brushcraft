@@ -23,7 +23,7 @@ pub use correction::{CorrectionError, CorrectionTile, CorrectionView, Correction
 pub use dense::{CorrectionMap, DenseEvaluation};
 pub use eval::{
     EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,
-    normals, normals_into, parent_tiles, predict_region,
+    normals, normals_into, parent_tiles, predict_region, refresh_normals_into,
 };
 pub use frame::Frame;
 pub use key::{

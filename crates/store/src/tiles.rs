@@ -24,7 +24,10 @@
 //! pinning each tile it makes and unpinning the level below once the level is done. At most two
 //! levels of the cone are pinned at once, and no level is wider than [`geom::cone_width`], so an
 //! evaluation pins at most twice that many evaluated tiles, whatever its depth. Normals are
-//! evaluated the same way, from the cone of the tiles they read.
+//! evaluated the same way, from the cone of the tiles they read. An edit that moves the
+//! positions a tile's normals read, but not the tile's own, leaves its normals stale rather than
+//! dropping them, and only the border vertices that read a moved position are recomputed (see
+//! [`crate::deps`]): after a brush step, that is all its neighbours need.
 //!
 //! The tiles of one cone level are independent of each other, so they are built in parallel,
 //! on the store's worker threads ([`StoreConfig::threads`]), in rounds of at most [`ROUND`]
@@ -95,7 +98,7 @@ use std::sync::Arc;
 use geom::{
     BaseMesh, Channel, CorrectionError, CorrectionView, EvalError, FaceId, LayerId, Level,
     MAX_COPIES, PositionSource, Region, TileKey, Vec3, normal_tiles, normals_into, parent_tiles,
-    predict_region,
+    predict_region, refresh_normals_into,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -462,8 +465,11 @@ type ConeLevel = BTreeMap<TileKey, Vec<TileKey>>;
 struct EvalLog {
     /// Tiles whose positions were computed, in order.
     positions: Vec<TileKey>,
-    /// Tiles whose normals were computed, in order.
+    /// Tiles whose normals were computed, in order, in full or brought up to date.
     normals: Vec<TileKey>,
+    /// Tiles whose stale normals were brought up to date (only the vertices reading a changed
+    /// input recomputed), in order: also in `normals`.
+    refreshed: Vec<TileKey>,
     /// Correction tiles the owner thread looked up in its files, in order (prefetch
     /// workers' reads aren't counted).
     file_reads: Vec<TileKey>,
@@ -710,6 +716,20 @@ fn each_parallel<T: Sync>(
         })
     };
     results.into_iter().collect()
+}
+
+/// The slot of `key` among the evaluated tiles an evaluation pinned.
+///
+/// # Errors
+///
+/// [`Invariant::StaleHandle`] if `key` isn't among them (the store asks only for tiles it
+/// pinned).
+fn held_slot(held: &Held, key: &TileKey) -> Result<SlotId<EvaluatedSlot>, Invariant> {
+    held.binary_search_by_key(key, |&(k, _)| k)
+        .ok()
+        .and_then(|at| held.get(at))
+        .map(|&(_, id)| id)
+        .ok_or(Invariant::StaleHandle)
 }
 
 /// The tiles `key`'s positions are predicted from, listed with [`parent_tiles`], level 0 (the
@@ -2565,16 +2585,20 @@ impl TileStore {
     }
 
     /// Drops every evaluation that followed from the `edited` tiles' corrections: positions
-    /// through the recorded parents, transitively, and normals that read any of them. A pinned
+    /// through the recorded parents, transitively, and the normals of those tiles. A pinned
     /// tile keeps its slot, marked stale, and is recomputed in place on its next evaluation.
+    ///
+    /// Normals that read a dropped tile's positions but whose own tile's positions stay are
+    /// kept, marked stale since the inputs that changed (see [`crate::deps`]): their next
+    /// computation recomputes only the vertices that read those.
     fn invalidate(&mut self, edited: impl IntoIterator<Item = TileKey>) {
         #[cfg(test)]
         {
             self.log.invalidations += 1;
         }
         let cascade = self.deps.cascade(edited);
-        for key in cascade.normals {
-            self.deps.drop_normals(key);
+        for (key, changed) in cascade.normals {
+            self.deps.stale_normals(key, changed);
         }
         for key in cascade.positions {
             match self.evaluated.invalidate(&key) {
@@ -2922,7 +2946,8 @@ impl TileStore {
     }
 
     /// The slot of `key`'s current positions and normals: cached, else the normals are computed
-    /// from the positions of its [`normal_tiles`], made current together as one cone.
+    /// (or, where they are stale, brought up to date) from the positions of its
+    /// [`normal_tiles`], made current together as one cone.
     ///
     /// # Errors
     ///
@@ -2942,6 +2967,12 @@ impl TileStore {
     /// reading its own inputs, while they are pinned (as [`TileStore::store_positions`]
     /// records positions).
     ///
+    /// A tile whose normals are stale (see [`crate::deps`]) has only the vertices that read a
+    /// changed input recomputed, with [`geom::refresh_normals_into`]: the border vertices next
+    /// to a neighbour the brush moved, which is the same bits as computing them all. Whether
+    /// they are stale is asked once the inputs are pinned: making them current may have evicted
+    /// the tile, or rebuilt its positions, and its stale normals went with them.
+    ///
     /// # Errors
     ///
     /// As [`TileStore::evaluate`]; nothing stays pinned then.
@@ -2959,15 +2990,23 @@ impl TileStore {
         }
         let inputs = self.normal_inputs_of_all(&wanted)?;
         let held = self.pin_current(inputs.iter().flatten().copied().collect())?;
-        let computed = self.normals_rounds(&wanted, &inputs, &held);
+        let stale: Vec<Option<BTreeSet<TileKey>>> = wanted
+            .iter()
+            .map(|key| self.deps.stale_inputs(key).cloned())
+            .collect();
+        let computed = self.normals_rounds(&wanted, &inputs, &stale, &held);
         let released = self.unpin_held(&held);
         computed?;
         released
     }
 
-    /// Computes the normals of `wanted` (each with its normal `inputs`, in the same order) from
-    /// `held`, every tile they read, pinned: on the workers, a round at a time, each round then
-    /// installed in order (see [`TileStore::store_normals`]).
+    /// Computes the normals of `wanted` (each with its normal `inputs` and, where its normals
+    /// are stale, the inputs they are stale since, in the same order) from `held`, every tile
+    /// they read, pinned: on the workers, a round at a time, each round then installed in order
+    /// (see [`TileStore::store_normals`]).
+    ///
+    /// A stale tile's normals are copied out of its slot into the scratch buffer and brought up
+    /// to date there by [`geom::refresh_normals_into`]; any other's are computed in full.
     ///
     /// # Errors
     ///
@@ -2976,28 +3015,54 @@ impl TileStore {
         &mut self,
         wanted: &[TileKey],
         inputs: &[BTreeSet<TileKey>],
+        stale: &[Option<BTreeSet<TileKey>>],
         held: &Held,
     ) -> Result<(), CacheError> {
         let mut scratch = self.take_scratch(wanted.len());
+        let tasks: Vec<(TileKey, Option<&BTreeSet<TileKey>>)> = wanted
+            .iter()
+            .copied()
+            .zip(stale.iter().map(Option::as_ref))
+            .collect();
         let outcome =
-            wanted
+            tasks
                 .chunks(ROUND)
                 .zip(inputs.chunks(ROUND))
                 .try_for_each(|(round, inputs)| {
                     let mesh = &*self.mesh;
+                    let pool = &self.evaluated;
                     let source = Resident {
                         mesh,
-                        pool: &self.evaluated,
+                        pool,
                         tiles: held,
                     };
-                    let compute = |key: &TileKey, out: &mut Vec<Vec3>| {
-                        let out = prefix_mut(out, vertex_count(key))?;
-                        normals_into(mesh, &source, Region::of_tile(key), out)?;
+                    let compute = |&(key, since): &(TileKey, Option<&BTreeSet<TileKey>>),
+                                   out: &mut Vec<Vec3>| {
+                        let n = vertex_count(&key);
+                        let out = prefix_mut(out, n)?;
+                        let region = Region::of_tile(&key);
+                        let Some(since) = since else {
+                            normals_into(mesh, &source, region, out)?;
+                            return Ok(());
+                        };
+                        let id = held_slot(held, &key)?;
+                        let slot = pool.get(id).ok_or(Invariant::StaleHandle)?;
+                        out.copy_from_slice(prefix(&slot.normals, n)?);
+                        refresh_normals_into(mesh, &source, region, |k| since.contains(k), out)?;
                         Ok(())
                     };
                     each_parallel(&self.workers, round, &mut scratch, compute)?;
+                    #[cfg(test)]
+                    self.log.refreshed.extend(
+                        round
+                            .iter()
+                            .filter(|(_, since)| since.is_some())
+                            .map(|&(key, _)| key),
+                    );
                     round.iter().zip(inputs).zip(&scratch).try_for_each(
-                        |((&key, inputs), normals)| self.store_normals(key, inputs, held, normals),
+                        |((&(key, _), inputs), normals)| {
+                            self.store_normals(key, inputs, held, normals)
+                        },
                     )
                 });
         self.scratch = scratch;
@@ -3018,12 +3083,7 @@ impl TileStore {
         held: &Held,
         normals: &[Vec3],
     ) -> Result<(), CacheError> {
-        let own = held
-            .binary_search_by_key(&key, |&(k, _)| k)
-            .ok()
-            .and_then(|at| held.get(at))
-            .map(|&(_, id)| id)
-            .ok_or(Invariant::StaleHandle)?;
+        let own = held_slot(held, &key)?;
         let n = vertex_count(&key);
         let slot = self.evaluated.get_mut(own).ok_or(Invariant::StaleHandle)?;
         prefix_mut(&mut slot.normals, n)?.copy_from_slice(prefix(normals, n)?);

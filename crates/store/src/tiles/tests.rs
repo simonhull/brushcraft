@@ -3,7 +3,7 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -455,13 +455,147 @@ fn edits_after_evaluation_invalidate_exactly() {
         readers.len(),
         "each recomputed once"
     );
+    let mut neighbours = readers.clone();
+    neighbours.remove(&edited);
+    assert_eq!(
+        store.log.refreshed.iter().copied().collect::<BTreeSet<_>>(),
+        neighbours,
+        "the neighbours' normals, whose own positions stayed, were brought up to date; the \
+         edited tile's were computed in full"
+    );
     assert_eq!(
         (
             store.log.normal_inputs_reused.get(),
             store.log.normal_inputs_listed.get()
         ),
-        (readers.len() - 1, 1),
-        "the neighbours' inputs were read back from the graph; the edited tile left it"
+        (readers.len(), 0),
+        "every input list was read back from the graph: the neighbours' stale normals kept the \
+         edited tile's node there"
+    );
+}
+
+/// Evaluated positions of whole tiles, each vertex answered from its containing tile: the
+/// source of a full recompute of normals, as the store's own pinned tiles serve them.
+struct Snapshot(BTreeMap<TileKey, Vec<Vec3>>);
+
+impl PositionSource for Snapshot {
+    fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+        let (key, li, lj) =
+            TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level, i, j)?;
+        let index = usize::try_from(lj * key.side() + li).ok()?;
+        self.0.get(&key)?.get(index).copied()
+    }
+}
+
+/// Asserts that the store's normals of every tile of `keys` (all of one level) are a full
+/// recompute's from its evaluated positions, bit for bit.
+fn assert_normals_recomputed(store: &mut TileStore, keys: &[TileKey], what: &str) {
+    let mesh = Arc::clone(&store.mesh);
+    let snapshot = Snapshot(
+        keys.iter()
+            .map(|&key| (key, store.evaluate(key).unwrap().to_vec()))
+            .collect(),
+    );
+    for &key in keys {
+        let recomputed = normals(&mesh, &snapshot, Region::of_tile(&key)).unwrap();
+        let got = store.normals(key).unwrap();
+        for (k, (have, want)) in got.iter().zip(recomputed.as_slice()).enumerate() {
+            assert_eq!(have.to_bits(), want.to_bits(), "{what}: {key:?} vertex {k}");
+        }
+    }
+}
+
+/// Every vertex of `face` at `level` within `reach` grid steps of `(ci, cj)` (a square, clipped
+/// to the face) gets a random correction: a dab, as the store sees it.
+fn square_dab(
+    store: &mut TileStore,
+    rng: &mut Rng,
+    face: FaceId,
+    level: Level,
+    (ci, cj): (u32, u32),
+    reach: u32,
+) {
+    let n = level.face_quads();
+    let span = |c: u32| c.saturating_sub(reach)..=(c + reach).min(n);
+    for j in span(cj) {
+        for i in span(ci) {
+            let c = rng.vec3(0.5 / f32::from(u16::try_from(n).unwrap()));
+            store.set_correction(face, level, i, j, c).unwrap();
+        }
+    }
+}
+
+#[test]
+fn stale_normals_brought_up_to_date_equal_a_full_recompute() {
+    // The subdivided pentagonal prism at level 7: four tiles a face, so every tile has a face
+    // corner (valence 3, 4 or 5) and two tile corners on face edges.
+    //
+    // A tile is only brought up to date when it holds no vertex a dab moved (one that does is
+    // recomputed in full), so the dabs that matter move vertices one step off another tile's
+    // border: a neighbour's apron. At a base vertex, they move a point of its ring but not the
+    // vertex itself; at valence 5, the ring reaches faces that touch the dab's only there.
+    let mesh = Arc::new(geom::fixtures::subdivided_pentagonal_prism().unwrap());
+    let top = level(7);
+    let n = top.face_quads();
+    let half = n / 2;
+    let all = tiles(&mesh, 7, 7);
+    let dabs: Vec<(u32, (u32, u32), u32)> = vec![
+        // Ring points of the caps' centres (valence 5), one on its own and one with the
+        // vertices next to it, but never the centre.
+        (5, (n - 1, n), 0),
+        (0, (n, n - 2), 1),
+        // A ring point of a corner of the prism (valence 3), and of a valence-4 vertex.
+        (0, (1, 0), 0),
+        (12, (n, 1), 0),
+        // One step off a tile corner on a face edge, across the edge from the next face, and
+        // along the edge from the next tile.
+        (12, (half, 1), 0),
+        (20, (1, half), 0),
+        (12, (half + 1, 0), 0),
+        // One step off a tile corner inside a face, along each border.
+        (25, (half + 1, half), 0),
+        (25, (half, half - 1), 0),
+        // Squares across tile borders and around a valence-5 centre.
+        (7, (half, 30), 3),
+        (3, (100, half + 1), 1),
+        (5, (n, n), 2),
+    ];
+    let dir = TestDir::new();
+    let dab_count = dabs.len();
+    let mut runs = Vec::new();
+    for threads in [
+        1,
+        thread::available_parallelism().map_or(1, NonZeroUsize::get),
+    ] {
+        let config = StoreConfig {
+            threads: NonZeroUsize::new(threads),
+            ..config(80, 16)
+        };
+        let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);
+        store.evaluate_many(&all, Evaluation::Normals).unwrap();
+        store.begin_op().unwrap();
+        let mut rng = Rng(21);
+        let random = (0..8).map(|_| {
+            let face = rng.below(mesh.face_count());
+            (face, (rng.below(n + 1), rng.below(n + 1)), rng.below(3))
+        });
+        let dabs: Vec<_> = dabs.iter().copied().chain(random).collect();
+        for (k, &(face, at, reach)) in dabs.iter().enumerate() {
+            square_dab(&mut store, &mut rng, FaceId::new(face), top, at, reach);
+            store.evaluate_many(&all, Evaluation::Normals).unwrap();
+            let what = format!("{threads} threads, dab {k} on face {face} at {at:?}");
+            assert_normals_recomputed(&mut store, &all, &what);
+        }
+        assert!(
+            store.log.refreshed.len() > 2 * dab_count,
+            "{threads} threads: neighbours were brought up to date, not recomputed: {}",
+            store.log.refreshed.len()
+        );
+        runs.push((store.log.normals.clone(), store.log.refreshed.clone()));
+    }
+    assert!(
+        runs.windows(2).all(|pair| pair[0] == pair[1]),
+        "the same tiles computed and refreshed whatever the thread count"
     );
 }
 

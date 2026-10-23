@@ -15,7 +15,10 @@
 //!    one of those, whose normal cones may have turned: the tiles each reached tile's normals read,
 //!    gathered from the base mesh's topology.
 //! 6. **Evaluate**: those tiles are evaluated again, positions and normals, together through
-//!    [`TileStore::evaluate_many`], which builds them in parallel.
+//!    [`TileStore::evaluate_many`], which builds them in parallel. A neighbour whose own positions
+//!    didn't move keeps its normals, stale, and only the border vertices that read a moved vertex
+//!    (its apron, and the rings of base vertices at its corners) are recomputed; the tiles that
+//!    moved are recomputed in full.
 //! 7. **Refit**: their bounds are recomputed and the index's tree refitted.
 //!
 //! Corrections live in each vertex's tangent frame `(t, b, n)` of the predicted surface, so a

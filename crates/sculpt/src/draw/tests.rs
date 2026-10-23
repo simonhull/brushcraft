@@ -9,7 +9,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use geom::{BaseMesh, CorrectionMap, DenseEvaluation, FaceId, Level, cube_sphere};
+use geom::{
+    BaseMesh, Channel, CorrectionMap, DenseEvaluation, FaceId, LayerId, Level, PositionSource,
+    cube_sphere, normals,
+};
 use store::{ProjectConfig, StoreConfig};
 
 use super::*;
@@ -395,6 +398,108 @@ fn a_step_at_a_valence_5_vertex_matches_dense_and_keeps_its_five_copies_in_step(
     project.end_stroke().unwrap();
     assert_twins(project.store(), level);
     assert_bounds_fresh(project.store(), &index);
+}
+
+/// Evaluated positions of whole tiles, each vertex answered from its containing tile: the
+/// source of a full recompute of normals.
+struct Snapshot(BTreeMap<TileKey, Vec<Vec3>>);
+
+impl PositionSource for Snapshot {
+    fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+        let (key, li, lj) =
+            TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level, i, j)?;
+        let index = usize::try_from(lj * key.side() + li).ok()?;
+        self.0.get(&key)?.get(index).copied()
+    }
+}
+
+/// Asserts that the store's normals of every tile of `level` are a full recompute's from its
+/// evaluated positions, bit for bit.
+fn assert_normals_recomputed(store: &mut TileStore, level: Level, what: &str) {
+    let mesh = store.mesh().clone();
+    let keys = tiles(&mesh, level);
+    let snapshot = Snapshot(
+        keys.iter()
+            .map(|&key| (key, store.evaluate(key).unwrap().to_vec()))
+            .collect(),
+    );
+    for key in keys {
+        let recomputed = normals(&mesh, &snapshot, Region::of_tile(&key)).unwrap();
+        let got = store.normals(key).unwrap();
+        for (k, (have, want)) in got.iter().zip(recomputed.as_slice()).enumerate() {
+            assert_eq!(have.to_bits(), want.to_bits(), "{what}: {key:?} vertex {k}");
+        }
+    }
+}
+
+#[test]
+fn normals_after_random_steps_equal_a_full_recompute_at_any_thread_count() {
+    // The subdivided pentagonal prism at level 7: every tile has a face corner, of valence 3, 4
+    // or 5, and tile corners on face edges. Small dabs near the corners and borders leave the
+    // neighbours' normals to be brought up to date from their aprons and corner rings.
+    let level = Level::new(7).unwrap();
+    let mesh = geom::fixtures::subdivided_pentagonal_prism().unwrap();
+    let n = level.face_quads();
+    let hardware = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let mut finals = Vec::new();
+    for threads in [1, hardware] {
+        let dir = TestDir::new();
+        let config = ProjectConfig {
+            store: StoreConfig {
+                budget_bytes: 64 << 20,
+                chunk_bytes: 1 << 20,
+                site: 1,
+                threads: std::num::NonZeroUsize::new(threads),
+            },
+            recovery_dir: dir.0.join("recovery"),
+        };
+        let mut project = Project::new(mesh.clone(), config).unwrap();
+        let mut index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
+        let mut seed: u32 = 7;
+        let mut next = |below: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % below
+        };
+        project.begin_stroke().unwrap();
+        for k in 0..10 {
+            // Near a face corner or a tile corner, a few vertices off it.
+            let face = next(mesh.face_count());
+            let corner = [0, n / 2, n][usize::try_from(next(3)).unwrap()];
+            let other = [0, n / 2, n][usize::try_from(next(3)).unwrap()];
+            let (i, j) = (
+                corner.abs_diff(next(4)).min(n),
+                other.abs_diff(next(4)).min(n),
+            );
+            let center = vertex_of(&mesh, level, face, i, j);
+            let radius = 0.004 + 0.002 * f32::from(u8::try_from(next(4)).unwrap());
+            let strength = if next(2) == 0 { 0.003 } else { -0.002 };
+            let params = DrawParams::new(center, radius, strength).unwrap();
+            draw_step(&mut project, &mut index, params).unwrap();
+            assert_normals_recomputed(
+                project.store(),
+                level,
+                &format!("{threads} threads, step {k} on face {face} near ({i}, {j})"),
+            );
+        }
+        project.end_stroke().unwrap();
+        let store = project.store();
+        let all: Vec<Vec<[u32; 3]>> = tiles(&mesh, level)
+            .into_iter()
+            .map(|key| {
+                store
+                    .normals(key)
+                    .unwrap()
+                    .iter()
+                    .map(|p| p.to_bits())
+                    .collect()
+            })
+            .collect();
+        finals.push(all);
+    }
+    assert!(
+        finals.windows(2).all(|pair| pair[0] == pair[1]),
+        "the same normals whatever the thread count"
+    );
 }
 
 #[test]

@@ -21,6 +21,16 @@
 //! them back instead of listing the tiles again ([`DepGraph::parents`],
 //! [`DepGraph::normal_inputs`]).
 //!
+//! # Stale normals
+//!
+//! An edit that changes the positions a tile's normals read, but not the tile's own positions,
+//! leaves most of those normals right: only the vertices whose inputs include a changed position
+//! are wrong, and they lie on the tile's border (see [`geom::refresh_normals_into`]). Such normals
+//! aren't dropped but marked *stale*, with the inputs whose positions changed. They keep their
+//! edges to every input, so a later edit of another input adds it to the list, and the store
+//! brings them up to date by recomputing just the vertices that read a listed input. An edit of
+//! the tile's own positions drops them as before.
+//!
 //! # Recording order
 //!
 //! A tile's positions must be recorded while its parents' nodes still hold their own parents:
@@ -30,7 +40,7 @@
 //! and every edit at a coarser level is taken to reach it (see [`DepGraph::cascade`]), so the
 //! graph over-invalidates rather than lose an edge.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use geom::{Level, TileKey};
 
@@ -51,8 +61,9 @@ struct Node {
     /// The same-level tiles its normals are computed from; `None` until they are first recorded.
     /// Kept when the normals are dropped: the list is structural.
     normal_inputs: Option<Vec<TileKey>>,
-    /// The slot holds normals computed from `normal_inputs`, which list it as a normal reader.
-    has_normals: bool,
+    /// What the slot holds for normals. Unless they are [`Normals::Absent`], they were computed
+    /// from `normal_inputs`, which list the tile as a normal reader.
+    normals: Normals,
     /// Tiles whose positions were predicted from this one's.
     readers: BTreeSet<TileKey>,
     /// Tiles whose normals were computed from this one's positions.
@@ -66,15 +77,37 @@ impl Node {
     }
 }
 
+/// The state of a tile's normals in its slot.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum Normals {
+    /// None worth keeping: never computed, or dropped.
+    #[default]
+    Absent,
+    /// Computed from the current positions of every input.
+    Current,
+    /// Computed from earlier positions of these inputs, and the current positions of every
+    /// other input, the tile itself included (see the module notes).
+    Stale(BTreeSet<TileKey>),
+}
+
+impl Normals {
+    /// Whether the slot holds normals computed from the recorded inputs, current or stale: the
+    /// inputs then list the tile as a normal reader.
+    fn is_held(&self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+}
+
 /// What an edit invalidates, as [`DepGraph::cascade`] finds it.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Cascade {
     /// Tiles whose positions no longer follow from their inputs: the edited tiles and everything
     /// predicted from them, transitively, cached or not.
     pub(crate) positions: BTreeSet<TileKey>,
-    /// Tiles whose normals were computed from any of those positions (positions dropped implies
-    /// normals dropped, so this includes every cached tile of `positions` with normals).
-    pub(crate) normals: BTreeSet<TileKey>,
+    /// Tiles whose normals were computed from any of those positions, each with the inputs of
+    /// its normals among them. A tile's own positions are among its inputs, so this includes
+    /// every tile of `positions` with normals, listing itself.
+    pub(crate) normals: BTreeMap<TileKey, BTreeSet<TileKey>>,
 }
 
 /// Recorded inputs of the cached evaluated tiles, with reverse edges.
@@ -155,12 +188,42 @@ impl DepGraph {
         }
         let node = self.node(key);
         node.normal_inputs = Some(inputs);
-        node.has_normals = true;
+        node.normals = Normals::Current;
     }
 
     /// Whether `key`'s slot holds current normals.
     pub(crate) fn has_normals(&self, key: &TileKey) -> bool {
-        self.nodes.get(key).is_some_and(|node| node.has_normals)
+        self.nodes
+            .get(key)
+            .is_some_and(|node| node.normals == Normals::Current)
+    }
+
+    /// The inputs whose positions changed since `key`'s normals were computed, if its slot holds
+    /// stale normals (see the module notes); `None` if they are current or absent.
+    pub(crate) fn stale_inputs(&self, key: &TileKey) -> Option<&BTreeSet<TileKey>> {
+        match &self.nodes.get(key)?.normals {
+            Normals::Stale(changed) => Some(changed),
+            Normals::Absent | Normals::Current => None,
+        }
+    }
+
+    /// Records that the positions of `changed`, inputs of `key`'s normals, changed: current
+    /// normals become stale since them, and stale ones add them to the inputs they are stale
+    /// since. If `key` is among them, its own positions changed, and its normals are dropped
+    /// instead. Absent normals stay absent.
+    pub(crate) fn stale_normals(&mut self, key: TileKey, changed: BTreeSet<TileKey>) {
+        if changed.contains(&key) {
+            self.drop_normals(key);
+            return;
+        }
+        let Some(node) = self.nodes.get_mut(&key) else {
+            return;
+        };
+        match &mut node.normals {
+            Normals::Absent => {}
+            Normals::Current => node.normals = Normals::Stale(changed),
+            Normals::Stale(since) => since.extend(changed),
+        }
     }
 
     /// Whether any node is untracked (see the module notes): an edit at any level may then
@@ -189,13 +252,17 @@ impl DepGraph {
         self.nodes.get(key)?.normal_inputs.as_deref()
     }
 
-    /// Forgets `key`'s normals: the slot's normals are no longer current. The list of their
-    /// inputs stays, for [`DepGraph::normal_inputs`].
+    /// Forgets `key`'s normals, current or stale: the slot's normals are no longer of use. The
+    /// list of their inputs stays, for [`DepGraph::normal_inputs`].
     pub(crate) fn drop_normals(&mut self, key: TileKey) {
-        let Some(own) = self.nodes.get_mut(&key).filter(|node| node.has_normals) else {
+        let Some(own) = self
+            .nodes
+            .get_mut(&key)
+            .filter(|node| node.normals.is_held())
+        else {
             return;
         };
-        own.has_normals = false;
+        own.normals = Normals::Absent;
         let inputs = own.normal_inputs.take().unwrap_or_default();
         for input in &inputs {
             if let Some(read) = self.nodes.get_mut(input) {
@@ -224,8 +291,9 @@ impl DepGraph {
     /// Everything an edit of the `edited` tiles' corrections invalidates: those tiles, then every
     /// tile recorded as predicted from an invalidated one (cached or not, since the walk must
     /// reach cached descendants of evicted tiles), then the normals of every tile recorded as
-    /// reading an invalidated tile's positions. An untracked node (see the module notes) finer
-    /// than the coarsest edited tile is taken to be predicted from it. The graph isn't changed.
+    /// reading an invalidated tile's positions (current or stale), with the invalidated tiles
+    /// each reads. An untracked node (see the module notes) finer than the coarsest edited tile
+    /// is taken to be predicted from it. The graph isn't changed.
     pub(crate) fn cascade(&self, edited: impl IntoIterator<Item = TileKey>) -> Cascade {
         let mut cascade = Cascade::default();
         // Readers are one level finer, so a set ordered by level finishes each level before
@@ -248,7 +316,9 @@ impl DepGraph {
                 continue;
             };
             queue.extend(node.readers.iter().map(|r| (r.level(), *r)));
-            cascade.normals.extend(node.normal_readers.iter().copied());
+            for &reader in &node.normal_readers {
+                cascade.normals.entry(reader).or_default().insert(key);
+            }
         }
         cascade
     }
@@ -334,7 +404,12 @@ impl DepGraph {
                     format!("{reader:?} doesn't list its parent {key:?}")
                 })?;
             }
-            for input in n.normal_inputs.iter().flatten().filter(|_| n.has_normals) {
+            for input in n
+                .normal_inputs
+                .iter()
+                .flatten()
+                .filter(|_| n.normals.is_held())
+            {
                 let readers = &node(input, key, "normal input")?.normal_readers;
                 check(readers.contains(key), || {
                     format!("{input:?} doesn't list its normal reader {key:?}")
@@ -344,7 +419,7 @@ impl DepGraph {
                 let reader_node = node(reader, key, "normal reader")?;
                 let inputs = reader_node.normal_inputs.iter().flatten();
                 check(
-                    reader_node.has_normals && inputs.into_iter().any(|i| i == key),
+                    reader_node.normals.is_held() && inputs.into_iter().any(|i| i == key),
                     || format!("{reader:?} doesn't list its normal input {key:?}"),
                 )?;
             }
@@ -413,12 +488,16 @@ mod tests {
         assert_eq!(cascade.positions, set([p, x]), "x's positions");
         assert_eq!(
             cascade.normals,
-            set([x, y]),
-            "every tile whose normals read x"
+            BTreeMap::from([(x, set([x])), (y, set([x]))]),
+            "every tile whose normals read x, with x"
         );
         let finest = graph.cascade([z]);
         assert_eq!(finest.positions, set([z]), "nothing reads z's positions");
-        assert_eq!(finest.normals, set([y, z]), "but y's and z's normals do");
+        assert_eq!(
+            finest.normals,
+            BTreeMap::from([(y, set([z])), (z, set([z]))]),
+            "but y's and z's normals do"
+        );
     }
 
     #[test]
@@ -495,6 +574,38 @@ mod tests {
         graph.left_pool(p);
         graph.check_invariants().unwrap();
         assert_eq!(graph.cascade([g]).positions, set([g, p, c]), "through p");
+    }
+
+    #[test]
+    fn normals_go_stale_since_the_inputs_that_changed() {
+        let mut graph = DepGraph::new();
+        let (x, y, z) = (key(1, 0), key(1, 1), key(1, 2));
+        for k in [x, y, z] {
+            graph.record_positions(k, &[]);
+        }
+        graph.record_normals(x, &[x, y, z]);
+        assert_eq!(graph.stale_inputs(&x), None, "current");
+        graph.stale_normals(x, set([y]));
+        assert!(!graph.has_normals(&x), "no longer current");
+        assert_eq!(graph.stale_inputs(&x), Some(&set([y])), "stale since y");
+        graph.left_pool(z);
+        graph.check_invariants().unwrap();
+        assert_eq!(graph.len(), 3, "stale normals still read z");
+        assert_eq!(
+            graph.cascade([z]).normals,
+            BTreeMap::from([(x, set([z]))]),
+            "and an edit of z still reaches them"
+        );
+        graph.stale_normals(x, set([z]));
+        assert_eq!(graph.stale_inputs(&x), Some(&set([y, z])), "since y and z");
+        graph.record_normals(x, &[x, y, z]);
+        assert!(graph.has_normals(&x), "brought up to date");
+        graph.stale_normals(x, set([y, x]));
+        assert_eq!(graph.stale_inputs(&x), None, "x's own positions changed");
+        assert!(!graph.has_normals(&x), "so its normals are dropped");
+        graph.stale_normals(x, set([y]));
+        assert_eq!(graph.stale_inputs(&x), None, "absent normals stay absent");
+        graph.check_invariants().unwrap();
     }
 
     #[test]
