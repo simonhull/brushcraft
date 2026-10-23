@@ -209,22 +209,48 @@ impl SpatialIndex {
     }
 
     /// Re-evaluates the tiles `keys` (after edits), together with
-    /// [`TileStore::evaluate_many`], and refits the tree to their new bounds.
+    /// [`TileStore::evaluate_many`], and refits the tree to their new bounds (see
+    /// [`SpatialIndex::refit`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`SpatialIndex::refit`]. The index is unchanged on error.
+    pub fn update(&mut self, store: &mut TileStore, keys: &[TileKey]) -> Result<(), IndexError> {
+        self.check_known(keys)?;
+        store.evaluate_many(keys, Evaluation::Normals)?;
+        self.refit(store, keys)
+    }
+
+    /// Refits the tree to the bounds of the tiles `keys` as the store evaluates them now.
+    ///
+    /// For a caller that has made them current itself, with [`TileStore::evaluate_many`]: their
+    /// positions and normals are then read from the store's cache. A tile that isn't current is
+    /// evaluated on its own, one at a time; [`SpatialIndex::update`] makes them all current
+    /// together first.
     ///
     /// # Errors
     ///
     /// As [`SpatialIndex::bounds_of`]; [`IndexError::UnknownTile`] for a tile not in the index.
     /// The index is unchanged on error.
-    pub fn update(&mut self, store: &mut TileStore, keys: &[TileKey]) -> Result<(), IndexError> {
-        if let Some(&key) = keys.iter().find(|k| self.bvh.bounds(k).is_none()) {
-            return Err(IndexError::UnknownTile(key));
-        }
-        store.evaluate_many(keys, Evaluation::Normals)?;
+    pub fn refit(&mut self, store: &mut TileStore, keys: &[TileKey]) -> Result<(), IndexError> {
+        self.check_known(keys)?;
         let changed = keys
             .iter()
             .map(|&key| Ok((key, Self::bounds_of(store, key)?)))
             .collect::<Result<Vec<_>, IndexError>>()?;
         self.bvh.refit(&changed)
+    }
+
+    /// Checks that every tile of `keys` is in the index.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::UnknownTile`] for the first that isn't.
+    fn check_known(&self, keys: &[TileKey]) -> Result<(), IndexError> {
+        match keys.iter().find(|k| self.bvh.bounds(k).is_none()) {
+            Some(&key) => Err(IndexError::UnknownTile(key)),
+            None => Ok(()),
+        }
     }
 
     /// The level whose tiles the index holds.

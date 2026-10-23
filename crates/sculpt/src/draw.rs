@@ -283,7 +283,8 @@ pub fn draw_step(
     store.evaluate_many(&changed, Evaluation::Normals)?;
     times.evaluate = laps.lap();
 
-    index.update(store, &changed)?;
+    // The tiles were made current together just above: the refit reads them from the cache.
+    index.refit(store, &changed)?;
     times.refit = laps.lap();
     drop(pins);
 
