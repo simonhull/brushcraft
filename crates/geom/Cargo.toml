@@ -9,6 +9,11 @@ description = "Base mesh, Catmull–Clark subdivision, correction pyramid, tile 
 [lints]
 workspace = true
 
+[features]
+# Meshes for the tests of the crates above (`geom::fixtures`), turned on in their
+# dev-dependencies only, so release builds never compile them.
+test-fixtures = []
+
 [dependencies]
 bytemuck.workspace = true
 thiserror.workspace = true

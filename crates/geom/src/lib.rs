@@ -5,6 +5,8 @@
 mod correction;
 mod dense;
 mod eval;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixtures;
 mod frame;
 mod key;
 mod math;
