@@ -186,6 +186,23 @@ impl<'a, S: PositionSource> Reader<'a, S> {
             .ok_or_else(|| missing(g, self.level, i64::from(gi), i64::from(gj)))
     }
 
+    /// The position of face-grid vertex `(i, j)` of `face`, which the caller knows is its own
+    /// owner copy (strictly inside a face of the mesh): [`Reader::fetch`] without the lookup.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError::Missing`] if `(i, j)` is off the face or the source lacks the position.
+    fn fetch_own(&self, face: FaceId, i: i64, j: i64) -> Result<Vec3, EvalError> {
+        let missing = || missing(face, self.level, i, j);
+        let (ui, uj) = (u32::try_from(i), u32::try_from(j));
+        let (Ok(ui), Ok(uj)) = (ui, uj) else {
+            return Err(missing());
+        };
+        self.src
+            .position(face, self.level, ui, uj)
+            .ok_or_else(missing)
+    }
+
     /// The tile a read of face-grid vertex `(i, j)` of `f` resolves to: [`TileKey::containing`]
     /// of its owner copy, the tile a source answers it from.
     ///
@@ -313,11 +330,21 @@ pub(crate) fn gather(
     let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
     let face = region.face();
     let mut padded = Padded::filled(region.quads(), Vec3::NAN);
+    // Strictly inside a face of the mesh, a point is its own owner copy: read it straight away.
+    let n = i64::from(reader.n);
+    let own = |x: i64| (1..n).contains(&x);
+    let on_mesh = reader.topology.contains(face);
     for j in -1..=q + 1 {
-        for i in -1..=q + 1 {
-            if let Some((g, gi, gj)) = reader.topology.locate(face, reader.n, x0 + i, y0 + j) {
-                padded.set(i, j, reader.fetch(g, i64::from(gi), i64::from(gj))?);
-            }
+        let y = y0 + j;
+        for (x, slot) in (x0 - 1..).zip(padded.row_mut(j)) {
+            *slot = if on_mesh && own(x) && own(y) {
+                reader.fetch_own(face, x, y)?
+            } else {
+                match reader.topology.locate(face, reader.n, x, y) {
+                    Some((g, gi, gj)) => reader.fetch(g, i64::from(gi), i64::from(gj))?,
+                    None => Vec3::NAN,
+                }
+            };
         }
     }
     let mut corners: [Option<CornerRing>; 4] = [None, None, None, None];

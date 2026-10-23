@@ -49,7 +49,7 @@ impl Padded {
     }
 
     /// Row `j` (`-1 ..= quads + 1`) with its ring, writable: as [`Padded::row`].
-    fn row_mut(&mut self, j: i64) -> &mut [Vec3] {
+    pub(crate) fn row_mut(&mut self, j: i64) -> &mut [Vec3] {
         let side = usize::try_from(self.quads)
             .unwrap_or(usize::MAX)
             .saturating_add(3);
