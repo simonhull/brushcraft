@@ -2,7 +2,8 @@
 //!
 //! Every durable save point holds the edits up to its snapshot; ticks pace the flushes; edits
 //! made while a flush is in flight reach the next one; a drop mid-flush is prompt and leaves a
-//! file that opens; a failed sync is reported and leaves no save point.
+//! file that opens; a failed sync is reported and leaves no save point; ticked, a flush's snapshot
+//! stays proportional to the tiles dirtied per interval.
 
 use super::*;
 use crate::recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
@@ -49,6 +50,11 @@ fn dab_interior(store: &mut TileStore, map: &mut CorrectionMap, key: TileKey, c:
     .unwrap();
 }
 
+/// Every stroke end yields a durable save point holding exactly the edits so far.
+///
+/// Three strokes under a roomy budget and a tight one (where evaluation writes dirty tiles back,
+/// so streamed and written-back records interleave): one flush per stroke, nothing left dirty
+/// after each, and every save point, reopened, evaluates as the dense evaluation of its edits.
 #[test]
 fn a_stroke_end_yields_a_save_point_equal_to_the_edits_so_far() {
     for (name, config) in [("roomy", roomy()), ("tight", tight())] {
@@ -85,6 +91,11 @@ fn a_stroke_end_yields_a_save_point_equal_to_the_edits_so_far() {
     }
 }
 
+/// Records appended while the tiles sync are synced again before the save point.
+///
+/// Write-backs during the tile sync grow the file past what that sync covers, so the flush syncs
+/// once more before writing its save point. The save point still holds only the edits at its
+/// cut, and the written-back edits land in the next one.
 #[test]
 fn records_appended_while_the_tiles_sync_are_synced_before_the_save_point() {
     let dir = TestDir::new();
@@ -120,6 +131,11 @@ fn records_appended_while_the_tiles_sync_are_synced_before_the_save_point() {
     assert_save_point(&path, second, &mesh, &map);
 }
 
+/// Ticks during a ten-second stroke of one op flush about once a second.
+///
+/// A tick every 100 ms: the flushes are at least [`FLUSH_INTERVAL`] apart and at most a tick
+/// late. The stroke's tail is flushed by the next due tick; with nothing edited since, neither a
+/// tick nor a stroke end writes anything.
 #[test]
 fn a_long_stroke_flushes_about_once_a_second() {
     let dir = TestDir::new();
@@ -182,6 +198,12 @@ fn a_long_stroke_flushes_about_once_a_second() {
     );
 }
 
+/// Edits made while a flush is in flight land in the next flush, never lost and never doubled.
+///
+/// Tiles edited during each phase (encoding, tile sync, save point sync) stay dirty and reach
+/// the queued flush, which starts as soon as the first is durable; each flush appends each of
+/// its tiles once, a tile's latest record carries its latest edit, and both save points reopen
+/// to the state at their cuts.
 #[test]
 fn edits_during_a_flush_land_in_the_next_one_never_lost_never_doubled() {
     let dir = TestDir::new();
@@ -281,6 +303,11 @@ fn edits_during_a_flush_land_in_the_next_one_never_lost_never_doubled() {
     assert_save_point(&path, second, &mesh, &map);
 }
 
+/// Dropping the writer in any phase of a flush joins its thread promptly, and the file reopens.
+///
+/// For each phase, the drop takes under a second and leaves no thread behind; the file opens at
+/// its last durable save point, and its latest state is that save point, or the flush's own if
+/// its save point was already written.
 #[test]
 fn dropping_the_writer_mid_flush_joins_promptly_and_the_file_reopens() {
     let (done, finished) = mpsc::channel();
@@ -348,6 +375,11 @@ fn dropping_the_writer_mid_flush_joins_promptly_and_the_file_reopens() {
         .expect("the writer dropped in time (a panic on its thread shows above)");
 }
 
+/// A failed sync, of the tiles or of the save point, fails the writer for good.
+///
+/// The failure is reported as a sync error where the hook made it fail; no save point is written
+/// over tiles whose sync failed; every later trigger asks for a new file and writes nothing; and
+/// the file still opens at its last durable save point.
 #[test]
 fn a_failed_sync_fails_the_writer_and_leaves_the_last_durable_save_point() {
     // The tile sync fails (the first of the flush), then the save point's (the second).
@@ -433,6 +465,10 @@ fn a_failed_sync_fails_the_writer_and_leaves_the_last_durable_save_point() {
     }
 }
 
+/// A failed sync is reported by whichever call advances the flush to it.
+///
+/// That is [`RecoveryWriter::poll`] or [`RecoveryWriter::finish`]. Closing the failed writer says
+/// it needs a new file, and unsubscribes it all the same.
 #[test]
 fn a_failed_sync_surfaces_through_poll_and_finish() {
     for through in ["finish", "poll"] {
@@ -478,6 +514,8 @@ fn a_failed_sync_surfaces_through_poll_and_finish() {
     }
 }
 
+/// A sync that fails with a flush queued behind it settles the writer as failed in a few steps:
+/// the queued flush is dropped rather than retried against the failed file.
 #[test]
 fn a_failed_sync_with_a_flush_queued_does_not_spin() {
     let dir = TestDir::new();
@@ -725,6 +763,8 @@ fn every_save_point_is_its_snapshot_and_every_cut_opens_at_one() {
     assert!(ends.len() > 100, "{} record boundaries", ends.len());
 }
 
+/// A store save is refused while a recovery writer streams from it, writing nothing; once the
+/// writer is closed, the save goes through.
 #[test]
 fn a_store_save_is_refused_while_a_writer_streams() {
     let dir = TestDir::new();
@@ -744,6 +784,11 @@ fn a_store_save_is_refused_while_a_writer_streams() {
     store.save().unwrap();
 }
 
+/// Broken slots are left out of a flush and reported once; every other tile still flushes.
+///
+/// One slot is dirty with no op, another holds no valid tile. Every other tile reaches the save
+/// point, and the broken ones are dropped from the flush mark, so later flushes never stall on
+/// them.
 #[test]
 fn a_broken_slot_is_reported_and_the_rest_still_flush() {
     let dir = TestDir::new();
@@ -787,6 +832,8 @@ fn a_broken_slot_is_reported_and_the_rest_still_flush() {
     assert_save_point(&path, offset, &mesh, &map);
 }
 
+/// A roll-over to a new recovery file carries every edit across, dirty or only in the file, and
+/// lists the one tile whose damaged record it cannot read; a flush in flight is abandoned.
 #[test]
 fn a_roll_over_carries_every_edit_and_lists_what_it_cannot_read() {
     let dir = TestDir::new();
@@ -876,4 +923,71 @@ fn a_roll_over_labels_an_unreadable_clean_tile_with_its_own_op() {
     store.evict_all().unwrap();
     assert_positions(&mut store, &dense(&mesh, &map), &top, "carried across");
     writer.close(&mut store, Instant::now()).unwrap();
+}
+
+/// With a tick every 100 ms during a long stroke, the peak snapshot is the tiles dirtied per
+/// flush interval, not the stroke.
+///
+/// One op dabs `PER_TICK` fresh tiles per tick until it has dirtied every top-level tile. Ticked,
+/// each flush snapshots about a second's worth of tiles, and the peak bytes in flight to the
+/// writer stay within an interval's dabs. The same stroke with no tick snapshots every tile it
+/// dirtied at its end, all at once.
+#[test]
+fn ticks_bound_a_long_strokes_snapshot_to_the_tiles_of_one_interval() {
+    /// Fresh tiles each tick dabs.
+    const PER_TICK: usize = 2;
+    /// The time between ticks.
+    const TICK: Duration = Duration::from_millis(100);
+    /// The bytes of one tile's snapshot: a correction slot's copy.
+    const SLOT: usize = size_of::<CorrectionSlot>();
+    let ticks_per_interval =
+        usize::try_from(FLUSH_INTERVAL.as_millis() / TICK.as_millis()).unwrap();
+    let mesh = mesh();
+    let top = tiles(&mesh, TOP, TOP);
+    assert!(
+        top.len() >= 4 * ticks_per_interval * PER_TICK,
+        "the stroke spans at least four intervals: {} tiles",
+        top.len()
+    );
+    let mut peaks = Vec::new();
+    for ticked in [true, false] {
+        let dir = TestDir::new();
+        let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+        let mut writer = RecoveryWriter::new(&mut store).unwrap();
+        let mut map = CorrectionMap::new();
+        let start = Instant::now();
+        store.begin_op().unwrap();
+        for (n, keys) in (1..).zip(top.chunks(PER_TICK)) {
+            for (k, key) in keys.iter().enumerate() {
+                let c = Vec3::new(0.0, 1e-3 * f32::from(u8::try_from(k + 1).unwrap()), 0.0);
+                dab_interior(&mut store, &mut map, *key, c);
+            }
+            if ticked {
+                writer.tick(&mut store, start + TICK * n).unwrap();
+                settle(&mut writer, &mut store);
+            }
+        }
+        writer
+            .end_stroke(&mut store, start + FLUSH_INTERVAL * 100)
+            .unwrap();
+        settle(&mut writer, &mut store);
+        assert!(
+            store.unsaved.is_empty(),
+            "ticked {ticked}: every edit is in the file"
+        );
+        peaks.push(writer.peak_snapshot_bytes());
+    }
+    let (ticked, unticked) = (peaks[0], peaks[1]);
+    assert!(ticked > 0, "the ticked stroke snapshotted something");
+    assert!(
+        ticked <= ticks_per_interval * PER_TICK * SLOT,
+        "ticked: the peak, {} tiles, is at most an interval's dabs ({} tiles)",
+        ticked / SLOT,
+        ticks_per_interval * PER_TICK
+    );
+    assert_eq!(
+        unticked,
+        top.len() * SLOT,
+        "never ticked: one snapshot of every tile the stroke dirtied"
+    );
 }

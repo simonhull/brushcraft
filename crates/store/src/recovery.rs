@@ -23,6 +23,21 @@
 //! The owner advances the phases in [`RecoveryWriter::poll`], which the app calls from its frame
 //! loop (and every trigger calls first); it never blocks there.
 //!
+//! # Memory
+//!
+//! A flush's snapshot is the one copy it makes outside the tile pool's budget: a slot copy for
+//! every tile dirtied since the previous flush, 26.9 KB each, held until the writer thread has
+//! encoded them. The app bounds it by calling [`RecoveryWriter::tick`] regularly, every frame: a
+//! tick starts a flush once [`FLUSH_INTERVAL`] has passed since the last, so each snapshot holds
+//! about a second of edits however long the stroke runs. A caller that never ticks gets one large
+//! snapshot at [`RecoveryWriter::end_stroke`], of every tile the stroke dirtied: for a stroke over
+//! a whole level, gigabytes.
+//!
+//! The snapshot is taken whole, at the cut, because the save point names the state at that one
+//! cut. A later option would bound the memory without relying on the tick and without changing
+//! the cut rules: copy-on-write cuts, fixed at the trigger, where a slot dirty at the cut is
+//! copied only if an edit is about to change it before the writer has taken it.
+//!
 //! # Ordering
 //!
 //! A save point is written only after a sync that began after every record it names was
@@ -153,6 +168,10 @@ struct Hooks {
     /// Syncs still to fail once the passing ones have run, counting down: each fails with an
     /// I/O error instead of syncing.
     failing_syncs: std::sync::atomic::AtomicUsize,
+    /// Bytes of snapshot copies handed to the writer thread and not yet dropped by it.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// The most [`Hooks::in_flight`] has been.
+    peak_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -165,6 +184,24 @@ impl Hooks {
                 .is_ok()
         }
         !count_down(&self.passing_syncs) && count_down(&self.failing_syncs)
+    }
+
+    /// The bytes `snapshots` hold: their slots' copies.
+    const fn bytes_of(snapshots: &[Snapshot]) -> usize {
+        snapshots.len() * size_of::<crate::slot::CorrectionSlot>()
+    }
+
+    /// `snapshots` are handed to the writer thread: counts their bytes in flight, and the peak.
+    fn sent(&self, snapshots: &[Snapshot]) {
+        let bytes = Self::bytes_of(snapshots);
+        let now = self.in_flight.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+    }
+
+    /// The writer thread dropped `snapshots`: their bytes are no longer in flight.
+    fn dropped(&self, snapshots: &[Snapshot]) {
+        self.in_flight
+            .fetch_sub(Self::bytes_of(snapshots), Ordering::SeqCst);
     }
 }
 
@@ -258,7 +295,9 @@ impl RecoveryWriter {
     /// flight. Advances the flush in flight first (see [`RecoveryWriter::poll`]).
     ///
     /// The drawing thread's cost is the snapshot: one slot copy per tile edited since the last
-    /// flush. Encoding, compression and syncing happen on the writer thread.
+    /// flush, held outside the tile pool until encoded. Encoding, compression and syncing happen
+    /// on the writer thread. A stroke with no [`RecoveryWriter::tick`] during it snapshots every
+    /// tile it dirtied here, at once (see the module notes on memory).
     ///
     /// # Errors
     ///
@@ -273,6 +312,12 @@ impl RecoveryWriter {
     /// Time passed, to `now`, during a stroke or after it: starts a flush (or queues one, if one
     /// is in flight) when edits are waiting and [`FLUSH_INTERVAL`] has passed since the last
     /// flush started. Advances the flush in flight first.
+    ///
+    /// The app must call it regularly, every frame. Besides keeping a save point at least once a
+    /// second, it bounds a flush's snapshot, the copies made outside the tile pool, to the tiles
+    /// dirtied since the previous flush: about a second of edits. A caller that never ticks gets
+    /// one large snapshot at [`RecoveryWriter::end_stroke`], of every tile the stroke dirtied
+    /// (see the module notes on memory).
     ///
     /// # Errors
     ///
@@ -411,9 +456,12 @@ impl RecoveryWriter {
         store.open_cut();
         self.generation = store.generation();
         let started = match store.snapshot_dirty(self.consumer, &mut self.skipped) {
-            Ok(snapshots) if !snapshots.is_empty() => self
-                .send(Request::Encode(snapshots))
-                .map(|()| self.phase = Phase::Encoding),
+            Ok(snapshots) if !snapshots.is_empty() => {
+                #[cfg(test)]
+                self.hooks.sent(&snapshots);
+                self.send(Request::Encode(snapshots))
+                    .map(|()| self.phase = Phase::Encoding)
+            }
             Ok(_) if owed || store.has_unsaved_tiles() => self.request_tile_sync(store),
             // Nothing to flush: the interval keeps running from the last real flush.
             Ok(_) => return Ok(()),
@@ -575,6 +623,12 @@ impl RecoveryWriter {
         }
     }
 
+    /// The most bytes of snapshot copies ever in flight to the writer thread at once: handed
+    /// over and not yet dropped by it.
+    pub(crate) fn peak_snapshot_bytes(&self) -> usize {
+        self.hooks.peak_in_flight.load(Ordering::SeqCst)
+    }
+
     /// A handle that upgrades only while the writer or its thread is alive: once the writer is
     /// dropped and its thread joined, it can't.
     pub(crate) fn liveness(&self) -> std::sync::Weak<AtomicBool> {
@@ -615,10 +669,16 @@ impl Worker {
     fn run(self) {
         while let Ok(request) = self.requests.recv() {
             let reply = match request {
-                Request::Encode(snapshots) => match self.encode(&snapshots) {
-                    Some((framed, broken)) => Reply::Encoded(framed, broken),
-                    None => return,
-                },
+                Request::Encode(snapshots) => {
+                    let encoded = self.encode(&snapshots);
+                    #[cfg(test)]
+                    self.hooks.dropped(&snapshots);
+                    drop(snapshots);
+                    match encoded {
+                        Some((framed, broken)) => Reply::Encoded(framed, broken),
+                        None => return,
+                    }
+                }
                 Request::Sync(syncer) => Reply::Synced(sync(
                     &syncer,
                     #[cfg(test)]

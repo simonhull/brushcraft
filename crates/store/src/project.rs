@@ -854,6 +854,11 @@ impl Project {
     /// [`RecoveryWriter::tick`]), and tries to put paused crash protection back in place once
     /// the wait since the last try has passed.
     ///
+    /// The app must call it regularly, every frame. A flush snapshots the tiles dirtied since the
+    /// previous one outside the tile pool's budget, so ticking bounds that copy to about a second
+    /// of edits; a caller that never ticks gets one large snapshot at [`Project::end_stroke`], of
+    /// every tile the stroke dirtied.
+    ///
     /// # Errors
     ///
     /// As [`Project::end_stroke`].
