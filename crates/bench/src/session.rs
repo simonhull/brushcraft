@@ -20,12 +20,7 @@ const SITE: u16 = 1;
 /// directory.
 pub(crate) fn config(options: &Options, paths: &Paths) -> ProjectConfig {
     ProjectConfig {
-        store: StoreConfig {
-            budget_bytes: options.budget_bytes(),
-            chunk_bytes: StoreConfig::DEFAULT_CHUNK_BYTES,
-            site: SITE,
-            threads: None,
-        },
+        store: StoreConfig::new(options.budget_bytes(), SITE),
         recovery_dir: paths.recovery.clone(),
     }
 }

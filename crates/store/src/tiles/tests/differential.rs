@@ -104,19 +104,11 @@ enum Reads {
 /// evaluated slots.
 fn budgets(mesh: &BaseMesh, extra_chunks: &[usize]) -> Vec<StoreConfig> {
     let chunk = 4 * EVAL;
-    let base = StoreConfig {
-        budget_bytes: 0,
-        chunk_bytes: chunk,
-        site: SITE,
-        threads: None,
-    };
+    let base = StoreConfig::new(0, SITE).with_chunk_bytes(chunk);
     let minimum = base.minimum_budget(mesh);
     extra_chunks
         .iter()
-        .map(|extra| StoreConfig {
-            budget_bytes: minimum + extra * chunk,
-            ..base
-        })
+        .map(|extra| base.with_budget_bytes(minimum + extra * chunk))
         .collect()
 }
 
@@ -627,10 +619,7 @@ fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
         let outcomes: Vec<Outcome> = thread_counts()
             .into_iter()
             .map(|threads| {
-                let config = StoreConfig {
-                    threads: Some(threads),
-                    ..config
-                };
+                let config = config.with_threads(Some(threads));
                 run(&mesh, 7, config, Reads::Batched, seed, 400)
             })
             .collect();

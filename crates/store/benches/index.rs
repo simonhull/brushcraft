@@ -139,13 +139,8 @@ impl Fresh {
         );
         let file =
             ProjectFile::create(&dir.join("index.bcrf"), meta, Arc::clone(&mesh)).expect("file");
-        let mut config = StoreConfig {
-            budget_bytes: 0,
-            chunk_bytes: 4 << 20,
-            site: 1,
-            threads: None,
-        };
-        config.budget_bytes = config.minimum_budget(&mesh).max(256 << 20);
+        let config = StoreConfig::new(0, 1).with_chunk_bytes(4 << 20);
+        let config = config.with_budget_bytes(config.minimum_budget(&mesh).max(256 << 20));
         let store = TileStore::open(file, config).expect("store");
         Self { store, dir }
     }

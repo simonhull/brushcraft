@@ -51,12 +51,7 @@ fn project(dir: &TestDir, level: Level) -> (Project, SpatialIndex) {
 /// `dir`, and its spatial index at `level`.
 fn project_over(dir: &TestDir, mesh: BaseMesh, level: Level) -> (Project, SpatialIndex) {
     let config = ProjectConfig {
-        store: StoreConfig {
-            budget_bytes: 64 << 20,
-            chunk_bytes: 1 << 20,
-            site: 1,
-            threads: None,
-        },
+        store: StoreConfig::new(64 << 20, 1).with_chunk_bytes(1 << 20),
         recovery_dir: dir.0.join("recovery"),
     };
     let mut project = Project::new(mesh, config).unwrap();
@@ -445,12 +440,9 @@ fn normals_after_random_steps_equal_a_full_recompute_at_any_thread_count() {
     for threads in [1, hardware] {
         let dir = TestDir::new();
         let config = ProjectConfig {
-            store: StoreConfig {
-                budget_bytes: 64 << 20,
-                chunk_bytes: 1 << 20,
-                site: 1,
-                threads: std::num::NonZeroUsize::new(threads),
-            },
+            store: StoreConfig::new(64 << 20, 1)
+                .with_chunk_bytes(1 << 20)
+                .with_threads(std::num::NonZeroUsize::new(threads)),
             recovery_dir: dir.0.join("recovery"),
         };
         let mut project = Project::new(mesh.clone(), config).unwrap();

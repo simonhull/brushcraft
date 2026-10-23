@@ -76,12 +76,7 @@ impl Fresh {
         ));
         std::fs::create_dir_all(&dir).expect("temporary directory");
         let config = ProjectConfig {
-            store: StoreConfig {
-                budget_bytes: 2 << 30,
-                chunk_bytes: StoreConfig::DEFAULT_CHUNK_BYTES,
-                site: 1,
-                threads: None,
-            },
+            store: StoreConfig::new(2 << 30, 1),
             recovery_dir: dir.join("recovery"),
         };
         let mut project =

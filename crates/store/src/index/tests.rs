@@ -22,13 +22,8 @@ const LEVEL: u8 = 4;
 fn store_over(dir: &TestDir, mesh: &Arc<BaseMesh>) -> TileStore {
     let file = ProjectFile::create(&dir.path("index"), meta_for(mesh), Arc::clone(mesh)).unwrap();
     let chunk_bytes = 8 * size_of::<EvaluatedSlot>();
-    let mut config = StoreConfig {
-        budget_bytes: 64 * chunk_bytes,
-        chunk_bytes,
-        site: 3,
-        threads: None,
-    };
-    config.budget_bytes = config.budget_bytes.max(config.minimum_budget(mesh));
+    let config = StoreConfig::new(64 * chunk_bytes, 3).with_chunk_bytes(chunk_bytes);
+    let config = config.with_budget_bytes(config.budget_bytes.max(config.minimum_budget(mesh)));
     TileStore::open(file, config).unwrap()
 }
 

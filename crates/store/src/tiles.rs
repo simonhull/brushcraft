@@ -128,7 +128,18 @@ use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 use crate::stamp::Stamp;
 
 /// How a [`TileStore`] is set up.
+///
+/// Made with [`StoreConfig::new`] and adjusted with its `with_` setters, so that a field added
+/// later doesn't break a caller:
+///
+/// ```
+/// # use std::num::NonZeroUsize;
+/// # use store::StoreConfig;
+/// let config = StoreConfig::new(2 << 30, 1).with_threads(NonZeroUsize::new(4));
+/// assert_eq!(config.chunk_bytes, StoreConfig::DEFAULT_CHUNK_BYTES);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StoreConfig {
     /// Bytes the two pools may hold together. The pools never exceed it. At least
     /// [`StoreConfig::minimum_budget`] for the store's mesh. How the pools share it is the
@@ -151,6 +162,50 @@ impl StoreConfig {
     /// The default chunk: 64 MiB, large enough that the allocator maps each chunk on its own
     /// and gives it back to the OS when it is dropped (see the pool's notes).
     pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
+
+    /// A store of `budget_bytes` whose op ids carry `site`, with
+    /// [`StoreConfig::DEFAULT_CHUNK_BYTES`] chunks and one evaluation worker per hardware
+    /// thread.
+    #[must_use]
+    pub const fn new(budget_bytes: usize, site: u16) -> Self {
+        Self {
+            budget_bytes,
+            chunk_bytes: Self::DEFAULT_CHUNK_BYTES,
+            site,
+            threads: None,
+        }
+    }
+
+    /// This configuration with a budget of `budget_bytes` (see [`StoreConfig::budget_bytes`]).
+    #[must_use]
+    pub const fn with_budget_bytes(self, budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            ..self
+        }
+    }
+
+    /// This configuration with chunks of `chunk_bytes` (see [`StoreConfig::chunk_bytes`]).
+    #[must_use]
+    pub const fn with_chunk_bytes(self, chunk_bytes: usize) -> Self {
+        Self {
+            chunk_bytes,
+            ..self
+        }
+    }
+
+    /// This configuration with op ids of `site` (see [`StoreConfig::site`]).
+    #[must_use]
+    pub const fn with_site(self, site: u16) -> Self {
+        Self { site, ..self }
+    }
+
+    /// This configuration with `threads` evaluation workers, or one per hardware thread for
+    /// `None` (see [`StoreConfig::threads`]).
+    #[must_use]
+    pub const fn with_threads(self, threads: Option<NonZeroUsize>) -> Self {
+        Self { threads, ..self }
+    }
 
     /// The least [`StoreConfig::budget_bytes`] a store over `mesh` with these chunks works
     /// with: enough that no evaluation, normals computation or edit runs out of room while

@@ -81,12 +81,7 @@ pub(crate) fn mesh() -> Arc<BaseMesh> {
 
 /// A configuration with chunks of `chunk_slots` evaluated slots and a budget of `chunks` of them.
 fn config(chunks: usize, chunk_slots: usize) -> StoreConfig {
-    StoreConfig {
-        budget_bytes: chunks * chunk_slots * EVAL,
-        chunk_bytes: chunk_slots * EVAL,
-        site: SITE,
-        threads: None,
-    }
+    StoreConfig::new(chunks * chunk_slots * EVAL, SITE).with_chunk_bytes(chunk_slots * EVAL)
 }
 
 /// Room for every tile of levels 1–8 of the cube, twice over.
@@ -372,10 +367,7 @@ fn evaluating_many_equals_the_dense_evaluation_at_any_thread_count() {
         .into_iter()
         .flat_map(|c| threads.map(|n| (c, n)))
     {
-        let config = StoreConfig {
-            threads: NonZeroUsize::new(n),
-            ..base
-        };
+        let config = base.with_threads(NonZeroUsize::new(n));
         let name = format!("{}-{n}.bcp", config.budget_bytes);
         let mut store = new_store(&dir, &name, &mesh, config);
         let mut map = CorrectionMap::new();
@@ -412,10 +404,7 @@ fn wide_batches_near_the_minimum_keep_a_correction_chunk() {
     let chunk = 4 * EVAL;
     let minimum = config(0, 4).minimum_budget(&mesh);
     for extra in 0..6 {
-        let config = StoreConfig {
-            budget_bytes: minimum + extra * chunk,
-            ..config(0, 4)
-        };
+        let config = config(0, 4).with_budget_bytes(minimum + extra * chunk);
         let mut store = new_store(&dir, &format!("{extra}.bcp"), &mesh, config);
         let mut map = CorrectionMap::new();
         apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 21));
@@ -643,10 +632,7 @@ fn stale_normals_brought_up_to_date_equal_a_full_recompute() {
         1,
         thread::available_parallelism().map_or(1, NonZeroUsize::get),
     ] {
-        let config = StoreConfig {
-            threads: NonZeroUsize::new(threads),
-            ..config(80, 16)
-        };
+        let config = config(80, 16).with_threads(NonZeroUsize::new(threads));
         let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);
         store.evaluate_many(&all, Evaluation::Normals).unwrap();
         store.begin_op().unwrap();
@@ -1323,10 +1309,7 @@ fn bad_requests_are_refused() {
         Arc::clone(&mesh),
     )
     .unwrap();
-    let reserved = StoreConfig {
-        site: RESERVED_SITE,
-        ..roomy()
-    };
+    let reserved = roomy().with_site(RESERVED_SITE);
     assert!(
         matches!(
             TileStore::open(file, reserved),
@@ -1449,10 +1432,7 @@ fn a_budget_below_the_minimum_is_refused() {
     );
     let file =
         ProjectFile::create(&dir.path("small.bcp"), meta_for(&mesh), Arc::clone(&mesh)).unwrap();
-    let small = StoreConfig {
-        budget_bytes: minimum - 1,
-        ..tight()
-    };
+    let small = tight().with_budget_bytes(minimum - 1);
     let refused = TileStore::open(file, small);
     assert!(
         matches!(refused, Err(CacheError::BudgetTooSmall { minimum: m }) if m == minimum),
