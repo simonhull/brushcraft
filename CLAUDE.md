@@ -25,6 +25,9 @@ if they disagree, raise it rather than drifting silently.
 - `cargo fmt` uses the pinned nightly's rustfmt (unstable options in `rustfmt.toml`) through `RUSTFMT` in
   `mise.toml`. Stable rustfmt gives different output: point your editor at `scripts/rustfmt`, and run
   anything that needs nightly (fmt, Miri) via `cargo +$BRUSHCRAFT_NIGHTLY …` under mise.
+- Profiling: `samply` (pinned in `mise.toml`) on a release build, e.g. `samply record --save-only -o
+  /tmp/brush.json.gz target/release/brushcraft-bench brush`, then `samply load /tmp/brush.json.gz`. On Linux it
+  needs `kernel.perf_event_paranoid` at 1 or lower (`echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid`).
 - Toolchain and cargo tools are pinned in `mise.toml`; bump `rust` there and `rust-version` in `Cargo.toml`
   together. Run cargo through mise (`mise exec -- cargo …` in a shell without `mise activate`), or you get
   rustup's default toolchain instead.
