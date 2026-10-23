@@ -41,8 +41,9 @@
 //!
 //! [`TileStore::evaluate_many`] widens the cone to many target tiles at once, so the levels are
 //! wide enough to keep every worker busy; [`TileStore::pin`] goes through it too. Such a cone's
-//! levels are wider than [`geom::cone_width`]: a batch is sized to the room the budget has free
-//! of pins, and halved, down to the one tile the bound above holds for, if it runs out.
+//! levels are wider than [`geom::cone_width`]: a batch is sized to the room the evaluated pool
+//! can reach free of pins, and halved, down to the one tile the bound above holds for, if it
+//! runs out.
 //!
 //! # Ops and writes
 //!
@@ -71,16 +72,28 @@
 //! the pools only within limits that keep each pool enough to work with.
 //!
 //! A budget of [`StoreConfig::minimum_budget`] is enough for every evaluation and edit when
-//! nothing else is pinned, and [`TileStore::open`] refuses less. An evaluation pins at most `E`
-//! evaluated slots (two cone levels) and no correction slot:
+//! nothing else is pinned, and [`TileStore::open`] refuses less. An evaluation of one tile pins
+//! at most `E` evaluated slots (two cone levels), and correction slots only for a round, while
+//! the workers predict it: a round unpins them before it installs anything, so no correction
+//! slot of the evaluation's is pinned when it asks for an evaluated one.
 //!
 //! - The evaluated pool needs a chunk only when every one of its slots is pinned, so it holds fewer
 //!   than `⌈E / per chunk⌉` chunks then, and the minimum leaves room for one more besides a
-//!   correction chunk. Taking correction chunks back stops as soon as that room is there, so the
-//!   correction pool keeps a chunk, however the evaluated pins are spread.
-//! - The correction pool so always has a slot to reuse: none of its slots is pinned. (Its first
-//!   chunk is mapped by an evaluation's first build, which loads a correction tile before it asks
-//!   for an evaluated slot.)
+//!   correction chunk. Making that room takes evaluated chunks back first, then correction chunks,
+//!   and stops as soon as the room is there, so the correction pool keeps a chunk, however the
+//!   evaluated pins are spread.
+//! - Besides, making room for the evaluated pool never takes the correction pool's last chunk: the
+//!   correction floor (see [`TileStore::make_room`]). Within the bound above it never binds, as the
+//!   room is there first; it binds for a batch of [`TileStore::evaluate_many`], whose wider cone
+//!   can pin every evaluated chunk. Such a batch fails and is halved, and the coarsest level's pins
+//!   of the one-tile batch it comes down to may then sit in every evaluated chunk: without the
+//!   floor, no chunk would be left to load its correction tiles into.
+//! - The correction pool so always has a slot to reuse when a round's first tile loads: none of its
+//!   slots is pinned then. (Its first chunk is mapped by an evaluation's first build, which loads a
+//!   correction tile before it asks for an evaluated slot.) A round's other tiles take only a free
+//!   slot, a new chunk or a clean tile's slot, and the round is cut at the first that finds none
+//!   ([`TileStore::load_round`]): a round that can't widen is a round of one tile, as one tile at a
+//!   time would build it, and writes back no more.
 //!
 //! An edit pins correction slots only, at most one cone width of them, which the minimum's
 //! correction chunks hold once every evaluated chunk is taken back.
@@ -558,7 +571,9 @@ impl EvalLog {
 /// [`TileStore::shrink_to`]) evaluated chunks first, then correction chunks, the cheapest of
 /// each pool first: the correction chunk with the fewest dirty tiles (each written back before
 /// the chunk goes), the evaluated chunk with the fewest tiles in use. A chunk holding a pinned
-/// slot stays.
+/// slot stays, and so does the correction pool's last chunk when the room is for the evaluated
+/// pool (the correction floor, see the module notes): the next evaluation loads its correction
+/// tiles there.
 pub struct TileStore {
     /// The prefetch workers. Declared first, so they are stopped and joined (when the store is
     /// dropped) before anything else goes, the working file included.
