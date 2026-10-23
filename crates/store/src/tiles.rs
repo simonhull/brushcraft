@@ -145,6 +145,11 @@ pub struct StoreConfig {
     /// [`StoreConfig::minimum_budget`] for the store's mesh. How the pools share it is the
     /// store's memory policy (see [`TileStore`]): corrections take evaluated chunks only up to a
     /// quarter of it, and never below the evaluated pool's floor.
+    ///
+    /// It bounds the pools alone. The evaluation scratch (about 3 MB), the read buffers, the
+    /// workers' own allocations (a few hundred KB each at most) and the thread stacks (2 MiB
+    /// reserved per worker) sit outside it: a few MB besides the budget, plus the stacks (see
+    /// "Memory outside the budget" on [`TileStore`]).
     pub budget_bytes: usize,
     /// Bytes per pool chunk, the unit both pools grow and shrink by and are charged in (whole
     /// slots fill it, the rest of a chunk is charged unused):
@@ -628,6 +633,27 @@ impl EvalLog {
 /// slot stays, and so does the correction pool's last chunk when the room is for the evaluated
 /// pool (the correction floor, see the module notes): the next evaluation loads its correction
 /// tiles there.
+///
+/// # Memory outside the budget
+///
+/// [`StoreConfig::budget_bytes`] bounds the two pools, which hold nearly all of a store's
+/// memory. Besides them, and not charged to the budget:
+///
+/// - the evaluation scratch: one buffer of the largest tile's positions (about 50 KB) per tile of a
+///   round, so about 3.2 MB at most (64 of them), kept for the store's life;
+/// - the buffers and zstd context the owner thread reads correction tiles with, and each prefetch
+///   worker's (at most four): a few hundred KB together, with the prefetched tiles waiting for
+///   [`TileStore::poll`] and the spare boxes the workers decode into, about 27 KB each;
+/// - what each evaluation worker allocates while it predicts a tile or computes its normals: the
+///   gathered parent block, the prediction and its tangent frames, a few tiles' worth (a few
+///   hundred KB for the largest tiles), freed when the tile is done;
+/// - the thread stacks: Rust's default of 2 MiB of address space reserved per evaluation worker
+///   ([`StoreConfig::threads`]) and per prefetch worker, of which only the pages touched are
+///   committed;
+/// - the bookkeeping: the dependency graph, the pools' indices and the change feed, which grow with
+///   the tiles resident and edited, not with their size.
+///
+/// That is a few MB besides the budget, ten or so with dozens of workers, plus the stacks.
 pub struct TileStore {
     /// The prefetch workers. Declared first, so they are stopped and joined (when the store is
     /// dropped) before anything else goes, the working file included.
