@@ -2,12 +2,23 @@
 //!
 //! # Layout
 //!
-//! The tree lives in two flat arrays and has no pointers. `items` holds every tile's key and
+//! The tree lives in flat arrays and has no pointers. `items` holds every tile's key and
 //! bounds, ordered so each leaf covers one contiguous range of it. `nodes` holds the nodes in
 //! the order the build made them: the root first, and a node's two children always after it
 //! (they are made together, as a pair, when the node is split). A refit uses that order:
 //! walking the touched nodes from the highest index down updates every child before its
 //! parent.
+//!
+//! The tree is always resident, so it is kept small: about 83 bytes a tile, against a target
+//! of 100 (measured by a test over 153,600 tiles, the benchmark sphere's level 9). The parts:
+//!
+//! - an item, a tile's key and bounds: 52 bytes;
+//! - its node share: a node is 32 bytes (its box, and two `u32`s saying what it holds), and a tree
+//!   of leaves of up to [`LEAF_SIZE`] items has about two nodes for every three items;
+//! - the parent of each pair of children, a `u32` (children come in pairs, so one entry serves
+//!   both: the pair `2p + 1`, `2p + 2` has parent `parents[p]`);
+//! - the leaf of each item, a `u32`, for a refit to start from;
+//! - the key table ([`KeyTable`]), a `u32` a tile, from a tile's place on the mesh to its item.
 //!
 //! # Build
 //!
@@ -26,11 +37,14 @@
 //! from a heap: the caller's precise test runs on the candidate tiles in that order, and stops
 //! as soon as the next candidate's box starts beyond the nearest hit found.
 
+mod keys;
+
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap};
 
 use geom::{TileKey, Vec3};
 
+use self::keys::KeyTable;
 use super::{IndexError, TileBounds};
 
 /// Bins per axis the build sorts centroids into to find a split.
@@ -44,6 +58,20 @@ const BINS_F32: f32 = 16.0;
 /// Small, because the item a raycast finally tests is a whole tile's quads: a candidate the
 /// tree could have ruled out costs far more than one more node visit.
 const LEAF_SIZE: usize = 4;
+
+/// The most tiles a tree holds: few enough that every item and node index (fewer than twice
+/// as many nodes as items) fits the `u32`s the tree stores them in.
+pub const MAX_TILES: usize = 1 << 30;
+
+/// `i` as a `u32` index into the tree's arrays.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a tree holds at most MAX_TILES = 2^30 items and fewer than 2^31 nodes, so every \
+              index the build stores fits"
+)]
+const fn narrow(i: usize) -> u32 {
+    i as u32
+}
 
 /// A coordinate axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,7 +276,8 @@ pub struct Hit {
     pub t: f32,
 }
 
-/// What a node is: an inner node with two children, or a leaf over a range of items.
+/// What a node is: an inner node with two children, or a leaf over a range of items. A view of
+/// a [`Node`], which stores it packed ([`Node::kind`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeKind {
     /// A node split in two. The children are made together, so `right` is `left + 1`; both
@@ -268,16 +297,50 @@ enum NodeKind {
     },
 }
 
-/// One node of the tree.
+/// One node of the tree: 32 bytes, its box and what it holds packed in two `u32`s (see
+/// [`Node::kind`]). Its parent is kept apart, once per pair of children ([`Bvh::parents`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Node {
     /// The smallest box holding every item below the node (exactly that, after a build or a
     /// refit).
     aabb: Aabb,
-    /// The node's parent; `None` for the root.
-    parent: Option<usize>,
-    /// Whether it is split, and into what.
-    kind: NodeKind,
+    /// A leaf's first item, or an inner node's first child.
+    start: u32,
+    /// How many items a leaf holds, at least one; 0 for an inner node.
+    count: u32,
+}
+
+impl Node {
+    /// A leaf over the items `first..end`, with box `aabb`. `first < end`.
+    const fn leaf(aabb: Aabb, first: usize, end: usize) -> Self {
+        Self {
+            aabb,
+            start: narrow(first),
+            count: narrow(end - first),
+        }
+    }
+
+    /// Makes the node an inner node whose children are `left` and `left + 1`.
+    const fn split_into(&mut self, left: usize) {
+        self.start = narrow(left);
+        self.count = 0;
+    }
+
+    /// What the node is, unpacked.
+    const fn kind(&self) -> NodeKind {
+        let start = self.start as usize;
+        if self.count == 0 {
+            NodeKind::Inner {
+                left: start,
+                right: start + 1,
+            }
+        } else {
+            NodeKind::Leaf {
+                first: start,
+                end: start + self.count as usize,
+            }
+        }
+    }
 }
 
 /// One item while the tree is built: a tile, its bounds and its box's centroid.
@@ -301,12 +364,15 @@ pub struct Bvh {
     /// The nodes: the root first, a node's children after it (see the module notes). Empty for
     /// a tree of no tiles.
     nodes: Vec<Node>,
+    /// The parent of each pair of children: `parents[p]` is the parent of nodes `2p + 1` and
+    /// `2p + 2`. (The root, node 0, has none; every other node was made in a pair.)
+    parents: Vec<u32>,
     /// Every tile with its bounds, each leaf's items contiguous.
     items: Vec<(TileKey, TileBounds)>,
     /// The leaf node each item is in, by item index.
-    leaf_of: Vec<usize>,
+    leaf_of: Vec<u32>,
     /// The index in [`Bvh::items`] of each tile.
-    index_of: HashMap<TileKey, usize>,
+    index_of: KeyTable,
 }
 
 impl std::fmt::Debug for Bvh {
@@ -452,10 +518,21 @@ fn aabb_of(entries: &[Entry]) -> Option<Aabb> {
 impl Bvh {
     /// The tree over `tiles` (see the module notes on the build).
     ///
+    /// The tiles must be of one level, layer and channel, as the tiles of one level of a mesh
+    /// are: the tree finds a tile's item from its place on the mesh, in a dense table.
+    ///
     /// # Errors
     ///
-    /// [`IndexError::DuplicateTile`] if a tile is listed twice.
+    /// Checked before anything is built: [`IndexError::TooManyTiles`] for more than
+    /// [`MAX_TILES`]; [`IndexError::MixedTiles`] if the tiles aren't of one level, layer and
+    /// channel; [`IndexError::DuplicateTile`] if a tile is listed twice.
     pub fn build(tiles: Vec<(TileKey, TileBounds)>) -> Result<Self, IndexError> {
+        if tiles.len() > MAX_TILES {
+            return Err(IndexError::TooManyTiles(tiles.len()));
+        }
+        let keys: Vec<TileKey> = tiles.iter().map(|&(key, _)| key).collect();
+        let mut index_of = KeyTable::new(&keys)?;
+        drop(keys);
         let mut entries: Vec<Entry> = tiles
             .into_iter()
             .map(|(key, bounds)| Entry {
@@ -465,15 +542,9 @@ impl Bvh {
             })
             .collect();
         let mut nodes = Vec::with_capacity(2 * entries.len().div_ceil(LEAF_SIZE));
+        let mut parents = Vec::with_capacity(entries.len().div_ceil(LEAF_SIZE));
         if let Some(aabb) = aabb_of(&entries) {
-            nodes.push(Node {
-                aabb,
-                parent: None,
-                kind: NodeKind::Leaf {
-                    first: 0,
-                    end: entries.len(),
-                },
-            });
+            nodes.push(Node::leaf(aabb, 0, entries.len()));
         }
         // Nodes still to split: each starts as a leaf over its entries (a valid node already),
         // and becomes an inner node if it splits. An explicit stack, so a lopsided tree can't
@@ -490,43 +561,53 @@ impl Bvh {
             };
             let left = nodes.len();
             let right = left + 1;
-            let child = |aabb, from, to| Node {
-                aabb,
-                parent: Some(node),
-                kind: NodeKind::Leaf {
-                    first: from,
-                    end: to,
-                },
-            };
-            nodes.push(child(low_aabb, first, first + mid));
-            nodes.push(child(high_aabb, first + mid, end));
+            nodes.push(Node::leaf(low_aabb, first, first + mid));
+            nodes.push(Node::leaf(high_aabb, first + mid, end));
+            parents.push(narrow(node));
             if let Some(parent) = nodes.get_mut(node) {
-                parent.kind = NodeKind::Inner { left, right };
+                parent.split_into(left);
             }
             work.push((right, first + mid, high));
             work.push((left, first, low));
         }
         drop(work);
+        nodes.shrink_to_fit();
+        parents.shrink_to_fit();
         let mut leaf_of = vec![0; entries.len()];
         for (index, node) in nodes.iter().enumerate() {
-            if let NodeKind::Leaf { first, end } = node.kind
+            if let NodeKind::Leaf { first, end } = node.kind()
                 && let Some(range) = leaf_of.get_mut(first..end)
             {
-                range.fill(index);
+                range.fill(narrow(index));
             }
         }
-        let mut index_of = HashMap::with_capacity(entries.len());
-        for (index, e) in entries.iter().enumerate() {
-            if index_of.insert(e.key, index).is_some() {
-                return Err(IndexError::DuplicateTile(e.key));
-            }
-        }
+        index_of.reindex(entries.iter().map(|e| &e.key));
+        let mut items: Vec<_> = entries.into_iter().map(|e| (e.key, e.bounds)).collect();
+        // Collecting may reuse the entries' larger allocation.
+        items.shrink_to_fit();
         Ok(Self {
             nodes,
-            items: entries.into_iter().map(|e| (e.key, e.bounds)).collect(),
+            parents,
+            items,
             leaf_of,
             index_of,
         })
+    }
+
+    /// The bytes the tree holds on the heap: its arrays, at their capacity.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.nodes.capacity() * size_of::<Node>()
+            + self.parents.capacity() * size_of::<u32>()
+            + self.items.capacity() * size_of::<(TileKey, TileBounds)>()
+            + self.leaf_of.capacity() * size_of::<u32>()
+            + self.index_of.heap_bytes()
+    }
+
+    /// The parent of node `n`; `None` for the root (or a node the tree doesn't have).
+    fn parent(&self, n: usize) -> Option<usize> {
+        let pair = n.checked_sub(1)? / 2;
+        self.parents.get(pair).map(|&p| p as usize)
     }
 
     /// How many tiles the tree holds.
@@ -550,7 +631,7 @@ impl Bvh {
     /// `key`'s bounds, as last built or refitted; `None` if the tree doesn't hold it.
     #[must_use]
     pub fn bounds(&self, key: &TileKey) -> Option<&TileBounds> {
-        let &index = self.index_of.get(key)?;
+        let index = self.index_of.get(key)?;
         self.items.get(index).map(|(_, bounds)| bounds)
     }
 
@@ -570,12 +651,7 @@ impl Bvh {
     pub fn refit(&mut self, changed: &[(TileKey, TileBounds)]) -> Result<(), IndexError> {
         let at = changed
             .iter()
-            .map(|(key, _)| {
-                self.index_of
-                    .get(key)
-                    .copied()
-                    .ok_or(IndexError::UnknownTile(*key))
-            })
+            .map(|(key, _)| self.index_of.get(key).ok_or(IndexError::UnknownTile(*key)))
             .collect::<Result<Vec<_>, _>>()?;
         // Every node whose box may change: the changed items' leaves and all their ancestors.
         // A walk up stops at a node already marked, whose ancestors are marked too.
@@ -584,18 +660,18 @@ impl Bvh {
             if let Some(item) = self.items.get_mut(index) {
                 item.1 = bounds;
             }
-            let mut node = self.leaf_of.get(index).copied();
+            let mut node = self.leaf_of.get(index).map(|&leaf| leaf as usize);
             while let Some(n) = node {
                 if !stale.insert(n) {
                     break;
                 }
-                node = self.nodes.get(n).and_then(|n| n.parent);
+                node = self.parent(n);
             }
         }
         // Children come after their parents, so going down the indices updates every child
         // before the parent that unites it.
         for &n in stale.iter().rev() {
-            let aabb = self.nodes.get(n).and_then(|node| match node.kind {
+            let aabb = self.nodes.get(n).and_then(|node| match node.kind() {
                 NodeKind::Leaf { first, end } => self
                     .items
                     .get(first..end)?
@@ -679,7 +755,7 @@ impl Bvh {
                         best = Some(Hit { key, t });
                     }
                 }
-                Visit::Node(n) => match self.nodes.get(n).map(|node| node.kind) {
+                Visit::Node(n) => match self.nodes.get(n).map(Node::kind) {
                     Some(NodeKind::Inner { left, right }) => {
                         for child in [left, right] {
                             if let Some(c) = self.nodes.get(child) {
@@ -782,7 +858,7 @@ impl Iterator for SphereQuery<'_> {
             if !self.touches(&node.aabb) {
                 continue;
             }
-            match node.kind {
+            match node.kind() {
                 NodeKind::Inner { left, right } => self.stack.extend([right, left]),
                 NodeKind::Leaf { first, end } => self.leaf = first..end,
             }

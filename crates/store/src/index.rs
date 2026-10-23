@@ -3,8 +3,8 @@
 //! [`SpatialIndex`] keeps, for every tile of one level (the finest the store evaluates), the
 //! tile's [`TileBounds`]: the box of its evaluated positions and a cone bounding its normals.
 //! The bounds sit in a [`Bvh`], built with the binned surface area heuristic and refitted as
-//! edits move tiles. It is small (a few tens of bytes per tile) and always resident; the tiles
-//! themselves are evaluated through the [`TileStore`] only when a query needs them.
+//! edits move tiles. It is small (under 100 bytes a tile, see [`Bvh`]) and always resident; the
+//! tiles themselves are evaluated through the [`TileStore`] only when a query needs them.
 //!
 //! Two queries:
 //!
@@ -17,7 +17,7 @@ mod bvh;
 #[cfg(test)]
 mod tests;
 
-pub use bvh::{Aabb, Bvh, Hit, Ray, SphereQuery};
+pub use bvh::{Aabb, Bvh, Hit, MAX_TILES, Ray, SphereQuery};
 use geom::{BaseMesh, Level, TileKey, Vec3};
 use thiserror::Error;
 
@@ -35,6 +35,13 @@ pub enum IndexError {
     /// A tile was listed twice for a build.
     #[error("{0:?} is listed twice")]
     DuplicateTile(TileKey),
+    /// A build was given tiles of more than one level, layer or channel: this one differs from
+    /// the first.
+    #[error("{0:?} is not of the same level, layer and channel as the other tiles")]
+    MixedTiles(TileKey),
+    /// A build was given more than [`MAX_TILES`] tiles: this many.
+    #[error("{0} tiles are more than an index holds")]
+    TooManyTiles(usize),
     /// A refit or an update named a tile the index doesn't hold.
     #[error("{0:?} is not in the index")]
     UnknownTile(TileKey),

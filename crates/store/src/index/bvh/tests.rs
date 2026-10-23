@@ -3,6 +3,7 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 
 use geom::{FaceId, Level};
@@ -180,19 +181,24 @@ fn random_ray(rng: &mut Rng, k: usize) -> Ray {
 fn check(bvh: &Bvh) {
     assert_eq!(bvh.leaf_of.len(), bvh.items.len(), "a leaf per item");
     assert_eq!(bvh.index_of.len(), bvh.items.len(), "an index per item");
-    if let Some(root) = bvh.nodes.first() {
-        assert_eq!(root.parent, None, "the root has no parent");
-    } else {
+    if bvh.nodes.is_empty() {
         assert!(bvh.items.is_empty(), "no nodes, no items");
+    } else {
+        assert_eq!(bvh.parent(0), None, "the root has no parent");
+        assert_eq!(
+            bvh.parents.len(),
+            (bvh.nodes.len() - 1) / 2,
+            "a parent per pair of children"
+        );
     }
     let mut covered = vec![0_u32; bvh.items.len()];
     for (n, node) in bvh.nodes.iter().enumerate() {
-        let union = match node.kind {
+        let union = match node.kind() {
             NodeKind::Inner { left, right } => {
                 assert!(left > n, "node {n}'s children come after it");
                 assert_eq!(right, left + 1, "node {n}'s children are a pair");
                 for child in [left, right] {
-                    assert_eq!(bvh.nodes[child].parent, Some(n), "{child}'s parent is {n}");
+                    assert_eq!(bvh.parent(child), Some(n), "{child}'s parent is {n}");
                 }
                 bvh.nodes[left].aabb.union(bvh.nodes[right].aabb)
             }
@@ -201,7 +207,7 @@ fn check(bvh: &Bvh) {
                 assert!(end - first <= LEAF_SIZE, "leaf {n} is small");
                 for (k, count) in covered.iter_mut().enumerate().take(end).skip(first) {
                     *count += 1;
-                    assert_eq!(bvh.leaf_of[k], n, "item {k} is in leaf {n}");
+                    assert_eq!(bvh.leaf_of[k] as usize, n, "item {k} is in leaf {n}");
                 }
                 bvh.items[first..end]
                     .iter()
@@ -217,7 +223,11 @@ fn check(bvh: &Bvh) {
         "every item in exactly one leaf"
     );
     for (k, (key, _)) in bvh.items.iter().enumerate() {
-        assert_eq!(bvh.index_of[key], k, "{key:?} is found where it is");
+        assert_eq!(
+            bvh.index_of.get(key),
+            Some(k),
+            "{key:?} is found where it is"
+        );
     }
 }
 
@@ -328,6 +338,57 @@ fn a_duplicate_tile_is_refused() {
 }
 
 #[test]
+fn tiles_of_another_level_layer_or_channel_are_refused() {
+    let b = bounds(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0));
+    let other_level = TileKey::displacement(FaceId::new(0), Level::new(8).unwrap(), 0, 0).unwrap();
+    let other_layer = TileKey::new(
+        geom::LayerId::new(1),
+        geom::Channel::DISPLACEMENT,
+        FaceId::new(0),
+        Level::new(9).unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
+    for odd in [other_level, other_layer] {
+        let err = Bvh::build(vec![(key(0), b), (key(1), b), (odd, b)]).unwrap_err();
+        assert!(
+            matches!(err, IndexError::MixedTiles(k) if k == odd),
+            "names the odd one out: {err:?}"
+        );
+    }
+    let bvh = Bvh::build(vec![(key(0), b), (key(1), b)]).unwrap();
+    assert!(
+        bvh.bounds(&other_level).is_none() && bvh.bounds(&other_layer).is_none(),
+        "and a lookup of one finds nothing"
+    );
+    assert!(
+        bvh.bounds(&key(64 * 5)).is_none(),
+        "nor of a tile past the last face"
+    );
+}
+
+/// The benchmark sphere's level-9 tile count: 2,400 faces of 8 × 8 tiles.
+const SPHERE_TILES: usize = 153_600;
+
+#[test]
+fn the_tree_takes_at_most_100_bytes_a_tile() {
+    let mut rng = Rng(9);
+    let scene = random_scene(&mut rng, SPHERE_TILES, 0.002);
+    let bvh = Bvh::build(scene).unwrap();
+    let tiles = f64::from(u32::try_from(SPHERE_TILES).unwrap());
+    let per_tile = f64::from(u32::try_from(bvh.heap_bytes()).unwrap()) / tiles;
+    println!(
+        "{SPHERE_TILES} tiles: {} bytes, {per_tile:.1} a tile ({} nodes of {} bytes)",
+        bvh.heap_bytes(),
+        bvh.nodes.len(),
+        size_of::<Node>()
+    );
+    assert_eq!(size_of::<Node>(), 32, "a node is its box and two u32s");
+    assert!(per_tile <= 100.0, "{per_tile:.1} bytes a tile");
+}
+
+#[test]
 fn an_empty_tree_answers_nothing() {
     let bvh = Bvh::build(Vec::new()).unwrap();
     check(&bvh);
@@ -363,7 +424,7 @@ fn coincident_tiles_are_halved_into_small_leaves() {
     let depth = (0..bvh.nodes.len())
         .map(|mut n| {
             let mut depth = 0;
-            while let Some(p) = bvh.nodes[n].parent {
+            while let Some(p) = bvh.parent(n) {
                 n = p;
                 depth += 1;
             }
@@ -452,7 +513,7 @@ fn visited(bvh: &Bvh, center: Vec3, radius: f32) -> usize {
             continue;
         }
         count += 1;
-        if let NodeKind::Inner { left, right } = node.kind {
+        if let NodeKind::Inner { left, right } = node.kind() {
             stack.extend([left, right]);
         }
     }
@@ -475,7 +536,7 @@ fn the_build_splits_where_the_gap_is() {
         .collect();
     let bvh = Bvh::build(scene).unwrap();
     check(&bvh);
-    let NodeKind::Inner { left, right } = bvh.nodes[0].kind else {
+    let NodeKind::Inner { left, right } = bvh.nodes[0].kind() else {
         panic!("the root is split");
     };
     let (a, b) = (bvh.nodes[left].aabb, bvh.nodes[right].aabb);

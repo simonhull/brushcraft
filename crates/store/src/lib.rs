@@ -33,7 +33,7 @@ pub use file::{
     MAX_MESH_RAW, MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place,
 };
 pub use index::{
-    Aabb, Bvh, Hit, IndexError, NormalCone, Ray, SpatialIndex, SphereQuery, TileBounds,
+    Aabb, Bvh, Hit, IndexError, MAX_TILES, NormalCone, Ray, SpatialIndex, SphereQuery, TileBounds,
 };
 pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
