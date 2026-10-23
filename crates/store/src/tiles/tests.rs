@@ -398,6 +398,45 @@ fn evaluating_many_equals_the_dense_evaluation_at_any_thread_count() {
     }
 }
 
+/// Wide batches near the minimum budget still find a correction slot to load into.
+///
+/// A batch whose cone pins every evaluated chunk fails and is halved. Without the
+/// correction floor (see [`TileStore::make_room`]) the failed batch takes every correction
+/// chunk back, and the one-tile batch it is halved to fails too, with nothing else pinned.
+#[test]
+fn wide_batches_near_the_minimum_keep_a_correction_chunk() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let all = tiles(&mesh, 1, TOP);
+    let finest = tiles(&mesh, TOP, TOP);
+    let chunk = 4 * EVAL;
+    let minimum = config(0, 4).minimum_budget(&mesh);
+    for extra in 0..6 {
+        let config = StoreConfig {
+            budget_bytes: minimum + extra * chunk,
+            ..config(0, 4)
+        };
+        let mut store = new_store(&dir, &format!("{extra}.bcp"), &mesh, config);
+        let mut map = CorrectionMap::new();
+        apply(&mut store, &mut map, &random_edits(&mesh, TOP, 300, 21));
+        let what = format!("{extra} chunks over the minimum");
+        for _ in 0..2 {
+            store
+                .evaluate_many(&all, Evaluation::Positions)
+                .unwrap_or_else(|e| panic!("{what}: positions: {e:?}"));
+            store
+                .evaluate_many(&finest, Evaluation::Normals)
+                .unwrap_or_else(|e| panic!("{what}: normals: {e:?}"));
+            assert!(
+                store.bytes() <= config.budget_bytes,
+                "{what}: over the budget"
+            );
+        }
+        let dense = dense(&mesh, &map);
+        assert_positions(&mut store, &dense, &all, &what);
+    }
+}
+
 #[test]
 fn edits_after_evaluation_invalidate_exactly() {
     let dir = TestDir::new();

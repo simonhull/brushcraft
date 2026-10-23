@@ -2421,7 +2421,7 @@ impl TileStore {
                 write_slot(file, unsaved, k, slot).map(drop)
             }) {
                 Err(PoolError::Full) if attempt == 0 => {
-                    if !self.make_room(self.corrections.chunk_bytes())? {
+                    if !self.make_room(self.corrections.chunk_bytes(), 0)? {
                         return Err(CacheError::Full);
                     }
                 }
@@ -2459,7 +2459,8 @@ impl TileStore {
             self.note_evictions();
             match acquired {
                 Err(PoolError::Full) if attempt == 0 => {
-                    if !self.make_room(self.evaluated.chunk_bytes())? {
+                    let keep = self.corrections.chunk_bytes();
+                    if !self.make_room(self.evaluated.chunk_bytes(), keep)? {
                         return Err(CacheError::Full);
                     }
                 }
@@ -2469,14 +2470,29 @@ impl TileStore {
         Err(CacheError::Full)
     }
 
-    /// Takes chunks back until another `need` bytes fit the budget; whether they do now.
+    /// Takes chunks back until another `need` bytes fit the budget, leaving the correction pool
+    /// at least `keep` bytes of its chunks; whether they fit now.
+    ///
+    /// Evaluated chunks go first, then correction chunks (see [`TileStore::give_back`]), but
+    /// never below `keep`. The evaluated pool asks with one correction chunk kept: the
+    /// correction floor. Without it, a batch whose cone pins every evaluated chunk could take
+    /// every correction chunk back, fail, and leave the one-tile batch it is halved to with no
+    /// correction slot to load into, as the coarsest level's pins would then sit in every
+    /// evaluated chunk (see the module notes). The correction pool asks with nothing kept: its
+    /// own chunks are what it is short of.
     ///
     /// # Errors
     ///
     /// As [`TileStore::give_back`].
-    fn make_room(&mut self, need: usize) -> Result<bool, CacheError> {
+    fn make_room(&mut self, need: usize, keep: usize) -> Result<bool, CacheError> {
         let target = self.budget.limit().saturating_sub(need);
-        self.give_back(target)?;
+        let evaluated = self
+            .evaluated
+            .shrink_to(&mut self.budget, target, nothing_to_write);
+        self.note_evictions();
+        evaluated?;
+        let floor = self.evaluated.bytes().saturating_add(keep);
+        self.give_back(target.max(floor))?;
         Ok(self.budget.used() <= target)
     }
 

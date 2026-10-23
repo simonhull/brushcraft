@@ -577,7 +577,10 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
     let cube = mesh();
     let prism = Arc::new(split_prism(7));
     let cases = [(&cube, TOP, 8, 1500), (&prism, 7, 4, 800)];
-    for (mesh, top, seeds, steps) in cases {
+    for ((mesh, top, seeds, steps), reads) in cases
+        .into_iter()
+        .flat_map(|case| [(case, Reads::OneByOne), (case, Reads::Batched)])
+    {
         // At the prism's minimum every pin is over the budget, so coverage is counted per mesh.
         let mut total = Stats::default();
         for config in budgets(mesh, &[0, 1, 3, 10]) {
@@ -590,7 +593,7 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
                     .map(|seed| {
                         scope.spawn(move || {
                             let seed = seed * 7919 + 13;
-                            run(mesh, top, config, Reads::OneByOne, seed, steps).stats
+                            run(mesh, top, config, reads, seed, steps).stats
                         })
                     })
                     .collect();
@@ -599,13 +602,13 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
                     .fold(Stats::default(), std::ops::Add::add)
             });
             println!(
-                "{} faces, {} bytes: {stats:?}",
+                "{} faces, {} bytes, {reads:?}: {stats:?}",
                 mesh.face_count(),
                 config.budget_bytes
             );
             total = total + stats;
         }
-        assert_covered(total, &format!("{} faces", mesh.face_count()));
+        assert_covered(total, &format!("{} faces, {reads:?}", mesh.face_count()));
     }
 }
 
@@ -620,7 +623,7 @@ fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
     let mesh = mesh();
     // The minimum budget, where batches are halved and rounds cut short, and room to spare,
     // where the batches are wide.
-    for (seed, config) in (0xBA7C..).zip(budgets(&mesh, &[0, 40])) {
+    for (seed, config) in (0xBA7C..).zip(budgets(&mesh, &[0, 1, 3, 40])) {
         let outcomes: Vec<Outcome> = thread_counts()
             .into_iter()
             .map(|threads| {
