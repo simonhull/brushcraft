@@ -455,7 +455,9 @@ impl Prediction {
     /// to each predicted position in its frame.
     #[must_use]
     pub fn apply(&self, corrections: impl Fn(u32, u32) -> Vec3) -> Grid {
-        Grid::from_parts(self.side(), self.positions(corrections).collect())
+        let mut data = vec![Vec3::ZERO; self.frames.len()];
+        self.write_positions(&corrections, &mut data);
+        Grid::from_parts(self.side(), data)
     }
 
     /// [`Prediction::apply`] into `out`, row-major `side²`, without allocating.
@@ -469,24 +471,28 @@ impl Prediction {
         out: &mut [Vec3],
     ) -> Result<(), EvalError> {
         check_buffer(out, self.frames.len())?;
-        for (slot, p) in out.iter_mut().zip(self.positions(corrections)) {
-            *slot = p;
-        }
+        self.write_positions(&corrections, out);
         Ok(())
     }
 
-    /// The final positions, row-major: one per frame.
-    fn positions(&self, corrections: impl Fn(u32, u32) -> Vec3) -> impl Iterator<Item = Vec3> {
+    /// The final positions into `out` (one per frame, row-major), a row at a time: the
+    /// predicted row, the frames' row and the output row as slices.
+    fn write_positions(&self, corrections: &impl Fn(u32, u32) -> Vec3, out: &mut [Vec3]) {
         let side = self.side();
-        (0..side)
-            .flat_map(move |j| (0..side).map(move |i| (i, j)))
-            .zip(&self.frames)
-            .map(move |((i, j), frame)| {
-                frame.apply(
-                    self.predicted.get(i64::from(i), i64::from(j)),
-                    corrections(i, j),
-                )
-            })
+        let width = usize::try_from(side).unwrap_or(usize::MAX);
+        let rows = self.frames.chunks(width).zip(out.chunks_mut(width));
+        for (j, (frames, out_row)) in (0..side).zip(rows) {
+            // Columns `0..=quads` of padded row `j`: past the ring's first slot.
+            let predicted = self
+                .predicted
+                .row(i64::from(j))
+                .get(1..)
+                .unwrap_or_default();
+            let vertices = predicted.iter().zip(frames).zip(out_row);
+            for (i, ((&p, frame), slot)) in (0..side).zip(vertices) {
+                *slot = frame.apply(p, corrections(i, j));
+            }
+        }
     }
 }
 
