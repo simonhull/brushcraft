@@ -73,6 +73,13 @@ dependencies = [
 [[package]]
 name = "brushcraft-bench"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "geom",
+ "rustix",
+ "sculpt",
+ "store",
+]
 
 [[package]]
 name = "bumpalo"

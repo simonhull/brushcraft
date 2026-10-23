@@ -1,0 +1,211 @@
+//! Where things are on the benchmark's surface: tiles near a direction, points on the surface,
+//! a brush radius that covers a footprint, and the path a stroke follows.
+
+use anyhow::{Context as _, Result, anyhow};
+use geom::{BaseMesh, Level, Region, TileKey, Topology, Vec3};
+use store::{Ray, SpatialIndex, TileStore};
+
+/// Every tile of `level` on `mesh` with an estimate of the direction of its centre from the
+/// mesh's centre, worked out from the base mesh alone (nothing is evaluated).
+///
+/// The estimate is the point of the tile's centre on the bilinear patch through its face's
+/// four corners (corners 0–3 at face-grid `(0, 0)`, `(n, 0)`, `(n, n)`, `(0, n)`), normalised.
+/// On the benchmark sphere that is within a fraction of a tile of the true centre, which is
+/// all choosing a region of nearby tiles needs.
+///
+/// # Errors
+///
+/// If a face has no corner, which a valid mesh never lacks.
+pub(crate) fn tile_directions(mesh: &BaseMesh, level: Level) -> Result<Vec<(TileKey, Vec3)>> {
+    let per_side = level.tiles_per_side();
+    let side = f32::from(u16::try_from(per_side)?);
+    let mut tiles = Vec::new();
+    for face in mesh.faces() {
+        let corner = |c| {
+            mesh.corner_position(face, c)
+                .ok_or_else(|| anyhow!("{face} has no corner {c}"))
+        };
+        let [c0, c1, c2, c3] = [corner(0)?, corner(1)?, corner(2)?, corner(3)?];
+        for ty in 0..u16::try_from(per_side)? {
+            for tx in 0..u16::try_from(per_side)? {
+                let u = (f32::from(tx) + 0.5) / side;
+                let v = (f32::from(ty) + 0.5) / side;
+                let p = c0 * ((1.0 - u) * (1.0 - v))
+                    + c1 * (u * (1.0 - v))
+                    + c2 * (u * v)
+                    + c3 * ((1.0 - u) * v);
+                let key = TileKey::displacement(face, level, tx, ty)?;
+                tiles.push((key, p.normalized().unwrap_or(p)));
+            }
+        }
+    }
+    Ok(tiles)
+}
+
+/// The `n` tiles of `tiles` (from [`tile_directions`]) nearest `direction`, nearest first; all
+/// of them if there are fewer.
+pub(crate) fn nearest_tiles(tiles: &[(TileKey, Vec3)], direction: Vec3, n: usize) -> Vec<TileKey> {
+    let mut by_distance: Vec<(f32, TileKey)> = tiles
+        .iter()
+        .map(|&(key, d)| ((d - direction).length(), key))
+        .collect();
+    by_distance.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    by_distance
+        .into_iter()
+        .take(n)
+        .map(|(_, key)| key)
+        .collect()
+}
+
+/// Whether tile `key` owns its vertex `(i, j)`: the one of the vertex's copies (one per tile
+/// holding it) that counts it, so a vertex on a tile border is counted, or written, once.
+///
+/// An interior vertex has one copy, and its tile owns it. A border vertex is owned by the least
+/// of its copies, ordered by face, tile row, tile column, then row and column within the tile:
+/// the order `sculpt`'s draw step uses, which every copy computes alike.
+pub(crate) fn owns(topology: &Topology, key: &TileKey, i: u32, j: u32) -> bool {
+    let inner = 1..key.side() - 1;
+    if inner.contains(&i) && inner.contains(&j) {
+        return true;
+    }
+    let region = Region::of_tile(key);
+    let copies = topology.copies(key.face(), key.level(), region.x0() + i, region.y0() + j);
+    let least = copies
+        .iter()
+        .map(|copy| (copy.face.index(), copy.ty, copy.tx, copy.j, copy.i))
+        .min();
+    least.is_none_or(|least| least == (key.face().index(), key.ty(), key.tx(), j, i))
+}
+
+/// Where the surface lies in `direction` from the origin, the centre of the closed benchmark
+/// surface: where a ray from the origin leaves it.
+///
+/// # Errors
+///
+/// If a tile can't be evaluated, or the ray leaves through no tile (the surface isn't closed
+/// around the origin).
+pub(crate) fn on_surface(
+    index: &SpatialIndex,
+    store: &mut TileStore,
+    direction: Vec3,
+) -> Result<Vec3> {
+    let ray = Ray::new(Vec3::ZERO, direction).ok_or_else(|| anyhow!("no direction"))?;
+    let hit = index
+        .raycast(store, &ray)
+        .context("raycasting")?
+        .ok_or_else(|| anyhow!("the ray along {direction:?} leaves through no tile"))?;
+    Ok(ray.at(hit.t))
+}
+
+/// Evaluated positions within `radius` of `center`, over the tiles the index finds there.
+///
+/// A vertex on a tile border counts once per tile holding it, a few percent more than the
+/// vertices themselves; the draw step's own count, which the harness reports, is exact.
+///
+/// # Errors
+///
+/// If a tile can't be evaluated.
+fn positions_within(
+    index: &SpatialIndex,
+    store: &mut TileStore,
+    center: Vec3,
+    radius: f32,
+) -> Result<usize> {
+    let keys: Vec<TileKey> = index.query_sphere(center, radius).collect();
+    let mut count = 0;
+    for key in keys {
+        count += store
+            .evaluate(key)?
+            .iter()
+            .filter(|&&p| (p - center).length() < radius)
+            .count();
+    }
+    Ok(count)
+}
+
+/// The radius that covers about `footprint` vertices around `center`, by bisection on the
+/// count of evaluated positions within it (see [`positions_within`]).
+///
+/// # Errors
+///
+/// If a tile can't be evaluated.
+pub(crate) fn calibrated_radius(
+    index: &SpatialIndex,
+    store: &mut TileStore,
+    center: Vec3,
+    footprint: usize,
+) -> Result<f32> {
+    let (mut low, mut high) = (0.0_f32, 2.0_f32);
+    for _ in 0..30 {
+        let mid = f32::midpoint(low, high);
+        if positions_within(index, store, center, mid)? < footprint {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    Ok(high)
+}
+
+/// The directions of a stroke's `steps` dabs from the origin: along a circle about the `z`
+/// axis through `start`, each `step` (in radians of that circle) on from the one before.
+pub(crate) fn path(start: Vec3, step: f32, steps: usize) -> impl Iterator<Item = Vec3> {
+    (0_u32..).take(steps).map(move |k| {
+        // Up to 2^24 steps convert exactly; strokes are hundreds.
+        #[expect(clippy::cast_precision_loss, reason = "step counts are far below 2^24")]
+        let angle = step * k as f32;
+        let (sin, cos) = angle.sin_cos();
+        Vec3::new(
+            start.x * cos - start.y * sin,
+            start.x * sin + start.y * cos,
+            start.z,
+        )
+    })
+}
+
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+mod tests {
+    use geom::cube_sphere;
+
+    use super::*;
+
+    #[test]
+    fn tile_directions_cover_the_sphere_and_nearest_finds_neighbours() {
+        let mesh = cube_sphere(2).unwrap();
+        let level = Level::new(8).unwrap();
+        let tiles = tile_directions(&mesh, level).unwrap();
+        assert_eq!(tiles.len(), 24 * 16, "every tile");
+        assert!(
+            tiles.iter().all(|(_, d)| (d.length() - 1.0).abs() < 1e-5),
+            "unit directions"
+        );
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let near = nearest_tiles(&tiles, up, 4);
+        assert_eq!(near.len(), 4, "as many as asked");
+        for key in &near {
+            let (_, d) = tiles.iter().find(|(k, _)| k == key).unwrap();
+            assert!(d.dot(up) > 0.95, "{key:?} is near the pole: {d:?}");
+        }
+        assert_eq!(
+            nearest_tiles(&tiles, up, 10_000).len(),
+            tiles.len(),
+            "at most all"
+        );
+    }
+
+    #[test]
+    fn the_path_turns_about_z() {
+        let start = Vec3::new(1.0, 0.0, 0.5);
+        let points: Vec<Vec3> = path(start, std::f32::consts::FRAC_PI_2, 3).collect();
+        assert_eq!(points.len(), 3, "three dabs");
+        assert!(
+            (points[1] - Vec3::new(0.0, 1.0, 0.5)).length() < 1e-6,
+            "a quarter turn"
+        );
+        assert!(
+            (points[2] - Vec3::new(-1.0, 0.0, 0.5)).length() < 1e-6,
+            "a half turn"
+        );
+    }
+}

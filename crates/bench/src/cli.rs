@@ -1,0 +1,445 @@
+//! The command line: which subcommand to run, and its options.
+//!
+//! Hand-parsed from `std::env::args`, as `pen-probe` does: `brushcraft-bench SUBCOMMAND
+//! [--flag VALUE | --flag=VALUE | --switch]…`. Every option has a default; each subcommand
+//! accepts only the options it uses, and refuses the rest, so a typo never runs a benchmark
+//! with a setting silently ignored.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
+
+/// What the harness prints when its arguments don't parse.
+pub(crate) const USAGE: &str = "\
+usage: brushcraft-bench SUBCOMMAND [OPTIONS]
+
+subcommands:
+  generate   build the benchmark sphere with fBm corrections at every level and save it
+  page-in    time evaluating and pinning a brush footprint and a large region, cold and warm
+  brush      time a stroke of draw steps over a footprint along a path
+  save       brush, then save: time, file growth and bytes per edited vertex
+             (the save goes into the project: it gains a save point each run)
+  budget     a random walk (evaluate, brush, pan) under a budget, sampling RSS every 100 ms
+
+options (each subcommand takes the ones it uses):
+  --project PATH          the project file (default $XDG_CACHE_HOME/brushcraft/bench/sphere.bcrf);
+                          never inside the repository. Recovery files go to `recovery/` beside it
+  --budget-mib N          the tile store's budget (default: generate 2048, page-in 4096,
+                          brush 2048, save 2048, budget 1024)
+  --seed N                the random seed (default 1)
+  generate: --splits N (20)  --levels N (9)  --amplitude F (0.01)  --force (replace the file)
+  page-in, brush, save, budget: --level N, the finest level, the one measured (9)
+  page-in:  --samples N (5)  --footprint VERTICES (50000)  --region-quads N (42000000)
+  brush:    --steps N (200)  --footprint VERTICES (50000)  --strength F (0.0001)
+  save:     --steps N (50)   --footprint VERTICES (50000)  --strength F (0.0001)
+  budget:   --moves N (20)  --steps-per-move N (10)  --view-tiles N (2000)
+            --footprint VERTICES (50000)  --strength F (0.0001)
+
+Results go to stdout as JSON lines; progress and a human summary go to stderr.";
+
+/// A subcommand: one benchmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Subcommand {
+    /// Build the benchmark sphere and save it.
+    Generate,
+    /// Time evaluating and pinning regions from a fresh cache.
+    PageIn,
+    /// Time a stroke of draw steps.
+    Brush,
+    /// Brush, then time a save.
+    Save,
+    /// A random walk under a memory budget, sampling RSS.
+    Budget,
+}
+
+impl Subcommand {
+    /// Every subcommand.
+    const ALL: [Self; 5] = [
+        Self::Generate,
+        Self::PageIn,
+        Self::Brush,
+        Self::Save,
+        Self::Budget,
+    ];
+
+    /// The subcommand's name on the command line and in the JSON records.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Generate => "generate",
+            Self::PageIn => "page-in",
+            Self::Brush => "brush",
+            Self::Save => "save",
+            Self::Budget => "budget",
+        }
+    }
+
+    /// The store budget the subcommand runs with unless told otherwise, in MiB.
+    ///
+    /// `page-in` pins a whole 42M-quad region at once (about 10,000 level-9 tiles, 1.3 GB of
+    /// evaluated and correction slots), so it needs more than the others; `budget` is the
+    /// spec's 1 GB workload.
+    const fn default_budget_mib(self) -> usize {
+        match self {
+            Self::Generate | Self::Brush | Self::Save => 2048,
+            Self::PageIn => 4096,
+            Self::Budget => 1024,
+        }
+    }
+
+    /// Whether the subcommand takes the option `flag`.
+    fn takes(self, flag: Flag) -> bool {
+        use Flag::{
+            Amplitude, BudgetMib, Footprint, Force, Level, Levels, Moves, Project, RegionQuads,
+            Samples, Seed, Splits, Steps, StepsPerMove, Strength, ViewTiles,
+        };
+        match flag {
+            Project | BudgetMib | Seed => true,
+            Splits | Levels | Amplitude | Force => self == Self::Generate,
+            Level | Footprint => self != Self::Generate,
+            Samples | RegionQuads => self == Self::PageIn,
+            Steps => matches!(self, Self::Brush | Self::Save),
+            Strength => matches!(self, Self::Brush | Self::Save | Self::Budget),
+            Moves | StepsPerMove | ViewTiles => self == Self::Budget,
+        }
+    }
+}
+
+/// An option's flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flag {
+    /// `--project`.
+    Project,
+    /// `--budget-mib`.
+    BudgetMib,
+    /// `--seed`.
+    Seed,
+    /// `--splits`.
+    Splits,
+    /// `--levels`.
+    Levels,
+    /// `--amplitude`.
+    Amplitude,
+    /// `--force`, a switch.
+    Force,
+    /// `--level`.
+    Level,
+    /// `--samples`.
+    Samples,
+    /// `--footprint`.
+    Footprint,
+    /// `--region-quads`.
+    RegionQuads,
+    /// `--steps`.
+    Steps,
+    /// `--strength`.
+    Strength,
+    /// `--moves`.
+    Moves,
+    /// `--steps-per-move`.
+    StepsPerMove,
+    /// `--view-tiles`.
+    ViewTiles,
+}
+
+impl Flag {
+    /// Every flag with its name, without the leading `--`.
+    const NAMES: [(Self, &'static str); 16] = [
+        (Self::Project, "project"),
+        (Self::BudgetMib, "budget-mib"),
+        (Self::Seed, "seed"),
+        (Self::Splits, "splits"),
+        (Self::Levels, "levels"),
+        (Self::Amplitude, "amplitude"),
+        (Self::Force, "force"),
+        (Self::Level, "level"),
+        (Self::Samples, "samples"),
+        (Self::Footprint, "footprint"),
+        (Self::RegionQuads, "region-quads"),
+        (Self::Steps, "steps"),
+        (Self::Strength, "strength"),
+        (Self::Moves, "moves"),
+        (Self::StepsPerMove, "steps-per-move"),
+        (Self::ViewTiles, "view-tiles"),
+    ];
+
+    /// The flag named `name` (without the leading `--`).
+    fn named(name: &str) -> Option<Self> {
+        Self::NAMES
+            .iter()
+            .find(|&&(_, n)| n == name)
+            .map(|&(flag, _)| flag)
+    }
+}
+
+/// Every option of every subcommand, with its value or its default.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Options {
+    /// The project file; `None` for the default under the cache directory (see
+    /// [`crate::paths`]).
+    pub(crate) project: Option<PathBuf>,
+    /// The tile store's budget, in MiB.
+    pub(crate) budget_mib: usize,
+    /// The seed of every random choice.
+    pub(crate) seed: u64,
+    /// `generate`: the base mesh's `cube_sphere` splits.
+    pub(crate) splits: u32,
+    /// `generate`: the finest level given corrections, from level 1.
+    pub(crate) levels: u8,
+    /// `generate`: the fBm noise's amplitude at level 1, halving every level after.
+    pub(crate) amplitude: f32,
+    /// `generate`: replace an existing project file.
+    pub(crate) force: bool,
+    /// The finest level of the project: the one evaluated, indexed and brushed.
+    pub(crate) level: u8,
+    /// `page-in`: samples of each measurement.
+    pub(crate) samples: usize,
+    /// The brush footprint, in vertices.
+    pub(crate) footprint: usize,
+    /// `page-in`: the large region, in quads of the measured level.
+    pub(crate) region_quads: u64,
+    /// `brush`, `save`: draw steps in the stroke.
+    pub(crate) steps: usize,
+    /// How far the draw brush pushes at its centre, along the frame normal.
+    pub(crate) strength: f32,
+    /// `budget`: places the walk pans to.
+    pub(crate) moves: usize,
+    /// `budget`: draw steps at each place.
+    pub(crate) steps_per_move: usize,
+    /// `budget`: tiles evaluated and pinned at each place, as a view would.
+    pub(crate) view_tiles: usize,
+}
+
+impl Options {
+    /// The defaults of `subcommand`.
+    fn defaults(subcommand: Subcommand) -> Self {
+        Self {
+            project: None,
+            budget_mib: subcommand.default_budget_mib(),
+            seed: 1,
+            splits: 20,
+            levels: 9,
+            amplitude: 0.01,
+            force: false,
+            level: 9,
+            samples: 5,
+            footprint: 50_000,
+            region_quads: 42_000_000,
+            steps: if subcommand == Subcommand::Save {
+                50
+            } else {
+                200
+            },
+            strength: 1e-4,
+            moves: 20,
+            steps_per_move: 10,
+            view_tiles: 2000,
+        }
+    }
+
+    /// The store budget in bytes.
+    pub(crate) const fn budget_bytes(&self) -> usize {
+        self.budget_mib.saturating_mul(1 << 20)
+    }
+
+    /// Sets `flag` from `value` (`None` for a switch).
+    ///
+    /// # Errors
+    ///
+    /// If the value doesn't parse, is out of range, or is missing (or given to a switch).
+    fn set(&mut self, flag: Flag, value: Option<OsString>) -> Result<()> {
+        if flag == Flag::Force {
+            ensure!(value.is_none(), "--force takes no value");
+            self.force = true;
+            return Ok(());
+        }
+        let value = value.ok_or_else(|| anyhow!("{} needs a value", flag_name(flag)))?;
+        if flag == Flag::Project {
+            self.project = Some(PathBuf::from(value));
+            return Ok(());
+        }
+        let text = value
+            .to_str()
+            .ok_or_else(|| anyhow!("{}'s value isn't text", flag_name(flag)))?;
+        match flag {
+            Flag::BudgetMib => self.budget_mib = parse(flag, text)?,
+            Flag::Seed => self.seed = parse(flag, text)?,
+            Flag::Splits => self.splits = positive(flag, text)?,
+            Flag::Levels => self.levels = positive(flag, text)?,
+            Flag::Amplitude => self.amplitude = finite(flag, text)?,
+            Flag::Level => self.level = positive(flag, text)?,
+            Flag::Samples => self.samples = positive(flag, text)?,
+            Flag::Footprint => self.footprint = positive(flag, text)?,
+            Flag::RegionQuads => self.region_quads = positive(flag, text)?,
+            Flag::Steps => self.steps = positive(flag, text)?,
+            Flag::Strength => self.strength = finite(flag, text)?,
+            Flag::Moves => self.moves = positive(flag, text)?,
+            Flag::StepsPerMove => self.steps_per_move = positive(flag, text)?,
+            Flag::ViewTiles => self.view_tiles = positive(flag, text)?,
+            Flag::Project | Flag::Force => {}
+        }
+        Ok(())
+    }
+}
+
+/// `flag` as typed: `--name`.
+fn flag_name(flag: Flag) -> String {
+    let name = Flag::NAMES
+        .iter()
+        .find(|&&(f, _)| f == flag)
+        .map_or("?", |&(_, n)| n);
+    format!("--{name}")
+}
+
+/// `text` parsed as a `T`, for `flag`.
+///
+/// # Errors
+///
+/// If it doesn't parse.
+fn parse<T: FromStr>(flag: Flag, text: &str) -> Result<T>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    text.parse()
+        .with_context(|| format!("{} {text:?}", flag_name(flag)))
+}
+
+/// `text` parsed as a positive integer, for `flag`.
+///
+/// # Errors
+///
+/// If it doesn't parse, or is zero.
+fn positive<T: FromStr + Default + PartialEq>(flag: Flag, text: &str) -> Result<T>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let value: T = parse(flag, text)?;
+    ensure!(
+        value != T::default(),
+        "{} must be positive",
+        flag_name(flag)
+    );
+    Ok(value)
+}
+
+/// `text` parsed as a finite float, for `flag`.
+///
+/// # Errors
+///
+/// If it doesn't parse, or isn't finite.
+fn finite(flag: Flag, text: &str) -> Result<f32> {
+    let value: f32 = parse(flag, text)?;
+    ensure!(value.is_finite(), "{} must be finite", flag_name(flag));
+    Ok(value)
+}
+
+/// What the command line asks for: a subcommand and its options.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Command {
+    /// The benchmark to run.
+    pub(crate) subcommand: Subcommand,
+    /// Its options.
+    pub(crate) options: Options,
+}
+
+impl Command {
+    /// Parses the arguments after the program name.
+    ///
+    /// # Errors
+    ///
+    /// On a missing or unknown subcommand, an unknown flag or one the subcommand doesn't take,
+    /// a flag without its value, a value that doesn't parse, or a stray argument.
+    pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
+        let mut args = args.into_iter();
+        let first = args.next().ok_or_else(|| anyhow!("no subcommand"))?;
+        let subcommand = Subcommand::ALL
+            .into_iter()
+            .find(|s| first.to_str() == Some(s.name()))
+            .ok_or_else(|| anyhow!("unknown subcommand {}", first.display()))?;
+        let mut options = Options::defaults(subcommand);
+        while let Some(arg) = args.next() {
+            let text = arg
+                .to_str()
+                .ok_or_else(|| anyhow!("argument {} isn't text", arg.display()))?;
+            let Some(body) = text.strip_prefix("--") else {
+                bail!("unexpected argument {text:?}");
+            };
+            let (name, inline) = match body.split_once('=') {
+                Some((name, value)) => (name, Some(OsString::from(value))),
+                None => (body, None),
+            };
+            let flag = Flag::named(name).ok_or_else(|| anyhow!("unknown option --{name}"))?;
+            ensure!(
+                subcommand.takes(flag),
+                "{} doesn't take --{name}",
+                subcommand.name()
+            );
+            let value = match inline {
+                Some(value) => Some(value),
+                None if flag == Flag::Force => None,
+                None => Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--{name} needs a value"))?,
+                ),
+            };
+            options.set(flag, value)?;
+        }
+        Ok(Self {
+            subcommand,
+            options,
+        })
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+mod tests {
+    use super::*;
+
+    /// Parses `args`, split on spaces.
+    ///
+    /// # Errors
+    ///
+    /// As [`Command::parse`].
+    fn parse(args: &str) -> Result<Command> {
+        Command::parse(args.split_whitespace().map(OsString::from))
+    }
+
+    #[test]
+    fn defaults_and_values_parse() {
+        let brush = parse("brush").unwrap();
+        assert_eq!(brush.subcommand, Subcommand::Brush, "the subcommand");
+        assert_eq!(brush.options.steps, 200, "brush's default steps");
+        assert_eq!(brush.options.budget_mib, 2048, "brush's default budget");
+        let save = parse("save --steps 7 --level=6 --project /tmp/x.bcrf").unwrap();
+        assert_eq!(save.options.steps, 7, "a spaced value");
+        assert_eq!(save.options.level, 6, "an inline value");
+        assert_eq!(
+            save.options.project,
+            Some(PathBuf::from("/tmp/x.bcrf")),
+            "a path"
+        );
+        let generate = parse("generate --force --splits 2").unwrap();
+        assert!(generate.options.force, "a switch");
+        assert_eq!(generate.options.splits, 2, "after a switch");
+    }
+
+    #[test]
+    fn bad_command_lines_are_refused() {
+        for (args, what) in [
+            ("", "no subcommand"),
+            ("frobnicate", "an unknown subcommand"),
+            ("brush --splits 3", "an option of another subcommand"),
+            ("brush --nope 3", "an unknown option"),
+            ("brush --steps", "a missing value"),
+            ("brush --steps 0", "zero steps"),
+            ("brush --steps x", "a value that doesn't parse"),
+            ("brush --strength inf", "an infinite strength"),
+            ("generate --force=yes", "a value for a switch"),
+            ("brush stray", "a stray argument"),
+        ] {
+            assert!(parse(args).is_err(), "{what}: {args:?}");
+        }
+    }
+}
