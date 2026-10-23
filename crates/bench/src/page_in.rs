@@ -8,6 +8,11 @@
 //! [`store::TileStore::pin`] of them: every tile evaluated coarse to fine from its corrections,
 //! and pinned with them. Cold samples first drop the file's pages with
 //! `posix_fadvise(DONTNEED)`; each warm sample repeats its cold sample's region right after.
+//!
+//! Emptying the store gives its chunks back to the system (`shrink_to(0)`), so every sample,
+//! warm ones too, also pays for mapping fresh chunks and faulting their pages in as the tiles
+//! fill them: zeroed pages from the kernel, a cost an app whose pool is already warm doesn't
+//! see. The warm figure is so an upper bound on paging in from the page cache alone.
 
 use std::fmt::Write as _;
 use std::io::Write;
