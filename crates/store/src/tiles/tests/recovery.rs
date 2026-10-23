@@ -877,3 +877,96 @@ fn a_roll_over_labels_an_unreadable_clean_tile_with_its_own_op() {
     assert_positions(&mut store, &dense(&mesh, &map), &top, "carried across");
     writer.close(&mut store, Instant::now()).unwrap();
 }
+
+/// Edits one interior vertex of every tile of `keys` as one op, each to its own value from
+/// `seed`, in the store and in the oracle's map.
+fn dirty_each(store: &mut TileStore, map: &mut CorrectionMap, keys: &[TileKey], seed: f32) {
+    store.begin_op().unwrap();
+    for (n, &key) in (0_u16..).zip(keys) {
+        dab_interior(store, map, key, Vec3::new(seed, f32::from(n) * 1e-4, 0.0));
+    }
+}
+
+#[test]
+fn a_flush_snapshots_at_most_a_batch_at_a_time() {
+    const BATCH: usize = 4;
+    for (name, config) in [("roomy", roomy()), ("tight", tight())] {
+        let dir = TestDir::new();
+        let mesh = mesh();
+        let path = dir.path("recovery.bcrf");
+        let mut store = new_store(&dir, "recovery.bcrf", &mesh, config);
+        let mut writer = RecoveryWriter::new(&mut store).unwrap();
+        writer.set_batch(BATCH);
+        let mut map = CorrectionMap::new();
+        let top = tiles(&mesh, TOP, TOP);
+        dirty_each(&mut store, &mut map, &top, 0.001);
+        let dirty = store.unsaved.len();
+        writer.end_stroke(&mut store, Instant::now()).unwrap();
+        settle(&mut writer, &mut store);
+        let slot = size_of::<CorrectionSlot>();
+        assert!(
+            writer.peak_snapshot_bytes() <= BATCH * slot,
+            "{name}: at most {BATCH} copies in flight, not {} bytes",
+            writer.peak_snapshot_bytes()
+        );
+        assert!(
+            writer.batches() >= dirty.div_ceil(BATCH),
+            "{name}: {dirty} dirty tiles take {} batches",
+            writer.batches()
+        );
+        assert_eq!(
+            writer.flushes(),
+            1,
+            "{name}: one save point, after the batches"
+        );
+        assert!(
+            store.unsaved.is_empty(),
+            "{name}: every edit is in the file"
+        );
+        let offset = writer.durable_save_point().unwrap();
+        drop(writer);
+        drop(store);
+        assert_save_point(&path, offset, &mesh, &map);
+    }
+}
+
+#[test]
+fn a_batched_flush_cuts_at_the_batch_that_takes_every_dirty_tile() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    writer.set_batch(4);
+    let mut map = CorrectionMap::new();
+    let top = tiles(&mesh, TOP, TOP);
+    assert!(top.len() > 12, "more dirty tiles than three batches");
+    dirty_each(&mut store, &mut map, &top, 0.001);
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    assert_eq!(writer.phase(), "pre-copying", "too many for one batch");
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(writer.phase(), "pre-copying", "a second pre-copy");
+
+    // Before the cut, in the same stroke: a tile already pre-copied, and one not reached yet.
+    let (first, last) = (top[0], top[top.len() - 1]);
+    dab_interior(&mut store, &mut map, first, Vec3::new(0.002, 0.0, 0.0));
+    dab_interior(&mut store, &mut map, last, Vec3::new(0.003, 0.0, 0.0));
+    let at_cut = map.clone();
+    while writer.phase() == "pre-copying" {
+        writer.step_blocking(&mut store).unwrap();
+    }
+    assert_eq!(writer.phase(), "encoding", "the batch that is the cut");
+
+    // Past the cut: the next flush's.
+    dab_interior(&mut store, &mut map, top[1], Vec3::new(0.004, 0.0, 0.0));
+    settle(&mut writer, &mut store);
+    let cut = writer.durable_save_point().unwrap();
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    let next = writer.durable_save_point().unwrap();
+    assert_eq!(writer.flushes(), 2, "two save points");
+    drop(writer);
+    drop(store);
+    assert_save_point(&path, cut, &mesh, &at_cut);
+    assert_save_point(&path, next, &mesh, &map);
+}

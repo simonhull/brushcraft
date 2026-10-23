@@ -698,6 +698,17 @@ pub(crate) struct Snapshot {
     pub(crate) slot: Box<CorrectionSlot>,
 }
 
+/// What [`TileStore::snapshot_dirty`] took: copies of dirty slots, and whether they are all of
+/// them.
+#[derive(Debug)]
+pub(crate) struct DirtyBatch {
+    /// The copies, in key order.
+    pub(crate) snapshots: Vec<Snapshot>,
+    /// Whether the copies are every dirty slot the flush mark held: `false` if the batch
+    /// stopped at its limit, with more left in the mark for the next one.
+    pub(crate) complete: bool,
+}
+
 /// Proof that a save copied every tile edited since the last rebase into a project file, made
 /// only by [`TileStore::save_into`] and taken by [`TileStore::rebase`].
 ///
@@ -1595,10 +1606,11 @@ impl TileStore {
         self.feed.has_pending(id) || self.streams.get(&id).is_some_and(|mark| !mark.is_empty())
     }
 
-    /// Copies, for streaming consumer `id`, every correction slot whose latest edit isn't in the
-    /// working file yet: the keys of its flush mark, with those the feed has pushed since its
-    /// last call added, that are resident and dirty, each with the op and stamp of its latest
-    /// write.
+    /// Copies, for streaming consumer `id`, the correction slots whose latest edit isn't in the
+    /// working file yet, at most `limit` of them: the keys of its flush mark, with those the
+    /// feed has pushed since its last call added, that are resident and dirty, in key order,
+    /// each with the op and stamp of its latest write. The batch says whether it holds every
+    /// such slot ([`DirtyBatch::complete`]), or stopped at `limit` with more left in the mark.
     ///
     /// A key of the mark whose slot is clean or not resident is in the working file already (a
     /// slot leaves the pool only once written back, and only a write clears it), so it leaves
@@ -1610,6 +1622,8 @@ impl TileStore {
     /// the flushes of the rest.
     ///
     /// This is the drawing thread's share of a flush: a copy of each slot, no encoding or I/O.
+    /// The limit bounds the copies' memory, `limit` × 26.9 KB, however many tiles a stroke
+    /// left dirty.
     ///
     /// # Errors
     ///
@@ -1618,15 +1632,20 @@ impl TileStore {
         &mut self,
         id: ConsumerId,
         skipped: &mut Vec<TileKey>,
-    ) -> Result<Vec<Snapshot>, CacheError> {
+        limit: usize,
+    ) -> Result<DirtyBatch, CacheError> {
         let drained = self.feed.drain(id);
         let Some(mark) = self.streams.get_mut(&id) else {
-            return Ok(Vec::new());
+            return Ok(DirtyBatch {
+                snapshots: Vec::new(),
+                complete: true,
+            });
         };
         mark.extend(drained.into_iter().map(|(key, _)| key));
         let (corrections, unsaved) = (&self.corrections, &self.unsaved);
-        let mut snapshots = Vec::with_capacity(mark.len());
+        let mut snapshots = Vec::with_capacity(mark.len().min(limit));
         let mut written = Vec::new();
+        let mut complete = true;
         for &key in mark.iter() {
             let Some(slot_id) = corrections.find(&key) else {
                 written.push(key);
@@ -1642,6 +1661,10 @@ impl TileStore {
                 written.push(key);
                 continue;
             };
+            if snapshots.len() == limit {
+                complete = false;
+                break;
+            }
             let mut copy = bytemuck::zeroed_box::<CorrectionSlot>();
             *copy = *corrections.get(slot_id).ok_or(Invariant::StaleHandle)?;
             snapshots.push(Snapshot {
@@ -1654,7 +1677,10 @@ impl TileStore {
         for key in &written {
             mark.remove(key);
         }
-        Ok(snapshots)
+        Ok(DirtyBatch {
+            snapshots,
+            complete,
+        })
     }
 
     /// Appends streaming consumer `id`'s encoded `tiles` to the working file: each one whose slot

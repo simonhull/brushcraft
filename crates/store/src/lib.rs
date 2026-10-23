@@ -41,5 +41,5 @@ pub use project::{
     CandidateStatus, KeptRecovery, Project, ProjectConfig, ProjectError, Protection,
     ROLL_OVER_RETRY, RecoveryCandidate, SaveOutcome, default_recovery_dir, find_recoveries,
 };
-pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
+pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter, SNAPSHOT_BATCH};
 pub use tiles::{CacheError, Invariant, PinGuard, StoreConfig, TileEdit, TileStore};

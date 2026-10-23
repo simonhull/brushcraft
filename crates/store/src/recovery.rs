@@ -9,7 +9,8 @@
 //!
 //! 1. **Snapshot** (owner): [`TileStore::snapshot_dirty`] copies every correction slot edited since
 //!    the writer's last flush and not yet in the working file, a 26.9 KB copy each, and the batch
-//!    goes to the writer thread. This is all a stroke end costs the drawing thread.
+//!    goes to the writer thread. This is all a stroke end costs the drawing thread. A batch holds
+//!    at most [`SNAPSHOT_BATCH`] copies (see below).
 //! 2. **Encoding** (writer): each copy is encoded, compressed and framed as a tile record, and the
 //!    records come back.
 //! 3. **Syncing tiles**: the owner appends the records to the working file
@@ -22,6 +23,28 @@
 //!
 //! The owner advances the phases in [`RecoveryWriter::poll`], which the app calls from its frame
 //! loop (and every trigger calls first); it never blocks there.
+//!
+//! # Batches
+//!
+//! A flush snapshots at most [`SNAPSHOT_BATCH`] tiles at a time, so the copies in flight stay
+//! under 7 MB however many tiles a stroke dirtied: an app that runs a stroke over a whole level
+//! without a tick in between would otherwise copy every one of them at its end, gigabytes
+//! outside the tile pool's budget.
+//!
+//! A save point names the state as of the flush's cut, and the cut is only right if every slot
+//! dirty at it is copied at it: a slot copied later may hold edits past the cut, and its state
+//! at the cut would be in no record. So a batch that can't take every dirty slot is a
+//! **pre-copy**: its records are appended (cleaning each slot unchanged since its copy, as any
+//! flush's do) but no save point follows, and the next batch is taken as soon as they are, as
+//! part of the same flush. The flush cuts at the first batch that takes every slot still dirty,
+//! and only that batch's snapshot is the cut: every slot clean then has its latest edit in the
+//! file already, from a pre-copy, a write-back or an earlier flush. The tile sync and the save
+//! point follow as usual.
+//!
+//! The save point is so deferred until the dirty slots fit one batch. Pre-copies take a batch
+//! each time the owner advances the flush, so they catch up with a stroke whose edits come
+//! slower than the writer encodes; at the latest, the stroke's end stops the edits, and the
+//! flush then cuts within a few batches.
 //!
 //! # Ordering
 //!
@@ -76,6 +99,11 @@ use crate::tiles::{CacheError, Snapshot, TileStore};
 /// The longest a [`RecoveryWriter::tick`] lets edits wait before it starts a flush.
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The most correction slots one snapshot copies: 256 copies of 26.9 KB, 6.9 MB in flight to
+/// the writer thread at most. A flush with more dirty slots takes them in batches (see the
+/// module notes).
+pub const SNAPSHOT_BATCH: usize = 256;
+
 /// Why a [`RecoveryWriter`] call failed. The flush it was part of is abandoned and its edits are
 /// kept for the next one (see the module notes).
 #[derive(Debug, Error)]
@@ -108,7 +136,11 @@ pub enum RecoveryError {
 enum Phase {
     /// No flush in flight.
     Idle,
-    /// The writer thread is encoding the snapshot.
+    /// The writer thread is encoding a pre-copy: a batch that couldn't take every dirty slot,
+    /// whose records go into the file with no save point after them (see the module notes).
+    PreCopying,
+    /// The writer thread is encoding the flush's cut: the batch that took every slot still
+    /// dirty.
     Encoding,
     /// The writer thread is syncing the tiles appended so far, which end at byte `end`.
     SyncingTiles {
@@ -153,6 +185,12 @@ struct Hooks {
     /// Syncs still to fail once the passing ones have run, counting down: each fails with an
     /// I/O error instead of syncing.
     failing_syncs: std::sync::atomic::AtomicUsize,
+    /// Bytes of snapshot copies handed to the writer thread and not yet dropped by it.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// The most [`Hooks::in_flight`] has been.
+    peak_in_flight: std::sync::atomic::AtomicUsize,
+    /// Batches handed to the writer thread to encode.
+    batches: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -165,6 +203,27 @@ impl Hooks {
                 .is_ok()
         }
         !count_down(&self.passing_syncs) && count_down(&self.failing_syncs)
+    }
+
+    /// The bytes `snapshots` hold, their slots' copies.
+    const fn bytes_of(snapshots: &[Snapshot]) -> usize {
+        snapshots.len() * size_of::<crate::slot::CorrectionSlot>()
+    }
+
+    /// `snapshots` are handed to the writer thread: counts their bytes in flight.
+    fn sent(&self, snapshots: &[Snapshot]) {
+        let now = self
+            .in_flight
+            .fetch_add(Self::bytes_of(snapshots), Ordering::SeqCst)
+            + Self::bytes_of(snapshots);
+        self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+        self.batches.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The writer thread dropped `snapshots`: their bytes are no longer in flight.
+    fn dropped(&self, snapshots: &[Snapshot]) {
+        self.in_flight
+            .fetch_sub(Self::bytes_of(snapshots), Ordering::SeqCst);
     }
 }
 
@@ -207,6 +266,8 @@ pub struct RecoveryWriter {
     /// Tiles left out of a flush because their slots were broken, not yet reported (see
     /// [`RecoveryWriter::take_skipped`]).
     skipped: Vec<TileKey>,
+    /// The most slots one snapshot copies: [`SNAPSHOT_BATCH`], less in tests.
+    batch: usize,
     /// Test hooks shared with the writer thread.
     #[cfg(test)]
     hooks: Arc<Hooks>,
@@ -249,6 +310,7 @@ impl RecoveryWriter {
             flushes: 0,
             generation: store.generation(),
             skipped: Vec::new(),
+            batch: SNAPSHOT_BATCH,
             #[cfg(test)]
             hooks,
         })
@@ -258,7 +320,8 @@ impl RecoveryWriter {
     /// flight. Advances the flush in flight first (see [`RecoveryWriter::poll`]).
     ///
     /// The drawing thread's cost is the snapshot: one slot copy per tile edited since the last
-    /// flush. Encoding, compression and syncing happen on the writer thread.
+    /// flush, at most [`SNAPSHOT_BATCH`] at a time (the rest follow as the flush advances).
+    /// Encoding, compression and syncing happen on the writer thread.
     ///
     /// # Errors
     ///
@@ -397,9 +460,10 @@ impl RecoveryWriter {
         }
     }
 
-    /// Starts a flush at `at`: snapshots the dirty slots and hands them to the writer thread.
-    /// With nothing to encode it goes straight to syncing, if the file holds tiles no save point
-    /// names yet or the last flush failed, and does nothing otherwise.
+    /// Starts a flush at `at`: snapshots the dirty slots and hands them to the writer thread
+    /// ([`RecoveryWriter::take_batch`]). With nothing to encode it goes straight to syncing, if
+    /// the file holds tiles no save point names yet or the last flush failed, and does nothing
+    /// otherwise.
     ///
     /// # Errors
     ///
@@ -408,19 +472,46 @@ impl RecoveryWriter {
     fn start(&mut self, store: &mut TileStore, at: Instant) -> Result<(), RecoveryError> {
         self.queued = None;
         let owed = std::mem::take(&mut self.unconfirmed);
-        store.open_cut();
         self.generation = store.generation();
-        let started = match store.snapshot_dirty(self.consumer, &mut self.skipped) {
-            Ok(snapshots) if !snapshots.is_empty() => self
-                .send(Request::Encode(snapshots))
-                .map(|()| self.phase = Phase::Encoding),
-            Ok(_) if owed || store.has_unsaved_tiles() => self.request_tile_sync(store),
+        let started = match self.take_batch(store) {
+            Ok(true) => Ok(()),
+            Ok(false) if owed || store.has_unsaved_tiles() => self.request_tile_sync(store),
             // Nothing to flush: the interval keeps running from the last real flush.
-            Ok(_) => return Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(false) => return Ok(()),
+            Err(e) => Err(e),
         };
         self.last_flush = Some(at);
         self.settle(started)
+    }
+
+    /// Takes the flush's next batch: opens a cut at the latest write, snapshots at most
+    /// [`RecoveryWriter::batch`] dirty slots, and hands them to the writer thread, as the
+    /// cut's batch if they are every dirty slot and as a pre-copy if not (see the module
+    /// notes). Returns whether there was anything to hand over.
+    ///
+    /// The cut is opened whatever the batch turns out to be: no write comes between it and the
+    /// snapshot, and a pre-copy's cut is replaced by the next batch's, which every record
+    /// appended meanwhile is at or before.
+    ///
+    /// # Errors
+    ///
+    /// [`RecoveryError::Store`] if the snapshot fails; [`RecoveryError::Stopped`] if the writer
+    /// thread is gone.
+    fn take_batch(&mut self, store: &mut TileStore) -> Result<bool, RecoveryError> {
+        store.open_cut();
+        let batch = store.snapshot_dirty(self.consumer, &mut self.skipped, self.batch)?;
+        if batch.snapshots.is_empty() {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        self.hooks.sent(&batch.snapshots);
+        self.send(Request::Encode(batch.snapshots))?;
+        self.phase = if batch.complete {
+            Phase::Encoding
+        } else {
+            Phase::PreCopying
+        };
+        Ok(true)
     }
 
     /// Blocks for the writer thread's next reply and advances the flush with it.
@@ -461,12 +552,17 @@ impl RecoveryWriter {
             return Err(RecoveryError::OutOfStep);
         }
         match (self.phase, reply) {
-            (Phase::Encoding, Reply::Encoded(tiles, broken)) => {
+            (phase @ (Phase::PreCopying | Phase::Encoding), Reply::Encoded(tiles, broken)) => {
                 for key in broken {
                     store.drop_from_stream(self.consumer, &key);
                     self.skipped.push(key);
                 }
                 store.append_streamed(self.consumer, &tiles)?;
+                // A pre-copy goes on to the next batch; once a batch is the cut, or nothing is
+                // left dirty (all of it in the file now), the tiles are synced for the save point.
+                if phase == Phase::PreCopying && self.take_batch(store)? {
+                    return Ok(());
+                }
                 self.request_tile_sync(store)
             }
             (Phase::SyncingTiles { end }, Reply::Synced(synced)) => {
@@ -563,16 +659,33 @@ impl RecoveryWriter {
         self.wait_step(store)
     }
 
-    /// The phase of the flush in flight, by name: `idle`, `encoding`, `syncing tiles`,
-    /// `syncing save point` or `failed`.
+    /// The phase of the flush in flight, by name: `idle`, `pre-copying`, `encoding`,
+    /// `syncing tiles`, `syncing save point` or `failed`.
     pub(crate) const fn phase(&self) -> &'static str {
         match self.phase {
             Phase::Idle => "idle",
+            Phase::PreCopying => "pre-copying",
             Phase::Encoding => "encoding",
             Phase::SyncingTiles { .. } => "syncing tiles",
             Phase::SyncingSavePoint { .. } => "syncing save point",
             Phase::Failed => "failed",
         }
+    }
+
+    /// Makes every snapshot copy at most `batch` slots, instead of [`SNAPSHOT_BATCH`].
+    pub(crate) const fn set_batch(&mut self, batch: usize) {
+        self.batch = batch;
+    }
+
+    /// The most bytes of snapshot copies ever in flight to the writer thread at once: handed
+    /// over and not yet dropped by it.
+    pub(crate) fn peak_snapshot_bytes(&self) -> usize {
+        self.hooks.peak_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Batches handed to the writer thread to encode so far.
+    pub(crate) fn batches(&self) -> usize {
+        self.hooks.batches.load(Ordering::SeqCst)
     }
 
     /// A handle that upgrades only while the writer or its thread is alive: once the writer is
@@ -615,10 +728,16 @@ impl Worker {
     fn run(self) {
         while let Ok(request) = self.requests.recv() {
             let reply = match request {
-                Request::Encode(snapshots) => match self.encode(&snapshots) {
-                    Some((framed, broken)) => Reply::Encoded(framed, broken),
-                    None => return,
-                },
+                Request::Encode(snapshots) => {
+                    let encoded = self.encode(&snapshots);
+                    #[cfg(test)]
+                    self.hooks.dropped(&snapshots);
+                    drop(snapshots);
+                    match encoded {
+                        Some((framed, broken)) => Reply::Encoded(framed, broken),
+                        None => return,
+                    }
+                }
                 Request::Sync(syncer) => Reply::Synced(sync(
                     &syncer,
                     #[cfg(test)]
