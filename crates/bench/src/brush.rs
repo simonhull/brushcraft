@@ -7,10 +7,11 @@
 //! on the surface by a raycast from the origin. Every dab is one [`sculpt::draw_step`], timed
 //! as a whole (the latency reported, p50 and p99) and by its phases (the means reported).
 //!
-//! The stroke runs warm: planning it ([`Plan::new`]) raycasts every dab's centre first, which
-//! evaluates the tiles along the path, so the steps find most of their tiles resident and
-//! evaluated (as an app's do, the view having drawn them). What a cold region costs is
-//! `page-in`'s measure.
+//! The stroke runs warm: planning it ([`Plan::new`]) raycasts every dab's centre first, then
+//! evaluates every tile the dabs' spheres reach, positions and normals, so the steps find their
+//! tiles resident and evaluated (as an app's do, the view having drawn them). The index is
+//! loaded from the project's stored bounds, which evaluates nothing, so this warm-up is the
+//! stroke's own. What a cold region costs is `page-in`'s measure.
 //!
 //! Loading the spatial index comes first, and is reported apart: from the bounds `generate`
 //! saved with the tiles, it evaluates no tile (a project without them has all 153,600 level-9
@@ -21,13 +22,13 @@
 //! much the file grew per edited vertex. The save goes into the project file, which gains a
 //! save point every run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use geom::{TileKey, Vec3};
-use store::{Project, SpatialIndex};
+use store::{Evaluation, Project, SpatialIndex};
 
 use crate::cli::Options;
 use crate::noise::Rng;
@@ -61,8 +62,8 @@ impl Plan {
     /// A stroke of `steps` dabs starting in `direction` from the origin, with a brush of
     /// `size` (see the module notes).
     ///
-    /// Finding the dabs' centres raycasts the path, which evaluates the tiles along it: the
-    /// stroke then runs warm.
+    /// Finding the dabs' centres raycasts the path, and every tile a dab's sphere reaches is then
+    /// evaluated, positions and normals, together: the stroke runs warm.
     ///
     /// # Errors
     ///
@@ -85,6 +86,14 @@ impl Plan {
         let centres = path(direction, STEP_RADII * radius, steps)
             .map(|d| on_surface(index, store, d))
             .collect::<Result<Vec<_>>>()?;
+        let reached: BTreeSet<TileKey> = centres
+            .iter()
+            .flat_map(|&centre| index.query_sphere(centre, radius))
+            .collect();
+        let reached: Vec<TileKey> = reached.into_iter().collect();
+        store
+            .evaluate_many(&reached, Evaluation::Normals)
+            .context("warming the stroke's tiles")?;
         Ok(Self { radius, centres })
     }
 }
