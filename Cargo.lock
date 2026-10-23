@@ -589,6 +589,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernels"
+version = "0.0.0"
+dependencies = [
+ "divan",
+]
+
+[[package]]
 name = "keyboard-types"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
