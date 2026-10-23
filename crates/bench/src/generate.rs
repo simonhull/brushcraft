@@ -9,8 +9,10 @@
 //!
 //! Everything goes through [`Project`], as the app's edits do: a stroke per level, each tile
 //! evaluated, then edited with [`store::TileStore::edit_tile`], each vertex written once
-//! through the tile that owns it (which writes its copies in the neighbouring tiles too). Then
-//! [`Project::save_as`] writes the project file and the recovery file is deleted.
+//! through the tile that owns it (which writes its copies in the neighbouring tiles too), and the
+//! project ticked every [`TICK_EVERY`] tiles, as a frame loop would, so the recovery writer
+//! streams the edits as they are made. Then [`Project::save_as`] writes the project file and
+//! the recovery file is deleted.
 
 use std::io::Write;
 use std::time::Instant;
@@ -27,8 +29,12 @@ use crate::session;
 use crate::surface::owns;
 use crate::sys::Rss;
 
-/// How often, in tiles, the generator lets the recovery writer advance.
-const POLL_EVERY: usize = 64;
+/// How often, in tiles, the generator ticks the project ([`Project::tick`]).
+///
+/// A tick, as the app's frame loop makes one, advances the recovery flush in flight and starts
+/// a new one once a second has passed, so a level's edits stream into the recovery file while
+/// it is sculpted, rather than all waiting for the flush at its stroke's end.
+const TICK_EVERY: usize = 64;
 
 /// Every tile of `level` on a mesh of `faces` faces, face by face, row by row.
 ///
@@ -135,8 +141,8 @@ pub(crate) fn run<J: Write, H: Write>(
             sculpt_tile(&mut project, noise, octave, key, &mut scratch)?;
             vertices += u64::try_from(scratch.writes.len())?;
             done += 1;
-            if done % POLL_EVERY == 0 {
-                project.poll()?;
+            if done % TICK_EVERY == 0 {
+                project.tick(Instant::now())?;
             }
             out.progress(&format!("level {level}"), done, total, start)?;
         }
