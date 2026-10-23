@@ -9,7 +9,8 @@
 //!    any correction is written: an edit moves the positions of every tile holding a copy of the
 //!    vertex, and a later tile's brush must see the surface as the step found it.
 //! 4. **Edit**: each delta is added to the `z` of its vertex's correction (read-modify-write, `c.z
-//!    += delta`) through [`TileStore::edit_tile`], which keeps seam twins in step.
+//!    += delta`) through [`TileStore::update_tiles`], which keeps seam twins in step and, the tiles
+//!    being pinned, writes their interiors in parallel.
 //! 5. **Neighbours**: the tiles whose bounds may have changed are listed. That is every tile
 //!    holding a vertex within the radius, whose positions moved, and every tile whose normals read
 //!    one of those, whose normal cones may have turned: the tiles each reached tile's normals read,
@@ -31,7 +32,7 @@
 //! its position and correction, and the copies agree bit for bit. Each of those tiles is a
 //! candidate, and its brush finds the vertex within the radius with the same delta. Adding the
 //! delta once per copy would push the vertex once per tile that holds it, so exactly one copy
-//! edits it: the least of its copies (see [`geom::Topology::owns`]). `edit_tile` then writes the
+//! edits it: the least of its copies (see [`geom::Topology::owns`]). The edit then writes the
 //! new value into every copy.
 
 use std::collections::BTreeSet;
@@ -40,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use brush::Smoothstep;
 use geom::{EvalError, Region, TileKey, Vec3, normal_tiles};
-use store::{CacheError, Evaluation, IndexError, Project, SpatialIndex, TileEdit, TileStore};
+use store::{CacheError, Evaluation, IndexError, Project, SpatialIndex, TileStore};
 use thiserror::Error;
 
 /// Why [`DrawParams::new`] refused its arguments.
@@ -252,8 +253,8 @@ impl Laps {
 /// [`SculptError::Cache`] if the store can't pin the tiles the brush touches (more than its
 /// budget holds, for one), evaluate them or edit them; [`SculptError::Index`] if the index
 /// can't be updated; [`SculptError::Eval`] never, for a valid mesh. An error in the edit phase
-/// leaves the tiles edited before it edited (each tile's edit is whole), and the index not
-/// updated for them: rebuild it.
+/// leaves the tiles edited as [`TileStore::update_tiles`] says, and the index not updated for
+/// them: rebuild it.
 pub fn draw_step(
     project: &mut Project,
     index: &mut SpatialIndex,
@@ -272,9 +273,8 @@ pub fn draw_step(
     let found = run_brush(store, pins.keys(), params)?;
     times.brush = laps.lap();
 
-    for tile in &found.edits {
-        store.edit_tile(tile.key, |edit| add_deltas(edit, &tile.deltas))??;
-    }
+    let edited: Vec<TileKey> = found.edits.iter().map(|tile| tile.key).collect();
+    store.update_tiles(&edited, |n, i, j, c| add_delta(&found.edits, n, i, j, c))?;
     times.edit = laps.lap();
 
     let changed = bounds_changed(store.mesh(), &found.reached)?;
@@ -341,18 +341,13 @@ fn run_brush(
     Ok(found)
 }
 
-/// The edit phase for one tile: adds each nonzero delta to the `z` of its vertex's correction,
-/// in row-major order.
-///
-/// # Errors
-///
-/// As [`TileEdit::update`].
-fn add_deltas(edit: &mut TileEdit<'_>, deltas: &[f32]) -> Result<(), CacheError> {
-    let side = edit.key().side();
-    edit.update(|i, j, c| {
-        let delta = deltas.get(usize::try_from(j * side + i).ok()?).copied()?;
-        (delta != 0.0).then(|| Vec3::new(c.x, c.y, c.z + delta))
-    })
+/// The edit for vertex `(i, j)` of tile `edits[n]`, whose correction is `c`: its delta added
+/// to `c`'s `z`, or `None` (no write) where the delta is zero.
+fn add_delta(edits: &[TileDeltas], n: usize, i: u32, j: u32, c: Vec3) -> Option<Vec3> {
+    let tile = edits.get(n)?;
+    let at = usize::try_from(j * tile.key.side() + i).ok()?;
+    let delta = tile.deltas.get(at).copied()?;
+    (delta != 0.0).then(|| Vec3::new(c.x, c.y, c.z + delta))
 }
 
 /// The tiles whose bounds an edit of the `reached` tiles may change, each once, in key order.

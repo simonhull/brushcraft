@@ -1904,10 +1904,7 @@ fn updating_a_tile_equals_getting_and_setting_each_vertex() {
         );
         if poisoned.is_some() {
             assert!(
-                matches!(
-                    got,
-                    Err(CacheError::Correction(CorrectionError::NotFinite))
-                ),
+                matches!(got, Err(CacheError::Correction(CorrectionError::NotFinite))),
                 "round {round}: {got:?}"
             );
         }
@@ -1926,6 +1923,147 @@ fn updating_a_tile_equals_getting_and_setting_each_vertex() {
             "{key:?}: the same bits"
         );
     }
+}
+
+/// A change for [`updating_tiles_equals_updating_each_in_turn`], a pure function of its
+/// arguments.
+///
+/// The round, the tile's place in the list and the vertex pick it. About half the vertices
+/// move; now and then one by a lot (so the scale grows part-way through a tile). In the
+/// `poisoned` round, tile 3 gets a value that isn't finite part-way through a row.
+fn tiles_change(round: u32, poisoned: bool, tile: usize, i: u32, j: u32, c: Vec3) -> Option<Vec3> {
+    let tile = u32::try_from(tile).unwrap();
+    if poisoned && tile == 3 && (i, j) == (9, 7) {
+        return Some(Vec3::new(0.0, f32::INFINITY, 0.0));
+    }
+    let seed = u64::from(round) << 40 ^ u64::from(tile) << 24 ^ u64::from(j) << 12 ^ u64::from(i);
+    let mut rng = Rng(seed);
+    let delta = match rng.below(40) {
+        0..20 => return None,
+        20 => rng.vec3(0.05),
+        _ => rng.vec3(0.002),
+    };
+    Some(Vec3::new(c.x + delta.x, c.y + delta.y, c.z + delta.z))
+}
+
+/// Runs round `round` of [`updating_tiles_equals_updating_each_in_turn`] on `store`, as a new op.
+///
+/// The store named "None" edits one tile at a time (the definition), the others with
+/// [`TileStore::update_tiles`]. Returns the outcome, printed.
+fn update_round(
+    name: &str,
+    store: &mut TileStore,
+    keys: &[TileKey],
+    round: u32,
+    poisoned: bool,
+) -> String {
+    store.begin_op().unwrap();
+    let change = |n: usize, i: u32, j: u32, c: Vec3| tiles_change(round, poisoned, n, i, j, c);
+    let outcome = if name == "None" {
+        (0..).zip(keys).try_for_each(|(n, &key)| {
+            store
+                .edit_tile(key, |edit| edit.update(|i, j, c| change(n, i, j, c)))
+                .and_then(std::convert::identity)
+        })
+    } else {
+        store.update_tiles(keys, change)
+    };
+    format!("{outcome:?}")
+}
+
+#[test]
+fn updating_tiles_equals_updating_each_in_turn() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    // Neighbouring tiles of the finest level, sharing borders; one of them (5) isn't pinned.
+    let keys: Vec<TileKey> = tiles(&mesh, TOP, TOP).into_iter().take(12).collect();
+    let pinned: Vec<TileKey> = (0..)
+        .zip(&keys)
+        .filter(|&(n, _)| n != 5)
+        .map(|(_, &k)| k)
+        .collect();
+    let mut stores: Vec<(String, TileStore)> = [None, Some(1), Some(2), Some(5)]
+        .into_iter()
+        .map(|threads| {
+            let name = format!("{threads:?}");
+            let config = roomy().with_threads(threads.and_then(NonZeroUsize::new));
+            let store = new_store(&dir, &format!("{name}.bcp"), &mesh, config);
+            (name, store)
+        })
+        .collect();
+    let guards: Vec<PinGuard> = stores
+        .iter_mut()
+        .map(|(_, store)| store.pin(&pinned).unwrap())
+        .collect();
+    for round in 0..5 {
+        for (name, store) in &mut stores {
+            assert_eq!(
+                update_round(name, store, &keys, round, false),
+                "Ok(())",
+                "{name}"
+            );
+        }
+    }
+    let (reference, others) = stores.split_first_mut().unwrap();
+    let reference = &mut reference.1;
+    let edited: BTreeSet<TileKey> = reference.unsaved.keys().copied().collect();
+    assert!(
+        edited.len() > keys.len(),
+        "border copies reached other tiles"
+    );
+    let expected_feed = reference.feed.drain(reference.save_consumer);
+    for (name, store) in others.iter_mut() {
+        assert_eq!(
+            store.unsaved, reference.unsaved,
+            "{name} workers: the same tiles dirty, with the same ops and stamps"
+        );
+        assert_eq!(
+            store.feed.drain(store.save_consumer),
+            expected_feed,
+            "{name} workers: the same feed"
+        );
+        for key in &edited {
+            assert_eq!(
+                slot_resident(store, key),
+                slot_resident(reference, key),
+                "{name} workers, {key:?}: the same bits"
+            );
+        }
+    }
+
+    // A value that isn't finite in tile 3: the same error; the tiles up to it edited alike;
+    // any later tile whose interior was written is dirty in the round's op.
+    let before: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|key| slot_resident(reference, key))
+        .collect();
+    let expected = update_round("None", reference, &keys, 5, true);
+    assert!(expected.contains("NotFinite"), "{expected}");
+    for (name, store) in others.iter_mut() {
+        assert_eq!(
+            update_round(name, store, &keys, 5, true),
+            expected,
+            "{name} workers"
+        );
+        let op = store.current_op().unwrap();
+        for (n, key) in keys.iter().enumerate() {
+            let bits = slot_resident(store, key);
+            if n <= 3 {
+                assert_eq!(
+                    bits,
+                    slot_resident(reference, key),
+                    "{name} workers, tile {n}"
+                );
+            } else if bits != before[n] {
+                assert_eq!(
+                    store.unsaved.get(key).map(|dirty| dirty.op),
+                    Some(op),
+                    "{name} workers, tile {n}: written, so dirty"
+                );
+            }
+        }
+    }
+    drop(guards);
 }
 
 #[test]

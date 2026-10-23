@@ -108,9 +108,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use geom::{
-    BaseMesh, Channel, CorrectionError, CorrectionView, EvalError, FaceId, LayerId, Level,
-    MAX_COPIES, PositionSource, Region, TileKey, Vec3, normal_tiles, normals_into, parent_tiles,
-    predict_region, refresh_normals_into,
+    BaseMesh, Channel, CorrectionError, CorrectionView, CorrectionViewMut, EvalError, FaceId,
+    LayerId, Level, MAX_COPIES, PositionSource, Region, TileKey, Vec3, normal_tiles, normals_into,
+    parent_tiles, predict_region, refresh_normals_into,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -692,8 +692,8 @@ impl EvalLog {
 /// - the buffers and zstd context the owner thread reads correction tiles with, each evaluation
 ///   worker's (made the first time a round's tiles are loaded on the workers) and each prefetch
 ///   worker's (at most four): about 150 KB a thread, so a few MB with dozens of workers, with the
-///   prefetched tiles waiting for [`TileStore::poll`] and the spare boxes the workers decode
-///   into, about 27 KB each;
+///   prefetched tiles waiting for [`TileStore::poll`] and the spare boxes the workers decode into,
+///   about 27 KB each;
 /// - what each evaluation worker allocates while it predicts a tile or computes its normals: the
 ///   gathered parent block, the prediction and its tangent frames, a few tiles' worth (a few
 ///   hundred KB for the largest tiles), freed when the tile is done;
@@ -1819,6 +1819,114 @@ impl TileStore {
         Ok(result)
     }
 
+    /// Rewrites the corrections of each tile of `keys` in turn, as part of the current op: the
+    /// same as [`TileStore::edit_tile`] with [`TileEdit::update`] for each tile in order, with
+    /// `f(n, i, j, c)` for vertex `(i, j)` of `keys[n]`, and the same bits; faster, as tiles
+    /// the caller holds pinned (with [`TileStore::pin`]) have their interiors written on the
+    /// store's workers.
+    ///
+    /// That is sound because a tile's interior vertices have no copies in other tiles, and its
+    /// quantization scale covers its interior alone: what an interior write reads and changes
+    /// is the tile's own, whichever tile is edited first. So each run of consecutive pinned
+    /// tiles (no tile twice) has its interiors written in parallel, each tile's in row-major
+    /// order (a value that outgrows the scale re-quantizes the interior, so the order within a
+    /// tile matters); then, tile by tile in order, its border vertices are set with their
+    /// copies and the tile is marked written where its first write falls in row-major order,
+    /// as one tile at a time would. `f` must so be a pure function of its arguments: it is
+    /// called for a tile's interior before its border, and on several threads. Other tiles are
+    /// edited one at a time.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::edit_tile`] and [`TileEdit::update`], for the first tile that fails, in
+    /// order: the tiles before it are edited, and it is left as [`TileEdit::update`] leaves a
+    /// tile. Tiles after it in its run may have had their interiors written; any that was is
+    /// marked written and its evaluations dropped, as for a whole edit.
+    pub fn update_tiles(
+        &mut self,
+        keys: &[TileKey],
+        f: impl Fn(usize, u32, u32, Vec3) -> Option<Vec3> + Sync,
+    ) -> Result<(), CacheError> {
+        self.sync_pins()?;
+        let mut start = 0;
+        while let Some(&next) = keys.get(start) {
+            let mut run: Vec<TileKey> = Vec::new();
+            for key in keys.get(start..).unwrap_or_default() {
+                if run.contains(key) || !self.corrections.is_pinned(key) {
+                    break;
+                }
+                run.push(*key);
+            }
+            if run.len() < 2 {
+                self.edit_tile(next, |edit| edit.update(|i, j, c| f(start, i, j, c)))??;
+                start += 1;
+            } else {
+                self.update_run(start, &run, &f)?;
+                start += run.len();
+            }
+        }
+        Ok(())
+    }
+
+    /// [`TileStore::update_tiles`] for `run`, tiles `first..` of its keys, each pinned by the
+    /// caller and none twice: their interiors in parallel, then each tile's border and marking
+    /// in order.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::update_tiles`].
+    fn update_run(
+        &mut self,
+        first: usize,
+        run: &[TileKey],
+        f: &(impl Fn(usize, u32, u32, Vec3) -> Option<Vec3> + Sync),
+    ) -> Result<(), CacheError> {
+        self.check_keys_and_op(run)?;
+        let ids = run
+            .iter()
+            .map(|key| {
+                self.corrections
+                    .lookup(key)
+                    .map(|(id, _)| id)
+                    .ok_or(Invariant::StaleHandle)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut slots = self
+            .corrections
+            .get_many_mut(&ids)
+            .ok_or(Invariant::StaleHandle)?;
+        let interiors: Vec<InteriorPass> = self.workers.install(|| {
+            run.par_iter()
+                .zip(slots.par_iter_mut())
+                .enumerate()
+                .map(|(k, (key, slot))| {
+                    update_interior(slot, key.side(), |i, j, c| f(first + k, i, j, c))
+                })
+                .collect()
+        });
+        let mut outcome = Ok(());
+        for (k, (&key, pass)) in run.iter().zip(interiors).enumerate() {
+            if outcome.is_err() {
+                // Past the failing tile: one whose interior was written is marked and dropped.
+                if pass.first_row.is_some() {
+                    #[expect(
+                        clippy::redundant_closure_for_method_calls,
+                        reason = "the method path names one edit lifetime; edit_tile's closure \
+                                  must take any"
+                    )]
+                    self.edit_tile(key, |edit| edit.mark_own_written())??;
+                }
+                continue;
+            }
+            outcome = self
+                .edit_tile(key, |edit| {
+                    edit.update_border(pass, |i, j, c| f(first + k, i, j, c))
+                })
+                .and_then(std::convert::identity);
+        }
+        outcome
+    }
+
     /// `key`'s evaluated positions, row-major `side²`: cached, else computed coarse to fine
     /// from the base mesh, or from the finest level of its cone that is cached (see the module
     /// notes), with its corrections.
@@ -2469,6 +2577,17 @@ impl TileStore {
             });
         }
         Ok(())
+    }
+
+    /// Checks each of `keys` as [`TileStore::check_key`] does, and that an op is current or can
+    /// be begun, before anything of an edit is written.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::NotATile`]; [`CacheError::OpsExhausted`].
+    fn check_keys_and_op(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {
+        keys.iter().try_for_each(|key| self.check_key(key))?;
+        self.edit_op().map(drop)
     }
 
     /// Checks that `key` names a tile this store holds: base layer, displacement, level ≥ 1, a
@@ -3132,7 +3251,13 @@ impl TileStore {
                     .get_mut(fill.id)
                     .ok_or(Invariant::StaleHandle)?;
                 let scratch = &mut self.read_scratch;
-                outcomes.push(fill_slot(&self.file, self.base.as_ref(), fill, slot, scratch));
+                outcomes.push(fill_slot(
+                    &self.file,
+                    self.base.as_ref(),
+                    fill,
+                    slot,
+                    scratch,
+                ));
             }
             return Ok(outcomes);
         }
@@ -3470,6 +3595,87 @@ impl TileStore {
     }
 }
 
+/// What [`update_interior`] did to a tile's interior.
+#[derive(Debug)]
+struct InteriorPass {
+    /// The first row with an interior vertex written: where, in row-major order, the tile's
+    /// first interior write falls (after the row's first border vertex, before its last).
+    first_row: Option<u32>,
+    /// The row where a vertex failed, and why: nothing after it in row-major order was written.
+    failed: Option<(u32, CacheError)>,
+}
+
+/// Runs `f` over the interior vertices of row `j` of `view`, in order, setting what it returns.
+///
+/// `side` is the tile's vertices a side. Returns whether anything was written, and the error of
+/// a value that isn't finite, which stops the row (nothing is written for it).
+///
+/// # Errors
+///
+/// [`CacheError::Correction`] with [`CorrectionError::NotFinite`];
+/// [`CacheError::Internal`] for a broken view.
+fn update_row(
+    view: &mut CorrectionViewMut<'_>,
+    side: u32,
+    j: u32,
+    f: &mut impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+) -> (bool, Result<(), CacheError>) {
+    let mut wrote = false;
+    for i in 1..side - 1 {
+        let Some(current) = view.get(i, j) else {
+            return (wrote, Err(Invariant::StaleHandle.into()));
+        };
+        let Some(c) = f(i, j, current) else {
+            continue;
+        };
+        if !c.is_finite() {
+            return (
+                wrote,
+                Err(CacheError::Correction(CorrectionError::NotFinite)),
+            );
+        }
+        if let Err(e) = view.set(i, j, c) {
+            return (wrote, Err(Invariant::CorrectionSlot(e).into()));
+        }
+        wrote = true;
+    }
+    (wrote, Ok(()))
+}
+
+/// The half of [`TileStore::update_tiles`] that runs on the workers, for one tile.
+///
+/// Runs `f` over every interior vertex of the tile in `slot` (`side` vertices a side), row by
+/// row in row-major order, setting what it returns, as [`TileEdit::update`] would. Stops at
+/// the first vertex that fails.
+fn update_interior(
+    slot: &mut CorrectionSlot,
+    side: u32,
+    mut f: impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+) -> InteriorPass {
+    let mut pass = InteriorPass {
+        first_row: None,
+        failed: None,
+    };
+    let mut view = match slot.view_mut() {
+        Ok(view) => view,
+        Err(e) => {
+            pass.failed = Some((0, Invariant::CorrectionSlot(e).into()));
+            return pass;
+        }
+    };
+    for j in 1..side.saturating_sub(1) {
+        let (wrote, row) = update_row(&mut view, side, j, &mut f);
+        if wrote && pass.first_row.is_none() {
+            pass.first_row = Some(j);
+        }
+        if let Err(e) = row {
+            pass.failed = Some((j, e));
+            break;
+        }
+    }
+    pass
+}
+
 /// A tile [`TileEdit`] has touched: loaded and pinned, perhaps written.
 #[derive(Debug, Clone, Copy)]
 struct Touched {
@@ -3685,33 +3891,81 @@ impl TileEdit<'_> {
         f: &mut impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
     ) -> Result<(), CacheError> {
         let side = self.key.side();
-        let tile = self.touched.first_mut().ok_or(Invariant::StaleHandle)?;
+        let tile = self.touched.first().ok_or(Invariant::StaleHandle)?;
         let slot = self
             .store
             .corrections
             .get_mut(tile.id)
             .ok_or(Invariant::StaleHandle)?;
         let mut view = slot.view_mut().map_err(Invariant::CorrectionSlot)?;
-        let mut wrote = false;
-        let mut outcome = Ok(());
-        for i in 1..side - 1 {
-            let current = view.get(i, j).ok_or(Invariant::StaleHandle)?;
-            let Some(c) = f(i, j, current) else {
-                continue;
-            };
-            if !c.is_finite() {
-                outcome = Err(CacheError::Correction(CorrectionError::NotFinite));
-                break;
-            }
-            view.set(i, j, c).map_err(Invariant::CorrectionSlot)?;
-            wrote = true;
+        let (wrote, row) = update_row(&mut view, side, j, f);
+        if wrote {
+            self.mark_own_written()?;
         }
-        if wrote && !tile.written {
+        row
+    }
+
+    /// The other half of [`TileStore::update_tiles`] for this tile, whose interior `pass`
+    /// wrote: runs `f` over the border vertices in row-major order, setting what it returns
+    /// with [`TileEdit::set`], and marks the tile written where its first interior write falls
+    /// in that order (if no border write marked it first). Stops where the interior pass
+    /// failed, as [`TileEdit::update`] would have.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileEdit::set`] for a border vertex; else the interior pass's error.
+    fn update_border(
+        &mut self,
+        pass: InteriorPass,
+        mut f: impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+    ) -> Result<(), CacheError> {
+        let side = self.key.side();
+        let last = side - 1;
+        let InteriorPass { first_row, failed } = pass;
+        let (failed_row, mut failure) = match failed {
+            Some((row, e)) => (Some(row), Some(e)),
+            None => (None, None),
+        };
+        if failed_row == Some(0)
+            && let Some(e) = failure.take()
+        {
+            return Err(e);
+        }
+        for j in 0..side {
+            if j == 0 || j == last {
+                for i in 0..side {
+                    self.update_one(i, j, &mut f)?;
+                }
+                continue;
+            }
+            self.update_one(0, j, &mut f)?;
+            if first_row == Some(j) {
+                self.mark_own_written()?;
+            }
+            if failed_row == Some(j)
+                && let Some(e) = failure.take()
+            {
+                return Err(e);
+            }
+            self.update_one(last, j, &mut f)?;
+        }
+        Ok(())
+    }
+
+    /// Marks the edited tile written, if no write has yet: dirty, on the change feed with the
+    /// edit's op, and its evaluations dropped when the edit ends (see [`TileEdit::write`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] for a stale handle.
+    fn mark_own_written(&mut self) -> Result<(), CacheError> {
+        let tile = self.touched.first_mut().ok_or(Invariant::StaleHandle)?;
+        if !tile.written {
             tile.written = true;
             let (key, id) = (tile.key, tile.id);
             self.store.mark_written(key, id, self.op)?;
         }
-        outcome
+        Ok(())
     }
 
     /// The index in `touched` of `key`'s tile, loaded and pinned if it is new.
