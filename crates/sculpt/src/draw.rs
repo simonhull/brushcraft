@@ -346,15 +346,13 @@ fn run_brush(
 ///
 /// # Errors
 ///
-/// As [`TileEdit::get`] and [`TileEdit::set`].
+/// As [`TileEdit::update`].
 fn add_deltas(edit: &mut TileEdit<'_>, deltas: &[f32]) -> Result<(), CacheError> {
-    for ((i, j), &delta) in vertices(edit.key().side()).zip(deltas) {
-        if delta != 0.0 {
-            let c = edit.get(i, j)?;
-            edit.set(i, j, Vec3::new(c.x, c.y, c.z + delta))?;
-        }
-    }
-    Ok(())
+    let side = edit.key().side();
+    edit.update(|i, j, c| {
+        let delta = deltas.get(usize::try_from(j * side + i).ok()?).copied()?;
+        (delta != 0.0).then(|| Vec3::new(c.x, c.y, c.z + delta))
+    })
 }
 
 /// The tiles whose bounds an edit of the `reached` tiles may change, each once, in key order.

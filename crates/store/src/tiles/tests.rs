@@ -1835,6 +1835,99 @@ fn edits_between_evaluations_invalidate_once() {
     assert_eq!(store.log.invalidations, 3, "a whole tile edit drops once");
 }
 
+/// Applies `change` to every vertex of `key`'s tile in row-major order, through `update` or
+/// through `get` and `set` vertex by vertex.
+///
+/// # Errors
+///
+/// The edit's or the first write's.
+fn change_tile(
+    store: &mut TileStore,
+    key: TileKey,
+    through_update: bool,
+    change: &dyn Fn(u32, u32, Vec3) -> Option<Vec3>,
+) -> Result<(), CacheError> {
+    store
+        .edit_tile(key, |edit| {
+            if through_update {
+                return edit.update(change);
+            }
+            let side = key.side();
+            for (i, j) in (0..side).flat_map(|j| (0..side).map(move |i| (i, j))) {
+                if let Some(c) = change(i, j, edit.get(i, j)?) {
+                    edit.set(i, j, c)?;
+                }
+            }
+            Ok(())
+        })
+        .and_then(std::convert::identity)
+}
+
+#[test]
+fn updating_a_tile_equals_getting_and_setting_each_vertex() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut by_vertex = new_store(&dir, "by_vertex.bcp", &mesh, roomy());
+    let mut updated = new_store(&dir, "updated.bcp", &mesh, roomy());
+    let all = tiles(&mesh, 1, TOP);
+    let mut rng = Rng(0x000B_D7E5);
+    for round in 0..24 {
+        let key = all[rng.below(u32::try_from(all.len()).unwrap()) as usize];
+        let side = key.side();
+        let amplitude = 0.5 / f32::from(u16::try_from(key.level().face_quads()).unwrap());
+        // About half the vertices change; now and then by a lot, so the scale grows (and the
+        // interior is re-quantized) part-way through the tile.
+        let deltas: Vec<Option<Vec3>> = (0..side * side)
+            .map(|_| match rng.below(40) {
+                0..20 => None,
+                20 => Some(rng.vec3(amplitude * 40.0)),
+                _ => Some(rng.vec3(amplitude)),
+            })
+            .collect();
+        // Every few rounds, a value that isn't finite part-way through a row inside the tile.
+        let poisoned = (round % 4 == 3).then_some((side / 2, side / 2));
+        let change = |i: u32, j: u32, c: Vec3| {
+            if poisoned == Some((i, j)) {
+                return Some(Vec3::new(f32::NAN, 0.0, 0.0));
+            }
+            let d = deltas[(j * side + i) as usize]?;
+            Some(Vec3::new(c.x + d.x, c.y + d.y, c.z + d.z))
+        };
+        let op = by_vertex.begin_op().unwrap();
+        assert_eq!(updated.begin_op().unwrap(), op, "the same ops");
+        let expected = change_tile(&mut by_vertex, key, false, &change);
+        let got = change_tile(&mut updated, key, true, &change);
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{expected:?}"),
+            "round {round}: the same outcome"
+        );
+        if poisoned.is_some() {
+            assert!(
+                matches!(
+                    got,
+                    Err(CacheError::Correction(CorrectionError::NotFinite))
+                ),
+                "round {round}: {got:?}"
+            );
+        }
+    }
+    assert_eq!(
+        updated.unsaved, by_vertex.unsaved,
+        "the same tiles dirty, with the same ops and stamps (written in the same order)"
+    );
+    let drain = |store: &mut TileStore| store.feed.drain(store.save_consumer);
+    assert_eq!(drain(&mut updated), drain(&mut by_vertex), "the same feed");
+    let edited: BTreeSet<TileKey> = by_vertex.unsaved.keys().copied().collect();
+    for key in &edited {
+        assert_eq!(
+            slot_resident(&updated, key),
+            slot_resident(&by_vertex, key),
+            "{key:?}: the same bits"
+        );
+    }
+}
+
 #[test]
 fn an_unread_edit_still_reaches_untracked_tiles() {
     let dir = TestDir::new();

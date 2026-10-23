@@ -3617,6 +3617,103 @@ impl TileEdit<'_> {
         Ok(())
     }
 
+    /// Rewrites the tile's corrections vertex by vertex: `f` sees every vertex in row-major
+    /// order, with its coordinates and its correction as stored, and where it returns a new
+    /// value, that is set as [`TileEdit::set`] sets it, before `f` sees the next vertex.
+    ///
+    /// The same as [`TileEdit::get`] then [`TileEdit::set`] for each vertex in that order, and
+    /// so the same bits: order matters, as a value that outgrows the tile's scale re-quantizes
+    /// its interior. It is cheaper, as each run of interior vertices of a row (which have no
+    /// copies in other tiles) is read and written through one borrowed view instead of a
+    /// lookup per call; border vertices go through [`TileEdit::set`], copies and all.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileEdit::set`], for the first vertex that fails; the vertices before it stay
+    /// written.
+    pub fn update(
+        &mut self,
+        mut f: impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+    ) -> Result<(), CacheError> {
+        let side = self.key.side();
+        let last = side - 1;
+        for j in 0..side {
+            if j == 0 || j == last {
+                for i in 0..side {
+                    self.update_one(i, j, &mut f)?;
+                }
+            } else {
+                self.update_one(0, j, &mut f)?;
+                self.update_interior_row(j, &mut f)?;
+                self.update_one(last, j, &mut f)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`TileEdit::update`] for vertex `(i, j)` alone, through [`TileEdit::get`] and
+    /// [`TileEdit::set`].
+    ///
+    /// # Errors
+    ///
+    /// As [`TileEdit::set`].
+    fn update_one(
+        &mut self,
+        i: u32,
+        j: u32,
+        f: &mut impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+    ) -> Result<(), CacheError> {
+        match f(i, j, self.get(i, j)?) {
+            Some(c) => self.set(i, j, c),
+            None => Ok(()),
+        }
+    }
+
+    /// [`TileEdit::update`] for the interior vertices of row `j` (`1..side - 1`, for a row
+    /// inside the tile), through one view of the tile's slot. The tile is marked written after
+    /// the row if anything in it was, before any other tile can be touched: as
+    /// [`TileEdit::write`] marks it at its first write.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`] for a value `f` returns
+    /// that isn't finite (nothing is written for it, the row's earlier writes stay);
+    /// [`CacheError::Internal`] for a stale handle or a broken slot.
+    fn update_interior_row(
+        &mut self,
+        j: u32,
+        f: &mut impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+    ) -> Result<(), CacheError> {
+        let side = self.key.side();
+        let tile = self.touched.first_mut().ok_or(Invariant::StaleHandle)?;
+        let slot = self
+            .store
+            .corrections
+            .get_mut(tile.id)
+            .ok_or(Invariant::StaleHandle)?;
+        let mut view = slot.view_mut().map_err(Invariant::CorrectionSlot)?;
+        let mut wrote = false;
+        let mut outcome = Ok(());
+        for i in 1..side - 1 {
+            let current = view.get(i, j).ok_or(Invariant::StaleHandle)?;
+            let Some(c) = f(i, j, current) else {
+                continue;
+            };
+            if !c.is_finite() {
+                outcome = Err(CacheError::Correction(CorrectionError::NotFinite));
+                break;
+            }
+            view.set(i, j, c).map_err(Invariant::CorrectionSlot)?;
+            wrote = true;
+        }
+        if wrote && !tile.written {
+            tile.written = true;
+            let (key, id) = (tile.key, tile.id);
+            self.store.mark_written(key, id, self.op)?;
+        }
+        outcome
+    }
+
     /// The index in `touched` of `key`'s tile, loaded and pinned if it is new.
     ///
     /// # Errors
