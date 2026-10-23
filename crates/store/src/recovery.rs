@@ -15,10 +15,10 @@
 //!    save point names the bounds of the state the snapshot copies. This is all a stroke end costs
 //!    the drawing thread, and it grows with the edits since the last flush.
 //! 2. **Encoding** (writer): each copy is encoded, compressed and framed as a tile record, and the
-//!    records come back. A copy that doesn't encode is left out. If its live slot is broken too, or
-//!    still the copy, the tile is lost in the store, as a save loses one, and the bounds its edit
-//!    could have changed are appended as unknown, at the cut; a slot edited since the snapshot
-//!    stays dirty, for the next flush to try again.
+//!    records come back. A copy that doesn't encode is left out, and the bounds its edit could have
+//!    changed are appended as unknown, at the cut, whatever its slot holds now. If its live slot is
+//!    broken too, the tile is lost in the store, as a save loses one; a valid slot means the
+//!    failure was transient, and it stays dirty, for the next flush to try again.
 //! 3. **Syncing tiles**: the owner appends the records to the working file
 //!    ([`TileStore::append_streamed`], page-cache writes), then asks the writer to `fdatasync` the
 //!    file. Appending a record clears its slot's dirty flag only if the slot is unchanged since the
@@ -93,7 +93,6 @@ use thiserror::Error;
 
 use crate::feed::ConsumerId;
 use crate::file::{FileSyncer, FramedTile, StoreError, frame_displacement};
-use crate::stamp::Stamp;
 use crate::tiles::{CacheError, Snapshot, TileStore};
 
 /// The longest a [`RecoveryWriter::tick`] lets edits wait before it starts a flush.
@@ -157,17 +156,12 @@ enum Request {
     Sync(FileSyncer),
 }
 
-/// The tiles whose copies a flush couldn't encode, each with the stamp of the write its copy was
-/// taken at.
-type LeftOut = Vec<(TileKey, Stamp)>;
-
 /// What the writer thread answers, one reply per request, in order.
 #[derive(Debug)]
 enum Reply {
     /// The framed records, in snapshot order, and the tiles whose copies didn't encode, left
-    /// out, each with the stamp of the write its copy was taken at (see
-    /// [`TileStore::left_out_at_reply`]).
-    Encoded(Vec<FramedTile>, LeftOut),
+    /// out.
+    Encoded(Vec<FramedTile>, Vec<TileKey>),
     /// The sync completed, or why it failed.
     Synced(Result<(), StoreError>),
 }
@@ -431,14 +425,16 @@ impl RecoveryWriter {
         self.flushes
     }
 
-    /// The tiles left out of flushes since the last call because their correction slots were
-    /// broken (a dirty slot with no op, or one that doesn't hold a valid tile): their latest
-    /// edits are not in the recovery file. Each is dropped from the writer's flush mark when
-    /// found, so one bad slot never stalls the flushes of the rest, and lost in the store as a
-    /// save loses a tile: its slot is dropped (or, if pinned, filled again from the tile's last
-    /// record), what was evaluated from it too, and the store reads the tile's last record from
-    /// then on. An edit of it later is tried again. A copy that failed to encode while its slot
-    /// was edited since isn't listed: the slot stays dirty for the next flush.
+    /// The tiles left out of flushes since the last call: their latest edits are not in the save
+    /// point the flush made.
+    ///
+    /// A broken slot (a dirty slot with no op, or one that doesn't hold a valid tile) is dropped
+    /// from the writer's flush mark when found, so it never stalls the flushes of the rest, and
+    /// lost in the store as a save loses a tile: its slot is dropped (or, if pinned, filled
+    /// again from the tile's last record), what was evaluated from it too, and the store reads
+    /// the tile's last record from then on; an edit of it later is tried again. A valid slot
+    /// whose copy failed to encode (a transient failure) stays dirty, and the next flush tries
+    /// it again.
     pub fn take_skipped(&mut self) -> Vec<TileKey> {
         std::mem::take(&mut self.skipped)
     }
@@ -544,14 +540,15 @@ impl RecoveryWriter {
         }
         match (self.phase, reply) {
             (Phase::Encoding, Reply::Encoded(tiles, broken)) => {
-                // A copy that failed to encode is lost only if the live slot is broken or still
-                // what was copied; one edited since stays dirty, for the next flush to retry.
+                // Every tile left out is unprotected by this save point, which names unknown
+                // bounds for whatever its at-cut edit could change. Only a broken live slot is
+                // lost in memory; a valid one stays dirty, for the next flush to retry.
                 let lost = store.left_out_at_reply(&broken);
                 for key in &lost {
                     store.drop_from_stream(self.consumer, key);
-                    self.skipped.push(*key);
                 }
-                store.forget_bounds_at_cut(&lost)?;
+                self.skipped.extend(broken.iter().copied());
+                store.forget_bounds_at_cut(&broken, &lost)?;
                 store.append_streamed(self.consumer, &tiles)?;
                 self.request_tile_sync(store)
             }
@@ -735,9 +732,9 @@ impl Worker {
         }
     }
 
-    /// Frames every snapshot as a tile record, leaving out (and listing, with the stamp of its
-    /// copy) any whose copy doesn't encode; `None` if the owner stopped the writer part-way.
-    fn encode(&self, snapshots: &[Snapshot]) -> Option<(Vec<FramedTile>, LeftOut)> {
+    /// Frames every snapshot as a tile record, leaving out (and listing) any whose copy doesn't
+    /// encode; `None` if the owner stopped the writer part-way.
+    fn encode(&self, snapshots: &[Snapshot]) -> Option<(Vec<FramedTile>, Vec<TileKey>)> {
         let mut framed = Vec::with_capacity(snapshots.len());
         let mut broken = Vec::new();
         for snapshot in snapshots {
@@ -754,7 +751,7 @@ impl Worker {
             };
             match encoded {
                 Ok(tile) => framed.push(tile),
-                Err(_) => broken.push((snapshot.key, snapshot.stamp)),
+                Err(_) => broken.push(snapshot.key),
             }
         }
         Some((framed, broken))

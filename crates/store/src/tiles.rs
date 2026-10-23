@@ -2713,61 +2713,56 @@ impl TileStore {
         Ok(())
     }
 
-    /// Which of the tiles whose copies a flush couldn't encode (`broken`, each with the stamp of
-    /// the write its copy was taken at) are lost: those whose live slot is broken too (holds no
-    /// valid tile), or is still the copy that failed (dirty, its latest write the copy's). A
-    /// slot edited since holds a newer, valid tile: the failure (a transient compression error,
-    /// say) is no reason to drop it, and it stays dirty, in the flush mark, for the next flush
-    /// to try again. A slot clean or gone was written by someone else since, encoded: nothing is
-    /// lost.
-    pub(crate) fn left_out_at_reply(&self, broken: &[(TileKey, Stamp)]) -> Vec<TileKey> {
+    /// Which of the tiles whose copies a flush couldn't encode (`broken`) are lost in memory:
+    /// those whose live slot is dirty and broken too (holds no valid tile). A valid slot means
+    /// the failure was transient (a compression error, say), whether or not it was edited since
+    /// the snapshot: it stays dirty, in the flush mark, for the next flush to try again. A slot
+    /// clean or gone was written by someone else since, encoded.
+    pub(crate) fn left_out_at_reply(&self, broken: &[TileKey]) -> Vec<TileKey> {
         broken
             .iter()
-            .filter(|&&(key, stamp)| {
-                let Some(id) = self
-                    .corrections
-                    .find(&key)
+            .filter(|key| {
+                self.corrections
+                    .find(key)
                     .filter(|&id| self.corrections.is_dirty(id) == Some(true))
-                else {
-                    return false;
-                };
-                let invalid = self
-                    .corrections
-                    .get(id)
-                    .is_none_or(|slot| slot.to_tile().is_err());
-                let unchanged = self
-                    .unsaved
-                    .get(&key)
-                    .is_none_or(|write| write.stamp == stamp);
-                invalid || unchanged
+                    .is_some_and(|id| {
+                        self.corrections
+                            .get(id)
+                            .is_none_or(|slot| slot.to_tile().is_err())
+                    })
             })
-            .map(|&(key, _)| key)
+            .copied()
             .collect()
     }
 
-    /// Loses the `lost` tiles, whose copies didn't encode (see [`TileStore::lose_left_out`]),
-    /// and makes unknown, in the save point of the flush in flight too, every bound their edits
-    /// could have changed: the save point holds their older state. The unknown bounds are
-    /// appended placed at the flush's cut; the store's own are made unknown as well, and the
-    /// next flush writes them again.
+    /// The two halves of a flush leaving out the `left_out` tiles, whose copies didn't encode.
+    ///
+    /// In the file: every bound their at-cut edits could have changed is appended as unknown,
+    /// placed at the flush's cut, whatever their live slots hold now: the save point holds their
+    /// older state, and the bounds the flush appended at its snapshot may describe the edits it
+    /// lacks. The store's own are made unknown as well, and the next flush writes them again.
+    ///
+    /// In memory: only the `lost` ones (broken slots, see [`TileStore::left_out_at_reply`])
+    /// are lost (see [`TileStore::lose_left_out`]); the others stay dirty for the next flush.
     ///
     /// # Errors
     ///
     /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if an
     /// append fails.
-    pub(crate) fn forget_bounds_at_cut(&mut self, lost: &[TileKey]) -> Result<(), CacheError> {
-        if lost.is_empty() {
+    pub(crate) fn forget_bounds_at_cut(
+        &mut self,
+        left_out: &[TileKey],
+        lost: &[TileKey],
+    ) -> Result<(), CacheError> {
+        self.lose_left_out(lost)?;
+        if left_out.is_empty() {
             return Ok(());
         }
-        self.lose_left_out(lost)?;
-        let stale = self.bounds.forget(&self.mesh, lost.iter().copied())?;
+        let stale = self.bounds.forget(&self.mesh, left_out.iter().copied())?;
         let at = self.file.cut_at().unwrap_or(self.last_write);
-        for key in stale {
-            self.file
-                .write_bounds(key, None, at)
-                .map_err(CacheError::WriteBack)?;
-        }
-        Ok(())
+        self.file
+            .write_bounds_many(stale.iter().map(|&key| (key, None)), at)
+            .map_err(CacheError::WriteBack)
     }
 
     /// Frees every unpinned slot of both pools, writing dirty correction tiles back first.

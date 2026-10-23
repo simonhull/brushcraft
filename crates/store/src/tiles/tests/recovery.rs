@@ -36,8 +36,20 @@ fn edit_interior(store: &mut TileStore, map: &mut CorrectionMap, key: TileKey, c
 
 /// [`edit_interior`] as part of the current op: another dab of the same stroke.
 fn dab_interior(store: &mut TileStore, map: &mut CorrectionMap, key: TileKey, c: Vec3) {
+    dab_interior_at(store, map, key, (5, 7), c);
+}
+
+/// Sets interior vertex `(i, j)` of `key` to `c` as part of the current op, in the store and in
+/// the oracle's map.
+fn dab_interior_at(
+    store: &mut TileStore,
+    map: &mut CorrectionMap,
+    key: TileKey,
+    (i, j): (u32, u32),
+    c: Vec3,
+) {
     store
-        .edit_tile(key, |edit| edit.set(5, 7, c))
+        .edit_tile(key, |edit| edit.set(i, j, c))
         .unwrap()
         .unwrap();
     let region = Region::of_tile(&key);
@@ -45,8 +57,8 @@ fn dab_interior(store: &mut TileStore, map: &mut CorrectionMap, key: TileKey, c:
         store.mesh.topology(),
         key.face(),
         key.level(),
-        region.x0() + 5,
-        region.y0() + 7,
+        region.x0() + i,
+        region.y0() + j,
         c,
     )
     .unwrap();
@@ -1010,13 +1022,14 @@ fn a_pinned_broken_slot_lost_to_a_roll_over_is_reloaded_in_place() {
     );
 }
 
-/// A copy that fails to encode loses its tile only if the slot is still what was copied.
+/// A copy that fails to encode while its live slot is valid loses nothing: the failure was
+/// transient.
 ///
-/// Two tiles' copies fail as a transient compression error would. One is edited after the
-/// snapshot: its slot, valid and newer, stays dirty and reaches the next flush with both edits.
-/// The other, unchanged, is left out and reported.
+/// Two tiles' copies fail as a transient compression error would; one is edited after the
+/// snapshot, the other not. Both are reported as unprotected by that flush's save point, both
+/// slots stay dirty, and the next flush writes both, with every edit.
 #[test]
-fn a_failed_encode_keeps_a_tile_edited_since_the_snapshot() {
+fn a_failed_encode_of_a_valid_slot_is_retried_by_the_next_flush() {
     let dir = TestDir::new();
     let mesh = mesh();
     let path = dir.path("recovery.bcrf");
@@ -1026,42 +1039,80 @@ fn a_failed_encode_keeps_a_tile_edited_since_the_snapshot() {
     let (edited, unchanged) = (top[3], top[40]);
     let mut map = CorrectionMap::new();
     edit_interior(&mut store, &mut map, edited, Vec3::new(0.0, 0.0, 0.01));
-    edit_interior(
-        &mut store,
-        &mut CorrectionMap::new(),
-        unchanged,
-        Vec3::new(0.0, 0.01, 0.0),
-    );
+    edit_interior(&mut store, &mut map, unchanged, Vec3::new(0.0, 0.01, 0.0));
     writer.fail_encodes(2);
     writer.end_stroke(&mut store, Instant::now()).unwrap();
     // After the snapshot, before its reply is handled.
-    store
-        .edit_tile(edited, |edit| edit.set(9, 4, Vec3::new(0.02, 0.0, 0.0)))
-        .unwrap()
-        .unwrap();
-    let region = Region::of_tile(&edited);
-    map.set(
-        mesh.topology(),
-        edited.face(),
-        edited.level(),
-        region.x0() + 9,
-        region.y0() + 4,
+    dab_interior_at(
+        &mut store,
+        &mut map,
+        edited,
+        (9, 4),
         Vec3::new(0.02, 0.0, 0.0),
-    )
-    .unwrap();
+    );
     settle(&mut writer, &mut store);
+    let mut skipped = writer.take_skipped();
+    skipped.sort_unstable();
     assert_eq!(
-        writer.take_skipped(),
-        [unchanged],
-        "only the unchanged tile is lost"
+        skipped,
+        [edited, unchanged],
+        "both unprotected by that save point"
     );
     writer.end_stroke(&mut store, Instant::now()).unwrap();
     settle(&mut writer, &mut store);
-    assert_eq!(writer.take_skipped(), [], "the edited tile flushes");
+    assert_eq!(writer.take_skipped(), [], "both flush");
     let offset = writer.durable_save_point().unwrap();
     drop(writer);
     drop(store);
     assert_save_point(&path, offset, &mesh, &map);
+}
+
+/// A flush whose copy of a tile fails to encode names unknown bounds for whatever the tile's
+/// at-cut edit could change, though the live slot, edited since, is kept.
+///
+/// The index was refitted over the edit before the flush, so the bounds the flush appended at
+/// its snapshot describe an edit its save point then lacks.
+#[test]
+fn a_failed_encode_leaves_no_stale_bound_in_its_save_point() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let top = tiles(&mesh, TOP, TOP);
+    let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    let map = CorrectionMap::new();
+    edit_interior(
+        &mut store,
+        &mut CorrectionMap::new(),
+        top[5],
+        Vec3::new(0.0, 0.0, 0.25),
+    );
+    index.update(&mut store, &top).unwrap();
+    writer.fail_encodes(1);
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    // Edited again before the reply: the slot is kept, and the save point lacks both edits.
+    edit_interior(
+        &mut store,
+        &mut CorrectionMap::new(),
+        top[5],
+        Vec3::new(0.0, 0.0, 0.3),
+    );
+    settle(&mut writer, &mut store);
+    assert_eq!(
+        writer.take_skipped(),
+        [top[5]],
+        "unprotected by that save point"
+    );
+    let offset = writer.durable_save_point().unwrap();
+    drop(writer);
+    drop(store);
+    assert_save_point(&path, offset, &mesh, &map);
+    let file = ProjectFile::open_at(&path, offset).unwrap();
+    let mut saved = TileStore::open(file, roomy()).unwrap();
+    assert_loads_as_built(&mut saved, level(TOP), "the save point without the edit");
 }
 
 /// A roll-over to a new recovery file carries every edit across, dirty or only in the file, and
