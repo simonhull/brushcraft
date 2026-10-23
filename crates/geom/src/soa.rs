@@ -26,6 +26,16 @@ pub(crate) struct Vectors {
 }
 
 impl Vectors {
+    /// Makes the row `points`, in order.
+    pub(crate) fn set_points(&mut self, points: &[Vec3]) {
+        self.x.clear();
+        self.x.extend(points.iter().map(|p| p.x));
+        self.y.clear();
+        self.y.extend(points.iter().map(|p| p.y));
+        self.z.clear();
+        self.z.extend(points.iter().map(|p| p.z));
+    }
+
     /// Makes the row `plus[k] − minus[k]` for every `k` (as many as the shorter slice holds):
     /// [`Vec3`]'s subtraction, component by component.
     pub(crate) fn set_difference(&mut self, plus: &[Vec3], minus: &[Vec3]) {
@@ -149,6 +159,9 @@ mod tests {
         };
         let (va, vb, vc) = (row(&a), row(&b), row(&c));
         assert_eq!(bits(va.points()), bits(a.iter().copied()), "a − 0 is a");
+        let mut loaded = Vectors::default();
+        loaded.set_points(&a);
+        assert_eq!(bits(loaded.points()), bits(a.iter().copied()), "set_points");
 
         let mut diff = Vectors::default();
         diff.set_difference(&a, &b);

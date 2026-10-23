@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::frame::{self, Block, CornerAxes, Frame, Stencil, frames};
+use crate::frame::{self, Block, CornerAxes, Frame, FrameRows, Scattered, Stencil, frames};
 use crate::subdiv::{CornerRing, Padded, extraordinary, predict, ring_edge_point};
 use crate::topology::{Ring, Topology, corner_at, edge_to_grid};
 use crate::{
@@ -852,7 +852,8 @@ pub fn refresh_normals_into(
     let q = i64::from(region.quads());
     let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
     let inside = |(i, j): (i64, i64)| (0..=q).contains(&i) && (0..=q).contains(&j);
-    let mut refreshed = 0;
+    // The stale vertices, computed together at the end as the full normals compute theirs.
+    let mut stale_vertices = Scattered::with_capacity(4 * usize::try_from(side).unwrap_or(0));
     for (i, j) in border(q) {
         let local = match frame::stencil(&block, i, j) {
             Stencil::Axes([u, v]) => {
@@ -879,7 +880,7 @@ pub fn refresh_normals_into(
                 for (value, (a, b)) in values.iter_mut().zip(reads) {
                     *value = reader.at(face, x0 + a, y0 + b)?;
                 }
-                frame::central(values)
+                frame::Local::Central(values)
             }
             Stencil::Corner(_) => {
                 let at = (x0 + i, y0 + j);
@@ -900,12 +901,12 @@ pub fn refresh_normals_into(
             Stencil::Outside => continue,
         };
         let index = usize::try_from(j * i64::from(side) + i).unwrap_or(usize::MAX);
-        if let Some(slot) = out.get_mut(index) {
-            *slot = frame::normal(local);
-            refreshed += 1;
+        if index < out.len() {
+            stale_vertices.push(index, local);
         }
     }
-    Ok(refreshed)
+    stale_vertices.normals_into(&mut FrameRows::default(), out);
+    Ok(stale_vertices.len())
 }
 
 /// The border vertices of a block of `q` quads per side, each once: the bottom and top rows,

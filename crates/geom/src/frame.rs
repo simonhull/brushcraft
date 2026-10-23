@@ -27,49 +27,13 @@ impl Frame {
         b: Vec3::new(0.0, 1.0, 0.0),
         n: Vec3::new(0.0, 0.0, 1.0),
     };
-    /// A frame whose every component is NaN: what non-finite derivatives give, so a bug upstream
-    /// shows up in the output instead of being hidden behind [`Frame::FALLBACK`].
+    /// A frame whose every component is NaN: what non-finite inputs give, so a bug upstream shows
+    /// up in the output instead of being hidden behind [`Frame::FALLBACK`].
     const NAN: Self = Self {
         t: Vec3::NAN,
         b: Vec3::NAN,
         n: Vec3::NAN,
     };
-
-    /// The frame from derivatives along u and v: [`Frame::FALLBACK`] where finite derivatives are
-    /// degenerate, and all NaN where either derivative isn't finite.
-    #[must_use]
-    pub(crate) fn from_derivatives(du: Vec3, dv: Vec3) -> Self {
-        if !(du.is_finite() && dv.is_finite()) {
-            return Self::NAN;
-        }
-        Self::from_tangent_and_normal(du, du.cross(dv))
-    }
-
-    /// The frame from a tangent direction `du` and an unnormalized normal, both computed from
-    /// finite inputs: `n` the normal normalized, `t` `du` projected onto its plane, or
-    /// [`Frame::FALLBACK`] where either is degenerate.
-    fn from_tangent_and_normal(du: Vec3, normal: Vec3) -> Self {
-        let Some(n) = normal.normalized() else {
-            return Self::FALLBACK;
-        };
-        let Some(t) = (du - n * du.dot(n)).normalized() else {
-            return Self::FALLBACK;
-        };
-        Self {
-            t,
-            b: n.cross(t),
-            n,
-        }
-    }
-
-    /// The frame for a vertex's [`Local`] axes.
-    fn from_local(local: Local) -> Self {
-        match local {
-            Local::Derivatives { du, dv } => Self::from_derivatives(du, dv),
-            Local::Ring { du, normal } => Self::from_tangent_and_normal(du, normal),
-            Local::NonFinite => Self::NAN,
-        }
-    }
 
     /// Tangent: along the owner's grid u direction.
     #[must_use]
@@ -151,13 +115,10 @@ impl CornerAxes<'_> {
 /// What a vertex's frame and normal are built from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Local {
-    /// Derivatives along the owner's u and v: the normal is `du × dv`.
-    Derivatives {
-        /// The derivative along the owner's u axis.
-        du: Vec3,
-        /// The derivative along the owner's v axis.
-        dv: Vec3,
-    },
+    /// Central differences: a [`Stencil::Axes`] stencil's four reads
+    /// `[plus_u, minus_u, plus_v, minus_v]`. The derivatives are `du = plus_u − minus_u` and
+    /// `dv = plus_v − minus_v`, the unnormalized normal `du × dv`.
+    Central([Vec3; 4]),
     /// At a base vertex, from finite inputs: the owner's first-edge direction and the
     /// unnormalized ring normal.
     Ring {
@@ -166,19 +127,8 @@ pub(crate) enum Local {
         /// The ring normal, summed over the whole ring, not normalized.
         normal: Vec3,
     },
-    /// At a base vertex whose ring isn't finite (or isn't known).
+    /// At a base vertex whose ring isn't finite (or isn't known), or off the face.
     NonFinite,
-}
-
-impl Local {
-    /// Whether the inputs were finite: frames assert it, normals pass NaN through.
-    const fn is_finite(&self) -> bool {
-        match self {
-            Self::Derivatives { du, dv } => du.is_finite() && dv.is_finite(),
-            Self::Ring { .. } => true,
-            Self::NonFinite => false,
-        }
-    }
 }
 
 /// Where a block sits, so derivatives at shared vertices can be taken in the owner's orientation.
@@ -249,17 +199,6 @@ pub(crate) fn stencil(block: &Block<'_>, i: i64, j: i64) -> Stencil {
     Stencil::Axes(axes)
 }
 
-/// The derivatives from a [`Stencil::Axes`] stencil's four reads.
-///
-/// They are `du = plus_u − minus_u` and `dv = plus_v − minus_v`. Every caller computes them
-/// here, so a vertex gets the same bits however its reads were gathered.
-pub(crate) fn central([plus_u, minus_u, plus_v, minus_v]: [Vec3; 4]) -> Local {
-    Local::Derivatives {
-        du: plus_u - minus_u,
-        dv: plus_v - minus_v,
-    }
-}
-
 /// The [`Local`] axes at block vertex `(i, j)` of `grid`, in the owner's orientation: central
 /// differences, or the ring at a base vertex. `corners[c]` holds block corner `c`'s ring when it
 /// is a base vertex.
@@ -275,7 +214,7 @@ fn derivatives(
             .get(c)
             .and_then(Option::as_ref)
             .map_or(Local::NonFinite, CornerAxes::local),
-        Stencil::Axes([u, v]) => central([
+        Stencil::Axes([u, v]) => Local::Central([
             grid.get(i + u.0, j + u.1),
             grid.get(i - u.0, j - u.1),
             grid.get(i + v.0, j + v.1),
@@ -317,11 +256,9 @@ fn run_of<'a>(row: &'a [Vec3], columns: &RangeInclusive<i64>, shift: i64) -> &'a
 enum RowPart<'a> {
     /// Vertex `(i, j)`, on the face's border: its stencil ([`stencil`]) is read alone.
     Vertex(i64, i64),
-    /// A run of consecutive vertices of row `j`, strictly inside the face: each vertex's four
-    /// reads `[plus_u, minus_u, plus_v, minus_v]`, as [`central`] takes them.
+    /// A run of consecutive vertices of a row, strictly inside the face: each vertex's four
+    /// reads `[plus_u, minus_u, plus_v, minus_v]`, as [`Local::Central`] holds them.
     Run {
-        /// The row.
-        j: i64,
         /// The runs of reads, one slice per read, one entry per vertex.
         reads: [&'a [Vec3]; 4],
     },
@@ -332,39 +269,90 @@ enum RowPart<'a> {
 fn row_parts<'a>(block: &Block<'_>, grid: &'a Padded) -> impl Iterator<Item = RowPart<'a>> {
     let q = i64::from(block.quads);
     let (columns, rows) = inside_face(block);
+    let run_len = columns.clone().count();
     (0..=q).flat_map(move |j| {
-        let inside = rows.contains(&j) && !columns.is_empty();
-        let (before, after) = if inside {
-            (0..*columns.start(), *columns.end() + 1..=q)
+        let has_run = rows.contains(&j) && run_len > 0;
+        // The vertices before the run end at `before_end`, those after it start at
+        // `after_start`; a row without a run is all "before".
+        let (before_end, after_start) = if has_run {
+            (*columns.start(), *columns.end() + 1)
         } else {
-            (0..q + 1, q + 1..=q)
+            (q + 1, q + 1)
         };
-        let run = inside.then(|| {
+        let run = has_run.then(|| {
             let row = grid.row(j);
-            RowPart::Run {
-                j,
-                reads: [
-                    run_of(row, &columns, 1),
-                    run_of(row, &columns, -1),
-                    run_of(grid.row(j + 1), &columns, 0),
-                    run_of(grid.row(j - 1), &columns, 0),
-                ],
-            }
+            let reads = [
+                run_of(row, &columns, 1),
+                run_of(row, &columns, -1),
+                run_of(grid.row(j + 1), &columns, 0),
+                run_of(grid.row(j - 1), &columns, 0),
+            ];
+            debug_assert!(
+                reads.iter().all(|r| r.len() == run_len),
+                "row {j}'s reads lie in the padded block"
+            );
+            RowPart::Run { reads }
         });
         let vertex = move |i| RowPart::Vertex(i, j);
-        before.map(vertex).chain(run).chain(after.map(vertex))
+        (0..before_end)
+            .map(vertex)
+            .chain(run)
+            .chain((after_start..=q).map(vertex))
     })
 }
 
-/// Working space for [`frames_of_run`] and [`normals_of_run`], one array per quantity of the
-/// frame formula, reused from row to row.
+/// What [`policy`] gives a vertex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// What the formula gave.
+    Formula,
+    /// The fallback: finite inputs that don't normalize.
+    Fallback,
+    /// NaN: inputs that aren't finite.
+    NotFinite,
+}
+
+/// The frame and normal policy, the one place it is written: what the formula gave where it
+/// `normalized`, else the fallback where the inputs were finite, else NaN.
+///
+/// `inputs_finite` is only asked when the formula didn't normalize. A normal that normalizes
+/// had finite inputs: an infinite or NaN component of `du` or `dv` makes two components of
+/// `du × dv` infinite or NaN, and a ring's inputs are finite by construction
+/// ([`CornerAxes::local`]).
+fn policy(normalized: bool, inputs_finite: impl FnOnce() -> bool) -> Outcome {
+    if normalized {
+        Outcome::Formula
+    } else if inputs_finite() {
+        Outcome::Fallback
+    } else {
+        Outcome::NotFinite
+    }
+}
+
+/// Where a batch in [`FrameRows`] came from, for [`policy`]'s question about its inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inputs {
+    /// Central differences: `du` and `dv` hold them.
+    Central,
+    /// Base-vertex rings, whose inputs are finite.
+    Ring,
+}
+
+/// The frame and normal formula over a batch of vertices, one array per quantity.
+///
+/// Every frame and normal goes through it: a row's run of vertices at a time, or a block's
+/// scattered vertices together ([`Scattered`]). The arrays are reused from batch to batch.
+///
+/// The formula runs a step at a time over the whole batch, so each step is one loop over
+/// independent vertices that the compiler vectorises.
 #[derive(Debug, Default)]
-struct FrameRows {
-    /// The derivatives along the owner's u axis.
+pub(crate) struct FrameRows {
+    /// The derivatives along the owner's u axis (central differences), or the owner's first
+    /// edge (rings).
     du: Vectors,
-    /// The derivatives along the owner's v axis.
+    /// The derivatives along the owner's v axis (central differences only).
     dv: Vectors,
-    /// `du × dv`, then normalized: the normals.
+    /// The unnormalized normals (`du × dv`, or the ring normal), then normalized.
     n: Vectors,
     /// The lengths `n` was normalized by.
     n_lengths: Vec<f32>,
@@ -378,48 +366,195 @@ struct FrameRows {
     b: Vectors,
 }
 
-/// Frames from central differences for a run of consecutive vertices of one row, pushed onto
-/// `out` in order.
-///
-/// `[plus_u, minus_u, plus_v, minus_v]` hold each vertex's four reads, as [`central`] takes
-/// them. [`Frame::from_derivatives`]' formula runs a step at a time over the whole run, then
-/// each vertex's policy (NaN where an input isn't finite, the fallback where the normal or the
-/// tangent doesn't normalize) picks its frame: vertex `k` gets the bits
-/// `Frame::from_local(central(...))` gives for its reads.
-fn frames_of_run(reads: [&[Vec3]; 4], rows: &mut FrameRows, out: &mut Vec<Frame>) {
-    let [plus_u, minus_u, plus_v, minus_v] = reads;
-    rows.du.set_difference(plus_u, minus_u);
-    rows.dv.set_difference(plus_v, minus_v);
-    rows.n.set_cross(&rows.du, &rows.dv);
-    rows.n.normalize(&mut rows.n_lengths);
-    Vectors::dot_into(&rows.du, &rows.n, &mut rows.along);
-    rows.t.set_minus_scaled(&rows.du, &rows.n, &rows.along);
-    rows.t.normalize(&mut rows.t_lengths);
-    rows.b.set_cross(&rows.n, &rows.t);
-    let inputs = rows.du.points().zip(rows.dv.points());
-    let axes = rows.t.points().zip(rows.b.points()).zip(rows.n.points());
-    let lengths = rows.n_lengths.iter().zip(&rows.t_lengths);
-    out.extend(inputs.zip(axes).zip(lengths).map(
-        |(((du, dv), ((t, b), n)), (&n_length, &t_length))| {
-            // The common case first. A normal that normalizes had finite inputs: an infinite or
-            // NaN component of `du` or `dv` makes two components of `du × dv` infinite or NaN.
-            if normalizable(n_length) & normalizable(t_length) {
-                Frame { t, b, n }
-            } else if du.is_finite() && dv.is_finite() {
-                Frame::FALLBACK
-            } else {
-                Frame::NAN
+impl FrameRows {
+    /// Loads a batch of central differences from their four reads, one slice per read, one
+    /// entry per vertex.
+    fn load_central(&mut self, [plus_u, minus_u, plus_v, minus_v]: [&[Vec3]; 4]) -> Inputs {
+        self.du.set_difference(plus_u, minus_u);
+        self.dv.set_difference(plus_v, minus_v);
+        self.n.set_cross(&self.du, &self.dv);
+        Inputs::Central
+    }
+
+    /// Loads a batch of rings: each one's first-edge direction and unnormalized ring normal.
+    fn load_rings(&mut self, du: &[Vec3], normals: &[Vec3]) -> Inputs {
+        self.du.set_points(du);
+        self.n.set_points(normals);
+        Inputs::Ring
+    }
+
+    /// The batch's unit normals, into `out` in order (one slot per vertex).
+    fn normals<'o>(&mut self, inputs: Inputs, out: impl Iterator<Item = &'o mut Vec3>) {
+        self.n.normalize(&mut self.n_lengths);
+        // The batch's own iterator first: `zip` stops on it without taking a slot past it.
+        let normals = self.n.points().zip(&self.n_lengths).zip(out);
+        match inputs {
+            Inputs::Central => {
+                let derivatives = self.du.points().zip(self.dv.points());
+                for (((n, &length), slot), (du, dv)) in normals.zip(derivatives) {
+                    *slot = normal_policy(n, length, || du.is_finite() && dv.is_finite());
+                }
             }
-        },
-    ));
+            Inputs::Ring => {
+                for ((n, &length), slot) in normals {
+                    *slot = normal_policy(n, length, || true);
+                }
+            }
+        }
+    }
+
+    /// The batch's frames, appended to `out` in order: `n` normalized, `t` `du` projected onto
+    /// its plane and normalized, `b = n × t`.
+    fn frames(&mut self, inputs: Inputs, out: &mut Vec<Frame>) {
+        self.n.normalize(&mut self.n_lengths);
+        Vectors::dot_into(&self.du, &self.n, &mut self.along);
+        self.t.set_minus_scaled(&self.du, &self.n, &self.along);
+        self.t.normalize(&mut self.t_lengths);
+        self.b.set_cross(&self.n, &self.t);
+        let tbn = self.t.points().zip(self.b.points()).zip(self.n.points());
+        let frames = tbn
+            .zip(self.n_lengths.iter().zip(&self.t_lengths))
+            .map(|(((t, b), n), (&nl, &tl))| ([t, b, n], [nl, tl]));
+        match inputs {
+            Inputs::Central => {
+                let derivatives = self.du.points().zip(self.dv.points());
+                out.extend(frames.zip(derivatives).map(|((axes, lengths), (du, dv))| {
+                    frame_policy(axes, lengths, || du.is_finite() && dv.is_finite())
+                }));
+            }
+            Inputs::Ring => {
+                out.extend(frames.map(|(axes, lengths)| frame_policy(axes, lengths, || true)));
+            }
+        }
+    }
+}
+
+/// One normal of a [`FrameRows`] batch, by [`policy`]: `n`, normalized by `length`.
+fn normal_policy(n: Vec3, length: f32, inputs_finite: impl FnOnce() -> bool) -> Vec3 {
+    match policy(normalizable(length), inputs_finite) {
+        Outcome::Formula => n,
+        Outcome::Fallback => Frame::FALLBACK.n,
+        Outcome::NotFinite => Vec3::NAN,
+    }
+}
+
+/// One frame of a [`FrameRows`] batch, by [`policy`]: its axes, and the lengths `n` and `t`
+/// were normalized by.
+fn frame_policy(
+    [t, b, n]: [Vec3; 3],
+    [n_length, t_length]: [f32; 2],
+    inputs_finite: impl FnOnce() -> bool,
+) -> Frame {
+    match policy(
+        normalizable(n_length) & normalizable(t_length),
+        inputs_finite,
+    ) {
+        Outcome::Formula => Frame { t, b, n },
+        Outcome::Fallback => Frame::FALLBACK,
+        Outcome::NotFinite => Frame::NAN,
+    }
+}
+
+/// Vertices whose frames or normals are computed apart from the rows' runs.
+///
+/// They are the vertices on the face's border, base vertices, and a refresh's stale vertices:
+/// collected by kind, then computed together through [`FrameRows`], as the runs are.
+#[derive(Debug, Default)]
+pub(crate) struct Scattered {
+    /// Where each central-difference vertex's result goes, in the order of `reads`.
+    central: Vec<usize>,
+    /// Their reads `[plus_u, minus_u, plus_v, minus_v]`, one array per read.
+    reads: [Vec<Vec3>; 4],
+    /// Where each ring vertex's result goes, in the order of `ring_du` and `ring_normals`.
+    rings: Vec<usize>,
+    /// Their first-edge directions.
+    ring_du: Vec<Vec3>,
+    /// Their unnormalized ring normals.
+    ring_normals: Vec<Vec3>,
+    /// Where the vertices without finite inputs go: they get NaN.
+    non_finite: Vec<usize>,
+}
+
+impl Scattered {
+    /// No vertices yet, with room for `capacity` central-difference vertices.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            central: Vec::with_capacity(capacity),
+            reads: std::array::from_fn(|_| Vec::with_capacity(capacity)),
+            ..Self::default()
+        }
+    }
+
+    /// Adds a vertex whose result goes to `place`.
+    pub(crate) fn push(&mut self, place: usize, local: Local) {
+        match local {
+            Local::Central(reads) => {
+                self.central.push(place);
+                for (column, read) in self.reads.iter_mut().zip(reads) {
+                    column.push(read);
+                }
+            }
+            Local::Ring { du, normal } => {
+                self.rings.push(place);
+                self.ring_du.push(du);
+                self.ring_normals.push(normal);
+            }
+            Local::NonFinite => self.non_finite.push(place),
+        }
+    }
+
+    /// How many vertices were added.
+    pub(crate) fn len(&self) -> usize {
+        self.central.len() + self.rings.len() + self.non_finite.len()
+    }
+
+    /// The four read columns, as [`FrameRows::load_central`] takes them.
+    fn reads(&self) -> [&[Vec3]; 4] {
+        self.reads.each_ref().map(Vec::as_slice)
+    }
+
+    /// Each vertex's frame, written to `out` at its place.
+    fn frames_into(&self, rows: &mut FrameRows, out: &mut [Frame]) {
+        let mut central = Vec::with_capacity(self.central.len());
+        let central_inputs = rows.load_central(self.reads());
+        rows.frames(central_inputs, &mut central);
+        place(&self.central, central.into_iter(), out);
+        let mut rings = Vec::with_capacity(self.rings.len());
+        let ring_inputs = rows.load_rings(&self.ring_du, &self.ring_normals);
+        rows.frames(ring_inputs, &mut rings);
+        place(&self.rings, rings.into_iter(), out);
+        place(&self.non_finite, std::iter::repeat(Frame::NAN), out);
+    }
+
+    /// Each vertex's unit normal, written to `out` at its place.
+    pub(crate) fn normals_into(&self, rows: &mut FrameRows, out: &mut [Vec3]) {
+        let mut central = vec![Vec3::NAN; self.central.len()];
+        let central_inputs = rows.load_central(self.reads());
+        rows.normals(central_inputs, central.iter_mut());
+        place(&self.central, central.into_iter(), out);
+        let mut rings = vec![Vec3::NAN; self.rings.len()];
+        let ring_inputs = rows.load_rings(&self.ring_du, &self.ring_normals);
+        rows.normals(ring_inputs, rings.iter_mut());
+        place(&self.rings, rings.into_iter(), out);
+        place(&self.non_finite, std::iter::repeat(Vec3::NAN), out);
+    }
+}
+
+/// Writes `values` to `out` at `places`, in order.
+fn place<T>(places: &[usize], values: impl Iterator<Item = T>, out: &mut [T]) {
+    for (&k, value) in places.iter().zip(values) {
+        if let Some(slot) = out.get_mut(k) {
+            *slot = value;
+        }
+    }
 }
 
 /// Frames for every vertex of a predicted block, row-major `(quads + 1)²`. `corners` holds the
 /// predicted rings at base-vertex block corners.
 ///
-/// The vertices strictly inside the face go a row at a time through [`frames_of_run`]; the rest
-/// (on the face's border, where the owner's axes or a base vertex's ring apply) one by one. Both
-/// give a vertex the same bits.
+/// The vertices strictly inside the face go a row's run at a time through [`FrameRows`]; the
+/// rest (on the face's border, where the owner's axes or a base vertex's ring apply) are
+/// collected and go through it together at the end.
 pub(crate) fn frames(
     block: &Block<'_>,
     predicted: &Padded,
@@ -427,79 +562,34 @@ pub(crate) fn frames(
 ) -> Vec<Frame> {
     let side = usize::try_from(block.quads).map_or(0, |q| q + 1);
     let mut out = Vec::with_capacity(side * side);
-    let mut scratch = FrameRows::default();
+    let mut rows = FrameRows::default();
+    // At most the block's border is on the face's border.
+    let mut scattered = Scattered::with_capacity(4 * side);
     for part in row_parts(block, predicted) {
         match part {
             RowPart::Vertex(i, j) => {
-                let local = derivatives(block, predicted, corners, i, j);
-                debug_assert!(
-                    local.is_finite(),
-                    "frame inputs at ({i}, {j}) of {block:?} are not finite"
-                );
-                out.push(Frame::from_local(local));
+                scattered.push(out.len(), derivatives(block, predicted, corners, i, j));
+                out.push(Frame::NAN);
             }
-            RowPart::Run { j, reads } => {
-                let run_start = out.len();
-                frames_of_run(reads, &mut scratch, &mut out);
-                debug_assert!(
-                    out.get(run_start..)
-                        .is_some_and(|run| run.iter().all(|f| f.n.is_finite())),
-                    "frame inputs in row {j} of {block:?} are not finite"
-                );
+            RowPart::Run { reads, .. } => {
+                let inputs = rows.load_central(reads);
+                rows.frames(inputs, &mut out);
             }
         }
     }
+    scattered.frames_into(&mut rows, &mut out);
+    debug_assert!(
+        out.iter().all(|f| f.n.is_finite()),
+        "frame inputs of {block:?} are not finite"
+    );
     out
-}
-
-/// The unit normal, with [`Frame::from_local`]'s policy: the fallback frame's normal where finite
-/// inputs are degenerate, NaN where any isn't finite.
-pub(crate) fn normal(local: Local) -> Vec3 {
-    match local {
-        Local::Derivatives { du, dv } if du.is_finite() && dv.is_finite() => du.cross(dv),
-        Local::Ring { normal, .. } => normal,
-        Local::Derivatives { .. } | Local::NonFinite => return Vec3::NAN,
-    }
-    .normalized()
-    .unwrap_or(Frame::FALLBACK.n)
-}
-
-/// Unit normals from central differences for a run of consecutive vertices of one row, into
-/// `out` in order (one slot per vertex).
-///
-/// `[plus_u, minus_u, plus_v, minus_v]` hold each vertex's four reads, as [`central`] takes
-/// them. `du × dv` is normalized over the whole run, then each vertex's policy applies: vertex
-/// `k` gets the bits `normal(central(...))` gives for its reads.
-fn normals_of_run<'o>(
-    reads: [&[Vec3]; 4],
-    rows: &mut FrameRows,
-    out: impl Iterator<Item = &'o mut Vec3>,
-) {
-    let [plus_u, minus_u, plus_v, minus_v] = reads;
-    rows.du.set_difference(plus_u, minus_u);
-    rows.dv.set_difference(plus_v, minus_v);
-    rows.n.set_cross(&rows.du, &rows.dv);
-    rows.n.normalize(&mut rows.n_lengths);
-    let normals = rows.n.points().zip(&rows.n_lengths);
-    let inputs = rows.du.points().zip(rows.dv.points());
-    // The run's own iterator first: `zip` stops on it without taking a slot past the run.
-    for (((n, &length), (du, dv)), slot) in normals.zip(inputs).zip(out) {
-        // As in `frames_of_run`: a normal that normalizes had finite inputs.
-        *slot = if normalizable(length) {
-            n
-        } else if du.is_finite() && dv.is_finite() {
-            Frame::FALLBACK.n
-        } else {
-            Vec3::NAN
-        };
-    }
 }
 
 /// Unit normals for every vertex of a block of evaluated positions, into `out`.
 ///
 /// `out` holds `(quads + 1)²` values, row-major. Positions come from a source, so non-finite
-/// input is passed through as NaN, not asserted. The vertices strictly inside the face go a row
-/// at a time through [`normals_of_run`], the rest one by one; both give a vertex the same bits.
+/// input is passed through as NaN, not asserted. As in [`frames`], the vertices strictly inside
+/// the face go a row's run at a time through [`FrameRows`], the rest together at the end.
 pub(crate) fn normals(
     block: &Block<'_>,
     positions: &Padded,
@@ -512,18 +602,24 @@ pub(crate) fn normals(
         (q + 1).checked_pow(2),
         "one normal per vertex"
     );
-    let mut slots = out.iter_mut();
-    let mut scratch = FrameRows::default();
+    let mut rows = FrameRows::default();
+    // At most the block's border is on the face's border.
+    let mut scattered = Scattered::with_capacity(4 * (q + 1));
+    let mut slots = out.iter_mut().enumerate();
     for part in row_parts(block, positions) {
         match part {
             RowPart::Vertex(i, j) => {
-                if let Some(slot) = slots.next() {
-                    *slot = normal(derivatives(block, positions, corners, i, j));
+                if let Some((k, _)) = slots.next() {
+                    scattered.push(k, derivatives(block, positions, corners, i, j));
                 }
             }
-            RowPart::Run { reads, .. } => normals_of_run(reads, &mut scratch, slots.by_ref()),
+            RowPart::Run { reads, .. } => {
+                let inputs = rows.load_central(reads);
+                rows.normals(inputs, slots.by_ref().map(|(_, slot)| slot));
+            }
         }
     }
+    scattered.normals_into(&mut rows, out);
 }
 
 #[cfg(test)]
@@ -532,9 +628,91 @@ mod tests {
     use super::*;
     use crate::test_rng::Rng;
 
+    /// The frame and normal of one vertex, as rewritten from the specification with early
+    /// returns: an oracle independent of [`FrameRows`] and [`policy`], which the kernels must
+    /// match bit for bit.
+    mod reference {
+        use super::{Frame, Local, Vec3};
+
+        /// The frame from a tangent direction and an unnormalized normal, from finite inputs.
+        fn from_tangent_and_normal(du: Vec3, normal: Vec3) -> Frame {
+            let Some(n) = normal.normalized() else {
+                return Frame::FALLBACK;
+            };
+            let Some(t) = (du - n * du.dot(n)).normalized() else {
+                return Frame::FALLBACK;
+            };
+            Frame {
+                t,
+                b: n.cross(t),
+                n,
+            }
+        }
+
+        /// A vertex's frame.
+        pub(super) fn frame(local: Local) -> Frame {
+            match local {
+                Local::Central([plus_u, minus_u, plus_v, minus_v]) => {
+                    let (du, dv) = (plus_u - minus_u, plus_v - minus_v);
+                    if du.is_finite() && dv.is_finite() {
+                        from_tangent_and_normal(du, du.cross(dv))
+                    } else {
+                        Frame::NAN
+                    }
+                }
+                Local::Ring { du, normal } => from_tangent_and_normal(du, normal),
+                Local::NonFinite => Frame::NAN,
+            }
+        }
+
+        /// A vertex's unit normal.
+        pub(super) fn normal(local: Local) -> Vec3 {
+            let unnormalized = match local {
+                Local::Central([plus_u, minus_u, plus_v, minus_v]) => {
+                    let (du, dv) = (plus_u - minus_u, plus_v - minus_v);
+                    if !(du.is_finite() && dv.is_finite()) {
+                        return Vec3::NAN;
+                    }
+                    du.cross(dv)
+                }
+                Local::Ring { normal, .. } => normal,
+                Local::NonFinite => return Vec3::NAN,
+            };
+            unnormalized.normalized().unwrap_or(Frame::FALLBACK.n)
+        }
+    }
+
+    /// One vertex's frame, through the kernels.
+    fn frame_of(local: Local) -> Frame {
+        let mut scattered = Scattered::default();
+        scattered.push(0, local);
+        let mut out = [Frame::FALLBACK];
+        scattered.frames_into(&mut FrameRows::default(), &mut out);
+        out[0]
+    }
+
+    /// One vertex's normal, through the kernels.
+    fn normal_of(local: Local) -> Vec3 {
+        let mut scattered = Scattered::default();
+        scattered.push(0, local);
+        let mut out = [Vec3::ZERO];
+        scattered.normals_into(&mut FrameRows::default(), &mut out);
+        out[0]
+    }
+
+    /// Central differences `du` and `dv` as a stencil's reads.
+    fn central(du: Vec3, dv: Vec3) -> Local {
+        Local::Central([du, Vec3::ZERO, dv, Vec3::ZERO])
+    }
+
+    /// A frame's bits.
+    fn bits(f: &Frame) -> [[u32; 3]; 3] {
+        [f.t, f.b, f.n].map(Vec3::to_bits)
+    }
+
     #[test]
     fn frames_are_orthonormal_and_right_handed() {
-        let f = Frame::from_derivatives(Vec3::new(2.0, 0.1, 0.0), Vec3::new(0.0, 3.0, 0.2));
+        let f = frame_of(central(Vec3::new(2.0, 0.1, 0.0), Vec3::new(0.0, 3.0, 0.2)));
         assert!((f.t.length() - 1.0).abs() < 1e-6, "t unit");
         assert!((f.n.length() - 1.0).abs() < 1e-6, "n unit");
         assert!(f.t.dot(f.n).abs() < 1e-6, "t ⟂ n");
@@ -545,19 +723,22 @@ mod tests {
     #[test]
     fn degenerate_derivatives_fall_back_deterministically() {
         assert_eq!(
-            Frame::from_derivatives(Vec3::ZERO, Vec3::ZERO),
+            frame_of(central(Vec3::ZERO, Vec3::ZERO)),
             Frame::FALLBACK,
             "zero"
         );
-        let nan = Frame::from_derivatives(Vec3::NAN, Vec3::new(0.0, 1.0, 0.0));
+        let nan = frame_of(central(Vec3::NAN, Vec3::new(0.0, 1.0, 0.0)));
         assert!(
             !(nan.t.is_finite() || nan.b.is_finite() || nan.n.is_finite()),
             "NaN propagates instead of falling back: {nan:?}"
         );
         assert!(
-            !Frame::from_derivatives(Vec3::new(1.0, 0.0, 0.0), Vec3::new(f32::INFINITY, 0.0, 0.0))
-                .n
-                .is_finite(),
+            !frame_of(central(
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(f32::INFINITY, 0.0, 0.0)
+            ))
+            .n
+            .is_finite(),
             "so does infinity"
         );
     }
@@ -565,19 +746,18 @@ mod tests {
     #[test]
     fn normals_follow_the_frame_policy() {
         let (du, dv) = (Vec3::new(2.0, 0.1, 0.0), Vec3::new(0.0, 3.0, 0.2));
-        let local = |a, b| Local::Derivatives { du: a, dv: b };
         assert_eq!(
-            normal(local(du, dv)),
-            Frame::from_derivatives(du, dv).n,
+            normal_of(central(du, dv)),
+            frame_of(central(du, dv)).n,
             "same normal as the frame"
         );
         assert_eq!(
-            normal(local(Vec3::ZERO, dv)),
+            normal_of(central(Vec3::ZERO, dv)),
             Frame::FALLBACK.n,
             "degenerate: fallback"
         );
         assert!(
-            !normal(local(Vec3::NAN, dv)).is_finite(),
+            !normal_of(central(Vec3::NAN, dv)).is_finite(),
             "non-finite: NaN, not the fallback"
         );
     }
@@ -600,10 +780,14 @@ mod tests {
                 points: &points,
                 owner_corner,
             };
-            let f = Frame::from_local(axes.local());
+            let f = frame_of(axes.local());
             assert_eq!(f.n, Vec3::new(0.0, 0.0, 1.0), "corner {owner_corner}: n");
             assert_eq!(f.t, Vec3::new(t, 0.0, 0.0), "corner {owner_corner}: t");
-            assert_eq!(normal(axes.local()), f.n, "corner {owner_corner}: normal");
+            assert_eq!(
+                normal_of(axes.local()),
+                f.n,
+                "corner {owner_corner}: normal"
+            );
         }
     }
 
@@ -617,12 +801,12 @@ mod tests {
             owner_corner: 0,
         };
         assert_eq!(
-            Frame::from_local(degenerate.local()),
+            frame_of(degenerate.local()),
             Frame::FALLBACK,
             "degenerate: fallback frame"
         );
         assert_eq!(
-            normal(degenerate.local()),
+            normal_of(degenerate.local()),
             Frame::FALLBACK.n,
             "degenerate: fallback normal"
         );
@@ -635,18 +819,18 @@ mod tests {
         };
         assert_eq!(nan.local(), Local::NonFinite, "a NaN anywhere in the ring");
         assert!(
-            !Frame::from_local(nan.local()).n.is_finite(),
+            !frame_of(nan.local()).n.is_finite(),
             "NaN frame, not the fallback"
         );
-        assert!(!normal(nan.local()).is_finite(), "NaN normal");
+        assert!(!normal_of(nan.local()).is_finite(), "NaN normal");
     }
 
     /// Derivatives that exercise every branch of the frame policy: random, parallel, zero,
-    /// tiny, huge, infinite and NaN, and a normal that normalizes beside a tangent that doesn't.
+    /// negative zero, tiny, huge, infinite and NaN, and a normal that normalizes beside a
+    /// tangent that doesn't.
     fn awkward_derivatives(rng: &mut Rng, k: usize) -> (Vec3, Vec3) {
         let du = rng.vec3(1.0);
-        match k % 10 {
-            7 => (Vec3::new(1e-39, 0.0, 0.0), Vec3::new(0.0, 1e20, 0.0)),
+        match k % 12 {
             0 => (du, du * 2.0),
             1 => (Vec3::ZERO, rng.vec3(1.0)),
             2 => (Vec3::new(1e-30, 2e-30, 0.0), Vec3::new(0.0, 1e-30, 3e-30)),
@@ -654,64 +838,105 @@ mod tests {
             4 => (Vec3::new(f32::INFINITY, 0.0, 1.0), rng.vec3(1.0)),
             5 => (du, Vec3::new(0.5, f32::NAN, 0.0)),
             6 => (Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0)),
+            7 => (Vec3::new(1e-39, 0.0, 0.0), Vec3::new(0.0, 1e20, 0.0)),
+            8 => (Vec3::new(-0.0, 1.0, -0.0), Vec3::new(0.0, -0.0, 1.0)),
+            9 => (Vec3::new(-0.0, -0.0, -0.0), rng.vec3(1.0)),
             _ => (du, rng.vec3(1.0)),
         }
     }
 
-    /// The row kernel gives every vertex the bits of the one-vertex frame, whatever branch of
-    /// the policy it takes.
-    #[test]
-    fn runs_of_frames_match_one_vertex_frames() {
-        let mut rng = Rng::new(77);
-        for len in [0, 1, 7, 8, 9, 65, 200] {
-            let (du, dv): (Vec<Vec3>, Vec<Vec3>) =
-                (0..len).map(|k| awkward_derivatives(&mut rng, k)).unzip();
-            let zero = vec![Vec3::ZERO; len];
-            let mut out = Vec::new();
-            frames_of_run(
-                [&du, &zero, &dv, &zero],
-                &mut FrameRows::default(),
-                &mut out,
-            );
-            assert_eq!(out.len(), len, "one frame per vertex");
-            for (k, ((&u, &v), got)) in du.iter().zip(&dv).zip(&out).enumerate() {
-                let want = Frame::from_local(central([u, Vec3::ZERO, v, Vec3::ZERO]));
-                let bits = |f: &Frame| [f.t, f.b, f.n].map(Vec3::to_bits);
-                assert_eq!(bits(got), bits(&want), "vertex {k} of {len}: {u:?}, {v:?}");
-            }
-        }
+    /// Stencil reads giving [`awkward_derivatives`], with `+0.0`, `-0.0` or random points
+    /// subtracted.
+    fn awkward_reads(rng: &mut Rng, k: usize) -> [Vec3; 4] {
+        let (du, dv) = awkward_derivatives(rng, k);
+        let minus = match k % 3 {
+            0 => Vec3::ZERO,
+            1 => Vec3::new(-0.0, -0.0, -0.0),
+            _ => rng.vec3(1.0),
+        };
+        [du + minus, minus, dv + minus, minus]
     }
 
-    /// The row kernel gives every vertex the bits of the one-vertex normal, whatever branch of
-    /// the policy it takes.
+    /// A batch of central differences gets the reference's bits, frames and normals, whatever
+    /// branch of the policy each vertex takes; a normals batch takes only its own slots.
     #[test]
-    fn runs_of_normals_match_one_vertex_normals() {
-        let mut rng = Rng::new(78);
+    fn central_batches_match_the_reference() {
+        let mut rng = Rng::new(77);
         for len in [0, 1, 7, 8, 9, 65, 200] {
-            let (du, dv): (Vec<Vec3>, Vec<Vec3>) =
-                (0..len).map(|k| awkward_derivatives(&mut rng, k)).unzip();
-            let zero = vec![Vec3::ZERO; len];
-            // One slot past the run: the caller's next slot, as `normals` hands them out.
-            let mut out = vec![Vec3::ZERO; len + 1];
-            let mut slots = out.iter_mut();
-            normals_of_run(
-                [&du, &zero, &dv, &zero],
-                &mut FrameRows::default(),
-                slots.by_ref(),
-            );
+            let reads: Vec<[Vec3; 4]> = (0..len).map(|k| awkward_reads(&mut rng, k)).collect();
+            let columns: [Vec<Vec3>; 4] =
+                std::array::from_fn(|c| reads.iter().map(|r| r[c]).collect());
+            let slices = columns.each_ref().map(Vec::as_slice);
+            let mut rows = FrameRows::default();
+            let mut frames = Vec::new();
+            let inputs = rows.load_central(slices);
+            rows.frames(inputs, &mut frames);
+            assert_eq!(frames.len(), len, "one frame per vertex");
+            let mut normals = vec![Vec3::ZERO; len + 1];
+            let mut slots = normals.iter_mut();
+            let again = rows.load_central(slices);
+            rows.normals(again, slots.by_ref());
             *slots.next().unwrap() = Vec3::new(9.0, 9.0, 9.0);
-            for (k, ((&u, &v), got)) in du.iter().zip(&dv).zip(&out).enumerate() {
-                let want = normal(central([u, Vec3::ZERO, v, Vec3::ZERO]));
+            for (k, ((&r, got), n)) in reads.iter().zip(&frames).zip(&normals).enumerate() {
+                let local = Local::Central(r);
+                let what = format!("vertex {k} of {len}: {r:?}");
+                assert_eq!(bits(got), bits(&reference::frame(local)), "frame, {what}");
                 assert_eq!(
-                    got.to_bits(),
-                    want.to_bits(),
-                    "vertex {k} of {len}: {u:?}, {v:?}"
+                    n.to_bits(),
+                    reference::normal(local).to_bits(),
+                    "normal, {what}"
                 );
             }
             assert_eq!(
-                out[len],
+                normals[len],
                 Vec3::new(9.0, 9.0, 9.0),
-                "the run took only its own slots"
+                "the batch took only its own slots"
+            );
+        }
+    }
+
+    /// Scattered vertices of every kind (central differences, rings including degenerate ones,
+    /// no finite inputs) land at their places with the reference's bits.
+    #[test]
+    fn scattered_vertices_match_the_reference() {
+        let mut rng = Rng::new(79);
+        let locals: Vec<Local> = (0..60)
+            .map(|k| match k % 4 {
+                0 | 1 => Local::Central(awkward_reads(&mut rng, k)),
+                2 => {
+                    let (du, normal) = awkward_derivatives(&mut rng, k);
+                    let finite = du.is_finite() && normal.is_finite();
+                    if finite {
+                        Local::Ring { du, normal }
+                    } else {
+                        Local::NonFinite
+                    }
+                }
+                _ => Local::NonFinite,
+            })
+            .collect();
+        // Places in a scrambled order.
+        let places: Vec<usize> = (0..locals.len()).map(|k| (k * 37) % locals.len()).collect();
+        let mut scattered = Scattered::default();
+        for (&place, &local) in places.iter().zip(&locals) {
+            scattered.push(place, local);
+        }
+        assert_eq!(scattered.len(), locals.len(), "every vertex counted");
+        let mut frames = vec![Frame::FALLBACK; locals.len()];
+        let mut normals = vec![Vec3::ZERO; locals.len()];
+        let mut rows = FrameRows::default();
+        scattered.frames_into(&mut rows, &mut frames);
+        scattered.normals_into(&mut rows, &mut normals);
+        for (&place, &local) in places.iter().zip(&locals) {
+            assert_eq!(
+                bits(&frames[place]),
+                bits(&reference::frame(local)),
+                "frame of {local:?}"
+            );
+            assert_eq!(
+                normals[place].to_bits(),
+                reference::normal(local).to_bits(),
+                "normal of {local:?}"
             );
         }
     }
