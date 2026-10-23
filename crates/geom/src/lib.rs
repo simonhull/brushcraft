@@ -8,6 +8,9 @@ mod eval;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fixtures;
 mod frame;
+#[cfg(feature = "bench-kernels")]
+#[doc(hidden)]
+pub mod kernels;
 mod key;
 mod math;
 mod mesh;

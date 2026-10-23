@@ -112,12 +112,13 @@ const fn check_buffer(out: &[Vec3], expected: usize) -> Result<(), EvalError> {
 }
 
 /// The parent level's block, ring and base-vertex rings.
-struct Parent {
+#[derive(Debug)]
+pub(crate) struct Parent {
     /// The block with its one-vertex ring, each vertex read from its owner's copy.
-    padded: Padded,
+    pub(crate) padded: Padded,
     /// Per block corner (`(0, 0)`, `(q, 0)`, `(q, q)`, `(0, q)`), the ring of the base vertex
     /// there; `None` where the corner isn't a base vertex.
-    corners: [Option<CornerRing>; 4],
+    pub(crate) corners: [Option<CornerRing>; 4],
 }
 
 /// The error for a position the source can't supply.
@@ -302,7 +303,11 @@ impl<'a, S: PositionSource> Reader<'a, S> {
 /// # Errors
 ///
 /// [`EvalError::Missing`] if `src` lacks a needed position.
-fn gather(mesh: &BaseMesh, src: &impl PositionSource, region: Region) -> Result<Parent, EvalError> {
+pub(crate) fn gather(
+    mesh: &BaseMesh,
+    src: &impl PositionSource,
+    region: Region,
+) -> Result<Parent, EvalError> {
     let reader = Reader::new(mesh, src, region.level());
     let q = i64::from(region.quads());
     let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
@@ -343,7 +348,7 @@ pub struct Prediction {
 ///
 /// [`EvalError::LevelZero`] for a level-0 region, or [`EvalError::NoExactParent`] for a region
 /// that doesn't halve exactly.
-fn parent_region(region: Region) -> Result<Region, EvalError> {
+pub(crate) fn parent_region(region: Region) -> Result<Region, EvalError> {
     if region.level() == Level::ZERO {
         return Err(EvalError::LevelZero);
     }
@@ -364,8 +369,36 @@ pub fn predict_region(
 ) -> Result<Prediction, EvalError> {
     let parent = gather(mesh, src, parent_region(region)?)?;
     let predicted = predict(&parent.padded, &parent.corners);
-    // Frames at base vertices use the predicted level's ring: the vertex point and every edge
-    // point around it, computed from the ring alone so all copies agree.
+    let frames = predicted_frames(mesh, region, &parent, &predicted);
+    Ok(Prediction {
+        region,
+        predicted,
+        frames,
+    })
+}
+
+/// Where `region` sits on its face, for frames and normals.
+fn block_of(mesh: &BaseMesh, region: Region) -> Block<'_> {
+    Block {
+        topology: mesh.topology(),
+        face: region.face(),
+        face_quads: region.level().face_quads(),
+        x0: region.x0(),
+        y0: region.y0(),
+        quads: region.quads(),
+    }
+}
+
+/// The tangent frames of `region`, predicted as `predicted` from `parent`.
+///
+/// Frames at base vertices use the predicted level's ring: the vertex point and every edge point
+/// around it, computed from the parent's ring alone so all copies agree.
+pub(crate) fn predicted_frames(
+    mesh: &BaseMesh,
+    region: Region,
+    parent: &Parent,
+    predicted: &Padded,
+) -> Vec<Frame> {
     let edge_points = parent.corners.each_ref().map(|c| {
         c.as_ref().map(|ring| {
             let mut points = [Vec3::NAN; MAX_VALENCE];
@@ -383,20 +416,7 @@ pub fn predict_region(
             owner_corner: ring.owner_corner,
         })
     });
-    let block = Block {
-        topology: mesh.topology(),
-        face: region.face(),
-        face_quads: region.level().face_quads(),
-        x0: region.x0(),
-        y0: region.y0(),
-        quads: region.quads(),
-    };
-    let frames = frames(&block, &predicted, &axes);
-    Ok(Prediction {
-        region,
-        predicted,
-        frames,
-    })
+    frames(&block_of(mesh, region), predicted, &axes)
 }
 
 impl Prediction {
@@ -697,14 +717,7 @@ pub fn normals_into(
             owner_corner: ring.owner_corner,
         })
     });
-    let block = Block {
-        topology: mesh.topology(),
-        face: region.face(),
-        face_quads: region.level().face_quads(),
-        x0: region.x0(),
-        y0: region.y0(),
-        quads: region.quads(),
-    };
+    let block = block_of(mesh, region);
     frame::normals(&block, &gathered.padded, &axes, out);
     Ok(())
 }
@@ -746,14 +759,7 @@ pub fn refresh_normals_into(
     let side = region.quads() + 1;
     check_buffer(out, usize::try_from(side * side).unwrap_or(usize::MAX))?;
     let reader = Reader::new(mesh, src, region.level());
-    let block = Block {
-        topology: mesh.topology(),
-        face: region.face(),
-        face_quads: region.level().face_quads(),
-        x0: region.x0(),
-        y0: region.y0(),
-        quads: region.quads(),
-    };
+    let block = block_of(mesh, region);
     let face = region.face();
     let q = i64::from(region.quads());
     let (x0, y0) = (i64::from(region.x0()), i64::from(region.y0()));
@@ -1783,6 +1789,90 @@ mod tests {
                     mesh.face_count()
                 );
             }
+        }
+    }
+
+    /// The hash of every kernel's output over wide blocks of `prism(n)` subdivided once.
+    ///
+    /// Under fixed-seed random corrections, it hashes predicted positions, positions with
+    /// corrections applied (so every frame component), normals, and refreshed border normals.
+    ///
+    /// The blocks are whole faces and quarter faces at levels 6 and 7, so rows run 31 to 127
+    /// vertices inside the face, with base vertices of valence 3, 4 and `n` at their corners.
+    fn kernel_hash(n: usize) -> u64 {
+        let mesh = crate::reference::prism(n).subdivide().to_base_mesh();
+        let (coarse, fine) = (level(6), level(7));
+        let mut rng = Rng::new(0x4B45_0000 + u64::try_from(n).unwrap());
+        let mut map = CorrectionMap::new();
+        for _ in 0..400 {
+            let face = FaceId::new(rng.below(mesh.face_count()));
+            let l = level(1 + u8::try_from(rng.below(6)).unwrap());
+            let side = l.face_quads() + 1;
+            let (i, j) = (rng.below(side), rng.below(side));
+            map.set(mesh.topology(), face, l, i, j, rng.vec3(0.02))
+                .unwrap();
+        }
+        let dense = DenseEvaluation::new(&mesh, coarse, &map).unwrap();
+        let blocks = |l: Level| {
+            let q = l.face_quads();
+            mesh.faces().flat_map(move |f| {
+                [(0, 0, q), (0, 0, q / 2), (q / 2, q / 4, q / 2)]
+                    .map(|(x0, y0, quads)| Region::new(f, l, x0, y0, quads).unwrap())
+            })
+        };
+        let mut points = Vec::new();
+        for region in blocks(fine) {
+            let prediction = predict_region(&mesh, &dense, region).unwrap();
+            let side = prediction.side();
+            for j in 0..side {
+                for i in 0..side {
+                    points.push(prediction.predicted(i, j).unwrap());
+                }
+            }
+            let corrections: Vec<Vec3> = (0..side * side).map(|_| rng.vec3(0.01)).collect();
+            let c = |i: u32, j: u32| corrections[usize::try_from(j * side + i).unwrap()];
+            points.extend_from_slice(prediction.apply(c).as_slice());
+        }
+        for region in blocks(coarse) {
+            let side = usize::try_from(region.quads() + 1).unwrap();
+            let mut out = vec![Vec3::ZERO; side * side];
+            normals_into(&mesh, &dense, region, &mut out).unwrap();
+            points.extend_from_slice(&out);
+            out.fill(Vec3::ZERO);
+            refresh_normals_into(&mesh, &dense, region, |_| true, &mut out).unwrap();
+            points.extend_from_slice(&out);
+        }
+        crate::test_rng::fnv1a(points)
+    }
+
+    /// [`kernel_hash`] for `prism(3)`, `prism(5)` and `prism(8)`, recorded from the kernels as they
+    /// stood when these were pinned (before the row and lane rewrites, so those are held to the
+    /// per-vertex code's bits).
+    ///
+    /// To regenerate after a deliberate change to the arithmetic, run
+    /// `BRUSHCRAFT_PRINT_GOLDEN=1 cargo nextest run -p geom kernel_bits --no-capture`, check the
+    /// change was meant to move the bits, and paste the printed values here.
+    const KERNEL_GOLDEN: [(usize, u64); 3] = [
+        (3, 0x7BE8_3E3F_9151_C7E5),
+        (5, 0x279C_99FF_705C_FE78),
+        (8, 0x9955_E72D_6E3F_B2C9),
+    ];
+
+    /// Pins the kernels' bits on blocks wide enough that whole rows run through them: the
+    /// golden-bits test in `dense` works on level-3 faces, whose rows are too short to.
+    #[test]
+    fn kernel_bits_are_pinned_on_wide_blocks() {
+        let hashes = KERNEL_GOLDEN.map(|(n, _)| (n, kernel_hash(n)));
+        if std::env::var_os("BRUSHCRAFT_PRINT_GOLDEN").is_some() {
+            for (n, hash) in hashes {
+                let groups =
+                    [48, 32, 16, 0].map(|shift| format!("{:04X}", (hash >> shift) & 0xFFFF));
+                println!("({n}, 0x{}),", groups.join("_"));
+            }
+            return;
+        }
+        for ((n, hash), (_, want)) in hashes.into_iter().zip(KERNEL_GOLDEN) {
+            assert_eq!(hash, want, "prism({n}): 0x{hash:016X} != 0x{want:016X}");
         }
     }
 }

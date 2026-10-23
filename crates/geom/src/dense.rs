@@ -181,7 +181,7 @@ impl DenseEvaluation {
 mod tests {
     use super::*;
     use crate::reference::{Poly, assert_same_points, pentagonal_prism, prism};
-    use crate::test_rng::Rng;
+    use crate::test_rng::{Rng, fnv1a};
     use crate::{MAX_VALENCE, Region, TileKey, Topology, cube_sphere, evaluate_region, normals};
 
     fn all_points(eval: &DenseEvaluation, mesh: &BaseMesh, level: Level) -> Vec<Vec3> {
@@ -296,17 +296,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// FNV-1a (64-bit) over the little-endian bits of `points`, in order.
-    fn fnv1a(points: impl IntoIterator<Item = Vec3>) -> u64 {
-        points
-            .into_iter()
-            .flat_map(Vec3::to_bits)
-            .flat_map(u32::to_le_bytes)
-            .fold(0xCBF2_9CE4_8422_2325, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
-            })
     }
 
     /// The hash of level 3 of `prism(n)` subdivided once, under fixed-seed random corrections at

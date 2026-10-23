@@ -1,4 +1,4 @@
-//! Deterministic random numbers for tests.
+//! Deterministic random numbers for tests, and a hash that pins exact bits.
 
 #![expect(clippy::missing_panics_doc, reason = "test helpers panic to fail")]
 
@@ -40,6 +40,18 @@ impl Rng {
             self.signed() * amplitude,
         )
     }
+}
+
+/// FNV-1a (64-bit) over the little-endian bits of `points`, in order: pinned-bits tests compare
+/// it with a recorded value.
+pub(crate) fn fnv1a(points: impl IntoIterator<Item = crate::Vec3>) -> u64 {
+    points
+        .into_iter()
+        .flat_map(crate::Vec3::to_bits)
+        .flat_map(u32::to_le_bytes)
+        .fold(0xCBF2_9CE4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+        })
 }
 
 #[cfg(test)]

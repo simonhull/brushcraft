@@ -30,6 +30,12 @@ impl Padded {
         self.quads
     }
 
+    /// How many slots the block has, ring included: `(quads + 3)²`.
+    #[cfg(feature = "bench-kernels")]
+    pub(crate) const fn len(&self) -> usize {
+        self.data.len()
+    }
+
     /// Where `(i, j)` is in `data`; `None` outside the block and its ring.
     fn index(&self, i: i64, j: i64) -> Option<usize> {
         let side = i64::from(self.quads) + 3;
