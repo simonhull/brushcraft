@@ -1755,6 +1755,48 @@ fn editing_a_tile_equals_setting_its_vertices() {
     assert_positions(&mut batched, &dense, &tiles(&mesh, 1, TOP), "batched");
 }
 
+/// `evict_all` empties the store but keeps its pools' chunks mapped for the next pin.
+///
+/// The next pin reuses their slots without mapping another; `shrink_to(0)` is what gives the
+/// chunks back. The benchmark's warm-pool page-in relies on the first.
+#[test]
+fn evicting_everything_keeps_the_chunks_for_the_next_pin() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 200, 31),
+    );
+    let finest = tiles(&mesh, TOP, TOP);
+    let per_face = finest.len() / mesh.faces().count();
+    let (first, second) = finest.split_at(per_face);
+    let second = &second[..per_face];
+
+    drop(store.pin(first).unwrap());
+    let mapped = store.bytes();
+    assert!(mapped > 0, "the pin mapped chunks");
+    store.evict_all().unwrap();
+    assert_eq!(store.bytes(), mapped, "evicting kept every chunk");
+    assert!(
+        tiles(&mesh, 1, TOP)
+            .iter()
+            .all(|key| store.evaluated.find(key).is_none() && store.corrections.find(key).is_none()),
+        "nothing resident"
+    );
+
+    drop(store.pin(second).unwrap());
+    assert_eq!(
+        store.bytes(),
+        mapped,
+        "another face's tiles fit in the slots freed: no chunk mapped"
+    );
+    store.evict_all().unwrap();
+    store.shrink_to(0).unwrap();
+    assert_eq!(store.bytes(), 0, "shrinking gave every chunk back");
+}
+
 #[test]
 fn a_failed_write_back_is_reported_and_keeps_the_tile() {
     let dir = TestDir::new();

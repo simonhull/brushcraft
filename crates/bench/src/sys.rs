@@ -1,5 +1,6 @@
-//! What the harness asks of the operating system: the process's resident memory, and dropping
-//! a file's pages from the page cache. Linux only for now (macOS comes with the `kit` runs).
+//! What the harness asks of the operating system: the process's resident memory and page
+//! faults, and dropping a file's pages from the page cache. Linux only for now (macOS comes with
+//! the `kit` runs).
 
 use std::fs::File;
 use std::path::Path;
@@ -62,6 +63,40 @@ impl Rss {
             peak: kib(status, "VmHWM")?,
         })
     }
+}
+
+/// The minor page faults the process (every thread of it) has taken so far: faults served
+/// without reading the disk, such as the first touch of a page of freshly mapped memory. Read
+/// from `/proc/self/stat`.
+///
+/// # Errors
+///
+/// If `/proc/self/stat` can't be read or doesn't parse.
+pub(crate) fn minor_faults() -> Result<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").context("reading /proc/self/stat")?;
+    parse_minor_faults(&stat)
+}
+
+/// The minor faults `stat` (the text of `/proc/self/stat`) gives: its 10th field.
+///
+/// The 2nd field, the command name, is in parentheses and may hold spaces and parentheses
+/// itself, so the fields are counted from after its last `)`: the 3rd field (the state) is the
+/// first there, and the 10th the eighth.
+///
+/// # Errors
+///
+/// If there is no `)`, too few fields, or the field isn't a number.
+fn parse_minor_faults(stat: &str) -> Result<u64> {
+    let (_, after_name) = stat
+        .rsplit_once(')')
+        .ok_or_else(|| anyhow!("no command name in /proc/self/stat"))?;
+    let field = after_name
+        .split_whitespace()
+        .nth(7)
+        .ok_or_else(|| anyhow!("too few fields in /proc/self/stat"))?;
+    field
+        .parse()
+        .with_context(|| format!("minor faults in /proc/self/stat: {field:?}"))
 }
 
 /// Resets the process's resident high-water mark (`VmHWM`) to what is resident now.
@@ -164,6 +199,25 @@ mod tests {
         assert!(Rss::parse("VmRSS: 1 kB\n").is_err(), "no high-water mark");
         let own = Rss::read().unwrap();
         assert!(own.now > 0 && own.peak >= own.now, "this process: {own:?}");
+    }
+
+    #[test]
+    fn minor_faults_parse_and_count_first_touches() {
+        let stat = "42 (a (b) c) S 1 42 42 0 -1 4194560 1234 0 5 0 10 3";
+        assert_eq!(parse_minor_faults(stat).unwrap(), 1234, "the 10th field");
+        assert!(parse_minor_faults("42 x S 1").is_err(), "no command name");
+        assert!(
+            parse_minor_faults("42 (x) S 1 2").is_err(),
+            "too few fields"
+        );
+        let before = minor_faults().unwrap();
+        // 16 MiB never touched, then one byte written in each page: at least one minor fault
+        // (one a page, or one per huge page where transparent huge pages back it).
+        let mut fresh = vec![0_u8; 16 << 20];
+        fresh.iter_mut().step_by(4096).for_each(|b| *b = 1);
+        let after = minor_faults().unwrap();
+        drop(fresh);
+        assert!(after > before, "first touches fault: {before} to {after}");
     }
 
     #[test]

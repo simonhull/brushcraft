@@ -174,6 +174,57 @@ fn page_in_times_both_regions_cold_and_warm() {
 }
 
 #[test]
+fn page_in_measures_a_warm_pool_beside_the_cold_one() {
+    let dir = TempDir::new();
+    generate(&dir);
+    let printed = run_on(
+        &dir.project(),
+        "page-in --level 6 --samples 2 --footprint 5000 --region-quads 20000 --pool both",
+    )
+    .unwrap();
+    for region in ["footprint", "region"] {
+        let cold = line(&printed, "page-in", region);
+        assert!(cold.contains("\"pool\":\"cold\""), "the cold pool: {cold}");
+        assert!(
+            !cold.contains("pool_growth_mib"),
+            "a cold pool isn't warmed: {cold}"
+        );
+        let warm = line(&printed, "page-in", &format!("{region}-warm-pool"));
+        assert!(warm.contains("\"pool\":\"warm\""), "the warm pool: {warm}");
+        assert!(
+            (number(warm, "tiles") - number(cold, "tiles")).abs() < 0.5,
+            "the same regions: {warm}"
+        );
+        for field in ["cold_median_ms", "warm_median_ms"] {
+            assert!(number(warm, field) > 0.0, "{field} in {warm}");
+        }
+        for field in ["cold_faults_median", "warm_faults_median"] {
+            assert!(number(warm, field) >= 0.0, "{field} in {warm}");
+        }
+        assert!(number(warm, "pool_mib") > 0.0, "chunks kept mapped: {warm}");
+        assert!(
+            number(warm, "pool_growth_mib").abs() < 1e-9,
+            "every sample reused the warmed chunks: {warm}"
+        );
+    }
+
+    // Alone, from a store just opened (no chunk mapped): the warm-up maps the chunks.
+    let alone = run_on(
+        &dir.project(),
+        "page-in --level 6 --samples 2 --footprint 5000 --region-quads 20000 --pool warm",
+    )
+    .unwrap();
+    assert_eq!(alone.json.len(), 2, "two records: {:?}", alone.json);
+    for region in ["footprint-warm-pool", "region-warm-pool"] {
+        let warm = line(&alone, "page-in", region);
+        assert!(
+            number(warm, "pool_growth_mib").abs() < 1e-9,
+            "warmed before the first sample: {warm}"
+        );
+    }
+}
+
+#[test]
 fn brush_times_a_stroke_after_loading_the_index() {
     let dir = TempDir::new();
     generate(&dir);

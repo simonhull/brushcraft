@@ -32,6 +32,9 @@ options (each subcommand takes the ones it uses):
   generate: --splits N (20)  --levels N (9)  --amplitude F (0.01)  --force (replace the file)
   page-in, brush, save, budget: --level N, the finest level, the one measured (9)
   page-in:  --samples N (5)  --footprint VERTICES (50000)  --region-quads N (42000000)
+            --pool cold|warm|both (cold): between samples the store is emptied and its memory
+            given back (cold: every pin maps fresh memory), or emptied with its memory kept
+            (warm: as in a running app), or each in turn (both)
   brush:    --steps N (200)  --footprint VERTICES (50000)  --strength F (0.0001)
   save:     --steps N (50)   --footprint VERTICES (50000)  --strength F (0.0001)
   budget:   --moves N (20)  --steps-per-move N (10)  --view-tiles N (2000)
@@ -91,17 +94,71 @@ impl Subcommand {
     /// Whether the subcommand takes the option `flag`.
     fn takes(self, flag: Flag) -> bool {
         use Flag::{
-            Amplitude, BudgetMib, Footprint, Force, Level, Levels, Moves, Project, RegionQuads,
-            Samples, Seed, Splits, Steps, StepsPerMove, Strength, ViewTiles,
+            Amplitude, BudgetMib, Footprint, Force, Level, Levels, Moves, Pool, Project,
+            RegionQuads, Samples, Seed, Splits, Steps, StepsPerMove, Strength, ViewTiles,
         };
         match flag {
             Project | BudgetMib | Seed => true,
             Splits | Levels | Amplitude | Force => self == Self::Generate,
             Level | Footprint => self != Self::Generate,
-            Samples | RegionQuads => self == Self::PageIn,
+            Samples | RegionQuads | Pool => self == Self::PageIn,
             Steps => matches!(self, Self::Brush | Self::Save),
             Strength => matches!(self, Self::Brush | Self::Save | Self::Budget),
             Moves | StepsPerMove | ViewTiles => self == Self::Budget,
+        }
+    }
+}
+
+/// `page-in`: the state of the store's slot pool when a sample's pin starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pool {
+    /// Emptied with its memory given back between samples (`evict_all`, then `shrink_to(0)`):
+    /// every pin maps fresh chunks and faults their pages in, zeroed by the kernel, as the
+    /// first pin after the app starts does.
+    Cold,
+    /// Emptied with its memory kept between samples (`evict_all` alone): every pin reuses
+    /// chunks mapped and touched earlier, as a running app panning to a new region does.
+    Warm,
+}
+
+impl Pool {
+    /// The pool state's name on the command line and in the JSON records.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Warm => "warm",
+        }
+    }
+}
+
+/// `--pool`: which pool states `page-in` measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pools {
+    /// Only [`Pool::Cold`], the default: the measure the harness has always taken.
+    Cold,
+    /// Only [`Pool::Warm`].
+    Warm,
+    /// [`Pool::Cold`], then [`Pool::Warm`], each over the same places.
+    Both,
+}
+
+impl Pools {
+    /// The choice named `name` on the command line (`cold`, `warm` or `both`).
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "cold" => Some(Self::Cold),
+            "warm" => Some(Self::Warm),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// The pool states to measure, in the order they are measured.
+    pub(crate) const fn each(self) -> &'static [Pool] {
+        match self {
+            Self::Cold => &[Pool::Cold],
+            Self::Warm => &[Pool::Warm],
+            Self::Both => &[Pool::Cold, Pool::Warm],
         }
     }
 }
@@ -131,6 +188,8 @@ enum Flag {
     Footprint,
     /// `--region-quads`.
     RegionQuads,
+    /// `--pool`.
+    Pool,
     /// `--steps`.
     Steps,
     /// `--strength`.
@@ -145,7 +204,7 @@ enum Flag {
 
 impl Flag {
     /// Every flag with its name, without the leading `--`.
-    const NAMES: [(Self, &'static str); 16] = [
+    const NAMES: [(Self, &'static str); 17] = [
         (Self::Project, "project"),
         (Self::BudgetMib, "budget-mib"),
         (Self::Seed, "seed"),
@@ -157,6 +216,7 @@ impl Flag {
         (Self::Samples, "samples"),
         (Self::Footprint, "footprint"),
         (Self::RegionQuads, "region-quads"),
+        (Self::Pool, "pool"),
         (Self::Steps, "steps"),
         (Self::Strength, "strength"),
         (Self::Moves, "moves"),
@@ -199,6 +259,8 @@ pub(crate) struct Options {
     pub(crate) footprint: usize,
     /// `page-in`: the large region, in quads of the measured level.
     pub(crate) region_quads: u64,
+    /// `page-in`: whether the pool is measured cold, warm or both.
+    pub(crate) pools: Pools,
     /// `brush`, `save`: draw steps in the stroke.
     pub(crate) steps: usize,
     /// How far the draw brush pushes at its centre, along the frame normal.
@@ -226,6 +288,7 @@ impl Options {
             samples: 5,
             footprint: 50_000,
             region_quads: 42_000_000,
+            pools: Pools::Cold,
             steps: if subcommand == Subcommand::Save {
                 50
             } else {
@@ -272,6 +335,11 @@ impl Options {
             Flag::Samples => self.samples = positive(flag, text)?,
             Flag::Footprint => self.footprint = positive(flag, text)?,
             Flag::RegionQuads => self.region_quads = positive(flag, text)?,
+            Flag::Pool => {
+                self.pools = Pools::named(text).ok_or_else(|| {
+                    anyhow!("--pool {text:?}: expected one of cold, warm or both")
+                })?;
+            }
             Flag::Steps => self.steps = positive(flag, text)?,
             Flag::Strength => self.strength = finite(flag, text)?,
             Flag::Moves => self.moves = positive(flag, text)?,
@@ -420,6 +488,14 @@ mod tests {
             Some(PathBuf::from("/tmp/x.bcrf")),
             "a path"
         );
+        let page_in = parse("page-in").unwrap();
+        assert_eq!(page_in.options.pools, Pools::Cold, "page-in's default pool");
+        let both = parse("page-in --pool both").unwrap();
+        assert_eq!(
+            both.options.pools.each(),
+            [Pool::Cold, Pool::Warm],
+            "both, cold first"
+        );
         let generate = parse("generate --force --splits 2").unwrap();
         assert!(generate.options.force, "a switch");
         assert_eq!(generate.options.splits, 2, "after a switch");
@@ -436,6 +512,8 @@ mod tests {
             ("brush --steps 0", "zero steps"),
             ("brush --steps x", "a value that doesn't parse"),
             ("brush --strength inf", "an infinite strength"),
+            ("page-in --pool lukewarm", "an unknown pool state"),
+            ("brush --pool warm", "a pool state for another subcommand"),
             ("generate --force=yes", "a value for a switch"),
             ("brush stray", "a stray argument"),
         ] {
