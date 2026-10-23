@@ -41,6 +41,12 @@ impl Drop for TestDir {
 /// A new project over the cube (`cube_sphere(1)`, 6 faces) with room for every tile, recovery
 /// files in `dir`, and its spatial index at `level`.
 fn project(dir: &TestDir, level: Level) -> (Project, SpatialIndex) {
+    project_over(dir, cube_sphere(1).unwrap(), level)
+}
+
+/// A new project over `mesh` with room for every tile of a few dozen faces, recovery files in
+/// `dir`, and its spatial index at `level`.
+fn project_over(dir: &TestDir, mesh: BaseMesh, level: Level) -> (Project, SpatialIndex) {
     let config = ProjectConfig {
         store: StoreConfig {
             budget_bytes: 64 << 20,
@@ -49,7 +55,7 @@ fn project(dir: &TestDir, level: Level) -> (Project, SpatialIndex) {
         },
         recovery_dir: dir.0.join("recovery"),
     };
-    let mut project = Project::new(cube_sphere(1).unwrap(), config).unwrap();
+    let mut project = Project::new(mesh, config).unwrap();
     let index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
     (project, index)
 }
@@ -232,8 +238,12 @@ fn assert_bounds_fresh(store: &mut TileStore, index: &SpatialIndex) {
 
 /// The cube's face-grid vertex `(i, j)` of `face` at `level`, as evaluated before any edit.
 fn vertex(level: Level, face: u32, i: u32, j: u32) -> Vec3 {
-    let mesh = cube_sphere(1).unwrap();
-    let dense = DenseEvaluation::new(&mesh, level, &CorrectionMap::new()).unwrap();
+    vertex_of(&cube_sphere(1).unwrap(), level, face, i, j)
+}
+
+/// `mesh`'s face-grid vertex `(i, j)` of `face` at `level`, as evaluated before any edit.
+fn vertex_of(mesh: &BaseMesh, level: Level, face: u32, i: u32, j: u32) -> Vec3 {
+    let dense = DenseEvaluation::new(mesh, level, &CorrectionMap::new()).unwrap();
     dense
         .grid(FaceId::new(face), level)
         .unwrap()
@@ -352,6 +362,37 @@ fn a_stroke_of_overlapping_steps_matches_dense_after_each_step() {
         assert_as_dense(project.store(), &map, level, &format!("after step {k}"));
     }
     project.end_stroke().unwrap();
+    assert_bounds_fresh(project.store(), &index);
+}
+
+#[test]
+fn a_step_at_a_valence_5_vertex_matches_dense_and_keeps_its_five_copies_in_step() {
+    let dir = TestDir::new();
+    let level = Level::new(6).unwrap();
+    let mesh = geom::fixtures::subdivided_pentagonal_prism().unwrap();
+    let (mut project, mut index) = project_over(&dir, mesh.clone(), level);
+    // Face 5's corner 2, at face-grid (n, n), is the top cap's centre, where five faces meet.
+    let n = level.face_quads();
+    let pole = vertex_of(&mesh, level, 5, n, n);
+    let copies = mesh.topology().copies(FaceId::new(5), level, n, n);
+    assert_eq!(copies.len(), 5, "a copy in each of the five faces");
+    let mut map = CorrectionMap::new();
+    project.begin_stroke().unwrap();
+    // On the pole, then off it so the falloff crosses it unevenly, pushing out and then in.
+    for (k, (shift, strength)) in [(0.0, 0.05), (0.08, -0.03)].into_iter().enumerate() {
+        let center = Vec3::new(pole.x + shift, pole.y, pole.z);
+        let params = DrawParams::new(center, 0.3, strength).unwrap();
+        let stats = draw_step(&mut project, &mut index, params).unwrap();
+        let moved = oracle_step(&mesh, level, &mut map, params);
+        assert_eq!(stats.vertices, moved, "step {k}: vertices moved");
+        assert!(
+            stats.tiles_edited >= 5,
+            "step {k}: the brush reaches all five faces: {stats:?}"
+        );
+        assert_as_dense(project.store(), &map, level, &format!("after step {k}"));
+    }
+    project.end_stroke().unwrap();
+    assert_twins(project.store(), level);
     assert_bounds_fresh(project.store(), &index);
 }
 

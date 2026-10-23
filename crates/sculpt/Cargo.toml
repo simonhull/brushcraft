@@ -18,6 +18,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
+geom = { workspace = true, features = ["test-fixtures"] }
 
 [[bench]]
 name = "draw_step"
