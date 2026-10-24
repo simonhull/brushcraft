@@ -36,12 +36,17 @@
 //! The tiles of one cone level are independent of each other, so they are built in parallel,
 //! on the store's worker threads ([`StoreConfig::threads`]), in rounds of at most [`ROUND`]
 //! tiles: the owner thread loads and pins the round's correction tiles, the workers predict
-//! every tile of the round from the pinned level below into scratch buffers, reading the pools
-//! only through shared references, and the owner unpins the correction tiles and installs the
-//! results one by one, in key order. Nothing the workers do touches the pools, the budget or the
-//! dependency graph, and the rounds are cut the same way whatever the thread count, so the store
-//! makes the same decisions (which slot, which victim) and computes the same bits with one
-//! thread or thirty-two.
+//! every tile of the round from the pinned level below, and the owner unpins the correction
+//! tiles and installs the results one by one, in key order. A round of tiles that already have
+//! slots (stale tiles recomputed in place, as after a brush step) is predicted straight into
+//! those slots, each task writing its own; any other round into scratch buffers, which the
+//! owner copies into the slots it takes as it installs them. Normals are computed straight into
+//! their tiles' slots the same way. The workers write only the slots (or buffers) handed to
+//! them, one per task, borrowed disjointly from the pool, and read the pinned tiles through
+//! shared borrows; nothing they do touches the pools' bookkeeping, the budget or the dependency
+//! graph, and the rounds are cut the same way whatever the thread count, so the store makes the
+//! same decisions (which slot, which victim) and computes the same bits with one thread or
+//! thirty-two.
 //!
 //! [`TileStore::evaluate_many`] widens the cone to many target tiles at once, so the levels are
 //! wide enough to keep every worker busy; [`TileStore::pin`] goes through it too. Such a cone's
@@ -254,7 +259,8 @@ impl StoreConfig {
 /// operations come in the same order however many workers it has. Each round pins its tiles'
 /// correction slots while the workers read them (fewer, cut at the first tile after the first
 /// that would need a dirty tile written back or an evaluated chunk taken, see
-/// [`TileStore::load_round`]), and holds a scratch buffer of one tile per tile of the round.
+/// [`TileStore::load_round`]), and a round of tiles without slots holds a scratch buffer of one
+/// tile per tile of the round.
 const ROUND: usize = 64;
 
 /// Target tiles [`TileStore::evaluate_many`] and [`TileStore::pin`] put in one batch at most.
@@ -603,6 +609,9 @@ type ConeLevel = BTreeMap<TileKey, Vec<TileKey>>;
 struct EvalLog {
     /// Tiles whose positions were computed, in order.
     positions: Vec<TileKey>,
+    /// Tiles whose positions were predicted straight into their slots on the workers, in
+    /// order: also in `positions`.
+    in_place: Vec<TileKey>,
     /// Tiles whose normals were computed, in order, in full or brought up to date.
     normals: Vec<TileKey>,
     /// Tiles whose stale normals were brought up to date (only the vertices reading a changed
@@ -682,7 +691,7 @@ struct EvalLog {
 /// memory. Besides them, and not charged to the budget:
 ///
 /// - the evaluation scratch: one buffer of the largest tile's positions (about 50 KB) per tile of a
-///   round, so about 3.2 MB at most (64 of them), kept for the store's life;
+///   round of new tiles, so about 3.2 MB at most (64 of them), kept for the store's life;
 /// - the buffers and zstd context the owner thread reads correction tiles with, each evaluation
 ///   worker's (made the first time a round's tiles are loaded on the workers) and each prefetch
 ///   worker's (at most four): about 150 KB a thread, so a few MB with dozens of workers, with the
@@ -766,9 +775,9 @@ pub struct TileStore {
     pin_sets: HashMap<u64, Vec<Pinned>>,
     /// The id the next pin set gets.
     next_pin_set: u64,
-    /// One tile of positions or normals per tile of a round (see [`ROUND`]): the workers
-    /// write here, then the owner thread copies each into its slot. Grown on demand, never past
-    /// [`ROUND`] buffers.
+    /// One tile of positions per tile of a round of tiles without slots (see [`ROUND`] and
+    /// [`TileStore::build_round`]): the workers write here, then the owner thread copies each
+    /// into the slot it takes for it. Grown on demand, never past [`ROUND`] buffers.
     scratch: Vec<Vec<Vec3>>,
     /// The evaluation workers (see the module notes).
     workers: rayon::ThreadPool,
@@ -802,6 +811,28 @@ impl std::fmt::Debug for TileStore {
     }
 }
 
+/// The positions of tiles an evaluation pinned, each tile with all `SIDE²` of its slot's
+/// positions, in key order: what a [`Resident`] source reads.
+type Positions<'a> = Vec<(TileKey, &'a [Vec3])>;
+
+/// Where a [`Resident`] source finds the pinned tiles' positions.
+#[derive(Clone, Copy)]
+enum Tiles<'a> {
+    /// Borrowed slices ([`Positions`]), found once per round by the owner thread, split off
+    /// the same borrow that hands the workers the slots they write
+    /// ([`TileStore::predict_round`], [`TileStore::normals_round`]).
+    Split(&'a [(TileKey, &'a [Vec3])]),
+    /// Looked up in the evaluated pool, shared, when a read first needs a tile: for a round
+    /// whose workers write no slot (a round of new tiles, as paging in builds them), which so
+    /// costs the owner nothing per tile of the level below, however wide that level is.
+    Shared {
+        /// The evaluated pool.
+        pool: &'a Pool<EvaluatedSlot>,
+        /// The pinned tiles, in key order.
+        held: &'a [(TileKey, SlotId<EvaluatedSlot>)],
+    },
+}
+
 /// Positions of the tiles an evaluation pinned, and the base mesh at level 0.
 ///
 /// Each vertex is read from [`TileKey::containing`]'s tile, as [`PositionSource`] requires, so
@@ -809,30 +840,23 @@ impl std::fmt::Debug for TileStore {
 ///
 /// A gather reads a block row by row, so nearly every read falls in the tile the read before
 /// it did: the source remembers that tile's positions, and finds a tile (a binary search of the
-/// pinned tiles, then a pool lookup) only when a read leaves it. The memory is a [`Cell`], so a
+/// pinned tiles, see [`Tiles`]) only when a read leaves it. The memory is a [`Cell`], so a
 /// source is `!Sync`: each task on the workers makes its own ([`Resident::new`]), which costs
 /// nothing.
 struct Resident<'a> {
     /// Level 0.
     mesh: &'a BaseMesh,
-    /// The evaluated pool.
-    pool: &'a Pool<EvaluatedSlot>,
-    /// The pinned tiles, in key order.
-    tiles: &'a [(TileKey, SlotId<EvaluatedSlot>)],
+    /// The pinned tiles.
+    tiles: Tiles<'a>,
     /// The tile the last read above level 0 resolved to, and its positions.
     last: Cell<Option<(TileKey, &'a [Vec3])>>,
 }
 
 impl<'a> Resident<'a> {
-    /// A source over `tiles`, pinned in `pool`, and `mesh` at level 0, remembering no tile yet.
-    const fn new(
-        mesh: &'a BaseMesh,
-        pool: &'a Pool<EvaluatedSlot>,
-        tiles: &'a [(TileKey, SlotId<EvaluatedSlot>)],
-    ) -> Self {
+    /// A source over the pinned `tiles` and `mesh` at level 0, remembering no tile yet.
+    const fn new(mesh: &'a BaseMesh, tiles: Tiles<'a>) -> Self {
         Self {
             mesh,
-            pool,
             tiles,
             last: Cell::new(None),
         }
@@ -846,9 +870,16 @@ impl<'a> Resident<'a> {
         {
             return Some(positions);
         }
-        let at = self.tiles.binary_search_by_key(&key, |&(k, _)| k).ok()?;
-        let &(_, id) = self.tiles.get(at)?;
-        let positions = self.pool.get(id)?.positions.as_slice();
+        let positions = match self.tiles {
+            Tiles::Split(tiles) => {
+                let at = tiles.binary_search_by_key(&key, |&(k, _)| k).ok()?;
+                tiles.get(at)?.1
+            }
+            Tiles::Shared { pool, held } => {
+                let at = held.binary_search_by_key(&key, |&(k, _)| k).ok()?;
+                pool.get(held.get(at)?.1)?.positions.as_slice()
+            }
+        };
         self.last.set(Some((key, positions)));
         Some(positions)
     }
@@ -913,18 +944,20 @@ fn map_parallel<T: Sync, R: Send>(
 /// Runs `f` on every item of `items` with a buffer of its own, as [`map_parallel`] does, and
 /// returns the first error in item order.
 ///
-/// Item `k` gets `buffers[k]`; there must be as many buffers as items. The error returned
-/// doesn't depend on which worker finished first.
+/// Item `k` gets `buffers[k]`; there must be as many buffers as items. A buffer is whatever
+/// the item writes: a scratch vector, or a borrow of the slot the item fills, so the borrows
+/// handed to the workers are disjoint by construction. The error returned doesn't depend on
+/// which worker finished first.
 ///
 /// # Errors
 ///
 /// The first item's error, in order; [`CacheError::Internal`] if there are fewer buffers than
 /// items.
-fn each_parallel<T: Sync>(
+fn each_parallel<T: Sync, B: Send>(
     workers: &rayon::ThreadPool,
     items: &[T],
-    buffers: &mut [Vec<Vec3>],
-    f: impl Fn(&T, &mut Vec<Vec3>) -> Result<(), CacheError> + Sync + Send,
+    buffers: &mut [B],
+    f: impl Fn(&T, &mut B) -> Result<(), CacheError> + Sync + Send,
 ) -> Result<(), CacheError> {
     let got = buffers.len();
     let buffers = buffers
@@ -947,18 +980,57 @@ fn each_parallel<T: Sync>(
     results.into_iter().collect()
 }
 
-/// The slot of `key` among the evaluated tiles an evaluation pinned.
+/// The tasks of a round of predictions: each tile of `round` with its correction slot (from
+/// `corrections`, in the same order).
+fn round_tasks(
+    round: &[(TileKey, &[TileKey])],
+    corrections: &[SlotId<CorrectionSlot>],
+) -> Vec<(TileKey, SlotId<CorrectionSlot>)> {
+    round
+        .iter()
+        .map(|&(key, _)| key)
+        .zip(corrections.iter().copied())
+        .collect()
+}
+
+/// Predicts tile `key` and applies its corrections, into the first `side²` values of `out`.
+///
+/// The parents are read from `tiles` (pinned, with the mesh at level 0), the corrections from
+/// slot `id` of `pool`. Reads only, so it runs on any worker.
+///
+/// # Errors
+///
+/// [`CacheError::Eval`] (not for a valid mesh); [`CacheError::Internal`] for a stale handle, a
+/// broken slot, or an `out` shorter than the tile.
+fn predict_tile(
+    mesh: &BaseMesh,
+    pool: &Pool<CorrectionSlot>,
+    tiles: Tiles<'_>,
+    key: TileKey,
+    id: SlotId<CorrectionSlot>,
+    out: &mut [Vec3],
+) -> Result<(), CacheError> {
+    let view = pool
+        .get(id)
+        .ok_or(Invariant::StaleHandle)?
+        .view()
+        .map_err(Invariant::CorrectionSlot)?;
+    let source = Resident::new(mesh, tiles);
+    let prediction = predict_region(mesh, &source, Region::of_tile(&key))?;
+    let out = prefix_mut(out, vertex_count(&key))?;
+    prediction.apply_into(|i, j| view.get(i, j).unwrap_or(Vec3::ZERO), out)?;
+    Ok(())
+}
+
+/// Where `key` is among the evaluated tiles an evaluation pinned (in key order).
 ///
 /// # Errors
 ///
 /// [`Invariant::StaleHandle`] if `key` isn't among them (the store asks only for tiles it
 /// pinned).
-fn held_slot(held: &Held, key: &TileKey) -> Result<SlotId<EvaluatedSlot>, Invariant> {
+fn held_index(held: &Held, key: &TileKey) -> Result<usize, Invariant> {
     held.binary_search_by_key(key, |&(k, _)| k)
-        .ok()
-        .and_then(|at| held.get(at))
-        .map(|&(_, id)| id)
-        .ok_or(Invariant::StaleHandle)
+        .or(Err(Invariant::StaleHandle))
 }
 
 /// The tiles `key`'s positions are predicted from, listed with [`parent_tiles`], level 0 (the
@@ -3832,8 +3904,19 @@ impl TileStore {
 
     /// Builds one round: predicts every tile of `round` on the workers, from `below` and its
     /// pinned correction slot (`corrections`, in the same order), unpins the correction slots,
-    /// then installs each tile in order (see [`TileStore::store_positions`]), pinning it and
-    /// adding it to `held`.
+    /// then installs each tile in key order, pinning it and adding it to `held`.
+    ///
+    /// A tile that already has a slot (a stale tile recomputed in place, as a brush step's
+    /// tiles are: pinned, so kept when their edit invalidated them) is predicted straight into
+    /// that slot on the workers, and installing it is only its bookkeeping
+    /// ([`TileStore::positions_installed`]). Any other tile is predicted into a scratch buffer,
+    /// and the owner copies it into a slot it takes as it installs the tile
+    /// ([`TileStore::store_positions`]). Either way the pools see the same calls in the same
+    /// order as when every tile went through scratch: a lookup of each tile's slot, or a slot
+    /// taken for it, in key order, after the correction slots are unpinned. Slots are not taken
+    /// earlier to predict into them: that would hold the round's correction pins while the
+    /// evaluated pool makes room (see below), and fault fresh chunks' pages in on the workers,
+    /// which once made paging in slower.
     ///
     /// The correction slots are unpinned before anything is installed, as an evaluation one
     /// tile at a time holds no correction slot while it takes an evaluated one: the evaluated
@@ -3843,6 +3926,7 @@ impl TileStore {
     ///
     /// As [`TileStore::evaluate`]: the first error of the round in key order. The tiles
     /// installed before it stay in `held`, pinned; the correction slots are unpinned either way.
+    /// A tile predicted in place but not installed keeps its slot, stale, to be recomputed.
     fn build_round(
         &mut self,
         round: &[(TileKey, &[TileKey])],
@@ -3850,60 +3934,143 @@ impl TileStore {
         below: &Held,
         held: &mut Held,
     ) -> Result<(), CacheError> {
+        let slots: Vec<Option<SlotId<EvaluatedSlot>>> = round
+            .iter()
+            .map(|(key, _)| self.evaluated.find(key))
+            .collect();
         let mut scratch = self.take_scratch(round.len());
-        let predicted = self.predict_round(round, corrections, below, &mut scratch);
+        let predicted = self.predict_round(round, corrections, &slots, below, &mut scratch);
         let released = self.unpin_corrections(corrections);
         let built = predicted.and(released).and_then(|()| {
-            round
-                .iter()
-                .zip(&scratch)
-                .try_for_each(|(&(key, parents), positions)| {
-                    let id = self.store_positions(key, parents, positions)?;
+            round.iter().zip(&slots).zip(&scratch).try_for_each(
+                |((&(key, parents), &slot), positions)| {
+                    let id = match slot {
+                        Some(id) => {
+                            self.install_in_place(key, id, parents)?;
+                            id
+                        }
+                        None => self.store_positions(key, parents, positions)?,
+                    };
                     self.evaluated.pin(id)?;
                     held.push((key, id));
                     Ok(())
-                })
+                },
+            )
         });
         self.scratch = scratch;
         built
     }
 
     /// Predicts every tile of `round` on the workers, from the pinned tiles of `below` and its
-    /// correction slot (`corrections`, in the same order), into the buffers of `scratch`, one
-    /// per tile. The workers only read: the pools are shared, not changed.
+    /// correction slot (`corrections`, in the same order): straight into the tile's evaluated
+    /// slot where `slots` names one (in the same order), else into its buffer of `scratch`.
+    ///
+    /// The slots written and the slots read are borrowed together, in one
+    /// [`Pool::get_many_mut`], which hands out each slot once: the round's slots stay mutable,
+    /// one per task, and its tiles' parents (each once, found in `below`) are reborrowed shared
+    /// for every task to read. Only the parents are borrowed, not all of `below`: a wide level
+    /// is built in many rounds, and borrowing the whole level below for each would cost each
+    /// round as much as the level is wide. The round's tiles are a level finer than their
+    /// parents, so no slot is named twice. Nothing of the pools' bookkeeping, the budget or the
+    /// dependency graph changes; the owner installs the tiles afterwards, in key order.
     ///
     /// # Errors
     ///
     /// The first tile's error in key order: [`CacheError::Eval`] (not for a valid mesh), or
-    /// [`CacheError::Internal`] for a stale handle or a broken slot.
+    /// [`CacheError::Internal`] for a stale handle, a parent not in `below`, a slot named twice,
+    /// a broken slot or too few buffers. A slot whose tile failed holds whatever its prediction
+    /// had written: it stays stale.
     fn predict_round(
-        &self,
+        &mut self,
         round: &[(TileKey, &[TileKey])],
         corrections: &[SlotId<CorrectionSlot>],
+        slots: &[Option<SlotId<EvaluatedSlot>>],
         below: &Held,
         scratch: &mut [Vec<Vec3>],
     ) -> Result<(), CacheError> {
-        let mesh = &*self.mesh;
-        let evaluated = &self.evaluated;
-        let pool = &self.corrections;
-        let tasks: Vec<(TileKey, SlotId<CorrectionSlot>)> = round
+        let (mesh, pool) = (&*self.mesh, &self.corrections);
+        let tasks = round_tasks(round, corrections);
+        if slots.iter().all(Option::is_none) {
+            // Nothing to write in place: the workers read the pool shared, as paging in always
+            // has, and write only scratch.
+            let tiles = Tiles::Shared {
+                pool: &self.evaluated,
+                held: below,
+            };
+            return each_parallel(&self.workers, &tasks, scratch, |&(key, id), out| {
+                predict_tile(mesh, pool, tiles, key, id, out)
+            });
+        }
+        let mut parent_keys: Vec<TileKey> = round
             .iter()
-            .map(|&(key, _)| key)
-            .zip(corrections.iter().copied())
+            .flat_map(|&(_, parents)| parents.iter().copied())
             .collect();
-        let predict = |&(key, id): &(TileKey, SlotId<CorrectionSlot>), out: &mut Vec<Vec3>| {
-            let view = pool
-                .get(id)
-                .ok_or(Invariant::StaleHandle)?
-                .view()
-                .map_err(Invariant::CorrectionSlot)?;
-            let source = Resident::new(mesh, evaluated, below);
-            let prediction = predict_region(mesh, &source, Region::of_tile(&key))?;
-            let out = prefix_mut(out, vertex_count(&key))?;
-            prediction.apply_into(|i, j| view.get(i, j).unwrap_or(Vec3::ZERO), out)?;
-            Ok(())
-        };
-        each_parallel(&self.workers, &tasks, scratch, predict)
+        parent_keys.sort_unstable();
+        parent_keys.dedup();
+        let read_from: Held = parent_keys
+            .into_iter()
+            .map(|key| {
+                let at = held_index(below, &key)?;
+                below.get(at).copied().ok_or(Invariant::StaleHandle)
+            })
+            .collect::<Result<_, Invariant>>()?;
+        let own: Vec<SlotId<EvaluatedSlot>> = slots.iter().flatten().copied().collect();
+        let ids: Vec<SlotId<EvaluatedSlot>> = own
+            .iter()
+            .copied()
+            .chain(read_from.iter().map(|&(_, id)| id))
+            .collect();
+        let mut written = self
+            .evaluated
+            .get_many_mut(&ids)
+            .ok_or(Invariant::StaleHandle)?;
+        let read = written.split_off(own.len());
+        let parents: Positions<'_> = read_from
+            .iter()
+            .zip(read)
+            .map(|(&(key, _), slot)| {
+                let slot: &EvaluatedSlot = slot;
+                (key, slot.positions.as_slice())
+            })
+            .collect();
+        let mut written = written.into_iter();
+        let mut outs: Vec<&mut [Vec3]> = slots
+            .iter()
+            .zip(scratch.iter_mut())
+            .map(|(own_slot, buffer)| match own_slot {
+                Some(_) => written.next().map(|slot| slot.positions.as_mut_slice()),
+                None => Some(buffer.as_mut_slice()),
+            })
+            .collect::<Option<_>>()
+            .ok_or(Invariant::StaleHandle)?;
+        let tiles = Tiles::Split(&parents);
+        each_parallel(&self.workers, &tasks, &mut outs, |&(key, id), out| {
+            predict_tile(mesh, pool, tiles, key, id, out)
+        })
+    }
+
+    /// Installs `key`'s positions, predicted straight into its slot `id`: looks the slot up,
+    /// as [`TileStore::store_positions`] finds a stale slot (marking it used), and records the
+    /// tile as predicted from `parents` ([`TileStore::positions_installed`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] if `key`'s slot is no longer `id` (the slot is pinned while the
+    /// round is built, so this doesn't happen).
+    fn install_in_place(
+        &mut self,
+        key: TileKey,
+        id: SlotId<EvaluatedSlot>,
+        parents: &[TileKey],
+    ) -> Result<(), CacheError> {
+        match self.evaluated.lookup(&key) {
+            Some((found, _)) if found == id => {}
+            _ => return Err(Invariant::StaleHandle.into()),
+        }
+        self.positions_installed(key, id, parents)?;
+        #[cfg(test)]
+        self.log.in_place.push(key);
+        Ok(())
     }
 
     /// The scratch buffers, taken out of the store so the owner thread can install from them
@@ -3944,11 +4111,28 @@ impl TileStore {
         let n = vertex_count(&key);
         let slot = self.evaluated.get_mut(id).ok_or(Invariant::StaleHandle)?;
         prefix_mut(&mut slot.positions, n)?.copy_from_slice(prefix(positions, n)?);
+        self.positions_installed(key, id, parents)?;
+        Ok(id)
+    }
+
+    /// The bookkeeping of `key`'s new positions, written into its slot `id`: marks the slot
+    /// fresh and records the tile as predicted from `parents`, which the caller holds pinned
+    /// (see [`TileStore::store_positions`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] for a stale handle.
+    fn positions_installed(
+        &mut self,
+        key: TileKey,
+        id: SlotId<EvaluatedSlot>,
+        parents: &[TileKey],
+    ) -> Result<(), CacheError> {
         self.evaluated.mark_fresh(id)?;
         self.deps.record_positions(key, parents);
         #[cfg(test)]
         self.log.positions.push(key);
-        Ok(id)
+        Ok(())
     }
 
     /// The slot of `key`'s current positions and normals: cached, else the normals are computed
@@ -4008,15 +4192,15 @@ impl TileStore {
 
     /// Computes the normals of `wanted` (each with its normal `inputs` and, where its normals
     /// are stale, the inputs they are stale since, in the same order) from `held`, every tile
-    /// they read, pinned: on the workers, a round at a time, each round then installed in order
-    /// (see [`TileStore::store_normals`]).
-    ///
-    /// A stale tile's normals are copied out of its slot into the scratch buffer and brought up
-    /// to date there by [`geom::refresh_normals_into`]; any other's are computed in full.
+    /// they read, pinned: on the workers, straight into each tile's slot
+    /// ([`TileStore::normals_round`]), then recorded in key order (see
+    /// [`TileStore::normals_installed`]).
     ///
     /// # Errors
     ///
-    /// As [`TileStore::evaluate`]: the first error in key order.
+    /// As [`TileStore::evaluate`]: the first error in key order. Nothing is recorded then: a
+    /// tile whose normals were absent keeps none, and one whose normals were stale stays stale
+    /// since the same inputs (any vertex rewritten was one its refresh recomputes).
     fn normals_rounds(
         &mut self,
         wanted: &[TileKey],
@@ -4024,75 +4208,93 @@ impl TileStore {
         stale: &[Option<BTreeSet<TileKey>>],
         held: &Held,
     ) -> Result<(), CacheError> {
-        let mut scratch = self.take_scratch(wanted.len());
         let tasks: Vec<(TileKey, Option<&BTreeSet<TileKey>>)> = wanted
             .iter()
             .copied()
             .zip(stale.iter().map(Option::as_ref))
             .collect();
-        let outcome =
+        self.normals_round(&tasks, held)?;
+        #[cfg(test)]
+        self.log.refreshed.extend(
             tasks
-                .chunks(ROUND)
-                .zip(inputs.chunks(ROUND))
-                .try_for_each(|(round, inputs)| {
-                    let mesh = &*self.mesh;
-                    let pool = &self.evaluated;
-                    let compute = |&(key, since): &(TileKey, Option<&BTreeSet<TileKey>>),
-                                   out: &mut Vec<Vec3>| {
-                        let source = Resident::new(mesh, pool, held);
-                        let n = vertex_count(&key);
-                        let out = prefix_mut(out, n)?;
-                        let region = Region::of_tile(&key);
-                        let Some(since) = since else {
-                            normals_into(mesh, &source, region, out)?;
-                            return Ok(());
-                        };
-                        let id = held_slot(held, &key)?;
-                        let slot = pool.get(id).ok_or(Invariant::StaleHandle)?;
-                        out.copy_from_slice(prefix(&slot.normals, n)?);
-                        refresh_normals_into(mesh, &source, region, |k| since.contains(k), out)?;
-                        Ok(())
-                    };
-                    each_parallel(&self.workers, round, &mut scratch, compute)?;
-                    #[cfg(test)]
-                    self.log.refreshed.extend(
-                        round
-                            .iter()
-                            .filter(|(_, since)| since.is_some())
-                            .map(|&(key, _)| key),
-                    );
-                    round.iter().zip(inputs).zip(&scratch).try_for_each(
-                        |((&(key, _), inputs), normals)| {
-                            self.store_normals(key, inputs, held, normals)
-                        },
-                    )
-                });
-        self.scratch = scratch;
-        outcome
+                .iter()
+                .filter(|(_, since)| since.is_some())
+                .map(|&(key, _)| key),
+        );
+        for (&key, read) in wanted.iter().zip(inputs) {
+            self.normals_installed(key, read);
+        }
+        Ok(())
     }
 
-    /// Copies `normals` into `key`'s slot (pinned in `held`) and records them as read from
-    /// `inputs`, which `held` holds pinned.
+    /// Computes the normals of each tile of `tasks` on the workers, straight into its slot
+    /// among `held` (every tile the normals read, pinned, in key order; the tasks' tiles are
+    /// among them, each once): brought up to date by [`geom::refresh_normals_into`] where they
+    /// are stale since a set of inputs, computed in full by [`geom::normals_into`] otherwise.
+    ///
+    /// Every slot of `held` is borrowed at once ([`Pool::get_many_mut`]) and split by field:
+    /// all the positions shared, for every task to read, and each task's tile's normals
+    /// mutable, for that task alone. A task writes only its own tile's normals and reads only
+    /// positions, so what lands in each slot is the same whichever worker computes it, and
+    /// nothing of the pools' bookkeeping changes.
     ///
     /// # Errors
     ///
-    /// [`CacheError::Internal`] if `key` isn't in `held`, its handle went stale, or `normals`
-    /// is shorter than the tile.
-    fn store_normals(
+    /// The first task's error in order: [`CacheError::Eval`] (not for a valid mesh), or
+    /// [`CacheError::Internal`] for a stale handle or a task whose tile isn't in `held`, or is
+    /// in `tasks` twice.
+    fn normals_round(
         &mut self,
-        key: TileKey,
-        inputs: &BTreeSet<TileKey>,
+        tasks: &[(TileKey, Option<&BTreeSet<TileKey>>)],
         held: &Held,
-        normals: &[Vec3],
     ) -> Result<(), CacheError> {
-        let own = held_slot(held, &key)?;
-        let n = vertex_count(&key);
-        let slot = self.evaluated.get_mut(own).ok_or(Invariant::StaleHandle)?;
-        prefix_mut(&mut slot.normals, n)?.copy_from_slice(prefix(normals, n)?);
+        let ids: Vec<SlotId<EvaluatedSlot>> = held.iter().map(|&(_, id)| id).collect();
+        let slots = self
+            .evaluated
+            .get_many_mut(&ids)
+            .ok_or(Invariant::StaleHandle)?;
+        let mut positions: Positions<'_> = Vec::with_capacity(held.len());
+        let mut normals = Vec::with_capacity(held.len());
+        for (&(key, _), slot) in held.iter().zip(slots) {
+            let EvaluatedSlot {
+                positions: own,
+                normals: out,
+            } = slot;
+            let own: &[Vec3] = own;
+            positions.push((key, own));
+            normals.push(Some(out));
+        }
+        let mut outs = tasks
+            .iter()
+            .map(|(key, _)| {
+                let at = held_index(held, key)?;
+                normals
+                    .get_mut(at)
+                    .and_then(Option::take)
+                    .ok_or(Invariant::StaleHandle)
+            })
+            .collect::<Result<Vec<_>, Invariant>>()?;
+        let mesh = &*self.mesh;
+        each_parallel(&self.workers, tasks, &mut outs, |&(key, since), out| {
+            let source = Resident::new(mesh, Tiles::Split(&positions));
+            let out = prefix_mut(out.as_mut_slice(), vertex_count(&key))?;
+            let region = Region::of_tile(&key);
+            match since {
+                None => normals_into(mesh, &source, region, out)?,
+                Some(since) => {
+                    refresh_normals_into(mesh, &source, region, |k| since.contains(k), out)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Records `key`'s normals, just written into its slot, as read from `inputs`, which the
+    /// caller holds pinned.
+    fn normals_installed(&mut self, key: TileKey, inputs: &BTreeSet<TileKey>) {
         self.deps.record_normals(key, inputs);
         #[cfg(test)]
         self.log.normals.push(key);
-        Ok(())
     }
 
     /// Unpins the evaluated tiles an evaluation pinned.

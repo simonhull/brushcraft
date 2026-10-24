@@ -2263,6 +2263,132 @@ fn updating_tiles_equals_updating_each_in_turn() {
     drop(guards);
 }
 
+/// Every evaluated and correction slot `store` holds for a tile of `all`, byte for byte, with
+/// the slot's freshness and whether its normals are current: what a run's workers wrote, and
+/// what the owner decided.
+fn every_slot(store: &TileStore, all: &[TileKey]) -> Vec<(TileKey, String, Vec<u8>, Vec<u8>)> {
+    all.iter()
+        .map(|key| {
+            let evaluated = store.evaluated.find(key).map_or_else(Vec::new, |id| {
+                bytemuck::bytes_of(store.evaluated.get(id).unwrap()).to_vec()
+            });
+            let correction = store.corrections.find(key).map_or_else(Vec::new, |id| {
+                bytemuck::bytes_of(store.corrections.get(id).unwrap()).to_vec()
+            });
+            let state = format!(
+                "{:?} normals {} dirty {:?}",
+                store.evaluated.freshness(key),
+                store.deps.has_normals(key),
+                store.unsaved.get(key),
+            );
+            (*key, state, evaluated, correction)
+        })
+        .collect()
+}
+
+/// A stroke as a brush makes it on `keys`, pinned if `pin` is set.
+///
+/// Each round is a new op of [`tiles_change`] through [`TileStore::update_tiles`], then the
+/// positions and normals of the tiles and every tile whose normals read them (`around`)
+/// brought up to date together.
+fn brush_rounds(store: &mut TileStore, keys: &[TileKey], around: &[TileKey], pin: bool) {
+    let guard = pin.then(|| store.pin(keys).unwrap());
+    store.evaluate_many(around, Evaluation::Normals).unwrap();
+    for round in 0..4 {
+        assert_eq!(update_round("tiles", store, keys, round, false), "Ok(())");
+        store.evaluate_many(around, Evaluation::Normals).unwrap();
+    }
+    drop(guard);
+}
+
+/// The finest-level tiles [`brush_rounds`] edits, and those it brings up to date.
+fn brushed_tiles(mesh: &BaseMesh) -> (Vec<TileKey>, Vec<TileKey>) {
+    let keys: Vec<TileKey> = tiles(mesh, TOP, TOP).into_iter().take(12).collect();
+    let around: BTreeSet<TileKey> = keys
+        .iter()
+        .flat_map(|key| list_normal_inputs(mesh, key).unwrap())
+        .collect();
+    (keys, around.into_iter().collect())
+}
+
+/// Slots written on the workers are the same, byte for byte, whatever the thread count.
+///
+/// A brush's pinned tiles are predicted straight into their slots and every normal is written
+/// straight into its slot; every slot, the dirty set and the change feed end up the same.
+#[test]
+fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (keys, around) = brushed_tiles(&mesh);
+    let all = tiles(&mesh, 1, TOP);
+    let mut runs = Vec::new();
+    for threads in [
+        1,
+        2,
+        thread::available_parallelism().map_or(1, NonZeroUsize::get),
+    ] {
+        let config = roomy().with_threads(NonZeroUsize::new(threads));
+        let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);
+        brush_rounds(&mut store, &keys, &around, true);
+        assert_eq!(
+            store.log.in_place.len(),
+            4 * keys.len(),
+            "{threads} threads: every pinned tile predicted in place each round"
+        );
+        let feed = store.feed.drain(store.save_consumer);
+        runs.push((threads, every_slot(&store, &all), feed, store.log.positions));
+    }
+    let ((_, slots, feed, positions), others) = runs.split_first().unwrap();
+    assert!(!feed.is_empty(), "the rounds went to the feed");
+    for (threads, other_slots, other_feed, other_positions) in others {
+        assert_eq!(other_feed, feed, "{threads} threads: the same feed");
+        assert_eq!(
+            other_positions, positions,
+            "{threads} threads: the same tiles computed, in the same order"
+        );
+        for (got, want) in other_slots.iter().zip(slots) {
+            assert!(
+                got == want,
+                "{threads} threads, {:?}: the same slot",
+                want.0
+            );
+        }
+    }
+}
+
+/// Predicting a pinned tile straight into its slot gives the same bits as through scratch.
+///
+/// A tile that isn't pinned loses its slot to an edit, so it is predicted into scratch and
+/// copied into a slot taken afresh.
+#[test]
+fn predicting_in_place_equals_predicting_into_scratch() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (keys, around) = brushed_tiles(&mesh);
+    let mut stores = [true, false].map(|pin| {
+        let mut store = new_store(&dir, &format!("{pin}.bcp"), &mesh, roomy());
+        brush_rounds(&mut store, &keys, &around, pin);
+        store
+    });
+    let [in_place, scratch] = &mut stores;
+    assert!(!in_place.log.in_place.is_empty(), "pinned: in place");
+    assert!(scratch.log.in_place.is_empty(), "not pinned: into scratch");
+    for &key in &around {
+        let positions = scratch.evaluate(key).unwrap().to_vec();
+        let same = in_place.evaluate(key).unwrap().iter().zip(&positions);
+        assert!(
+            same.into_iter().all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{key:?}: positions"
+        );
+        let normals = scratch.normals(key).unwrap().to_vec();
+        let alike = in_place.normals(key).unwrap().iter().zip(&normals);
+        assert!(
+            alike.into_iter().all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{key:?}: normals"
+        );
+    }
+}
+
 /// A tile of a run whose border fails before the row of its first interior write still has its
 /// interior pass applied: it is marked written, never left changed and clean.
 ///
@@ -2902,7 +3028,18 @@ fn resident_rows_read_as_single_vertices() {
             }
         }
     }
-    let source = Resident::new(&store.mesh, &store.evaluated, &held);
+    let positions: Positions<'_> = held
+        .iter()
+        .map(|&(key, id)| (key, store.evaluated.get(id).unwrap().positions.as_slice()))
+        .collect();
+    let split = Resident::new(&store.mesh, Tiles::Split(&positions));
+    let shared = Resident::new(
+        &store.mesh,
+        Tiles::Shared {
+            pool: &store.evaluated,
+            held: &held,
+        },
+    );
     let runs = [
         (0, n + 1),
         (1, tq - 1),
@@ -2911,24 +3048,30 @@ fn resident_rows_read_as_single_vertices() {
         (tq, 1),
         (n - 3, 4),
     ];
-    for face in mesh.faces() {
-        for j in [0, 1, tq - 1, tq, tq + 1, n / 2, n] {
-            for (i, len) in runs {
-                let mut row =
-                    vec![Vec3::new(f32::NAN, f32::NAN, f32::NAN); usize::try_from(len).unwrap()];
-                source.row(face, top, i, j, &mut row).unwrap();
-                for (x, got) in (i..).zip(&row) {
-                    let want = source.position(face, top, x, j).unwrap();
-                    assert_ne!(want, planted, "a single read takes the next tile's copy");
-                    assert_eq!(got.to_bits(), want.to_bits(), "{face:?} ({x}, {j})");
+    for source in [&split, &shared] {
+        for face in mesh.faces() {
+            for j in [0, 1, tq - 1, tq, tq + 1, n / 2, n] {
+                for (i, len) in runs {
+                    let mut row = vec![
+                        Vec3::new(f32::NAN, f32::NAN, f32::NAN);
+                        usize::try_from(len).unwrap()
+                    ];
+                    source.row(face, top, i, j, &mut row).unwrap();
+                    for (x, got) in (i..).zip(&row) {
+                        let want = source.position(face, top, x, j).unwrap();
+                        assert_ne!(want, planted, "a single read takes the next tile's copy");
+                        assert_eq!(got.to_bits(), want.to_bits(), "{face:?} ({x}, {j})");
+                        let other = shared.position(face, top, x, j).unwrap();
+                        assert_eq!(other.to_bits(), want.to_bits(), "split and shared agree");
+                    }
                 }
             }
         }
+        let mut past = [Vec3::ZERO; 2];
+        assert!(
+            source.row(FaceId::new(0), top, n, 0, &mut past).is_none(),
+            "a run off the face isn't available"
+        );
     }
-    let mut past = [Vec3::ZERO; 2];
-    assert!(
-        source.row(FaceId::new(0), top, n, 0, &mut past).is_none(),
-        "a run off the face isn't available"
-    );
     store.unpin_held(&held).unwrap();
 }
