@@ -22,8 +22,9 @@
 //! against the latest baseline of each metric on the same hardware, and a change beyond the
 //! metric's noise is flagged ([`compare`]); a flagged slowdown makes the exit status 3, and
 //! failing that a comparison too noisy to conclude makes it 4.
-//! `--baseline` marks the run as the new baseline, which a loaded run (or a dirty tree) can't
-//! be.
+//! `--baseline` marks the run as the new baseline, which a loaded run can't be, nor one whose
+//! binary wasn't built from a clean tree at the commit checked out. Records name the commit the
+//! binary was built from (embedded by `build.rs`).
 
 mod compare;
 mod history;
@@ -401,7 +402,8 @@ fn report<J: Write, H: Write>(
 ///
 /// # Errors
 ///
-/// If the options don't go together, `--baseline` meets a dirty tree, the history can't be read
+/// If the options don't go together, `--baseline` meets a binary that doesn't match a clean
+/// tree, the history can't be read
 /// or written, a part fails, or `--baseline` was asked of a run that turned out loaded (its
 /// records are written, not as a baseline).
 pub(crate) fn run<J: Write, H: Write>(
@@ -413,13 +415,17 @@ pub(crate) fn run<J: Write, H: Write>(
     let started = SystemTime::now();
     let repo = repo_root();
     let machine = Machine::this()?;
-    let revision = Revision::of(&repo);
-    if plan.baseline {
+    // The records name the binary's revision; the tree's only checks it.
+    let revision = Revision::built();
+    if let Some(mismatch) = revision.mismatch(&Revision::of(&repo)) {
         ensure!(
-            !revision.dirty,
-            "--baseline needs a clean tree at a known commit (now {}, with changes)",
-            revision.commit
+            !plan.baseline,
+            "--baseline needs a binary built from a clean tree at the commit checked out: \
+             {mismatch}"
         );
+        out.say(&format!(
+            "perf: warning: the binary doesn't vouch for the code measured: {mismatch}"
+        ))?;
     }
     let history_file = plan
         .history

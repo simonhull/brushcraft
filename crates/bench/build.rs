@@ -13,6 +13,12 @@
 //!
 //! The hash is FNV-1a (64-bit) over each file's path relative to the repository, its length and
 //! its bytes, in sorted path order, and reaches the crate as `BRUSHCRAFT_GENERATOR_HASH`.
+//!
+//! It also records the commit the binary is built from and whether tracked files differed from
+//! it (`BRUSHCRAFT_BUILD_COMMIT`, `BRUSHCRAFT_BUILD_DIRTY`), so `perf` records what it measured,
+//! not what the tree holds when it runs. It reruns on a commit or checkout (git's `HEAD` log and
+//! index) and on any change to the code (`crates`, `tools`, the root manifests); a build outside
+//! a git checkout says `unknown` and dirty.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -62,6 +68,32 @@ fn files(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What the repository's tree says at build time: the commit and whether tracked files differ,
+/// `unknown` and dirty when git can't tell. Also returns git's directory, if found, for the
+/// rerun triggers.
+fn revision(repo: &Path) -> (String, bool, Option<PathBuf>) {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let dir = git(&["rev-parse", "--absolute-git-dir"]).map(PathBuf::from);
+    match (
+        git(&["rev-parse", "HEAD"]),
+        git(&["status", "--porcelain", "--untracked-files=no"]),
+    ) {
+        (Some(commit), Some(status)) => (commit, !status.is_empty(), dir),
+        _ => ("unknown".to_owned(), true, dir),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or("no manifest dir")?);
     let repo = manifest.join("..").join("..");
@@ -86,5 +118,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cargo,
         "cargo::rustc-env=BRUSHCRAFT_GENERATOR_HASH={hash:016x}"
     )?;
+    let (commit, dirty, git_dir) = revision(&repo);
+    let mut triggers = vec![
+        repo.join("crates"),
+        repo.join("tools"),
+        repo.join("Cargo.toml"),
+        repo.join("Cargo.lock"),
+    ];
+    if let Some(dir) = git_dir {
+        triggers.extend([dir.join("logs").join("HEAD"), dir.join("index")]);
+    }
+    for path in triggers {
+        writeln!(cargo, "cargo::rerun-if-changed={}", path.display())?;
+    }
+    writeln!(cargo, "cargo::rustc-env=BRUSHCRAFT_BUILD_COMMIT={commit}")?;
+    writeln!(cargo, "cargo::rustc-env=BRUSHCRAFT_BUILD_DIRTY={dirty}")?;
     Ok(())
 }

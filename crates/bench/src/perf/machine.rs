@@ -93,6 +93,39 @@ pub(crate) struct Revision {
 }
 
 impl Revision {
+    /// The revision this binary was built from, as `build.rs` recorded it: the commit (unknown
+    /// if the recorded text isn't a hash) and whether tracked files differed from it then.
+    pub(crate) fn built() -> Self {
+        match env!("BRUSHCRAFT_BUILD_COMMIT").parse() {
+            Ok(commit) => Self {
+                commit,
+                dirty: env!("BRUSHCRAFT_BUILD_DIRTY") != "false",
+            },
+            Err(_not_a_hash) => Self::unknown(),
+        }
+    }
+
+    /// Why this binary's revision (`self`) doesn't vouch for the tree's (`tree`), if it
+    /// doesn't: a different commit, or changes in either. The stage benches build from the
+    /// tree, the rest is this binary, so a run with a reason measures a mix.
+    pub(crate) fn mismatch(&self, tree: &Self) -> Option<String> {
+        if self.commit != tree.commit {
+            Some(format!(
+                "built from {}, the tree is at {}",
+                self.commit, tree.commit
+            ))
+        } else if self.dirty || tree.dirty {
+            Some(format!(
+                "{} with uncommitted changes (built {}, tree {})",
+                self.commit,
+                if self.dirty { "dirty" } else { "clean" },
+                if tree.dirty { "dirty" } else { "clean" }
+            ))
+        } else {
+            None
+        }
+    }
+
     /// An unknown commit, counted dirty: nothing vouches for the code.
     fn unknown() -> Self {
         Self {
@@ -417,6 +450,38 @@ mod tests {
             "too few fields"
         );
         assert!(children_cpu().is_ok(), "this process's");
+    }
+
+    /// The build's revision is recorded, and a mismatch with the tree, or changes in either,
+    /// is named.
+    #[test]
+    fn the_build_vouches_for_the_tree_only_when_both_are_clean_at_one_commit() {
+        let built = Revision::built();
+        assert!(
+            built.commit == Commit::unknown() || built.commit.as_str().len() == 40,
+            "{built:?}"
+        );
+        let at = |hash: &str, dirty| Revision {
+            commit: hash.repeat(40).parse().unwrap(),
+            dirty,
+        };
+        assert_eq!(
+            at("a", false).mismatch(&at("a", false)),
+            None,
+            "clean, one commit"
+        );
+        assert!(
+            at("a", false).mismatch(&at("b", false)).is_some(),
+            "two commits"
+        );
+        assert!(
+            at("a", true).mismatch(&at("a", false)).is_some(),
+            "a dirty build"
+        );
+        assert!(
+            at("a", false).mismatch(&at("a", true)).is_some(),
+            "a dirty tree"
+        );
     }
 
     #[test]
