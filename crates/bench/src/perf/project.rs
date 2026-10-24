@@ -234,6 +234,23 @@ pub(crate) fn remove_stale(dir: &Path, keep: &Path) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
+/// How [`WorkDir::copy`] copied a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Copied {
+    /// A reflink: the copy shares the source's extents, no data written.
+    Reflinked,
+    /// A byte-for-byte copy: the file system can't share extents (or the two are on different
+    /// ones), so the copy cost the project's size in time and disk.
+    InFull,
+}
+
+/// The process id in a work directory's name, `work-<pid>-<n>`; `None` for any other name.
+fn work_pid(name: &str) -> Option<u32> {
+    let (pid, n) = name.strip_prefix("work-")?.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
 /// A directory for one run's project copies, removed with everything in it when dropped.
 #[derive(Debug)]
 pub(crate) struct WorkDir(PathBuf);
@@ -256,6 +273,34 @@ impl WorkDir {
         Ok(Self(dir))
     }
 
+    /// Removes every work directory under `root` whose process has died (a run killed by a
+    /// signal never ran its [`Drop`]); returns the directories removed. A directory whose
+    /// process still runs, or whose name doesn't read `work-<pid>-<n>`, is left alone.
+    ///
+    /// # Errors
+    ///
+    /// If `root` can't be listed or a dead run's directory removed.
+    pub(crate) fn sweep(root: &Path) -> Result<Vec<PathBuf>> {
+        let mut removed = Vec::new();
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+            Err(e) => return Err(e).with_context(|| format!("listing {}", root.display())),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            let Some(pid) = path.file_name().and_then(|n| n.to_str()).and_then(work_pid) else {
+                continue;
+            };
+            if pid != std::process::id() && !Path::new("/proc").join(pid.to_string()).exists() {
+                std::fs::remove_dir_all(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                removed.push(path);
+            }
+        }
+        Ok(removed)
+    }
+
     /// Where a project named `name` goes in it: `<dir>/<name>/project.bcrf`, its own directory
     /// so its recovery files (`recovery/` beside it) stay apart from the others'.
     ///
@@ -275,16 +320,17 @@ impl WorkDir {
     /// # Errors
     ///
     /// If the source can't be read or the copy written.
-    pub(crate) fn copy(&self, source: &Path, name: &str) -> Result<PathBuf> {
+    pub(crate) fn copy(&self, source: &Path, name: &str) -> Result<(PathBuf, Copied)> {
         let target = self.project(name)?;
         let from = File::open(source).with_context(|| format!("opening {}", source.display()))?;
         let to = File::create(&target).with_context(|| format!("creating {}", target.display()))?;
-        if rustix::fs::ioctl_ficlone(&to, &from).is_err() {
-            drop(to);
-            std::fs::copy(source, &target)
-                .with_context(|| format!("copying {} to {}", source.display(), target.display()))?;
+        if rustix::fs::ioctl_ficlone(&to, &from).is_ok() {
+            return Ok((target, Copied::Reflinked));
         }
-        Ok(target)
+        drop(to);
+        std::fs::copy(source, &target)
+            .with_context(|| format!("copying {} to {}", source.display(), target.display()))?;
+        Ok((target, Copied::InFull))
     }
 
     /// The directory.
@@ -379,6 +425,39 @@ mod tests {
         }
     }
 
+    /// Work directories of dead runs are swept; live ones, this run's and other names stay.
+    #[test]
+    fn dead_runs_work_dirs_are_swept() {
+        assert_eq!(work_pid("work-123-0"), Some(123), "a work directory");
+        for other in ["work-123", "work-x-0", "medium-1.bcrf", "work-1-x"] {
+            assert_eq!(work_pid(other), None, "{other}");
+        }
+        let root =
+            std::env::temp_dir().join(format!("brushcraft-perf-sweep-{}", std::process::id()));
+        // PIDs past the kernel's maximum (2^22) are never alive.
+        let dead = root.join("work-4999999-0");
+        let live = root.join(format!("work-{}-7", std::process::id()));
+        let init = root.join("work-1-0");
+        let other = root.join("keep-me");
+        for dir in [&dead, &live, &init, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        assert_eq!(
+            WorkDir::sweep(&root).unwrap(),
+            std::slice::from_ref(&dead),
+            "only the dead run's"
+        );
+        assert!(
+            live.exists() && init.exists() && other.exists(),
+            "the rest stay"
+        );
+        assert!(
+            WorkDir::sweep(&root.join("missing")).unwrap().is_empty(),
+            "no root"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn stale_projects_go_and_nothing_else() {
         let root =
@@ -410,7 +489,7 @@ mod tests {
         let source = root.join("source.bcrf");
         std::fs::write(&source, vec![5_u8; 1 << 16]).unwrap();
         let work = WorkDir::new(&root).unwrap();
-        let copy = work.copy(&source, "medium").unwrap();
+        let (copy, _) = work.copy(&source, "medium").unwrap();
         assert_eq!(
             copy,
             work.path().join("medium").join("project.bcrf"),

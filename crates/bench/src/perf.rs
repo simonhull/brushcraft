@@ -47,7 +47,7 @@ use crate::perf::compare::Verdict;
 use crate::perf::history::{Entry, Label, PartLoad, RunInfo};
 use crate::perf::machine::{Machine, Revision};
 use crate::perf::metric::Metric;
-use crate::perf::project::{Scale, WorkDir, cache_key, cached_file, remove_stale};
+use crate::perf::project::{Copied, Scale, WorkDir, cache_key, cached_file, remove_stale};
 use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak, own_load};
 use crate::perf::suite::Runner;
 use crate::report::Output;
@@ -200,6 +200,40 @@ impl Session {
     }
 }
 
+/// A fresh work directory under `root`, after sweeping dead runs' from it (saying so on `out`).
+///
+/// # Errors
+///
+/// If the sweep or the directory fails, or writing does.
+fn work_dir<J: Write, H: Write>(root: &Path, out: &mut Output<J, H>) -> Result<WorkDir> {
+    for dead in WorkDir::sweep(root)? {
+        out.say(&format!("perf: removed a dead run's {}", dead.display()))?;
+    }
+    WorkDir::new(root)
+}
+
+/// A copy of `source` as project `name` in `work`, saying on `out` when it couldn't be a
+/// reflink.
+///
+/// # Errors
+///
+/// As [`WorkDir::copy`], or if writing fails.
+fn copy<J: Write, H: Write>(
+    work: &WorkDir,
+    source: &Path,
+    name: &str,
+    out: &mut Output<J, H>,
+) -> Result<PathBuf> {
+    let (file, copied) = work.copy(source, name)?;
+    if copied == Copied::InFull {
+        out.say(&format!(
+            "perf: {} couldn't be reflinked: copied in full",
+            source.display()
+        ))?;
+    }
+    Ok(file)
+}
+
 /// The medium project, from the cache under `cache` or freshly generated into it (see
 /// [`project::cache_key`]); returns its file and its key.
 ///
@@ -223,7 +257,7 @@ fn medium<J: Write, H: Write>(
             "perf: generating the medium project: {}",
             file.display()
         ))?;
-        let building = WorkDir::new(cache)?;
+        let building = work_dir(cache, out)?;
         let fresh = building.project("medium")?;
         let start = Instant::now();
         suite::generate(runner, &fresh, Scale::Medium)?;
@@ -507,7 +541,7 @@ fn measure_all<J: Write, H: Write>(
     for &scale in &plan.scales {
         match scale {
             Scale::Tiny => {
-                let work = WorkDir::new(&std::env::temp_dir())?;
+                let work = work_dir(&std::env::temp_dir(), out)?;
                 let file = work.project("tiny")?;
                 suite::generate(&mut session.runner, &file, scale)?;
                 measure_project(session, scale, &file, "tiny", out)?;
@@ -517,8 +551,8 @@ fn measure_all<J: Write, H: Write>(
                 std::fs::create_dir_all(&cache)
                     .with_context(|| format!("creating {}", cache.display()))?;
                 let (cached, key) = medium(&mut session.runner, &cache, out)?;
-                let work = WorkDir::new(&cache)?;
-                let file = work.copy(&cached, "medium")?;
+                let work = work_dir(&cache, out)?;
+                let file = copy(&work, &cached, "medium", out)?;
                 measure_project(session, scale, &file, &key, out)?;
             }
             Scale::Full => {
@@ -537,8 +571,8 @@ fn measure_all<J: Write, H: Write>(
                     source.file_name().unwrap_or_default().to_string_lossy()
                 );
                 let dir = source.parent().context("the full project's directory")?;
-                let work = WorkDir::new(dir)?;
-                let file = work.copy(source, "full")?;
+                let work = work_dir(dir, out)?;
+                let file = copy(&work, source, "full", out)?;
                 measure_project(session, scale, &file, &name, out)?;
             }
         }
