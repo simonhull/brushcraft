@@ -48,7 +48,7 @@ use crate::perf::history::{Entry, Label, PartLoad, RunInfo};
 use crate::perf::machine::{Machine, Revision};
 use crate::perf::metric::Metric;
 use crate::perf::project::{Scale, WorkDir, cache_key, cached_file, remove_stale};
-use crate::perf::quiet::{Load, LoadLog, Quiet, own_load};
+use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak, own_load};
 use crate::perf::suite::Runner;
 use crate::report::Output;
 
@@ -165,17 +165,34 @@ impl Session {
             self.label = self.label.after(settled);
         }
         let start = Instant::now();
-        let (load, others) = (Load::now()?, others(&self.runner)?);
-        out.say(&format!("perf: {name} (load {load}, others {others})"))?;
+        let (load, others_start) = (Load::now()?, others(&self.runner)?);
+        out.say(&format!(
+            "perf: {name} (load {load}, others {others_start})"
+        ))?;
         let metrics = measure(&mut self.runner).with_context(|| format!("the {name} part"))?;
+        // Load that arrived while the part ran: each sample less the suite's own share, now that
+        // every stretch of the part's work is known, and the others' load as it ended.
+        let at_end = others(&self.runner)?;
+        let peak = others_peak(&self.log.since(start), &self.runner.busy)
+            .map_or(at_end, |peak| if peak > at_end { peak } else { at_end });
+        if let Some(quiet) = self.quiet {
+            let held = quiet.held(peak);
+            if let Settled::Loaded { .. } = held {
+                out.say(&format!(
+                    "perf: {name}: other load reached {peak} during the part: the run is labelled \
+                     loaded"
+                ))?;
+            }
+            self.label = self.label.after(held);
+        }
         let load = PartLoad {
-            start: load.get(),
-            others: others.get(),
+            start: load,
+            others: others_start,
+            others_peak: peak,
             max: self
                 .log
                 .max_since(start)
-                .map_or(load, |sampled| if sampled > load { sampled } else { load })
-                .get(),
+                .map_or(load, |sampled| if sampled > load { sampled } else { load }),
         };
         self.measured
             .extend(metrics.into_iter().map(|m| (project.to_owned(), load, m)));

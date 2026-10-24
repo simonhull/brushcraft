@@ -125,6 +125,9 @@ pub(crate) struct Busy {
 /// `u · (e^−(now−e)/60 − e^−(now−s)/60)` to it at `now`. A CPU-bound thread is runnable while it
 /// runs, so CPU time stands for runnable time; threads waiting for a CPU, or for the disk, count
 /// in the kernel's figure and not here, so this is a slight underestimate.
+///
+/// `now` may fall inside a stretch (a load sample taken while a child ran, judged once it has
+/// ended): only the stretch's part before `now` counts then, at the stretch's mean rate.
 pub(crate) fn own_load(busy: &[Busy], now: Instant) -> Load {
     let share: f64 = busy
         .iter()
@@ -133,13 +136,26 @@ pub(crate) fn own_load(busy: &[Busy], now: Instant) -> Load {
             if length <= 0.0 {
                 return None;
             }
-            let since_end = now.checked_duration_since(b.end)?.as_secs_f64();
-            let since_start = since_end + length;
+            let since_start = now.checked_duration_since(b.start)?.as_secs_f64();
+            let since_end = now.saturating_duration_since(b.end).as_secs_f64();
             let cpus = b.cpu.as_secs_f64() / length;
             Some(cpus * ((-since_end / MINUTE).exp() - (-since_start / MINUTE).exp()))
         })
         .sum();
     Load(share.max(0.0))
+}
+
+/// The other processes' highest load among `samples` (when, and the 1-minute load average
+/// then), each less the suite's own share at its time from `busy` ([`own_load`]); `None` without
+/// samples.
+///
+/// Taken once a part has ended, so every stretch of its work is known, this sees load that
+/// arrived while the part ran, which the guard (looking only before it) can't.
+pub(crate) fn others_peak(samples: &[(Instant, Load)], busy: &[Busy]) -> Option<Load> {
+    samples
+        .iter()
+        .map(|&(at, load)| load.less(own_load(busy, at)))
+        .reduce(|a, b| if b > a { b } else { a })
 }
 
 /// What the guard does after one look at the load.
@@ -190,6 +206,19 @@ impl Quiet {
             below: Load(2.0),
             within,
             every: Duration::from_secs(5),
+        }
+    }
+
+    /// How a part went, judged after it from the others' highest load during it (`peak`, see
+    /// [`others_peak`]): loaded if it reached the threshold, as if the guard had never settled.
+    pub(crate) fn held(&self, peak: Load) -> Settled {
+        if peak < self.below {
+            Settled::Quiet {
+                waited: Duration::ZERO,
+                others: peak,
+            }
+        } else {
+            Settled::Loaded { others: peak }
         }
     }
 
@@ -313,14 +342,22 @@ impl LoadLog {
         })
     }
 
-    /// The highest load sampled from `since` on (`None` if no sample was taken since).
-    pub(crate) fn max_since(&self, since: Instant) -> Option<Load> {
+    /// The samples taken from `since` on.
+    pub(crate) fn since(&self, since: Instant) -> Vec<(Instant, Load)> {
         self.samples
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|&&(at, _)| at >= since)
-            .map(|&(_, load)| load)
+            .copied()
+            .collect()
+    }
+
+    /// The highest load sampled from `since` on (`None` if no sample was taken since).
+    pub(crate) fn max_since(&self, since: Instant) -> Option<Load> {
+        self.since(since)
+            .into_iter()
+            .map(|(_, load)| load)
             .reduce(|a, b| if b > a { b } else { a })
     }
 
@@ -476,7 +513,10 @@ mod tests {
             at(120)
         );
         assert!(at(600) < 0.01, "gone in ten minutes: {}", at(600));
-        assert_eq!(own_load(&[busy], start), load(0.0), "not before it ended");
+        assert_eq!(own_load(&[busy], start), load(0.0), "nothing as it starts");
+        let midway = own_load(&[busy], start + Duration::from_secs(30)).get();
+        let half = 16.0 * (1.0 - (-0.5_f64).exp());
+        assert!((midway - half).abs() < 1e-9, "half a minute in: {midway}");
         let instant = Busy {
             start,
             end: start,
@@ -489,6 +529,41 @@ mod tests {
         );
         let two = own_load(&[busy, busy], start + Duration::from_secs(90)).get();
         assert!((two - 2.0 * at(90)).abs() < 1e-9, "shares add up");
+    }
+
+    /// Load that arrives during a part labels it loaded, once the suite's own share is taken
+    /// off each sample; the suite's own load alone doesn't.
+    #[test]
+    fn load_arriving_mid_part_is_seen_after_it() {
+        let quiet = Quiet::new(Duration::from_secs(300));
+        let start = Instant::now();
+        let busy = [Busy {
+            start,
+            end: start + Duration::from_secs(60),
+            cpu: Duration::from_mins(16),
+        }];
+        let at = |secs| start + Duration::from_secs(secs);
+        // The suite alone: 16 CPUs for a minute show as ~6.3 at 30 s, ~10.1 at 60 s.
+        let own_only: Vec<(Instant, Load)> =
+            [30, 60].map(|s| (at(s), own_load(&busy, at(s)))).to_vec();
+        let peak = others_peak(&own_only, &busy).unwrap();
+        assert!(peak.get() < 1e-9, "nothing but the suite: {peak}");
+        assert!(matches!(quiet.held(peak), Settled::Quiet { .. }), "quiet");
+        let busier: Vec<(Instant, Load)> = own_only
+            .iter()
+            .map(|&(t, l)| (t, load(l.get() + 2.5)))
+            .collect();
+        let busy_peak = others_peak(&busier, &busy).unwrap();
+        assert!(
+            (busy_peak.get() - 2.5).abs() < 1e-9,
+            "the others' 2.5: {busy_peak}"
+        );
+        assert_eq!(
+            quiet.held(busy_peak),
+            Settled::Loaded { others: busy_peak },
+            "loaded"
+        );
+        assert_eq!(others_peak(&[], &busy), None, "no samples");
     }
 
     #[test]

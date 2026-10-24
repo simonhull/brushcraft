@@ -15,7 +15,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::perf::json::{Json, Object};
 use crate::perf::metric::{Measured, Metric, MetricName, Unit};
-use crate::perf::quiet::Settled;
+use crate::perf::quiet::{Load, Settled};
 use crate::report::Record;
 
 /// How quiet the machine was for a run.
@@ -103,11 +103,14 @@ pub(crate) struct RunInfo {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PartLoad {
     /// The 1-minute load average as the part started.
-    pub(crate) start: f64,
+    pub(crate) start: Load,
     /// That, less the suite's own share: the other processes' load the guard waited on.
-    pub(crate) others: f64,
+    pub(crate) others: Load,
+    /// The other processes' highest load during the part and as it ended, judged after it
+    /// ([`crate::perf::quiet::others_peak`]); at or above 2 it labels the run loaded.
+    pub(crate) others_peak: Load,
     /// The highest 1-minute load average the log sampled during the part.
-    pub(crate) max: f64,
+    pub(crate) max: Load,
 }
 
 /// One history line: a metric of a run, with the run's details.
@@ -146,9 +149,10 @@ impl Entry {
             .with("workers", info.workers.as_str())
             .with("worker_threads", info.worker_threads)
             .with("project", self.project.as_str())
-            .with("load_start", self.load.start)
-            .with("load_others", self.load.others)
-            .with("load_max", self.load.max)
+            .with("load_start", self.load.start.get())
+            .with("load_others", self.load.others.get())
+            .with("load_others_peak", self.load.others_peak.get())
+            .with("load_max", self.load.max.get())
     }
 
     /// The entry a history line holds.
@@ -172,6 +176,7 @@ impl Entry {
                 .as_number()
                 .ok_or_else(|| anyhow!("{name:?} isn't a number"))
         };
+        let load = |name: &str| -> Result<Load> { Ok(Load::new(number(name)?)?) };
         let flag = |name: &str| -> Result<bool> {
             get(name)?
                 .as_bool()
@@ -221,9 +226,15 @@ impl Entry {
             },
             project: text("project")?,
             load: PartLoad {
-                start: number("load_start")?,
-                others: number("load_others")?,
-                max: number("load_max")?,
+                start: load("load_start")?,
+                others: load("load_others")?,
+                // Records written before the peak was kept have none: their start stands in.
+                others_peak: if object.get("load_others_peak").is_some() {
+                    load("load_others_peak")?
+                } else {
+                    load("load_others")?
+                },
+                max: load("load_max")?,
             },
             metric: Metric {
                 name: text("metric")?.parse()?,
@@ -318,9 +329,10 @@ pub(crate) mod tests {
             },
             project: "medium-0123456789abcdef".to_owned(),
             load: PartLoad {
-                start: 1.5,
-                others: 0.75,
-                max: 3.25,
+                start: Load::new(1.5).unwrap(),
+                others: Load::new(0.75).unwrap(),
+                others_peak: Load::new(1.25).unwrap(),
+                max: Load::new(3.25).unwrap(),
             },
             metric: Metric {
                 name: metric.parse().unwrap(),
@@ -376,6 +388,13 @@ pub(crate) mod tests {
         assert!(
             Entry::parse(&extra).is_err(),
             "nested objects aren't entries"
+        );
+        let older = line.replacen(r#","load_others_peak":1.25"#, "", 1);
+        assert_ne!(older, line, "the edit applies");
+        let read_older = Entry::parse(&older).unwrap();
+        assert_eq!(
+            read_older.load.others_peak, e.load.others,
+            "a record from before the peak was kept"
         );
         let added = line.replacen('{', r#"{"later":"field","#, 1);
         assert_eq!(
