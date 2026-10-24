@@ -2366,6 +2366,160 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
     }
 }
 
+/// The set-up of the in-place error tests: finest-level edits on a few tiles.
+///
+/// The edits are applied to a store holding those tiles pinned and their normals' inputs
+/// evaluated with normals, and to the oracle's map. Returns the store, the map, the pin, the
+/// edited tiles and the tiles around them.
+fn pinned_and_edited(
+    dir: &TestDir,
+    mesh: &Arc<BaseMesh>,
+) -> (
+    TileStore,
+    CorrectionMap,
+    PinGuard,
+    Vec<TileKey>,
+    Vec<TileKey>,
+) {
+    let mut store = new_store(dir, "work.bcp", mesh, roomy());
+    let mut map = CorrectionMap::new();
+    let edits: Vec<Edit> = random_edits(mesh, TOP, 200, 11)
+        .into_iter()
+        .filter(|edit| edit.level == level(TOP))
+        .take(12)
+        .collect();
+    let keys: Vec<TileKey> = edits
+        .iter()
+        .map(|edit| tile_at(edit.face, edit.i, edit.j))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let around: Vec<TileKey> = keys
+        .iter()
+        .flat_map(|key| list_normal_inputs(mesh, key).unwrap())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let guard = store.pin(&keys).unwrap();
+    store.evaluate_many(&around, Evaluation::Normals).unwrap();
+    apply(&mut store, &mut map, &edits);
+    (store, map, guard, keys, around)
+}
+
+/// The bytes of `key`'s evaluated slot, what the workers wrote into it; `None` if it has none.
+fn evaluated_bytes(store: &TileStore, key: &TileKey) -> Option<Vec<u8>> {
+    let id = store.evaluated.find(key)?;
+    Some(bytemuck::bytes_of(store.evaluated.get(id)?).to_vec())
+}
+
+/// A round whose prediction fails part-way installs nothing.
+///
+/// The workers have written the other pinned tiles' slots in place by then: every tile stays
+/// stale, and once the failing tile is readable again the store evaluates as the dense oracle
+/// does.
+#[test]
+fn a_round_failing_after_writing_in_place_leaves_its_tiles_stale() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, map, guard, keys, _) = pinned_and_edited(&dir, &mesh);
+    assert!(keys.len() >= 4, "several tiles: {}", keys.len());
+    let broken = keys[keys.len() / 2];
+    let id = store.corrections.find(&broken).unwrap();
+    let side = store.corrections.get(id).unwrap().side;
+    store.corrections.get_mut(id).unwrap().side = 0;
+    let before: Vec<Option<Vec<u8>>> = keys.iter().map(|k| evaluated_bytes(&store, k)).collect();
+    let computed = store.log.positions.len();
+
+    let failed = store.evaluate_many(&keys, Evaluation::Positions);
+    assert!(matches!(failed, Err(CacheError::Internal(_))), "{failed:?}");
+    assert_eq!(store.log.positions.len(), computed, "nothing installed");
+    for key in &keys {
+        assert_eq!(
+            store.evaluated.freshness(key),
+            Some(Freshness::Stale),
+            "{key:?}: still stale"
+        );
+    }
+    let written = keys
+        .iter()
+        .zip(&before)
+        .filter(|&(key, bytes)| *key != broken && evaluated_bytes(&store, key) != *bytes)
+        .count();
+    assert!(
+        written > 0,
+        "the workers wrote other tiles' slots before the failure"
+    );
+
+    store.corrections.get_mut(id).unwrap().side = side;
+    let dense = dense(&mesh, &map);
+    assert_positions(&mut store, &dense, &keys, "recomputed after the failure");
+    drop(guard);
+}
+
+/// A normals round that fails part-way records nothing.
+///
+/// The workers have written other tiles' normals in place by then: moved tiles keep no normals,
+/// and neighbours stay stale since the same inputs (any vertex rewritten was one their refresh
+/// recomputes). Computed again, every normal is the dense oracle's.
+#[test]
+fn normals_failing_after_writing_in_place_stay_stale() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, map, guard, keys, around) = pinned_and_edited(&dir, &mesh);
+    let stale: Vec<TileKey> = around
+        .iter()
+        .copied()
+        .filter(|key| store.deps.stale_inputs(key).is_some())
+        .collect();
+    assert!(
+        stale.len() >= 2,
+        "neighbours with stale normals: {}",
+        stale.len()
+    );
+    let since: Vec<BTreeSet<TileKey>> = stale
+        .iter()
+        .map(|key| store.deps.stale_inputs(key).unwrap().clone())
+        .collect();
+    store.failing_normals = Some(stale[stale.len() / 2]);
+    let before: Vec<Option<Vec<u8>>> = around.iter().map(|k| evaluated_bytes(&store, k)).collect();
+    let computed = store.log.normals.len();
+
+    let failed = store.evaluate_many(&around, Evaluation::Normals);
+    assert!(matches!(failed, Err(CacheError::Internal(_))), "{failed:?}");
+    assert_eq!(store.log.normals.len(), computed, "nothing recorded");
+    for key in &keys {
+        assert!(
+            !store.deps.has_normals(key),
+            "{key:?}: a moved tile keeps no normals"
+        );
+    }
+    for (key, inputs) in stale.iter().zip(&since) {
+        assert_eq!(
+            store.deps.stale_inputs(key),
+            Some(inputs),
+            "{key:?}: still stale"
+        );
+    }
+    let written = around
+        .iter()
+        .zip(&before)
+        .filter(|&(key, bytes)| bytes.is_some() && evaluated_bytes(&store, key) != *bytes)
+        .count();
+    assert!(written > 0, "the workers wrote slots before the failure");
+
+    store.failing_normals = None;
+    store.evaluate_many(&around, Evaluation::Normals).unwrap();
+    let dense = dense(&mesh, &map);
+    assert_normals(
+        &mut store,
+        &mesh,
+        &dense,
+        &around,
+        "recomputed after the failure",
+    );
+    drop(guard);
+}
+
 /// A stale slot nothing pins any more isn't written in place: an earlier tile of the same round
 /// can take it as the clock's victim when it installs.
 ///
@@ -2465,23 +2619,83 @@ fn recorded_normal_inputs_are_the_listed_ones() {
     }
 }
 
+/// The bounds book's readers through recorded neighbour lists equal readers by listing, for
+/// edits at coarser levels than those tracked and several tracked levels at once.
+///
+/// Every tile of levels 5 to 8 has its normals computed, so its neighbour list is recorded;
+/// coarser tiles have none. Edits at levels 3 to 8 then walk down through recorded and
+/// unrecorded levels alike.
+#[test]
+fn readers_through_recorded_lists_equal_readers_by_listing_at_every_level() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    store
+        .evaluate_many(&tiles(&mesh, 5, TOP), Evaluation::Normals)
+        .unwrap();
+    let recorded = tiles(&mesh, 5, TOP)
+        .iter()
+        .filter(|key| store.deps.normal_inputs(key).is_some())
+        .count();
+    assert!(recorded > 100, "levels 5 to 8 recorded: {recorded}");
+    let empty = DepGraph::new();
+    let candidates = tiles(&mesh, 3, TOP);
+    let mut rng = Rng(23);
+    for tracked in [
+        BTreeSet::from([level(TOP)]),
+        BTreeSet::from([level(6), level(TOP)]),
+        BTreeSet::from([level(5), level(6), level(7), level(TOP)]),
+    ] {
+        for _ in 0..12 {
+            let count = u32::try_from(candidates.len()).unwrap();
+            let edited: BTreeSet<TileKey> = (0..=rng.below(3))
+                .map(|_| candidates[usize::try_from(rng.below(count)).unwrap()])
+                .collect();
+            let through = crate::bounds::readers(&mesh, &store.deps, &edited, &tracked).unwrap();
+            let listed = crate::bounds::readers(&mesh, &empty, &edited, &tracked).unwrap();
+            assert!(!listed.is_empty(), "{edited:?} reaches a tracked level");
+            assert_eq!(through, listed, "{edited:?}, tracking {tracked:?}");
+        }
+    }
+}
+
 /// Recorded lists and listed ones come back in key order, mixed, and the error is the first
 /// in key order, whatever the thread count.
+///
+/// A recorded value and a listed one differ (`10n` against `10n + 1`), so a record ignored for
+/// a listing shows; only keys without a record are listed, so a listing that would fail for a
+/// recorded key is never run.
 #[test]
 fn recorded_or_listed_keeps_key_order() {
     let mesh = mesh();
     let keys = tiles(&mesh, TOP, TOP);
     let keys = &keys[..40];
     let index = |key: &TileKey| keys.iter().position(|k| k == key).unwrap();
+    let is_recorded = |n: usize| n.is_multiple_of(3);
     for threads in [1, 4] {
         let workers = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .unwrap();
-        let recorded = |key: &TileKey| (index(key) % 3 == 0).then(|| index(key) * 10);
-        let listed = recorded_or_listed(&workers, keys, recorded, |key| Ok(index(key) * 10));
-        let want: Vec<usize> = (0..keys.len()).map(|n| n * 10).collect();
+        let recorded = |key: &TileKey| is_recorded(index(key)).then(|| index(key) * 10);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let listed = recorded_or_listed(&workers, keys, recorded, |key| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match index(key) {
+                n if is_recorded(n) => Err(CacheError::NotATile(*key)),
+                n => Ok(n * 10 + 1),
+            }
+        });
+        let want: Vec<usize> = (0..keys.len())
+            .map(|n| if is_recorded(n) { n * 10 } else { n * 10 + 1 })
+            .collect();
         assert_eq!(listed.unwrap(), want, "{threads} threads");
+        let unrecorded = (0..keys.len()).filter(|&n| !is_recorded(n)).count();
+        assert_eq!(
+            calls.into_inner(),
+            unrecorded,
+            "{threads} threads: only the keys without a record are listed"
+        );
         let failing = recorded_or_listed(&workers, keys, recorded, |key| match index(key) {
             n @ (7 | 20) => Err(CacheError::NotATile(keys[n])),
             n => Ok(n),

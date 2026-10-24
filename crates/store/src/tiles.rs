@@ -808,6 +808,10 @@ pub struct TileStore {
     /// A correction tile whose reads from the working file fail, for tests of error paths.
     #[cfg(test)]
     unreadable: Option<TileKey>,
+    /// A tile whose normals computation fails on the workers, after every other task of its
+    /// round has written its slot: for tests of that error path.
+    #[cfg(test)]
+    failing_normals: Option<TileKey>,
 }
 
 impl std::fmt::Debug for TileStore {
@@ -1487,6 +1491,8 @@ impl TileStore {
             log: EvalLog::default(),
             #[cfg(test)]
             unreadable: None,
+            #[cfg(test)]
+            failing_normals: None,
         })
     }
 
@@ -4367,7 +4373,13 @@ impl TileStore {
             })
             .collect::<Result<Vec<_>, Invariant>>()?;
         let mesh = &*self.mesh;
+        #[cfg(test)]
+        let failing = self.failing_normals;
         each_parallel(&self.workers, tasks, &mut outs, |&(key, since), out| {
+            #[cfg(test)]
+            if failing == Some(key) {
+                return Err(Invariant::StaleHandle.into());
+            }
             let source = Resident::new(mesh, Tiles::Split(&positions));
             let out = prefix_mut(out.as_mut_slice(), vertex_count(&key))?;
             let region = Region::of_tile(&key);
