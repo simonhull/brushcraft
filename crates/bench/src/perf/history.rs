@@ -442,10 +442,11 @@ pub(crate) mod tests {
             entry("medium.brush.p99_ms", 2.2, "r2", false, "cpu"),
             entry("medium.brush.p99_ms", 9.9, "r3", true, "other cpu"),
             entry("medium.brush.p99_ms", 1.9, "r4", true, "cpu"),
+            entry("medium.brush.p99_ms", 2.4, "r5", false, "cpu"),
         ];
         append(&path, &second).unwrap();
         let all = read(&path).unwrap();
-        assert_eq!(all.len(), 5, "both appends");
+        assert_eq!(all.len(), 6, "both appends");
         let base = baselines(&all, "cpu");
         let p99: MetricName = "medium.brush.p99_ms".parse().unwrap();
         let p50: MetricName = "medium.brush.p50_ms".parse().unwrap();
