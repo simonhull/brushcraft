@@ -558,7 +558,7 @@ fn a_tile_lost_to_a_save_drops_what_was_evaluated_from_it() {
     store.save().unwrap();
     let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
     // The clean slot goes; the evaluations made from it stay cached.
-    store.corrections.remove(&lost).unwrap();
+    evict(&mut store, &lost);
     damage(&dir.path("r1.bcrf"), store.file.locate(&lost).unwrap());
     let proof = store.save_into(&mut project).unwrap();
     assert_eq!(proof.lost().iter().copied().collect::<Vec<_>>(), [lost]);
@@ -790,6 +790,41 @@ fn a_rebase_onto_a_save_point_not_descending_from_the_base_is_refused() {
         "{refused:?}"
     );
     assert_eq!(store.working_len(), len, "still on the old working file");
+}
+
+#[test]
+fn only_resident_tiles_keep_the_op_of_their_record() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let project = saved_project(
+        &dir,
+        "p.bcrf",
+        &mesh,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 200, 93),
+    );
+    let saved: Vec<TileKey> = project.keys().copied().collect();
+    let working = recovery(&dir, "r1.bcrf", &project);
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), tight()).unwrap();
+    // More tiles than fit: loading each evicts others, whose ops go with them.
+    for key in &saved {
+        store.correction(*key).unwrap();
+        store.assert_known_ops_resident();
+        let (op, _) = project.read_displacement(key).unwrap().unwrap();
+        assert_eq!(
+            store.known_ops.get(key),
+            Some(&op),
+            "{key:?}: its record's op"
+        );
+    }
+    assert!(
+        store.known_ops.len() < saved.len(),
+        "the budget evicted some: {} of {} kept",
+        store.known_ops.len(),
+        saved.len()
+    );
+    store.evict_all().unwrap();
+    assert!(store.known_ops.is_empty(), "nothing resident, no op kept");
 }
 
 #[test]

@@ -1207,7 +1207,7 @@ fn a_tile_lost_to_a_roll_over_drops_what_was_evaluated_from_it() {
     store.save().unwrap();
     let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
     // The clean slot goes; the evaluations made from it stay cached.
-    store.corrections.remove(&lost).unwrap();
+    evict(&mut store, &lost);
     damage(&path, store.file.locate(&lost).unwrap());
     let meta = store.file.meta().clone();
     let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();

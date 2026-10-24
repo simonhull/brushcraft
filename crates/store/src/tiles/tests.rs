@@ -251,6 +251,16 @@ fn dab(store: &mut TileStore, map: &mut CorrectionMap, e: &Edit) {
         .unwrap();
 }
 
+/// Frees `key`'s clean resident correction slot as an eviction does, op included, without
+/// writing anything: its next read loads it from its record again.
+pub(crate) fn evict(store: &mut TileStore, key: &TileKey) {
+    assert!(
+        store.corrections.remove(key).unwrap(),
+        "{key:?} was resident"
+    );
+    store.known_ops.remove(key);
+}
+
 /// Breaks `key`'s resident correction slot: it no longer holds a valid tile, so it neither
 /// encodes nor saves.
 pub(crate) fn break_slot(store: &mut TileStore, key: &TileKey) {

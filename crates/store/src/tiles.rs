@@ -759,8 +759,10 @@ pub struct TileStore {
     /// The op of the record each clean resident correction slot holds, where it has one:
     /// recorded when a slot is filled from a record, or cleaned by writing one. A clean slot
     /// whose record can't be read back any more is written again labelled with this op (see
-    /// [`TileStore::fill_roll_over`]), never with one that didn't edit it. Entries of tiles
-    /// no longer resident are never read, and go at the next rebase or roll-over.
+    /// [`TileStore::fill_roll_over`]), never with one that didn't edit it. Only resident tiles
+    /// have an entry: a tile's goes when its slot is evicted (the correction pool logs its
+    /// evictions, see [`TileStore::forget_evicted_ops`]) or removed, so the map never grows
+    /// past the pool, and no save walks it.
     known_ops: HashMap<TileKey, OpId>,
     /// Counts the working files the store has had: a rebase moves it on, so a recovery flush
     /// started before can tell it would finish in the wrong file.
@@ -1466,7 +1468,7 @@ impl TileStore {
             base,
             budget: Budget::new(config.budget_bytes),
             headroom,
-            corrections: Pool::new(config.chunk_bytes),
+            corrections: Pool::with_eviction_log(config.chunk_bytes),
             evaluated: Pool::with_eviction_log(config.chunk_bytes),
             deps: DepGraph::new(),
             unsaved: HashMap::new(),
@@ -1686,7 +1688,9 @@ impl TileStore {
         }
         // What was evaluated from a lost edit isn't the saved state the store reads from now on.
         self.invalidate_edited(lost.iter().copied());
-        self.prune_known_ops();
+        self.forget_evicted_ops();
+        #[cfg(test)]
+        self.assert_known_ops_resident();
         self.since_rebase.clear();
         self.bounds.rebased();
         self.generation += 1;
@@ -1909,7 +1913,9 @@ impl TileStore {
                 self.known_ops.insert(key, write.op);
             }
         }
-        self.prune_known_ops();
+        self.forget_evicted_ops();
+        #[cfg(test)]
+        self.assert_known_ops_resident();
         let marks: Vec<ConsumerId> = self.streams.keys().copied().collect();
         for id in marks {
             if let Some(mark) = self.streams.get_mut(&id) {
@@ -1936,11 +1942,24 @@ impl TileStore {
             .extend(drained.into_iter().map(|(key, _)| key));
     }
 
-    /// Drops the [`TileStore::known_ops`] of tiles no longer resident.
-    fn prune_known_ops(&mut self) {
-        let corrections = &self.corrections;
-        self.known_ops
-            .retain(|key, _| corrections.find(key).is_some());
+    /// Asserts that only resident correction tiles have a [`TileStore::known_ops`] entry: that
+    /// every eviction and removal dropped its tile's.
+    ///
+    /// # Panics
+    ///
+    /// If a tile that isn't resident has one.
+    #[cfg(test)]
+    fn assert_known_ops_resident(&self) {
+        let mut stale: Vec<&TileKey> = self
+            .known_ops
+            .keys()
+            .filter(|key| self.corrections.find(key).is_none())
+            .collect();
+        stale.sort_unstable();
+        assert!(
+            stale.is_empty(),
+            "ops kept for tiles not resident: {stale:?}"
+        );
     }
 
     /// Whether the store holds edits no save has made part of a save point of the project
@@ -2860,6 +2879,7 @@ impl TileStore {
             return Ok(true);
         }
         self.corrections.remove(key)?;
+        self.known_ops.remove(key);
         Ok(false)
     }
 
@@ -3010,9 +3030,11 @@ impl TileStore {
         self.note_evictions();
         evaluated?;
         let (file, unsaved) = (&mut self.file, &mut self.unsaved);
-        self.corrections
-            .evict_all(|key, slot| write_slot(file, unsaved, key, slot).map(drop))?;
-        Ok(())
+        let corrections = self
+            .corrections
+            .evict_all(|key, slot| write_slot(file, unsaved, key, slot).map(drop));
+        self.forget_evicted_ops();
+        Ok(corrections?)
     }
 
     /// Gives chunks back until the pools hold at most `bytes` or only chunks with pinned slots
@@ -3090,6 +3112,8 @@ impl TileStore {
                 installed += 1;
             }
         }
+        #[cfg(test)]
+        self.assert_known_ops_resident();
         Ok(installed)
     }
 
@@ -3117,7 +3141,9 @@ impl TileStore {
         if self.corrections.find(&key).is_some() {
             return Ok(false);
         }
-        let id = match self.corrections.acquire_clean(key, &mut self.budget) {
+        let acquired = self.corrections.acquire_clean(key, &mut self.budget);
+        self.forget_evicted_ops();
+        let id = match acquired {
             Ok(id) => id,
             Err(PoolError::Full) => return Ok(false),
             Err(e) => return Err(e.into()),
@@ -3398,9 +3424,15 @@ impl TileStore {
     /// [`CacheError::Full`] when no free slot, new chunk or clean tile's slot is to be had.
     fn take_correction_slot(&mut self, key: TileKey, acquire: Acquire) -> Result<Fill, CacheError> {
         let id = match acquire {
-            Acquire::Any => self.acquire_correction(key)?,
-            Acquire::Clean => self.corrections.acquire_clean(key, &mut self.budget)?,
+            Acquire::Any => self.acquire_correction(key),
+            Acquire::Clean => self
+                .corrections
+                .acquire_clean(key, &mut self.budget)
+                .map_err(CacheError::from),
         };
+        // Taking a slot may have evicted others, whether or not it succeeded.
+        self.forget_evicted_ops();
+        let id = id?;
         #[cfg(test)]
         self.log.file_reads.push(key);
         Ok(Fill {
@@ -3583,12 +3615,34 @@ impl TileStore {
         evaluated?;
         if self.budget.used() > bytes {
             let (file, unsaved) = (&mut self.file, &mut self.unsaved);
-            self.corrections
+            let shrunk = self
+                .corrections
                 .shrink_to(&mut self.budget, bytes, |key, slot| {
                     write_slot(file, unsaved, key, slot).map(drop)
-                })?;
+                });
+            self.forget_evicted_ops();
+            shrunk?;
         }
+        #[cfg(test)]
+        self.assert_known_ops_resident();
         Ok(())
+    }
+
+    /// Drops the [`TileStore::known_ops`] of the correction tiles the pool has evicted since
+    /// the last call, so that only resident tiles have one. A tile resident again keeps its
+    /// entry: no flow reloads a tile between its eviction and the next drain today (each slot
+    /// taken drains before it is filled), so that check only guards a future one.
+    ///
+    /// Called wherever the pool may evict: after taking a slot (to load a tile or install a
+    /// prefetched one), evicting all, or giving chunks back, each whether or not it succeeded;
+    /// and at a rebase or roll-over, which so find nothing left to drop. Tests assert after
+    /// those, and after every poll, that only resident tiles have an op.
+    fn forget_evicted_ops(&mut self) {
+        for key in self.corrections.drain_evicted() {
+            if self.corrections.find(&key).is_none() {
+                self.known_ops.remove(&key);
+            }
+        }
     }
 
     /// Tells the dependency graph which evaluated tiles the pool evicted.
