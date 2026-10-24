@@ -153,6 +153,16 @@ pub enum StoreError {
         /// The tile's side.
         tile: u32,
     },
+    /// A full Index would name a different number of records than the save point derived in
+    /// memory (from the last one and the records written since) holds: a bug in deriving it.
+    /// Nothing was written, and the file's last save point stands.
+    #[error("a full save point names {named} records, but its derived maps hold {derived}")]
+    SavePointMismatch {
+        /// The records the full Index would name.
+        named: usize,
+        /// The records the derived maps hold.
+        derived: usize,
+    },
 }
 
 /// A tile record's contents, decompressed.
@@ -518,13 +528,11 @@ struct Appended {
     loc: Loc,
     /// The head op it records.
     head: Option<OpId>,
-    /// The tile records it names that its parent didn't, or named elsewhere, in key order:
-    /// those written since the parent, as of the cut it was written for, if any. For a full
-    /// Index with a parent too, so the new save point's maps are derived from its parent's
-    /// either way; for the first Index, every tile record it names.
-    tiles: Records,
+    /// Each tile record the new save point names: the last save point's with those written
+    /// since put in, as of the cut it was written for, if any (see [`SavedState`]).
+    tiles: SharedMap<TileKey, Loc>,
     /// The same for bounds records.
-    bounds: Records,
+    bounds: SharedMap<TileKey, Loc>,
 }
 
 /// A parsed Tile payload, borrowing the record.
@@ -580,6 +588,10 @@ pub struct ProjectFile {
     access: Access,
     /// The cut the next save point is written for, while one is open (see [`Cut`]).
     cut: Option<Cut>,
+    /// Makes the next save point's derivation leave out its first new tile record: for tests
+    /// of the guard in [`ProjectFile::append_index`].
+    #[cfg(test)]
+    skew_derivation: bool,
 }
 
 /// A save point in the making: the state of the file as of a write of the store (the cut),
@@ -714,6 +726,8 @@ impl ProjectFile {
             head: None,
             access: Access::ReadWrite,
             cut: None,
+            #[cfg(test)]
+            skew_derivation: false,
         })
     }
 
@@ -822,6 +836,8 @@ impl ProjectFile {
             head: None,
             access,
             cut: None,
+            #[cfg(test)]
+            skew_derivation: false,
         };
         let tail = this.load_base(&heads, len)?;
         if this.end < len {
@@ -894,6 +910,8 @@ impl ProjectFile {
             head: chain.head,
             access: Access::ReadOnly,
             cut: None,
+            #[cfg(test)]
+            skew_derivation: false,
         })
     }
 
@@ -1521,7 +1539,8 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`].
+    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`];
+    /// [`StoreError::SavePointMismatch`] (a bug), with nothing written.
     pub fn save(&mut self) -> Result<u64, StoreError> {
         if self.access == Access::ReadOnly {
             return Err(StoreError::ReadOnly);
@@ -1546,7 +1565,8 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`].
+    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`];
+    /// [`StoreError::SavePointMismatch`] (a bug), with nothing written.
     pub(crate) fn write_save_point(&mut self) -> Result<u64, StoreError> {
         if self.access == Access::ReadOnly {
             return Err(StoreError::ReadOnly);
@@ -1557,11 +1577,17 @@ impl ProjectFile {
 
     /// Appends the next Index: full the first time and every [`FULL_EVERY`]th, otherwise a
     /// delta of the tiles written since the last one. Returns what
-    /// [`ProjectFile::commit_index`] needs to make it the latest save point.
+    /// [`ProjectFile::commit_index`] needs to make it the latest save point: with it, the new
+    /// save point's maps, derived before anything is written (see [`SavedState`]).
+    ///
+    /// For a full Index, the derived maps must hold as many records as the Index names, or
+    /// nothing is written: a check of the derivation that costs nothing in release builds
+    /// beyond two lengths.
     ///
     /// # Errors
     ///
-    /// [`StoreError::TooLarge`], [`StoreError::Io`].
+    /// [`StoreError::SavePointMismatch`] if that check fails; [`StoreError::TooLarge`],
+    /// [`StoreError::Io`].
     fn append_index(&mut self) -> Result<Appended, StoreError> {
         #[cfg(test)]
         self.check_live();
@@ -1576,24 +1602,49 @@ impl ProjectFile {
             _ => self.head,
         };
         let delta = self.at_cut(&self.pending, Coverage::Delta);
-        let (payload, (tiles, bounds)) = match (coverage, parent) {
-            // The first save point: what it names is all there is.
+        // What the Index names, and the records new since the last save point (all of them for
+        // the first), from which the new save point's maps are derived.
+        let (payload, named, (tiles, bounds)) = match (coverage, parent) {
             (Coverage::Full, None) => {
                 let entries = self.at_cut(&self.live, coverage);
                 (
                     index_payload(coverage, parent, head, &entries)?,
+                    Some(entries.len()),
                     split_names(&entries),
                 )
             }
-            (Coverage::Full, Some(_)) => (
-                index_payload(coverage, parent, head, &self.at_cut(&self.live, coverage))?,
-                split_names(&delta),
-            ),
+            (Coverage::Full, Some(_)) => {
+                let entries = self.at_cut(&self.live, coverage);
+                (
+                    index_payload(coverage, parent, head, &entries)?,
+                    Some(entries.len()),
+                    split_names(&delta),
+                )
+            }
             (Coverage::Delta, _) => (
                 index_payload(coverage, parent, head, &delta)?,
+                None,
                 split_names(&delta),
             ),
         };
+        #[cfg(test)]
+        let tiles = if std::mem::take(&mut self.skew_derivation) {
+            tiles.into_iter().skip(1).collect()
+        } else {
+            tiles
+        };
+        let (old_tiles, old_bounds) = self
+            .saved
+            .as_ref()
+            .map(|saved| (saved.tiles.clone(), saved.bounds.clone()))
+            .unwrap_or_default();
+        let (tiles, bounds) = (old_tiles.with(tiles), old_bounds.with(bounds));
+        // A full Index names every record of the new save point: a cheap check of the
+        // derivation, before anything is written.
+        let derived = tiles.len() + bounds.len();
+        if let Some(named) = named.filter(|&named| named != derived) {
+            return Err(StoreError::SavePointMismatch { named, derived });
+        }
         let loc = self.append(KIND_INDEX, &payload)?;
         Ok(Appended {
             coverage,
@@ -1631,9 +1682,9 @@ impl ProjectFile {
     }
 
     /// Makes the Index `appended` the latest save point, the parent of the next, and returns
-    /// its offset. Its maps are the last save point's with the Index's new entries put in (see
-    /// [`SavedState`]). What it named leaves `pending`; the records past a cut it was written
-    /// for stay, for the next one, and the cut closes.
+    /// its offset, with the maps [`ProjectFile::append_index`] derived for it. What it named leaves
+    /// `pending`; the records past a cut it was written for stay, for the next one, and the cut
+    /// closes.
     fn commit_index(&mut self, appended: Appended) -> u64 {
         let Appended {
             coverage,
@@ -1642,20 +1693,16 @@ impl ProjectFile {
             tiles,
             bounds,
         } = appended;
-        let previous = self.saved.take();
-        let parent = previous.as_ref().map(|saved| SavePoint {
+        let parent = self.saved.as_ref().map(|saved| SavePoint {
             project: self.meta.project(),
             offset: saved.offset,
             head: saved.head,
         });
-        let (old_tiles, old_bounds) = previous
-            .map(|saved| (saved.tiles, saved.bounds))
-            .unwrap_or_default();
         self.saved = Some(SavedState {
             offset: loc.offset,
             head,
-            tiles: old_tiles.with(tiles),
-            bounds: old_bounds.with(bounds),
+            tiles,
+            bounds,
             parent,
         });
         self.deltas = match coverage {
@@ -3010,6 +3057,51 @@ mod tests {
 
     fn op(seq: u64) -> OpId {
         OpId::new(0, seq).unwrap()
+    }
+
+    #[test]
+    fn a_full_index_its_derived_maps_disagree_with_is_refused_before_it_is_written() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
+        f.write_displacement(key(1, 0), op(1), &tile(0.5)).unwrap();
+        f.save().unwrap();
+        // Delta saves up to the one before the next full Index.
+        for seq in 2..=FULL_EVERY {
+            f.write_displacement(key(1, 0), op(u64::from(seq)), &tile(0.25))
+                .unwrap();
+            f.save().unwrap();
+        }
+        let points = f.save_points().unwrap();
+        // A new tile, which the skewed derivation leaves out.
+        f.write_displacement(key(2, 0), op(100), &tile(0.125))
+            .unwrap();
+        f.skew_derivation = true;
+        let refused = f.save();
+        assert!(
+            matches!(
+                refused,
+                Err(StoreError::SavePointMismatch {
+                    named: 2,
+                    derived: 1
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(f.save_points().unwrap(), points, "no Index written");
+        // The next save derives right, and is the full Index.
+        let at = f.save().unwrap();
+        assert_eq!(f.deltas, 0, "a full Index");
+        let base = f.base().unwrap();
+        assert_eq!(base.save_point().offset, at);
+        assert!(base.same_state(&f.base_at(base.save_point()).unwrap().unwrap()));
+        drop(f);
+        let reopened = ProjectFile::open(&path).unwrap();
+        assert_eq!(
+            reopened.read_displacement(&key(2, 0)).unwrap(),
+            Some((op(100), tile(0.125))),
+            "saved by the save after"
+        );
     }
 
     #[test]
