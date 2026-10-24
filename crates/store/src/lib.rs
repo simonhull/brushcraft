@@ -47,4 +47,4 @@ pub use project::{
 };
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 pub use tiles::{CacheError, Evaluation, Invariant, PinGuard, StoreConfig, TileEdit, TileStore};
-pub use workers::{ParseWorkersError, Workers};
+pub use workers::{ParseWorkersError, StartWorkersError, Workers};

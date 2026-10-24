@@ -101,6 +101,7 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Why a [`RecoveryWriter`] call failed. The flush it was part of is abandoned and its edits are
 /// kept for the next one (see the module notes).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RecoveryError {
     /// The tile store failed: copying a slot, or appending a record or a save point to the
     /// working file.

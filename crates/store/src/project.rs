@@ -129,6 +129,7 @@ pub fn default_recovery_dir() -> Option<PathBuf> {
 
 /// Why a [`Project`] operation failed.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ProjectError {
     /// A file system call failed: creating the recovery directory, renaming a file into place,
     /// deleting a recovery file.

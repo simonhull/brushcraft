@@ -12,6 +12,7 @@ const LEVEL: i32 = 3;
 
 /// Why a displacement payload didn't encode or decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum CodecError {
     /// The header or body is the wrong size.
     #[error("displacement payload has the wrong size")]

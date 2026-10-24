@@ -3445,3 +3445,35 @@ fn resident_rows_read_as_single_vertices() {
     }
     store.unpin_held(&held).unwrap();
 }
+
+/// A save point whose derived maps disagree with it is reported as a broken invariant.
+///
+/// It is a bug, which trying again can't fix, so it is never a save to retry, whichever
+/// operation wrote the save point. Other file errors keep the operation's own variant.
+#[test]
+fn a_save_point_mismatch_is_an_internal_error_not_a_retryable_save() {
+    let mismatch = || StoreError::SavePointMismatch {
+        named: 2,
+        derived: 1,
+    };
+    for wrap in [CacheError::Save, CacheError::WriteBack, CacheError::Store] {
+        let routed = CacheError::from_save_point(mismatch(), wrap);
+        assert!(
+            matches!(
+                routed,
+                CacheError::Internal(Invariant::SavePointMismatch {
+                    named: 2,
+                    derived: 1
+                })
+            ),
+            "{routed:?}"
+        );
+    }
+    assert!(
+        matches!(
+            CacheError::from_save_point(StoreError::ReadOnly, CacheError::Save),
+            CacheError::Save(StoreError::ReadOnly)
+        ),
+        "an I/O-class error stays a save to retry"
+    );
+}

@@ -25,6 +25,7 @@ pub struct BaseMesh {
 
 /// Why a base mesh was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum MeshError {
     /// No faces.
     #[error("the mesh has no faces")]

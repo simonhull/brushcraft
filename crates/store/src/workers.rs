@@ -65,6 +65,19 @@ impl std::fmt::Display for Workers {
 #[error("{0:?} is not a worker setting: expected physical, logical or a positive count")]
 pub struct ParseWorkersError(String);
 
+/// Why the evaluation worker threads couldn't be started (see [`crate::CacheError::Workers`]):
+/// the operating system refused a thread. The thread library's own error is its source.
+#[derive(Debug, thiserror::Error)]
+#[error("the evaluation worker threads couldn't be started")]
+pub struct StartWorkersError(#[source] rayon::ThreadPoolBuildError);
+
+impl StartWorkersError {
+    /// The error building the thread pool gave.
+    pub(crate) const fn new(source: rayon::ThreadPoolBuildError) -> Self {
+        Self(source)
+    }
+}
+
 /// Parses what [`Workers`]' `Display` writes: `physical`, `logical`, or a positive count.
 impl std::str::FromStr for Workers {
     type Err = ParseWorkersError;

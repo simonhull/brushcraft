@@ -48,6 +48,7 @@ use thiserror::Error;
 
 /// Why [`DrawParams::new`] refused its arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum DrawParamsError {
     /// The brush's centre has a component that isn't finite.
     #[error("the brush centre is not finite")]
@@ -123,6 +124,7 @@ impl DrawParams {
 
 /// Why a [`draw_step`] failed.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SculptError {
     /// The store couldn't pin, evaluate or edit a tile.
     #[error("the tile store failed")]

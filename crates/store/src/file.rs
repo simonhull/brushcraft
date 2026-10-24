@@ -78,6 +78,7 @@ const MAX_MESH_PAYLOAD: u32 = 4 + MAX_MESH_RAW + MAX_MESH_RAW / 128 + 1024;
 
 /// Why a project file operation failed.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StoreError {
     /// An I/O call failed.
     #[error("project file I/O failed")]
@@ -154,8 +155,12 @@ pub enum StoreError {
         tile: u32,
     },
     /// A full Index would name a different number of records than the save point derived in
-    /// memory (from the last one and the records written since) holds: a bug in deriving it.
-    /// Nothing was written, and the file's last save point stands.
+    /// memory (from the last one and the records written since) holds: a bug in deriving it,
+    /// not an I/O failure. Nothing was written, and the file's last save point stands.
+    ///
+    /// Trying the save again doesn't help: the same derivation fails the same way. A
+    /// [`crate::TileStore`] reports it as [`crate::Invariant::SavePointMismatch`], never as a
+    /// save that can be retried.
     #[error("a full save point names {named} records, but its derived maps hold {derived}")]
     SavePointMismatch {
         /// The records the full Index would name.

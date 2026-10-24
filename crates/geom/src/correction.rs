@@ -33,6 +33,7 @@ pub struct CorrectionTile {
 
 /// Why a correction tile operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum CorrectionError {
     /// The vertex is outside the tile.
     #[error("vertex ({i}, {j}) is outside a tile of {side} vertices per side")]

@@ -40,6 +40,7 @@ const QUEUE_CAPACITY: usize = 1024;
 
 /// Why the backend couldn't start or stopped.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BackendError {
     /// The display or window isn't a Wayland one (X11, or not Linux).
     #[error("not a Wayland display or window")]

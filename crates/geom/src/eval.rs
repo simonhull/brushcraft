@@ -95,6 +95,7 @@ impl Grid {
 
 /// Why a block couldn't be evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum EvalError {
     /// Level 0 is the base mesh; it has nothing to predict from.
     #[error("level 0 has no parent; its positions come from the base mesh")]

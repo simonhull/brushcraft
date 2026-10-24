@@ -136,7 +136,7 @@ use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotData, Slo
 use crate::prefetch::{Fetched, Job, Prefetcher, Source};
 use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 use crate::stamp::Stamp;
-use crate::workers::Workers;
+use crate::workers::{StartWorkersError, Workers};
 
 /// How a [`TileStore`] is set up.
 ///
@@ -328,6 +328,7 @@ impl Headroom {
 
 /// Why a [`TileStore`] operation failed.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CacheError {
     /// Reading the working file, or recording a save point in it, failed.
     #[error("project file operation failed")]
@@ -403,11 +404,12 @@ pub enum CacheError {
     Internal(#[from] Invariant),
     /// The evaluation worker threads couldn't be started (see [`StoreConfig::workers`]).
     #[error("starting the evaluation worker threads failed")]
-    Workers(#[source] rayon::ThreadPoolBuildError),
+    Workers(#[source] StartWorkersError),
 }
 
 /// An invariant of [`TileStore`] found broken (see [`CacheError::Internal`]).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Invariant {
     /// A dirty correction tile had no op to write it with.
     #[error("dirty correction tile {0:?} has no op")]
@@ -452,6 +454,29 @@ pub enum Invariant {
         /// Values the buffer held.
         got: usize,
     },
+    /// A full save point would have named a different number of records than the maps derived
+    /// for it hold (see [`StoreError::SavePointMismatch`]). Nothing was written.
+    #[error("a full save point names {named} records, but its derived maps hold {derived}")]
+    SavePointMismatch {
+        /// The records the full Index would name.
+        named: usize,
+        /// The records the derived maps hold.
+        derived: usize,
+    },
+}
+
+impl CacheError {
+    /// `error`, from writing a save point, as the store reports it.
+    ///
+    /// [`StoreError::SavePointMismatch`] is a bug in deriving the save point, which trying again
+    /// can't fix, so it is [`Invariant::SavePointMismatch`] whatever the operation was. Any other
+    /// error is `wrap`ped as the operation reports file errors.
+    fn from_save_point(error: StoreError, wrap: impl FnOnce(StoreError) -> Self) -> Self {
+        if let StoreError::SavePointMismatch { named, derived } = error {
+            return Invariant::SavePointMismatch { named, derived }.into();
+        }
+        wrap(error)
+    }
 }
 
 /// No operation fails with [`Infallible`]: this lets `?` take pool results whose write-back
@@ -1443,7 +1468,7 @@ impl TileStore {
             .num_threads(config.worker_threads())
             .thread_name(|n| format!("tile-eval-{n}"))
             .build()
-            .map_err(CacheError::Workers)?;
+            .map_err(|e| CacheError::Workers(StartWorkersError::new(e)))?;
         let mut feed = ChangeFeed::new();
         let save_consumer = feed.subscribe();
         Ok(Self {
@@ -1514,7 +1539,8 @@ impl TileStore {
     /// fails; [`CacheError::Internal`] for an edited tile that has no record in the working file
     /// and isn't dirty ([`Invariant::NothingToSave`]: every edit is in one or the other), or a
     /// tile of the recovery file that wasn't copied ([`Invariant::NotInSave`], checked before
-    /// the save point is written).
+    /// the save point is written), or a save point whose derived maps disagree with it
+    /// ([`Invariant::SavePointMismatch`], with nothing written: not retryable).
     pub(crate) fn save_into(&mut self, project: &mut ProjectFile) -> Result<Saved, CacheError> {
         self.sync_pins()?;
         if project.meta().role() != Role::Project {
@@ -1589,7 +1615,9 @@ impl TileStore {
                 Stamp::ZERO,
             )
             .map_err(CacheError::Save)?;
-        project.save().map_err(CacheError::Save)?;
+        project
+            .save()
+            .map_err(|e| CacheError::from_save_point(e, CacheError::Save))?;
         let base = saved_base(project)?;
         Ok(Saved {
             base,
@@ -1761,7 +1789,8 @@ impl TileStore {
     ///
     /// [`CacheError::MeshMismatch`] or [`CacheError::WrongBase`] if `fresh` isn't over the
     /// store's mesh, or doesn't name the same base as the working file; [`CacheError::WriteBack`]
-    /// if writing or saving `fresh` fails.
+    /// if writing or saving `fresh` fails; [`CacheError::Internal`] if its save point's derived
+    /// maps disagree with it ([`Invariant::SavePointMismatch`]).
     pub(crate) fn fill_roll_over(&mut self, mut fresh: ProjectFile) -> Result<Filled, CacheError> {
         self.sync_pins()?;
         if fresh.meta().mesh_hash() != self.mesh_hash {
@@ -1839,7 +1868,9 @@ impl TileStore {
                 Stamp::ZERO,
             )
             .map_err(CacheError::WriteBack)?;
-        fresh.save().map_err(CacheError::WriteBack)?;
+        fresh
+            .save()
+            .map_err(|e| CacheError::from_save_point(e, CacheError::WriteBack))?;
         Ok(Filled {
             file: fresh,
             lost,
@@ -2496,7 +2527,8 @@ impl TileStore {
     /// point the writer is about to write, so the durable state could go backwards.
     /// [`CacheError::WriteBack`] if a tile's or a bound's write fails; [`CacheError::Eval`] if
     /// listing what the edits made stale fails (never, for tiles of the store's mesh);
-    /// [`CacheError::Store`] if the save point's write does.
+    /// [`CacheError::Store`] if the save point's write does; [`CacheError::Internal`] if the
+    /// save point's derived maps disagree with it ([`Invariant::SavePointMismatch`]).
     pub fn save(&mut self) -> Result<u64, CacheError> {
         if !self.streams.is_empty() {
             return Err(CacheError::Streaming);
@@ -2516,7 +2548,9 @@ impl TileStore {
             }
         }
         self.write_unsaved_bounds()?;
-        Ok(self.file.save()?)
+        self.file
+            .save()
+            .map_err(|e| CacheError::from_save_point(e, CacheError::Store))
     }
 
     /// Subscribes a streaming consumer (the recovery writer) to the change feed, with an empty
@@ -2714,9 +2748,12 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Store`] if the write fails.
+    /// [`CacheError::Store`] if the write fails; [`CacheError::Internal`] if the save point's
+    /// derived maps disagree with it ([`Invariant::SavePointMismatch`]).
     pub(crate) fn write_save_point(&mut self) -> Result<u64, CacheError> {
-        Ok(self.file.write_save_point()?)
+        self.file
+            .write_save_point()
+            .map_err(|e| CacheError::from_save_point(e, CacheError::Store))
     }
 
     /// Records `bounds`, computed from the store's current state (by the spatial index), as

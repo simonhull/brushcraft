@@ -38,6 +38,7 @@ const BUILD_BATCH: usize = 1024;
 
 /// Why building or updating the spatial index failed.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IndexError {
     /// Evaluating a tile failed.
     #[error("evaluating a tile failed")]
