@@ -1257,6 +1257,7 @@ dependencies = [
  "divan",
  "geom",
  "rayon",
+ "rustix",
  "thiserror 2.0.21",
  "zstd",
 ]

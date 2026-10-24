@@ -27,6 +27,7 @@ mod stamp;
 #[cfg(test)]
 mod test_dir;
 mod tiles;
+mod workers;
 
 pub use codec::CodecError;
 pub use feed::{ChangeFeed, ConsumerId};
@@ -45,3 +46,4 @@ pub use project::{
 };
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 pub use tiles::{CacheError, Evaluation, Invariant, PinGuard, StoreConfig, TileEdit, TileStore};
+pub use workers::Workers;

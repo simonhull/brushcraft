@@ -16,6 +16,10 @@ rayon.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 
+# Counting physical cores reads the process's CPU affinity mask (see `workers`).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["thread"] }
+
 [dev-dependencies]
 divan.workspace = true
 geom = { workspace = true, features = ["test-fixtures"] }

@@ -34,7 +34,7 @@
 //! [`crate::deps`]): after a brush step, that is all its neighbours need.
 //!
 //! The tiles of one cone level are independent of each other, so they are built in parallel,
-//! on the store's worker threads ([`StoreConfig::threads`]), in rounds of at most [`ROUND`]
+//! on the store's worker threads ([`StoreConfig::workers`]), in rounds of at most [`ROUND`]
 //! tiles: the owner thread loads and pins the round's correction tiles, the workers predict
 //! every tile of the round from the pinned level below, and the owner unpins the correction
 //! tiles and installs the results one by one, in key order. A round of tiles that already have
@@ -137,6 +137,7 @@ use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotData, Slo
 use crate::prefetch::{Fetched, Job, Prefetcher, Source};
 use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 use crate::stamp::Stamp;
+use crate::workers::Workers;
 
 /// How a [`TileStore`] is set up.
 ///
@@ -145,9 +146,13 @@ use crate::stamp::Stamp;
 ///
 /// ```
 /// # use std::num::NonZeroUsize;
-/// # use store::StoreConfig;
+/// # use store::{StoreConfig, Workers};
 /// let config = StoreConfig::new(2 << 30, 1).with_threads(NonZeroUsize::new(4));
 /// assert_eq!(config.chunk_bytes, StoreConfig::DEFAULT_CHUNK_BYTES);
+/// assert_eq!(
+///     config.workers,
+///     Workers::Fixed(NonZeroUsize::new(4).unwrap())
+/// );
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -168,10 +173,10 @@ pub struct StoreConfig {
     pub chunk_bytes: usize,
     /// The site (machine or session) the store's op ids carry; any but [`RESERVED_SITE`].
     pub site: u16,
-    /// Worker threads that evaluate tiles in parallel (see [`TileStore::evaluate_many`]), or
-    /// `None` for one per hardware thread ([`std::thread::available_parallelism`], one if that
-    /// can't be told). Results are the same bits whatever the count; tests pin it to compare.
-    pub threads: Option<NonZeroUsize>,
+    /// How many worker threads evaluate tiles in parallel (see [`TileStore::evaluate_many`]):
+    /// by default one per physical core ([`Workers::PhysicalCores`], see [`crate::Workers`] for
+    /// why). Results are the same bits whatever the count; tests pin it to compare.
+    pub workers: Workers,
 }
 
 impl StoreConfig {
@@ -180,15 +185,15 @@ impl StoreConfig {
     pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
 
     /// A store of `budget_bytes` whose op ids carry `site`, with
-    /// [`StoreConfig::DEFAULT_CHUNK_BYTES`] chunks and one evaluation worker per hardware
-    /// thread.
+    /// [`StoreConfig::DEFAULT_CHUNK_BYTES`] chunks and one evaluation worker per physical core
+    /// ([`Workers::PhysicalCores`]).
     #[must_use]
     pub const fn new(budget_bytes: usize, site: u16) -> Self {
         Self {
             budget_bytes,
             chunk_bytes: Self::DEFAULT_CHUNK_BYTES,
             site,
-            threads: None,
+            workers: Workers::PhysicalCores,
         }
     }
 
@@ -216,11 +221,22 @@ impl StoreConfig {
         Self { site, ..self }
     }
 
-    /// This configuration with `threads` evaluation workers, or one per hardware thread for
-    /// `None` (see [`StoreConfig::threads`]).
+    /// This configuration with `threads` evaluation workers ([`Workers::Fixed`]), or the
+    /// default, one per physical core, for `None` (see [`StoreConfig::workers`]).
     #[must_use]
     pub const fn with_threads(self, threads: Option<NonZeroUsize>) -> Self {
-        Self { threads, ..self }
+        let workers = match threads {
+            Some(n) => Workers::Fixed(n),
+            None => Workers::PhysicalCores,
+        };
+        Self { workers, ..self }
+    }
+
+    /// This configuration with its evaluation workers counted as `workers` asks (see
+    /// [`StoreConfig::workers`]).
+    #[must_use]
+    pub const fn with_workers(self, workers: Workers) -> Self {
+        Self { workers, ..self }
     }
 
     /// The least [`StoreConfig::budget_bytes`] a store over `mesh` with these chunks works
@@ -245,12 +261,10 @@ impl StoreConfig {
         Headroom::of(mesh).minimum_budget(self.chunk_bytes)
     }
 
-    /// The worker threads this configuration asks for: [`StoreConfig::threads`], else one per
-    /// hardware thread, else one.
+    /// The worker threads this configuration asks for on this machine (see
+    /// [`StoreConfig::workers`]).
     fn worker_threads(&self) -> usize {
-        self.threads
-            .or_else(|| std::thread::available_parallelism().ok())
-            .map_or(1, NonZeroUsize::get)
+        self.workers.count().get()
     }
 }
 
@@ -401,7 +415,7 @@ pub enum CacheError {
     /// its input or the file's contents.
     #[error("internal invariant broken")]
     Internal(#[from] Invariant),
-    /// The evaluation worker threads couldn't be started (see [`StoreConfig::threads`]).
+    /// The evaluation worker threads couldn't be started (see [`StoreConfig::workers`]).
     #[error("starting the evaluation worker threads failed")]
     Workers(#[source] rayon::ThreadPoolBuildError),
 }
@@ -702,7 +716,7 @@ struct EvalLog {
 ///   gathered parent block, the prediction and its tangent frames, a few tiles' worth (a few
 ///   hundred KB for the largest tiles), freed when the tile is done;
 /// - the thread stacks: Rust's default of 2 MiB of address space reserved per evaluation worker
-///   ([`StoreConfig::threads`]) and per prefetch worker, of which only the pages touched are
+///   ([`StoreConfig::workers`]) and per prefetch worker, of which only the pages touched are
 ///   committed;
 /// - the bookkeeping: the dependency graph, the pools' indices and the change feed, which grow with
 ///   the tiles resident and edited, not with their size.
@@ -2283,7 +2297,7 @@ impl TileStore {
     }
 
     /// `f` of every item of `items`, in order, computed on the store's evaluation workers
-    /// ([`StoreConfig::threads`]); a single item is computed on the calling thread.
+    /// ([`StoreConfig::workers`]); a single item is computed on the calling thread.
     ///
     /// For per-tile work over what the store has cached (with
     /// [`TileStore::cached_positions`] and [`TileStore::cached_normals`]) that is independent
