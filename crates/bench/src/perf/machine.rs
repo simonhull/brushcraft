@@ -1,11 +1,14 @@
 //! What a run records about where and on what it ran: the machine, the commit, the time.
 
+use std::fmt;
 use std::path::Path;
 use std::process::Command;
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, ensure};
 use store::Workers;
+use thiserror::Error;
 
 /// The machine a run measured: its name, and a fingerprint of the hardware that sets its
 /// speed.
@@ -18,7 +21,7 @@ pub(crate) struct Machine {
     pub(crate) name: String,
     /// CPU model, logical CPUs, physical cores and memory, as in `AMD Ryzen 9 5950X 16-Core
     /// Processor; 32 CPUs; 16 cores; 62 GiB`.
-    pub(crate) fingerprint: String,
+    pub(crate) fingerprint: Fingerprint,
     /// The kernel release, recorded beside the fingerprint but not part of it: a kernel update
     /// shouldn't orphan every baseline, and a change it makes should show as a change.
     pub(crate) kernel: String,
@@ -46,7 +49,7 @@ impl Machine {
         let gib = (memory + (1 << 19)) >> 20;
         Ok(Self {
             name,
-            fingerprint: format!("{model}; {cpus} CPUs; {cores} cores; {gib} GiB"),
+            fingerprint: Fingerprint(format!("{model}; {cpus} CPUs; {cores} cores; {gib} GiB")),
             kernel,
         })
     }
@@ -82,14 +85,22 @@ fn file_name(host: &str) -> Result<String> {
 /// The commit a run measured, and whether the working tree differed from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Revision {
-    /// The commit's full hash, or `unknown` outside a git checkout.
-    pub(crate) commit: String,
+    /// The commit, unknown outside a git checkout.
+    pub(crate) commit: Commit,
     /// Whether tracked files had uncommitted changes (untracked files don't count). True when
     /// the commit is unknown: nothing vouches for the code.
     pub(crate) dirty: bool,
 }
 
 impl Revision {
+    /// An unknown commit, counted dirty: nothing vouches for the code.
+    fn unknown() -> Self {
+        Self {
+            commit: Commit::unknown(),
+            dirty: true,
+        }
+    }
+
     /// The revision of the checkout at `repo`, from `git`; unknown and dirty if `git` can't
     /// tell (no git, or not a checkout).
     pub(crate) fn of(repo: &Path) -> Self {
@@ -109,33 +120,151 @@ impl Revision {
             git(&["rev-parse", "HEAD"]),
             git(&["status", "--porcelain", "--untracked-files=no"]),
         ) {
-            (Some(commit), Some(status)) => Self {
-                commit,
-                dirty: !status.is_empty(),
+            (Some(commit), Some(status)) => match commit.parse() {
+                Ok(commit) => Self {
+                    commit,
+                    dirty: !status.is_empty(),
+                },
+                Err(_not_a_hash) => Self::unknown(),
             },
-            _ => Self {
-                commit: "unknown".to_owned(),
-                dirty: true,
-            },
+            _ => Self::unknown(),
         }
     }
 }
 
-/// `time` as an RFC 3339 UTC timestamp to the second, as in `2026-10-24T13:05:09Z`.
-///
-/// # Errors
-///
-/// If `time` is before 1970.
-pub(crate) fn utc(time: SystemTime) -> Result<String> {
-    let seconds = time.duration_since(UNIX_EPOCH)?.as_secs();
-    let (days, rest) = (seconds / 86_400, seconds % 86_400);
-    let (year, month, day) = civil(i64::try_from(days)?);
-    Ok(format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60
-    ))
+/// Why a text isn't a run detail ([`Commit`], [`Fingerprint`] or [`Timestamp`]).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum BadDetail {
+    /// Not 40 lowercase hex digits, nor `unknown`.
+    #[error("{0:?} isn't a commit hash")]
+    Commit(String),
+    /// Empty.
+    #[error("an empty hardware fingerprint")]
+    Fingerprint,
+    /// Not `YYYY-MM-DDTHH:MM:SSZ`.
+    #[error("{0:?} isn't a UTC timestamp")]
+    Timestamp(String),
+}
+
+/// A commit: its full 40-digit hash, or unknown (a build outside a git checkout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Commit(String);
+
+impl Commit {
+    /// The commit of a build outside a git checkout.
+    pub(crate) fn unknown() -> Self {
+        Self("unknown".to_owned())
+    }
+
+    /// The hash, or `unknown`.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for Commit {
+    type Err = BadDetail;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let hash = text.len() == 40
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if hash || text == "unknown" {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(BadDetail::Commit(text.to_owned()))
+        }
+    }
+}
+
+impl fmt::Display for Commit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A hardware fingerprint (see [`Machine::fingerprint`]): free text, never empty. Baselines
+/// count only for runs with the same one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fingerprint(String);
+
+impl Fingerprint {
+    /// The fingerprint as text.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for Fingerprint {
+    type Err = BadDetail;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.trim().is_empty() {
+            Err(BadDetail::Fingerprint)
+        } else {
+            Ok(Self(text.to_owned()))
+        }
+    }
+}
+
+impl fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An RFC 3339 UTC timestamp to the second, `YYYY-MM-DDTHH:MM:SSZ`: when a run started, which
+/// with the machine names the run.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Timestamp(String);
+
+impl Timestamp {
+    /// `time` as a timestamp.
+    ///
+    /// # Errors
+    ///
+    /// If `time` is before 1970.
+    pub(crate) fn of(time: SystemTime) -> Result<Self> {
+        let seconds = time.duration_since(UNIX_EPOCH)?.as_secs();
+        let (days, rest) = (seconds / 86_400, seconds % 86_400);
+        let (year, month, day) = civil(i64::try_from(days)?);
+        Ok(Self(format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            rest / 3600,
+            rest % 3600 / 60,
+            rest % 60
+        )))
+    }
+
+    /// The timestamp as text.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for Timestamp {
+    type Err = BadDetail;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        const PATTERN: &[u8] = b"dddd-dd-ddTdd:dd:ddZ";
+        let fits = text.len() == PATTERN.len()
+            && text.bytes().zip(PATTERN).all(|(b, &p)| match p {
+                b'd' => b.is_ascii_digit(),
+                literal => b == literal,
+            });
+        if fits {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(BadDetail::Timestamp(text.to_owned()))
+        }
+    }
+}
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// The proleptic Gregorian date `days` after 1970-01-01: year, month (1–12), day (1–31).
@@ -209,7 +338,10 @@ mod tests {
     fn this_machine_is_described() {
         let machine = Machine::this().unwrap();
         assert!(!machine.name.is_empty(), "{machine:?}");
-        assert!(machine.fingerprint.contains(" CPUs; "), "{machine:?}");
+        assert!(
+            machine.fingerprint.as_str().contains(" CPUs; "),
+            "{machine:?}"
+        );
         assert_eq!(
             file_name("Omarchy.local_1").unwrap(),
             "omarchylocal1",
@@ -223,9 +355,48 @@ mod tests {
         );
     }
 
+    /// Commits, fingerprints and timestamps refuse what they can't be.
+    #[test]
+    fn run_details_are_checked() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(hash.parse::<Commit>().unwrap().as_str(), hash, "a hash");
+        assert_eq!(
+            "unknown".parse::<Commit>().unwrap(),
+            Commit::unknown(),
+            "unknown"
+        );
+        for bad in ["", "0123", &hash.to_uppercase(), &format!("{hash}0")] {
+            assert!(bad.parse::<Commit>().is_err(), "{bad:?}");
+        }
+        assert!(" ".parse::<Fingerprint>().is_err(), "empty fingerprint");
+        assert_eq!(
+            "cpu".parse::<Fingerprint>().unwrap().as_str(),
+            "cpu",
+            "fingerprint"
+        );
+        let stamp = "2026-10-24T13:05:09Z";
+        assert_eq!(
+            stamp.parse::<Timestamp>().unwrap().as_str(),
+            stamp,
+            "a timestamp"
+        );
+        for bad in [
+            "r1",
+            "2026-10-24 13:05:09Z",
+            "2026-10-24T13:05:09",
+            "2026-1x-24T13:05:09Z",
+        ] {
+            assert!(bad.parse::<Timestamp>().is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn timestamps_are_utc_dates() {
-        let at = |secs| utc(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+        let at = |secs| {
+            Timestamp::of(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap()
+                .to_string()
+        };
         assert_eq!(at(0), "1970-01-01T00:00:00Z", "the epoch");
         assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z", "a leap day");
         assert_eq!(at(1_792_847_109), "2026-10-24T13:05:09Z", "today");
@@ -253,11 +424,11 @@ mod tests {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let revision = Revision::of(repo);
         assert!(
-            revision.commit == "unknown" || revision.commit.len() == 40,
+            revision.commit.as_str() == "unknown" || revision.commit.as_str().len() == 40,
             "{revision:?}"
         );
         let nowhere = Revision::of(Path::new("/nonexistent/brushcraft"));
-        assert_eq!(nowhere.commit, "unknown", "no checkout");
+        assert_eq!(nowhere.commit, Commit::unknown(), "no checkout");
         assert!(nowhere.dirty, "unknown counts as dirty");
     }
 }

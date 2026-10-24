@@ -45,7 +45,7 @@ use crate::cli::{Options, Projects};
 use crate::paths::{Paths, cache_root, repo_root};
 use crate::perf::compare::Verdict;
 use crate::perf::history::{Entry, Label, PartLoad, RunInfo};
-use crate::perf::machine::{Machine, Revision};
+use crate::perf::machine::{Machine, Revision, Timestamp};
 use crate::perf::metric::Metric;
 use crate::perf::project::{Copied, Scale, WorkDir, cache_key, cached_file, remove_stale};
 use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak, own_load};
@@ -363,8 +363,10 @@ fn report<J: Write, H: Write>(
     label: Label,
     out: &mut Output<J, H>,
 ) -> Result<(usize, usize)> {
-    let fingerprint = entries.first().map_or("", |e| e.info.fingerprint.as_str());
-    let baselines = history::baselines(past, fingerprint);
+    let baselines = entries
+        .first()
+        .map(|e| history::baselines(past, &e.info.fingerprint))
+        .unwrap_or_default();
     out.say(&format!(
         "\nperf: {} metrics, run labelled {label}",
         entries.len()
@@ -453,13 +455,13 @@ pub(crate) fn run<J: Write, H: Write>(
 
     let baseline = plan.baseline && label.allows_baseline();
     let info = RunInfo {
-        run: machine::utc(started)?,
+        run: Timestamp::of(started)?,
         commit: revision.commit,
         dirty: revision.dirty,
         machine: machine.name,
         fingerprint: machine.fingerprint,
         kernel: machine.kernel,
-        workers: options.workers.to_string(),
+        workers: options.workers,
         worker_threads: options.workers.count().get(),
         label,
         baseline,
@@ -565,7 +567,9 @@ fn measure_all<J: Write, H: Write>(
                     "{} doesn't exist: run `brushcraft-bench generate` first",
                     source.display()
                 );
-                let bytes = std::fs::metadata(source)?.len();
+                let bytes = std::fs::metadata(source)
+                    .with_context(|| format!("reading {}'s size", source.display()))?
+                    .len();
                 let name = format!(
                     "{} ({bytes} bytes)",
                     source.file_name().unwrap_or_default().to_string_lossy()
@@ -651,8 +655,20 @@ mod tests {
 
     #[test]
     fn table_lines_show_value_baseline_and_verdict() {
-        let now = entry("medium.brush.p99_ms", 2.2, "r2", false, "cpu");
-        let base = entry("medium.brush.p99_ms", 2.0, "r1", true, "cpu");
+        let now = entry(
+            "medium.brush.p99_ms",
+            2.2,
+            "2026-10-24T00:00:02Z",
+            false,
+            "cpu",
+        );
+        let base = entry(
+            "medium.brush.p99_ms",
+            2.0,
+            "2026-10-24T00:00:01Z",
+            true,
+            "cpu",
+        );
         let verdict = Verdict::judge(Some(&base.metric.value), &now.metric.value);
         let line = table_line(&now, Some(&base), verdict);
         assert!(line.starts_with("medium.brush.p99_ms"), "{line}");

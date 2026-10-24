@@ -12,8 +12,10 @@ use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use store::Workers;
 
 use crate::perf::json::{Json, Object};
+use crate::perf::machine::{Commit, Fingerprint, Timestamp};
 use crate::perf::metric::{Measured, Metric, MetricName, Unit};
 use crate::perf::quiet::{Load, Settled};
 use crate::report::Record;
@@ -77,20 +79,20 @@ impl fmt::Display for Label {
 /// What every metric of a run shares: when, what code, where, how loaded.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RunInfo {
-    /// When the run started, UTC (`2026-10-24T13:05:09Z`); with the machine, it names the run.
-    pub(crate) run: String,
+    /// When the run started; with the machine, it names the run.
+    pub(crate) run: Timestamp,
     /// The commit measured.
-    pub(crate) commit: String,
+    pub(crate) commit: Commit,
     /// Whether tracked files differed from it.
     pub(crate) dirty: bool,
     /// The machine's name.
     pub(crate) machine: String,
     /// Its hardware fingerprint (see [`crate::perf::machine::Machine`]).
-    pub(crate) fingerprint: String,
+    pub(crate) fingerprint: Fingerprint,
     /// Its kernel release.
     pub(crate) kernel: String,
-    /// The evaluation workers setting (`physical`, `logical` or a count).
-    pub(crate) workers: String,
+    /// The evaluation workers setting.
+    pub(crate) workers: Workers,
     /// The worker threads it gave.
     pub(crate) worker_threads: usize,
     /// How quiet the machine was.
@@ -146,7 +148,7 @@ impl Entry {
             .with("machine", info.machine.as_str())
             .with("fingerprint", info.fingerprint.as_str())
             .with("kernel", info.kernel.as_str())
-            .with("workers", info.workers.as_str())
+            .with("workers", info.workers.to_string())
             .with("worker_threads", info.worker_threads)
             .with("project", self.project.as_str())
             .with("load_start", self.load.start.get())
@@ -202,13 +204,13 @@ impl Entry {
         let threads = number("worker_threads")?;
         Ok(Self {
             info: RunInfo {
-                run: text("run")?,
-                commit: text("commit")?,
+                run: text("run")?.parse()?,
+                commit: text("commit")?.parse()?,
                 dirty: flag("dirty")?,
                 machine: text("machine")?,
-                fingerprint: text("fingerprint")?,
+                fingerprint: text("fingerprint")?.parse()?,
                 kernel: text("kernel")?,
-                workers: text("workers")?,
+                workers: text("workers")?.parse()?,
                 worker_threads: if threads.fract() == 0.0 && (0.0..1e9).contains(&threads) {
                     // Checked whole and small just above.
                     #[expect(
@@ -293,11 +295,11 @@ pub(crate) fn read(path: &Path) -> Result<History> {
 /// with `fingerprint`.
 pub(crate) fn baselines<'a>(
     entries: &'a [Entry],
-    fingerprint: &str,
+    fingerprint: &Fingerprint,
 ) -> BTreeMap<&'a MetricName, &'a Entry> {
     entries
         .iter()
-        .filter(|e| e.info.baseline && e.info.fingerprint == fingerprint)
+        .filter(|e| e.info.baseline && e.info.fingerprint == *fingerprint)
         .map(|e| (&e.metric.name, e))
         .collect()
 }
@@ -357,13 +359,13 @@ pub(crate) mod tests {
     ) -> Entry {
         Entry {
             info: RunInfo {
-                run: run.to_owned(),
-                commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                run: run.parse().unwrap(),
+                commit: "0123456789abcdef0123456789abcdef01234567".parse().unwrap(),
                 dirty: false,
                 machine: "omarchy".to_owned(),
-                fingerprint: fingerprint.to_owned(),
+                fingerprint: fingerprint.parse().unwrap(),
                 kernel: "7.2.8".to_owned(),
-                workers: "physical".to_owned(),
+                workers: Workers::PhysicalCores,
                 worker_threads: 16,
                 label: Label::Quiet,
                 baseline,
@@ -447,9 +449,15 @@ pub(crate) mod tests {
 
     #[test]
     fn malformed_entries_are_refused() {
-        let line = entry("medium.brush.p99_ms", 2.0, "r", false, "cpu")
-            .to_record()
-            .to_json();
+        let line = entry(
+            "medium.brush.p99_ms",
+            2.0,
+            "2026-10-24T00:00:00Z",
+            false,
+            "cpu",
+        )
+        .to_record()
+        .to_json();
         for (from, to, what) in [
             (
                 r#""result":"metric""#,
@@ -497,36 +505,72 @@ pub(crate) mod tests {
             "no file yet: no history"
         );
         let first = [
-            entry("medium.brush.p99_ms", 2.0, "r1", true, "cpu"),
-            entry("medium.brush.p50_ms", 1.5, "r1", true, "cpu"),
+            entry(
+                "medium.brush.p99_ms",
+                2.0,
+                "2026-10-24T00:00:01Z",
+                true,
+                "cpu",
+            ),
+            entry(
+                "medium.brush.p50_ms",
+                1.5,
+                "2026-10-24T00:00:01Z",
+                true,
+                "cpu",
+            ),
         ];
         assert_eq!(append(&path, &first).unwrap(), 0, "nothing torn");
         let second = [
-            entry("medium.brush.p99_ms", 2.2, "r2", false, "cpu"),
-            entry("medium.brush.p99_ms", 9.9, "r3", true, "other cpu"),
-            entry("medium.brush.p99_ms", 1.9, "r4", true, "cpu"),
-            entry("medium.brush.p99_ms", 2.4, "r5", false, "cpu"),
+            entry(
+                "medium.brush.p99_ms",
+                2.2,
+                "2026-10-24T00:00:02Z",
+                false,
+                "cpu",
+            ),
+            entry(
+                "medium.brush.p99_ms",
+                9.9,
+                "2026-10-24T00:00:03Z",
+                true,
+                "other cpu",
+            ),
+            entry(
+                "medium.brush.p99_ms",
+                1.9,
+                "2026-10-24T00:00:04Z",
+                true,
+                "cpu",
+            ),
+            entry(
+                "medium.brush.p99_ms",
+                2.4,
+                "2026-10-24T00:00:05Z",
+                false,
+                "cpu",
+            ),
         ];
         append(&path, &second).unwrap();
         let history = read(&path).unwrap();
         assert_eq!(history.torn, None, "whole lines");
         let all = history.entries;
         assert_eq!(all.len(), 6, "both appends");
-        let base = baselines(&all, "cpu");
+        let base = baselines(&all, &"cpu".parse().unwrap());
         let p99: MetricName = "medium.brush.p99_ms".parse().unwrap();
         let p50: MetricName = "medium.brush.p50_ms".parse().unwrap();
         assert_eq!(
             base.get(&p99).map(|e| e.info.run.as_str()),
-            Some("r4"),
+            Some("2026-10-24T00:00:04Z"),
             "the latest baseline"
         );
         assert_eq!(
             base.get(&p50).map(|e| e.info.run.as_str()),
-            Some("r1"),
+            Some("2026-10-24T00:00:01Z"),
             "per metric"
         );
         assert!(
-            baselines(&all, "new cpu").is_empty(),
+            baselines(&all, &"new cpu".parse().unwrap()).is_empty(),
             "other hardware has none"
         );
 
@@ -545,14 +589,26 @@ pub(crate) mod tests {
     fn a_torn_last_line_is_left_out_and_dropped() {
         let path =
             std::env::temp_dir().join(format!("brushcraft-perf-torn-{}.jsonl", std::process::id()));
-        let whole = entry("medium.brush.p99_ms", 2.0, "r1", true, "cpu")
-            .to_record()
-            .to_json();
+        let whole = entry(
+            "medium.brush.p99_ms",
+            2.0,
+            "2026-10-24T00:00:01Z",
+            true,
+            "cpu",
+        )
+        .to_record()
+        .to_json();
         std::fs::write(&path, format!("{whole}\n{}", &whole[..40])).unwrap();
         let history = read(&path).unwrap();
         assert_eq!(history.entries.len(), 1, "the whole line");
         assert_eq!(history.torn, Some(2), "line 2 is torn");
-        let next = [entry("medium.brush.p99_ms", 2.1, "r2", false, "cpu")];
+        let next = [entry(
+            "medium.brush.p99_ms",
+            2.1,
+            "2026-10-24T00:00:02Z",
+            false,
+            "cpu",
+        )];
         assert_eq!(append(&path, &next).unwrap(), 40, "the torn bytes dropped");
         let after = read(&path).unwrap();
         assert_eq!(after.torn, None, "nothing torn now");
