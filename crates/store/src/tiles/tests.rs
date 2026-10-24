@@ -2314,7 +2314,9 @@ fn brushed_tiles(mesh: &BaseMesh) -> (Vec<TileKey>, Vec<TileKey>) {
 /// Slots written on the workers are the same, byte for byte, whatever the thread count.
 ///
 /// A brush's pinned tiles are predicted straight into their slots and every normal is written
-/// straight into its slot; every slot, the dirty set and the change feed end up the same.
+/// straight into its slot; every slot, the dirty set and the change feed end up the same. The
+/// edits reach unpinned neighbours too (through border copies), so each round mixes tiles
+/// predicted in place with tiles predicted into scratch.
 #[test]
 fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
     let dir = TestDir::new();
@@ -2335,6 +2337,14 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
             4 * keys.len(),
             "{threads} threads: every pinned tile predicted in place each round"
         );
+        // The cold evaluation before the first round goes through scratch: look after it.
+        let in_place: BTreeSet<TileKey> = store.log.in_place.iter().copied().collect();
+        let first = store.log.in_place.first().unwrap();
+        let rounds = store.log.positions.iter().skip_while(|key| *key != first);
+        assert!(
+            rounds.filter(|key| !in_place.contains(key)).count() >= 4,
+            "{threads} threads: unpinned tiles went through scratch in the rounds"
+        );
         let feed = store.feed.drain(store.save_consumer);
         runs.push((threads, every_slot(&store, &all), feed, store.log.positions));
     }
@@ -2354,6 +2364,61 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
             );
         }
     }
+}
+
+/// A stale slot nothing pins any more isn't written in place: an earlier tile of the same round
+/// can take it as the clock's victim when it installs.
+///
+/// Tiles A were pinned when an edit made them stale, and the pin was dropped after: their slots
+/// stay, stale and unreferenced, the clock's first victims. With the pool full and the hand on
+/// A's first slot, a round of B (no slot) then A takes A's slot for B. Predicting A in place
+/// would have written a slot that is B's by the time A installs.
+#[test]
+fn a_stale_slot_that_lost_its_pin_is_not_predicted_in_place() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let finest = tiles(&mesh, TOP, TOP);
+    let mut store = new_store(&dir, "work.bcp", &mesh, config(16, 4));
+    let (b, a) = (finest[0], [finest[2], finest[3]]);
+    store.evaluate(b).unwrap();
+    let guard = store.pin(&a).unwrap();
+    assert_eq!(
+        update_round("tiles", &mut store, &[b, a[0], a[1]], 0, false),
+        "Ok(())"
+    );
+    drop(guard);
+    // Fill the free slots and the budget with tiles nothing else needs, without evicting.
+    for key in finest.iter().skip(8) {
+        let room =
+            store.evaluated.has_free_slot() || store.budget.fits(store.evaluated.chunk_bytes());
+        if !room {
+            break;
+        }
+        store.evaluate(*key).unwrap();
+    }
+    assert!(!store.evaluated.has_free_slot(), "the pool is full");
+    let stale = store
+        .evaluated
+        .find(&a[0])
+        .expect("A's stale slot is still there");
+    assert_eq!(store.evaluated.freshness(&a[0]), Some(Freshness::Stale));
+    assert!(!store.evaluated.is_pinned(&a[0]), "and nothing pins it");
+    store.evaluated.aim_hand_at(stale);
+
+    store
+        .evaluate_many(&[b, a[0], a[1]], Evaluation::Positions)
+        .unwrap();
+    for key in [b, a[0], a[1]] {
+        assert_eq!(
+            store.evaluated.freshness(&key),
+            Some(Freshness::Fresh),
+            "{key:?}"
+        );
+    }
+    assert!(
+        store.log.in_place.is_empty(),
+        "nothing pinned, nothing in place"
+    );
 }
 
 /// The normal inputs the store reads back from its records are those the mesh lists.

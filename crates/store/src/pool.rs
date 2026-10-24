@@ -560,6 +560,13 @@ impl<T: SlotData> Pool<T> {
         Ok(())
     }
 
+    /// Points the clock's hand at slot `id`, so the next sweep looks at it first: for tests
+    /// that need a particular victim.
+    #[cfg(test)]
+    pub(crate) fn aim_hand_at(&mut self, id: SlotId<T>) {
+        self.hand = u64::from(id.chunk) * u64::from(self.per_chunk) + u64::from(id.index);
+    }
+
     /// Undoes one [`Pool::pin`]. A [`Freshness::Stale`] slot loses its `referenced` mark, so it
     /// is the clock's first victim once nothing pins it.
     ///

@@ -3990,10 +3990,13 @@ impl TileStore {
     /// pinned correction slot (`corrections`, in the same order), unpins the correction slots,
     /// then installs each tile in key order, pinning it and adding it to `held`.
     ///
-    /// A tile that already has a slot (a stale tile recomputed in place, as a brush step's
-    /// tiles are: pinned, so kept when their edit invalidated them) is predicted straight into
-    /// that slot on the workers, and installing it is only its bookkeeping
-    /// ([`TileStore::positions_installed`]). Any other tile is predicted into a scratch buffer,
+    /// A tile whose slot is pinned (a stale tile recomputed in place, as a brush step's tiles
+    /// are: pinned by the step, so kept when their edit invalidated them) is predicted straight
+    /// into that slot on the workers, and installing it is only its bookkeeping
+    /// ([`TileStore::positions_installed`]). Only a pinned slot is safe to write ahead of the
+    /// installs: a stale slot nothing pins any more (its pins dropped after the edit) is the
+    /// clock's first victim, and an earlier tile of the round taking a slot as it installs
+    /// would take it. Any other tile, such a one included, is predicted into a scratch buffer,
     /// and the owner copies it into a slot it takes as it installs the tile
     /// ([`TileStore::store_positions`]). Either way the pools see the same calls in the same
     /// order as when every tile went through scratch: a lookup of each tile's slot, or a slot
@@ -4020,7 +4023,11 @@ impl TileStore {
     ) -> Result<(), CacheError> {
         let slots: Vec<Option<SlotId<EvaluatedSlot>>> = round
             .iter()
-            .map(|(key, _)| self.evaluated.find(key))
+            .map(|(key, _)| {
+                self.evaluated
+                    .find(key)
+                    .filter(|_| self.evaluated.is_pinned(key))
+            })
             .collect();
         let mut scratch = self.take_scratch(round.len());
         let predicted = self.predict_round(round, corrections, &slots, below, &mut scratch);
@@ -4139,8 +4146,9 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Internal`] if `key`'s slot is no longer `id` (the slot is pinned while the
-    /// round is built, so this doesn't happen).
+    /// [`CacheError::Internal`] if `key`'s slot is no longer `id` (only pinned slots are
+    /// predicted in place, and nothing unpins them while the round is built, so this doesn't
+    /// happen).
     fn install_in_place(
         &mut self,
         key: TileKey,
@@ -4186,8 +4194,8 @@ impl TileStore {
         parents: &[TileKey],
         positions: &[Vec3],
     ) -> Result<SlotId<EvaluatedSlot>, CacheError> {
-        // A stale slot (pinned elsewhere, so still here) is overwritten in place: its handles
-        // stay valid.
+        // A stale slot still here (one that wasn't pinned when the round began, and that no
+        // earlier tile of the round took) is overwritten in place: its handles stay valid.
         let id = match self.evaluated.lookup(&key) {
             Some((id, _)) => id,
             None => self.acquire_evaluated(key)?,
