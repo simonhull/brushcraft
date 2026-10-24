@@ -13,9 +13,11 @@
 //!
 //! Each result is a JSON line on stdout (`{"bench": …, "result": …, …}`); progress and a human
 //! summary go to stderr. The project lives outside the repository, under
-//! `$XDG_CACHE_HOME/brushcraft/bench/` by default ([`paths`]). Everything runs on one thread
-//! except the recovery writer, prefetch and the RSS sampler: the single-threaded baseline that
-//! later optimisation is measured against.
+//! `$XDG_CACHE_HOME/brushcraft/bench/` by default ([`paths`]). Tiles are evaluated, brushed and
+//! edited on the tile store's evaluation workers, one per physical core unless `--workers` says
+//! otherwise; every JSON line records the setting (`workers`) and the count it gave
+//! (`worker_threads`). The recovery writer, prefetch and the RSS sampler have threads of their
+//! own.
 
 mod brush;
 mod budget;
@@ -68,6 +70,9 @@ fn main() -> ExitCode {
         }
     };
     let mut out = Output::new(std::io::stdout().lock(), std::io::stderr());
+    let workers = command.options.workers;
+    out.stamp("workers", workers.to_string());
+    out.stamp("worker_threads", workers.count().get());
     match run(&command, &mut out) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

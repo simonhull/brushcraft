@@ -49,6 +49,39 @@ impl Workers {
     }
 }
 
+/// The names [`Workers`] goes by in text: `physical`, `logical`, or a positive count.
+impl std::fmt::Display for Workers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PhysicalCores => f.write_str("physical"),
+            Self::LogicalCores => f.write_str("logical"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+/// Why a [`Workers`] setting didn't parse.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not a worker setting: expected physical, logical or a positive count")]
+pub struct ParseWorkersError(String);
+
+/// Parses what [`Workers`]' `Display` writes: `physical`, `logical`, or a positive count.
+impl std::str::FromStr for Workers {
+    type Err = ParseWorkersError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "physical" => Ok(Self::PhysicalCores),
+            "logical" => Ok(Self::LogicalCores),
+            _ => text
+                .parse()
+                .ok()
+                .map(Self::Fixed)
+                .ok_or_else(|| ParseWorkersError(text.to_owned())),
+        }
+    }
+}
+
 /// The hardware threads available to the process, one if that can't be told.
 fn logical_cores() -> NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
@@ -269,5 +302,18 @@ mod tests {
         let three = NonZeroUsize::new(3).unwrap();
         assert_eq!(Workers::Fixed(three).count(), three);
         assert_eq!(Workers::default(), Workers::PhysicalCores);
+    }
+
+    /// A setting reads back as it is written, and anything else is refused.
+    #[test]
+    fn settings_read_back_as_written() {
+        let three = Workers::Fixed(NonZeroUsize::new(3).unwrap());
+        for workers in [Workers::PhysicalCores, Workers::LogicalCores, three] {
+            assert_eq!(workers.to_string().parse(), Ok(workers), "{workers}");
+        }
+        assert_eq!(three.to_string(), "3");
+        for text in ["", "0", "-1", "Physical", "physical ", "3.5", "many"] {
+            assert!(text.parse::<Workers>().is_err(), "{text:?}");
+        }
     }
 }

@@ -16,11 +16,11 @@ use crate::report::{Output, Record, Spread, mib, ms, to_f64};
 /// The site the harness's op ids carry: any but the reserved one.
 const SITE: u16 = 1;
 
-/// The project configuration for `options`' budget, with recovery files in `paths`' recovery
-/// directory.
+/// The project configuration for `options`' budget and evaluation workers, with recovery files
+/// in `paths`' recovery directory.
 pub(crate) fn config(options: &Options, paths: &Paths) -> ProjectConfig {
     ProjectConfig {
-        store: StoreConfig::new(options.budget_bytes(), SITE),
+        store: StoreConfig::new(options.budget_bytes(), SITE).with_workers(options.workers),
         recovery_dir: paths.recovery.clone(),
     }
 }

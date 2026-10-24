@@ -147,6 +147,9 @@ impl Record {
 pub(crate) struct Output<J, H> {
     /// The JSON lines: stdout in the binary.
     json: J,
+    /// Fields every JSON line ends with, whatever its result: the run's setting (see
+    /// [`Output::stamp`]).
+    stamps: Vec<(String, Value)>,
     /// The human summary and progress: stderr in the binary.
     human: H,
     /// When the last progress line was written, to write at most one every
@@ -163,8 +166,15 @@ impl<J: Write, H: Write> Output<J, H> {
         Self {
             json,
             human,
+            stamps: Vec::new(),
             last_progress: None,
         }
+    }
+
+    /// Ends every JSON line written from now on with `name` set to `value`: for what holds for
+    /// the whole run (its evaluation workers), so no result can leave it out.
+    pub(crate) fn stamp(&mut self, name: impl Into<String>, value: impl Into<Value>) {
+        self.stamps.push((name.into(), value.into()));
     }
 
     /// Writes `record` as a JSON line.
@@ -173,7 +183,13 @@ impl<J: Write, H: Write> Output<J, H> {
     ///
     /// If writing fails.
     pub(crate) fn record(&mut self, record: &Record) -> Result<()> {
-        writeln!(self.json, "{}", record.to_json())?;
+        let stamped = self
+            .stamps
+            .iter()
+            .fold(record.clone(), |line, (name, value)| {
+                line.with(name.clone(), value.clone())
+            });
+        writeln!(self.json, "{}", stamped.to_json())?;
         self.json.flush()?;
         Ok(())
     }
@@ -324,6 +340,26 @@ mod tests {
             r#"{"bench":"brush","result":"step","name":"a \"b\"\n","n":3,"x":1.5,"bad":null,"xs":[1,2.25]}"#,
             "fields in order, strings escaped, NaN as null"
         );
+    }
+
+    /// A stamp ends every JSON line written after it, whatever the result, and never the
+    /// human summary.
+    #[test]
+    fn stamps_end_every_json_line() {
+        let mut out = Output::new(Vec::new(), Vec::new());
+        out.stamp("workers", "physical");
+        out.stamp("worker_threads", 16_usize);
+        out.record(&Record::new("brush", "index")).unwrap();
+        out.record(&Record::new("brush", "stroke").with("n", 3_u64))
+            .unwrap();
+        out.say("a summary").unwrap();
+        let (json, human) = out.into_parts();
+        assert_eq!(
+            String::from_utf8(json).unwrap(),
+            "{\"bench\":\"brush\",\"result\":\"index\",\"workers\":\"physical\",\"worker_threads\":16}\n\
+             {\"bench\":\"brush\",\"result\":\"stroke\",\"n\":3,\"workers\":\"physical\",\"worker_threads\":16}\n"
+        );
+        assert_eq!(String::from_utf8(human).unwrap(), "a summary\n");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use store::Workers;
 
 /// What the harness prints when its arguments don't parse.
 pub(crate) const USAGE: &str = "\
@@ -29,6 +30,9 @@ options (each subcommand takes the ones it uses):
   --budget-mib N          the tile store's budget (default: generate 2048, page-in 4096,
                           brush 2048, save 2048, budget 1024)
   --seed N                the random seed (default 1)
+  --workers W             the store's evaluation workers: physical (default, one per physical
+                          core), logical (one per hardware thread) or a count; every JSON line
+                          records the setting and the count it gave
   generate: --splits N (20)  --levels N (9)  --amplitude F (0.01)  --force (replace the file)
   page-in, brush, save, budget: --level N, the finest level, the one measured (9)
   page-in:  --samples N (5)  --footprint VERTICES (50000)  --region-quads N (42000000)
@@ -95,10 +99,10 @@ impl Subcommand {
     fn takes(self, flag: Flag) -> bool {
         use Flag::{
             Amplitude, BudgetMib, Footprint, Force, Level, Levels, Moves, Pool, Project,
-            RegionQuads, Samples, Seed, Splits, Steps, StepsPerMove, Strength, ViewTiles,
+            RegionQuads, Samples, Seed, Splits, Steps, StepsPerMove, Strength, ViewTiles, Workers,
         };
         match flag {
-            Project | BudgetMib | Seed => true,
+            Project | BudgetMib | Seed | Workers => true,
             Splits | Levels | Amplitude | Force => self == Self::Generate,
             Level | Footprint => self != Self::Generate,
             Samples | RegionQuads | Pool => self == Self::PageIn,
@@ -200,11 +204,13 @@ enum Flag {
     StepsPerMove,
     /// `--view-tiles`.
     ViewTiles,
+    /// `--workers`.
+    Workers,
 }
 
 impl Flag {
     /// Every flag with its name, without the leading `--`.
-    const NAMES: [(Self, &'static str); 17] = [
+    const NAMES: [(Self, &'static str); 18] = [
         (Self::Project, "project"),
         (Self::BudgetMib, "budget-mib"),
         (Self::Seed, "seed"),
@@ -222,6 +228,7 @@ impl Flag {
         (Self::Moves, "moves"),
         (Self::StepsPerMove, "steps-per-move"),
         (Self::ViewTiles, "view-tiles"),
+        (Self::Workers, "workers"),
     ];
 
     /// The flag named `name` (without the leading `--`).
@@ -271,6 +278,8 @@ pub(crate) struct Options {
     pub(crate) steps_per_move: usize,
     /// `budget`: tiles evaluated and pinned at each place, as a view would.
     pub(crate) view_tiles: usize,
+    /// How many evaluation workers the tile store starts.
+    pub(crate) workers: Workers,
 }
 
 impl Options {
@@ -298,6 +307,7 @@ impl Options {
             moves: 20,
             steps_per_move: 10,
             view_tiles: 2000,
+            workers: Workers::PhysicalCores,
         }
     }
 
@@ -345,6 +355,7 @@ impl Options {
             Flag::Moves => self.moves = positive(flag, text)?,
             Flag::StepsPerMove => self.steps_per_move = positive(flag, text)?,
             Flag::ViewTiles => self.view_tiles = positive(flag, text)?,
+            Flag::Workers => self.workers = parse(flag, text)?,
             Flag::Project | Flag::Force => {}
         }
         Ok(())
@@ -499,6 +510,21 @@ mod tests {
         let generate = parse("generate --force --splits 2").unwrap();
         assert!(generate.options.force, "a switch");
         assert_eq!(generate.options.splits, 2, "after a switch");
+        assert_eq!(
+            generate.options.workers,
+            Workers::PhysicalCores,
+            "one worker a physical core by default"
+        );
+        for (args, workers) in [
+            ("brush --workers logical", Workers::LogicalCores),
+            ("page-in --workers physical", Workers::PhysicalCores),
+            (
+                "generate --workers 3",
+                Workers::Fixed(std::num::NonZeroUsize::new(3).unwrap()),
+            ),
+        ] {
+            assert_eq!(parse(args).unwrap().options.workers, workers, "{args}");
+        }
     }
 
     #[test]
@@ -514,6 +540,8 @@ mod tests {
             ("brush --strength inf", "an infinite strength"),
             ("page-in --pool lukewarm", "an unknown pool state"),
             ("brush --pool warm", "a pool state for another subcommand"),
+            ("brush --workers 0", "no workers"),
+            ("brush --workers some", "an unknown worker setting"),
             ("generate --force=yes", "a value for a switch"),
             ("brush stray", "a stray argument"),
         ] {
