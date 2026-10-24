@@ -3059,6 +3059,110 @@ mod tests {
         OpId::new(0, seq).unwrap()
     }
 
+    /// The next number of a `SplitMix64` sequence at `state`, so failures replay.
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Writes `count` random records to `f`, tiles and bounds of a few dozen keys, each with the
+    /// stamp after `stamp`'s (which it moves on) or, with `at`, that stamp; returns their names.
+    fn random_writes(
+        f: &mut ProjectFile,
+        rng: &mut u64,
+        stamp: &mut Stamp,
+        at: Option<Stamp>,
+        count: u64,
+    ) -> Vec<Name> {
+        (0..count)
+            .map(|_| {
+                let r = next_random(rng);
+                let face = u32::try_from(r % 6).unwrap();
+                let tx = u16::try_from((r >> 8) % 8).unwrap();
+                let k = key(face, tx);
+                let write = at.unwrap_or_else(|| {
+                    *stamp = stamp.next();
+                    *stamp
+                });
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a small seed for a tile's values"
+                )]
+                let seed = ((r >> 16) % 1000) as f32 / 1000.0;
+                if (r >> 32).is_multiple_of(3) {
+                    let known = !(r >> 40).is_multiple_of(4);
+                    f.write_bounds(k, known.then(|| bound(seed)).as_ref(), write)
+                        .unwrap();
+                    Name::Bounds(k)
+                } else {
+                    f.write_displacement_stamped(k, op(r >> 48), write, &tile(seed))
+                        .unwrap();
+                    Name::Tile(k)
+                }
+            })
+            .collect()
+    }
+
+    /// Every save point derived through cuts and full Indexes is its chain read back, bit for
+    /// bit, and extends the one before.
+    ///
+    /// Rounds alternate at random between a plain save and a recovery flush's save point at a
+    /// cut: records written past the cut, then some written at it after them (the flush's own
+    /// copies), so the save point names the cut's state and the records past it wait. Every
+    /// full Index is written at a cut with records past it, so the derivation of a full Index
+    /// from the cut's delta is covered, not only the delta's.
+    #[test]
+    fn derived_save_points_are_their_chains_through_random_cuts_and_full_indexes() {
+        for seed in 1..=6_u64 {
+            let dir = TestDir::new();
+            let path = dir.path("p.bcrf");
+            let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
+            let mut rng = seed;
+            let mut stamp = Stamp::ZERO;
+            let mut previous: Option<BaseFile> = None;
+            let mut full_at_cut = 0;
+            for round in 0..50 {
+                let what = format!("seed {seed}, round {round}");
+                let before = 1 + next_random(&mut rng) % 6;
+                random_writes(&mut f, &mut rng, &mut stamp, None, before);
+                let full = f.last_index().is_none() || f.deltas + 1 >= FULL_EVERY;
+                if full || next_random(&mut rng).is_multiple_of(2) {
+                    let at = stamp;
+                    f.open_cut(at);
+                    let past = 1 + next_random(&mut rng) % 5;
+                    random_writes(&mut f, &mut rng, &mut stamp, None, past);
+                    let copies = next_random(&mut rng) % 4;
+                    random_writes(&mut f, &mut rng, &mut stamp, Some(at), copies);
+                    f.write_save_point().unwrap();
+                    full_at_cut += usize::from(full);
+                } else {
+                    f.save().unwrap();
+                }
+                let base = f.base().unwrap();
+                let rebuilt = f.base_at(base.save_point()).unwrap().unwrap();
+                assert!(base.same_state(&rebuilt), "{what}: the chain's state");
+                if let Some(previous) = &previous {
+                    assert!(base.extends(previous), "{what}: extends the one before");
+                }
+                previous = Some(base);
+            }
+            assert!(
+                full_at_cut >= 4,
+                "seed {seed}: {full_at_cut} full Indexes at a cut"
+            );
+            let last = previous.unwrap();
+            drop(f);
+            let reopened = ProjectFile::open(&path).unwrap();
+            assert!(
+                reopened.base().unwrap().same_state(&last),
+                "seed {seed}: reopened at the last save point"
+            );
+        }
+    }
+
     #[test]
     fn a_full_index_its_derived_maps_disagree_with_is_refused_before_it_is_written() {
         let dir = TestDir::new();
