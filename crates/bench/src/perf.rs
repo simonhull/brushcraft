@@ -322,13 +322,24 @@ fn table_line(entry: &Entry, baseline: Option<&Entry>, verdict: Verdict) -> Stri
         .join("  ")
 }
 
-/// The history file of `machine` in `dir`: `<dir>/<machine name>.jsonl`, the directory made if
-/// missing.
+/// The history file of `machine` in `dir`: `<dir>/<machine name>.jsonl`.
+///
+/// `dir` itself is made if missing (the first run on a new docs checkout), but never its
+/// parent: a mistyped `--history` or `BRUSHCRAFT_DOCS` should fail, not start a history
+/// nobody reads.
 ///
 /// # Errors
 ///
-/// If the directory can't be made.
+/// If `dir`'s parent doesn't exist, or `dir` can't be made.
 fn history_file(dir: &Path, machine: &Machine) -> Result<PathBuf> {
+    let parent = dir.parent().unwrap_or(dir);
+    ensure!(
+        parent.is_dir(),
+        "{} doesn't exist: check --history (scripts/perf.sh sets it from BRUSHCRAFT_DOCS, \
+         default ~/Code/brushcraft-docs)",
+        parent.display()
+    );
+    // The parent exists, so this makes at most `dir` itself.
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir.join(format!("{}.jsonl", machine.name)))
 }
@@ -651,6 +662,32 @@ mod tests {
             "noisy"
         );
         assert_eq!(status(0, 0, &mut out).unwrap(), Status::Clean, "clean");
+    }
+
+    /// The history directory is made only inside an existing parent.
+    #[test]
+    fn history_directories_need_their_parent() {
+        let machine = Machine::this().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("brushcraft-perf-docs-{}", std::process::id()));
+        let missing = root.join("typo").join("perf");
+        let err = history_file(&missing, &machine).unwrap_err();
+        assert!(err.to_string().contains("doesn't exist"), "{err}");
+        assert!(!missing.exists(), "nothing made");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join("perf");
+        let file = history_file(&dir, &machine).unwrap();
+        assert!(dir.is_dir(), "made inside an existing parent");
+        assert_eq!(
+            file,
+            dir.join(format!("{}.jsonl", machine.name)),
+            "named for the machine"
+        );
+        assert!(
+            history_file(&dir, &machine).is_ok(),
+            "again, once it exists"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
