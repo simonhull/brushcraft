@@ -291,15 +291,21 @@ pub(crate) fn read(path: &Path) -> Result<History> {
     Ok(History { entries, torn })
 }
 
-/// The latest baseline of each metric among `entries` (in file order) measured on hardware
-/// with `fingerprint`.
+/// The latest baseline of each metric among `entries` (in file order) measured as `run` is.
+///
+/// That is on hardware with the same fingerprint and with the same evaluation workers setting:
+/// a run at 32 workers says nothing about one at 16.
 pub(crate) fn baselines<'a>(
     entries: &'a [Entry],
-    fingerprint: &Fingerprint,
+    run: &RunInfo,
 ) -> BTreeMap<&'a MetricName, &'a Entry> {
     entries
         .iter()
-        .filter(|e| e.info.baseline && e.info.fingerprint == *fingerprint)
+        .filter(|e| {
+            e.info.baseline
+                && e.info.fingerprint == run.fingerprint
+                && e.info.workers == run.workers
+        })
         .map(|e| (&e.metric.name, e))
         .collect()
 }
@@ -556,7 +562,15 @@ pub(crate) mod tests {
         assert_eq!(history.torn, None, "whole lines");
         let all = history.entries;
         assert_eq!(all.len(), 6, "both appends");
-        let base = baselines(&all, &"cpu".parse().unwrap());
+        let this = entry(
+            "medium.brush.p99_ms",
+            2.0,
+            "2026-10-24T00:00:09Z",
+            false,
+            "cpu",
+        )
+        .info;
+        let base = baselines(&all, &this);
         let p99: MetricName = "medium.brush.p99_ms".parse().unwrap();
         let p50: MetricName = "medium.brush.p50_ms".parse().unwrap();
         assert_eq!(
@@ -569,10 +583,6 @@ pub(crate) mod tests {
             Some("2026-10-24T00:00:01Z"),
             "per metric"
         );
-        assert!(
-            baselines(&all, &"new cpu".parse().unwrap()).is_empty(),
-            "other hardware has none"
-        );
 
         std::fs::write(&path, "\n{\"bench\":\"perf\"}\n").unwrap();
         let err = read(&path).unwrap_err();
@@ -581,6 +591,40 @@ pub(crate) mod tests {
             "the line is named: {err:#}"
         );
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A baseline counts only for runs on the same hardware with the same workers setting.
+    #[test]
+    fn baselines_match_hardware_and_workers() {
+        let all = [entry(
+            "medium.brush.p99_ms",
+            2.0,
+            "2026-10-24T00:00:01Z",
+            true,
+            "cpu",
+        )];
+        let this = entry(
+            "medium.brush.p99_ms",
+            2.0,
+            "2026-10-24T00:00:09Z",
+            false,
+            "cpu",
+        )
+        .info;
+        assert_eq!(baselines(&all, &this).len(), 1, "the same setting");
+        let elsewhere = entry("x", 1.0, "2026-10-24T00:00:09Z", false, "new cpu").info;
+        assert!(
+            baselines(&all, &elsewhere).is_empty(),
+            "other hardware has none"
+        );
+        let logical = RunInfo {
+            workers: Workers::LogicalCores,
+            ..this
+        };
+        assert!(
+            baselines(&all, &logical).is_empty(),
+            "another workers setting has none"
+        );
     }
 
     /// A last line cut short is left out with a warning, and the next append drops it; a

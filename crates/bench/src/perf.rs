@@ -365,7 +365,7 @@ fn report<J: Write, H: Write>(
 ) -> Result<(usize, usize)> {
     let baselines = entries
         .first()
-        .map(|e| history::baselines(past, &e.info.fingerprint))
+        .map(|e| history::baselines(past, &e.info))
         .unwrap_or_default();
     out.say(&format!(
         "\nperf: {} metrics, run labelled {label}",
