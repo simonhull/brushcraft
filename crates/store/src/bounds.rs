@@ -55,6 +55,7 @@ use geom::{
 };
 
 use crate::bytes::{KEY_LEN, Reader, put_key};
+use crate::deps::DepGraph;
 use crate::index::TileBounds;
 
 /// The state byte of a stored bound whose tile's bounds are unknown: the tile is evaluated when
@@ -166,6 +167,11 @@ fn children(key: &TileKey, level: Level) -> impl Iterator<Item = TileKey> {
 /// level. Every tile whose normals might read a moved one is taken, unfiltered: the set the draw
 /// brush refits.
 ///
+/// A tile's neighbours are read from `deps` where it recorded them (a tile whose normals were
+/// computed lists exactly [`normal_tiles`] as their inputs, see [`DepGraph::normal_inputs`]),
+/// and listed from the mesh otherwise: listing them is the costly part, and the tiles a brush
+/// writes have all had their normals computed.
+///
 /// Writes of other layers or channels, and of levels finer than every tracked one, change nothing
 /// the index holds.
 ///
@@ -174,6 +180,7 @@ fn children(key: &TileKey, level: Level) -> impl Iterator<Item = TileKey> {
 /// [`EvalError`] from listing a tile's neighbours or parents: never for tiles of `mesh`.
 pub(crate) fn readers(
     mesh: &BaseMesh,
+    deps: &DepGraph,
     edited: &BTreeSet<TileKey>,
     levels: &BTreeSet<Level>,
 ) -> Result<BTreeSet<TileKey>, EvalError> {
@@ -195,7 +202,10 @@ pub(crate) fn readers(
         moved.extend(by_level.remove(&level).unwrap_or_default());
         let mut around = BTreeSet::new();
         for key in &moved {
-            around.extend(normal_tiles(mesh, Region::of_tile(key))?);
+            match deps.normal_inputs(key) {
+                Some(recorded) => around.extend(recorded.iter().copied()),
+                None => around.extend(normal_tiles(mesh, Region::of_tile(key))?),
+            }
         }
         if levels.contains(&level) {
             answer.extend(moved.iter().copied());
@@ -267,16 +277,16 @@ impl Book {
     }
 
     /// Makes unknown every bound the writes noted since the last call can change (see
-    /// [`readers`]).
+    /// [`readers`], which reads neighbours `deps` recorded).
     ///
     /// # Errors
     ///
     /// As [`readers`]; the writes stay noted then.
-    pub(crate) fn settle(&mut self, mesh: &BaseMesh) -> Result<(), EvalError> {
+    pub(crate) fn settle(&mut self, mesh: &BaseMesh, deps: &DepGraph) -> Result<(), EvalError> {
         if self.edited.is_empty() {
             return Ok(());
         }
-        let stale = readers(mesh, &self.edited, &self.levels)?;
+        let stale = readers(mesh, deps, &self.edited, &self.levels)?;
         self.edited.clear();
         for key in stale {
             self.set(key, None);
@@ -294,10 +304,13 @@ impl Book {
     pub(crate) fn forget(
         &mut self,
         mesh: &BaseMesh,
+        deps: &DepGraph,
         lost: impl IntoIterator<Item = TileKey>,
     ) -> Result<Vec<TileKey>, EvalError> {
         let lost: BTreeSet<TileKey> = lost.into_iter().collect();
-        let stale: Vec<TileKey> = readers(mesh, &lost, &self.levels)?.into_iter().collect();
+        let stale: Vec<TileKey> = readers(mesh, deps, &lost, &self.levels)?
+            .into_iter()
+            .collect();
         for &key in &stale {
             self.set(key, None);
         }

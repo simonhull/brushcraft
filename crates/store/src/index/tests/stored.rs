@@ -103,7 +103,13 @@ fn edits_saved_and_reopened_still_load_as_built() {
         .take(2)
         .collect();
     let edited: BTreeSet<TileKey> = edits.iter().flat_map(|e| e.keys(&mesh)).collect();
-    let stale = readers(&mesh, &edited, &BTreeSet::from([top()])).unwrap();
+    let stale = readers(
+        &mesh,
+        &crate::deps::DepGraph::new(),
+        &edited,
+        &BTreeSet::from([top()]),
+    )
+    .unwrap();
     {
         let mut store = open(&path, false, 2);
         apply(&mut store, &mut CorrectionMap::new(), &edits);

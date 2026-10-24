@@ -15,7 +15,8 @@
 //! 5. **Neighbours**: the tiles whose bounds may have changed are listed. That is every tile
 //!    holding a vertex within the radius, whose positions moved, and every tile whose normals read
 //!    one of those, whose normal cones may have turned: the tiles each reached tile's normals read,
-//!    gathered from the base mesh's topology.
+//!    as the store recorded them when it last computed those normals
+//!    ([`TileStore::normal_inputs`]).
 //! 6. **Evaluate**: those tiles are evaluated again, positions and normals, together through
 //!    [`TileStore::evaluate_many`], which builds them in parallel. A neighbour whose own positions
 //!    didn't move keeps its normals, stale, and only the border vertices that read a moved vertex
@@ -41,7 +42,7 @@ use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
 use brush::Smoothstep;
-use geom::{EvalError, Region, TileKey, Vec3, normal_tiles};
+use geom::{TileKey, Vec3};
 use store::{CacheError, Evaluation, IndexError, Project, SpatialIndex, TileStore};
 use thiserror::Error;
 
@@ -129,9 +130,6 @@ pub enum SculptError {
     /// The spatial index couldn't be brought up to date.
     #[error("updating the spatial index failed")]
     Index(#[from] IndexError),
-    /// Listing the tiles whose normals read an edited tile failed (not for a valid mesh).
-    #[error("listing the tiles an edit reaches failed")]
-    Eval(#[from] EvalError),
 }
 
 /// How long each phase of a [`draw_step`] took (see the module notes for the phases).
@@ -253,7 +251,7 @@ impl Laps {
 ///
 /// [`SculptError::Cache`] if the store can't pin the tiles the brush touches (more than its
 /// budget holds, for one), evaluate them or edit them; [`SculptError::Index`] if the index
-/// can't be updated; [`SculptError::Eval`] never, for a valid mesh. An error in the edit phase
+/// can't be updated. An error in the edit phase
 /// leaves the tiles edited as [`TileStore::update_tiles`] says (the failing tile may have its
 /// whole interior pass applied, and is then marked dirty), and the index not updated for them:
 /// rebuild it.
@@ -279,7 +277,7 @@ pub fn draw_step(
     store.update_tiles(&edited, |n, i, j, c| add_delta(&found.edits, n, i, j, c))?;
     times.edit = laps.lap();
 
-    let changed = bounds_changed(store.mesh(), &found.reached)?;
+    let changed = bounds_changed(store, &found.reached)?;
     times.neighbours = laps.lap();
 
     store.evaluate_many(&changed, Evaluation::Normals)?;
@@ -417,17 +415,17 @@ fn add_delta(edits: &[TileDeltas], n: usize, i: u32, j: u32, c: Vec3) -> Option<
 /// That is each of them (their positions move), and every tile whose normals read one of them
 /// (their normal cones may turn).
 ///
-/// The tiles a tile's normals read ([`normal_tiles`]: the tile, its apron and the rings at its
-/// corners) are its neighbours, and neighbourhood goes both ways, so the tiles reading a
-/// reached tile are among the tiles it reads.
+/// The tiles a tile's normals read ([`TileStore::normal_inputs`]: the tile, its apron and the
+/// rings at its corners) are its neighbours, and neighbourhood goes both ways, so the tiles
+/// reading a reached tile are among the tiles it reads.
 ///
 /// # Errors
 ///
-/// As [`normal_tiles`].
-fn bounds_changed(mesh: &geom::BaseMesh, reached: &[TileKey]) -> Result<Vec<TileKey>, EvalError> {
+/// As [`TileStore::normal_inputs`].
+fn bounds_changed(store: &TileStore, reached: &[TileKey]) -> Result<Vec<TileKey>, CacheError> {
     let mut changed = BTreeSet::new();
     for key in reached {
-        changed.extend(normal_tiles(mesh, Region::of_tile(key))?);
+        changed.extend(store.normal_inputs(key)?.iter().copied());
     }
     Ok(changed.into_iter().collect())
 }

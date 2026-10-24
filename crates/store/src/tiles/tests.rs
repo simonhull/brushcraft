@@ -2356,6 +2356,50 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
     }
 }
 
+/// The normal inputs the store reads back from its records are those the mesh lists.
+///
+/// [`TileStore::normal_inputs`] and the bounds book's [`crate::bounds::readers`] read a tile's
+/// neighbours from the dependency graph where it recorded them: after a brush's rounds, every
+/// tile's list (recorded or listed) is the tile and [`normal_tiles`], and the readers of random
+/// edits found through the graph are those found by listing.
+#[test]
+fn recorded_normal_inputs_are_the_listed_ones() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (keys, around) = brushed_tiles(&mesh);
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    brush_rounds(&mut store, &keys, &around, true);
+    let finest = tiles(&mesh, TOP, TOP);
+    let mut recorded = 0;
+    for key in &finest {
+        let mut want = normal_tiles(&mesh, Region::of_tile(key)).unwrap();
+        want.insert(*key);
+        let want: Vec<TileKey> = want.into_iter().collect();
+        assert_eq!(*store.normal_inputs(key).unwrap(), *want, "{key:?}");
+        if let Some(list) = store.deps.normal_inputs(key) {
+            assert_eq!(list, want.as_slice(), "{key:?}: recorded");
+            recorded += 1;
+        }
+    }
+    assert!(
+        recorded >= around.len(),
+        "the brushed tiles' lists were recorded"
+    );
+    let levels = BTreeSet::from([level(TOP)]);
+    let empty = DepGraph::new();
+    let mut rng = Rng(7);
+    for _ in 0..20 {
+        let edited: BTreeSet<TileKey> = (0..3)
+            .map(|_| finest[usize::try_from(rng.below(48)).unwrap()])
+            .collect();
+        assert_eq!(
+            crate::bounds::readers(&mesh, &store.deps, &edited, &levels).unwrap(),
+            crate::bounds::readers(&mesh, &empty, &edited, &levels).unwrap(),
+            "{edited:?}"
+        );
+    }
+}
+
 /// Predicting a pinned tile straight into its slot gives the same bits as through scratch.
 ///
 /// A tile that isn't pinned loses its slot to an edit, so it is predicted into scratch and

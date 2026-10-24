@@ -107,6 +107,7 @@
 //! An edit pins correction slots only, at most one cone width of them, which the minimum's
 //! correction chunks hold once every evaluated chunk is taken back.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
@@ -1532,8 +1533,9 @@ impl TileStore {
             return Err(Invariant::NotInSave(*missing).into());
         }
         // The bounds of the state the save point names: the lost tiles' edits aren't in it.
-        self.bounds.settle(&self.mesh)?;
-        self.bounds.forget(&self.mesh, lost.iter().copied())?;
+        self.bounds.settle(&self.mesh, &self.deps)?;
+        self.bounds
+            .forget(&self.mesh, &self.deps, lost.iter().copied())?;
         project
             .write_bounds_many(
                 self.bounds.all_changed().map(|(key, kept)| (*key, kept)),
@@ -1717,8 +1719,9 @@ impl TileStore {
                 cleaned.push((key, id));
             }
         }
-        self.bounds.settle(&self.mesh)?;
-        self.bounds.forget(&self.mesh, lost.iter().copied())?;
+        self.bounds.settle(&self.mesh, &self.deps)?;
+        self.bounds
+            .forget(&self.mesh, &self.deps, lost.iter().copied())?;
         let carried: BTreeSet<TileKey> =
             self.file.bounds_locations().map(|(key, _)| *key).collect();
         for &key in &carried {
@@ -2211,6 +2214,28 @@ impl TileStore {
         prefix(&self.evaluated.get(id)?.normals, vertex_count(key)).ok()
     }
 
+    /// The tiles `key`'s normals are computed from, the tile itself included, in key order: the
+    /// tile, its apron and the rings at its corners, as [`normal_tiles`] lists them for
+    /// [`Region::of_tile`]. The list is structural, so it is read back from what the store
+    /// recorded when it last computed the tile's normals, and listed from the mesh only for a
+    /// tile it hasn't.
+    ///
+    /// Neighbourhood is symmetric, so these are also the tiles whose normals read `key`'s
+    /// positions.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::NotATile`]; [`CacheError::Eval`] (not for a valid key).
+    pub fn normal_inputs(&self, key: &TileKey) -> Result<Cow<'_, [TileKey]>, CacheError> {
+        self.check_key(key)?;
+        if let Some(recorded) = self.deps.normal_inputs(key) {
+            return Ok(Cow::Borrowed(recorded));
+        }
+        Ok(Cow::Owned(
+            list_normal_inputs(&self.mesh, key)?.into_iter().collect(),
+        ))
+    }
+
     /// `key`'s evaluated slot if its positions are current, found without counting as a use.
     fn fresh_slot(&self, key: &TileKey) -> Option<SlotId<EvaluatedSlot>> {
         (self.evaluated.freshness(key)? == Freshness::Fresh)
@@ -2602,7 +2627,7 @@ impl TileStore {
         &mut self,
         bounds: &[(TileKey, TileBounds)],
     ) -> Result<(), CacheError> {
-        self.bounds.settle(&self.mesh)?;
+        self.bounds.settle(&self.mesh, &self.deps)?;
         for &(key, tile) in bounds {
             self.bounds.record(key, tile);
         }
@@ -2624,7 +2649,7 @@ impl TileStore {
         &mut self,
         keys: &[TileKey],
     ) -> Result<Vec<Option<TileBounds>>, CacheError> {
-        self.bounds.settle(&self.mesh)?;
+        self.bounds.settle(&self.mesh, &self.deps)?;
         let mut found = vec![None; keys.len()];
         let (mut working, mut base) = (Vec::new(), Vec::new());
         for (n, key) in keys.iter().enumerate() {
@@ -2675,8 +2700,9 @@ impl TileStore {
     /// append fails: the bounds are kept for the next flush.
     pub(crate) fn flush_bounds(&mut self, lost: &[TileKey]) -> Result<(), CacheError> {
         self.lose_left_out(lost)?;
-        self.bounds.settle(&self.mesh)?;
-        self.bounds.forget(&self.mesh, lost.iter().copied())?;
+        self.bounds.settle(&self.mesh, &self.deps)?;
+        self.bounds
+            .forget(&self.mesh, &self.deps, lost.iter().copied())?;
         self.write_unflushed_bounds()
     }
 
@@ -2780,7 +2806,7 @@ impl TileStore {
     /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if
     /// the append fails: the bounds stay unflushed.
     fn write_unflushed_bounds(&mut self) -> Result<(), CacheError> {
-        self.bounds.settle(&self.mesh)?;
+        self.bounds.settle(&self.mesh, &self.deps)?;
         let unflushed: Vec<TileKey> = self.bounds.unflushed().map(|(key, _)| *key).collect();
         self.file
             .write_bounds_many(
@@ -2802,7 +2828,7 @@ impl TileStore {
     /// [`CacheError::Eval`] as for [`TileStore::record_bounds`]; [`CacheError::WriteBack`] if
     /// the append fails: the bounds stay as they were.
     fn write_unsaved_bounds(&mut self) -> Result<(), CacheError> {
-        self.bounds.settle(&self.mesh)?;
+        self.bounds.settle(&self.mesh, &self.deps)?;
         let unsaved: Vec<TileKey> = self.bounds.unsaved().map(|(key, _)| *key).collect();
         self.file
             .write_bounds_many(
@@ -2861,7 +2887,9 @@ impl TileStore {
         if left_out.is_empty() {
             return Ok(());
         }
-        let stale = self.bounds.forget(&self.mesh, left_out.iter().copied())?;
+        let stale = self
+            .bounds
+            .forget(&self.mesh, &self.deps, left_out.iter().copied())?;
         let at = self.file.cut_at().unwrap_or(self.last_write);
         self.file
             .write_bounds_many(stale.iter().map(|&key| (key, None)), at)

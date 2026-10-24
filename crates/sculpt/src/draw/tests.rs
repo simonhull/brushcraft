@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use geom::{
     BaseMesh, Channel, CorrectionMap, DenseEvaluation, FaceId, LayerId, Level, PositionSource,
-    cube_sphere, normals,
+    Region, cube_sphere, normals,
 };
 use store::{ProjectConfig, StoreConfig};
 

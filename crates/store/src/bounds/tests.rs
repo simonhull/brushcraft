@@ -164,7 +164,7 @@ fn readers_hold_every_bound_a_write_changes() {
         let levels = BTreeSet::from([level(8)]);
         for (n, key) in all.iter().enumerate().step_by(7) {
             let edited = BTreeSet::from([*key, all[(n * 31 + 5) % all.len()]]);
-            let got = readers(&mesh, &edited, &levels).unwrap();
+            let got = readers(&mesh, &DepGraph::new(), &edited, &levels).unwrap();
             let want = brute_readers(&mesh, &edited, 8);
             assert!(
                 want.is_subset(&got),
@@ -184,16 +184,21 @@ fn a_finest_write_reaches_its_neighbourhood_and_nothing_else_does() {
     let mesh = mesh();
     let s = tiles(&mesh, 8, 8)[9];
     let levels = BTreeSet::from([level(8)]);
-    let got = readers(&mesh, &BTreeSet::from([s]), &levels).unwrap();
+    let got = readers(&mesh, &DepGraph::new(), &BTreeSet::from([s]), &levels).unwrap();
     let mut want = normal_tiles(&mesh, Region::of_tile(&s)).unwrap();
     want.insert(s);
     assert_eq!(got, want, "the tile and its neighbours");
     let finer = tiles(&mesh, 8, 8)[0];
     let coarse_only = BTreeSet::from([level(7)]);
     assert!(
-        readers(&mesh, &BTreeSet::from([finer]), &coarse_only)
-            .unwrap()
-            .is_empty(),
+        readers(
+            &mesh,
+            &DepGraph::new(),
+            &BTreeSet::from([finer]),
+            &coarse_only
+        )
+        .unwrap()
+        .is_empty(),
         "a finer write changes no coarser bound"
     );
     let other = TileKey::new(
@@ -206,15 +211,20 @@ fn a_finest_write_reaches_its_neighbourhood_and_nothing_else_does() {
     )
     .unwrap();
     assert!(
-        readers(&mesh, &BTreeSet::from([other]), &levels)
+        readers(&mesh, &DepGraph::new(), &BTreeSet::from([other]), &levels)
             .unwrap()
             .is_empty(),
         "another layer changes nothing evaluated"
     );
     assert!(
-        readers(&mesh, &BTreeSet::from([s]), &BTreeSet::new())
-            .unwrap()
-            .is_empty(),
+        readers(
+            &mesh,
+            &DepGraph::new(),
+            &BTreeSet::from([s]),
+            &BTreeSet::new()
+        )
+        .unwrap()
+        .is_empty(),
         "nothing tracked"
     );
 }
@@ -235,9 +245,10 @@ fn the_book_makes_unknown_what_a_write_changes() {
     let changes = book.changes();
     book.note_write(all[9]);
     assert!(book.has_unsettled(), "noted");
-    book.settle(&mesh).unwrap();
+    book.settle(&mesh, &DepGraph::new()).unwrap();
     let stale = readers(
         &mesh,
+        &DepGraph::new(),
         &BTreeSet::from([all[9]]),
         &BTreeSet::from([level(8)]),
     )
@@ -257,7 +268,7 @@ fn the_book_makes_unknown_what_a_write_changes() {
     let unflushed: BTreeSet<TileKey> = book.unflushed().map(|(key, _)| *key).collect();
     assert_eq!(unflushed, stale, "the unknown ones are to flush");
     assert!(book.changes() > changes, "counted");
-    let forgotten = book.forget(&mesh, [all[20]]).unwrap();
+    let forgotten = book.forget(&mesh, &DepGraph::new(), [all[20]]).unwrap();
     assert!(forgotten.contains(&all[20]), "a lost tile's own bound");
     assert_eq!(book.changed(&all[20]), Some(Kept::Unknown), "unknown");
     book.rebased();
