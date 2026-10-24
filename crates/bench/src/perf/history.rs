@@ -245,25 +245,48 @@ impl Entry {
     }
 }
 
+/// A history file as read: its entries, and the torn last line left out, if there was one.
+#[derive(Debug, Default)]
+pub(crate) struct History {
+    /// Every whole line's entry, in file order.
+    pub(crate) entries: Vec<Entry>,
+    /// The number of a last line without its newline, left out: a write cut short (the run
+    /// killed mid-append, the disk full). [`append`] drops it before writing.
+    pub(crate) torn: Option<usize>,
+}
+
 /// Reads every entry of the history file `path`; none if it doesn't exist yet.
+///
+/// A last line without its newline is a write cut short, not a record: it is left out and
+/// reported in [`History::torn`], so one interrupted run can't block every later one.
 ///
 /// # Errors
 ///
-/// If it can't be read, or a line (blank ones aside) isn't an entry: history is never silently
-/// skipped, since a dropped baseline would turn every comparison into "new".
-pub(crate) fn read(path: &Path) -> Result<Vec<Entry>> {
+/// If it can't be read, or a whole line (blank ones aside) isn't an entry: history is never
+/// silently skipped, since a dropped baseline would turn every comparison into "new".
+pub(crate) fn read(path: &Path) -> Result<History> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(History::default()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    text.lines()
+    let (whole, torn) = match text.rfind('\n') {
+        _ if text.is_empty() || text.ends_with('\n') => (text.as_str(), None),
+        Some(end) => (
+            text.get(..=end).unwrap_or_default(),
+            Some(text.lines().count()),
+        ),
+        None => ("", Some(1)),
+    };
+    let entries = whole
+        .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
         .map(|(n, line)| {
             Entry::parse(line).with_context(|| format!("{}, line {}", path.display(), n + 1))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok(History { entries, torn })
 }
 
 /// The latest baseline of each metric among `entries` (in file order) measured on hardware
@@ -281,23 +304,41 @@ pub(crate) fn baselines<'a>(
 
 /// Appends `entries` to the history file `path`, created if missing, in one write.
 ///
+/// Returns how many bytes of a torn last line (one without its newline, see
+/// [`History::torn`]) it dropped first, so the new records start on a line of their own.
+///
 /// # Errors
 ///
-/// If the file can't be opened, written or synced.
-pub(crate) fn append(path: &Path, entries: &[Entry]) -> Result<()> {
+/// If the file can't be opened, read, cut, written or synced.
+pub(crate) fn append(path: &Path, entries: &[Entry]) -> Result<u64> {
     let text: String = entries
         .iter()
         .map(|e| e.to_record().to_json() + "\n")
         .collect();
+    let old = match std::fs::read(path) {
+        Ok(old) => old,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
+    let whole = old
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let dropped = u64::try_from(old.len() - whole)?;
+    if dropped > 0 {
+        file.set_len(u64::try_from(whole)?)
+            .with_context(|| format!("dropping {}'s torn last line", path.display()))?;
+    }
     file.write_all(text.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
     file.sync_all()
-        .with_context(|| format!("syncing {}", path.display()))
+        .with_context(|| format!("syncing {}", path.display()))?;
+    Ok(dropped)
 }
 
 #[cfg(test)]
@@ -451,12 +492,15 @@ pub(crate) mod tests {
             std::process::id()
         ));
         drop(std::fs::remove_file(&path));
-        assert!(read(&path).unwrap().is_empty(), "no file yet: no history");
+        assert!(
+            read(&path).unwrap().entries.is_empty(),
+            "no file yet: no history"
+        );
         let first = [
             entry("medium.brush.p99_ms", 2.0, "r1", true, "cpu"),
             entry("medium.brush.p50_ms", 1.5, "r1", true, "cpu"),
         ];
-        append(&path, &first).unwrap();
+        assert_eq!(append(&path, &first).unwrap(), 0, "nothing torn");
         let second = [
             entry("medium.brush.p99_ms", 2.2, "r2", false, "cpu"),
             entry("medium.brush.p99_ms", 9.9, "r3", true, "other cpu"),
@@ -464,7 +508,9 @@ pub(crate) mod tests {
             entry("medium.brush.p99_ms", 2.4, "r5", false, "cpu"),
         ];
         append(&path, &second).unwrap();
-        let all = read(&path).unwrap();
+        let history = read(&path).unwrap();
+        assert_eq!(history.torn, None, "whole lines");
+        let all = history.entries;
         assert_eq!(all.len(), 6, "both appends");
         let base = baselines(&all, "cpu");
         let p99: MetricName = "medium.brush.p99_ms".parse().unwrap();
@@ -490,6 +536,31 @@ pub(crate) mod tests {
             format!("{err:#}").contains("line 2"),
             "the line is named: {err:#}"
         );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A last line cut short is left out with a warning, and the next append drops it; a
+    /// malformed whole line is still refused.
+    #[test]
+    fn a_torn_last_line_is_left_out_and_dropped() {
+        let path =
+            std::env::temp_dir().join(format!("brushcraft-perf-torn-{}.jsonl", std::process::id()));
+        let whole = entry("medium.brush.p99_ms", 2.0, "r1", true, "cpu")
+            .to_record()
+            .to_json();
+        std::fs::write(&path, format!("{whole}\n{}", &whole[..40])).unwrap();
+        let history = read(&path).unwrap();
+        assert_eq!(history.entries.len(), 1, "the whole line");
+        assert_eq!(history.torn, Some(2), "line 2 is torn");
+        let next = [entry("medium.brush.p99_ms", 2.1, "r2", false, "cpu")];
+        assert_eq!(append(&path, &next).unwrap(), 40, "the torn bytes dropped");
+        let after = read(&path).unwrap();
+        assert_eq!(after.torn, None, "nothing torn now");
+        assert_eq!(after.entries.len(), 2, "the old line and the new one");
+        std::fs::write(&path, &whole[..40]).unwrap();
+        assert_eq!(read(&path).unwrap().torn, Some(1), "a torn only line");
+        std::fs::write(&path, format!("{}\n{whole}\n", &whole[..40])).unwrap();
+        assert!(read(&path).is_err(), "a malformed interior line is refused");
         std::fs::remove_file(&path).unwrap();
     }
 }

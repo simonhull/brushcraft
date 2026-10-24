@@ -299,6 +299,23 @@ fn history_file(dir: &Path, machine: &Machine) -> Result<PathBuf> {
     Ok(dir.join(format!("{}.jsonl", machine.name)))
 }
 
+/// The entries of the history file `file`, warning on `out` about a torn last line.
+///
+/// # Errors
+///
+/// As [`history::read`], or if writing fails.
+fn read_history<J: Write, H: Write>(file: &Path, out: &mut Output<J, H>) -> Result<Vec<Entry>> {
+    let history = history::read(file)?;
+    if let Some(line) = history.torn {
+        out.say(&format!(
+            "perf: warning: {} line {line} has no newline, a write cut short: left out, and \
+             dropped when this run appends",
+            file.display()
+        ))?;
+    }
+    Ok(history.entries)
+}
+
 /// Prints each of `entries` as a JSON line and a line of the comparison table, judged against
 /// the latest baselines in `past` on the same hardware; returns how many got worse and how many
 /// were inconclusive.
@@ -363,7 +380,7 @@ pub(crate) fn run<J: Write, H: Write>(
         .map(|dir| history_file(dir, &machine))
         .transpose()?;
     let past = match &history_file {
-        Some(file) => history::read(file)?,
+        Some(file) => read_history(file, out)?,
         None => Vec::new(),
     };
     out.say(&format!(
@@ -424,7 +441,13 @@ pub(crate) fn run<J: Write, H: Write>(
         .collect();
     let (flagged, noisy) = report(&entries, &past, label, out)?;
     if let Some(file) = &history_file {
-        history::append(file, &entries)?;
+        let dropped = history::append(file, &entries)?;
+        if dropped > 0 {
+            out.say(&format!(
+                "perf: dropped {dropped} bytes of a torn last line from {}",
+                file.display()
+            ))?;
+        }
         out.say(&format!(
             "perf: appended {} records to {}{}",
             entries.len(),
