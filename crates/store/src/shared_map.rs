@@ -33,7 +33,10 @@ type Runs<K, V> = Arc<[Arc<[(K, V)]>]>;
 /// lookup searches the list of runs by their last keys, then the run. Making a version with
 /// `n` entries put in costs, besides those entries, a copy of each run they land in and of the
 /// list of runs (one pointer a run). Entries are only ever put in, never taken out, which is
-/// all a save point needs: a save never removes a record from the state it names.
+/// all a save point needs: a save never removes a record from the state it names. The format
+/// allows it (an Index entry of zero length removes its record, and loading a chain applies
+/// such removals), but this crate's writer never emits one: an Index names only records
+/// written, so a save point's maps only grow.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedMap<K, V> {
     /// The runs, in key order: each sorted by key, non-empty, its keys below the next run's.
