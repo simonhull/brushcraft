@@ -209,8 +209,10 @@ pub(crate) fn cached_file(dir: &Path, key: &str) -> PathBuf {
     dir.join(format!("medium-{key}.bcrf"))
 }
 
-/// Removes every cached medium project in `dir` but `keep`, with its recovery directory if it
-/// has one. Only files named `medium-*.bcrf` are touched.
+/// Removes every cached medium project in `dir` but `keep`.
+///
+/// Only files named `medium-*.bcrf` are touched. A cached project never has a recovery
+/// directory of its own: every run opens a copy of it in a work directory.
 ///
 /// # Errors
 ///

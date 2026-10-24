@@ -469,6 +469,12 @@ pub(crate) fn fit_line(points: &[(f64, f64)]) -> Option<(f64, f64)> {
 /// Index (every 16th save point, ~25 ms more on the full project): the median of the rounds
 /// leaves it out, as the save cost model's fits did.
 ///
+/// `save.fixed_ms` is an extrapolated intercept: the save time the fit gives at no edited
+/// vertex, which no save measured. It means something only where the strokes edit enough
+/// vertices for the slope to be measured (medium and full: ~50k to ~500k a save); the tiny
+/// project's two short strokes give a line through two noisy points, whose intercept and slope
+/// (even a negative one) mean nothing, and are never recorded.
+///
 /// # Errors
 ///
 /// If a save fails, misses a result, or a round's saves edit the same count of vertices (no

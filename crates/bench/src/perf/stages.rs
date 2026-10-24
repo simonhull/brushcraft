@@ -36,7 +36,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<StageTime>> {
     let mut stage: Option<String> = None;
     let mut times = Vec::new();
     for line in text.lines() {
-        // A row is the tree's lead (`│  ` or three spaces per level above), a branch (`├─` or
+        // A row is the tree's lead (`│  ` or three spaces per depth above), a branch (`├─` or
         // `╰─`), then the columns, split by the same `│` the lead may hold.
         let Some((lead, row)) = line.split_once(['├', '╰']) else {
             continue;
