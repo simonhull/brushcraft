@@ -50,9 +50,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{
-    BaseMesh, Channel, EvalError, LayerId, Level, Region, TileKey, normal_tiles, parent_tiles,
-};
+use geom::{BaseMesh, Channel, EvalError, LayerId, Level, Region, TileKey, parent_tiles};
 
 use crate::bytes::{KEY_LEN, Reader, put_key};
 use crate::deps::DepGraph;
@@ -154,11 +152,11 @@ fn children(key: &TileKey, level: Level) -> impl Iterator<Item = TileKey> {
 /// can change.
 ///
 /// A tile's positions are predicted from the positions of its [`parent_tiles`] and changed by its
-/// own corrections; its normals are computed from the positions of its [`normal_tiles`]. So the
-/// walk goes from the coarsest edited level down to the finest tracked one: at each level, the
-/// tiles whose positions move are the edited ones and every tile predicted from a tile that
-/// moved at the level above, and at a tracked level, those tiles and every tile whose normals
-/// read one of them are the answer.
+/// own corrections; its normals are computed from the positions of its
+/// [`normal_tiles`](geom::normal_tiles). So the walk goes from the coarsest edited level down to
+/// the finest tracked one: at each level, the tiles whose positions move are the edited ones and
+/// every tile predicted from a tile that moved at the level above, and at a tracked level, those
+/// tiles and every tile whose normals read one of them are the answer.
 ///
 /// The readers of a tile are found among its neighbours, as the neighbourhood is symmetric: a
 /// tile whose normals read `s` is among `normal_tiles(s)`, and a tile predicted from `s` subdivides
@@ -167,10 +165,11 @@ fn children(key: &TileKey, level: Level) -> impl Iterator<Item = TileKey> {
 /// level. Every tile whose normals might read a moved one is taken, unfiltered: the set the draw
 /// brush refits.
 ///
-/// A tile's neighbours are read from `deps` where it recorded them (a tile whose normals were
-/// computed lists exactly [`normal_tiles`] as their inputs, see [`DepGraph::normal_inputs`]),
-/// and listed from the mesh otherwise: listing them is the costly part, and the tiles a brush
-/// writes have all had their normals computed.
+/// A tile's neighbours are its normal inputs as the store itself finds them
+/// ([`DepGraph::normal_inputs_or_list`]): read from `deps` where it recorded them (a tile whose
+/// normals were computed lists exactly [`normal_tiles`](geom::normal_tiles) as their inputs), and
+/// listed from the mesh otherwise. Listing them is the costly part, and the tiles a brush writes
+/// have all had their normals computed.
 ///
 /// Writes of other layers or channels, and of levels finer than every tracked one, change nothing
 /// the index holds.
@@ -202,10 +201,7 @@ pub(crate) fn readers(
         moved.extend(by_level.remove(&level).unwrap_or_default());
         let mut around = BTreeSet::new();
         for key in &moved {
-            match deps.normal_inputs(key) {
-                Some(recorded) => around.extend(recorded.iter().copied()),
-                None => around.extend(normal_tiles(mesh, Region::of_tile(key))?),
-            }
+            around.extend(deps.normal_inputs_or_list(mesh, key)?.iter().copied());
         }
         if levels.contains(&level) {
             answer.extend(moved.iter().copied());

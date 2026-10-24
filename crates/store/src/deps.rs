@@ -40,9 +40,10 @@
 //! and every edit at a coarser level is taken to reach it (see [`DepGraph::cascade`]), so the
 //! graph over-invalidates rather than lose an edge.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use geom::{Level, TileKey};
+use geom::{BaseMesh, EvalError, Level, Region, TileKey, normal_tiles};
 
 /// Whether a tile of `level` is predicted from other tiles: above level 1 (level-1 tiles are
 /// predicted from the base mesh).
@@ -252,6 +253,31 @@ impl DepGraph {
         self.nodes.get(key)?.normal_inputs.as_deref()
     }
 
+    /// The tiles `key`'s normals are computed from, the tile itself included, in key order: as
+    /// this graph recorded them ([`DepGraph::normal_inputs`]), else listed from `mesh`
+    /// ([`list_normal_inputs`]).
+    ///
+    /// This is the one rule for a tile's normal inputs. [`crate::TileStore::normal_inputs`]
+    /// answers with it, and the walk that finds the bounds an edit makes stale
+    /// ([`crate::bounds::readers`]) follows it, so the two agree by construction: a bound is
+    /// marked stale exactly where the store would recompute normals.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError`] from listing them: never for a tile of `mesh`.
+    pub(crate) fn normal_inputs_or_list(
+        &self,
+        mesh: &BaseMesh,
+        key: &TileKey,
+    ) -> Result<Cow<'_, [TileKey]>, EvalError> {
+        if let Some(recorded) = self.normal_inputs(key) {
+            return Ok(Cow::Borrowed(recorded));
+        }
+        Ok(Cow::Owned(
+            list_normal_inputs(mesh, key)?.into_iter().collect(),
+        ))
+    }
+
     /// Forgets `key`'s normals, current or stale: the slot's normals are no longer of use. The
     /// list of their inputs stays, for [`DepGraph::normal_inputs`].
     pub(crate) fn drop_normals(&mut self, key: TileKey) {
@@ -426,6 +452,23 @@ impl DepGraph {
         }
         Ok(())
     }
+}
+
+/// The tiles `key`'s normals are computed from, listed with [`normal_tiles`], the tile itself
+/// included: what [`DepGraph::normal_inputs_or_list`] falls back on for a tile the graph hasn't
+/// recorded.
+///
+/// # Errors
+///
+/// [`EvalError`]: never for a tile of `mesh`.
+pub(crate) fn list_normal_inputs(
+    mesh: &BaseMesh,
+    key: &TileKey,
+) -> Result<BTreeSet<TileKey>, EvalError> {
+    let mut inputs = normal_tiles(mesh, Region::of_tile(key))?;
+    // The tile's own block is among them; inserting it makes that plain.
+    inputs.insert(*key);
+    Ok(inputs)
 }
 
 #[cfg(test)]

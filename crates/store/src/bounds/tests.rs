@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use geom::{BaseMesh, Vec3};
+use geom::{BaseMesh, Vec3, normal_tiles};
 
 use super::*;
 use crate::index::{Aabb, NormalCone};

@@ -116,8 +116,8 @@ use std::sync::Arc;
 
 use geom::{
     BaseMesh, Channel, CorrectionError, CorrectionView, CorrectionViewMut, EvalError, FaceId,
-    LayerId, Level, MAX_COPIES, PositionSource, Region, TileKey, Vec3, normal_tiles, normals_into,
-    parent_tiles, predict_region, refresh_normals_into,
+    LayerId, Level, MAX_COPIES, PositionSource, Region, TileKey, Vec3, normals_into, parent_tiles,
+    predict_region, refresh_normals_into,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -126,7 +126,7 @@ use rayon::slice::{ParallelSlice, ParallelSliceMut};
 use thiserror::Error;
 
 use crate::bounds::Book;
-use crate::deps::DepGraph;
+use crate::deps::{DepGraph, list_normal_inputs};
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
 use crate::index::TileBounds;
@@ -1128,19 +1128,6 @@ fn list_parents(mesh: &BaseMesh, key: &TileKey) -> Result<Vec<TileKey>, CacheErr
         .into_iter()
         .filter(|parent| parent.level() != Level::ZERO)
         .collect())
-}
-
-/// The tiles `key`'s normals are computed from, listed with [`normal_tiles`], the tile itself
-/// included.
-///
-/// # Errors
-///
-/// [`CacheError::Eval`] (not for a valid key).
-fn list_normal_inputs(mesh: &BaseMesh, key: &TileKey) -> Result<BTreeSet<TileKey>, CacheError> {
-    let mut inputs = normal_tiles(mesh, Region::of_tile(key))?;
-    // The tile's own block is among them; inserting it makes that plain.
-    inputs.insert(*key);
-    Ok(inputs)
 }
 
 /// Vertices in `key`'s tile: `side²`.
@@ -2363,10 +2350,10 @@ impl TileStore {
     }
 
     /// The tiles `key`'s normals are computed from, the tile itself included, in key order: the
-    /// tile, its apron and the rings at its corners, as [`normal_tiles`] lists them for
-    /// [`Region::of_tile`]. The list is structural, so it is read back from what the store
-    /// recorded when it last computed the tile's normals, and listed from the mesh only for a
-    /// tile it hasn't.
+    /// tile, its apron and the rings at its corners, as [`normal_tiles`](geom::normal_tiles) lists
+    /// them for [`Region::of_tile`]. The list is structural, so it is read back from what the
+    /// store recorded when it last computed the tile's normals, and listed from the mesh only
+    /// for a tile it hasn't.
     ///
     /// Neighbourhood is symmetric, so these are also the tiles whose normals read `key`'s
     /// positions.
@@ -2376,12 +2363,7 @@ impl TileStore {
     /// [`CacheError::NotATile`]; [`CacheError::Eval`] (not for a valid key).
     pub fn normal_inputs(&self, key: &TileKey) -> Result<Cow<'_, [TileKey]>, CacheError> {
         self.check_key(key)?;
-        if let Some(recorded) = self.deps.normal_inputs(key) {
-            return Ok(Cow::Borrowed(recorded));
-        }
-        Ok(Cow::Owned(
-            list_normal_inputs(&self.mesh, key)?.into_iter().collect(),
-        ))
+        Ok(self.deps.normal_inputs_or_list(&self.mesh, key)?)
     }
 
     /// `key`'s evaluated slot if its positions are current, found without counting as a use.
@@ -2426,8 +2408,8 @@ impl TileStore {
     }
 
     /// `key`'s unit normals, row-major `side²`: cached, else computed from the evaluated
-    /// positions of its own level's [`normal_tiles`] (the tile, its apron and the rings at its
-    /// corners).
+    /// positions of its own level's [`normal_tiles`](geom::normal_tiles) (the tile, its apron and
+    /// the rings at its corners).
     ///
     /// # Errors
     ///
@@ -3885,9 +3867,9 @@ impl TileStore {
         Ok(keys.into_iter().zip(found).collect())
     }
 
-    /// The tiles the normals of each of `keys` are computed from, the tile itself included: as
-    /// the dependency graph recorded them for a key that still has a node listing them, else
-    /// from [`normal_tiles`], listed on the workers (see [`recorded_or_listed`]).
+    /// The tiles the normals of each of `keys` are computed from, the tile itself included:
+    /// [`DepGraph::normal_inputs_or_list`]'s rule, with the lists not recorded made on the
+    /// workers (see [`recorded_or_listed`]).
     ///
     /// # Errors
     ///
@@ -3911,7 +3893,7 @@ impl TileStore {
                     .normal_inputs(key)
                     .map(|inputs| inputs.iter().copied().collect())
             },
-            |key| list_normal_inputs(mesh, key),
+            |key| Ok(list_normal_inputs(mesh, key)?),
         )
     }
 
@@ -4377,7 +4359,7 @@ impl TileStore {
 
     /// The slot of `key`'s current positions and normals: cached, else the normals are computed
     /// (or, where they are stale, brought up to date) from the positions of its
-    /// [`normal_tiles`], made current together as one cone.
+    /// [`normal_tiles`](geom::normal_tiles), made current together as one cone.
     ///
     /// # Errors
     ///
