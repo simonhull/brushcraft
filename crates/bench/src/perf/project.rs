@@ -24,23 +24,51 @@ pub(crate) enum Scale {
 }
 
 /// The generator's settings for a project the suite makes itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Every `generate` option that changes what it writes is here, all passed explicitly
+/// ([`Shape::args`]) and all in the cache key ([`cache_key`]), so a changed default of `generate`'s
+/// can't make a cached project stale unnoticed.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Shape {
     /// The base mesh's `cube_sphere` splits.
     pub(crate) splits: u32,
     /// Levels sculpted, from 1; the last is the one measured.
     pub(crate) levels: u8,
+    /// The noise's seed.
+    pub(crate) seed: u64,
+    /// The noise's amplitude at level 1.
+    pub(crate) amplitude: f32,
+    /// The store's budget while generating, in MiB: it decides when tiles are evicted and
+    /// written, so the file's layout.
+    pub(crate) budget_mib: usize,
 }
 
 impl Shape {
-    /// The arguments `generate` takes for this shape (the seed and amplitude are its
-    /// defaults).
+    /// The suite's shape with `splits` and `levels`: seed 1, amplitude 0.01, a 2 GiB budget, as
+    /// the benchmark project was generated.
+    const fn new(splits: u32, levels: u8) -> Self {
+        Self {
+            splits,
+            levels,
+            seed: 1,
+            amplitude: 0.01,
+            budget_mib: 2048,
+        }
+    }
+
+    /// The arguments `generate` takes for this shape: every field, none left to a default.
     pub(crate) fn args(self) -> Vec<OsString> {
         [
             "--splits",
             &self.splits.to_string(),
             "--levels",
             &self.levels.to_string(),
+            "--seed",
+            &self.seed.to_string(),
+            "--amplitude",
+            &self.amplitude.to_string(),
+            "--budget-mib",
+            &self.budget_mib.to_string(),
         ]
         .map(OsString::from)
         .to_vec()
@@ -95,14 +123,8 @@ impl Scale {
     /// `generate`'s default, made by hand).
     pub(crate) const fn shape(self) -> Option<Shape> {
         match self {
-            Self::Tiny => Some(Shape {
-                splits: 2,
-                levels: 6,
-            }),
-            Self::Medium => Some(Shape {
-                splits: 5,
-                levels: 9,
-            }),
+            Self::Tiny => Some(Shape::new(2, 6)),
+            Self::Medium => Some(Shape::new(5, 9)),
             Self::Full => None,
         }
     }
@@ -151,23 +173,35 @@ impl Scale {
     }
 }
 
-/// FNV-1a over `bytes` (64-bit).
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xCBF2_9CE4_8422_2325, |h, &b| {
+/// The generator's code fingerprint, as `build.rs` computed it.
+const GENERATOR_HASH: u64 = match u64::from_str_radix(env!("BRUSHCRAFT_GENERATOR_HASH"), 16) {
+    Ok(hash) => hash,
+    // Evaluated at compile time: a malformed hash from build.rs fails the build.
+    Err(_) => panic!("build.rs writes the generator hash as 16 hex digits"),
+};
+
+/// `hash` continued over `bytes` with FNV-1a (64-bit), as `build.rs` hashes the sources.
+fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
     })
 }
 
-/// The cache key of a project of `shape` made by this build: the generator's code fingerprint
-/// (see `build.rs`) and the shape, hashed together, as 16 hex digits.
+/// The cache key of a project of `shape` made by this build, as 16 hex digits: the generator's
+/// code fingerprint (see `build.rs`) continued over every field of the shape.
 pub(crate) fn cache_key(shape: Shape) -> String {
-    let text = format!(
-        "{} splits {} levels {}",
-        env!("BRUSHCRAFT_GENERATOR_HASH"),
-        shape.splits,
-        shape.levels
-    );
-    format!("{:016x}", fnv1a(text.as_bytes()))
+    let hash = [
+        &shape.splits.to_le_bytes()[..],
+        &[shape.levels],
+        &shape.seed.to_le_bytes(),
+        &shape.amplitude.to_bits().to_le_bytes(),
+        &u64::try_from(shape.budget_mib)
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    ]
+    .into_iter()
+    .fold(GENERATOR_HASH, fnv1a);
+    format!("{hash:016x}")
 }
 
 /// The cached medium project's file in `dir` for key `key`.
@@ -278,18 +312,71 @@ mod tests {
         let key = cache_key(medium);
         assert_eq!(key.len(), 16, "{key}");
         assert_eq!(key, cache_key(medium), "stable");
-        assert_ne!(
-            key,
-            cache_key(Shape {
-                splits: 6,
-                ..medium
-            }),
-            "another shape, another key"
-        );
+        for (other, what) in [
+            (
+                Shape {
+                    splits: 6,
+                    ..medium
+                },
+                "splits",
+            ),
+            (
+                Shape {
+                    levels: 8,
+                    ..medium
+                },
+                "levels",
+            ),
+            (Shape { seed: 2, ..medium }, "seed"),
+            (
+                Shape {
+                    amplitude: 0.02,
+                    ..medium
+                },
+                "amplitude",
+            ),
+            (
+                Shape {
+                    budget_mib: 1024,
+                    ..medium
+                },
+                "budget",
+            ),
+        ] {
+            assert_ne!(key, cache_key(other), "another {what}, another key");
+        }
         assert!(
             cached_file(Path::new("/c"), &key).ends_with(format!("medium-{key}.bcrf")),
             "named for its key"
         );
+    }
+
+    /// `generate` gets every field of the shape on its command line, so its own defaults
+    /// never decide what the suite's projects hold: parsed back, the options are the shape's.
+    #[test]
+    fn generate_gets_the_whole_shape() {
+        for scale in [Scale::Tiny, Scale::Medium] {
+            let shape = scale.shape().unwrap();
+            let args = std::iter::once(OsString::from("generate")).chain(shape.args());
+            let options = crate::cli::Command::parse(args).unwrap().options;
+            assert_eq!(
+                (
+                    options.splits,
+                    options.levels,
+                    options.seed,
+                    options.amplitude.to_bits(),
+                    options.budget_mib
+                ),
+                (
+                    shape.splits,
+                    shape.levels,
+                    shape.seed,
+                    shape.amplitude.to_bits(),
+                    shape.budget_mib
+                ),
+                "{scale:?}"
+            );
+        }
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //!
 //! The project `generate` makes depends on the generator (`generate.rs`, its noise, the
 //! session's configuration), on how tiles are evaluated (`geom`), on how they are stored and
-//! encoded (`store`, and the versions of its dependencies such as zstd in `Cargo.lock`), and on
-//! the toolchain (`mise.toml`). This hashes all of those files' contents, so any change to them
+//! encoded (`store`, and the versions of its dependencies such as zstd in `Cargo.lock`), on the
+//! build profiles (the root `Cargo.toml`), on `generate`'s options (`cli.rs`) and on the
+//! toolchain (`mise.toml`). This hashes all of those files' contents, so any change to them
 //! gives a new key and `perf` regenerates the project. Changes elsewhere (the brush, `perf`
 //! itself, comments in other crates) keep the cached one. A changed comment in `geom` or `store`
 //! regenerates needlessly; that costs seconds, and missing a real change would cost a wrong
@@ -18,13 +19,15 @@ use std::path::{Path, PathBuf};
 
 /// The files and directories (whole trees) the generated project depends on, relative to the
 /// repository.
-const INPUTS: [&str; 9] = [
+const INPUTS: [&str; 11] = [
+    "Cargo.toml",
     "Cargo.lock",
     "mise.toml",
     "crates/geom/Cargo.toml",
     "crates/geom/src",
     "crates/store/Cargo.toml",
     "crates/store/src",
+    "crates/bench/src/cli.rs",
     "crates/bench/src/generate.rs",
     "crates/bench/src/noise.rs",
     "crates/bench/src/session.rs",
