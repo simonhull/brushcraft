@@ -15,7 +15,7 @@
 
 use std::fmt;
 
-use crate::perf::metric::Measured;
+use crate::perf::metric::{Measured, Metric};
 
 /// The least relative change ever flagged.
 pub(crate) const MIN_CHANGE: f64 = 0.05;
@@ -111,6 +111,34 @@ impl Verdict {
             | Self::Noisy(change)
             | Self::Better(change)
             | Self::Worse(change) => Some(*change),
+        }
+    }
+}
+
+/// A metric against its ceiling (the spec's target, such as peak RSS within budget + 512 MB):
+/// judged on every run, independent of any baseline, since a baseline can miss it too.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Target {
+    /// The metric has no ceiling.
+    Unset,
+    /// The median is at or under it.
+    Met,
+    /// The median is over it: flagged.
+    Missed {
+        /// How far over, in the metric's unit.
+        by: f64,
+    },
+}
+
+impl Target {
+    /// `metric` against its ceiling.
+    pub(crate) fn check(metric: &Metric) -> Self {
+        match metric.ceiling {
+            None => Self::Unset,
+            Some(ceiling) if metric.value.median() <= ceiling => Self::Met,
+            Some(ceiling) => Self::Missed {
+                by: metric.value.median() - ceiling,
+            },
         }
     }
 }
@@ -231,6 +259,32 @@ mod tests {
             Verdict::judge(Some(&base), &value(62.0, 0.34)).word(),
             "NOISY",
             "shown"
+        );
+    }
+
+    /// A ceiling is judged on the run alone: over it is missed, at it is met.
+    #[test]
+    fn ceilings_are_judged_without_a_baseline() {
+        let metric = |median: f64, ceiling| Metric {
+            name: "medium.budget.peak_rss_mib".parse().unwrap(),
+            unit: crate::perf::metric::Unit::Mib,
+            value: value(median, 0.0),
+            ceiling,
+        };
+        assert_eq!(
+            Target::check(&metric(2000.0, None)),
+            Target::Unset,
+            "no ceiling"
+        );
+        assert_eq!(
+            Target::check(&metric(1536.0, Some(1536.0))),
+            Target::Met,
+            "at it"
+        );
+        assert_eq!(
+            Target::check(&metric(1600.0, Some(1536.0))),
+            Target::Missed { by: 64.0 },
+            "over it"
         );
     }
 

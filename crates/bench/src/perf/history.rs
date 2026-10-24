@@ -134,7 +134,7 @@ impl Entry {
     pub(crate) fn to_record(&self) -> Record {
         let info = &self.info;
         let metric = &self.metric;
-        Record::new("perf", "metric")
+        let record = Record::new("perf", "metric")
             .with("metric", metric.name.as_str())
             .with("unit", metric.unit.name())
             .with("median", metric.value.median())
@@ -154,7 +154,11 @@ impl Entry {
             .with("load_start", self.load.start.get())
             .with("load_others", self.load.others.get())
             .with("load_others_peak", self.load.others_peak.get())
-            .with("load_max", self.load.max.get())
+            .with("load_max", self.load.max.get());
+        match metric.ceiling {
+            Some(ceiling) => record.with("ceiling", ceiling),
+            None => record,
+        }
     }
 
     /// The entry a history line holds.
@@ -242,6 +246,10 @@ impl Entry {
                 name: text("metric")?.parse()?,
                 unit: Unit::named(&unit).ok_or_else(|| anyhow!("unknown unit {unit:?}"))?,
                 value: Measured::recorded(number("median")?, number("spread")?, samples)?,
+                ceiling: match object.get("ceiling") {
+                    Some(_) => Some(number("ceiling")?),
+                    None => None,
+                },
             },
         })
     }
@@ -387,6 +395,7 @@ pub(crate) mod tests {
                 name: metric.parse().unwrap(),
                 unit: Unit::Ms,
                 value: Measured::of(vec![median * 0.99, median, median * 1.02]).unwrap(),
+                ceiling: None,
             },
         }
     }
@@ -437,6 +446,18 @@ pub(crate) mod tests {
         assert!(
             Entry::parse(&extra).is_err(),
             "nested objects aren't entries"
+        );
+        let mut capped = e.clone();
+        capped.metric.ceiling = Some(1536.0);
+        let capped_line = capped.to_record().to_json();
+        assert!(
+            capped_line.ends_with(r#","ceiling":1536}"#),
+            "{capped_line}"
+        );
+        assert_eq!(
+            Entry::parse(&capped_line).unwrap(),
+            capped,
+            "a ceiling read back"
         );
         let older = line.replacen(r#","load_others_peak":1.25"#, "", 1);
         assert_ne!(older, line, "the edit applies");

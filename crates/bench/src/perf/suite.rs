@@ -206,7 +206,12 @@ impl Samples {
             .into_iter()
             .map(|(name, unit, samples)| {
                 let value = Measured::of(samples).with_context(|| format!("measuring {name}"))?;
-                Ok(Metric { name, unit, value })
+                Ok(Metric {
+                    name,
+                    unit,
+                    value,
+                    ceiling: None,
+                })
             })
             .collect()
     }
@@ -288,6 +293,13 @@ const PAGE_IN: [Taken; 4] = [
         Unit::Ms,
     ),
 ];
+
+/// The budget the `budget` walk runs under, in MiB: `budget`'s default, the spec's 1 GB
+/// workload, passed explicitly so the ceiling below can't drift from it.
+const WALK_BUDGET_MIB: usize = 1024;
+
+/// The spec's limit on resident memory during a session: within budget + 512 MB.
+const RSS_OVER_BUDGET_MIB: usize = 512;
 
 /// What the suite takes from `budget`: the walk's exact peak resident memory.
 const BUDGET: [Taken; 1] = [(
@@ -443,6 +455,8 @@ pub(crate) fn budget_part(
     for _ in 0..w.runs {
         let mut args = words(&[
             "budget",
+            "--budget-mib",
+            &WALK_BUDGET_MIB.to_string(),
             "--moves",
             &w.moves.to_string(),
             "--steps-per-move",
@@ -456,7 +470,17 @@ pub(crate) fn budget_part(
         let lines = runner.bench(&args)?;
         take(&mut samples, scale, "budget", &BUDGET, &lines)?;
     }
-    samples.measure()
+    let ceiling = WALK_BUDGET_MIB + RSS_OVER_BUDGET_MIB;
+    Ok(samples
+        .measure()?
+        .into_iter()
+        .map(|metric| Metric {
+            // Exact: a few thousand MiB.
+            #[expect(clippy::cast_precision_loss, reason = "1536 is exact in an f64")]
+            ceiling: Some(ceiling as f64),
+            ..metric
+        })
+        .collect())
 }
 
 /// The least-squares line `y = a + b x` through `points`: `(a, b)`; `None` for fewer than two

@@ -209,7 +209,7 @@ impl Measured {
     }
 }
 
-/// One metric of one run: its name, unit and value.
+/// One metric of one run: its name, unit and value, and the spec's ceiling on it if it has one.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Metric {
     /// What was measured.
@@ -218,6 +218,9 @@ pub(crate) struct Metric {
     pub(crate) unit: Unit,
     /// Its value.
     pub(crate) value: Measured,
+    /// A target the median must stay at or under, in the metric's unit, judged on every run
+    /// whatever the baseline (see [`crate::perf::compare::Target`]); `None` for most metrics.
+    pub(crate) ceiling: Option<f64>,
 }
 
 #[cfg(test)]

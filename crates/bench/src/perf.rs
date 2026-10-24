@@ -44,7 +44,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 
 use crate::cli::{Options, Projects};
 use crate::paths::{Paths, cache_root, repo_root};
-use crate::perf::compare::Verdict;
+use crate::perf::compare::{Target, Verdict};
 use crate::perf::history::{Entry, Label, PartLoad, RunInfo};
 use crate::perf::machine::{Machine, Revision, Timestamp};
 use crate::perf::metric::Metric;
@@ -305,7 +305,7 @@ fn measure_project<J: Write, H: Write>(
 }
 
 /// The comparison table's line for `entry` judged `verdict` against `baseline`.
-fn table_line(entry: &Entry, baseline: Option<&Entry>, verdict: Verdict) -> String {
+fn table_line(entry: &Entry, baseline: Option<&Entry>, verdict: Verdict, target: Target) -> String {
     let m = &entry.metric;
     let now = format!(
         "{:<40} {:>10.3} {:<3} ±{:>4.1} %",
@@ -316,11 +316,25 @@ fn table_line(entry: &Entry, baseline: Option<&Entry>, verdict: Verdict) -> Stri
     );
     let was = baseline.map(|base| format!("was {:>10.3}", base.metric.value.median()));
     let change = verdict.change().map(|change| change.to_string());
-    [Some(now), was, change, Some(verdict.word().to_owned())]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("  ")
+    let ceiling = match (target, m.ceiling) {
+        (Target::Missed { by }, Some(ceiling)) => Some(format!(
+            "OVER TARGET by {by:.1} {} (ceiling {ceiling:.0})",
+            m.unit.name()
+        )),
+        (Target::Met, Some(ceiling)) => Some(format!("within target ({ceiling:.0})")),
+        (Target::Unset | Target::Met | Target::Missed { .. }, _) => None,
+    };
+    [
+        Some(now),
+        was,
+        change,
+        Some(verdict.word().to_owned()),
+        ceiling,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("  ")
 }
 
 /// The history file of `machine` in `dir`: `<dir>/<machine name>.jsonl`.
@@ -393,7 +407,11 @@ fn report<J: Write, H: Write>(
             Verdict::Noisy(_) => noisy += 1,
             Verdict::New | Verdict::Same(_) | Verdict::Better(_) => {}
         }
-        out.say(&table_line(entry, base, verdict))?;
+        let target = Target::check(&entry.metric);
+        if let Target::Missed { .. } = target {
+            flagged += 1;
+        }
+        out.say(&table_line(entry, base, verdict, target))?;
     }
     Ok((flagged, noisy))
 }
@@ -713,13 +731,18 @@ mod tests {
             "cpu",
         );
         let verdict = Verdict::judge(Some(&base.metric.value), &now.metric.value);
-        let line = table_line(&now, Some(&base), verdict);
+        let line = table_line(&now, Some(&base), verdict, Target::Unset);
         assert!(line.starts_with("medium.brush.p99_ms"), "{line}");
         assert!(
             line.contains("was      2.000") && line.ends_with("WORSE"),
             "{line}"
         );
-        let new = table_line(&now, None, Verdict::New);
+        let new = table_line(&now, None, Verdict::New, Target::Unset);
         assert!(new.ends_with("new") && !new.contains("was"), "{new}");
+        let mut capped = now;
+        capped.metric.ceiling = Some(2.0);
+        let target = Target::check(&capped.metric);
+        let over = table_line(&capped, None, Verdict::New, target);
+        assert!(over.contains("OVER TARGET by 0.2 ms (ceiling 2)"), "{over}");
     }
 }
