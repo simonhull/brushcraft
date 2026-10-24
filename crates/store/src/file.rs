@@ -221,8 +221,8 @@ type Records = Vec<(TileKey, Loc)>;
 /// Splits a map keyed by [`Name`] into its tile records and its bounds records, each in key
 /// order.
 ///
-/// A map keyed by names lists every tile, then every bound, each kind in key order, so each
-/// half is already sorted and is built in one pass, with no lookups.
+/// One pass over the map for each kind, with no lookups: a map keyed by names lists each kind
+/// in key order, so each half comes out sorted, as [`SharedMap`] needs.
 fn split_names(names: &BTreeMap<Name, Loc>) -> (Records, Records) {
     let tiles = names
         .iter()
