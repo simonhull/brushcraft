@@ -321,9 +321,31 @@ fn words(args: &[&str]) -> Vec<OsString> {
 ///
 /// If the benches fail or their table doesn't parse.
 pub(crate) fn stage_part(runner: &mut Runner, rounds: usize) -> Result<Vec<Metric>> {
+    stage_samples(std::iter::repeat_with(|| runner.stage_benches()), rounds)
+}
+
+/// The stage metrics from `rounds` of divan's tables taken from `outputs`, after one more taken
+/// first and discarded.
+///
+/// The first round runs on cold caches and an unwarmed core, and measured
+/// 1.6–1.9× the median in 7 of the 14 benches, which used up the spread's one trim.
+///
+/// # Errors
+///
+/// If an output fails or doesn't parse.
+fn stage_samples(
+    mut outputs: impl Iterator<Item = Result<String>>,
+    rounds: usize,
+) -> Result<Vec<Metric>> {
+    let mut next = || {
+        outputs
+            .next()
+            .ok_or_else(|| anyhow!("no stage bench output"))?
+    };
+    stages::parse(&next()?).context("the warm-up round")?;
     let mut samples = Samples::default();
     for _ in 0..rounds {
-        for time in stages::parse(&runner.stage_benches()?)? {
+        for time in stages::parse(&next()?)? {
             samples.push(time.name, Unit::Us, time.median_us)?;
         }
     }
@@ -507,6 +529,27 @@ pub(crate) fn generate(runner: &mut Runner, project: &Path, scale: Scale) -> Res
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use super::*;
+
+    /// The first round is a warm-up: its times never reach the samples.
+    #[test]
+    fn the_stage_warm_up_round_is_discarded() {
+        let table = |median: &str| {
+            format!(
+                "stages   fastest │ slowest │ median │ mean │ samples │ iters\n\
+                 ╰─ frames        │         │        │      │         │\n   \
+                 ╰─ interior   1 µs │ 1 µs │ {median} µs │ 1 µs │ 1 │ 1\n"
+            )
+        };
+        let outputs = ["99", "30", "31", "32"].map(|m| Ok(table(m)));
+        let metrics = stage_samples(outputs.into_iter(), 3).unwrap();
+        assert_eq!(metrics.len(), 1, "{metrics:?}");
+        assert_eq!(metrics[0].value.samples(), [30.0, 31.0, 32.0], "no 99");
+        let short = ["99", "30"].map(|m| Ok(table(m)));
+        assert!(
+            stage_samples(short.into_iter(), 3).is_err(),
+            "too few outputs"
+        );
+    }
 
     #[test]
     fn lines_fit_and_degenerate_points_dont() {
