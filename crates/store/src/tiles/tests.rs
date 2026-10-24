@@ -2400,6 +2400,34 @@ fn recorded_normal_inputs_are_the_listed_ones() {
     }
 }
 
+/// Recorded lists and listed ones come back in key order, mixed, and the error is the first
+/// in key order, whatever the thread count.
+#[test]
+fn recorded_or_listed_keeps_key_order() {
+    let mesh = mesh();
+    let keys = tiles(&mesh, TOP, TOP);
+    let keys = &keys[..40];
+    let index = |key: &TileKey| keys.iter().position(|k| k == key).unwrap();
+    for threads in [1, 4] {
+        let workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let recorded = |key: &TileKey| (index(key) % 3 == 0).then(|| index(key) * 10);
+        let listed = recorded_or_listed(&workers, keys, recorded, |key| Ok(index(key) * 10));
+        let want: Vec<usize> = (0..keys.len()).map(|n| n * 10).collect();
+        assert_eq!(listed.unwrap(), want, "{threads} threads");
+        let failing = recorded_or_listed(&workers, keys, recorded, |key| match index(key) {
+            n @ (7 | 20) => Err(CacheError::NotATile(keys[n])),
+            n => Ok(n),
+        });
+        assert!(
+            matches!(failing, Err(CacheError::NotATile(key)) if key == keys[7]),
+            "{threads} threads: the first failure in key order"
+        );
+    }
+}
+
 /// Predicting a pinned tile straight into its slot gives the same bits as through scratch.
 ///
 /// A tile that isn't pinned loses its slot to an edit, so it is predicted into scratch and

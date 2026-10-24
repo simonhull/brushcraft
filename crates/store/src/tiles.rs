@@ -1023,6 +1023,45 @@ fn predict_tile(
     Ok(())
 }
 
+/// A structural list for each of `keys`, in order: `recorded(key)` where the store recorded it,
+/// else `list(key)`, computed on `workers`.
+///
+/// Reading a record back costs next to nothing, so those are read on the calling thread, and
+/// only the keys without one go to the workers (none, in a brush step, whose tiles were all
+/// evaluated before): a wave of trivial tasks costs more in waking the workers than it saves.
+///
+/// # Errors
+///
+/// The first error of `list`, in key order.
+fn recorded_or_listed<T: Send>(
+    workers: &rayon::ThreadPool,
+    keys: &[TileKey],
+    recorded: impl Fn(&TileKey) -> Option<T>,
+    list: impl Fn(&TileKey) -> Result<T, CacheError> + Sync + Send,
+) -> Result<Vec<T>, CacheError> {
+    let mut found: Vec<Option<T>> = keys.iter().map(recorded).collect();
+    let missing: Vec<TileKey> = keys
+        .iter()
+        .zip(&found)
+        .filter(|(_, got)| got.is_none())
+        .map(|(key, _)| *key)
+        .collect();
+    let mut listed = map_parallel(workers, &missing, list).into_iter();
+    found
+        .iter_mut()
+        .map(|got| match got.take() {
+            Some(value) => Ok(value),
+            None => listed.next().unwrap_or_else(|| {
+                Err(Invariant::ShortBuffer {
+                    expected: missing.len() + 1,
+                    got: missing.len(),
+                }
+                .into())
+            }),
+        })
+        .collect()
+}
+
 /// Where `key` is among the evaluated tiles an evaluation pinned (in key order).
 ///
 /// # Errors
@@ -3670,7 +3709,7 @@ impl TileStore {
 
     /// The tiles each of `keys` is predicted from, level 0 (the mesh) left out, in key order: as
     /// the dependency graph recorded them for a key that still has a node, else from
-    /// [`parent_tiles`], listed on the workers.
+    /// [`parent_tiles`], listed on the workers (see [`recorded_or_listed`]).
     ///
     /// # Errors
     ///
@@ -3686,20 +3725,19 @@ impl TileStore {
             };
             counter.set(counter.get() + 1);
         }
-        let (mesh, deps) = (&*self.mesh, &self.deps);
-        let found = map_parallel(&self.workers, &keys, |key| match deps.parents(key) {
-            Some(parents) => Ok(parents.to_vec()),
-            None => list_parents(mesh, key),
-        });
-        keys.into_iter()
-            .zip(found)
-            .map(|(key, parents)| Ok((key, parents?)))
-            .collect()
+        let mesh = &*self.mesh;
+        let found = recorded_or_listed(
+            &self.workers,
+            &keys,
+            |key| self.deps.parents(key).map(<[TileKey]>::to_vec),
+            |key| list_parents(mesh, key),
+        )?;
+        Ok(keys.into_iter().zip(found).collect())
     }
 
     /// The tiles the normals of each of `keys` are computed from, the tile itself included: as
     /// the dependency graph recorded them for a key that still has a node listing them, else
-    /// from [`normal_tiles`], listed on the workers.
+    /// from [`normal_tiles`], listed on the workers (see [`recorded_or_listed`]).
     ///
     /// # Errors
     ///
@@ -3714,13 +3752,17 @@ impl TileStore {
             };
             counter.set(counter.get() + 1);
         }
-        let (mesh, deps) = (&*self.mesh, &self.deps);
-        map_parallel(&self.workers, keys, |key| match deps.normal_inputs(key) {
-            Some(inputs) => Ok(inputs.iter().copied().collect()),
-            None => list_normal_inputs(mesh, key),
-        })
-        .into_iter()
-        .collect()
+        let mesh = &*self.mesh;
+        recorded_or_listed(
+            &self.workers,
+            keys,
+            |key| {
+                self.deps
+                    .normal_inputs(key)
+                    .map(|inputs| inputs.iter().copied().collect())
+            },
+            |key| list_normal_inputs(mesh, key),
+        )
     }
 
     /// Makes every tile of one cone level current, building those that aren't from `below` (the
