@@ -85,10 +85,22 @@ mod tests {
             );
         }
         assert!(stderr.contains("run labelled unchecked"), "{stderr}");
+        // The work root (`brushcraft-perf-<uid>`) stays for the next run; what it held goes.
         let left: Vec<_> = std::fs::read_dir(&scratch.0)
             .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .filter(|name| name != "cache")
+            .map(|e| e.unwrap().path())
+            .filter(|path| !path.ends_with("cache"))
+            .flat_map(|root| {
+                assert!(
+                    root.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("brushcraft-perf-")),
+                    "only the work root: {}",
+                    root.display()
+                );
+                std::fs::read_dir(root)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+            })
             .collect();
         assert!(left.is_empty(), "the work directory is gone: {left:?}");
     }

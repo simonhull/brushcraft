@@ -48,7 +48,9 @@ use crate::perf::compare::{Target, Verdict};
 use crate::perf::history::{Entry, Label, PartLoad, RunInfo};
 use crate::perf::machine::{Machine, Revision, Timestamp};
 use crate::perf::metric::Metric;
-use crate::perf::project::{Copied, Scale, WorkDir, cache_key, cached_file, remove_stale};
+use crate::perf::project::{
+    Copied, Scale, WorkDir, WorkRoot, cache_key, cached_file, remove_stale,
+};
 use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak, own_load};
 use crate::perf::suite::Runner;
 use crate::report::Output;
@@ -201,16 +203,25 @@ impl Session {
     }
 }
 
-/// A fresh work directory under `root`, after sweeping dead runs' from it (saying so on `out`).
+/// A fresh work directory in this user's work root under `base`, after sweeping dead runs'
+/// from that root, saying on `out` what was removed and warning of what couldn't be.
 ///
 /// # Errors
 ///
-/// If the sweep or the directory fails, or writing does.
-fn work_dir<J: Write, H: Write>(root: &Path, out: &mut Output<J, H>) -> Result<WorkDir> {
-    for dead in WorkDir::sweep(root)? {
+/// If the root can't be listed, the directory can't be made, or writing fails.
+fn work_dir<J: Write, H: Write>(base: &Path, out: &mut Output<J, H>) -> Result<WorkDir> {
+    let root = WorkRoot::under(base);
+    let sweep = WorkDir::sweep(&root)?;
+    for dead in sweep.removed {
         out.say(&format!("perf: removed a dead run's {}", dead.display()))?;
     }
-    WorkDir::new(root)
+    for (path, why) in sweep.skipped {
+        out.say(&format!(
+            "perf: warning: left {} in place: {why:#}",
+            path.display()
+        ))?;
+    }
+    WorkDir::new(&root)
 }
 
 /// A copy of `source` as project `name` in `work`, saying on `out` when it couldn't be a

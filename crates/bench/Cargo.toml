@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 geom.workspace = true
-rustix = { workspace = true, features = ["thread"] }
+rustix = { workspace = true, features = ["process", "thread"] }
 sculpt.workspace = true
 store.workspace = true
 thiserror.workspace = true

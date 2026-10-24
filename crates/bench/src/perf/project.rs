@@ -246,61 +246,158 @@ pub(crate) enum Copied {
     InFull,
 }
 
-/// The process id in a work directory's name, `work-<pid>-<n>`; `None` for any other name.
-fn work_pid(name: &str) -> Option<u32> {
-    let (pid, n) = name.strip_prefix("work-")?.split_once('-')?;
-    n.parse::<u64>().ok()?;
-    pid.parse().ok()
+/// The directory under a base directory that holds this user's perf work directories and
+/// nothing else, so a sweep never looks at anything another tool or user made.
+///
+/// It is `<base>/brushcraft-perf-<uid>`: the user id keeps two users' runs apart in a shared
+/// directory such as `/tmp`, where one user's directory would otherwise block the other's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkRoot(PathBuf);
+
+impl WorkRoot {
+    /// This user's work root under `base`. Nothing is made until a [`WorkDir`] is.
+    pub(crate) fn under(base: &Path) -> Self {
+        Self(base.join(format!(
+            "brushcraft-perf-{}",
+            rustix::process::getuid().as_raw()
+        )))
+    }
+
+    /// The directory.
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// What [`WorkDir::sweep`] did.
+#[derive(Debug, Default)]
+pub(crate) struct Sweep {
+    /// The dead runs' directories removed.
+    pub(crate) removed: Vec<PathBuf>,
+    /// The entries that looked like a dead run's but couldn't be checked or removed, with why:
+    /// left in place for the user, never a reason to fail the run.
+    pub(crate) skipped: Vec<(PathBuf, anyhow::Error)>,
 }
 
 /// A directory for one run's project copies, removed with everything in it when dropped.
+///
+/// It is named `work-<pid>-<n>` (the process id only for whoever reads the directory) and is
+/// locked (`flock`, exclusive) for as long as it lives. The kernel drops the lock when the
+/// process dies however it dies, so a [`WorkDir::sweep`] that can take the lock knows the
+/// directory's run is gone, whatever its process id now names, in this PID namespace or another.
 #[derive(Debug)]
-pub(crate) struct WorkDir(PathBuf);
+pub(crate) struct WorkDir {
+    /// The directory.
+    dir: PathBuf,
+    /// The open directory, holding the lock that says its run is alive.
+    _lock: File,
+}
 
 impl WorkDir {
-    /// A fresh directory under `root`, named for this process.
+    /// A fresh, locked directory in `root`, made if missing.
+    ///
+    /// The directory is made under a `new-` name, locked, then renamed to its `work-` name, so a
+    /// sweep never sees it unlocked. A process killed between the first two steps leaves an
+    /// empty `new-` directory behind, which nothing sweeps: harmless, and a window of
+    /// microseconds.
     ///
     /// # Errors
     ///
-    /// If it can't be made.
-    pub(crate) fn new(root: &Path) -> Result<Self> {
+    /// If it can't be made, locked or renamed.
+    pub(crate) fn new(root: &WorkRoot) -> Result<Self> {
         /// Tells apart the directories one process makes.
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = root.join(format!(
-            "work-{}-{}",
+        let root = root.path();
+        std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+        let name = format!(
+            "{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        Ok(Self(dir))
+        );
+        let staging = root.join(format!("new-{name}"));
+        let dir = root.join(format!("work-{name}"));
+        #[expect(
+            clippy::create_dir,
+            reason = "the name is this process's alone: an existing directory is an error"
+        )]
+        std::fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
+        let locked = File::open(&staging)
+            .with_context(|| format!("opening {}", staging.display()))
+            .and_then(|lock| {
+                lock.try_lock()
+                    .with_context(|| format!("locking {}", staging.display()))?;
+                std::fs::rename(&staging, &dir).with_context(|| {
+                    format!("renaming {} to {}", staging.display(), dir.display())
+                })?;
+                Ok(lock)
+            });
+        match locked {
+            Ok(lock) => Ok(Self { dir, _lock: lock }),
+            Err(e) => {
+                // Best effort: the error says what went wrong; an empty directory is left at worst.
+                drop(std::fs::remove_dir(&staging));
+                Err(e)
+            }
+        }
     }
 
-    /// Removes every work directory under `root` whose process has died (a run killed by a
-    /// signal never ran its [`Drop`]); returns the directories removed. A directory whose
-    /// process still runs, or whose name doesn't read `work-<pid>-<n>`, is left alone.
+    /// Removes every work directory in `root` whose run has died (a run killed by a signal never
+    /// ran its [`Drop`]), which [`WorkDir::new`]'s lock tells: an unlocked `work-` directory is
+    /// a dead run's. Only `work-` entries of `root` are looked at, and a live run's directory,
+    /// this process's included, stays.
+    ///
+    /// An entry that can't be opened, locked or removed is skipped and reported in
+    /// [`Sweep::skipped`], not an error: clearing up after dead runs never fails a live one.
     ///
     /// # Errors
     ///
-    /// If `root` can't be listed or a dead run's directory removed.
-    pub(crate) fn sweep(root: &Path) -> Result<Vec<PathBuf>> {
-        let mut removed = Vec::new();
+    /// If `root` exists but can't be listed.
+    pub(crate) fn sweep(root: &WorkRoot) -> Result<Sweep> {
+        let root = root.path();
+        let mut sweep = Sweep::default();
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(sweep),
             Err(e) => return Err(e).with_context(|| format!("listing {}", root.display())),
         };
         for entry in entries {
-            let path = entry?.path();
-            let Some(pid) = path.file_name().and_then(|n| n.to_str()).and_then(work_pid) else {
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    sweep.skipped.push((root.to_owned(), e.into()));
+                    continue;
+                }
             };
-            if pid != std::process::id() && !Path::new("/proc").join(pid.to_string()).exists() {
-                std::fs::remove_dir_all(&path)
-                    .with_context(|| format!("removing {}", path.display()))?;
-                removed.push(path);
+            if !entry.file_name().to_string_lossy().starts_with("work-") {
+                continue;
+            }
+            let path = entry.path();
+            match Self::remove_if_dead(&path) {
+                Ok(true) => sweep.removed.push(path),
+                Ok(false) => {}
+                Err(e) => sweep.skipped.push((path, e)),
             }
         }
-        Ok(removed)
+        Ok(sweep)
+    }
+
+    /// Removes the work directory at `path` if its run has died (no lock held on it); returns
+    /// whether it did.
+    ///
+    /// # Errors
+    ///
+    /// If it can't be opened, its lock can't be tried, or it can't be removed.
+    fn remove_if_dead(path: &Path) -> Result<bool> {
+        let dir = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        match dir.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+        std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
+        Ok(true)
     }
 
     /// Where a project named `name` goes in it: `<dir>/<name>/project.bcrf`, its own directory
@@ -310,7 +407,7 @@ impl WorkDir {
     ///
     /// If the project's directory can't be made.
     pub(crate) fn project(&self, name: &str) -> Result<PathBuf> {
-        let dir = self.0.join(name);
+        let dir = self.dir.join(name);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(dir.join("project.bcrf"))
     }
@@ -338,14 +435,15 @@ impl WorkDir {
     /// The directory.
     #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        &self.dir
     }
 }
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        // Best effort: a copy left behind is in the cache directory, named for its process.
-        drop(std::fs::remove_dir_all(&self.0));
+        // Best effort: a directory left behind stays unlocked once this process ends, so the next
+        // run's sweep removes it.
+        drop(std::fs::remove_dir_all(&self.dir));
     }
 }
 
@@ -427,37 +525,85 @@ mod tests {
         }
     }
 
-    /// Work directories of dead runs are swept; live ones, this run's and other names stay.
+    /// A scratch directory for one test, empty.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("brushcraft-perf-{name}-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The sweep looks only inside our own work root, and removes only a dead run's directory.
+    ///
+    /// A live run's directory, an entry of another name, and a foreign `work-` directory beside
+    /// the root (another tool's, in a shared directory such as `/tmp`) all stay.
     #[test]
-    fn dead_runs_work_dirs_are_swept() {
-        assert_eq!(work_pid("work-123-0"), Some(123), "a work directory");
-        for other in ["work-123", "work-x-0", "medium-1.bcrf", "work-1-x"] {
-            assert_eq!(work_pid(other), None, "{other}");
+    fn the_sweep_removes_dead_runs_and_touches_nothing_else() {
+        let base = scratch("sweep");
+        let root = WorkRoot::under(&base);
+        assert!(
+            root.path().starts_with(&base) && root.path() != base,
+            "a directory of its own"
+        );
+        let live = WorkDir::new(&root).unwrap();
+        // A dead run's directory: named like a work directory, nobody holding its lock.
+        let dead = root.path().join("work-1-0");
+        let other = root.path().join("keep-me");
+        let foreign = base.join("work-1-0");
+        for dir in [&dead, &other, &foreign] {
+            std::fs::create_dir_all(dir.join("inside")).unwrap();
         }
-        let root =
-            std::env::temp_dir().join(format!("brushcraft-perf-sweep-{}", std::process::id()));
-        // PIDs past the kernel's maximum (2^22) are never alive.
-        let dead = root.join("work-4999999-0");
-        let live = root.join(format!("work-{}-7", std::process::id()));
-        let init = root.join("work-1-0");
-        let other = root.join("keep-me");
-        for dir in [&dead, &live, &init, &other] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
+        let sweep = WorkDir::sweep(&root).unwrap();
         assert_eq!(
-            WorkDir::sweep(&root).unwrap(),
+            sweep.removed,
             std::slice::from_ref(&dead),
             "only the dead run's"
         );
+        assert!(sweep.skipped.is_empty(), "{:?}", sweep.skipped);
         assert!(
-            live.exists() && init.exists() && other.exists(),
+            live.path().exists() && other.exists() && foreign.exists(),
             "the rest stay"
         );
+        drop(live);
         assert!(
-            WorkDir::sweep(&root.join("missing")).unwrap().is_empty(),
-            "no root"
+            WorkDir::sweep(&WorkRoot::under(&base.join("missing")))
+                .unwrap()
+                .removed
+                .is_empty(),
+            "no root, nothing to do"
         );
-        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A dead run's directory that can't be removed is skipped with the reason, and the sweep
+    /// still succeeds, so the run that swept goes on.
+    #[test]
+    fn an_unremovable_entry_is_skipped_not_fatal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch("stuck");
+        let root = WorkRoot::under(&base);
+        let stuck = root.path().join("work-1-0");
+        let sealed = stuck.join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("file"), b"x").unwrap();
+        // Read and enter only: the file inside can't be unlinked.
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let sweep = WorkDir::sweep(&root);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sweep = sweep.unwrap();
+        assert!(sweep.removed.is_empty(), "{:?}", sweep.removed);
+        assert_eq!(
+            sweep
+                .skipped
+                .iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>(),
+            [&stuck],
+            "skipped, with the reason"
+        );
+        assert!(WorkDir::new(&root).is_ok(), "the run goes on");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
@@ -485,12 +631,10 @@ mod tests {
 
     #[test]
     fn work_dirs_copy_projects_and_clean_up() {
-        let root =
-            std::env::temp_dir().join(format!("brushcraft-perf-work-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = scratch("work");
         let source = root.join("source.bcrf");
         std::fs::write(&source, vec![5_u8; 1 << 16]).unwrap();
-        let work = WorkDir::new(&root).unwrap();
+        let work = WorkDir::new(&WorkRoot::under(&root)).unwrap();
         let (copy, _) = work.copy(&source, "medium").unwrap();
         assert_eq!(
             copy,
