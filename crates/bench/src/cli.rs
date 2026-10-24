@@ -50,7 +50,8 @@ options (each subcommand takes the ones it uses):
             --full (also the benchmark project at --project, through a reflinked copy)
             --tiny (a tiny project, no guard, nothing recorded: checks the suite runs)
             --no-stages (skip the stage benches)  --settle-secs N (300: the quiet guard's
-            longest wait for the other processes' 1-minute load to fall below 2)
+            longest wait for the other processes' 1-minute load to fall below 1.5; it
+            reaching 2 during a part labels the run loaded)
             Exit status 3 when a metric got worse beyond its noise; else 4 when one was too
             noisy to compare (its noise band over 25 %).
 

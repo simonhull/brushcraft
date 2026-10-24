@@ -9,8 +9,9 @@
 //! them, as it samples once every 5 s a count that swings between 0 and 16 within milliseconds.
 //! Taking a model of the suite's share off the load average left that noise in (a quiet desktop
 //! read as 3.5 one page-in and 1.6 the next), so the suite is left out of the count instead.
-//! A part is measured once the others' load is below 2, and the run is labelled loaded if it
-//! reaches 2 during a part.
+//! A part is measured once the others' load is below 1.5 ([`SETTLE_BELOW`]), and the run is
+//! labelled loaded if it reaches 2 during a part ([`LOADED_AT`]): the gap keeps a release just
+//! under the mark from being undone by the average's noise.
 
 use std::fmt;
 use std::io::Write as _;
@@ -167,10 +168,25 @@ pub(crate) fn others_peak(samples: &[Sample]) -> Option<Load> {
         .reduce(|a, b| if b > a { b } else { a })
 }
 
+/// The others' load the guard waits to fall below before a part.
+///
+/// Lower than [`LOADED_AT`] by 0.5, so a part the guard released isn't labelled loaded by noise
+/// alone. The others' average varies by about ±0.15 (one standard deviation) from sampling at
+/// 2 s, and on a quiet desktop it wandered by up to ~0.35 within a minute as other processes
+/// woke and slept; 0.5 is over three standard deviations of the first and covers the second.
+/// A run that released at 2.00 as an average seeded from a busy minute decayed, then read 2.03
+/// and 2.10 in its next parts with the other processes at ~0.7, is what this prevents. It stays
+/// above a quiet desktop's floor (~0.7 to 1.4 here), so the wait still ends.
+pub(crate) const SETTLE_BELOW: Load = Load(1.5);
+
+/// The others' load that labels the run loaded when reached during a part: the documented
+/// meaning of a loaded run, the other processes' load at 2 or more.
+pub(crate) const LOADED_AT: Load = Load(2.0);
+
 /// What the guard does after one look at the load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Decision {
-    /// The others' load is below the threshold: measure.
+    /// The others' load is below [`Quiet::settle_below`]: measure.
     Measure,
     /// It isn't yet, and there is time left: look again after [`Quiet::every`].
     Wait,
@@ -178,12 +194,15 @@ pub(crate) enum Decision {
     GiveUp,
 }
 
-/// How the guard waits: for the others' load to fall below `below`, looking every `every`, for
-/// at most `within`.
+/// How the guard waits and judges: it waits for the others' load to fall below `settle_below`,
+/// looking every `every`, for at most `within`; a part during which it reaches `loaded_at`
+/// labels the run loaded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Quiet {
-    /// The load to fall below.
-    pub(crate) below: Load,
+    /// The load to fall below before a part ([`SETTLE_BELOW`]).
+    pub(crate) settle_below: Load,
+    /// The load that labels the run loaded when reached during a part ([`LOADED_AT`]).
+    pub(crate) loaded_at: Load,
     /// The longest wait before a part.
     pub(crate) within: Duration,
     /// How often to look.
@@ -193,7 +212,7 @@ pub(crate) struct Quiet {
 /// How a wait ended.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Settled {
-    /// The others' load fell below the threshold, after `waited`.
+    /// The others' load was below the threshold, after `waited`.
     Quiet {
         /// How long it took.
         waited: Duration,
@@ -208,20 +227,23 @@ pub(crate) enum Settled {
 }
 
 impl Quiet {
-    /// The guard the suite uses: below a load of 2, looking every 5 s (as often as the kernel
-    /// updates the average), for at most `within`.
+    /// The guard the suite uses: it waits for [`SETTLE_BELOW`], looking every 5 s (as often as
+    /// the Linux load average updates), for at most `within`, and labels a run loaded at
+    /// [`LOADED_AT`].
     pub(crate) const fn new(within: Duration) -> Self {
         Self {
-            below: Load(2.0),
+            settle_below: SETTLE_BELOW,
+            loaded_at: LOADED_AT,
             within,
             every: Duration::from_secs(5),
         }
     }
 
     /// How a part went, judged after it from the others' highest load during it (`peak`, see
-    /// [`others_peak`]): loaded if it reached the threshold, as if the guard had never settled.
+    /// [`others_peak`]): loaded if it reached [`Quiet::loaded_at`], as if the guard had never
+    /// settled.
     pub(crate) fn held(&self, peak: Load) -> Settled {
-        if peak < self.below {
+        if peak < self.loaded_at {
             Settled::Quiet {
                 waited: Duration::ZERO,
                 others: peak,
@@ -233,7 +255,7 @@ impl Quiet {
 
     /// What to do after a look found the others' load at `others`, having waited `waited`.
     pub(crate) fn decide(&self, others: Load, waited: Duration) -> Decision {
-        if others < self.below {
+        if others < self.settle_below {
             Decision::Measure
         } else if waited + self.every <= self.within {
             Decision::Wait
@@ -242,8 +264,8 @@ impl Quiet {
         }
     }
 
-    /// Waits until the others' load, as `look` reads it, falls below the threshold, sleeping
-    /// with `sleep` between looks and saying what it does with `say`; gives up after
+    /// Waits until the others' load, as `look` reads it, falls below [`Quiet::settle_below`],
+    /// sleeping with `sleep` between looks and saying what it does with `say`; gives up after
     /// [`Quiet::within`].
     ///
     /// # Errors
@@ -274,7 +296,7 @@ impl Quiet {
                             "quiet: other load {others}, waiting (up to {} s) for it to fall \
                              below {}",
                             self.within.as_secs(),
-                            self.below
+                            self.settle_below
                         ))?;
                     }
                     sleep(self.every);
@@ -445,6 +467,8 @@ impl LoadLog {
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     /// A load of `x`.
@@ -473,14 +497,14 @@ mod tests {
     fn the_guard_measures_waits_or_gives_up() {
         let quiet = Quiet::new(Duration::from_secs(20));
         let s = Duration::from_secs;
-        assert_eq!(quiet.decide(load(1.99), s(0)), Decision::Measure, "below");
+        assert_eq!(quiet.decide(load(1.49), s(0)), Decision::Measure, "below");
         assert_eq!(
             quiet.decide(load(1.0), s(20)),
             Decision::Measure,
             "below, late"
         );
         assert_eq!(
-            quiet.decide(load(2.0), s(0)),
+            quiet.decide(load(1.5), s(0)),
             Decision::Wait,
             "at the threshold"
         );
@@ -532,12 +556,12 @@ mod tests {
             "quiet at once"
         );
         assert_eq!((slept, said.len()), (Duration::ZERO, 0), "silently");
-        let (later, slept_later, said_later) = run(&[3.0, 2.5, 1.5]);
+        let (later, slept_later, said_later) = run(&[3.0, 2.5, 1.4]);
         assert_eq!(
             later,
             Settled::Quiet {
                 waited: Duration::from_secs(10),
-                others: load(1.5)
+                others: load(1.4)
             },
             "after two waits"
         );
@@ -557,6 +581,84 @@ mod tests {
         assert!(
             said_long.last().unwrap().contains("labelled loaded"),
             "{said_long:?}"
+        );
+    }
+
+    /// The guard releases below the lower threshold and labels loaded at the higher one, and
+    /// between them a part is neither held back nor labelled loaded.
+    #[test]
+    fn the_two_thresholds_differ() {
+        let quiet = Quiet::new(Duration::from_secs(20));
+        assert!(SETTLE_BELOW < LOADED_AT, "a gap between them");
+        let between = load(1.8);
+        assert_eq!(
+            quiet.decide(between, Duration::ZERO),
+            Decision::Wait,
+            "waits"
+        );
+        assert!(
+            matches!(quiet.held(between), Settled::Quiet { .. }),
+            "but a part reading it stays quiet"
+        );
+        assert_eq!(
+            quiet.held(LOADED_AT),
+            Settled::Loaded { others: LOADED_AT },
+            "loaded at 2"
+        );
+    }
+
+    /// An average seeded from a busy minute decays, and the guard releases it only below 1.5,
+    /// out of reach of the next part's noise.
+    ///
+    /// The seed is 11.87, as a run started straight after a test suite saw, and the other
+    /// processes' real load is 0.6. The next part's noise (up to three standard deviations,
+    /// +0.45) doesn't reach 2; with one threshold at 2 the same release was undone by +0.1.
+    #[test]
+    fn a_decaying_seed_releases_below_the_lower_threshold() {
+        let quiet = Quiet::new(Duration::from_mins(15));
+        let start = Instant::now();
+        let (clock, tick) = (Cell::new(start), Cell::new(start + Duration::from_secs(2)));
+        let average = Cell::new(Average::seeded(load(11.87), start));
+        // The other processes' counts every 2 s, as the log takes them: 0.6 on average.
+        let mut counts = [1, 0, 1, 1, 0, 1, 0, 1, 1, 0].into_iter().cycle();
+        let settled = quiet
+            .settle(
+                || Ok(average.get().load()),
+                |wait| {
+                    clock.set(clock.get() + wait);
+                    while tick.get() <= clock.get() {
+                        let mut next = average.get();
+                        next.fold(counts.next().unwrap(), tick.get());
+                        average.set(next);
+                        tick.set(tick.get() + Duration::from_secs(2));
+                    }
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let Settled::Quiet { waited, others } = settled else {
+            panic!("never released: {settled:?}");
+        };
+        assert!(others < SETTLE_BELOW, "released below 1.5: {others}");
+        assert!(others.get() > 1.3, "as soon as it fell below: {others}");
+        // 60 ln((11.87 − 0.6) / (1.5 − 0.6)) ≈ 152 s.
+        assert!(
+            (145..=165).contains(&waited.as_secs()),
+            "after {} s",
+            waited.as_secs()
+        );
+        let noisy = load(others.get() + 0.45);
+        assert!(
+            matches!(quiet.held(noisy), Settled::Quiet { .. }),
+            "noise after the release: {noisy}"
+        );
+        let one_threshold = load(1.99 + 0.1);
+        assert_eq!(
+            quiet.held(one_threshold),
+            Settled::Loaded {
+                others: one_threshold
+            },
+            "the old edge"
         );
     }
 
