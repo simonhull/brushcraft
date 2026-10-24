@@ -74,6 +74,9 @@ fn files(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 fn revision(repo: &Path) -> (String, bool, Option<PathBuf>) {
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
+            // No index refresh: a status that rewrote the index would make the next build rerun
+            // build.rs, whose triggers include the index.
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .arg("-C")
             .arg(repo)
             .args(args)
