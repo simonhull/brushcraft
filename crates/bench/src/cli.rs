@@ -51,7 +51,8 @@ options (each subcommand takes the ones it uses):
             --tiny (a tiny project, no guard, nothing recorded: checks the suite runs)
             --no-stages (skip the stage benches)  --settle-secs N (300: the quiet guard's
             longest wait for the other processes' 1-minute load to fall below 2)
-            Exit status 3 when a metric got worse beyond its noise.
+            Exit status 3 when a metric got worse beyond its noise; else 4 when one was too
+            noisy to compare (its noise band over 25 %).
 
 Results go to stdout as JSON lines; progress and a human summary go to stderr.";
 

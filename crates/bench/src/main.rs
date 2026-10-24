@@ -69,6 +69,9 @@ fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<
 /// The exit status of a `perf` run that flagged a metric got worse.
 const FLAGGED: u8 = 3;
 
+/// The exit status of a `perf` run with no metric worse but one too noisy to compare.
+const INCONCLUSIVE: u8 = 4;
+
 fn main() -> ExitCode {
     let mut stderr = std::io::stderr();
     let command = match Command::parse(std::env::args_os().skip(1)) {
@@ -89,6 +92,7 @@ fn main() -> ExitCode {
     match run(&command, &mut out) {
         Ok(Status::Clean) => ExitCode::SUCCESS,
         Ok(Status::Flagged) => ExitCode::from(FLAGGED),
+        Ok(Status::Inconclusive) => ExitCode::from(INCONCLUSIVE),
         Err(e) => {
             drop(writeln!(
                 stderr,

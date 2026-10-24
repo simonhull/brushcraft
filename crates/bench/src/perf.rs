@@ -20,7 +20,8 @@
 //! Each metric prints as a JSON line (`{"bench":"perf","result":"metric",…}`) and, with
 //! `--history DIR`, is appended to `DIR/<machine>.jsonl` ([`history`]). The run is compared
 //! against the latest baseline of each metric on the same hardware, and a change beyond the
-//! metric's noise is flagged ([`compare`]); a flagged slowdown makes the exit status 3.
+//! metric's noise is flagged ([`compare`]); a flagged slowdown makes the exit status 3, and
+//! failing that a comparison too noisy to conclude makes it 4.
 //! `--baseline` marks the run as the new baseline, which a loaded run (or a dirty tree) can't
 //! be.
 
@@ -57,10 +58,13 @@ const STAGE_ROUNDS: usize = 5;
 /// How a run ended, for the exit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Status {
-    /// Nothing flagged.
+    /// Nothing flagged, nothing inconclusive.
     Clean,
     /// At least one metric got worse beyond its noise.
     Flagged,
+    /// None got worse, but at least one was too noisy to compare (see
+    /// [`compare::MAX_THRESHOLD`]).
+    Inconclusive,
 }
 
 /// What `perf` is asked to do, checked.
@@ -279,7 +283,8 @@ fn history_file(dir: &Path, machine: &Machine) -> Result<PathBuf> {
 }
 
 /// Prints each of `entries` as a JSON line and a line of the comparison table, judged against
-/// the latest baselines in `past` on the same hardware; returns how many got worse.
+/// the latest baselines in `past` on the same hardware; returns how many got worse and how many
+/// were inconclusive.
 ///
 /// # Errors
 ///
@@ -289,24 +294,26 @@ fn report<J: Write, H: Write>(
     past: &[Entry],
     label: Label,
     out: &mut Output<J, H>,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let fingerprint = entries.first().map_or("", |e| e.info.fingerprint.as_str());
     let baselines = history::baselines(past, fingerprint);
     out.say(&format!(
         "\nperf: {} metrics, run labelled {label}",
         entries.len()
     ))?;
-    let mut flagged = 0;
+    let (mut flagged, mut noisy) = (0, 0);
     for entry in entries {
         out.record(&entry.to_record())?;
         let base = baselines.get(&entry.metric.name).copied();
         let verdict = Verdict::judge(base.map(|b| &b.metric.value), &entry.metric.value);
-        if let Verdict::Worse(_) = verdict {
-            flagged += 1;
+        match verdict {
+            Verdict::Worse(_) => flagged += 1,
+            Verdict::Noisy(_) => noisy += 1,
+            Verdict::New | Verdict::Same(_) | Verdict::Better(_) => {}
         }
         out.say(&table_line(entry, base, verdict))?;
     }
-    Ok(flagged)
+    Ok((flagged, noisy))
 }
 
 /// Runs `perf` (see the module notes); `paths.project` is the full project for `--full`.
@@ -398,7 +405,7 @@ pub(crate) fn run<J: Write, H: Write>(
             metric,
         })
         .collect();
-    let flagged = report(&entries, &past, label, out)?;
+    let (flagged, noisy) = report(&entries, &past, label, out)?;
     if let Some(file) = &history_file {
         history::append(file, &entries)?;
         out.say(&format!(
@@ -413,11 +420,31 @@ pub(crate) fn run<J: Write, H: Write>(
             "the run was {label}, so it was recorded but not as a baseline: rerun on a quiet machine"
         );
     }
+    status(flagged, noisy, out)
+}
+
+/// The run's status from how many metrics got worse (`flagged`) and how many were too noisy to
+/// compare (`noisy`), said to `out`.
+///
+/// # Errors
+///
+/// If writing fails.
+fn status<J: Write, H: Write>(
+    flagged: usize,
+    noisy: usize,
+    out: &mut Output<J, H>,
+) -> Result<Status> {
     if flagged > 0 {
         out.say(&format!(
             "perf: {flagged} metrics got worse beyond their noise"
         ))?;
         return Ok(Status::Flagged);
+    }
+    if noisy > 0 {
+        out.say(&format!(
+            "perf: {noisy} metrics too noisy to compare (a noise band over 25 %): rerun quieter"
+        ))?;
+        return Ok(Status::Inconclusive);
     }
     Ok(Status::Clean)
 }
@@ -532,6 +559,20 @@ mod tests {
         ] {
             assert!(plan(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A slowdown outranks an inconclusive comparison, which outranks a clean run: each has its
+    /// own exit status.
+    #[test]
+    fn statuses_rank_slowdowns_over_noise() {
+        let mut out = Output::new(Vec::new(), Vec::new());
+        assert_eq!(status(1, 1, &mut out).unwrap(), Status::Flagged, "worse");
+        assert_eq!(
+            status(0, 1, &mut out).unwrap(),
+            Status::Inconclusive,
+            "noisy"
+        );
+        assert_eq!(status(0, 0, &mut out).unwrap(), Status::Clean, "clean");
     }
 
     #[test]

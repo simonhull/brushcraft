@@ -6,6 +6,12 @@
 //! spreads covers the noisier metrics: when one run's repetitions of a metric land ±10 % around
 //! its median, two runs 12 % apart haven't shown it moved. The larger of the two spreads is used
 //! because either run's noise can make the difference.
+//!
+//! The band has a ceiling: when it would pass [`MAX_THRESHOLD`] (25 %), the comparison can't
+//! tell a 30 % slowdown from noise, so a change inside it is [`Verdict::Noisy`], inconclusive,
+//! rather than "same". A spread of 0.34 would otherwise call a doubling unchanged. 25 % is five
+//! times the floor, and about the smallest slowdown nobody would want to merge unseen. A change
+//! beyond even a wide band is still flagged.
 
 use std::fmt;
 
@@ -16,6 +22,9 @@ pub(crate) const MIN_CHANGE: f64 = 0.05;
 
 /// How many spreads a change must exceed to be flagged.
 pub(crate) const SPREADS: f64 = 3.0;
+
+/// The widest noise band a comparison may conclude "same" within.
+pub(crate) const MAX_THRESHOLD: f64 = 0.25;
 
 /// A relative change against a baseline, and the threshold it was held to.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,8 +52,10 @@ impl fmt::Display for Change {
 pub(crate) enum Verdict {
     /// No baseline to compare with.
     New,
-    /// Within the noise.
+    /// Within the noise, and the noise narrow enough to say so.
     Same(Change),
+    /// Within the noise, but the noise is wider than [`MAX_THRESHOLD`]: inconclusive.
+    Noisy(Change),
     /// Lower beyond the noise.
     Better(Change),
     /// Higher beyond the noise: flagged.
@@ -74,6 +85,8 @@ impl Verdict {
             Self::Worse(change)
         } else if ratio < -threshold {
             Self::Better(change)
+        } else if threshold > MAX_THRESHOLD {
+            Self::Noisy(change)
         } else {
             Self::Same(change)
         }
@@ -84,6 +97,7 @@ impl Verdict {
         match self {
             Self::New => "new",
             Self::Same(_) => "same",
+            Self::Noisy(_) => "NOISY",
             Self::Better(_) => "better",
             Self::Worse(_) => "WORSE",
         }
@@ -93,7 +107,10 @@ impl Verdict {
     pub(crate) const fn change(&self) -> Option<Change> {
         match self {
             Self::New => None,
-            Self::Same(change) | Self::Better(change) | Self::Worse(change) => Some(*change),
+            Self::Same(change)
+            | Self::Noisy(change)
+            | Self::Better(change)
+            | Self::Worse(change) => Some(*change),
         }
     }
 }
@@ -175,6 +192,46 @@ mod tests {
         assert!((c.ratio - 0.13).abs() < 1e-12, "{c:?}");
         assert!((c.threshold - 0.12).abs() < 1e-12, "{c:?}");
         assert_eq!(c.to_string(), "+13.0 % (noise ±12.0 %)", "shown");
+    }
+
+    /// Past the 25 % ceiling a change inside the band is inconclusive, not "same": the
+    /// reviewer's case, a run at spread 0.34 doubling from 31 to 62, is no longer passed.
+    #[test]
+    fn wide_bands_are_inconclusive() {
+        let base = value(31.0, 0.0);
+        assert!(
+            matches!(
+                Verdict::judge(Some(&base), &value(62.0, 0.34)),
+                Verdict::Noisy(_)
+            ),
+            "a doubling inside a ±102 % band"
+        );
+        assert!(
+            matches!(
+                Verdict::judge(Some(&base), &value(31.0, 0.084)),
+                Verdict::Noisy(_)
+            ),
+            "a band of 25.2 %"
+        );
+        assert!(
+            matches!(
+                Verdict::judge(Some(&base), &value(31.0, 0.083)),
+                Verdict::Same(_)
+            ),
+            "a band of 24.9 %"
+        );
+        assert!(
+            matches!(
+                Verdict::judge(Some(&base), &value(93.0, 0.34)),
+                Verdict::Worse(_)
+            ),
+            "beyond even a wide band"
+        );
+        assert_eq!(
+            Verdict::judge(Some(&base), &value(62.0, 0.34)).word(),
+            "NOISY",
+            "shown"
+        );
     }
 
     #[test]
