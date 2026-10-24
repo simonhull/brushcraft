@@ -430,16 +430,25 @@ fn a_never_saved_project_restores_from_its_recovery_file_alone() {
     }
 }
 
+/// Under a tight budget, the stroke in progress has tiles written back to the file past its
+/// save point, and a crash discards them, whether or not the project was ever saved.
+///
+/// The two cases (each a child process and a directory of its own) run side by side: under
+/// the tight budget each takes several seconds.
 #[test]
 fn a_crash_discards_the_stroke_in_progress_written_back_to_make_room() {
-    for saved in [true, false] {
-        crash(Scenario {
-            saved,
-            strokes: 3,
-            crash: Crash::MidStroke,
-            tight: true,
-        });
-    }
+    std::thread::scope(|scope| {
+        for saved in [true, false] {
+            scope.spawn(move || {
+                crash(Scenario {
+                    saved,
+                    strokes: 3,
+                    crash: Crash::MidStroke,
+                    tight: true,
+                });
+            });
+        }
+    });
 }
 
 #[test]

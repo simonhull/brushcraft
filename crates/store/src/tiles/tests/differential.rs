@@ -622,28 +622,51 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
     }
 }
 
-/// The thread counts the batched runs compare: one, two, and one per hardware thread.
+/// The thread counts the batched runs compare: one, two and eight, whatever the hardware.
+///
+/// The comparison needs several distinct counts, one among them, with work split unevenly
+/// across workers. A fixed eight keeps the test the same on every machine, where one per
+/// hardware thread (32 on the dev box) grew it with the hardware.
 fn thread_counts() -> [NonZeroUsize; 3] {
-    let all = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
-    [NonZeroUsize::MIN, NonZeroUsize::new(2).unwrap(), all]
+    [1, 2, 8].map(|n| NonZeroUsize::new(n).unwrap())
 }
 
+/// The same random operations end in the same bits at every thread count, at the minimum
+/// budget, where batches are halved and rounds cut short, and with room to spare, where the
+/// batches are wide.
+///
+/// The runs are independent (each has its own store and file), so they run side by side, each
+/// on a thread of its own: the test takes as long as its slowest run, not all twelve in turn.
 #[test]
 fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
     let mesh = mesh();
-    // The minimum budget, where batches are halved and rounds cut short, and room to spare,
-    // where the batches are wide.
-    let mut total = Stats::default();
-    for (seed, config) in (0xBA7C..).zip(budgets(&mesh, &[0, 1, 3, 40])) {
-        let outcomes: Vec<Outcome> = thread_counts()
-            .into_iter()
-            .map(|threads| {
-                let config = config.with_workers(Workers::Fixed(threads));
-                run(&mesh, 7, config, Reads::Batched, seed, 400)
+    let budgets: Vec<(u64, StoreConfig)> = (0xBA7C..).zip(budgets(&mesh, &[0, 1, 3, 40])).collect();
+    let outcomes: Vec<Vec<Outcome>> = thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "every run is spawned before any is joined: a lazy chain would run them in turn"
+        )]
+        let runs: Vec<Vec<_>> = budgets
+            .iter()
+            .map(|&(seed, config)| {
+                thread_counts()
+                    .map(|threads| {
+                        let config = config.with_workers(Workers::Fixed(threads));
+                        let mesh = &mesh;
+                        scope.spawn(move || run(mesh, 7, config, Reads::Batched, seed, 400))
+                    })
+                    .into_iter()
+                    .collect()
             })
             .collect();
+        runs.into_iter()
+            .map(|counts| counts.into_iter().map(|run| run.join().unwrap()).collect())
+            .collect()
+    });
+    let mut total = Stats::default();
+    for ((_, config), at_counts) in budgets.iter().zip(&outcomes) {
         let what = format!("{} bytes", config.budget_bytes);
-        let (first, rest) = outcomes.split_first().unwrap();
+        let (first, rest) = at_counts.split_first().unwrap();
         assert_covered(first.stats, &what);
         total = total + first.stats;
         for (outcome, threads) in rest.iter().zip(thread_counts().into_iter().skip(1)) {
