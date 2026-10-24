@@ -34,9 +34,31 @@ pub(crate) struct Runner {
     pub(crate) busy: Vec<Busy>,
 }
 
-/// The CPU the stage benches are pinned to: one core, away from CPU 0 (where interrupts tend to
-/// land), and present on any machine with three or more.
+/// Which allowed CPU the stage benches are pinned to, counted from 0 among those the affinity
+/// mask allows.
+///
+/// The third: away from the first (where interrupts tend to land), and present wherever three
+/// or more are allowed.
 const STAGE_CPU: usize = 2;
+
+/// The CPU to pin the stage benches to among `allowed` (ascending CPU ids, as the affinity
+/// mask gives them, not necessarily `0..n`): the [`STAGE_CPU`]th, or the last if there are
+/// fewer; `None` if none is allowed.
+fn stage_cpu(allowed: &[usize]) -> Option<usize> {
+    allowed.get(STAGE_CPU).or_else(|| allowed.last()).copied()
+}
+
+/// The CPUs this process's affinity mask allows, ascending.
+///
+/// # Errors
+///
+/// If the mask can't be read.
+fn allowed_cpus() -> Result<Vec<usize>> {
+    let mask = rustix::thread::sched_getaffinity(None).context("reading the affinity mask")?;
+    Ok((0..rustix::thread::CpuSet::MAX_CPU)
+        .filter(|&cpu| mask.is_set(cpu))
+        .collect())
+}
 
 impl Runner {
     /// A runner of this binary's subcommands with `workers`, and of the stage benches in
@@ -118,16 +140,15 @@ impl Runner {
             .collect()
     }
 
-    /// Runs the stage benches once, pinned to [`STAGE_CPU`] (or the last CPU, on a machine
-    /// with fewer), through `taskset` and the `cargo` building this (`$CARGO`, else the one on
+    /// Runs the stage benches once, pinned to one allowed CPU ([`stage_cpu`]), through
+    /// `taskset` and the `cargo` building this (`$CARGO`, else the one on
     /// the path), and returns divan's table.
     ///
     /// # Errors
     ///
     /// If `taskset` or `cargo` can't be run, or the benches fail.
     pub(crate) fn stage_benches(&mut self) -> Result<String> {
-        let cpus = std::thread::available_parallelism()?.get();
-        let cpu = STAGE_CPU.min(cpus - 1);
+        let cpu = stage_cpu(&allowed_cpus()?).context("no CPU in the affinity mask")?;
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut args: Vec<OsString> = vec!["-c".into(), cpu.to_string().into(), cargo];
         args.extend(
@@ -535,6 +556,20 @@ pub(crate) fn generate(runner: &mut Runner, project: &Path, scale: Scale) -> Res
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use super::*;
+
+    /// The stage CPU comes from the affinity mask's CPUs, whatever their ids.
+    #[test]
+    fn the_stage_cpu_is_an_allowed_one() {
+        assert_eq!(stage_cpu(&[0, 1, 2, 3]), Some(2), "the third");
+        assert_eq!(stage_cpu(&[8, 9, 12, 13]), Some(12), "a mask not from 0");
+        assert_eq!(stage_cpu(&[5, 7]), Some(7), "the last of two");
+        assert_eq!(stage_cpu(&[]), None, "none");
+        let allowed = allowed_cpus().unwrap();
+        assert!(
+            stage_cpu(&allowed).is_some_and(|cpu| allowed.contains(&cpu)),
+            "this process's: {allowed:?}"
+        );
+    }
 
     /// The first round is a warm-up: its times never reach the samples.
     #[test]
