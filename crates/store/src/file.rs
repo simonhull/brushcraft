@@ -558,10 +558,19 @@ pub struct ProjectFile {
     /// Where the next record goes.
     end: u64,
     /// Each live tile's and bounds' latest record, saved or not: what reads find.
+    ///
+    /// **Invariant:** `live` is `saved`'s records with `pending`'s put in over them (just
+    /// `pending` before the first save point). Each save point's maps are derived from the
+    /// last one's and the records written since (see [`SavedState`]), which is right only while
+    /// this holds. So every record appended goes into `live` and `pending` together, through
+    /// [`ProjectFile::note`]; loading a save point sets `live` and `saved` from the same chain,
+    /// with `pending` empty; and a save point leaves in `pending` only the records past its
+    /// cut, which `live` holds too. Tests assert it before and after every save point.
     live: BTreeMap<Name, Loc>,
-    /// Entries written since the last Index.
+    /// Entries written since the last Index (see the invariant on `live`).
     pending: BTreeMap<Name, Loc>,
-    /// The latest save point, the parent of the next one; `None` until the first save.
+    /// The latest save point, the parent of the next one; `None` until the first save (see the
+    /// invariant on `live`).
     saved: Option<SavedState>,
     /// Delta indexes since the last full one.
     deltas: u32,
@@ -1554,6 +1563,8 @@ impl ProjectFile {
     ///
     /// [`StoreError::TooLarge`], [`StoreError::Io`].
     fn append_index(&mut self) -> Result<Appended, StoreError> {
+        #[cfg(test)]
+        self.check_live();
         let parent = self.last_index();
         let coverage = if parent.is_none() || self.deltas + 1 >= FULL_EVERY {
             Coverage::Full
@@ -1656,7 +1667,10 @@ impl ProjectFile {
             None => self.pending.clear(),
         }
         #[cfg(test)]
-        self.check_saved();
+        {
+            self.check_saved();
+            self.check_live();
+        }
         loc.offset
     }
 
@@ -1828,6 +1842,46 @@ impl ProjectFile {
             "the derived save point's bounds differ from its chain's"
         );
         assert_eq!(saved.head, rebuilt.head, "the derived save point's head");
+    }
+
+    /// Checks the invariant on [`ProjectFile::live`]: it holds the latest save point's records
+    /// with those written since put in over them, and nothing else. Run before and after every
+    /// save point a test writes.
+    ///
+    /// # Panics
+    ///
+    /// If it doesn't.
+    fn check_live(&self) {
+        let saved_loc = |name: &Name| {
+            let saved = self.saved.as_ref()?;
+            match name {
+                Name::Tile(key) => saved.tiles.get(key),
+                Name::Bounds(key) => saved.bounds.get(key),
+            }
+            .copied()
+        };
+        for (name, loc) in &self.live {
+            let expected = self.pending.get(name).copied().or_else(|| saved_loc(name));
+            assert_eq!(
+                Some(*loc),
+                expected,
+                "{name:?}: live, against saved and pending"
+            );
+        }
+        let saved_len = self
+            .saved
+            .as_ref()
+            .map_or(0, |saved| saved.tiles.len() + saved.bounds.len());
+        let only_pending = self
+            .pending
+            .keys()
+            .filter(|name| saved_loc(name).is_none())
+            .count();
+        assert_eq!(
+            self.live.len(),
+            saved_len + only_pending,
+            "live holds a name neither saved nor pending, or lacks one"
+        );
     }
 
     /// Payload bytes of the last Index.
@@ -2294,12 +2348,12 @@ fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
                     return Err(StoreError::Damaged { offset });
                 }
                 let loc = to.append_record(&raw)?;
-                to.live.insert(*name, loc);
+                to.note(*name, None, Stamp::ZERO, loc);
             }
             Name::Bounds(key) => match from.read_bounds_record(key)? {
                 Some(raw) => {
                     let loc = to.append_record(&raw)?;
-                    to.live.insert(*name, loc);
+                    to.note(*name, None, Stamp::ZERO, loc);
                 }
                 None => to.write_bounds(*key, None, Stamp::ZERO)?,
             },
