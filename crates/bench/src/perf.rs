@@ -26,6 +26,7 @@
 //! binary wasn't built from a clean tree at the commit checked out. Records name the commit the
 //! binary was built from (embedded by `build.rs`).
 
+mod census;
 mod compare;
 mod history;
 mod json;
@@ -51,7 +52,7 @@ use crate::perf::metric::Metric;
 use crate::perf::project::{
     Copied, Scale, Source, Sweep, WorkDir, WorkRoot, cache_key, cached_file, remove_stale,
 };
-use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak, own_load};
+use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak};
 use crate::perf::suite::Runner;
 use crate::report::Output;
 
@@ -154,29 +155,26 @@ impl Session {
         name: &str,
         project: &str,
         out: &mut Output<J, H>,
-        measure: impl FnOnce(&mut Runner) -> Result<Vec<Metric>>,
+        measure: impl FnOnce(&Runner) -> Result<Vec<Metric>>,
     ) -> Result<()> {
-        let others = |runner: &Runner| -> Result<Load> {
-            Ok(Load::now()?.less(own_load(&runner.busy, Instant::now())))
-        };
         if let (Some(quiet), Label::Quiet) = (self.quiet, self.label) {
+            let log = &self.log;
             let settled = quiet.settle(
-                || others(&self.runner),
+                || Ok(log.latest()?.others),
                 std::thread::sleep,
                 |line| out.say(&format!("perf: {name}: {line}")),
             )?;
             self.label = self.label.after(settled);
         }
         let start = Instant::now();
-        let (load, others_start) = (Load::now()?, others(&self.runner)?);
+        let (load, others_start) = (Load::now()?, self.log.latest()?.others);
         out.say(&format!(
             "perf: {name} (load {load}, others {others_start})"
         ))?;
-        let metrics = measure(&mut self.runner).with_context(|| format!("the {name} part"))?;
-        // Load that arrived while the part ran: each sample less the suite's own share, now that
-        // every stretch of the part's work is known, and the others' load as it ended.
-        let at_end = others(&self.runner)?;
-        let peak = others_peak(&self.log.since(start), &self.runner.busy)
+        let metrics = measure(&self.runner).with_context(|| format!("the {name} part"))?;
+        // Load that arrived while the part ran: the others' highest during it, and as it ended.
+        let at_end = self.log.latest()?.others;
+        let peak = others_peak(&self.log.since(start))
             .map_or(at_end, |peak| if peak > at_end { peak } else { at_end });
         if let Some(quiet) = self.quiet {
             let held = quiet.held(peak);
@@ -271,7 +269,7 @@ fn copy<J: Write, H: Write>(
 ///
 /// If generating it, or tidying the cache, fails.
 fn medium<J: Write, H: Write>(
-    runner: &mut Runner,
+    runner: &Runner,
     cache: &Path,
     out: &mut Output<J, H>,
 ) -> Result<(Source, String)> {
@@ -611,14 +609,14 @@ fn measure_all<J: Write, H: Write>(
             Scale::Tiny => {
                 let work = work_dir(&std::env::temp_dir(), out)?;
                 let file = work.project("tiny")?;
-                suite::generate(&mut session.runner, &file, scale)?;
+                suite::generate(&session.runner, &file, scale)?;
                 measure_project(session, scale, &file, "tiny", out)?;
             }
             Scale::Medium => {
                 let cache = cache_root()?.join("perf");
                 std::fs::create_dir_all(&cache)
                     .with_context(|| format!("creating {}", cache.display()))?;
-                let (cached, key) = medium(&mut session.runner, &cache, out)?;
+                let (cached, key) = medium(&session.runner, &cache, out)?;
                 let work = work_dir(&cache, out)?;
                 let file = copy(&work, &cached, "medium", out)?;
                 // The run measures its own copy: other runs may tidy the cache from here on.

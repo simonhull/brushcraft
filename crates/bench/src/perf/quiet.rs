@@ -1,24 +1,30 @@
 //! The quiet guard: before each measured part, wait (for a bounded time) until the machine's
 //! other work settles, and log the load all through the run.
 //!
-//! The measure is the 1-minute load average from `/proc/loadavg`, less the suite's own share of
-//! it. The suite's parts load the machine themselves (a page-in keeps 16 workers busy), and the
-//! load average remembers that for minutes: on a desktop whose floor is ~1.7, waiting for the raw
-//! figure to fall below 2 after a part would take two minutes or never happen. So each part's
-//! CPU time is recorded ([`Busy`]), and its share of the load average is worked out the way the
-//! kernel averages ([`own_load`]): what is left is the other processes' load, which is what the
-//! guard waits on.
+//! The measure is the other processes' load: their threads running, waiting to run, or in
+//! uninterruptible sleep, counted every 2 s with the suite's own process tree left out
+//! ([`census`]), and averaged as the Linux 1-minute load average is, from the load average as the
+//! run starts ([`Average`]). The suite's parts load the machine themselves (a page-in keeps 16
+//! workers busy), and the load average remembers that for minutes; it also carries noise from
+//! them, as it samples once every 5 s a count that swings between 0 and 16 within milliseconds.
+//! Taking a model of the suite's share off the load average left that noise in (a quiet desktop
+//! read as 3.5 one page-in and 1.6 the next), so the suite is left out of the count instead.
+//! A part is measured once the others' load is below 2, and the run is labelled loaded if it
+//! reaches 2 during a part.
 
 use std::fmt;
 use std::io::Write as _;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use thiserror::Error;
+
+use crate::perf::census::{self, Pid};
 
 /// A load average: the mean number of tasks running or waiting to run (or in uninterruptible
 /// sleep), finite and at least 0.
@@ -77,12 +83,6 @@ impl Load {
         let text = std::fs::read_to_string("/proc/loadavg").context("reading /proc/loadavg")?;
         Ok(Self::from_loadavg(&text)?)
     }
-
-    /// This load less `other`, at least 0.
-    #[must_use]
-    pub(crate) fn less(self, other: Self) -> Self {
-        Self((self.0 - other.0).max(0.0))
-    }
 }
 
 impl FromStr for Load {
@@ -102,59 +102,68 @@ impl fmt::Display for Load {
     }
 }
 
-/// The kernel's averaging time for the 1-minute load: an exponential with this time constant.
+/// The Linux load average's time constant for its 1-minute figure: an exponential moving
+/// average with this time constant, in seconds.
 const MINUTE: f64 = 60.0;
 
-/// A stretch of the suite's own work: a part's child processes, from start to finish, and the
-/// CPU time they took.
+/// The other processes' load: their active threads ([`census::others_active`]), averaged as the
+/// Linux 1-minute load average is, from a starting figure.
+///
+/// It is what the load average would read without the suite: the same average of the same
+/// count, with the suite's own bursts (whose sampling noise the load average carries, and no
+/// model of the suite's share can take off) left out.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Busy {
-    /// When it started.
-    pub(crate) start: Instant,
-    /// When it ended.
-    pub(crate) end: Instant,
-    /// CPU time it took, every thread's.
-    pub(crate) cpu: Duration,
+pub(crate) struct Average {
+    /// The average.
+    value: f64,
+    /// When it was last brought up to date.
+    at: Instant,
 }
 
-/// The suite's own share of the 1-minute load average at `now`, from the stretches of work it
-/// did (`busy`), each taken to keep `cpu / (end − start)` CPUs busy throughout.
-///
-/// The kernel's average is an exponential moving average with a one-minute time constant of the
-/// tasks runnable, sampled every 5 s; taken as continuous, a load `u` held over `[s, e]` adds
-/// `u · (e^−(now−e)/60 − e^−(now−s)/60)` to it at `now`. A CPU-bound thread is runnable while it
-/// runs, so CPU time stands for runnable time; threads waiting for a CPU, or for the disk, count
-/// in the kernel's figure and not here, so this is a slight underestimate.
-///
-/// `now` may fall inside a stretch (a load sample taken while a child ran, judged once it has
-/// ended): only the stretch's part before `now` counts then, at the stretch's mean rate.
-pub(crate) fn own_load(busy: &[Busy], now: Instant) -> Load {
-    let share: f64 = busy
-        .iter()
-        .filter_map(|b| {
-            let length = b.end.checked_duration_since(b.start)?.as_secs_f64();
-            if length <= 0.0 {
-                return None;
-            }
-            let since_start = now.checked_duration_since(b.start)?.as_secs_f64();
-            let since_end = now.saturating_duration_since(b.end).as_secs_f64();
-            let cpus = b.cpu.as_secs_f64() / length;
-            Some(cpus * ((-since_end / MINUTE).exp() - (-since_start / MINUTE).exp()))
-        })
-        .sum();
-    Load(share.max(0.0))
+impl Average {
+    /// An average reading `start` at `at`. The suite seeds it with the load average as the run
+    /// starts, before any part: all of it is the other processes' then.
+    pub(crate) const fn seeded(start: Load, at: Instant) -> Self {
+        Self { value: start.0, at }
+    }
+
+    /// Folds in `active` threads counted at `at`, taken as held since the last count: the
+    /// average moves towards `active` by `1 − e^−Δt/60`, as the load average does over `Δt`.
+    /// A count from before the last one changes nothing.
+    pub(crate) fn fold(&mut self, active: u32, at: Instant) {
+        let Some(since) = at.checked_duration_since(self.at) else {
+            return;
+        };
+        let keep = (-since.as_secs_f64() / MINUTE).exp();
+        self.value = f64::from(active) + (self.value - f64::from(active)) * keep;
+        self.at = at;
+    }
+
+    /// The average as a load.
+    pub(crate) const fn load(&self) -> Load {
+        Load(self.value)
+    }
 }
 
-/// The other processes' highest load among `samples` (when, and the 1-minute load average
-/// then), each less the suite's own share at its time from `busy` ([`own_load`]); `None` without
-/// samples.
+/// One look of the load log: when, the 1-minute load average, and the other processes' load.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Sample {
+    /// When it was taken.
+    pub(crate) at: Instant,
+    /// The 1-minute load average then, the suite's own work included.
+    pub(crate) load: Load,
+    /// The other processes' load then ([`Average`]).
+    pub(crate) others: Load,
+}
+
+/// The other processes' highest load among `samples`; `None` without samples.
 ///
-/// Taken once a part has ended, so every stretch of its work is known, this sees load that
-/// arrived while the part ran, which the guard (looking only before it) can't.
-pub(crate) fn others_peak(samples: &[(Instant, Load)], busy: &[Busy]) -> Option<Load> {
+/// Taken once a part has ended, this sees load that arrived while the part ran, which the guard
+/// (looking only before it) can't.
+pub(crate) fn others_peak(samples: &[Sample]) -> Option<Load> {
     samples
         .iter()
-        .map(|&(at, load)| load.less(own_load(busy, at)))
+        .map(|sample| sample.others)
         .reduce(|a, b| if b > a { b } else { a })
 }
 
@@ -284,49 +293,90 @@ impl Quiet {
     }
 }
 
-/// Samples the load average on a thread of its own every [`LoadLog::EVERY`], printing each
-/// sample to stderr, until stopped.
+/// Samples the load on a thread of its own every [`LoadLog::EVERY`] until stopped.
+///
+/// Each sample holds the load average and the other processes' load ([`Average`]), from a
+/// census of their threads ([`census`]); one in [`LoadLog::SHOWN`] is printed to stderr.
 #[derive(Debug)]
 pub(crate) struct LoadLog {
     /// Tells the thread to stop.
     stop: Arc<AtomicBool>,
-    /// The samples so far: when, and the 1-minute load average.
-    samples: Arc<Mutex<Vec<(Instant, Load)>>>,
+    /// The samples so far, oldest first; never empty.
+    samples: Arc<Mutex<Vec<Sample>>>,
     /// The thread; it ends with the first error it meets, if any.
     thread: JoinHandle<Result<()>>,
 }
 
-impl LoadLog {
-    /// How often the log samples: as often as the kernel updates the average.
-    const EVERY: Duration = Duration::from_secs(5);
+/// Takes one sample: the load average now, and `others` brought up to date with a census of
+/// the other processes than this one and its descendants.
+///
+/// # Errors
+///
+/// If `/proc` can't be read.
+fn sample(others: &mut Average) -> Result<Sample> {
+    let load = Load::now()?;
+    let active = census::others_active(&census::scan(Path::new("/proc"))?, Pid::this());
+    let at = Instant::now();
+    others.fold(active, at);
+    Ok(Sample {
+        at,
+        load,
+        others: others.load(),
+    })
+}
 
-    /// Starts logging.
+impl LoadLog {
+    /// How often the log samples.
+    ///
+    /// A census costs ~17 ms of one CPU, nearly all of it the Linux kernel producing ~2,500
+    /// threads' `stat` lines (measured on a 32-thread desktop with ~680 processes), so every
+    /// 2 s it takes under 1 % of one CPU from the parts it watches. That is often enough: the
+    /// other processes' count varies by about 1 from one look to the next, which averaged over a
+    /// minute leaves noise of about ±0.15, against ±1.3 in the load average from the suite's own
+    /// bursts.
+    const EVERY: Duration = Duration::from_secs(2);
+    /// One sample in this many is printed: every 10 s.
+    const SHOWN: u32 = 5;
+
+    /// Starts logging: takes the first sample, which seeds the other processes' load with the
+    /// load average (nothing of the suite runs yet), then samples on a thread.
     ///
     /// # Errors
     ///
-    /// If the thread can't be started.
+    /// If the first sample fails, or the thread can't be started.
     pub(crate) fn start() -> Result<Self> {
+        let start = Instant::now();
+        let mut others = Average::seeded(Load::now()?, start);
+        let first = sample(&mut others)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let samples = Arc::new(Mutex::new(Vec::new()));
+        let samples = Arc::new(Mutex::new(vec![first]));
         let (flag, shared) = (Arc::clone(&stop), Arc::clone(&samples));
+        let show = move |taken: &Sample| {
+            writeln!(
+                std::io::stderr(),
+                "perf: load {}, others {} at {:.0} s",
+                taken.load,
+                taken.others,
+                taken.at.duration_since(start).as_secs_f64()
+            )
+        };
+        show(&first)?;
         let thread = std::thread::Builder::new()
             .name("load-log".to_owned())
             .spawn(move || {
-                let start = Instant::now();
-                let mut next = start;
+                let mut next = start + Self::EVERY;
+                let mut count = 1_u32;
                 while !flag.load(Ordering::Relaxed) {
-                    let now = Instant::now();
-                    if now >= next {
-                        let load = Load::now()?;
+                    if Instant::now() >= next {
+                        let taken = sample(&mut others)?;
                         shared
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
-                            .push((now, load));
-                        writeln!(
-                            std::io::stderr(),
-                            "perf: load {load} at {:.0} s",
-                            now.duration_since(start).as_secs_f64()
-                        )?;
+                            .push(taken);
+                        if count.is_multiple_of(Self::SHOWN) {
+                            show(&taken)?;
+                        }
+                        count = count.wrapping_add(1);
                         next += Self::EVERY;
                     }
                     // Short naps, so stopping is prompt.
@@ -342,22 +392,40 @@ impl LoadLog {
         })
     }
 
+    /// The latest sample: at most [`LoadLog::EVERY`] old while the log runs.
+    ///
+    /// # Errors
+    ///
+    /// If the log's thread has stopped (a sample failed), so the latest sample would be stale.
+    pub(crate) fn latest(&self) -> Result<Sample> {
+        ensure!(
+            !self.thread.is_finished(),
+            "the load log stopped early (its error comes when the run ends)"
+        );
+        self.samples
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last()
+            .copied()
+            .ok_or_else(|| anyhow!("the load log has no sample"))
+    }
+
     /// The samples taken from `since` on.
-    pub(crate) fn since(&self, since: Instant) -> Vec<(Instant, Load)> {
+    pub(crate) fn since(&self, since: Instant) -> Vec<Sample> {
         self.samples
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .filter(|&&(at, _)| at >= since)
+            .filter(|sample| sample.at >= since)
             .copied()
             .collect()
     }
 
-    /// The highest load sampled from `since` on (`None` if no sample was taken since).
+    /// The highest load average sampled from `since` on (`None` if no sample was taken since).
     pub(crate) fn max_since(&self, since: Instant) -> Option<Load> {
         self.since(since)
             .into_iter()
-            .map(|(_, load)| load)
+            .map(|sample| sample.load)
             .reduce(|a, b| if b > a { b } else { a })
     }
 
@@ -396,7 +464,6 @@ mod tests {
             assert!(Load::from_loadavg(bad).is_err(), "{bad:?}");
         }
         assert!(Load::now().is_ok(), "this machine's");
-        assert_eq!(load(1.0).less(load(3.0)), load(0.0), "never below 0");
         assert_eq!(load(2.5).to_string(), "2.50", "shown");
     }
 
@@ -493,89 +560,102 @@ mod tests {
         );
     }
 
-    /// The suite's own share decays as the kernel's average does: a minute of 16 busy CPUs
-    /// leaves `16 (1 − 1/e)` just after, a minute later `1/e` of that, and nothing before it
-    /// started.
+    /// The others' load starts at its seed and moves towards each count as the load average
+    /// would.
+    ///
+    /// A minute at 0 leaves `1/e` of the seed, a count held for long is reached, and a count
+    /// from the past changes nothing.
     #[test]
-    fn the_suites_own_load_decays_as_the_kernels_average() {
+    fn the_others_average_is_seeded_and_decays() {
         let start = Instant::now();
-        let busy = Busy {
-            start,
-            end: start + Duration::from_mins(1),
-            cpu: Duration::from_mins(16),
-        };
-        let at = |secs| own_load(&[busy], start + Duration::from_secs(secs)).get();
-        let just_after = 16.0 * (1.0 - (-1.0_f64).exp());
-        assert!((at(60) - just_after).abs() < 1e-9, "{}", at(60));
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut average = Average::seeded(load(3.0), start);
+        assert_eq!(average.load(), load(3.0), "the seed at once");
+        average.fold(0, at(60));
+        let a_minute = 3.0 / 1.0_f64.exp();
         assert!(
-            (at(120) - just_after / 1.0_f64.exp()).abs() < 1e-9,
+            (average.load().get() - a_minute).abs() < 1e-9,
             "{}",
-            at(120)
+            average.load()
         );
-        assert!(at(600) < 0.01, "gone in ten minutes: {}", at(600));
-        assert_eq!(own_load(&[busy], start), load(0.0), "nothing as it starts");
-        let midway = own_load(&[busy], start + Duration::from_secs(30)).get();
-        let half = 16.0 * (1.0 - (-0.5_f64).exp());
-        assert!((midway - half).abs() < 1e-9, "half a minute in: {midway}");
-        let instant = Busy {
-            start,
-            end: start,
-            cpu: Duration::ZERO,
-        };
+        let in_steps = (1..=60).fold(Average::seeded(load(3.0), start), |mut avg, s| {
+            avg.fold(0, at(s));
+            avg
+        });
+        assert!(
+            (in_steps.load().get() - a_minute).abs() < 1e-9,
+            "the same in steps of a second: {}",
+            in_steps.load()
+        );
+        average.fold(5, at(60 + 600));
+        assert!(
+            (average.load().get() - 5.0).abs() < 1e-3,
+            "ten minutes at 5: {}",
+            average.load()
+        );
+        let before = average;
+        average.fold(40, at(30));
+        assert_eq!(average, before, "a count from the past");
+        average.fold(40, at(660));
         assert_eq!(
-            own_load(&[instant], start + Duration::from_secs(1)),
-            load(0.0),
-            "an empty stretch adds nothing"
+            average.load(),
+            before.load(),
+            "no time passed: nothing moves"
         );
-        let two = own_load(&[busy, busy], start + Duration::from_secs(90)).get();
-        assert!((two - 2.0 * at(90)).abs() < 1e-9, "shares add up");
     }
 
-    /// Load that arrives during a part labels it loaded, once the suite's own share is taken
-    /// off each sample; the suite's own load alone doesn't.
+    /// A sample at `secs` after `start`, with the load average at `load_avg` and the others'
+    /// load at `others`.
+    fn sample_at(start: Instant, secs: u64, load_avg: f64, others: f64) -> Sample {
+        Sample {
+            at: start + Duration::from_secs(secs),
+            load: load(load_avg),
+            others: load(others),
+        }
+    }
+
+    /// A part is judged on the others' load alone: a load average swollen by the suite's own
+    /// work doesn't label it loaded, and the others' load reaching 2 at any sample does.
     #[test]
-    fn load_arriving_mid_part_is_seen_after_it() {
+    fn a_part_is_judged_on_the_others_load() {
         let quiet = Quiet::new(Duration::from_secs(300));
         let start = Instant::now();
-        let busy = [Busy {
-            start,
-            end: start + Duration::from_secs(60),
-            cpu: Duration::from_mins(16),
-        }];
-        let at = |secs| start + Duration::from_secs(secs);
-        // The suite alone: 16 CPUs for a minute show as ~6.3 at 30 s, ~10.1 at 60 s.
-        let own_only: Vec<(Instant, Load)> =
-            [30, 60].map(|s| (at(s), own_load(&busy, at(s)))).to_vec();
-        let peak = others_peak(&own_only, &busy).unwrap();
-        assert!(peak.get() < 1e-9, "nothing but the suite: {peak}");
+        let own_only = [
+            sample_at(start, 0, 1.2, 1.2),
+            sample_at(start, 30, 7.6, 1.3),
+            sample_at(start, 60, 8.2, 1.1),
+        ];
+        let peak = others_peak(&own_only).unwrap();
+        assert_eq!(peak, load(1.3), "the others' highest");
         assert!(matches!(quiet.held(peak), Settled::Quiet { .. }), "quiet");
-        let busier: Vec<(Instant, Load)> = own_only
-            .iter()
-            .map(|&(t, l)| (t, load(l.get() + 2.5)))
-            .collect();
-        let busy_peak = others_peak(&busier, &busy).unwrap();
-        assert!(
-            (busy_peak.get() - 2.5).abs() < 1e-9,
-            "the others' 2.5: {busy_peak}"
-        );
+        let mut busier = own_only;
+        if let Some(middle) = busier.get_mut(1) {
+            middle.others = load(2.0);
+        }
+        let busy_peak = others_peak(&busier).unwrap();
         assert_eq!(
             quiet.held(busy_peak),
-            Settled::Loaded { others: busy_peak },
-            "loaded"
+            Settled::Loaded { others: load(2.0) },
+            "loaded at 2"
         );
-        assert_eq!(others_peak(&[], &busy), None, "no samples");
+        assert_eq!(others_peak(&[]), None, "no samples");
     }
 
     #[test]
     fn the_log_samples_and_stops() {
         let start = Instant::now();
         let log = LoadLog::start().unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(log.max_since(start).is_some(), "sampled at once");
+        let first = log.latest().unwrap();
+        assert!(first.at >= start, "sampled at once: {first:?}");
+        assert_eq!(log.max_since(start), Some(first.load), "the load average");
         assert!(
             log.max_since(start + Duration::from_secs(3600)).is_none(),
             "nothing from the future"
         );
+        std::thread::sleep(Duration::from_millis(2500));
+        let later = log.latest().unwrap();
+        assert!(later.at > first.at, "sampled again: {later:?}");
+        assert!(log.since(start).len() >= 2, "two samples or more");
         log.stop().unwrap();
     }
 }

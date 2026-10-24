@@ -106,7 +106,8 @@ pub(crate) struct RunInfo {
 pub(crate) struct PartLoad {
     /// The 1-minute load average as the part started.
     pub(crate) start: Load,
-    /// That, less the suite's own share: the other processes' load the guard waited on.
+    /// The other processes' load as the part started, the guard's measure
+    /// ([`crate::perf::quiet::Average`]).
     pub(crate) others: Load,
     /// The other processes' highest load during the part and as it ended, judged after it
     /// ([`crate::perf::quiet::others_peak`]); at or above 2 it labels the run loaded.

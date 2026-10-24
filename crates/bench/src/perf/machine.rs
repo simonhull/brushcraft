@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, ensure};
 use store::Workers;
@@ -325,49 +325,11 @@ const fn civil(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-/// The CPU time this process's waited-for children have taken, from `/proc/self/stat`
-/// (`cutime` + `cstime`): read before and after running a child, the difference is its CPU
-/// time.
-///
-/// # Errors
-///
-/// If `/proc/self/stat` can't be read or parsed.
-pub(crate) fn children_cpu() -> Result<Duration> {
-    let stat = std::fs::read_to_string("/proc/self/stat").context("reading /proc/self/stat")?;
-    let ticks = parse_children_ticks(&stat)?;
-    let per_second = rustix::param::clock_ticks_per_second();
-    ensure!(per_second > 0, "no clock ticks per second");
-    Ok(Duration::from_secs(ticks / per_second)
-        + Duration::from_nanos(ticks % per_second * 1_000_000_000 / per_second))
-}
-
-/// The children's CPU ticks in `stat` (the text of `/proc/self/stat`): its 16th and 17th fields
-/// summed, counted after the command name's closing parenthesis as
-/// [`crate::sys::minor_faults`] counts.
-///
-/// # Errors
-///
-/// If there is no `)`, too few fields, or they aren't numbers.
-fn parse_children_ticks(stat: &str) -> Result<u64> {
-    let (_, after_name) = stat
-        .rsplit_once(')')
-        .ok_or_else(|| anyhow!("no command name in /proc/self/stat"))?;
-    // After the name, the 3rd field is the first: the 16th and 17th are the 14th and 15th.
-    let mut fields = after_name.split_whitespace().skip(13);
-    let mut tick = || -> Result<u64> {
-        let field = fields
-            .next()
-            .ok_or_else(|| anyhow!("too few fields in /proc/self/stat"))?;
-        field
-            .parse()
-            .with_context(|| format!("children's CPU time in /proc/self/stat: {field:?}"))
-    };
-    Ok(tick()? + tick()?)
-}
-
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -438,21 +400,6 @@ mod tests {
         assert_eq!(at(1_792_847_109), "2026-10-24T13:05:09Z", "today");
         assert_eq!(at(4_107_542_399), "2100-02-28T23:59:59Z", "2100 isn't leap");
         assert_eq!(civil(-1), (1969, 12, 31), "before the epoch");
-    }
-
-    #[test]
-    fn childrens_cpu_ticks_parse() {
-        let stat = "42 (a (b) c) S 1 42 42 0 -1 4194560 1234 7 5 0 10 3 25 17 20 0";
-        assert_eq!(
-            parse_children_ticks(stat).unwrap(),
-            42,
-            "cutime 25 + cstime 17"
-        );
-        assert!(
-            parse_children_ticks("42 (x) S 1 2").is_err(),
-            "too few fields"
-        );
-        assert!(children_cpu().is_ok(), "this process's");
     }
 
     /// The build's revision is recorded, and a mismatch with the tree, or changes in either,

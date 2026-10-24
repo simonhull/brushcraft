@@ -8,20 +8,17 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow, ensure};
 use store::Workers;
 
 use crate::perf::json::{Json, Object};
-use crate::perf::machine::children_cpu;
 use crate::perf::metric::{Measured, Metric, MetricName, Unit};
 use crate::perf::project::Scale;
-use crate::perf::quiet::Busy;
 use crate::perf::stages;
 
-/// Runs the suite's child processes and keeps the stretches of CPU work they did, for the
-/// quiet guard to discount (see [`crate::perf::quiet::own_load`]).
+/// Runs the suite's child processes. The quiet guard leaves them out of the other processes'
+/// load as descendants of this process (see [`crate::perf::census`]).
 #[derive(Debug)]
 pub(crate) struct Runner {
     /// The `brushcraft-bench` binary: this one.
@@ -30,8 +27,6 @@ pub(crate) struct Runner {
     workers: Workers,
     /// The repository, where the stage benches are built and run.
     repo: PathBuf,
-    /// Every child's stretch of work so far.
-    pub(crate) busy: Vec<Busy>,
 }
 
 /// Which allowed CPU the stage benches are pinned to, counted from 0 among those the affinity
@@ -72,17 +67,16 @@ impl Runner {
             exe: std::env::current_exe().context("finding brushcraft-bench's own path")?,
             workers,
             repo: repo.to_owned(),
-            busy: Vec::new(),
         })
     }
 
     /// Runs `program` with `args` (in `dir`, if given), its stderr passed through, and returns
-    /// its stdout; records its stretch of work.
+    /// its stdout.
     ///
     /// # Errors
     ///
     /// If it can't be started, or fails.
-    fn spawn(&mut self, program: &OsStr, args: &[OsString], dir: Option<&Path>) -> Result<String> {
+    fn spawn(program: &OsStr, args: &[OsString], dir: Option<&Path>) -> Result<String> {
         let shown = || {
             let words: Vec<String> = args
                 .iter()
@@ -99,8 +93,6 @@ impl Runner {
         if let Some(dir) = dir {
             command.current_dir(dir);
         }
-        let cpu_before = children_cpu()?;
-        let start = Instant::now();
         let mut child = command
             .spawn()
             .with_context(|| format!("starting {}", shown()))?;
@@ -113,11 +105,6 @@ impl Runner {
         let status = child
             .wait()
             .with_context(|| format!("waiting for {}", shown()))?;
-        self.busy.push(Busy {
-            start,
-            end: Instant::now(),
-            cpu: children_cpu()?.saturating_sub(cpu_before),
-        });
         read.with_context(|| format!("reading {}'s output", shown()))?;
         ensure!(status.success(), "{} failed: {status}", shown());
         Ok(stdout)
@@ -128,11 +115,11 @@ impl Runner {
     /// # Errors
     ///
     /// If it fails, or a line of its stdout isn't a JSON object.
-    pub(crate) fn bench(&mut self, args: &[OsString]) -> Result<Vec<Object>> {
+    pub(crate) fn bench(&self, args: &[OsString]) -> Result<Vec<Object>> {
         let mut all = args.to_vec();
         all.extend(["--workers".into(), self.workers.to_string().into()]);
         let exe = self.exe.clone();
-        let stdout = self.spawn(exe.as_os_str(), &all, None)?;
+        let stdout = Self::spawn(exe.as_os_str(), &all, None)?;
         stdout
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -147,7 +134,7 @@ impl Runner {
     /// # Errors
     ///
     /// If `taskset` or `cargo` can't be run, or the benches fail.
-    pub(crate) fn stage_benches(&mut self) -> Result<String> {
+    pub(crate) fn stage_benches(&self) -> Result<String> {
         let cpu = stage_cpu(&allowed_cpus()?).context("no CPU in the affinity mask")?;
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut args: Vec<OsString> = vec!["-c".into(), cpu.to_string().into(), cargo];
@@ -164,7 +151,7 @@ impl Runner {
             .map(OsString::from),
         );
         let repo = self.repo.clone();
-        self.spawn(OsStr::new("taskset"), &args, Some(&repo))
+        Self::spawn(OsStr::new("taskset"), &args, Some(&repo))
     }
 }
 
@@ -353,7 +340,7 @@ fn words(args: &[&str]) -> Vec<OsString> {
 /// # Errors
 ///
 /// If the benches fail or their table doesn't parse.
-pub(crate) fn stage_part(runner: &mut Runner, rounds: usize) -> Result<Vec<Metric>> {
+pub(crate) fn stage_part(runner: &Runner, rounds: usize) -> Result<Vec<Metric>> {
     stage_samples(std::iter::repeat_with(|| runner.stage_benches()), rounds)
 }
 
@@ -390,7 +377,7 @@ fn stage_samples(
 /// # Errors
 ///
 /// If a run fails or misses a result.
-pub(crate) fn brush_part(runner: &mut Runner, project: &Path, scale: Scale) -> Result<Vec<Metric>> {
+pub(crate) fn brush_part(runner: &Runner, project: &Path, scale: Scale) -> Result<Vec<Metric>> {
     let w = scale.workload();
     let mut samples = Samples::default();
     for _ in 0..w.runs {
@@ -414,11 +401,7 @@ pub(crate) fn brush_part(runner: &mut Runner, project: &Path, scale: Scale) -> R
 /// # Errors
 ///
 /// If a run fails or misses a result.
-pub(crate) fn page_in_part(
-    runner: &mut Runner,
-    project: &Path,
-    scale: Scale,
-) -> Result<Vec<Metric>> {
+pub(crate) fn page_in_part(runner: &Runner, project: &Path, scale: Scale) -> Result<Vec<Metric>> {
     let w = scale.workload();
     let mut samples = Samples::default();
     for _ in 0..w.runs {
@@ -445,11 +428,7 @@ pub(crate) fn page_in_part(
 /// # Errors
 ///
 /// If a run fails or misses a result.
-pub(crate) fn budget_part(
-    runner: &mut Runner,
-    project: &Path,
-    scale: Scale,
-) -> Result<Vec<Metric>> {
+pub(crate) fn budget_part(runner: &Runner, project: &Path, scale: Scale) -> Result<Vec<Metric>> {
     let w = scale.workload();
     let mut samples = Samples::default();
     for _ in 0..w.runs {
@@ -524,7 +503,7 @@ pub(crate) fn fit_line(points: &[(f64, f64)]) -> Option<(f64, f64)> {
 ///
 /// If a save fails, misses a result, or a round's saves edit the same count of vertices (no
 /// fit).
-pub(crate) fn save_part(runner: &mut Runner, project: &Path, scale: Scale) -> Result<Vec<Metric>> {
+pub(crate) fn save_part(runner: &Runner, project: &Path, scale: Scale) -> Result<Vec<Metric>> {
     let w = scale.workload();
     let mut samples = Samples::default();
     for _ in 0..w.runs {
@@ -565,7 +544,7 @@ pub(crate) fn save_part(runner: &mut Runner, project: &Path, scale: Scale) -> Re
 /// # Errors
 ///
 /// If the scale has no shape (the full project isn't the suite's to make), or `generate` fails.
-pub(crate) fn generate(runner: &mut Runner, project: &Path, scale: Scale) -> Result<()> {
+pub(crate) fn generate(runner: &Runner, project: &Path, scale: Scale) -> Result<()> {
     let shape = scale
         .shape()
         .ok_or_else(|| anyhow!("the {} project isn't generated by the suite", scale.name()))?;
