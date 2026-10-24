@@ -25,6 +25,10 @@ if they disagree, raise it rather than drifting silently.
 - `cargo fmt` uses the pinned nightly's rustfmt (unstable options in `rustfmt.toml`) through `RUSTFMT` in
   `mise.toml`. Stable rustfmt gives different output: point your editor at `scripts/rustfmt`, and run
   anything that needs nightly (fmt, Miri) via `cargo +$BRUSHCRAFT_NIGHTLY …` under mise.
+- `scripts/perf.sh`: the tracked performance suite (stage benches and a cached medium project; `--full` adds the
+  benchmark project), appended to the docs repo's `research/platform/perf/<machine>.jsonl` and compared with the
+  latest baseline; exit status 3 flags a slowdown beyond noise. Run it before merging into `main` and on any change to
+  a hot path; `--full` at milestones; `--baseline` only on a quiet machine at a clean commit.
 - Profiling: `samply` (pinned in `mise.toml`) on a release build, e.g. `samply record --save-only -o
   /tmp/brush.json.gz target/release/brushcraft-bench brush`, then `samply load /tmp/brush.json.gz`. On Linux it
   needs `kernel.perf_event_paranoid` at 1 or lower (`echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid`).

@@ -13,5 +13,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features --no-tests=warn
 cargo test --workspace --doc --all-features
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --all-features
+cargo bench --workspace --all-features --no-run
+# The performance suite on a tiny project: that it runs, not a measurement.
+cargo run -p brushcraft-bench -- perf --tiny
 cargo deny check
 cargo machete

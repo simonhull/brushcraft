@@ -46,6 +46,18 @@ jobs:
       - run: cargo nextest run --workspace --all-features --profile ci --no-tests=warn
       - run: cargo test --workspace --doc --all-features
 
+  perf:
+    # Builds every benchmark and runs the performance suite on a tiny project: it checks the
+    # suite works end to end. No timings: shared runners are too noisy to measure on, so the
+    # tiny run records nothing and compares nothing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --workspace --all-features --no-run
+      - run: cargo run -p brushcraft-bench -- perf --tiny
+
   deps:
     runs-on: ubuntu-latest
     steps:
