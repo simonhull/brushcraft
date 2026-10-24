@@ -3477,3 +3477,14 @@ fn a_save_point_mismatch_is_an_internal_error_not_a_retryable_save() {
         "an I/O-class error stays a save to retry"
     );
 }
+
+/// Looking for a tile an evaluation didn't pin names the tile, not a stale handle.
+#[test]
+fn a_tile_not_held_is_named_as_such() {
+    let key = tile_at(FaceId::new(0), 0, 0);
+    let held: Held = Vec::new();
+    assert!(
+        matches!(held_index(&held, &key), Err(Invariant::NotHeld(k)) if k == key),
+        "names the tile"
+    );
+}

@@ -420,6 +420,16 @@ pub enum Invariant {
     /// A slot handle was used after its slot was freed.
     #[error("a slot handle outlived its slot")]
     StaleHandle,
+    /// Slots borrowed together weren't all live and distinct: a handle outlived its slot, or
+    /// two named the same slot.
+    #[error("slots borrowed together were stale or named one slot twice")]
+    SlotsNotDisjoint,
+    /// A tile an evaluation didn't pin was looked for among those it did.
+    #[error("{0:?} is not among the tiles the evaluation pinned")]
+    NotHeld(TileKey),
+    /// A tile was named twice among the tasks of one round, which write one tile each.
+    #[error("{0:?} is named twice in one round")]
+    NamedTwice(TileKey),
     /// A tile was given a second slot in one pool.
     #[error("a tile was given a second slot")]
     SecondSlot,
@@ -1100,11 +1110,10 @@ fn recorded_or_listed<T: Send>(
 ///
 /// # Errors
 ///
-/// [`Invariant::StaleHandle`] if `key` isn't among them (the store asks only for tiles it
-/// pinned).
+/// [`Invariant::NotHeld`] if `key` isn't among them (the store asks only for tiles it pinned).
 fn held_index(held: &Held, key: &TileKey) -> Result<usize, Invariant> {
     held.binary_search_by_key(key, |&(k, _)| k)
-        .or(Err(Invariant::StaleHandle))
+        .or(Err(Invariant::NotHeld(*key)))
 }
 
 /// The tiles `key`'s positions are predicted from, listed with [`parent_tiles`], level 0 (the
@@ -4202,9 +4211,10 @@ impl TileStore {
     /// # Errors
     ///
     /// The first tile's error in key order: [`CacheError::Eval`] (not for a valid mesh), or
-    /// [`CacheError::Internal`] for a stale handle, a parent not in `below`, a slot named twice,
-    /// a broken slot or too few buffers. A slot whose tile failed holds whatever its prediction
-    /// had written: it stays stale.
+    /// [`CacheError::Internal`] for slots that can't be borrowed together (a stale handle or a
+    /// slot named twice, [`Invariant::SlotsNotDisjoint`]), a parent not in `below`
+    /// ([`Invariant::NotHeld`]), a broken slot, or too few buffers ([`Invariant::ShortBuffer`]). A
+    /// slot whose tile failed holds whatever its prediction had written: it stays stale.
     fn predict_round(
         &mut self,
         round: &[(TileKey, &[TileKey])],
@@ -4236,7 +4246,7 @@ impl TileStore {
             .into_iter()
             .map(|key| {
                 let at = held_index(below, &key)?;
-                below.get(at).copied().ok_or(Invariant::StaleHandle)
+                below.get(at).copied().ok_or(Invariant::NotHeld(key))
             })
             .collect::<Result<_, Invariant>>()?;
         let own: Vec<SlotId<EvaluatedSlot>> = slots.iter().flatten().copied().collect();
@@ -4248,7 +4258,7 @@ impl TileStore {
         let mut written = self
             .evaluated
             .get_many_mut(&ids)
-            .ok_or(Invariant::StaleHandle)?;
+            .ok_or(Invariant::SlotsNotDisjoint)?;
         let read = written.split_off(own.len());
         let parents: Positions<'_> = read_from
             .iter()
@@ -4259,6 +4269,7 @@ impl TileStore {
             })
             .collect();
         let mut written = written.into_iter();
+        let scratch_count = scratch.len();
         let mut buffers = scratch.iter_mut();
         let mut outs: Vec<&mut [Vec3]> = slots
             .iter()
@@ -4267,7 +4278,10 @@ impl TileStore {
                 None => buffers.next().map(Vec::as_mut_slice),
             })
             .collect::<Option<_>>()
-            .ok_or(Invariant::StaleHandle)?;
+            .ok_or(Invariant::ShortBuffer {
+                expected: slots.len() - own.len(),
+                got: scratch_count,
+            })?;
         let tiles = Tiles::Split(&parents);
         each_parallel(&self.workers, &tasks, &mut outs, |&(key, id), out| {
             predict_tile(mesh, pool, tiles, key, id, out)
@@ -4467,8 +4481,9 @@ impl TileStore {
     /// # Errors
     ///
     /// The first task's error in order: [`CacheError::Eval`] (not for a valid mesh), or
-    /// [`CacheError::Internal`] for a stale handle or a task whose tile isn't in `held`, or is
-    /// in `tasks` twice.
+    /// [`CacheError::Internal`] for slots of `held` that can't be borrowed together
+    /// ([`Invariant::SlotsNotDisjoint`]), or a task whose tile isn't in `held`
+    /// ([`Invariant::NotHeld`]) or is in `tasks` twice ([`Invariant::NamedTwice`]).
     fn normals_round(
         &mut self,
         tasks: &[(TileKey, Option<&BTreeSet<TileKey>>)],
@@ -4478,7 +4493,7 @@ impl TileStore {
         let slots = self
             .evaluated
             .get_many_mut(&ids)
-            .ok_or(Invariant::StaleHandle)?;
+            .ok_or(Invariant::SlotsNotDisjoint)?;
         let mut positions: Positions<'_> = Vec::with_capacity(held.len());
         let mut normals = Vec::with_capacity(held.len());
         for (&(key, _), slot) in held.iter().zip(slots) {
@@ -4497,7 +4512,7 @@ impl TileStore {
                 normals
                     .get_mut(at)
                     .and_then(Option::take)
-                    .ok_or(Invariant::StaleHandle)
+                    .ok_or(Invariant::NamedTwice(*key))
             })
             .collect::<Result<Vec<_>, Invariant>>()?;
         let mesh = &*self.mesh;
