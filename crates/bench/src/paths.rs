@@ -61,6 +61,15 @@ impl Paths {
 ///
 /// If neither variable names an absolute path.
 fn default_dir() -> Result<PathBuf> {
+    Ok(cache_root()?.join("bench"))
+}
+
+/// BrushCraft's cache directory: `$XDG_CACHE_HOME/brushcraft`, else `$HOME/.cache/brushcraft`.
+///
+/// # Errors
+///
+/// If neither variable names an absolute path.
+pub(crate) fn cache_root() -> Result<PathBuf> {
     /// The variable's value as a path, if it is an absolute one.
     fn absolute(name: &str) -> Option<PathBuf> {
         std::env::var_os(name)
@@ -70,11 +79,11 @@ fn default_dir() -> Result<PathBuf> {
     let cache = absolute("XDG_CACHE_HOME")
         .or_else(|| absolute("HOME").map(|home| home.join(".cache")))
         .ok_or_else(|| anyhow!("neither XDG_CACHE_HOME nor HOME is an absolute path"))?;
-    Ok(cache.join("brushcraft").join("bench"))
+    Ok(cache.join("brushcraft"))
 }
 
 /// The repository the harness was built from: two levels above this crate's manifest.
-fn repo_root() -> PathBuf {
+pub(crate) fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 

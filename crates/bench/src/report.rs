@@ -21,6 +21,8 @@ pub(crate) enum Value {
     Float(f64),
     /// An array of floats, each written as [`Value::Float`] is.
     Floats(Vec<f64>),
+    /// `true` or `false`.
+    Bool(bool),
 }
 
 impl From<&str> for Value {
@@ -50,6 +52,12 @@ impl From<usize> for Value {
 impl From<f64> for Value {
     fn from(x: f64) -> Self {
         Self::Float(x)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Self {
+        Self::Bool(b)
     }
 }
 
@@ -129,6 +137,7 @@ impl Record {
                 let value = match value {
                     Value::Str(s) => quoted(s),
                     Value::Int(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
                     Value::Float(x) => number(*x),
                     Value::Floats(xs) => {
                         let xs: Vec<String> = xs.iter().map(|&x| number(x)).collect();
@@ -334,10 +343,11 @@ mod tests {
             .with("n", 3_u64)
             .with("x", 1.5)
             .with("bad", f64::NAN)
-            .with("xs", vec![1.0, 2.25]);
+            .with("xs", vec![1.0, 2.25])
+            .with("yes", true);
         assert_eq!(
             r.to_json(),
-            r#"{"bench":"brush","result":"step","name":"a \"b\"\n","n":3,"x":1.5,"bad":null,"xs":[1,2.25]}"#,
+            r#"{"bench":"brush","result":"step","name":"a \"b\"\n","n":3,"x":1.5,"bad":null,"xs":[1,2.25],"yes":true}"#,
             "fields in order, strings escaped, NaN as null"
         );
     }

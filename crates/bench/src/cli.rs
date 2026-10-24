@@ -5,7 +5,7 @@
 //! accepts only the options it uses, and refuses the rest, so a typo never runs a benchmark
 //! with a setting silently ignored.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -23,6 +23,8 @@ subcommands:
   save       brush, then save: time, file growth and bytes per edited vertex
              (the save goes into the project: it gains a save point each run)
   budget     a random walk (evaluate, brush, pan) under a budget, sampling RSS every 100 ms
+  perf       the tracked performance suite: stage benches and a cached medium project (and
+             with --full the benchmark project), compared with the history's baseline
 
 options (each subcommand takes the ones it uses):
   --project PATH          the project file (default $XDG_CACHE_HOME/brushcraft/bench/sphere.bcrf);
@@ -43,6 +45,13 @@ options (each subcommand takes the ones it uses):
   save:     --steps N (50)   --footprint VERTICES (50000)  --strength F (0.0001)
   budget:   --moves N (20)  --steps-per-move N (10)  --view-tiles N (2000)
             --footprint VERTICES (50000)  --strength F (0.0001)
+  perf:     --history DIR (append to DIR/<machine>.jsonl and compare with its baselines)
+            --baseline (mark this run the baseline; needs --history, a clean tree, a quiet run)
+            --full (also the benchmark project at --project, through a reflinked copy)
+            --tiny (a tiny project, no guard, nothing recorded: checks the suite runs)
+            --no-stages (skip the stage benches)  --settle-secs N (300: the quiet guard's
+            longest wait for the other processes' 1-minute load to fall below 2)
+            Exit status 3 when a metric got worse beyond its noise.
 
 Results go to stdout as JSON lines; progress and a human summary go to stderr.";
 
@@ -59,16 +68,19 @@ pub(crate) enum Subcommand {
     Save,
     /// A random walk under a memory budget, sampling RSS.
     Budget,
+    /// The tracked performance suite.
+    Perf,
 }
 
 impl Subcommand {
     /// Every subcommand.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Generate,
         Self::PageIn,
         Self::Brush,
         Self::Save,
         Self::Budget,
+        Self::Perf,
     ];
 
     /// The subcommand's name on the command line and in the JSON records.
@@ -79,6 +91,7 @@ impl Subcommand {
             Self::Brush => "brush",
             Self::Save => "save",
             Self::Budget => "budget",
+            Self::Perf => "perf",
         }
     }
 
@@ -86,10 +99,10 @@ impl Subcommand {
     ///
     /// `page-in` pins a whole 42M-quad region at once (about 10,000 level-9 tiles, 1.3 GB of
     /// evaluated and correction slots), so it needs more than the others; `budget` is the
-    /// spec's 1 GB workload.
+    /// spec's 1 GB workload. `perf` doesn't use one: each part runs with its subcommand's.
     const fn default_budget_mib(self) -> usize {
         match self {
-            Self::Generate | Self::Brush | Self::Save => 2048,
+            Self::Generate | Self::Brush | Self::Save | Self::Perf => 2048,
             Self::PageIn => 4096,
             Self::Budget => 1024,
         }
@@ -98,13 +111,16 @@ impl Subcommand {
     /// Whether the subcommand takes the option `flag`.
     fn takes(self, flag: Flag) -> bool {
         use Flag::{
-            Amplitude, BudgetMib, Footprint, Force, Level, Levels, Moves, Pool, Project,
-            RegionQuads, Samples, Seed, Splits, Steps, StepsPerMove, Strength, ViewTiles, Workers,
+            Amplitude, Baseline, BudgetMib, Footprint, Force, Full, History, Level, Levels, Moves,
+            NoStages, Pool, Project, RegionQuads, Samples, Seed, SettleSecs, Splits, Steps,
+            StepsPerMove, Strength, Tiny, ViewTiles, Workers,
         };
         match flag {
-            Project | BudgetMib | Seed | Workers => true,
+            Project | Workers => true,
+            BudgetMib | Seed => self != Self::Perf,
             Splits | Levels | Amplitude | Force => self == Self::Generate,
-            Level | Footprint => self != Self::Generate,
+            Level | Footprint => !matches!(self, Self::Generate | Self::Perf),
+            History | Baseline | Full | Tiny | NoStages | SettleSecs => self == Self::Perf,
             Samples | RegionQuads | Pool => self == Self::PageIn,
             Steps => matches!(self, Self::Brush | Self::Save),
             Strength => matches!(self, Self::Brush | Self::Save | Self::Budget),
@@ -167,6 +183,17 @@ impl Pools {
     }
 }
 
+/// `perf`: the projects measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Projects {
+    /// The cached medium project, the default.
+    Medium,
+    /// The medium project, then the full benchmark project (`--full`).
+    MediumAndFull,
+    /// A tiny project instead (`--tiny`), unguarded and unrecorded.
+    Tiny,
+}
+
 /// An option's flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flag {
@@ -206,11 +233,23 @@ enum Flag {
     ViewTiles,
     /// `--workers`.
     Workers,
+    /// `--history`.
+    History,
+    /// `--baseline`, a switch.
+    Baseline,
+    /// `--full`, a switch.
+    Full,
+    /// `--tiny`, a switch.
+    Tiny,
+    /// `--no-stages`, a switch.
+    NoStages,
+    /// `--settle-secs`.
+    SettleSecs,
 }
 
 impl Flag {
     /// Every flag with its name, without the leading `--`.
-    const NAMES: [(Self, &'static str); 18] = [
+    const NAMES: [(Self, &'static str); 24] = [
         (Self::Project, "project"),
         (Self::BudgetMib, "budget-mib"),
         (Self::Seed, "seed"),
@@ -229,7 +268,21 @@ impl Flag {
         (Self::StepsPerMove, "steps-per-move"),
         (Self::ViewTiles, "view-tiles"),
         (Self::Workers, "workers"),
+        (Self::History, "history"),
+        (Self::Baseline, "baseline"),
+        (Self::Full, "full"),
+        (Self::Tiny, "tiny"),
+        (Self::NoStages, "no-stages"),
+        (Self::SettleSecs, "settle-secs"),
     ];
+
+    /// Whether the flag is a switch, taking no value.
+    const fn is_switch(self) -> bool {
+        matches!(
+            self,
+            Self::Force | Self::Baseline | Self::Full | Self::Tiny | Self::NoStages
+        )
+    }
 
     /// The flag named `name` (without the leading `--`).
     fn named(name: &str) -> Option<Self> {
@@ -280,6 +333,16 @@ pub(crate) struct Options {
     pub(crate) view_tiles: usize,
     /// How many evaluation workers the tile store starts.
     pub(crate) workers: Workers,
+    /// `perf`: the history directory to append to and compare with.
+    pub(crate) history: Option<PathBuf>,
+    /// `perf`: mark the run as the new baseline.
+    pub(crate) baseline: bool,
+    /// `perf`: the projects measured.
+    pub(crate) projects: Projects,
+    /// `perf`: run the stage benches.
+    pub(crate) stages: bool,
+    /// `perf`: the quiet guard's longest wait before a part, in seconds.
+    pub(crate) settle_secs: u64,
 }
 
 impl Options {
@@ -308,6 +371,11 @@ impl Options {
             steps_per_move: 10,
             view_tiles: 2000,
             workers: Workers::PhysicalCores,
+            history: None,
+            baseline: false,
+            projects: Projects::Medium,
+            stages: true,
+            settle_secs: 300,
         }
     }
 
@@ -321,42 +389,57 @@ impl Options {
     /// # Errors
     ///
     /// If the value doesn't parse, is out of range, or is missing (or given to a switch).
-    fn set(&mut self, flag: Flag, value: Option<OsString>) -> Result<()> {
-        if flag == Flag::Force {
-            ensure!(value.is_none(), "--force takes no value");
-            self.force = true;
-            return Ok(());
+    fn set(&mut self, flag: Flag, value: Option<&OsStr>) -> Result<()> {
+        if flag.is_switch() {
+            ensure!(value.is_none(), "{} takes no value", flag_name(flag));
         }
-        let value = value.ok_or_else(|| anyhow!("{} needs a value", flag_name(flag)))?;
-        if flag == Flag::Project {
-            self.project = Some(PathBuf::from(value));
-            return Ok(());
-        }
-        let text = value
-            .to_str()
-            .ok_or_else(|| anyhow!("{}'s value isn't text", flag_name(flag)))?;
+        let given = || value.ok_or_else(|| anyhow!("{} needs a value", flag_name(flag)));
+        let path = || given().map(PathBuf::from);
+        let text = || {
+            given()?
+                .to_str()
+                .ok_or_else(|| anyhow!("{}'s value isn't text", flag_name(flag)))
+        };
         match flag {
-            Flag::BudgetMib => self.budget_mib = parse(flag, text)?,
-            Flag::Seed => self.seed = parse(flag, text)?,
-            Flag::Splits => self.splits = positive(flag, text)?,
-            Flag::Levels => self.levels = positive(flag, text)?,
-            Flag::Amplitude => self.amplitude = finite(flag, text)?,
-            Flag::Level => self.level = positive(flag, text)?,
-            Flag::Samples => self.samples = positive(flag, text)?,
-            Flag::Footprint => self.footprint = positive(flag, text)?,
-            Flag::RegionQuads => self.region_quads = positive(flag, text)?,
+            Flag::Force => self.force = true,
+            Flag::Baseline => self.baseline = true,
+            Flag::Full => {
+                self.projects = match self.projects {
+                    Projects::Tiny => bail!("--tiny and --full don't go together"),
+                    Projects::Medium | Projects::MediumAndFull => Projects::MediumAndFull,
+                };
+            }
+            Flag::Tiny => {
+                self.projects = match self.projects {
+                    Projects::MediumAndFull => bail!("--tiny and --full don't go together"),
+                    Projects::Medium | Projects::Tiny => Projects::Tiny,
+                };
+            }
+            Flag::NoStages => self.stages = false,
+            Flag::Project => self.project = Some(path()?),
+            Flag::History => self.history = Some(path()?),
+            Flag::BudgetMib => self.budget_mib = parse(flag, text()?)?,
+            Flag::Seed => self.seed = parse(flag, text()?)?,
+            Flag::Splits => self.splits = positive(flag, text()?)?,
+            Flag::Levels => self.levels = positive(flag, text()?)?,
+            Flag::Amplitude => self.amplitude = finite(flag, text()?)?,
+            Flag::Level => self.level = positive(flag, text()?)?,
+            Flag::Samples => self.samples = positive(flag, text()?)?,
+            Flag::Footprint => self.footprint = positive(flag, text()?)?,
+            Flag::RegionQuads => self.region_quads = positive(flag, text()?)?,
             Flag::Pool => {
+                let text = text()?;
                 self.pools = Pools::named(text).ok_or_else(|| {
                     anyhow!("--pool {text:?}: expected one of cold, warm or both")
                 })?;
             }
-            Flag::Steps => self.steps = positive(flag, text)?,
-            Flag::Strength => self.strength = finite(flag, text)?,
-            Flag::Moves => self.moves = positive(flag, text)?,
-            Flag::StepsPerMove => self.steps_per_move = positive(flag, text)?,
-            Flag::ViewTiles => self.view_tiles = positive(flag, text)?,
-            Flag::Workers => self.workers = parse(flag, text)?,
-            Flag::Project | Flag::Force => {}
+            Flag::Steps => self.steps = positive(flag, text()?)?,
+            Flag::Strength => self.strength = finite(flag, text()?)?,
+            Flag::Moves => self.moves = positive(flag, text()?)?,
+            Flag::StepsPerMove => self.steps_per_move = positive(flag, text()?)?,
+            Flag::ViewTiles => self.view_tiles = positive(flag, text()?)?,
+            Flag::Workers => self.workers = parse(flag, text()?)?,
+            Flag::SettleSecs => self.settle_secs = parse(flag, text()?)?,
         }
         Ok(())
     }
@@ -456,13 +539,13 @@ impl Command {
             );
             let value = match inline {
                 Some(value) => Some(value),
-                None if flag == Flag::Force => None,
+                None if flag.is_switch() => None,
                 None => Some(
                     args.next()
                         .ok_or_else(|| anyhow!("--{name} needs a value"))?,
                 ),
             };
-            options.set(flag, value)?;
+            options.set(flag, value.as_deref())?;
         }
         Ok(Self {
             subcommand,
@@ -515,6 +598,25 @@ mod tests {
             Workers::PhysicalCores,
             "one worker a physical core by default"
         );
+        let perf =
+            parse("perf --full --baseline --no-stages --history /d --settle-secs 9").unwrap();
+        assert_eq!(perf.subcommand, Subcommand::Perf, "perf");
+        let o = &perf.options;
+        assert!(o.baseline && !o.stages, "switches: {o:?}");
+        assert_eq!(o.projects, Projects::MediumAndFull, "--full");
+        assert_eq!(
+            o.history,
+            Some(PathBuf::from("/d")),
+            "the history directory"
+        );
+        assert_eq!(o.settle_secs, 9, "the guard's bound");
+        let plain = parse("perf --tiny").unwrap().options;
+        assert_eq!(plain.projects, Projects::Tiny, "--tiny");
+        assert!(
+            plain.stages && plain.history.is_none(),
+            "defaults: {plain:?}"
+        );
+        assert_eq!(plain.settle_secs, 300, "five minutes by default");
         for (args, workers) in [
             ("brush --workers logical", Workers::LogicalCores),
             ("page-in --workers physical", Workers::PhysicalCores),
@@ -544,6 +646,14 @@ mod tests {
             ("brush --workers some", "an unknown worker setting"),
             ("generate --force=yes", "a value for a switch"),
             ("brush stray", "a stray argument"),
+            ("brush --history /d", "a perf option for another subcommand"),
+            ("perf --seed 3", "a seed for perf, which fixes its own"),
+            ("perf --level 6", "a level for perf, which fixes its own"),
+            ("perf --tiny=yes", "a value for a perf switch"),
+            ("perf --tiny --full", "a tiny and a full project"),
+            ("perf --full --tiny", "a full and a tiny project"),
+            ("perf --history", "a history without its directory"),
+            ("perf --settle-secs x", "a wait that doesn't parse"),
         ] {
             assert!(parse(args).is_err(), "{what}: {args:?}");
         }

@@ -1,6 +1,6 @@
 //! `brushcraft-bench`: the M0 benchmark harness.
 //!
-//! Five subcommands, headless, over the benchmark project (see [`cli::USAGE`]):
+//! Six subcommands, headless, over the benchmark project (see [`cli::USAGE`]):
 //!
 //! - `generate` builds the benchmark sphere (`cube_sphere(20)`, levels 1 to 9: 1.26 billion
 //!   triangles) with fBm-noise corrections at every level, and saves it ([`generate`]);
@@ -9,7 +9,9 @@
 //! - `brush` times a stroke of 200 draw steps over a 50,000-vertex footprint ([`brush`]);
 //! - `save` brushes, then times a save and the file's growth per edited vertex
 //!   ([`brush::run_save`]);
-//! - `budget` walks the model under a 1 GiB budget, sampling RSS every 100 ms ([`budget`]).
+//! - `budget` walks the model under a 1 GiB budget, sampling RSS every 100 ms ([`budget`]);
+//! - `perf` runs the tracked performance suite over the others and the stage benches, records it in
+//!   the docs repository's history and flags changes beyond noise ([`perf`]).
 //!
 //! Each result is a JSON line on stdout (`{"bench": …, "result": …, …}`); progress and a human
 //! summary go to stderr. The project lives outside the repository, under
@@ -26,6 +28,7 @@ mod generate;
 mod noise;
 mod page_in;
 mod paths;
+mod perf;
 mod report;
 mod session;
 mod surface;
@@ -40,14 +43,16 @@ use anyhow::Result;
 
 use crate::cli::{Command, Subcommand, USAGE};
 use crate::paths::Paths;
+use crate::perf::Status;
 use crate::report::Output;
 
-/// Runs `command`, reporting to `out`.
+/// Runs `command`, reporting to `out`; every subcommand but `perf` ends [`Status::Clean`] when
+/// it succeeds.
 ///
 /// # Errors
 ///
 /// Whatever the subcommand fails with.
-fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<()> {
+fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<Status> {
     let options = &command.options;
     let paths = Paths::resolve(options.project.as_deref())?;
     match command.subcommand {
@@ -56,8 +61,13 @@ fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<
         Subcommand::Brush => brush::run(options, &paths, out),
         Subcommand::Save => brush::run_save(options, &paths, out),
         Subcommand::Budget => budget::run(options, &paths, out),
-    }
+        Subcommand::Perf => return perf::run(options, &paths, out),
+    }?;
+    Ok(Status::Clean)
 }
+
+/// The exit status of a `perf` run that flagged a metric got worse.
+const FLAGGED: u8 = 3;
 
 fn main() -> ExitCode {
     let mut stderr = std::io::stderr();
@@ -70,11 +80,15 @@ fn main() -> ExitCode {
         }
     };
     let mut out = Output::new(std::io::stdout().lock(), std::io::stderr());
-    let workers = command.options.workers;
-    out.stamp("workers", workers.to_string());
-    out.stamp("worker_threads", workers.count().get());
+    // `perf`'s records carry the setting themselves, beside the rest of the run's details.
+    if command.subcommand != Subcommand::Perf {
+        let workers = command.options.workers;
+        out.stamp("workers", workers.to_string());
+        out.stamp("worker_threads", workers.count().get());
+    }
     match run(&command, &mut out) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Status::Clean) => ExitCode::SUCCESS,
+        Ok(Status::Flagged) => ExitCode::from(FLAGGED),
         Err(e) => {
             drop(writeln!(
                 stderr,

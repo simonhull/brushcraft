@@ -1,0 +1,213 @@
+//! The noise rule: whether a metric moved beyond its own noise since the baseline.
+//!
+//! A change counts when it exceeds `max(5 %, 3 × spread)`, the spread being the larger of the
+//! baseline's and this run's (see [`crate::perf::metric::Measured::spread`]). Five percent is
+//! the floor: below it, a quiet desktop's drift between runs would alarm on every metric. Three
+//! spreads covers the noisier metrics: when one run's repetitions of a metric land ±10 % around
+//! its median, two runs 12 % apart haven't shown it moved. The larger of the two spreads is used
+//! because either run's noise can make the difference.
+
+use std::fmt;
+
+use crate::perf::metric::Measured;
+
+/// The least relative change ever flagged.
+pub(crate) const MIN_CHANGE: f64 = 0.05;
+
+/// How many spreads a change must exceed to be flagged.
+pub(crate) const SPREADS: f64 = 3.0;
+
+/// A relative change against a baseline, and the threshold it was held to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Change {
+    /// `(now − baseline) / |baseline|`: positive is higher, which is worse for every metric.
+    /// Infinite if the baseline was 0 and now isn't.
+    pub(crate) ratio: f64,
+    /// `max(MIN_CHANGE, SPREADS × spread)`.
+    pub(crate) threshold: f64,
+}
+
+impl fmt::Display for Change {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:+.1} % (noise ±{:.1} %)",
+            self.ratio * 100.0,
+            self.threshold * 100.0
+        )
+    }
+}
+
+/// What a metric did against its baseline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Verdict {
+    /// No baseline to compare with.
+    New,
+    /// Within the noise.
+    Same(Change),
+    /// Lower beyond the noise.
+    Better(Change),
+    /// Higher beyond the noise: flagged.
+    Worse(Change),
+}
+
+impl Verdict {
+    /// The verdict on `now` against `baseline` (see the module notes); [`Verdict::New`] without
+    /// one.
+    pub(crate) fn judge(baseline: Option<&Measured>, now: &Measured) -> Self {
+        let Some(baseline) = baseline else {
+            return Self::New;
+        };
+        let threshold = MIN_CHANGE.max(SPREADS * baseline.spread().max(now.spread()));
+        let difference = now.median() - baseline.median();
+        let ratio = if baseline.median() == 0.0 {
+            if difference == 0.0 {
+                0.0
+            } else {
+                difference.signum() * f64::INFINITY
+            }
+        } else {
+            difference / baseline.median().abs()
+        };
+        let change = Change { ratio, threshold };
+        if ratio > threshold {
+            Self::Worse(change)
+        } else if ratio < -threshold {
+            Self::Better(change)
+        } else {
+            Self::Same(change)
+        }
+    }
+
+    /// The verdict's word in the comparison table.
+    pub(crate) const fn word(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Same(_) => "same",
+            Self::Better(_) => "better",
+            Self::Worse(_) => "WORSE",
+        }
+    }
+
+    /// The change, if there was a baseline.
+    pub(crate) const fn change(&self) -> Option<Change> {
+        match self {
+            Self::New => None,
+            Self::Same(change) | Self::Better(change) | Self::Worse(change) => Some(*change),
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+mod tests {
+    use super::*;
+
+    /// A value with median `median` and spread `spread` (no samples).
+    fn value(median: f64, spread: f64) -> Measured {
+        Measured::recorded(median, spread, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn without_a_baseline_a_metric_is_new() {
+        assert_eq!(Verdict::judge(None, &value(1.0, 0.0)), Verdict::New, "new");
+        assert_eq!(Verdict::New.change(), None, "no change");
+    }
+
+    /// Quiet metrics are held to 5 %: 4.9 % is noise, 5.1 % is flagged, either way.
+    #[test]
+    fn quiet_metrics_are_held_to_five_percent() {
+        let base = value(100.0, 0.001);
+        assert!(
+            matches!(
+                Verdict::judge(Some(&base), &value(104.9, 0.0)),
+                Verdict::Same(_)
+            ),
+            "+4.9 %"
+        );
+        assert!(
+            matches!(
+                Verdict::judge(Some(&base), &value(105.1, 0.0)),
+                Verdict::Worse(_)
+            ),
+            "+5.1 %"
+        );
+        assert!(
+            matches!(
+                Verdict::judge(Some(&base), &value(95.1, 0.0)),
+                Verdict::Same(_)
+            ),
+            "−4.9 %"
+        );
+        assert!(
+            matches!(
+                Verdict::judge(Some(&base), &value(94.9, 0.0)),
+                Verdict::Better(_)
+            ),
+            "−5.1 %"
+        );
+    }
+
+    /// Noisy metrics are held to three spreads, the larger of the two runs'.
+    #[test]
+    fn noisy_metrics_are_held_to_three_spreads() {
+        let noisy = value(100.0, 0.04);
+        let change = |now: &Measured| Verdict::judge(Some(&noisy), now);
+        assert!(
+            matches!(change(&value(111.0, 0.0)), Verdict::Same(_)),
+            "+11 % within 12 %"
+        );
+        assert!(
+            matches!(change(&value(113.0, 0.0)), Verdict::Worse(_)),
+            "+13 % beyond 12 %"
+        );
+        let quiet = value(100.0, 0.0);
+        assert!(
+            matches!(
+                Verdict::judge(Some(&quiet), &value(111.0, 0.04)),
+                Verdict::Same(_)
+            ),
+            "this run's noise counts too"
+        );
+        let Verdict::Worse(c) = change(&value(113.0, 0.01)) else {
+            panic!("flagged");
+        };
+        assert!((c.ratio - 0.13).abs() < 1e-12, "{c:?}");
+        assert!((c.threshold - 0.12).abs() < 1e-12, "{c:?}");
+        assert_eq!(c.to_string(), "+13.0 % (noise ±12.0 %)", "shown");
+    }
+
+    #[test]
+    fn negative_and_zero_baselines_compare_by_magnitude() {
+        let below = value(-100.0, 0.0);
+        assert!(
+            matches!(
+                Verdict::judge(Some(&below), &value(-80.0, 0.0)),
+                Verdict::Worse(_)
+            ),
+            "higher is worse below zero too"
+        );
+        let zero = value(0.0, 0.0);
+        assert!(
+            matches!(
+                Verdict::judge(Some(&zero), &value(0.0, 0.0)),
+                Verdict::Same(_)
+            ),
+            "0 to 0"
+        );
+        assert!(
+            matches!(
+                Verdict::judge(Some(&zero), &value(1.0, 0.0)),
+                Verdict::Worse(_)
+            ),
+            "0 to 1"
+        );
+        assert!(
+            matches!(
+                Verdict::judge(Some(&zero), &value(-1.0, 0.0)),
+                Verdict::Better(_)
+            ),
+            "0 to −1"
+        );
+    }
+}
