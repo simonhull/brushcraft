@@ -79,7 +79,7 @@ fn budgets(mesh: &BaseMesh, extra_chunks: &[usize]) -> Vec<StoreConfig> {
     let chunk = 4 * EVAL;
     let base = StoreConfig::new(0, SITE)
         .with_chunk_bytes(chunk)
-        .with_threads(TEST_THREADS);
+        .with_workers(TEST_THREADS);
     let minimum = base.minimum_budget(mesh);
     extra_chunks
         .iter()
@@ -638,7 +638,7 @@ fn batched_reads_are_the_same_bits_whatever_the_thread_count() {
         let outcomes: Vec<Outcome> = thread_counts()
             .into_iter()
             .map(|threads| {
-                let config = config.with_threads(Some(threads));
+                let config = config.with_workers(Workers::Fixed(threads));
                 run(&mesh, 7, config, Reads::Batched, seed, 400)
             })
             .collect();

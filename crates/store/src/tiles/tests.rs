@@ -99,14 +99,23 @@ pub(crate) fn mesh() -> Arc<BaseMesh> {
 /// Evaluation workers of a store whose test isn't about how many there are: two, so that
 /// evaluation runs in parallel without every store of a test run starting a worker per
 /// hardware thread.
-pub(crate) const TEST_THREADS: Option<NonZeroUsize> = NonZeroUsize::new(2);
+pub(crate) const TEST_THREADS: Workers = Workers::Fixed(NonZeroUsize::new(2).unwrap());
+
+/// Exactly `n` evaluation workers.
+///
+/// # Panics
+///
+/// If `n` is 0.
+pub(crate) fn fixed(n: usize) -> Workers {
+    Workers::Fixed(NonZeroUsize::new(n).expect("a positive worker count"))
+}
 
 /// A configuration with chunks of `chunk_slots` evaluated slots and a budget of `chunks` of
 /// them, and [`TEST_THREADS`] workers.
 fn config(chunks: usize, chunk_slots: usize) -> StoreConfig {
     StoreConfig::new(chunks * chunk_slots * EVAL, SITE)
         .with_chunk_bytes(chunk_slots * EVAL)
-        .with_threads(TEST_THREADS)
+        .with_workers(TEST_THREADS)
 }
 
 /// Room for every tile of levels 1–8 of the cube, twice over.
@@ -444,7 +453,7 @@ fn evaluating_many_equals_the_dense_evaluation_at_any_thread_count() {
         .into_iter()
         .flat_map(|c| threads.map(|n| (c, n)))
     {
-        let config = base.with_threads(NonZeroUsize::new(n));
+        let config = base.with_workers(fixed(n));
         let name = format!("{}-{n}.bcp", config.budget_bytes);
         let mut store = new_store(&dir, &name, &mesh, config);
         let mut map = CorrectionMap::new();
@@ -723,7 +732,7 @@ fn stale_normals_brought_up_to_date_equal_a_full_recompute() {
         1,
         thread::available_parallelism().map_or(1, NonZeroUsize::get),
     ] {
-        let config = config(80, 16).with_threads(NonZeroUsize::new(threads));
+        let config = config(80, 16).with_workers(fixed(threads));
         let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);
         store.evaluate_many(&all, Evaluation::Normals).unwrap();
         store.begin_op().unwrap();
@@ -2183,7 +2192,7 @@ fn updating_tiles_equals_updating_each_in_turn() {
         .into_iter()
         .map(|threads| {
             let name = format!("{threads:?}");
-            let config = roomy().with_threads(threads.and_then(NonZeroUsize::new));
+            let config = roomy().with_workers(threads.map_or(Workers::PhysicalCores, fixed));
             let store = new_store(&dir, &format!("{name}.bcp"), &mesh, config);
             (name, store)
         })
@@ -2339,7 +2348,7 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
         2,
         thread::available_parallelism().map_or(1, NonZeroUsize::get),
     ] {
-        let config = roomy().with_threads(NonZeroUsize::new(threads));
+        let config = roomy().with_workers(fixed(threads));
         let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);
         brush_rounds(&mut store, &keys, &around, true);
         assert_eq!(

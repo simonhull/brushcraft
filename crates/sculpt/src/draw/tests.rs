@@ -13,9 +13,18 @@ use geom::{
     BaseMesh, Channel, CorrectionMap, DenseEvaluation, FaceId, LayerId, Level, PositionSource,
     Region, cube_sphere, normals,
 };
-use store::{ProjectConfig, StoreConfig};
+use store::{ProjectConfig, StoreConfig, Workers};
 
 use super::*;
+
+/// Exactly `n` evaluation workers.
+///
+/// # Panics
+///
+/// If `n` is 0.
+fn fixed(n: usize) -> Workers {
+    Workers::Fixed(std::num::NonZeroUsize::new(n).expect("a positive worker count"))
+}
 
 /// Distinguishes the directories of one process.
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -53,7 +62,7 @@ fn project_over(dir: &TestDir, mesh: BaseMesh, level: Level) -> (Project, Spatia
     let config = ProjectConfig {
         store: StoreConfig::new(64 << 20, 1)
             .with_chunk_bytes(1 << 20)
-            .with_threads(std::num::NonZeroUsize::new(2)),
+            .with_workers(fixed(2)),
         recovery_dir: dir.0.join("recovery"),
     };
     let mut project = Project::new(mesh, config).unwrap();
@@ -444,7 +453,7 @@ fn normals_after_random_steps_equal_a_full_recompute_at_any_thread_count() {
         let config = ProjectConfig {
             store: StoreConfig::new(64 << 20, 1)
                 .with_chunk_bytes(1 << 20)
-                .with_threads(std::num::NonZeroUsize::new(threads)),
+                .with_workers(fixed(threads)),
             recovery_dir: dir.0.join("recovery"),
         };
         let mut project = Project::new(mesh.clone(), config).unwrap();

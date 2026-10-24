@@ -14,6 +14,7 @@ use crate::fixture::meta_for;
 use crate::slot::EvaluatedSlot;
 use crate::test_dir::TestDir;
 use crate::tiles::StoreConfig;
+use crate::tiles::tests::fixed;
 
 mod stored;
 
@@ -48,7 +49,7 @@ fn store_over(dir: &TestDir, mesh: &Arc<BaseMesh>) -> TileStore {
     let chunk_bytes = 8 * size_of::<EvaluatedSlot>();
     let config = StoreConfig::new(64 * chunk_bytes, 3)
         .with_chunk_bytes(chunk_bytes)
-        .with_threads(std::num::NonZeroUsize::new(2));
+        .with_workers(fixed(2));
     let config = config.with_budget_bytes(config.budget_bytes.max(config.minimum_budget(mesh)));
     TileStore::open(file, config).unwrap()
 }

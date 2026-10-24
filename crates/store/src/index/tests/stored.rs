@@ -2,14 +2,13 @@
 //! bit, after saves, edits, reopens and compaction, evaluating only what isn't stored.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
 
 use geom::{CorrectionMap, Level};
 
 use super::*;
 use crate::bounds::readers;
 use crate::file::compact;
-use crate::tiles::tests::{TOP, apply, mesh, random_edits, roomy, tiles};
+use crate::tiles::tests::{TOP, apply, fixed, mesh, random_edits, roomy, tiles};
 
 /// The level indexed: the tests' finest, 96 tiles of the cube.
 fn top() -> Level {
@@ -25,7 +24,7 @@ fn open(path: &std::path::Path, create: bool, threads: usize) -> TileStore {
     } else {
         ProjectFile::open(path).unwrap()
     };
-    TileStore::open(file, roomy().with_threads(NonZeroUsize::new(threads))).unwrap()
+    TileStore::open(file, roomy().with_workers(fixed(threads))).unwrap()
 }
 
 #[test]

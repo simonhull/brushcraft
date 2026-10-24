@@ -111,7 +111,6 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
-use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -147,12 +146,10 @@ use crate::workers::Workers;
 /// ```
 /// # use std::num::NonZeroUsize;
 /// # use store::{StoreConfig, Workers};
-/// let config = StoreConfig::new(2 << 30, 1).with_threads(NonZeroUsize::new(4));
+/// let four = Workers::Fixed(NonZeroUsize::new(4).unwrap());
+/// let config = StoreConfig::new(2 << 30, 1).with_workers(four);
 /// assert_eq!(config.chunk_bytes, StoreConfig::DEFAULT_CHUNK_BYTES);
-/// assert_eq!(
-///     config.workers,
-///     Workers::Fixed(NonZeroUsize::new(4).unwrap())
-/// );
+/// assert_eq!(config.workers, four);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -219,17 +216,6 @@ impl StoreConfig {
     #[must_use]
     pub const fn with_site(self, site: u16) -> Self {
         Self { site, ..self }
-    }
-
-    /// This configuration with `threads` evaluation workers ([`Workers::Fixed`]), or the
-    /// default, one per physical core, for `None` (see [`StoreConfig::workers`]).
-    #[must_use]
-    pub const fn with_threads(self, threads: Option<NonZeroUsize>) -> Self {
-        let workers = match threads {
-            Some(n) => Workers::Fixed(n),
-            None => Workers::PhysicalCores,
-        };
-        Self { workers, ..self }
     }
 
     /// This configuration with its evaluation workers counted as `workers` asks (see
