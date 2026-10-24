@@ -1617,17 +1617,18 @@ impl TileStore {
     /// `saved` must be current: made by [`TileStore::save_into`] with no write since. Then every
     /// tile edited since the last rebase is in the new save point, and the old working file's
     /// records are no longer needed. That is checked, not assumed: every tile of the old
-    /// working file and of the old base must be in the new save point, but for those the save
-    /// listed as lost ([`Saved::lost`]), whose last saved state the store reads from now on (a
-    /// lost tile's resident slot is dropped, or, if a pin holds it, filled again in place from
-    /// the saved record, and every evaluation that followed from it is dropped too, as it may
-    /// have come from the lost edit). Dirty slots are clean
-    /// after the rebase (the save wrote them), and every other resident correction tile is kept,
-    /// as it is what was just saved; so are the other cached evaluations, which stay valid: nothing
-    /// they read has changed. Prefetches in flight are dropped (their workers stop and are
-    /// joined), and later ones read the new files. The op generator continues, past the base's
-    /// head if that is newer, and the current op ends: the next edit starts a new one, so the
-    /// edits after a save point are newer than its head.
+    /// working file and of the old base must be in the new save point (the old base's checked
+    /// one by one only if the save point isn't known to extend it, see
+    /// [`TileStore::missing_from_save`]), but for those the save listed as lost ([`Saved::lost`]),
+    /// whose last saved state the store reads from now on (a lost tile's resident slot is
+    /// dropped, or, if a pin holds it, filled again in place from the saved record, and every
+    /// evaluation that followed from it is dropped too, as it may have come from the lost
+    /// edit). Dirty slots are clean after the rebase (the save wrote them), and every other
+    /// resident correction tile is kept, as it is what was just saved; so are the other cached
+    /// evaluations, which stay valid: nothing they read has changed. Prefetches in flight are
+    /// dropped (their workers stop and are joined), and later ones read the new files. The op
+    /// generator continues, past the base's head if that is newer, and the current op ends: the
+    /// next edit starts a new one, so the edits after a save point are newer than its head.
     ///
     /// # Errors
     ///
@@ -1657,15 +1658,8 @@ impl TileStore {
             return Err(CacheError::MeshMismatch);
         }
         check_layers(working.meta(), Some(&base))?;
-        let old_base = self.base.iter().flat_map(BaseFile::keys);
-        if let Some(missing) = self
-            .file
-            .keys()
-            .chain(old_base)
-            .chain(&self.since_rebase)
-            .find(|key| !base.contains(key) && !lost.contains(key))
-        {
-            return Err(Invariant::NotInSave(*missing).into());
+        if let Some(missing) = self.missing_from_save(&base, &lost) {
+            return Err(Invariant::NotInSave(missing).into());
         }
         let next_op = match self.next_op {
             Some(op) => {
@@ -1706,6 +1700,56 @@ impl TileStore {
             self.reload_lost(key);
         }
         Ok(old)
+    }
+
+    /// The first tile the store could read that `saved`, a new save point, lacks, but for
+    /// `lost`, the tiles the save listed as lost; `None` if it lacks none. What a rebase onto
+    /// it checks, so that no tile the store reads is lost by moving on (a bug in a save).
+    ///
+    /// The tiles the store can read are the working file's, every tile edited since the last
+    /// rebase, and the old base's. The first two are what the save wrote, and grow with the
+    /// edits; the old base's are every tile of the project. So when the new save point is known
+    /// to hold every tile of the old base ([`BaseFile::extends`]: it was made from the old
+    /// base's save point, in the same open file, with records only put in), they aren't looked
+    /// up one by one, and the check costs what the save wrote. Otherwise (a project saved under
+    /// a new name, a save point loaded from the file, or one that doesn't descend from the
+    /// base at all) every tile of the old base is looked up too.
+    ///
+    /// Tests run the full check as well whenever the short one passes.
+    ///
+    /// # Panics
+    ///
+    /// In tests only, if the full check finds a tile the short one missed: a save point taken
+    /// to extend the base that doesn't.
+    fn missing_from_save(&self, saved: &BaseFile, lost: &BTreeSet<TileKey>) -> Option<TileKey> {
+        let old_base = self.base.as_ref().filter(|old| !saved.extends(old));
+        let missing = self.missing_among(saved, lost, old_base);
+        #[cfg(test)]
+        if missing.is_none() {
+            assert_eq!(
+                self.missing_among(saved, lost, self.base.as_ref()),
+                None,
+                "a save point taken to extend the base lacks a tile of it"
+            );
+        }
+        missing
+    }
+
+    /// The first tile of the working file, of those edited since the last rebase, or of
+    /// `old_base` if given, that `saved` lacks and `lost` doesn't list (see
+    /// [`TileStore::missing_from_save`]).
+    fn missing_among(
+        &self,
+        saved: &BaseFile,
+        lost: &BTreeSet<TileKey>,
+        old_base: Option<&BaseFile>,
+    ) -> Option<TileKey> {
+        self.file
+            .keys()
+            .chain(&self.since_rebase)
+            .chain(old_base.into_iter().flat_map(BaseFile::keys))
+            .find(|key| !saved.contains(key) && !lost.contains(key))
+            .copied()
     }
 
     /// Fills `fresh`, a new working file on the same base, with every edit, after the working

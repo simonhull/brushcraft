@@ -757,6 +757,42 @@ fn a_rebase_onto_a_save_without_an_edited_tile_is_refused() {
 }
 
 #[test]
+fn a_rebase_onto_a_save_point_not_descending_from_the_base_is_refused() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let project = saved_project(
+        &dir,
+        "p.bcrf",
+        &mesh,
+        &mut map,
+        &random_edits(&mesh, TOP, 60, 91),
+    );
+    let working = recovery(&dir, "r1.bcrf", &project);
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), roomy()).unwrap();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 5, 92));
+    // Another file of the same project and mesh, which never held the base's records: its save
+    // point holds the edits, but doesn't descend from the base.
+    let mut other =
+        ProjectFile::create_like(&dir.path("q.bcrf"), project.meta().clone(), &project).unwrap();
+    let saved = store.save_into(&mut other).unwrap();
+    let only_in_base = *project
+        .keys()
+        .find(|key| !other.contains(key))
+        .expect("the base holds tiles the edits didn't touch");
+    let len = store.working_len();
+    let refused = store.rebase(saved, recovery(&dir, "r2.bcrf", &other));
+    assert!(
+        matches!(
+            refused,
+            Err(CacheError::Internal(Invariant::NotInSave(key))) if key == only_in_base
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(store.working_len(), len, "still on the old working file");
+}
+
+#[test]
 fn an_edited_tile_with_nothing_to_copy_is_nothing_to_save() {
     let dir = TestDir::new();
     let mesh = mesh();

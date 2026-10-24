@@ -487,11 +487,15 @@ struct SavedState {
     tiles: SharedMap<TileKey, Loc>,
     /// Each bounds record it names, by key.
     bounds: SharedMap<TileKey, Loc>,
+    /// The save point it was derived from by putting entries in, never taking one out; `None`
+    /// for one loaded from the file, or the file's first. With the file it was derived in, this
+    /// proves the save point holds every record its parent does (see [`BaseFile::extends`]).
+    parent: Option<SavePoint>,
 }
 
 impl SavedState {
     /// The save point at `offset`, with head op `head`, whose live records are `live`: loaded
-    /// from the file.
+    /// from the file, with no parent.
     fn loaded(offset: u64, head: Option<OpId>, live: &BTreeMap<Name, Loc>) -> Self {
         let (tiles, bounds) = split_names(live);
         Self {
@@ -499,6 +503,7 @@ impl SavedState {
             head,
             tiles: SharedMap::from_sorted(tiles),
             bounds: SharedMap::from_sorted(bounds),
+            parent: None,
         }
     }
 }
@@ -1234,7 +1239,9 @@ impl ProjectFile {
     /// with [`StoreError::Closed`].
     ///
     /// Nothing is copied or read: the base shares the maps the file keeps of its latest save
-    /// point (see [`SavedState`]), so this costs the same whatever the project's size.
+    /// point (see [`SavedState`]), so this costs the same whatever the project's size. A base
+    /// of a save point this `ProjectFile` wrote names the save point before it as the one it
+    /// extends (see [`BaseFile::extends`]).
     pub(crate) fn base(&self) -> Option<BaseFile> {
         let saved = self.saved.as_ref()?;
         Some(BaseFile {
@@ -1248,6 +1255,7 @@ impl ProjectFile {
                 head: saved.head,
             },
             head: self.head,
+            extends: saved.parent,
         })
     }
 
@@ -1282,6 +1290,7 @@ impl ProjectFile {
             meta: self.meta.clone(),
             save_point: point,
             head: self.head,
+            extends: None,
         }))
     }
 
@@ -1622,9 +1631,13 @@ impl ProjectFile {
             tiles,
             bounds,
         } = appended;
-        let (old_tiles, old_bounds) = self
-            .saved
-            .take()
+        let previous = self.saved.take();
+        let parent = previous.as_ref().map(|saved| SavePoint {
+            project: self.meta.project(),
+            offset: saved.offset,
+            head: saved.head,
+        });
+        let (old_tiles, old_bounds) = previous
             .map(|saved| (saved.tiles, saved.bounds))
             .unwrap_or_default();
         self.saved = Some(SavedState {
@@ -1632,6 +1645,7 @@ impl ProjectFile {
             head,
             tiles: old_tiles.with(tiles),
             bounds: old_bounds.with(bounds),
+            parent,
         });
         self.deltas = match coverage {
             Coverage::Full => 0,
@@ -1844,6 +1858,13 @@ pub(crate) struct FileReader {
 }
 
 impl FileReader {
+    /// Whether `other` reads the same open file: the same [`ProjectFile`], not merely the same
+    /// path. Each holds the file weakly, which keeps its allocation, so readers of two files
+    /// opened apart never compare equal, even after one is closed.
+    pub(crate) fn same_file(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.file, &other.file)
+    }
+
     /// The whole record at `loc`, framing included, as it is in the file: for copying it into
     /// another. Not checked here; the caller verifies it.
     ///
@@ -2005,6 +2026,9 @@ pub(crate) struct BaseFile {
     /// The newest edit in the whole file when the base was made, records after the save point
     /// included: a store's op ids continue after it, so no op is handed out twice in one file.
     head: Option<OpId>,
+    /// The save point this one was derived from in memory, with records only put in (see
+    /// [`SavedState::parent`]); `None` for one loaded from the file.
+    extends: Option<SavePoint>,
 }
 
 impl BaseFile {
@@ -2064,6 +2088,18 @@ impl BaseFile {
     /// How many tiles the save point holds.
     pub(crate) const fn len(&self) -> usize {
         self.locations.len()
+    }
+
+    /// Whether this save point is known to hold every tile and bound `older` does, without
+    /// looking at them: it was derived in the same open [`ProjectFile`] from `older`'s save
+    /// point by putting records in (see [`SavedState`]), so its Index's parent is `older`'s
+    /// Index (the same project, offset and head op), and nothing was taken out on the way.
+    ///
+    /// `false` proves nothing either way: a save point loaded from the file, one two or more
+    /// saves on, or one of another file (a project saved under a new name) may still hold
+    /// them all, and has to be checked key by key.
+    pub(crate) fn extends(&self, older: &Self) -> bool {
+        self.extends == Some(older.save_point) && self.reader.same_file(&older.reader)
     }
 
     /// Whether `other` is the same save point with the same records: every tile's and every
@@ -2920,6 +2956,55 @@ mod tests {
 
     fn op(seq: u64) -> OpId {
         OpId::new(0, seq).unwrap()
+    }
+
+    #[test]
+    fn a_save_point_extends_only_the_one_before_it_in_the_same_open_file() {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
+        f.write_displacement(key(1, 0), op(1), &tile(0.5)).unwrap();
+        f.save().unwrap();
+        let first = f.base().unwrap();
+        assert!(!first.extends(&first), "the first save point extends none");
+
+        // A byte-for-byte copy holds the same save point, but not as this file made it.
+        let copy_path = dir.path("q.bcrf");
+        std::fs::copy(&path, &copy_path).unwrap();
+        let mut copy = ProjectFile::open(&copy_path).unwrap();
+        let loaded = copy.base().unwrap();
+        assert_eq!(
+            loaded.save_point(),
+            first.save_point(),
+            "the same save point"
+        );
+        assert!(!loaded.extends(&first), "loaded from the file: no parent");
+
+        f.write_displacement(key(2, 0), op(2), &tile(0.25)).unwrap();
+        f.save().unwrap();
+        let second = f.base().unwrap();
+        assert!(second.extends(&first), "derived from the first");
+        assert!(!first.extends(&second), "not the other way");
+
+        // The copy saves the same records: a save point with the same parent, in another file.
+        copy.write_displacement(key(2, 0), op(2), &tile(0.25))
+            .unwrap();
+        copy.save().unwrap();
+        let copied = copy.base().unwrap();
+        assert_eq!(
+            copied.save_point(),
+            second.save_point(),
+            "the same save point"
+        );
+        assert!(!copied.extends(&first), "another open file");
+
+        f.save().unwrap();
+        let third = f.base().unwrap();
+        assert!(third.extends(&second), "the one before");
+        assert!(!third.extends(&first), "only the one before");
+        let reloaded = f.base_at(second.save_point()).unwrap().unwrap();
+        assert!(third.extends(&reloaded), "the save point before, read back");
+        assert!(!reloaded.extends(&first), "read back: no parent");
     }
 
     #[test]
