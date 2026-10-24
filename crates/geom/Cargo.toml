@@ -13,8 +13,8 @@ workspace = true
 # Meshes for the tests of the crates above (`geom::fixtures`), turned on in their
 # dev-dependencies only, so release builds never compile them.
 test-fixtures = []
-# The stages of a prediction one at a time (`geom::kernels`), for `benches/kernels.rs` only.
-bench-kernels = []
+# The stages of a prediction one at a time (`geom::stages`), for `benches/stages.rs` only.
+bench-stages = []
 
 [dependencies]
 bytemuck.workspace = true
@@ -28,6 +28,6 @@ name = "evaluate"
 harness = false
 
 [[bench]]
-name = "kernels"
+name = "stages"
 harness = false
-required-features = ["bench-kernels"]
+required-features = ["bench-stages"]

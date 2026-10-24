@@ -629,8 +629,8 @@ mod tests {
     use crate::test_rng::Rng;
 
     /// The frame and normal of one vertex, as rewritten from the specification with early
-    /// returns: an oracle independent of [`FrameRows`] and [`policy`], which the kernels must
-    /// match bit for bit.
+    /// returns: an oracle independent of [`FrameRows`] and [`policy`], which the row and batch code
+    /// must match bit for bit.
     mod reference {
         use super::{Frame, Local, Vec3};
 
@@ -682,7 +682,7 @@ mod tests {
         }
     }
 
-    /// One vertex's frame, through the kernels.
+    /// One vertex's frame, through the batch code.
     fn frame_of(local: Local) -> Frame {
         let mut scattered = Scattered::default();
         scattered.push(0, local);
@@ -691,7 +691,7 @@ mod tests {
         out[0]
     }
 
-    /// One vertex's normal, through the kernels.
+    /// One vertex's normal, through the batch code.
     fn normal_of(local: Local) -> Vec3 {
         let mut scattered = Scattered::default();
         scattered.push(0, local);

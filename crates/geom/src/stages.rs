@@ -1,7 +1,7 @@
-//! The stages of predicting a block, one at a time, for the per-kernel benchmarks
-//! (`benches/kernels.rs`).
+//! The stages of predicting a block, one at a time, for the per-stage benchmarks
+//! (`benches/stages.rs`).
 //!
-//! Compiled only with the `bench-kernels` feature, which only the benchmarks turn on: it is not
+//! Compiled only with the `bench-stages` feature, which only the benchmarks turn on: it is not
 //! part of the crate's API, and nothing here is needed to evaluate.
 
 use crate::eval::{Parent, gather, parent_region, predicted_frames};

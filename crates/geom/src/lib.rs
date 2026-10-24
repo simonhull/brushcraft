@@ -8,9 +8,6 @@ mod eval;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fixtures;
 mod frame;
-#[cfg(feature = "bench-kernels")]
-#[doc(hidden)]
-pub mod kernels;
 mod key;
 mod math;
 mod mesh;
@@ -18,6 +15,9 @@ mod mesh;
 mod reference;
 mod soa;
 mod sphere;
+#[cfg(feature = "bench-stages")]
+#[doc(hidden)]
+pub mod stages;
 mod subdiv;
 #[cfg(test)]
 mod test_rng;

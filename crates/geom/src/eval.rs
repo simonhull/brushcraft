@@ -1882,14 +1882,14 @@ mod tests {
         }
     }
 
-    /// The hash of every kernel's output over wide blocks of `prism(n)` subdivided once.
+    /// The hash of every stage's output over wide blocks of `prism(n)` subdivided once.
     ///
     /// Under fixed-seed random corrections, it hashes predicted positions, positions with
     /// corrections applied (so every frame component), normals, and refreshed border normals.
     ///
     /// The blocks are whole faces and quarter faces at levels 6 and 7, so rows run 31 to 127
     /// vertices inside the face, with base vertices of valence 3, 4 and `n` at their corners.
-    fn kernel_hash(n: usize) -> u64 {
+    fn stage_hash(n: usize) -> u64 {
         let mesh = crate::reference::prism(n).subdivide().to_base_mesh();
         let (coarse, fine) = (level(6), level(7));
         let mut rng = Rng::new(0x4B45_0000 + u64::try_from(n).unwrap());
@@ -1935,24 +1935,24 @@ mod tests {
         crate::test_rng::fnv1a(points)
     }
 
-    /// [`kernel_hash`] for `prism(3)`, `prism(5)` and `prism(8)`, recorded from the kernels as they
+    /// [`stage_hash`] for `prism(3)`, `prism(5)` and `prism(8)`, recorded from the stages as they
     /// stood when these were pinned (before the row and lane rewrites, so those are held to the
     /// per-vertex code's bits).
     ///
     /// To regenerate after a deliberate change to the arithmetic, run
-    /// `BRUSHCRAFT_PRINT_GOLDEN=1 cargo nextest run -p geom kernel_bits --no-capture`, check the
+    /// `BRUSHCRAFT_PRINT_GOLDEN=1 cargo nextest run -p geom stage_bits --no-capture`, check the
     /// change was meant to move the bits, and paste the printed values here.
-    const KERNEL_GOLDEN: [(usize, u64); 3] = [
+    const STAGE_GOLDEN: [(usize, u64); 3] = [
         (3, 0x7BE8_3E3F_9151_C7E5),
         (5, 0x279C_99FF_705C_FE78),
         (8, 0x9955_E72D_6E3F_B2C9),
     ];
 
-    /// Pins the kernels' bits on blocks wide enough that whole rows run through them: the
+    /// Pins the stages' bits on blocks wide enough that whole rows run through them: the
     /// golden-bits test in `dense` works on level-3 faces, whose rows are too short to.
     #[test]
-    fn kernel_bits_are_pinned_on_wide_blocks() {
-        let hashes = KERNEL_GOLDEN.map(|(n, _)| (n, kernel_hash(n)));
+    fn stage_bits_are_pinned_on_wide_blocks() {
+        let hashes = STAGE_GOLDEN.map(|(n, _)| (n, stage_hash(n)));
         if std::env::var_os("BRUSHCRAFT_PRINT_GOLDEN").is_some() {
             for (n, hash) in hashes {
                 let groups =
@@ -1961,7 +1961,7 @@ mod tests {
             }
             return;
         }
-        for ((n, hash), (_, want)) in hashes.into_iter().zip(KERNEL_GOLDEN) {
+        for ((n, hash), (_, want)) in hashes.into_iter().zip(STAGE_GOLDEN) {
             assert_eq!(hash, want, "prism({n}): 0x{hash:016X} != 0x{want:016X}");
         }
     }

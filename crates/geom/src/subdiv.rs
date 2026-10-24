@@ -31,7 +31,7 @@ impl Padded {
     }
 
     /// How many slots the block has, ring included: `(quads + 3)²`.
-    #[cfg(feature = "bench-kernels")]
+    #[cfg(feature = "bench-stages")]
     pub(crate) const fn len(&self) -> usize {
         self.data.len()
     }

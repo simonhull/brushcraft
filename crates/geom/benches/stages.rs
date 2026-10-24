@@ -1,11 +1,11 @@
-//! Each subdivision kernel on a level-9 tile (64×64 quads, 4,225 vertices), alone: the gather,
+//! Each subdivision stage on a level-9 tile (64×64 quads, 4,225 vertices), alone: the gather,
 //! the Catmull–Clark stencils, the frames, the whole `predict_region`, `apply_into`, and the
 //! normals in full (`normals_into`) and on the border (`refresh_normals_into`). Each runs on an
 //! interior tile, all of whose vertices are strictly inside the face, and on a face-corner tile,
 //! whose two face-border sides and base vertex go through the scattered-vertex batch.
 //!
-//! Run with `cargo bench -p geom --bench kernels --features bench-kernels`: the stages inside
-//! `predict_region` are reached through `geom::kernels`, which only that feature compiles.
+//! Run with `cargo bench -p geom --bench stages --features bench-stages`: the stages inside
+//! `predict_region` are reached through `geom::stages`, which only that feature compiles.
 
 #![expect(
     clippy::expect_used,
@@ -16,7 +16,7 @@
 use std::sync::LazyLock;
 
 use divan::Bencher;
-use geom::kernels::Stages;
+use geom::stages::Stages;
 use geom::{
     BaseMesh, CorrectionMap, CorrectionTile, DenseEvaluation, FaceId, Level, Region, TileKey, Vec3,
     cube_sphere, normals_into, predict_region, refresh_normals_into,
