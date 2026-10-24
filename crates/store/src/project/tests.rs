@@ -3,6 +3,7 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
+mod base;
 mod bounds;
 mod crash;
 mod restore;

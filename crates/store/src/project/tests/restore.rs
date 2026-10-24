@@ -105,7 +105,6 @@ fn a_restored_project_holds_its_edits_unsaved_and_saves_them() {
         .unwrap()
         .base()
         .unwrap()
-        .unwrap()
         .save_point();
     assert_eq!(candidate.base, Some(point), "on its latest save point");
 
@@ -361,7 +360,7 @@ fn forge(dir: &TestDir, path: &Path, head: Option<OpId>, suffix: u64) -> PathBuf
     let project = ProjectFile::open(path).unwrap();
     let point = SavePoint {
         head,
-        ..project.base().unwrap().unwrap().save_point()
+        ..project.base().unwrap().save_point()
     };
     let meta = project.meta().on_save_point(point, path);
     let name = format!("{}-{suffix:016x}.bcrf", meta.project());

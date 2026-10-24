@@ -9,13 +9,18 @@ use crate::index::SpatialIndex;
 use crate::index::tests::{assert_loads_as_built, index_bits};
 
 /// The level indexed: the tests' finest.
-fn top() -> Level {
+pub(super) fn top() -> Level {
     Level::new(TOP).unwrap()
 }
 
 /// A stroke of `count` random edits with `seed`, its dabs then a refit of `index` to every tile
 /// of the level (if `refit`), so the bounds recorded are those of the stroke's end.
-fn indexed_stroke(project: &mut Project, index: &mut SpatialIndex, refit: bool, seed: u64) {
+pub(super) fn indexed_stroke(
+    project: &mut Project,
+    index: &mut SpatialIndex,
+    refit: bool,
+    seed: u64,
+) {
     let mesh = project.store().working().mesh();
     let edits = random_edits(&mesh, TOP, 40, seed);
     project.begin_stroke().unwrap();

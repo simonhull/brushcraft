@@ -31,6 +31,7 @@ use crate::record::{
     HEAD, Head, KIND_BOUNDS, KIND_INDEX, KIND_MESH, KIND_META, KIND_TILE, TAIL, frame, parse_head,
     verify,
 };
+use crate::shared_map::SharedMap;
 use crate::slot::CorrectionSlot;
 use crate::stamp::Stamp;
 
@@ -214,16 +215,23 @@ impl Name {
     }
 }
 
-/// Splits a map keyed by [`Name`] into its tile records and its bounds records.
-fn split_names(live: &BTreeMap<Name, Loc>) -> (BTreeMap<TileKey, Loc>, BTreeMap<TileKey, Loc>) {
-    let mut tiles = BTreeMap::new();
-    let mut bounds = BTreeMap::new();
-    for (name, &loc) in live {
-        match name {
-            Name::Tile(key) => tiles.insert(*key, loc),
-            Name::Bounds(key) => bounds.insert(*key, loc),
-        };
-    }
+/// Records of one kind, by the key of their tile, in key order.
+type Records = Vec<(TileKey, Loc)>;
+
+/// Splits a map keyed by [`Name`] into its tile records and its bounds records, each in key
+/// order.
+///
+/// A map keyed by names lists every tile, then every bound, each kind in key order, so each
+/// half is already sorted and is built in one pass, with no lookups.
+fn split_names(names: &BTreeMap<Name, Loc>) -> (Records, Records) {
+    let tiles = names
+        .iter()
+        .filter_map(|(name, &loc)| name.tile().map(|key| (*key, loc)))
+        .collect();
+    let bounds = names
+        .iter()
+        .filter_map(|(name, &loc)| name.bounds().map(|key| (*key, loc)))
+        .collect();
     (tiles, bounds)
 }
 
@@ -460,6 +468,60 @@ struct Chain {
     head: Option<OpId>,
 }
 
+/// The latest save point of a [`ProjectFile`], kept as the maps a [`BaseFile`] of it reads, so
+/// that making one copies nothing (see [`ProjectFile::base`]).
+///
+/// It is derived, not reread: when a save point is loaded (opening the file), its maps are
+/// built from the Index chain once; each save point written after that has the previous one's
+/// maps with the entries the new Index adds put in ([`SharedMap::with`]), whether that Index
+/// is a delta or full. So a save costs what it wrote, not what the project holds, and the maps
+/// of the save point before stay valid and shared with any [`BaseFile`] still holding them.
+/// Tests check every derived save point against the chain read back from the file.
+#[derive(Debug, Clone)]
+struct SavedState {
+    /// Where the save point's Index starts.
+    offset: u64,
+    /// The head op its Index records; `None` before any edit.
+    head: Option<OpId>,
+    /// Each tile record it names, by key.
+    tiles: SharedMap<TileKey, Loc>,
+    /// Each bounds record it names, by key.
+    bounds: SharedMap<TileKey, Loc>,
+}
+
+impl SavedState {
+    /// The save point at `offset`, with head op `head`, whose live records are `live`: loaded
+    /// from the file.
+    fn loaded(offset: u64, head: Option<OpId>, live: &BTreeMap<Name, Loc>) -> Self {
+        let (tiles, bounds) = split_names(live);
+        Self {
+            offset,
+            head,
+            tiles: SharedMap::from_sorted(tiles),
+            bounds: SharedMap::from_sorted(bounds),
+        }
+    }
+}
+
+/// An Index appended but not yet the latest save point: what [`ProjectFile::commit_index`]
+/// needs to make it so.
+#[derive(Debug)]
+struct Appended {
+    /// Whether it lists every live record or only those changed since its parent.
+    coverage: Coverage,
+    /// Where it is.
+    loc: Loc,
+    /// The head op it records.
+    head: Option<OpId>,
+    /// The tile records it names that its parent didn't, or named elsewhere, in key order:
+    /// those written since the parent, as of the cut it was written for, if any. For a full
+    /// Index with a parent too, so the new save point's maps are derived from its parent's
+    /// either way; for the first Index, every tile record it names.
+    tiles: Records,
+    /// The same for bounds records.
+    bounds: Records,
+}
+
 /// A parsed Tile payload, borrowing the record.
 #[derive(Debug)]
 struct TileRecord<'a> {
@@ -494,8 +556,8 @@ pub struct ProjectFile {
     live: BTreeMap<Name, Loc>,
     /// Entries written since the last Index.
     pending: BTreeMap<Name, Loc>,
-    /// The offset of the latest Index, the parent of the next one; `None` until the first save.
-    last_index: Option<u64>,
+    /// The latest save point, the parent of the next one; `None` until the first save.
+    saved: Option<SavedState>,
     /// Delta indexes since the last full one.
     deltas: u32,
     /// The greatest op written (see [`ProjectFile::head`]).
@@ -549,7 +611,7 @@ impl std::fmt::Debug for ProjectFile {
             .field("end", &self.end)
             .field("live", &self.live.len())
             .field("pending", &self.pending.len())
-            .field("last_index", &self.last_index)
+            .field("last_index", &self.last_index())
             .field("deltas", &self.deltas)
             .field("head", &self.head)
             .field("access", &self.access)
@@ -633,7 +695,7 @@ impl ProjectFile {
             end: leading.len() as u64,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
-            last_index: None,
+            saved: None,
             deltas: 0,
             head: None,
             access: Access::ReadWrite,
@@ -741,7 +803,7 @@ impl ProjectFile {
             end: leading.end,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
-            last_index: None,
+            saved: None,
             deltas: 0,
             head: None,
             access,
@@ -804,6 +866,7 @@ impl ProjectFile {
         let chain = load_chain(&file, index_offset, len)?.ok_or(StoreError::Damaged {
             offset: index_offset,
         })?;
+        let saved = SavedState::loaded(index_offset, chain.head, &chain.live);
         Ok(Self {
             meta: leading.meta,
             mesh: leading.mesh,
@@ -812,7 +875,7 @@ impl ProjectFile {
             end: len,
             live: chain.live,
             pending: BTreeMap::new(),
-            last_index: Some(index_offset),
+            saved: Some(saved),
             deltas: chain.deltas,
             head: chain.head,
             access: Access::ReadOnly,
@@ -833,10 +896,10 @@ impl ProjectFile {
                 continue;
             }
             if let Some(chain) = load_chain(&self.file, offset, len)? {
+                self.saved = Some(SavedState::loaded(offset, chain.head, &chain.live));
                 self.live = chain.live;
                 self.deltas = chain.deltas;
                 self.head = chain.head;
-                self.last_index = Some(offset);
                 self.end = offset + head.total();
                 return Ok(at + 1);
             }
@@ -1170,35 +1233,22 @@ impl ProjectFile {
     /// and doesn't keep it open: once this `ProjectFile` is dropped, reads through the base fail
     /// with [`StoreError::Closed`].
     ///
-    /// # Errors
-    ///
-    /// [`StoreError::Damaged`] if the last save point must be read again (records were written
-    /// since it) and its chain no longer loads; [`StoreError::Io`].
-    pub(crate) fn base(&self) -> Result<Option<BaseFile>, StoreError> {
-        let Some(offset) = self.last_index else {
-            return Ok(None);
-        };
-        let (locations, saved_head) = if self.pending.is_empty() {
-            (self.live.clone(), self.head)
-        } else {
-            let len = self.file.metadata()?.len();
-            let chain =
-                load_chain(&self.file, offset, len)?.ok_or(StoreError::Damaged { offset })?;
-            (chain.live, chain.head)
-        };
-        let (locations, bounds) = split_names(&locations);
-        Ok(Some(BaseFile {
+    /// Nothing is copied or read: the base shares the maps the file keeps of its latest save
+    /// point (see [`SavedState`]), so this costs the same whatever the project's size.
+    pub(crate) fn base(&self) -> Option<BaseFile> {
+        let saved = self.saved.as_ref()?;
+        Some(BaseFile {
             reader: self.reader(),
-            locations: Arc::new(locations),
-            bounds: Arc::new(bounds),
+            locations: saved.tiles.clone(),
+            bounds: saved.bounds.clone(),
             meta: self.meta.clone(),
             save_point: SavePoint {
                 project: self.meta.project(),
-                offset,
-                head: saved_head,
+                offset: saved.offset,
+                head: saved.head,
             },
             head: self.head,
-        }))
+        })
     }
 
     /// The project file as of `point`, one of its save points, as a base to layer a recovery
@@ -1224,11 +1274,11 @@ impl ProjectFile {
         if chain.head != point.head {
             return Ok(None);
         }
-        let (locations, bounds) = split_names(&chain.live);
+        let saved = SavedState::loaded(point.offset, chain.head, &chain.live);
         Ok(Some(BaseFile {
             reader: self.reader(),
-            locations: Arc::new(locations),
-            bounds: Arc::new(bounds),
+            locations: saved.tiles,
+            bounds: saved.bounds,
             meta: self.meta.clone(),
             save_point: point,
             head: self.head,
@@ -1461,10 +1511,9 @@ impl ProjectFile {
         self.cut = None;
         // Tiles are durable before the Index that names them.
         self.file.sync_data()?;
-        let (coverage, loc) = self.append_index()?;
+        let appended = self.append_index()?;
         self.file.sync_data()?;
-        self.commit_index(coverage, loc);
-        Ok(loc.offset)
+        Ok(self.commit_index(appended))
     }
 
     /// Appends a save point naming the tiles and bounds written so far, without syncing anything,
@@ -1484,55 +1533,106 @@ impl ProjectFile {
         if self.access == Access::ReadOnly {
             return Err(StoreError::ReadOnly);
         }
-        let (coverage, loc) = self.append_index()?;
-        self.commit_index(coverage, loc);
-        Ok(loc.offset)
+        let appended = self.append_index()?;
+        Ok(self.commit_index(appended))
     }
 
     /// Appends the next Index: full the first time and every [`FULL_EVERY`]th, otherwise a
-    /// delta of the tiles written since the last one. Returns its coverage and location, for
-    /// [`ProjectFile::commit_index`].
+    /// delta of the tiles written since the last one. Returns what
+    /// [`ProjectFile::commit_index`] needs to make it the latest save point.
     ///
     /// # Errors
     ///
     /// [`StoreError::TooLarge`], [`StoreError::Io`].
-    fn append_index(&mut self) -> Result<(Coverage, Loc), StoreError> {
-        let coverage = if self.last_index.is_none() || self.deltas + 1 >= FULL_EVERY {
+    fn append_index(&mut self) -> Result<Appended, StoreError> {
+        let parent = self.last_index();
+        let coverage = if parent.is_none() || self.deltas + 1 >= FULL_EVERY {
             Coverage::Full
         } else {
             Coverage::Delta
         };
-        let latest = match coverage {
-            Coverage::Full => &self.live,
-            Coverage::Delta => &self.pending,
+        let head = match &self.cut {
+            Some(cut) if !cut.prior.is_empty() => cut.head,
+            _ => self.head,
         };
-        let (entries, head) = match &self.cut {
-            Some(cut) if !cut.prior.is_empty() => {
-                let mut at_cut = latest.clone();
-                for (key, prior) in &cut.prior {
-                    let place = match coverage {
-                        Coverage::Full => prior.live,
-                        Coverage::Delta => prior.pending,
-                    };
-                    match place {
-                        Some(loc) => at_cut.insert(*key, loc),
-                        None => at_cut.remove(key),
-                    };
-                }
-                (Cow::Owned(at_cut), cut.head)
+        let delta = self.at_cut(&self.pending, Coverage::Delta);
+        let (payload, (tiles, bounds)) = match (coverage, parent) {
+            // The first save point: what it names is all there is.
+            (Coverage::Full, None) => {
+                let entries = self.at_cut(&self.live, coverage);
+                (
+                    index_payload(coverage, parent, head, &entries)?,
+                    split_names(&entries),
+                )
             }
-            _ => (Cow::Borrowed(latest), self.head),
+            (Coverage::Full, Some(_)) => (
+                index_payload(coverage, parent, head, &self.at_cut(&self.live, coverage))?,
+                split_names(&delta),
+            ),
+            (Coverage::Delta, _) => (
+                index_payload(coverage, parent, head, &delta)?,
+                split_names(&delta),
+            ),
         };
-        let payload = index_payload(coverage, self.last_index, head, &entries)?;
         let loc = self.append(KIND_INDEX, &payload)?;
-        Ok((coverage, loc))
+        Ok(Appended {
+            coverage,
+            loc,
+            head,
+            tiles,
+            bounds,
+        })
     }
 
-    /// Makes the Index at `loc` the latest save point: the parent of the next. What it named
-    /// leaves `pending`; the records past a cut it was written for stay, for the next one, and
-    /// the cut closes.
-    fn commit_index(&mut self, coverage: Coverage, loc: Loc) {
-        self.last_index = Some(loc.offset);
+    /// `latest`, the latest record of each name (all of them for a full Index, or those written
+    /// since the last save point for a delta), as of the open cut, if any (see [`Cut`]): each
+    /// name with a record past the cut takes its place at the cut for `coverage`'s kind of
+    /// Index, or is left out if it had none.
+    fn at_cut<'a>(
+        &self,
+        latest: &'a BTreeMap<Name, Loc>,
+        coverage: Coverage,
+    ) -> Cow<'a, BTreeMap<Name, Loc>> {
+        let Some(cut) = self.cut.as_ref().filter(|cut| !cut.prior.is_empty()) else {
+            return Cow::Borrowed(latest);
+        };
+        let mut at_cut = latest.clone();
+        for (key, prior) in &cut.prior {
+            let place = match coverage {
+                Coverage::Full => prior.live,
+                Coverage::Delta => prior.pending,
+            };
+            match place {
+                Some(loc) => at_cut.insert(*key, loc),
+                None => at_cut.remove(key),
+            };
+        }
+        Cow::Owned(at_cut)
+    }
+
+    /// Makes the Index `appended` the latest save point, the parent of the next, and returns
+    /// its offset. Its maps are the last save point's with the Index's new entries put in (see
+    /// [`SavedState`]). What it named leaves `pending`; the records past a cut it was written
+    /// for stay, for the next one, and the cut closes.
+    fn commit_index(&mut self, appended: Appended) -> u64 {
+        let Appended {
+            coverage,
+            loc,
+            head,
+            tiles,
+            bounds,
+        } = appended;
+        let (old_tiles, old_bounds) = self
+            .saved
+            .take()
+            .map(|saved| (saved.tiles, saved.bounds))
+            .unwrap_or_default();
+        self.saved = Some(SavedState {
+            offset: loc.offset,
+            head,
+            tiles: old_tiles.with(tiles),
+            bounds: old_bounds.with(bounds),
+        });
         self.deltas = match coverage {
             Coverage::Full => 0,
             Coverage::Delta => self.deltas + 1,
@@ -1541,6 +1641,15 @@ impl ProjectFile {
             Some(cut) => self.pending.retain(|key, _| cut.prior.contains_key(key)),
             None => self.pending.clear(),
         }
+        #[cfg(test)]
+        self.check_saved();
+        loc.offset
+    }
+
+    /// The offset of the latest save point's Index, the parent of the next; `None` until the
+    /// first save.
+    fn last_index(&self) -> Option<u64> {
+        self.saved.as_ref().map(|saved| saved.offset)
     }
 
     /// Whether records (tiles or bounds) have been written since the last save point (or,
@@ -1565,7 +1674,7 @@ impl ProjectFile {
     pub fn save_points(&self) -> Result<Vec<u64>, StoreError> {
         let len = self.file.metadata()?.len();
         let mut points = Vec::new();
-        let mut next = self.last_index;
+        let mut next = self.last_index();
         while let Some(offset) = next {
             let index =
                 read_index(&self.file, offset, len)?.ok_or(StoreError::Damaged { offset })?;
@@ -1680,9 +1789,36 @@ impl ProjectFile {
             .collect()
     }
 
+    /// Checks the latest save point's maps, derived in memory (see [`SavedState`]), against
+    /// the same save point's chain read back from the file and rebuilt in full: the same tiles
+    /// and bounds, bit for bit, and the same head op. Run after every save point a test writes.
+    ///
+    /// # Panics
+    ///
+    /// If they differ, or the chain can't be read back.
+    fn check_saved(&self) {
+        let Some(saved) = &self.saved else {
+            return;
+        };
+        let len = self.file.metadata().unwrap().len();
+        let chain = load_chain(&self.file, saved.offset, len)
+            .unwrap()
+            .expect("a save point just written loads");
+        let rebuilt = SavedState::loaded(saved.offset, chain.head, &chain.live);
+        assert!(
+            saved.tiles.same_entries(&rebuilt.tiles),
+            "the derived save point's tiles differ from its chain's"
+        );
+        assert!(
+            saved.bounds.same_entries(&rebuilt.bounds),
+            "the derived save point's bounds differ from its chain's"
+        );
+        assert_eq!(saved.head, rebuilt.head, "the derived save point's head");
+    }
+
     /// Payload bytes of the last Index.
     fn last_index_len(&self) -> Option<u64> {
-        self.index_len(self.last_index?).ok()
+        self.index_len(self.last_index()?).ok()
     }
 
     /// Frames and appends an arbitrary record.
@@ -1856,10 +1992,12 @@ pub(crate) struct BaseFile {
     /// Reads the project file while its owner keeps it open.
     reader: FileReader,
     /// Each saved tile's record as of the save point. Records are never moved while the file
-    /// is open, so these stay valid as the owner appends.
-    locations: Arc<BTreeMap<TileKey, Loc>>,
+    /// is open, so these stay valid as the owner appends. Shared with the file's own record of
+    /// the save point, and with the bases of the save points before and after it, where they
+    /// agree (see [`SavedState`]).
+    locations: SharedMap<TileKey, Loc>,
     /// Each saved bound's record as of the save point.
-    bounds: Arc<BTreeMap<TileKey, Loc>>,
+    bounds: SharedMap<TileKey, Loc>,
     /// The project file's meta: its project, its role and its mesh.
     meta: Meta,
     /// The save point: the project, the Index's offset and the head op it recorded.
@@ -1921,6 +2059,20 @@ impl BaseFile {
     /// The saved tiles, in key order.
     pub(crate) fn keys(&self) -> impl Iterator<Item = &TileKey> {
         self.locations.keys()
+    }
+
+    /// How many tiles the save point holds.
+    pub(crate) const fn len(&self) -> usize {
+        self.locations.len()
+    }
+
+    /// Whether `other` is the same save point with the same records: every tile's and every
+    /// bound's, bit for bit, however each was made.
+    #[cfg(test)]
+    pub(crate) fn same_state(&self, other: &Self) -> bool {
+        self.save_point == other.save_point
+            && self.locations.same_entries(&other.locations)
+            && self.bounds.same_entries(&other.bounds)
     }
 
     /// Where `key`'s saved bounds record is, if the save point has one.

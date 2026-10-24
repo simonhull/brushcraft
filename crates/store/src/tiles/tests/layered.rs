@@ -26,10 +26,7 @@ fn saved_project(
 
 /// A base for a store: `project` as of its last save point.
 fn base_of(project: &ProjectFile) -> BaseFile {
-    project
-        .base()
-        .unwrap()
-        .expect("the project has a save point")
+    project.base().expect("the project has a save point")
 }
 
 /// A new, empty recovery file at `name` in `dir`, layered on `project`'s last save point: its

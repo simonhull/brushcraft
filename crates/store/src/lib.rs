@@ -22,6 +22,7 @@ mod prefetch;
 mod project;
 mod record;
 mod recovery;
+mod shared_map;
 mod slot;
 mod stamp;
 #[cfg(test)]

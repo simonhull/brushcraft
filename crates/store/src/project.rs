@@ -442,7 +442,7 @@ impl Project {
         if project.meta().role() != Role::Project {
             return Err(ProjectError::NotAProject);
         }
-        let base = project.base()?.ok_or(ProjectError::NeverSaved)?;
+        let base = project.base().ok_or(ProjectError::NeverSaved)?;
         let meta = project.meta().on_save_point(base.save_point(), &path);
         let earlier = recovery_heads(&config.recovery_dir, meta.project());
         let (working, recovery_path) = create_placed(&config.recovery_dir, meta.project(), |at| {
@@ -1542,7 +1542,7 @@ fn standing(
     {
         return Ok((CandidateStatus::ProjectMissing, None));
     }
-    let latest = project.base()?;
+    let latest = project.base();
     if latest.as_ref().map(BaseFile::save_point) == Some(point) {
         return Ok((CandidateStatus::Restorable, latest));
     }

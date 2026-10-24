@@ -821,7 +821,7 @@ impl std::fmt::Debug for TileStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TileStore")
             .field("file", &self.file)
-            .field("base", &self.base.as_ref().map(|base| base.keys().count()))
+            .field("base", &self.base.as_ref().map(BaseFile::len))
             .field("budget", &self.budget)
             .field("corrections", &self.corrections)
             .field("evaluated", &self.evaluated)
@@ -1336,13 +1336,10 @@ fn book_of(working: &ProjectFile, base: Option<&BaseFile>) -> Result<Book, Cache
 ///
 /// # Errors
 ///
-/// [`CacheError::Save`] if the save point can't be read; [`CacheError::Internal`] with
-/// [`Invariant::NotSaved`] if `project` has none, which a save that went through rules out.
+/// [`CacheError::Internal`] with [`Invariant::NotSaved`] if `project` has none, which a save
+/// that went through rules out.
 fn saved_base(project: &ProjectFile) -> Result<BaseFile, CacheError> {
-    project
-        .base()
-        .map_err(CacheError::Save)?
-        .ok_or_else(|| Invariant::NotSaved.into())
+    project.base().ok_or_else(|| Invariant::NotSaved.into())
 }
 
 /// Checks that a working file with `working`'s meta may be layered on `base`.
