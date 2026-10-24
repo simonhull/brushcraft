@@ -3,6 +3,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
+use std::io::{Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -209,31 +210,116 @@ pub(crate) fn cached_file(dir: &Path, key: &str) -> PathBuf {
     dir.join(format!("medium-{key}.bcrf"))
 }
 
-/// Removes every cached medium project in `dir` but `keep`.
+/// A project file a run measures through a copy, open from before the copy is made until after.
 ///
-/// Only files named `medium-*.bcrf` are touched. A cached project never has a recovery
+/// The copy reads this handle, never the path again, so the file being removed or replaced
+/// under its name meanwhile (another run tidying the cache, or generating the same project)
+/// can't take the project from under the run.
+#[derive(Debug)]
+pub(crate) struct Source {
+    /// Where it was opened, for messages.
+    path: PathBuf,
+    /// The open file, locked shared if it is a cached project (see [`Source::cached`]).
+    file: File,
+}
+
+impl Source {
+    /// The project at `path`, open.
+    ///
+    /// # Errors
+    ///
+    /// If it can't be opened.
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+        })
+    }
+
+    /// The cached project at `path`, open and locked shared (`flock`) for as long as this lives,
+    /// so [`remove_stale`] in another run leaves it alone; `None` if there is none.
+    ///
+    /// # Errors
+    ///
+    /// If it exists but can't be opened or locked.
+    pub(crate) fn cached(path: &Path) -> Result<Option<Self>> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        };
+        file.lock_shared()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(Some(Self {
+            path: path.to_owned(),
+            file,
+        }))
+    }
+
+    /// Where it was opened.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Removes every cached medium project in `dir` but `keep`, except those a run is using.
+///
+/// Only files named `medium-*.bcrf` are touched, and one only once it is locked exclusively
+/// (`flock`, without waiting): a run holds a shared lock on the project it uses
+/// ([`Source::cached`]) until its copy is made, so a project in use, say by a run from another
+/// worktree whose build has another key, stays. An entry that can't be checked or removed is
+/// skipped and reported, as [`WorkDir::sweep`] does. A cached project never has a recovery
 /// directory of its own: every run opens a copy of it in a work directory.
 ///
 /// # Errors
 ///
-/// If the directory can't be listed or a file removed.
-pub(crate) fn remove_stale(dir: &Path, keep: &Path) -> Result<Vec<PathBuf>> {
-    let mut removed = Vec::new();
+/// If the directory can't be listed.
+pub(crate) fn remove_stale(dir: &Path, keep: &Path) -> Result<Sweep> {
+    let mut sweep = Sweep::default();
     for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
-        let path = entry?.path();
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                sweep.skipped.push((dir.to_owned(), e.into()));
+                continue;
+            }
+        };
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        if path != keep
-            && name.starts_with("medium-")
-            && path.extension().is_some_and(|e| e == "bcrf")
+        if path == keep
+            || !name.starts_with("medium-")
+            || path.extension().is_none_or(|e| e != "bcrf")
         {
-            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-            removed.push(path);
+            continue;
+        }
+        match remove_unused(&path) {
+            Ok(true) => sweep.removed.push(path),
+            Ok(false) => {}
+            Err(e) => sweep.skipped.push((path, e)),
         }
     }
-    Ok(removed)
+    Ok(sweep)
+}
+
+/// Removes the file at `path` unless another process holds a lock on it; returns whether it did.
+///
+/// # Errors
+///
+/// If it can't be opened, its lock can't be tried, or it can't be removed.
+fn remove_unused(path: &Path) -> Result<bool> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(e).with_context(|| format!("locking {}", path.display()));
+        }
+    }
+    std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    Ok(true)
 }
 
 /// How [`WorkDir::copy`] copied a project.
@@ -269,13 +355,13 @@ impl WorkRoot {
     }
 }
 
-/// What [`WorkDir::sweep`] did.
+/// What a clear-up of what other runs left ([`WorkDir::sweep`], [`remove_stale`]) did.
 #[derive(Debug, Default)]
 pub(crate) struct Sweep {
-    /// The dead runs' directories removed.
+    /// The entries removed: dead runs' directories, or stale projects.
     pub(crate) removed: Vec<PathBuf>,
-    /// The entries that looked like a dead run's but couldn't be checked or removed, with why:
-    /// left in place for the user, never a reason to fail the run.
+    /// The entries that looked removable but couldn't be checked or removed, with why: left in
+    /// place for the user, never a reason to fail the run.
     pub(crate) skipped: Vec<(PathBuf, anyhow::Error)>,
 }
 
@@ -414,21 +500,25 @@ impl WorkDir {
 
     /// A copy of the project `source` as project `name` (see [`WorkDir::project`]): a reflink
     /// where the file system shares extents (no data copied, so a 1.7 GB project costs nothing),
-    /// else a plain copy.
+    /// else a plain copy. It reads `source`'s open handle from its start, whatever its name now
+    /// points at.
     ///
     /// # Errors
     ///
     /// If the source can't be read or the copy written.
-    pub(crate) fn copy(&self, source: &Path, name: &str) -> Result<(PathBuf, Copied)> {
+    pub(crate) fn copy(&self, source: &Source, name: &str) -> Result<(PathBuf, Copied)> {
         let target = self.project(name)?;
-        let from = File::open(source).with_context(|| format!("opening {}", source.display()))?;
-        let to = File::create(&target).with_context(|| format!("creating {}", target.display()))?;
-        if rustix::fs::ioctl_ficlone(&to, &from).is_ok() {
+        let mut to =
+            File::create(&target).with_context(|| format!("creating {}", target.display()))?;
+        if rustix::fs::ioctl_ficlone(&to, &source.file).is_ok() {
             return Ok((target, Copied::Reflinked));
         }
-        drop(to);
-        std::fs::copy(source, &target)
-            .with_context(|| format!("copying {} to {}", source.display(), target.display()))?;
+        let mut from = &source.file;
+        from.seek(SeekFrom::Start(0))
+            .and_then(|_| std::io::copy(&mut from, &mut to))
+            .with_context(|| {
+                format!("copying {} to {}", source.path.display(), target.display())
+            })?;
         Ok((target, Copied::InFull))
     }
 
@@ -608,24 +698,76 @@ mod tests {
 
     #[test]
     fn stale_projects_go_and_nothing_else() {
-        let root =
-            std::env::temp_dir().join(format!("brushcraft-perf-cache-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = scratch("cache");
         let keep = cached_file(&root, "1111111111111111");
         let stale = cached_file(&root, "2222222222222222");
         let other = root.join("sphere.bcrf");
         for path in [&keep, &stale, &other] {
             std::fs::write(path, b"x").unwrap();
         }
+        let sweep = remove_stale(&root, &keep).unwrap();
         assert_eq!(
-            remove_stale(&root, &keep).unwrap(),
+            sweep.removed,
             std::slice::from_ref(&stale),
             "only the stale one"
         );
+        assert!(sweep.skipped.is_empty(), "{:?}", sweep.skipped);
         assert!(
             keep.exists() && other.exists() && !stale.exists(),
             "the rest stay"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Two runs from builds with different keys share the cache: neither removes the project
+    /// the other is using, and one no longer used goes on the next tidy.
+    #[test]
+    fn a_project_in_use_is_never_removed() {
+        let root = scratch("in-use");
+        let mine = cached_file(&root, "1111111111111111");
+        let theirs = cached_file(&root, "2222222222222222");
+        for path in [&mine, &theirs] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        let using = Source::cached(&theirs).unwrap().unwrap();
+        assert!(
+            Source::cached(&root.join("medium-none.bcrf"))
+                .unwrap()
+                .is_none(),
+            "none cached"
+        );
+        let sweep = remove_stale(&root, &mine).unwrap();
+        assert!(
+            sweep.removed.is_empty() && sweep.skipped.is_empty(),
+            "{sweep:?}"
+        );
+        assert!(theirs.exists(), "in use, so kept");
+        drop(using);
+        assert_eq!(
+            remove_stale(&root, &mine).unwrap().removed,
+            std::slice::from_ref(&theirs),
+            "unused, so removed"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A copy reads the project the run opened, even if its name was removed or replaced since.
+    #[test]
+    fn a_copy_reads_the_opened_project_whatever_its_name_holds_now() {
+        let root = scratch("replaced");
+        let cached = root.join("medium-1.bcrf");
+        std::fs::write(&cached, vec![7_u8; 1 << 12]).unwrap();
+        let source = Source::cached(&cached).unwrap().unwrap();
+        std::fs::remove_file(&cached).unwrap();
+        std::fs::write(&cached, b"another project").unwrap();
+        let work = WorkDir::new(&WorkRoot::under(&root)).unwrap();
+        let (copy, _) = work.copy(&source, "medium").unwrap();
+        assert_eq!(
+            std::fs::read(copy).unwrap(),
+            vec![7_u8; 1 << 12],
+            "the opened one"
+        );
+        drop(work);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -635,7 +777,9 @@ mod tests {
         let source = root.join("source.bcrf");
         std::fs::write(&source, vec![5_u8; 1 << 16]).unwrap();
         let work = WorkDir::new(&WorkRoot::under(&root)).unwrap();
-        let (copy, _) = work.copy(&source, "medium").unwrap();
+        let (copy, _) = work
+            .copy(&Source::open(&source).unwrap(), "medium")
+            .unwrap();
         assert_eq!(
             copy,
             work.path().join("medium").join("project.bcrf"),

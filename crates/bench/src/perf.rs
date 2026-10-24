@@ -49,7 +49,7 @@ use crate::perf::history::{Entry, Label, PartLoad, RunInfo};
 use crate::perf::machine::{Machine, Revision, Timestamp};
 use crate::perf::metric::Metric;
 use crate::perf::project::{
-    Copied, Scale, WorkDir, WorkRoot, cache_key, cached_file, remove_stale,
+    Copied, Scale, Source, Sweep, WorkDir, WorkRoot, cache_key, cached_file, remove_stale,
 };
 use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak, own_load};
 use crate::perf::suite::Runner;
@@ -203,6 +203,29 @@ impl Session {
     }
 }
 
+/// Says on `out` what a clear-up removed (each as `removed`, e.g. "a dead run's"), and warns of
+/// what it couldn't.
+///
+/// # Errors
+///
+/// If writing fails.
+fn report_sweep<J: Write, H: Write>(
+    sweep: Sweep,
+    removed: &str,
+    out: &mut Output<J, H>,
+) -> Result<()> {
+    for path in sweep.removed {
+        out.say(&format!("perf: removed {removed} {}", path.display()))?;
+    }
+    for (path, why) in sweep.skipped {
+        out.say(&format!(
+            "perf: warning: left {} in place: {why:#}",
+            path.display()
+        ))?;
+    }
+    Ok(())
+}
+
 /// A fresh work directory in this user's work root under `base`, after sweeping dead runs'
 /// from that root, saying on `out` what was removed and warning of what couldn't be.
 ///
@@ -211,16 +234,7 @@ impl Session {
 /// If the root can't be listed, the directory can't be made, or writing fails.
 fn work_dir<J: Write, H: Write>(base: &Path, out: &mut Output<J, H>) -> Result<WorkDir> {
     let root = WorkRoot::under(base);
-    let sweep = WorkDir::sweep(&root)?;
-    for dead in sweep.removed {
-        out.say(&format!("perf: removed a dead run's {}", dead.display()))?;
-    }
-    for (path, why) in sweep.skipped {
-        out.say(&format!(
-            "perf: warning: left {} in place: {why:#}",
-            path.display()
-        ))?;
-    }
+    report_sweep(WorkDir::sweep(&root)?, "a dead run's", out)?;
     WorkDir::new(&root)
 }
 
@@ -232,7 +246,7 @@ fn work_dir<J: Write, H: Write>(base: &Path, out: &mut Output<J, H>) -> Result<W
 /// As [`WorkDir::copy`], or if writing fails.
 fn copy<J: Write, H: Write>(
     work: &WorkDir,
-    source: &Path,
+    source: &Source,
     name: &str,
     out: &mut Output<J, H>,
 ) -> Result<PathBuf> {
@@ -240,14 +254,18 @@ fn copy<J: Write, H: Write>(
     if copied == Copied::InFull {
         out.say(&format!(
             "perf: {} couldn't be reflinked: copied in full",
-            source.display()
+            source.path().display()
         ))?;
     }
     Ok(file)
 }
 
 /// The medium project, from the cache under `cache` or freshly generated into it (see
-/// [`project::cache_key`]); returns its file and its key.
+/// [`project::cache_key`]), open and locked shared so no other run removes it while it is
+/// copied; returns it and its key.
+///
+/// A freshly generated project is opened and locked before it is moved into the cache, so it is
+/// never there unlocked before this run has copied it.
 ///
 /// # Errors
 ///
@@ -256,14 +274,15 @@ fn medium<J: Write, H: Write>(
     runner: &mut Runner,
     cache: &Path,
     out: &mut Output<J, H>,
-) -> Result<(PathBuf, String)> {
+) -> Result<(Source, String)> {
     let shape = Scale::Medium
         .shape()
         .context("the medium project has a shape")?;
     let key = cache_key(shape);
     let file = cached_file(cache, &key);
-    if file.exists() {
+    let source = if let Some(source) = Source::cached(&file)? {
         out.say(&format!("perf: medium project cached: {}", file.display()))?;
+        source
     } else {
         out.say(&format!(
             "perf: generating the medium project: {}",
@@ -273,17 +292,18 @@ fn medium<J: Write, H: Write>(
         let fresh = building.project("medium")?;
         let start = Instant::now();
         suite::generate(runner, &fresh, Scale::Medium)?;
+        let source = Source::cached(&fresh)?
+            .with_context(|| format!("{} was just generated", fresh.display()))?;
         std::fs::rename(&fresh, &file)
             .with_context(|| format!("moving {} to {}", fresh.display(), file.display()))?;
         out.say(&format!(
             "perf: generated in {:.1} s",
             start.elapsed().as_secs_f64()
         ))?;
-    }
-    for stale in remove_stale(cache, &file)? {
-        out.say(&format!("perf: removed the stale {}", stale.display()))?;
-    }
-    Ok((file, format!("medium-{key}")))
+        source
+    };
+    report_sweep(remove_stale(cache, &file)?, "the stale", out)?;
+    Ok((source, format!("medium-{key}")))
 }
 
 /// Measures every part of `scale` on the project at `file` (named `project` in the records).
@@ -601,6 +621,8 @@ fn measure_all<J: Write, H: Write>(
                 let (cached, key) = medium(&mut session.runner, &cache, out)?;
                 let work = work_dir(&cache, out)?;
                 let file = copy(&work, &cached, "medium", out)?;
+                // The run measures its own copy: other runs may tidy the cache from here on.
+                drop(cached);
                 measure_project(session, scale, &file, &key, out)?;
             }
             Scale::Full => {
@@ -622,7 +644,7 @@ fn measure_all<J: Write, H: Write>(
                 );
                 let dir = source.parent().context("the full project's directory")?;
                 let work = work_dir(dir, out)?;
-                let file = copy(&work, source, "full", out)?;
+                let file = copy(&work, &Source::open(source)?, "full", out)?;
                 measure_project(session, scale, &file, &name, out)?;
             }
         }
