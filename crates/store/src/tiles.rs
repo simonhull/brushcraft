@@ -274,8 +274,8 @@ impl StoreConfig {
 /// operations come in the same order however many workers it has. Each round pins its tiles'
 /// correction slots while the workers read them (fewer, cut at the first tile after the first
 /// that would need a dirty tile written back or an evaluated chunk taken, see
-/// [`TileStore::load_round`]), and a round of tiles without slots holds a scratch buffer of one
-/// tile per tile of the round.
+/// [`TileStore::load_round`]), and holds a scratch buffer of one tile per tile of the round that
+/// isn't predicted in place.
 const ROUND: usize = 64;
 
 /// Target tiles [`TileStore::evaluate_many`] and [`TileStore::pin`] put in one batch at most.
@@ -706,7 +706,8 @@ struct EvalLog {
 /// memory. Besides them, and not charged to the budget:
 ///
 /// - the evaluation scratch: one buffer of the largest tile's positions (about 50 KB) per tile of a
-///   round of new tiles, so about 3.2 MB at most (64 of them), kept for the store's life;
+///   round not predicted in place, so about 3.2 MB at most (64 of them, once a round of new tiles
+///   has been built), kept for the store's life;
 /// - the buffers and zstd context the owner thread reads correction tiles with, each evaluation
 ///   worker's (made the first time a round's tiles are loaded on the workers) and each prefetch
 ///   worker's (at most four): about 150 KB a thread, so a few MB with dozens of workers, with the
@@ -790,9 +791,11 @@ pub struct TileStore {
     pin_sets: HashMap<u64, Vec<Pinned>>,
     /// The id the next pin set gets.
     next_pin_set: u64,
-    /// One tile of positions per tile of a round of tiles without slots (see [`ROUND`] and
-    /// [`TileStore::build_round`]): the workers write here, then the owner thread copies each
-    /// into the slot it takes for it. Grown on demand, never past [`ROUND`] buffers.
+    /// One tile of positions per tile of a round that isn't predicted in place (see [`ROUND`]
+    /// and [`TileStore::build_round`]): the workers write here, then the owner thread copies
+    /// each into the slot it takes for it. Grown on demand to the most such tiles a round has
+    /// had, never past [`ROUND`] buffers; a round predicted wholly in place (a brush step's)
+    /// takes none.
     scratch: Vec<Vec<Vec3>>,
     /// The evaluation workers (see the module notes).
     workers: rayon::ThreadPool,
@@ -4035,24 +4038,30 @@ impl TileStore {
                     .filter(|_| self.evaluated.is_pinned(key))
             })
             .collect();
-        let mut scratch = self.take_scratch(round.len());
+        let through_scratch = slots.iter().filter(|slot| slot.is_none()).count();
+        let mut scratch = self.take_scratch(through_scratch);
         let predicted = self.predict_round(round, corrections, &slots, below, &mut scratch);
         let released = self.unpin_corrections(corrections);
         let built = predicted.and(released).and_then(|()| {
-            round.iter().zip(&slots).zip(&scratch).try_for_each(
-                |((&(key, parents), &slot), positions)| {
-                    let id = match slot {
-                        Some(id) => {
-                            self.install_in_place(key, id, parents)?;
-                            id
-                        }
-                        None => self.store_positions(key, parents, positions)?,
+            let mut buffers = scratch.iter();
+            round
+                .iter()
+                .zip(&slots)
+                .try_for_each(|(&(key, parents), &slot)| {
+                    let id = if let Some(id) = slot {
+                        self.install_in_place(key, id, parents)?;
+                        id
+                    } else {
+                        let positions = buffers.next().ok_or(Invariant::ShortBuffer {
+                            expected: through_scratch,
+                            got: scratch.len(),
+                        })?;
+                        self.store_positions(key, parents, positions)?
                     };
                     self.evaluated.pin(id)?;
                     held.push((key, id));
                     Ok(())
-                },
-            )
+                })
         });
         self.scratch = scratch;
         built
@@ -4060,7 +4069,8 @@ impl TileStore {
 
     /// Predicts every tile of `round` on the workers, from the pinned tiles of `below` and its
     /// correction slot (`corrections`, in the same order): straight into the tile's evaluated
-    /// slot where `slots` names one (in the same order), else into its buffer of `scratch`.
+    /// slot where `slots` names one (in the same order), else into the next buffer of
+    /// `scratch`, which holds one for each tile without a slot.
     ///
     /// The slots written and the slots read are borrowed together, in one
     /// [`Pool::get_many_mut`], which hands out each slot once: the round's slots stay mutable,
@@ -4131,12 +4141,12 @@ impl TileStore {
             })
             .collect();
         let mut written = written.into_iter();
+        let mut buffers = scratch.iter_mut();
         let mut outs: Vec<&mut [Vec3]> = slots
             .iter()
-            .zip(scratch.iter_mut())
-            .map(|(own_slot, buffer)| match own_slot {
+            .map(|own_slot| match own_slot {
                 Some(_) => written.next().map(|slot| slot.positions.as_mut_slice()),
-                None => Some(buffer.as_mut_slice()),
+                None => buffers.next().map(Vec::as_mut_slice),
             })
             .collect::<Option<_>>()
             .ok_or(Invariant::StaleHandle)?;
