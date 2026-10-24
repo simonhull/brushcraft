@@ -375,8 +375,10 @@ impl SpatialIndex {
     pub fn refit(&mut self, store: &mut TileStore, keys: &[TileKey]) -> Result<(), IndexError> {
         self.check_known(keys)?;
         let changed = Self::bounds_of_all(store, keys)?;
-        self.bvh.refit(&changed)?;
-        Ok(store.record_bounds(&changed)?)
+        // The store first: the tree's refit changes nothing when it fails, and can't fail here
+        // (every key is known), so a failure leaves the index as it was.
+        store.record_bounds(&changed)?;
+        self.bvh.refit(&changed)
     }
 
     /// The bounds of each of `keys`, in order, as [`SpatialIndex::bounds_of`] gives them.
