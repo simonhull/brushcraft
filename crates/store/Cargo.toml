@@ -17,7 +17,7 @@ thiserror.workspace = true
 zstd.workspace = true
 
 # Counting physical cores reads the process's CPU affinity mask (see `workers`).
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 rustix = { workspace = true, features = ["thread"] }
 
 [dev-dependencies]
