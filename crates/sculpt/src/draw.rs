@@ -332,13 +332,7 @@ fn run_brush(
     };
     let mut found = BrushOutput::default();
     for (&key, tile) in keys.iter().zip(brushed) {
-        let tile = tile.map_or_else(
-            || {
-                let positions = store.evaluate(key)?.to_vec();
-                Ok::<_, CacheError>(brush_tile(store.mesh().topology(), key, &positions, params))
-            },
-            Ok,
-        )?;
+        let tile = tile.map_or_else(|| brush_evicted(store, key, params), Ok)?;
         if !tile.reached {
             continue;
         }
@@ -352,6 +346,29 @@ fn run_brush(
         }
     }
     Ok(found)
+}
+
+/// What the brush does to `key`, a tile a later tile's evaluation pushed out of the cache
+/// before the workers could brush it: evaluated again, then brushed here.
+///
+/// The positions are read back shared ([`TileStore::cached_positions`]) beside the mesh, not
+/// copied out of the evaluation's mutable borrow. They are current right after the evaluation,
+/// so the copy below it is a fallback that keeps the result right should that ever change.
+///
+/// # Errors
+///
+/// As [`TileStore::evaluate`].
+fn brush_evicted(
+    store: &mut TileStore,
+    key: TileKey,
+    params: DrawParams,
+) -> Result<TileBrush, CacheError> {
+    store.evaluate(key)?;
+    if let Some(positions) = store.cached_positions(&key) {
+        return Ok(brush_tile(store.mesh().topology(), key, positions, params));
+    }
+    let positions = store.evaluate(key)?.to_vec();
+    Ok(brush_tile(store.mesh().topology(), key, &positions, params))
 }
 
 /// What the brush does to one tile: see [`brush_tile`].

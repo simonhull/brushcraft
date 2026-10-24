@@ -572,3 +572,24 @@ fn phase_times_add_up() {
     assert_eq!(times.refit, ms(14), "phase by phase");
     assert_eq!(times.neighbours, ms(10), "the neighbours too");
 }
+
+/// A tile evicted before the workers could brush it is brushed from its positions read back
+/// after evaluating it again, with the same result as brushing a copy of them.
+#[test]
+fn an_evicted_tile_is_brushed_as_from_its_positions() {
+    let dir = TestDir::new();
+    let level = Level::new(6).unwrap();
+    let (mut project, _) = project(&dir, level);
+    let params = DrawParams::new(vertex(level, 0, 60, 30), 0.3, 0.05).unwrap();
+    let key = TileKey::displacement(FaceId::new(0), level, 0, 0).unwrap();
+    let store = project.store();
+    let copy = store.evaluate(key).unwrap().to_vec();
+    let want = brush_tile(store.mesh().topology(), key, &copy, params);
+    let got = brush_evicted(store, key, params).unwrap();
+    assert!(want.reached, "the brush reaches the tile");
+    assert_eq!(
+        (got.reached, got.moved, got.deltas),
+        (want.reached, want.moved, want.deltas),
+        "the same brush"
+    );
+}
