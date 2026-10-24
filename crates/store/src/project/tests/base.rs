@@ -98,3 +98,39 @@ fn the_base_is_the_rebuilt_save_point_after_every_kind_of_save() {
     assert_base_rebuilds(&project, "saved in the new file");
     project.close(false).unwrap();
 }
+
+/// Saves `project` and asserts the save took the rebase's short path: the new base is known to
+/// extend the one before (see [`BaseFile::extends`]), so the old base's tiles weren't looked up
+/// one by one.
+fn assert_saves_extending(project: &mut Project, what: &str) {
+    let before = project
+        .store
+        .base()
+        .expect("a saved project has a base")
+        .clone();
+    assert_saved(project.save());
+    let after = project.store.base().expect("a saved project has a base");
+    assert!(after.extends(&before), "{what}: extends the base before");
+}
+
+#[test]
+fn saves_take_the_short_rebase_path_after_saves_and_after_an_open() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    let mut map = CorrectionMap::new();
+    stroke(&mut project, &mut map, 60, 1);
+    assert_saved(project.save_as(&path));
+    // Twenty in a row: a full Index among them.
+    for k in 0..20_u64 {
+        stroke(&mut project, &mut map, 30, 10 + k);
+        assert_saves_extending(&mut project, &format!("save {k}"));
+    }
+    project.close(false).unwrap();
+    // The first save after opening: its base was loaded from the file.
+    project = Project::open(&path, config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 30, 40);
+    assert_saves_extending(&mut project, "the first save after an open");
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "every save");
+}
