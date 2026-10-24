@@ -47,15 +47,16 @@ jobs:
       - run: cargo test --workspace --doc --all-features
 
   perf:
-    # Builds every benchmark and runs the performance suite on a tiny project: it checks the
-    # suite works end to end. No timings: shared runners are too noisy to measure on, so the
-    # tiny run records nothing and compares nothing.
+    # Runs the performance suite on a tiny project: it checks the suite works end to end. No
+    # timings: shared runners are too noisy to measure on, so the tiny run records nothing and
+    # compares nothing. The stage bench is built first exactly as perf builds it (every bench's
+    # code is already checked by clippy --all-targets in the lint job).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
       - uses: Swatinem/rust-cache@v2
-      - run: cargo bench --workspace --all-features --no-run
+      - run: cargo bench --no-run -p geom --bench stages --features bench-stages
       - run: cargo run -p brushcraft-bench -- perf --tiny
 
   deps:
