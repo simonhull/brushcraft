@@ -427,20 +427,22 @@ fn open_writable(path: &Path) -> io::Result<File> {
 /// Opens `path` with `access` (`RDONLY` or `RDWR`) and returns it as a blocking [`File`], if it
 /// is a regular file.
 ///
-/// A path may come from a file (a recovery file names its project), so it may name a FIFO or a
-/// device, and opening one must neither block nor do more than the open itself: a plain open of
-/// a FIFO waits for a writer, and would hang listing recovery files at every launch. So the open
-/// doesn't block (`O_NONBLOCK`, and `O_CLOEXEC`), anything but a regular file is refused, and the
-/// descriptor is then made blocking again, so it reads as any other.
+/// A path may come from a file (a recovery file names its project) or a directory listing, so it
+/// may name a FIFO or a device, and opening one must neither block nor do more than the open
+/// itself: a plain open of a FIFO waits for a writer, and would hang listing recovery files at
+/// every launch, and a terminal could become the process's controlling one. So the open doesn't
+/// block (`O_NONBLOCK`) or take a terminal (`O_NOCTTY`), and closes on exec (`O_CLOEXEC`);
+/// anything but a regular file is refused, and the descriptor is then made blocking again, so it
+/// reads as any other.
 ///
 /// # Errors
 ///
 /// [`io::ErrorKind::InvalidInput`] if `path` names something other than a regular file; the I/O
 /// error of the open, the `fstat` or the `fcntl`s.
-fn open_regular(path: &Path, access: OFlags) -> io::Result<File> {
+pub(crate) fn open_regular(path: &Path, access: OFlags) -> io::Result<File> {
     let file = File::from(rustix::fs::open(
         path,
-        access | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        access | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
     if FileType::from_raw_mode(rustix::fs::fstat(&file)?.st_mode) != FileType::RegularFile {
@@ -2912,9 +2914,10 @@ fn plausible_index(head: Head, payload_start: &[u8]) -> bool {
 /// Every byte offset is a candidate, so the checks beyond the checksum keep bytes inside another
 /// record from passing for one. Only a candidate [`plausible_index`] accepts is checksummed.
 ///
-/// The range is read in windows, so a long tail costs one pass and little memory; a candidate
-/// longer than its window is checksummed in window-sized pieces, and read whole only if its
-/// checksum matches.
+/// The range is read in windows, so a long tail costs one pass and a window of memory. A
+/// candidate longer than its window is checksummed in window-sized pieces, which costs one more
+/// window; only one whose checksum matches is then read whole, its stated length, which the file
+/// holds.
 ///
 /// The bytes checksummed over all candidates are capped at four times the range's length, or
 /// 64 MiB if that is more. A search that would checksum more stops with [`Search::TooCostly`],
@@ -2999,7 +3002,7 @@ fn charge(spent: &mut u64, n: u64, budget: u64) -> bool {
 }
 
 /// Whether the record `head` heads at `at` matches its checksum, read in pieces of at most `most`
-/// bytes into `piece`, so a long record costs no more memory than one piece.
+/// bytes into `piece`: checking it costs no more memory than one piece, whatever its length.
 ///
 /// # Errors
 ///

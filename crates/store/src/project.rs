@@ -79,10 +79,11 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
 use geom::{BaseMesh, Level};
+use rustix::fs::OFlags;
 use thiserror::Error;
 
 use crate::OpId;
-use crate::file::{BaseFile, ProjectFile, StoreError, sync_parent};
+use crate::file::{BaseFile, ProjectFile, StoreError, open_regular, sync_parent};
 use crate::index::{IndexError, LoadStats, SpatialIndex};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
@@ -1438,7 +1439,9 @@ fn order(found: &mut [RecoveryCandidate]) {
 /// Removes the temporary file at `path` if it is a crash's leftover.
 ///
 /// It is one if unwritten for [`STALE_TEMPORARY`] and lockable, so no instance is still making
-/// it. Best effort: a file that can't be checked or removed is left for the next listing.
+/// it. Only a regular file is opened to check (see [`open_regular`]): anything else at a
+/// temporary file's name, a FIFO say, is left as it is, never waited on. Best effort: a file
+/// that can't be checked or removed is left for the next listing.
 fn sweep(path: &Path) {
     let stale = fs::metadata(path)
         .and_then(|meta| meta.modified())
@@ -1448,7 +1451,7 @@ fn sweep(path: &Path) {
     if !stale {
         return;
     }
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(file) = open_regular(path, OFlags::RDONLY) else {
         return;
     };
     // The lock is held across the removal, so an instance can't take the file meanwhile.
