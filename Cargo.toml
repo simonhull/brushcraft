@@ -144,3 +144,10 @@ debug = "line-tables-only"
 
 [profile.bench]
 debug = "line-tables-only"
+
+# The stage benches in the gate's `perf --tiny`, which records nothing: thin LTO builds faster.
+# Recorded numbers always come from `bench`.
+[profile.bench-fast]
+inherits = "bench"
+lto = "thin"
+codegen-units = 16

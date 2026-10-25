@@ -53,7 +53,7 @@ use crate::perf::project::{
     Copied, Scale, Source, Sweep, WorkDir, WorkRoot, cache_key, cached_file, remove_stale,
 };
 use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak};
-use crate::perf::suite::Runner;
+use crate::perf::suite::{Runner, StageProfile};
 use crate::report::Output;
 
 /// Rounds of the stage benches: each takes a fraction of a second.
@@ -78,6 +78,9 @@ struct Plan {
     scales: Vec<Scale>,
     /// Whether the stage benches run.
     stages: bool,
+    /// The profile the stage benches are built in: `bench-fast` for `--tiny`, which records
+    /// nothing, and `bench` for every run whose numbers may be recorded.
+    stage_profile: StageProfile,
     /// The history directory, if the run is recorded.
     history: Option<PathBuf>,
     /// Whether the run should become the baseline.
@@ -116,6 +119,11 @@ impl Plan {
         Ok(Self {
             scales,
             stages: options.stages,
+            stage_profile: if tiny {
+                StageProfile::BenchFast
+            } else {
+                StageProfile::Bench
+            },
             history: options.history.clone(),
             baseline: options.baseline,
             quiet: (!tiny).then(|| Quiet::new(Duration::from_secs(options.settle_secs))),
@@ -601,7 +609,7 @@ fn measure_all<J: Write, H: Write>(
 ) -> Result<()> {
     if plan.stages {
         session.part("stage benches", "none", out, |r| {
-            suite::stage_part(r, STAGE_ROUNDS)
+            suite::stage_part(r, STAGE_ROUNDS, plan.stage_profile)
         })?;
     }
     for &scale in &plan.scales {
@@ -696,6 +704,18 @@ mod tests {
         let tiny = plan("perf --tiny --no-stages").unwrap();
         assert_eq!(tiny.scales, [Scale::Tiny], "tiny");
         assert!(!tiny.stages && tiny.quiet.is_none(), "no stages, no guard");
+        assert_eq!(
+            plan("perf --tiny").unwrap().stage_profile,
+            StageProfile::BenchFast,
+            "tiny records nothing, so its stage benches build fast"
+        );
+        for recorded in ["perf", "perf --full", "perf --baseline --history /d"] {
+            assert_eq!(
+                plan(recorded).unwrap().stage_profile,
+                StageProfile::Bench,
+                "{recorded}: recorded numbers come from the bench profile"
+            );
+        }
         for bad in [
             "perf --tiny --history /d",
             "perf --tiny --baseline",

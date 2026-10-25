@@ -43,6 +43,27 @@ fn stage_cpu(allowed: &[usize]) -> Option<usize> {
     allowed.get(STAGE_CPU).or_else(|| allowed.last()).copied()
 }
 
+/// The cargo profile the stage benches are built in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageProfile {
+    /// `bench`: fat LTO and one codegen unit, as the release build. Every recorded number
+    /// comes from this profile.
+    Bench,
+    /// `bench-fast`: thin LTO and 16 codegen units, so the stage benches build faster. Only for
+    /// runs that record nothing (`perf --tiny`): its timings aren't comparable with `bench`'s.
+    BenchFast,
+}
+
+impl StageProfile {
+    /// The profile's name, as `cargo --profile` takes it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Bench => "bench",
+            Self::BenchFast => "bench-fast",
+        }
+    }
+}
+
 /// The CPUs this process's affinity mask allows, ascending.
 ///
 /// # Errors
@@ -127,20 +148,22 @@ impl Runner {
             .collect()
     }
 
-    /// Runs the stage benches once, pinned to one allowed CPU ([`stage_cpu`]), through
-    /// `taskset` and the `cargo` building this (`$CARGO`, else the one on
-    /// the path), and returns divan's table.
+    /// Runs the stage benches once, built in `profile`, pinned to one allowed CPU
+    /// ([`stage_cpu`]), through `taskset` and the `cargo` building this (`$CARGO`, else the one
+    /// on the path), and returns divan's table.
     ///
     /// # Errors
     ///
     /// If `taskset` or `cargo` can't be run, or the benches fail.
-    pub(crate) fn stage_benches(&self) -> Result<String> {
+    pub(crate) fn stage_benches(&self, profile: StageProfile) -> Result<String> {
         let cpu = stage_cpu(&allowed_cpus()?).context("no CPU in the affinity mask")?;
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut args: Vec<OsString> = vec!["-c".into(), cpu.to_string().into(), cargo];
         args.extend(
             [
                 "bench",
+                "--profile",
+                profile.name(),
                 "-p",
                 "geom",
                 "--bench",
@@ -334,14 +357,21 @@ fn words(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
 }
 
-/// The stage benches, `rounds` times: each round's divan median is a sample of its stage and
-/// tile.
+/// The stage benches built in `profile`, `rounds` times: each round's divan median is a sample
+/// of its stage and tile.
 ///
 /// # Errors
 ///
 /// If the benches fail or their table doesn't parse.
-pub(crate) fn stage_part(runner: &Runner, rounds: usize) -> Result<Vec<Metric>> {
-    stage_samples(std::iter::repeat_with(|| runner.stage_benches()), rounds)
+pub(crate) fn stage_part(
+    runner: &Runner,
+    rounds: usize,
+    profile: StageProfile,
+) -> Result<Vec<Metric>> {
+    stage_samples(
+        std::iter::repeat_with(|| runner.stage_benches(profile)),
+        rounds,
+    )
 }
 
 /// The stage metrics from `rounds` of divan's tables taken from `outputs`, after one more taken
