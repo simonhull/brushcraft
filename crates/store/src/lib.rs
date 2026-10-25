@@ -15,6 +15,9 @@ mod feed;
 mod file;
 #[cfg(test)]
 mod fixture;
+#[cfg(any(fuzzing, test))]
+#[doc(hidden)]
+pub mod fuzzing;
 mod index;
 mod kept;
 mod meta;

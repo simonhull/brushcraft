@@ -1,0 +1,50 @@
+# Whole-file fuzz targets, run by cargo-fuzz on the pinned nightly (see CLAUDE.md "Commands").
+#
+# A workspace of its own, left out of the main one: libfuzzer-sys builds libFuzzer's C++ and is
+# only meant for nightly fuzzing builds, so the gate and cargo-deny never see it.
+[package]
+name = "brushcraft-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+description = "cargo-fuzz targets for whole project files and base meshes."
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+geom = { path = "../crates/geom" }
+libfuzzer-sys = "0.4.13"
+store = { path = "../crates/store" }
+
+# The main workspace's lints that apply to a binary crate of this size.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+missing_docs_in_private_items = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+
+[[bin]]
+name = "mesh_from_bytes"
+path = "fuzz_targets/mesh_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "project_open"
+path = "fuzz_targets/project_open.rs"
+test = false
+doc = false
+bench = false

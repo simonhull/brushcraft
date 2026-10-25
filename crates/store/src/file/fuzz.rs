@@ -15,6 +15,7 @@ use crate::bounds::{KNOWN_RECORD_LEN, UNKNOWN_RECORD_LEN};
 use crate::fixture;
 use crate::meta::{ProjectId, Role};
 use crate::op::{MAX_SEQ, RESERVED_SITE};
+use crate::test_dir::TestDir;
 
 /// A key's raw fields as a generator makes them: layer, channel, face, level, tx, ty.
 type RawKey = (u16, u8, u32, u8, u16, u16);
@@ -365,4 +366,63 @@ fn decompression_never_panics() {
                 assert_eq!(back.len(), len, "exactly the stated length");
             }
         });
+}
+
+/// A small project file at `path` with `meta`: three save points (one full Index, two deltas)
+/// of a tile each at levels 1 to 3, a known and an unknown bound, and an unsaved tile after the
+/// last save point.
+fn seed_file(path: &Path, meta: Meta) {
+    let mut file = ProjectFile::create(path, meta, fixture::mesh()).unwrap();
+    for (seq, level) in (1..).zip(1..=3_u8) {
+        let face = FaceId::new(level.into());
+        let key = TileKey::displacement(face, Level::new(level).unwrap(), 0, 0).unwrap();
+        let side = key.side();
+        let values: Vec<Vec3> = (0..side * side)
+            .map(|k| Vec3::new(0.0, f32::from(u8::try_from(k % 5).unwrap()) * 1e-3, 0.0))
+            .collect();
+        let tile = CorrectionTile::from_values(side, &values).unwrap();
+        file.write_displacement(key, op_of(0, seq), &tile).unwrap();
+        let bound = TileBounds::of_tile(
+            &[Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)],
+            &[Vec3::new(0.0, 0.0, 1.0)],
+        );
+        let known = seq == 2;
+        file.write_bounds(key, bound.as_ref().filter(|_| known), Stamp::ZERO)
+            .unwrap();
+        file.save().unwrap();
+    }
+    let key = TileKey::displacement(FaceId::new(4), Level::new(1).unwrap(), 0, 0).unwrap();
+    let tile = CorrectionTile::from_values(3, &[Vec3::ZERO; 9]).unwrap();
+    file.write_displacement(key, op_of(0, 4), &tile).unwrap();
+}
+
+/// Writes the seed corpora of the cargo-fuzz targets (`fuzz/corpus/<target>/seed-*`).
+///
+/// Each is a few KiB: the tests' mesh, and small project and recovery files over it. Run by hand
+/// when the format changes: `cargo nextest run -p store --run-ignored only write_fuzz_seeds`.
+#[test]
+#[ignore = "writes the fuzz seed corpora; run by hand"]
+fn write_fuzz_seeds() {
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus");
+    let mesh = fixture::mesh().to_bytes();
+    std::fs::write(corpus.join("mesh_from_bytes/seed-cube"), mesh).unwrap();
+    let dir = TestDir::new();
+    let project = dir.path("project");
+    seed_file(&project, fixture::meta());
+    let point = ProjectFile::open(&project)
+        .unwrap()
+        .base()
+        .unwrap()
+        .save_point();
+    let recovery = fixture::meta()
+        .with_role(Role::Recovery { base: Some(point) })
+        .on_save_point(point, Path::new("/home/someone/sculpts/head.project"));
+    let recovery_path = dir.path("recovery");
+    seed_file(&recovery_path, recovery);
+    let seeds = corpus.join("project_open");
+    for (from, name) in [(project, "seed-project"), (recovery_path, "seed-recovery")] {
+        let bytes = std::fs::read(from).unwrap();
+        assert!(bytes.len() <= 64 << 10, "{name}: a seed stays small");
+        std::fs::write(seeds.join(name), bytes).unwrap();
+    }
 }
