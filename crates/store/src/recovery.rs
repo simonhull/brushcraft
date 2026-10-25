@@ -74,6 +74,14 @@
 //! The file stays at its last durable save point. The owner ([`crate::Project`]) rolls over to
 //! a new recovery file, copying every edit into it from the store, and starts a new writer.
 //!
+//! A writer whose thread has stopped (it panicked) is failed too: no flush can be finished,
+//! and the edits a flush in flight snapshotted would never reach the file. The call that finds
+//! the thread gone returns [`RecoveryError::Stopped`], and every trigger after it
+//! [`RecoveryError::NeedsNewFile`], so the owner rolls over the same way. Rolling over, rather
+//! than starting a new writer on the same file, is what keeps every edit: a new writer
+//! subscribes with an empty flush mark, so tiles already dirty would never be flushed, whereas
+//! a roll-over copies every edit from the store.
+//!
 //! # Shutdown
 //!
 //! Dropping the writer stops its thread and joins it: the thread checks a stop flag between
@@ -114,7 +122,9 @@ pub enum RecoveryError {
     /// The writer thread couldn't be started.
     #[error("the recovery writer's thread couldn't be started")]
     Spawn(#[source] io::Error),
-    /// The writer thread has stopped (it panicked): no flush can be finished.
+    /// The writer thread has stopped (it panicked): no flush can be finished. The writer is
+    /// failed from then on, as after a failed sync (see the module notes), and every later
+    /// trigger returns [`RecoveryError::NeedsNewFile`].
     #[error("the recovery writer's thread has stopped")]
     Stopped,
     /// A sync of the working file failed earlier, so the writer no longer writes to it (see
@@ -143,7 +153,8 @@ enum Phase {
         /// Where the save point starts.
         offset: u64,
     },
-    /// A sync failed: no flush will be made into this file again (see the module notes).
+    /// A sync failed, or the writer thread stopped: no flush will be made into this file again
+    /// (see the module notes).
     Failed,
 }
 
@@ -434,8 +445,8 @@ impl RecoveryWriter {
         matches!(self.phase, Phase::Idle | Phase::Failed) && self.queued.is_none()
     }
 
-    /// Whether a sync has failed, so the writer no longer writes to its file (see the module
-    /// notes).
+    /// Whether a sync has failed, or the writer thread has stopped, so the writer no longer
+    /// writes to its file (see the module notes).
     #[must_use]
     pub const fn is_failed(&self) -> bool {
         matches!(self.phase, Phase::Failed)
@@ -634,7 +645,8 @@ impl RecoveryWriter {
 
     /// Passes `outcome` through. On error the flush in flight and any queued after it are
     /// abandoned, and the next trigger flushes even with no new edits, to confirm what it held;
-    /// a failed sync fails the writer for good (see the module notes).
+    /// a failed sync, or a writer thread found stopped, fails the writer for good (see the
+    /// module notes).
     ///
     /// # Errors
     ///
@@ -644,7 +656,9 @@ impl RecoveryWriter {
             self.queued = None;
             self.unconfirmed = true;
             self.phase = match (self.phase, e) {
-                (Phase::Failed, _) | (_, RecoveryError::Sync(_)) => Phase::Failed,
+                (Phase::Failed, _) | (_, RecoveryError::Sync(_) | RecoveryError::Stopped) => {
+                    Phase::Failed
+                }
                 _ => Phase::Idle,
             };
         }
@@ -675,6 +689,16 @@ impl RecoveryWriter {
     /// the next one. Dropping the writer lets the thread go.
     pub(crate) fn pause(&self, paused: bool) {
         self.hooks.pause(paused);
+    }
+
+    /// Stops the writer thread as a panic would: its channel closes and the thread is joined, so
+    /// the next request finds it gone.
+    pub(crate) fn stop_thread(&mut self) {
+        drop(self.requests.take());
+        self.hooks.pause(false);
+        if let Some(thread) = self.thread.take() {
+            drop(thread.join());
+        }
     }
 
     /// Whether a trigger has queued a flush behind the one in flight.

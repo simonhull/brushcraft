@@ -145,6 +145,37 @@ fn records_appended_while_the_tiles_sync_are_synced_before_the_save_point() {
     assert_save_point(&path, second, &mesh, &map);
 }
 
+/// A writer whose thread stopped (as a panic would stop it) is failed: no flush can be finished
+/// there, so every trigger after the one that found it gone asks for a new file.
+#[test]
+fn a_writer_whose_thread_stopped_is_failed_and_needs_a_new_file() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 20, 51));
+    writer.stop_thread();
+    assert!(
+        matches!(
+            writer.end_stroke(&mut store, Instant::now()),
+            Err(RecoveryError::Stopped)
+        ),
+        "the stroke's flush finds the thread gone"
+    );
+    assert!(
+        writer.is_failed(),
+        "a writer that can't finish a flush is failed"
+    );
+    assert!(
+        matches!(
+            writer.end_stroke(&mut store, Instant::now()),
+            Err(RecoveryError::NeedsNewFile)
+        ),
+        "it needs a new file"
+    );
+}
+
 /// Ticks during a ten-second stroke of one op flush about once a second.
 ///
 /// A tick every 100 ms: the flushes are at least [`FLUSH_INTERVAL`] apart and at most a tick

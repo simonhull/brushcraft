@@ -343,9 +343,10 @@ enum Recovery {
 /// would.
 pub struct Project {
     /// Streams the store's edits into the recovery file. `None` while crash protection is
-    /// paused: a writer whose file failed to sync is closed at once, and none runs until a new
-    /// recovery file is in place ([`Project::resume`]). Also `None` once closed: it is taken out
-    /// by [`Project::close`] and the drop, which close it on the store.
+    /// paused: a writer whose file failed to sync, or whose thread stopped, is closed at once, and
+    /// none runs until a new recovery file is in place ([`Project::resume`]). Also `None` once
+    /// closed: it is taken out by [`Project::close`] and the drop, which close it on the
+    /// store.
     writer: Option<RecoveryWriter>,
     /// The tile store: the recovery file over the project file's last save point.
     store: TileStore,
@@ -985,10 +986,11 @@ impl Project {
     /// Runs `call` on the recovery writer, then deals with what it found.
     ///
     /// Tiles the writer left out of its flushes (broken slots) wait to be reported
-    /// ([`Project::report`]). If the writer has failed (a sync of the recovery file failed, see
-    /// [`crate::recovery`]), it is closed, and the project moves to a new recovery file holding
-    /// every edit ([`Project::resume`]); the failure, dealt with, isn't returned. With no
-    /// writer, crash protection is paused: `call` isn't run, and protection is tried again.
+    /// ([`Project::report`]). If the writer has failed (a sync of the recovery file failed, or
+    /// its thread stopped, see [`crate::recovery`]), it is closed, and the project moves to a new
+    /// recovery file holding every edit ([`Project::resume`]); the failure, dealt with, isn't
+    /// returned. With no writer, crash protection is paused: `call` isn't run, and protection
+    /// is tried again.
     ///
     /// # Errors
     ///

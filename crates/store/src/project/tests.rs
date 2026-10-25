@@ -669,6 +669,43 @@ fn a_failed_sync_rolls_over_to_a_new_recovery_file() {
     );
 }
 
+/// A writer whose thread stopped, as a panic would stop it, is replaced by a roll-over.
+///
+/// The next stroke's end finds it gone, the project moves to a new recovery file with a new
+/// writer, and protection carries on, every edit kept.
+#[test]
+fn a_writer_whose_thread_stopped_is_replaced_by_a_roll_over() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 61);
+    project.finish_flushes().unwrap();
+    let old = project.recovery_path().unwrap().to_path_buf();
+    project.writer.as_mut().unwrap().stop_thread();
+    stroke(&mut project, &mut map, 60, 62);
+    assert_ne!(
+        project.recovery_path().unwrap(),
+        old,
+        "rolled over to a new recovery file"
+    );
+    assert!(
+        !project.writer.as_ref().unwrap().is_failed(),
+        "a new writer"
+    );
+    assert!(project.protection().is_active(), "protection carries on");
+    let path = project.recovery_path().unwrap().to_path_buf();
+    project.close(true).unwrap();
+    let file = ProjectFile::open(&path).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "every edit, both strokes",
+    );
+}
+
 #[test]
 fn a_saved_project_rolls_over_on_its_save_point_and_saves_after() {
     let dir = TestDir::new();
