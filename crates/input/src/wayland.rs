@@ -647,6 +647,26 @@ mod tests {
     use super::*;
     use crate::{Buttons, ControlId, PadEvent, Position, StrokeSample, Tool, Unit};
 
+    #[test]
+    fn retry_later_passes_success() {
+        assert!(matches!(retry_later(Ok(5)), Ok(())));
+    }
+
+    #[test]
+    fn retry_later_waits_out_would_block() {
+        let would_block = WaylandError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        assert!(matches!(retry_later::<()>(Err(would_block)), Ok(())));
+    }
+
+    #[test]
+    fn retry_later_reports_other_errors() {
+        let broken = WaylandError::Io(std::io::ErrorKind::BrokenPipe.into());
+        assert!(matches!(
+            retry_later::<()>(Err(broken)),
+            Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+    }
+
     /// A pen sample in `phase`.
     fn sample(phase: Phase) -> Event {
         let now = Instant::now();
