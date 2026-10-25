@@ -318,6 +318,17 @@ fn brush_per_step_reports_every_step() {
             number(step, "minor_faults") >= 0.0,
             "page faults counted: {step}"
         );
+        let reused = number(step, "predictions_reused");
+        assert!(
+            reused <= number(step, "positions_computed"),
+            "reuses are among the predictions: {step}"
+        );
+        if n > 0 {
+            assert!(
+                reused > 0.5,
+                "after the first step, the pinned tiles reuse their predictions: {step}"
+            );
+        }
     }
     let slowest = walls.iter().copied().fold(0.0, f64::max);
     assert!(

@@ -116,8 +116,8 @@ use std::sync::Arc;
 
 use geom::{
     BaseMesh, Channel, CorrectionError, CorrectionView, CorrectionViewMut, EvalError, FaceId,
-    LayerId, Level, MAX_COPIES, PositionSource, Region, TileBorder, TileKey, Vec3, VertexCopy,
-    normals_into, parent_tiles, predict_region, refresh_normals_into,
+    LayerId, Level, MAX_COPIES, PositionSource, Prediction, Region, TileBorder, TileKey, Vec3,
+    VertexCopy, normals_into, parent_tiles, predict_region, refresh_normals_into,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -131,6 +131,7 @@ use crate::deps::{DepGraph, list_normal_inputs};
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
 use crate::index::TileBounds;
+use crate::kept::Kept;
 use crate::meta::{Meta, Role, SavePoint};
 use crate::op::{OpId, RESERVED_SITE};
 use crate::pool::{Budget, Freshness, Invalidated, Pool, PoolError, SlotData, SlotId};
@@ -175,12 +176,21 @@ pub struct StoreConfig {
     /// by default one per physical core ([`Workers::PhysicalCores`], see [`crate::Workers`] for
     /// why). Results are the same bits whatever the count; tests pin it to compare.
     pub workers: Workers,
+    /// How many tiles' predictions the store keeps for predicting them again in place (see
+    /// "Kept predictions" on [`TileStore`]): [`StoreConfig::DEFAULT_KEPT_PREDICTIONS`] unless
+    /// set. Each is about 206 KB for a finest tile, outside the budget; zero keeps none, and
+    /// every tile is predicted in full. Results are the same bits either way.
+    pub kept_predictions: usize,
 }
 
 impl StoreConfig {
     /// The default chunk: 64 MiB, large enough that the allocator maps each chunk on its own
     /// and gives it back to the OS when it is dropped (see the pool's notes).
     pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
+    /// The default [`StoreConfig::kept_predictions`]: 64, about 13 MB. A brush step re-predicts
+    /// the 20 to 30 tiles its sphere reaches, and a stroke moves on by a tenth of a radius a
+    /// step, so a stroke's tiles are reused for several steps before it leaves them.
+    pub const DEFAULT_KEPT_PREDICTIONS: usize = 64;
 
     /// A store of `budget_bytes` whose op ids carry `site`, with
     /// [`StoreConfig::DEFAULT_CHUNK_BYTES`] chunks and one evaluation worker per physical core
@@ -192,6 +202,7 @@ impl StoreConfig {
             chunk_bytes: Self::DEFAULT_CHUNK_BYTES,
             site,
             workers: Workers::PhysicalCores,
+            kept_predictions: Self::DEFAULT_KEPT_PREDICTIONS,
         }
     }
 
@@ -224,6 +235,16 @@ impl StoreConfig {
     #[must_use]
     pub const fn with_workers(self, workers: Workers) -> Self {
         Self { workers, ..self }
+    }
+
+    /// This configuration keeping up to `kept_predictions` tiles' predictions (see
+    /// [`StoreConfig::kept_predictions`]).
+    #[must_use]
+    pub const fn with_kept_predictions(self, kept_predictions: usize) -> Self {
+        Self {
+            kept_predictions,
+            ..self
+        }
     }
 
     /// The least [`StoreConfig::budget_bytes`] a store over `mesh` with these chunks works
@@ -722,6 +743,23 @@ struct EvalLog {
 /// pool (the correction floor, see the module notes): the next evaluation loads its correction
 /// tiles there.
 ///
+/// # Kept predictions
+///
+/// A tile is evaluated in two parts: its prediction from the level below (the subdivided
+/// positions and each vertex's tangent frame, most of the work) and its corrections applied in
+/// those frames. Editing a tile changes only its corrections, so a tile predicted again because
+/// it was edited is predicted from the same positions as before. The store keeps the predictions
+/// of the tiles it predicts in place (pinned tiles recomputed after an edit: a brush step's) and,
+/// next time, only applies the corrections, to the same bits: see
+/// [`StoreConfig::kept_predictions`] for how many.
+///
+/// A kept prediction goes when it may no longer be right: when the positions it was predicted
+/// from are invalidated (an edit of the tile's parents, or of anything they follow from), when
+/// the tile leaves the evaluated pool (its dependency record goes with it, so later edits of its
+/// parents couldn't reach the prediction), or when it is the least recently used past the
+/// bound. Tiles predicted outside a brush step (paging in) aren't kept: thousands of them would
+/// cycle through the bound for nothing.
+///
 /// # Memory outside the budget
 ///
 /// [`StoreConfig::budget_bytes`] bounds the two pools, which hold nearly all of a store's
@@ -730,6 +768,9 @@ struct EvalLog {
 /// - the evaluation scratch: one buffer of the largest tile's positions (about 50 KB) per tile of a
 ///   round not predicted in place, so about 3.2 MB at most (64 of them, once a round of new tiles
 ///   has been built), kept for the store's life;
+/// - the kept predictions: up to [`StoreConfig::kept_predictions`] of them, about 206 KB each for a
+///   finest tile (the predicted positions with their ring, and a tangent frame per vertex), so
+///   about 13 MB at the default 64;
 /// - the buffers and zstd context the owner thread reads correction tiles with, each evaluation
 ///   worker's (made the first time a round's tiles are loaded on the workers) and each prefetch
 ///   worker's (at most four): about 150 KB a thread, so a few MB with dozens of workers, with the
@@ -829,6 +870,10 @@ pub struct TileStore {
     /// slots at once (see [`TileStore::fill_round`]). Made on demand, never more than there are
     /// workers.
     worker_read_scratch: Vec<ReadScratch>,
+    /// The predictions kept for tiles predicted again in place (see "Kept predictions" on
+    /// [`TileStore`]): only of tiles resident in the evaluated pool, and only while their
+    /// parents' positions stay as they were.
+    kept: Kept<Prediction>,
     /// What the store has done since it opened, for [`TileStore::activity`].
     activity: Activity,
     /// What was computed, for the tests.
@@ -1028,12 +1073,15 @@ fn each_parallel<T: Sync, B: Send>(
     results.into_iter().collect()
 }
 
+/// One task of a round of predictions: a tile with its correction slot.
+type RoundTask = (TileKey, SlotId<CorrectionSlot>);
+
 /// The tasks of a round of predictions: each tile of `round` with its correction slot (from
 /// `corrections`, in the same order).
 fn round_tasks(
     round: &[(TileKey, &[TileKey])],
     corrections: &[SlotId<CorrectionSlot>],
-) -> Vec<(TileKey, SlotId<CorrectionSlot>)> {
+) -> Vec<RoundTask> {
     round
         .iter()
         .map(|&(key, _)| key)
@@ -1042,6 +1090,9 @@ fn round_tasks(
 }
 
 /// Predicts tile `key` and applies its corrections, into the first `side²` values of `out`.
+///
+/// Returns the prediction made, or `None` if `kept` was given: the tile's kept prediction,
+/// whose corrections alone are applied (see "Kept predictions" on [`TileStore`]).
 ///
 /// The parents are read from `tiles` (pinned, with the mesh at level 0), the corrections from
 /// slot `id` of `pool`. Reads only, so it runs on any worker.
@@ -1054,20 +1105,25 @@ fn predict_tile(
     mesh: &BaseMesh,
     pool: &Pool<CorrectionSlot>,
     tiles: Tiles<'_>,
-    key: TileKey,
-    id: SlotId<CorrectionSlot>,
+    (key, id): RoundTask,
+    kept: Option<&Prediction>,
     out: &mut [Vec3],
-) -> Result<(), CacheError> {
+) -> Result<Option<Prediction>, CacheError> {
     let view = pool
         .get(id)
         .ok_or(Invariant::StaleHandle)?
         .view()
         .map_err(Invariant::CorrectionSlot)?;
+    let corrections = |i, j| view.get(i, j).unwrap_or(Vec3::ZERO);
+    let out = prefix_mut(out, vertex_count(&key))?;
+    if let Some(prediction) = kept {
+        prediction.apply_into(corrections, out)?;
+        return Ok(None);
+    }
     let source = Resident::new(mesh, tiles);
     let prediction = predict_region(mesh, &source, Region::of_tile(&key))?;
-    let out = prefix_mut(out, vertex_count(&key))?;
-    prediction.apply_into(|i, j| view.get(i, j).unwrap_or(Vec3::ZERO), out)?;
-    Ok(())
+    prediction.apply_into(corrections, out)?;
+    Ok(Some(prediction))
 }
 
 /// A structural list for each of `keys`, in order: `recorded(key)` where the store recorded it,
@@ -1499,6 +1555,7 @@ impl TileStore {
             workers,
             read_scratch: ReadScratch::new()?,
             worker_read_scratch: Vec::new(),
+            kept: Kept::new(config.kept_predictions),
             activity: Activity::default(),
             #[cfg(test)]
             log: EvalLog::default(),
@@ -1957,6 +2014,26 @@ impl TileStore {
         let drained = self.feed.drain(self.save_consumer);
         self.since_rebase
             .extend(drained.into_iter().map(|(key, _)| key));
+    }
+
+    /// Asserts that only tiles resident in the evaluated pool have a kept prediction: that
+    /// every eviction and every invalidation that freed a slot dropped its tile's.
+    ///
+    /// # Panics
+    ///
+    /// If a tile that isn't resident has one.
+    #[cfg(test)]
+    fn assert_kept_resident(&self) {
+        let mut stale: Vec<&TileKey> = self
+            .kept
+            .keys()
+            .filter(|key| self.evaluated.find(key).is_none())
+            .collect();
+        stale.sort_unstable();
+        assert!(
+            stale.is_empty(),
+            "predictions kept for tiles not resident: {stale:?}"
+        );
     }
 
     /// Asserts that only resident correction tiles have a [`TileStore::known_ops`] entry: that
@@ -3139,7 +3216,10 @@ impl TileStore {
             }
         }
         #[cfg(test)]
-        self.assert_known_ops_resident();
+        {
+            self.assert_known_ops_resident();
+            self.assert_kept_resident();
+        }
         Ok(installed)
     }
 
@@ -3677,6 +3757,7 @@ impl TileStore {
     fn note_evictions(&mut self) {
         for key in self.evaluated.drain_evicted() {
             self.activity.evaluated_evicted += 1;
+            self.kept.remove(&key);
             self.deps.left_pool(key);
         }
     }
@@ -3771,10 +3852,25 @@ impl TileStore {
         for (key, changed) in cascade.normals {
             self.deps.stale_normals(key, changed);
         }
+        for key in &cascade.positions {
+            // A tile whose parents moved is predicted from other positions now; one edited
+            // alone keeps its prediction, which its corrections don't change.
+            let parents_moved = self.deps.parents(key).is_none_or(|parents| {
+                parents
+                    .iter()
+                    .any(|parent| cascade.positions.contains(parent))
+            });
+            if parents_moved {
+                self.kept.remove(key);
+            }
+        }
         for key in cascade.positions {
             match self.evaluated.invalidate(&key) {
                 Invalidated::Marked => {}
-                Invalidated::Freed | Invalidated::Absent => self.deps.left_pool(key),
+                Invalidated::Freed | Invalidated::Absent => {
+                    self.kept.remove(&key);
+                    self.deps.left_pool(key);
+                }
             }
         }
     }
@@ -4229,8 +4325,8 @@ impl TileStore {
                 pool: &self.evaluated,
                 held: below,
             };
-            return each_parallel(&self.workers, &tasks, scratch, |&(key, id), out| {
-                predict_tile(mesh, pool, tiles, key, id, out)
+            return each_parallel(&self.workers, &tasks, scratch, |&task, out| {
+                predict_tile(mesh, pool, tiles, task, None, out).map(drop)
             });
         }
         let mut parent_keys: Vec<TileKey> = round
@@ -4268,21 +4364,46 @@ impl TileStore {
         let mut written = written.into_iter();
         let scratch_count = scratch.len();
         let mut buffers = scratch.iter_mut();
-        let mut outs: Vec<&mut [Vec3]> = slots
+        let mut outs: Vec<(&mut [Vec3], Option<Prediction>)> = slots
             .iter()
             .map(|own_slot| match own_slot {
                 Some(_) => written.next().map(|slot| slot.positions.as_mut_slice()),
                 None => buffers.next().map(Vec::as_mut_slice),
             })
+            .map(|out| out.map(|out| (out, None)))
             .collect::<Option<_>>()
             .ok_or(Invariant::ShortBuffer {
                 expected: slots.len() - own.len(),
                 got: scratch_count,
             })?;
+        // Only a tile predicted in place reuses or keeps a prediction: a brush step's.
+        let found: Vec<Option<&Prediction>> = round
+            .iter()
+            .zip(slots)
+            .map(|(&(key, _), slot)| slot.and_then(|_| self.kept.get(&key)))
+            .collect();
+        let reuses: Vec<bool> = found.iter().map(Option::is_some).collect();
+        let tasks: Vec<(RoundTask, Option<&Prediction>)> = tasks.into_iter().zip(found).collect();
         let tiles = Tiles::Split(&parents);
-        each_parallel(&self.workers, &tasks, &mut outs, |&(key, id), out| {
-            predict_tile(mesh, pool, tiles, key, id, out)
-        })
+        each_parallel(
+            &self.workers,
+            &tasks,
+            &mut outs,
+            |&(task, kept), (out, made)| {
+                *made = predict_tile(mesh, pool, tiles, task, kept, out)?;
+                Ok(())
+            },
+        )?;
+        let new: Vec<Option<Prediction>> = outs.into_iter().map(|(_, made)| made).collect();
+        for (((&(key, _), slot), reused), made) in round.iter().zip(slots).zip(reuses).zip(new) {
+            if reused {
+                self.kept.used(&key);
+                self.activity.predictions_reused += 1;
+            } else if let (Some(_), Some(prediction)) = (slot, made) {
+                self.kept.insert(key, prediction);
+            }
+        }
+        Ok(())
     }
 
     /// Installs `key`'s positions, predicted straight into its slot `id`: looks the slot up,

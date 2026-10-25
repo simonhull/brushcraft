@@ -198,6 +198,7 @@ pub(crate) fn step_records<'a>(
             .with("tiles_updated", stats.tiles_updated)
             .with("corrections_loaded", activity.corrections_loaded)
             .with("positions_computed", activity.positions_computed)
+            .with("predictions_reused", activity.predictions_reused)
             .with("normals_computed", activity.normals_computed)
             .with("corrections_evicted", activity.corrections_evicted)
             .with("evaluated_evicted", activity.evaluated_evicted);

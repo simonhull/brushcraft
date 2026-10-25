@@ -2487,6 +2487,89 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
     }
 }
 
+/// A stroke's work on a store, as the tests compare it: every slot of `all`, the dirty tiles
+/// with their ops and stamps, and the change feed.
+type Worked = (
+    Vec<(TileKey, String, Vec<u8>, Vec<u8>)>,
+    HashMap<TileKey, Dirty>,
+    Vec<(TileKey, OpId)>,
+);
+
+/// A stroke around a parent's edit, on a store keeping `kept` predictions: what the store
+/// worked out, and its activity.
+///
+/// Brush rounds, then an edit of every vertex of a parent of the first brushed tile (one level
+/// coarser) while the brushed tiles are pinned, brush rounds again, every tile evicted, and
+/// brush rounds once more.
+fn rounds_around_a_parent_edit(
+    dir: &TestDir,
+    mesh: &Arc<BaseMesh>,
+    kept: usize,
+) -> (Worked, Activity) {
+    let (keys, around) = brushed_tiles(mesh);
+    let config = roomy().with_kept_predictions(kept);
+    let mut store = new_store(dir, &format!("kept-{kept}.bcp"), mesh, config);
+    brush_rounds(&mut store, &keys, &around, true);
+    // The brushed tiles stay pinned through their parent's edit, as a stroke's do: their slots
+    // are kept, stale, and predicted again in place.
+    let pins = store.pin(&keys).unwrap();
+    let parent = *store.deps.parents(&keys[0]).unwrap().first().unwrap();
+    store.begin_op().unwrap();
+    store
+        .edit_tile(parent, |edit| {
+            edit.update(|_, _, c| Some(Vec3::new(c.x, c.y + 0.003, c.z - 0.002)))
+        })
+        .unwrap()
+        .unwrap();
+    brush_rounds(&mut store, &keys, &around, true);
+    drop(pins);
+    store.evict_all().unwrap();
+    assert_eq!(
+        store.kept.keys().count(),
+        0,
+        "nothing kept once nothing is resident"
+    );
+    brush_rounds(&mut store, &keys, &around, true);
+    let feed = store.feed.drain(store.save_consumer);
+    let all = tiles(mesh, 1, TOP);
+    (
+        (every_slot(&store, &all), store.unsaved.clone(), feed),
+        store.activity(),
+    )
+}
+
+/// Kept predictions change no bits.
+///
+/// A store keeping them works out the same slots, dirty set and feed as one predicting every
+/// tile in full, through a parent's edit (which must drop the predictions of its children) and
+/// an eviction of every tile.
+#[test]
+fn kept_predictions_change_no_bits() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (full, none) = rounds_around_a_parent_edit(&dir, &mesh, 0);
+    let (kept, some) = rounds_around_a_parent_edit(&dir, &mesh, 64);
+    assert_eq!(none.predictions_reused, 0, "none kept, none reused");
+    assert!(
+        some.predictions_reused > 0,
+        "the brushed tiles reused their predictions: {some:?}"
+    );
+    assert_eq!(
+        (some.positions_computed, some.normals_computed),
+        (none.positions_computed, none.normals_computed),
+        "the same tiles evaluated"
+    );
+    assert_eq!(
+        kept.1, full.1,
+        "the same tiles dirty, with the same ops and stamps"
+    );
+    assert_eq!(kept.2, full.2, "the same feed");
+    for (got, want) in kept.0.iter().zip(&full.0) {
+        assert!(got == want, "{:?}: the same slot", want.0);
+    }
+    assert_eq!(kept.0.len(), full.0.len(), "the same tiles resident");
+}
+
 /// The set-up of the in-place error tests: finest-level edits on a few tiles.
 ///
 /// The edits are applied to a store holding those tiles pinned and their normals' inputs

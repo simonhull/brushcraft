@@ -16,6 +16,9 @@ pub struct Activity {
     pub corrections_loaded: u64,
     /// Tiles whose positions were computed: predicted from the level below and corrected.
     pub positions_computed: u64,
+    /// Of those, the tiles predicted again in place from the prediction the store kept for
+    /// them, only their corrections applied (see "Kept predictions" on [`crate::TileStore`]).
+    pub predictions_reused: u64,
     /// Tiles whose normals were computed, in full or (where they were stale) only for the
     /// vertices that read a changed tile.
     pub normals_computed: u64,
@@ -40,6 +43,9 @@ impl Activity {
             positions_computed: self
                 .positions_computed
                 .saturating_sub(earlier.positions_computed),
+            predictions_reused: self
+                .predictions_reused
+                .saturating_sub(earlier.predictions_reused),
             normals_computed: self
                 .normals_computed
                 .saturating_sub(earlier.normals_computed),
@@ -63,6 +69,7 @@ mod tests {
         let earlier = Activity {
             corrections_loaded: 1,
             positions_computed: 2,
+            predictions_reused: 6,
             normals_computed: 3,
             corrections_evicted: 4,
             evaluated_evicted: 5,
@@ -70,6 +77,7 @@ mod tests {
         let later = Activity {
             corrections_loaded: 11,
             positions_computed: 22,
+            predictions_reused: 66,
             normals_computed: 33,
             corrections_evicted: 44,
             evaluated_evicted: 55,
@@ -79,6 +87,7 @@ mod tests {
             Activity {
                 corrections_loaded: 10,
                 positions_computed: 20,
+                predictions_reused: 60,
                 normals_computed: 30,
                 corrections_evicted: 40,
                 evaluated_evicted: 50,

@@ -16,6 +16,7 @@ mod file;
 #[cfg(test)]
 mod fixture;
 mod index;
+mod kept;
 mod meta;
 mod op;
 mod pool;
