@@ -14,7 +14,7 @@ use crate::fixture::meta_for;
 use crate::slot::EvaluatedSlot;
 use crate::test_dir::TestDir;
 use crate::tiles::StoreConfig;
-use crate::tiles::tests::{fixed, with_kept_share};
+use crate::tiles::tests::{fixed, with_reserved_shares};
 
 mod stored;
 
@@ -47,7 +47,7 @@ const LEVEL: u8 = 4;
 fn store_over(dir: &TestDir, mesh: &Arc<BaseMesh>) -> TileStore {
     let file = ProjectFile::create(&dir.path("index"), meta_for(mesh), Arc::clone(mesh)).unwrap();
     let chunk_bytes = 8 * size_of::<EvaluatedSlot>();
-    let config = with_kept_share(
+    let config = with_reserved_shares(
         StoreConfig::new(64 * chunk_bytes, 3)
             .with_chunk_bytes(chunk_bytes)
             .with_workers(fixed(2)),

@@ -112,25 +112,31 @@ pub(crate) fn fixed(n: usize) -> Workers {
 
 /// A configuration with pools of `chunks` chunks of `chunk_slots` evaluated slots.
 ///
-/// The default kept predictions come besides (their share of the budget, see
-/// [`StoreConfig::kept_prediction_bytes`]), with [`TEST_THREADS`] workers.
+/// The default kept predictions and stroke state come besides (their shares of the budget, see
+/// [`StoreConfig::kept_prediction_bytes`] and [`StoreConfig::stroke_state_bytes`]), with
+/// [`TEST_THREADS`] workers.
 fn config(chunks: usize, chunk_slots: usize) -> StoreConfig {
-    with_kept_share(
+    with_reserved_shares(
         StoreConfig::new(chunks * chunk_slots * EVAL, SITE)
             .with_chunk_bytes(chunk_slots * EVAL)
             .with_workers(TEST_THREADS),
     )
 }
 
-/// The bytes `config`'s pools may hold: its budget less the kept predictions' share.
-pub(crate) fn pools(config: &StoreConfig) -> usize {
-    config.budget_bytes - config.kept_prediction_bytes().unwrap()
+/// The bytes of `config`'s reserved shares: the kept predictions' and the stroke state's.
+fn reserved(config: &StoreConfig) -> usize {
+    config.kept_prediction_bytes().unwrap() + config.stroke_state_bytes().unwrap()
 }
 
-/// `config` with its kept predictions' share added to its budget: pools of the budget it had.
-pub(crate) fn with_kept_share(config: StoreConfig) -> StoreConfig {
-    let kept = config.kept_prediction_bytes().unwrap();
-    config.with_budget_bytes(config.budget_bytes + kept)
+/// The bytes `config`'s pools may hold: its budget less the reserved shares.
+pub(crate) fn pools(config: &StoreConfig) -> usize {
+    config.budget_bytes - reserved(config)
+}
+
+/// `config` with its reserved shares (the kept predictions' and the stroke state's) added to
+/// its budget: pools of the budget it had.
+pub(crate) fn with_reserved_shares(config: StoreConfig) -> StoreConfig {
+    config.with_budget_bytes(config.budget_bytes + reserved(&config))
 }
 
 /// Room for every tile of levels 1–8 of the cube, twice over.
@@ -1646,32 +1652,45 @@ fn a_budget_below_the_minimum_is_refused() {
         TileStore::open(file, config)
     };
     let kept = tight().kept_prediction_bytes().unwrap();
-    let pools = minimum - kept;
+    let stroke = tight().stroke_state_bytes().unwrap();
+    let pools = minimum - kept - stroke;
     let refused = open("small.bcp", tight().with_budget_bytes(pools - 1));
     assert!(
         matches!(refused, Err(CacheError::BudgetTooSmall { minimum: m }) if m == minimum),
         "below the pools' minimum: {refused:?}"
     );
-    let none_kept = tight().with_kept_predictions(0);
+    let none_reserved = tight().with_kept_predictions(0).with_stroke_tiles(0);
     assert_eq!(
-        none_kept.minimum_budget(&mesh),
+        none_reserved.minimum_budget(&mesh),
         pools,
-        "nothing kept, nothing set aside"
+        "nothing kept and no stroke state, nothing set aside"
     );
     assert!(
-        open("none.bcp", none_kept.with_budget_bytes(pools)).is_ok(),
-        "the pools' minimum is enough with nothing kept"
+        open("none.bcp", none_reserved.with_budget_bytes(pools)).is_ok(),
+        "the pools' minimum is enough with nothing reserved"
     );
-    let short = open("kept.bcp", tight().with_budget_bytes(minimum - 1));
+    let short_kept = open("kept.bcp", tight().with_budget_bytes(pools + kept - 1));
     assert!(
         matches!(
-            short,
+            short_kept,
             Err(CacheError::TooManyKeptPredictions {
                 asked: 64,
                 most: 63
             })
         ),
-        "a byte short of the kept predictions' share: {short:?}"
+        "a byte short of the kept predictions' share: {short_kept:?}"
+    );
+    let short = open("stroke.bcp", tight().with_budget_bytes(minimum - 1));
+    assert!(
+        matches!(
+            short,
+            Err(CacheError::TooManyStrokeTiles {
+                asked: StoreConfig::DEFAULT_STROKE_TILES,
+                most
+            }) if most == StoreConfig::DEFAULT_STROKE_TILES - 1
+        ),
+        "a byte short of the stroke state's share, the kept predictions' set aside first: \
+         {short:?}"
     );
     assert!(
         open("exact.bcp", tight().with_budget_bytes(minimum)).is_ok(),
@@ -1712,6 +1731,83 @@ fn kept_predictions_beyond_the_budget_are_refused() {
             "{asked}: a share past usize is a minimum no budget meets"
         );
     }
+}
+
+/// A stroke-state count whose share doesn't fit beside the pools' minimum and the kept
+/// predictions is refused with what the budget can set aside, not allocated for.
+#[test]
+fn a_stroke_share_that_does_not_fit_is_refused() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    for (n, asked) in [
+        usize::MAX,
+        usize::MAX / StoreConfig::STROKE_TILE_BYTES + 1,
+        1 << 20,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let config = roomy().with_stroke_tiles(asked);
+        let spare = config.budget_bytes
+            - Headroom::of(&mesh).minimum_budget(config.chunk_bytes)
+            - config.kept_prediction_bytes().unwrap();
+        let file = ProjectFile::create(
+            &dir.path(&format!("{n}.bcp")),
+            meta_for(&mesh),
+            Arc::clone(&mesh),
+        )
+        .unwrap();
+        let refused = TileStore::open(file, config);
+        assert!(
+            matches!(
+                refused,
+                Err(CacheError::TooManyStrokeTiles { asked: a, most })
+                    if a == asked && most == spare / StoreConfig::STROKE_TILE_BYTES
+            ),
+            "{asked}: {refused:?}"
+        );
+        assert_eq!(
+            config.minimum_budget(&mesh) == usize::MAX,
+            config.stroke_state_bytes().is_none(),
+            "{asked}: a share past usize is a minimum no budget meets"
+        );
+    }
+    assert_eq!(
+        StoreConfig::STROKE_TILE_BYTES,
+        33_800,
+        "two f32 a vertex of the largest tile"
+    );
+}
+
+/// The stroke state's share comes out of the pools: a store with it holds exactly its bytes
+/// less than one without it, and the store reports the count set aside.
+#[test]
+fn the_stroke_share_comes_out_of_the_pools() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let with = roomy();
+    let without = with.with_stroke_tiles(0);
+    let share = with.stroke_state_bytes().unwrap();
+    assert_eq!(
+        share,
+        StoreConfig::DEFAULT_STROKE_TILES * StoreConfig::STROKE_TILE_BYTES,
+        "the default share"
+    );
+    assert_eq!(without.stroke_state_bytes(), Some(0), "none set aside");
+    let stroked = new_store(&dir, "with.bcp", &mesh, with);
+    let plain = new_store(&dir, "without.bcp", &mesh, without);
+    assert_eq!(
+        plain.budget.limit() - stroked.budget.limit(),
+        share,
+        "the pools hold the share less"
+    );
+    assert_eq!(stroked.budget.limit(), pools(&with), "the pools' share");
+    assert_eq!(
+        stroked.stroke_tiles(),
+        StoreConfig::DEFAULT_STROKE_TILES,
+        "the count set aside"
+    );
+    assert_eq!(plain.stroke_tiles(), 0, "none");
 }
 
 #[test]
@@ -3884,11 +3980,13 @@ fn the_kept_share_costs_only_its_bytes() {
     let dir = TestDir::new();
     let mesh = mesh();
     let chunk = 16 * EVAL;
-    // Three kept predictions (617,904 bytes) leave room for 9 of a chunk's 16 evaluated slots.
+    // Three kept predictions (617,904 bytes), and no stroke state, leave room for 9 of a
+    // chunk's 16 evaluated slots.
     let config = StoreConfig::new(12 * chunk, SITE)
         .with_chunk_bytes(chunk)
         .with_workers(TEST_THREADS)
-        .with_kept_predictions(3);
+        .with_kept_predictions(3)
+        .with_stroke_tiles(0);
     let room = 12 * chunk - config.kept_prediction_bytes().unwrap() - 11 * chunk;
     assert_eq!(room / EVAL, 9, "the set-up: room for nine slots");
     let mut store = new_store(&dir, "work.bcp", &mesh, config);

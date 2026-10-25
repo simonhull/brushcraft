@@ -156,17 +156,19 @@ use crate::workers::{StartWorkersError, Workers};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StoreConfig {
-    /// Bytes the two pools and the kept predictions may hold together, never exceeded (the kept
-    /// predictions are charged their positions' and frames' allocations; their map entries and
-    /// the allocator's rounding, a few KB at the default count, sit outside it). At least
+    /// Bytes the two pools, the kept predictions and a brush stroke's state may hold together,
+    /// never exceeded (the kept predictions are charged their positions' and frames'
+    /// allocations, the stroke state its per-vertex buffers; their map entries and the
+    /// allocator's rounding, a few KB at the default counts, sit outside it). At least
     /// [`StoreConfig::minimum_budget`] for the store's mesh.
     ///
     /// The kept predictions' share is set aside first, at its worst case
-    /// ([`StoreConfig::kept_prediction_bytes`]), and the pools share the rest, the evaluated
-    /// pool filling the room below a whole chunk with a short one, so the share costs only its
-    /// own bytes. How the pools share it is the store's memory policy (see [`TileStore`]):
+    /// ([`StoreConfig::kept_prediction_bytes`]), then the stroke state's
+    /// ([`StoreConfig::stroke_state_bytes`]), and the pools share the rest, the evaluated pool
+    /// filling the room below a whole chunk with a short one, so the shares cost only their own
+    /// bytes. How the pools share it is the store's memory policy (see [`TileStore`]):
     /// corrections take evaluated chunks only up to a quarter of the pools' share (the budget less
-    /// the kept predictions'), and never below the evaluated pool's floor.
+    /// the reserved shares), and never below the evaluated pool's floor.
     ///
     /// The evaluation scratch (about 3 MB), the read buffers, the workers' own allocations (a
     /// few hundred KB each at most) and the thread stacks (2 MiB reserved per worker) sit
@@ -190,6 +192,15 @@ pub struct StoreConfig {
     /// predicted in full. Results are the same bits either way. [`TileStore::open`] refuses a
     /// count whose share leaves the pools less than their minimum.
     pub kept_predictions: usize,
+    /// How many tiles' stroke state the budget sets aside: the `f32` start and summed deltas a
+    /// brush stroke keeps per vertex of the tiles it is editing, so that deltas smaller than a
+    /// quantization step aren't rounded away dab by dab (the brush crate holds the state; the
+    /// store only reserves for it and reports the count, [`TileStore::stroke_tiles`]).
+    /// [`StoreConfig::DEFAULT_STROKE_TILES`] unless set. Each is charged to the budget at the
+    /// largest tile's size, [`StoreConfig::STROKE_TILE_BYTES`]; zero keeps none, and a stroke
+    /// writes every tile dab by dab. [`TileStore::open`] refuses a count whose share leaves the
+    /// pools less than their minimum beside the kept predictions.
+    pub stroke_tiles: usize,
 }
 
 impl StoreConfig {
@@ -200,6 +211,14 @@ impl StoreConfig {
     /// re-predicts the 20 to 30 tiles its sphere reaches, and a stroke moves on by a tenth of a
     /// radius a step, so a stroke's tiles are reused for several steps before it leaves them.
     pub const DEFAULT_KEPT_PREDICTIONS: usize = 64;
+    /// The default [`StoreConfig::stroke_tiles`]: 512, about 17.3 MB of the budget. A dab edits
+    /// the 20 to 30 tiles its sphere reaches, so a stroke keeps the state of every tile its last
+    /// several dabs edited with room to spare.
+    pub const DEFAULT_STROKE_TILES: usize = 512;
+    /// The bytes of the budget one tile's stroke state is charged:
+    /// two `f32` (the start and the summed deltas) per vertex of the largest tile,
+    /// `(TILE_QUADS + 1)²` of them, so 33,800 bytes.
+    pub const STROKE_TILE_BYTES: usize = SIDE * SIDE * 2 * size_of::<f32>();
 
     /// A store of `budget_bytes` whose op ids carry `site`, with
     /// [`StoreConfig::DEFAULT_CHUNK_BYTES`] chunks and one evaluation worker per physical core
@@ -212,6 +231,7 @@ impl StoreConfig {
             site,
             workers: Workers::PhysicalCores,
             kept_predictions: Self::DEFAULT_KEPT_PREDICTIONS,
+            stroke_tiles: Self::DEFAULT_STROKE_TILES,
         }
     }
 
@@ -264,10 +284,29 @@ impl StoreConfig {
         self.kept_predictions.checked_mul(Prediction::TILE_BYTES)
     }
 
+    /// This configuration setting aside stroke state for up to `stroke_tiles` tiles (see
+    /// [`StoreConfig::stroke_tiles`]).
+    #[must_use]
+    pub const fn with_stroke_tiles(self, stroke_tiles: usize) -> Self {
+        Self {
+            stroke_tiles,
+            ..self
+        }
+    }
+
+    /// The bytes of the budget set aside for stroke state: [`StoreConfig::stroke_tiles`] at
+    /// [`StoreConfig::STROKE_TILE_BYTES`] each. `None` if that is more than a `usize` counts
+    /// (no budget holds it).
+    #[must_use]
+    pub const fn stroke_state_bytes(&self) -> Option<usize> {
+        self.stroke_tiles.checked_mul(Self::STROKE_TILE_BYTES)
+    }
+
     /// The least [`StoreConfig::budget_bytes`] a store over `mesh` with these chunks works
     /// with: enough that no evaluation, normals computation or edit runs out of room while
     /// nothing else is pinned, besides the kept predictions' share
-    /// ([`StoreConfig::kept_prediction_bytes`]; `usize::MAX` if that overflows).
+    /// ([`StoreConfig::kept_prediction_bytes`]) and the stroke state's
+    /// ([`StoreConfig::stroke_state_bytes`]; `usize::MAX` if either overflows).
     ///
     /// The pools' part is the larger of
     ///
@@ -287,6 +326,7 @@ impl StoreConfig {
         Headroom::of(mesh)
             .minimum_budget(self.chunk_bytes)
             .saturating_add(self.kept_prediction_bytes().unwrap_or(usize::MAX))
+            .saturating_add(self.stroke_state_bytes().unwrap_or(usize::MAX))
     }
 
     /// The worker threads this configuration asks for on this machine (see
@@ -368,28 +408,42 @@ impl Headroom {
     }
 }
 
-/// The budget's share for the kept predictions ([`StoreConfig::kept_prediction_bytes`]), once
-/// `config`'s budget is checked to hold it beside the pools' minimum for `headroom`.
+/// The bytes of the budget's reserved shares, once checked to fit beside the pools' minimum.
+///
+/// The shares are the kept predictions' ([`StoreConfig::kept_prediction_bytes`]) and the
+/// stroke state's ([`StoreConfig::stroke_state_bytes`]); `config`'s budget is checked to hold
+/// them beside the pools' minimum for `headroom`, the kept predictions first.
 ///
 /// # Errors
 ///
 /// [`CacheError::BudgetTooSmall`] if the budget is below the pools' minimum alone;
-/// [`CacheError::TooManyKeptPredictions`] if it holds that but not the kept predictions besides.
-fn kept_share(headroom: Headroom, config: &StoreConfig) -> Result<usize, CacheError> {
+/// [`CacheError::TooManyKeptPredictions`] if it holds that but not the kept predictions besides;
+/// [`CacheError::TooManyStrokeTiles`] if it holds both but not the stroke state besides.
+fn reserved_shares(headroom: Headroom, config: &StoreConfig) -> Result<usize, CacheError> {
     let pools = headroom.minimum_budget(config.chunk_bytes);
     let Some(spare) = config.budget_bytes.checked_sub(pools) else {
         let kept = config.kept_prediction_bytes().unwrap_or(usize::MAX);
+        let stroke = config.stroke_state_bytes().unwrap_or(usize::MAX);
         return Err(CacheError::BudgetTooSmall {
-            minimum: pools.saturating_add(kept),
+            minimum: pools.saturating_add(kept).saturating_add(stroke),
         });
     };
-    config
+    let kept = config
         .kept_prediction_bytes()
         .filter(|&kept| kept <= spare)
         .ok_or(CacheError::TooManyKeptPredictions {
             asked: config.kept_predictions,
             most: spare / Prediction::TILE_BYTES,
-        })
+        })?;
+    let spare = spare - kept;
+    let stroke = config
+        .stroke_state_bytes()
+        .filter(|&stroke| stroke <= spare)
+        .ok_or(CacheError::TooManyStrokeTiles {
+            asked: config.stroke_tiles,
+            most: spare / StoreConfig::STROKE_TILE_BYTES,
+        })?;
+    Ok(kept + stroke)
 }
 
 /// Why a [`TileStore`] operation failed.
@@ -451,11 +505,13 @@ pub enum CacheError {
     #[error("the store was edited after the save it was to be rebased on")]
     StaleSave,
     /// The configured budget is below [`StoreConfig::minimum_budget`] for the mesh, without
-    /// counting the kept predictions (see [`CacheError::TooManyKeptPredictions`]).
+    /// counting the reserved shares (see [`CacheError::TooManyKeptPredictions`] and
+    /// [`CacheError::TooManyStrokeTiles`]).
     #[error("the budget is below the {minimum} bytes this mesh needs")]
     BudgetTooSmall {
         /// The least budget the mesh works with, at the configured
-        /// [`StoreConfig::kept_predictions`] ([`StoreConfig::minimum_budget`]).
+        /// [`StoreConfig::kept_predictions`] and [`StoreConfig::stroke_tiles`]
+        /// ([`StoreConfig::minimum_budget`]).
         minimum: usize,
     },
     /// The budget holds the pools' minimum, but not beside the share the configured
@@ -465,6 +521,17 @@ pub enum CacheError {
         /// The kept predictions asked for.
         asked: usize,
         /// The most this budget can keep beside the pools' minimum.
+        most: usize,
+    },
+    /// The budget holds the pools' minimum and the kept predictions' share, but not beside the
+    /// share the configured [`StoreConfig::stroke_tiles`] need
+    /// ([`StoreConfig::stroke_state_bytes`]).
+    #[error("stroke state for {asked} tiles takes more of the budget than the {most} it can spare")]
+    TooManyStrokeTiles {
+        /// The tiles' stroke state asked for.
+        asked: usize,
+        /// The most tiles' stroke state this budget can set aside beside the pools' minimum
+        /// and the kept predictions.
         most: usize,
     },
     /// Every op id of this site has been handed out.
@@ -775,15 +842,16 @@ struct EvalLog {
 ///
 /// # Memory policy
 ///
-/// The pools share [`StoreConfig::budget_bytes`] and grow by whole chunks of
-/// [`StoreConfig::chunk_bytes`] while the budget allows another; once it is spent, memory moves
+/// The pools share [`StoreConfig::budget_bytes`], less the reserved shares (the kept predictions',
+/// below, and a brush stroke's state, see [`StoreConfig::stroke_tiles`]), and grow by whole chunks
+/// of [`StoreConfig::chunk_bytes`] while the budget allows another; once it is spent, memory moves
 /// between them only a chunk at a time. A correction tile that needs a slot (to be read, edited,
 /// or evaluated from) takes the first of:
 ///
 /// 1. a free correction slot, or a new chunk if the budget allows one;
 /// 2. the slot of a clean correction tile, the clock's pick: it is read again if it is wanted;
 /// 3. an evaluated chunk taken back, while the correction pool holds less than a quarter of the
-///    pools' share (the budget less the kept predictions') and the evaluated pool keeps its floor
+///    pools' share (the budget less the reserved shares) and the evaluated pool keeps its floor
 ///    without that chunk (the chunks one evaluation pins, see [`StoreConfig::minimum_budget`], plus
 ///    one for the cache). Of the evaluated chunks without a pin, the one with the fewest tiles in
 ///    use goes (current, or referenced since the clock last passed); its tiles are recomputed when
@@ -834,10 +902,21 @@ struct EvalLog {
 /// chunk, of as many slots as fit, in the room that leaves below a whole chunk, so the share
 /// costs the pools its own bytes and no more.
 ///
+/// # Stroke state
+///
+/// A brush stroke keeps, for each vertex of the tiles it is editing, the correction it first
+/// found and the sum of its deltas, in `f32`, and writes their sum, so a dab's delta smaller
+/// than a quantization step isn't rounded away. That state is the brush's, not the store's,
+/// but it is charged to the budget the same way: [`StoreConfig::stroke_tiles`] tiles' worth at
+/// the largest tile's size ([`StoreConfig::stroke_state_bytes`]) is set aside after the kept
+/// predictions' share and before the pools share the rest. The store reports the count
+/// ([`TileStore::stroke_tiles`]); one stroke at a time allocates it.
+///
 /// # Memory outside the budget
 ///
-/// [`StoreConfig::budget_bytes`] bounds the two pools and the kept predictions, which hold
-/// nearly all of a store's memory. Besides them, and not charged to the budget:
+/// [`StoreConfig::budget_bytes`] bounds the two pools, the kept predictions and the stroke
+/// state, which hold nearly all of a store's memory. Besides them, and not charged to the
+/// budget:
 ///
 /// - the evaluation scratch: one buffer of the largest tile's positions (about 50 KB) per tile of a
 ///   round not predicted in place, so about 3.2 MB at most (64 of them, once a round of new tiles
@@ -871,7 +950,8 @@ pub struct TileStore {
     /// The project file as of its last save, read where the working file has no record; `None`
     /// for a project never saved.
     base: Option<BaseFile>,
-    /// The bytes both pools may hold: the configured budget less the kept predictions' share.
+    /// The bytes both pools may hold: the configured budget less the reserved shares (the kept
+    /// predictions' and the stroke state's).
     budget: Budget,
     /// What the store pins for its own work, besides [`TileStore::pin`]'s tiles.
     headroom: Headroom,
@@ -952,6 +1032,10 @@ pub struct TileStore {
     /// [`TileStore`]): only of tiles resident in the evaluated pool, and only while their
     /// parents' positions stay as they were.
     kept: Kept<Prediction>,
+    /// How many tiles' stroke state the budget set aside ([`StoreConfig::stroke_tiles`]): the
+    /// most a brush stroke over this store may keep, which it reads through
+    /// [`TileStore::stroke_tiles`]. The store holds none of that state itself.
+    stroke_tiles: usize,
     /// The pinned tiles an edit of their own corrections alone marked stale, their parents'
     /// positions unchanged: the tiles whose next prediction, made in place, is worth keeping
     /// (see "Kept predictions" on [`TileStore`]). A mark goes when the tile is next predicted,
@@ -1568,8 +1652,9 @@ impl TileStore {
     ///
     /// [`CacheError::ReservedSite`]; [`CacheError::WrongBase`] if `working` is a recovery file
     /// that names a save point (it needs that save point under it);
-    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`] without the kept
-    /// predictions, [`CacheError::TooManyKeptPredictions`] below it with them;
+    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`] without the reserved
+    /// shares, [`CacheError::TooManyKeptPredictions`] below it with the kept predictions',
+    /// [`CacheError::TooManyStrokeTiles`] below it with the stroke state's besides;
     /// [`CacheError::OpsExhausted`] if the file's head is the site's last op id;
     /// [`CacheError::Store`] if the read buffers can't be made; [`CacheError::Workers`] if the
     /// evaluation workers can't be started.
@@ -1595,8 +1680,9 @@ impl TileStore {
     ///
     /// [`CacheError::ReservedSite`]; [`CacheError::MeshMismatch`] if the base's mesh hash isn't
     /// the working file's; [`CacheError::WrongBase`] if the files don't belong together;
-    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`] without the kept
-    /// predictions, [`CacheError::TooManyKeptPredictions`] below it with them;
+    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`] without the reserved
+    /// shares, [`CacheError::TooManyKeptPredictions`] below it with the kept predictions',
+    /// [`CacheError::TooManyStrokeTiles`] below it with the stroke state's besides;
     /// [`CacheError::OpsExhausted`] if a file's head is the site's last op id;
     /// [`CacheError::Store`] if the read buffers can't be made; [`CacheError::Workers`] if the
     /// evaluation workers can't be started.
@@ -1618,7 +1704,7 @@ impl TileStore {
         check_layers(working.meta(), base.as_ref())?;
         let mesh = working.mesh();
         let headroom = Headroom::of(&mesh);
-        let kept_bytes = kept_share(headroom, &config)?;
+        let reserved_bytes = reserved_shares(headroom, &config)?;
         let next_op = first_op(
             config.site,
             [working.head(), base.as_ref().and_then(BaseFile::head)],
@@ -1642,11 +1728,11 @@ impl TileStore {
             mesh_hash,
             file: working,
             base,
-            budget: Budget::new(config.budget_bytes - kept_bytes),
+            budget: Budget::new(config.budget_bytes - reserved_bytes),
             headroom,
             corrections: Pool::with_eviction_log(config.chunk_bytes),
-            // Short chunks let the evaluated pool use the room the kept predictions' share
-            // leaves below a whole chunk (see "Kept predictions" on `TileStore`).
+            // Short chunks let the evaluated pool use the room the reserved shares
+            // leave below a whole chunk (see "Kept predictions" on `TileStore`).
             evaluated: Pool::with_eviction_log(config.chunk_bytes).with_short_chunks(),
             deps: DepGraph::new(),
             unsaved: HashMap::new(),
@@ -1669,6 +1755,7 @@ impl TileStore {
             read_scratch: ReadScratch::new()?,
             worker_read_scratch: Vec::new(),
             kept: Kept::new(config.kept_predictions),
+            stroke_tiles: config.stroke_tiles,
             own_edits: BTreeSet::new(),
             activity: Activity::default(),
             #[cfg(test)]
@@ -2261,6 +2348,15 @@ impl TileStore {
     #[must_use]
     pub const fn current_op(&self) -> Option<OpId> {
         self.op
+    }
+
+    /// How many tiles' stroke state the budget set aside for a brush stroke
+    /// ([`StoreConfig::stroke_tiles`]): the most tiles one stroke over this store may keep a
+    /// start and summed deltas for. Its bytes are already out of the pools' share, so a stroke
+    /// that allocates this much, and no more, stays within the budget.
+    #[must_use]
+    pub const fn stroke_tiles(&self) -> usize {
+        self.stroke_tiles
     }
 
     /// The op for an edit: the current one, or a new one if none is current.
@@ -3826,7 +3922,7 @@ impl TileStore {
 
     /// Whether a correction acquire that found no free or clean slot may take an evaluated
     /// chunk back rather than write a dirty tile back: while the correction pool holds less
-    /// than a quarter of the pools' share (the budget less the kept predictions'), and the
+    /// than a quarter of the pools' share (the budget less the reserved shares), and the
     /// evaluated pool keeps its floor (its share of the minimum budget plus one chunk) without
     /// the chunk, and has a chunk without pins to give.
     fn may_take_evaluated_chunk(&self) -> bool {
