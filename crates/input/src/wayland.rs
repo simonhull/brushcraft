@@ -32,11 +32,34 @@ use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_seat_v2::{self, ZwpTa
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_tool_v2::ZwpTabletToolV2;
 use wayland_protocols::wp::tablet::zv2::client::zwp_tablet_v2::{self, ZwpTabletV2};
 
-use crate::queue::{self, Events, Sender};
-use crate::{Event, SurfaceId};
+use crate::queue::{self, Droppable, Events, Sender};
+use crate::{Event, PadEventKind, Phase, SurfaceId};
 
 /// Events buffered before the backend starts dropping: about 6 s of pen samples.
+///
+/// The last [`queue::RESERVE`] of them are kept for phase changes and pad state changes, so a
+/// consumer that falls behind loses motion, not a stroke's start or end.
 const QUEUE_CAPACITY: usize = 1024;
+
+impl Droppable for Event {
+    /// Motion is droppable: a pen `Hover` or `Drag` sample, a ring or strip moving, a dial
+    /// turning. A pen phase change, a pad button, or a finger lifting off a ring or strip is a
+    /// state change and is not.
+    fn droppable(&self) -> bool {
+        match self {
+            Self::Sample(sample) => match sample.phase {
+                Phase::Hover | Phase::Drag => true,
+                Phase::Enter | Phase::Down | Phase::Up | Phase::Leave => false,
+            },
+            Self::Pad(pad) => match pad.kind {
+                PadEventKind::Ring { angle, .. } => angle.is_some(),
+                PadEventKind::Strip { position, .. } => position.is_some(),
+                PadEventKind::Dial { .. } => true,
+                PadEventKind::Button { .. } => false,
+            },
+        }
+    }
+}
 
 /// Why the backend couldn't start or stopped.
 #[derive(Debug, thiserror::Error)]
