@@ -353,6 +353,50 @@ impl WorkRoot {
     pub(crate) fn path(&self) -> &Path {
         &self.0
     }
+
+    /// Makes the root if missing, as this user's alone (`0700`; its parent must exist), and
+    /// checks it is safe to work in: a directory, not a symlink, owned by this user, and
+    /// writable by no one else.
+    ///
+    /// In a shared directory such as `/tmp`, another user can make the root first, under the
+    /// name this user's runs use; working in it would let them swap or read what the run
+    /// writes there. A directory that fails the check is refused, never repaired.
+    ///
+    /// # Errors
+    ///
+    /// If it can't be made or inspected, or fails the check.
+    pub(crate) fn ensure(&self) -> Result<()> {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+        let root = self.path();
+        match std::fs::DirBuilder::new().mode(0o700).create(root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("creating {}", root.display())),
+        }
+        let meta = std::fs::symlink_metadata(root)
+            .with_context(|| format!("inspecting {}", root.display()))?;
+        if !meta.file_type().is_dir() {
+            anyhow::bail!(
+                "the work root {} is not a directory (or is a symlink)",
+                root.display()
+            );
+        }
+        if meta.uid() != rustix::process::getuid().as_raw() {
+            anyhow::bail!(
+                "the work root {} belongs to another user ({})",
+                root.display(),
+                meta.uid()
+            );
+        }
+        if meta.mode() & 0o022 != 0 {
+            anyhow::bail!(
+                "the work root {} is writable by others (mode {:o})",
+                root.display(),
+                meta.mode() & 0o7777
+            );
+        }
+        Ok(())
+    }
 }
 
 /// What a clear-up of what other runs left ([`WorkDir::sweep`], [`remove_stale`]) did.
@@ -380,7 +424,8 @@ pub(crate) struct WorkDir {
 }
 
 impl WorkDir {
-    /// A fresh, locked directory in `root`, made if missing.
+    /// A fresh, locked directory in `root`, which is made if missing and checked
+    /// ([`WorkRoot::ensure`]).
     ///
     /// The directory is made under a `new-` name, locked, then renamed to its `work-` name, so a
     /// sweep never sees it unlocked. A process killed between the first two steps leaves an
@@ -389,12 +434,13 @@ impl WorkDir {
     ///
     /// # Errors
     ///
-    /// If it can't be made, locked or renamed.
+    /// If the root fails [`WorkRoot::ensure`], or the directory can't be made, locked or
+    /// renamed.
     pub(crate) fn new(root: &WorkRoot) -> Result<Self> {
         /// Tells apart the directories one process makes.
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        root.ensure()?;
         let root = root.path();
-        std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
         let name = format!(
             "{}-{}",
             std::process::id(),
@@ -437,8 +483,11 @@ impl WorkDir {
     ///
     /// # Errors
     ///
-    /// If `root` exists but can't be listed.
+    /// If `root` exists but fails [`WorkRoot::ensure`] or can't be listed.
     pub(crate) fn sweep(root: &WorkRoot) -> Result<Sweep> {
+        if std::fs::symlink_metadata(root.path()).is_ok() {
+            root.ensure()?;
+        }
         let root = root.path();
         let mut sweep = Sweep::default();
         let entries = match std::fs::read_dir(root) {
@@ -693,6 +742,44 @@ mod tests {
             "skipped, with the reason"
         );
         assert!(WorkDir::new(&root).is_ok(), "the run goes on");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A work root someone else could write is refused, by a new work directory and a sweep
+    /// alike, and left as it is; one the run makes itself is this user's alone.
+    #[test]
+    fn a_work_root_someone_else_could_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch("open-root");
+        let root = WorkRoot::under(&base);
+        std::fs::create_dir_all(root.path()).unwrap();
+        // Set explicitly: the umask masks what a directory is made with.
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = WorkDir::new(&root).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains(&root.path().display().to_string()),
+            "names the root: {refused:#}"
+        );
+        assert!(WorkDir::sweep(&root).is_err(), "a sweep refuses it too");
+        let mode = std::fs::metadata(root.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o777, "left as it was");
+
+        let fresh = WorkRoot::under(&base.join("fresh"));
+        std::fs::create_dir_all(base.join("fresh")).unwrap();
+        let work = WorkDir::new(&fresh).unwrap();
+        let fresh_mode = std::fs::metadata(fresh.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(fresh_mode & 0o777, 0o700, "made the user's alone");
+        drop(work);
+
+        let link = WorkRoot::under(&base.join("linked"));
+        std::fs::create_dir_all(base.join("linked")).unwrap();
+        std::os::unix::fs::symlink(fresh.path(), link.path()).unwrap();
+        assert!(WorkDir::new(&link).is_err(), "a symlink is refused");
         std::fs::remove_dir_all(&base).unwrap();
     }
 
