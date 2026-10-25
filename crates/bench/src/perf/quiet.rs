@@ -754,7 +754,13 @@ mod tests {
             log.max_since(start + Duration::from_secs(3600)).is_none(),
             "nothing from the future"
         );
-        std::thread::sleep(Duration::from_millis(2500));
+        // The second sample is due after `EVERY`, but a loaded machine can delay the thread
+        // well past it: wait for it, with a deadline generous enough that only a log that
+        // never samples again misses it.
+        let deadline = Instant::now() + LoadLog::EVERY * 30;
+        while log.since(start).len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let later = log.latest().unwrap();
         assert!(later.at > first.at, "sampled again: {later:?}");
         assert!(log.since(start).len() >= 2, "two samples or more");
