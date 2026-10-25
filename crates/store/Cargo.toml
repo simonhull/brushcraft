@@ -9,6 +9,11 @@ description = "Project file, out-of-core tile paging, tile pool, cache budget an
 [lints]
 workspace = true
 
+[features]
+# What the whole-file fuzz target needs from inside the crate (`store::fuzzing`), turned on by
+# the fuzz crate only, so release builds never compile it.
+fuzzing = []
+
 [dependencies]
 bytemuck.workspace = true
 geom.workspace = true

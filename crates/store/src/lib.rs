@@ -15,7 +15,7 @@ mod feed;
 mod file;
 #[cfg(test)]
 mod fixture;
-#[cfg(any(fuzzing, test))]
+#[cfg(any(feature = "fuzzing", test))]
 #[doc(hidden)]
 pub mod fuzzing;
 mod index;

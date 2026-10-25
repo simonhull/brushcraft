@@ -19,7 +19,7 @@ members = ["."]
 [dependencies]
 geom = { path = "../crates/geom" }
 libfuzzer-sys = "0.4.13"
-store = { path = "../crates/store" }
+store = { path = "../crates/store", features = ["fuzzing"] }
 
 # The main workspace's lints that apply to a binary crate of this size.
 [lints.rust]

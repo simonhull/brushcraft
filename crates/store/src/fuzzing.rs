@@ -1,8 +1,8 @@
 //! What the whole-file fuzz target (`fuzz/fuzz_targets/project_open.rs`) needs from inside the
-//! crate. Built only under cargo-fuzz's `cfg(fuzzing)` (and for its own tests), so no other
-//! build has it.
+//! crate. Built only with the `fuzzing` feature, which the fuzz crate turns on (and for its own
+//! tests), so no other build has it.
 //!
-//! Every record is checksummed, so a fuzzer's change to a file fails [`crate::record::verify`] at
+//! Every record is checksummed, so a fuzzer's change to a file fails its checksum at
 //! the first record it touches and nothing behind the checksum is ever reached. The target lets
 //! the fuzzer change any byte, then recomputes each record's checksum before opening the file:
 //! the framing is the store's own, so this is the one thing it can't do from outside.
