@@ -1,0 +1,5 @@
+# cargo-mutants: test strength, per branch and weekly (see CLAUDE.md "Commands" and
+# .github/workflows/weekly.yml). Debug and Display output are not behaviour the tests pin.
+test_tool = "nextest"
+exclude_globs = ["crates/bench/**", "tools/**", "fuzz/**"]
+exclude_re = ["impl (Debug|Display)", "fn fmt"]

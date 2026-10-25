@@ -15,8 +15,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # samply is pinned in mise.toml for profiling on our machines; CI never profiles, so it
-  # isn't installed there.
-  MISE_DISABLE_TOOLS: "cargo:samply"
+  # isn't installed there. Nor are the verification tools: weekly.yml runs mutants and
+  # coverage, and fuzzing and the proofs run on our machines.
+  MISE_DISABLE_TOOLS: "cargo:samply,cargo:cargo-bolero,cargo:cargo-fuzz,cargo:cargo-mutants,cargo:cargo-llvm-cov,cargo:kani-verifier"
 
 jobs:
   lint:
