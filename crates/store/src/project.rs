@@ -35,6 +35,15 @@
 //! file in place, as a roll-over that failed does (see [`ROLL_OVER_RETRY`]), and once one is,
 //! protection runs again.
 //!
+//! A roll-over that fails pauses protection the same way, but leaves a recovery file: the one
+//! whose writer failed, at its last durable save point. Nothing more may be appended to it (a
+//! failed sync proves nothing about what follows), so the store is moved off it onto a scratch
+//! file, **stranding** it: still held and locked, still the recovery file on disk
+//! ([`Project::recovery_path`]), until a new recovery file replaces it or a save makes it
+//! unneeded. The scratch file is made in the project file's directory or the recovery
+//! directory, never the temporary directory, which is often memory-backed: it is filled with
+//! every edit since the last save. If none can be made, the store stays on the failed file.
+//!
 //! # The spatial index
 //!
 //! The bounds of the spatial index are kept with the tiles (see [`crate::bounds`]). What edits
@@ -357,8 +366,11 @@ pub struct Project {
     /// restored onto an earlier save point of its project file, whose file is held (its base
     /// reads it) but not saved into.
     path: Option<PathBuf>,
-    /// Where the store's working file, the recovery file, is; `None` while it is a scratch file
-    /// (see [`scratch`]), after a save that couldn't make its new recovery file.
+    /// Where the recovery file on disk that protects the project is: the store's working file,
+    /// or, after a failed roll-over, the failed file the store has moved off
+    /// ([`Project::stranded`]), still at its last durable save point. `None` while crash
+    /// protection has been paused since a save that couldn't make its new recovery file (the
+    /// store works on a scratch file then, see [`scratch`]).
     recovery_path: Option<PathBuf>,
     /// The directory recovery files go in.
     recovery_dir: PathBuf,
@@ -380,6 +392,16 @@ pub struct Project {
     /// they are or the project closes, so no listing offers them while it runs (see
     /// [`Project::let_go`]). Deleting them is tried again whenever protection is put in place.
     held: Vec<(PathBuf, ProjectFile)>,
+    /// Whether the store's working file is a recovery file whose writer failed (a failed sync,
+    /// or a stopped thread), so nothing more may be appended to it: the store moves off it at
+    /// the first chance ([`Project::strand`], or a roll-over or a save).
+    failed_working: bool,
+    /// The failed recovery file the store has moved off ([`Project::strand`]), still held (open
+    /// and locked) while the store works on a scratch file instead. It stays the project's
+    /// recovery file on disk ([`Project::recovery_path`]), at its last durable save point, until
+    /// a new recovery file replaces it or a save makes it unneeded: it is released only through
+    /// [`Project::let_go`].
+    stranded: Option<ProjectFile>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename (see
     /// [`Unplaced::crash`]).
@@ -626,6 +648,8 @@ impl Project {
             retry_at: None,
             retry_after: ROLL_OVER_RETRY,
             held: Vec::new(),
+            failed_working: false,
+            stranded: None,
             #[cfg(test)]
             fail_next_recovery: false,
         })
@@ -827,8 +851,10 @@ impl Project {
         self.path.as_deref()
     }
 
-    /// Where the recovery file is: it changes with every save, and every roll-over. `None`
-    /// while crash protection has been paused since a save, which left no recovery file.
+    /// Where the recovery file on disk that protects the project is: it changes with every save,
+    /// and every roll-over. It is the store's working file or, after a roll-over failed, the
+    /// failed file the store has moved off, still at its last durable save point. `None` while
+    /// crash protection has been paused since a save that couldn't make its new recovery file.
     #[must_use]
     pub fn recovery_path(&self) -> Option<&Path> {
         self.recovery_path.as_deref()
@@ -1011,6 +1037,7 @@ impl Project {
         if let Some(failed) = self.writer.take() {
             // It can only say that it needs a new file; closing releases its subscription.
             drop(failed.close(&mut self.store, Instant::now()));
+            self.failed_working = true;
         }
         self.resume(retry)
     }
@@ -1034,7 +1061,10 @@ impl Project {
             Retry::Now => Instant::now(),
         };
         match self.roll_over() {
-            Err(cause) if self.writer.is_none() => Err(self.pause(cause, now)),
+            Err(cause) if self.writer.is_none() => {
+                self.strand();
+                Err(self.pause(cause, now))
+            }
             rolled => {
                 self.protected();
                 rolled
@@ -1106,6 +1136,7 @@ impl Project {
             }
         };
         self.unreported.extend(lost);
+        self.failed_working = false;
         let retired = match self.recovery_path.replace(fresh_path) {
             Some(old_path) => self.let_go(old_path, old),
             // A scratch file, which no listing finds: closing it deletes it.
@@ -1183,6 +1214,7 @@ impl Project {
                 return Err(e.into());
             }
         };
+        self.failed_working = false;
         let kept = match std::mem::replace(&mut self.recovery_path, fresh_path) {
             Some(old_path) => self.let_go(old_path, old),
             None => None,
@@ -1207,20 +1239,72 @@ impl Project {
         Ok(kept)
     }
 
-    /// Deletes the old recovery file `old`, at `path`, which the project has moved on from
+    /// Deletes the old recovery file at `path`, which the project has moved on from
     /// ([`retire`]), while still holding it, and only then closes it; returns it if it couldn't
     /// be deleted.
+    ///
+    /// The handle that holds `path` is `old`, the store's old working file, unless the store had
+    /// moved off a failed recovery file onto a scratch file ([`Project::strand`]): then it is the
+    /// stranded file, and `old` is the scratch file, deleted by dropping it.
     ///
     /// A recovery file is unlocked only once it is gone, so [`find_recoveries`] never finds a
     /// running project's old file unheld and offers to restore it. One that can't be deleted is
     /// held until it is (tried again when protection is next put in place), or the project
     /// closes (or is dropped): only then is it listed.
     fn let_go(&mut self, path: PathBuf, old: ProjectFile) -> Option<KeptRecovery> {
+        let holder = self.stranded.take().unwrap_or(old);
         let kept = retire(&path).err();
         if kept.is_some() {
-            self.held.push((path, old));
+            self.held.push((path, holder));
         }
         kept
+    }
+
+    /// Moves the store off a failed recovery file onto an unlinked scratch file on disk-backed
+    /// storage, so later write-backs never reach the failed one: after a roll-over failed, with
+    /// crash protection pausing. The failed file is kept, held, as the recovery file on disk
+    /// ([`Project::stranded`]), at its last durable save point.
+    ///
+    /// The scratch file is filled with every edit ([`TileStore::fill_roll_over`]) and swapped in
+    /// ([`TileStore::roll_over`]). It is made in the project file's directory, when the project
+    /// has been saved, else (or if that fails) in the recovery directory, where the roll-over
+    /// just failed, so it often fails too. Never in the system's temporary directory: that is
+    /// often memory-backed (tmpfs), and filling the file there would put every edit since the
+    /// last save into memory outside the store's budget, under the very pressure that writes
+    /// tiles back.
+    ///
+    /// Best effort: does nothing unless the working file is a failed recovery file not yet left;
+    /// if no scratch file can be made or filled, the store stays where it was.
+    fn strand(&mut self) {
+        if !self.failed_working || self.stranded.is_some() {
+            return;
+        }
+        let dirs: Vec<PathBuf> = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain([self.recovery_dir.clone()])
+            .collect();
+        for dir in &dirs {
+            let meta = self.store.working().meta().clone();
+            let Ok(file) = scratch_in(dir, meta, self.store.working()) else {
+                continue;
+            };
+            // A failed fill changes nothing in the store, so the next directory can be tried.
+            let Ok(filled) = self.store.fill_roll_over(file) else {
+                continue;
+            };
+            // The store can't have moved on since the fill, within this call.
+            let Ok((old, lost)) = self.store.roll_over(filled) else {
+                return;
+            };
+            self.unreported.extend(lost);
+            self.stranded = Some(old);
+            self.failed_working = false;
+            return;
+        }
     }
 }
 
@@ -1252,20 +1336,34 @@ fn retire(old: &Path) -> Result<(), KeptRecovery> {
     })
 }
 
-/// A scratch working file with `meta` over `like`'s mesh: what a save rebases the store onto
-/// when it can't make a fresh recovery file, so the store has a file to write tiles back to.
+/// A scratch working file with `meta` over `like`'s mesh, in the system's temporary directory.
 ///
-/// It is made in the system's temporary directory and unlinked at once, so it is only ever the
-/// project's open handle: no listing finds it, and nothing is left of it after a crash, or once
-/// it is closed. It is no crash protection, and doesn't pretend to be.
+/// It is what a save rebases the store onto when it can't make a fresh recovery file, so the
+/// store has a file to write tiles back to (see [`scratch_in`]).
+///
+/// # Errors
+///
+/// As [`scratch_in`].
+fn scratch(meta: Meta, like: &ProjectFile) -> Result<ProjectFile, ProjectError> {
+    scratch_in(&std::env::temp_dir(), meta, like)
+}
+
+/// A scratch working file with `meta` over `like`'s mesh, made in `dir`.
+///
+/// It is a file for the store to write tiles back to when it has no recovery file to write them
+/// to, after a save ([`scratch`]) or a failed roll-over ([`Project::strand`]).
+///
+/// It is unlinked at once, so it is only ever the project's open handle: no listing finds it,
+/// and nothing is left of it after a crash, or once it is closed. It is no crash protection,
+/// and doesn't pretend to be.
 ///
 /// # Errors
 ///
 /// [`ProjectError::Io`] if no random name can be drawn, or it can't be unlinked;
 /// [`ProjectError::Store`] if it can't be made. Nothing is left behind, best effort.
-fn scratch(meta: Meta, like: &ProjectFile) -> Result<ProjectFile, ProjectError> {
+fn scratch_in(dir: &Path, meta: Meta, like: &ProjectFile) -> Result<ProjectFile, ProjectError> {
     let suffix = ProjectId::random()?.to_bits() >> 64;
-    let at = std::env::temp_dir().join(format!(
+    let at = dir.join(format!(
         "brushcraft-{}-{suffix:016x}.scratch",
         meta.project()
     ));

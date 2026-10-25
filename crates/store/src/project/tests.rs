@@ -810,6 +810,66 @@ fn a_roll_over_that_cannot_make_its_file_keeps_the_old_one_and_tries_again() {
     );
 }
 
+/// After a failed sync and a failed roll-over, nothing more is appended to the failed file.
+///
+/// The store moves off it onto a scratch file, so the edits made while protection is paused,
+/// written back to make room, land there; the failed file stays the recovery file on disk, at
+/// its last durable save point, until the next try rolls over and deletes it. The new file holds
+/// every edit, the paused ones too.
+#[test]
+fn a_paused_roll_over_writes_nothing_more_into_the_failed_file() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 91);
+    project.finish_flushes().unwrap();
+    let old = project.recovery_path().unwrap().to_path_buf();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    project.fail_next_recovery();
+    stroke(&mut project, &mut map, 60, 92);
+    let began = Instant::now();
+    let failed = loop {
+        match project.poll() {
+            Ok(()) => {
+                assert!(began.elapsed() < Duration::from_secs(30), "the sync fails");
+                std::thread::yield_now();
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(paused_by_io(&failed), "{failed:?}");
+    let len = fs::metadata(&old).unwrap().len();
+    stroke(&mut project, &mut map, 60, 93);
+    project.store().evict_all().unwrap();
+    assert_eq!(
+        fs::metadata(&old).unwrap().len(),
+        len,
+        "nothing is appended to the recovery file whose sync failed"
+    );
+    assert_eq!(
+        project.recovery_path().unwrap(),
+        old,
+        "it is still the recovery file on disk"
+    );
+    project.tick(Instant::now() + ROLL_OVER_RETRY).unwrap();
+    assert_ne!(project.recovery_path().unwrap(), old, "rolled over");
+    assert!(
+        !old.exists(),
+        "the failed file goes once a new one is in place"
+    );
+    let path = project.recovery_path().unwrap().to_path_buf();
+    project.close(true).unwrap();
+    let file = ProjectFile::open(&path).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "every edit, the paused ones too",
+    );
+}
+
 /// One stroke whose flush fails to sync.
 ///
 /// Begun, `count` random edits with `seed` applied as its dabs to the project's store and to
