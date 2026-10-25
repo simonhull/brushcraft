@@ -6,12 +6,13 @@
 //! them, and damage to them fails the open rather than being cut off as a torn tail.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::ops::Deref;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -978,15 +979,37 @@ impl ProjectFile {
     /// it, and returns the position in `heads` of the first record after it (0 if there is
     /// none, and `end` stays after the leading records).
     ///
+    /// A parent is followed only to an Index of `heads`, where every parent a writer names is,
+    /// and each Index is read at most once however many chains lead to it, so a file of many
+    /// Indexes naming one large or many made-up parents costs one pass, not one per Index.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Io`].
     fn load_base(&mut self, heads: &[(u64, Head)], len: u64) -> Result<usize, StoreError> {
+        let indexes: BTreeSet<u64> = heads
+            .iter()
+            .filter(|(_, head)| head.kind == KIND_INDEX)
+            .map(|&(offset, _)| offset)
+            .collect();
+        let mut read: BTreeMap<u64, Option<Rc<Index>>> = BTreeMap::new();
+        let file = &self.file;
+        let mut index_at = |at: u64| -> io::Result<Option<Rc<Index>>> {
+            if !indexes.contains(&at) {
+                return Ok(None);
+            }
+            if let Some(known) = read.get(&at) {
+                return Ok(known.clone());
+            }
+            let index = read_save_point(file, at, len)?.map(Rc::new);
+            read.insert(at, index.clone());
+            Ok(index)
+        };
         for (at, &(offset, head)) in heads.iter().enumerate().rev() {
             if head.kind != KIND_INDEX {
                 continue;
             }
-            if let Some(chain) = load_chain(&self.file, offset, len)? {
+            if let Some(chain) = chain_from(offset, &mut index_at)? {
                 self.saved = Some(SavedState::loaded(offset, chain.head, &chain.live));
                 self.live = chain.live;
                 self.deltas = chain.deltas;
@@ -2794,35 +2817,51 @@ fn scan_heads(file: &File, start: u64, len: u64) -> io::Result<Vec<(u64, Head)>>
     Ok(heads)
 }
 
+/// Test hook: the work an open did on this thread, so adversarial tests can bound it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Work {
+    /// Indexes read by [`read_index`].
+    indexes: u64,
+    /// Bytes read (and checksummed) by [`read_index`].
+    index_bytes: u64,
+    /// Bytes checksummed by [`find_index`].
+    searched: u64,
+}
+
 #[cfg(test)]
 thread_local! {
-    /// Test hook: Indexes read by [`read_index`] and bytes checksummed by [`find_index`] on this
-    /// thread, so adversarial tests can bound the work an open does.
-    static WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Test hook: the [`Work`] done on this thread since [`take_work`] last ran.
+    static WORK: std::cell::Cell<Work> = const {
+        std::cell::Cell::new(Work { indexes: 0, index_bytes: 0, searched: 0 })
+    };
 }
 
-/// Test hook: the work counted in [`WORK`] since the last call on this thread (Indexes read,
-/// bytes checksummed), and starts counting again from zero.
+/// Test hook: the work counted in [`WORK`] since the last call on this thread, and starts
+/// counting again from zero.
 #[cfg(test)]
-pub(super) fn take_work() -> (u64, u64) {
-    WORK.with(|work| work.replace((0, 0)))
+pub(super) fn take_work() -> Work {
+    WORK.with(|work| work.replace(Work::default()))
 }
 
-/// Test hook: counts one more Index read in [`WORK`].
+/// Test hook: counts one more Index of `bytes` read in [`WORK`].
 #[cfg(test)]
-fn count_index_read() {
+fn count_index_read(bytes: u64) {
     WORK.with(|work| {
-        let (indexes, bytes) = work.get();
-        work.set((indexes.saturating_add(1), bytes));
+        let mut now = work.get();
+        now.indexes = now.indexes.saturating_add(1);
+        now.index_bytes = now.index_bytes.saturating_add(bytes);
+        work.set(now);
     });
 }
 
-/// Test hook: counts `n` more bytes checksummed in [`WORK`].
+/// Test hook: counts `n` more bytes checksummed by [`find_index`] in [`WORK`].
 #[cfg(test)]
 fn count_checksummed(n: u64) {
     WORK.with(|work| {
-        let (indexes, bytes) = work.get();
-        work.set((indexes, bytes.saturating_add(n)));
+        let mut now = work.get();
+        now.searched = now.searched.saturating_add(n);
+        work.set(now);
     });
 }
 
@@ -3023,7 +3062,7 @@ fn read_index(file: &File, offset: u64, len: u64) -> io::Result<Option<Index>> {
         return Ok(None);
     }
     #[cfg(test)]
-    count_index_read();
+    count_index_read(head.total());
     Ok(save_point(&read_exact(file, offset, head.total())?, offset))
 }
 
@@ -3040,25 +3079,51 @@ fn save_point(record: &[u8], at: u64) -> Option<Index> {
     parent_ok.then_some(index)
 }
 
-/// The live map of the Index at `offset`, or `None` if any Index of its chain is bad.
-///
-/// Follows parent links back to a full Index, then applies it and the deltas oldest first. A chain
-/// that ends without a full Index is bad, or that is longer than any writer makes ([`MAX_CHAIN`]),
-/// and so is one with an entry outside the records before its Index.
+/// The live map of the Index at `offset`, or `None` if any Index of its chain is bad (see
+/// [`chain_from`]).
 ///
 /// # Errors
 ///
 /// The I/O error of a read.
 fn load_chain(file: &File, offset: u64, len: u64) -> io::Result<Option<Chain>> {
+    chain_from(
+        offset,
+        |at| Ok(read_save_point(file, at, len)?.map(Rc::new)),
+    )
+}
+
+/// The save point at `offset` (see [`read_index`]), if its entries all lie between the header
+/// and `offset`: an Index names only records written before it, and so bounds what loading them
+/// reads.
+///
+/// # Errors
+///
+/// The I/O error of a read.
+fn read_save_point(file: &File, offset: u64, len: u64) -> io::Result<Option<Index>> {
+    Ok(read_index(file, offset, len)?.filter(|index| index.entries_precede(offset)))
+}
+
+/// The live map of the Index `index_at` gives at `offset`, or `None` if any Index of its chain
+/// is bad.
+///
+/// Follows parent links back to a full Index, then applies it and the deltas oldest first. A chain
+/// that ends without a full Index is bad, or that is longer than any writer makes ([`MAX_CHAIN`]),
+/// and so is one with an Index `index_at` doesn't give (`None`: not a save point, or one with an
+/// entry outside the records before it).
+///
+/// # Errors
+///
+/// `index_at`'s I/O error.
+fn chain_from(
+    offset: u64,
+    mut index_at: impl FnMut(u64) -> io::Result<Option<Rc<Index>>>,
+) -> io::Result<Option<Chain>> {
     let mut chain = Vec::new();
     let mut at = offset;
     loop {
-        let Some(index) = read_index(file, at, len)? else {
+        let Some(index) = index_at(at)? else {
             return Ok(None);
         };
-        if !index.entries_precede(at) {
-            return Ok(None);
-        }
         let (coverage, parent) = (index.coverage, index.parent);
         chain.push(index);
         if chain.len() > MAX_CHAIN {
@@ -3076,8 +3141,8 @@ fn load_chain(file: &File, offset: u64, len: u64) -> io::Result<Option<Chain>> {
         return Ok(None);
     };
     let mut live = BTreeMap::new();
-    for index in chain.into_iter().rev() {
-        for (key, loc) in index.entries {
+    for index in chain.iter().rev() {
+        for &(key, loc) in &index.entries {
             match loc {
                 Some(loc) => live.insert(key, loc),
                 None => live.remove(&key),

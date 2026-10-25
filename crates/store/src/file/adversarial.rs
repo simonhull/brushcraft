@@ -549,12 +549,98 @@ fn a_long_delta_chain_is_refused_in_linear_work() {
     drop(f);
     take_work();
     let opened = ProjectFile::open(&path);
-    let (indexes, _) = take_work();
+    let Work { indexes, .. } = take_work();
     assert!(opened.is_err(), "no save point loads: {opened:?}");
     assert!(
         indexes <= 17 * DELTAS,
         "{indexes} Index reads for {DELTAS} Indexes"
     );
+}
+
+#[test]
+fn a_chain_is_at_most_one_full_index_and_fifteen_deltas() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    drop(ProjectFile::create(&path, meta(), mesh()).unwrap());
+    let mut f = ProjectFile::open(&path).unwrap();
+    let mut chain = Vec::new();
+    for n in 0..=MAX_CHAIN {
+        let at = f.len();
+        let coverage = if n == 0 {
+            Coverage::Full
+        } else {
+            Coverage::Delta
+        };
+        f.append_raw(
+            KIND_INDEX,
+            &index_payload(coverage, chain.last().copied(), None, &BTreeMap::new()).unwrap(),
+        )
+        .unwrap();
+        chain.push(at);
+    }
+    drop(f);
+    let longest = chain[MAX_CHAIN - 1];
+    let over = chain[MAX_CHAIN];
+    assert!(
+        ProjectFile::open_at(&path, longest).is_ok(),
+        "{MAX_CHAIN} Indexes load"
+    );
+    assert!(
+        matches!(ProjectFile::open_at(&path, over), Err(StoreError::Damaged { offset }) if offset == over),
+        "one more is refused"
+    );
+}
+
+#[test]
+fn many_indexes_naming_one_parent_are_read_once() {
+    /// Bytes of the large record the parents lie in.
+    const LARGE: usize = 1 << 20;
+    /// Delta Indexes naming parents in it.
+    const DELTAS: usize = 1000;
+    for one_record in [true, false] {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        drop(ProjectFile::create(&path, meta(), mesh()).unwrap());
+        let mut f = ProjectFile::open(&path).unwrap();
+        let large = f.len();
+        let parents: Vec<u64> = if one_record {
+            // An Index record that verifies but doesn't parse, named by every delta.
+            f.append_raw(KIND_INDEX, &vec![0xFF; LARGE]).unwrap();
+            vec![large; DELTAS]
+        } else {
+            // A record of another kind, packed with Index heads each claiming the rest of it,
+            // and each delta naming another: none is where a record starts.
+            let mut payload = vec![0; LARGE];
+            for (n, head) in payload.as_chunks_mut::<HEAD>().0.iter_mut().enumerate() {
+                let rest = (LARGE - n * HEAD).saturating_sub(HEAD + TAIL);
+                let claimed = u32::try_from(rest).unwrap();
+                head[0] = KIND_INDEX;
+                head[4..].copy_from_slice(&claimed.to_le_bytes());
+            }
+            f.append_raw(9, &payload).unwrap();
+            let first = large + u64::try_from(HEAD).unwrap();
+            (0..DELTAS)
+                .map(|n| first + u64::try_from(n * HEAD).unwrap())
+                .collect()
+        };
+        for &parent in &parents {
+            f.append_raw(
+                KIND_INDEX,
+                &index_payload(Coverage::Delta, Some(parent), None, &BTreeMap::new()).unwrap(),
+            )
+            .unwrap();
+        }
+        drop(f);
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        take_work();
+        let opened = ProjectFile::open(&path);
+        let Work { index_bytes, .. } = take_work();
+        assert!(opened.is_err(), "one record {one_record}: {opened:?}");
+        assert!(
+            index_bytes <= 2 * file_len,
+            "one record {one_record}: {index_bytes} bytes of Indexes read in a {file_len}-byte file"
+        );
+    }
 }
 
 #[test]
@@ -668,7 +754,10 @@ fn a_tail_of_index_lookalikes_is_searched_in_bounded_work() {
         std::fs::write(&path, &bad).unwrap();
         take_work();
         let opened = ProjectFile::open(&path);
-        let (_, checksummed) = take_work();
+        let Work {
+            searched: checksummed,
+            ..
+        } = take_work();
         match &opened {
             Err(StoreError::DamagedMidFile { .. }) => println!("full {full}: refused as damage"),
             Ok(f) => {
