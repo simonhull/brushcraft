@@ -241,12 +241,41 @@ fn index_entries_with_impossible_lengths_are_damage() {
     let path = dir.path("p.bcrf");
     let (good, [s1, ..]) = three(&path);
     let over = usize::try_from(MAX_TILE_RECORD + 1).unwrap();
+    assert_eq!(
+        (bounds::UNKNOWN_RECORD_LEN, bounds::KNOWN_RECORD_LEN),
+        (25, 65),
+        "a bounds record's two lengths"
+    );
     for (what, name, len, loads) in [
         (
             "a bounds entry of 100 bytes",
             Name::Bounds(key(1)),
             100,
             false,
+        ),
+        (
+            "a bounds entry of 30 bytes",
+            Name::Bounds(key(1)),
+            30,
+            false,
+        ),
+        (
+            "a bounds entry of 64 bytes",
+            Name::Bounds(key(1)),
+            64,
+            false,
+        ),
+        (
+            "a bounds entry of an unknown bound's record",
+            Name::Bounds(key(1)),
+            bounds::UNKNOWN_RECORD_LEN,
+            true,
+        ),
+        (
+            "a bounds entry of a known bound's record",
+            Name::Bounds(key(1)),
+            bounds::KNOWN_RECORD_LEN,
+            true,
         ),
         (
             "a tile entry over the largest tile record",
