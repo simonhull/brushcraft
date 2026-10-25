@@ -173,6 +173,68 @@ mod tests {
         assert_eq!(events.dropped(), 3);
     }
 
+    /// A test event: an id, and whether it is droppable motion.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Ev(u32, bool);
+
+    impl Droppable for Ev {
+        fn droppable(&self) -> bool {
+            self.1
+        }
+    }
+
+    /// Room for 6 droppable events before the reserve.
+    const SMALL: usize = RESERVE + 6;
+
+    #[test]
+    fn a_full_queue_keeps_room_for_essential_events() {
+        let (tx, events) = channel(SMALL);
+        for i in 0..100 {
+            tx.send(Ev(i, true)).expect("receiver alive");
+        }
+        for i in 100..103 {
+            tx.send(Ev(i, false)).expect("receiver alive");
+        }
+        let expected: Vec<Ev> = (0..6)
+            .map(|i| Ev(i, true))
+            .chain((100..103).map(|i| Ev(i, false)))
+            .collect();
+        assert_eq!(events.try_iter().collect::<Vec<_>>(), expected);
+        assert_eq!(events.dropped(), 94);
+        assert_eq!(events.lost_essential(), 0);
+    }
+
+    #[test]
+    fn essential_events_past_the_reserve_are_counted_apart() {
+        let (tx, events) = channel(SMALL);
+        for i in 0..75 {
+            tx.send(Ev(i, false)).expect("receiver alive");
+        }
+        let delivered: Vec<Ev> = events.try_iter().collect();
+        assert_eq!(delivered, (0..70).map(|i| Ev(i, false)).collect::<Vec<_>>());
+        assert_eq!(events.lost_essential(), 5);
+        assert_eq!(events.dropped(), 0);
+    }
+
+    #[test]
+    fn draining_frees_room() {
+        let (tx, events) = channel(SMALL);
+        for i in 0..10 {
+            tx.send(Ev(i, true)).expect("receiver alive");
+        }
+        assert_eq!(events.try_iter().count(), 6);
+        assert_eq!(events.dropped(), 4);
+        for i in 10..16 {
+            tx.send(Ev(i, true)).expect("receiver alive");
+        }
+        assert_eq!(
+            events.try_iter().collect::<Vec<_>>(),
+            (10..16).map(|i| Ev(i, true)).collect::<Vec<_>>(),
+            "the drained room takes droppable events again"
+        );
+        assert_eq!(events.dropped(), 4);
+    }
+
     #[test]
     fn send_fails_once_the_receiver_is_gone() {
         let (tx, events) = channel(RESERVE + 2);
