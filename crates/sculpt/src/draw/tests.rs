@@ -1090,33 +1090,40 @@ fn a_project_reopened_after_discarding_a_stroke_starts_afresh() {
 
 #[test]
 fn a_stroke_saved_part_way_goes_on_from_the_save() {
+    // A save moves the store to a new op, so the stroke starts its sums afresh from the saved
+    // values, then keeps them from dab to dab: as the oracle does with a new stroke state at the
+    // save, bit for bit.
     let level = Level::new(7).unwrap();
-    let run = |reuse: bool| {
-        let dir = TestDir::new();
-        let path = dir.0.join("project.bcp");
-        let mut project = Project::new(cube_sphere(1).unwrap(), reopen_config(&dir)).unwrap();
-        assert_saved(project.save_as(&path));
-        let mut index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
-        let (key, scale) = strong_stroke(&mut project, &mut index, level);
-        let light = light_dab(level, 4, scale);
-        let mut stroke = Stroke::new(project.store());
-        project.begin_stroke().unwrap();
-        for _ in 0..3 {
-            draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
-        }
-        assert_saved(project.save());
-        if !reuse {
-            stroke = Stroke::new(project.store());
-        }
-        for _ in 0..5 {
-            draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
-            assert!(stroke.holds(&key), "the tile keeps its state");
-        }
-        project.end_stroke().unwrap();
-        snapshot(project.store(), level)
-    };
-    assert!(
-        run(true) == run(false),
-        "after a save, the stroke goes on as a fresh one would, keeping its state from dab to dab"
-    );
+    let dir = TestDir::new();
+    let path = dir.0.join("project.bcp");
+    let mut project = Project::new(cube_sphere(1).unwrap(), reopen_config(&dir)).unwrap();
+    assert_saved(project.save_as(&path));
+    let mesh = project.store().mesh().clone();
+    let mut index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
+    let mut map = CorrectionMap::new();
+    let (key, scale) = strong_stroke(&mut project, &mut index, level);
+    let strong = DrawParams::new(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
+    oracle_step(&mesh, level, &mut map, &mut OracleStroke::new(), strong);
+    let light = light_dab(level, 4, scale);
+    let mut stroke = Stroke::new(project.store());
+    let mut oracle = OracleStroke::new();
+    project.begin_stroke().unwrap();
+    for _ in 0..3 {
+        draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
+        oracle_step(&mesh, level, &mut map, &mut oracle, light);
+    }
+    assert_saved(project.save());
+    oracle = OracleStroke::new();
+    for k in 0..5 {
+        draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
+        oracle_step(&mesh, level, &mut map, &mut oracle, light);
+        assert!(stroke.holds(&key), "the tile keeps its state");
+        assert_as_dense(
+            project.store(),
+            &map,
+            level,
+            &format!("dab {k} after the save"),
+        );
+    }
+    project.end_stroke().unwrap();
 }
