@@ -55,6 +55,7 @@ use geom::{BaseMesh, Channel, EvalError, LayerId, Level, Region, TileKey, parent
 use crate::bytes::{KEY_LEN, Reader, put_key};
 use crate::deps::DepGraph;
 use crate::index::TileBounds;
+use crate::record::{HEAD, TAIL};
 
 /// The state byte of a stored bound whose tile's bounds are unknown: the tile is evaluated when
 /// the index is loaded.
@@ -63,6 +64,17 @@ const UNKNOWN: u8 = 0;
 const KNOWN: u8 = 1;
 /// Bytes of a known bound's values: ten `f32`, bit for bit.
 const VALUES_LEN: usize = 4 * TileBounds::BITS;
+
+/// Bytes of a framed `Bounds` record holding an unknown bound: framing, key and state.
+pub(crate) const UNKNOWN_RECORD_LEN: u64 = (HEAD + TAIL + KEY_LEN + 1) as u64;
+/// Bytes of a framed `Bounds` record holding a known bound: framing, key, state and values.
+pub(crate) const KNOWN_RECORD_LEN: u64 = UNKNOWN_RECORD_LEN + VALUES_LEN as u64;
+
+/// Whether `len` is the length of a framed `Bounds` record: [`UNKNOWN_RECORD_LEN`] or
+/// [`KNOWN_RECORD_LEN`].
+pub(crate) const fn is_record_len(len: u64) -> bool {
+    len == UNKNOWN_RECORD_LEN || len == KNOWN_RECORD_LEN
+}
 
 /// A `Bounds` record's payload: `key | state: u8`, then, if the state is known, the ten `f32`
 /// of [`TileBounds::to_bits`] (little-endian). The state is 0 for unknown, 1 for known.

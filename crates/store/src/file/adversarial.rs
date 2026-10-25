@@ -235,6 +235,81 @@ fn index_entries_must_point_before_their_index() {
     }
 }
 
+#[test]
+fn index_entries_with_impossible_lengths_are_damage() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (good, [s1, ..]) = three(&path);
+    let over = usize::try_from(MAX_TILE_RECORD + 1).unwrap();
+    for (what, name, len, loads) in [
+        (
+            "a bounds entry of 100 bytes",
+            Name::Bounds(key(1)),
+            100,
+            false,
+        ),
+        (
+            "a tile entry over the largest tile record",
+            Name::Tile(key(1)),
+            MAX_TILE_RECORD + 1,
+            false,
+        ),
+        (
+            "a tile entry of the largest tile record",
+            Name::Tile(key(1)),
+            MAX_TILE_RECORD,
+            true,
+        ),
+    ] {
+        std::fs::write(&path, &good).unwrap();
+        let mut f = ProjectFile::open(&path).unwrap();
+        // A filler record, so the entry still lies before its Index.
+        let filler = f.len();
+        f.append_raw(9, &vec![0; over]).unwrap();
+        let entries = BTreeMap::from([(
+            name,
+            Loc {
+                offset: filler,
+                len,
+            },
+        )]);
+        let end = f.len();
+        f.append_raw(
+            KIND_INDEX,
+            &index_payload(Coverage::Full, None, None, &entries).unwrap(),
+        )
+        .unwrap();
+        drop(f);
+        let bad = std::fs::read(&path).unwrap();
+        // Dropped at once: its shared lock would keep the next open out.
+        let at = ProjectFile::open_at(&path, end).map(drop);
+        let latest = ProjectFile::open(&path).map(|opened| opened.save_points().unwrap());
+        if loads {
+            assert!(at.is_ok(), "{what}: {at:?}");
+            assert_eq!(
+                latest.unwrap().last(),
+                Some(&end),
+                "{what}: the latest save point"
+            );
+        } else {
+            // The Index doesn't parse, so it is no save point, and one that late is damage.
+            assert!(
+                matches!(at, Err(StoreError::NotASavePoint(offset)) if offset == end),
+                "{what}: {at:?}"
+            );
+            assert!(
+                matches!(latest, Err(StoreError::DamagedMidFile { .. })),
+                "{what}: {latest:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bad, "{what}: file untouched");
+        }
+        assert!(
+            ProjectFile::open_at(&path, s1).is_ok(),
+            "{what}: earlier save points still open"
+        );
+    }
+}
+
 /// Every live tile and the op that wrote it.
 fn state(f: &ProjectFile) -> Vec<(TileKey, OpId)> {
     f.keys()

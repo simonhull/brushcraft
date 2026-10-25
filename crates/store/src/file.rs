@@ -19,7 +19,7 @@ use geom::{BaseMesh, Channel, CorrectionTile, MeshError, TileKey};
 use thiserror::Error;
 
 use crate::OpId;
-use crate::bounds::{Kept, bounds_payload, parse_bounds_payload};
+use crate::bounds::{self, Kept, bounds_payload, parse_bounds_payload};
 use crate::bytes::{KEY_LEN, Reader, put_key};
 use crate::codec::{
     CodecError, compress, decode_displacement_into, decompress, displacement_body_len,
@@ -62,6 +62,17 @@ const INDEX_FIXED: usize = 28;
 /// Readers reject a record that states a larger size, so a damaged or hostile file can't make
 /// them allocate more.
 pub const MAX_RAW: u32 = 1 << 20;
+
+/// The longest framed tile record a reader accepts.
+///
+/// That is framing, key, op, header length, the largest header (`u16::MAX`), the stated size, and
+/// a zstd frame of at most [`MAX_RAW`] bytes (zstd never expands by more than 1/128 plus a small
+/// constant).
+const MAX_TILE_RECORD: u64 = (HEAD + TAIL + KEY_LEN + 8 + 2 + 4) as u64
+    + u16::MAX as u64
+    + MAX_RAW as u64
+    + MAX_RAW as u64 / 128
+    + 1024;
 
 /// The largest base mesh, in canonical bytes ([`BaseMesh::to_bytes`]): 64 MiB, room for about
 /// 2.8 million vertices and their faces.
@@ -3049,7 +3060,8 @@ fn load_chain(file: &File, offset: u64, len: u64) -> io::Result<Option<Chain>> {
 ///
 /// # Errors
 ///
-/// [`StoreError::TooLarge`] if the header exceeds its length field or the body [`MAX_RAW`].
+/// [`StoreError::TooLarge`] if the header exceeds its length field, the body [`MAX_RAW`], or the
+/// framed record [`MAX_TILE_RECORD`].
 fn tile_payload(
     key: TileKey,
     op: OpId,
@@ -3062,7 +3074,12 @@ fn tile_payload(
         .ok()
         .filter(|&n| n <= MAX_RAW)
         .ok_or(StoreError::TooLarge)?;
-    let mut out = Vec::with_capacity(KEY_LEN + 14 + header.len() + packed.len());
+    let payload_len = KEY_LEN + 14 + header.len() + packed.len();
+    let framed = u64::try_from(HEAD + TAIL + payload_len).or(Err(StoreError::TooLarge))?;
+    if framed > MAX_TILE_RECORD {
+        return Err(StoreError::TooLarge);
+    }
+    let mut out = Vec::with_capacity(payload_len);
     put_key(&mut out, &key);
     out.extend_from_slice(&op.to_bits().to_le_bytes());
     out.extend_from_slice(&header_len.to_le_bytes());
@@ -3136,17 +3153,19 @@ fn index_payload(
     Ok(out)
 }
 
-/// Parses `count` Index entries of `r`, each named by `name` of its key.
+/// Parses `count` Index entries of `r`, each named by `name` of its key; `None` if a record's
+/// length isn't one that `fits` its kind (a zero length, a removed entry, always is).
 fn parse_entries(
     r: &mut Reader<'_>,
     count: usize,
     name: fn(TileKey) -> Name,
+    fits: fn(u64) -> bool,
 ) -> Option<Vec<(Name, Option<Loc>)>> {
     (0..count)
         .map(|_| {
             let key = r.key()?;
             let offset = r.u64()?;
-            let len = r.u32()?;
+            let len = r.u32().filter(|&len| len == 0 || fits(len.into()))?;
             Some((
                 name(key),
                 (len != 0).then_some(Loc {
@@ -3158,8 +3177,12 @@ fn parse_entries(
         .collect()
 }
 
-/// Parses [`index_payload`]'s output; `None` on any shortfall, an invalid key, a bounds section
-/// that is empty or doesn't fill the rest exactly, or a section's keys out of order.
+/// Parses [`index_payload`]'s output.
+///
+/// `None` on any shortfall, an invalid key, a bounds section that is empty or doesn't fill the
+/// rest exactly, a section's keys out of order, or an entry whose record length no record of its
+/// kind has (a tile record over [`MAX_TILE_RECORD`], a bounds record of neither length
+/// [`bounds::is_record_len`] accepts).
 fn parse_index_payload(payload: &[u8]) -> Option<Index> {
     let mut r = Reader::new(payload);
     let coverage = match r.u8()? {
@@ -3174,13 +3197,18 @@ fn parse_index_payload(payload: &[u8]) -> Option<Index> {
         bits => Some(OpId::from_bits(bits)?),
     };
     let tiles = usize::try_from(r.u32()?).ok()?;
-    let mut entries = parse_entries(&mut r, tiles, Name::Tile)?;
+    let mut entries = parse_entries(&mut r, tiles, Name::Tile, |len| len <= MAX_TILE_RECORD)?;
     if !r.rest().is_empty() {
         let bounds = usize::try_from(r.u32()?).ok()?;
         if bounds == 0 || r.rest().len() != bounds.checked_mul(ENTRY_LEN)? {
             return None;
         }
-        entries.extend(parse_entries(&mut r, bounds, Name::Bounds)?);
+        entries.extend(parse_entries(
+            &mut r,
+            bounds,
+            Name::Bounds,
+            bounds::is_record_len,
+        )?);
     }
     // In order, so loading a chain applies each name's entries in the order they were made.
     let ordered = entries.windows(2).all(|pair| match pair {
@@ -3763,7 +3791,13 @@ mod tests {
         let entries = BTreeMap::from([
             (Name::Tile(key(1, 0)), at(100)),
             (Name::Tile(key(2, 0)), at(140)),
-            (Name::Bounds(key(1, 0)), at(180)),
+            (
+                Name::Bounds(key(1, 0)),
+                Loc {
+                    offset: 180,
+                    len: bounds::KNOWN_RECORD_LEN,
+                },
+            ),
         ]);
         let good = index_payload(Coverage::Full, None, None, &entries).unwrap();
         let parsed = parse_index_payload(&good).unwrap();
