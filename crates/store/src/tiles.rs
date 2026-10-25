@@ -2549,9 +2549,18 @@ impl TileStore {
     /// order (a value that outgrows the scale re-quantizes the interior, so the order within a
     /// tile matters); then, tile by tile in order, its border vertices are set with their
     /// copies and the tile is marked written where its first write falls in row-major order,
-    /// as one tile at a time would. `f` must so be a pure function of its arguments: it is
-    /// called for a tile's interior before its border, and on several threads. Other tiles are
-    /// edited one at a time.
+    /// as one tile at a time would. Other tiles are edited one at a time.
+    ///
+    /// What callers may rely on of the calls to `f`:
+    ///
+    /// - `f` is called exactly once per vertex of each entry of `keys` (at most once, where an edit
+    ///   fails part way), with the vertex's correction as stored just before its write;
+    /// - a tile's interior vertices are called before its border vertices;
+    /// - calls run on several threads, one tile's interior all on one thread.
+    ///
+    /// So `f` may keep state per vertex that only that vertex's call touches (a brush stroke's
+    /// summed deltas, say), but must give the same result whatever the thread schedule. A
+    /// change here that called `f` twice for a vertex would break such callers.
     ///
     /// # Errors
     ///
