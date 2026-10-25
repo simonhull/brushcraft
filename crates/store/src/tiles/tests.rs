@@ -4046,3 +4046,34 @@ fn a_head_at_the_last_op_of_the_site_exhausts_its_ops() {
         "the last op is still given"
     );
 }
+
+/// A correction no tile's scale can hold is the caller's error, `TooLarge`, by every way the
+/// store writes one, and nothing is written.
+#[test]
+fn a_correction_too_large_to_store_is_the_caller_s_error() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    let key = tiles(&mesh, TOP, TOP)[0];
+    let region = Region::of_tile(&key);
+    // Finite, but past the largest interior value any scale decodes.
+    let huge = Vec3::new(f32::MAX, 0.0, 0.0);
+    let at = |i: u32, j: u32| ((i, j) == (5, 5)).then_some(huge);
+    let too_large = |got: &Result<(), CacheError>| {
+        matches!(got, Err(CacheError::Correction(CorrectionError::TooLarge)))
+    };
+    let (x, y) = (region.x0() + 5, region.y0() + 5);
+    let one = store.set_correction(key.face(), key.level(), x, y, huge);
+    assert!(too_large(&one), "set_correction: {one:?}");
+    let edited = store.edit_tile(key, |edit| edit.set(5, 5, huge)).unwrap();
+    assert!(too_large(&edited), "TileEdit::set: {edited:?}");
+    let updated = store
+        .edit_tile(key, |edit| edit.update(|i, j, _| at(i, j)))
+        .unwrap();
+    assert!(too_large(&updated), "TileEdit::update: {updated:?}");
+    let guard = store.pin(&[key]).unwrap();
+    let in_parallel = store.update_tiles(&[key], |_, i, j, _| at(i, j));
+    assert!(too_large(&in_parallel), "update_tiles: {in_parallel:?}");
+    drop(guard);
+    assert!(store.unsaved.is_empty(), "nothing was written");
+}

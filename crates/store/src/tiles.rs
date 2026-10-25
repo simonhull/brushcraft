@@ -2454,7 +2454,9 @@ impl TileStore {
     ///
     /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`],
     /// [`CorrectionError::LevelZero`], [`CorrectionError::UnknownFace`] or
-    /// [`CorrectionError::OutOfTile`], before anything is written;
+    /// [`CorrectionError::OutOfTile`], before anything is written, or with
+    /// [`CorrectionError::TooLarge`] for an interior value no tile's scale can hold (an interior
+    /// vertex has one copy, so nothing is written then either);
     /// [`CacheError::OpsExhausted`] if no op is current and none can be begun;
     /// [`CacheError::Store`], [`CacheError::Full`] or [`CacheError::WriteBack`] if a copy's tile
     /// can't be loaded, also before anything is written. Should writing a copy fail all the same
@@ -4084,6 +4086,8 @@ impl TileStore {
     ///
     /// # Errors
     ///
+    /// [`CacheError::Correction`] with [`CorrectionError::TooLarge`] or
+    /// [`CorrectionError::NotFinite`] for a value no tile can hold (the slot is unchanged);
     /// [`CacheError::Internal`] for a stale handle, or if the slot doesn't hold a valid tile or
     /// `(i, j)` is outside it (neither happens for a loaded slot and a copy's coordinates).
     fn write_correction(
@@ -4095,9 +4099,8 @@ impl TileStore {
         op: OpId,
     ) -> Result<(), CacheError> {
         let slot = self.corrections.get_mut(id).ok_or(Invariant::StaleHandle)?;
-        slot.view_mut()
-            .and_then(|mut view| view.set(i, j, c))
-            .map_err(Invariant::CorrectionSlot)?;
+        let mut view = slot.view_mut().map_err(Invariant::CorrectionSlot)?;
+        view.set(i, j, c).map_err(refused_value)?;
         self.mark_written(key, id, op)
     }
 
@@ -5154,21 +5157,30 @@ struct InteriorPass {
 ///
 /// # Errors
 ///
-/// [`CacheError::Correction`] with [`CorrectionError::NotFinite`];
-/// [`CacheError::Internal`] with [`Invariant::CorrectionSlot`] and the slot's own error for a
-/// row outside the tile's interior (the store asks only for interior rows).
+/// [`CacheError::Correction`] with [`CorrectionError::NotFinite`] or
+/// [`CorrectionError::TooLarge`] for a value no tile can hold; [`CacheError::Internal`] with
+/// [`Invariant::CorrectionSlot`] and the slot's own error for a row outside the tile's interior
+/// (the store asks only for interior rows).
 fn update_row(
     view: &mut CorrectionViewMut<'_>,
     j: u32,
     f: &mut impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
 ) -> (bool, Result<(), CacheError>) {
     let RowUpdate { wrote, error } = view.update_interior_row(j, f);
-    let row = match error {
-        None => Ok(()),
-        Some(CorrectionError::NotFinite) => Err(CacheError::Correction(CorrectionError::NotFinite)),
-        Some(e) => Err(Invariant::CorrectionSlot(e).into()),
-    };
-    (wrote, row)
+    (wrote, error.map_or(Ok(()), |e| Err(refused_value(e))))
+}
+
+/// The store's error for a value a correction slot refused to take.
+///
+/// The caller's ([`CacheError::Correction`]) for a value no tile can hold,
+/// [`CorrectionError::TooLarge`] or [`CorrectionError::NotFinite`]; else the store's own
+/// ([`Invariant::CorrectionSlot`]), as the store writes only inside a tile it holds.
+fn refused_value(e: CorrectionError) -> CacheError {
+    if matches!(e, CorrectionError::TooLarge | CorrectionError::NotFinite) {
+        CacheError::Correction(e)
+    } else {
+        Invariant::CorrectionSlot(e).into()
+    }
 }
 
 /// The half of [`TileStore::update_tiles`] that runs on the workers, for one tile.
@@ -5315,7 +5327,9 @@ impl TileEdit<'_> {
     /// # Errors
     ///
     /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`] or
-    /// [`CorrectionError::OutOfTile`], before anything is written; [`CacheError::Store`],
+    /// [`CorrectionError::OutOfTile`], before anything is written, or with
+    /// [`CorrectionError::TooLarge`] for an interior value no tile's scale can hold (the tile is
+    /// unchanged); [`CacheError::Store`],
     /// [`CacheError::Full`] or [`CacheError::WriteBack`] if a neighbouring tile holding a copy
     /// can't be loaded, also before anything of this vertex is written.
     pub fn set(&mut self, i: u32, j: u32, c: Vec3) -> Result<(), CacheError> {
@@ -5446,8 +5460,9 @@ impl TileEdit<'_> {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`] for a value `f` returns
-    /// that isn't finite (nothing is written for it, the row's earlier writes stay);
+    /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`] or
+    /// [`CorrectionError::TooLarge`] for a value `f` returns that no tile can hold (nothing is
+    /// written for it, the row's earlier writes stay);
     /// [`CacheError::Internal`] for a stale handle or a broken slot.
     fn update_interior_row(
         &mut self,
@@ -5640,9 +5655,8 @@ impl TileEdit<'_> {
             .corrections
             .get_mut(tile.id)
             .ok_or(Invariant::StaleHandle)?;
-        slot.view_mut()
-            .and_then(|mut view| view.set(i, j, c))
-            .map_err(Invariant::CorrectionSlot)?;
+        let mut view = slot.view_mut().map_err(Invariant::CorrectionSlot)?;
+        view.set(i, j, c).map_err(refused_value)?;
         if !tile.written {
             tile.written = true;
             self.store.mark_written(tile.key, tile.id, self.op)?;
