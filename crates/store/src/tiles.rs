@@ -194,8 +194,8 @@ pub struct StoreConfig {
     pub kept_predictions: usize,
     /// How many tiles' stroke state the budget sets aside: the `f32` start and summed deltas a
     /// brush stroke keeps per vertex of the tiles it is editing, so that deltas smaller than a
-    /// quantization step aren't rounded away dab by dab (the brush crate holds the state; the
-    /// store only reserves for it and reports the count, [`TileStore::stroke_tiles`]).
+    /// quantization step aren't rounded away dab by dab (the `sculpt` crate holds the state;
+    /// the store only reserves for it and reports the count, [`TileStore::stroke_tiles`]).
     /// [`StoreConfig::DEFAULT_STROKE_TILES`] unless set. Each is charged to the budget at the
     /// largest tile's size, [`StoreConfig::STROKE_TILE_BYTES`]; zero keeps none, and a stroke
     /// writes every tile dab by dab. [`TileStore::open`] refuses a count whose share leaves the
@@ -444,6 +444,21 @@ fn reserved_shares(headroom: Headroom, config: &StoreConfig) -> Result<usize, Ca
             most: spare / StoreConfig::STROKE_TILE_BYTES,
         })?;
     Ok(kept + stroke)
+}
+
+/// A [`TileStore`]'s identity among the stores the process opens ([`TileStore::id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StoreId(u64);
+
+impl StoreId {
+    /// A store identity no store of this process has had yet.
+    fn next() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// The next identity to hand out.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 /// Why a [`TileStore`] operation failed.
@@ -1036,6 +1051,8 @@ pub struct TileStore {
     /// most a brush stroke over this store may keep, which it reads through
     /// [`TileStore::stroke_tiles`]. The store holds none of that state itself.
     stroke_tiles: usize,
+    /// This store's identity among every store the process opens ([`TileStore::id`]).
+    id: StoreId,
     /// The pinned tiles an edit of their own corrections alone marked stale, their parents'
     /// positions unchanged: the tiles whose next prediction, made in place, is worth keeping
     /// (see "Kept predictions" on [`TileStore`]). A mark goes when the tile is next predicted,
@@ -1756,6 +1773,7 @@ impl TileStore {
             worker_read_scratch: Vec::new(),
             kept: Kept::new(config.kept_predictions),
             stroke_tiles: config.stroke_tiles,
+            id: StoreId::next(),
             own_edits: BTreeSet::new(),
             activity: Activity::default(),
             #[cfg(test)]
@@ -2359,6 +2377,16 @@ impl TileStore {
         self.stroke_tiles
     }
 
+    /// This store's identity: no other store the process opens has it, whatever its file or
+    /// configuration, so state kept beside a store (a brush stroke's, say) can tell it is still
+    /// over the same one. Op ids can't: every store of a site starts its ops at the same
+    /// sequence number, and a project reopened after its edits were discarded hands out the
+    /// discarded ops' ids again.
+    #[must_use]
+    pub const fn id(&self) -> StoreId {
+        self.id
+    }
+
     /// The op for an edit: the current one, or a new one if none is current.
     ///
     /// # Errors
@@ -2555,7 +2583,6 @@ impl TileStore {
     ///
     /// - `f` is called exactly once per vertex of each entry of `keys` (at most once, where an edit
     ///   fails part way), with the vertex's correction as stored just before its write;
-    /// - a tile's interior vertices are called before its border vertices;
     /// - calls run on several threads, one tile's interior all on one thread.
     ///
     /// So `f` may keep state per vertex that only that vertex's call touches (a brush stroke's

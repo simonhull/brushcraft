@@ -49,5 +49,7 @@ pub use project::{
     ROLL_OVER_RETRY, RecoveryCandidate, SaveOutcome, default_recovery_dir, find_recoveries,
 };
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
-pub use tiles::{CacheError, Evaluation, Invariant, PinGuard, StoreConfig, TileEdit, TileStore};
+pub use tiles::{
+    CacheError, Evaluation, Invariant, PinGuard, StoreConfig, StoreId, TileEdit, TileStore,
+};
 pub use workers::{ParseWorkersError, StartWorkersError, Workers};
