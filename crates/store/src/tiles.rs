@@ -952,6 +952,11 @@ pub struct TileStore {
     /// round has written its slot: for tests of that error path.
     #[cfg(test)]
     failing_normals: Option<TileKey>,
+    /// Whether [`TileStore::tile_border`] gives `None` for every tile, as it would for a tile
+    /// holding a border vertex twice: for tests of the edits' fallback, which no valid mesh
+    /// reaches.
+    #[cfg(test)]
+    without_tile_borders: bool,
 }
 
 impl std::fmt::Debug for TileStore {
@@ -1651,6 +1656,8 @@ impl TileStore {
             unreadable: None,
             #[cfg(test)]
             failing_normals: None,
+            #[cfg(test)]
+            without_tile_borders: false,
         })
     }
 
@@ -2231,6 +2238,23 @@ impl TileStore {
             Some(op) => Ok(op),
             None => self.begin_op(),
         }
+    }
+
+    /// The copies of every border vertex of tile `key`, found once
+    /// ([`geom::Topology::tile_border`]), for an edit's border pass.
+    ///
+    /// `None` for a tile holding one of its border vertices twice, whose edits then find each
+    /// vertex's copies one by one. No mesh [`BaseMesh`] accepts has such a tile: only a face
+    /// glued to itself could hold a vertex twice, and a quad that repeats no vertex (which
+    /// [`BaseMesh`] checks) can't share an edge or a corner with itself. The fallback is kept
+    /// rather than made an error, as it is the definition the fast path must match; the tests
+    /// reach it by forcing it.
+    fn tile_border(&self, key: &TileKey) -> Option<TileBorder> {
+        #[cfg(test)]
+        if self.without_tile_borders {
+            return None;
+        }
+        self.mesh.topology().tile_border(key)
     }
 
     /// Bytes the pools hold: whole chunks, never more than the budget.
@@ -4930,7 +4954,8 @@ struct InteriorPass {
 /// # Errors
 ///
 /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`];
-/// [`CacheError::Internal`] for a row outside the tile's interior.
+/// [`CacheError::Internal`] with [`Invariant::CorrectionSlot`] and the slot's own error for a
+/// row outside the tile's interior (the store asks only for interior rows).
 fn update_row(
     view: &mut CorrectionViewMut<'_>,
     j: u32,
@@ -4940,7 +4965,7 @@ fn update_row(
     let row = match error {
         None => Ok(()),
         Some(CorrectionError::NotFinite) => Err(CacheError::Correction(CorrectionError::NotFinite)),
-        Some(_) => Err(Invariant::StaleHandle.into()),
+        Some(e) => Err(Invariant::CorrectionSlot(e).into()),
     };
     (wrote, row)
 }
@@ -5290,7 +5315,7 @@ impl TileEdit<'_> {
         {
             return Err(e);
         }
-        let border = match self.store.mesh.topology().tile_border(&self.key) {
+        let border = match self.store.tile_border(&self.key) {
             Some(copies) => Some((self.border_values()?, copies)),
             None => None,
         };

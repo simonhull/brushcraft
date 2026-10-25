@@ -2355,6 +2355,10 @@ fn border_values_are_found_where_border_order_put_them() {
     }
 }
 
+/// Updating tiles together ([`TileStore::update_tiles`]) is the same as updating each in turn.
+///
+/// The same bits, dirty set and feed, whatever the workers, and with or without the tiles'
+/// [`TileBorder`]s (the fallback no valid mesh reaches, forced on one store).
 #[test]
 fn updating_tiles_equals_updating_each_in_turn() {
     let dir = TestDir::new();
@@ -2366,12 +2370,15 @@ fn updating_tiles_equals_updating_each_in_turn() {
         .filter(|&(n, _)| n != 5)
         .map(|(_, &k)| k)
         .collect();
-    let mut stores: Vec<(String, TileStore)> = [None, Some(1), Some(2), Some(5)]
+    // The last store's border passes find each vertex's copies one by one, as for a tile with
+    // no `TileBorder`.
+    let mut stores: Vec<(String, TileStore)> = [None, Some(1), Some(2), Some(5), Some(3)]
         .into_iter()
         .map(|threads| {
             let name = format!("{threads:?}");
             let config = roomy().with_workers(threads.map_or(Workers::PhysicalCores, fixed));
-            let store = new_store(&dir, &format!("{name}.bcp"), &mesh, config);
+            let mut store = new_store(&dir, &format!("{name}.bcp"), &mesh, config);
+            store.without_tile_borders = threads == Some(3);
             (name, store)
         })
         .collect();
@@ -3788,4 +3795,82 @@ fn a_tile_not_held_is_named_as_such() {
         matches!(held_index(&held, &key), Err(Invariant::NotHeld(k)) if k == key),
         "names the tile"
     );
+}
+
+/// A row the interior pass shouldn't reach is reported as the slot's own error.
+///
+/// The cause is kept: a row on the border, or past the tile.
+#[test]
+fn an_interior_row_outside_the_interior_keeps_its_cause() {
+    let side = 9;
+    let mut slot = CorrectionSlot::from_tile(&CorrectionTile::zero(side).unwrap());
+    let mut view = slot.view_mut().unwrap();
+    let mut f = |_, _, c: Vec3| Some(c + Vec3::new(0.0, 0.001, 0.0));
+    for j in [0, side - 1, side] {
+        let (wrote, row) = update_row(&mut view, j, &mut f);
+        assert!(!wrote, "row {j}: nothing written");
+        assert!(
+            matches!(
+                row,
+                Err(CacheError::Internal(Invariant::CorrectionSlot(
+                    CorrectionError::OutOfTile { .. }
+                )))
+            ),
+            "row {j}: {row:?}"
+        );
+    }
+    let (wrote, row) = update_row(&mut view, 1, &mut f);
+    assert!(wrote && row.is_ok(), "an interior row is written: {row:?}");
+}
+
+/// A tile whose parents the dependency graph doesn't record counts as moved by a coarser edit.
+///
+/// Such a tile is an untracked node (see [`crate::deps`]): its kept prediction goes, and it is
+/// predicted again from its parents' new positions.
+///
+/// The store records every tile's parents before they can leave the graph, so the test loses
+/// the graph by hand: it is replaced by one where the brushed tile is known only as the parent
+/// of a finer tile.
+#[test]
+fn a_tile_with_unrecorded_parents_loses_its_kept_prediction() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (keys, around) = brushed_tiles(&mesh);
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy());
+    brush_rounds(&mut store, &keys, &around, true);
+    let key = keys[0];
+    assert!(store.kept.get(&key).is_some(), "brushed: a prediction kept");
+    let pins = store.pin(&[key]).unwrap();
+    let parent = *store.deps.parents(&key).unwrap().first().unwrap();
+    let child =
+        TileKey::displacement(key.face(), level(TOP + 1), 2 * key.tx(), 2 * key.ty()).unwrap();
+    store.deps = DepGraph::new();
+    store.deps.record_positions(child, &[key]);
+    assert!(
+        store.deps.parents(&key).is_none() && store.deps.has_untracked(),
+        "the tile is untracked"
+    );
+    store.begin_op().unwrap();
+    store
+        .edit_tile(parent, |edit| {
+            edit.update(|_, _, c| Some(Vec3::new(c.x + 0.004, c.y, c.z - 0.003)))
+        })
+        .unwrap()
+        .unwrap();
+    assert!(store.kept.get(&key).is_none(), "its kept prediction went");
+    let again: Vec<u32> = store
+        .evaluate(key)
+        .unwrap()
+        .iter()
+        .flat_map(|p| p.to_bits())
+        .collect();
+    drop(pins);
+    store.evict_all().unwrap();
+    let fresh: Vec<u32> = store
+        .evaluate(key)
+        .unwrap()
+        .iter()
+        .flat_map(|p| p.to_bits())
+        .collect();
+    assert!(again == fresh, "predicted from the parent's new positions");
 }
