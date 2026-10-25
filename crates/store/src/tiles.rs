@@ -3494,7 +3494,9 @@ impl TileStore {
     /// correction floor (one chunk, see [`TileStore::make_room`]) and the chunks its pinned
     /// slots, which can't go, and its dirty ones, which go only after a write, fill. Those are
     /// counted as if packed into chunks, not by the chunks they sit in: where a tile sits
-    /// depends on when prefetched tiles were installed, and the count must not.
+    /// depends on when prefetched tiles were installed, and the count must not. What the
+    /// evaluated pool reaches is whole chunks and, in the room below a whole one, the short chunk
+    /// it would map there ([`Pool::short_slots`]).
     ///
     /// It depends on the budget and the counts of pinned and dirty slots alone, never on the
     /// thread count or where tiles sit, so the batches, like the rounds, are the same whatever
@@ -3504,8 +3506,11 @@ impl TileStore {
         let held_chunks = held.div_ceil(self.corrections.per_chunk() as usize);
         let kept = (held_chunks + 1) * self.corrections.chunk_bytes();
         let reachable = self.budget.limit().saturating_sub(kept);
-        let chunks = reachable / self.evaluated.chunk_bytes().max(1);
-        let slots = chunks.saturating_mul(self.evaluated.per_chunk() as usize);
+        let chunk = self.evaluated.chunk_bytes().max(1);
+        let (chunks, rest) = (reachable / chunk, reachable % chunk);
+        let slots = chunks
+            .saturating_mul(self.evaluated.per_chunk() as usize)
+            .saturating_add(self.evaluated.short_slots(rest) as usize);
         let taken = self.evaluated.pinned_slots() + pending + self.headroom.evaluated;
         (slots.saturating_sub(taken) / BATCH_SHARE).clamp(1, MAX_BATCH)
     }

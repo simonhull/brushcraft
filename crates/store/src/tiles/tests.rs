@@ -3892,6 +3892,10 @@ fn the_kept_share_costs_only_its_bytes() {
     let room = 12 * chunk - config.kept_prediction_bytes().unwrap() - 11 * chunk;
     assert_eq!(room / EVAL, 9, "the set-up: room for nine slots");
     let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    // Batches count the short chunk's slots: ten whole chunks besides the correction floor,
+    // and nine slots.
+    let reach = 10 * 16 + 9 - store.headroom.evaluated;
+    assert_eq!(store.batch_size(0), reach / BATCH_SHARE, "batches reach it");
     for key in tiles(&mesh, 1, TOP) {
         store.evaluate(key).unwrap();
     }

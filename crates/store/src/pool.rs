@@ -278,6 +278,11 @@ pub(crate) struct Pool<T: SlotData> {
     per_chunk: u32,
     /// Slot storage; `None` for a chunk given back. Its metadata stays, so generations survive.
     chunks: Vec<Option<Vec<T>>>,
+    /// What the budget was charged for each chunk when it was mapped, given back exactly when
+    /// it goes; zero for a chunk not mapped. Recorded rather than inferred from the storage, as
+    /// a short chunk may hold as many slots as a whole one (whose charge includes the slack
+    /// after its last slot).
+    charges: Vec<usize>,
     /// Per chunk, per slot.
     meta: Vec<Vec<Meta>>,
     /// Free slots of mapped chunks.
@@ -331,6 +336,7 @@ impl<T: SlotData> Pool<T> {
             chunk_bytes,
             per_chunk,
             chunks: Vec::new(),
+            charges: Vec::new(),
             meta: Vec::new(),
             free: Vec::new(),
             index: HashMap::new(),
@@ -420,16 +426,10 @@ impl<T: SlotData> Pool<T> {
             .sum()
     }
 
-    /// What the budget is charged for `chunk`: [`Pool::chunk_bytes`] for a whole chunk, its
-    /// slots' bytes for a short one, nothing if it isn't mapped.
+    /// What the budget was charged for `chunk` when it was mapped: [`Pool::chunk_bytes`] for a
+    /// whole chunk, its slots' bytes for a short one, nothing if it isn't mapped.
     fn charge(&self, chunk: u32) -> usize {
-        match self.chunks.get(chunk as usize) {
-            Some(Some(storage)) if storage.len() < self.per_chunk as usize => {
-                storage.len() * size_of::<T>()
-            }
-            Some(Some(_)) => self.chunk_bytes,
-            _ => 0,
-        }
+        self.charges.get(chunk as usize).copied().unwrap_or(0)
     }
 
     /// `key`'s slot and whether its contents are current, marking it referenced.
@@ -733,10 +733,12 @@ impl<T: SlotData> Pool<T> {
             };
             self.evict_chunk(chunk, &mut write_back)?;
             self.free.retain(|&(c, _)| c != chunk);
-            let charge = self.charge(chunk);
-            if let Some(storage) = self.chunks.get_mut(chunk as usize) {
+            if let (Some(storage), Some(charge)) = (
+                self.chunks.get_mut(chunk as usize),
+                self.charges.get_mut(chunk as usize),
+            ) {
                 *storage = None;
-                budget.give(charge);
+                budget.give(std::mem::take(charge));
             }
         }
         Ok(())
@@ -770,14 +772,19 @@ impl<T: SlotData> Pool<T> {
         let Ok(chunk) = u32::try_from(unmapped.unwrap_or(self.chunks.len())) else {
             return false;
         };
-        let Some(slots) = self.slots_to_map(budget) else {
+        let Some((slots, charge)) = self.slots_to_map(budget) else {
             return false;
         };
         let storage = Some(bytemuck::zeroed_vec(slots as usize));
-        if let Some(place) = self.chunks.get_mut(chunk as usize) {
+        if let (Some(place), Some(charged)) = (
+            self.chunks.get_mut(chunk as usize),
+            self.charges.get_mut(chunk as usize),
+        ) {
             *place = storage;
+            *charged = charge;
         } else {
             self.chunks.push(storage);
+            self.charges.push(charge);
             self.meta
                 .push(vec![Meta::default(); self.per_chunk as usize]);
         }
@@ -787,23 +794,29 @@ impl<T: SlotData> Pool<T> {
         true
     }
 
-    /// How many slots the next chunk holds, its charge taken from `budget`: a whole chunk's if
-    /// the budget has room for one, else, for a pool [`Pool::with_short_chunks`], the whole
-    /// slots the room holds if that is at least half a chunk; `None` if nothing is mapped.
-    fn slots_to_map(&self, budget: &mut Budget) -> Option<u32> {
+    /// How many slots the next chunk holds and what it is charged, the charge taken from
+    /// `budget`: a whole chunk if the budget has room for one, else, for a pool
+    /// [`Pool::with_short_chunks`], the slots [`Pool::short_slots`] finds in the room, charged
+    /// exactly their bytes; `None` if nothing is mapped.
+    fn slots_to_map(&self, budget: &mut Budget) -> Option<(u32, usize)> {
         if budget.try_take(self.chunk_bytes) {
-            return Some(self.per_chunk);
+            return Some((self.per_chunk, self.chunk_bytes));
         }
-        if !self.short_chunks {
-            return None;
-        }
+        let slots = self.short_slots(budget.room());
+        let bytes = slots as usize * size_of::<T>();
+        (slots > 0 && budget.try_take(bytes)).then_some((slots, bytes))
+    }
+
+    /// The slots of a short chunk in `room` bytes, less than a whole chunk: as many whole slots
+    /// as fit (at most a whole chunk's), if that is at least half a chunk and the pool maps
+    /// short chunks ([`Pool::with_short_chunks`]); else zero.
+    pub(crate) fn short_slots(&self, room: usize) -> u32 {
         let size = size_of::<T>().max(1);
-        let slots = (budget.room() / size).min(self.per_chunk as usize);
-        let bytes = slots * size;
-        let half = self.chunk_bytes / 2;
-        (slots > 0 && bytes >= half && budget.try_take(bytes))
-            .then(|| u32::try_from(slots).ok())
-            .flatten()
+        let slots = (room / size).min(self.per_chunk as usize);
+        if !self.short_chunks || slots * size < self.chunk_bytes / 2 {
+            return 0;
+        }
+        u32::try_from(slots).unwrap_or(0)
     }
 
     /// The clock's victim: sweeping from the hand over mapped slots, skipping pinned ones (and
@@ -1632,6 +1645,49 @@ mod tests {
             2 * chunk,
             "without short chunks: whole ones only"
         );
+    }
+
+    /// A short chunk holding as many slots as a whole one is charged its slots' bytes, not the
+    /// whole chunk's.
+    ///
+    /// A chunk size that isn't a whole number of slots leaves slack after a whole chunk's last
+    /// slot; room between those slots' bytes and a whole chunk maps a short chunk of a whole
+    /// chunk's slots. The budget counts exactly what the pool holds through mapping, giving back
+    /// and mapping again.
+    #[test]
+    fn a_short_chunk_of_a_whole_chunks_slots_is_charged_its_slots() {
+        let size = size_of::<Small>();
+        let chunk = 4 * size + 7;
+        let mut pool = Pool::<Small>::new(chunk).with_short_chunks();
+        let mut budget = Budget::new(2 * chunk + 4 * size);
+        let check = |mapped: &Pool<Small>, charged: &Budget, what: &str| {
+            assert_eq!(
+                charged.used(),
+                mapped.bytes(),
+                "{what}: the budget counts the pool"
+            );
+            assert!(
+                charged.used() <= charged.limit(),
+                "{what}: within the limit"
+            );
+        };
+        for round in 0..2 {
+            for n in 0..12 {
+                put(&mut pool, &mut budget, n, 1);
+            }
+            assert_eq!(
+                pool.bytes(),
+                2 * chunk + 4 * size,
+                "round {round}: two whole chunks and a short one of four slots"
+            );
+            check(&pool, &budget, &format!("round {round}: mapped"));
+            pool.shrink_to(&mut budget, chunk + 4 * size, no_write_back)
+                .unwrap();
+            check(&pool, &budget, &format!("round {round}: one given back"));
+            pool.shrink_to(&mut budget, 0, no_write_back).unwrap();
+            check(&pool, &budget, &format!("round {round}: all given back"));
+            assert_eq!(budget.used(), 0, "round {round}: nothing left charged");
+        }
     }
 
     #[test]
