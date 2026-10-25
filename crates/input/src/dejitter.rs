@@ -636,6 +636,9 @@ fn quarter_slope(points: &VecDeque<Point>, guess: f64) -> Option<f64> {
     Some(period)
 }
 
+/// The filter against simulated pens. The `#[ignore]`d tests are reports, not checks: they print
+/// measurements, assert nothing, and are run by hand (`cargo nextest run -p input --run-ignored
+/// only -- report`).
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
@@ -1707,5 +1710,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Outputs stay between the previous output and the receipt.
+    ///
+    /// For any monotone receipts (steps of `0..=65_535` µs) with strokes ended anywhere, every
+    /// output is no later than its receipt and no earlier than the output before it, and the
+    /// period is unknown or positive.
+    #[test]
+    fn outputs_stay_between_the_last_output_and_the_receipt() {
+        bolero::check!()
+            .with_type::<Vec<(u16, bool)>>()
+            .for_each(|steps| {
+                let mut filter = Dejitter::new();
+                let mut received = Instant::now();
+                let mut last: Option<Instant> = None;
+                for (n, &(delta_us, end_stroke)) in steps.iter().enumerate() {
+                    received += Duration::from_micros(delta_us.into());
+                    let out = filter.push(received);
+                    assert!(out <= received, "step {n}: after its receipt");
+                    assert!(last.is_none_or(|last| out >= last), "step {n}: went back");
+                    last = Some(out);
+                    if end_stroke {
+                        filter.end_stroke();
+                    }
+                    let period = filter.period();
+                    assert!(
+                        period.is_none_or(|p| p > Duration::ZERO),
+                        "step {n}: {period:?}"
+                    );
+                }
+            });
     }
 }

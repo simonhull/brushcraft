@@ -265,6 +265,69 @@ mod tests {
         assert!(feed.last.is_empty(), "drained entries leave no trace");
     }
 
+    /// A small deterministic generator (`SplitMix64`), so failures replay.
+    struct Rng(u64);
+
+    impl Rng {
+        /// The next number below `n`.
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) % n
+        }
+    }
+
+    /// Drains match a model through random interleavings.
+    ///
+    /// Random interleavings of subscribes, unsubscribes, pushes over 8 keys and 3 ops, and
+    /// drains, against an oracle per consumer: the latest op of each key pushed since its last
+    /// drain. Every drain must report exactly the oracle's entries, each key once.
+    #[test]
+    fn drains_match_a_model_through_random_interleavings() {
+        use std::collections::BTreeMap;
+
+        for seed in 0..64 {
+            let mut rng = Rng(seed);
+            let mut feed = ChangeFeed::new();
+            // Per consumer ever subscribed: its id, and its oracle while subscribed (`None`
+            // once unsubscribed: it reads nothing).
+            let mut consumers: Vec<(ConsumerId, Option<BTreeMap<TileKey, OpId>>)> = Vec::new();
+            for step in 0..2_000 {
+                let any = rng.below(consumers.len().max(1) as u64);
+                let picked = consumers.get_mut(usize::try_from(any).unwrap());
+                match (rng.below(10), picked) {
+                    (0, _) => consumers.push((feed.subscribe(), Some(BTreeMap::new()))),
+                    (1, Some((id, oracle))) => {
+                        feed.unsubscribe(*id);
+                        *oracle = None;
+                    }
+                    (2..=5, Some((id, oracle))) => {
+                        let got = feed.drain(*id);
+                        let as_set: BTreeMap<TileKey, OpId> = got.iter().copied().collect();
+                        assert_eq!(
+                            as_set.len(),
+                            got.len(),
+                            "seed {seed} step {step}: once each"
+                        );
+                        let want = oracle.as_mut().map(std::mem::take).unwrap_or_default();
+                        assert_eq!(as_set, want, "seed {seed} step {step}: drain of {id:?}");
+                        assert!(!feed.has_pending(*id), "seed {seed} step {step}: drained");
+                    }
+                    _ => {
+                        let pushed = key(u32::try_from(rng.below(8)).unwrap());
+                        let op = OpId::new(0, rng.below(3)).unwrap();
+                        feed.push(pushed, op);
+                        for oracle in consumers.iter_mut().filter_map(|(_, o)| o.as_mut()) {
+                            oracle.insert(pushed, op);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn no_consumers_keep_nothing() {
         let mut feed = ChangeFeed::new();

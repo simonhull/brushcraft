@@ -489,4 +489,46 @@ mod tests {
         assert_eq!(button_bit(0x149), Some(Buttons::TERTIARY));
         assert_eq!(button_bit(0x110), None, "BTN_LEFT isn't a barrel button");
     }
+
+    /// From a hovering tool, any sequence of `Down`, `Up`, `Motion`, `Pressure`, `Frame` and
+    /// `ProximityOut` events emits no `Drag` after an `Up` or `Leave` without a `Down` between.
+    /// Each step is `(event choice, x, y, pressure)`.
+    #[test]
+    fn no_drag_without_a_down_after_an_up_or_leave() {
+        bolero::check!()
+            .with_type::<Vec<(u8, f64, f64, u16)>>()
+            .for_each(|steps| {
+                let start = Instant::now();
+                let mut tool = hovering();
+                let mut emitted = Vec::new();
+                for (n, &(choice, x, y, pressure)) in steps.iter().enumerate() {
+                    let event = match choice % 6 {
+                        0 => E::Down {
+                            serial: u32::from(choice),
+                        },
+                        1 => E::Up,
+                        2 => E::Motion { x, y },
+                        3 => E::Pressure {
+                            pressure: pressure.into(),
+                        },
+                        4 => E::ProximityOut,
+                        _ => E::Frame {
+                            time: u32::try_from(n).unwrap_or(u32::MAX),
+                        },
+                    };
+                    let received = start + std::time::Duration::from_millis(n.try_into().unwrap());
+                    emitted.extend(phases(&tool.apply(event, received)));
+                }
+                // Hovering: no stroke is open until a `Down`.
+                let mut open = false;
+                for (n, phase) in emitted.iter().enumerate() {
+                    match phase {
+                        Phase::Down => open = true,
+                        Phase::Up | Phase::Leave => open = false,
+                        Phase::Drag => assert!(open, "a drag without a down at {n}: {emitted:?}"),
+                        Phase::Enter | Phase::Hover => {}
+                    }
+                }
+            });
+    }
 }

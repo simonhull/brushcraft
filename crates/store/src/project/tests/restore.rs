@@ -426,3 +426,46 @@ fn a_damaged_recovery_file_is_listed_damaged_and_not_restored() {
     assert_not_restorable(&dir, &candidate, CandidateStatus::Damaged);
     assert_eq!(fs::read(&path).unwrap(), bytes, "left as it is");
 }
+
+/// A never-saved project's recovery file, dropped as a crash would leave it, with a stroke of
+/// `seed`. Returns its path.
+fn never_saved_and_dropped(dir: &TestDir, seed: u64) -> PathBuf {
+    let mut project = Project::new((*mesh()).clone(), config(dir)).unwrap();
+    stroke(&mut project, &mut CorrectionMap::new(), 40, seed);
+    let path = project.recovery_path().unwrap().to_path_buf();
+    drop(project);
+    path
+}
+
+/// Restoring `candidate` fails because another file is under its path.
+fn assert_candidate_changed(dir: &TestDir, candidate: &RecoveryCandidate) {
+    match Project::restore(candidate, config(dir)) {
+        Err(ProjectError::CandidateChanged) => {}
+        other => panic!("restoring {candidate:?}: {other:?}"),
+    }
+}
+
+#[test]
+fn a_never_saved_candidate_replaced_by_another_project_s_file_has_changed() {
+    let dir = TestDir::new();
+    let mine = never_saved_and_dropped(&dir, 60);
+    let candidate = only(&dir);
+    assert_eq!(candidate.status, CandidateStatus::NeverSaved, "the set-up");
+    let other = never_saved_and_dropped(&dir, 61);
+    fs::rename(&other, &mine).unwrap();
+    assert_candidate_changed(&dir, &candidate);
+    assert!(mine.exists(), "kept");
+}
+
+#[test]
+fn a_restorable_candidate_replaced_by_another_project_s_file_has_changed() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    saved_and_dropped(&dir, &path, 70);
+    let candidate = only(&dir);
+    assert_eq!(candidate.status, CandidateStatus::Restorable, "the set-up");
+    let other = never_saved_and_dropped(&dir, 71);
+    fs::rename(&other, &candidate.path).unwrap();
+    assert_candidate_changed(&dir, &candidate);
+    assert!(candidate.path.exists(), "kept");
+}

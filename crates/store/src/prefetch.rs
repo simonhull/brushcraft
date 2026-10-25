@@ -348,3 +348,153 @@ impl Worker {
         }
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use geom::{CorrectionTile, FaceId, Level, Vec3};
+
+    use super::*;
+    use crate::fixture::{mesh, meta};
+    use crate::test_dir::TestDir;
+
+    /// How long a test waits for the workers before it fails.
+    const PATIENCE: Duration = Duration::from_secs(30);
+
+    /// The one tile the tests prefetch.
+    fn key() -> TileKey {
+        TileKey::displacement(FaceId::new(1), Level::new(9).unwrap(), 0, 0).unwrap()
+    }
+
+    /// A full-size tile of values made from `seed`.
+    fn tile(seed: f32) -> CorrectionTile {
+        let values: Vec<Vec3> = (0..65 * 65u16)
+            .map(|k| Vec3::new(0.0, seed, seed * f32::from(k % 7)))
+            .collect();
+        CorrectionTile::from_values(65, &values).unwrap()
+    }
+
+    /// Writes the tile again into `file` with op `seq`, and returns the job of its new record.
+    fn write(file: &mut ProjectFile, seq: u8) -> Job {
+        let op = OpId::new(0, seq.into()).unwrap();
+        file.write_displacement(key(), op, &tile(seq.into()))
+            .unwrap();
+        let loc = file.locate(&key()).unwrap();
+        Job {
+            key: key(),
+            source: Source::Working,
+            loc,
+        }
+    }
+
+    /// Jobs waiting in the queue, not yet taken by a worker.
+    fn waiting(prefetch: &Prefetcher) -> usize {
+        prefetch.shared.lock().jobs.len()
+    }
+
+    /// Waits until a worker has taken every waiting job.
+    fn until_taken(prefetch: &Prefetcher) {
+        let deadline = Instant::now() + PATIENCE;
+        while waiting(prefetch) > 0 {
+            assert!(Instant::now() < deadline, "the workers never took the job");
+            thread::yield_now();
+        }
+    }
+
+    /// Waits for the next result.
+    fn next_result(prefetch: &mut Prefetcher) -> Fetched {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            if let Some(fetched) = prefetch.next() {
+                return fetched;
+            }
+            assert!(Instant::now() < deadline, "no result arrived");
+            thread::yield_now();
+        }
+    }
+
+    /// A key asked for again at the same location, while its job still waits, is neither new
+    /// nor queued twice.
+    #[test]
+    fn a_waiting_key_asked_again_at_its_location_is_queued_once() {
+        let dir = TestDir::new();
+        let mut file = ProjectFile::create(&dir.path("p.bcrf"), meta(), mesh()).unwrap();
+        let at_a = write(&mut file, 1);
+        let mut prefetch = Prefetcher::new();
+        prefetch.pause(true);
+        assert_eq!(prefetch.request(&file, None, &[at_a]).unwrap(), 1, "new");
+        assert_eq!(
+            prefetch.request(&file, None, &[at_a]).unwrap(),
+            0,
+            "not new again"
+        );
+        assert_eq!(waiting(&prefetch), 1, "queued once");
+        assert_eq!(prefetch.pending(), 1, "pending once");
+        prefetch.pause(false);
+        assert_eq!(next_result(&mut prefetch).job, at_a, "read once");
+        assert_eq!(prefetch.pending(), 0, "and forgotten");
+    }
+
+    /// A key a worker is reading already, asked for again at the same location, is left to that
+    /// read: neither new nor queued.
+    #[test]
+    fn a_key_being_read_asked_again_at_its_location_is_not_queued() {
+        let dir = TestDir::new();
+        let mut file = ProjectFile::create(&dir.path("p.bcrf"), meta(), mesh()).unwrap();
+        let at_a = write(&mut file, 1);
+        let mut prefetch = Prefetcher::new();
+        assert_eq!(prefetch.request(&file, None, &[at_a]).unwrap(), 1, "new");
+        until_taken(&prefetch);
+        prefetch.pause(true);
+        assert_eq!(
+            prefetch.request(&file, None, &[at_a]).unwrap(),
+            0,
+            "being read"
+        );
+        assert_eq!(waiting(&prefetch), 0, "not queued again");
+        prefetch.pause(false);
+        assert_eq!(next_result(&mut prefetch).job, at_a, "the one read");
+        assert_eq!(prefetch.pending(), 0, "forgotten");
+    }
+
+    /// A key asked for at a new location is new; the result of its read at the old location,
+    /// arriving after, is stale and leaves the key pending at the new one.
+    #[test]
+    fn a_stale_result_does_not_forget_a_key_asked_for_at_a_new_location() {
+        let dir = TestDir::new();
+        let mut file = ProjectFile::create(&dir.path("p.bcrf"), meta(), mesh()).unwrap();
+        let at_a = write(&mut file, 1);
+        let mut prefetch = Prefetcher::new();
+        assert_eq!(
+            prefetch.request(&file, None, &[at_a]).unwrap(),
+            1,
+            "new at A"
+        );
+        until_taken(&prefetch);
+        prefetch.pause(true);
+        let at_b = write(&mut file, 2);
+        assert_ne!(at_a.loc, at_b.loc, "the set-up: the record moved");
+        assert_eq!(
+            prefetch.request(&file, None, &[at_b]).unwrap(),
+            1,
+            "new at B"
+        );
+        assert_eq!(
+            next_result(&mut prefetch).job,
+            at_a,
+            "the read at A arrives"
+        );
+        assert_eq!(prefetch.pending(), 1, "still pending");
+        assert_eq!(
+            prefetch.request(&file, None, &[at_b]).unwrap(),
+            0,
+            "pending at B"
+        );
+        assert_eq!(waiting(&prefetch), 1, "the job at B, once");
+        prefetch.pause(false);
+        assert_eq!(next_result(&mut prefetch).job, at_b, "the read at B");
+        assert_eq!(prefetch.pending(), 0, "forgotten once the read at B is in");
+    }
+}

@@ -15,6 +15,7 @@ use geom::{
 };
 
 use super::*;
+use crate::MAX_SEQ;
 use crate::fixture::meta_for;
 use crate::test_dir::TestDir;
 
@@ -4003,4 +4004,45 @@ fn the_kept_share_costs_only_its_bytes() {
         "every whole chunk and a short one of nine slots"
     );
     assert!(store.bytes() <= pools(&config), "within the pools' share");
+}
+
+/// With no head of its site, a store's ops start at sequence 0, whatever other sites' heads.
+#[test]
+fn ops_start_at_zero_without_a_head_of_the_site() {
+    let zero = OpId::new(SITE, 0).unwrap();
+    assert_eq!(first_op(SITE, []).unwrap(), zero, "no heads");
+    assert_eq!(first_op(SITE, [None, None]).unwrap(), zero, "no edits");
+    let others = [OpId::new(SITE + 1, 900), OpId::new(SITE - 1, 5)];
+    assert_eq!(first_op(SITE, others).unwrap(), zero, "other sites");
+}
+
+/// Ops start past the newest head of the site, ignoring other sites' heads, however much newer.
+#[test]
+fn ops_start_past_the_newest_head_of_the_site_only() {
+    let heads = [
+        OpId::new(SITE, 7),
+        None,
+        OpId::new(SITE + 1, MAX_SEQ),
+        OpId::new(SITE, 41),
+        OpId::new(SITE, 3),
+    ];
+    let next = OpId::new(SITE, 42).unwrap();
+    assert_eq!(first_op(SITE, heads).unwrap(), next, "past 41");
+}
+
+/// A head at the last sequence of the site leaves no op to start at.
+#[test]
+fn a_head_at_the_last_op_of_the_site_exhausts_its_ops() {
+    let heads = [OpId::new(SITE, 1), OpId::new(SITE, MAX_SEQ)];
+    assert!(
+        matches!(first_op(SITE, heads), Err(CacheError::OpsExhausted)),
+        "the last sequence"
+    );
+    let below = [OpId::new(SITE, MAX_SEQ - 1)];
+    let last = OpId::new(SITE, MAX_SEQ).unwrap();
+    assert_eq!(
+        first_op(SITE, below).unwrap(),
+        last,
+        "the last op is still given"
+    );
 }
