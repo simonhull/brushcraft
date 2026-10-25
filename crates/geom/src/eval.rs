@@ -442,6 +442,9 @@ pub(crate) fn parent_region(region: Region) -> Result<Region, EvalError> {
 /// Predicts `region` (level ≥ 1) from the parent level's positions in `src`, with each vertex's
 /// tangent frame.
 ///
+/// Positions come from `src` unchecked: a parent position that isn't finite gives non-finite
+/// predictions near it and NaN frames, not an error (nor a panic, in any build).
+///
 /// # Errors
 ///
 /// [`EvalError::LevelZero`] for a level-0 region, [`EvalError::NoExactParent`] for a region that
@@ -987,6 +990,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The base mesh's positions, with every face's vertex `(0, 0)` not a number.
+    struct Poisoned<'a>(&'a BaseMesh);
+
+    impl PositionSource for Poisoned<'_> {
+        fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+            if (i, j) == (0, 0) {
+                return Some(Vec3::new(f32::NAN, 0.0, 0.0));
+            }
+            self.0.position(face, level, i, j)
+        }
+    }
+
+    /// A source with a position that isn't finite gives a prediction with NaN frames, not an
+    /// error, and not a panic: this runs in the debug test profile, where a debug assertion
+    /// would fire.
+    #[test]
+    fn non_finite_source_positions_give_nan_frames_not_a_panic() {
+        let mesh = cube_sphere(1).unwrap();
+        let region = Region::whole_face(FaceId::new(2), level(1));
+        let prediction = predict_region(&mesh, &Poisoned(&mesh), region).unwrap();
+        let side = region.quads() + 1;
+        let frames: Vec<Frame> = (0..side)
+            .flat_map(|j| (0..side).map(move |i| (i, j)))
+            .map(|(i, j)| prediction.frame(i, j).unwrap())
+            .collect();
+        assert!(
+            frames.iter().any(|f| !f.n().is_finite()),
+            "a non-finite input shows in a frame"
+        );
     }
 
     #[test]

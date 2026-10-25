@@ -555,6 +555,9 @@ fn place<T>(places: &[usize], values: impl Iterator<Item = T>, out: &mut [T]) {
 /// The vertices strictly inside the face go a row's run at a time through [`FrameRows`]; the
 /// rest (on the face's border, where the owner's axes or a base vertex's ring apply) are
 /// collected and go through it together at the end.
+///
+/// Vertices whose inputs aren't finite get [`Frame::NAN`], as [`normals`] passes such input
+/// through: positions come from a source, so this is not asserted.
 pub(crate) fn frames(
     block: &Block<'_>,
     predicted: &Padded,
@@ -578,10 +581,6 @@ pub(crate) fn frames(
         }
     }
     scattered.frames_into(&mut rows, &mut out);
-    debug_assert!(
-        out.iter().all(|f| f.n.is_finite()),
-        "frame inputs of {block:?} are not finite"
-    );
     out
 }
 
