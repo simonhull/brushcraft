@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
 # rustfmt from the pinned nightly, for the unstable options in rustfmt.toml. Selected via RUSTFMT in mise.toml.
-exec rustup run "${BRUSHCRAFT_NIGHTLY:?run through mise so BRUSHCRAFT_NIGHTLY is set}" rustfmt "$@"
+# Outside mise (an editor launched from the desktop), read the pinned nightly from mise.toml.
+nightly=${BRUSHCRAFT_NIGHTLY:-$(sed -n 's/^BRUSHCRAFT_NIGHTLY = "\(.*\)"$/\1/p' "$(dirname "$0")/../mise.toml")}
+exec rustup run "${nightly:?BRUSHCRAFT_NIGHTLY not found in mise.toml}" rustfmt "$@"
