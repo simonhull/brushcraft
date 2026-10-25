@@ -10,9 +10,11 @@ if they disagree, raise it rather than drifting silently.
 - Workspace lints in the root `Cargo.toml` are the standard, and `clippy.toml` applies them to public and
   private items alike. Don't weaken them; a local
   `#[expect(lint, reason = "…")]` needs a real reason (`#[allow]` is denied).
-- `unsafe_code` is denied workspace-wide. A crate that needs it overrides the lint in its own manifest with a
-  justification, every block carries a `// SAFETY:` proof, and it is tested under `cargo +nightly miri test`.
-- `geom`, `store` and `sculpt` stay headless: no GPU or windowing dependencies.
+- `unsafe_code` is denied workspace-wide. Where FFI needs it, allow it at the narrowest scope with
+  `#[expect(unsafe_code, reason = "…")]`; every block carries a `// SAFETY:` proof. Pure-Rust `unsafe` must also
+  pass `cargo +$BRUSHCRAFT_NIGHTLY miri test` for its crate. FFI can't run under Miri, so it is covered by review
+  and the integration tests.
+- `geom`, `store`, `brush` and `sculpt` stay headless: no GPU or windowing dependencies.
 - Dependencies point downward only (see the crate table in the architecture spec). Add third-party crates
   through `[workspace.dependencies]`.
 - Performance claims need a `divan` benchmark before and after. Profile with `samply` before optimizing.
