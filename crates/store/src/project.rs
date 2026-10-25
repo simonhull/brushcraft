@@ -408,6 +408,10 @@ pub struct Project {
     /// this kind (see [`Unplaced::crash`]).
     #[cfg(test)]
     fail_next_recovery: Option<io::ErrorKind>,
+    /// Test hook: makes the directory sync after the next save as moves its new file into
+    /// place fail, with an I/O error (see [`Project::write_new_project`]).
+    #[cfg(test)]
+    fail_dir_sync: bool,
     /// Test record: each directory [`Project::strand`] tried a scratch file in, in order, and
     /// whether the store moved onto it there.
     #[cfg(test)]
@@ -657,6 +661,8 @@ impl Project {
             #[cfg(test)]
             fail_next_recovery: None,
             #[cfg(test)]
+            fail_dir_sync: false,
+            #[cfg(test)]
             strand_tries: Vec::new(),
         })
     }
@@ -712,9 +718,11 @@ impl Project {
     /// project file, path and id. [`ProjectError::Exists`] if `path` names a file already, or
     /// does by the time the new file is to be moved there (it is removed then);
     /// [`ProjectError::Store`] or [`ProjectError::Cache`] if creating or writing the new file
-    /// fails (the temporary file is removed); [`ProjectError::Io`] if the rename does;
-    /// [`ProjectError::Cache`] from installing prefetched tiles. As [`Project::save`] once the
-    /// new file is in place: the project goes on with the old one then.
+    /// fails (the temporary file is removed); [`ProjectError::Io`] if the rename does, or the
+    /// directory's sync after it (the new file is removed from `path` then, best effort, so a
+    /// retry finds the path free); [`ProjectError::Cache`] from installing prefetched tiles. As
+    /// [`Project::save`] once the new file is in place and durable: the project goes on with
+    /// the old one then.
     pub fn save_as(&mut self, path: &Path) -> Result<SaveOutcome, ProjectError> {
         let path = std::path::absolute(path)?;
         if fs::symlink_metadata(&path).is_ok() {
@@ -751,6 +759,9 @@ impl Project {
     /// Fills `project`, the new file being written at `tmp`, with the last save point's tiles
     /// and the edits since, saves it, and renames it to `path`.
     ///
+    /// If the directory can't be synced after the rename, the file is removed from `path`
+    /// again: the project doesn't adopt it, so it mustn't be left there looking saved.
+    ///
     /// # Errors
     ///
     /// As [`Project::save_as`].
@@ -771,7 +782,18 @@ impl Project {
                 e.into()
             }
         })?;
-        sync_parent(path)?;
+        let synced = sync_parent(path);
+        #[cfg(test)]
+        let synced = if std::mem::take(&mut self.fail_dir_sync) {
+            Err(io::Error::other("a directory sync failing, for the test").into())
+        } else {
+            synced
+        };
+        if let Err(e) = synced {
+            // Best effort: the error at hand is the one to report.
+            drop(fs::remove_file(path));
+            return Err(e.into());
+        }
         Ok(saved)
     }
 
@@ -1456,6 +1478,12 @@ impl Project {
     /// ([`io::ErrorKind::StorageFull`]), say.
     pub(crate) const fn fail_next_recovery_with(&mut self, kind: io::ErrorKind) {
         self.fail_next_recovery = Some(kind);
+    }
+
+    /// Makes the directory sync after the next save as moves its new file into place fail, as
+    /// a sync that fails after the rename would.
+    pub(crate) const fn fail_dir_sync(&mut self) {
+        self.fail_dir_sync = true;
     }
 
     /// Each directory [`Project::strand`] has tried a scratch file in, in order, and whether

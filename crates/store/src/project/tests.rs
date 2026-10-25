@@ -226,6 +226,43 @@ fn a_save_starts_an_empty_recovery_file_on_its_save_point() {
     assert!(recovery.exists(), "kept when asked");
 }
 
+/// A save as whose directory sync fails after the move removes the new file again.
+///
+/// Nothing is left at the path that the project didn't adopt, so the project goes on with its
+/// old file, and a retry finds the path free.
+#[test]
+fn a_save_as_whose_directory_sync_fails_leaves_nothing_at_the_path() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (old, target) = (dir.path("old.bcrf"), dir.path("new.bcrf"));
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 81);
+    assert_saved(project.save_as(&old));
+    let old_id = project.id();
+    stroke(&mut project, &mut map, 60, 82);
+
+    project.fail_dir_sync();
+    assert!(
+        matches!(
+            project.save_as(&target),
+            Err(ProjectError::Store(StoreError::Io(_)))
+        ),
+        "the sync's error"
+    );
+    assert!(!target.exists(), "nothing left at the path");
+    assert_eq!(project.id(), old_id, "still the old project");
+    assert_saved(project.save());
+    let saved = map.clone();
+
+    stroke(&mut project, &mut map, 60, 83);
+    assert_saved(project.save_as(&target));
+    assert_ne!(project.id(), old_id, "a new id");
+    project.close(false).unwrap();
+    assert_project_file(&old, &saved, "the save went to its old path");
+    assert_project_file(&target, &map, "the retry");
+}
+
 #[test]
 fn save_as_gives_a_new_id_and_leaves_the_old_file_untouched() {
     let dir = TestDir::new();
