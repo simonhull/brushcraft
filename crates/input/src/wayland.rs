@@ -42,9 +42,10 @@ use crate::{Event, PadEventKind, Phase, SurfaceId};
 const QUEUE_CAPACITY: usize = 1024;
 
 impl Droppable for Event {
-    /// Motion is droppable: a pen `Hover` or `Drag` sample, a ring or strip moving, a dial
-    /// turning. A pen phase change, a pad button, or a finger lifting off a ring or strip is a
-    /// state change and is not.
+    /// Motion that a later event supersedes is droppable: a pen `Hover` or `Drag` sample, a ring
+    /// or strip moving to an absolute position. A pen phase change, a pad button, a finger lifting
+    /// off a ring or strip, or a dial turn is not: a dial reports relative turns, so dropping one
+    /// would silently lose rotation.
     fn droppable(&self) -> bool {
         match self {
             Self::Sample(sample) => match sample.phase {
@@ -54,8 +55,7 @@ impl Droppable for Event {
             Self::Pad(pad) => match pad.kind {
                 PadEventKind::Ring { angle, .. } => angle.is_some(),
                 PadEventKind::Strip { position, .. } => position.is_some(),
-                PadEventKind::Dial { .. } => true,
-                PadEventKind::Button { .. } => false,
+                PadEventKind::Dial { .. } | PadEventKind::Button { .. } => false,
             },
         }
     }
@@ -635,6 +635,88 @@ impl Dispatch<ZwpTabletV2, ()> for State {
         if matches!(event, zwp_tablet_v2::Event::Removed) {
             state.tablets.remove(&proxy.id());
             proxy.destroy();
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "test code may panic")]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::{Buttons, ControlId, PadEvent, Position, StrokeSample, Tool, Unit};
+
+    /// A pen sample in `phase`.
+    fn sample(phase: Phase) -> Event {
+        let now = Instant::now();
+        Event::Sample(StrokeSample {
+            phase,
+            tool: Tool::default(),
+            surface: SurfaceId::from_raw(0x1000),
+            pos: Position::default(),
+            pressure: Unit::ZERO,
+            distance: None,
+            tilt: None,
+            roll: None,
+            buttons: Buttons::default(),
+            timestamp: now,
+            received: now,
+            device_ms: 0,
+            predicted: false,
+        })
+    }
+
+    /// A pad event of `kind`.
+    fn pad(kind: PadEventKind) -> Event {
+        Event::Pad(PadEvent {
+            received: Instant::now(),
+            kind,
+        })
+    }
+
+    #[test]
+    fn pen_motion_is_droppable_and_phase_changes_are_not() {
+        assert!(sample(Phase::Hover).droppable());
+        assert!(sample(Phase::Drag).droppable());
+        for phase in [Phase::Enter, Phase::Down, Phase::Up, Phase::Leave] {
+            assert!(!sample(phase).droppable(), "{phase:?} must not be dropped");
+        }
+    }
+
+    #[test]
+    fn pad_motion_is_droppable_and_state_changes_are_not() {
+        let control = ControlId::from_raw(1);
+        let ring = PadEventKind::Ring {
+            control,
+            angle: Some(90.0),
+        };
+        let strip = PadEventKind::Strip {
+            control,
+            position: Some(Unit::ONE),
+        };
+        assert!(pad(ring).droppable());
+        assert!(pad(strip).droppable());
+        let essential = [
+            PadEventKind::Ring {
+                control,
+                angle: None,
+            },
+            PadEventKind::Strip {
+                control,
+                position: None,
+            },
+            PadEventKind::Button {
+                index: 0,
+                pressed: false,
+            },
+            PadEventKind::Dial {
+                control,
+                delta: 120,
+            },
+        ];
+        for kind in essential {
+            assert!(!pad(kind).droppable(), "{kind:?} must not be dropped");
         }
     }
 }

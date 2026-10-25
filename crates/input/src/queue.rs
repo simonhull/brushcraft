@@ -126,7 +126,7 @@ impl<T> Events<T> {
     }
 
     /// Events dropped because the queue was full: the consumer fell behind. Only motion (pen
-    /// samples between a stroke's phase changes, ring and strip movement, dial turns) is dropped
+    /// samples between a stroke's phase changes, ring and strip movement) is dropped
     /// this way, keeping room for the state changes around it.
     #[must_use]
     pub fn dropped(&self) -> u64 {
