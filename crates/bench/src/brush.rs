@@ -11,7 +11,7 @@
 //! [`Plan::warm`] evaluates every tile the dabs' spheres reach, positions and normals, so the steps
 //! find their tiles resident and evaluated (as an app's do, the view having drawn them). The index
 //! is loaded from the project's stored bounds, which evaluates nothing, so this warm-up is the
-//! stroke's own (since 38eab39; before, building the index on open warmed it). Before the warm-up,
+//! stroke's own (since cbf4a05; before, building the index on open warmed it). Before the warm-up,
 //! `brush` times one dab where the stroke starts, cold, and reports it beside the warm stroke
 //! (`cold_first_dab_ms`): what a stroke's first dab costs over a region the view hasn't drawn.
 //! What a cold region costs in full is `page-in`'s measure.
