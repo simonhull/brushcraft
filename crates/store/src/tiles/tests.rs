@@ -3874,3 +3874,31 @@ fn a_tile_with_unrecorded_parents_loses_its_kept_prediction() {
         .collect();
     assert!(again == fresh, "predicted from the parent's new positions");
 }
+
+/// The kept predictions' share costs only its own bytes.
+///
+/// The evaluated pool fills the room it leaves below a whole chunk with a short chunk, so the
+/// pools reach the budget less the share, not a whole chunk less.
+#[test]
+fn the_kept_share_costs_only_its_bytes() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let chunk = 16 * EVAL;
+    // Three kept predictions (617,904 bytes) leave room for 9 of a chunk's 16 evaluated slots.
+    let config = StoreConfig::new(12 * chunk, SITE)
+        .with_chunk_bytes(chunk)
+        .with_workers(TEST_THREADS)
+        .with_kept_predictions(3);
+    let room = 12 * chunk - config.kept_prediction_bytes().unwrap() - 11 * chunk;
+    assert_eq!(room / EVAL, 9, "the set-up: room for nine slots");
+    let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    for key in tiles(&mesh, 1, TOP) {
+        store.evaluate(key).unwrap();
+    }
+    assert_eq!(
+        store.bytes(),
+        11 * chunk + 9 * EVAL,
+        "every whole chunk and a short one of nine slots"
+    );
+    assert!(store.bytes() <= pools(&config), "within the pools' share");
+}

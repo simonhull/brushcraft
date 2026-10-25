@@ -156,14 +156,17 @@ use crate::workers::{StartWorkersError, Workers};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StoreConfig {
-    /// Bytes the two pools and the kept predictions may hold together, never exceeded. At least
+    /// Bytes the two pools and the kept predictions may hold together, never exceeded (the kept
+    /// predictions are charged their positions' and frames' allocations; their map entries and
+    /// the allocator's rounding, a few KB at the default count, sit outside it). At least
     /// [`StoreConfig::minimum_budget`] for the store's mesh.
     ///
     /// The kept predictions' share is set aside first, at its worst case
-    /// ([`StoreConfig::kept_prediction_bytes`]), and the pools share the rest. How they share it
-    /// is the store's memory policy (see [`TileStore`]): corrections take evaluated chunks only
-    /// up to a quarter of the whole budget, and never below the evaluated pool's floor, so the
-    /// kept predictions' share comes out of what the evaluated cache can grow to.
+    /// ([`StoreConfig::kept_prediction_bytes`]), and the pools share the rest, the evaluated
+    /// pool filling the room below a whole chunk with a short one, so the share costs only its
+    /// own bytes. How the pools share it is the store's memory policy (see [`TileStore`]):
+    /// corrections take evaluated chunks only up to a quarter of the pools' share (the budget less
+    /// the kept predictions'), and never below the evaluated pool's floor.
     ///
     /// The evaluation scratch (about 3 MB), the read buffers, the workers' own allocations (a
     /// few hundred KB each at most) and the thread stacks (2 MiB reserved per worker) sit
@@ -774,10 +777,11 @@ struct EvalLog {
 /// 1. a free correction slot, or a new chunk if the budget allows one;
 /// 2. the slot of a clean correction tile, the clock's pick: it is read again if it is wanted;
 /// 3. an evaluated chunk taken back, while the correction pool holds less than a quarter of the
-///    budget and the evaluated pool keeps its floor without that chunk (the chunks one evaluation
-///    pins, see [`StoreConfig::minimum_budget`], plus one for the cache). Of the evaluated chunks
-///    without a pin, the one with the fewest tiles in use goes (current, or referenced since the
-///    clock last passed); its tiles are recomputed when next wanted;
+///    pools' share (the budget less the kept predictions') and the evaluated pool keeps its floor
+///    without that chunk (the chunks one evaluation pins, see [`StoreConfig::minimum_budget`], plus
+///    one for the cache). Of the evaluated chunks without a pin, the one with the fewest tiles in
+///    use goes (current, or referenced since the clock last passed); its tiles are recomputed when
+///    next wanted;
 /// 4. the slot of one dirty correction tile, written back to the working file first: one write per
 ///    slot taken, never a batch;
 /// 5. only when every correction slot is pinned, chunks taken back from the pools (below).
@@ -820,7 +824,9 @@ struct EvalLog {
 /// bound. Room is made before a round predicts, so the bound holds with the round's new
 /// predictions counted: the store never holds more than [`StoreConfig::kept_predictions`] of
 /// them. They are charged to the budget at their worst case, set aside from it before the pools
-/// share the rest ([`StoreConfig::kept_prediction_bytes`]).
+/// share the rest ([`StoreConfig::kept_prediction_bytes`]); the evaluated pool maps a short
+/// chunk, of as many slots as fit, in the room that leaves below a whole chunk, so the share
+/// costs the pools its own bytes and no more.
 ///
 /// # Memory outside the budget
 ///
@@ -1627,7 +1633,9 @@ impl TileStore {
             budget: Budget::new(config.budget_bytes - kept_bytes),
             headroom,
             corrections: Pool::with_eviction_log(config.chunk_bytes),
-            evaluated: Pool::with_eviction_log(config.chunk_bytes),
+            // Short chunks let the evaluated pool use the room the kept predictions' share
+            // leaves below a whole chunk (see "Kept predictions" on `TileStore`).
+            evaluated: Pool::with_eviction_log(config.chunk_bytes).with_short_chunks(),
             deps: DepGraph::new(),
             unsaved: HashMap::new(),
             since_rebase,
@@ -3757,7 +3765,7 @@ impl TileStore {
 
     /// Whether a correction acquire that found no free or clean slot may take an evaluated
     /// chunk back rather than write a dirty tile back: while the correction pool holds less
-    /// than a quarter of the pools' budget (the kept predictions' share left out), and the
+    /// than a quarter of the pools' share (the budget less the kept predictions'), and the
     /// evaluated pool keeps its floor (its share of the minimum budget plus one chunk) without
     /// the chunk, and has a chunk without pins to give.
     fn may_take_evaluated_chunk(&self) -> bool {

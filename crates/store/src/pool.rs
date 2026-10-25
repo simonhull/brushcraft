@@ -9,6 +9,12 @@
 //! and a pool asked to shrink gives back its cheapest chunks first: the fewest dirty slots, then
 //! the fewest in use.
 //!
+//! A pool made [`Pool::with_short_chunks`] may also map a *short* chunk when the budget has room
+//! for less than a whole one: as many whole slots as the room holds, charged exactly their bytes,
+//! so a budget that isn't a whole number of chunks (the tile store's, once its kept predictions
+//! are set aside) loses at most part of a slot. Only a short chunk of at least half a chunk is
+//! mapped, for the reason below.
+//!
 //! Chunks should be large: glibc serves an allocation from `mmap` (and so returns it to the OS
 //! when it is dropped) only above its mmap threshold, which adapts upwards to as much as 32 MiB.
 //! A smaller chunk may come from the heap and stay with the process after the pool gives it
@@ -51,6 +57,11 @@ impl Budget {
     /// Bytes the pools' mapped chunks hold.
     pub(crate) const fn used(&self) -> usize {
         self.used
+    }
+
+    /// Bytes still to be had under the limit.
+    pub(crate) const fn room(&self) -> usize {
+        self.limit.saturating_sub(self.used)
     }
 
     /// Whether another `bytes` fit under the limit.
@@ -277,6 +288,9 @@ pub(crate) struct Pool<T: SlotData> {
     pinned: usize,
     /// Where the clock resumes, as a flat position (`chunk × per_chunk + index`).
     hand: u64,
+    /// Whether the pool may map a short chunk, of fewer slots, with room for less than a whole
+    /// one (see the module notes and [`Pool::with_short_chunks`]).
+    short_chunks: bool,
     /// Keys the pool freed on its own (the clock's victims, [`Pool::evict_all`],
     /// [`Pool::shrink_to`]) since [`Pool::drain_evicted`] last ran; `None` unless the pool was
     /// made with [`Pool::with_eviction_log`].
@@ -322,7 +336,19 @@ impl<T: SlotData> Pool<T> {
             index: HashMap::new(),
             pinned: 0,
             hand: 0,
+            short_chunks: false,
             evicted: None,
+        }
+    }
+
+    /// This pool, which may map a short chunk when the budget has room for at least half a
+    /// chunk but not a whole one: as many slots as the room holds, charged exactly their bytes
+    /// (see the module notes). Its other chunks are whole, so the room it gives back is still a
+    /// whole chunk for another pool, except for the short one.
+    pub(crate) fn with_short_chunks(self) -> Self {
+        Self {
+            short_chunks: true,
+            ..self
         }
     }
 
@@ -389,7 +415,21 @@ impl<T: SlotData> Pool<T> {
 
     /// Bytes of the mapped chunks: what the budget counts for this pool.
     pub(crate) fn bytes(&self) -> usize {
-        self.mapped_chunks() * self.chunk_bytes
+        (0..self.chunk_count())
+            .map(|chunk| self.charge(chunk))
+            .sum()
+    }
+
+    /// What the budget is charged for `chunk`: [`Pool::chunk_bytes`] for a whole chunk, its
+    /// slots' bytes for a short one, nothing if it isn't mapped.
+    fn charge(&self, chunk: u32) -> usize {
+        match self.chunks.get(chunk as usize) {
+            Some(Some(storage)) if storage.len() < self.per_chunk as usize => {
+                storage.len() * size_of::<T>()
+            }
+            Some(Some(_)) => self.chunk_bytes,
+            _ => 0,
+        }
     }
 
     /// `key`'s slot and whether its contents are current, marking it referenced.
@@ -693,9 +733,10 @@ impl<T: SlotData> Pool<T> {
             };
             self.evict_chunk(chunk, &mut write_back)?;
             self.free.retain(|&(c, _)| c != chunk);
+            let charge = self.charge(chunk);
             if let Some(storage) = self.chunks.get_mut(chunk as usize) {
                 *storage = None;
-                budget.give(self.chunk_bytes);
+                budget.give(charge);
             }
         }
         Ok(())
@@ -722,16 +763,17 @@ impl<T: SlotData> Pool<T> {
     }
 
     /// Maps a chunk if the budget allows one, reusing the lowest unmapped chunk's place, and puts
-    /// its slots on the free list; whether it did.
+    /// its slots on the free list; whether it did. A pool [`Pool::with_short_chunks`] maps a
+    /// short chunk where the budget has room for at least half a chunk but not a whole one.
     fn map_chunk(&mut self, budget: &mut Budget) -> bool {
         let unmapped = self.chunks.iter().position(Option::is_none);
         let Ok(chunk) = u32::try_from(unmapped.unwrap_or(self.chunks.len())) else {
             return false;
         };
-        if !budget.try_take(self.chunk_bytes) {
+        let Some(slots) = self.slots_to_map(budget) else {
             return false;
-        }
-        let storage = Some(bytemuck::zeroed_vec(self.per_chunk as usize));
+        };
+        let storage = Some(bytemuck::zeroed_vec(slots as usize));
         if let Some(place) = self.chunks.get_mut(chunk as usize) {
             *place = storage;
         } else {
@@ -741,8 +783,27 @@ impl<T: SlotData> Pool<T> {
         }
         // Reversed, so slots are handed out in order.
         self.free
-            .extend((0..self.per_chunk).rev().map(|index| (chunk, index)));
+            .extend((0..slots).rev().map(|index| (chunk, index)));
         true
+    }
+
+    /// How many slots the next chunk holds, its charge taken from `budget`: a whole chunk's if
+    /// the budget has room for one, else, for a pool [`Pool::with_short_chunks`], the whole
+    /// slots the room holds if that is at least half a chunk; `None` if nothing is mapped.
+    fn slots_to_map(&self, budget: &mut Budget) -> Option<u32> {
+        if budget.try_take(self.chunk_bytes) {
+            return Some(self.per_chunk);
+        }
+        if !self.short_chunks {
+            return None;
+        }
+        let size = size_of::<T>().max(1);
+        let slots = (budget.room() / size).min(self.per_chunk as usize);
+        let bytes = slots * size;
+        let half = self.chunk_bytes / 2;
+        (slots > 0 && bytes >= half && budget.try_take(bytes))
+            .then(|| u32::try_from(slots).ok())
+            .flatten()
     }
 
     /// The clock's victim: sweeping from the hand over mapped slots, skipping pinned ones (and
@@ -858,11 +919,6 @@ impl<T: SlotData> Pool<T> {
         if let Some(key) = key {
             self.index.remove(&key);
         }
-    }
-
-    /// Chunks mapped now.
-    fn mapped_chunks(&self) -> usize {
-        self.chunks.iter().flatten().count()
     }
 
     /// Chunks ever mapped (mapped now or not).
@@ -1066,10 +1122,13 @@ mod tests {
 
     #[test]
     fn never_exceeds_the_budget() {
+        // Three chunks and three evaluated slots: the evaluated pool maps a short chunk of three
+        // slots where a whole chunk doesn't fit.
         let chunk = 4 * size_of::<EvaluatedSlot>();
-        let mut budget = Budget::new(3 * chunk);
+        let mut budget = Budget::new(3 * chunk + 3 * size_of::<EvaluatedSlot>());
         let mut corrections = Pool::<CorrectionSlot>::new(chunk);
-        let mut evaluated = Pool::<EvaluatedSlot>::new(chunk);
+        let mut evaluated = Pool::<EvaluatedSlot>::new(chunk).with_short_chunks();
+        let mut short = 0;
         let mut rng = 0x2545_F491_4F6C_DD1D_u64;
         let mut next = |n: u64| {
             rng ^= rng << 13;
@@ -1104,6 +1163,7 @@ mod tests {
                         }
                         grown += usize::from(pool.bytes() > before);
                     }
+                    short += usize::from(!evaluated.bytes().is_multiple_of(chunk));
                 }),
                 6 | 7 => with_pool!(|pool| {
                     pool.lookup(&k);
@@ -1149,6 +1209,7 @@ mod tests {
             check_step(step, &budget, &corrections, &evaluated, &pinned);
         }
         assert!(fulls > 0 && grown > 10, "the workload hit the budget");
+        assert!(short > 0, "the evaluated pool mapped a short chunk");
     }
 
     #[test]
@@ -1510,6 +1571,67 @@ mod tests {
         );
         pool.shrink_to(&mut budget, chunk, no_write_back).unwrap();
         assert_eq!(resident(&pool), vec![key(4), key(5)], "then chunk 1");
+    }
+
+    /// A pool with short chunks fills the room below a whole chunk with whole slots.
+    ///
+    /// As many as fit, if that is at least half a chunk, charged exactly their bytes and given
+    /// exactly them back; a pool without maps whole chunks only.
+    #[test]
+    fn short_chunks_fill_the_room_below_a_chunk() {
+        let size = size_of::<Small>();
+        let chunk = 4 * size;
+        for (room, short) in [
+            (3 * size, Some(3)),
+            (3 * size + 7, Some(3)),
+            (2 * size, Some(2)),
+            (size, None),
+        ] {
+            let mut pool = Pool::<Small>::new(chunk).with_short_chunks();
+            let mut budget = Budget::new(2 * chunk + room);
+            let ids: Vec<SlotId<Small>> =
+                (0..8).map(|n| put(&mut pool, &mut budget, n, 1)).collect();
+            assert_eq!(pool.bytes(), 2 * chunk, "{room}: two whole chunks first");
+            let more = pool.acquire(key(8), &mut budget, no_write_back);
+            let Some(slots) = short else {
+                assert!(more.is_ok(), "{room}: a victim instead");
+                assert_eq!(pool.bytes(), 2 * chunk, "{room}: no short chunk under half");
+                continue;
+            };
+            more.unwrap();
+            assert_eq!(
+                pool.bytes(),
+                2 * chunk + slots * size,
+                "{room}: whole slots"
+            );
+            assert_eq!(budget.used(), pool.bytes(), "{room}: charged exactly");
+            assert!(budget.used() <= budget.limit(), "{room}: within the budget");
+            for n in 9..8 + u32::try_from(slots).unwrap() {
+                put(&mut pool, &mut budget, n, 1);
+            }
+            assert_eq!(
+                pool.bytes(),
+                2 * chunk + slots * size,
+                "{room}: filled, no more"
+            );
+            assert!(pool.get(ids[0]).is_some(), "{room}: nothing evicted yet");
+            pool.shrink_to(&mut budget, 0, no_write_back).unwrap();
+            assert_eq!(
+                (pool.bytes(), budget.used()),
+                (0, 0),
+                "{room}: all given back"
+            );
+        }
+        let mut whole = Pool::<Small>::new(chunk);
+        let mut budget = Budget::new(2 * chunk + 3 * size);
+        for n in 0..9 {
+            whole.acquire(key(n), &mut budget, no_write_back).unwrap();
+        }
+        assert_eq!(
+            whole.bytes(),
+            2 * chunk,
+            "without short chunks: whole ones only"
+        );
     }
 
     #[test]
