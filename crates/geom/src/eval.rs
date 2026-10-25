@@ -504,6 +504,26 @@ pub(crate) fn predicted_frames(
 }
 
 impl Prediction {
+    /// The most bytes a tile's prediction holds on the heap: a tile of [`TILE_QUADS`] quads a
+    /// side (the largest), its predicted positions with their one-vertex ring and a tangent
+    /// frame per vertex, about 206 KB. A coarse tile's, of fewer quads, holds less. What a cache
+    /// of predictions is charged per entry ([`Prediction::heap_bytes`] is at most this for any
+    /// tile's prediction).
+    pub const TILE_BYTES: usize = {
+        // The constants are small: the casts are exact.
+        let side = TILE_QUADS as usize + 1;
+        let padded = side + 2;
+        padded * padded * size_of::<Vec3>() + side * side * size_of::<Frame>()
+    };
+
+    /// The bytes this prediction holds on the heap: its positions' and frames' allocations.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.predicted
+            .heap_bytes()
+            .saturating_add(self.frames.capacity().saturating_mul(size_of::<Frame>()))
+    }
+
     /// The block predicted.
     #[must_use]
     pub const fn region(&self) -> Region {
@@ -1001,6 +1021,29 @@ mod tests {
         }
         assert_eq!(prediction.predicted(3, 0), None, "outside: position");
         assert_eq!(prediction.frame(0, 3), None, "outside: frame");
+    }
+
+    /// A tile's prediction holds what [`Prediction::TILE_BYTES`] charges for it: exactly that
+    /// for a tile of the most quads, less for a coarser one.
+    #[test]
+    fn a_tiles_prediction_holds_at_most_its_charge() {
+        let mesh = cube_sphere(1).unwrap();
+        let map = CorrectionMap::new();
+        let dense = DenseEvaluation::new(&mesh, level(7), &map).unwrap();
+        let finest = TileKey::displacement(FaceId::new(3), level(7), 1, 0).unwrap();
+        let prediction = predict_region(&mesh, &dense, Region::of_tile(&finest)).unwrap();
+        assert_eq!(
+            prediction.heap_bytes(),
+            Prediction::TILE_BYTES,
+            "a full tile: the charge"
+        );
+        let coarse = TileKey::displacement(FaceId::new(3), level(3), 0, 0).unwrap();
+        let smaller = predict_region(&mesh, &dense, Region::of_tile(&coarse)).unwrap();
+        assert!(
+            smaller.heap_bytes() < Prediction::TILE_BYTES,
+            "a coarse tile: less, {}",
+            smaller.heap_bytes()
+        );
     }
 
     #[test]

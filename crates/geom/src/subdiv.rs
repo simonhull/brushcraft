@@ -36,6 +36,11 @@ impl Padded {
         self.data.len()
     }
 
+    /// The bytes the block holds on the heap: its slots' allocation.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.data.capacity().saturating_mul(size_of::<Vec3>())
+    }
+
     /// Row `j` (`-1 ..= quads + 1`) with its ring: `quads + 3` slots, column `i` at index `i + 1`.
     /// Empty outside the block and its ring.
     pub(crate) fn row(&self, j: i64) -> &[Vec3] {
