@@ -65,6 +65,15 @@ pub enum CorrectionError {
     },
 }
 
+/// What [`CorrectionViewMut::update_interior_row`] did to a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowUpdate {
+    /// Whether any vertex of the row was written.
+    pub wrote: bool,
+    /// Why the row stopped before its end, if it did: nothing after that vertex was written.
+    pub error: Option<CorrectionError>,
+}
+
 /// A correction tile stored elsewhere (a pool slot): `side` vertices per side, interior quantized
 /// with `scale`, border exact. Same layout and rules as [`CorrectionTile`], whose
 /// [`CorrectionTile::view`] is one.
@@ -338,19 +347,83 @@ impl<'a> CorrectionViewMut<'a> {
             return Err(CorrectionError::NotFinite);
         }
         if let Some(Slot::Interior(_)) = slot(self.side, i, j) {
-            let needed = max_abs(c);
-            let scale = *self.scale;
-            if needed > Q_MAX * scale {
-                if scale == 0.0 {
-                    if needed >= TINY {
-                        self.requantize(needed / Q_MAX);
-                    }
-                } else {
-                    self.requantize(grown_scale(scale, needed));
-                }
-            }
+            self.fit_scale(c);
         }
         self.store(i, j, c)
+    }
+
+    /// Rewrites the interior vertices of row `j` (`1..side - 1`, a row inside the tile), in
+    /// order: `f` sees each vertex's coordinates and its correction as stored, and where it
+    /// returns a new value, that is set as [`CorrectionViewMut::set`] sets it, before `f` sees
+    /// the next vertex.
+    ///
+    /// The same bits as [`CorrectionViewMut::get`] then [`CorrectionViewMut::set`] for each
+    /// vertex in that order (a value that outgrows the scale re-quantizes the interior, which
+    /// the vertices after it then read), without finding each vertex's place in the tile again
+    /// for the read and the write: what an edit of a whole interior, row by row, costs per
+    /// vertex.
+    ///
+    /// It stops at the first value `f` returns that isn't finite, which isn't written; the
+    /// writes before it stay. The outcome says whether anything was written, and why it
+    /// stopped if it did: [`CorrectionError::NotFinite`], or [`CorrectionError::OutOfTile`] for
+    /// a row that isn't inside the tile (nothing is read then).
+    pub fn update_interior_row(
+        &mut self,
+        j: u32,
+        mut f: impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+    ) -> RowUpdate {
+        let side = self.side;
+        let mut outcome = RowUpdate {
+            wrote: false,
+            error: None,
+        };
+        let first = (j >= 1 && j + 1 < side)
+            .then(|| usize::try_from((j - 1) * (side - 2)).ok())
+            .flatten();
+        let Some(first) = first else {
+            outcome.error = Some(CorrectionError::OutOfTile { i: 0, j, side });
+            return outcome;
+        };
+        for (i, k) in (1..side - 1).zip(first..) {
+            let Some(&q) = self.interior.get(k) else {
+                outcome.error = Some(CorrectionError::OutOfTile { i, j, side });
+                return outcome;
+            };
+            let Some(c) = f(i, j, decode(q, *self.scale)) else {
+                continue;
+            };
+            if !c.is_finite() {
+                outcome.error = Some(CorrectionError::NotFinite);
+                return outcome;
+            }
+            self.fit_scale(c);
+            let scale = *self.scale;
+            if let Some(stored) = self.interior.get_mut(k) {
+                *stored = [
+                    quantize(c.x, scale),
+                    quantize(c.y, scale),
+                    quantize(c.z, scale),
+                ];
+            }
+            outcome.wrote = true;
+        }
+        outcome
+    }
+
+    /// Grows the scale, re-quantizing the interior, if interior value `c` (finite) doesn't fit
+    /// it: as [`CorrectionViewMut::set`] describes.
+    fn fit_scale(&mut self, c: Vec3) {
+        let needed = max_abs(c);
+        let scale = *self.scale;
+        if needed > Q_MAX * scale {
+            if scale == 0.0 {
+                if needed >= TINY {
+                    self.requantize(needed / Q_MAX);
+                }
+            } else {
+                self.requantize(grown_scale(scale, needed));
+            }
+        }
     }
 
     /// Writes `value` with the current scale.
@@ -809,6 +882,71 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn updating_an_interior_row_equals_getting_and_setting_each_vertex() {
+        let mut rng = Rng::new(23);
+        for case in 0..400_u32 {
+            let side = 3 + rng.below(63);
+            let amplitude = 10f32.powf(rng.signed() * 3.0);
+            let values: Vec<Vec3> = (0..side * side).map(|_| rng.vec3(amplitude)).collect();
+            let start = if case % 5 == 0 {
+                CorrectionTile::zero(side).unwrap()
+            } else {
+                CorrectionTile::from_values(side, &values).unwrap()
+            };
+            let j = 1 + rng.below(side - 2);
+            let seed = rng.next_u64();
+            // Pure in its arguments, as the edit's `f` must be: no write, a small change, a
+            // change that outgrows the scale, from time to time a value that isn't finite.
+            let f = |i: u32, row: u32, c: Vec3| {
+                let mut r = Rng::new(seed ^ (u64::from(i) << 20) ^ u64::from(row));
+                match r.below(30) {
+                    0..10 => None,
+                    10..13 => Some(c + r.vec3(amplitude * 1000.0)),
+                    13 if case % 7 == 0 => Some(Vec3::new(f32::NAN, 0.0, 0.0)),
+                    _ => Some(c + r.vec3(amplitude * 0.1)),
+                }
+            };
+            let mut fast = start.clone();
+            let got = fast.view_mut().update_interior_row(j, f);
+            let mut slow = start.clone();
+            let mut want = RowUpdate {
+                wrote: false,
+                error: None,
+            };
+            let mut view = slow.view_mut();
+            for i in 1..side - 1 {
+                let Some(c) = f(i, j, view.get(i, j).unwrap()) else {
+                    continue;
+                };
+                if let Err(e) = view.set(i, j, c) {
+                    want.error = Some(e);
+                    break;
+                }
+                want.wrote = true;
+            }
+            assert_eq!(got, want, "case {case}: the same outcome");
+            assert_eq!(
+                fast.view().scale().to_bits(),
+                slow.view().scale().to_bits(),
+                "case {case}: the same scale"
+            );
+            assert_eq!(fast, slow, "case {case}: the same values");
+        }
+        let mut tile = CorrectionTile::zero(5).unwrap();
+        for j in [0, 4, 9] {
+            let outcome = tile.view_mut().update_interior_row(j, |_, _, c| Some(c));
+            assert_eq!(
+                outcome,
+                RowUpdate {
+                    wrote: false,
+                    error: Some(CorrectionError::OutOfTile { i: 0, j, side: 5 }),
+                },
+                "row {j} isn't inside the tile"
+            );
         }
     }
 

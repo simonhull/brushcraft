@@ -23,7 +23,9 @@ mod subdiv;
 mod test_rng;
 mod topology;
 
-pub use correction::{CorrectionError, CorrectionTile, CorrectionView, CorrectionViewMut};
+pub use correction::{
+    CorrectionError, CorrectionTile, CorrectionView, CorrectionViewMut, RowUpdate,
+};
 pub use dense::{CorrectionMap, DenseEvaluation};
 pub use eval::{
     EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,

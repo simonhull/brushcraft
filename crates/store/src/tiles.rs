@@ -116,8 +116,8 @@ use std::sync::Arc;
 
 use geom::{
     BaseMesh, Channel, CorrectionError, CorrectionView, CorrectionViewMut, EvalError, FaceId,
-    LayerId, Level, MAX_COPIES, PositionSource, Prediction, Region, TileBorder, TileKey, Vec3,
-    VertexCopy, normals_into, parent_tiles, predict_region, refresh_normals_into,
+    LayerId, Level, MAX_COPIES, PositionSource, Prediction, Region, RowUpdate, TileBorder, TileKey,
+    Vec3, VertexCopy, normals_into, parent_tiles, predict_region, refresh_normals_into,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -4734,41 +4734,28 @@ struct InteriorPass {
     failed: Option<(u32, CacheError)>,
 }
 
-/// Runs `f` over the interior vertices of row `j` of `view`, in order, setting what it returns.
+/// Runs `f` over the interior vertices of row `j` of `view`, in order, setting what it returns
+/// ([`CorrectionViewMut::update_interior_row`]).
 ///
-/// `side` is the tile's vertices a side. Returns whether anything was written, and the error of
-/// a value that isn't finite, which stops the row (nothing is written for it).
+/// Returns whether anything was written, and the error of a value that isn't finite, which
+/// stops the row (nothing is written for it).
 ///
 /// # Errors
 ///
 /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`];
-/// [`CacheError::Internal`] for a broken view.
+/// [`CacheError::Internal`] for a row outside the tile's interior.
 fn update_row(
     view: &mut CorrectionViewMut<'_>,
-    side: u32,
     j: u32,
     f: &mut impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
 ) -> (bool, Result<(), CacheError>) {
-    let mut wrote = false;
-    for i in 1..side - 1 {
-        let Some(current) = view.get(i, j) else {
-            return (wrote, Err(Invariant::StaleHandle.into()));
-        };
-        let Some(c) = f(i, j, current) else {
-            continue;
-        };
-        if !c.is_finite() {
-            return (
-                wrote,
-                Err(CacheError::Correction(CorrectionError::NotFinite)),
-            );
-        }
-        if let Err(e) = view.set(i, j, c) {
-            return (wrote, Err(Invariant::CorrectionSlot(e).into()));
-        }
-        wrote = true;
-    }
-    (wrote, Ok(()))
+    let RowUpdate { wrote, error } = view.update_interior_row(j, f);
+    let row = match error {
+        None => Ok(()),
+        Some(CorrectionError::NotFinite) => Err(CacheError::Correction(CorrectionError::NotFinite)),
+        Some(_) => Err(Invariant::StaleHandle.into()),
+    };
+    (wrote, row)
 }
 
 /// The half of [`TileStore::update_tiles`] that runs on the workers, for one tile.
@@ -4793,7 +4780,7 @@ fn update_interior(
         }
     };
     for j in 1..side.saturating_sub(1) {
-        let (wrote, row) = update_row(&mut view, side, j, &mut f);
+        let (wrote, row) = update_row(&mut view, j, &mut f);
         if wrote && pass.first_row.is_none() {
             pass.first_row = Some(j);
         }
@@ -5054,7 +5041,6 @@ impl TileEdit<'_> {
         j: u32,
         f: &mut impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
     ) -> Result<(), CacheError> {
-        let side = self.key.side();
         let tile = self.touched.first().ok_or(Invariant::StaleHandle)?;
         let slot = self
             .store
@@ -5062,7 +5048,7 @@ impl TileEdit<'_> {
             .get_mut(tile.id)
             .ok_or(Invariant::StaleHandle)?;
         let mut view = slot.view_mut().map_err(Invariant::CorrectionSlot)?;
-        let (wrote, row) = update_row(&mut view, side, j, f);
+        let (wrote, row) = update_row(&mut view, j, f);
         if wrote {
             self.mark_own_written()?;
         }
