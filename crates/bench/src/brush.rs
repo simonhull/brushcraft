@@ -16,6 +16,12 @@
 //! (`cold_first_dab_ms`): what a stroke's first dab costs over a region the view hasn't drawn.
 //! What a cold region costs in full is `page-in`'s measure.
 //!
+//! With `--per-step`, `brush` also reports each step of the warm stroke on a line of its own
+//! ([`session::step_records`]): its time and each phase's, its footprint, what the store loaded,
+//! evaluated and evicted during it, and the page faults. The p99 of 200 steps is about the
+//! slowest two or three, so those lines are what tells a slow step's cause from the summary's
+//! means.
+//!
 //! Loading the spatial index comes first, and is reported apart: from the bounds `generate`
 //! saved with the tiles, it evaluates no tile (a project without them has all 153,600 level-9
 //! tiles evaluated).
@@ -37,7 +43,7 @@ use crate::cli::Options;
 use crate::noise::Rng;
 use crate::paths::Paths;
 use crate::report::{Output, Record, mib, ms};
-use crate::session;
+use crate::session::{self, Detail};
 use crate::surface::{calibrated_radius, on_surface, path};
 
 /// How far the brush moves each dab, in radii.
@@ -177,6 +183,7 @@ pub(crate) fn run<J: Write, H: Write>(
         plan.centres.get(..1).unwrap_or_default(),
         plan.radius,
         options.strength,
+        Detail::Summary,
     )?;
     let cold_ms = cold.first().map_or(0.0, |dab| ms(dab.wall));
     plan.warm(&mut project, &index)?;
@@ -186,7 +193,13 @@ pub(crate) fn run<J: Write, H: Write>(
         &plan.centres,
         plan.radius,
         options.strength,
+        options.detail,
     )?;
+    if options.detail == Detail::PerStep {
+        for record in session::step_records("brush", &dabs) {
+            out.record(&record)?;
+        }
+    }
     out.record(&session::add_dabs(
         Record::new("brush", "stroke")
             .with("level", u64::from(options.level))
@@ -280,6 +293,7 @@ pub(crate) fn run_save<J: Write, H: Write>(
         &plan.centres,
         plan.radius,
         options.strength,
+        Detail::Summary,
     )?;
     let after = corrections(&mut project, &reached)?;
     let edited = changed_vertices(&mut project, &before, &after);

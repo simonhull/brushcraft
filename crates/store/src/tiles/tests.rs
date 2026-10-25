@@ -563,6 +563,69 @@ fn batches_are_sized_from_the_room_the_evaluated_pool_can_reach() {
     assert_eq!(store.batch_size(0), size(0), "clean again");
 }
 
+/// Of `keys`, how many have a slot in `pool`.
+fn resident<T: SlotData>(pool: &Pool<T>, keys: &[TileKey]) -> u64 {
+    keys.iter()
+        .filter(|key| pool.find(key).is_some())
+        .count()
+        .try_into()
+        .unwrap()
+}
+
+#[test]
+fn activity_counts_what_the_store_did() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, tight());
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 200, 5));
+    store.log = EvalLog::default();
+    let before = store.activity();
+    for key in &tiles(&mesh, TOP, TOP) {
+        store.normals(*key).unwrap();
+    }
+    let did = store.activity().since(&before);
+    let count = |n: usize| u64::try_from(n).unwrap();
+    assert_eq!(
+        (
+            did.positions_computed,
+            did.normals_computed,
+            did.corrections_loaded
+        ),
+        (
+            count(store.log.positions.len()),
+            count(store.log.normals.len()),
+            count(store.log.file_reads.len())
+        ),
+        "the work the log saw, counted alike"
+    );
+    assert!(
+        did.positions_computed > 0 && did.normals_computed > 0 && did.corrections_loaded > 0,
+        "the evaluations did work: {did:?}"
+    );
+    assert!(
+        did.evaluated_evicted > 0 && did.corrections_evicted > 0,
+        "the tight budget evicted from both pools: {did:?}"
+    );
+
+    let all = tiles(&mesh, 1, TOP);
+    let (evaluated, corrections) = (
+        resident(&store.evaluated, &all),
+        resident(&store.corrections, &all),
+    );
+    let full = store.activity();
+    store.evict_all().unwrap();
+    assert_eq!(
+        store.activity().since(&full),
+        Activity {
+            evaluated_evicted: evaluated,
+            corrections_evicted: corrections,
+            ..Activity::default()
+        },
+        "emptying the pools counts each resident tile once, and nothing else"
+    );
+}
+
 #[test]
 fn edits_after_evaluation_invalidate_exactly() {
     let dir = TestDir::new();

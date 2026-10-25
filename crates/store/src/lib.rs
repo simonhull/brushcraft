@@ -5,6 +5,7 @@
 //! Positional reads and writes use Unix's `FileExt` (`read_exact_at`, `write_all_at`) for now, so
 //! the crate builds on Unix only. Windows needs `seek_read`/`seek_write` later.
 
+mod activity;
 mod bounds;
 mod bytes;
 mod codec;
@@ -30,6 +31,7 @@ mod test_dir;
 mod tiles;
 mod workers;
 
+pub use activity::Activity;
 pub use codec::CodecError;
 pub use feed::{ChangeFeed, ConsumerId};
 pub use file::{

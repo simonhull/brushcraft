@@ -125,6 +125,7 @@ use rayon::iter::{
 use rayon::slice::{ParallelSlice, ParallelSliceMut};
 use thiserror::Error;
 
+use crate::activity::Activity;
 use crate::bounds::Book;
 use crate::deps::{DepGraph, list_normal_inputs};
 use crate::feed::{ChangeFeed, ConsumerId};
@@ -828,6 +829,8 @@ pub struct TileStore {
     /// slots at once (see [`TileStore::fill_round`]). Made on demand, never more than there are
     /// workers.
     worker_read_scratch: Vec<ReadScratch>,
+    /// What the store has done since it opened, for [`TileStore::activity`].
+    activity: Activity,
     /// What was computed, for the tests.
     #[cfg(test)]
     log: EvalLog,
@@ -1496,6 +1499,7 @@ impl TileStore {
             workers,
             read_scratch: ReadScratch::new()?,
             worker_read_scratch: Vec::new(),
+            activity: Activity::default(),
             #[cfg(test)]
             log: EvalLog::default(),
             #[cfg(test)]
@@ -2324,6 +2328,14 @@ impl TileStore {
                 .and_then(std::convert::identity);
         }
         outcome
+    }
+
+    /// What the store has done since it opened: tiles loaded and evaluated, and evicted to make
+    /// room (see [`Activity`]). Two counts around a call, through [`Activity::since`], give what
+    /// that call did.
+    #[must_use]
+    pub const fn activity(&self) -> Activity {
+        self.activity
     }
 
     /// `key`'s evaluated positions as cached, if they are current: no evaluation, and the read
@@ -3447,6 +3459,7 @@ impl TileStore {
         // Taking a slot may have evicted others, whether or not it succeeded.
         self.forget_evicted_ops();
         let id = id?;
+        self.activity.corrections_loaded += 1;
         #[cfg(test)]
         self.log.file_reads.push(key);
         Ok(Fill {
@@ -3653,6 +3666,7 @@ impl TileStore {
     /// those, and after every poll, that only resident tiles have an op.
     fn forget_evicted_ops(&mut self) {
         for key in self.corrections.drain_evicted() {
+            self.activity.corrections_evicted += 1;
             if self.corrections.find(&key).is_none() {
                 self.known_ops.remove(&key);
             }
@@ -3662,6 +3676,7 @@ impl TileStore {
     /// Tells the dependency graph which evaluated tiles the pool evicted.
     fn note_evictions(&mut self) {
         for key in self.evaluated.drain_evicted() {
+            self.activity.evaluated_evicted += 1;
             self.deps.left_pool(key);
         }
     }
@@ -4352,6 +4367,7 @@ impl TileStore {
     ) -> Result<(), CacheError> {
         self.evaluated.mark_fresh(id)?;
         self.deps.record_positions(key, parents);
+        self.activity.positions_computed += 1;
         #[cfg(test)]
         self.log.positions.push(key);
         Ok(())
@@ -4522,6 +4538,7 @@ impl TileStore {
     /// caller holds pinned.
     fn normals_installed(&mut self, key: TileKey, inputs: &BTreeSet<TileKey>) {
         self.deps.record_normals(key, inputs);
+        self.activity.normals_computed += 1;
         #[cfg(test)]
         self.log.normals.push(key);
     }

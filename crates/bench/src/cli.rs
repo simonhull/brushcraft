@@ -12,6 +12,8 @@ use std::str::FromStr;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use store::Workers;
 
+use crate::session::Detail;
+
 /// What the harness prints when its arguments don't parse.
 pub(crate) const USAGE: &str = "\
 usage: brushcraft-bench SUBCOMMAND [OPTIONS]
@@ -42,6 +44,8 @@ options (each subcommand takes the ones it uses):
             given back (cold: every pin maps fresh memory), or emptied with its memory kept
             (warm: as in a running app), or each in turn (both)
   brush:    --steps N (200)  --footprint VERTICES (50000)  --strength F (0.0001)
+            --per-step (a JSON line per step besides the summary: its time and each phase's,
+            its footprint, the tiles the store loaded, evaluated and evicted, page faults)
   save:     --steps N (50)   --footprint VERTICES (50000)  --strength F (0.0001)
   budget:   --moves N (20)  --steps-per-move N (10)  --view-tiles N (2000)
             --footprint VERTICES (50000)  --strength F (0.0001)
@@ -114,8 +118,8 @@ impl Subcommand {
     fn takes(self, flag: Flag) -> bool {
         use Flag::{
             Amplitude, Baseline, BudgetMib, Footprint, Force, Full, History, Level, Levels, Moves,
-            NoStages, Pool, Project, RegionQuads, Samples, Seed, SettleSecs, Splits, Steps,
-            StepsPerMove, Strength, Tiny, ViewTiles, Workers,
+            NoStages, PerStep, Pool, Project, RegionQuads, Samples, Seed, SettleSecs, Splits,
+            Steps, StepsPerMove, Strength, Tiny, ViewTiles, Workers,
         };
         match flag {
             Project | Workers => true,
@@ -125,6 +129,7 @@ impl Subcommand {
             History | Baseline | Full | Tiny | NoStages | SettleSecs => self == Self::Perf,
             Samples | RegionQuads | Pool => self == Self::PageIn,
             Steps => matches!(self, Self::Brush | Self::Save),
+            PerStep => self == Self::Brush,
             Strength => matches!(self, Self::Brush | Self::Save | Self::Budget),
             Moves | StepsPerMove | ViewTiles => self == Self::Budget,
         }
@@ -225,6 +230,8 @@ enum Flag {
     Pool,
     /// `--steps`.
     Steps,
+    /// `--per-step`, a switch.
+    PerStep,
     /// `--strength`.
     Strength,
     /// `--moves`.
@@ -251,7 +258,7 @@ enum Flag {
 
 impl Flag {
     /// Every flag with its name, without the leading `--`.
-    const NAMES: [(Self, &'static str); 24] = [
+    const NAMES: [(Self, &'static str); 25] = [
         (Self::Project, "project"),
         (Self::BudgetMib, "budget-mib"),
         (Self::Seed, "seed"),
@@ -265,6 +272,7 @@ impl Flag {
         (Self::RegionQuads, "region-quads"),
         (Self::Pool, "pool"),
         (Self::Steps, "steps"),
+        (Self::PerStep, "per-step"),
         (Self::Strength, "strength"),
         (Self::Moves, "moves"),
         (Self::StepsPerMove, "steps-per-move"),
@@ -282,7 +290,7 @@ impl Flag {
     const fn is_switch(self) -> bool {
         matches!(
             self,
-            Self::Force | Self::Baseline | Self::Full | Self::Tiny | Self::NoStages
+            Self::Force | Self::Baseline | Self::Full | Self::Tiny | Self::NoStages | Self::PerStep
         )
     }
 
@@ -325,6 +333,8 @@ pub(crate) struct Options {
     pub(crate) pools: Pools,
     /// `brush`, `save`: draw steps in the stroke.
     pub(crate) steps: usize,
+    /// `brush`: how closely each step of the stroke is watched and reported.
+    pub(crate) detail: Detail,
     /// How far the draw brush pushes at its centre, along the frame normal.
     pub(crate) strength: f32,
     /// `budget`: places the walk pans to.
@@ -368,6 +378,7 @@ impl Options {
             } else {
                 200
             },
+            detail: Detail::Summary,
             strength: 1e-4,
             moves: 20,
             steps_per_move: 10,
@@ -418,6 +429,7 @@ impl Options {
                 };
             }
             Flag::NoStages => self.stages = false,
+            Flag::PerStep => self.detail = Detail::PerStep,
             Flag::Project => self.project = Some(path()?),
             Flag::History => self.history = Some(path()?),
             Flag::BudgetMib => self.budget_mib = parse(flag, text()?)?,
@@ -576,6 +588,16 @@ mod tests {
         assert_eq!(brush.subcommand, Subcommand::Brush, "the subcommand");
         assert_eq!(brush.options.steps, 200, "brush's default steps");
         assert_eq!(brush.options.budget_mib, 2048, "brush's default budget");
+        assert_eq!(
+            brush.options.detail,
+            Detail::Summary,
+            "a summary by default"
+        );
+        assert_eq!(
+            parse("brush --per-step").unwrap().options.detail,
+            Detail::PerStep,
+            "a record per step asked for"
+        );
         let save = parse("save --steps 7 --level=6 --project /tmp/x.bcrf").unwrap();
         assert_eq!(save.options.steps, 7, "a spaced value");
         assert_eq!(save.options.level, 6, "an inline value");
@@ -652,6 +674,11 @@ mod tests {
             ("perf --seed 3", "a seed for perf, which fixes its own"),
             ("perf --level 6", "a level for perf, which fixes its own"),
             ("perf --tiny=yes", "a value for a perf switch"),
+            (
+                "save --per-step",
+                "per-step records for a subcommand without them",
+            ),
+            ("brush --per-step=yes", "a value for the per-step switch"),
             ("perf --tiny --full", "a tiny and a full project"),
             ("perf --full --tiny", "a full and a tiny project"),
             ("perf --history", "a history without its directory"),

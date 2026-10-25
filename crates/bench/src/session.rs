@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, ensure};
 use geom::{Level, Vec3};
 use sculpt::{DrawParams, StepStats, draw_step};
-use store::{Project, ProjectConfig, SpatialIndex, StoreConfig};
+use store::{Activity, Project, ProjectConfig, SpatialIndex, StoreConfig};
 
 use crate::cli::Options;
 use crate::paths::Paths;
 use crate::report::{Output, Record, Spread, mib, ms, to_f64};
+use crate::sys;
 
 /// The site the harness's op ids carry: any but the reserved one.
 const SITE: u16 = 1;
@@ -100,42 +101,111 @@ pub(crate) fn load_index<J: Write, H: Write>(
     Ok(index)
 }
 
-/// One dab of a stroke as the harness measured it: the step's own statistics, and the wall
-/// time of the whole call.
+/// One dab of a stroke as the harness measured it: the step's own statistics, the wall time
+/// of the whole call, and what the store and the process did during it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Dab {
     /// What the step did, with its phases' times.
     pub(crate) stats: StepStats,
     /// The call's wall time, start to return.
     pub(crate) wall: Duration,
+    /// What the tile store did during the call: tiles loaded, evaluated and evicted.
+    pub(crate) activity: Activity,
+    /// The minor page faults the process took during the call (every thread of it), if the
+    /// stroke counted them ([`Detail::PerStep`]).
+    pub(crate) minor_faults: Option<u64>,
+}
+
+/// How closely [`stroke`] watches each step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Detail {
+    /// The step's statistics, wall time and store activity: what costs nothing to take.
+    Summary,
+    /// Those, and the process's page faults around each step: two reads of
+    /// `/proc/self/stat` a step, outside the time measured.
+    PerStep,
 }
 
 /// Runs one stroke of draw steps with `radius` and `strength`, one at each of `centres`,
-/// between [`Project::begin_stroke`] and [`Project::end_stroke`].
+/// between [`Project::begin_stroke`] and [`Project::end_stroke`], watching each as `detail`
+/// says.
 ///
 /// # Errors
 ///
-/// If a step fails, or the stroke can't begin or end.
+/// If a step fails, the stroke can't begin or end, or (with [`Detail::PerStep`]) the page
+/// faults can't be read.
 pub(crate) fn stroke(
     project: &mut Project,
     index: &mut SpatialIndex,
     centres: &[Vec3],
     radius: f32,
     strength: f32,
+    detail: Detail,
 ) -> Result<Vec<Dab>> {
+    let faults = || match detail {
+        Detail::Summary => Ok(None),
+        Detail::PerStep => sys::minor_faults().map(Some),
+    };
     project.begin_stroke().context("beginning a stroke")?;
     let mut dabs = Vec::with_capacity(centres.len());
     for &center in centres {
         let params = DrawParams::new(center, radius, strength)?;
+        let faults_before = faults()?;
+        let activity_before = project.store().activity();
         let start = Instant::now();
         let stats = draw_step(project, index, params).context("a draw step")?;
+        let wall = start.elapsed();
+        let activity = project.store().activity().since(&activity_before);
+        let minor_faults = faults()?
+            .zip(faults_before)
+            .map(|(after, before)| after.saturating_sub(before));
         dabs.push(Dab {
             stats,
-            wall: start.elapsed(),
+            wall,
+            activity,
+            minor_faults,
         });
     }
     project.end_stroke().context("ending the stroke")?;
     Ok(dabs)
+}
+
+/// One record per dab of `dabs`, as `bench`'s `step` result, in stroke order.
+///
+/// Each has the dab's number (from 0), its wall time and each phase's, its footprint
+/// (candidates, tiles edited, vertices moved, tiles updated), what the store did during it, and
+/// the page faults if they were counted: what finds the slow steps of a stroke and tells what
+/// they did differently.
+pub(crate) fn step_records<'a>(
+    bench: &'a str,
+    dabs: &'a [Dab],
+) -> impl Iterator<Item = Record> + 'a {
+    dabs.iter().enumerate().map(move |(n, dab)| {
+        let (stats, times, activity) = (&dab.stats, &dab.stats.times, &dab.activity);
+        let record = Record::new(bench, "step")
+            .with("step", n)
+            .with("wall_ms", ms(dab.wall))
+            .with("query_ms", ms(times.query))
+            .with("pin_ms", ms(times.pin))
+            .with("brush_ms", ms(times.brush))
+            .with("edit_ms", ms(times.edit))
+            .with("neighbours_ms", ms(times.neighbours))
+            .with("evaluate_ms", ms(times.evaluate))
+            .with("refit_ms", ms(times.refit))
+            .with("candidates", stats.candidates)
+            .with("tiles_edited", stats.tiles_edited)
+            .with("vertices", stats.vertices)
+            .with("tiles_updated", stats.tiles_updated)
+            .with("corrections_loaded", activity.corrections_loaded)
+            .with("positions_computed", activity.positions_computed)
+            .with("normals_computed", activity.normals_computed)
+            .with("corrections_evicted", activity.corrections_evicted)
+            .with("evaluated_evicted", activity.evaluated_evicted);
+        match dab.minor_faults {
+            Some(faults) => record.with("minor_faults", faults),
+            None => record,
+        }
+    })
 }
 
 /// `record` with the latency of `dabs` (their wall times' spread, as `step_*`) and the mean of

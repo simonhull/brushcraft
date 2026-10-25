@@ -26,7 +26,7 @@ use crate::cli::Options;
 use crate::noise::Rng;
 use crate::paths::Paths;
 use crate::report::{Output, Record, mib, ms, to_f64};
-use crate::session;
+use crate::session::{self, Detail};
 use crate::surface::{nearest_tiles, tile_directions};
 use crate::sys::{Rss, RssSampler, reset_peak};
 
@@ -163,8 +163,15 @@ fn walk<J: Write, H: Write>(
         let size = radius.map_or(Size::Footprint(options.footprint), Size::Radius);
         let plan = Plan::new(project, index, direction, size, options.steps_per_move)?;
         radius = Some(plan.radius);
-        steps +=
-            session::stroke(project, index, &plan.centres, plan.radius, options.strength)?.len();
+        steps += session::stroke(
+            project,
+            index,
+            &plan.centres,
+            plan.radius,
+            options.strength,
+            Detail::Summary,
+        )?
+        .len();
         drop(pins);
         project.poll()?;
         out.progress("moves", done, options.moves, start)?;

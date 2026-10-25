@@ -256,6 +256,77 @@ fn brush_times_a_stroke_after_loading_the_index() {
 }
 
 #[test]
+fn brush_per_step_reports_every_step() {
+    let dir = TempDir::new();
+    generate(&dir);
+    let printed = run_on(
+        &dir.project(),
+        "brush --level 6 --steps 4 --footprint 3000 --per-step",
+    )
+    .unwrap();
+    let steps: Vec<&String> = printed
+        .json
+        .iter()
+        .filter(|l| l.starts_with("{\"bench\":\"brush\",\"result\":\"step\""))
+        .collect();
+    assert_eq!(steps.len(), 4, "one record per step: {:?}", printed.json);
+    let stroke = line(&printed, "brush", "stroke");
+    let mut walls = Vec::new();
+    for (n, step) in steps.iter().enumerate() {
+        assert!(
+            (number(step, "step") - report::to_f64(n)).abs() < 0.5,
+            "in stroke order: {step}"
+        );
+        let phases: f64 = [
+            "query_ms",
+            "pin_ms",
+            "brush_ms",
+            "edit_ms",
+            "neighbours_ms",
+            "evaluate_ms",
+            "refit_ms",
+        ]
+        .iter()
+        .map(|phase| number(step, phase))
+        .sum();
+        let wall = number(step, "wall_ms");
+        assert!(
+            phases > 0.0 && phases <= wall + 1e-9,
+            "the phases lie within the step: {step}"
+        );
+        walls.push(wall);
+        assert!(
+            number(step, "vertices") > 0.0 && number(step, "tiles_edited") > 0.0,
+            "a footprint: {step}"
+        );
+        assert!(
+            number(step, "positions_computed") >= number(step, "tiles_edited")
+                && number(step, "normals_computed") >= number(step, "tiles_edited"),
+            "the edited tiles were evaluated again: {step}"
+        );
+        for counter in [
+            "corrections_loaded",
+            "corrections_evicted",
+            "evaluated_evicted",
+        ] {
+            assert!(
+                number(step, counter) < 0.5,
+                "a warm stroke under a roomy budget loads and evicts nothing: {step}"
+            );
+        }
+        assert!(
+            number(step, "minor_faults") >= 0.0,
+            "page faults counted: {step}"
+        );
+    }
+    let slowest = walls.iter().copied().fold(0.0, f64::max);
+    assert!(
+        (number(stroke, "step_max_ms") - slowest).abs() < 1e-9,
+        "the summary's slowest step is one of them: {stroke}"
+    );
+}
+
+#[test]
 fn save_reports_growth_per_edited_vertex() {
     let dir = TempDir::new();
     generate(&dir);
