@@ -430,7 +430,7 @@ impl Run<'_> {
                 "evict_all"
             }
             91..95 => {
-                let budget = u32::try_from(self.config.budget_bytes).unwrap();
+                let budget = u32::try_from(pools(&self.config)).unwrap();
                 store
                     .shrink_to(self.rng.below(budget + 1) as usize)
                     .unwrap();
@@ -503,10 +503,7 @@ fn run(
             run.index = None;
         }
         let at = format!("seed {seed} step {step} ({what})");
-        assert!(
-            store.bytes() <= config.budget_bytes,
-            "{at}: over the budget"
-        );
+        assert!(store.bytes() <= pools(&config), "{at}: over the budget");
         if let Err(broken) = store.deps.check_invariants() {
             panic!("{at}: dependency graph: {broken}");
         }
@@ -613,7 +610,7 @@ fn the_store_reads_as_the_dense_evaluation_for_many_seeds() {
             println!(
                 "{} faces, {} bytes, {reads:?}: {stats:?}",
                 mesh.face_count(),
-                config.budget_bytes
+                pools(&config)
             );
             total = total + stats;
         }

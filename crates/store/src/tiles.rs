@@ -156,15 +156,19 @@ use crate::workers::{StartWorkersError, Workers};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StoreConfig {
-    /// Bytes the two pools may hold together. The pools never exceed it. At least
-    /// [`StoreConfig::minimum_budget`] for the store's mesh. How the pools share it is the
-    /// store's memory policy (see [`TileStore`]): corrections take evaluated chunks only up to a
-    /// quarter of it, and never below the evaluated pool's floor.
+    /// Bytes the two pools and the kept predictions may hold together, never exceeded. At least
+    /// [`StoreConfig::minimum_budget`] for the store's mesh.
     ///
-    /// It bounds the pools alone. The evaluation scratch (about 3 MB), the read buffers, the
-    /// workers' own allocations (a few hundred KB each at most) and the thread stacks (2 MiB
-    /// reserved per worker) sit outside it: a few MB besides the budget, plus the stacks (see
-    /// "Memory outside the budget" on [`TileStore`]).
+    /// The kept predictions' share is set aside first, at its worst case
+    /// ([`StoreConfig::kept_prediction_bytes`]), and the pools share the rest. How they share it
+    /// is the store's memory policy (see [`TileStore`]): corrections take evaluated chunks only
+    /// up to a quarter of the whole budget, and never below the evaluated pool's floor, so the
+    /// kept predictions' share comes out of what the evaluated cache can grow to.
+    ///
+    /// The evaluation scratch (about 3 MB), the read buffers, the workers' own allocations (a
+    /// few hundred KB each at most) and the thread stacks (2 MiB reserved per worker) sit
+    /// outside it: a few MB besides the budget, plus the stacks (see "Memory outside the
+    /// budget" on [`TileStore`]).
     pub budget_bytes: usize,
     /// Bytes per pool chunk, the unit both pools grow and shrink by and are charged in (whole
     /// slots fill it, the rest of a chunk is charged unused):
@@ -178,8 +182,10 @@ pub struct StoreConfig {
     pub workers: Workers,
     /// How many tiles' predictions the store keeps for predicting them again in place (see
     /// "Kept predictions" on [`TileStore`]): [`StoreConfig::DEFAULT_KEPT_PREDICTIONS`] unless
-    /// set. Each is about 206 KB for a finest tile, outside the budget; zero keeps none, and
-    /// every tile is predicted in full. Results are the same bits either way.
+    /// set. Each is charged to the budget at the largest tile's size,
+    /// [`geom::Prediction::TILE_BYTES`] (about 206 KB); zero keeps none, and every tile is
+    /// predicted in full. Results are the same bits either way. [`TileStore::open`] refuses a
+    /// count whose share leaves the pools less than their minimum.
     pub kept_predictions: usize,
 }
 
@@ -187,9 +193,9 @@ impl StoreConfig {
     /// The default chunk: 64 MiB, large enough that the allocator maps each chunk on its own
     /// and gives it back to the OS when it is dropped (see the pool's notes).
     pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
-    /// The default [`StoreConfig::kept_predictions`]: 64, about 13 MB. A brush step re-predicts
-    /// the 20 to 30 tiles its sphere reaches, and a stroke moves on by a tenth of a radius a
-    /// step, so a stroke's tiles are reused for several steps before it leaves them.
+    /// The default [`StoreConfig::kept_predictions`]: 64, about 13 MB of the budget. A brush step
+    /// re-predicts the 20 to 30 tiles its sphere reaches, and a stroke moves on by a tenth of a
+    /// radius a step, so a stroke's tiles are reused for several steps before it leaves them.
     pub const DEFAULT_KEPT_PREDICTIONS: usize = 64;
 
     /// A store of `budget_bytes` whose op ids carry `site`, with
@@ -247,11 +253,20 @@ impl StoreConfig {
         }
     }
 
+    /// The bytes of the budget set aside for the kept predictions:
+    /// [`StoreConfig::kept_predictions`] at [`geom::Prediction::TILE_BYTES`] each, the most
+    /// they can hold. `None` if that is more than a `usize` counts (no budget holds it).
+    #[must_use]
+    pub const fn kept_prediction_bytes(&self) -> Option<usize> {
+        self.kept_predictions.checked_mul(Prediction::TILE_BYTES)
+    }
+
     /// The least [`StoreConfig::budget_bytes`] a store over `mesh` with these chunks works
     /// with: enough that no evaluation, normals computation or edit runs out of room while
-    /// nothing else is pinned.
+    /// nothing else is pinned, besides the kept predictions' share
+    /// ([`StoreConfig::kept_prediction_bytes`]; `usize::MAX` if that overflows).
     ///
-    /// That is the larger of
+    /// The pools' part is the larger of
     ///
     /// - evaluated chunks for twice the mesh's [`geom::cone_width`] (the two cone levels an
     ///   evaluation holds pinned, see the module notes) plus one correction chunk, and
@@ -266,7 +281,9 @@ impl StoreConfig {
     /// it once.
     #[must_use]
     pub fn minimum_budget(&self, mesh: &BaseMesh) -> usize {
-        Headroom::of(mesh).minimum_budget(self.chunk_bytes)
+        Headroom::of(mesh)
+            .minimum_budget(self.chunk_bytes)
+            .saturating_add(self.kept_prediction_bytes().unwrap_or(usize::MAX))
     }
 
     /// The worker threads this configuration asks for on this machine (see
@@ -348,6 +365,30 @@ impl Headroom {
     }
 }
 
+/// The budget's share for the kept predictions ([`StoreConfig::kept_prediction_bytes`]), once
+/// `config`'s budget is checked to hold it beside the pools' minimum for `headroom`.
+///
+/// # Errors
+///
+/// [`CacheError::BudgetTooSmall`] if the budget is below the pools' minimum alone;
+/// [`CacheError::TooManyKeptPredictions`] if it holds that but not the kept predictions besides.
+fn kept_share(headroom: Headroom, config: &StoreConfig) -> Result<usize, CacheError> {
+    let pools = headroom.minimum_budget(config.chunk_bytes);
+    let Some(spare) = config.budget_bytes.checked_sub(pools) else {
+        let kept = config.kept_prediction_bytes().unwrap_or(usize::MAX);
+        return Err(CacheError::BudgetTooSmall {
+            minimum: pools.saturating_add(kept),
+        });
+    };
+    config
+        .kept_prediction_bytes()
+        .filter(|&kept| kept <= spare)
+        .ok_or(CacheError::TooManyKeptPredictions {
+            asked: config.kept_predictions,
+            most: spare / Prediction::TILE_BYTES,
+        })
+}
+
 /// Why a [`TileStore`] operation failed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -400,11 +441,22 @@ pub enum CacheError {
     /// working file filled before the latest edit.
     #[error("the store was edited after the save it was to be rebased on")]
     StaleSave,
-    /// The configured budget is below [`StoreConfig::minimum_budget`] for the mesh.
+    /// The configured budget is below [`StoreConfig::minimum_budget`] for the mesh, without
+    /// counting the kept predictions (see [`CacheError::TooManyKeptPredictions`]).
     #[error("the budget is below the {minimum} bytes this mesh needs")]
     BudgetTooSmall {
-        /// The least budget the mesh works with.
+        /// The least budget the mesh works with, at the configured
+        /// [`StoreConfig::kept_predictions`] ([`StoreConfig::minimum_budget`]).
         minimum: usize,
+    },
+    /// The budget holds the pools' minimum, but not beside the share the configured
+    /// [`StoreConfig::kept_predictions`] need ([`StoreConfig::kept_prediction_bytes`]).
+    #[error("keeping {asked} predictions takes more of the budget than the {most} it can spare")]
+    TooManyKeptPredictions {
+        /// The kept predictions asked for.
+        asked: usize,
+        /// The most this budget can keep beside the pools' minimum.
+        most: usize,
     },
     /// Every op id of this site has been handed out.
     #[error("the op ids of this site are used up")]
@@ -762,15 +814,12 @@ struct EvalLog {
 ///
 /// # Memory outside the budget
 ///
-/// [`StoreConfig::budget_bytes`] bounds the two pools, which hold nearly all of a store's
-/// memory. Besides them, and not charged to the budget:
+/// [`StoreConfig::budget_bytes`] bounds the two pools and the kept predictions, which hold
+/// nearly all of a store's memory. Besides them, and not charged to the budget:
 ///
 /// - the evaluation scratch: one buffer of the largest tile's positions (about 50 KB) per tile of a
 ///   round not predicted in place, so about 3.2 MB at most (64 of them, once a round of new tiles
 ///   has been built), kept for the store's life;
-/// - the kept predictions: up to [`StoreConfig::kept_predictions`] of them, about 206 KB each for a
-///   finest tile (the predicted positions with their ring, and a tangent frame per vertex), so
-///   about 13 MB at the default 64;
 /// - the buffers and zstd context the owner thread reads correction tiles with, each evaluation
 ///   worker's (made the first time a round's tiles are loaded on the workers) and each prefetch
 ///   worker's (at most four): about 150 KB a thread, so a few MB with dozens of workers, with the
@@ -778,7 +827,8 @@ struct EvalLog {
 ///   about 27 KB each;
 /// - what each evaluation worker allocates while it predicts a tile or computes its normals: the
 ///   gathered parent block, the prediction and its tangent frames, a few tiles' worth (a few
-///   hundred KB for the largest tiles), freed when the tile is done;
+///   hundred KB for the largest tiles), freed when the tile is done (a prediction to be kept is
+///   charged to the budget instead);
 /// - the thread stacks: Rust's default of 2 MiB of address space reserved per evaluation worker
 ///   ([`StoreConfig::workers`]) and per prefetch worker, of which only the pages touched are
 ///   committed;
@@ -799,7 +849,7 @@ pub struct TileStore {
     /// The project file as of its last save, read where the working file has no record; `None`
     /// for a project never saved.
     base: Option<BaseFile>,
-    /// The bytes both pools may hold.
+    /// The bytes both pools may hold: the configured budget less the kept predictions' share.
     budget: Budget,
     /// What the store pins for its own work, besides [`TileStore::pin`]'s tiles.
     headroom: Headroom,
@@ -1457,7 +1507,8 @@ impl TileStore {
     ///
     /// [`CacheError::ReservedSite`]; [`CacheError::WrongBase`] if `working` is a recovery file
     /// that names a save point (it needs that save point under it);
-    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`];
+    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`] without the kept
+    /// predictions, [`CacheError::TooManyKeptPredictions`] below it with them;
     /// [`CacheError::OpsExhausted`] if the file's head is the site's last op id;
     /// [`CacheError::Store`] if the read buffers can't be made; [`CacheError::Workers`] if the
     /// evaluation workers can't be started.
@@ -1483,7 +1534,8 @@ impl TileStore {
     ///
     /// [`CacheError::ReservedSite`]; [`CacheError::MeshMismatch`] if the base's mesh hash isn't
     /// the working file's; [`CacheError::WrongBase`] if the files don't belong together;
-    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`];
+    /// [`CacheError::BudgetTooSmall`] below [`StoreConfig::minimum_budget`] without the kept
+    /// predictions, [`CacheError::TooManyKeptPredictions`] below it with them;
     /// [`CacheError::OpsExhausted`] if a file's head is the site's last op id;
     /// [`CacheError::Store`] if the read buffers can't be made; [`CacheError::Workers`] if the
     /// evaluation workers can't be started.
@@ -1505,10 +1557,7 @@ impl TileStore {
         check_layers(working.meta(), base.as_ref())?;
         let mesh = working.mesh();
         let headroom = Headroom::of(&mesh);
-        let minimum = headroom.minimum_budget(config.chunk_bytes);
-        if config.budget_bytes < minimum {
-            return Err(CacheError::BudgetTooSmall { minimum });
-        }
+        let kept_bytes = kept_share(headroom, &config)?;
         let next_op = first_op(
             config.site,
             [working.head(), base.as_ref().and_then(BaseFile::head)],
@@ -1532,7 +1581,7 @@ impl TileStore {
             mesh_hash,
             file: working,
             base,
-            budget: Budget::new(config.budget_bytes),
+            budget: Budget::new(config.budget_bytes - kept_bytes),
             headroom,
             corrections: Pool::with_eviction_log(config.chunk_bytes),
             evaluated: Pool::with_eviction_log(config.chunk_bytes),
@@ -3643,8 +3692,9 @@ impl TileStore {
 
     /// Whether a correction acquire that found no free or clean slot may take an evaluated
     /// chunk back rather than write a dirty tile back: while the correction pool holds less
-    /// than a quarter of the budget, and the evaluated pool keeps its floor (its share of the
-    /// minimum budget plus one chunk) without the chunk, and has a chunk without pins to give.
+    /// than a quarter of the pools' budget (the kept predictions' share left out), and the
+    /// evaluated pool keeps its floor (its share of the minimum budget plus one chunk) without
+    /// the chunk, and has a chunk without pins to give.
     fn may_take_evaluated_chunk(&self) -> bool {
         let chunk = self.evaluated.chunk_bytes();
         let floor = self.headroom.evaluated_floor(chunk);

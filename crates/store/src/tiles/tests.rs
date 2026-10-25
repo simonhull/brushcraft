@@ -110,12 +110,27 @@ pub(crate) fn fixed(n: usize) -> Workers {
     Workers::Fixed(NonZeroUsize::new(n).expect("a positive worker count"))
 }
 
-/// A configuration with chunks of `chunk_slots` evaluated slots and a budget of `chunks` of
-/// them, and [`TEST_THREADS`] workers.
+/// A configuration with pools of `chunks` chunks of `chunk_slots` evaluated slots.
+///
+/// The default kept predictions come besides (their share of the budget, see
+/// [`StoreConfig::kept_prediction_bytes`]), with [`TEST_THREADS`] workers.
 fn config(chunks: usize, chunk_slots: usize) -> StoreConfig {
-    StoreConfig::new(chunks * chunk_slots * EVAL, SITE)
-        .with_chunk_bytes(chunk_slots * EVAL)
-        .with_workers(TEST_THREADS)
+    with_kept_share(
+        StoreConfig::new(chunks * chunk_slots * EVAL, SITE)
+            .with_chunk_bytes(chunk_slots * EVAL)
+            .with_workers(TEST_THREADS),
+    )
+}
+
+/// The bytes `config`'s pools may hold: its budget less the kept predictions' share.
+pub(crate) fn pools(config: &StoreConfig) -> usize {
+    config.budget_bytes - config.kept_prediction_bytes().unwrap()
+}
+
+/// `config` with its kept predictions' share added to its budget: pools of the budget it had.
+pub(crate) fn with_kept_share(config: StoreConfig) -> StoreConfig {
+    let kept = config.kept_prediction_bytes().unwrap();
+    config.with_budget_bytes(config.budget_bytes + kept)
 }
 
 /// Room for every tile of levels 1–8 of the cube, twice over.
@@ -382,10 +397,10 @@ fn evaluation_equals_dense(config: StoreConfig) -> (TestDir, TileStore) {
     let reversed: Vec<TileKey> = all.iter().rev().copied().collect();
     assert_positions(&mut store, &dense, &reversed, "second pass");
     assert!(
-        store.bytes() <= config.budget_bytes,
+        store.bytes() <= pools(&config),
         "{} bytes in a budget of {}",
         store.bytes(),
-        config.budget_bytes
+        pools(&config)
     );
     (dir, store)
 }
@@ -515,10 +530,7 @@ fn wide_batches_near_the_minimum_keep_a_correction_chunk() {
             store
                 .evaluate_many(&finest, Evaluation::Normals)
                 .unwrap_or_else(|e| panic!("{what}: normals: {e:?}"));
-            assert!(
-                store.bytes() <= config.budget_bytes,
-                "{what}: over the budget"
-            );
+            assert!(store.bytes() <= pools(&config), "{what}: over the budget");
         }
         let dense = dense(&mesh, &map);
         assert_positions(&mut store, &dense, &all, &what);
@@ -540,7 +552,7 @@ fn batches_are_sized_from_the_room_the_evaluated_pool_can_reach() {
     );
     let (chunk, headroom) = (config.chunk_bytes, store.headroom.evaluated);
     let size = |held_chunks: usize| {
-        let chunks = (config.budget_bytes - (held_chunks + 1) * chunk) / chunk;
+        let chunks = (pools(&config) - (held_chunks + 1) * chunk) / chunk;
         (chunks * per_evaluated - headroom) / BATCH_SHARE
     };
     assert_eq!(store.batch_size(0), size(0), "the floor alone");
@@ -1115,7 +1127,7 @@ fn corrections_take_chunks_back_from_evaluated_tiles() {
         store.evaluate(*key).unwrap();
     }
     assert!(
-        store.bytes() + store.corrections.chunk_bytes() > config.budget_bytes,
+        store.bytes() + store.corrections.chunk_bytes() > pools(&config),
         "the evaluated pool has spent the budget"
     );
     // Every correction slot pinned: the next correction tile has no slot to reuse.
@@ -1134,7 +1146,7 @@ fn corrections_take_chunks_back_from_evaluated_tiles() {
         store.corrections.bytes() > corrections && store.evaluated.bytes() < evaluated,
         "an evaluated chunk was taken back for a correction chunk"
     );
-    assert!(store.bytes() <= config.budget_bytes, "within the budget");
+    assert!(store.bytes() <= pools(&config), "within the budget");
     for &id in &resident {
         assert!(
             store.corrections.get(id).is_some(),
@@ -1195,7 +1207,7 @@ fn spent_on_dirty_corrections(
     fill_and_dirty_corrections(&mut store, &all);
     assert_eq!(
         store.corrections.bytes() + store.evaluated.bytes(),
-        config.budget_bytes,
+        pools(&config),
         "the budget is spent"
     );
     store
@@ -1628,14 +1640,78 @@ fn a_budget_below_the_minimum_is_refused() {
         minimum > config(5, 4).budget_bytes,
         "and a chunk less is not"
     );
-    let file =
-        ProjectFile::create(&dir.path("small.bcp"), meta_for(&mesh), Arc::clone(&mesh)).unwrap();
-    let small = tight().with_budget_bytes(minimum - 1);
-    let refused = TileStore::open(file, small);
+    let open = |name: &str, config: StoreConfig| {
+        let file =
+            ProjectFile::create(&dir.path(name), meta_for(&mesh), Arc::clone(&mesh)).unwrap();
+        TileStore::open(file, config)
+    };
+    let kept = tight().kept_prediction_bytes().unwrap();
+    let pools = minimum - kept;
+    let refused = open("small.bcp", tight().with_budget_bytes(pools - 1));
     assert!(
         matches!(refused, Err(CacheError::BudgetTooSmall { minimum: m }) if m == minimum),
-        "refused: {refused:?}"
+        "below the pools' minimum: {refused:?}"
     );
+    let none_kept = tight().with_kept_predictions(0);
+    assert_eq!(
+        none_kept.minimum_budget(&mesh),
+        pools,
+        "nothing kept, nothing set aside"
+    );
+    assert!(
+        open("none.bcp", none_kept.with_budget_bytes(pools)).is_ok(),
+        "the pools' minimum is enough with nothing kept"
+    );
+    let short = open("kept.bcp", tight().with_budget_bytes(minimum - 1));
+    assert!(
+        matches!(
+            short,
+            Err(CacheError::TooManyKeptPredictions {
+                asked: 64,
+                most: 63
+            })
+        ),
+        "a byte short of the kept predictions' share: {short:?}"
+    );
+    assert!(
+        open("exact.bcp", tight().with_budget_bytes(minimum)).is_ok(),
+        "the minimum is enough"
+    );
+}
+
+/// A kept-prediction count beyond any budget is refused with what the budget can keep, not
+/// allocated for.
+#[test]
+fn kept_predictions_beyond_the_budget_are_refused() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    for (n, asked) in [usize::MAX, usize::MAX / Prediction::TILE_BYTES + 1, 1 << 20]
+        .into_iter()
+        .enumerate()
+    {
+        let config = roomy().with_kept_predictions(asked);
+        let spare = config.budget_bytes - Headroom::of(&mesh).minimum_budget(config.chunk_bytes);
+        let file = ProjectFile::create(
+            &dir.path(&format!("{n}.bcp")),
+            meta_for(&mesh),
+            Arc::clone(&mesh),
+        )
+        .unwrap();
+        let refused = TileStore::open(file, config);
+        assert!(
+            matches!(
+                refused,
+                Err(CacheError::TooManyKeptPredictions { asked: a, most })
+                    if a == asked && most == spare / Prediction::TILE_BYTES
+            ),
+            "{asked}: {refused:?}"
+        );
+        assert_eq!(
+            config.minimum_budget(&mesh) == usize::MAX,
+            config.kept_prediction_bytes().is_none(),
+            "{asked}: a share past usize is a minimum no budget meets"
+        );
+    }
 }
 
 #[test]
@@ -3436,10 +3512,10 @@ const WORKLOAD_PINS: usize = 3;
 /// which counts exactly their chunks, and the dependency graph is whole.
 fn check_workload_step(store: &TileStore, config: StoreConfig, what: &str) {
     assert!(
-        store.bytes() <= config.budget_bytes,
+        store.bytes() <= pools(&config),
         "{what}: {} bytes in a budget of {}",
         store.bytes(),
-        config.budget_bytes
+        pools(&config)
     );
     assert_eq!(
         store.bytes(),
@@ -3527,7 +3603,7 @@ fn random_workload(seed: u64, steps: u32) {
                 "evict_all"
             }
             _ => {
-                let budget = u32::try_from(config.budget_bytes).unwrap();
+                let budget = u32::try_from(pools(&config)).unwrap();
                 store.shrink_to(rng.below(budget + 1) as usize).unwrap();
                 "shrink_to"
             }
