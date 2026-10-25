@@ -910,6 +910,242 @@ fn the_change_feed_stays_bounded_while_protection_is_paused() {
     );
 }
 
+/// Fails a stroke's sync and the roll-over after it, and polls until crash protection pauses.
+///
+/// The writer's next sync fails, and the roll-over after it with an I/O error of `kind`
+/// (before its rename); returns why protection paused. The flushes of earlier strokes finish
+/// first, so the sync that fails is this stroke's.
+fn fail_and_pause(
+    project: &mut Project,
+    map: &mut CorrectionMap,
+    seed: u64,
+    kind: io::ErrorKind,
+) -> ProjectError {
+    project.finish_flushes().unwrap();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    project.fail_next_recovery_with(kind);
+    stroke(project, map, 60, seed);
+    let began = Instant::now();
+    loop {
+        match project.poll() {
+            Ok(()) => {
+                assert!(began.elapsed() < Duration::from_secs(30), "the sync fails");
+                std::thread::yield_now();
+            }
+            Err(e) => return e,
+        }
+    }
+}
+
+/// A directory made read-only for a test, made writable again on drop, so the test directory
+/// can be removed whatever happens.
+struct ReadOnly(PathBuf);
+
+impl ReadOnly {
+    /// Makes `dir` read-only; `None` if files can still be made in it (running as root, say),
+    /// so a test that needs it unwritable has nothing to check.
+    fn new(dir: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let guard = Self(dir.to_path_buf());
+        let probe = dir.join("probe");
+        if fs::write(&probe, b"").is_ok() {
+            drop(fs::remove_file(&probe));
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        drop(fs::set_permissions(
+            &self.0,
+            fs::Permissions::from_mode(0o755),
+        ));
+    }
+}
+
+/// A failed file is released once a new recovery file replaces it, so a second failure is
+/// stranded too.
+///
+/// Two cycles of a failed sync and a failed roll-over: after each the store leaves the failed
+/// file, which takes no more appends; after the first roll-over that gets there, nothing is
+/// stranded and the store's working file isn't marked failed, so the second failed file is
+/// left the same way. The last recovery file holds every edit.
+#[test]
+fn a_second_failed_file_is_stranded_as_the_first_was() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 101);
+    let first = project.recovery_path().unwrap().to_path_buf();
+    let failed = fail_and_pause(&mut project, &mut map, 102, io::ErrorKind::Other);
+    assert!(paused_by_io(&failed), "{failed:?}");
+    assert!(project.is_stranded(), "the failed file is stranded");
+    assert!(
+        !project.store().is_working_failed(),
+        "the store has left the failed file"
+    );
+    project.tick(Instant::now() + ROLL_OVER_RETRY).unwrap();
+    let second = project.recovery_path().unwrap().to_path_buf();
+    assert_ne!(second, first, "rolled over");
+    assert!(
+        !project.is_stranded(),
+        "the stranded file is released once a new recovery file replaces it"
+    );
+    assert!(
+        !project.store().is_working_failed(),
+        "the new recovery file isn't failed"
+    );
+    let again = fail_and_pause(&mut project, &mut map, 103, io::ErrorKind::Other);
+    assert!(paused_by_io(&again), "{again:?}");
+    assert!(project.is_stranded(), "the second failed file is stranded");
+    let len = fs::metadata(&second).unwrap().len();
+    stroke(&mut project, &mut map, 60, 104);
+    project.store().evict_all().unwrap();
+    assert_eq!(
+        fs::metadata(&second).unwrap().len(),
+        len,
+        "nothing is appended to the second recovery file whose sync failed"
+    );
+    project.tick(Instant::now() + ROLL_OVER_RETRY).unwrap();
+    assert_ne!(
+        project.recovery_path().unwrap(),
+        second,
+        "rolled over again"
+    );
+    assert!(!second.exists(), "the second failed file goes");
+    let path = project.recovery_path().unwrap().to_path_buf();
+    project.close(true).unwrap();
+    let file = ProjectFile::open(&path).unwrap();
+    let mut store = TileStore::open(file, roomy()).unwrap();
+    assert_positions(
+        &mut store,
+        &dense(&mesh, &map),
+        &tiles(&mesh, 1, TOP),
+        "every edit, through both failures",
+    );
+}
+
+/// A saved project's failed recovery file is stranded onto a scratch file in the project
+/// file's folder: disk-backed, beside the user's work, never the system's temporary folder.
+#[test]
+fn a_saved_project_strands_its_failed_file_in_the_project_folder() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    let path = dir.path("p.bcrf");
+    stroke(&mut project, &mut map, 60, 111);
+    assert_saved(project.save_as(&path));
+    stroke(&mut project, &mut map, 60, 112);
+    let failed = fail_and_pause(&mut project, &mut map, 113, io::ErrorKind::Other);
+    assert!(paused_by_io(&failed), "{failed:?}");
+    let folder = path.parent().unwrap().to_path_buf();
+    assert_eq!(
+        project.strand_tries(),
+        [(folder, true)],
+        "the scratch file is made in the project file's folder first, and is used"
+    );
+    assert!(project.is_stranded(), "stranded");
+    assert!(
+        project
+            .strand_tries()
+            .iter()
+            .all(|(tried, _)| *tried != std::env::temp_dir()),
+        "never in the temporary folder"
+    );
+    project.tick(Instant::now() + ROLL_OVER_RETRY).unwrap();
+    assert_saved(project.save());
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "every edit, saved after the stranding");
+}
+
+/// With the project file's folder unwritable, the scratch file goes in the recovery folder.
+#[test]
+fn a_failed_file_is_stranded_in_the_recovery_folder_when_the_project_folder_is_unwritable() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    let folder = dir.path("project");
+    fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("p.bcrf");
+    stroke(&mut project, &mut map, 60, 121);
+    assert_saved(project.save_as(&path));
+    stroke(&mut project, &mut map, 60, 122);
+    let Some(read_only) = ReadOnly::new(&folder) else {
+        return;
+    };
+    let failed = fail_and_pause(&mut project, &mut map, 123, io::ErrorKind::Other);
+    assert!(paused_by_io(&failed), "{failed:?}");
+    assert_eq!(
+        project.strand_tries(),
+        [(folder, false), (dir.path("recovery"), true)],
+        "the project folder fails, and the recovery folder takes the scratch file"
+    );
+    assert!(project.is_stranded(), "stranded");
+    drop(read_only);
+    project.tick(Instant::now() + ROLL_OVER_RETRY).unwrap();
+    assert_saved(project.save());
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "every edit, saved after the stranding");
+}
+
+/// A roll-over that ran out of space isn't followed by a copy into the same folder, and a
+/// failed file the store couldn't leave takes no save point; a save moves the store off it.
+///
+/// The roll-over fails for want of space, and the project folder is unwritable: the stranding
+/// tries the project folder only, so the store stays on the failed file, where
+/// [`TileStore::save`] refuses. The project's save goes through all the same, onto a fresh
+/// recovery file, and the store is on a healthy file again.
+#[test]
+fn a_full_recovery_folder_is_not_tried_again_and_a_failed_file_takes_no_save_point() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    let folder = dir.path("project");
+    fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("p.bcrf");
+    stroke(&mut project, &mut map, 60, 131);
+    assert_saved(project.save_as(&path));
+    stroke(&mut project, &mut map, 60, 132);
+    let Some(read_only) = ReadOnly::new(&folder) else {
+        return;
+    };
+    let failed = fail_and_pause(&mut project, &mut map, 133, io::ErrorKind::StorageFull);
+    assert!(paused_by_io(&failed), "{failed:?}");
+    assert_eq!(
+        project.strand_tries(),
+        [(folder, false)],
+        "the recovery folder, out of space, isn't filled again"
+    );
+    assert!(!project.is_stranded(), "nowhere to strand it");
+    assert!(
+        project.store().is_working_failed(),
+        "the store is still on the failed file"
+    );
+    assert!(
+        matches!(project.store().save(), Err(CacheError::FailedWorkingFile)),
+        "no save point is written into a failed file"
+    );
+    // The save's own roll-over fails the same way; its fresh recovery file doesn't.
+    project.fail_next_recovery_with(io::ErrorKind::StorageFull);
+    let saved = project.save().unwrap();
+    assert!(saved.protection.is_active(), "{saved:?}");
+    assert!(
+        !project.store().is_working_failed(),
+        "the save moved the store onto its fresh recovery file"
+    );
+    drop(read_only);
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "every edit, saved from the failed file");
+}
+
 /// One stroke whose flush fails to sync.
 ///
 /// Begun, `count` random edits with `seed` applied as its dabs to the project's store and to

@@ -439,6 +439,12 @@ pub enum CacheError {
     /// writes its save points itself.
     #[error("the working file is streamed by a recovery writer, which writes its save points")]
     Streaming,
+    /// [`TileStore::save`] was called while the working file is a recovery file whose writer
+    /// failed: a sync of it failed (or the writer's thread stopped), so no save point may be
+    /// written there again. The project moves the store to a new file; save the project
+    /// ([`crate::Project::save`]) instead.
+    #[error("the working file is a recovery file whose sync failed: no save point goes there")]
+    FailedWorkingFile,
     /// A rebase was given a save that is out of date: the store was edited after the save was
     /// made, so the save doesn't hold every edit. Save again. Or a roll-over was given a new
     /// working file filled before the latest edit.
@@ -896,6 +902,12 @@ pub struct TileStore {
     /// Counts the working files the store has had: a rebase moves it on, so a recovery flush
     /// started before can tell it would finish in the wrong file.
     generation: u64,
+    /// Whether the working file is a recovery file whose writer failed (a failed sync, or a
+    /// stopped writer thread), as its owner said ([`TileStore::fail_working`]). After a failed
+    /// sync, what was appended since the last durable save point may not be on disk, so no save
+    /// point may be written there again: [`TileStore::save`] refuses. Cleared when the store
+    /// moves to another working file, by a rebase or a roll-over.
+    working_failed: bool,
     /// The spatial index's bounds the store keeps in its files: which changed since the last
     /// save, which the working file lacks, and which writes may have made stale (see
     /// [`crate::bounds`]).
@@ -1642,6 +1654,7 @@ impl TileStore {
             last_write: Stamp::ZERO,
             known_ops: HashMap::new(),
             generation: 0,
+            working_failed: false,
             bounds,
             feed,
             save_consumer,
@@ -1868,6 +1881,7 @@ impl TileStore {
         self.since_rebase.clear();
         self.bounds.rebased();
         self.generation += 1;
+        self.working_failed = false;
         // The old workers read the old files; dropping them joins them and drops their results.
         self.prefetch = Prefetcher::new();
         self.next_op = next_op;
@@ -2102,6 +2116,7 @@ impl TileStore {
         // The new file holds every bound as it is now.
         self.bounds.all_flushed();
         self.generation += 1;
+        self.working_failed = false;
         // The workers' jobs name records of the old file.
         self.prefetch = Prefetcher::new();
         let old = std::mem::replace(&mut self.file, file);
@@ -2739,6 +2754,9 @@ impl TileStore {
     /// [`CacheError::Streaming`] while a recovery writer streams the working file: its save
     /// points are cuts at its snapshots, and one made here could name later edits than a save
     /// point the writer is about to write, so the durable state could go backwards.
+    /// [`CacheError::FailedWorkingFile`] while the working file is a recovery file whose
+    /// writer failed, as the [`crate::Project`] that owns the store marks it: a save point there
+    /// would vouch for records a failed sync may have lost.
     /// [`CacheError::WriteBack`] if a tile's or a bound's write fails; [`CacheError::Eval`] if
     /// listing what the edits made stale fails (never, for tiles of the store's mesh);
     /// [`CacheError::Store`] if the save point's write does; [`CacheError::Internal`] if the
@@ -2746,6 +2764,9 @@ impl TileStore {
     pub fn save(&mut self) -> Result<u64, CacheError> {
         if !self.streams.is_empty() {
             return Err(CacheError::Streaming);
+        }
+        if self.working_failed {
+            return Err(CacheError::FailedWorkingFile);
         }
         self.sync_pins()?;
         self.drain_saves();
@@ -2933,6 +2954,19 @@ impl TileStore {
     /// The working-file generation: moved on by every rebase.
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The working file is a recovery file whose writer failed (see
+    /// [`TileStore::working_failed`]): no save point is written there again, until the store
+    /// moves to another working file.
+    pub(crate) const fn fail_working(&mut self) {
+        self.working_failed = true;
+    }
+
+    /// Whether the working file is a recovery file whose writer failed, which the store hasn't
+    /// moved off yet ([`TileStore::fail_working`]).
+    pub(crate) const fn is_working_failed(&self) -> bool {
+        self.working_failed
     }
 
     /// Drops `key` from streaming consumer `id`'s flush mark: its copy couldn't be flushed, and

@@ -42,7 +42,9 @@
 //! ([`Project::recovery_path`]), until a new recovery file replaces it or a save makes it
 //! unneeded. The scratch file is made in the project file's directory or the recovery
 //! directory, never the temporary directory, which is often memory-backed: it is filled with
-//! every edit since the last save. If none can be made, the store stays on the failed file.
+//! every edit since the last save. If none can be made, the store stays on the failed file:
+//! write-back still lands there, but no save point is ever written there again
+//! ([`TileStore::save`] refuses).
 //!
 //! # The spatial index
 //!
@@ -392,10 +394,6 @@ pub struct Project {
     /// they are or the project closes, so no listing offers them while it runs (see
     /// [`Project::let_go`]). Deleting them is tried again whenever protection is put in place.
     held: Vec<(PathBuf, ProjectFile)>,
-    /// Whether the store's working file is a recovery file whose writer failed (a failed sync,
-    /// or a stopped thread), so nothing more may be appended to it: the store moves off it at
-    /// the first chance ([`Project::strand`], or a roll-over or a save).
-    failed_working: bool,
     /// The failed recovery file the store has moved off ([`Project::strand`]), still held (open
     /// and locked) while the store works on a scratch file instead. It stays the project's
     /// recovery file on disk ([`Project::recovery_path`]), at its last durable save point, until
@@ -403,10 +401,14 @@ pub struct Project {
     /// [`Project::let_go`].
     stranded: Option<ProjectFile>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
-    /// after its temporary file is written and synced, before the rename (see
-    /// [`Unplaced::crash`]).
+    /// after its temporary file is written and synced, before the rename, with an I/O error of
+    /// this kind (see [`Unplaced::crash`]).
     #[cfg(test)]
-    fail_next_recovery: bool,
+    fail_next_recovery: Option<io::ErrorKind>,
+    /// Test record: each directory [`Project::strand`] tried a scratch file in, in order, and
+    /// whether the store moved onto it there.
+    #[cfg(test)]
+    strand_tries: Vec<(PathBuf, bool)>,
 }
 
 impl std::fmt::Debug for Project {
@@ -648,10 +650,11 @@ impl Project {
             retry_at: None,
             retry_after: ROLL_OVER_RETRY,
             held: Vec::new(),
-            failed_working: false,
             stranded: None,
             #[cfg(test)]
-            fail_next_recovery: false,
+            fail_next_recovery: None,
+            #[cfg(test)]
+            strand_tries: Vec::new(),
         })
     }
 
@@ -893,7 +896,8 @@ impl Project {
     /// # Errors
     ///
     /// [`ProjectError::Recovery`] if the recovery writer fails, unless the failure was a sync,
-    /// which the project deals with by moving to a new recovery file holding every edit;
+    /// or a stopped writer thread, which the project deals with by moving to a new recovery
+    /// file holding every edit;
     /// [`ProjectError::ProtectionPaused`] if moving to a new recovery file fails (it is tried
     /// again after [`ROLL_OVER_RETRY`], then waits doubling up to a minute while it keeps
     /// failing); [`ProjectError::OldRecoveryKept`] if it moved, but couldn't delete the old
@@ -1013,7 +1017,8 @@ impl Project {
     ///
     /// Tiles the writer left out of its flushes (broken slots) wait to be reported
     /// ([`Project::report`]). If the writer has failed (a sync of the recovery file failed, or
-    /// its thread stopped, see [`crate::recovery`]), it is closed, and the project moves to a new
+    /// its thread stopped, see [`crate::recovery`]), it is closed, the store's working file is
+    /// marked failed ([`TileStore::fail_working`]), and the project moves to a new
     /// recovery file holding every edit ([`Project::resume`]); the failure, dealt with, isn't
     /// returned. With no writer, crash protection is paused: `call` isn't run, and protection
     /// is tried again.
@@ -1037,7 +1042,7 @@ impl Project {
         if let Some(failed) = self.writer.take() {
             // It can only say that it needs a new file; closing releases its subscription.
             drop(failed.close(&mut self.store, Instant::now()));
-            self.failed_working = true;
+            self.store.fail_working();
         }
         // With no writer, no flush drains save's cursor in the change feed, and nothing else
         // does between saves: drained here, the feed stays bounded while protection is paused.
@@ -1065,7 +1070,7 @@ impl Project {
         };
         match self.roll_over() {
             Err(cause) if self.writer.is_none() => {
-                self.strand();
+                self.strand(&cause);
                 Err(self.pause(cause, now))
             }
             rolled => {
@@ -1139,7 +1144,6 @@ impl Project {
             }
         };
         self.unreported.extend(lost);
-        self.failed_working = false;
         let retired = match self.recovery_path.replace(fresh_path) {
             Some(old_path) => self.let_go(old_path, old),
             // A scratch file, which no listing finds: closing it deletes it.
@@ -1217,7 +1221,6 @@ impl Project {
                 return Err(e.into());
             }
         };
-        self.failed_working = false;
         let kept = match std::mem::replace(&mut self.recovery_path, fresh_path) {
             Some(old_path) => self.let_go(old_path, old),
             None => None,
@@ -1264,50 +1267,81 @@ impl Project {
     }
 
     /// Moves the store off a failed recovery file onto an unlinked scratch file on disk-backed
-    /// storage, so later write-backs never reach the failed one: after a roll-over failed, with
-    /// crash protection pausing. The failed file is kept, held, as the recovery file on disk
-    /// ([`Project::stranded`]), at its last durable save point.
+    /// storage, so later write-backs never reach the failed one: after a roll-over failed, for
+    /// `cause`, with crash protection pausing. The failed file is kept, held, as the recovery
+    /// file on disk ([`Project::stranded`]), at its last durable save point.
     ///
     /// The scratch file is filled with every edit ([`TileStore::fill_roll_over`]) and swapped in
-    /// ([`TileStore::roll_over`]). It is made in the project file's directory, when the project
-    /// has been saved, else (or if that fails) in the recovery directory, where the roll-over
-    /// just failed, so it often fails too. Never in the system's temporary directory: that is
-    /// often memory-backed (tmpfs), and filling the file there would put every edit since the
+    /// ([`TileStore::roll_over`]), which clears the store's failed mark. It is made in the
+    /// project file's directory, when the project has been saved, else (or if that fails) in the
+    /// recovery directory, where the roll-over just failed, so it often fails too. If the
+    /// roll-over failed for want of space ([`is_out_of_space`]), the recovery directory is
+    /// skipped: filling a file there again would copy every edit since the last save on the
+    /// drawing thread only to fail the same way. Never in the system's temporary directory: that
+    /// is often memory-backed (tmpfs), and filling the file there would put every edit since the
     /// last save into memory outside the store's budget, under the very pressure that writes
     /// tiles back.
     ///
-    /// Best effort: does nothing unless the working file is a failed recovery file not yet left;
-    /// if no scratch file can be made or filled, the store stays where it was.
-    fn strand(&mut self) {
-        if !self.failed_working || self.stranded.is_some() {
+    /// A crash between making the scratch file and unlinking it leaves a stray
+    /// `brushcraft-<project id>-<suffix>.scratch` in that directory, the project file's one
+    /// included. No listing takes it for a recovery file (their names end in `.bcrf`); making it
+    /// unnamed from the start (`O_TMPFILE`) would leave nothing, and is a later change.
+    ///
+    /// Best effort: does nothing unless the working file is a failed recovery file
+    /// ([`TileStore::is_working_failed`]); if no scratch file can be made or filled, the store
+    /// stays where it was, and [`TileStore::save`] refuses to write a save point there.
+    fn strand(&mut self, cause: &ProjectError) {
+        if !self.store.is_working_failed() {
             return;
         }
+        debug_assert!(
+            self.recovery_path.is_some(),
+            "a failed recovery file is the project's recovery file on disk"
+        );
+        debug_assert!(
+            self.stranded.is_none(),
+            "a file stranded before was released when the store moved to a new one"
+        );
+        if self.stranded.is_some() {
+            return;
+        }
+        let skip_recovery_dir = is_out_of_space(cause);
         let dirs: Vec<PathBuf> = self
             .path
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf)
             .into_iter()
-            .chain([self.recovery_dir.clone()])
+            .chain((!skip_recovery_dir).then(|| self.recovery_dir.clone()))
             .collect();
-        for dir in &dirs {
-            let meta = self.store.working().meta().clone();
-            let Ok(file) = scratch_in(dir, meta, self.store.working()) else {
-                continue;
-            };
-            // A failed fill changes nothing in the store, so the next directory can be tried.
-            let Ok(filled) = self.store.fill_roll_over(file) else {
-                continue;
-            };
-            // The store can't have moved on since the fill, within this call.
-            let Ok((old, lost)) = self.store.roll_over(filled) else {
+        for dir in dirs {
+            let moved = self.strand_in(&dir);
+            #[cfg(test)]
+            self.strand_tries.push((dir, moved));
+            if moved {
                 return;
-            };
-            self.unreported.extend(lost);
-            self.stranded = Some(old);
-            self.failed_working = false;
-            return;
+            }
         }
+    }
+
+    /// [`Project::strand`] in `dir`: makes a scratch file there, fills it and moves the store
+    /// onto it; whether it did. A failed fill changes nothing in the store, so the caller can try
+    /// the next directory.
+    fn strand_in(&mut self, dir: &Path) -> bool {
+        let meta = self.store.working().meta().clone();
+        let Ok(file) = scratch_in(dir, meta, self.store.working()) else {
+            return false;
+        };
+        let Ok(filled) = self.store.fill_roll_over(file) else {
+            return false;
+        };
+        // The store can't have moved on since the fill, within this call.
+        let Ok((old, lost)) = self.store.roll_over(filled) else {
+            return false;
+        };
+        self.unreported.extend(lost);
+        self.stranded = Some(old);
+        true
     }
 }
 
@@ -1336,6 +1370,15 @@ fn retire(old: &Path) -> Result<(), KeptRecovery> {
         } else {
             kept(io::Error::other(e))
         }
+    })
+}
+
+/// Whether `e`, or an error it comes from, is an I/O error for want of space (`ENOSPC`).
+fn is_out_of_space(e: &ProjectError) -> bool {
+    let first: &(dyn std::error::Error + 'static) = e;
+    std::iter::successors(Some(first), |err| err.source()).any(|err| {
+        err.downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::StorageFull)
     })
 }
 
@@ -1395,7 +1438,24 @@ impl Project {
     /// Makes the next placement of a recovery file fail once its temporary file is written and
     /// synced, before the rename: what a crash mid-create leaves.
     pub(crate) const fn fail_next_recovery(&mut self) {
-        self.fail_next_recovery = true;
+        self.fail_next_recovery_with(io::ErrorKind::Other);
+    }
+
+    /// As [`Project::fail_next_recovery`], failing with an I/O error of `kind`: a full disk
+    /// ([`io::ErrorKind::StorageFull`]), say.
+    pub(crate) const fn fail_next_recovery_with(&mut self, kind: io::ErrorKind) {
+        self.fail_next_recovery = Some(kind);
+    }
+
+    /// Each directory [`Project::strand`] has tried a scratch file in, in order, and whether
+    /// the store moved onto it there.
+    pub(crate) fn strand_tries(&self) -> &[(PathBuf, bool)] {
+        &self.strand_tries
+    }
+
+    /// Whether a failed recovery file is stranded: held while the store works on a scratch file.
+    pub(crate) const fn is_stranded(&self) -> bool {
+        self.stranded.is_some()
     }
 }
 
@@ -1694,10 +1754,10 @@ struct Unplaced {
     tmp: PathBuf,
     /// Its name once placed: `<project id>-<suffix>.bcrf`.
     path: PathBuf,
-    /// Test hook: [`Unplaced::place`] fails as a crash before the rename would, and leaves the
-    /// temporary file behind as a crash does.
+    /// Test hook: [`Unplaced::place`] fails as a crash before the rename would, with an I/O
+    /// error of this kind, and leaves the temporary file behind as a crash does.
     #[cfg(test)]
-    crash: bool,
+    crash: Option<io::ErrorKind>,
 }
 
 impl Unplaced {
@@ -1710,8 +1770,8 @@ impl Unplaced {
     /// sync fails. The temporary file is removed then.
     fn place(self) -> Result<PathBuf, ProjectError> {
         #[cfg(test)]
-        if self.crash {
-            return Err(io::Error::other("a crash before the rename, for the test").into());
+        if let Some(kind) = self.crash {
+            return Err(io::Error::new(kind, "a crash before the rename, for the test").into());
         }
         let placed = (|| {
             place_new(&self.tmp, &self.path)?;
@@ -1729,7 +1789,7 @@ impl Unplaced {
 
     /// These names, with [`Unplaced::crash`] set to `crash`.
     #[cfg(test)]
-    fn crashing(self, crash: bool) -> Self {
+    fn crashing(self, crash: Option<io::ErrorKind>) -> Self {
         Self { crash, ..self }
     }
 
@@ -1762,7 +1822,7 @@ fn create_recovery(
         tmp: dir.join(format!("{name}.tmp")),
         path: dir.join(&name),
         #[cfg(test)]
-        crash: false,
+        crash: None,
     };
     let file = create(&names.tmp)?;
     Ok((file, names))
