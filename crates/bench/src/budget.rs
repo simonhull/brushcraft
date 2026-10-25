@@ -19,6 +19,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use sculpt::Stroke;
 use store::{Project, TileStore};
 
 use crate::brush::{Plan, Size};
@@ -155,6 +156,7 @@ fn walk<J: Write, H: Write>(
 ) -> Result<usize> {
     let mut steps = 0;
     let mut radius = None;
+    let mut state = Stroke::new(project.store());
     for done in 1..=options.moves {
         let direction = rng.direction();
         let view = nearest_tiles(tiles, direction, options.view_tiles);
@@ -166,6 +168,7 @@ fn walk<J: Write, H: Write>(
         steps += session::stroke(
             project,
             index,
+            &mut state,
             &plan.centres,
             plan.radius,
             options.strength,

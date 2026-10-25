@@ -37,6 +37,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use geom::{TileKey, Vec3};
+use sculpt::Stroke;
 use store::{Evaluation, Project, SpatialIndex};
 
 use crate::cli::Options;
@@ -170,6 +171,7 @@ pub(crate) fn run<J: Write, H: Write>(
     out: &mut Output<J, H>,
 ) -> Result<()> {
     let (mut project, mut index, plan) = prepare(options, paths, "brush", out)?;
+    let mut state = Stroke::new(project.store());
     out.say(&format!(
         "brush: {} draw steps, radius {:.5}",
         plan.centres.len(),
@@ -180,6 +182,7 @@ pub(crate) fn run<J: Write, H: Write>(
     let cold = session::stroke(
         &mut project,
         &mut index,
+        &mut state,
         plan.centres.get(..1).unwrap_or_default(),
         plan.radius,
         options.strength,
@@ -190,6 +193,7 @@ pub(crate) fn run<J: Write, H: Write>(
     let dabs = session::stroke(
         &mut project,
         &mut index,
+        &mut state,
         &plan.centres,
         plan.radius,
         options.strength,
@@ -271,6 +275,7 @@ pub(crate) fn run_save<J: Write, H: Write>(
     out: &mut Output<J, H>,
 ) -> Result<()> {
     let (mut project, mut index, plan) = prepare(options, paths, "save", out)?;
+    let mut state = Stroke::new(project.store());
     plan.warm(&mut project, &index)?;
     // Every tile a dab can reach: the corrections that may change.
     let mut reached: Vec<TileKey> = plan
@@ -290,6 +295,7 @@ pub(crate) fn run_save<J: Write, H: Write>(
     let dabs = session::stroke(
         &mut project,
         &mut index,
+        &mut state,
         &plan.centres,
         plan.radius,
         options.strength,

@@ -126,9 +126,11 @@ pub(crate) enum Detail {
     PerStep,
 }
 
-/// Runs one stroke of draw steps with `radius` and `strength`, one at each of `centres`,
-/// between [`Project::begin_stroke`] and [`Project::end_stroke`], watching each as `detail`
-/// says.
+/// Runs one stroke of draw steps with `radius` and `strength`, one at each of `centres`.
+///
+/// The steps run between [`Project::begin_stroke`] and [`Project::end_stroke`], each watched as
+/// `detail` says. `stroke_state` is the session's one stroke state ([`Stroke`]), which starts
+/// afresh with the stroke.
 ///
 /// # Errors
 ///
@@ -137,6 +139,7 @@ pub(crate) enum Detail {
 pub(crate) fn stroke(
     project: &mut Project,
     index: &mut SpatialIndex,
+    stroke_state: &mut Stroke,
     centres: &[Vec3],
     radius: f32,
     strength: f32,
@@ -147,14 +150,13 @@ pub(crate) fn stroke(
         Detail::PerStep => sys::minor_faults().map(Some),
     };
     project.begin_stroke().context("beginning a stroke")?;
-    let mut stroke = Stroke::new(project.store());
     let mut dabs = Vec::with_capacity(centres.len());
     for &center in centres {
         let params = DrawParams::new(center, radius, strength)?;
         let faults_before = faults()?;
         let activity_before = project.store().activity();
         let start = Instant::now();
-        let stats = draw_step(project, index, &mut stroke, params).context("a draw step")?;
+        let stats = draw_step(project, index, stroke_state, params).context("a draw step")?;
         let wall = start.elapsed();
         let activity = project.store().activity().since(&activity_before);
         let minor_faults = faults()?

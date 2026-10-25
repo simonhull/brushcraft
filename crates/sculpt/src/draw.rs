@@ -260,8 +260,8 @@ impl Laps {
 /// vertices edited are those of the level `index` holds, the finest the store evaluates.
 ///
 /// `stroke` keeps each edited vertex's start and summed deltas across the stroke's steps, and
-/// the step writes their sum (see [`Stroke`]); it starts afresh when the store's op changes.
-/// Pass the same one to every step over this project.
+/// the step writes their sum (see [`Stroke`]); it starts afresh when the store's op changes, or
+/// when it is used over another store. Keep one for the session and pass it to every step.
 ///
 /// # Errors
 ///
@@ -270,8 +270,11 @@ impl Laps {
 /// can't be updated. An error in the edit phase
 /// leaves the tiles edited as [`TileStore::update_tiles`] says (the failing tile may have its
 /// whole interior pass applied, and is then marked dirty), and the index not updated for them:
-/// rebuild it. The deltas of the vertices it didn't write are in `stroke`'s sums all the same,
-/// so the next step that writes one of them writes them too.
+/// rebuild it. The deltas the edit summed into `stroke` but didn't write (the failing vertex's,
+/// and the interiors of later tiles of its parallel run) are written by the next step that
+/// writes those vertices, as part of their sums; sums no later step writes are lost. Tiles
+/// after the failing one get no sums for their border vertices, nor tiles after its run for
+/// any vertex. Don't retry a failed step: its deltas already summed would be counted twice.
 pub fn draw_step(
     project: &mut Project,
     index: &mut SpatialIndex,
@@ -292,12 +295,12 @@ pub fn draw_step(
     times.brush = laps.lap();
 
     let edited: Vec<TileKey> = found.edits.iter().map(|tile| tile.key).collect();
-    let tiles_unaccumulated = stroke.begin_dab(store.current_op(), &edited);
+    let tiles_unaccumulated = stroke.begin_dab(store, &edited);
     let states = stroke.states(&edited);
     let edit = store.update_tiles(&edited, |n, i, j, c| {
         stroke_write(&found.edits, &states, n, i, j, c)
     });
-    stroke.end_dab(store.current_op());
+    stroke.end_dab(store);
     edit?;
     times.edit = laps.lap();
 
@@ -451,8 +454,8 @@ fn brush_tile(
 /// `c.z` plus the delta.
 ///
 /// Interior and border vertices so take the same formula: the stored value is rounded to the
-/// tile's quantization once per stroke, never dab by dab, and the interior's error over the
-/// whole stroke is at most half a step of the tile's scale.
+/// tile's quantization when it is written, never added to dab by dab, and the interior's error
+/// over the stroke is bounded per capture of the start (see "Error bound" on [`Stroke`]).
 ///
 /// This keeps state per vertex, which is sound because [`TileStore::update_tiles`] calls its
 /// closure exactly once per vertex of each tile, and only the vertex's owner has a non-zero

@@ -5,21 +5,13 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use geom::{TILE_QUADS, TileKey};
-use store::{OpId, TileStore};
+use store::{OpId, StoreId, TileStore};
 
 /// Vertices of the largest tile, the entries of each [`TileStroke`]: `(TILE_QUADS + 1)²`.
 const ENTRIES: usize = (TILE_QUADS as usize + 1) * (TILE_QUADS as usize + 1);
 
 /// The bits of a start not captured yet: a NaN, which a stored correction never is.
 const NO_START: u32 = f32::NAN.to_bits();
-
-/// The fewest tiles a stroke keeps the state of before it releases any (when the store set
-/// aside that many): the soft capacity's floor.
-const SOFT_FLOOR: usize = 256;
-
-/// How many times the most tiles any dab of the stroke has edited the soft capacity is, above
-/// [`SOFT_FLOOR`].
-const SOFT_PER_DAB: usize = 4;
 
 /// The state one brush stroke keeps across its dabs, so that its small dabs move a tile's
 /// interior as far as its border.
@@ -29,53 +21,57 @@ const SOFT_PER_DAB: usize = 4;
 /// step would vanish on the interior and be kept on the border, building ridges along tile
 /// seams. Instead, for every vertex a stroke writes, it keeps the correction's `z` as it first
 /// found it (the start) and the sum of its deltas, both in `f32`, and writes `start + sum`: the
-/// stored value is rounded once per stroke, not once per dab, and interior and border move
-/// alike. The interior's error over the whole stroke is at most half a step of the tile's scale.
+/// stored value is rounded when it is written, not added to dab by dab, and interior and border
+/// move alike.
+///
+/// # Error bound
+///
+/// An interior vertex's stored value differs from its value before the stroke plus the stroke's
+/// deltas by at most half a step of its tile's scale for each time its start is captured: once,
+/// unless its tile's state is released and the vertex edited again (see "Releasing tiles"),
+/// when the start is captured again from the rounded stored value. Should the tile's scale grow
+/// during the stroke, the re-quantization rounds the values written before it again, and the
+/// bound is one step of the final scale for each capture instead.
 ///
 /// # Memory
 ///
 /// [`Stroke::new`] allocates the state of [`TileStore::stroke_tiles`] tiles up front, two `f32`
 /// per vertex of the largest tile ([`store::StoreConfig::STROKE_TILE_BYTES`], 33,800 bytes), and
-/// nothing more after: the store has set that much aside from its budget
-/// ([`store::StoreConfig::stroke_tiles`]). A store reserves for one stroke state, so keep one
-/// `Stroke` per store for the session, and pass it to every [`super::draw_step`]: it starts
-/// afresh by itself when the store's op changes (a new stroke).
+/// nothing more while it is used over that store: the store has set that much aside from its
+/// budget ([`store::StoreConfig::stroke_tiles`]). A store reserves for one stroke state, so keep
+/// one `Stroke` per store for the session, and pass it to every [`super::draw_step`]. It starts
+/// afresh by itself when the store's op changes (a new stroke, or a save), and when it is used
+/// over another store ([`TileStore::id`]), whose reservation it then takes the size of.
 ///
 /// # Releasing tiles
 ///
-/// A tile edited in the last [`Stroke::PROTECTED_DABS`] dabs, the current one included, is never
-/// released. Before each dab, while the stroke holds more tiles than its soft capacity,
-/// `min(hard, max(256, 4 × the most tiles any dab of this stroke has edited))` with `hard` the
-/// store's [`TileStore::stroke_tiles`], the unprotected tile with the oldest last dab (then the
-/// least key) is released; a tile needing state when none is free releases one the same way.
-/// The order is deterministic, so the result doesn't depend on the worker count.
-///
-/// A vertex of a released tile that the stroke edits again has its start captured again from
-/// the stored value, quantized: at most another half step. So a vertex stays within one step of
-/// its exact sum over the stroke, not half.
+/// A tile keeps its state until the stroke ends, unless a tile the current dab edits needs
+/// state and none is free. Then the tile with the oldest last dab (then the least key) of those
+/// not edited in the last [`Stroke::PROTECTED_DABS`] dabs, the current one included, is
+/// released, and its buffer reused. The order is deterministic, so the result doesn't depend on
+/// the worker count.
 ///
 /// # The thrash limit
 ///
-/// When the last [`Stroke::PROTECTED_DABS`] dabs together edit more than `hard` tiles (with the
-/// default, 512: dabs that each edit over about 128 tiles), a tile the current dab edits may
-/// find no state free and none to release. Tiles get state in key order; the rest are written
-/// per dab, as without a stroke state (the start-of-dab value plus the dab's delta), and counted
-/// in [`super::StepStats::tiles_unaccumulated`]. Nothing fails.
+/// When the last [`Stroke::PROTECTED_DABS`] dabs together edit more than the store's
+/// [`TileStore::stroke_tiles`] tiles (with the default, 512: dabs that each edit over about 128
+/// tiles), a tile the current dab edits may find no state free and none to release. Tiles get
+/// state in key order; the rest are written per dab, as without a stroke state (the
+/// start-of-dab value plus the dab's delta), and counted in
+/// [`super::StepStats::tiles_unaccumulated`]. Nothing fails.
 #[derive(Debug)]
 pub struct Stroke {
+    /// The store the state is kept over. A dab over another releases every tile first.
+    store: StoreId,
     /// The op of the stroke the state belongs to: the store's op when the last dab ended.
     /// A dab that finds the store at another op releases every tile first.
     op: Option<OpId>,
     /// The dabs counted so far, the current one included: each tile's last dab is one of them.
     dab: u64,
-    /// The most tiles any dab of this stroke has edited, for the soft capacity.
-    largest_dab: usize,
-    /// How many tiles' state the stroke holds at most: the store's
-    /// [`TileStore::stroke_tiles`], all allocated by [`Stroke::new`].
-    hard: usize,
     /// The tiles whose state the stroke keeps, each with its buffers.
     tiles: BTreeMap<TileKey, TileStroke>,
-    /// The buffers no tile holds, ready for the next tile that needs state.
+    /// The buffers no tile holds, ready for the next tile that needs state: with `tiles`, the
+    /// store's [`TileStore::stroke_tiles`] of them.
     free: Vec<TileStroke>,
 }
 
@@ -90,33 +86,35 @@ impl Stroke {
     /// and every tile is written per dab.
     #[must_use]
     pub fn new(store: &TileStore) -> Self {
-        let hard = store.stroke_tiles();
         Self {
+            store: store.id(),
             op: None,
             dab: 0,
-            largest_dab: 0,
-            hard,
             tiles: BTreeMap::new(),
-            free: (0..hard).map(|_| TileStroke::new()).collect(),
+            free: (0..store.stroke_tiles())
+                .map(|_| TileStroke::new())
+                .collect(),
         }
     }
 
-    /// Readies the state for a dab at the store's op `op` that edits `edited` (in key order):
-    /// releases every tile if `op` isn't the stroke's, counts the dab, releases tiles down to
-    /// the soft capacity, and gives each edited tile state, in key order, while some is free or
-    /// can be released (see [`Stroke`]). Returns how many edited tiles got none: those are
-    /// written per dab.
-    pub(super) fn begin_dab(&mut self, op: Option<OpId>, edited: &[TileKey]) -> usize {
-        if op != self.op {
+    /// Readies the state for a dab over `store` that edits `edited` (in key order): releases
+    /// every tile if the store or its op isn't the stroke's (taking the size of a new store's
+    /// reservation), counts the dab, and gives each edited tile state, in key order, while some
+    /// is free or can be released (see [`Stroke`]). Returns how many edited tiles got none: those
+    /// are written per dab.
+    pub(super) fn begin_dab(&mut self, store: &TileStore, edited: &[TileKey]) -> usize {
+        let op = store.current_op();
+        if store.id() != self.store {
             self.release_all();
-            self.op = op;
+            self.store = store.id();
+            self.free.truncate(store.stroke_tiles());
+            let missing = store.stroke_tiles().saturating_sub(self.free.len());
+            self.free.extend((0..missing).map(|_| TileStroke::new()));
+        } else if op != self.op {
+            self.release_all();
         }
+        self.op = op;
         self.dab += 1;
-        self.largest_dab = self.largest_dab.max(edited.len());
-        let soft = self
-            .hard
-            .min(SOFT_FLOOR.max(SOFT_PER_DAB.saturating_mul(self.largest_dab)));
-        while self.tiles.len() > soft && self.release_oldest() {}
         // Tiles already held are marked first, so none of this dab's is released for another.
         for key in edited {
             if let Some(tile) = self.tiles.get_mut(key) {
@@ -133,7 +131,7 @@ impl Stroke {
             }
             match self.free.pop() {
                 Some(mut tile) => {
-                    tile.reset(self.dab);
+                    tile.take(self.dab);
                     self.tiles.insert(*key, tile);
                 }
                 None => overflow += 1,
@@ -147,10 +145,10 @@ impl Stroke {
         edited.iter().map(|key| self.tiles.get(key)).collect()
     }
 
-    /// Records the store's op as of the end of a dab: the op its edits were made in, which the
+    /// Records `store`'s op as of the end of a dab: the op its edits were made in, which the
     /// edit may have begun itself.
-    pub(super) const fn end_dab(&mut self, op: Option<OpId>) {
-        self.op = op;
+    pub(super) const fn end_dab(&mut self, store: &TileStore) {
+        self.op = store.current_op();
     }
 
     /// How many tiles' state the stroke holds now.
@@ -165,16 +163,24 @@ impl Stroke {
         self.tiles.contains_key(key)
     }
 
+    /// How many tiles' buffers the stroke has, held or free.
+    #[cfg(test)]
+    pub(crate) fn buffers(&self) -> usize {
+        self.tiles.len() + self.free.len()
+    }
+
     /// Releases every tile: a new stroke begins.
     fn release_all(&mut self) {
         while let Some((_, tile)) = self.tiles.pop_first() {
             self.free.push(tile);
         }
-        self.largest_dab = 0;
     }
 
-    /// Releases the unprotected tile with the oldest last dab, the least key among equals.
-    /// Returns whether one was.
+    /// Releases the tile with the oldest last dab, the least key among equals, of those not
+    /// edited in the last [`Stroke::PROTECTED_DABS`] dabs. Returns whether one was.
+    ///
+    /// A scan of the tiles held: it runs only when every buffer is taken, which a stroke over the
+    /// default reservation reaches only when it has edited 512 tiles.
     fn release_oldest(&mut self) -> bool {
         let dab = self.dab;
         let oldest = self
@@ -206,6 +212,9 @@ pub(super) struct TileStroke {
     acc: Box<[AtomicU32]>,
     /// The dab that last edited the tile.
     last_dab: u64,
+    /// Whether a tile has held the buffer since it was cleared: a buffer still clean from
+    /// [`TileStroke::new`] needs no clearing before its first tile.
+    used: bool,
 }
 
 impl std::fmt::Debug for TileStroke {
@@ -213,6 +222,7 @@ impl std::fmt::Debug for TileStroke {
         f.debug_struct("TileStroke")
             .field("entries", &self.start.len())
             .field("last_dab", &self.last_dab)
+            .field("used", &self.used)
             .finish_non_exhaustive()
     }
 }
@@ -226,17 +236,22 @@ impl TileStroke {
                 .map(|_| AtomicU32::new(0.0_f32.to_bits()))
                 .collect(),
             last_dab: 0,
+            used: false,
         }
     }
 
-    /// Clears the state for a tile first edited at dab `dab`: no start captured, every sum zero.
-    fn reset(&mut self, dab: u64) {
-        for start in &mut self.start {
-            *start.get_mut() = NO_START;
+    /// Readies the buffer for a tile first edited at dab `dab`: no start captured and every sum
+    /// zero, clearing what an earlier tile left.
+    fn take(&mut self, dab: u64) {
+        if self.used {
+            for start in &mut self.start {
+                *start.get_mut() = NO_START;
+            }
+            for acc in &mut self.acc {
+                *acc.get_mut() = 0.0_f32.to_bits();
+            }
         }
-        for acc in &mut self.acc {
-            *acc.get_mut() = 0.0_f32.to_bits();
-        }
+        self.used = true;
         self.last_dab = dab;
     }
 

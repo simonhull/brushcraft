@@ -881,24 +881,45 @@ fn a_dab_past_the_thrash_limit_writes_its_overflow_tiles_per_dab_and_does_not_fa
     );
 }
 
+/// Three light dabs across the border between tiles `(face 4, 0, 0)` and `(face 4, 1, 0)`.
+///
+/// The border is face-grid `i = 64`, whose vertices the first tile owns. The dabs are near
+/// `(61 + k, 30 + k)`, of `0.4 × scale`, `scale` the first tile's (see [`strong_stroke`]).
+fn border_dabs(
+    project: &mut Project,
+    index: &mut SpatialIndex,
+    stroke: &mut Stroke,
+    level: Level,
+    k: u32,
+    scale: f32,
+) {
+    for n in 0..3 {
+        let center = vertex(level, 4, 61 + n + k, 30 + k);
+        let params = DrawParams::new(center, 0.06, 0.4 * scale).unwrap();
+        draw_step(project, index, stroke, params).unwrap();
+    }
+}
+
 #[test]
 fn a_new_stroke_starts_afresh() {
     let level = Level::new(7).unwrap();
+    // One tile's state: the second stroke reuses the buffer the first left, over the same
+    // vertices, the border ones included.
     let run = |reuse: bool| {
         let dir = TestDir::new();
-        let (mut project, mut index) = project_with(&dir, level, 2, 512);
-        let (_, scale) = strong_stroke(&mut project, &mut index, level);
+        let (mut project, mut index) = project_with(&dir, level, 2, 1);
+        let (key, scale) = strong_stroke(&mut project, &mut index, level);
         let mut stroke = Stroke::new(project.store());
         for k in 0..2 {
             project.begin_stroke().unwrap();
             if k == 1 && !reuse {
                 stroke = Stroke::new(project.store());
             }
-            for n in 0..3 {
-                let center = vertex(level, 4, 50 + 3 * n + k, 30 + 2 * k);
-                let params = DrawParams::new(center, 0.06, 0.4 * scale).unwrap();
-                draw_step(&mut project, &mut index, &mut stroke, params).unwrap();
-            }
+            border_dabs(&mut project, &mut index, &mut stroke, level, k, scale);
+            assert!(
+                stroke.holds(&key),
+                "the tile owning the border has the state"
+            );
             project.end_stroke().unwrap();
         }
         snapshot(project.store(), level)
@@ -906,5 +927,196 @@ fn a_new_stroke_starts_afresh() {
     assert!(
         run(true) == run(false),
         "a reused stroke state starts afresh"
+    );
+}
+
+#[test]
+fn a_reused_buffer_starts_with_no_sums() {
+    let dir = TestDir::new();
+    let level = Level::new(7).unwrap();
+    // One tile's state: tile (face 1, 0, 0) takes the buffer tile (face 4, 0, 0) leaves, and
+    // its dabs touch the same tile coordinates as the sums left in it.
+    let (mut project, mut index) = project_with(&dir, level, 2, 1);
+    let (_, scale) = strong_stroke(&mut project, &mut index, level);
+    let other = TileKey::displacement(FaceId::new(1), level, 0, 0).unwrap();
+    let light = DrawParams::new(vertex(level, 1, 50, 32), 0.06, 0.4 * scale).unwrap();
+    let before = tile_state(project.store(), other);
+
+    project.begin_stroke().unwrap();
+    let mut stroke = Stroke::new(project.store());
+    for _ in 0..5 {
+        draw_step(
+            &mut project,
+            &mut index,
+            &mut stroke,
+            light_dab(level, 4, scale),
+        )
+        .unwrap();
+    }
+    // Tile (4, 0, 0) was last edited at dab 5: protected through dab 8, released at dab 9.
+    let mut unaccumulated = Vec::new();
+    for _ in 0..5 {
+        let stats = draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
+        unaccumulated.push(stats.tiles_unaccumulated);
+    }
+    project.end_stroke().unwrap();
+    assert_eq!(
+        unaccumulated,
+        [1, 1, 1, 0, 0],
+        "written per dab while the buffer's tile is protected, then given its buffer"
+    );
+    assert!(stroke.holds(&other), "the tile has the buffer");
+    let (inside, _) = assert_moved_by_dabs(project.store(), other, &before, light, 5.0, 1.0);
+    assert!(inside > 0, "the brush reaches the tile");
+}
+
+#[test]
+fn a_scale_that_grows_mid_stroke_keeps_vertices_within_a_step() {
+    let dir = TestDir::new();
+    let level = Level::new(7).unwrap();
+    let (mut project, mut index) = project_with(&dir, level, 2, 512);
+    let (key, scale) = strong_stroke(&mut project, &mut index, level);
+    let light = light_dab(level, 4, scale);
+    let before = tile_state(project.store(), key);
+
+    project.begin_stroke().unwrap();
+    let mut stroke = Stroke::new(project.store());
+    for _ in 0..10 {
+        draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
+    }
+    // A stronger dab in another corner of the tile, out of the light dabs' reach, grows the
+    // tile's scale.
+    let stronger = DrawParams::new(vertex(level, 4, 10, 55), 0.1, 0.2).unwrap();
+    draw_step(&mut project, &mut index, &mut stroke, stronger).unwrap();
+    for _ in 0..10 {
+        draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
+    }
+    project.end_stroke().unwrap();
+    let grown = project.store().correction(key).unwrap().scale();
+    assert!(grown >= 2.0 * scale, "the scale grew: {scale} to {grown}");
+    let (inside, _) = assert_moved_by_dabs(project.store(), key, &before, light, 20.0, 1.0);
+    assert!(inside > 0, "the brush reaches the tile");
+}
+
+#[test]
+fn a_stroke_used_over_another_project_starts_afresh() {
+    let level = Level::new(7).unwrap();
+    // The second project's store has the same site, so its first op has the same id as the
+    // first's, and a reservation of another size.
+    let second = |stroke: &mut Option<Stroke>| {
+        let dir = TestDir::new();
+        let (mut project, mut index) = project_with(&dir, level, 2, 3);
+        let (_, scale) = strong_stroke(&mut project, &mut index, level);
+        let mut stroke = stroke
+            .take()
+            .unwrap_or_else(|| Stroke::new(project.store()));
+        project.begin_stroke().unwrap();
+        border_dabs(&mut project, &mut index, &mut stroke, level, 0, scale);
+        project.end_stroke().unwrap();
+        assert_eq!(stroke.buffers(), 3, "the second store's reservation");
+        snapshot(project.store(), level)
+    };
+    let dir = TestDir::new();
+    let (mut project, mut index) = project_with(&dir, level, 2, 512);
+    let (_, scale) = strong_stroke(&mut project, &mut index, level);
+    let mut stroke = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    border_dabs(&mut project, &mut index, &mut stroke, level, 0, scale);
+    // The first project's stroke is still in progress.
+    let reused = second(&mut Some(stroke));
+    assert!(
+        reused == second(&mut None),
+        "a stroke state carried to another project starts afresh"
+    );
+}
+
+/// Asserts a save went through with crash protection running.
+fn assert_saved(saved: Result<store::SaveOutcome, store::ProjectError>) {
+    let outcome = saved.unwrap();
+    assert!(outcome.protection.is_active(), "{outcome:?}");
+}
+
+/// A configuration for the reopening and saving tests: two workers, the default stroke state,
+/// recovery files in `dir`.
+fn reopen_config(dir: &TestDir) -> ProjectConfig {
+    ProjectConfig {
+        store: StoreConfig::new(64 << 20, 1)
+            .with_chunk_bytes(1 << 20)
+            .with_workers(fixed(2)),
+        recovery_dir: dir.0.join("recovery"),
+    }
+}
+
+#[test]
+fn a_project_reopened_after_discarding_a_stroke_starts_afresh() {
+    let level = Level::new(7).unwrap();
+    let run = |reuse: bool| {
+        let dir = TestDir::new();
+        let path = dir.0.join("project.bcp");
+        let mut project = Project::new(cube_sphere(1).unwrap(), reopen_config(&dir)).unwrap();
+        assert_saved(project.save_as(&path));
+        let mut index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
+        let (_, scale) = strong_stroke(&mut project, &mut index, level);
+        let mut stroke = Stroke::new(project.store());
+        project.begin_stroke().unwrap();
+        border_dabs(&mut project, &mut index, &mut stroke, level, 0, scale);
+        project.end_stroke().unwrap();
+        // Closed unsaved, its recovery file deleted: the reopened project hands out the
+        // discarded strokes' op ids again.
+        project.close(false).unwrap();
+        let mut reopened = Project::open(&path, reopen_config(&dir)).unwrap();
+        let mut reindexed = SpatialIndex::build(reopened.store(), level, |_, _| {}).unwrap();
+        let (_, rescale) = strong_stroke(&mut reopened, &mut reindexed, level);
+        if !reuse {
+            stroke = Stroke::new(reopened.store());
+        }
+        reopened.begin_stroke().unwrap();
+        border_dabs(
+            &mut reopened,
+            &mut reindexed,
+            &mut stroke,
+            level,
+            0,
+            rescale,
+        );
+        reopened.end_stroke().unwrap();
+        snapshot(reopened.store(), level)
+    };
+    assert!(
+        run(true) == run(false),
+        "the discarded stroke's sums don't come back"
+    );
+}
+
+#[test]
+fn a_stroke_saved_part_way_goes_on_from_the_save() {
+    let level = Level::new(7).unwrap();
+    let run = |reuse: bool| {
+        let dir = TestDir::new();
+        let path = dir.0.join("project.bcp");
+        let mut project = Project::new(cube_sphere(1).unwrap(), reopen_config(&dir)).unwrap();
+        assert_saved(project.save_as(&path));
+        let mut index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
+        let (key, scale) = strong_stroke(&mut project, &mut index, level);
+        let light = light_dab(level, 4, scale);
+        let mut stroke = Stroke::new(project.store());
+        project.begin_stroke().unwrap();
+        for _ in 0..3 {
+            draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
+        }
+        assert_saved(project.save());
+        if !reuse {
+            stroke = Stroke::new(project.store());
+        }
+        for _ in 0..5 {
+            draw_step(&mut project, &mut index, &mut stroke, light).unwrap();
+            assert!(stroke.holds(&key), "the tile keeps its state");
+        }
+        project.end_stroke().unwrap();
+        snapshot(project.store(), level)
+    };
+    assert!(
+        run(true) == run(false),
+        "after a save, the stroke goes on as a fresh one would, keeping its state from dab to dab"
     );
 }
