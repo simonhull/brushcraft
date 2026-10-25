@@ -212,9 +212,6 @@ pub(super) struct TileStroke {
     acc: Box<[AtomicU32]>,
     /// The dab that last edited the tile.
     last_dab: u64,
-    /// Whether a tile has held the buffer since it was cleared: a buffer still clean from
-    /// [`TileStroke::new`] needs no clearing before its first tile.
-    used: bool,
 }
 
 impl std::fmt::Debug for TileStroke {
@@ -222,7 +219,6 @@ impl std::fmt::Debug for TileStroke {
         f.debug_struct("TileStroke")
             .field("entries", &self.start.len())
             .field("last_dab", &self.last_dab)
-            .field("used", &self.used)
             .finish_non_exhaustive()
     }
 }
@@ -236,22 +232,23 @@ impl TileStroke {
                 .map(|_| AtomicU32::new(0.0_f32.to_bits()))
                 .collect(),
             last_dab: 0,
-            used: false,
         }
     }
 
     /// Readies the buffer for a tile first edited at dab `dab`: no start captured and every sum
     /// zero, clearing what an earlier tile left.
+    ///
+    /// Every entry is cleared: at the levels a brush edits, every tile is the largest, so
+    /// clearing only a tile's own `side²` entries would save nothing; and skipping buffers still
+    /// clean from [`TileStroke::new`] measured no faster (the cold first dab of the medium
+    /// project's `brush`, interleaved runs).
     fn take(&mut self, dab: u64) {
-        if self.used {
-            for start in &mut self.start {
-                *start.get_mut() = NO_START;
-            }
-            for acc in &mut self.acc {
-                *acc.get_mut() = 0.0_f32.to_bits();
-            }
+        for start in &mut self.start {
+            *start.get_mut() = NO_START;
         }
-        self.used = true;
+        for acc in &mut self.acc {
+            *acc.get_mut() = 0.0_f32.to_bits();
+        }
         self.last_dab = dab;
     }
 
