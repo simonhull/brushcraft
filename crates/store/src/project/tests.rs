@@ -555,6 +555,45 @@ fn close_keeps_the_recovery_file_only_when_asked() {
     assert!(kept.exists(), "another project's file is left alone");
 }
 
+/// Recovery files and their directory are the user's alone, whatever the umask.
+///
+/// They hold the user's unsaved work: the recovery file a new project starts, the one a save
+/// starts, and the one an open starts, and the recovery directory when the project makes it.
+/// The project file a save as writes is the user's own, and gets what any file the user saves
+/// gets.
+#[test]
+fn recovery_files_and_their_dir_are_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode();
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    assert!(!dir.path("recovery").exists(), "the project makes it");
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    assert_eq!(mode(&dir.path("recovery")) & 0o077, 0, "the recovery dir");
+    let created = project.recovery_path().unwrap().to_path_buf();
+    assert_eq!(mode(&created) & 0o077, 0, "a new project's recovery file");
+
+    stroke(&mut project, &mut map, 20, 71);
+    let path = dir.path("p.bcrf");
+    assert_saved(project.save_as(&path));
+    let saved = project.recovery_path().unwrap().to_path_buf();
+    assert_eq!(mode(&saved) & 0o077, 0, "a save's recovery file");
+    let plain = dir.path("plain");
+    fs::File::create(&plain).unwrap();
+    assert_eq!(
+        mode(&path),
+        mode(&plain),
+        "the project file is the user's to share"
+    );
+    project.close(false).unwrap();
+
+    let reopened = Project::open(&path, config(&dir)).unwrap();
+    let opened = reopened.recovery_path().unwrap().to_path_buf();
+    assert_eq!(mode(&opened) & 0o077, 0, "an open's recovery file");
+    reopened.close(false).unwrap();
+}
+
 #[test]
 fn dropping_a_project_closes_its_writer_and_keeps_the_recovery_file() {
     let dir = TestDir::new();

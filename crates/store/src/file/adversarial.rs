@@ -1249,6 +1249,25 @@ fn compacting_in_place_keeps_permissions_and_symlinks() {
     );
 }
 
+/// The file a compaction writes is created with the source's mode, not the default one, so a
+/// private project is never exposed through its temporary copy, even while it is written.
+#[test]
+fn a_compaction_creates_its_copy_no_more_open_than_the_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    three(&path);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let copy = dir.path("copy.bcrf");
+    compact_into(&ProjectFile::inspect(&path).unwrap(), &copy).unwrap();
+    assert_eq!(
+        std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "created with the source's mode"
+    );
+}
+
 #[test]
 fn an_empty_first_save_is_a_parent() {
     let dir = TestDir::new();

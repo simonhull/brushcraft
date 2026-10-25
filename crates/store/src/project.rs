@@ -84,6 +84,7 @@
 //! back half a stroke. At worst, the stroke in progress is lost.
 
 use std::collections::{BTreeSet, HashMap};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -94,7 +95,9 @@ use rustix::fs::OFlags;
 use thiserror::Error;
 
 use crate::OpId;
-use crate::file::{BaseFile, ProjectFile, StoreError, open_regular, sync_parent};
+use crate::file::{
+    BaseFile, PRIVATE_MODE, ProjectFile, SHARED_MODE, StoreError, open_regular, sync_parent,
+};
 use crate::index::{IndexError, LoadStats, SpatialIndex};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
@@ -437,7 +440,7 @@ impl Project {
         let mesh = Arc::new(mesh);
         let meta = Meta::new(ProjectId::random()?, Role::Recovery { base: None }, &mesh);
         let (working, recovery_path) = create_placed(&config.recovery_dir, meta.project(), |at| {
-            ProjectFile::create(at, meta, Arc::clone(&mesh))
+            ProjectFile::create_private(at, meta, Arc::clone(&mesh))
         })?;
         Self::start(
             TileStore::open(working, config.store),
@@ -473,7 +476,7 @@ impl Project {
         let meta = project.meta().on_save_point(base.save_point(), &path);
         let earlier = recovery_heads(&config.recovery_dir, meta.project());
         let (working, recovery_path) = create_placed(&config.recovery_dir, meta.project(), |at| {
-            ProjectFile::create_like(at, meta, &project)
+            ProjectFile::create_like_mode(at, meta, &project, PRIVATE_MODE)
         })?;
         let store = past(
             TileStore::open_layered(working, Some(base), config.store),
@@ -725,7 +728,7 @@ impl Project {
             .with_project(ProjectId::random()?)
             .with_role(Role::Project);
         let tmp = temporary(&path)?;
-        let mut project = create_clean(&tmp, meta, self.store.working())?;
+        let mut project = create_clean(&tmp, meta, self.store.working(), SHARED_MODE)?;
         let written = self.write_new_project(&mut project, &tmp, &path);
         let saved = match written {
             Ok(saved) => saved,
@@ -1123,7 +1126,7 @@ impl Project {
     fn roll_over(&mut self) -> Result<(), ProjectError> {
         let meta = self.store.working().meta().clone();
         let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
-            ProjectFile::create_like(at, meta, self.store.working())
+            ProjectFile::create_like_mode(at, meta, self.store.working(), PRIVATE_MODE)
         })?;
         #[cfg(test)]
         let names = names.crashing(std::mem::take(&mut self.fail_next_recovery));
@@ -1172,7 +1175,7 @@ impl Project {
         like: &ProjectFile,
     ) -> Result<(ProjectFile, PathBuf), ProjectError> {
         let (fresh, names) = create_recovery(&self.recovery_dir, meta.project(), |at| {
-            ProjectFile::create_like(at, meta, like)
+            ProjectFile::create_like_mode(at, meta, like, PRIVATE_MODE)
         })?;
         #[cfg(test)]
         let names = names.crashing(std::mem::take(&mut self.fail_next_recovery));
@@ -1399,6 +1402,8 @@ fn scratch(meta: Meta, like: &ProjectFile) -> Result<ProjectFile, ProjectError> 
 /// It is a file for the store to write tiles back to when it has no recovery file to write them
 /// to, after a save ([`scratch`]) or a failed roll-over ([`Project::strand`]).
 ///
+/// It is created readable and writable by the user only ([`PRIVATE_MODE`]), as it holds the
+/// user's unsaved work and may sit in a shared directory such as `/tmp` until it is unlinked.
 /// It is unlinked at once, so it is only ever the project's open handle: no listing finds it,
 /// and nothing is left of it after a crash, or once it is closed. It is no crash protection,
 /// and doesn't pretend to be.
@@ -1413,19 +1418,25 @@ fn scratch_in(dir: &Path, meta: Meta, like: &ProjectFile) -> Result<ProjectFile,
         "brushcraft-{}-{suffix:016x}.scratch",
         meta.project()
     ));
-    let file = create_clean(&at, meta, like)?;
+    let file = create_clean(&at, meta, like, PRIVATE_MODE)?;
     fs::remove_file(&at)?;
     Ok(file)
 }
 
-/// [`ProjectFile::create_like`] at `at`, removing the file again, best effort, if it was made
-/// but couldn't be set up. A file already at `at` isn't this call's, and is left alone.
+/// [`ProjectFile::create_like_mode`] at `at` with permission bits `mode`, removing the file
+/// again, best effort, if it was made but couldn't be set up. A file already at `at` isn't this
+/// call's, and is left alone.
 ///
 /// # Errors
 ///
-/// As [`ProjectFile::create_like`].
-fn create_clean(at: &Path, meta: Meta, like: &ProjectFile) -> Result<ProjectFile, StoreError> {
-    ProjectFile::create_like(at, meta, like).inspect_err(|e| {
+/// As [`ProjectFile::create_like_mode`].
+fn create_clean(
+    at: &Path,
+    meta: Meta,
+    like: &ProjectFile,
+    mode: u32,
+) -> Result<ProjectFile, StoreError> {
+    ProjectFile::create_like_mode(at, meta, like, mode).inspect_err(|e| {
         if !matches!(e, StoreError::Io(io) if io.kind() == io::ErrorKind::AlreadyExists) {
             drop(fs::remove_file(at));
         }
@@ -1804,7 +1815,11 @@ impl Unplaced {
 /// a fresh one (see the module notes), and returns it open, with its names for
 /// [`Unplaced::place`].
 ///
-/// `create` makes the file at the temporary path it is given, durable.
+/// `create` makes the file at the temporary path it is given, durable, and readable by the user
+/// only ([`PRIVATE_MODE`]).
+///
+/// The directory is made if missing, with its parents, as the user's alone (`0700`): it holds
+/// the user's unsaved work. A directory that already exists keeps its mode.
 ///
 /// # Errors
 ///
@@ -1815,7 +1830,10 @@ fn create_recovery(
     project: ProjectId,
     create: impl FnOnce(&Path) -> Result<ProjectFile, StoreError>,
 ) -> Result<(ProjectFile, Unplaced), ProjectError> {
-    fs::create_dir_all(dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
     let suffix = ProjectId::random()?.to_bits() >> 64;
     let name = format!("{project}-{suffix:016x}.{EXTENSION}");
     let names = Unplaced {

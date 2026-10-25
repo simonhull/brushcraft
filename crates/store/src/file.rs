@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::ops::Deref;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +53,12 @@ const FULL_EVERY: u32 = 16;
 const MAX_CHAIN: usize = FULL_EVERY as usize;
 /// "None" for an index's parent offset and head op.
 const NONE: u64 = u64::MAX;
+/// The mode a user's project file is created with: the umask decides who else may read it, as
+/// for any file the user saves.
+pub(crate) const SHARED_MODE: u32 = 0o666;
+/// The mode recovery, scratch and temporary files are created with: only the user may read or
+/// write them, whatever the umask, as they hold the user's unsaved work.
+pub(crate) const PRIVATE_MODE: u32 = 0o600;
 /// Bytes per index entry: key, offset `u64`, len `u32`.
 const ENTRY_LEN: usize = KEY_LEN + 12;
 /// Bytes of an Index payload before its entries: `full: u8`, seven reserved, `parent: u64`,
@@ -728,19 +734,52 @@ impl ProjectFile {
     /// [`StoreError::Locked`].
     pub fn create(path: &Path, meta: Meta, mesh: Arc<BaseMesh>) -> Result<Self, StoreError> {
         let record = mesh_record(&meta, &mesh)?;
-        Self::create_with(path, meta, mesh, record.into())
+        Self::create_with(path, meta, mesh, record.into(), SHARED_MODE)
+    }
+
+    /// Creates a new file at `path`, as [`ProjectFile::create`] does, readable and writable by
+    /// the user only ([`PRIVATE_MODE`]): a recovery file.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::create`].
+    pub(crate) fn create_private(
+        path: &Path,
+        meta: Meta,
+        mesh: Arc<BaseMesh>,
+    ) -> Result<Self, StoreError> {
+        let record = mesh_record(&meta, &mesh)?;
+        Self::create_with(path, meta, mesh, record.into(), PRIVATE_MODE)
+    }
+
+    /// [`ProjectFile::create_like_mode`] with [`SHARED_MODE`], for tests that make files beside
+    /// a project and don't care who may read them.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::create_like_mode`].
+    #[cfg(test)]
+    pub(crate) fn create_like(path: &Path, meta: Meta, like: &Self) -> Result<Self, StoreError> {
+        Self::create_like_mode(path, meta, like, SHARED_MODE)
     }
 
     /// Creates a new file at `path`, as [`ProjectFile::create`] does, over `like`'s mesh: its
     /// `Mesh` record is copied as it is, without compressing (or hashing) the mesh again.
     /// `meta` must be over the same mesh (made from `like`'s meta with [`Meta::with_role`],
-    /// say).
+    /// say). The file is created with permission bits `mode` (less the umask's):
+    /// [`PRIVATE_MODE`] for a recovery, scratch or temporary file, [`SHARED_MODE`] for a
+    /// user's project file.
     ///
     /// # Errors
     ///
     /// As [`ProjectFile::create`]; [`StoreError::MeshMismatch`] if `meta`'s mesh hash isn't
     /// `like`'s.
-    pub(crate) fn create_like(path: &Path, meta: Meta, like: &Self) -> Result<Self, StoreError> {
+    pub(crate) fn create_like_mode(
+        path: &Path,
+        meta: Meta,
+        like: &Self,
+        mode: u32,
+    ) -> Result<Self, StoreError> {
         if meta.mesh_hash() != like.meta.mesh_hash() {
             return Err(StoreError::MeshMismatch);
         }
@@ -749,11 +788,13 @@ impl ProjectFile {
             meta,
             Arc::clone(&like.mesh),
             Arc::clone(&like.mesh_record),
+            mode,
         )
     }
 
     /// Creates the file at `path` with `meta` and the framed `Mesh` record `mesh_record` of
-    /// `mesh`, which the caller has checked against `meta`.
+    /// `mesh`, which the caller has checked against `meta`, with permission bits `mode` (less
+    /// the umask's), set as the file is made: it is never more open than that.
     ///
     /// # Errors
     ///
@@ -763,12 +804,14 @@ impl ProjectFile {
         meta: Meta,
         mesh: Arc<BaseMesh>,
         mesh_record: Arc<[u8]>,
+        mode: u32,
     ) -> Result<Self, StoreError> {
         let leading = leading_bytes(&meta, &mesh_record)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(mode)
             .open(path)?;
         let file = LockedFile::new(file, Lock::Exclusive)?;
         file.write_all_at(&leading, 0)?;
@@ -2441,9 +2484,10 @@ pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
 
 /// Compacts the project at `path` in place, as [`compact`] does.
 ///
-/// It compacts into a temporary file `<name>.compact-*.tmp` in the same directory, gives it the
-/// project's permissions, then renames it over `path` (resolved first, so a symlink keeps
-/// pointing at the project rather than being replaced). Replacing the project is a write, so
+/// It compacts into a temporary file `<name>.compact-*.tmp` in the same directory, created with
+/// no more permissions than the project's (so a private project is never exposed through it),
+/// gives it the project's permissions, then renames it over `path` (resolved first, so a symlink
+/// keeps pointing at the project rather than being replaced). Replacing the project is a write, so
 /// the source is locked exclusively until after the rename: no writer or other compaction runs
 /// meanwhile, and one that opened the old file locks it only to find the path replaced (see
 /// [`ProjectFile::open`]). The directory is synced after the rename, so the swap is durable.
@@ -2465,6 +2509,7 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
     let permissions = from.file.metadata()?.permissions();
     let tmp = temp_sibling(&path)?;
     let swapped = compact_into(&from, &tmp).and_then(|()| {
+        // The umask may have masked bits of the project's mode at creation: give them back.
         std::fs::set_permissions(&tmp, permissions)?;
         std::fs::rename(&tmp, &path)?;
         sync_parent(&path)
@@ -2476,7 +2521,8 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
     swapped
 }
 
-/// Writes `from`'s live tiles and bounds and one full Index to a new project at `dst`.
+/// Writes `from`'s live tiles and bounds and one full Index to a new project at `dst`, created
+/// with `from`'s permission bits (less the umask's), so it is never more open than `from`.
 ///
 /// A bounds record that doesn't read is written as unknown, as [`ProjectFile::copy_base`] does.
 ///
@@ -2484,7 +2530,8 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
 ///
 /// As [`compact`].
 fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
-    let mut to = ProjectFile::create_like(dst, from.meta.clone(), from)?;
+    let mode = from.file.metadata()?.permissions().mode() & 0o777;
+    let mut to = ProjectFile::create_like_mode(dst, from.meta.clone(), from, mode)?;
     for (name, &Loc { offset, len }) in &from.live {
         match name {
             Name::Tile(key) => {
@@ -2736,7 +2783,7 @@ struct Leading {
 /// and the offset where its other records start.
 ///
 /// If the `Mesh` record is byte for byte `like`'s (a file made with
-/// [`ProjectFile::create_like`]) and the meta states `like`'s mesh hash, `like`'s mesh is
+/// [`ProjectFile::create_like_mode`]) and the meta states `like`'s mesh hash, `like`'s mesh is
 /// shared: the record verified, so it holds what `like`'s held, and `like` checked that against
 /// the same hash. Otherwise the mesh is decompressed, hashed and parsed.
 ///
