@@ -74,6 +74,13 @@ use std::time::{Duration, Instant};
 
 /// Samples kept for the period fit. At ~170 Hz that's about 3 s.
 const WINDOW: usize = 512;
+/// The most slots a window spans without a drop; a seed from a span with drops can't otherwise
+/// ever be replaced.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a window of a few hundred samples converts to f64 exactly"
+)]
+const MAX_WINDOW_SPAN: f64 = (WINDOW - 1) as f64;
 /// Samples the lower envelope looks back over.
 const ENVELOPE: usize = 32;
 /// Slots a fit must span before its period replaces the seed and seeds later strokes.
@@ -202,6 +209,9 @@ struct Segment {
     origin: Instant,
     /// The latest samples, oldest first: at most [`WINDOW`], for the fit and the envelope.
     points: VecDeque<Point>,
+    /// Samples pushed into this segment, for the seed-check schedule; unlike `points.len()` it
+    /// keeps counting past the window.
+    pushed: usize,
     /// The period the line uses: unknown, seeded or fitted.
     period: Period,
     /// The last output on the line, for the rise limit.
@@ -307,6 +317,7 @@ impl Dejitter {
         self.segment = Some(Segment {
             origin: received,
             points: VecDeque::from([Point { slot: 0.0, at: 0.0 }]),
+            pushed: 1,
             period: seed.map_or(Period::Unknown, Period::Seeded),
             last_line: None,
             next_slot: 1.0,
@@ -354,6 +365,7 @@ impl Segment {
             self.points.pop_front();
         }
         self.points.push_back(Point { slot, at });
+        self.pushed += 1;
         if self.suspects > 0 {
             if self.suspects < DROP_CONFIRM {
                 return Step::Raw;
@@ -459,18 +471,26 @@ impl Segment {
     /// At [`SEED_CHECK`] samples by the mean interval; at 16, 32 and 64 samples and every 64
     /// after by the stroke's own quarter slope, which can be off by at most twice the spread over
     /// half the samples. A rejected seed gives way to the stroke's own fit.
+    ///
+    /// The schedule counts samples pushed, not the samples in the window: the window stops
+    /// growing at [`WINDOW`], so a schedule on its length would check on every sample once it is
+    /// full. Today the two agree, because [`MAX_WINDOW_SPAN`] lets a full window always replace
+    /// the seed, so no seed is still in use past the window; counting pushes keeps the
+    /// documented schedule if the window or that cap changes.
     fn check_seed(&mut self) {
         let Period::Seeded(Seed { period: seed, .. }) = self.period else {
             return;
         };
+        let pushed = self.pushed;
+        // The samples in the fit, which stop growing at the window.
         let count = self.points.len();
-        let agrees = if count == SEED_CHECK {
+        let agrees = if pushed == SEED_CHECK {
             let (Some(first), Some(last)) = (self.points.front(), self.points.back()) else {
                 return;
             };
             let mean = (last.at - first.at) / (last.slot - first.slot);
             SEED_AGREEMENT.contains(&(mean / seed))
-        } else if matches!(count, 16 | 32) || (count >= 64 && count.is_multiple_of(64)) {
+        } else if matches!(pushed, 16 | 32) || (pushed >= 64 && pushed.is_multiple_of(64)) {
             let Some(fit) = quarter_slope(&self.points, seed) else {
                 return;
             };
@@ -494,11 +514,14 @@ impl Segment {
         }
     }
 
-    /// Refits the period, unless the seed came from a longer span than this segment has.
+    /// Refits the period, unless the seed came from a longer span than this segment has. A full
+    /// window always counts as long enough ([`MAX_WINDOW_SPAN`]).
     fn refit(&mut self) {
         let span = self.span();
         let guess = match self.period {
-            Period::Seeded(seed) if span >= SEED_SPAN && span >= seed.span => seed.period,
+            Period::Seeded(seed) if span >= SEED_SPAN && span >= seed.span.min(MAX_WINDOW_SPAN) => {
+                seed.period
+            }
             Period::Unknown if self.points.len() >= MIN_FIT => {
                 match (self.points.front(), self.points.back()) {
                     (Some(first), Some(last)) => (last.at - first.at) / (last.slot - first.slot),
@@ -1237,6 +1260,43 @@ mod tests {
         drop(Stroke::new(start, PERIOD, 400, || delay.draw(&mut rng), |_| false).run(&mut filter));
         let period = filter.period().expect("a period").as_secs_f64();
         assert!((period - PERIOD).abs() < 0.01 * MS, "learned {period}");
+    }
+
+    /// A filter whose seed comes from a 1,000-sample stroke at [`PERIOD`] with every 20th
+    /// sample dropped: its window spans more slots than a window without drops can.
+    fn seeded_across_drops(start: Instant, rng: &mut Rng) -> Dejitter {
+        let mut filter = Dejitter::new();
+        let clean = Stroke::new(start, PERIOD, 400, || rng.unit() * 0.1 * MS, |_| false);
+        drop(clean.run(&mut filter));
+        let stroke = Stroke::new(
+            start + Duration::from_secs(10),
+            PERIOD,
+            1000,
+            || rng.unit() * 0.1 * MS,
+            |i| i % 20 == 19,
+        );
+        drop(stroke.run(&mut filter));
+        filter
+    }
+
+    #[test]
+    fn a_seed_learned_across_drops_can_be_replaced() {
+        let base = Instant::now();
+        let device = PERIOD * 1.001;
+        for seed in 1..=20 {
+            let mut rng = Rng::new(seed);
+            let mut filter = seeded_across_drops(base, &mut rng);
+            let span = filter.seed.expect("a seed").span;
+            assert!(span > 511.0, "seed {seed}: the seed spans {span} slots");
+            let start = base + Duration::from_secs(20);
+            let stroke = Stroke::new(start, device, 1000, || rng.unit() * 0.1 * MS, |_| false);
+            drop(stroke.run(&mut filter));
+            let period = filter.period().expect("a period").as_secs_f64();
+            assert!(
+                (period - device).abs() < US,
+                "seed {seed}: kept {period}, the stroke ran at {device}"
+            );
+        }
     }
 
     /// Runs `(true time, receipt)` pairs through `filter` as one stroke: the worst lag from
