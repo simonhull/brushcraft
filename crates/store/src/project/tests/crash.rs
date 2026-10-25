@@ -294,6 +294,22 @@ fn crash_child() {
     wait_for_the_kill();
 }
 
+/// Asserts that the process `pid`, a killed child, left no test directory of its own: it works
+/// in the parent's, as a killed process runs no drops and anything of its own would stay behind.
+fn assert_no_directory_of(pid: u32, scenario: Scenario) {
+    let own = format!("brushcraft-store-{pid}-");
+    let left: Vec<String> = fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&own))
+        .collect();
+    assert_eq!(
+        left,
+        Vec::<String>::new(),
+        "{scenario:?}: the child left directories"
+    );
+}
+
 /// Runs `scenario` in a child process up to where it is to crash, kills it there with
 /// `SIGKILL`, then restores what it left and checks it.
 fn crash(scenario: Scenario) {
@@ -334,6 +350,7 @@ fn crash(scenario: Scenario) {
     let got_there = ready_seen.recv_timeout(CHILD_TIMEOUT);
     child.kill().unwrap();
     let status = child.wait().unwrap();
+    assert_no_directory_of(child.id(), scenario);
     let output = format!("{}\n{}", out.join().unwrap(), err.join().unwrap());
     assert!(
         got_there.is_ok(),

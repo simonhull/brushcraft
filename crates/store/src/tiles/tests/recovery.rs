@@ -558,6 +558,9 @@ fn dropping_the_writer_mid_flush_joins_promptly_and_the_file_reopens() {
                 &format!("{phase}: the latest save point"),
             );
         }
+        // Removed before the test is told it is done: the test's process may exit at once,
+        // ending this thread before its drops run.
+        drop(dir);
         done.send(()).unwrap();
     });
     finished

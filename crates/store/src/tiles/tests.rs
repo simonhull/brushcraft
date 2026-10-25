@@ -3626,6 +3626,9 @@ fn dropping_a_store_with_queued_work_returns_promptly() {
                 "paused {paused}: the file is free: {reopened:?}"
             );
         }
+        // Removed before the test is told it is done: the test's process may exit at once,
+        // ending this thread before its drops run.
+        drop(dir);
         done.send(()).unwrap();
     });
     finished
