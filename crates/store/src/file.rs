@@ -673,6 +673,10 @@ struct Cut {
     head: Option<OpId>,
     /// For each tile or bounds with a record past the cut, where its record at the cut is.
     prior: BTreeMap<Name, Prior>,
+    /// Where the last record the cut's save point will name ends: the file's end when the cut
+    /// opened, moved by every record appended at or before the cut since. A sync must cover it
+    /// before the save point is written.
+    named_end: u64,
 }
 
 /// Where a tile's record at a cut is, for each kind of Index the cut's save point may be.
@@ -1155,6 +1159,8 @@ impl ProjectFile {
                 };
                 cut.prior.entry(name).or_insert(before);
             } else {
+                // First, as the branch may return early: every record at the cut is named.
+                cut.named_end = cut.named_end.max(loc.offset + loc.len);
                 cut.head = cut.head.max(op);
                 if let Some(prior) = cut.prior.get_mut(&name) {
                     *prior = Prior {
@@ -1178,7 +1184,15 @@ impl ProjectFile {
             at,
             head: self.head,
             prior: BTreeMap::new(),
+            named_end: self.end,
         });
+    }
+
+    /// Where the last record the next save point names ends: with a cut open, the end of the
+    /// last record at or before it (see [`Cut`]), else the file's end. A sync that covers it
+    /// covers every record the save point names; records past the cut beyond it need none.
+    pub(crate) fn named_end(&self) -> u64 {
+        self.cut.as_ref().map_or(self.end, |cut| cut.named_end)
     }
 
     /// Whether a record of `key` past the open cut has been appended: a copy of its tile as of

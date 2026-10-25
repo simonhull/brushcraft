@@ -2954,6 +2954,12 @@ impl TileStore {
         self.file.len()
     }
 
+    /// Where the last record the working file's next save point names ends
+    /// ([`ProjectFile::named_end`]): a sync must cover it before that save point is written.
+    pub(crate) fn working_named_end(&self) -> u64 {
+        self.file.named_end()
+    }
+
     /// Whether the working file has records (tiles or bounds) written since its last save
     /// point.
     pub(crate) fn has_unsaved_records(&self) -> bool {

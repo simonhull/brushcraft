@@ -50,8 +50,12 @@
 //! A save point is written only after a sync that began after every record it names was
 //! written. Records can be appended between the request for the tile sync and its completion:
 //! a dirty tile written back to make room, say. So when the tile sync completes, the owner
-//! checks that the file hasn't grown since it asked; if it has, it asks for another sync before
-//! writing the save point.
+//! checks where the last record the save point will name ends
+//! ([`TileStore::working_named_end`]); if that is past what the sync covered, it asks for
+//! another sync before writing the save point. Records past the flush's cut don't count: the
+//! save point doesn't name them, and they wait for the next one. So steady write-back of later
+//! edits during a long stroke can't postpone a flush's save point, or the flushes queued behind
+//! it.
 //!
 //! # Triggers
 //!
@@ -145,7 +149,8 @@ enum Phase {
     Encoding,
     /// The writer thread is syncing the tiles appended so far, which end at byte `end`.
     SyncingTiles {
-        /// The working file's length when the sync was asked for.
+        /// The working file's length when the sync was asked for: the sync covers every record
+        /// before it.
         end: u64,
     },
     /// The writer thread is syncing the save point at byte `offset`.
@@ -594,8 +599,8 @@ impl RecoveryWriter {
             }
             (Phase::SyncingTiles { end }, Reply::Synced(synced)) => {
                 synced.map_err(RecoveryError::Sync)?;
-                if store.working_len() != end {
-                    // Appended to after the sync was asked for: those records aren't covered.
+                if store.working_named_end() > end {
+                    // A record the save point names was appended after the sync was asked for.
                     return self.request_tile_sync(store);
                 }
                 let offset = store.write_save_point()?;

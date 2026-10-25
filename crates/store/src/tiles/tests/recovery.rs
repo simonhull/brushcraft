@@ -105,13 +105,14 @@ fn a_stroke_end_yields_a_save_point_equal_to_the_edits_so_far() {
     }
 }
 
-/// Records appended while the tiles sync are synced again before the save point.
+/// Records past the cut written back during the tile sync need no second sync.
 ///
-/// Write-backs during the tile sync grow the file past what that sync covers, so the flush syncs
-/// once more before writing its save point. The save point still holds only the edits at its
-/// cut, and the written-back edits land in the next one.
+/// Write-backs during the tile sync grow the file past what that sync covers, but they hold
+/// edits past the flush's cut, which its save point doesn't name: the flush writes its save
+/// point without syncing again. The save point still holds only the edits at its cut, and the
+/// written-back edits land in the next one.
 #[test]
-fn records_appended_while_the_tiles_sync_are_synced_before_the_save_point() {
+fn records_past_the_cut_written_back_during_the_tile_sync_need_no_second_sync() {
     let dir = TestDir::new();
     let mesh = mesh();
     let path = dir.path("recovery.bcrf");
@@ -130,8 +131,9 @@ fn records_appended_while_the_tiles_sync_are_synced_before_the_save_point() {
     writer.step_blocking(&mut store).unwrap();
     assert_eq!(
         writer.phase(),
-        "syncing tiles",
-        "the file grew during the sync, so it is synced again before the save point"
+        "syncing save point",
+        "the records written back during the sync are past the cut, so the save point needs no \
+         second sync"
     );
     settle(&mut writer, &mut store);
     let first = writer.durable_save_point().unwrap();
@@ -206,6 +208,73 @@ fn the_change_feed_stays_bounded_between_saves() {
         "every consumer has drained what it was given"
     );
     assert!(store.has_unsaved_edits(), "the edits still wait for a save");
+}
+
+/// A record at the cut appended during the tile sync is synced before the save point.
+///
+/// A record the save point names, appended after the tile sync was asked for, isn't covered by
+/// that sync: the flush syncs again before writing the save point.
+#[test]
+fn a_record_at_the_cut_appended_during_the_tile_sync_is_synced_before_the_save_point() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 60, 41));
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(writer.phase(), "syncing tiles", "the records are appended");
+    let key = tiles(&mesh, TOP, TOP)[0];
+    let tile = CorrectionTile::zero(key.side()).unwrap();
+    let op = store.begin_op().unwrap();
+    store
+        .file
+        .write_displacement_stamped(key, op, Stamp::ZERO, &tile)
+        .unwrap();
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(
+        writer.phase(),
+        "syncing tiles",
+        "a record the save point names was appended after the sync was asked for"
+    );
+}
+
+/// An at-cut record replacing a past-cut one during the tile sync is synced before the save
+/// point.
+///
+/// A tile edited past the cut and written back leaves the cut a prior record; a record of the
+/// same tile at the cut appended after it is the cut's state, so the save point names it, and
+/// the flush syncs again before writing the save point.
+#[test]
+fn an_at_cut_record_replacing_a_past_cut_one_during_the_tile_sync_is_synced_before_the_save_point()
+{
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 60, 41));
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(writer.phase(), "syncing tiles", "the records are appended");
+    let key = tiles(&mesh, TOP, TOP)[0];
+    edit_interior(&mut store, &mut map, key, Vec3::new(0.0, 0.0, 0.002));
+    // Written back past the cut: the cut remembers the tile's prior record.
+    store.evict_all().unwrap();
+    let tile = CorrectionTile::zero(key.side()).unwrap();
+    let op = store.begin_op().unwrap();
+    store
+        .file
+        .write_displacement_stamped(key, op, Stamp::ZERO, &tile)
+        .unwrap();
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(
+        writer.phase(),
+        "syncing tiles",
+        "the at-cut record that replaced the prior is named, and was appended after the sync was \
+         asked for"
+    );
 }
 
 /// Ticks during a ten-second stroke of one op flush about once a second.
