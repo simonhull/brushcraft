@@ -2576,7 +2576,9 @@ type Worked = (
 ///
 /// Brush rounds, an edit of a brushed tile once unpinned, then an edit of every vertex of a
 /// parent of the first brushed tile (one level coarser) while the brushed tiles are pinned,
-/// brush rounds again, every tile evicted, and brush rounds once more.
+/// the pinned tiles evaluated again (their parents moved, so nothing of theirs is kept), brush
+/// rounds again, every tile evicted, and brush rounds once more. With a bound below the
+/// brushed tiles, the store never holds more predictions than the bound.
 fn rounds_around_a_parent_edit(
     dir: &TestDir,
     mesh: &Arc<BaseMesh>,
@@ -2591,9 +2593,9 @@ fn rounds_around_a_parent_edit(
         "only the pinned tiles, predicted in place, keep a prediction"
     );
     assert_eq!(
-        store.kept.keys().count(),
-        if kept > 0 { keys.len() } else { 0 },
-        "every pinned tile keeps one, if any are kept"
+        store.kept.len(),
+        kept.min(keys.len()),
+        "every pinned tile keeps one, as far as the bound allows"
     );
     // A brushed tile edited unpinned loses its slot, and its prediction with it.
     store.begin_op().unwrap();
@@ -2613,7 +2615,23 @@ fn rounds_around_a_parent_edit(
         })
         .unwrap()
         .unwrap();
+    let moved: Vec<TileKey> = keys
+        .iter()
+        .filter(|key| store.evaluated.freshness(key) == Some(Freshness::Stale))
+        .copied()
+        .collect();
+    assert!(!moved.is_empty(), "the parent's edit reached brushed tiles");
+    store.evaluate_many(&keys, Evaluation::Positions).unwrap();
+    assert!(
+        moved.iter().all(|key| store.kept.get(key).is_none()),
+        "tiles predicted again because their parents moved keep nothing"
+    );
     brush_rounds(&mut store, &keys, &around, true);
+    assert!(
+        store.log.predictions_held <= kept,
+        "never more held than the bound, new ones included: {}",
+        store.log.predictions_held
+    );
     drop(pins);
     store.evict_all().unwrap();
     assert_eq!(
@@ -2640,8 +2658,14 @@ fn kept_predictions_change_no_bits() {
     let dir = TestDir::new();
     let mesh = mesh();
     let (full, none) = rounds_around_a_parent_edit(&dir, &mesh, 0);
+    let (few, bounded) = rounds_around_a_parent_edit(&dir, &mesh, 2);
     let (kept, some) = rounds_around_a_parent_edit(&dir, &mesh, 64);
     assert_eq!(none.predictions_reused, 0, "none kept, none reused");
+    assert!(
+        (1..some.predictions_reused).contains(&bounded.predictions_reused),
+        "two kept: fewer reused, {bounded:?}"
+    );
+    assert!(few == full, "two kept: the same work");
     assert!(
         some.predictions_reused > 0,
         "the brushed tiles reused their predictions: {some:?}"
