@@ -2498,9 +2498,9 @@ type Worked = (
 /// A stroke around a parent's edit, on a store keeping `kept` predictions: what the store
 /// worked out, and its activity.
 ///
-/// Brush rounds, then an edit of every vertex of a parent of the first brushed tile (one level
-/// coarser) while the brushed tiles are pinned, brush rounds again, every tile evicted, and
-/// brush rounds once more.
+/// Brush rounds, an edit of a brushed tile once unpinned, then an edit of every vertex of a
+/// parent of the first brushed tile (one level coarser) while the brushed tiles are pinned,
+/// brush rounds again, every tile evicted, and brush rounds once more.
 fn rounds_around_a_parent_edit(
     dir: &TestDir,
     mesh: &Arc<BaseMesh>,
@@ -2510,6 +2510,22 @@ fn rounds_around_a_parent_edit(
     let config = roomy().with_kept_predictions(kept);
     let mut store = new_store(dir, &format!("kept-{kept}.bcp"), mesh, config);
     brush_rounds(&mut store, &keys, &around, true);
+    assert!(
+        store.kept.keys().all(|key| keys.contains(key)),
+        "only the pinned tiles, predicted in place, keep a prediction"
+    );
+    assert_eq!(
+        store.kept.keys().count(),
+        if kept > 0 { keys.len() } else { 0 },
+        "every pinned tile keeps one, if any are kept"
+    );
+    // A brushed tile edited unpinned loses its slot, and its prediction with it.
+    store.begin_op().unwrap();
+    store
+        .edit_tile(keys[1], |edit| edit.set(1, 1, Vec3::new(0.0, 0.0, 0.001)))
+        .unwrap()
+        .unwrap();
+    assert!(store.kept.get(&keys[1]).is_none(), "gone with its slot");
     // The brushed tiles stay pinned through their parent's edit, as a stroke's do: their slots
     // are kept, stale, and predicted again in place.
     let pins = store.pin(&keys).unwrap();

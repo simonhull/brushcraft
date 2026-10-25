@@ -1295,6 +1295,49 @@ mod tests {
     }
 
     #[test]
+    fn an_edge_run_refuses_copies_that_dont_move_alike() {
+        let copy = |tx: u16, i: u32, j: u32| VertexCopy {
+            face: FaceId::new(0),
+            tx,
+            ty: 0,
+            i,
+            j,
+        };
+        let copies = |list: &[VertexCopy]| {
+            let mut copies = Copies::default();
+            for &c in list {
+                copies.0.push(c);
+            }
+            copies
+        };
+        // Five vertices along an edge, two copies each, moving one step a vertex.
+        let linear = |t: usize| {
+            let t = u32::try_from(t).unwrap();
+            copies(&[copy(0, 1 + t, 0), copy(1, 1 + t, 64)])
+        };
+        let run = EdgeRun::along(7, linear).unwrap();
+        assert_eq!(&*run.at(3).unwrap(), &*linear(3), "worked out alike");
+        assert!(run.at(5).is_none(), "past the run");
+        let bent = |t: usize| {
+            let t = u32::try_from(t).unwrap();
+            copies(&[copy(0, 1 + t * t, 0)])
+        };
+        assert!(EdgeRun::along(7, bent).is_none(), "not linear at its end");
+        let moving = |t: usize| copies(&[copy(u16::from(t > 0), 1, 0)]);
+        assert!(EdgeRun::along(7, moving).is_none(), "a copy changing tiles");
+        let growing = |t: usize| {
+            let list = [copy(0, 1, 0), copy(1, 1, 64)];
+            copies(list.get(..1 + usize::from(t > 0)).unwrap())
+        };
+        assert!(
+            EdgeRun::along(7, growing).is_none(),
+            "a copy more on the way"
+        );
+        let three = |_: usize| copies(&[copy(0, 1, 0), copy(1, 1, 64), copy(2, 1, 64)]);
+        assert!(EdgeRun::along(7, three).is_none(), "more than two copies");
+    }
+
+    #[test]
     fn copy_keys_name_any_layer_and_channel() {
         let mesh = cube_sphere(1).unwrap();
         let level = Level::new(8).unwrap();
