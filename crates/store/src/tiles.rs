@@ -116,8 +116,8 @@ use std::sync::Arc;
 
 use geom::{
     BaseMesh, Channel, CorrectionError, CorrectionView, CorrectionViewMut, EvalError, FaceId,
-    LayerId, Level, MAX_COPIES, PositionSource, Region, TileKey, Vec3, normals_into, parent_tiles,
-    predict_region, refresh_normals_into,
+    LayerId, Level, MAX_COPIES, PositionSource, Region, TileBorder, TileKey, Vec3, VertexCopy,
+    normals_into, parent_tiles, predict_region, refresh_normals_into,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -4558,6 +4558,51 @@ impl TileStore {
     }
 }
 
+/// The border vertices of a tile with `side` vertices a side, in row-major order.
+///
+/// That is the first row, then the first and last vertex of each row inside, then the last row:
+/// the order [`TileEdit::update`] visits them in.
+fn border_order(side: u32) -> impl Iterator<Item = (u32, u32)> {
+    let last = side.saturating_sub(1);
+    (0..side).flat_map(move |j| {
+        let step = if j == 0 || j == last { 1 } else { last.max(1) };
+        (0..side)
+            .step_by(usize::try_from(step).unwrap_or(1))
+            .map(move |i| (i, j))
+    })
+}
+
+/// A tile's border corrections, read at once in [`border_order`] for the tile's border writes
+/// ([`TileEdit::update_border_one`]), instead of a slot lookup per vertex.
+#[derive(Debug)]
+struct BorderValues {
+    /// The tile's vertices a side.
+    side: u32,
+    /// The corrections, in [`border_order`].
+    values: Vec<Vec3>,
+}
+
+impl BorderValues {
+    /// The correction read for border vertex `(i, j)`; `None` for a vertex inside the tile or
+    /// outside it.
+    fn get(&self, i: u32, j: u32) -> Option<Vec3> {
+        let last = self.side.checked_sub(1)?;
+        if i > last || j > last {
+            return None;
+        }
+        let at = if j == 0 {
+            i
+        } else if j == last {
+            self.side + 2 * (last - 1) + i
+        } else if i == 0 || i == last {
+            self.side + 2 * (j - 1) + u32::from(i == last)
+        } else {
+            return None;
+        };
+        self.values.get(usize::try_from(at).ok()?).copied()
+    }
+}
+
 /// What [`update_interior`] did to a tile's interior.
 #[derive(Debug)]
 struct InteriorPass {
@@ -4768,14 +4813,26 @@ impl TileEdit<'_> {
         if inside.contains(&i) && inside.contains(&j) {
             return self.write(0, (i, j), c);
         }
-        let level = self.key.level();
         let region = Region::of_tile(&self.key);
         let copies = self.store.mesh.topology().copies(
             self.key.face(),
-            level,
+            self.key.level(),
             region.x0() + i,
             region.y0() + j,
         );
+        self.set_copies(&copies, c)
+    }
+
+    /// Sets every one of `copies`, the copies of one vertex in [`geom::Topology::copies`]'s order,
+    /// to `c` (finite): each one's tile is loaded and pinned first, in that order, then each
+    /// copy is written, as [`TileEdit::set`] does for a border vertex.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileEdit::set`] for a neighbouring tile that can't be loaded, before anything of
+    /// this vertex is written.
+    fn set_copies(&mut self, copies: &[VertexCopy], c: Vec3) -> Result<(), CacheError> {
+        let level = self.key.level();
         let mut at = [0; MAX_COPIES];
         for (copy, place) in copies.iter().zip(&mut at) {
             *place = self.touch(copy.key(level))?;
@@ -4784,6 +4841,29 @@ impl TileEdit<'_> {
             self.write(n, (copy.i, copy.j), c)?;
         }
         Ok(())
+    }
+
+    /// [`TileEdit::set`] for border vertex `(i, j)`, its copies read from `border`, the tile's
+    /// [`TileBorder`]: the same writes in the same order, without finding the copies again for
+    /// every vertex.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileEdit::set`].
+    fn set_border(
+        &mut self,
+        border: &TileBorder,
+        i: u32,
+        j: u32,
+        c: Vec3,
+    ) -> Result<(), CacheError> {
+        let Some(copies) = border.copies(i, j) else {
+            return self.set(i, j, c);
+        };
+        if !c.is_finite() {
+            return Err(CacheError::Correction(CorrectionError::NotFinite));
+        }
+        self.set_copies(&copies, c)
     }
 
     /// Rewrites the tile's corrections vertex by vertex: `f` sees every vertex in row-major
@@ -4916,14 +4996,18 @@ impl TileEdit<'_> {
         {
             return Err(e);
         }
+        let border = match self.store.mesh.topology().tile_border(&self.key) {
+            Some(copies) => Some((self.border_values()?, copies)),
+            None => None,
+        };
         for j in 0..side {
             if j == 0 || j == last {
                 for i in 0..side {
-                    self.update_one(i, j, &mut f)?;
+                    self.update_border_one(border.as_ref(), i, j, &mut f)?;
                 }
                 continue;
             }
-            self.update_one(0, j, &mut f)?;
+            self.update_border_one(border.as_ref(), 0, j, &mut f)?;
             if first_row == Some(j) {
                 self.mark_own_written()?;
             }
@@ -4932,9 +5016,61 @@ impl TileEdit<'_> {
             {
                 return Err(e);
             }
-            self.update_one(last, j, &mut f)?;
+            self.update_border_one(border.as_ref(), last, j, &mut f)?;
         }
         Ok(())
+    }
+
+    /// The corrections of the tile's border vertices as they are now, read through one view
+    /// (see [`BorderValues`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] for a stale handle or a broken slot.
+    fn border_values(&self) -> Result<BorderValues, CacheError> {
+        let side = self.key.side();
+        let own = self.touched.first().ok_or(Invariant::StaleHandle)?;
+        let slot = self
+            .store
+            .corrections
+            .get(own.id)
+            .ok_or(Invariant::StaleHandle)?;
+        let view = slot.view().map_err(Invariant::CorrectionSlot)?;
+        let values = border_order(side)
+            .map(|(i, j)| view.get(i, j).ok_or(Invariant::StaleHandle))
+            .collect::<Result<_, _>>()?;
+        Ok(BorderValues { side, values })
+    }
+
+    /// [`TileEdit::update_one`] for border vertex `(i, j)`; where the tile has a [`TileBorder`],
+    /// with its correction from the [`BorderValues`] read before the tile's border writes and
+    /// its copies from the border.
+    ///
+    /// The values read before are the values [`TileEdit::get`] would read now: the writes since
+    /// went to other vertices' copies, and a tile with a [`TileBorder`] holds no vertex twice,
+    /// so none of them landed on this vertex.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileEdit::set`].
+    fn update_border_one(
+        &mut self,
+        border: Option<&(BorderValues, TileBorder)>,
+        i: u32,
+        j: u32,
+        f: &mut impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
+    ) -> Result<(), CacheError> {
+        let Some((values, copies)) = border else {
+            return self.update_one(i, j, f);
+        };
+        let current = match values.get(i, j) {
+            Some(c) => c,
+            None => self.get(i, j)?,
+        };
+        match f(i, j, current) {
+            Some(c) => self.set_border(copies, i, j, c),
+            None => Ok(()),
+        }
     }
 
     /// Marks the edited tile written, if no write has yet: dirty, on the change feed with the

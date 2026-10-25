@@ -2241,6 +2241,45 @@ fn update_round(
 }
 
 #[test]
+fn border_values_are_found_where_border_order_put_them() {
+    for side in [2, 3, 4, 65] {
+        let order: Vec<(u32, u32)> = border_order(side).collect();
+        let last = side - 1;
+        let border: Vec<(u32, u32)> = (0..side)
+            .flat_map(|j| (0..side).map(move |i| (i, j)))
+            .filter(|&(i, j)| i == 0 || i == last || j == 0 || j == last)
+            .collect();
+        assert_eq!(
+            order, border,
+            "side {side}: every border vertex once, row-major"
+        );
+        let values = BorderValues {
+            side,
+            values: (0_u16..)
+                .zip(&order)
+                .map(|(n, _)| Vec3::new(f32::from(n), 0.0, 0.0))
+                .collect(),
+        };
+        for (n, &(i, j)) in (0_u16..).zip(&order) {
+            assert_eq!(
+                values.get(i, j),
+                Some(Vec3::new(f32::from(n), 0.0, 0.0)),
+                "side {side}: ({i}, {j})"
+            );
+        }
+        for (i, j) in [(1, 1), (side, 0), (0, side)] {
+            if !order.contains(&(i, j)) {
+                assert_eq!(
+                    values.get(i, j),
+                    None,
+                    "side {side}: ({i}, {j}) isn't on it"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn updating_tiles_equals_updating_each_in_turn() {
     let dir = TestDir::new();
     let mesh = mesh();

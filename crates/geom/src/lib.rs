@@ -37,4 +37,4 @@ pub use key::{
 pub use math::Vec3;
 pub use mesh::{BaseMesh, MAX_VALENCE, MeshError};
 pub use sphere::cube_sphere;
-pub use topology::{Copies, MAX_COPIES, Topology, VertexCopy};
+pub use topology::{BorderCopies, Copies, MAX_COPIES, TileBorder, Topology, VertexCopy};

@@ -308,6 +308,51 @@ impl Topology {
         copies
     }
 
+    /// The copies of every border vertex of tile `key`, found once for the tile
+    /// ([`TileBorder`]): [`Topology::copies`] for each, without its cost per call. `None` for a
+    /// tile holding one of its border vertices twice (only a face glued to itself could), whose
+    /// vertices then each need [`Topology::copies`].
+    ///
+    /// It looks up the copies of the tile's four corners and of three vertices of each edge: a
+    /// few dozen lookups, against the hundreds of border vertices of a finest tile.
+    #[must_use]
+    pub fn tile_border(&self, key: &TileKey) -> Option<TileBorder> {
+        let (level, side) = (key.level(), key.side());
+        let last = side - 1;
+        let region = Region::of_tile(key);
+        let at =
+            |(i, j): (u32, u32)| self.copies(key.face(), level, region.x0() + i, region.y0() + j);
+        let held_once = |copy: &VertexCopy, (i, j): (u32, u32)| {
+            copy.face != key.face()
+                || copy.tx != key.tx()
+                || copy.ty != key.ty()
+                || (copy.i, copy.j) == (i, j)
+        };
+        let corners = CORNERS.map(|corner| (corner, at(corner.at(last))));
+        if !corners
+            .iter()
+            .all(|(corner, copies)| copies.iter().all(|copy| held_once(copy, corner.at(last))))
+        {
+            return None;
+        }
+        let mut edges = [EdgeRun::EMPTY; 4];
+        for (edge, run) in EDGES.into_iter().zip(&mut edges) {
+            *run = EdgeRun::along(side, |t| at(edge.at(last, t)))?;
+            let ends = [0, run.vertices.saturating_sub(1)];
+            for t in ends.into_iter().take(run.vertices) {
+                let copies = run.at(t)?;
+                if !copies.iter().all(|copy| held_once(copy, edge.at(last, t))) {
+                    return None;
+                }
+            }
+        }
+        Some(TileBorder {
+            side,
+            corners: corners.map(|(_, copies)| copies),
+            edges,
+        })
+    }
+
     /// Whether tile `key` owns its vertex `(i, j)` (in the tile's own coordinates): whether, of
     /// the vertex's copies (one per tile holding it, see [`Topology::copies`]), this is the one
     /// that counts it, so that a vertex on a tile border is counted, or edited, exactly once.
@@ -563,6 +608,273 @@ impl<'a> IntoIterator for &'a Copies {
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+/// A corner of a tile, by which of its axes are at their last coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileCorner {
+    /// `(0, 0)`.
+    First,
+    /// `(last, 0)`.
+    LastColumn,
+    /// `(0, last)`.
+    LastRow,
+    /// `(last, last)`.
+    Last,
+}
+
+/// The tile's corners in the order [`TileBorder`] keeps them: `(0, 0)`, `(last, 0)`,
+/// `(0, last)`, `(last, last)`, so corner `(i, j)` is at `[(i == last) + 2 (j == last)]`.
+const CORNERS: [TileCorner; 4] = [
+    TileCorner::First,
+    TileCorner::LastColumn,
+    TileCorner::LastRow,
+    TileCorner::Last,
+];
+
+impl TileCorner {
+    /// The corner's coordinates in a tile whose last coordinate is `last`.
+    const fn at(self, last: u32) -> (u32, u32) {
+        match self {
+            Self::First => (0, 0),
+            Self::LastColumn => (last, 0),
+            Self::LastRow => (0, last),
+            Self::Last => (last, last),
+        }
+    }
+}
+
+/// An edge of a tile, between two of its corners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileEdge {
+    /// The first row, `j = 0`.
+    Bottom,
+    /// The last column, `i = last`.
+    Right,
+    /// The last row, `j = last`.
+    Top,
+    /// The first column, `i = 0`.
+    Left,
+}
+
+/// The tile's edges in the order [`TileBorder`] keeps them.
+const EDGES: [TileEdge; 4] = [
+    TileEdge::Bottom,
+    TileEdge::Right,
+    TileEdge::Top,
+    TileEdge::Left,
+];
+
+impl TileEdge {
+    /// The edge's place in [`EDGES`].
+    const fn index(self) -> usize {
+        match self {
+            Self::Bottom => 0,
+            Self::Right => 1,
+            Self::Top => 2,
+            Self::Left => 3,
+        }
+    }
+
+    /// The coordinates of the `t`-th vertex between the edge's corners (from 0, counted from
+    /// the corner with the lower coordinate along it), in a tile whose last coordinate is
+    /// `last`.
+    const fn at(self, last: u32, t: usize) -> (u32, u32) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a tile edge has fewer vertices than u32 counts"
+        )]
+        let along = 1 + t as u32;
+        match self {
+            Self::Bottom => (along, 0),
+            Self::Right => (last, along),
+            Self::Top => (along, last),
+            Self::Left => (0, along),
+        }
+    }
+}
+
+/// The copies of the vertices between two corners of a tile: copy `k` of the `t`-th vertex is
+/// `first[k]` moved `t` steps of `step[k]` within its tile.
+///
+/// Along an open tile edge nothing changes but the position: the faces holding the vertices
+/// are the same (a face corner is a tile corner), and so are the tiles (tile borders lie at the
+/// same multiples on both sides of a face edge, as neighbouring faces' grids meet end to end).
+/// So the copies' coordinates move linearly, which [`EdgeRun::along`] checks at both ends.
+#[derive(Debug, Clone, Copy)]
+struct EdgeRun {
+    /// The vertices between the corners: the tile's side less two.
+    vertices: usize,
+    /// How many copies each vertex has: at most two (two tiles of one face, or one tile of each
+    /// of two faces).
+    copies: usize,
+    /// The copies of the first vertex; past `copies`, placeholders.
+    first: [VertexCopy; 2],
+    /// How each copy's coordinates move from one vertex to the next, `(di, dj)`.
+    step: [(i64, i64); 2],
+}
+
+impl EdgeRun {
+    /// No vertices: what the run of each edge is until it is found.
+    const EMPTY: Self = Self {
+        vertices: 0,
+        copies: 0,
+        first: [VertexCopy {
+            face: FaceId::new(0),
+            tx: 0,
+            ty: 0,
+            i: 0,
+            j: 0,
+        }; 2],
+        step: [(0, 0); 2],
+    };
+
+    /// The run of an edge of a tile with `side` vertices a side, from `copies(t)`, the copies of
+    /// the edge's `t`-th vertex. `None` unless every vertex has the same number of copies (at most
+    /// two), each in the same tile for every vertex and moving linearly: checked at the first,
+    /// second and last vertices.
+    fn along(side: u32, copies: impl Fn(usize) -> Copies) -> Option<Self> {
+        let vertices = usize::try_from(side.saturating_sub(2)).ok()?;
+        if vertices == 0 {
+            return Some(Self::EMPTY);
+        }
+        let first = copies(0);
+        if first.len() > 2 {
+            return None;
+        }
+        let mut run = Self {
+            vertices,
+            copies: first.len(),
+            ..Self::EMPTY
+        };
+        for (place, copy) in run.first.iter_mut().zip(first.iter()) {
+            *place = *copy;
+        }
+        if vertices == 1 {
+            return Some(run);
+        }
+        let (second, end) = (copies(1), copies(vertices - 1));
+        if second.len() != run.copies || end.len() != run.copies {
+            return None;
+        }
+        let span = i64::try_from(vertices - 1).ok()?;
+        for ((step, (a, b)), z) in run
+            .step
+            .iter_mut()
+            .zip(first.iter().zip(second.iter()))
+            .zip(end.iter())
+        {
+            let same_tile = |c: &VertexCopy| (c.face, c.tx, c.ty) == (a.face, a.tx, a.ty);
+            if !same_tile(b) || !same_tile(z) {
+                return None;
+            }
+            *step = (
+                i64::from(b.i) - i64::from(a.i),
+                i64::from(b.j) - i64::from(a.j),
+            );
+            let reaches =
+                |from: u32, by: i64, to: u32| i64::from(from) + by * span == i64::from(to);
+            if !reaches(a.i, step.0, z.i) || !reaches(a.j, step.1, z.j) {
+                return None;
+            }
+        }
+        Some(run)
+    }
+
+    /// The copies of the `t`-th vertex; `None` past the run.
+    fn at(&self, t: usize) -> Option<BorderCopies<'_>> {
+        if t >= self.vertices {
+            return None;
+        }
+        let t = i64::try_from(t).ok()?;
+        let mut copies = self.first;
+        for (copy, (di, dj)) in copies.iter_mut().zip(self.step).take(self.copies) {
+            copy.i = u32::try_from(i64::from(copy.i) + di * t).ok()?;
+            copy.j = u32::try_from(i64::from(copy.j) + dj * t).ok()?;
+        }
+        Some(BorderCopies(Held::Edge {
+            copies,
+            len: self.copies,
+        }))
+    }
+}
+
+/// The copies of every border vertex of one tile, as [`Topology::tile_border`] found them.
+///
+/// [`TileBorder::copies`] gives each vertex's, the same as [`Topology::copies`] in the same
+/// order, from a few values kept per corner and edge.
+///
+/// An edit sets every copy of each border vertex it moves, so finding them per vertex (each a
+/// walk of the face's neighbours and two lists of inline copies) costs more than writing them;
+/// a tile edited across its border finds them all here at once.
+#[derive(Debug, Clone)]
+pub struct TileBorder {
+    /// The tile's vertices a side.
+    side: u32,
+    /// The copies of each corner, in [`CORNERS`] order.
+    corners: [Copies; 4],
+    /// The copies along each edge, in [`EDGES`] order.
+    edges: [EdgeRun; 4],
+}
+
+impl TileBorder {
+    /// The copies of the tile's vertex `(i, j)`, in [`Topology::copies`]'s order; `None` if it
+    /// isn't on the tile's border.
+    #[must_use]
+    pub fn copies(&self, i: u32, j: u32) -> Option<BorderCopies<'_>> {
+        let last = self.side.checked_sub(1)?;
+        if i > last || j > last {
+            return None;
+        }
+        let (end_i, end_j) = (i == 0 || i == last, j == 0 || j == last);
+        if end_i && end_j {
+            let corner = usize::from(i == last) + 2 * usize::from(j == last);
+            return self
+                .corners
+                .get(corner)
+                .map(|c| BorderCopies(Held::Corner(c)));
+        }
+        let (edge, along) = match (i, j) {
+            (_, 0) => (TileEdge::Bottom, i),
+            (_, j) if j == last => (TileEdge::Top, i),
+            (0, _) => (TileEdge::Left, j),
+            (i, _) if i == last => (TileEdge::Right, j),
+            _ => return None,
+        };
+        self.edges
+            .get(edge.index())?
+            .at(usize::try_from(along.checked_sub(1)?).ok()?)
+    }
+}
+
+/// The copies of one border vertex, from a [`TileBorder`]: a slice of [`VertexCopy`] through
+/// `Deref`, as [`Copies`] is.
+#[derive(Debug, Clone, Copy)]
+pub struct BorderCopies<'a>(Held<'a>);
+
+/// Where a [`BorderCopies`] holds its copies.
+#[derive(Debug, Clone, Copy)]
+enum Held<'a> {
+    /// A corner's, kept by the border.
+    Corner(&'a Copies),
+    /// An edge vertex's, worked out from its edge's run: the first `len` of `copies`.
+    Edge {
+        /// The copies, then placeholders.
+        copies: [VertexCopy; 2],
+        /// How many are copies.
+        len: usize,
+    },
+}
+
+impl std::ops::Deref for BorderCopies<'_> {
+    type Target = [VertexCopy];
+
+    fn deref(&self) -> &[VertexCopy] {
+        match &self.0 {
+            Held::Corner(copies) => copies,
+            Held::Edge { copies, len } => copies.get(..*len).unwrap_or_default(),
+        }
     }
 }
 
@@ -933,6 +1245,52 @@ mod tests {
             edge.iter().copied().collect::<Vec<_>>(),
             edge.into_iter().collect::<Vec<_>>(),
             "by reference and by value alike"
+        );
+    }
+
+    /// Asserts that [`Topology::tile_border`] of every tile of `mesh` at each of `levels` gives
+    /// every border vertex exactly [`Topology::copies`]'s copies, in its order, and nothing for a
+    /// vertex inside the tile.
+    fn assert_tile_borders(mesh: &BaseMesh, levels: std::ops::RangeInclusive<u8>, what: &str) {
+        let t = mesh.topology();
+        for level in levels.map(|n| Level::new(n).unwrap()) {
+            let tiles = u16::try_from(level.tiles_per_side()).unwrap();
+            for face in mesh.faces() {
+                for (tx, ty) in (0..tiles).flat_map(|ty| (0..tiles).map(move |tx| (tx, ty))) {
+                    let key = TileKey::displacement(face, level, tx, ty).unwrap();
+                    let border = t.tile_border(&key).unwrap();
+                    let (side, region) = (key.side(), Region::of_tile(&key));
+                    for (i, j) in (0..side).flat_map(|j| (0..side).map(move |i| (i, j))) {
+                        let inside = (1..side - 1).contains(&i) && (1..side - 1).contains(&j);
+                        let got = border.copies(i, j);
+                        if inside {
+                            assert!(got.is_none(), "{what}: {key:?} ({i}, {j}) is inside");
+                            continue;
+                        }
+                        let want = t.copies(face, level, region.x0() + i, region.y0() + j);
+                        assert_eq!(got.as_deref(), Some(&*want), "{what}: {key:?} ({i}, {j})");
+                    }
+                    assert!(border.copies(side, 0).is_none(), "{what}: outside the tile");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tile_border_gives_each_border_vertex_its_copies() {
+        assert_tile_borders(&cube_sphere(1).unwrap(), 1..=9, "the cube");
+        assert_tile_borders(&cube_sphere(2).unwrap(), 1..=7, "a split cube");
+        assert_tile_borders(
+            &crate::fixtures::subdivided_pentagonal_prism().unwrap(),
+            1..=7,
+            "valence 3, 4 and 5",
+        );
+        assert_tile_borders(
+            &crate::reference::prism(MAX_VALENCE)
+                .subdivide()
+                .to_base_mesh(),
+            1..=7,
+            "the highest valence",
         );
     }
 
