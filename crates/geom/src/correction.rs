@@ -363,9 +363,10 @@ impl<'a> CorrectionViewMut<'a> {
         self.store(i, j, c)
     }
 
-    /// Rewrites the interior vertices of row `j` (`1..side - 1`, a row inside the tile), in
-    /// order: `f` sees each vertex's coordinates and its correction as stored, and where it
-    /// returns a new value, that is set as [`CorrectionViewMut::set`] sets it, before `f` sees
+    /// Rewrites the interior vertices of row `j` (`1..side - 1`, a row inside the tile; any
+    /// `j` is checked against that without overflow, as `side` is at least 2), in order: `f` sees
+    /// each vertex's coordinates and its correction as stored, and where it returns a new
+    /// value, that is set as [`CorrectionViewMut::set`] sets it, before `f` sees
     /// the next vertex.
     ///
     /// The same bits as [`CorrectionViewMut::get`] then [`CorrectionViewMut::set`] for each
@@ -390,7 +391,7 @@ impl<'a> CorrectionViewMut<'a> {
             wrote: false,
             error: None,
         };
-        let first = (j >= 1 && j + 1 < side)
+        let first = (j >= 1 && j < side - 1)
             .then(|| usize::try_from((j - 1) * (side - 2)).ok())
             .flatten();
         let Some(first) = first else {
@@ -970,7 +971,7 @@ mod tests {
             assert_eq!(fast, slow, "case {case}: the same values");
         }
         let mut tile = CorrectionTile::zero(5).unwrap();
-        for j in [0, 4, 9] {
+        for j in [0, 4, 9, u32::MAX] {
             let outcome = tile.view_mut().update_interior_row(j, |_, _, c| Some(c));
             assert_eq!(
                 outcome,
