@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, ensure};
 use geom::{Level, Vec3};
-use sculpt::{DrawParams, StepStats, draw_step};
+use sculpt::{DrawParams, StepStats, Stroke, draw_step};
 use store::{Activity, Project, ProjectConfig, SpatialIndex, StoreConfig};
 
 use crate::cli::Options;
@@ -147,13 +147,14 @@ pub(crate) fn stroke(
         Detail::PerStep => sys::minor_faults().map(Some),
     };
     project.begin_stroke().context("beginning a stroke")?;
+    let mut stroke = Stroke::new(project.store());
     let mut dabs = Vec::with_capacity(centres.len());
     for &center in centres {
         let params = DrawParams::new(center, radius, strength)?;
         let faults_before = faults()?;
         let activity_before = project.store().activity();
         let start = Instant::now();
-        let stats = draw_step(project, index, params).context("a draw step")?;
+        let stats = draw_step(project, index, &mut stroke, params).context("a draw step")?;
         let wall = start.elapsed();
         let activity = project.store().activity().since(&activity_before);
         let minor_faults = faults()?
@@ -173,7 +174,8 @@ pub(crate) fn stroke(
 /// One record per dab of `dabs`, as `bench`'s `step` result, in stroke order.
 ///
 /// Each has the dab's number (from 0), its wall time and each phase's, its footprint
-/// (candidates, tiles edited, vertices moved, tiles updated), what the store did during it, and
+/// (candidates, tiles edited, vertices moved, tiles updated, tiles written per dab for want of
+/// stroke state), what the store did during it, and
 /// the page faults if they were counted: what finds the slow steps of a stroke and tells what
 /// they did differently.
 pub(crate) fn step_records<'a>(
@@ -196,6 +198,7 @@ pub(crate) fn step_records<'a>(
             .with("tiles_edited", stats.tiles_edited)
             .with("vertices", stats.vertices)
             .with("tiles_updated", stats.tiles_updated)
+            .with("tiles_unaccumulated", stats.tiles_unaccumulated)
             .with("corrections_loaded", activity.corrections_loaded)
             .with("positions_computed", activity.positions_computed)
             .with("predictions_reused", activity.predictions_reused)

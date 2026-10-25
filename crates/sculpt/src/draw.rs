@@ -9,9 +9,11 @@
 //!    frame. Every delta is computed before any correction is written: an edit moves the positions
 //!    of every tile holding a copy of the vertex, and a later tile's brush must see the surface as
 //!    the step found it.
-//! 4. **Edit**: each delta is added to the `z` of its vertex's correction (read-modify-write, `c.z
-//!    += delta`) through [`TileStore::update_tiles`], which keeps seam twins in step and, the tiles
-//!    being pinned, writes their interiors in parallel.
+//! 4. **Edit**: each delta is added to the sum of the stroke's deltas for its vertex, and the
+//!    vertex's correction `z` is set to the value the stroke first found there plus that sum (see
+//!    [`Stroke`]), through [`TileStore::update_tiles`], which keeps seam twins in step and, the
+//!    tiles being pinned, writes their interiors in parallel. The stored value is so rounded to its
+//!    tile's quantization once per stroke, not once per dab.
 //! 5. **Neighbours**: the tiles whose bounds may have changed are listed. That is every tile
 //!    holding a vertex within the radius, whose positions moved, and every tile whose normals read
 //!    one of those, whose normal cones may have turned: the tiles each reached tile's normals read,
@@ -44,7 +46,11 @@ use std::time::{Duration, Instant};
 use brush::Smoothstep;
 use geom::{TileKey, Vec3};
 use store::{CacheError, Evaluation, IndexError, Project, SpatialIndex, TileStore};
+pub use stroke::Stroke;
+use stroke::TileStroke;
 use thiserror::Error;
+
+mod stroke;
 
 /// Why [`DrawParams::new`] refused its arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -195,6 +201,10 @@ pub struct StepStats {
     /// Tiles evaluated again and refitted in the index: those holding a moved vertex, and those
     /// whose normals read one of them.
     pub tiles_updated: usize,
+    /// Tiles of [`StepStats::tiles_edited`] this step wrote per dab, the stored value plus the
+    /// dab's delta, because the stroke had no room to keep their state (see "The thrash limit"
+    /// on [`Stroke`]): their small deltas may be rounded away on their interiors.
+    pub tiles_unaccumulated: usize,
     /// How long each phase took.
     pub times: PhaseTimes,
 }
@@ -249,6 +259,10 @@ impl Laps {
 /// [`Project::begin_stroke`] and [`Project::end_stroke`], so the stroke's steps are one op. The
 /// vertices edited are those of the level `index` holds, the finest the store evaluates.
 ///
+/// `stroke` keeps each edited vertex's start and summed deltas across the stroke's steps, and
+/// the step writes their sum (see [`Stroke`]); it starts afresh when the store's op changes.
+/// Pass the same one to every step over this project.
+///
 /// # Errors
 ///
 /// [`SculptError::Cache`] if the store can't pin the tiles the brush touches (more than its
@@ -256,10 +270,12 @@ impl Laps {
 /// can't be updated. An error in the edit phase
 /// leaves the tiles edited as [`TileStore::update_tiles`] says (the failing tile may have its
 /// whole interior pass applied, and is then marked dirty), and the index not updated for them:
-/// rebuild it.
+/// rebuild it. The deltas of the vertices it didn't write are in `stroke`'s sums all the same,
+/// so the next step that writes one of them writes them too.
 pub fn draw_step(
     project: &mut Project,
     index: &mut SpatialIndex,
+    stroke: &mut Stroke,
     params: DrawParams,
 ) -> Result<StepStats, SculptError> {
     let store = project.store();
@@ -276,7 +292,13 @@ pub fn draw_step(
     times.brush = laps.lap();
 
     let edited: Vec<TileKey> = found.edits.iter().map(|tile| tile.key).collect();
-    store.update_tiles(&edited, |n, i, j, c| add_delta(&found.edits, n, i, j, c))?;
+    let tiles_unaccumulated = stroke.begin_dab(store.current_op(), &edited);
+    let states = stroke.states(&edited);
+    let edit = store.update_tiles(&edited, |n, i, j, c| {
+        stroke_write(&found.edits, &states, n, i, j, c)
+    });
+    stroke.end_dab(store.current_op());
+    edit?;
     times.edit = laps.lap();
 
     let changed = bounds_changed(store, &found.reached)?;
@@ -295,6 +317,7 @@ pub fn draw_step(
         tiles_edited: found.edits.len(),
         vertices: found.vertices,
         tiles_updated: changed.len(),
+        tiles_unaccumulated,
         times,
     })
 }
@@ -420,13 +443,41 @@ fn brush_tile(
     }
 }
 
-/// The edit for vertex `(i, j)` of tile `edits[n]`, whose correction is `c`: its delta added
-/// to `c`'s `z`, or `None` (no write) where the delta is zero.
-fn add_delta(edits: &[TileDeltas], n: usize, i: u32, j: u32, c: Vec3) -> Option<Vec3> {
+/// The edit for vertex `(i, j)` of tile `edits[n]`, whose correction is stored as `c`.
+///
+/// `None` (no write) where its delta is zero; else `c` with its `z` the stroke's start for the
+/// vertex plus the stroke's deltas for it so far, this one included ([`TileStroke::write`]), or,
+/// for a tile without state (`states[n]` is `None`, see "The thrash limit" on [`Stroke`]),
+/// `c.z` plus the delta.
+///
+/// Interior and border vertices so take the same formula: the stored value is rounded to the
+/// tile's quantization once per stroke, never dab by dab, and the interior's error over the
+/// whole stroke is at most half a step of the tile's scale.
+///
+/// This keeps state per vertex, which is sound because [`TileStore::update_tiles`] calls its
+/// closure exactly once per vertex of each tile, and only the vertex's owner has a non-zero
+/// delta for it (copies are zeroed by [`brush_tile`]): the vertex's entries are read and written
+/// by one thread a dab, and `c` is its value before this dab writes it. The same bits at any
+/// worker count.
+fn stroke_write(
+    edits: &[TileDeltas],
+    states: &[Option<&TileStroke>],
+    n: usize,
+    i: u32,
+    j: u32,
+    c: Vec3,
+) -> Option<Vec3> {
     let tile = edits.get(n)?;
     let at = usize::try_from(j * tile.key.side() + i).ok()?;
     let delta = tile.deltas.get(at).copied()?;
-    (delta != 0.0).then(|| Vec3::new(c.x, c.y, c.z + delta))
+    if delta == 0.0 {
+        return None;
+    }
+    let written = match states.get(n)? {
+        Some(state) => state.write(at, c.z, delta)?,
+        None => c.z + delta,
+    };
+    Some(Vec3::new(c.x, c.y, written))
 }
 
 /// The tiles whose bounds an edit of the `reached` tiles may change, each once, in key order.

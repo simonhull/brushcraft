@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use geom::{Level, Vec3, cube_sphere};
-use sculpt::{DrawParams, PhaseTimes, StepStats, draw_step};
+use sculpt::{DrawParams, PhaseTimes, StepStats, Stroke, draw_step};
 use store::{Project, ProjectConfig, Ray, SpatialIndex, StoreConfig};
 
 fn main() {
@@ -234,6 +234,7 @@ fn draw_step_50k(bencher: divan::Bencher<'_, '_>) {
         .map(|k| on_surface(&mut fresh, direction(k, radius)))
         .collect();
     fresh.project.begin_stroke().expect("stroke");
+    let mut stroke = Stroke::new(fresh.project.store());
     let mut all: Vec<StepStats> = Vec::new();
     bencher.bench_local(|| {
         let center = path
@@ -241,7 +242,8 @@ fn draw_step_50k(bencher: divan::Bencher<'_, '_>) {
             .copied()
             .expect("a path of PATH_STEPS centres");
         let params = DrawParams::new(center, radius, STRENGTH).expect("params");
-        let stats = draw_step(&mut fresh.project, &mut fresh.index, params).expect("draw step");
+        let stats = draw_step(&mut fresh.project, &mut fresh.index, &mut stroke, params)
+            .expect("draw step");
         all.push(stats);
     });
     fresh.project.end_stroke().expect("stroke");
