@@ -725,25 +725,37 @@ fn a_tail_of_index_lookalikes_is_searched_in_bounded_work() {
     let count = (256 << 10) / FAKE;
     let tail_len = count * FAKE;
     let file_len = good.len() + tail_len;
-    // A `full` byte of 1 makes each fake pass every check but the checksum; 2 makes none
-    // plausible.
-    for (full, plausible) in [(1, true), (2, false)] {
-        // Each claims a full Index of as many tiles as fit in the rest of the file, so each
+    // The first case passes every check but the checksum; each other breaks one rule of
+    // `plausible_index`. `extra` is stated length past the tile entries.
+    for (what, full, reserved, extra, plausible) in [
+        ("plausible", 1, 0, 0, true),
+        ("an unknown coverage", 2, 0, 0, false),
+        ("a reserved byte set", 1, 1, 0, false),
+        (
+            "a bounds section of no whole entry",
+            1,
+            0,
+            4 + ENTRY_LEN + 1,
+            false,
+        ),
+    ] {
+        // Each claims an Index of as many tiles as fit in the rest of the file, so each
         // checksum would cover most of the tail.
         let mut tail = Vec::with_capacity(tail_len);
         for n in 0..count {
             let rest = file_len - (good.len() + n * FAKE);
-            let tiles = rest.saturating_sub(HEAD + TAIL + INDEX_FIXED) / ENTRY_LEN;
-            let len = u32::try_from(INDEX_FIXED + tiles * ENTRY_LEN).unwrap();
+            let tiles = rest.saturating_sub(HEAD + TAIL + INDEX_FIXED + extra) / ENTRY_LEN;
+            let len = u32::try_from(INDEX_FIXED + tiles * ENTRY_LEN + extra).unwrap();
             let mut head = [KIND_INDEX, 0, 0, 0, 0, 0, 0, 0];
             head[4..].copy_from_slice(&len.to_le_bytes());
             let mut fixed = [0; INDEX_FIXED];
             fixed[0] = full;
+            fixed[4] = reserved;
             fixed[24..].copy_from_slice(&u32::try_from(tiles).unwrap().to_le_bytes());
             assert_eq!(
                 plausible_index(parse_head(head).unwrap(), &fixed),
                 plausible,
-                "full {full}: fake {n}"
+                "{what}: fake {n}"
             );
             tail.extend_from_slice(&head);
             tail.extend_from_slice(&fixed);
@@ -759,16 +771,16 @@ fn a_tail_of_index_lookalikes_is_searched_in_bounded_work() {
             ..
         } = take_work();
         match &opened {
-            Err(StoreError::DamagedMidFile { .. }) => println!("full {full}: refused as damage"),
+            Err(StoreError::DamagedMidFile { .. }) => println!("{what}: refused as damage"),
             Ok(f) => {
-                println!("full {full}: tail cut back");
+                println!("{what}: tail cut back");
                 assert_eq!(
                     f.len(),
                     u64::try_from(good.len()).unwrap(),
-                    "full {full}: cut at the save point"
+                    "{what}: cut at the save point"
                 );
             }
-            Err(e) => panic!("full {full}: unexpected {e:?}"),
+            Err(e) => panic!("{what}: unexpected {e:?}"),
         }
         let bound = if plausible {
             4 * u64::try_from(tail_len).unwrap() + (64 << 20)
@@ -777,8 +789,75 @@ fn a_tail_of_index_lookalikes_is_searched_in_bounded_work() {
         };
         assert!(
             checksummed <= bound,
-            "full {full}: {checksummed} bytes checksummed for a {tail_len}-byte tail"
+            "{what}: {checksummed} bytes checksummed for a {tail_len}-byte tail"
         );
+    }
+}
+
+/// Writes a tile and its (unknown) bound to `f`, so the next save point names a bounds record:
+/// its Index has a bounds section.
+fn tile_and_bound(f: &mut ProjectFile) {
+    f.write_displacement(key(1), op(1), &tile(1.0)).unwrap();
+    f.write_bounds(key(1), None, Stamp::ZERO).unwrap();
+}
+
+/// Whether the save point at `point` of the file at `path` names a bounds record.
+fn names_bounds(path: &Path, point: u64) -> bool {
+    let file = File::open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    read_index(&file, point, len)
+        .unwrap()
+        .unwrap()
+        .entries
+        .iter()
+        .any(|(name, _)| matches!(name, Name::Bounds(_)))
+}
+
+/// Damages the reserved byte of the head at `first`, then opens the file at `path`: a real save
+/// point after it proves the damage, so the open fails and the file is left as it was.
+fn assert_damage_proven(path: &Path, first: u64, what: &str) {
+    let mut bad = std::fs::read(path).unwrap();
+    bad[usize::try_from(first).unwrap() + 1] = 1;
+    std::fs::write(path, &bad).unwrap();
+    let opened = ProjectFile::open(path);
+    assert!(
+        matches!(opened, Err(StoreError::DamagedMidFile { offset }) if offset == first),
+        "{what}: {opened:?}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), bad, "{what}: file untouched");
+}
+
+#[test]
+fn a_save_point_naming_bounds_proves_damage() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
+    let first = f.len();
+    tile_and_bound(&mut f);
+    let point = f.save().unwrap();
+    drop(f);
+    assert!(names_bounds(&path, point), "a bounds section");
+    assert_damage_proven(&path, first, "the first record damaged");
+}
+
+#[test]
+fn a_save_point_naming_bounds_across_a_search_window_boundary_is_found() {
+    for d in [-90i64, -80, -40, -12, -1, 0, 4] {
+        let dir = TestDir::new();
+        let path = dir.path("p.bcrf");
+        let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
+        let start = f.len();
+        f.append_raw(9, &[]).unwrap(); // 12 bytes at the first record
+        tile_and_bound(&mut f);
+        // Filler, so the save point starts `d` bytes from the second search window.
+        let target = i64::try_from(start).unwrap() + (1i64 << 20) + d;
+        let filler = usize::try_from(target - i64::try_from(f.len()).unwrap() - 12).unwrap();
+        f.append_raw(9, &vec![0x77; filler]).unwrap();
+        let point = f.save().unwrap();
+        drop(f);
+        assert_eq!(i64::try_from(point).unwrap(), target, "d {d}: placed");
+        assert!(names_bounds(&path, point), "d {d}: a bounds section");
+        assert_damage_proven(&path, start, &format!("d {d}"));
     }
 }
 
