@@ -61,7 +61,7 @@ impl ToolState {
                 tool_type: WEnum::Value(kind),
             } => self.kind = tool_kind(kind),
             E::ProximityIn { surface, .. } => self.proximity_in(surface_of(&surface)),
-            E::ProximityOut => self.pending.push(Phase::Leave),
+            E::ProximityOut => self.proximity_out(),
             E::Down { .. } => {
                 self.contact = true;
                 self.pending.push(Phase::Down);
@@ -110,6 +110,17 @@ impl ToolState {
     fn proximity_in(&mut self, surface: SurfaceId) {
         self.surface = Some(surface);
         self.pending.push(Phase::Enter);
+    }
+
+    /// The tool left proximity. The protocol sends `up` first when the tip is down, so a
+    /// conforming compositor never leaves a contact open here; should one arrive without it, the
+    /// open stroke is closed with an `Up`, as [`removed`](Self::removed) does.
+    fn proximity_out(&mut self) {
+        if self.contact {
+            self.contact = false;
+            self.pending.push(Phase::Up);
+        }
+        self.pending.push(Phase::Leave);
     }
 
     /// The tool was removed: closes what it left open, an `Up` if it was in contact and a `Leave`
@@ -420,6 +431,19 @@ mod tests {
         }
         assert!(!tool.contact);
         assert_eq!(tool.surface, None);
+    }
+
+    #[test]
+    fn proximity_out_while_down_closes_the_stroke() {
+        let mut tool = hovering();
+        frame(&mut tool, [E::Down { serial: 1 }]);
+        let out = frame(&mut tool, [E::ProximityOut]);
+        assert_eq!(phases(&out), [Phase::Up, Phase::Leave]);
+        assert!(!tool.contact);
+        tool.proximity_in(SURFACE);
+        assert_eq!(phases(&frame(&mut tool, [])), [Phase::Enter]);
+        let back = frame(&mut tool, [E::Motion { x: 1.0, y: 1.0 }]);
+        assert_eq!(phases(&back), [Phase::Hover], "back in range, not touching");
     }
 
     #[test]
