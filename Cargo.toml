@@ -15,6 +15,7 @@ input = { path = "crates/input" }
 brush = { path = "crates/brush" }
 sculpt = { path = "crates/sculpt" }
 anyhow = "1.0.100"
+bolero = "0.13.7"
 bytemuck = { version = "1.25.2", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 divan = "0.1.21"
 raw-window-handle = "0.6.2"
@@ -46,6 +47,8 @@ unnameable_types = "deny"
 meta_variable_misuse = "deny"
 non_ascii_idents = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
+# `kani` is set by `cargo kani` (the proofs), `fuzzing` by cargo-fuzz and `cargo bolero`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)'] }
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
@@ -151,3 +154,10 @@ debug = "line-tables-only"
 inherits = "bench"
 lto = "thin"
 codegen-units = 16
+
+# `cargo bolero test` builds its harnesses in this profile (it requires one by this name).
+[profile.fuzz]
+inherits = "dev"
+opt-level = 3
+incremental = false
+codegen-units = 1

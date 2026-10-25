@@ -3387,6 +3387,9 @@ fn parse_index_payload(payload: &[u8]) -> Option<Index> {
 mod adversarial;
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use std::path::Path;

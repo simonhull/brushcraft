@@ -692,4 +692,52 @@ mod tests {
         assert_rings_are_canonical(&BaseMesh::from_polygons(v, &f).unwrap());
         assert_rings_are_canonical(&cube_sphere(3).unwrap());
     }
+
+    /// Decoding takes any bytes, and a mesh it accepts is its own encoding.
+    #[test]
+    fn decoding_any_bytes_never_panics() {
+        bolero::check!().for_each(|bytes: &[u8]| {
+            if let Ok(mesh) = BaseMesh::from_bytes(bytes) {
+                assert_eq!(
+                    mesh.to_bytes(),
+                    bytes,
+                    "an accepted mesh is its own encoding"
+                );
+            }
+        });
+    }
+
+    /// Accepted encodings round-trip.
+    ///
+    /// A mesh's encoding, with one byte changed or not, decodes only to a mesh that encodes back
+    /// to the same bytes. The meshes are any positions with faces indexing them (wrapped into
+    /// range), so many get past the counts to the validation.
+    #[test]
+    fn accepted_encodings_round_trip() {
+        type Parts = (Vec<[f32; 3]>, Vec<[u32; 4]>, Option<(u16, u8)>);
+        bolero::check!()
+            .with_type::<Parts>()
+            .for_each(|(positions, faces, flip)| {
+                let vertices = u32::try_from(positions.len()).unwrap();
+                let mut bytes = vertices.to_le_bytes().to_vec();
+                for p in positions.iter().flatten() {
+                    bytes.extend_from_slice(&p.to_le_bytes());
+                }
+                bytes.extend_from_slice(&u32::try_from(faces.len()).unwrap().to_le_bytes());
+                for v in faces.iter().flatten() {
+                    bytes.extend_from_slice(&(v % vertices.max(1)).to_le_bytes());
+                }
+                if let Some((at, xor)) = flip {
+                    let at = usize::from(*at) % bytes.len();
+                    bytes[at] ^= xor;
+                }
+                if let Ok(mesh) = BaseMesh::from_bytes(&bytes) {
+                    assert_eq!(
+                        mesh.to_bytes(),
+                        bytes,
+                        "an accepted mesh is its own encoding"
+                    );
+                }
+            });
+    }
 }

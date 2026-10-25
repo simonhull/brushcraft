@@ -4,3 +4,13 @@
 # samply / perf output
 profile.json*
 perf.data*
+# Fuzzing: bolero keeps corpora and crashes beside each harness; cargo-fuzz grows its corpora,
+# and writes crash artifacts, under fuzz/. Only the small seed-* files of fuzz/corpus are kept.
+__fuzz__/
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/seed-*
+/fuzz/artifacts/
+/fuzz/target/
+/fuzz/coverage/
+# cargo-mutants reports
+/mutants.out*/
