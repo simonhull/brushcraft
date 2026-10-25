@@ -16,8 +16,9 @@ rayon.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 
-# Counting physical cores reads the process's CPU affinity mask (see `workers`).
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# Opening a path a file names without blocking (see `file`); on Linux and Android, counting
+# physical cores also reads the process's CPU affinity mask (see `workers`).
+[target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["thread"] }
 
 [dev-dependencies]

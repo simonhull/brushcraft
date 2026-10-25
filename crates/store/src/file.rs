@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use geom::{BaseMesh, Channel, CorrectionTile, MeshError, TileKey};
+use rustix::fs::{FileType, Mode, OFlags};
 use thiserror::Error;
 
 use crate::OpId;
@@ -404,22 +405,52 @@ fn is_at(file: &File, path: &Path) -> io::Result<bool> {
     }
 }
 
-/// Opens `path` for reading.
+/// Opens `path` for reading, if it is a regular file (see [`open_regular`]).
 ///
 /// # Errors
 ///
-/// The I/O error of the open.
+/// As [`open_regular`].
 fn open_readable(path: &Path) -> io::Result<File> {
-    File::open(path)
+    open_regular(path, OFlags::RDONLY)
 }
 
-/// Opens `path` for reading and writing.
+/// Opens `path` for reading and writing, if it is a regular file (see [`open_regular`]).
 ///
 /// # Errors
 ///
-/// The I/O error of the open.
+/// As [`open_regular`].
 fn open_writable(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).open(path)
+    open_regular(path, OFlags::RDWR)
+}
+
+/// Opens `path` with `access` (`RDONLY` or `RDWR`) and returns it as a blocking [`File`], if it
+/// is a regular file.
+///
+/// A path may come from a file (a recovery file names its project), so it may name a FIFO or a
+/// device, and opening one must neither block nor do more than the open itself: a plain open of
+/// a FIFO waits for a writer, and would hang listing recovery files at every launch. So the open
+/// doesn't block (`O_NONBLOCK`, and `O_CLOEXEC`), anything but a regular file is refused, and the
+/// descriptor is then made blocking again, so it reads as any other.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidInput`] if `path` names something other than a regular file; the I/O
+/// error of the open, the `fstat` or the `fcntl`s.
+fn open_regular(path: &Path, access: OFlags) -> io::Result<File> {
+    let file = File::from(rustix::fs::open(
+        path,
+        access | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    if FileType::from_raw_mode(rustix::fs::fstat(&file)?.st_mode) != FileType::RegularFile {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let flags = rustix::fs::fcntl_getfl(&file)?;
+    rustix::fs::fcntl_setfl(&file, flags.difference(OFlags::NONBLOCK))?;
+    Ok(file)
 }
 
 /// Why the walk of the records after the last save point stopped (see
