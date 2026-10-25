@@ -555,6 +555,70 @@ fn a_save_point_across_a_search_window_boundary_is_found() {
 }
 
 #[test]
+fn a_tail_of_index_lookalikes_is_searched_in_bounded_work() {
+    /// A fake Index: its head, then the fixed part of a payload.
+    const FAKE: usize = HEAD + INDEX_FIXED;
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let (good, _) = three(&path);
+    let count = (256 << 10) / FAKE;
+    let tail_len = count * FAKE;
+    let file_len = good.len() + tail_len;
+    // A `full` byte of 1 makes each fake pass every check but the checksum; 2 makes none
+    // plausible.
+    for (full, plausible) in [(1, true), (2, false)] {
+        // Each claims a full Index of as many tiles as fit in the rest of the file, so each
+        // checksum would cover most of the tail.
+        let mut tail = Vec::with_capacity(tail_len);
+        for n in 0..count {
+            let rest = file_len - (good.len() + n * FAKE);
+            let tiles = rest.saturating_sub(HEAD + TAIL + INDEX_FIXED) / ENTRY_LEN;
+            let len = u32::try_from(INDEX_FIXED + tiles * ENTRY_LEN).unwrap();
+            let mut head = [KIND_INDEX, 0, 0, 0, 0, 0, 0, 0];
+            head[4..].copy_from_slice(&len.to_le_bytes());
+            let mut fixed = [0; INDEX_FIXED];
+            fixed[0] = full;
+            fixed[24..].copy_from_slice(&u32::try_from(tiles).unwrap().to_le_bytes());
+            assert_eq!(
+                plausible_index(parse_head(head).unwrap(), &fixed),
+                plausible,
+                "full {full}: fake {n}"
+            );
+            tail.extend_from_slice(&head);
+            tail.extend_from_slice(&fixed);
+        }
+        tail[1] = 1; // a reserved byte of the first record's head: the walk stops there
+        let mut bad = good.clone();
+        bad.extend_from_slice(&tail);
+        std::fs::write(&path, &bad).unwrap();
+        take_work();
+        let opened = ProjectFile::open(&path);
+        let (_, checksummed) = take_work();
+        match &opened {
+            Err(StoreError::DamagedMidFile { .. }) => println!("full {full}: refused as damage"),
+            Ok(f) => {
+                println!("full {full}: tail cut back");
+                assert_eq!(
+                    f.len(),
+                    u64::try_from(good.len()).unwrap(),
+                    "full {full}: cut at the save point"
+                );
+            }
+            Err(e) => panic!("full {full}: unexpected {e:?}"),
+        }
+        let bound = if plausible {
+            4 * u64::try_from(tail_len).unwrap() + (64 << 20)
+        } else {
+            0
+        };
+        assert!(
+            checksummed <= bound,
+            "full {full}: {checksummed} bytes checksummed for a {tail_len}-byte tail"
+        );
+    }
+}
+
+#[test]
 fn only_a_plausible_index_proves_damage() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");

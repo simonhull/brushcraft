@@ -25,6 +25,7 @@ use crate::codec::{
     CodecError, compress, decode_displacement_into, decompress, displacement_body_len,
     encode_displacement,
 };
+use crate::crc::Crc32;
 use crate::index::TileBounds;
 use crate::meta::{MAX_BASE_PATH, Meta, SavePoint, mesh_hash};
 use crate::record::{
@@ -52,6 +53,9 @@ const MAX_CHAIN: usize = FULL_EVERY as usize;
 const NONE: u64 = u64::MAX;
 /// Bytes per index entry: key, offset `u64`, len `u32`.
 const ENTRY_LEN: usize = KEY_LEN + 12;
+/// Bytes of an Index payload before its entries: `full: u8`, seven reserved, `parent: u64`,
+/// `head: u64`, `count: u32`.
+const INDEX_FIXED: usize = 28;
 
 /// The largest decompressed tile body, in bytes (1 MiB). A displacement tile needs 26,886.
 ///
@@ -850,7 +854,12 @@ impl ProjectFile {
         let tail = this.load_base(&heads, len)?;
         if this.end < len {
             let (stop, stopped_at) = this.walk_tail(heads.get(tail..).unwrap_or_default())?;
-            if stop == Stop::Index || find_index(&this.file, stopped_at, len)?.is_some() {
+            let damaged = stop == Stop::Index
+                || match find_index(&this.file, stopped_at, len)? {
+                    Search::Index(_) | Search::TooCostly => true,
+                    Search::Nothing => false,
+                };
+            if damaged {
                 return Err(StoreError::DamagedMidFile { offset: stopped_at });
             }
             match repair {
@@ -2766,21 +2775,82 @@ fn count_index_read() {
     });
 }
 
-/// The first offset in `[from, len)` where a save point starts (see [`save_point`]): proof that the
-/// file is damaged, not torn, at `from`. `None` if there is none.
+/// Test hook: counts `n` more bytes checksummed in [`WORK`].
+#[cfg(test)]
+fn count_checksummed(n: u64) {
+    WORK.with(|work| {
+        let (indexes, bytes) = work.get();
+        work.set((indexes, bytes.saturating_add(n)));
+    });
+}
+
+/// What [`find_index`] found after the walk stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Search {
+    /// A save point starts at this offset: proof of mid-file damage.
+    Index(u64),
+    /// No save point: the tail is torn, and is cut back.
+    Nothing,
+    /// The search would cost more than its budget: treated as damage, so nothing is cut.
+    TooCostly,
+}
+
+/// Whether a byte offset is worth checksumming as an Index: `head`, an Index head, and
+/// `payload_start`, the first [`INDEX_FIXED`] bytes after it, could begin what [`index_payload`]
+/// writes.
+///
+/// That is, the `full` byte is 0 or 1, the seven reserved bytes are zero (every writer writes
+/// zeros), and the stated length is exactly the fixed part and `count` tile entries, then either
+/// nothing or a bounds section of one entry or more.
+///
+/// Checking this costs a few bytes; checksumming a candidate costs its whole stated length.
+fn plausible_index(head: Head, payload_start: &[u8]) -> bool {
+    let (Some(&full), Some(reserved), Some(count)) = (
+        payload_start.first(),
+        payload_start.get(1..8),
+        payload_start
+            .get(24..INDEX_FIXED)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok()),
+    ) else {
+        return false;
+    };
+    if full > 1 || reserved.iter().any(|&b| b != 0) {
+        return false;
+    }
+    let entry = ENTRY_LEN as u64;
+    let rest = u64::from(u32::from_le_bytes(count))
+        .checked_mul(entry)
+        .and_then(|tiles| tiles.checked_add(INDEX_FIXED as u64))
+        .and_then(|fixed| u64::from(head.len).checked_sub(fixed));
+    rest.is_some_and(|rest| rest == 0 || (rest >= 4 + entry && (rest - 4) % entry == 0))
+}
+
+/// Where a save point starts in `[from, len)` (see [`save_point`]): proof that the file is
+/// damaged, not torn, at `from`.
 ///
 /// Every byte offset is a candidate, so the checks beyond the checksum keep bytes inside another
-/// record from passing for one.
+/// record from passing for one. Only a candidate [`plausible_index`] accepts is checksummed.
 ///
 /// The range is read in windows, so a long tail costs one pass and little memory; a candidate
-/// longer than its window is read on its own.
+/// longer than its window is checksummed in window-sized pieces, and read whole only if its
+/// checksum matches.
+///
+/// The bytes checksummed over all candidates are capped at four times the range's length, or
+/// 64 MiB if that is more. A search that would checksum more stops with [`Search::TooCostly`],
+/// which the caller treats as damage, as it does a save point found: it fails closed, so a file
+/// that costs this much to search (hostile, or badly damaged) is refused, never cut back.
 ///
 /// # Errors
 ///
 /// The I/O error of a read.
-fn find_index(file: &File, from: u64, len: u64) -> io::Result<Option<u64>> {
-    /// Candidate head positions per window.
+fn find_index(file: &File, from: u64, len: u64) -> io::Result<Search> {
+    /// Candidate head positions per window, and the longest piece checksummed at once.
     const WINDOW: u64 = 1 << 20;
+    /// The smallest budget of bytes checksummed.
+    const MIN_BUDGET: u64 = 64 << 20;
+    let budget = len.saturating_sub(from).saturating_mul(4).max(MIN_BUDGET);
+    let mut spent = 0u64;
+    let mut piece = Vec::new();
     let mut start = from;
     while start.saturating_add((HEAD + TAIL) as u64) <= len {
         // Enough bytes for a head at each of the window's positions.
@@ -2792,24 +2862,83 @@ fn find_index(file: &File, from: u64, len: u64) -> io::Result<Option<u64>> {
                 .and_then(parse_head)
                 .filter(|h| h.kind == KIND_INDEX)
                 .filter(|h| at.saturating_add(h.total()) <= len)
+                .filter(|h| u64::from(h.len) >= INDEX_FIXED as u64)
             else {
                 continue;
             };
-            let in_buf = usize::try_from(at - start)
-                .ok()
+            let lo = usize::try_from(at - start).ok();
+            let mut fixed = [0; INDEX_FIXED];
+            let fixed_in_buf = lo
+                .and_then(|lo| buf.get(lo.checked_add(HEAD)?..lo.checked_add(HEAD + INDEX_FIXED)?));
+            match fixed_in_buf {
+                Some(payload_start) => fixed.copy_from_slice(payload_start),
+                None => file.read_exact_at(&mut fixed, at + HEAD as u64)?,
+            }
+            if !plausible_index(head, &fixed) {
+                continue;
+            }
+            if !charge(&mut spent, head.total(), budget) {
+                return Ok(Search::TooCostly);
+            }
+            let in_buf = lo
                 .zip(usize::try_from(head.total()).ok())
                 .and_then(|(lo, n)| buf.get(lo..lo.checked_add(n)?));
-            let good = match in_buf {
-                Some(record) => save_point(record, at).is_some(),
-                None => save_point(&read_exact(file, at, head.total())?, at).is_some(),
+            let good = if let Some(record) = in_buf {
+                save_point(record, at).is_some()
+            } else {
+                if !checksums(file, at, head, &mut piece, WINDOW)? {
+                    continue;
+                }
+                // A match is checksummed once more, as the whole record is checked.
+                if !charge(&mut spent, head.total(), budget) {
+                    return Ok(Search::TooCostly);
+                }
+                save_point(&read_exact(file, at, head.total())?, at).is_some()
             };
             if good {
-                return Ok(Some(at));
+                return Ok(Search::Index(at));
             }
         }
         start = start.saturating_add(WINDOW);
     }
-    Ok(None)
+    Ok(Search::Nothing)
+}
+
+/// Adds `n` bytes to `spent` if the total stays within `budget`, and says whether it did.
+fn charge(spent: &mut u64, n: u64, budget: u64) -> bool {
+    match spent.checked_add(n).filter(|&total| total <= budget) {
+        Some(total) => {
+            *spent = total;
+            #[cfg(test)]
+            count_checksummed(n);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether the record `head` heads at `at` matches its checksum, read in pieces of at most `most`
+/// bytes into `piece`, so a long record costs no more memory than one piece.
+///
+/// # Errors
+///
+/// The I/O error of a read.
+fn checksums(file: &File, at: u64, head: Head, piece: &mut Vec<u8>, most: u64) -> io::Result<bool> {
+    let body = head.total() - TAIL as u64;
+    let mut crc = Crc32::new();
+    let mut done = 0;
+    while done < body {
+        let n = (body - done).min(most);
+        let n_bytes =
+            usize::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        piece.resize(n_bytes, 0);
+        file.read_exact_at(piece, at + done)?;
+        crc.update(piece);
+        done += n;
+    }
+    let mut stored = [0; TAIL];
+    file.read_exact_at(&mut stored, at + body)?;
+    Ok(crc.finish() == u32::from_le_bytes(stored))
 }
 
 /// The head at `offset`, if it is valid and its record ends by `len`.

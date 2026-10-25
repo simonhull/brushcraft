@@ -65,28 +65,59 @@ fn entry(k: usize, byte: u8) -> u32 {
         .unwrap_or(0)
 }
 
-/// The CRC-32 of `bytes`.
-///
-/// Eight bytes at a time through [`TABLES`], then the last few one at a time.
-pub(crate) fn crc32(bytes: &[u8]) -> u32 {
-    let (whole, rest) = bytes.as_chunks::<8>();
-    let mut crc = !0u32;
-    for chunk in whole {
-        let [b0, b1, b2, b3, b4, b5, b6, b7] = *chunk;
-        let [r0, r1, r2, r3] = (crc ^ u32::from_le_bytes([b0, b1, b2, b3])).to_le_bytes();
-        crc = entry(7, r0)
-            ^ entry(6, r1)
-            ^ entry(5, r2)
-            ^ entry(4, r3)
-            ^ entry(3, b4)
-            ^ entry(2, b5)
-            ^ entry(1, b6)
-            ^ entry(0, b7);
+/// A CRC-32 computed over bytes fed in pieces: [`Crc32::update`] with each piece in order, then
+/// [`Crc32::finish`] gives what [`crc32`] gives of them all at once. A long record is so checked
+/// without holding it whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Crc32(u32);
+
+impl Crc32 {
+    /// The checksum of no bytes yet.
+    pub(crate) const fn new() -> Self {
+        Self(!0)
     }
-    !rest.iter().fold(crc, |crc, &b| {
-        let [low, ..] = crc.to_le_bytes();
-        entry(0, low ^ b) ^ (crc >> 8)
-    })
+
+    /// Feeds `bytes`, after those fed before.
+    ///
+    /// Eight bytes at a time through [`TABLES`], then the last few one at a time.
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        let (whole, rest) = bytes.as_chunks::<8>();
+        let mut crc = self.0;
+        for chunk in whole {
+            let [b0, b1, b2, b3, b4, b5, b6, b7] = *chunk;
+            let [r0, r1, r2, r3] = (crc ^ u32::from_le_bytes([b0, b1, b2, b3])).to_le_bytes();
+            crc = entry(7, r0)
+                ^ entry(6, r1)
+                ^ entry(5, r2)
+                ^ entry(4, r3)
+                ^ entry(3, b4)
+                ^ entry(2, b5)
+                ^ entry(1, b6)
+                ^ entry(0, b7);
+        }
+        self.0 = rest.iter().fold(crc, |crc, &b| {
+            let [low, ..] = crc.to_le_bytes();
+            entry(0, low ^ b) ^ (crc >> 8)
+        });
+    }
+
+    /// The CRC-32 of every byte fed.
+    pub(crate) const fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The CRC-32 of `bytes`.
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = Crc32::new();
+    crc.update(bytes);
+    crc.finish()
 }
 
 #[cfg(test)]
@@ -110,6 +141,36 @@ mod tests {
         !bytes.iter().fold(!0u32, |crc, &b| {
             byte_step((crc ^ u32::from(b)) & 0xFF) ^ (crc >> 8)
         })
+    }
+
+    #[test]
+    fn chunked_updates_match_the_whole() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state >> 33
+        };
+        for _ in 0..200 {
+            let len = usize::try_from(next() % 300).unwrap();
+            let bytes: Vec<u8> = (0..len).map(|_| next().to_le_bytes()[0]).collect();
+            let mut splits: Vec<usize> = (0..next() % 5)
+                .map(|_| usize::try_from(next()).unwrap() % (len + 1))
+                .collect();
+            splits.sort_unstable();
+            let mut crc = Crc32::new();
+            let mut from = 0;
+            for &at in splits.iter().chain([&len]) {
+                crc.update(&bytes[from..at]);
+                from = at;
+            }
+            assert_eq!(
+                crc.finish(),
+                crc32(&bytes),
+                "length {len}, splits {splits:?}"
+            );
+        }
     }
 
     #[test]
