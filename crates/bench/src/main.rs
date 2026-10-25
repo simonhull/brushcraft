@@ -24,6 +24,7 @@
 mod brush;
 mod budget;
 mod cli;
+mod coarse;
 mod generate;
 mod noise;
 mod page_in;
@@ -61,6 +62,7 @@ fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<
         Subcommand::Brush => brush::run(options, &paths, out),
         Subcommand::Save => brush::run_save(options, &paths, out),
         Subcommand::Budget => budget::run(options, &paths, out),
+        Subcommand::CoarseError => coarse::run(options, &paths, out),
         Subcommand::Perf => return perf::run(options, &paths, out),
     }?;
     Ok(Status::Clean)

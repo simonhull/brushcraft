@@ -33,7 +33,7 @@ mod tiles;
 mod workers;
 
 pub use activity::Activity;
-pub use codec::CodecError;
+pub use codec::{CodecError, displacement_payload_len};
 pub use feed::{ChangeFeed, ConsumerId};
 pub use file::{
     MAX_MESH_RAW, MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place,

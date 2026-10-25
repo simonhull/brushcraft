@@ -76,17 +76,21 @@ pub(crate) enum Subcommand {
     Budget,
     /// The tracked performance suite.
     Perf,
+    /// Hidden, a design spike: how far coarse levels lie from the finest, and what accounting
+    /// for it costs (see [`crate::coarse`]).
+    CoarseError,
 }
 
 impl Subcommand {
     /// Every subcommand.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Generate,
         Self::PageIn,
         Self::Brush,
         Self::Save,
         Self::Budget,
         Self::Perf,
+        Self::CoarseError,
     ];
 
     /// The subcommand's name on the command line and in the JSON records.
@@ -98,6 +102,7 @@ impl Subcommand {
             Self::Save => "save",
             Self::Budget => "budget",
             Self::Perf => "perf",
+            Self::CoarseError => "coarse-error",
         }
     }
 
@@ -108,7 +113,7 @@ impl Subcommand {
     /// spec's 1 GB workload. `perf` doesn't use one: each part runs with its subcommand's.
     const fn default_budget_mib(self) -> usize {
         match self {
-            Self::Generate | Self::Brush | Self::Save | Self::Perf => 2048,
+            Self::Generate | Self::Brush | Self::Save | Self::Perf | Self::CoarseError => 2048,
             Self::PageIn => 4096,
             Self::Budget => 1024,
         }
@@ -127,10 +132,14 @@ impl Subcommand {
             Splits | Levels | Amplitude | Force => self == Self::Generate,
             Level | Footprint => !matches!(self, Self::Generate | Self::Perf),
             History | Baseline | Full | Tiny | NoStages | SettleSecs => self == Self::Perf,
-            Samples | RegionQuads | Pool => self == Self::PageIn,
-            Steps => matches!(self, Self::Brush | Self::Save),
+            Samples => matches!(self, Self::PageIn | Self::CoarseError),
+            RegionQuads | Pool => self == Self::PageIn,
+            Steps => matches!(self, Self::Brush | Self::Save | Self::CoarseError),
             PerStep => self == Self::Brush,
-            Strength => matches!(self, Self::Brush | Self::Save | Self::Budget),
+            Strength => matches!(
+                self,
+                Self::Brush | Self::Save | Self::Budget | Self::CoarseError
+            ),
             Moves | StepsPerMove | ViewTiles => self == Self::Budget,
         }
     }
@@ -369,7 +378,11 @@ impl Options {
             amplitude: 0.01,
             force: false,
             level: 9,
-            samples: 5,
+            samples: if subcommand == Subcommand::CoarseError {
+                200
+            } else {
+                5
+            },
             footprint: 50_000,
             region_quads: 42_000_000,
             pools: Pools::Cold,

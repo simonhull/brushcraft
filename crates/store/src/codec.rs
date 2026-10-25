@@ -195,6 +195,19 @@ pub(crate) fn displacement_body_len(header: &[u8]) -> Result<(u32, usize), Codec
     Ok((side, n * 6 + ring * 12))
 }
 
+/// The bytes a displacement tile's payload takes in a tile record: its header and its body as
+/// zstd compresses it, framing excluded. A read-only measure for the benchmark harness's
+/// spikes, which size data the store doesn't yet keep.
+///
+/// # Errors
+///
+/// As [`encode_displacement`] (as [`std::io::ErrorKind::Other`]), or the compressor's I/O error.
+#[doc(hidden)]
+pub fn displacement_payload_len(tile: &CorrectionTile) -> std::io::Result<usize> {
+    let (header, body) = encode_displacement(tile).map_err(std::io::Error::other)?;
+    Ok(header.len() + compress(&body)?.len())
+}
+
 /// zstd-compresses `raw`.
 ///
 /// # Errors

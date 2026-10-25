@@ -227,7 +227,10 @@ pub(crate) fn run<J: Write, H: Write>(
 /// # Errors
 ///
 /// If a tile's corrections can't be loaded.
-fn corrections(project: &mut Project, keys: &[TileKey]) -> Result<BTreeMap<TileKey, Vec<Vec3>>> {
+pub(crate) fn corrections(
+    project: &mut Project,
+    keys: &[TileKey],
+) -> Result<BTreeMap<TileKey, Vec<Vec3>>> {
     let store = project.store();
     let mut all = BTreeMap::new();
     for &key in keys {

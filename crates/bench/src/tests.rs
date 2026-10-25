@@ -7,6 +7,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use geom::Vec3;
+
 use super::*;
 
 /// A temporary directory for one test's project, removed on drop.
@@ -379,4 +381,127 @@ fn a_missing_project_is_reported() {
     let dir = TempDir::new();
     let err = run_on(&dir.project(), "brush --level 6").err().unwrap();
     assert!(err.to_string().contains("run `generate` first"), "{err}");
+}
+
+/// The bilinear interpolation of `corners` (`(0, 0)`, `(1, 0)`, `(0, 1)`, `(1, 1)`) at `(u, v)`.
+fn bilerp(corners: [Vec3; 4], u: f32, v: f32) -> Vec3 {
+    let [c00, c10, c01, c11] = corners;
+    let bottom = c00 + (c10 - c00) * u;
+    let top = c01 + (c11 - c01) * u;
+    bottom + (top - bottom) * v
+}
+
+#[test]
+fn deviation_is_zero_on_a_refinement_and_finds_a_bump() {
+    use crate::coarse::{Grid, Rect, deviation};
+    let corners = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.2),
+        Vec3::new(0.0, 1.0, 0.1),
+        Vec3::new(1.0, 1.0, 0.5),
+    ];
+    let coarse = Grid::new(0, 2, (0, 0), corners.to_vec()).unwrap();
+    let mut points: Vec<Vec3> = (0..5_u8)
+        .flat_map(|j| (0..5_u8).map(move |i| (i, j)))
+        .map(|(i, j)| bilerp(corners, f32::from(i) / 4.0, f32::from(j) / 4.0))
+        .collect();
+    let all = Rect::new(0, 0, 4, 4);
+    let smooth = Grid::new(2, 5, (0, 0), points.clone()).unwrap();
+    assert!(deviation(&coarse, &smooth, all).unwrap().max < 1e-6);
+    assert_eq!(Grid::subsampled(&smooth, 0).unwrap(), coarse);
+    let h = 0.03;
+    points[5 + 2] = points[5 + 2] + Vec3::new(0.0, 0.0, h);
+    let bumped = Grid::new(2, 5, (0, 0), points).unwrap();
+    let found = deviation(&coarse, &bumped, all).unwrap();
+    assert!((found.max - h).abs() < 1e-6, "{found:?}");
+    assert!(
+        found.normal > 0.8 * h && found.normal <= h + 1e-6,
+        "{found:?}"
+    );
+}
+
+#[test]
+fn coarse_levels_of_a_smooth_project_lie_close_and_one_correction_shows() {
+    use crate::coarse::{Measures, coarse_levels, measure_face};
+    let dir = TempDir::new();
+    run_on(
+        &dir.project(),
+        "generate --splits 2 --levels 6 --amplitude 0",
+    )
+    .unwrap();
+    let args = ["coarse-error", "--level", "6", "--project"]
+        .map(OsString::from)
+        .into_iter()
+        .chain([dir.project().into_os_string()]);
+    let command = Command::parse(args).unwrap();
+    let paths = Paths::resolve(Some(&dir.project())).unwrap();
+    let mut project = session::open(&command.options, &paths).unwrap();
+    let finest = geom::Level::new(6).unwrap();
+    let levels = coarse_levels(finest).unwrap();
+    let face = geom::FaceId::new(0);
+    let mut smooth = Measures::default();
+    measure_face(project.store(), face, finest, &levels, &mut smooth).unwrap();
+    assert_eq!(smooth.levels.len(), 4);
+    // With no corrections every level is the same subdivision surface: what separates them is
+    // the coarse net's distance from its limit, far below a quad (a wrong vertex mapping would be
+    // about a quad off).
+    for (level, measure) in &smooth.levels {
+        #[expect(clippy::cast_possible_truncation, reason = "an edge length")]
+        let edge = (measure.edge.0 / report::to_f64(measure.edge.1)) as f32;
+        for tile in &measure.tiles {
+            assert!(
+                tile.d.max < 0.1 * edge,
+                "level {level}: {tile:?}, edge {edge}"
+            );
+            assert!(
+                tile.s.max < 0.1 * edge,
+                "level {level}: {tile:?}, edge {edge}"
+            );
+            assert!(tile.e >= tile.d.max * 0.999, "level {level}: {tile:?}");
+        }
+    }
+    let h = 0.05;
+    let key = geom::TileKey::displacement(face, finest, 0, 0).unwrap();
+    project.begin_stroke().unwrap();
+    project
+        .store()
+        .edit_tile(key, |edit| edit.set(21, 23, Vec3::new(0.0, 0.0, h)))
+        .unwrap()
+        .unwrap();
+    project.end_stroke().unwrap();
+    let mut bumped = Measures::default();
+    measure_face(project.store(), face, finest, &levels, &mut bumped).unwrap();
+    for (level, measure) in &bumped.levels {
+        let before = &smooth.levels[level].tiles;
+        for (tile, old) in measure.tiles.iter().zip(before) {
+            let slack = old.d.max + 1e-5;
+            assert!((tile.d.max - h).abs() <= slack, "level {level}: {tile:?}");
+            // (21, 23) coincides with no coarser vertex, so subsampling misses it too.
+            assert!(
+                (tile.s.max - h).abs() <= old.s.max + 1e-5,
+                "level {level}: {tile:?}"
+            );
+            assert!(tile.e >= tile.d.max * 0.999, "level {level}: {tile:?}");
+        }
+    }
+    project.close(false).unwrap();
+}
+
+#[test]
+fn coarse_error_reports_every_coarse_level_and_the_stroke() {
+    let dir = TempDir::new();
+    generate(&dir);
+    let printed = run_on(
+        &dir.project(),
+        "coarse-error --level 6 --steps 3 --footprint 3000 --samples 4",
+    )
+    .unwrap();
+    let levels = printed
+        .json
+        .iter()
+        .filter(|l| l.starts_with("{\"bench\":\"coarse-error\",\"result\":\"level\""))
+        .count();
+    assert_eq!(levels, 4, "{:?}", printed.json);
+    let stroke = line(&printed, "coarse-error", "stroke");
+    assert!((number(stroke, "steps") - 3.0).abs() < f64::EPSILON);
 }
