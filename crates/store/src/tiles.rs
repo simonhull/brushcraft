@@ -2113,10 +2113,22 @@ impl TileStore {
 
     /// Moves every key save's consumer hasn't drained from the change feed into
     /// [`TileStore::since_rebase`].
-    fn drain_saves(&mut self) {
+    ///
+    /// Draining early changes nothing a save sees, as `since_rebase` is a set. A save drains it
+    /// ([`TileStore::save_into`], [`TileStore::save`]), as do a roll-over and a lost tile, and so
+    /// does every flush ([`TileStore::snapshot_dirty`]); with no recovery writer running, the
+    /// project drains it on every call that would have advanced one
+    /// ([`crate::Project::with_writer`]). So the feed's backlog stays bounded between saves.
+    pub(crate) fn drain_saves(&mut self) {
         let drained = self.feed.drain(self.save_consumer);
         self.since_rebase
             .extend(drained.into_iter().map(|(key, _)| key));
+    }
+
+    /// The change feed's backlog: entries some consumer hasn't drained yet.
+    #[cfg(test)]
+    pub(crate) fn feed_backlog(&self) -> usize {
+        self.feed.backlog()
     }
 
     /// Asserts that only tiles resident in the evaluated pool have a kept prediction or an
@@ -2794,6 +2806,9 @@ impl TileStore {
     ///
     /// This is the drawing thread's share of a flush: a copy of each slot, no encoding or I/O.
     ///
+    /// Save's consumer is drained into [`TileStore::since_rebase`] here too, so the feed holds
+    /// no more than one flush's worth of entries between saves.
+    ///
     /// # Errors
     ///
     /// [`CacheError::Internal`] if a handle went stale. The mark keeps every key then.
@@ -2802,6 +2817,7 @@ impl TileStore {
         id: ConsumerId,
         skipped: &mut Vec<TileKey>,
     ) -> Result<Vec<Snapshot>, CacheError> {
+        self.drain_saves();
         let drained = self.feed.drain(id);
         let Some(mark) = self.streams.get_mut(&id) else {
             return Ok(Vec::new());

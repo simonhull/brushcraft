@@ -1039,6 +1039,9 @@ impl Project {
             drop(failed.close(&mut self.store, Instant::now()));
             self.failed_working = true;
         }
+        // With no writer, no flush drains save's cursor in the change feed, and nothing else
+        // does between saves: drained here, the feed stays bounded while protection is paused.
+        self.store.drain_saves();
         self.resume(retry)
     }
 

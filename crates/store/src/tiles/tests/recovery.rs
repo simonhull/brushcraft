@@ -176,6 +176,38 @@ fn a_writer_whose_thread_stopped_is_failed_and_needs_a_new_file() {
     );
 }
 
+/// The change feed stays bounded between saves: every flush drains it for every consumer.
+///
+/// Ten strokes over the same eight tiles, a new op each, each flushed: the feed holds nothing
+/// after, though no save has drained save's consumer, and the edits still wait for a save.
+#[test]
+fn the_change_feed_stays_bounded_between_saves() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    let keys: Vec<TileKey> = tiles(&mesh, TOP, TOP).into_iter().take(8).collect();
+    for k in 0_u8..10 {
+        for &key in &keys {
+            edit_interior(
+                &mut store,
+                &mut map,
+                key,
+                Vec3::new(0.0, 0.0, 0.001 * f32::from(k + 1)),
+            );
+        }
+        writer.end_stroke(&mut store, Instant::now()).unwrap();
+        settle(&mut writer, &mut store);
+    }
+    assert_eq!(
+        store.feed.backlog(),
+        0,
+        "every consumer has drained what it was given"
+    );
+    assert!(store.has_unsaved_edits(), "the edits still wait for a save");
+}
+
 /// Ticks during a ten-second stroke of one op flush about once a second.
 ///
 /// A tick every 100 ms: the flushes are at least [`FLUSH_INTERVAL`] apart and at most a tick

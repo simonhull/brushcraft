@@ -870,6 +870,46 @@ fn a_paused_roll_over_writes_nothing_more_into_the_failed_file() {
     );
 }
 
+/// The change feed stays bounded while crash protection is paused.
+///
+/// With no writer, nothing drains the feed but save's consumer: five strokes after a failed
+/// roll-over leave no backlog, and the edits still wait for a save.
+#[test]
+fn the_change_feed_stays_bounded_while_protection_is_paused() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 60, 91);
+    project.finish_flushes().unwrap();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    project.fail_next_recovery();
+    stroke(&mut project, &mut map, 60, 92);
+    let began = Instant::now();
+    let failed = loop {
+        match project.poll() {
+            Ok(()) => {
+                assert!(began.elapsed() < Duration::from_secs(30), "the sync fails");
+                std::thread::yield_now();
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(paused_by_io(&failed), "{failed:?}");
+    for k in 0..5 {
+        stroke(&mut project, &mut map, 40, 200 + k);
+    }
+    assert_eq!(
+        project.store().feed_backlog(),
+        0,
+        "nothing drains the feed but save's cursor while paused, and that is drained every call"
+    );
+    assert!(
+        project.has_unsaved_edits(),
+        "the edits still wait for a save"
+    );
+}
+
 /// One stroke whose flush fails to sync.
 ///
 /// Begun, `count` random edits with `seed` applied as its dabs to the project's store and to
