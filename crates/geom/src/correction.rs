@@ -8,6 +8,9 @@ use crate::{FaceId, TILE_QUADS, Vec3};
 const Q_MAX: f32 = 32767.0;
 /// Interior magnitudes below this would need a subnormal scale; such interiors are stored as zero.
 const TINY: f32 = Q_MAX * f32::MIN_POSITIVE;
+/// The largest scale a tile can have: every one of its `±32767` steps decodes finite, as
+/// `Q_MAX × MAX_SCALE < f32::MAX`. A power-of-two divisor keeps it exact.
+const MAX_SCALE: f32 = f32::MAX / 65536.0;
 
 /// One tile's corrections, `(t, b, n)` per vertex (`x`, `y`, `z`) in the tangent frame of the
 /// predicted surface.
@@ -63,6 +66,10 @@ pub enum CorrectionError {
         /// Vertices per side.
         side: u32,
     },
+    /// An interior value would need a scale above the largest a tile can have, past which its
+    /// steps decode to infinity.
+    #[error("correction is too large to store")]
+    TooLarge,
 }
 
 /// What [`CorrectionViewMut::update_interior_row`] did to a row.
@@ -161,12 +168,13 @@ fn counts(side: u32) -> Result<(usize, usize), CorrectionError> {
     Ok((to((side - 2) * (side - 2))?, to(4 * (side - 1))?))
 }
 
-/// Whether `scale` can be a tile's scale: `+0.0`, or finite, positive and normal.
+/// Whether `scale` can be a tile's scale: `+0.0`, or finite, positive, normal and at most
+/// [`MAX_SCALE`], so every interior value decodes finite.
 ///
 /// `-0.0` is not one: it would decode every interior value to a signed zero, so equal tiles
 /// could differ in their bits. Callers that accept it normalise it to `+0.0` first.
 fn valid_scale(scale: f32) -> bool {
-    scale.to_bits() == 0 || (scale.is_finite() && scale >= f32::MIN_POSITIVE)
+    scale.to_bits() == 0 || (f32::MIN_POSITIVE..=MAX_SCALE).contains(&scale)
 }
 
 /// Whether `v` has a `-0.0` component.
@@ -185,7 +193,7 @@ impl<'a> CorrectionView<'a> {
     ///
     /// [`CorrectionError::BadSide`] for a side outside `2..=65`, or
     /// [`CorrectionError::BadParts`] if either slice is too short or the scale is negative
-    /// (`-0.0` included), subnormal or not finite.
+    /// (`-0.0` included), subnormal, not finite or so large its steps decode to infinity.
     pub fn new(
         side: u32,
         scale: f32,
@@ -233,7 +241,8 @@ impl<'a> CorrectionView<'a> {
     /// Checks the values against the rules every tile keeps, the ones a tile written only through
     /// [`CorrectionViewMut::set`] keeps by construction:
     ///
-    /// - the scale is `+0.0`, or finite, positive and normal;
+    /// - the scale is `+0.0`, or finite, positive and normal, and small enough that every interior
+    ///   value decodes finite;
     /// - a zero scale has a zero interior (anything else would decode to zero);
     /// - no interior value is `i16::MIN`, which quantization never produces (its range is
     ///   symmetric, `±32767`);
@@ -341,13 +350,15 @@ impl<'a> CorrectionViewMut<'a> {
     ///
     /// # Errors
     ///
-    /// [`CorrectionError::OutOfTile`] or [`CorrectionError::NotFinite`].
+    /// [`CorrectionError::OutOfTile`] or [`CorrectionError::NotFinite`];
+    /// [`CorrectionError::TooLarge`] for an interior value no scale can hold with every step
+    /// decoding finite. Nothing is written then.
     pub fn set(&mut self, i: u32, j: u32, c: Vec3) -> Result<(), CorrectionError> {
         if !c.is_finite() {
             return Err(CorrectionError::NotFinite);
         }
         if let Some(Slot::Interior(_)) = slot(self.side, i, j) {
-            self.fit_scale(c);
+            self.fit_scale(c)?;
         }
         self.store(i, j, c)
     }
@@ -363,10 +374,12 @@ impl<'a> CorrectionViewMut<'a> {
     /// for the read and the write: what an edit of a whole interior, row by row, costs per
     /// vertex.
     ///
-    /// It stops at the first value `f` returns that isn't finite, which isn't written; the
-    /// writes before it stay. The outcome says whether anything was written, and why it
-    /// stopped if it did: [`CorrectionError::NotFinite`], or [`CorrectionError::OutOfTile`] for
-    /// a row that isn't inside the tile (nothing is read then).
+    /// It stops at the first value `f` returns that isn't finite, or is too large to store,
+    /// which isn't written; the writes before it stay. The outcome says whether anything was
+    /// written, and why it stopped if it did: [`CorrectionError::NotFinite`],
+    /// [`CorrectionError::TooLarge`] (as [`CorrectionViewMut::set`]), or
+    /// [`CorrectionError::OutOfTile`] for a row that isn't inside the tile (nothing is read
+    /// then).
     pub fn update_interior_row(
         &mut self,
         j: u32,
@@ -396,7 +409,10 @@ impl<'a> CorrectionViewMut<'a> {
                 outcome.error = Some(CorrectionError::NotFinite);
                 return outcome;
             }
-            self.fit_scale(c);
+            if let Err(e) = self.fit_scale(c) {
+                outcome.error = Some(e);
+                return outcome;
+            }
             let scale = *self.scale;
             if let Some(stored) = self.interior.get_mut(k) {
                 *stored = [
@@ -412,10 +428,18 @@ impl<'a> CorrectionViewMut<'a> {
 
     /// Grows the scale, re-quantizing the interior, if interior value `c` (finite) doesn't fit
     /// it: as [`CorrectionViewMut::set`] describes.
-    fn fit_scale(&mut self, c: Vec3) {
+    ///
+    /// # Errors
+    ///
+    /// [`CorrectionError::TooLarge`] if `c` needs a scale above [`MAX_SCALE`]; the tile is
+    /// unchanged then.
+    fn fit_scale(&mut self, c: Vec3) -> Result<(), CorrectionError> {
         let needed = max_abs(c);
         let scale = *self.scale;
         if needed > Q_MAX * scale {
+            if needed > Q_MAX * MAX_SCALE {
+                return Err(CorrectionError::TooLarge);
+            }
             if scale == 0.0 {
                 if needed >= TINY {
                     self.requantize(needed / Q_MAX);
@@ -424,6 +448,7 @@ impl<'a> CorrectionViewMut<'a> {
                 self.requantize(grown_scale(scale, needed));
             }
         }
+        Ok(())
     }
 
     /// Writes `value` with the current scale.
@@ -488,7 +513,8 @@ impl CorrectionTile {
     /// # Errors
     ///
     /// [`CorrectionError::BadSide`], [`CorrectionError::BadParts`] if `values` has the wrong
-    /// length, or [`CorrectionError::NotFinite`].
+    /// length, [`CorrectionError::NotFinite`], or [`CorrectionError::TooLarge`] if an interior
+    /// value needs a scale above the largest a tile can have.
     pub fn from_values(side: u32, values: &[Vec3]) -> Result<Self, CorrectionError> {
         let mut tile = Self::zero(side)?;
         if values.len() != tile.interior.len() + tile.border.len() {
@@ -505,6 +531,9 @@ impl CorrectionTile {
             .filter(|((i, j), _)| matches!(slot(side, *i, *j), Some(Slot::Interior(_))))
             .map(|(_, v)| max_abs(*v))
             .fold(0.0, f32::max);
+        if peak > Q_MAX * MAX_SCALE {
+            return Err(CorrectionError::TooLarge);
+        }
         tile.scale = if peak < TINY { 0.0 } else { peak / Q_MAX };
         let mut view = tile.view_mut();
         cells
@@ -615,18 +644,22 @@ impl CorrectionTile {
     ///
     /// # Errors
     ///
-    /// [`CorrectionError::OutOfTile`] or [`CorrectionError::NotFinite`].
+    /// As [`CorrectionViewMut::set`].
     pub fn set(&mut self, i: u32, j: u32, c: Vec3) -> Result<(), CorrectionError> {
         self.view_mut().set(i, j, c)
     }
 }
 
-/// Grows `scale` by the smallest power of two that makes `needed` fit.
+/// Grows `scale` by the smallest power of two that makes `needed` fit, staying at most
+/// [`MAX_SCALE`].
+///
+/// [`MAX_SCALE`] itself if no power of two below it does, which fits any `needed` up to
+/// `Q_MAX × MAX_SCALE` (the caller refuses more).
 fn grown_scale(scale: f32, needed: f32) -> f32 {
     (1..=128)
         .map(|k| scale * 2.0_f32.powi(k))
-        .find(|grown| grown.is_finite() && grown * Q_MAX >= needed)
-        .unwrap_or(needed / Q_MAX)
+        .find(|grown| *grown <= MAX_SCALE && grown * Q_MAX >= needed)
+        .unwrap_or(MAX_SCALE)
 }
 
 /// Maps `-0.0` components to `+0.0`, so equal corrections have equal bits.
@@ -1301,5 +1334,79 @@ mod tests {
                 "mutable, scale {scale}"
             );
         }
+    }
+
+    /// A stored tile with a scale past [`MAX_SCALE`] is refused, as scales not far past it
+    /// decode the largest step to infinity; at [`MAX_SCALE`] every step decodes finite.
+    #[test]
+    fn from_parts_rejects_scales_that_decode_to_infinity() {
+        assert!(
+            (Q_MAX * MAX_SCALE).is_finite(),
+            "the largest step decodes finite"
+        );
+        assert!(
+            !(Q_MAX * MAX_SCALE * 4.0).is_finite(),
+            "four times the cap would not"
+        );
+        assert_eq!(
+            CorrectionTile::from_parts(
+                3,
+                MAX_SCALE * 2.0,
+                vec![[32767, 0, 0]],
+                vec![Vec3::ZERO; 8]
+            )
+            .unwrap_err(),
+            CorrectionError::BadParts { side: 3 },
+        );
+        let tile =
+            CorrectionTile::from_parts(3, MAX_SCALE, vec![[32767, 0, 0]], vec![Vec3::ZERO; 8])
+                .unwrap();
+        assert!(tile.get(1, 1).unwrap().is_finite());
+    }
+
+    /// A value no allowed scale can hold is refused before anything is written, through `set`,
+    /// a row update and `from_values` alike; a large value that fits is stored.
+    #[test]
+    fn values_needing_a_scale_past_the_cap_are_refused() {
+        let huge = Vec3::new(f32::MAX, 0.0, 0.0);
+        let mut tile = CorrectionTile::zero(3).unwrap();
+        assert_eq!(tile.set(1, 1, huge), Err(CorrectionError::TooLarge));
+        assert_eq!(tile, CorrectionTile::zero(3).unwrap(), "unchanged");
+
+        // From a non-zero scale, growth is capped too.
+        tile.set(1, 1, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+        let before = tile.clone();
+        assert_eq!(tile.set(1, 1, huge), Err(CorrectionError::TooLarge));
+        assert_eq!(tile, before, "unchanged");
+        let outcome = tile.view_mut().update_interior_row(1, |_, _, _| Some(huge));
+        assert_eq!(
+            outcome,
+            RowUpdate {
+                wrote: false,
+                error: Some(CorrectionError::TooLarge)
+            }
+        );
+        assert_eq!(tile, before, "unchanged by the row either");
+
+        tile.set(1, 1, Vec3::new(1e30, 0.0, 0.0)).unwrap();
+        assert!(tile.scale() <= MAX_SCALE);
+        tile.view().validate().unwrap();
+        let got = tile.get(1, 1).unwrap();
+        assert!((got.x - 1e30).abs() <= tile.scale(), "{got:?}");
+
+        // The largest value that fits, from a small scale: growth stops at the cap.
+        let mut capped = CorrectionTile::zero(3).unwrap();
+        capped.set(1, 1, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+        capped
+            .set(1, 1, Vec3::new(Q_MAX * MAX_SCALE, 0.0, 0.0))
+            .unwrap();
+        assert!(capped.scale() <= MAX_SCALE && capped.get(1, 1).unwrap().is_finite());
+
+        let mut values = vec![Vec3::ZERO; 9];
+        values[4] = huge;
+        assert_eq!(
+            CorrectionTile::from_values(3, &values).unwrap_err(),
+            CorrectionError::TooLarge
+        );
     }
 }
