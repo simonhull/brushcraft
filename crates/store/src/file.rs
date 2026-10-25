@@ -45,6 +45,9 @@ pub(crate) const HEADER_LEN: usize = 16;
 const FIRST_RECORD: u64 = 16;
 /// Every this-many-th index is full; the rest are deltas.
 const FULL_EVERY: u32 = 16;
+/// The longest parent chain a reader follows: writers make a full Index every
+/// [`FULL_EVERY`]th, so a chain is at most one full Index and `FULL_EVERY - 1` deltas.
+const MAX_CHAIN: usize = FULL_EVERY as usize;
 /// "None" for an index's parent offset and head op.
 const NONE: u64 = u64::MAX;
 /// Bytes per index entry: key, offset `u64`, len `u32`.
@@ -2740,6 +2743,29 @@ fn scan_heads(file: &File, start: u64, len: u64) -> io::Result<Vec<(u64, Head)>>
     Ok(heads)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: Indexes read by [`read_index`] and bytes checksummed by [`find_index`] on this
+    /// thread, so adversarial tests can bound the work an open does.
+    static WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Test hook: the work counted in [`WORK`] since the last call on this thread (Indexes read,
+/// bytes checksummed), and starts counting again from zero.
+#[cfg(test)]
+pub(super) fn take_work() -> (u64, u64) {
+    WORK.with(|work| work.replace((0, 0)))
+}
+
+/// Test hook: counts one more Index read in [`WORK`].
+#[cfg(test)]
+fn count_index_read() {
+    WORK.with(|work| {
+        let (indexes, bytes) = work.get();
+        work.set((indexes.saturating_add(1), bytes));
+    });
+}
+
 /// The first offset in `[from, len)` where a save point starts (see [`save_point`]): proof that the
 /// file is damaged, not torn, at `from`. `None` if there is none.
 ///
@@ -2825,6 +2851,8 @@ fn read_index(file: &File, offset: u64, len: u64) -> io::Result<Option<Index>> {
     if head.kind != KIND_INDEX {
         return Ok(None);
     }
+    #[cfg(test)]
+    count_index_read();
     Ok(save_point(&read_exact(file, offset, head.total())?, offset))
 }
 
@@ -2844,8 +2872,8 @@ fn save_point(record: &[u8], at: u64) -> Option<Index> {
 /// The live map of the Index at `offset`, or `None` if any Index of its chain is bad.
 ///
 /// Follows parent links back to a full Index, then applies it and the deltas oldest first. A chain
-/// that ends without a full Index is bad, and so is one with an entry outside the records before
-/// its Index.
+/// that ends without a full Index is bad, or that is longer than any writer makes ([`MAX_CHAIN`]),
+/// and so is one with an entry outside the records before its Index.
 ///
 /// # Errors
 ///
@@ -2862,6 +2890,9 @@ fn load_chain(file: &File, offset: u64, len: u64) -> io::Result<Option<Chain>> {
         }
         let (coverage, parent) = (index.coverage, index.parent);
         chain.push(index);
+        if chain.len() > MAX_CHAIN {
+            return Ok(None);
+        }
         match (coverage, parent) {
             (Coverage::Full, _) => break,
             // Parents come strictly earlier, so the walk ends.

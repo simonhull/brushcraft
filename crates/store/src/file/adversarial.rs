@@ -449,6 +449,40 @@ fn full_indexes_are_the_first_and_every_sixteenth() {
 }
 
 #[test]
+fn a_long_delta_chain_is_refused_in_linear_work() {
+    const DELTAS: u64 = 200;
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut created = ProjectFile::create(&path, meta(), mesh()).unwrap();
+    created
+        .write_displacement(key(1), op(1), &tile(1.0))
+        .unwrap();
+    drop(created);
+    let mut f = ProjectFile::open(&path).unwrap();
+    // The oldest is a delta with no parent, so no chain ever loads; each later one names the
+    // one before it.
+    let mut parent = None;
+    for _ in 0..DELTAS {
+        let at = f.len();
+        f.append_raw(
+            KIND_INDEX,
+            &index_payload(Coverage::Delta, parent, None, &BTreeMap::new()).unwrap(),
+        )
+        .unwrap();
+        parent = Some(at);
+    }
+    drop(f);
+    take_work();
+    let opened = ProjectFile::open(&path);
+    let (indexes, _) = take_work();
+    assert!(opened.is_err(), "no save point loads: {opened:?}");
+    assert!(
+        indexes <= 17 * DELTAS,
+        "{indexes} Index reads for {DELTAS} Indexes"
+    );
+}
+
+#[test]
 fn a_checksummed_index_that_does_not_load_stops_recovery_as_damage() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
