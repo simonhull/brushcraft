@@ -15,7 +15,7 @@ input = { path = "crates/input" }
 brush = { path = "crates/brush" }
 sculpt = { path = "crates/sculpt" }
 anyhow = "1.0.100"
-bytemuck = { version = "=1.25.2", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
+bytemuck = { version = "1.25.2", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 divan = "0.1.21"
 raw-window-handle = "0.6.2"
 rayon = "1.12.0"
@@ -25,8 +25,9 @@ thiserror = "2.0.21"
 wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
+# Exact: a pre-release; a caret would float to later betas.
 winit = { version = "=0.31.0-beta.3", default-features = false, features = ["wayland", "wayland-dlopen"] }
-zstd = { version = "=0.14.3", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
