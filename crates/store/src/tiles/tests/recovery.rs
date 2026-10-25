@@ -240,6 +240,44 @@ fn a_record_at_the_cut_appended_during_the_tile_sync_is_synced_before_the_save_p
     );
 }
 
+/// A tile at the cut, written back to make room during the tile sync, is synced before the save
+/// point: the store's own write-back, end to end.
+///
+/// One copy fails to encode, so its tile stays dirty at its at-cut edit. Written back while the
+/// tiles sync, its record is one the save point names, so the flush syncs again first; the save
+/// point then holds every edit at the cut, that tile's included.
+#[test]
+fn an_at_cut_tile_written_back_during_the_tile_sync_is_synced_before_the_save_point() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 60, 41));
+    writer.fail_encodes(1);
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    let cut = map.clone();
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(writer.phase(), "syncing tiles", "the records are appended");
+    assert!(
+        !store.unsaved.is_empty(),
+        "the tile whose copy failed to encode stays dirty"
+    );
+    store.evict_all().unwrap();
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(
+        writer.phase(),
+        "syncing tiles",
+        "the tile written back is at the cut, so the save point names it: it is synced first"
+    );
+    settle(&mut writer, &mut store);
+    let first = writer.durable_save_point().unwrap();
+    drop(writer);
+    drop(store);
+    assert_save_point(&path, first, &mesh, &cut);
+}
+
 /// An at-cut record replacing a past-cut one during the tile sync is synced before the save
 /// point.
 ///
