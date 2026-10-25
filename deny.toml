@@ -1,11 +1,19 @@
 [graph]
 all-features = true
+# The platforms on the roadmap: Linux first, then Android, Windows, macOS and iOS.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-linux-android",
+  "x86_64-pc-windows-msvc",
+  "aarch64-apple-darwin",
+  "aarch64-apple-ios",
+]
 
 [advisories]
 yanked = "deny"
 
 [licenses]
-# Permissive licenses only; BrushCraft is closed source, so copyleft is out.
+# Permissive licenses only, so every licensing option stays open.
 allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
