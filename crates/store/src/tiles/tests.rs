@@ -10,12 +10,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use geom::{
-    BaseMesh, CorrectionMap, CorrectionTile, DenseEvaluation, FaceId, Level, PositionSource,
-    Region, TileKey, Vec3, cube_sphere, normal_tiles, normals,
+    BaseMesh, CorrectionError, CorrectionMap, CorrectionTile, DenseEvaluation, FaceId, Level,
+    PositionSource, Region, TileKey, Vec3, cube_sphere, normal_tiles, normals,
 };
 
 use super::edit::{BorderValues, border_order, update_row};
-use super::layers::saved_base;
+use super::layers::{first_op, saved_base};
 use super::*;
 use crate::MAX_SEQ;
 use crate::fixture::meta_for;
