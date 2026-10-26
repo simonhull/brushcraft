@@ -125,6 +125,7 @@ use rayon::iter::{
 use rayon::slice::{ParallelSlice, ParallelSliceMut};
 
 use self::config::{BATCH_SHARE, Headroom, MAX_BATCH, ROUND, reserved_shares};
+use self::pins::{PinTable, Pinned};
 use crate::activity::Activity;
 use crate::bounds::Book;
 use crate::deps::{DepGraph, list_normal_inputs};
@@ -145,9 +146,11 @@ use crate::workers::StartWorkersError;
 
 mod config;
 mod error;
+mod pins;
 
 pub use config::{Evaluation, StoreConfig};
 pub use error::{CacheError, Invariant};
+pub use pins::PinGuard;
 
 /// A [`TileStore`]'s identity among the stores the process opens ([`TileStore::id`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -163,51 +166,6 @@ impl StoreId {
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 }
-
-/// Pin sets whose guards have been dropped, waiting for the store to unpin them.
-///
-/// Shared between the store and its guards. It is borrowed only for a push (a guard's drop) or
-/// a take (the store's next call), never across anything that could drop a guard, so the
-/// borrows never overlap.
-#[derive(Debug, Default)]
-struct PinTable {
-    /// Ids of released pin sets.
-    released: Vec<u64>,
-}
-
-/// Keeps a set of tiles resident: their evaluated positions and their correction tiles stay in
-/// the pools, in the same slots, until the guard is dropped.
-///
-/// An edit of a pinned tile (or of anything it was predicted from) doesn't move it: its slot is
-/// recomputed in place on its next [`TileStore::evaluate`]. The store applies the unpin at its
-/// next call after the drop.
-#[derive(Debug)]
-#[must_use = "dropping the guard unpins the tiles"]
-pub struct PinGuard {
-    /// The pin set in the store.
-    id: u64,
-    /// The pinned tiles, in key order.
-    keys: Vec<TileKey>,
-    /// Where the drop is reported.
-    table: Rc<RefCell<PinTable>>,
-}
-
-impl PinGuard {
-    /// The pinned tiles, in key order, each once.
-    #[must_use]
-    pub fn keys(&self) -> &[TileKey] {
-        &self.keys
-    }
-}
-
-impl Drop for PinGuard {
-    fn drop(&mut self) {
-        self.table.borrow_mut().released.push(self.id);
-    }
-}
-
-/// The slots one pinned tile holds: its evaluated tile and its correction tile.
-type Pinned = (SlotId<EvaluatedSlot>, SlotId<CorrectionSlot>);
 
 /// What happens to a batch's targets once [`TileStore::in_batches`] has run it: what the
 /// batches after it must leave room for.
