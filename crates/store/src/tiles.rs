@@ -1054,9 +1054,9 @@ pub struct TileStore {
     stroke_tiles: usize,
     /// This store's identity among every store the process opens ([`TileStore::id`]).
     id: StoreId,
-    /// How many times corrections were written (each [`TileStore::invalidate_edited`]), as of
-    /// now: while it stays the same, every tile evaluates to the same bits, so bounds computed
-    /// from an evaluation are still the tile's ([`TileStore::edits`]).
+    /// How many times a correction slot's values changed, as of now ([`TileStore::edits`]):
+    /// while it stays the same, every tile evaluates to the same bits, so bounds computed from
+    /// an evaluation are still the tile's.
     edits: u64,
     /// The pinned tiles an edit of their own corrections alone marked stale, their parents'
     /// positions unchanged: the tiles whose next prediction, made in place, is worth keeping
@@ -2393,12 +2393,23 @@ impl TileStore {
         self.id
     }
 
-    /// How many times corrections have been written since the store opened, counting every
-    /// edit, page-in of a lost tile and reload that drops evaluations. While it stays the same,
-    /// every tile evaluates to the same bits: what [`WaveBounds`] checks before its bounds are
-    /// used.
+    /// How many times a correction slot's values have changed since the store opened: every
+    /// write ([`TileStore::mark_written`]) and every lost tile's write undone, by
+    /// [`TileStore::rebase`], [`TileStore::roll_over`] or [`TileStore::lose_left_out`]
+    /// ([`TileStore::drop_lost_slot`], [`TileStore::reload_lost`]). An ordinary page-in reads
+    /// what the files hold and changes nothing. While it stays the same, every tile evaluates
+    /// to the same bits: what [`WaveBounds`] checks before its bounds are used.
     pub(crate) const fn edits(&self) -> u64 {
         self.edits
+    }
+
+    /// Counts a change of a correction slot's values ([`TileStore::edits`]).
+    ///
+    /// Called where the values change, not where evaluations are dropped: an invalidation may
+    /// skip a tile nothing cached follows from, and a path that drops evaluations some other
+    /// way must still be counted.
+    const fn corrections_changed(&mut self) {
+        self.edits = self.edits.wrapping_add(1);
     }
 
     /// The op for an edit: the current one, or a new one if none is current.
@@ -3337,6 +3348,8 @@ impl TileStore {
     ///
     /// [`CacheError::Internal`] for a stale handle.
     fn drop_lost_slot(&mut self, key: &TileKey) -> Result<bool, CacheError> {
+        // The tile reads as its last record from now on, not as the lost write.
+        self.corrections_changed();
         self.unsaved.remove(key);
         let Some(id) = self.corrections.find(key) else {
             return Ok(false);
@@ -3359,6 +3372,7 @@ impl TileStore {
     /// one: every read or edit of it fails until it leaves the pool (a clean slot, so dropping
     /// it writes nothing), and the tile is read from its record again after that.
     fn reload_lost(&mut self, key: &TileKey) {
+        self.corrections_changed();
         let Some(id) = self.corrections.find(key) else {
             return;
         };
@@ -4170,6 +4184,7 @@ impl TileStore {
         id: SlotId<CorrectionSlot>,
         op: OpId,
     ) -> Result<(), CacheError> {
+        self.corrections_changed();
         self.last_write = self.last_write.next();
         self.unsaved.insert(
             key,
@@ -4194,10 +4209,7 @@ impl TileStore {
     /// again, however many there are and whatever their ops. While the dependency graph holds
     /// an untracked node, nothing is skipped: the cascade takes such a node to follow from
     /// every coarser edit, recorded or not (see [`crate::deps`]).
-    ///
-    /// Every call counts as a write of corrections ([`TileStore::edits`]), whatever it skips.
     fn invalidate_edited(&mut self, edited: impl IntoIterator<Item = TileKey>) {
-        self.edits = self.edits.wrapping_add(1);
         let reached: Vec<TileKey> = edited
             .into_iter()
             .filter(|key| {
