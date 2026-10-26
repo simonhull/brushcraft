@@ -8,7 +8,8 @@ use geom::{CorrectionMap, Level};
 use super::*;
 use crate::bounds::readers;
 use crate::file::compact;
-use crate::tiles::tests::{TOP, apply, fixed, mesh, random_edits, roomy, tiles};
+use crate::fixture::{TOP, fixed, mesh, random_edits, roomy, tiles};
+use crate::tiles::tests::apply;
 
 /// The level indexed: the tests' finest, 96 tiles of the cube.
 fn top() -> Level {

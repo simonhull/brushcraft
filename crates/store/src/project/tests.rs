@@ -12,13 +12,11 @@ mod restore;
 use geom::{CorrectionMap, Level, Region, TileKey, Vec3};
 
 use super::*;
+use crate::fixture::{TOP, assert_positions, damage, dense, mesh, random_edits, roomy, tiles};
 use crate::index::SpatialIndex;
 use crate::index::tests::assert_loads_as_built;
 use crate::test_dir::TestDir;
-use crate::tiles::tests::{
-    TOP, apply, apply_dabs, assert_positions, break_slot, damage, dense, mesh, random_edits, roomy,
-    tiles,
-};
+use crate::tiles::tests::{apply, apply_dabs, break_slot};
 
 /// Asserts that a save went through with nothing to report: crash protection runs, every edit
 /// is protected, and the old recovery file was deleted.

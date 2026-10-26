@@ -41,9 +41,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
+use crate::fixture::{record, tight};
 use crate::index::SpatialIndex;
 use crate::index::tests::assert_loads_as_built;
-use crate::tiles::tests::{record, tight};
 
 /// The level the child indexes: the tests' finest.
 fn top() -> Level {

@@ -11,11 +11,10 @@ use geom::{FaceId, cube_sphere};
 use super::bvh::tests::Rng;
 use super::*;
 use crate::file::ProjectFile;
-use crate::fixture::meta_for;
+use crate::fixture::{fixed, meta_for, with_reserved_shares};
 use crate::slot::EvaluatedSlot;
 use crate::test_dir::TestDir;
 use crate::tiles::StoreConfig;
-use crate::tiles::tests::{fixed, with_reserved_shares};
 
 mod stored;
 

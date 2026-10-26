@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use geom::{BaseMesh, Vec3, normal_tiles};
 
 use super::*;
+use crate::fixture::{level, mesh, split_prism, tiles};
 use crate::index::{Aabb, NormalCone};
-use crate::tiles::tests::{level, mesh, split_prism, tiles};
 
 /// Bounds with every kind of value a tile's bounds can hold: a negative zero, a tight cone.
 fn sample() -> TileBounds {
