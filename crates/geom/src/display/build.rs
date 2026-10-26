@@ -375,7 +375,12 @@ pub fn build_face_with(
 /// The largest bound of the level-`finer` display tiles under `key` (one level coarser), from
 /// `finer_bounds` (that level's tiles, row by row); 0 if `finer` is the finest level, whose
 /// surface is exact.
-fn children_bound(key: &TileKey, finer: Level, finest: Level, finer_bounds: &[f32]) -> f32 {
+pub(super) fn children_bound(
+    key: &TileKey,
+    finer: Level,
+    finest: Level,
+    finer_bounds: &[f32],
+) -> f32 {
     if finer == finest {
         return 0.0;
     }

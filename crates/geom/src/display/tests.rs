@@ -703,3 +703,35 @@ fn a_codec_breaking_seams_is_refused() {
         "the level-7 tile in column 1 disagrees with column 0"
     );
 }
+
+/// A parent's bound takes the largest of its own children's, wherever the parent lies.
+///
+/// At level 7 under a level-9 finest, each tile has four level-8 children, at twice its column
+/// and row. (The bound property's finest level, 8, gives level 7 only zero-bound children.)
+#[test]
+fn a_parent_takes_its_own_childrens_largest_bound() {
+    // Level 8 has 4×4 tiles: each one's bound is its row-major index, so every parent's
+    // children have a distinct largest bound.
+    let finer: Vec<f32> = (0..16_u8).map(f32::from).collect();
+    let cases = [((0, 0), 5.0), ((1, 0), 7.0), ((0, 1), 13.0), ((1, 1), 15.0)];
+    for ((tx, ty), want) in cases {
+        let key = TileKey::display(FaceId::new(0), level(7), tx, ty).unwrap();
+        assert_eq!(
+            build::children_bound(&key, level(8), level(9), &finer),
+            want,
+            "({tx}, {ty})"
+        );
+    }
+    let whole = TileKey::display(FaceId::new(0), level(6), 0, 0).unwrap();
+    assert_eq!(
+        build::children_bound(&whole, level(7), level(9), &[1.0, 4.0, 2.0, 3.0]),
+        4.0,
+        "a whole-face parent over 2×2 children"
+    );
+    let below_finest = TileKey::display(FaceId::new(0), level(8), 0, 0).unwrap();
+    assert_eq!(
+        build::children_bound(&below_finest, level(9), level(9), &finer),
+        0.0,
+        "the finest level is exact"
+    );
+}
