@@ -558,6 +558,50 @@ fn unknown_record_kinds_are_skipped() {
     assert_eq!(opened.len(), len, "nothing cut off");
 }
 
+/// A bound record cut short by the end of the file reads as unknown, not as an error, and the
+/// records read with it in one window still read as written.
+///
+/// The window over all of them runs past the end, so each record is read again on its own: the
+/// whole ones give their bounds, the cut one nothing.
+#[test]
+fn a_bound_cut_short_by_the_end_of_the_file_reads_as_unknown() {
+    let dir = TestDir::new();
+    let path = dir.path("cut.bcrf");
+    let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
+    for k in 0..3u16 {
+        f.write_bounds(key(1, k), Some(&bound(f32::from(k + 1))), Stamp::ZERO)
+            .unwrap();
+    }
+    let mut entries: Vec<(TileKey, Loc)> =
+        f.bounds_locations().map(|(key, loc)| (*key, loc)).collect();
+    entries.sort_by_key(|(_, loc)| loc.offset);
+    let &(_, last) = entries.last().unwrap();
+    assert_eq!(
+        last.offset + last.len,
+        f.len(),
+        "the set-up: the last record ends the file"
+    );
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(last.offset + last.len / 2)
+        .unwrap();
+    let read = f.read_bounds(&entries).unwrap();
+    let want: Vec<Option<[u32; TileBounds::BITS]>> = (0..3u16)
+        .map(|k| (k < 2).then(|| bound(f32::from(k + 1)).to_bits()))
+        .collect();
+    assert_eq!(
+        read.into_iter()
+            .map(|b| b.map(TileBounds::to_bits))
+            .collect::<Vec<_>>(),
+        want,
+        "the whole records read, the cut one is unknown"
+    );
+    let alone = f.read_bounds(&entries[2..]).unwrap();
+    assert_eq!(alone, vec![None], "read on its own, too");
+}
+
 #[test]
 fn an_index_names_its_bounds_strictly() {
     let at = |offset| Loc { offset, len: 40 };
