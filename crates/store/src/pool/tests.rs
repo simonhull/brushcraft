@@ -35,7 +35,7 @@ fn put(pool: &mut Pool<Small>, budget: &mut Budget, n: u32, value: u64) -> SlotI
     id
 }
 
-/// A pinned handle in [`never_exceeds_the_budget`]'s workload: handles of the two pools are
+/// A pinned handle in `never_exceeds_the_budget`'s workload: handles of the two pools are
 /// different types.
 enum Pinned {
     /// In the correction pool.
@@ -62,7 +62,7 @@ fn pinned_by_scan<T: SlotData>(pool: &Pool<T>) -> usize {
     pool.meta.iter().flatten().filter(|m| m.pins > 0).count()
 }
 
-/// What holds after every step of [`never_exceeds_the_budget`]: the pools are within the
+/// What holds after every step of `never_exceeds_the_budget`: the pools are within the
 /// budget, which counts exactly their chunks, pinned slots stay, and the pinned counts are
 /// right.
 fn check_step(

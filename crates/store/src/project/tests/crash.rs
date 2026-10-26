@@ -4,7 +4,7 @@
 //! # How it runs
 //!
 //! Each case re-executes the test binary ([`std::env::current_exe`]) as a child, asking it to
-//! run only [`crash_child`] (an ignored test, so a normal run skips it): `--exact` with the
+//! run only `crash_child` (an ignored test, so a normal run skips it): `--exact` with the
 //! test's full path, and `--ignored`. libtest takes these arguments whether the binary was
 //! started by `cargo test` or by `cargo nextest run`, which runs each test as
 //! `<binary> --exact <name>` too. The [`SCENARIO`] variable tells the child what to do and

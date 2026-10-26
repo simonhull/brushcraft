@@ -229,7 +229,7 @@ impl Pattern {
     }
 }
 
-/// A change for [`updating_tiles_equals_updating_each_in_turn`], a pure function of its
+/// A change for `updating_tiles_equals_updating_each_in_turn`, a pure function of its
 /// arguments.
 ///
 /// The round, the tile's place in the list and the vertex pick it, the tiles all of the finest
@@ -261,7 +261,7 @@ fn tiles_change(round: u32, poisoned: bool, tile: usize, i: u32, j: u32, c: Vec3
     Some(Vec3::new(c.x + delta.x, c.y + delta.y, c.z + delta.z))
 }
 
-/// Runs round `round` of [`updating_tiles_equals_updating_each_in_turn`] on `store`, as a new op.
+/// Runs round `round` of `updating_tiles_equals_updating_each_in_turn` on `store`, as a new op.
 ///
 /// The store named "None" edits one tile at a time (the definition), the others with
 /// [`TileStore::update_tiles`]. Returns the outcome, printed.

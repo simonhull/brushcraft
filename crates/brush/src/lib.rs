@@ -8,8 +8,8 @@
 //! Brushes are generic over the pieces a brush is composed from, starting with its
 //! [`Falloff`], so each built-in brush is monomorphised into straight-line code.
 //!
-//! M0 has one brush, [`draw`], with a [`Smoothstep`] falloff: enough to measure edit latency.
-//! [`draw_vertex`] is its step for one vertex.
+//! M0 has one brush, [`draw`](fn@draw), with a [`Smoothstep`] falloff: enough to measure edit
+//! latency. [`draw_vertex`] is its step for one vertex.
 
 #![no_std]
 

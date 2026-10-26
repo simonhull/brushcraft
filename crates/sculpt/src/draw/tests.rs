@@ -727,7 +727,7 @@ fn project_with(
     (project, index)
 }
 
-/// Makes the strong dab of [`light_dabs_move_a_tiles_interior_as_far_as_its_border`] at the
+/// Makes the strong dab of `light_dabs_move_a_tiles_interior_as_far_as_its_border` at the
 /// centre of tile `(face 4, 0, 0)` as a stroke of its own, and returns the tile and its scale.
 ///
 /// It pushes the surface out by 0.05 around face-grid `(32, 32)`, so a light dab meant to reach
