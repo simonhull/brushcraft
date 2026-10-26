@@ -26,15 +26,20 @@
 //! # The choice
 //!
 //! Measured on the benchmark project (all 2,400 faces, `brushcraft-bench display-study`; the
-//! table is in the docs repository's `research/platform/m1a2-display-encoding.md`), as growth of
-//! the project file: [`Interpolating`] at `Precision::QuadFraction(6)` (a step of about a
-//! 64th of the level's quad edge) with 8-bit octahedral normals, +38.6 % (positions 24.5 %,
-//! normals and roughness 13.6 %). It meets the first three constraints by construction; its
-//! quantization stays under 1.4 % of a quad edge and raises the median `e` by about 2 %. A
-//! coarser step (a 16th) saves 7 points more but raises the median `e` by about 20 %, which the
-//! renderer pays in triangles. 16-bit normals cost 41.4 % on their own, which no position codec
-//! leaves room for under the 65 % budget without that coarser step; 8-bit octahedral normals
-//! are off by at most 0.96°.
+//! tables are in the docs repository's `research/platform/m1a2-display-encoding.md`), as growth
+//! of the project file:
+//!
+//! - **Positions:** [`Interpolating`] at `Precision::QuadFraction(6)` (a step of about a 64th of
+//!   the level's quad edge), +24.6 %. It meets the first three constraints by construction; its
+//!   quantization stays under 1.4 % of a quad edge and raises the median `e` by about 2 %. A
+//!   coarser step (a 16th) saves 7.6 points more but raises the median `e` by about 20 %, which the
+//!   renderer pays in triangles.
+//! - **Normals:** octahedral at 2 × 12 bits ([`NormalEncoding::Octahedral`]), +29.3 % with
+//!   roughness: the smallest encoding whose largest error is under 0.1° (0.059°, 99th percentile
+//!   0.049°). Predicting normals from the tile's decoded surface loses to it at equal error (2 × 10
+//!   bits: +29.9 %, 0.078°) and decodes ten times slower.
+//!
+//! In all, +53.9 %.
 //!
 //! Integer streams are written as byte planes (every value's low byte, then the next, …), which
 //! the store's zstd compresses far better than interleaved bytes: small residuals leave the high
@@ -72,7 +77,7 @@ pub(super) const CHOSEN: Interpolating = Interpolating::new(Precision::QuadFract
 
 /// The normal encoding [`build_level`](super::build_level) and
 /// [`DisplayTile::decode`](super::DisplayTile::decode) use.
-pub(super) const CHOSEN_NORMALS: NormalEncoding = NormalEncoding::Octahedral(8);
+pub(super) const CHOSEN_NORMALS: NormalEncoding = NormalEncoding::Octahedral(12);
 
 /// How a display tile's positions are stored.
 ///

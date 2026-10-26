@@ -1,5 +1,6 @@
 //! Normals and roughness: each vertex's unit normal, as octahedral coordinates or as a residual
-//! from the normal of the tile's own decoded surface, then one roughness byte per vertex.
+//! from the normal of the tile's own decoded surface, then one roughness byte per vertex,
+//! delta-coded.
 //!
 //! A vertex two tiles share must decode to the same bits in both, as positions do: its mean
 //! normal is the same in both (the mip is computed once, as the owner computes it), so it is
@@ -94,6 +95,9 @@ impl NormalEncoding {
             Self::Octahedral(bits) => put_octahedral(&mut out, normals, bits),
             Self::Predicted(bits) => encode_predicted(&mut out, normals, positions, bits)?,
         }
+        // Delta-coded along rows. Measured on the benchmark project, raw roughness compresses
+        // smaller alone (0.92 % of the file against 0.99 %) but not beside the normals in one
+        // zstd frame (+53.88 % in all against +53.87 %), which is how the store writes it.
         out.extend(deltas_u8(roughness));
         Ok(out)
     }
