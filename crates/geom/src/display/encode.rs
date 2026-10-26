@@ -62,6 +62,12 @@ pub(super) const CHOSEN_NORMALS: NormalEncoding = NormalEncoding::Oct8;
 ///
 /// `encode` then `decode` gives the positions the tile draws, which the bound is computed from;
 /// `decode` of the same bytes always gives the same bits.
+///
+/// **A vertex shared by two tiles must decode to the same bits in both** (border vertices of
+/// tiles of one level, and across faces): seams are exact by construction, without reading a
+/// neighbour, and the bound, chained through one copy, holds for every copy.
+/// [`build_face_with`](super::build_face_with) checks it within a face and fails with
+/// [`DisplayError::Seam`] otherwise.
 pub trait DisplayCodec {
     /// The positions of tile `key`, row-major `side²` (its side), encoded.
     ///

@@ -286,7 +286,9 @@ pub fn build_face(
 ///
 /// [`DisplayError::Shape`] if either grid isn't the face's whole grid at `finest`;
 /// [`DisplayError::NoDisplayLevel`] at level 0 (no level below it);
-/// [`DisplayError::NotFinite`] for a position or normal that isn't finite; the codec's errors.
+/// [`DisplayError::NotFinite`] for a position or normal that isn't finite;
+/// [`DisplayError::Seam`] if the codec decodes a vertex two tiles share to different bits in
+/// each; the codec's errors.
 pub fn build_face_with(
     codec: &impl DisplayCodec,
     normals: NormalEncoding,
@@ -318,6 +320,9 @@ pub fn build_face_with(
         input = subsample(&input)?;
         means = mip_normals(&means)?;
         let mut decoded = input.clone();
+        // Which vertices of `decoded` a tile has written: a vertex two tiles share must decode
+        // to the same bits in both, or the bound would cover one copy and not the other.
+        let mut written = vec![false; decoded.as_slice().len()];
         let keys = level_keys(face, level)?;
         let mut bounds = Vec::with_capacity(keys.len());
         for key in keys {
@@ -336,13 +341,18 @@ pub fn build_face_with(
             let below = children_bound(&key, finer_level, finest, &finer_bounds);
             let error = round_up(f64::from(delta) + f64::from(below))?;
             for (i, j) in cells(positions.side()) {
-                let slot =
-                    decoded
-                        .data_mut()
-                        .get_mut(at(input.side(), region.x0() + i, region.y0() + j));
-                if let (Some(slot), Some(p)) = (slot, positions.get(i, j)) {
-                    *slot = p;
+                let index = at(input.side(), region.x0() + i, region.y0() + j);
+                let p = positions.get(i, j).ok_or(DisplayError::Shape)?;
+                let seen = written.get_mut(index).ok_or(DisplayError::Shape)?;
+                let slot = decoded
+                    .data_mut()
+                    .get_mut(index)
+                    .ok_or(DisplayError::Shape)?;
+                if *seen && slot.to_bits() != p.to_bits() {
+                    return Err(DisplayError::Seam(key));
                 }
+                *slot = p;
+                *seen = true;
             }
             bounds.push(error);
             tiles.push(DisplayTile {

@@ -659,3 +659,47 @@ fn a_built_tile_reads_back_from_its_bytes() {
         "grids of the wrong level"
     );
 }
+
+/// A codec that breaks the shared-vertex contract: the chosen one, but every tile in an odd
+/// column decodes its corner `(0, 0)` a step off, so it disagrees with its left neighbour.
+struct BrokenSeams;
+
+impl DisplayCodec for BrokenSeams {
+    fn encode(&self, key: &TileKey, positions: &Grid) -> Result<Vec<u8>, DisplayError> {
+        encode::CHOSEN.encode(key, positions)
+    }
+
+    fn decode(&self, key: &TileKey, bytes: &[u8]) -> Result<Grid, DisplayError> {
+        let grid = encode::CHOSEN.decode(key, bytes)?;
+        if key.tx().is_multiple_of(2) {
+            return Ok(grid);
+        }
+        let mut data = grid.as_slice().to_vec();
+        data[0].x = data[0].x.next_up();
+        Ok(Grid::new(grid.side(), data)?)
+    }
+}
+
+/// A codec that decodes a shared vertex to different bits in two tiles is refused, naming the
+/// second tile, rather than built with a bound that covers one copy only.
+#[test]
+fn a_codec_breaking_seams_is_refused() {
+    let sculpt = Sculpt::random(5);
+    let face = FaceId::new(1);
+    let (positions, unit) = sculpt.finest(face);
+    let built = build_face_with(
+        &BrokenSeams,
+        NormalEncoding::Oct16,
+        face,
+        &positions,
+        &unit,
+        level(FINEST),
+    );
+    assert_eq!(
+        built.map(|_| ()),
+        Err(DisplayError::Seam(
+            TileKey::display(face, level(FINEST - 1), 1, 0).unwrap()
+        )),
+        "the level-7 tile in column 1 disagrees with column 0"
+    );
+}

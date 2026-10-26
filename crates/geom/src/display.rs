@@ -63,6 +63,10 @@ pub enum DisplayError {
     /// A value is too large for the encoding to store.
     #[error("a display tile's values are too large to encode")]
     TooLarge,
+    /// A codec decoded a vertex shared by two tiles of a level to different bits in each, the
+    /// second of them this tile: seams wouldn't be exact, and the bound would miss the gap.
+    #[error("display tile {0:?} decodes a shared vertex differently from its neighbour")]
+    Seam(TileKey),
     /// The level is the finest, or above it: it has no display tiles.
     #[error("level {0} has no display tiles under the finest level")]
     NoDisplayLevel(Level),
