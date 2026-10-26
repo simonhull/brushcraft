@@ -379,6 +379,43 @@ fn bounds_from_the_normals_wave_are_the_bounds_read_back() {
     }
 }
 
+/// After a refit, no bound the store keeps is stale: every tile whose normals read an edited
+/// one has the bounds the refit recorded for it, or none known, never its old ones.
+///
+/// The edit is inside one tile, and only that tile is refitted, so its neighbours, whose cones
+/// the edit may turn, must be left unknown.
+#[test]
+fn no_bound_is_stale_after_a_refit() {
+    let dir = TestDir::new();
+    let mesh = Arc::new(cube_sphere(2).unwrap());
+    let mut store = store_over(&dir, &mesh);
+    let mut index = SpatialIndex::build(&mut store, level(), |_, _| {}).unwrap();
+    store.begin_op().unwrap();
+    store
+        .set_correction(FaceId::new(3), level(), 7, 4, Vec3::new(0.0, 0.0, 0.3))
+        .unwrap();
+    let edited = TileKey::displacement(FaceId::new(3), level(), 0, 0).unwrap();
+    index.update(&mut store, &[edited]).unwrap();
+    let all: Vec<TileKey> = tiles_of(&mesh, level()).collect();
+    let stored = store.stored_bounds(&all).unwrap();
+    let readers = store.normal_inputs(&edited).unwrap().into_owned();
+    assert!(readers.len() > 1, "the edited tile has neighbours");
+    for (key, kept) in all.iter().zip(stored) {
+        let now = SpatialIndex::bounds_of(&mut store, *key).unwrap();
+        match kept {
+            Some(kept) => assert_eq!(kept.to_bits(), now.to_bits(), "{key:?}: current"),
+            None => assert!(readers.contains(key), "{key:?}: only a reader is unknown"),
+        }
+    }
+    let unknown = readers.iter().filter(|key| **key != edited);
+    for key in unknown {
+        assert!(
+            store.stored_bounds(&[*key]).unwrap()[0].is_none(),
+            "{key:?}: its cone may have turned, and it wasn't refitted"
+        );
+    }
+}
+
 #[test]
 fn update_refits_to_an_edit() {
     let mut fx = sphere();

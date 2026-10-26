@@ -284,6 +284,38 @@ impl Book {
         }
     }
 
+    /// [`Book::settle`], then [`Book::record`] of each of `bounds`, with the same result; a bound
+    /// the settle would make unknown and `bounds` records is set once, to its recorded value,
+    /// to be flushed (as `record` over an unknown left by the settle does).
+    ///
+    /// # Errors
+    ///
+    /// As [`Book::settle`]; nothing is recorded then.
+    pub(crate) fn settle_and_record(
+        &mut self,
+        mesh: &BaseMesh,
+        deps: &DepGraph,
+        bounds: &[(TileKey, TileBounds)],
+    ) -> Result<(), EvalError> {
+        let mut stale = if self.edited.is_empty() {
+            BTreeSet::new()
+        } else {
+            readers(mesh, deps, &self.edited, &self.levels)?
+        };
+        self.edited.clear();
+        for &(key, tile) in bounds {
+            if stale.remove(&key) {
+                self.set(key, Some(tile));
+            } else {
+                self.record(key, tile);
+            }
+        }
+        for key in stale {
+            self.set(key, None);
+        }
+        Ok(())
+    }
+
     /// Makes unknown every bound the writes noted since the last call can change (see
     /// [`readers`], which reads neighbours `deps` recorded).
     ///

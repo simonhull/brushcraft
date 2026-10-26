@@ -3218,11 +3218,9 @@ impl TileStore {
         &mut self,
         bounds: &[(TileKey, TileBounds)],
     ) -> Result<(), CacheError> {
-        self.bounds.settle(&self.mesh, &self.deps)?;
-        for &(key, tile) in bounds {
-            self.bounds.record(key, tile);
-        }
-        Ok(())
+        Ok(self
+            .bounds
+            .settle_and_record(&self.mesh, &self.deps, bounds)?)
     }
 
     /// The bounds the store keeps for each of `keys`, in order: `None` where none is known (none

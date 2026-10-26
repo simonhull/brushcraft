@@ -298,3 +298,70 @@ fn a_recorded_bound_is_flushed_only_over_an_edits_change() {
     book.saved(&all[1]);
     assert_eq!(book.unsaved().count(), 0, "both saved");
 }
+
+/// Settling and recording in one pass leaves the book as a settle followed by a record of each
+/// bound does: the same values, the same flush list and the same derived bounds.
+///
+/// The recorded bounds include tiles the settle makes unknown (recorded over them, to be
+/// flushed) and tiles it doesn't (derived); the stale tiles left unrecorded stay unknown.
+#[test]
+fn settling_while_recording_is_settling_then_recording() {
+    let mesh = mesh();
+    let all = tiles(&mesh, 8, 8);
+    let ready = || {
+        let mut book = Book::default();
+        for key in &all {
+            book.set(*key, Some(sample()));
+        }
+        for key in &all {
+            book.flushed(key);
+        }
+        book.note_write(all[9]);
+        book.note_write(all[40]);
+        book
+    };
+    let stale = readers(
+        &mesh,
+        &DepGraph::new(),
+        &BTreeSet::from([all[9], all[40]]),
+        &BTreeSet::from([level(8)]),
+    )
+    .unwrap();
+    let fresh = TileBounds {
+        aabb: Aabb::new(Vec3::new(1.0, 1.0, 1.0), Vec3::new(2.0, 2.0, 2.0)).unwrap(),
+        ..sample()
+    };
+    let recorded: Vec<(TileKey, TileBounds)> = stale
+        .iter()
+        .take(stale.len() / 2)
+        .chain(all.iter().filter(|key| !stale.contains(key)).take(5))
+        .map(|&key| (key, fresh))
+        .collect();
+    assert!(recorded.len() > 5, "some of each");
+
+    let mut apart = ready();
+    apart.settle(&mesh, &DepGraph::new()).unwrap();
+    for &(key, bounds) in &recorded {
+        apart.record(key, bounds);
+    }
+    let mut together = ready();
+    together
+        .settle_and_record(&mesh, &DepGraph::new(), &recorded)
+        .unwrap();
+
+    let contents = |book: &Book| {
+        let bits = |kept: Option<&TileBounds>| kept.map(|b| b.to_bits());
+        let changed: Vec<_> = book.all_changed().map(|(k, b)| (*k, bits(b))).collect();
+        let unflushed: Vec<_> = book.unflushed().map(|(k, b)| (*k, bits(b))).collect();
+        let unsaved: Vec<_> = book.unsaved().map(|(k, b)| (*k, bits(b))).collect();
+        (changed, unflushed, unsaved, book.has_unsettled())
+    };
+    assert_eq!(contents(&together), contents(&apart), "the same book");
+    for key in stale.iter().skip(stale.len() / 2) {
+        assert_eq!(
+            together.changed(key),
+            Some(Kept::Unknown),
+            "{key:?} stays unknown"
+        );
+    }
+}
