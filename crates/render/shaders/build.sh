@@ -33,12 +33,20 @@ for crate in brush-gpu eval-gpu; do
     --deny-warnings \
     --multimodule \
     --output-dir "$crate/target/spirv-out"
+done
+# Every crate built: replace the checked-in modules, dropping any no entry point produces now.
+rm -f ../src/spike/*.spv
+for crate in brush-gpu eval-gpu; do
   for module in "$crate"/target/spirv-out/*.spv; do
     spv=${crate//-/_}_$(basename "$module")
     cp "$module" "../src/spike/$spv"
     echo "updated crates/render/src/spike/$spv"
   done
 done
-# The stamp check.sh compares, so a stale SPIR-V can't go unnoticed.
-./sources.sh > ../src/spike/spirv.sources
+# The stamp check.sh compares: what the modules were built from, then the modules themselves,
+# so neither a stale module nor a module changed by hand goes unnoticed.
+{
+  ./sources.sh
+  (cd ../src/spike && sha256sum -- *.spv)
+} > ../src/spike/spirv.sources
 echo "updated crates/render/src/spike/spirv.sources"

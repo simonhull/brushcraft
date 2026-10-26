@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Prints the stamp of what the checked-in SPIR-V is built from: the rust-gpu version and a hash
-# of every source the shader builds read (brush's sources and manifest; each shader crate's
-# sources, manifest and lockfile). build.sh writes it beside the SPIR-V
-# (crates/render/src/spike/spirv.sources); check.sh recomputes it.
-# Usage: crates/render/shaders/sources.sh
+# of every tracked file the shader builds read. build.sh writes it to
+# crates/render/src/spike/spirv.sources, followed by the SPIR-V files' own hashes; check.sh
+# recomputes both. Usage: crates/render/shaders/sources.sh
+#
+# The files: brush's sources and manifest, the root manifest (brush inherits its edition,
+# rust-version and lints from it), build.sh and bin/cargo (the build's flags), and each shader
+# crate's sources, manifest and lockfile. Only files git tracks count, so a stray local file can't
+# make the stamp differ between machines.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 
@@ -16,13 +20,15 @@ if [[ $(wc -l <<<"$versions") -ne 1 || -z $versions ]]; then
   exit 1
 fi
 echo "rust-gpu $versions"
-# Paths relative to the repository and sorted bytewise, so the hash is the same on every machine.
-{
-  find crates/brush/src -type f
-  echo crates/brush/Cargo.toml
-  for crate in "${shaders[@]}"; do
-    find "crates/render/shaders/$crate/src" -type f
-    echo "crates/render/shaders/$crate/Cargo.toml"
-    echo "crates/render/shaders/$crate/Cargo.lock"
-  done
-} | LC_ALL=C sort | xargs sha256sum | sha256sum | sed 's/ .*//; s/^/sources /'
+paths=(
+  Cargo.toml
+  crates/brush/Cargo.toml
+  crates/brush/src
+  crates/render/shaders/build.sh
+  crates/render/shaders/bin/cargo
+)
+for crate in "${shaders[@]}"; do
+  paths+=("crates/render/shaders/$crate/src" "crates/render/shaders/$crate/Cargo.toml" "crates/render/shaders/$crate/Cargo.lock")
+done
+# Sorted bytewise and relative to the repository, so the hash is the same on every machine.
+git ls-files -z -- "${paths[@]}" | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | sed 's/ .*//; s/^/sources /'
