@@ -72,6 +72,7 @@ impl Grid {
     /// The `len` positions of row `j` from column `i`, or `None` if a non-empty run leaves the
     /// block. An empty run is `Some`, wherever it starts, as [`PositionSource::row`]'s default
     /// gives.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn row(&self, i: u32, j: u32, len: usize) -> Option<&[Vec3]> {
         if len == 0 {
             return Some(&[]);
