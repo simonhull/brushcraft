@@ -7,14 +7,13 @@
 //! - [`Shader::Wgsl`]: `draw.wgsl`, a hand-written twin of `brush::draw_vertex` with the
 //!   [`Smoothstep`] falloff, operation for operation;
 //! - [`Shader::RustGpu`]: `brush::draw_vertex` itself, compiled to SPIR-V by rust-gpu from the
-//!   unchanged `brush` source (see `shaders/brush-gpu`), to be loaded through `naga`'s SPIR-V front
-//!   end, so the same module would run on Vulkan and on Metal.
+//!   `brush` source (see `shaders/brush-gpu`), loaded through `naga`'s SPIR-V front end, so the
+//!   same module runs on Vulkan and on Metal.
 //!
-//! The finding so far: rust-gpu compiles `brush` unchanged (its build has to skip cargo's
-//! rust-version check, as its nightly is older than the workspace's), and the SPIR-V validates,
-//! but `naga` rejects it: `brush`'s square root tests `f32::is_finite`, which `core` writes as a
-//! comparison with an infinite constant, and `naga` refuses infinite literals. A test pins that
-//! rejection, so it is noticed when it changes.
+//! rust-gpu compiles `brush` as it is, given two accommodations: its build skips cargo's
+//! rust-version check (rust-gpu's nightly is older than the workspace's), and `brush`'s square
+//! root tests finiteness on the exponent bits, because `naga` rejects the infinite constant that
+//! `f32::is_finite` compiles to. On lavapipe both shaders match the CPU bit for bit.
 //!
 //! A [`Footprint`] holds the buffers for one set of positions, so a benchmark can time the
 //! upload, the dispatch and the readback separately, as a brush step would pay them.
@@ -26,7 +25,6 @@ use std::time::Duration;
 use brush::{Smoothstep, draw};
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
-use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, Buffer, BufferDescriptor, BufferUsages,
     CommandEncoderDescriptor, ComputePassDescriptor, ComputePassTimestampWrites, ComputePipeline,
@@ -42,8 +40,10 @@ mod tests;
 /// The WGSL twin of `brush::draw_vertex`.
 const WGSL: &str = include_str!("draw.wgsl");
 
-/// The SPIR-V rust-gpu compiled from `shaders/brush-gpu`, which calls `brush::draw_vertex`
-/// unchanged. Rebuilt by `shaders/build.sh`; checked in so the gate needs no rust-gpu toolchain.
+/// The SPIR-V rust-gpu compiled from `shaders/brush-gpu`, which calls `brush::draw_vertex`.
+///
+/// Rebuilt by `shaders/build.sh`; checked in so the gate needs no rust-gpu toolchain,
+/// with a stamp of its sources (`brush_gpu.spv.sources`) the gate checks.
 const SPIRV: &[u8] = include_bytes!("brush_gpu.spv");
 
 // SPIR-V is a stream of 32-bit words; `make_spirv_raw` would panic on a partial one.
@@ -60,8 +60,7 @@ const WORKGROUP: u32 = 64;
 pub enum Shader {
     /// `draw.wgsl`, the hand-written twin of `brush::draw_vertex`.
     Wgsl,
-    /// `brush::draw_vertex` itself, compiled to SPIR-V by rust-gpu. `naga` rejects it for now
-    /// (see the module docs), so [`GpuDraw::new`] fails with it.
+    /// `brush::draw_vertex` itself, compiled to SPIR-V by rust-gpu.
     RustGpu,
 }
 
@@ -93,7 +92,8 @@ pub enum DrawError {
     /// covering nothing, so it never reaches the GPU.
     #[error("the brush radius {0} isn't positive and finite")]
     Radius(f32),
-    /// More vertices than one dispatch along one dimension covers on this device.
+    /// More vertices than one dispatch along one dimension covers on this device, or than one
+    /// storage binding holds.
     #[error("{count} vertices is more than one dispatch covers here ({max})")]
     TooManyVertices {
         /// The vertices asked for.
@@ -174,6 +174,12 @@ impl Difference {
         self.max_strength_ulps
     }
 
+    /// Vertices whose values differ at all (`-0` and `0` count as the same).
+    #[must_use]
+    pub const fn differing(&self) -> usize {
+        self.differing
+    }
+
     /// Vertices compared.
     #[must_use]
     pub const fn compared(&self) -> usize {
@@ -213,8 +219,7 @@ fn ordered(x: f32) -> i64 {
 ///
 /// # Errors
 ///
-/// [`DrawError::TooManyVertices`] if one dispatch can't cover `positions`; [`DrawError::Gpu`]
-/// if the GPU fails.
+/// As [`GpuDraw::footprint`], [`Footprint::dispatch`] and [`Footprint::read_deltas`].
 pub fn against_cpu(
     gpu: &Gpu,
     draw: &GpuDraw,
@@ -224,7 +229,7 @@ pub fn against_cpu(
     let footprint = draw.footprint(gpu, positions)?;
     let mut difference = Difference::default();
     for brush in brushes {
-        footprint.dispatch(gpu, draw, brush);
+        footprint.dispatch(gpu, brush)?;
         difference.add(&footprint.read_deltas(gpu)?, &brush.cpu(positions), brush);
     }
     Ok(difference)
@@ -323,7 +328,8 @@ impl GpuDraw {
     ///
     /// # Errors
     ///
-    /// [`GpuError::Validation`] if `wgpu` rejects the shader.
+    /// [`GpuError::Validation`] if `wgpu` rejects the shader, [`GpuError::Internal`] if the
+    /// backend's compiler does; as [`Gpu::scoped`] otherwise.
     pub fn new(gpu: &Gpu, shader: Shader) -> Result<Self, GpuError> {
         let label = match shader {
             Shader::Wgsl => "draw brush (WGSL)",
@@ -344,8 +350,7 @@ impl GpuDraw {
     ///
     /// # Errors
     ///
-    /// [`DrawError::TooManyVertices`] if one dispatch can't cover `positions`; [`DrawError::Gpu`]
-    /// if the GPU fails.
+    /// As [`GpuDraw::footprint`], [`Footprint::dispatch`] and [`Footprint::read_deltas`].
     pub fn draw(
         &self,
         gpu: &Gpu,
@@ -353,92 +358,105 @@ impl GpuDraw {
         positions: &[[f32; 3]],
     ) -> Result<Vec<f32>, DrawError> {
         let footprint = self.footprint(gpu, positions)?;
-        footprint.dispatch(gpu, self, brush);
+        footprint.dispatch(gpu, brush)?;
         Ok(footprint.read_deltas(gpu)?)
     }
 
-    /// Buffers for `positions` on the GPU, with the pipeline bound to them.
+    /// Buffers for `positions` on the GPU, with this pipeline bound to them.
     ///
     /// # Errors
     ///
-    /// [`DrawError::TooManyVertices`] if one dispatch can't cover `positions`.
+    /// [`DrawError::TooManyVertices`] if one dispatch can't cover `positions`, or their buffer
+    /// is larger than one storage binding may be on this device; [`DrawError::Gpu`] if creating
+    /// the buffers fails.
     pub fn footprint(&self, gpu: &Gpu, positions: &[[f32; 3]]) -> Result<Footprint, DrawError> {
-        let too_many = || DrawError::TooManyVertices {
-            count: positions.len(),
-            max: u64::from(gpu.device().limits().max_compute_workgroups_per_dimension)
-                * u64::from(WORKGROUP),
-        };
-        let max_workgroups = gpu.device().limits().max_compute_workgroups_per_dimension;
+        let limits = gpu.device().limits();
+        let max = (u64::from(limits.max_compute_workgroups_per_dimension) * u64::from(WORKGROUP))
+            .min(limits.max_storage_buffer_binding_size / size_of::<[f32; 3]>() as u64);
         let count = u32::try_from(positions.len())
             .ok()
-            .filter(|count| count.div_ceil(WORKGROUP) <= max_workgroups)
-            .ok_or_else(too_many)?;
-        let device = gpu.device();
-        let params = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("draw params"),
-            contents: bytemuck::bytes_of(&Params::zeroed()),
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        });
+            .filter(|&count| u64::from(count) <= max)
+            .ok_or(DrawError::TooManyVertices {
+                count: positions.len(),
+                max,
+            })?;
         // A zero-sized binding is invalid, so an empty footprint still gets one element.
-        let floats = positions.len().max(1);
-        let positions_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("draw positions"),
-            size: (floats * size_of::<[f32; 3]>()) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        gpu.queue()
-            .write_buffer(&positions_buffer, 0, bytemuck::cast_slice(positions));
-        let deltas_size = (floats * size_of::<f32>()) as u64;
-        let deltas = device.create_buffer(&BufferDescriptor {
-            label: Some("draw deltas"),
-            size: deltas_size,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging = device.create_buffer(&BufferDescriptor {
-            label: Some("draw deltas readback"),
-            size: deltas_size,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("draw"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: params.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: positions_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: deltas.as_entire_binding(),
-                },
-            ],
-        });
-        Ok(Footprint {
-            count,
-            params,
-            positions: positions_buffer,
-            deltas,
-            staging,
-            bind_group,
-            timer: gpu.timestamp_period().map(|period| Timer::new(gpu, period)),
-        })
+        let floats = positions.len().max(1) as u64;
+        let buffer = |label, size, usage| {
+            gpu.device().create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        Ok(gpu.scoped("draw footprint", || {
+            let params = buffer(
+                "draw params",
+                size_of::<Params>() as u64,
+                BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            );
+            let positions_buffer = buffer(
+                "draw positions",
+                floats * size_of::<[f32; 3]>() as u64,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            );
+            gpu.queue()
+                .write_buffer(&positions_buffer, 0, bytemuck::cast_slice(positions));
+            let deltas_size = floats * size_of::<f32>() as u64;
+            let deltas = buffer(
+                "draw deltas",
+                deltas_size,
+                BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            );
+            let staging = buffer(
+                "draw deltas readback",
+                deltas_size,
+                BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            );
+            let bind_group = gpu.device().create_bind_group(&BindGroupDescriptor {
+                label: Some("draw"),
+                layout: &self.pipeline.get_bind_group_layout(0),
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: params.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: positions_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: deltas.as_entire_binding(),
+                    },
+                ],
+            });
+            Footprint {
+                count,
+                pipeline: self.pipeline.clone(),
+                params,
+                positions: positions_buffer,
+                deltas,
+                staging,
+                bind_group,
+                timer: gpu.timestamp_period().map(|period| Timer::new(gpu, period)),
+            }
+        })?)
     }
 }
 
-/// One set of positions on the GPU, with the buffers a draw dispatch reads and writes.
+/// One set of positions on the GPU, with the buffers a draw dispatch reads and writes and the
+/// pipeline that dispatches over them.
 ///
-/// Made by [`GpuDraw::footprint`]; it stays bound to that pipeline's layout.
+/// Made by [`GpuDraw::footprint`]. It keeps that pipeline (a shared handle), so it can only be
+/// dispatched through the pipeline its bindings were made for.
 #[derive(Debug)]
 pub struct Footprint {
     /// The vertices it holds.
     count: u32,
+    /// The pipeline the bind group was made for.
+    pipeline: ComputePipeline,
     /// The uniform block: the brush.
     params: Buffer,
     /// The positions, three floats each, tightly packed.
@@ -456,35 +474,44 @@ pub struct Footprint {
 impl Footprint {
     /// Writes new `positions` into the footprint's buffer: the per-step upload. Only as many as
     /// the footprint holds are written.
-    pub fn upload(&self, gpu: &Gpu, positions: &[[f32; 3]]) {
-        let count = positions.len().min(self.count as usize);
-        let positions = positions.get(..count).unwrap_or_default();
-        gpu.queue()
-            .write_buffer(&self.positions, 0, bytemuck::cast_slice(positions));
-    }
-
-    /// Dispatches `draw` with `brush` over the footprint and submits it, without waiting.
-    pub fn dispatch(&self, gpu: &Gpu, draw: &GpuDraw, brush: &DrawBrush) {
-        self.submit(gpu, draw, brush, None);
-    }
-
-    /// Dispatches `draw` with `brush`, waits for it, and returns how long the compute pass took
-    /// on the GPU, from timestamp queries; `None` if the device has none.
     ///
     /// # Errors
     ///
-    /// [`GpuError`] if waiting or reading the timestamps fails.
+    /// As [`Gpu::scoped`].
+    pub fn upload(&self, gpu: &Gpu, positions: &[[f32; 3]]) -> Result<(), GpuError> {
+        let count = positions.len().min(self.count as usize);
+        let positions = positions.get(..count).unwrap_or_default();
+        gpu.scoped("draw upload", || {
+            gpu.queue()
+                .write_buffer(&self.positions, 0, bytemuck::cast_slice(positions));
+        })
+    }
+
+    /// Dispatches `brush` over the footprint and submits it, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::scoped`].
+    pub fn dispatch(&self, gpu: &Gpu, brush: &DrawBrush) -> Result<(), GpuError> {
+        self.submit(gpu, brush, None)
+    }
+
+    /// Dispatches `brush`, waits for it, and returns how long the compute pass took on the GPU,
+    /// from timestamp queries; `None` if the device has none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::scoped`] and [`Gpu::read_buffer`].
     pub fn time_dispatch(
         &self,
         gpu: &Gpu,
-        draw: &GpuDraw,
         brush: &DrawBrush,
     ) -> Result<Option<Duration>, GpuError> {
         let Some(timer) = &self.timer else {
-            self.dispatch(gpu, draw, brush);
+            self.dispatch(gpu, brush)?;
             return Ok(None);
         };
-        self.submit(gpu, draw, brush, Some(timer));
+        self.submit(gpu, brush, Some(timer))?;
         let ticks: Vec<u64> = gpu.read_buffer_with(&timer.resolved, &timer.staging)?;
         let elapsed = match ticks.as_slice() {
             [begin, end] => end.saturating_sub(*begin),
@@ -504,41 +531,47 @@ impl Footprint {
     ///
     /// # Errors
     ///
-    /// [`GpuError`] if waiting or mapping fails.
+    /// As [`Gpu::read_buffer`].
     pub fn read_deltas(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
         let mut deltas: Vec<f32> = gpu.read_buffer_with(&self.deltas, &self.staging)?;
         deltas.truncate(self.count as usize);
         Ok(deltas)
     }
 
-    /// Records `brush` into the uniform block and one compute pass of `draw` over the
-    /// footprint, timed by `timer` if given, and submits it.
-    fn submit(&self, gpu: &Gpu, draw: &GpuDraw, brush: &DrawBrush, timer: Option<&Timer>) {
-        gpu.queue().write_buffer(
-            &self.params,
-            0,
-            bytemuck::bytes_of(&brush.params(self.count)),
-        );
-        let mut encoder = gpu
-            .device()
-            .create_command_encoder(&CommandEncoderDescriptor::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("draw"),
-                timestamp_writes: timer.map(|timer| ComputePassTimestampWrites {
-                    query_set: &timer.queries,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: Some(1),
-                }),
-            });
-            pass.set_pipeline(&draw.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(self.count.div_ceil(WORKGROUP), 1, 1);
-        }
-        if let Some(timer) = timer {
-            encoder.resolve_query_set(&timer.queries, 0..2, &timer.resolved, 0);
-        }
-        gpu.queue().submit([encoder.finish()]);
+    /// Records `brush` into the uniform block and one compute pass over the footprint, timed
+    /// by `timer` if given, and submits it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::scoped`].
+    fn submit(&self, gpu: &Gpu, brush: &DrawBrush, timer: Option<&Timer>) -> Result<(), GpuError> {
+        gpu.scoped("draw dispatch", || {
+            gpu.queue().write_buffer(
+                &self.params,
+                0,
+                bytemuck::bytes_of(&brush.params(self.count)),
+            );
+            let mut encoder = gpu
+                .device()
+                .create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("draw"),
+                    timestamp_writes: timer.map(|timer| ComputePassTimestampWrites {
+                        query_set: &timer.queries,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }),
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.dispatch_workgroups(self.count.div_ceil(WORKGROUP), 1, 1);
+            }
+            if let Some(timer) = timer {
+                encoder.resolve_query_set(&timer.queries, 0..2, &timer.resolved, 0);
+            }
+            gpu.queue().submit([encoder.finish()]);
+        })
     }
 }
 
@@ -556,7 +589,8 @@ struct Timer {
 }
 
 impl Timer {
-    /// A timer on `gpu`, whose timestamps tick every `period` nanoseconds.
+    /// A timer on `gpu`, whose timestamps tick every `period` nanoseconds. Created inside the
+    /// caller's error scope.
     fn new(gpu: &Gpu, period: f32) -> Self {
         let device = gpu.device();
         let size = 2 * QUERY_SIZE;

@@ -11,11 +11,12 @@ use brush::{Smoothstep, draw_vertex};
 use spirv_std::glam::{UVec3, Vec3};
 use spirv_std::spirv;
 
-/// The brush, the same for every vertex of a dispatch: the uniform block at binding 0, laid out
-/// as `Params` in `draw.wgsl` and on the host (32 bytes; `center` is a vec3 aligned to 16, and
-/// `radius` fills its fourth lane).
+/// The brush, the same for every vertex of a dispatch: the uniform block at binding 0.
+///
+/// Laid out as `Params` in `draw.wgsl` and on the host: 32 bytes, `center` a vec3 aligned to 16,
+/// and `radius` in its fourth lane.
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct Params {
     /// The brush centre.
     pub center: Vec3,
@@ -32,7 +33,7 @@ pub struct Params {
 }
 
 /// One invocation per vertex: reads its position, writes `brush::draw_vertex`'s delta for it,
-/// or 0 outside the brush.
+/// or 0 outside the brush. Invocations past `count` or the buffers' ends do nothing.
 ///
 /// Bindings: 0, the [`Params`] uniform block; 1, the positions, three floats each, tightly
 /// packed; 2, the deltas, one per vertex.
@@ -44,20 +45,26 @@ pub fn main(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] deltas: &mut [f32],
 ) {
     let k = id.x as usize;
-    if k >= params.count as usize {
+    // The last workgroup runs past `count`, and an empty footprint still binds one element: an
+    // invocation without a vertex of its own, or outside the buffers, writes nothing.
+    if k >= params.count as usize || k >= positions.len() || k >= deltas.len() {
         return;
     }
     let Vec3 { x, y, z } = params.center;
-    let delta = draw_vertex(
-        &Smoothstep,
-        [x, y, z],
-        params.radius,
-        params.radius_squared,
-        params.strength,
-        positions[k],
-    );
-    deltas[k] = match delta {
-        Some(delta) => delta,
-        None => 0.0,
-    };
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "rust-gpu can't compile `slice::get` (an `Option<&T>` needs a pointer-to-integer \
+                  cast, which SPIR-V lacks); `k` is checked against both lengths just above"
+    )]
+    {
+        deltas[k] = draw_vertex(
+            &Smoothstep,
+            [x, y, z],
+            params.radius,
+            params.radius_squared,
+            params.strength,
+            positions[k],
+        )
+        .unwrap_or(0.0);
+    }
 }

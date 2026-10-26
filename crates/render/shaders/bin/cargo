@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# cargo, for ../build.sh only: adds --ignore-rust-version to `cargo rustc`, the command
-# spirv-builder compiles the shader crate with, so rust-gpu's nightly (rustc 1.98) builds `brush`
-# despite its rust-version (1.99). Every other cargo command passes through unchanged.
+# cargo, for ../build.sh only: adds --ignore-rust-version when the subcommand is one that
+# spirv-builder compiles the shader crate with (rustc, clippy, check, build), so rust-gpu's
+# nightly (rustc 1.98) builds `brush` despite its rust-version (1.99). Every other cargo command,
+# `cargo gpu` itself included, passes through unchanged.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # The next cargo on PATH after this one: rustup's proxy, which honours the +toolchain argument.
 real=$(PATH=${PATH//"$here:"/} command -v cargo)
-args=()
-for arg in "$@"; do
-  args+=("$arg")
-  if [[ $arg == rustc && ${#args[@]} -le 2 ]]; then
-    args+=(--ignore-rust-version)
-  fi
-done
+args=("$@")
+# The subcommand is the first argument, or the second after a +toolchain.
+at=0
+if [[ ${args[0]:-} == +* ]]; then
+  at=1
+fi
+if [[ ${args[$at]:-} =~ ^(rustc|clippy|check|build)$ ]]; then
+  args=("${args[@]:0:$((at + 1))}" --ignore-rust-version "${args[@]:$((at + 1))}")
+fi
 exec "$real" "${args[@]}"

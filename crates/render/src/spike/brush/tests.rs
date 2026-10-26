@@ -1,4 +1,4 @@
-//! The GPU draw shaders against `brush::draw` on the CPU, on lavapipe.
+//! Both GPU draw shaders against `brush::draw` on the CPU, on lavapipe.
 //!
 //! The differences are measured and printed (`cargo nextest run -p render --features spike
 //! --no-capture spike::brush`) for the spike report; the assertions bound them loosely, so a
@@ -99,70 +99,89 @@ fn a_radius_that_is_not_positive_and_finite_is_rejected() {
     }
 }
 
-#[test]
-fn the_wgsl_shader_matches_the_cpu_on_random_brushes() {
-    GpuTest::run(|gpu| {
-        let difference = compare(gpu, Shader::Wgsl);
-        println!("WGSL on {}: {difference}", gpu.adapter_info().name);
+/// Asserts `difference` is what this adapter allows: bit-identical on a software adapter
+/// (lavapipe, where the gate runs; measured), within rounding of the strength on any other.
+fn assert_matches_cpu(gpu: &Gpu, shader: Shader, difference: &Difference) {
+    if gpu.adapter_info().device_type == wgpu::DeviceType::Cpu {
         assert_eq!(
-            difference.compared(),
-            POSITIONS * BRUSHES,
-            "every vertex of every brush"
+            difference.differing(),
+            0,
+            "{shader:?} matches the CPU bit for bit on a software adapter: {difference}"
         );
+    } else {
         // Strengths are below 1, so this is a relative bound too: rounding, not a different
         // computation.
         assert!(
             difference.max_abs() < 1e-5,
-            "the shader follows the CPU: {difference}"
+            "{shader:?} follows the CPU: {difference}"
         );
+    }
+}
+
+#[test]
+fn both_shaders_match_the_cpu_on_random_brushes() {
+    GpuTest::run(|gpu| {
+        for shader in Shader::ALL {
+            let difference = compare(gpu, shader);
+            println!("{shader:?} on {}: {difference}", gpu.adapter_info().name);
+            assert_eq!(
+                difference.compared(),
+                POSITIONS * BRUSHES,
+                "every vertex of every brush"
+            );
+            assert_matches_cpu(gpu, shader, &difference);
+        }
     });
 }
 
 #[test]
-fn the_rust_gpu_shader_is_rejected_by_naga_for_an_infinite_constant() {
-    // `brush`'s `sqrt` tests `x.is_finite()`, which `core` writes as `x.abs() < f32::INFINITY`;
-    // rust-gpu keeps the infinity as a SPIR-V constant, valid SPIR-V (spirv-val accepts it), but
-    // naga's SPIR-V front end, the only safe way into wgpu and the only way onto Metal, refuses
-    // infinite literals. When this test fails, rust-gpu's output loads: compare
-    // `Shader::RustGpu` against the CPU too.
+fn the_two_shaders_agree_with_each_other_bit_for_bit() {
     GpuTest::run(|gpu| {
-        let error = GpuDraw::new(gpu, Shader::RustGpu).expect_err("naga rejects the module");
-        let message = error.to_string();
-        assert!(
-            message.contains("Float literal is infinite"),
-            "for the infinite constant: {message}"
-        );
+        let mut rng = Rng(0xD1FF);
+        let points = positions(&mut rng, 10_000);
+        let brush = random_brush(&mut rng);
+        let [wgsl, rust_gpu] = Shader::ALL.map(|shader| {
+            GpuDraw::new(gpu, shader)
+                .expect("the shader builds")
+                .draw(gpu, &brush, &points)
+                .expect("the draw")
+        });
+        let mut difference = Difference::default();
+        difference.add(&rust_gpu, &wgsl, &brush);
+        assert_eq!(difference.differing(), 0, "{difference}");
     });
 }
 
 #[test]
 fn full_strength_at_the_centre_and_nothing_from_the_rim_on() {
     GpuTest::run(|gpu| {
-        let draw = GpuDraw::new(gpu, Shader::Wgsl).expect("the shader builds");
-        let brush = DrawBrush::new([0.0; 3], 3.0, 0.25).expect("a valid radius");
-        let points = [
-            [0.0, 0.0, 0.0],
-            [3.0, 0.0, 0.0],
-            [0.0, -3.0, 0.0],
-            [0.0, 0.0, 3.0],
-            [3.5, 0.0, 0.0],
-            [2.999, 0.0, 0.0],
-        ];
-        let deltas = draw.draw(gpu, &brush, &points).expect("the draw");
-        assert_eq!(
-            deltas.first().map(|d| d.to_bits()),
-            Some(0.25_f32.to_bits()),
-            "weight(0) = 1, so the full strength at the centre: {deltas:?}"
-        );
-        assert_eq!(
-            deltas.get(1..5),
-            Some([0.0; 4].as_slice()),
-            "weight(1) = 0, so nothing on the rim or past it: {deltas:?}"
-        );
-        assert!(
-            deltas.get(5).is_some_and(|&d| d > 0.0 && d < 1e-6),
-            "just inside the rim, a little: {deltas:?}"
-        );
+        for shader in Shader::ALL {
+            let draw = GpuDraw::new(gpu, shader).expect("the shader builds");
+            let brush = DrawBrush::new([0.0; 3], 3.0, 0.25).expect("a valid radius");
+            let points = [
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [0.0, -3.0, 0.0],
+                [0.0, 0.0, 3.0],
+                [3.5, 0.0, 0.0],
+                [2.999, 0.0, 0.0],
+            ];
+            let deltas = draw.draw(gpu, &brush, &points).expect("the draw");
+            assert_eq!(
+                deltas.first().map(|d| d.to_bits()),
+                Some(0.25_f32.to_bits()),
+                "{shader:?}: weight(0) = 1, so the full strength at the centre: {deltas:?}"
+            );
+            assert_eq!(
+                deltas.get(1..5),
+                Some([0.0; 4].as_slice()),
+                "{shader:?}: weight(1) = 0, so nothing on the rim or past it: {deltas:?}"
+            );
+            assert!(
+                deltas.get(5).is_some_and(|&d| d > 0.0 && d < 1e-6),
+                "{shader:?}: just inside the rim, a little: {deltas:?}"
+            );
+        }
     });
 }
 
@@ -213,16 +232,13 @@ fn a_footprint_takes_new_positions_between_dispatches() {
         let second = positions(&mut rng, 1000);
         let brush = DrawBrush::new([0.1, 0.2, 0.3], 0.8, 0.5).expect("a valid radius");
         let footprint = draw.footprint(gpu, &first).expect("1000 vertices fit");
-        footprint.upload(gpu, &second);
-        footprint.dispatch(gpu, &draw, &brush);
+        footprint.upload(gpu, &second).expect("the upload");
+        footprint.dispatch(gpu, &brush).expect("the dispatch");
         let deltas = footprint.read_deltas(gpu).expect("the readback");
         let expected = brush.cpu(&second);
         let mut difference = Difference::default();
         difference.add(&deltas, &expected, &brush);
-        assert!(
-            difference.max_abs() < 1e-5,
-            "the second positions were drawn: {difference}"
-        );
+        assert_matches_cpu(gpu, Shader::Wgsl, &difference);
         assert_ne!(
             brush.cpu(&first),
             expected,
@@ -252,9 +268,7 @@ fn a_dispatch_is_timed_where_the_device_has_timestamps() {
         let points = positions(&mut rng, POSITIONS);
         let brush = random_brush(&mut rng);
         let footprint = draw.footprint(gpu, &points).expect("50k vertices fit");
-        let timed = footprint
-            .time_dispatch(gpu, &draw, &brush)
-            .expect("the timing");
+        let timed = footprint.time_dispatch(gpu, &brush).expect("the timing");
         assert_eq!(
             timed.is_some(),
             gpu.timestamp_period().is_some(),
@@ -263,10 +277,7 @@ fn a_dispatch_is_timed_where_the_device_has_timestamps() {
         let deltas = footprint.read_deltas(gpu).expect("the readback");
         let mut difference = Difference::default();
         difference.add(&deltas, &brush.cpu(&points), &brush);
-        assert!(
-            difference.max_abs() < 1e-5,
-            "and the timed dispatch drew: {difference}"
-        );
+        assert_matches_cpu(gpu, Shader::Wgsl, &difference);
     });
 }
 
@@ -274,8 +285,11 @@ fn a_dispatch_is_timed_where_the_device_has_timestamps() {
 fn more_vertices_than_one_dispatch_covers_is_an_error() {
     GpuTest::run(|gpu| {
         let draw = GpuDraw::new(gpu, Shader::Wgsl).expect("the shader builds");
-        let max = gpu.device().limits().max_compute_workgroups_per_dimension as usize
-            * WORKGROUP as usize;
+        let limits = gpu.device().limits();
+        let max = (limits.max_compute_workgroups_per_dimension as usize * WORKGROUP as usize).min(
+            usize::try_from(limits.max_storage_buffer_binding_size).expect("fits")
+                / size_of::<[f32; 3]>(),
+        );
         let points = vec![[0.0; 3]; max + 1];
         assert!(
             matches!(

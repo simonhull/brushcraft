@@ -29,6 +29,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: test -n "$RUSTFMT" && test -n "$BRUSHCRAFT_NIGHTLY" && "$RUSTFMT" --version
       - run: cargo fmt --all --check
+      # The rust-gpu shader crate (its own workspace): SPIR-V current, lints, fmt, clippy, deny.
+      - run: crates/render/shaders/check.sh
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo clippy --workspace --all-targets -- -D warnings
 

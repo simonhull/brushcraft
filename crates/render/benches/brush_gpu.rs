@@ -70,10 +70,10 @@ fn report_dispatch_times(gpu: &Gpu) -> Result<(), Box<dyn std::error::Error>> {
             brushes.len()
         )?;
         let footprint = draw.footprint(gpu, &positions)?;
-        footprint.time_dispatch(gpu, &draw, &brush)?;
+        footprint.time_dispatch(gpu, &brush)?;
         let mut times = Vec::with_capacity(TIMED_RUNS);
         for _ in 0..TIMED_RUNS {
-            match footprint.time_dispatch(gpu, &draw, &brush)? {
+            match footprint.time_dispatch(gpu, &brush)? {
                 Some(time) => times.push(time),
                 None => break,
             }
@@ -164,9 +164,10 @@ fn gpu_upload_dispatch_readback(bencher: divan::Bencher<'_, '_>, shader: Shader)
     bencher
         .counter(divan::counter::ItemsCount::new(positions.len()))
         .bench_local(|| {
-            footprint.upload(gpu, &positions);
-            footprint.dispatch(gpu, &draw, &brush);
-            footprint.read_deltas(gpu)
+            footprint
+                .upload(gpu, &positions)
+                .and_then(|()| footprint.dispatch(gpu, &brush))
+                .and_then(|()| footprint.read_deltas(gpu))
         });
 }
 
@@ -184,7 +185,8 @@ fn gpu_dispatch_and_wait(bencher: divan::Bencher<'_, '_>, shader: Shader) {
     bencher
         .counter(divan::counter::ItemsCount::new(positions.len()))
         .bench_local(|| {
-            footprint.dispatch(gpu, &draw, &brush);
-            gpu.device().poll(PollType::wait_indefinitely())
+            footprint
+                .dispatch(gpu, &brush)
+                .map(|()| gpu.device().poll(PollType::wait_indefinitely()))
         });
 }

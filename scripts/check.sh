@@ -12,9 +12,14 @@ fi
 # machine's own GPU. It is required, never skipped (lavapipe.sh says how to install it).
 VK_ICD_FILENAMES=$(scripts/lavapipe.sh)
 export VK_ICD_FILENAMES VK_DRIVER_FILES=$VK_ICD_FILENAMES
+# Both would add drivers back, or filter the list: neither may.
+unset VK_ADD_DRIVER_FILES VK_LOADER_DRIVERS_SELECT
 
 cargo fmt --all --check
 scripts/headless.sh
+# The rust-gpu shader crate, a workspace of its own: its SPIR-V is current, its lints are ours,
+# fmt, clippy (host target) and deny.
+crates/render/shaders/check.sh
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace --all-features --no-tests=warn

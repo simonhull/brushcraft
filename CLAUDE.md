@@ -27,6 +27,8 @@ if they disagree, raise it rather than drifting silently.
 - `cargo nextest run`: tests. `cargo test --doc`: doctests.
 - GPU tests (`render`) run on lavapipe, software Vulkan, through `GpuTest`; `check.sh` requires it (`sudo pacman -S
   vulkan-swrast`) and hides every other GPU from the tests. `cargo run -p render --example adapters` lists the GPUs.
+- rust-gpu shaders: `crates/render/shaders/build.sh` rebuilds the checked-in SPIR-V (cargo-gpu brings rust-gpu's
+  nightly); the gate fails if `brush` or a shader changed since. Rerun it and commit both files.
 - `cargo fmt` uses the pinned nightly's rustfmt (unstable options in `rustfmt.toml`) through `RUSTFMT` in
   `mise.toml`. Stable rustfmt gives different output: point your editor at `scripts/rustfmt`, and run
   anything that needs nightly (fmt, Miri) via `cargo +$BRUSHCRAFT_NIGHTLY …` under mise.
