@@ -86,6 +86,28 @@ impl TileStore {
         Ok(self.deps.normal_inputs_or_list(&self.mesh, key)?)
     }
 
+    /// The evaluated tiles whose positions or normals change when the `reached` tiles' positions
+    /// do, each once, in key order: what a re-evaluation after an edit of `reached` must redo.
+    ///
+    /// That is each of them (their positions move), and every tile whose normals read one of
+    /// them (their normals, and with them their normal cones and bounds, may turn).
+    ///
+    /// The tiles a tile's normals read ([`TileStore::normal_inputs`]: the tile, its apron and the
+    /// rings at its corners) are its neighbours, and neighbourhood goes both ways, so the tiles
+    /// reading a reached tile are among the tiles it reads: the set is the union of the reached
+    /// tiles' normal inputs.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::normal_inputs`].
+    pub fn stale_after(&self, reached: &[TileKey]) -> Result<Vec<TileKey>, CacheError> {
+        let mut stale = BTreeSet::new();
+        for key in reached {
+            stale.extend(self.normal_inputs(key)?.iter().copied());
+        }
+        Ok(stale.into_iter().collect())
+    }
+
     /// `key`'s evaluated slot if its positions are current, found without counting as a use.
     fn fresh_slot(&self, key: &TileKey) -> Option<SlotId<EvaluatedSlot>> {
         (self.evaluated.freshness(key)? == Freshness::Fresh)

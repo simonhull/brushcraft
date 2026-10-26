@@ -17,8 +17,7 @@
 //! 5. **Neighbours**: the tiles whose bounds may have changed are listed. That is every tile
 //!    holding a vertex within the radius, whose positions moved, and every tile whose normals read
 //!    one of those, whose normal cones may have turned: the tiles each reached tile's normals read,
-//!    as the store recorded them when it last computed those normals
-//!    ([`TileStore::normal_inputs`]).
+//!    as the store recorded them when it last computed those normals ([`TileStore::stale_after`]).
 //! 6. **Evaluate**: those tiles are evaluated again, positions and normals, together through
 //!    [`TileStore::evaluate_many_with_bounds`], which builds them in parallel. A neighbour whose
 //!    own positions didn't move keeps its normals, stale, and only the border vertices that read a
@@ -41,7 +40,6 @@
 //! edits it: the least of its copies (see [`geom::Topology::owns`]). The edit then writes the
 //! new value into every copy.
 
-use std::collections::BTreeSet;
 use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
@@ -307,7 +305,7 @@ pub fn draw_step(
     edit?;
     times.edit = laps.lap();
 
-    let changed = bounds_changed(store, &found.reached)?;
+    let changed = store.stale_after(&found.reached)?;
     times.neighbours = laps.lap();
 
     let wave = store.evaluate_many_with_bounds(&changed)?;
@@ -485,26 +483,6 @@ fn stroke_write(
         None => c.z + delta,
     };
     Some(Vec3::new(c.x, c.y, written))
-}
-
-/// The tiles whose bounds an edit of the `reached` tiles may change, each once, in key order.
-///
-/// That is each of them (their positions move), and every tile whose normals read one of them
-/// (their normal cones may turn).
-///
-/// The tiles a tile's normals read ([`TileStore::normal_inputs`]: the tile, its apron and the
-/// rings at its corners) are its neighbours, and neighbourhood goes both ways, so the tiles
-/// reading a reached tile are among the tiles it reads.
-///
-/// # Errors
-///
-/// As [`TileStore::normal_inputs`].
-fn bounds_changed(store: &TileStore, reached: &[TileKey]) -> Result<Vec<TileKey>, CacheError> {
-    let mut changed = BTreeSet::new();
-    for key in reached {
-        changed.extend(store.normal_inputs(key)?.iter().copied());
-    }
-    Ok(changed.into_iter().collect())
 }
 
 /// The vertex coordinates `(i, j)` of a tile with `side` vertices per side, in row-major order

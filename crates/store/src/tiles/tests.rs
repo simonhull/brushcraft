@@ -44,6 +44,7 @@ mod layered;
 mod prefetch;
 mod recovery;
 mod rounds_kept;
+mod stale;
 mod workload;
 
 /// Chunks in [`pinning`]'s budget.
