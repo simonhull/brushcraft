@@ -9,7 +9,7 @@
 set -euo pipefail
 
 arch=$(uname -m)
-dirs=(/usr/share/vulkan/icd.d /etc/vulkan/icd.d)
+dirs=(/usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d)
 
 # Whether $1 is a lavapipe manifest this machine can load: its own architecture's, or unsuffixed.
 usable() {

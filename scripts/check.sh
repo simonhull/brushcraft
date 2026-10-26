@@ -12,8 +12,8 @@ fi
 # machine's own GPU. It is required, never skipped (lavapipe.sh says how to install it).
 VK_ICD_FILENAMES=$(scripts/lavapipe.sh)
 export VK_ICD_FILENAMES VK_DRIVER_FILES=$VK_ICD_FILENAMES
-# Both would add drivers back, or filter the list: neither may.
-unset VK_ADD_DRIVER_FILES VK_LOADER_DRIVERS_SELECT
+# These would add drivers back, or filter or disable them: none may.
+unset VK_ADD_DRIVER_FILES VK_LOADER_DRIVERS_SELECT VK_LOADER_DRIVERS_DISABLE
 
 cargo fmt --all --check
 scripts/headless.sh
