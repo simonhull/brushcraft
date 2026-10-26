@@ -25,3 +25,9 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 [[profile.coverage.overrides]]
 filter = 'test(/::crash::/)'
 slow-timeout = { period = "240s", terminate-after = 3 }
+
+# The ignored many-seed tests (the weekly job, and by hand): minutes each by design.
+[profile.slow]
+fail-fast = false
+failure-output = "immediate-final"
+slow-timeout = { period = "300s", terminate-after = 24 }
