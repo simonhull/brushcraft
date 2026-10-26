@@ -1,5 +1,23 @@
 //! Opening a store over its layers, saving it, and moving it onto a new save point or a fresh
 //! working file.
+//!
+//! # Protocol
+//!
+//! [`crate::Project`] (`project.rs`) drives these:
+//!
+//! - It opens the store with [`TileStore::open_layered`]: the working file over the base, which
+//!   must belong together.
+//! - A save is two calls. [`TileStore::save_into`] copies every tile edited since the last rebase,
+//!   with every bound changed since, into the project file and saves it; nothing in the store
+//!   changes, and it returns the proof a rebase needs ([`Saved`]). [`TileStore::rebase`] then swaps
+//!   in that save point as the base and a fresh working file over it, and refuses a proof the store
+//!   was written after.
+//! - After the working file fails to sync, a roll-over is two calls too.
+//!   [`TileStore::fill_roll_over`] fills a fresh working file on the same base with every edit,
+//!   changing nothing in the store; [`TileStore::roll_over`] swaps it in once the caller has named
+//!   it, and refuses it if the store was written since.
+//! - With no recovery writer running, it calls [`TileStore::drain_saves`] on every call that would
+//!   have advanced one, so the change feed's backlog stays bounded between saves.
 
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;

@@ -1,5 +1,19 @@
 //! The spatial index's bounds as the store keeps them: recorded with the tiles, layered over the
 //! saved bounds, written out when tiles are, and dropped or reloaded with the tiles they bound.
+//!
+//! # Protocol
+//!
+//! [`crate::SpatialIndex`] (`index.rs`) reads the bounds the store keeps with
+//! [`TileStore::stored_bounds`] (`None` where none is known, and the tile must be evaluated),
+//! and records those it computes from the store's current state with
+//! [`TileStore::record_bounds`], which settles the writes since its last call first.
+//!
+//! [`crate::RecoveryWriter`] (`recovery.rs`) calls the rest within a flush (see
+//! [`super::stream`]): [`TileStore::flush_bounds`] right after the snapshot, before any later
+//! write, so the flush's save point names tiles and bounds of one state; then, for the copies
+//! that didn't encode, [`TileStore::left_out_at_reply`] to tell which are lost in memory, and
+//! [`TileStore::forget_bounds_at_cut`] to append as unknown every bound their at-cut edits could
+//! have changed.
 
 use geom::TileKey;
 

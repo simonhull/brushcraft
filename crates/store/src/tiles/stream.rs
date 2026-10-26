@@ -1,5 +1,26 @@
 //! Streaming the working file: the change-feed consumers a recovery writer subscribes, the dirty
 //! tiles it snapshots and appends, and the save points that make its records count.
+//!
+//! # Protocol
+//!
+//! [`crate::RecoveryWriter`] (`recovery.rs`) drives these, on the owner thread:
+//!
+//! - It subscribes with [`TileStore::subscribe_stream`], leaves with
+//!   [`TileStore::unsubscribe_stream`], and asks [`TileStore::has_unflushed`] and
+//!   [`TileStore::has_unsaved_records`] whether a flush has anything to do.
+//! - A flush starts with [`TileStore::open_cut`] and notes [`TileStore::generation`], which every
+//!   rebase moves on: a flush that sees it change is abandoned. [`TileStore::snapshot_dirty`] then
+//!   copies the dirty slots, with no encoding or I/O, and [`TileStore::flush_bounds`] appends the
+//!   bounds of the same state at the same cut.
+//! - With the copies encoded, the tiles left out are dealt with (see [`super::bounds`]; a lost one
+//!   leaves the flush mark through [`TileStore::drop_from_stream`]), and
+//!   [`TileStore::append_streamed`] appends the rest.
+//! - Once a sync ([`TileStore::working_syncer`]) covers [`TileStore::working_named_end`],
+//!   [`TileStore::write_save_point`] appends the save point, unsynced, and another sync makes it
+//!   durable.
+//!
+//! [`crate::Project`] marks a working file whose writer failed with [`TileStore::fail_working`]:
+//! no save point is written there again until the store moves to another working file.
 
 use std::collections::BTreeSet;
 
