@@ -8,7 +8,7 @@ use std::sync::Weak;
 
 use geom::TileKey;
 
-use super::error::StoreError;
+use super::error::FileError;
 use super::format::{MAX_RAW, read_exact, tile_payload, tile_record};
 use super::lock::LockedFile;
 use super::{Loc, check_displacement};
@@ -26,7 +26,7 @@ use crate::stamp::Stamp;
 /// The file is append-only while open, so a location stays valid. A reader doesn't keep the file
 /// open: once its [`ProjectFile`](super::ProjectFile) is dropped, the file closes and its lock is
 /// released (after any read in flight, which holds the file for its duration), and reads fail with
-/// [`StoreError::Closed`].
+/// [`FileError::Closed`].
 #[derive(Debug, Clone)]
 pub(crate) struct FileReader {
     /// The owner's open file, upgraded for the length of each read.
@@ -46,13 +46,13 @@ impl FileReader {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Damaged`] if the file ends first, [`StoreError::Closed`] if the
-    /// [`ProjectFile`](super::ProjectFile) has been dropped, [`StoreError::Io`].
-    pub(crate) fn read_record(&self, Loc { offset, len }: Loc) -> Result<Vec<u8>, StoreError> {
-        let file = self.file.upgrade().ok_or(StoreError::Closed)?;
+    /// [`FileError::Damaged`] if the file ends first, [`FileError::Closed`] if the
+    /// [`ProjectFile`](super::ProjectFile) has been dropped, [`FileError::Io`].
+    pub(crate) fn read_record(&self, Loc { offset, len }: Loc) -> Result<Vec<u8>, FileError> {
+        let file = self.file.upgrade().ok_or(FileError::Closed)?;
         match read_exact(&file, offset, len) {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                Err(StoreError::Damaged { offset })
+                Err(FileError::Damaged { offset })
             }
             other => Ok(other?),
         }
@@ -63,21 +63,21 @@ impl FileReader {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Damaged`] if the record fails its checksum, isn't a tile of `key` or doesn't
-    /// decompress; [`StoreError::NotDisplacement`], [`StoreError::WrongSide`],
-    /// [`StoreError::Codec`] as for
+    /// [`FileError::Damaged`] if the record fails its checksum, isn't a tile of `key` or doesn't
+    /// decompress; [`FileError::NotDisplacement`], [`FileError::WrongSide`],
+    /// [`FileError::Codec`] as for
     /// [`ProjectFile::read_displacement`](super::ProjectFile::read_displacement);
-    /// [`StoreError::Closed`] if the [`ProjectFile`](super::ProjectFile) has been dropped;
-    /// [`StoreError::Io`]. On error `slot` holds no tile.
+    /// [`FileError::Closed`] if the [`ProjectFile`](super::ProjectFile) has been dropped;
+    /// [`FileError::Io`]. On error `slot` holds no tile.
     pub(crate) fn read_displacement_into(
         &self,
         key: &TileKey,
         loc: Loc,
         slot: &mut CorrectionSlot,
         scratch: &mut ReadScratch,
-    ) -> Result<OpId, StoreError> {
+    ) -> Result<OpId, FileError> {
         let file = check_displacement(key, key.side())
-            .and_then(|()| self.file.upgrade().ok_or(StoreError::Closed));
+            .and_then(|()| self.file.upgrade().ok_or(FileError::Closed));
         match file {
             Ok(file) => read_displacement_at(&file, key, loc, slot, scratch),
             Err(e) => {
@@ -106,11 +106,11 @@ impl FileSyncer {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Closed`] if the [`ProjectFile`](super::ProjectFile) has been dropped;
-    /// [`StoreError::Io`] if the sync fails, after which what was written since the last good
+    /// [`FileError::Closed`] if the [`ProjectFile`](super::ProjectFile) has been dropped;
+    /// [`FileError::Io`] if the sync fails, after which what was written since the last good
     /// sync may not be on disk.
-    pub(crate) fn sync_data(&self) -> Result<(), StoreError> {
-        let file = self.file.upgrade().ok_or(StoreError::Closed)?;
+    pub(crate) fn sync_data(&self) -> Result<(), FileError> {
+        let file = self.file.upgrade().ok_or(FileError::Closed)?;
         file.sync_data()?;
         Ok(())
     }
@@ -156,24 +156,24 @@ impl FramedTile {
 ///
 /// # Errors
 ///
-/// [`StoreError::NotDisplacement`] if `key` is of another channel, [`StoreError::WrongSide`] if
-/// the slot's side isn't the key's, [`StoreError::Codec`] if the slot holds no valid tile,
-/// [`StoreError::TooLarge`], [`StoreError::Io`] if compression fails.
+/// [`FileError::NotDisplacement`] if `key` is of another channel, [`FileError::WrongSide`] if
+/// the slot's side isn't the key's, [`FileError::Codec`] if the slot holds no valid tile,
+/// [`FileError::TooLarge`], [`FileError::Io`] if compression fails.
 pub(crate) fn frame_displacement(
     key: TileKey,
     op: OpId,
     stamp: Stamp,
     slot: &CorrectionSlot,
-) -> Result<FramedTile, StoreError> {
+) -> Result<FramedTile, FileError> {
     let tile = slot.to_tile().map_err(CodecError::from)?;
     check_displacement(&key, tile.side())?;
     let (header, body) = encode_displacement(&tile)?;
     if !u32::try_from(body.len()).is_ok_and(|n| n <= MAX_RAW) {
-        return Err(StoreError::TooLarge);
+        return Err(FileError::TooLarge);
     }
     let packed = compress(&body)?;
     let payload = tile_payload(key, op, &header, body.len(), &packed)?;
-    let record = frame(KIND_TILE, &payload).ok_or(StoreError::TooLarge)?;
+    let record = frame(KIND_TILE, &payload).ok_or(FileError::TooLarge)?;
     Ok(FramedTile {
         key,
         op,
@@ -198,8 +198,8 @@ impl ReadScratch {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] if zstd can't allocate its context.
-    pub(crate) fn new() -> Result<Self, StoreError> {
+    /// [`FileError::Io`] if zstd can't allocate its context.
+    pub(crate) fn new() -> Result<Self, FileError> {
         Ok(Self {
             record: Vec::new(),
             raw: Vec::new(),
@@ -229,7 +229,7 @@ pub(super) fn read_displacement_at(
     loc: Loc,
     slot: &mut CorrectionSlot,
     scratch: &mut ReadScratch,
-) -> Result<OpId, StoreError> {
+) -> Result<OpId, FileError> {
     let read = decode_record_at(file, key, loc, slot, scratch);
     if read.is_err() {
         bytemuck::bytes_of_mut(slot).fill(0);
@@ -248,10 +248,10 @@ fn decode_record_at(
     Loc { offset, len }: Loc,
     slot: &mut CorrectionSlot,
     scratch: &mut ReadScratch,
-) -> Result<OpId, StoreError> {
+) -> Result<OpId, FileError> {
     let ReadScratch { record, raw, zstd } = scratch;
-    let damaged = StoreError::Damaged { offset };
-    record.resize(usize::try_from(len).or(Err(StoreError::TooLarge))?, 0);
+    let damaged = FileError::Damaged { offset };
+    record.resize(usize::try_from(len).or(Err(FileError::TooLarge))?, 0);
     match file.read_exact_at(record, offset) {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(damaged),
         other => other?,
@@ -265,7 +265,7 @@ fn decode_record_at(
     raw.resize(body_len, 0);
     match zstd.decompress_to_buffer(tile.packed, raw.as_mut_slice()) {
         Ok(n) if n == body_len => {}
-        _ => return Err(StoreError::Damaged { offset }),
+        _ => return Err(FileError::Damaged { offset }),
     }
     decode_displacement_into(tile.header, raw, slot)?;
     Ok(tile.op)

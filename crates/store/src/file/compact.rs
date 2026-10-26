@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::error::StoreError;
+use super::error::FileError;
 use super::format::tile_record;
 use super::lock::{Lock, open_locked, open_readable};
 use super::{Loc, Name, ProjectFile, Repair};
@@ -23,9 +23,9 @@ use crate::stamp::Stamp;
 ///
 /// # Errors
 ///
-/// Any [`StoreError`] from reading `src` (a damaged live tile is [`StoreError::Damaged`]; one
-/// open for writing, [`StoreError::Locked`]) or writing `dst`, which must not exist.
-pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
+/// Any [`FileError`] from reading `src` (a damaged live tile is [`FileError::Damaged`]; one
+/// open for writing, [`FileError::Locked`]) or writing `dst`, which must not exist.
+pub fn compact(src: &Path, dst: &Path) -> Result<(), FileError> {
     compact_into(&ProjectFile::inspect(src)?, dst)
 }
 
@@ -45,8 +45,8 @@ pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
 ///
 /// # Errors
 ///
-/// As [`compact`], with [`StoreError::Locked`] if the project is open at all.
-pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
+/// As [`compact`], with [`FileError::Locked`] if the project is open at all.
+pub fn compact_in_place(path: &Path) -> Result<(), FileError> {
     let path = path.canonicalize()?;
     let from = ProjectFile::open_latest(
         open_locked(&path, open_readable, Lock::Exclusive)?,
@@ -76,7 +76,7 @@ pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
 /// # Errors
 ///
 /// As [`compact`].
-pub(super) fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
+pub(super) fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), FileError> {
     let mode = from.file.metadata()?.permissions().mode() & 0o777;
     let mut to = ProjectFile::create_like_mode(dst, from.meta.clone(), from, mode)?;
     for (name, &Loc { offset, len }) in &from.live {
@@ -84,7 +84,7 @@ pub(super) fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreEr
             Name::Tile(key) => {
                 let raw = from.read_record(offset, len)?;
                 if tile_record(&raw, key).is_none() {
-                    return Err(StoreError::Damaged { offset });
+                    return Err(FileError::Damaged { offset });
                 }
                 let loc = to.append_record(&raw)?;
                 to.note(*name, None, Stamp::ZERO, loc);
@@ -107,8 +107,8 @@ pub(super) fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreEr
 ///
 /// # Errors
 ///
-/// [`StoreError::Io`] if `path` has no file name.
-fn temp_sibling(path: &Path) -> Result<PathBuf, StoreError> {
+/// [`FileError::Io`] if `path` has no file name.
+fn temp_sibling(path: &Path) -> Result<PathBuf, FileError> {
     /// Distinguishes this process's temporary files.
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().ok_or_else(|| {
@@ -130,8 +130,8 @@ fn temp_sibling(path: &Path) -> Result<PathBuf, StoreError> {
 ///
 /// # Errors
 ///
-/// [`StoreError::Io`].
-pub(crate) fn sync_parent(path: &Path) -> Result<(), StoreError> {
+/// [`FileError::Io`].
+pub(crate) fn sync_parent(path: &Path) -> Result<(), FileError> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),

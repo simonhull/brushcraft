@@ -124,7 +124,7 @@ fn new_edit_save_as_close_open_evaluates_as_dense() {
             .map(drop)
             .unwrap_err()
             .to_string(),
-        ProjectError::Store(StoreError::Locked).to_string(),
+        ProjectError::Store(FileError::Locked).to_string(),
         "one instance at a time"
     );
 }
@@ -193,7 +193,7 @@ fn a_save_starts_an_empty_recovery_file_on_its_save_point() {
     );
     let saved = ProjectFile::open(&path).map(drop);
     assert!(
-        matches!(saved, Err(StoreError::Locked)),
+        matches!(saved, Err(FileError::Locked)),
         "the project holds its file: {saved:?}"
     );
     let point = *project
@@ -244,7 +244,7 @@ fn a_save_as_whose_directory_sync_fails_leaves_nothing_at_the_path() {
     assert!(
         matches!(
             project.save_as(&target),
-            Err(ProjectError::Store(StoreError::Io(_)))
+            Err(ProjectError::Store(FileError::Io(_)))
         ),
         "the sync's error"
     );

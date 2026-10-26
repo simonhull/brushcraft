@@ -97,17 +97,17 @@ pub(crate) fn bounds_payload(key: &TileKey, bounds: Option<&TileBounds>) -> Vec<
 ///
 /// `None` on any shortfall or trailing byte, an invalid key, a state other than 0 or 1, or values
 /// that aren't valid bounds (see [`TileBounds::from_bits`]).
-pub(crate) fn parse_bounds_payload(payload: &[u8]) -> Option<(TileKey, Kept)> {
+pub(crate) fn parse_bounds_payload(payload: &[u8]) -> Option<(TileKey, StoredBound)> {
     let mut r = Reader::new(payload);
     let key = r.key()?;
     let kept = match r.u8()? {
-        UNKNOWN => Kept::Unknown,
+        UNKNOWN => StoredBound::Unknown,
         KNOWN => {
             let mut bits = [0; TileBounds::BITS];
             for value in &mut bits {
                 *value = r.u32()?;
             }
-            Kept::Known(TileBounds::from_bits(bits)?)
+            StoredBound::Known(TileBounds::from_bits(bits)?)
         }
         _ => return None,
     };
@@ -117,14 +117,14 @@ pub(crate) fn parse_bounds_payload(payload: &[u8]) -> Option<(TileKey, Kept)> {
 /// A tile's bound as the store keeps it: its bounds, or the fact that they aren't known (the
 /// tile is evaluated when the index is loaded).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Kept {
+pub(crate) enum StoredBound {
     /// The tile's bounds, as its tiles give them.
     Known(TileBounds),
     /// Not known: the tile is evaluated.
     Unknown,
 }
 
-impl Kept {
+impl StoredBound {
     /// The bounds, if known.
     pub(crate) const fn bounds(self) -> Option<TileBounds> {
         match self {
@@ -134,7 +134,7 @@ impl Kept {
     }
 }
 
-impl From<Option<TileBounds>> for Kept {
+impl From<Option<TileBounds>> for StoredBound {
     /// Known bounds, or unknown for `None`.
     fn from(bounds: Option<TileBounds>) -> Self {
         bounds.map_or(Self::Unknown, Self::Known)
@@ -382,8 +382,10 @@ impl Book {
 
     /// `key`'s bound if it changed since the last rebase; `None` if the files hold whatever is
     /// current.
-    pub(crate) fn changed(&self, key: &TileKey) -> Option<Kept> {
-        self.changed.get(key).map(|&bounds| Kept::from(bounds))
+    pub(crate) fn changed(&self, key: &TileKey) -> Option<StoredBound> {
+        self.changed
+            .get(key)
+            .map(|&bounds| StoredBound::from(bounds))
     }
 
     /// Every bound changed since the last rebase, in key order: what a save copies.

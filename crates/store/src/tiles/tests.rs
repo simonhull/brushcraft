@@ -23,7 +23,7 @@ use super::round::{
 use super::*;
 use crate::MAX_SEQ;
 use crate::deps::list_normal_inputs;
-use crate::file::StoreError;
+use crate::file::FileError;
 use crate::fixture::{
     EVAL, Edit, Rng, SITE, TEST_THREADS, TOP, assert_positions, assert_tile, config, damage, dense,
     fixed, level, mesh, meta_for, pools, random_edits, roomy, split_prism, tight, tiles,

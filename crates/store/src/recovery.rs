@@ -104,7 +104,7 @@ use geom::TileKey;
 use thiserror::Error;
 
 use crate::feed::ConsumerId;
-use crate::file::{FileSyncer, FramedTile, StoreError, frame_displacement};
+use crate::file::{FileError, FileSyncer, FramedTile, frame_displacement};
 use crate::tiles::{CacheError, Snapshot, TileStore};
 
 /// The longest a [`RecoveryWriter::tick`] lets edits wait before it starts a flush.
@@ -122,7 +122,7 @@ pub enum RecoveryError {
     /// Syncing the working file failed. What was appended since the last durable save point may
     /// not be on disk.
     #[error("syncing the recovery file failed")]
-    Sync(#[source] StoreError),
+    Sync(#[source] FileError),
     /// The writer thread couldn't be started.
     #[error("the recovery writer's thread couldn't be started")]
     Spawn(#[source] io::Error),
@@ -180,7 +180,7 @@ enum Reply {
     /// out.
     Encoded(Vec<FramedTile>, Vec<TileKey>),
     /// The sync completed, or why it failed.
-    Synced(Result<(), StoreError>),
+    Synced(Result<(), FileError>),
 }
 
 /// Counts `n` down unless it is zero; whether it did.
@@ -839,7 +839,7 @@ impl Worker {
 /// # Errors
 ///
 /// As [`FileSyncer::sync_data`].
-fn sync(syncer: &FileSyncer, #[cfg(test)] hooks: &Hooks) -> Result<(), StoreError> {
+fn sync(syncer: &FileSyncer, #[cfg(test)] hooks: &Hooks) -> Result<(), FileError> {
     #[cfg(test)]
     if hooks.sync_fails() {
         return Err(io::Error::other("a failing sync, for the test").into());

@@ -40,7 +40,7 @@ pub use activity::Activity;
 pub use codec::CodecError;
 pub use feed::{ChangeFeed, ConsumerId};
 pub use file::{
-    MAX_MESH_RAW, MAX_RAW, ProjectFile, StoreError, TileBytes, compact, compact_in_place,
+    FileError, MAX_MESH_RAW, MAX_RAW, ProjectFile, TileBytes, compact, compact_in_place,
 };
 pub use index::{
     Aabb, Bvh, Hit, IndexError, LoadStats, MAX_TILES, NormalCone, Ray, SpatialIndex, SphereQuery,

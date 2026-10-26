@@ -9,7 +9,7 @@ use std::path::Path;
 
 use rustix::fs::{FileType, Mode, OFlags};
 
-use super::error::StoreError;
+use super::error::FileError;
 
 /// Whether a [`ProjectFile`](super::ProjectFile) accepts writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,14 +35,14 @@ impl Lock {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Locked`] if a conflicting lock is held, [`StoreError::Io`].
-    fn take(self, file: &File) -> Result<(), StoreError> {
+    /// [`FileError::Locked`] if a conflicting lock is held, [`FileError::Io`].
+    fn take(self, file: &File) -> Result<(), FileError> {
         let locked = match self {
             Self::Exclusive => file.try_lock(),
             Self::Shared => file.try_lock_shared(),
         };
         locked.map_err(|e| match e {
-            TryLockError::WouldBlock => StoreError::Locked,
+            TryLockError::WouldBlock => FileError::Locked,
             TryLockError::Error(e) => e.into(),
         })
     }
@@ -54,7 +54,7 @@ impl Lock {
 /// and closing a descriptor releases it only once no duplicate is left. Spawning a process
 /// duplicates all of this process's descriptors into the child until its `exec` (close-on-exec
 /// closes them only then), so a file merely closed while another thread spawns stays locked for
-/// that moment, against this very process: reopening it fails with [`StoreError::Locked`].
+/// that moment, against this very process: reopening it fails with [`FileError::Locked`].
 /// Unlocking releases the lock on the description itself, whichever descriptors still share it,
 /// so a dropped `LockedFile` is unlocked at once.
 #[derive(Debug)]
@@ -66,7 +66,7 @@ impl LockedFile {
     /// # Errors
     ///
     /// As [`Lock::take`].
-    pub(super) fn new(file: File, lock: Lock) -> Result<Self, StoreError> {
+    pub(super) fn new(file: File, lock: Lock) -> Result<Self, FileError> {
         lock.take(&file)?;
         Ok(Self(file))
     }
@@ -99,7 +99,7 @@ pub(super) fn open_locked(
     path: &Path,
     open: impl Fn(&Path) -> io::Result<File>,
     lock: Lock,
-) -> Result<LockedFile, StoreError> {
+) -> Result<LockedFile, FileError> {
     lock_at(path, open(path)?, open, lock)
 }
 
@@ -112,14 +112,14 @@ pub(super) fn open_locked(
 ///
 /// # Errors
 ///
-/// [`StoreError::Locked`] if a conflicting lock is held, or `path` is replaced again during the
-/// retry; `open`'s error; [`StoreError::Io`].
+/// [`FileError::Locked`] if a conflicting lock is held, or `path` is replaced again during the
+/// retry; `open`'s error; [`FileError::Io`].
 pub(super) fn lock_at(
     path: &Path,
     file: File,
     open: impl Fn(&Path) -> io::Result<File>,
     lock: Lock,
-) -> Result<LockedFile, StoreError> {
+) -> Result<LockedFile, FileError> {
     let file = LockedFile::new(file, lock)?;
     if is_at(&file, path)? {
         return Ok(file);
@@ -129,7 +129,7 @@ pub(super) fn lock_at(
     if is_at(&reopened, path)? {
         Ok(reopened)
     } else {
-        Err(StoreError::Locked)
+        Err(FileError::Locked)
     }
 }
 

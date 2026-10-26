@@ -25,7 +25,7 @@ fn scratch() -> PathBuf {
 /// # Errors
 ///
 /// The first error of an open or a read: the answer to a hostile file, which ends the walk.
-fn open_and_read(path: &std::path::Path) -> Result<(), store::StoreError> {
+fn open_and_read(path: &std::path::Path) -> Result<(), store::FileError> {
     let file = ProjectFile::open(path)?;
     let points = file.save_points()?;
     read_all(&file)?;
@@ -41,7 +41,7 @@ fn open_and_read(path: &std::path::Path) -> Result<(), store::StoreError> {
 /// # Errors
 ///
 /// The first read's error.
-fn read_all(file: &ProjectFile) -> Result<(), store::StoreError> {
+fn read_all(file: &ProjectFile) -> Result<(), store::FileError> {
     let keys: Vec<_> = file.keys().copied().collect();
     for key in &keys {
         file.read_tile(key)?;

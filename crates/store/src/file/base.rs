@@ -3,7 +3,7 @@
 
 use geom::TileKey;
 
-use super::error::StoreError;
+use super::error::FileError;
 use super::reader::{FileReader, ReadScratch};
 use super::{Loc, read_bounds_at};
 use crate::OpId;
@@ -63,7 +63,7 @@ impl BaseFile {
     ///
     /// # Errors
     ///
-    /// As [`FileReader::read_displacement_into`]; [`StoreError::Closed`] once the project file
+    /// As [`FileReader::read_displacement_into`]; [`FileError::Closed`] once the project file
     /// is dropped. On error `slot` holds no tile.
     pub(crate) fn read_at(
         &self,
@@ -71,7 +71,7 @@ impl BaseFile {
         loc: Loc,
         slot: &mut CorrectionSlot,
         scratch: &mut ReadScratch,
-    ) -> Result<OpId, StoreError> {
+    ) -> Result<OpId, FileError> {
         self.reader.read_displacement_into(key, loc, slot, scratch)
     }
 
@@ -137,12 +137,12 @@ impl BaseFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Closed`] once the project file is dropped; [`StoreError::Io`].
+    /// [`FileError::Closed`] once the project file is dropped; [`FileError::Io`].
     pub(crate) fn read_bounds(
         &self,
         entries: &[(TileKey, Loc)],
-    ) -> Result<Vec<Option<TileBounds>>, StoreError> {
-        let file = self.reader.file.upgrade().ok_or(StoreError::Closed)?;
+    ) -> Result<Vec<Option<TileBounds>>, FileError> {
+        let file = self.reader.file.upgrade().ok_or(FileError::Closed)?;
         Ok(read_bounds_at(&file, entries)?)
     }
 }

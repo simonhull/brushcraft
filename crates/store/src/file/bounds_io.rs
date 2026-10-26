@@ -7,12 +7,12 @@ use geom::TileKey;
 
 use super::Loc;
 use super::format::read_exact;
-use crate::bounds::{Kept, parse_bounds_payload};
+use crate::bounds::{StoredBound, parse_bounds_payload};
 use crate::index::TileBounds;
 use crate::record::{KIND_BOUNDS, verify};
 
 /// The bound in a raw record, if the record verifies and holds a bound of `key`.
-pub(super) fn bounds_record(raw: &[u8], key: &TileKey) -> Option<Kept> {
+pub(super) fn bounds_record(raw: &[u8], key: &TileKey) -> Option<StoredBound> {
     match verify(raw) {
         Some((KIND_BOUNDS, payload)) => parse_bounds_payload(payload),
         _ => None,
@@ -67,7 +67,7 @@ pub(super) fn read_bounds_at(
                 for &n in group {
                     if let (Some(&(key, loc)), Some(slot)) = (entries.get(n), found.get_mut(n)) {
                         *slot = match read_exact(file, loc.offset, loc.len) {
-                            Ok(raw) => bounds_record(&raw, &key).and_then(Kept::bounds),
+                            Ok(raw) => bounds_record(&raw, &key).and_then(StoredBound::bounds),
                             Err(short) if short.kind() == io::ErrorKind::UnexpectedEof => None,
                             Err(failed) => return Err(failed),
                         };
@@ -85,7 +85,7 @@ pub(super) fn read_bounds_at(
                     .and_then(|(lo, len)| window.get(lo..lo.checked_add(len)?));
                 *slot = raw
                     .and_then(|raw| bounds_record(raw, &key))
-                    .and_then(Kept::bounds);
+                    .and_then(StoredBound::bounds);
             }
         }
     }

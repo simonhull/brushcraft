@@ -10,7 +10,7 @@ use geom::TileKey;
 
 use crate::hash::{TileHash, TileMap};
 
-/// The most entries [`Kept::new`] makes room for up front: the default bound's worth. A larger
+/// The most entries [`KeptLru::new`] makes room for up front: the default bound's worth. A larger
 /// bound grows the map as values come instead.
 const PREALLOCATED: usize = 64;
 
@@ -24,7 +24,7 @@ const PREALLOCATED: usize = 64;
 /// counter, and the oldest stamp goes first. The ticks are kept in order beside the values, so
 /// finding the oldest is a lookup, not a scan.
 #[derive(Debug)]
-pub(crate) struct Kept<T> {
+pub(crate) struct KeptLru<T> {
     /// The most values kept; zero keeps none.
     capacity: usize,
     /// Each tile's value, with the tick of its last use.
@@ -35,7 +35,7 @@ pub(crate) struct Kept<T> {
     tick: u64,
 }
 
-impl<T> Kept<T> {
+impl<T> KeptLru<T> {
     /// Nothing kept yet, room for `capacity` values (allocated up front only up to
     /// [`PREALLOCATED`] of them).
     pub(crate) fn new(capacity: usize) -> Self {
@@ -52,7 +52,7 @@ impl<T> Kept<T> {
         self.capacity
     }
 
-    /// `key`'s value, if it is kept. Reading it isn't a use: call [`Kept::used`] for that.
+    /// `key`'s value, if it is kept. Reading it isn't a use: call [`KeptLru::used`] for that.
     pub(crate) fn get(&self, key: &TileKey) -> Option<&T> {
         self.values.get(key).map(|(value, _)| value)
     }
@@ -131,7 +131,7 @@ mod tests {
     }
 
     /// The tiles `kept` holds, sorted.
-    fn held(kept: &Kept<u32>) -> Vec<TileKey> {
+    fn held(kept: &KeptLru<u32>) -> Vec<TileKey> {
         let mut keys: Vec<TileKey> = kept.keys().copied().collect();
         keys.sort_unstable();
         keys
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn the_least_recently_used_goes_to_make_room() {
-        let mut kept = Kept::new(2);
+        let mut kept = KeptLru::new(2);
         kept.insert(key(0), 10);
         kept.insert(key(1), 11);
         kept.used(&key(0));
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn making_room_drops_the_least_recently_used() {
-        let mut kept = Kept::new(3);
+        let mut kept = KeptLru::new(3);
         for n in 0..3 {
             kept.insert(key(n), u32::from(n));
         }
@@ -187,7 +187,7 @@ mod tests {
     /// removals.
     #[test]
     fn each_value_has_one_tick() {
-        let mut kept = Kept::new(2);
+        let mut kept = KeptLru::new(2);
         kept.insert(key(0), 10);
         kept.insert(key(0), 20);
         kept.used(&key(0));
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn no_capacity_keeps_nothing() {
-        let mut kept = Kept::new(0);
+        let mut kept = KeptLru::new(0);
         kept.insert(key(0), 10);
         assert_eq!(kept.get(&key(0)), None, "nothing kept");
         assert!(held(&kept).is_empty(), "empty");

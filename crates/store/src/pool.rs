@@ -220,7 +220,7 @@ pub(crate) enum PoolError<W = Infallible> {
 
 /// One slot's bookkeeping.
 #[derive(Debug, Clone, Copy, Default)]
-struct Meta {
+struct SlotMeta {
     /// The tile it holds; `None` while free.
     key: Option<TileKey>,
     /// Bumped whenever the slot is freed, so older handles go stale.
@@ -285,7 +285,7 @@ pub(crate) struct Pool<T: SlotData> {
     /// after its last slot).
     charges: Vec<usize>,
     /// Per chunk, per slot.
-    meta: Vec<Vec<Meta>>,
+    meta: Vec<Vec<SlotMeta>>,
     /// Free slots of mapped chunks.
     free: Vec<Pos>,
     /// Where each tile's slot is.
@@ -569,7 +569,7 @@ impl<T: SlotData> Pool<T> {
         };
         let generation = {
             let meta = self.meta_mut(pos).ok_or(PoolError::Full)?;
-            *meta = Meta {
+            *meta = SlotMeta {
                 key: Some(key),
                 generation: meta.generation,
                 pins: 0,
@@ -787,7 +787,7 @@ impl<T: SlotData> Pool<T> {
             self.chunks.push(storage);
             self.charges.push(charge);
             self.meta
-                .push(vec![Meta::default(); self.per_chunk as usize]);
+                .push(vec![SlotMeta::default(); self.per_chunk as usize]);
         }
         // Reversed, so slots are handed out in order.
         self.free
@@ -894,7 +894,7 @@ impl<T: SlotData> Pool<T> {
         pos: Pos,
         write_back: &mut impl FnMut(TileKey, &T) -> Result<(), W>,
     ) -> Result<(), PoolError<W>> {
-        let Some(Meta {
+        let Some(SlotMeta {
             key: Some(key),
             dirty: true,
             ..
@@ -926,9 +926,9 @@ impl<T: SlotData> Pool<T> {
             return;
         };
         let key = meta.key.take();
-        *meta = Meta {
+        *meta = SlotMeta {
             generation: meta.generation.wrapping_add(1),
-            ..Meta::default()
+            ..SlotMeta::default()
         };
         if let Some(key) = key {
             self.index.remove(&key);
@@ -955,12 +955,12 @@ impl<T: SlotData> Pool<T> {
     }
 
     /// The bookkeeping of the slot at `pos`, mapped or not; `None` past the chunks ever mapped.
-    fn meta_of(&self, (chunk, index): Pos) -> Option<&Meta> {
+    fn meta_of(&self, (chunk, index): Pos) -> Option<&SlotMeta> {
         self.meta.get(chunk as usize)?.get(index as usize)
     }
 
     /// As [`Pool::meta_of`], mutably.
-    fn meta_mut(&mut self, (chunk, index): Pos) -> Option<&mut Meta> {
+    fn meta_mut(&mut self, (chunk, index): Pos) -> Option<&mut SlotMeta> {
         self.meta.get_mut(chunk as usize)?.get_mut(index as usize)
     }
 
@@ -982,13 +982,13 @@ impl<T: SlotData> Pool<T> {
     }
 
     /// The live slot's bookkeeping, or `None` if `id` is stale.
-    fn live(&self, id: SlotId<T>) -> Option<&Meta> {
+    fn live(&self, id: SlotId<T>) -> Option<&SlotMeta> {
         self.meta_of((id.chunk, id.index))
             .filter(|m| m.generation == id.generation && m.key.is_some())
     }
 
     /// As [`Pool::live`], mutably.
-    fn live_mut(&mut self, id: SlotId<T>) -> Option<&mut Meta> {
+    fn live_mut(&mut self, id: SlotId<T>) -> Option<&mut SlotMeta> {
         self.meta_mut((id.chunk, id.index))
             .filter(|m| m.generation == id.generation && m.key.is_some())
     }

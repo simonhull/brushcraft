@@ -3,7 +3,7 @@
 use geom::{FaceId, Level};
 
 use super::*;
-use crate::StoreError;
+use crate::FileError;
 use crate::slot::{CorrectionSlot, EvaluatedSlot};
 
 /// A small slot for the rule tests.
@@ -18,7 +18,7 @@ fn key(n: u32) -> TileKey {
 /// # Errors
 ///
 /// Never: it panics instead.
-fn no_write_back<T>(key: TileKey, _: &T) -> Result<(), StoreError> {
+fn no_write_back<T>(key: TileKey, _: &T) -> Result<(), FileError> {
     panic!("unexpected write-back of {key:?}")
 }
 
@@ -53,7 +53,7 @@ enum Pinned {
     clippy::unnecessary_wraps,
     reason = "it is a pool write-back, whose signature returns a result"
 )]
-const fn write_nothing<T>(_: TileKey, _: &T) -> Result<(), StoreError> {
+const fn write_nothing<T>(_: TileKey, _: &T) -> Result<(), FileError> {
     Ok(())
 }
 
@@ -282,7 +282,7 @@ fn dirty_victims_are_written_back_once() {
     }
     // A failing write-back leaves the victim dirty and in place.
     let failed = pool.acquire(key(10), &mut budget, |_, _: &Small| {
-        Err(StoreError::ReadOnly)
+        Err(FileError::ReadOnly)
     });
     assert!(
         matches!(failed, Err(PoolError::WriteBack(_))),
@@ -296,7 +296,7 @@ fn dirty_victims_are_written_back_once() {
     for n in 10..20 {
         pool.acquire(key(n), &mut budget, |k, v: &Small| {
             written.push((k, *v));
-            Ok::<_, StoreError>(())
+            Ok::<_, FileError>(())
         })
         .unwrap();
     }
@@ -311,7 +311,7 @@ fn dirty_victims_are_written_back_once() {
     pool.set_dirty(id, true).unwrap();
     pool.evict_all(|k, v: &Small| {
         written.push((k, *v));
-        Ok::<_, StoreError>(())
+        Ok::<_, FileError>(())
     })
     .unwrap();
     assert_eq!(
@@ -545,7 +545,7 @@ fn shrinking_gives_back_the_chunk_with_fewest_dirty_tiles_first() {
     let mut written = Vec::new();
     let mut write = |k: TileKey, _: &Small| {
         written.push(k);
-        Ok::<_, StoreError>(())
+        Ok::<_, FileError>(())
     };
     pool.shrink_to(&mut budget, 2 * chunk, &mut write).unwrap();
     assert_eq!(
@@ -703,7 +703,7 @@ fn shrink_returns_chunks() {
     let mut written = Vec::new();
     pool.shrink_to(&mut budget, 0, |k, _: &Small| {
         written.push(k);
-        Ok::<_, StoreError>(())
+        Ok::<_, FileError>(())
     })
     .unwrap();
     assert_eq!(

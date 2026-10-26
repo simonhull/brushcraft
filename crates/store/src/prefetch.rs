@@ -14,7 +14,7 @@
 //! Dropping the [`Prefetcher`] closes the queue and joins the workers. A worker checks the closed
 //! flag before every job and while it waits for one, so it stops after at most the read in hand,
 //! however much work is still queued. A read whose file has been closed under it fails with
-//! [`StoreError::Closed`], which is sent back like any other error: the job is answered, and the
+//! [`FileError::Closed`], which is sent back like any other error: the job is answered, and the
 //! worker goes on to the next.
 //!
 //! A prefetcher reads the files it was started with. The store makes a new one when it swaps its
@@ -29,7 +29,7 @@ use std::thread::{self, JoinHandle};
 use geom::TileKey;
 
 use crate::OpId;
-use crate::file::{BaseFile, FileReader, Loc, ProjectFile, ReadScratch, StoreError};
+use crate::file::{BaseFile, FileError, FileReader, Loc, ProjectFile, ReadScratch};
 use crate::slot::CorrectionSlot;
 
 /// Most worker threads a prefetcher starts, however many cores there are.
@@ -71,7 +71,7 @@ pub(crate) struct Fetched {
     pub(crate) job: Job,
     /// The op of the record read and the decoded tile, boxed so the channel moves a pointer,
     /// not the slot.
-    pub(crate) slot: Result<(OpId, Box<CorrectionSlot>), StoreError>,
+    pub(crate) slot: Result<(OpId, Box<CorrectionSlot>), FileError>,
 }
 
 /// The queue the owner fills and the workers drain, behind the [`Shared`] mutex.
@@ -186,14 +186,14 @@ impl Prefetcher {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] if no worker could be started or a worker's read buffers can't be
+    /// [`FileError::Io`] if no worker could be started or a worker's read buffers can't be
     /// made. Nothing is queued then.
     pub(crate) fn request(
         &mut self,
         working: &ProjectFile,
         base: Option<&BaseFile>,
         jobs: &[Job],
-    ) -> Result<usize, StoreError> {
+    ) -> Result<usize, FileError> {
         if jobs.is_empty() {
             return Ok(0);
         }
@@ -255,8 +255,8 @@ impl Prefetcher {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] if read buffers can't be made, or no worker started.
-    fn start(&mut self, working: &ProjectFile, base: Option<&BaseFile>) -> Result<(), StoreError> {
+    /// [`FileError::Io`] if read buffers can't be made, or no worker started.
+    fn start(&mut self, working: &ProjectFile, base: Option<&BaseFile>) -> Result<(), FileError> {
         let count = thread::available_parallelism()
             .map_or(1, NonZero::get)
             .min(MAX_WORKERS);
@@ -338,7 +338,7 @@ impl Worker {
             };
             // A base job without a base reader can't be queued: the store queues base jobs
             // only when it has a base, and starts its workers with it.
-            let read = reader.map_or(Err(StoreError::Closed), |reader| {
+            let read = reader.map_or(Err(FileError::Closed), |reader| {
                 reader.read_displacement_into(&job.key, job.loc, &mut slot, &mut self.scratch)
             });
             let slot = read.map(|op| (op, slot));

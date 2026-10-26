@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use geom::{BaseMesh, TileKey};
 
-use super::error::StoreError;
+use super::error::FileError;
 use super::{Loc, Name, ProjectFile};
 use crate::bytes::{KEY_LEN, Reader, put_key};
 use crate::codec::{compress, decompress};
@@ -156,12 +156,12 @@ pub(super) fn tile_record<'a>(raw: &'a [u8], key: &TileKey) -> Option<TileRecord
 ///
 /// # Errors
 ///
-/// [`StoreError::BadHeader`] if it is short or has the wrong magic or version, or flags or
+/// [`FileError::BadHeader`] if it is short or has the wrong magic or version, or flags or
 /// reserved bits this version doesn't know (a later version may set them to mean something),
-/// [`StoreError::Io`].
-pub(super) fn check_header(file: &File, len: u64) -> Result<(), StoreError> {
+/// [`FileError::Io`].
+pub(super) fn check_header(file: &File, len: u64) -> Result<(), FileError> {
     if len < FIRST_RECORD {
-        return Err(StoreError::BadHeader);
+        return Err(FileError::BadHeader);
     }
     let mut header = [0; HEADER_LEN];
     file.read_exact_at(&mut header, 0)?;
@@ -173,7 +173,7 @@ pub(super) fn check_header(file: &File, len: u64) -> Result<(), StoreError> {
     {
         Ok(())
     } else {
-        Err(StoreError::BadHeader)
+        Err(FileError::BadHeader)
     }
 }
 
@@ -181,20 +181,20 @@ pub(super) fn check_header(file: &File, len: u64) -> Result<(), StoreError> {
 ///
 /// # Errors
 ///
-/// [`StoreError::MeshMismatch`] if `meta` wasn't made for `mesh`; [`StoreError::TooLarge`] if
-/// the mesh's bytes exceed [`MAX_MESH_RAW`]; [`StoreError::Io`] if compression fails.
-pub(super) fn mesh_record(meta: &Meta, mesh: &BaseMesh) -> Result<Vec<u8>, StoreError> {
+/// [`FileError::MeshMismatch`] if `meta` wasn't made for `mesh`; [`FileError::TooLarge`] if
+/// the mesh's bytes exceed [`MAX_MESH_RAW`]; [`FileError::Io`] if compression fails.
+pub(super) fn mesh_record(meta: &Meta, mesh: &BaseMesh) -> Result<Vec<u8>, FileError> {
     let raw = mesh.to_bytes();
     if mesh_hash(&raw) != meta.mesh_hash() {
-        return Err(StoreError::MeshMismatch);
+        return Err(FileError::MeshMismatch);
     }
     let raw_len = u32::try_from(raw.len())
         .ok()
         .filter(|&n| n <= MAX_MESH_RAW)
-        .ok_or(StoreError::TooLarge)?;
+        .ok_or(FileError::TooLarge)?;
     let mut payload = raw_len.to_le_bytes().to_vec();
     payload.extend_from_slice(&compress(&raw)?);
-    frame(KIND_MESH, &payload).ok_or(StoreError::TooLarge)
+    frame(KIND_MESH, &payload).ok_or(FileError::TooLarge)
 }
 
 /// The header and leading records of a new file holding `meta`, then `mesh_record` (made by
@@ -202,9 +202,9 @@ pub(super) fn mesh_record(meta: &Meta, mesh: &BaseMesh) -> Result<Vec<u8>, Store
 ///
 /// # Errors
 ///
-/// [`StoreError::TooLarge`] if the meta doesn't fit a record (it does).
-pub(super) fn leading_bytes(meta: &Meta, mesh_record: &[u8]) -> Result<Vec<u8>, StoreError> {
-    let meta_record = frame(KIND_META, &meta.to_payload()).ok_or(StoreError::TooLarge)?;
+/// [`FileError::TooLarge`] if the meta doesn't fit a record (it does).
+pub(super) fn leading_bytes(meta: &Meta, mesh_record: &[u8]) -> Result<Vec<u8>, FileError> {
+    let meta_record = frame(KIND_META, &meta.to_payload()).ok_or(FileError::TooLarge)?;
     let mut header = [0; HEADER_LEN];
     let (magic, rest) = header.split_at_mut(MAGIC.len());
     magic.copy_from_slice(&MAGIC);
@@ -236,20 +236,20 @@ pub(super) struct Leading {
 ///
 /// # Errors
 ///
-/// [`StoreError::MissingMeta`] if either record isn't where it belongs;
-/// [`StoreError::BadHeader`] if either is damaged or doesn't parse (or states a mesh larger
-/// than [`MAX_MESH_RAW`]); [`StoreError::MeshMismatch`] if the mesh doesn't match the meta's
-/// hash; [`StoreError::BadMesh`] if it isn't a valid mesh; [`StoreError::Io`].
+/// [`FileError::MissingMeta`] if either record isn't where it belongs;
+/// [`FileError::BadHeader`] if either is damaged or doesn't parse (or states a mesh larger
+/// than [`MAX_MESH_RAW`]); [`FileError::MeshMismatch`] if the mesh doesn't match the meta's
+/// hash; [`FileError::BadMesh`] if it isn't a valid mesh; [`FileError::Io`].
 pub(super) fn read_leading(
     file: &File,
     len: u64,
     like: Option<&ProjectFile>,
-) -> Result<Leading, StoreError> {
+) -> Result<Leading, FileError> {
     let (meta_record, mesh_at) =
         leading_record(file, FIRST_RECORD, len, KIND_META, MAX_META_PAYLOAD)?;
     let meta = verify(&meta_record)
         .and_then(|(_, payload)| Meta::from_payload(payload))
-        .ok_or(StoreError::BadHeader)?;
+        .ok_or(FileError::BadHeader)?;
     let (mesh_record, end) = leading_record(file, mesh_at, len, KIND_MESH, MAX_MESH_PAYLOAD)?;
     if let Some(like) = like
         && like.meta.mesh_hash() == meta.mesh_hash()
@@ -262,18 +262,18 @@ pub(super) fn read_leading(
             end,
         });
     }
-    let (_, payload) = verify(&mesh_record).ok_or(StoreError::BadHeader)?;
+    let (_, payload) = verify(&mesh_record).ok_or(FileError::BadHeader)?;
     let mut r = Reader::new(payload);
     let raw_len = r
         .u32()
         .filter(|&n| n <= MAX_MESH_RAW)
         .and_then(|n| usize::try_from(n).ok())
-        .ok_or(StoreError::BadHeader)?;
-    let raw = decompress(r.rest(), raw_len).or(Err(StoreError::BadHeader))?;
+        .ok_or(FileError::BadHeader)?;
+    let raw = decompress(r.rest(), raw_len).or(Err(FileError::BadHeader))?;
     if mesh_hash(&raw) != meta.mesh_hash() {
-        return Err(StoreError::MeshMismatch);
+        return Err(FileError::MeshMismatch);
     }
-    let mesh = BaseMesh::from_bytes(&raw).map_err(StoreError::BadMesh)?;
+    let mesh = BaseMesh::from_bytes(&raw).map_err(FileError::BadMesh)?;
     Ok(Leading {
         meta,
         mesh: Arc::new(mesh),
@@ -287,31 +287,31 @@ pub(super) fn read_leading(
 ///
 /// # Errors
 ///
-/// [`StoreError::MissingMeta`] if the file ends before the record's head or the head is of
-/// another kind; [`StoreError::BadHeader`] if the head is malformed, the record states more
-/// than `max` bytes or runs past the end, or fails its checksum; [`StoreError::Io`].
+/// [`FileError::MissingMeta`] if the file ends before the record's head or the head is of
+/// another kind; [`FileError::BadHeader`] if the head is malformed, the record states more
+/// than `max` bytes or runs past the end, or fails its checksum; [`FileError::Io`].
 fn leading_record(
     file: &File,
     offset: u64,
     len: u64,
     kind: u8,
     max: u32,
-) -> Result<(Vec<u8>, u64), StoreError> {
+) -> Result<(Vec<u8>, u64), FileError> {
     if offset.saturating_add(HEAD as u64) > len {
-        return Err(StoreError::MissingMeta);
+        return Err(FileError::MissingMeta);
     }
     let mut bytes = [0; HEAD];
     file.read_exact_at(&mut bytes, offset)?;
-    let head = parse_head(bytes).ok_or(StoreError::BadHeader)?;
+    let head = parse_head(bytes).ok_or(FileError::BadHeader)?;
     if head.kind != kind {
-        return Err(StoreError::MissingMeta);
+        return Err(FileError::MissingMeta);
     }
     let end = offset.saturating_add(head.total());
     if head.len > max || end > len {
-        return Err(StoreError::BadHeader);
+        return Err(FileError::BadHeader);
     }
     let raw = read_exact(file, offset, head.total())?;
-    verify(&raw).ok_or(StoreError::BadHeader)?;
+    verify(&raw).ok_or(FileError::BadHeader)?;
     Ok((raw, end))
 }
 
@@ -671,7 +671,7 @@ pub(super) fn chain_from(
 ///
 /// # Errors
 ///
-/// [`StoreError::TooLarge`] if the header exceeds its length field, the body [`MAX_RAW`], or the
+/// [`FileError::TooLarge`] if the header exceeds its length field, the body [`MAX_RAW`], or the
 /// framed record [`MAX_TILE_RECORD`].
 pub(super) fn tile_payload(
     key: TileKey,
@@ -679,16 +679,16 @@ pub(super) fn tile_payload(
     header: &[u8],
     raw_len: usize,
     packed: &[u8],
-) -> Result<Vec<u8>, StoreError> {
-    let header_len = u16::try_from(header.len()).or(Err(StoreError::TooLarge))?;
+) -> Result<Vec<u8>, FileError> {
+    let header_len = u16::try_from(header.len()).or(Err(FileError::TooLarge))?;
     let raw_len = u32::try_from(raw_len)
         .ok()
         .filter(|&n| n <= MAX_RAW)
-        .ok_or(StoreError::TooLarge)?;
+        .ok_or(FileError::TooLarge)?;
     let payload_len = KEY_LEN + 14 + header.len() + packed.len();
-    let framed = u64::try_from(HEAD + TAIL + payload_len).or(Err(StoreError::TooLarge))?;
+    let framed = u64::try_from(HEAD + TAIL + payload_len).or(Err(FileError::TooLarge))?;
     if framed > MAX_TILE_RECORD {
-        return Err(StoreError::TooLarge);
+        return Err(FileError::TooLarge);
     }
     let mut out = Vec::with_capacity(payload_len);
     put_key(&mut out, &key);
@@ -728,14 +728,14 @@ pub(super) fn parse_tile_payload(payload: &[u8]) -> Option<TileRecord<'_>> {
 ///
 /// # Errors
 ///
-/// [`StoreError::TooLarge`] if either section has more than `u32::MAX` entries or a record is
+/// [`FileError::TooLarge`] if either section has more than `u32::MAX` entries or a record is
 /// longer than `u32::MAX` bytes.
 pub(super) fn index_payload(
     coverage: Coverage,
     parent: Option<u64>,
     head: Option<OpId>,
     entries: &BTreeMap<Name, Loc>,
-) -> Result<Vec<u8>, StoreError> {
+) -> Result<Vec<u8>, FileError> {
     let tiles = entries
         .keys()
         .take_while(|name| name.tile().is_some())
@@ -749,7 +749,7 @@ pub(super) fn index_payload(
     out.extend_from_slice(&[0; 7]);
     out.extend_from_slice(&parent.unwrap_or(NONE).to_le_bytes());
     out.extend_from_slice(&head.map_or(NONE, OpId::to_bits).to_le_bytes());
-    let count = |n: usize| u32::try_from(n).or(Err(StoreError::TooLarge));
+    let count = |n: usize| u32::try_from(n).or(Err(FileError::TooLarge));
     out.extend_from_slice(&count(tiles)?.to_le_bytes());
     for (n, (name, loc)) in entries.iter().enumerate() {
         if n == tiles {
@@ -758,7 +758,7 @@ pub(super) fn index_payload(
         let (Name::Tile(key) | Name::Bounds(key)) = name;
         put_key(&mut out, key);
         out.extend_from_slice(&loc.offset.to_le_bytes());
-        let len = u32::try_from(loc.len).or(Err(StoreError::TooLarge))?;
+        let len = u32::try_from(loc.len).or(Err(FileError::TooLarge))?;
         out.extend_from_slice(&len.to_le_bytes());
     }
     Ok(out)

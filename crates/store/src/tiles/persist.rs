@@ -37,7 +37,7 @@ use crate::deps::DepGraph;
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, ProjectFile, ReadScratch};
 use crate::hash::TileMap;
-use crate::kept::Kept;
+use crate::kept::KeptLru;
 use crate::meta::Role;
 use crate::op::RESERVED_SITE;
 use crate::pool::{Budget, Pool};
@@ -162,7 +162,7 @@ impl TileStore {
             workers,
             read_scratch: ReadScratch::new()?,
             worker_read_scratch: Vec::new(),
-            kept: Kept::new(config.kept_predictions),
+            kept: KeptLru::new(config.kept_predictions),
             stroke_tiles: config.stroke_tiles,
             id: StoreId::next(),
             edits: 0,

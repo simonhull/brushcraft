@@ -96,7 +96,7 @@ use thiserror::Error;
 
 use crate::OpId;
 use crate::file::{
-    BaseFile, PRIVATE_MODE, ProjectFile, SHARED_MODE, StoreError, open_regular, sync_parent,
+    BaseFile, FileError, PRIVATE_MODE, ProjectFile, SHARED_MODE, open_regular, sync_parent,
 };
 use crate::index::{IndexError, LoadStats, SpatialIndex};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
@@ -152,7 +152,7 @@ pub enum ProjectError {
     Io(#[from] io::Error),
     /// The project file or a recovery file failed.
     #[error("a project or recovery file failed")]
-    Store(#[from] StoreError),
+    Store(#[from] FileError),
     /// The tile store failed.
     #[error("the tile store failed")]
     Cache(#[from] CacheError),
@@ -468,7 +468,7 @@ impl Project {
     /// # Errors
     ///
     /// [`ProjectError::Store`] if the file can't be opened (including
-    /// [`StoreError::Locked`]); [`ProjectError::NotAProject`]; [`ProjectError::NeverSaved`];
+    /// [`FileError::Locked`]); [`ProjectError::NotAProject`]; [`ProjectError::NeverSaved`];
     /// as [`Project::new`] for the recovery file, the store and the writer.
     pub fn open(path: &Path, config: ProjectConfig) -> Result<Self, ProjectError> {
         let path = std::path::absolute(path)?;
@@ -521,7 +521,7 @@ impl Project {
     /// moved or deleted since, or is open elsewhere); [`ProjectError::CandidateChanged`] if
     /// another file is under the candidate's path; [`ProjectError::Store`] if either file
     /// can't be opened (the recovery file is held by a running instance:
-    /// [`StoreError::Locked`]); [`ProjectError::Cache`] if the store refuses `config.store`;
+    /// [`FileError::Locked`]); [`ProjectError::Cache`] if the store refuses `config.store`;
     /// [`ProjectError::Recovery`] if the writer's thread can't be started. The recovery file is
     /// kept on error.
     pub fn restore(
@@ -1390,7 +1390,7 @@ fn retire(old: &Path) -> Result<(), KeptRecovery> {
         Err(e) => return Err(kept(e)),
     }
     sync_parent(old).map_err(|e| {
-        if let StoreError::Io(io) = e {
+        if let FileError::Io(io) = e {
             kept(io)
         } else {
             kept(io::Error::other(e))
@@ -1457,9 +1457,9 @@ fn create_clean(
     meta: Meta,
     like: &ProjectFile,
     mode: u32,
-) -> Result<ProjectFile, StoreError> {
+) -> Result<ProjectFile, FileError> {
     ProjectFile::create_like_mode(at, meta, like, mode).inspect_err(|e| {
-        if !matches!(e, StoreError::Io(io) if io.kind() == io::ErrorKind::AlreadyExists) {
+        if !matches!(e, FileError::Io(io) if io.kind() == io::ErrorKind::AlreadyExists) {
             drop(fs::remove_file(at));
         }
     })
@@ -1691,8 +1691,8 @@ fn candidate(path: PathBuf, named: ProjectId, modified: SystemTime) -> Option<Re
     };
     let file = match ProjectFile::inspect(&path) {
         Ok(file) => file,
-        Err(StoreError::Locked) => return None,
-        Err(StoreError::Io(e)) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(FileError::Locked) => return None,
+        Err(FileError::Io(e)) if e.kind() == io::ErrorKind::NotFound => return None,
         Err(_) => return Some(damaged(path)),
     };
     let meta = file.meta();
@@ -1732,12 +1732,12 @@ fn candidate(path: PathBuf, named: ProjectId, modified: SystemTime) -> Option<Re
 ///
 /// # Errors
 ///
-/// [`StoreError::Damaged`] if a save point of the project file no longer loads;
-/// [`StoreError::Io`].
+/// [`FileError::Damaged`] if a save point of the project file no longer loads;
+/// [`FileError::Io`].
 fn standing(
     meta: &Meta,
     project: &ProjectFile,
-) -> Result<(CandidateStatus, Option<BaseFile>), StoreError> {
+) -> Result<(CandidateStatus, Option<BaseFile>), FileError> {
     let Role::Recovery { base: Some(point) } = meta.role() else {
         return Ok((CandidateStatus::ProjectMissing, None));
     };
@@ -1761,7 +1761,7 @@ fn standing(
 /// The error a restore reports for a project file that failed to open with `e`:
 /// [`ProjectError::NotRestorable`] if the project isn't available ([`unavailable`]), else the
 /// failure itself.
-fn not_restorable(e: StoreError) -> ProjectError {
+fn not_restorable(e: FileError) -> ProjectError {
     match unavailable(&e) {
         Some(status) => ProjectError::NotRestorable(status),
         None => e.into(),
@@ -1773,12 +1773,12 @@ fn not_restorable(e: StoreError) -> ProjectError {
 ///
 /// That is [`CandidateStatus::ProjectMissing`] for a file that isn't there, and
 /// [`CandidateStatus::ProjectInUse`] for one a running instance holds.
-fn unavailable(e: &StoreError) -> Option<CandidateStatus> {
-    if let StoreError::Io(io) = e
+fn unavailable(e: &FileError) -> Option<CandidateStatus> {
+    if let FileError::Io(io) = e
         && io.kind() == io::ErrorKind::NotFound
     {
         Some(CandidateStatus::ProjectMissing)
-    } else if matches!(e, StoreError::Locked) {
+    } else if matches!(e, FileError::Locked) {
         Some(CandidateStatus::ProjectInUse)
     } else {
         None
@@ -1856,7 +1856,7 @@ impl Unplaced {
 fn create_recovery(
     dir: &Path,
     project: ProjectId,
-    create: impl FnOnce(&Path) -> Result<ProjectFile, StoreError>,
+    create: impl FnOnce(&Path) -> Result<ProjectFile, FileError>,
 ) -> Result<(ProjectFile, Unplaced), ProjectError> {
     fs::DirBuilder::new()
         .recursive(true)
@@ -1883,7 +1883,7 @@ fn create_recovery(
 fn create_placed(
     dir: &Path,
     project: ProjectId,
-    create: impl FnOnce(&Path) -> Result<ProjectFile, StoreError>,
+    create: impl FnOnce(&Path) -> Result<ProjectFile, FileError>,
 ) -> Result<(ProjectFile, PathBuf), ProjectError> {
     let (file, names) = create_recovery(dir, project, create)?;
     let path = names.place()?;

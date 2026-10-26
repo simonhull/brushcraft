@@ -601,7 +601,7 @@ fn a_failed_sync_fails_the_writer_and_leaves_the_last_durable_save_point() {
         let (at, error) = failed.expect("the failed sync is reported");
         assert_eq!(at, phase, "it failed where the hook made it fail");
         assert!(
-            matches!(error, RecoveryError::Sync(StoreError::Io(_))),
+            matches!(error, RecoveryError::Sync(FileError::Io(_))),
             "{phase}: reported as a sync failure: {error:?}"
         );
         assert!(writer.is_failed(), "{phase}: the writer is failed");

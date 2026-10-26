@@ -58,7 +58,7 @@ fn only_a_regular_file_opens() {
     for path in [Path::new("/dev/null"), directory.as_path()] {
         let inspected = ProjectFile::inspect(path).map(drop);
         assert!(
-            matches!(&inspected, Err(StoreError::Io(e)) if e.kind() == io::ErrorKind::InvalidInput),
+            matches!(&inspected, Err(FileError::Io(e)) if e.kind() == io::ErrorKind::InvalidInput),
             "{}: {inspected:?}",
             path.display()
         );

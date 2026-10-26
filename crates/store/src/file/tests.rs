@@ -152,7 +152,7 @@ fn a_full_index_its_derived_maps_disagree_with_is_refused_before_it_is_written()
     assert!(
         matches!(
             refused,
-            Err(StoreError::SavePointMismatch {
+            Err(FileError::SavePointMismatch {
                 named: 2,
                 derived: 1
             })
@@ -322,7 +322,7 @@ fn bad_header_is_rejected() {
     let path = dir.path("p.bcrf");
     std::fs::write(&path, b"NOTAPROJECTFILE!").unwrap();
     assert!(
-        matches!(ProjectFile::open(&path), Err(StoreError::BadHeader)),
+        matches!(ProjectFile::open(&path), Err(FileError::BadHeader)),
         "magic"
     );
 }
@@ -344,7 +344,7 @@ fn a_damaged_old_tile_is_caught_when_read() {
     assert!(
         matches!(
             opened.read_displacement(&key(1, 0)),
-            Err(StoreError::Damaged { .. })
+            Err(FileError::Damaged { .. })
         ),
         "checksum"
     );
@@ -513,7 +513,7 @@ fn every_save_point_opens_to_its_own_state() {
         assert!(
             matches!(
                 old.write_displacement(key(0, 0), op(1), &tile(0.0)),
-                Err(StoreError::ReadOnly)
+                Err(FileError::ReadOnly)
             ),
             "read-only"
         );
@@ -521,7 +521,7 @@ fn every_save_point_opens_to_its_own_state() {
     assert!(
         matches!(
             ProjectFile::open_at(&path, 17),
-            Err(StoreError::NotASavePoint(17))
+            Err(FileError::NotASavePoint(17))
         ),
         "not an index"
     );
@@ -646,7 +646,7 @@ fn damage_before_later_records_fails_open_and_leaves_the_file() {
         assert!(
             matches!(
                 opened,
-                Err(StoreError::DamagedMidFile { offset }) if offset == start
+                Err(FileError::DamagedMidFile { offset }) if offset == start
             ),
             "{what}: {opened:?}"
         );
@@ -895,14 +895,14 @@ fn a_damaged_record_read_through_a_reader_is_damaged() {
     assert!(
         matches!(
             reader.read_displacement_into(&key(1, 0), other, &mut slot, &mut scratch),
-            Err(StoreError::Damaged { offset }) if offset == other.offset
+            Err(FileError::Damaged { offset }) if offset == other.offset
         ),
         "wrong key"
     );
     assert!(
         matches!(
             reader.read_displacement_into(&small_key(1), loc, &mut slot, &mut scratch),
-            Err(StoreError::Damaged { .. })
+            Err(FileError::Damaged { .. })
         ),
         "a key of another level"
     );
@@ -923,7 +923,7 @@ fn a_damaged_record_read_through_a_reader_is_damaged() {
     assert!(
         matches!(
             reader.read_displacement_into(&key(1, 0), loc, &mut slot, &mut scratch),
-            Err(StoreError::Damaged { offset }) if offset == loc.offset
+            Err(FileError::Damaged { offset }) if offset == loc.offset
         ),
         "flipped bit"
     );
@@ -931,7 +931,7 @@ fn a_damaged_record_read_through_a_reader_is_damaged() {
     assert!(
         matches!(
             f.read_displacement_into(&key(1, 0), &mut slot, &mut scratch),
-            Err(StoreError::Damaged { .. })
+            Err(FileError::Damaged { .. })
         ),
         "the owner's read agrees"
     );
@@ -960,7 +960,7 @@ fn a_reader_lets_go_of_the_file_when_its_owner_drops() {
     assert!(
         matches!(
             clone.read_displacement_into(&key(1, 0), loc, &mut slot, &mut scratch),
-            Err(StoreError::Closed)
+            Err(FileError::Closed)
         ),
         "a reader of a closed file reads nothing"
     );
@@ -983,7 +983,7 @@ fn a_body_that_decompresses_short_is_damaged() {
         matches!(
             f.reader()
                 .read_displacement_into(&k, loc, &mut slot, &mut scratch),
-            Err(StoreError::Damaged { offset }) if offset == loc.offset
+            Err(FileError::Damaged { offset }) if offset == loc.offset
         ),
         "the reader rejects it"
     );
@@ -992,12 +992,12 @@ fn a_body_that_decompresses_short_is_damaged() {
     assert!(
         matches!(
             f.read_displacement(&k),
-            Err(StoreError::Damaged { offset }) if offset == loc.offset
+            Err(FileError::Damaged { offset }) if offset == loc.offset
         ),
         "so does the owner"
     );
     assert!(
-        matches!(f.read_tile(&k), Err(StoreError::Damaged { .. })),
+        matches!(f.read_tile(&k), Err(FileError::Damaged { .. })),
         "and the raw read"
     );
 }
@@ -1047,7 +1047,7 @@ fn a_meta_made_for_another_mesh_creates_nothing() {
     let other = geom::cube_sphere(2).unwrap();
     let created = ProjectFile::create(&path, fixture::meta_for(&other), mesh());
     assert!(
-        matches!(created, Err(StoreError::MeshMismatch)),
+        matches!(created, Err(FileError::MeshMismatch)),
         "{created:?}"
     );
     assert!(!path.exists(), "no file");

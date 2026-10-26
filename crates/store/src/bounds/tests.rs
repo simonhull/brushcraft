@@ -270,7 +270,11 @@ fn the_book_makes_unknown_what_a_write_changes() {
     assert!(book.changes() > changes, "counted");
     let forgotten = book.forget(&mesh, &DepGraph::new(), [all[20]]).unwrap();
     assert!(forgotten.contains(&all[20]), "a lost tile's own bound");
-    assert_eq!(book.changed(&all[20]), Some(Kept::Unknown), "unknown");
+    assert_eq!(
+        book.changed(&all[20]),
+        Some(StoredBound::Unknown),
+        "unknown"
+    );
     book.rebased();
     assert!(book.changed(&all[0]).is_none(), "a rebase empties the book");
     assert!(!book.has_unflushed(), "and the flush list");
@@ -360,7 +364,7 @@ fn settling_while_recording_is_settling_then_recording() {
     for key in stale.iter().skip(stale.len() / 2) {
         assert_eq!(
             together.changed(key),
-            Some(Kept::Unknown),
+            Some(StoredBound::Unknown),
             "{key:?} stays unknown"
         );
     }

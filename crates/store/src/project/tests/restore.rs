@@ -210,7 +210,7 @@ fn a_project_saved_since_restores_onto_the_earlier_save_point_and_saves_as_new()
     drop(reader);
     let writer = ProjectFile::open(&path).map(drop);
     assert!(
-        matches!(writer, Err(StoreError::Locked)),
+        matches!(writer, Err(FileError::Locked)),
         "a writer can't: {writer:?}"
     );
     let mesh = mesh();

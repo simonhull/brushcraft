@@ -125,7 +125,7 @@ use crate::deps::DepGraph;
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, ProjectFile, ReadScratch};
 use crate::hash::TileMap;
-use crate::kept::Kept;
+use crate::kept::KeptLru;
 use crate::op::OpId;
 use crate::pool::{Budget, Pool};
 use crate::prefetch::Prefetcher;
@@ -408,7 +408,7 @@ pub struct TileStore {
     /// The predictions kept for tiles predicted again in place (see "Kept predictions" on
     /// [`TileStore`]): only of tiles resident in the evaluated pool, and only while their
     /// parents' positions stay as they were.
-    kept: Kept<Prediction>,
+    kept: KeptLru<Prediction>,
     /// How many tiles' stroke state the budget set aside ([`StoreConfig::stroke_tiles`]): the
     /// most a brush stroke over this store may keep, which it reads through
     /// [`TileStore::stroke_tiles`]. The store holds none of that state itself.

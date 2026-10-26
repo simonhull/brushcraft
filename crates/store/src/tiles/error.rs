@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use geom::{CorrectionError, EvalError, TileKey};
 use thiserror::Error;
 
-use crate::file::StoreError;
+use crate::file::FileError;
 use crate::op::RESERVED_SITE;
 use crate::pool::PoolError;
 use crate::workers::StartWorkersError;
@@ -17,7 +17,7 @@ use crate::workers::StartWorkersError;
 pub enum CacheError {
     /// Reading the working file, or recording a save point in it, failed.
     #[error("project file operation failed")]
-    Store(#[from] StoreError),
+    Store(#[from] FileError),
     /// No slot to be had: every slot of the pool that needs one is pinned, and no chunk without a
     /// pin is left to take back. Only pins taken with [`TileStore::pin`](super::TileStore::pin) can
     /// crowd the store's own work this far (see
@@ -27,11 +27,11 @@ pub enum CacheError {
     /// Writing a dirty correction tile to the working file failed: when its slot was needed, or
     /// on [`TileStore::save`](super::TileStore::save). The tile stays resident and dirty.
     #[error("writing a dirty correction tile back failed")]
-    WriteBack(#[source] StoreError),
+    WriteBack(#[source] FileError),
     /// Writing the project file during a save failed: a tile, or the save point. The store is
     /// unchanged (its working file still holds every edit), and the save can be tried again.
     #[error("writing the project file during a save failed")]
-    Save(#[source] StoreError),
+    Save(#[source] FileError),
     /// Evaluation failed (not for a valid mesh).
     #[error("evaluation failed")]
     Eval(#[from] EvalError),
@@ -185,7 +185,7 @@ pub enum Invariant {
         got: usize,
     },
     /// A full save point would have named a different number of records than the maps derived
-    /// for it hold (see [`StoreError::SavePointMismatch`]). Nothing was written.
+    /// for it hold (see [`FileError::SavePointMismatch`]). Nothing was written.
     #[error("a full save point names {named} records, but its derived maps hold {derived}")]
     SavePointMismatch {
         /// The records the full Index would name.
@@ -198,14 +198,11 @@ pub enum Invariant {
 impl CacheError {
     /// `error`, from writing a save point, as the store reports it.
     ///
-    /// [`StoreError::SavePointMismatch`] is a bug in deriving the save point, which trying again
+    /// [`FileError::SavePointMismatch`] is a bug in deriving the save point, which trying again
     /// can't fix, so it is [`Invariant::SavePointMismatch`] whatever the operation was. Any other
     /// error is `wrap`ped as the operation reports file errors.
-    pub(super) fn from_save_point(
-        error: StoreError,
-        wrap: impl FnOnce(StoreError) -> Self,
-    ) -> Self {
-        if let StoreError::SavePointMismatch { named, derived } = error {
+    pub(super) fn from_save_point(error: FileError, wrap: impl FnOnce(FileError) -> Self) -> Self {
+        if let FileError::SavePointMismatch { named, derived } = error {
             return Invariant::SavePointMismatch { named, derived }.into();
         }
         wrap(error)

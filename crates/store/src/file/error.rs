@@ -1,4 +1,4 @@
-//! Why a project file operation fails: [`StoreError`].
+//! Why a project file operation fails: [`FileError`].
 
 use std::io;
 
@@ -10,7 +10,7 @@ use crate::codec::CodecError;
 /// Why a project file operation failed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum StoreError {
+pub enum FileError {
     /// An I/O call failed.
     #[error("project file I/O failed")]
     Io(#[from] io::Error),

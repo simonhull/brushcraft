@@ -53,7 +53,7 @@ mod reader;
 pub(crate) use base::BaseFile;
 pub(crate) use compact::sync_parent;
 pub use compact::{compact, compact_in_place};
-pub use error::StoreError;
+pub use error::FileError;
 #[cfg(any(feature = "fuzzing", test))]
 pub(crate) use format::HEADER_LEN;
 pub use format::{MAX_MESH_RAW, MAX_RAW};
@@ -162,7 +162,7 @@ enum Stop {
 enum Repair {
     /// Cut them off, so the file is writable again. Opens read-write.
     Truncate,
-    /// Fail with [`StoreError::NeedsRepair`]: the file can't be written. Opens read-only.
+    /// Fail with [`FileError::NeedsRepair`]: the file can't be written. Opens read-only.
     Refuse,
     /// Leave them in place and open the save point read-only, for compaction and inspection.
     Ignore,
@@ -344,17 +344,17 @@ impl ProjectFile {
     /// ([`Meta::new`]); this is checked before the file is created.
     ///
     /// The file is created, then locked: in between, another open of the same path can find it
-    /// without its header (and fail with [`StoreError::BadHeader`]) or lock it first (and this
-    /// fails with [`StoreError::Locked`], leaving the empty file behind). Only two processes
+    /// without its header (and fail with [`FileError::BadHeader`]) or lock it first (and this
+    /// fails with [`FileError::Locked`], leaving the empty file behind). Only two processes
     /// creating and opening one new path at the same instant can meet this.
     ///
     /// # Errors
     ///
-    /// [`StoreError::MeshMismatch`] if `meta`'s mesh hash isn't `mesh`'s;
-    /// [`StoreError::TooLarge`] if the mesh's canonical bytes exceed [`MAX_MESH_RAW`] (nothing is
-    /// created then); [`StoreError::Io`], including when `path` already exists;
-    /// [`StoreError::Locked`].
-    pub fn create(path: &Path, meta: Meta, mesh: Arc<BaseMesh>) -> Result<Self, StoreError> {
+    /// [`FileError::MeshMismatch`] if `meta`'s mesh hash isn't `mesh`'s;
+    /// [`FileError::TooLarge`] if the mesh's canonical bytes exceed [`MAX_MESH_RAW`] (nothing is
+    /// created then); [`FileError::Io`], including when `path` already exists;
+    /// [`FileError::Locked`].
+    pub fn create(path: &Path, meta: Meta, mesh: Arc<BaseMesh>) -> Result<Self, FileError> {
         let record = mesh_record(&meta, &mesh)?;
         Self::create_with(path, meta, mesh, record.into(), SHARED_MODE)
     }
@@ -369,7 +369,7 @@ impl ProjectFile {
         path: &Path,
         meta: Meta,
         mesh: Arc<BaseMesh>,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Self, FileError> {
         let record = mesh_record(&meta, &mesh)?;
         Self::create_with(path, meta, mesh, record.into(), PRIVATE_MODE)
     }
@@ -381,7 +381,7 @@ impl ProjectFile {
     ///
     /// As [`ProjectFile::create_like_mode`].
     #[cfg(test)]
-    pub(crate) fn create_like(path: &Path, meta: Meta, like: &Self) -> Result<Self, StoreError> {
+    pub(crate) fn create_like(path: &Path, meta: Meta, like: &Self) -> Result<Self, FileError> {
         Self::create_like_mode(path, meta, like, SHARED_MODE)
     }
 
@@ -394,16 +394,16 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// As [`ProjectFile::create`]; [`StoreError::MeshMismatch`] if `meta`'s mesh hash isn't
+    /// As [`ProjectFile::create`]; [`FileError::MeshMismatch`] if `meta`'s mesh hash isn't
     /// `like`'s.
     pub(crate) fn create_like_mode(
         path: &Path,
         meta: Meta,
         like: &Self,
         mode: u32,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Self, FileError> {
         if meta.mesh_hash() != like.meta.mesh_hash() {
-            return Err(StoreError::MeshMismatch);
+            return Err(FileError::MeshMismatch);
         }
         Self::create_with(
             path,
@@ -427,7 +427,7 @@ impl ProjectFile {
         mesh: Arc<BaseMesh>,
         mesh_record: Arc<[u8]>,
         mode: u32,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Self, FileError> {
         let leading = leading_bytes(&meta, &mesh_record)?;
         let file = OpenOptions::new()
             .read(true)
@@ -488,10 +488,10 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::DamagedMidFile`], [`StoreError::NeedsRepair`], [`StoreError::Locked`],
-    /// [`StoreError::BadHeader`], [`StoreError::MissingMeta`], [`StoreError::MeshMismatch`],
-    /// [`StoreError::BadMesh`], [`StoreError::Io`].
-    pub fn open(path: &Path) -> Result<Self, StoreError> {
+    /// [`FileError::DamagedMidFile`], [`FileError::NeedsRepair`], [`FileError::Locked`],
+    /// [`FileError::BadHeader`], [`FileError::MissingMeta`], [`FileError::MeshMismatch`],
+    /// [`FileError::BadMesh`], [`FileError::Io`].
+    pub fn open(path: &Path) -> Result<Self, FileError> {
         Self::open_sharing(path, None)
     }
 
@@ -503,7 +503,7 @@ impl ProjectFile {
     /// # Errors
     ///
     /// As [`ProjectFile::open`].
-    pub(crate) fn open_sharing_mesh(path: &Path, like: &Self) -> Result<Self, StoreError> {
+    pub(crate) fn open_sharing_mesh(path: &Path, like: &Self) -> Result<Self, FileError> {
         Self::open_sharing(path, Some(like))
     }
 
@@ -512,10 +512,10 @@ impl ProjectFile {
     /// # Errors
     ///
     /// As [`ProjectFile::open`].
-    fn open_sharing(path: &Path, like: Option<&Self>) -> Result<Self, StoreError> {
+    fn open_sharing(path: &Path, like: Option<&Self>) -> Result<Self, FileError> {
         match open_locked(path, open_writable, Lock::Exclusive) {
             Ok(file) => Self::open_latest(file, Repair::Truncate, like),
-            Err(StoreError::Io(e))
+            Err(FileError::Io(e))
                 if matches!(
                     e.kind(),
                     io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
@@ -543,7 +543,7 @@ impl ProjectFile {
         file: LockedFile,
         repair: Repair,
         like: Option<&Self>,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Self, FileError> {
         let access = repair.access();
         let len = file.metadata()?.len();
         check_header(&file, len)?;
@@ -574,14 +574,14 @@ impl ProjectFile {
                     Search::Nothing => false,
                 };
             if damaged {
-                return Err(StoreError::DamagedMidFile { offset: stopped_at });
+                return Err(FileError::DamagedMidFile { offset: stopped_at });
             }
             match repair {
                 Repair::Truncate => {
                     this.file.set_len(this.end)?;
                     this.file.sync_all()?;
                 }
-                Repair::Refuse => return Err(StoreError::NeedsRepair { offset: this.end }),
+                Repair::Refuse => return Err(FileError::NeedsRepair { offset: this.end }),
                 Repair::Ignore => {}
             }
         }
@@ -597,9 +597,9 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Locked`] if the file is open for writing; as [`ProjectFile::open`]
-    /// otherwise, except [`StoreError::NeedsRepair`].
-    pub(crate) fn inspect(path: &Path) -> Result<Self, StoreError> {
+    /// [`FileError::Locked`] if the file is open for writing; as [`ProjectFile::open`]
+    /// otherwise, except [`FileError::NeedsRepair`].
+    pub(crate) fn inspect(path: &Path) -> Result<Self, FileError> {
         Self::open_latest(
             open_locked(path, open_readable, Lock::Shared)?,
             Repair::Ignore,
@@ -612,19 +612,19 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotASavePoint`] if no good Index starts there, [`StoreError::Damaged`] if
-    /// its parent chain is, [`StoreError::Locked`] if the file is open for writing,
-    /// [`StoreError::BadHeader`], [`StoreError::MissingMeta`], [`StoreError::MeshMismatch`],
-    /// [`StoreError::BadMesh`], [`StoreError::Io`].
-    pub fn open_at(path: &Path, index_offset: u64) -> Result<Self, StoreError> {
+    /// [`FileError::NotASavePoint`] if no good Index starts there, [`FileError::Damaged`] if
+    /// its parent chain is, [`FileError::Locked`] if the file is open for writing,
+    /// [`FileError::BadHeader`], [`FileError::MissingMeta`], [`FileError::MeshMismatch`],
+    /// [`FileError::BadMesh`], [`FileError::Io`].
+    pub fn open_at(path: &Path, index_offset: u64) -> Result<Self, FileError> {
         let file = open_locked(path, open_readable, Lock::Shared)?;
         let len = file.metadata()?.len();
         check_header(&file, len)?;
         let leading = read_leading(&file, len, None)?;
         if index_offset < leading.end || read_index(&file, index_offset, len)?.is_none() {
-            return Err(StoreError::NotASavePoint(index_offset));
+            return Err(FileError::NotASavePoint(index_offset));
         }
-        let chain = load_chain(&file, index_offset, len)?.ok_or(StoreError::Damaged {
+        let chain = load_chain(&file, index_offset, len)?.ok_or(FileError::Damaged {
             offset: index_offset,
         })?;
         let saved = SavedState::loaded(index_offset, chain.head, &chain.live);
@@ -656,8 +656,8 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`].
-    fn load_base(&mut self, heads: &[(u64, Head)], len: u64) -> Result<usize, StoreError> {
+    /// [`FileError::Io`].
+    fn load_base(&mut self, heads: &[(u64, Head)], len: u64) -> Result<usize, FileError> {
         let indexes: BTreeSet<u64> = heads
             .iter()
             .filter(|(_, head)| head.kind == KIND_INDEX)
@@ -701,8 +701,8 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`].
-    fn walk_tail(&self, heads: &[(u64, Head)]) -> Result<(Stop, u64), StoreError> {
+    /// [`FileError::Io`].
+    fn walk_tail(&self, heads: &[(u64, Head)]) -> Result<(Stop, u64), FileError> {
         let mut at = self.end;
         for &(offset, head) in heads {
             let raw = read_exact(&self.file, offset, head.total())?;
@@ -720,15 +720,15 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`] (including a body larger than
-    /// [`MAX_RAW`]), [`StoreError::Io`].
+    /// [`FileError::ReadOnly`], [`FileError::TooLarge`] (including a body larger than
+    /// [`MAX_RAW`]), [`FileError::Io`].
     pub fn write_tile(
         &mut self,
         key: TileKey,
         op: OpId,
         header: &[u8],
         body: &[u8],
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), FileError> {
         self.write_tile_stamped(key, op, Stamp::ZERO, header, body)
     }
 
@@ -745,13 +745,13 @@ impl ProjectFile {
         stamp: Stamp,
         header: &[u8],
         body: &[u8],
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly);
+            return Err(FileError::ReadOnly);
         }
         // Checked before compressing: no reader would accept it.
         if !u32::try_from(body.len()).is_ok_and(|n| n <= MAX_RAW) {
-            return Err(StoreError::TooLarge);
+            return Err(FileError::TooLarge);
         }
         let packed = compress(body)?;
         let payload = tile_payload(key, op, header, body.len(), &packed)?;
@@ -764,14 +764,14 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// As [`ProjectFile::write_tile`]; [`StoreError::NotDisplacement`] if `key` is of another
-    /// channel, [`StoreError::WrongSide`] if the tile's side isn't the key's.
+    /// As [`ProjectFile::write_tile`]; [`FileError::NotDisplacement`] if `key` is of another
+    /// channel, [`FileError::WrongSide`] if the tile's side isn't the key's.
     pub fn write_displacement(
         &mut self,
         key: TileKey,
         op: OpId,
         tile: &CorrectionTile,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), FileError> {
         self.write_displacement_stamped(key, op, Stamp::ZERO, tile)
     }
 
@@ -787,7 +787,7 @@ impl ProjectFile {
         op: OpId,
         stamp: Stamp,
         tile: &CorrectionTile,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), FileError> {
         check_displacement(&key, tile.side())?;
         let (header, body) = encode_displacement(tile)?;
         self.write_tile_stamped(key, op, stamp, &header, &body)
@@ -800,10 +800,10 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::Io`].
-    pub(crate) fn append_framed(&mut self, tile: &FramedTile) -> Result<(), StoreError> {
+    /// [`FileError::ReadOnly`], [`FileError::Io`].
+    pub(crate) fn append_framed(&mut self, tile: &FramedTile) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly);
+            return Err(FileError::ReadOnly);
         }
         let loc = self.append_record(&tile.record)?;
         self.note(Name::Tile(tile.key), Some(tile.op), tile.stamp, loc);
@@ -878,9 +878,9 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::TooLarge`], [`StoreError::Io`].
-    fn append(&mut self, kind: u8, payload: &[u8]) -> Result<Loc, StoreError> {
-        let record = frame(kind, payload).ok_or(StoreError::TooLarge)?;
+    /// [`FileError::TooLarge`], [`FileError::Io`].
+    fn append(&mut self, kind: u8, payload: &[u8]) -> Result<Loc, FileError> {
+        let record = frame(kind, payload).ok_or(FileError::TooLarge)?;
         self.append_record(&record)
     }
 
@@ -888,8 +888,8 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`].
-    fn append_record(&mut self, record: &[u8]) -> Result<Loc, StoreError> {
+    /// [`FileError::Io`].
+    fn append_record(&mut self, record: &[u8]) -> Result<Loc, FileError> {
         self.file.write_all_at(record, self.end)?;
         let loc = Loc {
             offset: self.end,
@@ -903,9 +903,9 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Damaged`] if the record fails its checksum or doesn't decode as a tile of
-    /// `key`, [`StoreError::Io`].
-    pub fn read_tile(&self, key: &TileKey) -> Result<Option<TileBytes>, StoreError> {
+    /// [`FileError::Damaged`] if the record fails its checksum or doesn't decode as a tile of
+    /// `key`, [`FileError::Io`].
+    pub fn read_tile(&self, key: &TileKey) -> Result<Option<TileBytes>, FileError> {
         self.read_tile_checked(key, |_| Ok(()))
     }
 
@@ -918,17 +918,17 @@ impl ProjectFile {
     fn read_tile_checked(
         &self,
         key: &TileKey,
-        check: impl FnOnce(&TileRecord<'_>) -> Result<(), StoreError>,
-    ) -> Result<Option<TileBytes>, StoreError> {
+        check: impl FnOnce(&TileRecord<'_>) -> Result<(), FileError>,
+    ) -> Result<Option<TileBytes>, FileError> {
         let Some(&Loc { offset, len }) = self.live.get(&Name::Tile(*key)) else {
             return Ok(None);
         };
         let raw = self.read_record(offset, len)?;
-        let tile = tile_record(&raw, key).ok_or(StoreError::Damaged { offset })?;
+        let tile = tile_record(&raw, key).ok_or(FileError::Damaged { offset })?;
         check(&tile)?;
         let body = decompress(tile.packed, tile.raw_len)
             .ok()
-            .ok_or(StoreError::Damaged { offset })?;
+            .ok_or(FileError::Damaged { offset })?;
         Ok(Some(TileBytes {
             op: tile.op,
             header: tile.header.to_vec(),
@@ -940,11 +940,11 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Damaged`] if the file ends first, [`StoreError::Io`].
-    fn read_record(&self, offset: u64, len: u64) -> Result<Vec<u8>, StoreError> {
+    /// [`FileError::Damaged`] if the file ends first, [`FileError::Io`].
+    fn read_record(&self, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
         match read_exact(&self.file, offset, len) {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                Err(StoreError::Damaged { offset })
+                Err(FileError::Damaged { offset })
             }
             other => Ok(other?),
         }
@@ -954,14 +954,14 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// As [`ProjectFile::read_tile`]; [`StoreError::Codec`] if the payload isn't a valid
-    /// displacement tile, [`StoreError::NotDisplacement`] if `key` is of another channel,
-    /// [`StoreError::WrongSide`] if the stored side isn't the key's. The side and the stated body
+    /// As [`ProjectFile::read_tile`]; [`FileError::Codec`] if the payload isn't a valid
+    /// displacement tile, [`FileError::NotDisplacement`] if `key` is of another channel,
+    /// [`FileError::WrongSide`] if the stored side isn't the key's. The side and the stated body
     /// size are checked before decompressing.
     pub fn read_displacement(
         &self,
         key: &TileKey,
-    ) -> Result<Option<(OpId, CorrectionTile)>, StoreError> {
+    ) -> Result<Option<(OpId, CorrectionTile)>, FileError> {
         let mut slot = bytemuck::zeroed_box::<CorrectionSlot>();
         let Some(op) = self.read_displacement_into(key, &mut slot, &mut ReadScratch::new()?)?
         else {
@@ -981,7 +981,7 @@ impl ProjectFile {
         key: &TileKey,
         slot: &mut CorrectionSlot,
         scratch: &mut ReadScratch,
-    ) -> Result<Option<OpId>, StoreError> {
+    ) -> Result<Option<OpId>, FileError> {
         if let Err(e) = check_displacement(key, key.side()) {
             bytemuck::bytes_of_mut(slot).fill(0);
             return Err(e);
@@ -1002,7 +1002,7 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// As [`FileReader::read_displacement_into`], but never [`StoreError::Closed`]. On error
+    /// As [`FileReader::read_displacement_into`], but never [`FileError::Closed`]. On error
     /// `slot` holds no tile.
     pub(crate) fn read_at(
         &self,
@@ -1010,7 +1010,7 @@ impl ProjectFile {
         loc: Loc,
         slot: &mut CorrectionSlot,
         scratch: &mut ReadScratch,
-    ) -> Result<OpId, StoreError> {
+    ) -> Result<OpId, FileError> {
         if let Err(e) = check_displacement(key, key.side()) {
             bytemuck::bytes_of_mut(slot).fill(0);
             return Err(e);
@@ -1026,7 +1026,7 @@ impl ProjectFile {
     /// Its locations are a snapshot, so writes and saves after this call don't change what it
     /// reads; a later save needs a new base. The base reads this open file
     /// and doesn't keep it open: once this `ProjectFile` is dropped, reads through the base fail
-    /// with [`StoreError::Closed`].
+    /// with [`FileError::Closed`].
     ///
     /// Nothing is copied or read: the base shares the maps the file keeps of its latest save
     /// point (see [`SavedState`]), so this costs the same whatever the project's size. A base
@@ -1060,13 +1060,13 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Damaged`] if an Index of the current chain is; [`StoreError::Io`].
-    pub(crate) fn base_at(&self, point: SavePoint) -> Result<Option<BaseFile>, StoreError> {
+    /// [`FileError::Damaged`] if an Index of the current chain is; [`FileError::Io`].
+    pub(crate) fn base_at(&self, point: SavePoint) -> Result<Option<BaseFile>, FileError> {
         if point.project != self.meta.project() || !self.save_points()?.contains(&point.offset) {
             return Ok(None);
         }
         let len = self.file.metadata()?.len();
-        let chain = load_chain(&self.file, point.offset, len)?.ok_or(StoreError::Damaged {
+        let chain = load_chain(&self.file, point.offset, len)?.ok_or(FileError::Damaged {
             offset: point.offset,
         })?;
         if chain.head != point.head {
@@ -1090,15 +1090,15 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Damaged`] if the record fails its checksum or isn't a tile of `key`;
-    /// [`StoreError::Io`].
-    pub(crate) fn read_tile_record(&self, key: &TileKey) -> Result<Option<Vec<u8>>, StoreError> {
+    /// [`FileError::Damaged`] if the record fails its checksum or isn't a tile of `key`;
+    /// [`FileError::Io`].
+    pub(crate) fn read_tile_record(&self, key: &TileKey) -> Result<Option<Vec<u8>>, FileError> {
         let Some(Loc { offset, len }) = self.locate(key) else {
             return Ok(None);
         };
         let raw = self.read_record(offset, len)?;
         if tile_record(&raw, key).is_none() {
-            return Err(StoreError::Damaged { offset });
+            return Err(FileError::Damaged { offset });
         }
         Ok(Some(raw))
     }
@@ -1112,14 +1112,14 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if a tile record of `base` fails its
-    /// checksum or isn't a tile of its key; [`StoreError::Io`]; [`StoreError::Closed`] if
+    /// [`FileError::ReadOnly`]; [`FileError::Damaged`] if a tile record of `base` fails its
+    /// checksum or isn't a tile of its key; [`FileError::Io`]; [`FileError::Closed`] if
     /// `base`'s file has been dropped.
-    pub(crate) fn copy_base(&mut self, base: &BaseFile) -> Result<(), StoreError> {
+    pub(crate) fn copy_base(&mut self, base: &BaseFile) -> Result<(), FileError> {
         for (key, &loc) in base.locations.iter() {
             let raw = base.reader.read_record(loc)?;
             if tile_record(&raw, key).is_none() {
-                return Err(StoreError::Damaged { offset: loc.offset });
+                return Err(FileError::Damaged { offset: loc.offset });
             }
             self.append_copy(key, &raw)?;
         }
@@ -1128,7 +1128,7 @@ impl ProjectFile {
                 Ok(raw) if bounds_record(&raw, key).is_some() => {
                     self.append_bounds_copy(key, &raw)?;
                 }
-                Ok(_) | Err(StoreError::Damaged { .. }) => {
+                Ok(_) | Err(FileError::Damaged { .. }) => {
                     self.write_bounds(*key, None, Stamp::ZERO)?;
                 }
                 Err(e) => return Err(e),
@@ -1142,15 +1142,15 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::Io`].
+    /// [`FileError::ReadOnly`], [`FileError::Io`].
     pub(crate) fn write_bounds(
         &mut self,
         key: TileKey,
         bounds: Option<&TileBounds>,
         stamp: Stamp,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly);
+            return Err(FileError::ReadOnly);
         }
         let loc = self.append(KIND_BOUNDS, &bounds_payload(&key, bounds))?;
         self.note(Name::Bounds(key), None, stamp, loc);
@@ -1166,21 +1166,21 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`].
+    /// [`FileError::ReadOnly`], [`FileError::TooLarge`], [`FileError::Io`].
     pub(crate) fn write_bounds_many<'a>(
         &mut self,
         bounds: impl IntoIterator<Item = (TileKey, Option<&'a TileBounds>)>,
         stamp: Stamp,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly);
+            return Err(FileError::ReadOnly);
         }
-        let size = |n: usize| u64::try_from(n).or(Err(StoreError::TooLarge));
+        let size = |n: usize| u64::try_from(n).or(Err(FileError::TooLarge));
         let mut buffer = Vec::new();
         let mut placed = Vec::new();
         for (key, kept) in bounds {
             let record =
-                frame(KIND_BOUNDS, &bounds_payload(&key, kept)).ok_or(StoreError::TooLarge)?;
+                frame(KIND_BOUNDS, &bounds_payload(&key, kept)).ok_or(FileError::TooLarge)?;
             placed.push((key, size(buffer.len())?, size(record.len())?));
             buffer.extend_from_slice(&record);
         }
@@ -1206,18 +1206,18 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if `raw` isn't a whole bounds record
-    /// of `key` after all; [`StoreError::Io`].
+    /// [`FileError::ReadOnly`]; [`FileError::Damaged`] if `raw` isn't a whole bounds record
+    /// of `key` after all; [`FileError::Io`].
     pub(crate) fn append_bounds_copy(
         &mut self,
         key: &TileKey,
         raw: &[u8],
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly);
+            return Err(FileError::ReadOnly);
         }
         if bounds_record(raw, key).is_none() {
-            return Err(StoreError::Damaged { offset: self.end });
+            return Err(FileError::Damaged { offset: self.end });
         }
         let loc = self.append_record(raw)?;
         self.note(Name::Bounds(*key), None, Stamp::ZERO, loc);
@@ -1230,14 +1230,14 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`].
-    pub(crate) fn read_bounds_record(&self, key: &TileKey) -> Result<Option<Vec<u8>>, StoreError> {
+    /// [`FileError::Io`].
+    pub(crate) fn read_bounds_record(&self, key: &TileKey) -> Result<Option<Vec<u8>>, FileError> {
         let Some(&Loc { offset, len }) = self.live.get(&Name::Bounds(*key)) else {
             return Ok(None);
         };
         match self.read_record(offset, len) {
             Ok(raw) => Ok(bounds_record(&raw, key).is_some().then_some(raw)),
-            Err(StoreError::Damaged { .. }) => Ok(None),
+            Err(FileError::Damaged { .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1258,11 +1258,11 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`].
+    /// [`FileError::Io`].
     pub(crate) fn read_bounds(
         &self,
         entries: &[(TileKey, Loc)],
-    ) -> Result<Vec<Option<TileBounds>>, StoreError> {
+    ) -> Result<Vec<Option<TileBounds>>, FileError> {
         Ok(read_bounds_at(&self.file, entries)?)
     }
 
@@ -1271,14 +1271,14 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`]; [`StoreError::Damaged`] if `raw` isn't a whole tile record of
-    /// `key` after all; [`StoreError::Io`].
-    pub(crate) fn append_copy(&mut self, key: &TileKey, raw: &[u8]) -> Result<(), StoreError> {
+    /// [`FileError::ReadOnly`]; [`FileError::Damaged`] if `raw` isn't a whole tile record of
+    /// `key` after all; [`FileError::Io`].
+    pub(crate) fn append_copy(&mut self, key: &TileKey, raw: &[u8]) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly);
+            return Err(FileError::ReadOnly);
         }
         let op = tile_record(raw, key)
-            .ok_or(StoreError::Damaged { offset: self.end })?
+            .ok_or(FileError::Damaged { offset: self.end })?
             .op;
         let loc = self.append_record(raw)?;
         self.note(Name::Tile(*key), Some(op), Stamp::ZERO, loc);
@@ -1302,11 +1302,11 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`];
-    /// [`StoreError::SavePointMismatch`] (a bug), with nothing written.
-    pub fn save(&mut self) -> Result<u64, StoreError> {
+    /// [`FileError::ReadOnly`], [`FileError::TooLarge`], [`FileError::Io`];
+    /// [`FileError::SavePointMismatch`] (a bug), with nothing written.
+    pub fn save(&mut self) -> Result<u64, FileError> {
         if self.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly);
+            return Err(FileError::ReadOnly);
         }
         self.cut = None;
         // Tiles are durable before the Index that names them.
@@ -1328,11 +1328,11 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::ReadOnly`], [`StoreError::TooLarge`], [`StoreError::Io`];
-    /// [`StoreError::SavePointMismatch`] (a bug), with nothing written.
-    pub(crate) fn write_save_point(&mut self) -> Result<u64, StoreError> {
+    /// [`FileError::ReadOnly`], [`FileError::TooLarge`], [`FileError::Io`];
+    /// [`FileError::SavePointMismatch`] (a bug), with nothing written.
+    pub(crate) fn write_save_point(&mut self) -> Result<u64, FileError> {
         if self.access == Access::ReadOnly {
-            return Err(StoreError::ReadOnly);
+            return Err(FileError::ReadOnly);
         }
         let appended = self.append_index()?;
         Ok(self.commit_index(appended))
@@ -1349,9 +1349,9 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::SavePointMismatch`] if that check fails; [`StoreError::TooLarge`],
-    /// [`StoreError::Io`].
-    fn append_index(&mut self) -> Result<Appended, StoreError> {
+    /// [`FileError::SavePointMismatch`] if that check fails; [`FileError::TooLarge`],
+    /// [`FileError::Io`].
+    fn append_index(&mut self) -> Result<Appended, FileError> {
         #[cfg(test)]
         self.check_live();
         let parent = self.last_index();
@@ -1406,7 +1406,7 @@ impl ProjectFile {
         // derivation, before anything is written.
         let derived = tiles.len() + bounds.len();
         if let Some(named) = named.filter(|&named| named != derived) {
-            return Err(StoreError::SavePointMismatch { named, derived });
+            return Err(FileError::SavePointMismatch { named, derived });
         }
         let loc = self.append(KIND_INDEX, &payload)?;
         Ok(Appended {
@@ -1508,18 +1508,18 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Damaged`] if an Index of the chain is, [`StoreError::Io`].
-    pub fn save_points(&self) -> Result<Vec<u64>, StoreError> {
+    /// [`FileError::Damaged`] if an Index of the chain is, [`FileError::Io`].
+    pub fn save_points(&self) -> Result<Vec<u64>, FileError> {
         let len = self.file.metadata()?.len();
         let mut points = Vec::new();
         let mut next = self.last_index();
         while let Some(offset) = next {
             let index =
-                read_index(&self.file, offset, len)?.ok_or(StoreError::Damaged { offset })?;
+                read_index(&self.file, offset, len)?.ok_or(FileError::Damaged { offset })?;
             points.push(offset);
             next = match index.parent {
                 Some(parent) if parent < offset => Some(parent),
-                Some(_) => return Err(StoreError::Damaged { offset }),
+                Some(_) => return Err(FileError::Damaged { offset }),
                 None => None,
             };
         }
@@ -1589,11 +1589,11 @@ impl ProjectFile {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Damaged`] if no record head is there, [`StoreError::Io`].
-    fn index_len(&self, offset: u64) -> Result<u64, StoreError> {
+    /// [`FileError::Damaged`] if no record head is there, [`FileError::Io`].
+    fn index_len(&self, offset: u64) -> Result<u64, FileError> {
         let len = self.file.metadata()?.len();
         Ok(read_head(&self.file, offset, len)?
-            .ok_or(StoreError::Damaged { offset })?
+            .ok_or(FileError::Damaged { offset })?
             .len
             .into())
     }
@@ -1704,7 +1704,7 @@ impl ProjectFile {
     /// # Errors
     ///
     /// As [`ProjectFile::append`].
-    fn append_raw(&mut self, kind: u8, payload: &[u8]) -> Result<(), StoreError> {
+    fn append_raw(&mut self, kind: u8, payload: &[u8]) -> Result<(), FileError> {
         self.append(kind, payload).map(drop)
     }
 }
@@ -1713,12 +1713,12 @@ impl ProjectFile {
 ///
 /// # Errors
 ///
-/// [`StoreError::NotDisplacement`], [`StoreError::WrongSide`].
-fn check_displacement(key: &TileKey, side: u32) -> Result<(), StoreError> {
+/// [`FileError::NotDisplacement`], [`FileError::WrongSide`].
+fn check_displacement(key: &TileKey, side: u32) -> Result<(), FileError> {
     if key.channel() != Channel::DISPLACEMENT {
-        Err(StoreError::NotDisplacement(key.channel().raw()))
+        Err(FileError::NotDisplacement(key.channel().raw()))
     } else if side != key.side() {
-        Err(StoreError::WrongSide {
+        Err(FileError::WrongSide {
             key: key.side(),
             tile: side,
         })

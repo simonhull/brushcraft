@@ -12,9 +12,9 @@ use super::error::{CacheError, Invariant};
 use super::layers::{Dirty, write_slot};
 use super::pins::Pinned;
 use super::round::{Acquire, Fill, Targets, fill_slot, keep_first, nothing_to_write};
-use crate::file::Loc;
 #[cfg(test)]
-use crate::file::StoreError;
+use crate::file::FileError;
+use crate::file::Loc;
 use crate::hash::{TileHash, TileSet};
 use crate::op::OpId;
 use crate::pool::{Freshness, Invalidated, Pool, PoolError, SlotData, SlotId};
@@ -523,7 +523,7 @@ impl TileStore {
         filled: Result<Option<OpId>, CacheError>,
     ) -> Result<Option<OpId>, CacheError> {
         if self.unreadable == Some(key) {
-            Err(StoreError::from(std::io::Error::other("an unreadable tile, for the test")).into())
+            Err(FileError::from(std::io::Error::other("an unreadable tile, for the test")).into())
         } else {
             filled
         }

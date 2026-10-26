@@ -91,7 +91,7 @@ fn a_huge_stated_size_is_rejected_without_allocating() {
     let opened = ProjectFile::open(&path).unwrap();
     assert!(opened.contains(&key(2)), "named by the last save point");
     assert!(
-        matches!(opened.read_tile(&key(2)), Err(StoreError::Damaged { offset: o }) if o == offset),
+        matches!(opened.read_tile(&key(2)), Err(FileError::Damaged { offset: o }) if o == offset),
         "unparseable, so damaged"
     );
     assert!(
@@ -143,7 +143,7 @@ fn bodies_over_the_cap_are_not_written() {
     assert!(
         matches!(
             f.write_tile(key(1), op(1), b"", &vec![0; cap + 1]),
-            Err(StoreError::TooLarge)
+            Err(FileError::TooLarge)
         ),
         "one byte over"
     );
@@ -177,12 +177,12 @@ fn displacement_reads_check_the_stated_size_before_decompressing() {
     assert!(
         matches!(
             opened.read_displacement(&key(1)),
-            Err(StoreError::Codec(CodecError::Size))
+            Err(FileError::Codec(CodecError::Size))
         ),
         "the side needs 26,886 bytes, not MAX_RAW"
     );
     assert!(
-        matches!(opened.read_tile(&key(1)), Err(StoreError::Damaged { offset: o }) if o == offset),
+        matches!(opened.read_tile(&key(1)), Err(FileError::Damaged { offset: o }) if o == offset),
         "and the frame doesn't hold MAX_RAW bytes"
     );
 }
@@ -235,7 +235,7 @@ fn index_entries_must_point_before_their_index() {
         .unwrap();
         drop(f);
         assert!(
-            matches!(ProjectFile::open_at(&path, end), Err(StoreError::Damaged { offset }) if offset == end),
+            matches!(ProjectFile::open_at(&path, end), Err(FileError::Damaged { offset }) if offset == end),
             "{what}"
         );
         assert!(
@@ -333,11 +333,11 @@ fn index_entries_with_impossible_lengths_are_damage() {
         } else {
             // The Index doesn't parse, so it is no save point, and one that late is damage.
             assert!(
-                matches!(at, Err(StoreError::NotASavePoint(offset)) if offset == end),
+                matches!(at, Err(FileError::NotASavePoint(offset)) if offset == end),
                 "{what}: {at:?}"
             );
             assert!(
-                matches!(latest, Err(StoreError::DamagedMidFile { .. })),
+                matches!(latest, Err(FileError::DamagedMidFile { .. })),
                 "{what}: {latest:?}"
             );
             assert_eq!(std::fs::read(&path).unwrap(), bad, "{what}: file untouched");
@@ -373,15 +373,15 @@ fn one_writer_or_many_readers() {
     let (good, [s1, ..]) = three(&path);
     let writer = ProjectFile::open(&path).unwrap();
     assert!(
-        matches!(ProjectFile::open(&path), Err(StoreError::Locked)),
+        matches!(ProjectFile::open(&path), Err(FileError::Locked)),
         "a second writer"
     );
     assert!(
-        matches!(ProjectFile::open_at(&path, s1), Err(StoreError::Locked)),
+        matches!(ProjectFile::open_at(&path, s1), Err(FileError::Locked)),
         "a reader while a writer is open"
     );
     assert!(
-        matches!(compact(&path, &dir.path("c.bcrf")), Err(StoreError::Locked)),
+        matches!(compact(&path, &dir.path("c.bcrf")), Err(FileError::Locked)),
         "compaction while a writer is open"
     );
     assert!(
@@ -392,7 +392,7 @@ fn one_writer_or_many_readers() {
     let a = ProjectFile::open_at(&path, s1).unwrap();
     let b = ProjectFile::open_at(&path, s1).unwrap();
     assert!(
-        matches!(ProjectFile::open(&path), Err(StoreError::Locked)),
+        matches!(ProjectFile::open(&path), Err(FileError::Locked)),
         "a writer while readers are open"
     );
     drop((a, b));
@@ -437,11 +437,11 @@ fn a_file_that_cannot_be_written_opens_read_only_if_its_tail_is_clean() {
     assert!(
         matches!(
             f.write_displacement(key(9), op(9), &tile(9.0)),
-            Err(StoreError::ReadOnly)
+            Err(FileError::ReadOnly)
         ),
         "no writes"
     );
-    assert!(matches!(f.save(), Err(StoreError::ReadOnly)), "no saves");
+    assert!(matches!(f.save(), Err(FileError::ReadOnly)), "no saves");
     drop(f);
     let torn = [good.as_slice(), &[KIND_TILE, 0, 0, 0, 100, 0, 0, 0]].concat();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -449,7 +449,7 @@ fn a_file_that_cannot_be_written_opens_read_only_if_its_tail_is_clean() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
     let end = u64::try_from(good.len()).unwrap();
     assert!(
-        matches!(ProjectFile::open(&path), Err(StoreError::NeedsRepair { offset }) if offset == end),
+        matches!(ProjectFile::open(&path), Err(FileError::NeedsRepair { offset }) if offset == end),
         "a torn tail it can't cut off"
     );
     assert_eq!(std::fs::read(&path).unwrap(), torn, "left untouched");
@@ -468,7 +468,7 @@ fn compacting_in_place_replaces_the_file() {
     let want = state(&f);
     let big = f.len();
     assert!(
-        matches!(compact_in_place(&path), Err(StoreError::Locked)),
+        matches!(compact_in_place(&path), Err(FileError::Locked)),
         "not while open for writing"
     );
     assert_eq!(
@@ -500,7 +500,7 @@ fn a_damaged_middle_save_point_fails_open_and_earlier_ones_still_open() {
     std::fs::write(&path, &bad).unwrap();
     let opened = ProjectFile::open(&path);
     assert!(
-        matches!(opened, Err(StoreError::DamagedMidFile { offset }) if offset == s2),
+        matches!(opened, Err(FileError::DamagedMidFile { offset }) if offset == s2),
         "S3 still follows: {opened:?}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), bad, "file untouched");
@@ -508,11 +508,11 @@ fn a_damaged_middle_save_point_fails_open_and_earlier_ones_still_open() {
     assert_eq!(state(&at_s1), [(key(1), op(1))], "S1's state");
     drop(at_s1);
     assert!(
-        matches!(ProjectFile::open_at(&path, s2), Err(StoreError::NotASavePoint(o)) if o == s2),
+        matches!(ProjectFile::open_at(&path, s2), Err(FileError::NotASavePoint(o)) if o == s2),
         "S2 is damaged"
     );
     assert!(
-        matches!(ProjectFile::open_at(&path, s3), Err(StoreError::Damaged { offset }) if offset == s3),
+        matches!(ProjectFile::open_at(&path, s3), Err(FileError::Damaged { offset }) if offset == s3),
         "S3's chain runs through S2"
     );
 }
@@ -625,7 +625,7 @@ fn a_chain_is_at_most_one_full_index_and_fifteen_deltas() {
         "{MAX_CHAIN} Indexes load"
     );
     assert!(
-        matches!(ProjectFile::open_at(&path, over), Err(StoreError::Damaged { offset }) if offset == over),
+        matches!(ProjectFile::open_at(&path, over), Err(FileError::Damaged { offset }) if offset == over),
         "one more is refused"
     );
 }
@@ -718,7 +718,7 @@ fn a_checksummed_index_that_does_not_load_stops_recovery_as_damage() {
         let bad = std::fs::read(&path).unwrap();
         let opened = ProjectFile::open(&path);
         assert!(
-            matches!(opened, Err(StoreError::DamagedMidFile { offset }) if offset == stop),
+            matches!(opened, Err(FileError::DamagedMidFile { offset }) if offset == stop),
             "{what}: {opened:?}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), bad, "{what}: file untouched");
@@ -747,7 +747,7 @@ fn a_save_point_across_a_search_window_boundary_is_found() {
         assert!(
             matches!(
                 opened,
-                Err(StoreError::DamagedMidFile { offset }) if i64::try_from(offset).unwrap() == start
+                Err(FileError::DamagedMidFile { offset }) if i64::try_from(offset).unwrap() == start
             ),
             "d {d}: {opened:?}"
         );
@@ -810,7 +810,7 @@ fn a_tail_of_index_lookalikes_is_searched_in_bounded_work() {
             ..
         } = take_work();
         match &opened {
-            Err(StoreError::DamagedMidFile { .. }) => println!("{what}: refused as damage"),
+            Err(FileError::DamagedMidFile { .. }) => println!("{what}: refused as damage"),
             Ok(f) => {
                 println!("{what}: tail cut back");
                 assert_eq!(
@@ -860,7 +860,7 @@ fn assert_damage_proven(path: &Path, first: u64, what: &str) {
     std::fs::write(path, &bad).unwrap();
     let opened = ProjectFile::open(path);
     assert!(
-        matches!(opened, Err(StoreError::DamagedMidFile { offset }) if offset == first),
+        matches!(opened, Err(FileError::DamagedMidFile { offset }) if offset == first),
         "{what}: {opened:?}"
     );
     assert_eq!(std::fs::read(path).unwrap(), bad, "{what}: file untouched");
@@ -942,7 +942,7 @@ fn only_a_plausible_index_proves_damage() {
         let opened = ProjectFile::open(&path);
         if proof {
             assert!(
-                matches!(opened, Err(StoreError::DamagedMidFile { offset }) if offset == saved),
+                matches!(opened, Err(FileError::DamagedMidFile { offset }) if offset == saved),
                 "parent {what}: {opened:?}"
             );
             assert_eq!(
@@ -977,7 +977,7 @@ fn an_entry_naming_another_keys_record_is_damage() {
     drop(f);
     let opened = ProjectFile::open(&path).unwrap();
     assert!(
-        matches!(opened.read_tile(&key(1)), Err(StoreError::Damaged { offset }) if offset == theirs.offset),
+        matches!(opened.read_tile(&key(1)), Err(FileError::Damaged { offset }) if offset == theirs.offset),
         "key 1 names key 2's record"
     );
     assert_eq!(
@@ -1039,11 +1039,11 @@ fn unknown_header_flags_or_reserved_bits_are_rejected() {
         bad[byte] = 1;
         std::fs::write(&path, &bad).unwrap();
         assert!(
-            matches!(ProjectFile::open(&path), Err(StoreError::BadHeader)),
+            matches!(ProjectFile::open(&path), Err(FileError::BadHeader)),
             "open, byte {byte}"
         );
         assert!(
-            matches!(ProjectFile::open_at(&path, s1), Err(StoreError::BadHeader)),
+            matches!(ProjectFile::open_at(&path, s1), Err(FileError::BadHeader)),
             "open_at, byte {byte}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), bad, "byte {byte}: untouched");
@@ -1069,7 +1069,7 @@ fn displacement_tiles_must_fit_their_keys() {
     assert!(
         matches!(
             f.write_displacement(other, op(1), &tile(1.0)),
-            Err(StoreError::NotDisplacement(1))
+            Err(FileError::NotDisplacement(1))
         ),
         "write under another channel"
     );
@@ -1077,7 +1077,7 @@ fn displacement_tiles_must_fit_their_keys() {
     assert!(
         matches!(
             f.write_displacement(key(1), op(1), &small),
-            Err(StoreError::WrongSide { key: 65, tile: 2 })
+            Err(FileError::WrongSide { key: 65, tile: 2 })
         ),
         "write a side-2 tile under a level-9 key"
     );
@@ -1089,14 +1089,14 @@ fn displacement_tiles_must_fit_their_keys() {
     assert!(
         matches!(
             f.read_displacement(&key(1)),
-            Err(StoreError::WrongSide { key: 65, tile: 2 })
+            Err(FileError::WrongSide { key: 65, tile: 2 })
         ),
         "read a side-2 tile under a level-9 key"
     );
     assert!(
         matches!(
             f.read_displacement(&other),
-            Err(StoreError::NotDisplacement(1))
+            Err(FileError::NotDisplacement(1))
         ),
         "read under another channel"
     );
@@ -1190,25 +1190,25 @@ fn in_place_compactions_cannot_interleave() {
     // What a running in-place compaction holds on its source.
     let source = open_locked(&path, open_readable, Lock::Exclusive).unwrap();
     assert!(
-        matches!(compact_in_place(&path), Err(StoreError::Locked)),
+        matches!(compact_in_place(&path), Err(FileError::Locked)),
         "a second in-place compaction"
     );
     assert!(
-        matches!(compact(&path, &dir.path("c.bcrf")), Err(StoreError::Locked)),
+        matches!(compact(&path, &dir.path("c.bcrf")), Err(FileError::Locked)),
         "a compaction to another file"
     );
     assert!(
-        matches!(ProjectFile::open(&path), Err(StoreError::Locked)),
+        matches!(ProjectFile::open(&path), Err(FileError::Locked)),
         "a writer"
     );
     assert!(
-        matches!(ProjectFile::open_at(&path, s1), Err(StoreError::Locked)),
+        matches!(ProjectFile::open_at(&path, s1), Err(FileError::Locked)),
         "a reader"
     );
     drop(source);
     let reader = ProjectFile::open_at(&path, s1).unwrap();
     assert!(
-        matches!(compact_in_place(&path), Err(StoreError::Locked)),
+        matches!(compact_in_place(&path), Err(FileError::Locked)),
         "not while a reader is open either"
     );
     drop(reader);
@@ -1339,12 +1339,12 @@ fn a_mesh_that_does_not_match_its_hash_is_rejected() {
     std::fs::write(&path, &bad).unwrap();
     let latest = ProjectFile::open(&path);
     assert!(
-        matches!(latest, Err(StoreError::MeshMismatch)),
+        matches!(latest, Err(FileError::MeshMismatch)),
         "open: {latest:?}"
     );
     let saved = ProjectFile::open_at(&path, s1);
     assert!(
-        matches!(saved, Err(StoreError::MeshMismatch)),
+        matches!(saved, Err(FileError::MeshMismatch)),
         "open_at: {saved:?}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), bad, "untouched");
@@ -1360,7 +1360,7 @@ fn a_mesh_record_that_is_no_valid_mesh_is_rejected() {
     std::fs::write(&path, leading(&honest, &nan, stated(&nan))).unwrap();
     let invalid = ProjectFile::open(&path);
     assert!(
-        matches!(invalid, Err(StoreError::BadMesh(MeshError::NotFinite(_)))),
+        matches!(invalid, Err(FileError::BadMesh(MeshError::NotFinite(_)))),
         "{invalid:?}"
     );
     // A stated size over the cap is refused before decompressing.
@@ -1369,7 +1369,7 @@ fn a_mesh_record_that_is_no_valid_mesh_is_rejected() {
         std::fs::write(&path, leading(&meta(), &raw, size)).unwrap();
         let opened = ProjectFile::open(&path);
         assert!(
-            matches!(opened, Err(StoreError::BadHeader)),
+            matches!(opened, Err(FileError::BadHeader)),
             "stated {size}: {opened:?}"
         );
     }
@@ -1402,7 +1402,7 @@ fn a_file_without_its_meta_or_mesh_record_is_rejected() {
         std::fs::write(&path, &bytes).unwrap();
         let opened = ProjectFile::open(&path);
         assert!(
-            matches!(opened, Err(StoreError::MissingMeta)),
+            matches!(opened, Err(FileError::MissingMeta)),
             "{what}: {opened:?}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "{what}: untouched");
@@ -1431,7 +1431,7 @@ fn damage_in_the_leading_records_fails_open_and_is_never_cut_off() {
             assert!(
                 matches!(
                     opened,
-                    Err(StoreError::BadHeader | StoreError::MissingMeta | StoreError::MeshMismatch)
+                    Err(FileError::BadHeader | FileError::MissingMeta | FileError::MeshMismatch)
                 ),
                 "byte {byte} bit {bit}: {opened:?}"
             );
@@ -1451,7 +1451,7 @@ fn damage_in_the_leading_records_fails_open_and_is_never_cut_off() {
         std::fs::write(&path, &good[..cut]).unwrap();
         let opened = ProjectFile::open(&path);
         assert!(
-            matches!(opened, Err(StoreError::BadHeader | StoreError::MissingMeta)),
+            matches!(opened, Err(FileError::BadHeader | FileError::MissingMeta)),
             "cut at {cut}: {opened:?}"
         );
         assert_eq!(

@@ -895,12 +895,12 @@ fn a_failed_write_back_is_reported_and_keeps_the_tile() {
     assert!(!dirty.is_empty(), "the edit made tiles dirty");
     let evicted = store.evict_all();
     assert!(
-        matches!(evicted, Err(CacheError::WriteBack(StoreError::ReadOnly))),
+        matches!(evicted, Err(CacheError::WriteBack(FileError::ReadOnly))),
         "evicting a dirty tile reports the write: {evicted:?}"
     );
     let saving = store.save();
     assert!(
-        matches!(saving, Err(CacheError::WriteBack(StoreError::ReadOnly))),
+        matches!(saving, Err(CacheError::WriteBack(FileError::ReadOnly))),
         "and so does saving it: {saving:?}"
     );
     for key in &dirty {
@@ -915,7 +915,7 @@ fn a_failed_write_back_is_reported_and_keeps_the_tile() {
 /// operation wrote the save point. Other file errors keep the operation's own variant.
 #[test]
 fn a_save_point_mismatch_is_an_internal_error_not_a_retryable_save() {
-    let mismatch = || StoreError::SavePointMismatch {
+    let mismatch = || FileError::SavePointMismatch {
         named: 2,
         derived: 1,
     };
@@ -934,8 +934,8 @@ fn a_save_point_mismatch_is_an_internal_error_not_a_retryable_save() {
     }
     assert!(
         matches!(
-            CacheError::from_save_point(StoreError::ReadOnly, CacheError::Save),
-            CacheError::Save(StoreError::ReadOnly)
+            CacheError::from_save_point(FileError::ReadOnly, CacheError::Save),
+            CacheError::Save(FileError::ReadOnly)
         ),
         "an I/O-class error stays a save to retry"
     );
