@@ -1,12 +1,15 @@
 //! Tests of the tile evaluator, against the dense evaluator and the reference meshes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
+use super::cone::gathered_tiles;
 use super::*;
 use crate::reference::pentagonal_prism;
 use crate::test_rng::Rng;
-use crate::topology::edge_to_grid;
-use crate::{CorrectionMap, DenseEvaluation, FaceId, Level, Region, cube_sphere};
+use crate::topology::{corner_at, edge_to_grid};
+use crate::{
+    Channel, CorrectionMap, DenseEvaluation, FaceId, LayerId, Level, Region, TileKey, cube_sphere,
+};
 
 fn level(l: u8) -> Level {
     Level::new(l).unwrap()
