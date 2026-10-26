@@ -39,7 +39,7 @@ pub use display::{
 };
 pub use display::{
     DisplayError, DisplayTile, FaceGrids, FacePositions, MeanNormals, build_level, build_mesh,
-    build_positions, mip_normals,
+    build_positions, build_tile, mip_normals, mip_normals_tile,
 };
 pub use eval::{
     EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,

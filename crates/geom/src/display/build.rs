@@ -297,13 +297,54 @@ pub fn mip_normals(
     face: FaceId,
     level: Level,
 ) -> Result<MeanNormals, DisplayError> {
+    mip_region(mesh, finer, Region::whole_face(face, level))
+}
+
+/// The mean normals of display tile `key` alone (its block of its face's grid), from every
+/// face's means one level finer in `finer`: [`mip_normals`] over the tile, the same bits.
+///
+/// `finer` holds level `key.level() + 1` over the tile's area, its one-vertex apron (on
+/// neighbouring faces where the tile meets a face border) and the rings of the base vertices at
+/// its corners.
+///
+/// # Errors
+///
+/// As [`mip_normals`].
+pub fn mip_normals_tile(
+    mesh: &BaseMesh,
+    finer: &impl PositionSource,
+    key: &TileKey,
+) -> Result<MeanNormals, DisplayError> {
+    mip_region(mesh, finer, Region::of_tile(key))
+}
+
+/// [`mip_normals`] over `region` (at the coarser level) alone.
+///
+/// # Errors
+///
+/// As [`mip_normals`].
+fn mip_region(
+    mesh: &BaseMesh,
+    finer: &impl PositionSource,
+    region: Region,
+) -> Result<MeanNormals, DisplayError> {
+    let level = region.level();
     let finer_level = level.child().ok_or(DisplayError::NoDisplayLevel(level))?;
-    let gathered = gather(mesh, finer, Region::whole_face(face, finer_level))?;
-    let quads = finer_level.face_quads();
-    let side = level.face_quads() + 1;
+    let fine = Region::new(
+        region.face(),
+        finer_level,
+        2 * region.x0(),
+        2 * region.y0(),
+        2 * region.quads(),
+    )
+    .ok_or(DisplayError::Shape)?;
+    let gathered = gather(mesh, finer, fine)?;
+    let quads = fine.quads();
+    let side = region.quads() + 1;
     let data = cells(side)
         .map(|(i, j)| {
             let (x, y) = (2 * i, 2 * j);
+            // The block's corners, where `gather` has the ring of a base vertex (a face corner).
             let corner = match (x, y) {
                 (0, 0) => Some(0),
                 (_, 0) if x == quads => Some(1),
@@ -555,15 +596,22 @@ pub fn build_positions_with(
         let mut tiles = Vec::with_capacity(keys.len());
         for key in keys {
             let region = Region::of_tile(&key);
-            let bytes = codec.encode(&key, &block(&input, region)?)?;
-            let positions = codec.decode(&key, &bytes)?;
-            let delta = step_error_at(
-                &decoded_finer,
-                (2 * region.x0(), 2 * region.y0()),
-                &positions,
-            )?;
+            let fine = Region::new(
+                region.face(),
+                finer_level,
+                2 * region.x0(),
+                2 * region.y0(),
+                2 * region.quads(),
+            )
+            .ok_or(DisplayError::Shape)?;
             let below = children_bound(&key, finer_level, finest, &finer_bounds);
-            let error = round_up(sum_up(delta, below))?;
+            let (bytes, positions, error) = positions_tile(
+                codec,
+                &key,
+                &block(&input, region)?,
+                &block(&decoded_finer, fine)?,
+                below,
+            )?;
             write_tile(&mut decoded, &mut written, key, positions.as_slice())?;
             tiles.push(PositionTile { key, bytes, error });
         }
@@ -578,6 +626,89 @@ pub fn build_positions_with(
         finest,
         levels,
     })
+}
+
+/// One display tile built from its inputs alone, with the encoding chosen by measurement: what a
+/// store brings up to date after an edit, one tile at a time, the same bits as [`build_mesh`]
+/// gives.
+///
+/// `exact` is the tile's block of the finest positions subsampled at its level; `finer` the
+/// block under it one level finer (side `2 × (side − 1) + 1`): the finest positions there if
+/// that is the finest level, else the decoded positions of the display tiles there;
+/// `children_bound` the largest bound of those tiles (0 at the finest level); `means` the tile's
+/// mean normals ([`mip_normals_tile`]).
+///
+/// # Errors
+///
+/// [`DisplayError::Shape`] if a block doesn't fit the key; [`DisplayError::NotFinite`] for a
+/// position or mean that isn't finite; [`DisplayError::NoDisplayLevel`] for a key of a non-display
+/// channel.
+pub fn build_tile(
+    key: TileKey,
+    exact: &Grid,
+    finer: &Grid,
+    children_bound: f32,
+    means: &MeanNormals,
+) -> Result<DisplayTile, DisplayError> {
+    if !(exact.as_slice().iter().all(|v| v.is_finite()) && children_bound.is_finite()) {
+        return Err(DisplayError::NotFinite);
+    }
+    let (bytes, positions, error) = positions_tile(&CHOSEN, &key, exact, finer, children_bound)?;
+    let (normal_bytes, normals, roughness) = normals_tile(CHOSEN_NORMALS, &positions, &means.grid)?;
+    Ok(DisplayTile {
+        key,
+        positions: positions.as_slice().to_vec(),
+        normals,
+        roughness,
+        error,
+        encoded: encode::join_parts(&bytes, &normal_bytes)?,
+    })
+}
+
+/// One tile's positions: encoded with `codec` from `exact`, decoded, and bounded against `finer`
+/// (the block one level finer) and `children_bound`. Returns the bytes, the decoded block and
+/// the bound.
+///
+/// # Errors
+///
+/// [`DisplayError::Shape`] if the blocks don't fit; the codec's errors.
+fn positions_tile(
+    codec: &impl DisplayCodec,
+    key: &TileKey,
+    exact: &Grid,
+    finer: &Grid,
+    children_bound: f32,
+) -> Result<(Vec<u8>, Grid, f32), DisplayError> {
+    let bytes = codec.encode(key, exact)?;
+    let positions = codec.decode(key, &bytes)?;
+    let delta = step_error_at(finer, (0, 0), &positions)?;
+    let error = round_up(sum_up(delta, children_bound))?;
+    Ok((bytes, positions, error))
+}
+
+/// A tile's normals as stored: the bytes, and the unit normals and roughness they decode to.
+type StoredNormals = (Vec<u8>, Vec<Vec3>, Vec<u8>);
+
+/// One tile's normals, as stored.
+///
+/// The unit normals and roughness of `means` (its block), encoded with `normals` against the
+/// tile's decoded `positions`, and decoded.
+///
+/// # Errors
+///
+/// The encoding's errors.
+fn normals_tile(
+    normals: NormalEncoding,
+    positions: &Grid,
+    means: &Grid,
+) -> Result<StoredNormals, DisplayError> {
+    if means.side() != positions.side() {
+        return Err(DisplayError::Shape);
+    }
+    let (shaded, rough) = shade(means.as_slice());
+    let bytes = normals.encode(&shaded, &rough, positions)?;
+    let (unit, roughness) = normals.decode(positions, &bytes)?;
+    Ok((bytes, unit, roughness))
 }
 
 /// The display tiles of one face at `level`: its `positions` there, with `means` (the face's
@@ -634,9 +765,8 @@ pub fn build_level_with(
     for tile in &layer.tiles {
         let region = Region::of_tile(&tile.key);
         let tile_positions = block(&layer.decoded, region)?;
-        let (shaded, rough) = shade(block(&means.grid, region)?.as_slice());
-        let normal_bytes = normals.encode(&shaded, &rough, &tile_positions)?;
-        let (unit, roughness) = normals.decode(&tile_positions, &normal_bytes)?;
+        let (normal_bytes, unit, roughness) =
+            normals_tile(normals, &tile_positions, &block(&means.grid, region)?)?;
         let decoded: Vec<Vec3> = unit
             .iter()
             .zip(&roughness)

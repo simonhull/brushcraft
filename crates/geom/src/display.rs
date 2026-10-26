@@ -57,7 +57,8 @@ mod build;
 mod encode;
 
 pub use build::{
-    FaceGrids, FacePositions, MeanNormals, build_level, build_mesh, build_positions, mip_normals,
+    FaceGrids, FacePositions, MeanNormals, build_level, build_mesh, build_positions, build_tile,
+    mip_normals, mip_normals_tile,
 };
 #[cfg(any(test, feature = "display-study"))]
 pub use build::{build_level_with, build_mesh_with, build_positions_with};
@@ -160,6 +161,17 @@ impl DisplayTile {
     #[must_use]
     pub fn roughness(&self) -> &[u8] {
         &self.roughness
+    }
+
+    /// The mean normal each vertex stands for: its unit normal at its roughness's length, as
+    /// the next coarser level's [`mip_normals`] reads it.
+    #[must_use]
+    pub fn means(&self) -> Vec<Vec3> {
+        self.normals
+            .iter()
+            .zip(&self.roughness)
+            .map(|(&n, &r)| encode::mean_of(n, r))
+            .collect()
     }
 
     /// `e`: a bound, in world units, on the distance from the surface the tile draws (its

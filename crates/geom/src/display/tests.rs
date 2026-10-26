@@ -926,3 +926,91 @@ fn decoded_means_stay_near_the_exact_ones() {
         });
     println!("largest drift by level: {:?}", DRIFT.lock().unwrap());
 }
+
+/// Every tile [`build_tile`] builds from its inputs alone is bit for bit the tile
+/// [`build_mesh`] built.
+///
+/// The inputs are the finest positions under it, the decoded tiles one level finer and their
+/// means: a store can bring tiles up to date one at a time.
+#[test]
+fn a_tile_built_alone_is_the_tile_built_with_its_mesh() {
+    let sculpt = Sculpt::random(21);
+    let (positions, normals) = sculpt.finest_grids();
+    let tiles = build_mesh(&sculpt.mesh, &positions, &normals).unwrap();
+    let by_key: BTreeMap<TileKey, &DisplayTile> = tiles.iter().map(|t| (*t.key(), t)).collect();
+    for l in (0..FINEST).rev() {
+        let finer_level = level(l + 1);
+        // Every face's grid one level finer: decoded positions and means of the tiles there, or
+        // the finest positions and normals.
+        let (mut finer_positions, mut finer_means) =
+            (FaceGrids::new(finer_level), FaceGrids::new(finer_level));
+        for face in sculpt.mesh.faces() {
+            if l + 1 == FINEST {
+                finer_positions
+                    .insert(face, positions.get(face).unwrap().clone())
+                    .unwrap();
+                finer_means
+                    .insert(face, normals.get(face).unwrap().clone())
+                    .unwrap();
+                continue;
+            }
+            let side = finer_level.face_quads() + 1;
+            let count = usize::try_from(side * side).unwrap();
+            let (mut ps, mut ms) = (vec![Vec3::ZERO; count], vec![Vec3::ZERO; count]);
+            for tile in tiles
+                .iter()
+                .filter(|t| t.key().face() == face && t.key().level() == finer_level)
+            {
+                let region = Region::of_tile(tile.key());
+                for (index, (pp, mm)) in tile.positions().iter().zip(tile.means()).enumerate() {
+                    let index = u32::try_from(index).unwrap();
+                    let (x, y) = (
+                        region.x0() + index % tile.key().side(),
+                        region.y0() + index / tile.key().side(),
+                    );
+                    let at = usize::try_from(y * side + x).unwrap();
+                    ps[at] = *pp;
+                    ms[at] = mm;
+                }
+            }
+            finer_positions
+                .insert(face, Grid::new(side, ps).unwrap())
+                .unwrap();
+            finer_means
+                .insert(face, Grid::new(side, ms).unwrap())
+                .unwrap();
+        }
+        for tile in tiles.iter().filter(|t| t.key().level() == level(l)) {
+            let key = *tile.key();
+            let region = Region::of_tile(&key);
+            let shift = FINEST - l;
+            let finest = positions.get(key.face()).unwrap();
+            let exact = grid(key.side(), |i, j| {
+                finest
+                    .get((region.x0() + i) << shift, (region.y0() + j) << shift)
+                    .unwrap()
+            });
+            let finer_grid = finer_positions.get(key.face()).unwrap();
+            let finer = grid(2 * region.quads() + 1, |i, j| {
+                finer_grid
+                    .get(2 * region.x0() + i, 2 * region.y0() + j)
+                    .unwrap()
+            });
+            let children = if l + 1 == FINEST {
+                0.0
+            } else {
+                let ratio = finer_level.tiles_per_side() / level(l).tiles_per_side();
+                (0..ratio * ratio)
+                    .map(|n| {
+                        let tx = u16::try_from(u32::from(key.tx()) * ratio + n % ratio).unwrap();
+                        let ty = u16::try_from(u32::from(key.ty()) * ratio + n / ratio).unwrap();
+                        by_key[&TileKey::display(key.face(), finer_level, tx, ty).unwrap()].error()
+                    })
+                    .fold(0.0, f32::max)
+            };
+            let means = mip_normals_tile(&sculpt.mesh, &finer_means, &key).unwrap();
+            let alone = build_tile(key, &exact, &finer, children, &means).unwrap();
+            assert_eq!(&alone, tile, "{key:?}");
+        }
+    }
+}
