@@ -54,15 +54,52 @@ pub fn draw<F: Falloff>(
     let radius_squared = radius * radius;
     let mut inside = 0;
     for (&p, o) in pairs {
-        let d2 = distance_squared(p, center);
-        *o = if d2 < radius_squared {
-            inside += 1;
-            strength * falloff.weight(sqrt(d2) / radius)
-        } else {
-            0.0
-        };
+        match draw_vertex(falloff, center, radius, radius_squared, strength, p) {
+            Some(w) => {
+                inside += 1;
+                *o = w;
+            }
+            None => *o = 0.0,
+        }
     }
     inside
+}
+
+/// The displacement [`draw`] gives the vertex at `p`, or `None` outside its sphere.
+///
+/// Inside the sphere of `radius` around `center` it is `strength · falloff(d / radius)`; outside it
+/// (`d² ≥ radius²`) it is `None`. `radius` must be positive and finite, and `radius_squared` must
+/// be `radius * radius`; [`draw`] checks the radius once for all vertices.
+///
+/// It is [`draw`]'s step for one vertex, bit for bit, for a caller that walks the vertices itself
+/// (a GPU thread runs one vertex).
+///
+/// ```
+/// use brush::{Smoothstep, draw_vertex};
+///
+/// let (center, radius, strength) = ([0.0; 3], 1.0, 0.1);
+/// let at = |p| draw_vertex(&Smoothstep, center, radius, radius * radius, strength, p);
+/// assert!(
+///     (at([0.0, 0.0, 0.0]).unwrap() - 0.1).abs() < 1e-7,
+///     "full strength at the centre"
+/// );
+/// assert!(
+///     (at([0.5, 0.0, 0.0]).unwrap() - 0.05).abs() < 1e-7,
+///     "half strength halfway"
+/// );
+/// assert_eq!(at([2.0, 0.0, 0.0]), None, "nothing outside");
+/// ```
+#[inline]
+pub fn draw_vertex<F: Falloff>(
+    falloff: &F,
+    center: [f32; 3],
+    radius: f32,
+    radius_squared: f32,
+    strength: f32,
+    p: [f32; 3],
+) -> Option<f32> {
+    let d2 = distance_squared(p, center);
+    (d2 < radius_squared).then(|| strength * falloff.weight(sqrt(d2) / radius))
 }
 
 #[cfg(test)]
@@ -127,6 +164,22 @@ mod tests {
             "the brush covers a good part of the grid: {inside}"
         );
         assert!(inside < positions.len(), "and not all of it");
+    }
+
+    #[test]
+    fn draw_equals_draw_vertex_at_every_point_bit_for_bit() {
+        let positions = grid(101, 0.02);
+        let (center, radius, strength) = ([0.13, -0.07, 0.05], 0.6, 0.25);
+        let mut out = std::vec![f32::NAN; positions.len()];
+        let inside = draw(&Smoothstep, center, radius, strength, &positions, &mut out);
+        let mut counted = 0;
+        for (&p, &o) in positions.iter().zip(&out) {
+            let one = draw_vertex(&Smoothstep, center, radius, radius * radius, strength, p);
+            counted += usize::from(one.is_some());
+            assert_eq!(o.to_bits(), one.unwrap_or(0.0).to_bits(), "at {p:?}");
+        }
+        assert_eq!(inside, counted, "the count of positions inside");
+        assert!(inside > 1000 && inside < positions.len(), "a mix: {inside}");
     }
 
     #[test]

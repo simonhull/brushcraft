@@ -9,6 +9,7 @@
 //! [`Falloff`], so each built-in brush is monomorphised into straight-line code.
 //!
 //! M0 has one brush, [`draw`], with a [`Smoothstep`] falloff: enough to measure edit latency.
+//! [`draw_vertex`] is its step for one vertex.
 
 #![no_std]
 
@@ -16,5 +17,5 @@ mod draw;
 mod falloff;
 mod math;
 
-pub use draw::draw;
+pub use draw::{draw, draw_vertex};
 pub use falloff::{Falloff, Smoothstep};
