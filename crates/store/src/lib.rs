@@ -11,6 +11,7 @@ mod bytes;
 mod codec;
 mod crc;
 mod deps;
+mod display;
 mod feed;
 mod file;
 #[cfg(test)]

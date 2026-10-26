@@ -1124,7 +1124,9 @@ fn keys_differing_only_in_layer_or_channel_stay_apart() {
         )
         .unwrap()
     };
-    let keys = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+    // Channel 7: a channel this build doesn't know, which must round-trip as it is (channel 1,
+    // the display layer's, is read as display records, which compaction checks).
+    let keys = [at(0, 0), at(1, 0), at(0, 7), at(1, 7)];
     assert_eq!(
         TileKey::displacement(FaceId::new(3), Level::new(9).unwrap(), 1, 2).unwrap(),
         keys[0],

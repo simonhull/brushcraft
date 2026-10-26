@@ -8,12 +8,16 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
-use geom::{FaceId, LayerId, Level, Vec3};
+use geom::{
+    CorrectionMap, DenseEvaluation, DisplayTile, FaceGrids, FaceId, LayerId, Level, Vec3,
+    build_mesh,
+};
 
 use super::format::{ENTRY_LEN, MAX_TILE_RECORD, NONE, parse_index_payload, parse_tile_payload};
 use super::*;
 use crate::bounds::{KNOWN_RECORD_LEN, UNKNOWN_RECORD_LEN, parse_bounds_payload};
 use crate::codec::decode_displacement_into;
+use crate::display::{DisplayRecord, StoredDisplay, display_body, display_header, parse_display};
 use crate::meta::{MAX_BASE_PATH, ProjectId, Role};
 use crate::op::{MAX_SEQ, RESERVED_SITE};
 use crate::record::{HEAD, TAIL};
@@ -394,9 +398,91 @@ fn seed_file(path: &Path, meta: Meta) {
             .unwrap();
         file.save().unwrap();
     }
+    // Display records, named by a save point: two known, one unknown.
+    let display = small_display_tiles();
+    let records: Vec<DisplayRecord> = display.iter().take(2).map(DisplayRecord::of).collect();
+    let unknown = *display[2].key();
+    file.write_display_many(
+        records
+            .iter()
+            .zip(&display)
+            .map(|(r, t)| (*t.key(), Some(r)))
+            .chain([(unknown, None)]),
+        Stamp::ZERO,
+    )
+    .unwrap();
+    file.save().unwrap();
     let key = TileKey::displacement(FaceId::new(4), Level::new(1).unwrap(), 0, 0).unwrap();
     let tile = CorrectionTile::from_values(3, &[Vec3::ZERO; 9]).unwrap();
     file.write_displacement(key, op_of(0, 4), &tile).unwrap();
+}
+
+/// Display tiles of the tests' mesh at levels 0 and 1, built from its level-2 surface: small,
+/// real tiles for the display records' harnesses and seeds.
+fn small_display_tiles() -> Vec<DisplayTile> {
+    let mesh = fixture::mesh();
+    let finest = Level::new(2).unwrap();
+    let dense = DenseEvaluation::new(&mesh, finest, &CorrectionMap::new()).unwrap();
+    let (mut positions, mut normals) = (FaceGrids::new(finest), FaceGrids::new(finest));
+    for face in mesh.faces() {
+        positions
+            .insert(face, dense.grid(face, finest).unwrap().clone())
+            .unwrap();
+        let unit = geom::normals(&mesh, &dense, geom::Region::whole_face(face, finest)).unwrap();
+        normals.insert(face, unit).unwrap();
+    }
+    build_mesh(&mesh, &positions, &normals).unwrap()
+}
+
+/// [`parse_display`] takes any header and body for any key without panicking, and what it
+/// accepts is a display tile of that key.
+#[test]
+fn display_records_parse_anything() {
+    bolero::check!()
+        .with_type::<(RawKey, Vec<u8>, Vec<u8>)>()
+        .for_each(|(key, header, body)| {
+            let key = key_of(*key);
+            if let Some(StoredDisplay::Known(record)) = parse_display(&key, header, body) {
+                assert!(
+                    DisplayTile::decode(key, record.error, &record.encoded).is_ok(),
+                    "accepted means decodes"
+                );
+            }
+        });
+}
+
+/// A display record reads back as its writer wrote it; with one byte of its header or body
+/// changed, it reads as a tile that decodes (a change that keeps it valid) or not at all, never
+/// as a panic.
+#[test]
+fn display_records_round_trip_or_are_refused() {
+    let tiles = small_display_tiles();
+    bolero::check!()
+        .with_type::<(u8, Flip, bool)>()
+        .for_each(|&(pick, flip, in_header)| {
+            let tile = &tiles[usize::from(pick) % tiles.len()];
+            let record = DisplayRecord::of(tile);
+            let header = display_header(Some(&record));
+            let body = display_body(Some(&record)).to_vec();
+            let parsed = if in_header {
+                parse_display(tile.key(), &flipped(header, flip), &body)
+            } else {
+                parse_display(tile.key(), &header, &flipped(body, flip))
+            };
+            if flip.is_none_or(|(_, xor)| xor == 0) {
+                assert_eq!(
+                    parsed,
+                    Some(StoredDisplay::Known(record)),
+                    "{:?} round-trips",
+                    tile.key()
+                );
+            }
+        });
+    assert_eq!(
+        parse_display(tiles[0].key(), &display_header(None), &[]),
+        Some(StoredDisplay::Unknown),
+        "an unknown record reads as unknown"
+    );
 }
 
 /// Writes the seed corpora of the cargo-fuzz targets (`fuzz/corpus/<target>/seed-*`).

@@ -36,7 +36,8 @@ fn open_and_read(path: &std::path::Path) -> Result<(), store::FileError> {
     Ok(())
 }
 
-/// Reads every tile of `file`, raw and decoded.
+/// Reads every tile of `file`, raw and decoded (correction tiles as displacement, display
+/// records as display tiles).
 ///
 /// # Errors
 ///
@@ -45,9 +46,11 @@ fn read_all(file: &ProjectFile) -> Result<(), store::FileError> {
     let keys: Vec<_> = file.keys().copied().collect();
     for key in &keys {
         file.read_tile(key)?;
-        file.read_displacement(key)?;
+        if key.channel() == geom::Channel::DISPLACEMENT {
+            file.read_displacement(key)?;
+        }
     }
-    Ok(())
+    store::fuzzing::read_displays(file)
 }
 
 fuzz_target!(|bytes: &[u8]| {

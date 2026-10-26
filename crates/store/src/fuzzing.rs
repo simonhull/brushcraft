@@ -39,6 +39,20 @@ pub fn fix_checksums(file: &mut [u8]) {
     }
 }
 
+/// Reads every display record `file` holds (tile records of the display channel), as a store
+/// opening it would: damage reads as unknown, so only I/O fails.
+///
+/// # Errors
+///
+/// The first read's I/O error.
+pub fn read_displays(file: &crate::ProjectFile) -> Result<(), crate::FileError> {
+    let keys: Vec<geom::TileKey> = file.display_keys().copied().collect();
+    for key in &keys {
+        file.read_display(key)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {

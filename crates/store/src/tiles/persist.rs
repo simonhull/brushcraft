@@ -27,6 +27,7 @@ use geom::TileKey;
 #[cfg(test)]
 use super::TestHooks;
 use super::config::{Headroom, StoreConfig, reserved_shares};
+use super::display::display_book_of;
 use super::error::{CacheError, Invariant};
 use super::layers::{
     Dirty, Filled, Saved, book_of, check_layers, first_op, saved_base, write_slot,
@@ -34,6 +35,7 @@ use super::layers::{
 use super::{StoreId, TileStore};
 use crate::activity::Activity;
 use crate::deps::DepGraph;
+use crate::display::is_display;
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, ProjectFile, ReadScratch};
 use crate::hash::TileMap;
@@ -119,10 +121,12 @@ impl TileStore {
         )?;
         // A recovery file holds only edits no save has: a restored one's are still to save.
         let since_rebase = match working.meta().role() {
-            Role::Recovery { .. } => working.keys().copied().collect(),
+            // Display records aren't edits: the display book carries them.
+            Role::Recovery { .. } => working.keys().copied().filter(is_correction).collect(),
             Role::Project => BTreeSet::new(),
         };
         let bounds = book_of(&working, base.as_ref())?;
+        let display = display_book_of(&working, base.as_ref());
         let workers = rayon::ThreadPoolBuilder::new()
             .num_threads(config.worker_threads())
             .thread_name(|n| format!("tile-eval-{n}"))
@@ -150,6 +154,7 @@ impl TileStore {
             generation: 0,
             working_failed: false,
             bounds,
+            display,
             feed,
             save_consumer,
             streams: HashMap::new(),
@@ -265,7 +270,7 @@ impl TileStore {
         if let Some(missing) = self
             .file
             .keys()
-            .find(|key| recovery && !self.since_rebase.contains(key))
+            .find(|key| recovery && is_correction(key) && !self.since_rebase.contains(key))
         {
             return Err(Invariant::NotInSave(*missing).into());
         }
@@ -279,6 +284,7 @@ impl TileStore {
                 Stamp::ZERO,
             )
             .map_err(CacheError::Save)?;
+        self.save_display(project, &lost)?;
         project
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::Save))?;
@@ -287,7 +293,7 @@ impl TileStore {
             base,
             stamp: self.last_write,
             lost,
-            bounds: self.bounds.changes(),
+            bounds: self.derived_changes(),
         })
     }
 
@@ -330,7 +336,7 @@ impl TileStore {
             lost,
             bounds,
         } = saved;
-        if stamp != self.last_write || bounds != self.bounds.changes() {
+        if stamp != self.last_write || bounds != self.derived_changes() {
             return Err(CacheError::StaleSave);
         }
         if base.meta().mesh_hash() != self.mesh_hash || working.meta().mesh_hash() != self.mesh_hash
@@ -371,6 +377,7 @@ impl TileStore {
         self.assert_known_ops_resident();
         self.since_rebase.clear();
         self.bounds.rebased();
+        self.display.rebased();
         self.generation += 1;
         self.working_failed = false;
         // The old workers read the old files; dropping them joins them and drops their results.
@@ -431,6 +438,7 @@ impl TileStore {
             .keys()
             .chain(&self.since_rebase)
             .chain(old_base.into_iter().flat_map(BaseFile::keys))
+            .filter(|key| is_correction(key))
             .find(|key| !saved.contains(key) && !lost.contains(key))
             .copied()
     }
@@ -471,6 +479,7 @@ impl TileStore {
             .file
             .keys()
             .copied()
+            .filter(is_correction)
             .chain(self.unsaved.keys().copied())
             .collect();
         let mut lost = Vec::new();
@@ -533,6 +542,7 @@ impl TileStore {
                 Stamp::ZERO,
             )
             .map_err(CacheError::WriteBack)?;
+        self.carry_display(&mut fresh, &lost)?;
         fresh
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::WriteBack))?;
@@ -541,7 +551,7 @@ impl TileStore {
             lost,
             cleaned,
             stamp: self.last_write,
-            bounds: self.bounds.changes(),
+            bounds: self.derived_changes(),
         })
     }
 
@@ -573,7 +583,7 @@ impl TileStore {
             stamp,
             bounds,
         } = filled;
-        if stamp != self.last_write || bounds != self.bounds.changes() {
+        if stamp != self.last_write || bounds != self.derived_changes() {
             return Err(CacheError::StaleSave);
         }
         // Drained first, so the feed can't bring a lost key back.
@@ -606,6 +616,7 @@ impl TileStore {
         }
         // The new file holds every bound as it is now.
         self.bounds.all_flushed();
+        self.display.all_flushed();
         self.generation += 1;
         self.working_failed = false;
         // The workers' jobs name records of the old file.
@@ -615,6 +626,12 @@ impl TileStore {
             self.reload_lost(key);
         }
         Ok((old, lost))
+    }
+
+    /// The changes counted to the bounds and the display tiles the store keeps: a save or a
+    /// roll-over made before a later one doesn't hold it.
+    pub(super) const fn derived_changes(&self) -> u64 {
+        self.bounds.changes().wrapping_add(self.display.changes())
     }
 
     /// Moves every key save's consumer hasn't drained from the change feed into
@@ -696,8 +713,15 @@ impl TileStore {
             }
         }
         self.write_unsaved_bounds()?;
+        self.write_unsaved_display()?;
         self.file
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::Store))
     }
+}
+
+/// Whether `key` names a tile record that is an edit, not a display record (see
+/// [`crate::display`]): only those are saved, carried and checked as edits.
+fn is_correction(key: &TileKey) -> bool {
+    !is_display(key)
 }

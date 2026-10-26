@@ -55,6 +55,7 @@ impl TileStore {
         self.feed.has_pending(id)
             || self.streams.get(&id).is_some_and(|mark| !mark.is_empty())
             || self.bounds.has_unflushed()
+            || self.display.has_unflushed()
     }
 
     /// Copies, for streaming consumer `id`, every correction slot whose latest edit isn't in the

@@ -45,6 +45,7 @@ use crate::tile_bounds::TileBounds;
 mod base;
 mod bounds_io;
 mod compact;
+mod display_io;
 mod error;
 mod format;
 mod lock;
@@ -1108,7 +1109,8 @@ impl ProjectFile {
     /// into this one.
     ///
     /// A bounds record that doesn't read is written as unknown instead: a bound is derived
-    /// data, which loading the index computes again, and must never stop a save.
+    /// data, which loading the index computes again, and must never stop a save. So is a display
+    /// record (see [`crate::display`]).
     ///
     /// # Errors
     ///
@@ -1117,6 +1119,17 @@ impl ProjectFile {
     /// `base`'s file has been dropped.
     pub(crate) fn copy_base(&mut self, base: &BaseFile) -> Result<(), FileError> {
         for (key, &loc) in base.locations.iter() {
+            if crate::display::is_display(key) {
+                // Derived: one that doesn't read goes across as unknown.
+                match base.reader.read_record(loc) {
+                    Ok(raw) => self.append_display_copy(key, &raw)?,
+                    Err(FileError::Damaged { .. }) => {
+                        self.write_display_many([(*key, None)], Stamp::ZERO)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
             let raw = base.reader.read_record(loc)?;
             if tile_record(&raw, key).is_none() {
                 return Err(FileError::Damaged { offset: loc.offset });

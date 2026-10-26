@@ -11,6 +11,7 @@ use super::error::FileError;
 use super::format::tile_record;
 use super::lock::{Lock, open_locked, open_readable};
 use super::{Loc, Name, ProjectFile, Repair};
+use crate::display::is_display;
 use crate::stamp::Stamp;
 
 /// Writes a new project at `dst` holding `src`'s meta and mesh, its live tiles and bounds (raw
@@ -71,7 +72,8 @@ pub fn compact_in_place(path: &Path) -> Result<(), FileError> {
 /// Writes `from`'s live tiles and bounds and one full Index to a new project at `dst`, created
 /// with `from`'s permission bits (less the umask's), so it is never more open than `from`.
 ///
-/// A bounds record that doesn't read is written as unknown, as [`ProjectFile::copy_base`] does.
+/// A bounds or display record that doesn't read is written as unknown, as
+/// [`ProjectFile::copy_base`] does.
 ///
 /// # Errors
 ///
@@ -81,6 +83,16 @@ pub(super) fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), FileErr
     let mut to = ProjectFile::create_like_mode(dst, from.meta.clone(), from, mode)?;
     for (name, &Loc { offset, len }) in &from.live {
         match name {
+            Name::Tile(key) if is_display(key) => {
+                // Derived: one that doesn't read goes across as unknown.
+                match from.read_record(offset, len) {
+                    Ok(raw) => to.append_display_copy(key, &raw)?,
+                    Err(FileError::Damaged { .. }) => {
+                        to.write_display_many([(*key, None)], Stamp::ZERO)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Name::Tile(key) => {
                 let raw = from.read_record(offset, len)?;
                 if tile_record(&raw, key).is_none() {

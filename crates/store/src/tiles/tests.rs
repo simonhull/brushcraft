@@ -27,7 +27,8 @@ use crate::deps::list_normal_inputs;
 use crate::file::FileError;
 use crate::fixture::{
     EVAL, Edit, Rng, SITE, TEST_THREADS, TOP, assert_positions, assert_tile, config, damage, dense,
-    fixed, level, mesh, meta_for, pools, random_edits, roomy, split_prism, tight, tiles,
+    display_layer, fixed, level, mesh, meta_for, pools, random_edits, roomy, split_prism, tight,
+    tiles,
 };
 use crate::op::RESERVED_SITE;
 use crate::pool::{Freshness, SlotData, SlotId};
@@ -36,6 +37,7 @@ use crate::workers::Workers;
 
 mod budget;
 mod differential;
+mod display;
 mod edit;
 mod evaluate;
 mod feed;

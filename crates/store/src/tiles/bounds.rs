@@ -114,7 +114,8 @@ impl TileStore {
         self.bounds.settle(&self.mesh, &self.deps)?;
         self.bounds
             .forget(&self.mesh, &self.deps, lost.iter().copied())?;
-        self.write_unflushed_bounds()
+        self.write_unflushed_bounds()?;
+        self.flush_display(lost)
     }
 
     /// Loses the `lost` tiles a flush leaves out (broken slots), as a save loses a tile whose
@@ -303,6 +304,7 @@ impl TileStore {
         if left_out.is_empty() {
             return Ok(());
         }
+        self.forget_display_at_cut(left_out)?;
         let stale = self
             .bounds
             .forget(&self.mesh, &self.deps, left_out.iter().copied())?;

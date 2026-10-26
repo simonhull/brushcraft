@@ -41,7 +41,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
-use crate::fixture::{record, tight};
+use crate::fixture::{display_layer, record, tight};
 use crate::index::SpatialIndex;
 use crate::index::tests::assert_loads_as_built;
 
@@ -220,13 +220,41 @@ fn edit(project: &mut Project, index: &mut SpatialIndex, count: u32, seed: u64) 
     edit_and_refit(project.store(), index, count, seed);
 }
 
-/// Applies `count` edits with `seed` to `store` as dabs of its current op, and refits `index`
-/// to every tile of its level: the bounds recorded are those of the edits' state.
+/// Records the whole display layer, applies `count` edits with `seed` to `store` as dabs of its
+/// current op, and refits `index` to every tile of its level.
+///
+/// The bounds recorded are those of the edits' state; the display tiles, those of the state
+/// before them, which the edits must make unknown wherever they change them, or a restore would
+/// show them stale.
 fn edit_and_refit(store: &mut TileStore, index: &mut SpatialIndex, count: u32, seed: u64) {
     let mesh = store.working().mesh();
+    let layer = display_layer(store);
+    store.record_display(&layer).unwrap();
     let edits = random_edits(&mesh, TOP, count, seed);
     apply_dabs(store, &mut CorrectionMap::new(), &edits);
     index.update(store, &tiles(&mesh, TOP, TOP)).unwrap();
+}
+
+/// Asserts what [`assert_loads_as_built`] does of `store`'s index over [`top`], and that it holds
+/// no display tile older (or newer) than its corrections ([`assert_display_current`]); returns
+/// the index load's stats.
+fn assert_restored_derived(store: &mut TileStore, what: &str) -> LoadStats {
+    let loaded = assert_loads_as_built(store, top(), what);
+    assert_display_current(store, what);
+    loaded
+}
+
+/// Asserts that `store` holds no display tile older (or newer) than its corrections: each is
+/// unknown, or the one its tiles build, bit for bit.
+fn assert_display_current(store: &mut TileStore, what: &str) {
+    let built = display_layer(store);
+    let keys: Vec<TileKey> = built.iter().map(|t| *t.key()).collect();
+    let stored = store.stored_display(&keys).unwrap();
+    for (tile, kept) in built.iter().zip(stored) {
+        if let Some(kept) = kept {
+            assert_eq!(&kept, tile, "{what}: display tile {:?}", tile.key());
+        }
+    }
 }
 
 /// Blocks the calling thread for good: the child waits there for its kill, running nothing
@@ -397,7 +425,7 @@ fn crash(scenario: Scenario) {
         scenario.strokes > 0 || scenario.keeps_the_last_stroke(),
         "{scenario:?}: the recovered edits, and only they, are unsaved"
     );
-    let loaded = assert_loads_as_built(project.store(), top(), &what);
+    let loaded = assert_restored_derived(project.store(), &what);
     // A project never saved, whose first flush never finished, has no save point to hold any.
     let durable = scenario.saved || scenario.strokes > 0 || scenario.keeps_the_last_stroke();
     assert_eq!(

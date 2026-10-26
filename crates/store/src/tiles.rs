@@ -122,6 +122,7 @@ use self::pins::{PinTable, Pinned};
 use crate::activity::Activity;
 use crate::bounds::Book;
 use crate::deps::DepGraph;
+use crate::display::Display;
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, ProjectFile, ReadScratch};
 use crate::hash::TileMap;
@@ -134,6 +135,7 @@ use crate::stamp::Stamp;
 
 mod bounds;
 mod config;
+mod display;
 mod edit;
 mod error;
 mod evaluate;
@@ -337,6 +339,9 @@ pub struct TileStore {
     /// save, which the working file lacks, and which writes may have made stale (see
     /// [`crate::bounds`]).
     bounds: Book,
+    /// The display tiles the store keeps in its files, under the bounds' rule (see
+    /// [`crate::display`]).
+    display: Book<Display>,
     /// The change feed: every key an edit changed, with its op.
     feed: ChangeFeed,
     /// Save's place in the feed.

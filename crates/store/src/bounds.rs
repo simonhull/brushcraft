@@ -236,21 +236,102 @@ pub(crate) fn readers(
     }
 }
 
-/// What the store knows of the bounds it keeps in its files (see the module notes).
-#[derive(Debug, Default)]
-pub(crate) struct Book {
-    /// The levels whose bounds any file of the store, or this session, holds: writes are settled
-    /// against these. Empty while no bound is kept anywhere, and then writes are not noted.
+/// A kind of data derived from the corrections that the store keeps in its files under the
+/// bounds' rule (see the module notes).
+///
+/// The spatial index's bounds ([`Bounds`]), or the display layer
+/// ([`crate::display::Display`]).
+pub(crate) trait Derived {
+    /// What the store keeps of one tile.
+    type Value: Clone + std::fmt::Debug;
+
+    /// Whether a recorded value always goes to the working file with the next flush, and leaves
+    /// memory once there ([`Kept::Written`]): for values too large to keep in memory until a save,
+    /// whose files grow with the edits anyway. Else a value recorded with no edit waiting is
+    /// derived, kept in memory for the next save only.
+    const SPILLS: bool;
+
+    /// Whether a write of `key`'s corrections can change a tile of a tracked level in `levels`.
+    fn reaches(levels: &BTreeSet<Level>, key: &TileKey) -> bool;
+
+    /// Every tile of a tracked level in `levels` whose value a write of the `edited` tiles can
+    /// change.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError`] from listing a tile's neighbours or parents: never for tiles of `mesh`.
+    fn readers(
+        mesh: &BaseMesh,
+        deps: &DepGraph,
+        edited: &BTreeSet<TileKey>,
+        levels: &BTreeSet<Level>,
+    ) -> Result<BTreeSet<TileKey>, EvalError>;
+}
+
+/// The spatial index's bounds, as a [`Book`] keeps them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Bounds;
+
+impl Derived for Bounds {
+    type Value = TileBounds;
+
+    const SPILLS: bool = false;
+
+    fn reaches(levels: &BTreeSet<Level>, key: &TileKey) -> bool {
+        levels
+            .last()
+            .is_some_and(|&finest| key.level() <= finest && is_evaluated(key))
+    }
+
+    fn readers(
+        mesh: &BaseMesh,
+        deps: &DepGraph,
+        edited: &BTreeSet<TileKey>,
+        levels: &BTreeSet<Level>,
+    ) -> Result<BTreeSet<TileKey>, EvalError> {
+        readers(mesh, deps, edited, levels)
+    }
+}
+
+/// One tile's value as a [`Book`] keeps it since the last rebase.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Kept<V> {
+    /// The value, as the store's current state gives it.
+    Known(V),
+    /// Not known: whoever needs it computes it.
+    Unknown,
+    /// Known, and in the working file as its latest record, which reads find instead (for a
+    /// [`Derived::SPILLS`] kind, once a flush or a save of the working file wrote it).
+    Written,
+}
+
+impl<V> Kept<V> {
+    /// The value, if it is held here and known.
+    pub(crate) const fn known(&self) -> Option<&V> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Unknown | Self::Written => None,
+        }
+    }
+}
+
+/// What the store knows of the derived data of one kind (bounds by default) it keeps in its
+/// files (see the module notes).
+#[derive(Debug)]
+pub(crate) struct Book<D: Derived = Bounds> {
+    /// The levels whose values any file of the store, or this session, holds: writes are settled
+    /// against these. Empty while none is kept anywhere, and then writes are not noted.
     levels: BTreeSet<Level>,
-    /// Correction tiles written since the last settle, of levels at most the finest tracked.
+    /// Correction tiles written since the last settle that can reach a tracked level.
     edited: BTreeSet<TileKey>,
-    /// Every bound changed since the store opened or was last rebased: its value now, `None` if
-    /// unknown. What a save copies into the project file, and what reads find first.
-    changed: BTreeMap<TileKey, Option<TileBounds>>,
-    /// The bounds of [`Book::changed`] edits changed that the working file hasn't received since
-    /// (see the module notes): what the next flush writes.
+    /// Every value changed since the store opened or was last rebased. What a save copies into
+    /// the project file, and what reads find first.
+    changed: BTreeMap<TileKey, Kept<D::Value>>,
+    /// The values of [`Book::changed`] edits changed that the working file hasn't received since
+    /// (see the module notes), and for a [`Derived::SPILLS`] kind every value recorded since: what
+    /// the next flush writes.
     unflushed: BTreeSet<TileKey>,
-    /// The bounds of [`Book::changed`] whose latest change is derived (see the module notes): no
+    /// The values of [`Book::changed`] whose latest change is derived (see the module notes): no
     /// flush writes them; a save of the project file, or of the working file itself, does.
     derived: BTreeSet<TileKey>,
     /// Counts the changes made to [`Book::changed`]: a save or a roll-over made before a later
@@ -258,12 +339,25 @@ pub(crate) struct Book {
     changes: u64,
 }
 
-impl Book {
-    /// A book over files holding bounds of `levels`, with `changed` the bounds the working file
+impl<D: Derived> Default for Book<D> {
+    fn default() -> Self {
+        Self {
+            levels: BTreeSet::new(),
+            edited: BTreeSet::new(),
+            changed: BTreeMap::new(),
+            unflushed: BTreeSet::new(),
+            derived: BTreeSet::new(),
+            changes: 0,
+        }
+    }
+}
+
+impl<D: Derived> Book<D> {
+    /// A book over files holding values of `levels`, with `changed` the values the working file
     /// holds that no save has copied into the project file (those of a restored recovery file).
-    pub(crate) fn new(
+    pub(crate) fn with(
         levels: BTreeSet<Level>,
-        changed: BTreeMap<TileKey, Option<TileBounds>>,
+        changed: BTreeMap<TileKey, Kept<D::Value>>,
     ) -> Self {
         Self {
             levels,
@@ -272,21 +366,17 @@ impl Book {
         }
     }
 
-    /// Notes a write of `key`'s corrections, if it can change a tracked level's bounds: the next
+    /// Notes a write of `key`'s corrections, if it can change a tracked level's values: the next
     /// [`Book::settle`] makes those unknown.
     pub(crate) fn note_write(&mut self, key: TileKey) {
-        let reaches = self
-            .levels
-            .last()
-            .is_some_and(|&finest| key.level() <= finest && is_evaluated(&key));
-        if reaches {
+        if D::reaches(&self.levels, &key) {
             self.edited.insert(key);
         }
     }
 
-    /// [`Book::settle`], then [`Book::record`] of each of `bounds`, with the same result; a bound
-    /// the settle would make unknown and `bounds` records is set once, to its recorded value,
-    /// to be flushed (as `record` over an unknown left by the settle does).
+    /// [`Book::settle`], then [`Book::record`] of each of `values`, with the same result; a value
+    /// the settle would make unknown and `values` records is set once, to its recorded value, to
+    /// be flushed (as `record` over an unknown left by the settle does).
     ///
     /// # Errors
     ///
@@ -295,19 +385,19 @@ impl Book {
         &mut self,
         mesh: &BaseMesh,
         deps: &DepGraph,
-        bounds: &[(TileKey, TileBounds)],
+        values: &[(TileKey, D::Value)],
     ) -> Result<(), EvalError> {
         let mut stale = if self.edited.is_empty() {
             BTreeSet::new()
         } else {
-            readers(mesh, deps, &self.edited, &self.levels)?
+            D::readers(mesh, deps, &self.edited, &self.levels)?
         };
         self.edited.clear();
-        for &(key, tile) in bounds {
-            if stale.remove(&key) {
-                self.set(key, Some(tile));
+        for (key, value) in values {
+            if stale.remove(key) {
+                self.set(*key, Some(value.clone()));
             } else {
-                self.record(key, tile);
+                self.record(*key, value.clone());
             }
         }
         for key in stale {
@@ -316,7 +406,7 @@ impl Book {
         Ok(())
     }
 
-    /// Makes unknown every bound the writes noted since the last call can change (see
+    /// Makes unknown every value the writes noted since the last call can change (see
     /// [`readers`], which reads neighbours `deps` recorded).
     ///
     /// # Errors
@@ -326,7 +416,7 @@ impl Book {
         if self.edited.is_empty() {
             return Ok(());
         }
-        let stale = readers(mesh, deps, &self.edited, &self.levels)?;
+        let stale = D::readers(mesh, deps, &self.edited, &self.levels)?;
         self.edited.clear();
         for key in stale {
             self.set(key, None);
@@ -334,9 +424,9 @@ impl Book {
         Ok(())
     }
 
-    /// Makes unknown every bound a write of the `lost` tiles could have changed: their latest
-    /// edits are in no file, so bounds recorded since describe a state no save point holds. Done
-    /// after [`Book::settle`]. Returns the bounds made unknown.
+    /// Makes unknown every value a write of the `lost` tiles could have changed: their latest
+    /// edits are in no file, so values recorded since describe a state no save point holds. Done
+    /// after [`Book::settle`]. Returns the values made unknown.
     ///
     /// # Errors
     ///
@@ -348,7 +438,7 @@ impl Book {
         lost: impl IntoIterator<Item = TileKey>,
     ) -> Result<Vec<TileKey>, EvalError> {
         let lost: BTreeSet<TileKey> = lost.into_iter().collect();
-        let stale: Vec<TileKey> = readers(mesh, deps, &lost, &self.levels)?
+        let stale: Vec<TileKey> = D::readers(mesh, deps, &lost, &self.levels)?
             .into_iter()
             .collect();
         for &key in &stale {
@@ -357,57 +447,55 @@ impl Book {
         Ok(stale)
     }
 
-    /// Sets `key`'s bound to `bounds` (`None`: unknown), to be flushed, and tracks its level.
-    pub(crate) fn set(&mut self, key: TileKey, bounds: Option<TileBounds>) {
+    /// Sets `key`'s value to `value` (`None`: unknown), to be flushed, and tracks its level.
+    pub(crate) fn set(&mut self, key: TileKey, value: Option<D::Value>) {
         self.levels.insert(key.level());
-        self.changed.insert(key, bounds);
+        self.changed
+            .insert(key, value.map_or(Kept::Unknown, Kept::Known));
         self.unflushed.insert(key);
         self.derived.remove(&key);
         self.changes += 1;
     }
 
-    /// Records `bounds`, computed from the store's current state, as `key`'s bound: flushed if
-    /// an edit's change to it is waiting to be (it replaces that change, which the working file
-    /// must not miss), else derived, kept for the next save only (see the module notes).
-    pub(crate) fn record(&mut self, key: TileKey, bounds: TileBounds) {
-        if self.unflushed.contains(&key) {
-            self.set(key, Some(bounds));
+    /// Records `value`, computed from the store's current state, as `key`'s: flushed if an
+    /// edit's change to it is waiting to be (it replaces that change, which the working file
+    /// must not miss) or the kind [spills](Derived::SPILLS), else derived, kept for the next save
+    /// only (see the module notes).
+    pub(crate) fn record(&mut self, key: TileKey, value: D::Value) {
+        if D::SPILLS || self.unflushed.contains(&key) {
+            self.set(key, Some(value));
             return;
         }
         self.levels.insert(key.level());
-        self.changed.insert(key, Some(bounds));
+        self.changed.insert(key, Kept::Known(value));
         self.derived.insert(key);
         self.changes += 1;
     }
 
-    /// `key`'s bound if it changed since the last rebase; `None` if the files hold whatever is
+    /// `key`'s value if it changed since the last rebase; `None` if the files hold whatever is
     /// current.
-    pub(crate) fn changed(&self, key: &TileKey) -> Option<StoredBound> {
-        self.changed
-            .get(key)
-            .map(|&bounds| StoredBound::from(bounds))
+    pub(crate) fn kept(&self, key: &TileKey) -> Option<&Kept<D::Value>> {
+        self.changed.get(key)
     }
 
-    /// Every bound changed since the last rebase, in key order: what a save copies.
-    pub(crate) fn all_changed(&self) -> impl Iterator<Item = (&TileKey, Option<&TileBounds>)> {
-        self.changed
-            .iter()
-            .map(|(key, bounds)| (key, bounds.as_ref()))
+    /// Every value changed since the last rebase, in key order: what a save copies.
+    pub(crate) fn all_kept(&self) -> impl Iterator<Item = (&TileKey, &Kept<D::Value>)> {
+        self.changed.iter()
     }
 
-    /// The bounds the working file hasn't received, with their values, in key order.
-    pub(crate) fn unflushed(&self) -> impl Iterator<Item = (&TileKey, Option<&TileBounds>)> {
+    /// The values the working file hasn't received, in key order.
+    pub(crate) fn unflushed_kept(&self) -> impl Iterator<Item = (&TileKey, &Kept<D::Value>)> {
         self.unflushed
             .iter()
-            .filter_map(|key| Some((key, self.changed.get(key)?.as_ref())))
+            .filter_map(|key| Some((key, self.changed.get(key)?)))
     }
 
-    /// The bounds a save of the working file itself writes, with their values, in key order:
-    /// those a flush would, and the derived ones.
-    pub(crate) fn unsaved(&self) -> impl Iterator<Item = (&TileKey, Option<&TileBounds>)> {
+    /// The values a save of the working file itself writes, in key order: those a flush would,
+    /// and the derived ones.
+    pub(crate) fn unsaved_kept(&self) -> impl Iterator<Item = (&TileKey, &Kept<D::Value>)> {
         self.unflushed
             .union(&self.derived)
-            .filter_map(|key| Some((key, self.changed.get(key)?.as_ref())))
+            .filter_map(|key| Some((key, self.changed.get(key)?)))
     }
 
     /// Whether `key`'s latest change is waiting for a flush.
@@ -415,7 +503,8 @@ impl Book {
         self.unflushed.contains(key)
     }
 
-    /// Whether the working file lacks a bound's latest change made by an edit.
+    /// Whether the working file lacks a value's latest change made by an edit (or, for a kind
+    /// that spills, any recorded value).
     pub(crate) fn has_unflushed(&self) -> bool {
         !self.unflushed.is_empty()
     }
@@ -423,6 +512,7 @@ impl Book {
     /// The working file has received `key`'s latest change.
     pub(crate) fn flushed(&mut self, key: &TileKey) {
         self.unflushed.remove(key);
+        self.spill(key);
     }
 
     /// The working file has received `key`'s latest change in a save of its own: nothing of it
@@ -430,15 +520,31 @@ impl Book {
     pub(crate) fn saved(&mut self, key: &TileKey) {
         self.unflushed.remove(key);
         self.derived.remove(key);
+        self.spill(key);
     }
 
-    /// A new working file holds every bound a flush would write, as it is now (a roll-over
-    /// filled it). Derived bounds stay derived: it doesn't hold them.
+    /// For a kind that [spills](Derived::SPILLS), drops `key`'s known value from memory once the
+    /// working file holds it: reads find the file's record instead.
+    fn spill(&mut self, key: &TileKey) {
+        if D::SPILLS
+            && let Some(kept) = self.changed.get_mut(key)
+            && matches!(kept, Kept::Known(_))
+        {
+            *kept = Kept::Written;
+        }
+    }
+
+    /// A new working file holds every value a flush would write, as it is now (a roll-over
+    /// filled it). Derived values stay derived: it doesn't hold them.
     pub(crate) fn all_flushed(&mut self) {
+        let keys: Vec<TileKey> = self.unflushed.iter().copied().collect();
         self.unflushed.clear();
+        for key in &keys {
+            self.spill(key);
+        }
     }
 
-    /// The project file's new save point holds every changed bound, and the working file is a
+    /// The project file's new save point holds every changed value, and the working file is a
     /// new, empty one over it: nothing is changed since.
     pub(crate) fn rebased(&mut self) {
         self.changed.clear();
@@ -455,6 +561,45 @@ impl Book {
     #[cfg(test)]
     pub(crate) fn has_unsettled(&self) -> bool {
         !self.edited.is_empty()
+    }
+}
+
+impl Book<Bounds> {
+    /// A book over files holding bounds of `levels`, with `changed` the bounds the working file
+    /// holds that no save has copied into the project file (those of a restored recovery file).
+    pub(crate) fn new(
+        levels: BTreeSet<Level>,
+        changed: BTreeMap<TileKey, Option<TileBounds>>,
+    ) -> Self {
+        let kept = changed
+            .into_iter()
+            .map(|(key, bounds)| (key, bounds.map_or(Kept::Unknown, Kept::Known)))
+            .collect();
+        Self::with(levels, kept)
+    }
+
+    /// `key`'s bound if it changed since the last rebase; `None` if the files hold whatever is
+    /// current.
+    pub(crate) fn changed(&self, key: &TileKey) -> Option<StoredBound> {
+        self.kept(key)
+            .map(|kept| StoredBound::from(kept.known().copied()))
+    }
+
+    /// Every bound changed since the last rebase, in key order, `None` if unknown: what a save
+    /// copies.
+    pub(crate) fn all_changed(&self) -> impl Iterator<Item = (&TileKey, Option<&TileBounds>)> {
+        self.all_kept().map(|(key, kept)| (key, kept.known()))
+    }
+
+    /// The bounds the working file hasn't received, with their values, in key order.
+    pub(crate) fn unflushed(&self) -> impl Iterator<Item = (&TileKey, Option<&TileBounds>)> {
+        self.unflushed_kept().map(|(key, kept)| (key, kept.known()))
+    }
+
+    /// The bounds a save of the working file itself writes, with their values, in key order:
+    /// those a flush would, and the derived ones.
+    pub(crate) fn unsaved(&self) -> impl Iterator<Item = (&TileKey, Option<&TileBounds>)> {
+        self.unsaved_kept().map(|(key, kept)| (key, kept.known()))
     }
 }
 

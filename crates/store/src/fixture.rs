@@ -316,3 +316,41 @@ pub(crate) fn assert_positions(
         assert_tile(got, |i, j| grid.get(i, j).unwrap(), key, what);
     }
 }
+
+/// Every display tile of the store's mesh, built from the store's own finest tiles at [`TOP`]:
+/// what the store's display layer should hold for its current state.
+pub(crate) fn display_layer(store: &mut TileStore) -> Vec<geom::DisplayTile> {
+    let mesh = store.mesh().clone();
+    let finest = level(TOP);
+    let side = finest.face_quads() + 1;
+    let (mut positions, mut normals) = (geom::FaceGrids::new(finest), geom::FaceGrids::new(finest));
+    for face in mesh.faces() {
+        let count = usize::try_from(side * side).unwrap();
+        let (mut p, mut n) = (vec![Vec3::ZERO; count], vec![Vec3::ZERO; count]);
+        for key in tiles(&mesh, TOP, TOP)
+            .into_iter()
+            .filter(|k| k.face() == face)
+        {
+            let region = Region::of_tile(&key);
+            let got_p = store.evaluate(key).unwrap().to_vec();
+            let got_n = store.normals(key).unwrap().to_vec();
+            for (index, (gp, gn)) in got_p.into_iter().zip(got_n).enumerate() {
+                let index = u32::try_from(index).unwrap();
+                let (x, y) = (
+                    region.x0() + index % key.side(),
+                    region.y0() + index / key.side(),
+                );
+                let at = usize::try_from(y * side + x).unwrap();
+                p[at] = gp;
+                n[at] = gn;
+            }
+        }
+        positions
+            .insert(face, geom::Grid::new(side, p).unwrap())
+            .unwrap();
+        normals
+            .insert(face, geom::Grid::new(side, n).unwrap())
+            .unwrap();
+    }
+    geom::build_mesh(&mesh, &positions, &normals).unwrap()
+}
