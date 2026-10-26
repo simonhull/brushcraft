@@ -27,6 +27,8 @@ subcommands:
   budget     a random walk (evaluate, brush, pan) under a budget, sampling RSS every 100 ms
   perf       the tracked performance suite: stage benches and a cached medium project (and
              with --full the benchmark project), compared with the history's baseline
+  display-study  every display-tile encoding measured on sampled faces: file growth, the
+             error bound, decode cost and seam exactness (reads the project, saves nothing)
 
 options (each subcommand takes the ones it uses):
   --project PATH          the project file (default $XDG_CACHE_HOME/brushcraft/bench/sphere.bcrf);
@@ -39,6 +41,7 @@ options (each subcommand takes the ones it uses):
                           records the setting and the count it gave
   generate: --splits N (20)  --levels N (9)  --amplitude F (0.01)  --force (replace the file)
   page-in, brush, save, budget: --level N, the finest level, the one measured (9)
+  display-study: --samples N (200), the faces measured, evenly spaced
   page-in:  --samples N (5)  --footprint VERTICES (50000)  --region-quads N (42000000)
             --pool cold|warm|both (cold): between samples the store is emptied and its memory
             given back (cold: every pin maps fresh memory), or emptied with its memory kept
@@ -76,17 +79,20 @@ pub(crate) enum Subcommand {
     Budget,
     /// The tracked performance suite.
     Perf,
+    /// The display-tile encoding study.
+    DisplayStudy,
 }
 
 impl Subcommand {
     /// Every subcommand.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Generate,
         Self::PageIn,
         Self::Brush,
         Self::Save,
         Self::Budget,
         Self::Perf,
+        Self::DisplayStudy,
     ];
 
     /// The subcommand's name on the command line and in the JSON records.
@@ -98,6 +104,7 @@ impl Subcommand {
             Self::Save => "save",
             Self::Budget => "budget",
             Self::Perf => "perf",
+            Self::DisplayStudy => "display-study",
         }
     }
 
@@ -108,7 +115,7 @@ impl Subcommand {
     /// spec's 1 GB workload. `perf` doesn't use one: each part runs with its subcommand's.
     const fn default_budget_mib(self) -> usize {
         match self {
-            Self::Generate | Self::Brush | Self::Save | Self::Perf => 2048,
+            Self::Generate | Self::Brush | Self::Save | Self::Perf | Self::DisplayStudy => 2048,
             Self::PageIn => 4096,
             Self::Budget => 1024,
         }
@@ -125,9 +132,11 @@ impl Subcommand {
             Project | Workers => true,
             BudgetMib | Seed => self != Self::Perf,
             Splits | Levels | Amplitude | Force => self == Self::Generate,
-            Level | Footprint => !matches!(self, Self::Generate | Self::Perf),
+            Level => !matches!(self, Self::Generate | Self::Perf),
+            Footprint => !matches!(self, Self::Generate | Self::Perf | Self::DisplayStudy),
             History | Baseline | Full | Tiny | NoStages | SettleSecs => self == Self::Perf,
-            Samples | RegionQuads | Pool => self == Self::PageIn,
+            Samples => matches!(self, Self::PageIn | Self::DisplayStudy),
+            RegionQuads | Pool => self == Self::PageIn,
             Steps => matches!(self, Self::Brush | Self::Save),
             PerStep => self == Self::Brush,
             Strength => matches!(self, Self::Brush | Self::Save | Self::Budget),
@@ -369,7 +378,11 @@ impl Options {
             amplitude: 0.01,
             force: false,
             level: 9,
-            samples: 5,
+            samples: if subcommand == Subcommand::DisplayStudy {
+                200
+            } else {
+                5
+            },
             footprint: 50_000,
             region_quads: 42_000_000,
             pools: Pools::Cold,

@@ -231,6 +231,7 @@ dependencies = [
  "sculpt",
  "store",
  "thiserror 2.0.21",
+ "zstd",
 ]
 
 [[package]]

@@ -11,8 +11,9 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-geom.workspace = true
+geom = { workspace = true, features = ["display-study"] }
 rustix = { workspace = true, features = ["process", "thread"] }
 sculpt.workspace = true
 store.workspace = true
 thiserror.workspace = true
+zstd.workspace = true

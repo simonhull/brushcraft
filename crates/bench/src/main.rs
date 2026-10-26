@@ -1,6 +1,6 @@
 //! `brushcraft-bench`: the M0 benchmark harness.
 //!
-//! Six subcommands, headless, over the benchmark project (see [`cli::USAGE`]):
+//! Seven subcommands, headless, over the benchmark project (see [`cli::USAGE`]):
 //!
 //! - `generate` builds the benchmark sphere (`cube_sphere(20)`, levels 1 to 9: 1.26 billion
 //!   triangles) with fBm-noise corrections at every level, and saves it ([`generate`]);
@@ -11,7 +11,9 @@
 //!   ([`brush::run_save`]);
 //! - `budget` walks the model under a 1 GiB budget, sampling RSS every 100 ms ([`budget`]);
 //! - `perf` runs the tracked performance suite over the others and the stage benches, records it in
-//!   the docs repository's history and flags changes beyond noise ([`perf`]).
+//!   the docs repository's history and flags changes beyond noise ([`perf`]);
+//! - `display-study` measures every candidate display-tile encoding on the project's faces: file
+//!   growth, the error bound, decode cost and seam exactness ([`display_study`]).
 //!
 //! Each result is a JSON line on stdout (`{"bench": …, "result": …, …}`); progress and a human
 //! summary go to stderr. The project lives outside the repository, under
@@ -24,6 +26,7 @@
 mod brush;
 mod budget;
 mod cli;
+mod display_study;
 mod generate;
 mod noise;
 mod page_in;
@@ -62,6 +65,7 @@ fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<
         Subcommand::Save => brush::run_save(options, &paths, out),
         Subcommand::Budget => budget::run(options, &paths, out),
         Subcommand::Perf => return perf::run(options, &paths, out),
+        Subcommand::DisplayStudy => display_study::run(options, &paths, out),
     }?;
     Ok(Status::Clean)
 }

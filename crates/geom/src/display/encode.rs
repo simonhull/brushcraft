@@ -18,6 +18,19 @@
 //!   in its tangent frame, quantized as correction tiles are. It needs the base level to decode, so
 //!   it fails the second constraint by construction; it is kept for the study.
 //!
+//! # The choice
+//!
+//! Measured on the benchmark project (all 2,400 faces, `brushcraft-bench display-study`; the
+//! table is in the docs repository's `research/platform/m1a2-display-encoding.md`), as growth of
+//! the project file: [`Interpolating`] at `Precision::QuadFraction(6)` (a step of about a
+//! 64th of the level's quad edge) with [`NormalEncoding::Oct8`], +38.6 % (positions 24.5 %,
+//! normals and roughness 13.6 %). It meets the first three constraints by construction; its
+//! quantization stays under 1.4 % of a quad edge and raises the median `e` by about 2 %. A
+//! coarser step (a 16th) saves 7 points more but raises the median `e` by about 20 %, which the
+//! renderer pays in triangles. 16-bit normals cost 41.4 % on their own, which no position codec
+//! leaves room for under the 65 % budget without that coarser step; 8-bit octahedral normals
+//! are off by at most 0.96°.
+//!
 //! Integer streams are written as byte planes (every value's low byte, then the next, …), which
 //! the store's zstd compresses far better than interleaved bytes: small residuals leave the high
 //! planes zero.
@@ -39,11 +52,11 @@ mod study;
 
 /// The position codec [`build_face`](super::build_face) and [`DisplayTile::decode`](
 /// super::DisplayTile::decode) use.
-pub(super) const CHOSEN: Interpolating = Interpolating::new(Precision::Lossless);
+pub(super) const CHOSEN: Interpolating = Interpolating::new(Precision::QuadFraction(6));
 
 /// The normal encoding [`build_face`](super::build_face) and [`DisplayTile::decode`](
 /// super::DisplayTile::decode) use.
-pub(super) const CHOSEN_NORMALS: NormalEncoding = NormalEncoding::Oct16;
+pub(super) const CHOSEN_NORMALS: NormalEncoding = NormalEncoding::Oct8;
 
 /// How a display tile's positions are stored.
 ///
