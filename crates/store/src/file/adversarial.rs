@@ -5,7 +5,7 @@
 
 use std::os::unix::fs::MetadataExt;
 
-use geom::{FaceId, Level, Vec3};
+use geom::{FaceId, Level, MeshError, Vec3};
 
 use super::*;
 use crate::fixture::{mesh, meta};
