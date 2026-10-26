@@ -17,6 +17,9 @@ test-fixtures = []
 # The stages of a prediction one at a time (`geom::stages`), for `benches/stages.rs` only. The
 # bench evaluates its parents with the dense evaluator, so it brings `test-fixtures`.
 bench-stages = ["test-fixtures"]
+# A block's evaluation inputs as plain data (`geom::gather_block`, `geom::vertex_stencil`), for
+# render's GPU evaluation spike only: its `spike` feature turns this on.
+eval-inputs = []
 
 [dependencies]
 bytemuck.workspace = true

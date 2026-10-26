@@ -136,18 +136,32 @@ pub enum VertexStencil {
     Outside,
 }
 
-/// The stencil of block vertex `(i, j)` of `region`: structural, from the vertex's place on the
-/// face and the mesh's topology, never from positions.
+/// The stencil of block vertex `(i, j)` of `region`, for `i` and `j` in `0..=region.quads()`.
+///
+/// It is structural, from the vertex's place on the face and the mesh's topology, never from
+/// positions. [`VertexStencil::Outside`] for a vertex off the block (either coordinate past
+/// `region.quads()`).
+///
+/// # Panics
+///
+/// Never: `geom`'s stencils hold block corners `0..4` and grid steps of `-1`, `0` or `1`, which
+/// the conversions to `u8` and `i32` take.
 #[must_use]
+#[expect(
+    clippy::expect_used,
+    reason = "geom's stencils hold block corners 0..4 and grid steps of -1, 0 or 1"
+)]
 pub fn vertex_stencil(mesh: &BaseMesh, region: Region, i: u32, j: u32) -> VertexStencil {
-    let step = |(a, b): (i64, i64)| {
-        [
-            i32::try_from(a).unwrap_or(i32::MAX),
-            i32::try_from(b).unwrap_or(i32::MAX),
-        ]
+    if i > region.quads() || j > region.quads() {
+        return VertexStencil::Outside;
+    }
+    let step = |step: (i64, i64)| {
+        <[i64; 2]>::from(step).map(|x| i32::try_from(x).expect("a grid step is -1, 0 or 1"))
     };
     match stencil(&block_of(mesh, region), i64::from(i), i64::from(j)) {
-        Stencil::Corner(c) => VertexStencil::Corner(u8::try_from(c).unwrap_or(u8::MAX)),
+        Stencil::Corner(c) => {
+            VertexStencil::Corner(u8::try_from(c).expect("a block corner is 0, 1, 2 or 3"))
+        }
         Stencil::Axes([u, v]) => VertexStencil::Axes([step(u), step(v)]),
         Stencil::Outside => VertexStencil::Outside,
     }
@@ -229,6 +243,33 @@ mod tests {
         assert!(
             matches!(vertex_stencil(&mesh, region, 1, 0), VertexStencil::Axes(_)),
             "on the face's border, some owner's axes"
+        );
+        assert_eq!(
+            vertex_stencil(&mesh, region, q + 1, 0),
+            VertexStencil::Outside,
+            "one column past the block"
+        );
+        assert_eq!(
+            vertex_stencil(&mesh, region, 0, q + 1),
+            VertexStencil::Outside,
+            "one row past the block"
+        );
+        assert_eq!(
+            vertex_stencil(&mesh, region, u32::MAX, u32::MAX),
+            VertexStencil::Outside,
+            "far off"
+        );
+        // A block inside the face: its last vertex is the face's inside, still its own.
+        let inner = Region::new(region.face(), region.level(), 0, 0, 2).expect("a 2-quad block");
+        assert_eq!(
+            vertex_stencil(&mesh, inner, 2, 2),
+            VertexStencil::Axes([[1, 0], [0, 1]]),
+            "the block's last vertex"
+        );
+        assert_eq!(
+            vertex_stencil(&mesh, inner, 3, 2),
+            VertexStencil::Outside,
+            "a face vertex off the block"
         );
     }
 }

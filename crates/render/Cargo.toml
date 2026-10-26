@@ -10,8 +10,9 @@ description = "The wgpu renderer: opens a GPU device and runs compute and drawin
 workspace = true
 
 [features]
-# M1a's spikes (src/spike): built and tested by the gate, left out of the shipped renderer.
-spike = ["dep:brush", "dep:geom"]
+# M1a's spikes (src/spike): built and tested by the gate, left out of the shipped renderer. They
+# load rust-gpu's SPIR-V (wgpu's naga front end) and gather geom's evaluation inputs.
+spike = ["dep:brush", "dep:geom", "geom/eval-inputs", "wgpu/spirv"]
 
 [dependencies]
 brush = { workspace = true, optional = true }

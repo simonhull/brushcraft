@@ -37,6 +37,7 @@ impl Padded {
     }
 
     /// Every slot, ring included, row-major from `(-1, -1)`.
+    #[cfg(feature = "eval-inputs")]
     pub(crate) fn as_slice(&self) -> &[Vec3] {
         &self.data
     }

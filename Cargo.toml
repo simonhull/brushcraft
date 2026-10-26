@@ -30,10 +30,10 @@ thiserror = "2.0.21"
 wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
-# Exact: every wgpu major breaks the API. Vulkan and Metal (Linux, Android, macOS, iOS); WGSL
-# shaders, and SPIR-V through naga's front end (the rust-gpu spike). No GL, DX12 or browser
-# backends yet.
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl", "spirv"] }
+# Exact: every wgpu major breaks the API. Vulkan and Metal (Linux, Android, macOS, iOS) and WGSL
+# shaders; render's `spike` feature adds SPIR-V input (rust-gpu). No GL, DX12 or browser backends
+# yet.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl"] }
 # Exact: a pre-release; a caret would float to later betas.
 winit = { version = "=0.31.0-beta.3", default-features = false, features = ["wayland", "wayland-dlopen"] }
 zstd = { version = "0.14.3", default-features = false }

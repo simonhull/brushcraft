@@ -30,10 +30,11 @@ pub use correction::{
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use dense::{CorrectionMap, DenseEvaluation};
 pub use eval::{
-    EvalError, GatheredBlock, GatheredRing, Grid, PositionSource, Prediction, VertexStencil,
-    cone_width, evaluate_region, gather_block, normal_tiles, normals, normals_into, parent_tiles,
-    predict_region, refresh_normals_into, vertex_stencil,
+    EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,
+    normals, normals_into, parent_tiles, predict_region, refresh_normals_into,
 };
+#[cfg(feature = "eval-inputs")]
+pub use eval::{GatheredBlock, GatheredRing, VertexStencil, gather_block, vertex_stencil};
 pub use frame::Frame;
 pub use key::{
     Channel, FaceId, LayerId, Level, LevelOutOfRange, MAX_LEVEL, Region, TILE_QUADS, TileKey,
