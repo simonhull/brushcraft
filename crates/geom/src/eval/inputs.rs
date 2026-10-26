@@ -2,8 +2,8 @@
 //! `render`'s GPU evaluation spike uploads them and runs the same stencils in a compute shader.
 //!
 //! [`gather_block`] reads what [`predict_region`](super::predict_region) and
-//! [`normals`](super::normals) read, through the same owner copies; [`vertex_stencil`] says which
-//! of those reads each vertex's frame and normal take. Both are structural copies of `geom`'s
+//! [`normals`](fn@super::normals) read, through the same owner copies; [`vertex_stencil`] says
+//! which of those reads each vertex's frame and normal take. Both are structural copies of `geom`'s
 //! internals, exposed for the spike, with no behaviour of their own.
 
 use super::{EvalError, PositionSource, block_of, gather};

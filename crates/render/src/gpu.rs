@@ -119,7 +119,7 @@ pub enum GpuError {
     /// A mapped buffer couldn't be viewed.
     #[error("viewing a mapped buffer failed")]
     MapRange(#[from] MapRangeError),
-    /// Waiting for the GPU didn't finish within [`WAIT_LIMIT`] (or was given another device's
+    /// Waiting for the GPU didn't finish within 30 seconds (or was given another device's
     /// submission).
     #[error("waiting for the GPU failed")]
     Poll(#[from] PollError),
@@ -347,7 +347,10 @@ impl Gpu {
     ///
     /// # Errors
     ///
-    /// As [`Gpu::read_buffer_with`].
+    /// [`GpuError::NotCopySource`] or [`GpuError::UnalignedCopy`] before touching the GPU; the
+    /// copy's and map's errors as [`Gpu::scoped`]; [`GpuError::Poll`] if the GPU doesn't finish
+    /// within 30 seconds; [`GpuError::Map`], [`GpuError::MapPending`] or [`GpuError::MapRange`]
+    /// if the mapping fails, never completes, or can't be viewed.
     pub fn read_buffer<T: Pod>(&self, source: &Buffer) -> Result<Vec<T>, GpuError> {
         let staging = self.scoped("readback staging", || {
             self.device.create_buffer(&BufferDescriptor {
