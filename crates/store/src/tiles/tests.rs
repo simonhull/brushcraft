@@ -14,6 +14,7 @@ use geom::{
     cube_sphere, normal_tiles, normals,
 };
 
+use super::edit::{BorderValues, border_order, update_row};
 use super::*;
 use crate::MAX_SEQ;
 use crate::fixture::meta_for;
