@@ -18,6 +18,10 @@ fn key(n: u32) -> TileKey {
 /// # Errors
 ///
 /// Never: it panics instead.
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "a write-back here fails the test; the pool's write-back type returns a Result"
+)]
 fn no_write_back<T>(key: TileKey, _: &T) -> Result<(), FileError> {
     panic!("unexpected write-back of {key:?}")
 }

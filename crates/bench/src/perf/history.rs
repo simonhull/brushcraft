@@ -328,10 +328,11 @@ pub(crate) fn baselines<'a>(
 ///
 /// If the file can't be opened, read, cut, written or synced.
 pub(crate) fn append(path: &Path, entries: &[Entry]) -> Result<u64> {
-    let text: String = entries
-        .iter()
-        .map(|e| e.to_record().to_json() + "\n")
-        .collect();
+    let text = entries.iter().fold(String::new(), |mut text, e| {
+        text.push_str(&e.to_record().to_json());
+        text.push('\n');
+        text
+    });
     let old = match std::fs::read(path) {
         Ok(old) => old,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
