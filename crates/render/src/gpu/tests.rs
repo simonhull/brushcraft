@@ -238,3 +238,112 @@ fn a_lost_device_fails_every_later_call() {
         }
     });
 }
+
+#[test]
+fn a_staging_buffer_that_cannot_be_mapped_is_an_error() {
+    GpuTest::run(|gpu| {
+        let source = buffer(gpu, 16, BufferUsages::COPY_SRC);
+        let staging = buffer(gpu, 16, BufferUsages::COPY_DST);
+        let error = gpu
+            .read_buffer_with::<u32>(&source, &staging)
+            .expect_err("no MAP_READ");
+        assert!(matches!(error, GpuError::StagingUsage), "{error}");
+    });
+}
+
+#[test]
+fn a_staging_buffer_smaller_than_the_source_is_an_error() {
+    GpuTest::run(|gpu| {
+        let source = buffer(gpu, 32, BufferUsages::COPY_SRC);
+        let staging = buffer(gpu, 16, BufferUsages::COPY_DST | BufferUsages::MAP_READ);
+        let error = gpu
+            .read_buffer_with::<u32>(&source, &staging)
+            .expect_err("16 bytes can't hold 32");
+        assert!(
+            matches!(
+                error,
+                GpuError::StagingTooSmall {
+                    size: 32,
+                    staging: 16
+                }
+            ),
+            "{error}"
+        );
+        // A kept staging buffer serves readback after readback: it is unmapped each time.
+        let fits = buffer(gpu, 32, BufferUsages::COPY_DST | BufferUsages::MAP_READ);
+        for _ in 0..2 {
+            let values: Vec<u32> = gpu.read_buffer_with(&source, &fits).expect("the readback");
+            assert_eq!(values, vec![0; 8], "a fresh buffer reads zero");
+        }
+    });
+}
+
+#[test]
+fn every_unscoped_error_is_counted() {
+    GpuTest::run(|gpu| {
+        for _ in 0..3 {
+            drop(gpu.device().create_buffer(&BufferDescriptor {
+                label: Some("invalid"),
+                size: 16,
+                usage: BufferUsages::MAP_READ | BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+        }
+        let error = gpu.check().expect_err("three earlier errors");
+        assert!(
+            matches!(&error, GpuError::Uncaptured { message } if message.ends_with("(and 2 more)")),
+            "{error}"
+        );
+        gpu.check().expect("reported once");
+    });
+}
+
+#[test]
+fn an_error_another_thread_raises_during_scoped_work_is_that_calls() {
+    GpuTest::run(|gpu| {
+        let small = buffer(gpu, 16, BufferUsages::COPY_SRC);
+        let other = buffer(gpu, 16, BufferUsages::COPY_DST);
+        let invalid = || {
+            drop(gpu.device().create_buffer(&BufferDescriptor {
+                label: Some("invalid"),
+                size: 16,
+                usage: BufferUsages::MAP_READ | BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+        };
+        // Alone: scopes are thread-local, so the other thread's error is unscoped, and the
+        // closing check gives it to this call.
+        let error = gpu
+            .scoped("work beside another thread", || {
+                std::thread::scope(|s| {
+                    s.spawn(invalid);
+                });
+            })
+            .expect_err("the other thread's error");
+        assert!(matches!(error, GpuError::Uncaptured { .. }), "{error}");
+        gpu.check().expect("attributed, so not reported again");
+        // With a scoped error of its own: that is the error, naming the unscoped one.
+        let both = gpu
+            .scoped("a bad copy beside another thread", || {
+                let mut encoder = gpu
+                    .device()
+                    .create_command_encoder(&CommandEncoderDescriptor::default());
+                encoder.copy_buffer_to_buffer(&small, 0, &other, 0, 64);
+                gpu.queue().submit([encoder.finish()]);
+                std::thread::scope(|s| {
+                    s.spawn(invalid);
+                });
+            })
+            .expect_err("both errors");
+        let message = both.to_string();
+        assert!(
+            matches!(both, GpuError::Validation { .. }),
+            "the scoped error first: {message}"
+        );
+        assert!(
+            message.contains("meanwhile, unscoped"),
+            "and the unscoped one named: {message}"
+        );
+        gpu.check().expect("nothing left over");
+    });
+}

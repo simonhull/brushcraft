@@ -106,8 +106,9 @@ pub enum GpuError {
         /// The reason the driver gave.
         message: String,
     },
-    /// Work done directly on [`Gpu::device`], outside this module's error scopes, raised an
-    /// error since the last call. Reported once.
+    /// Work done directly on [`Gpu::device`], outside this module's error scopes (on any
+    /// thread: `wgpu`'s scopes are thread-local), raised an error since the last call. Reported
+    /// once, the message counting any more.
     #[error("an earlier GPU call failed: {message}")]
     Uncaptured {
         /// `wgpu`'s description of the failure, with its sources.
@@ -167,6 +168,8 @@ struct Health {
     lost: Option<String>,
     /// The first error raised outside an error scope since the last check.
     uncaptured: Option<String>,
+    /// How many more were raised after it.
+    more_uncaptured: usize,
 }
 
 /// An open GPU: the adapter's description, and the device and queue created on it.
@@ -219,9 +222,12 @@ impl Gpu {
         });
         let on_error = Arc::clone(&health);
         device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
-            record(&on_error)
-                .uncaptured
-                .get_or_insert_with(|| describe(&error));
+            let mut state = record(&on_error);
+            if state.uncaptured.is_some() {
+                state.more_uncaptured += 1;
+            } else {
+                state.uncaptured = Some(describe(&error));
+            }
         }));
         Ok(Self {
             adapter_info,
@@ -276,8 +282,11 @@ impl Gpu {
                 message: message.clone(),
             });
         }
+        let more = std::mem::take(&mut health.more_uncaptured);
         match health.uncaptured.take() {
-            Some(message) => Err(GpuError::Uncaptured { message }),
+            Some(message) => Err(GpuError::Uncaptured {
+                message: and_more(message, more),
+            }),
             None => Ok(()),
         }
     }
@@ -285,10 +294,17 @@ impl Gpu {
     /// Runs `work` on the device inside validation, internal and out-of-memory error scopes,
     /// so its errors come back as values; `what` names it in them.
     ///
+    /// `wgpu`'s error scopes are thread-local: they catch what `work` does on this thread. Errors
+    /// from work other threads do on the device arrive through the uncaptured-error handler, and
+    /// [`Gpu::check`] reports them as [`GpuError::Uncaptured`].
+    ///
     /// # Errors
     ///
-    /// The scope's error as [`GpuError::Validation`], [`GpuError::Internal`] or
-    /// [`GpuError::OutOfMemory`]; and as [`Gpu::check`], before and after.
+    /// [`GpuError::DeviceLost`] if the device is lost, before `work` or during it; else the
+    /// scopes' first error as [`GpuError::Validation`], [`GpuError::Internal`] or
+    /// [`GpuError::OutOfMemory`], its message counting the other scopes' errors and naming an
+    /// unscoped error raised meanwhile (each scope keeps only its first error, as WebGPU's do);
+    /// else [`GpuError::Uncaptured`] for an unscoped error, before `work` or during it.
     pub fn scoped<T>(&self, what: &str, work: impl FnOnce() -> T) -> Result<T, GpuError> {
         self.check()?;
         let out_of_memory = self.device.push_error_scope(ErrorFilter::OutOfMemory);
@@ -297,13 +313,22 @@ impl Gpu {
         let value = work();
         // Popped innermost first, all of them, before any is awaited.
         let popped = [validation.pop(), internal.pop(), out_of_memory.pop()];
-        for scope in popped {
-            if let Some(error) = pollster::block_on(scope) {
-                return Err(classify(what, &error));
-            }
+        let errors: Vec<wgpu::Error> = popped.into_iter().filter_map(pollster::block_on).collect();
+        // Always checked, so a loss or an unscoped error during `work` is this call's.
+        let closing = self.check();
+        if let Err(lost @ GpuError::DeviceLost { .. }) = closing {
+            return Err(lost);
         }
-        self.check()?;
-        Ok(value)
+        let Some(first) = errors.first() else {
+            return closing.map(|()| value);
+        };
+        let mut error = classify(what, first, errors.len() - 1);
+        if let (Err(GpuError::Uncaptured { message }), Some(text)) = (closing, error.message_mut())
+        {
+            text.push_str("; meanwhile, unscoped: ");
+            text.push_str(&message);
+        }
+        Err(error)
     }
 
     /// Builds a compute pipeline from `source`, running its `entry_point`, with the layout the
@@ -417,6 +442,29 @@ impl Gpu {
                 drop(sender.send(result));
             });
         })?;
+        let mapped = self.mapped(staging, size, &receiver);
+        // Unmapped whatever happened, so a staging buffer the caller keeps (a timer's) can be
+        // mapped again: a pending map is cancelled, a done one released.
+        let unmapped = self.scoped("readback unmap", || staging.unmap());
+        let values = mapped?;
+        unmapped?;
+        Ok(values)
+    }
+
+    /// Waits for `staging`'s map, which `receiver` hears of, and copies out its first `size`
+    /// bytes as `T`s. The caller unmaps it, whatever this returns.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Poll`] if the GPU doesn't finish within [`WAIT_LIMIT`]; as [`Gpu::check`];
+    /// [`GpuError::Map`], [`GpuError::MapPending`] or [`GpuError::MapRange`] if the mapping
+    /// fails, never completes, or can't be viewed.
+    fn mapped<T: Pod>(
+        &self,
+        staging: &Buffer,
+        size: u64,
+        receiver: &mpsc::Receiver<Result<(), BufferAsyncError>>,
+    ) -> Result<Vec<T>, GpuError> {
         self.device.poll(PollType::Wait {
             submission_index: None,
             timeout: Some(WAIT_LIMIT),
@@ -425,9 +473,42 @@ impl Gpu {
         receiver
             .try_recv()
             .map_err(|_pending| GpuError::MapPending)??;
-        let values = bytemuck::pod_collect_to_vec(&staging.get_mapped_range(..size)?);
-        staging.unmap();
-        Ok(values)
+        Ok(bytemuck::pod_collect_to_vec(
+            &staging.get_mapped_range(..size)?,
+        ))
+    }
+}
+
+/// `message`, saying how many more errors came with it, if any.
+fn and_more(message: String, more: usize) -> String {
+    if more == 0 {
+        message
+    } else {
+        format!("{message} (and {more} more)")
+    }
+}
+
+impl GpuError {
+    /// The message of an error that carries `wgpu`'s description, to add to.
+    fn message_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Validation { message, .. }
+            | Self::OutOfMemory { message, .. }
+            | Self::Internal { message, .. }
+            | Self::Uncaptured { message }
+            | Self::DeviceLost { message } => Some(message),
+            Self::NoAdapter { .. }
+            | Self::RequestDevice(_)
+            | Self::Map(_)
+            | Self::MapRange(_)
+            | Self::Poll(_)
+            | Self::MapPending
+            | Self::Misaligned { .. }
+            | Self::UnalignedCopy { .. }
+            | Self::NotCopySource
+            | Self::StagingUsage
+            | Self::StagingTooSmall { .. } => None,
+        }
     }
 }
 
@@ -437,10 +518,11 @@ fn record(health: &Mutex<Health>) -> MutexGuard<'_, Health> {
     health.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `error`, raised while doing `what`, as the [`GpuError`] of its kind.
-fn classify(what: &str, error: &wgpu::Error) -> GpuError {
+/// `error`, raised while doing `what` with `more` errors after it, as the [`GpuError`] of its
+/// kind.
+fn classify(what: &str, error: &wgpu::Error, more: usize) -> GpuError {
     let what = what.to_owned();
-    let message = describe(error);
+    let message = and_more(describe(error), more);
     match error {
         wgpu::Error::Validation { .. } => GpuError::Validation { what, message },
         wgpu::Error::OutOfMemory { .. } => GpuError::OutOfMemory { what, message },
