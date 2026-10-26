@@ -142,3 +142,99 @@ fn a_readback_as_wider_elements_than_the_buffer_holds_is_misaligned() {
         );
     });
 }
+
+/// A buffer of `size` bytes with `usage`, created inside an error scope.
+fn buffer(gpu: &Gpu, size: u64, usage: BufferUsages) -> Buffer {
+    gpu.scoped("test buffer", || {
+        gpu.device().create_buffer(&BufferDescriptor {
+            label: Some("test"),
+            size,
+            usage,
+            mapped_at_creation: false,
+        })
+    })
+    .expect("a valid buffer")
+}
+
+#[test]
+fn a_readback_that_is_not_whole_words_is_an_error() {
+    GpuTest::run(|gpu| {
+        let six = buffer(gpu, 6, BufferUsages::COPY_SRC);
+        let error = gpu
+            .read_buffer::<u8>(&six)
+            .expect_err("6 bytes aren't whole words");
+        assert!(
+            matches!(error, GpuError::UnalignedCopy { size: 6 }),
+            "{error}"
+        );
+    });
+}
+
+#[test]
+fn a_readback_of_a_buffer_without_copy_src_is_an_error() {
+    GpuTest::run(|gpu| {
+        let storage = buffer(gpu, 16, BufferUsages::STORAGE);
+        let error = gpu
+            .read_buffer::<u32>(&storage)
+            .expect_err("not a copy source");
+        assert!(matches!(error, GpuError::NotCopySource), "{error}");
+    });
+}
+
+#[test]
+fn a_scoped_validation_error_is_returned_not_raised() {
+    GpuTest::run(|gpu| {
+        let small = buffer(gpu, 16, BufferUsages::COPY_SRC);
+        let other = buffer(gpu, 16, BufferUsages::COPY_DST);
+        let error = gpu
+            .scoped("an out-of-bounds copy", || {
+                let mut encoder = gpu
+                    .device()
+                    .create_command_encoder(&CommandEncoderDescriptor::default());
+                encoder.copy_buffer_to_buffer(&small, 0, &other, 0, 64);
+                gpu.queue().submit([encoder.finish()]);
+            })
+            .expect_err("64 bytes from a 16-byte buffer");
+        assert!(
+            matches!(&error, GpuError::Validation { what, .. } if what == "an out-of-bounds copy"),
+            "{error}"
+        );
+        gpu.check()
+            .expect("and nothing is left over for the next call");
+    });
+}
+
+#[test]
+fn an_error_outside_any_scope_is_reported_once_by_the_next_call() {
+    GpuTest::run(|gpu| {
+        // MAP_READ may only be combined with COPY_DST: invalid, and raised outside any scope.
+        drop(gpu.device().create_buffer(&BufferDescriptor {
+            label: Some("invalid"),
+            size: 16,
+            usage: BufferUsages::MAP_READ | BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        }));
+        let error = gpu
+            .compute_pipeline("double", ShaderSource::Wgsl(DOUBLE.into()), "double")
+            .expect_err("the earlier error");
+        assert!(matches!(error, GpuError::Uncaptured { .. }), "{error}");
+        gpu.compute_pipeline("double", ShaderSource::Wgsl(DOUBLE.into()), "double")
+            .expect("reported once, then the device works");
+    });
+}
+
+#[test]
+fn a_lost_device_fails_every_later_call() {
+    GpuTest::run(|gpu| {
+        gpu.device().destroy();
+        // The loss is reported through the device's callback, which runs as the device is
+        // polled.
+        drop(gpu.device().poll(PollType::Poll));
+        for _ in 0..2 {
+            let error = gpu
+                .compute_pipeline("double", ShaderSource::Wgsl(DOUBLE.into()), "double")
+                .expect_err("the device is gone");
+            assert!(matches!(error, GpuError::DeviceLost { .. }), "{error}");
+        }
+    });
+}
