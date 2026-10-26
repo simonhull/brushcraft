@@ -17,13 +17,16 @@ use geom::{
 use super::config::BATCH_SHARE;
 use super::edit::{BorderValues, border_order, update_row};
 use super::layers::{first_op, saved_base};
-use super::round::nothing_to_write;
+use super::round::{
+    Held, Positions, Resident, Tiles, held_index, nothing_to_write, recorded_or_listed,
+};
 use super::*;
 use crate::MAX_SEQ;
+use crate::deps::list_normal_inputs;
 use crate::file::{Loc, StoreError};
 use crate::fixture::meta_for;
 use crate::op::RESERVED_SITE;
-use crate::pool::SlotData;
+use crate::pool::{Freshness, SlotData, SlotId};
 use crate::test_dir::TestDir;
 use crate::workers::Workers;
 

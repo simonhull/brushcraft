@@ -9,9 +9,10 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 
+use super::TileStore;
 use super::error::{CacheError, Invariant};
 use super::layers::first_op;
-use super::{TileStore, keep_first};
+use super::round::keep_first;
 use crate::op::OpId;
 use crate::pool::SlotId;
 use crate::slot::CorrectionSlot;
