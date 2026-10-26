@@ -131,11 +131,9 @@ macro_rules! corner_local {
         let center: $crate::math::Vec3 = $center;
         let valence: u32 = $valence;
         let mut finite = center.is_finite();
-        let mut next = 0_u32;
-        while next < valence {
-            let $k = next;
+        // Range loops, not `while`: see `extraordinary` for why.
+        for $k in 0..valence {
             finite = finite && $point.is_finite();
-            next += 1;
         }
         if !finite || valence < 2 {
             $crate::frame::Local::unknown()
@@ -151,8 +149,7 @@ macro_rules! corner_local {
             let du = $crate::frame::Local::first_edge(center, e0, e1, $owner_corner);
             // Σ_k (e_k − v) × (e_{k+1} − v), from the owner, wrapping.
             let mut normal = $crate::math::Vec3::ZERO;
-            let mut at = 0_u32;
-            while at < valence {
+            for at in 0..valence {
                 let a = {
                     let $k = at;
                     $point
@@ -162,7 +159,6 @@ macro_rules! corner_local {
                     $point
                 };
                 normal = normal + (a - center).cross(b - center);
-                at += 1;
             }
             $crate::frame::Local::ring(du, normal)
         }

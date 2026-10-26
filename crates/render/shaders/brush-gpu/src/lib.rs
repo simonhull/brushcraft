@@ -3,7 +3,7 @@
 //!
 //! The only code here is the entry point's plumbing: which vertex an invocation is, where its
 //! position and delta live. The brush math is `brush`'s, unchanged. `render`'s spike loads the
-//! SPIR-V this builds (`render/src/spike/brush_gpu.spv`) and checks it against the CPU.
+//! SPIR-V this builds (`render/src/spike/brush_gpu_main.spv`) and checks it against the CPU.
 
 #![no_std]
 

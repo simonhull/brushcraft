@@ -34,14 +34,25 @@ use crate::spike::Timer;
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
 
-/// The SPIR-V rust-gpu compiled from `shaders/eval-gpu`.
+/// The SPIR-V rust-gpu compiled from `shaders/eval-gpu`'s `predict`.
 ///
-/// Rebuilt by `shaders/build.sh`; checked in with the stamp of its sources (`spirv.sources`)
-/// the gate checks.
-const SPIRV: &[u8] = include_bytes!("eval_gpu.spv");
+/// One module per entry point, rebuilt by `shaders/build.sh` and checked in with the stamp of
+/// their sources (`spirv.sources`) the gate checks.
+const PREDICT: &[u8] = include_bytes!("eval_gpu_predict.spv");
+
+/// The SPIR-V of `shaders/eval-gpu`'s `apply` (see [`PREDICT`]).
+const APPLY: &[u8] = include_bytes!("eval_gpu_apply.spv");
+
+/// The SPIR-V of `shaders/eval-gpu`'s `normals` (see [`PREDICT`]).
+const NORMALS: &[u8] = include_bytes!("eval_gpu_normals.spv");
 
 // SPIR-V is a stream of 32-bit words; `make_spirv_raw` would panic on a partial one.
-const _: () = assert!(SPIRV.len().is_multiple_of(4), "eval_gpu.spv is whole words");
+const _: () = assert!(
+    PREDICT.len().is_multiple_of(4)
+        && APPLY.len().is_multiple_of(4)
+        && NORMALS.len().is_multiple_of(4),
+    "the eval modules are whole words"
+);
 
 /// Quads per side of every tile the shaders evaluate: the finest level's tiles.
 pub const QUADS: u32 = 64;
@@ -340,11 +351,11 @@ impl GpuEval {
     ///
     /// As [`Gpu::compute_pipeline`].
     pub fn new(gpu: &Gpu) -> Result<Self, GpuError> {
-        let source = || ShaderSource::SpirV(wgpu::util::make_spirv_raw(SPIRV));
+        let source = |spirv| ShaderSource::SpirV(wgpu::util::make_spirv_raw(spirv));
         Ok(Self {
-            predict: gpu.compute_pipeline("eval predict", source(), "predict")?,
-            apply: gpu.compute_pipeline("eval apply", source(), "apply")?,
-            normals: gpu.compute_pipeline("eval normals", source(), "normals")?,
+            predict: gpu.compute_pipeline("eval predict", source(PREDICT), "predict")?,
+            apply: gpu.compute_pipeline("eval apply", source(APPLY), "apply")?,
+            normals: gpu.compute_pipeline("eval normals", source(NORMALS), "normals")?,
         })
     }
 
@@ -697,6 +708,12 @@ pub struct Consistency {
     pub normal_mismatches: usize,
     /// The most tiles that computed one vertex.
     pub most_copies: usize,
+    /// Of the position mismatches, pairs of copies on different faces (whose tiles compute the
+    /// vertex in different orientations).
+    pub across_faces: usize,
+    /// The largest distance between two copies' positions, in units in the last place of a
+    /// component.
+    pub max_ulps: u64,
 }
 
 impl fmt::Display for Consistency {
@@ -704,11 +721,13 @@ impl fmt::Display for Consistency {
         write!(
             f,
             "{} shared vertices, {} pairs of copies (up to {} copies of one vertex): {} \
-             position and {} normal mismatches",
+             position ({} across faces, up to {} ulps) and {} normal mismatches",
             self.shared,
             self.pairs,
             self.most_copies,
             self.position_mismatches,
+            self.across_faces,
+            self.max_ulps,
             self.normal_mismatches
         )
     }
@@ -730,24 +749,37 @@ pub fn seam_consistency(mesh: &BaseMesh, tiles: &[TileKey], evaluated: &Evaluate
             let copies =
                 mesh.topology()
                     .copies(tile.face(), tile.level(), region.x0() + i, region.y0() + j);
-            let held: Vec<usize> = copies
+            let held: Vec<(usize, geom::FaceId)> = copies
                 .iter()
                 .filter_map(|copy| {
                     let other = *slots.get(&copy.key(tile.level()))?;
-                    Some(at(other, copy.i, copy.j))
+                    Some((at(other, copy.i, copy.j), copy.face))
                 })
                 .collect();
             // Each shared vertex is counted once: from the tile that holds its first copy.
-            if held.len() < 2 || held.first() != Some(&at(slot, i, j)) {
+            let Some(&(first, first_face)) = held.first() else {
+                continue;
+            };
+            if held.len() < 2 || first != at(slot, i, j) {
                 continue;
             }
             result.shared += 1;
             result.most_copies = result.most_copies.max(held.len());
-            let first = held.first().copied().unwrap_or_default();
-            for &other in held.iter().skip(1) {
+            for &(other, face) in held.iter().skip(1) {
                 result.pairs += 1;
                 let same = |values: &[[f32; 3]]| bits(values, first) == bits(values, other);
-                result.position_mismatches += usize::from(!same(&evaluated.positions));
+                if !same(&evaluated.positions) {
+                    result.position_mismatches += 1;
+                    result.across_faces += usize::from(face != first_face);
+                    if let (Some(a), Some(b)) = (
+                        evaluated.positions.get(first),
+                        evaluated.positions.get(other),
+                    ) {
+                        for (&x, &y) in a.iter().zip(b) {
+                            result.max_ulps = result.max_ulps.max(ordered(x).abs_diff(ordered(y)));
+                        }
+                    }
+                }
                 result.normal_mismatches += usize::from(!same(&evaluated.normals));
             }
         }

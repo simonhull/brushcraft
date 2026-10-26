@@ -33,11 +33,11 @@ pub(crate) fn extraordinary(rings: &[[f32; 3]], ring: Ring) -> Vec3 {
     let n = ring.valence as f32;
     let mut edges = Vec3::ZERO;
     let mut diagonals = Vec3::ZERO;
-    let mut k = 0;
-    while k < ring.valence {
+    // A range loop, not `while`: naga's Metal output of rust-gpu's `while` loop here kept the
+    // sums from before the last iteration (the base vertex came out wrong on the M4 only).
+    for k in 0..ring.valence {
         edges = edges + ring.edge(rings, k);
         diagonals = diagonals + ring.diagonal(rings, k);
-        k += 1;
     }
     load(rings, ring.offset) * ((4.0 * n - 7.0) / (4.0 * n))
         + edges * (3.0 / (2.0 * n * n))

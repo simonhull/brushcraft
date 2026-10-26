@@ -44,12 +44,12 @@ const WGSL: &str = include_str!("draw.wgsl");
 ///
 /// Rebuilt by `shaders/build.sh`; checked in so the gate needs no rust-gpu toolchain,
 /// with a stamp of its sources (`spirv.sources`) the gate checks.
-const SPIRV: &[u8] = include_bytes!("brush_gpu.spv");
+const SPIRV: &[u8] = include_bytes!("brush_gpu_main.spv");
 
 // SPIR-V is a stream of 32-bit words; `make_spirv_raw` would panic on a partial one.
 const _: () = assert!(
     SPIRV.len().is_multiple_of(4),
-    "brush_gpu.spv is whole words"
+    "brush_gpu_main.spv is whole words"
 );
 
 /// Invocations per workgroup in both shaders.
