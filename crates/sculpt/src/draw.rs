@@ -25,7 +25,8 @@
 //!    tiles that moved are recomputed in full. Each tile's bounds are computed on the worker that
 //!    computed its normals, right after.
 //! 7. **Refit**: the index's tree is refitted to those bounds (any tile without, read back from the
-//!    store's cache) and they are recorded in the store.
+//!    store's cache) and they are recorded in the store; the step closes its epoch of the store's
+//!    stale-tile feed ([`TileStore::close_epoch`]).
 //!
 //! Corrections live in each vertex's tangent frame `(t, b, n)` of the predicted surface, so a
 //! push along the frame normal `n` is a change of the correction's `z` alone, with no frames to
@@ -315,6 +316,8 @@ pub fn draw_step(
     // The tiles were made current together just above, their bounds computed with their
     // normals: the refit takes those, and reads any other tile from the cache.
     index.refit_with(store, &changed, &wave)?;
+    // The step's edits and their re-evaluation are one epoch of the stale-tile feed.
+    store.close_epoch()?;
     times.refit = laps.lap();
     drop(pins);
 

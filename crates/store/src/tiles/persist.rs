@@ -158,6 +158,9 @@ impl TileStore {
             display_finest: config.display,
             jobs: std::collections::VecDeque::new(),
             bumped: std::collections::BTreeMap::new(),
+            stale: crate::stale::StaleFeed::new(config.stale_cap),
+            epoch_writes: BTreeSet::new(),
+            epoch_keys: BTreeSet::new(),
             feed,
             save_consumer,
             streams: HashMap::new(),
@@ -377,6 +380,10 @@ impl TileStore {
         }
         // What was evaluated from a lost edit isn't the saved state the store reads from now on.
         self.invalidate_edited(lost.iter().copied());
+        for key in &lost {
+            self.note_epoch_write(*key);
+        }
+        self.close_epoch()?;
         self.forget_evicted_ops();
         #[cfg(test)]
         self.assert_known_ops_resident();
@@ -604,6 +611,10 @@ impl TileStore {
         }
         // What was evaluated from a lost edit isn't what the store reads from now on.
         self.invalidate_edited(lost.iter().copied());
+        for key in &lost {
+            self.note_epoch_write(*key);
+        }
+        self.close_epoch()?;
         for (key, id) in cleaned {
             self.corrections.set_dirty(id, false)?;
             if let Some(write) = self.unsaved.remove(&key) {

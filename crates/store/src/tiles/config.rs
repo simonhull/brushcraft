@@ -79,6 +79,10 @@ pub struct StoreConfig {
     /// [`TileStore::run_jobs`](super::TileStore::run_jobs) after writes; `None` (the default)
     /// keeps none. A store opened over files without a display layer queues its rebuild.
     pub display: Option<geom::Level>,
+    /// The most keys a consumer of the stale-tile feed may have pending before it loses them and
+    /// is told to resync (see [`TileStore::drain_stale`](super::TileStore::drain_stale)):
+    /// [`crate::DEFAULT_STALE_CAP`] unless set.
+    pub stale_cap: usize,
 }
 
 impl StoreConfig {
@@ -111,7 +115,15 @@ impl StoreConfig {
             kept_predictions: Self::DEFAULT_KEPT_PREDICTIONS,
             stroke_tiles: Self::DEFAULT_STROKE_TILES,
             display: None,
+            stale_cap: crate::stale::DEFAULT_STALE_CAP,
         }
+    }
+
+    /// This configuration letting a stale-feed consumer fall `stale_cap` keys behind (see
+    /// [`StoreConfig::stale_cap`]).
+    #[must_use]
+    pub const fn with_stale_cap(self, stale_cap: usize) -> Self {
+        Self { stale_cap, ..self }
     }
 
     /// This configuration keeping a display layer under `finest` (see

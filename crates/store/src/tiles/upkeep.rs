@@ -299,6 +299,8 @@ impl TileStore {
         match self.try_build_display(key, finest) {
             Ok(Attempt::Built(tile)) => {
                 self.record_display(std::slice::from_ref(&*tile))?;
+                // A slice is an operation: its display tile is an epoch of its own.
+                self.close_epoch()?;
                 report.built += 1;
             }
             Ok(Attempt::Evaluate(keys, what)) => {

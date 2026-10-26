@@ -148,7 +148,11 @@ impl TileStore {
             }
         }
         self.invalidate_edited(lost.iter().copied());
-        Ok(())
+        // Their positions go back to their records: an epoch for whoever shows them.
+        for key in lost {
+            self.note_epoch_write(*key);
+        }
+        self.close_epoch()
     }
 
     /// Forgets a lost tile's latest write and drops its correction slot, if it has one: its

@@ -32,6 +32,7 @@ mod record;
 mod recovery;
 mod shared_map;
 mod slot;
+mod stale;
 mod stamp;
 #[cfg(test)]
 mod test_dir;
@@ -57,6 +58,7 @@ pub use project::{
     ROLL_OVER_RETRY, RecoveryCandidate, SaveOutcome, default_recovery_dir, find_recoveries,
 };
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
+pub use stale::{DEFAULT_STALE_CAP, Drained, Epoch, StaleCursor};
 pub use tiles::{
     CacheError, Evaluation, Invariant, PinGuard, StoreConfig, StoreId, TileEdit, TileStore,
 };

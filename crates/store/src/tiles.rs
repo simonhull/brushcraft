@@ -137,6 +137,7 @@ mod bounds;
 mod config;
 mod display;
 mod edit;
+mod epochs;
 mod error;
 mod evaluate;
 #[cfg(test)]
@@ -351,6 +352,13 @@ pub struct TileStore {
     /// [`TileStore::bump_display_error`]): drawn in their place until a refresh records them.
     /// Memory only: never written.
     bumped: std::collections::BTreeMap<TileKey, (crate::display::DisplayRecord, f32)>,
+    /// The stale-tile feed (see [`crate::stale`]).
+    stale: crate::stale::StaleFeed,
+    /// The correction writes since the open epoch began, noted while a consumer listens.
+    epoch_writes: BTreeSet<TileKey>,
+    /// The other tiles the open epoch changed (display tiles recorded), noted while a consumer
+    /// listens.
+    epoch_keys: BTreeSet<TileKey>,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,
     /// The change feed: every key an edit changed, with its op.

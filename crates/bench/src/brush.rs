@@ -40,7 +40,7 @@ use geom::{TileKey, Vec3};
 use sculpt::Stroke;
 use store::{Evaluation, Project, SpatialIndex};
 
-use crate::cli::Options;
+use crate::cli::{DisplayLayer, Options};
 use crate::noise::Rng;
 use crate::paths::Paths;
 use crate::report::{Output, Record, mib, ms};
@@ -171,6 +171,11 @@ pub(crate) fn run<J: Write, H: Write>(
     out: &mut Output<J, H>,
 ) -> Result<()> {
     let (mut project, mut index, plan) = prepare(options, paths, "brush", out)?;
+    // With the display layer kept, a renderer listens to the stale-tile feed: each step then
+    // closes an epoch naming what it changed (never drained here: past the cap, it resyncs).
+    if options.display == DisplayLayer::Kept {
+        project.store().subscribe_stale();
+    }
     let mut state = Stroke::new(project.store());
     out.say(&format!(
         "brush: {} draw steps, radius {:.5}",

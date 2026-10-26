@@ -34,6 +34,7 @@ impl TileStore {
         for tile in tiles {
             self.bumped.remove(tile.key());
         }
+        self.note_epoch_keys(tiles.iter().map(|tile| *tile.key()));
         let records: Vec<(TileKey, DisplayRecord)> = tiles
             .iter()
             .map(|tile| (*tile.key(), DisplayRecord::of(tile)))

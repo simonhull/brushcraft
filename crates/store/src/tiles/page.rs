@@ -779,6 +779,7 @@ impl TileStore {
         self.feed.push(key, op);
         self.bounds.note_write(key);
         self.display.note_write(key);
+        self.note_epoch_write(key);
         self.corrections.set_dirty(id, true)?;
         Ok(())
     }

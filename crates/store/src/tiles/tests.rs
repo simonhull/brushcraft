@@ -39,6 +39,7 @@ mod budget;
 mod differential;
 mod display;
 mod edit;
+mod epochs;
 mod evaluate;
 mod feed;
 mod invalidate;
