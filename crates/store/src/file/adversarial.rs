@@ -7,6 +7,7 @@ use std::os::unix::fs::MetadataExt;
 
 use geom::{FaceId, Level, MeshError, Vec3};
 
+use super::lock::lock_at;
 use super::*;
 use crate::fixture::{mesh, meta};
 use crate::test_dir::TestDir;
