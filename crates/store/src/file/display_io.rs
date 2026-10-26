@@ -157,3 +157,15 @@ impl BaseFile {
         self.keys().filter(|key| is_display(key))
     }
 }
+
+/// The length of an unknown display record, framing included.
+///
+/// The same for every key (a key, an op, a two-byte header and an empty body), so a store can
+/// tell unknown records from the file's map alone. `None` if the empty body won't compress
+/// (never).
+pub(crate) fn unknown_display_len() -> Option<u64> {
+    let key = TileKey::display(geom::FaceId::new(0), geom::Level::ZERO, 0, 0).ok()?;
+    let packed = compress(&[]).ok()?;
+    let payload = tile_payload(key, DISPLAY_OP, &display_header(None), 0, &packed).ok()?;
+    u64::try_from(frame(KIND_TILE, &payload)?.len()).ok()
+}

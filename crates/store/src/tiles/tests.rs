@@ -47,6 +47,7 @@ mod prefetch;
 mod recovery;
 mod rounds_kept;
 mod stale;
+mod upkeep;
 mod workload;
 
 /// Chunks in [`pinning`]'s budget.

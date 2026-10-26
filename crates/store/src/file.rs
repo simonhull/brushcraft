@@ -54,6 +54,7 @@ mod reader;
 pub(crate) use base::BaseFile;
 pub(crate) use compact::sync_parent;
 pub use compact::{compact, compact_in_place};
+pub(crate) use display_io::unknown_display_len;
 pub use error::FileError;
 #[cfg(any(feature = "fuzzing", test))]
 pub(crate) use format::HEADER_LEN;
@@ -88,9 +89,14 @@ pub(crate) struct Loc {
     len: u64,
 }
 
-#[cfg(test)]
 impl Loc {
+    /// The record's length in bytes, framing included.
+    pub(crate) const fn len(self) -> u64 {
+        self.len
+    }
+
     /// The byte halfway through the record: for tests that damage one.
+    #[cfg(test)]
     pub(crate) const fn middle(self) -> u64 {
         self.offset + self.len / 2
     }

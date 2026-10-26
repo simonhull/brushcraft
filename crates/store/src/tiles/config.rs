@@ -74,6 +74,11 @@ pub struct StoreConfig {
     /// writes every tile dab by dab. [`TileStore::open`](super::TileStore::open) refuses a count
     /// whose share leaves the pools less than their minimum beside the kept predictions.
     pub stroke_tiles: usize,
+    /// The finest level the store keeps a display layer under (`geom::DisplayTile`s, stored as
+    /// derived records): display tiles of every level below it, brought up to date by
+    /// [`TileStore::run_jobs`](super::TileStore::run_jobs) after writes; `None` (the default)
+    /// keeps none. A store opened over files without a display layer queues its rebuild.
+    pub display: Option<geom::Level>,
 }
 
 impl StoreConfig {
@@ -105,6 +110,17 @@ impl StoreConfig {
             workers: Workers::PhysicalCores,
             kept_predictions: Self::DEFAULT_KEPT_PREDICTIONS,
             stroke_tiles: Self::DEFAULT_STROKE_TILES,
+            display: None,
+        }
+    }
+
+    /// This configuration keeping a display layer under `finest` (see
+    /// [`StoreConfig::display`]).
+    #[must_use]
+    pub const fn with_display(self, finest: geom::Level) -> Self {
+        Self {
+            display: Some(finest),
+            ..self
         }
     }
 

@@ -31,6 +31,9 @@ impl TileStore {
     /// [`CacheError::Eval`] if listing a written tile's readers fails (never, for tiles of the
     /// store's mesh). Nothing is recorded then.
     pub fn record_display(&mut self, tiles: &[DisplayTile]) -> Result<(), CacheError> {
+        for tile in tiles {
+            self.bumped.remove(tile.key());
+        }
         let records: Vec<(TileKey, DisplayRecord)> = tiles
             .iter()
             .map(|tile| (*tile.key(), DisplayRecord::of(tile)))
@@ -58,6 +61,68 @@ impl TileStore {
         self.display.settle(&self.mesh, &self.deps)?;
         keys.iter()
             .map(|key| {
+                let record = self.display_record(key)?;
+                Ok(record.and_then(|r| DisplayTile::decode(*key, r.error, &r.encoded).ok()))
+            })
+            .collect()
+    }
+
+    /// Raises the bound of every display tile a dab's writes of the `edited` tiles can change by
+    /// twice `max_displacement`, the farthest the dab moved a finest vertex: in memory only,
+    /// never written, so the display tiles as they were before the stroke stay drawable, their
+    /// bound still a bound, until a refresh replaces them (see [`TileStore::display_for_draw`]).
+    ///
+    /// Twice: the finest vertex and the display vertex compared with it can each move that far
+    /// (the renderer's stand-ins move display vertices too). Call it after each dab's writes,
+    /// before anything reads the store's display tiles: the first dab of a stroke keeps each
+    /// tile as it was before the stroke.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] if listing the writes' readers fails (never, for tiles of the
+    /// store's mesh); [`CacheError::Store`] if a display record can't be read.
+    pub fn bump_display_error(
+        &mut self,
+        edited: &[TileKey],
+        max_displacement: f32,
+    ) -> Result<(), CacheError> {
+        if self.display_finest.is_none() || self.display.levels().is_empty() || edited.is_empty() {
+            return Ok(());
+        }
+        let edited: BTreeSet<TileKey> = edited.iter().copied().collect();
+        let readers =
+            crate::display::readers(&self.mesh, &self.deps, &edited, self.display.levels())?;
+        let raise = 2.0 * max_displacement.abs();
+        for key in readers {
+            if let Some((_, extra)) = self.bumped.get_mut(&key) {
+                *extra += raise;
+            } else if let Some(record) = self.display_record(&key)? {
+                self.bumped.insert(key, (record, raise));
+            }
+        }
+        Ok(())
+    }
+
+    /// The display tiles to draw for each of `keys`, in order: the stored tile, or one a stroke
+    /// is changing as it was before the stroke with its bound raised (see
+    /// [`TileStore::bump_display_error`]); `None` where neither is known, and the tile must be
+    /// drawn finer.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::stored_display`].
+    pub fn display_for_draw(
+        &mut self,
+        keys: &[TileKey],
+    ) -> Result<Vec<Option<DisplayTile>>, CacheError> {
+        self.display.settle(&self.mesh, &self.deps)?;
+        keys.iter()
+            .map(|key| {
+                if let Some((record, extra)) = self.bumped.get(key) {
+                    // Rounded up, so it stays a bound.
+                    let bound = (record.error + extra).next_up();
+                    return Ok(DisplayTile::decode(*key, bound, &record.encoded).ok());
+                }
                 let record = self.display_record(key)?;
                 Ok(record.and_then(|r| DisplayTile::decode(*key, r.error, &r.encoded).ok()))
             })

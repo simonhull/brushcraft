@@ -557,6 +557,21 @@ impl<D: Derived> Book<D> {
         self.changes
     }
 
+    /// The levels whose values the files, or this session, hold.
+    pub(crate) const fn levels(&self) -> &BTreeSet<Level> {
+        &self.levels
+    }
+
+    /// Every tile whose value is unknown since the last rebase, in key order: what a refresh
+    /// brings up to date.
+    pub(crate) fn unknown_keys(&self) -> Vec<TileKey> {
+        self.changed
+            .iter()
+            .filter(|(_, kept)| matches!(kept, Kept::Unknown))
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
     /// Whether writes are noted and not yet settled.
     #[cfg(test)]
     pub(crate) fn has_unsettled(&self) -> bool {

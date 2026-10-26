@@ -134,7 +134,7 @@ impl TileStore {
             .map_err(|e| CacheError::Workers(StartWorkersError::new(e)))?;
         let mut feed = ChangeFeed::new();
         let save_consumer = feed.subscribe();
-        Ok(Self {
+        let mut store = Self {
             prefetch: Prefetcher::new(),
             mesh,
             mesh_hash,
@@ -155,6 +155,9 @@ impl TileStore {
             working_failed: false,
             bounds,
             display,
+            display_finest: config.display,
+            jobs: std::collections::VecDeque::new(),
+            bumped: std::collections::BTreeMap::new(),
             feed,
             save_consumer,
             streams: HashMap::new(),
@@ -175,7 +178,9 @@ impl TileStore {
             activity: Activity::default(),
             #[cfg(test)]
             hooks: TestHooks::default(),
-        })
+        };
+        store.queue_missing_display();
+        Ok(store)
     }
 
     /// Copies every tile edited since the last rebase (or since the store opened) into

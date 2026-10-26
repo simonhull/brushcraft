@@ -148,6 +148,7 @@ mod pins;
 mod read;
 mod round;
 mod stream;
+mod upkeep;
 
 pub use config::{Evaluation, StoreConfig};
 pub use edit::TileEdit;
@@ -342,6 +343,16 @@ pub struct TileStore {
     /// The display tiles the store keeps in its files, under the bounds' rule (see
     /// [`crate::display`]).
     display: Book<Display>,
+    /// The finest level the display layer is kept under ([`StoreConfig::display`]); `None` for
+    /// a store that keeps none.
+    display_finest: Option<geom::Level>,
+    /// The display tiles a brush stroke's dabs changed, as they were before the first of them,
+    /// with what the dabs since have added to their bound (see
+    /// [`TileStore::bump_display_error`]): drawn in their place until a refresh records them.
+    /// Memory only: never written.
+    bumped: std::collections::BTreeMap<TileKey, (crate::display::DisplayRecord, f32)>,
+    /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
+    jobs: std::collections::VecDeque<crate::jobs::Job>,
     /// The change feed: every key an edit changed, with its op.
     feed: ChangeFeed,
     /// Save's place in the feed.

@@ -21,6 +21,7 @@ mod fixture;
 pub mod fuzzing;
 mod hash;
 mod index;
+mod jobs;
 mod kept;
 mod meta;
 mod op;
@@ -48,6 +49,7 @@ pub use index::{
     Aabb, Bvh, Hit, IndexError, LoadStats, MAX_TILES, NormalCone, Ray, SpatialIndex, SphereQuery,
     TileBounds, WaveBounds,
 };
+pub use jobs::{JobsReport, Progress};
 pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
 pub use project::{

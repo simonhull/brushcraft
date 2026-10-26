@@ -35,6 +35,10 @@ pub enum CacheError {
     /// Evaluation failed (not for a valid mesh).
     #[error("evaluation failed")]
     Eval(#[from] EvalError),
+    /// A display tile of the store's display layer wouldn't build or decode from what the store
+    /// holds.
+    #[error("display tile could not be built")]
+    Display(#[from] geom::DisplayError),
     /// A correction was rejected: not finite, at level 0, on an unknown face, or outside the face
     /// or tile. Nothing was written.
     #[error("correction rejected")]
