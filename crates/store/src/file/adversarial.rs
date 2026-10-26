@@ -1059,7 +1059,7 @@ fn displacement_tiles_must_fit_their_keys() {
     let mut f = ProjectFile::create(&path, meta(), mesh()).unwrap();
     let other = TileKey::new(
         LayerId::new(0),
-        Channel::from_raw(1),
+        Channel::DISPLAY,
         FaceId::new(1),
         Level::new(9).unwrap(),
         0,
@@ -1069,9 +1069,9 @@ fn displacement_tiles_must_fit_their_keys() {
     assert!(
         matches!(
             f.write_displacement(other, op(1), &tile(1.0)),
-            Err(FileError::NotDisplacement(1))
+            Err(FileError::NotDisplacement(c)) if c == Channel::DISPLAY.raw()
         ),
-        "write under another channel"
+        "write under another channel: the display layer's"
     );
     let small = CorrectionTile::zero(2).unwrap();
     assert!(
@@ -1096,9 +1096,9 @@ fn displacement_tiles_must_fit_their_keys() {
     assert!(
         matches!(
             f.read_displacement(&other),
-            Err(FileError::NotDisplacement(1))
+            Err(FileError::NotDisplacement(c)) if c == Channel::DISPLAY.raw()
         ),
-        "read under another channel"
+        "read under another channel: the display layer's"
     );
     assert_eq!(
         f.read_tile(&other).unwrap().unwrap().body,
