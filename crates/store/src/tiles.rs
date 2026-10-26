@@ -2858,6 +2858,7 @@ impl TileStore {
     /// # Errors
     ///
     /// As [`TileStore::evaluate_many`]. The bounds computed before an error are lost.
+    #[must_use = "the bounds are what this adds to evaluate_many: pass them to refit_with"]
     pub fn evaluate_many_with_bounds(
         &mut self,
         keys: &[TileKey],

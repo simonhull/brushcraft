@@ -237,15 +237,9 @@ pub struct WaveBounds {
 
 impl WaveBounds {
     /// How many tiles have bounds.
-    #[must_use]
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.bounds.len()
-    }
-
-    /// Whether no tile has bounds.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.bounds.is_empty()
     }
 
     /// `key`'s bounds, if they were computed and are still the tile's in `store`: the store
