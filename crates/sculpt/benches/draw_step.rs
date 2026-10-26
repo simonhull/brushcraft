@@ -242,7 +242,7 @@ fn draw_step_50k(bencher: divan::Bencher<'_, '_>) {
             .copied()
             .expect("a path of PATH_STEPS centres");
         let params = DrawParams::new(center, radius, STRENGTH).expect("params");
-        let stats = draw_step(&mut fresh.project, &mut fresh.index, &mut stroke, params)
+        let stats = draw_step(fresh.project.store(), &mut fresh.index, &mut stroke, params)
             .expect("draw step");
         all.push(stats);
     });

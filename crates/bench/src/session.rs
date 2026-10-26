@@ -156,7 +156,8 @@ pub(crate) fn stroke(
         let faults_before = faults()?;
         let activity_before = project.store().activity();
         let start = Instant::now();
-        let stats = draw_step(project, index, stroke_state, params).context("a draw step")?;
+        let stats =
+            draw_step(project.store(), index, stroke_state, params).context("a draw step")?;
         let wall = start.elapsed();
         let activity = project.store().activity().since(&activity_before);
         let minor_faults = faults()?

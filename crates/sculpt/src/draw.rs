@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use brush::Smoothstep;
 use geom::{TileKey, Vec3};
-use store::{CacheError, IndexError, Project, SpatialIndex, TileStore};
+use store::{CacheError, IndexError, SpatialIndex, TileStore};
 pub use stroke::Stroke;
 use stroke::TileStroke;
 use thiserror::Error;
@@ -257,8 +257,10 @@ impl Laps {
 /// Every vertex of the index's level within the radius moves by `strength · smoothstep(d /
 /// radius)`, and `index` is brought up to date (see the module notes for the phases).
 ///
-/// The step edits as part of the store's current op: call it between
-/// [`Project::begin_stroke`] and [`Project::end_stroke`], so the stroke's steps are one op. The
+/// `store` is the project's ([`Project::store`](store::Project::store)). The step edits as part
+/// of the store's current op: call it between
+/// [`Project::begin_stroke`](store::Project::begin_stroke)
+/// and [`Project::end_stroke`](store::Project::end_stroke), so the stroke's steps are one op. The
 /// vertices edited are those of the level `index` holds, the finest the store evaluates.
 ///
 /// `stroke` keeps each edited vertex's start and summed deltas across the stroke's steps, and
@@ -278,12 +280,11 @@ impl Laps {
 /// after the failing one get no sums for their border vertices, nor tiles after its run for
 /// any vertex. Don't retry a failed step: its deltas already summed would be counted twice.
 pub fn draw_step(
-    project: &mut Project,
+    store: &mut TileStore,
     index: &mut SpatialIndex,
     stroke: &mut Stroke,
     params: DrawParams,
 ) -> Result<StepStats, SculptError> {
-    let store = project.store();
     let mut laps = Laps::start();
     let mut times = PhaseTimes::default();
 
