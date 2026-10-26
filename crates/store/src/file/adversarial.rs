@@ -3,6 +3,7 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
+use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 
 use geom::{FaceId, Level, MeshError, Vec3};

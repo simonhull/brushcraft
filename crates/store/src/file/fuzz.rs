@@ -12,7 +12,7 @@ use geom::{FaceId, LayerId, Level, Vec3};
 
 use super::format::{ENTRY_LEN, MAX_TILE_RECORD, NONE, parse_index_payload, parse_tile_payload};
 use super::*;
-use crate::bounds::{KNOWN_RECORD_LEN, UNKNOWN_RECORD_LEN};
+use crate::bounds::{KNOWN_RECORD_LEN, UNKNOWN_RECORD_LEN, parse_bounds_payload};
 use crate::codec::decode_displacement_into;
 use crate::meta::{MAX_BASE_PATH, ProjectId, Role};
 use crate::op::{MAX_SEQ, RESERVED_SITE};
