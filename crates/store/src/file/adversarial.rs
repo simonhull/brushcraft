@@ -7,6 +7,7 @@ use std::os::unix::fs::MetadataExt;
 
 use geom::{FaceId, Level, MeshError, Vec3};
 
+use super::compact::compact_into;
 use super::format::{
     ENTRY_LEN, INDEX_FIXED, MAX_CHAIN, MAX_TILE_RECORD, parse_tile_payload, plausible_index,
 };

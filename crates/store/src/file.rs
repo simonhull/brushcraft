@@ -9,11 +9,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{FileExt, OpenOptionsExt as _, PermissionsExt as _};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{FileExt, OpenOptionsExt as _};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use geom::{BaseMesh, Channel, CorrectionTile, TileKey};
 
@@ -41,12 +40,15 @@ use crate::slot::CorrectionSlot;
 use crate::stamp::Stamp;
 
 mod base;
+mod compact;
 mod error;
 mod format;
 mod lock;
 mod reader;
 
 pub(crate) use base::BaseFile;
+pub(crate) use compact::sync_parent;
+pub use compact::{compact, compact_in_place};
 pub use error::StoreError;
 #[cfg(any(feature = "fuzzing", test))]
 pub(crate) use format::HEADER_LEN;
@@ -1701,133 +1703,6 @@ impl ProjectFile {
     fn append_raw(&mut self, kind: u8, payload: &[u8]) -> Result<(), StoreError> {
         self.append(kind, payload).map(drop)
     }
-}
-
-/// Writes a new project at `dst` holding `src`'s meta and mesh, its live tiles and bounds (raw
-/// records copied, not recompressed) and one full Index.
-///
-/// `src` is recovered as by [`ProjectFile::open`], but never modified: whatever follows its last
-/// save point is left in place (and not copied). It is held with a shared lock, so it can't be open
-/// for writing. History before the latest state is dropped; which history to keep is decided with
-/// stroke history (M2). On error, `dst` may be left partly written.
-///
-/// # Errors
-///
-/// Any [`StoreError`] from reading `src` (a damaged live tile is [`StoreError::Damaged`]; one
-/// open for writing, [`StoreError::Locked`]) or writing `dst`, which must not exist.
-pub fn compact(src: &Path, dst: &Path) -> Result<(), StoreError> {
-    compact_into(&ProjectFile::inspect(src)?, dst)
-}
-
-/// Compacts the project at `path` in place, as [`compact`] does.
-///
-/// It compacts into a temporary file `<name>.compact-*.tmp` in the same directory, created with
-/// no more permissions than the project's (so a private project is never exposed through it),
-/// gives it the project's permissions, then renames it over `path` (resolved first, so a symlink
-/// keeps pointing at the project rather than being replaced). Replacing the project is a write, so
-/// the source is locked exclusively until after the rename: no writer or other compaction runs
-/// meanwhile, and one that opened the old file locks it only to find the path replaced (see
-/// [`ProjectFile::open`]). The directory is synced after the rename, so the swap is durable.
-///
-/// On error, `path` is unchanged (unless the rename succeeded and only the directory sync
-/// failed) and the temporary file is removed. A crash before the rename can leave the temporary
-/// file behind; it is never read, and can be deleted.
-///
-/// # Errors
-///
-/// As [`compact`], with [`StoreError::Locked`] if the project is open at all.
-pub fn compact_in_place(path: &Path) -> Result<(), StoreError> {
-    let path = path.canonicalize()?;
-    let from = ProjectFile::open_latest(
-        open_locked(&path, open_readable, Lock::Exclusive)?,
-        Repair::Ignore,
-        None,
-    )?;
-    let permissions = from.file.metadata()?.permissions();
-    let tmp = temp_sibling(&path)?;
-    let swapped = compact_into(&from, &tmp).and_then(|()| {
-        // The umask may have masked bits of the project's mode at creation: give them back.
-        std::fs::set_permissions(&tmp, permissions)?;
-        std::fs::rename(&tmp, &path)?;
-        sync_parent(&path)
-    });
-    if swapped.is_err() {
-        // Best effort: gone already if the rename succeeded.
-        drop(std::fs::remove_file(&tmp));
-    }
-    swapped
-}
-
-/// Writes `from`'s live tiles and bounds and one full Index to a new project at `dst`, created
-/// with `from`'s permission bits (less the umask's), so it is never more open than `from`.
-///
-/// A bounds record that doesn't read is written as unknown, as [`ProjectFile::copy_base`] does.
-///
-/// # Errors
-///
-/// As [`compact`].
-fn compact_into(from: &ProjectFile, dst: &Path) -> Result<(), StoreError> {
-    let mode = from.file.metadata()?.permissions().mode() & 0o777;
-    let mut to = ProjectFile::create_like_mode(dst, from.meta.clone(), from, mode)?;
-    for (name, &Loc { offset, len }) in &from.live {
-        match name {
-            Name::Tile(key) => {
-                let raw = from.read_record(offset, len)?;
-                if tile_record(&raw, key).is_none() {
-                    return Err(StoreError::Damaged { offset });
-                }
-                let loc = to.append_record(&raw)?;
-                to.note(*name, None, Stamp::ZERO, loc);
-            }
-            Name::Bounds(key) => match from.read_bounds_record(key)? {
-                Some(raw) => {
-                    let loc = to.append_record(&raw)?;
-                    to.note(*name, None, Stamp::ZERO, loc);
-                }
-                None => to.write_bounds(*key, None, Stamp::ZERO)?,
-            },
-        }
-    }
-    to.head = from.head;
-    to.save()?;
-    Ok(())
-}
-
-/// A path for a temporary file next to `path`, unique within this process and among processes.
-///
-/// # Errors
-///
-/// [`StoreError::Io`] if `path` has no file name.
-fn temp_sibling(path: &Path) -> Result<PathBuf, StoreError> {
-    /// Distinguishes this process's temporary files.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the project path has no file name",
-        )
-    })?;
-    let mut tmp = name.to_os_string();
-    tmp.push(format!(
-        ".compact-{}-{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    Ok(path.with_file_name(tmp))
-}
-
-/// Syncs the directory holding `path`, making a new or renamed entry in it durable.
-///
-/// # Errors
-///
-/// [`StoreError::Io`].
-pub(crate) fn sync_parent(path: &Path) -> Result<(), StoreError> {
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    File::open(dir)?.sync_all()?;
-    Ok(())
 }
 
 /// Checks that `key` is a displacement key whose tiles have `side` vertices per side.
