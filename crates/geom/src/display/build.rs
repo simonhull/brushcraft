@@ -471,6 +471,14 @@ impl FacePositions {
         self.tile(key).map(|t| t.error)
     }
 
+    /// Display tile `key`'s positions as its codec stored them, or `None` if the face holds no
+    /// such tile: for the encoding study, which measures them apart from the normals.
+    #[cfg(any(test, feature = "display-study"))]
+    #[must_use]
+    pub fn encoded(&self, key: &TileKey) -> Option<&[u8]> {
+        self.tile(key).map(|t| t.bytes.as_slice())
+    }
+
     /// Display tile `key` of this face.
     fn tile(&self, key: &TileKey) -> Option<&PositionTile> {
         if key.face() != self.face {
