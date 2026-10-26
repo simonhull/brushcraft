@@ -120,6 +120,59 @@ pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     crc.finish()
 }
 
+/// Proofs, for every input, run by `cargo kani -p store`: every table entry, and the tail step.
+///
+/// The eight-byte step itself (the xor of eight table entries against 64 bit steps) is left to
+/// the tests: CBMC did not finish it, for one chunk from any register, in 30 minutes.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// The byte-at-a-time CRC step: register `crc` after feeding `bytes`, one bit at a time,
+    /// the definition [`Crc32::update`] must match.
+    fn bytewise(mut crc: u32, bytes: &[u8]) -> u32 {
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    0xEDB8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc
+    }
+
+    /// Every entry of every table is what its definition says: the register after feeding its
+    /// byte and then as many zero bytes as its table's number, into a zero register.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn every_table_entry_is_its_definition() {
+        let byte: u8 = kani::any();
+        let zeros: usize = kani::any();
+        kani::assume(zeros < 8);
+        let mut fed = [0_u8; 8];
+        fed[0] = byte;
+        let Some(fed) = fed.get(..=zeros) else {
+            return;
+        };
+        assert_eq!(entry(zeros, byte), bytewise(0, fed), "the defined register");
+    }
+
+    /// From every register, a tail byte through the byte table gives the register the bitwise
+    /// loop gives.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn a_tail_byte_matches_bytewise() {
+        let start: u32 = kani::any();
+        let byte: u8 = kani::any();
+        let mut crc = Crc32(start);
+        crc.update(&[byte]);
+        assert_eq!(crc.0, bytewise(start, &[byte]), "the same register");
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {

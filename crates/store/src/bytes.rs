@@ -86,6 +86,36 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Proofs, for every input, run by `cargo kani -p store`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Every key [`TileKey::new`] accepts reads back from its encoding.
+    #[kani::proof]
+    #[kani::unwind(13)]
+    fn keys_round_trip() {
+        let Ok(level) = Level::new(kani::any()) else {
+            return;
+        };
+        let made = TileKey::new(
+            LayerId::new(kani::any()),
+            Channel::from_raw(kani::any()),
+            FaceId::new(kani::any()),
+            level,
+            kani::any(),
+            kani::any(),
+        );
+        let Ok(key) = made else {
+            return;
+        };
+        let mut out = Vec::with_capacity(KEY_LEN);
+        put_key(&mut out, &key);
+        assert_eq!(out.len(), KEY_LEN, "fixed width");
+        assert_eq!(Reader::new(&out).key(), Some(key), "the same key");
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {

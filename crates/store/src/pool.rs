@@ -261,8 +261,8 @@ pub(crate) trait SlotData: Pod {
     fn clear(&mut self);
 }
 
-/// Pools of plain arrays (the pool's own tests) are zeroed.
-#[cfg(test)]
+/// Pools of plain arrays (the pool's own tests and proofs) are zeroed.
+#[cfg(any(test, kani))]
 impl<T: Pod, const N: usize> SlotData for [T; N] {
     fn clear(&mut self) {
         bytemuck::bytes_of_mut(self).fill(0);
@@ -990,6 +990,31 @@ impl<T: SlotData> Pool<T> {
     fn live_mut(&mut self, id: SlotId<T>) -> Option<&mut Meta> {
         self.meta_mut((id.chunk, id.index))
             .filter(|m| m.generation == id.generation && m.key.is_some())
+    }
+}
+
+/// Proofs, for every input, run by `cargo kani -p store`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// A small slot, of the pool's own tests' kind.
+    type Slot = [u64; 3];
+
+    /// For every chunk size, a chunk holds at least one slot and its slots fit what it is
+    /// charged.
+    ///
+    /// [`Pool::short_slots`] and [`Pool::pos_of`] are left out: they need a pool, and making one
+    /// makes a `HashMap`, whose random keys come from a `getrandom` syscall Kani can't model.
+    #[kani::proof]
+    fn layouts_hold_their_slots() {
+        let chunk_bytes: usize = kani::any();
+        let (per_chunk, charged) = Pool::<Slot>::layout(chunk_bytes);
+        assert!(per_chunk >= 1, "at least one slot");
+        assert!(
+            u64::from(per_chunk) * size_of::<Slot>() as u64 <= charged as u64,
+            "the slots fit the charge"
+        );
     }
 }
 

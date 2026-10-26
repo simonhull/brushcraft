@@ -68,6 +68,30 @@ impl OpId {
     }
 }
 
+/// Proofs, for every input, run by `cargo kani -p store`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Every packing [`OpId::from_bits`] accepts packs back to the same bits.
+    #[kani::proof]
+    fn accepted_bits_round_trip() {
+        let bits: u64 = kani::any();
+        if let Some(op) = OpId::from_bits(bits) {
+            assert_eq!(op.to_bits(), bits, "the same bits");
+        }
+    }
+
+    /// Every valid op id unpacks from its packing.
+    #[kani::proof]
+    fn valid_ops_round_trip() {
+        let (site, seq): (u16, u64) = (kani::any(), kani::any());
+        if let Some(op) = OpId::new(site, seq) {
+            assert_eq!(OpId::from_bits(op.to_bits()), Some(op), "the same op");
+        }
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {

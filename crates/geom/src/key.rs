@@ -474,6 +474,43 @@ impl Region {
     }
 }
 
+/// Proofs, for every input, run by `cargo kani -p geom`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// For every level and every vertex of the face grid, [`TileKey::containing`] finds a tile
+    /// of the grid and coordinates inside it, without overflowing.
+    #[kani::proof]
+    fn containing_stays_inside_its_tile() {
+        let Ok(level) = Level::new(kani::any()) else {
+            return;
+        };
+        let (i, j): (u32, u32) = (kani::any(), kani::any());
+        kani::assume(i <= level.face_quads() && j <= level.face_quads());
+        let found = TileKey::containing(
+            LayerId::new(0),
+            Channel::from_raw(0),
+            FaceId::new(kani::any()),
+            level,
+            i,
+            j,
+        );
+        let Some((key, x, y)) = found else {
+            panic!("a vertex of the face is in a tile");
+        };
+        assert!(
+            x <= level.tile_quads() && y <= level.tile_quads(),
+            "inside the tile"
+        );
+        let per_side = level.tiles_per_side();
+        assert!(
+            u32::from(key.tx()) < per_side && u32::from(key.ty()) < per_side,
+            "a tile of the grid"
+        );
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
