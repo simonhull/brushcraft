@@ -562,6 +562,35 @@ fn measure_normals(
     Ok(())
 }
 
+/// Adds to `angles` the angle between each decoded normal of `tiles` (one face's at one level)
+/// and the exact mean `exact` of the finest normals under it.
+///
+/// # Errors
+///
+/// If a tile vertex lies off the face.
+fn measure_drift(angles: &mut Angles, tiles: &[DisplayTile], exact: &MeanNormals) -> Result<()> {
+    let side = u32::try_from(exact.as_slice().len().isqrt())?;
+    for tile in tiles {
+        let key = tile.key();
+        let region = Region::of_tile(key);
+        for (index, &normal) in tile.normals().iter().enumerate() {
+            let index = u32::try_from(index)?;
+            let (x, y) = (
+                region.x0() + index % key.side(),
+                region.y0() + index / key.side(),
+            );
+            let mean = exact
+                .as_slice()
+                .get(usize::try_from(y * side + x)?)
+                .copied()
+                .context("inside the face")?;
+            let unit = mean.normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+            angles.add(angle_degrees(normal, unit));
+        }
+    }
+    Ok(())
+}
+
 /// The value at quantile `q` (nearest rank) of `values`, or NaN if there are none.
 fn quantile(values: &[f32], q: f64) -> f64 {
     let mut sorted: Vec<f32> = values.to_vec();
@@ -724,22 +753,33 @@ fn normals_part<J: Write, H: Write>(
             decode: (Duration::ZERO, 0),
             roughness: (0, 0),
         };
-        let mut finer: Option<FaceGrids> = None;
+        // The decoded means each level is mipped from, and the exact ones (the same mip of the
+        // finest normals, never encoded) that the decoded normals drift from.
+        let (mut finer, mut finer_exact): (Option<FaceGrids>, Option<FaceGrids>) = (None, None);
+        let mut drift: BTreeMap<u8, Angles> = BTreeMap::new();
         let mut level = finest;
         while let Some(coarser) = level.parent() {
             let mut decoded = FaceGrids::new(coarser);
+            let mut exact_level = FaceGrids::new(coarser);
+            let angles = drift.entry(coarser.get()).or_insert_with(Angles::new);
             for (positions, exact) in kept {
                 let face = positions.face();
-                let means = match &finer {
-                    None => exact.clone(),
-                    Some(source) => mip_normals(mesh, source, face, coarser)?,
+                let (means, exact_means) = match (&finer, &finer_exact) {
+                    (Some(source), Some(exact_source)) => (
+                        mip_normals(mesh, source, face, coarser)?,
+                        mip_normals(mesh, exact_source, face, coarser)?,
+                    ),
+                    _ => (exact.clone(), exact.clone()),
                 };
                 let (tiles, decoded_means) =
                     build_level_with(encoding, positions, coarser, &means)?;
                 measure_normals(&mut tally, encoding, &tiles, &means, coarser == below)?;
+                measure_drift(angles, &tiles, &exact_means)?;
                 decoded.insert(face, decoded_means.into_grid())?;
+                exact_level.insert(face, exact_means.into_grid())?;
             }
             finer = Some(decoded);
+            finer_exact = Some(exact_level);
             level = coarser;
         }
         let bytes = |b: u64| to_f64(usize::try_from(b).unwrap_or(usize::MAX)) * scale / file;
@@ -749,8 +789,22 @@ fn normals_part<J: Write, H: Write>(
         let decode_us = ms(tally.decode.0) * 1000.0 / to_f64(tally.decode.1.max(1));
         let (max, p99) = (tally.angles.max, tally.angles.quantile(0.99));
         let (raw, delta) = (bytes(tally.roughness.0), bytes(tally.roughness.1));
+        let mut record = Record::new("display-study", "normals");
+        let mut drift_parts = Vec::new();
+        for (l, angles) in &drift {
+            let (drift_max, drift_p99) = (angles.max, angles.quantile(0.99));
+            record = record
+                .with(format!("drift_l{l}_max_degrees"), drift_max)
+                .with(format!("drift_l{l}_p99_degrees"), drift_p99);
+            drift_parts.push(format!("l{l} {drift_max:.3}/{drift_p99:.3}"));
+        }
+        out.say(&format!(
+            "{} drift from the exact means, max/p99 °: {}",
+            encoding_name(encoding),
+            drift_parts.join(" ")
+        ))?;
         out.record(
-            &Record::new("display-study", "normals")
+            &record
                 .with("encoding", encoding_name(encoding))
                 .with("positions", POSITIONS.name())
                 .with("growth", total)

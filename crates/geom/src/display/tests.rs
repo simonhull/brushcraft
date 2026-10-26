@@ -872,3 +872,57 @@ fn step_error_bounds_what_f64_rounding_hides() {
         "a finer grid larger than the coarser one's refinement"
     );
 }
+
+/// Bolero cases `decoded_means_stay_near_the_exact_ones` runs.
+const DRIFT_CASES: usize = 16;
+
+/// The largest angle, by level, between a decoded display normal and the exact mean of the
+/// finest normals under it, over every case so far.
+static DRIFT: std::sync::Mutex<[f64; FINEST as usize]> =
+    std::sync::Mutex::new([0.0; FINEST as usize]);
+
+/// Decoded display normals stay within 0.5° of the exact means at every level.
+///
+/// Each level is mipped from the decoded means one level finer, so encoding error could build
+/// up over levels. Against the exact means (the same mip of the finest normals, never encoded),
+/// every decoded normal of the chosen encoding stays within the limit on random sculpts. The
+/// largest angle per level is printed (`--nocapture`).
+#[test]
+fn decoded_means_stay_near_the_exact_ones() {
+    bolero::check!()
+        .with_type::<u64>()
+        .with_iterations(DRIFT_CASES)
+        .for_each(|&seed| {
+            let sculpt = Sculpt::random(seed);
+            let (positions, normals) = sculpt.finest_grids();
+            let tiles = build_mesh(&sculpt.mesh, &positions, &normals).unwrap();
+            let mut exact = normals;
+            for l in (0..FINEST).rev() {
+                let mut coarser = FaceGrids::new(level(l));
+                for face in sculpt.mesh.faces() {
+                    let means = mip_normals(&sculpt.mesh, &exact, face, level(l)).unwrap();
+                    coarser.insert(face, means.into_grid()).unwrap();
+                }
+                exact = coarser;
+                let mut worst = 0.0_f64;
+                for tile in tiles.iter().filter(|t| t.key().level() == level(l)) {
+                    let key = tile.key();
+                    let region = Region::of_tile(key);
+                    let grid = exact.get(key.face()).unwrap();
+                    for (index, &normal) in tile.normals().iter().enumerate() {
+                        let index = u32::try_from(index).unwrap();
+                        let (i, j) = (index % key.side(), index / key.side());
+                        let mean = grid.get(region.x0() + i, region.y0() + j).unwrap();
+                        let unit = mean.normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+                        worst = worst.max(angle_degrees(normal, unit));
+                    }
+                }
+                {
+                    let mut drift = DRIFT.lock().unwrap();
+                    drift[usize::from(l)] = drift[usize::from(l)].max(worst);
+                }
+                assert!(worst <= 0.5, "level {l}: {worst}° from the exact mean");
+            }
+        });
+    println!("largest drift by level: {:?}", DRIFT.lock().unwrap());
+}
