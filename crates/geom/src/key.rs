@@ -1,6 +1,7 @@
 //! Identifiers and tile arithmetic: faces, levels, layers, channels, tile keys and regions.
 
 use core::fmt;
+use core::hash::{Hash, Hasher};
 
 use thiserror::Error;
 
@@ -211,7 +212,11 @@ pub struct TileOutOfRange {
 
 /// One tile: a block of [`TILE_QUADS`]² quads (or a whole face at levels up to 6) of one channel of
 /// one layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Its [`Hash`] writes the key as two `u64` words, its place on its face (column, row, level)
+/// then whose it is (face, layer, channel), packed one-to-one: a hasher made for whole words
+/// reads it in two steps instead of six.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TileKey {
     /// The layer the tile belongs to.
     layer: LayerId,
@@ -364,6 +369,30 @@ impl TileKey {
     #[must_use]
     pub const fn side(&self) -> u32 {
         self.level.tile_quads() + 1
+    }
+
+    /// The key packed into two words, one-to-one: the tile's place on its face (column, row and
+    /// level) in the first, from the lowest bits up, and its face, layer and channel in the
+    /// second. What [`Hash`] writes.
+    ///
+    /// The fields that tell the tiles of one region apart come first and lowest, where a hasher
+    /// that mixes upwards (a multiply) carries them into every higher bit.
+    const fn words(&self) -> [u64; 2] {
+        let place = self.tx as u64 | (self.ty as u64) << 16 | (self.level.get() as u64) << 32;
+        let whose = self.face.index() as u64
+            | (self.layer.get() as u64) << 32
+            | (self.channel.raw() as u64) << 48;
+        [place, whose]
+    }
+}
+
+/// Writes the key's two packed words (`TileKey::words`): equal keys write equal words and, the
+/// packing being one-to-one, only equal keys do.
+impl Hash for TileKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let [place, whose] = self.words();
+        state.write_u64(place);
+        state.write_u64(whose);
     }
 }
 

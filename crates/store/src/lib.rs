@@ -18,6 +18,7 @@ mod fixture;
 #[cfg(any(feature = "fuzzing", test))]
 #[doc(hidden)]
 pub mod fuzzing;
+mod hash;
 mod index;
 mod kept;
 mod meta;

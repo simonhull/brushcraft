@@ -41,9 +41,11 @@
 //! graph over-invalidates rather than lose an edge.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{BaseMesh, EvalError, Level, Region, TileKey, normal_tiles};
+
+use crate::hash::TileMap;
 
 /// Whether a tile of `level` is predicted from other tiles: above level 1 (level-1 tiles are
 /// predicted from the base mesh).
@@ -115,7 +117,7 @@ pub(crate) struct Cascade {
 #[derive(Debug, Default)]
 pub(crate) struct DepGraph {
     /// Every tile that is resident or read by a recorded tile.
-    nodes: HashMap<TileKey, Node>,
+    nodes: TileMap<Node>,
     /// Nodes above level 1 whose parents were never recorded: their ancestry is unknown, so any
     /// coarser edit reaches them. Empty unless a tile was recorded after a parent's node went.
     untracked: BTreeSet<TileKey>,

@@ -109,7 +109,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -130,6 +130,7 @@ use crate::bounds::Book;
 use crate::deps::{DepGraph, list_normal_inputs};
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
+use crate::hash::{TileHash, TileMap, TileSet};
 use crate::index::TileBounds;
 use crate::kept::Kept;
 use crate::meta::{Meta, Role, SavePoint};
@@ -978,7 +979,7 @@ pub struct TileStore {
     deps: DepGraph,
     /// The latest write of each dirty correction slot: the op its record is written with, by
     /// write-back or [`TileStore::save`], and its stamp.
-    unsaved: HashMap<TileKey, Dirty>,
+    unsaved: TileMap<Dirty>,
     /// Every tile edited since the last rebase (or since the store opened), drained from the
     /// feed by save's consumer: what the next save copies into the project file.
     since_rebase: BTreeSet<TileKey>,
@@ -993,7 +994,7 @@ pub struct TileStore {
     /// have an entry: a tile's goes when its slot is evicted (the correction pool logs its
     /// evictions, see [`TileStore::forget_evicted_ops`]) or removed, so the map never grows
     /// past the pool, and no save walks it.
-    known_ops: HashMap<TileKey, OpId>,
+    known_ops: TileMap<OpId>,
     /// Counts the working files the store has had: a rebase moves it on, so a recovery flush
     /// started before can tell it would finish in the wrong file.
     generation: u64,
@@ -1476,7 +1477,7 @@ pub(crate) struct Dirty {
 /// no recorded write (every slot marked dirty gets one first) or doesn't hold a valid tile.
 fn write_slot(
     file: &mut ProjectFile,
-    unsaved: &mut HashMap<TileKey, Dirty>,
+    unsaved: &mut TileMap<Dirty>,
     key: TileKey,
     slot: &CorrectionSlot,
 ) -> Result<OpId, CacheError> {
@@ -1752,10 +1753,10 @@ impl TileStore {
             // leave below a whole chunk (see "Kept predictions" on `TileStore`).
             evaluated: Pool::with_eviction_log(config.chunk_bytes).with_short_chunks(),
             deps: DepGraph::new(),
-            unsaved: HashMap::new(),
+            unsaved: TileMap::default(),
             since_rebase,
             last_write: Stamp::ZERO,
-            known_ops: HashMap::new(),
+            known_ops: TileMap::default(),
             generation: 0,
             working_failed: false,
             bounds,
@@ -3483,7 +3484,7 @@ impl TileStore {
         for key in keys {
             self.check_key(key)?;
         }
-        let mut seen = HashSet::with_capacity(keys.len());
+        let mut seen = TileSet::with_capacity_and_hasher(keys.len(), TileHash);
         let jobs: Vec<Job> = keys
             .iter()
             .filter(|&&key| seen.insert(key) && self.corrections.find(&key).is_none())

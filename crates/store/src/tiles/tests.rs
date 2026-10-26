@@ -2671,7 +2671,7 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
 /// with their ops and stamps, and the change feed.
 type Worked = (
     Vec<(TileKey, String, Vec<u8>, Vec<u8>)>,
-    HashMap<TileKey, Dirty>,
+    TileMap<Dirty>,
     Vec<(TileKey, OpId)>,
 );
 

@@ -4,9 +4,11 @@
 //! their predictions (positions and tangent frames from the level below) are kept, and each step
 //! only applies the new corrections.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use geom::TileKey;
+
+use crate::hash::{TileHash, TileMap};
 
 /// The most entries [`Kept::new`] makes room for up front: the default bound's worth. A larger
 /// bound grows the map as values come instead.
@@ -26,7 +28,7 @@ pub(crate) struct Kept<T> {
     /// The most values kept; zero keeps none.
     capacity: usize,
     /// Each tile's value, with the tick of its last use.
-    values: HashMap<TileKey, (T, u64)>,
+    values: TileMap<(T, u64)>,
     /// The tile each live tick stamps: one entry per value, oldest first.
     order: BTreeMap<u64, TileKey>,
     /// The tick the next use or insert is stamped with.
@@ -39,7 +41,7 @@ impl<T> Kept<T> {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            values: HashMap::with_capacity(capacity.min(PREALLOCATED)),
+            values: TileMap::with_capacity_and_hasher(capacity.min(PREALLOCATED), TileHash),
             order: BTreeMap::new(),
             tick: 0,
         }

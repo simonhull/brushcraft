@@ -1,11 +1,12 @@
 //! The change feed: the stream of tiles edits make dirty, read by several independent consumers
 //! (save now; GPU upload, undo and the live link later), each at its own pace.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use geom::TileKey;
 
 use crate::OpId;
+use crate::hash::TileMap;
 
 /// A subscriber's handle. Ids are never reused, so a stale one reads nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,7 +31,7 @@ pub struct ChangeFeed {
     cursors: Vec<Option<u64>>,
     /// Per key in `entries`: the op and sequence number of its latest entry, for skipping
     /// repeated pushes.
-    last: HashMap<TileKey, (OpId, u64)>,
+    last: TileMap<(OpId, u64)>,
 }
 
 impl ChangeFeed {
@@ -84,7 +85,7 @@ impl ChangeFeed {
         let skip = usize::try_from(*cursor - self.first).unwrap_or(usize::MAX);
         *cursor = end;
         let mut order: Vec<(TileKey, OpId)> = Vec::new();
-        let mut at: HashMap<TileKey, usize> = HashMap::new();
+        let mut at: TileMap<usize> = TileMap::default();
         for &(key, op) in self.entries.iter().skip(skip) {
             if let Some(slot) = at.get(&key).and_then(|&i| order.get_mut(i)) {
                 slot.1 = op;

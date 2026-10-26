@@ -21,7 +21,6 @@
 //! back to the budget. The default 64 MB chunk is above it; tests use small chunks knowingly.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -29,6 +28,8 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use geom::TileKey;
 use thiserror::Error;
+
+use crate::hash::TileMap;
 
 /// Bytes the pools may use, shared by all of them.
 ///
@@ -288,7 +289,7 @@ pub(crate) struct Pool<T: SlotData> {
     /// Free slots of mapped chunks.
     free: Vec<Pos>,
     /// Where each tile's slot is.
-    index: HashMap<TileKey, Pos>,
+    index: TileMap<Pos>,
     /// Slots with at least one pin.
     pinned: usize,
     /// Where the clock resumes, as a flat position (`chunk × per_chunk + index`).
@@ -339,7 +340,7 @@ impl<T: SlotData> Pool<T> {
             charges: Vec::new(),
             meta: Vec::new(),
             free: Vec::new(),
-            index: HashMap::new(),
+            index: TileMap::default(),
             pinned: 0,
             hand: 0,
             short_chunks: false,
@@ -1004,8 +1005,8 @@ mod proofs {
     /// For every chunk size, a chunk holds at least one slot and its slots fit what it is
     /// charged.
     ///
-    /// [`Pool::short_slots`] and [`Pool::pos_of`] are left out: they need a pool, and making one
-    /// makes a `HashMap`, whose random keys come from a `getrandom` syscall Kani can't model.
+    /// [`Pool::short_slots`] and [`Pool::pos_of`] are left out: they need a pool, which these
+    /// proofs don't build.
     #[kani::proof]
     fn layouts_hold_their_slots() {
         let chunk_bytes: usize = kani::any();
