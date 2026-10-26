@@ -1,11 +1,18 @@
 //! A fast hasher for the store's maps keyed by tile.
 //!
 //! The standard maps hash with `SipHash`, keyed at random, so that keys an attacker chooses can't
-//! pile into one bucket. The store's tile keys are its own (tiles of its mesh, found by its
-//! own walks), never chosen from outside, so its maps take a multiply-and-rotate hash instead,
-//! which reads a [`TileKey`] in two steps (its [`Hash`](std::hash::Hash) writes two words).
-//! Should tile keys ever come from untrusted input into a long-lived map, this choice must be
-//! revisited.
+//! pile into one bucket. The maps that take this multiply-and-rotate hash instead, which reads a
+//! [`TileKey`] in two steps (its [`Hash`](std::hash::Hash) writes two words), hold keys the store
+//! derives from its mesh's topology: dense face ids `0..F` and tile coordinates bounded by their
+//! level's grid, checked when a key enters the store. A project file chooses the mesh, and so
+//! how many such keys there are, but not their values. No map with this hash takes keys parsed
+//! from a file: those go to `BTreeMap`s (the bounds book, the file's own indexes) and to the
+//! prefetcher's standard map. And every such map is bounded by what the store holds: the pools'
+//! budget, the tiles it has edited since a save. Should tile keys ever come from untrusted input
+//! into a long-lived map of this kind, this choice must be revisited.
+//!
+//! The hash's low bits are its best mixed (see [`TileHasher`]); only a table of more than 2²⁶
+//! buckets, far past any these maps reach, would take bucket bits from the weakly mixed ones.
 //!
 //! Nothing may depend on the order such a map iterates in: it differs from `SipHash`'s, and
 //! nothing of it is part of what the store promises.
