@@ -114,9 +114,9 @@ impl TileStore {
         #[cfg(test)]
         for key in &keys {
             let counter = if self.deps.parents(key).is_some() {
-                &self.log.parents_reused
+                &self.hooks.log.parents_reused
             } else {
-                &self.log.parents_listed
+                &self.hooks.log.parents_listed
             };
             counter.set(counter.get() + 1);
         }
@@ -141,9 +141,9 @@ impl TileStore {
         #[cfg(test)]
         for key in keys {
             let counter = if self.deps.normal_inputs(key).is_some() {
-                &self.log.normal_inputs_reused
+                &self.hooks.log.normal_inputs_reused
             } else {
-                &self.log.normal_inputs_listed
+                &self.hooks.log.normal_inputs_listed
             };
             counter.set(counter.get() + 1);
         }
@@ -582,7 +582,7 @@ impl TileStore {
         #[cfg(test)]
         {
             let held = self.kept.len() + made.iter().flatten().count();
-            self.log.predictions_held = self.log.predictions_held.max(held);
+            self.hooks.log.predictions_held = self.hooks.log.predictions_held.max(held);
         }
         for (&(key, _), prediction) in plan.iter().zip(made) {
             if let Some(prediction) = prediction {
@@ -658,7 +658,7 @@ impl TileStore {
         }
         self.positions_installed(key, id, parents)?;
         #[cfg(test)]
-        self.log.in_place.push(key);
+        self.hooks.log.in_place.push(key);
         Ok(())
     }
 
@@ -721,7 +721,7 @@ impl TileStore {
         self.deps.record_positions(key, parents);
         self.activity.positions_computed += 1;
         #[cfg(test)]
-        self.log.positions.push(key);
+        self.hooks.log.positions.push(key);
         Ok(())
     }
 
@@ -817,7 +817,7 @@ impl TileStore {
             .collect();
         let computed = self.normals_round(&tasks, held, bounds.is_some())?;
         #[cfg(test)]
-        self.log.refreshed.extend(
+        self.hooks.log.refreshed.extend(
             tasks
                 .iter()
                 .filter(|(_, since)| since.is_some())
@@ -897,7 +897,7 @@ impl TileStore {
             .collect::<Result<Vec<_>, Invariant>>()?;
         let mesh = &*self.mesh;
         #[cfg(test)]
-        let failing = self.failing_normals;
+        let failing = self.hooks.failing_normals;
         each_parallel(
             &self.workers,
             tasks,
@@ -932,7 +932,7 @@ impl TileStore {
         self.deps.record_normals(key, inputs);
         self.activity.normals_computed += 1;
         #[cfg(test)]
-        self.log.normals.push(key);
+        self.hooks.log.normals.push(key);
     }
 
     /// Unpins the evaluated tiles an evaluation pinned.

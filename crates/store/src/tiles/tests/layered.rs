@@ -145,7 +145,7 @@ fn a_tile_in_both_reads_the_working_copy() {
             assert_eq!(store.prefetch(&[both, base_only]).unwrap(), 2, "queued");
             assert_eq!(drain_prefetch(&mut store), 2, "installed");
         }
-        store.log = EvalLog::default();
+        store.hooks.log = EvalLog::default();
         for key in [both, base_only] {
             store.correction(key).unwrap();
         }
@@ -160,7 +160,11 @@ fn a_tile_in_both_reads_the_working_copy() {
             "{what}: the base's tile"
         );
         let reads = if prefetched { 0 } else { 2 };
-        assert_eq!(store.log.file_reads.len(), reads, "{what}: owner reads");
+        assert_eq!(
+            store.hooks.log.file_reads.len(),
+            reads,
+            "{what}: owner reads"
+        );
     }
 }
 
@@ -236,9 +240,9 @@ fn a_rebase_keeps_evaluations_valid_and_bit_identical() {
     drop(old);
     std::fs::remove_file(dir.path("r1.bcrf")).unwrap();
 
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
     assert_eq!(positions(&mut store, &all), before, "cached, bit for bit");
-    assert_eq!(store.log.positions, [], "nothing recomputed");
+    assert_eq!(store.hooks.log.positions, [], "nothing recomputed");
     store.shrink_to(0).unwrap();
     assert_eq!(
         positions(&mut store, &all),

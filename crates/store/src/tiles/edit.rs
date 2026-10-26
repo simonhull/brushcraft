@@ -695,7 +695,7 @@ impl TileStore {
     /// must match; the tests reach it by forcing it.
     fn tile_border(&self, key: &TileKey) -> Option<TileBorder> {
         #[cfg(test)]
-        if self.without_tile_borders {
+        if self.hooks.without_tile_borders {
             return None;
         }
         self.mesh.topology().tile_border(key)

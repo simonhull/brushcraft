@@ -112,12 +112,12 @@ fn random_workload(seed: u64, steps: u32) {
     assert!(pin_sets > 10, "seed {seed}: only {pin_sets} pin sets held");
     // Installs happen at whichever call polls first, so they are counted by the store.
     assert!(
-        store.log.prefetched > 10,
+        store.hooks.log.prefetched > 10,
         "seed {seed}: only {} prefetched tiles installed",
-        store.log.prefetched
+        store.hooks.log.prefetched
     );
     assert!(
-        store.log.positions.len() > 2 * all.len(),
+        store.hooks.log.positions.len() > 2 * all.len(),
         "seed {seed}: evicting, so tiles were evaluated again"
     );
     let dense = dense(&mesh, &map);

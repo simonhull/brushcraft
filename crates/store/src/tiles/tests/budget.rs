@@ -76,12 +76,12 @@ fn pins_survive_pressure() {
         .iter()
         .map(|key| store.evaluated.find(key).unwrap())
         .collect();
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
     assert_positions(&mut store, &dense, &tiles(&mesh, 1, TOP), "the other tiles");
     assert!(
-        store.log.positions.len() > 100,
+        store.hooks.log.positions.len() > 100,
         "under pressure: {} evaluations",
-        store.log.positions.len()
+        store.hooks.log.positions.len()
     );
     for (key, id) in pinned.iter().zip(&ids) {
         assert_eq!(
@@ -90,7 +90,7 @@ fn pins_survive_pressure() {
             "{key:?} stayed in its slot"
         );
         assert!(
-            !store.log.positions.contains(key),
+            !store.hooks.log.positions.contains(key),
             "{key:?} was never recomputed"
         );
     }
@@ -557,7 +557,7 @@ fn a_pin_that_fails_part_way_releases_only_its_own_pins() {
         .find(|key| store.file.contains(key))
         .copied()
         .unwrap();
-    store.unreadable = Some(on_disk);
+    store.hooks.unreadable = Some(on_disk);
     let wanted = [finest[1].min(on_disk), finest[1].max(on_disk)];
     let refused = store.pin(&wanted);
     assert!(
@@ -589,7 +589,7 @@ fn a_round_that_fails_part_way_keeps_only_the_tiles_before_the_failure() {
         .collect();
     assert_eq!(wanted.len(), 5, "enough tiles on disk");
     wanted.sort_unstable();
-    store.unreadable = Some(wanted[1]);
+    store.hooks.unreadable = Some(wanted[1]);
     let refused = store.pin(&wanted);
     assert!(
         matches!(refused, Err(CacheError::Store(_))),

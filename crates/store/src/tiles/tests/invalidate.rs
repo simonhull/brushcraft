@@ -18,7 +18,7 @@ fn edits_after_evaluation_invalidate_exactly() {
     for key in &finest {
         store.normals(*key).unwrap();
     }
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
 
     // An interior vertex of one finest tile: its only copy.
     let (face, i, j) = (FaceId::new(4), 64 + 17, 128 + 40);
@@ -36,7 +36,7 @@ fn edits_after_evaluation_invalidate_exactly() {
     assert_normals(&mut store, &mesh, &dense, &finest, "after the edit");
 
     assert_eq!(
-        store.log.positions,
+        store.hooks.log.positions,
         vec![edited],
         "only the edited tile's positions were recomputed"
     );
@@ -50,28 +50,34 @@ fn edits_after_evaluation_invalidate_exactly() {
         .copied()
         .collect();
     assert!(readers.len() > 1, "the edited tile has neighbours");
-    let recomputed: BTreeSet<TileKey> = store.log.normals.iter().copied().collect();
+    let recomputed: BTreeSet<TileKey> = store.hooks.log.normals.iter().copied().collect();
     assert_eq!(
         recomputed, readers,
         "exactly the normals that read the edited tile were dropped"
     );
     assert_eq!(
-        store.log.normals.len(),
+        store.hooks.log.normals.len(),
         readers.len(),
         "each recomputed once"
     );
     let mut neighbours = readers.clone();
     neighbours.remove(&edited);
     assert_eq!(
-        store.log.refreshed.iter().copied().collect::<BTreeSet<_>>(),
+        store
+            .hooks
+            .log
+            .refreshed
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
         neighbours,
         "the neighbours' normals, whose own positions stayed, were brought up to date; the \
          edited tile's were computed in full"
     );
     assert_eq!(
         (
-            store.log.normal_inputs_reused.get(),
-            store.log.normal_inputs_listed.get()
+            store.hooks.log.normal_inputs_reused.get(),
+            store.hooks.log.normal_inputs_listed.get()
         ),
         (readers.len(), 0),
         "every input list was read back from the graph: the neighbours' stale normals kept the \
@@ -189,11 +195,14 @@ fn stale_normals_brought_up_to_date_equal_a_full_recompute() {
             assert_normals_recomputed(&mut store, &all, &what);
         }
         assert!(
-            store.log.refreshed.len() > 2 * dab_count,
+            store.hooks.log.refreshed.len() > 2 * dab_count,
             "{threads} threads: neighbours were brought up to date, not recomputed: {}",
-            store.log.refreshed.len()
+            store.hooks.log.refreshed.len()
         );
-        runs.push((store.log.normals.clone(), store.log.refreshed.clone()));
+        runs.push((
+            store.hooks.log.normals.clone(),
+            store.hooks.log.refreshed.clone(),
+        ));
     }
     assert!(
         runs.windows(2).all(|pair| pair[0] == pair[1]),
@@ -223,29 +232,29 @@ fn structural_lists_are_read_back_from_the_graph() {
         store.deps.left_pool(key);
     }
     store.deps.check_invariants().unwrap();
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
     let dense = dense(&mesh, &map);
     assert_positions(&mut store, &dense, &[gone], "rebuilt from levels 3 up");
     assert_normals(&mut store, &mesh, &dense, &[gone], "rebuilt");
     assert!(
-        store.log.positions.len() > 4,
+        store.hooks.log.positions.len() > 4,
         "levels 4–8 were evaluated again: {:?}",
-        store.log.positions
+        store.hooks.log.positions
     );
     assert_eq!(
-        store.log.parents_listed.get(),
+        store.hooks.log.parents_listed.get(),
         0,
         "every parent list was read back from the graph"
     );
     assert!(
-        store.log.parents_reused.get() >= store.log.positions.len(),
+        store.hooks.log.parents_reused.get() >= store.hooks.log.positions.len(),
         "one per tile built at least: {}",
-        store.log.parents_reused.get()
+        store.hooks.log.parents_reused.get()
     );
     assert_eq!(
         (
-            store.log.normal_inputs_reused.get(),
-            store.log.normal_inputs_listed.get()
+            store.hooks.log.normal_inputs_reused.get(),
+            store.hooks.log.normal_inputs_listed.get()
         ),
         (1, 0),
         "and the normal inputs"
@@ -268,7 +277,7 @@ fn edits_at_a_coarse_level_reach_the_finest() {
         assert!(store.evaluated.remove(&key).unwrap(), "{key:?} was cached");
         store.deps.left_pool(key);
     }
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
     let edits: Vec<Edit> = random_edits(&mesh, 3, 40, 5)
         .into_iter()
         .filter(|e| e.level == level(3))
@@ -279,7 +288,12 @@ fn edits_at_a_coarse_level_reach_the_finest() {
     let finest = tiles(&mesh, TOP, TOP);
     assert_positions(&mut store, &dense, &finest, "level 8 after level-3 edits");
     assert!(
-        store.log.positions.iter().any(|k| k.level() == level(TOP)),
+        store
+            .hooks
+            .log
+            .positions
+            .iter()
+            .any(|k| k.level() == level(TOP)),
         "level-8 tiles were recomputed"
     );
 }
@@ -293,7 +307,7 @@ fn edits_between_evaluations_invalidate_once() {
     let key = tiles(&mesh, TOP, TOP)[37];
     let region = Region::of_tile(&key);
     store.normals(key).unwrap();
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
     // One op throughout, as a brush stroke: the store is evaluated between its dabs.
     store.begin_op().unwrap();
     let mut rng = Rng(19);
@@ -313,7 +327,7 @@ fn edits_between_evaluations_invalidate_once() {
     };
     dab(&mut store, &mut map);
     assert_eq!(
-        store.log.invalidations, 1,
+        store.hooks.log.invalidations, 1,
         "the first edit drops the tile's evaluations; the rest find nothing to drop"
     );
     assert_normals(
@@ -324,7 +338,10 @@ fn edits_between_evaluations_invalidate_once() {
         "after a dab",
     );
     dab(&mut store, &mut map);
-    assert_eq!(store.log.invalidations, 2, "evaluated since: dropped again");
+    assert_eq!(
+        store.hooks.log.invalidations, 2,
+        "evaluated since: dropped again"
+    );
     let dense = dense(&mesh, &map);
     assert_positions(&mut store, &dense, &[key], "after the second dab, same op");
     assert_normals(
@@ -341,5 +358,8 @@ fn edits_between_evaluations_invalidate_once() {
             }
         })
         .unwrap();
-    assert_eq!(store.log.invalidations, 3, "a whole tile edit drops once");
+    assert_eq!(
+        store.hooks.log.invalidations, 3,
+        "a whole tile edit drops once"
+    );
 }

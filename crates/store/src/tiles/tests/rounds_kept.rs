@@ -73,20 +73,30 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
         let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);
         brush_rounds(&mut store, &keys, &around, true);
         assert_eq!(
-            store.log.in_place.len(),
+            store.hooks.log.in_place.len(),
             4 * keys.len(),
             "{threads} threads: every pinned tile predicted in place each round"
         );
         // The cold evaluation before the first round goes through scratch: look after it.
-        let in_place: BTreeSet<TileKey> = store.log.in_place.iter().copied().collect();
-        let first = store.log.in_place.first().unwrap();
-        let rounds = store.log.positions.iter().skip_while(|key| *key != first);
+        let in_place: BTreeSet<TileKey> = store.hooks.log.in_place.iter().copied().collect();
+        let first = store.hooks.log.in_place.first().unwrap();
+        let rounds = store
+            .hooks
+            .log
+            .positions
+            .iter()
+            .skip_while(|key| *key != first);
         assert!(
             rounds.filter(|key| !in_place.contains(key)).count() >= 4,
             "{threads} threads: unpinned tiles went through scratch in the rounds"
         );
         let feed = store.feed.drain(store.save_consumer);
-        runs.push((threads, every_slot(&store, &all), feed, store.log.positions));
+        runs.push((
+            threads,
+            every_slot(&store, &all),
+            feed,
+            store.hooks.log.positions,
+        ));
     }
     let ((_, slots, feed, positions), others) = runs.split_first().unwrap();
     assert!(!feed.is_empty(), "the rounds went to the feed");
@@ -171,9 +181,9 @@ fn rounds_around_a_parent_edit(
     );
     brush_rounds(&mut store, &keys, &around, true);
     assert!(
-        store.log.predictions_held <= kept,
+        store.hooks.log.predictions_held <= kept,
         "never more held than the bound, new ones included: {}",
-        store.log.predictions_held
+        store.hooks.log.predictions_held
     );
     drop(pins);
     store.evict_all().unwrap();
@@ -291,11 +301,15 @@ fn a_round_failing_after_writing_in_place_leaves_its_tiles_stale() {
     let side = store.corrections.get(id).unwrap().side;
     store.corrections.get_mut(id).unwrap().side = 0;
     let before: Vec<Option<Vec<u8>>> = keys.iter().map(|k| evaluated_bytes(&store, k)).collect();
-    let computed = store.log.positions.len();
+    let computed = store.hooks.log.positions.len();
 
     let failed = store.evaluate_many(&keys, Evaluation::Positions);
     assert!(matches!(failed, Err(CacheError::Internal(_))), "{failed:?}");
-    assert_eq!(store.log.positions.len(), computed, "nothing installed");
+    assert_eq!(
+        store.hooks.log.positions.len(),
+        computed,
+        "nothing installed"
+    );
     for key in &keys {
         assert_eq!(
             store.evaluated.freshness(key),
@@ -343,13 +357,13 @@ fn normals_failing_after_writing_in_place_stay_stale() {
         .iter()
         .map(|key| store.deps.stale_inputs(key).unwrap().clone())
         .collect();
-    store.failing_normals = Some(stale[stale.len() / 2]);
+    store.hooks.failing_normals = Some(stale[stale.len() / 2]);
     let before: Vec<Option<Vec<u8>>> = around.iter().map(|k| evaluated_bytes(&store, k)).collect();
-    let computed = store.log.normals.len();
+    let computed = store.hooks.log.normals.len();
 
     let failed = store.evaluate_many(&around, Evaluation::Normals);
     assert!(matches!(failed, Err(CacheError::Internal(_))), "{failed:?}");
-    assert_eq!(store.log.normals.len(), computed, "nothing recorded");
+    assert_eq!(store.hooks.log.normals.len(), computed, "nothing recorded");
     for key in &keys {
         assert!(
             !store.deps.has_normals(key),
@@ -370,7 +384,7 @@ fn normals_failing_after_writing_in_place_stay_stale() {
         .count();
     assert!(written > 0, "the workers wrote slots before the failure");
 
-    store.failing_normals = None;
+    store.hooks.failing_normals = None;
     store.evaluate_many(&around, Evaluation::Normals).unwrap();
     let dense = dense(&mesh, &map);
     assert_normals(
@@ -433,7 +447,7 @@ fn a_stale_slot_that_lost_its_pin_is_not_predicted_in_place() {
         );
     }
     assert!(
-        store.log.in_place.is_empty(),
+        store.hooks.log.in_place.is_empty(),
         "nothing pinned, nothing in place"
     );
 }
@@ -585,8 +599,11 @@ fn predicting_in_place_equals_predicting_into_scratch() {
         store
     });
     let [in_place, scratch] = &mut stores;
-    assert!(!in_place.log.in_place.is_empty(), "pinned: in place");
-    assert!(scratch.log.in_place.is_empty(), "not pinned: into scratch");
+    assert!(!in_place.hooks.log.in_place.is_empty(), "pinned: in place");
+    assert!(
+        scratch.hooks.log.in_place.is_empty(),
+        "not pinned: into scratch"
+    );
     for &key in &around {
         let positions = scratch.evaluate(key).unwrap().to_vec();
         let same = in_place.evaluate(key).unwrap().iter().zip(&positions);

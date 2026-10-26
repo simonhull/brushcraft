@@ -200,7 +200,7 @@ impl TileStore {
         self.known_ops.insert(key, op);
         #[cfg(test)]
         {
-            self.log.prefetched += 1;
+            self.hooks.log.prefetched += 1;
         }
         Ok(true)
     }
@@ -502,7 +502,7 @@ impl TileStore {
         let id = id?;
         self.activity.corrections_loaded += 1;
         #[cfg(test)]
-        self.log.file_reads.push(key);
+        self.hooks.log.file_reads.push(key);
         Ok(Fill {
             key,
             id,
@@ -522,7 +522,7 @@ impl TileStore {
         key: TileKey,
         filled: Result<Option<OpId>, CacheError>,
     ) -> Result<Option<OpId>, CacheError> {
-        if self.unreadable == Some(key) {
+        if self.hooks.unreadable == Some(key) {
             Err(FileError::from(std::io::Error::other("an unreadable tile, for the test")).into())
         } else {
             filled
@@ -823,7 +823,7 @@ impl TileStore {
     fn invalidate(&mut self, edited: impl IntoIterator<Item = TileKey>) {
         #[cfg(test)]
         {
-            self.log.invalidations += 1;
+            self.hooks.log.invalidations += 1;
         }
         let edited: BTreeSet<TileKey> = edited.into_iter().collect();
         let cascade = self.deps.cascade(edited.iter().copied());

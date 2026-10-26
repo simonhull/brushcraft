@@ -16,6 +16,7 @@ use geom::{
 
 use super::config::BATCH_SHARE;
 use super::edit::{BorderValues, border_order, update_row};
+use super::hooks::EvalLog;
 use super::layers::{first_op, saved_base};
 use super::round::{
     Held, Positions, Resident, Tiles, held_index, nothing_to_write, recorded_or_listed,

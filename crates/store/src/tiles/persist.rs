@@ -25,7 +25,7 @@ use std::rc::Rc;
 use geom::TileKey;
 
 #[cfg(test)]
-use super::EvalLog;
+use super::TestHooks;
 use super::config::{Headroom, StoreConfig, reserved_shares};
 use super::error::{CacheError, Invariant};
 use super::layers::{
@@ -169,13 +169,7 @@ impl TileStore {
             own_edits: BTreeSet::new(),
             activity: Activity::default(),
             #[cfg(test)]
-            log: EvalLog::default(),
-            #[cfg(test)]
-            unreadable: None,
-            #[cfg(test)]
-            failing_normals: None,
-            #[cfg(test)]
-            without_tile_borders: false,
+            hooks: TestHooks::default(),
         })
     }
 

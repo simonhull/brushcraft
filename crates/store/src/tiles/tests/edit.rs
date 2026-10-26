@@ -224,7 +224,7 @@ fn updating_tiles_equals_updating_each_in_turn() {
             let name = format!("{threads:?}");
             let config = roomy().with_workers(threads.map_or(Workers::PhysicalCores, fixed));
             let mut store = new_store(&dir, &format!("{name}.bcp"), &mesh, config);
-            store.without_tile_borders = threads == Some(3);
+            store.hooks.without_tile_borders = threads == Some(3);
             (name, store)
         })
         .collect();
@@ -417,13 +417,13 @@ fn an_unread_edit_still_reaches_untracked_tiles() {
         store.deps.cascade([coarse]).positions.contains(&fine),
         "an edit of it reaches the untracked node's reader"
     );
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
     store.begin_op().unwrap();
     store
         .edit_tile(coarse, |edit| edit.set(1, 1, Vec3::new(0.001, 0.0, 0.0)))
         .unwrap()
         .unwrap();
-    assert_eq!(store.log.invalidations, 1, "the cascade ran");
+    assert_eq!(store.hooks.log.invalidations, 1, "the cascade ran");
     assert_eq!(store.deps.parents(&fine), None, "and dropped the reader");
 }
 

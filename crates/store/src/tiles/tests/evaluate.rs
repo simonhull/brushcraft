@@ -31,7 +31,7 @@ fn evaluation_equals_dense(config: StoreConfig) -> (TestDir, TileStore) {
 fn store_evaluation_equals_dense_with_room() {
     let (_dir, store) = evaluation_equals_dense(roomy());
     assert_eq!(
-        store.log.positions.len(),
+        store.hooks.log.positions.len(),
         tiles(&store.mesh, 1, TOP).len(),
         "with room, each tile is evaluated once"
     );
@@ -47,9 +47,9 @@ fn store_evaluation_equals_dense_under_pressure() {
     let (_dir, store) = evaluation_equals_dense(tight());
     let tiles = tiles(&store.mesh, 1, TOP).len();
     assert!(
-        store.log.positions.len() > 2 * tiles,
+        store.hooks.log.positions.len() > 2 * tiles,
         "evaluated {} times for {tiles} tiles: evicting constantly",
-        store.log.positions.len()
+        store.hooks.log.positions.len()
     );
     assert!(
         store.file.keys().count() > 50,
@@ -204,7 +204,7 @@ fn activity_counts_what_the_store_did() {
     let mut store = new_store(&dir, "work.bcp", &mesh, tight());
     let mut map = CorrectionMap::new();
     apply(&mut store, &mut map, &random_edits(&mesh, TOP, 200, 5));
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
     let before = store.activity();
     for key in &tiles(&mesh, TOP, TOP) {
         store.normals(*key).unwrap();
@@ -218,9 +218,9 @@ fn activity_counts_what_the_store_did() {
             did.corrections_loaded
         ),
         (
-            count(store.log.positions.len()),
-            count(store.log.normals.len()),
-            count(store.log.file_reads.len())
+            count(store.hooks.log.positions.len()),
+            count(store.hooks.log.normals.len()),
+            count(store.hooks.log.file_reads.len())
         ),
         "the work the log saw, counted alike"
     );

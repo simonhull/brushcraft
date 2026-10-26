@@ -34,7 +34,7 @@ fn prefetched_tiles_are_used_without_reading_the_file() {
     assert_eq!(drain_prefetch(&mut store), on_disk.len(), "all installed");
     assert_eq!(store.prefetch(&on_disk).unwrap(), 0, "resident: not queued");
 
-    store.log = EvalLog::default();
+    store.hooks.log = EvalLog::default();
     for key in &on_disk {
         store.correction(*key).unwrap();
         assert_eq!(
@@ -43,15 +43,20 @@ fn prefetched_tiles_are_used_without_reading_the_file() {
             "{key:?}: the prefetched slot is the file's tile"
         );
     }
-    assert_eq!(store.log.file_reads, [], "no read on the owner's thread");
+    assert_eq!(
+        store.hooks.log.file_reads,
+        [],
+        "no read on the owner's thread"
+    );
     let dense = dense(&mesh, &map);
     assert_positions(&mut store, &dense, &tiles(&mesh, 1, TOP), "prefetched");
     assert!(
-        store.log.file_reads.contains(&absent),
+        store.hooks.log.file_reads.contains(&absent),
         "the absent tile was looked up"
     );
     assert!(
         store
+            .hooks
             .log
             .file_reads
             .iter()
