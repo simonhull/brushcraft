@@ -1,0 +1,16 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The wgpu renderer: opens a GPU device and runs compute and drawing work on it."
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true

@@ -15,9 +15,13 @@ input = { path = "crates/input" }
 brush = { path = "crates/brush" }
 sculpt = { path = "crates/sculpt" }
 anyhow = "1.0.100"
-bolero = "0.13.7"
+# 0.13.4, not 0.13.7: bolero-generator-derive 0.13.5 (pulled in by bolero 0.13.5 and later) pins
+# indexmap to exactly 2.11.2, and wgpu 30 needs 2.11.4 or later. Return to the latest once the
+# derive crate drops that pin. cargo-bolero 0.13.5 drives 0.13.4 fine.
+bolero = "0.13.4"
 bytemuck = { version = "1.25.2", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 divan = "0.1.21"
+pollster = "1.0.1"
 raw-window-handle = "0.6.2"
 rayon = "1.12.0"
 rustix = { version = "1.1.5", default-features = false, features = ["event", "fs", "param", "std"] }
@@ -26,6 +30,9 @@ thiserror = "2.0.21"
 wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
+# Exact: every wgpu major breaks the API. Vulkan and Metal (Linux, Android, macOS, iOS) and WGSL
+# shaders only: no GL, DX12 or browser backends yet.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl"] }
 # Exact: a pre-release; a caret would float to later betas.
 winit = { version = "=0.31.0-beta.3", default-features = false, features = ["wayland", "wayland-dlopen"] }
 zstd = { version = "0.14.3", default-features = false }
