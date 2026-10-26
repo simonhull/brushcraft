@@ -251,7 +251,7 @@ pub(super) struct Headroom {
     /// Evaluated slots one evaluation pins at most: two levels of its cone.
     pub(super) evaluated: usize,
     /// Correction slots one edit pins at most: the tiles holding copies of its vertices.
-    pub(super) corrections: usize,
+    corrections: usize,
 }
 
 impl Headroom {

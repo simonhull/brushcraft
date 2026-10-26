@@ -64,12 +64,12 @@ impl BorderValues {
 
 /// What [`update_interior`] did to a tile's interior.
 #[derive(Debug)]
-pub(super) struct InteriorPass {
+struct InteriorPass {
     /// The first row with an interior vertex written: where, in row-major order, the tile's
     /// first interior write falls (after the row's first border vertex, before its last).
-    pub(super) first_row: Option<u32>,
+    first_row: Option<u32>,
     /// The row where a vertex failed, and why: nothing after it in row-major order was written.
-    pub(super) failed: Option<(u32, CacheError)>,
+    failed: Option<(u32, CacheError)>,
 }
 
 /// Runs `f` over the interior vertices of row `j` of `view`, in order, setting what it returns
@@ -111,7 +111,7 @@ pub(super) fn refused_value(e: CorrectionError) -> CacheError {
 /// Runs `f` over every interior vertex of the tile in `slot` (`side` vertices a side), row by
 /// row in row-major order, setting what it returns, as [`TileEdit::update`] would. Stops at
 /// the first vertex that fails.
-pub(super) fn update_interior(
+fn update_interior(
     slot: &mut CorrectionSlot,
     side: u32,
     mut f: impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
@@ -144,11 +144,11 @@ pub(super) fn update_interior(
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Touched {
     /// The tile.
-    pub(super) key: TileKey,
+    key: TileKey,
     /// Its correction slot, pinned until the edit ends.
-    pub(super) id: SlotId<CorrectionSlot>,
+    id: SlotId<CorrectionSlot>,
     /// Whether a copy in it was written (it is dirty and on the feed).
-    pub(super) written: bool,
+    written: bool,
 }
 
 /// One tile's corrections being edited as part of the current op: what
@@ -160,11 +160,11 @@ pub(super) struct Touched {
 /// each one's evaluations are dropped, once.
 pub struct TileEdit<'a> {
     /// The store, borrowed for the edit.
-    pub(super) store: &'a mut TileStore,
+    store: &'a mut TileStore,
     /// The tile edited.
-    pub(super) key: TileKey,
+    key: TileKey,
     /// The op every write is recorded with.
-    pub(super) op: OpId,
+    op: OpId,
     /// The tiles holding copies touched so far, the edited tile first; empty once the edit is
     /// finished. A handful (a border vertex's copies lie in the tile's neighbours), so a linear
     /// search finds them.
@@ -200,7 +200,7 @@ impl TileEdit<'_> {
     ///
     /// [`CacheError::Internal`] if a touched slot's handle went stale (pinned slots are never
     /// freed, so this doesn't happen); every tile is unpinned and invalidated either way.
-    pub(super) fn finish(&mut self) -> Result<(), CacheError> {
+    fn finish(&mut self) -> Result<(), CacheError> {
         let touched = std::mem::take(&mut self.touched);
         let mut outcome = Ok(());
         for tile in &touched {
@@ -417,7 +417,7 @@ impl TileEdit<'_> {
     /// As [`TileEdit::set`] for a border vertex; else the interior pass's error. Whatever
     /// fails, and wherever in row-major order, a tile whose interior the pass wrote is marked
     /// written: its slot holds the pass's writes, before the failing vertex or not.
-    pub(super) fn update_border(
+    fn update_border(
         &mut self,
         pass: InteriorPass,
         f: impl FnMut(u32, u32, Vec3) -> Option<Vec3>,
@@ -537,7 +537,7 @@ impl TileEdit<'_> {
     /// # Errors
     ///
     /// [`CacheError::Internal`] for a stale handle.
-    pub(super) fn mark_own_written(&mut self) -> Result<(), CacheError> {
+    fn mark_own_written(&mut self) -> Result<(), CacheError> {
         let tile = self.touched.first_mut().ok_or(Invariant::StaleHandle)?;
         if !tile.written {
             tile.written = true;

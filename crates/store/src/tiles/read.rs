@@ -1,5 +1,8 @@
 //! Reading the store: its mesh and identity, the tiles it has cached, evaluating tiles and their
 //! normals on demand, and pinning them.
+//!
+//! Also [`WaveBounds`], the bounds a wave of normals computed on the way, which the spatial index
+//! refits from.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
