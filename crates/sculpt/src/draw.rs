@@ -303,6 +303,7 @@ pub fn draw_step(
     });
     stroke.end_dab(store);
     edit?;
+    raise_display_bounds(store, &found)?;
     times.edit = laps.lap();
 
     let changed = store.stale_after(&found.reached)?;
@@ -483,6 +484,35 @@ fn stroke_write(
         None => c.z + delta,
     };
     Some(Vec3::new(c.x, c.y, written))
+}
+
+/// Raises the bound of every display tile the step's writes can change.
+///
+/// By twice the farthest the step moved a vertex (see [`TileStore::bump_display_error`]), so
+/// the display tiles drawn until the store's refresh stay bounds.
+///
+/// The farthest is the largest delta plus the quantization step of the tiles it was written
+/// into: a stroke rounds each written value to its tile's step once, so a dab's change can
+/// exceed its delta by that much.
+///
+/// # Errors
+///
+/// As [`TileStore::bump_display_error`], and [`TileStore::correction`] for reading a tile's
+/// step.
+fn raise_display_bounds(store: &mut TileStore, found: &BrushOutput) -> Result<(), CacheError> {
+    let delta = found
+        .edits
+        .iter()
+        .flat_map(|tile| tile.deltas.iter())
+        .fold(0.0_f32, |m, d| m.max(d.abs()));
+    if delta == 0.0 {
+        return Ok(());
+    }
+    let mut step = 0.0_f32;
+    for tile in &found.edits {
+        step = step.max(store.correction(tile.key)?.scale());
+    }
+    store.bump_display_error(&found.reached, delta + step)
 }
 
 /// The vertex coordinates `(i, j)` of a tile with `side` vertices per side, in row-major order
