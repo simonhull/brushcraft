@@ -714,6 +714,10 @@ pub struct Consistency {
     /// The largest distance between two copies' positions, in units in the last place of a
     /// component.
     pub max_ulps: u64,
+    /// Shared base vertices (corners of a face) by how many tiles computed them: entry `k`
+    /// counts those held by `k` tiles (7 or more in the last), which for the corner tiles of a
+    /// face is the vertex's valence.
+    pub base_vertices: [usize; 8],
 }
 
 impl fmt::Display for Consistency {
@@ -749,14 +753,17 @@ pub fn seam_consistency(mesh: &BaseMesh, tiles: &[TileKey], evaluated: &Evaluate
             let copies =
                 mesh.topology()
                     .copies(tile.face(), tile.level(), region.x0() + i, region.y0() + j);
-            let held: Vec<(usize, geom::FaceId)> = copies
+            let mut held: Vec<(usize, geom::FaceId)> = copies
                 .iter()
                 .filter_map(|copy| {
                     let other = *slots.get(&copy.key(tile.level()))?;
                     Some((at(other, copy.i, copy.j), copy.face))
                 })
                 .collect();
-            // Each shared vertex is counted once: from the tile that holds its first copy.
+            // Each shared vertex is counted once: from the tile holding the copy that comes
+            // first in the evaluated buffers (`copies` lists them from the asking face, so its
+            // own order differs between faces).
+            held.sort_unstable();
             let Some(&(first, first_face)) = held.first() else {
                 continue;
             };
@@ -764,6 +771,14 @@ pub fn seam_consistency(mesh: &BaseMesh, tiles: &[TileKey], evaluated: &Evaluate
                 continue;
             }
             result.shared += 1;
+            let n = tile.level().face_quads();
+            let (fi, fj) = (region.x0() + i, region.y0() + j);
+            if (fi == 0 || fi == n)
+                && (fj == 0 || fj == n)
+                && let Some(count) = result.base_vertices.get_mut(held.len().min(7))
+            {
+                *count += 1;
+            }
             result.most_copies = result.most_copies.max(held.len());
             for &(other, face) in held.iter().skip(1) {
                 result.pairs += 1;

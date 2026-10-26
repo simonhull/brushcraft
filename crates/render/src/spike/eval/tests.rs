@@ -206,7 +206,13 @@ fn the_gpu_step_matches_geom_within_rounding() {
 #[test]
 fn every_vertex_tiles_share_has_the_same_bits_in_each() {
     GpuTest::run(|gpu| {
-        for ((name, fixture), meeting) in fixtures().into_iter().zip([3, 5]) {
+        // The base vertices each mesh shares between tiles, by valence: the cube sphere split
+        // twice has its 8 cube corners (3) and 18 others (4); the prism its 10 old corners (3),
+        // 20 edge and side-face points (4) and 2 cap centres (5).
+        let shared = [[0, 0, 0, 8, 18, 0, 0, 0], [0, 0, 0, 10, 20, 2, 0, 0]];
+        for (((name, fixture), meeting), base_vertices) in
+            fixtures().into_iter().zip([3, 5]).zip(shared)
+        {
             let inputs = fixture.inputs();
             let got = evaluate(gpu, &inputs);
             let consistency = seam_consistency(&fixture.mesh, inputs.tiles(), &got);
@@ -223,6 +229,10 @@ fn every_vertex_tiles_share_has_the_same_bits_in_each() {
                 consistency.most_copies >= meeting,
                 "{name}: the {meeting} tiles meeting at a base vertex are compared: {consistency}"
             );
+            assert_eq!(
+                consistency.base_vertices, base_vertices,
+                "{name}: every base vertex is compared, by valence"
+            );
         }
     });
 }
@@ -233,13 +243,26 @@ fn the_seam_check_finds_a_vertex_that_differs() {
         let (_, fixture) = fixtures().into_iter().next().expect("a fixture");
         let inputs = fixture.inputs();
         let mut got = evaluate(gpu, &inputs);
+        let flip = |evaluated: &mut Evaluated, k: usize| {
+            evaluated.positions[k][0] = f32::from_bits(evaluated.positions[k][0].to_bits() ^ 1);
+        };
         // Tile 0's vertex (64, 32) lies on its border with tile 1 of the same face.
-        let k = (32 * SIDE + 64) as usize;
-        got.positions[k][0] = f32::from_bits(got.positions[k][0].to_bits() ^ 1);
+        let same_face = (32 * SIDE + 64) as usize;
+        flip(&mut got, same_face);
         let consistency = seam_consistency(&fixture.mesh, inputs.tiles(), &got);
         assert_eq!(
-            consistency.position_mismatches, 1,
-            "one flipped bit is found: {consistency}"
+            (consistency.position_mismatches, consistency.across_faces),
+            (1, 0),
+            "one flipped bit is found, within a face: {consistency}"
+        );
+        flip(&mut got, same_face);
+        // Its vertex (32, 0) lies on the face's edge, shared with a tile of the next face.
+        flip(&mut got, 32);
+        let across = seam_consistency(&fixture.mesh, inputs.tiles(), &got);
+        assert_eq!(
+            (across.position_mismatches, across.across_faces),
+            (1, 1),
+            "one flipped bit is found, across faces: {across}"
         );
     });
 }
