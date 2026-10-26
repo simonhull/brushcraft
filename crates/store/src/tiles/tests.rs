@@ -18,6 +18,7 @@ use super::*;
 use crate::MAX_SEQ;
 use crate::fixture::meta_for;
 use crate::test_dir::TestDir;
+use crate::workers::Workers;
 
 mod differential;
 mod layered;
