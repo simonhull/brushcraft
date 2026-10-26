@@ -55,6 +55,7 @@ fn from_tiles(level: Level) -> bool {
 
 /// One tile's place in the graph.
 #[derive(Debug, Default)]
+#[cfg_attr(test, derive(PartialEq))]
 struct Node {
     /// The tile is in the evaluated pool (fresh or awaiting recomputation in place).
     resident: bool,
@@ -115,6 +116,7 @@ pub(crate) struct Cascade {
 
 /// Recorded inputs of the cached evaluated tiles, with reverse edges.
 #[derive(Debug, Default)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct DepGraph {
     /// Every tile that is resident or read by a recorded tile.
     nodes: TileMap<Node>,
@@ -132,6 +134,12 @@ impl DepGraph {
     /// Records that `key` is resident with positions predicted from `parents` (level-0 parents
     /// are skipped). Replaces whatever was recorded for its positions before; its normals, which
     /// read the old positions, are dropped.
+    ///
+    /// When the parents recorded are the same list (a tile predicted again in place: its
+    /// parents are structural), the reader edges are left as they are, instead of being
+    /// removed from each parent and added back. That is the same graph: the parents list `key`
+    /// as a reader before and after, and no parent can become garbage in between, as `key`
+    /// still reads it.
     pub(crate) fn record_positions<'a>(
         &mut self,
         key: TileKey,
@@ -143,6 +151,13 @@ impl DepGraph {
             .filter(|p| p.level() != Level::ZERO)
             .copied()
             .collect();
+        if let Some(node) = self.nodes.get_mut(&key)
+            && node.parents.as_ref() == Some(&parents)
+        {
+            node.resident = true;
+            self.untracked.remove(&key);
+            return;
+        }
         let old = self
             .nodes
             .get_mut(&key)
@@ -179,13 +194,28 @@ impl DepGraph {
     }
 
     /// Records that `key`'s slot holds normals computed from the positions of `inputs`.
+    ///
+    /// When the slot held normals (current or stale) computed from the same list of inputs (a
+    /// tile's normals brought up to date in place: the inputs are structural), they are only
+    /// marked current, instead of their reader edges being removed from each input and added
+    /// back. That is the same graph: held normals list `key` as a normal reader of each of
+    /// their inputs, before and after. (The slow way could differ only if dropping the edges
+    /// collected an input's node, which it can't while the caller holds the inputs pinned,
+    /// resident.)
     pub(crate) fn record_normals<'a>(
         &mut self,
         key: TileKey,
         inputs: impl IntoIterator<Item = &'a TileKey>,
     ) {
-        self.drop_normals(key);
         let inputs: Vec<TileKey> = inputs.into_iter().copied().collect();
+        if let Some(node) = self.nodes.get_mut(&key)
+            && node.normals.is_held()
+            && node.normal_inputs.as_ref() == Some(&inputs)
+        {
+            node.normals = Normals::Current;
+            return;
+        }
+        self.drop_normals(key);
         for &input in &inputs {
             self.node(input).normal_readers.insert(key);
         }
@@ -651,6 +681,59 @@ mod tests {
         graph.stale_normals(x, set([y]));
         assert_eq!(graph.stale_inputs(&x), None, "absent normals stay absent");
         graph.check_invariants().unwrap();
+    }
+
+    /// Recording a tile's inputs again, unchanged, leaves the graph as recording them once does.
+    ///
+    /// That is positions from the same parents and normals from the same inputs (the fast
+    /// paths): current normals stay current, stale ones become current, and absent ones get
+    /// their edges back.
+    #[test]
+    fn recording_the_same_inputs_again_changes_nothing() {
+        let (pa, pb) = (key(1, 0), key(1, 1));
+        let (x, y, z) = (key(2, 0), key(2, 1), key(2, 2));
+        let build = |again: bool| {
+            let mut graph = DepGraph::new();
+            for k in [pa, pb] {
+                graph.record_positions(k, &[]);
+            }
+            for k in [x, y, z] {
+                graph.record_positions(k, &[pa, pb]);
+                if again {
+                    graph.record_positions(k, &[pa, pb]);
+                }
+            }
+            graph.record_normals(x, &[x, y]);
+            graph.record_normals(y, &[x, y, z]);
+            graph.record_normals(z, &[y, z]);
+            if again {
+                graph.record_normals(x, &[x, y]);
+                graph.stale_normals(y, set([z]));
+                graph.record_normals(y, &[x, y, z]);
+                graph.stale_normals(z, set([z]));
+                graph.record_normals(z, &[y, z]);
+            }
+            graph.check_invariants().unwrap();
+            graph
+        };
+        let (once, twice) = (build(false), build(true));
+        assert_eq!(once, twice, "the same graph");
+        for k in [pa, pb, x, y, z] {
+            assert_eq!(once.has_normals(&k), twice.has_normals(&k), "{k:?}");
+            assert_eq!(once.stale_inputs(&k), twice.stale_inputs(&k), "{k:?}");
+            assert_eq!(once.is_read(&k), twice.is_read(&k), "{k:?}");
+        }
+        assert!(twice.has_normals(&y), "stale normals made current");
+        let (mut once, mut twice) = (once, twice);
+        once.record_positions(x, &[pa, pb]);
+        twice.record_positions(x, &[pa, pb]);
+        twice.record_positions(x, &[pa, pb]);
+        once.check_invariants().unwrap();
+        assert_eq!(
+            once, twice,
+            "positions again drop the normals once, edges kept"
+        );
+        assert!(!twice.has_normals(&x), "x's normals read its old positions");
     }
 
     #[test]
