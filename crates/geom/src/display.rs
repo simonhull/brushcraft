@@ -23,15 +23,31 @@
 //! # Normals
 //!
 //! A vertex-centred mip of *unnormalized* mean normals, a 3×3 tent per level (weights ¼ centre,
-//! ⅛ edge neighbours, 1/16 diagonal ones, renormalized where a face border cuts the tent off;
-//! [`mip_normals`]), so each level is computed from the one below. The stored normal is the
-//! normalized mean, and the mean's length is the roughness term (Toksvig), as a `u8`.
+//! ⅛ edge neighbours, 1/16 diagonal ones; [`mip_normals`]), read across face borders through
+//! the topology, so a vertex several faces share gets one mean whichever face's tile holds it.
+//! Each level is computed from the means one level finer *as stored* (decoded), so the store can
+//! bring a level up to date from the stored tiles below it and their one-vertex apron. The
+//! stored normal is the normalized mean, and the mean's length is the roughness term (Toksvig),
+//! as a `u8`.
+//!
+//! So positions are built a face at a time ([`build_positions`]: they need nothing from a
+//! neighbour), and normals a level at a time across faces ([`mip_normals`], [`build_level`]);
+//! [`build_mesh`] does both for a whole mesh.
 //!
 //! # Encoding
 //!
-//! [`DisplayCodec`] is how a tile's positions are stored; [`NormalEncoding`] how its normals are.
-//! [`build_face`] and [`DisplayTile::decode`] use one fixed choice of both (see the encoding
-//! module's notes for the candidates and why).
+//! [`build_positions`], [`build_level`] and [`DisplayTile::decode`] use one fixed encoding of
+//! positions and of normals, chosen by measurement (see the encoding module's notes for the
+//! candidates and why; they are public behind the `display-study` feature).
+
+// Without the study, the study's entry points are reachable from nowhere outside the crate.
+#![cfg_attr(
+    not(any(test, feature = "display-study")),
+    expect(
+        unreachable_pub,
+        reason = "public for the encoding study (the display-study feature) only"
+    )
+)]
 
 use thiserror::Error;
 
@@ -40,10 +56,18 @@ use crate::{Channel, EvalError, LayerId, Level, TileKey, Vec3};
 mod build;
 mod encode;
 
-pub use build::{MeanNormals, build_face, build_face_with, mip_normals, step_error, subsample};
+pub use build::{
+    FaceGrids, FacePositions, MeanNormals, build_level, build_mesh, build_positions, mip_normals,
+};
 #[cfg(any(test, feature = "display-study"))]
-pub use encode::{BaseOffsets, FixedPoint};
-pub use encode::{DisplayCodec, Interpolating, NormalEncoding, Precision};
+pub use build::{build_level_with, build_mesh_with, build_positions_with};
+#[cfg(test)]
+use build::{step_error, subsample};
+#[cfg(any(test, feature = "display-study"))]
+pub use encode::{BaseOffsets, DisplayCodec, FixedPoint, Interpolating, NormalEncoding, Precision};
+// The study's codec and normal encoding, under names of their own: public, and re-exported
+// under their own names, with the display-study feature only.
+use encode::{DisplayCodec as Codec, NormalEncoding as Normals};
 
 /// Why a display tile couldn't be built, encoded or decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -70,22 +94,31 @@ pub enum DisplayError {
     /// The key isn't a display tile's: not the base layer's [`Channel::DISPLAY`].
     #[error("{0:?} is not a display tile")]
     NotDisplay(TileKey),
+    /// A face, or a vertex of a neighbouring face's apron, wasn't supplied: the mip of normals
+    /// reads every face's means one level finer around the face.
+    #[error("a face's grid, or a neighbour's apron, was not supplied")]
+    Unavailable,
     /// The level is the finest, or above it: it has no display tiles.
     #[error("level {0} has no display tiles under the finest level")]
     NoDisplayLevel(Level),
 }
 
 impl From<EvalError> for DisplayError {
-    fn from(_: EvalError) -> Self {
-        Self::Shape
+    fn from(e: EvalError) -> Self {
+        match e {
+            EvalError::Missing { .. } => Self::Unavailable,
+            EvalError::LevelZero | EvalError::NoExactParent | EvalError::BufferSize { .. } => {
+                Self::Shape
+            }
+        }
     }
 }
 
 /// One display tile: the finest surface subsampled at a coarser tile, as decoded from its
 /// encoding, with its averaged normals, roughness and error bound.
 ///
-/// Built by [`build_face`] (all of a face's tiles at once, bound chained), or read back with
-/// [`DisplayTile::decode`] from the bytes [`DisplayTile::encoded`] gives.
+/// Built by [`build_level`] (or [`build_mesh`]), or read back with [`DisplayTile::decode`] from
+/// the bytes [`DisplayTile::encoded`] gives.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayTile {
     /// The tile: channel [`Channel::DISPLAY`](crate::Channel::DISPLAY), level below the finest.
@@ -145,7 +178,7 @@ impl DisplayTile {
         &self.encoded
     }
 
-    /// The tile `key` from bytes [`DisplayTile::encoded`] gave for a tile [`build_face`] built,
+    /// The tile `key` from bytes [`DisplayTile::encoded`] gave for a tile [`build_level`] built,
     /// with its bound `error` (stored beside them).
     ///
     /// Any level's key is accepted, the finest included: a tile doesn't know its finest level, so
@@ -158,39 +191,39 @@ impl DisplayTile {
     /// bound isn't finite and non-negative; [`DisplayError::NotFinite`] if a position decodes
     /// to a value that isn't finite.
     pub fn decode(key: TileKey, error: f32, bytes: &[u8]) -> Result<Self, DisplayError> {
-        Self::decode_with(&encode::CHOSEN, encode::CHOSEN_NORMALS, key, error, bytes)
+        decode_with(&encode::CHOSEN, encode::CHOSEN_NORMALS, key, error, bytes)
     }
+}
 
-    /// [`DisplayTile::decode`] for bytes encoded with `codec` and `normals`.
-    ///
-    /// # Errors
-    ///
-    /// As [`DisplayTile::decode`].
-    pub fn decode_with(
-        codec: &impl DisplayCodec,
-        normals: NormalEncoding,
-        key: TileKey,
-        error: f32,
-        bytes: &[u8],
-    ) -> Result<Self, DisplayError> {
-        if key.layer() != LayerId::BASE || key.channel() != Channel::DISPLAY {
-            return Err(DisplayError::NotDisplay(key));
-        }
-        if !(error.is_finite() && error >= 0.0) {
-            return Err(DisplayError::Malformed);
-        }
-        let (positions, rest) = encode::split_parts(bytes)?;
-        let positions = codec.decode(&key, positions)?.as_slice().to_vec();
-        let (normals, roughness) = normals.decode(positions.len(), rest)?;
-        Ok(Self {
-            key,
-            positions,
-            normals,
-            roughness,
-            error,
-            encoded: bytes.to_vec(),
-        })
+/// [`DisplayTile::decode`] for bytes encoded with `codec` and `normals`.
+///
+/// # Errors
+///
+/// As [`DisplayTile::decode`].
+pub fn decode_with(
+    codec: &impl Codec,
+    normals: Normals,
+    key: TileKey,
+    error: f32,
+    bytes: &[u8],
+) -> Result<DisplayTile, DisplayError> {
+    if key.layer() != LayerId::BASE || key.channel() != Channel::DISPLAY {
+        return Err(DisplayError::NotDisplay(key));
     }
+    if !(error.is_finite() && error >= 0.0) {
+        return Err(DisplayError::Malformed);
+    }
+    let (positions, rest) = encode::split_parts(bytes)?;
+    let positions = codec.decode(&key, positions)?;
+    let (normals, roughness) = normals.decode(&positions, rest)?;
+    Ok(DisplayTile {
+        key,
+        positions: positions.as_slice().to_vec(),
+        normals,
+        roughness,
+        error,
+        encoded: bytes.to_vec(),
+    })
 }
 
 #[cfg(test)]

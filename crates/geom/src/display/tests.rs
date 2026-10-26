@@ -171,14 +171,23 @@ fn step_error_is_the_largest_distance_to_the_triangulated_coarser_surface() {
     );
 }
 
-/// Unit normals that all agree mip to unit means at every level, face border included (where
-/// the tent is cut off and renormalized); normals that alternate shorten the mean.
+/// Unit normals that all agree mip to unit means, at every vertex, face corners of valence 3
+/// included (the tent's weights sum to 1 at any valence); normals that alternate shorten the
+/// mean.
 #[test]
 fn the_normals_mip_keeps_agreement_and_shortens_disagreement() {
+    let mesh = cube_sphere(1).unwrap();
     let up = Vec3::new(0.0, 0.0, 1.0);
-    let mut means = MeanNormals::from_unit(grid(17, |_, _| up));
-    while means.side() > 2 {
-        means = mip_normals(&means).unwrap();
+    let all = |f: &dyn Fn(u32, u32) -> Vec3| {
+        let mut grids = FaceGrids::new(level(4));
+        for face in mesh.faces() {
+            grids.insert(face, grid(17, f)).unwrap();
+        }
+        grids
+    };
+    let agreeing = all(&|_, _| up);
+    for face in mesh.faces() {
+        let means = mip_normals(&mesh, &agreeing, face, level(3)).unwrap();
         for m in means.as_slice() {
             assert!(
                 (m.length() - 1.0).abs() < 1e-6,
@@ -186,21 +195,30 @@ fn the_normals_mip_keeps_agreement_and_shortens_disagreement() {
             );
         }
     }
-    let tilted = |i: u32| {
+    let tilted = |i: u32, _: u32| {
         if i.is_multiple_of(2) {
             Vec3::new(0.6, 0.0, 0.8)
         } else {
             Vec3::new(-0.6, 0.0, 0.8)
         }
     };
-    let rough = mip_normals(&MeanNormals::from_unit(grid(9, |i, _| tilted(i)))).unwrap();
-    for m in rough.as_slice() {
-        assert!(
-            m.length() < 0.95,
-            "alternating normals average shorter: {m:?}"
-        );
-        assert!(m.z > 0.79, "but still point up: {m:?}");
+    let alternating = all(&tilted);
+    let means = mip_normals(&mesh, &alternating, FaceId::new(0), level(3)).unwrap();
+    for j in 1..8 {
+        for i in 1..8 {
+            let m = means.as_slice()[usize::try_from(j * 9 + i).unwrap()];
+            assert!(
+                m.length() < 0.95,
+                "alternating normals average shorter: {m:?}"
+            );
+            assert!(m.z > 0.79, "but still point up: {m:?}");
+        }
     }
+    assert_eq!(
+        mip_normals(&mesh, &FaceGrids::new(level(4)), FaceId::new(0), level(3)).map(|_| ()),
+        Err(DisplayError::Unavailable),
+        "no means one level finer"
+    );
 }
 
 /// Every standalone codec decodes what it encoded to the same bits each time, with exact borders.
@@ -287,24 +305,49 @@ pub(crate) fn angle_degrees(a: Vec3, b: Vec3) -> f64 {
     sin.atan2(ax * bx + ay * by + az * bz).to_degrees()
 }
 
-/// Octahedral normals come back within their precision's angle, roughness exactly.
+/// Every normal encoding comes back within its precision's angle, roughness exactly, and
+/// rejects bytes for another tile size.
+///
+/// Octahedral normals are random; predicted ones lie within 5° of the tile's own surface
+/// normal, as averaged normals do (a tile whose normals stray past 60° falls back to octahedral,
+/// checked with the random normals).
 #[test]
 fn normals_round_trip_within_their_precision() {
+    let positions = grid(45, patch);
+    let count = positions.as_slice().len();
     let mut rng = Rng::new(7);
-    let normals: Vec<Vec3> = (0..2000)
+    let random: Vec<Vec3> = (0..count)
         .map(|_| {
             rng.vec3(1.0)
                 .normalized()
                 .unwrap_or(Vec3::new(0.0, 0.0, -1.0))
         })
         .collect();
-    let roughness: Vec<u8> = (0..2000).map(|n| u8::try_from(n % 256).unwrap()).collect();
-    for (encoding, limit_degrees) in [
-        (NormalEncoding::Oct16, 0.01_f64),
-        (NormalEncoding::Oct8, 1.5),
-    ] {
-        let bytes = encoding.encode(&normals, &roughness).unwrap();
-        let (back, rough) = encoding.decode(normals.len(), &bytes).unwrap();
+    let surface = |i: u32, j: u32| {
+        let at = |x: u32, y: u32| positions.get(x.min(44), y.min(44)).unwrap();
+        let du = at(i + 1, j) - at(i.saturating_sub(1), j);
+        let dv = at(i, j + 1) - at(i, j.saturating_sub(1));
+        du.cross(dv).normalized().unwrap()
+    };
+    let near: Vec<Vec3> = (0..45)
+        .flat_map(|j| (0..45).map(move |i| (i, j)))
+        .map(|(i, j)| (surface(i, j) + rng.vec3(0.04)).normalized().unwrap())
+        .collect();
+    let roughness: Vec<u8> = (0..count).map(|n| u8::try_from(n % 256).unwrap()).collect();
+    let cases = [
+        (NormalEncoding::Octahedral(6), &random, 5.0_f64),
+        (NormalEncoding::Octahedral(8), &random, 1.3),
+        (NormalEncoding::Octahedral(10), &random, 0.33),
+        (NormalEncoding::Octahedral(12), &random, 0.085),
+        (NormalEncoding::Octahedral(16), &random, 0.006),
+        (NormalEncoding::Predicted(8), &near, 0.1),
+        (NormalEncoding::Predicted(10), &near, 0.085),
+        (NormalEncoding::Predicted(12), &near, 0.085),
+        (NormalEncoding::Predicted(10), &random, 0.085),
+    ];
+    for (encoding, normals, limit_degrees) in cases {
+        let bytes = encoding.encode(normals, &roughness, &positions).unwrap();
+        let (back, rough) = encoding.decode(&positions, &bytes).unwrap();
         assert_eq!(rough, roughness, "{encoding:?}: roughness exact");
         let worst = normals
             .iter()
@@ -313,11 +356,18 @@ fn normals_round_trip_within_their_precision() {
             .fold(0.0_f64, f64::max);
         assert!(worst < limit_degrees, "{encoding:?}: {worst}°");
         assert_eq!(
-            encoding.decode(normals.len() + 1, &bytes).map(|_| ()),
+            encoding.decode(&grid(46, patch), &bytes).map(|_| ()),
             Err(DisplayError::Malformed),
-            "{encoding:?}: too few bytes"
+            "{encoding:?}: bytes for a smaller tile"
         );
     }
+    assert_eq!(
+        NormalEncoding::Octahedral(17)
+            .encode(&random, &roughness, &positions)
+            .map(|_| ()),
+        Err(DisplayError::Shape),
+        "more bits than an i16"
+    );
 }
 
 /// A sculpt: the mesh, its evaluation to [`FINEST`] with the corrections, and a face's finest
@@ -383,6 +433,18 @@ impl Sculpt {
         (positions, unit)
     }
 
+    /// Every face's finest positions and unit normals.
+    fn finest_grids(&self) -> (FaceGrids, FaceGrids) {
+        let (mut positions, mut normals) =
+            (FaceGrids::new(level(FINEST)), FaceGrids::new(level(FINEST)));
+        for face in self.mesh.faces() {
+            let (p, n) = self.finest(face);
+            positions.insert(face, p).unwrap();
+            normals.insert(face, n).unwrap();
+        }
+        (positions, normals)
+    }
+
     /// `face`'s base grids at every level below the finest, for [`BaseOffsets`].
     fn base(&self, face: FaceId) -> Vec<Grid> {
         (0..FINEST)
@@ -391,11 +453,11 @@ impl Sculpt {
     }
 }
 
-/// `face`'s display tiles built with every codec, by codec name.
-fn every_build(sculpt: &Sculpt, face: FaceId) -> Vec<(&'static str, Vec<DisplayTile>)> {
-    let (positions, unit) = sculpt.finest(face);
+/// `face`'s display positions built with every codec, by codec name.
+fn every_build(sculpt: &Sculpt, face: FaceId) -> Vec<(&'static str, FacePositions)> {
+    let (positions, _) = sculpt.finest(face);
     let base = sculpt.base(face);
-    let with = |codec: &dyn ErasedCodec| codec.build(face, &positions, &unit);
+    let with = |codec: &dyn ErasedCodec| codec.positions(face, &positions);
     vec![
         ("lossless", with(&Interpolating::new(Precision::Lossless))),
         ("bits16", with(&Interpolating::new(Precision::Bits16))),
@@ -412,32 +474,26 @@ fn every_build(sculpt: &Sculpt, face: FaceId) -> Vec<(&'static str, Vec<DisplayT
     ]
 }
 
-/// [`build_face_with`] behind a trait object, so the tests can list codecs of different types.
+/// [`build_positions_with`] behind a trait object, so the tests can list codecs of different
+/// types.
 trait ErasedCodec {
-    /// `face`'s display tiles with this codec and 16-bit normals.
-    fn build(&self, face: FaceId, positions: &Grid, unit: &Grid) -> Vec<DisplayTile>;
+    /// `face`'s display positions with this codec.
+    fn positions(&self, face: FaceId, positions: &Grid) -> FacePositions;
 }
 
 impl<C: DisplayCodec> ErasedCodec for C {
-    fn build(&self, face: FaceId, positions: &Grid, unit: &Grid) -> Vec<DisplayTile> {
-        build_face_with(
-            self,
-            NormalEncoding::Oct16,
-            face,
-            positions,
-            unit,
-            level(FINEST),
-        )
-        .unwrap()
+    fn positions(&self, face: FaceId, positions: &Grid) -> FacePositions {
+        build_positions_with(self, face, positions, level(FINEST)).unwrap()
     }
 }
 
-/// The surface tile `tile` draws at the point `at` of its own grid (in quads, fractional).
+/// The surface a tile with decoded positions `tile` draws at the point `at` of its own grid (in
+/// quads, fractional).
 ///
 /// That is, in `f64`, its decoded positions on the two triangles of the quad holding the point,
 /// split along the `(i, j)`–`(i + 1, j + 1)` diagonal.
-fn drawn(tile: &DisplayTile, (along, up): (f64, f64)) -> [f64; 3] {
-    let side = tile.key().side();
+fn drawn(tile: &Grid, (along, up): (f64, f64)) -> [f64; 3] {
+    let side = tile.side();
     let quads = f64::from(side - 1);
     let qi = along.floor().min(quads - 1.0);
     let qj = up.floor().min(quads - 1.0);
@@ -449,10 +505,7 @@ fn drawn(tile: &DisplayTile, (along, up): (f64, f64)) -> [f64; 3] {
     )]
     let (qi, qj) = (qi as u32, qj as u32);
     let at = |i: u32, j: u32| {
-        let p = *tile
-            .positions()
-            .get(usize::try_from(j * side + i).unwrap())
-            .unwrap();
+        let p = tile.get(i, j).unwrap();
         [f64::from(p.x), f64::from(p.y), f64::from(p.z)]
     };
     let (p00, p10, p01, p11) = (
@@ -473,66 +526,77 @@ fn drawn(tile: &DisplayTile, (along, up): (f64, f64)) -> [f64; 3] {
     out
 }
 
-/// Checks the bound for every tile of `tiles` (one face's, from one codec), and returns how many
-/// vertex checks ran.
+/// Checks the bound for every display tile of a face's `positions` (from one codec), and
+/// returns how many vertex checks ran.
 ///
 /// Every finest vertex under a tile lies within its `e` of the surface it draws, `e` never grows
 /// toward finer levels, and the finest level's parents' `e` is their own step's error alone (the
 /// finest level is exact).
-fn check_bound(name: &str, tiles: &[DisplayTile], finest: &Grid) -> usize {
-    let by_key: BTreeMap<TileKey, &DisplayTile> = tiles.iter().map(|t| (*t.key(), t)).collect();
+fn check_bound(name: &str, positions: &FacePositions, finest: &Grid) -> usize {
     let mut checks = 0;
-    for tile in tiles {
-        let key = tile.key();
-        let shift = FINEST - key.level().get();
-        let scale = f64::from(1_u32 << shift);
-        let region = Region::of_tile(key);
-        let bound = f64::from(tile.error());
-        // The test's own `f64` rounding, far below an `f32` step of `e`.
-        let allowed = bound + bound * 1e-12;
-        for y in (region.y0() << shift)..=((region.y0() + region.quads()) << shift) {
-            for x in (region.x0() << shift)..=((region.x0() + region.quads()) << shift) {
-                let point = finest.get(x, y).unwrap();
-                let at = (
-                    f64::from(x) / scale - f64::from(region.x0()),
-                    f64::from(y) / scale - f64::from(region.y0()),
+    for l in 0..FINEST {
+        let decoded = positions.decoded(level(l)).unwrap();
+        let per_side = u16::try_from(level(l).tiles_per_side()).unwrap();
+        for (tx, ty) in (0..per_side).flat_map(|ty| (0..per_side).map(move |tx| (tx, ty))) {
+            let key = TileKey::display(positions.face(), level(l), tx, ty).unwrap();
+            let region = Region::of_tile(&key);
+            let tile = grid(key.side(), |i, j| {
+                decoded.get(region.x0() + i, region.y0() + j).unwrap()
+            });
+            let error = positions.error(&key).unwrap();
+            checks += check_tile(name, &key, &tile, error, finest);
+            if let Some(finer) = key.level().child().filter(|f| f.get() < FINEST) {
+                let ratio = finer.tiles_per_side() / key.level().tiles_per_side();
+                for dy in 0..ratio {
+                    for dx in 0..ratio {
+                        let cx = u16::try_from(u32::from(tx) * ratio + dx).unwrap();
+                        let cy = u16::try_from(u32::from(ty) * ratio + dy).unwrap();
+                        let child = TileKey::display(key.face(), finer, cx, cy).unwrap();
+                        let below = positions.error(&child).unwrap();
+                        assert!(error >= below, "{name}: e grows from {key:?} to {child:?}");
+                    }
+                }
+            } else {
+                let own = step_error_at_tile(finest, &region, &tile);
+                assert_eq!(
+                    error, own,
+                    "{name}: {key:?} above the finest is its step alone"
                 );
-                let surface = drawn(tile, at);
-                let gap = [
-                    f64::from(point.x) - surface[0],
-                    f64::from(point.y) - surface[1],
-                    f64::from(point.z) - surface[2],
-                ];
-                let dist = gap.iter().map(|g| g * g).sum::<f64>().sqrt();
-                assert!(
-                    dist <= allowed,
-                    "{name}: {key:?} finest ({x}, {y}) is {dist} from the drawn surface, e = {bound}"
-                );
-                checks += 1;
             }
         }
-        if let Some(finer) = key.level().child().filter(|l| l.get() < FINEST) {
-            let ratio = finer.tiles_per_side() / key.level().tiles_per_side();
-            for dy in 0..ratio {
-                for dx in 0..ratio {
-                    let tx = u16::try_from(u32::from(key.tx()) * ratio + dx).unwrap();
-                    let ty = u16::try_from(u32::from(key.ty()) * ratio + dy).unwrap();
-                    let child = by_key[&TileKey::display(key.face(), finer, tx, ty).unwrap()];
-                    assert!(
-                        tile.error() >= child.error(),
-                        "{name}: e grows from {key:?} to {:?}",
-                        child.key()
-                    );
-                }
-            }
-        } else {
-            let grid = Grid::new(key.side(), tile.positions().to_vec()).unwrap();
-            let own = step_error_at_tile(finest, &region, &grid);
-            assert_eq!(
-                tile.error(),
-                own,
-                "{name}: {key:?} above the finest is its step alone"
+    }
+    checks
+}
+
+/// Checks that every finest vertex under tile `key` (decoded positions `tile`, bound `error`)
+/// lies within `error` of the surface it draws; returns how many vertices it checked.
+fn check_tile(name: &str, key: &TileKey, tile: &Grid, error: f32, finest: &Grid) -> usize {
+    let shift = FINEST - key.level().get();
+    let scale = f64::from(1_u32 << shift);
+    let region = Region::of_tile(key);
+    let bound = f64::from(error);
+    // The test's own `f64` rounding, far below an `f32` step of `e`.
+    let allowed = bound + bound * 1e-12;
+    let mut checks = 0;
+    for y in (region.y0() << shift)..=((region.y0() + region.quads()) << shift) {
+        for x in (region.x0() << shift)..=((region.x0() + region.quads()) << shift) {
+            let point = finest.get(x, y).unwrap();
+            let at = (
+                f64::from(x) / scale - f64::from(region.x0()),
+                f64::from(y) / scale - f64::from(region.y0()),
             );
+            let surface = drawn(tile, at);
+            let gap = [
+                f64::from(point.x) - surface[0],
+                f64::from(point.y) - surface[1],
+                f64::from(point.z) - surface[2],
+            ];
+            let dist = gap.iter().map(|g| g * g).sum::<f64>().sqrt();
+            assert!(
+                dist <= allowed,
+                "{name}: {key:?} finest ({x}, {y}) is {dist} from the drawn surface, e = {bound}"
+            );
+            checks += 1;
         }
     }
     checks
@@ -570,8 +634,8 @@ fn the_bound_holds_for_random_sculpts() {
             let sculpt = Sculpt::random(seed);
             let face = FaceId::new(u32::from(face % 6));
             let (finest, _) = sculpt.finest(face);
-            for (name, tiles) in every_build(&sculpt, face) {
-                let checks = check_bound(name, &tiles, &finest);
+            for (name, positions) in every_build(&sculpt, face) {
+                let checks = check_bound(name, &positions, &finest);
                 assert!(checks > 0, "{name}: something was checked");
             }
             BOUND_RUN.fetch_add(1, Ordering::Relaxed);
@@ -579,68 +643,104 @@ fn the_bound_holds_for_random_sculpts() {
     assert!(BOUND_RUN.load(Ordering::Relaxed) >= 1, "cases ran");
 }
 
-/// The chosen encoding and [`FixedPoint`] decode every vertex two display tiles share to the
-/// same bits in both.
+/// Bolero cases `shared_vertices_decode_identically_across_tiles_and_faces` runs.
+const SEAM_CASES: usize = 12;
+
+/// Every normal encoding the study measures, with the chosen positions.
+const ENCODINGS: [NormalEncoding; 8] = [
+    NormalEncoding::Octahedral(6),
+    NormalEncoding::Octahedral(8),
+    NormalEncoding::Octahedral(10),
+    NormalEncoding::Octahedral(12),
+    NormalEncoding::Octahedral(16),
+    NormalEncoding::Predicted(8),
+    NormalEncoding::Predicted(10),
+    NormalEncoding::Predicted(12),
+];
+
+/// Every vertex two display tiles share decodes to the same position, normal and roughness
+/// bits in both.
 ///
-/// That holds across tile borders and across faces: seams are exact without reading a
-/// neighbour.
+/// Across tile borders and across faces, for random sculpts and every normal encoding: seams
+/// are exact in shape and in shading, without reading a neighbour at draw time.
 #[test]
 fn shared_vertices_decode_identically_across_tiles_and_faces() {
-    let sculpt = Sculpt::random(11);
-    let faces: Vec<FaceId> = sculpt.mesh.faces().collect();
-    let builds: [(&str, &dyn ErasedCodec); 2] =
-        [("chosen", &encode::CHOSEN), ("fixed", &FixedPoint)];
-    for (name, codec) in builds {
-        let mut tiles: BTreeMap<TileKey, DisplayTile> = BTreeMap::new();
-        for &face in &faces {
-            let (positions, unit) = sculpt.finest(face);
-            for tile in codec.build(face, &positions, &unit) {
-                tiles.insert(*tile.key(), tile);
+    bolero::check!()
+        .with_type::<u64>()
+        .with_iterations(SEAM_CASES)
+        .for_each(|&seed| {
+            let sculpt = Sculpt::random(seed);
+            let (positions, normals) = sculpt.finest_grids();
+            for encoding in ENCODINGS {
+                let tiles: BTreeMap<TileKey, DisplayTile> = build_mesh_with(
+                    &encode::CHOSEN,
+                    encoding,
+                    &sculpt.mesh,
+                    &positions,
+                    &normals,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|t| (*t.key(), t))
+                .collect();
+                let shared = compare_shared(&sculpt.mesh, &tiles);
+                assert!(shared > 0, "{encoding:?}: shared vertices were compared");
             }
-        }
-        let mut shared = 0;
-        for tile in tiles.values() {
-            let key = tile.key();
-            let region = Region::of_tile(key);
-            for (i, j) in border(key.side()) {
-                let mine = tile.positions()[usize::try_from(j * key.side() + i).unwrap()];
-                let copies = sculpt.mesh.topology().copies(
-                    key.face(),
-                    key.level(),
-                    region.x0() + i,
-                    region.y0() + j,
-                );
-                for copy in &copies {
-                    let other = &tiles[&copy.key_in(LayerId::BASE, Channel::DISPLAY, key.level())];
-                    let side = other.key().side();
-                    let theirs =
-                        other.positions()[usize::try_from(copy.j * side + copy.i).unwrap()];
-                    assert_eq!(
-                        mine.to_bits(),
-                        theirs.to_bits(),
-                        "{name}: {key:?} ({i}, {j}) against {:?}",
-                        other.key()
-                    );
-                    shared += 1;
-                }
-            }
-        }
-        assert!(shared > 0, "{name}: shared vertices were compared");
-    }
+        });
 }
 
-/// A tile [`build_face`] built reads back from its bytes bit for bit, and its bytes say the same
+/// Compares every shared vertex of `tiles` (every display tile of `mesh`) across the tiles that
+/// hold it; returns how many pairs it compared.
+fn compare_shared(mesh: &BaseMesh, tiles: &BTreeMap<TileKey, DisplayTile>) -> usize {
+    let mut shared = 0;
+    for tile in tiles.values() {
+        let key = tile.key();
+        let region = Region::of_tile(key);
+        for (i, j) in border(key.side()) {
+            let mine = usize::try_from(j * key.side() + i).unwrap();
+            let copies =
+                mesh.topology()
+                    .copies(key.face(), key.level(), region.x0() + i, region.y0() + j);
+            for copy in &copies {
+                let other = &tiles[&copy.key_in(LayerId::BASE, Channel::DISPLAY, key.level())];
+                let theirs = usize::try_from(copy.j * other.key().side() + copy.i).unwrap();
+                let what = || format!("{key:?} ({i}, {j}) against {:?}", other.key());
+                assert_eq!(
+                    tile.positions()[mine].to_bits(),
+                    other.positions()[theirs].to_bits(),
+                    "position of {}",
+                    what()
+                );
+                assert_eq!(
+                    tile.normals()[mine].to_bits(),
+                    other.normals()[theirs].to_bits(),
+                    "normal of {}",
+                    what()
+                );
+                assert_eq!(
+                    tile.roughness()[mine],
+                    other.roughness()[theirs],
+                    "roughness of {}",
+                    what()
+                );
+                shared += 1;
+            }
+        }
+    }
+    shared
+}
+
+/// A tile [`build_mesh`] built reads back from its bytes bit for bit, and its bytes say the same
 /// again: the store can keep only the bytes and the bound.
 #[test]
 fn a_built_tile_reads_back_from_its_bytes() {
     let sculpt = Sculpt::random(3);
-    let face = FaceId::new(2);
-    let (positions, unit) = sculpt.finest(face);
-    let tiles = build_face(face, &positions, &unit, level(FINEST)).unwrap();
+    let (positions, normals) = sculpt.finest_grids();
+    let tiles = build_mesh(&sculpt.mesh, &positions, &normals).unwrap();
     assert_eq!(
         tiles.len(),
-        usize::from(FINEST - 1) + 4,
-        "levels 0–6 a tile each, level 7 four"
+        6 * (usize::from(FINEST - 1) + 4),
+        "per face, levels 0–6 a tile each, level 7 four"
     );
     for tile in &tiles {
         let back = DisplayTile::decode(*tile.key(), tile.error(), tile.encoded()).unwrap();
@@ -652,16 +752,23 @@ fn a_built_tile_reads_back_from_its_bytes() {
         Err(DisplayError::Malformed),
         "a bound that isn't one"
     );
+    let face = first.key().face();
     let displacement = TileKey::displacement(face, first.key().level(), 0, 0).unwrap();
     assert_eq!(
         DisplayTile::decode(displacement, first.error(), first.encoded()).map(|_| ()),
         Err(DisplayError::NotDisplay(displacement)),
         "a key of another channel"
     );
+    let finest = positions.get(face).unwrap();
     assert_eq!(
-        build_face(face, &unit, &positions, level(FINEST - 1)).map(|_| ()),
+        build_positions(face, finest, level(FINEST - 1)).map(|_| ()),
         Err(DisplayError::Shape),
-        "grids of the wrong level"
+        "a grid of the wrong level"
+    );
+    assert_eq!(
+        build_mesh(&sculpt.mesh, &positions, &FaceGrids::new(level(FINEST))).map(|_| ()),
+        Err(DisplayError::Unavailable),
+        "no normals"
     );
 }
 
@@ -691,15 +798,8 @@ impl DisplayCodec for BrokenSeams {
 fn a_codec_breaking_seams_is_refused() {
     let sculpt = Sculpt::random(5);
     let face = FaceId::new(1);
-    let (positions, unit) = sculpt.finest(face);
-    let built = build_face_with(
-        &BrokenSeams,
-        NormalEncoding::Oct16,
-        face,
-        &positions,
-        &unit,
-        level(FINEST),
-    );
+    let (positions, _) = sculpt.finest(face);
+    let built = build_positions_with(&BrokenSeams, face, &positions, level(FINEST));
     assert_eq!(
         built.map(|_| ()),
         Err(DisplayError::Seam(

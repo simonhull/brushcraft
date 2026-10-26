@@ -1,14 +1,21 @@
-//! Building display tiles from the finest level: subsampling, the error a level adds, the
-//! normals' mip, and a whole face's tiles with their bounds chained.
+//! Building display tiles from the finest level.
+//!
+//! Subsampling, the error a level adds and its chained bound (positions, a face at a time), the
+//! normals' mip across faces (a level at a time), and the two joined into tiles.
 
-use super::encode::{self, CHOSEN, CHOSEN_NORMALS};
-use super::{DisplayCodec, DisplayError, DisplayTile, NormalEncoding};
-use crate::{FaceId, Grid, Level, Region, TileKey, Vec3};
+use std::collections::BTreeMap;
+
+use super::encode::{self, CHOSEN, CHOSEN_NORMALS, DisplayCodec, NormalEncoding, mean_of, shade};
+use super::{DisplayError, DisplayTile};
+use crate::eval::gather;
+use crate::subdiv::{CornerRing, Padded};
+use crate::{BaseMesh, FaceId, Grid, Level, PositionSource, Region, TileKey, Vec3};
 
 /// Unnormalized mean normals over a face's grid at one level, row-major `side²`.
 ///
-/// Each is the mean of the finest unit normals under its vertex, through [`mip_normals`]'s tent.
-/// Their length is at most 1, and less where the normals under a vertex disagree.
+/// Each is the tent of the means one level finer around its vertex ([`mip_normals`]), down from
+/// the finest unit normals. Their length is at most 1, and less where the normals under a vertex
+/// disagree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeanNormals {
     /// The means, as a grid of vectors.
@@ -32,6 +39,67 @@ impl MeanNormals {
     #[must_use]
     pub fn as_slice(&self) -> &[Vec3] {
         self.grid.as_slice()
+    }
+
+    /// The means as a grid, for a [`FaceGrids`] of a level's means.
+    #[must_use]
+    pub fn into_grid(self) -> Grid {
+        self.grid
+    }
+}
+
+/// Whole-face grids of several faces at one level, read as a [`PositionSource`]: a level's
+/// finest positions or normals, or its mean normals, for [`mip_normals`] and [`build_mesh`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FaceGrids {
+    /// The level.
+    level: Level,
+    /// Each face's grid.
+    grids: BTreeMap<FaceId, Grid>,
+}
+
+impl FaceGrids {
+    /// An empty set at `level`.
+    #[must_use]
+    pub const fn new(level: Level) -> Self {
+        Self {
+            level,
+            grids: BTreeMap::new(),
+        }
+    }
+
+    /// The level.
+    #[must_use]
+    pub const fn level(&self) -> Level {
+        self.level
+    }
+
+    /// Sets `face`'s grid, returning the one it replaces.
+    ///
+    /// # Errors
+    ///
+    /// [`DisplayError::Shape`] unless `grid` is a whole face at the set's level.
+    pub fn insert(&mut self, face: FaceId, grid: Grid) -> Result<Option<Grid>, DisplayError> {
+        if grid.side() == self.level.face_quads() + 1 {
+            Ok(self.grids.insert(face, grid))
+        } else {
+            Err(DisplayError::Shape)
+        }
+    }
+
+    /// `face`'s grid, if the set holds it.
+    #[must_use]
+    pub fn get(&self, face: FaceId) -> Option<&Grid> {
+        self.grids.get(&face)
+    }
+}
+
+impl PositionSource for FaceGrids {
+    fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+        if level != self.level {
+            return None;
+        }
+        self.grids.get(&face)?.get(i, j)
     }
 }
 
@@ -59,7 +127,7 @@ fn halved(side: u32) -> Option<u32> {
 ///
 /// [`DisplayError::Shape`] if `finer` has no coarser grid nested in it (its quads per side
 /// aren't even and at least 2).
-pub fn subsample(finer: &Grid) -> Result<Grid, DisplayError> {
+pub(crate) fn subsample(finer: &Grid) -> Result<Grid, DisplayError> {
     let side = halved(finer.side()).ok_or(DisplayError::Shape)?;
     let data = cells(side)
         .map(|(i, j)| finer.get(2 * i, 2 * j).ok_or(DisplayError::Shape))
@@ -84,7 +152,8 @@ pub fn subsample(finer: &Grid) -> Result<Grid, DisplayError> {
 /// # Errors
 ///
 /// [`DisplayError::Shape`] unless `finer`'s side is `2 × (coarser's − 1) + 1`.
-pub fn step_error(finer: &Grid, coarser: &Grid) -> Result<f32, DisplayError> {
+#[cfg(test)]
+pub(crate) fn step_error(finer: &Grid, coarser: &Grid) -> Result<f32, DisplayError> {
     let quads = coarser.side().checked_sub(1).ok_or(DisplayError::Shape)?;
     if finer.side() != 2 * quads + 1 {
         return Err(DisplayError::Shape);
@@ -202,51 +271,79 @@ fn round_up(v: f64) -> Result<f32, DisplayError> {
     }
 }
 
-/// The weight of each 3×3 tent neighbour, in sixteenths, by `(di, dj)` from the centre.
-const fn tent_weight(di: i64, dj: i64) -> f32 {
-    match (di == 0, dj == 0) {
-        (true, true) => 4.0,
-        (true, false) | (false, true) => 2.0,
-        (false, false) => 1.0,
-    }
-}
-
-/// The mean normals one level coarser, through a 3×3 tent.
+/// The mean normals of `face` at `level`, from every face's means one level finer in `finer`:
+/// at each vertex, a 3×3 tent over the finer level's vertex there and its neighbours, read
+/// across face borders.
 ///
-/// At each coarse vertex `(i, j)`, the tent is over
-/// `finer`'s `(2i + di, 2j + dj)`, weights ¼ at the centre, ⅛ at edge neighbours and 1/16 at
-/// diagonal ones. Where the face's border cuts the tent off, the weights present are
-/// renormalized to sum to 1. The means stay unnormalized, so their length still says how much
-/// the normals under them agree.
+/// The tent weighs the vertex ¼, its edge neighbours ⅛ and its diagonal ones 1/16. At a base
+/// vertex (a face corner) of valence `n`, it is the vertex ¼, each of its `n` edge neighbours
+/// `1/(2n)` and each of its `n` diagonal ones `1/(4n)`, summed in the ring's canonical order.
+/// Every read goes to the vertex's owner copy, and the tent pairs opposite neighbours
+/// symmetrically, so a vertex several faces share gets the same bits from every one of them.
+/// The means stay unnormalized, so their length still says how much the normals under them
+/// agree.
+///
+/// `finer` holds level `level + 1` of `face`, the one-vertex apron around it on its neighbours,
+/// and the rings of its corners' base vertices; [`FaceGrids`] of every face does.
 ///
 /// # Errors
 ///
-/// [`DisplayError::Shape`] if `finer` has no coarser grid nested in it.
-pub fn mip_normals(finer: &MeanNormals) -> Result<MeanNormals, DisplayError> {
-    let side = halved(finer.side()).ok_or(DisplayError::Shape)?;
-    let fine = &finer.grid;
+/// [`DisplayError::Unavailable`] if `finer` lacks a vertex the tents read;
+/// [`DisplayError::NoDisplayLevel`] at the deepest level (nothing finer);
+/// [`DisplayError::NotFinite`] if a mean isn't finite.
+pub fn mip_normals(
+    mesh: &BaseMesh,
+    finer: &impl PositionSource,
+    face: FaceId,
+    level: Level,
+) -> Result<MeanNormals, DisplayError> {
+    let finer_level = level.child().ok_or(DisplayError::NoDisplayLevel(level))?;
+    let gathered = gather(mesh, finer, Region::whole_face(face, finer_level))?;
+    let quads = finer_level.face_quads();
+    let side = level.face_quads() + 1;
     let data = cells(side)
         .map(|(i, j)| {
-            let (ci, cj) = (i64::from(2 * i), i64::from(2 * j));
-            let mut sum = Vec3::ZERO;
-            let mut weight = 0.0_f32;
-            for (di, dj) in (-1..=1).flat_map(|dj| (-1..=1).map(move |di| (di, dj))) {
-                let neighbour = u32::try_from(ci + di)
-                    .ok()
-                    .zip(u32::try_from(cj + dj).ok())
-                    .and_then(|(x, y)| fine.get(x, y));
-                if let Some(n) = neighbour {
-                    let w = tent_weight(di, dj);
-                    sum = sum + n * w;
-                    weight += w;
-                }
+            let (x, y) = (2 * i, 2 * j);
+            let corner = match (x, y) {
+                (0, 0) => Some(0),
+                (_, 0) if x == quads => Some(1),
+                _ if x == quads && y == quads => Some(2),
+                (0, _) if y == quads => Some(3),
+                _ => None,
+            };
+            let mean = match corner.and_then(|c| gathered.corners.get(c)?.as_ref()) {
+                Some(ring) => ring_tent(ring),
+                None => grid_tent(&gathered.padded, i64::from(x), i64::from(y)),
+            };
+            if mean.is_finite() {
+                Ok(mean)
+            } else {
+                Err(DisplayError::NotFinite)
             }
-            sum * weight.recip()
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(MeanNormals {
         grid: Grid::new(side, data)?,
     })
+}
+
+/// The tent at `(x, y)` of a padded block away from base vertices.
+///
+/// Opposite neighbours are summed in pairs and the pairs together, so the bits don't depend on
+/// which way the face's grid runs (any rotation or reflection maps each pair to a pair).
+fn grid_tent(padded: &Padded, x: i64, y: i64) -> Vec3 {
+    let at = |dx: i64, dy: i64| padded.get(x + dx, y + dy);
+    let edges = (at(-1, 0) + at(1, 0)) + (at(0, -1) + at(0, 1));
+    let diagonals = (at(-1, -1) + at(1, 1)) + (at(1, -1) + at(-1, 1));
+    (at(0, 0) * 4.0 + edges * 2.0 + diagonals) * (1.0 / 16.0)
+}
+
+/// The tent at a base vertex: the vertex ¼, each edge neighbour `1/(2n)` and each diagonal one
+/// `1/(4n)` at valence `n`, summed in the ring's canonical order (the same from every face).
+fn ring_tent(ring: &CornerRing) -> Vec3 {
+    let sum = |points: &[Vec3]| points.iter().fold(Vec3::ZERO, |s, &p| s + p);
+    let n = f32::from(u8::try_from(ring.edges().len()).unwrap_or(u8::MAX));
+    ring.center * 0.25 + sum(ring.edges()) * (0.5 / n) + sum(ring.diagonals()) * (0.25 / n)
 }
 
 /// The block of `grid` covering `region` (on the grid's level), copied out.
@@ -282,90 +379,176 @@ fn level_keys(face: FaceId, level: Level) -> Result<Vec<TileKey>, DisplayError> 
         .collect()
 }
 
-/// Every display tile of `face` at every level below `finest`, with the encoding chosen by
-/// measurement: see [`build_face_with`].
+/// Writes `values`, a tile's at `region`, into the face grid `face`, checking that every vertex
+/// already written by another tile gets the same bits again.
 ///
 /// # Errors
 ///
-/// As [`build_face_with`].
-pub fn build_face(
-    face: FaceId,
-    finest_positions: &Grid,
-    finest_normals: &Grid,
-    finest: Level,
-) -> Result<Vec<DisplayTile>, DisplayError> {
-    build_face_with(
-        &CHOSEN,
-        CHOSEN_NORMALS,
-        face,
-        finest_positions,
-        finest_normals,
-        finest,
-    )
+/// [`DisplayError::Seam`] naming `key` if a shared vertex differs; [`DisplayError::Shape`] if
+/// the tile doesn't fit.
+fn write_tile(
+    face: &mut Grid,
+    written: &mut [bool],
+    key: TileKey,
+    values: &[Vec3],
+) -> Result<(), DisplayError> {
+    let region = Region::of_tile(&key);
+    let (side, tile_side) = (face.side(), region.quads() + 1);
+    for ((i, j), &v) in cells(tile_side).zip(values) {
+        let index = at(side, region.x0() + i, region.y0() + j);
+        let seen = written.get_mut(index).ok_or(DisplayError::Shape)?;
+        let slot = face.data_mut().get_mut(index).ok_or(DisplayError::Shape)?;
+        if *seen && slot.to_bits() != v.to_bits() {
+            return Err(DisplayError::Seam(key));
+        }
+        *slot = v;
+        *seen = true;
+    }
+    Ok(())
 }
 
-/// Every display tile of `face` at every level below `finest`, in key order, positions stored
-/// with `codec` and normals with `normals`.
+/// One display tile's positions: its key, encoded bytes and bound.
+#[derive(Debug, Clone, PartialEq)]
+struct PositionTile {
+    /// The tile.
+    key: TileKey,
+    /// Its positions as the codec stored them.
+    bytes: Vec<u8>,
+    /// `e`.
+    error: f32,
+}
+
+/// One level of a face's display positions.
+#[derive(Debug, Clone, PartialEq)]
+struct PositionLevel {
+    /// The decoded positions of the whole face at the level.
+    decoded: Grid,
+    /// Its tiles, row by row.
+    tiles: Vec<PositionTile>,
+}
+
+/// One face's display positions at every level below the finest: each tile's encoded
+/// positions and bound `e`, and each level's decoded face grid.
 ///
-/// Each level's positions are the finest ones
-/// subsampled ([`subsample`]), its normals the finest ones mipped ([`mip_normals`]), and each
+/// Positions need nothing from neighbouring faces (border vertices are stored exactly, so they
+/// agree across seams by construction), so a face's are built alone, with
+/// [`build_positions`]. Normals need their neighbours' ([`mip_normals`]); [`build_level`] joins
+/// the two into display tiles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FacePositions {
+    /// The face.
+    face: FaceId,
+    /// The finest level, whose surface the tiles' bounds are against.
+    finest: Level,
+    /// Levels `0..finest`, by level.
+    levels: Vec<PositionLevel>,
+}
+
+impl FacePositions {
+    /// The face.
+    #[must_use]
+    pub const fn face(&self) -> FaceId {
+        self.face
+    }
+
+    /// The finest level.
+    #[must_use]
+    pub const fn finest(&self) -> Level {
+        self.finest
+    }
+
+    /// The decoded positions of the whole face at `level`, or `None` at the finest level and
+    /// above.
+    #[must_use]
+    pub fn decoded(&self, level: Level) -> Option<&Grid> {
+        Some(&self.levels.get(usize::from(level.get()))?.decoded)
+    }
+
+    /// The bound `e` of display tile `key` of this face, or `None` if the face holds no such
+    /// tile.
+    #[must_use]
+    pub fn error(&self, key: &TileKey) -> Option<f32> {
+        self.tile(key).map(|t| t.error)
+    }
+
+    /// Display tile `key` of this face.
+    fn tile(&self, key: &TileKey) -> Option<&PositionTile> {
+        if key.face() != self.face {
+            return None;
+        }
+        let level = self.levels.get(usize::from(key.level().get()))?;
+        let per_side = key.level().tiles_per_side();
+        level
+            .tiles
+            .get(at(per_side, u32::from(key.tx()), u32::from(key.ty())))
+    }
+}
+
+/// `face`'s display positions at every level below `finest`, with the encoding chosen by
+/// measurement.
+///
+/// Each level's positions are the finest ones subsampled (vertex `(i·2ᵏ, j·2ᵏ)`), and each
 /// tile's bound `e` is chained from the finest level up through the *decoded* positions (see
-/// the module notes), so the codec's quantization is inside it.
-///
-/// `finest_positions` and `finest_normals` are the face's whole grid at `finest`; the normals are
-/// unit normals, as evaluated.
+/// the module notes), so the encoding's quantization is inside it. `finest_positions` is the
+/// face's whole grid at `finest`.
 ///
 /// # Errors
 ///
-/// [`DisplayError::Shape`] if either grid isn't the face's whole grid at `finest`;
+/// [`DisplayError::Shape`] if the grid isn't the face's whole grid at `finest`;
 /// [`DisplayError::NoDisplayLevel`] at level 0 (no level below it);
-/// [`DisplayError::NotFinite`] for a position or normal that isn't finite;
-/// [`DisplayError::Seam`] if the codec decodes a vertex two tiles share to different bits in
-/// each; the codec's errors.
-pub fn build_face_with(
-    codec: &impl DisplayCodec,
-    normals: NormalEncoding,
+/// [`DisplayError::NotFinite`] for a position that isn't finite;
+/// [`DisplayError::Seam`] if the encoding decodes a vertex two tiles share to different bits in
+/// each; [`DisplayError::TooLarge`] for a position out of the encoding's range.
+pub fn build_positions(
     face: FaceId,
     finest_positions: &Grid,
-    finest_normals: &Grid,
     finest: Level,
-) -> Result<Vec<DisplayTile>, DisplayError> {
-    let side = finest.face_quads() + 1;
-    if finest_positions.side() != side || finest_normals.side() != side {
+) -> Result<FacePositions, DisplayError> {
+    build_positions_with(&CHOSEN, face, finest_positions, finest)
+}
+
+/// [`build_positions`] with positions stored with `codec`.
+///
+/// # Errors
+///
+/// As [`build_positions`], and the codec's errors.
+#[cfg_attr(
+    not(any(test, feature = "display-study")),
+    expect(
+        unreachable_pub,
+        reason = "public for the encoding study (the display-study feature) only"
+    )
+)]
+pub fn build_positions_with(
+    codec: &impl DisplayCodec,
+    face: FaceId,
+    finest_positions: &Grid,
+    finest: Level,
+) -> Result<FacePositions, DisplayError> {
+    if finest_positions.side() != finest.face_quads() + 1 {
         return Err(DisplayError::Shape);
     }
     if finest == Level::ZERO {
         return Err(DisplayError::NoDisplayLevel(finest));
     }
-    let finite = |g: &Grid| g.as_slice().iter().all(|v| v.is_finite());
-    if !finite(finest_positions) || !finite(finest_normals) {
+    if !finest_positions.as_slice().iter().all(|v| v.is_finite()) {
         return Err(DisplayError::NotFinite);
     }
-    let mut tiles = Vec::new();
-    // Each level's face grid of subsampled positions and mean normals, and of decoded positions
-    // with the bounds of its tiles, from `finest − 1` down to 0.
+    let mut levels = Vec::new();
     let mut input = finest_positions.clone();
-    let mut means = MeanNormals::from_unit(finest_normals.clone());
     let mut decoded_finer = finest_positions.clone();
     let mut finer_bounds: Vec<f32> = Vec::new();
     let mut finer_level = finest;
     while let Some(level) = finer_level.parent() {
         input = subsample(&input)?;
-        means = mip_normals(&means)?;
         let mut decoded = input.clone();
-        // Which vertices of `decoded` a tile has written: a vertex two tiles share must decode
-        // to the same bits in both, or the bound would cover one copy and not the other.
         let mut written = vec![false; decoded.as_slice().len()];
         let keys = level_keys(face, level)?;
-        let mut bounds = Vec::with_capacity(keys.len());
+        let mut tiles = Vec::with_capacity(keys.len());
         for key in keys {
             let region = Region::of_tile(&key);
-            let positions_bytes = codec.encode(&key, &block(&input, region)?)?;
-            let positions = codec.decode(&key, &positions_bytes)?;
-            let tile_means = block(&means.grid, region)?;
-            let (shaded, rough) = encode::shade(tile_means.as_slice());
-            let normal_bytes = normals.encode(&shaded, &rough)?;
-            let (unit, roughness) = normals.decode(shaded.len(), &normal_bytes)?;
+            let bytes = codec.encode(&key, &block(&input, region)?)?;
+            let positions = codec.decode(&key, &bytes)?;
             let delta = step_error_at(
                 &decoded_finer,
                 (2 * region.x0(), 2 * region.y0()),
@@ -373,33 +556,179 @@ pub fn build_face_with(
             )?;
             let below = children_bound(&key, finer_level, finest, &finer_bounds);
             let error = round_up(sum_up(delta, below))?;
-            for (i, j) in cells(positions.side()) {
-                let index = at(input.side(), region.x0() + i, region.y0() + j);
-                let p = positions.get(i, j).ok_or(DisplayError::Shape)?;
-                let seen = written.get_mut(index).ok_or(DisplayError::Shape)?;
-                let slot = decoded
-                    .data_mut()
-                    .get_mut(index)
-                    .ok_or(DisplayError::Shape)?;
-                if *seen && slot.to_bits() != p.to_bits() {
-                    return Err(DisplayError::Seam(key));
-                }
-                *slot = p;
-                *seen = true;
-            }
-            bounds.push(error);
-            tiles.push(DisplayTile {
-                key,
-                positions: positions.as_slice().to_vec(),
-                normals: unit,
-                roughness,
-                error,
-                encoded: encode::join_parts(&positions_bytes, &normal_bytes)?,
-            });
+            write_tile(&mut decoded, &mut written, key, positions.as_slice())?;
+            tiles.push(PositionTile { key, bytes, error });
         }
-        decoded_finer = decoded;
-        finer_bounds = bounds;
+        finer_bounds = tiles.iter().map(|t| t.error).collect();
+        decoded_finer = decoded.clone();
+        levels.push(PositionLevel { decoded, tiles });
         finer_level = level;
+    }
+    levels.reverse();
+    Ok(FacePositions {
+        face,
+        finest,
+        levels,
+    })
+}
+
+/// The display tiles of one face at `level`: its `positions` there, with `means` (the face's
+/// mean normals at the level, from [`mip_normals`]) stored with the normal encoding chosen by
+/// measurement.
+///
+/// Also gives back the means as they decode (each decoded unit normal at its roughness's
+/// length): what the next coarser level's [`mip_normals`] reads, so a level is computed from
+/// what is stored one level finer, and the store can bring a level up to date from the stored
+/// tiles below it.
+///
+/// # Errors
+///
+/// [`DisplayError::Shape`] if `means` isn't the face's whole grid at `level`;
+/// [`DisplayError::NoDisplayLevel`] if `level` isn't below the finest; [`DisplayError::Seam`] if
+/// a vertex two tiles share decodes differently in each; [`DisplayError::NotFinite`] for a mean
+/// that isn't finite.
+pub fn build_level(
+    positions: &FacePositions,
+    level: Level,
+    means: &MeanNormals,
+) -> Result<(Vec<DisplayTile>, MeanNormals), DisplayError> {
+    build_level_with(CHOSEN_NORMALS, positions, level, means)
+}
+
+/// [`build_level`] with normals stored with `normals`.
+///
+/// # Errors
+///
+/// As [`build_level`]; [`DisplayError::Shape`] if the encoding's bits are out of range.
+#[cfg_attr(
+    not(any(test, feature = "display-study")),
+    expect(
+        unreachable_pub,
+        reason = "public for the encoding study (the display-study feature) only"
+    )
+)]
+pub fn build_level_with(
+    normals: NormalEncoding,
+    positions: &FacePositions,
+    level: Level,
+    means: &MeanNormals,
+) -> Result<(Vec<DisplayTile>, MeanNormals), DisplayError> {
+    let layer = positions
+        .levels
+        .get(usize::from(level.get()))
+        .ok_or(DisplayError::NoDisplayLevel(level))?;
+    if means.side() != level.face_quads() + 1 {
+        return Err(DisplayError::Shape);
+    }
+    let mut decoded_means = means.grid.clone();
+    let mut written = vec![false; decoded_means.as_slice().len()];
+    let mut tiles = Vec::with_capacity(layer.tiles.len());
+    for tile in &layer.tiles {
+        let region = Region::of_tile(&tile.key);
+        let tile_positions = block(&layer.decoded, region)?;
+        let (shaded, rough) = shade(block(&means.grid, region)?.as_slice());
+        let normal_bytes = normals.encode(&shaded, &rough, &tile_positions)?;
+        let (unit, roughness) = normals.decode(&tile_positions, &normal_bytes)?;
+        let decoded: Vec<Vec3> = unit
+            .iter()
+            .zip(&roughness)
+            .map(|(&n, &r)| mean_of(n, r))
+            .collect();
+        write_tile(&mut decoded_means, &mut written, tile.key, &decoded)?;
+        tiles.push(DisplayTile {
+            key: tile.key,
+            positions: tile_positions.as_slice().to_vec(),
+            normals: unit,
+            roughness,
+            error: tile.error,
+            encoded: encode::join_parts(&tile.bytes, &normal_bytes)?,
+        });
+    }
+    Ok((
+        tiles,
+        MeanNormals {
+            grid: decoded_means,
+        },
+    ))
+}
+
+/// Every display tile of every face of `mesh` at every level below the finest, in key order.
+///
+/// Built with the encoding chosen by measurement, from each face's finest positions and unit
+/// normals (at `finest_positions`' level).
+///
+/// Positions are built face by face ([`build_positions`]); normals level by level over all
+/// faces, finest first, each level's [`mip_normals`] reading every face's decoded means one
+/// level finer ([`build_level`]). This holds the whole mesh in memory: the store builds the
+/// same tiles from the same pieces, a region at a time.
+///
+/// # Errors
+///
+/// [`DisplayError::Unavailable`] if a face of the mesh is missing from either grid set, or the
+/// two sets aren't at the same level; the pieces' errors.
+pub fn build_mesh(
+    mesh: &BaseMesh,
+    finest_positions: &FaceGrids,
+    finest_normals: &FaceGrids,
+) -> Result<Vec<DisplayTile>, DisplayError> {
+    build_mesh_with(
+        &CHOSEN,
+        CHOSEN_NORMALS,
+        mesh,
+        finest_positions,
+        finest_normals,
+    )
+}
+
+/// [`build_mesh`] with positions stored with `codec` and normals with `normals`.
+///
+/// # Errors
+///
+/// As [`build_mesh`], and the codec's errors.
+#[cfg_attr(
+    not(any(test, feature = "display-study")),
+    expect(
+        unreachable_pub,
+        reason = "public for the encoding study (the display-study feature) only"
+    )
+)]
+pub fn build_mesh_with(
+    codec: &impl DisplayCodec,
+    normals: NormalEncoding,
+    mesh: &BaseMesh,
+    finest_positions: &FaceGrids,
+    finest_normals: &FaceGrids,
+) -> Result<Vec<DisplayTile>, DisplayError> {
+    let finest = finest_positions.level();
+    if finest_normals.level() != finest {
+        return Err(DisplayError::Unavailable);
+    }
+    let faces: Vec<FaceId> = mesh.faces().collect();
+    let positions = faces
+        .iter()
+        .map(|&face| {
+            let grid = finest_positions
+                .get(face)
+                .ok_or(DisplayError::Unavailable)?;
+            build_positions_with(codec, face, grid, finest)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tiles = Vec::new();
+    let mut finer: Option<FaceGrids> = None;
+    let mut level = finest;
+    while let Some(coarser) = level.parent() {
+        let source = finer.as_ref().unwrap_or(finest_normals);
+        let mut decoded = FaceGrids::new(coarser);
+        for face_positions in &positions {
+            let face = face_positions.face();
+            let means = mip_normals(mesh, source, face, coarser)?;
+            let (built, decoded_means) =
+                build_level_with(normals, face_positions, coarser, &means)?;
+            tiles.extend(built);
+            decoded.insert(face, decoded_means.grid)?;
+        }
+        finer = Some(decoded);
+        level = coarser;
     }
     tiles.sort_by_key(|tile| tile.key);
     Ok(tiles)

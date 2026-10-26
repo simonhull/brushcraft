@@ -32,9 +32,14 @@ pub use correction::{
 pub use dense::{CorrectionMap, DenseEvaluation};
 #[cfg(any(test, feature = "display-study"))]
 pub use display::{BaseOffsets, FixedPoint};
+#[cfg(any(test, feature = "display-study"))]
 pub use display::{
-    DisplayCodec, DisplayError, DisplayTile, Interpolating, MeanNormals, NormalEncoding, Precision,
-    build_face, build_face_with, mip_normals, step_error, subsample,
+    DisplayCodec, Interpolating, NormalEncoding, Precision, build_level_with, build_mesh_with,
+    build_positions_with, decode_with,
+};
+pub use display::{
+    DisplayError, DisplayTile, FaceGrids, FacePositions, MeanNormals, build_level, build_mesh,
+    build_positions, mip_normals,
 };
 pub use eval::{
     EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,

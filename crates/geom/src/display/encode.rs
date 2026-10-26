@@ -1,11 +1,16 @@
 //! How display tiles are stored: the position codecs measured against each other, and the
-//! normals' octahedral encoding.
+//! normal encodings.
+//!
+//! The codecs and encodings are public for the encoding study only (`brushcraft-bench
+//! display-study`, behind the `display-study` feature); everything else stores and reads tiles
+//! with the chosen ones, through [`build_positions`](super::build_positions),
+//! [`build_level`](super::build_level) and [`DisplayTile::decode`](super::DisplayTile::decode).
 //!
 //! Decision 4 of the display-layer plan asks of the stored positions, in order: border vertices
 //! decode to exactly the same `f32`s in every tile holding them (seams exact without reading a
 //! neighbour); a tile decodes on its own (no ancestor, no base level); the stored `e` comes from
-//! the decoded values (which [`build_face_with`](super::build_face_with) guarantees for any
-//! codec); and the file grows by no more than the design note's estimate. The candidates:
+//! the decoded values (which [`build_positions_with`](super::build_positions_with) guarantees
+//! for any codec); and the file grows by no more than the design note's estimate. The candidates:
 //!
 //! - [`Interpolating`]: each vertex coded against the midpoint of its two parents in the
 //!   triangulation (its edge's ends, or its quad's diagonal), coarsest first, so a smooth surface
@@ -23,7 +28,7 @@
 //! Measured on the benchmark project (all 2,400 faces, `brushcraft-bench display-study`; the
 //! table is in the docs repository's `research/platform/m1a2-display-encoding.md`), as growth of
 //! the project file: [`Interpolating`] at `Precision::QuadFraction(6)` (a step of about a
-//! 64th of the level's quad edge) with [`NormalEncoding::Oct8`], +38.6 % (positions 24.5 %,
+//! 64th of the level's quad edge) with 8-bit octahedral normals, +38.6 % (positions 24.5 %,
 //! normals and roughness 13.6 %). It meets the first three constraints by construction; its
 //! quantization stays under 1.4 % of a quad edge and raises the median `e` by about 2 %. A
 //! coarser step (a 16th) saves 7 points more but raises the median `e` by about 20 %, which the
@@ -35,11 +40,22 @@
 //! the store's zstd compresses far better than interleaved bytes: small residuals leave the high
 //! planes zero.
 
+// Without the study, the codecs' public items are reachable from nowhere outside the crate,
+// and the precisions and encodings it measured but didn't choose are never made.
+#![cfg_attr(
+    not(any(test, feature = "display-study")),
+    expect(
+        unreachable_pub,
+        dead_code,
+        reason = "the study's codecs: public, and all used, with the display-study feature only"
+    )
+)]
+
 use self::bytes::{
     Reader, put_u16_planes, put_u32_planes, take_u16_planes, take_u32_planes, unzigzag, zigzag,
 };
 pub use self::normals::NormalEncoding;
-pub(super) use self::normals::shade;
+pub(super) use self::normals::{mean_of, shade};
 #[cfg(any(test, feature = "display-study"))]
 pub use self::study::{BaseOffsets, FixedPoint};
 use super::DisplayError;
@@ -50,13 +66,13 @@ mod normals;
 #[cfg(any(test, feature = "display-study"))]
 mod study;
 
-/// The position codec [`build_face`](super::build_face) and [`DisplayTile::decode`](
-/// super::DisplayTile::decode) use.
+/// The position codec [`build_positions`](super::build_positions) and
+/// [`DisplayTile::decode`](super::DisplayTile::decode) use.
 pub(super) const CHOSEN: Interpolating = Interpolating::new(Precision::QuadFraction(6));
 
-/// The normal encoding [`build_face`](super::build_face) and [`DisplayTile::decode`](
-/// super::DisplayTile::decode) use.
-pub(super) const CHOSEN_NORMALS: NormalEncoding = NormalEncoding::Oct8;
+/// The normal encoding [`build_level`](super::build_level) and
+/// [`DisplayTile::decode`](super::DisplayTile::decode) use.
+pub(super) const CHOSEN_NORMALS: NormalEncoding = NormalEncoding::Octahedral(8);
 
 /// How a display tile's positions are stored.
 ///
@@ -66,7 +82,7 @@ pub(super) const CHOSEN_NORMALS: NormalEncoding = NormalEncoding::Oct8;
 /// **A vertex shared by two tiles must decode to the same bits in both** (border vertices of
 /// tiles of one level, and across faces): seams are exact by construction, without reading a
 /// neighbour, and the bound, chained through one copy, holds for every copy.
-/// [`build_face_with`](super::build_face_with) checks it within a face and fails with
+/// [`build_positions_with`](super::build_positions_with) checks it within a face and fails with
 /// [`DisplayError::Seam`] otherwise.
 pub trait DisplayCodec {
     /// The positions of tile `key`, row-major `side²` (its side), encoded.
