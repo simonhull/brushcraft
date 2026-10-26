@@ -20,6 +20,9 @@ bench-stages = ["test-fixtures"]
 # A block's evaluation inputs as plain data (`geom::gather_block`, `geom::vertex_stencil`), for
 # render's GPU evaluation spike only: its `spike` feature turns this on.
 eval-inputs = []
+# The display tile codecs that lost the encoding study (`geom::FixedPoint`, `geom::BaseOffsets`),
+# for `brushcraft-bench display-study` and the tests only, so release builds never compile them.
+display-study = []
 
 [dependencies]
 bytemuck.workspace = true
@@ -31,6 +34,11 @@ divan.workspace = true
 
 [[bench]]
 name = "evaluate"
+harness = false
+required-features = ["test-fixtures"]
+
+[[bench]]
+name = "display"
 harness = false
 required-features = ["test-fixtures"]
 

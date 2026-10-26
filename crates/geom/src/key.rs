@@ -182,6 +182,12 @@ pub struct Channel(u8);
 impl Channel {
     /// The correction pyramid (sculpted shape).
     pub const DISPLACEMENT: Self = Self(0);
+    /// The display layer: for a tile below the finest level, the finest surface subsampled at
+    /// the tile's level, with averaged normals and an error bound (see
+    /// [`DisplayTile`](crate::DisplayTile)). Derived from the displacement channel, never edited.
+    ///
+    /// Fixed in the file format at `1`, like every channel's value.
+    pub const DISPLAY: Self = Self(1);
 
     /// A channel by its file-format value.
     #[must_use]
@@ -278,6 +284,15 @@ impl TileKey {
         ty: u16,
     ) -> Result<Self, TileOutOfRange> {
         Self::new(LayerId::BASE, Channel::DISPLACEMENT, face, level, tx, ty)
+    }
+
+    /// A base-layer display tile (see [`Channel::DISPLAY`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TileKey::new`].
+    pub fn display(face: FaceId, level: Level, tx: u16, ty: u16) -> Result<Self, TileOutOfRange> {
+        Self::new(LayerId::BASE, Channel::DISPLAY, face, level, tx, ty)
     }
 
     /// Without the range check, for callers that derived `tx`, `ty` from a valid grid position.

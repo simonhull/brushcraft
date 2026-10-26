@@ -53,6 +53,18 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// A grid of `side` vertices per side holding `data`, `side²` positions row-major: a block
+    /// put together from tiles, say.
+    ///
+    /// # Errors
+    ///
+    /// [`EvalError::BufferSize`] unless `data` holds exactly `side²` positions.
+    pub fn new(side: u32, data: Vec<Vec3>) -> Result<Self, EvalError> {
+        let expected = usize::try_from(u64::from(side) * u64::from(side)).unwrap_or(usize::MAX);
+        check_buffer(&data, expected)?;
+        Ok(Self { side, data })
+    }
+
     /// A grid of `side` vertices per side holding `data`, row-major; the caller makes `data`
     /// `side²` long.
     pub(crate) const fn from_parts(side: u32, data: Vec<Vec3>) -> Self {
@@ -98,6 +110,11 @@ impl Grid {
     #[must_use]
     pub fn as_slice(&self) -> &[Vec3] {
         &self.data
+    }
+
+    /// All positions, row-major, to write in place.
+    pub(crate) fn data_mut(&mut self) -> &mut [Vec3] {
+        &mut self.data
     }
 }
 

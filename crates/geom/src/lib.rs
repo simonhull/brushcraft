@@ -5,6 +5,7 @@
 mod correction;
 #[cfg(any(test, feature = "test-fixtures"))]
 mod dense;
+mod display;
 mod eval;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fixtures;
@@ -29,6 +30,12 @@ pub use correction::{
 };
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use dense::{CorrectionMap, DenseEvaluation};
+#[cfg(any(test, feature = "display-study"))]
+pub use display::{BaseOffsets, FixedPoint};
+pub use display::{
+    DisplayCodec, DisplayError, DisplayTile, Interpolating, MeanNormals, NormalEncoding, Precision,
+    build_face, build_face_with, mip_normals, step_error, subsample,
+};
 pub use eval::{
     EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,
     normals, normals_into, parent_tiles, predict_region, refresh_normals_into,
