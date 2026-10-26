@@ -17,8 +17,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned in mise.toml for our machines: profiling, fuzzing and the proofs aren't run here.
-  MISE_DISABLE_TOOLS: "cargo:samply,cargo:cargo-bolero,cargo:cargo-fuzz,cargo:kani-verifier"
+  # Pinned in mise.toml for our machines: profiling, shader builds, fuzzing and the proofs aren't
+  # run here.
+  MISE_DISABLE_TOOLS: "cargo:samply,cargo:cargo-gpu,cargo:cargo-bolero,cargo:cargo-fuzz,cargo:kani-verifier"
 
 jobs:
   mutants:
@@ -32,6 +33,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # GPU tests run on lavapipe (software Vulkan), and only on it, as in check.sh.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+      - run: |
+          icd=$(scripts/lavapipe.sh)
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
       # Settings in .cargo/mutants.toml. Survivors make cargo-mutants exit non-zero: reported,
       # not gating.
       - run: cargo mutants --workspace --shard ${{ matrix.shard }}/4 --timeout-multiplier 3
@@ -50,6 +57,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # GPU tests run on lavapipe (software Vulkan), and only on it, as in check.sh.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+      - run: |
+          icd=$(scripts/lavapipe.sh)
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
       # A map, with no threshold. Code that runs only in the crash tests' children
       # (project/tests/crash.rs) shows as uncovered: they are killed with SIGKILL, so their
       # counters are never written.
