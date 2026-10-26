@@ -8,7 +8,13 @@ if [[ -z ${BRUSHCRAFT_UNDER_MISE:-} ]]; then
   BRUSHCRAFT_UNDER_MISE=1 exec mise exec -- "$0" "$@"
 fi
 
+# GPU tests run on lavapipe and nothing else: with only its ICD visible, no test can pick the
+# machine's own GPU. It is required, never skipped (lavapipe.sh says how to install it).
+VK_ICD_FILENAMES=$(scripts/lavapipe.sh)
+export VK_ICD_FILENAMES VK_DRIVER_FILES=$VK_ICD_FILENAMES
+
 cargo fmt --all --check
+scripts/headless.sh
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace --all-features --no-tests=warn

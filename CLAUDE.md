@@ -14,7 +14,8 @@ if they disagree, raise it rather than drifting silently.
   `#[expect(unsafe_code, reason = "…")]`; every block carries a `// SAFETY:` proof. Pure-Rust `unsafe` must also
   pass `cargo +$BRUSHCRAFT_NIGHTLY miri test` for its crate. FFI can't run under Miri, so it is covered by review
   and the integration tests.
-- `geom`, `store`, `brush` and `sculpt` stay headless: no GPU or windowing dependencies.
+- `geom`, `store`, `brush` and `sculpt` stay headless: no GPU or windowing dependencies (`scripts/headless.sh`
+  checks it in the gate).
 - Dependencies point downward only (see the crate table in the architecture spec). Add third-party crates
   through `[workspace.dependencies]`.
 - Performance claims need a `divan` benchmark before and after. Profile with `samply` before optimizing.
@@ -24,6 +25,8 @@ if they disagree, raise it rather than drifting silently.
 
 - `scripts/check.sh`: everything CI runs.
 - `cargo nextest run`: tests. `cargo test --doc`: doctests.
+- GPU tests (`render`) run on lavapipe, software Vulkan, through `GpuTest`; `check.sh` requires it (`sudo pacman -S
+  vulkan-swrast`) and hides every other GPU from the tests. `cargo run -p render --example adapters` lists the GPUs.
 - `cargo fmt` uses the pinned nightly's rustfmt (unstable options in `rustfmt.toml`) through `RUSTFMT` in
   `mise.toml`. Stable rustfmt gives different output: point your editor at `scripts/rustfmt`, and run
   anything that needs nightly (fmt, Miri) via `cargo +$BRUSHCRAFT_NIGHTLY …` under mise.
