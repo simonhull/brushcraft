@@ -3,6 +3,7 @@
 
 #![expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use geom::{FaceId, cube_sphere};
@@ -45,12 +46,17 @@ const LEVEL: u8 = 4;
 
 /// A store over a fresh file of `mesh`, with room for every tile of the tests' levels.
 fn store_over(dir: &TestDir, mesh: &Arc<BaseMesh>) -> TileStore {
+    store_with_workers(dir, mesh, 2)
+}
+
+/// [`store_over`], with `workers` evaluation workers.
+fn store_with_workers(dir: &TestDir, mesh: &Arc<BaseMesh>, workers: usize) -> TileStore {
     let file = ProjectFile::create(&dir.path("index"), meta_for(mesh), Arc::clone(mesh)).unwrap();
     let chunk_bytes = 8 * size_of::<EvaluatedSlot>();
     let config = with_reserved_shares(
         StoreConfig::new(64 * chunk_bytes, 3)
             .with_chunk_bytes(chunk_bytes)
-            .with_workers(fixed(2)),
+            .with_workers(fixed(workers)),
     );
     let config = config.with_budget_bytes(config.budget_bytes.max(config.minimum_budget(mesh)));
     TileStore::open(file, config).unwrap()
@@ -302,6 +308,74 @@ fn a_sphere_query_finds_every_tile_with_a_vertex_inside() {
                 assert!(found.contains(key), "{key:?} has a vertex in the sphere");
             }
         }
+    }
+}
+
+/// The bounds the normals wave computes are, bit for bit, the bounds read back from the store,
+/// at one worker and at four.
+///
+/// After edits on faces' borders, corners and insides, every tile is evaluated with
+/// [`TileStore::evaluate_many_with_bounds`]: the wave computes the normals of those the edits
+/// reached (stale or dropped), and each bound it gives equals [`SpatialIndex::bounds_of`]'s. A
+/// refit of every tile with them makes the index [`SpatialIndex::build`] makes. Once another
+/// correction is written, they are no longer used.
+#[test]
+fn bounds_from_the_normals_wave_are_the_bounds_read_back() {
+    for workers in [1, 4] {
+        let dir = TestDir::new();
+        let mesh = Arc::new(cube_sphere(2).unwrap());
+        let mut store = store_with_workers(&dir, &mesh, workers);
+        let mut index = SpatialIndex::build(&mut store, level(), |_, _| {}).unwrap();
+        store.begin_op().unwrap();
+        let side = Level::new(LEVEL).unwrap().tile_quads() + 1;
+        for (face, i, j) in [(0, 0, 3), (0, side / 2, side / 2), (5, side - 1, side - 1)] {
+            store
+                .set_correction(FaceId::new(face), level(), i, j, Vec3::new(0.0, 0.0, 0.2))
+                .unwrap();
+        }
+        let changed: Vec<TileKey> = tiles_of(&mesh, level()).collect();
+        let wave = store.evaluate_many_with_bounds(&changed).unwrap();
+        let edited: BTreeSet<TileKey> = [0, 5]
+            .into_iter()
+            .map(|face| TileKey::displacement(FaceId::new(face), level(), 0, 0).unwrap())
+            .collect();
+        assert!(
+            edited.iter().all(|key| wave.current(&store, key).is_some()),
+            "{workers} workers: the edited tiles' normals were computed"
+        );
+        assert!(
+            wave.len() < changed.len(),
+            "{workers} workers: not the rest"
+        );
+        for key in &changed {
+            let Some(from_wave) = wave.current(&store, key) else {
+                continue;
+            };
+            let read_back = SpatialIndex::bounds_of(&mut store, *key).unwrap();
+            assert_eq!(
+                from_wave.to_bits(),
+                read_back.to_bits(),
+                "{workers} workers: {key:?}'s bounds, bit for bit"
+            );
+        }
+        index.refit_with(&mut store, &changed, &wave).unwrap();
+        let built = SpatialIndex::build(&mut store, level(), |_, _| {}).unwrap();
+        let (mut refitted, mut built) = (index_bits(&index), index_bits(&built));
+        refitted.sort_unstable();
+        built.sort_unstable();
+        assert!(
+            refitted == built,
+            "{workers} workers: the refitted index holds the bounds a build finds"
+        );
+        store
+            .set_correction(FaceId::new(0), level(), 1, 1, Vec3::new(0.0, 0.0, 0.1))
+            .unwrap();
+        assert!(
+            changed
+                .iter()
+                .all(|key| wave.current(&store, key).is_none()),
+            "{workers} workers: a write since leaves them unused"
+        );
     }
 }
 

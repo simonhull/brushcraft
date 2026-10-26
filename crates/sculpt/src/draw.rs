@@ -20,11 +20,13 @@
 //!    as the store recorded them when it last computed those normals
 //!    ([`TileStore::normal_inputs`]).
 //! 6. **Evaluate**: those tiles are evaluated again, positions and normals, together through
-//!    [`TileStore::evaluate_many`], which builds them in parallel. A neighbour whose own positions
-//!    didn't move keeps its normals, stale, and only the border vertices that read a moved vertex
-//!    (its apron, and the rings of base vertices at its corners) are recomputed; the tiles that
-//!    moved are recomputed in full.
-//! 7. **Refit**: their bounds are recomputed and the index's tree refitted.
+//!    [`TileStore::evaluate_many_with_bounds`], which builds them in parallel. A neighbour whose
+//!    own positions didn't move keeps its normals, stale, and only the border vertices that read a
+//!    moved vertex (its apron, and the rings of base vertices at its corners) are recomputed; the
+//!    tiles that moved are recomputed in full. Each tile's bounds are computed on the worker that
+//!    computed its normals, right after.
+//! 7. **Refit**: the index's tree is refitted to those bounds (any tile without, read back from the
+//!    store's cache) and they are recorded in the store.
 //!
 //! Corrections live in each vertex's tangent frame `(t, b, n)` of the predicted surface, so a
 //! push along the frame normal `n` is a change of the correction's `z` alone, with no frames to
@@ -45,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use brush::Smoothstep;
 use geom::{TileKey, Vec3};
-use store::{CacheError, Evaluation, IndexError, Project, SpatialIndex, TileStore};
+use store::{CacheError, IndexError, Project, SpatialIndex, TileStore};
 pub use stroke::Stroke;
 use stroke::TileStroke;
 use thiserror::Error;
@@ -307,11 +309,12 @@ pub fn draw_step(
     let changed = bounds_changed(store, &found.reached)?;
     times.neighbours = laps.lap();
 
-    store.evaluate_many(&changed, Evaluation::Normals)?;
+    let wave = store.evaluate_many_with_bounds(&changed)?;
     times.evaluate = laps.lap();
 
-    // The tiles were made current together just above: the refit reads them from the cache.
-    index.refit(store, &changed)?;
+    // The tiles were made current together just above, their bounds computed with their
+    // normals: the refit takes those, and reads any other tile from the cache.
+    index.refit_with(store, &changed, &wave)?;
     times.refit = laps.lap();
     drop(pins);
 

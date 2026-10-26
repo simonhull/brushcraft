@@ -131,7 +131,7 @@ use crate::deps::{DepGraph, list_normal_inputs};
 use crate::feed::{ChangeFeed, ConsumerId};
 use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
 use crate::hash::{TileHash, TileMap, TileSet};
-use crate::index::TileBounds;
+use crate::index::{TileBounds, WaveBounds};
 use crate::kept::Kept;
 use crate::meta::{Meta, Role, SavePoint};
 use crate::op::{OpId, RESERVED_SITE};
@@ -1054,6 +1054,10 @@ pub struct TileStore {
     stroke_tiles: usize,
     /// This store's identity among every store the process opens ([`TileStore::id`]).
     id: StoreId,
+    /// How many times corrections were written (each [`TileStore::invalidate_edited`]), as of
+    /// now: while it stays the same, every tile evaluates to the same bits, so bounds computed
+    /// from an evaluation are still the tile's ([`TileStore::edits`]).
+    edits: u64,
     /// The pinned tiles an edit of their own corrections alone marked stale, their parents'
     /// positions unchanged: the tiles whose next prediction, made in place, is worth keeping
     /// (see "Kept predictions" on [`TileStore`]). A mark goes when the tile is next predicted,
@@ -1775,6 +1779,7 @@ impl TileStore {
             kept: Kept::new(config.kept_predictions),
             stroke_tiles: config.stroke_tiles,
             id: StoreId::next(),
+            edits: 0,
             own_edits: BTreeSet::new(),
             activity: Activity::default(),
             #[cfg(test)]
@@ -2388,6 +2393,14 @@ impl TileStore {
         self.id
     }
 
+    /// How many times corrections have been written since the store opened, counting every
+    /// edit, page-in of a lost tile and reload that drops evaluations. While it stays the same,
+    /// every tile evaluates to the same bits: what [`WaveBounds`] checks before its bounds are
+    /// used.
+    pub(crate) const fn edits(&self) -> u64 {
+        self.edits
+    }
+
     /// The op for an edit: the current one, or a new one if none is current.
     ///
     /// # Errors
@@ -2819,6 +2832,46 @@ impl TileStore {
     /// As [`TileStore::evaluate`]: [`CacheError::NotATile`] before anything is evaluated. The
     /// batches made before an error stay cached.
     pub fn evaluate_many(&mut self, keys: &[TileKey], what: Evaluation) -> Result<(), CacheError> {
+        self.evaluate_many_into(keys, what, None)
+    }
+
+    /// [`TileStore::evaluate_many`] with [`Evaluation::Normals`], which also hands back the
+    /// bounds of every tile whose normals it computed: a box and a cone over the tile's
+    /// positions and normals, as [`crate::SpatialIndex::bounds_of`] gives them, computed on the
+    /// worker that computed the normals, while they are in its cache.
+    ///
+    /// For [`crate::SpatialIndex::refit_with`], which uses them in place of reading every tile
+    /// back, as long as no correction is written in between (see [`WaveBounds`]). A tile whose
+    /// normals were current already, or that has no finite position, gets none.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`]. The bounds computed before an error are lost.
+    pub fn evaluate_many_with_bounds(
+        &mut self,
+        keys: &[TileKey],
+    ) -> Result<WaveBounds, CacheError> {
+        let mut bounds = TileMap::default();
+        self.evaluate_many_into(keys, Evaluation::Normals, Some(&mut bounds))?;
+        Ok(WaveBounds {
+            store: Some(self.id),
+            edits: self.edits,
+            bounds,
+        })
+    }
+
+    /// [`TileStore::evaluate_many`], putting the bounds of every tile whose normals are
+    /// computed in `bounds`, if given (see [`TileStore::evaluate_many_with_bounds`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`].
+    fn evaluate_many_into(
+        &mut self,
+        keys: &[TileKey],
+        what: Evaluation,
+        mut bounds: Option<&mut TileMap<TileBounds>>,
+    ) -> Result<(), CacheError> {
         self.sync_pins()?;
         self.poll()?;
         for key in keys {
@@ -2830,7 +2883,7 @@ impl TileStore {
                 let held = store.pin_current(batch.iter().copied().collect())?;
                 store.unpin_held(&held)
             }
-            Evaluation::Normals => store.normals_batch(batch),
+            Evaluation::Normals => store.normals_batch(batch, bounds.as_deref_mut()),
         })
     }
 
@@ -4143,7 +4196,10 @@ impl TileStore {
     /// again, however many there are and whatever their ops. While the dependency graph holds
     /// an untracked node, nothing is skipped: the cascade takes such a node to follow from
     /// every coarser edit, recorded or not (see [`crate::deps`]).
+    ///
+    /// Every call counts as a write of corrections ([`TileStore::edits`]), whatever it skips.
     fn invalidate_edited(&mut self, edited: impl IntoIterator<Item = TileKey>) {
+        self.edits = self.edits.wrapping_add(1);
         let reached: Vec<TileKey> = edited
             .into_iter()
             .filter(|key| {
@@ -4918,7 +4974,7 @@ impl TileStore {
     ///
     /// As [`TileStore::evaluate`].
     fn ensure_normals(&mut self, key: TileKey) -> Result<SlotId<EvaluatedSlot>, CacheError> {
-        self.normals_batch(&[key])?;
+        self.normals_batch(&[key], None)?;
         // The normals were computed with the tile pinned, and nothing has taken a slot since.
         match self.evaluated.lookup(&key) {
             Some((id, Freshness::Fresh)) => Ok(id),
@@ -4938,10 +4994,17 @@ impl TileStore {
     /// they are stale is asked once the inputs are pinned: making them current may have evicted
     /// the tile, or rebuilt its positions, and its stale normals went with them.
     ///
+    /// With `bounds`, each tile whose normals are computed has its bounds put there too (see
+    /// [`TileStore::evaluate_many_with_bounds`]).
+    ///
     /// # Errors
     ///
     /// As [`TileStore::evaluate`]; nothing stays pinned then.
-    fn normals_batch(&mut self, batch: &[TileKey]) -> Result<(), CacheError> {
+    fn normals_batch(
+        &mut self,
+        batch: &[TileKey],
+        bounds: Option<&mut TileMap<TileBounds>>,
+    ) -> Result<(), CacheError> {
         let mut wanted = Vec::with_capacity(batch.len());
         for &key in batch {
             let current = matches!(self.evaluated.lookup(&key), Some((_, Freshness::Fresh)))
@@ -4959,7 +5022,7 @@ impl TileStore {
             .iter()
             .map(|key| self.deps.stale_inputs(key).cloned())
             .collect();
-        let computed = self.normals_rounds(&wanted, &inputs, &stale, &held);
+        let computed = self.normals_rounds(&wanted, &inputs, &stale, &held, bounds);
         let released = self.unpin_held(&held);
         computed?;
         released
@@ -4969,7 +5032,8 @@ impl TileStore {
     /// are stale, the inputs they are stale since, in the same order) from `held`, every tile
     /// they read, pinned: on the workers, straight into each tile's slot
     /// ([`TileStore::normals_round`]), then recorded in key order (see
-    /// [`TileStore::normals_installed`]).
+    /// [`TileStore::normals_installed`]). With `bounds`, each tile's bounds are computed beside
+    /// its normals and put there once they are recorded.
     ///
     /// # Errors
     ///
@@ -4982,13 +5046,14 @@ impl TileStore {
         inputs: &[BTreeSet<TileKey>],
         stale: &[Option<BTreeSet<TileKey>>],
         held: &Held,
+        bounds: Option<&mut TileMap<TileBounds>>,
     ) -> Result<(), CacheError> {
         let tasks: Vec<(TileKey, Option<&BTreeSet<TileKey>>)> = wanted
             .iter()
             .copied()
             .zip(stale.iter().map(Option::as_ref))
             .collect();
-        self.normals_round(&tasks, held)?;
+        let computed = self.normals_round(&tasks, held, bounds.is_some())?;
         #[cfg(test)]
         self.log.refreshed.extend(
             tasks
@@ -4998,6 +5063,14 @@ impl TileStore {
         );
         for (&key, read) in wanted.iter().zip(inputs) {
             self.normals_installed(key, read);
+        }
+        if let Some(bounds) = bounds {
+            bounds.extend(
+                wanted
+                    .iter()
+                    .zip(computed)
+                    .filter_map(|(&key, tile)| Some((key, tile?))),
+            );
         }
         Ok(())
     }
@@ -5013,6 +5086,10 @@ impl TileStore {
     /// positions, so what lands in each slot is the same whichever worker computes it, and
     /// nothing of the pools' bookkeeping changes.
     ///
+    /// With `with_bounds`, each task then computes its tile's bounds from its positions and the
+    /// normals it just wrote ([`TileBounds::of_tile`], as [`crate::SpatialIndex::bounds_of`]
+    /// does from the same slot), returned in task order; `None` for each tile without.
+    ///
     /// # Errors
     ///
     /// The first task's error in order: [`CacheError::Eval`] (not for a valid mesh), or
@@ -5023,7 +5100,8 @@ impl TileStore {
         &mut self,
         tasks: &[(TileKey, Option<&BTreeSet<TileKey>>)],
         held: &Held,
-    ) -> Result<(), CacheError> {
+        with_bounds: bool,
+    ) -> Result<Vec<Option<TileBounds>>, CacheError> {
         let ids: Vec<SlotId<EvaluatedSlot>> = held.iter().map(|&(_, id)| id).collect();
         let slots = self
             .evaluated
@@ -5040,35 +5118,49 @@ impl TileStore {
             positions.push((key, own));
             normals.push(Some(out));
         }
+        // Each task's buffer: its tile's normals to write, its tile's own positions, and the
+        // bounds it computes.
         let mut outs = tasks
             .iter()
             .map(|(key, _)| {
                 let at = held_index(held, key)?;
-                normals
+                let own = positions.get(at).map(|&(_, own)| own);
+                let out = normals
                     .get_mut(at)
                     .and_then(Option::take)
-                    .ok_or(Invariant::NamedTwice(*key))
+                    .ok_or(Invariant::NamedTwice(*key))?;
+                Ok((out, own.ok_or(Invariant::NotHeld(*key))?, None))
             })
             .collect::<Result<Vec<_>, Invariant>>()?;
         let mesh = &*self.mesh;
         #[cfg(test)]
         let failing = self.failing_normals;
-        each_parallel(&self.workers, tasks, &mut outs, |&(key, since), out| {
-            #[cfg(test)]
-            if failing == Some(key) {
-                return Err(Invariant::StaleHandle.into());
-            }
-            let source = Resident::new(mesh, Tiles::Split(&positions));
-            let out = prefix_mut(out.as_mut_slice(), vertex_count(&key))?;
-            let region = Region::of_tile(&key);
-            match since {
-                None => normals_into(mesh, &source, region, out)?,
-                Some(since) => {
-                    refresh_normals_into(mesh, &source, region, |k| since.contains(k), out)?;
+        each_parallel(
+            &self.workers,
+            tasks,
+            &mut outs,
+            |&(key, since), (out, own, bounds)| {
+                #[cfg(test)]
+                if failing == Some(key) {
+                    return Err(Invariant::StaleHandle.into());
                 }
-            }
-            Ok(())
-        })
+                let source = Resident::new(mesh, Tiles::Split(&positions));
+                let n = vertex_count(&key);
+                let out = prefix_mut(out.as_mut_slice(), n)?;
+                let region = Region::of_tile(&key);
+                match since {
+                    None => normals_into(mesh, &source, region, out)?,
+                    Some(since) => {
+                        refresh_normals_into(mesh, &source, region, |k| since.contains(k), out)?;
+                    }
+                }
+                if with_bounds {
+                    *bounds = TileBounds::of_tile(prefix(own, n)?, out);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(outs.into_iter().map(|(_, _, bounds)| bounds).collect())
     }
 
     /// Records `key`'s normals, just written into its slot, as read from `inputs`, which the

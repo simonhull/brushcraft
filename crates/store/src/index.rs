@@ -26,7 +26,8 @@ pub use bvh::{Aabb, Bvh, Hit, MAX_TILES, Ray, SphereQuery};
 use geom::{BaseMesh, Level, MAX_LEVEL, TILE_QUADS, TileKey, Vec3};
 use thiserror::Error;
 
-use crate::tiles::{CacheError, Evaluation, TileStore};
+use crate::hash::TileMap;
+use crate::tiles::{CacheError, Evaluation, StoreId, TileStore};
 
 /// Tiles [`SpatialIndex::build`] evaluates together before it reads their bounds.
 ///
@@ -216,6 +217,45 @@ impl TileBounds {
 /// A tile's cached positions and normals, which its bounds are computed from.
 type Cached<'a> = (&'a [Vec3], &'a [Vec3]);
 
+/// Bounds the normals wave of [`TileStore::evaluate_many_with_bounds`] computed, for
+/// [`SpatialIndex::refit_with`].
+///
+/// They are the store's own: only the store makes them, and a refit uses them only over the
+/// store that made them, and only while no correction has been written to it since. Every tile
+/// then evaluates to the bits it had when they were computed, so each is the bound
+/// [`SpatialIndex::bounds_of`] would compute again. Otherwise the refit computes every bound
+/// itself, as [`SpatialIndex::refit`] does.
+#[derive(Debug, Clone, Default)]
+pub struct WaveBounds {
+    /// The store that computed them.
+    pub(crate) store: Option<StoreId>,
+    /// That store's count of writes ([`TileStore::edits`]) when they were computed.
+    pub(crate) edits: u64,
+    /// The bounds, by tile.
+    pub(crate) bounds: TileMap<TileBounds>,
+}
+
+impl WaveBounds {
+    /// How many tiles have bounds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bounds.len()
+    }
+
+    /// Whether no tile has bounds.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bounds.is_empty()
+    }
+
+    /// `key`'s bounds, if they were computed and are still the tile's in `store`: the store
+    /// that computed them, with no correction written since.
+    pub(crate) fn current(&self, store: &TileStore, key: &TileKey) -> Option<TileBounds> {
+        let fresh = self.store == Some(store.id()) && self.edits == store.edits();
+        fresh.then(|| self.bounds.get(key).copied()).flatten()
+    }
+}
+
 /// What [`SpatialIndex::load`] found stored, and what it had to evaluate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LoadStats {
@@ -263,7 +303,7 @@ impl SpatialIndex {
         let mut tiles = Vec::with_capacity(total);
         for batch in keys.chunks(BUILD_BATCH) {
             store.evaluate_many(batch, Evaluation::Normals)?;
-            for bounds in Self::bounds_of_all(store, batch)? {
+            for bounds in Self::bounds_of_all(store, batch, &WaveBounds::default())? {
                 tiles.push(bounds);
                 progress(tiles.len(), total);
             }
@@ -308,7 +348,7 @@ impl SpatialIndex {
         let mut computed = Vec::with_capacity(missing.len());
         for batch in missing.chunks(BUILD_BATCH) {
             store.evaluate_many(batch, Evaluation::Normals)?;
-            computed.extend(Self::bounds_of_all(store, batch)?);
+            computed.extend(Self::bounds_of_all(store, batch, &WaveBounds::default())?);
             progress(stats.stored + computed.len(), total);
         }
         store.record_bounds(&computed)?;
@@ -356,8 +396,8 @@ impl SpatialIndex {
     /// As [`SpatialIndex::refit`]. The index is unchanged on error.
     pub fn update(&mut self, store: &mut TileStore, keys: &[TileKey]) -> Result<(), IndexError> {
         self.check_known(keys)?;
-        store.evaluate_many(keys, Evaluation::Normals)?;
-        self.refit(store, keys)
+        let wave = store.evaluate_many_with_bounds(keys)?;
+        self.refit_with(store, keys, &wave)
     }
 
     /// Refits the tree to the bounds of the tiles `keys` as the store evaluates them now, and
@@ -373,8 +413,25 @@ impl SpatialIndex {
     /// As [`SpatialIndex::bounds_of`]; [`IndexError::UnknownTile`] for a tile not in the index.
     /// The index is unchanged on error.
     pub fn refit(&mut self, store: &mut TileStore, keys: &[TileKey]) -> Result<(), IndexError> {
+        self.refit_with(store, keys, &WaveBounds::default())
+    }
+
+    /// [`SpatialIndex::refit`], taking the bounds of `wave` (from
+    /// [`TileStore::evaluate_many_with_bounds`]) for the tiles it has, if they are still
+    /// current (see [`WaveBounds`]): those tiles aren't read back from the store. The same
+    /// bits as `refit`.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpatialIndex::refit`].
+    pub fn refit_with(
+        &mut self,
+        store: &mut TileStore,
+        keys: &[TileKey],
+        wave: &WaveBounds,
+    ) -> Result<(), IndexError> {
         self.check_known(keys)?;
-        let changed = Self::bounds_of_all(store, keys)?;
+        let changed = Self::bounds_of_all(store, keys, wave)?;
         // The store first: the tree's refit changes nothing when it fails, and can't fail here
         // (every key is known), so a failure leaves the index as it was.
         store.record_bounds(&changed)?;
@@ -383,12 +440,13 @@ impl SpatialIndex {
 
     /// The bounds of each of `keys`, in order, as [`SpatialIndex::bounds_of`] gives them.
     ///
-    /// Each tile is made current as `bounds_of` makes it, one after another (a lookup for a
-    /// tile already current), and then the bounds, which are a box and a cone over each tile's
-    /// cached positions and normals, are computed on the store's workers
-    /// ([`TileStore::par_map`]). A tile that a later tile's evaluation pushed out of the cache
-    /// meanwhile is done on its own, with `bounds_of`. Either way the bounds are those of the
-    /// tile as the store evaluates it.
+    /// A tile `wave` has current bounds for takes those (see [`WaveBounds`]). Each other tile
+    /// is made current as `bounds_of` makes it, one after another (a lookup for a tile already
+    /// current), and then their bounds, which are a box and a cone over each tile's cached
+    /// positions and normals, are computed on the store's workers ([`TileStore::par_map`]). A
+    /// tile that a later tile's evaluation pushed out of the cache meanwhile is done on its
+    /// own, with `bounds_of`. Either way the bounds are those of the tile as the store
+    /// evaluates it.
     ///
     /// # Errors
     ///
@@ -396,14 +454,23 @@ impl SpatialIndex {
     fn bounds_of_all(
         store: &mut TileStore,
         keys: &[TileKey],
+        wave: &WaveBounds,
     ) -> Result<Vec<(TileKey, TileBounds)>, IndexError> {
-        for &key in keys {
+        let known: Vec<Option<TileBounds>> =
+            keys.iter().map(|key| wave.current(store, key)).collect();
+        let rest: Vec<TileKey> = keys
+            .iter()
+            .zip(&known)
+            .filter(|(_, known)| known.is_none())
+            .map(|(&key, _)| key)
+            .collect();
+        for &key in &rest {
             store.evaluate(key)?;
             store.normals(key)?;
         }
         let computed: Vec<Option<Result<TileBounds, IndexError>>> = {
             let cache = &*store;
-            let cached: Vec<(TileKey, Option<Cached<'_>>)> = keys
+            let cached: Vec<(TileKey, Option<Cached<'_>>)> = rest
                 .iter()
                 .map(|key| {
                     let views = cache.cached_positions(key).zip(cache.cached_normals(key));
@@ -416,12 +483,16 @@ impl SpatialIndex {
                 })
             })
         };
+        let mut computed = computed.into_iter();
         keys.iter()
-            .zip(computed)
-            .map(|(&key, bounds)| {
-                let bounds = match bounds {
-                    Some(bounds) => bounds?,
-                    None => Self::bounds_of(store, key)?,
+            .zip(known)
+            .map(|(&key, known)| {
+                let bounds = match known {
+                    Some(bounds) => bounds,
+                    None => match computed.next().flatten() {
+                        Some(bounds) => bounds?,
+                        None => Self::bounds_of(store, key)?,
+                    },
                 };
                 Ok((key, bounds))
             })

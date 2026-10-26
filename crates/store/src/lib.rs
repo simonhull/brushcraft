@@ -44,7 +44,7 @@ pub use file::{
 };
 pub use index::{
     Aabb, Bvh, Hit, IndexError, LoadStats, MAX_TILES, NormalCone, Ray, SpatialIndex, SphereQuery,
-    TileBounds,
+    TileBounds, WaveBounds,
 };
 pub use meta::{Meta, ProjectId, Role, SavePoint};
 pub use op::{MAX_SEQ, OpId, RESERVED_SITE};
