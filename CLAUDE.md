@@ -35,6 +35,20 @@ if they disagree, raise it rather than drifting silently.
 - Profiling: `samply` (pinned in `mise.toml`) on a release build, e.g. `samply record --save-only -o
   /tmp/brush.json.gz target/release/brushcraft-bench brush`, then `samply load /tmp/brush.json.gz`. On Linux it
   needs `kernel.perf_event_paranoid` at 1 or lower (`echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid`).
+- Property tests: the parsers' `bolero` checks run in `cargo nextest` (a second each); fuzz one for
+  longer with `cargo +$BRUSHCRAFT_NIGHTLY bolero test -p store file::fuzz::<harness> -T 60s`.
+- Whole-file fuzzing, in `fuzz/` (a workspace of its own): `cd fuzz && cargo +$BRUSHCRAFT_NIGHTLY fuzz
+  run --target x86_64-unknown-linux-gnu project_open -- -max_total_time=300 -timeout=10` (or
+  `mesh_from_bytes`). The `--target` is needed: the pinned cargo-fuzz binary defaults to musl. Seeds are
+  `fuzz/corpus/<target>/seed-*`, rewritten by `cargo nextest run -p store --run-ignored only
+  write_fuzz_seeds`; grown corpora and crash artifacts stay untracked.
+- Test strength: `cargo mutants -p store --in-diff <(git diff main...)` (and `-p geom`), `--jobs` at most
+  half the cores; settings in `.cargo/mutants.toml`. Survivors in `input/src/dejitter.rs` threshold
+  comparisons are tuning slack. The whole workspace runs weekly in CI (`.github/workflows/weekly.yml`).
+- Coverage, a map with no threshold: `cargo llvm-cov nextest --workspace --all-features --profile coverage --html` (report in
+  `target/llvm-cov/html`); code run only by the killed crash-test children shows as uncovered.
+- Proofs of the integer arithmetic: `cargo kani -p store` and `cargo kani -p geom` (the `#[cfg(kani)] mod
+  proofs` blocks; `cargo kani setup` once). Kani brings its own nightly toolchain.
 - Toolchain and cargo tools are pinned in `mise.toml`; bump `rust` there and `rust-version` in `Cargo.toml`
   together. Run cargo through mise (`mise exec -- cargo …` in a shell without `mise activate`), or you get
   rustup's default toolchain instead.
