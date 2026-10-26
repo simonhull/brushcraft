@@ -41,6 +41,21 @@ pub(crate) fn assert_loads_as_built(store: &mut TileStore, level: Level, what: &
     stats
 }
 
+/// Bounds of `keys` as a [`WaveBounds`] of `store` now, computed with
+/// [`SpatialIndex::bounds_of`]: what a normals wave would hand back, for tests of when such
+/// bounds stop being used.
+pub(crate) fn wave_now(store: &mut TileStore, keys: &[TileKey]) -> WaveBounds {
+    let bounds = keys
+        .iter()
+        .map(|&key| (key, SpatialIndex::bounds_of(store, key).unwrap()))
+        .collect();
+    WaveBounds {
+        store: Some(store.id()),
+        edits: store.edits(),
+        bounds,
+    }
+}
+
 /// The level the store-backed tests index: whole-face tiles of 16 × 16 quads.
 const LEVEL: u8 = 4;
 
@@ -414,6 +429,43 @@ fn no_bound_is_stale_after_a_refit() {
             "{key:?}: its cone may have turned, and it wasn't refitted"
         );
     }
+}
+
+/// Bounds a normals wave computed over another store are ignored: the refit computes every
+/// bound itself, and the index holds the bounds of its own store's tiles.
+///
+/// The two stores open the same mesh and differ by one edit, so the other store's bound for
+/// the edited tile is not this store's: had it been used, the refit would be wrong.
+#[test]
+fn bounds_from_another_store_are_ignored() {
+    let (dir_a, dir_b) = (TestDir::new(), TestDir::new());
+    let mesh = Arc::new(cube_sphere(2).unwrap());
+    let (mut edited, mut other) = (store_over(&dir_a, &mesh), store_over(&dir_b, &mesh));
+    let mut index = SpatialIndex::build(&mut other, level(), |_, _| {}).unwrap();
+    SpatialIndex::build(&mut edited, level(), |_, _| {}).unwrap();
+    edited.begin_op().unwrap();
+    edited
+        .set_correction(FaceId::new(2), level(), 7, 7, Vec3::new(0.0, 0.0, 0.4))
+        .unwrap();
+    let key = TileKey::displacement(FaceId::new(2), level(), 0, 0).unwrap();
+    let keys: Vec<TileKey> = edited.normal_inputs(&key).unwrap().into_owned();
+    let wave = edited.evaluate_many_with_bounds(&keys).unwrap();
+    let theirs = wave.current(&edited, &key).unwrap();
+    assert!(wave.current(&other, &key).is_none(), "not this store's");
+    index.refit_with(&mut other, &keys, &wave).unwrap();
+    for k in &keys {
+        let ours = SpatialIndex::bounds_of(&mut other, *k).unwrap();
+        assert_eq!(
+            index.bvh().bounds(k).unwrap().to_bits(),
+            ours.to_bits(),
+            "{k:?}"
+        );
+    }
+    assert_ne!(
+        index.bvh().bounds(&key).unwrap().to_bits(),
+        theirs.to_bits(),
+        "the other store's bound differs"
+    );
 }
 
 #[test]

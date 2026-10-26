@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::index::SpatialIndex;
-use crate::index::tests::assert_loads_as_built;
+use crate::index::tests::{assert_loads_as_built, wave_now};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
 
@@ -557,14 +557,20 @@ fn a_tile_lost_to_a_save_drops_what_was_evaluated_from_it() {
     );
     store.save().unwrap();
     let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    let wave = wave_now(&mut store, &[lost]);
     // The clean slot goes; the evaluations made from it stay cached.
     evict(&mut store, &lost);
     damage(&dir.path("r1.bcrf"), store.file.locate(&lost).unwrap());
     let proof = store.save_into(&mut project).unwrap();
     assert_eq!(proof.lost().iter().copied().collect::<Vec<_>>(), [lost]);
+    assert!(wave.current(&store, &lost).is_some(), "current before");
     store
         .rebase(proof, recovery(&dir, "r2.bcrf", &project))
         .unwrap();
+    assert!(
+        wave.current(&store, &lost).is_none(),
+        "bounds from before the rebase that lost the tile are not used"
+    );
     assert_positions(
         &mut store,
         &dense(&mesh, &saved),

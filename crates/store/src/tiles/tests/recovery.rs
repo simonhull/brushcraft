@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::index::SpatialIndex;
-use crate::index::tests::assert_loads_as_built;
+use crate::index::tests::{assert_loads_as_built, wave_now};
 use crate::recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 
 /// Blocks until the writer has no flush in flight or queued, advancing it reply by reply.
@@ -1086,12 +1086,20 @@ fn a_tile_left_out_of_a_flush_drops_what_was_evaluated_from_it() {
         edit_interior(&mut store, oracle, *key, c);
     }
     SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    let wave = wave_now(&mut store, &[no_op, invalid]);
     store.unsaved.remove(&no_op);
     let id = store.corrections.find(&invalid).unwrap();
     store.corrections.get_mut(id).unwrap().side = 0;
+    assert!(wave.current(&store, &no_op).is_some(), "current before");
     writer.end_stroke(&mut store, Instant::now()).unwrap();
     settle(&mut writer, &mut store);
     assert_eq!(writer.take_skipped().len(), 2, "both left out");
+    assert!(
+        [no_op, invalid]
+            .iter()
+            .all(|key| wave.current(&store, key).is_none()),
+        "bounds from before the flush that lost the tiles are not used"
+    );
     assert_positions(
         &mut store,
         &dense(&mesh, &map),
@@ -1379,15 +1387,21 @@ fn a_tile_lost_to_a_roll_over_drops_what_was_evaluated_from_it() {
     edit_interior(&mut store, &mut want, kept, Vec3::new(0.25, 0.0, 0.0));
     store.save().unwrap();
     let mut index = SpatialIndex::build(&mut store, level(TOP), |_, _| {}).unwrap();
+    let wave = wave_now(&mut store, &[lost]);
     // The clean slot goes; the evaluations made from it stay cached.
     evict(&mut store, &lost);
     damage(&path, store.file.locate(&lost).unwrap());
     let meta = store.file.meta().clone();
     let fresh = ProjectFile::create_like(&dir.path("fresh.bcrf"), meta, &store.file).unwrap();
     let filled = store.fill_roll_over(fresh).unwrap();
+    assert!(wave.current(&store, &lost).is_some(), "current before");
     let (old, lost_tiles) = store.roll_over(filled).unwrap();
     drop(old);
     assert_eq!(lost_tiles, [lost], "listed as lost");
+    assert!(
+        wave.current(&store, &lost).is_none(),
+        "bounds from before the roll-over that lost the tile are not used"
+    );
     assert_positions(
         &mut store,
         &dense(&mesh, &want),
