@@ -736,6 +736,63 @@ mod tests {
         assert!(!twice.has_normals(&x), "x's normals read its old positions");
     }
 
+    /// A tile that left the pool but stays for the tile that reads it, predicted again from
+    /// the same parents (the fast path), is resident again with its edges as they were: the
+    /// graph recording it once makes.
+    #[test]
+    fn positions_recorded_again_after_leaving_the_pool_change_nothing() {
+        let (g, p, c) = (key(1, 0), key(2, 0), key(3, 0));
+        let mut once = DepGraph::new();
+        once.record_positions(g, &[]);
+        once.record_positions(p, &[g]);
+        once.record_positions(c, &[p]);
+        // Normals computed once and dropped, as leaving the pool drops them: their inputs'
+        // list stays, structural.
+        once.record_normals(p, &[p]);
+        once.drop_normals(p);
+        let mut again = DepGraph::new();
+        again.record_positions(g, &[]);
+        again.record_positions(p, &[g]);
+        again.record_positions(c, &[p]);
+        again.record_normals(p, &[p]);
+        again.left_pool(p);
+        assert_eq!(again.parents(&p), Some(&[g][..]), "kept for its reader c");
+        again.record_positions(p, &[g]);
+        again.check_invariants().unwrap();
+        assert_eq!(again, once, "resident again, the same edges");
+        assert!(!again.has_normals(&p), "its normals went with its slot");
+    }
+
+    /// The same parents in another order take the slow path: the edges are rebuilt and the
+    /// graph is the one recording that order once makes.
+    #[test]
+    fn positions_recorded_again_from_permuted_parents_rebuild_the_edges() {
+        let (ga, gb, p) = (key(1, 0), key(1, 1), key(2, 0));
+        let build = |orders: &[[TileKey; 2]]| {
+            let mut graph = DepGraph::new();
+            graph.record_positions(ga, &[]);
+            graph.record_positions(gb, &[]);
+            for parents in orders {
+                graph.record_positions(p, parents);
+            }
+            graph.check_invariants().unwrap();
+            graph
+        };
+        let permuted = build(&[[ga, gb], [gb, ga]]);
+        assert_eq!(
+            permuted,
+            build(&[[gb, ga]]),
+            "as recorded once in that order"
+        );
+        assert_eq!(permuted.parents(&p), Some(&[gb, ga][..]));
+        assert_eq!(
+            permuted.cascade([ga]).positions,
+            set([ga, p]),
+            "still read by p"
+        );
+        assert_eq!(permuted.cascade([gb]).positions, set([gb, p]), "both edges");
+    }
+
     #[test]
     fn rerecording_positions_drops_normals() {
         let mut graph = DepGraph::new();
