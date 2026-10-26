@@ -34,13 +34,27 @@ pub(crate) fn sqrt(x: f32) -> f32 {
     if x <= 0.0 {
         return 0.0;
     }
-    if !x.is_finite() {
+    if !is_finite(x) {
         return x;
     }
     if x < f32::MIN_POSITIVE {
         return rsqrt_newton(x * SUBNORMAL_LIFT) * SUBNORMAL_UNDO;
     }
     rsqrt_newton(x)
+}
+
+/// The bits of an `f32`'s exponent field: all set for `±∞` and NaN, and only for them.
+const EXPONENT_MASK: u32 = 0x7F80_0000;
+
+/// Whether `x` is finite: neither infinite nor NaN. The same answer as [`f32::is_finite`].
+///
+/// Tested on the exponent bits rather than through `f32::is_finite`, which `core` writes as
+/// `x.abs() < f32::INFINITY`: compiled for the GPU, that comparison keeps `+∞` as a constant,
+/// and `naga` (`wgpu`'s shader translator, the only way onto Metal) rejects infinite literals,
+/// so the brush's shader wouldn't load. The bit test needs no float constant at all.
+#[inline]
+const fn is_finite(x: f32) -> bool {
+    x.to_bits() & EXPONENT_MASK != EXPONENT_MASK
 }
 
 /// `√x` for a positive, finite, normal `x`, as `x · (1/√x)` (see [`sqrt`]).
@@ -82,6 +96,41 @@ mod tests {
                     ulps(ours, exact)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn is_finite_agrees_with_core_on_every_class_of_input() {
+        let mut cases = std::vec::Vec::new();
+        // ±0, subnormals at both ends, normals at both ends, ±∞, and NaNs with several
+        // payloads (signalling, quiet, all ones), each with both signs.
+        for magnitude in [
+            0,
+            1,
+            0x7F_FFFF,
+            0x80_0000,
+            0x3F80_0000,
+            0x7F7F_FFFF,
+            0x7F80_0000,
+            0x7F80_0001,
+            0x7FA0_0000,
+            0x7FC0_0000,
+            0x7FFF_FFFF,
+        ] {
+            cases.push(magnitude);
+            cases.push(magnitude | 0x8000_0000);
+        }
+        // Either side of the exponent mask's boundary, at every mantissa bit: the largest
+        // finite exponent and the all-ones one.
+        for bit in 0..23 {
+            cases.push(0x7F00_0000 | (1 << bit));
+            cases.push(0x7F80_0000 | (1 << bit));
+        }
+        // And a dense sample of all 2^32 patterns: every 4099th, a prime stride.
+        cases.extend((0..=u32::MAX).step_by(4099));
+        for bits in cases {
+            let x = f32::from_bits(bits);
+            assert_eq!(is_finite(x), x.is_finite(), "{bits:#010X}");
         }
     }
 
