@@ -33,6 +33,7 @@ mod slot;
 mod stamp;
 #[cfg(test)]
 mod test_dir;
+mod tile_bounds;
 mod tiles;
 mod workers;
 

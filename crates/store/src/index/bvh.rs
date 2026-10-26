@@ -45,7 +45,8 @@ use std::collections::{BTreeSet, BinaryHeap};
 use geom::{TileKey, Vec3};
 
 use self::keys::KeyTable;
-use super::{IndexError, TileBounds};
+use super::IndexError;
+use crate::tile_bounds::{Aabb, Axis, TileBounds};
 
 /// Bins per axis the build sorts centroids into to find a split.
 const BINS: usize = 16;
@@ -73,129 +74,7 @@ const fn narrow(i: usize) -> u32 {
     i as u32
 }
 
-/// A coordinate axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Axis {
-    /// The x axis.
-    X,
-    /// The y axis.
-    Y,
-    /// The z axis.
-    Z,
-}
-
-impl Axis {
-    /// All three axes, in order.
-    const ALL: [Self; 3] = [Self::X, Self::Y, Self::Z];
-
-    /// `v`'s component along this axis.
-    const fn of(self, v: Vec3) -> f32 {
-        match self {
-            Self::X => v.x,
-            Self::Y => v.y,
-            Self::Z => v.z,
-        }
-    }
-}
-
-/// The component-wise minimum of `a` and `b`.
-const fn component_min(a: Vec3, b: Vec3) -> Vec3 {
-    Vec3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z))
-}
-
-/// The component-wise maximum of `a` and `b`.
-const fn component_max(a: Vec3, b: Vec3) -> Vec3 {
-    Vec3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z))
-}
-
-/// An axis-aligned bounding box: every point between [`Aabb::min`] and [`Aabb::max`],
-/// component by component.
-///
-/// Its corners are finite and `min ≤ max` in every component, so a box always holds at least
-/// one point; the constructors check it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Aabb {
-    /// The low corner.
-    min: Vec3,
-    /// The high corner.
-    max: Vec3,
-}
-
 impl Aabb {
-    /// The box from `min` to `max`, or `None` unless both are finite and `min ≤ max` in every
-    /// component.
-    #[must_use]
-    pub fn new(min: Vec3, max: Vec3) -> Option<Self> {
-        let ordered = Axis::ALL.iter().all(|&a| a.of(min) <= a.of(max));
-        (min.is_finite() && max.is_finite() && ordered).then_some(Self { min, max })
-    }
-
-    /// The smallest box holding every finite point of `points`, or `None` if there is none.
-    /// Points with a NaN or infinite component are skipped.
-    #[must_use]
-    pub fn from_points(points: impl IntoIterator<Item = Vec3>) -> Option<Self> {
-        points
-            .into_iter()
-            .filter(|p| p.is_finite())
-            .map(Self::point)
-            .reduce(Self::union)
-    }
-
-    /// The box holding just `p`, which must be finite.
-    const fn point(p: Vec3) -> Self {
-        Self { min: p, max: p }
-    }
-
-    /// The low corner.
-    #[must_use]
-    pub const fn min(&self) -> Vec3 {
-        self.min
-    }
-
-    /// The high corner.
-    #[must_use]
-    pub const fn max(&self) -> Vec3 {
-        self.max
-    }
-
-    /// The smallest box holding both boxes.
-    #[must_use]
-    pub const fn union(self, other: Self) -> Self {
-        Self {
-            min: component_min(self.min, other.min),
-            max: component_max(self.max, other.max),
-        }
-    }
-
-    /// The centre of the box.
-    #[must_use]
-    pub fn centroid(&self) -> Vec3 {
-        (self.min + self.max) * 0.5
-    }
-
-    /// The box's surface area: `2 (dx dy + dy dz + dz dx)`.
-    #[must_use]
-    pub fn surface_area(&self) -> f32 {
-        let d = self.max - self.min;
-        2.0 * (d.x * d.y + d.y * d.z + d.z * d.x)
-    }
-
-    /// Whether `p` lies in the box (its faces included).
-    #[must_use]
-    pub fn contains(&self, p: Vec3) -> bool {
-        Axis::ALL
-            .iter()
-            .all(|&a| (a.of(self.min)..=a.of(self.max)).contains(&a.of(p)))
-    }
-
-    /// The squared distance from `p` to the nearest point of the box: 0 inside it.
-    #[must_use]
-    pub fn distance_squared(&self, p: Vec3) -> f32 {
-        let nearest = component_min(component_max(p, self.min), self.max);
-        let d = p - nearest;
-        d.dot(d)
-    }
-
     /// Where `ray` enters the box: the least `t ≥ 0` with `ray.at(t)` in it (0 if the origin
     /// is inside), or `None` if the ray misses it. The box's faces count as inside, so a ray
     /// running along a face, an edge or a seam between two boxes enters them.

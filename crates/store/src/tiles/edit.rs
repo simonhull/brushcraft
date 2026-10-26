@@ -657,7 +657,7 @@ impl TileStore {
     /// [`TileStore::rebase`], [`TileStore::roll_over`] or [`TileStore::lose_left_out`]
     /// ([`TileStore::drop_lost_slot`], [`TileStore::reload_lost`]). An ordinary page-in reads
     /// what the files hold and changes nothing. While it stays the same, every tile evaluates
-    /// to the same bits: what [`WaveBounds`](crate::index::WaveBounds) checks before its bounds are
+    /// to the same bits: what [`WaveBounds`](super::WaveBounds) checks before its bounds are
     /// used.
     pub(crate) const fn edits(&self) -> u64 {
         self.edits

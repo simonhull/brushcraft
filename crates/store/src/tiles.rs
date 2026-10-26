@@ -152,6 +152,7 @@ pub use edit::TileEdit;
 pub use error::{CacheError, Invariant};
 pub(crate) use layers::{Saved, Snapshot};
 pub use pins::PinGuard;
+pub use read::WaveBounds;
 
 /// A [`TileStore`]'s identity among the stores the process opens ([`TileStore::id`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -7,10 +7,10 @@ use super::error::FileError;
 use super::reader::{FileReader, ReadScratch};
 use super::{Loc, read_bounds_at};
 use crate::OpId;
-use crate::index::TileBounds;
 use crate::meta::{Meta, SavePoint};
 use crate::shared_map::SharedMap;
 use crate::slot::CorrectionSlot;
+use crate::tile_bounds::TileBounds;
 
 /// A project file as of a save point, lent to a [`crate::TileStore`] as the read-only layer under
 /// its working file: corrections the working file doesn't hold are read from here. Made by

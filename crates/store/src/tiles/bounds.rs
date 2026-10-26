@@ -21,7 +21,7 @@ use super::TileStore;
 use super::error::CacheError;
 use super::round::{Fill, fill_slot};
 use crate::file::Loc;
-use crate::index::TileBounds;
+use crate::tile_bounds::TileBounds;
 
 impl TileStore {
     /// Records `bounds`, computed from the store's current state (by the spatial index), as

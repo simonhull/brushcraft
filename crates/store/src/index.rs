@@ -22,12 +22,13 @@ mod bvh;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use bvh::{Aabb, Bvh, Hit, MAX_TILES, Ray, SphereQuery};
+pub use bvh::{Bvh, Hit, MAX_TILES, Ray, SphereQuery};
 use geom::{BaseMesh, Level, MAX_LEVEL, TILE_QUADS, TileKey, Vec3};
 use thiserror::Error;
 
-use crate::hash::TileMap;
-use crate::tiles::{CacheError, Evaluation, StoreId, TileStore};
+pub use crate::tile_bounds::{Aabb, NormalCone, TileBounds};
+pub use crate::tiles::WaveBounds;
+use crate::tiles::{CacheError, Evaluation, TileStore};
 
 /// Tiles [`SpatialIndex::build`] evaluates together before it reads their bounds.
 ///
@@ -63,192 +64,8 @@ pub enum IndexError {
     UnknownTile(TileKey),
 }
 
-/// A cone bounding a set of unit normals: every normal is within its half-angle of its axis.
-///
-/// The cone of a tile tells, without evaluating the tile, whether all of it faces away from a
-/// viewer or a brush. When the normals spread too far for a cone to say anything (or aren't
-/// all valid), the cone is [`NormalCone::EVERYTHING`], which holds every direction.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NormalCone {
-    /// The cone's axis, a unit vector.
-    axis: Vec3,
-    /// The cosine of the cone's half-angle, in `[-1, 1]`: `-1` holds every direction.
-    cos_half_angle: f32,
-}
-
-impl NormalCone {
-    /// The cone that holds every direction: what a tile gets when its normals can't be bounded
-    /// any tighter.
-    pub const EVERYTHING: Self = Self {
-        axis: Vec3::new(0.0, 0.0, 1.0),
-        cos_half_angle: -1.0,
-    };
-    /// How far below the least `cos` of the normals the bound is set, so rounding in the dot
-    /// products never leaves one of them just outside the cone.
-    const SLACK: f32 = 1e-5;
-    /// How far from 1 a stored axis's squared length may be: a normalised vector's is within a
-    /// few units in the last place, and anything further isn't an axis this code made.
-    const UNIT_SLACK: f32 = 1e-4;
-
-    /// A cone holding every one of `normals`: its axis is their normalised mean, its half-angle
-    /// that of the normal furthest from it.
-    ///
-    /// That isn't the narrowest bounding cone, but it is cheap and close to it for the gently
-    /// curved normals of one tile. [`NormalCone::EVERYTHING`] if `normals` is empty, holds a
-    /// normal that isn't finite, or averages to nothing (normals spread all around).
-    #[must_use]
-    pub fn from_normals(normals: &[Vec3]) -> Self {
-        if !normals.iter().all(|n| n.is_finite()) {
-            return Self::EVERYTHING;
-        }
-        let Some(axis) = normals
-            .iter()
-            .fold(Vec3::ZERO, |sum, &n| sum + n)
-            .normalized()
-        else {
-            return Self::EVERYTHING;
-        };
-        let least = normals
-            .iter()
-            .filter_map(|n| n.normalized())
-            .map(|n| axis.dot(n))
-            .fold(1.0_f32, f32::min);
-        Self {
-            axis,
-            cos_half_angle: (least - Self::SLACK).max(-1.0),
-        }
-    }
-
-    /// The cone's axis, a unit vector.
-    #[must_use]
-    pub const fn axis(&self) -> Vec3 {
-        self.axis
-    }
-
-    /// The cosine of the cone's half-angle: `-1` for a cone that holds every direction.
-    #[must_use]
-    pub const fn cos_half_angle(&self) -> f32 {
-        self.cos_half_angle
-    }
-
-    /// The cone with `axis` and `cos_half_angle` as a stored bound holds them, bit for bit;
-    /// `None` unless both are finite, the cosine is in `[-1, 1]` and the axis is a unit vector
-    /// (to within [`NormalCone::UNIT_SLACK`], as normalising leaves it).
-    pub(crate) fn from_parts(axis: Vec3, cos_half_angle: f32) -> Option<Self> {
-        let unit = (axis.dot(axis) - 1.0).abs() <= Self::UNIT_SLACK;
-        let valid = axis.is_finite() && unit && (-1.0..=1.0).contains(&cos_half_angle);
-        valid.then_some(Self {
-            axis,
-            cos_half_angle,
-        })
-    }
-
-    /// Whether the direction of `n` lies in the cone. A zero or non-finite `n` has no
-    /// direction, and lies in no cone.
-    #[must_use]
-    pub fn contains(&self, n: Vec3) -> bool {
-        n.normalized()
-            .is_some_and(|n| self.axis.dot(n) >= self.cos_half_angle)
-    }
-}
-
-/// What the index knows of one tile without evaluating it: where it is and which way it faces.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TileBounds {
-    /// The box of the tile's evaluated positions.
-    pub aabb: Aabb,
-    /// A cone bounding the tile's normals.
-    pub cone: NormalCone,
-}
-
-impl TileBounds {
-    /// How many `u32` [`TileBounds::to_bits`] gives.
-    pub(crate) const BITS: usize = 10;
-
-    /// The bounds as bits, in the order the project file stores them: the box's low corner and
-    /// high corner, the cone's axis (each `x`, `y`, `z`), then the cone's cosine.
-    pub(crate) fn to_bits(self) -> [u32; Self::BITS] {
-        let [min, max, axis] =
-            [self.aabb.min(), self.aabb.max(), self.cone.axis].map(Vec3::to_bits);
-        let cos = self.cone.cos_half_angle.to_bits();
-        let mut bits = [0; Self::BITS];
-        let all = min.into_iter().chain(max).chain(axis).chain([cos]);
-        for (slot, value) in bits.iter_mut().zip(all) {
-            *slot = value;
-        }
-        bits
-    }
-
-    /// The bounds [`TileBounds::to_bits`] gave these bits, bit for bit; `None` unless they make
-    /// a valid box ([`Aabb::new`]) and cone ([`NormalCone::from_parts`]).
-    pub(crate) fn from_bits(bits: [u32; Self::BITS]) -> Option<Self> {
-        let [
-            min_x,
-            min_y,
-            min_z,
-            max_x,
-            max_y,
-            max_z,
-            axis_x,
-            axis_y,
-            axis_z,
-            cos,
-        ] = bits.map(f32::from_bits);
-        Some(Self {
-            aabb: Aabb::new(
-                Vec3::new(min_x, min_y, min_z),
-                Vec3::new(max_x, max_y, max_z),
-            )?,
-            cone: NormalCone::from_parts(Vec3::new(axis_x, axis_y, axis_z), cos)?,
-        })
-    }
-
-    /// The bounds of a tile with these evaluated `positions` and `normals`; `None` if no
-    /// position is finite.
-    #[must_use]
-    pub fn of_tile(positions: &[Vec3], normals: &[Vec3]) -> Option<Self> {
-        Some(Self {
-            aabb: Aabb::from_points(positions.iter().copied())?,
-            cone: NormalCone::from_normals(normals),
-        })
-    }
-}
-
 /// A tile's cached positions and normals, which its bounds are computed from.
 type Cached<'a> = (&'a [Vec3], &'a [Vec3]);
-
-/// Bounds the normals wave of [`TileStore::evaluate_many_with_bounds`] computed, for
-/// [`SpatialIndex::refit_with`].
-///
-/// They are the store's own: only the store makes them, and a refit uses them only over the
-/// store that made them, and only while no correction has been written to it since. Every tile
-/// then evaluates to the bits it had when they were computed, so each is the bound
-/// [`SpatialIndex::bounds_of`] would compute again. Otherwise the refit computes every bound
-/// itself, as [`SpatialIndex::refit`] does.
-#[derive(Debug, Clone, Default)]
-pub struct WaveBounds {
-    /// The store that computed them.
-    pub(crate) store: Option<StoreId>,
-    /// That store's count of writes ([`TileStore::edits`]) when they were computed.
-    pub(crate) edits: u64,
-    /// The bounds, by tile.
-    pub(crate) bounds: TileMap<TileBounds>,
-}
-
-impl WaveBounds {
-    /// How many tiles have bounds.
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.bounds.len()
-    }
-
-    /// `key`'s bounds, if they were computed and are still the tile's in `store`: the store
-    /// that computed them, with no correction written since.
-    pub(crate) fn current(&self, store: &TileStore, key: &TileKey) -> Option<TileBounds> {
-        let fresh = self.store == Some(store.id()) && self.edits == store.edits();
-        fresh.then(|| self.bounds.get(key).copied()).flatten()
-    }
-}
 
 /// What [`SpatialIndex::load`] found stored, and what it had to evaluate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

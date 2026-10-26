@@ -8,8 +8,8 @@ use geom::TileKey;
 use super::Loc;
 use super::format::read_exact;
 use crate::bounds::{StoredBound, parse_bounds_payload};
-use crate::index::TileBounds;
 use crate::record::{KIND_BOUNDS, verify};
+use crate::tile_bounds::TileBounds;
 
 /// The bound in a raw record, if the record verifies and holds a bound of `key`.
 pub(super) fn bounds_record(raw: &[u8], key: &TileKey) -> Option<StoredBound> {

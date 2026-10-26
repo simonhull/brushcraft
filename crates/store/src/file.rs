@@ -35,12 +35,12 @@ use self::reader::read_displacement_at;
 use crate::OpId;
 use crate::bounds::bounds_payload;
 use crate::codec::{CodecError, compress, decompress, encode_displacement};
-use crate::index::TileBounds;
 use crate::meta::{Meta, SavePoint};
 use crate::record::{Head, KIND_BOUNDS, KIND_INDEX, KIND_TILE, frame, verify};
 use crate::shared_map::SharedMap;
 use crate::slot::CorrectionSlot;
 use crate::stamp::Stamp;
+use crate::tile_bounds::TileBounds;
 
 mod base;
 mod bounds_io;

@@ -14,9 +14,9 @@ use super::round::{Targets, map_parallel, prefix, vertex_count};
 use super::{StoreId, TileStore};
 use crate::activity::Activity;
 use crate::hash::TileMap;
-use crate::index::{TileBounds, WaveBounds};
 use crate::pool::{Freshness, SlotId};
 use crate::slot::EvaluatedSlot;
+use crate::tile_bounds::TileBounds;
 
 impl TileStore {
     /// The base mesh the store's tiles subdivide: level 0 and the topology.
@@ -260,5 +260,39 @@ impl TileStore {
             keys: keys.into_iter().collect(),
             table: Rc::clone(&self.pins),
         })
+    }
+}
+
+/// Bounds the normals wave of [`TileStore::evaluate_many_with_bounds`] computed, for
+/// [`SpatialIndex::refit_with`](crate::index::SpatialIndex::refit_with).
+///
+/// They are the store's own: only the store makes them, and a refit uses them only over the
+/// store that made them, and only while no correction has been written to it since. Every tile
+/// then evaluates to the bits it had when they were computed, so each is the bound
+/// [`SpatialIndex::bounds_of`](crate::index::SpatialIndex::bounds_of) would compute again.
+/// Otherwise the refit computes every bound itself, as
+/// [`SpatialIndex::refit`](crate::index::SpatialIndex::refit) does.
+#[derive(Debug, Clone, Default)]
+pub struct WaveBounds {
+    /// The store that computed them.
+    pub(crate) store: Option<StoreId>,
+    /// That store's count of writes ([`TileStore::edits`]) when they were computed.
+    pub(crate) edits: u64,
+    /// The bounds, by tile.
+    pub(crate) bounds: TileMap<TileBounds>,
+}
+
+impl WaveBounds {
+    /// How many tiles have bounds.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.bounds.len()
+    }
+
+    /// `key`'s bounds, if they were computed and are still the tile's in `store`: the store
+    /// that computed them, with no correction written since.
+    pub(crate) fn current(&self, store: &TileStore, key: &TileKey) -> Option<TileBounds> {
+        let fresh = self.store == Some(store.id()) && self.edits == store.edits();
+        fresh.then(|| self.bounds.get(key).copied()).flatten()
     }
 }

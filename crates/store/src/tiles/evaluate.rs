@@ -19,9 +19,9 @@ use super::round::{
 use crate::deps::list_normal_inputs;
 use crate::file::ReadScratch;
 use crate::hash::TileMap;
-use crate::index::TileBounds;
 use crate::pool::{Freshness, SlotId};
 use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
+use crate::tile_bounds::TileBounds;
 
 impl TileStore {
     /// The slot of `key`'s current positions: cached and fresh, else evaluated coarse to fine.

@@ -54,8 +54,8 @@ use geom::{BaseMesh, Channel, EvalError, LayerId, Level, Region, TileKey, parent
 
 use crate::bytes::{KEY_LEN, Reader, put_key};
 use crate::deps::DepGraph;
-use crate::index::TileBounds;
 use crate::record::{HEAD, TAIL};
+use crate::tile_bounds::TileBounds;
 
 /// The state byte of a stored bound whose tile's bounds are unknown: the tile is evaluated when
 /// the index is loaded.

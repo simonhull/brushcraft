@@ -363,12 +363,12 @@ type Bounded = BTreeMap<TileKey, Option<[u32; TileBounds::BITS]>>;
 fn bound(seed: f32) -> TileBounds {
     let at = Vec3::new(seed, -seed, 2.0 * seed);
     let cone = if seed.to_bits() % 2 == 1 {
-        crate::index::NormalCone::EVERYTHING
+        crate::tile_bounds::NormalCone::EVERYTHING
     } else {
-        crate::index::NormalCone::from_normals(&[Vec3::new(0.0, 0.0, 1.0)])
+        crate::tile_bounds::NormalCone::from_normals(&[Vec3::new(0.0, 0.0, 1.0)])
     };
     TileBounds {
-        aabb: crate::index::Aabb::new(at, at + Vec3::new(1.0, 1.0, 1.0)).unwrap(),
+        aabb: crate::tile_bounds::Aabb::new(at, at + Vec3::new(1.0, 1.0, 1.0)).unwrap(),
         cone,
     }
 }

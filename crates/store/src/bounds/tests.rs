@@ -7,7 +7,7 @@ use geom::{BaseMesh, Vec3, normal_tiles};
 
 use super::*;
 use crate::fixture::{level, mesh, split_prism, tiles};
-use crate::index::{Aabb, NormalCone};
+use crate::tile_bounds::{Aabb, NormalCone};
 
 /// Bounds with every kind of value a tile's bounds can hold: a negative zero, a tight cone.
 fn sample() -> TileBounds {
