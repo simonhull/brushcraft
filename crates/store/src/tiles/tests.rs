@@ -10,16 +10,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use geom::{
-    BaseMesh, CorrectionError, CorrectionMap, CorrectionTile, DenseEvaluation, FaceId, Level,
-    PositionSource, Region, TileKey, Vec3, cube_sphere, normal_tiles, normals,
+    BaseMesh, Channel, CorrectionError, CorrectionMap, CorrectionTile, DenseEvaluation, FaceId,
+    LayerId, Level, PositionSource, Region, TileKey, Vec3, cube_sphere, normal_tiles, normals,
 };
 
+use super::config::BATCH_SHARE;
 use super::edit::{BorderValues, border_order, update_row};
 use super::layers::{first_op, saved_base};
+use super::round::nothing_to_write;
 use super::*;
 use crate::MAX_SEQ;
+use crate::file::{Loc, StoreError};
 use crate::fixture::meta_for;
 use crate::op::RESERVED_SITE;
+use crate::pool::SlotData;
 use crate::test_dir::TestDir;
 use crate::workers::Workers;
 
