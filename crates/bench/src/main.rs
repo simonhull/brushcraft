@@ -13,7 +13,8 @@
 //! - `perf` runs the tracked performance suite over the others and the stage benches, records it in
 //!   the docs repository's history and flags changes beyond noise ([`perf`]);
 //! - `display-study` measures every candidate display-tile encoding on the project's faces: file
-//!   growth, the error bound, decode cost and seam exactness ([`display_study`]).
+//!   growth, the error bound, decode cost and seam exactness (`display_study`, built with the
+//!   `display-study` feature only).
 //!
 //! Each result is a JSON line on stdout (`{"bench": …, "result": …, …}`); progress and a human
 //! summary go to stderr. The project lives outside the repository, under
@@ -26,6 +27,7 @@
 mod brush;
 mod budget;
 mod cli;
+#[cfg(feature = "display-study")]
 mod display_study;
 mod generate;
 mod noise;
@@ -65,7 +67,13 @@ fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<
         Subcommand::Save => brush::run_save(options, &paths, out),
         Subcommand::Budget => budget::run(options, &paths, out),
         Subcommand::Perf => return perf::run(options, &paths, out),
+        #[cfg(feature = "display-study")]
         Subcommand::DisplayStudy => display_study::run(options, &paths, out),
+        #[cfg(not(feature = "display-study"))]
+        Subcommand::DisplayStudy => Err(anyhow::anyhow!(
+            "built without the display-study feature: \
+             cargo run --release -p brushcraft-bench --features display-study -- display-study"
+        )),
     }?;
     Ok(Status::Clean)
 }

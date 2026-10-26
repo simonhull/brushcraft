@@ -28,7 +28,8 @@ subcommands:
   perf       the tracked performance suite: stage benches and a cached medium project (and
              with --full the benchmark project), compared with the history's baseline
   display-study  every display-tile encoding measured on sampled faces: file growth, the
-             error bound, decode cost and seam exactness (reads the project, saves nothing)
+             error bound, decode cost and seam exactness (reads the project, saves nothing;
+             needs the display-study feature)
 
 options (each subcommand takes the ones it uses):
   --project PATH          the project file (default $XDG_CACHE_HOME/brushcraft/bench/sphere.bcrf);

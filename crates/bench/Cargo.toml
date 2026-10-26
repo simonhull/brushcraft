@@ -9,11 +9,17 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The display-tile encoding study (`display-study`), with the codecs it measures and didn't
+# choose. Off by default, so builds of the workspace never compile those codecs:
+# `cargo run --release -p brushcraft-bench --features display-study -- display-study`.
+display-study = ["geom/display-study", "dep:zstd"]
+
 [dependencies]
 anyhow.workspace = true
-geom = { workspace = true, features = ["display-study"] }
+geom.workspace = true
 rustix = { workspace = true, features = ["process", "thread"] }
 sculpt.workspace = true
 store.workspace = true
 thiserror.workspace = true
-zstd.workspace = true
+zstd = { workspace = true, optional = true }
