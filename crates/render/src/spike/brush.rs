@@ -27,11 +27,11 @@ use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, Buffer, BufferDescriptor, BufferUsages,
-    CommandEncoderDescriptor, ComputePassDescriptor, ComputePassTimestampWrites, ComputePipeline,
-    QUERY_SIZE, QuerySet, QuerySetDescriptor, QueryType, ShaderSource,
+    CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, ShaderSource,
 };
 
 use crate::gpu::{Gpu, GpuError};
+use crate::spike::Timer;
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -43,7 +43,7 @@ const WGSL: &str = include_str!("draw.wgsl");
 /// The SPIR-V rust-gpu compiled from `shaders/brush-gpu`, which calls `brush::draw_vertex`.
 ///
 /// Rebuilt by `shaders/build.sh`; checked in so the gate needs no rust-gpu toolchain,
-/// with a stamp of its sources (`brush_gpu.spv.sources`) the gate checks.
+/// with a stamp of its sources (`spirv.sources`) the gate checks.
 const SPIRV: &[u8] = include_bytes!("brush_gpu.spv");
 
 // SPIR-V is a stream of 32-bit words; `make_spirv_raw` would panic on a partial one.
@@ -512,19 +512,7 @@ impl Footprint {
             return Ok(None);
         };
         self.submit(gpu, brush, Some(timer))?;
-        let ticks: Vec<u64> = gpu.read_buffer_with(&timer.resolved, &timer.staging)?;
-        let elapsed = match ticks.as_slice() {
-            [begin, end] => end.saturating_sub(*begin),
-            _ => 0,
-        };
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a dispatch's ticks are far below 2^52, and the product is nanoseconds"
-        )]
-        let nanos = (elapsed as f64 * f64::from(timer.period)) as u64;
-        Ok(Some(Duration::from_nanos(nanos)))
+        timer.elapsed(gpu).map(Some)
     }
 
     /// Reads the deltas back, waiting for every dispatch submitted before.
@@ -557,62 +545,16 @@ impl Footprint {
             {
                 let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                     label: Some("draw"),
-                    timestamp_writes: timer.map(|timer| ComputePassTimestampWrites {
-                        query_set: &timer.queries,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    }),
+                    timestamp_writes: timer.map(Timer::writes),
                 });
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.dispatch_workgroups(self.count.div_ceil(WORKGROUP), 1, 1);
             }
             if let Some(timer) = timer {
-                encoder.resolve_query_set(&timer.queries, 0..2, &timer.resolved, 0);
+                timer.resolve(&mut encoder);
             }
             gpu.queue().submit([encoder.finish()]);
         })
-    }
-}
-
-/// Two timestamp queries around a compute pass, and the buffers their values are read through.
-#[derive(Debug)]
-struct Timer {
-    /// The begin and end timestamps of the pass.
-    queries: QuerySet,
-    /// Where the queries are resolved to, as two `u64` ticks.
-    resolved: Buffer,
-    /// Where the resolved ticks are copied to be mapped.
-    staging: Buffer,
-    /// Nanoseconds per tick.
-    period: f32,
-}
-
-impl Timer {
-    /// A timer on `gpu`, whose timestamps tick every `period` nanoseconds. Created inside the
-    /// caller's error scope.
-    fn new(gpu: &Gpu, period: f32) -> Self {
-        let device = gpu.device();
-        let size = 2 * QUERY_SIZE;
-        Self {
-            queries: device.create_query_set(&QuerySetDescriptor {
-                label: Some("draw timestamps"),
-                ty: QueryType::Timestamp,
-                count: 2,
-            }),
-            resolved: device.create_buffer(&BufferDescriptor {
-                label: Some("draw timestamps resolved"),
-                size: u64::from(size),
-                usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }),
-            staging: device.create_buffer(&BufferDescriptor {
-                label: Some("draw timestamps readback"),
-                size: u64::from(size),
-                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            }),
-            period,
-        }
     }
 }

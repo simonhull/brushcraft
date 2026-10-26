@@ -11,17 +11,19 @@ workspace = true
 
 [features]
 # M1a's spikes (src/spike): built and tested by the gate, left out of the shipped renderer.
-spike = ["dep:brush"]
+spike = ["dep:brush", "dep:geom"]
 
 [dependencies]
 brush = { workspace = true, optional = true }
 bytemuck.workspace = true
+geom = { workspace = true, optional = true }
 pollster.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
+geom = { workspace = true, features = ["test-fixtures"] }
 
 [[bench]]
 name = "brush_gpu"

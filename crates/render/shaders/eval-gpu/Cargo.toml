@@ -1,0 +1,133 @@
+# One level step of tile evaluation as rust-gpu compute shaders: Catmull–Clark prediction,
+# tangent frames, corrections and normals, `no_std` and allocation-free twins of `geom`'s
+# stencils (M1a spike). Built to SPIR-V by ../build.sh with cargo-gpu, as brush-gpu is; the gate
+# checks the checked-in SPIR-V is current (../check.sh).
+# Its own workspace: it builds for the SPIR-V target, on rust-gpu's toolchain. Its lints are the
+# main workspace's, copied below `[workspace]`; ../check.sh fails if the copy drifts.
+[package]
+name = "eval-gpu"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "One level step of tile evaluation (prediction, frames, corrections, normals) as compute shaders, compiled by rust-gpu (M1a spike)."
+
+# spirv-builder compiles it with `--crate-type dylib` itself; a plain lib lets the host's clippy
+# check it too.
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+# Exact: rust-gpu's crates move in lockstep with the codegen backend cargo-gpu builds.
+spirv-std = "=0.10.0"
+
+[lints]
+workspace = true
+
+[workspace]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+unused_lifetimes = "deny"
+redundant_lifetimes = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+let_underscore_drop = "deny"
+unit_bindings = "deny"
+unnameable_types = "deny"
+meta_variable_misuse = "deny"
+non_ascii_idents = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+# `kani` is set by `cargo kani` (the proofs), `fuzzing` by cargo-fuzz and `cargo bolero`; the
+# `spirv` target is rust-gpu's (crates/render/shaders, which copies this lints table).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(fuzzing)', 'cfg(target_arch, values("spirv"))'] }
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+missing_crate_level_docs = "deny"
+unescaped_backticks = "deny"
+redundant_explicit_links = "deny"
+bare_urls = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+# Nursery lints left off: noisy, or wrong for this codebase.
+missing_const_for_fn = "allow"
+option_if_let_else = "allow"
+redundant_pub_crate = "allow" # conflicts with rustc's unreachable_pub
+suboptimal_flops = "allow" # suggests mul_add, a slow libm call without FMA
+cognitive_complexity = "allow"
+# Restriction lints, opted into one by one.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+as_underscore = "deny"
+assertions_on_result_states = "deny"
+cfg_not_test = "deny"
+clone_on_ref_ptr = "deny"
+create_dir = "deny"
+dbg_macro = "deny"
+deref_by_slicing = "deny"
+empty_drop = "deny"
+empty_enum_variants_with_brackets = "deny"
+empty_structs_with_brackets = "deny"
+error_impl_error = "deny"
+exit = "deny"
+expect_used = "deny"
+filetype_is_file = "deny"
+fn_to_numeric_cast_any = "deny"
+format_push_string = "deny"
+get_unwrap = "deny"
+if_then_some_else_none = "deny"
+indexing_slicing = "deny"
+infinite_loop = "deny"
+iter_over_hash_type = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "deny"
+lossy_float_literal = "deny"
+map_err_ignore = "deny"
+mem_forget = "deny"
+missing_assert_message = "deny"
+missing_docs_in_private_items = "deny"
+mixed_read_write_in_expression = "deny"
+mod_module_files = "deny"
+multiple_inherent_impl = "deny"
+multiple_unsafe_ops_per_block = "deny"
+mutex_atomic = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+partial_pub_fields = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+pub_without_shorthand = "deny"
+rc_buffer = "deny"
+rc_mutex = "deny"
+redundant_type_annotations = "deny"
+renamed_function_params = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+same_name_method = "deny"
+semicolon_if_nothing_returned = "deny"
+shadow_unrelated = "deny"
+str_to_string = "deny"
+string_add = "deny"
+string_lit_chars_any = "deny"
+tests_outside_test_module = "deny"
+todo = "deny"
+try_err = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+unnecessary_self_imports = "deny"
+unneeded_field_pattern = "deny"
+unused_result_ok = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+verbose_file_reads = "deny"
+wildcard_enum_match_arm = "deny"
+
