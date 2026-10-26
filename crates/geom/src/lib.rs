@@ -3,6 +3,7 @@
 //! No GPU or windowing code: everything here runs headless.
 
 mod correction;
+#[cfg(any(test, feature = "test-fixtures"))]
 mod dense;
 mod eval;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -26,6 +27,7 @@ mod topology;
 pub use correction::{
     CorrectionError, CorrectionTile, CorrectionView, CorrectionViewMut, RowUpdate,
 };
+#[cfg(any(test, feature = "test-fixtures"))]
 pub use dense::{CorrectionMap, DenseEvaluation};
 pub use eval::{
     EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,
