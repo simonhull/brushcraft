@@ -35,7 +35,7 @@
 
 use thiserror::Error;
 
-use crate::{EvalError, Level, TileKey, Vec3};
+use crate::{Channel, EvalError, LayerId, Level, TileKey, Vec3};
 
 mod build;
 mod encode;
@@ -67,6 +67,9 @@ pub enum DisplayError {
     /// second of them this tile: seams wouldn't be exact, and the bound would miss the gap.
     #[error("display tile {0:?} decodes a shared vertex differently from its neighbour")]
     Seam(TileKey),
+    /// The key isn't a display tile's: not the base layer's [`Channel::DISPLAY`].
+    #[error("{0:?} is not a display tile")]
+    NotDisplay(TileKey),
     /// The level is the finest, or above it: it has no display tiles.
     #[error("level {0} has no display tiles under the finest level")]
     NoDisplayLevel(Level),
@@ -145,8 +148,12 @@ impl DisplayTile {
     /// The tile `key` from bytes [`DisplayTile::encoded`] gave for a tile [`build_face`] built,
     /// with its bound `error` (stored beside them).
     ///
+    /// Any level's key is accepted, the finest included: a tile doesn't know its finest level, so
+    /// whoever holds the project's checks that.
+    ///
     /// # Errors
     ///
+    /// [`DisplayError::NotDisplay`] for a key of another channel or layer;
     /// [`DisplayError::Malformed`] if the bytes don't hold such a tile of `key`'s side, or the
     /// bound isn't finite and non-negative; [`DisplayError::NotFinite`] if a position decodes
     /// to a value that isn't finite.
@@ -166,6 +173,9 @@ impl DisplayTile {
         error: f32,
         bytes: &[u8],
     ) -> Result<Self, DisplayError> {
+        if key.layer() != LayerId::BASE || key.channel() != Channel::DISPLAY {
+            return Err(DisplayError::NotDisplay(key));
+        }
         if !(error.is_finite() && error >= 0.0) {
             return Err(DisplayError::Malformed);
         }

@@ -611,8 +611,7 @@ fn shared_vertices_decode_identically_across_tiles_and_faces() {
                     region.y0() + j,
                 );
                 for copy in &copies {
-                    let other =
-                        &tiles[&copy.key_in(LayerId::BASE, crate::Channel::DISPLAY, key.level())];
+                    let other = &tiles[&copy.key_in(LayerId::BASE, Channel::DISPLAY, key.level())];
                     let side = other.key().side();
                     let theirs =
                         other.positions()[usize::try_from(copy.j * side + copy.i).unwrap()];
@@ -652,6 +651,12 @@ fn a_built_tile_reads_back_from_its_bytes() {
         DisplayTile::decode(*first.key(), f32::NAN, first.encoded()).map(|_| ()),
         Err(DisplayError::Malformed),
         "a bound that isn't one"
+    );
+    let displacement = TileKey::displacement(face, first.key().level(), 0, 0).unwrap();
+    assert_eq!(
+        DisplayTile::decode(displacement, first.error(), first.encoded()).map(|_| ()),
+        Err(DisplayError::NotDisplay(displacement)),
+        "a key of another channel"
     );
     assert_eq!(
         build_face(face, &unit, &positions, level(FINEST - 1)).map(|_| ()),
