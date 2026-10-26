@@ -7,9 +7,16 @@ use std::os::unix::fs::MetadataExt;
 
 use geom::{FaceId, Level, MeshError, Vec3};
 
+use super::format::{
+    ENTRY_LEN, INDEX_FIXED, MAX_CHAIN, MAX_TILE_RECORD, parse_tile_payload, plausible_index,
+};
 use super::lock::lock_at;
 use super::*;
+use crate::bounds;
+use crate::bytes::KEY_LEN;
 use crate::fixture::{mesh, meta};
+use crate::meta::mesh_hash;
+use crate::record::{HEAD, KIND_MESH, KIND_META, TAIL, parse_head};
 use crate::test_dir::TestDir;
 
 fn key(face: u32) -> TileKey {

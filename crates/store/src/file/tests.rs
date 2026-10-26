@@ -4,7 +4,10 @@ use std::path::Path;
 
 use geom::{Channel, FaceId, LayerId, Level, Vec3};
 
+use super::format::{ENTRY_LEN, parse_index_payload};
 use super::*;
+use crate::bounds;
+use crate::bytes::KEY_LEN;
 use crate::fixture::{self, mesh, meta};
 use crate::test_dir::TestDir;
 

@@ -10,12 +10,14 @@
 
 use geom::{FaceId, LayerId, Level, Vec3};
 
+use super::format::{ENTRY_LEN, MAX_TILE_RECORD, NONE, parse_index_payload, parse_tile_payload};
 use super::*;
 use crate::bounds::{KNOWN_RECORD_LEN, UNKNOWN_RECORD_LEN};
-use crate::fixture;
-use crate::meta::{ProjectId, Role};
+use crate::meta::{MAX_BASE_PATH, ProjectId, Role};
 use crate::op::{MAX_SEQ, RESERVED_SITE};
+use crate::record::{HEAD, TAIL};
 use crate::test_dir::TestDir;
+use crate::{bounds, fixture};
 
 /// A key's raw fields as a generator makes them: layer, channel, face, level, tx, ty.
 type RawKey = (u16, u8, u32, u8, u16, u16);
