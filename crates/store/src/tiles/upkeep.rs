@@ -255,6 +255,22 @@ impl TileStore {
         Ok(report)
     }
 
+    /// Queues building the display tiles of `level` alone (a level below `finest`) the store
+    /// doesn't know: for timing a rebuild level by level, finest first.
+    pub fn queue_display_level(&mut self, finest: Level, level: Level) {
+        let keys: Vec<TileKey> = self
+            .all_display_keys(finest)
+            .into_iter()
+            .filter(|key| key.level() == level)
+            .collect();
+        self.jobs.push_back(Job::Rebuild(Upkeep::new(finest, keys)));
+    }
+
+    /// Drops every queued job, where it is: what they had built stays.
+    pub fn clear_jobs(&mut self) {
+        self.jobs.clear();
+    }
+
     /// Whether any job is queued.
     #[must_use]
     pub fn has_jobs(&self) -> bool {

@@ -27,6 +27,8 @@ subcommands:
   budget     a random walk (evaluate, brush, pan) under a budget, sampling RSS every 100 ms
   perf       the tracked performance suite: stage benches and a cached medium project (and
              with --full the benchmark project), compared with the history's baseline
+  display    the display layer kept: rebuilt level by level, saved (file growth), then the
+             brush stroke with its refresh after each step (saves into the project)
   display-study  every display-tile encoding measured on sampled faces: file growth, the
              error bound, decode cost and seam exactness (reads the project, saves nothing;
              needs the display-study feature)
@@ -48,6 +50,8 @@ options (each subcommand takes the ones it uses):
             given back (cold: every pin maps fresh memory), or emptied with its memory kept
             (warm: as in a running app), or each in turn (both)
   brush:    --steps N (200)  --footprint VERTICES (50000)  --strength F (0.0001)
+            --display (keep the display layer: each step raises its display tiles' bounds)
+  display:  --steps N (200)  --footprint VERTICES (50000)  --strength F (0.0001)
             --per-step (a JSON line per step besides the summary: its time and each phase's,
             its footprint, the tiles the store loaded, evaluated and evicted, page faults)
   save:     --steps N (50)   --footprint VERTICES (50000)  --strength F (0.0001)
@@ -82,11 +86,13 @@ pub(crate) enum Subcommand {
     Perf,
     /// The display-tile encoding study.
     DisplayStudy,
+    /// The display layer's costs.
+    Display,
 }
 
 impl Subcommand {
     /// Every subcommand.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Generate,
         Self::PageIn,
         Self::Brush,
@@ -94,6 +100,7 @@ impl Subcommand {
         Self::Budget,
         Self::Perf,
         Self::DisplayStudy,
+        Self::Display,
     ];
 
     /// The subcommand's name on the command line and in the JSON records.
@@ -106,6 +113,7 @@ impl Subcommand {
             Self::Budget => "budget",
             Self::Perf => "perf",
             Self::DisplayStudy => "display-study",
+            Self::Display => "display",
         }
     }
 
@@ -116,7 +124,12 @@ impl Subcommand {
     /// spec's 1 GB workload. `perf` doesn't use one: each part runs with its subcommand's.
     const fn default_budget_mib(self) -> usize {
         match self {
-            Self::Generate | Self::Brush | Self::Save | Self::Perf | Self::DisplayStudy => 2048,
+            Self::Generate
+            | Self::Brush
+            | Self::Save
+            | Self::Perf
+            | Self::DisplayStudy
+            | Self::Display => 2048,
             Self::PageIn => 4096,
             Self::Budget => 1024,
         }
@@ -125,9 +138,9 @@ impl Subcommand {
     /// Whether the subcommand takes the option `flag`.
     fn takes(self, flag: Flag) -> bool {
         use Flag::{
-            Amplitude, Baseline, BudgetMib, Footprint, Force, Full, History, Level, Levels, Moves,
-            NoStages, PerStep, Pool, Project, RegionQuads, Samples, Seed, SettleSecs, Splits,
-            Steps, StepsPerMove, Strength, Tiny, ViewTiles, Workers,
+            Amplitude, Baseline, BudgetMib, Display, Footprint, Force, Full, History, Level,
+            Levels, Moves, NoStages, PerStep, Pool, Project, RegionQuads, Samples, Seed,
+            SettleSecs, Splits, Steps, StepsPerMove, Strength, Tiny, ViewTiles, Workers,
         };
         match flag {
             Project | Workers => true,
@@ -138,9 +151,12 @@ impl Subcommand {
             History | Baseline | Full | Tiny | NoStages | SettleSecs => self == Self::Perf,
             Samples => matches!(self, Self::PageIn | Self::DisplayStudy),
             RegionQuads | Pool => self == Self::PageIn,
-            Steps => matches!(self, Self::Brush | Self::Save),
-            PerStep => self == Self::Brush,
-            Strength => matches!(self, Self::Brush | Self::Save | Self::Budget),
+            Steps => matches!(self, Self::Brush | Self::Save | Self::Display),
+            PerStep | Display => self == Self::Brush,
+            Strength => matches!(
+                self,
+                Self::Brush | Self::Save | Self::Budget | Self::Display
+            ),
             Moves | StepsPerMove | ViewTiles => self == Self::Budget,
         }
     }
@@ -264,11 +280,13 @@ enum Flag {
     NoStages,
     /// `--settle-secs`.
     SettleSecs,
+    /// `--display`, a switch.
+    Display,
 }
 
 impl Flag {
     /// Every flag with its name, without the leading `--`.
-    const NAMES: [(Self, &'static str); 25] = [
+    const NAMES: [(Self, &'static str); 26] = [
         (Self::Project, "project"),
         (Self::BudgetMib, "budget-mib"),
         (Self::Seed, "seed"),
@@ -294,13 +312,20 @@ impl Flag {
         (Self::Tiny, "tiny"),
         (Self::NoStages, "no-stages"),
         (Self::SettleSecs, "settle-secs"),
+        (Self::Display, "display"),
     ];
 
     /// Whether the flag is a switch, taking no value.
     const fn is_switch(self) -> bool {
         matches!(
             self,
-            Self::Force | Self::Baseline | Self::Full | Self::Tiny | Self::NoStages | Self::PerStep
+            Self::Force
+                | Self::Baseline
+                | Self::Full
+                | Self::Tiny
+                | Self::NoStages
+                | Self::PerStep
+                | Self::Display
         )
     }
 
@@ -365,6 +390,18 @@ pub(crate) struct Options {
     pub(crate) stages: bool,
     /// `perf`: the quiet guard's longest wait before a part, in seconds.
     pub(crate) settle_secs: u64,
+    /// Whether the store keeps a display layer under the level (`--display`; always for
+    /// `display`).
+    pub(crate) display: DisplayLayer,
+}
+
+/// Whether a store keeps a display layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplayLayer {
+    /// It keeps none: what the M0 subcommands measure.
+    Off,
+    /// It keeps one under the level measured.
+    Kept,
 }
 
 impl Options {
@@ -403,6 +440,11 @@ impl Options {
             projects: Projects::Medium,
             stages: true,
             settle_secs: 300,
+            display: if subcommand == Subcommand::Display {
+                DisplayLayer::Kept
+            } else {
+                DisplayLayer::Off
+            },
         }
     }
 
@@ -444,6 +486,7 @@ impl Options {
             }
             Flag::NoStages => self.stages = false,
             Flag::PerStep => self.detail = Detail::PerStep,
+            Flag::Display => self.display = DisplayLayer::Kept,
             Flag::Project => self.project = Some(path()?),
             Flag::History => self.history = Some(path()?),
             Flag::BudgetMib => self.budget_mib = parse(flag, text()?)?,

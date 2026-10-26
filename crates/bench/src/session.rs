@@ -9,7 +9,7 @@ use geom::{Level, Vec3};
 use sculpt::{DrawParams, StepStats, Stroke, draw_step};
 use store::{Activity, Project, ProjectConfig, SpatialIndex, StoreConfig};
 
-use crate::cli::Options;
+use crate::cli::{DisplayLayer, Options};
 use crate::paths::Paths;
 use crate::report::{Output, Record, Spread, mib, ms, to_f64};
 use crate::sys;
@@ -20,8 +20,13 @@ const SITE: u16 = 1;
 /// The project configuration for `options`' budget and evaluation workers, with recovery files
 /// in `paths`' recovery directory.
 pub(crate) fn config(options: &Options, paths: &Paths) -> ProjectConfig {
+    let store = StoreConfig::new(options.budget_bytes(), SITE).with_workers(options.workers);
+    let store = match Level::new(options.level) {
+        Ok(level) if options.display == DisplayLayer::Kept => store.with_display(level),
+        Ok(_) | Err(_) => store,
+    };
     ProjectConfig {
-        store: StoreConfig::new(options.budget_bytes(), SITE).with_workers(options.workers),
+        store,
         recovery_dir: paths.recovery.clone(),
     }
 }

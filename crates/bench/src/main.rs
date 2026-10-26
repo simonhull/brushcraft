@@ -1,6 +1,6 @@
 //! `brushcraft-bench`: the M0 benchmark harness.
 //!
-//! Seven subcommands, headless, over the benchmark project (see [`cli::USAGE`]):
+//! Eight subcommands, headless, over the benchmark project (see [`cli::USAGE`]):
 //!
 //! - `generate` builds the benchmark sphere (`cube_sphere(20)`, levels 1 to 9: 1.26 billion
 //!   triangles) with fBm-noise corrections at every level, and saves it ([`generate`]);
@@ -12,6 +12,8 @@
 //! - `budget` walks the model under a 1 GiB budget, sampling RSS every 100 ms ([`budget`]);
 //! - `perf` runs the tracked performance suite over the others and the stage benches, records it in
 //!   the docs repository's history and flags changes beyond noise ([`perf`]);
+//! - `display` measures what keeping the display layer costs: its rebuild level by level, the
+//!   file's growth, and the refresh after each brush step ([`display_layer`]);
 //! - `display-study` measures every candidate display-tile encoding on the project's faces: file
 //!   growth, the error bound, decode cost and seam exactness (`display_study`, built with the
 //!   `display-study` feature only).
@@ -27,6 +29,7 @@
 mod brush;
 mod budget;
 mod cli;
+mod display_layer;
 #[cfg(feature = "display-study")]
 mod display_study;
 mod generate;
@@ -67,6 +70,7 @@ fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<
         Subcommand::Save => brush::run_save(options, &paths, out),
         Subcommand::Budget => budget::run(options, &paths, out),
         Subcommand::Perf => return perf::run(options, &paths, out),
+        Subcommand::Display => display_layer::run(options, &paths, out),
         #[cfg(feature = "display-study")]
         Subcommand::DisplayStudy => display_study::run(options, &paths, out),
         #[cfg(not(feature = "display-study"))]
