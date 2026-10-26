@@ -115,21 +115,22 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use geom::{
-    BaseMesh, Channel, CorrectionError, CorrectionView, CorrectionViewMut, EvalError, FaceId,
-    LayerId, Level, MAX_COPIES, PositionSource, Prediction, Region, RowUpdate, TileBorder, TileKey,
-    Vec3, VertexCopy, normals_into, parent_tiles, predict_region, refresh_normals_into,
+    BaseMesh, Channel, CorrectionError, CorrectionView, CorrectionViewMut, FaceId, LayerId, Level,
+    MAX_COPIES, PositionSource, Prediction, Region, RowUpdate, TileBorder, TileKey, Vec3,
+    VertexCopy, normals_into, parent_tiles, predict_region, refresh_normals_into,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 use rayon::slice::{ParallelSlice, ParallelSliceMut};
-use thiserror::Error;
 
 use crate::activity::Activity;
 use crate::bounds::Book;
 use crate::deps::{DepGraph, list_normal_inputs};
 use crate::feed::{ChangeFeed, ConsumerId};
-use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch, StoreError};
+#[cfg(test)]
+use crate::file::StoreError;
+use crate::file::{BaseFile, FileSyncer, FramedTile, Loc, ProjectFile, ReadScratch};
 use crate::hash::{TileHash, TileMap, TileSet};
 use crate::index::{TileBounds, WaveBounds};
 use crate::kept::Kept;
@@ -140,6 +141,10 @@ use crate::prefetch::{Fetched, Job, Prefetcher, Source};
 use crate::slot::{CorrectionSlot, EvaluatedSlot, SIDE};
 use crate::stamp::Stamp;
 use crate::workers::{StartWorkersError, Workers};
+
+mod error;
+
+pub use error::{CacheError, Invariant};
 
 /// How a [`TileStore`] is set up.
 ///
@@ -459,226 +464,6 @@ impl StoreId {
         /// The next identity to hand out.
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-/// Why a [`TileStore`] operation failed.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum CacheError {
-    /// Reading the working file, or recording a save point in it, failed.
-    #[error("project file operation failed")]
-    Store(#[from] StoreError),
-    /// No slot to be had: every slot of the pool that needs one is pinned, and no chunk without a
-    /// pin is left to take back. Only pins taken with [`TileStore::pin`] can crowd the store's
-    /// own work this far (see [`StoreConfig::minimum_budget`]).
-    #[error("every slot is pinned and no chunk can be taken back")]
-    Full,
-    /// Writing a dirty correction tile to the working file failed: when its slot was needed, or
-    /// on [`TileStore::save`]. The tile stays resident and dirty.
-    #[error("writing a dirty correction tile back failed")]
-    WriteBack(#[source] StoreError),
-    /// Writing the project file during a save failed: a tile, or the save point. The store is
-    /// unchanged (its working file still holds every edit), and the save can be tried again.
-    #[error("writing the project file during a save failed")]
-    Save(#[source] StoreError),
-    /// Evaluation failed (not for a valid mesh).
-    #[error("evaluation failed")]
-    Eval(#[from] EvalError),
-    /// A correction was rejected: not finite, at level 0, on an unknown face, or outside the face
-    /// or tile. Nothing was written.
-    #[error("correction rejected")]
-    Correction(#[source] CorrectionError),
-    /// The key isn't a base-layer displacement tile above level 0 of a face of this mesh.
-    #[error("{0:?} is not a base-layer displacement tile of this mesh above level 0")]
-    NotATile(TileKey),
-    /// The configured site is [`RESERVED_SITE`].
-    #[error("site {RESERVED_SITE} is reserved")]
-    ReservedSite,
-    /// The working file and the base under it (or the store and a file given to a rebase or a
-    /// save) are over different base meshes: their meta's mesh hashes differ.
-    #[error("the working file and its base are over different meshes")]
-    MeshMismatch,
-    /// The working file isn't one that may be layered on the base given: a recovery file must
-    /// name, in its meta, the project and the save point (offset and head op) of its base, and
-    /// a file with no base must be a project file or a recovery file of a project never saved.
-    /// Or a save was asked to write into a file that isn't a project file.
-    #[error("the working file doesn't belong on this base")]
-    WrongBase,
-    /// [`TileStore::save`] was called while a recovery writer streams the working file, which
-    /// writes its save points itself.
-    #[error("the working file is streamed by a recovery writer, which writes its save points")]
-    Streaming,
-    /// [`TileStore::save`] was called while the working file is a recovery file whose writer
-    /// failed: a sync of it failed (or the writer's thread stopped), so no save point may be
-    /// written there again. The project moves the store to a new file; save the project
-    /// ([`crate::Project::save`]) instead.
-    #[error("the working file is a recovery file whose sync failed: no save point goes there")]
-    FailedWorkingFile,
-    /// A rebase was given a save that is out of date: the store was edited after the save was
-    /// made, so the save doesn't hold every edit. Save again. Or a roll-over was given a new
-    /// working file filled before the latest edit.
-    #[error("the store was edited after the save it was to be rebased on")]
-    StaleSave,
-    /// The configured budget is below [`StoreConfig::minimum_budget`] for the mesh, without
-    /// counting the reserved shares (see [`CacheError::TooManyKeptPredictions`] and
-    /// [`CacheError::TooManyStrokeTiles`]).
-    #[error("the budget is below the {minimum} bytes this mesh needs")]
-    BudgetTooSmall {
-        /// The least budget the mesh works with, at the configured
-        /// [`StoreConfig::kept_predictions`] and [`StoreConfig::stroke_tiles`]
-        /// ([`StoreConfig::minimum_budget`]).
-        minimum: usize,
-    },
-    /// The budget holds the pools' minimum, but not beside the share the configured
-    /// [`StoreConfig::kept_predictions`] need ([`StoreConfig::kept_prediction_bytes`]).
-    #[error("keeping {asked} predictions takes more of the budget than the {most} it can spare")]
-    TooManyKeptPredictions {
-        /// The kept predictions asked for.
-        asked: usize,
-        /// The most this budget can keep beside the pools' minimum.
-        most: usize,
-    },
-    /// The budget holds the pools' minimum and the kept predictions' share, but not beside the
-    /// share the configured [`StoreConfig::stroke_tiles`] need
-    /// ([`StoreConfig::stroke_state_bytes`]).
-    #[error("stroke state for {asked} tiles takes more of the budget than the {most} it can spare")]
-    TooManyStrokeTiles {
-        /// The tiles' stroke state asked for.
-        asked: usize,
-        /// The most tiles' stroke state this budget can set aside beside the pools' minimum
-        /// and the kept predictions.
-        most: usize,
-    },
-    /// Every op id of this site has been handed out.
-    #[error("the op ids of this site are used up")]
-    OpsExhausted,
-    /// A pin request can't be held within the budget, even with every unpinned slot freed.
-    /// Nothing was evicted or pinned.
-    #[error("pinning {tiles} tiles needs {needed} bytes of pool chunks; the budget is {budget}")]
-    OverBudget {
-        /// Distinct tiles requested.
-        tiles: usize,
-        /// Bytes of chunks the request and the pins already held would take.
-        needed: usize,
-        /// The budget.
-        budget: usize,
-    },
-    /// The store found one of its own invariants broken: a bug in the store, never caused by
-    /// its input or the file's contents.
-    #[error("internal invariant broken")]
-    Internal(#[from] Invariant),
-    /// The evaluation worker threads couldn't be started (see [`StoreConfig::workers`]).
-    #[error("starting the evaluation worker threads failed")]
-    Workers(#[source] StartWorkersError),
-}
-
-/// An invariant of [`TileStore`] found broken (see [`CacheError::Internal`]).
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum Invariant {
-    /// A dirty correction tile had no op to write it with.
-    #[error("dirty correction tile {0:?} has no op")]
-    MissingOp(TileKey),
-    /// A correction slot didn't hold a valid tile, or refused a write the store had checked.
-    #[error("a correction slot is broken")]
-    CorrectionSlot(#[source] CorrectionError),
-    /// A slot handle was used after its slot was freed.
-    #[error("a slot handle outlived its slot")]
-    StaleHandle,
-    /// Slots borrowed together weren't all live and distinct: a handle outlived its slot, or
-    /// two named the same slot.
-    #[error("slots borrowed together were stale or named one slot twice")]
-    SlotsNotDisjoint,
-    /// A tile an evaluation didn't pin was looked for among those it did.
-    #[error("{0:?} is not among the tiles the evaluation pinned")]
-    NotHeld(TileKey),
-    /// A tile was named twice among the tasks of one round, which write one tile each.
-    #[error("{0:?} is named twice in one round")]
-    NamedTwice(TileKey),
-    /// A tile was given a second slot in one pool.
-    #[error("a tile was given a second slot")]
-    SecondSlot,
-    /// A slot was unpinned more often than it was pinned.
-    #[error("a slot was unpinned more often than pinned")]
-    NotPinned,
-    /// A pinned slot was to be freed.
-    #[error("a pinned slot was to be freed")]
-    FreedPinned,
-    /// A dirty slot was to be freed without being written back.
-    #[error("a dirty slot was to be freed")]
-    FreedDirty,
-    /// A rebase found a tile the store could read (in its working file or its base) that the
-    /// save it was to be rebased on doesn't hold.
-    #[error("{0:?} is not in the save a rebase was given")]
-    NotInSave(TileKey),
-    /// A save found a tile edited since the last rebase that is neither dirty nor in the
-    /// working file: its edit is nowhere to copy from.
-    #[error("edited tile {0:?} is neither dirty nor in the working file")]
-    NothingToSave(TileKey),
-    /// A project file had no save point right after a save wrote one.
-    #[error("a project file had no save point after a save")]
-    NotSaved,
-    /// A correction tile was located in a base the store doesn't have.
-    #[error("a tile was located in a missing base")]
-    MissingBase,
-    /// A slot or buffer held fewer values than a tile has.
-    #[error("a buffer of {got} values is shorter than a tile's {expected}")]
-    ShortBuffer {
-        /// Values a tile has.
-        expected: usize,
-        /// Values the buffer held.
-        got: usize,
-    },
-    /// A full save point would have named a different number of records than the maps derived
-    /// for it hold (see [`StoreError::SavePointMismatch`]). Nothing was written.
-    #[error("a full save point names {named} records, but its derived maps hold {derived}")]
-    SavePointMismatch {
-        /// The records the full Index would name.
-        named: usize,
-        /// The records the derived maps hold.
-        derived: usize,
-    },
-}
-
-impl CacheError {
-    /// `error`, from writing a save point, as the store reports it.
-    ///
-    /// [`StoreError::SavePointMismatch`] is a bug in deriving the save point, which trying again
-    /// can't fix, so it is [`Invariant::SavePointMismatch`] whatever the operation was. Any other
-    /// error is `wrap`ped as the operation reports file errors.
-    fn from_save_point(error: StoreError, wrap: impl FnOnce(StoreError) -> Self) -> Self {
-        if let StoreError::SavePointMismatch { named, derived } = error {
-            return Invariant::SavePointMismatch { named, derived }.into();
-        }
-        wrap(error)
-    }
-}
-
-/// No operation fails with [`Infallible`]: this lets `?` take pool results whose write-back
-/// can't fail.
-impl From<Infallible> for CacheError {
-    fn from(never: Infallible) -> Self {
-        match never {}
-    }
-}
-
-/// A pool's error, as the store reports it: [`CacheError::Full`], the write-back's own error,
-/// or a broken invariant.
-impl<W> From<PoolError<W>> for CacheError
-where
-    Self: From<W>,
-{
-    fn from(e: PoolError<W>) -> Self {
-        match e {
-            PoolError::Full => Self::Full,
-            PoolError::WriteBack(w) => w.into(),
-            PoolError::Present => Invariant::SecondSlot.into(),
-            PoolError::Stale => Invariant::StaleHandle.into(),
-            PoolError::NotPinned => Invariant::NotPinned.into(),
-            PoolError::Pinned => Invariant::FreedPinned.into(),
-            PoolError::Dirty => Invariant::FreedDirty.into(),
-        }
     }
 }
 
