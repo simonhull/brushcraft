@@ -962,7 +962,7 @@ impl PositionSource for Recorder {
     }
 }
 
-/// The tiles [`gather`] reads for `region`, recorded read by read.
+/// The tiles [`gather`](fn@super::gather) reads for `region`, recorded read by read.
 fn recorded_tiles(mesh: &BaseMesh, region: Region) -> BTreeSet<TileKey> {
     let recorder = Recorder::default();
     gather(mesh, &recorder, region).unwrap();

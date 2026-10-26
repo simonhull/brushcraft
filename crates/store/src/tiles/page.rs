@@ -511,7 +511,7 @@ impl TileStore {
     }
 
     /// `filled`, the outcome of filling `key`'s slot, as the tests see it: an error for the
-    /// tile they made unreadable ([`TileStore::unreadable`]).
+    /// tile they made unreadable ([`TestHooks::unreadable`](super::hooks::TestHooks::unreadable)).
     ///
     /// # Errors
     ///

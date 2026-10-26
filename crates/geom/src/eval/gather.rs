@@ -12,8 +12,9 @@ use crate::{BaseMesh, Channel, FaceId, LayerId, Level, Region, TileKey, Vec3};
 /// Every read goes to the vertex's owner copy, so all faces compute a shared vertex from the
 /// same inputs even if the source's twins disagree.
 ///
-/// Both the full gather ([`gather`]) and the partial normal update ([`refresh_normals_into`])
-/// read through it, so a vertex's inputs are the same bits whichever computes it.
+/// Both the full gather ([`gather`]) and the partial normal update
+/// ([`refresh_normals_into`](super::refresh_normals_into)) read through it, so a vertex's inputs
+/// are the same bits whichever computes it.
 pub(super) struct Reader<'a, S> {
     /// The mesh's topology: owner copies, neighbours across edges, base-vertex rings.
     topology: &'a Topology,
@@ -206,8 +207,9 @@ impl<'a, S: PositionSource> Reader<'a, S> {
 ///
 /// Every position is read through one [`Reader`], as the owner's copy. The part of each row
 /// strictly inside the face, its own owner copies, is read as one [`PositionSource::row`]; the
-/// points on or past the face's border are located one by one. [`gathered_tiles`] lists the
-/// tiles these reads resolve to, and the tests check it against a recording of them.
+/// points on or past the face's border are located one by one.
+/// [`gathered_tiles`](super::cone::gathered_tiles) lists the tiles these reads resolve to, and the
+/// tests check it against a recording of them.
 ///
 /// # Errors
 ///

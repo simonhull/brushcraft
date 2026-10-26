@@ -410,7 +410,7 @@ pub struct Project {
     stranded: Option<ProjectFile>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename, with an I/O error of
-    /// this kind (see [`Unplaced::crash`]).
+    /// this kind (see [`Unplaced::crash`](place::Unplaced::crash)).
     #[cfg(test)]
     fail_next_recovery: Option<io::ErrorKind>,
     /// Test hook: makes the directory sync after the next save as moves its new file into
@@ -1188,7 +1188,7 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// As [`create_recovery`] and [`Unplaced::place`].
+    /// As [`create_recovery`] and [`Unplaced::place`](place::Unplaced::place).
     #[cfg_attr(
         not(test),
         expect(

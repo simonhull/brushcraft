@@ -52,7 +52,8 @@ pub(super) fn scratch(meta: Meta, like: &ProjectFile) -> Result<ProjectFile, Pro
 /// A scratch working file with `meta` over `like`'s mesh, made in `dir`.
 ///
 /// It is a file for the store to write tiles back to when it has no recovery file to write them
-/// to, after a save ([`scratch`]) or a failed roll-over ([`Project::strand`]).
+/// to, after a save ([`scratch`]) or a failed roll-over
+/// ([`Project::strand`](super::Project::strand)).
 ///
 /// It is created readable and writable by the user only ([`PRIVATE_MODE`]), as it holds the
 /// user's unsaved work and may sit in a shared directory such as `/tmp` until it is unlinked.
@@ -147,7 +148,7 @@ impl Unplaced {
     }
 
     /// Removes the temporary file: a creation given up. Best effort, as the error at hand is
-    /// the one to report; a leftover is swept by [`find_recoveries`].
+    /// the one to report; a leftover is swept by [`find_recoveries`](super::find_recoveries).
     pub(super) fn discard(self) {
         drop(fs::remove_file(&self.tmp));
     }

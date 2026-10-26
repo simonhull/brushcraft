@@ -35,7 +35,8 @@ pub(super) struct EvalLog {
     /// Normal input lists listed with `normal_tiles`.
     pub(super) normal_inputs_listed: Cell<usize>,
     /// The most predictions held at once past a round's predicting: those kept, and those the
-    /// round made to keep, before they are inserted (see [`TileStore::plan_predictions`]).
+    /// round made to keep, before they are inserted (see
+    /// [`TileStore::plan_predictions`](super::TileStore::plan_predictions)).
     pub(super) predictions_held: usize,
 }
 
@@ -49,8 +50,8 @@ pub(super) struct TestHooks {
     /// A tile whose normals computation fails on the workers, after every other task of its
     /// round has written its slot: for tests of that error path.
     pub(super) failing_normals: Option<TileKey>,
-    /// Whether [`TileStore::tile_border`] gives `None` for every tile, as it would for a tile
-    /// holding a border vertex twice: for tests of the edits' fallback, which no valid mesh
-    /// reaches.
+    /// Whether [`TileStore::tile_border`](super::TileStore::tile_border) gives `None` for every
+    /// tile, as it would for a tile holding a border vertex twice: for tests of the edits'
+    /// fallback, which no valid mesh reaches.
     pub(super) without_tile_borders: bool,
 }

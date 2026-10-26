@@ -9,23 +9,23 @@ use super::{EvalError, NoPositions, parent_region};
 use crate::topology::edge_to_grid;
 use crate::{BaseMesh, Region, TILE_QUADS, TileKey};
 
-/// The tiles [`gather`] reads for `region`: every tile it resolves a read to, through the
-/// owner copy and [`TileKey::containing`], without reading.
+/// The tiles [`gather`](fn@super::gather) reads for `region`: every tile it resolves a read to,
+/// through the owner copy and [`TileKey::containing`], without reading.
 ///
-/// Only the reads that can leave the face are resolved one by one, exactly as [`gather`]
-/// resolves them (with the same [`Reader`]): the points of the padded block on or past the
-/// face's border, and the rings of base vertices at the block's corners. The rest, the points
-/// strictly inside the face, are each their own owner copy, and [`TileKey::containing`] picks
-/// a point's tile column from its column alone and its tile row from its row alone; so their
-/// tiles are every pairing of the tile columns their columns fall in with the tile rows their
-/// rows fall in, found from one point of each. That makes the listing cost the block's
-/// perimeter, not its area: a level-9 tile's normal inputs are about 270 lookups instead of
-/// 4,500. The tests check it against a recording of [`gather`]'s reads.
+/// Only the reads that can leave the face are resolved one by one, exactly as
+/// [`gather`](fn@super::gather) resolves them (with the same [`Reader`]): the points of the padded
+/// block on or past the face's border, and the rings of base vertices at the block's corners. The
+/// rest, the points strictly inside the face, are each their own owner copy, and
+/// [`TileKey::containing`] picks a point's tile column from its column alone and its tile row from
+/// its row alone; so their tiles are every pairing of the tile columns their columns fall in with
+/// the tile rows their rows fall in, found from one point of each. That makes the listing cost the
+/// block's perimeter, not its area: a level-9 tile's normal inputs are about 270 lookups instead of
+/// 4,500. The tests check it against a recording of [`gather`](fn@super::gather)'s reads.
 ///
 /// # Errors
 ///
-/// [`EvalError::Missing`] where [`gather`] would miss a read with a source holding every tile
-/// (a point that resolves to no tile), which no [`Region`] causes.
+/// [`EvalError::Missing`] where [`gather`](fn@super::gather) would miss a read with a source
+/// holding every tile (a point that resolves to no tile), which no [`Region`] causes.
 pub(super) fn gathered_tiles(
     mesh: &BaseMesh,
     region: Region,
@@ -108,12 +108,13 @@ pub fn parent_tiles(mesh: &BaseMesh, region: Region) -> Result<BTreeSet<TileKey>
     gathered_tiles(mesh, parent_region(region)?)
 }
 
-/// The tiles of `region`'s own level that [`normals`](super::normals) reads.
+/// The tiles of `region`'s own level that [`normals`](fn@super::normals) reads.
 ///
 /// Like [`parent_tiles`], these are base-layer displacement keys naming tile positions (the block,
 /// its one-vertex apron, and every face around a base vertex at the block's corners), the tiles
-/// of the gather [`normals`](super::normals) runs, so a source holding just these tiles can compute
-/// `region`'s normals. At level 0 the keys are level-0 tiles, which `store` serves from the mesh.
+/// of the gather [`normals`](fn@super::normals) runs, so a source holding just these tiles can
+/// compute `region`'s normals. At level 0 the keys are level-0 tiles, which `store` serves from the
+/// mesh.
 ///
 /// # Errors
 ///

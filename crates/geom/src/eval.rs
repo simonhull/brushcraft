@@ -371,8 +371,8 @@ pub fn evaluate_region(
     Ok(predict_region(mesh, src, region)?.apply(corrections))
 }
 
-/// A source without positions: what [`gathered_tiles`] hands its [`Reader`], whose tile
-/// lookups read none.
+/// A source without positions: what [`gathered_tiles`](cone::gathered_tiles) hands its
+/// [`Reader`](gather::Reader), whose tile lookups read none.
 struct NoPositions;
 
 impl PositionSource for NoPositions {

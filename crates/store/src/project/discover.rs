@@ -170,7 +170,7 @@ fn sweep(path: &Path) {
 }
 
 /// The project id a recovery file's name gives, if `name` is one: `<32 hex digits>-<16 hex
-/// digits>.bcrf`, as [`create_recovery`] names them.
+/// digits>.bcrf`, as [`create_recovery`](super::place::create_recovery) names them.
 fn recovery_name(name: &str) -> Option<ProjectId> {
     let stem = name.strip_suffix(EXTENSION)?.strip_suffix('.')?;
     let (id, suffix) = stem.split_once('-')?;
