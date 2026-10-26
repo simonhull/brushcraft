@@ -8,3 +8,6 @@ allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-print-in-tests = true
 allow-dbg-in-tests = true
+# One inherent impl block per type per file (not per crate), so a large type's methods can be
+# grouped by concern in child modules. Agreed with the user, 2026-10-25.
+inherent-impl-lint-scope = "file"
