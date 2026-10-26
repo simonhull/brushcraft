@@ -36,6 +36,11 @@ impl Padded {
         self.data.len()
     }
 
+    /// Every slot, ring included, row-major from `(-1, -1)`.
+    pub(crate) fn as_slice(&self) -> &[Vec3] {
+        &self.data
+    }
+
     /// The bytes the block holds on the heap: its slots' allocation.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.data.capacity().saturating_mul(size_of::<Vec3>())

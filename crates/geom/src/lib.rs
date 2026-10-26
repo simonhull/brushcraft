@@ -30,8 +30,9 @@ pub use correction::{
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use dense::{CorrectionMap, DenseEvaluation};
 pub use eval::{
-    EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,
-    normals, normals_into, parent_tiles, predict_region, refresh_normals_into,
+    EvalError, GatheredBlock, GatheredRing, Grid, PositionSource, Prediction, VertexStencil,
+    cone_width, evaluate_region, gather_block, normal_tiles, normals, normals_into, parent_tiles,
+    predict_region, refresh_normals_into, vertex_stencil,
 };
 pub use frame::Frame;
 pub use key::{
