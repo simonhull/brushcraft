@@ -215,11 +215,12 @@ impl StoreConfig {
 /// operations come in the same order however many workers it has. Each round pins its tiles'
 /// correction slots while the workers read them (fewer, cut at the first tile after the first
 /// that would need a dirty tile written back or an evaluated chunk taken, see
-/// [`TileStore::load_round`]), and holds a scratch buffer of one tile per tile of the round that
-/// isn't predicted in place.
+/// [`TileStore::load_round`](super::TileStore::load_round)), and holds a scratch buffer of one tile
+/// per tile of the round that isn't predicted in place.
 pub(super) const ROUND: usize = 64;
 
-/// Target tiles [`TileStore::evaluate_many`] and [`TileStore::pin`] put in one batch at most.
+/// Target tiles [`TileStore::evaluate_many`](super::TileStore::evaluate_many) and
+/// [`TileStore::pin`](super::TileStore::pin) put in one batch at most.
 ///
 /// One batch is one dependency cone: this is enough to keep every worker busy at every level of
 /// the cone, and few enough that listing the cone stays cheap next to building it.
@@ -243,7 +244,8 @@ pub enum Evaluation {
 }
 
 /// The most slots of each pool the store pins for its own work: what [`StoreConfig`]'s minimum
-/// is made of, and what [`TileStore::pin`] counts besides the tiles asked for.
+/// is made of, and what [`TileStore::pin`](super::TileStore::pin) counts besides the tiles asked
+/// for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Headroom {
     /// Evaluated slots one evaluation pins at most: two levels of its cone.
@@ -262,8 +264,9 @@ impl Headroom {
         }
     }
 
-    /// The least the evaluated pool keeps when corrections take its chunks (see [`TileStore`]):
-    /// the chunks that hold an evaluation's pins, and one more for the cache besides.
+    /// The least the evaluated pool keeps when corrections take its chunks (see
+    /// [`TileStore`](super::TileStore)): the chunks that hold an evaluation's pins, and one
+    /// more for the cache besides.
     pub(super) fn evaluated_floor(self, chunk_bytes: usize) -> usize {
         let (per_chunk, charged) = Pool::<EvaluatedSlot>::layout(chunk_bytes);
         (self.evaluated.div_ceil(per_chunk as usize) + 1) * charged

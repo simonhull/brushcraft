@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use geom::{
-    BaseMesh, CorrectionMap, CorrectionTile, DenseEvaluation, FaceId, Level, Region, TileKey, Vec3,
-    cube_sphere, normal_tiles, normals,
+    BaseMesh, CorrectionMap, CorrectionTile, DenseEvaluation, FaceId, Level, PositionSource,
+    Region, TileKey, Vec3, cube_sphere, normal_tiles, normals,
 };
 
 use super::edit::{BorderValues, border_order, update_row};
