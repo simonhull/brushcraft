@@ -96,6 +96,14 @@ pub enum GpuError {
         /// The size of one element in bytes.
         element: usize,
     },
+    /// A staging buffer is smaller than the buffer read through it.
+    #[error("a {staging}-byte staging buffer can't hold a {size}-byte readback")]
+    StagingTooSmall {
+        /// The size of the buffer read, in bytes.
+        size: u64,
+        /// The staging buffer's size, in bytes.
+        staging: u64,
+    },
 }
 
 /// An open GPU: the adapter's description, and the device and queue created on it.
@@ -217,28 +225,52 @@ impl Gpu {
     ///
     /// # Errors
     ///
-    /// [`GpuError::Misaligned`] if the buffer isn't a whole number of `T`s;
-    /// [`GpuError::Poll`] if waiting fails (the device was lost); [`GpuError::Map`] if mapping
-    /// fails; [`GpuError::MapRange`] if the mapped bytes can't be viewed.
+    /// As [`Gpu::read_buffer_with`].
     pub fn read_buffer<T: Pod>(&self, source: &Buffer) -> Result<Vec<T>, GpuError> {
+        let staging = self.device.create_buffer(&BufferDescriptor {
+            label: Some("readback"),
+            size: source.size(),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.read_buffer_with(source, &staging)
+    }
+
+    /// [`Gpu::read_buffer`] through a staging buffer the caller keeps, so repeated readbacks
+    /// (a benchmark's) don't create one each time.
+    ///
+    /// `staging` needs [`BufferUsages::COPY_DST`] and [`BufferUsages::MAP_READ`], at least
+    /// `source`'s size, and must not be mapped.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Misaligned`] if `source` isn't a whole number of `T`s;
+    /// [`GpuError::StagingTooSmall`] if `staging` can't hold it; [`GpuError::Poll`] if waiting
+    /// fails (the device was lost); [`GpuError::Map`] if mapping fails; [`GpuError::MapRange`] if
+    /// the mapped bytes can't be viewed.
+    pub fn read_buffer_with<T: Pod>(
+        &self,
+        source: &Buffer,
+        staging: &Buffer,
+    ) -> Result<Vec<T>, GpuError> {
         let size = source.size();
         let element = size_of::<T>();
         if element == 0 || !size.is_multiple_of(element as u64) {
             return Err(GpuError::Misaligned { size, element });
         }
-        let staging = self.device.create_buffer(&BufferDescriptor {
-            label: Some("readback"),
-            size,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        if staging.size() < size {
+            return Err(GpuError::StagingTooSmall {
+                size,
+                staging: staging.size(),
+            });
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
-        encoder.copy_buffer_to_buffer(source, 0, &staging, 0, size);
+        encoder.copy_buffer_to_buffer(source, 0, staging, 0, size);
         self.queue.submit([encoder.finish()]);
         let (sender, receiver) = mpsc::channel();
-        staging.map_async(MapMode::Read, .., move |result| {
+        staging.map_async(MapMode::Read, ..size, move |result| {
             // The receiver outlives the poll below, so the send can't fail in practice; if it
             // did, the `recv` below reports the map as never done.
             drop(sender.send(result));
@@ -248,7 +280,7 @@ impl Gpu {
             .recv()
             .unwrap_or(Err(BufferAsyncError))
             .map_err(GpuError::Map)?;
-        let values = bytemuck::pod_collect_to_vec(&staging.get_mapped_range(..)?);
+        let values = bytemuck::pod_collect_to_vec(&staging.get_mapped_range(..size)?);
         staging.unmap();
         Ok(values)
     }

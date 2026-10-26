@@ -9,8 +9,21 @@ description = "The wgpu renderer: opens a GPU device and runs compute and drawin
 [lints]
 workspace = true
 
+[features]
+# M1a's spikes (src/spike): built and tested by the gate, left out of the shipped renderer.
+spike = ["dep:brush"]
+
 [dependencies]
+brush = { workspace = true, optional = true }
 bytemuck.workspace = true
 pollster.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "brush_gpu"
+harness = false
+required-features = ["spike"]

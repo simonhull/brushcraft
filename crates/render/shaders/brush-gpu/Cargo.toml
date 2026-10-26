@@ -1,0 +1,24 @@
+# The draw brush as a rust-gpu compute shader: `brush::draw_vertex`, unchanged, wrapped in an
+# entry point. Built to SPIR-V by ../build.sh with cargo-gpu (pinned in mise.toml), which brings
+# rust-gpu's own nightly; the gate never builds it, it loads the checked-in SPIR-V instead.
+# Its own workspace: it builds only for the SPIR-V target, on rust-gpu's toolchain.
+[package]
+name = "brush-gpu"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The draw brush's per-vertex step as a compute shader, compiled from brush's source by rust-gpu (M1a spike)."
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+brush = { path = "../../../brush" }
+# Exact: rust-gpu's crates move in lockstep with the codegen backend cargo-gpu builds.
+spirv-std = "=0.10.0"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+
+[workspace]

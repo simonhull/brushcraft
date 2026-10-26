@@ -6,5 +6,10 @@
 //!
 //! The crates below this one (`geom`, `store`, `brush`) never learn about the GPU: this crate
 //! reads their data and uploads it.
+//!
+//! With the `spike` feature, the `spike` module holds M1a's GPU experiments, built and tested by
+//! the gate but not part of the renderer.
 
 pub mod gpu;
+#[cfg(feature = "spike")]
+pub mod spike;

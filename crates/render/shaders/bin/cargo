@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# cargo, for ../build.sh only: adds --ignore-rust-version to `cargo rustc`, the command
+# spirv-builder compiles the shader crate with, so rust-gpu's nightly (rustc 1.98) builds `brush`
+# despite its rust-version (1.99). Every other cargo command passes through unchanged.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+# The next cargo on PATH after this one: rustup's proxy, which honours the +toolchain argument.
+real=$(PATH=${PATH//"$here:"/} command -v cargo)
+args=()
+for arg in "$@"; do
+  args+=("$arg")
+  if [[ $arg == rustc && ${#args[@]} -le 2 ]]; then
+    args+=(--ignore-rust-version)
+  fi
+done
+exec "$real" "${args[@]}"

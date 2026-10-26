@@ -14,3 +14,5 @@ __fuzz__/
 /fuzz/coverage/
 # cargo-mutants reports
 /mutants.out*/
+# rust-gpu shader builds (crates/render/shaders/build.sh)
+/crates/render/shaders/*/target/
