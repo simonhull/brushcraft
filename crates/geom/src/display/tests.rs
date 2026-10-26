@@ -735,3 +735,35 @@ fn a_parent_takes_its_own_childrens_largest_bound() {
         "the finest level is exact"
     );
 }
+
+/// The bound survives `f64` rounding at extreme magnitudes.
+///
+/// An edge from `x = 1` to `x = 10⁻³⁰` has its exact midpoint `10⁻³⁰ / 2` above `0.5`, which
+/// `f64` rounds to `0.5` exactly; a finer vertex at `0.5` is that far off, and the step error
+/// must not say 0.
+#[test]
+fn step_error_bounds_what_f64_rounding_hides() {
+    let corner = |i: u32, j: u32| {
+        if (i, j) == (1, 0) {
+            Vec3::new(1e-30, 0.0, 0.0)
+        } else {
+            Vec3::new(1.0, 0.0, 0.0)
+        }
+    };
+    let coarse = grid(2, corner);
+    let finer = grid(3, |i, j| match (i, j) {
+        (1, 0) | (2, 1) => Vec3::new(0.5, 0.0, 0.0),
+        _ if i % 2 == 0 && j % 2 == 0 => corner(i / 2, j / 2),
+        _ => Vec3::new(1.0, 0.0, 0.0),
+    });
+    let delta = step_error(&finer, &coarse).unwrap();
+    assert!(
+        f64::from(delta) >= 0.5e-30,
+        "true distance 5e-31, got {delta}"
+    );
+    assert_eq!(
+        step_error(&grid(5, patch), &coarse),
+        Err(DisplayError::Shape),
+        "a finer grid larger than the coarser one's refinement"
+    );
+}

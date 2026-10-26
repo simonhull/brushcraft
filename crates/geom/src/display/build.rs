@@ -77,15 +77,27 @@ pub fn subsample(finer: &Grid) -> Result<Grid, DisplayError> {
 /// from `(i, j)` to `(i + 1, j + 1)`. The finer triangles refine the coarser ones, so this is the
 /// largest distance between the two surfaces anywhere over the block.
 ///
-/// Computed in `f64` from the `f32` positions and rounded up to an `f32`, so it is a bound
-/// itself, not an estimate of one.
+/// Computed in `f64` from the `f32` positions, each distance raised by more than its `f64`
+/// rounding can have taken off (2⁻⁴⁸ of the largest coordinate it read), and rounded up
+/// to an `f32`: a bound itself, not an estimate of one, whatever the magnitudes.
 ///
 /// # Errors
 ///
-/// [`DisplayError::Shape`] if the grids' sides don't match.
+/// [`DisplayError::Shape`] unless `finer`'s side is `2 × (coarser's − 1) + 1`.
 pub fn step_error(finer: &Grid, coarser: &Grid) -> Result<f32, DisplayError> {
+    let quads = coarser.side().checked_sub(1).ok_or(DisplayError::Shape)?;
+    if finer.side() != 2 * quads + 1 {
+        return Err(DisplayError::Shape);
+    }
     step_error_at(finer, (0, 0), coarser)
 }
+
+/// What one distance's `f64` arithmetic can lose, relative to the largest coordinate it reads.
+///
+/// The midpoint, the difference, three squares, two sums and the square root each round by at
+/// most half an `f64` step (2⁻⁵³ relative) of values at most twice that coordinate: seven of
+/// them stay under 2⁻⁴⁸, the slack added (its biased exponent is `1023 − 48`).
+const ROUNDING: f64 = f64::from_bits((1023 - 48) << 52);
 
 /// [`step_error`] over the block of `finer` starting at `origin` (on `finer`'s grid) with
 /// `coarser`'s extent: a tile of a face's grid.
@@ -108,8 +120,9 @@ pub(super) fn step_error_at(
         let p = finer
             .get(origin.0 + i, origin.1 + j)
             .ok_or(DisplayError::Shape)?;
-        let drawn = drawn_at(coarser, i, j).ok_or(DisplayError::Shape)?;
-        worst = worst.max(distance(p, drawn));
+        let (drawn, magnitude) = drawn_at(coarser, i, j).ok_or(DisplayError::Shape)?;
+        let scale = wide(p).into_iter().fold(magnitude, |m, c| m.max(c.abs()));
+        worst = worst.max(distance(p, drawn) + scale * ROUNDING);
     }
     round_up(worst)
 }
@@ -117,21 +130,30 @@ pub(super) fn step_error_at(
 /// The point `coarser` draws at vertex `(i, j)` of the grid one level finer, in `f64`.
 ///
 /// That is the coarse vertex, or the midpoint of the coarse edge or quad diagonal the vertex
-/// lies on (see [`step_error`]). `None` outside the grid.
-fn drawn_at(coarser: &Grid, i: u32, j: u32) -> Option<[f64; 3]> {
+/// lies on (see [`step_error`]), with the largest magnitude of the coordinates it was computed
+/// from. `None` outside the grid.
+fn drawn_at(coarser: &Grid, i: u32, j: u32) -> Option<([f64; 3], f64)> {
+    let largest = |v: [f64; 3]| v.into_iter().fold(0.0_f64, |m, c| m.max(c.abs()));
     let (ci, cj) = (i / 2, j / 2);
     let (a, b) = match (i % 2, j % 2) {
-        (0, 0) => return Some(wide(coarser.get(ci, cj)?)),
+        (0, 0) => {
+            let v = wide(coarser.get(ci, cj)?);
+            return Some((v, largest(v)));
+        }
         (1, 0) => (coarser.get(ci, cj)?, coarser.get(ci + 1, cj)?),
         (0, _) => (coarser.get(ci, cj)?, coarser.get(ci, cj + 1)?),
         _ => (coarser.get(ci, cj)?, coarser.get(ci + 1, cj + 1)?),
     };
-    let ([ax, ay, az], [bx, by, bz]) = (wide(a), wide(b));
-    Some([
-        f64::midpoint(ax, bx),
-        f64::midpoint(ay, by),
-        f64::midpoint(az, bz),
-    ])
+    let (a, b) = (wide(a), wide(b));
+    let ([ax, ay, az], [bx, by, bz]) = (a, b);
+    Some((
+        [
+            f64::midpoint(ax, bx),
+            f64::midpoint(ay, by),
+            f64::midpoint(az, bz),
+        ],
+        largest(a).max(largest(b)),
+    ))
 }
 
 /// `v` in `f64`, exactly.
@@ -144,6 +166,17 @@ fn distance(p: Vec3, [qx, qy, qz]: [f64; 3]) -> f64 {
     let [px, py, pz] = wide(p);
     let (dx, dy, dz) = (px - qx, py - qy, pz - qz);
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// `a + b` in `f64`, moved up a step if the sum rounded below the exact one (an `f32` sum can
+/// be inexact in `f64` when the magnitudes are far apart), so it is never less than `a + b`.
+fn sum_up(a: f32, b: f32) -> f64 {
+    let (a, b) = (f64::from(a), f64::from(b));
+    let sum = a + b;
+    // Knuth's two-sum: the exact sum is `sum + error`.
+    let b_part = sum - a;
+    let error = (a - (sum - b_part)) + (b - b_part);
+    if error > 0.0 { sum.next_up() } else { sum }
 }
 
 /// The least `f32` at or above `v`, which is finite and non-negative.
@@ -339,7 +372,7 @@ pub fn build_face_with(
                 &positions,
             )?;
             let below = children_bound(&key, finer_level, finest, &finer_bounds);
-            let error = round_up(f64::from(delta) + f64::from(below))?;
+            let error = round_up(sum_up(delta, below))?;
             for (i, j) in cells(positions.side()) {
                 let index = at(input.side(), region.x0() + i, region.y0() + j);
                 let p = positions.get(i, j).ok_or(DisplayError::Shape)?;
