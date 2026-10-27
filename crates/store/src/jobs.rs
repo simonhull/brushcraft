@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{Level, TileKey, Vec3};
 
+use crate::stamp::Stamp;
+
 /// What a slice of a job left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
@@ -82,11 +84,15 @@ pub(crate) struct Upkeep {
 ///
 /// A tile reading more finest tiles than the budget holds at once (a whole face's, under a
 /// small budget) is still built, a batch at a time, never waiting for all of them to be
-/// resident together.
+/// resident together. A tile still cached is read from the cache instead, so only the tiles a
+/// job evaluated are copied. The copies hold as long as no write lands: any write empties them,
+/// since it can change any finest tile they hold.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct FinestScratch {
     /// The display tile they are for.
     pub(crate) tile: Option<TileKey>,
+    /// The store's latest write when they were copied.
+    as_of: Stamp,
     /// Finest tiles' positions, by key.
     pub(crate) positions: BTreeMap<TileKey, Vec<Vec3>>,
     /// Finest tiles' unit normals, by key.
@@ -94,10 +100,12 @@ pub(crate) struct FinestScratch {
 }
 
 impl FinestScratch {
-    /// Empties it for display tile `tile`, unless it is for that tile already.
-    pub(crate) fn begin(&mut self, tile: TileKey) {
-        if self.tile != Some(tile) {
+    /// Empties it for display tile `tile` as of the store's latest write `as_of`, unless it
+    /// holds that tile's copies from then already.
+    pub(crate) fn begin(&mut self, tile: TileKey, as_of: Stamp) {
+        if self.tile != Some(tile) || self.as_of != as_of {
             self.tile = Some(tile);
+            self.as_of = as_of;
             self.positions.clear();
             self.normals.clear();
         }
@@ -175,5 +183,48 @@ mod tests {
         assert_eq!(upkeep.next(), Some(key(5, 0)), "then level 5");
         assert_eq!(upkeep.next(), Some(key(3, 0)), "then level 3");
         assert!(upkeep.is_empty(), "nothing left");
+    }
+
+    /// The copies hold for one tile as of one write: another tile, or a write since, empties
+    /// them.
+    #[test]
+    fn copies_are_dropped_for_another_tile_or_after_a_write() {
+        let tile = |tx| TileKey::display(FaceId::new(0), Level::new(7).unwrap(), tx, 0).unwrap();
+        let finest = TileKey::new(
+            geom::LayerId::BASE,
+            geom::Channel::DISPLACEMENT,
+            FaceId::new(0),
+            Level::new(8).unwrap(),
+            0,
+            0,
+        )
+        .unwrap();
+        let copy = |scratch: &mut FinestScratch| {
+            scratch.positions.insert(finest, vec![Vec3::ZERO]);
+            scratch.normals.insert(finest, vec![Vec3::ZERO]);
+        };
+        let held = |scratch: &FinestScratch| {
+            scratch.positions.contains_key(&finest) && scratch.normals.contains_key(&finest)
+        };
+        let (before, after) = (Stamp::ZERO.next(), Stamp::ZERO.next().next());
+        let mut scratch = FinestScratch::default();
+        scratch.begin(tile(0), before);
+        copy(&mut scratch);
+        scratch.begin(tile(0), before);
+        assert!(held(&scratch), "kept for the same tile with no write since");
+        scratch.begin(tile(0), after);
+        assert!(
+            scratch.positions.is_empty() && scratch.normals.is_empty(),
+            "a write empties them"
+        );
+        copy(&mut scratch);
+        scratch.begin(tile(1), after);
+        assert!(
+            scratch.positions.is_empty() && scratch.normals.is_empty(),
+            "another tile's"
+        );
+        copy(&mut scratch);
+        scratch.clear();
+        assert!(!held(&scratch) && scratch.tile.is_none(), "cleared");
     }
 }

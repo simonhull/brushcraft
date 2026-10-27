@@ -265,3 +265,48 @@ fn bumped_bounds_stay_bounds_mid_stroke_until_the_refresh() {
     );
     assert_layer_current(&mut store, "refreshed after the stroke");
 }
+
+/// Edits between the slices of a rebuild never leave a tile built from stale copies.
+///
+/// Under the tightest budget, each edit lands on a finest tile whose values a coarse tile's
+/// build has copied so far; the layer ends as the one built from scratch.
+///
+/// The edits stop after a few: a write empties the copies, so edits more often than a coarse
+/// tile takes to gather its inputs hold that tile back until they stop.
+#[test]
+fn edits_between_slices_never_leave_a_tile_built_from_stale_copies() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let display = tight().with_display(level(TOP));
+    let config = display.with_budget_bytes(display.budget_bytes + display.floor_bytes(&mesh));
+    let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    let mut map = CorrectionMap::new();
+    let (mut calls, mut edits) = (0_u32, 0_u32);
+    while store.has_jobs() {
+        store
+            .run_jobs(Instant::now() + Duration::from_micros(200))
+            .unwrap();
+        calls += 1;
+        assert!(calls < 200_000, "the rebuild ends");
+        // A finest tile the job in progress has copied, if any.
+        let copied = store
+            .jobs
+            .front_mut()
+            .and_then(|job| job.upkeep().scratch.positions.keys().next().copied());
+        let Some(tile) = copied.filter(|_| edits < 12) else {
+            continue;
+        };
+        let quads = tile.level().tile_quads();
+        let edit = Edit {
+            face: tile.face(),
+            level: tile.level(),
+            i: u32::from(tile.tx()) * quads + 1,
+            j: u32::from(tile.ty()) * quads + 1,
+            c: Vec3::new(0.01, -0.02, 0.015),
+        };
+        apply(&mut store, &mut map, &[edit]);
+        edits += 1;
+    }
+    assert_eq!(edits, 12, "every edit landed on copies mid-build");
+    assert_layer_current(&mut store, "rebuilt among edits");
+}
