@@ -149,10 +149,11 @@ impl StoreConfig {
         };
         let per_face: usize = (0..finest.get().min(self.floor_top.get() + 1))
             .filter_map(|l| {
-                let key =
-                    geom::TileKey::display(geom::FaceId::new(0), geom::Level::new(l).ok()?, 0, 0)
-                        .ok()?;
-                Some(crate::display::max_body(&key))
+                let level = geom::Level::new(l).ok()?;
+                let key = geom::TileKey::display(geom::FaceId::new(0), level, 0, 0).ok()?;
+                // Levels finer than whole-face tiles have several a face.
+                let per_side = usize::try_from(level.tiles_per_side()).ok()?;
+                Some(crate::display::max_body(&key).saturating_mul(per_side * per_side))
             })
             .sum();
         per_face.saturating_mul(usize::try_from(mesh.face_count()).unwrap_or(usize::MAX))

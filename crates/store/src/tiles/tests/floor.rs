@@ -114,3 +114,31 @@ fn a_budget_without_room_for_the_floor_is_refused() {
         "{refused:?}"
     );
 }
+
+/// The floor's share counts every tile of every floor level at its largest, levels with several
+/// tiles a face included, and holds the floor the store then loads.
+#[test]
+fn the_floor_share_counts_every_tile_of_each_level() {
+    let mesh = mesh();
+    let config = roomy()
+        .with_display(level(TOP))
+        .with_floor_top(level(TOP - 1));
+    let want: usize = tiles(&mesh, 0, TOP - 1)
+        .iter()
+        .map(|k| {
+            crate::display::max_body(
+                &TileKey::display(k.face(), k.level(), k.tx(), k.ty()).unwrap(),
+            )
+        })
+        .sum();
+    assert_eq!(config.floor_bytes(&mesh), want, "every tile, levels 0 to 7");
+    let dir = TestDir::new();
+    let config = config.with_budget_bytes(config.budget_bytes + config.floor_bytes(&mesh));
+    let mut store = new_store(&dir, "work.bcp", &mesh, config);
+    run_all(&mut store);
+    let (_, bytes) = store.floor_size();
+    assert!(
+        bytes <= config.floor_bytes(&mesh),
+        "the floor fits its share"
+    );
+}
