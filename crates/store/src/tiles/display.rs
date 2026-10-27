@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{DisplayTile, Level, TileKey};
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use super::TileStore;
 use super::error::CacheError;
@@ -81,22 +82,31 @@ impl TileStore {
             return Ok(());
         };
         let top = self.floor_top.get().min(finest.get().saturating_sub(1));
-        let faces: Vec<geom::FaceId> = self.mesh.faces().collect();
-        for face in faces {
+        let mut keys = Vec::new();
+        for face in self.mesh.faces() {
             for l in 0..=top {
                 let level = Level::new(l).map_err(|_level| geom::DisplayError::Shape)?;
                 let per_side = u16::try_from(level.tiles_per_side()).unwrap_or(0);
                 for ty in 0..per_side {
                     for tx in 0..per_side {
-                        let key = TileKey::display(face, level, tx, ty)
-                            .map_err(|_range| geom::DisplayError::Shape)?;
-                        if let Some(record) = self.display_record(&key)? {
-                            self.floor.insert(key, record);
-                        }
+                        keys.push(
+                            TileKey::display(face, level, tx, ty)
+                                .map_err(|_range| geom::DisplayError::Shape)?,
+                        );
                     }
                 }
             }
         }
+        // Read and decompressed on the workers: thousands of records (14,400 on the benchmark
+        // project), each a read and a zstd frame.
+        // Nothing is kept in memory yet on open: the files hold every record.
+        let (file, base) = (&self.file, self.base.as_ref());
+        let records = self.workers.install(|| {
+            keys.par_iter()
+                .map(|key| Ok(read_display(file, base, key)?.map(|record| (*key, record))))
+                .collect::<Result<Vec<_>, CacheError>>()
+        })?;
+        self.floor.extend(records.into_iter().flatten());
         Ok(())
     }
 
@@ -203,13 +213,7 @@ impl TileStore {
             Some(Kept::Unknown) => return Ok(None),
             Some(Kept::Written) | None => {}
         }
-        if let Some(found) = self.file.read_display(key)? {
-            return Ok(found.known());
-        }
-        Ok(match &self.base {
-            Some(base) => base.read_display(key)?.and_then(StoredDisplay::known),
-            None => None,
-        })
+        read_display(&self.file, self.base.as_ref(), key)
     }
 
     /// The display part of a recovery flush, at its cut (see [`TileStore::flush_bounds`]): makes
@@ -401,4 +405,24 @@ pub(super) fn display_book_of(working: &ProjectFile, base: Option<&BaseFile>) ->
         Role::Project => BTreeMap::new(),
     };
     Book::with(levels, changed)
+}
+
+/// `key`'s display record as the files hold it: the working file's, else the base's; `None`
+/// where neither knows it.
+///
+/// # Errors
+///
+/// [`CacheError::Store`] if a read fails.
+fn read_display(
+    file: &ProjectFile,
+    base: Option<&BaseFile>,
+    key: &TileKey,
+) -> Result<Option<DisplayRecord>, CacheError> {
+    if let Some(found) = file.read_display(key)? {
+        return Ok(found.known());
+    }
+    Ok(match base {
+        Some(base) => base.read_display(key)?.and_then(StoredDisplay::known),
+        None => None,
+    })
 }
