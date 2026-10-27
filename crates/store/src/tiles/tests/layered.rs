@@ -1052,3 +1052,49 @@ fn a_tile_lost_between_refresh_slices_is_not_built_from_its_copy() {
         );
     }
 }
+
+/// A tile lost to a save goes back to its record at the rebase: its positions change, and the
+/// stale-tile feed names it, in an epoch of its own.
+#[test]
+fn a_tile_lost_to_a_rebase_is_named_by_the_feed() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut saved = CorrectionMap::new();
+    let mut project = saved_project(
+        &dir,
+        "p.bcrf",
+        &mesh,
+        &mut saved,
+        &random_edits(&mesh, TOP, 10, 95),
+    );
+    let working = recovery(&dir, "r1.bcrf", &project);
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), roomy()).unwrap();
+    let cursor = store.subscribe_stale();
+    let lost = tiles(&mesh, TOP, TOP)[17];
+    apply_batches(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &[(lost, vec![(5, 7, Vec3::new(0.0, 0.0, 0.25))])],
+    );
+    store.close_epoch().unwrap();
+    store.save().unwrap();
+    let before = store.evaluate(lost).unwrap().to_vec();
+    drop(store.drain_stale(&cursor));
+    evict(&mut store, &lost);
+    damage(&dir.path("r1.bcrf"), store.file.locate(&lost).unwrap());
+    let proof = store.save_into(&mut project).unwrap();
+    store
+        .rebase(proof, recovery(&dir, "r2.bcrf", &project))
+        .unwrap();
+    assert!(
+        store.evaluate(lost).unwrap() != before.as_slice(),
+        "the tile went back to its record"
+    );
+    match store.drain_stale(&cursor) {
+        crate::stale::Drained::Epochs(epochs) => assert!(
+            epochs.iter().any(|e| e.keys.contains(&lost)),
+            "the lost tile is named"
+        ),
+        crate::stale::Drained::Resync => panic!("no resync expected"),
+    }
+}

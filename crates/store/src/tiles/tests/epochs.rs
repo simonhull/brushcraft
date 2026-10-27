@@ -147,3 +147,169 @@ fn a_failed_close_keeps_the_epoch_open() {
         Drained::Resync => panic!("no resync expected"),
     }
 }
+
+/// A consumer of the feed in the model test, what it was last shown, and the epoch it expects
+/// next.
+struct Watcher {
+    /// Its place in the feed.
+    cursor: crate::stale::StaleCursor,
+    /// The finest tiles as of its last drain.
+    finest: BTreeMap<TileKey, (Vec<Vec3>, Vec<Vec3>)>,
+    /// The display tiles as of its last drain.
+    display: BTreeMap<TileKey, Option<DisplayTile>>,
+    /// The epoch it expects next, unless it hasn't seen one since subscribing or resyncing.
+    next: Option<u64>,
+}
+
+/// Drains `watcher` (consumer `n`, after operation `op`): its epochs come in order, none missed,
+/// and name every finest tile and display tile changed since its last drain; or it resyncs.
+fn observe(store: &mut TileStore, mesh: &BaseMesh, watcher: &mut Watcher, n: usize, op: u64) {
+    let finest = finest_state(store, mesh);
+    let display = display_state(store, mesh);
+    match store.drain_stale(&watcher.cursor) {
+        Drained::Epochs(epochs) => {
+            let mut named = BTreeSet::new();
+            for epoch in epochs {
+                assert!(
+                    watcher.next.is_none_or(|s| epoch.seq == s),
+                    "op {op}, consumer {n}: in order, none missed"
+                );
+                watcher.next = Some(epoch.seq + 1);
+                named.extend(epoch.keys);
+            }
+            for (key, was) in &watcher.finest {
+                if finest[key] != *was {
+                    assert!(named.contains(key), "op {op}, consumer {n}: {key:?}");
+                }
+            }
+            for (key, now) in &display {
+                if now.is_some() && *now != watcher.display[key] {
+                    assert!(named.contains(key), "op {op}, consumer {n}: {key:?}");
+                }
+            }
+        }
+        // Past the cap: it shows everything again, from now on.
+        Drained::Resync => watcher.next = None,
+    }
+    watcher.finest = finest;
+    watcher.display = display;
+}
+
+/// The feed's model through the store, under random operations and drains.
+///
+/// The operations are edits at random levels, refreshes, saves, and roll-overs that lose a
+/// tile; one consumer drains after each, one at random, and one is stalled.
+///
+/// Whenever the fast or the random consumer drains, its epochs come in order, none missed, and
+/// name every finest tile whose positions or normals changed and every display tile rebuilt
+/// since its previous drain; or, only past the cap, it is told to resync. The stalled one gets
+/// every epoch at the end, or past the cap one resync, and memory stays within the cap
+/// throughout.
+#[test]
+fn the_feed_names_every_change_under_random_operations_and_drains() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let cap = 400;
+    let config = roomy().with_display(level(TOP)).with_stale_cap(cap);
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, config);
+    let run_all = |s: &mut TileStore| {
+        while s.has_jobs() {
+            s.run_jobs(Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        }
+    };
+    run_all(&mut store);
+    let mut watchers: Vec<Watcher> = (0..2)
+        .map(|_| Watcher {
+            cursor: store.subscribe_stale(),
+            finest: finest_state(&mut store, &mesh),
+            display: display_state(&mut store, &mesh),
+            next: None,
+        })
+        .collect();
+    let stalled = store.subscribe_stale();
+    let top = tiles(&mesh, TOP, TOP);
+    let mut rng = Rng(23);
+    let mut rolls = 0;
+    for op in 0..16_u64 {
+        match rng.below(4) {
+            0 => run_all(&mut store),
+            1 => drop(store.save().unwrap()),
+            2 => {
+                // A tile edited, saved, then lost to a roll-over (its record damaged).
+                let lost = top[usize::try_from(rng.below(96)).unwrap()];
+                let region = Region::of_tile(&lost);
+                store.begin_op().unwrap();
+                store
+                    .set_correction(
+                        lost.face(),
+                        lost.level(),
+                        region.x0() + 7,
+                        region.y0() + 9,
+                        Vec3::new(0.0, 0.0, 0.2),
+                    )
+                    .unwrap();
+                store.close_epoch().unwrap();
+                store.save().unwrap();
+                // Shown with the edit, so its loss is a change of its own.
+                for (n, watcher) in watchers.iter_mut().enumerate() {
+                    observe(&mut store, &mesh, watcher, n, op);
+                }
+                if store.corrections.find(&lost).is_some() {
+                    evict(&mut store, &lost);
+                }
+                damage(
+                    &dir.path("recovery.bcrf"),
+                    store.file.locate(&lost).unwrap(),
+                );
+                rolls += 1;
+                let meta = store.file.meta().clone();
+                let name = format!("fresh{rolls}.bcrf");
+                let fresh = ProjectFile::create_like(&dir.path(&name), meta, &store.file).unwrap();
+                let filled = store.fill_roll_over(fresh).unwrap();
+                let (old, lost_tiles) = store.roll_over(filled).unwrap();
+                drop(old);
+                assert_eq!(lost_tiles, [lost], "op {op}: lost");
+                std::fs::rename(dir.path(&name), dir.path("recovery.bcrf")).unwrap();
+            }
+            _ => {
+                let edits = random_edits(&mesh, TOP, 1 + rng.below(3), 600 + op);
+                store.begin_op().unwrap();
+                for e in &edits {
+                    store
+                        .set_correction(e.face, e.level, e.i, e.j, e.c)
+                        .unwrap();
+                }
+                store.close_epoch().unwrap();
+            }
+        }
+        for (n, watcher) in watchers.iter_mut().enumerate() {
+            // The first drains after every operation, the second now and then.
+            if n == 1 && rng.below(3) != 0 {
+                continue;
+            }
+            observe(&mut store, &mesh, watcher, n, op);
+        }
+        assert!(
+            store.stale.most_pending() <= cap,
+            "op {op}: memory within the cap"
+        );
+    }
+    assert!(rolls > 0, "some tile was lost to a roll-over");
+    // The stalled consumer: every epoch since it subscribed, in order, within the cap; or, past
+    // the cap, one resync.
+    match store.drain_stale(&stalled) {
+        Drained::Epochs(epochs) => {
+            let held: usize = epochs.iter().map(|e| e.keys.len()).sum();
+            assert!(held <= cap, "within the cap");
+            for (n, epoch) in epochs.iter().enumerate() {
+                assert_eq!(
+                    epoch.seq,
+                    u64::try_from(n).unwrap(),
+                    "every epoch, in order"
+                );
+            }
+        }
+        Drained::Resync => {}
+    }
+}
