@@ -1,5 +1,7 @@
 //! Opens any bytes as a project file and reads everything it names: an error or the file's
-//! content, never a panic or an abort, and within libFuzzer's `-timeout`.
+//! content, never a panic or an abort, and within libFuzzer's `-timeout`. Then opens a tile store
+//! over it keeping a display layer (its book of display levels, the floor it loads, the rebuild
+//! it queues) and runs its jobs for a few milliseconds.
 //!
 //! The input is a whole file. Every record is checksummed, so a change anywhere would fail the
 //! checksum of the record it lands in and reach nothing behind it; the target therefore
@@ -12,7 +14,7 @@
 use std::path::PathBuf;
 
 use libfuzzer_sys::fuzz_target;
-use store::ProjectFile;
+use store::{ProjectFile, StoreConfig, TileStore, Workers};
 
 /// Where this process writes the file it opens: memory-backed, one per fuzzing process.
 fn scratch() -> PathBuf {
@@ -53,6 +55,22 @@ fn read_all(file: &ProjectFile) -> Result<(), store::FileError> {
     store::fuzzing::read_displays(file)
 }
 
+/// Opens a tile store over the file at `path` keeping a display layer under level 2 (the seeds'
+/// finest), with one worker, and runs its jobs for a few milliseconds.
+///
+/// # Errors
+///
+/// The open's or a job's error: the answer to a hostile file.
+fn open_store(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let finest = geom::Level::new(2)?;
+    let config = StoreConfig::new(64 << 20, 1)
+        .with_workers(Workers::Fixed(std::num::NonZeroUsize::MIN))
+        .with_display(finest);
+    let mut store = TileStore::open(ProjectFile::open(path)?, config)?;
+    store.run_jobs(std::time::Instant::now() + std::time::Duration::from_millis(5))?;
+    Ok(())
+}
+
 fuzz_target!(|bytes: &[u8]| {
     let mut bytes = bytes.to_vec();
     store::fuzzing::fix_checksums(&mut bytes);
@@ -60,6 +78,7 @@ fuzz_target!(|bytes: &[u8]| {
     if std::fs::write(&path, &bytes).is_ok() {
         // Any error is a valid answer to a hostile file; only panics and hangs are findings.
         drop(open_and_read(&path));
+        drop(open_store(&path));
         drop(std::fs::remove_file(&path));
     }
 });

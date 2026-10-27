@@ -400,7 +400,11 @@ fn seed_file(path: &Path, meta: Meta) {
     }
     // Display records, named by a save point: two known, one unknown.
     let display = small_display_tiles();
-    let records: Vec<DisplayRecord> = display.iter().take(2).map(DisplayRecord::of).collect();
+    let records: Vec<DisplayRecord> = display
+        .iter()
+        .take(2)
+        .map(|tile| DisplayRecord::of(tile, SMALL_FINEST))
+        .collect();
     let unknown = *display[2].key();
     file.write_display_many(
         records
@@ -417,11 +421,17 @@ fn seed_file(path: &Path, meta: Meta) {
     file.write_displacement(key, op_of(0, 4), &tile).unwrap();
 }
 
+/// The finest level [`small_display_tiles`] are built from.
+const SMALL_FINEST: Level = match Level::new(2) {
+    Ok(level) => level,
+    Err(_) => unreachable!(),
+};
+
 /// Display tiles of the tests' mesh at levels 0 and 1, built from its level-2 surface: small,
 /// real tiles for the display records' harnesses and seeds.
 fn small_display_tiles() -> Vec<DisplayTile> {
     let mesh = fixture::mesh();
-    let finest = Level::new(2).unwrap();
+    let finest = SMALL_FINEST;
     let dense = DenseEvaluation::new(&mesh, finest, &CorrectionMap::new()).unwrap();
     let (mut positions, mut normals) = (FaceGrids::new(finest), FaceGrids::new(finest));
     for face in mesh.faces() {
@@ -461,7 +471,7 @@ fn display_records_round_trip_or_are_refused() {
         .with_type::<(u8, Flip, bool)>()
         .for_each(|&(pick, flip, in_header)| {
             let tile = &tiles[usize::from(pick) % tiles.len()];
-            let record = DisplayRecord::of(tile);
+            let record = DisplayRecord::of(tile, SMALL_FINEST);
             let header = display_header(Some(&record));
             let body = display_body(Some(&record)).to_vec();
             let parsed = if in_header {

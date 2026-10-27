@@ -366,6 +366,19 @@ impl<D: Derived> Book<D> {
         }
     }
 
+    /// A book tracking no level that holds every one of `keys` unknown, to be flushed: for files
+    /// holding values the store can't keep up to date, so its next flush or save names none.
+    pub(crate) fn all_unknown(keys: impl IntoIterator<Item = TileKey>) -> Self {
+        let unflushed: BTreeSet<TileKey> = keys.into_iter().collect();
+        let changes = unflushed.len();
+        Self {
+            changed: unflushed.iter().map(|&key| (key, Kept::Unknown)).collect(),
+            unflushed,
+            changes: u64::try_from(changes).unwrap_or(u64::MAX),
+            ..Self::default()
+        }
+    }
+
     /// Notes a write of `key`'s corrections, if it can change a tracked level's values: the next
     /// [`Book::settle`] makes those unknown.
     pub(crate) fn note_write(&mut self, key: TileKey) {

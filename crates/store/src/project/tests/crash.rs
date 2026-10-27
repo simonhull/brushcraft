@@ -161,9 +161,13 @@ impl FromStr for Scenario {
 
 impl Scenario {
     /// The child's project configuration in `dir`.
+    ///
+    /// It keeps a display layer, its floor's share added to the budget.
     fn config(self, dir: &Path) -> ProjectConfig {
+        let store =
+            if self.tight { tight() } else { roomy() }.with_display(crate::fixture::level(TOP));
         ProjectConfig {
-            store: if self.tight { tight() } else { roomy() },
+            store: store.with_budget_bytes(store.budget_bytes + store.floor_bytes(&mesh())),
             recovery_dir: dir.join("recovery"),
         }
     }

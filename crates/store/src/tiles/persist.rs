@@ -126,7 +126,7 @@ impl TileStore {
             Role::Project => BTreeSet::new(),
         };
         let bounds = book_of(&working, base.as_ref())?;
-        let display = display_book_of(&working, base.as_ref());
+        let display = display_book_of(&working, base.as_ref(), config.display, mesh.face_count());
         let workers = rayon::ThreadPoolBuilder::new()
             .num_threads(config.worker_threads())
             .thread_name(|n| format!("tile-eval-{n}"))
@@ -184,8 +184,14 @@ impl TileStore {
             #[cfg(test)]
             hooks: TestHooks::default(),
         };
-        store.load_floor()?;
-        store.queue_missing_display();
+        if store.load_floor()? {
+            // A layer built for another surface: none of it is trusted.
+            if let Some(finest) = store.display_finest {
+                store.queue_display_rebuild(finest);
+            }
+        } else {
+            store.queue_missing_display();
+        }
         Ok(store)
     }
 

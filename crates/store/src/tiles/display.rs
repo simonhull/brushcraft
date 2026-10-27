@@ -29,19 +29,24 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Eval`] if listing a written tile's readers fails (never, for tiles of the
-    /// store's mesh). Nothing is recorded then.
+    /// [`CacheError::Display`] ([`geom::DisplayError::NoDisplayLevel`]) if the store keeps no
+    /// display layer; [`CacheError::Eval`] if listing a written tile's readers fails (never,
+    /// for tiles of the store's mesh). Nothing is recorded then.
     pub fn record_display(&mut self, tiles: &[DisplayTile]) -> Result<(), CacheError> {
+        let finest = self
+            .display_finest
+            .ok_or(geom::DisplayError::NoDisplayLevel(Level::ZERO))?;
         for tile in tiles {
             self.bumped.remove(tile.key());
             if tile.key().level() <= self.floor_top {
-                self.floor.insert(*tile.key(), DisplayRecord::of(tile));
+                self.floor
+                    .insert(*tile.key(), DisplayRecord::of(tile, finest));
             }
         }
         self.note_epoch_keys(tiles.iter().map(|tile| *tile.key()));
         let records: Vec<(TileKey, DisplayRecord)> = tiles
             .iter()
-            .map(|tile| (*tile.key(), DisplayRecord::of(tile)))
+            .map(|tile| (*tile.key(), DisplayRecord::of(tile, finest)))
             .collect();
         Ok(self
             .display
@@ -73,13 +78,15 @@ impl TileStore {
     }
 
     /// Loads the floor: every face's display tiles up to the floor's top level the files hold.
+    /// Returns whether a record the files hold was built from another finest level than the
+    /// store's: a layer built for another surface, which is then rebuilt whole.
     ///
     /// # Errors
     ///
     /// [`CacheError::Store`] if a record can't be read.
-    pub(super) fn load_floor(&mut self) -> Result<(), CacheError> {
+    pub(super) fn load_floor(&mut self) -> Result<bool, CacheError> {
         let Some(finest) = self.display_finest else {
-            return Ok(());
+            return Ok(false);
         };
         let top = self.floor_top.get().min(finest.get().saturating_sub(1));
         let mut keys = Vec::new();
@@ -106,8 +113,15 @@ impl TileStore {
                 .map(|key| Ok(read_display(file, base, key)?.map(|record| (*key, record))))
                 .collect::<Result<Vec<_>, CacheError>>()
         })?;
-        self.floor.extend(records.into_iter().flatten());
-        Ok(())
+        let mut foreign = false;
+        for (key, record) in records.into_iter().flatten() {
+            if record.finest == finest {
+                self.floor.insert(key, record);
+            } else {
+                foreign = true;
+            }
+        }
+        Ok(foreign)
     }
 
     /// The level the store's display layer is built from (its display tiles sit at the levels
@@ -221,7 +235,9 @@ impl TileStore {
             Some(Kept::Unknown) => return Ok(None),
             Some(Kept::Written) | None => {}
         }
-        read_display(&self.file, self.base.as_ref(), key)
+        // A record built from another finest level bounds another surface: unknown here.
+        Ok(read_display(&self.file, self.base.as_ref(), key)?
+            .filter(|record| Some(record.finest) == self.display_finest))
     }
 
     /// The display part of a recovery flush, at its cut (see [`TileStore::flush_bounds`]): makes
@@ -397,17 +413,39 @@ fn copy_record(to: &mut ProjectFile, from: &ProjectFile, key: &TileKey) -> Resul
     }
 }
 
-/// The display book of a store over `working` and `base`: every level either file holds display
-/// tiles of and, for a recovery file, its display tiles as changed since the last save, held by
-/// the working file.
-pub(super) fn display_book_of(working: &ProjectFile, base: Option<&BaseFile>) -> Book<Display> {
-    let mut levels: BTreeSet<Level> = working.display_keys().map(TileKey::level).collect();
-    if let Some(base) = base {
-        levels.extend(base.display_keys().map(TileKey::level));
-    }
+/// The display book of a store over `working` and `base` keeping a display layer under
+/// `finest` (none if `None`), on a mesh of `faces` faces.
+///
+/// Its levels are the store's, every one below `finest`, whatever keys the files hold, so a
+/// write always makes unknown the display tiles it changes. A display key the layer doesn't
+/// have (a level at or above `finest`, a face the mesh doesn't) is left out, as if absent. For
+/// a recovery file, the working file's display tiles are changes since the last save, held by
+/// it. A store keeping no display layer can't keep one up to date: every display tile the files
+/// hold is unknown to it, so its next save names none.
+pub(super) fn display_book_of(
+    working: &ProjectFile,
+    base: Option<&BaseFile>,
+    finest: Option<Level>,
+    faces: u32,
+) -> Book<Display> {
+    let on_mesh = |key: &&TileKey| key.face().index() < faces;
+    let Some(finest) = finest else {
+        let all: Vec<TileKey> = working
+            .display_keys()
+            .chain(base.into_iter().flat_map(BaseFile::display_keys))
+            .filter(on_mesh)
+            .copied()
+            .collect();
+        return Book::all_unknown(all);
+    };
+    let levels: BTreeSet<Level> = (0..finest.get())
+        .filter_map(|l| Level::new(l).ok())
+        .collect();
     let changed: BTreeMap<TileKey, Kept<DisplayRecord>> = match working.meta().role() {
         Role::Recovery { .. } => working
             .display_keys()
+            .filter(on_mesh)
+            .filter(|key| key.level() < finest)
             .map(|key| (*key, Kept::Written))
             .collect(),
         Role::Project => BTreeMap::new(),

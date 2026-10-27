@@ -32,8 +32,9 @@ use crate::bounds::{self, Derived};
 use crate::deps::DepGraph;
 use crate::op::OpId;
 
-/// The version byte of the display record format this build writes and reads.
-const VERSION: u8 = 1;
+/// The version byte of the display record format this build writes and reads: 2 adds the
+/// finest level a tile was built from.
+const VERSION: u8 = 2;
 /// The state byte of a display record whose tile is unknown: it is rebuilt.
 const UNKNOWN: u8 = 0;
 /// The state byte of a display record that holds its tile.
@@ -46,20 +47,25 @@ pub(crate) const DISPLAY_OP: OpId = match OpId::new(0, 0) {
     None => unreachable!(),
 };
 
-/// A display tile as the store keeps it: its bound and its encoding, as the file holds them.
+/// A display tile as the store keeps it: its bound, the finest level it was built from, and its
+/// encoding, as the file holds them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DisplayRecord {
     /// `e`.
     pub(crate) error: f32,
+    /// The finest level the tile was built from: a store keeping a display layer under another
+    /// level reads the record as unknown (its bound is no bound on that store's surface).
+    pub(crate) finest: Level,
     /// The tile's encoding (`geom::DisplayTile::encoded`).
     pub(crate) encoded: Vec<u8>,
 }
 
 impl DisplayRecord {
-    /// The record of a built tile.
-    pub(crate) fn of(tile: &DisplayTile) -> Self {
+    /// The record of a tile built from the surface at level `finest`.
+    pub(crate) fn of(tile: &DisplayTile, finest: Level) -> Self {
         Self {
             error: tile.error(),
+            finest,
             encoded: tile.encoded().to_vec(),
         }
     }
@@ -85,11 +91,12 @@ impl StoredDisplay {
     }
 }
 
-/// A display record's header: the version, the state, and the bound if known.
+/// A display record's header: the version, the state, and, if known, the finest level and the
+/// bound.
 pub(crate) fn display_header(record: Option<&DisplayRecord>) -> Vec<u8> {
     match record {
         Some(record) => {
-            let mut out = vec![VERSION, KNOWN];
+            let mut out = vec![VERSION, KNOWN, record.finest.get()];
             out.extend_from_slice(&record.error.to_le_bytes());
             out
         }
@@ -113,20 +120,22 @@ pub(crate) fn max_body(key: &TileKey) -> usize {
 
 /// What a display record of `key` with `header` and `body` holds.
 ///
-/// `None` if it isn't one this build reads (another version, a state other than 0 or 1, a bound
-/// that isn't finite and non-negative, a body longer than [`max_body`] or one that doesn't
-/// decode as `key`'s tile). Such a record counts as unknown: the tile is rebuilt.
+/// `None` if it isn't one this build reads (another version, a state other than 0 or 1, a
+/// finest level that isn't a level above `key`'s, a bound that isn't finite and non-negative, a
+/// body longer than [`max_body`] or one that doesn't decode as `key`'s tile). Such a record
+/// counts as unknown: the tile is rebuilt.
 pub(crate) fn parse_display(key: &TileKey, header: &[u8], body: &[u8]) -> Option<StoredDisplay> {
     match *header {
         [VERSION, UNKNOWN] => body.is_empty().then_some(StoredDisplay::Unknown),
-        [VERSION, KNOWN, a, b, c, d] => {
+        [VERSION, KNOWN, finest, a, b, c, d] => {
+            let finest = Level::new(finest).ok().filter(|f| *f > key.level())?;
             let error = f32::from_le_bytes([a, b, c, d]);
             if body.len() > max_body(key) {
                 return None;
             }
             // Decoding checks every byte and the bound; only a tile that decodes is trusted.
             let tile = DisplayTile::decode(*key, error, body).ok()?;
-            Some(StoredDisplay::Known(DisplayRecord::of(&tile)))
+            Some(StoredDisplay::Known(DisplayRecord::of(&tile, finest)))
         }
         _ => None,
     }

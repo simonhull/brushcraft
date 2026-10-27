@@ -3,18 +3,19 @@
 
 use super::*;
 
-/// A display record header round-trips its state and bound.
+/// A display record header round-trips its state, finest level and bound.
 #[test]
-fn headers_hold_the_state_and_the_bound() {
+fn headers_hold_the_state_the_finest_level_and_the_bound() {
     let record = DisplayRecord {
         error: 0.25,
+        finest: Level::new(9).unwrap(),
         encoded: Vec::new(),
     };
     assert_eq!(display_header(None), [VERSION, UNKNOWN], "unknown");
     let known = display_header(Some(&record));
-    assert_eq!(known[..2], [VERSION, KNOWN], "known");
+    assert_eq!(known[..3], [VERSION, KNOWN, 9], "known, from level 9");
     assert_eq!(
-        f32::from_le_bytes(known[2..].try_into().unwrap()),
+        f32::from_le_bytes(known[3..].try_into().unwrap()),
         0.25,
         "the bound"
     );
