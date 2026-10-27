@@ -265,6 +265,7 @@ impl TileStore {
 
     /// Queues building the display tiles of `level` alone (a level below `finest`) the store
     /// doesn't know: for timing a rebuild level by level, finest first.
+    #[cfg(feature = "bench")]
     pub fn queue_display_level(&mut self, finest: Level, level: Level) {
         let keys: Vec<TileKey> = self
             .all_display_keys(finest)

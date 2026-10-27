@@ -735,6 +735,10 @@ impl TileStore {
     /// between evaluations walk its dependencies once. To edit many vertices of one tile,
     /// [`TileStore::edit_tile`] does the bookkeeping once for all of them.
     ///
+    /// The change joins the open epoch of the stale-tile feed ([`TileStore::subscribe_stale`]): the
+    /// caller closes it with [`TileStore::close_epoch`] once its operation is done, as a brush
+    /// step does once per step.
+    ///
     /// # Errors
     ///
     /// [`CacheError::Correction`] with [`CorrectionError::NotFinite`],
@@ -818,6 +822,10 @@ impl TileStore {
     /// tiles are unpinned, and the evaluations of those written are dropped. The writes made
     /// before the panic stay, dirty and on the change feed.
     ///
+    /// The change joins the open epoch of the stale-tile feed ([`TileStore::subscribe_stale`]): the
+    /// caller closes it with [`TileStore::close_epoch`] once its operation is done, as a brush
+    /// step does once per step.
+    ///
     /// # Errors
     ///
     /// [`CacheError::NotATile`]; [`CacheError::OpsExhausted`] if no op is current and none can
@@ -875,6 +883,10 @@ impl TileStore {
     /// So `f` may keep state per vertex that only that vertex's call touches (a brush stroke's
     /// summed deltas, say), but must give the same result whatever the thread schedule. A
     /// change here that called `f` twice for a vertex would break such callers.
+    ///
+    /// The change joins the open epoch of the stale-tile feed ([`TileStore::subscribe_stale`]): the
+    /// caller closes it with [`TileStore::close_epoch`] once its operation is done, as a brush
+    /// step does once per step.
     ///
     /// # Errors
     ///

@@ -20,6 +20,6 @@ anyhow.workspace = true
 geom.workspace = true
 rustix = { workspace = true, features = ["process", "thread"] }
 sculpt.workspace = true
-store.workspace = true
+store = { workspace = true, features = ["bench"] }
 thiserror.workspace = true
 zstd = { workspace = true, optional = true }

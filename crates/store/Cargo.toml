@@ -13,6 +13,9 @@ workspace = true
 # What the whole-file fuzz target needs from inside the crate (`store::fuzzing`), turned on by
 # the fuzz crate only, so release builds never compile it.
 fuzzing = []
+# What `brushcraft-bench` needs to time the display layer level by level
+# (`TileStore::queue_display_level`), turned on by the bench only.
+bench = []
 
 [dependencies]
 bytemuck.workspace = true

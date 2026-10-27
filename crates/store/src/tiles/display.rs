@@ -32,7 +32,7 @@ impl TileStore {
     /// [`CacheError::Display`] ([`geom::DisplayError::NoDisplayLevel`]) if the store keeps no
     /// display layer; [`CacheError::Eval`] if listing a written tile's readers fails (never,
     /// for tiles of the store's mesh). Nothing is recorded then.
-    pub fn record_display(&mut self, tiles: &[DisplayTile]) -> Result<(), CacheError> {
+    pub(crate) fn record_display(&mut self, tiles: &[DisplayTile]) -> Result<(), CacheError> {
         let finest = self
             .display_finest
             .ok_or(geom::DisplayError::NoDisplayLevel(Level::ZERO))?;
@@ -62,8 +62,8 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Eval`] as for [`TileStore::record_display`]; [`CacheError::Store`] if a
-    /// read fails.
+    /// [`CacheError::Eval`] if listing what the writes since the last settle made unknown fails
+    /// (never, for tiles of the store's mesh); [`CacheError::Store`] if a read fails.
     pub fn stored_display(
         &mut self,
         keys: &[TileKey],

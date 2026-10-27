@@ -15,7 +15,7 @@ use geom::{Level, TileKey, Vec3};
 
 /// What a slice of a job left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Progress {
+pub(crate) enum Progress {
     /// More to do: run it again.
     More,
     /// Finished.
