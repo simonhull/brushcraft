@@ -33,6 +33,9 @@ impl TileStore {
     pub fn record_display(&mut self, tiles: &[DisplayTile]) -> Result<(), CacheError> {
         for tile in tiles {
             self.bumped.remove(tile.key());
+            if tile.key().level() <= self.floor_top {
+                self.floor.insert(*tile.key(), DisplayRecord::of(tile));
+            }
         }
         self.note_epoch_keys(tiles.iter().map(|tile| *tile.key()));
         let records: Vec<(TileKey, DisplayRecord)> = tiles
@@ -66,6 +69,44 @@ impl TileStore {
                 Ok(record.and_then(|r| DisplayTile::decode(*key, r.error, &r.encoded).ok()))
             })
             .collect()
+    }
+
+    /// Loads the floor: every face's display tiles up to the floor's top level the files hold.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] if a record can't be read.
+    pub(super) fn load_floor(&mut self) -> Result<(), CacheError> {
+        let Some(finest) = self.display_finest else {
+            return Ok(());
+        };
+        let top = self.floor_top.get().min(finest.get().saturating_sub(1));
+        let faces: Vec<geom::FaceId> = self.mesh.faces().collect();
+        for face in faces {
+            for l in 0..=top {
+                let level = Level::new(l).map_err(|_level| geom::DisplayError::Shape)?;
+                let per_side = u16::try_from(level.tiles_per_side()).unwrap_or(0);
+                for ty in 0..per_side {
+                    for tx in 0..per_side {
+                        let key = TileKey::display(face, level, tx, ty)
+                            .map_err(|_range| geom::DisplayError::Shape)?;
+                        if let Some(record) = self.display_record(&key)? {
+                            self.floor.insert(key, record);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The display floor the store keeps: how many tiles, and their encodings' bytes.
+    #[must_use]
+    pub fn floor_size(&self) -> (usize, usize) {
+        (
+            self.floor.len(),
+            self.floor.values().map(|r| r.encoded.len()).sum(),
+        )
     }
 
     /// Raises the bound of every display tile a dab's writes of the `edited` tiles can change by
@@ -106,8 +147,9 @@ impl TileStore {
 
     /// The display tiles to draw for each of `keys`, in order: the stored tile, or one a stroke
     /// is changing as it was before the stroke with its bound raised (see
-    /// [`TileStore::bump_display_error`]); `None` where neither is known, and the tile must be
-    /// drawn finer.
+    /// [`TileStore::bump_display_error`]), or a floor tile writes made unknown as it was last
+    /// recorded, its bound the largest there is; `None` where none of these is known, and the tile
+    /// must be drawn finer.
     ///
     /// # Errors
     ///
@@ -124,8 +166,16 @@ impl TileStore {
                     let bound = (record.error + extra).next_up();
                     return Ok(DisplayTile::decode(*key, bound, &record.encoded).ok());
                 }
-                let record = self.display_record(key)?;
-                Ok(record.and_then(|r| DisplayTile::decode(*key, r.error, &r.encoded).ok()))
+                if let Some(record) = self.display_record(key)? {
+                    return Ok(DisplayTile::decode(*key, record.error, &record.encoded).ok());
+                }
+                // A floor tile writes made unknown, and no stroke's bump covers: drawn as it was,
+                // its bound the largest there is, so a view finer than it is chosen whenever there
+                // is one, and never nothing.
+                Ok(self
+                    .floor
+                    .get(key)
+                    .and_then(|r| DisplayTile::decode(*key, f32::MAX, &r.encoded).ok()))
             })
             .collect()
     }

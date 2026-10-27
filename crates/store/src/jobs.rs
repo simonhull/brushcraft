@@ -9,9 +9,9 @@
 //! honoured to within one slice.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{Level, TileKey};
+use geom::{Level, TileKey, Vec3};
 
 /// What a slice of a job left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub struct JobsReport {
 }
 
 /// A job: work the store does in slices on its owner thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Job {
     /// Brings up to date the display tiles edits made unknown, finest level first.
     Refresh(Upkeep),
@@ -67,13 +67,48 @@ impl Job {
 }
 
 /// Display tiles to build, finest level first, for a display layer under `finest`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Upkeep {
     /// The finest level, which the display tiles are built from.
     pub(crate) finest: Level,
     /// The tiles still to build, finest level first, then in key order: a tile is built after
     /// every tile one level finer that it reads.
     pending: BTreeSet<(Reverse<Level>, TileKey)>,
+    /// The finest tiles' values the tile being built reads, copied as they are evaluated.
+    pub(crate) scratch: FinestScratch,
+}
+
+/// The finest positions and normals one display tile reads, copied as slices evaluate them.
+///
+/// A tile reading more finest tiles than the budget holds at once (a whole face's, under a
+/// small budget) is still built, a batch at a time, never waiting for all of them to be
+/// resident together.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct FinestScratch {
+    /// The display tile they are for.
+    pub(crate) tile: Option<TileKey>,
+    /// Finest tiles' positions, by key.
+    pub(crate) positions: BTreeMap<TileKey, Vec<Vec3>>,
+    /// Finest tiles' unit normals, by key.
+    pub(crate) normals: BTreeMap<TileKey, Vec<Vec3>>,
+}
+
+impl FinestScratch {
+    /// Empties it for display tile `tile`, unless it is for that tile already.
+    pub(crate) fn begin(&mut self, tile: TileKey) {
+        if self.tile != Some(tile) {
+            self.tile = Some(tile);
+            self.positions.clear();
+            self.normals.clear();
+        }
+    }
+
+    /// Empties it.
+    pub(crate) fn clear(&mut self) {
+        self.tile = None;
+        self.positions.clear();
+        self.normals.clear();
+    }
 }
 
 impl Upkeep {
@@ -81,6 +116,7 @@ impl Upkeep {
     pub(crate) fn new(finest: Level, keys: impl IntoIterator<Item = TileKey>) -> Self {
         Self {
             finest,
+            scratch: FinestScratch::default(),
             pending: keys
                 .into_iter()
                 .filter(|key| key.level() < finest)

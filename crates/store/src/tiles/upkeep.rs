@@ -27,7 +27,7 @@ use geom::{
 use super::TileStore;
 use super::config::Evaluation;
 use super::error::CacheError;
-use crate::jobs::{Job, JobsReport, Progress, Upkeep};
+use crate::jobs::{FinestScratch, Job, JobsReport, Progress, Upkeep};
 
 /// The most finest tiles one slice evaluates for a display tile: a whole-face tile reads all of
 /// its face's, which would make one slice of many milliseconds.
@@ -57,11 +57,11 @@ fn containing(
     Some((key, usize::try_from(lj * key.side() + li).ok()?))
 }
 
-/// The finest unit normals the store has evaluated, read as a [`PositionSource`] for the mip of
-/// the level above the finest; every tile it lacks is noted.
+/// The finest unit normals a job has copied, read as a [`PositionSource`] for the mip of the
+/// level above the finest; every tile it lacks is noted.
 struct FinestNormals<'a> {
-    /// The store, read without evaluating.
-    store: &'a TileStore,
+    /// The normals copied, by tile.
+    normals: &'a BTreeMap<TileKey, Vec<Vec3>>,
     /// The tiles whose normals a read found missing.
     misses: RefCell<BTreeSet<TileKey>>,
 }
@@ -69,10 +69,7 @@ struct FinestNormals<'a> {
 impl PositionSource for FinestNormals<'_> {
     fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
         let (key, index) = containing(Channel::DISPLACEMENT, face, level, i, j)?;
-        let found = self
-            .store
-            .cached_normals(&key)
-            .and_then(|n| n.get(index).copied());
+        let found = self.normals.get(&key).and_then(|n| n.get(index).copied());
         if found.is_none() {
             self.misses.borrow_mut().insert(key);
         }
@@ -296,8 +293,10 @@ impl TileStore {
                 Progress::More
             });
         }
-        match self.try_build_display(key, finest) {
+        upkeep.scratch.begin(key);
+        match self.try_build_display(key, finest, &upkeep.scratch) {
             Ok(Attempt::Built(tile)) => {
+                upkeep.scratch.clear();
                 self.record_display(std::slice::from_ref(&*tile))?;
                 // A slice is an operation: its display tile is an epoch of its own.
                 self.close_epoch()?;
@@ -307,6 +306,21 @@ impl TileStore {
                 let batch: Vec<TileKey> = keys.into_iter().take(EVALUATE_BATCH).collect();
                 upkeep.push(key);
                 self.evaluate_many(&batch, what)?;
+                // Copied now, while cached: a later batch may evict them.
+                for tile in &batch {
+                    let positions = match self.cached_positions(tile) {
+                        Some(p) => p.to_vec(),
+                        None => self.evaluate(*tile)?.to_vec(),
+                    };
+                    upkeep.scratch.positions.insert(*tile, positions);
+                    if what == Evaluation::Normals {
+                        let normals = match self.cached_normals(tile) {
+                            Some(n) => n.to_vec(),
+                            None => self.normals(*tile)?.to_vec(),
+                        };
+                        upkeep.scratch.normals.insert(*tile, normals);
+                    }
+                }
                 report.evaluated += batch.len();
             }
             Ok(Attempt::Needs(keys)) => {
@@ -334,7 +348,12 @@ impl TileStore {
     ///
     /// [`CacheError::Display`] if the tile won't build from its inputs; [`CacheError::Store`]
     /// if a display record can't be read.
-    fn try_build_display(&mut self, key: TileKey, finest: Level) -> Result<Attempt, CacheError> {
+    fn try_build_display(
+        &mut self,
+        key: TileKey,
+        finest: Level,
+        scratch: &FinestScratch,
+    ) -> Result<Attempt, CacheError> {
         let level = key.level();
         let finer = level.child().ok_or(DisplayError::NoDisplayLevel(level))?;
         let shift = finest.get() - level.get();
@@ -362,21 +381,21 @@ impl TileStore {
         let missing: Vec<TileKey> = finest_tiles(face, finest, xs, ys)
             .into_iter()
             .filter(|t| match what {
-                Evaluation::Normals => self.cached_normals(t).is_none(),
-                Evaluation::Positions => self.cached_positions(t).is_none(),
+                Evaluation::Normals => !scratch.normals.contains_key(t),
+                Evaluation::Positions => !scratch.positions.contains_key(t),
             })
             .collect();
         if !missing.is_empty() {
             return Ok(Attempt::Evaluate(missing, what));
         }
-        let finest_at = |store: &Self, x: u32, y: u32| -> Option<Vec3> {
+        let finest_at = |x: u32, y: u32| -> Option<Vec3> {
             let (tile, index) = containing(Channel::DISPLACEMENT, face, finest, x, y)?;
-            store.cached_positions(&tile)?.get(index).copied()
+            scratch.positions.get(&tile)?.get(index).copied()
         };
         let side = key.side();
         let exact = (0..side)
             .flat_map(|j| (0..side).map(move |i| (i, j)))
-            .map(|(i, j)| finest_at(self, span(region.x0() + i), span(region.y0() + j)))
+            .map(|(i, j)| finest_at(span(region.x0() + i), span(region.y0() + j)))
             .collect::<Option<Vec<Vec3>>>()
             .ok_or(DisplayError::Unavailable)?;
         let exact = Grid::new(side, exact)?;
@@ -384,11 +403,11 @@ impl TileStore {
         let (finer_block, children_bound, means) = if finer == finest {
             let block = (0..fine_side)
                 .flat_map(|j| (0..fine_side).map(move |i| (i, j)))
-                .map(|(i, j)| finest_at(self, 2 * region.x0() + i, 2 * region.y0() + j))
+                .map(|(i, j)| finest_at(2 * region.x0() + i, 2 * region.y0() + j))
                 .collect::<Option<Vec<Vec3>>>()
                 .ok_or(DisplayError::Unavailable)?;
             let source = FinestNormals {
-                store: self,
+                normals: &scratch.normals,
                 misses: RefCell::new(BTreeSet::new()),
             };
             let means = mip_normals_tile(&self.mesh, &source, &key);

@@ -42,6 +42,7 @@ mod edit;
 mod epochs;
 mod evaluate;
 mod feed;
+mod floor;
 mod invalidate;
 mod layered;
 mod prefetch;

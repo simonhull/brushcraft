@@ -107,6 +107,18 @@ pub enum CacheError {
         /// and the kept predictions.
         most: usize,
     },
+    /// The display layer's floor (every face's display tiles up to
+    /// [`StoreConfig::floor_top`](super::StoreConfig::floor_top), kept resident) doesn't fit
+    /// beside the pools' minimum and the other reserved shares.
+    #[error(
+        "the display floor takes {floor} bytes of the budget, more than the {most} it can spare"
+    )]
+    FloorTooLarge {
+        /// The floor's share, at its largest.
+        floor: usize,
+        /// The most the budget can set aside beside the pools' minimum and the other shares.
+        most: usize,
+    },
     /// Every op id of this site has been handed out.
     #[error("the op ids of this site are used up")]
     OpsExhausted,

@@ -352,6 +352,11 @@ pub struct TileStore {
     /// [`TileStore::bump_display_error`]): drawn in their place until a refresh records them.
     /// Memory only: never written.
     bumped: std::collections::BTreeMap<TileKey, (crate::display::DisplayRecord, f32)>,
+    /// The display layer's floor (see [`StoreConfig::floor_top`]): every face's display tiles up
+    /// to [`TileStore::floor_top`], as last recorded, kept for the store's life.
+    floor: std::collections::BTreeMap<TileKey, crate::display::DisplayRecord>,
+    /// The top level of the floor.
+    floor_top: geom::Level,
     /// The stale-tile feed (see [`crate::stale`]).
     stale: crate::stale::StaleFeed,
     /// The correction writes since the open epoch began, noted while a consumer listens.

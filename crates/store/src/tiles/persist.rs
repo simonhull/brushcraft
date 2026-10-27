@@ -114,7 +114,7 @@ impl TileStore {
         check_layers(working.meta(), base.as_ref())?;
         let mesh = working.mesh();
         let headroom = Headroom::of(&mesh);
-        let reserved_bytes = reserved_shares(headroom, &config)?;
+        let reserved_bytes = reserved_shares(headroom, &config, config.floor_bytes(&mesh))?;
         let next_op = first_op(
             config.site,
             [working.head(), base.as_ref().and_then(BaseFile::head)],
@@ -161,6 +161,8 @@ impl TileStore {
             stale: crate::stale::StaleFeed::new(config.stale_cap),
             epoch_writes: BTreeSet::new(),
             epoch_keys: BTreeSet::new(),
+            floor: std::collections::BTreeMap::new(),
+            floor_top: config.floor_top,
             feed,
             save_consumer,
             streams: HashMap::new(),
@@ -182,6 +184,7 @@ impl TileStore {
             #[cfg(test)]
             hooks: TestHooks::default(),
         };
+        store.load_floor()?;
         store.queue_missing_display();
         Ok(store)
     }

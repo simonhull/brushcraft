@@ -83,12 +83,24 @@ pub struct StoreConfig {
     /// is told to resync (see [`TileStore::drain_stale`](super::TileStore::drain_stale)):
     /// [`crate::DEFAULT_STALE_CAP`] unless set.
     pub stale_cap: usize,
+    /// The top level of the display layer's floor: every face's display tiles at this level
+    /// and below are loaded on open (and kept as a refresh or rebuild records them), never
+    /// evicted, and charged to the budget as a reserved share at their largest
+    /// ([`StoreConfig::floor_bytes`]), so a view always has something to draw.
+    /// [`StoreConfig::DEFAULT_FLOOR_TOP`] unless set; only with a display layer.
+    pub floor_top: geom::Level,
 }
 
 impl StoreConfig {
     /// The default chunk: 64 MiB, large enough that the allocator maps each chunk on its own
     /// and gives it back to the OS when it is dropped (see the pool's notes).
     pub const DEFAULT_CHUNK_BYTES: usize = 64 << 20;
+    /// The default [`StoreConfig::floor_top`]: level 5, about 16 MB compressed for the
+    /// benchmark's 2,400 faces (see the M1 spec's "Residency").
+    pub const DEFAULT_FLOOR_TOP: geom::Level = match geom::Level::new(5) {
+        Ok(level) => level,
+        Err(_) => unreachable!(),
+    };
     /// The default [`StoreConfig::kept_predictions`]: 64, about 13 MB of the budget. A brush step
     /// re-predicts the 20 to 30 tiles its sphere reaches, and a stroke moves on by a tenth of a
     /// radius a step, so a stroke's tiles are reused for several steps before it leaves them.
@@ -116,7 +128,34 @@ impl StoreConfig {
             stroke_tiles: Self::DEFAULT_STROKE_TILES,
             display: None,
             stale_cap: crate::stale::DEFAULT_STALE_CAP,
+            floor_top: Self::DEFAULT_FLOOR_TOP,
         }
+    }
+
+    /// This configuration keeping the display floor up to `floor_top` (see
+    /// [`StoreConfig::floor_top`]).
+    #[must_use]
+    pub const fn with_floor_top(self, floor_top: geom::Level) -> Self {
+        Self { floor_top, ..self }
+    }
+
+    /// The bytes of the budget set aside for the display floor over `mesh`: every face's display
+    /// tiles at levels up to [`StoreConfig::floor_top`] (and below the display layer's finest),
+    /// each at the most its level's encoding can take. Zero without a display layer.
+    #[must_use]
+    pub fn floor_bytes(&self, mesh: &BaseMesh) -> usize {
+        let Some(finest) = self.display else {
+            return 0;
+        };
+        let per_face: usize = (0..finest.get().min(self.floor_top.get() + 1))
+            .filter_map(|l| {
+                let key =
+                    geom::TileKey::display(geom::FaceId::new(0), geom::Level::new(l).ok()?, 0, 0)
+                        .ok()?;
+                Some(crate::display::max_body(&key))
+            })
+            .sum();
+        per_face.saturating_mul(usize::try_from(mesh.face_count()).unwrap_or(usize::MAX))
     }
 
     /// This configuration letting a stale-feed consumer fall `stale_cap` keys behind (see
@@ -326,6 +365,7 @@ impl Headroom {
 pub(super) fn reserved_shares(
     headroom: Headroom,
     config: &StoreConfig,
+    floor: usize,
 ) -> Result<usize, CacheError> {
     let pools = headroom.minimum_budget(config.chunk_bytes);
     let Some(spare) = config.budget_bytes.checked_sub(pools) else {
@@ -350,5 +390,9 @@ pub(super) fn reserved_shares(
             asked: config.stroke_tiles,
             most: spare / StoreConfig::STROKE_TILE_BYTES,
         })?;
-    Ok(kept + stroke)
+    let spare = spare - stroke;
+    if floor > spare {
+        return Err(CacheError::FloorTooLarge { floor, most: spare });
+    }
+    Ok(kept + stroke + floor)
 }
