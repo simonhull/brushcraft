@@ -38,6 +38,9 @@ pub struct JobsReport {
     pub left: usize,
     /// The longest slice run: the most the deadline can be overrun by.
     pub longest_slice: std::time::Duration,
+    /// Display tiles that wouldn't build (extreme geometry, say), left unknown and skipped
+    /// until a change lands (see [`TileStore::failed_display`](crate::TileStore::failed_display)).
+    pub failed: usize,
 }
 
 /// A job: work the store does in slices on its owner thread.

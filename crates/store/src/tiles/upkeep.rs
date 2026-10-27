@@ -160,7 +160,12 @@ impl TileStore {
             return Ok(());
         }
         self.display.settle(&self.mesh, &self.deps)?;
-        let unknown = self.display.unknown_keys();
+        let unknown: Vec<TileKey> = self
+            .display
+            .unknown_keys()
+            .into_iter()
+            .filter(|key| !self.has_failed(key))
+            .collect();
         if !unknown.is_empty() {
             self.jobs
                 .push_back(Job::Refresh(Upkeep::new(finest, unknown)));
@@ -292,7 +297,14 @@ impl TileStore {
         let Some(key) = upkeep.next() else {
             return Ok(Progress::Done);
         };
-        if self.knows_display(&key)? {
+        let known = match self.knows_display(&key) {
+            Ok(known) => known,
+            Err(e) => {
+                upkeep.push(key);
+                return Err(e);
+            }
+        };
+        if known || self.has_failed(&key) {
             return Ok(if upkeep.is_empty() {
                 Progress::Done
             } else {
@@ -303,7 +315,10 @@ impl TileStore {
         match self.try_build_display(key, finest, &upkeep.scratch) {
             Ok(Attempt::Built(tile)) => {
                 upkeep.scratch.clear();
-                self.record_display(std::slice::from_ref(&*tile))?;
+                if let Err(e) = self.record_display(std::slice::from_ref(&*tile)) {
+                    upkeep.push(key);
+                    return Err(e);
+                }
                 // A slice is an operation: its display tile is an epoch of its own.
                 self.close_epoch()?;
                 report.built += 1;
@@ -330,10 +345,23 @@ impl TileStore {
                 report.evaluated += batch.len();
             }
             Ok(Attempt::Needs(keys)) => {
-                upkeep.push(key);
-                for dep in keys {
-                    upkeep.push(dep);
+                // A tile reading one that wouldn't build can't build either, until a change.
+                if let Some(why) = keys.iter().find_map(|dep| self.failure(dep)) {
+                    self.fail_display(key, why);
+                    report.failed += 1;
+                } else {
+                    upkeep.push(key);
+                    for dep in keys {
+                        upkeep.push(dep);
+                    }
                 }
+            }
+            Err(CacheError::Display(why)) => {
+                // This tile won't build from what the store holds: unknown, and skipped, so
+                // one tile never holds up the rest.
+                upkeep.scratch.clear();
+                self.fail_display(key, why);
+                report.failed += 1;
             }
             Err(e) => {
                 upkeep.push(key);
@@ -345,6 +373,37 @@ impl TileStore {
         } else {
             Progress::More
         })
+    }
+
+    /// Why display tile `key` wouldn't build, if it failed since the last correction change.
+    fn failure(&self, key: &TileKey) -> Option<DisplayError> {
+        self.display_failed
+            .get(key)
+            .filter(|(at, _)| *at == self.edits)
+            .map(|&(_, why)| why)
+    }
+
+    /// Whether display tile `key` failed since the last correction change: it is skipped.
+    fn has_failed(&self, key: &TileKey) -> bool {
+        self.failure(key).is_some()
+    }
+
+    /// Records that display tile `key` wouldn't build, for `why`: it is unknown, and every job
+    /// skips it until a correction changes.
+    fn fail_display(&mut self, key: TileKey, why: DisplayError) {
+        self.display.set(key, None);
+        self.display_failed.insert(key, (self.edits, why));
+    }
+
+    /// The display tiles that wouldn't build since the last correction change, and why: each is
+    /// unknown (drawn finer), and is tried again once a change lands.
+    #[must_use]
+    pub fn failed_display(&self) -> Vec<(TileKey, DisplayError)> {
+        self.display_failed
+            .iter()
+            .filter(|(_, (at, _))| *at == self.edits)
+            .map(|(&key, &(_, why))| (key, why))
+            .collect()
     }
 
     /// Builds display tile `key` (a level below `finest`) from what the store holds, or says
@@ -360,6 +419,10 @@ impl TileStore {
         finest: Level,
         scratch: &FinestScratch,
     ) -> Result<Attempt, CacheError> {
+        #[cfg(test)]
+        if self.hooks.unbuildable_display == Some(key) {
+            return Err(DisplayError::TooLarge.into());
+        }
         let level = key.level();
         let finer = level.child().ok_or(DisplayError::NoDisplayLevel(level))?;
         let shift = finest.get() - level.get();

@@ -361,3 +361,62 @@ fn a_write_no_bump_covers_drops_the_bumps_it_reaches() {
         );
     }
 }
+
+/// A display tile that won't build is left unknown, reported and skipped, never a stall.
+///
+/// So is every tile reading it (as one from extreme geometry wouldn't build): every other tile
+/// is built, the jobs finish, and every display tile is known or unknown. It is tried again
+/// after the next change.
+#[test]
+fn a_tile_that_wont_build_is_skipped_not_a_stall() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let face = FaceId::new(3);
+    let bad = TileKey::display(face, level(TOP - 1), 1, 1).unwrap();
+    store.hooks.unbuildable_display = Some(bad);
+    // An edit under the tile: it and the tiles above it are to be built again.
+    store
+        .set_correction(face, level(TOP), 200, 200, Vec3::new(0.0, 0.0, 0.01))
+        .unwrap();
+    let mut failed = 0;
+    let mut calls = 0;
+    while store.has_jobs() || calls == 0 {
+        failed += store
+            .run_jobs(Instant::now() + Duration::from_secs(60))
+            .unwrap()
+            .failed;
+        calls += 1;
+        assert!(calls < 1000, "the jobs end");
+    }
+    let failures = store.failed_display();
+    assert!(failures.iter().any(|(k, _)| *k == bad), "the tile failed");
+    assert!(failures.len() > 1, "and the tiles reading it");
+    assert_eq!(failures.len(), failed, "each failure reported once");
+    let keys = display_layer_keys(&mesh);
+    let failed_keys: BTreeSet<TileKey> = failures.iter().map(|(k, _)| *k).collect();
+    for (key, kept) in keys.iter().zip(store.stored_display(&keys).unwrap()) {
+        assert_eq!(
+            kept.is_none(),
+            failed_keys.contains(key),
+            "{key:?}: unknown exactly when it failed"
+        );
+    }
+    // A change: the failed tiles are tried again, and build.
+    store.hooks.unbuildable_display = None;
+    store
+        .set_correction(face, level(TOP), 200, 200, Vec3::ZERO)
+        .unwrap();
+    assert!(store.failed_display().is_empty(), "retried after a change");
+    run_all(&mut store);
+    assert_layer_current(&mut store, "built again");
+}
+
+/// Every display tile key of `mesh` under [`TOP`].
+fn display_layer_keys(mesh: &BaseMesh) -> Vec<TileKey> {
+    tiles(mesh, 0, TOP - 1)
+        .into_iter()
+        .map(|k| TileKey::display(k.face(), k.level(), k.tx(), k.ty()).unwrap())
+        .collect()
+}

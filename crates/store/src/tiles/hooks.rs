@@ -50,6 +50,9 @@ pub(super) struct TestHooks {
     /// A tile whose normals computation fails on the workers, after every other task of its
     /// round has written its slot: for tests of that error path.
     pub(super) failing_normals: Option<TileKey>,
+    /// A display tile that won't build, as one from extreme geometry wouldn't: for tests of a
+    /// job skipping it.
+    pub(super) unbuildable_display: Option<TileKey>,
     /// Whether [`TileStore::tile_border`](super::TileStore::tile_border) gives `None` for every
     /// tile, as it would for a tile holding a border vertex twice: for tests of the edits'
     /// fallback, which no valid mesh reaches.

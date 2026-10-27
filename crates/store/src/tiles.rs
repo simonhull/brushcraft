@@ -352,6 +352,10 @@ pub struct TileStore {
     /// [`TileStore::bump_display_error`]): drawn in their place until a refresh records them.
     /// Memory only: never written.
     bumped: std::collections::BTreeMap<TileKey, (crate::display::DisplayRecord, f32)>,
+    /// The display tiles that wouldn't build, each with why and the count of correction changes
+    /// ([`TileStore::edits`]) it failed at: unknown, and left out of every job until a change
+    /// lands (see [`TileStore::failed_display`]).
+    display_failed: std::collections::BTreeMap<TileKey, (u64, geom::DisplayError)>,
     /// The tiles whose corrections changed (a write, or a lost tile going back to its record)
     /// since a bump last covered them, while any tile is bumped: a bump they reach no longer
     /// bounds its tile, and is dropped before anything reads one
