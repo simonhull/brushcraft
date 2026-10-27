@@ -503,6 +503,10 @@ fn stroke_write(
 /// As [`TileStore::bump_display_error`], and [`TileStore::correction`] for reading a tile's
 /// step.
 fn raise_display_bounds(store: &mut TileStore, found: &BrushOutput) -> Result<(), CacheError> {
+    // Without a display layer there is nothing to raise, and no reason to scan every delta.
+    if store.display_finest().is_none() {
+        return Ok(());
+    }
     let delta = found
         .edits
         .iter()

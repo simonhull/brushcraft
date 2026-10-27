@@ -110,6 +110,14 @@ impl TileStore {
         Ok(())
     }
 
+    /// The level the store's display layer is built from (its display tiles sit at the levels
+    /// below it), or `None` if the store keeps no display layer
+    /// ([`StoreConfig::display`](super::StoreConfig::display)).
+    #[must_use]
+    pub const fn display_finest(&self) -> Option<Level> {
+        self.display_finest
+    }
+
     /// The display floor the store keeps: how many tiles, and their encodings' bytes.
     #[must_use]
     pub fn floor_size(&self) -> (usize, usize) {
