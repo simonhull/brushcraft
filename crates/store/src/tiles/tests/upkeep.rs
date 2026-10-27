@@ -310,3 +310,54 @@ fn edits_between_slices_never_leave_a_tile_built_from_stale_copies() {
     assert_eq!(edits, 12, "every edit landed on copies mid-build");
     assert_layer_current(&mut store, "rebuilt among edits");
 }
+
+/// A write no bump covers (outside a dab, or a lost tile's revert) changes a bumped tile's finest
+/// values: its bumped bound no longer bounds it, so it is drawn as unknown, never as bumped.
+#[test]
+fn a_write_no_bump_covers_drops_the_bumps_it_reaches() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let face = FaceId::new(1);
+    let (ci, cj) = (100, 140);
+    let at = |i, j| {
+        TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level(TOP), i, j).unwrap()
+    };
+    // A dab: one vertex raised a little, bumped by what it moved.
+    store.begin_op().unwrap();
+    let (key, li, lj) = at(ci, cj);
+    let c = store.correction(key).unwrap().get(li, lj).unwrap();
+    store
+        .set_correction(face, level(TOP), ci, cj, c + Vec3::new(0.0, 0.0, 0.001))
+        .unwrap();
+    store.bump_display_error(&[key], 0.01).unwrap();
+    let bumped: Vec<TileKey> = store
+        .bumped
+        .keys()
+        .copied()
+        .filter(|k| k.level() == level(TOP - 1))
+        .collect();
+    assert!(
+        !bumped.is_empty(),
+        "the dab bumps tiles one level above the finest"
+    );
+    assert!(
+        store
+            .display_for_draw(&bumped)
+            .unwrap()
+            .iter()
+            .all(Option::is_some),
+        "drawn bumped"
+    );
+    // A large write to the same vertex, which no bump covers.
+    store
+        .set_correction(face, level(TOP), ci, cj, c + Vec3::new(0.0, 0.0, 0.5))
+        .unwrap();
+    for (k, drawn) in bumped.iter().zip(store.display_for_draw(&bumped).unwrap()) {
+        assert!(
+            drawn.is_none(),
+            "{k:?}: unknown, not drawn with a stale bump"
+        );
+    }
+}

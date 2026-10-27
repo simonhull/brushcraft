@@ -166,6 +166,7 @@ impl TileStore {
     pub(super) fn drop_lost_slot(&mut self, key: &TileKey) -> Result<bool, CacheError> {
         // The tile reads as its last record from now on, not as the lost write.
         self.corrections_changed();
+        self.note_unbumped(*key);
         self.unsaved.remove(key);
         let Some(id) = self.corrections.find(key) else {
             return Ok(false);

@@ -147,9 +147,11 @@ impl TileStore {
     /// bound still a bound, until a refresh replaces them (see [`TileStore::display_for_draw`]).
     ///
     /// Twice: the finest vertex and the display vertex compared with it can each move that far
-    /// (the renderer's stand-ins move display vertices too). Call it after each dab's writes,
-    /// before anything reads the store's display tiles: the first dab of a stroke keeps each
-    /// tile as it was before the stroke.
+    /// (the renderer's stand-ins move display vertices too). Call it after each dab's writes
+    /// ([`TileStore::update_tiles`], which settles every write before them), before anything
+    /// reads the store's display tiles: the first dab of a stroke keeps each tile as it was
+    /// before the stroke. A write since the last bump that isn't one of `edited` (a lost tile's
+    /// revert, a write outside the dab) drops the bumps it reaches: those tiles are unknown.
     ///
     /// # Errors
     ///
@@ -164,15 +166,56 @@ impl TileStore {
             return Ok(());
         }
         let edited: BTreeSet<TileKey> = edited.iter().copied().collect();
-        let readers =
-            crate::display::readers(&self.mesh, &self.deps, &edited, self.display.levels())?;
+        // Changes the bump doesn't cover: the tiles they reach are unknown, never bumped.
+        let uncovered: BTreeSet<TileKey> = self.unbumped.difference(&edited).copied().collect();
+        self.unbumped.clear();
+        let levels = self.display.levels().clone();
+        let stale = crate::display::readers(&self.mesh, &self.deps, &uncovered, &levels)?;
+        for key in &stale {
+            self.bumped.remove(key);
+        }
+        let readers = crate::display::readers(&self.mesh, &self.deps, &edited, &levels)?;
         let raise = 2.0 * max_displacement.abs();
-        for key in readers {
-            if let Some((_, extra)) = self.bumped.get_mut(&key) {
+        for key in readers.difference(&stale) {
+            if let Some((_, extra)) = self.bumped.get_mut(key) {
                 *extra += raise;
-            } else if let Some(record) = self.display_record(&key)? {
-                self.bumped.insert(key, (record, raise));
+            } else if let Some(record) = self.display_record(key)? {
+                // The record as it was before the dab's writes: every write before them is
+                // settled, theirs not yet.
+                self.bumped.insert(*key, (record, raise));
             }
+        }
+        Ok(())
+    }
+
+    /// Notes a change of `key`'s corrections no bump has covered yet, while any tile is bumped.
+    pub(super) fn note_unbumped(&mut self, key: TileKey) {
+        if !self.bumped.is_empty() {
+            self.unbumped.insert(key);
+        }
+    }
+
+    /// Drops every bump the corrections changed since the last bump reach: those tiles' bumped
+    /// bounds no longer bound them, and they are unknown (see
+    /// [`TileStore::bump_display_error`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] if listing the changes' readers fails (never, for tiles of the
+    /// store's mesh); they stay noted then.
+    pub(super) fn drop_uncovered_bumps(&mut self) -> Result<(), CacheError> {
+        if self.unbumped.is_empty() {
+            return Ok(());
+        }
+        let stale = crate::display::readers(
+            &self.mesh,
+            &self.deps,
+            &self.unbumped,
+            self.display.levels(),
+        )?;
+        self.unbumped.clear();
+        for key in &stale {
+            self.bumped.remove(key);
         }
         Ok(())
     }
@@ -190,6 +233,7 @@ impl TileStore {
         &mut self,
         keys: &[TileKey],
     ) -> Result<Vec<Option<DisplayTile>>, CacheError> {
+        self.drop_uncovered_bumps()?;
         self.display.settle(&self.mesh, &self.deps)?;
         keys.iter()
             .map(|key| {

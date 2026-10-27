@@ -352,6 +352,11 @@ pub struct TileStore {
     /// [`TileStore::bump_display_error`]): drawn in their place until a refresh records them.
     /// Memory only: never written.
     bumped: std::collections::BTreeMap<TileKey, (crate::display::DisplayRecord, f32)>,
+    /// The tiles whose corrections changed (a write, or a lost tile going back to its record)
+    /// since a bump last covered them, while any tile is bumped: a bump they reach no longer
+    /// bounds its tile, and is dropped before anything reads one
+    /// ([`TileStore::drop_uncovered_bumps`]).
+    unbumped: BTreeSet<TileKey>,
     /// The display layer's floor (see [`StoreConfig::floor_top`]): every face's display tiles up
     /// to [`TileStore::floor_top`], as last recorded, kept for the store's life.
     floor: std::collections::BTreeMap<TileKey, crate::display::DisplayRecord>,

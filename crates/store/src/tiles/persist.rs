@@ -158,6 +158,7 @@ impl TileStore {
             display_finest: config.display,
             jobs: std::collections::VecDeque::new(),
             bumped: std::collections::BTreeMap::new(),
+            unbumped: BTreeSet::new(),
             stale: crate::stale::StaleFeed::new(config.stale_cap),
             epoch_writes: BTreeSet::new(),
             epoch_keys: BTreeSet::new(),
