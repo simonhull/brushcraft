@@ -13,8 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{Level, TileKey, Vec3};
 
-use crate::stamp::Stamp;
-
 /// What a slice of a job left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
@@ -85,14 +83,16 @@ pub(crate) struct Upkeep {
 /// A tile reading more finest tiles than the budget holds at once (a whole face's, under a
 /// small budget) is still built, a batch at a time, never waiting for all of them to be
 /// resident together. A tile still cached is read from the cache instead, so only the tiles a
-/// job evaluated are copied. The copies hold as long as no write lands: any write empties them,
-/// since it can change any finest tile they hold.
+/// job evaluated are copied. The copies hold as long as no correction changes: a write, or a
+/// lost tile going back to its record, empties them, since it can change any finest tile they
+/// hold.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct FinestScratch {
     /// The display tile they are for.
     pub(crate) tile: Option<TileKey>,
-    /// The store's latest write when they were copied.
-    as_of: Stamp,
+    /// The store's count of correction changes ([`TileStore::edits`](crate::TileStore::edits))
+    /// when they were copied.
+    as_of: u64,
     /// Finest tiles' positions, by key.
     pub(crate) positions: BTreeMap<TileKey, Vec<Vec3>>,
     /// Finest tiles' unit normals, by key.
@@ -100,9 +100,9 @@ pub(crate) struct FinestScratch {
 }
 
 impl FinestScratch {
-    /// Empties it for display tile `tile` as of the store's latest write `as_of`, unless it
-    /// holds that tile's copies from then already.
-    pub(crate) fn begin(&mut self, tile: TileKey, as_of: Stamp) {
+    /// Empties it for display tile `tile` as of the store's count of correction changes
+    /// `as_of`, unless it holds that tile's copies from then already.
+    pub(crate) fn begin(&mut self, tile: TileKey, as_of: u64) {
         if self.tile != Some(tile) || self.as_of != as_of {
             self.tile = Some(tile);
             self.as_of = as_of;
@@ -206,7 +206,7 @@ mod tests {
         let held = |scratch: &FinestScratch| {
             scratch.positions.contains_key(&finest) && scratch.normals.contains_key(&finest)
         };
-        let (before, after) = (Stamp::ZERO.next(), Stamp::ZERO.next().next());
+        let (before, after) = (1, 2);
         let mut scratch = FinestScratch::default();
         scratch.begin(tile(0), before);
         copy(&mut scratch);

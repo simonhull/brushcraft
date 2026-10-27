@@ -955,3 +955,100 @@ fn a_flush_in_flight_across_a_rebase_is_abandoned() {
         "after",
     );
 }
+
+/// A tile lost to a save between two slices of a display refresh: the refresh copied the lost
+/// edit's evaluation, and must not build from that copy once the tile reads as its record.
+///
+/// The refresh, under the tightest budget, copies each finest tile it evaluates; the save loses
+/// one of them (its working-file record is damaged) and the rebase reverts it, without a write.
+/// The copies after the loss are of the saved state, and the layer the refresh then finishes
+/// is the one the saved state builds.
+#[test]
+fn a_tile_lost_between_refresh_slices_is_not_built_from_its_copy() {
+    use std::time::{Duration, Instant};
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut saved = CorrectionMap::new();
+    let mut project = saved_project(
+        &dir,
+        "p.bcrf",
+        &mesh,
+        &mut saved,
+        &random_edits(&mesh, TOP, 10, 90),
+    );
+    let working = recovery(&dir, "r1.bcrf", &project);
+    let display = tight().with_display(level(TOP));
+    let config = display.with_budget_bytes(display.budget_bytes + display.floor_bytes(&mesh));
+    let mut store = TileStore::open_layered(working, Some(base_of(&project)), config).unwrap();
+    let run_all = |s: &mut TileStore| {
+        while s.has_jobs() {
+            s.run_jobs(Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        }
+    };
+    run_all(&mut store);
+    let lost = tiles(&mesh, TOP, TOP)[9];
+    apply_batches(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &[(lost, vec![(9, 11, Vec3::new(0.02, -0.03, 0.25))])],
+    );
+    store.save().unwrap();
+    // Slices until the refresh has copied the lost tile's evaluation.
+    let mut calls = 0;
+    loop {
+        store
+            .run_jobs(Instant::now() + Duration::from_micros(50))
+            .unwrap();
+        calls += 1;
+        // Copied for a tile one level above the finest, which reads nothing else that the
+        // loss could make it wait for.
+        let copied = store.jobs.front_mut().is_some_and(|job| {
+            let scratch = &job.upkeep().scratch;
+            scratch.positions.contains_key(&lost)
+                && scratch.tile.is_some_and(|t| t.level() == level(TOP - 1))
+        });
+        if copied {
+            break;
+        }
+        assert!(
+            calls < 100_000 && store.has_jobs(),
+            "the refresh copies the tile"
+        );
+    }
+    if store.corrections.find(&lost).is_some() {
+        evict(&mut store, &lost);
+    }
+    damage(&dir.path("r1.bcrf"), store.file.locate(&lost).unwrap());
+    let proof = store.save_into(&mut project).unwrap();
+    assert_eq!(proof.lost().iter().copied().collect::<Vec<_>>(), [lost]);
+    store
+        .rebase(proof, recovery(&dir, "r2.bcrf", &project))
+        .unwrap();
+    // The next slice holds no copy of the lost tile but its current evaluation.
+    store
+        .run_jobs(Instant::now() + Duration::from_micros(50))
+        .unwrap();
+    let copy = store
+        .jobs
+        .front_mut()
+        .and_then(|job| job.upkeep().scratch.positions.get(&lost).cloned());
+    if let Some(copy) = copy {
+        let current = store.evaluate(lost).unwrap().to_vec();
+        assert!(
+            copy == current,
+            "a copy of the saved state, not of the lost edit"
+        );
+    }
+    run_all(&mut store);
+    let built = display_layer(&mut store);
+    let keys: Vec<TileKey> = built.iter().map(|t| *t.key()).collect();
+    for (tile, kept) in built.iter().zip(store.stored_display(&keys).unwrap()) {
+        assert_eq!(
+            kept.as_ref(),
+            Some(tile),
+            "{:?} as the saved state builds it",
+            tile.key()
+        );
+    }
+}

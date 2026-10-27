@@ -299,7 +299,7 @@ impl TileStore {
                 Progress::More
             });
         }
-        upkeep.scratch.begin(key, self.last_write);
+        upkeep.scratch.begin(key, self.edits);
         match self.try_build_display(key, finest, &upkeep.scratch) {
             Ok(Attempt::Built(tile)) => {
                 upkeep.scratch.clear();
