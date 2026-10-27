@@ -8,7 +8,9 @@
 //! 2. **saves** it, and reports how much the project file grew;
 //! 3. runs the `brush` workload's warm stroke with the display layer kept: after each step, the
 //!    refresh it leaves (every display tile the step made unknown) is run to the end, timed, and
-//!    the tiles it built counted.
+//!    the tiles it built counted;
+//! 4. **reopens** the project, alternately with the display layer kept and without, timing each
+//!    open (with it, the open loads the floor), and reports the floor's size.
 //!
 //! The save goes into the project: measure a reflinked copy.
 
@@ -68,6 +70,8 @@ pub(crate) fn run<J: Write, H: Write>(
     let save_time = saving.elapsed();
     let after = std::fs::metadata(&paths.project)?.len();
     let grown = after.saturating_sub(before);
+    // A closed quad mesh has about one vertex a quad (two more for a sphere's).
+    let quads = u64::from(project.store().mesh().face_count()) << (2 * finest.get());
     out.record(
         &Record::new("display", "save")
             .with("file_bytes_before", before)
@@ -75,6 +79,10 @@ pub(crate) fn run<J: Write, H: Write>(
             .with(
                 "growth",
                 to_f64(usize::try_from(grown)?) / to_f64(usize::try_from(before)?),
+            )
+            .with(
+                "growth_bytes_per_vertex",
+                to_f64(usize::try_from(grown)?) / to_f64(usize::try_from(quads)?),
             )
             .with("save_ms", ms(save_time))
             .with("outcome", format!("{outcome:?}")),
@@ -85,7 +93,70 @@ pub(crate) fn run<J: Write, H: Write>(
         100.0 * to_f64(usize::try_from(grown)?) / to_f64(usize::try_from(before)?)
     ))?;
     refresh_stroke(&mut project, &mut index, options, out)?;
+    let refreshed = project
+        .save()
+        .context("saving the refreshed display layer")?;
+    out.say(&format!(
+        "display: the refreshed layer saved: {refreshed:?}"
+    ))?;
     project.close(false).context("closing the project")?;
+    reopen(options, paths, out)
+}
+
+/// How many times each way [`reopen`] opens the project.
+const OPENS: usize = 3;
+
+/// Opens the project [`OPENS`] times with the display layer kept and as many without,
+/// alternately, timing each, and reports the floor the store loaded.
+///
+/// # Errors
+///
+/// If an open or a close fails, or writing the report fails.
+fn reopen<J: Write, H: Write>(
+    options: &Options,
+    paths: &Paths,
+    out: &mut Output<J, H>,
+) -> Result<()> {
+    let mut plain_options = options.clone();
+    plain_options.display = DisplayLayer::Off;
+    let mut display_options = options.clone();
+    display_options.display = DisplayLayer::Kept;
+    let (mut with, mut without) = (Vec::new(), Vec::new());
+    let (mut floor_tiles, mut floor_bytes, mut reserved) = (0, 0, 0);
+    for _ in 0..OPENS {
+        let plain_start = Instant::now();
+        let plain = session::open(&plain_options, paths)?;
+        without.push(plain_start.elapsed());
+        plain.close(false).context("closing the project")?;
+        let kept_start = Instant::now();
+        let mut kept = session::open(&display_options, paths)?;
+        with.push(kept_start.elapsed());
+        (floor_tiles, floor_bytes) = kept.store().floor_size();
+        reserved = session::config(&display_options, paths)
+            .store
+            .floor_bytes(kept.store().mesh());
+        kept.close(false).context("closing the project")?;
+    }
+    let mut record = Record::new("display", "open")
+        .with("floor_tiles", floor_tiles)
+        .with("floor_bytes", floor_bytes)
+        .with("floor_reserved_bytes", reserved);
+    if let Some(spread) = Spread::of(&with) {
+        record = spread.add_to(record, "with_display");
+    }
+    if let Some(spread) = Spread::of(&without) {
+        record = spread.add_to(record, "without_display");
+    }
+    out.record(&record)?;
+    let median = |samples: &[Duration]| Spread::of(samples).map_or(0.0, |s| s.median);
+    out.say(&format!(
+        "display: open {:.0} ms with the display layer, {:.0} ms without (medians of {OPENS}); \
+         the floor holds {floor_tiles} tiles, {:.1} MB of encodings ({:.1} MB reserved)",
+        median(&with),
+        median(&without),
+        to_f64(floor_bytes) / 1e6,
+        to_f64(reserved) / 1e6
+    ))?;
     Ok(())
 }
 
@@ -127,6 +198,7 @@ fn rebuild<J: Write, H: Write>(
         &Record::new("display", "rebuild")
             .with("tiles", tiles)
             .with("total_s", total.as_secs_f64())
+            .with("total_ms", ms(total))
             .with("floor_s", floor.as_secs_f64()),
     )?;
     out.say(&format!(

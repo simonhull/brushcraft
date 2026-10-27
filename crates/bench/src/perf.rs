@@ -11,6 +11,8 @@
 //!   open, page-in of a footprint and a region with a cold and a warm pool, the save cost model's
 //!   fixed and per-vertex parts, and peak RSS under a 1 GiB budget, each from five runs
 //!   ([`suite`]);
+//! - **the display layer** on each project: its rebuild, file growth, refresh per brush step, floor
+//!   size and open time, each run in a fresh copy;
 //! - with `--full`, **the full project** (the benchmark sphere, measured through a reflinked copy):
 //!   the same set, for milestones.
 //!
@@ -314,7 +316,8 @@ fn medium<J: Write, H: Write>(
 
 /// Measures every part of `scale` on the project at `file` (named `project` in the records).
 ///
-/// The save part goes last: it adds save points to the project.
+/// The save part goes after those that read the project as it is: it adds save points. The
+/// display part goes last, each run in a copy made in `work`.
 ///
 /// # Errors
 ///
@@ -322,6 +325,7 @@ fn medium<J: Write, H: Write>(
 fn measure_project<J: Write, H: Write>(
     session: &mut Session,
     scale: Scale,
+    work: &WorkDir,
     file: &Path,
     project: &str,
     out: &mut Output<J, H>,
@@ -338,6 +342,9 @@ fn measure_project<J: Write, H: Write>(
     })?;
     session.part(&format!("{s} save"), project, out, |r| {
         suite::save_part(r, file, scale)
+    })?;
+    session.part(&format!("{s} display"), project, out, |r| {
+        suite::display_part(r, work, file, scale)
     })
 }
 
@@ -618,7 +625,7 @@ fn measure_all<J: Write, H: Write>(
                 let work = work_dir(&std::env::temp_dir(), out)?;
                 let file = work.project("tiny")?;
                 suite::generate(&session.runner, &file, scale)?;
-                measure_project(session, scale, &file, "tiny", out)?;
+                measure_project(session, scale, &work, &file, "tiny", out)?;
             }
             Scale::Medium => {
                 let cache = cache_root()?.join("perf");
@@ -629,7 +636,7 @@ fn measure_all<J: Write, H: Write>(
                 let file = copy(&work, &cached, "medium", out)?;
                 // The run measures its own copy: other runs may tidy the cache from here on.
                 drop(cached);
-                measure_project(session, scale, &file, &key, out)?;
+                measure_project(session, scale, &work, &file, &key, out)?;
             }
             Scale::Full => {
                 let source = plan
@@ -651,7 +658,7 @@ fn measure_all<J: Write, H: Write>(
                 let dir = source.parent().context("the full project's directory")?;
                 let work = work_dir(dir, out)?;
                 let file = copy(&work, &Source::open(source)?, "full", out)?;
-                measure_project(session, scale, &file, &name, out)?;
+                measure_project(session, scale, &work, &file, &name, out)?;
             }
         }
     }

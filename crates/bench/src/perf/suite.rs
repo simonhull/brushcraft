@@ -14,7 +14,7 @@ use store::Workers;
 
 use crate::perf::json::{Json, Object};
 use crate::perf::metric::{Measured, Metric, MetricName, Unit};
-use crate::perf::project::Scale;
+use crate::perf::project::{Scale, Source, WorkDir};
 use crate::perf::stages;
 
 /// Runs the suite's child processes. The quiet guard leaves them out of the other processes'
@@ -319,6 +319,43 @@ const BUDGET: [Taken; 1] = [(
     Unit::Mib,
 )];
 
+/// What the suite takes from `display`: the layer's rebuild, the file's growth per vertex, the
+/// refresh after each brush step, and the floor and open time on reopening.
+const DISPLAY: [Taken; 7] = [
+    ("rebuild", "total_ms", "display.rebuild_ms", Unit::Ms),
+    (
+        "save",
+        "growth_bytes_per_vertex",
+        "display.growth_bytes_per_vertex",
+        Unit::Bytes,
+    ),
+    (
+        "refresh",
+        "refresh_median_ms",
+        "display.refresh_step_ms",
+        Unit::Ms,
+    ),
+    (
+        "refresh",
+        "us_per_tile",
+        "display.refresh_us_per_tile",
+        Unit::Us,
+    ),
+    ("open", "floor_bytes", "display.floor_bytes", Unit::Bytes),
+    (
+        "open",
+        "with_display_median_ms",
+        "display.open_ms",
+        Unit::Ms,
+    ),
+    (
+        "open",
+        "without_display_median_ms",
+        "display.open_plain_ms",
+        Unit::Ms,
+    ),
+];
+
 /// Adds what `taken` names from one run's `lines` of subcommand `bench` to `samples`, under
 /// `scale`'s names.
 ///
@@ -490,6 +527,41 @@ pub(crate) fn budget_part(runner: &Runner, project: &Path, scale: Scale) -> Resu
             ..metric
         })
         .collect())
+}
+
+/// `display` on copies of `project` made in `work`,
+/// [`Workload::display_runs`](crate::perf::project::Workload::display_runs) times: each run
+/// rebuilds the layer in a copy of its own (a project that keeps one has nothing to rebuild),
+/// removed after it.
+///
+/// # Errors
+///
+/// If a copy or a run fails, or a run misses a result.
+pub(crate) fn display_part(
+    runner: &Runner,
+    work: &WorkDir,
+    project: &Path,
+    scale: Scale,
+) -> Result<Vec<Metric>> {
+    let w = scale.workload();
+    let mut samples = Samples::default();
+    for run in 0..w.display_runs {
+        let name = format!("display-{run}");
+        let (copy, _) = work.copy(&Source::open(project)?, &name)?;
+        let mut args = words(&[
+            "display",
+            "--steps",
+            &w.brush_steps.to_string(),
+            "--footprint",
+            &w.footprint.to_string(),
+        ]);
+        args.extend(common(&copy, scale));
+        let lines = runner.bench(&args);
+        let dir = copy.parent().unwrap_or(&copy);
+        std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
+        take(&mut samples, scale, "display", &DISPLAY, &lines?)?;
+    }
+    samples.measure()
 }
 
 /// The least-squares line `y = a + b x` through `points`: `(a, b)`; `None` for fewer than two

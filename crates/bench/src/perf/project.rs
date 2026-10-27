@@ -97,6 +97,9 @@ pub(crate) struct Workload {
     pub(crate) steps_per_move: usize,
     /// `budget`: tiles pinned at each place.
     pub(crate) view_tiles: usize,
+    /// `display`: runs, each rebuilding the whole layer in a fresh copy (minutes on the full
+    /// project), so fewer there.
+    pub(crate) display_runs: usize,
 }
 
 /// The stroke lengths the save cost model fits over, as in the benchmark's "Save cost model".
@@ -147,6 +150,7 @@ impl Scale {
                 moves: 3,
                 steps_per_move: 2,
                 view_tiles: 6,
+                display_runs: 1,
             },
             Self::Medium => Workload {
                 runs: 5,
@@ -158,6 +162,7 @@ impl Scale {
                 moves: 10,
                 steps_per_move: 10,
                 view_tiles: 2000,
+                display_runs: 5,
             },
             Self::Full => Workload {
                 runs: 5,
@@ -169,6 +174,7 @@ impl Scale {
                 moves: 20,
                 steps_per_move: 10,
                 view_tiles: 2000,
+                display_runs: 3,
             },
         }
     }
