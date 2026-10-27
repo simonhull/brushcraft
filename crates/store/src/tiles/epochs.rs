@@ -53,21 +53,24 @@ impl TileStore {
             self.epoch_keys.clear();
             return Ok(());
         }
-        let mut keys = std::mem::take(&mut self.epoch_keys);
-        if !self.epoch_writes.is_empty() {
+        // The fallible part first: on an error, the epoch's keys and writes stay noted.
+        let moved = if self.epoch_writes.is_empty() {
+            BTreeSet::new()
+        } else {
             let finest = self
                 .display_finest
                 .or_else(|| self.epoch_writes.iter().map(TileKey::level).max())
                 .unwrap_or(Level::ZERO);
-            let moved = crate::bounds::readers(
+            crate::bounds::readers(
                 &self.mesh,
                 &self.deps,
                 &self.epoch_writes,
                 &BTreeSet::from([finest]),
-            )?;
-            keys.extend(moved);
-            self.epoch_writes.clear();
-        }
+            )?
+        };
+        self.epoch_writes.clear();
+        let mut keys = std::mem::take(&mut self.epoch_keys);
+        keys.extend(moved);
         self.stale.close(keys);
         Ok(())
     }

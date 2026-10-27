@@ -120,3 +120,30 @@ fn epochs_name_every_changed_tile_and_a_stalled_consumer_resyncs() {
         Drained::Resync => panic!("one resync"),
     }
 }
+
+/// An epoch whose close fails (listing its writes' readers fails, here for a write of a face the
+/// mesh doesn't have) stays open whole: the next close hands out every key it noted.
+#[test]
+fn a_failed_close_keeps_the_epoch_open() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy().with_display(level(TOP)));
+    let cursor = store.subscribe_stale();
+    let shown = TileKey::display(FaceId::new(0), level(2), 0, 0).unwrap();
+    store.note_epoch_keys([shown]);
+    let foreign = TileKey::displacement(FaceId::new(999), level(TOP), 0, 0).unwrap();
+    store.epoch_writes.insert(foreign);
+    assert!(
+        store.close_epoch().is_err(),
+        "the readers of a foreign write fail"
+    );
+    store.epoch_writes.remove(&foreign);
+    store.close_epoch().unwrap();
+    match store.drain_stale(&cursor) {
+        Drained::Epochs(epochs) => assert!(
+            epochs.iter().any(|e| e.keys.contains(&shown)),
+            "the key noted before the failed close: {epochs:?}"
+        ),
+        Drained::Resync => panic!("no resync expected"),
+    }
+}
