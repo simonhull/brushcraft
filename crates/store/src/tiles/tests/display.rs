@@ -313,3 +313,52 @@ fn a_save_without_a_display_layer_names_no_display_tile() {
         );
     }
 }
+
+/// [`readers`] against the display tiles a write really changes, found by building the whole
+/// layer before and after random edits at every level, across faces.
+///
+/// Every changed tile must be among the readers (soundness, asserted). How many readers didn't
+/// change is the listing's slack (its precision, printed): tiles made unknown and rebuilt to the
+/// same bits.
+#[test]
+fn readers_hold_every_display_tile_a_write_changes() {
+    let mesh = mesh();
+    let levels: BTreeSet<Level> = (0..TOP).map(level).collect();
+    let (mut listed, mut changed_total) = (0_usize, 0_usize);
+    for seed in 0..10_u64 {
+        let dir = TestDir::new();
+        let mut store = new_store(&dir, "work.bcp", &mesh, roomy().with_display(level(TOP)));
+        let before: BTreeMap<TileKey, DisplayTile> = display_layer(&mut store)
+            .into_iter()
+            .map(|t| (*t.key(), t))
+            .collect();
+        let edits = random_edits(&mesh, TOP, 1 + u32::try_from(seed % 3).unwrap(), 900 + seed);
+        apply(&mut store, &mut CorrectionMap::new(), &edits);
+        let edited: BTreeSet<TileKey> = edits.iter().flat_map(|e| e.keys(&mesh)).collect();
+        let reached = readers(&mesh, &store.deps, &edited, &levels).unwrap();
+        let after = display_layer(&mut store);
+        let changed: Vec<TileKey> = after
+            .iter()
+            .filter(|t| !same(&before[t.key()], t))
+            .map(|t| *t.key())
+            .collect();
+        assert!(
+            !changed.is_empty(),
+            "seed {seed}: the edits change the layer"
+        );
+        for key in &changed {
+            assert!(
+                reached.contains(key),
+                "seed {seed}: {key:?} changed, not listed"
+            );
+        }
+        listed += reached.len();
+        changed_total += changed.len();
+    }
+    let precision = f64::from(u32::try_from(changed_total).unwrap())
+        / f64::from(u32::try_from(listed).unwrap());
+    eprintln!(
+        "readers: {listed} listed, {changed_total} changed, precision {:.1} %",
+        100.0 * precision
+    );
+}
