@@ -18,6 +18,10 @@ use crate::stale::{Drained, StaleCursor};
 impl TileStore {
     /// A new consumer of the stale-tile feed: its first drain gives the epochs closed after now
     /// (what it shows already, it asks for itself).
+    ///
+    /// The cursor is this store's: a renderer subscribes again whenever the store it shows is
+    /// replaced (a restore opens a new store, as does opening another project), since every
+    /// drain of another store with it is [`Drained::Resync`].
     pub fn subscribe_stale(&mut self) -> StaleCursor {
         self.stale.subscribe()
     }

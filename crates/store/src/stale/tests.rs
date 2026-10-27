@@ -83,9 +83,32 @@ fn an_unsubscribed_cursor_is_told_to_resync() {
     let mut feed = StaleFeed::new(10);
     let cursor = feed.subscribe();
     assert!(feed.is_listened(), "listened to");
-    let kept = StaleCursor(cursor.0);
+    let kept = cursor.clone();
     feed.unsubscribe(cursor);
     assert!(!feed.is_listened(), "no one listens");
     feed.close(keys(0, 3));
     assert_eq!(feed.drain(&kept), Drained::Resync, "gone");
+}
+
+/// A cursor from one feed is never taken for another feed's.
+///
+/// Even where both handed out the same consumer number: draining another feed with it resyncs,
+/// and unsubscribing with it leaves that feed's consumers alone.
+#[test]
+fn a_cursor_of_another_feed_is_told_to_resync() {
+    let (mut a, mut b) = (StaleFeed::new(10), StaleFeed::new(10));
+    let from_a = a.subscribe();
+    let from_b = b.subscribe();
+    b.close(keys(0, 2));
+    assert_eq!(b.drain(&from_a), Drained::Resync, "not b's");
+    b.unsubscribe(from_a);
+    assert!(b.is_listened(), "b's consumer stays");
+    assert_eq!(
+        b.drain(&from_b),
+        Drained::Epochs(vec![Epoch {
+            seq: 0,
+            keys: keys(0, 2),
+        }]),
+        "b's own cursor"
+    );
 }

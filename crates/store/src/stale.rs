@@ -13,6 +13,10 @@
 //! drain. A consumer that falls more than a cap of pending keys behind loses them: its next
 //! drain is [`Drained::Resync`], and it asks for everything it shows again. So the feed's memory
 //! stays bounded however long a consumer stalls.
+//!
+//! A cursor belongs to one store's feed: given to another store (after a restore, which opens a
+//! new store, or a project swapped), every drain is [`Drained::Resync`]. A renderer subscribes
+//! again to each store it shows.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -22,10 +26,19 @@ use geom::TileKey;
 pub const DEFAULT_STALE_CAP: usize = 65_536;
 
 /// A consumer's place in the stale-tile feed, from
-/// [`TileStore::subscribe_stale`](crate::TileStore::subscribe_stale): held by the one consumer
-/// it was made for, and given back to unsubscribe.
+/// [`TileStore::subscribe_stale`](crate::TileStore::subscribe_stale).
+///
+/// Held by the one consumer it was made for, and given back to unsubscribe. It names the feed it
+/// came from, so another store's feed never mistakes it for one of its own.
 #[derive(Debug, PartialEq, Eq)]
-pub struct StaleCursor(u64);
+// Cloned only by the tests, to use a cursor after giving it back.
+#[cfg_attr(test, derive(Clone))]
+pub struct StaleCursor {
+    /// The feed it came from.
+    feed: u64,
+    /// The consumer, among that feed's.
+    consumer: u64,
+}
 
 /// The evaluated tiles one store operation changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +74,8 @@ struct Consumer {
 /// The feed: the epoch being built and every consumer's pending epochs.
 #[derive(Debug)]
 pub(crate) struct StaleFeed {
+    /// This feed's identity among every feed of the process: its cursors carry it.
+    id: u64,
     /// The most keys a consumer may have pending.
     cap: usize,
     /// The next epoch's number.
@@ -73,8 +88,13 @@ pub(crate) struct StaleFeed {
 
 impl StaleFeed {
     /// An empty feed whose consumers may each have `cap` keys pending.
-    pub(crate) const fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// The next feed's identity.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
             cap,
             next_seq: 0,
             next_cursor: 0,
@@ -92,16 +112,21 @@ impl StaleFeed {
         let cursor = self.next_cursor;
         self.next_cursor += 1;
         self.consumers.insert(cursor, Consumer::default());
-        StaleCursor(cursor)
+        StaleCursor {
+            feed: self.id,
+            consumer: cursor,
+        }
     }
 
-    /// Removes a consumer and its pending epochs.
+    /// Removes a consumer and its pending epochs; a cursor of another feed changes nothing.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "taking the cursor ends the subscription: nothing can drain with it again"
     )]
     pub(crate) fn unsubscribe(&mut self, cursor: StaleCursor) {
-        self.consumers.remove(&cursor.0);
+        if cursor.feed == self.id {
+            self.consumers.remove(&cursor.consumer);
+        }
     }
 
     /// Closes an epoch of `keys`, handing it to every consumer; a consumer it would take past
@@ -132,9 +157,12 @@ impl StaleFeed {
     }
 
     /// The epochs closed for `cursor` since its last drain, or [`Drained::Resync`] if it fell
-    /// past the cap; an unknown cursor (unsubscribed) is told to resync.
+    /// past the cap; an unknown cursor (unsubscribed, or another feed's) is told to resync.
     pub(crate) fn drain(&mut self, cursor: &StaleCursor) -> Drained {
-        let Some(consumer) = self.consumers.get_mut(&cursor.0) else {
+        if cursor.feed != self.id {
+            return Drained::Resync;
+        }
+        let Some(consumer) = self.consumers.get_mut(&cursor.consumer) else {
             return Drained::Resync;
         };
         if std::mem::take(&mut consumer.lost) {
