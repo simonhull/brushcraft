@@ -32,19 +32,40 @@ use crate::session;
 /// The highest level of the floor (see the M1 spec's "Residency"), reported apart.
 const FLOOR_TOP: u8 = 5;
 
-/// Runs the store's jobs to the end in slices of `slice` (at least once: the first call queues
-/// the refresh writes left); returns the tiles built and the time.
+/// What running the store's jobs to the end took.
+#[derive(Debug, Clone, Copy)]
+struct Ran {
+    /// The display tiles built.
+    built: usize,
+    /// The wall time.
+    time: Duration,
+    /// The longest slice of any call: how far past a deadline a call can run.
+    longest_slice: Duration,
+}
+
+/// Runs the store's jobs to the end in calls of `budget` each (at least one: the first call
+/// queues the refresh writes left).
 ///
 /// # Errors
 ///
 /// If a job fails.
-fn run_to_end(store: &mut TileStore, slice: Duration) -> Result<(usize, Duration)> {
+fn run_to_end(store: &mut TileStore, budget: Duration) -> Result<Ran> {
     let start = Instant::now();
-    let mut built = store.run_jobs(Instant::now() + slice)?.built;
-    while store.has_jobs() {
-        built += store.run_jobs(Instant::now() + slice)?.built;
+    let mut ran = Ran {
+        built: 0,
+        time: Duration::ZERO,
+        longest_slice: Duration::ZERO,
+    };
+    loop {
+        let report = store.run_jobs(Instant::now() + budget)?;
+        ran.built += report.built;
+        ran.longest_slice = ran.longest_slice.max(report.longest_slice);
+        if !store.has_jobs() {
+            break;
+        }
     }
-    Ok((built, start.elapsed()))
+    ran.time = start.elapsed();
+    Ok(ran)
 }
 
 /// Runs `display` (see the module notes).
@@ -172,10 +193,16 @@ fn rebuild<J: Write, H: Write>(
 ) -> Result<()> {
     store.clear_jobs();
     let (mut total, mut floor, mut tiles) = (Duration::ZERO, Duration::ZERO, 0);
+    let mut longest = Duration::ZERO;
     for l in (0..finest.get()).rev() {
         let level = Level::new(l)?;
         store.queue_display_level(finest, level);
-        let (built, time) = run_to_end(store, Duration::from_millis(50))?;
+        let Ran {
+            built,
+            time,
+            longest_slice,
+        } = run_to_end(store, Duration::from_millis(50))?;
+        longest = longest.max(longest_slice);
         total += time;
         tiles += built;
         if l <= FLOOR_TOP {
@@ -186,12 +213,14 @@ fn rebuild<J: Write, H: Write>(
                 .with("level", u64::from(l))
                 .with("tiles", built)
                 .with("ms", ms(time))
-                .with("us_per_tile", ms(time) * 1000.0 / to_f64(built.max(1))),
+                .with("us_per_tile", ms(time) * 1000.0 / to_f64(built.max(1)))
+                .with("longest_slice_ms", ms(longest_slice)),
         )?;
         out.say(&format!(
-            "display: level {l}: {built} tiles in {:.1} s ({:.0} µs a tile)",
+            "display: level {l}: {built} tiles in {:.1} s ({:.0} µs a tile, longest slice {:.2} ms)",
             time.as_secs_f64(),
-            ms(time) * 1000.0 / to_f64(built.max(1))
+            ms(time) * 1000.0 / to_f64(built.max(1)),
+            ms(longest_slice)
         ))?;
     }
     out.record(
@@ -199,7 +228,8 @@ fn rebuild<J: Write, H: Write>(
             .with("tiles", tiles)
             .with("total_s", total.as_secs_f64())
             .with("total_ms", ms(total))
-            .with("floor_s", floor.as_secs_f64()),
+            .with("floor_s", floor.as_secs_f64())
+            .with("longest_slice_ms", ms(longest)),
     )?;
     out.say(&format!(
         "display: rebuilt {tiles} tiles in {:.1} s (floor, levels ≤ {FLOOR_TOP}: {:.1} s)",
@@ -232,14 +262,16 @@ fn refresh_stroke<J: Write, H: Write>(
     let mut state = Stroke::new(project.store());
     project.begin_stroke()?;
     let (mut steps, mut refreshes, mut built) = (Vec::new(), Vec::new(), Vec::new());
+    let mut longest = Duration::ZERO;
     for &centre in &plan.centres {
         let params = DrawParams::new(centre, plan.radius, options.strength)?;
         let start = Instant::now();
         draw_step(project.store(), index, &mut state, params)?;
         steps.push(start.elapsed());
-        let (tiles, time) = run_to_end(project.store(), Duration::from_millis(50))?;
-        refreshes.push(time);
-        built.push(tiles);
+        let ran = run_to_end(project.store(), Duration::from_millis(50))?;
+        refreshes.push(ran.time);
+        built.push(ran.built);
+        longest = longest.max(ran.longest_slice);
     }
     project.end_stroke()?;
     let tiles: usize = built.iter().sum();
@@ -247,7 +279,8 @@ fn refresh_stroke<J: Write, H: Write>(
     let mut record = Record::new("display", "refresh")
         .with("steps", steps.len())
         .with("tiles_per_step", to_f64(tiles) / to_f64(steps.len().max(1)))
-        .with("us_per_tile", ms(total) * 1000.0 / to_f64(tiles.max(1)));
+        .with("us_per_tile", ms(total) * 1000.0 / to_f64(tiles.max(1)))
+        .with("longest_slice_ms", ms(longest));
     if let Some(spread) = Spread::of(&refreshes) {
         record = spread.add_to(record, "refresh");
     }
@@ -256,11 +289,13 @@ fn refresh_stroke<J: Write, H: Write>(
     }
     out.record(&record)?;
     out.say(&format!(
-        "display: refresh after each of {} steps: {:.1} tiles a step, {:.0} µs a tile, {:.2} ms a step",
+        "display: refresh after each of {} steps: {:.1} tiles a step, {:.0} µs a tile, {:.2} ms a step, \
+         longest slice {:.2} ms",
         steps.len(),
         to_f64(tiles) / to_f64(steps.len().max(1)),
         ms(total) * 1000.0 / to_f64(tiles.max(1)),
-        ms(total) / to_f64(steps.len().max(1))
+        ms(total) / to_f64(steps.len().max(1)),
+        ms(longest)
     ))?;
     // The same stroke again, its refresh run once at its end: what a refresh after the stroke
     // costs, the tiles the steps share built once.
@@ -270,7 +305,9 @@ fn refresh_stroke<J: Write, H: Write>(
         draw_step(project.store(), index, &mut state, params)?;
     }
     project.end_stroke()?;
-    let (once, time) = run_to_end(project.store(), Duration::from_millis(50))?;
+    let Ran {
+        built: once, time, ..
+    } = run_to_end(project.store(), Duration::from_millis(50))?;
     out.record(
         &Record::new("display", "refresh_after_stroke")
             .with("steps", plan.centres.len())
