@@ -347,3 +347,30 @@ fn an_error_another_thread_raises_during_scoped_work_is_that_calls() {
         gpu.check().expect("nothing left over");
     });
 }
+
+#[test]
+fn an_unscoped_error_names_the_thread_that_raised_it() {
+    GpuTest::run(|gpu| {
+        let invalid = || {
+            drop(gpu.device().create_buffer(&BufferDescriptor {
+                label: Some("invalid"),
+                size: 16,
+                usage: BufferUsages::MAP_READ | BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+        };
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .name("uploads".into())
+                .spawn_scoped(s, invalid)
+                .expect("a thread");
+        });
+        // Reported by a call on this thread, but raised on that one: the message says which.
+        let error = gpu.check().expect_err("the other thread's error");
+        let named = matches!(
+            &error,
+            GpuError::Uncaptured { message } if message.starts_with("on the \"uploads\" thread: ")
+        );
+        assert!(named, "{error}");
+    });
+}

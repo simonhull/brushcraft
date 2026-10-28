@@ -108,7 +108,7 @@ pub enum GpuError {
     },
     /// Work done directly on [`Gpu::device`], outside this module's error scopes (on any
     /// thread: `wgpu`'s scopes are thread-local), raised an error since the last call. Reported
-    /// once, the message counting any more.
+    /// once, the message naming the thread that raised it and counting any more.
     #[error("an earlier GPU call failed: {message}")]
     Uncaptured {
         /// `wgpu`'s description of the failure, with its sources.
@@ -232,12 +232,15 @@ impl Gpu {
             record(&on_lost).lost = Some(format!("{reason:?}: {message}"));
         });
         let on_error = Arc::clone(&health);
+        // `wgpu` raises an unscoped error on the thread whose call caused it, so the thread is
+        // named with it: the owner thread's uploads and the render thread's passes share this
+        // device, and the call that reports an error may be on the other thread.
         device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
             let mut state = record(&on_error);
             if state.uncaptured.is_some() {
                 state.more_uncaptured += 1;
             } else {
-                state.uncaptured = Some(describe(&error));
+                state.uncaptured = Some(on_this_thread(&describe(&error)));
             }
         }));
         Ok(Self {
@@ -632,6 +635,16 @@ fn describe(error: &wgpu::Error) -> String {
         source = cause.source();
     }
     message
+}
+
+/// `message`, saying which thread it was raised on: the current thread's name, or its id if it
+/// has none.
+fn on_this_thread(message: &str) -> String {
+    let thread = std::thread::current();
+    match thread.name() {
+        Some(name) => format!("on the {name:?} thread: {message}"),
+        None => format!("on thread {:?}: {message}", thread.id()),
+    }
 }
 
 /// Runs a closure against a GPU opened on the software adapter: the harness every GPU test
