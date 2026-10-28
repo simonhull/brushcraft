@@ -14,8 +14,11 @@
 //! With the `spike` feature, the `spike` module holds M1a's GPU experiments, built and tested by
 //! the gate but not part of the renderer.
 
+pub mod camera;
+pub mod cull;
 mod draw;
 pub mod gpu;
+pub mod lod;
 pub mod overlay;
 pub mod residency;
 #[cfg(feature = "spike")]

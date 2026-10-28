@@ -209,5 +209,44 @@ fn check_links(tree: &TileTree, resident: &[Place]) {
             place.neighbours(&tree.topology).map(link),
             "neighbours of {place:?}"
         );
+        // A base mesh is closed: every edge has a neighbour, resident or not.
+        assert_eq!(node.edges, 0b1111, "edges of {place:?}");
     }
+}
+
+#[test]
+fn arrivals_and_moves_to_new_data_are_stamped_and_departures_forgotten() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut tree = TileTree::new(gpu, &mesh, 8).expect("a tree");
+        let slot = |place: Place| Slot::for_tests(SizeClass::of(place.level), 0);
+        let [a, b, c] = [0, 1, 2].map(|face| Place {
+            face: FaceId::new(face),
+            level: level(7),
+            tx: 1,
+            ty: 0,
+        });
+        let start = tree.generation();
+        let first = tree.insert(a, slot(a), 1.0, 0).expect("inserted");
+        let second = tree.insert(b, slot(b), 1.0, 0).expect("inserted");
+        let all: Vec<u32> = tree.changed_since(start).collect();
+        assert_eq!(all, vec![first, second], "both arrivals, in node order");
+        let after = tree.generation();
+        assert_eq!(tree.changed_since(after).count(), 0, "nothing since");
+        tree.move_to(a, slot(a), 0.5);
+        let moved: Vec<u32> = tree.changed_since(after).collect();
+        assert_eq!(moved, vec![first], "the move to new data");
+        assert!(tree.remove(b).is_some(), "resident");
+        let third = tree.insert(c, slot(c), 1.0, 0).expect("inserted");
+        assert_eq!(third, second, "the node is reused");
+        let since: Vec<u32> = tree.changed_since(after).collect();
+        assert_eq!(
+            since,
+            vec![first, third],
+            "the reused node is stamped afresh"
+        );
+        assert!(tree.remove(c).is_some(), "resident");
+        let left: Vec<u32> = tree.changed_since(0).collect();
+        assert_eq!(left, vec![first], "a node that left isn't listed");
+    });
 }

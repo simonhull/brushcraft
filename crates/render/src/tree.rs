@@ -59,10 +59,11 @@ struct TileNode {
     // e: a bound, in world units, on the distance from what the tile draws to the finest
     // surface under it (0 for a finest tile).
     error: f32,
+    // Bit k set: the tile has a neighbour across edge k (resident or not); clear across an
+    // open border of the mesh. Edges in the order of neighbours.
+    edges: u32,
     // Zero.
-    reserved0: u32,
-    // Zero.
-    reserved1: u32,
+    reserved: u32,
     // The children's node indices, NONE where not resident: (2tx, 2ty), (2tx + 1, 2ty),
     // (2tx, 2ty + 1), (2tx + 1, 2ty + 1); a whole-face tile's one child first, the rest NONE.
     children: array<u32, 4>,
@@ -253,8 +254,12 @@ pub struct GpuNode {
     /// `e`: a bound, in world units, on the distance from what the tile draws to the finest
     /// surface under it; 0 for a finest tile.
     pub error: f32,
+    /// Bit `k` set: the tile has a neighbour across edge `k` ([`Place::neighbours`]'s order),
+    /// resident or not; clear across an open border of the mesh. A pass tells "the neighbour
+    /// isn't resident" from "there is none" by it.
+    pub edges: u32,
     /// Zero.
-    pub reserved: [u32; 2],
+    pub reserved: u32,
     /// The children's node indices in [`Place::children`]'s order, [`NONE`] where not resident.
     pub children: [u32; 4],
     /// The edge neighbours' node indices in [`Place::neighbours`]'s order, [`NONE`] where not
@@ -312,6 +317,11 @@ pub struct TileTree {
     by_place: BTreeMap<Place, u32>,
     /// Node indices whose GPU copy is out of date.
     dirty: BTreeSet<u32>,
+    /// Per node index, the [`TileTree::generation`] its tile's data last changed in: when it
+    /// arrived or moved to new data ([`TileTree::changed_since`]).
+    stamps: Vec<u64>,
+    /// Counts data changes: one more for every arrival and every move to new data.
+    generation: u64,
     /// The most nodes the tree holds: the GPU buffer's length.
     capacity: u32,
     /// The GPU buffer, `capacity` [`GpuNode`]s.
@@ -341,6 +351,8 @@ impl TileTree {
             free: Vec::new(),
             by_place: BTreeMap::new(),
             dirty: BTreeSet::new(),
+            stamps: Vec::new(),
+            generation: 0,
             capacity,
             buffer,
         })
@@ -404,6 +416,7 @@ impl TileTree {
                     capacity: self.capacity,
                 })?;
             self.nodes.push(None);
+            self.stamps.push(0);
             index
         };
         let node = Node {
@@ -421,6 +434,7 @@ impl TileTree {
         }
         self.by_place.insert(place, index);
         self.mark_around(&node, index);
+        self.stamp(index);
         Ok(index)
     }
 
@@ -452,7 +466,36 @@ impl TileTree {
         let old = std::mem::replace(&mut node.slot, slot);
         node.error = error;
         self.dirty.insert(index);
+        self.stamp(index);
         Some(old)
+    }
+
+    /// Records that node `index`'s tile data changed, in a new generation.
+    fn stamp(&mut self, index: u32) {
+        self.generation += 1;
+        let generation = self.generation;
+        if let Some(stamp) = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.stamps.get_mut(i))
+        {
+            *stamp = generation;
+        }
+    }
+
+    /// The generation the tree's data is at: it grows by one each time a tile arrives or moves
+    /// to new data (an epoch switching it, in place or to a shadow slot).
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The resident nodes whose tile data changed after `generation` (an earlier
+    /// [`TileTree::generation`]), in node order: what the bounds pass recomputes
+    /// ([`crate::cull::BoundsUpdate`]). A node that arrived and left since isn't listed.
+    pub fn changed_since(&self, generation: u64) -> impl Iterator<Item = u32> + '_ {
+        let live = self.stamps.iter().zip(&self.nodes).enumerate();
+        live.filter(move |(_, (stamp, node))| **stamp > generation && node.is_some())
+            .filter_map(|(index, _)| u32::try_from(index).ok())
     }
 
     /// Marks `node` (at `index`) and every node that links to it as out of date on the GPU.
@@ -495,7 +538,13 @@ impl TileTree {
             flags: NODE_LIVE | node.flags,
             parent: self.link(node.place.parent()),
             error: node.error,
-            reserved: [0; 2],
+            edges: node
+                .neighbours
+                .iter()
+                .enumerate()
+                .filter(|(_, neighbour)| neighbour.is_some())
+                .fold(0, |mask, (edge, _)| mask | (1 << edge)),
+            reserved: 0,
             children: node.place.children().map(|child| self.link(child)),
             neighbours: node.neighbours.map(|neighbour| self.link(neighbour)),
         }
