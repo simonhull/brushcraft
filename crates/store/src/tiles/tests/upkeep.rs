@@ -431,3 +431,22 @@ fn display_layer_keys(mesh: &BaseMesh) -> Vec<TileKey> {
         .map(|k| TileKey::display(k.face(), k.level(), k.tx(), k.ty()).unwrap())
         .collect()
 }
+
+/// A refresh dropped by `clear_jobs` is queued again by the next `run_jobs`, with no write in
+/// between: the unknown tiles it left are still to build.
+#[test]
+fn a_refresh_cleared_is_queued_again() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 3, 71));
+    // One short call queues the refresh and starts it; then it is dropped.
+    store.run_jobs(Instant::now()).unwrap();
+    assert!(store.has_jobs(), "the refresh is queued");
+    store.clear_jobs();
+    assert!(!store.has_jobs(), "cleared");
+    run_all(&mut store);
+    assert_layer_current(&mut store, "refreshed after a clear");
+}

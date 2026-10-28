@@ -590,9 +590,11 @@ impl TileStore {
     }
 
     /// Drops every queued job, where it is: what they had built stays. Tiles the workers are
-    /// building are dropped when they finish.
+    /// building are dropped when they finish. The next [`TileStore::run_jobs`] looks for the
+    /// display tiles writes left unknown again, so a refresh dropped here is queued anew.
     pub fn clear_jobs(&mut self) {
         self.jobs.clear();
+        self.refresh_seen = u64::MAX;
     }
 
     /// Whether any job is queued (tiles still to build, or being built).
