@@ -67,7 +67,61 @@ pub(crate) fn quad_triangles(
     [[p00, p10, p11], [p00, p11, p01]]
 }
 
+/// A grid vertex, `(column, row)`.
+type Grid = (i32, i32);
+
+/// The tile's extra triangles on a `side`-vertex grid.
+///
+/// As grid vertices counter-clockwise in the grid: the parent triangulation, then each edge
+/// variant's fans (`bounds.wgsl`'s `extra_normal`, in the same order).
+///
+/// # Panics
+///
+/// If `side` is 0 or past `i32`.
+pub(crate) fn extra_triangles(side: usize) -> Vec<[Grid; 3]> {
+    let quads = i32::try_from(side - 1).expect("small");
+    let half = quads / 2;
+    let ccw = |[g0, g1, g2]: [Grid; 3]| {
+        let cross = (g1.0 - g0.0) * (g2.1 - g0.1) - (g1.1 - g0.1) * (g2.0 - g0.0);
+        if cross < 0 {
+            [g0, g2, g1]
+        } else {
+            [g0, g1, g2]
+        }
+    };
+    let mut out = Vec::new();
+    for by in 0..half {
+        for bx in 0..half {
+            let p00 = (2 * bx, 2 * by);
+            let p22 = (p00.0 + 2, p00.1 + 2);
+            out.push(ccw([p00, (p00.0 + 2, p00.1), p22]));
+            out.push(ccw([p00, p22, (p00.0, p00.1 + 2)]));
+        }
+    }
+    for edge in 0..4 {
+        for s in 0..half {
+            let o = 2 * s + 1;
+            let (a, b, inward) = match edge {
+                0 => ((o - 1, 0), (o + 1, 0), (0, 1)),
+                1 => ((quads, o - 1), (quads, o + 1), (-1, 0)),
+                2 => ((o - 1, quads), (o + 1, quads), (0, -1)),
+                _ => ((0, o - 1), (0, o + 1), (1, 0)),
+            };
+            let step = |g: Grid| (g.0 + inward.0, g.1 + inward.1);
+            let m = step((i32::midpoint(a.0, b.0), i32::midpoint(a.1, b.1)));
+            out.push(ccw([a, b, m]));
+            out.push(ccw([a, m, step(a)]));
+            out.push(ccw([b, step(b), m]));
+        }
+    }
+    out
+}
+
 /// The bounds of a tile of `side` × `side` vertices, as the bounds pass computes them.
+///
+/// # Panics
+///
+/// If `vertices` holds fewer than `side²`.
 pub(crate) fn bounds_of(vertices: &[GpuVertex], side: usize) -> GpuBounds {
     let points: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
     let mut lo = [f32::MAX; 3];
@@ -94,9 +148,17 @@ pub(crate) fn bounds_of(vertices: &[GpuVertex], side: usize) -> GpuBounds {
         .map(|&p| distance(p, center))
         .fold(0.0, f32::max);
     let quads = side - 1;
+    let at = |(x, y): Grid| {
+        points[usize::try_from(y).expect("on the grid") * side
+            + usize::try_from(x).expect("on the grid")]
+    };
+    let extras = extra_triangles(side)
+        .into_iter()
+        .map(|[a, b, c]| face_normal(at(a), at(b), at(c)));
     let normals: Vec<[f32; 3]> = (0..quads * quads)
         .flat_map(|q| quad_triangles(&points, side, q % quads, q / quads))
         .map(|[a, b, c]| face_normal(a, b, c))
+        .chain(extras)
         .collect();
     let sum = normals
         .iter()

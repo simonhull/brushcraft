@@ -6,6 +6,9 @@
 // binding arrays). Triangles are the quads split along (i, j)-(i + 1, j + 1) (plan decision
 // 4), counter-clockwise seen from outside, so a triangle's normal is
 // cross(p10 - p00, p11 - p00) and cross(p11 - p00, p01 - p00).
+//
+// The cone also holds the tile's other triangulations (extra_normal): its parent
+// triangulation, where the geomorph starts, and every edge variant's fan (see cull.rs).
 
 // The tile tree: every tile's slot.
 @group(0) @binding(0) var<storage, read> tree: array<TileNode>;
@@ -61,6 +64,77 @@ fn face_normal(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> vec3<f32> {
         return n / l;
     }
     return vec3<f32>(0.0);
+}
+
+// The position of grid vertex `g` of the tile whose first vertex is `base`.
+fn at_grid(base: u32, side: u32, g: vec2<i32>) -> vec3<f32> {
+    return at(base, side, u32(g.x), u32(g.y));
+}
+
+// The unit normal of the triangle on grid vertices g0, g1, g2, taken counter-clockwise in the
+// grid (as the tile's own triangles are), or zero for a degenerate one.
+fn oriented(base: u32, side: u32, g0: vec2<i32>, g1: vec2<i32>, g2: vec2<i32>) -> vec3<f32> {
+    let u = g1 - g0;
+    let v = g2 - g0;
+    if u.x * v.y - u.y * v.x < 0 {
+        return face_normal(at_grid(base, side, g0), at_grid(base, side, g2), at_grid(base, side, g1));
+    }
+    return face_normal(at_grid(base, side, g0), at_grid(base, side, g1), at_grid(base, side, g2));
+}
+
+// How many extra triangles a tile of `quads` quads a side has: two per 2 × 2 block of its
+// parent triangulation, three per odd border vertex of each edge's variant.
+fn extra_count(quads: u32) -> u32 {
+    let half = quads / 2u;
+    return 2u * half * half + 12u * half;
+}
+
+// Extra triangle `x`'s unit normal (zero if degenerate). First the parent triangulation: each
+// 2 × 2-quad block split along its (0, 0)-(2, 2) diagonal. Then, per edge, per odd border
+// vertex o between even a and b, with m, ma and mb the vertices one row in from o, a and b:
+// the variant's fan (a, b, m), (a, m, ma), (b, mb, m).
+fn extra_normal(base: u32, side: u32, x: u32) -> vec3<f32> {
+    let quads = side - 1u;
+    let half = quads / 2u;
+    let blocks = 2u * half * half;
+    if x < blocks {
+        let block = x / 2u;
+        let p00 = vec2<i32>(2 * i32(block % half), 2 * i32(block / half));
+        let p22 = p00 + vec2<i32>(2, 2);
+        if x % 2u == 0u {
+            return oriented(base, side, p00, p00 + vec2<i32>(2, 0), p22);
+        }
+        return oriented(base, side, p00, p22, p00 + vec2<i32>(0, 2));
+    }
+    let y = x - blocks;
+    let which = y % 3u;
+    let o = i32(2u * ((y / 3u) % half) + 1u);
+    let edge = y / (3u * half);
+    let q = i32(quads);
+    var a = vec2<i32>(o - 1, 0);
+    var b = vec2<i32>(o + 1, 0);
+    var inward = vec2<i32>(0, 1);
+    if edge == 1u {
+        a = vec2<i32>(q, o - 1);
+        b = vec2<i32>(q, o + 1);
+        inward = vec2<i32>(-1, 0);
+    } else if edge == 2u {
+        a = vec2<i32>(o - 1, q);
+        b = vec2<i32>(o + 1, q);
+        inward = vec2<i32>(0, -1);
+    } else if edge == 3u {
+        a = vec2<i32>(0, o - 1);
+        b = vec2<i32>(0, o + 1);
+        inward = vec2<i32>(1, 0);
+    }
+    let m = (a + b) / 2 + inward;
+    if which == 0u {
+        return oriented(base, side, a, b, m);
+    }
+    if which == 1u {
+        return oriented(base, side, a, m, a + inward);
+    }
+    return oriented(base, side, b, b + inward, m);
 }
 
 // Reduces `scalar` to its maximum (`take_max`) or minimum in `scalar[0]`.
@@ -136,6 +210,10 @@ fn bound_tiles(
         let p01 = at(base, side, i, j + 1u);
         sum += face_normal(p00, p10, p11) + face_normal(p00, p11, p01);
     }
+    let extras = extra_count(quads);
+    for (var x = t; x < extras; x += GROUP) {
+        sum += extra_normal(base, side, x);
+    }
     scalar[t] = radius;
     low[t] = sum;
     workgroupBarrier();
@@ -171,6 +249,12 @@ fn bound_tiles(
         }
         if dot(b, b) > 0.0 {
             cosine = min(cosine, dot(b, axis));
+        }
+    }
+    for (var x = t; x < extras; x += GROUP) {
+        let n = extra_normal(base, side, x);
+        if dot(n, n) > 0.0 {
+            cosine = min(cosine, dot(n, axis));
         }
     }
     scalar[t] = cosine;

@@ -6,7 +6,8 @@ use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{BufferUsages, CommandEncoderDescriptor, TextureViewDescriptor};
 
 use super::reference::{
-    CpuPyramid, bounds_of, depth_texture, distance, dot, face_normal, quad_triangles, read_mip,
+    CpuPyramid, bounds_of, depth_texture, distance, dot, extra_triangles, face_normal,
+    quad_triangles, read_mip,
 };
 use super::*;
 use crate::gpu::GpuTest;
@@ -139,28 +140,58 @@ fn the_bounds_pass_matches_its_cpu_twin_and_holds_every_vertex_and_triangle() {
                 "quad edge"
             );
             assert!(close(gpu_bounds.cone_cos, cpu.cone_cos, 1e-4), "cone");
-            // Conservative: every vertex in the sphere, every triangle's normal in the cone.
-            let points: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
-            assert!(
-                points
-                    .iter()
-                    .all(|&p| distance(p, gpu_bounds.center) <= gpu_bounds.radius),
-                "the sphere holds every vertex"
-            );
-            let quads = side - 1;
-            let triangles = (0..quads * quads)
-                .flat_map(|q| quad_triangles(&points, *side, q % quads, q / quads));
-            for [a, b, c] in triangles {
-                let n = face_normal(a, b, c);
-                assert!(
-                    dot(n, n) == 0.0 || dot(n, gpu_bounds.axis) >= gpu_bounds.cone_cos,
-                    "the cone holds every triangle"
-                );
-            }
+            assert_holds(&gpu_bounds, vertices, *side);
         }
         // Nothing changed since: an update after this one bounds nothing.
         assert!(BoundsUpdate::since(&tree, update.generation()).is_empty());
     });
+}
+
+/// The bounds are conservative for the tile of `vertices`, `side` a row.
+///
+/// Every vertex is in the sphere and every triangle's normal in the cone: the tile's own and
+/// its extra ones (the parent triangulation's and every edge variant's), each extra one facing
+/// out as the tile does.
+fn assert_holds(gpu_bounds: &GpuBounds, vertices: &[GpuVertex], side: usize) {
+    // Conservative: every vertex in the sphere, every triangle's normal in the cone.
+    let points: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+    assert!(
+        points
+            .iter()
+            .all(|&p| distance(p, gpu_bounds.center) <= gpu_bounds.radius),
+        "the sphere holds every vertex"
+    );
+    let quads = side - 1;
+    let triangles =
+        (0..quads * quads).flat_map(|q| quad_triangles(&points, side, q % quads, q / quads));
+    for [a, b, c] in triangles {
+        let n = face_normal(a, b, c);
+        assert!(
+            dot(n, n) == 0.0 || dot(n, gpu_bounds.axis) >= gpu_bounds.cone_cos,
+            "the cone holds every triangle"
+        );
+    }
+    // And the parent triangulation's and every edge variant's triangles, each facing
+    // out of the sphere as the tile does.
+    let extras = extra_triangles(side);
+    let half = quads / 2;
+    assert_eq!(
+        extras.len(),
+        2 * half * half + 12 * half,
+        "every extra triangle"
+    );
+    let at = |(x, y): (i32, i32)| {
+        points[usize::try_from(y).expect("on the grid") * side
+            + usize::try_from(x).expect("on the grid")]
+    };
+    for [a, b, c] in extras {
+        let n = face_normal(at(a), at(b), at(c));
+        assert!(
+            dot(n, n) == 0.0 || dot(n, gpu_bounds.axis) >= gpu_bounds.cone_cos,
+            "the cone holds the extra triangle {a:?} {b:?} {c:?}"
+        );
+        assert!(dot(n, at(a)) > 0.0, "{a:?} {b:?} {c:?} faces outward");
+    }
 }
 
 #[test]

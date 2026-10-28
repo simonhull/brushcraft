@@ -11,9 +11,24 @@
 //! ([`crate::tree::TileTree::changed_since`]), the owner thread gathers those nodes into a
 //! [`BoundsUpdate`], and the render thread encodes the pass right after the frame's uploads.
 //!
-//! The cone bounds the triangles the tile draws at rest. A geomorph in progress (Task 4) draws
-//! triangles between the tile's and its parent's shape, whose normals the cone doesn't strictly
-//! hold; the raster's morph must stay within it or widen it.
+//! **What the cone holds**, and so what the raster (Task 4) may draw from a tile without leaving
+//! slivers at the silhouette:
+//!
+//! 1. the tile's own triangles: each quad split along `(i, j)–(i + 1, j + 1)` (decision 4);
+//! 2. its **parent triangulation**: each 2 × 2-quad block split along its `(0, 0)–(2, 2)` diagonal.
+//!    This is where the geomorph starts: with every odd vertex at its decision-4 midpoint, each of
+//!    the tile's triangles lies in one of these, so has its normal;
+//! 3. every **edge variant**: on an edge whose neighbour is a level coarser, each odd border vertex
+//!    `o` (between the even border vertices `a` and `b`; `m`, `ma` and `mb` the vertices one row in
+//!    from `o`, `a` and `b`) is dropped, and the two border quads sharing it become the fan `(a, b,
+//!    m)`, `(a, m, ma)`, `(b, mb, m)`. **The variant index buffers must use exactly this
+//!    triangulation** (`bounds.wgsl`'s `extra_normal`).
+//!
+//! In between, a morphing triangle with one moving vertex has a normal on the arc between its
+//! two ends, so inside the cone (cones are convex). One whose two or three vertices move together
+//! has a normal quadratic in the morph factor, which can leave the cone: the raster must either
+//! keep such a triangle's moving vertices from moving at once or widen the cone test (a margin on
+//! `cone_cos`) while a morph runs.
 //!
 //! # Tests
 //!
