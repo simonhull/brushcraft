@@ -1,4 +1,17 @@
 //! The CSV, written and read back, and the printed summary.
+//!
+//! The summary's measures follow `research/platform/pen-input-wayland.md` in the docs repo, so
+//! its numbers compare with that table: strokes are runs of contact samples, intervals longer
+//! than [`STROKE_GAP_S`] are breaks, and **speed noise** is the median relative change between
+//! consecutive speeds (each a 3-step moving average, steps under [`MIN_STEP_PX`] left out), on
+//! the receipt clock, the de-jittered clock, and a steady period (the median receipt interval):
+//! the floor, what is left of the hand's own speed changes once timing is perfect.
+//! [`dispatch`] adds how far behind the pen the main thread handles events, [`buttons`] what the
+//! barrel buttons send, and [`compare`] sets a winit run beside one of ours.
+
+mod buttons;
+pub(crate) mod compare;
+mod dispatch;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
@@ -9,11 +22,14 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use input::{Buttons, Phase};
 
-use crate::{Recording, Sample, Selection, Source};
+use crate::script::Step;
+use crate::winit_tool::{WinitButton, WinitEvent};
+use crate::{Recording, Sample, Selection, Source, frames};
 
 /// The CSV header the probe writes.
 const HEADER: &str = "source,received_s,dejittered_s,wakeup,x,y,contact,pressure,tilt_x,tilt_y,\
-                      distance,roll,phase,buttons,device_ms";
+                      distance,roll,phase,buttons,device_ms,event,button,state,proximity,\
+                      handled_s,step";
 
 /// Intervals longer than this are breaks between strokes, not sample spacing.
 const STROKE_GAP_S: f64 = 0.1;
@@ -83,9 +99,16 @@ fn to_csv(samples: &[Sample]) -> Result<String, fmt::Error> {
     }
     let mut out = format!("{HEADER}\n");
     for s in samples {
+        let (button, state) = match s.winit_event {
+            Some(WinitEvent::Button { button, pressed }) => (
+                Some(button.name()),
+                Some(if pressed { "pressed" } else { "released" }),
+            ),
+            Some(WinitEvent::Entered | WinitEvent::Left | WinitEvent::Moved) | None => (None, None),
+        };
         writeln!(
             out,
-            "{},{:.6},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{}",
+            "{},{:.6},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             s.source.name(),
             s.received.as_secs_f64(),
             opt(s.dejittered.map(|d| format!("{:.6}", d.as_secs_f64()))),
@@ -101,23 +124,31 @@ fn to_csv(samples: &[Sample]) -> Result<String, fmt::Error> {
             opt(s.phase.map(|p| format!("{p:?}"))),
             button_mask(s.buttons),
             opt(s.device_ms),
+            opt(s.winit_event.map(WinitEvent::name)),
+            opt(button),
+            opt(state),
+            opt(s.proximity.map(u8::from)),
+            opt(s.handled.map(|d| format!("{:.6}", d.as_secs_f64()))),
+            opt(s.step.map(Step::name)),
         )?;
     }
     Ok(out)
 }
 
-/// Reads back a CSV the probe wrote, for `--report`.
+/// Reads back a CSV the probe wrote, for `--report`, with the load's frames from the load CSV
+/// beside it ([`frames::path_for`]) if there is one.
 ///
 /// Pad events, drops and samples over other surfaces aren't in the CSV, so the recording leaves
 /// them unknown; the selection is the sources that have samples.
 ///
 /// # Errors
 ///
-/// If the file can't be read or isn't a probe CSV.
+/// If the file can't be read or isn't a probe CSV, or the load CSV beside it is unreadable.
 pub(crate) fn read_csv(path: &Path) -> Result<Recording> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let samples = parse_csv(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let frames = frames::read(&frames::path_for(path))?;
     let has = |source| samples.iter().any(|s: &Sample| s.source == source);
     let selection = match (has(Source::Winit), has(Source::Ours)) {
         (true, true) => Selection::Both,
@@ -129,10 +160,12 @@ pub(crate) fn read_csv(path: &Path) -> Result<Recording> {
         samples,
         ours_counts: None,
         note: None,
+        frames,
     })
 }
 
-/// Where each field is in a CSV row; `buttons` is missing from older CSVs.
+/// Where each field is in a CSV row; `buttons` and the columns after `device_ms` are missing
+/// from older CSVs.
 #[derive(Debug)]
 struct Columns {
     /// The `source` column.
@@ -165,6 +198,18 @@ struct Columns {
     buttons: Option<usize>,
     /// The `device_ms` column.
     device_ms: usize,
+    /// The `event` column (winit's event); `None` in older CSVs, as are the five after it.
+    event: Option<usize>,
+    /// The `button` column (winit's button).
+    button: Option<usize>,
+    /// The `state` column (winit's button state).
+    state: Option<usize>,
+    /// The `proximity` column.
+    proximity: Option<usize>,
+    /// The `handled_s` column.
+    handled: Option<usize>,
+    /// The `step` column (the guided script's).
+    step: Option<usize>,
 }
 
 impl Columns {
@@ -172,7 +217,7 @@ impl Columns {
     ///
     /// # Errors
     ///
-    /// If a column other than `buttons` is missing.
+    /// If a column other than `buttons` and those after `device_ms` is missing.
     fn find(header: &str) -> Result<Self> {
         let names: Vec<&str> = header.split(',').map(str::trim).collect();
         let column = |name: &str| names.iter().position(|n| *n == name);
@@ -195,6 +240,12 @@ impl Columns {
             phase: required("phase")?,
             buttons: column("buttons"),
             device_ms: required("device_ms")?,
+            event: column("event"),
+            button: column("button"),
+            state: column("state"),
+            proximity: column("proximity"),
+            handled: column("handled_s"),
+            step: column("step"),
         })
     }
 
@@ -222,9 +273,31 @@ impl Columns {
             .transpose()?;
         let tilt = parsed(field(self.tilt_x), "tilt_x")?.zip(parsed(field(self.tilt_y), "tilt_y")?);
         let mask: Option<u8> = parsed(self.buttons.and_then(field), "buttons")?;
+        let winit_event = self
+            .event
+            .and_then(field)
+            .map(|name| {
+                parse_winit_event(
+                    name,
+                    self.button.and_then(field),
+                    self.state.and_then(field),
+                )
+            })
+            .transpose()?;
+        let step = self
+            .step
+            .and_then(field)
+            .map(|name| Step::parse(name).with_context(|| format!("unknown step {name}")))
+            .transpose()?;
+        let proximity: Option<u8> = parsed(self.proximity.and_then(field), "proximity")?;
         Ok(Sample {
             source,
             received: seconds(self.received, "received_s")?.context("no received_s")?,
+            handled: self
+                .handled
+                .map(|i| seconds(i, "handled_s"))
+                .transpose()?
+                .flatten(),
             dejittered: seconds(self.dejittered, "dejittered_s")?,
             wakeup: parsed(field(self.wakeup), "wakeup")?.context("no wakeup")?,
             x: parsed(field(self.x), "x")?.context("no x")?,
@@ -237,8 +310,37 @@ impl Columns {
             phase,
             buttons: buttons_from_mask(mask.unwrap_or(0)),
             device_ms: parsed(field(self.device_ms), "device_ms")?,
+            winit_event,
+            proximity: proximity.map(|p| p != 0),
+            step,
         })
     }
+}
+
+/// The winit event `name` in the CSV (with `button` and `state` for a button event).
+///
+/// # Errors
+///
+/// If the name is unknown, or a button event lacks a known button or state.
+fn parse_winit_event(name: &str, button: Option<&str>, state: Option<&str>) -> Result<WinitEvent> {
+    Ok(match name {
+        "entered" => WinitEvent::Entered,
+        "left" => WinitEvent::Left,
+        "moved" => WinitEvent::Moved,
+        "button" => {
+            let button = button.context("a button event with no button")?;
+            WinitEvent::Button {
+                button: WinitButton::parse(button)
+                    .with_context(|| format!("unknown button {button}"))?,
+                pressed: match state.context("a button event with no state")? {
+                    "pressed" => true,
+                    "released" => false,
+                    other => bail!("unknown button state {other}"),
+                },
+            }
+        }
+        other => bail!("unknown event {other}"),
+    })
 }
 
 /// `field` parsed as a `T`, if it's there.
@@ -443,7 +545,9 @@ fn source_block(out: &mut String, source: Source, samples: &[&Sample]) -> fmt::R
     let receipt = intervals(&strokes, Clock::Receipt);
     timing(out, "receipt clock", &receipt)?;
     let steady = Clock::Steady(percentile(&receipt, 0.5));
-    if source == Source::Ours {
+    // Ours always has the de-jittered clock; winit has it from recordings that put its events
+    // through the filter.
+    if source == Source::Ours || samples.iter().any(|s| s.dejittered.is_some()) {
         timing(
             out,
             "de-jittered clock",
@@ -457,6 +561,9 @@ fn source_block(out: &mut String, source: Source, samples: &[&Sample]) -> fmt::R
             noise(&strokes, Clock::Dejittered),
             noise(&strokes, steady),
         )?;
+        if let Some(steady_step) = Noise::of_step(samples, Step::Steady) {
+            writeln!(out, "speed noise, steady-strokes step: {steady_step}")?;
+        }
     } else {
         writeln!(
             out,
@@ -529,7 +636,73 @@ fn source_block(out: &mut String, source: Source, samples: &[&Sample]) -> fmt::R
         let phases: Vec<String> = phases.iter().map(|(p, n)| format!("{p} {n}")).collect();
         writeln!(out, "phases: {}", phases.join(", "))?;
     }
+    dispatch::block(out, source, samples)?;
+    buttons::block(out, source, samples)?;
     Ok(())
+}
+
+/// Speed noise on the three clocks over one set of strokes, and the de-jittered clock's distance
+/// from the floor.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Noise {
+    /// On the receipt clock, in percent.
+    pub(crate) receipt: Option<f64>,
+    /// On the de-jittered clock, in percent.
+    pub(crate) dejittered: Option<f64>,
+    /// On a steady period, the median receipt interval: the floor, in percent.
+    pub(crate) floor: Option<f64>,
+    /// Contact samples measured.
+    pub(crate) samples: usize,
+}
+
+impl Noise {
+    /// The speed noise of the strokes in `samples` (one source's).
+    pub(crate) fn of(samples: &[&Sample]) -> Self {
+        let strokes = strokes(samples);
+        let receipt = intervals(&strokes, Clock::Receipt);
+        let steady = Clock::Steady(percentile(&receipt, 0.5));
+        Self {
+            receipt: speed_noise(&strokes, Clock::Receipt),
+            dejittered: speed_noise(&strokes, Clock::Dejittered),
+            floor: speed_noise(&strokes, steady),
+            samples: strokes.iter().map(|s| s.len()).sum(),
+        }
+    }
+
+    /// The speed noise of the strokes the guided script's `step` recorded; `None` if it recorded
+    /// none.
+    pub(crate) fn of_step(samples: &[&Sample], step: Step) -> Option<Self> {
+        let in_step: Vec<&Sample> = samples
+            .iter()
+            .copied()
+            .filter(|s| s.step == Some(step))
+            .collect();
+        let noise = Self::of(&in_step);
+        (noise.samples > 0).then_some(noise)
+    }
+
+    /// The de-jittered clock's noise less the floor's, in percentage points.
+    pub(crate) fn above_floor(&self) -> Option<f64> {
+        Some(self.dejittered? - self.floor?)
+    }
+}
+
+impl fmt::Display for Noise {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pct = |v: Option<f64>| v.map_or_else(|| "n/a".to_owned(), |v| format!("{v:.1}%"));
+        write!(
+            f,
+            "receipt {}, de-jittered {}, floor {} (de-jittered {} the floor; {} contact samples)",
+            pct(self.receipt),
+            pct(self.dejittered),
+            pct(self.floor),
+            self.above_floor().map_or_else(
+                || "n/a against".to_owned(),
+                |d| format!("{d:+.1} points from")
+            ),
+            self.samples,
+        )
+    }
 }
 
 /// How `phase` is written in the CSV and the report.
@@ -587,6 +760,20 @@ pub(crate) fn summarise(recording: &Recording) -> Result<String, fmt::Error> {
             }
         }
     }
+    if let Some(frames) = &recording.frames {
+        dispatch::load_block(&mut out, frames)?;
+    }
+    Ok(out)
+}
+
+/// The load's summary alone, for `--load-check`.
+///
+/// # Errors
+///
+/// Only if formatting fails, which writing to a `String` never does.
+pub(crate) fn load_summary(frames: &[frames::FrameRecord]) -> Result<String, fmt::Error> {
+    let mut out = String::new();
+    dispatch::load_block(&mut out, frames)?;
     Ok(out)
 }
 
@@ -635,6 +822,10 @@ mod tests {
             phase: None,
             buttons,
             device_ms: None,
+            handled: None,
+            winit_event: None,
+            proximity: None,
+            step: None,
         }
     }
 

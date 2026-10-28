@@ -1267,8 +1267,13 @@ name = "pen-probe"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "checkout",
+ "geom",
  "input",
+ "rustix",
+ "sculpt",
  "softbuffer",
+ "store",
  "winit",
 ]
 
