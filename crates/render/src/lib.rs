@@ -5,6 +5,8 @@
 //! so every GPU test runs on lavapipe in the gate. [`surface`] is where frames go: a window's
 //! swapchain, opened with an adapter that can present to it, or an offscreen texture.
 //! [`Renderer::draw`] draws a frame there: its passes in order, the [`overlay`] last.
+//! [`residency`] keeps tiles on the GPU within a budget, uploaded through [`upload`]'s staging
+//! ring an epoch at a time, and [`tree`] is the tree of resident tiles the GPU walks.
 //!
 //! The crates below this one (`geom`, `store`, `brush`) never learn about the GPU: this crate
 //! reads their data and uploads it.
