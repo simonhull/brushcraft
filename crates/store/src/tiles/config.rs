@@ -230,6 +230,12 @@ impl StoreConfig {
     /// it holds a round of finished tiles and a thousand keys however small the share (so it
     /// still makes progress), which a tiny budget may take past it. Once it holds as many
     /// finished tiles as the share does, it evaluates no more until the caller takes them.
+    ///
+    /// The share stays reserved while the queue is empty. Lending it to the pools between
+    /// requests would mean taking it back when the next frame's requests arrive: evicting
+    /// evaluated tiles (or writing dirty corrections back) on the owner thread, at the moment
+    /// a renderer wants tiles evaluated, which costs more than the sixty-fourth it frees. A store
+    /// without a display layer, which no renderer draws, reserves none.
     #[must_use]
     pub const fn evaluation_bytes(&self) -> usize {
         if self.display.is_none() {
