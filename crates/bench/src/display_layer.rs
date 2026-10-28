@@ -41,6 +41,10 @@ struct Ran {
     time: Duration,
     /// The longest slice of any call: how far past a deadline a call can run.
     longest_slice: Duration,
+    /// Slices run.
+    slices: usize,
+    /// Slices longer than a slice is made to take (`JobsReport::SLICE_TARGET`).
+    long_slices: usize,
 }
 
 /// Runs the store's jobs to the end in calls of `budget` each (at least one: the first call
@@ -55,11 +59,15 @@ fn run_to_end(store: &mut TileStore, budget: Duration) -> Result<Ran> {
         built: 0,
         time: Duration::ZERO,
         longest_slice: Duration::ZERO,
+        slices: 0,
+        long_slices: 0,
     };
     loop {
         let report = store.run_jobs(Instant::now() + budget)?;
         ran.built += report.built;
         ran.longest_slice = ran.longest_slice.max(report.longest_slice);
+        ran.slices += report.slices;
+        ran.long_slices += report.long_slices;
         if !store.has_jobs() {
             break;
         }
@@ -193,16 +201,20 @@ fn rebuild<J: Write, H: Write>(
 ) -> Result<()> {
     store.clear_jobs();
     let (mut total, mut floor, mut tiles) = (Duration::ZERO, Duration::ZERO, 0);
-    let mut longest = Duration::ZERO;
+    let (mut longest, mut slices, mut long_slices) = (Duration::ZERO, 0, 0);
     for l in (0..finest.get()).rev() {
         let level = Level::new(l)?;
         store.queue_display_level(finest, level);
+        let ran = run_to_end(store, Duration::from_millis(50))?;
         let Ran {
             built,
             time,
             longest_slice,
-        } = run_to_end(store, Duration::from_millis(50))?;
+            ..
+        } = ran;
         longest = longest.max(longest_slice);
+        slices += ran.slices;
+        long_slices += ran.long_slices;
         total += time;
         tiles += built;
         if l <= FLOOR_TOP {
@@ -229,12 +241,17 @@ fn rebuild<J: Write, H: Write>(
             .with("total_s", total.as_secs_f64())
             .with("total_ms", ms(total))
             .with("floor_s", floor.as_secs_f64())
-            .with("longest_slice_ms", ms(longest)),
+            .with("longest_slice_ms", ms(longest))
+            .with("slices", slices)
+            .with("long_slices", long_slices),
     )?;
     out.say(&format!(
-        "display: rebuilt {tiles} tiles in {:.1} s (floor, levels ≤ {FLOOR_TOP}: {:.1} s)",
+        "display: rebuilt {tiles} tiles in {:.1} s (floor, levels ≤ {FLOOR_TOP}: {:.1} s); \
+         longest slice {:.2} ms, {long_slices} of {slices} slices over {:.0} ms",
         total.as_secs_f64(),
-        floor.as_secs_f64()
+        floor.as_secs_f64(),
+        ms(longest),
+        ms(store::JobsReport::SLICE_TARGET)
     ))?;
     Ok(())
 }
@@ -262,7 +279,7 @@ fn refresh_stroke<J: Write, H: Write>(
     let mut state = Stroke::new(project.store());
     project.begin_stroke()?;
     let (mut steps, mut refreshes, mut built) = (Vec::new(), Vec::new(), Vec::new());
-    let mut longest = Duration::ZERO;
+    let (mut longest, mut slices, mut long_slices) = (Duration::ZERO, 0, 0);
     for &centre in &plan.centres {
         let params = DrawParams::new(centre, plan.radius, options.strength)?;
         let start = Instant::now();
@@ -272,6 +289,8 @@ fn refresh_stroke<J: Write, H: Write>(
         refreshes.push(ran.time);
         built.push(ran.built);
         longest = longest.max(ran.longest_slice);
+        slices += ran.slices;
+        long_slices += ran.long_slices;
     }
     project.end_stroke()?;
     let tiles: usize = built.iter().sum();
@@ -280,7 +299,13 @@ fn refresh_stroke<J: Write, H: Write>(
         .with("steps", steps.len())
         .with("tiles_per_step", to_f64(tiles) / to_f64(steps.len().max(1)))
         .with("us_per_tile", ms(total) * 1000.0 / to_f64(tiles.max(1)))
-        .with("longest_slice_ms", ms(longest));
+        .with(
+            "tiles_a_second",
+            to_f64(tiles) / total.as_secs_f64().max(f64::MIN_POSITIVE),
+        )
+        .with("longest_slice_ms", ms(longest))
+        .with("slices", slices)
+        .with("long_slices", long_slices);
     if let Some(spread) = Spread::of(&refreshes) {
         record = spread.add_to(record, "refresh");
     }
@@ -289,13 +314,15 @@ fn refresh_stroke<J: Write, H: Write>(
     }
     out.record(&record)?;
     out.say(&format!(
-        "display: refresh after each of {} steps: {:.1} tiles a step, {:.0} µs a tile, {:.2} ms a step, \
-         longest slice {:.2} ms",
+        "display: refresh after each of {} steps: {:.1} tiles a step, {:.0} µs a tile ({:.0} a \
+         second), {:.2} ms a step, longest slice {:.2} ms, {long_slices} of {slices} over {:.0} ms",
         steps.len(),
         to_f64(tiles) / to_f64(steps.len().max(1)),
         ms(total) * 1000.0 / to_f64(tiles.max(1)),
+        to_f64(tiles) / total.as_secs_f64().max(f64::MIN_POSITIVE),
         ms(total) / to_f64(steps.len().max(1)),
-        ms(longest)
+        ms(longest),
+        ms(store::JobsReport::SLICE_TARGET)
     ))?;
     // The same stroke again, its refresh run once at its end: what a refresh after the stroke
     // costs, the tiles the steps share built once.
@@ -319,6 +346,81 @@ fn refresh_stroke<J: Write, H: Write>(
         "display: refresh once after a stroke of {} steps: {once} tiles in {:.0} ms",
         plan.centres.len(),
         ms(time)
+    ))?;
+    paced_stroke(project, index, options, &plan, &mut state, out)
+}
+
+/// The steps a second of [`paced_stroke`]: a pen's rate.
+const STEPS_A_SECOND: u32 = 120;
+
+/// The same stroke again at [`STEPS_A_SECOND`], the jobs given the rest of each step.
+///
+/// After each step, the jobs run until the next step is due, as a frame loop gives them the
+/// rest of each frame. Reports the display tiles
+/// built during the stroke (each made unknown by several steps is built once), the tiles a
+/// second that makes, the longest slice, what is left when the stroke ends and how long it takes
+/// to catch up.
+///
+/// # Errors
+///
+/// If a step or a job fails, or writing the report fails.
+fn paced_stroke<J: Write, H: Write>(
+    project: &mut Project,
+    index: &mut store::SpatialIndex,
+    options: &Options,
+    plan: &Plan,
+    state: &mut Stroke,
+    out: &mut Output<J, H>,
+) -> Result<()> {
+    let period = Duration::from_secs(1) / STEPS_A_SECOND;
+    let began = Instant::now();
+    let (mut built, mut longest, mut late) = (0_usize, Duration::ZERO, 0_usize);
+    let (mut slices, mut long_slices) = (0, 0);
+    project.begin_stroke()?;
+    for &centre in &plan.centres {
+        let due = Instant::now() + period;
+        let params = DrawParams::new(centre, plan.radius, options.strength)?;
+        draw_step(project.store(), index, state, params)?;
+        if Instant::now() > due {
+            late += 1;
+        }
+        let report = project.store().run_jobs(due)?;
+        built += report.built;
+        longest = longest.max(report.longest_slice);
+        slices += report.slices;
+        long_slices += report.long_slices;
+    }
+    project.end_stroke()?;
+    let stroke = began.elapsed();
+    let left = project.store().run_jobs(Instant::now()).map(|r| r.left)?;
+    let ran = run_to_end(project.store(), Duration::from_millis(50))?;
+    let (after, catch_up) = (ran.built, ran.time);
+    longest = longest.max(ran.longest_slice);
+    slices += ran.slices;
+    long_slices += ran.long_slices;
+    let rate = to_f64(built) / stroke.as_secs_f64();
+    out.record(
+        &Record::new("display", "paced_stroke")
+            .with("steps", plan.centres.len())
+            .with("steps_a_second", u64::from(STEPS_A_SECOND))
+            .with("steps_late", late)
+            .with("tiles_during", built)
+            .with("tiles_a_second", rate)
+            .with("left_at_end", left)
+            .with("tiles_after", after)
+            .with("catch_up_ms", ms(catch_up))
+            .with("longest_slice_ms", ms(longest))
+            .with("slices", slices)
+            .with("long_slices", long_slices),
+    )?;
+    out.say(&format!(
+        "display: a stroke of {} steps at {STEPS_A_SECOND} a second ({late} steps late): {built} \
+         tiles built during it ({rate:.0} a second), {left} left at its end, caught up with \
+         {after} more in {:.0} ms; longest slice {:.2} ms, {long_slices} of {slices} over {:.0} ms",
+        plan.centres.len(),
+        ms(catch_up),
+        ms(longest),
+        ms(store::JobsReport::SLICE_TARGET)
     ))?;
     Ok(())
 }
