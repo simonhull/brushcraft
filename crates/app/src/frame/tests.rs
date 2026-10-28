@@ -1,5 +1,5 @@
-//! The frame loop on a small project, with no GPU: the order of its phases, render on demand,
-//! and closing.
+//! The frame loop on a small project, with no GPU, on the real clock: the order of its phases,
+//! render on demand, and closing.
 
 use anyhow::bail;
 use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
@@ -54,19 +54,33 @@ const fn presented(number: u64) -> Presented {
     }
 }
 
-/// Makes frames for as long as the owner wants them, up to `most`, each shown at once;
-/// returns how many it made.
+/// Makes one frame now, as [`Owner::next`] said with `deadline`, shown at once; returns
+/// what it handed the render thread.
+fn frame<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, deadline: Instant) -> FrameRequest {
+    let mut handed = None;
+    owner
+        .frame(Instant::now(), deadline, |request| {
+            handed = Some(request);
+            Ok(())
+        })
+        .expect("a frame");
+    let request = handed.expect("the frame was handed off");
+    owner.shown(presented(request.number));
+    request
+}
+
+/// Makes frames on the real clock for as long as the owner wants them, up to `most`, each
+/// shown at once, sleeping where the owner says to wait; returns how many it made.
 fn run<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, most: u64) -> u64 {
     let mut made = 0;
-    let mut now = Instant::now();
     while made < most {
+        let now = Instant::now();
         match owner.next(now) {
             Next::Frame { deadline } => {
-                let request = owner.frame(now, deadline).expect("a frame");
-                owner.shown(presented(request.number));
+                frame(owner, deadline);
                 made += 1;
             }
-            Next::Wait { until } => now = until,
+            Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
             Next::Render => panic!("the frame was shown"),
             Next::Idle { .. } => break,
         }
@@ -74,15 +88,27 @@ fn run<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, most: u64) -> u64 {
     made
 }
 
-/// A brush that, on its first step only, edits one vertex of one tile and closes the epoch.
+/// The first frame's deadline, which the owner wants at once.
+fn first_deadline<B: Brush, U: Uploads>(owner: &Owner<B, U>) -> Instant {
+    let Next::Frame { deadline } = owner.next(Instant::now()) else {
+        panic!("the first frame is wanted");
+    };
+    deadline
+}
+
+/// A brush that, on its first step only, edits one vertex of one tile and closes the epoch,
+/// and records the camera each step saw.
 #[derive(Debug, Default)]
 struct OneEdit {
     /// Whether it has made its edit.
     done: bool,
+    /// The camera each step was given.
+    cameras: Vec<Camera>,
 }
 
 impl Brush for OneEdit {
-    fn step(&mut self, project: &mut Project) -> Result<()> {
+    fn step(&mut self, project: &mut Project, camera: &Camera) -> Result<()> {
+        self.cameras.push(*camera);
         if std::mem::replace(&mut self.done, true) {
             return Ok(());
         }
@@ -122,39 +148,102 @@ impl Uploads for Recording {
 }
 
 #[test]
-fn the_brush_steps_before_the_feed_is_drained_so_its_epoch_is_uploaded_that_frame() {
+fn a_frame_runs_input_brush_feed_uploads_then_hands_off_then_the_jobs() {
     let dir = TestDir::new();
+    // A slow display, so the first frame's jobs surely record some of the display rebuild a new
+    // project queues, and close epochs of it.
+    let slow = Setup {
+        interval: Duration::from_millis(100),
+        ..setup(None)
+    };
     let mut owner = Owner::new(
         project(&dir),
         OneEdit::default(),
         Recording::default(),
-        setup(Some(1)),
+        slow,
         Instant::now(),
     );
-    let now = Instant::now();
-    let Next::Frame { deadline } = owner.next(now) else {
-        panic!("the first frame is wanted");
+    owner.input(Input::Press {
+        button: Button::MouseLeft,
+        at: Pixel { x: 160.0, y: 100.0 },
+    });
+    owner.input(Input::Move {
+        at: Pixel { x: 200.0, y: 100.0 },
+    });
+    let deadline = first_deadline(&owner);
+    let first = frame(&mut owner, deadline);
+
+    // Input, then the brush: the brush saw the camera the drag had already turned.
+    let seen = owner
+        .brush
+        .cameras
+        .first()
+        .copied()
+        .expect("the brush stepped");
+    assert_ne!(seen, Camera::default(), "the brush sees this frame's input");
+    // The brush, then the feed and the uploads: its epoch reached the uploads that frame, and
+    // only it: the jobs, which run after, hadn't closed theirs yet.
+    let uploaded = owner.uploads().frames.first().expect("uploads ran");
+    assert_eq!(uploaded.len(), 1, "the brush's epoch alone: {uploaded:?}");
+    assert!(!uploaded.iter().all(|epoch| epoch.keys.is_empty()));
+    // The jobs ran after and closed epochs of the rebuild, which the next frame drains.
+    assert!(owner.has_stale(), "the jobs closed epochs after the drain");
+    // The hand-off came before the jobs: its overlay reports the jobs of the frame before
+    // (none), the next frame's those of this one.
+    let first_text = first.overlay.join("\n");
+    assert!(first_text.contains("jobs       0 slices"), "{first_text}");
+    owner.expose();
+    let Next::Frame { deadline: later } = owner.next(Instant::now() + Duration::from_millis(100))
+    else {
+        panic!("the next frame is wanted");
     };
-    let request = owner.frame(now, deadline).expect("a frame");
-    let first = owner.uploads().frames.first().expect("uploads ran");
-    let keys: usize = first.iter().map(|epoch| epoch.keys.len()).sum();
+    let second = frame(&mut owner, later);
+    let second_text = second.overlay.join("\n");
     assert!(
-        !first.is_empty() && keys > 0,
-        "the brush's epoch, in the frame it was made: {first:?}"
+        !second_text.contains("jobs       0 slices"),
+        "{second_text}"
     );
-    assert_eq!(owner.feed().epochs, first.len() as u64);
-    let text = request.overlay.join("\n");
+    let next = owner
+        .uploads()
+        .frames
+        .get(1)
+        .expect("the second frame's uploads");
     assert!(
-        text.contains("tiles      3 tiles"),
-        "the uploads' summary: {text}"
+        !next.is_empty(),
+        "the jobs' epochs, drained by the next frame"
     );
-    owner.shown(presented(request.number));
-    assert!(owner.done());
+    assert!(
+        second_text.contains("tiles      3 tiles"),
+        "the uploads' summary: {second_text}"
+    );
     owner.close().expect("closed");
     let kept: Vec<_> = std::fs::read_dir(dir.path().join("recovery"))
         .expect("the recovery directory")
         .collect();
     assert_eq!(kept.len(), 1, "unsaved edits keep their recovery file");
+}
+
+#[test]
+fn a_frame_runs_a_slice_of_jobs_however_late_it_is() {
+    let dir = TestDir::new();
+    let mut owner = Owner::new(
+        project(&dir),
+        NoBrush,
+        NoUploads,
+        setup(None),
+        Instant::now(),
+    );
+    // A deadline already past: the jobs still get one slice.
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("a second after boot");
+    frame(&mut owner, past);
+    assert!(
+        owner.after_hand_off.report.slices >= 1,
+        "{:?}",
+        owner.after_hand_off.report
+    );
+    owner.close().expect("closed");
 }
 
 #[test]

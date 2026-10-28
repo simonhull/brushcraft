@@ -141,8 +141,10 @@ impl WindowApp {
             let now = Instant::now();
             match running.owner.next(now) {
                 Next::Frame { deadline } => {
-                    let frame = running.owner.frame(now, deadline)?;
-                    running.render.send(frame)?;
+                    let render = &mut running.render;
+                    running
+                        .owner
+                        .frame(now, deadline, |frame| render.send(frame))?;
                 }
                 Next::Wait { until } => {
                     event_loop.set_control_flow(ControlFlow::WaitUntil(until));

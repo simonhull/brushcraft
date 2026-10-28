@@ -138,7 +138,7 @@ fn drive_offscreen(owner: &mut Owner<NoBrush, NoUploads>, render: &mut RenderThr
     while !owner.done() {
         let now = Instant::now();
         match owner.next(now) {
-            Next::Frame { deadline } => render.send(owner.frame(now, deadline)?)?,
+            Next::Frame { deadline } => owner.frame(now, deadline, |frame| render.send(frame))?,
             Next::Render => owner.shown(render.wait()?),
             Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
             Next::Idle { upkeep } => {

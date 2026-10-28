@@ -5,14 +5,20 @@
 //! makes each frame in a fixed order:
 //!
 //! 1. **input**: the pointer input queued since the last frame moves the camera;
-//! 2. **brush**: a seam for M1a4's brush step ([`Brush`]; [`NoBrush`] until then);
+//! 2. **brush**: a seam for M1a4's brush step ([`Brush`]; [`NoBrush`] until then), which sees the
+//!    camera as the input left it;
 //! 3. **feed**: the stale-tile feed is drained: the epochs closed since the last frame;
 //! 4. **uploads**: a seam for M1a3 Task 2's GPU residency ([`Uploads`]; [`NoUploads`] until then),
 //!    which takes the drained epochs;
-//! 5. **upkeep**: the project's recovery writer is ticked and polled;
-//! 6. **jobs**: the store's resumable jobs (display-layer refresh and rebuild) run until the
-//!    frame's deadline;
-//! 7. the frame is handed to the render thread, as a [`FrameRequest`].
+//! 5. **hand-off**: the frame goes to the render thread, as a [`FrameRequest`], which starts
+//!    encoding it at once;
+//! 6. **upkeep**: meanwhile the project's recovery writer is ticked and polled;
+//! 7. **jobs**: and the store's resumable jobs (display-layer refresh and rebuild) run until the
+//!    frame's deadline, at least one slice of them. This frame draws nothing they produce: the
+//!    epochs they close are drained by the next frame, which they want.
+//!
+//! Handing off before the jobs keeps them out of the input's latency (the plan's order,
+//! amended by the Task 1 review).
 //!
 //! Frames are made on demand: [`schedule::Scheduler`] decides when, from why they are wanted.
 //! A frame that leaves store jobs queued, or uploads pending, wants the next one; input that
@@ -25,7 +31,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use render::DrawTimes;
 use render::surface::{Presentation, Size};
-use store::{Drained, Project, StaleCursor, TileStore};
+use store::{Drained, JobsReport, Project, StaleCursor, TileStore};
 
 use self::schedule::{Next, Reason, Scheduler};
 use crate::camera::{Arcball, Camera};
@@ -37,12 +43,13 @@ use crate::render_thread::{FrameRequest, Presented};
 /// before the feed is drained, so the epochs its edits close reach the GPU in the same frame.
 pub(crate) trait Brush {
     /// One frame's brush work on `project`: the stroke samples queued since the last frame,
-    /// applied, and their epoch closed.
+    /// applied, and their epoch closed. `camera` is the view as this frame's input left it,
+    /// which the samples are projected through.
     ///
     /// # Errors
     ///
     /// If the store fails the edit.
-    fn step(&mut self, project: &mut Project) -> Result<()>;
+    fn step(&mut self, project: &mut Project, camera: &Camera) -> Result<()>;
 }
 
 /// No brush yet (M1a4): the step does nothing.
@@ -50,7 +57,7 @@ pub(crate) trait Brush {
 pub(crate) struct NoBrush;
 
 impl Brush for NoBrush {
-    fn step(&mut self, _project: &mut Project) -> Result<()> {
+    fn step(&mut self, _project: &mut Project, _camera: &Camera) -> Result<()> {
         Ok(())
     }
 }
@@ -101,9 +108,9 @@ pub(crate) struct OwnerPhases {
     pub(crate) feed: Duration,
     /// The uploads.
     pub(crate) uploads: Duration,
-    /// Ticking and polling the project.
+    /// Ticking and polling the project, after the last frame's hand-off.
     pub(crate) upkeep: Duration,
-    /// The store's jobs.
+    /// The store's jobs, after the last frame's hand-off.
     pub(crate) jobs: Duration,
 }
 
@@ -186,6 +193,20 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     feed: FeedStats,
     /// The render thread's phases for the last frame it finished.
     render: Option<DrawTimes>,
+    /// The last frame's upkeep and jobs, which run after its hand-off: the next frame's
+    /// overlay reports them.
+    after_hand_off: AfterHandOff,
+}
+
+/// What a frame did after handing itself off, reported by the next frame's overlay.
+#[derive(Debug, Clone, Copy, Default)]
+struct AfterHandOff {
+    /// How long the upkeep took.
+    upkeep: Duration,
+    /// How long the jobs took.
+    jobs: Duration,
+    /// What the jobs did.
+    report: JobsReport,
 }
 
 impl<B: Brush, U: Uploads> Owner<B, U> {
@@ -222,6 +243,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             finished: 0,
             feed: FeedStats::default(),
             render: None,
+            after_hand_off: AfterHandOff::default(),
         }
     }
 
@@ -294,20 +316,30 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.finished
     }
 
-    /// Makes a frame started at `now` whose store jobs run until `deadline`, and returns what
-    /// the render thread is to draw. Call it when [`Owner::next`] says
-    /// [`Next::Frame`], then hand the request over and report back with [`Owner::shown`].
+    /// Makes a frame started at `now`, hands what the render thread is to draw to `hand_off`,
+    /// then runs the upkeep and the store's jobs until `deadline` (at least one slice of jobs,
+    /// however late it is). Call it when [`Owner::next`] says [`Next::Frame`], and report back
+    /// with [`Owner::shown`] when the render thread has drawn it.
     ///
     /// # Errors
     ///
-    /// If the brush, the uploads, the project's upkeep or the store's jobs fail.
-    pub(crate) fn frame(&mut self, now: Instant, deadline: Instant) -> Result<FrameRequest> {
+    /// If the brush, the uploads, the hand-off, the project's upkeep or the store's jobs fail.
+    pub(crate) fn frame(
+        &mut self,
+        now: Instant,
+        deadline: Instant,
+        hand_off: impl FnOnce(FrameRequest) -> Result<()>,
+    ) -> Result<()> {
         let size = self
             .size
             .context("a frame was started with no frame size")?;
         self.scheduler.started(now);
         self.started += 1;
-        let mut phases = OwnerPhases::default();
+        let mut phases = OwnerPhases {
+            upkeep: self.after_hand_off.upkeep,
+            jobs: self.after_hand_off.jobs,
+            ..OwnerPhases::default()
+        };
         let mut lap = Lap::new();
 
         let arcball = Arcball::new(size);
@@ -320,7 +352,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         phases.input = lap.next();
 
         self.brush
-            .step(&mut self.project)
+            .step(&mut self.project, &self.camera)
             .context("the brush step")?;
         phases.brush = lap.next();
 
@@ -334,23 +366,6 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .context("uploading tiles")?;
         phases.uploads = lap.next();
 
-        self.project.tick(now).context("ticking the project")?;
-        self.project.poll().context("polling the project")?;
-        phases.upkeep = lap.next();
-
-        let jobs = self
-            .project
-            .store()
-            .run_jobs(deadline)
-            .context("running the store's jobs")?;
-        phases.jobs = lap.next();
-
-        if uploads.converging || self.project.store().has_jobs() {
-            self.scheduler.want(Reason::Converging);
-        }
-        if self.limit.is_some_and(|limit| self.started < limit) {
-            self.scheduler.want(Reason::Scripted);
-        }
         let snapshot = Snapshot {
             frame: self.started,
             refresh_hz: self.scheduler.interval().as_secs_f64().recip(),
@@ -360,16 +375,37 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             owner: phases,
             render: self.render,
             feed: self.feed,
-            jobs,
+            jobs: self.after_hand_off.report,
             tiles: uploads.summary.as_deref(),
             camera: self.camera,
         };
-        Ok(FrameRequest {
+        hand_off(FrameRequest {
             number: self.started,
             size,
             overlay_scale: self.overlay_scale,
             overlay: overlay::lines(&snapshot),
-        })
+        })?;
+        lap.next();
+
+        self.project.tick(now).context("ticking the project")?;
+        self.project.poll().context("polling the project")?;
+        self.after_hand_off.upkeep = lap.next();
+
+        let deadline = deadline.max(Instant::now() + JobsReport::SLICE_TARGET);
+        self.after_hand_off.report = self
+            .project
+            .store()
+            .run_jobs(deadline)
+            .context("running the store's jobs")?;
+        self.after_hand_off.jobs = lap.next();
+
+        if uploads.converging || self.project.store().has_jobs() {
+            self.scheduler.want(Reason::Converging);
+        }
+        if self.limit.is_some_and(|limit| self.started < limit) {
+            self.scheduler.want(Reason::Scripted);
+        }
+        Ok(())
     }
 
     /// The render thread finished a frame.
@@ -408,16 +444,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         project.close(keep).context("closing the project")
     }
 
+    /// Whether the stale-tile feed holds epochs this loop hasn't drained (or a resync).
+    #[cfg(test)]
+    pub(crate) fn has_stale(&mut self) -> bool {
+        self.project.store().has_stale(&self.cursor)
+    }
+
     /// The camera.
     #[cfg(test)]
     pub(crate) const fn camera(&self) -> &Camera {
         &self.camera
-    }
-
-    /// What the feed has delivered.
-    #[cfg(test)]
-    pub(crate) const fn feed(&self) -> FeedStats {
-        self.feed
     }
 
     /// The uploads seam.
