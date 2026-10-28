@@ -143,19 +143,14 @@ struct Recording {
 }
 
 impl Uploads for Recording {
-    fn apply(
-        &mut self,
-        drained: Drained,
-        _store: &mut TileStore,
-        deadline: Instant,
-    ) -> Result<UploadStatus> {
-        let Drained::Epochs(epochs) = drained else {
+    fn apply(&mut self, update: FrameUpdate, _store: &mut TileStore) -> Result<UploadStatus> {
+        let Drained::Epochs(epochs) = update.drained else {
             bail!("no resync expected");
         };
         self.frames.push(epochs);
         let converging = self.converging_for > 0;
         self.converging_for = self.converging_for.saturating_sub(1);
-        self.times.push((Instant::now(), deadline));
+        self.times.push((Instant::now(), update.deadline));
         Ok(UploadStatus {
             converging,
             summary: Some("3 tiles".to_owned()),
@@ -587,8 +582,13 @@ fn the_first_frame_uploads_the_floor_and_then_nothing_spins() {
     let stats = owner.uploads().stats();
     assert_eq!(stats.floor, floor);
     assert_eq!(stats.lost_frames, 0);
-    // The floor is up and nothing else is asked for: no more frames are wanted.
-    assert_eq!(run_on_gpu(&gpu, &mut owner, 100), 0, "nothing converging");
+    // The floor is up and nothing else is asked for: once the floor frame's readback is read
+    // (it agrees: nothing requested), no more frames are wanted.
+    let settling = run_on_gpu(&gpu, &mut owner, 100);
+    assert!(
+        (1..=3).contains(&settling),
+        "a frame or so to read the readback, then none: {settling}"
+    );
     assert!(matches!(owner.next(Instant::now()), Next::Idle { .. }));
     owner.close().expect("closed");
 }
@@ -599,18 +599,19 @@ fn a_frame_whose_uploads_are_dropped_is_recovered_by_the_next() {
     let gpu = software_gpu();
     let mut owner = resident_owner(&dir, &gpu);
     let floor = owner.uploads().floor_tiles();
-    // The first frame's surface is lost: the render thread gives up on it, dropping its
-    // uploads unsubmitted, and says to draw again.
+    // The first frame's uploads are dropped unsubmitted (as by a render thread that gave up on
+    // its frame), and nothing else asks for another: no retry, no input.
     let mut dropped = 0;
     let deadline = first_deadline(&owner);
     frame_with(&mut owner, deadline, |request| {
         dropped = request.uploads.as_ref().map_or(0, FrameUploads::bytes);
         drop(request);
-        Outcome::Retry
+        Outcome::Presented
     });
     assert!(dropped > 0, "the floor was staged, and lost");
+    // Its readback never comes, so residency still wants a frame, which hears of the loss.
     let Next::Frame { deadline: again_by } = owner.next(Instant::now() + INTERVAL) else {
-        panic!("a lost frame is drawn again");
+        panic!("a frame whose uploads were lost is followed by another");
     };
     let mut again = 0;
     frame_with(&mut owner, again_by, |request| {
@@ -626,5 +627,66 @@ fn a_frame_whose_uploads_are_dropped_is_recovered_by_the_next() {
     assert_eq!(stats.lost_frames, 1, "the dropped frame was heard of");
     assert_eq!(stats.floor, floor, "and the floor is resident again");
     assert!(matches!(owner.next(Instant::now()), Next::Idle { .. }));
+    owner.close().expect("closed");
+}
+
+/// The request buffer's bytes as a level choice that wants `key` alone leaves them: the count
+/// 1, nothing dropped, then the one entry ([`render::residency::REQUESTS_WGSL`]).
+fn one_request(key: &TileKey) -> Vec<u8> {
+    let place = render::tree::Place::of(key);
+    let words = [1_u32, 0, 0, 0, key.face().index(), place.packed()];
+    let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    bytes.extend(100.0_f32.to_le_bytes());
+    bytes.extend(0_u32.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn the_last_moves_requests_are_read_back_with_no_further_event() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut owner = resident_owner(&dir, &gpu);
+    run_on_gpu(&gpu, &mut owner, 100);
+    assert!(
+        matches!(owner.next(Instant::now()), Next::Idle { .. }),
+        "settled"
+    );
+    // The camera moves once, and that frame's level choice asks for a finest tile; no frame
+    // after writes any request, and no event follows.
+    let wanted = TileKey::displacement(FaceId::new(2), Level::new(FINEST).expect("a level"), 0, 0)
+        .expect("a key");
+    owner.input(Input::Press {
+        button: Button::MouseLeft,
+        at: Pixel { x: 160.0, y: 100.0 },
+    });
+    owner.input(Input::Move {
+        at: Pixel { x: 170.0, y: 100.0 },
+    });
+    owner.input(Input::Release {
+        button: Button::MouseLeft,
+    });
+    let Next::Frame { deadline } = owner.next(Instant::now() + INTERVAL) else {
+        panic!("the move wants a frame");
+    };
+    let buffer = owner.uploads().residency().request_buffer().clone();
+    frame_with(&mut owner, deadline, |request| {
+        // As the level choice's pass would, before the frame's readback copies the buffer.
+        gpu.queue().write_buffer(&buffer, 0, &one_request(&wanted));
+        submit(&gpu, request);
+        Outcome::Presented
+    });
+    let moved = owner.uploads().residency().frame();
+    // That frame's readback is still to be read: frames keep coming until it is (and until the
+    // next one, which asks for nothing, agrees).
+    let made = run_on_gpu(&gpu, &mut owner, 100);
+    assert!(made >= 1, "frames came with no event: {made}");
+    assert!(
+        owner.uploads().residency().requests_heard() >= Some(moved),
+        "the moving frame's requests were read back"
+    );
+    assert!(
+        matches!(owner.next(Instant::now()), Next::Idle { .. }),
+        "and once the readbacks agree, nothing more is wanted"
+    );
     owner.close().expect("closed");
 }

@@ -84,19 +84,26 @@ pub(crate) struct UploadStatus {
 /// staging ring, on the owner thread (the store is read here, and only here), for the render
 /// thread to encode ahead of the frame's passes.
 pub(crate) trait Uploads {
-    /// Applies `drained`, the epochs closed since the last frame (or a resync), and stages the
-    /// frame's uploads, reading tiles from `store` until `deadline` (the floor goes up whole,
-    /// whatever the deadline).
+    /// Applies `update.drained`, the epochs closed since the last frame (or a resync), and
+    /// stages the frame's uploads, reading tiles from `store` until `update.deadline` (the
+    /// floor goes up whole, whatever the deadline).
     ///
     /// # Errors
     ///
     /// If the store can't give a tile, or the GPU refuses an upload.
-    fn apply(
-        &mut self,
-        drained: Drained,
-        store: &mut TileStore,
-        deadline: Instant,
-    ) -> Result<UploadStatus>;
+    fn apply(&mut self, update: FrameUpdate, store: &mut TileStore) -> Result<UploadStatus>;
+}
+
+/// What a frame gives the uploads.
+#[derive(Debug)]
+pub(crate) struct FrameUpdate {
+    /// The epochs closed since the last frame, or a resync.
+    pub(crate) drained: Drained,
+    /// When staging should stop.
+    pub(crate) deadline: Instant,
+    /// Whether the view (the camera or the frame size) changed since the last frame: what the
+    /// level choice asks for may change with it.
+    pub(crate) moved: bool,
 }
 
 /// No GPU residency, for the frame loop's tests without a GPU: nothing is uploaded, and the
@@ -107,12 +114,7 @@ pub(crate) struct NoUploads;
 
 #[cfg(test)]
 impl Uploads for NoUploads {
-    fn apply(
-        &mut self,
-        _drained: Drained,
-        _store: &mut TileStore,
-        _deadline: Instant,
-    ) -> Result<UploadStatus> {
+    fn apply(&mut self, _update: FrameUpdate, _store: &mut TileStore) -> Result<UploadStatus> {
         Ok(UploadStatus::default())
     }
 }
@@ -226,6 +228,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     after_hand_off: AfterHandOff,
     /// Every frame's phases, in a scripted run only (an open-ended one would grow it forever).
     log: Option<PhaseLog>,
+    /// The view (camera and frame size) the last frame was made with; `None` before the first.
+    last_view: Option<(Camera, Size)>,
 }
 
 /// Every frame's phase times in a scripted run, for the summary printed at its end.
@@ -341,6 +345,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             render: None,
             after_hand_off: AfterHandOff::default(),
             log: setup.frames.map(|_| PhaseLog::default()),
+            last_view: None,
         }
     }
 
@@ -454,13 +459,15 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.feed.count(&drained);
         phases.feed = lap.next();
 
+        let view = (self.camera, size);
+        let update = FrameUpdate {
+            drained,
+            deadline: uploads_deadline(now, deadline),
+            moved: self.last_view.replace(view) != Some(view),
+        };
         let mut uploads = self
             .uploads
-            .apply(
-                drained,
-                self.project.store(),
-                uploads_deadline(now, deadline),
-            )
+            .apply(update, self.project.store())
             .context("uploading tiles")?;
         phases.uploads = lap.next();
 

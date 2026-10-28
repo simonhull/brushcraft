@@ -41,8 +41,10 @@ pub(crate) struct FrameRequest {
     /// The overlay's lines.
     pub(crate) overlay: Vec<String>,
     /// The uploads the owner thread staged for this frame, encoded ahead of its passes and
-    /// submitted with them; `None` with no GPU residency. A request dropped undrawn drops them,
-    /// and residency recovers from that on the owner's next frame.
+    /// submitted with them, even when the frame gets no image to draw in; `None` with no GPU
+    /// residency. They are dropped unsubmitted only if the frame fails to draw (which ends the
+    /// run) or the request is never drawn: that frame makes no request readback, so residency
+    /// keeps wanting frames, and the next one hears of the loss and stages the tiles again.
     pub(crate) uploads: Option<FrameUploads>,
 }
 

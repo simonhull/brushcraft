@@ -8,7 +8,10 @@
 //! whose uploads never reach the GPU is recovered by the next [`Residency::begin_frame`].
 //!
 //! The tile requests a frame's readback gives come back through residency's own readback
-//! ([`Residency::take_requests`]), not through the render thread's report.
+//! ([`Residency::take_requests`]), not through the render thread's report. Each says which
+//! frame it is of ([`Residency::requests_heard`]), and frames keep coming after a change (the
+//! view moved, tiles arrived, the requests changed) until a readback from then on is read
+//! ([`settle`]): so the last view's requests are never left unread until the next event.
 //!
 //! Until the level choice (M1a3 Task 3) says what each frame cut and drew, the frame's use is
 //! a placeholder: the floor plus every tile requested, as both the cut and the drawn set
@@ -20,16 +23,15 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use geom::TileKey;
 use render::gpu::Gpu;
 use render::residency::{FrameUse, Residency, ResidencyConfig, ResidencyStats, Tier};
 use render::upload::{FrameUploads, StoreSource, prefetch_requests};
-use store::{Drained, TileStore};
+use store::TileStore;
 
-use crate::frame::{UploadStatus, Uploads};
+use crate::frame::{FrameUpdate, UploadStatus, Uploads};
 
 /// A mebibyte, for the overlay's sizes.
 const MIB: f64 = 1024.0 * 1024.0;
@@ -48,6 +50,12 @@ pub(crate) struct GpuResidency {
     /// [`ResidencyStats::starved`] as the last frame left it: the next frame's increase is how
     /// many requests found no slot then.
     starved: u64,
+    /// The first frame ([`Residency::frame`]) whose request readback must be read before the
+    /// requests are settled; `None` once they are. Set by a frame whose view moved, whose
+    /// uploads changed what is resident, or whose readback changed what is requested: what the
+    /// level choice asks for may differ from then on, and only that frame's readback (or a
+    /// later one) says.
+    settle_from: Option<u64>,
 }
 
 impl GpuResidency {
@@ -67,8 +75,7 @@ impl GpuResidency {
         let residency = gpu
             .scoped("setting up GPU residency", || {
                 Residency::new(&gpu, store.mesh(), finest, config)
-            })
-            .context("setting up GPU residency")?
+            })?
             .context("setting up GPU residency")?;
         Ok(Self {
             gpu,
@@ -76,12 +83,19 @@ impl GpuResidency {
             requested: BTreeSet::new(),
             use_changed: true,
             starved: 0,
+            settle_from: None,
         })
     }
 
     /// Residency's counts, as they stand.
     pub(crate) fn stats(&self) -> ResidencyStats {
         self.residency.stats()
+    }
+
+    /// The residency, for tests that look inside it.
+    #[cfg(test)]
+    pub(crate) const fn residency(&self) -> &Residency {
+        &self.residency
     }
 
     /// How many tiles the floor has, resident or not.
@@ -95,17 +109,19 @@ impl GpuResidency {
     /// # Errors
     ///
     /// If polling the GPU, the store's page-ins or the staging fail.
-    fn stage(
-        &mut self,
-        drained: Drained,
-        store: &mut TileStore,
-        deadline: Instant,
-    ) -> Result<FrameUploads> {
+    fn stage(&mut self, update: FrameUpdate, store: &mut TileStore) -> Result<FrameUploads> {
+        let FrameUpdate {
+            drained,
+            deadline,
+            moved,
+        } = update;
         let gpu = &*self.gpu;
         let residency = &mut self.residency;
         residency
             .begin_frame(gpu)
             .context("hearing what became of earlier frames")?;
+        let frame = residency.frame();
+        let mut changed = moved;
         residency.apply(drained);
         if let Some(requests) = residency.take_requests() {
             prefetch_requests(store, &requests).context("paging in requested tiles")?;
@@ -114,6 +130,7 @@ impl GpuResidency {
             if requested != self.requested {
                 self.requested = requested;
                 self.use_changed = true;
+                changed = true;
             }
         }
         // The use holds until the next call, so it is told only when it changes.
@@ -123,28 +140,28 @@ impl GpuResidency {
         let uploads = residency
             .stage(gpu, &mut StoreSource::new(store), deadline)
             .context("staging tiles")?;
+        // Tiles arriving or leaving change what the level choice asks for too.
+        changed |= !uploads.is_empty();
+        let heard = residency.requests_heard();
+        self.settle_from = settle(self.settle_from, changed.then_some(frame), heard);
         Ok(uploads)
     }
 }
 
 impl Uploads for GpuResidency {
-    fn apply(
-        &mut self,
-        drained: Drained,
-        store: &mut TileStore,
-        deadline: Instant,
-    ) -> Result<UploadStatus> {
+    fn apply(&mut self, update: FrameUpdate, store: &mut TileStore) -> Result<UploadStatus> {
         let gpu = Arc::clone(&self.gpu);
-        let uploads = gpu
-            .scoped("the owner thread's uploads", || {
-                self.stage(drained, store, deadline)
-            })
-            .context("uploading tiles on the owner thread")??;
+        let uploads = gpu.scoped("the owner thread's GPU work", || self.stage(update, store))??;
         let stats = self.residency.stats();
         let starved_now = stats.starved.saturating_sub(self.starved);
         self.starved = stats.starved;
+        let work = Work {
+            floor_ready: self.residency.floor_ready(),
+            starved_now,
+            settling: self.settle_from.is_some(),
+        };
         Ok(UploadStatus {
-            converging: converging(&stats, self.residency.floor_ready(), starved_now),
+            converging: converging(&stats, work),
             summary: Some(summary(&stats, self.floor_tiles())),
             frame: Some(uploads),
         })
@@ -164,19 +181,44 @@ pub(crate) fn placeholder_use(
     FrameUse::new(cut.clone(), cut)
 }
 
+/// What residency's counts don't say about the work left, for [`converging`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Work {
+    /// Whether every floor tile the source can give is resident.
+    pub(crate) floor_ready: bool,
+    /// How many of the wanted tiles found no slot this frame.
+    pub(crate) starved_now: u64,
+    /// Whether a request readback is still to be read before the requests are settled.
+    pub(crate) settling: bool,
+}
+
 /// Whether residency wants the next frame.
 ///
 /// It does while the floor isn't all resident, while an epoch is pending (it switches whole,
-/// over as many frames as it takes, forced within a few), and while a requested tile is still
-/// to come that a slot could be found for. `starved_now` of the wanted found none this frame:
-/// they wait for a slot, which only a change of use frees, so they alone want no frame, and an
-/// idle residency never spins.
-pub(crate) const fn converging(
-    stats: &ResidencyStats,
-    floor_ready: bool,
-    starved_now: u64,
-) -> bool {
-    !floor_ready || stats.pending_epochs > 0 || stats.wanted as u64 > starved_now
+/// over as many frames as it takes, forced within a few), while a requested tile is still to
+/// come that a slot could be found for, and while the requests are settling ([`settle`]).
+///
+/// Settling: a frame changed what the level choice may ask for (the view moved, tiles arrived
+/// or left, the requests changed) and no readback that recent has been read. Only frames bring
+/// readbacks, so frames come until one does and agrees with what is requested. A frame dropped
+/// unsubmitted makes no readback, so frames keep coming and the next one recovers its tiles.
+///
+/// Wanted tiles that found no slot (`work.starved_now`) wait for one, which only a change of
+/// use frees, so they alone want no frame, and an idle residency never spins.
+pub(crate) const fn converging(stats: &ResidencyStats, work: Work) -> bool {
+    !work.floor_ready
+        || stats.pending_epochs > 0
+        || stats.wanted as u64 > work.starved_now
+        || work.settling
+}
+
+/// The frame whose request readback must be read next; `None` once the requests are settled.
+///
+/// Given the one before (`from`), the frame that just changed what may be requested
+/// (`changed`, if it did) and the newest frame whose readback has been read (`heard`): settled
+/// once a readback that recent is in hand.
+pub(crate) fn settle(from: Option<u64>, changed: Option<u64>, heard: Option<u64>) -> Option<u64> {
+    from.max(changed).filter(|&frame| heard < Some(frame))
 }
 
 /// The overlay's line for what the GPU holds: resident tiles (the floor's of
@@ -219,18 +261,61 @@ mod tests {
 
     #[test]
     fn residency_converges_while_it_has_work_and_idles_without() {
-        assert!(converging(&stats(0, 0), false, 0), "the floor isn't up");
-        assert!(converging(&stats(0, 1), true, 0), "an epoch pending");
-        assert!(converging(&stats(3, 0), true, 0), "tiles to stage");
+        let ready = Work {
+            floor_ready: true,
+            ..Work::default()
+        };
+        let starved = |starved_now| Work {
+            starved_now,
+            ..ready
+        };
         assert!(
-            converging(&stats(3, 0), true, 2),
-            "one of them could be staged"
+            converging(&stats(0, 0), Work::default()),
+            "the floor isn't up"
         );
+        assert!(converging(&stats(0, 1), ready), "an epoch pending");
+        assert!(converging(&stats(3, 0), ready), "tiles to stage");
+        assert!(converging(&stats(3, 0), starved(2)), "one could be staged");
         assert!(
-            !converging(&stats(3, 0), true, 3),
+            !converging(&stats(3, 0), starved(3)),
             "all starved: no spinning"
         );
-        assert!(!converging(&stats(0, 0), true, 0), "idle");
+        let settling = Work {
+            settling: true,
+            ..ready
+        };
+        assert!(converging(&stats(0, 0), settling), "a readback to read");
+        assert!(!converging(&stats(0, 0), ready), "idle");
+    }
+
+    #[test]
+    fn requests_settle_once_a_readback_from_after_the_last_change_is_read() {
+        assert_eq!(settle(None, None, None), None, "nothing changed");
+        assert_eq!(
+            settle(None, Some(5), Some(4)),
+            Some(5),
+            "frame 5 changed things"
+        );
+        assert_eq!(
+            settle(Some(5), None, Some(4)),
+            Some(5),
+            "its readback not read yet"
+        );
+        assert_eq!(
+            settle(Some(5), Some(6), Some(5)),
+            Some(6),
+            "it changed them again"
+        );
+        assert_eq!(
+            settle(Some(6), None, Some(6)),
+            None,
+            "frame 6's agreed: settled"
+        );
+        assert_eq!(
+            settle(Some(6), None, Some(9)),
+            None,
+            "a later readback will do"
+        );
     }
 
     #[test]
