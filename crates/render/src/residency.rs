@@ -667,7 +667,7 @@ pub struct Residency {
     frame: u64,
     /// The current cut.
     cut: BTreeSet<TileKey>,
-    /// The places whose children are in the cut or drawn.
+    /// The places with a descendant in the cut or drawn: every ancestor of either.
     shielded: BTreeSet<Place>,
     /// The tiles the frame being staged wrote, with the slot each was written to.
     touched: Vec<(TileKey, Slot)>,
@@ -946,8 +946,12 @@ impl Residency {
     }
 
     /// Takes what the level choice used this frame: `frame.drawn`'s tiles are renewed as most
-    /// recently drawn, and until the next call `frame.cut`'s tiles and the parents of either's
-    /// are never evicted.
+    /// recently drawn, and until the next call `frame.cut`'s tiles and every ancestor of
+    /// either's are never evicted.
+    ///
+    /// The ancestors are the refined set the cut hangs from (and the tiles the relaxation and
+    /// its sweep refined beside it): were one evicted, everything under it would be
+    /// unreachable and drawn by the next ancestor up, two or more levels coarser.
     pub fn use_frame(&mut self, frame: FrameUse) {
         let FrameUse { cut, drawn } = frame;
         for key in &drawn {
@@ -961,11 +965,18 @@ impl Residency {
                 entry.last_drawn = self.frame;
             }
         }
-        let parents = cut
-            .iter()
-            .chain(&drawn)
-            .filter_map(|key| Place::of(key).parent());
-        self.shielded = parents.collect();
+        let mut shielded = BTreeSet::new();
+        for key in cut.iter().chain(&drawn) {
+            let mut above = Place::of(key).parent();
+            while let Some(place) = above {
+                // Already in: so are all its ancestors.
+                if !shielded.insert(place) {
+                    break;
+                }
+                above = place.parent();
+            }
+        }
+        self.shielded = shielded;
         self.cut = cut;
     }
 

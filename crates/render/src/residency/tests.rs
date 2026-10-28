@@ -1414,3 +1414,80 @@ fn a_request_is_staged_the_frame_after_it_is_made_so_its_page_in_can_land() {
         );
     });
 }
+
+#[test]
+fn eviction_under_a_tiny_budget_never_removes_an_ancestor_of_the_cut() {
+    GpuTest::run(|gpu| {
+        // Three levels above the floor, so a cut tile has a grandparent that can be evicted.
+        let finest = level(8);
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, finest);
+        let config = tiny(&mesh, 6);
+        let mut residency = Residency::new(gpu, &mesh, finest, config).expect("residency");
+        let mut rng = Rng(29);
+        let mut drawn: BTreeSet<TileKey> = BTreeSet::new();
+        let (mut evicted, mut deep) = (0, 0);
+        for step in 0..300 {
+            // The deepest resident tiles, where a grandparent is above the floor.
+            let deepest: Vec<TileKey> = residency
+                .resident()
+                .filter(|key| key.level() == finest)
+                .copied()
+                .collect();
+            let count = 1 + rng.below(2);
+            let cut: BTreeSet<TileKey> = if deepest.is_empty() {
+                random_cut(&mut rng, &residency, count)
+            } else {
+                (0..count)
+                    .map(|_| deepest[rng.below(deepest.len())])
+                    .collect()
+            };
+            let used: Vec<TileKey> = cut.iter().chain(&drawn).copied().collect();
+            let ancestors = used.iter().flat_map(|key| {
+                std::iter::successors(Place::of(key).parent(), |place| place.parent())
+                    .filter_map(|place| place.key(finest))
+                    .filter(|key| residency.slot(key).is_some())
+            });
+            let kept: BTreeSet<TileKey> = ancestors.collect();
+            // Ancestors above the floor that aren't a parent: what protecting parents alone
+            // would have left to eviction.
+            let parents: BTreeSet<Place> = used
+                .iter()
+                .filter_map(|key| Place::of(key).parent())
+                .collect();
+            let beyond = kept
+                .iter()
+                .filter(|key| key.level() > level(5) && !parents.contains(&Place::of(key)));
+            deep += beyond.count();
+            let asked = 1 + rng.below(6);
+            let requests = random_requests(&mut rng, &mut model, &residency, asked);
+            let (drained, _) = model.drain();
+            let before: BTreeSet<TileKey> = residency.resident().copied().collect();
+            frame(
+                gpu,
+                &mut residency,
+                &mut model,
+                drained,
+                FrameUse::new(cut.clone(), drawn.clone()),
+                Some(&requests),
+            );
+            for key in &kept {
+                assert!(
+                    residency.slot(key).is_some(),
+                    "step {step}: ancestor {key:?} was evicted"
+                );
+            }
+            let after: BTreeSet<TileKey> = residency.resident().copied().collect();
+            evicted += before.difference(&after).count();
+            drawn = cut;
+        }
+        assert!(
+            evicted > 50,
+            "the budget is tiny enough to evict: {evicted}"
+        );
+        assert!(
+            deep > 20,
+            "grandparents above the floor were at stake: {deep}"
+        );
+    });
+}
