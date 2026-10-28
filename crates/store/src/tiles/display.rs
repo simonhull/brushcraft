@@ -33,12 +33,16 @@ impl TileStore {
     /// [`CacheError::Display`] ([`geom::DisplayError::NoDisplayLevel`]) if the store keeps no
     /// display layer; [`CacheError::Eval`] if listing a written tile's readers fails (never,
     /// for tiles of the store's mesh). Nothing is recorded then.
-    pub(crate) fn record_display(&mut self, tiles: &[DisplayTile]) -> Result<(), CacheError> {
+    pub(crate) fn record_display<T: std::borrow::Borrow<DisplayTile>>(
+        &mut self,
+        tiles: &[T],
+    ) -> Result<(), CacheError> {
         let finest = self
             .display_finest
             .ok_or(geom::DisplayError::NoDisplayLevel(Level::ZERO))?;
         self.display_builds += 1;
-        for tile in tiles {
+        let tiles: Vec<&DisplayTile> = tiles.iter().map(std::borrow::Borrow::borrow).collect();
+        for &tile in &tiles {
             self.display_generations
                 .insert(*tile.key(), self.display_builds);
             self.bumped.remove(tile.key());
@@ -220,7 +224,8 @@ impl TileStore {
                 })
                 .collect()
         });
-        for ((key, _, _), record) in to_read.iter().zip(read) {
+        let reads = to_read.iter().zip(read);
+        for ((key, _, _), record) in reads {
             if let Some(record) = record?.filter(|record| Some(record.finest) == finest) {
                 self.bumped.insert(*key, (record, raise));
                 reached.insert(*key);

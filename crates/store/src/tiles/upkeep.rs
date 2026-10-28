@@ -34,7 +34,9 @@ use super::error::CacheError;
 use crate::bounds::Kept;
 use crate::display::{DisplayRecord, StoredDisplay, tent_reads};
 use crate::file::{FileError, FileReader, Loc, display_record, unknown_display_len};
-use crate::jobs::{Cone, FinestTile, Finished, Job, JobsReport, Outcome, Progress, Upkeep};
+use crate::jobs::{
+    Cone, DecodedTile, FinestTile, Finished, Job, JobsReport, Outcome, Progress, Upkeep,
+};
 
 /// How many pending tiles a slice looks at per tile it can hand out: it skips known, failed
 /// and unready tiles, and this bounds how long it looks.
@@ -193,7 +195,7 @@ enum TaskInputs {
     /// Build it, one level above the finest: the finest tiles it reads.
     Finest(BTreeMap<TileKey, FinestTile>),
     /// Build it, higher: the display tiles one level finer it reads, decoded.
-    Display(BTreeMap<TileKey, Arc<DisplayTile>>),
+    Display(BTreeMap<TileKey, Arc<DecodedTile>>),
     /// Decode it, for the tiles of the level above: where its record is.
     Decode(Finer),
 }
@@ -229,13 +231,18 @@ fn decode_finer(
     place: &Finer,
     finest: Level,
 ) -> Result<Option<DisplayTile>, CacheError> {
-    let record = match place {
-        Finer::Record(record) => Some(record.clone()),
-        Finer::File(reader, loc) => match reader.read_record(*loc) {
-            Ok(raw) => display_record(&raw, &key).and_then(StoredDisplay::known),
-            Err(FileError::Damaged { .. }) => None,
-            Err(e) => return Err(CacheError::Store(e)),
-        },
+    // Read from the file into this; a record held in memory is decoded where it is.
+    let read: Option<DisplayRecord>;
+    let record: Option<&DisplayRecord> = match place {
+        Finer::Record(record) => Some(record),
+        Finer::File(reader, loc) => {
+            read = match reader.read_record(*loc) {
+                Ok(raw) => display_record(&raw, &key).and_then(StoredDisplay::known),
+                Err(FileError::Damaged { .. }) => None,
+                Err(e) => return Err(CacheError::Store(e)),
+            };
+            read.as_ref()
+        }
     };
     Ok(record
         .filter(|r| r.finest == finest)
@@ -251,7 +258,7 @@ fn run_task(task: &Task) -> Outcome {
     let built = match &task.inputs {
         TaskInputs::Decode(place) => {
             return match decode_finer(key, place, task.finest) {
-                Ok(Some(tile)) => Outcome::Decoded(Box::new(tile)),
+                Ok(Some(tile)) => Outcome::Decoded(Box::new(DecodedTile::new(tile))),
                 Ok(None) => Outcome::Unreadable,
                 Err(e) => Outcome::Error(e),
             };
@@ -260,7 +267,7 @@ fn run_task(task: &Task) -> Outcome {
         TaskInputs::Finest(tiles) => build_from_finest(&task.mesh, key, tiles),
     };
     match built {
-        Ok(tile) => Outcome::Built(Box::new(tile)),
+        Ok(tile) => Outcome::Built(Box::new(DecodedTile::new(tile))),
         Err(why) => Outcome::Failed(why),
     }
 }
@@ -311,7 +318,7 @@ fn build_from_finest(
 fn build_from_finer(
     mesh: &BaseMesh,
     key: TileKey,
-    tiles: &BTreeMap<TileKey, Arc<DisplayTile>>,
+    tiles: &BTreeMap<TileKey, Arc<DecodedTile>>,
 ) -> Result<DisplayTile, DisplayError> {
     let region = Region::of_tile(&key);
     let finer = key
@@ -325,10 +332,12 @@ fn build_from_finer(
     let bound = tiles
         .iter()
         .filter(|(tile, _)| lies_under(Region::of_tile(tile), region))
-        .map(|(_, d)| d.error())
+        .map(|(_, d)| d.tile.error())
         .fold(0.0_f32, f32::max);
-    let positions: BTreeMap<TileKey, &[Vec3]> =
-        tiles.iter().map(|(k, d)| (*k, d.positions())).collect();
+    let positions: BTreeMap<TileKey, &[Vec3]> = tiles
+        .iter()
+        .map(|(k, d)| (*k, d.tile.positions()))
+        .collect();
     let block = block_from(
         &positions,
         Channel::DISPLAY,
@@ -338,10 +347,10 @@ fn build_from_finer(
         fine_side,
     )
     .ok_or(DisplayError::Unavailable)?;
-    let means_of: BTreeMap<TileKey, Vec<Vec3>> =
-        tiles.iter().map(|(k, d)| (*k, d.means())).collect();
-    let means: BTreeMap<TileKey, &[Vec3]> =
-        means_of.iter().map(|(k, m)| (*k, m.as_slice())).collect();
+    let means: BTreeMap<TileKey, &[Vec3]> = tiles
+        .iter()
+        .map(|(k, d)| (*k, d.means.as_slice()))
+        .collect();
     let source = TileValues::new(Channel::DISPLAY, &means);
     let mean_normals = mip_normals_tile(mesh, &source, &key);
     if source.missed.get() {
@@ -737,7 +746,7 @@ impl TileStore {
                 Outcome::Built(tile) => built.push(*tile),
                 Outcome::Decoded(tile) => {
                     self.display_decoded
-                        .insert(*tile.key(), (done.record, Arc::new(*tile)));
+                        .insert(*tile.tile.key(), (done.record, Arc::new(*tile)));
                 }
                 Outcome::Unreadable => {
                     // A record the files hold that doesn't read: unknown, so it is rebuilt.
@@ -759,7 +768,7 @@ impl TileStore {
         if !built.is_empty() {
             if let Err(e) = self.record_display(&built) {
                 for tile in &built {
-                    upkeep.push(*tile.key());
+                    upkeep.push(*tile.tile.key());
                 }
                 return Err(e);
             }
@@ -767,9 +776,9 @@ impl TileStore {
             // A slice is an operation: its display tiles are one epoch.
             self.close_epoch()?;
             for tile in built {
-                let record = self.display_generation(tile.key());
-                self.display_decoded
-                    .insert(*tile.key(), (record, Arc::new(tile)));
+                let key = *tile.tile.key();
+                let record = self.display_generation(&key);
+                self.display_decoded.insert(key, (record, Arc::new(tile)));
             }
         }
         error.map_or(Ok(count), Err)
@@ -847,12 +856,8 @@ impl TileStore {
                 }
                 Readiness::Evaluate(missing) => {
                     later.push(key);
-                    let fits = evaluate
-                        .iter()
-                        .chain(&missing)
-                        .collect::<BTreeSet<_>>()
-                        .len()
-                        <= crate::jobs::ROUND_MAX;
+                    let joining: usize = missing.iter().filter(|t| !evaluate.contains(t)).count();
+                    let fits = evaluate.len() + joining <= crate::jobs::ROUND_MAX;
                     if evaluate.is_empty() || fits {
                         evaluate.extend(missing);
                     } else {

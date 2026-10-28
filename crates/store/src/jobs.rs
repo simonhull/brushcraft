@@ -139,9 +139,9 @@ pub(crate) struct Finished {
 #[derive(Debug)]
 pub(crate) enum Outcome {
     /// The tile, built.
-    Built(Box<DisplayTile>),
+    Built(Box<DecodedTile>),
     /// The tile, decoded from its record.
-    Decoded(Box<DisplayTile>),
+    Decoded(Box<DecodedTile>),
     /// The tile's record (to decode) doesn't read: build it.
     Unreadable,
     /// It won't build from its inputs.
@@ -316,7 +316,33 @@ pub(crate) type FinestCopies = TileCache<FinestTile>;
 /// for many refreshes, not once each: a correction change doesn't touch a record, only a build
 /// replaces one. [`CacheCaps::decoded`] of them, emptied when a call to
 /// [`TileStore::run_jobs`](crate::TileStore::run_jobs) finds nothing to do.
-pub(crate) type DecodedTiles = TileCache<(u64, Arc<DisplayTile>)>;
+pub(crate) type DecodedTiles = TileCache<(u64, Arc<DecodedTile>)>;
+
+/// A display tile as the jobs read it back: the tile, and its mean normals.
+///
+/// The means (unnormalized, roughness folded in) are what the tiles above it mip, worked out
+/// once on the worker that made it rather than for every tile reading it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DecodedTile {
+    /// The tile.
+    pub(crate) tile: DisplayTile,
+    /// Its mean normals ([`DisplayTile::means`]), row-major.
+    pub(crate) means: Vec<Vec3>,
+}
+
+impl DecodedTile {
+    /// `tile`, with its means worked out.
+    pub(crate) fn new(tile: DisplayTile) -> Self {
+        let means = tile.means();
+        Self { tile, means }
+    }
+}
+
+impl std::borrow::Borrow<DisplayTile> for DecodedTile {
+    fn borrow(&self) -> &DisplayTile {
+        &self.tile
+    }
+}
 
 /// How many entries each of the display layer's caches holds, from the bytes the store's budget
 /// sets aside for them

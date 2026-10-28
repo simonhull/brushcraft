@@ -641,7 +641,7 @@ fn a_decode_finished_after_its_record_was_replaced_is_dropped() {
         let kept = store.display_decoded.tiles.get(tile.key());
         assert!(
             kept.is_none_or(|(generation, kept)| {
-                *generation == store.display_generation(tile.key()) && **kept == *tile
+                *generation == store.display_generation(tile.key()) && kept.tile == *tile
             }),
             "{:?}: never the decode of the record it replaced",
             tile.key()
