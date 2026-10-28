@@ -109,7 +109,7 @@ impl TileStore {
     }
 
     /// `key`'s evaluated slot if its positions are current, found without counting as a use.
-    fn fresh_slot(&self, key: &TileKey) -> Option<SlotId<EvaluatedSlot>> {
+    pub(super) fn fresh_slot(&self, key: &TileKey) -> Option<SlotId<EvaluatedSlot>> {
         (self.evaluated.freshness(key)? == Freshness::Fresh)
             .then(|| self.evaluated.find(key))
             .flatten()

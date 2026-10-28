@@ -47,6 +47,7 @@ mod invalidate;
 mod layered;
 mod prefetch;
 mod recovery;
+mod ring;
 mod rounds_kept;
 mod stale;
 mod upkeep;

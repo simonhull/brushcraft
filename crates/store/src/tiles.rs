@@ -148,6 +148,7 @@ mod persist;
 mod pins;
 mod read;
 mod read_ahead;
+mod ring;
 mod round;
 mod stream;
 mod upkeep;
