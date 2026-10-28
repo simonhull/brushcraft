@@ -27,7 +27,7 @@ pub(crate) const WAKE_MARGIN: Duration = Duration::from_micros(500);
 /// The most spare finest copies a job keeps to copy into again (about 100 KB each at level 9).
 const SPARE_COPIES: usize = 32;
 
-/// The most tiles a round of evaluation for a job holds (see [`Upkeep::round_size`]).
+/// The most tiles a round of evaluation for a job holds (see [`ConeSteps::round_size`]).
 pub(crate) const ROUND_MAX: usize = 8;
 
 /// About how long a round of evaluation for a job should take: well under a slice's
@@ -174,15 +174,65 @@ pub(crate) struct Upkeep {
     /// Copies no worker holds any more, kept to copy into again: a fresh allocation of a
     /// tile's size costs its page faults, several times the copy.
     spare: Vec<FinestTile>,
-    /// The finest tiles being evaluated a step at a time, with their normals' cone (see
-    /// `TileStore::evaluate_for`), listed once for every step.
+    /// The finest tiles the display tiles read, evaluated a step at a time (see
+    /// `TileStore::evaluate_for`).
+    pub(crate) steps: ConeSteps,
+}
+
+/// Finest tiles a job evaluates a step at a time, a round of their cone a slice (see
+/// `TileStore::step_cone`), and what a round has taken lately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConeSteps {
+    /// The finest tiles being evaluated, with their normals' cone, listed once for every step.
     pub(crate) cone: Option<Cone>,
     /// The tiles the steps of that cone have evaluated so far: one asked for again was
     /// evicted since.
-    pub(crate) cone_seen: BTreeSet<TileKey>,
+    pub(crate) seen: BTreeSet<TileKey>,
     /// What evaluating one tile has taken lately, wall time over the tiles of a round (a
     /// moving average): how many a slice's round holds.
     tile_cost: Duration,
+}
+
+impl Default for ConeSteps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConeSteps {
+    /// No cone yet, evaluating a tile assumed to take [`TILE_COST`].
+    pub(crate) const fn new() -> Self {
+        Self {
+            cone: None,
+            seen: BTreeSet::new(),
+            tile_cost: TILE_COST,
+        }
+    }
+
+    /// Forgets the cone being stepped through: the next step lists one anew.
+    pub(crate) fn reset(&mut self) {
+        self.cone = None;
+        self.seen.clear();
+    }
+
+    /// How many tiles the next round of evaluation holds, with `free` workers not building
+    /// display tiles: as many as [`ROUND_TIME`] fits at the cost measured lately, at least one,
+    /// at most one a free worker and [`ROUND_MAX`].
+    pub(crate) fn round_size(&self, free: usize) -> usize {
+        let fits = ROUND_TIME.as_nanos() / self.tile_cost.as_nanos().max(1);
+        usize::try_from(fits)
+            .unwrap_or(usize::MAX)
+            .min(free)
+            .clamp(1, ROUND_MAX)
+    }
+
+    /// Notes that a round of `tiles` tiles took `wall`, for [`ConeSteps::round_size`].
+    pub(crate) fn took(&mut self, wall: Duration, tiles: usize) {
+        let Some(each) = u32::try_from(tiles.max(1)).ok().map(|n| wall / n) else {
+            return;
+        };
+        self.tile_cost = (self.tile_cost * 3 + each) / 4;
+    }
 }
 
 /// Finest tiles a job evaluates a step at a time, with the cone their normals read.
@@ -421,9 +471,7 @@ impl Upkeep {
             received: Vec::new(),
             copies: FinestCopies::new(copies),
             spare: Vec::new(),
-            cone: None,
-            cone_seen: BTreeSet::new(),
-            tile_cost: TILE_COST,
+            steps: ConeSteps::new(),
         }
     }
 
@@ -485,25 +533,6 @@ impl Upkeep {
         {
             self.spare.push(tile);
         }
-    }
-
-    /// How many tiles the next round of evaluation holds, with `free` workers not building
-    /// display tiles: as many as [`ROUND_TIME`] fits at the cost measured lately, at least one,
-    /// at most one a free worker and [`ROUND_MAX`].
-    pub(crate) fn round_size(&self, free: usize) -> usize {
-        let fits = ROUND_TIME.as_nanos() / self.tile_cost.as_nanos().max(1);
-        usize::try_from(fits)
-            .unwrap_or(usize::MAX)
-            .min(free)
-            .clamp(1, ROUND_MAX)
-    }
-
-    /// Notes that a round of `tiles` tiles took `wall`, for [`Upkeep::round_size`].
-    pub(crate) fn took(&mut self, wall: Duration, tiles: usize) {
-        let Some(each) = u32::try_from(tiles.max(1)).ok().map(|n| wall / n) else {
-            return;
-        };
-        self.tile_cost = (self.tile_cost * 3 + each) / 4;
     }
 
     /// Waits until a worker finishes a tile or `until`, keeping what arrives for the next

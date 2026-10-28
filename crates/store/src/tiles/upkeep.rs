@@ -35,7 +35,7 @@ use crate::bounds::Kept;
 use crate::display::{DisplayRecord, StoredDisplay, tent_reads};
 use crate::file::{FileError, FileReader, Loc, display_record, unknown_display_len};
 use crate::jobs::{
-    Cone, DecodedTile, FinestTile, Finished, Job, JobsReport, Outcome, Progress, Upkeep,
+    Cone, ConeSteps, DecodedTile, FinestTile, Finished, Job, JobsReport, Outcome, Progress, Upkeep,
 };
 
 /// How many pending tiles a slice looks at per tile it can hand out: it skips known, failed
@@ -371,6 +371,18 @@ enum Readiness {
     Needs(Vec<TileKey>),
 }
 
+/// What one step through a cone of finest tiles did (see [`TileStore::step_cone`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ConeStep {
+    /// It evaluated a round of tiles of the cone.
+    Round,
+    /// It waits for the corrections it prefetched.
+    Reading,
+    /// The cone is current (or is to be evaluated whole): these finest tiles' normals are left
+    /// to compute.
+    Current(Vec<TileKey>),
+}
+
 /// What one step of evaluating finest tiles for a job did (see [`TileStore::evaluate_for`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -676,7 +688,7 @@ impl TileStore {
         if evaluated {
             // The evaluation runs on the workers not building display tiles (one, at least).
             let free = workers.saturating_sub(upkeep.busy()).max(1);
-            let round = upkeep.round_size(free);
+            let round = upkeep.steps.round_size(free);
             let evaluate: BTreeSet<TileKey> = evaluate.into_iter().take(round).collect();
             match self.evaluate_for(upkeep, &evaluate, round)? {
                 Step::Evaluated(n) => report.evaluated += n,
@@ -1024,17 +1036,8 @@ impl TileStore {
     }
 
     /// Evaluates the finest tiles of `evaluate` (with their normals, on the workers) a step at a
-    /// time, and copies them for the workers building the display tiles that read them.
-    ///
-    /// A step evaluates at most `round` tiles of the coarsest level of their cone (the positions
-    /// their normals read, and the tiles those are predicted from) that isn't current, so one
-    /// slice runs one round of evaluation however cold the cone. The corrections of that level
-    /// are prefetched first, and only tiles whose corrections are resident (or that have none)
-    /// are evaluated, so a slice never waits on the disk; with none ready and reads in flight,
-    /// it waits for them ([`Step::Reading`]). Once the whole cone is current, it computes their
-    /// normals. A step that would evaluate a tile an earlier step of this cone already did (a
-    /// budget too small to keep the cone cached between slices) evaluates them whole instead,
-    /// so the work always ends.
+    /// time (see [`TileStore::step_cone`]), and copies them for the workers building the display
+    /// tiles that read them.
     ///
     /// # Errors
     ///
@@ -1045,69 +1048,15 @@ impl TileStore {
         evaluate: &BTreeSet<TileKey>,
         round: usize,
     ) -> Result<Step, CacheError> {
-        // The tiles a cone is being stepped through for stay the ones evaluated until it is
-        // done, so a step never starts over.
-        let keys: Vec<TileKey> = match &upkeep.cone {
-            Some(cone) if cone.as_of == self.edits => cone.keys.clone(),
-            _ => {
-                let keys: Vec<TileKey> = evaluate.iter().copied().collect();
-                let levels = self.normals_cone(&keys)?;
-                upkeep.cone = Some(Cone {
-                    keys: keys.clone(),
-                    levels,
-                    as_of: self.edits,
-                });
-                upkeep.cone_seen.clear();
-                keys
-            }
+        let listed = || evaluate.iter().copied().collect();
+        let keys = match self.step_cone(&mut upkeep.steps, listed, round)? {
+            ConeStep::Round => return Ok(Step::Cone),
+            ConeStep::Reading => return Ok(Step::Reading),
+            ConeStep::Current(keys) => keys,
         };
-        let mut coarsest = None;
-        if let Some(Cone { levels: cone, .. }) = &upkeep.cone {
-            for level in cone {
-                let stale: Vec<TileKey> = level
-                    .iter()
-                    .copied()
-                    .filter(|key| !self.is_current(key))
-                    .collect();
-                if !stale.is_empty() {
-                    coarsest = Some(stale);
-                    break;
-                }
-            }
-        }
-        if let Some(stale) = coarsest
-            && !stale.iter().any(|key| upkeep.cone_seen.contains(key))
-        {
-            self.prefetch(
-                stale
-                    .get(..stale.len().min(PREFETCH_AHEAD))
-                    .unwrap_or_default(),
-            )?;
-            self.poll()?;
-            let mut ready: Vec<TileKey> = stale
-                .iter()
-                .filter(|key| self.corrections.find(key).is_some() || self.locate(key).is_none())
-                .take(round.max(1))
-                .copied()
-                .collect();
-            if ready.is_empty() {
-                if self.prefetching() > 0 {
-                    return Ok(Step::Reading);
-                }
-                // The reads landed and weren't kept (no room for them): read one here.
-                ready.extend(stale.first());
-            }
-            let t0 = Instant::now();
-            self.evaluate_many(&ready, Evaluation::Positions)?;
-            upkeep.took(t0.elapsed(), ready.len());
-            upkeep.cone_seen.extend(ready);
-            return Ok(Step::Cone);
-        }
-        upkeep.cone = None;
-        upkeep.cone_seen.clear();
         let t0 = Instant::now();
         self.evaluate_many(&keys, Evaluation::Normals)?;
-        upkeep.took(t0.elapsed(), keys.len());
+        upkeep.steps.took(t0.elapsed(), keys.len());
         // Copied now, while cached: a later batch may evict them before their tiles are handed
         // out.
         for tile in &keys {
@@ -1125,6 +1074,92 @@ impl TileStore {
             }
         }
         Ok(Step::Evaluated(keys.len()))
+    }
+
+    /// One step of evaluating finest tiles for a job, through the cone `steps` holds.
+    ///
+    /// The cone is of the finest tiles `keys` gives, listed when `steps` holds none or a
+    /// correction change since it was listed outdated it: the positions their normals read,
+    /// then the tiles those are predicted from, level by level. A step evaluates at most `round`
+    /// tiles of the coarsest level of it that isn't current, so one slice runs one round of
+    /// evaluation however cold the cone. The corrections of that level are prefetched first, and
+    /// only tiles whose corrections are resident (or that have none) are evaluated, so a slice
+    /// never waits on the disk; with none ready and reads in flight, it waits for them
+    /// ([`ConeStep::Reading`]). Once the whole cone is current, it hands the finest tiles back
+    /// ([`ConeStep::Current`]) and forgets the cone, for the caller to compute their normals. A
+    /// step that would evaluate a tile an earlier step of this cone already did (a budget too
+    /// small to keep the cone cached between slices) hands them back too, to be evaluated
+    /// whole, so the work always ends.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`] and [`TileStore::prefetch`].
+    pub(super) fn step_cone(
+        &mut self,
+        steps: &mut ConeSteps,
+        keys: impl FnOnce() -> Vec<TileKey>,
+        round: usize,
+    ) -> Result<ConeStep, CacheError> {
+        // The tiles a cone is being stepped through for stay the ones evaluated until it is
+        // done, so a step never starts over.
+        let keys: Vec<TileKey> = match &steps.cone {
+            Some(cone) if cone.as_of == self.edits => cone.keys.clone(),
+            _ => {
+                let keys = keys();
+                let levels = self.normals_cone(&keys)?;
+                steps.cone = Some(Cone {
+                    keys: keys.clone(),
+                    levels,
+                    as_of: self.edits,
+                });
+                steps.seen.clear();
+                keys
+            }
+        };
+        let mut coarsest = None;
+        if let Some(Cone { levels: cone, .. }) = &steps.cone {
+            for level in cone {
+                let stale: Vec<TileKey> = level
+                    .iter()
+                    .copied()
+                    .filter(|key| !self.is_current(key))
+                    .collect();
+                if !stale.is_empty() {
+                    coarsest = Some(stale);
+                    break;
+                }
+            }
+        }
+        if let Some(stale) = coarsest
+            && !stale.iter().any(|key| steps.seen.contains(key))
+        {
+            self.prefetch(
+                stale
+                    .get(..stale.len().min(PREFETCH_AHEAD))
+                    .unwrap_or_default(),
+            )?;
+            self.poll()?;
+            let mut ready: Vec<TileKey> = stale
+                .iter()
+                .filter(|key| self.corrections.find(key).is_some() || self.locate(key).is_none())
+                .take(round.max(1))
+                .copied()
+                .collect();
+            if ready.is_empty() {
+                if self.prefetching() > 0 {
+                    return Ok(ConeStep::Reading);
+                }
+                // The reads landed and weren't kept (no room for them): read one here.
+                ready.extend(stale.first());
+            }
+            let t0 = Instant::now();
+            self.evaluate_many(&ready, Evaluation::Positions)?;
+            steps.took(t0.elapsed(), ready.len());
+            steps.seen.extend(ready);
+            return Ok(ConeStep::Round);
+        }
+        steps.reset();
+        Ok(ConeStep::Current(keys))
     }
 
     /// Why display tile `key` wouldn't build, if it failed since the last correction change.
