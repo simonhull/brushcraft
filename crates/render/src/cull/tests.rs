@@ -14,6 +14,8 @@ use crate::residency::Slot;
 use crate::tree::{NODE_FINEST, Place, TileTree};
 use crate::upload::GpuVertex;
 
+mod truth;
+
 /// A small deterministic generator (splitmix64).
 pub(crate) struct Rng(pub(crate) u64);
 

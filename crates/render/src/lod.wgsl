@@ -711,8 +711,9 @@ fn occluded(v: View, center: vec3<f32>, radius: f32) -> bool {
     var lo = vec2<f32>(3.4e38);
     var hi = vec2<f32>(-3.4e38);
     var nearest = 0.0;
+    let q = center - v.eye.xyz;
     for (var k = 0u; k < 8u; k++) {
-        let corner = center + vec3<f32>(
+        let corner = q + vec3<f32>(
             select(-radius, radius, (k & 1u) != 0u),
             select(-radius, radius, (k & 2u) != 0u),
             select(-radius, radius, (k & 4u) != 0u),
@@ -729,11 +730,12 @@ fn occluded(v: View, center: vec3<f32>, radius: f32) -> bool {
     if nearest >= 1.0 {
         return false;
     }
+    // The rectangle, dilated by a pixel against rounding in the projection.
     let size = v.viewport.xy;
-    let x0 = (lo.x * 0.5 + 0.5) * size.x;
-    let x1 = (hi.x * 0.5 + 0.5) * size.x;
-    let y0 = (0.5 - hi.y * 0.5) * size.y;
-    let y1 = (0.5 - lo.y * 0.5) * size.y;
+    let x0 = (lo.x * 0.5 + 0.5) * size.x - 1.0;
+    let x1 = (hi.x * 0.5 + 0.5) * size.x + 1.0;
+    let y0 = (0.5 - hi.y * 0.5) * size.y - 1.0;
+    let y1 = (0.5 - lo.y * 0.5) * size.y + 1.0;
     if x1 < 0.0 || y1 < 0.0 || x0 >= size.x || y0 >= size.y {
         return false;
     }

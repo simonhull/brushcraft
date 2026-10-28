@@ -124,9 +124,15 @@ pub(crate) fn bounds_of(vertices: &[GpuVertex], side: usize) -> GpuBounds {
 
 /// `cull.wgsl`'s `in_frustum`.
 pub(crate) fn in_frustum(view: &GpuView, center: [f32; 3], radius: f32) -> bool {
+    let q = relative(view, center);
     view.planes
         .iter()
-        .all(|&[a, b, c, d]| dot([a, b, c], center) + d >= -radius)
+        .all(|&[a, b, c, d]| dot([a, b, c], q) + d >= -radius)
+}
+
+/// `center - eye`, as the GPU forms it.
+pub(crate) fn relative(view: &GpuView, center: [f32; 3]) -> [f32; 3] {
+    sub(center, [view.eye[0], view.eye[1], view.eye[2]])
 }
 
 /// `cull.wgsl`'s `backfacing`.
@@ -147,10 +153,13 @@ pub(crate) fn backfacing(bounds: &GpuBounds, eye: [f32; 3], margin: f32) -> bool
 }
 
 /// `cull.wgsl`'s `projected`.
-pub(crate) fn projected(view: &GpuView, bounds: &GpuBounds, margin: f32, length: f32) -> f32 {
-    let eye = [view.eye[0], view.eye[1], view.eye[2]];
-    let d = (distance(bounds.center, eye) - bounds.radius - margin).max(view.viewport[3]);
-    length * view.viewport[2] / d
+pub(crate) fn projected(view: &GpuView, bounds: &GpuBounds, margin: f32, extent: f32) -> f32 {
+    let q = relative(view, bounds.center);
+    let r = bounds.radius + margin;
+    let near = view.planes[4];
+    let z = (dot([near[0], near[1], near[2]], q) - r).max(view.viewport[3]);
+    let d = dot(q, q).sqrt() + r;
+    extent * view.viewport[2] * d / (z * z)
 }
 
 /// A depth pyramid on the CPU: per mip, its width, height and texels, row by row.
@@ -206,13 +215,10 @@ pub(crate) fn occluded(
     let mut hi = [f32::MIN; 2];
     let mut nearest = 0.0_f32;
     let columns = view.view_proj;
+    let q = relative(view, center);
     for corner in 0..8 {
         let offset = |bit: u32| if corner & bit != 0 { radius } else { -radius };
-        let point = [
-            center[0] + offset(1),
-            center[1] + offset(2),
-            center[2] + offset(4),
-        ];
+        let point = [q[0] + offset(1), q[1] + offset(2), q[2] + offset(4)];
         let clip: [f32; 4] = [0, 1, 2, 3].map(|row| {
             columns[0][row] * point[0]
                 + columns[1][row] * point[1]
@@ -231,10 +237,10 @@ pub(crate) fn occluded(
         return false;
     }
     let (sx, sy) = (view.viewport[0], view.viewport[1]);
-    let x0 = (lo[0] * 0.5 + 0.5) * sx;
-    let x1 = (hi[0] * 0.5 + 0.5) * sx;
-    let y0 = (0.5 - hi[1] * 0.5) * sy;
-    let y1 = (0.5 - lo[1] * 0.5) * sy;
+    let x0 = (lo[0] * 0.5 + 0.5) * sx - 1.0;
+    let x1 = (hi[0] * 0.5 + 0.5) * sx + 1.0;
+    let y0 = (0.5 - hi[1] * 0.5) * sy - 1.0;
+    let y1 = (0.5 - lo[1] * 0.5) * sy + 1.0;
     if x1 < 0.0 || y1 < 0.0 || x0 >= sx || y0 >= sy {
         return false;
     }

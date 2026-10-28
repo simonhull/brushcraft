@@ -2,14 +2,16 @@
 //
 // Declarations and functions only, no bindings: included ahead of the passes that use them
 // (the bounds pass, the level choice). Every test here is conservative: it culls only what is
-// certainly outside the view or facing away, and its CPU twin in cull.rs decides the same.
+// certainly outside the view or facing away, and its CPU twin in cull/reference.rs decides
+// the same. Points enter relative to the eye (p - eye), as View holds them.
 
 // A tile's bounds (render::cull::GpuBounds): 48 bytes, computed by the bounds pass when the
 // tile's data arrives or changes.
 struct TileBounds {
     // The centre of a sphere holding every vertex the tile draws, world units.
     center: vec3<f32>,
-    // Its radius; negative while the bounds aren't computed (nothing is culled then).
+    // Its radius; negative while the bounds aren't computed: such a tile is drawn, never
+    // culled, and never refined (it has no screen error).
     radius: f32,
     // The normal cone's axis, unit length: every triangle's normal is within the cone's
     // half-angle of it. Zero when the tile has no cone.
@@ -27,12 +29,13 @@ struct TileBounds {
     reserved2: u32,
 }
 
-// A view (render::camera::GpuView): 192 bytes.
+// A view (render::camera::GpuView): 192 bytes, relative to the eye.
 struct View {
-    // World to clip coordinates: reversed Z, infinite far plane.
+    // Eye-relative positions (p - eye) to clip coordinates: reversed Z, infinite far plane.
     view_proj: mat4x4<f32>,
-    // The frustum's planes, (n, d) with dot(n, p) + d >= 0 inside, |n| = 1: left, right,
-    // bottom, top, near, and the far plane at infinity (0, 0, 0, 1).
+    // The frustum's planes, (n, d) with dot(n, p - eye) + d >= 0 inside, |n| = 1: left,
+    // right, bottom, top, near (n forward, d minus the near distance), and the far plane at
+    // infinity (0, 0, 0, 1).
     planes: array<vec4<f32>, 6>,
     // The eye, w = 1.
     eye: vec4<f32>,
@@ -48,13 +51,14 @@ fn outside(plane: vec4<f32>, center: vec3<f32>, radius: f32) -> bool {
 
 // Whether any of the sphere (center, radius) may be inside the view's frustum.
 fn in_frustum(view: View, center: vec3<f32>, radius: f32) -> bool {
+    let q = center - view.eye.xyz;
     // Unrolled: a value array can't be indexed by a loop counter.
-    return !(outside(view.planes[0], center, radius)
-        || outside(view.planes[1], center, radius)
-        || outside(view.planes[2], center, radius)
-        || outside(view.planes[3], center, radius)
-        || outside(view.planes[4], center, radius)
-        || outside(view.planes[5], center, radius));
+    return !(outside(view.planes[0], q, radius)
+        || outside(view.planes[1], q, radius)
+        || outside(view.planes[2], q, radius)
+        || outside(view.planes[3], q, radius)
+        || outside(view.planes[4], q, radius)
+        || outside(view.planes[5], q, radius));
 }
 
 // Whether every triangle of the tile faces away from `eye`: each normal within the cone and
@@ -77,9 +81,16 @@ fn backfacing(bounds: TileBounds, eye: vec3<f32>, margin: f32) -> bool {
     return cos_t * bounds.cone_cos - sin_t * sin_a > r / d;
 }
 
-// Pixels a length of `length` covers at its nearest, for a tile of these bounds grown by
-// `margin`: from the sphere's nearest point (never nearer than the near plane).
-fn projected(view: View, bounds: TileBounds, margin: f32, length: f32) -> f32 {
-    let d = max(distance(bounds.center, view.eye.xyz) - bounds.radius - margin, view.viewport.w);
-    return length * view.viewport.z / d;
+// The most pixels a length `extent` anywhere in the sphere of these bounds grown by `margin`
+// can cover, in any direction. A point at view depth z and distance d from the eye maps a
+// short segment of length l to at most l · f · d / z² pixels (f the pixels a length covers at
+// distance 1: the projection's Jacobian has largest singular value d / z²), which off the
+// axis is up to (d / z)² more than l · f / d. Over the sphere, d is at most |c - eye| + r and z
+// at least its nearest view depth (floored at the near plane), so this never underestimates.
+fn projected(view: View, bounds: TileBounds, margin: f32, extent: f32) -> f32 {
+    let q = bounds.center - view.eye.xyz;
+    let r = bounds.radius + margin;
+    let z = max(dot(view.planes[4].xyz, q) - r, view.viewport.w);
+    let d = length(q) + r;
+    return extent * view.viewport.z * d / (z * z);
 }

@@ -7,10 +7,14 @@
 //! - **Screen error.** A tile is refined while its `e` projects above 1 px or its longest quad edge
 //!   above 4 px, and once refined is coarsened only when both drop below 0.5 px and 2 px
 //!   (hysteresis: the memory of last frame's choice is kept per node, checked against the node's
-//!   tile so a reused node starts afresh). Projection is from the nearest point of the tile's
-//!   bounding sphere grown by `e` (the finest surface lies within `e` of what the tile draws), so
-//!   the error is never underestimated. A tile out of view (frustum, or the normal cone facing
-//!   away, both with the sphere grown by `e`) isn't refined.
+//!   tile so a reused node starts afresh). A length's pixels are bounded over the tile's bounding
+//!   sphere grown by `e` (the finest surface lies within `e` of what the tile draws): `l · f · d /
+//!   z²` with `d` the sphere's farthest distance from the eye and `z` its nearest view depth,
+//!   floored at the near plane, which bounds the projection's stretch in any direction and anywhere
+//!   in the image (off the axis it is up to `(d / z)²` more than `l · f / d`), so the error is
+//!   never underestimated (checked against measured segments, `cull/tests/truth.rs`). A tile out of
+//!   view (frustum, or the normal cone facing away, both with the sphere grown by `e`) isn't
+//!   refined.
 //! - **Completeness.** A tile is refined only when all its children are resident, so the cut covers
 //!   every face exactly once; tiles under a missing one are unreachable and ignored. The pinned
 //!   floor means level 0 is always there.
@@ -40,9 +44,13 @@
 //!   [`LodOutput::frame_use`] is the [`FrameUse`] residency takes. **Latency:** the readback is
 //!   copied at the end of frame `F` and mapped when the GPU finishes it, so [`Lod::collect`] has it
 //!   at the start of frame `F + 1` at best, `F + 2` when the GPU runs a frame behind; residency
-//!   then protects a cut a frame or two old. That is safe: residency changes reach the tree in the
-//!   same submission as the tile data they point at, and the level choice of that frame sees the
-//!   tree as it is, so a tile it uses is never one already gone.
+//!   then protects a cut a frame or two old, with every ancestor of it (the refined set). What that
+//!   covers: the GPU never reads a slot that was freed, since residency changes reach the tree in
+//!   the same submission as the tile data they point at and each frame's level choice sees the tree
+//!   as it is; and the cut never has a hole, since a tile whose ancestor left is unreachable and
+//!   its ancestor's ancestor is drawn instead (the floor is never evicted). What it doesn't: a tile
+//!   the GPU started using in the last frame or two isn't protected yet, so under budget pressure
+//!   it can be evicted and drawn coarser for a frame, then requested again.
 //!
 //! # A frame
 //!

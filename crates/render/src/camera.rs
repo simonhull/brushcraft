@@ -495,6 +495,18 @@ impl View {
         -self.basis[2]
     }
 
+    /// The view's right, unit length.
+    #[must_use]
+    pub const fn right(&self) -> Vec3 {
+        self.basis[0]
+    }
+
+    /// The view's up, unit length.
+    #[must_use]
+    pub const fn up(&self) -> Vec3 {
+        self.basis[1]
+    }
+
     /// The viewport.
     #[must_use]
     pub const fn size(&self) -> Size {
@@ -552,9 +564,18 @@ impl View {
     )]
     pub fn gpu(&self) -> GpuView {
         let eye = self.eye;
+        // Relative to the eye: p - eye is formed in f32 on the GPU from two nearby f32 points,
+        // so a close view loses nothing to a large translation rounded into the matrix.
+        let mut relative = self.clip_from_world;
+        for row in &mut relative.rows {
+            row[3] += row[0] * eye.x + row[1] * eye.y + row[2] * eye.z;
+        }
+        let planes = self
+            .planes
+            .map(|[a, b, c, d]| [a, b, c, d + a * eye.x + b * eye.y + c * eye.z].map(|x| x as f32));
         GpuView {
-            view_proj: self.clip_from_world.columns_f32(),
-            planes: self.planes.map(|plane| plane.map(|c| c as f32)),
+            view_proj: relative.columns_f32(),
+            planes,
             eye: [eye.x as f32, eye.y as f32, eye.z as f32, 1.0],
             viewport: [
                 f64::from(self.size.width()) as f32,
@@ -567,12 +588,21 @@ impl View {
 }
 
 /// A [`View`] as the GPU reads it: 192 bytes, WGSL's `View` ([`crate::cull::CULL_WGSL`]).
+///
+/// Everything is **relative to the eye**: a point `p` goes in as `p - eye`, formed in `f32`
+/// from two nearby `f32` points, so a view close to the surface (down to
+/// [`Camera::MIN_DISTANCE`]) keeps the precision of the tile data itself rather than losing it
+/// to a world-space translation rounded into the matrix. The raster (Task 4) should transform
+/// vertices the same way.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct GpuView {
-    /// The view-projection, by columns.
+    /// The view-projection from eye-relative positions (`p - eye`) to clip coordinates, by
+    /// columns.
     pub view_proj: [[f32; 4]; 4],
-    /// The frustum's planes, as [`View::planes`].
+    /// The frustum's planes in eye-relative form: `n · (p - eye) + d ≥ 0` inside, in
+    /// [`View::planes`]' order. The near plane's normal is the view's forward direction, and
+    /// its `d` is minus the near distance.
     pub planes: [[f32; 4]; 6],
     /// The eye, `w` 1.
     pub eye: [f32; 4],
@@ -689,17 +719,33 @@ mod tests {
     }
 
     #[test]
-    fn the_gpu_view_holds_the_matrix_by_columns() {
+    fn the_gpu_view_holds_the_eye_relative_matrix_by_columns() {
         let view = Camera::default().view(size());
         let gpu = view.gpu();
         let p = Vec3::new(0.3, -0.2, 0.1);
         let clip = view.clip(p);
         let [c0, c1, c2, c3] = gpu.view_proj;
+        let q = p - view.eye();
         #[expect(clippy::cast_possible_truncation, reason = "comparing in f32")]
-        let pf = [p.x as f32, p.y as f32, p.z as f32];
+        let relative = [q.x as f32, q.y as f32, q.z as f32];
         for (row, expected) in clip.iter().enumerate() {
-            let got = c0[row] * pf[0] + c1[row] * pf[1] + c2[row] * pf[2] + c3[row];
+            let got =
+                c0[row] * relative[0] + c1[row] * relative[1] + c2[row] * relative[2] + c3[row];
             assert!((f64::from(got) - expected).abs() < 1e-5, "row {row}");
         }
+        let near = gpu.planes[4];
+        let forward = view.forward();
+        #[expect(clippy::cast_possible_truncation, reason = "comparing in f32")]
+        let forward = [forward.x as f32, forward.y as f32, forward.z as f32];
+        assert!(
+            (0..3).all(|k| (near[k] - forward[k]).abs() < 1e-6),
+            "the near plane faces forward"
+        );
+        #[expect(clippy::cast_possible_truncation, reason = "comparing in f32")]
+        let near_distance = view.near() as f32;
+        assert!(
+            (near[3] + near_distance).abs() < 1e-6,
+            "at the near distance"
+        );
     }
 }

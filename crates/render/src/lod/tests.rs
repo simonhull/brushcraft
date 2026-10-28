@@ -471,7 +471,7 @@ fn hysteresis_keeps_the_cut_still_for_a_camera_moving_back_and_forth_across_a_th
             let mut lod = Lod::new(gpu, tiles.tree.capacity(), config).expect("the level choice");
             let frames = (0..10).map(|frame| {
                 // Back and forth by 10 %: inside the factor of 2 between refining and coarsening.
-                let distance = if frame % 2 == 0 { 6.0 } else { 6.6 };
+                let distance = if frame % 2 == 0 { 12.0 } else { 13.2 };
                 let view = look(direction * distance, Vec3::default());
                 places(&run(gpu, &mut lod, tiles, &requests, &view, None, None))
             });
