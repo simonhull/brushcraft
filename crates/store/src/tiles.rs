@@ -270,9 +270,10 @@ impl StoreId {
 /// readers' memo: [`StoreConfig::display_cache_bytes`], a sixteenth of the budget at most, each
 /// cache holding a few dozen entries however small its share), and the display records
 /// waiting for the working file ([`StoreConfig::display_waiting_bytes`], a thirty-second of the
-/// budget at most, written through once past it; passed only while a recovery flush is between
-/// its cut and its save point, by what the store records meanwhile). Besides them, and not
-/// charged to the budget:
+/// budget, at most 64 MiB, written through down to half of it once past it; passed only by what
+/// the store records while it can't write them through: a recovery flush is between its cut and
+/// its save point, the working file is read-only or a failed recovery file, or a write through
+/// failed since the last flush). Besides them, and not charged to the budget:
 ///
 /// - the display tiles the workers are building or decoding, and the inputs handed to them: a slice
 ///   hands out a few at a time, at most one a worker in flight;
@@ -375,7 +376,7 @@ pub struct TileStore {
     /// The display book's count of changes when the refresh last looked for unknown tiles
     /// ([`TileStore::run_jobs`]): it looks again only once that moves.
     refresh_seen: u64,
-    /// How many times the store recorded built display tiles ([`TileStore::record_display`]).
+    /// How many times the store recorded built display tiles ([`TileStore::record_built`]).
     display_builds: u64,
     /// The generation of each display record built since the store opened: the value of
     /// `display_builds` that recorded it (see [`TileStore::display_generation`]).

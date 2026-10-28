@@ -196,9 +196,13 @@ impl StoreConfig {
     ///
     /// Charged to the budget as a reserved share, after the display caches, as much of it as
     /// the budget has left; with none left, every record is written through as it is recorded.
-    /// While a recovery flush is between its cut and its save point the records wait, as one
-    /// written then could be named by a save point holding an older state of its tiles, so the
-    /// share can be passed by what the store records meanwhile.
+    /// Once past it, the records are written through down to half of it, in one write.
+    ///
+    /// The share is passed by what the store records while it can't write them through, and
+    /// they wait in memory: while a recovery flush is between its cut and its save point (one
+    /// written then could be named by a save point holding an older state of its tiles), while
+    /// the working file is read-only or a recovery file whose writer failed, and after a write
+    /// through failed, until the next flush or save of the working file.
     #[must_use]
     pub const fn display_waiting_bytes(&self) -> usize {
         if self.display.is_none() {

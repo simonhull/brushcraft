@@ -42,18 +42,13 @@ use crate::meta::Role;
 use crate::stamp::Stamp;
 
 impl TileStore {
-    /// Records `tiles`, built from the store's current state, as the display tiles the store
-    /// keeps: they go to the working file with the next flush, and to the project file with its
-    /// next save.
-    ///
-    /// The writes since the last call are settled first, so the display tiles they made unknown
-    /// are replaced, not the other way round. Then the records waiting for the working file are
-    /// written through if they pass their share ([`TileStore::write_through_display`]).
+    /// [`TileStore::record_built`], then [`TileStore::write_through_display`], as a job's slice
+    /// records what the workers built: for tests that record a layer they built themselves.
     ///
     /// # Errors
     ///
     /// As [`TileStore::record_built`], and then nothing is recorded; as
-    /// [`TileStore::write_through_display`], and then the tiles are recorded, and wait in memory.
+    /// [`TileStore::write_through_display`], and then the tiles are recorded.
     #[cfg(test)]
     pub(crate) fn record_display<T: std::borrow::Borrow<DisplayTile>>(
         &mut self,
@@ -63,8 +58,13 @@ impl TileStore {
         self.write_through_display()
     }
 
-    /// [`TileStore::record_display`] but for the writing through: records `tiles`, after
-    /// settling the writes since the last call.
+    /// Records `tiles`, built from the store's current state, as the display tiles the store
+    /// keeps: they go to the working file with the next flush (or sooner, written through, see
+    /// [`TileStore::write_through_display`], which the caller runs next), and to the project
+    /// file with its next save.
+    ///
+    /// The writes since the last call are settled first, so the display tiles they made unknown
+    /// are replaced, not the other way round.
     ///
     /// # Errors
     ///
@@ -99,7 +99,7 @@ impl TileStore {
             .settle_and_record(&self.mesh, &self.deps, &records)?)
     }
 
-    /// The generation of `key`'s display record: the count of [`TileStore::record_display`]
+    /// The generation of `key`'s display record: the count of [`TileStore::record_built`]
     /// calls when it was last recorded, 0 for a record read from the files and never built
     /// since. A known record is only ever replaced by a build, so two decodes of a key at one
     /// generation give the same tile.
@@ -403,7 +403,7 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Eval`] as for [`TileStore::record_display`]; [`CacheError::WriteBack`] if
+    /// [`CacheError::Eval`] as for [`TileStore::record_built`]; [`CacheError::WriteBack`] if
     /// the append fails: the tiles stay unflushed.
     pub(super) fn flush_display(&mut self, lost: &[TileKey]) -> Result<(), CacheError> {
         self.display.settle(&self.mesh, &self.deps)?;
@@ -546,7 +546,7 @@ impl TileStore {
     ///
     /// # Errors
     ///
-    /// [`CacheError::Eval`] as for [`TileStore::record_display`]; [`CacheError::Save`] if a write
+    /// [`CacheError::Eval`] as for [`TileStore::record_built`]; [`CacheError::Save`] if a write
     /// to `project` fails.
     pub(super) fn save_display(
         &mut self,

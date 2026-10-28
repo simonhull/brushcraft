@@ -711,19 +711,19 @@ fn a_rebuild_holds_the_records_waiting_for_the_file_to_their_share() {
         let file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
         TileStore::open(file, roomy().with_display(level(TOP))).unwrap()
     };
-    let mut store = reopen();
-    assert_layer_current_or_unknown(&mut store, "saved straight after the edits");
-    assert!(store.has_jobs(), "the unknown tiles are refreshed");
-    store.hold_display_waiting_to(share);
-    run_all(&mut store);
+    let mut opened = reopen();
+    assert_layer_current_or_unknown(&mut opened, "saved straight after the edits");
+    assert!(opened.has_jobs(), "the unknown tiles are refreshed");
+    opened.hold_display_waiting_to(share);
+    run_all(&mut opened);
     assert!(
-        store.display_waiting().0 <= share,
+        opened.display_waiting().0 <= share,
         "the refresh holds to the share too"
     );
-    assert_layer_current(&mut store, "refreshed over written-through records");
-    let built = display_layer(&mut store);
-    store.save().unwrap();
-    drop(store);
+    assert_layer_current(&mut opened, "refreshed over written-through records");
+    let built = display_layer(&mut opened);
+    opened.save().unwrap();
+    drop(opened);
     let mut reopened = reopen();
     assert!(!reopened.has_jobs(), "nothing to rebuild");
     let keys: Vec<TileKey> = built.iter().map(|t| *t.key()).collect();
@@ -742,8 +742,8 @@ fn assert_layer_current_or_unknown(store: &mut TileStore, what: &str) {
     let keys: Vec<TileKey> = built.iter().map(|t| *t.key()).collect();
     let stored = store.stored_display(&keys).unwrap();
     let mut known = 0;
-    let kept = built.iter().zip(stored);
-    for (tile, kept) in kept {
+    let pairs = built.iter().zip(stored);
+    for (tile, kept) in pairs {
         if let Some(kept) = kept {
             assert_eq!(&kept, tile, "{what}: {:?} current or unknown", tile.key());
             known += 1;

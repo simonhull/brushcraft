@@ -252,8 +252,11 @@ pub(crate) trait Derived {
     const SPILLS: bool;
 
     /// The bytes of memory `value` holds, itself and what it owns: what a [`Book`] of a kind
-    /// that [spills](Derived::SPILLS) counts of the values waiting for the working file.
-    fn bytes(value: &Self::Value) -> usize;
+    /// that [spills](Derived::SPILLS) counts of the values waiting for the working file. By
+    /// default the value's own size, for a value that owns nothing.
+    fn bytes(_value: &Self::Value) -> usize {
+        size_of::<Self::Value>()
+    }
 
     /// Whether a write of `key`'s corrections can change a tile of a tracked level in `levels`.
     fn reaches(levels: &BTreeSet<Level>, key: &TileKey) -> bool;
@@ -280,10 +283,6 @@ impl Derived for Bounds {
     type Value = TileBounds;
 
     const SPILLS: bool = false;
-
-    fn bytes(_: &TileBounds) -> usize {
-        size_of::<TileBounds>()
-    }
 
     fn reaches(levels: &BTreeSet<Level>, key: &TileKey) -> bool {
         levels

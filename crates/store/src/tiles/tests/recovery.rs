@@ -1598,8 +1598,8 @@ fn a_layer_recorded_during_a_flush_is_not_named_by_its_save_point() {
         store.unsaved.contains_key(&key),
         "the tile whose copy failed to encode stays dirty"
     );
-    let layer = display_layer(&mut store);
-    store.record_display(&layer).unwrap();
+    let during = display_layer(&mut store);
+    store.record_display(&during).unwrap();
     settle(&mut writer, &mut store);
     assert_eq!(writer.take_skipped(), [key], "left out of the save point");
     let offset = writer.durable_save_point().unwrap();
