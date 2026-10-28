@@ -221,7 +221,8 @@ fn ring_vertices_are_the_same_bits_from_every_side_of_every_seam_and_base_vertex
                     }
                 }
             }
-            for (c, (ci, cj)) in [(0, 0), (q, 0), (q, q), (0, q)].into_iter().enumerate() {
+            let corners = [(0, 0), (q, 0), (q, q), (0, q)].into_iter().enumerate();
+            for (c, (ci, cj)) in corners {
                 let Some(ring) = block.corner(c) else {
                     continue;
                 };
@@ -283,7 +284,10 @@ fn normals_from_a_block_are_its_sources_normals_and_the_references() {
                 let region = Region::of_tile(&key);
                 let want = normals(mesh, &src, region).expect("normals");
                 let got = block.normals(mesh);
-                let bits = |v: &[Vec3]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+                let bits = |v: &[Vec3]| {
+                    let bits: Vec<[u32; 3]> = v.iter().map(|p| p.to_bits()).collect();
+                    bits
+                };
                 assert_eq!(
                     bits(got.as_slice()),
                     bits(want.as_slice()),
@@ -320,7 +324,10 @@ fn degenerate_and_non_finite_blocks_give_the_fallback_and_nan_alike() {
     let block = gather_block(&mesh, &Flat, region).expect("gathers");
     let got = block.normals(&mesh);
     let reference = ring_normals(&mesh, &block);
-    let bits = |v: &[Vec3]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+    let bits = |v: &[Vec3]| {
+        let bits: Vec<[u32; 3]> = v.iter().map(|p| p.to_bits()).collect();
+        bits
+    };
     assert_eq!(bits(got.as_slice()), bits(&reference), "the same bits");
     assert!(
         got.as_slice().iter().any(|n| n.x.is_nan()),
@@ -404,7 +411,8 @@ fn a_rings_owner_corner_is_the_owner_faces_corner() {
     for (key, block) in &blocks(&mesh, &dense, top) {
         let region = block.region();
         let q = region.quads();
-        for (c, (ci, cj)) in [(0, 0), (q, 0), (q, q), (0, q)].into_iter().enumerate() {
+        let corners = [(0, 0), (q, 0), (q, q), (0, q)].into_iter().enumerate();
+        for (c, (ci, cj)) in corners {
             let ring = block
                 .corner(c)
                 .expect("a whole face's corners are base vertices");
@@ -467,7 +475,10 @@ fn a_ring_point_that_isnt_finite_gives_nan_at_its_base_vertex() {
         got.get(0, 0).expect("a vertex").x.is_nan(),
         "NaN at the base vertex"
     );
-    let bits = |v: &[Vec3]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+    let bits = |v: &[Vec3]| {
+        let bits: Vec<[u32; 3]> = v.iter().map(|p| p.to_bits()).collect();
+        bits
+    };
     assert_eq!(
         bits(got.as_slice()),
         bits(&reference),

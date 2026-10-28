@@ -85,7 +85,8 @@ fn assert_seams_agree(
                 }
             }
         }
-        for (c, (ci, cj)) in [(0, 0), (q, 0), (q, q), (0, q)].into_iter().enumerate() {
+        let corners = [(0, 0), (q, 0), (q, q), (0, q)].into_iter().enumerate();
+        for (c, (ci, cj)) in corners {
             let Some(ring) = block.corner(c) else {
                 continue;
             };
@@ -123,8 +124,8 @@ fn assert_seams_agree(
 #[test]
 fn a_tile_with_its_ring_is_the_gather_of_the_dense_evaluation_and_agrees_across_seams() {
     let cube = mesh();
-    let prism = Arc::new(split_prism(5));
-    for (name, mesh, top) in [("cube", &cube, TOP), ("valence-5 prism", &prism, 6)] {
+    let prism = Arc::new(split_prism(7));
+    for (name, mesh, top) in [("cube", &cube, TOP), ("valence-7 prism", &prism, 6)] {
         let dir = TestDir::new();
         let (mut store, dense) = edited(&dir, mesh, roomy(), top);
         let keys = tiles(mesh, top, top);
@@ -165,8 +166,8 @@ fn a_tile_with_its_ring_is_the_gather_of_the_dense_evaluation_and_agrees_across_
 #[test]
 fn normals_computed_from_the_ring_are_the_stores_normals_bit_for_bit() {
     let cube = mesh();
-    let prism = Arc::new(split_prism(5));
-    for (name, mesh, top) in [("cube", &cube, TOP), ("valence-5 prism", &prism, 6)] {
+    let prism = Arc::new(split_prism(7));
+    for (name, mesh, top) in [("cube", &cube, TOP), ("valence-7 prism", &prism, 6)] {
         let dir = TestDir::new();
         let (mut store, _) = edited(&dir, mesh, roomy(), top);
         for key in tiles(mesh, 1, top) {
