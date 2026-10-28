@@ -816,6 +816,12 @@ impl Residency {
         self.entries.keys()
     }
 
+    /// The floor: every face's display tiles up to [`ResidencyConfig::floor_top`], pinned.
+    #[must_use]
+    pub const fn floor(&self) -> &BTreeSet<TileKey> {
+        &self.floor
+    }
+
     /// Whether every floor tile the source could give is resident: true after the first
     /// [`Residency::stage`].
     #[must_use]

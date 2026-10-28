@@ -1,10 +1,17 @@
 //! A frame drawn offscreen on lavapipe and read back: the clear colour, with the overlay over
 //! its corner.
 
+use std::convert::Infallible;
+
+use geom::{Level, TileKey, cube_sphere};
+use wgpu::PollType;
+
 use super::*;
 use crate::gpu::GpuTest;
 use crate::overlay::MARGIN;
+use crate::residency::{Residency, ResidencyConfig};
 use crate::surface::Offscreen;
+use crate::upload::{GpuVertex, TileSource};
 
 /// The clear colour the tests draw with, linear.
 const CLEAR: Color = Color {
@@ -48,7 +55,7 @@ fn draw(gpu: &Gpu, size: Size, overlay: Option<&TextImage>, scale: u32) -> (Draw
         overlay_scale: scale,
     };
     let drawn = renderer
-        .draw(gpu, &mut target, &inputs, || called = true)
+        .draw(gpu, &mut target, &inputs, None, || called = true)
         .expect("drawn");
     assert!(called, "before_present ran");
     let Target::Offscreen(offscreen) = &target else {
@@ -94,6 +101,106 @@ fn with_no_overlay_the_frame_is_the_clear_colour() {
         let (_, pixels) = draw(gpu, size, None, 1);
         let clear = [srgb(CLEAR.r), srgb(CLEAR.g), srgb(CLEAR.b), 255];
         assert!(pixels.iter().all(|&p| near(p, clear)), "every pixel");
+    });
+}
+
+/// A source whose every tile's vertices are at `(level, 0, 0)`, so a slot read back shows
+/// which tile it holds.
+struct ByLevel;
+
+impl TileSource for ByLevel {
+    type Error = Infallible;
+
+    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<f32>, Infallible> {
+        out.fill(Self::vertex(key));
+        Ok(Some(0.0))
+    }
+}
+
+impl ByLevel {
+    /// Every vertex it gives `key`.
+    fn vertex(key: TileKey) -> GpuVertex {
+        GpuVertex {
+            position: [f32::from(key.level().get()), 0.0, 0.0],
+            roughness: 1.0,
+            normal: [0.0, 0.0, 1.0],
+            reserved: 0,
+        }
+    }
+}
+
+/// Residency for a one-split cube sphere whose finest level is 7, and the first frame's
+/// uploads: its whole floor.
+fn floor_uploads(gpu: &Gpu) -> (Residency, FrameUploads) {
+    let mesh = cube_sphere(1).expect("a mesh");
+    let finest = Level::new(7).expect("a level");
+    let mut residency =
+        Residency::new(gpu, &mesh, finest, ResidencyConfig::default()).expect("residency");
+    residency.begin_frame(gpu).expect("a frame begins");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let uploads = residency
+        .stage(gpu, &mut ByLevel, deadline)
+        .expect("the floor is staged");
+    (residency, uploads)
+}
+
+/// Whether every floor tile's slot holds what [`ByLevel`] gave it, read back from the GPU, and
+/// no frame was lost.
+fn floor_arrived(gpu: &Gpu, residency: &mut Residency) -> bool {
+    gpu.device()
+        .poll(PollType::wait_indefinitely())
+        .expect("the GPU finishes");
+    residency.begin_frame(gpu).expect("the next frame begins");
+    if residency.stats().lost_frames != 0 {
+        return false;
+    }
+    residency.floor().iter().all(|key| {
+        let Some(slot) = residency.slot(key) else {
+            return false;
+        };
+        let buffer = &residency.slot_buffers(slot.class())[usize::from(slot.buffer())];
+        let vertices: Vec<GpuVertex> = gpu.read_buffer(buffer).expect("read back");
+        let first = (slot.index() * slot.class().vertices()) as usize;
+        vertices[first] == ByLevel::vertex(*key)
+    })
+}
+
+#[test]
+fn a_frames_uploads_go_in_its_submission_before_the_passes() {
+    GpuTest::run(|gpu| {
+        let (mut residency, uploads) = floor_uploads(gpu);
+        assert!(!uploads.is_empty(), "the floor is staged");
+        let size = Size::new(16, 16).expect("non-zero");
+        let mut target = Target::Offscreen(Offscreen::new(gpu, size).expect("target"));
+        let mut renderer = Renderer::new(gpu, target.format()).expect("renderer");
+        let inputs = FrameInputs {
+            size,
+            clear: CLEAR,
+            overlay: None,
+            overlay_scale: 1,
+        };
+        let drawn = renderer
+            .draw(gpu, &mut target, &inputs, Some(uploads), || {})
+            .expect("drawn");
+        assert_eq!(drawn.outcome, Outcome::Presented);
+        assert!(
+            floor_arrived(gpu, &mut residency),
+            "the floor is on the GPU"
+        );
+    });
+}
+
+#[test]
+fn a_frame_with_no_image_still_submits_its_uploads() {
+    GpuTest::run(|gpu| {
+        let (mut residency, uploads) = floor_uploads(gpu);
+        let times = DrawTimes::default();
+        let drawn = not_drawn(gpu, Some(uploads), Outcome::Retry, times).expect("submitted");
+        assert_eq!(drawn.outcome, Outcome::Retry);
+        assert!(
+            floor_arrived(gpu, &mut residency),
+            "the tiles arrive without an image to draw them in"
+        );
     });
 }
 
