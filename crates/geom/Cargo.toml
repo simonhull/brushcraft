@@ -17,10 +17,6 @@ test-fixtures = []
 # The stages of a prediction one at a time (`geom::stages`), for `benches/stages.rs` only. The
 # bench evaluates its parents with the dense evaluator, so it brings `test-fixtures`.
 bench-stages = ["test-fixtures"]
-# Turns on nothing: a block's evaluation inputs as plain data (`geom::gather_block`,
-# `geom::vertex_stencil`) were render's spike's only and are always built now (the store reads a
-# finest tile with its ring through them). Kept while render's `spike` feature still names it.
-eval-inputs = []
 # The display tile codecs that lost the encoding study (`geom::FixedPoint`, `geom::BaseOffsets`),
 # for `brushcraft-bench display-study` and the tests only, so release builds never compile them.
 display-study = []

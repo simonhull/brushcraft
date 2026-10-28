@@ -12,7 +12,7 @@ workspace = true
 [features]
 # M1a's spikes (src/spike): built and tested by the gate, left out of the shipped renderer. They
 # load rust-gpu's SPIR-V (wgpu's naga front end) and gather geom's evaluation inputs.
-spike = ["dep:brush", "geom/eval-inputs", "wgpu/spirv"]
+spike = ["dep:brush", "wgpu/spirv"]
 
 [dependencies]
 brush = { workspace = true, optional = true }
