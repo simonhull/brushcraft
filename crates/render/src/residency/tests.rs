@@ -559,6 +559,16 @@ fn assert_census(residency: &Residency) {
         free + residency.stats().resident as u64,
         "every slot is free or a resident tile's, once"
     );
+    let floor = residency
+        .entries
+        .values()
+        .filter(|entry| entry.floor)
+        .count();
+    assert_eq!(
+        residency.stats().floor,
+        floor,
+        "the count of resident floor tiles is kept as they come and go"
+    );
 }
 
 /// Checks that every tile the GPU holds shows the store's data, when no epoch is pending.

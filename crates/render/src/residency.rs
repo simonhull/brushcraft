@@ -639,6 +639,8 @@ pub struct Residency {
     recency: Vec<BTreeSet<(u64, TileKey)>>,
     /// The floor's tiles.
     floor: BTreeSet<TileKey>,
+    /// How many of them are resident: so a frame with the whole floor up skips scanning it.
+    floor_resident: usize,
     /// Tiles requested.
     wanted: BTreeMap<TileKey, Want>,
     /// Tiles the source had nothing for, until an epoch names them.
@@ -758,6 +760,7 @@ impl Residency {
             entries: BTreeMap::new(),
             recency: vec![BTreeSet::new(); CLASSES],
             floor,
+            floor_resident: 0,
             wanted: BTreeMap::new(),
             unavailable: BTreeSet::new(),
             groups: Vec::new(),
@@ -826,9 +829,11 @@ impl Residency {
     /// [`Residency::stage`].
     #[must_use]
     pub fn floor_ready(&self) -> bool {
-        self.floor
-            .iter()
-            .all(|key| self.entries.contains_key(key) || self.unavailable.contains(key))
+        self.floor_resident == self.floor.len()
+            || self
+                .floor
+                .iter()
+                .all(|key| self.entries.contains_key(key) || self.unavailable.contains(key))
     }
 
     /// Counts, as they stand.
@@ -836,7 +841,7 @@ impl Residency {
     pub fn stats(&self) -> ResidencyStats {
         ResidencyStats {
             resident: self.entries.len(),
-            floor: self.entries.values().filter(|entry| entry.floor).count(),
+            floor: self.floor_resident,
             allocated_bytes: self.pools.allocated(),
             wanted: self.wanted.len(),
             unavailable: self.unavailable.len(),
@@ -1228,6 +1233,11 @@ impl Residency {
     where
         S::Error: Into<ResidencyError>,
     {
+        // Nothing to look for while the whole floor is up, as it is but after a lost frame or a
+        // dropped tile: the scan is for those frames.
+        if self.floor_resident == self.floor.len() {
+            return Ok(());
+        }
         let missing: Vec<TileKey> = self
             .floor
             .iter()
@@ -1664,14 +1674,15 @@ impl Residency {
             flags |= NODE_FINEST;
         }
         self.tree.insert(Place::of(&key), slot, error, flags)?;
-        self.entries.insert(
-            key,
-            Entry {
-                slot,
-                last_drawn: self.frame,
-                floor,
-            },
-        );
+        let entry = Entry {
+            slot,
+            last_drawn: self.frame,
+            floor,
+        };
+        // Only a tile not resident arrives, so this counts each floor tile once.
+        if self.entries.insert(key, entry).is_none() && floor {
+            self.floor_resident += 1;
+        }
         if !floor && let Some(recency) = self.recency.get_mut(usize::from(slot.class.0)) {
             recency.insert((self.frame, key));
         }
@@ -1683,6 +1694,9 @@ impl Residency {
         let Some(entry) = self.entries.remove(key) else {
             return;
         };
+        if entry.floor {
+            self.floor_resident -= 1;
+        }
         if let Some(recency) = self.recency.get_mut(usize::from(entry.slot.class.0)) {
             recency.remove(&(entry.last_drawn, *key));
         }
