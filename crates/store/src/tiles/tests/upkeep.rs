@@ -695,8 +695,26 @@ fn a_rebuild_holds_the_records_waiting_for_the_file_to_their_share() {
         "records went to the working file before any save ({written})"
     );
     assert_layer_current(&mut store, "rebuilt, written through");
-    // Edits after: the written-through records they change are unknown, then refreshed.
-    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 3, 12));
+    // An edit after, inside one face: the written-through records it changes are unknown.
+    // Saved at once, before any refresh, the file holds each display tile current or unknown.
+    let edit = Edit {
+        face: FaceId::new(0),
+        level: level(TOP),
+        i: 100,
+        j: 90,
+        c: Vec3::new(0.01, -0.02, 0.03),
+    };
+    apply(&mut store, &mut map, &[edit]);
+    store.save().unwrap();
+    drop(store);
+    let reopen = || {
+        let file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+        TileStore::open(file, roomy().with_display(level(TOP))).unwrap()
+    };
+    let mut store = reopen();
+    assert_layer_current_or_unknown(&mut store, "saved straight after the edits");
+    assert!(store.has_jobs(), "the unknown tiles are refreshed");
+    store.hold_display_waiting_to(share);
     run_all(&mut store);
     assert!(
         store.display_waiting().0 <= share,
@@ -706,15 +724,32 @@ fn a_rebuild_holds_the_records_waiting_for_the_file_to_their_share() {
     let built = display_layer(&mut store);
     store.save().unwrap();
     drop(store);
-    let file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
-    let mut reopened = TileStore::open(file, roomy().with_display(level(TOP))).unwrap();
+    let mut reopened = reopen();
     assert!(!reopened.has_jobs(), "nothing to rebuild");
     let keys: Vec<TileKey> = built.iter().map(|t| *t.key()).collect();
     let stored = reopened.stored_display(&keys).unwrap();
-    for (tile, back) in built.iter().zip(stored) {
+    let saved = built.iter().zip(stored);
+    for (tile, back) in saved {
         let back = back.unwrap_or_else(|| panic!("{:?} saved", tile.key()));
         assert_eq!(&back, tile, "{:?} bit for bit", tile.key());
     }
+}
+
+/// Asserts that every display tile the store knows is the one its tiles build, bit for bit,
+/// and that it knows some.
+fn assert_layer_current_or_unknown(store: &mut TileStore, what: &str) {
+    let built = display_layer(store);
+    let keys: Vec<TileKey> = built.iter().map(|t| *t.key()).collect();
+    let stored = store.stored_display(&keys).unwrap();
+    let mut known = 0;
+    let kept = built.iter().zip(stored);
+    for (tile, kept) in kept {
+        if let Some(kept) = kept {
+            assert_eq!(&kept, tile, "{what}: {:?} current or unknown", tile.key());
+            known += 1;
+        }
+    }
+    assert!(known > 0, "{what}: some display tiles known");
 }
 
 /// The share of the budget the waiting display records are held to: a thirty-second, at most
