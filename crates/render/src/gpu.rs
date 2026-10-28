@@ -22,7 +22,7 @@ use wgpu::{
     COPY_BUFFER_ALIGNMENT, CommandEncoderDescriptor, ComputePipeline, ComputePipelineDescriptor,
     Device, DeviceDescriptor, DeviceType, ErrorFilter, Features, Instance, InstanceDescriptor,
     MapMode, MapRangeError, PollError, PollType, PowerPreference, Queue, RequestAdapterOptions,
-    RequestDeviceError, ShaderModuleDescriptor, ShaderSource,
+    RequestDeviceError, ShaderModuleDescriptor, ShaderSource, Surface,
 };
 
 #[cfg(test)]
@@ -206,7 +206,18 @@ impl Gpu {
     /// can't create the device.
     pub fn open(request: &AdapterRequest) -> Result<Self, GpuError> {
         let instance = instance();
-        let adapter = pollster::block_on(choose(&instance, request))?;
+        let adapter = pollster::block_on(choose(&instance, request, None))?;
+        Self::on_adapter(&adapter)
+    }
+
+    /// Creates the device and queue on `adapter`, blocking until they are ready: what
+    /// [`Gpu::open`] does once it has chosen, and what [`crate::surface`] does with the adapter
+    /// it chose for a window.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::RequestDevice`] if the adapter can't create the device.
+    pub(crate) fn on_adapter(adapter: &Adapter) -> Result<Self, GpuError> {
         let adapter_info = adapter.get_info();
         let descriptor = DeviceDescriptor {
             label: Some("brushcraft"),
@@ -541,20 +552,28 @@ pub fn adapters() -> Vec<Adapter> {
 
 /// The `wgpu` instance adapters are found through: every backend compiled in, with `wgpu`'s
 /// environment overrides (`WGPU_BACKEND`, `WGPU_DEBUG`, `WGPU_VALIDATION`) applied.
-fn instance() -> Instance {
+pub(crate) fn instance() -> Instance {
     Instance::new(InstanceDescriptor::new_without_display_handle_from_env())
 }
 
-/// The adapter `request` names, among those `instance` sees.
+/// The adapter `request` names, among those `instance` sees; given a `surface`, among those
+/// that can present to it.
 ///
 /// # Errors
 ///
 /// [`GpuError::NoAdapter`] if none matches.
-async fn choose(instance: &Instance, request: &AdapterRequest) -> Result<Adapter, GpuError> {
+pub(crate) async fn choose(
+    instance: &Instance,
+    request: &AdapterRequest,
+    surface: Option<&Surface<'_>>,
+) -> Result<Adapter, GpuError> {
+    let presents =
+        |adapter: &Adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface));
     let found = match request {
         AdapterRequest::Default => instance
             .request_adapter(&RequestAdapterOptions {
                 power_preference: PowerPreference::HighPerformance,
+                compatible_surface: surface,
                 ..RequestAdapterOptions::default()
             })
             .await
@@ -563,14 +582,16 @@ async fn choose(instance: &Instance, request: &AdapterRequest) -> Result<Adapter
             .enumerate_adapters(Backends::all())
             .await
             .into_iter()
-            .find(|adapter| adapter.get_info().device_type == DeviceType::Cpu),
+            .find(|adapter| adapter.get_info().device_type == DeviceType::Cpu && presents(adapter)),
         AdapterRequest::Named(name) => {
             let name = name.to_lowercase();
             instance
                 .enumerate_adapters(Backends::all())
                 .await
                 .into_iter()
-                .find(|adapter| adapter.get_info().name.to_lowercase().contains(&name))
+                .find(|adapter| {
+                    adapter.get_info().name.to_lowercase().contains(&name) && presents(adapter)
+                })
         }
     };
     match found {
