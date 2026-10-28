@@ -195,6 +195,49 @@ fn assert_holds(gpu_bounds: &GpuBounds, vertices: &[GpuVertex], side: usize) {
 }
 
 #[test]
+fn a_bounds_pass_that_fails_leaves_its_tiles_unknown_not_stale() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut tree = TileTree::new(gpu, &mesh, 8).expect("a tree");
+        let place = Place::of(&TileKey::display(FaceId::new(0), Level::ZERO, 0, 0).expect("a key"));
+        let class = SizeClass::of(Level::ZERO);
+        let node = tree
+            .insert(place, Slot::for_tests(class, 0), 0.0, 0)
+            .expect("inserted");
+        let mut pass = BoundsPass::new(gpu, 8).expect("the bounds pass");
+        let stale = GpuBounds {
+            radius: 1.0,
+            cone_cos: 0.5,
+            ..GpuBounds::UNKNOWN
+        };
+        pass.write(gpu, node, &[stale]);
+        let mut encoder = gpu
+            .device()
+            .create_command_encoder(&CommandEncoderDescriptor::default());
+        // No slot buffers at all: the tile's can't be found.
+        let failed = pass.encode(
+            gpu,
+            &mut encoder,
+            tree.buffer(),
+            &BoundsUpdate::since(&tree, 0),
+            &SlotBuffers::default(),
+            None,
+        );
+        assert!(
+            matches!(failed, Err(CullError::MissingSlotBuffer { .. })),
+            "{failed:?}"
+        );
+        gpu.queue().submit([encoder.finish()]);
+        let got: Vec<GpuBounds> = gpu.read_buffer(pass.buffer()).expect("read back");
+        assert_eq!(
+            got[usize::try_from(node).expect("small")],
+            GpuBounds::UNKNOWN,
+            "reset"
+        );
+    });
+}
+
+#[test]
 fn the_depth_pyramid_holds_the_farthest_depth_of_what_it_covers_at_every_mip() {
     GpuTest::run(|gpu| {
         let pass = PyramidPass::new(gpu).expect("the pyramid's passes");

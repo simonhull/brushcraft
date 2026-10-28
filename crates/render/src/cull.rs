@@ -46,6 +46,8 @@
 //! Shaders are WGSL: these passes share no source with the CPU code, so rust-gpu would buy
 //! nothing here (plan: "chosen per pass and recorded").
 
+use std::collections::BTreeMap;
+
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
@@ -195,8 +197,7 @@ impl BoundsUpdate {
     /// unsubmitted leaves its tiles to the next update), 0 for every resident tile.
     #[must_use]
     pub fn since(tree: &TileTree, generation: u64) -> Self {
-        let mut runs: std::collections::BTreeMap<(u8, u16), Vec<u32>> =
-            std::collections::BTreeMap::new();
+        let mut runs: BTreeMap<(u8, u16), Vec<u32>> = BTreeMap::new();
         for index in tree.changed_since(generation) {
             let slot = tree.gpu_node(index).slot;
             let class = u8::try_from(slot >> 29).unwrap_or(u8::MAX);
@@ -349,11 +350,38 @@ impl BoundsPass {
     /// slots in `slots`. The node list and runs are written through the queue, so encode this
     /// once per submission, after the frame's uploads and before the level choice.
     ///
+    /// A failure leaves no stale bounds: every tile of `update` is reset to
+    /// [`GpuBounds::UNKNOWN`] (drawn, never culled or refined) until a later update bounds it.
+    ///
     /// # Errors
     ///
     /// [`CullError::MissingSlotBuffer`] if a tile's slot buffer isn't in `slots` (nothing is
     /// encoded then); [`CullError::Gpu`] if a buffer or bind group can't be made.
     pub fn encode(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        tree: &Buffer,
+        update: &BoundsUpdate,
+        slots: &SlotBuffers,
+        timestamps: Option<ComputePassTimestampWrites<'_>>,
+    ) -> Result<(), CullError> {
+        let outcome = self.encode_runs(gpu, encoder, tree, update, slots, timestamps);
+        if outcome.is_err() {
+            let nodes = update.runs.iter().flat_map(|(_, nodes)| nodes);
+            for &node in nodes {
+                self.write(gpu, node, &[GpuBounds::UNKNOWN]);
+            }
+        }
+        outcome
+    }
+
+    /// [`BoundsPass::encode`] but for resetting the bounds on failure.
+    ///
+    /// # Errors
+    ///
+    /// As [`BoundsPass::encode`].
+    fn encode_runs(
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
@@ -372,7 +400,8 @@ impl BoundsPass {
                     buffer: *buffer,
                 });
             }
-            for chunk in nodes.chunks(usize::try_from(MAX_GROUPS).unwrap_or(usize::MAX)) {
+            let chunks = nodes.chunks(usize::try_from(MAX_GROUPS).unwrap_or(usize::MAX));
+            for chunk in chunks {
                 let first = u32::try_from(list.len()).unwrap_or(u32::MAX);
                 let count = u32::try_from(chunk.len()).unwrap_or(0);
                 list.extend_from_slice(chunk);
@@ -406,36 +435,39 @@ impl BoundsPass {
             }
         }
         queue.write_buffer(&self.runs, 0, &strided);
-        let groups = dispatches.iter().map(|(class, buffer, run)| {
-            let vertices = slots
-                .get(*class, *buffer)
-                .ok_or(CullError::MissingSlotBuffer {
-                    class: *class,
-                    buffer: *buffer,
+        let groups = dispatches
+            .iter()
+            .map(|(class, buffer, run)| -> Result<_, CullError> {
+                let vertices = slots
+                    .get(*class, *buffer)
+                    .ok_or(CullError::MissingSlotBuffer {
+                        class: *class,
+                        buffer: *buffer,
+                    })?;
+                let group = gpu.scoped("bounds bind group", || {
+                    gpu.device().create_bind_group(&BindGroupDescriptor {
+                        label: Some("bounds"),
+                        layout: &self.layout,
+                        entries: &[
+                            entry(0, tree),
+                            entry(1, &self.bounds),
+                            entry(2, vertices),
+                            entry(3, &self.nodes),
+                            BindGroupEntry {
+                                binding: 4,
+                                resource: BindingResource::Buffer(BufferBinding {
+                                    buffer: &self.runs,
+                                    offset: 0,
+                                    size: BufferSize::new(size_of::<GpuRun>() as u64),
+                                }),
+                            },
+                        ],
+                    })
                 })?;
-            let group = gpu.scoped("bounds bind group", || {
-                gpu.device().create_bind_group(&BindGroupDescriptor {
-                    label: Some("bounds"),
-                    layout: &self.layout,
-                    entries: &[
-                        entry(0, tree),
-                        entry(1, &self.bounds),
-                        entry(2, vertices),
-                        entry(3, &self.nodes),
-                        BindGroupEntry {
-                            binding: 4,
-                            resource: BindingResource::Buffer(BufferBinding {
-                                buffer: &self.runs,
-                                offset: 0,
-                                size: BufferSize::new(size_of::<GpuRun>() as u64),
-                            }),
-                        },
-                    ],
-                })
-            })?;
-            Ok::<_, CullError>((group, run.count))
-        });
-        let groups: Vec<(wgpu::BindGroup, u32)> = groups.collect::<Result<_, _>>()?;
+                Ok((group, run.count))
+            });
+        let groups: Result<Vec<(wgpu::BindGroup, u32)>, CullError> = groups.collect();
+        let groups = groups?;
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("bounds"),
             timestamp_writes: timestamps,
