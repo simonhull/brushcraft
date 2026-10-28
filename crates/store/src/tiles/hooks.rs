@@ -53,6 +53,12 @@ pub(super) struct TestHooks {
     /// A display tile that won't build, as one from extreme geometry wouldn't: for tests of a
     /// job skipping it.
     pub(super) unbuildable_display: Option<TileKey>,
+    /// Whether what the workers finish for a display job is held back, as if they were still
+    /// building it, until this is set back (then it arrives at the next slice, in order): for
+    /// tests of results that arrive after the store has changed under them.
+    pub(super) hold_finished: bool,
+    /// The results held back while [`TestHooks::hold_finished`] is set.
+    pub(super) held_finished: Vec<crate::jobs::Finished>,
     /// Whether [`TileStore::tile_border`](super::TileStore::tile_border) gives `None` for every
     /// tile, as it would for a tile holding a border vertex twice: for tests of the edits'
     /// fallback, which no valid mesh reaches.

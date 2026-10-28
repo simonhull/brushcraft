@@ -702,6 +702,16 @@ impl TileStore {
     ) -> Result<usize, CacheError> {
         let mut finished = std::mem::take(&mut upkeep.received);
         finished.extend(upkeep.receiver.try_iter());
+        #[cfg(test)]
+        {
+            // The tests' hold: what the workers finished waits, as if they were still at it,
+            // until it is let go.
+            if self.hooks.hold_finished {
+                self.hooks.held_finished.append(&mut finished);
+                return Ok(0);
+            }
+            finished.append(&mut self.hooks.held_finished);
+        }
         let count = finished.len();
         let mut built = Vec::new();
         let mut error = None;

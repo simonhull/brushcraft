@@ -515,3 +515,138 @@ fn the_display_caches_follow_the_budget_and_empty_when_idle() {
         "no layer, no caches"
     );
 }
+
+/// Runs the store's jobs in short calls until `done` holds of it; panics after a while.
+fn run_until(store: &mut TileStore, what: &str, done: impl Fn(&mut TileStore) -> bool) {
+    let began = Instant::now();
+    while !done(store) {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(2))
+            .unwrap();
+        assert!(began.elapsed() < Duration::from_secs(30), "{what}");
+    }
+}
+
+/// A display tile the workers built from inputs a write has since changed is built again, not
+/// recorded: its result is held back until after a write under it, then let go.
+#[test]
+fn a_build_finished_after_a_write_is_built_again() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let mut map = CorrectionMap::new();
+    let edits = random_edits(&mesh, TOP, 2, 81);
+    apply(&mut store, &mut map, &edits);
+    store.hooks.hold_finished = true;
+    run_until(&mut store, "a build is handed out", |store| {
+        store
+            .jobs
+            .front_mut()
+            .is_some_and(|job| !job.upkeep().in_flight.is_empty())
+            && !store.hooks.held_finished.is_empty()
+    });
+    // A vertex under the first tile held, moved while it is out: the tile it was built for
+    // has changed.
+    let held = store
+        .hooks
+        .held_finished
+        .iter()
+        .find(|done| !done.decode)
+        .map(|done| done.key)
+        .unwrap();
+    let region = Region::of_tile(&held);
+    let shift = TOP - held.level().get();
+    let centre = |v: u32| (v + region.quads() / 2) << shift;
+    apply(
+        &mut store,
+        &mut map,
+        &[Edit {
+            face: held.face(),
+            level: level(TOP),
+            i: centre(region.x0()),
+            j: centre(region.y0()),
+            c: Vec3::new(0.03, -0.02, 0.04),
+        }],
+    );
+    store.hooks.hold_finished = false;
+    run_all(&mut store);
+    assert_layer_current(&mut store, "built again after the write");
+}
+
+/// A finer display tile decoded from a record a build has since replaced is dropped.
+///
+/// The record's generation tells it, so the decode is never kept for the tiles above: it is held
+/// back until after the build, then let go.
+#[test]
+fn a_decode_finished_after_its_record_was_replaced_is_dropped() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut saving = display_store(&dir, &mesh);
+    run_all(&mut saving);
+    saving.save().unwrap();
+    drop(saving);
+    let file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let mut store = TileStore::open(file, roomy().with_display(level(TOP))).unwrap();
+    run_all(&mut store);
+    // A coarse tile unknown: its refresh decodes the finer tiles it reads from the file.
+    let coarse = TileKey::display(FaceId::new(0), level(TOP - 2), 0, 0).unwrap();
+    store.display.set(coarse, None);
+    store.hooks.hold_finished = true;
+    run_until(&mut store, "a decode is handed out", |store| {
+        store
+            .jobs
+            .front_mut()
+            .is_some_and(|job| !job.upkeep().decoding.is_empty())
+            && store.hooks.held_finished.iter().any(|done| done.decode)
+    });
+    let decoded: Vec<TileKey> = store
+        .hooks
+        .held_finished
+        .iter()
+        .filter(|done| done.decode)
+        .map(|done| done.key)
+        .collect();
+    // An edit under them, and their tiles built and recorded anew: other records, a newer
+    // generation.
+    let finer = decoded[0];
+    let region = Region::of_tile(&finer);
+    let shift = TOP - finer.level().get();
+    let (i, j) = ((region.x0() + 1) << shift, (region.y0() + 1) << shift);
+    let mut map = CorrectionMap::new();
+    apply(
+        &mut store,
+        &mut map,
+        &[Edit {
+            face: finer.face(),
+            level: level(TOP),
+            i,
+            j,
+            c: Vec3::new(0.02, -0.01, 0.03),
+        }],
+    );
+    let layer = display_layer(&mut store);
+    let rebuilt: Vec<DisplayTile> = layer
+        .iter()
+        .filter(|tile| decoded.contains(tile.key()))
+        .cloned()
+        .collect();
+    store.record_display(&rebuilt).unwrap();
+    store.hooks.hold_finished = false;
+    // The held decodes arrive at the next slice: each is of a replaced record, and dropped.
+    store
+        .run_jobs(Instant::now() + Duration::from_millis(2))
+        .unwrap();
+    for tile in &rebuilt {
+        let kept = store.display_decoded.tiles.get(tile.key());
+        assert!(
+            kept.is_none_or(|(generation, kept)| {
+                *generation == store.display_generation(tile.key()) && **kept == *tile
+            }),
+            "{:?}: never the decode of the record it replaced",
+            tile.key()
+        );
+    }
+    run_all(&mut store);
+    assert_layer_current(&mut store, "the coarse tile built from the new records");
+}
