@@ -62,7 +62,9 @@ pub(crate) struct WindowApp {
     /// The running app, once the window exists.
     running: Option<Running>,
     /// Where the run's outcome goes when the loop exits.
-    done: Sender<Result<Summary>>,
+    /// Where the run's outcome goes when the loop exits; `None` once it has been sent, so a
+    /// run finishes once, whatever events follow.
+    done: Option<Sender<Result<Summary>>>,
 }
 
 impl WindowApp {
@@ -76,7 +78,7 @@ impl WindowApp {
             options,
             project: Some(project),
             running: None,
-            done,
+            done: Some(done),
         }
     }
 
@@ -173,9 +175,15 @@ impl WindowApp {
         }
     }
 
-    /// Stops the render thread and closes the project, sends how the run went, and exits the
-    /// loop. `result` is an error that ended the run early, if one did.
+    /// Exits the loop, stops the render thread and closes the project, and sends how the run
+    /// went; `result` is an error that ended the run early, if one did. Only the first call does
+    /// more than exit.
     fn finish(&mut self, event_loop: &dyn ActiveEventLoop, result: Result<()>) {
+        event_loop.exit();
+        let Some(done) = self.done.take() else {
+            // Finished already (an error, then the close the exit brings): nothing more to say.
+            return;
+        };
         let outcome = match self.running.take() {
             Some(running) => {
                 let Running {
@@ -198,8 +206,7 @@ impl WindowApp {
             None => result.and_then(|()| Err(anyhow!("the window never opened"))),
         };
         // `main` holds the receiver until the loop returns, so the send can't fail.
-        drop(self.done.send(outcome));
-        event_loop.exit();
+        drop(done.send(outcome));
     }
 
     /// Turns a window event into frame-loop input or window state.
@@ -316,7 +323,7 @@ fn refresh_interval(window: &dyn Window) -> Duration {
 
 impl ApplicationHandler for WindowApp {
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if self.running.is_some() {
+        if self.running.is_some() || self.done.is_none() {
             return;
         }
         match self.open(event_loop) {
