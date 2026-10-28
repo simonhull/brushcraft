@@ -137,10 +137,16 @@ impl WindowApp {
 
     /// Runs the frame loop until it has to wait, and tells winit how long.
     ///
+    /// The display's refresh rate is read again first: the window may have moved to another
+    /// display, which winit doesn't report on Wayland (no `Moved` event there).
+    ///
     /// # Errors
     ///
     /// If a frame, the upkeep or the render thread fails.
     fn drive(running: &mut Running, event_loop: &dyn ActiveEventLoop) -> Result<()> {
+        running
+            .owner
+            .set_interval(refresh_interval(running.window.as_ref()));
         loop {
             let now = Instant::now();
             match running.owner.next(now) {
@@ -213,7 +219,6 @@ impl WindowApp {
         match event {
             WindowEvent::SurfaceResized(size) => owner.resize(frame_size(size)),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => owner.set_scale(scale_factor),
-            WindowEvent::Moved(_) => owner.set_interval(refresh_interval(running.window.as_ref())),
             WindowEvent::RedrawRequested | WindowEvent::Occluded(false) => owner.expose(),
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
