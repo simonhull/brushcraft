@@ -1562,3 +1562,60 @@ fn ticks_bound_a_long_strokes_snapshot_to_the_tiles_of_one_interval() {
         "never ticked: one snapshot of every tile the stroke dirtied"
     );
 }
+
+/// A display layer recorded while a flush's cut is open isn't named by its save point.
+///
+/// Every record is written through as it is recorded. One copy fails to encode, so its tile is
+/// left out of the flush, still dirty at its at-cut edit; the layer recorded during the tile
+/// sync is built from that edit. Placed at the cut, the save point would name it although it
+/// lacks the edit: so it waits, and the save point, reopened, holds each display tile current
+/// or unknown.
+#[test]
+fn a_layer_recorded_during_a_flush_is_not_named_by_its_save_point() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("recovery.bcrf");
+    let config = roomy().with_display(level(TOP));
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, config);
+    store.hold_display_waiting_to(0);
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let layer = display_layer(&mut store);
+    store.record_display(&layer).unwrap();
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    let key = tiles(&mesh, TOP, TOP)[5];
+    edit_interior(
+        &mut store,
+        &mut CorrectionMap::new(),
+        key,
+        Vec3::new(0.0, 0.0, 0.25),
+    );
+    writer.fail_encodes(1);
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    writer.step_blocking(&mut store).unwrap();
+    assert_eq!(writer.phase(), "syncing tiles", "the records are appended");
+    assert!(
+        store.unsaved.contains_key(&key),
+        "the tile whose copy failed to encode stays dirty"
+    );
+    let layer = display_layer(&mut store);
+    store.record_display(&layer).unwrap();
+    settle(&mut writer, &mut store);
+    assert_eq!(writer.take_skipped(), [key], "left out of the save point");
+    let offset = writer.durable_save_point().unwrap();
+    drop(writer);
+    drop(store);
+    let file = ProjectFile::open_at(&path, offset).unwrap();
+    let mut saved = TileStore::open(file, config).unwrap();
+    let built = display_layer(&mut saved);
+    let keys: Vec<TileKey> = built.iter().map(|t| *t.key()).collect();
+    let stored = saved.stored_display(&keys).unwrap();
+    let mut known = 0;
+    for (tile, kept) in built.iter().zip(stored) {
+        if let Some(kept) = kept {
+            assert_eq!(&kept, tile, "{:?}: current or unknown", tile.key());
+            known += 1;
+        }
+    }
+    assert!(known > 0, "the save point holds some of the layer");
+}
