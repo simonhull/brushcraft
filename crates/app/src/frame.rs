@@ -21,8 +21,9 @@
 //! amended by the Task 1 review).
 //!
 //! Frames are made on demand: [`schedule::Scheduler`] decides when, from why they are wanted.
-//! A frame that leaves store jobs queued, or uploads pending, wants the next one; input that
-//! moves the camera wants one; nothing else does.
+//! A frame that leaves store jobs queued, uploads pending, or epochs in the feed it hasn't
+//! drained (closed by its jobs or upkeep) wants the next one, as does upkeep between frames
+//! that closes epochs; input that moves the camera wants one; nothing else does.
 
 pub(crate) mod schedule;
 
@@ -399,7 +400,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .context("running the store's jobs")?;
         self.after_hand_off.jobs = lap.next();
 
-        if uploads.converging || self.project.store().has_jobs() {
+        if uploads.converging || self.project.store().has_jobs() || self.has_stale() {
             self.scheduler.want(Reason::Converging);
         }
         if self.limit.is_some_and(|limit| self.started < limit) {
@@ -424,6 +425,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.project.tick(now).context("ticking the project")?;
         self.project.poll().context("polling the project")?;
         self.scheduler.upkept(now);
+        // A poll can install prefetched tiles, closing epochs: the next frame takes them.
+        if self.has_stale() {
+            self.scheduler.want(Reason::Converging);
+        }
         Ok(())
     }
 
@@ -444,8 +449,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         project.close(keep).context("closing the project")
     }
 
-    /// Whether the stale-tile feed holds epochs this loop hasn't drained (or a resync).
-    #[cfg(test)]
+    /// Whether the stale-tile feed holds epochs this loop hasn't drained (or a resync): work
+    /// after the drain (the jobs, a poll) closed some, and a frame must take them.
     pub(crate) fn has_stale(&mut self) -> bool {
         self.project.store().has_stale(&self.cursor)
     }

@@ -192,10 +192,9 @@ fn a_frame_runs_input_brush_feed_uploads_then_hands_off_then_the_jobs() {
     // (none), the next frame's those of this one.
     let first_text = first.overlay.join("\n");
     assert!(first_text.contains("jobs       0 slices"), "{first_text}");
-    owner.expose();
     let Next::Frame { deadline: later } = owner.next(Instant::now() + Duration::from_millis(100))
     else {
-        panic!("the next frame is wanted");
+        panic!("the jobs' epochs, undrained, want the next frame");
     };
     let second = frame(&mut owner, later);
     let second_text = second.overlay.join("\n");
@@ -364,5 +363,38 @@ fn no_frames_while_there_is_no_frame_size() {
         matches!(owner.next(Instant::now()), Next::Frame { .. }),
         "a size again: the window is drawn"
     );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn epochs_closed_between_frames_want_a_frame_to_take_them() {
+    let dir = TestDir::new();
+    let mut owner = Owner::new(
+        project(&dir),
+        NoBrush,
+        NoUploads,
+        setup(None),
+        Instant::now(),
+    );
+    run(&mut owner, 10_000);
+    assert!(
+        matches!(owner.next(Instant::now()), Next::Idle { .. }),
+        "settled"
+    );
+    // Work between frames closes an epoch, as a poll installing prefetched tiles does.
+    OneEdit::default()
+        .step(owner.project(), &Camera::default())
+        .expect("an edit");
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(
+        matches!(
+            owner.next(Instant::now()),
+            Next::Frame { .. } | Next::Wait { .. }
+        ),
+        "the undrained epoch wants a frame"
+    );
+    // That frame drains it (and the refresh the edit queues takes a few more).
+    assert!(run(&mut owner, 10_000) >= 1);
+    assert!(!owner.has_stale(), "drained");
     owner.close().expect("closed");
 }
