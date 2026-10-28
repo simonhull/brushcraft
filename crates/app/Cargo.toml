@@ -1,0 +1,24 @@
+[package]
+name = "app"
+description = "BrushCraft itself: the window, input and the frame loop, on the store's owner thread."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "brushcraft"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+geom.workspace = true
+render.workspace = true
+store.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+

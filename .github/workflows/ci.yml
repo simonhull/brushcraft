@@ -69,6 +69,8 @@ jobs:
           echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
       - run: cargo nextest run --workspace --all-features --profile ci --no-tests=warn
       - run: cargo test --workspace --doc --all-features
+      # The app opens a project and closes it headless, on its default adapter: lavapipe.
+      - run: scripts/app-headless.sh
 
   perf:
     # Runs the performance suite on a tiny project: it checks the suite works end to end. No

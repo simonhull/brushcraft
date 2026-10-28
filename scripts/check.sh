@@ -32,5 +32,7 @@ RUSTDOCFLAGS='--cfg test -D warnings' cargo doc --workspace --no-deps --document
 # rebuild with other features.
 cargo bench --no-run --profile bench-fast -p geom --bench stages --features bench-stages
 cargo run -p brushcraft-bench -- perf --tiny
+# The app opens a project and closes it headless, on its default adapter: here, lavapipe.
+scripts/app-headless.sh
 cargo deny check
 cargo machete
