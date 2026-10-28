@@ -922,6 +922,29 @@ fn quiet_frame(gpu: &Gpu, residency: &mut Residency, model: &mut Model, asking: 
 }
 
 #[test]
+fn a_readback_says_which_frame_it_is_of() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), ResidencyConfig::default())
+            .expect("residency");
+        assert_eq!(residency.requests_heard(), None, "nothing read back yet");
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        let first = residency.frame();
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        // The second frame's begin heard the first's readback (the GPU had finished it).
+        assert_eq!(residency.requests_heard(), Some(first));
+        // A frame dropped unsubmitted makes none: what was heard stays the newest submitted.
+        residency.begin_frame(gpu).expect("a frame begins");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        drop(residency.stage(gpu, &mut model, deadline).expect("staged"));
+        let dropped = residency.frame();
+        residency.begin_frame(gpu).expect("the next begins");
+        assert_eq!(residency.requests_heard(), Some(dropped - 1));
+    });
+}
+
+#[test]
 fn tiles_the_source_has_nothing_for_wait_for_an_epoch_naming_them() {
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");

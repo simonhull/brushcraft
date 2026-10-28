@@ -153,6 +153,8 @@ pub(crate) struct RequestBuffer {
     mapped: Receiver<Readback>,
     /// Requests read back and not taken yet.
     latest: Option<Requests>,
+    /// The newest frame whose readback has been read, if any has.
+    heard: Option<u64>,
 }
 
 impl RequestBuffer {
@@ -179,6 +181,7 @@ impl RequestBuffer {
             sender,
             mapped,
             latest: None,
+            heard: None,
         })
     }
 
@@ -205,7 +208,7 @@ impl RequestBuffer {
     /// # Errors
     ///
     /// As [`Gpu::scoped`], making a readback buffer.
-    pub(crate) fn copy(&mut self, gpu: &Gpu) -> Result<Option<RequestCopy>, GpuError> {
+    pub(crate) fn copy(&mut self, gpu: &Gpu, frame: u64) -> Result<Option<RequestCopy>, GpuError> {
         let target = match self.free.pop() {
             Some(buffer) => buffer,
             None if self.made < READBACKS => {
@@ -227,6 +230,7 @@ impl RequestBuffer {
             source: self.buffer.clone(),
             target,
             done: self.sender.clone(),
+            frame,
         }))
     }
 
@@ -241,7 +245,10 @@ impl RequestBuffer {
     pub(crate) fn collect(&mut self, finest: Level) -> Result<(), GpuError> {
         while let Ok(back) = self.mapped.try_recv() {
             let buffer = match back {
-                Readback::Mapped(buffer) => buffer,
+                Readback::Mapped(buffer, frame) => {
+                    self.heard = self.heard.max(Some(frame));
+                    buffer
+                }
                 Readback::Unused(buffer) => {
                     self.free.push(buffer);
                     continue;
@@ -261,6 +268,11 @@ impl RequestBuffer {
             });
         }
         Ok(())
+    }
+
+    /// The newest frame whose readback has been read, if any has.
+    pub(crate) const fn heard(&self) -> Option<u64> {
+        self.heard
     }
 
     /// The requests read back since the last call, if any readback arrived.

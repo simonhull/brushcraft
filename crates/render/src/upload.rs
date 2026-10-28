@@ -504,8 +504,8 @@ impl Drop for Batch {
 /// A readback buffer coming back to the request buffer.
 #[derive(Debug)]
 pub(crate) enum Readback {
-    /// Mapped for reading, its frame's requests in it.
-    Mapped(Buffer),
+    /// Mapped for reading, the requests of frame `1` (residency's frame number) in it.
+    Mapped(Buffer, u64),
     /// Unmapped and unused: its frame was dropped before submission.
     Unused(Buffer),
     /// Mapping failed; the buffer is gone.
@@ -522,6 +522,8 @@ pub(crate) struct RequestCopy {
     pub(crate) target: Buffer,
     /// Where the readback buffer goes back.
     pub(crate) done: Sender<Readback>,
+    /// The residency frame the copy is made in: the level choice's requests of that frame.
+    pub(crate) frame: u64,
 }
 
 /// What became of a frame's uploads, told to the residency that staged them.
@@ -620,11 +622,16 @@ impl FrameUploads {
             }
         }
         if let Some(requests) = self.requests.take() {
-            let RequestCopy { target, done, .. } = requests;
+            let RequestCopy {
+                target,
+                done,
+                frame,
+                ..
+            } = requests;
             let buffer = target.clone();
             target.map_async(MapMode::Read, .., move |result| {
                 let back = if result.is_ok() {
-                    Readback::Mapped(buffer)
+                    Readback::Mapped(buffer, frame)
                 } else {
                     Readback::Failed
                 };

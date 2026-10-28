@@ -890,6 +890,21 @@ impl Residency {
         Ok(())
     }
 
+    /// The frame number: one more each [`Residency::begin_frame`], so the current frame's
+    /// after it. A frame's request readback carries it ([`Residency::requests_heard`]).
+    #[must_use]
+    pub const fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// The newest frame ([`Residency::frame`]) whose request readback has been read, if any
+    /// has: the level choice's requests as of that frame's uploads are in hand. A frame dropped
+    /// unsubmitted never makes one.
+    #[must_use]
+    pub const fn requests_heard(&self) -> Option<u64> {
+        self.requests.heard()
+    }
+
     /// The requests the latest request readbacks gave (merged, if several arrived), if any
     /// arrived since the last call: for [`crate::upload::prefetch_requests`], then
     /// [`Residency::want`].
@@ -1154,7 +1169,7 @@ impl Residency {
         let mut batch = Batch::new(&self.ring);
         match self.stage_into(gpu, &mut batch, source, deadline) {
             Ok(()) => {
-                let requests = match self.requests.copy(gpu) {
+                let requests = match self.requests.copy(gpu, self.frame) {
                     Ok(requests) => requests,
                     Err(error) => return Err(self.fail(batch, error.into())),
                 };
