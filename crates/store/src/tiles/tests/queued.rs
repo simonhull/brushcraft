@@ -418,3 +418,69 @@ fn is_cached_never_evaluates() {
     );
     assert!(!store.is_cached(&key), "a write under it outdates it");
 }
+
+/// With little budget to spare, the queue's share is what the display layer's shares leave.
+#[test]
+fn a_short_budget_gives_the_queue_what_is_left() {
+    use super::super::config::{Headroom, reserved_shares};
+
+    let mesh = mesh();
+    let headroom = Headroom::of(&mesh);
+    let base = roomy().with_display(level(TOP));
+    let floor = base.floor_bytes(&mesh);
+    let fixed = headroom.minimum_budget(base.chunk_bytes)
+        + base.kept_prediction_bytes().unwrap()
+        + base.stroke_state_bytes().unwrap()
+        + floor;
+    let mut partial = 0;
+    for step in 0..3000 {
+        let config = base.with_budget_bytes(fixed + step * 4096);
+        let shares = reserved_shares(headroom, &config, floor).unwrap();
+        let left = config.budget_bytes - fixed - shares.caches - shares.waiting;
+        assert_eq!(
+            shares.evaluation,
+            config.evaluation_bytes().min(left),
+            "step {step}: the share, or what the others leave"
+        );
+        if shares.evaluation > 0 && shares.evaluation < config.evaluation_bytes() {
+            partial += 1;
+        }
+    }
+    assert!(partial > 0, "some budgets give part of the share");
+}
+
+/// A write that leaves a finished tile alone keeps it: copied again from the cache, not
+/// evaluated again.
+#[test]
+fn a_write_elsewhere_keeps_a_finished_tile_copied_from_the_cache() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, mut map) = edited(&dir, &mesh, roomy());
+    let key = TileKey::displacement(FaceId::new(0), level(TOP), 1, 1).unwrap();
+    store.queue_evaluation(&[(key, 2.0)]).unwrap();
+    while store.evaluation.finished.is_empty() {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(2))
+            .unwrap();
+    }
+    apply(
+        &mut store,
+        &mut map,
+        &[Edit {
+            face: FaceId::new(5),
+            level: level(TOP),
+            i: 100,
+            j: 100,
+            c: Vec3::new(0.0, 0.01, 0.0),
+        }],
+    );
+    assert!(store.take_evaluated().is_empty(), "kept back after a write");
+    let report = store
+        .run_jobs(Instant::now() + Duration::from_millis(50))
+        .unwrap();
+    assert_eq!(report.queue_finished, 0, "nothing evaluated again");
+    assert_eq!(store.queued_evaluations(), 0, "nor queued again");
+    let taken = store.take_evaluated();
+    assert_eq!(taken.len(), 1, "handed over");
+    assert_dense(&mesh, &dense(&mesh, &map), &taken[0], "copied again");
+}
