@@ -23,6 +23,8 @@ use crate::surface::Size;
 use crate::tree::{NODE_BYTES, NODE_FINEST, TileTree};
 use crate::upload::GpuVertex;
 
+mod orbit;
+
 /// Level `l`.
 fn level(l: u8) -> Level {
     Level::new(l).expect("a level")
@@ -168,7 +170,8 @@ impl Scene {
         }
     }
 
-    /// Writes the tree's changed nodes and every resident tile's bounds to the GPU.
+    /// Writes the tree's changed nodes and every resident tile's bounds (in one write) to the
+    /// GPU.
     fn upload(&mut self, gpu: &Gpu, lod: &Lod) {
         for (start, nodes) in self.tree.take_dirty() {
             gpu.queue().write_buffer(
@@ -177,11 +180,14 @@ impl Scene {
                 bytemuck::cast_slice(&nodes),
             );
         }
+        let count = usize::try_from(self.tree.capacity()).expect("small");
+        let mut all = vec![GpuBounds::UNKNOWN; count];
         for (place, b) in &self.bounds {
             if let Some(node) = self.tree.node(*place) {
-                lod.bounds().write(gpu, node, &[*b]);
+                all[usize::try_from(node).expect("small")] = *b;
             }
         }
+        lod.bounds().write(gpu, 0, &all);
     }
 
     /// Whether `place` is resident.

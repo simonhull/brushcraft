@@ -374,8 +374,12 @@ pub struct LodConfig {
     thresholds: Thresholds,
 }
 
-/// The relaxation passes a frame runs by default: the most the benchmark orbit needed (see
-/// `examples/lod_orbit.rs` and `research/platform/m1a3-lod.md` in the docs repository).
+/// The relaxation passes a frame may run by default: all of them.
+///
+/// The benchmark orbit's tree shape (the ignored `lod::tests::orbit` measurement, RTX 4090,
+/// 2026-10-28) needed up to 13 in every frame, one per level between the front's finest tiles and
+/// the culled back faces at level 0, and settled within them (no shortfall). Passes after the
+/// settling are gated off on the GPU, so only those needed cost anything.
 pub const RELAX_PASSES: u32 = MAX_RELAX_PASSES;
 
 impl LodConfig {
@@ -461,7 +465,7 @@ pub enum LodError {
     Capacity(u32),
 }
 
-/// The most nodes the level choice covers: one dispatch of [`GROUP`] threads a workgroup.
+/// The most nodes the level choice covers: one dispatch of 64 threads a workgroup.
 pub const MAX_NODES: u32 = MAX_GROUPS * GROUP;
 
 /// What a frame's level choice counted, read back with its cut.
