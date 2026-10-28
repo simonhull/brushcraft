@@ -59,6 +59,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::ops::Bound;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
@@ -658,6 +659,9 @@ pub struct Residency {
     fresh: BTreeSet<TileKey>,
     /// Bytes of pending epochs forced into the frame being staged.
     forced_now: u64,
+    /// Per class, where the frame's last eviction scan stopped: the tiles before it may not
+    /// leave this frame, so the next scan starts past them.
+    scanned: Vec<Option<(u64, TileKey)>>,
     /// Per frame staged and not yet heard of as submitted, the tiles it wrote.
     in_flight: BTreeMap<u64, Vec<(TileKey, Slot)>>,
     /// The next staged frame's number.
@@ -764,6 +768,7 @@ impl Residency {
             touched: Vec::new(),
             fresh: BTreeSet::new(),
             forced_now: 0,
+            scanned: vec![None; CLASSES],
             in_flight: BTreeMap::new(),
             next_upload: 0,
             outcome_sender,
@@ -1114,6 +1119,7 @@ impl Residency {
         self.touched.clear();
         self.fresh.clear();
         self.forced_now = 0;
+        self.scanned.fill(None);
         self.pending = self
             .groups
             .iter()
@@ -1609,21 +1615,29 @@ impl Residency {
         if let Some(slot) = self.pools.acquire(gpu, class)? {
             return Ok(Some(slot));
         }
+        let index = usize::from(class.0);
+        let after = self.scanned.get(index).copied().flatten();
+        let from = after.map_or(Bound::Unbounded, Bound::Excluded);
         let candidates = self
             .recency
-            .get(usize::from(class.0))
+            .get(index)
             .into_iter()
-            .flatten()
-            .map(|(_, key)| key);
+            .flat_map(|recency| recency.range((from, Bound::Unbounded)));
         let victim = candidates
-            .filter(|key| {
+            .filter(|(_, key)| {
                 !self.protected(key) && !self.pending.contains(key) && !self.fresh.contains(key)
             })
-            .find(|key| !self.groups.iter().any(|group| group.holds(key)))
+            .find(|(_, key)| !self.groups.iter().any(|group| group.holds(key)))
             .copied();
         let Some(victim) = victim else {
             return Ok(None);
         };
+        // Every tile older than the victim stays protected for the rest of the frame (what
+        // protects a tile is fixed while it is staged), so the next scan starts past it.
+        if let Some(scanned) = self.scanned.get_mut(index) {
+            *scanned = Some(victim);
+        }
+        let (_, victim) = victim;
         self.remove_live(&victim);
         self.stats.evictions += 1;
         Ok(self.pools.acquire(gpu, class)?)

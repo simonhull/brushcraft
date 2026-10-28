@@ -29,6 +29,10 @@ geom = { workspace = true, features = ["test-fixtures"] }
 rayon.workspace = true
 
 [[bench]]
+name = "eviction"
+harness = false
+
+[[bench]]
 name = "brush_gpu"
 harness = false
 required-features = ["spike"]
