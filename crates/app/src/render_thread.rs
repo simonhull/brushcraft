@@ -1,27 +1,24 @@
-//! The render thread: encodes and submits each frame the owner thread hands it, and presents
-//! it (the M1 spec's "Threads": it only encodes and submits).
+//! The render thread: draws each frame the owner thread hands it (the M1 spec's "Threads": it
+//! only encodes and submits).
 //!
-//! It owns the [`Target`] and the overlay's GPU side. Frames arrive one at a time over a
-//! channel ([`FrameRequest`]); each is drawn (for now, a clear colour and the overlay) and
-//! presented, and what happened goes back ([`Presented`]), with a wake-up for the owner's event
-//! loop. Dropping the sender ends the thread, which hands the target back.
+//! It owns the [`Target`] and a [`Renderer`], which holds the frame's passes in order. Frames
+//! arrive one at a time over a channel ([`FrameRequest`]); each has its overlay text laid out,
+//! is drawn and presented, and what happened goes back ([`Presented`]), with a wake-up for the
+//! owner's event loop. Dropping the sender ends the thread, which hands the target back. The
+//! thread wakes the owner as it ends, however it ends (a panic included), so the owner always
+//! learns of it.
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use render::gpu::Gpu;
-use render::surface::{Acquired, Presentation, Size, Target};
-use wgpu::{
-    Color, CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
-    RenderPassDescriptor, StoreOp,
-};
+use render::surface::{Presentation, Size, Target};
+use render::{DrawTimes, FrameInputs, Outcome, Renderer};
+use wgpu::Color;
 
-use crate::frame::Lap;
-use crate::frame::schedule::Shown;
-use crate::overlay::{OverlayPass, TextImage};
+use crate::overlay::TextLayout;
 
 /// The colour frames are cleared to, linear: a dark grey with a touch of blue.
 pub(crate) const CLEAR: Color = Color {
@@ -32,6 +29,9 @@ pub(crate) const CLEAR: Color = Color {
 };
 
 /// A frame for the render thread to draw: everything it needs, owned.
+///
+/// GPU residency (M1a3 Task 2) adds the frame's staged uploads here, which the render thread
+/// encodes before the passes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrameRequest {
     /// The frame's number, from 1.
@@ -44,36 +44,33 @@ pub(crate) struct FrameRequest {
     pub(crate) overlay: Vec<String>,
 }
 
-/// How long the render thread's phases took for one frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct RenderPhases {
-    /// Waiting for the target's next image (FIFO waits here for a free one).
-    pub(crate) acquire: Duration,
-    /// Uploading the overlay, encoding the frame's passes and submitting them.
-    pub(crate) encode: Duration,
-    /// Presenting the image.
-    pub(crate) present: Duration,
-}
-
 /// What the render thread did with a frame.
+///
+/// GPU residency (Task 2) adds the frame's readback (tiles wanted but missing) here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Presented {
     /// The frame's number.
     pub(crate) number: u64,
     /// Whether it reached the screen.
-    pub(crate) shown: Shown,
+    pub(crate) outcome: Outcome,
     /// How long its phases took.
-    pub(crate) phases: RenderPhases,
+    pub(crate) times: DrawTimes,
 }
+
+/// A hook the render thread calls.
+type Hook = Box<dyn Fn() + Send>;
 
 /// What the render thread calls on the owner's behalf.
 pub(crate) struct Hooks {
-    /// Called after each frame's [`Presented`] is sent, and as the thread exits: wakes the
-    /// owner's event loop. Never blocks.
-    pub(crate) wake: Box<dyn Fn() + Send>,
+    /// Called after each frame's [`Presented`] is sent, and as the thread ends, however it
+    /// ends: wakes the owner's event loop. Never blocks.
+    wake: Hook,
     /// Called just before a frame is presented: winit's `pre_present_notify`, which lets the
     /// compositor pace the window.
-    pub(crate) pre_present: Box<dyn Fn() + Send>,
+    pre_present: Hook,
+    /// Test hook: called with each frame before it is drawn.
+    #[cfg(test)]
+    before_draw: Box<dyn Fn(&FrameRequest) + Send>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -83,12 +80,32 @@ impl std::fmt::Debug for Hooks {
 }
 
 impl Hooks {
+    /// Hooks that wake the owner with `wake` and call `pre_present` before each present.
+    pub(crate) fn new(
+        wake: impl Fn() + Send + 'static,
+        pre_present: impl Fn() + Send + 'static,
+    ) -> Self {
+        Self {
+            wake: Box::new(wake),
+            pre_present: Box::new(pre_present),
+            #[cfg(test)]
+            before_draw: Box::new(|_| {}),
+        }
+    }
+
     /// Hooks that do nothing: for a target with no event loop to wake.
     pub(crate) fn none() -> Self {
-        Self {
-            wake: Box::new(|| {}),
-            pre_present: Box::new(|| {}),
-        }
+        Self::new(|| {}, || {})
+    }
+}
+
+/// Calls the wake hook when dropped: when the render thread ends, by returning or by
+/// unwinding from a panic, so the owner always hears of it.
+struct WakeOnExit(Hook);
+
+impl Drop for WakeOnExit {
+    fn drop(&mut self) {
+        (self.0)();
     }
 }
 
@@ -110,25 +127,38 @@ impl RenderThread {
     ///
     /// # Errors
     ///
-    /// If the overlay's pipeline can't be built, or the thread can't be started.
+    /// If the renderer's passes can't be built, or the thread can't be started.
     pub(crate) fn spawn(gpu: Arc<Gpu>, target: Target, hooks: Hooks) -> Result<Self> {
         let presentation = target.presentation();
-        let overlay =
-            OverlayPass::new(&gpu, target.format()).context("building the overlay's pipeline")?;
+        let renderer =
+            Renderer::new(&gpu, target.format()).context("building the renderer's passes")?;
         // One frame at a time: the scheduler never sends another before this one is presented.
         let (frames, incoming) = mpsc::sync_channel(1);
         let (outgoing, presented) = mpsc::channel();
-        let mut renderer = Renderer {
+        let Hooks {
+            wake,
+            pre_present,
+            #[cfg(test)]
+            before_draw,
+        } = hooks;
+        let mut thread = Drawing {
             gpu,
             target,
-            overlay,
+            renderer,
+            #[cfg(test)]
+            before_draw,
         };
         let handle = thread::Builder::new()
             .name("render".into())
             .spawn(move || {
-                let result = renderer.run(&incoming, &outgoing, &hooks);
-                (hooks.wake)();
-                result.map(|()| renderer.target)
+                // Locals drop in reverse: `outgoing` first, so the owner, once woken, finds the
+                // channel closed; then `wake`, after the result is made or while unwinding from
+                // a panic.
+                let wake = WakeOnExit(wake);
+                let outgoing = outgoing;
+                thread
+                    .run(&incoming, &outgoing, &*wake.0, &*pre_present)
+                    .map(|()| thread.target)
             })
             .context("starting the render thread")?;
         Ok(Self {
@@ -238,20 +268,31 @@ impl Drop for RenderThread {
     }
 }
 
-/// The render thread's state: the GPU, where frames go, and the overlay.
-#[derive(Debug)]
-struct Renderer {
+/// The render thread's state: the GPU, where frames go, and the passes.
+struct Drawing {
     /// The GPU, shared with the owner thread.
     gpu: Arc<Gpu>,
     /// Where frames are drawn.
     target: Target,
-    /// The overlay's GPU side.
-    overlay: OverlayPass,
+    /// The frame's passes.
+    renderer: Renderer,
+    /// Test hook: called with each frame before it is drawn.
+    #[cfg(test)]
+    before_draw: Box<dyn Fn(&FrameRequest) + Send>,
 }
 
-impl Renderer {
+impl std::fmt::Debug for Drawing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Drawing")
+            .field("target", &self.target)
+            .field("renderer", &self.renderer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drawing {
     /// Draws every frame that arrives on `frames` until the owner hangs up, reporting each on
-    /// `presented` and calling the hooks.
+    /// `presented`, waking the owner after each and calling `pre_present` before each present.
     ///
     /// # Errors
     ///
@@ -260,153 +301,115 @@ impl Renderer {
         &mut self,
         frames: &Receiver<FrameRequest>,
         presented: &mpsc::Sender<Presented>,
-        hooks: &Hooks,
+        wake: &dyn Fn(),
+        pre_present: &dyn Fn(),
     ) -> Result<()> {
         while let Ok(frame) = frames.recv() {
-            let (shown, phases) = self
-                .draw(&frame, hooks)
+            #[cfg(test)]
+            (self.before_draw)(&frame);
+            let image = TextLayout::new(&frame.overlay).image();
+            let inputs = FrameInputs {
+                size: frame.size,
+                clear: CLEAR,
+                overlay: image.as_ref(),
+                overlay_scale: frame.overlay_scale,
+            };
+            let drawn = self
+                .renderer
+                .draw(&self.gpu, &mut self.target, &inputs, pre_present)
                 .with_context(|| format!("drawing frame {}", frame.number))?;
             let report = Presented {
                 number: frame.number,
-                shown,
-                phases,
+                outcome: drawn.outcome,
+                times: drawn.times,
             };
             if presented.send(report).is_err() {
                 // The owner has stopped listening; it will hang up next.
                 break;
             }
-            (hooks.wake)();
+            wake();
         }
         Ok(())
-    }
-
-    /// Draws `frame`: the clear colour and the overlay, then presents it.
-    ///
-    /// # Errors
-    ///
-    /// If the target can't be resized or acquired, or the GPU reports an error.
-    fn draw(&mut self, frame: &FrameRequest, hooks: &Hooks) -> Result<(Shown, RenderPhases)> {
-        let mut phases = RenderPhases::default();
-        self.target.resize(&self.gpu, frame.size)?;
-        let mut lap = Lap::new();
-        let acquired = self.target.acquire(&self.gpu)?;
-        phases.acquire = lap.next();
-        let image = match acquired {
-            Acquired::Frame(image) => image,
-            Acquired::Retry => return Ok((Shown::Retry, phases)),
-            Acquired::Hidden => return Ok((Shown::Hidden, phases)),
-        };
-        let text = TextImage::new(&frame.overlay);
-        self.overlay
-            .prepare(&self.gpu, &text, frame.size, frame.overlay_scale)?;
-        self.gpu.scoped("encoding a frame", || {
-            let mut encoder = self
-                .gpu
-                .device()
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("frame"),
-                });
-            {
-                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("clear and overlay"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: image.view(),
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: Operations {
-                            load: LoadOp::Clear(CLEAR),
-                            store: StoreOp::Store,
-                        },
-                    })],
-                    ..RenderPassDescriptor::default()
-                });
-                self.overlay.draw(&mut pass);
-            }
-            self.gpu.queue().submit([encoder.finish()]);
-        })?;
-        phases.encode = lap.next();
-        (hooks.pre_present)();
-        image.present(&self.gpu);
-        self.gpu.check()?;
-        phases.present = lap.next();
-        Ok((Shown::Presented, phases))
     }
 }
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
+    use std::time::Duration;
+
     use render::gpu::AdapterRequest;
+    use render::overlay::MARGIN;
     use render::surface::Offscreen;
 
     use super::*;
 
-    /// `value` (linear, 0 to 1) as an 8-bit sRGB code, as the target stores it.
-    fn srgb(value: f64) -> u8 {
-        let encoded = if value <= 0.003_130_8 {
-            value * 12.92
-        } else {
-            1.055 * value.powf(1.0 / 2.4) - 0.055
-        };
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "rounded from 0..=255"
-        )]
-        let code = (encoded * 255.0).round() as u8;
-        code
+    /// A software GPU and an offscreen target of `size` on it.
+    fn offscreen(size: Size) -> (Arc<Gpu>, Target) {
+        let gpu = Arc::new(Gpu::open(&AdapterRequest::Software).expect("GPU tests need lavapipe"));
+        let target = Target::Offscreen(Offscreen::new(&gpu, size).expect("target"));
+        (gpu, target)
+    }
+
+    /// Frame 1 of `size`, its overlay `lines`.
+    fn request(size: Size, lines: &[&str]) -> FrameRequest {
+        FrameRequest {
+            number: 1,
+            size,
+            overlay_scale: 1,
+            overlay: lines.iter().map(|&line| line.to_owned()).collect(),
+        }
     }
 
     #[test]
-    fn a_frame_is_the_clear_colour_with_the_overlay_drawn_over_its_corner() {
-        let gpu = Arc::new(Gpu::open(&AdapterRequest::Software).expect("GPU tests need lavapipe"));
+    fn the_thread_lays_out_the_overlay_text_and_draws_it() {
         let size = Size::new(160, 64).expect("non-zero");
-        let target = Target::Offscreen(Offscreen::new(&gpu, size).expect("target"));
+        let (gpu, target) = offscreen(size);
         let mut thread =
             RenderThread::spawn(Arc::clone(&gpu), target, Hooks::none()).expect("render thread");
         assert_eq!(thread.presentation(), Presentation::Offscreen);
-        thread
-            .send(FrameRequest {
-                number: 1,
-                size,
-                overlay_scale: 1,
-                overlay: vec!["#".to_owned()],
-            })
-            .expect("sent");
+        thread.send(request(size, &["#"])).expect("sent");
         let presented = thread.wait().expect("drawn");
         assert_eq!(presented.number, 1);
-        assert_eq!(presented.shown, Shown::Presented);
+        assert_eq!(presented.outcome, Outcome::Presented);
         let Target::Offscreen(offscreen) = thread.stop().expect("stopped cleanly") else {
             unreachable!("made offscreen");
         };
         let pixels = offscreen.read_pixels(&gpu).expect("read back");
-        let at = |x: usize, y: usize| pixels[y * 160 + x];
-        let clear = [srgb(CLEAR.r), srgb(CLEAR.g), srgb(CLEAR.b), 255];
-        let tolerance = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(&x, y)| x.abs_diff(y) <= 1);
-        assert!(
-            tolerance(at(150, 60), clear),
-            "outside the overlay: {:?}",
-            at(150, 60)
-        );
-        // The overlay starts 8 pixels in; its backing is darker than the clear colour, and the
-        // '#' glyph's first row has ink at its second column, 3 texels of padding further in.
-        let backing = at(9, 9);
-        assert!(
-            backing[0] < clear[0],
-            "backing {backing:?} darkens {clear:?}"
-        );
-        let ink = at(8 + 3 + 1, 8 + 3);
+        // '#''s first row has ink at its second column, 3 texels of padding in.
+        let corner = MARGIN as usize + 3;
+        let ink = pixels[corner * 160 + corner + 1];
         assert!(ink[0] > 200, "ink is bright: {ink:?}");
+        let blank = pixels[corner * 160 + corner];
+        assert!(blank[0] < 100, "its first column is backing: {blank:?}");
     }
 
     #[test]
     fn a_stopped_thread_hands_its_target_back_and_reports_nothing_more() {
-        let gpu = Arc::new(Gpu::open(&AdapterRequest::Software).expect("GPU tests need lavapipe"));
         let size = Size::new(8, 8).expect("non-zero");
-        let target = Target::Offscreen(Offscreen::new(&gpu, size).expect("target"));
+        let (gpu, target) = offscreen(size);
         let mut thread = RenderThread::spawn(gpu, target, Hooks::none()).expect("render thread");
         assert_eq!(thread.finished().expect("running"), Vec::new());
         let returned = thread.stop().expect("stopped cleanly");
         assert_eq!(returned.size(), size);
+    }
+
+    #[test]
+    fn a_panic_on_the_render_thread_wakes_the_owner_and_is_reported() {
+        let size = Size::new(8, 8).expect("non-zero");
+        let (gpu, target) = offscreen(size);
+        let (woken, wakes) = mpsc::channel();
+        let mut hooks = Hooks::new(move || woken.send(()).unwrap_or(()), || {});
+        hooks.before_draw = Box::new(|_| panic!("a bug in a pass"));
+        let mut thread = RenderThread::spawn(gpu, target, hooks).expect("render thread");
+        thread.send(request(size, &[])).expect("sent");
+        wakes
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the owner is woken as the thread unwinds");
+        let error = thread.finished().expect_err("the thread is gone");
+        assert!(
+            format!("{error:#}").contains("the render thread panicked"),
+            "{error:#}"
+        );
     }
 }

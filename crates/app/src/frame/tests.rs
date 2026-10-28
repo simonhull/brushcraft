@@ -3,11 +3,11 @@
 
 use anyhow::bail;
 use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
+use render::Outcome;
 use store::{Epoch, ProjectConfig, StoreConfig};
 
 use super::*;
 use crate::camera::Pixel;
-use crate::frame::schedule::Shown;
 use crate::navigate::Button;
 use crate::test_dir::TestDir;
 
@@ -45,8 +45,8 @@ fn setup(frames: Option<u64>) -> Setup {
 const fn presented(number: u64) -> Presented {
     Presented {
         number,
-        shown: Shown::Presented,
-        phases: RenderPhases {
+        outcome: Outcome::Presented,
+        times: DrawTimes {
             acquire: Duration::ZERO,
             encode: Duration::ZERO,
             present: Duration::ZERO,

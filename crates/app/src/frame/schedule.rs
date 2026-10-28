@@ -22,6 +22,8 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use render::Outcome;
+
 /// Why a frame is wanted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
@@ -90,17 +92,6 @@ impl fmt::Display for Reasons {
             f.write_str(&names.join("+"))
         }
     }
-}
-
-/// What happened to a frame the render thread was given.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Shown {
-    /// It reached the screen (or the offscreen texture).
-    Presented,
-    /// It couldn't be: the surface changed or timed out, and has been set up again.
-    Retry,
-    /// The window is hidden: nothing was drawn.
-    Hidden,
 }
 
 /// What the frame loop should do next.
@@ -212,9 +203,9 @@ impl Scheduler {
     }
 
     /// The render thread finished the frame in flight.
-    pub(crate) const fn shown(&mut self, shown: Shown) {
+    pub(crate) const fn shown(&mut self, shown: Outcome) {
         self.in_flight = false;
-        if matches!(shown, Shown::Retry) {
+        if matches!(shown, Outcome::Retry) {
             self.want(Reason::Exposed);
         }
     }
@@ -286,7 +277,7 @@ mod tests {
         scheduler.want(Reason::Input);
         let much_later = start + INTERVAL * 10;
         assert_eq!(scheduler.next(much_later), Next::Render, "in flight");
-        scheduler.shown(Shown::Presented);
+        scheduler.shown(Outcome::Presented);
         assert!(
             matches!(scheduler.next(much_later), Next::Frame { .. }),
             "the input that came meanwhile gets its frame"
@@ -298,7 +289,7 @@ mod tests {
         let (mut scheduler, start) = scheduler();
         scheduler.want(Reason::Input);
         scheduler.started(start);
-        scheduler.shown(Shown::Presented);
+        scheduler.shown(Outcome::Presented);
         scheduler.want(Reason::Input);
         let soon = start + Duration::from_millis(5);
         assert_eq!(
@@ -324,7 +315,7 @@ mod tests {
             scheduler.want(Reason::Converging);
             assert!(matches!(scheduler.next(now), Next::Frame { .. }));
             scheduler.started(now);
-            scheduler.shown(Shown::Presented);
+            scheduler.shown(Outcome::Presented);
             now += INTERVAL;
         }
         assert!(
@@ -338,10 +329,10 @@ mod tests {
         let (mut scheduler, start) = scheduler();
         scheduler.want(Reason::Exposed);
         scheduler.started(start);
-        scheduler.shown(Shown::Retry);
+        scheduler.shown(Outcome::Retry);
         assert!(scheduler.wanted().contains(Reason::Exposed), "retried");
         scheduler.started(start + INTERVAL);
-        scheduler.shown(Shown::Hidden);
+        scheduler.shown(Outcome::Hidden);
         assert!(
             matches!(scheduler.next(start + INTERVAL * 2), Next::Idle { .. }),
             "hidden: no frames until it is shown"
@@ -354,7 +345,7 @@ mod tests {
         let later = start + Duration::from_secs(3);
         scheduler.want(Reason::Scripted);
         scheduler.started(later);
-        scheduler.shown(Shown::Presented);
+        scheduler.shown(Outcome::Presented);
         assert_eq!(
             scheduler.next(later),
             Next::Idle {
@@ -371,7 +362,7 @@ mod tests {
         assert_eq!(scheduler.interval(), slower);
         scheduler.want(Reason::Input);
         scheduler.started(start);
-        scheduler.shown(Shown::Presented);
+        scheduler.shown(Outcome::Presented);
         scheduler.want(Reason::Input);
         assert_eq!(
             scheduler.next(start + INTERVAL),

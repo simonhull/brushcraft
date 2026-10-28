@@ -105,10 +105,10 @@ impl WindowApp {
         let adapter = describe_adapter(gpu.adapter_info());
         let proxy = event_loop.create_proxy();
         let presenting = Arc::clone(&window);
-        let hooks = Hooks {
-            wake: Box::new(move || proxy.wake_up()),
-            pre_present: Box::new(move || presenting.pre_present_notify()),
-        };
+        let hooks = Hooks::new(
+            move || proxy.wake_up(),
+            move || presenting.pre_present_notify(),
+        );
         let render = RenderThread::spawn(gpu, Target::Window(surface), hooks)?;
         let frames = match self.options.mode {
             crate::cli::Mode::Window { frames } => frames,

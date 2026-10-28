@@ -23,6 +23,7 @@ pub(crate) mod schedule;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use render::DrawTimes;
 use render::surface::{Presentation, Size};
 use store::{Drained, Project, StaleCursor, TileStore};
 
@@ -30,7 +31,7 @@ use self::schedule::{Next, Reason, Scheduler};
 use crate::camera::{Arcball, Camera};
 use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
-use crate::render_thread::{FrameRequest, Presented, RenderPhases};
+use crate::render_thread::{FrameRequest, Presented};
 
 /// The brush's place in the frame: M1a4's brush step, run on the owner thread after input and
 /// before the feed is drained, so the epochs its edits close reach the GPU in the same frame.
@@ -184,7 +185,7 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// What the feed has delivered.
     feed: FeedStats,
     /// The render thread's phases for the last frame it finished.
-    render: Option<RenderPhases>,
+    render: Option<DrawTimes>,
 }
 
 impl<B: Brush, U: Uploads> Owner<B, U> {
@@ -374,8 +375,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// The render thread finished a frame.
     pub(crate) fn shown(&mut self, presented: Presented) {
         self.finished += 1;
-        self.render = Some(presented.phases);
-        self.scheduler.shown(presented.shown);
+        self.render = Some(presented.times);
+        self.scheduler.shown(presented.outcome);
     }
 
     /// Upkeep with no frame, at `now`: the project's recovery writer ticked and polled.

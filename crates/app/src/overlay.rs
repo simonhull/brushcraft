@@ -1,30 +1,23 @@
 //! The debug overlay: what the frame loop reports each frame, as lines of text drawn over the
 //! frame's top-left corner in our own bitmap font ([`font`]).
 //!
-//! Three parts: [`lines`] says what the overlay shows, from a [`Snapshot`] of the frame loop;
-//! [`TextImage`] lays the lines out into a one-byte-per-texel image on the CPU; and
-//! [`OverlayPass`] uploads that image and draws it, scaled by a whole number, with a translucent
-//! backing so it reads over any scene. No UI toolkit: the app starts with this overlay only.
+//! Two parts here: [`lines`] says what the overlay shows, from a [`Snapshot`] of the frame
+//! loop, and [`TextLayout`] lays the lines out into a one-byte-per-texel image on the CPU. The
+//! renderer draws that image as the frame's last pass (`render::overlay`), scaled by a whole
+//! number, with a translucent backing so it reads over any scene. No UI toolkit: the app starts
+//! with this overlay only.
 
 mod font;
 
 use std::time::Duration;
 
-use render::gpu::{Gpu, GpuError};
+use render::DrawTimes;
+use render::overlay::TextImage;
 use render::surface::{Presentation, Size};
 use store::JobsReport;
-use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindingResource, BlendState, Buffer,
-    BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites, Extent3d, FragmentState,
-    MultisampleState, Origin3d, PrimitiveState, PrimitiveTopology, RenderPass, RenderPipeline,
-    RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, TexelCopyBufferLayout,
-    TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureUsages, TextureViewDescriptor, VertexState,
-};
 
 use crate::camera::{Camera, Vec3};
 use crate::frame::{FeedStats, OwnerPhases};
-use crate::render_thread::RenderPhases;
 
 /// Everything the overlay reports about one frame.
 #[derive(Debug, Clone, Copy)]
@@ -43,7 +36,7 @@ pub(crate) struct Snapshot<'a> {
     pub(crate) owner: OwnerPhases,
     /// How long the render thread took over the last frame it finished; `None` before it has
     /// finished one.
-    pub(crate) render: Option<RenderPhases>,
+    pub(crate) render: Option<DrawTimes>,
     /// What the stale-tile feed has delivered so far.
     pub(crate) feed: FeedStats,
     /// What this frame's store jobs did.
@@ -134,13 +127,11 @@ const GLYPH_GAP: usize = 1;
 const LINE_GAP: usize = 2;
 /// Pixels of backing around the text.
 const PADDING: usize = 3;
-/// The overlay's offset from the frame's top-left corner, in frame pixels.
-const MARGIN: f32 = 8.0;
 
 /// Lines of text laid out as an image: one byte per texel, 255 where a glyph has ink, 0 on the
 /// backing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TextImage {
+pub(crate) struct TextLayout {
     /// Texels across.
     width: usize,
     /// Texels down.
@@ -149,7 +140,7 @@ pub(crate) struct TextImage {
     texels: Vec<u8>,
 }
 
-impl TextImage {
+impl TextLayout {
     /// `lines` laid out top to bottom, each from the left edge, in [`font`]'s glyphs, with
     /// [`PADDING`] all round.
     pub(crate) fn new(lines: &[String]) -> Self {
@@ -196,6 +187,14 @@ impl TextImage {
         }
     }
 
+    /// The layout as the image the renderer's overlay pass draws; `None` if it is wider or
+    /// taller than a `u32` counts (no overlay is).
+    pub(crate) fn image(self) -> Option<TextImage> {
+        let width = u32::try_from(self.width).ok()?;
+        let height = u32::try_from(self.height).ok()?;
+        TextImage::new(width, height, self.texels)
+    }
+
     /// Texels across.
     #[cfg(test)]
     pub(crate) const fn width(&self) -> usize {
@@ -215,257 +214,6 @@ impl TextImage {
     }
 }
 
-/// The overlay's shader: one quad over the overlay's rectangle, each pixel reading its texel
-/// of the text image.
-const SHADER: &str = r"
-// The debug overlay: the text image drawn over the frame's corner at a whole-number scale,
-// ink near-white and the backing translucent black, premultiplied.
-
-// Where the overlay goes. All in frame pixels, but `scale`, frame pixels per texel.
-struct Placement {
-    // The overlay's top-left corner.
-    origin: vec2<f32>,
-    // The overlay's size: the image's times the scale.
-    size: vec2<f32>,
-    // The frame's size.
-    frame: vec2<f32>,
-    // Frame pixels per texel of the text image.
-    scale: f32,
-    // Unused: pads the struct to the 16-byte multiple uniforms need.
-    pad: f32,
-}
-
-// Where the overlay goes, written each frame.
-@group(0) @binding(0) var<uniform> placement: Placement;
-// The text image: red 1 where a glyph has ink, 0 on the backing. Larger than the image when
-// the image has shrunk; only the part `placement.size` covers is read.
-@group(0) @binding(1) var text: texture_2d<f32>;
-
-// The four corners of the overlay's rectangle as a triangle strip, in clip space.
-@vertex
-fn quad(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
-    let corner = vec2<f32>(f32(index & 1u), f32(index >> 1u));
-    let pixel = placement.origin + corner * placement.size;
-    let clip = vec2<f32>(pixel.x / placement.frame.x * 2.0 - 1.0, 1.0 - pixel.y / placement.frame.y * 2.0);
-    return vec4<f32>(clip, 0.0, 1.0);
-}
-
-// Each pixel's texel, unfiltered, as premultiplied ink over the backing.
-@fragment
-fn shade(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let texel = vec2<i32>((position.xy - placement.origin) / placement.scale);
-    let ink = textureLoad(text, texel, 0).r;
-    let backing = vec4<f32>(0.0, 0.0, 0.0, 0.6);
-    let glyph = vec4<f32>(0.85, 0.85, 0.8, 1.0);
-    return mix(backing, glyph, ink);
-}
-";
-
-/// The text image on the GPU, and the bind group that reads it.
-#[derive(Debug)]
-struct Uploaded {
-    /// The texture: at least the image's size, grown as the image does.
-    texture: Texture,
-    /// The placement uniforms and the texture, bound for the shader.
-    bind_group: BindGroup,
-}
-
-/// The GPU side of the overlay: its pipeline, its placement uniforms and the text image.
-#[derive(Debug)]
-pub(crate) struct OverlayPass {
-    /// Draws the quad.
-    pipeline: RenderPipeline,
-    /// The [`SHADER`]'s `Placement`, written each frame.
-    placement: Buffer,
-    /// The image's texture, once one has been prepared.
-    uploaded: Option<Uploaded>,
-}
-
-/// Bytes of the shader's `Placement`: eight `f32`.
-const PLACEMENT_BYTES: u64 = 32;
-
-impl OverlayPass {
-    /// The overlay's pipeline, drawing into frames of `format`.
-    ///
-    /// # Errors
-    ///
-    /// As [`Gpu::scoped`], if the shader or pipeline is refused.
-    pub(crate) fn new(gpu: &Gpu, format: TextureFormat) -> Result<Self, GpuError> {
-        let device = gpu.device();
-        gpu.scoped("overlay pipeline", || {
-            let module = device.create_shader_module(ShaderModuleDescriptor {
-                label: Some("overlay"),
-                source: ShaderSource::Wgsl(SHADER.into()),
-            });
-            let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-                label: Some("overlay"),
-                layout: None,
-                vertex: VertexState {
-                    module: &module,
-                    entry_point: Some("quad"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[],
-                },
-                primitive: PrimitiveState {
-                    topology: PrimitiveTopology::TriangleStrip,
-                    ..PrimitiveState::default()
-                },
-                depth_stencil: None,
-                multisample: MultisampleState::default(),
-                fragment: Some(FragmentState {
-                    module: &module,
-                    entry_point: Some("shade"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(ColorTargetState {
-                        format,
-                        blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                        write_mask: ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-            let placement = device.create_buffer(&BufferDescriptor {
-                label: Some("overlay placement"),
-                size: PLACEMENT_BYTES,
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            Self {
-                pipeline,
-                placement,
-                uploaded: None,
-            }
-        })
-    }
-
-    /// Uploads `image` and places it at the top-left of a frame of `frame` size, `scale` frame
-    /// pixels to the texel (at least 1).
-    ///
-    /// # Errors
-    ///
-    /// As [`Gpu::scoped`], if the texture can't be created or written.
-    pub(crate) fn prepare(
-        &mut self,
-        gpu: &Gpu,
-        image: &TextImage,
-        frame: Size,
-        scale: u32,
-    ) -> Result<(), GpuError> {
-        let (Ok(width), Ok(height)) = (u32::try_from(image.width), u32::try_from(image.height))
-        else {
-            // An image wider than the GPU could hold isn't one the overlay makes.
-            return Ok(());
-        };
-        if width == 0 || height == 0 {
-            return Ok(());
-        }
-        let grow = self.uploaded.as_ref().is_none_or(|uploaded| {
-            let size = uploaded.texture.size();
-            size.width < width || size.height < height
-        });
-        if grow {
-            self.uploaded = Some(self.upload_target(gpu, width, height)?);
-        }
-        let Some(uploaded) = &self.uploaded else {
-            return Ok(());
-        };
-        let scale = scale.max(1);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "frame and image sizes are far below 2^24, exact in f32"
-        )]
-        let placement: [f32; 8] = [
-            MARGIN * scale as f32,
-            MARGIN * scale as f32,
-            (width * scale) as f32,
-            (height * scale) as f32,
-            frame.width() as f32,
-            frame.height() as f32,
-            scale as f32,
-            0.0,
-        ];
-        gpu.scoped("overlay upload", || {
-            gpu.queue()
-                .write_buffer(&self.placement, 0, bytemuck::cast_slice(&placement));
-            gpu.queue().write_texture(
-                TexelCopyTextureInfo {
-                    texture: &uploaded.texture,
-                    mip_level: 0,
-                    origin: Origin3d::ZERO,
-                    aspect: TextureAspect::All,
-                },
-                &image.texels,
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width),
-                    rows_per_image: Some(height),
-                },
-                Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        })
-    }
-
-    /// A texture for a text image of at least `width × height`, rounded up so a slowly
-    /// growing image doesn't make one each frame, and its bind group.
-    ///
-    /// # Errors
-    ///
-    /// As [`Gpu::scoped`].
-    fn upload_target(&self, gpu: &Gpu, width: u32, height: u32) -> Result<Uploaded, GpuError> {
-        let device = gpu.device();
-        gpu.scoped("overlay texture", || {
-            let texture = device.create_texture(&TextureDescriptor {
-                label: Some("overlay text"),
-                size: Extent3d {
-                    width: width.next_multiple_of(64),
-                    height: height.next_multiple_of(16),
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::R8Unorm,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&TextureViewDescriptor::default());
-            let bind_group = device.create_bind_group(&BindGroupDescriptor {
-                label: Some("overlay"),
-                layout: &self.pipeline.get_bind_group_layout(0),
-                entries: &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: self.placement.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: 1,
-                        resource: BindingResource::TextureView(&view),
-                    },
-                ],
-            });
-            Uploaded {
-                texture,
-                bind_group,
-            }
-        })
-    }
-
-    /// Draws the prepared overlay into `pass`; nothing before [`OverlayPass::prepare`] has
-    /// uploaded an image.
-    pub(crate) fn draw(&self, pass: &mut RenderPass<'_>) {
-        if let Some(uploaded) = &self.uploaded {
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &uploaded.bind_group, &[]);
-            pass.draw(0..4, 0..1);
-        }
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
@@ -473,7 +221,7 @@ mod tests {
 
     #[test]
     fn text_is_laid_out_in_cells_inside_the_padding() {
-        let image = TextImage::new(&["AB".to_owned(), "i".to_owned()]);
+        let image = TextLayout::new(&["AB".to_owned(), "i".to_owned()]);
         // Two glyphs and a gap across, two lines and a gap down, padding all round.
         assert_eq!(image.width(), 2 * PADDING + 2 * font::WIDTH + GLYPH_GAP);
         assert_eq!(image.height(), 2 * PADDING + 2 * font::HEIGHT + LINE_GAP);
@@ -496,7 +244,7 @@ mod tests {
 
     #[test]
     fn no_lines_make_an_image_of_padding_only() {
-        let image = TextImage::new(&[]);
+        let image = TextLayout::new(&[]);
         assert_eq!((image.width(), image.height()), (2 * PADDING, 2 * PADDING));
     }
 
@@ -511,9 +259,9 @@ mod tests {
             adapter: "llvmpipe (Vulkan)",
             size: Size::new(640, 480).expect("non-zero"),
             owner: OwnerPhases::default(),
-            render: Some(RenderPhases {
+            render: Some(DrawTimes {
                 acquire: Duration::from_micros(1500),
-                ..RenderPhases::default()
+                ..DrawTimes::default()
             }),
             feed: FeedStats {
                 epochs: 3,
