@@ -195,8 +195,8 @@ struct LodParams {
     coarsen_error: f32,
     // ... and a quad edge below this many.
     coarsen_quad: f32,
-    // Zero.
-    reserved3: u32,
+    // OPTION_ bits.
+    options: u32,
     // Zero.
     reserved0: u32,
     // Zero.
@@ -239,6 +239,10 @@ const W_REFUSED: u32 = 512u;
 const W_SHORT: u32 = 1024u;
 // Wanted refining, below the budget's threshold.
 const W_HELD: u32 = 2048u;
+// Outside the frustum, by the sphere of what it draws: its seams are off-screen.
+const W_OUTSIDE: u32 = 4096u;
+// LodParams.options: seams of tiles outside the frustum are exempt from the neighbour rule.
+const OPTION_OFFSCREEN_SEAMS: u32 = 1u;
 // NodeWork.memory: the tile was refined last frame.
 const MEM_REFINED: u32 = 1u;
 // CutEntry.flags: drawn.
@@ -337,15 +341,25 @@ fn edge_refined(m: u32, edge: u32, bit: u32) -> bool {
     return (a != NONE && (flags_of(a) & bit) != 0u) || (b != NONE && (flags_of(b) & bit) != 0u);
 }
 
+// Whether the seam between node `n` and node `m` (NONE: not resident) is exempt from the
+// neighbour rule: either side lies outside the frustum, so the edge they share is off-screen.
+fn offscreen_seam(n: u32, m: u32) -> bool {
+    if (params.options & OPTION_OFFSCREEN_SEAMS) == 0u {
+        return false;
+    }
+    return (flags_of(n) & W_OUTSIDE) != 0u || (m != NONE && (flags_of(m) & W_OUTSIDE) != 0u);
+}
+
 // Whether node `n`, in the cut by `bit`, touches an area two levels finer: a neighbour at its
-// level refined, with that neighbour's child along the shared edge refined too.
+// level refined, with that neighbour's child along the shared edge refined too. Seams off the
+// screen don't count.
 fn violates(n: u32, bit: u32) -> bool {
     for (var k = 0u; k < 4u; k++) {
         if ((tree[n].edges >> k) & 1u) == 0u {
             continue;
         }
         let m = tree[n].neighbours[k];
-        if m == NONE || (flags_of(m) & bit) == 0u {
+        if m == NONE || (flags_of(m) & bit) == 0u || offscreen_seam(n, m) {
             continue;
         }
         for (var back = 0u; back < 4u; back++) {
@@ -409,6 +423,13 @@ fn begin(@builtin(local_invocation_index) t: u32) {
     frame.reserved = 0u;
 }
 
+// Whether a tile of bounds `b` and bound `e` faces wholly away for refining: its drawn cone,
+// the sphere grown by e. The one place a per-node refine cone (the finest normals' cone the
+// display records are to store) replaces the drawn cone when it arrives.
+fn refine_facing_away(b: TileBounds, e: f32) -> bool {
+    return backfacing(b, view.eye.xyz, e);
+}
+
 // Per tile: in view, wants refining (with hysteresis), complete; the screen error.
 @compute @workgroup_size(64)
 fn choose(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -428,9 +449,12 @@ fn choose(@builtin(global_invocation_id) id: vec3<u32>) {
     let e = tree[n].error;
     var out = W_LIVE;
     var priority = 0.0;
+    if b.radius >= 0.0 && !in_frustum(view, b.center, b.radius) {
+        out |= W_OUTSIDE;
+    }
     if b.radius >= 0.0
         && in_frustum(view, b.center, b.radius + e)
-        && !backfacing(b, view.eye.xyz, e) {
+        && !refine_facing_away(b, e) {
         out |= W_VISIBLE;
         let e_px = projected(view, b, e, e);
         let q_px = projected(view, b, e, b.quad_edge);
@@ -599,7 +623,7 @@ fn sweep(@builtin(global_invocation_id) id: vec3<u32>) {
             continue;
         }
         let m = tree[n].neighbours[k];
-        if m == NONE || !reached_final(m) {
+        if (m == NONE || !reached_final(m)) && !offscreen_seam(n, m) {
             ok = false;
         }
     }

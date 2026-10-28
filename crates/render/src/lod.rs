@@ -28,7 +28,10 @@
 //!   finer. Then a sweep, coarse to fine, keeps a refinement only where every edge neighbour is
 //!   reached at the same level, which makes the invariant hold whatever the passes left: an area
 //!   the passes didn't settle draws a level coarser, counted as the shortfall
-//!   ([`LodStats::shortfall`]).
+//!   ([`LodStats::shortfall`]). The rule is for seams between drawn tiles: a seam where either tile
+//!   lies outside the frustum (by the sphere of what it draws) is off-screen and exempt
+//!   ([`LodConfig::with_offscreen_seams`]); a tile culled by its cone is not, its seams may be on
+//!   the silhouette.
 //! - **Requests.** A tile in the cut that wants refining and lacks children requests them, with its
 //!   screen error, in residency's request buffer ([`crate::residency::REQUESTS_WGSL`]).
 //!
@@ -83,7 +86,7 @@ use crate::cull::{
 };
 use crate::gpu::{Gpu, GpuError};
 use crate::residency::{FrameUse, REQUESTS_WGSL, Tier};
-use crate::tree::{NODE_WGSL, Place};
+use crate::tree::{NODE_BYTES, NODE_WGSL, Place};
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -324,9 +327,15 @@ struct GpuParams {
     coarsen_error: f32,
     /// ... and this projected quad edge.
     coarsen_quad: f32,
+    /// [`OPTION_OFFSCREEN_SEAMS`] when set.
+    options: u32,
     /// Zero.
-    reserved: [u32; 4],
+    reserved: [u32; 3],
 }
+
+/// [`GpuParams::options`]: seams of tiles outside the frustum are exempt from the neighbour
+/// rule.
+const OPTION_OFFSCREEN_SEAMS: u32 = 1;
 
 /// A pass index, WGSL's `Step`.
 #[repr(C)]
@@ -380,6 +389,8 @@ pub struct LodConfig {
     relax_passes: u32,
     /// The screen-error thresholds.
     thresholds: Thresholds,
+    /// Whether seams of tiles outside the frustum are exempt from the neighbour rule.
+    offscreen_seams: bool,
 }
 
 /// The relaxation passes a frame may run by default: all of them.
@@ -403,6 +414,7 @@ impl LodConfig {
             triangle_budget,
             relax_passes: RELAX_PASSES,
             thresholds: Thresholds::SPEC,
+            offscreen_seams: true,
         }
     }
 
@@ -428,6 +440,21 @@ impl LodConfig {
             relax_passes: passes,
             ..self
         })
+    }
+
+    /// This configuration exempting seams of tiles outside the frustum from the neighbour rule
+    /// (`true`, the default) or not.
+    ///
+    /// The rule matters only for seams between drawn tiles, and a tile outside the frustum by
+    /// its conservative sphere has every seam off-screen, so exempting them saves the
+    /// relaxation raising areas nobody sees. Tiles culled by their cone aren't exempt: their
+    /// seams may lie on the silhouette.
+    #[must_use]
+    pub const fn with_offscreen_seams(self, exempt: bool) -> Self {
+        Self {
+            offscreen_seams: exempt,
+            ..self
+        }
     }
 
     /// This configuration with `thresholds`.
@@ -471,6 +498,22 @@ pub enum LodError {
     /// The tile tree is larger than one dispatch covers.
     #[error("{0} nodes: one dispatch covers at most {MAX_NODES}")]
     Capacity(u32),
+    /// The tile tree's buffer holds fewer nodes than the level choice covers.
+    #[error("a tile tree buffer of {bytes} bytes can't hold the {nodes} nodes it was made for")]
+    TreeTooSmall {
+        /// The buffer's size.
+        bytes: u64,
+        /// The nodes the level choice covers.
+        nodes: u32,
+    },
+    /// The previous frame's pyramid wasn't built for depth images of its view's size.
+    #[error("a depth pyramid for {pyramid:?} images against a {view:?} view")]
+    PyramidSize {
+        /// The depth image size the pyramid is for.
+        pyramid: (u32, u32),
+        /// The view's size.
+        view: (u32, u32),
+    },
 }
 
 /// The most nodes the level choice covers: one dispatch of 64 threads a workgroup.
@@ -918,42 +961,25 @@ impl Lod {
     ///
     /// # Errors
     ///
-    /// [`LodError::Gpu`] if a bind group can't be made.
+    /// [`LodError::TreeTooSmall`] if the tree buffer holds fewer nodes than the level choice
+    /// covers; [`LodError::PyramidSize`] if the previous pyramid wasn't built for depth images
+    /// of the previous view's size (nothing is encoded then); [`LodError::Gpu`] if a bind group
+    /// can't be made.
     pub fn encode_main(
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
         inputs: &MainInputs<'_>,
     ) -> Result<(), LodError> {
-        let queue = gpu.queue();
+        self.check(inputs)?;
+        self.write_settings(gpu, inputs);
         let passes = self.config.relax_passes;
-        let thresholds = self.config.thresholds;
-        let params = GpuParams {
-            capacity: self.capacity,
-            finest: u32::from(inputs.finest.get()),
-            budget: self.config.triangle_budget,
-            passes,
-            cluster_capacity: self.cluster_capacity,
-            cut_capacity: self.capacity,
-            retry_capacity: self.capacity,
-            previous: u32::from(inputs.previous.is_some()),
-            refine_error: thresholds.refine_error,
-            refine_quad: thresholds.refine_quad,
-            coarsen_error: thresholds.coarsen_error,
-            coarsen_quad: thresholds.coarsen_quad,
-            reserved: [0; 4],
-        };
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
-        let nodes = self.capacity.div_ceil(GROUP);
-        queue.write_buffer(&self.dispatches, 0, bytemuck::cast_slice(&[nodes, 1, 1]));
-        queue.write_buffer(&self.view, 0, bytemuck::bytes_of(&inputs.view.gpu()));
-        let previous = inputs.previous.map_or(inputs.view, |(view, _)| view);
-        queue.write_buffer(&self.previous_view, 0, bytemuck::bytes_of(&previous.gpu()));
         let group = self.group(gpu, inputs.tree, inputs.requests)?;
         let pyramid = inputs
             .previous
             .map_or(&self.empty_pyramid, |(_, pyramid)| pyramid);
         let phase = self.phase_group(gpu, false, pyramid)?;
+        let nodes = self.capacity.div_ceil(GROUP);
         let step = |index: u32| index * u32::try_from(UNIFORM_STRIDE).unwrap_or(256);
         let p = &self.pipelines;
         {
@@ -1026,6 +1052,66 @@ impl Lod {
         );
         self.group = Some(group);
         Ok(())
+    }
+
+    /// Checks a frame's inputs against what the level choice was made for.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lod::encode_main`]: [`LodError::TreeTooSmall`], [`LodError::PyramidSize`].
+    fn check(&self, inputs: &MainInputs<'_>) -> Result<(), LodError> {
+        let needed = u64::from(self.capacity) * NODE_BYTES;
+        if inputs.tree.size() < needed {
+            return Err(LodError::TreeTooSmall {
+                bytes: inputs.tree.size(),
+                nodes: self.capacity,
+            });
+        }
+        if let Some((view, pyramid)) = inputs.previous {
+            let size = view.size();
+            let wanted = (size.width(), size.height());
+            if pyramid.depth_size() != wanted {
+                return Err(LodError::PyramidSize {
+                    pyramid: pyramid.depth_size(),
+                    view: wanted,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes a frame's settings, its views and the first relaxation pass's dispatch through
+    /// the queue.
+    fn write_settings(&self, gpu: &Gpu, inputs: &MainInputs<'_>) {
+        let queue = gpu.queue();
+        let passes = self.config.relax_passes;
+        let thresholds = self.config.thresholds;
+        let params = GpuParams {
+            capacity: self.capacity,
+            finest: u32::from(inputs.finest.get()),
+            budget: self.config.triangle_budget,
+            passes,
+            cluster_capacity: self.cluster_capacity,
+            cut_capacity: self.capacity,
+            retry_capacity: self.capacity,
+            previous: u32::from(inputs.previous.is_some()),
+            refine_error: thresholds.refine_error,
+            refine_quad: thresholds.refine_quad,
+            coarsen_error: thresholds.coarsen_error,
+            coarsen_quad: thresholds.coarsen_quad,
+            options: if self.config.offscreen_seams {
+                OPTION_OFFSCREEN_SEAMS
+            } else {
+                0
+            },
+            reserved: [0; 3],
+        };
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
+        let nodes = self.capacity.div_ceil(GROUP);
+        queue.write_buffer(&self.dispatches, 0, bytemuck::cast_slice(&[nodes, 1, 1]));
+        queue.write_buffer(&self.view, 0, bytemuck::bytes_of(&inputs.view.gpu()));
+        let previous = inputs.previous.map_or(inputs.view, |(view, _)| view);
+        queue.write_buffer(&self.previous_view, 0, bytemuck::bytes_of(&previous.gpu()));
     }
 
     /// Encodes the second phase, after the first phase's clusters are drawn and `pyramid` is

@@ -309,13 +309,36 @@ fn check_partition(scene: &Scene, output: &LodOutput) {
     }
 }
 
+/// Whether `place` is resident and might lie outside `view`'s frustum.
+///
+/// That is, not decisively inside by the sphere of what it draws.
+fn maybe_outside(scene: &Scene, view: &View, place: Place) -> bool {
+    scene
+        .bounds
+        .get(&place)
+        .is_some_and(|b| !in_frustum(&view.gpu(), b.center, b.radius * 0.999))
+}
+
 /// Neighbours in the cut are at most one level apart across every edge.
-fn check_neighbours(scene: &Scene, output: &LodOutput) {
+///
+/// Given the `view` whose off-screen seams are exempt, a seam is skipped where a tile of it
+/// (either side, their parents, the finer side's edge children) might lie outside its frustum.
+fn check_neighbours(scene: &Scene, output: &LodOutput, view: Option<&View>) {
     let cut = places(output);
     let topology = scene.mesh.topology();
     for &c in &cut {
         for (edge, m) in c.neighbours(topology).into_iter().enumerate() {
             let Some(m) = m else { continue };
+            if let Some(view) = view {
+                let involved = [Some(c), c.parent(), Some(m), m.parent()]
+                    .into_iter()
+                    .flatten()
+                    .chain(m.children().into_iter().flatten());
+                let mut involved = involved;
+                if involved.any(|place| maybe_outside(scene, view, place)) {
+                    continue;
+                }
+            }
             let mut covering = Some(m);
             while let Some(p) = covering {
                 if cut.contains(&p) {
@@ -420,6 +443,94 @@ fn cpu_error(scene: &Scene, view: &View, place: Place) -> Option<f32> {
 }
 
 #[test]
+fn a_tree_too_small_or_a_pyramid_of_another_size_is_refused() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let small = TileTree::new(gpu, &mesh, 8).expect("a tree");
+        let mut lod = Lod::new(gpu, 64, LodConfig::default()).expect("the level choice");
+        let requests = request_buffer(gpu, 16);
+        let view = look(Vec3::new(0.0, 0.0, 3.0), Vec3::default());
+        let mut encoder = gpu
+            .device()
+            .create_command_encoder(&CommandEncoderDescriptor::default());
+        let mut inputs = MainInputs {
+            tree: small.buffer(),
+            requests: &requests,
+            view: &view,
+            previous: None,
+            finest: level(8),
+        };
+        let refused = lod.encode_main(gpu, &mut encoder, &inputs);
+        assert!(
+            matches!(refused, Err(LodError::TreeTooSmall { nodes: 64, .. })),
+            "{refused:?}"
+        );
+        let tree = TileTree::new(gpu, &mesh, 64).expect("a tree");
+        let other =
+            DepthPyramid::new(gpu, Size::new(320, 240).expect("non-zero")).expect("a pyramid");
+        inputs.tree = tree.buffer();
+        inputs.previous = Some((&view, &other));
+        let wrong_size = lod.encode_main(gpu, &mut encoder, &inputs);
+        assert!(
+            matches!(
+                wrong_size,
+                Err(LodError::PyramidSize {
+                    pyramid: (320, 240),
+                    view: (640, 480)
+                })
+            ),
+            "{wrong_size:?}"
+        );
+        inputs.previous = None;
+        assert!(
+            lod.encode_main(gpu, &mut encoder, &inputs).is_ok(),
+            "the right inputs pass"
+        );
+    });
+}
+
+#[test]
+fn seams_off_the_screen_are_exempt_from_the_neighbour_rule_and_save_triangles() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut scene = Scene::new(gpu, mesh, level(8), |_| true, |_| 0.3);
+        let requests = request_buffer(gpu, 1024);
+        let mut strict = Lod::new(
+            gpu,
+            scene.tree.capacity(),
+            LodConfig::default().with_offscreen_seams(false),
+        )
+        .expect("the level choice");
+        let mut exempt =
+            Lod::new(gpu, scene.tree.capacity(), LodConfig::default()).expect("the level choice");
+        let mut saved = 0;
+        // Close to the surface, looking along it: much of the sphere is off the screen.
+        for (k, height) in [1.02, 1.05, 1.1, 1.3].into_iter().enumerate() {
+            let eye = Vec3::new(
+                0.2,
+                height,
+                0.1 * f64::from(u8::try_from(k).expect("small")),
+            );
+            let view = look(eye, eye + Vec3::new(1.0, -0.2, 0.3));
+            let all = run(gpu, &mut strict, &mut scene, &requests, &view, None, None);
+            check_partition(&scene, &all);
+            check_neighbours(&scene, &all, None);
+            let some = run(gpu, &mut exempt, &mut scene, &requests, &view, None, None);
+            check_partition(&scene, &some);
+            check_neighbours(&scene, &some, Some(&view));
+            assert!(
+                some.stats.cut_triangles <= all.stats.cut_triangles,
+                "{:?} against {:?}",
+                some.stats,
+                all.stats
+            );
+            saved += all.stats.cut_triangles - some.stats.cut_triangles;
+        }
+        assert!(saved > 0, "the exemption saves triangles somewhere");
+    });
+}
+
+#[test]
 fn with_everything_resident_no_tile_in_view_is_left_over_a_pixel() {
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");
@@ -442,7 +553,7 @@ fn with_everything_resident_no_tile_in_view_is_left_over_a_pixel() {
             let view = look(eye, Vec3::default());
             let output = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
             check_partition(&scene, &output);
-            check_neighbours(&scene, &output);
+            check_neighbours(&scene, &output, Some(&view));
             check_clusters(gpu, &lod, &scene, &output);
             assert_eq!(output.stats.over_pixel, 0, "{:?}", output.stats);
             assert_eq!(output.stats.shortfall, 0, "settled: {:?}", output.stats);
@@ -516,7 +627,7 @@ fn the_cut_is_complete_with_no_hole_or_overlap_for_random_residency() {
                 let view = look(direction * f64::from(rng.range(1.05, 4.0)), Vec3::default());
                 let output = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
                 check_partition(&scene, &output);
-                check_neighbours(&scene, &output);
+                check_neighbours(&scene, &output, Some(&view));
                 check_clusters(gpu, &lod, &scene, &output);
                 let cut = places(&output);
                 let requested = read_requests(gpu, &requests);
@@ -579,7 +690,7 @@ fn a_spike_of_detail_is_relaxed_into_neighbours_a_level_apart_or_drawn_coarser()
         };
         let settled = relaxed(&mut scene, MAX_RELAX_PASSES);
         check_partition(&scene, &settled);
-        check_neighbours(&scene, &settled);
+        check_neighbours(&scene, &settled, Some(&view));
         let used = settled.stats.passes_used();
         assert!(used >= 2, "the spike needs passes: {:?}", settled.stats);
         assert!(
@@ -592,7 +703,7 @@ fn a_spike_of_detail_is_relaxed_into_neighbours_a_level_apart_or_drawn_coarser()
         for passes in [0, 1] {
             let short = relaxed(&mut scene, passes);
             check_partition(&scene, &short);
-            check_neighbours(&scene, &short);
+            check_neighbours(&scene, &short, Some(&view));
             assert!(
                 short.stats.shortfall > 0,
                 "{passes} passes: {:?}",
@@ -626,8 +737,18 @@ fn the_triangle_budget_caps_the_cut_and_refines_the_largest_errors_first() {
         let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
         let capped = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
         check_partition(&scene, &capped);
-        check_neighbours(&scene, &capped);
-        assert!(capped.stats.cut_triangles <= budget, "{:?}", capped.stats);
+        check_neighbours(&scene, &capped, Some(&view));
+        // Recounted from the cut on the CPU, not taken from the GPU's own count.
+        let recount: u32 = places(&capped)
+            .iter()
+            .map(|place| 2 * place.level().tile_quads().pow(2))
+            .sum();
+        assert!(
+            recount <= budget,
+            "{recount} triangles in the cut: {:?}",
+            capped.stats
+        );
+        assert_eq!(recount, capped.stats.cut_triangles, "the GPU's count");
         assert!(
             capped.stats.refined_triangles <= budget,
             "{:?}",

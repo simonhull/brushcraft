@@ -107,9 +107,9 @@ fn sampled_bounds(mesh: &BaseMesh, place: Place, finest: Level) -> GpuBounds {
 
 /// The benchmark tree shape with every tile up to `top` resident, `rough` choosing the
 /// per-tile error factor.
-fn benchmark_scene(gpu: &Gpu, top: Level, rough: bool) -> Scene {
-    let mesh = cube_sphere(20).expect("the benchmark mesh");
-    let finest = level(9);
+fn benchmark_scene(gpu: &Gpu, shape: Shape, rough: bool) -> Scene {
+    let mesh = cube_sphere(shape.splits).expect("the mesh");
+    let (finest, top) = (shape.finest, shape.top);
     let places: Vec<Place> = all_places(&mesh, finest)
         .into_iter()
         .filter(|place| place.level() <= top)
@@ -151,6 +151,20 @@ fn benchmark_scene(gpu: &Gpu, top: Level, rough: bool) -> Scene {
     }
 }
 
+/// A synthetic tree's shape: `cube_sphere(splits)` to `finest`, every tile up to `top`
+/// resident.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    /// The sphere's splits.
+    splits: u32,
+    /// The finest level.
+    finest: Level,
+    /// The finest resident level.
+    top: Level,
+    /// What to call it.
+    label: &'static str,
+}
+
 /// What a run of frames measured.
 #[derive(Debug, Default)]
 struct Measured {
@@ -162,6 +176,8 @@ struct Measured {
     over_pixel: u32,
     /// The largest cut, tiles and triangles.
     cut: (u32, u32),
+    /// The most triangles the refinements were charged.
+    charged: u32,
     /// Per frame, the stages' GPU times.
     timings: Vec<LodTimings>,
 }
@@ -212,6 +228,7 @@ fn orbit(
         measured.passes.push(stats.passes_used());
         measured.shortfall = measured.shortfall.max(stats.shortfall);
         measured.over_pixel = measured.over_pixel.max(stats.over_pixel);
+        measured.charged = measured.charged.max(stats.refined_triangles);
         measured.cut = (
             measured.cut.0.max(stats.cut),
             measured.cut.1.max(stats.cut_triangles),
@@ -258,36 +275,60 @@ fn orbit_relaxation_passes_and_timings_at_the_benchmark_tree_shape() {
         info.name, info.backend, info.driver, info.driver_info
     );
     let sizes = [(3840, 2160), (1920, 1080)];
-    for (top, label) in [
-        (level(9), "every tile (218,400 nodes)"),
-        (level(8), "display tiles (64,800 nodes)"),
-    ] {
+    let shapes = [
+        Shape {
+            splits: 20,
+            finest: level(9),
+            top: level(9),
+            label: "benchmark, every tile (218,400 nodes)",
+        },
+        Shape {
+            splits: 20,
+            finest: level(9),
+            top: level(8),
+            label: "benchmark, display tiles (64,800 nodes)",
+        },
+        // Deeper than the benchmark: 14 levels, so the relaxation's climb from the back faces
+        // is longest, against the cap of MAX_RELAX_PASSES.
+        Shape {
+            splits: 1,
+            finest: level(13),
+            top: level(13),
+            label: "deep, cube_sphere(1) to level 13 (131,106 nodes)",
+        },
+    ];
+    for shape in shapes {
         for rough in [false, true] {
-            let mut scene = benchmark_scene(&gpu, top, rough);
+            let mut scene = benchmark_scene(&gpu, shape, rough);
             for (width, height) in sizes {
                 let size = Size::new(width, height).expect("non-zero");
                 for distance in [3.0, 1.5, 1.1, 1.02] {
-                    let config = LodConfig::default();
-                    let mut lod =
-                        Lod::new(&gpu, scene.tree.capacity(), config).expect("the level choice");
-                    lod.enable_timing(&gpu).expect("timing");
-                    let mut measured = orbit(&gpu, &mut scene, &mut lod, distance, 72, size);
-                    let mut passes = measured.passes.clone();
-                    passes.sort_unstable();
-                    let max = passes.last().copied().unwrap_or(0);
-                    let median = passes.get(passes.len() / 2).copied().unwrap_or(0);
-                    // The first frame starts from nothing; the rest follow a moving camera.
-                    let steady = measured.passes.iter().skip(1).copied().max().unwrap_or(0);
-                    measured.timings.remove(0);
-                    println!(
-                        "{label}, {}, {width}×{height}, distance {distance}: passes p50 {median} max {max} (after frame 0: {steady}), shortfall max {}, over 1 px max {}, cut max {} tiles {} triangles; {}",
-                        if rough { "rough" } else { "smooth" },
-                        measured.shortfall,
-                        measured.over_pixel,
-                        measured.cut.0,
-                        measured.cut.1,
-                        stages(&measured.timings),
-                    );
+                    for exempt in [false, true] {
+                        let config = LodConfig::default().with_offscreen_seams(exempt);
+                        let mut lod = Lod::new(&gpu, scene.tree.capacity(), config)
+                            .expect("the level choice");
+                        lod.enable_timing(&gpu).expect("timing");
+                        let mut measured = orbit(&gpu, &mut scene, &mut lod, distance, 72, size);
+                        let mut passes = measured.passes.clone();
+                        passes.sort_unstable();
+                        let max = passes.last().copied().unwrap_or(0);
+                        let median = passes.get(passes.len() / 2).copied().unwrap_or(0);
+                        // The first frame starts from nothing; the rest follow a moving camera.
+                        let steady = measured.passes.iter().skip(1).copied().max().unwrap_or(0);
+                        measured.timings.remove(0);
+                        println!(
+                            "{}, {}, {width}×{height}, distance {distance}, off-screen seams {}: passes p50 {median} max {max} (after frame 0: {steady}), shortfall max {}, over 1 px max {}, cut max {} tiles {} triangles, charged max {} triangles; {}",
+                            shape.label,
+                            if rough { "rough" } else { "smooth" },
+                            if exempt { "exempt" } else { "held" },
+                            measured.shortfall,
+                            measured.over_pixel,
+                            measured.cut.0,
+                            measured.cut.1,
+                            measured.charged,
+                            stages(&measured.timings),
+                        );
+                    }
                 }
             }
         }
