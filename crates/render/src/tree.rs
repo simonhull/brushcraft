@@ -2,7 +2,9 @@
 //! walks (plan decision 3).
 //!
 //! Every tile resident on the GPU, display tile or finest tile, is one **node** of the tree, at
-//! a node index that stays the same while the tile stays resident. A node links to its parent,
+//! a node index that stays the same while the tile stays resident (even when an epoch moves its
+//! data to another slot), so the visibility buffer's cluster id derives from it. A node links
+//! to its parent,
 //! its children and its four edge neighbours by topology (across face borders too), each by
 //! node index, or [`NONE`] where that tile isn't resident. The links follow the tiles' places on
 //! their faces ([`Place`]), whichever channel holds them: a display tile's children one level
@@ -436,6 +438,11 @@ impl TileTree {
 
     /// Points the resident tile at `place` to `slot`, with bound `error`; returns the slot it
     /// held, or `None` if `place` isn't resident.
+    ///
+    /// The tile keeps its node index: an epoch that moves a tile to a shadow slot changes its
+    /// slot, never its node. A node index stays the tile's from [`TileTree::insert`] to
+    /// [`TileTree::remove`], which is why the visibility buffer's cluster id derives from the
+    /// node index and not from the slot (plan decision 2 as amended).
     pub(crate) fn move_to(&mut self, place: Place, slot: Slot, error: f32) -> Option<Slot> {
         let index = *self.by_place.get(&place)?;
         let node = usize::try_from(index)
@@ -492,6 +499,12 @@ impl TileTree {
             children: node.place.children().map(|child| self.link(child)),
             neighbours: node.neighbours.map(|neighbour| self.link(neighbour)),
         }
+    }
+
+    /// Marks every node out of date on the GPU: after a frame whose writes never reached it.
+    pub(crate) fn mark_all_dirty(&mut self) {
+        let count = u32::try_from(self.nodes.len()).unwrap_or(self.capacity);
+        self.dirty.extend(0..count);
     }
 
     /// The nodes out of date on the GPU, as runs of consecutive node indices: each run's first

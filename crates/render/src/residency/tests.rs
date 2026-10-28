@@ -5,7 +5,6 @@
 //! resident tile draws.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
 use geom::{BaseMesh, Level, TileKey, cube_sphere};
@@ -62,6 +61,20 @@ struct Model {
     lost: bool,
     /// Every tile of the project.
     all: Vec<TileKey>,
+    /// The tiles the tests' level choice asks for, with their screen errors.
+    asking: BTreeMap<TileKey, f32>,
+    /// Tiles the model has nothing for: their reads give `None`.
+    missing: BTreeSet<TileKey>,
+    /// One read in this many fails (0: none), for the tests of failed frames.
+    fail_one_in: usize,
+    /// Reads done, to choose which fail.
+    reads: usize,
+    /// Tiles readied by `prepare` and not read since: reads take their data from here.
+    prepared: BTreeMap<TileKey, u32>,
+    /// Reads of tiles `prepare` didn't ready.
+    unprepared: usize,
+    /// Every epoch closed, delivered or lost.
+    closed: Vec<Epoch>,
 }
 
 impl Model {
@@ -85,6 +98,13 @@ impl Model {
             undrained: Vec::new(),
             lost: false,
             all: all.collect(),
+            asking: BTreeMap::new(),
+            missing: BTreeSet::new(),
+            fail_one_in: 0,
+            reads: 0,
+            prepared: BTreeMap::new(),
+            unprepared: 0,
+            closed: Vec::new(),
         }
     }
 
@@ -102,12 +122,25 @@ impl Model {
             std::iter::once(place).chain(neighbours)
         });
         let keys: BTreeSet<TileKey> = around.filter_map(|p| p.key(self.finest)).collect();
+        let keys: Vec<TileKey> = keys.into_iter().collect();
+        self.close_exact(&keys);
+    }
+
+    /// Closes an epoch of exactly `keys`, bumping their versions.
+    fn close_exact(&mut self, keys: &[TileKey]) {
+        let keys: BTreeSet<TileKey> = keys.iter().copied().collect();
         let seq = self.next_seq;
         self.next_seq += 1;
         let version = u32::try_from(seq + 1).expect("few epochs");
         for key in &keys {
             self.versions.insert(*key, version);
+            // Data readied before the change is stale now.
+            self.prepared.remove(key);
         }
+        self.closed.push(Epoch {
+            seq,
+            keys: keys.clone(),
+        });
         self.undrained.push(Epoch { seq, keys });
     }
 
@@ -127,11 +160,39 @@ impl Model {
     }
 }
 
-impl TileSource for Model {
-    type Error = Infallible;
+/// A read the model was told to fail.
+#[derive(Debug)]
+struct Failure;
 
-    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<f32>, Infallible> {
-        let version = self.version(&key);
+impl From<Failure> for ResidencyError {
+    fn from(_: Failure) -> Self {
+        Self::Invariant("the model failed a read, as told")
+    }
+}
+
+impl TileSource for Model {
+    type Error = Failure;
+
+    fn prepare(&mut self, keys: &[TileKey]) -> Result<(), Failure> {
+        for key in keys {
+            self.prepared.insert(*key, self.version(key));
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<f32>, Failure> {
+        self.reads += 1;
+        if self.fail_one_in > 0 && self.reads.is_multiple_of(self.fail_one_in) {
+            return Err(Failure);
+        }
+        let readied = self.prepared.remove(&key);
+        if readied.is_none() {
+            self.unprepared += 1;
+        }
+        let version = readied.unwrap_or_else(|| self.version(&key));
+        if self.missing.contains(&key) {
+            return Ok(None);
+        }
         let tag = tag(&key, version);
         out.fill(tag);
         Ok(Some(tag.position[0]))
@@ -162,24 +223,26 @@ fn level(l: u8) -> Level {
 
 /// The configuration of the tiny-budget tests, `extra` slot buffers beyond the floor's.
 ///
-/// Slot buffers hold two side-65 slots, the staging ring four such tiles, and every epoch of
-/// two or more side-65 tiles goes through shadow slots.
+/// Slot buffers hold two side-65 slots, the staging ring four such tiles, every epoch of two
+/// or more side-65 tiles goes through shadow slots, and four such tiles may be forced into a
+/// frame. The floor's classes take twice the floor (their shadow headroom), reserved first.
 fn tiny(mesh: &BaseMesh, extra: u64) -> ResidencyConfig {
     let big = SizeClass::of(level(FINEST)).slot_bytes();
     let faces = u64::from(mesh.face_count());
     let floor: u64 = (0..6)
         .filter_map(SizeClass::new)
-        .map(|class| class.slot_bytes() * faces)
+        .map(|class| 2 * class.slot_bytes() * faces)
         .sum();
-    ResidencyConfig {
-        budget_bytes: floor + extra * 2 * big,
-        buffer_bytes: 2 * big,
-        staging_bytes: 2 * big,
-        staging_cap: 4 * big,
-        small_epoch_bytes: big + big / 2,
-        request_capacity: 64,
-        floor_top: level(5),
-    }
+    ResidencyConfig::new(
+        floor + extra * 2 * big,
+        2 * big,
+        4 * big,
+        big + big / 2,
+        64,
+        level(5),
+    )
+    .and_then(|config| config.with_buffer_bytes(2 * big))
+    .expect("a valid configuration")
 }
 
 /// What the GPU holds: every live node's tile, with the version its slot's first vertex
@@ -247,9 +310,7 @@ fn submit(gpu: &Gpu, uploads: FrameUploads, passes: impl FnOnce(&mut wgpu::Comma
             .create_command_encoder(&CommandEncoderDescriptor::default());
         uploads.encode(&mut encoder);
         passes(&mut encoder);
-        uploads.encode_requests(&mut encoder);
-        gpu.queue().submit([encoder.finish()]);
-        uploads.submitted();
+        uploads.submit(gpu.queue(), encoder);
     })
     .expect("the frame submits");
     gpu.device()
@@ -257,16 +318,35 @@ fn submit(gpu: &Gpu, uploads: FrameUploads, passes: impl FnOnce(&mut wgpu::Comma
         .expect("the GPU finishes");
 }
 
-/// Requests for `count` random tiles not resident, with random screen errors.
-fn random_requests(rng: &mut Rng, model: &Model, residency: &Residency, count: usize) -> Requests {
-    let wanted = (0..count).filter_map(|_| {
+/// The model's requests this frame, and `count` more random tiles not resident.
+///
+/// Those of earlier frames still missing stay asked for (a level choice asks for a tile until it
+/// arrives; one in ten is given up, as a camera moves on); screen errors are random.
+fn random_requests(
+    rng: &mut Rng,
+    model: &mut Model,
+    residency: &Residency,
+    count: usize,
+) -> Requests {
+    model.asking.retain(|key, _| residency.slot(key).is_none());
+    let kept: Vec<TileKey> = model.asking.keys().copied().collect();
+    for key in kept {
+        if rng.one_in(10) {
+            model.asking.remove(&key);
+        }
+    }
+    for _ in 0..count {
         let key = model.any(rng);
-        (residency.slot(&key).is_none()).then(|| Request {
-            key,
-            screen_error: f32::from(u16::try_from(rng.below(1000)).expect("small")),
-        })
-    });
-    Requests::new(wanted, 0)
+        if residency.slot(&key).is_none() {
+            let error = f32::from(u16::try_from(rng.below(1000)).expect("small"));
+            model.asking.insert(key, error);
+        }
+    }
+    let asked = model
+        .asking
+        .iter()
+        .map(|(&key, &screen_error)| Request { key, screen_error });
+    Requests::new(asked, 0)
 }
 
 /// A random cut among the resident tiles: up to `count` of them (none before any arrive).
@@ -318,7 +398,7 @@ fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_
         let mesh = cube_sphere(1).expect("a mesh");
         let mut model = Model::new(&mesh, level(FINEST));
         let config = tiny(&mesh, 3);
-        let budget = config.budget_bytes;
+        let budget = config.budget_bytes();
         let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
         let mut rng = Rng(11);
         let mut drawn: BTreeSet<TileKey> = BTreeSet::new();
@@ -335,7 +415,7 @@ fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_
             let mut kept: BTreeSet<TileKey> = parents.collect();
             kept.extend(cut.iter().copied());
             let asked = 1 + rng.below(6);
-            let requests = random_requests(&mut rng, &model, &residency, asked);
+            let requests = random_requests(&mut rng, &mut model, &residency, asked);
             if rng.one_in(5) {
                 let seed = model.any(&mut rng);
                 model.close(&mesh, &[seed]);
@@ -394,8 +474,9 @@ fn a_request_waits_while_every_slot_it_could_take_is_protected() {
             Requests::new(requests, 0)
         };
         let two = ask(&finest[..2]);
-        // The floor fills most of the first frame's staging; the two take a frame or two more.
-        for _ in 0..3 {
+        // Requests are staged from the frame after they're made; the floor fills most of the
+        // first frame's staging; the two take a frame or two more.
+        for _ in 0..4 {
             frame(
                 gpu,
                 &mut residency,
@@ -411,7 +492,8 @@ fn a_request_waits_while_every_slot_it_could_take_is_protected() {
         );
         let cut: BTreeSet<TileKey> = finest[..2].iter().copied().collect();
         let third = ask(&finest[2..3]);
-        for _ in 0..3 {
+        // The first of these frames only makes the request; the other three are starved.
+        for _ in 0..4 {
             frame(
                 gpu,
                 &mut residency,
@@ -463,6 +545,22 @@ fn assert_whole(view: &BTreeMap<TileKey, u32>, delivered: &[Epoch], step: usize)
     }
 }
 
+/// Checks that, with nothing pending, every slot made is free or a resident tile's, once: no
+/// slot leaked, none given back twice.
+fn assert_census(residency: &Residency) {
+    assert_eq!(
+        residency.stats().pending_epochs,
+        0,
+        "nothing pending holds a slot"
+    );
+    let (made, free) = residency.pools.census();
+    assert_eq!(
+        made,
+        free + residency.stats().resident as u64,
+        "every slot is free or a resident tile's, once"
+    );
+}
+
 /// Checks that every tile the GPU holds shows the store's data, when no epoch is pending.
 fn assert_current(view: &BTreeMap<TileKey, u32>, model: &Model, step: usize) {
     for (key, version) in view {
@@ -500,7 +598,7 @@ fn epochs_apply_whole(extra: u64, seed: u64) {
             delivered.extend(epochs);
             let cut = random_cut(&mut rng, &residency, 2);
             let asked = rng.below(5);
-            let requests = random_requests(&mut rng, &model, &residency, asked);
+            let requests = random_requests(&mut rng, &mut model, &residency, asked);
             frame(
                 gpu,
                 &mut residency,
@@ -524,7 +622,19 @@ fn epochs_apply_whole(extra: u64, seed: u64) {
             "epochs stayed pending over several frames: {pending}"
         );
         assert!(settled > 10, "and settled: {settled}");
-        assert!(residency.stats().forced > 0, "and some were forced whole");
+        assert_eq!(model.unprepared, 0, "every read was readied first");
+        if extra < 10 {
+            assert!(
+                residency.stats().forced > 0,
+                "a tiny budget stalls epochs, and forces them"
+            );
+        } else {
+            assert!(
+                residency.stats().shadowed > 50,
+                "room for shadow slots is used: {:?}",
+                residency.stats()
+            );
+        }
     });
 }
 
@@ -567,7 +677,7 @@ fn resyncs_recover(extra: u64, seed: u64) {
                 cut = random_cut(&mut rng, &residency, 2);
             }
             let asked = rng.below(4);
-            let requests = random_requests(&mut rng, &model, &residency, asked);
+            let requests = random_requests(&mut rng, &mut model, &residency, asked);
             frame(
                 gpu,
                 &mut residency,
@@ -588,11 +698,15 @@ fn resyncs_recover(extra: u64, seed: u64) {
                     "step {step}: floor tile {key:?} left and came back"
                 );
             }
+            assert_whole(&gpu_view(gpu, &residency), &model.closed, step);
             drawn = cut.clone();
         }
         assert!(residency.stats().resyncs > 5, "resynced often");
+        // Lost epochs included: a tile arriving while the resync is pending joins it.
+        assert_whole(&gpu_view(gpu, &residency), &model.closed, 200);
         assert_eq!(residency.stats().pending_epochs, 0, "settled");
         assert_current(&gpu_view(gpu, &residency), &model, 200);
+        assert_census(&residency);
     });
 }
 
@@ -660,10 +774,8 @@ fn requests_the_gpu_writes_are_read_back_a_frame_later_and_brought_in() {
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");
         let mut model = Model::new(&mesh, level(FINEST));
-        let config = ResidencyConfig {
-            request_capacity: 16,
-            ..ResidencyConfig::default()
-        };
+        let config = ResidencyConfig::new(4 << 30, 16 << 20, 64 << 20, 8 << 20, 16, level(5))
+            .expect("a valid configuration");
         let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
         let source = format!(
             "{}{}{REQUEST_CHILDREN}",
@@ -737,6 +849,494 @@ fn requests_the_gpu_writes_are_read_back_a_frame_later_and_brought_in() {
             gpu_view(gpu, &residency).len(),
             all,
             "and the GPU holds them all"
+        );
+    });
+}
+
+/// Runs one frame of nothing new: no epochs, no use, the model's open requests.
+fn quiet_frame(gpu: &Gpu, residency: &mut Residency, model: &mut Model, asking: &[TileKey]) {
+    let requests = Requests::new(
+        asking.iter().map(|&key| Request {
+            key,
+            screen_error: 1.0,
+        }),
+        0,
+    );
+    frame(
+        gpu,
+        residency,
+        model,
+        Drained::Epochs(Vec::new()),
+        FrameUse::default(),
+        Some(&requests),
+    );
+}
+
+#[test]
+fn tiles_the_source_has_nothing_for_wait_for_an_epoch_naming_them() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), ResidencyConfig::default())
+            .expect("residency");
+        let face = geom::FaceId::new(1);
+        let floor = TileKey::display(face, level(3), 0, 0).expect("a floor tile");
+        let fine = TileKey::displacement(face, level(FINEST), 1, 1).expect("a finest tile");
+        let doomed = TileKey::displacement(face, level(FINEST), 0, 1).expect("a finest tile");
+        model.missing.extend([floor, fine]);
+        for _ in 0..3 {
+            quiet_frame(gpu, &mut residency, &mut model, &[fine, doomed]);
+        }
+        assert!(
+            residency.floor_ready(),
+            "the floor is all there that can be"
+        );
+        assert!(
+            residency.slot(&floor).is_none(),
+            "the missing floor tile isn't"
+        );
+        assert!(
+            residency.slot(&fine).is_none(),
+            "nor the missing requested tile"
+        );
+        assert!(
+            residency.slot(&doomed).is_some(),
+            "the other request arrived"
+        );
+        assert_eq!(residency.stats().unavailable, 2, "both counted");
+
+        // The source has them now, but nothing says so: they aren't asked for again.
+        model.missing.clear();
+        let reads = model.reads;
+        for _ in 0..2 {
+            quiet_frame(gpu, &mut residency, &mut model, &[fine]);
+        }
+        assert_eq!(model.reads, reads, "an unavailable tile isn't read again");
+
+        // An epoch naming them: the floor tile is wanted again at once, the request once the
+        // level choice asks again.
+        model.close(&mesh, &[floor]);
+        model.close(&mesh, &[fine]);
+        let (named, _) = model.drain();
+        frame(
+            gpu,
+            &mut residency,
+            &mut model,
+            named,
+            FrameUse::default(),
+            None,
+        );
+        assert!(
+            residency.slot(&floor).is_some(),
+            "the floor tile came back with its epoch"
+        );
+        for _ in 0..2 {
+            quiet_frame(gpu, &mut residency, &mut model, &[fine]);
+        }
+        assert!(
+            residency.slot(&fine).is_some(),
+            "and the request once asked again"
+        );
+
+        // A resident tile whose epoch leaves the source with nothing: dropped when it switches.
+        model.missing.insert(doomed);
+        model.close(&mesh, &[doomed]);
+        let (drained, _) = model.drain();
+        frame(
+            gpu,
+            &mut residency,
+            &mut model,
+            drained,
+            FrameUse::default(),
+            None,
+        );
+        assert!(residency.slot(&doomed).is_none(), "dropped");
+        assert_eq!(residency.stats().dropped, 1, "and counted");
+        let view = gpu_view(gpu, &residency);
+        assert!(!view.contains_key(&doomed), "the GPU's tree lost it too");
+        assert_eq!(model.unprepared, 0, "every read was readied first");
+    });
+}
+
+#[test]
+fn a_resync_retries_the_floor_tiles_the_source_had_nothing_for() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), ResidencyConfig::default())
+            .expect("residency");
+        let floor = TileKey::display(geom::FaceId::new(4), level(5), 0, 0).expect("a floor tile");
+        model.missing.insert(floor);
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        assert!(residency.slot(&floor).is_none(), "missing");
+        model.missing.clear();
+        model.lost = true;
+        let (drained, _) = model.drain();
+        frame(
+            gpu,
+            &mut residency,
+            &mut model,
+            drained,
+            FrameUse::default(),
+            None,
+        );
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        assert!(residency.slot(&floor).is_some(), "retried by the resync");
+        assert_current(&gpu_view(gpu, &residency), &model, 0);
+    });
+}
+
+#[test]
+fn frames_in_flight_unwaited_still_apply_every_epoch_whole() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let config = tiny(&mesh, 20);
+        let cap = config.staging_cap;
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        let mut rng = Rng(41);
+        for step in 0..150 {
+            if step < 120 {
+                for _ in 0..rng.below(3) {
+                    let count = 1 + rng.below(3);
+                    let seeds: Vec<TileKey> = (0..count).map(|_| model.any(&mut rng)).collect();
+                    model.close(&mesh, &seeds);
+                }
+            }
+            let (drained, _) = model.drain();
+            let asked = rng.below(4);
+            let requests = random_requests(&mut rng, &mut model, &residency, asked);
+            residency.begin_frame(gpu).expect("begins");
+            residency.apply(drained);
+            residency.use_frame(FrameUse::default());
+            residency.want(&requests);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let uploads = residency.stage(gpu, &mut model, deadline).expect("staged");
+            // Submitted, never waited for: several frames are in flight, and the one poll a
+            // frame (in begin_frame) brings the staging buffers back when the GPU is done.
+            gpu.scoped("frame", || {
+                let mut encoder = gpu
+                    .device()
+                    .create_command_encoder(&CommandEncoderDescriptor::default());
+                uploads.encode(&mut encoder);
+                uploads.submit(gpu.queue(), encoder);
+            })
+            .expect("submits");
+            assert!(
+                residency.ring.alive() <= cap,
+                "step {step}: the ring stays within its cap"
+            );
+        }
+        gpu.device()
+            .poll(PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        for _ in 0..20 {
+            quiet_frame(gpu, &mut residency, &mut model, &[]);
+        }
+        let view = gpu_view(gpu, &residency);
+        assert_whole(&view, &model.closed, 150);
+        assert_eq!(residency.stats().pending_epochs, 0, "settled");
+        assert_current(&view, &model, 150);
+        assert_census(&residency);
+    });
+}
+
+#[test]
+fn failed_and_dropped_frames_lose_only_their_own_tiles_and_leak_nothing() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let config = tiny(&mesh, 8);
+        let cap = config.staging_cap;
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        let mut rng = Rng(43);
+        let (mut failed, mut dropped) = (0, 0);
+        for step in 0..250 {
+            let quiet = step >= 200;
+            if !quiet {
+                for _ in 0..rng.below(3) {
+                    let count = 1 + rng.below(3);
+                    let seeds: Vec<TileKey> = (0..count).map(|_| model.any(&mut rng)).collect();
+                    model.close(&mesh, &seeds);
+                }
+            }
+            model.fail_one_in = if !quiet && rng.one_in(6) { 3 } else { 0 };
+            let (drained, _) = model.drain();
+            let asked = rng.below(4);
+            let requests = random_requests(&mut rng, &mut model, &residency, asked);
+            residency.begin_frame(gpu).expect("begins");
+            residency.apply(drained);
+            residency.use_frame(FrameUse::default());
+            residency.want(&requests);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            match residency.stage(gpu, &mut model, deadline) {
+                Err(_) => failed += 1,
+                Ok(uploads) if !quiet && rng.one_in(6) => {
+                    // The render thread gives up on it.
+                    drop(uploads);
+                    dropped += 1;
+                }
+                Ok(uploads) => {
+                    submit(gpu, uploads, |_| {});
+                    // A frame after a lost one writes the whole tree: what the GPU holds is
+                    // then the CPU's, and every epoch is whole.
+                    let view = gpu_view(gpu, &residency);
+                    let cpu: BTreeSet<TileKey> = residency.resident().copied().collect();
+                    let on_gpu: BTreeSet<TileKey> = view.keys().copied().collect();
+                    assert_eq!(on_gpu, cpu, "step {step}: the GPU's tree is the CPU's");
+                    assert_whole(&view, &model.closed, step);
+                }
+            }
+            gpu.device()
+                .poll(PollType::wait_indefinitely())
+                .expect("the GPU finishes");
+            assert!(
+                residency.ring.alive() <= cap,
+                "step {step}: no staging leaks"
+            );
+            assert!(
+                residency.requests.made() <= 3,
+                "step {step}: no readback leaks"
+            );
+        }
+        assert!(
+            failed > 5 && dropped > 5,
+            "frames failed ({failed}) and were dropped ({dropped})"
+        );
+        assert!(residency.floor_ready(), "the floor came back");
+        assert_eq!(residency.stats().pending_epochs, 0, "settled");
+        assert_current(&gpu_view(gpu, &residency), &model, 250);
+        assert!(
+            residency.stats().lost_frames >= failed + dropped,
+            "each counted"
+        );
+        assert_census(&residency);
+        // One more frame hears the last map callbacks: then every buffer is back.
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        residency.begin_frame(gpu).expect("begins");
+        assert!(residency.ring.idle(), "every staging buffer came back");
+        assert!(residency.requests.idle(), "every readback buffer came back");
+    });
+}
+
+#[test]
+fn a_frames_uploads_can_be_submitted_on_another_thread() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), ResidencyConfig::default())
+            .expect("residency");
+        residency.begin_frame(gpu).expect("begins");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let uploads = residency.stage(gpu, &mut model, deadline).expect("staged");
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut encoder = gpu
+                    .device()
+                    .create_command_encoder(&CommandEncoderDescriptor::default());
+                uploads.encode(&mut encoder);
+                uploads.submit(gpu.queue(), encoder);
+            });
+        });
+        gpu.device()
+            .poll(PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        assert_eq!(
+            gpu_view(gpu, &residency).len(),
+            residency.stats().floor,
+            "the floor, uploaded from the render thread"
+        );
+    });
+}
+
+/// Stages one frame that has no time at all (its deadline has passed), with `used`, and
+/// submits it.
+fn rushed_frame(gpu: &Gpu, residency: &mut Residency, model: &mut Model, used: FrameUse) {
+    residency.begin_frame(gpu).expect("begins");
+    let (drained, _) = model.drain();
+    residency.apply(drained);
+    residency.use_frame(used);
+    let uploads = residency.stage(gpu, model, Instant::now()).expect("staged");
+    submit(gpu, uploads, |_| {});
+}
+
+#[test]
+fn a_small_epoch_behind_a_pending_large_one_shows_in_the_next_frame() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let config = tiny(&mesh, 10);
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        let face = geom::FaceId::new(0);
+        let tiles: Vec<TileKey> = [(0, 0), (1, 0), (0, 1)]
+            .into_iter()
+            .map(|(tx, ty)| TileKey::displacement(face, level(FINEST), tx, ty).expect("a tile"))
+            .collect();
+        for _ in 0..4 {
+            quiet_frame(gpu, &mut residency, &mut model, &tiles);
+        }
+        assert!(
+            tiles.iter().all(|key| residency.slot(key).is_some()),
+            "resident"
+        );
+        // A large epoch (three side-65 tiles, past the small epoch size) that a frame without
+        // time leaves pending: no slot was missing, so it hasn't stalled.
+        model.close_exact(&tiles);
+        rushed_frame(gpu, &mut residency, &mut model, FrameUse::default());
+        assert_eq!(residency.stats().pending_epochs, 1, "the large epoch waits");
+        // Frames out of time aren't stalls: nothing is forced however many pass.
+        for _ in 0..4 {
+            rushed_frame(gpu, &mut residency, &mut model, FrameUse::default());
+        }
+        assert_eq!(residency.stats().pending_epochs, 1, "still waiting");
+        assert_eq!(residency.stats().forced, 0, "and not forced");
+        // A brush step over one of its tiles: it can't show without the rest, so the pending
+        // epoch goes whole, now, deadline or not.
+        model.close_exact(&tiles[..1]);
+        rushed_frame(gpu, &mut residency, &mut model, FrameUse::default());
+        assert_eq!(residency.stats().pending_epochs, 0, "both applied");
+        assert_current(&gpu_view(gpu, &residency), &model, 0);
+        assert_eq!(residency.stats().forced, 1, "forced once");
+    });
+}
+
+/// Three finest tiles of face 0, and its level-5 floor tile, for the joining tests.
+fn joining_tiles() -> (Vec<TileKey>, TileKey) {
+    let face = geom::FaceId::new(0);
+    let tiles = [(0, 0), (1, 0), (0, 1)]
+        .into_iter()
+        .map(|(tx, ty)| TileKey::displacement(face, level(FINEST), tx, ty).expect("a tile"))
+        .collect();
+    let floor = TileKey::display(face, level(5), 0, 0).expect("a floor tile");
+    (tiles, floor)
+}
+
+#[test]
+fn a_tile_arriving_while_an_epoch_naming_it_is_pending_joins_it() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let config = tiny(&mesh, 10);
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        let (tiles, floor) = joining_tiles();
+        model.missing.insert(floor);
+        for _ in 0..4 {
+            quiet_frame(gpu, &mut residency, &mut model, &tiles);
+        }
+        assert!(
+            residency.slot(&floor).is_none(),
+            "the floor tile is unavailable"
+        );
+        // A large epoch over the tiles and the floor tile, which the source has again: the floor
+        // tile arrives whatever the deadline, the epoch waits for time.
+        model.missing.clear();
+        let mut named = tiles.clone();
+        named.push(floor);
+        model.close_exact(&named);
+        rushed_frame(gpu, &mut residency, &mut model, FrameUse::default());
+        assert_eq!(residency.stats().pending_epochs, 1, "the epoch waits");
+        assert!(
+            residency.slot(&floor).is_none(),
+            "and the floor tile with it"
+        );
+        assert_whole(&gpu_view(gpu, &residency), &model.closed, 0);
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        assert!(
+            residency.slot(&floor).is_some(),
+            "it arrives with the epoch"
+        );
+        assert_current(&gpu_view(gpu, &residency), &model, 1);
+    });
+}
+
+#[test]
+fn a_tile_arriving_while_a_resync_is_pending_joins_it() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let config = tiny(&mesh, 10);
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        let (tiles, floor) = joining_tiles();
+        model.missing.insert(floor);
+        for _ in 0..4 {
+            quiet_frame(gpu, &mut residency, &mut model, &tiles);
+        }
+        // An epoch over a kept tile and the floor tile, lost: the resync re-reads what it keeps
+        // (the cut's tiles and the floor) and retries the floor tile, which may be new beside
+        // the kept tiles' old data, so it waits with them.
+        model.missing.clear();
+        model.close_exact(&[tiles[0], floor]);
+        model.lost = true;
+        let cut: BTreeSet<TileKey> = tiles.iter().copied().collect();
+        rushed_frame(
+            gpu,
+            &mut residency,
+            &mut model,
+            FrameUse::new(cut.clone(), cut),
+        );
+        assert_eq!(residency.stats().pending_epochs, 1, "the resync waits");
+        assert!(
+            residency.slot(&floor).is_none(),
+            "and the floor tile with it"
+        );
+        assert_whole(&gpu_view(gpu, &residency), &model.closed, 0);
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        assert!(
+            residency.slot(&floor).is_some(),
+            "it arrives with the resync"
+        );
+        assert_current(&gpu_view(gpu, &residency), &model, 1);
+    });
+}
+
+#[test]
+fn a_resync_of_the_floor_goes_through_its_shadow_headroom_not_forced() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        // The floor is larger than a small epoch here: it can't go in place unforced.
+        let config = tiny(&mesh, 2);
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        let floor: Vec<TileKey> = residency.resident().copied().collect();
+        model.close_exact(&floor);
+        model.lost = true;
+        let (drained, _) = model.drain();
+        frame(
+            gpu,
+            &mut residency,
+            &mut model,
+            drained,
+            FrameUse::default(),
+            None,
+        );
+        assert_eq!(residency.stats().pending_epochs, 0, "re-read in one frame");
+        assert_eq!(residency.stats().forced, 0, "into shadow slots, not forced");
+        assert!(
+            residency.stats().shadowed >= floor.len() as u64,
+            "every floor tile shadowed"
+        );
+        assert_current(&gpu_view(gpu, &residency), &model, 0);
+    });
+}
+
+#[test]
+fn a_request_is_staged_the_frame_after_it_is_made_so_its_page_in_can_land() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), ResidencyConfig::default())
+            .expect("residency");
+        let (tiles, _) = joining_tiles();
+        quiet_frame(gpu, &mut residency, &mut model, &tiles);
+        assert!(
+            tiles.iter().all(|key| residency.slot(key).is_none()),
+            "not in the frame that asked"
+        );
+        quiet_frame(gpu, &mut residency, &mut model, &tiles);
+        assert!(
+            tiles.iter().all(|key| residency.slot(key).is_some()),
+            "in the next"
         );
     });
 }

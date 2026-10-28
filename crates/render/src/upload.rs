@@ -5,9 +5,11 @@
 //! as [`GpuVertex`]es and writes them, with the tile tree's changed nodes, into staging buffers
 //! mapped for writing. When the frame's uploads are staged, the buffers are unmapped and the
 //! copies they need become a [`FrameUploads`], which the render thread encodes into the frame's
-//! command buffer ahead of every pass ([`FrameUploads::encode`]) and, once submitted, hands back
-//! ([`FrameUploads::submitted`]): each staging buffer is mapped for writing again and returns to
-//! the ring when the GPU is done with it, without the owner thread ever waiting on the GPU.
+//! command buffer ahead of every pass ([`FrameUploads::encode`]) and submits
+//! ([`FrameUploads::submit`]): each staging buffer is then mapped for writing again and returns
+//! to the ring when the GPU is done with it, without the owner thread ever waiting on the GPU.
+//! A frame dropped instead (staging failed, or the render thread gave up on it) gives its
+//! buffers back too.
 //!
 //! Everything a frame stages goes into one submission, so a group of tiles staged together
 //! (an epoch, [`crate::residency`]) and the tree nodes pointing at them switch at once.
@@ -18,7 +20,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use bytemuck::{Pod, Zeroable};
 use geom::{Channel, DisplayTile, TileKey, Vec3};
 use store::{CacheError, Evaluation, TileStore};
-use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode};
+use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode, Queue};
 
 use crate::gpu::{Gpu, GpuError};
 use crate::residency::Requests;
@@ -200,13 +202,13 @@ pub fn prefetch_requests(store: &mut TileStore, requests: &Requests) -> Result<u
     store.prefetch(&finest)
 }
 
-/// A staging buffer the GPU has finished with, coming back to the ring: mapped for writing
-/// again, or not if mapping failed (it is dropped then).
+/// A staging buffer coming back to the ring: from the render thread's map callback once the
+/// GPU is done with it, or from a frame dropped before submission.
 #[derive(Debug)]
 struct Returned {
     /// The buffer.
     buffer: Buffer,
-    /// Whether it is mapped for writing.
+    /// Whether it is mapped for writing (else mapping failed, and it is dropped).
     mapped: bool,
 }
 
@@ -222,9 +224,9 @@ pub(crate) struct StagingRing {
     alive: u64,
     /// Ring buffers mapped and free.
     ready: Vec<Buffer>,
-    /// Where buffers come back from the render thread's map callbacks.
+    /// Where buffers come back.
     returns: Receiver<Returned>,
-    /// Given to each frame's uploads, to send its buffers back.
+    /// Given to each frame, to send its buffers back.
     sender: Sender<Returned>,
 }
 
@@ -243,8 +245,8 @@ impl StagingRing {
         }
     }
 
-    /// Takes back the buffers whose map callbacks have run (the device is polled by the
-    /// caller).
+    /// Takes back the buffers that came back (the device is polled by the caller, for the map
+    /// callbacks to run).
     pub(crate) fn collect(&mut self) {
         while let Ok(returned) = self.returns.try_recv() {
             if returned.mapped {
@@ -253,6 +255,18 @@ impl StagingRing {
                 self.alive = self.alive.saturating_sub(returned.buffer.size());
             }
         }
+    }
+
+    /// Bytes of ring buffers alive: free, being written, or in flight.
+    #[cfg(test)]
+    pub(crate) const fn alive(&self) -> u64 {
+        self.alive
+    }
+
+    /// Whether every ring buffer alive is back and free (none in flight, none lost).
+    #[cfg(test)]
+    pub(crate) fn idle(&self) -> bool {
+        self.ready.len() as u64 * self.buffer_bytes == self.alive
     }
 
     /// A free ring buffer, mapped: one that came back, else a new one if the cap allows;
@@ -323,9 +337,12 @@ struct CopyOp {
 }
 
 /// What the frame being staged has written so far.
-#[derive(Debug, Default)]
+///
+/// Dropped before [`Batch::finish`] (staging failed), it gives its ring buffers back, still
+/// mapped, and nothing it staged reaches the GPU.
+#[derive(Debug)]
 pub(crate) struct Batch {
-    /// Its staging buffers, the last one being filled.
+    /// Its staging buffers, mapped, the last one being filled.
     staging: Vec<Staging>,
     /// Bytes used in the last staging buffer.
     cursor: u64,
@@ -333,9 +350,22 @@ pub(crate) struct Batch {
     copies: Vec<CopyOp>,
     /// Bytes staged.
     bytes: u64,
+    /// Where its ring buffers go back if it is dropped.
+    returns: Sender<Returned>,
 }
 
 impl Batch {
+    /// An empty batch drawing on `ring`.
+    pub(crate) fn new(ring: &StagingRing) -> Self {
+        Self {
+            staging: Vec::new(),
+            cursor: 0,
+            copies: Vec::new(),
+            bytes: 0,
+            returns: ring.sender.clone(),
+        }
+    }
+
     /// Bytes the frame could still stage without going past the ring's cap: what's left in its
     /// current staging buffer and what the ring could give.
     pub(crate) fn room(&self, ring: &StagingRing) -> u64 {
@@ -374,10 +404,11 @@ impl Batch {
         let Some((staging, offset)) = self.reserve(gpu, ring, size, forced)? else {
             return Ok(false);
         };
-        let Some(buffer) = self.staging.get(staging).map(|s| &s.buffer) else {
+        let Some(chosen) = self.staging.get(staging) else {
             return Ok(false);
         };
-        buffer
+        chosen
+            .buffer
             .get_mapped_range_mut(offset..offset + size)?
             .copy_from_slice(data);
         self.copies.push(CopyOp {
@@ -432,19 +463,53 @@ impl Batch {
     }
 
     /// Ends the frame's staging: unmaps its buffers and hands them, with their copies and the
-    /// request readback, to the render thread.
-    pub(crate) fn finish(self, ring: &StagingRing, requests: Option<RequestCopy>) -> FrameUploads {
-        for staging in &self.staging {
-            staging.buffer.unmap();
+    /// request readback, to the render thread as frame `frame`, whose outcome goes to
+    /// `outcomes`.
+    pub(crate) fn finish(
+        mut self,
+        frame: u64,
+        requests: Option<RequestCopy>,
+        outcomes: Sender<FrameOutcome>,
+    ) -> FrameUploads {
+        let staging = std::mem::take(&mut self.staging);
+        for s in &staging {
+            s.buffer.unmap();
         }
         FrameUploads {
-            staging: self.staging,
-            copies: self.copies,
+            frame: Some(frame),
+            staging,
+            copies: std::mem::take(&mut self.copies),
             bytes: self.bytes,
             requests,
-            returns: ring.sender.clone(),
+            returns: self.returns.clone(),
+            outcomes,
         }
     }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        // Not finished: its ring buffers go back as they are, still mapped.
+        for staging in self.staging.drain(..) {
+            if !staging.one_off {
+                drop(self.returns.send(Returned {
+                    buffer: staging.buffer,
+                    mapped: true,
+                }));
+            }
+        }
+    }
+}
+
+/// A readback buffer coming back to the request buffer.
+#[derive(Debug)]
+pub(crate) enum Readback {
+    /// Mapped for reading, its frame's requests in it.
+    Mapped(Buffer),
+    /// Unmapped and unused: its frame was dropped before submission.
+    Unused(Buffer),
+    /// Mapping failed; the buffer is gone.
+    Failed,
 }
 
 /// The request readback a frame makes: the buffer the level choice writes its wanted tiles
@@ -455,16 +520,30 @@ pub(crate) struct RequestCopy {
     pub(crate) source: Buffer,
     /// The readback buffer, unmapped, for this frame alone.
     pub(crate) target: Buffer,
-    /// Where the readback buffer goes once mapped for reading (or not, if mapping failed).
-    pub(crate) done: Sender<(Buffer, bool)>,
+    /// Where the readback buffer goes back.
+    pub(crate) done: Sender<Readback>,
+}
+
+/// What became of a frame's uploads, told to the residency that staged them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameOutcome {
+    /// Frame `0` was submitted.
+    Submitted(u64),
+    /// Frame `0` was dropped before submission: nothing it staged reached the GPU.
+    Lost(u64),
 }
 
 /// One frame's uploads, staged by the owner thread, for the render thread to encode and submit.
 ///
-/// It is [`Send`]: made on the owner thread, consumed on the render thread.
+/// It is [`Send`]: made on the owner thread, consumed on the render thread. Frames are
+/// submitted in the order they were staged. One dropped without [`FrameUploads::submit`] gives
+/// its buffers back and tells its residency, which drops the tiles the frame wrote (they never
+/// reached the GPU) and rewrites the tile tree whole.
 #[derive(Debug)]
 #[must_use = "the frame's uploads must be encoded and submitted, or the tiles never arrive"]
 pub struct FrameUploads {
+    /// The frame number the residency staged it as; `None` once submitted.
+    frame: Option<u64>,
     /// Its staging buffers, unmapped.
     staging: Vec<Staging>,
     /// Its copies, in order.
@@ -475,6 +554,8 @@ pub struct FrameUploads {
     requests: Option<RequestCopy>,
     /// Where staging buffers go back to the ring.
     returns: Sender<Returned>,
+    /// Where the frame's outcome goes.
+    outcomes: Sender<FrameOutcome>,
 }
 
 impl FrameUploads {
@@ -506,10 +587,15 @@ impl FrameUploads {
         }
     }
 
-    /// Encodes the request readback: last in the frame's command buffer, after the pass that
-    /// writes requests. The request buffer is copied out, then its count cleared for the next
-    /// frame.
-    pub fn encode_requests(&self, encoder: &mut CommandEncoder) {
+    /// Ends the frame: encodes the request readback after the passes already in `encoder` (the
+    /// request buffer is copied out, then its count cleared for the next frame), submits the
+    /// command buffer, and only then maps the staging buffers for writing again (they return
+    /// to the ring when the GPU is done with them) and the readback buffer for reading. The
+    /// callbacks run when the device is polled ([`crate::residency::Residency::begin_frame`]
+    /// does).
+    ///
+    /// `encoder` must hold [`FrameUploads::encode`]'s copies first.
+    pub fn submit(mut self, queue: &Queue, mut encoder: CommandEncoder) {
         if let Some(requests) = &self.requests {
             encoder.copy_buffer_to_buffer(
                 &requests.source,
@@ -520,33 +606,61 @@ impl FrameUploads {
             );
             encoder.clear_buffer(&requests.source, 0, Some(crate::residency::REQUEST_HEADER));
         }
-    }
-
-    /// After the frame's command buffer is submitted: maps each staging buffer for writing
-    /// again, to return to the ring when the GPU is done with it, and the readback buffer for
-    /// reading. The callbacks run when the device is polled
-    /// ([`crate::residency::Residency::begin_frame`] does).
-    pub fn submitted(self) {
-        for staging in self.staging {
-            if staging.one_off {
-                continue;
+        queue.submit([encoder.finish()]);
+        for staging in std::mem::take(&mut self.staging) {
+            if !staging.one_off {
+                remap(&staging.buffer, self.returns.clone());
             }
-            let sender = self.returns.clone();
-            let buffer = staging.buffer.clone();
-            staging.buffer.map_async(MapMode::Write, .., move |result| {
-                // A ring that's gone (the residency dropped) has nothing to take it back.
-                drop(sender.send(Returned {
-                    buffer,
-                    mapped: result.is_ok(),
-                }));
-            });
         }
-        if let Some(requests) = self.requests {
+        if let Some(requests) = self.requests.take() {
             let RequestCopy { target, done, .. } = requests;
             let buffer = target.clone();
             target.map_async(MapMode::Read, .., move |result| {
-                drop(done.send((buffer, result.is_ok())));
+                let back = if result.is_ok() {
+                    Readback::Mapped(buffer)
+                } else {
+                    Readback::Failed
+                };
+                drop(done.send(back));
             });
         }
+        if let Some(frame) = self.frame.take() {
+            // A residency that's gone has nothing to hear.
+            self.outcomes
+                .send(FrameOutcome::Submitted(frame))
+                .unwrap_or(());
+        }
+    }
+}
+
+/// Maps `buffer` for writing again, to go back through `returns` once mapped.
+fn remap(buffer: &Buffer, returns: Sender<Returned>) {
+    let back = buffer.clone();
+    buffer.map_async(MapMode::Write, .., move |result| {
+        // A ring that's gone (the residency dropped) has nothing to take it back.
+        drop(returns.send(Returned {
+            buffer: back,
+            mapped: result.is_ok(),
+        }));
+    });
+}
+
+impl Drop for FrameUploads {
+    fn drop(&mut self) {
+        let Some(frame) = self.frame.take() else {
+            // Submitted: everything went with it.
+            return;
+        };
+        // Never submitted: its buffers go back unused, and its residency hears of the loss.
+        for staging in self.staging.drain(..) {
+            if !staging.one_off {
+                remap(&staging.buffer, self.returns.clone());
+            }
+        }
+        if let Some(requests) = self.requests.take() {
+            drop(requests.done.send(Readback::Unused(requests.target)));
+        }
+        // A residency that's gone has nothing to hear.
+        self.outcomes.send(FrameOutcome::Lost(frame)).unwrap_or(());
     }
 }

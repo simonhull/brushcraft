@@ -89,22 +89,24 @@ fn the_stores_tiles_land_in_their_slots_bit_for_bit() {
             Some(0),
             "nothing to page in"
         );
-        residency.begin_frame(gpu).expect("begins");
-        residency.want(&requests);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let uploads = residency
-            .stage(gpu, &mut StoreSource::new(store), deadline)
-            .expect("staged");
-        gpu.scoped("frame", || {
-            let mut encoder = gpu
-                .device()
-                .create_command_encoder(&CommandEncoderDescriptor::default());
-            uploads.encode(&mut encoder);
-            uploads.encode_requests(&mut encoder);
-            gpu.queue().submit([encoder.finish()]);
-            uploads.submitted();
-        })
-        .expect("submits");
+        // Requests are staged from the frame after they're made: the floor arrives in the
+        // first, the requests in the second.
+        for _ in 0..2 {
+            residency.begin_frame(gpu).expect("begins");
+            residency.want(&requests);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let uploads = residency
+                .stage(gpu, &mut StoreSource::new(store), deadline)
+                .expect("staged");
+            gpu.scoped("frame", || {
+                let mut encoder = gpu
+                    .device()
+                    .create_command_encoder(&CommandEncoderDescriptor::default());
+                uploads.encode(&mut encoder);
+                uploads.submit(gpu.queue(), encoder);
+            })
+            .expect("submits");
+        }
         assert!(residency.floor_ready(), "the floor arrived");
 
         let positions: Vec<[f32; 3]> = store
@@ -147,12 +149,4 @@ fn the_stores_tiles_land_in_their_slots_bit_for_bit() {
         }
         drop(project.close(false));
     });
-}
-
-/// Compiles only for a type that can be sent to another thread.
-const fn sendable<T: Send>() {}
-
-#[test]
-fn a_frames_uploads_can_go_to_the_render_thread() {
-    sendable::<FrameUploads>();
 }

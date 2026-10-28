@@ -10,7 +10,7 @@ use wgpu::{Buffer, BufferDescriptor, BufferUsages};
 
 use crate::gpu::{Gpu, GpuError};
 use crate::tree::Place;
-use crate::upload::RequestCopy;
+use crate::upload::{Readback, RequestCopy};
 
 /// Bytes before the request buffer's entries: the count, the dropped count, two reserved
 /// words. Cleared every frame after the readback copy.
@@ -147,10 +147,10 @@ pub(crate) struct RequestBuffer {
     free: Vec<Buffer>,
     /// Readback buffers made.
     made: usize,
-    /// Given to each frame's readback, to send its buffer back once mapped.
-    sender: Sender<(Buffer, bool)>,
-    /// Where mapped readback buffers arrive.
-    mapped: Receiver<(Buffer, bool)>,
+    /// Given to each frame's readback, to send its buffer back.
+    sender: Sender<Readback>,
+    /// Where readback buffers come back: mapped, unused, or lost.
+    mapped: Receiver<Readback>,
     /// Requests read back and not taken yet.
     latest: Option<Requests>,
 }
@@ -180,6 +180,18 @@ impl RequestBuffer {
             mapped,
             latest: None,
         })
+    }
+
+    /// Readback buffers alive: free or in flight.
+    #[cfg(test)]
+    pub(crate) const fn made(&self) -> usize {
+        self.made
+    }
+
+    /// Whether every readback buffer made is back and free.
+    #[cfg(test)]
+    pub(crate) const fn idle(&self) -> bool {
+        self.free.len() == self.made
     }
 
     /// The buffer the GPU appends requests to ([`REQUESTS_WGSL`]'s `TileRequests`).
@@ -219,6 +231,7 @@ impl RequestBuffer {
     }
 
     /// Reads the readback buffers whose maps completed (the device is polled by the caller),
+    /// takes back those of frames dropped before submission,
     /// keeping their requests for [`RequestBuffer::take`], and frees them. Places past
     /// `finest`, or off their face, are skipped.
     ///
@@ -226,11 +239,18 @@ impl RequestBuffer {
     ///
     /// [`GpuError::MapRange`] if a mapped buffer can't be viewed.
     pub(crate) fn collect(&mut self, finest: Level) -> Result<(), GpuError> {
-        while let Ok((buffer, mapped)) = self.mapped.try_recv() {
-            if !mapped {
-                self.made -= 1;
-                continue;
-            }
+        while let Ok(back) = self.mapped.try_recv() {
+            let buffer = match back {
+                Readback::Mapped(buffer) => buffer,
+                Readback::Unused(buffer) => {
+                    self.free.push(buffer);
+                    continue;
+                }
+                Readback::Failed => {
+                    self.made -= 1;
+                    continue;
+                }
+            };
             let read = read_requests(&buffer, finest);
             buffer.unmap();
             self.free.push(buffer);

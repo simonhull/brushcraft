@@ -4,9 +4,12 @@
 //!
 //! Tile data lives in **slot pools**, one per size class (plan decision 2). A class is a tile
 //! side: `2^l + 1` at levels up to 6, where a tile is a whole face, and 65 above. Each class is
-//! a set of storage buffers of up to 128 MiB, cut into equal slots of [`GpuVertex`]es, created
-//! as the budget ([`ResidencyConfig::budget_bytes`], from the capability tier) allows and kept;
-//! a [`Slot`] is (class, buffer, index), and stays the tile's while it is resident.
+//! a few storage buffers as large as the device binds (`max_storage_buffer_binding_size`; see
+//! [`Tier`]), cut into equal slots of [`GpuVertex`]es, created as the budget
+//! ([`ResidencyConfig::budget_bytes`], from the capability tier) allows and kept; a [`Slot`] is
+//! (class, buffer, index). A tile keeps its slot until an epoch large enough for shadow slots
+//! moves it; what stays the tile's while it is resident is its node index in the tile tree
+//! ([`crate::tree`]), and that is what the visibility buffer's cluster id derives from.
 //!
 //! # What stays
 //!
@@ -15,8 +18,8 @@
 //! draw. Other tiles come when the level choice requests them ([`Residency::want`]) and leave
 //! least recently drawn first, when their class needs a slot and the budget allows no new
 //! buffer. Never evicted: the floor, a tile in the current cut, a tile whose children are drawn
-//! (the cut and what was drawn come from the level choice each frame, [`FrameUse`]), and a tile
-//! with an epoch's change pending.
+//! (the cut and what was drawn come from the level choice each frame, [`FrameUse`]), a tile
+//! with an epoch's change pending, and a tile uploaded in the frame being staged.
 //!
 //! # Epochs
 //!
@@ -26,40 +29,49 @@
 //! own slots in the frame it is staged; a large one goes into **shadow slots** over as many
 //! frames as it takes, the tiles keeping their old slots meanwhile, and switches when the last
 //! is staged. A tile arriving while an epoch naming it is pending joins it, and epochs pending
-//! together whose tiles overlap merge. A pending epoch that can't make progress (no shadow
-//! slot to be had) goes whole in its next frame, in place, through a staging buffer of its
-//! own. [`Drained::Resync`] (the feed lost this consumer's epochs) drops every tile that
-//! isn't protected and re-reads the rest, the visible ones, as one epoch.
+//! together whose tiles overlap merge.
+//!
+//! A pending epoch goes whole into one frame, in place (**forced**), when it stalled (no shadow
+//! slot to be had), or when a small epoch (a brush step) merged into it, so that the step shows
+//! now; forced bytes per frame are capped ([`ResidencyConfig::forced_bytes`]), past the cap only
+//! for an epoch stalled for [`LONG_STALL`] frames. [`Drained::Resync`] (the feed lost this
+//! consumer's epochs) drops every tile that isn't protected and re-reads the rest as one epoch,
+//! which every tile arriving meanwhile joins.
 //!
 //! # A frame
 //!
 //! On the owner thread:
 //!
 //! 1. [`Residency::begin_frame`]: polls the device, takes back staging buffers and request
-//!    readbacks the GPU is done with.
+//!    readbacks the GPU is done with, and hears which frames were submitted or lost.
 //! 2. [`Residency::apply`] the drained feed; [`Residency::use_frame`] with the cut and what was
 //!    drawn; [`Residency::take_requests`], the requests a frame's readback gave, to
-//!    [`crate::upload::prefetch_requests`] and [`Residency::want`].
+//!    [`crate::upload::prefetch_requests`] and [`Residency::want`] (staged from the next frame on,
+//!    so the page-in has a frame to land).
 //! 3. [`Residency::stage`]: reads tiles from the source until the deadline, writes them and the
 //!    tile tree's changed nodes into the staging ring, and returns the frame's [`FrameUploads`] for
 //!    the render thread.
 //!
-//! The render thread encodes [`FrameUploads::encode`] before its passes and
-//! [`FrameUploads::encode_requests`] after them, submits, and calls
-//! [`FrameUploads::submitted`].
+//! The render thread encodes [`FrameUploads::encode`] before its passes, then
+//! [`FrameUploads::submit`]s. A frame that fails to stage, or is dropped unsubmitted, drops the
+//! tiles it wrote (their data never reached the GPU) and the whole tile tree is written again
+//! with the next frame; the floor comes back whole.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 use geom::{BaseMesh, Level, TileKey};
 use store::{CacheError, Drained, Epoch};
 use thiserror::Error;
-use wgpu::{Buffer, PollType};
+use wgpu::{Buffer, MAP_ALIGNMENT, PollType};
 
 use crate::gpu::{Gpu, GpuError};
 use crate::tree::{NODE_BYTES, NODE_FINEST, NODE_FLOOR, Place, TileTree, TreeError};
-use crate::upload::{Batch, FrameUploads, GpuVertex, StagingRing, TileSource, VERTEX_BYTES};
+use crate::upload::{
+    Batch, FrameOutcome, FrameUploads, GpuVertex, StagingRing, TileSource, VERTEX_BYTES,
+};
 
 mod pool;
 mod requests;
@@ -180,35 +192,92 @@ impl Slot {
 }
 
 /// A capability tier: what the device is given, per the renderer spec's tier table.
+///
+/// The device is opened with its adapter's limits ([`Gpu::open`]), and slot buffers are as
+/// large as `max_storage_buffer_binding_size` allows, so a class is a few buffers. As measured
+/// (`cargo run -p render --example adapters`, wgpu 30.0.1):
+///
+/// | Tier | Adapter | Storage binding | Buffer | Storage buffers per stage | Buffers per class at the budget |
+/// |---|---|---|---|---|---|
+/// | Desktop | RTX 4090 (Vulkan) | 2047 MiB | 4095 MiB | 524,288 | 2 |
+/// | Desktop | Apple M4 (Metal) | 4095 MiB | 4095 MiB | not recorded | 1 |
+/// | (gate) | lavapipe (Vulkan) | 128 MiB | 2047 MiB | 48 | 32 |
+/// | Mobile high | Adreno 730 | pending (M1c) | | | |
+///
+/// Where a tier's buffers per class would still exceed `max_storage_buffers_per_shader_stage`,
+/// the passes bind one slot buffer per bind group instead; binding arrays are not used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Tier {
-    /// A desktop GPU (an RTX 4090, an M4): 4 GB of tile slots.
+    /// A desktop GPU (an RTX 4090, an M4): 4 GiB of tile slots.
     Desktop,
-    /// A high-end tablet (Galaxy Tab S8+, iPad M-series): 1 GB of tile slots.
+    /// A high-end tablet (Galaxy Tab S8+, iPad M-series): 1 GiB of tile slots.
     MobileHigh,
 }
 
-/// How residency is set up.
+/// Why a residency configuration was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// A size isn't a positive multiple of [`MAP_ALIGNMENT`], as mapping and copying need.
+    #[error("{what} is {bytes} bytes: it must be a positive multiple of {MAP_ALIGNMENT}")]
+    Unaligned {
+        /// Which size.
+        what: &'static str,
+        /// Its value.
+        bytes: u64,
+    },
+    /// The staging cap is below one staging buffer.
+    #[error("the staging cap ({cap} bytes) is below one staging buffer ({buffer} bytes)")]
+    StagingCap {
+        /// The cap.
+        cap: u64,
+        /// Bytes per staging buffer.
+        buffer: u64,
+    },
+    /// The request buffer holds no request, or more than [`MAX_REQUESTS`].
+    #[error("the request buffer holds {0} requests: it must hold 1 to {MAX_REQUESTS}")]
+    Requests(u32),
+    /// A slot buffer can't hold one tile of the largest class.
+    #[error("slot buffers of {bytes} bytes can't hold one tile of {tile} bytes")]
+    BufferTooSmall {
+        /// The bytes per slot buffer.
+        bytes: u64,
+        /// The bytes of the largest class's tile.
+        tile: u64,
+    },
+    /// The budget allows more resident tiles than the tile tree can index, or bind.
+    #[error("the budget allows {tiles} resident tiles, more than a tile tree can hold here")]
+    TooManyTiles {
+        /// The tiles the budget allows.
+        tiles: u64,
+    },
+}
+
+/// The most requests a request buffer may hold.
+pub const MAX_REQUESTS: u32 = 1 << 20;
+
+/// How residency is set up: built by [`ResidencyConfig::for_tier`] or [`ResidencyConfig::new`],
+/// and changed through its checked `with_` methods, so every configuration is a valid one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidencyConfig {
     /// The most bytes the slot buffers may take together.
-    pub budget_bytes: u64,
-    /// Bytes per slot buffer, at most: 128 MiB, inside `wgpu`'s default binding limits (and
-    /// never past the device's).
-    pub buffer_bytes: u64,
+    budget_bytes: u64,
+    /// Bytes per slot buffer, at most; `None` for as large as the device binds.
+    buffer_bytes: Option<u64>,
     /// Bytes per staging buffer.
-    pub staging_bytes: u64,
-    /// The most bytes of staging buffers alive at once; a frame stages no more than the ring
-    /// has free, but for an epoch that must go whole.
-    pub staging_cap: u64,
+    staging_bytes: u64,
+    /// The most bytes of staging buffers alive at once.
+    staging_cap: u64,
     /// The largest epoch, in bytes of tile data, written into its tiles' own slots in the frame
     /// it is staged; a larger one goes through shadow slots.
-    pub small_epoch_bytes: u64,
+    small_epoch_bytes: u64,
+    /// The most bytes of pending epochs forced whole into one frame.
+    forced_bytes: u64,
     /// Requests the request buffer holds per frame.
-    pub request_capacity: u32,
+    request_capacity: u32,
     /// The finest level of the floor: every face's display tiles up to it are pinned.
-    pub floor_top: Level,
+    floor_top: Level,
 }
 
 /// A mebibyte.
@@ -220,6 +289,14 @@ const FLOOR_TOP: Level = match Level::new(5) {
     Err(_) => Level::ZERO,
 };
 
+/// Frames a pending epoch may stall before it is forced whole past
+/// [`ResidencyConfig::forced_bytes`]: so a tiny budget can't keep an epoch from ever applying.
+pub const LONG_STALL: u32 = 8;
+
+/// Keys readied at once by [`TileSource::prepare`]: the deadline is checked between such
+/// batches, so a frame overruns it by at most one batch of tiles.
+const PREPARE_BATCH: usize = 16;
+
 impl ResidencyConfig {
     /// The configuration of `tier`.
     #[must_use]
@@ -230,22 +307,141 @@ impl ResidencyConfig {
         };
         Self {
             budget_bytes,
-            buffer_bytes: 128 * MIB,
+            buffer_bytes: None,
             staging_bytes,
             staging_cap: 4 * staging_bytes,
             small_epoch_bytes: 8 * MIB,
+            forced_bytes: 4 * staging_bytes,
             request_capacity: 4096,
             floor_top: FLOOR_TOP,
         }
     }
 
+    /// A configuration: a budget of `budget_bytes`; staging buffers of `staging_bytes`, at
+    /// most `staging_cap` of them alive; epochs up to `small_epoch_bytes` written in place,
+    /// forced epochs up to the staging cap a frame; `request_capacity` requests a frame; the
+    /// floor up to `floor_top`. Slot buffers are as large as the device binds.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Unaligned`] for a size that isn't a positive multiple of
+    /// [`MAP_ALIGNMENT`]; [`ConfigError::StagingCap`] for a cap below one staging buffer;
+    /// [`ConfigError::Requests`] for a request capacity of 0 or above [`MAX_REQUESTS`].
+    pub fn new(
+        budget_bytes: u64,
+        staging_bytes: u64,
+        staging_cap: u64,
+        small_epoch_bytes: u64,
+        request_capacity: u32,
+        floor_top: Level,
+    ) -> Result<Self, ConfigError> {
+        let config = Self {
+            budget_bytes,
+            buffer_bytes: None,
+            staging_bytes,
+            staging_cap,
+            small_epoch_bytes,
+            forced_bytes: staging_cap,
+            request_capacity,
+            floor_top,
+        };
+        config.check()?;
+        Ok(config)
+    }
+
     /// This configuration with a budget of `budget_bytes`.
-    #[must_use]
-    pub const fn with_budget(self, budget_bytes: u64) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Unaligned`] if it isn't a positive multiple of [`MAP_ALIGNMENT`].
+    pub fn with_budget(self, budget_bytes: u64) -> Result<Self, ConfigError> {
+        let config = Self {
             budget_bytes,
             ..self
+        };
+        config.check()?;
+        Ok(config)
+    }
+
+    /// This configuration with slot buffers of at most `buffer_bytes` (still no larger than
+    /// the device binds).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Unaligned`] if it isn't a positive multiple of [`MAP_ALIGNMENT`].
+    pub fn with_buffer_bytes(self, buffer_bytes: u64) -> Result<Self, ConfigError> {
+        let config = Self {
+            buffer_bytes: Some(buffer_bytes),
+            ..self
+        };
+        config.check()?;
+        Ok(config)
+    }
+
+    /// This configuration forcing at most `forced_bytes` of pending epochs whole into a frame.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Unaligned`] if it isn't a positive multiple of [`MAP_ALIGNMENT`].
+    pub fn with_forced_bytes(self, forced_bytes: u64) -> Result<Self, ConfigError> {
+        let config = Self {
+            forced_bytes,
+            ..self
+        };
+        config.check()?;
+        Ok(config)
+    }
+
+    /// The most bytes the slot buffers may take together.
+    #[must_use]
+    pub const fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    /// The finest level of the floor.
+    #[must_use]
+    pub const fn floor_top(&self) -> Level {
+        self.floor_top
+    }
+
+    /// The most bytes of pending epochs forced whole into one frame.
+    #[must_use]
+    pub const fn forced_bytes(&self) -> u64 {
+        self.forced_bytes
+    }
+
+    /// Checks the sizes against each other.
+    ///
+    /// # Errors
+    ///
+    /// As [`ResidencyConfig::new`].
+    fn check(&self) -> Result<(), ConfigError> {
+        let sizes = [
+            ("the budget", Some(self.budget_bytes)),
+            ("a slot buffer", self.buffer_bytes),
+            ("a staging buffer", Some(self.staging_bytes)),
+            ("the staging cap", Some(self.staging_cap)),
+            ("the small epoch size", Some(self.small_epoch_bytes)),
+            ("the forced bytes", Some(self.forced_bytes)),
+        ];
+        let given = sizes
+            .into_iter()
+            .filter_map(|(what, bytes)| Some((what, bytes?)));
+        for (what, bytes) in given {
+            if bytes == 0 || !bytes.is_multiple_of(MAP_ALIGNMENT) {
+                return Err(ConfigError::Unaligned { what, bytes });
+            }
         }
+        if self.staging_cap < self.staging_bytes {
+            return Err(ConfigError::StagingCap {
+                cap: self.staging_cap,
+                buffer: self.staging_bytes,
+            });
+        }
+        if self.request_capacity == 0 || self.request_capacity > MAX_REQUESTS {
+            return Err(ConfigError::Requests(self.request_capacity));
+        }
+        Ok(())
     }
 }
 
@@ -280,12 +476,18 @@ pub enum ResidencyError {
     /// The GPU failed: making a buffer, mapping one, polling the device.
     #[error(transparent)]
     Gpu(#[from] GpuError),
-    /// The tile tree is full: it is sized for every slot the budget allows, so this is a bug.
+    /// The tile tree is full: it is sized for every tile the budget allows, so this is a bug.
     #[error(transparent)]
     Tree(#[from] TreeError),
     /// The store couldn't give a tile.
     #[error("the store couldn't give a tile: {0}")]
     Store(#[from] CacheError),
+    /// The configuration doesn't fit this project or device.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    /// Residency's own bookkeeping broke: a bug.
+    #[error("residency bookkeeping broke: {0}")]
+    Invariant(&'static str),
 }
 
 impl From<Infallible> for ResidencyError {
@@ -315,8 +517,12 @@ pub struct ResidencyStats {
     pub starved: u64,
     /// Resident tiles dropped because an epoch left the source with nothing for them, ever.
     pub dropped: u64,
+    /// Tiles staged into shadow slots, ever.
+    pub shadowed: u64,
     /// Pending epochs forced whole into one frame, ever.
     pub forced: u64,
+    /// Frames that failed to stage or were dropped unsubmitted, ever.
+    pub lost_frames: u64,
     /// Resyncs, ever.
     pub resyncs: u64,
     /// Bytes the last frame staged.
@@ -332,6 +538,15 @@ struct Entry {
     last_drawn: u64,
     /// Whether it is part of the floor.
     floor: bool,
+}
+
+/// A tile requested.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Want {
+    /// Its screen error: larger is staged first.
+    error: f32,
+    /// The frame it was first requested in: it is staged from the next one on.
+    since: u64,
 }
 
 /// A pending tile's new data.
@@ -354,12 +569,17 @@ enum Staged {
 struct Group {
     /// Every tile its epochs named, resident or not: a tile arriving that is one of them joins.
     keys: BTreeSet<TileKey>,
+    /// Whether it names every tile: a resync's, which every arrival joins.
+    all: bool,
     /// Members whose new data isn't staged yet.
     todo: BTreeSet<TileKey>,
     /// Members whose new data is staged.
     staged: BTreeMap<TileKey, Staged>,
-    /// Frames it was staged in without progress.
+    /// Frames it found no shadow slot to be had.
     stalled: u32,
+    /// Whether a small epoch merged into it: it goes whole in its next frame, so the small
+    /// one shows.
+    urgent: bool,
 }
 
 impl Group {
@@ -368,12 +588,19 @@ impl Group {
         self.todo.contains(key) || self.staged.contains_key(key)
     }
 
+    /// Whether a tile arriving as `key` joins it.
+    fn names(&self, key: &TileKey) -> bool {
+        self.all || self.keys.contains(key)
+    }
+
     /// Takes `other`'s keys and members.
     fn absorb(&mut self, other: Self) {
         self.keys.extend(other.keys);
+        self.all |= other.all;
         self.todo.extend(other.todo);
         self.staged.extend(other.staged);
         self.stalled = self.stalled.max(other.stalled);
+        self.urgent |= other.urgent;
     }
 }
 
@@ -386,6 +613,8 @@ enum Read {
     Missing,
     /// The staging ring had no room.
     NoRoom,
+    /// No slot of its class could be had.
+    NoSlot,
 }
 
 /// The GPU residency of one project's tiles (see the module notes).
@@ -409,8 +638,8 @@ pub struct Residency {
     recency: Vec<BTreeSet<(u64, TileKey)>>,
     /// The floor's tiles.
     floor: BTreeSet<TileKey>,
-    /// Tiles requested, by screen error.
-    wanted: BTreeMap<TileKey, f32>,
+    /// Tiles requested.
+    wanted: BTreeMap<TileKey, Want>,
     /// Tiles the source had nothing for, until an epoch names them.
     unavailable: BTreeSet<TileKey>,
     /// Pending epochs, oldest first.
@@ -423,6 +652,20 @@ pub struct Residency {
     cut: BTreeSet<TileKey>,
     /// The places whose children are in the cut or drawn.
     shielded: BTreeSet<Place>,
+    /// The tiles the frame being staged wrote, with the slot each was written to.
+    touched: Vec<(TileKey, Slot)>,
+    /// The same tiles, as a set: never evicted by the frame that wrote them.
+    fresh: BTreeSet<TileKey>,
+    /// Bytes of pending epochs forced into the frame being staged.
+    forced_now: u64,
+    /// Per frame staged and not yet heard of as submitted, the tiles it wrote.
+    in_flight: BTreeMap<u64, Vec<(TileKey, Slot)>>,
+    /// The next staged frame's number.
+    next_upload: u64,
+    /// Given to each frame's uploads, to tell what became of them.
+    outcome_sender: Sender<FrameOutcome>,
+    /// Where frames' outcomes arrive.
+    outcomes: Receiver<FrameOutcome>,
     /// The staging ring.
     ring: StagingRing,
     /// The request buffer and its readbacks.
@@ -435,10 +678,16 @@ pub struct Residency {
 
 impl Residency {
     /// Residency for a project of `mesh` whose finest level is `finest`, with nothing resident
-    /// yet: the floor is staged by the first [`Residency::stage`], whole.
+    /// yet: the floor's slot buffers are made now (with their shadow headroom), and the floor is
+    /// staged by the first [`Residency::stage`], whole.
+    ///
+    /// Slot buffers are as large as the device binds, or the configuration's smaller size;
+    /// staging buffers hold at least one tile of the finest class.
     ///
     /// # Errors
     ///
+    /// [`ResidencyError::Config`] if a slot buffer can't hold a tile of the finest class, or
+    /// the budget allows more resident tiles than the tile tree can index or the device bind;
     /// [`ResidencyError::Gpu`] or [`ResidencyError::Tree`] if a buffer can't be created.
     pub fn new(
         gpu: &Gpu,
@@ -447,19 +696,39 @@ impl Residency {
         config: ResidencyConfig,
     ) -> Result<Self, ResidencyError> {
         let limits = gpu.device().limits();
-        let buffer_bytes = config
-            .buffer_bytes
-            .min(limits.max_storage_buffer_binding_size)
+        let binding = limits
+            .max_storage_buffer_binding_size
             .min(limits.max_buffer_size);
+        let buffer_bytes = config.buffer_bytes.map_or(binding, |b| b.min(binding));
+        let largest = SizeClass::of(finest).slot_bytes();
+        if buffer_bytes < largest {
+            return Err(ConfigError::BufferTooSmall {
+                bytes: buffer_bytes,
+                tile: largest,
+            }
+            .into());
+        }
         let faces = mesh.face_count();
-        let pools = Pools::new(faces, finest, buffer_bytes, config.budget_bytes);
-        let capacity = u32::try_from(pools.max_slots()).unwrap_or(u32::MAX);
+        let mut pools = Pools::new(faces, finest, buffer_bytes, config.budget_bytes);
+        let tiles = pools.max_resident();
+        let capacity = u32::try_from(tiles)
+            .ok()
+            .filter(|&nodes| u64::from(nodes) * NODE_BYTES <= binding)
+            .ok_or(ConfigError::TooManyTiles { tiles })?;
         let tree = TileTree::new(gpu, mesh, capacity)?;
         let requests = RequestBuffer::new(gpu, config.request_capacity)?;
         let floor_levels = (0..=config.floor_top.get())
             .filter_map(|l| Level::new(l).ok())
             .filter(|&level| level < finest);
         let floor_levels: Vec<Level> = floor_levels.collect();
+        for &level in &floor_levels {
+            let class = SizeClass::of(level);
+            // A class the floor fills alone (every class but the last): its tiles all pinned,
+            // and tiny.
+            if usize::from(class.get()) + 1 < CLASSES {
+                pools.reserve(gpu, class)?;
+            }
+        }
         let floor: BTreeSet<TileKey> = mesh
             .faces()
             .flat_map(|face| {
@@ -472,10 +741,9 @@ impl Residency {
                 })
             })
             .collect();
-        // A staging buffer holds at least one tile of the largest class, or a tile that isn't
-        // forced would never find room.
-        let staging_bytes = config.staging_bytes.max(SizeClass::of(finest).slot_bytes());
+        let staging_bytes = config.staging_bytes.max(largest);
         let staging_cap = config.staging_cap.max(staging_bytes);
+        let (outcome_sender, outcomes) = mpsc::channel();
         Ok(Self {
             ring: StagingRing::new(staging_bytes, staging_cap),
             config,
@@ -493,6 +761,13 @@ impl Residency {
             frame: 0,
             cut: BTreeSet::new(),
             shielded: BTreeSet::new(),
+            touched: Vec::new(),
+            fresh: BTreeSet::new(),
+            forced_now: 0,
+            in_flight: BTreeMap::new(),
+            next_upload: 0,
+            outcome_sender,
+            outcomes,
             requests,
             stats: ResidencyStats::default(),
             scratch: Vec::new(),
@@ -560,7 +835,8 @@ impl Residency {
     }
 
     /// Starts a frame: polls the device without waiting, takes back the staging buffers the
-    /// GPU is done with, and reads the request readbacks that completed.
+    /// GPU is done with, reads the request readbacks that completed, and hears which staged
+    /// frames were submitted or lost (a lost frame's tiles are dropped).
     ///
     /// # Errors
     ///
@@ -570,6 +846,18 @@ impl Residency {
         gpu.device().poll(PollType::Poll).map_err(GpuError::from)?;
         self.ring.collect();
         self.requests.collect(self.finest)?;
+        while let Ok(outcome) = self.outcomes.try_recv() {
+            match outcome {
+                FrameOutcome::Submitted(frame) => {
+                    self.in_flight.remove(&frame);
+                }
+                FrameOutcome::Lost(frame) => {
+                    if let Some(touched) = self.in_flight.remove(&frame) {
+                        self.recover(&touched, false);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -581,20 +869,35 @@ impl Residency {
     }
 
     /// Wants the tiles of `requests` resident, larger screen error first: they replace the
-    /// requests wanted before (the floor stays wanted until resident). Resident tiles, tiles
-    /// of no face of the mesh, and tiles the source had nothing for are skipped.
+    /// requests wanted before (the floor stays wanted until resident). A tile is staged from
+    /// the frame after it was first requested on, so a page-in started now
+    /// ([`crate::upload::prefetch_requests`]) has a frame to land. Resident tiles, tiles of no
+    /// face of the mesh or below its finest level, and tiles the source had nothing for are
+    /// skipped.
     pub fn want(&mut self, requests: &Requests) {
-        let floor = &self.floor;
-        self.wanted.retain(|key, _| floor.contains(key));
-        let faces = self.faces;
-        let finest = self.finest;
+        let old = std::mem::take(&mut self.wanted);
+        let (faces, finest, frame) = (self.faces, self.finest, self.frame);
+        let floor = old
+            .iter()
+            .filter(|(key, _)| self.floor.contains(key))
+            .map(|(key, want)| (*key, *want));
+        let floor: Vec<(TileKey, Want)> = floor.collect();
         let fresh = requests.iter().filter(|request| {
             request.key.face().index() < faces
                 && request.key.level() <= finest
                 && !self.entries.contains_key(&request.key)
                 && !self.unavailable.contains(&request.key)
         });
-        let fresh: Vec<(TileKey, f32)> = fresh.map(|r| (r.key, r.screen_error)).collect();
+        let fresh = fresh.map(|request| {
+            let since = old.get(&request.key).map_or(frame, |want| want.since);
+            let want = Want {
+                error: request.screen_error,
+                since,
+            };
+            (request.key, want)
+        });
+        let fresh: Vec<(TileKey, Want)> = fresh.collect();
+        self.wanted.extend(floor);
         self.wanted.extend(fresh);
     }
 
@@ -636,12 +939,19 @@ impl Residency {
     }
 
     /// Makes `epoch` pending: its resident tiles, merged with the pending epochs that share a
-    /// member with it. A member already staged for an earlier epoch is staged again.
+    /// member with it. A member already staged for an earlier epoch is staged again. A small
+    /// epoch merged into a pending one makes it urgent: it goes whole in the next frame.
     fn apply_epoch(&mut self, epoch: Epoch) {
         let keys = epoch.keys;
         for key in &keys {
             if self.unavailable.remove(key) && self.floor.contains(key) {
-                self.wanted.insert(*key, f32::INFINITY);
+                self.wanted.insert(
+                    *key,
+                    Want {
+                        error: f32::INFINITY,
+                        since: 0,
+                    },
+                );
             }
         }
         let live: BTreeSet<TileKey> = keys
@@ -656,7 +966,12 @@ impl Residency {
         if live.is_empty() && touching.is_empty() {
             return;
         }
+        let bytes: u64 = live
+            .iter()
+            .map(|key| SizeClass::of(key.level()).slot_bytes())
+            .sum();
         let mut merged = Group {
+            urgent: !touching.is_empty() && bytes <= self.config.small_epoch_bytes,
             todo: live,
             ..Group::default()
         };
@@ -684,7 +999,8 @@ impl Residency {
 
     /// After the feed lost this consumer's epochs: drops every pending epoch and every
     /// resident tile that isn't protected, and makes the rest (the floor and what the frame
-    /// uses) one pending epoch, re-read whole.
+    /// uses) one pending epoch, re-read whole, which every tile arriving meanwhile joins (an
+    /// epoch the feed lost may name it).
     fn resync(&mut self) {
         self.stats.resyncs += 1;
         for group in std::mem::take(&mut self.groups) {
@@ -704,16 +1020,21 @@ impl Residency {
         let kept: BTreeSet<TileKey> = self.entries.keys().copied().collect();
         let retry = std::mem::take(&mut self.unavailable);
         let floor_retry = retry.into_iter().filter(|key| self.floor.contains(key));
-        let floor_retry: Vec<(TileKey, f32)> =
-            floor_retry.map(|key| (key, f32::INFINITY)).collect();
+        let floor_retry = floor_retry.map(|key| {
+            let want = Want {
+                error: f32::INFINITY,
+                since: 0,
+            };
+            (key, want)
+        });
+        let floor_retry: Vec<(TileKey, Want)> = floor_retry.collect();
         self.wanted.extend(floor_retry);
-        if !kept.is_empty() {
-            self.groups.push(Group {
-                keys: kept.clone(),
-                todo: kept,
-                ..Group::default()
-            });
-        }
+        self.groups.push(Group {
+            keys: kept.clone(),
+            all: true,
+            todo: kept,
+            ..Group::default()
+        });
     }
 
     /// Whether `key` must stay: the floor, the current cut, or a tile whose children are in
@@ -724,15 +1045,63 @@ impl Residency {
             || self.shielded.contains(&Place::of(key))
     }
 
+    /// After a frame failed to stage (`staged_now`) or was dropped unsubmitted: drops every
+    /// tile whose slot holds data the frame wrote (it never reached the GPU), unstages the
+    /// shadow data it wrote, and marks the whole tile tree to be written again.
+    ///
+    /// A slot the frame wrote that nothing holds any more was given back since (a later frame
+    /// evicted its tile), unless the frame failed while staging (`staged_now`): then it was
+    /// taken and never handed to its tile, and is given back here.
+    fn recover(&mut self, touched: &[(TileKey, Slot)], staged_now: bool) {
+        self.stats.lost_frames += 1;
+        for &(key, slot) in touched {
+            let live_here = self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.slot == slot);
+            let mut unstaged = false;
+            for group in &mut self.groups {
+                if matches!(group.staged.get(&key), Some(Staged::Data { slot: s, .. }) if *s == slot)
+                {
+                    group.staged.remove(&key);
+                    group.todo.insert(key);
+                    unstaged = true;
+                }
+            }
+            if live_here {
+                let mut shadows = Vec::new();
+                for group in &mut self.groups {
+                    group.todo.remove(&key);
+                    shadows.extend(group.staged.remove(&key));
+                }
+                for staged in shadows {
+                    self.release_staged(&key, staged);
+                }
+                self.remove_live(&key);
+            } else if unstaged || staged_now {
+                self.pools.release(slot);
+            }
+        }
+        // Members that aren't resident any more and were never staged wait to arrive anew.
+        let entries = &self.entries;
+        for group in &mut self.groups {
+            group.todo.retain(|key| entries.contains_key(key));
+        }
+        self.tree.mark_all_dirty();
+    }
+
     /// Stages the frame's uploads from `source`: the floor first if it isn't resident (whole,
     /// whatever the deadline), then the pending epochs oldest first, then requested tiles,
-    /// largest screen error first, until `deadline` or until the staging ring is full; then
-    /// the tile tree's changed nodes. Returns them for the render thread.
+    /// largest screen error first, until `deadline` (overrun by at most one batch of tiles
+    /// being readied) or until the staging ring is full; then the tile tree's changed nodes.
+    /// Returns them for the render thread.
     ///
     /// # Errors
     ///
-    /// [`ResidencyError::Gpu`] if a buffer can't be made or written; the source's errors; the
-    /// tiles staged until then are lost with the frame (and staged again later).
+    /// [`ResidencyError::Gpu`] if a buffer can't be made or written, the source's errors, and
+    /// [`ResidencyError::Tree`] or [`ResidencyError::Invariant`] for a bug. The frame is then
+    /// lost: its staging buffers go back to the ring, the tiles it wrote are dropped (none
+    /// reached the GPU), and the next frame writes the whole tile tree again.
     pub fn stage<S: TileSource>(
         &mut self,
         gpu: &Gpu,
@@ -742,20 +1111,83 @@ impl Residency {
     where
         S::Error: Into<ResidencyError>,
     {
-        let mut batch = Batch::default();
+        self.touched.clear();
+        self.fresh.clear();
+        self.forced_now = 0;
         self.pending = self
             .groups
             .iter()
             .flat_map(|group| group.todo.iter().chain(group.staged.keys()))
             .copied()
             .collect();
-        self.stage_floor(gpu, &mut batch, source)?;
-        for group in std::mem::take(&mut self.groups) {
-            if let Some(group) = self.stage_group(gpu, &mut batch, source, group, deadline)? {
-                self.groups.push(group);
+        let mut batch = Batch::new(&self.ring);
+        match self.stage_into(gpu, &mut batch, source, deadline) {
+            Ok(()) => {
+                let requests = match self.requests.copy(gpu) {
+                    Ok(requests) => requests,
+                    Err(error) => return Err(self.fail(batch, error.into())),
+                };
+                self.stats.staged_bytes = batch.bytes();
+                let frame = self.next_upload;
+                self.next_upload += 1;
+                self.in_flight
+                    .insert(frame, std::mem::take(&mut self.touched));
+                Ok(batch.finish(frame, requests, self.outcome_sender.clone()))
+            }
+            Err(error) => Err(self.fail(batch, error)),
+        }
+    }
+
+    /// Ends a frame that failed to stage: its batch goes (its buffers back to the ring) and
+    /// the tiles it wrote are dropped. Returns `error`.
+    fn fail(&mut self, batch: Batch, error: ResidencyError) -> ResidencyError {
+        drop(batch);
+        let touched = std::mem::take(&mut self.touched);
+        self.recover(&touched, true);
+        error
+    }
+
+    /// [`Residency::stage`]'s work, into `batch`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Residency::stage`].
+    fn stage_into<S: TileSource>(
+        &mut self,
+        gpu: &Gpu,
+        batch: &mut Batch,
+        source: &mut S,
+        deadline: Instant,
+    ) -> Result<(), ResidencyError>
+    where
+        S::Error: Into<ResidencyError>,
+    {
+        self.stage_floor(gpu, batch, source)?;
+        let mut groups = std::mem::take(&mut self.groups);
+        let mut at = 0;
+        let mut failed = None;
+        while at < groups.len() {
+            let Some(group) = groups.get_mut(at) else {
+                break;
+            };
+            match self.stage_group(gpu, batch, source, group, deadline) {
+                Ok(true) => {
+                    groups.remove(at);
+                }
+                Ok(false) => at += 1,
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
             }
         }
-        self.stage_wanted(gpu, &mut batch, source, deadline)?;
+        // Groups made meanwhile (none: only arrivals make them) go after the older ones.
+        groups.append(&mut self.groups);
+        self.groups = groups;
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        self.stage_wanted(gpu, batch, source, deadline)?;
         for (start, nodes) in self.tree.take_dirty() {
             let offset = u64::from(start) * NODE_BYTES;
             batch.write(
@@ -767,9 +1199,7 @@ impl Residency {
                 true,
             )?;
         }
-        self.stats.staged_bytes = batch.bytes();
-        let requests = self.requests.copy(gpu)?;
-        Ok(batch.finish(&self.ring, requests))
+        Ok(())
     }
 
     /// Stages every floor tile not resident, whole, past the ring's cap if need be.
@@ -801,14 +1231,17 @@ impl Residency {
         }
         source.prepare(&missing).map_err(Into::into)?;
         for key in missing {
-            self.wanted.remove(&key);
-            self.arrive(gpu, batch, source, key, true)?;
+            self.forced_now += SizeClass::of(key.level()).slot_bytes();
+            if self.arrive(gpu, batch, source, key, true)? != Read::NoSlot {
+                self.wanted.remove(&key);
+            }
         }
         Ok(())
     }
 
-    /// Stages the requested tiles, largest screen error first, until `deadline` or the ring
-    /// is full.
+    /// Stages the requested tiles, largest screen error first, readied a batch at a time,
+    /// until `deadline` or the ring is full. Tiles first requested this frame wait for the
+    /// next.
     ///
     /// # Errors
     ///
@@ -823,35 +1256,40 @@ impl Residency {
     where
         S::Error: Into<ResidencyError>,
     {
-        let mut by_error: Vec<(TileKey, f32)> = self.wanted.iter().map(|(k, e)| (*k, *e)).collect();
+        let frame = self.frame;
+        let due = self.wanted.iter().filter(|(_, want)| want.since < frame);
+        let mut by_error: Vec<(TileKey, f32)> = due.map(|(k, want)| (*k, want.error)).collect();
         by_error.sort_by(|a, b| b.1.total_cmp(&a.1));
         let waiting = by_error
             .iter()
             .filter(|(key, _)| !self.is_pending_arrival(key));
         let order: Vec<TileKey> = waiting.map(|(key, _)| *key).collect();
-        let room = batch.room(&self.ring);
-        let mut planned = 0;
-        let fits = order.iter().take_while(|key| {
-            planned += SizeClass::of(key.level()).slot_bytes();
-            planned <= room
-        });
-        let ahead: Vec<TileKey> = fits.copied().collect();
-        source.prepare(&ahead).map_err(Into::into)?;
-        for key in order {
+        for chunk in order.chunks(PREPARE_BATCH) {
             if Instant::now() >= deadline {
                 break;
             }
-            if self.entries.contains_key(&key) || self.unavailable.contains(&key) {
-                self.wanted.remove(&key);
-                continue;
+            let mut ready = Vec::with_capacity(chunk.len());
+            for key in chunk {
+                if self.entries.contains_key(key) || self.unavailable.contains(key) {
+                    self.wanted.remove(key);
+                } else {
+                    ready.push(*key);
+                }
             }
-            if batch.room(&self.ring) < SizeClass::of(key.level()).slot_bytes() {
+            let Some(first) = ready.first() else {
+                continue;
+            };
+            if batch.room(&self.ring) < SizeClass::of(first.level()).slot_bytes() {
                 break;
             }
-            match self.arrive(gpu, batch, source, key, false)? {
-                Read::NoRoom => break,
-                Read::Staged(_) | Read::Missing => {
-                    self.wanted.remove(&key);
+            source.prepare(&ready).map_err(Into::into)?;
+            for key in ready {
+                match self.arrive(gpu, batch, source, key, false)? {
+                    Read::NoRoom => return Ok(()),
+                    Read::NoSlot => {}
+                    Read::Staged(_) | Read::Missing => {
+                        self.wanted.remove(&key);
+                    }
                 }
             }
         }
@@ -885,9 +1323,9 @@ impl Residency {
     {
         let Some(slot) = self.acquire(gpu, SizeClass::of(key.level()))? else {
             self.stats.starved += 1;
-            return Ok(Read::NoRoom);
+            return Ok(Read::NoSlot);
         };
-        let read = self.read_into(gpu, batch, source, key, slot, forced)?;
+        let read = self.read_fresh(gpu, batch, source, key, slot, forced)?;
         match read {
             Read::Staged(error) => match self.joining(&key) {
                 Some(group) => {
@@ -899,7 +1337,7 @@ impl Residency {
                 self.pools.release(slot);
                 self.unavailable.insert(key);
             }
-            Read::NoRoom => self.pools.release(slot),
+            Read::NoRoom | Read::NoSlot => self.pools.release(slot),
         }
         Ok(read)
     }
@@ -909,7 +1347,7 @@ impl Residency {
     fn joining(&mut self, key: &TileKey) -> Option<&mut Group> {
         let (naming, rest): (Vec<Group>, Vec<Group>) = std::mem::take(&mut self.groups)
             .into_iter()
-            .partition(|group| group.keys.contains(key));
+            .partition(|group| group.names(key));
         self.groups = rest;
         let mut naming = naming.into_iter();
         let mut merged = naming.next()?;
@@ -920,9 +1358,10 @@ impl Residency {
         self.groups.last_mut()
     }
 
-    /// Stages what it can of pending `group`, and switches it if it is complete: whole in place
-    /// if small enough for this frame (or stalled), else into shadow slots until `deadline`.
-    /// Returns the group if it is still pending.
+    /// Stages what it can of pending `group`, and switches it if it is complete (returning
+    /// true): whole in place if small enough for this frame, or forced (stalled or urgent,
+    /// within the frame's forced bytes); else into shadow slots, a batch at a time, until
+    /// `deadline`. A stall is a frame that found no shadow slot to be had.
     ///
     /// # Errors
     ///
@@ -932,9 +1371,9 @@ impl Residency {
         gpu: &Gpu,
         batch: &mut Batch,
         source: &mut S,
-        mut group: Group,
+        group: &mut Group,
         deadline: Instant,
-    ) -> Result<Option<Group>, ResidencyError>
+    ) -> Result<bool, ResidencyError>
     where
         S::Error: Into<ResidencyError>,
     {
@@ -943,79 +1382,121 @@ impl Residency {
             .iter()
             .map(|key| SizeClass::of(key.level()).slot_bytes())
             .sum();
-        let forced = group.stalled > 0;
-        let in_place = forced
-            || (remaining <= self.config.small_epoch_bytes && remaining <= batch.room(&self.ring));
-        source.prepare(&todo).map_err(Into::into)?;
-        if in_place {
+        let small =
+            remaining <= self.config.small_epoch_bytes && remaining <= batch.room(&self.ring);
+        let within = self.forced_now + remaining <= self.config.forced_bytes;
+        let rescue = group.stalled >= LONG_STALL && self.forced_now == 0;
+        let forced = !small && (group.stalled > 0 || group.urgent) && (within || rescue);
+        if small || forced {
             if forced {
                 self.stats.forced += 1;
+                self.forced_now += remaining;
             }
-            for key in todo {
-                group.todo.remove(&key);
-                let own = self.entries.get(&key).map(|entry| entry.slot);
-                let target = match own {
-                    Some(slot) => slot,
-                    None => match self.acquire(gpu, SizeClass::of(key.level()))? {
-                        Some(slot) => slot,
-                        // An arrival with no slot to be had: it isn't drawn yet, so it waits
-                        // to be requested again.
-                        None => continue,
-                    },
-                };
-                match self.read_into(gpu, batch, source, key, target, true)? {
-                    Read::Staged(error) => {
-                        group.staged.insert(
-                            key,
-                            Staged::Data {
-                                slot: target,
-                                error,
-                            },
-                        );
-                    }
-                    Read::Missing | Read::NoRoom => {
-                        if own.is_none() {
-                            self.pools.release(target);
-                        }
-                        group.staged.insert(key, Staged::Missing);
-                    }
-                }
-            }
+            source.prepare(&todo).map_err(Into::into)?;
+            self.stage_in_place(gpu, batch, source, group, &todo)?;
             self.switch(group)?;
-            return Ok(None);
+            return Ok(true);
         }
-        let mut progressed = false;
-        for key in todo {
+        let mut no_slot = false;
+        'chunks: for chunk in todo.chunks(PREPARE_BATCH) {
             if Instant::now() >= deadline {
                 break;
             }
-            let Some(slot) = self.acquire(gpu, SizeClass::of(key.level()))? else {
-                continue;
-            };
-            match self.read_into(gpu, batch, source, key, slot, false)? {
-                Read::Staged(error) => {
-                    group.staged.insert(key, Staged::Data { slot, error });
+            source.prepare(chunk).map_err(Into::into)?;
+            for &key in chunk {
+                let Some(slot) = self.acquire(gpu, SizeClass::of(key.level()))? else {
+                    no_slot = true;
+                    continue;
+                };
+                match self.read_fresh(gpu, batch, source, key, slot, false)? {
+                    Read::Staged(error) => {
+                        group.staged.insert(key, Staged::Data { slot, error });
+                        self.stats.shadowed += 1;
+                    }
+                    Read::Missing => {
+                        self.pools.release(slot);
+                        group.staged.insert(key, Staged::Missing);
+                    }
+                    Read::NoRoom | Read::NoSlot => {
+                        self.pools.release(slot);
+                        break 'chunks;
+                    }
                 }
-                Read::Missing => {
-                    self.pools.release(slot);
-                    group.staged.insert(key, Staged::Missing);
-                }
-                Read::NoRoom => {
-                    self.pools.release(slot);
-                    break;
-                }
+                group.todo.remove(&key);
             }
-            group.todo.remove(&key);
-            progressed = true;
         }
         if group.todo.is_empty() {
             self.switch(group)?;
-            return Ok(None);
+            return Ok(true);
         }
-        if !progressed {
+        if no_slot {
             group.stalled += 1;
         }
-        Ok(Some(group))
+        Ok(false)
+    }
+
+    /// Writes every member of `group` in `todo` in place (a resident tile into its own slot, an
+    /// arriving one into a new slot), past the ring's cap if need be: the group then switches
+    /// in this frame.
+    ///
+    /// # Errors
+    ///
+    /// As [`Residency::stage`]; [`ResidencyError::Invariant`] if a forced write found no room.
+    fn stage_in_place<S: TileSource>(
+        &mut self,
+        gpu: &Gpu,
+        batch: &mut Batch,
+        source: &mut S,
+        group: &mut Group,
+        todo: &[TileKey],
+    ) -> Result<(), ResidencyError>
+    where
+        S::Error: Into<ResidencyError>,
+    {
+        for &key in todo {
+            let own = self.entries.get(&key).map(|entry| entry.slot);
+            let target = if let Some(slot) = own {
+                slot
+            } else {
+                let fresh = self.acquire(gpu, SizeClass::of(key.level()))?;
+                // An arrival with no slot to be had isn't drawn yet: it waits to be requested
+                // again.
+                let Some(slot) = fresh else {
+                    group.todo.remove(&key);
+                    continue;
+                };
+                slot
+            };
+            // Out of the todo only once read: a read that fails leaves it there, to be staged
+            // again (and the tiles this frame wrote are dropped).
+            let read = if own.is_some() {
+                self.read_into(gpu, batch, source, key, target, true)?
+            } else {
+                self.read_fresh(gpu, batch, source, key, target, true)?
+            };
+            group.todo.remove(&key);
+            match read {
+                Read::Staged(error) => {
+                    group.staged.insert(
+                        key,
+                        Staged::Data {
+                            slot: target,
+                            error,
+                        },
+                    );
+                }
+                Read::Missing => {
+                    if own.is_none() {
+                        self.pools.release(target);
+                    }
+                    group.staged.insert(key, Staged::Missing);
+                }
+                Read::NoRoom | Read::NoSlot => {
+                    return Err(ResidencyError::Invariant("a forced write found no room"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Switches a complete pending epoch: every staged member takes its new slot (giving its
@@ -1024,9 +1505,9 @@ impl Residency {
     /// # Errors
     ///
     /// [`ResidencyError::Tree`] if an arriving tile finds the tree full (it is sized for every
-    /// slot, so it doesn't).
-    fn switch(&mut self, group: Group) -> Result<(), ResidencyError> {
-        for (key, staged) in group.staged {
+    /// tile the budget allows, so it doesn't).
+    fn switch(&mut self, group: &mut Group) -> Result<(), ResidencyError> {
+        for (key, staged) in std::mem::take(&mut group.staged) {
             let place = Place::of(&key);
             match staged {
                 Staged::Data { slot, error } => {
@@ -1053,11 +1534,35 @@ impl Residency {
         Ok(())
     }
 
+    /// [`Residency::read_into`] for a slot just taken: given back if the read fails.
+    ///
+    /// # Errors
+    ///
+    /// As [`Residency::read_into`].
+    fn read_fresh<S: TileSource>(
+        &mut self,
+        gpu: &Gpu,
+        batch: &mut Batch,
+        source: &mut S,
+        key: TileKey,
+        slot: Slot,
+        forced: bool,
+    ) -> Result<Read, ResidencyError>
+    where
+        S::Error: Into<ResidencyError>,
+    {
+        let read = self.read_into(gpu, batch, source, key, slot, forced);
+        if read.is_err() {
+            self.pools.release(slot);
+        }
+        read
+    }
+
     /// Reads `key` from `source` and stages it for `slot`. With `forced`, past the ring's cap.
     ///
     /// # Errors
     ///
-    /// As [`Residency::stage`].
+    /// As [`Residency::stage`]; [`ResidencyError::Invariant`] if `slot` has no buffer.
     fn read_into<S: TileSource>(
         &mut self,
         gpu: &Gpu,
@@ -1080,11 +1585,14 @@ impl Residency {
         let Some(error) = source.read(key, &mut self.scratch).map_err(Into::into)? else {
             return Ok(Read::Missing);
         };
-        let Some((buffer, offset)) = self.pools.locate(slot) else {
-            return Ok(Read::NoRoom);
-        };
+        let (buffer, offset) = self
+            .pools
+            .locate(slot)
+            .ok_or(ResidencyError::Invariant("a slot without a buffer"))?;
         let data: &[u8] = bytemuck::cast_slice(&self.scratch);
         if batch.write(gpu, &mut self.ring, data, buffer, offset, forced)? {
+            self.touched.push((key, slot));
+            self.fresh.insert(key);
             Ok(Read::Staged(error))
         } else {
             Ok(Read::NoRoom)
@@ -1108,7 +1616,9 @@ impl Residency {
             .flatten()
             .map(|(_, key)| key);
         let victim = candidates
-            .filter(|key| !self.protected(key) && !self.pending.contains(key))
+            .filter(|key| {
+                !self.protected(key) && !self.pending.contains(key) && !self.fresh.contains(key)
+            })
             .find(|key| !self.groups.iter().any(|group| group.holds(key)))
             .copied();
         let Some(victim) = victim else {
