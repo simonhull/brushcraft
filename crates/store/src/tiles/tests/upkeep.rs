@@ -650,3 +650,100 @@ fn a_decode_finished_after_its_record_was_replaced_is_dropped() {
     run_all(&mut store);
     assert_layer_current(&mut store, "the coarse tile built from the new records");
 }
+
+/// The bytes a store's display layer, built whole, encodes to: for sizing a share in tests.
+fn layer_bytes(store: &mut TileStore) -> usize {
+    let layer = display_layer(store);
+    let sizes = layer.iter().map(|tile| tile.encoded().len());
+    sizes.sum()
+}
+
+/// A rebuild holds the display records waiting for the working file to their share.
+///
+/// The rest are written through between flushes; the layer saves and reopens bit for bit, and
+/// edits after it still make unknown what they change, written-through records included.
+#[test]
+fn a_rebuild_holds_the_records_waiting_for_the_file_to_their_share() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 30, 11));
+    // A quarter of the layer: most of it must go through.
+    let share = layer_bytes(&mut store) / 4;
+    store.display_waiting = share;
+    let mut most = 0;
+    let mut calls = 0;
+    while store.has_jobs() || calls == 0 {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(2))
+            .unwrap();
+        let (waiting, held_to) = store.display_waiting();
+        assert_eq!(held_to, share, "the share set");
+        assert!(
+            waiting <= share,
+            "call {calls}: {waiting} bytes waiting, held to {share}"
+        );
+        most = most.max(waiting);
+        calls += 1;
+        assert!(calls < 100_000, "the rebuild ends");
+    }
+    assert!(most > 0, "records waited in memory");
+    let written = store.working().display_keys().count();
+    assert!(
+        written > 0,
+        "records went to the working file before any save ({written})"
+    );
+    assert_layer_current(&mut store, "rebuilt, written through");
+    // Edits after: the written-through records they change are unknown, then refreshed.
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 3, 12));
+    run_all(&mut store);
+    assert!(
+        store.display_waiting().0 <= share,
+        "the refresh holds to the share too"
+    );
+    assert_layer_current(&mut store, "refreshed over written-through records");
+    let built = display_layer(&mut store);
+    store.save().unwrap();
+    drop(store);
+    let file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let mut reopened = TileStore::open(file, roomy().with_display(level(TOP))).unwrap();
+    assert!(!reopened.has_jobs(), "nothing to rebuild");
+    let keys: Vec<TileKey> = built.iter().map(|t| *t.key()).collect();
+    let stored = reopened.stored_display(&keys).unwrap();
+    for (tile, back) in built.iter().zip(stored) {
+        let back = back.unwrap_or_else(|| panic!("{:?} saved", tile.key()));
+        assert_eq!(&back, tile, "{:?} bit for bit", tile.key());
+    }
+}
+
+/// The share of the budget the waiting display records are held to: a thirty-second, at most
+/// the cap, and nothing without a display layer; a roomy budget gives all of it.
+#[test]
+fn the_waiting_records_share_follows_the_budget() {
+    let config = StoreConfig::new(1 << 30, 1).with_display(level(TOP));
+    assert_eq!(
+        config.display_waiting_bytes(),
+        (1 << 30) / 32,
+        "a thirty-second of the budget"
+    );
+    let huge = StoreConfig::new(64 << 30, 1).with_display(level(TOP));
+    assert_eq!(
+        huge.display_waiting_bytes(),
+        StoreConfig::MAX_DISPLAY_WAITING_BYTES,
+        "at most the cap"
+    );
+    assert_eq!(
+        StoreConfig::new(1 << 30, 1).display_waiting_bytes(),
+        0,
+        "no layer, no share"
+    );
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let store = display_store(&dir, &mesh);
+    assert_eq!(
+        store.display_waiting().1,
+        roomy().with_display(level(TOP)).display_waiting_bytes(),
+        "a roomy budget gives the whole share"
+    );
+}

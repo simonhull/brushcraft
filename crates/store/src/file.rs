@@ -875,6 +875,11 @@ impl ProjectFile {
             .is_some_and(|cut| cut.prior.contains_key(&Name::Tile(*key)))
     }
 
+    /// Whether records can be appended: the file wasn't opened read-only.
+    pub(crate) fn is_writable(&self) -> bool {
+        self.access != Access::ReadOnly
+    }
+
     /// The write the open cut is at, if one is open: a record appended with this stamp is part
     /// of the cut's save point.
     pub(crate) fn cut_at(&self) -> Option<Stamp> {

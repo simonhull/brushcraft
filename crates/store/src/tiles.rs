@@ -268,8 +268,11 @@ impl StoreId {
 /// state, which hold nearly all of a store's memory, and, with a display layer, its floor and
 /// its caches (the decoded display tiles, a job's finest copies, the records read ahead and the
 /// readers' memo: [`StoreConfig::display_cache_bytes`], a sixteenth of the budget at most, each
-/// cache holding a few dozen entries however small its share). Besides them, and not charged
-/// to the budget:
+/// cache holding a few dozen entries however small its share), and the display records
+/// waiting for the working file ([`StoreConfig::display_waiting_bytes`], a thirty-second of the
+/// budget at most, written through once past it; passed only while a recovery flush is between
+/// its cut and its save point, by what the store records meanwhile). Besides them, and not
+/// charged to the budget:
 ///
 /// - the display tiles the workers are building or decoding, and the inputs handed to them: a slice
 ///   hands out a few at a time, at most one a worker in flight;
@@ -353,6 +356,9 @@ pub struct TileStore {
     /// The finest level the display layer is kept under ([`StoreConfig::display`]); `None` for
     /// a store that keeps none.
     display_finest: Option<geom::Level>,
+    /// The bytes the display records waiting for the working file may hold before they are
+    /// written through: the budget's share for them ([`StoreConfig::display_waiting_bytes`]).
+    display_waiting: usize,
     /// The display tiles a brush stroke's dabs changed, as they were before the first of them,
     /// with what the dabs since have added to their bound (see
     /// [`TileStore::bump_display_error`]): drawn in their place until a refresh records them.

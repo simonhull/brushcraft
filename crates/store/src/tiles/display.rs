@@ -5,6 +5,27 @@
 //!
 //! It follows the bounds' protocol ([`super::bounds`]), with one difference: a recorded display
 //! tile always goes to the working file with the next flush, and leaves memory once there.
+//!
+//! # Written through
+//!
+//! A display record is tens of kilobytes, and a rebuild records the whole layer (about 1 GB on
+//! the benchmark project), so the records waiting for the working file are held to a share of
+//! the budget ([`StoreConfig::display_waiting_bytes`](super::StoreConfig::display_waiting_bytes)):
+//! past it, [`TileStore::write_through_display`] appends some to the working file between
+//! flushes, and they leave memory as a flush's do. That changes nothing a save point names, nor
+//! what a crash leaves:
+//!
+//! - a record appended past the last save point is named by none until the next one, and a crash
+//!   before it discards it with the rest of the file's tail (the tile is rebuilt, as it would be
+//!   had it waited in memory);
+//! - it is placed at the store's latest write, the state it was built from, and the writes are
+//!   settled first, so it is current there; the next save point, a flush's cut or a save, is at
+//!   that write or later, and a later write that changes the tile makes it unknown in the book,
+//!   which that save point's flush or save then writes over it;
+//! - nothing is written while a flush's cut is open: a tile left out of the flush (its copy didn't
+//!   encode, its slot still dirty) is in the store's state at the cut but not in the cut's save
+//!   point, so a record built from it and placed at the cut would be named stale. The records wait
+//!   until the save point is written.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,7 +35,7 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use super::TileStore;
 use super::error::CacheError;
 use super::read_ahead::Held;
-use crate::bounds::{Book, Kept};
+use crate::bounds::{Book, Derived as _, Kept};
 use crate::display::{Display, DisplayRecord, StoredDisplay};
 use crate::file::{BaseFile, FileError, ProjectFile, display_record};
 use crate::meta::Role;
@@ -26,14 +47,31 @@ impl TileStore {
     /// next save.
     ///
     /// The writes since the last call are settled first, so the display tiles they made unknown
-    /// are replaced, not the other way round.
+    /// are replaced, not the other way round. Then the records waiting for the working file are
+    /// written through if they pass their share ([`TileStore::write_through_display`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::record_built`], and then nothing is recorded; as
+    /// [`TileStore::write_through_display`], and then the tiles are recorded, and wait in memory.
+    #[cfg(test)]
+    pub(crate) fn record_display<T: std::borrow::Borrow<DisplayTile>>(
+        &mut self,
+        tiles: &[T],
+    ) -> Result<(), CacheError> {
+        self.record_built(tiles)?;
+        self.write_through_display()
+    }
+
+    /// [`TileStore::record_display`] but for the writing through: records `tiles`, after
+    /// settling the writes since the last call.
     ///
     /// # Errors
     ///
     /// [`CacheError::Display`] ([`geom::DisplayError::NoDisplayLevel`]) if the store keeps no
     /// display layer; [`CacheError::Eval`] if listing a written tile's readers fails (never,
     /// for tiles of the store's mesh). Nothing is recorded then.
-    pub(crate) fn record_display<T: std::borrow::Borrow<DisplayTile>>(
+    pub(super) fn record_built<T: std::borrow::Borrow<DisplayTile>>(
         &mut self,
         tiles: &[T],
     ) -> Result<(), CacheError> {
@@ -384,6 +422,62 @@ impl TileStore {
             self.display.flushed(key);
         }
         Ok(())
+    }
+
+    /// Writes display records through to the working file if those waiting in memory pass the
+    /// budget's share for them
+    /// ([`StoreConfig::display_waiting_bytes`](super::StoreConfig::display_waiting_bytes)):
+    /// as many, in key order, as bring them back within it, appended with one write as a flush
+    /// appends them, placed at the store's latest write; they leave memory as a flush's do (see
+    /// the module notes). Settles the writes first.
+    ///
+    /// Writes nothing while a recovery flush's cut is open, while the working file is a failed
+    /// recovery file (whose records a roll-over would have to read back) or one opened
+    /// read-only: the records wait in memory then.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] as for [`TileStore::record_display`]; [`CacheError::WriteBack`] if
+    /// the append fails: the records wait in memory, for the next flush or a later call.
+    pub(super) fn write_through_display(&mut self) -> Result<(), CacheError> {
+        let share = self.display_waiting;
+        if self.display.waiting_bytes() <= share
+            || self.file.cut_at().is_some()
+            || self.working_failed
+            || !self.file.is_writable()
+        {
+            return Ok(());
+        }
+        self.settle_display()?;
+        let mut over = self.display.waiting_bytes().saturating_sub(share);
+        let mut keys = Vec::new();
+        for (key, record) in self.display.waiting() {
+            if over == 0 {
+                break;
+            }
+            over = over.saturating_sub(Display::bytes(record));
+            keys.push(*key);
+        }
+        write_kept(&mut self.file, None, &self.display, &keys, self.last_write)
+            .map_err(CacheError::WriteBack)?;
+        for key in &keys {
+            self.display.flushed(key);
+        }
+        Ok(())
+    }
+
+    /// The bytes of the display records waiting in memory for the working file, and the share
+    /// of the budget they are held to (see [`TileStore::write_through_display`]).
+    #[cfg(test)]
+    pub(super) const fn display_waiting(&self) -> (usize, usize) {
+        (self.display.waiting_bytes(), self.display_waiting)
+    }
+
+    /// Holds the display records waiting for the working file to `bytes` instead of the
+    /// budget's share: for tests of the writing through.
+    #[cfg(test)]
+    pub(crate) const fn hold_display_waiting_to(&mut self, bytes: usize) {
+        self.display_waiting = bytes;
     }
 
     /// Appends every display tile a save of the working file itself writes: those a flush

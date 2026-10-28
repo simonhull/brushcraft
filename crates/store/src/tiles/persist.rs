@@ -114,9 +114,8 @@ impl TileStore {
         check_layers(working.meta(), base.as_ref())?;
         let mesh = working.mesh();
         let headroom = Headroom::of(&mesh);
-        let (reserved_bytes, cache_bytes) =
-            reserved_shares(headroom, &config, config.floor_bytes(&mesh))?;
-        let cache_caps = crate::jobs::CacheCaps::of(cache_bytes);
+        let shares = reserved_shares(headroom, &config, config.floor_bytes(&mesh))?;
+        let cache_caps = crate::jobs::CacheCaps::of(shares.caches);
         let next_op = first_op(
             config.site,
             [working.head(), base.as_ref().and_then(BaseFile::head)],
@@ -142,7 +141,7 @@ impl TileStore {
             mesh_hash,
             file: working,
             base,
-            budget: Budget::new(config.budget_bytes - reserved_bytes),
+            budget: Budget::new(config.budget_bytes - shares.reserved),
             headroom,
             corrections: Pool::with_eviction_log(config.chunk_bytes),
             // Short chunks let the evaluated pool use the room the reserved shares
@@ -158,6 +157,7 @@ impl TileStore {
             bounds,
             display,
             display_finest: config.display,
+            display_waiting: shares.waiting,
             jobs: std::collections::VecDeque::new(),
             bumped: std::collections::BTreeMap::new(),
             display_failed: std::collections::BTreeMap::new(),

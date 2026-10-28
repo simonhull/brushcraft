@@ -703,7 +703,8 @@ impl TileStore {
     /// # Errors
     ///
     /// The first [`CacheError::Store`] a worker met, or the errors of
-    /// [`TileStore::record_display`]: the tiles are put back.
+    /// [`TileStore::record_built`]: the tiles are put back; or those of
+    /// [`TileStore::write_through_display`], with the tiles recorded.
     fn collect(
         &mut self,
         upkeep: &mut Upkeep,
@@ -766,7 +767,7 @@ impl TileStore {
             }
         }
         if !built.is_empty() {
-            if let Err(e) = self.record_display(&built) {
+            if let Err(e) = self.record_built(&built) {
                 for tile in &built {
                     upkeep.push(*tile.tile.key());
                 }
@@ -780,6 +781,8 @@ impl TileStore {
                 let record = self.display_generation(&key);
                 self.display_decoded.insert(key, (record, Arc::new(tile)));
             }
+            // Recorded whatever comes of it: a failed write leaves them waiting in memory.
+            self.write_through_display()?;
         }
         error.map_or(Ok(count), Err)
     }

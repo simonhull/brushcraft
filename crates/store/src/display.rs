@@ -22,7 +22,10 @@
 //! A display tile is tens of kilobytes, a bound forty bytes. So a recorded display tile always
 //! goes to the working file with the next flush, never waiting in memory for the next save as a
 //! derived bound does, and once there the store drops its copy and reads the file (see
-//! [`crate::bounds::Kept::Written`]): a whole layer rebuilt in a session stays on disk.
+//! [`crate::bounds::Kept::Written`]): a whole layer rebuilt in a session stays on disk. Between
+//! flushes, the records waiting for one are held to a share of the budget, the rest written
+//! through to the working file before the flush (`TileStore::write_through_display`), so a
+//! session that doesn't flush holds no more of them either.
 
 use std::collections::BTreeSet;
 
@@ -531,6 +534,10 @@ impl Derived for Display {
     type Value = DisplayRecord;
 
     const SPILLS: bool = true;
+
+    fn bytes(value: &DisplayRecord) -> usize {
+        size_of::<DisplayRecord>().saturating_add(value.encoded.capacity())
+    }
 
     fn reaches(levels: &BTreeSet<Level>, key: &TileKey) -> bool {
         levels

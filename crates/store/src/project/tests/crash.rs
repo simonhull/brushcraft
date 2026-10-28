@@ -26,6 +26,11 @@
 //! child crashing mid-flush also edits and refits again while the flush is in flight: bounds of
 //! a state past the flush's cut, which its save point must not name.
 //!
+//! Before each stroke the child records the whole display layer. Some children write every
+//! display record through to the recovery file as they record it, between flushes, instead of
+//! holding it for the next one: a crash then leaves records past the last save point, which the
+//! restore must discard, and records the save points name, which must be current or unknown.
+//!
 //! The parent checks that the child died of `SIGKILL`, lists the recovery files, restores the
 //! one it finds, and checks the evaluation against the dense evaluation of exactly the edits
 //! that should have survived: every completed stroke, none of the interrupted one. The index
@@ -113,10 +118,14 @@ struct Scenario {
     /// Whether the child's store runs on the tight budget, writing dirty tiles back to the
     /// recovery file to make room, mid-stroke too.
     tight: bool,
+    /// Whether the child's store holds no display record waiting for the recovery file, writing
+    /// each through as it records it (between flushes, past the last save point), rather than
+    /// keeping them for the next flush.
+    through: bool,
 }
 
-/// `saved:strokes:crash:budget`, for the child's environment: `crash` is `stroke` or the
-/// flush phase, `budget` is `tight` or `roomy`.
+/// `saved:strokes:crash:budget:display`, for the child's environment: `crash` is `stroke` or
+/// the flush phase, `budget` is `tight` or `roomy`, `display` is `through` or `held`.
 impl std::fmt::Display for Scenario {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let crash = match self.crash {
@@ -124,7 +133,12 @@ impl std::fmt::Display for Scenario {
             Crash::MidFlush(phase) => phase,
         };
         let budget = if self.tight { "tight" } else { "roomy" };
-        write!(f, "{}:{}:{crash}:{budget}", self.saved, self.strokes)
+        let display = if self.through { "through" } else { "held" };
+        write!(
+            f,
+            "{}:{}:{crash}:{budget}:{display}",
+            self.saved, self.strokes
+        )
     }
 }
 
@@ -150,11 +164,17 @@ impl FromStr for Scenario {
             "roomy" => false,
             _ => return Err(bad()),
         };
+        let through = match next()? {
+            "through" => true,
+            "held" => false,
+            _ => return Err(bad()),
+        };
         Ok(Self {
             saved,
             strokes,
             crash,
             tight,
+            through,
         })
     }
 }
@@ -281,6 +301,9 @@ fn crash_child() {
     let scenario: Scenario = scenario.parse().unwrap();
     let dir = PathBuf::from(dir);
     let mut project = Project::new((*mesh()).clone(), scenario.config(&dir)).unwrap();
+    if scenario.through {
+        project.store.hold_display_waiting_to(0);
+    }
     let (mut index, _) = project.load_index(top(), |_, _| {}).unwrap();
     if scenario.saved {
         edit(&mut project, &mut index, EDITS, SAVED_SEED);
@@ -304,6 +327,12 @@ fn crash_child() {
                 assert!(
                     project.store().working().has_unsaved_records(),
                     "the stroke in progress has tiles in the file past its save point"
+                );
+            }
+            if scenario.through {
+                assert!(
+                    project.store().working().display_keys().next().is_some(),
+                    "display records written through before the crash"
                 );
             }
         }
@@ -463,6 +492,7 @@ fn a_crash_mid_stroke_restores_exactly_the_completed_strokes() {
             strokes,
             crash: Crash::MidStroke,
             tight: false,
+            through: false,
         });
     }
 }
@@ -475,6 +505,7 @@ fn a_never_saved_project_restores_from_its_recovery_file_alone() {
             strokes,
             crash: Crash::MidStroke,
             tight: false,
+            through: false,
         });
     }
 }
@@ -494,6 +525,7 @@ fn a_crash_discards_the_stroke_in_progress_written_back_to_make_room() {
                     strokes: 3,
                     crash: Crash::MidStroke,
                     tight: true,
+                    through: false,
                 });
             });
         }
@@ -509,7 +541,36 @@ fn a_crash_mid_flush_restores_the_previous_or_the_new_stroke_never_a_mix() {
                 strokes: 2,
                 crash: Crash::MidFlush(phase),
                 tight: false,
+                through: false,
             });
         }
+    }
+}
+
+/// A crash after display records were written through restores a layer no older than its tiles.
+///
+/// Every display record goes to the recovery file as it is recorded, between flushes. A crash
+/// mid-stroke (after the layer's records, before the stroke's save point) or mid-flush restores
+/// a layer no older or newer than its tiles: the records past the last save point go with the
+/// rest of the tail, and those a save point names are current or unknown.
+#[test]
+fn a_crash_after_display_records_written_through_restores_a_current_layer() {
+    for (saved, strokes) in [(true, 0), (true, 3), (false, 2)] {
+        crash(Scenario {
+            saved,
+            strokes,
+            crash: Crash::MidStroke,
+            tight: false,
+            through: true,
+        });
+    }
+    for phase in ["encoding", "syncing save point"] {
+        crash(Scenario {
+            saved: true,
+            strokes: 2,
+            crash: Crash::MidFlush(phase),
+            tight: false,
+            through: true,
+        });
     }
 }

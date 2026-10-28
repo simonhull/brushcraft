@@ -495,3 +495,35 @@ fn a_record_read_ahead_is_used_only_while_it_is_the_files_latest() {
         "the new record"
     );
 }
+
+/// A record written through is never placed at an open cut: while a flush's cut is open the
+/// records wait in memory, and go through once its save point is written.
+#[test]
+fn nothing_is_written_through_while_a_cut_is_open() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy().with_display(level(TOP)));
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 61),
+    );
+    store.hold_display_waiting_to(0);
+    let layer = display_layer(&mut store);
+    store.open_cut();
+    store.record_display(&layer).unwrap();
+    assert_eq!(
+        store.working().display_keys().count(),
+        0,
+        "nothing written at the cut"
+    );
+    assert!(store.display_waiting().0 > 0, "the records wait");
+    store.write_save_point().unwrap();
+    store.record_display(&layer[..1]).unwrap();
+    assert_eq!(
+        store.working().display_keys().count(),
+        layer.len(),
+        "the save point written, every record goes through"
+    );
+    assert_eq!(store.display_waiting().0, 0, "none waits");
+}

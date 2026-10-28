@@ -111,6 +111,9 @@ impl StoreConfig {
     pub const DEFAULT_STROKE_TILES: usize = 512;
     /// The most [`StoreConfig::display_cache_bytes`] gives the display layer's caches.
     pub const MAX_DISPLAY_CACHE_BYTES: usize = 256 << 20;
+    /// The most [`StoreConfig::display_waiting_bytes`] gives the display records waiting for the
+    /// working file.
+    pub const MAX_DISPLAY_WAITING_BYTES: usize = 64 << 20;
     /// The bytes of the budget one tile's stroke state is charged:
     /// two `f32` (the start and the summed deltas) per vertex of the largest tile,
     /// `(TILE_QUADS + 1)²` of them, so 33,800 bytes.
@@ -180,6 +183,32 @@ impl StoreConfig {
             share
         } else {
             Self::MAX_DISPLAY_CACHE_BYTES
+        }
+    }
+
+    /// The bytes of the budget the display records waiting for the working file may hold: those
+    /// the store recorded since the working file last received them, in memory until a recovery
+    /// flush or a save writes them, or until they pass this share, when the store writes them
+    /// through (see `TileStore::write_through_display`). A thirty-second of the budget, at most
+    /// 64 MiB: a rebuild of the benchmark project records about 1 GB, so without it a session
+    /// that doesn't flush (no recovery writer, or none yet) would hold all of it. Zero without a
+    /// display layer.
+    ///
+    /// Charged to the budget as a reserved share, after the display caches, as much of it as
+    /// the budget has left; with none left, every record is written through as it is recorded.
+    /// While a recovery flush is between its cut and its save point the records wait, as one
+    /// written then could be named by a save point holding an older state of its tiles, so the
+    /// share can be passed by what the store records meanwhile.
+    #[must_use]
+    pub const fn display_waiting_bytes(&self) -> usize {
+        if self.display.is_none() {
+            return 0;
+        }
+        let share = self.budget_bytes / 32;
+        if share < Self::MAX_DISPLAY_WAITING_BYTES {
+            share
+        } else {
+            Self::MAX_DISPLAY_WAITING_BYTES
         }
     }
 
@@ -376,14 +405,26 @@ impl Headroom {
     }
 }
 
-/// The bytes of the budget's reserved shares, once checked to fit beside the pools' minimum,
-/// and of them the display caches' share.
+/// The budget's reserved shares, as [`reserved_shares`] gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Shares {
+    /// The bytes of every reserved share together: what the pools don't get.
+    pub(super) reserved: usize,
+    /// The display caches' share ([`StoreConfig::display_cache_bytes`], or what was left).
+    pub(super) caches: usize,
+    /// The waiting display records' share ([`StoreConfig::display_waiting_bytes`], or what was
+    /// left).
+    pub(super) waiting: usize,
+}
+
+/// The budget's reserved shares, once checked to fit beside the pools' minimum.
 ///
 /// The shares are the kept predictions' ([`StoreConfig::kept_prediction_bytes`]), the
-/// stroke state's ([`StoreConfig::stroke_state_bytes`]), the display floor's (`floor`) and the
-/// display caches' ([`StoreConfig::display_cache_bytes`]); `config`'s budget is checked to hold
-/// the first three beside the pools' minimum for `headroom`, the kept predictions first. The
-/// caches get what is left of their share, which may be nothing.
+/// stroke state's ([`StoreConfig::stroke_state_bytes`]), the display floor's (`floor`), the
+/// display caches' ([`StoreConfig::display_cache_bytes`]) and the waiting display records'
+/// ([`StoreConfig::display_waiting_bytes`]); `config`'s budget is checked to hold the first
+/// three beside the pools' minimum for `headroom`, the kept predictions first. The caches, then
+/// the waiting records, get what is left of their shares, which may be nothing.
 ///
 /// # Errors
 ///
@@ -394,7 +435,7 @@ pub(super) fn reserved_shares(
     headroom: Headroom,
     config: &StoreConfig,
     floor: usize,
-) -> Result<(usize, usize), CacheError> {
+) -> Result<Shares, CacheError> {
     let pools = headroom.minimum_budget(config.chunk_bytes);
     let Some(spare) = config.budget_bytes.checked_sub(pools) else {
         let kept = config.kept_prediction_bytes().unwrap_or(usize::MAX);
@@ -422,6 +463,12 @@ pub(super) fn reserved_shares(
     if floor > spare {
         return Err(CacheError::FloorTooLarge { floor, most: spare });
     }
-    let caches = config.display_cache_bytes().min(spare - floor);
-    Ok((kept + stroke + floor + caches, caches))
+    let spare = spare - floor;
+    let caches = config.display_cache_bytes().min(spare);
+    let waiting = config.display_waiting_bytes().min(spare - caches);
+    Ok(Shares {
+        reserved: kept + stroke + floor + caches + waiting,
+        caches,
+        waiting,
+    })
 }

@@ -251,6 +251,10 @@ pub(crate) trait Derived {
     /// derived, kept in memory for the next save only.
     const SPILLS: bool;
 
+    /// The bytes of memory `value` holds, itself and what it owns: what a [`Book`] of a kind
+    /// that [spills](Derived::SPILLS) counts of the values waiting for the working file.
+    fn bytes(value: &Self::Value) -> usize;
+
     /// Whether a write of `key`'s corrections can change a tile of a tracked level in `levels`.
     fn reaches(levels: &BTreeSet<Level>, key: &TileKey) -> bool;
 
@@ -276,6 +280,10 @@ impl Derived for Bounds {
     type Value = TileBounds;
 
     const SPILLS: bool = false;
+
+    fn bytes(_: &TileBounds) -> usize {
+        size_of::<TileBounds>()
+    }
 
     fn reaches(levels: &BTreeSet<Level>, key: &TileKey) -> bool {
         levels
@@ -337,6 +345,12 @@ pub(crate) struct Book<D: Derived = Bounds> {
     /// Counts the changes made to [`Book::changed`]: a save or a roll-over made before a later
     /// one doesn't hold it.
     changes: u64,
+    /// For a kind that [spills](Derived::SPILLS), the values of [`Book::changed`] held in
+    /// memory ([`Kept::Known`]): each waits for the working file, which every one of them goes to
+    /// with the next flush. Empty for any other kind.
+    waiting: BTreeSet<TileKey>,
+    /// The bytes the values of [`Book::waiting`] hold ([`Derived::bytes`]).
+    waiting_bytes: usize,
 }
 
 impl<D: Derived> Default for Book<D> {
@@ -348,6 +362,8 @@ impl<D: Derived> Default for Book<D> {
             unflushed: BTreeSet::new(),
             derived: BTreeSet::new(),
             changes: 0,
+            waiting: BTreeSet::new(),
+            waiting_bytes: 0,
         }
     }
 }
@@ -359,11 +375,14 @@ impl<D: Derived> Book<D> {
         levels: BTreeSet<Level>,
         changed: BTreeMap<TileKey, Kept<D::Value>>,
     ) -> Self {
-        Self {
+        let mut book = Self {
             levels,
-            changed,
             ..Self::default()
+        };
+        for (key, kept) in changed {
+            book.put(key, kept);
         }
+        book
     }
 
     /// A book tracking no level that holds every one of `keys` unknown, to be flushed: for files
@@ -481,8 +500,7 @@ impl<D: Derived> Book<D> {
     /// Sets `key`'s value to `value` (`None`: unknown), to be flushed, and tracks its level.
     pub(crate) fn set(&mut self, key: TileKey, value: Option<D::Value>) {
         self.levels.insert(key.level());
-        self.changed
-            .insert(key, value.map_or(Kept::Unknown, Kept::Known));
+        self.put(key, value.map_or(Kept::Unknown, Kept::Known));
         self.unflushed.insert(key);
         self.derived.remove(&key);
         self.changes += 1;
@@ -498,9 +516,27 @@ impl<D: Derived> Book<D> {
             return;
         }
         self.levels.insert(key.level());
-        self.changed.insert(key, Kept::Known(value));
+        self.put(key, Kept::Known(value));
         self.derived.insert(key);
         self.changes += 1;
+    }
+
+    /// Makes `kept` `key`'s entry in [`Book::changed`], keeping [`Book::waiting`] and its bytes
+    /// in step.
+    fn put(&mut self, key: TileKey, kept: Kept<D::Value>) {
+        let known = match &kept {
+            Kept::Known(value) if D::SPILLS => Some(D::bytes(value)),
+            Kept::Known(_) | Kept::Unknown | Kept::Written => None,
+        };
+        if let Some(Kept::Known(old)) = self.changed.insert(key, kept)
+            && self.waiting.remove(&key)
+        {
+            self.waiting_bytes = self.waiting_bytes.saturating_sub(D::bytes(&old));
+        }
+        if let Some(bytes) = known {
+            self.waiting.insert(key);
+            self.waiting_bytes = self.waiting_bytes.saturating_add(bytes);
+        }
     }
 
     /// `key`'s value if it changed since the last rebase; `None` if the files hold whatever is
@@ -557,12 +593,22 @@ impl<D: Derived> Book<D> {
     /// For a kind that [spills](Derived::SPILLS), drops `key`'s known value from memory once the
     /// working file holds it: reads find the file's record instead.
     fn spill(&mut self, key: &TileKey) {
-        if D::SPILLS
-            && let Some(kept) = self.changed.get_mut(key)
-            && matches!(kept, Kept::Known(_))
-        {
-            *kept = Kept::Written;
+        if D::SPILLS && matches!(self.changed.get(key), Some(Kept::Known(_))) {
+            self.put(*key, Kept::Written);
         }
+    }
+
+    /// The values held in memory waiting for the working file, in key order: for a kind that
+    /// [spills](Derived::SPILLS), every known value of [`Book::changed`]; none for any other.
+    pub(crate) fn waiting(&self) -> impl Iterator<Item = (&TileKey, &D::Value)> {
+        self.waiting
+            .iter()
+            .filter_map(|key| Some((key, self.changed.get(key)?.known()?)))
+    }
+
+    /// The bytes the values of [`Book::waiting`] hold ([`Derived::bytes`]).
+    pub(crate) const fn waiting_bytes(&self) -> usize {
+        self.waiting_bytes
     }
 
     /// A new working file holds every value a flush would write, as it is now (a roll-over
@@ -581,6 +627,8 @@ impl<D: Derived> Book<D> {
         self.changed.clear();
         self.unflushed.clear();
         self.derived.clear();
+        self.waiting.clear();
+        self.waiting_bytes = 0;
     }
 
     /// The changes counted so far, for telling whether a save is still current.
