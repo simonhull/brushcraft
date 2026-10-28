@@ -62,6 +62,19 @@
 //! raster, the depth pyramid ([`crate::cull::PyramidPass`]), [`Lod::encode_post`], the second
 //! raster, [`Lod::encode_readback`]; submit; then [`CutReadback::submitted`]. The owner thread
 //! takes [`Lod::collect`]'s output a frame or two later.
+//!
+//! **The pyramids (decided for Task 4):** the renderer keeps two, `current` and `previous`.
+//! After the first raster, `current` is built from the depth and [`Lod::encode_post`] tests
+//! against it; after the second raster, `current` is **built again**, from the frame's whole
+//! depth, and the two swap, so the next frame's first phase tests against everything this frame
+//! drew, seen from this frame's view. The extra build is a few dispatches; testing against the
+//! first raster's depth alone would leave the next frame's first phase drawing tiles the second
+//! raster hid. After a resize there is no previous pyramid (pass `None`).
+//!
+//! **Readback cost:** each frame copies the counts (≈ 1.4 KB) and the whole cut list, 16 bytes
+//! a node of capacity: 3.5 MB a frame at the benchmark's 218,400 nodes, about 1 MB at a
+//! desktop budget's ~60k. On a tablet (unified memory, but a slower copy) that is worth a
+//! readback only every few frames, or of the cut's changes; residency tolerates a stale cut.
 
 use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -112,6 +125,13 @@ struct Cluster {
 /// Indices one cluster draws: 8 × 8 quads, two triangles each. A cluster of a smaller tile, or
 /// an edge variant with fewer triangles, pads with degenerate triangles.
 pub const CLUSTER_INDICES: u32 = 384;
+
+/// Triangles the triangle budget counts in a unit: a full cluster's.
+///
+/// Refinements at level 3 and finer are whole units; coarser ones round up to one, so the budget is
+/// respected with up to a unit of slack a coarse refinement. Counting in units keeps the GPU's sums
+/// from wrapping a `u32`.
+pub const BUDGET_UNIT: u32 = 128;
 
 /// The most relaxation passes a frame may run.
 pub const MAX_RELAX_PASSES: u32 = 16;
@@ -234,7 +254,7 @@ struct GpuFrame {
     threshold: u32,
     /// Triangles of the level-0 tiles.
     base: u32,
-    /// Triangles of the refined choice.
+    /// Budget units ([`BUDGET_UNIT`] triangles) the refined choice is charged.
     triangles: u32,
     /// Tiles in the cut.
     cut_count: u32,
@@ -526,7 +546,8 @@ pub struct LodStats {
     pub cut: u32,
     /// Triangles of the cut.
     pub cut_triangles: u32,
-    /// Triangles the refinements came to, within the budget.
+    /// Triangles the refinements were charged, within the budget: in [`BUDGET_UNIT`]s, so an
+    /// upper bound on [`LodStats::cut_triangles`].
     pub refined_triangles: u32,
     /// Triangles drawn, both phases.
     pub drawn_triangles: u32,
@@ -1570,7 +1591,7 @@ fn stats(frame: &GpuFrame) -> LodStats {
     LodStats {
         cut: frame.cut_count,
         cut_triangles: frame.cut_triangles,
-        refined_triangles: frame.triangles,
+        refined_triangles: frame.triangles.saturating_mul(BUDGET_UNIT),
         drawn_triangles: frame.drawn_triangles,
         drawn: (frame.drawn_main, frame.drawn_post),
         clusters: (frame.main.instance_count, frame.post.instance_count),

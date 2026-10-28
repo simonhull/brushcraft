@@ -20,7 +20,7 @@ use crate::cull::{GpuBounds, PyramidPass};
 use crate::gpu::GpuTest;
 use crate::residency::{REQUEST_HEADER, SizeClass, Slot};
 use crate::surface::Size;
-use crate::tree::{NODE_BYTES, NODE_FINEST, TileTree};
+use crate::tree::{GpuNode, NODE_BYTES, NODE_FINEST, TileTree};
 use crate::upload::GpuVertex;
 
 mod orbit;
@@ -668,6 +668,48 @@ fn the_cut_is_complete_with_no_hole_or_overlap_for_random_residency() {
                 );
             }
         }
+    });
+}
+
+#[test]
+fn an_edge_across_an_open_border_holds_no_neighbour_to_the_rule() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        // The spike: face 0 wants the finest level, its neighbours far coarser.
+        let spike = |place: Place| if place.face().index() == 0 { 30.0 } else { 0.3 };
+        let mut scene = Scene::new(gpu, mesh, level(8), |_| true, spike);
+        let requests = request_buffer(gpu, 1024);
+        let view = look(Vec3::new(4.0, 0.5, 0.3), Vec3::default());
+        let config = LodConfig::default()
+            .with_relax_passes(0)
+            .expect("valid")
+            .with_offscreen_seams(false);
+        let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+        let closed = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
+        assert!(
+            closed.stats.shortfall > 0,
+            "a closed mesh holds the spike back"
+        );
+        // Every edge an open border, as the tree marks one with its `edges` bit clear.
+        let open: Vec<GpuNode> = (0..scene.tree.capacity())
+            .map(|node| GpuNode {
+                edges: 0,
+                ..scene.tree.gpu_node(node)
+            })
+            .collect();
+        gpu.queue()
+            .write_buffer(scene.tree.buffer(), 0, bytemuck::cast_slice(&open));
+        let output = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
+        check_partition(&scene, &output);
+        assert_eq!(
+            output.stats.shortfall, 0,
+            "no neighbour to hold it: {:?}",
+            output.stats
+        );
+        assert!(
+            output.stats.cut_triangles > closed.stats.cut_triangles,
+            "the spike refines freely"
+        );
     });
 }
 

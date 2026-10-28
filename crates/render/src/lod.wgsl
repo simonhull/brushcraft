@@ -105,7 +105,7 @@ struct LodFrame {
     threshold: u32,
     // Triangles of the level-0 tiles.
     base: atomic<u32>,
-    // Triangles of the refined choice, kept within the budget.
+    // Budget units (UNIT triangles) the refined choice is charged, kept within the budget.
     triangles: atomic<u32>,
     // Tiles in the cut.
     cut_count: atomic<u32>,
@@ -153,7 +153,7 @@ struct LodFrame {
     reserved: u32,
     // Tiles raised by each relaxation pass.
     raises: array<atomic<u32>, 16>,
-    // Triangles each possible refinement adds, by bucket of its capped screen error.
+    // Budget units each possible refinement adds, by bucket of its capped screen error.
     histogram: array<atomic<u32>, 256>,
 }
 
@@ -273,6 +273,16 @@ fn triangles_of(level: u32) -> u32 {
 // Triangles refining a tile at `level` adds: its children draw four times its own.
 fn delta_of(level: u32) -> u32 {
     return 3u * triangles_of(level);
+}
+
+// Triangles a budget unit counts: a full cluster's. The budget counts in units, so its sums
+// can't wrap a u32 (at most 192 units a node, against 2^32 / 192 = 22M nodes, past MAX_NODES).
+const UNIT: u32 = 128u;
+
+// Budget units refining a tile at `level` is charged: exact from level 3 on (a multiple of a
+// cluster), rounded up to one below.
+fn delta_units(level: u32) -> u32 {
+    return max(delta_of(level) / UNIT, 1u);
 }
 
 // This frame's state of node `n`.
@@ -519,18 +529,19 @@ fn close(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     atomicOr(&work[n].flags, W_CLOSED);
     if (f & (W_WANTS | W_COMPLETE)) == (W_WANTS | W_COMPLETE) {
-        atomicAdd(&frame.histogram[bucket(effective)], delta_of(own_level));
+        atomicAdd(&frame.histogram[bucket(effective)], delta_units(own_level));
     }
 }
 
 // The lowest bucket the budget allows refining, from the top bucket down.
 @compute @workgroup_size(1)
 fn threshold() {
-    var total = atomicLoad(&frame.base);
+    let budget = params.budget / UNIT;
+    var total = (atomicLoad(&frame.base) + UNIT - 1u) / UNIT;
     var chosen = BUCKETS;
     for (var i = BUCKETS; i > 0u; i--) {
         let add = atomicLoad(&frame.histogram[i - 1u]);
-        if total > params.budget || add > params.budget - total {
+        if total > budget || add > budget - total {
             break;
         }
         total += add;
@@ -586,9 +597,10 @@ fn relax(@builtin(global_invocation_id) id: vec3<u32>) {
         atomicOr(&work[n].flags, W_STUCK);
         return;
     }
-    let delta = delta_of(level_of(tree[n].place));
+    let delta = delta_units(level_of(tree[n].place));
+    let budget = params.budget / UNIT;
     let before = atomicAdd(&frame.triangles, delta);
-    if before <= params.budget && delta <= params.budget - before {
+    if before <= budget && delta <= budget - before {
         atomicOr(&work[n].flags, W_REFINED);
         atomicAdd(&frame.raises[cursor.index], 1u);
     } else {
