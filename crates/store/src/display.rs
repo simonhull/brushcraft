@@ -30,6 +30,7 @@ use geom::{BaseMesh, Channel, DisplayTile, EvalError, FaceId, LayerId, Level, Re
 
 use crate::bounds::{self, Derived};
 use crate::deps::DepGraph;
+use crate::jobs::TileCache;
 use crate::op::OpId;
 
 /// The version byte of the display record format this build writes and reads: 2 adds the
@@ -215,39 +216,59 @@ pub(crate) fn readers(
 /// graph are the ones it would list).
 ///
 /// Behind a mutex, as the dependency graph that holds it is shared with the workers; only the
-/// owner thread asks, so it is never contended. At most [`ReachMemo::CAP`] tiles each, emptied
-/// when full.
-#[derive(Debug, Default)]
+/// owner thread asks, so it is never contended. At most its cap of answers of each kind
+/// (`jobs::CacheCaps::reach`), the oldest dropped one at a time, so a full memo never makes a
+/// stroke list everything again at once.
+#[derive(Debug)]
 pub(crate) struct ReachMemo(std::sync::Mutex<Reached>);
 
 /// What a [`ReachMemo`] holds.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Reached {
     /// The display levels the answers are for: other levels empty it.
     levels: BTreeSet<Level>,
     /// The display tiles a write of each tile can change.
-    by: std::collections::HashMap<TileKey, std::sync::Arc<[TileKey]>>,
+    by: TileCache<std::sync::Arc<[TileKey]>>,
     /// The display tiles around each display tile.
-    around: std::collections::HashMap<TileKey, std::sync::Arc<[TileKey]>>,
+    around: TileCache<std::sync::Arc<[TileKey]>>,
+}
+
+impl Reached {
+    /// No answers, for `levels`, at most `cap` of each kind.
+    fn new(levels: BTreeSet<Level>, cap: usize) -> Self {
+        Self {
+            levels,
+            by: TileCache::new(cap),
+            around: TileCache::new(cap),
+        }
+    }
+}
+
+impl Default for ReachMemo {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_CAP)
+    }
 }
 
 impl ReachMemo {
-    /// The most tiles it keeps answers for, of each kind (a few dozen tiles each).
-    const CAP: usize = 1 << 14;
+    /// The answers of each kind a memo made without a store's budget keeps.
+    const DEFAULT_CAP: usize = 256;
+
+    /// An empty memo keeping at most `cap` answers of each kind.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self(std::sync::Mutex::new(Reached::new(BTreeSet::new(), cap)))
+    }
 
     /// [`tiles_around`] `key`, kept for the next ask.
     pub(crate) fn around(&self, mesh: &BaseMesh, key: &TileKey) -> std::sync::Arc<[TileKey]> {
         let Ok(mut memo) = self.0.lock() else {
             return tiles_around(mesh, key).into_iter().collect();
         };
-        if let Some(found) = memo.around.get(key) {
+        if let Some(found) = memo.around.tiles.get(key) {
             return std::sync::Arc::clone(found);
         }
         let found: std::sync::Arc<[TileKey]> = tiles_around(mesh, key).into_iter().collect();
-        if memo.around.len() >= Self::CAP {
-            memo.around.clear();
-        }
-        memo.around.insert(*key, std::sync::Arc::clone(&found));
+        drop(memo.around.insert(*key, std::sync::Arc::clone(&found)));
         found
     }
 }
@@ -287,25 +308,20 @@ fn readers_memo(
         return Ok(reached_by(mesh, moved, finest, levels));
     };
     if memo.levels != *levels {
-        *memo = Reached {
-            levels: levels.clone(),
-            ..Reached::default()
-        };
+        let cap = memo.by.cap();
+        *memo = Reached::new(levels.clone(), cap);
     }
     // The tiles' answers overlap a lot: gathered in a hash set, then sorted once (a set built
     // from sorted keys is built in one pass).
     let mut answer = crate::hash::TileSet::with_capacity_and_hasher(1024, crate::hash::TileHash);
     for &key in edited {
-        if let Some(found) = memo.by.get(&key) {
+        if let Some(found) = memo.by.tiles.get(&key) {
             answer.extend(found.iter().copied());
             continue;
         }
         let found: std::sync::Arc<[TileKey]> = of(key)?.into_iter().collect();
         answer.extend(found.iter().copied());
-        if memo.by.len() >= ReachMemo::CAP {
-            memo.by.clear();
-        }
-        memo.by.insert(key, found);
+        drop(memo.by.insert(key, found));
     }
     let mut sorted: Vec<TileKey> = answer.into_iter().collect();
     sorted.sort_unstable();

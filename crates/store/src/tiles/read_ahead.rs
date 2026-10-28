@@ -63,23 +63,22 @@ pub(super) struct ReadAhead {
     looked: crate::hash::TileSet,
     /// The records read, the oldest dropped first: a few strokes' worth of the tiles around
     /// them (a record of a level-8 tile is about 35 KB).
-    pub(super) read: TileCache<ReadRecord, 512>,
+    pub(super) read: TileCache<ReadRecord>,
 }
 
 impl ReadAhead {
     /// The most tiles it remembers looking at.
     const LOOKED: usize = 4096;
-}
 
-impl Default for ReadAhead {
-    fn default() -> Self {
+    /// Nothing read ahead yet, keeping at most `cap` records (`jobs::CacheCaps::read_ahead`).
+    pub(super) fn new(cap: usize) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
             sender,
             receiver,
             asked: BTreeSet::new(),
             looked: crate::hash::TileSet::default(),
-            read: TileCache::default(),
+            read: TileCache::new(cap),
         }
     }
 }

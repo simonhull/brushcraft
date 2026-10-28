@@ -207,34 +207,61 @@ pub(crate) struct FinestTile {
     pub(crate) normals: Arc<[Vec3]>,
 }
 
-/// Tiles' values a job holds for its workers, by key: at most `CAP`, the oldest dropped first,
-/// and only as of one count of correction changes
-/// ([`TileStore::edits`](crate::TileStore::edits)), since a change can outdate any of them.
+/// Tiles' values a job or the store holds for the workers, by key, at most its cap.
+///
+/// The oldest go first, and, for values a correction change outdates, they hold only as of one
+/// count of them ([`TileStore::edits`](crate::TileStore::edits); see [`TileCache::since`]).
 ///
 /// Dropping one tile at a time when full, not emptying it, keeps each slice's share of the
 /// freeing small; what a change empties is handed back whole, for the caller to free off the
 /// owner thread.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TileCache<V, const CAP: usize> {
+pub(crate) struct TileCache<V> {
     /// The store's count of correction changes the values are as of.
     as_of: u64,
     /// The values, by tile.
     pub(crate) tiles: BTreeMap<TileKey, V>,
     /// The tiles in the order they came in, the oldest first (a tile put in again moves last).
     order: VecDeque<TileKey>,
+    /// The most tiles it holds (at least one).
+    cap: usize,
 }
 
-impl<V, const CAP: usize> Default for TileCache<V, CAP> {
-    fn default() -> Self {
+impl<V> TileCache<V> {
+    /// An empty cache of at most `cap` tiles (at least one).
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             as_of: 0,
             tiles: BTreeMap::new(),
             order: VecDeque::new(),
+            cap: cap.max(1),
         }
     }
-}
 
-impl<V, const CAP: usize> TileCache<V, CAP> {
+    /// The most tiles it holds.
+    pub(crate) const fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Drops the oldest tiles until it holds no more than its cap; returns the first dropped.
+    fn shrink(&mut self) -> Option<V> {
+        let mut out = None;
+        while self.tiles.len() > self.cap {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            let dropped = self.tiles.remove(&oldest);
+            out = out.or(dropped);
+        }
+        out
+    }
+
+    /// Empties it, handing back what it held (to free off the owner thread).
+    pub(crate) fn take(&mut self) -> BTreeMap<TileKey, V> {
+        self.order.clear();
+        std::mem::take(&mut self.tiles)
+    }
+
     /// Empties it unless its values are as of the store's count of correction changes `as_of`;
     /// returns what it held then, for the caller to free where it costs the owner thread
     /// nothing.
@@ -258,19 +285,13 @@ impl<V, const CAP: usize> TileCache<V, CAP> {
     /// Puts `value` in for `key`, dropping the oldest tile if it is full; returns the value it
     /// replaced or dropped, if any (the first, were there several), for the caller to reuse.
     pub(crate) fn insert(&mut self, key: TileKey, value: V) -> Option<V> {
-        let mut out = self.tiles.insert(key, value);
-        if out.is_some() {
+        let replaced = self.tiles.insert(key, value);
+        if replaced.is_some() {
             self.order.retain(|k| *k != key);
         }
         self.order.push_back(key);
-        while self.tiles.len() > CAP {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            let dropped = self.tiles.remove(&oldest);
-            out = out.or(dropped);
-        }
-        out
+        let dropped = self.shrink();
+        replaced.or(dropped)
     }
 }
 
@@ -279,13 +300,10 @@ impl<V, const CAP: usize> TileCache<V, CAP> {
 /// Copied once each, and shared by every display tile reading them; a tile evaluated for a job
 /// is copied right away, so a display tile reading more finest tiles than the budget holds at
 /// once (under a small budget) is still built, never waiting for all of them to be resident
-/// together. More than one display tile reads (its block, apron and the tiles across its face
-/// borders, a few dozen at most), so a tile can always gather all it reads; about 25 MB of
-/// copies at level 9.
-pub(crate) type FinestCopies = TileCache<FinestTile, FINEST_COPIES>;
-
-/// The most finest tiles a job keeps copied ([`FinestCopies`]).
-pub(crate) const FINEST_COPIES: usize = 256;
+/// together. It holds more than one display tile reads (its block, apron and the tiles across
+/// its face borders, a few dozen at most: [`CacheCaps::MIN_COPIES`]), so a tile can always
+/// gather all it reads; [`CacheCaps::copies`] of them.
+pub(crate) type FinestCopies = TileCache<FinestTile>;
 
 /// Display tiles the store's jobs built, or decoded from their records, for the coarser tiles
 /// that read them.
@@ -296,13 +314,72 @@ pub(crate) const FINEST_COPIES: usize = 256;
 /// Held by the store, not a job: a refresh's tiles of one level read those it just built a
 /// level finer, never decoding them again, and the tiles no refresh rebuilt are decoded once
 /// for many refreshes, not once each: a correction change doesn't touch a record, only a build
-/// replaces one. Outside the budget: about 140 KB each at level 8 (positions, normals and
-/// roughness of 65² vertices, and the encoding), so at most about 70 MB.
-pub(crate) type DecodedTiles = TileCache<(u64, Arc<DisplayTile>), 512>;
+/// replaces one. [`CacheCaps::decoded`] of them, emptied when a call to
+/// [`TileStore::run_jobs`](crate::TileStore::run_jobs) finds nothing to do.
+pub(crate) type DecodedTiles = TileCache<(u64, Arc<DisplayTile>)>;
+
+/// How many entries each of the display layer's caches holds, from the bytes the store's budget
+/// sets aside for them
+/// ([`StoreConfig::display_cache_bytes`](crate::StoreConfig::display_cache_bytes)).
+///
+/// The share is split by what each cache is for: half to the decoded display tiles (a coarser
+/// tile reads 16 or so, and a stroke's refresh reads them again and again), three tenths to a
+/// job's finest copies, a tenth each to the records read ahead and to the readers' memo. Each
+/// is counted at its largest entry, and never below the least that lets the jobs make progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheCaps {
+    /// Decoded display tiles the store keeps ([`DecodedTiles`]).
+    pub(crate) decoded: usize,
+    /// Finest tiles a job keeps copied ([`FinestCopies`]).
+    pub(crate) copies: usize,
+    /// Display records read ahead (`tiles::read_ahead`).
+    pub(crate) read_ahead: usize,
+    /// Tiles each of the display readers' memos keeps answers for
+    /// (`display::ReachMemo`).
+    pub(crate) reach: usize,
+}
+
+impl CacheCaps {
+    /// A finest tile's copy: 65² positions and normals.
+    const COPY_BYTES: usize = 65 * 65 * 24;
+    /// A decoded display tile at its largest: 65² vertices of positions, normals and roughness,
+    /// and its encoding.
+    const DECODED_BYTES: usize = 65 * 65 * 25 + 65 * 65 * 17;
+    /// The fewest finest copies: more than any display tile reads.
+    pub(crate) const MIN_COPIES: usize = 64;
+    /// The fewest decoded tiles kept: what the tiles of one coarser level read at once.
+    const MIN_DECODED: usize = 64;
+    /// The fewest memo answers: a dab's written tiles, many times over.
+    const MIN_REACH: usize = 256;
+    /// The fewest records read ahead: a dab's surroundings.
+    const MIN_READ_AHEAD: usize = 16;
+    /// One answer of the readers' memo: a few hundred keys at most.
+    const REACH_BYTES: usize = 4096;
+    /// A display record at its largest (`display::max_body` of a 65² tile).
+    const RECORD_BYTES: usize = 65 * 65 * 17 + 256;
+
+    /// The caps that `bytes` hold (each at least its minimum, which a tiny budget may take
+    /// past `bytes`).
+    pub(crate) fn of(bytes: usize) -> Self {
+        let part =
+            |tenths: usize, each: usize, least: usize| (bytes / 10 * tenths / each).max(least);
+        Self {
+            decoded: part(5, Self::DECODED_BYTES, Self::MIN_DECODED),
+            copies: part(3, Self::COPY_BYTES, Self::MIN_COPIES),
+            read_ahead: part(1, Self::RECORD_BYTES, Self::MIN_READ_AHEAD),
+            reach: part(1, Self::REACH_BYTES, Self::MIN_REACH),
+        }
+    }
+}
 
 impl Upkeep {
-    /// Work building `keys` (display tiles of levels below `finest`).
-    pub(crate) fn new(finest: Level, keys: impl IntoIterator<Item = TileKey>) -> Self {
+    /// Work building `keys` (display tiles of levels below `finest`), keeping at most `copies`
+    /// finest copies ([`CacheCaps::copies`]).
+    pub(crate) fn new(
+        finest: Level,
+        keys: impl IntoIterator<Item = TileKey>,
+        copies: usize,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
             finest,
@@ -316,7 +393,7 @@ impl Upkeep {
             sender,
             receiver,
             received: Vec::new(),
-            copies: FinestCopies::default(),
+            copies: FinestCopies::new(copies),
             spare: Vec::new(),
             cone: None,
             cone_seen: BTreeSet::new(),
@@ -433,6 +510,7 @@ mod tests {
         let mut upkeep = Upkeep::new(
             Level::new(8).unwrap(),
             [key(3, 0), key(7, 1), key(5, 0), key(8, 0)],
+            CacheCaps::MIN_COPIES,
         );
         assert_eq!(
             upkeep.next(),
@@ -470,7 +548,7 @@ mod tests {
             positions: Arc::from(vec![Vec3::ZERO]),
             normals: Arc::from(vec![Vec3::ZERO]),
         };
-        let mut copies = FinestCopies::default();
+        let mut copies = FinestCopies::new(CacheCaps::MIN_COPIES);
         assert!(copies.since(1).is_some(), "a first count empties it");
         copies.insert(finest(0), one.clone());
         assert!(copies.since(1).is_none(), "kept with no change since");
@@ -478,15 +556,19 @@ mod tests {
         let dropped = copies.since(2).unwrap();
         assert_eq!(dropped.len(), 1, "a change hands back what it held");
         assert!(copies.tiles.is_empty(), "a change empties them");
-        let cap = u16::try_from(FINEST_COPIES).unwrap();
+        let cap = u16::try_from(CacheCaps::MIN_COPIES).unwrap();
         for n in 0..cap {
             copies.insert(finest(n), one.clone());
         }
-        assert_eq!(copies.tiles.len(), FINEST_COPIES, "full");
+        assert_eq!(copies.tiles.len(), CacheCaps::MIN_COPIES, "full");
         copies.insert(finest(0), one.clone());
-        assert_eq!(copies.tiles.len(), FINEST_COPIES, "put in again: no growth");
+        assert_eq!(
+            copies.tiles.len(),
+            CacheCaps::MIN_COPIES,
+            "put in again: no growth"
+        );
         copies.insert(finest(cap), one);
-        assert_eq!(copies.tiles.len(), FINEST_COPIES, "the cap holds");
+        assert_eq!(copies.tiles.len(), CacheCaps::MIN_COPIES, "the cap holds");
         assert!(
             !copies.tiles.contains_key(&finest(1)),
             "the oldest went first"

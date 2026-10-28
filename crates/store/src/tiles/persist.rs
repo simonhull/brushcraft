@@ -114,7 +114,9 @@ impl TileStore {
         check_layers(working.meta(), base.as_ref())?;
         let mesh = working.mesh();
         let headroom = Headroom::of(&mesh);
-        let reserved_bytes = reserved_shares(headroom, &config, config.floor_bytes(&mesh))?;
+        let (reserved_bytes, cache_bytes) =
+            reserved_shares(headroom, &config, config.floor_bytes(&mesh))?;
+        let cache_caps = crate::jobs::CacheCaps::of(cache_bytes);
         let next_op = first_op(
             config.site,
             [working.head(), base.as_ref().and_then(BaseFile::head)],
@@ -146,7 +148,7 @@ impl TileStore {
             // Short chunks let the evaluated pool use the room the reserved shares
             // leave below a whole chunk (see "Kept predictions" on `TileStore`).
             evaluated: Pool::with_eviction_log(config.chunk_bytes).with_short_chunks(),
-            deps: DepGraph::new(),
+            deps: DepGraph::with_reach_memo(cache_caps.reach),
             unsaved: TileMap::default(),
             since_rebase,
             last_write: Stamp::ZERO,
@@ -162,8 +164,9 @@ impl TileStore {
             refresh_seen: u64::MAX,
             display_builds: 0,
             display_generations: std::collections::BTreeMap::new(),
-            display_decoded: crate::jobs::DecodedTiles::default(),
-            read_ahead: super::read_ahead::ReadAhead::default(),
+            display_decoded: crate::jobs::DecodedTiles::new(cache_caps.decoded),
+            read_ahead: super::read_ahead::ReadAhead::new(cache_caps.read_ahead),
+            cache_caps,
             bump_readers: None,
             unbumped: BTreeSet::new(),
             stale: crate::stale::StaleFeed::new(config.stale_cap),

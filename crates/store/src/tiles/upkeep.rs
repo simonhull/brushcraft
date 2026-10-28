@@ -410,8 +410,11 @@ impl TileStore {
                 }
             }
         } else {
-            self.jobs
-                .push_back(Job::Refresh(Upkeep::new(finest, unknown)));
+            self.jobs.push_back(Job::Refresh(Upkeep::new(
+                finest,
+                unknown,
+                self.cache_caps.copies,
+            )));
         }
         Ok(())
     }
@@ -430,8 +433,11 @@ impl TileStore {
             .filter(|key| self.where_held(key).is_none())
             .collect();
         if !missing.is_empty() {
-            self.jobs
-                .push_back(Job::Rebuild(Upkeep::new(finest, missing)));
+            self.jobs.push_back(Job::Rebuild(Upkeep::new(
+                finest,
+                missing,
+                self.cache_caps.copies,
+            )));
         }
     }
 
@@ -508,7 +514,11 @@ impl TileStore {
     /// job: for a file without a display layer.
     pub fn queue_display_rebuild(&mut self, finest: Level) {
         let keys = self.all_display_keys(finest);
-        self.jobs.push_back(Job::Rebuild(Upkeep::new(finest, keys)));
+        self.jobs.push_back(Job::Rebuild(Upkeep::new(
+            finest,
+            keys,
+            self.cache_caps.copies,
+        )));
     }
 
     /// Runs the queued jobs until `deadline` (and, for a store keeping a display layer, first
@@ -532,6 +542,12 @@ impl TileStore {
         let mut report = JobsReport::default();
         if let Some(finest) = self.display_finest {
             self.queue_refresh(finest)?;
+        }
+        if self.jobs.is_empty() && !self.display_decoded.tiles.is_empty() {
+            // Nothing to do: the layer is up to date, and the decoded tiles kept for the next
+            // refresh go, freed on the workers, until a refresh decodes them again.
+            let decoded = self.display_decoded.take();
+            self.workers.spawn(move || drop(decoded));
         }
         while Instant::now() < deadline {
             let Some(mut job) = self.jobs.pop_front() else {
@@ -586,7 +602,11 @@ impl TileStore {
             .into_iter()
             .filter(|key| key.level() == level)
             .collect();
-        self.jobs.push_back(Job::Rebuild(Upkeep::new(finest, keys)));
+        self.jobs.push_back(Job::Rebuild(Upkeep::new(
+            finest,
+            keys,
+            self.cache_caps.copies,
+        )));
     }
 
     /// Drops every queued job, where it is: what they had built stays. Tiles the workers are

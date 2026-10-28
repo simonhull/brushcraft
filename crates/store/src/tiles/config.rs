@@ -109,6 +109,8 @@ impl StoreConfig {
     /// the 20 to 30 tiles its sphere reaches, so a stroke keeps the state of every tile its last
     /// several dabs edited with room to spare.
     pub const DEFAULT_STROKE_TILES: usize = 512;
+    /// The most [`StoreConfig::display_cache_bytes`] gives the display layer's caches.
+    pub const MAX_DISPLAY_CACHE_BYTES: usize = 256 << 20;
     /// The bytes of the budget one tile's stroke state is charged:
     /// two `f32` (the start and the summed deltas) per vertex of the largest tile,
     /// `(TILE_QUADS + 1)²` of them, so 33,800 bytes.
@@ -157,6 +159,28 @@ impl StoreConfig {
             })
             .sum();
         per_face.saturating_mul(usize::try_from(mesh.face_count()).unwrap_or(usize::MAX))
+    }
+
+    /// The bytes of the budget the display layer's caches may hold: the decoded display tiles,
+    /// a job's copies of the finest tiles, the records read ahead and the readers' memo (see
+    /// `jobs::CacheCaps`). A sixteenth of the budget, at most 256 MiB: lean on modest hardware,
+    /// more where the budget is large. Zero without a display layer.
+    ///
+    /// Charged to the budget as a reserved share, after the floor, as much of it as the budget
+    /// has left: the pools never count on it. The caches are held to it, each at its largest
+    /// entry, except that each keeps a few dozen entries however small the budget (so the jobs
+    /// still make progress), which a tiny budget may take past its share.
+    #[must_use]
+    pub const fn display_cache_bytes(&self) -> usize {
+        if self.display.is_none() {
+            return 0;
+        }
+        let share = self.budget_bytes / 16;
+        if share < Self::MAX_DISPLAY_CACHE_BYTES {
+            share
+        } else {
+            Self::MAX_DISPLAY_CACHE_BYTES
+        }
     }
 
     /// This configuration letting a stale-feed consumer fall `stale_cap` keys behind (see
@@ -352,11 +376,14 @@ impl Headroom {
     }
 }
 
-/// The bytes of the budget's reserved shares, once checked to fit beside the pools' minimum.
+/// The bytes of the budget's reserved shares, once checked to fit beside the pools' minimum,
+/// and of them the display caches' share.
 ///
-/// The shares are the kept predictions' ([`StoreConfig::kept_prediction_bytes`]) and the
-/// stroke state's ([`StoreConfig::stroke_state_bytes`]); `config`'s budget is checked to hold
-/// them beside the pools' minimum for `headroom`, the kept predictions first.
+/// The shares are the kept predictions' ([`StoreConfig::kept_prediction_bytes`]), the
+/// stroke state's ([`StoreConfig::stroke_state_bytes`]), the display floor's (`floor`) and the
+/// display caches' ([`StoreConfig::display_cache_bytes`]); `config`'s budget is checked to hold
+/// the first three beside the pools' minimum for `headroom`, the kept predictions first. The
+/// caches get what is left of their share, which may be nothing.
 ///
 /// # Errors
 ///
@@ -367,7 +394,7 @@ pub(super) fn reserved_shares(
     headroom: Headroom,
     config: &StoreConfig,
     floor: usize,
-) -> Result<usize, CacheError> {
+) -> Result<(usize, usize), CacheError> {
     let pools = headroom.minimum_budget(config.chunk_bytes);
     let Some(spare) = config.budget_bytes.checked_sub(pools) else {
         let kept = config.kept_prediction_bytes().unwrap_or(usize::MAX);
@@ -395,5 +422,6 @@ pub(super) fn reserved_shares(
     if floor > spare {
         return Err(CacheError::FloorTooLarge { floor, most: spare });
     }
-    Ok(kept + stroke + floor)
+    let caches = config.display_cache_bytes().min(spare - floor);
+    Ok((kept + stroke + floor + caches, caches))
 }

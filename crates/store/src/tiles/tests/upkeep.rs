@@ -114,9 +114,11 @@ fn a_refresh_builds_the_unknown_neighbours_it_reads_first_across_faces() {
     }
     let coarse = TileKey::display(FaceId::new(0), level(3), 0, 0).unwrap();
     store.display.set(coarse, None);
-    store
-        .jobs
-        .push_back(Job::Refresh(Upkeep::new(level(TOP), [coarse])));
+    store.jobs.push_back(Job::Refresh(Upkeep::new(
+        level(TOP),
+        [coarse],
+        crate::jobs::CacheCaps::MIN_COPIES,
+    )));
     let calls = run_all(&mut store);
     assert!(calls >= 1, "ran");
     assert_layer_current(&mut store, "the chain refreshed");
@@ -449,4 +451,67 @@ fn a_refresh_cleared_is_queued_again() {
     assert!(!store.has_jobs(), "cleared");
     run_all(&mut store);
     assert_layer_current(&mut store, "refreshed after a clear");
+}
+
+/// The decoded display tiles a refresh kept go once a call finds nothing to do, and the caches
+/// are sized from the budget's share for them.
+#[test]
+fn the_display_caches_follow_the_budget_and_empty_when_idle() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 3, 73));
+    while store.has_jobs() {
+        store
+            .run_jobs(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+    }
+    // A call with nothing left to do; the one before may still have found a last tile to
+    // look at.
+    let mut idle = 0;
+    while store
+        .run_jobs(Instant::now() + Duration::from_secs(1))
+        .unwrap()
+        .slices
+        > 0
+    {
+        idle += 1;
+        assert!(idle < 10, "the jobs run out");
+    }
+    assert!(
+        store.display_decoded.tiles.is_empty(),
+        "nothing to do: the decoded tiles are let go ({} left, jobs {})",
+        store.display_decoded.tiles.len(),
+        store.has_jobs()
+    );
+    let caps = crate::jobs::CacheCaps::of(0);
+    assert_eq!(
+        caps.copies,
+        crate::jobs::CacheCaps::MIN_COPIES,
+        "a tiny share: the least"
+    );
+    let big = crate::jobs::CacheCaps::of(StoreConfig::MAX_DISPLAY_CACHE_BYTES);
+    assert!(
+        big.decoded > caps.decoded && big.copies > caps.copies,
+        "a large share: more"
+    );
+    let config = StoreConfig::new(1 << 30, 1).with_display(level(TOP));
+    assert_eq!(
+        config.display_cache_bytes(),
+        (1 << 30) / 16,
+        "a sixteenth of the budget"
+    );
+    let huge = StoreConfig::new(64 << 30, 1).with_display(level(TOP));
+    assert_eq!(
+        huge.display_cache_bytes(),
+        StoreConfig::MAX_DISPLAY_CACHE_BYTES,
+        "at most the cap"
+    );
+    assert_eq!(
+        StoreConfig::new(1 << 30, 1).display_cache_bytes(),
+        0,
+        "no layer, no caches"
+    );
 }

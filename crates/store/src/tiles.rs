@@ -265,9 +265,14 @@ impl StoreId {
 /// # Memory outside the budget
 ///
 /// [`StoreConfig::budget_bytes`] bounds the two pools, the kept predictions and the stroke
-/// state, which hold nearly all of a store's memory. Besides them, and not charged to the
-/// budget:
+/// state, which hold nearly all of a store's memory, and, with a display layer, its floor and
+/// its caches (the decoded display tiles, a job's finest copies, the records read ahead and the
+/// readers' memo: [`StoreConfig::display_cache_bytes`], a sixteenth of the budget at most, each
+/// cache holding a few dozen entries however small its share). Besides them, and not charged
+/// to the budget:
 ///
+/// - the display tiles the workers are building or decoding, and the inputs handed to them: a slice
+///   hands out a few at a time, at most one a worker in flight;
 /// - the evaluation scratch: one buffer of the largest tile's positions (about 50 KB) per tile of a
 ///   round not predicted in place, so about 3.2 MB at most (64 of them, once a round of new tiles
 ///   has been built), kept for the store's life;
@@ -367,6 +372,8 @@ pub struct TileStore {
     display_generations: std::collections::BTreeMap<TileKey, u64>,
     /// Display tiles the jobs built or decoded, for the coarser tiles that read them.
     display_decoded: crate::jobs::DecodedTiles,
+    /// How many entries the display layer's caches hold, from the budget's share for them.
+    cache_caps: crate::jobs::CacheCaps,
     /// Display records read ahead on the workers, for the next dabs' bumps.
     read_ahead: read_ahead::ReadAhead,
     /// The writes the last bump covered and the display tiles they can change, as it listed

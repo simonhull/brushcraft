@@ -134,7 +134,18 @@ impl DepGraph {
         &self.reach
     }
 
-    /// An empty graph.
+    /// An empty graph whose display readers' memo keeps answers for at most `cap` tiles of
+    /// each kind (see [`crate::display::ReachMemo`]).
+    pub(crate) fn with_reach_memo(cap: usize) -> Self {
+        Self {
+            reach: crate::display::ReachMemo::new(cap),
+            ..Self::default()
+        }
+    }
+
+    /// An empty graph, its readers' memo at its default size (the tests'; a store sizes it
+    /// from its budget, [`DepGraph::with_reach_memo`]).
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
