@@ -2,6 +2,7 @@
 //! them, a slice of the job, and handing over what it finished (see [`crate::queued`]).
 
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use geom::TileKey;
@@ -10,7 +11,8 @@ use super::TileStore;
 use super::config::Evaluation;
 use super::error::CacheError;
 use super::upkeep::ConeStep;
-use crate::jobs::{JobsReport, ROUND_MAX};
+use crate::jobs::JobsReport;
+use crate::pool::Freshness;
 use crate::queued::{EvaluatedTile, EvaluationQueue, Priority};
 
 /// About how long a slice spends bringing finished tiles up to date after a correction
@@ -69,18 +71,58 @@ impl TileStore {
     /// finished (highest priority first, within a round), each a copy of its positions with
     /// the ring and its normals as the store holds them now.
     ///
-    /// A tile finished before a correction changed is kept back: the next slice of the job
-    /// copies it again from the cache if it is still current there, or queues it again
-    /// (whatever the change moved, the tile handed over is never older than the store's).
+    /// A tile is kept back once a write since it finished reaches it: a write whose
+    /// evaluations reach the tile or a tile of its ring, or any write while one of those has
+    /// left the cache (nothing then tells whether the write reaches it), or a lost tile's write
+    /// undone. The next slice of the job copies it again from the cache if it is current there,
+    /// else queues it again, so the tile handed over is never older than the store's. Writes
+    /// elsewhere leave it alone: during a brush stroke, the tiles away from the brush are
+    /// handed over as they finish.
+    ///
+    /// A tile handed over can still change later without a write of its own, through its ring
+    /// (see [`EvaluatedTile`]): the stale-tile feed tells.
     #[must_use = "the tiles are handed over once: take them to draw them"]
     pub fn take_evaluated(&mut self) -> Vec<EvaluatedTile> {
-        let edits = self.edits;
         let (current, outdated): (Vec<EvaluatedTile>, Vec<EvaluatedTile>) =
             std::mem::take(&mut self.evaluation.finished)
                 .into_iter()
-                .partition(|tile| tile.as_of == edits);
+                .partition(|tile| tile.current);
         self.evaluation.finished = outdated;
         current
+    }
+
+    /// Outdates the finished tiles a write reaches, as the write's evaluations are dropped:
+    /// those reading a tile of `moved` (the positions the write's cascade drops), and those
+    /// reading a tile the cache doesn't hold current. The cascade follows only what the cache
+    /// records, so a tile read from that has left the cache since may follow from the write
+    /// without the cascade saying so.
+    ///
+    /// Called before the cascade's tiles are dropped, so every tile still current is one it
+    /// would reach if the write reached it.
+    pub(super) fn outdate_finished(&mut self, moved: &BTreeSet<TileKey>) {
+        let evaluated = &self.evaluated;
+        let reached = |inputs: &[TileKey]| {
+            inputs.iter().any(|input| {
+                moved.contains(input) || evaluated.freshness(input) != Some(Freshness::Fresh)
+            })
+        };
+        self.evaluation.outdate(reached);
+        #[cfg(test)]
+        for tile in &mut self.hooks.held_evaluated {
+            if reached(&tile.inputs) {
+                tile.current = false;
+            }
+        }
+    }
+
+    /// Outdates every finished tile: for a lost tile's write undone, where the slot's values
+    /// change outside an edit's cascade.
+    pub(super) fn outdate_all_finished(&mut self) {
+        self.evaluation.outdate(|_| true);
+        #[cfg(test)]
+        for tile in &mut self.hooks.held_evaluated {
+            tile.current = false;
+        }
     }
 
     /// How many tiles are queued for evaluation and not finished.
@@ -92,6 +134,9 @@ impl TileStore {
     /// Whether `key`'s positions and unit normals are cached and current: what
     /// [`TileStore::cached_positions`] and [`TileStore::cached_normals`] then read. Never
     /// evaluates, and doesn't count as a use of the tile.
+    ///
+    /// It says nothing of the tile's ring: [`TileStore::cached_positions_with_ring`] reads
+    /// its neighbours too, and may find one of them evicted while this holds.
     #[must_use]
     pub fn is_cached(&self, key: &TileKey) -> bool {
         self.cached_normals(key).is_some()
@@ -125,7 +170,9 @@ impl TileStore {
     ) -> Result<Turn, CacheError> {
         #[cfg(test)]
         if !self.hooks.hold_evaluated {
-            queue.finished.append(&mut self.hooks.held_evaluated);
+            for tile in std::mem::take(&mut self.hooks.held_evaluated) {
+                queue.keep(tile);
+            }
         }
         if self.refresh_finished(queue)? {
             return Ok(Turn::Worked);
@@ -134,9 +181,14 @@ impl TileStore {
         if room == 0 || queue.len() == 0 {
             return Ok(Turn::Idle);
         }
+        // As a display job's own evaluation: a round fits the workers not building display
+        // tiles (one at least) and the round's time at the cost measured lately, and the cone
+        // is of that many tiles, so a slice evaluates no more than one round, its normals or,
+        // past an evicted cone, that many tiles whole.
         let workers = self.workers.current_num_threads().max(1);
-        let round = queue.steps.round_size(workers);
-        let first = queue.first(room.min(ROUND_MAX));
+        let busy: usize = self.jobs.iter_mut().map(|job| job.upkeep().busy()).sum();
+        let round = queue.steps.round_size(workers.saturating_sub(busy).max(1));
+        let first = queue.first(room.min(round));
         let mut keys = match self.step_cone(&mut queue.steps, || first, round)? {
             ConeStep::Round => return Ok(Turn::Worked),
             ConeStep::Reading => return Ok(Turn::Reading),
@@ -161,7 +213,8 @@ impl TileStore {
                 // Evicted by the round after it (a budget about the size of the batch).
                 let ring = self.positions_with_ring(key)?;
                 let normals = self.normals(key)?.to_vec();
-                EvaluatedTile::new(key, priority, ring, normals, self.edits)
+                let inputs = self.normal_inputs(&key)?.into_owned();
+                EvaluatedTile::new(key, priority, ring, normals, inputs)
             };
             queue.done(&key);
             report.queue_finished += 1;
@@ -170,14 +223,15 @@ impl TileStore {
                 self.hooks.held_evaluated.push(tile);
                 continue;
             }
-            queue.finished.push(tile);
+            queue.keep(tile);
         }
         Ok(Turn::Worked)
     }
 
-    /// Brings the finished tiles a correction change outdated up to date, for about
-    /// [`REFRESH_TIME`]: each is copied again from the cache if it is current there, else
-    /// queued again at its priority. Returns whether there were any.
+    /// Brings the finished tiles a write outdated up to date, for about [`REFRESH_TIME`]: each
+    /// is copied again from the cache if it is current there, else queued again, behind the
+    /// tiles queued for the first time (at its priority, unless it is queued already, at a
+    /// newer one). Returns whether there were any.
     ///
     /// # Errors
     ///
@@ -187,7 +241,7 @@ impl TileStore {
         let mut any = false;
         let mut at = 0;
         while let Some(tile) = queue.finished.get(at) {
-            if tile.as_of == self.edits {
+            if tile.current {
                 at += 1;
                 continue;
             }
@@ -203,7 +257,7 @@ impl TileStore {
                 at += 1;
             } else {
                 queue.finished.remove(at);
-                queue.want(key, Priority::new(priority));
+                queue.want_again(key, Priority::new(priority));
             }
         }
         Ok(any)
@@ -227,12 +281,13 @@ impl TileStore {
         let Some(ring) = self.cached_positions_with_ring(&key)? else {
             return Ok(None);
         };
+        let inputs = self.normal_inputs(&key)?.into_owned();
         Ok(Some(EvaluatedTile::new(
             key,
             priority,
             ring,
             normals.to_vec(),
-            self.edits,
+            inputs,
         )))
     }
 }

@@ -62,11 +62,23 @@ impl Ord for Priority {
 }
 
 /// A finest tile the queued evaluation finished: its evaluated positions with the one-vertex
-/// ring, and its unit normals, copied out of the store's cache as of one count of correction
-/// changes.
+/// ring, and its unit normals, copied out of the store's cache.
 ///
 /// Handed over by [`TileStore::take_evaluated`](crate::TileStore::take_evaluated) only while
-/// no correction has changed since it was copied, so it is the tile as the store holds it.
+/// it is still the tile as the store holds it: a write whose evaluations reach the tile or any
+/// tile its ring reads outdates the copy, and the job copies it again (or evaluates it again)
+/// before handing it over. Writes elsewhere leave it alone, so tiles away from a brush stroke
+/// are handed over during the stroke.
+///
+/// Once taken, a tile can change without its own corrections being written: a write in a
+/// neighbour moves its ring, and with it the normals of its border vertices. The stale-tile
+/// feed says so ([`TileStore::drain_stale`](crate::TileStore::drain_stale)): an epoch names
+/// every evaluated tile whose positions moved, and a tile whose ring reads one of them has
+/// normals to compute again.
+///
+/// The normals are the store's CPU normals, for a renderer that uploads them. Once the GPU
+/// computes finest normals from the ring itself (M1a3 Task 5), they are only a reference, and
+/// can go.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvaluatedTile {
     /// The tile.
@@ -79,8 +91,14 @@ pub struct EvaluatedTile {
     /// Its unit normals, row-major `side²`, as [`TileStore::normals`](crate::TileStore::normals)
     /// gives them.
     normals: Vec<Vec3>,
-    /// The store's count of correction changes it was copied at.
-    pub(crate) as_of: u64,
+    /// The tiles its copy was read from (its own and its ring's, [`TileStore::normal_inputs`]
+    /// in key order): a write whose evaluations reach one outdates the copy.
+    ///
+    /// [`TileStore::normal_inputs`]: crate::TileStore::normal_inputs
+    pub(crate) inputs: Vec<TileKey>,
+    /// Whether the copy is still the tile as the store holds it: no write has reached its
+    /// inputs since it was made.
+    pub(crate) current: bool,
 }
 
 impl EvaluatedTile {
@@ -93,20 +111,21 @@ impl EvaluatedTile {
         (padded * padded + side * side) * size_of::<Vec3>() + size_of::<Self>()
     };
 
-    /// A finished tile, copied at count of correction changes `as_of`.
+    /// A finished tile, current, copied from `inputs`.
     pub(crate) const fn new(
         key: TileKey,
         priority: f32,
         ring: GatheredBlock,
         normals: Vec<Vec3>,
-        as_of: u64,
+        inputs: Vec<TileKey>,
     ) -> Self {
         Self {
             key,
             priority,
             ring,
             normals,
-            as_of,
+            inputs,
+            current: true,
         }
     }
 
@@ -192,14 +211,34 @@ impl EvaluationCaps {
     }
 }
 
+/// A wanted tile's place in the queue: the tiles queued for the first time before those queued
+/// again after a write outdated their copy, then the highest priority first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank {
+    /// Whether the tile was queued again after a write outdated its copy.
+    again: bool,
+    /// Its priority, highest first.
+    priority: Reverse<Priority>,
+}
+
+impl Rank {
+    /// The place of a tile queued `again` or not, at `priority`.
+    const fn new(again: bool, priority: Priority) -> Self {
+        Self {
+            again,
+            priority: Reverse(priority),
+        }
+    }
+}
+
 /// The queued evaluation's state: the tiles wanted, the cone being stepped through for the
 /// first of them, and the finished tiles waiting to be taken.
 #[derive(Debug)]
 pub(crate) struct EvaluationQueue {
-    /// The tiles wanted and not finished, with their priorities.
-    wanted: BTreeMap<TileKey, Priority>,
-    /// The same, highest priority first, then in key order.
-    order: BTreeSet<(Reverse<Priority>, TileKey)>,
+    /// The tiles wanted and not finished, with their places in the queue.
+    wanted: BTreeMap<TileKey, Rank>,
+    /// The same, in the order they are evaluated: first by [`Rank`], then by key.
+    order: BTreeSet<(Rank, TileKey)>,
     /// The cone of the tiles being evaluated (see `TileStore::step_cone`).
     pub(crate) steps: ConeSteps,
     /// The finished tiles, in the order they finished, waiting to be taken.
@@ -223,13 +262,28 @@ impl EvaluationQueue {
     /// Wants `key` at `priority`: queued, or its priority changed if it is already. A tile
     /// finished and waiting to be taken is queued anew (its copy stays until taken).
     pub(crate) fn want(&mut self, key: TileKey, priority: Priority) {
-        if let Some(old) = self.wanted.insert(key, priority) {
-            self.order.remove(&(Reverse(old), key));
-        }
-        self.order.insert((Reverse(priority), key));
+        self.rank(key, Rank::new(false, priority));
     }
 
-    /// Drops the lowest-priority keys past the cap; returns how many.
+    /// Wants `key` again at `priority`, a write having outdated its copy: behind every tile
+    /// queued for the first time, so a tile a brush keeps writing under can't keep the job from
+    /// the rest. A tile queued already keeps its place.
+    pub(crate) fn want_again(&mut self, key: TileKey, priority: Priority) {
+        if !self.wanted.contains_key(&key) {
+            self.rank(key, Rank::new(true, priority));
+        }
+    }
+
+    /// Puts `key` in the queue at `rank`, out of any place it had.
+    fn rank(&mut self, key: TileKey, rank: Rank) {
+        if let Some(old) = self.wanted.insert(key, rank) {
+            self.order.remove(&(old, key));
+        }
+        self.order.insert((rank, key));
+    }
+
+    /// Drops the lowest-priority keys past the cap; returns how many. A cone being stepped
+    /// through for a key dropped is dropped too.
     pub(crate) fn trim(&mut self) -> usize {
         let mut dropped = 0;
         while self.wanted.len() > self.caps.queued {
@@ -239,16 +293,14 @@ impl EvaluationQueue {
             self.wanted.remove(&key);
             dropped += 1;
         }
+        self.drop_lost_cone();
         dropped
     }
 
-    /// Keeps only the wanted tiles, and the finished ones, `keep` holds of; returns whether the
-    /// tiles being evaluated lost one.
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&TileKey) -> bool) -> bool {
-        self.wanted.retain(|key, _| keep(key));
+    /// Forgets the cone being stepped through if a tile it is for is no longer wanted; returns
+    /// whether it did.
+    fn drop_lost_cone(&mut self) -> bool {
         let wanted = &self.wanted;
-        self.order.retain(|(_, key)| wanted.contains_key(key));
-        self.finished.retain(|tile| keep(&tile.key));
         let lost = self
             .steps
             .cone
@@ -260,15 +312,42 @@ impl EvaluationQueue {
         lost
     }
 
+    /// Keeps only the wanted tiles, and the finished ones, `keep` holds of; returns whether the
+    /// tiles being evaluated lost one.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&TileKey) -> bool) -> bool {
+        self.wanted.retain(|key, _| keep(key));
+        let wanted = &self.wanted;
+        self.order.retain(|(_, key)| wanted.contains_key(key));
+        self.finished.retain(|tile| keep(&tile.key));
+        self.drop_lost_cone()
+    }
+
     /// The priority `key` is wanted at, if it is.
     pub(crate) fn priority(&self, key: &TileKey) -> Option<Priority> {
-        self.wanted.get(key).copied()
+        self.wanted.get(key).map(|rank| rank.priority.0)
     }
 
     /// Marks `key` finished: no longer wanted.
     pub(crate) fn done(&mut self, key: &TileKey) {
-        if let Some(priority) = self.wanted.remove(key) {
-            self.order.remove(&(Reverse(priority), *key));
+        if let Some(rank) = self.wanted.remove(key) {
+            self.order.remove(&(rank, *key));
+        }
+    }
+
+    /// Keeps `tile` for the caller, in place of a copy of the same tile not taken yet (a tile
+    /// queued again after it finished).
+    pub(crate) fn keep(&mut self, tile: EvaluatedTile) {
+        self.finished.retain(|older| older.key != tile.key);
+        self.finished.push(tile);
+    }
+
+    /// Outdates the finished tiles `reached` holds of (by their inputs): a write reached them.
+    pub(crate) fn outdate(&mut self, mut reached: impl FnMut(&[TileKey]) -> bool) {
+        let current = self.finished.iter_mut().filter(|tile| tile.current);
+        for tile in current {
+            if reached(&tile.inputs) {
+                tile.current = false;
+            }
         }
     }
 
@@ -289,10 +368,9 @@ impl EvaluationQueue {
     }
 
     /// Whether a slice has anything to do: tiles wanted with room to finish them, or finished
-    /// tiles to bring up to the store's count of correction changes `edits`.
-    pub(crate) fn has_work(&self, edits: u64) -> bool {
-        (!self.wanted.is_empty() && self.room() > 0)
-            || self.finished.iter().any(|tile| tile.as_of != edits)
+    /// tiles a write outdated, to copy again.
+    pub(crate) fn has_work(&self) -> bool {
+        (!self.wanted.is_empty() && self.room() > 0) || self.finished.iter().any(|t| !t.current)
     }
 
     /// Forgets every wanted tile and the cone; the finished tiles stay, to be taken.
@@ -364,12 +442,12 @@ mod tests {
         assert_eq!(queue.first(5), [key(4), key(3), key(2)], "the highest stay");
         queue.done(&key(3));
         assert_eq!(queue.first(5), [key(4), key(2)], "a finished tile leaves");
-        assert!(queue.has_work(0), "tiles wanted, room to finish them");
+        assert!(queue.has_work(), "tiles wanted, room to finish them");
         queue.retain(|k| *k == key(2));
         assert_eq!(queue.first(5), [key(2)], "withdrawn");
         queue.clear();
         assert_eq!(queue.len(), 0, "cleared");
-        assert!(!queue.has_work(0), "nothing to do");
+        assert!(!queue.has_work(), "nothing to do");
     }
 
     #[test]

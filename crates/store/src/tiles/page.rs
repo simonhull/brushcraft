@@ -804,7 +804,11 @@ impl TileStore {
                     || self.deps.has_untracked()
             })
             .collect();
-        if !reached.is_empty() {
+        if reached.is_empty() {
+            // Nothing the cache holds follows from the write; a finished tile read from a tile
+            // since evicted may, unseen.
+            self.outdate_finished(&BTreeSet::new());
+        } else {
             self.invalidate(reached);
         }
     }
@@ -830,6 +834,7 @@ impl TileStore {
         }
         let edited: BTreeSet<TileKey> = edited.into_iter().collect();
         let cascade = self.deps.cascade(edited.iter().copied());
+        self.outdate_finished(&cascade.positions);
         for (key, changed) in cascade.normals {
             self.deps.stale_normals(key, changed);
         }

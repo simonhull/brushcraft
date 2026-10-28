@@ -622,9 +622,9 @@ impl TileStore {
         sides: &mut Sides,
         report: &mut JobsReport,
     ) -> Result<(), CacheError> {
-        while Instant::now() < deadline {
+        while self.now() < deadline {
             let display_ready = !self.jobs.is_empty() && sides.display.is_none();
-            let queue_ready = sides.queue.is_none() && self.evaluation.has_work(self.edits);
+            let queue_ready = sides.queue.is_none() && self.evaluation.has_work();
             let run_queue = match (display_ready, queue_ready) {
                 (true, true) => sides.queue_next,
                 (false, true) => true,
@@ -638,13 +638,15 @@ impl TileStore {
             };
             sides.queue_next = !run_queue;
             #[cfg(test)]
-            self.hooks
-                .turns
-                .push((run_queue, display_ready && queue_ready));
+            let work = self
+                .hooks
+                .begin_turn(run_queue, display_ready && queue_ready);
             let began = Instant::now();
             if run_queue {
                 let turn = self.evaluation_slice(report);
                 note_slice(report, began.elapsed());
+                #[cfg(test)]
+                self.hooks.end_turn(work);
                 sides.queue = match turn? {
                     Turn::Worked => None,
                     waiting @ (Turn::Reading | Turn::Idle) => Some(waiting),
@@ -658,6 +660,8 @@ impl TileStore {
             };
             let progress = self.slice(&mut job, report);
             note_slice(report, began.elapsed());
+            #[cfg(test)]
+            self.hooks.end_turn(work);
             match progress {
                 Ok(Progress::Done) => report.finished += 1,
                 Ok(Progress::More) => self.jobs.push_front(job),
@@ -670,10 +674,9 @@ impl TileStore {
                     return Err(e);
                 }
             }
-            // The queued evaluation's reads may have landed by now.
-            if sides.queue == Some(Turn::Reading) {
-                sides.queue = None;
-            }
+            // The queued evaluation's reads may have landed by now, and a slice that found
+            // nothing to do may find something after the display jobs' slice.
+            sides.queue = None;
         }
         Ok(())
     }
@@ -690,26 +693,45 @@ impl TileStore {
             // Nothing to do, nothing to wait for.
             return false;
         }
+        let now = self.now();
         let until = deadline
             .checked_sub(crate::jobs::WAKE_MARGIN)
             .unwrap_or(deadline);
         let until = if reading || display == Some(Progress::Reading) {
-            until.min(Instant::now() + crate::jobs::READ_WAIT)
+            until.min(now + crate::jobs::READ_WAIT)
         } else {
             until
         };
-        let left = until.saturating_duration_since(Instant::now());
+        // The wait itself is in real time, whatever clock the deadline is on.
+        let left = until.saturating_duration_since(now);
         match self.jobs.front_mut() {
-            Some(job) if display.is_some() => job.upkeep().wait_until(until),
+            Some(job) if display.is_some() => job.upkeep().wait_until(Instant::now() + left),
             // A sleep of nothing still gives the thread up, for as long as the scheduler likes.
             _ if left.is_zero() => {}
             _ => std::thread::sleep(left),
         }
+        #[cfg(test)]
+        self.hooks.wait_until(until);
         sides.display = None;
         if reading {
             sides.queue = None;
         }
-        deadline.saturating_duration_since(Instant::now()) > crate::jobs::WAKE_MARGIN
+        deadline.saturating_duration_since(self.now()) > crate::jobs::WAKE_MARGIN
+    }
+
+    /// The time [`TileStore::run_jobs`] reads its deadline against: now, or, in a test that
+    /// sets one, the test's clock (in the store's test hooks), which moves only
+    /// by whole slices and waits.
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "only the tests' clock reads the store")
+    )]
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.hooks.clock_now() {
+            return now;
+        }
+        Instant::now()
     }
 
     /// Queues building the display tiles of `level` alone (a level below `finest`) the store
@@ -742,7 +764,7 @@ impl TileStore {
     /// queued for evaluation with room to finish them (or finished tiles to bring up to date).
     #[must_use]
     pub fn has_jobs(&self) -> bool {
-        !self.jobs.is_empty() || self.evaluation.has_work(self.edits)
+        !self.jobs.is_empty() || self.evaluation.has_work()
     }
 
     /// One slice of `job`: records what the workers finished, hands them the next tiles whose

@@ -61,31 +61,43 @@ fn a_rebuild_then_refreshes_after_edits_give_the_layer_built_from_scratch() {
     }
 }
 
+/// On the tests' clock, which moves a slice at a time: a call runs no more slices than its
+/// deadline holds, and no slice computes more than a round of tiles' positions or normals.
 #[test]
 fn run_jobs_honours_its_deadline_within_one_slice() {
     let dir = TestDir::new();
     let mesh = mesh();
     let mut store = display_store(&dir, &mesh);
-    let budget = Duration::from_micros(300);
+    let slice = Duration::from_millis(1);
+    store.hooks.clock = Some(hooks::TestClock {
+        now: Instant::now(),
+        slice,
+    });
     let mut calls = 0;
     let began = Instant::now();
     while store.has_jobs() {
-        let start = Instant::now();
-        let report = store.run_jobs(start + budget).unwrap();
-        let spent = start.elapsed();
+        let start = store.hooks.clock_now().unwrap();
+        let report = store.run_jobs(start + 2 * slice).unwrap();
         assert!(
-            spent <= budget + report.longest_slice + Duration::from_millis(1),
-            "call {calls}: {spent:?} for {budget:?}, longest slice {:?}",
-            report.longest_slice
+            report.slices <= 2,
+            "call {calls}: a deadline of two slices runs two at most: {}",
+            report.slices
         );
         calls += 1;
-        // A call shorter than a wait for the workers can take returns at once, so the calls
-        // are counted in time, not number.
         assert!(
             began.elapsed() < Duration::from_secs(60),
             "the rebuild ends"
         );
     }
+    let heavy: Vec<_> = store
+        .hooks
+        .turns
+        .iter()
+        .filter(|turn| {
+            turn.positions > crate::jobs::ROUND_MAX || turn.normals > crate::jobs::ROUND_MAX
+        })
+        .collect();
+    assert!(heavy.is_empty(), "no slice past a round: {heavy:?}");
     assert!(calls > 1, "a rebuild takes many short calls: {calls}");
     assert_layer_current(&mut store, "rebuilt in slices");
 }

@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use geom::gather_block;
 
+use super::super::hooks::{TestClock, Turned};
 use super::*;
 use crate::JobsReport;
+use crate::jobs::ROUND_MAX;
 use crate::queued::{EvaluatedTile, EvaluationCaps};
 
 /// Every finest tile of the cube, each with a priority from `seed`, all distinct.
@@ -64,7 +66,10 @@ fn assert_dense(mesh: &BaseMesh, dense: &DenseEvaluation, tile: &EvaluatedTile, 
     );
     let region = Region::of_tile(&key);
     let ring = gather_block(mesh, dense, region).unwrap();
-    let bits = |values: &[Vec3]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let bits = |values: &[Vec3]| {
+        let bits: Vec<[u32; 3]> = values.iter().map(|v| v.to_bits()).collect();
+        bits
+    };
     assert_eq!(
         bits(tile.ring().padded()),
         bits(ring.padded()),
@@ -188,8 +193,12 @@ fn withdrawn_tiles_are_neither_evaluated_nor_handed_over() {
     );
 }
 
+/// On the tests' clock, a call runs no more slices than its deadline holds.
+///
+/// The clock moves a slice at a time; no slice computes more than a round of tiles' positions or
+/// normals, and both jobs move on together.
 #[test]
-fn run_jobs_keeps_its_deadline_and_both_jobs_move_on_together() {
+fn run_jobs_keeps_its_deadline_in_slices_and_both_jobs_move_on_together() {
     let dir = TestDir::new();
     let mesh = mesh();
     let mut store = new_store(&dir, "work.bcp", &mesh, roomy().with_display(level(TOP)));
@@ -198,19 +207,22 @@ fn run_jobs_keeps_its_deadline_and_both_jobs_move_on_together() {
         "a file without a display layer queues its rebuild"
     );
     store.queue_evaluation(&prioritized(&mesh, 11)).unwrap();
-    let budget = Duration::from_micros(300);
+    let slice = Duration::from_millis(1);
+    store.hooks.clock = Some(TestClock {
+        now: Instant::now(),
+        slice,
+    });
     let began = Instant::now();
     let (mut built_while_queued, mut finished_while_building) = (0, 0);
     let mut taken = 0;
-    let mut calls = 0;
-    let mut overruns = Vec::new();
     while store.has_jobs() || store.queued_evaluations() > 0 {
-        let start = Instant::now();
-        let report = store.run_jobs(start + budget).unwrap();
-        let spent = start.elapsed();
-        if spent > budget + report.longest_slice + Duration::from_millis(1) {
-            overruns.push((calls, spent, report.longest_slice));
-        }
+        let start = store.hooks.clock_now().unwrap();
+        let report = store.run_jobs(start + 3 * slice).unwrap();
+        assert!(
+            report.slices <= 3,
+            "a deadline of three slices runs three at most: {}",
+            report.slices
+        );
         if report.queue_left > 0 {
             built_while_queued += report.built;
         }
@@ -218,17 +230,17 @@ fn run_jobs_keeps_its_deadline_and_both_jobs_move_on_together() {
             finished_while_building += report.queue_finished;
         }
         taken += store.take_evaluated().len();
-        calls += 1;
         assert!(began.elapsed() < Duration::from_secs(60), "the jobs end");
     }
-    // Thousands of calls of a fraction of a millisecond each: on a loaded machine (the tests
-    // run side by side, every store with its workers) the scheduler takes the thread away for
-    // a timeslice now and then, inside a call or out. Those are rare; a call overrunning its
-    // deadline by more than its longest slice every time would not be.
+    let turns = &store.hooks.turns;
+    let heavy: Vec<&Turned> = turns
+        .iter()
+        .filter(|turn| turn.positions > ROUND_MAX || turn.normals > ROUND_MAX)
+        .collect();
+    assert!(heavy.is_empty(), "no slice past a round: {heavy:?}");
     assert!(
-        overruns.len() * 100 <= calls,
-        "{} of {calls} calls overran by more than a slice: {overruns:?}",
-        overruns.len()
+        turns.iter().any(|turn| turn.positions > 0),
+        "slices evaluated"
     );
     assert_eq!(taken, tiles(&mesh, TOP, TOP).len(), "every queued tile");
     assert!(
@@ -239,6 +251,186 @@ fn run_jobs_keeps_its_deadline_and_both_jobs_move_on_together() {
         finished_while_building > 0,
         "the queue finished tiles while the display layer was being built"
     );
+}
+
+/// On the real clock, a coarse check that a call ends near its deadline: within its longest
+/// slice and a generous allowance for a loaded machine's scheduler.
+#[test]
+fn run_jobs_ends_near_its_deadline_on_the_real_clock() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy().with_display(level(TOP)));
+    store.queue_evaluation(&prioritized(&mesh, 23)).unwrap();
+    let budget = Duration::from_millis(2);
+    for call in 0..50 {
+        let start = Instant::now();
+        let report = store.run_jobs(start + budget).unwrap();
+        let spent = start.elapsed();
+        assert!(
+            spent <= budget + report.longest_slice + Duration::from_millis(50),
+            "call {call}: {spent:?} for {budget:?}, longest slice {:?}",
+            report.longest_slice
+        );
+        drop(store.take_evaluated());
+    }
+}
+
+/// During a brush stroke (a write between every call and take), the tiles away from the
+/// brush are handed over as they finish, and none under it, nor reading it through its ring,
+/// ever is stale.
+#[test]
+fn during_a_stroke_tiles_away_from_the_brush_are_handed_over() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, mut map) = edited(&dir, &mesh, roomy());
+    // The brush works inside face 0's first tile; the queue wants it, at the top priority, and
+    // every tile of faces 3 to 5 whose ring doesn't read it (away from the brush).
+    let brushed = TileKey::displacement(FaceId::new(0), level(TOP), 0, 0).unwrap();
+    let away = |reading: &TileStore, key: &TileKey| {
+        key.face().index() >= 3 && !reading.normal_inputs(key).unwrap().contains(&brushed)
+    };
+    let mut wanted: Vec<(TileKey, f32)> = prioritized(&mesh, 29)
+        .into_iter()
+        .filter(|(key, _)| away(&store, key))
+        .collect();
+    assert!(wanted.len() > 20, "tiles away from the brush");
+    wanted.push((brushed, 1e6));
+    store.queue_evaluation(&wanted).unwrap();
+    let mut taken = Vec::new();
+    let mut dab = 0_u32;
+    let began = Instant::now();
+    while taken.len() < wanted.len() - 1 {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(2))
+            .unwrap();
+        // The next frame's brush step, then its uploads.
+        store.begin_op().unwrap();
+        apply_dabs(
+            &mut store,
+            &mut map,
+            &[Edit {
+                face: FaceId::new(0),
+                level: level(TOP),
+                i: 10 + dab % 40,
+                j: 20,
+                c: Vec3::new(0.0, 0.0, 0.001 * f32::from(u16::try_from(dab % 7).unwrap())),
+            }],
+        );
+        dab += 1;
+        let dense = dense(&mesh, &map);
+        for tile in store.take_evaluated() {
+            assert_ne!(tile.key(), brushed, "the brushed tile is never handed over");
+            assert_dense(&mesh, &dense, &tile, "during the stroke");
+            taken.push(tile.key());
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the tiles away from the brush arrive during the stroke"
+        );
+    }
+    assert!(dab > 1, "a stroke of several dabs");
+}
+
+/// A lost tile's write undone, with tiles finished: every one is kept back, then handed over as
+/// the store reads it after the revert.
+#[test]
+fn a_lost_write_undone_keeps_finished_tiles_back_until_copied_again() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, mut map) = edited(&dir, &mesh, roomy());
+    let lost = TileKey::displacement(FaceId::new(1), level(TOP), 2, 2).unwrap();
+    let region = Region::of_tile(&lost);
+    apply(
+        &mut store,
+        &mut map,
+        &[Edit {
+            face: lost.face(),
+            level: level(TOP),
+            i: region.x0() + 20,
+            j: region.y0() + 20,
+            c: Vec3::new(0.02, 0.0, 0.01),
+        }],
+    );
+    let keys: Vec<(TileKey, f32)> = [
+        (lost, 1.0),
+        (
+            TileKey::displacement(FaceId::new(4), level(TOP), 0, 0).unwrap(),
+            0.5,
+        ),
+    ]
+    .to_vec();
+    store.queue_evaluation(&keys).unwrap();
+    while store.evaluation.finished.len() < 2 {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(2))
+            .unwrap();
+    }
+    store.flush_bounds(&[lost]).unwrap();
+    assert!(
+        store.take_evaluated().is_empty(),
+        "every finished tile kept back after a revert"
+    );
+    let taken = take_all(&mut store, Duration::from_millis(2));
+    assert_eq!(taken.len(), 2, "both handed over again");
+    for tile in &taken {
+        let key = tile.key();
+        let ring = store.positions_with_ring(key).unwrap();
+        let bits = |values: &[Vec3]| {
+            let bits: Vec<[u32; 3]> = values.iter().map(|v| v.to_bits()).collect();
+            bits
+        };
+        assert_eq!(
+            bits(tile.ring().padded()),
+            bits(ring.padded()),
+            "{key:?}: the ring as the store reads it now"
+        );
+        let normals = store.normals(key).unwrap();
+        assert_eq!(tile.normals(), normals, "{key:?}: and its normals");
+    }
+}
+
+/// A tile finished, then queued again before it is taken, is handed over once; one re-queued
+/// after a write keeps the newer priority it was queued at meanwhile.
+#[test]
+fn a_tile_queued_again_is_handed_over_once_at_its_newest_priority() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, mut map) = edited(&dir, &mesh, roomy());
+    let key = TileKey::displacement(FaceId::new(2), level(TOP), 1, 2).unwrap();
+    store.queue_evaluation(&[(key, 1.0)]).unwrap();
+    let run_until_finished = |running: &mut TileStore| {
+        while running.evaluation.finished.is_empty() || running.queued_evaluations() > 0 {
+            running
+                .run_jobs(Instant::now() + Duration::from_millis(2))
+                .unwrap();
+        }
+    };
+    run_until_finished(&mut store);
+    store.queue_evaluation(&[(key, 2.0)]).unwrap();
+    run_until_finished(&mut store);
+    assert_eq!(store.evaluation.finished.len(), 1, "one copy");
+    // Outdated by a write under it, and queued at a newer priority before the job sees it.
+    let region = Region::of_tile(&key);
+    apply(
+        &mut store,
+        &mut map,
+        &[Edit {
+            face: key.face(),
+            level: level(TOP),
+            i: region.x0() + 5,
+            j: region.y0() + 5,
+            c: Vec3::new(0.01, 0.01, 0.0),
+        }],
+    );
+    store.queue_evaluation(&[(key, 7.0)]).unwrap();
+    let taken = take_all(&mut store, Duration::from_millis(2));
+    assert_eq!(taken.len(), 1, "handed over once");
+    assert_eq!(
+        taken[0].priority().to_bits(),
+        7.0_f32.to_bits(),
+        "at its newest priority"
+    );
+    assert_dense(&mesh, &dense(&mesh, &map), &taken[0], "after the write");
 }
 
 #[test]
@@ -459,10 +651,10 @@ fn a_short_budget_gives_the_queue_what_is_left() {
     assert!(partial > 0, "some budgets give part of the share");
 }
 
-/// A write that leaves a finished tile alone keeps it: copied again from the cache, not
-/// evaluated again.
+/// A write that leaves a finished tile and its ring alone leaves the tile current: handed over
+/// at once, neither copied nor evaluated again.
 #[test]
-fn a_write_elsewhere_keeps_a_finished_tile_copied_from_the_cache() {
+fn a_write_elsewhere_leaves_a_finished_tile_current() {
     let dir = TestDir::new();
     let mesh = mesh();
     let (mut store, mut map) = edited(&dir, &mesh, roomy());
@@ -484,15 +676,11 @@ fn a_write_elsewhere_keeps_a_finished_tile_copied_from_the_cache() {
             c: Vec3::new(0.0, 0.01, 0.0),
         }],
     );
-    assert!(store.take_evaluated().is_empty(), "kept back after a write");
-    let report = store
-        .run_jobs(Instant::now() + Duration::from_millis(50))
-        .unwrap();
-    assert_eq!(report.queue_finished, 0, "nothing evaluated again");
+    assert!(!store.has_jobs(), "nothing to bring up to date");
     assert_eq!(store.queued_evaluations(), 0, "nor queued again");
     let taken = store.take_evaluated();
-    assert_eq!(taken.len(), 1, "handed over");
-    assert_dense(&mesh, &dense(&mesh, &map), &taken[0], "copied again");
+    assert_eq!(taken.len(), 1, "handed over right after the write");
+    assert_dense(&mesh, &dense(&mesh, &map), &taken[0], "as it was");
 }
 
 /// With both sides able to run, each slice goes to the side that didn't run the one before,
@@ -512,8 +700,8 @@ fn the_display_jobs_and_the_queue_take_turns() {
     let turns = &store.hooks.turns;
     let contested: Vec<bool> = turns
         .windows(2)
-        .filter(|pair| pair[1].1)
-        .map(|pair| pair[0].0 != pair[1].0)
+        .filter(|pair| pair[1].contested)
+        .map(|pair| pair[0].queue != pair[1].queue)
         .collect();
     assert!(!contested.is_empty(), "both sides had work at once");
     assert!(
@@ -521,7 +709,7 @@ fn the_display_jobs_and_the_queue_take_turns() {
         "each contested turn goes to the other side: {turns:?}"
     );
     assert!(
-        turns.iter().any(|&(queue, _)| queue) && turns.iter().any(|&(queue, _)| !queue),
+        turns.iter().any(|turn| turn.queue) && turns.iter().any(|turn| !turn.queue),
         "both ran"
     );
 }
