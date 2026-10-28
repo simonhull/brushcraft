@@ -13,7 +13,9 @@ use geom::{
     build_mesh,
 };
 
-use super::format::{ENTRY_LEN, MAX_TILE_RECORD, NONE, parse_index_payload, parse_tile_payload};
+use super::format::{
+    ENTRY_LEN, MAX_TILE_RECORD, NONE, index_payload, parse_index_payload, parse_tile_payload,
+};
 use super::*;
 use crate::bounds::{KNOWN_RECORD_LEN, UNKNOWN_RECORD_LEN, parse_bounds_payload};
 use crate::codec::decode_displacement_into;
@@ -121,17 +123,6 @@ fn rewritten(index: &Index) -> Option<Vec<u8>> {
     Some(index_payload(index.coverage, index.parent, index.head, &entries).unwrap())
 }
 
-/// The Index payload's reserved bytes, after the coverage byte.
-const RESERVED: std::ops::Range<usize> = 1..8;
-
-/// `payload` with its reserved bytes zeroed, as the writer writes them.
-fn reserved_zeroed(mut payload: Vec<u8>) -> Vec<u8> {
-    if let Some(reserved) = payload.get_mut(RESERVED) {
-        reserved.fill(0);
-    }
-    payload
-}
-
 /// The Index parser takes any bytes.
 #[test]
 fn index_parsing_never_panics() {
@@ -146,27 +137,9 @@ fn index_parsing_never_panics() {
     });
 }
 
-/// Every accepted Index payload is its own rewrite, but for the reserved bytes, which the parser
-/// skips unchecked (see [`index_payloads_round_trip_exactly`]).
+/// Every accepted Index payload is its own rewrite, byte for byte: the parser refuses a payload
+/// whose reserved bytes aren't the zeros the writer writes.
 #[test]
-fn index_payloads_round_trip_but_for_the_reserved_bytes() {
-    bolero::check!()
-        .with_type::<(IndexParts, Flip)>()
-        .for_each(|(parts, flip)| {
-            let payload = flipped(index_of(parts.clone()), *flip);
-            if let Some(again) = parse_index_payload(&payload).as_ref().and_then(rewritten) {
-                assert_eq!(again, reserved_zeroed(payload), "the Index's rewrite");
-            }
-        });
-}
-
-/// Every accepted Index payload is its own rewrite, byte for byte.
-///
-/// Fails today: the parser reads the 7 reserved bytes after the coverage byte without checking
-/// they are zero, so a payload with any of them set parses and rewrites with zeros. Whether
-/// readers should require zeros is a file-format decision.
-#[test]
-#[ignore = "pending the reserved-bytes decision (plan 008, TEST-06)"]
 fn index_payloads_round_trip_exactly() {
     bolero::check!()
         .with_type::<(IndexParts, Flip)>()
@@ -176,6 +149,22 @@ fn index_payloads_round_trip_exactly() {
                 assert_eq!(again, payload, "the Index's rewrite");
             }
         });
+}
+
+/// An Index payload with any of its seven reserved bytes set, the bytes after the coverage byte,
+/// is refused: a later version may give them a meaning this one can't read.
+#[test]
+fn an_index_with_a_reserved_byte_set_is_refused() {
+    let written = index_payload(Coverage::Full, None, None, &BTreeMap::new()).unwrap();
+    assert!(parse_index_payload(&written).is_some(), "the writer's own");
+    for byte in 1..8 {
+        let mut payload = written.clone();
+        payload[byte] = 1;
+        assert!(
+            parse_index_payload(&payload).is_none(),
+            "reserved byte {byte}"
+        );
+    }
 }
 
 /// What generates a tile payload: key, op, header, the body's stated length, and the packed body.

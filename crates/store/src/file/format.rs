@@ -790,10 +790,10 @@ fn parse_entries(
 
 /// Parses [`index_payload`]'s output.
 ///
-/// `None` on any shortfall, an invalid key, a bounds section that is empty or doesn't fill the
-/// rest exactly, a section's keys out of order, or an entry whose record length no record of its
-/// kind has (a tile record over [`MAX_TILE_RECORD`], a bounds record of neither length
-/// [`bounds::is_record_len`] accepts).
+/// `None` on any shortfall, a reserved byte that isn't zero, an invalid key, a bounds section that
+/// is empty or doesn't fill the rest exactly, a section's keys out of order, or an entry whose
+/// record length no record of its kind has (a tile record over [`MAX_TILE_RECORD`], a bounds record
+/// of neither length [`bounds::is_record_len`] accepts).
 pub(super) fn parse_index_payload(payload: &[u8]) -> Option<Index> {
     let mut r = Reader::new(payload);
     let coverage = match r.u8()? {
@@ -801,7 +801,10 @@ pub(super) fn parse_index_payload(payload: &[u8]) -> Option<Index> {
         1 => Coverage::Full,
         _ => return None,
     };
-    r.take(7)?;
+    // Every writer writes zeros here; a reader that skipped them would let a later version's
+    // meaning for them pass unnoticed.
+    r.take(7)
+        .filter(|reserved| reserved.iter().all(|&b| b == 0))?;
     let parent = Some(r.u64()?).filter(|&p| p != NONE);
     let head = match r.u64()? {
         NONE => None,
