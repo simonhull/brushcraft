@@ -5,11 +5,11 @@
 //! as [`GpuVertex`]es and writes them, with the tile tree's changed nodes, into staging buffers
 //! mapped for writing. When the frame's uploads are staged, the buffers are unmapped and the
 //! copies they need become a [`FrameUploads`], which the render thread encodes into the frame's
-//! command buffer ahead of every pass ([`FrameUploads::encode`]) and submits
-//! ([`FrameUploads::submit`]): each staging buffer is then mapped for writing again and returns
-//! to the ring when the GPU is done with it, without the owner thread ever waiting on the GPU.
-//! A frame dropped instead (staging failed, or the render thread gave up on it) gives its
-//! buffers back too.
+//! command buffer ahead of every pass and submits ([`FrameUploads::submit`], which takes
+//! the passes, so they can only follow the copies): each staging buffer is then mapped for writing
+//! again and returns to the ring when the GPU is done with it, without the owner thread ever
+//! waiting on the GPU. A frame dropped instead (staging failed, or the render thread gave up on it)
+//! gives its buffers back too.
 //!
 //! Everything a frame stages goes into one submission, so a group of tiles staged together
 //! (an epoch, [`crate::residency`]) and the tree nodes pointing at them switch at once.
@@ -573,7 +573,7 @@ impl FrameUploads {
 
     /// Encodes the copies into tile slots and the tile tree: first in the frame's command
     /// buffer, before any pass reads them.
-    pub fn encode(&self, encoder: &mut CommandEncoder) {
+    fn encode(&self, encoder: &mut CommandEncoder) {
         for copy in &self.copies {
             if let Some(staging) = self.staging.get(copy.staging) {
                 encoder.copy_buffer_to_buffer(
@@ -587,15 +587,22 @@ impl FrameUploads {
         }
     }
 
-    /// Ends the frame: encodes the request readback after the passes already in `encoder` (the
-    /// request buffer is copied out, then its count cleared for the next frame), submits the
-    /// command buffer, and only then maps the staging buffers for writing again (they return
-    /// to the ring when the GPU is done with them) and the readback buffer for reading. The
-    /// callbacks run when the device is polled ([`crate::residency::Residency::begin_frame`]
-    /// does).
+    /// Encodes and submits the frame: into `encoder`, the copies first, then `passes` (which
+    /// read the tiles they bring), then the request readback (the request buffer is copied
+    /// out, then its count cleared for the next frame); submits the command buffer, and only then
+    /// maps the staging buffers for writing again (they return to the ring when the GPU is done
+    /// with them) and the readback buffer for reading. The callbacks run when the device is
+    /// polled ([`crate::residency::Residency::begin_frame`] does).
     ///
-    /// `encoder` must hold [`FrameUploads::encode`]'s copies first.
-    pub fn submit(mut self, queue: &Queue, mut encoder: CommandEncoder) {
+    /// Taking the passes keeps the order fixed: no pass can be encoded before the copies.
+    pub fn submit(
+        mut self,
+        queue: &Queue,
+        mut encoder: CommandEncoder,
+        passes: impl FnOnce(&mut CommandEncoder),
+    ) {
+        self.encode(&mut encoder);
+        passes(&mut encoder);
         if let Some(requests) = &self.requests {
             encoder.copy_buffer_to_buffer(
                 &requests.source,

@@ -305,12 +305,10 @@ fn frame(
 /// Encodes `uploads` around `passes`, submits them and waits for the GPU.
 fn submit(gpu: &Gpu, uploads: FrameUploads, passes: impl FnOnce(&mut wgpu::CommandEncoder)) {
     gpu.scoped("frame", || {
-        let mut encoder = gpu
+        let encoder = gpu
             .device()
             .create_command_encoder(&CommandEncoderDescriptor::default());
-        uploads.encode(&mut encoder);
-        passes(&mut encoder);
-        uploads.submit(gpu.queue(), encoder);
+        uploads.submit(gpu.queue(), encoder, passes);
     })
     .expect("the frame submits");
     gpu.device()
@@ -1070,11 +1068,10 @@ fn frames_in_flight_unwaited_still_apply_every_epoch_whole() {
             // Submitted, never waited for: several frames are in flight, and the one poll a
             // frame (in begin_frame) brings the staging buffers back when the GPU is done.
             gpu.scoped("frame", || {
-                let mut encoder = gpu
+                let encoder = gpu
                     .device()
                     .create_command_encoder(&CommandEncoderDescriptor::default());
-                uploads.encode(&mut encoder);
-                uploads.submit(gpu.queue(), encoder);
+                uploads.submit(gpu.queue(), encoder, |_| {});
             })
             .expect("submits");
             assert!(
@@ -1186,11 +1183,10 @@ fn a_frames_uploads_can_be_submitted_on_another_thread() {
         let uploads = residency.stage(gpu, &mut model, deadline).expect("staged");
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let mut encoder = gpu
+                let encoder = gpu
                     .device()
                     .create_command_encoder(&CommandEncoderDescriptor::default());
-                uploads.encode(&mut encoder);
-                uploads.submit(gpu.queue(), encoder);
+                uploads.submit(gpu.queue(), encoder, |_| {});
             });
         });
         gpu.device()

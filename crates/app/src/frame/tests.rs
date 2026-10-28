@@ -507,11 +507,10 @@ fn submit(gpu: &Gpu, request: FrameRequest) -> u64 {
     };
     let bytes = uploads.bytes();
     gpu.scoped("a test frame", || {
-        let mut encoder = gpu
+        let encoder = gpu
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        uploads.encode(&mut encoder);
-        uploads.submit(gpu.queue(), encoder);
+        uploads.submit(gpu.queue(), encoder, |_| {});
     })
     .expect("the uploads submit");
     gpu.device()

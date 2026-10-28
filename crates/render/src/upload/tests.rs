@@ -99,11 +99,10 @@ fn the_stores_tiles_land_in_their_slots_bit_for_bit() {
                 .stage(gpu, &mut StoreSource::new(store), deadline)
                 .expect("staged");
             gpu.scoped("frame", || {
-                let mut encoder = gpu
+                let encoder = gpu
                     .device()
                     .create_command_encoder(&CommandEncoderDescriptor::default());
-                uploads.encode(&mut encoder);
-                uploads.submit(gpu.queue(), encoder);
+                uploads.submit(gpu.queue(), encoder, |_| {});
             })
             .expect("submits");
         }

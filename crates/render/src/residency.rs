@@ -52,10 +52,10 @@
 //!    tile tree's changed nodes into the staging ring, and returns the frame's [`FrameUploads`] for
 //!    the render thread.
 //!
-//! The render thread encodes [`FrameUploads::encode`] before its passes, then
-//! [`FrameUploads::submit`]s. A frame that fails to stage, or is dropped unsubmitted, drops the
-//! tiles it wrote (their data never reached the GPU) and the whole tile tree is written again
-//! with the next frame; the floor comes back whole.
+//! The render thread hands its passes to [`FrameUploads::submit`], which encodes them after
+//! the uploads' copies and submits them together. A frame that fails to stage, or is dropped
+//! unsubmitted, drops the tiles it wrote (their data never reached the GPU) and the whole tile tree
+//! is written again with the next frame; the floor comes back whole.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;

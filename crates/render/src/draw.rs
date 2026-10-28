@@ -63,7 +63,8 @@ pub enum Outcome {
 pub struct Drawn {
     /// What became of it.
     pub outcome: Outcome,
-    /// How long its phases took (only acquiring, if it wasn't drawn).
+    /// How long its phases took. A frame that wasn't drawn has no present time, and its
+    /// encode time is submitting its uploads alone, if it had any.
     pub times: DrawTimes,
 }
 
@@ -127,17 +128,13 @@ impl Renderer {
         self.overlay
             .prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         gpu.scoped("encoding a frame", || {
-            let mut encoder = gpu
+            let encoder = gpu
                 .device()
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("frame"),
                 });
-            // The uploads first: every pass after them reads the tiles they bring.
-            if let Some(uploads) = &uploads {
-                uploads.encode(&mut encoder);
-            }
-            {
-                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            let passes = |frame: &mut CommandEncoder| {
+                let mut pass = frame.begin_render_pass(&RenderPassDescriptor {
                     label: Some("clear and overlay"),
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: image.view(),
@@ -152,8 +149,8 @@ impl Renderer {
                 });
                 // The last pass: the overlay over everything.
                 self.overlay.draw(&mut pass);
-            }
-            submit(gpu, uploads, encoder);
+            };
+            submit(gpu, uploads, encoder, passes);
         })?;
         times.encode = encoding.elapsed();
         let presenting = Instant::now();
@@ -168,14 +165,22 @@ impl Renderer {
     }
 }
 
-/// Submits `encoder`: with `uploads`, through [`FrameUploads::submit`], which adds the request
-/// readback and hands the staging buffers back once submitted.
-fn submit(gpu: &Gpu, uploads: Option<FrameUploads>, encoder: CommandEncoder) {
-    match uploads {
-        Some(uploads) => uploads.submit(gpu.queue(), encoder),
-        None => {
-            gpu.queue().submit([encoder.finish()]);
-        }
+/// Encodes `passes` into `encoder` and submits it.
+///
+/// With `uploads`, through [`FrameUploads::submit`], which puts the uploads' copies first (every
+/// pass reads the tiles they bring), adds the request readback, and hands the staging buffers back
+/// once submitted.
+fn submit(
+    gpu: &Gpu,
+    uploads: Option<FrameUploads>,
+    mut encoder: CommandEncoder,
+    passes: impl FnOnce(&mut CommandEncoder),
+) {
+    if let Some(uploads) = uploads {
+        uploads.submit(gpu.queue(), encoder, passes);
+    } else {
+        passes(&mut encoder);
+        gpu.queue().submit([encoder.finish()]);
     }
 }
 
@@ -195,13 +200,12 @@ fn not_drawn(
     if let Some(uploads) = uploads {
         let encoding = Instant::now();
         gpu.scoped("submitting a frame's uploads", || {
-            let mut encoder = gpu
+            let encoder = gpu
                 .device()
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("uploads"),
                 });
-            uploads.encode(&mut encoder);
-            uploads.submit(gpu.queue(), encoder);
+            uploads.submit(gpu.queue(), encoder, |_| {});
         })?;
         times.encode = encoding.elapsed();
     }

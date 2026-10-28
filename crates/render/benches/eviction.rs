@@ -91,11 +91,10 @@ fn frame(
     });
     residency.want(&Requests::new(requests, 0));
     let uploads = residency.stage(gpu, &mut Zeros, Instant::now() + Duration::from_secs(60))?;
-    let mut encoder = gpu
+    let encoder = gpu
         .device()
         .create_command_encoder(&CommandEncoderDescriptor::default());
-    uploads.encode(&mut encoder);
-    uploads.submit(gpu.queue(), encoder);
+    uploads.submit(gpu.queue(), encoder, |_| {});
     gpu.device().poll(PollType::wait_indefinitely())?;
     Ok(())
 }
