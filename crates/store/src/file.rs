@@ -860,6 +860,13 @@ impl ProjectFile {
         });
     }
 
+    /// Drops the open cut, if any: the next save point names the latest state, as with no cut
+    /// opened. For a flush that writes no save point after its cut; the live maps already hold
+    /// every record's latest location, so nothing is lost.
+    pub(crate) fn drop_cut(&mut self) {
+        self.cut = None;
+    }
+
     /// Where the last record the next save point names ends: with a cut open, the end of the
     /// last record at or before it (see [`Cut`]), else the file's end. A sync that covers it
     /// covers every record the save point names; records past the cut beyond it need none.

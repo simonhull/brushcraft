@@ -409,7 +409,9 @@ impl RecoveryWriter {
             let reply = match self.replies.try_recv() {
                 Ok(reply) => reply,
                 Err(TryRecvError::Empty) => return Ok(()),
-                Err(TryRecvError::Disconnected) => return self.settle(Err(RecoveryError::Stopped)),
+                Err(TryRecvError::Disconnected) => {
+                    return self.settle(store, Err(RecoveryError::Stopped));
+                }
             };
             self.advance(store, reply)?;
         }
@@ -538,12 +540,16 @@ impl RecoveryWriter {
                     .map(|()| self.phase = Phase::Encoding)
             }
             Ok(_) if owed || store.has_unsaved_records() => self.request_tile_sync(store),
-            // Nothing to flush: the interval keeps running from the last real flush.
-            Ok(_) => return Ok(()),
+            // Nothing to flush: the interval keeps running from the last real flush, and no
+            // save point follows the cut.
+            Ok(_) => {
+                store.drop_cut();
+                return Ok(());
+            }
             Err(e) => Err(e.into()),
         };
         self.last_flush = Some(at);
-        self.settle(started)
+        self.settle(store, started)
     }
 
     /// Blocks for the writer thread's next reply and advances the flush with it.
@@ -554,7 +560,7 @@ impl RecoveryWriter {
     fn wait_step(&mut self, store: &mut TileStore) -> Result<(), RecoveryError> {
         match self.replies.recv() {
             Ok(reply) => self.advance(store, reply),
-            Err(_) => self.settle(Err(RecoveryError::Stopped)),
+            Err(_) => self.settle(store, Err(RecoveryError::Stopped)),
         }
     }
 
@@ -565,7 +571,7 @@ impl RecoveryWriter {
     /// As [`RecoveryWriter::step`].
     fn advance(&mut self, store: &mut TileStore, reply: Reply) -> Result<(), RecoveryError> {
         let stepped = self.step(store, reply);
-        self.settle(stepped)
+        self.settle(store, stepped)
     }
 
     /// One step of the flush in flight (see the module notes): `reply` answers the request of
@@ -649,15 +655,21 @@ impl RecoveryWriter {
     }
 
     /// Passes `outcome` through. On error the flush in flight and any queued after it are
-    /// abandoned, and the next trigger flushes even with no new edits, to confirm what it held;
-    /// a failed sync, or a writer thread found stopped, fails the writer for good (see the
-    /// module notes).
+    /// abandoned, with the cut it opened in `store`'s working file (no save point follows it,
+    /// and the next flush opens its own), and the next trigger flushes even with no new edits,
+    /// to confirm what it held; a failed sync, or a writer thread found stopped, fails the
+    /// writer for good (see the module notes).
     ///
     /// # Errors
     ///
     /// `outcome`'s.
-    fn settle(&mut self, outcome: Result<(), RecoveryError>) -> Result<(), RecoveryError> {
+    fn settle(
+        &mut self,
+        store: &mut TileStore,
+        outcome: Result<(), RecoveryError>,
+    ) -> Result<(), RecoveryError> {
         if let Err(e) = &outcome {
+            store.drop_cut();
             self.queued = None;
             self.unconfirmed = true;
             self.phase = match (self.phase, e) {

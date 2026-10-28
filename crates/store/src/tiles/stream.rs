@@ -200,6 +200,13 @@ impl TileStore {
         self.file.open_cut(self.last_write);
     }
 
+    /// Drops the cut open in the working file, if any: the flush that opened it was abandoned,
+    /// or had nothing to flush, so no save point follows it (see
+    /// [`ProjectFile::drop_cut`](crate::file::ProjectFile::drop_cut)).
+    pub(crate) fn drop_cut(&mut self) {
+        self.file.drop_cut();
+    }
+
     /// The working-file generation: moved on by every rebase.
     pub(crate) const fn generation(&self) -> u64 {
         self.generation

@@ -1619,3 +1619,31 @@ fn a_layer_recorded_during_a_flush_is_not_named_by_its_save_point() {
     }
     assert!(known > 0, "the save point holds some of the layer");
 }
+
+/// A flush that writes no save point leaves no cut open, so display records go through again.
+///
+/// One with nothing to flush, and one abandoned at a failed sync: neither leaves the cut it
+/// opened, which would keep every display record waiting until a later save point.
+#[test]
+fn a_flush_without_a_save_point_leaves_no_cut_open() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "recovery.bcrf", &mesh, roomy());
+    let mut writer = RecoveryWriter::new(&mut store).unwrap();
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 20, 95));
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    settle(&mut writer, &mut store);
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    assert!(writer.is_idle(), "nothing to flush");
+    assert_eq!(store.file.cut_at(), None, "nothing to flush: no cut left");
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 20, 96));
+    writer.fail_syncs(0, 1);
+    writer.end_stroke(&mut store, Instant::now()).unwrap();
+    let mut failed = false;
+    while !writer.is_idle() {
+        failed |= writer.step_blocking(&mut store).is_err();
+    }
+    assert!(failed, "the sync fails");
+    assert_eq!(store.file.cut_at(), None, "abandoned: no cut left");
+}
