@@ -37,7 +37,7 @@ use super::error::CacheError;
 use super::read_ahead::Held;
 use crate::bounds::{Book, Derived as _, Kept};
 use crate::display::{Display, DisplayRecord, StoredDisplay};
-use crate::file::{BaseFile, FileError, ProjectFile, display_record};
+use crate::file::{BaseFile, FileError, FramedDisplay, ProjectFile, display_record, frame_display};
 use crate::meta::Role;
 use crate::stamp::Stamp;
 
@@ -421,27 +421,32 @@ impl TileStore {
         for key in &unflushed {
             self.display.flushed(key);
         }
+        self.display_through_failed = false;
         Ok(())
     }
 
-    /// Writes display records through to the working file if those waiting in memory pass the
-    /// budget's share for them
+    /// Writes display records through to the working file once those waiting in memory pass
+    /// the budget's share for them
     /// ([`StoreConfig::display_waiting_bytes`](super::StoreConfig::display_waiting_bytes)):
-    /// as many, in key order, as bring them back within it, appended with one write as a flush
-    /// appends them, placed at the store's latest write; they leave memory as a flush's do (see
-    /// the module notes). Settles the writes first.
+    /// as many, in key order, as bring them down to half of it, so the writes come one per half
+    /// a share recorded, not one per slice. They are compressed and framed on the workers, then
+    /// appended with one write as a flush appends them, placed at the store's latest write, and
+    /// leave memory as a flush's do (see the module notes). Settles the writes first.
     ///
-    /// Writes nothing while a recovery flush's cut is open, while the working file is a failed
-    /// recovery file (whose records a roll-over would have to read back) or one opened
-    /// read-only: the records wait in memory then.
+    /// Writes nothing, and the records wait in memory past the share, while a recovery flush's
+    /// cut is open, while the working file is a failed recovery file (whose records a roll-over
+    /// would have to read back) or one opened read-only, and after a write through failed, until
+    /// the next flush or save of the working file (which meets the failure itself, and reports
+    /// it) or a new working file.
     ///
     /// # Errors
     ///
-    /// [`CacheError::Eval`] as for [`TileStore::record_display`]; [`CacheError::WriteBack`] if
-    /// the append fails: the records wait in memory, for the next flush or a later call.
+    /// [`CacheError::Eval`] if settling the writes fails (never, for tiles of the store's mesh).
+    /// A failed write is no error here (see above).
     pub(super) fn write_through_display(&mut self) -> Result<(), CacheError> {
-        let share = self.display_waiting;
+        let share = self.display_waiting_share;
         if self.display.waiting_bytes() <= share
+            || self.display_through_failed
             || self.file.cut_at().is_some()
             || self.working_failed
             || !self.file.is_writable()
@@ -449,17 +454,29 @@ impl TileStore {
             return Ok(());
         }
         self.settle_display()?;
-        let mut over = self.display.waiting_bytes().saturating_sub(share);
-        let mut keys = Vec::new();
+        let mut over = self.display.waiting_bytes().saturating_sub(share / 2);
+        let mut records: Vec<(TileKey, &DisplayRecord)> = Vec::new();
         for (key, record) in self.display.waiting() {
             if over == 0 {
                 break;
             }
             over = over.saturating_sub(Display::bytes(record));
-            keys.push(*key);
+            records.push((*key, record));
         }
-        write_kept(&mut self.file, None, &self.display, &keys, self.last_write)
-            .map_err(CacheError::WriteBack)?;
+        // Compressing them is the costly part: a few milliseconds a megabyte on one thread.
+        let framed: Result<Vec<FramedDisplay>, FileError> = self.workers.install(|| {
+            records
+                .par_iter()
+                .map(|&(key, record)| frame_display(key, Some(record)))
+                .collect()
+        });
+        let keys: Vec<TileKey> = records.iter().map(|&(key, _)| key).collect();
+        let appended =
+            framed.and_then(|framed| self.file.append_display_framed(&framed, self.last_write));
+        if appended.is_err() {
+            self.display_through_failed = true;
+            return Ok(());
+        }
         for key in &keys {
             self.display.flushed(key);
         }
@@ -469,15 +486,15 @@ impl TileStore {
     /// The bytes of the display records waiting in memory for the working file, and the share
     /// of the budget they are held to (see [`TileStore::write_through_display`]).
     #[cfg(test)]
-    pub(super) const fn display_waiting(&self) -> (usize, usize) {
-        (self.display.waiting_bytes(), self.display_waiting)
+    pub(crate) const fn display_waiting(&self) -> (usize, usize) {
+        (self.display.waiting_bytes(), self.display_waiting_share)
     }
 
     /// Holds the display records waiting for the working file to `bytes` instead of the
     /// budget's share: for tests of the writing through.
     #[cfg(test)]
     pub(crate) const fn hold_display_waiting_to(&mut self, bytes: usize) {
-        self.display_waiting = bytes;
+        self.display_waiting_share = bytes;
     }
 
     /// Appends every display tile a save of the working file itself writes: those a flush
@@ -500,6 +517,7 @@ impl TileStore {
         for key in &unsaved {
             self.display.saved(key);
         }
+        self.display_through_failed = false;
         Ok(())
     }
 

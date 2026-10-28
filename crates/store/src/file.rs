@@ -54,7 +54,7 @@ mod reader;
 pub(crate) use base::BaseFile;
 pub(crate) use compact::sync_parent;
 pub use compact::{compact, compact_in_place};
-pub(crate) use display_io::{display_record, unknown_display_len};
+pub(crate) use display_io::{FramedDisplay, display_record, frame_display, unknown_display_len};
 pub use error::FileError;
 #[cfg(any(feature = "fuzzing", test))]
 pub(crate) use format::HEADER_LEN;

@@ -671,7 +671,7 @@ fn a_rebuild_holds_the_records_waiting_for_the_file_to_their_share() {
     apply(&mut store, &mut map, &random_edits(&mesh, TOP, 30, 11));
     // A quarter of the layer: most of it must go through.
     let share = layer_bytes(&mut store) / 4;
-    store.display_waiting = share;
+    store.hold_display_waiting_to(share);
     let mut most = 0;
     let mut calls = 0;
     while store.has_jobs() || calls == 0 {

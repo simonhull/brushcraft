@@ -358,7 +358,11 @@ pub struct TileStore {
     display_finest: Option<geom::Level>,
     /// The bytes the display records waiting for the working file may hold before they are
     /// written through: the budget's share for them ([`StoreConfig::display_waiting_bytes`]).
-    display_waiting: usize,
+    display_waiting_share: usize,
+    /// Whether writing display records through to the working file failed since its last
+    /// flush or save: no more are written through until one (see
+    /// [`TileStore::write_through_display`]).
+    display_through_failed: bool,
     /// The display tiles a brush stroke's dabs changed, as they were before the first of them,
     /// with what the dabs since have added to their bound (see
     /// [`TileStore::bump_display_error`]): drawn in their place until a refresh records them.

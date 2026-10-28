@@ -157,7 +157,8 @@ impl TileStore {
             bounds,
             display,
             display_finest: config.display,
-            display_waiting: shares.waiting,
+            display_waiting_share: shares.waiting,
+            display_through_failed: false,
             jobs: std::collections::VecDeque::new(),
             bumped: std::collections::BTreeMap::new(),
             display_failed: std::collections::BTreeMap::new(),
@@ -414,6 +415,7 @@ impl TileStore {
         self.display.rebased();
         self.generation += 1;
         self.working_failed = false;
+        self.display_through_failed = false;
         // The old workers read the old files; dropping them joins them and drops their results.
         self.prefetch = Prefetcher::new();
         self.next_op = next_op;
@@ -657,6 +659,7 @@ impl TileStore {
         self.display.all_flushed();
         self.generation += 1;
         self.working_failed = false;
+        self.display_through_failed = false;
         // The workers' jobs name records of the old file.
         self.prefetch = Prefetcher::new();
         let old = std::mem::replace(&mut self.file, file);

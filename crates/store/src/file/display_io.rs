@@ -16,6 +16,40 @@ use crate::display::{
 use crate::record::{KIND_TILE, frame};
 use crate::stamp::Stamp;
 
+/// `key`'s display record holding `record` (`None`: unknown), compressed and framed.
+///
+/// Ready to append ([`ProjectFile::append_display_framed`]): the costly part of writing one,
+/// which needs no file, so it can run on any thread.
+///
+/// # Errors
+///
+/// [`FileError::TooLarge`], or [`FileError::Io`] if the compressor fails.
+pub(crate) fn frame_display(
+    key: TileKey,
+    record: Option<&DisplayRecord>,
+) -> Result<FramedDisplay, FileError> {
+    let body = display_body(record);
+    let packed = compress(body)?;
+    let payload = tile_payload(
+        key,
+        DISPLAY_OP,
+        &display_header(record),
+        body.len(),
+        &packed,
+    )?;
+    let framed = frame(KIND_TILE, &payload).ok_or(FileError::TooLarge)?;
+    Ok(FramedDisplay { key, framed })
+}
+
+/// A display record framed by [`frame_display`], waiting to be appended.
+#[derive(Debug)]
+pub(crate) struct FramedDisplay {
+    /// The display tile it is the record of.
+    key: TileKey,
+    /// The whole record, framing included.
+    framed: Vec<u8>,
+}
+
 /// What a raw record holds as `key`'s display tile.
 ///
 /// `None` if it doesn't verify as a display record of `key` this build reads (it counts as
@@ -75,22 +109,34 @@ impl ProjectFile {
         if self.access == super::lock::Access::ReadOnly {
             return Err(FileError::ReadOnly);
         }
+        let framed: Result<Vec<FramedDisplay>, FileError> = tiles
+            .into_iter()
+            .map(|(key, record)| frame_display(key, record))
+            .collect();
+        self.append_display_framed(&framed?, stamp)
+    }
+
+    /// Appends the records [`frame_display`] framed, in order, with one write, as
+    /// [`ProjectFile::write_display_many`] does once it has framed them.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::write_display_many`].
+    pub(crate) fn append_display_framed(
+        &mut self,
+        framed: &[FramedDisplay],
+        stamp: Stamp,
+    ) -> Result<(), FileError> {
+        if self.access == super::lock::Access::ReadOnly {
+            return Err(FileError::ReadOnly);
+        }
         let size = |n: usize| u64::try_from(n).or(Err(FileError::TooLarge));
-        let mut buffer = Vec::new();
-        let mut placed = Vec::new();
-        for (key, record) in tiles {
-            let body = display_body(record);
-            let packed = compress(body)?;
-            let payload = tile_payload(
-                key,
-                DISPLAY_OP,
-                &display_header(record),
-                body.len(),
-                &packed,
-            )?;
-            let framed = frame(KIND_TILE, &payload).ok_or(FileError::TooLarge)?;
-            placed.push((key, size(buffer.len())?, size(framed.len())?));
-            buffer.extend_from_slice(&framed);
+        let total: usize = framed.iter().map(|f| f.framed.len()).sum();
+        let mut buffer = Vec::with_capacity(total);
+        let mut placed = Vec::with_capacity(framed.len());
+        for record in framed {
+            placed.push((record.key, size(buffer.len())?, size(record.framed.len())?));
+            buffer.extend_from_slice(&record.framed);
         }
         if buffer.is_empty() {
             return Ok(());
