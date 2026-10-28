@@ -419,6 +419,24 @@ impl<D: Derived> Book<D> {
         Ok(())
     }
 
+    /// [`Book::settle`] with the values the writes noted can change already listed: `stale`,
+    /// [`Derived::readers`] of exactly `edited`. Does nothing and returns `false` unless
+    /// `edited` is the writes noted since the last settle.
+    pub(crate) fn settle_listed(
+        &mut self,
+        edited: &BTreeSet<TileKey>,
+        stale: &BTreeSet<TileKey>,
+    ) -> bool {
+        if self.edited.is_empty() || self.edited != *edited {
+            return false;
+        }
+        self.edited.clear();
+        for &key in stale {
+            self.set(key, None);
+        }
+        true
+    }
+
     /// Makes unknown every value the writes noted since the last call can change (see
     /// [`readers`], which reads neighbours `deps` recorded).
     ///

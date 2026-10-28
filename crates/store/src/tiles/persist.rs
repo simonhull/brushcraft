@@ -163,6 +163,8 @@ impl TileStore {
             display_builds: 0,
             display_generations: std::collections::BTreeMap::new(),
             display_decoded: crate::jobs::DecodedTiles::default(),
+            read_ahead: super::read_ahead::ReadAhead::default(),
+            bump_readers: None,
             unbumped: BTreeSet::new(),
             stale: crate::stale::StaleFeed::new(config.stale_cap),
             epoch_writes: BTreeSet::new(),

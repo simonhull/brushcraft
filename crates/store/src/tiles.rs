@@ -147,6 +147,7 @@ mod page;
 mod persist;
 mod pins;
 mod read;
+mod read_ahead;
 mod round;
 mod stream;
 mod upkeep;
@@ -366,6 +367,11 @@ pub struct TileStore {
     display_generations: std::collections::BTreeMap<TileKey, u64>,
     /// Display tiles the jobs built or decoded, for the coarser tiles that read them.
     display_decoded: crate::jobs::DecodedTiles,
+    /// Display records read ahead on the workers, for the next dabs' bumps.
+    read_ahead: read_ahead::ReadAhead,
+    /// The writes the last bump covered and the display tiles they can change, as it listed
+    /// them: the next settle of those writes takes them (see [`TileStore::settle_display`]).
+    bump_readers: Option<(BTreeSet<TileKey>, BTreeSet<TileKey>)>,
     /// The tiles whose corrections changed (a write, or a lost tile going back to its record)
     /// since a bump last covered them, while any tile is bumped: a bump they reach no longer
     /// bounds its tile, and is dropped before anything reads one

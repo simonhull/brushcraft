@@ -248,6 +248,13 @@ impl<V, const CAP: usize> TileCache<V, CAP> {
         Some(std::mem::take(&mut self.tiles))
     }
 
+    /// Takes `key`'s value out, if it holds one.
+    pub(crate) fn remove(&mut self, key: &TileKey) -> Option<V> {
+        let value = self.tiles.remove(key)?;
+        self.order.retain(|k| k != key);
+        Some(value)
+    }
+
     /// Puts `value` in for `key`, dropping the oldest tile if it is full; returns the value it
     /// replaced or dropped, if any (the first, were there several), for the caller to reuse.
     pub(crate) fn insert(&mut self, key: TileKey, value: V) -> Option<V> {

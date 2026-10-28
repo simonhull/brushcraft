@@ -123,9 +123,17 @@ pub(crate) struct DepGraph {
     /// Nodes above level 1 whose parents were never recorded: their ancestry is unknown, so any
     /// coarser edit reaches them. Empty unless a tile was recorded after a parent's node went.
     untracked: BTreeSet<TileKey>,
+    /// The display tiles each window of a face reaches, kept for the display layer's readers
+    /// (see [`crate::display::readers`]): structure, like the lists here.
+    reach: crate::display::ReachMemo,
 }
 
 impl DepGraph {
+    /// The display readers' memo of the tiles each window reaches.
+    pub(crate) const fn reach_memo(&self) -> &crate::display::ReachMemo {
+        &self.reach
+    }
+
     /// An empty graph.
     pub(crate) fn new() -> Self {
         Self::default()

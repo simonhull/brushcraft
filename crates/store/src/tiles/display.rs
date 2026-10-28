@@ -13,9 +13,10 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use super::TileStore;
 use super::error::CacheError;
+use super::read_ahead::Held;
 use crate::bounds::{Book, Kept};
 use crate::display::{Display, DisplayRecord, StoredDisplay};
-use crate::file::{BaseFile, FileError, ProjectFile};
+use crate::file::{BaseFile, FileError, ProjectFile, display_record};
 use crate::meta::Role;
 use crate::stamp::Stamp;
 
@@ -187,16 +188,68 @@ impl TileStore {
         }
         let readers = crate::display::readers(&self.mesh, &self.deps, &edited, &levels)?;
         let raise = 2.0 * max_displacement.abs();
+        self.take_read_ahead();
+        let mut reached = BTreeSet::new();
+        let mut to_read = Vec::new();
         for key in readers.difference(&stale) {
             if let Some((_, extra)) = self.bumped.get_mut(key) {
                 *extra += raise;
-            } else if let Some(record) = self.display_record(key)? {
-                // The record as it was before the dab's writes: every write before them is
-                // settled, theirs not yet.
-                self.bumped.insert(*key, (record, raise));
+                continue;
+            }
+            // The record as it was before the dab's writes: every write before them is
+            // settled, theirs not yet.
+            match self.bump_record(key) {
+                Held::Record(record) => {
+                    self.bumped.insert(*key, (record, raise));
+                    reached.insert(*key);
+                }
+                Held::In(reader, loc) => to_read.push((*key, reader, loc)),
+                Held::None => {}
             }
         }
+        // Records neither in memory nor read ahead (a stroke's first dab, mostly): read
+        // together on the workers, not one after another here.
+        let finest = self.display_finest;
+        let read: Vec<Result<Option<DisplayRecord>, FileError>> = self.workers.install(|| {
+            to_read
+                .par_iter()
+                .map(|(key, reader, loc)| match reader.read_record(*loc) {
+                    Ok(raw) => Ok(display_record(&raw, key).and_then(StoredDisplay::known)),
+                    Err(FileError::Damaged { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                })
+                .collect()
+        });
+        for ((key, _, _), record) in to_read.iter().zip(read) {
+            if let Some(record) = record?.filter(|record| Some(record.finest) == finest) {
+                self.bumped.insert(*key, (record, raise));
+                reached.insert(*key);
+            }
+        }
+        // The next dabs reach the tiles around those this one reached first: their records
+        // are read on the workers meanwhile.
+        if !reached.is_empty() {
+            self.read_around(&reached);
+        }
+        // The next settle makes the same tiles unknown, for the same writes: it takes them
+        // from here instead of listing them again.
+        self.bump_readers = Some((edited, readers));
         Ok(())
+    }
+
+    /// Settles the display book's writes (see [`Book::settle`]), with the tiles the last bump
+    /// listed for them if they are the same writes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Book::settle`].
+    pub(super) fn settle_display(&mut self) -> Result<(), CacheError> {
+        if let Some((edited, readers)) = self.bump_readers.take()
+            && self.display.settle_listed(&edited, &readers)
+        {
+            return Ok(());
+        }
+        Ok(self.display.settle(&self.mesh, &self.deps)?)
     }
 
     /// Notes a change of `key`'s corrections no bump has covered yet, while any tile is bumped.
@@ -294,8 +347,11 @@ impl TileStore {
             Some(Kept::Written) | None => {}
         }
         // A record built from another finest level bounds another surface: unknown here.
-        Ok(read_display(&self.file, self.base.as_ref(), key)?
-            .filter(|record| Some(record.finest) == self.display_finest))
+        let record = match self.read_ahead_record(key) {
+            Some(read) => read.known(),
+            None => read_display(&self.file, self.base.as_ref(), key)?,
+        };
+        Ok(record.filter(|record| Some(record.finest) == self.display_finest))
     }
 
     /// The display part of a recovery flush, at its cut (see [`TileStore::flush_bounds`]): makes

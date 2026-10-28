@@ -906,7 +906,7 @@ impl TileStore {
         // Every write before this one is settled, so the bump after it (see
         // `TileStore::bump_display_error`) reads display tiles as they are before it alone.
         self.drop_uncovered_bumps()?;
-        self.display.settle(&self.mesh, &self.deps)?;
+        self.settle_display()?;
         self.sync_pins()?;
         let mut start = 0;
         while let Some(&next) = keys.get(start) {

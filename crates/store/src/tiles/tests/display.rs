@@ -362,3 +362,56 @@ fn readers_hold_every_display_tile_a_write_changes() {
         100.0 * precision
     );
 }
+
+/// A record read ahead stands in for the file's only while it is the file's latest: once the
+/// tile is recorded again and saved, the store reads the new record, never the one read ahead.
+#[test]
+fn a_record_read_ahead_is_used_only_while_it_is_the_files_latest() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    saved_layer(&dir, "work.bcp", &mesh, 53);
+    let file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let mut store = TileStore::open(file, roomy().with_display(level(TOP))).unwrap();
+    let reached = TileKey::display(FaceId::new(0), level(TOP - 1), 0, 0).unwrap();
+    store.read_around(&BTreeSet::from([reached]));
+    let began = Instant::now();
+    let read = loop {
+        store.take_read_ahead();
+        if let Some(key) = store.read_ahead.read.tiles.keys().next().copied() {
+            break key;
+        }
+        assert!(began.elapsed() < Duration::from_secs(10), "read ahead");
+        thread::yield_now();
+    };
+    assert_ne!(read, reached, "the tiles around it, not itself");
+    let from_file = crate::tiles::display::read_display(&store.file, store.base.as_ref(), &read)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .read_ahead_record(&read)
+            .and_then(crate::display::StoredDisplay::known),
+        Some(from_file),
+        "the file's latest record, read ahead"
+    );
+    // Recorded again and saved: the file's latest record is another one.
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 54),
+    );
+    let layer = display_layer(&mut store);
+    store.record_display(&layer).unwrap();
+    store.save().unwrap();
+    assert!(
+        store.read_ahead_record(&read).is_none(),
+        "superseded: read again, not taken from what was read ahead"
+    );
+    let rebuilt = layer.iter().find(|tile| *tile.key() == read).unwrap();
+    let stored = store.stored_display(&[read]).unwrap();
+    assert_eq!(
+        stored.first(),
+        Some(&Some(rebuilt.clone())),
+        "the new record"
+    );
+}

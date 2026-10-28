@@ -201,8 +201,138 @@ pub(crate) fn readers(
     let Some(finest) = levels.last().and_then(|l| l.child()) else {
         return Ok(BTreeSet::new());
     };
-    let moved = bounds::readers(mesh, deps, edited, &BTreeSet::from([finest]))?;
-    Ok(reached_by(mesh, moved, finest, levels))
+    if edited.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    readers_memo(mesh, deps, edited, finest, levels)
+}
+
+/// The display tiles a write of each tile can change ([`readers`] of it alone), and those
+/// around each display tile ([`tiles_around`]), kept between calls.
+///
+/// A stroke's dabs write the same tiles step after step, and the answers depend on the mesh
+/// and the display levels alone (the neighbours [`bounds::readers`] reads from the dependency
+/// graph are the ones it would list).
+///
+/// Behind a mutex, as the dependency graph that holds it is shared with the workers; only the
+/// owner thread asks, so it is never contended. At most [`ReachMemo::CAP`] tiles each, emptied
+/// when full.
+#[derive(Debug, Default)]
+pub(crate) struct ReachMemo(std::sync::Mutex<Reached>);
+
+/// What a [`ReachMemo`] holds.
+#[derive(Debug, Default)]
+struct Reached {
+    /// The display levels the answers are for: other levels empty it.
+    levels: BTreeSet<Level>,
+    /// The display tiles a write of each tile can change.
+    by: std::collections::HashMap<TileKey, std::sync::Arc<[TileKey]>>,
+    /// The display tiles around each display tile.
+    around: std::collections::HashMap<TileKey, std::sync::Arc<[TileKey]>>,
+}
+
+impl ReachMemo {
+    /// The most tiles it keeps answers for, of each kind (a few dozen tiles each).
+    const CAP: usize = 1 << 14;
+
+    /// [`tiles_around`] `key`, kept for the next ask.
+    pub(crate) fn around(&self, mesh: &BaseMesh, key: &TileKey) -> std::sync::Arc<[TileKey]> {
+        let Ok(mut memo) = self.0.lock() else {
+            return tiles_around(mesh, key).into_iter().collect();
+        };
+        if let Some(found) = memo.around.get(key) {
+            return std::sync::Arc::clone(found);
+        }
+        let found: std::sync::Arc<[TileKey]> = tiles_around(mesh, key).into_iter().collect();
+        if memo.around.len() >= Self::CAP {
+            memo.around.clear();
+        }
+        memo.around.insert(*key, std::sync::Arc::clone(&found));
+        found
+    }
+}
+
+impl PartialEq for ReachMemo {
+    /// Always equal: what it holds follows from the mesh, so two graphs that differ only in it
+    /// are the same graph.
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// [`readers`] of `edited`, the union of each tile's own (a write's readers are the readers of
+/// each tile written), taken from the dependency graph's memo where it holds them.
+///
+/// # Errors
+///
+/// As [`readers`].
+fn readers_memo(
+    mesh: &BaseMesh,
+    deps: &DepGraph,
+    edited: &BTreeSet<TileKey>,
+    finest: Level,
+    levels: &BTreeSet<Level>,
+) -> Result<BTreeSet<TileKey>, EvalError> {
+    let of = |key: TileKey| -> Result<BTreeSet<TileKey>, EvalError> {
+        let moved = bounds::readers(
+            mesh,
+            deps,
+            &BTreeSet::from([key]),
+            &BTreeSet::from([finest]),
+        )?;
+        Ok(reached_by(mesh, moved, finest, levels))
+    };
+    let Ok(mut memo) = deps.reach_memo().0.lock() else {
+        let moved = bounds::readers(mesh, deps, edited, &BTreeSet::from([finest]))?;
+        return Ok(reached_by(mesh, moved, finest, levels));
+    };
+    if memo.levels != *levels {
+        *memo = Reached {
+            levels: levels.clone(),
+            ..Reached::default()
+        };
+    }
+    // The tiles' answers overlap a lot: gathered in a hash set, then sorted once (a set built
+    // from sorted keys is built in one pass).
+    let mut answer = crate::hash::TileSet::with_capacity_and_hasher(1024, crate::hash::TileHash);
+    for &key in edited {
+        if let Some(found) = memo.by.get(&key) {
+            answer.extend(found.iter().copied());
+            continue;
+        }
+        let found: std::sync::Arc<[TileKey]> = of(key)?.into_iter().collect();
+        answer.extend(found.iter().copied());
+        if memo.by.len() >= ReachMemo::CAP {
+            memo.by.clear();
+        }
+        memo.by.insert(key, found);
+    }
+    let mut sorted: Vec<TileKey> = answer.into_iter().collect();
+    sorted.sort_unstable();
+    Ok(sorted.into_iter().collect())
+}
+
+/// The windows of `levels` that finest tile `key` (of level `finest`) reaches: at each level,
+/// the vertices less than one quad of it (see [`readers`]).
+fn windows_of(
+    key: &TileKey,
+    finest: Level,
+    levels: &BTreeSet<Level>,
+) -> impl Iterator<Item = Window> {
+    let region = Region::of_tile(key);
+    let face = key.face();
+    levels.iter().map(move |&level| {
+        let shift = u32::from(finest.get() - level.get());
+        let n = level.face_quads();
+        let lo = |v: u32| (v >> shift).saturating_sub(1);
+        let hi = |v: u32| ((v + region.quads()).div_ceil(1 << shift) + 1).min(n);
+        (
+            face,
+            level,
+            (lo(region.x0()), hi(region.x0())),
+            (lo(region.y0()), hi(region.y0())),
+        )
+    })
 }
 
 /// The display tiles of `levels` reading a finest vertex (of level `finest`) of the `moved`
@@ -217,15 +347,7 @@ fn reached_by(
     // The windows already walked: at coarse levels, many moved tiles share one.
     let mut walked: BTreeSet<Window> = BTreeSet::new();
     for key in moved {
-        let region = Region::of_tile(&key);
-        let face = key.face();
-        for &level in levels {
-            let shift = u32::from(finest.get() - level.get());
-            let n = level.face_quads();
-            let lo = |v: u32| (v >> shift).saturating_sub(1);
-            let hi = |v: u32| ((v + region.quads()).div_ceil(1 << shift) + 1).min(n);
-            let xs = (lo(region.x0()), hi(region.x0()));
-            let ys = (lo(region.y0()), hi(region.y0()));
+        for (face, level, xs, ys) in windows_of(&key, finest, levels) {
             if walked.insert((face, level, xs, ys)) {
                 window_and_around(mesh, &mut answer, face, level, xs, ys);
             }
@@ -258,6 +380,22 @@ pub(crate) fn tent_reads(mesh: &BaseMesh, key: &TileKey) -> Option<BTreeSet<Tile
     let mut answer = BTreeSet::new();
     window_and_around(mesh, &mut answer, key.face(), finer, xs, ys);
     Some(answer)
+}
+
+/// The display tiles around display tile `key`, `key` among them.
+///
+/// Those of its level holding a vertex less than one tile from its own, on its face and,
+/// across its borders, the tiles of the faces sharing a border vertex next to the copies of it
+/// (see [`window_and_around`]).
+pub(crate) fn tiles_around(mesh: &BaseMesh, key: &TileKey) -> BTreeSet<TileKey> {
+    let region = Region::of_tile(key);
+    let n = key.level().face_quads();
+    let q = region.quads();
+    let xs = (region.x0().saturating_sub(q), (region.x0() + 2 * q).min(n));
+    let ys = (region.y0().saturating_sub(q), (region.y0() + 2 * q).min(n));
+    let mut answer = BTreeSet::new();
+    window_and_around(mesh, &mut answer, key.face(), key.level(), xs, ys);
+    answer
 }
 
 /// Adds to `out` the display tiles of `level` holding a vertex of the window `xs` × `ys` of
