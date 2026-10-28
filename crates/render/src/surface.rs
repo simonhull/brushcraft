@@ -166,6 +166,9 @@ pub struct WindowSurface {
     size: Size,
     /// The present mode chosen, as reported.
     presentation: Presentation,
+    /// Whether the last image acquired was suboptimal: drawn and presented as it was, the
+    /// surface is configured again before the next is acquired.
+    suboptimal: bool,
 }
 
 impl fmt::Debug for WindowSurface {
@@ -244,6 +247,7 @@ impl WindowSurface {
             config,
             size,
             presentation,
+            suboptimal: false,
         };
         this.configure(&gpu)?;
         Ok((gpu, this))
@@ -286,23 +290,26 @@ impl WindowSurface {
     /// a free image).
     ///
     /// A surface that has changed is configured again, and a lost one recreated; both give
-    /// [`Acquired::Retry`].
+    /// [`Acquired::Retry`]. A suboptimal image (usable, but no longer matching the surface) is
+    /// given as a frame, to draw and present, and the surface is configured again before the
+    /// next: dropping it instead could leave the window with nothing shown.
     ///
     /// # Errors
     ///
     /// [`SurfaceError::Acquire`] if acquiring fails validation; [`SurfaceError::Create`] or a
     /// [`GpuError`] if a lost surface can't be recreated and configured.
     pub fn acquire(&mut self, gpu: &Gpu) -> Result<Acquired<'_>, SurfaceError> {
+        if std::mem::take(&mut self.suboptimal) {
+            self.configure(gpu)?;
+        }
         match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(texture) => {
                 Ok(Acquired::Frame(Frame::swapchain(texture)))
             }
             CurrentSurfaceTexture::Suboptimal(texture) => {
-                // Discarded before the surface is set up again: configuring while a frame is
-                // held is refused.
-                drop(texture);
-                self.configure(gpu)?;
-                Ok(Acquired::Retry)
+                // Configuring while the image is held is refused: it is done before the next.
+                self.suboptimal = true;
+                Ok(Acquired::Frame(Frame::swapchain(texture)))
             }
             CurrentSurfaceTexture::Outdated => {
                 self.configure(gpu)?;
