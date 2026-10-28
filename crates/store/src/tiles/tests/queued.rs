@@ -9,6 +9,7 @@ use std::time::Duration;
 use geom::gather_block;
 
 use super::*;
+use crate::JobsReport;
 use crate::queued::{EvaluatedTile, EvaluationCaps};
 
 /// Every finest tile of the cube, each with a priority from `seed`, all distinct.
@@ -483,4 +484,57 @@ fn a_write_elsewhere_keeps_a_finished_tile_copied_from_the_cache() {
     let taken = store.take_evaluated();
     assert_eq!(taken.len(), 1, "handed over");
     assert_dense(&mesh, &dense(&mesh, &map), &taken[0], "copied again");
+}
+
+/// With both sides able to run, each slice goes to the side that didn't run the one before,
+/// within a call and across calls.
+#[test]
+fn the_display_jobs_and_the_queue_take_turns() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy().with_display(level(TOP)));
+    store.queue_evaluation(&prioritized(&mesh, 19)).unwrap();
+    for _ in 0..20 {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(1))
+            .unwrap();
+        drop(store.take_evaluated());
+    }
+    let turns = &store.hooks.turns;
+    let contested: Vec<bool> = turns
+        .windows(2)
+        .filter(|pair| pair[1].1)
+        .map(|pair| pair[0].0 != pair[1].0)
+        .collect();
+    assert!(!contested.is_empty(), "both sides had work at once");
+    assert!(
+        contested.iter().all(|&alternated| alternated),
+        "each contested turn goes to the other side: {turns:?}"
+    );
+    assert!(
+        turns.iter().any(|&(queue, _)| queue) && turns.iter().any(|&(queue, _)| !queue),
+        "both ran"
+    );
+}
+
+/// A slice is counted, its length kept if the longest, and counted long past the target.
+#[test]
+fn slices_are_counted_and_the_long_ones_noted() {
+    use super::super::upkeep::note_slice;
+
+    let mut report = JobsReport::default();
+    note_slice(&mut report, Duration::from_micros(10));
+    note_slice(&mut report, JobsReport::SLICE_TARGET);
+    note_slice(
+        &mut report,
+        JobsReport::SLICE_TARGET + Duration::from_micros(1),
+    );
+    note_slice(&mut report, Duration::from_micros(20));
+    assert_eq!(report.slices, 4, "every slice");
+    assert_eq!(report.long_slices, 1, "only one past the target");
+    assert_eq!(
+        report.longest_slice,
+        JobsReport::SLICE_TARGET + Duration::from_micros(1),
+        "the longest"
+    );
 }

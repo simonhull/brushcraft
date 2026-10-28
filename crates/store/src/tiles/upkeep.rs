@@ -384,7 +384,7 @@ struct Sides {
 }
 
 /// Counts a slice that took `took` in `report`.
-fn note_slice(report: &mut JobsReport, took: std::time::Duration) {
+pub(super) fn note_slice(report: &mut JobsReport, took: std::time::Duration) {
     report.longest_slice = report.longest_slice.max(took);
     if took > crate::jobs::SLICE_TARGET {
         report.long_slices += 1;
@@ -637,6 +637,10 @@ impl TileStore {
                 }
             };
             sides.queue_next = !run_queue;
+            #[cfg(test)]
+            self.hooks
+                .turns
+                .push((run_queue, display_ready && queue_ready));
             let began = Instant::now();
             if run_queue {
                 let turn = self.evaluation_slice(report);
