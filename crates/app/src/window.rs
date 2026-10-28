@@ -220,6 +220,8 @@ impl WindowApp {
             WindowEvent::SurfaceResized(size) => owner.resize(frame_size(size)),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => owner.set_scale(scale_factor),
             WindowEvent::RedrawRequested | WindowEvent::Occluded(false) => owner.expose(),
+            // A button held as focus goes may never report its release.
+            WindowEvent::Focused(false) => owner.input(Input::Cancel),
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
                 owner.input(Input::Modifiers(Modifiers {

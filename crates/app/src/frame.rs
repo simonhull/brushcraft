@@ -251,11 +251,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// Queues pointer input for the next frame's input phase, and wants that frame if the
     /// input may move the camera.
     pub(crate) fn input(&mut self, input: Input) {
-        let pending_press = self
-            .input
-            .iter()
-            .any(|queued| matches!(queued, Input::Press { .. }));
-        if self.navigator.may_move(&input, pending_press) {
+        if self.navigator.may_move(&self.input, &input) {
             self.scheduler.want(Reason::Input);
         }
         self.input.push(input);

@@ -11,10 +11,11 @@
 //! | middle or right button, dragged | pan |
 //! | wheel | zoom, a notch at a time |
 //!
-//! A gesture is chosen when its button goes down and lasts until that button comes up;
-//! modifiers changing meanwhile don't switch it. Input arrives as [`Input`], the window's
-//! events in our terms, so the rules here are tested without a window. The brush takes the pen
-//! tip over the model in M1a4; until then the tip navigates everywhere.
+//! A gesture is chosen when its button goes down and lasts until that button comes up, or the
+//! window loses focus (when the release may never come); modifiers changing meanwhile don't
+//! switch it. Only motion in a drag and the wheel ask for a frame. Input arrives as [`Input`], the
+//! window's events in our terms, so the rules here are tested without a window. The brush takes the
+//! pen tip over the model in M1a4; until then the tip navigates everywhere.
 
 use crate::camera::{Arcball, Camera, Pixel};
 
@@ -71,6 +72,9 @@ pub(crate) enum Input {
     },
     /// The modifier keys changed.
     Modifiers(Modifiers),
+    /// The window lost the keyboard and pointer focus: a drag in progress ends, and the pen's
+    /// barrel button counts as released, since their releases may never arrive.
+    Cancel,
 }
 
 /// What a drag does to the camera.
@@ -135,27 +139,29 @@ impl Navigator {
         self.drag.map(|drag| drag.gesture)
     }
 
-    /// Whether `input` may move the camera once applied after everything queued before it:
-    /// motion while a drag is in progress or about to start (`pending_press`: a press is
-    /// queued, not yet applied), or a wheel turn. What asks for a frame; hovering asks for
-    /// none.
-    pub(crate) fn may_move(&self, input: &Input, pending_press: bool) -> bool {
+    /// Whether `input` may move the camera once applied after the inputs `queued` before it:
+    /// motion during a drag (one in progress, or started by a queued press and not ended by a
+    /// queued release), or a wheel turn. What asks for a frame; hovering, a press alone (the
+    /// barrel's included) and motion after a release ask for none.
+    pub(crate) fn may_move(&self, queued: &[Input], input: &Input) -> bool {
         match input {
-            Input::Move { .. } => self.drag.is_some() || pending_press,
+            Input::Move { .. } => {
+                let mut ahead = self.clone();
+                for &earlier in queued {
+                    ahead.track(earlier);
+                }
+                ahead.drag.is_some()
+            }
             Input::Wheel { notches } => *notches != 0.0 && notches.is_finite(),
-            Input::Press { .. } | Input::Release { .. } | Input::Modifiers(_) => false,
+            Input::Press { .. } | Input::Release { .. } | Input::Modifiers(_) | Input::Cancel => {
+                false
+            }
         }
     }
 
-    /// Applies `input` to `camera`, whose viewport the `arcball` covers and is `height` pixels
-    /// tall; returns whether the camera moved.
-    pub(crate) fn apply(
-        &mut self,
-        input: Input,
-        camera: &mut Camera,
-        arcball: &Arcball,
-        height: f64,
-    ) -> bool {
+    /// Applies `input` to the navigator's own state (the drag, the barrel button, the
+    /// modifiers), leaving the camera alone; motion only moves the drag's last point.
+    fn track(&mut self, input: Input) {
         match input {
             Input::Press { button, at } => {
                 if button == Button::PenBarrel {
@@ -170,7 +176,6 @@ impl Navigator {
                         last: at,
                     });
                 }
-                false
             }
             Input::Release { button } => {
                 if button == Button::PenBarrel {
@@ -179,8 +184,31 @@ impl Navigator {
                 if self.drag.is_some_and(|drag| drag.button == button) {
                     self.drag = None;
                 }
-                false
             }
+            Input::Move { at } => {
+                if let Some(drag) = &mut self.drag {
+                    drag.last = at;
+                }
+            }
+            Input::Modifiers(modifiers) => self.modifiers = modifiers,
+            Input::Cancel => {
+                self.drag = None;
+                self.barrel = false;
+            }
+            Input::Wheel { .. } => {}
+        }
+    }
+
+    /// Applies `input` to `camera`, whose viewport the `arcball` covers and is `height` pixels
+    /// tall; returns whether the camera moved.
+    pub(crate) fn apply(
+        &mut self,
+        input: Input,
+        camera: &mut Camera,
+        arcball: &Arcball,
+        height: f64,
+    ) -> bool {
+        match input {
             Input::Move { at } => {
                 let Some(drag) = &mut self.drag else {
                     return false;
@@ -203,8 +231,8 @@ impl Navigator {
                 camera.zoom(NOTCH_ZOOM.powf(-notches));
                 true
             }
-            Input::Modifiers(modifiers) => {
-                self.modifiers = modifiers;
+            Input::Press { .. } | Input::Release { .. } | Input::Modifiers(_) | Input::Cancel => {
+                self.track(input);
                 false
             }
         }
@@ -385,19 +413,66 @@ mod tests {
     #[test]
     fn only_motion_in_a_drag_and_the_wheel_may_move_the_camera() {
         let motion = Input::Move { at: at(1.0, 1.0) };
-        let idle = Navigator::default();
-        assert!(!idle.may_move(&motion, false), "hovering");
-        assert!(idle.may_move(&motion, true), "a press is queued before it");
-        assert!(idle.may_move(&Input::Wheel { notches: -1.0 }, false));
-        assert!(!idle.may_move(&Input::Wheel { notches: 0.0 }, false));
-        assert!(!idle.may_move(&Input::Wheel { notches: f64::NAN }, false));
         let press = Input::Press {
             button: Button::MouseLeft,
             at: at(0.0, 0.0),
         };
-        assert!(!idle.may_move(&press, false), "a press alone moves nothing");
+        let release = Input::Release {
+            button: Button::MouseLeft,
+        };
+        let idle = Navigator::default();
+        assert!(!idle.may_move(&[], &motion), "hovering");
+        assert!(
+            idle.may_move(&[press], &motion),
+            "a press is queued before it"
+        );
+        assert!(
+            !idle.may_move(&[press, release], &motion),
+            "and released again: hovering"
+        );
+        let barrel = Input::Press {
+            button: Button::PenBarrel,
+            at: at(0.0, 0.0),
+        };
+        assert!(
+            !idle.may_move(&[barrel], &motion),
+            "the barrel alone drags nothing"
+        );
+        assert!(idle.may_move(&[], &Input::Wheel { notches: -1.0 }));
+        assert!(!idle.may_move(&[], &Input::Wheel { notches: 0.0 }));
+        assert!(!idle.may_move(&[], &Input::Wheel { notches: f64::NAN }));
+        assert!(!idle.may_move(&[], &press), "a press alone moves nothing");
         let (_, dragging) = run(&[press]);
-        assert!(dragging.may_move(&motion, false), "motion in a drag");
+        assert!(dragging.may_move(&[], &motion), "motion in a drag");
+        assert!(
+            !dragging.may_move(&[release], &motion),
+            "after its queued release"
+        );
+    }
+
+    #[test]
+    fn losing_focus_ends_a_drag_whose_release_never_came() {
+        let (camera, navigator) = run(&[
+            Input::Press {
+                button: Button::PenBarrel,
+                at: at(100.0, 50.0),
+            },
+            Input::Press {
+                button: Button::MouseLeft,
+                at: at(100.0, 50.0),
+            },
+            Input::Cancel,
+            Input::Move {
+                at: at(150.0, 50.0),
+            },
+        ]);
+        assert_eq!(navigator.gesture(), None, "the drag ended");
+        assert!(!navigator.barrel, "the barrel counts as released");
+        assert_eq!(
+            camera,
+            Camera::default(),
+            "the motion after it moves nothing"
+        );
     }
 
     #[test]
