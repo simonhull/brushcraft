@@ -98,6 +98,15 @@ fn queued_tiles_finish_highest_priority_first_as_the_dense_evaluation_has_them()
     );
     let keys: BTreeSet<TileKey> = taken.iter().map(EvaluatedTile::key).collect();
     assert_eq!(keys.len(), wanted.len(), "no tile twice");
+    let queued: BTreeMap<TileKey, f32> = wanted.iter().copied().collect();
+    for tile in &taken {
+        assert_eq!(
+            tile.priority().to_bits(),
+            queued[&tile.key()].to_bits(),
+            "{:?}: the priority it was queued with",
+            tile.key()
+        );
+    }
     let dense = dense(&mesh, &map);
     for tile in &taken {
         assert_dense(&mesh, &dense, tile, "queued");

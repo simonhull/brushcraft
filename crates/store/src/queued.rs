@@ -341,6 +341,13 @@ mod tests {
             Some(f32::NEG_INFINITY),
             "NaN taken as negative infinity"
         );
+        assert_eq!(Priority::new(2.0), Priority::new(2.0), "equal values");
+        assert_ne!(Priority::new(2.0), Priority::new(3.0), "different values");
+        assert_eq!(
+            Priority::new(f32::NAN),
+            Priority::new(f32::NEG_INFINITY),
+            "NaN is negative infinity"
+        );
     }
 
     #[test]
