@@ -1576,6 +1576,7 @@ dependencies = [
  "geom",
  "pollster",
  "rayon",
+ "store",
  "thiserror 2.0.21",
  "wgpu",
 ]

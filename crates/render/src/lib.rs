@@ -15,8 +15,11 @@
 mod draw;
 pub mod gpu;
 pub mod overlay;
+pub mod residency;
 #[cfg(feature = "spike")]
 pub mod spike;
 pub mod surface;
+pub mod tree;
+pub mod upload;
 
 pub use draw::{DrawTimes, Drawn, FrameInputs, Outcome, Renderer};
