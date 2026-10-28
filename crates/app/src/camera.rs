@@ -13,6 +13,12 @@
 //!
 //! Math is `f64`: the camera is a handful of numbers, and accumulated drags then stay unit
 //! length for far longer.
+//!
+//! Where this goes next: culling and level choice (M1a3 Task 3) need the view and projection
+//! as matrices, on the render side. Before then the camera itself ([`Camera`], [`Rotation`]
+//! and their `f64` vector) moves into `render` (a `render::camera` module that also builds the
+//! view-projection matrices, in `f64`, handed to the GPU as `f32`), and this module keeps only
+//! the arcball and what navigation does with it. `geom::Vec3` is `f32` and stays the mesh's.
 
 use std::ops::{Add, Mul, Neg, Sub};
 
