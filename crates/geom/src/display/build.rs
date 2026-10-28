@@ -536,10 +536,10 @@ impl FacePositions {
 /// `face`'s display positions at every level below `finest`, with the encoding chosen by
 /// measurement.
 ///
-/// Each level's positions are the finest ones subsampled (vertex `(i·2ᵏ, j·2ᵏ)`), and each
-/// tile's bound `e` is chained from the finest level up through the *decoded* positions (see
-/// the module notes), so the encoding's quantization is inside it. `finest_positions` is the
-/// face's whole grid at `finest`.
+/// Each level's positions are the decoded level below subsampled (the finest one below the
+/// finest), and each tile's bound `e` is chained from the finest level up through the *decoded*
+/// positions (see the module notes), so the encoding's quantization is inside it.
+/// `finest_positions` is the face's whole grid at `finest`.
 ///
 /// # Errors
 ///
@@ -584,12 +584,11 @@ pub fn build_positions_with(
         return Err(DisplayError::NotFinite);
     }
     let mut levels = Vec::new();
-    let mut input = finest_positions.clone();
     let mut decoded_finer = finest_positions.clone();
     let mut finer_bounds: Vec<f32> = Vec::new();
     let mut finer_level = finest;
     while let Some(level) = finer_level.parent() {
-        input = subsample(&input)?;
+        let input = subsample(&decoded_finer)?;
         let mut decoded = input.clone();
         let mut written = vec![false; decoded.as_slice().len()];
         let keys = level_keys(face, level)?;
@@ -632,11 +631,10 @@ pub fn build_positions_with(
 /// store brings up to date after an edit, one tile at a time, the same bits as [`build_mesh`]
 /// gives.
 ///
-/// `exact` is the tile's block of the finest positions subsampled at its level; `finer` the
-/// block under it one level finer (side `2 × (side − 1) + 1`): the finest positions there if
-/// that is the finest level, else the decoded positions of the display tiles there;
-/// `children_bound` the largest bound of those tiles (0 at the finest level); `means` the tile's
-/// mean normals ([`mip_normals_tile`]).
+/// `finer` is the block under it one level finer (side `2 × (side − 1) + 1`): the finest
+/// positions there if that is the finest level, else the decoded positions of the display tiles
+/// there; the tile stores its even vertices. `children_bound` is the largest bound of those
+/// tiles (0 at the finest level); `means` the tile's mean normals ([`mip_normals_tile`]).
 ///
 /// # Errors
 ///
@@ -645,15 +643,15 @@ pub fn build_positions_with(
 /// channel.
 pub fn build_tile(
     key: TileKey,
-    exact: &Grid,
     finer: &Grid,
     children_bound: f32,
     means: &MeanNormals,
 ) -> Result<DisplayTile, DisplayError> {
-    if !(exact.as_slice().iter().all(|v| v.is_finite()) && children_bound.is_finite()) {
+    if !(finer.as_slice().iter().all(|v| v.is_finite()) && children_bound.is_finite()) {
         return Err(DisplayError::NotFinite);
     }
-    let (bytes, positions, error) = positions_tile(&CHOSEN, &key, exact, finer, children_bound)?;
+    let exact = subsample(finer)?;
+    let (bytes, positions, error) = positions_tile(&CHOSEN, &key, &exact, finer, children_bound)?;
     let (normal_bytes, normals, roughness) = normals_tile(CHOSEN_NORMALS, &positions, &means.grid)?;
     Ok(DisplayTile {
         key,

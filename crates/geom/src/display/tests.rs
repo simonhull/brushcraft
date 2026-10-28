@@ -983,13 +983,6 @@ fn a_tile_built_alone_is_the_tile_built_with_its_mesh() {
         for tile in tiles.iter().filter(|t| t.key().level() == level(l)) {
             let key = *tile.key();
             let region = Region::of_tile(&key);
-            let shift = FINEST - l;
-            let finest = positions.get(key.face()).unwrap();
-            let exact = grid(key.side(), |i, j| {
-                finest
-                    .get((region.x0() + i) << shift, (region.y0() + j) << shift)
-                    .unwrap()
-            });
             let finer_grid = finer_positions.get(key.face()).unwrap();
             let finer = grid(2 * region.quads() + 1, |i, j| {
                 finer_grid
@@ -1009,7 +1002,7 @@ fn a_tile_built_alone_is_the_tile_built_with_its_mesh() {
                     .fold(0.0, f32::max)
             };
             let means = mip_normals_tile(&sculpt.mesh, &finer_means, &key).unwrap();
-            let alone = build_tile(key, &exact, &finer, children, &means).unwrap();
+            let alone = build_tile(key, &finer, children, &means).unwrap();
             assert_eq!(&alone, tile, "{key:?}");
         }
     }

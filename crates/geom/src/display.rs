@@ -2,10 +2,17 @@
 //!
 //! A brush moves the finest level only, so a coarse level of the correction pyramid shows none
 //! of what was sculpted finer. A display tile instead holds, for one tile at level `l` below the
-//! finest, the finest surface **subsampled** at that level (vertex `(i, j)` of the level-`l` face
-//! grid is the finest vertex `(i·2ᵏ, j·2ᵏ)`, `k = finest − l`), its **averaged normals** with a
+//! finest, the surface one level finer **subsampled** as it is stored there (vertex `(i, j)` of
+//! the level-`l` face grid is vertex `(2i, 2j)` of level `l + 1`: the finest vertex itself one
+//! level below the finest, else the *decoded* display vertex), its **averaged normals** with a
 //! roughness term, and `e`, a **true bound** on the distance from the surface it draws to every
 //! finest vertex under it.
+//!
+//! Subsampling the decoded level below, not the finest, lets a level be built from the stored
+//! level under it alone, never the finest positions under a whole face. Its border vertices are
+//! still the finest bits (every level stores its borders losslessly, and a tile's border lies on
+//! the borders of the tiles under it); its interior drifts by the quantization of the levels
+//! below, about 1/64 of a quad edge at each, which the chained bound includes.
 //!
 //! # The surface a tile draws
 //!
@@ -115,7 +122,7 @@ impl From<EvalError> for DisplayError {
     }
 }
 
-/// One display tile: the finest surface subsampled at a coarser tile, as decoded from its
+/// One display tile: the surface one level finer subsampled at a coarser tile, as decoded from its
 /// encoding, with its averaged normals, roughness and error bound.
 ///
 /// Built by [`build_level`] (or [`build_mesh`]), or read back with [`DisplayTile::decode`] from

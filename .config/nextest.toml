@@ -6,6 +6,12 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'test(/::crash::/)'
 slow-timeout = { period = "120s", terminate-after = 3 }
 
+# Timing: a deadline overrun by the owner thread being descheduled, which other tests' worker
+# threads cause, isn't the store's. Runs alone.
+[[profile.default.overrides]]
+filter = 'test(run_jobs_honours_its_deadline_within_one_slice)'
+threads-required = "num-cpus"
+
 [profile.ci]
 fail-fast = false
 failure-output = "immediate-final"
@@ -14,6 +20,12 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 [[profile.ci.overrides]]
 filter = 'test(/::crash::/)'
 slow-timeout = { period = "120s", terminate-after = 3 }
+
+# Timing: a deadline overrun by the owner thread being descheduled, which other tests' worker
+# threads cause, isn't the store's. Runs alone.
+[[profile.ci.overrides]]
+filter = 'test(run_jobs_honours_its_deadline_within_one_slice)'
+threads-required = "num-cpus"
 
 # Coverage builds run instrumented, several times slower: for cargo llvm-cov (the weekly job,
 # and by hand), so the slowest tests finish instead of timing out.

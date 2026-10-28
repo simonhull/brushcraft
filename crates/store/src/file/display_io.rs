@@ -21,7 +21,7 @@ use crate::stamp::Stamp;
 /// `None` if it doesn't verify as a display record of `key` this build reads (it counts as
 /// unknown). The body is decompressed only if its stated size is plausible for the key's level
 /// ([`max_body`]).
-pub(super) fn display_record(raw: &[u8], key: &TileKey) -> Option<StoredDisplay> {
+pub(crate) fn display_record(raw: &[u8], key: &TileKey) -> Option<StoredDisplay> {
     let tile = tile_record(raw, key)?;
     if tile.raw_len > max_body(key) {
         return None;

@@ -356,6 +356,16 @@ pub struct TileStore {
     /// ([`TileStore::edits`]) it failed at: unknown, and left out of every job until a change
     /// lands (see [`TileStore::failed_display`]).
     display_failed: std::collections::BTreeMap<TileKey, (u64, geom::DisplayError)>,
+    /// The display book's count of changes when the refresh last looked for unknown tiles
+    /// ([`TileStore::run_jobs`]): it looks again only once that moves.
+    refresh_seen: u64,
+    /// How many times the store recorded built display tiles ([`TileStore::record_display`]).
+    display_builds: u64,
+    /// The generation of each display record built since the store opened: the value of
+    /// `display_builds` that recorded it (see [`TileStore::display_generation`]).
+    display_generations: std::collections::BTreeMap<TileKey, u64>,
+    /// Display tiles the jobs built or decoded, for the coarser tiles that read them.
+    display_decoded: crate::jobs::DecodedTiles,
     /// The tiles whose corrections changed (a write, or a lost tile going back to its record)
     /// since a bump last covered them, while any tile is bumped: a bump they reach no longer
     /// bounds its tile, and is dropped before anything reads one

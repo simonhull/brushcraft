@@ -1,50 +1,58 @@
-//! Keeping the display layer up to date: building display tiles one at a time from what the
-//! store holds, as budgeted jobs (see [`crate::jobs`]).
+//! Keeping the display layer up to date: building display tiles on the store's workers from
+//! what the store holds, as budgeted jobs (see [`crate::jobs`]).
 //!
-//! A display tile at level `l` is built from (see `geom::build_tile`):
+//! A display tile at level `l` is built from (see `geom::build_tile`) the block under it one
+//! level finer, whose even vertices it stores (the finest positions at `finest − 1`, else the
+//! decoded display tiles at `l + 1`, whose bounds chain into its own), and its mean normals, the
+//! tent of the means one level finer around its vertices, read across face borders (the finest
+//! normals at `finest − 1`, else the decoded display tiles at `l + 1`, its own face's and its
+//! neighbours'). What it reads is known before it is built ([`crate::display::tent_reads`]).
 //!
-//! - the finest positions under it, subsampled, and the block one level finer (the finest positions
-//!   there at `finest − 1`, else the decoded display tiles at `l + 1`, whose bounds chain into its
-//!   own);
-//! - its mean normals, the tent of the means one level finer around its vertices, read across face
-//!   borders: the finest normals at `finest − 1`, else the decoded display tiles at `l + 1`, its
-//!   own face's and its neighbours'.
-//!
-//! So building a tile can find a display tile it reads unknown, always one level finer: that one
-//! is built first. Every such dependency is one level finer, and the finest level is always
-//! there (it is evaluated), so the work ends. It can also find a finest tile it reads not
-//! evaluated: a slice evaluates a bounded batch of those first.
+//! The owner thread hands a worker a tile once everything it reads is there, with those inputs,
+//! owned: the finest tiles' values copied once each for the job (shared by every tile reading
+//! them), or the finer display tiles decoded (by the job, or by the worker from a record, kept
+//! for the job afterwards). The worker assembles the blocks, runs the normals' mip and encodes;
+//! the owner records what comes back. A result built from inputs a correction change has since
+//! outdated (a write, a lost tile's revert) is dropped and the tile built again. A tile whose
+//! inputs aren't there waits: for the display tiles one level finer it reads (unknown, so built
+//! first: every dependency is one level finer and the finest level is evaluated, so the work
+//! ends), or for a slice that evaluates a few of the finest tiles it reads.
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use geom::{
-    Channel, DisplayError, DisplayTile, FaceId, Grid, LayerId, Level, MeanNormals, PositionSource,
+    BaseMesh, Channel, DisplayError, DisplayTile, FaceId, Grid, LayerId, Level, PositionSource,
     Region, TileKey, Vec3, build_tile, mip_normals_tile,
 };
 
 use super::TileStore;
 use super::config::Evaluation;
 use super::error::CacheError;
-use crate::jobs::{FinestScratch, Job, JobsReport, Progress, Upkeep};
+use crate::bounds::Kept;
+use crate::display::{DisplayRecord, StoredDisplay, tent_reads};
+use crate::file::{FileError, FileReader, Loc, display_record, unknown_display_len};
+use crate::jobs::{Cone, FinestTile, Finished, Job, JobsReport, Outcome, Progress, Upkeep};
 
-/// The most finest tiles one slice evaluates for a display tile: a whole-face tile reads all of
-/// its face's, which would make one slice of many milliseconds.
-const EVALUATE_BATCH: usize = 4;
+/// How many pending tiles a slice looks at per tile it can hand out: it skips known, failed
+/// and unready tiles, and this bounds how long it looks.
+const LOOK_AHEAD: usize = 4;
 
-/// What trying to build one display tile came to.
-#[derive(Debug)]
-enum Attempt {
-    /// The tile, built.
-    Built(Box<DisplayTile>),
-    /// Finest tiles it reads aren't evaluated as far as it needs: evaluate these first.
-    Evaluate(Vec<TileKey>, Evaluation),
-    /// Display tiles one level finer it reads are unknown: build these first.
-    Needs(Vec<TileKey>),
-}
+/// The most finest tiles a slice copies for the workers (about 100 KB each at level 9): the
+/// rest wait for the next slices.
+const COPY_BATCH: usize = 8;
 
-/// The base displacement tile of `level` holding face-grid vertex `(i, j)` of `face`, and the
+/// The most corrections of a cone a step asks the prefetch for: a few rounds' worth, so they
+/// land a few at a time.
+const PREFETCH_AHEAD: usize = 2 * crate::jobs::ROUND_MAX;
+
+/// About how long a slice spends handing tiles out (gathering and copying their inputs): it
+/// stops looking once past it, so a slice stays well under a millisecond.
+const HAND_OUT_TIME: std::time::Duration = std::time::Duration::from_micros(300);
+
+/// The base tile of `channel` at `level` holding face-grid vertex `(i, j)` of `face`, and the
 /// vertex's index in its row-major values.
 fn containing(
     channel: Channel,
@@ -57,116 +65,351 @@ fn containing(
     Some((key, usize::try_from(lj * key.side() + li).ok()?))
 }
 
-/// The finest unit normals the store has cached or a job has copied, read as a
-/// [`PositionSource`] for the mip of the level above the finest; every tile it lacks is noted.
-struct FinestNormals<'a> {
-    /// The store, read without evaluating.
-    store: &'a TileStore,
-    /// The normals copied, by tile.
-    normals: &'a BTreeMap<TileKey, Vec<Vec3>>,
-    /// The tiles whose normals a read found missing.
-    misses: RefCell<BTreeSet<TileKey>>,
+/// Tiles' values by key, read as a [`PositionSource`] for a tile's mip.
+///
+/// The finest normals, or the decoded means of display tiles. Remembers the last tile read (the
+/// mip reads row by row, so most reads fall in it) and whether any read missed.
+struct TileValues<'a> {
+    /// The channel the tiles are keyed under.
+    channel: Channel,
+    /// The values, by tile.
+    tiles: &'a BTreeMap<TileKey, &'a [Vec3]>,
+    /// The tile the last read found.
+    last: Cell<Option<(TileKey, &'a [Vec3])>>,
+    /// Whether a read found its tile missing.
+    missed: Cell<bool>,
 }
 
-impl PositionSource for FinestNormals<'_> {
-    fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
-        let (key, index) = containing(Channel::DISPLACEMENT, face, level, i, j)?;
-        let found = self
-            .store
-            .cached_normals(&key)
-            .or_else(|| self.normals.get(&key).map(Vec::as_slice))
-            .and_then(|n| n.get(index).copied());
-        if found.is_none() {
-            self.misses.borrow_mut().insert(key);
+impl<'a> TileValues<'a> {
+    /// `tiles`, keyed under `channel`.
+    const fn new(channel: Channel, tiles: &'a BTreeMap<TileKey, &'a [Vec3]>) -> Self {
+        Self {
+            channel,
+            tiles,
+            last: Cell::new(None),
+            missed: Cell::new(false),
         }
-        found
     }
 }
 
-/// Decoded display tiles' means, read as a [`PositionSource`] for the mip of the level above
-/// theirs; every tile it lacks is noted.
-struct DisplayMeans<'a> {
-    /// The means of the display tiles loaded, by key.
-    tiles: &'a BTreeMap<TileKey, Vec<Vec3>>,
-    /// The tiles a read found missing.
-    misses: RefCell<BTreeSet<TileKey>>,
-}
-
-impl PositionSource for DisplayMeans<'_> {
+impl PositionSource for TileValues<'_> {
     fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
-        let (key, index) = containing(Channel::DISPLAY, face, level, i, j)?;
-        let found = self.tiles.get(&key).and_then(|m| m.get(index).copied());
+        let (key, index) = containing(self.channel, face, level, i, j)?;
+        let values = match self.last.get() {
+            Some((last, values)) if last == key => Some(values),
+            _ => {
+                let found = self.tiles.get(&key).copied();
+                if let Some(values) = found {
+                    self.last.set(Some((key, values)));
+                }
+                found
+            }
+        };
+        let found = values.and_then(|v| v.get(index).copied());
         if found.is_none() {
-            self.misses.borrow_mut().insert(key);
+            self.missed.set(true);
         }
         found
     }
+
+    fn row(&self, face: FaceId, level: Level, i: u32, j: u32, out: &mut [Vec3]) -> Option<()> {
+        // Runs of whole tile rows, copied.
+        let tq = level.tile_quads();
+        let mut x = i;
+        let mut at = 0;
+        while at < out.len() {
+            let Some((key, index)) = containing(self.channel, face, level, x, j) else {
+                self.missed.set(true);
+                return None;
+            };
+            let tile_end = Region::of_tile(&key).x0() + tq;
+            let count = usize::try_from(tile_end - x + 1).ok()?.min(out.len() - at);
+            let Some(run) = self
+                .tiles
+                .get(&key)
+                .and_then(|values| values.get(index..index + count))
+            else {
+                self.missed.set(true);
+                return None;
+            };
+            out.get_mut(at..at + count)?.copy_from_slice(run);
+            at += count;
+            x += u32::try_from(count).ok()?;
+        }
+        Some(())
+    }
 }
 
-/// The display tiles of `level` under `region` (of the level above), row by row.
-fn tiles_under(region: Region, level: Level) -> Vec<TileKey> {
-    let tq = level.tile_quads();
-    let (x0, y0) = (2 * region.x0() / tq, 2 * region.y0() / tq);
-    let count = (2 * region.quads()).div_ceil(tq).max(1);
-    (y0..y0 + count)
-        .flat_map(|ty| (x0..x0 + count).map(move |tx| (tx, ty)))
-        .filter_map(|(tx, ty)| {
-            TileKey::display(
-                region.face(),
-                level,
-                u16::try_from(tx).ok()?,
-                u16::try_from(ty).ok()?,
-            )
-            .ok()
-        })
-        .collect()
-}
-
-/// The displacement tiles of `level` holding a vertex of columns `x0..=x1`, rows `y0..=y1` of
-/// `face` (clamped to the face).
-fn finest_tiles(
+/// The block of `side` × `side` vertices of `face` at `level` from `(x0, y0)`, put together row
+/// by row from whole tiles of `channel` in `tiles`; `None` if one it needs is missing.
+fn block_from(
+    tiles: &BTreeMap<TileKey, &[Vec3]>,
+    channel: Channel,
     face: FaceId,
     level: Level,
-    (x0, x1): (u32, u32),
-    (y0, y1): (u32, u32),
-) -> Vec<TileKey> {
+    (x0, y0): (u32, u32),
+    side: u32,
+) -> Option<Vec<Vec3>> {
     let tq = level.tile_quads();
-    let last = level.tiles_per_side() - 1;
-    let range = |lo: u32, hi: u32| (lo.div_ceil(tq).saturating_sub(1))..=(hi / tq).min(last);
-    range(y0, y1)
-        .flat_map(|ty| range(x0, x1).map(move |tx| (tx, ty)))
-        .filter_map(|(tx, ty)| {
-            TileKey::displacement(
-                face,
-                level,
-                u16::try_from(tx).ok()?,
-                u16::try_from(ty).ok()?,
-            )
-            .ok()
-        })
-        .collect()
+    let mut out = Vec::with_capacity(usize::try_from(side * side).ok()?);
+    for y in y0..y0 + side {
+        let mut x = x0;
+        while x < x0 + side {
+            let (key, index) = containing(channel, face, level, x, y)?;
+            // The run to the end of the row, or of the tile's row (a tile holds `tq + 1`
+            // vertices a row, from its own `x0`).
+            let tile_x0 = Region::of_tile(&key).x0();
+            let end = (tile_x0 + tq).min(x0 + side - 1);
+            let count = usize::try_from(end - x + 1).ok()?;
+            out.extend_from_slice(tiles.get(&key)?.get(index..index + count)?);
+            x = end + 1;
+        }
+    }
+    Some(out)
+}
+
+/// Whether `inner` (a region one level finer than `outer`) lies within `outer`'s area: a tile
+/// under it, not one of its neighbours.
+fn lies_under(inner: Region, outer: Region) -> bool {
+    inner.face() == outer.face()
+        && inner.x0() >= 2 * outer.x0()
+        && inner.y0() >= 2 * outer.y0()
+        && inner.x0() + inner.quads() <= 2 * (outer.x0() + outer.quads())
+        && inner.y0() + inner.quads() <= 2 * (outer.y0() + outer.quads())
+}
+
+/// Where a worker finds a display tile one level finer to decode.
+#[derive(Debug, Clone)]
+enum Finer {
+    /// The store holds its record, copied for the worker to decode.
+    Record(DisplayRecord),
+    /// A file holds it: the worker reads its record there.
+    File(FileReader, Loc),
+}
+
+/// What a worker builds or decodes a display tile from, owned by the worker.
+#[derive(Debug)]
+enum TaskInputs {
+    /// Build it, one level above the finest: the finest tiles it reads.
+    Finest(BTreeMap<TileKey, FinestTile>),
+    /// Build it, higher: the display tiles one level finer it reads, decoded.
+    Display(BTreeMap<TileKey, Arc<DisplayTile>>),
+    /// Decode it, for the tiles of the level above: where its record is.
+    Decode(Finer),
+}
+
+/// One display tile for a worker to build, with all it reads.
+#[derive(Debug)]
+struct Task {
+    /// The tile.
+    key: TileKey,
+    /// The store's count of correction changes the inputs were taken at.
+    as_of: u64,
+    /// The generation of the tile's record when it was handed out (see
+    /// [`TileStore::display_generation`]): what a decode decodes.
+    record: u64,
+    /// The store's mesh.
+    mesh: Arc<BaseMesh>,
+    /// The store's display layer's finest level: a record built from another is unknown.
+    finest: Level,
+    /// What it reads.
+    inputs: TaskInputs,
+    /// Whether it fails as one that won't build would (a test's hook).
+    unbuildable: bool,
+}
+
+/// Decodes display tile `key` from where it is: `None` if its record is unknown, built from
+/// another finest level than `finest`, damaged, or doesn't decode (it is then rebuilt).
+///
+/// # Errors
+///
+/// [`CacheError::Store`] if its record can't be read.
+fn decode_finer(
+    key: TileKey,
+    place: &Finer,
+    finest: Level,
+) -> Result<Option<DisplayTile>, CacheError> {
+    let record = match place {
+        Finer::Record(record) => Some(record.clone()),
+        Finer::File(reader, loc) => match reader.read_record(*loc) {
+            Ok(raw) => display_record(&raw, &key).and_then(StoredDisplay::known),
+            Err(FileError::Damaged { .. }) => None,
+            Err(e) => return Err(CacheError::Store(e)),
+        },
+    };
+    Ok(record
+        .filter(|r| r.finest == finest)
+        .and_then(|r| DisplayTile::decode(key, r.error, &r.encoded).ok()))
+}
+
+/// Builds or decodes `task`'s display tile (on a worker): see the module notes.
+fn run_task(task: &Task) -> Outcome {
+    if task.unbuildable {
+        return Outcome::Failed(DisplayError::TooLarge);
+    }
+    let key = task.key;
+    let built = match &task.inputs {
+        TaskInputs::Decode(place) => {
+            return match decode_finer(key, place, task.finest) {
+                Ok(Some(tile)) => Outcome::Decoded(Box::new(tile)),
+                Ok(None) => Outcome::Unreadable,
+                Err(e) => Outcome::Error(e),
+            };
+        }
+        TaskInputs::Display(tiles) => build_from_finer(&task.mesh, key, tiles),
+        TaskInputs::Finest(tiles) => build_from_finest(&task.mesh, key, tiles),
+    };
+    match built {
+        Ok(tile) => Outcome::Built(Box::new(tile)),
+        Err(why) => Outcome::Failed(why),
+    }
+}
+
+/// Builds display tile `key` (one level above the finest) from the finest tiles it reads.
+///
+/// # Errors
+///
+/// [`DisplayError`] if the tile won't build from them (or they don't hold what it reads).
+fn build_from_finest(
+    mesh: &BaseMesh,
+    key: TileKey,
+    tiles: &BTreeMap<TileKey, FinestTile>,
+) -> Result<DisplayTile, DisplayError> {
+    let region = Region::of_tile(&key);
+    let finer = key
+        .level()
+        .child()
+        .ok_or_else(|| DisplayError::NoDisplayLevel(key.level()))?;
+    let fine_side = 2 * region.quads() + 1;
+    let origin = (2 * region.x0(), 2 * region.y0());
+    let positions: BTreeMap<TileKey, &[Vec3]> =
+        tiles.iter().map(|(k, t)| (*k, &*t.positions)).collect();
+    let normals: BTreeMap<TileKey, &[Vec3]> =
+        tiles.iter().map(|(k, t)| (*k, &*t.normals)).collect();
+    let block = block_from(
+        &positions,
+        Channel::DISPLACEMENT,
+        key.face(),
+        finer,
+        origin,
+        fine_side,
+    )
+    .ok_or(DisplayError::Unavailable)?;
+    let source = TileValues::new(Channel::DISPLACEMENT, &normals);
+    let means = mip_normals_tile(mesh, &source, &key);
+    if source.missed.get() {
+        return Err(DisplayError::Unavailable);
+    }
+    build_tile(key, &Grid::new(fine_side, block)?, 0.0, &means?)
+}
+
+/// Builds display tile `key` from the decoded display tiles one level finer it reads.
+///
+/// # Errors
+///
+/// [`DisplayError`] if the tile won't build from them (or they don't hold what it reads).
+fn build_from_finer(
+    mesh: &BaseMesh,
+    key: TileKey,
+    tiles: &BTreeMap<TileKey, Arc<DisplayTile>>,
+) -> Result<DisplayTile, DisplayError> {
+    let region = Region::of_tile(&key);
+    let finer = key
+        .level()
+        .child()
+        .ok_or_else(|| DisplayError::NoDisplayLevel(key.level()))?;
+    let fine_side = 2 * region.quads() + 1;
+    let origin = (2 * region.x0(), 2 * region.y0());
+    // The bound chains from the tiles under it alone; the block reads any tile holding a vertex
+    // of it (one on its edge may come from a neighbour, the same bits there).
+    let bound = tiles
+        .iter()
+        .filter(|(tile, _)| lies_under(Region::of_tile(tile), region))
+        .map(|(_, d)| d.error())
+        .fold(0.0_f32, f32::max);
+    let positions: BTreeMap<TileKey, &[Vec3]> =
+        tiles.iter().map(|(k, d)| (*k, d.positions())).collect();
+    let block = block_from(
+        &positions,
+        Channel::DISPLAY,
+        key.face(),
+        finer,
+        origin,
+        fine_side,
+    )
+    .ok_or(DisplayError::Unavailable)?;
+    let means_of: BTreeMap<TileKey, Vec<Vec3>> =
+        tiles.iter().map(|(k, d)| (*k, d.means())).collect();
+    let means: BTreeMap<TileKey, &[Vec3]> =
+        means_of.iter().map(|(k, m)| (*k, m.as_slice())).collect();
+    let source = TileValues::new(Channel::DISPLAY, &means);
+    let mean_normals = mip_normals_tile(mesh, &source, &key);
+    if source.missed.get() {
+        return Err(DisplayError::Unavailable);
+    }
+    build_tile(key, &Grid::new(fine_side, block)?, bound, &mean_normals?)
+}
+
+/// What the owner found a pending tile to need.
+#[derive(Debug)]
+enum Readiness {
+    /// Everything it reads is there: hand it to a worker.
+    Ready,
+    /// Finest tiles it reads aren't evaluated: evaluate these first.
+    Evaluate(Vec<TileKey>),
+    /// Display tiles one level finer it reads are unknown or still being built: build these
+    /// first (those being built, it waits for).
+    Needs(Vec<TileKey>),
+}
+
+/// What one step of evaluating finest tiles for a job did (see [`TileStore::evaluate_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// It evaluated these many finest tiles, with their normals, and copied them.
+    Evaluated(usize),
+    /// It evaluated a few tiles of their cone.
+    Cone,
+    /// It waits for the corrections it prefetched.
+    Reading,
 }
 
 impl TileStore {
     /// Queues bringing up to date the display tiles under `finest` that writes since made
-    /// unknown, if any are and no job is queued for them.
+    /// unknown: into the refresh already queued (a tile made unknown by several steps is in it
+    /// once, and built once, from what the store holds when it is), else as a new one. Looks
+    /// only when the display book changed since it last did.
     ///
     /// # Errors
     ///
     /// [`CacheError::Eval`] if settling the writes fails (never, for tiles of the store's
     /// mesh).
     fn queue_refresh(&mut self, finest: Level) -> Result<(), CacheError> {
-        if !self.jobs.is_empty() {
+        self.display.settle(&self.mesh, &self.deps)?;
+        let changes = self.display.changes();
+        if changes == self.refresh_seen {
             return Ok(());
         }
-        self.display.settle(&self.mesh, &self.deps)?;
+        self.refresh_seen = changes;
         let unknown: Vec<TileKey> = self
             .display
             .unknown_keys()
             .into_iter()
             .filter(|key| !self.has_failed(key))
             .collect();
-        if !unknown.is_empty() {
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        if let Some(Job::Refresh(upkeep)) = self
+            .jobs
+            .iter_mut()
+            .find(|job| matches!(job, Job::Refresh(_)))
+        {
+            for key in unknown {
+                if !upkeep.in_flight.contains_key(&key) {
+                    upkeep.push(key);
+                }
+            }
+        } else {
             self.jobs
                 .push_back(Job::Refresh(Upkeep::new(finest, unknown)));
         }
@@ -181,25 +424,50 @@ impl TileStore {
         let Some(finest) = self.display_finest else {
             return;
         };
-        let unknown_len = crate::file::unknown_display_len();
         let missing: Vec<TileKey> = self
             .all_display_keys(finest)
             .into_iter()
-            .filter(|key| {
-                let loc = self
-                    .file
-                    .locate(key)
-                    .or_else(|| self.base.as_ref().and_then(|b| b.locate(key)));
-                match self.display.kept(key) {
-                    Some(crate::bounds::Kept::Unknown) => true,
-                    Some(_) => false,
-                    None => loc.is_none_or(|loc| Some(loc.len()) == unknown_len),
-                }
-            })
+            .filter(|key| self.where_held(key).is_none())
             .collect();
         if !missing.is_empty() {
             self.jobs
                 .push_back(Job::Rebuild(Upkeep::new(finest, missing)));
+        }
+    }
+
+    /// Where the store holds `key`'s display tile as known, without reading it: its record in
+    /// the book, or (where the book doesn't say) a record in the files that isn't an unknown
+    /// one (told by its length). `None` if it doesn't.
+    fn where_held(&self, key: &TileKey) -> Option<Finer> {
+        match self.display.kept(key) {
+            Some(Kept::Known(record)) => Some(Finer::Record(record.clone())),
+            Some(Kept::Unknown) => None,
+            Some(Kept::Written) | None => {
+                let unknown_len = unknown_display_len();
+                let known = |loc: &Loc| Some(loc.len()) != unknown_len;
+                if let Some(loc) = self.file.locate(key) {
+                    return known(&loc).then(|| Finer::File(self.file.reader(), loc));
+                }
+                let base = self.base.as_ref()?;
+                let loc = base.locate(key)?;
+                known(&loc).then(|| Finer::File(base.reader(), loc))
+            }
+        }
+    }
+
+    /// Whether the store holds `key`'s display tile as known (see [`TileStore::where_held`]),
+    /// without copying or reading anything.
+    fn held(&self, key: &TileKey) -> bool {
+        match self.display.kept(key) {
+            Some(Kept::Known(_)) => true,
+            Some(Kept::Unknown) => false,
+            Some(Kept::Written) | None => {
+                let unknown_len = unknown_display_len();
+                self.file
+                    .locate(key)
+                    .or_else(|| self.base.as_ref().and_then(|b| b.locate(key)))
+                    .is_some_and(|loc| Some(loc.len()) != unknown_len)
+            }
         }
     }
 
@@ -227,16 +495,23 @@ impl TileStore {
         self.jobs.push_back(Job::Rebuild(Upkeep::new(finest, keys)));
     }
 
-    /// Runs the queued jobs in slices until `deadline` (and, for a store keeping a display
-    /// layer, queues a refresh first when writes left display tiles unknown). Each job keeps its
-    /// place; the next call goes on from there. A slice is bounded (one display tile built, or
-    /// a few finest tiles evaluated for one), so the deadline is honoured to within one slice.
+    /// Runs the queued jobs until `deadline` (and, for a store keeping a display layer, first
+    /// adds the display tiles writes left unknown to its refresh). Each job keeps its place; the
+    /// next call goes on from there.
+    ///
+    /// The display tiles are built on the store's workers; the owner thread runs short slices
+    /// that collect and record what they finished, hand them more, or evaluate a few finest
+    /// tiles, so the deadline is honoured to within one slice ([`JobsReport::longest_slice`]).
+    /// With nothing to do but wait for the workers, it waits, until a tile is finished or the
+    /// deadline passes. A tile the workers built from inputs a write has since changed is built
+    /// again.
     ///
     /// # Errors
     ///
     /// [`CacheError::Eval`] if listing what a write made stale fails (never, for tiles of the
-    /// store's mesh); [`CacheError::Display`] if a display tile won't build; the errors of
-    /// [`TileStore::evaluate_many`]. The job stays queued, at the tile that failed.
+    /// store's mesh); [`CacheError::Store`] if a display record can't be read; the errors of
+    /// [`TileStore::evaluate_many`]. The job stays queued, its tiles still to build. A tile that
+    /// won't build is no error: it is reported and skipped ([`TileStore::failed_display`]).
     pub fn run_jobs(&mut self, deadline: Instant) -> Result<JobsReport, CacheError> {
         let mut report = JobsReport::default();
         if let Some(finest) = self.display_finest {
@@ -248,16 +523,39 @@ impl TileStore {
             };
             let began = Instant::now();
             let progress = self.slice(&mut job, &mut report);
-            report.longest_slice = report.longest_slice.max(began.elapsed());
+            let took = began.elapsed();
+            report.longest_slice = report.longest_slice.max(took);
+            if took > crate::jobs::SLICE_TARGET {
+                report.long_slices += 1;
+            }
+            report.slices += 1;
             match progress {
                 Ok(Progress::Done) => report.finished += 1,
                 Ok(Progress::More) => self.jobs.push_front(job),
+                Ok(wait @ (Progress::Waiting | Progress::Reading)) => {
+                    // Waiting on the workers, until one finishes a tile; on reads, a moment
+                    // (they land in the store, not on the channel), or until a tile is back.
+                    let until = deadline
+                        .checked_sub(crate::jobs::WAKE_MARGIN)
+                        .unwrap_or(deadline);
+                    let until = if wait == Progress::Reading {
+                        until.min(Instant::now() + crate::jobs::READ_WAIT)
+                    } else {
+                        until
+                    };
+                    job.upkeep().wait_until(until);
+                    self.jobs.push_front(job);
+                    if deadline.saturating_duration_since(Instant::now())
+                        <= crate::jobs::WAKE_MARGIN
+                    {
+                        break;
+                    }
+                }
                 Err(e) => {
                     self.jobs.push_front(job);
                     return Err(e);
                 }
             }
-            report.slices += 1;
         }
         report.left = self.jobs.iter().map(Job::left).sum();
         Ok(report)
@@ -275,105 +573,500 @@ impl TileStore {
         self.jobs.push_back(Job::Rebuild(Upkeep::new(finest, keys)));
     }
 
-    /// Drops every queued job, where it is: what they had built stays.
+    /// Drops every queued job, where it is: what they had built stays. Tiles the workers are
+    /// building are dropped when they finish.
     pub fn clear_jobs(&mut self) {
         self.jobs.clear();
     }
 
-    /// Whether any job is queued.
+    /// Whether any job is queued (tiles still to build, or being built).
     #[must_use]
     pub fn has_jobs(&self) -> bool {
         !self.jobs.is_empty()
     }
 
-    /// One slice of `job`: builds its next display tile, or evaluates a batch of the finest
-    /// tiles that one reads, or queues the finer display tiles it needs first.
+    /// One slice of `job`: records what the workers finished, hands them the next tiles whose
+    /// inputs the store holds (up to two a worker in flight), and, if it could hand them none,
+    /// evaluates a few of the finest tiles those read.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::run_jobs`]; the tile stays to build.
+    /// As [`TileStore::run_jobs`]; the tiles stay to build.
     fn slice(&mut self, job: &mut Job, report: &mut JobsReport) -> Result<Progress, CacheError> {
+        self.display.settle(&self.mesh, &self.deps)?;
         let upkeep = job.upkeep();
-        let finest = upkeep.finest;
-        let Some(key) = upkeep.next() else {
-            return Ok(Progress::Done);
-        };
-        let known = match self.knows_display(&key) {
-            Ok(known) => known,
-            Err(e) => {
-                upkeep.push(key);
-                return Err(e);
-            }
-        };
-        if known || self.has_failed(&key) {
-            return Ok(if upkeep.is_empty() {
-                Progress::Done
-            } else {
-                Progress::More
-            });
-        }
-        upkeep.scratch.begin(key, self.edits);
-        match self.try_build_display(key, finest, &upkeep.scratch) {
-            Ok(Attempt::Built(tile)) => {
-                upkeep.scratch.clear();
-                if let Err(e) = self.record_display(std::slice::from_ref(&*tile)) {
-                    upkeep.push(key);
-                    return Err(e);
-                }
-                // A slice is an operation: its display tile is an epoch of its own.
-                self.close_epoch()?;
-                report.built += 1;
-            }
-            Ok(Attempt::Evaluate(keys, what)) => {
-                let batch: Vec<TileKey> = keys.into_iter().take(EVALUATE_BATCH).collect();
-                upkeep.push(key);
-                self.evaluate_many(&batch, what)?;
-                // Copied now, while cached: a later batch may evict them before the tile builds.
-                for tile in &batch {
-                    let positions = match self.cached_positions(tile) {
-                        Some(p) => p.to_vec(),
-                        None => self.evaluate(*tile)?.to_vec(),
-                    };
-                    upkeep.scratch.positions.insert(*tile, positions);
-                    if what == Evaluation::Normals {
-                        let normals = match self.cached_normals(tile) {
-                            Some(n) => n.to_vec(),
-                            None => self.normals(*tile)?.to_vec(),
-                        };
-                        upkeep.scratch.normals.insert(*tile, normals);
-                    }
-                }
-                report.evaluated += batch.len();
-            }
-            Ok(Attempt::Needs(keys)) => {
-                // A tile reading one that wouldn't build can't build either, until a change.
-                if let Some(why) = keys.iter().find_map(|dep| self.failure(dep)) {
-                    self.fail_display(key, why);
-                    report.failed += 1;
+        // The finest copies a change outdated (any of them, C2) are freed on the workers: tens
+        // of megabytes, at worst. Decoded display tiles stay: a record is only replaced by a
+        // build, which its generation tells.
+        if let Some(copies) = upkeep.copies.since(self.edits)
+            && !copies.is_empty()
+        {
+            let mut rest = Vec::new();
+            for (_, tile) in copies {
+                if upkeep.spare_full() {
+                    rest.push(tile);
                 } else {
-                    upkeep.push(key);
-                    for dep in keys {
-                        upkeep.push(dep);
-                    }
+                    upkeep.recycle(tile);
                 }
             }
-            Err(CacheError::Display(why)) => {
-                // This tile won't build from what the store holds: unknown, and skipped, so
-                // one tile never holds up the rest.
-                upkeep.scratch.clear();
-                self.fail_display(key, why);
-                report.failed += 1;
+            if !rest.is_empty() {
+                self.workers.spawn(move || drop(rest));
             }
-            Err(e) => {
-                upkeep.push(key);
-                return Err(e);
+        }
+        let collected = self.collect(upkeep, report)?;
+        let workers = self.workers.current_num_threads().max(1);
+        // A quarter of the workers (one, at least) are left free of display tiles, for the
+        // evaluation a slice asks of the pool: a round finding none idle would wait for a
+        // display tile to finish, and the owner thread with it.
+        let reserve = (workers / 4).max(1);
+        let room = workers
+            .saturating_sub(reserve)
+            .max(1)
+            .saturating_sub(upkeep.busy());
+        let (handed, evaluate) = self.dispatch(upkeep, room, report);
+        let mut reading = false;
+        let evaluated = handed == 0 && !evaluate.is_empty();
+        if evaluated {
+            // The evaluation runs on the workers not building display tiles (one, at least).
+            let free = workers.saturating_sub(upkeep.busy()).max(1);
+            let round = upkeep.round_size(free);
+            let evaluate: BTreeSet<TileKey> = evaluate.into_iter().take(round).collect();
+            match self.evaluate_for(upkeep, &evaluate, round)? {
+                Step::Evaluated(n) => report.evaluated += n,
+                Step::Cone => {}
+                Step::Reading => reading = true,
             }
         }
         Ok(if upkeep.is_empty() {
             Progress::Done
+        } else if reading && collected == 0 {
+            Progress::Reading
+        } else if collected == 0 && handed == 0 && !evaluated && upkeep.busy() > 0 {
+            Progress::Waiting
         } else {
             Progress::More
         })
+    }
+
+    /// Records the tiles the workers finished since the last slice, as one epoch, and keeps them
+    /// (and the finer tiles they decoded) for the level above; puts back the ones built from
+    /// inputs a change has since outdated, and those whose inputs turned out short; marks failed
+    /// those that won't build. Returns how many finished.
+    ///
+    /// # Errors
+    ///
+    /// The first [`CacheError::Store`] a worker met, or the errors of
+    /// [`TileStore::record_display`]: the tiles are put back.
+    fn collect(
+        &mut self,
+        upkeep: &mut Upkeep,
+        report: &mut JobsReport,
+    ) -> Result<usize, CacheError> {
+        let mut finished = std::mem::take(&mut upkeep.received);
+        finished.extend(upkeep.receiver.try_iter());
+        let count = finished.len();
+        let mut built = Vec::new();
+        let mut error = None;
+        for done in finished {
+            let ours = if done.decode {
+                upkeep.decoding.remove(&done.key)
+            } else {
+                upkeep.in_flight.remove(&done.key).is_some()
+            };
+            if !ours {
+                continue;
+            }
+            if done.decode && done.record != self.display_generation(&done.key) {
+                // Decoded from a record since replaced: decoded again when a tile reads it.
+                continue;
+            }
+            if !done.decode && done.as_of != self.edits {
+                // Built from inputs a change has outdated since: built again.
+                upkeep.push(done.key);
+                continue;
+            }
+            match done.outcome {
+                Outcome::Built(tile) => built.push(*tile),
+                Outcome::Decoded(tile) => {
+                    self.display_decoded
+                        .insert(*tile.key(), (done.record, Arc::new(*tile)));
+                }
+                Outcome::Unreadable => {
+                    // A record the files hold that doesn't read: unknown, so it is rebuilt.
+                    self.display.set(done.key, None);
+                    upkeep.push(done.key);
+                }
+                Outcome::Failed(why) => {
+                    // This tile won't build from what the store holds: unknown, and skipped, so
+                    // one tile never holds up the rest.
+                    self.fail_display(done.key, why);
+                    report.failed += 1;
+                }
+                Outcome::Error(e) => {
+                    upkeep.push(done.key);
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        if !built.is_empty() {
+            if let Err(e) = self.record_display(&built) {
+                for tile in &built {
+                    upkeep.push(*tile.key());
+                }
+                return Err(e);
+            }
+            report.built += built.len();
+            // A slice is an operation: its display tiles are one epoch.
+            self.close_epoch()?;
+            for tile in built {
+                let record = self.display_generation(tile.key());
+                self.display_decoded
+                    .insert(*tile.key(), (record, Arc::new(tile)));
+            }
+        }
+        error.map_or(Ok(count), Err)
+    }
+
+    /// Hands the workers up to `room` pending tiles whose inputs the store holds; returns how
+    /// many it handed, and the finest tiles to evaluate for those it couldn't (all one tile
+    /// lacks, and others' only while they stay few). Looks at a bounded number of tiles.
+    fn dispatch(
+        &mut self,
+        upkeep: &mut Upkeep,
+        room: usize,
+        report: &mut JobsReport,
+    ) -> (usize, BTreeSet<TileKey>) {
+        let finest = upkeep.finest;
+        let mut handed = 0;
+        let mut evaluate: BTreeSet<TileKey> = BTreeSet::new();
+        let mut later: Vec<TileKey> = Vec::new();
+        let mut looked = 0;
+        let mut allowance = COPY_BATCH;
+        let began = Instant::now();
+        while handed < room && looked < LOOK_AHEAD * room.max(1) && began.elapsed() < HAND_OUT_TIME
+        {
+            let Some(key) = upkeep.next() else {
+                break;
+            };
+            looked += 1;
+            if upkeep.in_flight.contains_key(&key) || self.has_failed(&key) || self.held(&key) {
+                // Built, being built, or failed.
+                continue;
+            }
+            let Some(reads) = tent_reads(&self.mesh, &key) else {
+                continue;
+            };
+            match self.readiness(&key, &reads, upkeep) {
+                Readiness::Ready if key.level().child() == Some(finest) => {
+                    let Some(inputs) = self.finest_inputs(&reads, upkeep, &mut allowance) else {
+                        later.push(key);
+                        if allowance == 0 {
+                            // This slice's copies are made: the tiles after it wait too.
+                            break;
+                        }
+                        continue;
+                    };
+                    self.hand_out(key, inputs, upkeep);
+                    handed += 1;
+                }
+                Readiness::Ready => {
+                    // The finer tiles it reads, decoded each once for every tile reading them.
+                    let missing = match self.decoded_inputs(&reads) {
+                        Ok(inputs) => {
+                            self.hand_out(key, inputs, upkeep);
+                            handed += 1;
+                            continue;
+                        }
+                        Err(missing) => missing,
+                    };
+                    later.push(key);
+                    let mut asked = false;
+                    for tile in missing {
+                        if handed >= room || upkeep.decoding.contains(&tile) {
+                            continue;
+                        }
+                        if let Some(place) = self.where_held(&tile) {
+                            self.hand_out(tile, TaskInputs::Decode(place), upkeep);
+                            handed += 1;
+                            asked = true;
+                        }
+                    }
+                    if !asked && handed < room {
+                        // It waits for tiles being decoded, and so, coming in order, do most
+                        // tiles after it.
+                        break;
+                    }
+                }
+                Readiness::Evaluate(missing) => {
+                    later.push(key);
+                    let fits = evaluate
+                        .iter()
+                        .chain(&missing)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        <= crate::jobs::ROUND_MAX;
+                    if evaluate.is_empty() || fits {
+                        evaluate.extend(missing);
+                    } else {
+                        // Enough to evaluate: the tiles after it wait for the next slices.
+                        break;
+                    }
+                }
+                Readiness::Needs(needs) => {
+                    // A tile reading one that wouldn't build can't build either, until a change.
+                    if let Some(why) = needs.iter().find_map(|dep| self.failure(dep)) {
+                        self.fail_display(key, why);
+                        report.failed += 1;
+                        continue;
+                    }
+                    later.push(key);
+                    let waiting = needs.iter().all(|need| upkeep.in_flight.contains_key(need));
+                    for need in needs {
+                        if !upkeep.in_flight.contains_key(&need) {
+                            later.push(need);
+                        }
+                    }
+                    if waiting {
+                        // It waits for tiles the workers are building, and so, the tiles coming
+                        // finest first, do those after it: none is looked at again until they
+                        // are back.
+                        break;
+                    }
+                }
+            }
+        }
+        for key in later {
+            upkeep.push(key);
+        }
+        let evaluate = evaluate.into_iter().take(crate::jobs::ROUND_MAX).collect();
+        (handed, evaluate)
+    }
+
+    /// The decoded display tiles of `reads` (display tiles one level finer), for a worker
+    /// building the tile above them.
+    ///
+    /// # Errors
+    ///
+    /// Those of `reads` not decoded as their records now are: to decode first.
+    fn decoded_inputs(&self, reads: &BTreeSet<TileKey>) -> Result<TaskInputs, Vec<TileKey>> {
+        let current = |t: &TileKey| {
+            self.display_decoded
+                .tiles
+                .get(t)
+                .filter(|(record, _)| *record == self.display_generation(t))
+        };
+        let missing: Vec<TileKey> = reads
+            .iter()
+            .filter(|t| current(t).is_none())
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return Err(missing);
+        }
+        Ok(TaskInputs::Display(
+            reads
+                .iter()
+                .filter_map(|t| Some((*t, Arc::clone(&current(t)?.1))))
+                .collect(),
+        ))
+    }
+
+    /// Hands display tile `key` to a worker, to build or decode with `inputs`, as of the store's
+    /// count of correction changes now.
+    fn hand_out(&self, key: TileKey, inputs: TaskInputs, upkeep: &mut Upkeep) {
+        let decode = matches!(inputs, TaskInputs::Decode(_));
+        if decode {
+            upkeep.decoding.insert(key);
+        } else {
+            upkeep.in_flight.insert(key, self.edits);
+        }
+        #[cfg_attr(not(test), expect(unused_mut, reason = "only the tests' hook sets it"))]
+        let mut task = Task {
+            key,
+            as_of: self.edits,
+            record: self.display_generation(&key),
+            mesh: Arc::clone(&self.mesh),
+            finest: upkeep.finest,
+            inputs,
+            unbuildable: false,
+        };
+        #[cfg(test)]
+        {
+            task.unbuildable = !decode && self.hooks.unbuildable_display == Some(key);
+        }
+        let sender = upkeep.sender.clone();
+        self.workers.spawn(move || {
+            let outcome = run_task(&task);
+            // The job may be gone (cleared): then nobody wants the tile.
+            drop(sender.send(Finished {
+                key: task.key,
+                as_of: task.as_of,
+                record: task.record,
+                decode,
+                outcome,
+            }));
+        });
+    }
+
+    /// Whether everything display tile `key`, which reads `reads` (see [`tent_reads`]), needs is
+    /// there (see [`Readiness`]): the finest tiles it reads, cached or copied, one level above
+    /// the finest; else the display tiles it reads, known and not being rebuilt.
+    fn readiness(&self, key: &TileKey, reads: &BTreeSet<TileKey>, upkeep: &Upkeep) -> Readiness {
+        if key.level().child() == Some(upkeep.finest) {
+            let missing: Vec<TileKey> = reads
+                .iter()
+                .filter_map(|t| TileKey::displacement(t.face(), t.level(), t.tx(), t.ty()).ok())
+                .filter(|t| {
+                    !upkeep.copies.tiles.contains_key(t) && self.cached_normals(t).is_none()
+                })
+                .collect();
+            if missing.is_empty() {
+                Readiness::Ready
+            } else {
+                Readiness::Evaluate(missing)
+            }
+        } else {
+            let needs: Vec<TileKey> = reads
+                .iter()
+                .filter(|t| upkeep.in_flight.contains_key(t) || !self.held(t))
+                .copied()
+                .collect();
+            if needs.is_empty() {
+                Readiness::Ready
+            } else {
+                Readiness::Needs(needs)
+            }
+        }
+    }
+
+    /// The finest tiles in `reads` (display keys one level finer: the finest), copied for a
+    /// worker from `upkeep`'s copies or the store's cache (copying those into `upkeep` once, at
+    /// most `allowance` of them, which it counts down); `None` if one isn't there, or the
+    /// allowance ran out first (the copies made so far stay).
+    fn finest_inputs(
+        &self,
+        reads: &BTreeSet<TileKey>,
+        upkeep: &mut Upkeep,
+        allowance: &mut usize,
+    ) -> Option<TaskInputs> {
+        let mut tiles = BTreeMap::new();
+        for t in reads {
+            let Ok(key) = TileKey::displacement(t.face(), t.level(), t.tx(), t.ty()) else {
+                continue;
+            };
+            if !upkeep.copies.tiles.contains_key(&key) {
+                *allowance = allowance.checked_sub(1)?;
+                let positions = self.cached_positions(&key)?;
+                let normals = self.cached_normals(&key)?;
+                upkeep.copy_finest(key, positions, normals);
+            }
+            tiles.insert(key, upkeep.copies.tiles.get(&key)?.clone());
+        }
+        Some(TaskInputs::Finest(tiles))
+    }
+
+    /// Evaluates the finest tiles of `evaluate` (with their normals, on the workers) a step at a
+    /// time, and copies them for the workers building the display tiles that read them.
+    ///
+    /// A step evaluates at most `round` tiles of the coarsest level of their cone (the positions
+    /// their normals read, and the tiles those are predicted from) that isn't current, so one
+    /// slice runs one round of evaluation however cold the cone. The corrections of that level
+    /// are prefetched first, and only tiles whose corrections are resident (or that have none)
+    /// are evaluated, so a slice never waits on the disk; with none ready and reads in flight,
+    /// it waits for them ([`Step::Reading`]). Once the whole cone is current, it computes their
+    /// normals. A step that would evaluate a tile an earlier step of this cone already did (a
+    /// budget too small to keep the cone cached between slices) evaluates them whole instead,
+    /// so the work always ends.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`] and [`TileStore::prefetch`].
+    fn evaluate_for(
+        &mut self,
+        upkeep: &mut Upkeep,
+        evaluate: &BTreeSet<TileKey>,
+        round: usize,
+    ) -> Result<Step, CacheError> {
+        // The tiles a cone is being stepped through for stay the ones evaluated until it is
+        // done, so a step never starts over.
+        let keys: Vec<TileKey> = match &upkeep.cone {
+            Some(cone) if cone.as_of == self.edits => cone.keys.clone(),
+            _ => {
+                let keys: Vec<TileKey> = evaluate.iter().copied().collect();
+                let levels = self.normals_cone(&keys)?;
+                upkeep.cone = Some(Cone {
+                    keys: keys.clone(),
+                    levels,
+                    as_of: self.edits,
+                });
+                upkeep.cone_seen.clear();
+                keys
+            }
+        };
+        let mut coarsest = None;
+        if let Some(Cone { levels: cone, .. }) = &upkeep.cone {
+            for level in cone {
+                let stale: Vec<TileKey> = level
+                    .iter()
+                    .copied()
+                    .filter(|key| !self.is_current(key))
+                    .collect();
+                if !stale.is_empty() {
+                    coarsest = Some(stale);
+                    break;
+                }
+            }
+        }
+        if let Some(stale) = coarsest
+            && !stale.iter().any(|key| upkeep.cone_seen.contains(key))
+        {
+            self.prefetch(
+                stale
+                    .get(..stale.len().min(PREFETCH_AHEAD))
+                    .unwrap_or_default(),
+            )?;
+            self.poll()?;
+            let mut ready: Vec<TileKey> = stale
+                .iter()
+                .filter(|key| self.corrections.find(key).is_some() || self.locate(key).is_none())
+                .take(round.max(1))
+                .copied()
+                .collect();
+            if ready.is_empty() {
+                if self.prefetching() > 0 {
+                    return Ok(Step::Reading);
+                }
+                // The reads landed and weren't kept (no room for them): read one here.
+                ready.extend(stale.first());
+            }
+            let t0 = Instant::now();
+            self.evaluate_many(&ready, Evaluation::Positions)?;
+            upkeep.took(t0.elapsed(), ready.len());
+            upkeep.cone_seen.extend(ready);
+            return Ok(Step::Cone);
+        }
+        upkeep.cone = None;
+        upkeep.cone_seen.clear();
+        let t0 = Instant::now();
+        self.evaluate_many(&keys, Evaluation::Normals)?;
+        upkeep.took(t0.elapsed(), keys.len());
+        // Copied now, while cached: a later batch may evict them before their tiles are handed
+        // out.
+        for tile in &keys {
+            if self.cached_positions(tile).is_none() {
+                self.evaluate(*tile)?;
+            }
+            if self.cached_normals(tile).is_none() {
+                self.normals(*tile)?;
+            }
+            // Both cached now: the normals are computed with the positions pinned.
+            if let (Some(positions), Some(normals)) =
+                (self.cached_positions(tile), self.cached_normals(tile))
+            {
+                upkeep.copy_finest(*tile, positions, normals);
+            }
+        }
+        Ok(Step::Evaluated(keys.len()))
     }
 
     /// Why display tile `key` wouldn't build, if it failed since the last correction change.
@@ -405,199 +1098,5 @@ impl TileStore {
             .filter(|(_, (at, _))| *at == self.edits)
             .map(|(&key, &(_, why))| (key, why))
             .collect()
-    }
-
-    /// Builds display tile `key` (a level below `finest`) from what the store holds, or says
-    /// what it lacks (see the module notes).
-    ///
-    /// # Errors
-    ///
-    /// [`CacheError::Display`] if the tile won't build from its inputs; [`CacheError::Store`]
-    /// if a display record can't be read.
-    fn try_build_display(
-        &mut self,
-        key: TileKey,
-        finest: Level,
-        scratch: &FinestScratch,
-    ) -> Result<Attempt, CacheError> {
-        #[cfg(test)]
-        if self.hooks.unbuildable_display == Some(key) {
-            return Err(DisplayError::TooLarge.into());
-        }
-        let level = key.level();
-        let finer = level.child().ok_or(DisplayError::NoDisplayLevel(level))?;
-        let shift = finest.get() - level.get();
-        let region = Region::of_tile(&key);
-        let face = key.face();
-        // The finest tiles whose positions the tile reads: those under it, and, when its finer
-        // level is the finest, its normals' apron on its own face too.
-        let span = |v: u32| v << shift;
-        let apron = u32::from(finer == finest);
-        let n = finest.face_quads();
-        let xs = (
-            span(region.x0()).saturating_sub(apron),
-            (span(region.x0() + region.quads()) + apron).min(n),
-        );
-        let ys = (
-            span(region.y0()).saturating_sub(apron),
-            (span(region.y0() + region.quads()) + apron).min(n),
-        );
-        // Normals only where its own means read the finest level.
-        let what = if finer == finest {
-            Evaluation::Normals
-        } else {
-            Evaluation::Positions
-        };
-        let missing: Vec<TileKey> = finest_tiles(face, finest, xs, ys)
-            .into_iter()
-            .filter(|t| match what {
-                Evaluation::Normals => {
-                    self.cached_normals(t).is_none() && !scratch.normals.contains_key(t)
-                }
-                Evaluation::Positions => {
-                    self.cached_positions(t).is_none() && !scratch.positions.contains_key(t)
-                }
-            })
-            .collect();
-        if !missing.is_empty() {
-            return Ok(Attempt::Evaluate(missing, what));
-        }
-        let finest_at = |x: u32, y: u32| -> Option<Vec3> {
-            let (tile, index) = containing(Channel::DISPLACEMENT, face, finest, x, y)?;
-            self.cached_positions(&tile)
-                .or_else(|| scratch.positions.get(&tile).map(Vec::as_slice))?
-                .get(index)
-                .copied()
-        };
-        let side = key.side();
-        let exact = (0..side)
-            .flat_map(|j| (0..side).map(move |i| (i, j)))
-            .map(|(i, j)| finest_at(span(region.x0() + i), span(region.y0() + j)))
-            .collect::<Option<Vec<Vec3>>>()
-            .ok_or(DisplayError::Unavailable)?;
-        let exact = Grid::new(side, exact)?;
-        let fine_side = 2 * region.quads() + 1;
-        let (finer_block, children_bound, means) = if finer == finest {
-            let block = (0..fine_side)
-                .flat_map(|j| (0..fine_side).map(move |i| (i, j)))
-                .map(|(i, j)| finest_at(2 * region.x0() + i, 2 * region.y0() + j))
-                .collect::<Option<Vec<Vec3>>>()
-                .ok_or(DisplayError::Unavailable)?;
-            let source = FinestNormals {
-                store: self,
-                normals: &scratch.normals,
-                misses: RefCell::new(BTreeSet::new()),
-            };
-            let means = mip_normals_tile(&self.mesh, &source, &key);
-            let misses = source.misses.into_inner();
-            if !misses.is_empty() {
-                return Ok(Attempt::Evaluate(
-                    misses.into_iter().collect(),
-                    Evaluation::Normals,
-                ));
-            }
-            (Grid::new(fine_side, block)?, 0.0, means?)
-        } else {
-            match self.finer_display(&key, finer)? {
-                Ok(inputs) => inputs,
-                Err(needs) => return Ok(Attempt::Needs(needs)),
-            }
-        };
-        Ok(Attempt::Built(Box::new(build_tile(
-            key,
-            &exact,
-            &finer_block,
-            children_bound,
-            &means,
-        )?)))
-    }
-
-    /// The inputs of display tile `key` one level finer (`finer`, not the finest): the decoded
-    /// positions of the display tiles under it, their largest bound, and its means from the
-    /// display tiles around it, its neighbours' included. `Err` with the display tiles of
-    /// `finer` it reads that are unknown.
-    ///
-    /// # Errors
-    ///
-    /// [`CacheError::Display`] if the tiles don't fit; [`CacheError::Store`] if a record can't
-    /// be read.
-    #[expect(
-        clippy::type_complexity,
-        reason = "one call's result: the three inputs, or the tiles still needed"
-    )]
-    fn finer_display(
-        &mut self,
-        key: &TileKey,
-        finer: Level,
-    ) -> Result<Result<(Grid, f32, MeanNormals), Vec<TileKey>>, CacheError> {
-        let region = Region::of_tile(key);
-        let children = tiles_under(region, finer);
-        let mut loaded: BTreeMap<TileKey, DisplayTile> = BTreeMap::new();
-        let mut needs = Vec::new();
-        for child in &children {
-            match self
-                .stored_display(std::slice::from_ref(child))?
-                .pop()
-                .flatten()
-            {
-                Some(tile) => {
-                    loaded.insert(*child, tile);
-                }
-                None => needs.push(*child),
-            }
-        }
-        if !needs.is_empty() {
-            return Ok(Err(needs));
-        }
-        let fine_side = 2 * region.quads() + 1;
-        let mut block = vec![Vec3::ZERO; usize::try_from(fine_side * fine_side).unwrap_or(0)];
-        let mut bound = 0.0_f32;
-        for tile in loaded.values() {
-            bound = bound.max(tile.error());
-            let at = Region::of_tile(tile.key());
-            let tile_side = tile.key().side();
-            for (index, &p) in tile.positions().iter().enumerate() {
-                let index = u32::try_from(index).unwrap_or(u32::MAX);
-                let x = at.x0() + index % tile_side - 2 * region.x0();
-                let y = at.y0() + index / tile_side - 2 * region.y0();
-                if let Some(slot) = usize::try_from(y * fine_side + x)
-                    .ok()
-                    .and_then(|i| block.get_mut(i))
-                {
-                    *slot = p;
-                }
-            }
-        }
-        // The means: the tiles under it, then whatever the tent reads around it, loaded as the
-        // mip asks for them.
-        let mut means_of: BTreeMap<TileKey, Vec<Vec3>> =
-            loaded.iter().map(|(k, t)| (*k, t.means())).collect();
-        loop {
-            let source = DisplayMeans {
-                tiles: &means_of,
-                misses: RefCell::new(BTreeSet::new()),
-            };
-            let means = mip_normals_tile(&self.mesh, &source, key);
-            let misses = source.misses.into_inner();
-            if misses.is_empty() {
-                return Ok(Ok((Grid::new(fine_side, block)?, bound, means?)));
-            }
-            let mut unknown = Vec::new();
-            for miss in misses {
-                match self
-                    .stored_display(std::slice::from_ref(&miss))?
-                    .pop()
-                    .flatten()
-                {
-                    Some(tile) => {
-                        means_of.insert(miss, tile.means());
-                    }
-                    None => unknown.push(miss),
-                }
-            }
-            if !unknown.is_empty() {
-                return Ok(Err(unknown));
-            }
-        }
     }
 }

@@ -68,6 +68,7 @@ fn run_jobs_honours_its_deadline_within_one_slice() {
     let mut store = display_store(&dir, &mesh);
     let budget = Duration::from_micros(300);
     let mut calls = 0;
+    let began = Instant::now();
     while store.has_jobs() {
         let start = Instant::now();
         let report = store.run_jobs(start + budget).unwrap();
@@ -78,7 +79,12 @@ fn run_jobs_honours_its_deadline_within_one_slice() {
             report.longest_slice
         );
         calls += 1;
-        assert!(calls < 100_000, "the rebuild ends");
+        // A call shorter than a wait for the workers can take returns at once, so the calls
+        // are counted in time, not number.
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the rebuild ends"
+        );
     }
     assert!(calls > 1, "a rebuild takes many short calls: {calls}");
     assert_layer_current(&mut store, "rebuilt in slices");
@@ -281,18 +287,23 @@ fn edits_between_slices_never_leave_a_tile_built_from_stale_copies() {
     let config = display.with_budget_bytes(display.budget_bytes + display.floor_bytes(&mesh));
     let mut store = new_store(&dir, "work.bcp", &mesh, config);
     let mut map = CorrectionMap::new();
-    let (mut calls, mut edits) = (0_u32, 0_u32);
+    let mut edits = 0_u32;
+    let began = Instant::now();
     while store.has_jobs() {
         store
             .run_jobs(Instant::now() + Duration::from_micros(200))
             .unwrap();
-        calls += 1;
-        assert!(calls < 200_000, "the rebuild ends");
+        // A call shorter than a wait for the workers can take returns at once, so the calls
+        // are counted in time, not number.
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the rebuild ends"
+        );
         // A finest tile the job in progress has copied, if any.
         let copied = store
             .jobs
             .front_mut()
-            .and_then(|job| job.upkeep().scratch.positions.keys().next().copied());
+            .and_then(|job| job.upkeep().copies.tiles.keys().next().copied());
         let Some(tile) = copied.filter(|_| edits < 12) else {
             continue;
         };

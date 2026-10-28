@@ -104,3 +104,61 @@ fn reaching_by_runs_matches_reaching_one_vertex_at_a_time() {
         }
     }
 }
+
+/// A source that gives every vertex and notes the tile of each it is asked for.
+struct Recording {
+    /// The display tiles read.
+    read: std::cell::RefCell<BTreeSet<TileKey>>,
+}
+
+impl geom::PositionSource for Recording {
+    fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<geom::Vec3> {
+        let (key, _, _) = TileKey::containing(LayerId::BASE, Channel::DISPLAY, face, level, i, j)?;
+        self.read.borrow_mut().insert(key);
+        Some(geom::Vec3::new(0.0, 0.0, 1.0))
+    }
+}
+
+/// [`tent_reads`] holds every tile one level finer that a display tile's mip reads, and the
+/// tiles under it, for every display tile of meshes with base vertices of valence 3, 4 and 5.
+#[test]
+fn tent_reads_hold_everything_a_tile_reads() {
+    use crate::fixture::{TOP, level, split_prism, tiles};
+    let meshes = [(*crate::fixture::mesh()).clone(), split_prism(5)];
+    for (m, mesh) in meshes.iter().enumerate() {
+        for k in tiles(mesh, 0, TOP - 1) {
+            let key = TileKey::display(k.face(), k.level(), k.tx(), k.ty()).unwrap();
+            let reads = tent_reads(mesh, &key).unwrap();
+            let source = Recording {
+                read: std::cell::RefCell::new(BTreeSet::new()),
+            };
+            geom::mip_normals_tile(mesh, &source, &key).unwrap();
+            for read in source.read.into_inner() {
+                assert!(
+                    reads.contains(&read),
+                    "mesh {m}, {key:?}: the mip reads {read:?}"
+                );
+            }
+            let finer = level(key.level().get() + 1);
+            let region = Region::of_tile(&key);
+            let per = finer.tile_quads();
+            for y in (2 * region.y0()..=2 * (region.y0() + region.quads())).step_by(8) {
+                for x in (2 * region.x0()..=2 * (region.x0() + region.quads())).step_by(8) {
+                    let (under, _, _) = TileKey::containing(
+                        LayerId::BASE,
+                        Channel::DISPLAY,
+                        key.face(),
+                        finer,
+                        x,
+                        y,
+                    )
+                    .unwrap();
+                    assert!(
+                        reads.contains(&under),
+                        "mesh {m}, {key:?}: under it, {under:?} ({per})"
+                    );
+                }
+            }
+        }
+    }
+}

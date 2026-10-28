@@ -97,8 +97,51 @@ impl TileStore {
         }
     }
 
+    /// The cone of `keys`' normals, coarsest level first: the positions their normals read,
+    /// then the tiles those are predicted from, level by level, up to the first level whose
+    /// tiles are all current (or level 1, predicted from the mesh). Listed on the calling
+    /// thread: a job asks for a few tiles' cone between frames, and a hand-off to the workers
+    /// would wait behind the display tiles they build.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] (not for a valid key).
+    pub(super) fn normals_cone(
+        &mut self,
+        keys: &[TileKey],
+    ) -> Result<Vec<Vec<TileKey>>, CacheError> {
+        let mesh = std::sync::Arc::clone(&self.mesh);
+        let mut tiles = BTreeSet::new();
+        for key in keys {
+            match self.deps.normal_inputs(key) {
+                Some(inputs) => tiles.extend(inputs.iter().copied()),
+                None => tiles.extend(list_normal_inputs(&mesh, key)?),
+            }
+        }
+        let mut levels = Vec::new();
+        loop {
+            let current = tiles.iter().all(|key| self.is_current(key));
+            let mut parents = BTreeSet::new();
+            if !current {
+                for key in &tiles {
+                    match self.deps.parents(key) {
+                        Some(found) => parents.extend(found.iter().copied()),
+                        None => parents.extend(list_parents(&mesh, key)?),
+                    }
+                }
+            }
+            levels.push(tiles.into_iter().collect());
+            if parents.is_empty() {
+                break;
+            }
+            tiles = parents;
+        }
+        levels.reverse();
+        Ok(levels)
+    }
+
     /// Whether `key`'s evaluated positions are cached and current.
-    fn is_current(&mut self, key: &TileKey) -> bool {
+    pub(super) fn is_current(&mut self, key: &TileKey) -> bool {
         matches!(self.evaluated.lookup(key), Some((_, Freshness::Fresh)))
     }
 

@@ -36,7 +36,10 @@ impl TileStore {
         let finest = self
             .display_finest
             .ok_or(geom::DisplayError::NoDisplayLevel(Level::ZERO))?;
+        self.display_builds += 1;
         for tile in tiles {
+            self.display_generations
+                .insert(*tile.key(), self.display_builds);
             self.bumped.remove(tile.key());
             if tile.key().level() <= self.floor_top {
                 self.floor
@@ -51,6 +54,14 @@ impl TileStore {
         Ok(self
             .display
             .settle_and_record(&self.mesh, &self.deps, &records)?)
+    }
+
+    /// The generation of `key`'s display record: the count of [`TileStore::record_display`]
+    /// calls when it was last recorded, 0 for a record read from the files and never built
+    /// since. A known record is only ever replaced by a build, so two decodes of a key at one
+    /// generation give the same tile.
+    pub(super) fn display_generation(&self, key: &TileKey) -> u64 {
+        self.display_generations.get(key).copied().unwrap_or(0)
     }
 
     /// The display tiles the store keeps for each of `keys`, in order: `None` where none is
@@ -273,7 +284,10 @@ impl TileStore {
     /// # Errors
     ///
     /// [`CacheError::Store`] if a read fails.
-    fn display_record(&self, key: &TileKey) -> Result<Option<DisplayRecord>, CacheError> {
+    pub(super) fn display_record(
+        &self,
+        key: &TileKey,
+    ) -> Result<Option<DisplayRecord>, CacheError> {
         match self.display.kept(key) {
             Some(Kept::Known(record)) => return Ok(Some(record.clone())),
             Some(Kept::Unknown) => return Ok(None),
@@ -503,7 +517,7 @@ pub(super) fn display_book_of(
 /// # Errors
 ///
 /// [`CacheError::Store`] if a read fails.
-fn read_display(
+pub(super) fn read_display(
     file: &ProjectFile,
     base: Option<&BaseFile>,
     key: &TileKey,

@@ -226,49 +226,88 @@ fn reached_by(
             let hi = |v: u32| ((v + region.quads()).div_ceil(1 << shift) + 1).min(n);
             let xs = (lo(region.x0()), hi(region.x0()));
             let ys = (lo(region.y0()), hi(region.y0()));
-            if !walked.insert((face, level, xs, ys)) {
-                continue;
-            }
-            tiles_over(&mut answer, face, level, xs, ys);
-            // A run of border vertices along one edge has its copies in a run along the same
-            // edge of each face sharing it, so the windows around the copies of its two ends
-            // bound the windows around all of them.
-            for (first, last) in border_runs(n, xs, ys) {
-                let at = |(i, j): (u32, u32)| -> Vec<(FaceId, u32, u32)> {
-                    mesh.topology()
-                        .copies(face, level, i, j)
-                        .iter()
-                        .map(|copy| {
-                            let tile = copy.key_in(LayerId::BASE, Channel::DISPLAY, level);
-                            let held = Region::of_tile(&tile);
-                            (copy.face, held.x0() + copy.i, held.y0() + copy.j)
-                        })
-                        .collect()
-                };
-                let (starts, ends) = (at(first), at(last));
-                let alone = starts
-                    .iter()
-                    .enumerate()
-                    .all(|(k, c)| starts.iter().skip(k + 1).all(|d| d.0 != c.0));
-                if !alone {
-                    // A face meeting this edge twice (never on a mesh whose faces meet
-                    // themselves nowhere): its copies can't be paired by face, so walk them all.
-                    walk_run(mesh, &mut answer, face, level, n, first, last);
-                    continue;
-                }
-                for &(f, ci, cj) in &starts {
-                    let (ei, ej) = ends
-                        .iter()
-                        .find(|end| end.0 == f)
-                        .map_or((ci, cj), |&(_, ei, ej)| (ei, ej));
-                    let around =
-                        |a: u32, b: u32| (a.min(b).saturating_sub(1), (a.max(b) + 1).min(n));
-                    tiles_over(&mut answer, f, level, around(ci, ei), around(cj, ej));
-                }
+            if walked.insert((face, level, xs, ys)) {
+                window_and_around(mesh, &mut answer, face, level, xs, ys);
             }
         }
     }
     answer
+}
+
+/// The tiles one level finer that display tile `key` reads (display keys).
+///
+/// Those its mean normals read and its positions are subsampled from: every vertex less than one
+/// quad of level `key.level() + 1` from the tile's own, on its face and, across its borders, on
+/// every face sharing a border vertex (each base vertex's whole ring included). `None` at the
+/// deepest level (no finer one).
+///
+/// A superset of what [`geom::mip_normals_tile`] reads: the tent of each vertex reads its eight
+/// neighbours one level finer, the ring tent of a base vertex its neighbours around it.
+pub(crate) fn tent_reads(mesh: &BaseMesh, key: &TileKey) -> Option<BTreeSet<TileKey>> {
+    let finer = key.level().child()?;
+    let region = Region::of_tile(key);
+    let n = finer.face_quads();
+    let xs = (
+        (2 * region.x0()).saturating_sub(1),
+        (2 * (region.x0() + region.quads()) + 1).min(n),
+    );
+    let ys = (
+        (2 * region.y0()).saturating_sub(1),
+        (2 * (region.y0() + region.quads()) + 1).min(n),
+    );
+    let mut answer = BTreeSet::new();
+    window_and_around(mesh, &mut answer, key.face(), finer, xs, ys);
+    Some(answer)
+}
+
+/// Adds to `out` the display tiles of `level` holding a vertex of the window `xs` × `ys` of
+/// `face`, and those within one quad of each copy, on other faces, of the window's border
+/// vertices.
+fn window_and_around(
+    mesh: &BaseMesh,
+    out: &mut BTreeSet<TileKey>,
+    face: FaceId,
+    level: Level,
+    xs: (u32, u32),
+    ys: (u32, u32),
+) {
+    let n = level.face_quads();
+    tiles_over(out, face, level, xs, ys);
+    // A run of border vertices along one edge has its copies in a run along the same edge of
+    // each face sharing it, so the windows around the copies of its two ends bound the windows
+    // around all of them.
+    for (first, last) in border_runs(n, xs, ys) {
+        let at = |(i, j): (u32, u32)| -> Vec<(FaceId, u32, u32)> {
+            mesh.topology()
+                .copies(face, level, i, j)
+                .iter()
+                .map(|copy| {
+                    let tile = copy.key_in(LayerId::BASE, Channel::DISPLAY, level);
+                    let held = Region::of_tile(&tile);
+                    (copy.face, held.x0() + copy.i, held.y0() + copy.j)
+                })
+                .collect()
+        };
+        let (starts, ends) = (at(first), at(last));
+        let alone = starts
+            .iter()
+            .enumerate()
+            .all(|(k, c)| starts.iter().skip(k + 1).all(|d| d.0 != c.0));
+        if !alone {
+            // A face meeting this edge twice (never on a mesh whose faces meet themselves
+            // nowhere): its copies can't be paired by face, so walk them all.
+            walk_run(mesh, out, face, level, n, first, last);
+            continue;
+        }
+        for &(f, ci, cj) in &starts {
+            let (ei, ej) = ends
+                .iter()
+                .find(|end| end.0 == f)
+                .map_or((ci, cj), |&(_, ei, ej)| (ei, ej));
+            let around = |a: u32, b: u32| (a.min(b).saturating_sub(1), (a.max(b) + 1).min(n));
+            tiles_over(out, f, level, around(ci, ei), around(cj, ej));
+        }
+    }
 }
 
 /// Adds to `out` the display tiles of `level` within one quad of each copy of every border

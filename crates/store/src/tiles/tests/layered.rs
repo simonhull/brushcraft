@@ -995,24 +995,21 @@ fn a_tile_lost_between_refresh_slices_is_not_built_from_its_copy() {
     );
     store.save().unwrap();
     // Slices until the refresh has copied the lost tile's evaluation.
-    let mut calls = 0;
+    let began = Instant::now();
     loop {
         store
             .run_jobs(Instant::now() + Duration::from_micros(50))
             .unwrap();
-        calls += 1;
-        // Copied for a tile one level above the finest, which reads nothing else that the
-        // loss could make it wait for.
-        let copied = store.jobs.front_mut().is_some_and(|job| {
-            let scratch = &job.upkeep().scratch;
-            scratch.positions.contains_key(&lost)
-                && scratch.tile.is_some_and(|t| t.level() == level(TOP - 1))
-        });
+        let copied = store
+            .jobs
+            .front_mut()
+            .is_some_and(|job| job.upkeep().copies.tiles.contains_key(&lost));
         if copied {
             break;
         }
+        // Counted in time: a call this short returns at once while the workers build.
         assert!(
-            calls < 100_000 && store.has_jobs(),
+            began.elapsed() < Duration::from_secs(60) && store.has_jobs(),
             "the refresh copies the tile"
         );
     }
@@ -1029,10 +1026,13 @@ fn a_tile_lost_between_refresh_slices_is_not_built_from_its_copy() {
     store
         .run_jobs(Instant::now() + Duration::from_micros(50))
         .unwrap();
-    let copy = store
-        .jobs
-        .front_mut()
-        .and_then(|job| job.upkeep().scratch.positions.get(&lost).cloned());
+    let copy = store.jobs.front_mut().and_then(|job| {
+        job.upkeep()
+            .copies
+            .tiles
+            .get(&lost)
+            .map(|t| t.positions.to_vec())
+    });
     if let Some(copy) = copy {
         let current = store.evaluate(lost).unwrap().to_vec();
         assert!(
