@@ -876,55 +876,139 @@ fn step_error_bounds_what_f64_rounding_hides() {
 /// Bolero cases `decoded_means_stay_near_the_exact_ones` runs.
 const DRIFT_CASES: usize = 16;
 
-/// The largest angle, by level, between a decoded display normal and the exact mean of the
-/// finest normals under it, over every case so far.
-static DRIFT: std::sync::Mutex<[f64; FINEST as usize]> =
-    std::sync::Mutex::new([0.0; FINEST as usize]);
+/// The largest error, by level, of a decoded display mean against the exact mean of the finest
+/// normals under it, over every case so far, with the bound it was held to.
+static DRIFT: std::sync::Mutex<[(f64, f64); FINEST as usize]> =
+    std::sync::Mutex::new([(0.0, 0.0); FINEST as usize]);
 
-/// Decoded display normals stay within 0.5° of the exact means at every level.
+/// The largest angle the chosen normal encoding puts between a unit normal and its decoding.
 ///
-/// Each level is mipped from the decoded means one level finer, so encoding error could build
-/// up over levels. Against the exact means (the same mip of the finest normals, never encoded),
-/// every decoded normal of the chosen encoding stays within the limit on random sculpts. The
-/// largest angle per level is printed (`--nocapture`).
+/// The limit it was chosen under (0.1°), above the worst measured over every face of the
+/// benchmark project (0.059°, `research/platform/m1a2-display-encoding.md`).
+const NORMAL_ANGLE_DEGREES: f64 = 0.1;
+
+/// The least length of an exact mean at which the angle is checked too.
+///
+/// Below it the mean is mostly cancelled detail, a short vector whose direction a small
+/// absolute error turns a long way (see `decoded_means_stay_near_the_exact_ones`).
+const ANGLE_FLOOR: f64 = 0.5;
+
+/// The largest angle, in degrees, between a decoded display normal and the exact mean's
+/// direction, where that mean is at least [`ANGLE_FLOOR`] long.
+const ANGLE_LIMIT_DEGREES: f64 = 0.5;
+
+/// The decoded display means of a random sculpt stay within their bound of the exact means.
+///
+/// Each level is mipped from the decoded means one level finer, so encoding error builds up
+/// over levels; this checks it builds up no faster than the encoding allows. At vertex `v` of
+/// level `l`, write `M` for the exact mean (the tent mip of the finest unit normals, never
+/// encoded), `M̃` for the mean the build mips there from the decoded means one level finer, and
+/// `D` for the decoded mean (the decoded unit normal at its roughness's length); `E_l` is the
+/// largest `|D − M|` over level `l`, and `θ` is [`NORMAL_ANGLE_DEGREES`].
+///
+/// **One level's encoding.** `D = n̂ q`, where `q` is `|M̃|` rounded to 255ths and `n̂` is the
+/// direction `u` of `M̃` encoded, at most `θ` from it; the chord between them is at most
+/// `2 sin(θ/2)`. A mean too short to normalize has `q = 0`, which meets the same bound.
+///
+/// ```text
+/// |q − |M̃||  ≤ 1/510
+/// |n̂ − u|    ≤ 2 sin(θ/2)
+/// |D − M̃|    ≤ |n̂ q − n̂ |M̃|| + |M̃| |n̂ − u|  ≤  1/510 + 2 sin(θ/2) |M̃|
+/// ```
+///
+/// **The mip.** `M̃` and `M` are the same tent of the decoded and the exact means one level
+/// finer, at the same vertices, its weights non-negative and summing to 1: ¼, ⅛ and 1/16 inside
+/// a face, renormalized at its borders; ¼, `1/(2n)` and `1/(4n)` around a base vertex of
+/// valence `n`. So the tent's error is at most the largest error it reads:
+///
+/// ```text
+/// |M̃ − M|  ≤ E_{l+1}
+/// |M̃|      ≤ |M| + E_{l+1}
+/// ```
+///
+/// **Together**, with `E` zero one level finer than the finest display level (whose means are
+/// mipped from the finest normals themselves) and a margin of 1e-5 a level for the `f32` sums:
+///
+/// ```text
+/// |D − M|  ≤  E_{l+1}  +  1/510  +  2 sin(θ/2) (|M| + E_{l+1})
+/// ```
+///
+/// The bound is checked at every vertex; the angle to the exact mean's direction only where the
+/// exact mean is at least [`ANGLE_FLOOR`] long (within [`ANGLE_LIMIT_DEGREES`]). A short mean's
+/// direction is what tiny absolute errors move: at seed 5642940964296373039, a mean 0.0965 long
+/// with an absolute error of 0.002 points 0.78° off, which an angle limit took for a fault. The
+/// largest error and bound per level are printed (`--nocapture`).
 #[test]
 fn decoded_means_stay_near_the_exact_ones() {
     bolero::check!()
         .with_type::<u64>()
         .with_iterations(DRIFT_CASES)
-        .for_each(|&seed| {
-            let sculpt = Sculpt::random(seed);
-            let (positions, normals) = sculpt.finest_grids();
-            let tiles = build_mesh(&sculpt.mesh, &positions, &normals).unwrap();
-            let mut exact = normals;
-            for l in (0..FINEST).rev() {
-                let mut coarser = FaceGrids::new(level(l));
-                for face in sculpt.mesh.faces() {
-                    let means = mip_normals(&sculpt.mesh, &exact, face, level(l)).unwrap();
-                    coarser.insert(face, means.into_grid()).unwrap();
+        .for_each(|&seed| means_within_their_bound(seed));
+    println!(
+        "largest error and bound by level: {:?}",
+        DRIFT.lock().unwrap()
+    );
+}
+
+/// `decoded_means_stay_near_the_exact_ones` at the seed that found its old angle limit wrong:
+/// short means, whose directions drift though their errors stay within the bound.
+#[test]
+fn decoded_short_means_stay_within_their_bound() {
+    means_within_their_bound(5_642_940_964_296_373_039);
+}
+
+/// Checks the decoded display means of the sculpt `seed` makes against the exact means, level
+/// by level (see `decoded_means_stay_near_the_exact_ones`).
+fn means_within_their_bound(seed: u64) {
+    let chord = 2.0 * (NORMAL_ANGLE_DEGREES.to_radians() / 2.0).sin();
+    let sculpt = Sculpt::random(seed);
+    let (positions, normals) = sculpt.finest_grids();
+    let tiles = build_mesh(&sculpt.mesh, &positions, &normals).unwrap();
+    let mut exact = normals;
+    let mut finer_bound = 0.0_f64;
+    for l in (0..FINEST).rev() {
+        let mut coarser = FaceGrids::new(level(l));
+        for face in sculpt.mesh.faces() {
+            let means = mip_normals(&sculpt.mesh, &exact, face, level(l)).unwrap();
+            coarser.insert(face, means.into_grid()).unwrap();
+        }
+        exact = coarser;
+        let (mut worst, mut level_bound) = (0.0_f64, 0.0_f64);
+        let level_tiles = tiles.iter().filter(|t| t.key().level() == level(l));
+        for tile in level_tiles {
+            let key = tile.key();
+            let region = Region::of_tile(key);
+            let grid = exact.get(key.face()).unwrap();
+            let decoded = tile.means();
+            let pairs = decoded.iter().zip(tile.normals()).enumerate();
+            for (index, (&mean, &normal)) in pairs {
+                let index = u32::try_from(index).unwrap();
+                let (i, j) = (index % key.side(), index / key.side());
+                let want = grid.get(region.x0() + i, region.y0() + j).unwrap();
+                let length = f64::from(want.length());
+                let bound = finer_bound + 1.0 / 510.0 + chord * (length + finer_bound) + 1e-5;
+                let error = f64::from((mean - want).length());
+                assert!(
+                    error <= bound,
+                    "seed {seed}, level {l}, {key:?} ({i}, {j}): {error} past its bound {bound}"
+                );
+                if length >= ANGLE_FLOOR {
+                    let unit = want.normalized().unwrap();
+                    let angle = angle_degrees(normal, unit);
+                    assert!(
+                        angle <= ANGLE_LIMIT_DEGREES,
+                        "seed {seed}, level {l}: {angle}° from a mean {length} long"
+                    );
                 }
-                exact = coarser;
-                let mut worst = 0.0_f64;
-                for tile in tiles.iter().filter(|t| t.key().level() == level(l)) {
-                    let key = tile.key();
-                    let region = Region::of_tile(key);
-                    let grid = exact.get(key.face()).unwrap();
-                    for (index, &normal) in tile.normals().iter().enumerate() {
-                        let index = u32::try_from(index).unwrap();
-                        let (i, j) = (index % key.side(), index / key.side());
-                        let mean = grid.get(region.x0() + i, region.y0() + j).unwrap();
-                        let unit = mean.normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0));
-                        worst = worst.max(angle_degrees(normal, unit));
-                    }
-                }
-                {
-                    let mut drift = DRIFT.lock().unwrap();
-                    drift[usize::from(l)] = drift[usize::from(l)].max(worst);
-                }
-                assert!(worst <= 0.5, "level {l}: {worst}° from the exact mean");
+                worst = worst.max(error);
+                level_bound = level_bound.max(bound);
             }
-        });
-    println!("largest drift by level: {:?}", DRIFT.lock().unwrap());
+        }
+        if let Some(at) = DRIFT.lock().unwrap().get_mut(usize::from(l)) {
+            *at = (at.0.max(worst), at.1.max(level_bound));
+        }
+        finer_bound = level_bound;
+    }
 }
 
 /// Every tile [`build_tile`] builds from its inputs alone is bit for bit the tile
