@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 use anyhow::{Context as _, Result, anyhow};
 use render::gpu::Gpu;
 use render::surface::{Presentation, Size, Target};
+use render::upload::FrameUploads;
 use render::{DrawTimes, FrameInputs, Outcome, Renderer};
 use wgpu::Color;
 
@@ -29,10 +30,7 @@ pub(crate) const CLEAR: Color = Color {
 };
 
 /// A frame for the render thread to draw: everything it needs, owned.
-///
-/// GPU residency (M1a3 Task 2) adds the frame's staged uploads here, which the render thread
-/// encodes before the passes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct FrameRequest {
     /// The frame's number, from 1.
     pub(crate) number: u64,
@@ -42,11 +40,17 @@ pub(crate) struct FrameRequest {
     pub(crate) overlay_scale: u32,
     /// The overlay's lines.
     pub(crate) overlay: Vec<String>,
+    /// The uploads the owner thread staged for this frame, encoded ahead of its passes and
+    /// submitted with them; `None` with no GPU residency. A request dropped undrawn drops them,
+    /// and residency recovers from that on the owner's next frame.
+    pub(crate) uploads: Option<FrameUploads>,
 }
 
 /// What the render thread did with a frame.
 ///
-/// GPU residency (Task 2) adds the frame's readback (tiles wanted but missing) here.
+/// The frame's request readback (tiles wanted but missing) doesn't come back here: residency
+/// hears of it itself, through the readback buffer's mapping
+/// ([`render::residency::Residency::take_requests`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Presented {
     /// The frame's number.
@@ -304,7 +308,7 @@ impl Drawing {
         wake: &dyn Fn(),
         pre_present: &dyn Fn(),
     ) -> Result<()> {
-        while let Ok(frame) = frames.recv() {
+        while let Ok(mut frame) = frames.recv() {
             #[cfg(test)]
             (self.before_draw)(&frame);
             let image = TextLayout::new(&frame.overlay).image();
@@ -314,9 +318,10 @@ impl Drawing {
                 overlay: image.as_ref(),
                 overlay_scale: frame.overlay_scale,
             };
+            let uploads = frame.uploads.take();
             let drawn = self
                 .renderer
-                .draw(&self.gpu, &mut self.target, &inputs, pre_present)
+                .draw(&self.gpu, &mut self.target, &inputs, uploads, pre_present)
                 .with_context(|| format!("drawing frame {}", frame.number))?;
             let report = Presented {
                 number: frame.number,
@@ -358,6 +363,7 @@ mod tests {
             size,
             overlay_scale: 1,
             overlay: lines.iter().map(|&line| line.to_owned()).collect(),
+            uploads: None,
         }
     }
 

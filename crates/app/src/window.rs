@@ -3,10 +3,11 @@
 //!
 //! The loop's events become the frame loop's input (pointer motion, buttons, the wheel and
 //! modifiers, as [`Input`]) and its window state (size, scale, exposure). After each batch of
-//! events, [`WindowApp::drive`] asks the [`Owner`] what to do next: make a frame and hand it to
-//! the render thread, wait until the next frame may start, wait for the render thread (which
-//! wakes the loop when it has presented), or sleep until an event or the next upkeep. The pen
-//! navigates through winit's tablet events; `input`'s own pen backend is the brush's, in M1a4.
+//! events, [`WindowApp::drive`] asks the [`Owner`](crate::frame::Owner) what to do next: make a
+//! frame and hand it to the render thread, wait until the next frame may start, wait for the render
+//! thread (which wakes the loop when it has presented), or sleep until an event or the next upkeep.
+//! The pen navigates through winit's tablet events; `input`'s own pen backend is the brush's, in
+//! M1a4.
 
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -24,11 +25,11 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::camera::Pixel;
 use crate::cli::Options;
+use crate::frame::Setup;
 use crate::frame::schedule::Next;
-use crate::frame::{NoBrush, NoUploads, Owner, Setup};
 use crate::navigate::{Button, Input, Modifiers};
 use crate::render_thread::{Hooks, RenderThread};
-use crate::{ProjectToOpen, Summary, describe_adapter};
+use crate::{AppOwner, ProjectToOpen, Summary, describe_adapter, start};
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -40,7 +41,7 @@ const PIXELS_PER_NOTCH: f64 = 40.0;
 #[derive(Debug)]
 struct Running {
     /// The frame loop, holding the project.
-    owner: Owner<NoBrush, NoUploads>,
+    owner: AppOwner,
     /// The render thread. Declared before `window`, so it stops (releasing the surface) before
     /// the window is dropped.
     render: RenderThread,
@@ -114,7 +115,7 @@ impl WindowApp {
             move || proxy.wake_up(),
             move || presenting.pre_present_notify(),
         );
-        let render = RenderThread::spawn(gpu, Target::Window(surface), hooks)?;
+        let render = RenderThread::spawn(Arc::clone(&gpu), Target::Window(surface), hooks)?;
         let project = project.open()?;
         let frames = match self.options.mode {
             crate::cli::Mode::Window { frames } => frames,
@@ -127,7 +128,7 @@ impl WindowApp {
             adapter: adapter.clone(),
             frames,
         };
-        let mut owner = Owner::new(project, NoBrush, NoUploads, setup, Instant::now());
+        let mut owner = start(project, gpu, setup)?;
         owner.set_scale(window.scale_factor());
         Ok(Running {
             owner,
@@ -194,14 +195,10 @@ impl WindowApp {
                 } = running;
                 let presentation = render.presentation();
                 let stopped = render.stop().map(drop);
-                let frames = owner.finished();
+                let summary = Summary::of(&owner, adapter, presentation);
                 let closed = owner.close();
                 drop(window);
-                result.and(stopped).and(closed).map(|()| Summary {
-                    frames,
-                    adapter,
-                    presentation,
-                })
+                result.and(stopped).and(closed).map(|()| summary)
             }
             None => result.and_then(|()| Err(anyhow!("the window never opened"))),
         };

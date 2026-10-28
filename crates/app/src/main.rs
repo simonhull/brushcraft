@@ -1,10 +1,11 @@
 //! `brushcraft`: the app. Opens a project and draws it, in a window or offscreen.
 //!
 //! The main thread owns the project's tile store (it is `!Send`) and runs the frame loop
-//! ([`frame`]): input, the brush (M1a4), the stale-tile feed, uploads (M1a3 Task 2), the
-//! store's jobs, then the frame handed to the render thread ([`render_thread`]), which encodes,
-//! submits and presents it. Frames are made only when something asks for one
-//! ([`frame::schedule`]). For now a frame is a clear colour under the debug overlay
+//! ([`frame`]): input, the brush (M1a4), the stale-tile feed, the uploads that keep the
+//! project's tiles on the GPU ([`uploads`]), then the frame handed to the render thread
+//! ([`render_thread`]), which encodes the uploads and the passes, submits and presents them,
+//! while the main thread runs the store's jobs. Frames are made only when something asks for
+//! one ([`frame::schedule`]). For now a frame is a clear colour under the debug overlay
 //! ([`overlay`]); the camera orbits, pans and zooms with the mouse and the pen ([`navigate`],
 //! [`camera`]).
 //!
@@ -21,6 +22,7 @@ mod paths;
 mod render_thread;
 #[cfg(test)]
 mod test_dir;
+mod uploads;
 mod window;
 
 use std::io::Write as _;
@@ -36,14 +38,45 @@ use winit::event_loop::EventLoop;
 
 use crate::cli::{Mode, Options};
 use crate::frame::schedule::Next;
-use crate::frame::{NoBrush, NoUploads, Owner, Setup};
+use crate::frame::{NoBrush, Owner, Setup};
 use crate::render_thread::{Hooks, RenderThread};
+use crate::uploads::GpuResidency;
 use crate::window::WindowApp;
 
 /// The site the app's op ids carry: one, until sessions on several machines edit one project.
 const SITE: u16 = 1;
 
-/// How a run went, for the line printed at its end.
+/// The app's frame loop: no brush yet (M1a4), the project's tiles kept on the GPU.
+pub(crate) type AppOwner = Owner<NoBrush, GpuResidency>;
+
+/// The frame loop over `project` as `setup` says, its tiles kept on `gpu`, wanting its first
+/// frame now.
+///
+/// # Errors
+///
+/// If GPU residency can't be set up; the project is closed first.
+pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, setup: Setup) -> Result<AppOwner> {
+    match GpuResidency::new(gpu, project.store()) {
+        Ok(residency) => Ok(Owner::new(
+            project,
+            NoBrush,
+            residency,
+            setup,
+            Instant::now(),
+        )),
+        Err(error) => {
+            let keep = project.has_unsaved_edits();
+            match project.close(keep) {
+                Ok(()) => Err(error),
+                Err(close) => {
+                    Err(error.context(format!("and closing the project failed: {close}")))
+                }
+            }
+        }
+    }
+}
+
+/// How a run went, for the lines printed at its end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Summary {
     /// Frames the render thread finished.
@@ -52,6 +85,28 @@ pub(crate) struct Summary {
     pub(crate) adapter: String,
     /// How frames reached the screen.
     pub(crate) presentation: Presentation,
+    /// What the GPU held at the end, as the overlay's tiles line shows it.
+    pub(crate) tiles: String,
+    /// A scripted run's phase times ([`frame::PhaseLog::lines`]); empty for an open-ended run.
+    pub(crate) phases: Vec<String>,
+}
+
+impl Summary {
+    /// The summary of `owner`'s run: `adapter` presenting as `presentation`. Take it before
+    /// the owner closes.
+    pub(crate) fn of(owner: &AppOwner, adapter: String, presentation: Presentation) -> Self {
+        let uploads = owner.uploads();
+        Self {
+            frames: owner.finished(),
+            adapter,
+            presentation,
+            tiles: uploads::summary(&uploads.stats(), uploads.floor_tiles()),
+            phases: owner
+                .phase_log()
+                .map(frame::PhaseLog::lines)
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// A GPU's name and backend, as the overlay and the summary show it.
@@ -132,7 +187,7 @@ fn run_offscreen(options: &Options, project: ProjectToOpen, frames: u64) -> Resu
     let gpu = Arc::new(Gpu::open(&options.adapter).context("opening the GPU")?);
     let adapter = describe_adapter(gpu.adapter_info());
     let target = Target::Offscreen(Offscreen::new(&gpu, options.size)?);
-    let mut render = RenderThread::spawn(gpu, target, Hooks::none())?;
+    let mut render = RenderThread::spawn(Arc::clone(&gpu), target, Hooks::none())?;
     let project = project.open()?;
     let presentation = render.presentation();
     let setup = Setup {
@@ -142,17 +197,13 @@ fn run_offscreen(options: &Options, project: ProjectToOpen, frames: u64) -> Resu
         adapter: adapter.clone(),
         frames: Some(frames),
     };
-    let mut owner = Owner::new(project, NoBrush, NoUploads, setup, Instant::now());
+    let mut owner = start(project, gpu, setup)?;
     let ran = drive_offscreen(&mut owner, &mut render);
     let stopped = render.stop().map(drop);
-    let finished = owner.finished();
+    let summary = Summary::of(&owner, adapter, presentation);
     let closed = owner.close();
     ran.and(stopped).and(closed)?;
-    Ok(Summary {
-        frames: finished,
-        adapter,
-        presentation,
-    })
+    Ok(summary)
 }
 
 /// Runs the frame loop with no event loop until the scripted frames are done: sleeping where
@@ -161,7 +212,7 @@ fn run_offscreen(options: &Options, project: ProjectToOpen, frames: u64) -> Resu
 /// # Errors
 ///
 /// If a frame, the upkeep or the render thread fails.
-fn drive_offscreen(owner: &mut Owner<NoBrush, NoUploads>, render: &mut RenderThread) -> Result<()> {
+fn drive_offscreen(owner: &mut AppOwner, render: &mut RenderThread) -> Result<()> {
     while !owner.done() {
         let now = Instant::now();
         match owner.next(now) {
@@ -189,13 +240,18 @@ fn main() -> Result<()> {
         Mode::Offscreen { frames } => run_offscreen(&options, project, frames)?,
         Mode::Window { .. } => run_window(options.clone(), project)?,
     };
+    let mut out = std::io::stdout().lock();
     writeln!(
-        std::io::stdout().lock(),
+        out,
         "brushcraft: {} frames on {} ({}); {} closed",
         summary.frames,
         summary.adapter,
         summary.presentation,
         options.project.display()
     )?;
+    writeln!(out, "tiles: {}", summary.tiles)?;
+    for line in &summary.phases {
+        writeln!(out, "{line}")?;
+    }
     Ok(())
 }

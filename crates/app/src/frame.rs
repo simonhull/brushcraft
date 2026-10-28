@@ -8,10 +8,11 @@
 //! 2. **brush**: a seam for M1a4's brush step ([`Brush`]; [`NoBrush`] until then), which sees the
 //!    camera as the input left it;
 //! 3. **feed**: the stale-tile feed is drained: the epochs closed since the last frame;
-//! 4. **uploads**: a seam for M1a3 Task 2's GPU residency ([`Uploads`]; [`NoUploads`] until then),
-//!    which takes the drained epochs;
-//! 5. **hand-off**: the frame goes to the render thread, as a [`FrameRequest`], which starts
-//!    encoding it at once;
+//! 4. **uploads**: GPU residency ([`Uploads`], [`crate::uploads::GpuResidency`]) takes the drained
+//!    epochs and stages the frame's tiles from the store, until half the way to the frame's
+//!    deadline;
+//! 5. **hand-off**: the frame goes to the render thread, as a [`FrameRequest`] carrying the staged
+//!    uploads, which it starts encoding at once (the uploads first, then the passes);
 //! 6. **upkeep**: meanwhile the project's recovery writer is ticked and polled;
 //! 7. **jobs**: and the store's resumable jobs (display-layer refresh and rebuild) run until the
 //!    frame's deadline, at least one slice of them. This frame draws nothing they produce: the
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use render::DrawTimes;
 use render::surface::{Presentation, Size};
+use render::upload::FrameUploads;
 use store::{Drained, JobsReport, Project, StaleCursor, TileStore};
 
 use self::schedule::{Next, Reason, Scheduler};
@@ -63,39 +65,64 @@ impl Brush for NoBrush {
     }
 }
 
-/// What the uploads did with a frame's epochs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What the uploads did with a frame's epochs, and what they staged for it.
+#[derive(Debug, Default)]
 pub(crate) struct UploadStatus {
-    /// Whether uploads are still pending (an epoch going up over several frames, requests not
-    /// yet answered): the next frame is wanted.
+    /// Whether uploads are still pending (the floor not all up, an epoch going up over several
+    /// frames, requested tiles still to come): the next frame is wanted.
     pub(crate) converging: bool,
-    /// What the GPU holds, for the overlay (tiles per level, over-budget count, residency);
-    /// `None` while it holds nothing.
+    /// What the GPU holds, for the overlay's tiles line; `None` while it holds nothing.
     pub(crate) summary: Option<String>,
+    /// The frame's staged uploads, which travel to the render thread in its
+    /// [`FrameRequest`]; `None` if there is no GPU residency.
+    pub(crate) frame: Option<FrameUploads>,
 }
 
-/// The uploads' place in the frame: M1a3 Task 2's GPU residency.
+/// The uploads' place in the frame: GPU residency ([`crate::uploads::GpuResidency`]).
 ///
-/// It takes each frame's drained epochs and writes their tiles into its staging ring, on the
-/// owner thread (the store is read here, and only here).
+/// It takes each frame's drained epochs and stages the tiles the GPU should get into its
+/// staging ring, on the owner thread (the store is read here, and only here), for the render
+/// thread to encode ahead of the frame's passes.
 pub(crate) trait Uploads {
-    /// Applies `drained`, the epochs closed since the last frame (or a resync), reading the
-    /// tiles they name from `store`.
+    /// Applies `drained`, the epochs closed since the last frame (or a resync), and stages the
+    /// frame's uploads, reading tiles from `store` until `deadline` (the floor goes up whole,
+    /// whatever the deadline).
     ///
     /// # Errors
     ///
     /// If the store can't give a tile, or the GPU refuses an upload.
-    fn apply(&mut self, drained: Drained, store: &mut TileStore) -> Result<UploadStatus>;
+    fn apply(
+        &mut self,
+        drained: Drained,
+        store: &mut TileStore,
+        deadline: Instant,
+    ) -> Result<UploadStatus>;
 }
 
-/// No GPU residency yet (Task 2): nothing is uploaded, and the epochs are dropped.
+/// No GPU residency, for the frame loop's tests without a GPU: nothing is uploaded, and the
+/// epochs are dropped.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct NoUploads;
 
+#[cfg(test)]
 impl Uploads for NoUploads {
-    fn apply(&mut self, _drained: Drained, _store: &mut TileStore) -> Result<UploadStatus> {
+    fn apply(
+        &mut self,
+        _drained: Drained,
+        _store: &mut TileStore,
+        _deadline: Instant,
+    ) -> Result<UploadStatus> {
         Ok(UploadStatus::default())
     }
+}
+
+/// The uploads' deadline in a frame started at `now` whose work runs until `deadline`.
+///
+/// Half the way there: the uploads run before the hand-off, so their time is input latency;
+/// the jobs after it get the rest (and at least a slice).
+fn uploads_deadline(now: Instant, deadline: Instant) -> Instant {
+    now + deadline.saturating_duration_since(now) / 2
 }
 
 /// How long one frame's phases took on the owner thread.
@@ -197,6 +224,74 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// The last frame's upkeep and jobs, which run after its hand-off: the next frame's
     /// overlay reports them.
     after_hand_off: AfterHandOff,
+    /// Every frame's phases, in a scripted run only (an open-ended one would grow it forever).
+    log: Option<PhaseLog>,
+}
+
+/// Every frame's phase times in a scripted run, for the summary printed at its end.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PhaseLog {
+    /// The owner thread's phases, frame by frame: each frame's upkeep and jobs are its own,
+    /// recorded once they have run.
+    pub(crate) owner: Vec<OwnerPhases>,
+    /// The render thread's, for every frame it finished, in order.
+    pub(crate) render: Vec<DrawTimes>,
+}
+
+impl PhaseLog {
+    /// One line per phase: its median, 99th percentile and longest, in milliseconds, over
+    /// every frame but the first (which uploads the floor, shown on its own).
+    pub(crate) fn lines(&self) -> Vec<String> {
+        let rest = self.owner.get(1..).unwrap_or_default();
+        let render = self.render.get(1..).unwrap_or_default();
+        let owner_phase = |name: &str, phase: fn(&OwnerPhases) -> Duration| {
+            let times: Vec<Duration> = rest.iter().map(phase).collect();
+            spread(name, times)
+        };
+        let render_phase = |name: &str, phase: fn(&DrawTimes) -> Duration| {
+            let times: Vec<Duration> = render.iter().map(phase).collect();
+            spread(name, times)
+        };
+        let mut lines = Vec::new();
+        if let Some(first) = self.owner.first() {
+            let encode = self.render.first().map_or(Duration::ZERO, |r| r.encode);
+            lines.push(format!(
+                "first frame: uploads {:.2} ms (owner), encode and submit {:.2} ms (render)",
+                first.uploads.as_secs_f64() * 1e3,
+                encode.as_secs_f64() * 1e3
+            ));
+        }
+        lines.push(format!("later frames ({} of them), ms:", rest.len()));
+        lines.extend([
+            owner_phase("input", |p| p.input),
+            owner_phase("brush", |p| p.brush),
+            owner_phase("feed", |p| p.feed),
+            owner_phase("uploads", |p| p.uploads),
+            owner_phase("upkeep", |p| p.upkeep),
+            owner_phase("jobs", |p| p.jobs),
+            render_phase("acquire", |r| r.acquire),
+            render_phase("encode", |r| r.encode),
+            render_phase("present", |r| r.present),
+        ]);
+        lines
+    }
+}
+
+/// `name` and the median, 99th percentile and longest of `times`, in milliseconds.
+fn spread(name: &str, mut times: Vec<Duration>) -> String {
+    times.sort_unstable();
+    let at = |q: usize| {
+        let index = (times.len().saturating_sub(1) * q).div_ceil(100);
+        times
+            .get(index)
+            .map_or(0.0, |time| time.as_secs_f64() * 1e3)
+    };
+    format!(
+        "  {name:<8} p50 {:.3}  p99 {:.3}  max {:.3}",
+        at(50),
+        at(99),
+        at(100)
+    )
 }
 
 /// What a frame did after handing itself off, reported by the next frame's overlay.
@@ -245,6 +340,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             feed: FeedStats::default(),
             render: None,
             after_hand_off: AfterHandOff::default(),
+            log: setup.frames.map(|_| PhaseLog::default()),
         }
     }
 
@@ -358,9 +454,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.feed.count(&drained);
         phases.feed = lap.next();
 
-        let uploads = self
+        let mut uploads = self
             .uploads
-            .apply(drained, self.project.store())
+            .apply(
+                drained,
+                self.project.store(),
+                uploads_deadline(now, deadline),
+            )
             .context("uploading tiles")?;
         phases.uploads = lap.next();
 
@@ -377,11 +477,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             tiles: uploads.summary.as_deref(),
             camera: self.camera,
         };
+        let overlay = overlay::lines(&snapshot);
         hand_off(FrameRequest {
             number: self.started,
             size,
             overlay_scale: self.overlay_scale,
-            overlay: overlay::lines(&snapshot),
+            overlay,
+            uploads: uploads.frame.take(),
         })?;
         lap.next();
 
@@ -396,6 +498,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .run_jobs(deadline)
             .context("running the store's jobs")?;
         self.after_hand_off.jobs = lap.next();
+        if let Some(log) = &mut self.log {
+            log.owner.push(OwnerPhases {
+                upkeep: self.after_hand_off.upkeep,
+                jobs: self.after_hand_off.jobs,
+                ..phases
+            });
+        }
 
         if uploads.converging || self.project.store().has_jobs() || self.has_stale() {
             self.scheduler.want(Reason::Converging);
@@ -410,7 +519,15 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) fn shown(&mut self, presented: Presented) {
         self.finished += 1;
         self.render = Some(presented.times);
+        if let Some(log) = &mut self.log {
+            log.render.push(presented.times);
+        }
         self.scheduler.shown(presented.outcome);
+    }
+
+    /// Every frame's phases so far, in a scripted run; `None` in an open-ended one.
+    pub(crate) const fn phase_log(&self) -> Option<&PhaseLog> {
+        self.log.as_ref()
     }
 
     /// Upkeep with no frame, at `now`: the project's recovery writer ticked and polled.
@@ -459,7 +576,6 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// The uploads seam.
-    #[cfg(test)]
     pub(crate) const fn uploads(&self) -> &U {
         &self.uploads
     }

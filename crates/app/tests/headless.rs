@@ -1,6 +1,6 @@
 //! `brushcraft --offscreen --frames N` end to end, through the built binary, on the software
-//! adapter (lavapipe in the gate): the app opens a saved project, draws its frames with no
-//! window, closes it, and leaves nothing behind.
+//! adapter (lavapipe in the gate): the app opens a saved project, uploads its floor of display
+//! tiles to the GPU, draws its frames with no window, closes it, and leaves nothing behind.
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -75,7 +75,7 @@ mod tests {
             &[
                 "--offscreen",
                 "--frames",
-                "8",
+                "30",
                 "--adapter",
                 "software",
                 "--level",
@@ -92,8 +92,14 @@ mod tests {
             output.status
         );
         assert!(
-            stdout.contains("8 frames on llvmpipe") && stdout.contains("(offscreen)"),
+            stdout.contains("30 frames on llvmpipe") && stdout.contains("(offscreen)"),
             "the summary: {stdout}"
+        );
+        // The floor (24 faces' display tiles at levels 0 to 3, under level 4) went up to the
+        // GPU and is resident, and no frame's uploads were lost.
+        assert!(
+            stdout.contains("tiles: 96 resident (floor 96/96)") && stdout.contains("0 lost frames"),
+            "the floor is resident: {stdout}"
         );
         let recovery = state.join("brushcraft").join("recovery");
         let left: Vec<_> = std::fs::read_dir(&recovery)
