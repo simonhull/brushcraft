@@ -125,7 +125,8 @@ impl geom::PositionSource for Recording {
 fn tent_reads_hold_everything_a_tile_reads() {
     use crate::fixture::{TOP, level, split_prism, tiles};
     let meshes = [(*crate::fixture::mesh()).clone(), split_prism(5)];
-    for (m, mesh) in meshes.iter().enumerate() {
+    let numbered = meshes.iter().enumerate();
+    for (m, mesh) in numbered {
         for k in tiles(mesh, 0, TOP - 1) {
             let key = TileKey::display(k.face(), k.level(), k.tx(), k.ty()).unwrap();
             let reads = tent_reads(mesh, &key).unwrap();

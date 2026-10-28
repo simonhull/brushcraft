@@ -295,7 +295,8 @@ fn a_layer_built_from_another_finest_level_is_unknown_and_rebuilt() {
     let rebuilt: Vec<TileKey> = layer.iter().map(|t| *t.key()).collect();
     assert_eq!(rebuilt, keys, "the whole layer under level {}", TOP - 1);
     let stored = store.stored_display(&rebuilt).unwrap();
-    for (tile, kept) in layer.iter().zip(stored) {
+    let pairs = layer.iter().zip(stored);
+    for (tile, kept) in pairs {
         assert_eq!(
             kept.as_ref(),
             Some(tile),
@@ -352,7 +353,8 @@ fn damaged_and_foreign_records_among_the_layer_are_rebuilt() {
         let layer = display_layer(&mut store);
         let keys: Vec<TileKey> = layer.iter().map(|t| *t.key()).collect();
         let stored = store.stored_display(&keys).unwrap();
-        for (tile, kept) in layer.iter().zip(stored) {
+        let pairs = layer.iter().zip(stored);
+        for (tile, kept) in pairs {
             assert_eq!(
                 kept.as_ref(),
                 Some(tile),

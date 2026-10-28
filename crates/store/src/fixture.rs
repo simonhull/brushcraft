@@ -333,10 +333,10 @@ pub(crate) fn display_layer_at(store: &mut TileStore, top: u8) -> Vec<geom::Disp
     for face in mesh.faces() {
         let count = usize::try_from(side * side).unwrap();
         let (mut p, mut n) = (vec![Vec3::ZERO; count], vec![Vec3::ZERO; count]);
-        for key in tiles(&mesh, top, top)
+        let on_face = tiles(&mesh, top, top)
             .into_iter()
-            .filter(|k| k.face() == face)
-        {
+            .filter(|k| k.face() == face);
+        for key in on_face {
             let region = Region::of_tile(&key);
             let got_p = store.evaluate(key).unwrap().to_vec();
             let got_n = store.normals(key).unwrap().to_vec();
