@@ -4,6 +4,7 @@
 use super::gather::Reader;
 use super::{EvalError, Grid, PositionSource, block_of, check_buffer, gather};
 use crate::frame::{self, CornerAxes, FrameRows, Scattered, Stencil};
+use crate::subdiv::{CornerRing, Padded};
 use crate::{BaseMesh, Region, TileKey, Vec3};
 
 /// Unit normals of `region`'s evaluated positions in `src` (same level).
@@ -51,17 +52,33 @@ pub fn normals_into(
     let side = region.quads() + 1;
     check_buffer(out, usize::try_from(side * side).unwrap_or(usize::MAX))?;
     let gathered = gather(mesh, src, region)?;
+    let rings = gathered.corners.each_ref().map(Option::as_ref);
+    normals_of(mesh, region, &gathered.padded, rings, out);
+    Ok(())
+}
+
+/// The normals of `region` into `out` (one per block vertex), from its gathered positions.
+///
+/// `padded` is the block with its ring, `rings` the rings of the base vertices at its block
+/// corners: what [`normals_into`] computes once it has gathered them, and
+/// [`GatheredBlock::normals`](super::GatheredBlock::normals) from a block gathered before.
+pub(super) fn normals_of(
+    mesh: &BaseMesh,
+    region: Region,
+    padded: &Padded,
+    rings: [Option<&CornerRing>; 4],
+    out: &mut [Vec3],
+) {
     // The level's own ring: the base vertex (the owner's copy) and its edge neighbours.
-    let axes = gathered.corners.each_ref().map(|c| {
-        c.as_ref().map(|ring| CornerAxes {
+    let axes = rings.map(|c| {
+        c.map(|ring| CornerAxes {
             center: ring.center,
             points: ring.edges(),
             owner_corner: ring.owner_corner,
         })
     });
     let block = block_of(mesh, region);
-    frame::normals(&block, &gathered.padded, &axes, out);
-    Ok(())
+    frame::normals(&block, padded, &axes, out);
 }
 
 /// Brings `region`'s normals in `out` up to date after positions outside the region changed.

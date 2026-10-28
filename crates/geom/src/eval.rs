@@ -8,15 +8,14 @@ use crate::{BaseMesh, FaceId, Level, MAX_VALENCE, Region, TILE_QUADS, Vec3};
 
 mod cone;
 mod gather;
-#[cfg(feature = "eval-inputs")]
-mod inputs;
 mod normals;
+mod ring;
 
 pub use cone::{cone_width, normal_tiles, parent_tiles};
 pub(crate) use gather::gather;
-#[cfg(feature = "eval-inputs")]
-pub use inputs::{GatheredBlock, GatheredRing, VertexStencil, gather_block, vertex_stencil};
+use normals::normals_of;
 pub use normals::{normals, normals_into, refresh_normals_into};
+pub use ring::{GatheredBlock, GatheredRing, VertexStencil, gather_block, vertex_stencil};
 
 /// Read access to evaluated positions.
 ///

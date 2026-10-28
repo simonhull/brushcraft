@@ -42,11 +42,10 @@ pub use display::{
     build_positions, build_tile, mip_normals, mip_normals_tile,
 };
 pub use eval::{
-    EvalError, Grid, PositionSource, Prediction, cone_width, evaluate_region, normal_tiles,
-    normals, normals_into, parent_tiles, predict_region, refresh_normals_into,
+    EvalError, GatheredBlock, GatheredRing, Grid, PositionSource, Prediction, VertexStencil,
+    cone_width, evaluate_region, gather_block, normal_tiles, normals, normals_into, parent_tiles,
+    predict_region, refresh_normals_into, vertex_stencil,
 };
-#[cfg(feature = "eval-inputs")]
-pub use eval::{GatheredBlock, GatheredRing, VertexStencil, gather_block, vertex_stencil};
 pub use frame::Frame;
 pub use key::{
     Channel, FaceId, LayerId, Level, LevelOutOfRange, MAX_LEVEL, Region, TILE_QUADS, TileKey,

@@ -128,6 +128,89 @@ fn subdivided_prism(sides: u32) -> Result<BaseMesh, MeshError> {
     BaseMesh::from_polygons(positions, &faces)
 }
 
+/// NaN in every component: a vertex [`ring_normals`] has no normal for.
+const NO_NORMAL: Vec3 = Vec3::new(f32::NAN, f32::NAN, f32::NAN);
+
+/// `n` at unit length: scaled by the reciprocal of its length where the length is finite and
+/// above `f32::MIN_POSITIVE`; else `(0, 0, 1)` where the inputs were `finite`, else NaN.
+fn unit_or_fallback(n: Vec3, finite: bool) -> Vec3 {
+    let length = (n.x * n.x + n.y * n.y + n.z * n.z).sqrt();
+    if length.is_finite() && length > f32::MIN_POSITIVE {
+        let r = 1.0 / length;
+        Vec3::new(n.x * r, n.y * r, n.z * r)
+    } else if finite {
+        Vec3::new(0.0, 0.0, 1.0)
+    } else {
+        NO_NORMAL
+    }
+}
+
+/// `a × b`, component by component.
+const fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3::new(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    )
+}
+
+/// `a − b`, component by component.
+const fn minus(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3::new(a.x - b.x, a.y - b.y, a.z - b.z)
+}
+
+/// The normal at a base vertex from its ring: `Σ_k (e_k − v) × (e_{k+1} − v)` from the owner,
+/// wrapping, at unit length; NaN for a ring that isn't finite or has fewer than two points.
+fn ring_normal(ring: &crate::GatheredRing) -> Vec3 {
+    let v = ring.center();
+    let edges = ring.edges();
+    let finite = v.is_finite() && edges.iter().all(|e| e.is_finite());
+    if !finite || edges.len() < 2 {
+        return NO_NORMAL;
+    }
+    let next = edges.iter().cycle().skip(1);
+    let terms = edges
+        .iter()
+        .zip(next)
+        .map(|(&a, &b)| cross(minus(a, v), minus(b, v)));
+    let sum = terms.fold(Vec3::ZERO, |n, t| {
+        Vec3::new(n.x + t.x, n.y + t.y, n.z + t.z)
+    });
+    unit_or_fallback(sum, true)
+}
+
+/// The unit normals of `block`'s vertices, row-major `(quads + 1)²`, as a GPU computes them.
+///
+/// One vertex at a time, from the block's layout alone: the arithmetic the notes of
+/// [`gather_block`](crate::gather_block)'s module spell out, written out plainly, apart from
+/// `geom`'s own normals code. The reference a shader computing normals from a finest tile and
+/// its ring is checked against, and that `geom` and `store` check
+/// [`GatheredBlock::normals`](crate::GatheredBlock::normals) and the store's normals against,
+/// bit for bit.
+///
+/// `mesh` is the mesh the block was gathered over.
+#[must_use]
+pub fn ring_normals(mesh: &BaseMesh, block: &crate::GatheredBlock) -> Vec<Vec3> {
+    use crate::{VertexStencil, vertex_stencil};
+
+    let region = block.region();
+    let q = region.quads();
+    let vertices = (0..=q).flat_map(|j| (0..=q).map(move |i| (i, j)));
+    vertices
+        .map(|(i, j)| match vertex_stencil(mesh, region, i, j) {
+            VertexStencil::Axes([[ui, uj], [vi, vj]]) => {
+                let (i, j) = (i64::from(i), i64::from(j));
+                let at = |di: i32, dj: i32| block.get(i + i64::from(di), j + i64::from(dj));
+                let du = minus(at(ui, uj), at(-ui, -uj));
+                let dv = minus(at(vi, vj), at(-vi, -vj));
+                unit_or_fallback(cross(du, dv), du.is_finite() && dv.is_finite())
+            }
+            VertexStencil::Corner(c) => block.corner(usize::from(c)).map_or(NO_NORMAL, ring_normal),
+            VertexStencil::Outside => NO_NORMAL,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
