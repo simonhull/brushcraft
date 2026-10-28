@@ -20,6 +20,9 @@ if they disagree, raise it rather than drifting silently.
   through `[workspace.dependencies]`.
 - Performance claims need a `divan` benchmark before and after. Profile with `samply` before optimizing.
 - Never commit benchmark projects (`*.bcrf`); they are gigabytes.
+- Readability habits no lint checks: bind an iterator chain to a named variable rather than writing it in a `for`
+  header, and give a variable an explicit type rather than a turbofish where the type isn't obvious (`.into()`,
+  `.parse()`, `.collect()`).
 
 ## Commands
 
