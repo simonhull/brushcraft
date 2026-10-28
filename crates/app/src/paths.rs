@@ -1,86 +1,38 @@
-//! Which project files the app opens: never one inside the repository it was built from.
+//! Which project files the app opens: never one inside the source checkout it was built from.
 //!
 //! Opening a project writes beside it (a recovery file, locks, and saves into the file
-//! itself), and projects run to gigabytes, so a project inside the source tree is refused,
-//! whatever `.gitignore` says, as the benchmark harness refuses one. A copy of the binary
-//! run away from its repository refuses nothing.
+//! itself), and projects run to gigabytes, so a project inside the checkout is refused,
+//! whatever `.gitignore` says, as the benchmark harness refuses one. A binary built in a git
+//! worktree refuses the main checkout too ([`checkout`]).
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, ensure};
 
-/// `path` made absolute, checked to name a file outside the repository.
+/// `path` made absolute, checked to name a file outside the protected checkouts.
 ///
 /// # Errors
 ///
-/// If `path` can't be made absolute or resolved, names nothing, or lies inside the
-/// repository.
+/// If `path` can't be made absolute or resolved, lies inside a protected checkout, or names
+/// no file.
 pub(crate) fn project(path: &Path) -> Result<PathBuf> {
     let project =
         std::path::absolute(path).with_context(|| format!("making {} absolute", path.display()))?;
+    let inside = checkout::containing(&project)
+        .with_context(|| format!("resolving {}", project.display()))?;
+    if let Some(root) = inside {
+        anyhow::bail!(
+            "{} is inside the repository ({}); projects live outside it",
+            project.display(),
+            root.display()
+        );
+    }
     ensure!(
         project.is_file(),
         "{} isn't a project file",
         project.display()
     );
-    ensure!(
-        !inside_repo(&project)?,
-        "{} is inside the repository ({}); projects live outside it",
-        project.display(),
-        repo_root().display()
-    );
     Ok(project)
-}
-
-/// The repository the app was built from: two levels above this crate's manifest.
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
-}
-
-/// Whether `path` (absolute) lies inside the repository, symbolic links resolved.
-///
-/// # Errors
-///
-/// If resolving the path fails.
-fn inside_repo(path: &Path) -> Result<bool> {
-    let Ok(root) = repo_root().canonicalize() else {
-        // The repository isn't there any more (the binary was copied elsewhere): nothing to
-        // protect.
-        return Ok(false);
-    };
-    Ok(resolve(path)?.starts_with(root))
-}
-
-/// `path` (absolute) with its deepest existing ancestor's symbolic links resolved, and the
-/// rest appended with `.` and `..` applied lexically.
-///
-/// # Errors
-///
-/// If canonicalizing that ancestor fails.
-fn resolve(path: &Path) -> Result<PathBuf> {
-    let mut existing = path;
-    let mut rest = Vec::new();
-    while !existing.exists() {
-        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-            break;
-        };
-        rest.push(name);
-        existing = parent;
-    }
-    let mut resolved = existing
-        .canonicalize()
-        .with_context(|| format!("resolving {}", existing.display()))?;
-    let outward = rest.into_iter().rev();
-    for name in outward {
-        match Path::new(name).components().next() {
-            Some(Component::ParentDir) => {
-                resolved.pop();
-            }
-            Some(Component::CurDir) | None => {}
-            Some(_) => resolved.push(name),
-        }
-    }
-    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -90,23 +42,17 @@ mod tests {
 
     #[test]
     fn a_project_inside_the_repository_is_refused() {
-        let inside = repo_root().join("Cargo.toml");
+        let inside = checkout::build_root().join("Cargo.toml");
         let error = project(&inside).unwrap_err();
         assert!(
             error.to_string().contains("inside the repository"),
             "refused: {error}"
         );
-        let sneaky = std::env::temp_dir().join("..").join(
-            repo_root()
-                .canonicalize()
-                .unwrap()
-                .strip_prefix("/")
-                .unwrap(),
-        );
+        let missing = checkout::build_root().join("target").join("none.bcrf");
+        let unwritten = project(&missing).unwrap_err();
         assert!(
-            inside_repo(&std::path::absolute(sneaky.join("Cargo.toml")).unwrap()).unwrap(),
-            "through `..`: {}",
-            sneaky.display()
+            unwritten.to_string().contains("inside the repository"),
+            "refused whether it exists or not: {unwritten}"
         );
     }
 

@@ -17,6 +17,7 @@ display-study = ["geom/display-study", "dep:zstd"]
 
 [dependencies]
 anyhow.workspace = true
+checkout.workspace = true
 geom.workspace = true
 rustix = { workspace = true, features = ["process", "thread"] }
 sculpt.workspace = true

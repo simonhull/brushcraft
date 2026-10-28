@@ -2,11 +2,12 @@
 //! told otherwise.
 //!
 //! A benchmark project runs to gigabytes, and its recovery files as much again, so the harness
-//! refuses any path inside the repository it was built from, whatever `.gitignore` says.
+//! refuses any path inside the repository it was built from, whatever `.gitignore` says (and,
+//! built in a git worktree, inside the main checkout too: [`checkout`]).
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, anyhow, ensure};
+use anyhow::{Context as _, Result, anyhow, bail};
 
 /// The project file's name in the default directory.
 const DEFAULT_NAME: &str = "sphere.bcrf";
@@ -39,15 +40,15 @@ impl Paths {
             .ok_or_else(|| anyhow!("{} has no directory", project.display()))?;
         let recovery = dir.join("recovery");
         for path in [&project, &recovery] {
-            ensure!(
-                !inside_repo(path)?,
-                "{} is inside the repository ({}); benchmark files go outside it",
-                path.display(),
-                repo_root()
-                    .canonicalize()
-                    .unwrap_or_else(|_| repo_root())
-                    .display()
-            );
+            let inside = checkout::containing(path)
+                .with_context(|| format!("resolving {}", path.display()))?;
+            if let Some(root) = inside {
+                bail!(
+                    "{} is inside the repository ({}); benchmark files go outside it",
+                    path.display(),
+                    root.display()
+                );
+            }
         }
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(Self { project, recovery })
@@ -82,57 +83,9 @@ pub(crate) fn cache_root() -> Result<PathBuf> {
     Ok(cache.join("brushcraft"))
 }
 
-/// The repository the harness was built from: two levels above this crate's manifest.
+/// The repository the harness was built from: the checkout whose revision perf records.
 pub(crate) fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
-}
-
-/// Whether `path` (absolute) lies inside the repository, symbolic links resolved.
-///
-/// The path needn't exist: its deepest existing ancestor is resolved and the rest appended,
-/// with `..` and `.` taken lexically after that.
-///
-/// # Errors
-///
-/// If resolving an existing ancestor fails.
-fn inside_repo(path: &Path) -> Result<bool> {
-    let Ok(root) = repo_root().canonicalize() else {
-        // The repository isn't there any more (the binary was copied elsewhere): nothing to
-        // protect.
-        return Ok(false);
-    };
-    Ok(resolve(path)?.starts_with(root))
-}
-
-/// `path` (absolute) with its deepest existing ancestor's symbolic links resolved, and the
-/// rest appended with `.` and `..` applied lexically.
-///
-/// # Errors
-///
-/// If canonicalizing that ancestor fails.
-fn resolve(path: &Path) -> Result<PathBuf> {
-    let mut existing = path;
-    let mut rest = Vec::new();
-    while !existing.exists() {
-        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-            break;
-        };
-        rest.push(name);
-        existing = parent;
-    }
-    let mut resolved = existing
-        .canonicalize()
-        .with_context(|| format!("resolving {}", existing.display()))?;
-    for name in rest.into_iter().rev() {
-        match Path::new(name).components().next() {
-            Some(Component::ParentDir) => {
-                resolved.pop();
-            }
-            Some(Component::CurDir) | None => {}
-            Some(_) => resolved.push(name),
-        }
-    }
-    Ok(resolved)
+    checkout::build_root()
 }
 
 #[cfg(test)]
@@ -158,9 +111,10 @@ mod tests {
                     .unwrap(),
             )
             .join("y.bcrf");
+        let through = Paths::resolve(Some(&sneaky)).unwrap_err();
         assert!(
-            inside_repo(&std::path::absolute(&sneaky).unwrap()).unwrap(),
-            "through `..`: {}",
+            through.to_string().contains("inside the repository"),
+            "through `..`: {}: {through}",
             sneaky.display()
         );
     }

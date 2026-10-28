@@ -15,6 +15,7 @@ input = { path = "crates/input" }
 brush = { path = "crates/brush" }
 sculpt = { path = "crates/sculpt" }
 render = { path = "crates/render" }
+checkout = { path = "crates/checkout" }
 anyhow = "1.0.100"
 # 0.13.4, not 0.13.7: bolero-generator-derive 0.13.5 (pulled in by bolero 0.13.5 and later) pins
 # indexmap to exactly 2.11.2, and wgpu 30 needs 2.11.4 or later. Return to the latest once the
