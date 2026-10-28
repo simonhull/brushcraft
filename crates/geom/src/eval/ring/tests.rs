@@ -393,3 +393,84 @@ fn stencils_name_corners_borders_and_the_inside() {
         "a face vertex off the block"
     );
 }
+
+#[test]
+fn a_rings_owner_corner_is_the_owner_faces_corner() {
+    let mesh = subdivided_pentagonal_prism().expect("a valid mesh");
+    let dense = evaluated(&mesh, 3, 29);
+    let top = level(3);
+    let n = top.face_quads();
+    let mut owner_corners = std::collections::BTreeSet::new();
+    for (key, block) in &blocks(&mesh, &dense, top) {
+        let region = block.region();
+        let q = region.quads();
+        for (c, (ci, cj)) in [(0, 0), (q, 0), (q, q), (0, q)].into_iter().enumerate() {
+            let ring = block
+                .corner(c)
+                .expect("a whole face's corners are base vertices");
+            let (fi, fj) = (region.x0() + ci, region.y0() + cj);
+            let around = mesh
+                .topology()
+                .ring(region.face(), crate::topology::corner_at(fi, fj, n))
+                .expect("a base vertex");
+            let &(_, owner_corner) = around.entries.first().expect("an owner");
+            assert_eq!(ring.owner_corner(), owner_corner, "{key:?} corner {c}");
+            owner_corners.insert(owner_corner);
+        }
+    }
+    assert!(owner_corners.len() > 1, "owners at several corners");
+}
+
+#[test]
+fn rings_are_equal_only_when_every_part_is() {
+    /// A valence-3 ring: centre `c`, points `edge` and `diagonal` apart, owner corner `owner`.
+    fn ring(c: f32, edge: f32, diagonal: f32, owner: u8) -> GatheredRing {
+        let mut ring = CornerRing::new(Vec3::new(c, 0.0, 0.0), owner);
+        for k in 0..3_u8 {
+            let k = f32::from(k);
+            ring.push(
+                Vec3::new(edge + k, 1.0, 0.0),
+                Vec3::new(diagonal + k, 1.0, 1.0),
+            );
+        }
+        GatheredRing { ring }
+    }
+    let base = ring(0.0, 1.0, 2.0, 1);
+    assert_eq!(base, ring(0.0, 1.0, 2.0, 1), "the same parts");
+    assert_ne!(base, ring(0.5, 1.0, 2.0, 1), "another centre");
+    assert_ne!(base, ring(0.0, 1.5, 2.0, 1), "other edge points");
+    assert_ne!(base, ring(0.0, 1.0, 2.5, 1), "other diagonals");
+    assert_ne!(base, ring(0.0, 1.0, 2.0, 2), "another owner corner");
+    assert_eq!(base.valence(), 3, "three faces");
+}
+
+#[test]
+fn a_ring_point_that_isnt_finite_gives_nan_at_its_base_vertex() {
+    /// The dense evaluation, but for one edge neighbour of face 0's first corner, infinite.
+    struct Poisoned<'a>(&'a DenseEvaluation);
+    impl PositionSource for Poisoned<'_> {
+        fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
+            let p = self.0.position(face, level, i, j)?;
+            Some(if (face, i, j) == (FaceId::new(0), 1, 0) {
+                Vec3::new(f32::INFINITY, p.y, p.z)
+            } else {
+                p
+            })
+        }
+    }
+    let (mesh, dense) = sphere();
+    let region = Region::whole_face(FaceId::new(0), level(2));
+    let block = gather_block(&mesh, &Poisoned(&dense), region).expect("gathers");
+    let got = block.normals(&mesh);
+    let reference = ring_normals(&mesh, &block);
+    assert!(
+        got.get(0, 0).expect("a vertex").x.is_nan(),
+        "NaN at the base vertex"
+    );
+    let bits = |v: &[Vec3]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(got.as_slice()),
+        bits(&reference),
+        "the reference agrees"
+    );
+}

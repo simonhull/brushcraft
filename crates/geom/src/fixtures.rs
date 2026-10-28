@@ -160,12 +160,13 @@ const fn minus(a: Vec3, b: Vec3) -> Vec3 {
 }
 
 /// The normal at a base vertex from its ring: `Σ_k (e_k − v) × (e_{k+1} − v)` from the owner,
-/// wrapping, at unit length; NaN for a ring that isn't finite or has fewer than two points.
+/// wrapping, at unit length; NaN for a ring that isn't finite. (A valid mesh's rings have three
+/// points at least.)
 fn ring_normal(ring: &crate::GatheredRing) -> Vec3 {
     let v = ring.center();
     let edges = ring.edges();
     let finite = v.is_finite() && edges.iter().all(|e| e.is_finite());
-    if !finite || edges.len() < 2 {
+    if !finite {
         return NO_NORMAL;
     }
     let next = edges.iter().cycle().skip(1);

@@ -397,5 +397,9 @@ mod tests {
             std::hint::black_box(EvaluatedTile::BYTES) > least,
             "a finished tile is counted at its positions, ring, normals and corner rings at least"
         );
+        assert!(
+            std::hint::black_box(EvaluatedTile::BYTES) < least + 4096,
+            "and at little more"
+        );
     }
 }
