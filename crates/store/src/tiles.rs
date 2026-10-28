@@ -146,6 +146,7 @@ mod layers;
 mod page;
 mod persist;
 mod pins;
+mod queued;
 mod read;
 mod read_ahead;
 mod ring;
@@ -274,7 +275,9 @@ impl StoreId {
 /// budget, at most 64 MiB, written through down to half of it once past it; passed only by what
 /// the store records while it can't write them through: a recovery flush is between its cut and
 /// its save point, the working file is read-only or a failed recovery file, or a write through
-/// failed since the last flush). Besides them, and not charged to the budget:
+/// failed since the last flush), and the queued evaluation's finished tiles and keys
+/// ([`StoreConfig::evaluation_bytes`], a sixty-fourth of the budget, at most 64 MiB, holding a
+/// round of tiles however small). Besides them, and not charged to the budget:
 ///
 /// - the display tiles the workers are building or decoding, and the inputs handed to them: a slice
 ///   hands out a few at a time, at most one a worker in flight;
@@ -410,6 +413,13 @@ pub struct TileStore {
     epoch_keys: BTreeSet<TileKey>,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,
+    /// The queued evaluation (see [`crate::queued`]): finest tiles wanted by priority, run in
+    /// slices by [`TileStore::run_jobs`] beside the display jobs.
+    evaluation: crate::queued::EvaluationQueue,
+    /// Whether the next call to [`TileStore::run_jobs`] gives its first slice to the queued
+    /// evaluation (else to the display jobs): the turn carries across calls, so neither side
+    /// starves however short the calls.
+    evaluation_next: bool,
     /// The change feed: every key an edit changed, with its op.
     feed: ChangeFeed,
     /// Save's place in the feed.

@@ -59,6 +59,13 @@ pub(super) struct TestHooks {
     pub(super) hold_finished: bool,
     /// The results held back while [`TestHooks::hold_finished`] is set.
     pub(super) held_finished: Vec<crate::jobs::Finished>,
+    /// Whether the tiles the queued evaluation finishes are held back, as if still being
+    /// evaluated, until this is set back (then they are kept for the caller at the next slice,
+    /// as of the count of correction changes they were copied at): for tests of tiles finished
+    /// before a write.
+    pub(super) hold_evaluated: bool,
+    /// The tiles held back while [`TestHooks::hold_evaluated`] is set.
+    pub(super) held_evaluated: Vec<crate::queued::EvaluatedTile>,
     /// Whether [`TileStore::tile_border`](super::TileStore::tile_border) gives `None` for every
     /// tile, as it would for a tile holding a border vertex twice: for tests of the edits'
     /// fallback, which no valid mesh reaches.

@@ -81,6 +81,12 @@ pub struct JobsReport {
     /// Display tiles that wouldn't build (extreme geometry, say), left unknown and skipped
     /// until a change lands (see [`TileStore::failed_display`](crate::TileStore::failed_display)).
     pub failed: usize,
+    /// Finest tiles the queued evaluation finished
+    /// ([`TileStore::queue_evaluation`](crate::TileStore::queue_evaluation)), now waiting for
+    /// [`TileStore::take_evaluated`](crate::TileStore::take_evaluated).
+    pub queue_finished: usize,
+    /// Finest tiles still queued for evaluation, not finished.
+    pub queue_left: usize,
 }
 
 impl JobsReport {

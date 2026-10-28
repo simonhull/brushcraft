@@ -28,6 +28,7 @@ mod op;
 mod pool;
 mod prefetch;
 mod project;
+mod queued;
 mod record;
 mod recovery;
 mod shared_map;
@@ -57,6 +58,7 @@ pub use project::{
     CandidateStatus, KeptRecovery, Project, ProjectConfig, ProjectError, Protection,
     ROLL_OVER_RETRY, RecoveryCandidate, SaveOutcome, default_recovery_dir, find_recoveries,
 };
+pub use queued::EvaluatedTile;
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 pub use stale::{DEFAULT_STALE_CAP, Drained, Epoch, StaleCursor};
 pub use tiles::{

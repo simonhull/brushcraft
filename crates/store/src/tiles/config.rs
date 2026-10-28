@@ -114,6 +114,8 @@ impl StoreConfig {
     /// The most [`StoreConfig::display_waiting_bytes`] gives the display records waiting for the
     /// working file.
     pub const MAX_DISPLAY_WAITING_BYTES: usize = 64 << 20;
+    /// The most [`StoreConfig::evaluation_bytes`] gives the queued evaluation.
+    pub const MAX_EVALUATION_BYTES: usize = 64 << 20;
     /// The bytes of the budget one tile's stroke state is charged:
     /// two `f32` (the start and the summed deltas) per vertex of the largest tile,
     /// `(TILE_QUADS + 1)²` of them, so 33,800 bytes.
@@ -213,6 +215,31 @@ impl StoreConfig {
             share
         } else {
             Self::MAX_DISPLAY_WAITING_BYTES
+        }
+    }
+
+    /// The bytes of the budget the queued evaluation may hold (see
+    /// [`TileStore::queue_evaluation`](super::TileStore::queue_evaluation)): the finished tiles
+    /// waiting to be taken, copies of their positions with the ring and their normals, about
+    /// 105 KB each, and the keys queued. A sixty-fourth of the budget, at most 64 MiB (about 600
+    /// finished tiles, a few frames of a renderer's requests). Zero without a display layer: a
+    /// store without one isn't drawn, and its queue holds only the few entries below.
+    ///
+    /// Charged to the budget as a reserved share, after the waiting display records, as much of
+    /// it as the budget has left. The job is held to it, each tile at its largest, except that
+    /// it holds a round of finished tiles and a thousand keys however small the share (so it
+    /// still makes progress), which a tiny budget may take past it. Once it holds as many
+    /// finished tiles as the share does, it evaluates no more until the caller takes them.
+    #[must_use]
+    pub const fn evaluation_bytes(&self) -> usize {
+        if self.display.is_none() {
+            return 0;
+        }
+        let share = self.budget_bytes / 64;
+        if share < Self::MAX_EVALUATION_BYTES {
+            share
+        } else {
+            Self::MAX_EVALUATION_BYTES
         }
     }
 
@@ -419,16 +446,20 @@ pub(super) struct Shares {
     /// The waiting display records' share ([`StoreConfig::display_waiting_bytes`], or what was
     /// left).
     pub(super) waiting: usize,
+    /// The queued evaluation's share ([`StoreConfig::evaluation_bytes`], or what was left).
+    pub(super) evaluation: usize,
 }
 
 /// The budget's reserved shares, once checked to fit beside the pools' minimum.
 ///
 /// The shares are the kept predictions' ([`StoreConfig::kept_prediction_bytes`]), the
 /// stroke state's ([`StoreConfig::stroke_state_bytes`]), the display floor's (`floor`), the
-/// display caches' ([`StoreConfig::display_cache_bytes`]) and the waiting display records'
-/// ([`StoreConfig::display_waiting_bytes`]); `config`'s budget is checked to hold the first
+/// display caches' ([`StoreConfig::display_cache_bytes`]), the waiting display records'
+/// ([`StoreConfig::display_waiting_bytes`]) and the queued evaluation's
+/// ([`StoreConfig::evaluation_bytes`]); `config`'s budget is checked to hold the first
 /// three beside the pools' minimum for `headroom`, the kept predictions first. The caches, then
-/// the waiting records, get what is left of their shares, which may be nothing.
+/// the waiting records, then the queued evaluation, get what is left of their shares, which may
+/// be nothing.
 ///
 /// # Errors
 ///
@@ -470,9 +501,11 @@ pub(super) fn reserved_shares(
     let spare = spare - floor;
     let caches = config.display_cache_bytes().min(spare);
     let waiting = config.display_waiting_bytes().min(spare - caches);
+    let evaluation = config.evaluation_bytes().min(spare - caches - waiting);
     Ok(Shares {
-        reserved: kept + stroke + floor + caches + waiting,
+        reserved: kept + stroke + floor + caches + waiting + evaluation,
         caches,
         waiting,
+        evaluation,
     })
 }

@@ -101,17 +101,7 @@ impl TileStore {
         base: Option<BaseFile>,
         config: StoreConfig,
     ) -> Result<Self, CacheError> {
-        if config.site == RESERVED_SITE {
-            return Err(CacheError::ReservedSite);
-        }
-        let mesh_hash = working.meta().mesh_hash();
-        if base
-            .as_ref()
-            .is_some_and(|base| base.meta().mesh_hash() != mesh_hash)
-        {
-            return Err(CacheError::MeshMismatch);
-        }
-        check_layers(working.meta(), base.as_ref())?;
+        let mesh_hash = check_open(&working, base.as_ref(), &config)?;
         let mesh = working.mesh();
         let headroom = Headroom::of(&mesh);
         let shares = reserved_shares(headroom, &config, config.floor_bytes(&mesh))?;
@@ -160,6 +150,10 @@ impl TileStore {
             display_waiting_share: shares.waiting,
             display_through_failed: false,
             jobs: std::collections::VecDeque::new(),
+            evaluation: crate::queued::EvaluationQueue::new(crate::queued::EvaluationCaps::of(
+                shares.evaluation,
+            )),
+            evaluation_next: false,
             bumped: std::collections::BTreeMap::new(),
             display_failed: std::collections::BTreeMap::new(),
             refresh_seen: u64::MAX,
@@ -765,4 +759,27 @@ impl TileStore {
 /// [`crate::display`]): only those are saved, carried and checked as edits.
 fn is_correction(key: &TileKey) -> bool {
     !is_display(key)
+}
+
+/// Checks that a store may open over `working` and `base` with `config`; returns the mesh hash
+/// both files carry.
+///
+/// # Errors
+///
+/// [`CacheError::ReservedSite`] for the reserved site; [`CacheError::MeshMismatch`] if the base
+/// is of another mesh; the errors of [`check_layers`].
+fn check_open(
+    working: &ProjectFile,
+    base: Option<&BaseFile>,
+    config: &StoreConfig,
+) -> Result<u128, CacheError> {
+    if config.site == RESERVED_SITE {
+        return Err(CacheError::ReservedSite);
+    }
+    let mesh_hash = working.meta().mesh_hash();
+    if base.is_some_and(|base| base.meta().mesh_hash() != mesh_hash) {
+        return Err(CacheError::MeshMismatch);
+    }
+    check_layers(working.meta(), base)?;
+    Ok(mesh_hash)
 }

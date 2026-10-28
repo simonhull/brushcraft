@@ -46,6 +46,7 @@ mod floor;
 mod invalidate;
 mod layered;
 mod prefetch;
+mod queued;
 mod recovery;
 mod ring;
 mod rounds_kept;

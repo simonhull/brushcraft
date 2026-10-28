@@ -2,8 +2,8 @@
 //!
 //! The tile's evaluated positions, the ring of neighbouring vertices around it and the rings of
 //! the base vertices at its corners, gathered from the cached evaluated tiles as `geom`'s normals
-//! gather them: what a GPU needs to compute a finest tile's normals itself, with the bits the store's own
-//! normals have (see [`GatheredBlock`] for the layout and the arithmetic).
+//! gather them: what a GPU needs to compute a finest tile's normals itself, with the bits the
+//! store's own normals have (see [`GatheredBlock`] for the layout and the arithmetic).
 
 use std::collections::BTreeSet;
 

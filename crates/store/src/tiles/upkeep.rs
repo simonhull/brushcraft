@@ -31,6 +31,7 @@ use geom::{
 use super::TileStore;
 use super::config::Evaluation;
 use super::error::CacheError;
+use super::queued::Turn;
 use crate::bounds::Kept;
 use crate::display::{DisplayRecord, StoredDisplay, tent_reads};
 use crate::file::{FileError, FileReader, Loc, display_record, unknown_display_len};
@@ -371,6 +372,26 @@ enum Readiness {
     Needs(Vec<TileKey>),
 }
 
+/// Where each side of [`TileStore::run_jobs`] stands within one call.
+#[derive(Debug, Clone, Copy, Default)]
+struct Sides {
+    /// What the display jobs wait for, if they can do nothing on the owner thread now.
+    display: Option<Progress>,
+    /// What the queued evaluation waits for, or that it found nothing to do, if so.
+    queue: Option<Turn>,
+    /// Whether the next turn, both sides having work, is the queued evaluation's.
+    queue_next: bool,
+}
+
+/// Counts a slice that took `took` in `report`.
+fn note_slice(report: &mut JobsReport, took: std::time::Duration) {
+    report.longest_slice = report.longest_slice.max(took);
+    if took > crate::jobs::SLICE_TARGET {
+        report.long_slices += 1;
+    }
+    report.slices += 1;
+}
+
 /// What one step through a cone of finest tiles did (see [`TileStore::step_cone`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ConeStep {
@@ -549,16 +570,23 @@ impl TileStore {
     /// The display tiles are built on the store's workers; the owner thread runs short slices
     /// that collect and record what they finished, hand them more, or evaluate a few finest
     /// tiles, so the deadline is honoured to within one slice ([`JobsReport::longest_slice`]).
-    /// With nothing to do but wait for the workers, it waits, until a tile is finished or the
-    /// deadline passes. A tile the workers built from inputs a write has since changed is built
-    /// again.
+    /// A tile the workers built from inputs a write has since changed is built again.
+    ///
+    /// The queued evaluation ([`TileStore::queue_evaluation`]) runs beside the display jobs,
+    /// the two taking turns slice by slice: neither waits behind the other's whole job. A side
+    /// with nothing to do on the owner thread (waiting for the workers, or for reads to land)
+    /// gives its turn to the other; only when neither has anything to do does the call wait,
+    /// until a display tile is finished, a moment for reads, or the deadline. The turn carries
+    /// across calls (a call's first slice goes to the side that didn't run last), so neither
+    /// side starves however short the calls.
     ///
     /// # Errors
     ///
     /// [`CacheError::Eval`] if listing what a write made stale fails (never, for tiles of the
     /// store's mesh); [`CacheError::Store`] if a display record can't be read; the errors of
-    /// [`TileStore::evaluate_many`]. The job stays queued, its tiles still to build. A tile that
-    /// won't build is no error: it is reported and skipped ([`TileStore::failed_display`]).
+    /// [`TileStore::evaluate_many`]. The job stays queued, its tiles still to build or evaluate.
+    /// A tile that won't build is no error: it is reported and skipped
+    /// ([`TileStore::failed_display`]).
     pub fn run_jobs(&mut self, deadline: Instant) -> Result<JobsReport, CacheError> {
         let mut report = JobsReport::default();
         if let Some(finest) = self.display_finest {
@@ -570,48 +598,114 @@ impl TileStore {
             let decoded = self.display_decoded.take();
             self.workers.spawn(move || drop(decoded));
         }
+        let mut sides = Sides {
+            queue_next: self.evaluation_next,
+            ..Sides::default()
+        };
+        let ran = self.run_sides(deadline, &mut sides, &mut report);
+        self.evaluation_next = sides.queue_next;
+        ran?;
+        report.left = self.jobs.iter().map(Job::left).sum();
+        report.queue_left = self.evaluation.len();
+        Ok(report)
+    }
+
+    /// [`TileStore::run_jobs`]'s slices, taking turns between the display jobs and the queued
+    /// evaluation as `sides` says, until `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::run_jobs`].
+    fn run_sides(
+        &mut self,
+        deadline: Instant,
+        sides: &mut Sides,
+        report: &mut JobsReport,
+    ) -> Result<(), CacheError> {
         while Instant::now() < deadline {
-            let Some(mut job) = self.jobs.pop_front() else {
-                break;
+            let display_ready = !self.jobs.is_empty() && sides.display.is_none();
+            let queue_ready = sides.queue.is_none() && self.evaluation.has_work(self.edits);
+            let run_queue = match (display_ready, queue_ready) {
+                (true, true) => sides.queue_next,
+                (false, true) => true,
+                (true, false) => false,
+                (false, false) => {
+                    if !self.wait_for_sides(deadline, sides) {
+                        break;
+                    }
+                    continue;
+                }
             };
+            sides.queue_next = !run_queue;
             let began = Instant::now();
-            let progress = self.slice(&mut job, &mut report);
-            let took = began.elapsed();
-            report.longest_slice = report.longest_slice.max(took);
-            if took > crate::jobs::SLICE_TARGET {
-                report.long_slices += 1;
+            if run_queue {
+                let turn = self.evaluation_slice(report);
+                note_slice(report, began.elapsed());
+                sides.queue = match turn? {
+                    Turn::Worked => None,
+                    waiting @ (Turn::Reading | Turn::Idle) => Some(waiting),
+                };
+                // The display jobs may have something to collect by now.
+                sides.display = None;
+                continue;
             }
-            report.slices += 1;
+            let Some(mut job) = self.jobs.pop_front() else {
+                continue;
+            };
+            let progress = self.slice(&mut job, report);
+            note_slice(report, began.elapsed());
             match progress {
                 Ok(Progress::Done) => report.finished += 1,
                 Ok(Progress::More) => self.jobs.push_front(job),
                 Ok(wait @ (Progress::Waiting | Progress::Reading)) => {
-                    // Waiting on the workers, until one finishes a tile; on reads, a moment
-                    // (they land in the store, not on the channel), or until a tile is back.
-                    let until = deadline
-                        .checked_sub(crate::jobs::WAKE_MARGIN)
-                        .unwrap_or(deadline);
-                    let until = if wait == Progress::Reading {
-                        until.min(Instant::now() + crate::jobs::READ_WAIT)
-                    } else {
-                        until
-                    };
-                    job.upkeep().wait_until(until);
                     self.jobs.push_front(job);
-                    if deadline.saturating_duration_since(Instant::now())
-                        <= crate::jobs::WAKE_MARGIN
-                    {
-                        break;
-                    }
+                    sides.display = Some(wait);
                 }
                 Err(e) => {
                     self.jobs.push_front(job);
                     return Err(e);
                 }
             }
+            // The queued evaluation's reads may have landed by now.
+            if sides.queue == Some(Turn::Reading) {
+                sides.queue = None;
+            }
         }
-        report.left = self.jobs.iter().map(Job::left).sum();
-        Ok(report)
+        Ok(())
+    }
+
+    /// With neither side of [`TileStore::run_jobs`] able to do anything on the owner thread,
+    /// waits for one: until a worker finishes a display tile (when the display jobs wait on
+    /// the workers), a moment (when a side waits on reads, which land in the store, not on the
+    /// channel), or the deadline. Returns whether to go on: a side was waiting, and the deadline
+    /// leaves time after the wait.
+    fn wait_for_sides(&mut self, deadline: Instant, sides: &mut Sides) -> bool {
+        let reading = sides.queue == Some(Turn::Reading);
+        let display = sides.display;
+        if display.is_none() && !reading {
+            // Nothing to do, nothing to wait for.
+            return false;
+        }
+        let until = deadline
+            .checked_sub(crate::jobs::WAKE_MARGIN)
+            .unwrap_or(deadline);
+        let until = if reading || display == Some(Progress::Reading) {
+            until.min(Instant::now() + crate::jobs::READ_WAIT)
+        } else {
+            until
+        };
+        let left = until.saturating_duration_since(Instant::now());
+        match self.jobs.front_mut() {
+            Some(job) if display.is_some() => job.upkeep().wait_until(until),
+            // A sleep of nothing still gives the thread up, for as long as the scheduler likes.
+            _ if left.is_zero() => {}
+            _ => std::thread::sleep(left),
+        }
+        sides.display = None;
+        if reading {
+            sides.queue = None;
+        }
+        deadline.saturating_duration_since(Instant::now()) > crate::jobs::WAKE_MARGIN
     }
 
     /// Queues building the display tiles of `level` alone (a level below `finest`) the store
@@ -630,18 +724,21 @@ impl TileStore {
         )));
     }
 
-    /// Drops every queued job, where it is: what they had built stays. Tiles the workers are
+    /// Drops every queued job, where it is: what they had built stays, and so do the tiles the
+    /// queued evaluation finished, for [`TileStore::take_evaluated`]. Tiles the workers are
     /// building are dropped when they finish. The next [`TileStore::run_jobs`] looks for the
     /// display tiles writes left unknown again, so a refresh dropped here is queued anew.
     pub fn clear_jobs(&mut self) {
         self.jobs.clear();
+        self.evaluation.clear();
         self.refresh_seen = u64::MAX;
     }
 
-    /// Whether any job is queued (tiles still to build, or being built).
+    /// Whether any job has work left: display tiles still to build (or being built), or tiles
+    /// queued for evaluation with room to finish them (or finished tiles to bring up to date).
     #[must_use]
     pub fn has_jobs(&self) -> bool {
-        !self.jobs.is_empty()
+        !self.jobs.is_empty() || self.evaluation.has_work(self.edits)
     }
 
     /// One slice of `job`: records what the workers finished, hands them the next tiles whose
