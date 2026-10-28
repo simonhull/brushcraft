@@ -28,8 +28,10 @@
 //!
 //! Before each stroke the child records the whole display layer. Some children write every
 //! display record through to the recovery file as they record it, between flushes, instead of
-//! holding it for the next one: a crash then leaves records past the last save point, which the
-//! restore must discard, and records the save points name, which must be current or unknown.
+//! holding it for the next one, and one crashing mid-stroke records the layer again after the
+//! stroke's edits: a crash then leaves records past the last save point, built from a state no
+//! save point holds, which the restore must discard, and records the save points name, which
+//! must be current or unknown.
 //!
 //! The parent checks that the child died of `SIGKILL`, lists the recovery files, restores the
 //! one it finds, and checks the evaluation against the dense evaluation of exactly the edits
@@ -330,9 +332,18 @@ fn crash_child() {
                 );
             }
             if scenario.through {
+                // The layer again, of the interrupted stroke's state, which no save point
+                // holds: its records, written through, must go with the tail.
+                let layer = display_layer(project.store());
+                project.store().record_display(&layer).unwrap();
+                assert_eq!(
+                    project.store().display_waiting().0,
+                    0,
+                    "every display record written through before the crash"
+                );
                 assert!(
-                    project.store().working().display_keys().next().is_some(),
-                    "display records written through before the crash"
+                    project.store().working().has_unsaved_records(),
+                    "records past the last save point"
                 );
             }
         }
@@ -550,9 +561,10 @@ fn a_crash_mid_flush_restores_the_previous_or_the_new_stroke_never_a_mix() {
 /// A crash after display records were written through restores a layer no older than its tiles.
 ///
 /// Every display record goes to the recovery file as it is recorded, between flushes. A crash
-/// mid-stroke (after the layer's records, before the stroke's save point) or mid-flush restores
-/// a layer no older or newer than its tiles: the records past the last save point go with the
-/// rest of the tail, and those a save point names are current or unknown.
+/// mid-stroke (the layer recorded before the stroke's edits and again after them, of a state no
+/// save point holds, before the stroke's save point) or mid-flush restores a layer no older or
+/// newer than its tiles: the records past the last save point go with the rest of the tail, and
+/// those a save point names are current or unknown.
 #[test]
 fn a_crash_after_display_records_written_through_restores_a_current_layer() {
     for (saved, strokes) in [(true, 0), (true, 3), (false, 2)] {
