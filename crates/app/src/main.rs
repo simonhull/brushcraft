@@ -24,7 +24,7 @@ mod test_dir;
 mod window;
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
@@ -59,22 +59,46 @@ pub(crate) fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
     format!("{} ({:?})", info.name, info.backend)
 }
 
-/// Opens the project at `path` with a display layer under `options.level`, its recovery file
-/// in the app's recovery directory.
+/// A project checked and ready to open, opened only once the GPU (and the window) are.
 ///
-/// # Errors
-///
-/// If the path is refused (missing, or inside the repository), there is no recovery
-/// directory, or the project doesn't open.
-fn open_project(path: &Path, options: &Options) -> Result<Project> {
-    let path = paths::project(path)?;
-    let recovery_dir = default_recovery_dir()
-        .ok_or_else(|| anyhow!("neither XDG_STATE_HOME nor HOME is an absolute path"))?;
-    let config = ProjectConfig {
-        store: StoreConfig::new(options.budget_bytes, SITE).with_display(options.level),
-        recovery_dir,
-    };
-    Project::open(&path, config).with_context(|| format!("opening {}", path.display()))
+/// Opening a project makes a recovery file, so a launch that fails before the project opens
+/// leaves none behind, and one that fails after closes it.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectToOpen {
+    /// The project file: absolute, and outside the repository.
+    path: PathBuf,
+    /// How to open it.
+    config: ProjectConfig,
+}
+
+impl ProjectToOpen {
+    /// The project `options` name, with a display layer under `options.level` and its recovery
+    /// file in the app's recovery directory.
+    ///
+    /// # Errors
+    ///
+    /// If the path is refused (missing, or inside the repository) or there is no recovery
+    /// directory.
+    fn new(options: &Options) -> Result<Self> {
+        let path = paths::project(&options.project)?;
+        let recovery_dir = default_recovery_dir()
+            .ok_or_else(|| anyhow!("neither XDG_STATE_HOME nor HOME is an absolute path"))?;
+        let config = ProjectConfig {
+            store: StoreConfig::new(options.budget_bytes, SITE).with_display(options.level),
+            recovery_dir,
+        };
+        Ok(Self { path, config })
+    }
+
+    /// Opens it.
+    ///
+    /// # Errors
+    ///
+    /// If the project doesn't open (it leaves no recovery file then).
+    pub(crate) fn open(self) -> Result<Project> {
+        Project::open(&self.path, self.config)
+            .with_context(|| format!("opening {}", self.path.display()))
+    }
 }
 
 /// Runs the app in a window until it closes (or has drawn a scripted run's frames).
@@ -82,7 +106,7 @@ fn open_project(path: &Path, options: &Options) -> Result<Project> {
 /// # Errors
 ///
 /// If the event loop or the window fails, or the frame loop does.
-fn run_window(options: Options, project: Project) -> Result<Summary> {
+fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
     let (done, outcome) = mpsc::channel();
     let ran = EventLoop::new()
         .context("starting the event loop")?
@@ -97,16 +121,19 @@ fn run_window(options: Options, project: Project) -> Result<Summary> {
     Ok(summary)
 }
 
-/// Runs the app offscreen for `frames` frames, then closes the project.
+/// Runs the app offscreen for `frames` frames, then closes the project. The GPU, the target
+/// and the render thread come first, the project last.
 ///
 /// # Errors
 ///
-/// If the GPU or the target can't be opened, a frame fails, or the project doesn't close.
-fn run_offscreen(options: &Options, project: Project, frames: u64) -> Result<Summary> {
+/// If the GPU or the target can't be opened, the project doesn't open, a frame fails, or the
+/// project doesn't close.
+fn run_offscreen(options: &Options, project: ProjectToOpen, frames: u64) -> Result<Summary> {
     let gpu = Arc::new(Gpu::open(&options.adapter).context("opening the GPU")?);
     let adapter = describe_adapter(gpu.adapter_info());
     let target = Target::Offscreen(Offscreen::new(&gpu, options.size)?);
     let mut render = RenderThread::spawn(gpu, target, Hooks::none())?;
+    let project = project.open()?;
     let presentation = render.presentation();
     let setup = Setup {
         size: Some(options.size),
@@ -150,14 +177,14 @@ fn drive_offscreen(owner: &mut Owner<NoBrush, NoUploads>, render: &mut RenderThr
     Ok(())
 }
 
-/// Parses the command line, opens the project, runs, and prints a line saying how it went.
+/// Parses the command line, checks the project, runs, and prints a line saying how it went.
 ///
 /// # Errors
 ///
 /// If the arguments don't parse, the project doesn't open, or the run fails.
 fn main() -> Result<()> {
     let options = Options::parse(std::env::args_os().skip(1))?;
-    let project = open_project(&options.project, &options)?;
+    let project = ProjectToOpen::new(&options)?;
     let summary = match options.mode {
         Mode::Offscreen { frames } => run_offscreen(&options, project, frames)?,
         Mode::Window { .. } => run_window(options.clone(), project)?,

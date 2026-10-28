@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use render::surface::{Size, Target, WindowSurface};
-use store::Project;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{
@@ -29,7 +28,7 @@ use crate::frame::schedule::Next;
 use crate::frame::{NoBrush, NoUploads, Owner, Setup};
 use crate::navigate::{Button, Input, Modifiers};
 use crate::render_thread::{Hooks, RenderThread};
-use crate::{Summary, describe_adapter};
+use crate::{ProjectToOpen, Summary, describe_adapter};
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -57,8 +56,9 @@ struct Running {
 pub(crate) struct WindowApp {
     /// The command line.
     options: Options,
-    /// The project, until the window opens and the frame loop takes it.
-    project: Option<Project>,
+    /// The project to open, until the window, its surface and the render thread are up and
+    /// the frame loop opens it.
+    project: Option<ProjectToOpen>,
     /// The running app, once the window exists.
     running: Option<Running>,
     /// Where the run's outcome goes when the loop exits.
@@ -69,7 +69,7 @@ impl WindowApp {
     /// An app that opens `project` in a window as `options` say, reporting to `done`.
     pub(crate) const fn new(
         options: Options,
-        project: Project,
+        project: ProjectToOpen,
         done: Sender<Result<Summary>>,
     ) -> Self {
         Self {
@@ -80,11 +80,14 @@ impl WindowApp {
         }
     }
 
-    /// Opens the window, its surface and the render thread, and starts the frame loop.
+    /// Opens the window, its surface and the render thread, then the project, and starts the
+    /// frame loop. The project comes last, so a launch that fails before it leaves no recovery
+    /// file.
     ///
     /// # Errors
     ///
-    /// If the window, the surface, the GPU or the render thread can't be made.
+    /// If the window, the surface, the GPU or the render thread can't be made, or the project
+    /// doesn't open.
     fn open(&mut self, event_loop: &dyn ActiveEventLoop) -> Result<Running> {
         let project = self
             .project
@@ -110,6 +113,7 @@ impl WindowApp {
             move || presenting.pre_present_notify(),
         );
         let render = RenderThread::spawn(gpu, Target::Window(surface), hooks)?;
+        let project = project.open()?;
         let frames = match self.options.mode {
             crate::cli::Mode::Window { frames } => frames,
             crate::cli::Mode::Offscreen { .. } => None,

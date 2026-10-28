@@ -109,6 +109,33 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_that_fails_before_drawing_leaves_no_recovery_file() {
+        let scratch = Scratch::new("bad-adapter");
+        let project = scratch.0.join("small.bcrf");
+        let state = scratch.0.join("state");
+        save_project(&project, &scratch.0.join("setup"));
+        let output = brushcraft(
+            &project,
+            &state,
+            &[
+                "--offscreen",
+                "--frames",
+                "1",
+                "--adapter",
+                "no such adapter, surely",
+            ],
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("no adapter matches"), "{stderr}");
+        let recovery = state.join("brushcraft").join("recovery");
+        let left: Vec<_> = std::fs::read_dir(&recovery)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "nothing left behind: {left:?}");
+    }
+
+    #[test]
     fn a_missing_project_is_refused_before_any_window_or_gpu() {
         let scratch = Scratch::new("missing");
         let output = brushcraft(
