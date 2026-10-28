@@ -398,3 +398,38 @@ fn epochs_closed_between_frames_want_a_frame_to_take_them() {
     assert!(!owner.has_stale(), "drained");
     owner.close().expect("closed");
 }
+
+#[test]
+fn a_minimised_window_still_runs_its_upkeep() {
+    let dir = TestDir::new();
+    let mut owner = Owner::new(
+        project(&dir),
+        NoBrush,
+        NoUploads,
+        setup(None),
+        Instant::now(),
+    );
+    run(&mut owner, 10_000);
+    // An edit the recovery writer has yet to flush, then the window is minimised.
+    OneEdit::default()
+        .step(owner.project(), &Camera::default())
+        .expect("an edit");
+    owner.resize(None);
+    let later = Instant::now() + schedule::UPKEEP_INTERVAL;
+    let Next::Idle { upkeep } = owner.next(later) else {
+        panic!("no frames while minimised");
+    };
+    assert!(upkeep <= later, "upkeep falls due however long it waits");
+    owner
+        .upkeep(later)
+        .expect("upkeep: the recovery writer ticked");
+    let Next::Idle { upkeep: after } = owner.next(later) else {
+        panic!("still no frames");
+    };
+    assert_eq!(
+        after,
+        later + schedule::UPKEEP_INTERVAL,
+        "and is due again later"
+    );
+    owner.close().expect("closed");
+}

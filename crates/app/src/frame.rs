@@ -294,14 +294,15 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// What to do at `now`: as the scheduler says, but no frame while there is no frame size
-    /// or once a scripted run has made its frames.
+    /// (a minimised window) or once a scripted run has made its frames; upkeep stays due on
+    /// its own clock meanwhile.
     pub(crate) fn next(&self, now: Instant) -> Next {
         let next = self.scheduler.next(now);
         let no_frames =
             self.size.is_none() || self.limit.is_some_and(|limit| self.started >= limit);
         match next {
             Next::Frame { .. } | Next::Wait { .. } if no_frames => Next::Idle {
-                upkeep: now + schedule::UPKEEP_INTERVAL,
+                upkeep: self.scheduler.upkeep_due(),
             },
             Next::Frame { .. } | Next::Wait { .. } | Next::Render | Next::Idle { .. } => next,
         }

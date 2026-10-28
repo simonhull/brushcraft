@@ -13,11 +13,14 @@
 //! - One frame at a time: none starts while the render thread has the last one.
 //! - Paced to the display: a frame starts no sooner than one refresh interval after the last.
 //! - A frame's store jobs run until three quarters of an interval after it starts, leaving the rest
-//!   for handing it over and handling the window's events.
-//! - A frame that couldn't be shown (the surface changed) is wanted again; a hidden window's is
-//!   not, until it is shown.
-//! - While idle, the loop still wakes now and then for upkeep (the recovery writer's flushes), with
-//!   no frame.
+//!   for handling the window's events.
+//! - A frame that couldn't be shown (the surface changed) is wanted again at once.
+//! - While the window is hidden (its last frame came back [`Outcome::Hidden`]), frames still wanted
+//!   are tried only every [`UPKEEP_INTERVAL`], not every refresh, until one is shown or the window
+//!   is exposed: so a hidden window costs next to nothing, yet notices it is visible again even if
+//!   no event says so.
+//! - Upkeep (the recovery writer's flushes) is due every [`UPKEEP_INTERVAL`] after the last, which
+//!   a frame also runs; while idle the loop wakes for it, with no frame.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -136,6 +139,8 @@ pub(crate) struct Scheduler {
     last_start: Option<Instant>,
     /// When upkeep last ran (a frame runs it too).
     upkept: Instant,
+    /// Whether the window's last frame came back hidden, and none has been shown since.
+    hidden: bool,
 }
 
 impl Scheduler {
@@ -147,6 +152,7 @@ impl Scheduler {
             in_flight: false,
             last_start: None,
             upkept: now,
+            hidden: false,
         }
     }
 
@@ -171,6 +177,11 @@ impl Scheduler {
         self.wanted
     }
 
+    /// When upkeep is next due: [`UPKEEP_INTERVAL`] after it last ran (it may be past).
+    pub(crate) fn upkeep_due(&self) -> Instant {
+        self.upkept + UPKEEP_INTERVAL
+    }
+
     /// What to do at `now`.
     pub(crate) fn next(&self, now: Instant) -> Next {
         if self.in_flight {
@@ -178,15 +189,18 @@ impl Scheduler {
         }
         if self.wanted.is_empty() {
             return Next::Idle {
-                upkeep: self.upkept + UPKEEP_INTERVAL,
+                upkeep: self.upkeep_due(),
             };
         }
+        let pace = if self.hidden && !self.wanted.contains(Reason::Exposed) {
+            UPKEEP_INTERVAL
+        } else {
+            self.interval
+        };
         if let Some(last) = self.last_start
-            && now < last + self.interval
+            && now < last + pace
         {
-            return Next::Wait {
-                until: last + self.interval,
-            };
+            return Next::Wait { until: last + pace };
         }
         Next::Frame {
             deadline: now + self.interval * JOB_QUARTERS / 4,
@@ -202,11 +216,13 @@ impl Scheduler {
         std::mem::take(&mut self.wanted)
     }
 
-    /// The render thread finished the frame in flight.
-    pub(crate) const fn shown(&mut self, shown: Outcome) {
+    /// The render thread finished the frame in flight, with `outcome`.
+    pub(crate) const fn shown(&mut self, outcome: Outcome) {
         self.in_flight = false;
-        if matches!(shown, Outcome::Retry) {
-            self.want(Reason::Exposed);
+        match outcome {
+            Outcome::Presented => self.hidden = false,
+            Outcome::Retry => self.want(Reason::Exposed),
+            Outcome::Hidden => self.hidden = true,
         }
     }
 
@@ -325,18 +341,66 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_not_shown_is_wanted_again_unless_the_window_is_hidden() {
+    fn a_frame_not_shown_is_wanted_again() {
         let (mut scheduler, start) = scheduler();
         scheduler.want(Reason::Exposed);
         scheduler.started(start);
         scheduler.shown(Outcome::Retry);
         assert!(scheduler.wanted().contains(Reason::Exposed), "retried");
-        scheduler.started(start + INTERVAL);
+        assert!(matches!(
+            scheduler.next(start + INTERVAL),
+            Next::Frame { .. }
+        ));
+    }
+
+    #[test]
+    fn a_hidden_window_tries_converging_frames_only_now_and_then() {
+        let (mut scheduler, start) = scheduler();
+        scheduler.want(Reason::Converging);
+        scheduler.started(start);
         scheduler.shown(Outcome::Hidden);
-        assert!(
-            matches!(scheduler.next(start + INTERVAL * 2), Next::Idle { .. }),
-            "hidden: no frames until it is shown"
+        scheduler.want(Reason::Converging);
+        assert_eq!(
+            scheduler.next(start + INTERVAL),
+            Next::Wait {
+                until: start + UPKEEP_INTERVAL
+            },
+            "not every refresh"
         );
+        assert!(matches!(
+            scheduler.next(start + UPKEEP_INTERVAL),
+            Next::Frame { .. }
+        ));
+        scheduler.want(Reason::Exposed);
+        assert!(
+            matches!(scheduler.next(start + INTERVAL), Next::Frame { .. }),
+            "exposed: drawn at once"
+        );
+        let shown = start + UPKEEP_INTERVAL;
+        scheduler.started(shown);
+        scheduler.shown(Outcome::Presented);
+        scheduler.want(Reason::Converging);
+        assert_eq!(
+            scheduler.next(shown),
+            Next::Wait {
+                until: shown + INTERVAL
+            },
+            "shown again: paced to the display"
+        );
+    }
+
+    #[test]
+    fn upkeep_is_due_an_interval_after_the_last() {
+        let (mut scheduler, start) = scheduler();
+        assert_eq!(scheduler.upkeep_due(), start + UPKEEP_INTERVAL);
+        scheduler.want(Reason::Exposed);
+        assert_eq!(
+            scheduler.upkeep_due(),
+            start + UPKEEP_INTERVAL,
+            "wanting a frame doesn't move it"
+        );
+        scheduler.upkept(start + UPKEEP_INTERVAL * 3);
+        assert_eq!(scheduler.upkeep_due(), start + UPKEEP_INTERVAL * 4);
     }
 
     #[test]
