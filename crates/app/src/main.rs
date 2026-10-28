@@ -95,12 +95,12 @@ impl Summary {
     /// The summary of `owner`'s run: `adapter` presenting as `presentation`. Take it before
     /// the owner closes.
     pub(crate) fn of(owner: &AppOwner, adapter: String, presentation: Presentation) -> Self {
-        let uploads = owner.uploads();
+        let residency = owner.uploads();
         Self {
             frames: owner.finished(),
             adapter,
             presentation,
-            tiles: uploads::summary(&uploads.stats(), uploads.floor_tiles()),
+            tiles: uploads::summary(&residency.stats(), residency.floor_tiles()),
             phases: owner
                 .phase_log()
                 .map(frame::PhaseLog::lines)
