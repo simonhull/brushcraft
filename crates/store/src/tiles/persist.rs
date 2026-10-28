@@ -193,8 +193,10 @@ impl TileStore {
             hooks: TestHooks::default(),
         };
         if store.load_floor()? {
-            // A layer built for another surface: none of it is trusted.
+            // A layer built for another surface: none of it is trusted. Every tile is made
+            // unknown, so no job takes a record the files hold for one it doesn't need to build.
             if let Some(finest) = store.display_finest {
+                store.forget_foreign_display(finest);
                 store.queue_display_rebuild(finest);
             }
         } else {

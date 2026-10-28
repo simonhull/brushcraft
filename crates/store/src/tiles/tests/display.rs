@@ -283,6 +283,84 @@ fn a_layer_built_from_another_finest_level_is_unknown_and_rebuilt() {
         "no floor tile from another surface"
     );
     assert!(store.has_jobs(), "rebuilt");
+    let mut calls = 0;
+    while store.has_jobs() {
+        store
+            .run_jobs(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        calls += 1;
+        assert!(calls < 1000, "the rebuild ends");
+    }
+    let layer = crate::fixture::display_layer_at(&mut store, TOP - 1);
+    let rebuilt: Vec<TileKey> = layer.iter().map(|t| *t.key()).collect();
+    assert_eq!(rebuilt, keys, "the whole layer under level {}", TOP - 1);
+    let stored = store.stored_display(&rebuilt).unwrap();
+    for (tile, kept) in layer.iter().zip(stored) {
+        assert_eq!(
+            kept.as_ref(),
+            Some(tile),
+            "{:?} rebuilt, bit for bit",
+            tile.key()
+        );
+    }
+}
+
+/// A damaged display record, or one built from another finest level, among the store's own is
+/// rebuilt.
+///
+/// Each is found unknown (read on open, as a floor tile, or decoded by the tile above it), and
+/// built; the layer ends as the one built from scratch.
+#[test]
+fn damaged_and_foreign_records_among_the_layer_are_rebuilt() {
+    for foreign in [false, true] {
+        let dir = TestDir::new();
+        let mesh = mesh();
+        saved_layer(&dir, "work.bcp", &mesh, 61);
+        let mut file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+        let key = TileKey::display(FaceId::new(2), level(TOP - 1), 1, 1).unwrap();
+        let record = file.read_display(&key).unwrap().unwrap().known().unwrap();
+        if foreign {
+            let other = crate::display::DisplayRecord {
+                finest: level(TOP + 1),
+                ..record
+            };
+            file.write_display_many([(key, Some(&other))], Stamp::ZERO)
+                .unwrap();
+            file.save().unwrap();
+            drop(file);
+        } else {
+            file.save().unwrap();
+            drop(file);
+            damage(&dir.path("work.bcp"), {
+                let opened = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+                opened.locate(&key).unwrap()
+            });
+        }
+        let reopened = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+        let mut store = TileStore::open(reopened, roomy().with_display(level(TOP))).unwrap();
+        // Make a tile above it unknown: its build reads the record and finds it unreadable.
+        let above = TileKey::display(FaceId::new(2), level(TOP - 2), 0, 0).unwrap();
+        store.display.set(above, None);
+        let mut calls = 0;
+        while store.has_jobs() || calls == 0 {
+            store
+                .run_jobs(Instant::now() + Duration::from_secs(60))
+                .unwrap();
+            calls += 1;
+            assert!(calls < 1000, "the jobs end");
+        }
+        let layer = display_layer(&mut store);
+        let keys: Vec<TileKey> = layer.iter().map(|t| *t.key()).collect();
+        let stored = store.stored_display(&keys).unwrap();
+        for (tile, kept) in layer.iter().zip(stored) {
+            assert_eq!(
+                kept.as_ref(),
+                Some(tile),
+                "foreign {foreign}: {:?} current",
+                tile.key()
+            );
+        }
+    }
 }
 
 /// After a save by a store keeping no display layer, the file names no display tile.

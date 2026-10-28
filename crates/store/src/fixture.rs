@@ -320,14 +320,20 @@ pub(crate) fn assert_positions(
 /// Every display tile of the store's mesh, built from the store's own finest tiles at [`TOP`]:
 /// what the store's display layer should hold for its current state.
 pub(crate) fn display_layer(store: &mut TileStore) -> Vec<geom::DisplayTile> {
+    display_layer_at(store, TOP)
+}
+
+/// Every display tile of the store's mesh, built from the store's own tiles at level `top` as
+/// the finest: what a store keeping its display layer under `top` should hold.
+pub(crate) fn display_layer_at(store: &mut TileStore, top: u8) -> Vec<geom::DisplayTile> {
     let mesh = store.mesh().clone();
-    let finest = level(TOP);
+    let finest = level(top);
     let side = finest.face_quads() + 1;
     let (mut positions, mut normals) = (geom::FaceGrids::new(finest), geom::FaceGrids::new(finest));
     for face in mesh.faces() {
         let count = usize::try_from(side * side).unwrap();
         let (mut p, mut n) = (vec![Vec3::ZERO; count], vec![Vec3::ZERO; count]);
-        for key in tiles(&mesh, TOP, TOP)
+        for key in tiles(&mesh, top, top)
             .into_iter()
             .filter(|k| k.face() == face)
         {

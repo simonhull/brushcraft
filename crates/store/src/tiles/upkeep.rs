@@ -457,6 +457,12 @@ impl TileStore {
 
     /// Whether the store holds `key`'s display tile as known (see [`TileStore::where_held`]),
     /// without copying or reading anything.
+    ///
+    /// A record of the files is told known by its length, so a damaged record, or one built
+    /// from another finest level, counts as held until a tile reading it decodes it: that
+    /// decode fails ([`Outcome::Unreadable`]), and the tile is made unknown and built. A file
+    /// whose floor holds a layer from another level has every tile made unknown on open
+    /// ([`TileStore::forget_foreign_display`]).
     fn held(&self, key: &TileKey) -> bool {
         match self.display.kept(key) {
             Some(Kept::Known(_)) => true,
@@ -486,6 +492,16 @@ impl TileStore {
                 })
             })
             .collect()
+    }
+
+    /// Makes every display tile under `finest` unknown, whatever the files hold: for a file
+    /// holding a layer built from another finest level, whose records bound another surface.
+    /// A record's level is in its body, so the jobs, which tell known records by their length
+    /// alone ([`TileStore::held`]), would otherwise take them as built.
+    pub(super) fn forget_foreign_display(&mut self, finest: Level) {
+        for key in self.all_display_keys(finest) {
+            self.display.set(key, None);
+        }
     }
 
     /// Queues building every display tile under `finest` the store doesn't know, as a rebuild
