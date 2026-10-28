@@ -253,6 +253,17 @@ pub enum ConfigError {
         /// The tiles the budget allows.
         tiles: u64,
     },
+    /// The budget can't hold the floor: some of its tiles would never get a slot, and the floor
+    /// is pinned and wanted until it is all resident.
+    #[error("the budget holds {slots} tiles of side {side}, but the floor has {tiles} of them")]
+    FloorTooBig {
+        /// The side of the tiles of the class that can't hold its floor tiles.
+        side: u32,
+        /// The floor tiles of that class.
+        tiles: u64,
+        /// The most of them the budget allows at once.
+        slots: u64,
+    },
 }
 
 /// The most requests a request buffer may hold.
@@ -641,6 +652,9 @@ pub struct Residency {
     floor: BTreeSet<TileKey>,
     /// How many of them are resident: so a frame with the whole floor up skips scanning it.
     floor_resident: usize,
+    /// How many of them the source had nothing for (they are in `unavailable`): with
+    /// `floor_resident`, whether the floor has anything left to look for.
+    floor_unavailable: usize,
     /// Tiles requested.
     wanted: BTreeMap<TileKey, Want>,
     /// Tiles the source had nothing for, until an epoch names them.
@@ -693,7 +707,8 @@ impl Residency {
     /// # Errors
     ///
     /// [`ResidencyError::Config`] if a slot buffer can't hold a tile of the finest class, or
-    /// the budget allows more resident tiles than the tile tree can index or the device bind;
+    /// the budget allows more resident tiles than the tile tree can index or the device bind, or
+    /// can't hold the floor ([`ConfigError::FloorTooBig`]: its tiles would be wanted forever);
     /// [`ResidencyError::Gpu`] or [`ResidencyError::Tree`] if a buffer can't be created.
     pub fn new(
         gpu: &Gpu,
@@ -747,6 +762,7 @@ impl Residency {
                 })
             })
             .collect();
+        check_floor_fits(&pools, &floor)?;
         let staging_bytes = config.staging_bytes.max(largest);
         let staging_cap = config.staging_cap.max(staging_bytes);
         let (outcome_sender, outcomes) = mpsc::channel();
@@ -761,6 +777,7 @@ impl Residency {
             recency: vec![BTreeSet::new(); CLASSES],
             floor,
             floor_resident: 0,
+            floor_unavailable: 0,
             wanted: BTreeMap::new(),
             unavailable: BTreeSet::new(),
             groups: Vec::new(),
@@ -829,11 +846,7 @@ impl Residency {
     /// [`Residency::stage`].
     #[must_use]
     pub fn floor_ready(&self) -> bool {
-        self.floor_resident == self.floor.len()
-            || self
-                .floor
-                .iter()
-                .all(|key| self.entries.contains_key(key) || self.unavailable.contains(key))
+        self.floor_settled()
     }
 
     /// Counts, as they stand.
@@ -960,7 +973,7 @@ impl Residency {
     fn apply_epoch(&mut self, epoch: Epoch) {
         let keys = epoch.keys;
         for key in &keys {
-            if self.unavailable.remove(key) && self.floor.contains(key) {
+            if self.forget_unavailable(key) && self.floor.contains(key) {
                 self.wanted.insert(
                     *key,
                     Want {
@@ -1035,6 +1048,7 @@ impl Residency {
         }
         let kept: BTreeSet<TileKey> = self.entries.keys().copied().collect();
         let retry = std::mem::take(&mut self.unavailable);
+        self.floor_unavailable = 0;
         let floor_retry = retry.into_iter().filter(|key| self.floor.contains(key));
         let floor_retry = floor_retry.map(|key| {
             let want = Want {
@@ -1233,9 +1247,9 @@ impl Residency {
     where
         S::Error: Into<ResidencyError>,
     {
-        // Nothing to look for while the whole floor is up, as it is but after a lost frame or a
-        // dropped tile: the scan is for those frames.
-        if self.floor_resident == self.floor.len() {
+        // Nothing to look for while every floor tile is up or has nothing to give, as it is but
+        // after a lost frame, a dropped tile or an epoch naming one: the scan is for those.
+        if self.floor_settled() {
             return Ok(());
         }
         let missing: Vec<TileKey> = self
@@ -1357,7 +1371,7 @@ impl Residency {
             },
             Read::Missing => {
                 self.pools.release(slot);
-                self.unavailable.insert(key);
+                self.mark_unavailable(key);
             }
             Read::NoRoom | Read::NoSlot => self.pools.release(slot),
         }
@@ -1549,7 +1563,7 @@ impl Residency {
                         self.remove_live(&key);
                         self.stats.dropped += 1;
                     }
-                    self.unavailable.insert(key);
+                    self.mark_unavailable(key);
                 }
             }
         }
@@ -1689,6 +1703,28 @@ impl Residency {
         Ok(())
     }
 
+    /// Whether every floor tile is resident or one the source had nothing for: what
+    /// [`Residency::floor_ready`] says, from the counts (a tile is never both).
+    fn floor_settled(&self) -> bool {
+        self.floor_resident + self.floor_unavailable == self.floor.len()
+    }
+
+    /// Notes that the source had nothing for `key`, counting it if it is a floor tile.
+    fn mark_unavailable(&mut self, key: TileKey) {
+        if self.unavailable.insert(key) && self.floor.contains(&key) {
+            self.floor_unavailable += 1;
+        }
+    }
+
+    /// Forgets that the source had nothing for `key` (an epoch named it); whether it was so.
+    fn forget_unavailable(&mut self, key: &TileKey) -> bool {
+        let was = self.unavailable.remove(key);
+        if was && self.floor.contains(key) {
+            self.floor_unavailable -= 1;
+        }
+        was
+    }
+
     /// Makes `key` not resident, giving back its slot.
     fn remove_live(&mut self, key: &TileKey) {
         let Some(entry) = self.entries.remove(key) else {
@@ -1703,4 +1739,31 @@ impl Residency {
         self.tree.remove(Place::of(key));
         self.pools.release(entry.slot);
     }
+}
+
+/// Checks that `pools` can hold every tile of `floor` at once.
+///
+/// # Errors
+///
+/// [`ConfigError::FloorTooBig`] for the first size class that can't.
+fn check_floor_fits(pools: &Pools, floor: &BTreeSet<TileKey>) -> Result<(), ConfigError> {
+    let mut per_class = [0_u64; CLASSES];
+    for key in floor {
+        if let Some(count) = per_class.get_mut(usize::from(SizeClass::of(key.level()).get())) {
+            *count += 1;
+        }
+    }
+    let classes = (0..CLASSES).filter_map(|c| u8::try_from(c).ok().and_then(SizeClass::new));
+    let counted = classes.zip(per_class);
+    for (class, tiles) in counted {
+        let slots = pools.capacity(class);
+        if tiles > slots {
+            return Err(ConfigError::FloorTooBig {
+                side: class.side(),
+                tiles,
+                slots,
+            });
+        }
+    }
+    Ok(())
 }

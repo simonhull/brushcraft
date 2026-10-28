@@ -183,6 +183,18 @@ impl Pools {
         Ok(true)
     }
 
+    /// The most tiles `class` could ever hold at once: the slots made, and those the budget
+    /// still allows (within the class's most).
+    pub(crate) fn capacity(&self, class: SizeClass) -> u64 {
+        let room = self.budget.saturating_sub(self.allocated) / class.slot_bytes();
+        self.classes
+            .get(usize::from(class.get()))
+            .map_or(0, |pool| {
+                let made = pool.slots();
+                made + room.min(pool.most_slots().saturating_sub(made))
+            })
+    }
+
     /// Gives `slot` back, to be handed out again.
     pub(crate) fn release(&mut self, slot: Slot) {
         if let Some(pool) = self.classes.get_mut(usize::from(slot.class.get())) {

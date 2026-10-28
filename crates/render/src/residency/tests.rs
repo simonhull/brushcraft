@@ -393,6 +393,28 @@ fn the_floor_is_resident_after_the_first_frame_whole() {
 }
 
 #[test]
+fn a_budget_that_cannot_hold_the_floor_is_refused() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        // Enough for the coarsest floor tiles, not for the rest.
+        let config = ResidencyConfig::default()
+            .with_budget(4096)
+            .expect("an aligned budget");
+        let refused = Residency::new(gpu, &mesh, level(FINEST), config).expect_err("too small");
+        assert!(
+            matches!(
+                refused,
+                ResidencyError::Config(ConfigError::FloorTooBig { tiles, slots, .. })
+                    if tiles > slots
+            ),
+            "{refused}"
+        );
+        // The tiny budget the other tests use holds it.
+        Residency::new(gpu, &mesh, level(FINEST), tiny(&mesh, 0)).expect("the floor fits");
+    });
+}
+
+#[test]
 fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_childs_parent() {
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");
@@ -559,6 +581,12 @@ fn assert_census(residency: &Residency) {
         free + residency.stats().resident as u64,
         "every slot is free or a resident tile's, once"
     );
+    assert_floor_counts(residency);
+}
+
+/// Checks that the counts of floor tiles resident and unavailable match the sets, and say what
+/// a scan of the floor would.
+fn assert_floor_counts(residency: &Residency) {
     let floor = residency
         .entries
         .values()
@@ -568,6 +596,19 @@ fn assert_census(residency: &Residency) {
         residency.stats().floor,
         floor,
         "the count of resident floor tiles is kept as they come and go"
+    );
+    let unavailable = residency.floor.intersection(&residency.unavailable).count();
+    assert_eq!(
+        residency.floor_unavailable, unavailable,
+        "and of floor tiles the source had nothing for"
+    );
+    assert_eq!(
+        residency.floor_settled(),
+        residency
+            .floor
+            .iter()
+            .all(|key| residency.entries.contains_key(key) || residency.unavailable.contains(key)),
+        "the counts say what a scan would"
     );
 }
 
@@ -914,6 +955,7 @@ fn tiles_the_source_has_nothing_for_wait_for_an_epoch_naming_them() {
             "the other request arrived"
         );
         assert_eq!(residency.stats().unavailable, 2, "both counted");
+        assert_floor_counts(&residency);
 
         // The source has them now, but nothing says so: they aren't asked for again.
         model.missing.clear();
@@ -964,6 +1006,7 @@ fn tiles_the_source_has_nothing_for_wait_for_an_epoch_naming_them() {
         assert_eq!(residency.stats().dropped, 1, "and counted");
         let view = gpu_view(gpu, &residency);
         assert!(!view.contains_key(&doomed), "the GPU's tree lost it too");
+        assert_floor_counts(&residency);
         assert_eq!(model.unprepared, 0, "every read was readied first");
     });
 }
@@ -979,6 +1022,7 @@ fn a_resync_retries_the_floor_tiles_the_source_had_nothing_for() {
         model.missing.insert(floor);
         quiet_frame(gpu, &mut residency, &mut model, &[]);
         assert!(residency.slot(&floor).is_none(), "missing");
+        assert_floor_counts(&residency);
         model.missing.clear();
         model.lost = true;
         let (drained, _) = model.drain();
@@ -992,6 +1036,7 @@ fn a_resync_retries_the_floor_tiles_the_source_had_nothing_for() {
         );
         quiet_frame(gpu, &mut residency, &mut model, &[]);
         assert!(residency.slot(&floor).is_some(), "retried by the resync");
+        assert_floor_counts(&residency);
         assert_current(&gpu_view(gpu, &residency), &model, 0);
     });
 }
