@@ -112,3 +112,24 @@ fn a_cursor_of_another_feed_is_told_to_resync() {
         "b's own cursor"
     );
 }
+
+/// What a frame loop asks before sleeping: whether a drain would give anything.
+#[test]
+fn has_pending_says_whether_a_drain_would_give_anything() {
+    let mut feed = StaleFeed::new(4);
+    let cursor = feed.subscribe();
+    assert!(!feed.has_pending(&cursor), "nothing closed yet");
+    feed.close(keys(0, 2));
+    assert!(feed.has_pending(&cursor), "an epoch waits");
+    assert_ne!(feed.drain(&cursor), Drained::Epochs(Vec::new()));
+    assert!(!feed.has_pending(&cursor), "drained");
+    feed.close(keys(0, 5));
+    assert!(feed.has_pending(&cursor), "past the cap: a resync waits");
+    assert_eq!(feed.drain(&cursor), Drained::Resync);
+    assert!(!feed.has_pending(&cursor), "resynced");
+    let other = StaleFeed::new(4).subscribe();
+    assert!(
+        feed.has_pending(&other),
+        "another feed's cursor is told to resync"
+    );
+}

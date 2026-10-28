@@ -38,6 +38,14 @@ impl TileStore {
         self.stale.drain(cursor)
     }
 
+    /// Whether [`TileStore::drain_stale`] with `cursor` would give anything now: epochs closed
+    /// since its last drain, or a resync. Reads only, so a frame loop can ask after work that
+    /// may close epochs (jobs, a poll) whether another frame is needed to take them.
+    #[must_use]
+    pub fn has_stale(&self, cursor: &StaleCursor) -> bool {
+        self.stale.has_pending(cursor)
+    }
+
     /// Closes the epoch of the operation since the last one: every finest tile whose evaluated
     /// positions, or ring, the writes since changed, and every display tile recorded since.
     /// What a brush step calls once its edits and their re-evaluation are done; the store calls

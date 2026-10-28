@@ -172,6 +172,17 @@ impl StaleFeed {
         Drained::Epochs(consumer.pending.drain(..).collect())
     }
 
+    /// Whether a drain with `cursor` would give anything: epochs pending, or a resync (lost
+    /// epochs, or a cursor this feed doesn't know).
+    pub(crate) fn has_pending(&self, cursor: &StaleCursor) -> bool {
+        if cursor.feed != self.id {
+            return true;
+        }
+        self.consumers
+            .get(&cursor.consumer)
+            .is_none_or(|consumer| consumer.lost || !consumer.pending.is_empty())
+    }
+
     /// The most keys any consumer has pending: what the feed holds, at most the cap each.
     #[cfg(test)]
     pub(crate) fn most_pending(&self) -> usize {
