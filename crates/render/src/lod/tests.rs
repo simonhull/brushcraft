@@ -15,8 +15,8 @@ use wgpu::{
 use super::*;
 use crate::camera::{Vec3, View};
 use crate::cull::reference::{
-    CpuPyramid, backfacing, bounds_of, cone_cos_sin, depth_texture, finest_facing_away, in_frustum,
-    occluded, projected,
+    CpuPyramid, ShaderErrors, backfacing, bounds_of, cone_cos_sin, depth_texture,
+    finest_facing_away, finest_facing_away_with, in_frustum, occluded, projected,
 };
 use crate::cull::tests::Rng;
 use crate::cull::{GpuBounds, PyramidPass};
@@ -1382,6 +1382,233 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
              kept by the drawn cone {drawn_kept}"
         );
     });
+}
+
+/// A uniform `f64` in `[lo, hi)`.
+fn uniform(rng: &mut Rng, lo: f64, hi: f64) -> f64 {
+    let bits = u32::try_from(rng.next() >> 32).expect("32 bits");
+    lo + (hi - lo) * f64::from(bits) / 4_294_967_296.0
+}
+
+/// `x` in `f32`, as the GPU holds it.
+fn narrow_scalar(x: f64) -> f32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounds go to the GPU as f32"
+    )]
+    let narrowed = x as f32;
+    narrowed
+}
+
+/// A random unit vector.
+fn random_direction(rng: &mut Rng) -> Vec3 {
+    loop {
+        let v = Vec3::new(
+            uniform(rng, -1.0, 1.0),
+            uniform(rng, -1.0, 1.0),
+            uniform(rng, -1.0, 1.0),
+        );
+        if (0.1..=1.0).contains(&v.length()) {
+            return v.normalized().expect("long enough");
+        }
+    }
+}
+
+/// A unit vector perpendicular to the unit vector `axis`, at a random turn about it.
+fn random_perpendicular(rng: &mut Rng, axis: Vec3) -> Vec3 {
+    let u = perpendicular(axis);
+    let (sin, cos) = uniform(rng, 0.0, std::f64::consts::TAU).sin_cos();
+    u * cos + axis.cross(u) * sin
+}
+
+/// One case of the finest-normal cone test, as the GPU holds its inputs.
+struct ConeCase {
+    /// The tile's bounds (only the sphere matters).
+    bounds: GpuBounds,
+    /// The tile's finest-normal cone.
+    cone: FinestNormalCone,
+    /// The eye.
+    eye: [f32; 3],
+    /// What the sphere is grown by: `e`.
+    margin: f32,
+}
+
+/// Where a [`cone_case`] lies.
+#[derive(Debug, Clone, Copy)]
+enum ConeEdge {
+    /// Anywhere.
+    Random,
+    /// θ + α just short of a quarter turn: the sphere's edge grazing the cone's rim.
+    QuarterTurn,
+    /// A narrow cone pointing almost straight away, the eye almost on the grown sphere:
+    /// `d·cos(θ + α)` near `d`, where widening the angle buys almost nothing.
+    StraightAway,
+}
+
+/// A random cone test, distances from 10⁻³ to 10⁴; a quarter of the spheres are tiny.
+///
+/// On an edge (`QuarterTurn`, `StraightAway`), the grown sphere's radius is near `d·cos(θ + α)`,
+/// the most it can be and still face away, for a half-angle that is half the time the stored
+/// one (where facing away truly ends), else one step wider (where the test, which widens by a
+/// step, stops saying so).
+fn cone_case(rng: &mut Rng, edge: ConeEdge) -> ConeCase {
+    let most_steps = if matches!(edge, ConeEdge::StraightAway) {
+        4
+    } else {
+        2100
+    };
+    let steps = u32::try_from(rng.below(most_steps)).expect("small");
+    let axis_bits = u32::try_from(rng.next() & 0xF_FFFF).expect("20 bits");
+    let cone = FinestNormalCone::from_bits((steps << 20) | axis_bits);
+    let axis = Vec3::from_f32(cone.axis());
+    let alpha = f64::from(cone.half_angle());
+    let d = 10_f64.powf(uniform(rng, -3.0, 4.0));
+    let widened = if rng.below(2) == 0 {
+        alpha
+    } else {
+        alpha + std::f64::consts::PI / 4095.0
+    };
+    let side = random_perpendicular(rng, axis);
+    let towards = |theta: f64| axis * theta.cos() + side * theta.sin();
+    let (direction, reach) = match edge {
+        ConeEdge::Random => {
+            let reach = d * 10_f64.powf(uniform(rng, -6.0, 0.0));
+            (random_direction(rng), reach)
+        }
+        ConeEdge::QuarterTurn => {
+            let delta = 10_f64.powf(uniform(rng, -7.0, -0.5));
+            let theta = (FRAC_PI_2 - widened - delta).max(0.0);
+            let reach = d * (theta + widened).cos() * (1.0 + uniform(rng, -1e-3, 1e-3));
+            (towards(theta), reach.max(0.0))
+        }
+        ConeEdge::StraightAway => {
+            let theta = uniform(rng, 0.0, 1e-3);
+            let reach = d * (theta + widened).cos() * (1.0 - uniform(rng, 0.0, 3e-5));
+            (towards(theta), reach)
+        }
+    };
+    let radius = reach
+        * if rng.below(4) == 0 {
+            1e-6
+        } else {
+            uniform(rng, 0.0, 1.0)
+        };
+    // The eye at a distance from the origin like d's, so f32 rounding of the centre and the
+    // eye doesn't swamp where the sphere lies.
+    let eye = random_direction(rng) * (d * 10_f64.powf(uniform(rng, -3.0, 0.5)));
+    let center = eye + direction * d;
+    ConeCase {
+        bounds: GpuBounds {
+            center: narrow_array(center),
+            radius: narrow_scalar(radius),
+            ..GpuBounds::UNKNOWN
+        },
+        cone,
+        eye: narrow_array(eye),
+        margin: narrow_scalar(reach - radius),
+    }
+}
+
+/// Checks, in `f64`, that every direction the case's cone holds faces away from every point of
+/// its grown sphere, as the case's inputs stand.
+///
+/// The bound `d·cos(θ + α) − r` is positive (θ the angle from the decoded axis to the centre,
+/// α the stored half-angle), and so is
+/// `n · (p − eye)` for directions [`FinestNormalCone::contains`] accepts on the cone's rim and
+/// inside it, at the sphere's point nearest to facing each and at random points of it. Returns
+/// the bound over `d` and how many directions were checked.
+fn assert_faces_away(rng: &mut Rng, case: &ConeCase) -> (f64, u32) {
+    let center = wide(case.bounds.center);
+    let eye = wide(case.eye);
+    let v = center - eye;
+    let d = v.length();
+    let reach = f64::from(case.bounds.radius) + f64::from(case.margin);
+    let axis = Vec3::from_f32(case.cone.axis())
+        .normalized()
+        .expect("a unit axis");
+    let alpha = f64::from(case.cone.half_angle());
+    let theta = v.cross(axis).length().atan2(v.dot(axis));
+    let bound = d * (theta + alpha).min(std::f64::consts::PI).cos() - reach;
+    assert!(
+        bound > 0.0,
+        "the f64 bound {bound:e} (d {d:e}, θ + α {}, r {reach:e})",
+        theta + alpha
+    );
+    let mut checked = 0;
+    for _ in 0..12 {
+        let side = random_perpendicular(rng, axis);
+        let fractions = [1.0 - 1e-7, 1.0 - 1e-4, uniform(rng, 0.0, 1.0)];
+        for fraction in fractions {
+            let (sin, cos) = (alpha * fraction).sin_cos();
+            let n32 = narrow(axis * cos + side * sin);
+            if !case.cone.contains(n32) {
+                continue;
+            }
+            let n = Vec3::from_f32(n32).normalized().expect("a direction");
+            // The sphere's point where n · (p − eye) is least: the centre less `reach` along n.
+            let least = n.dot(v) - reach;
+            let anywhere = n.dot(center + random_direction(rng) * reach - eye);
+            assert!(
+                least > 0.0 && anywhere > 0.0,
+                "{n:?} in the cone faces the eye: {least:e}, {anywhere:e}"
+            );
+            checked += 1;
+        }
+    }
+    (bound / d, checked)
+}
+
+/// The cone test checked against the truth in `f64`, not against its twin.
+///
+/// Whenever it says a tile faces away, as the CPU computes it and with the shader's errors
+/// pushed to the bounds `lod.wgsl` states, every direction the cone holds faces away.
+///
+/// Random cases, and cases on the two edges where the margins matter: θ + α just short of a
+/// quarter turn, and a narrow cone pointing straight away with the eye almost on the sphere
+/// (where the slack, not the widening, carries it). With the slack below the stated error the
+/// second fails; the one-step widening alone isn't needed for these bounds (the slack covers
+/// the axis's decode error too), so dropping it, while keeping the slack, passes.
+#[test]
+fn whenever_the_cone_test_says_facing_away_every_finest_normal_faces_away_in_f64() {
+    let mut rng = Rng(97);
+    let edges = [
+        ConeEdge::Random,
+        ConeEdge::QuarterTurn,
+        ConeEdge::StraightAway,
+    ];
+    let (mut away, mut on_edge, mut straight, mut directions) = (0, 0, 0, 0);
+    let mut closest = f64::MAX;
+    for k in 0..300_000 {
+        let edge = edges[k % edges.len()];
+        let case = cone_case(&mut rng, edge);
+        // The shader's own errors, at the bounds lod.wgsl states, the worst way: its decoded
+        // axis turned 2·10⁻⁶ rad off the CPU's, its q over the true value by 6·10⁻⁶·d.
+        let axis = Vec3::from_f32(case.cone.axis());
+        let turned = axis + random_perpendicular(&mut rng, axis) * 2e-6;
+        let shader = ShaderErrors {
+            axis: narrow_array(turned.normalized().expect("a direction")),
+            overestimate: 6e-6,
+        };
+        let said = finest_facing_away(&case.bounds, case.cone, case.eye, case.margin);
+        let worst = finest_facing_away_with(&case.bounds, case.cone, case.eye, case.margin, shader);
+        if !(said || worst) {
+            continue;
+        }
+        let (bound, checked) = assert_faces_away(&mut rng, &case);
+        away += 1;
+        on_edge += u32::from(bound < 1e-3);
+        straight += u32::from(matches!(edge, ConeEdge::StraightAway));
+        closest = closest.min(bound);
+        directions += checked;
+    }
+    // The test means something: many cases face away, many of them within 10⁻³·d of the
+    // boundary (one step of widening is 7.7·10⁻⁴), some pointing straight away, and most rim
+    // directions are ones the cone holds.
+    assert!(
+        away > 20_000 && on_edge > 2_000 && straight > 1_000 && directions > 20 * away,
+        "facing away {away}, on the edge {on_edge}, straight away {straight}, directions \
+         {directions}, closest {closest:e}"
+    );
 }
 
 #[test]

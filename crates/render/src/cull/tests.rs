@@ -206,8 +206,14 @@ fn a_bounds_pass_that_fails_leaves_its_tiles_unknown_not_stale() {
         let mut tree = TileTree::new(gpu, &mesh, 8).expect("a tree");
         let place = Place::of(&TileKey::display(FaceId::new(0), Level::ZERO, 0, 0).expect("a key"));
         let class = SizeClass::of(Level::ZERO);
+        // A display tile, its e and cone unused here (the bounds pass reads neither): e 0 and
+        // the cone that covers everything.
+        let unused = TileDetail {
+            error: 0.0,
+            cone: geom::FinestNormalCone::EVERYTHING,
+        };
         let node = tree
-            .insert(place, Slot::for_tests(class, 0), TileDetail::FINEST, 0)
+            .insert(place, Slot::for_tests(class, 0), unused, 0)
             .expect("inserted");
         let mut pass = BoundsPass::new(gpu, 8).expect("the bounds pass");
         let stale = GpuBounds {

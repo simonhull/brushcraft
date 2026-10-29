@@ -235,20 +235,49 @@ pub(crate) fn cone_cos_sin(x: f32) -> (f32, f32) {
     (c, s)
 }
 
-/// `lod.wgsl`'s `finest_facing_away`, in the same `f32` arithmetic.
+/// `lod.wgsl`'s `finest_facing_away`: the same formula in `f32` (the shader may contract it into
+/// fused multiply-adds, and takes its lengths through `inverseSqrt`).
 ///
 /// Whether every normal in `cone`, widened by one step, faces away from `eye` at every point of
 /// `bounds`' sphere grown by `margin`, with the shader's slack on its rounding. The axis is
 /// [`FinestNormalCone::axis`], which the shader's decode mirrors.
-///
-/// # Panics
-///
-/// Never: a step count is 12 bits, so one more fits a `u16`.
 pub(crate) fn finest_facing_away(
     bounds: &GpuBounds,
     cone: FinestNormalCone,
     eye: [f32; 3],
     margin: f32,
+) -> bool {
+    let decoded = cone.axis();
+    let errors = ShaderErrors {
+        axis: [decoded.x, decoded.y, decoded.z],
+        overestimate: 0.0,
+    };
+    finest_facing_away_with(bounds, cone, eye, margin, errors)
+}
+
+/// What [`finest_facing_away_with`] stands in for the shader's own rounding, beyond this
+/// arithmetic's: the axis it decodes, and how far its `q` may come out over the true value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShaderErrors {
+    /// The decoded axis the shader uses (within its decode's error of
+    /// [`FinestNormalCone::axis`]).
+    pub(crate) axis: [f32; 3],
+    /// How far over `|a|·d·cos(θ + α')` the shader's `q` comes out, as a fraction of `d`.
+    pub(crate) overestimate: f32,
+}
+
+/// [`finest_facing_away`] with the shader's errors made explicit (`errors`), so a test can push
+/// them to the bounds `lod.wgsl` states and check the test stays conservative.
+///
+/// # Panics
+///
+/// Never: a step count is 12 bits, so one more fits a `u16`.
+pub(crate) fn finest_facing_away_with(
+    bounds: &GpuBounds,
+    cone: FinestNormalCone,
+    eye: [f32; 3],
+    margin: f32,
+    errors: ShaderErrors,
 ) -> bool {
     /// `lod.wgsl`'s `CONE_STEP`.
     const STEP: f32 = core::f32::consts::PI / 4095.0;
@@ -268,12 +297,11 @@ pub(crate) fn finest_facing_away(
     if d <= radius {
         return false;
     }
-    let decoded = cone.axis();
-    let axis = [decoded.x, decoded.y, decoded.z];
+    let axis = errors.axis;
     let across = cross(offset, axis);
     let (cos_a, sin_a) = cone_cos_sin(half);
     let q = dot(offset, axis) * cos_a - dot(across, across).sqrt() * sin_a;
-    q > radius + SLACK * d
+    q + errors.overestimate * d > radius + SLACK * d
 }
 
 /// `cull.wgsl`'s `projected`.
