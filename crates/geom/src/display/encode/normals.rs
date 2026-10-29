@@ -137,12 +137,12 @@ impl NormalEncoding {
 }
 
 /// The largest magnitude a signed `bits`-bit component holds: `2^(bits − 1) − 1`.
-fn levels(bits: u8) -> f32 {
+pub(in crate::display) fn levels(bits: u8) -> f32 {
     f32::from((1_u16 << (bits.clamp(2, 16) - 1)) - 1)
 }
 
 /// `c` in `[−1, 1]` as a signed `bits`-bit fraction.
-fn quantize_unit(c: f32, bits: u8) -> i16 {
+pub(in crate::display) fn quantize_unit(c: f32, bits: u8) -> i16 {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "within ±(2^15 − 1) after the clamp, rounded"
@@ -376,7 +376,7 @@ fn take_zigzag(reader: &mut Reader<'_>, count: usize, bits: u8) -> Result<Vec<i1
 }
 
 /// Unit vector `n` mapped onto the octahedron and unfolded into `[−1, 1]²`.
-fn octahedral(n: Vec3) -> (f32, f32) {
+pub(in crate::display) fn octahedral(n: Vec3) -> (f32, f32) {
     let l1 = n.x.abs() + n.y.abs() + n.z.abs();
     if l1 <= 0.0 {
         return (0.0, 0.0);
@@ -390,7 +390,7 @@ fn octahedral(n: Vec3) -> (f32, f32) {
 }
 
 /// [`octahedral`]'s inverse: the unit vector at `(u, v)`.
-fn from_octahedral(across: f32, up: f32) -> Vec3 {
+pub(in crate::display) fn from_octahedral(across: f32, up: f32) -> Vec3 {
     let height = 1.0 - across.abs() - up.abs();
     let (x, y) = if height >= 0.0 {
         (across, up)

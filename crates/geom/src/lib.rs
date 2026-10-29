@@ -38,8 +38,9 @@ pub use display::{
     build_positions_with, decode_with,
 };
 pub use display::{
-    DisplayError, DisplayTile, FaceGrids, FacePositions, MeanNormals, build_level, build_mesh,
-    build_positions, build_tile, mip_normals, mip_normals_tile,
+    DisplayError, DisplayTile, FaceCones, FaceGrids, FacePositions, MeanNormals, NormalCone,
+    build_cones, build_level, build_mesh, build_positions, build_tile, mip_normals,
+    mip_normals_tile,
 };
 pub use eval::{
     EvalError, GatheredBlock, GatheredRing, Grid, PositionSource, Prediction, VertexStencil,

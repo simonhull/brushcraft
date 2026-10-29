@@ -60,7 +60,9 @@ use self::bytes::{
     Reader, put_u16_planes, put_u32_planes, take_u16_planes, take_u32_planes, unzigzag, zigzag,
 };
 pub use self::normals::NormalEncoding;
-pub(super) use self::normals::{mean_of, shade};
+pub(super) use self::normals::{
+    from_octahedral, levels, mean_of, octahedral, quantize_unit, shade,
+};
 #[cfg(any(test, feature = "display-study"))]
 pub use self::study::{BaseOffsets, FixedPoint};
 use super::DisplayError;

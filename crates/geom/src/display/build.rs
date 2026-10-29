@@ -1,12 +1,13 @@
 //! Building display tiles from the finest level.
 //!
 //! Subsampling, the error a level adds and its chained bound (positions, a face at a time), the
-//! normals' mip across faces (a level at a time), and the two joined into tiles.
+//! normal cones chained the same way (a face at a time), the normals' mip across faces (a level
+//! at a time), and the three joined into tiles.
 
 use std::collections::BTreeMap;
 
 use super::encode::{self, CHOSEN, CHOSEN_NORMALS, DisplayCodec, NormalEncoding, mean_of, shade};
-use super::{DisplayError, DisplayTile};
+use super::{DisplayError, DisplayTile, NormalCone};
 use crate::eval::gather;
 use crate::subdiv::{CornerRing, Padded};
 use crate::{BaseMesh, FaceId, Grid, Level, PositionSource, Region, TileKey, Vec3};
@@ -634,7 +635,10 @@ pub fn build_positions_with(
 /// `finer` is the block under it one level finer (side `2 × (side − 1) + 1`): the finest
 /// positions there if that is the finest level, else the decoded positions of the display tiles
 /// there; the tile stores its even vertices. `children_bound` is the largest bound of those
-/// tiles (0 at the finest level); `means` the tile's mean normals ([`mip_normals_tile`]).
+/// tiles (0 at the finest level); `cone` the tile's normal cone ([`NormalCone::covering`] the
+/// finest normals under it one level above the finest, else [`NormalCone::holding`] the cones
+/// of those tiles, as [`build_cones`] chains them); `means` the tile's mean normals
+/// ([`mip_normals_tile`]).
 ///
 /// # Errors
 ///
@@ -645,6 +649,7 @@ pub fn build_tile(
     key: TileKey,
     finer: &Grid,
     children_bound: f32,
+    cone: NormalCone,
     means: &MeanNormals,
 ) -> Result<DisplayTile, DisplayError> {
     if !(finer.as_slice().iter().all(|v| v.is_finite()) && children_bound.is_finite()) {
@@ -659,6 +664,7 @@ pub fn build_tile(
         normals,
         roughness,
         error,
+        cone,
         encoded: encode::join_parts(&bytes, &normal_bytes)?,
     })
 }
@@ -709,9 +715,9 @@ fn normals_tile(
     Ok((bytes, unit, roughness))
 }
 
-/// The display tiles of one face at `level`: its `positions` there, with `means` (the face's
-/// mean normals at the level, from [`mip_normals`]) stored with the normal encoding chosen by
-/// measurement.
+/// The display tiles of one face at `level`: its `positions` and `cones` there, with `means`
+/// (the face's mean normals at the level, from [`mip_normals`]) stored with the normal encoding
+/// chosen by measurement.
 ///
 /// Also gives back the means as they decode (each decoded unit normal at its roughness's
 /// length): what the next coarser level's [`mip_normals`] reads, so a level is computed from
@@ -720,33 +726,45 @@ fn normals_tile(
 ///
 /// # Errors
 ///
-/// [`DisplayError::Shape`] if `means` isn't the face's whole grid at `level`;
-/// [`DisplayError::NoDisplayLevel`] if `level` isn't below the finest; [`DisplayError::Seam`] if
-/// a vertex two tiles share decodes differently in each; [`DisplayError::NotFinite`] for a mean
-/// that isn't finite.
+/// [`DisplayError::Shape`] if `means` isn't the face's whole grid at `level`, or `cones` aren't
+/// the same face's; [`DisplayError::NoDisplayLevel`] if `level` isn't below the finest;
+/// [`DisplayError::Seam`] if a vertex two tiles share decodes differently in each;
+/// [`DisplayError::NotFinite`] for a mean that isn't finite.
 pub fn build_level(
     positions: &FacePositions,
+    cones: &FaceCones,
     level: Level,
     means: &MeanNormals,
 ) -> Result<(Vec<DisplayTile>, MeanNormals), DisplayError> {
-    build_level_with(CHOSEN_NORMALS, positions, level, means)
+    level_tiles(CHOSEN_NORMALS, positions, Some(cones), level, means)
 }
 
-/// [`build_level`] with normals stored with `normals`.
+/// [`build_level`] with normals stored with `normals`, and every tile's cone the one that
+/// covers everything: the encoding study measures positions and normals, never cones.
 ///
 /// # Errors
 ///
 /// As [`build_level`]; [`DisplayError::Shape`] if the encoding's bits are out of range.
-#[cfg_attr(
-    not(any(test, feature = "display-study")),
-    expect(
-        unreachable_pub,
-        reason = "public for the encoding study (the display-study feature) only"
-    )
-)]
+#[cfg(any(test, feature = "display-study"))]
 pub fn build_level_with(
     normals: NormalEncoding,
     positions: &FacePositions,
+    level: Level,
+    means: &MeanNormals,
+) -> Result<(Vec<DisplayTile>, MeanNormals), DisplayError> {
+    level_tiles(normals, positions, None, level, means)
+}
+
+/// [`build_level`] with normals stored with `normals`, and each tile's cone from `cones` (the
+/// cone that covers everything without them).
+///
+/// # Errors
+///
+/// As [`build_level`]; [`DisplayError::Shape`] if the encoding's bits are out of range.
+fn level_tiles(
+    normals: NormalEncoding,
+    positions: &FacePositions,
+    cones: Option<&FaceCones>,
     level: Level,
     means: &MeanNormals,
 ) -> Result<(Vec<DisplayTile>, MeanNormals), DisplayError> {
@@ -771,12 +789,17 @@ pub fn build_level_with(
             .map(|(&n, &r)| mean_of(n, r))
             .collect();
         write_tile(&mut decoded_means, &mut written, tile.key, &decoded)?;
+        let cone = match cones {
+            Some(cones) => cones.cone(&tile.key).ok_or(DisplayError::Shape)?,
+            None => NormalCone::EVERYTHING,
+        };
         tiles.push(DisplayTile {
             key: tile.key,
             positions: tile_positions.as_slice().to_vec(),
             normals: unit,
             roughness,
             error: tile.error,
+            cone,
             encoded: encode::join_parts(&tile.bytes, &normal_bytes)?,
         });
     }
@@ -793,10 +816,10 @@ pub fn build_level_with(
 /// Built with the encoding chosen by measurement, from each face's finest positions and unit
 /// normals (at `finest_positions`' level).
 ///
-/// Positions are built face by face ([`build_positions`]); normals level by level over all
-/// faces, finest first, each level's [`mip_normals`] reading every face's decoded means one
-/// level finer ([`build_level`]). This holds the whole mesh in memory: the store builds the
-/// same tiles from the same pieces, a region at a time.
+/// Positions and cones are built face by face ([`build_positions`], [`build_cones`]); normals
+/// level by level over all faces, finest first, each level's [`mip_normals`] reading every face's
+/// decoded means one level finer ([`build_level`]). This holds the whole mesh in memory: the store
+/// builds the same tiles from the same pieces, a region at a time.
 ///
 /// # Errors
 ///
@@ -849,17 +872,25 @@ pub fn build_mesh_with(
             build_positions_with(codec, face, grid, finest)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let cones = faces
+        .iter()
+        .map(|&face| {
+            let grid = finest_normals.get(face).ok_or(DisplayError::Unavailable)?;
+            build_cones(face, grid, finest)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut tiles = Vec::new();
     let mut finer: Option<FaceGrids> = None;
     let mut level = finest;
     while let Some(coarser) = level.parent() {
         let source = finer.as_ref().unwrap_or(finest_normals);
         let mut decoded = FaceGrids::new(coarser);
-        for face_positions in &positions {
+        let by_face = positions.iter().zip(&cones);
+        for (face_positions, face_cones) in by_face {
             let face = face_positions.face();
             let means = mip_normals(mesh, source, face, coarser)?;
             let (built, decoded_means) =
-                build_level_with(normals, face_positions, coarser, &means)?;
+                level_tiles(normals, face_positions, Some(face_cones), coarser, &means)?;
             tiles.extend(built);
             decoded.insert(face, decoded_means.grid)?;
         }
@@ -882,11 +913,109 @@ pub(super) fn children_bound(
     if finer == finest {
         return 0.0;
     }
+    children(key, finer, finer_bounds).fold(0.0, |a, &b| a.max(b))
+}
+
+/// The values of the level-`finer` display tiles under `key` (one level coarser), row by row,
+/// from `finer_values` (that level's tiles, row by row).
+fn children<'a, T>(
+    key: &TileKey,
+    finer: Level,
+    finer_values: &'a [T],
+) -> impl Iterator<Item = &'a T> {
     let per_side = finer.tiles_per_side();
     let ratio = per_side / key.level().tiles_per_side();
     let (x0, y0) = (u32::from(key.tx()) * ratio, u32::from(key.ty()) * ratio);
     (0..ratio)
-        .flat_map(|dy| (0..ratio).map(move |dx| (dx, dy)))
-        .filter_map(|(dx, dy)| finer_bounds.get(at(per_side, x0 + dx, y0 + dy)))
-        .fold(0.0, |a, &b| a.max(b))
+        .flat_map(move |dy| (0..ratio).map(move |dx| (dx, dy)))
+        .filter_map(move |(dx, dy)| finer_values.get(at(per_side, x0 + dx, y0 + dy)))
+}
+
+/// One face's normal cones at every level below the finest: each display tile's, holding every
+/// finest normal under it (see [`NormalCone`]).
+///
+/// Built with [`build_cones`]: like positions, cones need nothing from a neighbouring face (a
+/// cone holds the normals under its tile, not its apron's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaceCones {
+    /// The face.
+    face: FaceId,
+    /// Levels `0..finest`, by level: each level's tiles' cones, row by row.
+    levels: Vec<Vec<NormalCone>>,
+}
+
+impl FaceCones {
+    /// The face.
+    #[must_use]
+    pub const fn face(&self) -> FaceId {
+        self.face
+    }
+
+    /// The cone of display tile `key` of this face, or `None` if the face holds no such tile.
+    #[must_use]
+    pub fn cone(&self, key: &TileKey) -> Option<NormalCone> {
+        if key.face() != self.face {
+            return None;
+        }
+        let level = self.levels.get(usize::from(key.level().get()))?;
+        let per_side = key.level().tiles_per_side();
+        level
+            .get(at(per_side, u32::from(key.tx()), u32::from(key.ty())))
+            .copied()
+    }
+}
+
+/// `face`'s normal cones at every level below `finest`, from `finest_normals`, the face's whole
+/// grid of unit normals at `finest`.
+///
+/// One level below the finest, each tile's cone is [`NormalCone::covering`] the finest normals
+/// under it (its block, borders included, row by row); above, [`NormalCone::holding`] the cones
+/// of the tiles under it. So a tile's cone holds every finest normal under it, and its
+/// children's cones.
+///
+/// # Errors
+///
+/// [`DisplayError::Shape`] if the grid isn't the face's whole grid at `finest`;
+/// [`DisplayError::NoDisplayLevel`] at level 0 (no level below it);
+/// [`DisplayError::NotFinite`] for a normal that isn't finite.
+pub fn build_cones(
+    face: FaceId,
+    finest_normals: &Grid,
+    finest: Level,
+) -> Result<FaceCones, DisplayError> {
+    if finest_normals.side() != finest.face_quads() + 1 {
+        return Err(DisplayError::Shape);
+    }
+    if finest == Level::ZERO {
+        return Err(DisplayError::NoDisplayLevel(finest));
+    }
+    let mut levels: Vec<Vec<NormalCone>> = Vec::new();
+    let mut finer_level = finest;
+    while let Some(level) = finer_level.parent() {
+        let finer_cones = levels.last().map_or(&[][..], Vec::as_slice);
+        let cones = level_keys(face, level)?
+            .iter()
+            .map(|key| {
+                if finer_level != finest {
+                    let under: Vec<NormalCone> =
+                        children(key, finer_level, finer_cones).copied().collect();
+                    return NormalCone::holding(&under);
+                }
+                let region = Region::of_tile(key);
+                let fine = Region::new(
+                    region.face(),
+                    finer_level,
+                    2 * region.x0(),
+                    2 * region.y0(),
+                    2 * region.quads(),
+                )
+                .ok_or(DisplayError::Shape)?;
+                NormalCone::covering(block(finest_normals, fine)?.as_slice())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        levels.push(cones);
+        finer_level = level;
+    }
+    levels.reverse();
+    Ok(FaceCones { face, levels })
 }

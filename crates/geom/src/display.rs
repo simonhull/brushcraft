@@ -5,8 +5,9 @@
 //! finest, the surface one level finer **subsampled** as it is stored there (vertex `(i, j)` of
 //! the level-`l` face grid is vertex `(2i, 2j)` of level `l + 1`: the finest vertex itself one
 //! level below the finest, else the *decoded* display vertex), its **averaged normals** with a
-//! roughness term, and `e`, a **true bound** on the distance from the surface it draws to every
-//! finest vertex under it.
+//! roughness term, `e`, a **true bound** on the distance from the surface it draws to every
+//! finest vertex under it, and a **normal cone** ([`NormalCone`]) holding every finest normal
+//! under it.
 //!
 //! Subsampling the decoded level below, not the finest, lets a level be built from the stored
 //! level under it alone, never the finest positions under a whole face. Its border vertices are
@@ -37,6 +38,13 @@
 //! stored normal is the normalized mean, and the mean's length is the roughness term (Toksvig),
 //! as a `u8`.
 //!
+//! # Normal cones
+//!
+//! Each tile's cone holds every finest normal under it, as stored (see [`NormalCone`]): one
+//! level below the finest, taken from those normals; above, the union of the cones of the
+//! tiles under it, so it chains up the levels as `e` does, and a tile's cone holds its
+//! children's. Like positions, cones need nothing from a neighbouring face ([`build_cones`]).
+//!
 //! So positions are built a face at a time ([`build_positions`]: they need nothing from a
 //! neighbour), and normals a level at a time across faces ([`mip_normals`], [`build_level`]);
 //! [`build_mesh`] does both for a whole mesh.
@@ -61,16 +69,18 @@ use thiserror::Error;
 use crate::{Channel, EvalError, LayerId, Level, TileKey, Vec3};
 
 mod build;
+mod cone;
 mod encode;
 
 pub use build::{
-    FaceGrids, FacePositions, MeanNormals, build_level, build_mesh, build_positions, build_tile,
-    mip_normals, mip_normals_tile,
+    FaceCones, FaceGrids, FacePositions, MeanNormals, build_cones, build_level, build_mesh,
+    build_positions, build_tile, mip_normals, mip_normals_tile,
 };
 #[cfg(any(test, feature = "display-study"))]
 pub use build::{build_level_with, build_mesh_with, build_positions_with};
 #[cfg(test)]
 use build::{step_error, subsample};
+pub use cone::NormalCone;
 #[cfg(any(test, feature = "display-study"))]
 pub use encode::{BaseOffsets, DisplayCodec, FixedPoint, Interpolating, NormalEncoding, Precision};
 // The study's codec and normal encoding, under names of their own: public, and re-exported
@@ -123,7 +133,7 @@ impl From<EvalError> for DisplayError {
 }
 
 /// One display tile: the surface one level finer subsampled at a coarser tile, as decoded from its
-/// encoding, with its averaged normals, roughness and error bound.
+/// encoding, with its averaged normals, roughness, error bound and normal cone.
 ///
 /// Built by [`build_level`] (or [`build_mesh`]), or read back with [`DisplayTile::decode`] from
 /// the bytes [`DisplayTile::encoded`] gives.
@@ -140,6 +150,8 @@ pub struct DisplayTile {
     /// `e`: a bound, in world units, on the distance from the surface the tile draws to every
     /// finest vertex under it.
     error: f32,
+    /// The cone holding every finest normal under the tile.
+    cone: NormalCone,
     /// The encoded positions and normals ([`DisplayTile::encoded`]).
     encoded: Vec<u8>,
 }
@@ -189,6 +201,13 @@ impl DisplayTile {
         self.error
     }
 
+    /// The cone holding every finest normal under the tile, as stored (see [`NormalCone`]): the
+    /// union of its children's cones above the level below the finest, so it holds theirs.
+    #[must_use]
+    pub const fn cone(&self) -> NormalCone {
+        self.cone
+    }
+
     /// The tile's encoded positions and normals, as [`DisplayTile::decode`] reads them: a
     /// `u32` length of the positions' part, the positions as the codec stored them, then the
     /// normals and roughness.
@@ -198,7 +217,7 @@ impl DisplayTile {
     }
 
     /// The tile `key` from bytes [`DisplayTile::encoded`] gave for a tile [`build_level`] built,
-    /// with its bound `error` (stored beside them).
+    /// with its bound `error` and its `cone` (stored beside them).
     ///
     /// Any level's key is accepted, the finest included: a tile doesn't know its finest level, so
     /// whoever holds the project's checks that.
@@ -209,12 +228,25 @@ impl DisplayTile {
     /// [`DisplayError::Malformed`] if the bytes don't hold such a tile of `key`'s side, or the
     /// bound isn't finite and non-negative; [`DisplayError::NotFinite`] if a position decodes
     /// to a value that isn't finite.
-    pub fn decode(key: TileKey, error: f32, bytes: &[u8]) -> Result<Self, DisplayError> {
-        decode_with(&encode::CHOSEN, encode::CHOSEN_NORMALS, key, error, bytes)
+    pub fn decode(
+        key: TileKey,
+        error: f32,
+        cone: NormalCone,
+        bytes: &[u8],
+    ) -> Result<Self, DisplayError> {
+        decode_with(
+            &encode::CHOSEN,
+            encode::CHOSEN_NORMALS,
+            key,
+            error,
+            cone,
+            bytes,
+        )
     }
 }
 
-/// [`DisplayTile::decode`] for bytes encoded with `codec` and `normals`.
+/// [`DisplayTile::decode`] for bytes encoded with `codec` and `normals`, with the bound and
+/// cone stored beside them.
 ///
 /// # Errors
 ///
@@ -224,6 +256,7 @@ pub fn decode_with(
     normals: Normals,
     key: TileKey,
     error: f32,
+    cone: NormalCone,
     bytes: &[u8],
 ) -> Result<DisplayTile, DisplayError> {
     if key.layer() != LayerId::BASE || key.channel() != Channel::DISPLAY {
@@ -241,6 +274,7 @@ pub fn decode_with(
         normals,
         roughness,
         error,
+        cone,
         encoded: bytes.to_vec(),
     })
 }

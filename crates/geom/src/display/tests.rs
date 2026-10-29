@@ -421,6 +421,13 @@ impl Sculpt {
         Self { mesh, dense }
     }
 
+    /// `cube_sphere(1)` without corrections: the smooth limit surface.
+    fn smooth() -> Self {
+        let mesh = cube_sphere(1).unwrap();
+        let dense = DenseEvaluation::new(&mesh, level(FINEST), &CorrectionMap::new()).unwrap();
+        Self { mesh, dense }
+    }
+
     /// `face`'s finest positions and unit normals.
     fn finest(&self, face: FaceId) -> (Grid, Grid) {
         let positions = self.dense.grid(face, level(FINEST)).unwrap().clone();
@@ -743,19 +750,20 @@ fn a_built_tile_reads_back_from_its_bytes() {
         "per face, levels 0–6 a tile each, level 7 four"
     );
     for tile in &tiles {
-        let back = DisplayTile::decode(*tile.key(), tile.error(), tile.encoded()).unwrap();
+        let back =
+            DisplayTile::decode(*tile.key(), tile.error(), tile.cone(), tile.encoded()).unwrap();
         assert_eq!(&back, tile, "{:?}", tile.key());
     }
     let first = tiles.first().unwrap();
     assert_eq!(
-        DisplayTile::decode(*first.key(), f32::NAN, first.encoded()).map(|_| ()),
+        DisplayTile::decode(*first.key(), f32::NAN, first.cone(), first.encoded()).map(|_| ()),
         Err(DisplayError::Malformed),
         "a bound that isn't one"
     );
     let face = first.key().face();
     let displacement = TileKey::displacement(face, first.key().level(), 0, 0).unwrap();
     assert_eq!(
-        DisplayTile::decode(displacement, first.error(), first.encoded()).map(|_| ()),
+        DisplayTile::decode(displacement, first.error(), first.cone(), first.encoded()).map(|_| ()),
         Err(DisplayError::NotDisplay(displacement)),
         "a key of another channel"
     );
@@ -1073,21 +1081,215 @@ fn a_tile_built_alone_is_the_tile_built_with_its_mesh() {
                     .get(2 * region.x0() + i, 2 * region.y0() + j)
                     .unwrap()
             });
-            let children = if l + 1 == FINEST {
-                0.0
+            let (children, cone) = if l + 1 == FINEST {
+                let finest_normals = normals.get(key.face()).unwrap();
+                let under = grid(2 * region.quads() + 1, |i, j| {
+                    finest_normals
+                        .get(2 * region.x0() + i, 2 * region.y0() + j)
+                        .unwrap()
+                });
+                (0.0, NormalCone::covering(under.as_slice()).unwrap())
             } else {
                 let ratio = finer_level.tiles_per_side() / level(l).tiles_per_side();
-                (0..ratio * ratio)
+                // Handed over in reverse, as a store might gather them: the order doesn't
+                // matter.
+                let under: Vec<&DisplayTile> = (0..ratio * ratio)
+                    .rev()
                     .map(|n| {
                         let tx = u16::try_from(u32::from(key.tx()) * ratio + n % ratio).unwrap();
                         let ty = u16::try_from(u32::from(key.ty()) * ratio + n / ratio).unwrap();
-                        by_key[&TileKey::display(key.face(), finer_level, tx, ty).unwrap()].error()
+                        by_key[&TileKey::display(key.face(), finer_level, tx, ty).unwrap()]
                     })
-                    .fold(0.0, f32::max)
+                    .collect();
+                let cones: Vec<NormalCone> = under.iter().map(|t| t.cone()).collect();
+                (
+                    under.iter().map(|t| t.error()).fold(0.0, f32::max),
+                    NormalCone::holding(&cones).unwrap(),
+                )
             };
             let means = mip_normals_tile(&sculpt.mesh, &finer_means, &key).unwrap();
-            let alone = build_tile(key, &finer, children, &means).unwrap();
+            let alone = build_tile(key, &finer, children, cone, &means).unwrap();
             assert_eq!(&alone, tile, "{key:?}");
+        }
+    }
+}
+
+/// The finest normals under display tile `key`: its block of the face's finest grid, borders
+/// included.
+fn finest_under(normals: &FaceGrids, key: &TileKey) -> Vec<Vec3> {
+    let region = Region::of_tile(key);
+    let shift = u32::from(FINEST - key.level().get());
+    let face = normals.get(key.face()).unwrap();
+    let side = (region.quads() << shift) + 1;
+    let (x0, y0) = (region.x0() << shift, region.y0() << shift);
+    (0..side)
+        .flat_map(|j| (0..side).map(move |i| (i, j)))
+        .map(|(i, j)| face.get(x0 + i, y0 + j).unwrap())
+        .collect()
+}
+
+/// The display tiles under `key` one level finer.
+fn children_of<'a>(
+    tiles: &'a BTreeMap<TileKey, DisplayTile>,
+    key: &TileKey,
+) -> impl Iterator<Item = &'a DisplayTile> {
+    let region = Region::of_tile(key);
+    let finer = key.level().child().unwrap();
+    tiles.values().filter(move |t| {
+        let under = Region::of_tile(t.key());
+        t.key().face() == key.face()
+            && t.key().level() == finer
+            && under.x0() >= 2 * region.x0()
+            && under.y0() >= 2 * region.y0()
+            && under.x0() + under.quads() <= 2 * (region.x0() + region.quads())
+            && under.y0() + under.quads() <= 2 * (region.y0() + region.quads())
+    })
+}
+
+/// Every display tile of `sculpt`, by key, with the finest normals they were built from.
+fn built(sculpt: &Sculpt) -> (BTreeMap<TileKey, DisplayTile>, FaceGrids) {
+    let (positions, normals) = sculpt.finest_grids();
+    let tiles = build_mesh(&sculpt.mesh, &positions, &normals).unwrap();
+    (tiles.into_iter().map(|t| (*t.key(), t)).collect(), normals)
+}
+
+/// The smooth sphere and random sculpts the cone tests build, by name.
+fn cone_sculpts() -> impl Iterator<Item = (String, Sculpt)> {
+    let random = [3_u64, 8, 21, 34, 55]
+        .into_iter()
+        .map(|seed| (format!("seed {seed}"), Sculpt::random(seed)));
+    std::iter::once(("smooth".to_owned(), Sculpt::smooth())).chain(random)
+}
+
+/// Every finest normal under every display tile lies within its cone as decoded, at every level,
+/// on the smooth sphere and on rough random sculpts; and a tile's cone holds each of its
+/// children's.
+#[test]
+fn cones_hold_every_finest_normal_and_their_childrens_cones() {
+    for (name, sculpt) in cone_sculpts() {
+        let (tiles, normals) = built(&sculpt);
+        for (key, tile) in &tiles {
+            let cone = tile.cone();
+            for normal in finest_under(&normals, key) {
+                assert!(
+                    cone.contains(normal),
+                    "{name}, {key:?}: {normal:?} outside {cone:?} ({}° from its axis)",
+                    angle_degrees(normal, cone.axis())
+                );
+            }
+            if key.level().get() + 1 == FINEST {
+                continue;
+            }
+            let children: Vec<&DisplayTile> = children_of(&tiles, key).collect();
+            assert!(!children.is_empty(), "{name}, {key:?}: no children");
+            for child in children {
+                assert!(
+                    cone.holds(child.cone()),
+                    "{name}, {key:?}: {:?} of {:?} outside {cone:?}",
+                    child.cone(),
+                    child.key()
+                );
+            }
+        }
+    }
+}
+
+/// The half-angle of `tile`'s cone and how far it lies over the exact cone around the same
+/// axis (the widest angle from it to a finest normal under the tile), in degrees.
+fn width_and_slack(normals: &FaceGrids, tile: &DisplayTile) -> (f64, f64) {
+    let cone = tile.cone();
+    let half = f64::from(cone.half_angle().to_degrees());
+    let exact = finest_under(normals, tile.key())
+        .into_iter()
+        .map(|n| angle_degrees(n, cone.axis()))
+        .fold(0.0_f64, f64::max);
+    (half, half - exact)
+}
+
+/// On the smooth sphere, no cone covers everything, and each is as tight as its inputs allow
+/// around its own axis.
+///
+/// That is, within a step of the widest finest normal one level below the finest,
+/// within a step of the widest child cone above, and a tile holding one child has the child's
+/// very cone.
+#[test]
+fn cones_on_a_smooth_sphere_are_tight() {
+    // A step, in degrees, with room for the slack and the rounding of the degrees.
+    let step = 180.0 / 4095.0 + 1e-6;
+    let (tiles, normals) = built(&Sculpt::smooth());
+    for (key, tile) in &tiles {
+        let cone = tile.cone();
+        assert!(!cone.covers_everything(), "{key:?}");
+        let half = f64::from(cone.half_angle().to_degrees());
+        if key.level().get() + 1 == FINEST {
+            let (_, slack) = width_and_slack(&normals, tile);
+            assert!(
+                (0.0..=step).contains(&slack),
+                "{key:?}: {half}°, {slack}° over its normals"
+            );
+            continue;
+        }
+        let children: Vec<&DisplayTile> = children_of(&tiles, key).collect();
+        if let [only] = children.as_slice() {
+            assert_eq!(cone, only.cone(), "{key:?}: one child");
+            continue;
+        }
+        let widest = children
+            .iter()
+            .map(|c| {
+                angle_degrees(cone.axis(), c.cone().axis())
+                    + f64::from(c.cone().half_angle().to_degrees())
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            (0.0..=step).contains(&(half - widest)),
+            "{key:?}: {half}° around children reaching {widest}°"
+        );
+    }
+}
+
+/// The `q` quantile of sorted `values`, by nearest rank.
+fn quantile(values: &[f64], q: f64) -> f64 {
+    let last = values.len().saturating_sub(1);
+    let rank = (q * f64::from(u32::try_from(last).unwrap())).round();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a rank within the values, rounded"
+    )]
+    let rank = rank as usize;
+    values[rank.min(last)]
+}
+
+/// Prints the median and 99th percentile half-angle of the cones at each level, and of how far
+/// they lie over the exact cone around the same axis.
+///
+/// On the smooth sphere and the random sculpts: `cargo nextest run -p geom --run-ignored only
+/// cone_widths --no-capture`.
+#[test]
+#[ignore = "a measurement to read, not a check"]
+fn cone_widths() {
+    for (name, sculpt) in cone_sculpts() {
+        let (tiles, normals) = built(&sculpt);
+        let mut by_level: BTreeMap<u8, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+        for tile in tiles.values() {
+            let (half, slack) = width_and_slack(&normals, tile);
+            let entry = by_level.entry(tile.key().level().get()).or_default();
+            entry.0.push(half);
+            entry.1.push(slack);
+        }
+        println!("{name}: level, median / p99 half-angle °, median / p99 over the exact °");
+        for (l, (mut halves, mut slacks)) in by_level {
+            halves.sort_by(f64::total_cmp);
+            slacks.sort_by(f64::total_cmp);
+            println!(
+                "  {l}: {:7.3} / {:7.3}   {:6.3} / {:6.3}   ({} tiles)",
+                quantile(&halves, 0.5),
+                quantile(&halves, 0.99),
+                quantile(&slacks, 0.5),
+                quantile(&slacks, 0.99),
+                halves.len()
+            );
         }
     }
 }
