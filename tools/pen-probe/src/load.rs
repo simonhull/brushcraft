@@ -128,6 +128,10 @@ pub(crate) fn ensure_outside_repo(path: &Path) -> Result<()> {
 /// The prefix of a work directory's name.
 const WORK_PREFIX: &str = "pen-probe-";
 
+/// The file [`WorkDir::beside`] puts in each work directory it makes: the sweep removes only
+/// directories that hold one.
+const WORK_MARKER: &str = ".pen-probe-work";
+
 /// A directory beside a project for one run's copy of it, removed with everything in it when
 /// dropped: `pen-probe-<pid>-<n>`.
 #[derive(Debug)]
@@ -140,24 +144,46 @@ impl WorkDir {
     /// A new work directory beside `project`, after removing those that runs no longer alive
     /// left there.
     ///
+    /// The directory beside `project` is checked to be outside the repository before anything in
+    /// it is touched. Each name is taken with an exclusive `mkdir`, so two runs never share one,
+    /// and the new directory gets a [`WORK_MARKER`] file, which the sweep requires before it
+    /// removes anything.
+    ///
     /// # Errors
     ///
-    /// If `project` has no directory, the directory is inside the repository, or it can't be
-    /// made.
+    /// If `project`'s directory is inside the repository, or the work directory or its marker
+    /// can't be made.
     pub(crate) fn beside(project: &Path) -> Result<Self> {
         let parent = project
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        ensure_outside_repo(parent)?;
         sweep(parent);
         let pid = std::process::id();
-        let dir = (0..u32::MAX)
-            .map(|n| parent.join(format!("{WORK_PREFIX}{pid}-{n}")))
-            .find(|dir| !dir.exists())
-            .context("no free work directory name")?;
-        ensure_outside_repo(&dir)?;
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        Ok(Self { dir })
+        for n in 0..u32::MAX {
+            let dir = parent.join(format!("{WORK_PREFIX}{pid}-{n}"));
+            #[expect(
+                clippy::create_dir,
+                reason = "taking a name must fail if it exists, which `create_dir_all` doesn't"
+            )]
+            let made = std::fs::create_dir(&dir);
+            match made {
+                Ok(()) => {
+                    // Owned from here: should the marker fail, dropping removes the directory.
+                    let work = Self { dir };
+                    let marker = work.dir.join(WORK_MARKER);
+                    File::create_new(&marker)
+                        .with_context(|| format!("creating {}", marker.display()))?;
+                    return Ok(work);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("creating {}", dir.display()));
+                }
+            }
+        }
+        bail!("no free work directory name in {}", parent.display())
     }
 
     /// The directory.
@@ -173,8 +199,40 @@ impl Drop for WorkDir {
     }
 }
 
-/// Removes the work directories in `dir` whose run's process is gone (Linux: no `/proc/<pid>`);
-/// does nothing elsewhere.
+/// A decimal `u32` written with digits only: no sign, no spaces.
+fn digits(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// The pid in a work directory's name, `pen-probe-<pid>-<n>` exactly; `None` for any other name.
+fn work_dir_pid(name: &str) -> Option<u32> {
+    let (pid, n) = name.strip_prefix(WORK_PREFIX)?.split_once('-')?;
+    digits(n)?;
+    digits(pid)
+}
+
+/// Whether `entry` is a work directory a run no longer alive left: named as one, a directory
+/// itself (not a link to one), holding the [`WORK_MARKER`] file, and its pid not running (Linux:
+/// no `/proc/<pid>`).
+fn is_stale_work_dir(entry: &std::fs::DirEntry) -> bool {
+    let Some(pid) = entry.file_name().to_str().and_then(work_dir_pid) else {
+        return false;
+    };
+    // `DirEntry::file_type` doesn't follow a symbolic link.
+    let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+    let marked =
+        std::fs::symlink_metadata(entry.path().join(WORK_MARKER)).is_ok_and(|m| m.is_file());
+    is_dir
+        && marked
+        && pid != std::process::id()
+        && !Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// Removes the work directories in `dir` that runs no longer alive left (see
+/// [`is_stale_work_dir`]); does nothing on systems other than Linux.
 fn sweep(dir: &Path) {
     if !cfg!(target_os = "linux") {
         return;
@@ -184,17 +242,7 @@ fn sweep(dir: &Path) {
     };
     let stale: Vec<PathBuf> = entries
         .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name();
-            let pid = name
-                .to_str()
-                .and_then(|n| n.strip_prefix(WORK_PREFIX))
-                .and_then(|rest| rest.split('-').next())
-                .and_then(|pid| pid.parse::<u32>().ok());
-            pid.is_some_and(|pid| {
-                pid != std::process::id() && !Path::new("/proc").join(pid.to_string()).exists()
-            })
-        })
+        .filter(is_stale_work_dir)
         .map(|entry| entry.path())
         .collect();
     for path in stale {
@@ -692,12 +740,18 @@ mod tests {
 
     use super::*;
 
-    /// A directory under the system's temporary one, removed when dropped.
+    /// A uniquely named directory, removed when dropped.
     struct Scratch(PathBuf);
 
     impl Scratch {
+        /// One under the system's temporary directory.
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
+            Self::under(&std::env::temp_dir(), name)
+        }
+
+        /// One under `base`.
+        fn under(base: &Path, name: &str) -> Self {
+            let dir = base.join(format!(
                 "pen-probe-test-{name}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
@@ -708,6 +762,12 @@ mod tests {
         }
     }
 
+    /// Makes `dir` a work directory as [`WorkDir::beside`] would leave it: marked.
+    fn marked(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("made");
+        File::create(dir.join(WORK_MARKER)).expect("marked");
+    }
+
     impl Drop for Scratch {
         fn drop(&mut self) {
             drop(std::fs::remove_dir_all(&self.0));
@@ -715,21 +775,81 @@ mod tests {
     }
 
     #[test]
-    fn a_work_dir_goes_when_dropped_and_stale_ones_are_swept() {
+    fn a_work_dir_goes_when_dropped_and_only_stale_ones_are_swept() {
         let scratch = Scratch::new("work");
         let project = scratch.0.join("p.bcrf");
-        // A dead run's directory: no process has pid u32::MAX - 1.
-        let dead = scratch.0.join(format!("{WORK_PREFIX}{}-0", u32::MAX - 1));
-        std::fs::create_dir_all(&dead).expect("made");
+        // No process has pid u32::MAX - 1; pid 1 always runs.
+        let dead_pid = u32::MAX - 1;
+        let dead = scratch.0.join(format!("{WORK_PREFIX}{dead_pid}-0"));
+        marked(&dead);
+        let live = scratch.0.join(format!("{WORK_PREFIX}1-0"));
+        marked(&live);
+        let suffixed = scratch.0.join(format!("{WORK_PREFIX}{dead_pid}-0-extra"));
+        marked(&suffixed);
+        let unmarked = scratch.0.join(format!("{WORK_PREFIX}{dead_pid}-1"));
+        std::fs::create_dir_all(&unmarked).expect("made");
+        let file = scratch.0.join(format!("{WORK_PREFIX}{dead_pid}-2"));
+        std::fs::write(&file, b"not a directory").expect("written");
         let other = scratch.0.join("keep-me");
-        std::fs::create_dir_all(&other).expect("made");
+        marked(&other);
+        let link = scratch.0.join(format!("{WORK_PREFIX}{dead_pid}-3"));
+        std::os::unix::fs::symlink(&other, &link).expect("linked");
+
         let work = WorkDir::beside(&project).expect("a work directory");
-        assert!(work.path().is_dir());
+        assert!(work.path().join(WORK_MARKER).is_file(), "marked");
         assert!(!dead.exists(), "the dead run's directory is swept");
-        assert!(other.exists(), "nothing else is");
+        for kept in [&live, &suffixed, &unmarked, &file, &other] {
+            assert!(kept.exists(), "{} is kept", kept.display());
+        }
+        assert!(link.is_symlink(), "a link to a marked directory is kept");
+        assert!(other.join(WORK_MARKER).is_file(), "and so is its target");
         let path = work.path().to_path_buf();
         drop(work);
         assert!(!path.exists(), "removed when dropped");
+    }
+
+    #[test]
+    fn a_work_dir_name_is_taken_exclusively() {
+        let scratch = Scratch::new("exclusive");
+        let first = WorkDir::beside(&scratch.0.join("p.bcrf")).expect("a work directory");
+        let second = WorkDir::beside(&scratch.0.join("p.bcrf")).expect("a work directory");
+        assert_ne!(first.path(), second.path());
+        assert!(second.path().join(WORK_MARKER).is_file());
+    }
+
+    #[test]
+    fn work_dir_names_match_exactly() {
+        assert_eq!(work_dir_pid("pen-probe-12-3"), Some(12));
+        for name in [
+            "pen-probe-12-3-extra",
+            "pen-probe-12-",
+            "pen-probe--3",
+            "pen-probe-+12-3",
+            "pen-probe-12-+3",
+            "pen-probe-12",
+            "pen-probe-test-load-12-3",
+            "pen-probe-99999999999-3",
+        ] {
+            assert_eq!(work_dir_pid(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_project_inside_the_repository_is_refused_before_anything_is_swept() {
+        let inside = Scratch::under(Path::new(env!("CARGO_MANIFEST_DIR")), "inside");
+        let dead = inside.0.join(format!("{WORK_PREFIX}{}-0", u32::MAX - 1));
+        marked(&dead);
+        let refused = WorkDir::beside(&inside.0.join("p.bcrf")).expect_err("refused");
+        assert!(
+            refused.to_string().contains("inside the repository"),
+            "{refused:#}"
+        );
+        assert!(
+            dead.join(WORK_MARKER).is_file(),
+            "nothing beside it is touched"
+        );
+        let entries = std::fs::read_dir(&inside.0).expect("listed").count();
+        assert_eq!(entries, 1, "and no work directory is made");
     }
 
     #[test]
