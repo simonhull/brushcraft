@@ -246,6 +246,10 @@ impl TileStore {
     /// tile is drawn with the normal cone that covers everything (never facing away) until the
     /// refresh rebuilds its cone with the rest of it.
     ///
+    /// The display tiles whose bound it raises, and those it makes unknown, are noted for the
+    /// open epoch of the stale-tile feed, so a consumer that listens reads them again when the
+    /// dab's epoch closes; the refresh that rebuilds them names them in its own epoch.
+    ///
     /// Twice: the finest vertex and the display vertex compared with it can each move that far
     /// (the renderer's stand-ins move display vertices too). Call it after each dab's writes
     /// ([`TileStore::update_tiles`], which settles every write before them), before anything
@@ -278,10 +282,12 @@ impl TileStore {
         let raise = 2.0 * max_displacement.abs();
         self.take_read_ahead();
         let mut reached = BTreeSet::new();
+        let mut grown = Vec::new();
         let mut to_read = Vec::new();
         for key in readers.difference(&stale) {
             if let Some((_, extra)) = self.bumped.get_mut(key) {
                 *extra += raise;
+                grown.push(*key);
                 continue;
             }
             // The record as it was before the dab's writes: every write before them is
@@ -315,6 +321,11 @@ impl TileStore {
                 reached.insert(*key);
             }
         }
+        // What a reader draws of these tiles changed: the dab's epoch names them, so a
+        // consumer reads them again (their raised bound, the cone that covers everything), and
+        // so do the tiles the uncovered writes made unknown.
+        let changed = stale.iter().chain(&reached).chain(&grown).copied();
+        self.note_epoch_keys(changed);
         // The next dabs reach the tiles around those this one reached first: their records
         // are read on the workers meanwhile.
         if !reached.is_empty() {

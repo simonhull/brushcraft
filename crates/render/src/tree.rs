@@ -467,8 +467,9 @@ impl TileTree {
     }
 
     /// Points the resident tile at `place` to `slot`, with the bound `e` and finest normals'
-    /// cone of its new data (`detail`: both change with it, a dab's tiles covering everything
-    /// until their refresh); returns the slot it held, or `None` if `place` isn't resident.
+    /// cone of its new data (`detail`: both change with the data an epoch brings, a dab raising
+    /// `e` and widening the cone to everything, its refresh rebuilding both); returns the slot it
+    /// held, or `None` if `place` isn't resident.
     ///
     /// The tile keeps its node index: an epoch that moves a tile to a shadow slot changes its
     /// slot, never its node. A node index stays the tile's from [`TileTree::insert`] to

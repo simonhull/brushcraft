@@ -67,15 +67,17 @@ struct TileVertex {
 /// What a tile read gives the level choice beside its vertices: how far what the tile draws may
 /// be from the finest surface under it, and which way that surface faces.
 ///
-/// The two change together (a dab, a display refresh), so they travel together, from the read
-/// to the tile tree's node ([`crate::tree::GpuNode::error`] and
-/// [`crate::tree::GpuNode::finest_cone`]).
+/// The two change together, so they travel together from the read to the tile tree's node
+/// ([`crate::tree::GpuNode::error`] and [`crate::tree::GpuNode::finest_cone`]): a dab raises
+/// `e` and makes the cone cover everything, and the refresh rebuilds both, each in an epoch
+/// of the stale-tile feed naming the tile, so residency reads it again and switches both.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TileDetail {
     /// `e`: a bound, in world units, on the distance from what the tile draws to the finest
     /// surface under it; 0 for a finest tile.
     pub error: f32,
-    /// The cone holding every finest normal under the tile, as its display record stores it.
+    /// The cone holding every finest normal under the tile, as its display record stores it
+    /// (covering everything while a dab has raised its bound).
     /// [`FinestNormalCone::EVERYTHING`] for a finest tile (the level choice tests a finest
     /// tile by its own triangles, which are the finest surface) and for any tile whose finest
     /// normals aren't known: never facing away, so refined whenever its error asks.

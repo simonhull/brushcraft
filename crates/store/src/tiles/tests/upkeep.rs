@@ -406,6 +406,68 @@ fn a_dab_makes_the_cones_it_reaches_cover_everything_until_the_refresh() {
     assert_layer_current(&mut store, "refreshed after the dab");
 }
 
+/// The display tiles each epoch names, drained from `cursor`.
+fn named_since(store: &mut TileStore, cursor: &crate::stale::StaleCursor) -> BTreeSet<TileKey> {
+    match store.drain_stale(cursor) {
+        crate::stale::Drained::Epochs(epochs) => epochs.into_iter().flat_map(|e| e.keys).collect(),
+        crate::stale::Drained::Resync => panic!("the consumer keeps up"),
+    }
+}
+
+/// A dab's epoch names the display tiles its bump raises, and the refresh's name them again.
+///
+/// A later dab's epoch names those it raises again, so a consumer reads each of them with its
+/// raised bound and the cone that covers everything, then with its rebuilt one.
+#[test]
+fn a_dab_s_epoch_names_the_display_tiles_it_bumps_and_the_refresh_names_them_again() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let cursor = store.subscribe_stale();
+    let face = FaceId::new(1);
+    let (ci, cj) = (100, 140);
+    let (key, li, lj) = TileKey::containing(
+        LayerId::BASE,
+        Channel::DISPLACEMENT,
+        face,
+        level(TOP),
+        ci,
+        cj,
+    )
+    .unwrap();
+    for (dab, lift) in [0.05, 0.02].into_iter().enumerate() {
+        store.begin_op().unwrap();
+        let c = store.correction(key).unwrap().get(li, lj).unwrap();
+        store
+            .set_correction(face, level(TOP), ci, cj, c + Vec3::new(0.0, 0.0, lift))
+            .unwrap();
+        store.bump_display_error(&[key], lift).unwrap();
+        store.close_epoch().unwrap();
+        let bumped: Vec<TileKey> = store.bumped.keys().copied().collect();
+        assert!(!bumped.is_empty(), "dab {dab} bumps display tiles");
+        let named = named_since(&mut store, &cursor);
+        for k in &bumped {
+            assert!(named.contains(k), "dab {dab}: its epoch names {k:?}");
+        }
+    }
+    let bumped: Vec<TileKey> = store.bumped.keys().copied().collect();
+    run_all(&mut store);
+    let named = named_since(&mut store, &cursor);
+    let refreshed = store.display_for_draw(&bumped).unwrap();
+    let pairs = bumped.iter().zip(&refreshed);
+    for (k, tile) in pairs {
+        assert!(named.contains(k), "the refresh names {k:?}");
+        let tile = tile.as_ref().unwrap_or_else(|| panic!("{k:?}: refreshed"));
+        if k.level() == level(TOP - 1) {
+            assert!(
+                !tile.cone().covers_everything(),
+                "{k:?}: a tight cone again"
+            );
+        }
+    }
+}
+
 /// A write no bump covers (outside a dab, or a lost tile's revert) changes a bumped tile's finest
 /// values: its bumped bound no longer bounds it, so it is drawn as unknown, never as bumped.
 #[test]

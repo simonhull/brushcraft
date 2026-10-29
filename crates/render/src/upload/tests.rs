@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use geom::{FaceId, Level, TileKey, cube_sphere};
+use geom::{FaceId, FinestNormalCone, Level, TileKey, cube_sphere};
 use store::{Project, ProjectConfig, StoreConfig};
 use wgpu::CommandEncoderDescriptor;
 
@@ -146,6 +146,159 @@ fn the_stores_tiles_land_in_their_slots_bit_for_bit() {
                 );
             }
         }
+        drop(project.close(false));
+    });
+}
+
+/// Stages one frame of `residency` from `store`, wanting `requests`, and submits its uploads.
+fn frame(gpu: &Gpu, residency: &mut Residency, store: &mut TileStore, requests: &Requests) {
+    residency.begin_frame(gpu).expect("begins");
+    residency.want(requests);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let uploads = residency
+        .stage(gpu, &mut StoreSource::new(store), deadline)
+        .expect("staged");
+    gpu.scoped("frame", || {
+        let encoder = gpu
+            .device()
+            .create_command_encoder(&CommandEncoderDescriptor::default());
+        uploads.submit(gpu.queue(), encoder, |_| {});
+    })
+    .expect("submits");
+}
+
+/// The `e` and cone resident tile `key`'s node holds.
+fn node_detail(residency: &Residency, key: &TileKey) -> (f32, FinestNormalCone) {
+    let tree = residency.tree();
+    let index = tree
+        .node(crate::tree::Place::of(key))
+        .unwrap_or_else(|| panic!("{key:?} resident"));
+    let node = tree.gpu_node(index);
+    (node.error, FinestNormalCone::from_bits(node.finest_cone))
+}
+
+/// Runs frames, each after applying the feed's epochs, until `done` holds of `key`'s node (at
+/// most a few).
+fn frames_until(
+    gpu: &Gpu,
+    residency: &mut Residency,
+    store: &mut TileStore,
+    cursor: &store::StaleCursor,
+    key: &TileKey,
+    done: impl Fn((f32, FinestNormalCone)) -> bool,
+) -> (f32, FinestNormalCone) {
+    let none = Requests::new([], 0);
+    for _ in 0..4 {
+        residency.apply(store.drain_stale(cursor));
+        frame(gpu, residency, store, &none);
+        let detail = node_detail(residency, key);
+        if done(detail) {
+            return detail;
+        }
+    }
+    panic!(
+        "{key:?}'s node never changed: {:?}",
+        node_detail(residency, key)
+    );
+}
+
+#[test]
+fn a_dab_makes_a_resident_display_tile_cover_everything_until_its_refresh() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("dab-cone");
+        let mesh = cube_sphere(1).expect("a mesh");
+        let finest = level(7);
+        let config = ProjectConfig {
+            store: StoreConfig::new(256 << 20, 1).with_display(finest),
+            recovery_dir: dir.0.clone(),
+        };
+        let mut project = Project::new(mesh.clone(), config).expect("a project");
+        let store = project.store();
+        store.queue_display_rebuild(finest);
+        while store.has_jobs() {
+            store
+                .run_jobs(Instant::now() + Duration::from_millis(50))
+                .expect("the display layer builds");
+        }
+        let cursor = store.subscribe_stale();
+        let mut residency =
+            Residency::new(gpu, &mesh, finest, ResidencyConfig::default()).expect("residency");
+        let face = FaceId::new(2);
+        // A whole-face display tile above the floor: every dab on the face reaches it.
+        let coarse = TileKey::display(face, level(6), 0, 0).expect("a display tile");
+        let requests = Requests::new(
+            [Request {
+                key: coarse,
+                screen_error: 2.0,
+            }],
+            0,
+        );
+        for _ in 0..2 {
+            frame(gpu, &mut residency, store, &requests);
+        }
+        let built = store
+            .display_for_draw(&[coarse])
+            .expect("reads")
+            .pop()
+            .flatten()
+            .expect("built");
+        let (e, cone) = node_detail(&residency, &coarse);
+        assert_eq!((e, cone), (built.error(), built.cone()), "the record's");
+        assert!(!cone.covers_everything(), "a tight cone to begin with");
+
+        // A dab: a small bump on the face, its display tiles' bounds raised.
+        let lift = 0.002_f32;
+        let (key, li, lj) = TileKey::containing(
+            geom::LayerId::BASE,
+            Channel::DISPLACEMENT,
+            face,
+            finest,
+            40,
+            50,
+        )
+        .expect("a finest tile");
+        store.begin_op().expect("an op");
+        let c = store
+            .correction(key)
+            .expect("reads")
+            .get(li, lj)
+            .expect("a vertex");
+        store
+            .set_correction(face, finest, 40, 50, c + Vec3::new(0.0, 0.0, lift))
+            .expect("written");
+        store.bump_display_error(&[key], lift).expect("bumped");
+        store.close_epoch().expect("closed");
+        let (bumped_e, _) = frames_until(gpu, &mut residency, store, &cursor, &coarse, |d| {
+            d.1.covers_everything()
+        });
+        assert!(bumped_e > e, "its bound raised: {bumped_e} over {e}");
+
+        // The refresh's epochs bring its rebuilt record, a tight cone again. The first call
+        // queues it (the dab's writes settle there), so it runs at least once.
+        loop {
+            store
+                .run_jobs(Instant::now() + Duration::from_millis(50))
+                .expect("the refresh runs");
+            if !store.has_jobs() {
+                break;
+            }
+        }
+        let rebuilt = store
+            .display_for_draw(&[coarse])
+            .expect("reads")
+            .pop()
+            .flatten()
+            .expect("rebuilt");
+        assert!(
+            !rebuilt.cone().covers_everything(),
+            "the refresh's cone is tight: e {} against {bumped_e}, jobs {}",
+            rebuilt.error(),
+            store.has_jobs()
+        );
+        let record = (rebuilt.error(), rebuilt.cone());
+        frames_until(gpu, &mut residency, store, &cursor, &coarse, |d| {
+            d == record
+        });
         drop(project.close(false));
     });
 }
