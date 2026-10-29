@@ -9,7 +9,8 @@
 //!    beside it for information only: the wait comes from the frame loop and delays U's samples as
 //!    much, so W is held to U's figure (the plan's corrected rule, 2026-10-28);
 //! 3. its events tell each barrel button apart from the tip: a click while hovering makes no
-//!    pen-down, and a release mid-stroke ends no stroke while the pen still presses.
+//!    pen-down without force (a tip touch in the step is no failure), and a release mid-stroke ends
+//!    no stroke while the pen still presses.
 //!
 //! Otherwise U. The numbers are printed beside each check, so a borderline call is the reader's.
 
@@ -80,11 +81,14 @@ impl fmt::Display for Verdict {
 }
 
 /// Whether W tells one barrel apart, from its hover and mid-stroke steps.
+///
+/// A pen-down while hovering fails it only if the pen never pressed after it: one that pressed is
+/// the tip touching, which the hover step doesn't forbid.
 fn told_apart(hover: StepFindings, stroke: StepFindings) -> Verdict {
     if hover.presses == 0 && stroke.presses == 0 {
         return Verdict::Unknown;
     }
-    if hover.downs > 0 || stroke.ends_pressing > 0 {
+    if hover.downs_without_force > 0 || stroke.ends_pressing > 0 {
         Verdict::Fail
     } else {
         Verdict::Pass
@@ -163,6 +167,39 @@ pub(crate) fn checks(winit: &[&Sample], ours: &[&Sample]) -> Checks {
     }
 }
 
+/// One source's findings in a barrel step, for printing: the same fields for W and U.
+fn show_findings(f: StepFindings) -> String {
+    format!(
+        "{} button events, {} pen-downs ({} never pressing), {} strokes ended while pressing ({} \
+         ends)",
+        f.presses, f.downs, f.downs_without_force, f.ends_pressing, f.ups,
+    )
+}
+
+/// Appends a row per barrel step: what W's samples `w` and U's `u` show in it.
+///
+/// # Errors
+///
+/// Only if formatting fails, which writing to a `String` never does.
+fn barrel_rows(out: &mut String, w: &[&Sample], u: &[&Sample]) -> fmt::Result {
+    writeln!(out, "barrel buttons:")?;
+    for step in [
+        Step::Barrel1Hover,
+        Step::Barrel1Stroke,
+        Step::Barrel2Hover,
+        Step::Barrel2Stroke,
+    ] {
+        writeln!(
+            out,
+            "  {}: W {}; U {}",
+            step.name(),
+            show_findings(buttons::findings(Source::Winit, w, step)),
+            show_findings(buttons::findings(Source::Ours, u, step)),
+        )?;
+    }
+    Ok(())
+}
+
 /// The comparison of `winit` (W's run) and `ours` (U's), with the checks and the choice.
 ///
 /// # Errors
@@ -196,30 +233,7 @@ pub(crate) fn compare(winit: &Recording, ours: &Recording) -> Result<String, fmt
         away(winit),
         away(ours)
     )?;
-    writeln!(out, "barrel buttons:")?;
-    for step in [
-        Step::Barrel1Hover,
-        Step::Barrel1Stroke,
-        Step::Barrel2Hover,
-        Step::Barrel2Stroke,
-    ] {
-        let (fw, fu) = (
-            buttons::findings(Source::Winit, &w, step),
-            buttons::findings(Source::Ours, &u, step),
-        );
-        writeln!(
-            out,
-            "  {}: W {} button events, {} pen-downs, {} strokes ended while pressing; U {} \
-             button events, {} pen-downs, {} ends",
-            step.name(),
-            fw.presses,
-            fw.downs,
-            fw.ends_pressing,
-            fu.presses,
-            fu.downs,
-            fu.ups,
-        )?;
-    }
+    barrel_rows(&mut out, &w, &u)?;
     let checks = checks(&w, &u);
     writeln!(out, "checks for W:")?;
     writeln!(
@@ -401,11 +415,14 @@ mod tests {
         };
         let text = compare(&winit, &ours).expect("a String");
         assert!(
-            text.contains("barrel1-hover: W 2 button events, 1 pen-downs"),
+            text.contains("barrel1-hover: W 2 button events, 1 pen-downs (1 never pressing)"),
             "{text}"
         );
         assert!(
-            text.contains("barrel1-stroke: W 4 button events, 1 pen-downs, 1 strokes ended"),
+            text.contains(
+                "barrel1-stroke: W 4 button events, 1 pen-downs (0 never pressing), 1 strokes \
+                 ended while pressing (1 ends)"
+            ),
             "{text}"
         );
         assert!(
@@ -510,6 +527,20 @@ mod tests {
         assert_eq!(told_apart(found(4, 2, 0), found(4, 2, 0)), Verdict::Fail);
         assert_eq!(told_apart(found(4, 0, 0), found(4, 2, 1)), Verdict::Fail);
         assert_eq!(told_apart(found(0, 0, 0), found(0, 2, 0)), Verdict::Unknown);
+    }
+
+    #[test]
+    fn a_tip_touch_during_a_hover_step_is_no_false_down() {
+        let touched = StepFindings {
+            downs_without_force: 0,
+            ..found(2, 1, 0)
+        };
+        assert_eq!(told_apart(touched, found(4, 2, 0)), Verdict::Pass);
+        let clicked = StepFindings {
+            downs_without_force: 1,
+            ..found(2, 2, 0)
+        };
+        assert_eq!(told_apart(clicked, found(4, 2, 0)), Verdict::Fail);
     }
 
     #[test]
