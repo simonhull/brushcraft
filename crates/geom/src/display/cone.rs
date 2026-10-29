@@ -81,15 +81,20 @@ const SLACK: f64 = 1e-9;
 /// How far over the least cosine a normal's cosine to the axis may lie and still be measured
 /// exactly by [`FinestNormalCone::covering`]: every other normal is narrower.
 ///
-/// A cosine `(a · n) / (|a| |n|)` of `f32` vectors computed in `f64` is off by at most a few
-/// `f64` rounding steps, under 10⁻¹⁵ (the products are exact; two sums, two roots, a product and
-/// a quotient each round by at most 2⁻⁵³ relative). A normal whose computed cosine lies more than
-/// 10⁻¹² over the least is therefore truly narrower than the least-cosine normal, and its `atan2`
-/// measure (off by about 10⁻¹⁵ rad) is under that normal's plus [`SLACK`], which is what the
-/// half-angle is built from. The tolerance is a thousand times the error, and small enough that
-/// only a handful of normals beside the widest are measured. (Were the widest measured at exactly
-/// 0, every cosine would be within rounding of 1, so none lies past the tolerance.)
-const COSINE_TOLERANCE: f64 = 1e-12;
+/// The cosines are computed in `f32`, as `(a · n) / √(n · n)` with `a` the decoded axis (unit to
+/// within 2⁻²³). Each of the dot products' three products and two sums rounds by at most 2⁻²⁴
+/// of terms no larger than `|n|`, the root and the quotient by 2⁻²⁴ relative each, and `|a|`
+/// scales every cosine alike by at most 2⁻²³: under 10⁻⁶ in all for a normal of any length. A
+/// normal whose computed cosine lies more than 10⁻⁵ over the least is therefore truly narrower
+/// than the least-cosine normal (by over 8·10⁻⁶ in cosine), and its exact `atan2` measure (off
+/// by about 10⁻¹⁵ rad) is under that normal's plus [`SLACK`], which is what the half-angle is
+/// built from. The band is ten times the error, and narrow enough that only the normals beside
+/// the widest are measured exactly. (Were the widest measured at exactly 0, every cosine would
+/// be within rounding of 1, so none lies past the band.)
+const COSINE_TOLERANCE: f32 = 1e-5;
+
+/// The independent accumulators [`lane_sum`] sums normals in.
+const LANES: usize = 8;
 
 /// A cone of directions: an axis and a half-angle, as a display tile stores the cone holding
 /// every finest normal under it (see the module notes).
@@ -191,69 +196,75 @@ impl FinestNormalCone {
                 <= f64::from(self.half_angle())
     }
 
-    /// The cone holding every one of `normals`, as stored: around their sum (summed in order,
-    /// so the same normals give the same bits), its half-angle the largest angle from the
-    /// decoded axis to any of them, rounded up (see the module notes).
+    /// The cone holding every one of `normals`, as stored: around their sum, its half-angle the
+    /// largest angle from the decoded axis to any of them, rounded up (see the module notes).
     ///
     /// A zero normal has no direction, so it widens nothing. Normals that cancel out (a zero
     /// sum) get the axis `+z`; normals spread over more than a hemisphere around the axis may
     /// need the cone that covers everything.
     ///
-    /// The widest normal is found by its cosine to the decoded axis, and only those within
-    /// [`COSINE_TOLERANCE`] of the least are measured with the `atan2` that
-    /// [`FinestNormalCone::contains`] uses: the half-angle bounds every normal as that measures
-    /// it (see [`COSINE_TOLERANCE`]).
+    /// The sum is taken in `f32` in eight lanes, each normal's lane set by its place in order, so
+    /// the same normals give the same bits however they are cut into runs. It only picks the axis:
+    /// the half-angle is measured from the decoded axis, which is what makes the cone hold
+    /// them. The widest normal is found by its `f32` cosine to the decoded axis, and only those
+    /// within `COSINE_TOLERANCE` (10⁻⁵) of the least are measured with the `atan2` that
+    /// [`FinestNormalCone::contains`] uses, so the half-angle bounds every normal as that
+    /// measures it.
     ///
     /// # Errors
     ///
     /// [`DisplayError::Shape`] for no normals; [`DisplayError::NotFinite`] for a normal that
-    /// isn't finite.
+    /// isn't finite, or normals so large their sum is not.
     pub fn covering(normals: &[Vec3]) -> Result<Self, DisplayError> {
-        Self::covering_each(normals.iter().copied())
+        Self::covering_runs(&[normals])
     }
 
-    /// [`FinestNormalCone::covering`] of the normals `normals` gives, in order: the same bits
-    /// for the same normals, read in place (the rows of a block, without copying them out).
-    ///
-    /// The iterator is walked three times (the sum, the least cosine, the exact angles of the
-    /// widest), so it must clone cheaply.
+    /// [`FinestNormalCone::covering`] of the normals in `runs`, one run after another: the same
+    /// bits as the runs joined into one slice, read in place (the rows of a block, without
+    /// copying them out).
     ///
     /// # Errors
     ///
     /// As [`FinestNormalCone::covering`].
-    pub fn covering_each(
-        normals: impl IntoIterator<Item = Vec3, IntoIter: Clone>,
-    ) -> Result<Self, DisplayError> {
-        let normals = normals.into_iter();
-        let mut count = 0_usize;
-        let mut sum = [0.0; 3];
-        for n in normals.clone() {
-            if !n.is_finite() {
-                return Err(DisplayError::NotFinite);
-            }
-            let [nx, ny, nz] = wide(n);
-            sum = [sum[0] + nx, sum[1] + ny, sum[2] + nz];
-            count += 1;
-        }
-        if count == 0 {
+    pub fn covering_runs(runs: &[&[Vec3]]) -> Result<Self, DisplayError> {
+        if runs.iter().all(|run| run.is_empty()) {
             return Err(DisplayError::Shape);
         }
-        Ok(Self::around(sum, |axis| {
-            let axis_length = dot(axis, axis).sqrt();
-            // The cosine of each normal to the axis; a zero normal has none (and no angle).
+        // A normal that isn't finite makes the sum not finite: checked once, here.
+        let sum = lane_sum(runs);
+        if !sum.is_finite() {
+            return Err(DisplayError::NotFinite);
+        }
+        Ok(Self::around(wide(sum), |axis| {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the decoded axis, an f32 vector widened: narrowed back exactly"
+            )]
+            let a = Vec3::new(axis[0] as f32, axis[1] as f32, axis[2] as f32);
+            // The cosine of a normal to the axis, in `f32`; `None` for a zero normal, which has
+            // no direction (and no angle).
             let cosine = |n: Vec3| {
-                let n = wide(n);
-                let length = dot(n, n).sqrt() * axis_length;
-                (length > 0.0).then(|| dot(axis, n) / length)
+                let length = n.dot(n);
+                (length > 0.0).then(|| a.dot(n) / length.sqrt())
             };
-            let least = normals
-                .clone()
-                .filter_map(cosine)
-                .fold(f64::INFINITY, f64::min);
-            let widest = normals
-                .clone()
-                .filter(|&n| cosine(n).is_some_and(|c| c <= least + COSINE_TOLERANCE));
-            widest.map(|n| reach(axis, wide(n))).fold(0.0, f64::max)
+            let mut least = f32::INFINITY;
+            for run in runs {
+                for &n in *run {
+                    if let Some(c) = cosine(n) {
+                        least = least.min(c);
+                    }
+                }
+            }
+            let band = least + COSINE_TOLERANCE;
+            let mut need = 0.0_f64;
+            for run in runs {
+                for &n in *run {
+                    if cosine(n).is_some_and(|c| c <= band) {
+                        need = need.max(reach(axis, wide(n)));
+                    }
+                }
+            }
+            need
         }))
     }
 
@@ -343,6 +354,42 @@ impl fmt::Debug for FinestNormalCone {
             .field("half_degrees", &self.half_angle().to_degrees())
             .finish()
     }
+}
+
+/// The sum of the normals in `runs`, in `f32`: the normal at place `k` (counting through the
+/// runs in order) goes to lane `k mod LANES`, each lane adds in order, and the lanes are summed
+/// pairwise at the end.
+///
+/// The lanes are independent, so the additions run side by side, not as one chain; and each
+/// normal's lane depends on its place alone, not on how the normals are cut into runs, so a
+/// block read row by row and one read tile run by tile run give the same bits.
+fn lane_sum(runs: &[&[Vec3]]) -> Vec3 {
+    let mut lanes = [Vec3::ZERO; LANES];
+    // The lane of the next normal.
+    let mut next = 0;
+    for run in runs {
+        // The normals that bring the lanes round to the first, then whole rounds of them.
+        let head = ((LANES - next) % LANES).min(run.len());
+        let (first, rest) = run.split_at_checked(head).unwrap_or((run, &[]));
+        let heads = lanes.iter_mut().skip(next).zip(first);
+        for (lane, &n) in heads {
+            *lane = *lane + n;
+        }
+        let (rounds, tail) = rest.as_chunks::<LANES>();
+        for round in rounds {
+            let whole = lanes.iter_mut().zip(round);
+            for (lane, &n) in whole {
+                *lane = *lane + n;
+            }
+        }
+        let tails = lanes.iter_mut().zip(tail);
+        for (lane, &n) in tails {
+            *lane = *lane + n;
+        }
+        next = (next + run.len()) % LANES;
+    }
+    let [l0, l1, l2, l3, l4, l5, l6, l7] = lanes;
+    ((l0 + l1) + (l2 + l3)) + ((l4 + l5) + (l6 + l7))
 }
 
 /// The half-angle `steps` steps stand for, in radians, as decoded (an `f32` product, so it can

@@ -328,7 +328,7 @@ fn build_from_finest(
         fine_side,
     )
     .ok_or(DisplayError::Unavailable)?;
-    let cone = FinestNormalCone::covering_each(under.iter().flat_map(|run| run.iter().copied()))?;
+    let cone = FinestNormalCone::covering_runs(&under)?;
     let source = TileValues::new(Channel::DISPLACEMENT, &normals);
     let means = mip_normals_tile(mesh, &source, &key);
     if source.missed.get() {

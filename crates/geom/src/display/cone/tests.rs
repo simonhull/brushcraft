@@ -202,10 +202,8 @@ fn the_cosine_shortcut_gives_the_cone_every_angle_gives() {
         if case % 5 == 0 {
             normals.push(Vec3::ZERO);
         }
-        let sum = normals.iter().fold([0.0; 3], |[x, y, z], &normal| {
-            let [nx, ny, nz] = wide(normal);
-            [x + nx, y + ny, z + nz]
-        });
+        // Around the same axis, which the sum alone picks.
+        let sum = wide(lane_sum(&[&normals]));
         let every = FinestNormalCone::around(sum, |axis| {
             normals
                 .iter()
@@ -215,6 +213,36 @@ fn the_cosine_shortcut_gives_the_cone_every_angle_gives() {
         assert_eq!(
             FinestNormalCone::covering(&normals),
             Ok(every),
+            "case {case}"
+        );
+    }
+}
+
+/// Normals cut into runs anywhere give the cone they give as one slice, bit for bit: a block
+/// read row by row and one read tile run by tile run agree.
+#[test]
+fn runs_cut_anywhere_give_the_cone_of_one_slice() {
+    let mut rng = Rng::new(31);
+    for case in 0..256 {
+        let count = 1 + usize::try_from(rng.below(300)).unwrap();
+        let normals = around(&mut rng, Vec3::new(0.3, -0.2, 0.9), 0.4, count);
+        let whole = FinestNormalCone::covering(&normals).unwrap();
+        let mut runs: Vec<&[Vec3]> = Vec::new();
+        let mut rest = normals.as_slice();
+        while !rest.is_empty() {
+            let cut = usize::try_from(rng.below(20)).unwrap().min(rest.len());
+            let (run, after) = rest.split_at(cut);
+            runs.push(run);
+            rest = after;
+        }
+        assert_eq!(
+            lane_sum(&runs).to_bits(),
+            lane_sum(&[&normals]).to_bits(),
+            "case {case}: the sum"
+        );
+        assert_eq!(
+            FinestNormalCone::covering_runs(&runs),
+            Ok(whole),
             "case {case}"
         );
     }

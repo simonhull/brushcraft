@@ -1034,8 +1034,8 @@ pub fn build_cones(
                     2 * region.quads(),
                 )
                 .ok_or(DisplayError::Shape)?;
-                let rows = block_rows(finest_normals, fine)?;
-                FinestNormalCone::covering_each(rows.flat_map(|row| row.iter().copied()))
+                let rows: Vec<&[Vec3]> = block_rows(finest_normals, fine)?.collect();
+                FinestNormalCone::covering_runs(&rows)
             })
             .collect::<Result<Vec<_>, _>>()?;
         levels.push(cones);
