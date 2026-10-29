@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use geom::{Level, cube_sphere};
+use geom::{Level, MAX_LEVEL, cube_sphere};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 
 use super::*;
@@ -288,13 +288,13 @@ fn orbit_relaxation_passes_and_timings_at_the_benchmark_tree_shape() {
             top: level(8),
             label: "benchmark, display tiles (64,800 nodes)",
         },
-        // Deeper than the benchmark: 14 levels, so the relaxation's climb from the back faces
-        // is longest, against the cap of MAX_RELAX_PASSES.
+        // As deep as levels go: 13 levels, so the relaxation's climb from the back faces is
+        // longest, against the cap of MAX_RELAX_PASSES.
         Shape {
             splits: 1,
-            finest: level(13),
-            top: level(13),
-            label: "deep, cube_sphere(1) to level 13 (131,106 nodes)",
+            finest: level(MAX_LEVEL),
+            top: level(MAX_LEVEL),
+            label: "deep, cube_sphere(1) to level 12 (32,802 nodes)",
         },
     ];
     for shape in shapes {
