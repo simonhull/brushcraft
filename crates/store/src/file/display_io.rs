@@ -4,6 +4,7 @@
 use std::os::unix::fs::FileExt as _;
 
 use geom::TileKey;
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use super::base::BaseFile;
 use super::format::{tile_payload, tile_record};
@@ -39,6 +40,29 @@ pub(crate) fn frame_display(
     )?;
     let framed = frame(KIND_TILE, &payload).ok_or(FileError::TooLarge)?;
     Ok(FramedDisplay { key, framed })
+}
+
+/// Each of `tiles`' display records (`None`: unknown), framed as [`frame_display`] frames one,
+/// in order, compressed on `workers`.
+///
+/// Compressing is a few milliseconds a megabyte on one thread, so a flush or a save of hundreds
+/// of records isn't held to one core. Framing is deterministic, so the bytes are those the
+/// records framed one by one would be.
+///
+/// # Errors
+///
+/// As [`frame_display`]: if more than one record fails, which one's error is returned is
+/// unspecified, and none of them is framed.
+pub(crate) fn frame_display_on(
+    workers: &rayon::ThreadPool,
+    tiles: &[(TileKey, Option<&DisplayRecord>)],
+) -> Result<Vec<FramedDisplay>, FileError> {
+    workers.install(|| {
+        tiles
+            .par_iter()
+            .map(|&(key, record)| frame_display(key, record))
+            .collect()
+    })
 }
 
 /// A display record framed by [`frame_display`], waiting to be appended.
@@ -132,6 +156,10 @@ impl ProjectFile {
     ///
     /// If the write fails, none of them is recorded (the bytes written past the end, if any, are
     /// overwritten by the next append).
+    ///
+    /// The records are compressed here, on the calling thread, which suits a few. Many go
+    /// through [`frame_display_on`], compressed on the store's workers, then
+    /// [`ProjectFile::append_display_framed`], which writes the same bytes.
     ///
     /// # Errors
     ///

@@ -4,9 +4,11 @@
 use geom::DisplayTile;
 
 use super::*;
+use crate::bounds::Kept;
 use crate::deps::DepGraph;
 use crate::display::readers;
 use crate::stamp::Stamp;
+use crate::tiles::display::write_kept;
 
 /// Every display tile key of the tests' mesh, in key order.
 fn display_keys(mesh: &BaseMesh) -> Vec<TileKey> {
@@ -572,4 +574,86 @@ fn nothing_is_written_through_while_a_cut_is_open() {
         "the save point written, every record goes through"
     );
     assert_eq!(store.display_waiting().0, 0, "none waits");
+}
+
+/// The display records a flush or a save writes, compressed on the workers, are the bytes
+/// written one by one.
+///
+/// Those of [`write_kept`] land in the file as the same bytes, in the same places, as records
+/// compressed one by one on the calling thread ([`ProjectFile::write_display_many`]): who
+/// compresses changes nothing written.
+#[test]
+fn records_compressed_on_the_workers_are_the_bytes_written_one_by_one() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy().with_display(level(TOP)));
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 67),
+    );
+    let layer = display_layer(&mut store);
+    store.record_display(&layer).unwrap();
+    // An unknown one among them, framed as unknown on both paths.
+    let unknown = *layer[layer.len() / 2].key();
+    store.display.set(unknown, None);
+    let keys: Vec<TileKey> = store
+        .display
+        .unflushed_kept()
+        .map(|(key, _)| *key)
+        .collect();
+    assert_eq!(keys.len(), layer.len(), "every record waits for a flush");
+    let held: Vec<(TileKey, Option<&crate::display::DisplayRecord>)> = keys
+        .iter()
+        .map(|key| match store.display.kept(key) {
+            Some(Kept::Known(record)) => (*key, Some(record)),
+            _ => (*key, None),
+        })
+        .collect();
+    assert_eq!(
+        held.iter().filter(|(_, record)| record.is_none()).count(),
+        1,
+        "one is unknown"
+    );
+    let stamp = Stamp::ZERO.next();
+    let mut serial =
+        ProjectFile::create(&dir.path("serial.bcp"), meta_for(&mesh), Arc::clone(&mesh)).unwrap();
+    let mut parallel = ProjectFile::create(
+        &dir.path("parallel.bcp"),
+        meta_for(&mesh),
+        Arc::clone(&mesh),
+    )
+    .unwrap();
+    let start = std::fs::metadata(dir.path("serial.bcp")).unwrap().len();
+    assert_eq!(
+        std::fs::metadata(dir.path("parallel.bcp")).unwrap().len(),
+        start,
+        "the files start alike"
+    );
+    serial
+        .write_display_many(held.iter().copied(), stamp)
+        .unwrap();
+    let workers = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    write_kept(&mut parallel, None, &workers, &store.display, &keys, stamp).unwrap();
+    for key in &keys {
+        assert_eq!(serial.locate(key), parallel.locate(key), "{key:?} in place");
+        assert_eq!(
+            serial.read_tile_record(key).unwrap(),
+            parallel.read_tile_record(key).unwrap(),
+            "{key:?} the same record"
+        );
+    }
+    drop((serial, parallel));
+    let serial_bytes = std::fs::read(dir.path("serial.bcp")).unwrap();
+    let parallel_bytes = std::fs::read(dir.path("parallel.bcp")).unwrap();
+    let at = usize::try_from(start).unwrap();
+    assert!(serial_bytes.len() > at, "the records were written");
+    assert_eq!(
+        serial_bytes.get(at..),
+        parallel_bytes.get(at..),
+        "the same bytes"
+    );
 }

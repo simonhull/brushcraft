@@ -99,7 +99,8 @@ impl TileStore {
     /// bounds the lost tiles' edits could have changed, and
     /// appends, with one write, every bound edits changed that the working file lacks, placed at
     /// the cut. Derived bounds stay out (see [`crate::bounds`]), so the cost grows with the edits
-    /// since the last flush.
+    /// since the last flush. Then the display part ([`TileStore::flush_display`]), whose records
+    /// are compressed on the store's workers and appended here.
     ///
     /// Called right after the flush's snapshot, on the owner thread, before any later write:
     /// the bounds appended are those of the state the snapshot copies, so the flush's save point

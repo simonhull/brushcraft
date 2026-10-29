@@ -38,7 +38,7 @@ use super::read_ahead::Held;
 use crate::bounds::{Book, Derived as _, Kept};
 use crate::display::{Display, DisplayRecord, StoredDisplay};
 use crate::file::{
-    BaseFile, FileError, FramedDisplay, ProjectFile, display_record, frame_display,
+    BaseFile, FileError, FramedDisplay, ProjectFile, display_record, frame_display_on,
     unknown_display_len,
 };
 use crate::meta::Role;
@@ -458,7 +458,9 @@ impl TileStore {
 
     /// The display part of a recovery flush, at its cut (see [`TileStore::flush_bounds`]): makes
     /// unknown the display tiles the `lost` tiles' edits could have changed, then appends every
-    /// display tile the working file lacks, placed at the store's latest write.
+    /// display tile the working file lacks, placed at the store's latest write. The records are
+    /// compressed on the workers, the costly part (a few milliseconds a megabyte on one thread),
+    /// and appended by the owner with one write ([`write_kept`]).
     ///
     /// # Errors
     ///
@@ -472,6 +474,7 @@ impl TileStore {
         write_kept(
             &mut self.file,
             None,
+            &self.workers,
             &self.display,
             &unflushed,
             self.last_write,
@@ -514,21 +517,16 @@ impl TileStore {
         }
         self.settle_display()?;
         let mut over = self.display.waiting_bytes().saturating_sub(share / 2);
-        let mut records: Vec<(TileKey, &DisplayRecord)> = Vec::new();
+        let mut records: Vec<(TileKey, Option<&DisplayRecord>)> = Vec::new();
         for (key, record) in self.display.waiting() {
             if over == 0 {
                 break;
             }
             over = over.saturating_sub(Display::bytes(record));
-            records.push((*key, record));
+            records.push((*key, Some(record)));
         }
-        // Compressing them is the costly part: a few milliseconds a megabyte on one thread.
-        let framed: Result<Vec<FramedDisplay>, FileError> = self.workers.install(|| {
-            records
-                .par_iter()
-                .map(|&(key, record)| frame_display(key, Some(record)))
-                .collect()
-        });
+        let framed: Result<Vec<FramedDisplay>, FileError> =
+            frame_display_on(&self.workers, &records);
         let keys: Vec<TileKey> = records.iter().map(|&(key, _)| key).collect();
         let appended =
             framed.and_then(|framed| self.file.append_display_framed(&framed, self.last_write));
@@ -568,6 +566,7 @@ impl TileStore {
         write_kept(
             &mut self.file,
             None,
+            &self.workers,
             &self.display,
             &unsaved,
             self.last_write,
@@ -616,8 +615,15 @@ impl TileStore {
         self.display
             .forget(&self.mesh, &self.deps, lost.iter().copied())?;
         let all: Vec<TileKey> = self.display.all_kept().map(|(key, _)| *key).collect();
-        write_kept(project, Some(&self.file), &self.display, &all, Stamp::ZERO)
-            .map_err(CacheError::Save)
+        write_kept(
+            project,
+            Some(&self.file),
+            &self.workers,
+            &self.display,
+            &all,
+            Stamp::ZERO,
+        )
+        .map_err(CacheError::Save)
     }
 
     /// Carries the display layer into `fresh`, a new working file (a roll-over): every record
@@ -651,6 +657,7 @@ impl TileStore {
         write_kept(
             fresh,
             Some(&self.file),
+            &self.workers,
             &self.display,
             &changed,
             Stamp::ZERO,
@@ -663,14 +670,18 @@ impl TileStore {
 ///
 /// A known one is written as it is, an unknown one as unknown, one the working file holds
 /// ([`Kept::Written`]) copied from `working` (as unknown if it doesn't read; with no `working`,
-/// `to` is the working file itself, which has it).
+/// `to` is the working file itself, which has it). The copies are appended first, in key order,
+/// then the known and unknown ones, compressed on `workers` ([`frame_display_on`]) and appended
+/// in key order with one write: the bytes [`ProjectFile::write_display_many`] would write.
 ///
 /// # Errors
 ///
-/// The [`FileError`] of a failed write.
-fn write_kept(
+/// The [`FileError`] of a failed write, or of a failed compression: then none of the known and
+/// unknown ones is recorded.
+pub(super) fn write_kept(
     to: &mut ProjectFile,
     working: Option<&ProjectFile>,
+    workers: &rayon::ThreadPool,
     book: &Book<Display>,
     keys: &[TileKey],
     stamp: Stamp,
@@ -688,7 +699,11 @@ fn write_kept(
             None => {}
         }
     }
-    to.write_display_many(held, stamp)
+    if !to.is_writable() {
+        return Err(FileError::ReadOnly);
+    }
+    let framed = frame_display_on(workers, &held)?;
+    to.append_display_framed(&framed, stamp)
 }
 
 /// Copies `key`'s display record from `from` into `to`, as unknown if it doesn't read.
