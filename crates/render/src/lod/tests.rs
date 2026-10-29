@@ -5,6 +5,7 @@
 //! those of the sphere under them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::f64::consts::FRAC_PI_2;
 
 use geom::{BaseMesh, FinestNormalCone, Level, cube_sphere};
 use wgpu::{
@@ -14,7 +15,8 @@ use wgpu::{
 use super::*;
 use crate::camera::{Vec3, View};
 use crate::cull::reference::{
-    CpuPyramid, backfacing, bounds_of, depth_texture, in_frustum, occluded, projected,
+    CpuPyramid, backfacing, bounds_of, cone_cos_sin, depth_texture, finest_facing_away, in_frustum,
+    occluded, projected,
 };
 use crate::cull::tests::Rng;
 use crate::cull::{GpuBounds, PyramidPass};
@@ -188,6 +190,27 @@ impl Scene {
             tree,
             bounds,
             details,
+        }
+    }
+
+    /// Gives the resident tile at `place` a new `e` and cone, as an epoch switching it does.
+    fn set_detail(&mut self, place: Place, detail: TileDetail) {
+        let slot = Slot::for_tests(SizeClass::of(place.level()), 0);
+        assert!(
+            self.tree.move_to(place, slot, detail).is_some(),
+            "{place:?} is resident"
+        );
+        self.details.insert(place, detail);
+    }
+
+    /// `lod.wgsl`'s `refine_facing_away` for the tile at `place`, the sphere grown by
+    /// `margin`: a finest tile by its drawn cone, any other by its finest normals' cone.
+    fn refine_facing_away(&self, place: Place, eye: [f32; 3], margin: f32) -> bool {
+        let b = &self.bounds[&place];
+        if place.level() == self.finest {
+            backfacing(b, eye, margin)
+        } else {
+            finest_facing_away(b, self.details[&place].cone, eye, margin)
         }
     }
 
@@ -451,9 +474,9 @@ fn cpu_error(scene: &Scene, view: &View, place: Place) -> Option<f32> {
         let b = scene.bounds[&p];
         let e = scene.details[&p].error;
         let wide = in_frustum(&gpu, b.center, (b.radius + e) * 1.001)
-            && !backfacing(&b, eye, e * 1.001 + b.radius * 0.001);
+            && !scene.refine_facing_away(p, eye, e * 1.001 + b.radius * 0.001);
         let narrow = in_frustum(&gpu, b.center, (b.radius + e) * 0.999)
-            && !backfacing(&b, eye, e * 0.999 - b.radius * 0.001);
+            && !scene.refine_facing_away(p, eye, e * 0.999 - b.radius * 0.001);
         if wide != narrow {
             return None;
         }
@@ -1000,4 +1023,330 @@ fn culling_agrees_with_the_cpu_reference_in_both_phases() {
             "culled {culled}, hidden {hidden}"
         );
     });
+}
+
+/// `v` in `f32`, as the GPU holds it.
+fn narrow(v: Vec3) -> geom::Vec3 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "directions go to the cone builder as f32"
+    )]
+    let narrowed = geom::Vec3::new(v.x as f32, v.y as f32, v.z as f32);
+    narrowed
+}
+
+/// `v` as bounds hold it.
+fn narrow_array(v: Vec3) -> [f32; 3] {
+    let n = narrow(v);
+    [n.x, n.y, n.z]
+}
+
+/// `p` as a camera vector.
+fn wide(p: [f32; 3]) -> Vec3 {
+    Vec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))
+}
+
+/// A unit vector perpendicular to the unit vector `axis`.
+fn perpendicular(axis: Vec3) -> Vec3 {
+    let helper = if axis.x.abs() < 0.9 {
+        Vec3::new(1.0, 0.0, 0.0)
+    } else {
+        Vec3::new(0.0, 1.0, 0.0)
+    };
+    axis.cross(helper).normalized().expect("not parallel")
+}
+
+/// A finest-normal cone around `axis`, holding the directions `half_degrees` from it.
+///
+/// Built by [`FinestNormalCone::covering`] from the axis and four directions on that circle, so
+/// its stored half-angle is that or a little more (the axis's quantization, a step's rounding).
+fn cone_around(axis: Vec3, half_degrees: f64) -> FinestNormalCone {
+    let axis = axis.normalized().expect("a direction");
+    let u = perpendicular(axis);
+    let w = axis.cross(u);
+    let (sin, cos) = half_degrees.to_radians().sin_cos();
+    let rim = [u, w, -u, -w].map(|side| axis * cos + side * sin);
+    let directions = std::iter::once(axis).chain(rim).map(narrow);
+    let normals: Vec<geom::Vec3> = directions.collect();
+    FinestNormalCone::covering(&normals).expect("finite normals")
+}
+
+/// A one-split cube sphere's level-0 and level-1 tiles, `e` 0.3 of their quad edge: a level-0
+/// tile has its one child resident, so it is refined exactly when the level choice wants it.
+fn two_levels(gpu: &Gpu) -> Scene {
+    let mesh = cube_sphere(1).expect("a mesh");
+    Scene::new(gpu, mesh, level(8), |p| p.level().get() <= 1, |_| 0.3)
+}
+
+/// The level-0 tile of face 0.
+fn lone_root() -> Place {
+    Place::of(&TileKey::display(geom::FaceId::new(0), level(0), 0, 0).expect("a key"))
+}
+
+/// Whether one frame's level choice from `eye`, looking at `place`'s centre, refines `place`.
+///
+/// `place` is a level-0 tile; the level choice is a fresh one, so no earlier frame's choice
+/// holds it. A refined tile's child is in the cut in its stead.
+fn refined_from(gpu: &Gpu, scene: &mut Scene, place: Place, eye: Vec3) -> bool {
+    let center = wide(scene.bounds[&place].center);
+    let view = look(eye, center);
+    let mut lod =
+        Lod::new(gpu, scene.tree.capacity(), LodConfig::default()).expect("the level choice");
+    let requests = request_buffer(gpu, 1024);
+    let output = run(gpu, &mut lod, scene, &requests, &view, None, None);
+    let cut = places(&output);
+    let refined = !cut.contains(&place);
+    let child = place.children()[0].expect("a child");
+    assert_eq!(cut.contains(&child), refined, "the child stands in for it");
+    refined
+}
+
+/// The lone root's eye three units out along its centre's direction, its `e`, and `away`: the
+/// direction from the eye towards the tile, along which a normal faces away.
+fn lone_view(scene: &Scene, place: Place) -> (Vec3, f32, Vec3) {
+    let center = wide(scene.bounds[&place].center);
+    let out = center.normalized().expect("off the origin");
+    (center + out * 3.0, scene.details[&place].error, -out)
+}
+
+/// [`lone_view`], with the lone root's own triangles made to face away (its drawn cone 8°
+/// around `away`): the drawn cone alone would never refine it.
+fn facing_away_drawn(scene: &mut Scene, place: Place) -> (Vec3, f32, Vec3) {
+    let (eye, e, away) = lone_view(scene, place);
+    let drawn = GpuBounds {
+        axis: narrow_array(away),
+        cone_cos: 0.99,
+        ..scene.bounds[&place]
+    };
+    scene.bounds.insert(place, drawn);
+    assert!(
+        backfacing(&drawn, narrow_array(eye), e),
+        "its own triangles face away, the sphere grown by e"
+    );
+    (eye, e, away)
+}
+
+#[test]
+fn a_silhouette_tile_whose_finest_detail_faces_the_camera_is_refined_though_it_faces_away() {
+    GpuTest::run(|gpu| {
+        let mut scene = two_levels(gpu);
+        let place = lone_root();
+        let (eye, e, away) = facing_away_drawn(&mut scene, place);
+        let b = scene.bounds[&place];
+        let e3 = narrow_array(eye);
+        // The finest detail turns past the silhouette: a cone 60° off `away` and 35° wide holds
+        // directions 95° from it, which face the eye.
+        let (sin, cos) = 60_f64.to_radians().sin_cos();
+        let tilted = away * cos + perpendicular(away) * sin;
+        let past = cone_around(tilted, 35.0);
+        assert!(
+            !finest_facing_away(&b, past, e3, e),
+            "the CPU reference: some finest normal faces the eye"
+        );
+        scene.set_detail(
+            place,
+            TileDetail {
+                error: e,
+                cone: past,
+            },
+        );
+        assert!(
+            refined_from(gpu, &mut scene, place, eye),
+            "refined by the finest normals' cone"
+        );
+        // Refined by its own triangles' cone instead (8° around `away`), it would not be.
+        let drawn = cone_around(away, 8.2);
+        assert!(finest_facing_away(&b, drawn, e3, e), "the CPU reference");
+        scene.set_detail(
+            place,
+            TileDetail {
+                error: e,
+                cone: drawn,
+            },
+        );
+        assert!(
+            !refined_from(gpu, &mut scene, place, eye),
+            "the drawn cone alone leaves it coarse"
+        );
+    });
+}
+
+#[test]
+fn a_tile_whose_finest_normals_all_face_away_too_is_not_refined() {
+    GpuTest::run(|gpu| {
+        let mut scene = two_levels(gpu);
+        let place = lone_root();
+        let (eye, e, away) = facing_away_drawn(&mut scene, place);
+        let b = scene.bounds[&place];
+        // Finest normals 35° around `away`: every one faces away from every point of the grown
+        // sphere.
+        let all_away = cone_around(away, 35.0);
+        assert!(
+            finest_facing_away(&b, all_away, narrow_array(eye), e),
+            "the CPU reference: every finest normal faces away"
+        );
+        scene.set_detail(
+            place,
+            TileDetail {
+                error: e,
+                cone: all_away,
+            },
+        );
+        assert!(
+            !refined_from(gpu, &mut scene, place, eye),
+            "nothing under it can show, so it isn't refined"
+        );
+    });
+}
+
+#[test]
+fn a_tile_whose_finest_cone_covers_everything_is_refined_whenever_its_error_asks() {
+    GpuTest::run(|gpu| {
+        let mut scene = two_levels(gpu);
+        let place = lone_root();
+        let (front, e, away) = lone_view(&scene, place);
+        let b = scene.bounds[&place];
+        let center = wide(b.center);
+        // In front, behind (its own triangles and the sphere's normals under it facing away)
+        // and beside it.
+        let behind = center + away * 3.0;
+        let eyes = [front, behind, center + perpendicular(away) * 3.0];
+        let sphere = scene.details[&place];
+        let unknown = TileDetail {
+            error: e,
+            cone: FinestNormalCone::EVERYTHING,
+        };
+        for eye in eyes {
+            let view = look(eye, center).gpu();
+            assert!(
+                projected(&view, &b, e, e) > 2.0 * Thresholds::SPEC.refine_error,
+                "its error asks for refining from {eye:?}"
+            );
+            scene.set_detail(place, unknown);
+            assert!(
+                refined_from(gpu, &mut scene, place, eye),
+                "refined from {eye:?}"
+            );
+        }
+        // The control: from behind, the sphere's own cone faces away and leaves it coarse.
+        let from_behind = narrow_array(behind);
+        assert!(
+            backfacing(&b, from_behind, e) && finest_facing_away(&b, sphere.cone, from_behind, e),
+            "the CPU reference: from behind, both cones face away"
+        );
+        scene.set_detail(place, sphere);
+        assert!(
+            !refined_from(gpu, &mut scene, place, behind),
+            "the sphere's cone, from behind"
+        );
+    });
+}
+
+/// A random finest-normal cone: any axis, 0° to 100° wide, or one in ten covering everything.
+fn random_cone(rng: &mut Rng) -> FinestNormalCone {
+    if rng.below(10) == 0 {
+        return FinestNormalCone::EVERYTHING;
+    }
+    let axis = Vec3::new(
+        f64::from(rng.range(-1.0, 1.0)),
+        f64::from(rng.range(-1.0, 1.0)),
+        f64::from(rng.range(-1.0, 1.0)),
+    );
+    let axis = axis.normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+    cone_around(axis, f64::from(rng.range(0.0, 100.0)))
+}
+
+#[test]
+fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
+    GpuTest::run(|gpu| {
+        // 2,400 level-0 tiles, each with its one child resident: a root is refined exactly when
+        // the level choice wants it, which with its error well over the threshold is when it is
+        // in view and its finest normals' cone doesn't face away.
+        let mesh = cube_sphere(20).expect("a mesh");
+        let mut scene = Scene::new(gpu, mesh, level(9), |p| p.level().get() <= 1, |_| 0.3);
+        let roots: Vec<Place> = scene
+            .bounds
+            .keys()
+            .copied()
+            .filter(|p| p.level().get() == 0)
+            .collect();
+        let mut rng = Rng(41);
+        let (mut decisive, mut refined, mut away, mut past_drawn) = (0, 0, 0, 0);
+        for round in 0..6 {
+            for &place in &roots {
+                scene.bounds.insert(place, random_bounds(&mut rng));
+                let detail = TileDetail {
+                    error: rng.range(0.02, 0.3),
+                    cone: random_cone(&mut rng),
+                };
+                scene.set_detail(place, detail);
+            }
+            let eye = Vec3::new(
+                f64::from(rng.range(-1.0, 1.0)),
+                f64::from(rng.range(-1.0, 1.0)),
+                5.0,
+            );
+            let view = look(eye, Vec3::default());
+            let gview = view.gpu();
+            let e3 = [gview.eye[0], gview.eye[1], gview.eye[2]];
+            let mut lod = Lod::new(gpu, scene.tree.capacity(), LodConfig::default())
+                .expect("the level choice");
+            let requests = request_buffer(gpu, 1 << 14);
+            let output = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
+            let cut = places(&output);
+            for &place in &roots {
+                let b = scene.bounds[&place];
+                let TileDetail { error: e, cone } = scene.details[&place];
+                if projected(&gview, &b, e, e) < 1.5 * Thresholds::SPEC.refine_error {
+                    continue;
+                }
+                // Decisive only if the answer holds with the sphere a little larger and smaller.
+                let slack = 1e-3 * (b.radius + e) + 1e-3;
+                let wants = |grow: f32| {
+                    in_frustum(&gview, b.center, (b.radius + e) * (1.0 + grow))
+                        && !finest_facing_away(&b, cone, e3, e + grow.signum() * slack)
+                };
+                let (wide, narrow) = (wants(1e-3), wants(-1e-3));
+                if wide != narrow {
+                    continue;
+                }
+                decisive += 1;
+                refined += u32::from(wide);
+                away += u32::from(!wide && in_frustum(&gview, b.center, b.radius + e));
+                past_drawn += u32::from(wide && backfacing(&b, e3, e));
+                assert_eq!(
+                    !cut.contains(&place),
+                    wide,
+                    "round {round}: {place:?} {b:?} {cone:?} e {e}"
+                );
+            }
+        }
+        // The test means something: many decided, refined and left coarse by the cone, and
+        // some refined although their own triangles face away.
+        assert!(decisive > 5_000, "decisive {decisive}");
+        assert!(
+            refined > 1_000 && away > 500 && past_drawn > 50,
+            "refined {refined}, facing away {away}, refined past the drawn cone {past_drawn}"
+        );
+    });
+}
+
+#[test]
+fn the_cone_test_s_cosine_and_sine_are_within_a_millionth_up_to_a_quarter_turn() {
+    let steps = 100_000_u32;
+    let angles = (0..=steps).map(|k| f64::from(k) / f64::from(steps) * FRAC_PI_2);
+    let errors = angles.map(|x| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the shader's input is an f32"
+        )]
+        let narrowed = x as f32;
+        let exact = f64::from(narrowed);
+        let (c, s) = cone_cos_sin(narrowed);
+        (f64::from(c) - exact.cos())
+            .abs()
+            .max((f64::from(s) - exact.sin()).abs())
+    });
+    let worst = errors.fold(0.0, f64::max);
+    assert!(worst < 1e-6, "worst {worst:e}");
 }

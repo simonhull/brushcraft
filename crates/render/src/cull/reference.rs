@@ -1,9 +1,10 @@
 //! CPU twins of the culling passes, for the tests.
 //!
 //! The same arithmetic as `cull.wgsl`, `bounds.wgsl`, `pyramid.wgsl` and the level choice's
-//! occlusion test, in `f32`, plus helpers that put a synthetic depth image on the GPU and read
-//! a pyramid back.
+//! occlusion and finest-normal cone tests, in `f32`, plus helpers that put a synthetic depth
+//! image on the GPU and read a pyramid back.
 
+use geom::FinestNormalCone;
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, CompareFunction, DepthStencilState,
     Extent3d, FragmentState, MultisampleState, Origin3d, PipelineCompilationOptions,
@@ -212,6 +213,67 @@ pub(crate) fn backfacing(bounds: &GpuBounds, eye: [f32; 3], margin: f32) -> bool
     let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
     let sin_a = (1.0 - bounds.cone_cos * bounds.cone_cos).max(0.0).sqrt();
     cos_t * bounds.cone_cos - sin_t * sin_a > r / d
+}
+
+/// `lod.wgsl`'s `cone_cos_sin`: the cosine and sine of `x` in `[0, π/2]` by their Taylor
+/// series, in `f32` products and sums.
+pub(crate) fn cone_cos_sin(x: f32) -> (f32, f32) {
+    let t = x * x;
+    let c = 1.0
+        + t * (-1.0 / 2.0
+            + t * (1.0 / 24.0
+                + t * (-1.0 / 720.0
+                    + t * (1.0 / 40_320.0
+                        + t * (-1.0 / 3_628_800.0 + t * (1.0 / 479_001_600.0))))));
+    let s = x
+        * (1.0
+            + t * (-1.0 / 6.0
+                + t * (1.0 / 120.0
+                    + t * (-1.0 / 5040.0
+                        + t * (1.0 / 362_880.0
+                            + t * (-1.0 / 39_916_800.0 + t * (1.0 / (479_001_600.0 * 13.0))))))));
+    (c, s)
+}
+
+/// `lod.wgsl`'s `finest_facing_away`, in the same `f32` arithmetic.
+///
+/// Whether every normal in `cone`, widened by one step, faces away from `eye` at every point of
+/// `bounds`' sphere grown by `margin`, with the shader's slack on its rounding. The axis is
+/// [`FinestNormalCone::axis`], which the shader's decode mirrors.
+///
+/// # Panics
+///
+/// Never: a step count is 12 bits, so one more fits a `u16`.
+pub(crate) fn finest_facing_away(
+    bounds: &GpuBounds,
+    cone: FinestNormalCone,
+    eye: [f32; 3],
+    margin: f32,
+) -> bool {
+    /// `lod.wgsl`'s `CONE_STEP`.
+    const STEP: f32 = core::f32::consts::PI / 4095.0;
+    /// `lod.wgsl`'s `CONE_SLACK`.
+    const SLACK: f32 = 1e-5;
+    if cone.covers_everything() || bounds.radius < 0.0 {
+        return false;
+    }
+    let steps = u16::try_from((cone.to_bits() >> 20) + 1).expect("a 12-bit count");
+    let half = f32::from(steps) * STEP;
+    if half >= core::f32::consts::FRAC_PI_2 {
+        return false;
+    }
+    let offset = sub(bounds.center, eye);
+    let d = dot(offset, offset).sqrt();
+    let radius = bounds.radius + margin;
+    if d <= radius {
+        return false;
+    }
+    let decoded = cone.axis();
+    let axis = [decoded.x, decoded.y, decoded.z];
+    let across = cross(offset, axis);
+    let (cos_a, sin_a) = cone_cos_sin(half);
+    let q = dot(offset, axis) * cos_a - dot(across, across).sqrt() * sin_a;
+    q > radius + SLACK * d
 }
 
 /// `cull.wgsl`'s `projected`.

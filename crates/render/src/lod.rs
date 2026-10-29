@@ -13,8 +13,12 @@
 //!   floored at the near plane, which bounds the projection's stretch in any direction and anywhere
 //!   in the image (off the axis it is up to `(d / z)²` more than `l · f / d`), so the error is
 //!   never underestimated (checked against measured segments, `cull/tests/truth.rs`). A tile out of
-//!   view (frustum, or the normal cone facing away, both with the sphere grown by `e`) isn't
-//!   refined.
+//!   view (frustum, or facing away, both with the sphere grown by `e`) isn't refined. A display
+//!   tile faces away when the cone of the finest normals under it does
+//!   ([`crate::tree::GpuNode::finest_cone`], spec "Normal cone"), not its own triangles: a coarse
+//!   tile at a silhouette can face away while finer detail under it faces the camera. A finest
+//!   tile, which has nothing to refine into, is tested by its own triangles' cone. Drawing culls
+//!   every tile by its own triangles either way.
 //! - **Completeness.** A tile is refined only when all its children are resident, so the cut covers
 //!   every face exactly once; tiles under a missing one are unreachable and ignored. The pinned
 //!   floor means level 0 is always there.

@@ -433,11 +433,112 @@ fn begin(@builtin(local_invocation_index) t: u32) {
     frame.reserved = 0u;
 }
 
-// Whether a tile of bounds `b` and bound `e` faces wholly away for refining: its drawn cone,
-// the sphere grown by e. The one place a per-node refine cone (the finest normals' cone the
-// display records are to store) replaces the drawn cone when it arrives.
-fn refine_facing_away(b: TileBounds, e: f32) -> bool {
-    return backfacing(b, view.eye.xyz, e);
+// One step of a finest-normal cone's half-angle (geom::FinestNormalCone): pi / 4095, as the
+// CPU computes it in f32.
+const CONE_STEP: f32 = 3.1415927 / 4095.0;
+// A cone's half-angle step count that means it covers everything.
+const CONE_EVERYTHING: u32 = 4095u;
+// pi / 2, rounded up in f32: a cone this wide or wider never faces away.
+const CONE_QUARTER_TURN: f32 = 1.5707964;
+// What finest_facing_away's dot(n, p - eye) bound must clear beyond the sphere's radius, as a
+// fraction of the distance to the sphere: the f32 arithmetic's error, under 6e-6 of it (see
+// there), with room to spare.
+const CONE_SLACK: f32 = 1e-5;
+
+// The octahedral fold's sign: 1 for zero and up, -1 below (as geom's, unlike sign(), which
+// gives 0 for 0).
+fn fold_sign(v: f32) -> f32 {
+    return select(-1.0, 1.0, v >= 0.0);
+}
+
+// The axis of the finest-normal cone `bits` (TileNode.finest_cone), decoded as
+// geom::FinestNormalCone::axis decodes it: two signed 10-bit fractions of 511 (across in bits
+// 0..10, up in 10..20, sign-extended), unfolded from the octahedron, normalized.
+fn cone_axis(bits: u32) -> vec3<f32> {
+    let across = clamp(f32(bitcast<i32>(bits << 22u) >> 22u) / 511.0, -1.0, 1.0);
+    let up = clamp(f32(bitcast<i32>(bits << 12u) >> 22u) / 511.0, -1.0, 1.0);
+    let height = 1.0 - abs(across) - abs(up);
+    var xy = vec2<f32>(across, up);
+    if height < 0.0 {
+        xy = vec2<f32>((1.0 - abs(up)) * fold_sign(across), (1.0 - abs(across)) * fold_sign(up));
+    }
+    // |x| + |y| + |height| is 1 either way, so the vector is never zero.
+    return normalize(vec3<f32>(xy, height));
+}
+
+// The cosine and sine of `x` in [0, pi / 2], by their Taylor series to x^12 and x^13 in plain
+// products and sums. WGSL rounds those correctly, but lets cos and sin be off by 2^-11 (which
+// near 0 is an angle of 0.03 rad); these are within 1e-6 of the true values (the series' tails
+// are under 7e-9, and the rounding of a few terms of magnitude at most about 1 adds the rest).
+fn cone_cos_sin(x: f32) -> vec2<f32> {
+    let t = x * x;
+    let c = 1.0 + t * (-1.0 / 2.0 + t * (1.0 / 24.0 + t * (-1.0 / 720.0 + t * (1.0 / 40320.0
+        + t * (-1.0 / 3628800.0 + t * (1.0 / 479001600.0))))));
+    let s = x * (1.0 + t * (-1.0 / 6.0 + t * (1.0 / 120.0 + t * (-1.0 / 5040.0
+        + t * (1.0 / 362880.0 + t * (-1.0 / 39916800.0 + t * (1.0 / 6227020800.0)))))));
+    return vec2<f32>(c, s);
+}
+
+// Whether every finest normal under a tile faces away from `eye`, at every point of its bounds'
+// sphere grown by `margin`: the finest surface lies within e of what the tile draws, so with
+// margin e none of it can face the eye, and refining the tile shows nothing. `cone` is the
+// tile's finest-normal cone (TileNode.finest_cone); one that covers everything never faces
+// away. Twin: cull::reference::finest_facing_away.
+//
+// backfacing's test, with the finest-normal cone for the drawn one: with v = center - eye at
+// distance d, θ the angle from the axis a to v and α' the half-angle, the least dot(n, p - eye)
+// over the cone and the sphere is d·cos(θ + α') - r, and
+// dot(v, a)·cos(α') - |v × a|·sin(α') = |a|·d·cos(θ + α') exactly. Taking θ's sine from the
+// cross product, not from its cosine, keeps it well conditioned near θ = 0, where
+// sqrt(1 - cos²) would turn an f32 cosine's rounding into an angle of 4e-4 rad or more.
+//
+// Why it is conservative in f32:
+// - The angle: every finest normal is within the stored half-angle α of the axis the CPU
+//   decodes (FinestNormalCone's guarantee, measured in f64). This decode is a few ULP from
+//   that one (within 2e-6 rad), and α is one f32 rounding from the CPU's, so every finest
+//   normal is within α' = α + one step (pi / 4095, 7.7e-4 rad) of this axis: the one-step
+//   widening FinestNormalCone's notes ask of an f32 consumer, with plenty to spare.
+// - The arithmetic: q below is within 6e-6·d of |a|·d·cos(θ + α'): the dot and cross products
+//   and the final products and difference round by under 2e-6·d together, cone_cos_sin's
+//   1e-6 errors cost at most 2e-6·d (|dot| and |cross| are each at most d), |a| is within 1e-6
+//   of 1 (another 1e-6·d), and v = center - eye is correctly rounded (the eye moved by at most
+//   6e-8·d). r's rounding is under 6e-8·d where it matters (r < d).
+// So q > r + CONE_SLACK·d (1e-5·d) means d·cos(θ + α') > r: every finest normal faces away from
+// every point of the grown sphere. A half-angle reaching a quarter turn never passes (the least
+// dot product is then at most -r), nor does an eye inside the sphere.
+fn finest_facing_away(b: TileBounds, cone: u32, eye: vec3<f32>, margin: f32) -> bool {
+    let steps = cone >> 20u;
+    if steps == CONE_EVERYTHING || b.radius < 0.0 {
+        return false;
+    }
+    let half = f32(steps + 1u) * CONE_STEP;
+    if half >= CONE_QUARTER_TURN {
+        return false;
+    }
+    let v = b.center - eye;
+    let d = length(v);
+    let r = b.radius + margin;
+    if d <= r {
+        return false;
+    }
+    let a = cone_axis(cone);
+    let cs = cone_cos_sin(half);
+    let q = dot(v, a) * cs.x - length(cross(v, a)) * cs.y;
+    return q > r + CONE_SLACK * d;
+}
+
+// Whether node `n`, of bounds `b` and bound `e`, faces wholly away for refining, the sphere
+// grown by e. A display tile is tested by the cone of the finest normals under it
+// (TileNode.finest_cone), not by its own triangles: a coarse tile at a silhouette can face away
+// while finest detail under it faces the camera, and the 1 px rule must hold there too
+// (spec, "Normal cone"). A finest tile is tested by its drawn cone, as drawing culls it: its
+// triangles are the finest surface, and it has nothing to refine into. Drawing culls every tile
+// by its own triangles (emit's backfacing), whichever cone refines it.
+fn refine_facing_away(n: u32, b: TileBounds, e: f32) -> bool {
+    if (tree[n].flags & NODE_FINEST) != 0u {
+        return backfacing(b, view.eye.xyz, e);
+    }
+    return finest_facing_away(b, tree[n].finest_cone, view.eye.xyz, e);
 }
 
 // Per tile: in view, wants refining (with hysteresis), complete; the screen error.
@@ -464,7 +565,7 @@ fn choose(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     if b.radius >= 0.0
         && in_frustum(view, b.center, b.radius + e)
-        && !refine_facing_away(b, e) {
+        && !refine_facing_away(n, b, e) {
         out |= W_VISIBLE;
         let e_px = projected(view, b, e, e);
         let q_px = projected(view, b, e, b.quad_edge);
