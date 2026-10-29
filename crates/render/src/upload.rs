@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use bytemuck::{Pod, Zeroable};
-use geom::{Channel, DisplayTile, TileKey, Vec3};
+use geom::{Channel, DisplayTile, FinestNormalCone, TileKey, Vec3};
 use store::{CacheError, Evaluation, TileStore};
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode, Queue};
 
@@ -64,6 +64,41 @@ struct TileVertex {
 }
 ";
 
+/// What a tile read gives the level choice beside its vertices: how far what the tile draws may
+/// be from the finest surface under it, and which way that surface faces.
+///
+/// The two change together (a dab, a display refresh), so they travel together, from the read
+/// to the tile tree's node ([`crate::tree::GpuNode::error`] and
+/// [`crate::tree::GpuNode::finest_cone`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileDetail {
+    /// `e`: a bound, in world units, on the distance from what the tile draws to the finest
+    /// surface under it; 0 for a finest tile.
+    pub error: f32,
+    /// The cone holding every finest normal under the tile, as its display record stores it.
+    /// [`FinestNormalCone::EVERYTHING`] for a finest tile (the level choice tests a finest
+    /// tile by its own triangles, which are the finest surface) and for any tile whose finest
+    /// normals aren't known: never facing away, so refined whenever its error asks.
+    pub cone: FinestNormalCone,
+}
+
+impl TileDetail {
+    /// A finest tile's: `e` 0, the cone that covers everything.
+    pub const FINEST: Self = Self {
+        error: 0.0,
+        cone: FinestNormalCone::EVERYTHING,
+    };
+
+    /// A display tile's: its `e` and its finest normals' cone.
+    #[must_use]
+    pub const fn of_display(tile: &DisplayTile) -> Self {
+        Self {
+            error: tile.error(),
+            cone: tile.cone(),
+        }
+    }
+}
+
 /// Where the data of resident tiles comes from: the store, or a model of it in tests.
 ///
 /// Read on the owner thread, a tile at a time, while the frame's uploads are staged.
@@ -86,13 +121,18 @@ pub trait TileSource {
     }
 
     /// Writes `key`'s vertices into `out` (row-major `side²`, as many as `out` holds) and
-    /// returns its bound `e`, or `None` if the source has nothing to draw for it yet (a display
-    /// tile not built, or made unknown by edits): it is then drawn finer, or by an ancestor.
+    /// returns its bound `e` and its finest normals' cone, or `None` if the source has nothing
+    /// to draw for it yet (a display tile not built, or made unknown by edits): it is then drawn
+    /// finer, or by an ancestor.
     ///
     /// # Errors
     ///
     /// As the source reports them; staging stops there.
-    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<f32>, Self::Error>;
+    fn read(
+        &mut self,
+        key: TileKey,
+        out: &mut [GpuVertex],
+    ) -> Result<Option<TileDetail>, Self::Error>;
 }
 
 /// [`TileSource`] over the store: display tiles from [`TileStore::display_for_draw`], finest
@@ -139,7 +179,11 @@ impl TileSource for StoreSource<'_> {
         Ok(())
     }
 
-    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<f32>, CacheError> {
+    fn read(
+        &mut self,
+        key: TileKey,
+        out: &mut [GpuVertex],
+    ) -> Result<Option<TileDetail>, CacheError> {
         if key.channel() == Channel::DISPLAY {
             let tile = match self.display.remove(&key) {
                 Some(tile) => tile,
@@ -161,7 +205,7 @@ impl TileSource for StoreSource<'_> {
                     reserved: 0,
                 };
             }
-            return Ok(Some(tile.error()));
+            return Ok(Some(TileDetail::of_display(&tile)));
         }
         let normals = self.store.normals(key)?;
         let with_normals = out.iter_mut().zip(normals);
@@ -175,7 +219,7 @@ impl TileSource for StoreSource<'_> {
         for (vertex, position) in with_positions {
             vertex.position = components(*position);
         }
-        Ok(Some(0.0))
+        Ok(Some(TileDetail::FINEST))
     }
 }
 

@@ -25,6 +25,7 @@ use wgpu::{Buffer, BufferDescriptor, BufferUsages};
 
 use crate::gpu::{Gpu, GpuError};
 use crate::residency::Slot;
+use crate::upload::TileDetail;
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -62,8 +63,11 @@ struct TileNode {
     // Bit k set: the tile has a neighbour across edge k (resident or not); clear across an
     // open border of the mesh. Edges in the order of neighbours.
     edges: u32,
-    // Zero.
-    reserved: u32,
+    // The cone holding every finest normal under the tile (geom::FinestNormalCone's bits), for
+    // the level choice: bits 0..10 and 10..20 the axis's two octahedral components, signed
+    // fractions of 511; bits 20..32 the half-angle in steps of pi / 4095, 4095 meaning it
+    // covers everything. Covers everything for a finest tile (tested by its own triangles).
+    finest_cone: u32,
     // The children's node indices, NONE where not resident: (2tx, 2ty), (2tx + 1, 2ty),
     // (2tx, 2ty + 1), (2tx + 1, 2ty + 1); a whole-face tile's one child first, the rest NONE.
     children: array<u32, 4>,
@@ -258,8 +262,16 @@ pub struct GpuNode {
     /// resident or not; clear across an open border of the mesh. A pass tells "the neighbour
     /// isn't resident" from "there is none" by it.
     pub edges: u32,
-    /// Zero.
-    pub reserved: u32,
+    /// The cone holding every finest normal under the tile, as [`geom::FinestNormalCone::to_bits`]
+    /// stores it: bits 0 to 20 the axis, octahedral, two signed 10-bit fractions of 511 (across
+    /// in bits 0 to 10, up in 10 to 20); bits 20 to 32 the half-angle, a count of `π / 4095`
+    /// steps, 4095 meaning it covers everything.
+    ///
+    /// The level choice refines a display tile unless every direction in this cone faces away
+    /// (spec, "Normal cone"); drawing still culls by the tile's own triangles. A finest tile
+    /// carries [`geom::FinestNormalCone::EVERYTHING`]: its own triangles are the finest
+    /// surface, so the level choice tests it by its drawn cone, as before.
+    pub finest_cone: u32,
     /// The children's node indices in [`Place::children`]'s order, [`NONE`] where not resident.
     pub children: [u32; 4],
     /// The edge neighbours' node indices in [`Place::neighbours`]'s order, [`NONE`] where not
@@ -269,6 +281,9 @@ pub struct GpuNode {
 
 /// The bytes of one [`GpuNode`].
 pub const NODE_BYTES: u64 = size_of::<GpuNode>() as u64;
+
+// `TileNode` is 64 bytes, its fields all four-byte words in this order.
+const _: () = assert!(NODE_BYTES == 64, "a node is 64 bytes");
 
 /// Why the tree couldn't take a node.
 #[derive(Debug, Error)]
@@ -295,8 +310,8 @@ struct Node {
     place: Place,
     /// Its slot.
     slot: Slot,
-    /// Its bound `e`.
-    error: f32,
+    /// Its bound `e` and its finest normals' cone.
+    detail: TileDetail,
     /// [`NODE_FLOOR`] and [`NODE_FINEST`] as they apply ([`NODE_LIVE`] is implied).
     flags: u32,
     /// Its edge neighbours' places, found once on arrival.
@@ -389,8 +404,9 @@ impl TileTree {
         self.by_place.get(&place).copied()
     }
 
-    /// Adds the tile at `place`, in `slot` with bound `error`, and returns its node index.
-    /// `flags` adds [`NODE_FLOOR`] or [`NODE_FINEST`]; [`NODE_LIVE`] is implied.
+    /// Adds the tile at `place`, in `slot` with its bound `e` and finest normals' cone
+    /// (`detail`), and returns its node index. `flags` adds [`NODE_FLOOR`] or [`NODE_FINEST`];
+    /// [`NODE_LIVE`] is implied.
     ///
     /// # Errors
     ///
@@ -400,7 +416,7 @@ impl TileTree {
         &mut self,
         place: Place,
         slot: Slot,
-        error: f32,
+        detail: TileDetail,
         flags: u32,
     ) -> Result<u32, TreeError> {
         if self.by_place.contains_key(&place) {
@@ -422,7 +438,7 @@ impl TileTree {
         let node = Node {
             place,
             slot,
-            error,
+            detail,
             flags: flags & (NODE_FLOOR | NODE_FINEST),
             neighbours: place.neighbours(&self.topology),
         };
@@ -450,21 +466,22 @@ impl TileTree {
         Some(node.slot)
     }
 
-    /// Points the resident tile at `place` to `slot`, with bound `error`; returns the slot it
-    /// held, or `None` if `place` isn't resident.
+    /// Points the resident tile at `place` to `slot`, with the bound `e` and finest normals'
+    /// cone of its new data (`detail`: both change with it, a dab's tiles covering everything
+    /// until their refresh); returns the slot it held, or `None` if `place` isn't resident.
     ///
     /// The tile keeps its node index: an epoch that moves a tile to a shadow slot changes its
     /// slot, never its node. A node index stays the tile's from [`TileTree::insert`] to
     /// [`TileTree::remove`], which is why the visibility buffer's cluster id derives from the
     /// node index and not from the slot (plan decision 2 as amended).
-    pub(crate) fn move_to(&mut self, place: Place, slot: Slot, error: f32) -> Option<Slot> {
+    pub(crate) fn move_to(&mut self, place: Place, slot: Slot, detail: TileDetail) -> Option<Slot> {
         let index = *self.by_place.get(&place)?;
         let node = usize::try_from(index)
             .ok()
             .and_then(|i| self.nodes.get_mut(i))
             .and_then(Option::as_mut)?;
         let old = std::mem::replace(&mut node.slot, slot);
-        node.error = error;
+        node.detail = detail;
         self.dirty.insert(index);
         self.stamp(index);
         Some(old)
@@ -537,14 +554,14 @@ impl TileTree {
             slot: node.slot.packed(),
             flags: NODE_LIVE | node.flags,
             parent: self.link(node.place.parent()),
-            error: node.error,
+            error: node.detail.error,
             edges: node
                 .neighbours
                 .iter()
                 .enumerate()
                 .filter(|(_, neighbour)| neighbour.is_some())
                 .fold(0, |mask, (edge, _)| mask | (1 << edge)),
-            reserved: 0,
+            finest_cone: node.detail.cone.to_bits(),
             children: node.place.children().map(|child| self.link(child)),
             neighbours: node.neighbours.map(|neighbour| self.link(neighbour)),
         }

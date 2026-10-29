@@ -26,9 +26,12 @@ use crate::residency::CLASSES;
 /// Samples a side of a tile's bounds are taken from.
 const SAMPLES: u32 = 9;
 
-/// The bounds of `place` on the unit sphere, from a `SAMPLES` × `SAMPLES` grid of its
-/// vertices, grown by the sphere's bulge between samples.
-fn sampled_bounds(mesh: &BaseMesh, place: Place, finest: Level) -> GpuBounds {
+/// The bounds of `place` on the unit sphere and the cone of the finest normals under it.
+///
+/// The bounds come from a `SAMPLES` × `SAMPLES` grid of its vertices, grown by the sphere's
+/// bulge between samples; the cone covers the grid's normals, which holds them all, as
+/// [`sphere_cone`]'s does.
+fn sampled_bounds(mesh: &BaseMesh, place: Place, finest: Level) -> (GpuBounds, FinestNormalCone) {
     let key = place.key(finest).expect("a tile");
     let quads = place.level().tile_quads();
     let steps = SAMPLES.min(quads + 1) - 1;
@@ -95,14 +98,20 @@ fn sampled_bounds(mesh: &BaseMesh, place: Place, finest: Level) -> GpuBounds {
         let narrowed = x as f32;
         narrowed
     };
-    GpuBounds {
+    let normals: Vec<geom::Vec3> = grid
+        .iter()
+        .map(|p| geom::Vec3::new(narrow(p[0]), narrow(p[1]), narrow(p[2])))
+        .collect();
+    let finest_cone = FinestNormalCone::covering(&normals).expect("a tile has normals");
+    let bounds = GpuBounds {
         center: center.map(narrow),
         radius: narrow(radius * (1.0 + 1e-4)),
         axis: axis.map(narrow),
         cone_cos: narrow(cone - 1e-4),
         quad_edge: narrow(quad_edge),
         reserved: [0; 3],
-    }
+    };
+    (bounds, finest_cone)
 }
 
 /// The benchmark tree shape with every tile up to `top` resident, `rough` choosing the
@@ -114,7 +123,7 @@ fn benchmark_scene(gpu: &Gpu, shape: Shape, rough: bool) -> Scene {
         .into_iter()
         .filter(|place| place.level() <= top)
         .collect();
-    let bounds: Vec<GpuBounds> = places
+    let bounds: Vec<(GpuBounds, FinestNormalCone)> = places
         .iter()
         .map(|place| sampled_bounds(&mesh, *place, finest))
         .collect();
@@ -122,32 +131,35 @@ fn benchmark_scene(gpu: &Gpu, shape: Shape, rough: bool) -> Scene {
     let mut tree = TileTree::new(gpu, &mesh, capacity).expect("a tree");
     let mut rng = Rng(77);
     let mut scene_bounds = BTreeMap::new();
-    let mut errors = BTreeMap::new();
-    for (place, b) in places.into_iter().zip(bounds) {
+    let mut details = BTreeMap::new();
+    for (place, (b, cone)) in places.into_iter().zip(bounds) {
         let finest_tile = place.level() == finest;
         let factor = if rough { rng.range(0.25, 2.0) } else { 1.0 };
-        let e = if finest_tile {
-            0.0
+        let detail = if finest_tile {
+            TileDetail::FINEST
         } else {
-            0.25 * factor * b.quad_edge
+            TileDetail {
+                error: 0.25 * factor * b.quad_edge,
+                cone,
+            }
         };
         let flags = if finest_tile { NODE_FINEST } else { 0 };
         tree.insert(
             place,
             Slot::for_tests(SizeClass::of(place.level()), 0),
-            e,
+            detail,
             flags,
         )
         .expect("inserted");
         scene_bounds.insert(place, b);
-        errors.insert(place, e);
+        details.insert(place, detail);
     }
     Scene {
         mesh,
         finest,
         tree,
         bounds: scene_bounds,
-        errors,
+        details,
     }
 }
 
@@ -355,7 +367,7 @@ fn bounds_timing(gpu: &Gpu) {
         tree.insert(
             *place,
             Slot::for_tests(SizeClass::of(finest), index),
-            0.0,
+            TileDetail::FINEST,
             NODE_FINEST,
         )
         .expect("inserted");

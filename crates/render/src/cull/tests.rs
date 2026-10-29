@@ -13,7 +13,7 @@ use super::*;
 use crate::gpu::GpuTest;
 use crate::residency::Slot;
 use crate::tree::{NODE_FINEST, Place, TileTree};
-use crate::upload::GpuVertex;
+use crate::upload::{GpuVertex, TileDetail};
 
 mod truth;
 
@@ -91,7 +91,12 @@ fn the_bounds_pass_matches_its_cpu_twin_and_holds_every_vertex_and_triangle() {
                     .expect("a key"),
             );
             let node = tree
-                .insert(place, Slot::for_tests(class, index), 0.0, NODE_FINEST)
+                .insert(
+                    place,
+                    Slot::for_tests(class, index),
+                    TileDetail::FINEST,
+                    NODE_FINEST,
+                )
                 .expect("inserted");
             expected.push((node, bounds_of(&vertices, side), vertices, side));
         }
@@ -202,7 +207,7 @@ fn a_bounds_pass_that_fails_leaves_its_tiles_unknown_not_stale() {
         let place = Place::of(&TileKey::display(FaceId::new(0), Level::ZERO, 0, 0).expect("a key"));
         let class = SizeClass::of(Level::ZERO);
         let node = tree
-            .insert(place, Slot::for_tests(class, 0), 0.0, 0)
+            .insert(place, Slot::for_tests(class, 0), TileDetail::FINEST, 0)
             .expect("inserted");
         let mut pass = BoundsPass::new(gpu, 8).expect("the bounds pass");
         let stale = GpuBounds {

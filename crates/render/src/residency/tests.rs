@@ -18,7 +18,7 @@ use wgpu::{
 use super::*;
 use crate::gpu::GpuTest;
 use crate::tree::{GpuNode, NODE_LIVE, Place};
-use crate::upload::{GpuVertex, TileSource};
+use crate::upload::{GpuVertex, TileDetail, TileSource};
 
 /// The test projects' finest level: level 7, where a face has 2 × 2 tiles.
 const FINEST: u8 = 7;
@@ -180,7 +180,7 @@ impl TileSource for Model {
         Ok(())
     }
 
-    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<f32>, Failure> {
+    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<TileDetail>, Failure> {
         self.reads += 1;
         if self.fail_one_in > 0 && self.reads.is_multiple_of(self.fail_one_in) {
             return Err(Failure);
@@ -193,9 +193,17 @@ impl TileSource for Model {
         if self.missing.contains(&key) {
             return Ok(None);
         }
-        let tag = tag(&key, version);
-        out.fill(tag);
-        Ok(Some(tag.position[0]))
+        out.fill(tag(&key, version));
+        Ok(Some(detail_tag(version)))
+    }
+}
+
+/// The bound `e` and cone the model gives a tile at `version`: the version as `e`, and a cone
+/// whose bits follow from it (any bits are a cone), so the tree shows which data's they are.
+fn detail_tag(version: u32) -> TileDetail {
+    TileDetail {
+        error: f32::from(u16::try_from(version).expect("small values")),
+        cone: geom::FinestNormalCone::from_bits(version.wrapping_mul(0x9E37_79B9)),
     }
 }
 
@@ -272,6 +280,12 @@ fn gpu_view(gpu: &Gpu, residency: &Residency) -> BTreeMap<TileKey, u32> {
         let data = &slots[&(class.get(), buffer)][first..first + vertices];
         let version = data[0].reserved;
         assert_eq!(data[0], tag(&key, version), "{key:?}'s slot holds its data");
+        let detail = detail_tag(version);
+        assert_eq!(
+            (node.error, node.finest_cone),
+            (detail.error, detail.cone.to_bits()),
+            "{key:?}'s node holds the e and cone of the data its slot holds"
+        );
         assert!(
             data.iter().all(|v| *v == data[0]),
             "{key:?}'s slot holds one version, whole"

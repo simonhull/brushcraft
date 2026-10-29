@@ -11,7 +11,7 @@ use crate::gpu::GpuTest;
 use crate::overlay::MARGIN;
 use crate::residency::{Residency, ResidencyConfig};
 use crate::surface::Offscreen;
-use crate::upload::{GpuVertex, TileSource};
+use crate::upload::{GpuVertex, TileDetail, TileSource};
 
 /// The clear colour the tests draw with, linear.
 const CLEAR: Color = Color {
@@ -111,9 +111,13 @@ struct ByLevel;
 impl TileSource for ByLevel {
     type Error = Infallible;
 
-    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<f32>, Infallible> {
+    fn read(
+        &mut self,
+        key: TileKey,
+        out: &mut [GpuVertex],
+    ) -> Result<Option<TileDetail>, Infallible> {
         out.fill(Self::vertex(key));
-        Ok(Some(0.0))
+        Ok(Some(TileDetail::FINEST))
     }
 }
 

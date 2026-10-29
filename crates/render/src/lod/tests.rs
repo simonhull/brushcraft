@@ -1,11 +1,12 @@
 //! Tests of the level choice on lavapipe, over synthetic tile trees.
 //!
 //! The tiles lie on a sphere, their bounds computed on the CPU and written straight into the
-//! bounds buffer, their `e` a chosen fraction of their quad edge.
+//! bounds buffer, their `e` a chosen fraction of their quad edge, their finest normals' cones
+//! those of the sphere under them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{BaseMesh, Level, cube_sphere};
+use geom::{BaseMesh, FinestNormalCone, Level, cube_sphere};
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, PollType, TextureViewDescriptor,
 };
@@ -21,7 +22,7 @@ use crate::gpu::GpuTest;
 use crate::residency::{REQUEST_HEADER, SizeClass, Slot};
 use crate::surface::Size;
 use crate::tree::{GpuNode, NODE_BYTES, NODE_FINEST, TileTree};
-use crate::upload::GpuVertex;
+use crate::upload::{GpuVertex, TileDetail};
 
 mod orbit;
 
@@ -109,7 +110,23 @@ fn vertices(mesh: &BaseMesh, place: Place, finest: Level) -> (Vec<GpuVertex>, us
     (out, side)
 }
 
-/// A synthetic tile tree: the resident tiles of a sphere, their bounds and their `e`.
+/// The cone of the finest normals under a tile of the test sphere whose vertices are `data`:
+/// [`FinestNormalCone::covering`] their normals.
+///
+/// Every finest normal under the tile lies in it: a tile's edges are straight in its face's
+/// bilinear patch (lines of one parameter), so on the sphere they are great-circle arcs between
+/// the boundary vertices, and a cone narrower than a hemisphere that holds the boundary holds
+/// the region it encloses.
+fn sphere_cone(data: &[GpuVertex]) -> FinestNormalCone {
+    let normals: Vec<geom::Vec3> = data
+        .iter()
+        .map(|v| geom::Vec3::new(v.normal[0], v.normal[1], v.normal[2]))
+        .collect();
+    FinestNormalCone::covering(&normals).expect("a tile has normals")
+}
+
+/// A synthetic tile tree: the resident tiles of a sphere, their bounds, their `e` and their
+/// finest normals' cones.
 struct Scene {
     /// The base mesh.
     mesh: BaseMesh,
@@ -119,13 +136,14 @@ struct Scene {
     tree: TileTree,
     /// Every resident place's bounds.
     bounds: BTreeMap<Place, GpuBounds>,
-    /// Every resident place's `e`.
-    errors: BTreeMap<Place, f32>,
+    /// Every resident place's `e` and finest normals' cone.
+    details: BTreeMap<Place, TileDetail>,
 }
 
 impl Scene {
     /// The tiles of `mesh` up to `finest`, those `keep` keeps resident, each with `e` =
-    /// `error(place)` times its longest quad edge (0 at the finest level).
+    /// `error(place)` times its longest quad edge and the cone of the sphere's normals under it
+    /// ([`sphere_cone`]); [`TileDetail::FINEST`] at the finest level.
     fn new(
         gpu: &Gpu,
         mesh: BaseMesh,
@@ -140,23 +158,26 @@ impl Scene {
         let capacity = u32::try_from(kept.len()).expect("small");
         let mut tree = TileTree::new(gpu, &mesh, capacity).expect("a tree");
         let mut bounds = BTreeMap::new();
-        let mut errors = BTreeMap::new();
+        let mut details = BTreeMap::new();
         for place in kept {
             let (data, side) = vertices(&mesh, place, finest);
             let b = bounds_of(&data, side);
             let finest_tile = place.level() == finest;
-            let e = if finest_tile {
-                0.0
+            let detail = if finest_tile {
+                TileDetail::FINEST
             } else {
-                error(place) * b.quad_edge
+                TileDetail {
+                    error: error(place) * b.quad_edge,
+                    cone: sphere_cone(&data),
+                }
             };
             bounds.insert(place, b);
-            errors.insert(place, e);
+            details.insert(place, detail);
             let flags = if finest_tile { NODE_FINEST } else { 0 };
             tree.insert(
                 place,
                 Slot::for_tests(SizeClass::of(place.level()), 0),
-                e,
+                detail,
                 flags,
             )
             .expect("inserted");
@@ -166,7 +187,7 @@ impl Scene {
             finest,
             tree,
             bounds,
-            errors,
+            details,
         }
     }
 
@@ -428,7 +449,7 @@ fn cpu_error(scene: &Scene, view: &View, place: Place) -> Option<f32> {
     let mut at = Some(place);
     while let Some(p) = at {
         let b = scene.bounds[&p];
-        let e = scene.errors[&p];
+        let e = scene.details[&p].error;
         let wide = in_frustum(&gpu, b.center, (b.radius + e) * 1.001)
             && !backfacing(&b, eye, e * 1.001 + b.radius * 0.001);
         let narrow = in_frustum(&gpu, b.center, (b.radius + e) * 0.999)

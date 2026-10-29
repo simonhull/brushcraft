@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use geom::{BaseMesh, Level, TileKey, cube_sphere};
 use render::gpu::{AdapterRequest, Gpu};
 use render::residency::{FrameUse, Request, Requests, Residency, ResidencyConfig, SizeClass};
-use render::upload::{GpuVertex, TileSource};
+use render::upload::{GpuVertex, TileDetail, TileSource};
 use store::Drained;
 use wgpu::{CommandEncoderDescriptor, PollType};
 
@@ -49,8 +49,12 @@ struct Zeros;
 impl TileSource for Zeros {
     type Error = Infallible;
 
-    fn read(&mut self, _key: TileKey, _out: &mut [GpuVertex]) -> Result<Option<f32>, Infallible> {
-        Ok(Some(0.0))
+    fn read(
+        &mut self,
+        _key: TileKey,
+        _out: &mut [GpuVertex],
+    ) -> Result<Option<TileDetail>, Infallible> {
+        Ok(Some(TileDetail::FINEST))
     }
 }
 

@@ -27,6 +27,15 @@ fn level(l: u8) -> Level {
     Level::new(l).expect("a level")
 }
 
+/// A tile's bound `error` and a cone told apart by `tag` (any bits are a cone).
+fn detail(error: f32, tag: usize) -> TileDetail {
+    let bits = u32::try_from(tag).expect("small").wrapping_mul(0x9E37_79B9);
+    TileDetail {
+        error,
+        cone: geom::FinestNormalCone::from_bits(bits),
+    }
+}
+
 /// A small deterministic generator for the tests' random choices.
 struct Rng(u64);
 
@@ -153,7 +162,7 @@ fn the_gpu_copy_kept_from_dirty_nodes_matches_the_tree_after_any_arrivals_and_de
             if arrive {
                 let place = all[rng.below(all.len())];
                 let slot = Slot::for_tests(SizeClass::of(place.level), rng.below(100));
-                match tree.insert(place, slot, 0.5, 0) {
+                match tree.insert(place, slot, detail(0.5, step), 0) {
                     Ok(_) => resident.push(place),
                     Err(TreeError::Present(_)) => {}
                     Err(error) => panic!("step {step}: {error}"),
@@ -165,7 +174,8 @@ fn the_gpu_copy_kept_from_dirty_nodes_matches_the_tree_after_any_arrivals_and_de
             if rng.below(4) == 0
                 && let Some(&place) = resident.first()
             {
-                tree.move_to(place, Slot::for_tests(SizeClass::of(place.level), 5), 2.0);
+                let moved = detail(2.0, step + 1);
+                tree.move_to(place, Slot::for_tests(SizeClass::of(place.level), 5), moved);
             }
             for (start, nodes) in tree.take_dirty() {
                 for (offset, node) in nodes.into_iter().enumerate() {
@@ -227,17 +237,30 @@ fn arrivals_and_moves_to_new_data_are_stamped_and_departures_forgotten() {
             ty: 0,
         });
         let start = tree.generation();
-        let first = tree.insert(a, slot(a), 1.0, 0).expect("inserted");
-        let second = tree.insert(b, slot(b), 1.0, 0).expect("inserted");
+        let first = tree
+            .insert(a, slot(a), detail(1.0, 0), 0)
+            .expect("inserted");
+        let second = tree
+            .insert(b, slot(b), detail(1.0, 0), 0)
+            .expect("inserted");
         let all: Vec<u32> = tree.changed_since(start).collect();
         assert_eq!(all, vec![first, second], "both arrivals, in node order");
         let after = tree.generation();
         assert_eq!(tree.changed_since(after).count(), 0, "nothing since");
-        tree.move_to(a, slot(a), 0.5);
+        let refreshed = detail(0.5, 3);
+        tree.move_to(a, slot(a), refreshed);
         let moved: Vec<u32> = tree.changed_since(after).collect();
         assert_eq!(moved, vec![first], "the move to new data");
+        let node = tree.gpu_node(first);
+        assert_eq!(
+            (node.error, node.finest_cone),
+            (refreshed.error, refreshed.cone.to_bits()),
+            "the new data's e and cone, together"
+        );
         assert!(tree.remove(b).is_some(), "resident");
-        let third = tree.insert(c, slot(c), 1.0, 0).expect("inserted");
+        let third = tree
+            .insert(c, slot(c), detail(1.0, 0), 0)
+            .expect("inserted");
         assert_eq!(third, second, "the node is reused");
         let since: Vec<u32> = tree.changed_since(after).collect();
         assert_eq!(

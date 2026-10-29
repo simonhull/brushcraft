@@ -71,7 +71,7 @@ use wgpu::{Buffer, MAP_ALIGNMENT, PollType};
 use crate::gpu::{Gpu, GpuError};
 use crate::tree::{NODE_BYTES, NODE_FINEST, NODE_FLOOR, Place, TileTree, TreeError};
 use crate::upload::{
-    Batch, FrameOutcome, FrameUploads, GpuVertex, StagingRing, TileSource, VERTEX_BYTES,
+    Batch, FrameOutcome, FrameUploads, GpuVertex, StagingRing, TileDetail, TileSource, VERTEX_BYTES,
 };
 
 mod pool;
@@ -565,12 +565,12 @@ struct Want {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Staged {
     /// Uploaded into `slot` (a shadow slot, or the tile's own for an epoch written in place),
-    /// with bound `error`.
+    /// with its bound `e` and finest normals' cone.
     Data {
         /// Where it is.
         slot: Slot,
-        /// Its bound `e`.
-        error: f32,
+        /// Its bound `e` and finest normals' cone.
+        detail: TileDetail,
     },
     /// The source had nothing for it: it leaves when the epoch switches.
     Missing,
@@ -619,8 +619,8 @@ impl Group {
 /// What reading one tile into staging came to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Read {
-    /// Staged, with its bound `e`.
-    Staged(f32),
+    /// Staged, with its bound `e` and finest normals' cone.
+    Staged(TileDetail),
     /// The source had nothing for it.
     Missing,
     /// The staging ring had no room.
@@ -1389,11 +1389,11 @@ impl Residency {
         };
         let read = self.read_fresh(gpu, batch, source, key, slot, forced)?;
         match read {
-            Read::Staged(error) => match self.joining(&key) {
+            Read::Staged(detail) => match self.joining(&key) {
                 Some(group) => {
-                    group.staged.insert(key, Staged::Data { slot, error });
+                    group.staged.insert(key, Staged::Data { slot, detail });
                 }
-                None => self.insert_live(key, slot, error)?,
+                None => self.insert_live(key, slot, detail)?,
             },
             Read::Missing => {
                 self.pools.release(slot);
@@ -1471,8 +1471,8 @@ impl Residency {
                     continue;
                 };
                 match self.read_fresh(gpu, batch, source, key, slot, false)? {
-                    Read::Staged(error) => {
-                        group.staged.insert(key, Staged::Data { slot, error });
+                    Read::Staged(detail) => {
+                        group.staged.insert(key, Staged::Data { slot, detail });
                         self.stats.shadowed += 1;
                     }
                     Read::Missing => {
@@ -1538,12 +1538,12 @@ impl Residency {
             };
             group.todo.remove(&key);
             match read {
-                Read::Staged(error) => {
+                Read::Staged(detail) => {
                     group.staged.insert(
                         key,
                         Staged::Data {
                             slot: target,
-                            error,
+                            detail,
                         },
                     );
                 }
@@ -1572,16 +1572,16 @@ impl Residency {
         for (key, staged) in std::mem::take(&mut group.staged) {
             let place = Place::of(&key);
             match staged {
-                Staged::Data { slot, error } => {
+                Staged::Data { slot, detail } => {
                     if let Some(entry) = self.entries.get_mut(&key) {
                         let old = entry.slot;
                         entry.slot = slot;
-                        self.tree.move_to(place, slot, error);
+                        self.tree.move_to(place, slot, detail);
                         if old != slot {
                             self.pools.release(old);
                         }
                     } else {
-                        self.insert_live(key, slot, error)?;
+                        self.insert_live(key, slot, detail)?;
                     }
                 }
                 Staged::Missing => {
@@ -1644,7 +1644,7 @@ impl Residency {
         let vertices = usize::try_from(slot.class.vertices()).unwrap_or(usize::MAX);
         self.scratch.clear();
         self.scratch.resize(vertices, GpuVertex::default());
-        let Some(error) = source.read(key, &mut self.scratch).map_err(Into::into)? else {
+        let Some(detail) = source.read(key, &mut self.scratch).map_err(Into::into)? else {
             return Ok(Read::Missing);
         };
         let (buffer, offset) = self
@@ -1655,7 +1655,7 @@ impl Residency {
         if batch.write(gpu, &mut self.ring, data, buffer, offset, forced)? {
             self.touched.push((key, slot));
             self.fresh.insert(key);
-            Ok(Read::Staged(error))
+            Ok(Read::Staged(detail))
         } else {
             Ok(Read::NoRoom)
         }
@@ -1699,12 +1699,17 @@ impl Residency {
         Ok(self.pools.acquire(gpu, class)?)
     }
 
-    /// Makes `key` resident in `slot` with bound `error`.
+    /// Makes `key` resident in `slot` with its bound `e` and finest normals' cone (`detail`).
     ///
     /// # Errors
     ///
     /// [`ResidencyError::Tree`] if the tree is full.
-    fn insert_live(&mut self, key: TileKey, slot: Slot, error: f32) -> Result<(), ResidencyError> {
+    fn insert_live(
+        &mut self,
+        key: TileKey,
+        slot: Slot,
+        detail: TileDetail,
+    ) -> Result<(), ResidencyError> {
         let floor = self.floor.contains(&key);
         let mut flags = 0;
         if floor {
@@ -1713,7 +1718,7 @@ impl Residency {
         if key.level() == self.finest {
             flags |= NODE_FINEST;
         }
-        self.tree.insert(Place::of(&key), slot, error, flags)?;
+        self.tree.insert(Place::of(&key), slot, detail, flags)?;
         let entry = Entry {
             slot,
             last_drawn: self.frame,
