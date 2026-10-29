@@ -81,20 +81,39 @@ const SLACK: f64 = 1e-9;
 /// How far over the least cosine a normal's cosine to the axis may lie and still be measured
 /// exactly by [`FinestNormalCone::covering`]: every other normal is narrower.
 ///
-/// The cosines are computed in `f32`, as `(a · n) / √(n · n)` with `a` the decoded axis (unit to
-/// within 2⁻²³). Each of the dot products' three products and two sums rounds by at most 2⁻²⁴
-/// of terms no larger than `|n|`, the root and the quotient by 2⁻²⁴ relative each, and `|a|`
-/// scales every cosine alike by at most 2⁻²³: under 10⁻⁶ in all for a normal of any length. A
-/// normal whose computed cosine lies more than 10⁻⁵ over the least is therefore truly narrower
-/// than the least-cosine normal (by over 8·10⁻⁶ in cosine), and its exact `atan2` measure (off
-/// by about 10⁻¹⁵ rad) is under that normal's plus [`SLACK`], which is what the half-angle is
-/// built from. The band is ten times the error, and narrow enough that only the normals beside
-/// the widest are measured exactly. (Were the widest measured at exactly 0, every cosine would
-/// be within rounding of 1, so none lies past the band.)
+/// The cosines are ranked in `f32`, against `a`, the decoded axis (unit to within 2⁻²³). For
+/// normals of unit length (all of them within [`UNIT_LENGTH_STRAY`] of it), the plain `a · n`
+/// stands for the cosine: `|a| |n|` is within 1.3·10⁻⁶ of 1, and the dot product's three
+/// products and two sums round by at most 2⁻²⁴ of terms no larger than 1 each (3·10⁻⁷), so it
+/// is within 1.6·10⁻⁶ of the true cosine. Otherwise the cosine is `(a · n) / √(n · n)`, the
+/// root and the quotient adding 2⁻²⁴ relative each: within 10⁻⁶. Either way, a normal ranked
+/// more than 10⁻⁵ over the least is truly narrower than the least-ranked normal (by over
+/// 6·10⁻⁶ in cosine), and its exact `atan2` measure (off by about 10⁻¹⁵ rad) is under that
+/// normal's plus [`SLACK`], which is what the half-angle is built from. The band is several
+/// times the error, and narrow enough that only the normals beside the widest are measured
+/// exactly. (Were the widest measured at exactly 0, every cosine would be within rounding of 1,
+/// so none lies past the band.)
 const COSINE_TOLERANCE: f32 = 1e-5;
 
-/// The independent accumulators [`lane_sum`] sums normals in.
-const LANES: usize = 8;
+/// How far `n · n` may stray from 1, for every normal, for [`FinestNormalCone::covering`] to
+/// rank them by `a · n` alone, without a root and a quotient each: `2·10⁻⁶`, so `|n|` is within
+/// about 10⁻⁶ of 1.
+///
+/// The ranking needs every normal near unit length: a long one looks narrower than it is and
+/// could be left out of the band, and a short one (a zero one most of all) looks wider, so it
+/// moves the band and can leave a truly wider one outside. The finest normals are unit to `f32`
+/// precision: the evaluation scales each `du × dv` (or ring normal) by the reciprocal of its
+/// length, or gives the unit fallback normal, so `|n|` is within a few 2⁻²⁴ of 1, and `n · n`
+/// within about 6·10⁻⁷ (computing it and subtracting 1 add under 3·10⁻⁷), three times inside
+/// this. A call holding any other normal ranks them all by the full cosine instead.
+const UNIT_LENGTH_STRAY: f32 = 2e-6;
+
+/// The normals [`lane_sum`] and [`Scan`] take side by side: four, a vector's width of
+/// `f32` on every target.
+const LANES: usize = 4;
+
+/// The floats of a round of [`LANES`] normals.
+const ROUND: usize = 3 * LANES;
 
 /// A cone of directions: an axis and a half-angle, as a display tile stores the cone holding
 /// every finest normal under it (see the module notes).
@@ -203,13 +222,14 @@ impl FinestNormalCone {
     /// sum) get the axis `+z`; normals spread over more than a hemisphere around the axis may
     /// need the cone that covers everything.
     ///
-    /// The sum is taken in `f32` in eight lanes, each normal's lane set by its place in order, so
+    /// The sum is taken in `f32` in four lanes, each normal's lane set by its place in order, so
     /// the same normals give the same bits however they are cut into runs. It only picks the axis:
     /// the half-angle is measured from the decoded axis, which is what makes the cone hold
-    /// them. The widest normal is found by its `f32` cosine to the decoded axis, and only those
-    /// within `COSINE_TOLERANCE` (10⁻⁵) of the least are measured with the `atan2` that
-    /// [`FinestNormalCone::contains`] uses, so the half-angle bounds every normal as that
-    /// measures it.
+    /// them. The widest normal is found by its `f32` cosine to the decoded axis (`a · n` alone
+    /// when every normal is of unit length, as the finest normals are; the full cosine
+    /// otherwise), and only those within `COSINE_TOLERANCE` (10⁻⁵) of the least are measured
+    /// with the `atan2` that [`FinestNormalCone::contains`] uses, so the half-angle bounds every
+    /// normal as that measures it.
     ///
     /// # Errors
     ///
@@ -241,30 +261,12 @@ impl FinestNormalCone {
                 reason = "the decoded axis, an f32 vector widened: narrowed back exactly"
             )]
             let a = Vec3::new(axis[0] as f32, axis[1] as f32, axis[2] as f32);
-            // The cosine of a normal to the axis, in `f32`; `None` for a zero normal, which has
-            // no direction (and no angle).
-            let cosine = |n: Vec3| {
-                let length = n.dot(n);
-                (length > 0.0).then(|| a.dot(n) / length.sqrt())
-            };
-            let mut least = f32::INFINITY;
-            for run in runs {
-                for &n in *run {
-                    if let Some(c) = cosine(n) {
-                        least = least.min(c);
-                    }
-                }
+            let scan = Scan::of(runs, a);
+            if !scan.unit() {
+                return widest_by_cosine(runs, axis, a);
             }
-            let band = least + COSINE_TOLERANCE;
-            let mut need = 0.0_f64;
-            for run in runs {
-                for &n in *run {
-                    if cosine(n).is_some_and(|c| c <= band) {
-                        need = need.max(reach(axis, wide(n)));
-                    }
-                }
-            }
-            need
+            let band = scan.least.iter().fold(f32::INFINITY, |m, &l| m.min(l)) + COSINE_TOLERANCE;
+            widest_unit(runs, &scan.least, axis, a, band)
         }))
     }
 
@@ -356,40 +358,175 @@ impl fmt::Debug for FinestNormalCone {
     }
 }
 
-/// The sum of the normals in `runs`, in `f32`: the normal at place `k` (counting through the
-/// runs in order) goes to lane `k mod LANES`, each lane adds in order, and the lanes are summed
-/// pairwise at the end.
+/// The sum of the normals in `runs`, in `f32`, a round of four normals at a time.
 ///
-/// The lanes are independent, so the additions run side by side, not as one chain; and each
-/// normal's lane depends on its place alone, not on how the normals are cut into runs, so a
+/// The normal at place `k` (counting through the runs in order) is summed in lane `k mod LANES`,
+/// each lane adds in order, and the lanes are summed pairwise at the end. The lanes are
+/// independent, so the additions run side by side as vector operations, not as one chain; and
+/// each normal's lane depends on its place alone, not on how the normals are cut into runs, so a
 /// block read row by row and one read tile run by tile run give the same bits.
 fn lane_sum(runs: &[&[Vec3]]) -> Vec3 {
-    let mut lanes = [Vec3::ZERO; LANES];
-    // The lane of the next normal.
+    // Lane `l`'s components at `3l..3l + 3`: a round's floats add to them one to one.
+    let mut lanes = [0.0_f32; ROUND];
+    // Where the next normal's floats go.
     let mut next = 0;
     for run in runs {
-        // The normals that bring the lanes round to the first, then whole rounds of them.
-        let head = ((LANES - next) % LANES).min(run.len());
-        let (first, rest) = run.split_at_checked(head).unwrap_or((run, &[]));
+        let flat: &[f32] = bytemuck::cast_slice(run);
+        // The floats that bring the lanes round to the first, then whole rounds of them.
+        let head = ((ROUND - next) % ROUND).min(flat.len());
+        let (first, rest) = flat.split_at_checked(head).unwrap_or((flat, &[]));
         let heads = lanes.iter_mut().skip(next).zip(first);
-        for (lane, &n) in heads {
-            *lane = *lane + n;
+        for (lane, &c) in heads {
+            *lane += c;
         }
-        let (rounds, tail) = rest.as_chunks::<LANES>();
+        let (rounds, tail) = rest.as_chunks::<ROUND>();
         for round in rounds {
-            let whole = lanes.iter_mut().zip(round);
-            for (lane, &n) in whole {
-                *lane = *lane + n;
+            let sums = lanes.iter_mut().zip(round);
+            for (lane, &c) in sums {
+                *lane += c;
             }
         }
         let tails = lanes.iter_mut().zip(tail);
-        for (lane, &n) in tails {
-            *lane = *lane + n;
+        for (lane, &c) in tails {
+            *lane += c;
         }
-        next = (next + run.len()) % LANES;
+        next = (next + flat.len()) % ROUND;
     }
-    let [l0, l1, l2, l3, l4, l5, l6, l7] = lanes;
-    ((l0 + l1) + (l2 + l3)) + ((l4 + l5) + (l6 + l7))
+    let lane = |l: usize| {
+        let at = |c: usize| lanes.get(3 * l + c).copied().unwrap_or(0.0);
+        Vec3::new(at(0), at(1), at(2))
+    };
+    (lane(0) + lane(1)) + (lane(2) + lane(3))
+}
+
+/// What a pass over the normals tells against the decoded axis `a`: the least `a · n` of each
+/// run, and the shortest and longest `n · n` of all.
+#[derive(Debug, Clone, PartialEq)]
+struct Scan {
+    /// The least `a · n` of each run, in order.
+    least: Vec<f32>,
+    /// The least `n · n`.
+    shortest: f32,
+    /// The largest `n · n`.
+    longest: f32,
+}
+
+impl Scan {
+    /// The pass over `runs`, four normals side by side, each `a · n` summed in the order
+    /// `Vec3::dot` takes it, so the band pass, which takes `a.dot(n)`, gets the same bits.
+    fn of(runs: &[&[Vec3]], a: Vec3) -> Self {
+        let mut run_least = Vec::with_capacity(runs.len());
+        let mut lo = [f32::INFINITY; LANES];
+        let mut hi = [0.0_f32; LANES];
+        // A run's last normals, fewer than a round, one at a time.
+        let (mut tail_lo, mut tail_hi) = (f32::INFINITY, 0.0_f32);
+        for run in runs {
+            let mut least = [f32::INFINITY; LANES];
+            let flat: &[f32] = bytemuck::cast_slice(run);
+            let (rounds, tail) = flat.as_chunks::<ROUND>();
+            for round in rounds {
+                let [x0, y0, z0, x1, y1, z1, x2, y2, z2, x3, y3, z3] = *round;
+                let along = [
+                    a.x * x0 + a.y * y0 + a.z * z0,
+                    a.x * x1 + a.y * y1 + a.z * z1,
+                    a.x * x2 + a.y * y2 + a.z * z2,
+                    a.x * x3 + a.y * y3 + a.z * z3,
+                ];
+                let length = [
+                    x0 * x0 + y0 * y0 + z0 * z0,
+                    x1 * x1 + y1 * y1 + z1 * z1,
+                    x2 * x2 + y2 * y2 + z2 * z2,
+                    x3 * x3 + y3 * y3 + z3 * z3,
+                ];
+                // Selects, not `min`/`max`: four independent lanes, no NaN handling (a NaN
+                // shows in the sum).
+                let nearest = least.iter_mut().zip(along);
+                for (l, d) in nearest {
+                    *l = if d < *l { d } else { *l };
+                }
+                let lengths = lo.iter_mut().zip(&mut hi).zip(length);
+                for ((s, g), q) in lengths {
+                    *s = if q < *s { q } else { *s };
+                    *g = if q > *g { q } else { *g };
+                }
+            }
+            let [l0, l1, l2, l3] = least;
+            let mut this = l0.min(l1).min(l2.min(l3));
+            let (rest, _) = tail.as_chunks::<3>();
+            for &[x, y, z] in rest {
+                let n = Vec3::new(x, y, z);
+                let (d, q) = (a.dot(n), n.dot(n));
+                this = this.min(d);
+                tail_lo = tail_lo.min(q);
+                tail_hi = tail_hi.max(q);
+            }
+            run_least.push(this);
+        }
+        let [s0, s1, s2, s3] = lo;
+        let [g0, g1, g2, g3] = hi;
+        Self {
+            least: run_least,
+            shortest: s0.min(s1).min(s2.min(s3)).min(tail_lo),
+            longest: g0.max(g1).max(g2.max(g3)).max(tail_hi),
+        }
+    }
+
+    /// Whether every normal is of unit length to within [`UNIT_LENGTH_STRAY`].
+    fn unit(&self) -> bool {
+        1.0 - self.shortest <= UNIT_LENGTH_STRAY && self.longest - 1.0 <= UNIT_LENGTH_STRAY
+    }
+}
+
+/// The widest angle, as [`reach`] measures it from `axis` (the decoded axis, `a` in `f32`), of
+/// the normals in `runs` whose `a · n` is at most `band`, visiting only the runs whose `least`
+/// (from [`Scan`], one a run) is.
+///
+/// For normals of unit length (see [`UNIT_LENGTH_STRAY`]), every normal past the band is
+/// narrower than one inside it.
+fn widest_unit(runs: &[&[Vec3]], least: &[f32], axis: Wide, a: Vec3, band: f32) -> f64 {
+    let mut need = 0.0_f64;
+    let reaching = runs
+        .iter()
+        .zip(least)
+        .filter(|&(_, &l)| l <= band)
+        .map(|(run, _)| run);
+    for run in reaching {
+        for &n in *run {
+            if a.dot(n) <= band {
+                need = need.max(reach(axis, wide(n)));
+            }
+        }
+    }
+    need
+}
+
+/// [`widest_unit`] for normals of any length.
+///
+/// They are ranked by their cosine to the axis, `(a · n) / √(n · n)`, zero normals left out
+/// (they have no direction, and no angle), and the band is [`COSINE_TOLERANCE`] over the least.
+fn widest_by_cosine(runs: &[&[Vec3]], axis: Wide, a: Vec3) -> f64 {
+    let cosine = |n: Vec3| {
+        let length = n.dot(n);
+        (length > 0.0).then(|| a.dot(n) / length.sqrt())
+    };
+    let mut least = f32::INFINITY;
+    for run in runs {
+        for &n in *run {
+            if let Some(c) = cosine(n) {
+                least = least.min(c);
+            }
+        }
+    }
+    let band = least + COSINE_TOLERANCE;
+    let mut need = 0.0_f64;
+    for run in runs {
+        for &n in *run {
+            if cosine(n).is_some_and(|c| c <= band) {
+                need = need.max(reach(axis, wide(n)));
+            }
+        }
+    }
+    need
 }
 
 /// The half-angle `steps` steps stand for, in radians, as decoded (an `f32` product, so it can

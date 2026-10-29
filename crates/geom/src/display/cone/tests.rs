@@ -248,6 +248,46 @@ fn runs_cut_anywhere_give_the_cone_of_one_slice() {
     }
 }
 
+/// A normal that isn't unit length sends the ranking to the full cosine.
+///
+/// The cone still holds every normal: a long one that is the widest (which `a · n` would rank
+/// narrower than it is), and a short one, which would move the band.
+#[test]
+fn normals_off_unit_length_are_ranked_by_their_cosine() {
+    let mut rng = Rng::new(37);
+    let base = around(&mut rng, Vec3::new(0.0, 0.0, 1.0), 0.05, 200);
+    let long = Vec3::new(1.6, 0.0, 1.2);
+    // Along the axis: narrow, but `a · n` alone would rank it the widest.
+    let short = Vec3::new(0.0, 0.0, 0.1);
+    let cases = [("long", long), ("short", short)];
+    for (name, odd) in cases {
+        let mut normals = base.clone();
+        normals.insert(77, odd);
+        let cone = FinestNormalCone::covering(&normals).unwrap();
+        for &normal in &normals {
+            assert!(cone.contains(normal), "{name}: {normal:?} outside {cone:?}");
+        }
+        let sum = wide(lane_sum(&[&normals]));
+        let every = FinestNormalCone::around(sum, |axis| {
+            normals
+                .iter()
+                .map(|&normal| reach(axis, wide(normal)))
+                .fold(0.0, f64::max)
+        });
+        assert_eq!(cone, every, "{name}: the cone every angle gives");
+    }
+    // The long one is the widest by far: its angle sets the cone.
+    let mut normals = base;
+    normals.insert(77, long);
+    let cone = FinestNormalCone::covering(&normals).unwrap();
+    let widest = angle(wide(cone.axis()), wide(long));
+    assert!(f64::from(cone.half_angle()) >= widest, "{cone:?}");
+    assert!(
+        f64::from(cone.half_angle()) - widest < 1e-3,
+        "{cone:?}: set by it"
+    );
+}
+
 /// A cone's debug form names its axis and half-angle in degrees.
 #[test]
 fn debug_names_the_axis_and_the_half_angle() {
@@ -255,4 +295,23 @@ fn debug_names_the_axis_and_the_half_angle() {
     let shown = format!("{cone:?}");
     assert!(shown.starts_with("FinestNormalCone { axis: "), "{shown}");
     assert!(shown.contains("half_degrees: "), "{shown}");
+}
+
+/// Prints what [`FinestNormalCone::covering_runs`] costs a tile one level above the finest:
+/// 129 × 129 normals within 0.3 of `+z`, as rows of 129, in µs a call.
+///
+/// `cargo nextest run --release -p geom --run-ignored only covering_cost --no-capture`.
+#[test]
+#[ignore = "a timing to read, not a check"]
+fn covering_cost() {
+    const CALLS: u32 = 2000;
+    let normals = around(&mut Rng::new(5), Vec3::new(0.0, 0.0, 1.0), 0.3, 129 * 129);
+    let rows: Vec<&[Vec3]> = normals.chunks(129).collect();
+    let started = std::time::Instant::now();
+    for _ in 0..CALLS {
+        let cone = FinestNormalCone::covering_runs(std::hint::black_box(&rows));
+        std::hint::black_box(cone).unwrap();
+    }
+    let each = started.elapsed() / CALLS;
+    println!("covering_runs: {:.1} µs a call", each.as_secs_f64() * 1e6);
 }
