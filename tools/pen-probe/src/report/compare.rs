@@ -4,8 +4,10 @@
 //!
 //! 1. its de-jittered speed noise is within about 0.1–0.3 points of the floor (the steady period's,
 //!    in the same run) on the steady-strokes step, or on every stroke without one;
-//! 2. its p99 dispatch delay under load fits the [`BUDGET_MS`] budget (handled behind the pen's
-//!    clock: see [`super::dispatch`]);
+//! 2. its p99 dispatch delay under load is at most [`DISPATCH_MARGIN_MS`] over U's, both handled
+//!    behind the pen's clock (see [`super::dispatch`]). The brief's flat [`BUDGET_MS`] is printed
+//!    beside it for information only: the wait comes from the frame loop and delays U's samples as
+//!    much, so W is held to U's figure (the plan's corrected rule, 2026-10-28);
 //! 3. its events tell each barrel button apart from the tip: a click while hovering makes no
 //!    pen-down, and a release mid-stroke ends no stroke while the pen still presses.
 //!
@@ -21,6 +23,13 @@ use crate::{Recording, Sample, Source};
 
 /// The most W's de-jittered speed noise may sit above the floor, in points.
 pub(crate) const NOISE_MARGIN: f64 = 0.3;
+
+/// The most W's p99 dispatch delay may exceed U's, in milliseconds.
+///
+/// The M1a3 plan's corrected rule (2026-10-28): both runs wait on the same frame loop, which
+/// delays U's samples reaching the brush as much as W's, so W is judged by what it adds on top of
+/// U. The millisecond is the rule's allowance for two runs of one load not being identical.
+pub(crate) const DISPATCH_MARGIN_MS: f64 = 1.0;
 
 /// The samples of `source` in `recording`.
 fn of(recording: &Recording, source: Source) -> Vec<&Sample> {
@@ -87,7 +96,7 @@ fn told_apart(hover: StepFindings, stroke: StepFindings) -> Verdict {
 pub(crate) struct Checks {
     /// Speed noise near the floor.
     pub(crate) noise: Verdict,
-    /// Dispatch within the budget.
+    /// Dispatch at most [`DISPATCH_MARGIN_MS`] behind U's.
     pub(crate) dispatch: Verdict,
     /// Barrel 1 told apart.
     pub(crate) barrel1: Verdict,
@@ -118,18 +127,28 @@ impl Checks {
     }
 }
 
-/// The checks for W's samples.
-pub(crate) fn checks(winit: &[&Sample]) -> Checks {
+/// The dispatch delay the decision reads, for either source: handled behind the pen's clock.
+fn dispatch_delay(samples: &[&Sample]) -> Option<Spread> {
+    dispatch::behind_clock(samples, Moment::Handled)
+}
+
+/// Whether W's dispatch delay `w` is within [`DISPATCH_MARGIN_MS`] of U's `u` at the p99.
+fn dispatch_verdict(w: Option<Spread>, u: Option<Spread>) -> Verdict {
+    match (w, u) {
+        (Some(w), Some(u)) if w.p99 - u.p99 <= DISPATCH_MARGIN_MS => Verdict::Pass,
+        (Some(_), Some(_)) => Verdict::Fail,
+        _ => Verdict::Unknown,
+    }
+}
+
+/// The checks for W's samples `winit`, against U's samples `ours` where a check compares them.
+pub(crate) fn checks(winit: &[&Sample], ours: &[&Sample]) -> Checks {
     let noise = match steady_noise(winit).above_floor() {
         Some(d) if d <= NOISE_MARGIN => Verdict::Pass,
         Some(_) => Verdict::Fail,
         None => Verdict::Unknown,
     };
-    let dispatch = match dispatch::dispatch_delay(Source::Winit, winit) {
-        Some(s) if s.p99 <= BUDGET_MS => Verdict::Pass,
-        Some(_) => Verdict::Fail,
-        None => Verdict::Unknown,
-    };
+    let dispatch = dispatch_verdict(dispatch_delay(winit), dispatch_delay(ours));
     let barrel = |hover, stroke| {
         told_apart(
             buttons::findings(Source::Winit, winit, hover),
@@ -160,17 +179,15 @@ pub(crate) fn compare(winit: &Recording, ours: &Recording) -> Result<String, fmt
     let (w_noise, u_noise) = (steady_noise(&w), steady_noise(&u));
     writeln!(out, "  W: {w_noise}")?;
     writeln!(out, "  U: {u_noise}")?;
+    let (w_delay, u_delay) = (dispatch_delay(&w), dispatch_delay(&u));
     writeln!(out, "dispatch delay:")?;
+    writeln!(out, "  W: handled behind the pen's clock {}", show(w_delay))?;
+    writeln!(out, "  U: handled behind the pen's clock {}", show(u_delay))?;
     writeln!(
         out,
-        "  W: handled behind the pen's clock {}",
-        show(dispatch::dispatch_delay(Source::Winit, &w))
-    )?;
-    writeln!(
-        out,
-        "  U: receipt to main-thread handling {}; receipt behind the pen's clock {} (the \
-         compositor's share, which W's figure includes)",
-        show(dispatch::dispatch_delay(Source::Ours, &u)),
+        "     of which receipt to main-thread handling {}; receipt behind the pen's clock {} \
+         (compositor, socket and input-thread scheduling)",
+        show(dispatch::handling(&u)),
         show(dispatch::behind_clock(&u, Moment::Received)),
     )?;
     writeln!(
@@ -203,7 +220,7 @@ pub(crate) fn compare(winit: &Recording, ours: &Recording) -> Result<String, fmt
             fu.ups,
         )?;
     }
-    let checks = checks(&w);
+    let checks = checks(&w, &u);
     writeln!(out, "checks for W:")?;
     writeln!(
         out,
@@ -213,16 +230,34 @@ pub(crate) fn compare(winit: &Recording, ours: &Recording) -> Result<String, fmt
             .above_floor()
             .map_or_else(|| "n/a".to_owned(), |d| format!("{d:+.1} points")),
     )?;
+    let p99 = |spread: Option<Spread>| {
+        spread.map_or_else(|| "n/a".to_owned(), |s| format!("{:.2} ms", s.p99))
+    };
+    let unloaded: Vec<&str> = [("W", winit), ("U", ours)]
+        .into_iter()
+        .filter(|(_, run)| run.frames.is_none())
+        .map(|(name, _)| name)
+        .collect();
     writeln!(
         out,
-        "  2. p99 dispatch delay under load within {BUDGET_MS:.0} ms: {} ({}{})",
+        "  2. p99 dispatch delay under load at most {DISPATCH_MARGIN_MS:.0} ms over U's: {} (W {}, \
+         U {}{})",
         checks.dispatch,
-        dispatch::dispatch_delay(Source::Winit, &w)
-            .map_or_else(|| "n/a".to_owned(), |s| format!("{:.2} ms", s.p99)),
-        if winit.frames.is_some() {
-            ""
-        } else {
-            "; the W run had no --load"
+        p99(w_delay),
+        p99(u_delay),
+        match unloaded.as_slice() {
+            [] => String::new(),
+            [one] => format!("; the {one} run had no --load"),
+            _ => "; neither run had --load".to_owned(),
+        },
+    )?;
+    writeln!(
+        out,
+        "     for information, the brief's flat rule: W's p99 within {BUDGET_MS:.0} ms: {}",
+        match w_delay {
+            Some(s) if s.p99 <= BUDGET_MS => "yes",
+            Some(_) => "no",
+            None => "not measured",
         },
     )?;
     writeln!(
@@ -344,13 +379,17 @@ mod tests {
         );
         assert!(noise.floor.unwrap() < 1e-6, "an even speed: {noise}");
         assert!(
-            dispatch::dispatch_delay(Source::Winit, &w).is_some_and(|d| d.max < 4.1),
+            dispatch_delay(&w).is_some_and(|d| d.max < 4.1),
             "behind the clock by at most the 4 ms jitter"
         );
-        let checks = checks(&w);
+        let checks = checks(&w, &[]);
         assert_eq!(checks.barrel1, Verdict::Fail, "{checks:?}");
         assert_eq!(checks.barrel2, Verdict::Unknown, "{checks:?}");
-        assert_eq!(checks.dispatch, Verdict::Pass, "{checks:?}");
+        assert_eq!(
+            checks.dispatch,
+            Verdict::Unknown,
+            "W alone can't be held to U: {checks:?}"
+        );
 
         let ours = Recording {
             samples: vec![Sample {
@@ -373,10 +412,85 @@ mod tests {
             text.contains("3. barrel buttons told apart from the tip: NO"),
             "{text}"
         );
-        assert!(text.contains("the W run had no --load"), "{text}");
+        assert!(text.contains("neither run had --load"), "{text}");
         assert!(
             text.ends_with("choice: U (our Wayland backend)\n"),
             "{text}"
+        );
+    }
+
+    /// A run of `source` whose one contact sample is handled `behind_us` behind the pen's clock,
+    /// under a load of one frame.
+    fn handled_behind(source: Source, behind_us: u64) -> Recording {
+        let dejittered = Duration::from_millis(10);
+        Recording {
+            samples: vec![Sample {
+                source,
+                received: dejittered,
+                handled: Some(dejittered + Duration::from_micros(behind_us)),
+                dejittered: Some(dejittered),
+                wakeup: 0,
+                x: 0.0,
+                y: 0.0,
+                contact: true,
+                pressure: Some(0.5),
+                tilt: None,
+                distance: None,
+                roll: None,
+                phase: Some(input::Phase::Drag),
+                buttons: Buttons::default(),
+                device_ms: None,
+                winit_event: None,
+                proximity: Some(true),
+                step: None,
+            }],
+            frames: Some(vec![crate::frames::FrameRecord::default()]),
+            ..Recording::default()
+        }
+    }
+
+    #[test]
+    fn dispatch_holds_w_to_us_handled_behind_the_clock() {
+        // The user's measurement: W fails by 18 ms, though both are far over the flat 8 ms.
+        let (winit, ours) = (
+            handled_behind(Source::Winit, 61_800),
+            handled_behind(Source::Ours, 43_700),
+        );
+        let (w, u) = (of(&winit, Source::Winit), of(&ours, Source::Ours));
+        assert_eq!(checks(&w, &u).dispatch, Verdict::Fail);
+        let text = compare(&winit, &ours).expect("a String");
+        assert!(
+            text.contains("  W: handled behind the pen's clock p50 61.80 / p99 61.80"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  U: handled behind the pen's clock p50 43.70 / p99 43.70"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "2. p99 dispatch delay under load at most 1 ms over U's: NO (W 61.80 ms, U 43.70 \
+                 ms)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("the brief's flat rule: W's p99 within 8 ms: no"),
+            "{text}"
+        );
+
+        // Within a millisecond of U passes, over the flat budget or not.
+        let close = handled_behind(Source::Winit, 44_500);
+        let close_w = of(&close, Source::Winit);
+        assert_eq!(checks(&close_w, &u).dispatch, Verdict::Pass);
+        let close_text = compare(&close, &ours).expect("a String");
+        assert!(
+            close_text.contains("over U's: yes (W 44.50 ms, U 43.70 ms)"),
+            "{close_text}"
+        );
+        assert_eq!(
+            dispatch_verdict(dispatch_delay(&close_w), None),
+            Verdict::Unknown
         );
     }
 

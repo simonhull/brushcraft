@@ -8,11 +8,11 @@
 //!   wait happens before winit reads it, where the probe can't see it.
 //! - **handled behind the pen's clock** (`handled − de-jittered`, contact samples): the de-jittered
 //!   line is the lower envelope of the receipts, so this is how much later than the least-delayed
-//!   samples the main thread got each one. For winit it is the dispatch delay the decision reads:
-//!   what the main thread's busy stretches add to the compositor's own jitter.
-//! - **receipt behind the pen's clock** (`received − de-jittered`): for ours, the compositor's and
-//!   the socket's share alone, since our thread reads at once: the part of winit's figure the main
-//!   thread didn't add.
+//!   samples the main thread got each one. It is the dispatch delay the decision reads, for both
+//!   sources alike: what the main thread's busy stretches add to the delivery's own jitter.
+//! - **receipt behind the pen's clock** (`received − de-jittered`): for ours, the compositor,
+//!   socket and input-thread scheduling together, since our thread reads at once: the part of the
+//!   handled figure the main thread didn't add. It isn't measured to be the compositor's alone.
 
 use std::fmt::{self, Write as _};
 use std::time::Duration;
@@ -21,7 +21,12 @@ use super::{percentile, to_f64};
 use crate::frames::FrameRecord;
 use crate::{Sample, Source};
 
-/// The dispatch budget the decision holds W's p99 to.
+/// A flat per-frame budget, in milliseconds: the load block counts the frames that keep the main
+/// thread away longer, and the comparison prints W's p99 dispatch delay against it.
+///
+/// Information only: the decision no longer holds W to it. The dispatch wait comes from the frame
+/// loop and delays U's samples reaching the brush as much as W's, so W is held to U's figure
+/// instead ([`super::compare::DISPATCH_MARGIN_MS`]).
 pub(crate) const BUDGET_MS: f64 = 8.0;
 
 /// The spread of a set of delays, in milliseconds.
@@ -99,15 +104,6 @@ pub(crate) fn behind_clock(samples: &[&Sample], moment: Moment) -> Option<Spread
     }))
 }
 
-/// The dispatch delay the decision reads: for winit, handled behind the pen's clock; for ours,
-/// receipt to handling. See the module notes.
-pub(crate) fn dispatch_delay(source: Source, samples: &[&Sample]) -> Option<Spread> {
-    match source {
-        Source::Winit => behind_clock(samples, Moment::Handled),
-        Source::Ours => handling(samples),
-    }
-}
-
 /// Appends the dispatch lines for one source's samples; nothing for a CSV from before handling
 /// was recorded.
 ///
@@ -128,14 +124,15 @@ pub(super) fn block(out: &mut String, source: Source, samples: &[&Sample]) -> fm
         Source::Ours => {
             writeln!(
                 out,
-                "dispatch: receipt (our thread) to main-thread handling {}",
-                show(handling(samples)),
+                "dispatch: handled behind the pen's clock {}",
+                show(behind_clock(samples, Moment::Handled)),
             )?;
             writeln!(
                 out,
-                "dispatch: receipt behind the pen's clock {}; handled behind it {}",
+                "  of which: receipt (our thread) to main-thread handling {}; receipt behind the \
+                 pen's clock {} (compositor, socket and input-thread scheduling)",
+                show(handling(samples)),
                 show(behind_clock(samples, Moment::Received)),
-                show(behind_clock(samples, Moment::Handled)),
             )
         }
     }
@@ -247,15 +244,15 @@ mod tests {
     }
 
     #[test]
-    fn ours_dispatch_is_receipt_to_handling_and_winits_is_behind_the_clock() {
+    fn handling_and_the_clock_split_ours_and_winits_is_all_behind_the_clock() {
         // Ours: received 1 ms behind the clock, handled 3 ms after receipt.
         let ours = [
             row(Source::Ours, 11, 14, Some(10)),
             row(Source::Ours, 21, 24, Some(20)),
         ];
         let ours: Vec<&Sample> = ours.iter().collect();
-        let ours_delay = dispatch_delay(Source::Ours, &ours).expect("some");
-        assert!((ours_delay.p99 - 3.0).abs() < 1e-9, "{ours_delay:?}");
+        let ours_handling = handling(&ours).expect("some");
+        assert!((ours_handling.p99 - 3.0).abs() < 1e-9, "{ours_handling:?}");
         let behind = behind_clock(&ours, Moment::Received).expect("some");
         assert!((behind.max - 1.0).abs() < 1e-9, "{behind:?}");
         let handled = behind_clock(&ours, Moment::Handled).expect("some");
@@ -267,7 +264,7 @@ mod tests {
             row(Source::Winit, 30, 30, None),
         ];
         let winit: Vec<&Sample> = winit.iter().collect();
-        let winit_delay = dispatch_delay(Source::Winit, &winit).expect("some");
+        let winit_delay = behind_clock(&winit, Moment::Handled).expect("some");
         assert_eq!(winit_delay.n, 1, "contact samples only");
         assert!((winit_delay.p50 - 6.0).abs() < 1e-9, "{winit_delay:?}");
         let zero = handling(&winit).expect("some");
