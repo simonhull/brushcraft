@@ -2,20 +2,22 @@
 //! instead of being rebuilt from every finest tile.
 //!
 //! A display tile (`geom::DisplayTile`) is derived from the finest level: its positions are the
-//! finest ones subsampled, its normals a mip of the finest normals, its bound `e` chained up from
-//! the finest level. Rebuilding the layer means evaluating every finest tile, so the files keep
-//! it, under the same rule as the spatial index's bounds (see [`crate::bounds`]): **a save point
-//! never names a display tile its tiles don't give**. A write makes every display tile it can
-//! change unknown ([`readers`]); an unknown or damaged display tile is rebuilt, never trusted.
+//! finest ones subsampled, its normals a mip of the finest normals, its bound `e` and its normal
+//! cone chained up from the finest level. Rebuilding the layer means evaluating every finest tile,
+//! so the files keep it, under the same rule as the spatial index's bounds (see [`crate::bounds`]):
+//! **a save point never names a display tile its tiles don't give**. A write makes every display
+//! tile it can change unknown ([`readers`]); an unknown or damaged display tile is rebuilt, never
+//! trusted.
 //!
 //! # In the file
 //!
 //! A display tile is a tile record of the base layer's [`Channel::DISPLAY`] channel, which the
 //! format has always allowed (a channel a reader doesn't know round-trips): no new record kind,
 //! and nothing a save point names changes. Its header is `version: u8, state: u8`, then, if the
-//! state is known, the bound `e: f32`; its body, compressed as every tile body is, is the tile's
-//! encoding (`geom::DisplayTile::encoded`), or empty if unknown. The record's op is
-//! [`DISPLAY_OP`]: a display tile is no edit.
+//! state is known, `finest: u8` (the level it was built from), the bound `e: f32` and the normal
+//! cone `cone: u32` (`geom::NormalCone::to_bits`), little-endian; its body, compressed as every
+//! tile body is, is the tile's encoding (`geom::DisplayTile::encoded`), or empty if unknown. The
+//! record's op is [`DISPLAY_OP`]: a display tile is no edit.
 //!
 //! # Unlike bounds
 //!
@@ -29,16 +31,20 @@
 
 use std::collections::BTreeSet;
 
-use geom::{BaseMesh, Channel, DisplayTile, EvalError, FaceId, LayerId, Level, Region, TileKey};
+use geom::{
+    BaseMesh, Channel, DisplayTile, EvalError, FaceId, LayerId, Level, NormalCone, Region, TileKey,
+};
 
 use crate::bounds::{self, Derived};
 use crate::deps::DepGraph;
 use crate::jobs::TileCache;
 use crate::op::OpId;
 
-/// The version byte of the display record format this build writes and reads: 2 adds the
-/// finest level a tile was built from.
-const VERSION: u8 = 2;
+/// The version byte of the display record format this build writes and reads.
+///
+/// 2 adds the finest level a tile was built from, 3 its normal cone. A record of an older
+/// version reads as unknown, and is rebuilt.
+const VERSION: u8 = 3;
 /// The state byte of a display record whose tile is unknown: it is rebuilt.
 const UNKNOWN: u8 = 0;
 /// The state byte of a display record that holds its tile.
@@ -51,12 +57,14 @@ pub(crate) const DISPLAY_OP: OpId = match OpId::new(0, 0) {
     None => unreachable!(),
 };
 
-/// A display tile as the store keeps it: its bound, the finest level it was built from, and its
-/// encoding, as the file holds them.
+/// A display tile as the store keeps it: its bound, its normal cone, the finest level it was
+/// built from, and its encoding, as the file holds them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DisplayRecord {
     /// `e`.
     pub(crate) error: f32,
+    /// The cone holding every finest normal under the tile.
+    pub(crate) cone: NormalCone,
     /// The finest level the tile was built from: a store keeping a display layer under another
     /// level reads the record as unknown (its bound is no bound on that store's surface).
     pub(crate) finest: Level,
@@ -69,9 +77,16 @@ impl DisplayRecord {
     pub(crate) fn of(tile: &DisplayTile, finest: Level) -> Self {
         Self {
             error: tile.error(),
+            cone: tile.cone(),
             finest,
             encoded: tile.encoded().to_vec(),
         }
+    }
+
+    /// The tile `key` the record holds, decoded with its bound and cone; `None` if it doesn't
+    /// decode as `key`'s.
+    pub(crate) fn decode(&self, key: &TileKey) -> Option<DisplayTile> {
+        DisplayTile::decode(*key, self.error, self.cone, &self.encoded).ok()
     }
 }
 
@@ -95,13 +110,14 @@ impl StoredDisplay {
     }
 }
 
-/// A display record's header: the version, the state, and, if known, the finest level and the
-/// bound.
+/// A display record's header: the version, the state, and, if known, the finest level, the
+/// bound and the cone.
 pub(crate) fn display_header(record: Option<&DisplayRecord>) -> Vec<u8> {
     match record {
         Some(record) => {
             let mut out = vec![VERSION, KNOWN, record.finest.get()];
             out.extend_from_slice(&record.error.to_le_bytes());
+            out.extend_from_slice(&record.cone.to_bits().to_le_bytes());
             out
         }
         None => vec![VERSION, UNKNOWN],
@@ -131,14 +147,16 @@ pub(crate) fn max_body(key: &TileKey) -> usize {
 pub(crate) fn parse_display(key: &TileKey, header: &[u8], body: &[u8]) -> Option<StoredDisplay> {
     match *header {
         [VERSION, UNKNOWN] => body.is_empty().then_some(StoredDisplay::Unknown),
-        [VERSION, KNOWN, finest, a, b, c, d] => {
+        [VERSION, KNOWN, finest, e0, e1, e2, e3, c0, c1, c2, c3] => {
             let finest = Level::new(finest).ok().filter(|f| *f > key.level())?;
-            let error = f32::from_le_bytes([a, b, c, d]);
+            let error = f32::from_le_bytes([e0, e1, e2, e3]);
+            // Every `u32` is a cone.
+            let cone = NormalCone::from_bits(u32::from_le_bytes([c0, c1, c2, c3]));
             if body.len() > max_body(key) {
                 return None;
             }
             // Decoding checks every byte and the bound; only a tile that decodes is trusted.
-            let tile = DisplayTile::decode(*key, error, body).ok()?;
+            let tile = DisplayTile::decode(*key, error, cone, body).ok()?;
             Some(StoredDisplay::Known(DisplayRecord::of(&tile, finest)))
         }
         _ => None,

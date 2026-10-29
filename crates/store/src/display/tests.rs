@@ -3,21 +3,29 @@
 
 use super::*;
 
-/// A display record header round-trips its state, finest level and bound.
+/// A display record header round-trips its state, finest level, bound and cone.
 #[test]
-fn headers_hold_the_state_the_finest_level_and_the_bound() {
+fn headers_hold_the_state_the_finest_level_the_bound_and_the_cone() {
+    let cone = NormalCone::from_bits(0x1234_5678);
     let record = DisplayRecord {
         error: 0.25,
+        cone,
         finest: Level::new(9).unwrap(),
         encoded: Vec::new(),
     };
     assert_eq!(display_header(None), [VERSION, UNKNOWN], "unknown");
     let known = display_header(Some(&record));
+    assert_eq!(known.len(), 11, "version, state, finest level, bound, cone");
     assert_eq!(known[..3], [VERSION, KNOWN, 9], "known, from level 9");
     assert_eq!(
-        f32::from_le_bytes(known[3..].try_into().unwrap()),
+        f32::from_le_bytes(known[3..7].try_into().unwrap()),
         0.25,
         "the bound"
+    );
+    assert_eq!(
+        NormalCone::from_bits(u32::from_le_bytes(known[7..].try_into().unwrap())),
+        cone,
+        "the cone"
     );
     assert!(
         display_body(None).is_empty(),

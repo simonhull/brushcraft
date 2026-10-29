@@ -336,6 +336,75 @@ fn edits_between_slices_never_leave_a_tile_built_from_stale_copies() {
     assert_layer_current(&mut store, "rebuilt among edits");
 }
 
+/// A dab's tiles are drawn with the normal cone that covers everything until the refresh.
+///
+/// A dab turns the finest normals under the tiles it reaches, so those tiles never face away
+/// while their bound is raised; the refresh gives them a tight cone again, the one built from
+/// scratch.
+#[test]
+fn a_dab_makes_the_cones_it_reaches_cover_everything_until_the_refresh() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let face = FaceId::new(1);
+    let (ci, cj) = (100, 140);
+    let (key, li, lj) = TileKey::containing(
+        LayerId::BASE,
+        Channel::DISPLACEMENT,
+        face,
+        level(TOP),
+        ci,
+        cj,
+    )
+    .unwrap();
+    // A sharp spike: it turns the normals around it well past the cones they had.
+    store.begin_op().unwrap();
+    let c = store.correction(key).unwrap().get(li, lj).unwrap();
+    store
+        .set_correction(face, level(TOP), ci, cj, c + Vec3::new(0.0, 0.0, 0.05))
+        .unwrap();
+    store.bump_display_error(&[key], 0.05).unwrap();
+    let bumped: Vec<TileKey> = store.bumped.keys().copied().collect();
+    let levels: BTreeSet<Level> = bumped.iter().map(TileKey::level).collect();
+    assert_eq!(
+        levels.len(),
+        usize::from(TOP),
+        "the dab reaches a tile at every display level"
+    );
+    let drawn = store.display_for_draw(&bumped).unwrap();
+    for (k, tile) in bumped.iter().zip(&drawn) {
+        let tile = tile
+            .as_ref()
+            .unwrap_or_else(|| panic!("{k:?}: drawn bumped"));
+        assert!(
+            tile.cone().covers_everything(),
+            "{k:?}: {:?} while the dab's tiles are bumped",
+            tile.cone()
+        );
+    }
+    run_all(&mut store);
+    assert!(store.bumped.is_empty(), "the refresh replaces every bump");
+    let refreshed = store.display_for_draw(&bumped).unwrap();
+    let finest_below: Vec<&DisplayTile> = refreshed
+        .iter()
+        .flatten()
+        .filter(|t| t.key().level() == level(TOP - 1))
+        .collect();
+    assert!(
+        !finest_below.is_empty(),
+        "refreshed one level above the finest"
+    );
+    for tile in finest_below {
+        assert!(
+            !tile.cone().covers_everything(),
+            "{:?}: a tight cone again",
+            tile.key()
+        );
+    }
+    assert_layer_current(&mut store, "refreshed after the dab");
+}
+
 /// A write no bump covers (outside a dab, or a lost tile's revert) changes a bumped tile's finest
 /// values: its bumped bound no longer bounds it, so it is drawn as unknown, never as bumped.
 #[test]

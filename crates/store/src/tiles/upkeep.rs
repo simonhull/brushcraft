@@ -3,7 +3,8 @@
 //!
 //! A display tile at level `l` is built from (see `geom::build_tile`) the block under it one
 //! level finer, whose even vertices it stores (the finest positions at `finest − 1`, else the
-//! decoded display tiles at `l + 1`, whose bounds chain into its own), and its mean normals, the
+//! decoded display tiles at `l + 1`, whose bounds and normal cones chain into its own; at
+//! `finest − 1` its cone covers the finest normals of the block), and its mean normals, the
 //! tent of the means one level finer around its vertices, read across face borders (the finest
 //! normals at `finest − 1`, else the decoded display tiles at `l + 1`, its own face's and its
 //! neighbours'). What it reads is known before it is built ([`crate::display::tent_reads`]).
@@ -24,8 +25,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use geom::{
-    BaseMesh, Channel, DisplayError, DisplayTile, FaceId, Grid, LayerId, Level, PositionSource,
-    Region, TileKey, Vec3, build_tile, mip_normals_tile,
+    BaseMesh, Channel, DisplayError, DisplayTile, FaceId, Grid, LayerId, Level, NormalCone,
+    PositionSource, Region, TileKey, Vec3, build_tile, mip_normals_tile,
 };
 
 use super::TileStore;
@@ -247,7 +248,7 @@ fn decode_finer(
     };
     Ok(record
         .filter(|r| r.finest == finest)
-        .and_then(|r| DisplayTile::decode(key, r.error, &r.encoded).ok()))
+        .and_then(|r| r.decode(&key)))
 }
 
 /// Builds or decodes `task`'s display tile (on a worker): see the module notes.
@@ -303,12 +304,23 @@ fn build_from_finest(
         fine_side,
     )
     .ok_or(DisplayError::Unavailable)?;
+    // The finest normals under the tile, row by row, as `geom::build_cones` reads them.
+    let under = block_from(
+        &normals,
+        Channel::DISPLACEMENT,
+        key.face(),
+        finer,
+        origin,
+        fine_side,
+    )
+    .ok_or(DisplayError::Unavailable)?;
+    let cone = NormalCone::covering(&under)?;
     let source = TileValues::new(Channel::DISPLACEMENT, &normals);
     let means = mip_normals_tile(mesh, &source, &key);
     if source.missed.get() {
         return Err(DisplayError::Unavailable);
     }
-    build_tile(key, &Grid::new(fine_side, block)?, 0.0, &means?)
+    build_tile(key, &Grid::new(fine_side, block)?, 0.0, cone, &means?)
 }
 
 /// Builds display tile `key` from the decoded display tiles one level finer it reads.
@@ -328,13 +340,16 @@ fn build_from_finer(
         .ok_or_else(|| DisplayError::NoDisplayLevel(key.level()))?;
     let fine_side = 2 * region.quads() + 1;
     let origin = (2 * region.x0(), 2 * region.y0());
-    // The bound chains from the tiles under it alone; the block reads any tile holding a vertex
-    // of it (one on its edge may come from a neighbour, the same bits there).
-    let bound = tiles
+    // The bound and the cone chain from the tiles under it alone; the block reads any tile
+    // holding a vertex of it (one on its edge may come from a neighbour, the same bits there).
+    let under: Vec<&DisplayTile> = tiles
         .iter()
         .filter(|(tile, _)| lies_under(Region::of_tile(tile), region))
-        .map(|(_, d)| d.tile.error())
-        .fold(0.0_f32, f32::max);
+        .map(|(_, d)| &d.tile)
+        .collect();
+    let bound = under.iter().map(|t| t.error()).fold(0.0_f32, f32::max);
+    let cones: Vec<NormalCone> = under.iter().map(|t| t.cone()).collect();
+    let cone = NormalCone::holding(&cones)?;
     let positions: BTreeMap<TileKey, &[Vec3]> = tiles
         .iter()
         .map(|(k, d)| (*k, d.tile.positions()))
@@ -357,7 +372,13 @@ fn build_from_finer(
     if source.missed.get() {
         return Err(DisplayError::Unavailable);
     }
-    build_tile(key, &Grid::new(fine_side, block)?, bound, &mean_normals?)
+    build_tile(
+        key,
+        &Grid::new(fine_side, block)?,
+        bound,
+        cone,
+        &mean_normals?,
+    )
 }
 
 /// What the owner found a pending tile to need.

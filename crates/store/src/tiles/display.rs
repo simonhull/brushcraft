@@ -29,7 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{DisplayTile, Level, TileKey};
+use geom::{DisplayTile, Level, NormalCone, TileKey};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use super::TileStore;
@@ -126,7 +126,7 @@ impl TileStore {
         keys.iter()
             .map(|key| {
                 let record = self.display_record(key)?;
-                Ok(record.and_then(|r| DisplayTile::decode(*key, r.error, &r.encoded).ok()))
+                Ok(record.and_then(|r| r.decode(key)))
             })
             .collect()
     }
@@ -199,6 +199,10 @@ impl TileStore {
     /// twice `max_displacement`, the farthest the dab moved a finest vertex: in memory only,
     /// never written, so the display tiles as they were before the stroke stay drawable, their
     /// bound still a bound, until a refresh replaces them (see [`TileStore::display_for_draw`]).
+    ///
+    /// A dab turns the finest normals under it by an amount no displacement bounds, so a bumped
+    /// tile is drawn with the normal cone that covers everything (never facing away) until the
+    /// refresh rebuilds its cone with the rest of it.
     ///
     /// Twice: the finest vertex and the display vertex compared with it can each move that far
     /// (the renderer's stand-ins move display vertices too). Call it after each dab's writes
@@ -328,10 +332,10 @@ impl TileStore {
     }
 
     /// The display tiles to draw for each of `keys`, in order: the stored tile, or one a stroke
-    /// is changing as it was before the stroke with its bound raised (see
-    /// [`TileStore::bump_display_error`]), or a floor tile writes made unknown as it was last
-    /// recorded, its bound the largest there is; `None` where none of these is known, and the tile
-    /// must be drawn finer.
+    /// is changing as it was before the stroke with its bound raised and its normal cone the one
+    /// that covers everything (see [`TileStore::bump_display_error`]), or a floor tile writes made
+    /// unknown as it was last recorded, its bound the largest there is and its cone covering
+    /// everything; `None` where none of these is known, and the tile must be drawn finer.
     ///
     /// # Errors
     ///
@@ -347,18 +351,19 @@ impl TileStore {
                 if let Some((record, extra)) = self.bumped.get(key) {
                     // Rounded up, so it stays a bound.
                     let bound = (record.error + extra).next_up();
-                    return Ok(DisplayTile::decode(*key, bound, &record.encoded).ok());
+                    // A dab turns normals too: the cone before it holds them no longer.
+                    let cone = NormalCone::EVERYTHING;
+                    return Ok(DisplayTile::decode(*key, bound, cone, &record.encoded).ok());
                 }
                 if let Some(record) = self.display_record(key)? {
-                    return Ok(DisplayTile::decode(*key, record.error, &record.encoded).ok());
+                    return Ok(record.decode(key));
                 }
                 // A floor tile writes made unknown, and no stroke's bump covers: drawn as it was,
-                // its bound the largest there is, so a view finer than it is chosen whenever there
-                // is one, and never nothing.
-                Ok(self
-                    .floor
-                    .get(key)
-                    .and_then(|r| DisplayTile::decode(*key, f32::MAX, &r.encoded).ok()))
+                // its bound the largest there is and its cone covering everything, so a view finer
+                // than it is chosen whenever there is one, and never nothing.
+                Ok(self.floor.get(key).and_then(|r| {
+                    DisplayTile::decode(*key, f32::MAX, NormalCone::EVERYTHING, &r.encoded).ok()
+                }))
             })
             .collect()
     }
