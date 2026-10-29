@@ -132,6 +132,37 @@ pub(crate) fn run<J: Write, H: Write>(
     reopen(options, paths, out)
 }
 
+/// `display-save`: rebuilds the project's display layer under its finest level and saves it.
+///
+/// The project then opens with its layer, so the app, the pen probe and render measurements on
+/// the benchmark project skip a minute's rebuild.
+///
+/// It writes into the project, so the project must be named ([`crate::cli::Command::parse`]
+/// refuses the bench's default, the benchmark sphere `perf` measures as it is): make a reflinked
+/// copy and pass it.
+///
+/// # Errors
+///
+/// If the open, the rebuild, the save or the close fails.
+pub(crate) fn run_save<J: Write, H: Write>(
+    options: &Options,
+    paths: &Paths,
+    out: &mut Output<J, H>,
+) -> Result<()> {
+    let finest = session::level(options)?;
+    let before = std::fs::metadata(&paths.project)?.len();
+    let mut project = session::open(options, paths)?;
+    rebuild(project.store(), finest, out)?;
+    let outcome = project.save().context("saving the display layer")?;
+    project.close(false).context("closing the project")?;
+    let after = std::fs::metadata(&paths.project)?.len();
+    out.say(&format!(
+        "display-save: saved {} ({before} to {after} bytes): {outcome:?}",
+        paths.project.display()
+    ))?;
+    Ok(())
+}
+
 /// How many times each way [`reopen`] opens the project.
 const OPENS: usize = 3;
 

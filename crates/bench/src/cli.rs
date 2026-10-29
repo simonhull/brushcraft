@@ -29,6 +29,8 @@ subcommands:
              with --full the benchmark project), compared with the history's baseline
   display    the display layer kept: rebuilt level by level, saved (file growth), then the
              brush stroke with its refresh after each step (saves into the project)
+  display-save  the display layer rebuilt and saved, nothing else: a project that opens with
+             its layer (saves into the project, so --project must be given)
   display-study  every display-tile encoding measured on sampled faces: file growth, the
              error bound, decode cost and seam exactness (reads the project, saves nothing;
              needs the display-study feature)
@@ -88,11 +90,13 @@ pub(crate) enum Subcommand {
     DisplayStudy,
     /// The display layer's costs.
     Display,
+    /// Rebuild the display layer and save it.
+    DisplaySave,
 }
 
 impl Subcommand {
     /// Every subcommand.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Generate,
         Self::PageIn,
         Self::Brush,
@@ -101,6 +105,7 @@ impl Subcommand {
         Self::Perf,
         Self::DisplayStudy,
         Self::Display,
+        Self::DisplaySave,
     ];
 
     /// The subcommand's name on the command line and in the JSON records.
@@ -114,6 +119,7 @@ impl Subcommand {
             Self::Perf => "perf",
             Self::DisplayStudy => "display-study",
             Self::Display => "display",
+            Self::DisplaySave => "display-save",
         }
     }
 
@@ -129,7 +135,8 @@ impl Subcommand {
             | Self::Save
             | Self::Perf
             | Self::DisplayStudy
-            | Self::Display => 2048,
+            | Self::Display
+            | Self::DisplaySave => 2048,
             Self::PageIn => 4096,
             Self::Budget => 1024,
         }
@@ -147,7 +154,10 @@ impl Subcommand {
             BudgetMib | Seed => self != Self::Perf,
             Splits | Levels | Amplitude | Force => self == Self::Generate,
             Level => !matches!(self, Self::Generate | Self::Perf),
-            Footprint => !matches!(self, Self::Generate | Self::Perf | Self::DisplayStudy),
+            Footprint => !matches!(
+                self,
+                Self::Generate | Self::Perf | Self::DisplayStudy | Self::DisplaySave
+            ),
             History | Baseline | Full | Tiny | NoStages | SettleSecs => self == Self::Perf,
             Samples => matches!(self, Self::PageIn | Self::DisplayStudy),
             RegionQuads | Pool => self == Self::PageIn,
@@ -440,7 +450,7 @@ impl Options {
             projects: Projects::Medium,
             stages: true,
             settle_secs: 300,
-            display: if subcommand == Subcommand::Display {
+            display: if matches!(subcommand, Subcommand::Display | Subcommand::DisplaySave) {
                 DisplayLayer::Kept
             } else {
                 DisplayLayer::Off
@@ -582,7 +592,8 @@ impl Command {
     /// # Errors
     ///
     /// On a missing or unknown subcommand, an unknown flag or one the subcommand doesn't take,
-    /// a flag without its value, a value that doesn't parse, or a stray argument.
+    /// a flag without its value, a value that doesn't parse, a stray argument, or
+    /// `display-save` without `--project`.
     pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut args = args.into_iter();
         let first = args.next().ok_or_else(|| anyhow!("no subcommand"))?;
@@ -618,6 +629,13 @@ impl Command {
             };
             options.set(flag, value.as_deref())?;
         }
+        // It writes into the project, and the default is the benchmark sphere `perf` measures
+        // as it is.
+        ensure!(
+            subcommand != Subcommand::DisplaySave || options.project.is_some(),
+            "display-save writes into the project: name it with --project (a reflinked copy of \
+             the benchmark project, never the one perf measures)"
+        );
         Ok(Self {
             subcommand,
             options,
@@ -740,6 +758,11 @@ mod tests {
             ("perf --full --tiny", "a full and a tiny project"),
             ("perf --history", "a history without its directory"),
             ("perf --settle-secs x", "a wait that doesn't parse"),
+            ("display-save", "display-save on the default project"),
+            (
+                "display-save --project /tmp/x.bcrf --steps 3",
+                "steps for display-save, which doesn't brush",
+            ),
         ] {
             assert!(parse(args).is_err(), "{what}: {args:?}");
         }

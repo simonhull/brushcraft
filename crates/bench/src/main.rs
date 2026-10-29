@@ -71,6 +71,7 @@ fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<
         Subcommand::Budget => budget::run(options, &paths, out),
         Subcommand::Perf => return perf::run(options, &paths, out),
         Subcommand::Display => display_layer::run(options, &paths, out),
+        Subcommand::DisplaySave => display_layer::run_save(options, &paths, out),
         #[cfg(feature = "display-study")]
         Subcommand::DisplayStudy => display_study::run(options, &paths, out),
         #[cfg(not(feature = "display-study"))]

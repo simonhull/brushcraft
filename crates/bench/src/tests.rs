@@ -375,6 +375,42 @@ fn budget_walks_and_samples_rss() {
 }
 
 #[test]
+fn display_save_leaves_a_project_that_opens_with_its_layer() {
+    let dir = TempDir::new();
+    generate(&dir);
+    let before = std::fs::metadata(dir.project()).unwrap().len();
+    let command = Command::parse(
+        ["display-save", "--level", "6", "--project"]
+            .map(OsString::from)
+            .into_iter()
+            .chain([dir.project().into_os_string()]),
+    )
+    .unwrap();
+    let paths = Paths::resolve(Some(&dir.project())).unwrap();
+    // Without a saved layer, opening it keeping one queues the rebuild.
+    let mut bare = session::open(&command.options, &paths).unwrap();
+    assert!(
+        bare.store().has_jobs(),
+        "a project without its layer rebuilds it"
+    );
+    bare.close(false).unwrap();
+    let printed = run_on(&dir.project(), "display-save --level 6").unwrap();
+    assert!(
+        printed.human.contains("display-save: saved"),
+        "{}",
+        printed.human
+    );
+    assert!(
+        std::fs::metadata(dir.project()).unwrap().len() > before,
+        "the layer was saved into the project"
+    );
+    // Opened keeping the layer, the store finds it whole: nothing to rebuild.
+    let mut saved = session::open(&command.options, &paths).unwrap();
+    assert!(!saved.store().has_jobs(), "the layer opens whole");
+    saved.close(false).unwrap();
+}
+
+#[test]
 fn a_missing_project_is_reported() {
     let dir = TempDir::new();
     let err = run_on(&dir.project(), "brush --level 6").err().unwrap();
