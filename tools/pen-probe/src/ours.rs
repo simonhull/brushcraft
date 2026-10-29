@@ -55,7 +55,9 @@ mod linux {
             // should it not run, `App` declares `backend` before `surface`, so the backend drops
             // (joining its thread) before the window. What remains is winit destroying surfaces of
             // its own, such as fallback decoration subsurfaces, as a pen enters them: the residual
-            // race `spawn`'s `# Safety` section describes, accepted for a diagnostic tool.
+            // race `spawn`'s `# Safety` section describes, accepted for a diagnostic tool. The
+            // window asks for no decorations (main.rs), which leaves winit fewer such surfaces,
+            // but nothing here relies on it.
             let backend = unsafe {
                 PenBackend::spawn(event_loop.owned_display_handle(), move || proxy.wake_up())
             }?;

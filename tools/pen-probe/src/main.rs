@@ -983,7 +983,11 @@ impl ApplicationHandler for App {
 
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         let result = (|| -> Result<()> {
-            let attributes = WindowAttributes::default().with_title("pen-probe");
+            // Undecorated, as the app's window will be, so our backend is measured the way the
+            // app runs it.
+            let attributes = WindowAttributes::default()
+                .with_title("pen-probe")
+                .with_decorations(false);
             let window = event_loop.create_window(attributes)?;
             let context = Context::new(event_loop.owned_display_handle())
                 .map_err(|e| anyhow!("creating the softbuffer context: {e}"))?;
