@@ -913,11 +913,18 @@ mod tests {
     }
 
     /// A prepared copy is a reflink of the source with its display layer saved, in the work
-    /// directory; the source is untouched. Skipped where the temporary directory can't reflink
-    /// (tmpfs, ext4).
+    /// directory; the source is untouched.
+    ///
+    /// The source is a tiny generated project in a scratch directory under the cache root
+    /// ([`cache_root`]), where the benchmark projects live and the load reflinks: unlike the
+    /// temporary directory (often tmpfs), that file system has to reflink for `--load` to work.
+    /// If it can't, the test fails saying so, except under CI (`CI` set), whose runners' disks
+    /// can't reflink, where it says it didn't run.
     #[test]
     fn prepare_works_on_a_reflinked_copy() {
-        let scratch = Scratch::new("prepare");
+        let root = cache_root().expect("a cache directory");
+        std::fs::create_dir_all(&root).expect("the cache directory");
+        let scratch = Scratch::under(&root, "prepare");
         let source = scratch.0.join("source.bcrf");
         let level = Level::new(4).expect("a level");
         let mut project = Project::new(
@@ -940,7 +947,11 @@ mod tests {
                 assert_eq!(std::fs::read(&source).expect("read"), before, "untouched");
             }
             Err(e) if e.to_string().contains("can't be reflinked") => {
-                eprintln!("skipped: {e}");
+                assert!(
+                    std::env::var_os("CI").is_some(),
+                    "the cache directory can't reflink, so --load can't run here: {e}"
+                );
+                eprintln!("NOT RUN: the CI runner's cache directory can't reflink: {e}");
             }
             Err(e) => panic!("{e:#}"),
         }
