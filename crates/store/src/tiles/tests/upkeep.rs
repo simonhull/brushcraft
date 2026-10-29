@@ -373,7 +373,8 @@ fn a_dab_makes_the_cones_it_reaches_cover_everything_until_the_refresh() {
         "the dab reaches a tile at every display level"
     );
     let drawn = store.display_for_draw(&bumped).unwrap();
-    for (k, tile) in bumped.iter().zip(&drawn) {
+    let pairs = bumped.iter().zip(&drawn);
+    for (k, tile) in pairs {
         let tile = tile
             .as_ref()
             .unwrap_or_else(|| panic!("{k:?}: drawn bumped"));

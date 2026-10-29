@@ -149,7 +149,8 @@ fn holding_holds_each_cone_in_any_order() {
             .map(|g| NormalCone::covering(g).unwrap())
             .collect();
         let union = NormalCone::holding(&cones).unwrap();
-        for (cone, group) in cones.iter().zip(&groups) {
+        let pairs = cones.iter().zip(&groups);
+        for (cone, group) in pairs {
             assert!(union.holds(*cone), "case {case}: {cone:?} in {union:?}");
             for &normal in group {
                 assert!(

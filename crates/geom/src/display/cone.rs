@@ -15,10 +15,14 @@
 //! themselves (`angle(axis, n)` for a normal, `angle(axis, child's axis) + child's half-angle`
 //! for a child, which holds everything the child holds by the triangle inequality on the
 //! sphere), each angle raised by [`SLACK`] unless it is exactly 0, and rounded **up** to its
-//! stored step. So whatever the axis's
-//! quantization error, the stored cone holds its inputs, and the chosen axis only decides how
-//! tight it is. A half-angle that reaches 180° (or past) is stored as the cone that covers
-//! everything.
+//! stored step. So whatever the axis's quantization error, the stored cone holds its inputs, and
+//! the chosen axis only decides how tight it is. A half-angle that reaches 180° (or past) is
+//! stored as the cone that covers everything.
+//!
+//! The chaining costs width: a parent's cone holds its children's whole cones, not just the
+//! normals in them, so it is wider than the least cone of those normals (on the display tests'
+//! smooth sphere, about 6° wider than the exact cone around the same axis, where four children
+//! of 30.6° meet).
 //!
 //! # Stored
 //!
@@ -37,7 +41,7 @@ use crate::Vec3;
 /// Bits per octahedral component of the axis.
 ///
 /// A cone grows, at each level, by up to the axis's quantization error (its half-angle is
-/// measured from the decoded axis: at most 1.3° at 8 bits, 0.33° at 10, 0.085° at 12) and by up
+/// measured from the decoded axis: under 1.3° at 8 bits, 0.33° at 10, 0.085° at 12) and by up
 /// to one half-angle step (it is rounded up: 0.003° at 16 bits, 0.044° at 12, 0.71° at 8), and
 /// the levels add these up. Of the splits of the 32 bits, 10 + 12 gives the tightest cones on
 /// the display tests' fixtures (`cone_widths`): the smooth sphere's cones one level below the
