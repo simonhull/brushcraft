@@ -10,7 +10,8 @@
 //! 2. it prepares the load's project once: a reflinked copy of the benchmark project, beside it,
 //!    with its display layer built and saved ([`load::prepare`]), so neither run rebuilds it;
 //! 3. it runs winit's recording, then ours, each with the load and the guided script
-//!    ([`crate::script`]): `winit.csv` and `ours.csv`, each with its `-load.csv`;
+//!    ([`crate::script`]): `winit.csv` and `ours.csv`, each with its `-load.csv`. Those an earlier
+//!    run left in the directory are removed first, so a failed child can't be reported from them;
 //! 4. it prints each run's summary and the comparison ([`report::compare`]), and writes them to
 //!    `report.txt` beside the CSVs;
 //! 5. the prepared copy goes with its work directory; the CSVs stay.
@@ -26,7 +27,7 @@ use geom::Level;
 
 use crate::load::{self, WorkDir};
 use crate::script::Step;
-use crate::{Source, report, say};
+use crate::{Source, frames, report, say};
 
 /// The default scratch directory for a run's CSVs.
 ///
@@ -54,6 +55,23 @@ fn wait_for_enter() -> Result<()> {
         .lock()
         .read_line(&mut String::new())
         .context("reading standard input")?;
+    Ok(())
+}
+
+/// Removes what an earlier run left at `csv` and its load CSV, so a child that fails before
+/// writing can't be reported from it.
+///
+/// # Errors
+///
+/// If one exists and can't be removed.
+fn remove_stale(csv: &Path) -> Result<()> {
+    for path in [csv.to_path_buf(), frames::path_for(csv)] {
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e).with_context(|| format!("removing the stale {}", path.display()));
+        }
+    }
     Ok(())
 }
 
@@ -99,6 +117,7 @@ pub(crate) fn run(project: &Path, level: Level, out: Option<PathBuf>) -> Result<
             }
         ));
         wait_for_enter()?;
+        remove_stale(&csv)?;
         let status = Command::new(&exe)
             .arg("--source")
             .arg(source.name())
@@ -140,4 +159,37 @@ pub(crate) fn run(project: &Path, level: Level, out: Option<PathBuf>) -> Result<
     std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
     say(format_args!("\n{text}report: {}", path.display()));
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "test functions are documented by their names; panicking is how they fail"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_csv_and_its_load_csv_go_before_a_run() {
+        let dir = std::env::temp_dir().join(format!(
+            "pen-probe-test-stale-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let (csv, load_csv, other) = (
+            dir.join("winit.csv"),
+            dir.join("winit-load.csv"),
+            dir.join("ours.csv"),
+        );
+        for path in [&csv, &load_csv, &other] {
+            std::fs::write(path, b"stale").expect("written");
+        }
+        remove_stale(&csv).expect("removed");
+        assert!(!csv.exists() && !load_csv.exists(), "both go");
+        assert!(other.exists(), "the other run's stays");
+        remove_stale(&csv).expect("nothing to remove is fine");
+        std::fs::remove_dir_all(&dir).expect("cleaned up");
+    }
 }
