@@ -37,9 +37,30 @@ use super::error::CacheError;
 use super::read_ahead::Held;
 use crate::bounds::{Book, Derived as _, Kept};
 use crate::display::{Display, DisplayRecord, StoredDisplay};
-use crate::file::{BaseFile, FileError, FramedDisplay, ProjectFile, display_record, frame_display};
+use crate::file::{
+    BaseFile, FileError, FramedDisplay, ProjectFile, display_record, frame_display,
+    unknown_display_len,
+};
 use crate::meta::Role;
 use crate::stamp::Stamp;
+
+/// Whether the display layer the files hold can be trusted, as [`TileStore::load_floor`] finds
+/// its floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Floor {
+    /// Every floor record the files hold reads, built from the store's finest level (or there
+    /// are none): the layer's records are taken as they are, and the missing ones built.
+    Current,
+    /// A floor record is an intact record of another version, which this build doesn't read
+    /// (every file written before the records held normal cones has them). The layer's other
+    /// records are likely of that version too, and the jobs, telling known records by their
+    /// length alone, would take them as built: the layer is rebuilt whole. (A damaged record is
+    /// its own tile's alone: it is found unknown when read, and built.)
+    Outdated,
+    /// A floor record was built from another finest level: a layer built for another surface,
+    /// which is rebuilt whole.
+    Foreign,
+}
 
 impl TileStore {
     /// [`TileStore::record_built`], then [`TileStore::write_through_display`], as a job's slice
@@ -132,15 +153,15 @@ impl TileStore {
     }
 
     /// Loads the floor: every face's display tiles up to the floor's top level the files hold.
-    /// Returns whether a record the files hold was built from another finest level than the
-    /// store's: a layer built for another surface, which is then rebuilt whole.
+    /// Returns whether the layer the files hold can be trusted ([`Floor`]): one built for
+    /// another surface, or one holding records this build doesn't read, is rebuilt whole.
     ///
     /// # Errors
     ///
     /// [`CacheError::Store`] if a record can't be read.
-    pub(super) fn load_floor(&mut self) -> Result<bool, CacheError> {
+    pub(super) fn load_floor(&mut self) -> Result<Floor, CacheError> {
         let Some(finest) = self.display_finest else {
-            return Ok(false);
+            return Ok(Floor::Current);
         };
         let top = self.floor_top.get().min(finest.get().saturating_sub(1));
         let mut keys = Vec::new();
@@ -164,18 +185,39 @@ impl TileStore {
         let (file, base) = (&self.file, self.base.as_ref());
         let records = self.workers.install(|| {
             keys.par_iter()
-                .map(|key| Ok(read_display(file, base, key)?.map(|record| (*key, record))))
+                .map(|key| Ok((*key, read_display(file, base, key)?)))
                 .collect::<Result<Vec<_>, CacheError>>()
         })?;
-        let mut foreign = false;
-        for (key, record) in records.into_iter().flatten() {
-            if record.finest == finest {
-                self.floor.insert(key, record);
-            } else {
-                foreign = true;
+        let mut state = Floor::Current;
+        let unknown_len = unknown_display_len();
+        for (key, record) in records {
+            match record {
+                Some(record) if record.finest == finest => {
+                    self.floor.insert(key, record);
+                }
+                Some(_) => state = Floor::Foreign,
+                // Unknown, or a record that doesn't read. One whose length says known is read
+                // again (a few, on an open): intact but of another version, the layer's other
+                // records are likely of it too, and the jobs, telling known records by their
+                // length alone, would count them built. A damaged one is that tile's alone.
+                None => {
+                    let in_file = file.locate(&key);
+                    let located = in_file.or_else(|| base.and_then(|b| b.locate(&key)));
+                    if located.is_none_or(|loc| Some(loc.len()) == unknown_len) {
+                        continue;
+                    }
+                    let outdated = match (in_file, base) {
+                        (Some(_), _) => file.display_outdated(&key)?,
+                        (None, Some(base)) => base.display_outdated(&key)?,
+                        (None, None) => false,
+                    };
+                    if outdated {
+                        state = state.max(Floor::Outdated);
+                    }
+                }
             }
         }
-        Ok(foreign)
+        Ok(state)
     }
 
     /// The level the store's display layer is built from (its display tiles sit at the levels

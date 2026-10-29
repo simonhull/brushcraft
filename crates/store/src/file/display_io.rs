@@ -10,8 +10,8 @@ use super::format::{tile_payload, tile_record};
 use super::{FileError, Loc, Name, ProjectFile};
 use crate::codec::{compress, decompress};
 use crate::display::{
-    DISPLAY_OP, DisplayRecord, StoredDisplay, display_body, display_header, is_display, max_body,
-    parse_display,
+    DISPLAY_OP, DisplayRecord, StoredDisplay, display_body, display_header, is_current_version,
+    is_display, max_body, parse_display,
 };
 use crate::record::{KIND_TILE, frame};
 use crate::stamp::Stamp;
@@ -65,6 +65,24 @@ pub(crate) fn display_record(raw: &[u8], key: &TileKey) -> Option<StoredDisplay>
 }
 
 impl ProjectFile {
+    /// Appends `raw` as `key`'s latest display record, as it is, whatever it holds: for tests
+    /// planting records an older build wrote ([`ProjectFile::append_display_copy`] writes an
+    /// unknown one in place of one that doesn't read).
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::append_display_copy`].
+    #[cfg(test)]
+    pub(crate) fn append_display_raw(
+        &mut self,
+        key: &TileKey,
+        raw: &[u8],
+    ) -> Result<(), FileError> {
+        let loc = self.append_record(raw)?;
+        self.note(Name::Tile(*key), None, Stamp::ZERO, loc);
+        Ok(())
+    }
+
     /// `key`'s display tile as its latest record holds it: `None` if it has no record, else the
     /// record, unknown if it says so or doesn't read (a display tile is derived, so damage only
     /// means it is rebuilt).
@@ -88,6 +106,23 @@ impl ProjectFile {
     /// The display tiles the file holds a record of, in key order.
     pub(crate) fn display_keys(&self) -> impl Iterator<Item = &TileKey> {
         self.keys().filter(|key| is_display(key))
+    }
+
+    /// Whether `key`'s latest record is an intact display record of another version than this
+    /// build's ([`is_outdated`]); `false` if there is none, or it is damaged.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Io`].
+    pub(crate) fn display_outdated(&self, key: &TileKey) -> Result<bool, FileError> {
+        let Some(Loc { offset, len }) = self.live.get(&Name::Tile(*key)).copied() else {
+            return Ok(false);
+        };
+        match self.read_record(offset, len) {
+            Ok(raw) => Ok(is_outdated(&raw, key)),
+            Err(FileError::Damaged { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Appends a display record for each of `tiles` (`None`: unknown), in order, framed into one
@@ -202,6 +237,52 @@ impl BaseFile {
     pub(crate) fn display_keys(&self) -> impl Iterator<Item = &TileKey> {
         self.keys().filter(|key| is_display(key))
     }
+
+    /// Whether `key`'s record is an intact display record of another version: as
+    /// [`ProjectFile::display_outdated`].
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Closed`] once the project file is dropped; [`FileError::Io`].
+    pub(crate) fn display_outdated(&self, key: &TileKey) -> Result<bool, FileError> {
+        let Some(loc) = self.locate(key) else {
+            return Ok(false);
+        };
+        match self.reader.read_record(loc) {
+            Ok(raw) => Ok(is_outdated(&raw, key)),
+            Err(FileError::Damaged { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Whether `raw`, a record that verified, is a tile record of `key` whose display header is of
+/// another version than this build's: written by another build, intact, and unread here.
+fn is_outdated(raw: &[u8], key: &TileKey) -> bool {
+    tile_record(raw, key).is_some_and(|tile| !is_current_version(tile.header))
+}
+
+/// `key`'s display record as version 2 wrote it, framed: the finest level and the bound of
+/// `record` (known) or nothing (unknown), no normal cone. For tests of how a file from before
+/// the cones reads.
+///
+/// # Panics
+///
+/// Never: a display record of a tile [`max_body`] holds always frames.
+#[cfg(test)]
+pub(crate) fn version_2_record(key: TileKey, record: Option<&DisplayRecord>) -> Vec<u8> {
+    let (header, body): (Vec<u8>, &[u8]) = match record {
+        Some(record) => {
+            let mut header = vec![2, 1, record.finest.get()];
+            header.extend_from_slice(&record.error.to_le_bytes());
+            (header, &record.encoded)
+        }
+        None => (vec![2, 0], &[]),
+    };
+    let packed = compress(body).expect("a display body compresses");
+    let payload =
+        tile_payload(key, DISPLAY_OP, &header, body.len(), &packed).expect("a display payload");
+    frame(KIND_TILE, &payload).expect("a display record frames")
 }
 
 /// The length of an unknown display record, framing included.

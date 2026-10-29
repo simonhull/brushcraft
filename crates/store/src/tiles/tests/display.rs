@@ -306,6 +306,52 @@ fn a_layer_built_from_another_finest_level_is_unknown_and_rebuilt() {
     }
 }
 
+/// A file whose display layer an older build wrote is rebuilt whole on open.
+///
+/// The layer is version 2, from before the normal cones: the floor and the finer levels alike
+/// are queued, and the rebuild gives the layer built from scratch.
+///
+/// Its records' lengths say they are known, so without the floor's check nothing would be
+/// queued and the store would keep no floor.
+#[test]
+fn a_layer_an_older_version_wrote_is_rebuilt_whole() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let layer = saved_layer(&dir, "work.bcp", &mesh, 67);
+    let mut file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let keys: Vec<TileKey> = file.display_keys().copied().collect();
+    assert_eq!(keys.len(), layer.len(), "the file holds the whole layer");
+    for key in &keys {
+        let record = file.read_display(key).unwrap().unwrap().known().unwrap();
+        let old = crate::file::version_2_record(*key, Some(&record));
+        file.append_display_raw(key, &old).unwrap();
+        assert_eq!(
+            file.read_display(key).unwrap(),
+            Some(crate::display::StoredDisplay::Unknown),
+            "{key:?}: unread"
+        );
+    }
+    file.save().unwrap();
+    drop(file);
+    let reopened = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let mut store = TileStore::open(reopened, roomy().with_display(level(TOP))).unwrap();
+    assert!(store.has_jobs(), "the layer is queued for a rebuild");
+    let mut calls = 0;
+    while store.has_jobs() {
+        store
+            .run_jobs(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        calls += 1;
+        assert!(calls < 1000, "the jobs end");
+    }
+    let layer_keys: Vec<TileKey> = layer.iter().map(|t| *t.key()).collect();
+    let stored = store.stored_display(&layer_keys).unwrap();
+    let pairs = layer.iter().zip(stored);
+    for (tile, kept) in pairs {
+        assert_eq!(kept.as_ref(), Some(tile), "{:?} rebuilt", tile.key());
+    }
+}
+
 /// A damaged display record, or one built from another finest level, among the store's own is
 /// rebuilt.
 ///

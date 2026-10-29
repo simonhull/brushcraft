@@ -491,29 +491,23 @@ fn a_version_2_display_record_reads_as_unknown() {
     let mut known = vec![2, 1, SMALL_FINEST.get()];
     known.extend_from_slice(&record.error.to_le_bytes());
     let unknown = vec![2, 0];
-    let cases = [(known, record.encoded.as_slice()), (unknown, &[][..])];
-    for (header, body) in cases {
+    let cases = [
+        (known, record.encoded.as_slice(), Some(&record)),
+        (unknown, &[][..], None),
+    ];
+    for (header, body, held) in cases {
         assert_eq!(
             parse_display(tile.key(), &header, body),
             None,
             "{header:?}: not a header this build reads"
         );
-        let packed = compress(body).unwrap();
-        let payload = tile_payload(
-            *tile.key(),
-            crate::display::DISPLAY_OP,
-            &header,
-            body.len(),
-            &packed,
-        )
-        .unwrap();
-        let raw = frame(KIND_TILE, &payload).unwrap();
+        let raw = version_2_record(*tile.key(), held);
         assert_eq!(display_record(&raw, tile.key()), None, "{header:?}");
         // As a file holds it: read back as unknown, not as a missing record.
         let dir = TestDir::new();
         let mut file =
             ProjectFile::create(&dir.path("old.bcp"), fixture::meta(), fixture::mesh()).unwrap();
-        file.append_display_copy(tile.key(), &raw).unwrap();
+        file.append_display_raw(tile.key(), &raw).unwrap();
         assert_eq!(
             file.read_display(tile.key()).unwrap(),
             Some(StoredDisplay::Unknown),

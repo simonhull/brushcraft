@@ -190,15 +190,17 @@ impl TileStore {
             #[cfg(test)]
             hooks: TestHooks::default(),
         };
-        if store.load_floor()? {
-            // A layer built for another surface: none of it is trusted. Every tile is made
-            // unknown, so no job takes a record the files hold for one it doesn't need to build.
-            if let Some(finest) = store.display_finest {
-                store.forget_foreign_display(finest);
-                store.queue_display_rebuild(finest);
+        match store.load_floor()? {
+            super::display::Floor::Current => store.queue_missing_display(),
+            super::display::Floor::Outdated | super::display::Floor::Foreign => {
+                // A layer built for another surface, or holding records this build doesn't
+                // read: none of it is trusted. Every tile is made unknown, so no job takes a
+                // record the files hold for one it doesn't need to build.
+                if let Some(finest) = store.display_finest {
+                    store.forget_foreign_display(finest);
+                    store.queue_display_rebuild(finest);
+                }
             }
-        } else {
-            store.queue_missing_display();
         }
         Ok(store)
     }

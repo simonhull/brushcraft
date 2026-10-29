@@ -163,6 +163,12 @@ pub(crate) fn parse_display(key: &TileKey, header: &[u8], body: &[u8]) -> Option
     }
 }
 
+/// Whether a display record's `header` is of the version this build writes: one that isn't
+/// (an older build's) reads as unknown however intact it is.
+pub(crate) fn is_current_version(header: &[u8]) -> bool {
+    header.first() == Some(&VERSION)
+}
+
 /// Whether `key` names a display tile: the base layer's display channel.
 pub(crate) fn is_display(key: &TileKey) -> bool {
     key.layer() == LayerId::BASE && key.channel() == Channel::DISPLAY
