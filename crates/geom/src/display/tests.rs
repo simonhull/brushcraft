@@ -1088,7 +1088,7 @@ fn a_tile_built_alone_is_the_tile_built_with_its_mesh() {
                         .get(2 * region.x0() + i, 2 * region.y0() + j)
                         .unwrap()
                 });
-                (0.0, NormalCone::covering(under.as_slice()).unwrap())
+                (0.0, FinestNormalCone::covering(under.as_slice()).unwrap())
             } else {
                 let ratio = finer_level.tiles_per_side() / level(l).tiles_per_side();
                 // Handed over in reverse, as a store might gather them: the order doesn't
@@ -1101,10 +1101,10 @@ fn a_tile_built_alone_is_the_tile_built_with_its_mesh() {
                         by_key[&TileKey::display(key.face(), finer_level, tx, ty).unwrap()]
                     })
                     .collect();
-                let cones: Vec<NormalCone> = under.iter().map(|t| t.cone()).collect();
+                let cones: Vec<FinestNormalCone> = under.iter().map(|t| t.cone()).collect();
                 (
                     under.iter().map(|t| t.error()).fold(0.0, f32::max),
-                    NormalCone::holding(&cones).unwrap(),
+                    FinestNormalCone::holding(&cones).unwrap(),
                 )
             };
             let means = mip_normals_tile(&sculpt.mesh, &finer_means, &key).unwrap();
@@ -1261,14 +1261,122 @@ fn quantile(values: &[f64], q: f64) -> f64 {
     values[rank.min(last)]
 }
 
+/// The finest level of the deep cone fixture ([`deep_normals`]): its level 9 has 8×8 tiles a
+/// face, so levels 8, 7 and 6 each take the union of several children's cones, unions of unions.
+const DEEP_FINEST: u8 = 10;
+
+/// One face's unit normals at [`DEEP_FINEST`], made up rather than evaluated.
+///
+/// A whole mesh that deep is slow to build. These are a curved face's, as a cube face's projected
+/// onto a sphere, with bumps at a few scales and per-vertex noise of length `rough`, from `seed`.
+fn deep_normals(seed: u64, rough: f32) -> Grid {
+    let side = level(DEEP_FINEST).face_quads() + 1;
+    let step = 2.0 / f32::from(u16::try_from(side - 1).unwrap());
+    let mut rng = Rng::new(seed);
+    let data = (0..side)
+        .flat_map(|j| (0..side).map(move |i| (i, j)))
+        .map(|(i, j)| {
+            let u = -1.0 + f32::from(u16::try_from(i).unwrap()) * step;
+            let v = -1.0 + f32::from(u16::try_from(j).unwrap()) * step;
+            let bump = 0.2 * (13.0 * u).sin() * (9.0 * v).cos() + 0.05 * (70.0 * (u + v)).sin();
+            let n = Vec3::new(u + bump, v - bump, 1.0) + rng.vec3(rough);
+            n.normalized().unwrap()
+        })
+        .collect();
+    Grid::new(side, data).unwrap()
+}
+
+/// Cones chain through unions of unions without losing a finest normal.
+///
+/// The cones [`build_cones`] gives a face deeper than the meshes' fixtures hold every finest
+/// normal under each tile, and each parent holds its children's, through three levels of unions:
+/// on a smooth face and on a rough one.
+#[test]
+fn deep_cones_chain_through_unions_of_unions() {
+    let finest = level(DEEP_FINEST);
+    let face = FaceId::new(0);
+    for (seed, rough) in [(1_u64, 0.0_f32), (2, 0.3)] {
+        let normals = deep_normals(seed, rough);
+        let cones = build_cones(face, &normals, finest).unwrap();
+        let mut merging_levels = 0;
+        for l in 0..DEEP_FINEST {
+            let at = level(l);
+            let per_side = u16::try_from(at.tiles_per_side()).unwrap();
+            let keys: Vec<TileKey> = (0..per_side)
+                .flat_map(|ty| (0..per_side).map(move |tx| (tx, ty)))
+                .map(|(tx, ty)| TileKey::display(face, at, tx, ty).unwrap())
+                .collect();
+            for key in &keys {
+                let cone = cones.cone(key).unwrap();
+                let region = Region::of_tile(key);
+                let shift = u32::from(DEEP_FINEST - l);
+                let side = (region.quads() << shift) + 1;
+                let (x0, y0) = (region.x0() << shift, region.y0() << shift);
+                let under = (0..side).flat_map(|j| (0..side).map(move |i| (x0 + i, y0 + j)));
+                for (i, j) in under {
+                    let n = normals.get(i, j).unwrap();
+                    assert!(
+                        cone.contains(n),
+                        "rough {rough}, {key:?}: {n:?} outside {cone:?}"
+                    );
+                }
+            }
+            let Some(finer) = at.child().filter(|f| *f < finest) else {
+                continue;
+            };
+            let ratio = finer.tiles_per_side() / at.tiles_per_side();
+            merging_levels += usize::from(ratio > 1);
+            for key in &keys {
+                let cone = cones.cone(key).unwrap();
+                let children = (0..ratio * ratio).map(|n| {
+                    let tx = u16::try_from(u32::from(key.tx()) * ratio + n % ratio).unwrap();
+                    let ty = u16::try_from(u32::from(key.ty()) * ratio + n / ratio).unwrap();
+                    cones
+                        .cone(&TileKey::display(face, finer, tx, ty).unwrap())
+                        .unwrap()
+                });
+                for child in children {
+                    assert!(
+                        cone.holds(child),
+                        "rough {rough}, {key:?}: {child:?} in {cone:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(merging_levels, 3, "levels 8, 7 and 6 take unions");
+    }
+}
+
 /// Prints the median and 99th percentile half-angle of the cones at each level, and of how far
 /// they lie over the exact cone around the same axis.
 ///
-/// On the smooth sphere and the random sculpts: `cargo nextest run -p geom --run-ignored only
-/// cone_widths --no-capture`.
+/// On the smooth sphere and the random sculpts, then the half-angles alone on the deep smooth
+/// and rough faces: `cargo nextest run -p geom --run-ignored only cone_widths --no-capture`.
 #[test]
 #[ignore = "a measurement to read, not a check"]
 fn cone_widths() {
+    let face = FaceId::new(0);
+    for (seed, rough) in [(1_u64, 0.0_f32), (2, 0.3)] {
+        let cones = build_cones(face, &deep_normals(seed, rough), level(DEEP_FINEST)).unwrap();
+        println!("deep face, rough {rough}: level, median / p99 half-angle °");
+        for l in 0..DEEP_FINEST {
+            let per_side = u16::try_from(level(l).tiles_per_side()).unwrap();
+            let mut halves: Vec<f64> = (0..per_side)
+                .flat_map(|ty| (0..per_side).map(move |tx| (tx, ty)))
+                .map(|(tx, ty)| {
+                    let key = TileKey::display(face, level(l), tx, ty).unwrap();
+                    f64::from(cones.cone(&key).unwrap().half_angle().to_degrees())
+                })
+                .collect();
+            halves.sort_by(f64::total_cmp);
+            println!(
+                "  {l}: {:7.3} / {:7.3}   ({} tiles)",
+                quantile(&halves, 0.5),
+                quantile(&halves, 0.99),
+                halves.len()
+            );
+        }
+    }
     for (name, sculpt) in cone_sculpts() {
         let (tiles, normals) = built(&sculpt);
         let mut by_level: BTreeMap<u8, (Vec<f64>, Vec<f64>)> = BTreeMap::new();

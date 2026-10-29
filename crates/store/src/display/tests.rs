@@ -6,7 +6,7 @@ use super::*;
 /// A display record header round-trips its state, finest level, bound and cone.
 #[test]
 fn headers_hold_the_state_the_finest_level_the_bound_and_the_cone() {
-    let cone = NormalCone::from_bits(0x1234_5678);
+    let cone = FinestNormalCone::from_bits(0x1234_5678);
     let record = DisplayRecord {
         error: 0.25,
         cone,
@@ -23,7 +23,7 @@ fn headers_hold_the_state_the_finest_level_the_bound_and_the_cone() {
         "the bound"
     );
     assert_eq!(
-        NormalCone::from_bits(u32::from_le_bytes(known[7..].try_into().unwrap())),
+        FinestNormalCone::from_bits(u32::from_le_bytes(known[7..].try_into().unwrap())),
         cone,
         "the cone"
     );

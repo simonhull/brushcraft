@@ -6,7 +6,7 @@
 //! the level-`l` face grid is vertex `(2i, 2j)` of level `l + 1`: the finest vertex itself one
 //! level below the finest, else the *decoded* display vertex), its **averaged normals** with a
 //! roughness term, `e`, a **true bound** on the distance from the surface it draws to every
-//! finest vertex under it, and a **normal cone** ([`NormalCone`]) holding every finest normal
+//! finest vertex under it, and a **normal cone** ([`FinestNormalCone`]) holding every finest normal
 //! under it.
 //!
 //! Subsampling the decoded level below, not the finest, lets a level be built from the stored
@@ -40,7 +40,7 @@
 //!
 //! # Normal cones
 //!
-//! Each tile's cone holds every finest normal under it, as stored (see [`NormalCone`]): one
+//! Each tile's cone holds every finest normal under it, as stored (see [`FinestNormalCone`]): one
 //! level below the finest, taken from those normals; above, the union of the cones of the
 //! tiles under it, so it chains up the levels as `e` does, and a tile's cone holds its
 //! children's. Like positions, cones need nothing from a neighbouring face ([`build_cones`]).
@@ -80,7 +80,7 @@ pub use build::{
 pub use build::{build_level_with, build_mesh_with, build_positions_with};
 #[cfg(test)]
 use build::{step_error, subsample};
-pub use cone::NormalCone;
+pub use cone::FinestNormalCone;
 #[cfg(any(test, feature = "display-study"))]
 pub use encode::{BaseOffsets, DisplayCodec, FixedPoint, Interpolating, NormalEncoding, Precision};
 // The study's codec and normal encoding, under names of their own: public, and re-exported
@@ -151,7 +151,7 @@ pub struct DisplayTile {
     /// finest vertex under it.
     error: f32,
     /// The cone holding every finest normal under the tile.
-    cone: NormalCone,
+    cone: FinestNormalCone,
     /// The encoded positions and normals ([`DisplayTile::encoded`]).
     encoded: Vec<u8>,
 }
@@ -201,10 +201,10 @@ impl DisplayTile {
         self.error
     }
 
-    /// The cone holding every finest normal under the tile, as stored (see [`NormalCone`]): the
-    /// union of its children's cones above the level below the finest, so it holds theirs.
+    /// The cone holding every finest normal under the tile, as stored (see [`FinestNormalCone`]):
+    /// the union of its children's cones above the level below the finest, so it holds theirs.
     #[must_use]
-    pub const fn cone(&self) -> NormalCone {
+    pub const fn cone(&self) -> FinestNormalCone {
         self.cone
     }
 
@@ -231,7 +231,7 @@ impl DisplayTile {
     pub fn decode(
         key: TileKey,
         error: f32,
-        cone: NormalCone,
+        cone: FinestNormalCone,
         bytes: &[u8],
     ) -> Result<Self, DisplayError> {
         decode_with(
@@ -256,7 +256,7 @@ pub fn decode_with(
     normals: Normals,
     key: TileKey,
     error: f32,
-    cone: NormalCone,
+    cone: FinestNormalCone,
     bytes: &[u8],
 ) -> Result<DisplayTile, DisplayError> {
     if key.layer() != LayerId::BASE || key.channel() != Channel::DISPLAY {

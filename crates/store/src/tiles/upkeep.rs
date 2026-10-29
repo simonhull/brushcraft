@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use geom::{
-    BaseMesh, Channel, DisplayError, DisplayTile, FaceId, Grid, LayerId, Level, NormalCone,
+    BaseMesh, Channel, DisplayError, DisplayTile, FaceId, FinestNormalCone, Grid, LayerId, Level,
     PositionSource, Region, TileKey, Vec3, build_tile, mip_normals_tile,
 };
 
@@ -314,7 +314,7 @@ fn build_from_finest(
         fine_side,
     )
     .ok_or(DisplayError::Unavailable)?;
-    let cone = NormalCone::covering(&under)?;
+    let cone = FinestNormalCone::covering(&under)?;
     let source = TileValues::new(Channel::DISPLACEMENT, &normals);
     let means = mip_normals_tile(mesh, &source, &key);
     if source.missed.get() {
@@ -348,8 +348,8 @@ fn build_from_finer(
         .map(|(_, d)| &d.tile)
         .collect();
     let bound = under.iter().map(|t| t.error()).fold(0.0_f32, f32::max);
-    let cones: Vec<NormalCone> = under.iter().map(|t| t.cone()).collect();
-    let cone = NormalCone::holding(&cones)?;
+    let cones: Vec<FinestNormalCone> = under.iter().map(|t| t.cone()).collect();
+    let cone = FinestNormalCone::holding(&cones)?;
     let positions: BTreeMap<TileKey, &[Vec3]> = tiles
         .iter()
         .map(|(k, d)| (*k, d.tile.positions()))

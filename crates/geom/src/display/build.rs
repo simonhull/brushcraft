@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use super::encode::{self, CHOSEN, CHOSEN_NORMALS, DisplayCodec, NormalEncoding, mean_of, shade};
-use super::{DisplayError, DisplayTile, NormalCone};
+use super::{DisplayError, DisplayTile, FinestNormalCone};
 use crate::eval::gather;
 use crate::subdiv::{CornerRing, Padded};
 use crate::{BaseMesh, FaceId, Grid, Level, PositionSource, Region, TileKey, Vec3};
@@ -635,8 +635,8 @@ pub fn build_positions_with(
 /// `finer` is the block under it one level finer (side `2 × (side − 1) + 1`): the finest
 /// positions there if that is the finest level, else the decoded positions of the display tiles
 /// there; the tile stores its even vertices. `children_bound` is the largest bound of those
-/// tiles (0 at the finest level); `cone` the tile's normal cone ([`NormalCone::covering`] the
-/// finest normals under it one level above the finest, else [`NormalCone::holding`] the cones
+/// tiles (0 at the finest level); `cone` the tile's normal cone ([`FinestNormalCone::covering`] the
+/// finest normals under it one level above the finest, else [`FinestNormalCone::holding`] the cones
 /// of those tiles, as [`build_cones`] chains them); `means` the tile's mean normals
 /// ([`mip_normals_tile`]).
 ///
@@ -649,7 +649,7 @@ pub fn build_tile(
     key: TileKey,
     finer: &Grid,
     children_bound: f32,
-    cone: NormalCone,
+    cone: FinestNormalCone,
     means: &MeanNormals,
 ) -> Result<DisplayTile, DisplayError> {
     if !(finer.as_slice().iter().all(|v| v.is_finite()) && children_bound.is_finite()) {
@@ -791,7 +791,7 @@ fn level_tiles(
         write_tile(&mut decoded_means, &mut written, tile.key, &decoded)?;
         let cone = match cones {
             Some(cones) => cones.cone(&tile.key).ok_or(DisplayError::Shape)?,
-            None => NormalCone::EVERYTHING,
+            None => FinestNormalCone::EVERYTHING,
         };
         tiles.push(DisplayTile {
             key: tile.key,
@@ -932,7 +932,7 @@ fn children<'a, T>(
 }
 
 /// One face's normal cones at every level below the finest: each display tile's, holding every
-/// finest normal under it (see [`NormalCone`]).
+/// finest normal under it (see [`FinestNormalCone`]).
 ///
 /// Built with [`build_cones`]: like positions, cones need nothing from a neighbouring face (a
 /// cone holds the normals under its tile, not its apron's).
@@ -941,7 +941,7 @@ pub struct FaceCones {
     /// The face.
     face: FaceId,
     /// Levels `0..finest`, by level: each level's tiles' cones, row by row.
-    levels: Vec<Vec<NormalCone>>,
+    levels: Vec<Vec<FinestNormalCone>>,
 }
 
 impl FaceCones {
@@ -953,7 +953,7 @@ impl FaceCones {
 
     /// The cone of display tile `key` of this face, or `None` if the face holds no such tile.
     #[must_use]
-    pub fn cone(&self, key: &TileKey) -> Option<NormalCone> {
+    pub fn cone(&self, key: &TileKey) -> Option<FinestNormalCone> {
         if key.face() != self.face {
             return None;
         }
@@ -968,9 +968,9 @@ impl FaceCones {
 /// `face`'s normal cones at every level below `finest`, from `finest_normals`, the face's whole
 /// grid of unit normals at `finest`.
 ///
-/// One level below the finest, each tile's cone is [`NormalCone::covering`] the finest normals
-/// under it (its block, borders included, row by row); above, [`NormalCone::holding`] the cones
-/// of the tiles under it. So a tile's cone holds every finest normal under it, and its
+/// One level below the finest, each tile's cone is [`FinestNormalCone::covering`] the finest
+/// normals under it (its block, borders included, row by row); above, [`FinestNormalCone::holding`]
+/// the cones of the tiles under it. So a tile's cone holds every finest normal under it, and its
 /// children's cones.
 ///
 /// # Errors
@@ -989,7 +989,7 @@ pub fn build_cones(
     if finest == Level::ZERO {
         return Err(DisplayError::NoDisplayLevel(finest));
     }
-    let mut levels: Vec<Vec<NormalCone>> = Vec::new();
+    let mut levels: Vec<Vec<FinestNormalCone>> = Vec::new();
     let mut finer_level = finest;
     while let Some(level) = finer_level.parent() {
         let finer_cones = levels.last().map_or(&[][..], Vec::as_slice);
@@ -997,9 +997,9 @@ pub fn build_cones(
             .iter()
             .map(|key| {
                 if finer_level != finest {
-                    let under: Vec<NormalCone> =
+                    let under: Vec<FinestNormalCone> =
                         children(key, finer_level, finer_cones).copied().collect();
-                    return NormalCone::holding(&under);
+                    return FinestNormalCone::holding(&under);
                 }
                 let region = Region::of_tile(key);
                 let fine = Region::new(
@@ -1010,7 +1010,7 @@ pub fn build_cones(
                     2 * region.quads(),
                 )
                 .ok_or(DisplayError::Shape)?;
-                NormalCone::covering(block(finest_normals, fine)?.as_slice())
+                FinestNormalCone::covering(block(finest_normals, fine)?.as_slice())
             })
             .collect::<Result<Vec<_>, _>>()?;
         levels.push(cones);

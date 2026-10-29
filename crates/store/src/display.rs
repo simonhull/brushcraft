@@ -15,9 +15,9 @@
 //! format has always allowed (a channel a reader doesn't know round-trips): no new record kind,
 //! and nothing a save point names changes. Its header is `version: u8, state: u8`, then, if the
 //! state is known, `finest: u8` (the level it was built from), the bound `e: f32` and the normal
-//! cone `cone: u32` (`geom::NormalCone::to_bits`), little-endian; its body, compressed as every
-//! tile body is, is the tile's encoding (`geom::DisplayTile::encoded`), or empty if unknown. The
-//! record's op is [`DISPLAY_OP`]: a display tile is no edit.
+//! cone `cone: u32` (`geom::FinestNormalCone::to_bits`), little-endian; its body, compressed as
+//! every tile body is, is the tile's encoding (`geom::DisplayTile::encoded`), or empty if unknown.
+//! The record's op is [`DISPLAY_OP`]: a display tile is no edit.
 //!
 //! # Unlike bounds
 //!
@@ -32,7 +32,8 @@
 use std::collections::BTreeSet;
 
 use geom::{
-    BaseMesh, Channel, DisplayTile, EvalError, FaceId, LayerId, Level, NormalCone, Region, TileKey,
+    BaseMesh, Channel, DisplayTile, EvalError, FaceId, FinestNormalCone, LayerId, Level, Region,
+    TileKey,
 };
 
 use crate::bounds::{self, Derived};
@@ -64,7 +65,7 @@ pub(crate) struct DisplayRecord {
     /// `e`.
     pub(crate) error: f32,
     /// The cone holding every finest normal under the tile.
-    pub(crate) cone: NormalCone,
+    pub(crate) cone: FinestNormalCone,
     /// The finest level the tile was built from: a store keeping a display layer under another
     /// level reads the record as unknown (its bound is no bound on that store's surface).
     pub(crate) finest: Level,
@@ -151,7 +152,7 @@ pub(crate) fn parse_display(key: &TileKey, header: &[u8], body: &[u8]) -> Option
             let finest = Level::new(finest).ok().filter(|f| *f > key.level())?;
             let error = f32::from_le_bytes([e0, e1, e2, e3]);
             // Every `u32` is a cone.
-            let cone = NormalCone::from_bits(u32::from_le_bytes([c0, c1, c2, c3]));
+            let cone = FinestNormalCone::from_bits(u32::from_le_bytes([c0, c1, c2, c3]));
             if body.len() > max_body(key) {
                 return None;
             }

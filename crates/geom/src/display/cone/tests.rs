@@ -12,6 +12,16 @@ fn around(rng: &mut Rng, centre: Vec3, spread: f32, n: usize) -> Vec<Vec3> {
         .collect()
 }
 
+/// Every one of the 2^20 axis patterns (at a half-angle of 0) decodes to a finite unit axis.
+#[test]
+fn every_axis_pattern_decodes_to_a_unit_axis() {
+    for bits in 0..1_u32 << (2 * AXIS_BITS) {
+        let axis = FinestNormalCone::from_bits(bits).axis();
+        assert!(axis.is_finite(), "{bits:#x}: {axis:?}");
+        assert!((axis.length() - 1.0).abs() < 1e-6, "{bits:#x}: {axis:?}");
+    }
+}
+
 /// Every `u32` decodes to a cone whose bits are the same `u32` again, with a unit axis and a
 /// half-angle a whole number of steps up to 180°.
 #[test]
@@ -25,7 +35,7 @@ fn bits_round_trip() {
         (HALF_MAX - 1) << HALF_SHIFT,
     ]);
     for bits in samples {
-        let cone = NormalCone::from_bits(bits);
+        let cone = FinestNormalCone::from_bits(bits);
         assert_eq!(cone.to_bits(), bits);
         assert!(
             (cone.axis().length() - 1.0).abs() < 1e-6,
@@ -44,15 +54,15 @@ fn bits_round_trip() {
 /// holds it; it is the default, and a half-angle reaching 180° saturates to it.
 #[test]
 fn everything_holds_everything() {
-    let everything = NormalCone::EVERYTHING;
+    let everything = FinestNormalCone::EVERYTHING;
     assert!(everything.covers_everything());
-    assert_eq!(NormalCone::default(), everything);
-    assert_eq!(format!("{everything:?}"), "NormalCone::EVERYTHING");
+    assert_eq!(FinestNormalCone::default(), everything);
+    assert_eq!(format!("{everything:?}"), "FinestNormalCone::EVERYTHING");
     let mut rng = Rng::new(5);
     for _ in 0..256 {
         let direction = rng.vec3(1.0);
         assert!(everything.contains(direction), "{direction:?}");
-        let other = NormalCone::from_bits(rng.below(u32::MAX));
+        let other = FinestNormalCone::from_bits(rng.below(u32::MAX));
         assert!(everything.holds(other), "{other:?}");
         assert_eq!(other.holds(everything), other.covers_everything());
     }
@@ -65,23 +75,23 @@ fn everything_holds_everything() {
         Vec3::new(0.0, 0.0, 1.0),
         Vec3::new(0.0, 0.0, -1.0),
     ];
-    assert_eq!(NormalCone::covering(&all_round), Ok(everything));
+    assert_eq!(FinestNormalCone::covering(&all_round), Ok(everything));
     // A hemisphere's rim and its pole: 90° from the axis at best, not everything.
-    let hemisphere = NormalCone::covering(&all_round[..5]).unwrap();
+    let hemisphere = FinestNormalCone::covering(&all_round[..5]).unwrap();
     assert!(!hemisphere.covers_everything());
     assert!(
         hemisphere.half_angle().to_degrees() < 90.5,
         "{hemisphere:?}"
     );
     assert_eq!(
-        NormalCone::holding(&[hemisphere, everything]),
+        FinestNormalCone::holding(&[hemisphere, everything]),
         Ok(everything),
         "a union with everything"
     );
-    let opposite = NormalCone::covering(&[Vec3::new(0.0, 0.0, -1.0)]).unwrap();
-    let up = NormalCone::covering(&[Vec3::new(0.0, 0.0, 1.0)]).unwrap();
+    let opposite = FinestNormalCone::covering(&[Vec3::new(0.0, 0.0, -1.0)]).unwrap();
+    let up = FinestNormalCone::covering(&[Vec3::new(0.0, 0.0, 1.0)]).unwrap();
     assert_eq!(
-        NormalCone::holding(&[up, opposite]),
+        FinestNormalCone::holding(&[up, opposite]),
         Ok(everything),
         "opposite directions span 180°"
     );
@@ -100,7 +110,7 @@ fn covering_holds_every_normal() {
         let spread = [0.0, 1e-4, 0.01, 0.1, 0.5, 1.0, 3.0][case % 7];
         let n = 1 + usize::try_from(rng.below(64)).unwrap();
         let normals = around(&mut rng, centre, spread, n);
-        let cone = NormalCone::covering(&normals).unwrap();
+        let cone = FinestNormalCone::covering(&normals).unwrap();
         let exact = normals
             .iter()
             .map(|&normal| angle(wide(cone.axis()), wide(normal)))
@@ -116,12 +126,12 @@ fn covering_holds_every_normal() {
             );
         }
     }
-    assert_eq!(NormalCone::covering(&[]), Err(DisplayError::Shape));
+    assert_eq!(FinestNormalCone::covering(&[]), Err(DisplayError::Shape));
     assert_eq!(
-        NormalCone::covering(&[Vec3::new(f32::NAN, 0.0, 1.0)]),
+        FinestNormalCone::covering(&[Vec3::new(f32::NAN, 0.0, 1.0)]),
         Err(DisplayError::NotFinite)
     );
-    let zero = NormalCone::covering(&[Vec3::ZERO]).unwrap();
+    let zero = FinestNormalCone::covering(&[Vec3::ZERO]).unwrap();
     assert_eq!(zero.half_angle(), 0.0, "a zero normal widens nothing");
 }
 
@@ -144,11 +154,11 @@ fn holding_holds_each_cone_in_any_order() {
                 around(&mut rng, at, spread * 0.5, n)
             })
             .collect();
-        let cones: Vec<NormalCone> = groups
+        let cones: Vec<FinestNormalCone> = groups
             .iter()
-            .map(|g| NormalCone::covering(g).unwrap())
+            .map(|g| FinestNormalCone::covering(g).unwrap())
             .collect();
-        let union = NormalCone::holding(&cones).unwrap();
+        let union = FinestNormalCone::holding(&cones).unwrap();
         let pairs = cones.iter().zip(&groups);
         for (cone, group) in pairs {
             assert!(union.holds(*cone), "case {case}: {cone:?} in {union:?}");
@@ -162,7 +172,7 @@ fn holding_holds_each_cone_in_any_order() {
         let mut reversed = cones.clone();
         reversed.reverse();
         assert_eq!(
-            NormalCone::holding(&reversed),
+            FinestNormalCone::holding(&reversed),
             Ok(union),
             "case {case}: the order doesn't matter"
         );
@@ -173,14 +183,14 @@ fn holding_holds_each_cone_in_any_order() {
             );
         }
     }
-    assert_eq!(NormalCone::holding(&[]), Err(DisplayError::Shape));
+    assert_eq!(FinestNormalCone::holding(&[]), Err(DisplayError::Shape));
 }
 
 /// A cone's debug form names its axis and half-angle in degrees.
 #[test]
 fn debug_names_the_axis_and_the_half_angle() {
-    let cone = NormalCone::covering(&[Vec3::new(0.0, 0.0, 1.0)]).unwrap();
+    let cone = FinestNormalCone::covering(&[Vec3::new(0.0, 0.0, 1.0)]).unwrap();
     let shown = format!("{cone:?}");
-    assert!(shown.starts_with("NormalCone { axis: "), "{shown}");
+    assert!(shown.starts_with("FinestNormalCone { axis: "), "{shown}");
     assert!(shown.contains("half_degrees: "), "{shown}");
 }

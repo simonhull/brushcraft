@@ -76,9 +76,25 @@ fn no_workload_evicts_a_floor_tile() {
             store.evaluate(key).unwrap();
         }
         let drawn = store.display_for_draw(&floor).unwrap();
-        for (key, tile) in floor.iter().zip(&drawn) {
-            assert!(tile.is_some(), "round {round}: {key:?} still drawable");
+        let known = store.stored_display(&floor).unwrap();
+        let mut unknown = 0;
+        let with_known = floor.iter().zip(&drawn).zip(&known);
+        for ((key, tile), kept) in with_known {
+            let tile = tile
+                .as_ref()
+                .unwrap_or_else(|| panic!("round {round}: {key:?} still drawable"));
+            if kept.is_none() {
+                // Made unknown by the edits, and no stroke's bump covers it: drawn as it was,
+                // nothing trusted of its bound or its cone.
+                unknown += 1;
+                assert_eq!(tile.error(), f32::MAX, "round {round}: {key:?}'s bound");
+                assert!(
+                    tile.cone().covers_everything(),
+                    "round {round}: {key:?}'s cone"
+                );
+            }
         }
+        assert!(unknown > 0, "round {round}: the edits outdate floor tiles");
         assert_eq!(
             store.floor_size().0,
             floor.len(),

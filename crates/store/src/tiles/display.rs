@@ -29,7 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{DisplayTile, Level, NormalCone, TileKey};
+use geom::{DisplayTile, FinestNormalCone, Level, TileKey};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use super::TileStore;
@@ -394,7 +394,7 @@ impl TileStore {
                     // Rounded up, so it stays a bound.
                     let bound = (record.error + extra).next_up();
                     // A dab turns normals too: the cone before it holds them no longer.
-                    let cone = NormalCone::EVERYTHING;
+                    let cone = FinestNormalCone::EVERYTHING;
                     return Ok(DisplayTile::decode(*key, bound, cone, &record.encoded).ok());
                 }
                 if let Some(record) = self.display_record(key)? {
@@ -404,7 +404,8 @@ impl TileStore {
                 // its bound the largest there is and its cone covering everything, so a view finer
                 // than it is chosen whenever there is one, and never nothing.
                 Ok(self.floor.get(key).and_then(|r| {
-                    DisplayTile::decode(*key, f32::MAX, NormalCone::EVERYTHING, &r.encoded).ok()
+                    DisplayTile::decode(*key, f32::MAX, FinestNormalCone::EVERYTHING, &r.encoded)
+                        .ok()
                 }))
             })
             .collect()

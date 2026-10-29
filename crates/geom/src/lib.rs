@@ -38,7 +38,7 @@ pub use display::{
     build_positions_with, decode_with,
 };
 pub use display::{
-    DisplayError, DisplayTile, FaceCones, FaceGrids, FacePositions, MeanNormals, NormalCone,
+    DisplayError, DisplayTile, FaceCones, FaceGrids, FacePositions, FinestNormalCone, MeanNormals,
     build_cones, build_level, build_mesh, build_positions, build_tile, mip_normals,
     mip_normals_tile,
 };

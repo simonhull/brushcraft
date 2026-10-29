@@ -8,8 +8,8 @@
 //! # Building one
 //!
 //! One level below the finest, a tile's cone is taken from the finest normals under it
-//! ([`NormalCone::covering`]); above, from its children's decoded cones
-//! ([`NormalCone::holding`]), so it chains up the levels as `e` does. Either way, an axis is
+//! ([`FinestNormalCone::covering`]); above, from its children's decoded cones
+//! ([`FinestNormalCone::holding`]), so it chains up the levels as `e` does. Either way, an axis is
 //! chosen (the normals' sum, or the children's cones merged two at a time), quantized, and
 //! decoded; the half-angle is then measured against the *decoded* axis, from the inputs
 //! themselves (`angle(axis, n)` for a normal, `angle(axis, child's axis) + child's half-angle`
@@ -26,7 +26,7 @@
 //!
 //! # Stored
 //!
-//! In one `u32` ([`NormalCone::to_bits`]): the axis octahedral in the low [`AXIS_BITS`] × 2
+//! In one `u32` ([`FinestNormalCone::to_bits`]): the axis octahedral in the low [`AXIS_BITS`] × 2
 //! (two signed fractions), the half-angle in the high [`HALF_BITS`] as a count of
 //! `π / (2^HALF_BITS − 1)` steps, the largest count meaning 180°: everything. Every `u32` is a
 //! cone. The split of the 32 bits is the measured one (see [`AXIS_BITS`]).
@@ -81,20 +81,39 @@ const SLACK: f64 = 1e-9;
 /// A cone of directions: an axis and a half-angle, as a display tile stores the cone holding
 /// every finest normal under it (see the module notes).
 ///
-/// Every `u32` is one ([`NormalCone::from_bits`]); a half-angle of 180° holds every direction
-/// ([`NormalCone::EVERYTHING`], also the [`Default`], what a tile whose normals aren't known is
-/// given).
+/// It bounds the **finest normals under the tile**, not the tile's own triangles: it is for level
+/// choice (whether finer detail under the tile can face the camera), not for back-face culling
+/// of what the tile draws, whose triangles can face outside it.
+///
+/// Every `u32` is one ([`FinestNormalCone::from_bits`]); a half-angle of 180° holds every
+/// direction ([`FinestNormalCone::EVERYTHING`], also the [`Default`], what a tile whose normals
+/// aren't known is given). Bits with the half-angle's top count and other axis bits cover
+/// everything too but aren't equal to [`FinestNormalCone::EVERYTHING`] (the builds never make
+/// them, but a file may hold them): ask [`FinestNormalCone::covers_everything`], never compare.
+///
+/// # Testing in `f32`
+///
+/// [`FinestNormalCone::contains`] measures in `f64`, and the guarantee is to that measure. A
+/// consumer testing in `f32`, as a GPU's `dot(n, axis) >= cos(half)` does, must widen the cone by
+/// a margin, such as one step (π/4095): `acos` is ill-conditioned near 1, so an `f32` dot product
+/// of unit vectors puts the angle off by up to about 4·10⁻⁴ rad.
+///
+/// # Determinism
+///
+/// The same inputs give the same bits on one platform. The axis and the half-angle go through
+/// `atan2`, `sin` and `cos`, so another platform's maths library may round differently and, near a
+/// step's boundary, give a cone a step apart; either is conservative.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NormalCone(u32);
+pub struct FinestNormalCone(u32);
 
 /// A direction in `f64`, not necessarily unit.
 type Wide = [f64; 3];
 
-impl NormalCone {
+impl FinestNormalCone {
     /// The cone that holds every direction: a half-angle of 180°, around `+z`.
     pub const EVERYTHING: Self = Self(HALF_MAX << HALF_SHIFT);
 
-    /// The cone `bits` store, as [`NormalCone::to_bits`] gave them: every `u32` is one.
+    /// The cone `bits` store, as [`FinestNormalCone::to_bits`] gave them: every `u32` is one.
     #[must_use]
     pub const fn from_bits(bits: u32) -> Self {
         Self(bits)
@@ -113,7 +132,7 @@ impl NormalCone {
         self.steps() == HALF_MAX
     }
 
-    /// The decoded axis, a unit vector (`+z` for [`NormalCone::EVERYTHING`]).
+    /// The decoded axis, a unit vector (`+z` for [`FinestNormalCone::EVERYTHING`]).
     #[must_use]
     pub fn axis(self) -> Vec3 {
         let component = |shift: u32| {
@@ -121,6 +140,8 @@ impl NormalCone {
             // Sign-extended from its `AXIS_BITS`: the top bit is the sign.
             let unused = 32 - u32::from(AXIS_BITS);
             let signed = (raw << unused).cast_signed() >> unused;
+            // A sign-extended `AXIS_BITS`-bit value is within ±2^(AXIS_BITS − 1), which an
+            // `i16` holds: the fallback is never taken.
             let small = i16::try_from(signed).unwrap_or(0);
             (f32::from(small) / levels(AXIS_BITS)).clamp(-1.0, 1.0)
         };
@@ -243,19 +264,19 @@ impl NormalCone {
     }
 }
 
-impl Default for NormalCone {
-    /// [`NormalCone::EVERYTHING`]: the cone of a tile whose normals aren't known.
+impl Default for FinestNormalCone {
+    /// [`FinestNormalCone::EVERYTHING`]: the cone of a tile whose normals aren't known.
     fn default() -> Self {
         Self::EVERYTHING
     }
 }
 
-impl fmt::Debug for NormalCone {
+impl fmt::Debug for FinestNormalCone {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.covers_everything() {
-            return f.write_str("NormalCone::EVERYTHING");
+            return f.write_str("FinestNormalCone::EVERYTHING");
         }
-        f.debug_struct("NormalCone")
+        f.debug_struct("FinestNormalCone")
             .field("axis", &self.axis())
             .field("half_degrees", &self.half_angle().to_degrees())
             .finish()
@@ -265,6 +286,8 @@ impl fmt::Debug for NormalCone {
 /// The half-angle `steps` steps stand for, in radians, as decoded (an `f32` product, so it can
 /// be computed the same way anywhere).
 fn half_of(steps: u32) -> f32 {
+    // A step count is a `HALF_BITS`-bit field (12 bits), which a `u16` holds: the fallback is
+    // never taken.
     f32::from(u16::try_from(steps).unwrap_or(u16::MAX)) * HALF_STEP
 }
 
