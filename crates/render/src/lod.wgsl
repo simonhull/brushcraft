@@ -481,7 +481,10 @@ fn cone_cos_sin(x: f32) -> vec2<f32> {
 
 // Whether every finest normal under a tile faces away from `eye`, at every point of its bounds'
 // sphere grown by `margin`: the finest surface lies within e of what the tile draws, so with
-// margin e none of it can face the eye, and refining the tile shows nothing. `cone` is the
+// margin e none of it can face the eye, and refining the tile shows nothing. (Strictly, the
+// cone holds the finest *vertex* normals; a finest triangle's face normal can stray slightly
+// outside it. That matters little: such a triangle is all but edge-on, and the raster pass culls
+// no triangles by facing, so this test is the only place it is judged.) `cone` is the
 // tile's finest-normal cone (TileNode.finest_cone); one that covers everything never faces
 // away. Twin: cull::reference::finest_facing_away.
 //
@@ -532,13 +535,19 @@ fn finest_facing_away(b: TileBounds, cone: u32, eye: vec3<f32>, margin: f32) -> 
 // (TileNode.finest_cone), not by its own triangles: a coarse tile at a silhouette can face away
 // while finest detail under it faces the camera, and the 1 px rule must hold there too
 // (spec, "Normal cone"). A finest tile is tested by its drawn cone, as drawing culls it: its
-// triangles are the finest surface, and it has nothing to refine into. Drawing culls every tile
-// by its own triangles (emit's backfacing), whichever cone refines it.
+// triangles are the finest surface, and it has nothing to refine into.
+//
+// Drawing culls every tile by its own triangles (emit's backfacing, margin 0), and a coarse
+// quad's normal can lie outside the finest normals' cone: a tile can face away by its finest
+// normals while its own triangles face the eye. Such a tile would be drawn, coarse, at its full
+// screen error, so it is skipped for refining only when emit culls it too (the same call,
+// backfacing(b, eye, 0.0)); otherwise it is refined like any tile in view.
 fn refine_facing_away(n: u32, b: TileBounds, e: f32) -> bool {
     if (tree[n].flags & NODE_FINEST) != 0u {
         return backfacing(b, view.eye.xyz, e);
     }
-    return finest_facing_away(b, tree[n].finest_cone, view.eye.xyz, e);
+    return finest_facing_away(b, tree[n].finest_cone, view.eye.xyz, e)
+        && backfacing(b, view.eye.xyz, 0.0);
 }
 
 // Per tile: in view, wants refining (with hysteresis), complete; the screen error.

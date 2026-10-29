@@ -203,14 +203,18 @@ impl Scene {
         self.details.insert(place, detail);
     }
 
-    /// `lod.wgsl`'s `refine_facing_away` for the tile at `place`, the sphere grown by
-    /// `margin`: a finest tile by its drawn cone, any other by its finest normals' cone.
-    fn refine_facing_away(&self, place: Place, eye: [f32; 3], margin: f32) -> bool {
+    /// `lod.wgsl`'s `refine_facing_away` for the tile at `place`, the sphere grown by `margin`.
+    ///
+    /// A finest tile by its drawn cone; any other by its finest normals' cone, and only if its
+    /// drawn cone faces away too with the sphere grown by `drawn` (0 on the GPU, as drawing
+    /// culls it: a tile that is drawn is never skipped for refining).
+    fn refine_facing_away(&self, place: Place, eye: [f32; 3], margin: f32, drawn: f32) -> bool {
         let b = &self.bounds[&place];
         if place.level() == self.finest {
             backfacing(b, eye, margin)
         } else {
             finest_facing_away(b, self.details[&place].cone, eye, margin)
+                && backfacing(b, eye, drawn)
         }
     }
 
@@ -474,9 +478,9 @@ fn cpu_error(scene: &Scene, view: &View, place: Place) -> Option<f32> {
         let b = scene.bounds[&p];
         let e = scene.details[&p].error;
         let wide = in_frustum(&gpu, b.center, (b.radius + e) * 1.001)
-            && !scene.refine_facing_away(p, eye, e * 1.001 + b.radius * 0.001);
+            && !scene.refine_facing_away(p, eye, e * 1.001 + b.radius * 0.001, b.radius * 0.001);
         let narrow = in_frustum(&gpu, b.center, (b.radius + e) * 0.999)
-            && !scene.refine_facing_away(p, eye, e * 0.999 - b.radius * 0.001);
+            && !scene.refine_facing_away(p, eye, e * 0.999 - b.radius * 0.001, -b.radius * 0.001);
         if wide != narrow {
             return None;
         }
@@ -1083,11 +1087,12 @@ fn lone_root() -> Place {
     Place::of(&TileKey::display(geom::FaceId::new(0), level(0), 0, 0).expect("a key"))
 }
 
-/// Whether one frame's level choice from `eye`, looking at `place`'s centre, refines `place`.
+/// What one frame's level choice from `eye`, looking at `place`'s centre, does with `place`:
+/// whether it refines it, and whether it draws it.
 ///
 /// `place` is a level-0 tile; the level choice is a fresh one, so no earlier frame's choice
 /// holds it. A refined tile's child is in the cut in its stead.
-fn refined_from(gpu: &Gpu, scene: &mut Scene, place: Place, eye: Vec3) -> bool {
+fn choice_from(gpu: &Gpu, scene: &mut Scene, place: Place, eye: Vec3) -> (bool, bool) {
     let center = wide(scene.bounds[&place].center);
     let view = look(eye, center);
     let mut lod =
@@ -1098,7 +1103,13 @@ fn refined_from(gpu: &Gpu, scene: &mut Scene, place: Place, eye: Vec3) -> bool {
     let refined = !cut.contains(&place);
     let child = place.children()[0].expect("a child");
     assert_eq!(cut.contains(&child), refined, "the child stands in for it");
-    refined
+    let key = place.key(scene.finest).expect("a tile");
+    (refined, output.drawn.contains(&key))
+}
+
+/// Whether one frame's level choice from `eye` refines `place` ([`choice_from`]).
+fn refined_from(gpu: &Gpu, scene: &mut Scene, place: Place, eye: Vec3) -> bool {
+    choice_from(gpu, scene, place, eye).0
 }
 
 /// The lone root's eye three units out along its centre's direction, its `e`, and `away`: the
@@ -1192,9 +1203,45 @@ fn a_tile_whose_finest_normals_all_face_away_too_is_not_refined() {
                 cone: all_away,
             },
         );
+        assert_eq!(
+            choice_from(gpu, &mut scene, place, eye),
+            (false, false),
+            "nothing under it can show, so it is neither refined nor drawn"
+        );
+    });
+}
+
+#[test]
+fn a_tile_whose_finest_normals_face_away_but_whose_own_triangles_face_the_eye_is_refined() {
+    GpuTest::run(|gpu| {
+        let mut scene = two_levels(gpu);
+        let place = lone_root();
+        // Seen from in front: its own triangles (the sphere's face) face the eye.
+        let (eye, e, away) = lone_view(&scene, place);
+        let b = scene.bounds[&place];
+        let e3 = narrow_array(eye);
+        assert!(!backfacing(&b, e3, 0.0), "its own triangles face the eye");
+        // Finest normals 35° around `away`: every one faces away, but the tile would be drawn,
+        // coarse, at its full error, so it must be refined.
+        let all_away = cone_around(away, 35.0);
         assert!(
-            !refined_from(gpu, &mut scene, place, eye),
-            "nothing under it can show, so it isn't refined"
+            finest_facing_away(&b, all_away, e3, e),
+            "the CPU reference: every finest normal faces away"
+        );
+        assert!(
+            !scene.refine_facing_away(place, e3, e, 0.0),
+            "the CPU reference: not facing away for refining"
+        );
+        scene.set_detail(
+            place,
+            TileDetail {
+                error: e,
+                cone: all_away,
+            },
+        );
+        assert!(
+            refined_from(gpu, &mut scene, place, eye),
+            "refined, not drawn coarse past its error"
         );
     });
 }
@@ -1261,7 +1308,8 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
     GpuTest::run(|gpu| {
         // 2,400 level-0 tiles, each with its one child resident: a root is refined exactly when
         // the level choice wants it, which with its error well over the threshold is when it is
-        // in view and its finest normals' cone doesn't face away.
+        // in view and doesn't face away for refining (its finest normals' cone and, as it would
+        // otherwise be drawn, its own triangles' cone).
         let mesh = cube_sphere(20).expect("a mesh");
         let mut scene = Scene::new(gpu, mesh, level(9), |p| p.level().get() <= 1, |_| 0.3);
         let roots: Vec<Place> = scene
@@ -1271,7 +1319,8 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
             .filter(|p| p.level().get() == 0)
             .collect();
         let mut rng = Rng(41);
-        let (mut decisive, mut refined, mut away, mut past_drawn) = (0, 0, 0, 0);
+        let (mut decisive, mut refined, mut away) = (0, 0, 0);
+        let (mut past_drawn, mut drawn_kept) = (0, 0);
         for round in 0..6 {
             for &place in &roots {
                 scene.bounds.insert(place, random_bounds(&mut rng));
@@ -1303,8 +1352,9 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
                 // Decisive only if the answer holds with the sphere a little larger and smaller.
                 let slack = 1e-3 * (b.radius + e) + 1e-3;
                 let wants = |grow: f32| {
+                    let s = grow.signum() * slack;
                     in_frustum(&gview, b.center, (b.radius + e) * (1.0 + grow))
-                        && !finest_facing_away(&b, cone, e3, e + grow.signum() * slack)
+                        && !scene.refine_facing_away(place, e3, e + s, s)
                 };
                 let (wide, narrow) = (wants(1e-3), wants(-1e-3));
                 if wide != narrow {
@@ -1314,6 +1364,7 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
                 refined += u32::from(wide);
                 away += u32::from(!wide && in_frustum(&gview, b.center, b.radius + e));
                 past_drawn += u32::from(wide && backfacing(&b, e3, e));
+                drawn_kept += u32::from(wide && finest_facing_away(&b, cone, e3, e));
                 assert_eq!(
                     !cut.contains(&place),
                     wide,
@@ -1321,12 +1372,14 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
                 );
             }
         }
-        // The test means something: many decided, refined and left coarse by the cone, and
-        // some refined although their own triangles face away.
+        // The test means something: many decided, refined and left coarse by the cones, some
+        // refined although their own triangles face away, and some although their finest
+        // normals do (their own triangles face the eye, so they are drawn).
         assert!(decisive > 5_000, "decisive {decisive}");
         assert!(
-            refined > 1_000 && away > 500 && past_drawn > 50,
-            "refined {refined}, facing away {away}, refined past the drawn cone {past_drawn}"
+            refined > 1_000 && away > 50 && past_drawn > 50 && drawn_kept > 50,
+            "refined {refined}, facing away {away}, refined past the drawn cone {past_drawn}, \
+             kept by the drawn cone {drawn_kept}"
         );
     });
 }

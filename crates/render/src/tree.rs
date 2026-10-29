@@ -268,8 +268,9 @@ pub struct GpuNode {
     /// steps, 4095 meaning it covers everything.
     ///
     /// The level choice refines a display tile unless every direction in this cone faces away
-    /// (spec, "Normal cone"); drawing still culls by the tile's own triangles. A finest tile
-    /// carries [`geom::FinestNormalCone::EVERYTHING`]: its own triangles are the finest
+    /// (spec, "Normal cone") and drawing culls the tile by its own triangles too (it is never
+    /// drawn coarse past its error); drawing still culls by the tile's own triangles. A finest
+    /// tile carries [`geom::FinestNormalCone::EVERYTHING`]: its own triangles are the finest
     /// surface, so the level choice tests it by its drawn cone, as before.
     pub finest_cone: u32,
     /// The children's node indices in [`Place::children`]'s order, [`NONE`] where not resident.
