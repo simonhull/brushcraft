@@ -404,6 +404,30 @@ fn block(grid: &Grid, region: Region) -> Result<Grid, DisplayError> {
     Ok(Grid::new(side, data)?)
 }
 
+/// The rows of `grid` covering `region` (on the grid's level), in place, top to bottom: the
+/// block [`block`] copies out, read where it is.
+///
+/// # Errors
+///
+/// [`DisplayError::Shape`] if the region doesn't lie inside the grid.
+fn block_rows(
+    grid: &Grid,
+    region: Region,
+) -> Result<impl Iterator<Item = &[Vec3]> + Clone, DisplayError> {
+    let side = usize::try_from(grid.side()).map_err(|_size| DisplayError::Shape)?;
+    let at = |v: u32| usize::try_from(v).map_err(|_size| DisplayError::Shape);
+    let (x0, y0, width) = (at(region.x0())?, at(region.y0())?, at(region.quads() + 1)?);
+    if x0 + width > side || y0 + width > side {
+        return Err(DisplayError::Shape);
+    }
+    Ok(grid
+        .as_slice()
+        .chunks_exact(side)
+        .skip(y0)
+        .take(width)
+        .filter_map(move |row| row.get(x0..x0 + width)))
+}
+
 /// Every display tile key of `face` at `level`, row by row.
 ///
 /// # Errors
@@ -1010,7 +1034,8 @@ pub fn build_cones(
                     2 * region.quads(),
                 )
                 .ok_or(DisplayError::Shape)?;
-                FinestNormalCone::covering(block(finest_normals, fine)?.as_slice())
+                let rows = block_rows(finest_normals, fine)?;
+                FinestNormalCone::covering_each(rows.flat_map(|row| row.iter().copied()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         levels.push(cones);

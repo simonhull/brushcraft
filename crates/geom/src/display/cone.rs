@@ -78,6 +78,19 @@ const _: () = assert!(HALF_MAX == 4095, "HALF_STEP divides by HALF_MAX");
 /// its own union and a level whose tiles each hold one child doesn't widen.
 const SLACK: f64 = 1e-9;
 
+/// How far over the least cosine a normal's cosine to the axis may lie and still be measured
+/// exactly by [`FinestNormalCone::covering`]: every other normal is narrower.
+///
+/// A cosine `(a · n) / (|a| |n|)` of `f32` vectors computed in `f64` is off by at most a few
+/// `f64` rounding steps, under 10⁻¹⁵ (the products are exact; two sums, two roots, a product and
+/// a quotient each round by at most 2⁻⁵³ relative). A normal whose computed cosine lies more than
+/// 10⁻¹² over the least is therefore truly narrower than the least-cosine normal, and its `atan2`
+/// measure (off by about 10⁻¹⁵ rad) is under that normal's plus [`SLACK`], which is what the
+/// half-angle is built from. The tolerance is a thousand times the error, and small enough that
+/// only a handful of normals beside the widest are measured. (Were the widest measured at exactly
+/// 0, every cosine would be within rounding of 1, so none lies past the tolerance.)
+const COSINE_TOLERANCE: f64 = 1e-12;
+
 /// A cone of directions: an axis and a half-angle, as a display tile stores the cone holding
 /// every finest normal under it (see the module notes).
 ///
@@ -186,26 +199,61 @@ impl FinestNormalCone {
     /// sum) get the axis `+z`; normals spread over more than a hemisphere around the axis may
     /// need the cone that covers everything.
     ///
+    /// The widest normal is found by its cosine to the decoded axis, and only those within
+    /// [`COSINE_TOLERANCE`] of the least are measured with the `atan2` that
+    /// [`FinestNormalCone::contains`] uses: the half-angle bounds every normal as that measures
+    /// it (see [`COSINE_TOLERANCE`]).
+    ///
     /// # Errors
     ///
     /// [`DisplayError::Shape`] for no normals; [`DisplayError::NotFinite`] for a normal that
     /// isn't finite.
     pub fn covering(normals: &[Vec3]) -> Result<Self, DisplayError> {
-        if normals.is_empty() {
+        Self::covering_each(normals.iter().copied())
+    }
+
+    /// [`FinestNormalCone::covering`] of the normals `normals` gives, in order: the same bits
+    /// for the same normals, read in place (the rows of a block, without copying them out).
+    ///
+    /// The iterator is walked three times (the sum, the least cosine, the exact angles of the
+    /// widest), so it must clone cheaply.
+    ///
+    /// # Errors
+    ///
+    /// As [`FinestNormalCone::covering`].
+    pub fn covering_each(
+        normals: impl IntoIterator<Item = Vec3, IntoIter: Clone>,
+    ) -> Result<Self, DisplayError> {
+        let normals = normals.into_iter();
+        let mut count = 0_usize;
+        let mut sum = [0.0; 3];
+        for n in normals.clone() {
+            if !n.is_finite() {
+                return Err(DisplayError::NotFinite);
+            }
+            let [nx, ny, nz] = wide(n);
+            sum = [sum[0] + nx, sum[1] + ny, sum[2] + nz];
+            count += 1;
+        }
+        if count == 0 {
             return Err(DisplayError::Shape);
         }
-        if !normals.iter().all(|n| n.is_finite()) {
-            return Err(DisplayError::NotFinite);
-        }
-        let sum = normals.iter().fold([0.0; 3], |[x, y, z], &n| {
-            let [nx, ny, nz] = wide(n);
-            [x + nx, y + ny, z + nz]
-        });
         Ok(Self::around(sum, |axis| {
-            normals
-                .iter()
-                .map(|&n| reach(axis, wide(n)))
-                .fold(0.0, f64::max)
+            let axis_length = dot(axis, axis).sqrt();
+            // The cosine of each normal to the axis; a zero normal has none (and no angle).
+            let cosine = |n: Vec3| {
+                let n = wide(n);
+                let length = dot(n, n).sqrt() * axis_length;
+                (length > 0.0).then(|| dot(axis, n) / length)
+            };
+            let least = normals
+                .clone()
+                .filter_map(cosine)
+                .fold(f64::INFINITY, f64::min);
+            let widest = normals
+                .clone()
+                .filter(|&n| cosine(n).is_some_and(|c| c <= least + COSINE_TOLERANCE));
+            widest.map(|n| reach(axis, wide(n))).fold(0.0, f64::max)
         }))
     }
 
@@ -225,15 +273,29 @@ impl FinestNormalCone {
         if cones.iter().any(|c| c.covers_everything()) {
             return Ok(Self::EVERYTHING);
         }
-        let mut sorted: Vec<Self> = cones.to_vec();
-        sorted.sort_unstable_by_key(|c| c.0);
-        let (first, rest) = sorted.split_first().ok_or(DisplayError::Shape)?;
-        let start = (unit(wide(first.axis())), f64::from(first.half_angle()));
-        let (axis, _) = rest.iter().fold(start, |cone, c| {
-            merge(cone, (unit(wide(c.axis())), f64::from(c.half_angle())))
-        });
-        Ok(Self::around(axis, |decoded| {
-            sorted
+        // In the order of their bits, without sorting a copy: the next is the least past the
+        // last taken (a parent has at most four children, so the walk is short). A cone equal to
+        // one taken is skipped, which changes nothing: a cone merged with itself is itself.
+        let after = |last: Option<u32>| {
+            cones
+                .iter()
+                .map(|c| c.0)
+                .filter(|&bits| last.is_none_or(|l| bits > l))
+                .min()
+        };
+        let first = after(None).ok_or(DisplayError::Shape)?;
+        let as_wide = |bits: u32| {
+            let cone = Self(bits);
+            (unit(wide(cone.axis())), f64::from(cone.half_angle()))
+        };
+        let mut merged = as_wide(first);
+        let mut last = first;
+        while let Some(next) = after(Some(last)) {
+            merged = merge(merged, as_wide(next));
+            last = next;
+        }
+        Ok(Self::around(merged.0, |decoded| {
+            cones
                 .iter()
                 .map(|c| reach(decoded, wide(c.axis())) + f64::from(c.half_angle()))
                 .fold(0.0, f64::max)
@@ -383,7 +445,13 @@ fn angle(a: Wide, b: Wide) -> f64 {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ];
-    dot(cross, cross).sqrt().atan2(dot(a, b))
+    let (sin, cos) = (dot(cross, cross).sqrt(), dot(a, b));
+    // A zero vector gives `atan2(0, ±0)`, and `atan2(0, −0)` is π: a zero normal facing an axis
+    // with negative components would read as opposite it. It has no direction: 0.
+    if sin == 0.0 && cos == 0.0 {
+        return 0.0;
+    }
+    sin.atan2(cos)
 }
 
 #[cfg(test)]

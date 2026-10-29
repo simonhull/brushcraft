@@ -186,6 +186,40 @@ fn holding_holds_each_cone_in_any_order() {
     assert_eq!(FinestNormalCone::holding(&[]), Err(DisplayError::Shape));
 }
 
+/// Measuring only the normals near the least cosine gives the very cone that measuring every
+/// normal's angle does, however few, many, spread or tight they are.
+#[test]
+fn the_cosine_shortcut_gives_the_cone_every_angle_gives() {
+    let mut rng = Rng::new(29);
+    for case in 0..512 {
+        let centre = rng
+            .vec3(1.0)
+            .normalized()
+            .unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+        let spread = [0.0, 1e-6, 1e-3, 0.05, 0.5, 2.0][case % 6];
+        let count = 1 + usize::try_from(rng.below(256)).unwrap();
+        let mut normals = around(&mut rng, centre, spread, count);
+        if case % 5 == 0 {
+            normals.push(Vec3::ZERO);
+        }
+        let sum = normals.iter().fold([0.0; 3], |[x, y, z], &normal| {
+            let [nx, ny, nz] = wide(normal);
+            [x + nx, y + ny, z + nz]
+        });
+        let every = FinestNormalCone::around(sum, |axis| {
+            normals
+                .iter()
+                .map(|&normal| reach(axis, wide(normal)))
+                .fold(0.0, f64::max)
+        });
+        assert_eq!(
+            FinestNormalCone::covering(&normals),
+            Ok(every),
+            "case {case}"
+        );
+    }
+}
+
 /// A cone's debug form names its axis and half-angle in degrees.
 #[test]
 fn debug_names_the_axis_and_the_half_angle() {

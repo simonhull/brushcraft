@@ -151,11 +151,25 @@ fn block_from(
     channel: Channel,
     face: FaceId,
     level: Level,
-    (x0, y0): (u32, u32),
+    origin: (u32, u32),
     side: u32,
 ) -> Option<Vec<Vec3>> {
+    Some(block_runs(tiles, channel, face, level, origin, side)?.concat())
+}
+
+/// The block [`block_from`] puts together, as the runs of the tiles' values it is made of, in
+/// order, read in place: what a pass over the block reads without copying it out.
+fn block_runs<'t>(
+    tiles: &BTreeMap<TileKey, &'t [Vec3]>,
+    channel: Channel,
+    face: FaceId,
+    level: Level,
+    (x0, y0): (u32, u32),
+    side: u32,
+) -> Option<Vec<&'t [Vec3]>> {
     let tq = level.tile_quads();
-    let mut out = Vec::with_capacity(usize::try_from(side * side).ok()?);
+    // A row crosses at most a few tiles: room for two runs a row.
+    let mut out = Vec::with_capacity(usize::try_from(2 * side).ok()?);
     for y in y0..y0 + side {
         let mut x = x0;
         while x < x0 + side {
@@ -165,7 +179,7 @@ fn block_from(
             let tile_x0 = Region::of_tile(&key).x0();
             let end = (tile_x0 + tq).min(x0 + side - 1);
             let count = usize::try_from(end - x + 1).ok()?;
-            out.extend_from_slice(tiles.get(&key)?.get(index..index + count)?);
+            out.push(tiles.get(&key)?.get(index..index + count)?);
             x = end + 1;
         }
     }
@@ -304,8 +318,8 @@ fn build_from_finest(
         fine_side,
     )
     .ok_or(DisplayError::Unavailable)?;
-    // The finest normals under the tile, row by row, as `geom::build_cones` reads them.
-    let under = block_from(
+    // The finest normals under the tile, row by row as `geom::build_cones` reads them, in place.
+    let under = block_runs(
         &normals,
         Channel::DISPLACEMENT,
         key.face(),
@@ -314,7 +328,7 @@ fn build_from_finest(
         fine_side,
     )
     .ok_or(DisplayError::Unavailable)?;
-    let cone = FinestNormalCone::covering(&under)?;
+    let cone = FinestNormalCone::covering_each(under.iter().flat_map(|run| run.iter().copied()))?;
     let source = TileValues::new(Channel::DISPLACEMENT, &normals);
     let means = mip_normals_tile(mesh, &source, &key);
     if source.missed.get() {
@@ -342,13 +356,15 @@ fn build_from_finer(
     let origin = (2 * region.x0(), 2 * region.y0());
     // The bound and the cone chain from the tiles under it alone; the block reads any tile
     // holding a vertex of it (one on its edge may come from a neighbour, the same bits there).
-    let under: Vec<&DisplayTile> = tiles
+    let under = tiles
         .iter()
         .filter(|(tile, _)| lies_under(Region::of_tile(tile), region))
-        .map(|(_, d)| &d.tile)
-        .collect();
-    let bound = under.iter().map(|t| t.error()).fold(0.0_f32, f32::max);
-    let cones: Vec<FinestNormalCone> = under.iter().map(|t| t.cone()).collect();
+        .map(|(_, d)| &d.tile);
+    let bound = under
+        .clone()
+        .map(DisplayTile::error)
+        .fold(0.0_f32, f32::max);
+    let cones: Vec<FinestNormalCone> = under.map(DisplayTile::cone).collect();
     let cone = FinestNormalCone::holding(&cones)?;
     let positions: BTreeMap<TileKey, &[Vec3]> = tiles
         .iter()
