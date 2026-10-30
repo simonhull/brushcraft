@@ -18,6 +18,7 @@ pub mod camera;
 pub mod cull;
 mod draw;
 pub mod gpu;
+pub mod indices;
 pub mod lod;
 pub mod overlay;
 pub mod residency;
