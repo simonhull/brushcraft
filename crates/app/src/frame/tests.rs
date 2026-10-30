@@ -830,6 +830,11 @@ fn the_app_draws_the_surface_through_residency_and_hears_its_cuts() {
     let stats = residency.stats();
     assert!(stats.resident > floor, "requested tiles arrived: {stats:?}");
     assert_eq!(stats.wanted, 0, "and none is wanted still");
+    assert_eq!(
+        owner.uploads().evaluated_while_staging(),
+        0,
+        "the requested finest tiles were evaluated in the jobs, never while staging"
+    );
     // The surface is in the visibility buffer, and every id names a resident tile.
     let finest = Level::new(FINEST).expect("a level");
     let ids: Vec<VisibilityId> = screen
