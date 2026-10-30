@@ -576,6 +576,9 @@ pub struct ResidencyStats {
     /// the whole floor: 219 MiB on the benchmark project), so half of those stay allocated and
     /// unused.
     pub used_bytes: u64,
+    /// Bytes the normal pass keeps between frames, outside the slot budget: its record chunks
+    /// (as many as hold the staging ring's cap) and its job list.
+    pub record_bytes: u64,
     /// Tiles requested and not resident yet.
     pub wanted: usize,
     /// Tiles the source had nothing for, waiting for an epoch naming them.
@@ -851,8 +854,8 @@ impl Residency {
         let staging_bytes = config.staging_bytes.max(largest);
         let staging_cap = config.staging_cap.max(staging_bytes);
         let (outcome_sender, outcomes) = mpsc::channel();
-        // A record chunk holds what a staging buffer does.
-        let normals = NormalPass::new(gpu, staging_bytes)?;
+        // A record chunk holds what a staging buffer does; as many are kept as hold the ring.
+        let normals = NormalPass::new(gpu, staging_bytes, staging_cap)?;
         Ok(Self {
             ring: StagingRing::new(staging_bytes, staging_cap),
             config,
@@ -961,6 +964,7 @@ impl Residency {
             floor: self.floor_resident,
             allocated_bytes: self.pools.allocated(),
             used_bytes: self.pools.used(),
+            record_bytes: self.normals.kept_bytes(),
             wanted: self.wanted.len(),
             unavailable: self.unavailable.len(),
             pending_epochs: self.groups.len(),

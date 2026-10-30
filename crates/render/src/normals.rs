@@ -269,9 +269,12 @@ pub(crate) const JOB_BYTES: u64 = size_of::<GpuJob>() as u64;
 ///
 /// **Record chunks** are storage buffers of a fixed size (a staging buffer's, at most what the
 /// device binds), made as a frame first needs them and reused by every frame after, from the
-/// first: a frame's copies into them follow the previous frame's pass in queue order. They hold
-/// the most any frame staged, outside the slot budget: one staging ring's worth for frames the
-/// ring caps, more after a frame forced past it (the floor, a large epoch forced whole).
+/// first: a frame's copies into them follow the previous frame's pass in queue order. At most
+/// `kept` are kept, as many as hold the staging ring's cap, so what a frame the ring caps stages
+/// always fits them. A frame forced past the cap (the floor, a resync's epoch rescued whole)
+/// stages the rest into **one-off chunks**, held by the frame's [`NormalWork`] and dropped with it
+/// once submitted, as a one-off staging buffer is. The kept chunks and the job list are GPU memory
+/// outside the slot budget ([`NormalPass::kept_bytes`]).
 #[derive(Debug)]
 pub(crate) struct NormalPass {
     /// The pass.
@@ -280,9 +283,13 @@ pub(crate) struct NormalPass {
     layout: BindGroupLayout,
     /// Bytes per record chunk.
     chunk_bytes: u64,
-    /// The record chunks.
+    /// The most record chunks kept.
+    kept: usize,
+    /// The record chunks kept.
     chunks: Vec<Buffer>,
-    /// The chunk the frame is filling, by index.
+    /// The frame's one-off chunks: by index, past the kept ones.
+    one_off: Vec<Buffer>,
+    /// The chunk the frame is filling, by index (kept, then one-off).
     chunk: usize,
     /// Bytes the frame used in it.
     cursor: u64,
@@ -296,12 +303,13 @@ pub(crate) struct NormalPass {
 }
 
 impl NormalPass {
-    /// The pass, with record chunks of `chunk_bytes` (at most what the device binds).
+    /// The pass, with record chunks of `chunk_bytes` (at most what the device binds), keeping as
+    /// many as hold `kept_bytes` (the staging ring's cap).
     ///
     /// # Errors
     ///
     /// As [`Gpu::scoped`], making the pipeline or the job list.
-    pub(crate) fn new(gpu: &Gpu, chunk_bytes: u64) -> Result<Self, GpuError> {
+    pub(crate) fn new(gpu: &Gpu, chunk_bytes: u64, kept_bytes: u64) -> Result<Self, GpuError> {
         let device = gpu.device();
         let limits = device.limits();
         let largest = limits
@@ -326,11 +334,15 @@ impl NormalPass {
         let source = format!("{VERTEX_WGSL}{NORMALS_WGSL}");
         let pipeline = pipeline(gpu, "normals", &source, &[&layout], "finest_normals")?;
         let jobs = storage_buffer(gpu, "normal jobs", 4096)?;
+        let chunk_bytes = chunk_bytes.min(largest).max(8);
+        let kept = usize::try_from(kept_bytes.div_ceil(chunk_bytes)).unwrap_or(usize::MAX);
         Ok(Self {
             pipeline,
             layout,
-            chunk_bytes: chunk_bytes.min(largest),
+            chunk_bytes,
+            kept,
             chunks: Vec::new(),
+            one_off: Vec::new(),
             chunk: 0,
             cursor: 0,
             jobs,
@@ -339,11 +351,34 @@ impl NormalPass {
         })
     }
 
-    /// Starts a frame: no jobs, the record chunks empty.
+    /// Starts a frame: no jobs, the record chunks empty, the last frame's one-off chunks let go
+    /// (its work holds them until it is submitted).
     pub(crate) fn begin(&mut self) {
         self.pending.clear();
+        self.one_off.clear();
         self.chunk = 0;
         self.cursor = 0;
+    }
+
+    /// Bytes of GPU memory it keeps between frames, outside the slot budget: the record chunks
+    /// kept and the job list.
+    pub(crate) fn kept_bytes(&self) -> u64 {
+        let chunks: u64 = self.chunks.iter().map(Buffer::size).sum();
+        chunks + self.jobs.size()
+    }
+
+    /// How many record chunks it keeps.
+    #[cfg(test)]
+    pub(crate) const fn kept_chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Chunk `index`: a kept one, then the frame's one-offs.
+    fn chunk_at(&self, index: usize) -> Option<&Buffer> {
+        match index.checked_sub(self.chunks.len()) {
+            None => self.chunks.get(index),
+            Some(past) => self.one_off.get(past),
+        }
     }
 
     /// Forgets the frame's job for `slot`, written since with vertices of their own (which the
@@ -376,7 +411,7 @@ impl NormalPass {
         let data = record.bytes();
         let size = data.len() as u64;
         let (chunk, offset) = self.room(gpu, size)?;
-        let Some(buffer) = self.chunks.get(chunk) else {
+        let Some(buffer) = self.chunk_at(chunk) else {
             return Ok(false);
         };
         if !batch.write(gpu, ring, data, buffer, offset, forced)? {
@@ -402,7 +437,8 @@ impl NormalPass {
     }
 
     /// Where `size` bytes of record go: the chunk and the offset in it, the chunk made if need
-    /// be (larger than the others if a record is).
+    /// be: kept while fewer than `kept` are and the record fits one, else one-off (as large as
+    /// the record, if it is larger).
     ///
     /// # Errors
     ///
@@ -411,17 +447,26 @@ impl NormalPass {
         let mut chunk = self.chunk;
         let mut cursor = self.cursor;
         loop {
-            match self.chunks.get(chunk) {
+            match self.chunk_at(chunk) {
                 Some(buffer) if buffer.size() - cursor >= size => return Ok((chunk, cursor)),
                 Some(_) => {
                     chunk += 1;
                     cursor = 0;
                 }
                 None => {
-                    let bytes = self.chunk_bytes.max(size);
-                    self.chunks
-                        .push(storage_buffer(gpu, "normal records", bytes)?);
-                    return Ok((self.chunks.len() - 1, 0));
+                    // Kept chunks come first: one is added only while there is no one-off.
+                    let keep = self.one_off.is_empty()
+                        && self.chunks.len() < self.kept
+                        && size <= self.chunk_bytes;
+                    if keep {
+                        let buffer = storage_buffer(gpu, "normal records", self.chunk_bytes)?;
+                        self.chunks.push(buffer);
+                    } else {
+                        let bytes = self.chunk_bytes.max(size);
+                        let buffer = storage_buffer(gpu, "one-off normal records", bytes)?;
+                        self.one_off.push(buffer);
+                    }
+                    return Ok((self.chunks.len() + self.one_off.len() - 1, 0));
                 }
             }
         }

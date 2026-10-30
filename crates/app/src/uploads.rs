@@ -438,20 +438,22 @@ pub(crate) fn awaits_cut(from: Option<u64>, drawn: Option<u64>) -> bool {
 ///
 /// Resident tiles (the floor's of `floor_tiles`), slot memory used of that allocated (the
 /// floor's classes are allocated twice over, for a resync, so used is below allocated even when
-/// every tile is resident), what is still wanted and pending, and what the last frame staged.
+/// every tile is resident) and the finest tiles' record chunks beside it, what is still wanted
+/// and pending, and what the last frame staged.
 pub(crate) fn summary(stats: &ResidencyStats, floor_tiles: usize) -> String {
     #[expect(
         clippy::cast_precision_loss,
         reason = "byte counts shown to two places in MiB: far below f64's exact range"
     )]
-    let (used, allocated, staged) = (
+    let (used, allocated, records, staged) = (
         stats.used_bytes as f64 / MIB,
         stats.allocated_bytes as f64 / MIB,
+        stats.record_bytes as f64 / MIB,
         stats.staged_bytes as f64 / MIB,
     );
     format!(
-        "{} resident (floor {}/{floor_tiles})  {used:.1} of {allocated:.1} MiB used  {} \
-         wanted  {} epochs \
+        "{} resident (floor {}/{floor_tiles})  {used:.1} of {allocated:.1} MiB used  \
+         + {records:.1} MiB records  {} wanted  {} epochs \
          pending  staged {staged:.2} MiB  {} evicted  {} lost frames",
         stats.resident,
         stats.floor,
@@ -604,11 +606,14 @@ mod tests {
             floor: 5,
             used_bytes: 3 << 20,
             allocated_bytes: 10 << 20,
+            record_bytes: 1 << 19,
             ..ResidencyStats::default()
         };
         let line = summary(&stats, 5);
         assert!(
-            line.starts_with("7 resident (floor 5/5)  3.0 of 10.0 MiB used  0 wanted"),
+            line.starts_with(
+                "7 resident (floor 5/5)  3.0 of 10.0 MiB used  + 0.5 MiB records  0 wanted"
+            ),
             "{line}"
         );
     }

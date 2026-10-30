@@ -19,6 +19,8 @@ use crate::gpu::GpuTest;
 use crate::residency::{Request, Requests, Residency, ResidencyConfig};
 use crate::upload::{TileData, TileDetail, TileSource};
 
+mod records;
+
 /// The finest level: four tiles a face, so seams inside faces as well as across them.
 const FINEST: u8 = 7;
 
