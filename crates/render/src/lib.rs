@@ -15,12 +15,16 @@
 //! into a linear HDR image, which `tone` brings to the frame's format; `visibility_view` shows
 //! the visibility buffer as colours instead, a debug view.
 //!
+//! [`aa`] smooths edges: frames accumulated at jittered sample points while the camera is still,
+//! an edge filter in the tone map while it moves.
+//!
 //! The crates below this one (`geom`, `store`, `brush`) never learn about the GPU: this crate
 //! reads their data and uploads it.
 //!
 //! With the `spike` feature, the `spike` module holds M1a's GPU experiments, built and tested by
 //! the gate but not part of the renderer.
 
+pub mod aa;
 pub mod camera;
 pub mod cull;
 mod draw;

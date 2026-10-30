@@ -242,6 +242,15 @@ impl World {
         }
     }
 
+    /// Records that the tile at `node` has new data (the same, put in its own slot again), as an
+    /// epoch does: the tree stamps it, so the next bounds update names it.
+    pub(crate) fn restamp(&mut self, gpu: &Gpu, node: u32) {
+        let place = self.place_of(node);
+        let tile = &self.tiles[&place];
+        self.tree.move_to(place, tile.slot, tile.detail);
+        self.write_tree(gpu);
+    }
+
     /// The node of `place`.
     fn node(&self, place: Place) -> u32 {
         self.tiles[&place].node

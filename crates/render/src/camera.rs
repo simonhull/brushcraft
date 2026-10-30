@@ -375,6 +375,70 @@ impl Mat4 {
     }
 }
 
+/// The frustum's planes of the view-projection `clip_from_world`, as [`View::planes`] holds them.
+fn frustum_planes(clip_from_world: &Mat4) -> [[f64; 4]; 6] {
+    let [r0, r1, r2, r3] = clip_from_world.rows;
+    let add = |a: [f64; 4], b: [f64; 4], sign: f64| {
+        [
+            a[0] + sign * b[0],
+            a[1] + sign * b[1],
+            a[2] + sign * b[2],
+            a[3] + sign * b[3],
+        ]
+    };
+    let normalize = |p: [f64; 4]| {
+        let length = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if length > 0.0 {
+            p.map(|c| c / length)
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        }
+    };
+    [
+        normalize(add(r3, r0, 1.0)),
+        normalize(add(r3, r0, -1.0)),
+        normalize(add(r3, r1, 1.0)),
+        normalize(add(r3, r1, -1.0)),
+        // Depth at most 1: z ≤ w.
+        normalize(add(r3, r2, -1.0)),
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// Where inside its pixel a frame samples the scene: an offset from the pixel's centre, in
+/// pixels, each axis in `[-0.5, 0.5)` (x right, y down). [`View::jittered`] applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Jitter {
+    /// Right, pixels.
+    x: f64,
+    /// Down, pixels.
+    y: f64,
+}
+
+impl Jitter {
+    /// The pixel's centre: no offset.
+    pub const CENTRE: Self = Self { x: 0.0, y: 0.0 };
+
+    /// The offset `(x, y)` pixels from the centre; `None` unless both lie in `[-0.5, 0.5)`.
+    #[must_use]
+    pub fn new(x: f64, y: f64) -> Option<Self> {
+        let inside = |v: f64| (-0.5..0.5).contains(&v);
+        (inside(x) && inside(y)).then_some(Self { x, y })
+    }
+
+    /// The offset right, pixels.
+    #[must_use]
+    pub const fn x(self) -> f64 {
+        self.x
+    }
+
+    /// The offset down, pixels.
+    #[must_use]
+    pub const fn y(self) -> f64 {
+        self.y
+    }
+}
+
 /// A view: where the eye is and how the world projects onto a viewport, `f64`.
 ///
 /// Built from a [`Camera`] ([`Camera::view`]) or directly ([`View::look_at`]); handed to the
@@ -446,40 +510,43 @@ impl View {
             ],
         };
         let clip_from_world = projection.mul(&view);
-        let [r0, r1, r2, r3] = clip_from_world.rows;
-        let add = |a: [f64; 4], b: [f64; 4], sign: f64| {
-            [
-                a[0] + sign * b[0],
-                a[1] + sign * b[1],
-                a[2] + sign * b[2],
-                a[3] + sign * b[3],
-            ]
-        };
-        let normalize = |p: [f64; 4]| {
-            let length = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-            if length > 0.0 {
-                p.map(|c| c / length)
-            } else {
-                [0.0, 0.0, 0.0, 1.0]
-            }
-        };
-        let planes = [
-            normalize(add(r3, r0, 1.0)),
-            normalize(add(r3, r0, -1.0)),
-            normalize(add(r3, r1, 1.0)),
-            normalize(add(r3, r1, -1.0)),
-            // Depth at most 1: z ≤ w.
-            normalize(add(r3, r2, -1.0)),
-            [0.0, 0.0, 0.0, 1.0],
-        ];
         Self {
             eye,
             basis,
             clip_from_world,
-            planes,
+            planes: frustum_planes(&clip_from_world),
             size,
             pixels_per_unit: focal * height / 2.0,
             near,
+        }
+    }
+
+    /// The same view with its image moved by `jitter`, a fraction of a pixel: pixel `(x, y)`'s
+    /// centre then sees what this view shows at `(x + 0.5 + jitter.x, y + 0.5 + jitter.y)`
+    /// (x right, y down), so frames drawn at different jitters sample the scene at different
+    /// points inside each pixel ([`crate::aa`]).
+    ///
+    /// Only the projection's first two rows change (each gains a multiple of the last), so the
+    /// eye, the depth of every point, the near plane, [`View::pixels_per_unit`] and every pixel
+    /// length are bit for bit the same: what the level choice and the geomorph compute from them
+    /// doesn't move with the jitter. The frustum's side planes move with the image.
+    #[must_use]
+    pub fn jittered(&self, jitter: Jitter) -> Self {
+        let (width, height) = (f64::from(self.size.width()), f64::from(self.size.height()));
+        // ndc x' = ndc x − 2 jx / width moves the image left by jx pixels; ndc y points up
+        // while pixels count down, so y' = y + 2 jy / height moves it up by jy.
+        let shift = [-2.0 * jitter.x / width, 2.0 * jitter.y / height];
+        let mut clip_from_world = self.clip_from_world;
+        let [r0, r1, _, r3] = &mut clip_from_world.rows;
+        for (row, by) in [r0, r1].into_iter().zip(shift) {
+            for (value, last) in row.iter_mut().zip(*r3) {
+                *value += by * last;
+            }
+        }
+        Self {
+            clip_from_world,
+            planes: frustum_planes(&clip_from_world),
+            ..*self
         }
     }
 
@@ -676,6 +743,42 @@ mod tests {
             let inside_clip = w > 0.0 && x.abs() <= w && y.abs() <= w && z <= w;
             assert_eq!(inside_planes, inside_clip, "{point:?}");
         }
+    }
+
+    #[test]
+    fn a_jittered_view_moves_the_image_by_the_jitter_and_nothing_else() {
+        let view = View::look_at(
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(0.1, -0.2, 0.3),
+            Vec3::new(0.0, 1.0, 0.0),
+            60_f64.to_radians(),
+            size(),
+            0.01,
+        )
+        .expect("a view");
+        let jitter = Jitter::new(0.25, -0.375).expect("inside the pixel");
+        let moved = view.jittered(jitter);
+        for p in [Vec3::new(0.1, -0.2, 0.3), Vec3::new(0.4, 0.1, -0.2)] {
+            let (x, y, depth) = view.pixel(p).expect("in front");
+            let (mx, my, moved_depth) = moved.pixel(p).expect("in front");
+            assert!((mx - (x - 0.25)).abs() < 1e-9, "x: {x} {mx}");
+            assert!((my - (y + 0.375)).abs() < 1e-9, "y: {y} {my}");
+            assert!((moved_depth - depth).abs() < 1e-12, "the same depth");
+        }
+        let (gpu, moved_gpu) = (view.gpu(), moved.gpu());
+        assert_eq!(
+            gpu.planes[4], moved_gpu.planes[4],
+            "the near plane, bit for bit"
+        );
+        assert_eq!(gpu.viewport, moved_gpu.viewport, "lengths in pixels");
+        assert_eq!(gpu.eye, moved_gpu.eye);
+        assert_ne!(gpu.planes[0], moved_gpu.planes[0], "the sides move");
+        assert_eq!(
+            view.jittered(Jitter::CENTRE),
+            view,
+            "the centre changes nothing"
+        );
+        assert!(Jitter::new(0.5, 0.0).is_none() && Jitter::new(0.0, -0.6).is_none());
     }
 
     #[test]

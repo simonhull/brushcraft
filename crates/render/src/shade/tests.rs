@@ -27,7 +27,7 @@ use crate::raster::{RasterConfig, RasterFrame};
 
 mod flip;
 mod golden;
-mod png;
+pub(crate) mod png;
 
 /// The probe, appended to the pass's shader in tests only: for each pixel, the rebuilt point
 /// relative to the eye and its depth (`w`, -1 where nothing is drawn), then its normal and

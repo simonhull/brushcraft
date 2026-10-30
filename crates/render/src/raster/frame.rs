@@ -24,7 +24,8 @@ use wgpu::{Buffer, CommandEncoder};
 
 use super::{ClusterDraw, Phase, Raster, RasterConfig, RasterError, RasterFrame};
 use crate::Look;
-use crate::camera::View;
+use crate::aa::{AaError, AccumulateInputs, Accumulation};
+use crate::camera::{Jitter, View};
 use crate::cull::{BoundsUpdate, DepthPyramid, PyramidPass, SlotBuffers};
 use crate::gpu::{Gpu, GpuError};
 use crate::lod::{CutReadback, Lod, LodConfig, LodError, MainInputs};
@@ -48,6 +49,9 @@ pub enum FrameError {
     /// The shading pass failed.
     #[error(transparent)]
     Shade(#[from] ShadeError),
+    /// The accumulation failed.
+    #[error(transparent)]
+    Aa(#[from] AaError),
 }
 
 /// What one frame's passes read.
@@ -89,6 +93,8 @@ pub struct FramePasses {
     previous: Option<(View, DepthPyramid)>,
     /// The shading pass.
     shade: Shade,
+    /// The accumulation while the camera is still ([`crate::aa`]).
+    aa: Accumulation,
 }
 
 impl FramePasses {
@@ -100,7 +106,8 @@ impl FramePasses {
     ///
     /// # Errors
     ///
-    /// As [`Lod::new`], [`Raster::new`], [`PyramidPass::new`] and `Shade::new`.
+    /// As [`Lod::new`], [`Raster::new`], [`PyramidPass::new`], `Shade::new` and
+    /// `Accumulation::new`.
     pub fn new(
         gpu: &Gpu,
         capacity: u32,
@@ -117,6 +124,7 @@ impl FramePasses {
             current: None,
             previous: None,
             shade: Shade::new(gpu, slots, path, MatCapStyle::default())?,
+            aa: Accumulation::new(gpu, capacity)?,
         })
     }
 
@@ -142,6 +150,50 @@ impl FramePasses {
     #[must_use]
     pub(crate) const fn shade(&self) -> &Shade {
         &self.shade
+    }
+
+    /// Rebuilds the accumulation with `patches` in its pixel pass, for the tests' bite checks.
+    ///
+    /// # Panics
+    ///
+    /// If the patched pass can't be built.
+    #[cfg(test)]
+    pub(crate) fn patch_aa(&mut self, gpu: &Gpu, capacity: u32, patches: &[(&str, &str)]) {
+        self.aa = Accumulation::patched(gpu, capacity, patches).expect("the patched pass");
+    }
+
+    /// The accumulation: its means, which the tone map shows while the camera is still.
+    pub(crate) const fn aa(&self) -> &Accumulation {
+        &self.aa
+    }
+
+    /// Encodes the accumulation of the frame just shaded ([`crate::aa`]): `changes` names the
+    /// tiles whose data changed this frame, `restart` starts every pixel's history again; `tree`
+    /// is the tile tree's buffer, `None` for the last one given.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError::Aa`] as `Accumulation::encode`; nothing is encoded before the first
+    /// shading.
+    pub(crate) fn encode_accumulation(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        tree: Option<&Buffer>,
+        changes: Option<&BoundsUpdate>,
+        restart: bool,
+    ) -> Result<(), FrameError> {
+        let Some(shaded) = self.shade.target() else {
+            return Ok(());
+        };
+        let inputs = AccumulateInputs {
+            tree,
+            raster: &self.raster,
+            shaded,
+            changes,
+            restart,
+        };
+        Ok(self.aa.encode(gpu, encoder, &inputs)?)
     }
 
     /// Sets how the shading shows the scene, `look`'s wireframe and MatCap style, the wireframe's
@@ -209,6 +261,23 @@ impl FramePasses {
         encoder: &mut CommandEncoder,
         inputs: &SceneInputs<'_>,
     ) -> Result<Option<CutReadback>, FrameError> {
+        self.encode_jittered(gpu, encoder, inputs, Jitter::CENTRE)
+    }
+
+    /// [`FramePasses::encode`] with the raster drawing at `jitter` ([`View::jittered`]): the
+    /// level choice and its culling see `inputs.view` as it is, so the cut and every vertex are
+    /// the same at every jitter ([`crate::aa`]); the shading then rebuilds the jittered frame.
+    ///
+    /// # Errors
+    ///
+    /// As [`FramePasses::encode`].
+    pub fn encode_jittered(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        inputs: &SceneInputs<'_>,
+        jitter: Jitter,
+    ) -> Result<Option<CutReadback>, FrameError> {
         let size = inputs.view.size();
         let wanted = (size.width(), size.height());
         let current = match self.current.take() {
@@ -236,8 +305,9 @@ impl FramePasses {
             finest: inputs.finest,
         };
         self.lod.encode_main(gpu, encoder, &main)?;
+        let jittered = inputs.view.jittered(jitter);
         let frame = RasterFrame {
-            view: inputs.view,
+            view: &jittered,
             time: inputs.time,
             moving: inputs.moving,
         };

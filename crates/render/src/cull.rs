@@ -231,6 +231,13 @@ impl BoundsUpdate {
         self.runs.iter().map(|(_, nodes)| nodes.len()).sum()
     }
 
+    /// The node indices of the tiles it bounds: those whose data changed.
+    pub fn nodes(&self) -> impl Iterator<Item = u32> + '_ {
+        self.runs
+            .iter()
+            .flat_map(|(_, nodes)| nodes.iter().copied())
+    }
+
     /// Whether it bounds no tile.
     #[must_use]
     pub fn is_empty(&self) -> bool {

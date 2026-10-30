@@ -10,12 +10,17 @@
 //! 2. the shading pass ([`crate::shade`]), shading the visibility buffer into the linear HDR image;
 //!    a frame whose scene is unchanged and whose shading isn't ([`Scene::Reshade`]: a material or
 //!    wireframe change) runs this pass alone, with no level choice or raster;
-//! 3. the target cleared to the frame's colour, with the scene shown over it: the shaded image tone
-//!    mapped ([`crate::tone`]), or, as a debug view ([`SceneView::Clusters`]), the visibility
-//!    buffer as a colour per cluster ([`crate::visibility_view`]);
-//! 4. the overlay ([`crate::overlay`]), always last.
+//! 3. with the camera still, the accumulation ([`crate::aa`]): the frame was drawn at the next
+//!    jitter, and its sample goes into each pixel's history;
+//! 4. the target cleared to the frame's colour, with the scene shown over it: the histories' means
+//!    (still) or the shaded image filtered (moving), tone mapped ([`crate::tone`]), or, as a debug
+//!    view ([`SceneView::Clusters`]), the visibility buffer as a colour per cluster
+//!    ([`crate::visibility_view`]), neither jittered nor accumulated;
+//! 5. the overlay ([`crate::overlay`]), always last.
 //!
-//! Anti-aliasing (M1a3 Task 6) goes between the shading and the tone map.
+//! A frame shading the last scene again with the look the histories already hold (one wanted for
+//! the overlay alone, such as a pick line) shades nothing: it shows the histories as they are, so
+//! it neither restarts nor adds to them.
 
 use std::time::{Duration, Instant};
 
@@ -25,6 +30,8 @@ use wgpu::{
     RenderPassDescriptor, StoreOp, TextureFormat,
 };
 
+use crate::aa::{AaFrame, AaState};
+use crate::camera::Jitter;
 use crate::gpu::{Gpu, GpuError};
 use crate::lod::CutReadback;
 use crate::material::MatCapStyle;
@@ -32,7 +39,7 @@ use crate::overlay::{OverlayPass, TextImage};
 use crate::raster::{FrameError, FramePasses, SceneInputs};
 use crate::shade::ShadeSettings;
 use crate::surface::{Acquired, Size, SurfaceError, Target};
-use crate::tone::ToneMap;
+use crate::tone::{ToneMap, ToneSource};
 use crate::upload::FrameUploads;
 use crate::visibility_view::VisibilityView;
 
@@ -68,7 +75,8 @@ pub enum Scene<'a> {
     /// Draws it: the tiles the frame draws, its view (of the frame's size) and its time.
     Draw(&'a SceneInputs<'a>),
     /// Shows the last scene drawn again, shaded with this frame's [`Look`]: the shading pass
-    /// alone, no level choice or raster, for a change of material or wireframe with nothing else
+    /// alone (or, with the camera still and the look unchanged, nothing: the accumulated image as
+    /// it is), no level choice or raster, for a change of material or wireframe with nothing else
     /// changed (spec target: a shading pass only, independent of the mesh). Shows no scene
     /// ([`Drawn::shown`] false) if the last one drawn was of another size than the frame, or there
     /// was none, or the frame brings uploads: those may change the tiles the visibility buffer's
@@ -204,6 +212,8 @@ pub struct Renderer {
     image: ImagePasses,
     /// The scene's level choice and raster, once given ([`Renderer::set_passes`]).
     passes: Option<FramePasses>,
+    /// Whether the accumulation's histories carry on, and the last jitter.
+    aa: AaState,
 }
 
 impl Renderer {
@@ -217,6 +227,7 @@ impl Renderer {
         Ok(Self {
             image: ImagePasses::new(gpu, format)?,
             passes: None,
+            aa: AaState::default(),
         })
     }
 
@@ -274,6 +285,7 @@ impl Renderer {
         let Self {
             image: image_passes,
             passes: scene_passes,
+            aa,
         } = self;
         let ImagePasses {
             view,
@@ -299,6 +311,7 @@ impl Renderer {
             look: inputs.look,
             size: inputs.size,
             staged: uploads.as_ref().is_some_and(|uploads| !uploads.is_empty()),
+            clear: inputs.clear,
         };
         let outcome = gpu.scoped("encoding a frame", || {
             let commands = gpu
@@ -309,7 +322,7 @@ impl Renderer {
             let mut encoded = None;
             let passes = |frame: &mut CommandEncoder| {
                 encoded = to_draw.and_then(|(scene, passes)| {
-                    encode_scene(gpu, frame, scene, passes, (view, tone), showing)
+                    encode_scene(gpu, frame, scene, passes, (view, tone, &mut *aa), showing)
                 });
                 let mut pass = frame.begin_render_pass(&RenderPassDescriptor {
                     label: Some("scene and overlay"),
@@ -336,16 +349,7 @@ impl Renderer {
             submit(gpu, uploads, commands, passes);
             encoded
         })?;
-        let (scene, visible) = match outcome {
-            Some(Ok(encoded)) => {
-                if let Some(readback) = encoded.readback {
-                    readback.submitted();
-                }
-                (drawing, encoded.shown)
-            }
-            Some(Err(error)) => return Err(error.into()),
-            None => (false, false),
-        };
+        let (scene, visible) = settle(outcome, drawing, &mut self.aa)?;
         times.encode = encoding.elapsed();
         let presenting = Instant::now();
         before_present();
@@ -370,62 +374,155 @@ struct Showing {
     size: Size,
     /// Whether the frame brings uploads: a scene shaded again must not.
     staged: bool,
+    /// The frame's clear colour, which the tone map composites over.
+    clear: Color,
 }
 
-/// Encodes `scene` with `passes` into `frame`, after the uploads (drawn, or shaded again), and
-/// binds the image the frame shows ([`Showing::look`]) for the tone map or the debug view;
-/// `None` for no scene.
+/// Encodes `scene` with `passes` into `frame`, after the uploads; `None` for no scene.
+///
+/// The scene is drawn or shaded again, with its accumulation as `aa` decides, and the image the
+/// frame shows ([`Showing::look`]) is bound for the tone map or the debug view.
 ///
 /// A scene drawn is always shaded, the debug view or not, so the shading pass's view and bind
 /// groups are the last scene's when a later frame shades it again.
 ///
 /// # Errors
 ///
-/// As [`FramePasses::encode`] and [`FramePasses::encode_shading`]; [`FrameError::Gpu`] if the
-/// tone map or the debug view can't bind its image.
+/// As [`FramePasses::encode`], [`FramePasses::encode_shading`] and
+/// [`FramePasses::encode_accumulation`]; [`FrameError::Gpu`] if the tone map or the debug view
+/// can't bind its image.
 fn encode_scene(
     gpu: &Gpu,
     frame: &mut CommandEncoder,
     scene: Scene<'_>,
     passes: &mut FramePasses,
-    (view, tone): (&mut VisibilityView, &mut ToneMap),
+    (view, tone, aa): (&mut VisibilityView, &mut ToneMap, &mut AaState),
     showing: Showing,
 ) -> Option<Result<EncodedScene, FrameError>> {
     let shaded = showing.look.view == SceneView::Shaded;
     let encoded = match scene {
         Scene::None => return None,
         Scene::Draw(scene) => (|| {
-            let readback = passes.encode(gpu, frame, scene)?;
+            let step = aa.draw(!scene.moving, showing.look, showing.size);
+            let jitter = match step {
+                AaFrame::Accumulate { jitter, .. } => jitter,
+                AaFrame::Plain | AaFrame::Filter | AaFrame::Show => Jitter::CENTRE,
+            };
+            let readback = passes.encode_jittered(gpu, frame, scene, jitter)?;
             passes.encode_shading(gpu, frame, scene)?;
-            Ok(EncodedScene {
-                readback,
-                shown: true,
-            })
+            if let AaFrame::Accumulate { restart, .. } = step {
+                let changes = Some(scene.bounds);
+                passes.encode_accumulation(gpu, frame, Some(scene.tree), changes, restart)?;
+            }
+            Ok((
+                EncodedScene {
+                    readback,
+                    shown: true,
+                },
+                step,
+            ))
         })(),
         Scene::Reshade => (|| {
             let visibility = passes.raster().visibility();
             let same_size = (visibility.width(), visibility.height())
                 == (showing.size.width(), showing.size.height());
             let unchanged = same_size && !showing.staged;
-            let visible = unchanged && (!shaded || passes.encode_shading_again(gpu, frame)?);
-            Ok(EncodedScene {
+            if !unchanged {
+                let nothing = EncodedScene {
+                    readback: None,
+                    shown: false,
+                };
+                return Ok((nothing, AaFrame::Plain));
+            }
+            let step = aa.reshade(showing.look, showing.size);
+            let visible = match step {
+                AaFrame::Show => passes.aa().mean().is_some(),
+                AaFrame::Accumulate { restart, .. } => {
+                    let again = passes.encode_shading_again(gpu, frame)?;
+                    if again {
+                        passes.encode_accumulation(gpu, frame, None, None, restart)?;
+                    }
+                    again
+                }
+                AaFrame::Plain | AaFrame::Filter => true,
+            };
+            let encoded = EncodedScene {
                 readback: None,
                 shown: visible,
-            })
+            };
+            Ok((encoded, step))
         })(),
     };
-    Some(encoded.and_then(|encoded| {
+    Some(encoded.and_then(|(encoded, step)| {
         if encoded.shown {
             if shaded {
-                if let Some(target) = passes.shade().target() {
-                    tone.bind(gpu, target)?;
-                }
+                bind_shaded(gpu, passes, tone, step, showing.clear)?;
             } else {
                 view.bind(gpu, passes.raster().visibility())?;
             }
         }
         Ok(encoded)
     }))
+}
+
+/// Binds the image a shaded frame shows for the tone map, as `step` made it: the histories'
+/// means while still, else the shaded image, filtered while moving.
+///
+/// # Errors
+///
+/// [`FrameError::Gpu`] if the tone map can't bind it.
+fn bind_shaded(
+    gpu: &Gpu,
+    passes: &FramePasses,
+    tone: &mut ToneMap,
+    step: AaFrame,
+    clear: Color,
+) -> Result<(), FrameError> {
+    let Some(target) = passes.shade().target() else {
+        return Ok(());
+    };
+    let source = match (step, passes.aa().mean()) {
+        (AaFrame::Accumulate { .. } | AaFrame::Show, Some(means)) => ToneSource::Means {
+            shaded: target,
+            means,
+        },
+        _ => ToneSource::Shaded {
+            image: target,
+            filter: step == AaFrame::Filter,
+        },
+    };
+    tone.bind(gpu, source, clear)?;
+    Ok(())
+}
+
+/// What a submitted frame's scene came to: whether it was drawn (`drawing`, if encoded) and
+/// shown. Its readback is marked submitted; a scene not shown leaves `aa` no history to continue.
+///
+/// # Errors
+///
+/// The scene's encoding error, if it had one.
+fn settle(
+    outcome: Option<Result<EncodedScene, FrameError>>,
+    drawing: bool,
+    aa: &mut AaState,
+) -> Result<(bool, bool), FrameError> {
+    let settled = match outcome {
+        Some(Ok(encoded)) => {
+            if let Some(readback) = encoded.readback {
+                readback.submitted();
+            }
+            (drawing, encoded.shown)
+        }
+        Some(Err(error)) => {
+            aa.lost();
+            return Err(error);
+        }
+        None => (false, false),
+    };
+    if !settled.1 {
+        aa.lost();
+    }
+    Ok(settled)
 }
 
 /// Encodes `passes` into `encoder` and submits it.
