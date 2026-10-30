@@ -141,6 +141,10 @@ struct GpuMatCapParams {
 }
 
 /// The MatCap's WGSL: its bindings and `material`.
+///
+/// The Toksvig mip choice assumes the image's scale at its centre (a turn of `d` radians is `d /
+/// 2` of the width), so near silhouettes, where the image's scale differs, the blur is not the
+/// lobe's: see the comment on `material`.
 const MATCAP_WGSL: &str = r"
 // The MatCap images, one layer a style (render::material::MatCapStyle), linear, mipmapped.
 @group(2) @binding(0) var matcaps: texture_2d_array<f32>;
@@ -168,7 +172,9 @@ struct MatCapParams {
 // concentration k = r (3 - r^2) / (1 - r^2), whose angular spread is about 1 / sqrt(k) radians.
 // The image maps a normal's turn of d radians near its centre to d / 2 of its width, so the lobe
 // covers spread * size / 2 texels: the mip level whose texels are that wide. r = 1 (a finest
-// tile, or a flat one) is level 0.
+// tile, or a flat one) is level 0. The scale is the image's centre's: a turn of d radians at
+// angle a from the view covers d cos(a) / 2 of the width, less towards the rim, so there the
+// chosen level is wider than the lobe and silhouettes over-blur.
 fn material(surface: Surface, eye: Eye) -> vec3<f32> {
     let towards = eye.to_eye;
     var across = cross(eye.up, towards);

@@ -28,10 +28,10 @@
 //!
 //! **Features.**
 //!
-//! 5. On each image's achromatic channel, normalized (`y / 100`), the edge and point responses: the
-//!    gradient's length after the first derivatives of a Gaussian of `σ = ½ ·` [`FEATURE`] `· ppd`,
-//!    and the length of `(∂²/∂x², ∂²/∂y²)` after its second derivatives, each filter scaled so its
-//!    positive weights sum to 1 (and the second's negative ones to −1).
+//! 5. On each image's achromatic channel, normalized (`(y + 16) / 116`), the edge and point
+//!    responses: the gradient's length after the first derivatives of a Gaussian of `σ = ½ ·`
+//!    [`FEATURE`] `· ppd`, and the length of `(∂²/∂x², ∂²/∂y²)` after its second derivatives, each
+//!    filter scaled so its positive weights sum to 1 (and the second's negative ones to −1).
 //! 6. `Δf = max(|edge_R − edge_T|, |point_R − point_T|)`, and `e_f = (Δf / √2)^½`.
 //!
 //! **Together:** `E = e_c^(1 − e_f)`: a feature difference (an edge moved, a point lost) raises

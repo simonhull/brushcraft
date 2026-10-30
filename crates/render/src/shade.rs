@@ -43,7 +43,10 @@
 //! the corners' mixed by the **perspective-correct barycentric coordinates** of the pixel's centre,
 //! solved in homogeneous clip coordinates (Cramer's rule: no division by a corner's `w`), as the
 //! rasterizer interpolates. A morphing vertex's normal and roughness term are carried from its
-//! parents' midpoint by its factor, as its position is. The tests check the rebuilt point against
+//! parents' midpoint by its factor, as its position is. That midpoint is of the tile's own even
+//! vertices' normals, not the parent tile's (whose averaged normals and roughness are its own,
+//! over a wider tent), so as a morph starts the shading can step slightly where the geometry
+//! doesn't. The tests check the rebuilt point against
 //! the depth the raster wrote, pixel by pixel, with edge variants and morphs in the scene, and that
 //! the check bites when either is ignored.
 //!
