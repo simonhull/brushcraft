@@ -796,3 +796,15 @@ fn quads_reaching_behind_the_eye_are_rebuilt_as_drawn_collapsed_triangles_never_
         }
     });
 }
+
+#[test]
+fn the_pass_indexes_no_local_array_at_run_time() {
+    let slots = SlotLayout::new([2; crate::residency::CLASSES]);
+    let source = shade_source(slots, crate::material::MATCAP_WGSL, &[]);
+    let indexed = crate::shader_check::run_time_indexed_locals(&source);
+    assert_eq!(
+        indexed,
+        Vec::<String>::new(),
+        "the crate's notes, \"Shaders\""
+    );
+}

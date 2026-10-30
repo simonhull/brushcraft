@@ -26,6 +26,16 @@
 //!
 //! With the `spike` feature, the `spike` module holds M1a's GPU experiments, built and tested by
 //! the gate but not part of the renderer.
+//!
+//! # Shaders
+//!
+//! Per-pixel and per-vertex WGSL never indexes a function-local array by a value known only at
+//! run time: not a `let` or `var` array, an array inside a local copy of a struct, or a
+//! `var<private>` one, even by a loop counter. It picks with `select` or a branch instead, or
+//! reads the buffer's array itself. Some drivers move such an array to slow memory, and the
+//! whole pass slows with it: the shading pass ran 6 to 20 times slower on an NVIDIA desktop GPU
+//! while it picked its triangle's corners that way. Lavapipe, which the tests run on, doesn't
+//! show it, so the shaders' tests hold them to the rule through `shader_check`.
 
 pub mod aa;
 pub mod camera;
@@ -40,6 +50,8 @@ pub mod overlay;
 pub mod raster;
 pub mod residency;
 pub mod shade;
+#[cfg(test)]
+mod shader_check;
 #[cfg(feature = "spike")]
 pub mod spike;
 pub mod surface;

@@ -2157,3 +2157,14 @@ fn cluster_keys(world: &World, clusters: &[GpuCluster]) -> BTreeSet<(u32, u32)> 
     });
     keys.collect()
 }
+
+#[test]
+fn the_raster_indexes_no_local_array_at_run_time() {
+    let source = shader_source(&SlotLayout::new([2; CLASSES]), &[]);
+    let indexed = crate::shader_check::run_time_indexed_locals(&source);
+    assert_eq!(
+        indexed,
+        Vec::<String>::new(),
+        "the crate's notes, \"Shaders\""
+    );
+}

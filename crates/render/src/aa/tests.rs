@@ -1232,3 +1232,15 @@ fn the_half_float_mean_drifts_a_few_ulps_at_most() {
             "the test rounds: an exact mean would say nothing"
         );
     });
+}
+
+#[test]
+fn the_pixel_pass_indexes_no_local_array_at_run_time() {
+    let (_, pixels) = sources(&[]);
+    let indexed = crate::shader_check::run_time_indexed_locals(&pixels);
+    assert_eq!(
+        indexed,
+        Vec::<String>::new(),
+        "the crate's notes, \"Shaders\""
+    );
+}

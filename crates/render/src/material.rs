@@ -142,7 +142,7 @@ struct GpuMatCapParams {
 /// The Toksvig mip choice assumes the image's scale at its centre (a turn of `d` radians is `d /
 /// 2` of the width), so near silhouettes, where the image's scale differs, the blur is not the
 /// lobe's: see the comment on `material`.
-const MATCAP_WGSL: &str = r"
+pub(crate) const MATCAP_WGSL: &str = r"
 // The MatCap images, one layer a style (render::material::MatCapStyle), linear, mipmapped.
 @group(2) @binding(0) var matcaps: texture_2d_array<f32>;
 // Trilinear, clamped.
