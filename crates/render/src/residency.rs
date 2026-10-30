@@ -4,12 +4,13 @@
 //!
 //! Tile data lives in **slot pools**, one per size class (plan decision 2). A class is a tile
 //! side: `2^l + 1` at levels up to 6, where a tile is a whole face, and 65 above. Each class is
-//! a few storage buffers as large as the device binds (`max_storage_buffer_binding_size`; see
-//! [`Tier`]), cut into equal slots of [`GpuVertex`]es, created as the budget
-//! ([`ResidencyConfig::budget_bytes`], from the capability tier) allows and kept; a [`Slot`] is
-//! (class, buffer, index). A tile keeps its slot until an epoch large enough for shadow slots
-//! moves it; what stays the tile's while it is resident is its node index in the tile tree
-//! ([`crate::tree`]), and that is what the visibility buffer's cluster id derives from.
+//! a few storage buffers, the first 64 MiB and each next twice the last, up to as large as the
+//! device binds (`max_storage_buffer_binding_size`; see [`Tier`]), cut into equal slots of
+//! [`GpuVertex`]es, created as the budget ([`ResidencyConfig::budget_bytes`], from the capability
+//! tier) allows and kept; a [`Slot`] is (class, buffer, index). A tile keeps its slot until an
+//! epoch large enough for shadow slots moves it; what stays the tile's while it is resident is its
+//! node index in the tile tree ([`crate::tree`]), and that is what the visibility buffer's cluster
+//! id derives from.
 //!
 //! # What stays
 //!
@@ -194,15 +195,17 @@ impl Slot {
 
 /// A capability tier: what the device is given, per the renderer spec's tier table.
 ///
-/// The device is opened with its adapter's limits ([`Gpu::open`]), and slot buffers are as
-/// large as `max_storage_buffer_binding_size` allows, so a class is a few buffers. As measured
-/// (`cargo run -p render --example adapters`, wgpu 30.0.1):
+/// The device is opened with its adapter's limits ([`Gpu::open`]). A class's slot buffers start
+/// at 64 MiB and double up to as large as `max_storage_buffer_binding_size` allows (`pool.rs`),
+/// so a class is a few buffers. As measured (`cargo run -p render --example adapters`, wgpu
+/// 30.0.1), with the buffers the benchmark project's finest class and all classes can have at
+/// the budget (counted in `pool.rs`'s tests):
 ///
-/// | Tier | Adapter | Storage binding | Buffer | Storage buffers per stage | Buffers per class at the budget |
-/// |---|---|---|---|---|---|
-/// | Desktop | RTX 4090 (Vulkan) | 2047 MiB | 4095 MiB | 524,288 | 2 |
-/// | Desktop | Apple M4 (Metal) | 4095 MiB | 4095 MiB | not recorded | 1 |
-/// | (gate) | lavapipe (Vulkan) | 128 MiB | 2047 MiB | 48 | 32 |
+/// | Tier | Adapter | Storage binding | Buffer | Storage buffers per stage | Finest class's buffers | All classes' |
+/// |---|---|---|---|---|---|---|
+/// | Desktop | RTX 4090 (Vulkan) | 2047 MiB | 4095 MiB | 524,288 | 7 | 14 |
+/// | Desktop | Apple M4 (Metal) | 4095 MiB | 4095 MiB | not recorded | 7 | 14 |
+/// | (gate) | lavapipe (Vulkan) | 128 MiB | 2047 MiB | 48 | 33 | 40 |
 /// | Mobile high | Adreno 730 | pending (M1c) | | | |
 ///
 /// The bounds pass binds one slot buffer per dispatch. The raster's one draw a phase binds every
@@ -376,7 +379,7 @@ impl ResidencyConfig {
     /// A configuration: a budget of `budget_bytes`; staging buffers of `staging_bytes`, at
     /// most `staging_cap` of them alive; epochs up to `small_epoch_bytes` written in place,
     /// forced epochs up to the staging cap a frame; `request_capacity` requests a frame; the
-    /// floor up to `floor_top`. Slot buffers are as large as the device binds.
+    /// floor up to `floor_top`. Slot buffers grow to as large as the device binds.
     ///
     /// # Errors
     ///
@@ -559,8 +562,13 @@ pub struct ResidencyStats {
     pub resident: usize,
     /// Floor tiles resident.
     pub floor: usize,
-    /// Bytes of slot buffers.
+    /// Bytes of slot buffers made: every slot, handed out or not.
     pub allocated_bytes: u64,
+    /// Bytes of the slots handed out: resident tiles and pending epochs' shadow copies. The
+    /// floor's classes are made whole up front with twice their slots (headroom for a resync of
+    /// the whole floor: 219 MiB on the benchmark project), so half of those stay allocated and
+    /// unused.
+    pub used_bytes: u64,
     /// Tiles requested and not resident yet.
     pub wanted: usize,
     /// Tiles the source had nothing for, waiting for an epoch naming them.
@@ -747,7 +755,7 @@ impl Residency {
     /// yet: the floor's slot buffers are made now (with their shadow headroom), and the floor is
     /// staged by the first [`Residency::stage`], whole.
     ///
-    /// Slot buffers are as large as the device binds, or the configuration's smaller size;
+    /// Slot buffers grow to as large as the device binds, or the configuration's smaller size;
     /// staging buffers hold at least one tile of the finest class.
     ///
     /// # Errors
@@ -932,6 +940,7 @@ impl Residency {
             resident: self.entries.len(),
             floor: self.floor_resident,
             allocated_bytes: self.pools.allocated(),
+            used_bytes: self.pools.used(),
             wanted: self.wanted.len(),
             unavailable: self.unavailable.len(),
             pending_epochs: self.groups.len(),

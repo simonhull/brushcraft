@@ -1546,3 +1546,52 @@ fn eviction_under_a_tiny_budget_never_removes_an_ancestor_of_the_cut() {
         );
     });
 }
+
+#[test]
+fn the_first_finer_tile_makes_only_a_small_slot_buffer() {
+    GpuTest::run(|gpu| {
+        // Level 9: the finest class has 510 tiles, 1020 slots with their headroom, more than
+        // the first buffer's 496 and more than lavapipe's 128 MiB buffers would hold at once.
+        let finest = level(9);
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, finest);
+        let mut residency =
+            Residency::new(gpu, &mesh, finest, ResidencyConfig::default()).expect("residency");
+        let class = SizeClass::of(finest);
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        assert!(
+            residency.slot_buffers(class).is_empty(),
+            "the floor has none"
+        );
+        let floor_bytes = residency.stats().allocated_bytes;
+        let tile = TileKey::displacement(geom::FaceId::new(0), finest, 0, 0).expect("a key");
+        quiet_frame(gpu, &mut residency, &mut model, &[tile]);
+        quiet_frame(gpu, &mut residency, &mut model, &[tile]);
+        assert!(residency.slot(&tile).is_some(), "it arrived");
+        let buffers = residency.slot_buffers(class);
+        assert_eq!(buffers.len(), 1, "one buffer");
+        let first = pool::FIRST_BUFFER_BYTES / class.slot_bytes() * class.slot_bytes();
+        assert_eq!(
+            buffers[0].size(),
+            first,
+            "of about 64 MiB, not the binding's size"
+        );
+        let stats = residency.stats();
+        assert_eq!(stats.allocated_bytes, floor_bytes + first);
+        assert_eq!(
+            stats.used_bytes,
+            used_by(&residency),
+            "used counts the slots handed out"
+        );
+        assert!(stats.used_bytes < stats.allocated_bytes);
+    });
+}
+
+/// The bytes of every resident tile's slot.
+fn used_by(residency: &Residency) -> u64 {
+    residency
+        .resident()
+        .filter_map(|key| residency.slot(key))
+        .map(|slot| slot.class().slot_bytes())
+        .sum()
+}

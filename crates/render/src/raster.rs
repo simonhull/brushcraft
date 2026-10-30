@@ -96,9 +96,10 @@
 //! headroom), a placeholder bound for each not made yet, so nothing is recompiled mid-session.
 //! Residency refuses a budget whose most buffers don't fit `max_storage_buffers_per_shader_stage`
 //! beside the raster's own four ([`slot_buffer_limit`]; on Metal its two uniform buffers count
-//! against the same table); every tier measured fits (desktop: 8 buffers; lavapipe, the gate: 38
-//! of 48). A tier past it would draw one indirect draw per slot buffer from cluster lists split
-//! by buffer: not built (plan, "Gaps found while executing", the "Task 4 review" bullet).
+//! against the same table); every tier measured fits (desktop: 14 buffers for the benchmark
+//! project; lavapipe, the gate: 40 of its 44). A tier past it would draw one indirect draw per slot
+//! buffer from cluster lists split by buffer: not built (plan, "Gaps found while executing", the
+//! "Task 4 review" bullet).
 //!
 //! # A frame
 //!
