@@ -1000,6 +1000,71 @@ fn a_readback_says_which_frame_it_is_of() {
 }
 
 #[test]
+fn a_frame_without_a_level_choice_is_heard_of_but_keeps_the_tiles_wanted() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), ResidencyConfig::default())
+            .expect("residency");
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        let deadline = || Instant::now() + Duration::from_secs(60);
+        // A drawn frame: its level choice asks for one tile.
+        let key = TileKey::displacement(geom::FaceId::new(0), level(FINEST), 0, 0).expect("a key");
+        residency.begin_frame(gpu).expect("a frame begins");
+        let drawn = residency
+            .stage(gpu, &mut model, deadline())
+            .expect("staged");
+        let place = Place::of(&key);
+        let words = [1_u32, 0, 0, 0, key.face().index(), place.packed(), 0, 0];
+        let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        bytes[24..28].copy_from_slice(&50.0_f32.to_le_bytes());
+        gpu.queue()
+            .write_buffer(residency.request_buffer(), 0, &bytes);
+        submit(gpu, drawn, |_| {});
+        // The next frame hears it and wants the tile; this frame gets no image (a retry), so
+        // its passes, the level choice among them, don't run.
+        residency.begin_frame(gpu).expect("a frame begins");
+        let requests = residency
+            .take_requests()
+            .expect("the drawn frame's requests");
+        residency.want(&requests);
+        let wanted = residency.wanted.clone();
+        assert!(wanted.contains_key(&key), "wanted: {wanted:?}");
+        let retry = residency.frame();
+        let retried = residency
+            .stage(gpu, &mut model, deadline())
+            .expect("staged");
+        gpu.scoped("a frame with no image", || {
+            let encoder = gpu
+                .device()
+                .create_command_encoder(&CommandEncoderDescriptor::default());
+            retried
+                .without_level_choice()
+                .submit(gpu.queue(), encoder, |_| {});
+        })
+        .expect("submitted");
+        gpu.device()
+            .poll(PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        // The retried frame is heard of, so settling can end, but asks for nothing: the tile is
+        // still wanted, since the frame it was first asked for.
+        residency.begin_frame(gpu).expect("a frame begins");
+        assert_eq!(residency.requests_heard(), Some(retry), "heard of");
+        assert!(residency.take_requests().is_none(), "with no requests");
+        assert_eq!(
+            residency.wanted.get(&key).map(|want| want.since),
+            wanted.get(&key).map(|want| want.since),
+            "still wanted, as since it was first asked for"
+        );
+        let next = residency
+            .stage(gpu, &mut model, deadline())
+            .expect("staged");
+        submit(gpu, next, |_| {});
+        assert!(residency.slot(&key).is_some(), "and it arrives");
+    });
+}
+
+#[test]
 fn tiles_the_source_has_nothing_for_wait_for_an_epoch_naming_them() {
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");

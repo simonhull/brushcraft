@@ -527,6 +527,7 @@ impl Batch {
             copies: std::mem::take(&mut self.copies),
             bytes: self.bytes,
             requests,
+            level_choice: true,
             returns: self.returns.clone(),
             outcomes,
         }
@@ -554,6 +555,9 @@ pub(crate) enum Readback {
     Mapped(Buffer, u64),
     /// Unmapped and unused: its frame was dropped before submission.
     Unused(Buffer),
+    /// Unmapped and unread: frame `1` was submitted without a level choice, which writes the
+    /// requests ([`FrameUploads::without_level_choice`]). It is heard of, with no requests.
+    Skipped(Buffer, u64),
     /// Mapping failed; the buffer is gone.
     Failed,
 }
@@ -600,6 +604,9 @@ pub struct FrameUploads {
     bytes: u64,
     /// The request readback, if a readback buffer was free.
     requests: Option<RequestCopy>,
+    /// Whether the frame's passes run the level choice, which writes the request buffer the
+    /// readback copies.
+    level_choice: bool,
     /// Where staging buffers go back to the ring.
     returns: Sender<Returned>,
     /// Where the frame's outcome goes.
@@ -617,6 +624,16 @@ impl FrameUploads {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.copies.is_empty()
+    }
+
+    /// The same uploads, for a frame whose passes don't run the level choice (a frame with no
+    /// image, or no scene): the request buffer isn't copied out or cleared, since nothing wrote
+    /// it, and the frame's readback is heard of with no requests, so it neither replaces the
+    /// tiles wanted nor keeps residency waiting for it
+    /// ([`crate::residency::Residency::requests_heard`]).
+    pub const fn without_level_choice(mut self) -> Self {
+        self.level_choice = false;
+        self
     }
 
     /// Encodes the copies into tile slots and the tile tree: first in the frame's command
@@ -651,6 +668,17 @@ impl FrameUploads {
     ) {
         self.encode(&mut encoder);
         passes(&mut encoder);
+        if !self.level_choice
+            && let Some(RequestCopy {
+                target,
+                done,
+                frame,
+                ..
+            }) = self.requests.take()
+        {
+            // A residency that's gone has nothing to hear.
+            drop(done.send(Readback::Skipped(target, frame)));
+        }
         if let Some(requests) = &self.requests {
             encoder.copy_buffer_to_buffer(
                 &requests.source,

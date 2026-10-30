@@ -220,6 +220,14 @@ impl Renderer {
             .overlay
             .prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         let to_draw = inputs.scene.zip(scene_passes.as_mut());
+        // A frame with no scene runs no level choice: its request readback reads nothing.
+        let uploads = uploads.map(|uploads| {
+            if to_draw.is_some() {
+                uploads
+            } else {
+                uploads.without_level_choice()
+            }
+        });
         let outcome = gpu.scoped("encoding a frame", || {
             let commands = gpu
                 .device()
@@ -336,7 +344,9 @@ fn not_drawn(
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("uploads"),
                 });
-            uploads.submit(gpu.queue(), encoder, |_| {});
+            uploads
+                .without_level_choice()
+                .submit(gpu.queue(), encoder, |_| {});
         })?;
         times.encode = encoding.elapsed();
     }

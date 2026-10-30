@@ -253,6 +253,13 @@ impl RequestBuffer {
                     self.free.push(buffer);
                     continue;
                 }
+                Readback::Skipped(buffer, frame) => {
+                    // Heard of, so settling can end, but nothing asked for: the tiles wanted
+                    // stay as the last frame with a level choice left them.
+                    self.heard = self.heard.max(Some(frame));
+                    self.free.push(buffer);
+                    continue;
+                }
                 Readback::Failed => {
                     self.made -= 1;
                     continue;
