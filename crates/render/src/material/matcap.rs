@@ -37,7 +37,7 @@ impl MatCapStyle {
 
     /// The style's layer in the images.
     #[must_use]
-    pub const fn layer(self) -> u32 {
+    pub(crate) const fn layer(self) -> u32 {
         match self {
             Self::Clay => 0,
             Self::Glossy => 1,

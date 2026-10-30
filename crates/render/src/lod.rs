@@ -252,39 +252,41 @@ impl GpuCluster {
 /// variant and finer edges ([`GpuCluster::variant`], [`GpuCluster::finer`]) to rebuild the
 /// triangles drawn there: the id carries only the node, the cluster and the quad. The cluster's
 /// own bits are the tile's on the edges the cluster lies on ([`DrawnEdges::cell`]).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-pub struct DrawnEdges(u8);
+pub(crate) struct DrawnEdges(u8);
 
+#[cfg(test)]
 impl DrawnEdges {
     /// The edges whose neighbour is drawn a level `coarser` and `finer` (bit `k` for edge `k`;
     /// bits past the fourth are dropped).
     #[must_use]
-    pub const fn new(coarser: u8, finer: u8) -> Self {
+    pub(crate) const fn new(coarser: u8, finer: u8) -> Self {
         Self((coarser & 0xF) | ((finer & 0xF) << 4))
     }
 
     /// The edges whose neighbour is drawn a level coarser.
     #[must_use]
-    pub const fn coarser(self) -> u8 {
+    pub(crate) const fn coarser(self) -> u8 {
         self.0 & 0xF
     }
 
     /// The edges whose neighbour is drawn finer.
     #[must_use]
-    pub const fn finer(self) -> u8 {
+    pub(crate) const fn finer(self) -> u8 {
         self.0 >> 4
     }
 
     /// The byte, as the GPU keeps it.
     #[must_use]
-    pub const fn bits(self) -> u8 {
+    pub(crate) const fn bits(self) -> u8 {
         self.0
     }
 
     /// [`GpuCluster::cell`] of cluster `(cx, cy)` of a tile `quads` quads a side whose drawn
     /// edges these are, as `emit` lists it (WGSL's `cluster_cell`).
     #[must_use]
-    pub fn cell(self, cx: u32, cy: u32, quads: u32) -> u32 {
+    pub(crate) fn cell(self, cx: u32, cy: u32, quads: u32) -> u32 {
         let per = (quads / 8).max(1);
         let on = u32::from(cy == 0)
             | (u32::from(cx + 1 == per) << 1)

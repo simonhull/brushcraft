@@ -19,11 +19,13 @@ use wgpu::{
 use crate::gpu::{Gpu, GpuError};
 
 /// The curve's knee: below it, colour is shown as it is.
-pub const KNEE: f32 = 0.8;
+#[cfg(test)]
+pub(crate) const KNEE: f32 = 0.8;
 
-/// The curve, on the CPU: `c` (linear, not negative) as the tone map shows it, linear.
+/// The curve on the CPU, for the tests: `c` (linear, not negative) as the tone map shows it.
 #[must_use]
-pub fn tone(c: f32) -> f32 {
+#[cfg(test)]
+pub(crate) fn tone(c: f32) -> f32 {
     if c <= KNEE {
         return c.max(0.0);
     }
@@ -32,7 +34,7 @@ pub fn tone(c: f32) -> f32 {
 
 /// The tone map's pipeline for one frame format, and the bind group of the image it last showed.
 #[derive(Debug)]
-pub struct ToneMap {
+pub(crate) struct ToneMap {
     /// Draws the fullscreen triangle.
     pipeline: RenderPipeline,
     /// The shaded image bound, and its bind group: kept while the shading pass keeps it.
@@ -45,7 +47,7 @@ impl ToneMap {
     /// # Errors
     ///
     /// As [`Gpu::scoped`], if the shader or pipeline is refused.
-    pub fn new(gpu: &Gpu, format: TextureFormat) -> Result<Self, GpuError> {
+    pub(crate) fn new(gpu: &Gpu, format: TextureFormat) -> Result<Self, GpuError> {
         let device = gpu.device();
         let encode = if format.is_srgb() { 0.0 } else { 1.0 };
         let constants = [("ENCODE_SRGB", encode)];
@@ -99,7 +101,7 @@ impl ToneMap {
     /// # Errors
     ///
     /// As [`Gpu::scoped`].
-    pub fn bind(&mut self, gpu: &Gpu, shaded: &Texture) -> Result<(), GpuError> {
+    pub(crate) fn bind(&mut self, gpu: &Gpu, shaded: &Texture) -> Result<(), GpuError> {
         if self
             .bound
             .as_ref()
@@ -124,7 +126,7 @@ impl ToneMap {
     }
 
     /// Draws the image last bound ([`ToneMap::bind`]) into `pass`; nothing if none is.
-    pub fn draw(&self, pass: &mut RenderPass<'_>) {
+    pub(crate) fn draw(&self, pass: &mut RenderPass<'_>) {
         if let Some((_, group)) = &self.bound {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, group, &[]);

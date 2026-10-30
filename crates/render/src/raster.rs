@@ -95,8 +95,8 @@
 //! buffers the raster keeps per node, read with the same code the vertex shader runs
 //! (`place.wgsl`'s `place_vertex`):
 //!
-//! - **The drawn edges** ([`crate::lod::DrawnEdges`]): the level choice's `emit` records, in each
-//!   cut entry, across which of the tile's edges the neighbour is drawn coarser and finer, and the
+//! - **The drawn edges** (`crate::lod::DrawnEdges`): the level choice's `emit` records, in each cut
+//!   entry, across which of the tile's edges the neighbour is drawn coarser and finer, and the
 //!   stamp pass keeps that byte per node. A cluster's variant and finer bits are the tile's on the
 //!   edges the cluster lies on, so the byte and the cluster's place give back the very
 //!   `Cluster.cell` emit listed (`lod.rs`' `CLUSTER_WGSL`, `cluster_cell`, which emit lists

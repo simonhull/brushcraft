@@ -5,7 +5,7 @@
 //! For each pixel the raster drew ([`crate::raster`]), the pass (`shade.wgsl`) rebuilds the
 //! triangle drawn there and the surface at the pixel's centre, and calls the material
 //! ([`crate::material`]) with it; the colour goes, linear, into a 16-bit float target
-//! ([`HDR_FORMAT`]), which the tone map ([`crate::tone`]) then brings to the frame's format
+//! (`HDR_FORMAT`), which the tone map (`crate::tone`) then brings to the frame's format
 //! (spec, "Shading": a linear HDR pipeline from the first frame).
 //!
 //! # Rebuilding what was drawn
@@ -16,7 +16,7 @@
 //!
 //! 1. **The cluster's `cell`:** its place in the tile (from the id's cluster and the tile's side),
 //!    its edge variant and its finer edges. The id doesn't carry the last two, so the level choice
-//!    records each tile's [`crate::lod::DrawnEdges`] in its cut entry and the raster's stamp pass
+//!    records each tile's `crate::lod::DrawnEdges` in its cut entry and the raster's stamp pass
 //!    keeps them per node; `cluster_cell` (the function `emit` lists clusters with) rebuilds the
 //!    very cell from them.
 //! 2. **The remap:** each corner's grid vertex through the variant's table.
@@ -59,10 +59,10 @@
 //! # The material and the overlay
 //!
 //! The material sees WGSL's `Surface` (the point, the unit normal, the roughness term, channels)
-//! and `Eye` ([`crate::material::SURFACE_WGSL`]), and returns linear colour. The **wireframe**
+//! and `Eye` (`crate::material::SURFACE_WGSL`), and returns linear colour. The **wireframe**
 //! is analytic: each barycentric coordinate over its rate of change across the screen is the
 //! pixel's distance to the triangle's edge opposite that corner, and a line of
-//! [`WIRE_WIDTH`] pixels with a pixel's ramp is mixed over the colour
+//! `WIRE_WIDTH` pixels with a pixel's ramp is mixed over the colour
 //! ([`ShadeSettings::wireframe`]). Background pixels are written as zero (alpha 0), for the tone
 //! map to leave the frame's clear colour there.
 //!
@@ -75,7 +75,7 @@
 //!
 //! # A shading pass alone
 //!
-//! A change of material or of the wireframe needs no raster: [`Shade::encode_again`] runs the
+//! A change of material or of the wireframe needs no raster: `Shade::encode_again` runs the
 //! pass over the visibility buffer last shaded, with the bind groups it kept, the material's
 //! new settings and the same view. Its cost is one pass over the pixels, independent of the mesh
 //! (spec target, "Light or material change").
@@ -99,7 +99,9 @@ use crate::cull::{CULL_WGSL, SlotBuffers, entry, storage_buffer, uniform_buffer}
 use crate::gpu::{Gpu, GpuError};
 use crate::indices::INDICES_WGSL;
 use crate::lod::CLUSTER_WGSL;
-use crate::material::{MatCap, MatCapStyle, Material, SHADING_STAGES, SURFACE_WGSL};
+use crate::material::{
+    MATERIAL_GROUP, MatCap, MatCapStyle, Material, SHADING_STAGES, SURFACE_WGSL,
+};
 use crate::raster::{
     MORPH_WGSL, PLACE_WGSL, QUAD_WGSL, Raster, RasterError, slot_group, slot_source,
 };
@@ -115,7 +117,7 @@ pub(crate) mod tests;
 const SHADE_WGSL: &str = include_str!("shade.wgsl");
 
 /// The format the pass shades into: linear, 16-bit float, HDR.
-pub const HDR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+pub(crate) const HDR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
 /// Storage buffers the pass binds itself beside the slot buffers and its material's: the tree,
 /// the remap tables, the stamps and the drawn edges.
@@ -138,7 +140,7 @@ pub(crate) const fn fixed_buffers<M: Material>() -> (u32, u32) {
 const GROUP_SIDE: u32 = 8;
 
 /// The wireframe's lines' width, pixels.
-pub const WIRE_WIDTH: f32 = 1.0;
+pub(crate) const WIRE_WIDTH: f32 = 1.0;
 
 /// The wireframe's colour, linear: a dark slate, readable over every MatCap.
 const WIRE_COLOUR: [f32; 3] = [0.012, 0.016, 0.024];
@@ -164,8 +166,8 @@ impl ShadePath {
     }
 }
 
-/// What the shading shows beside its material's own settings ([`Material::Settings`]): a
-/// change of these alone needs only the shading pass ([`Shade::encode_again`]).
+/// What the shading shows beside its material's own settings (`Material::Settings`): a
+/// change of these alone needs only the shading pass (`Shade::encode_again`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ShadeSettings {
     /// Whether the wireframe is drawn over the shading.
@@ -213,15 +215,15 @@ pub enum ShadeError {
 
 /// What a frame's shading reads: the scene the raster drew.
 #[derive(Debug, Clone, Copy)]
-pub struct ShadeScene<'a> {
+pub(crate) struct ShadeScene<'a> {
     /// The tile tree's buffer.
-    pub tree: &'a Buffer,
+    pub(crate) tree: &'a Buffer,
     /// The slot buffers the tree's slots name.
-    pub slots: &'a SlotBuffers,
+    pub(crate) slots: &'a SlotBuffers,
     /// The raster, its frame drawn: its visibility buffer, stamps, drawn edges and settings.
-    pub raster: &'a Raster,
+    pub(crate) raster: &'a Raster,
     /// The frame's view (the raster's).
-    pub view: &'a View,
+    pub(crate) view: &'a View,
 }
 
 /// The pipeline, by path.
@@ -260,7 +262,7 @@ struct Bound {
 /// The shading pass: its pipeline (for the slot layout it was built for, and its material), its
 /// settings and its target.
 #[derive(Debug)]
-pub struct Shade<M: Material = MatCap> {
+pub(crate) struct Shade<M: Material = MatCap> {
     /// How it runs.
     path: ShadePath,
     /// The material.
@@ -297,7 +299,7 @@ impl Shade<MatCap> {
     /// # Errors
     ///
     /// As [`Shade::with_material`] and [`MatCap::new`].
-    pub fn new(
+    pub(crate) fn new(
         gpu: &Gpu,
         slots: SlotLayout,
         path: ShadePath,
@@ -311,12 +313,12 @@ impl Shade<MatCap> {
 impl<M: Material> Shade<M> {
     /// Sets what the shading shows beside the material, from the next pass on (a uniform write:
     /// no new pipeline).
-    pub fn set_settings(&mut self, settings: ShadeSettings) {
+    pub(crate) fn set_settings(&mut self, settings: ShadeSettings) {
         self.settings = settings;
     }
 
     /// Sets the material's settings, from the next pass on (its own buffers: no new pipeline).
-    pub fn set_material(&mut self, gpu: &Gpu, settings: M::Settings) {
+    pub(crate) fn set_material(&mut self, gpu: &Gpu, settings: M::Settings) {
         self.material.set_settings(gpu, settings);
     }
 
@@ -325,7 +327,7 @@ impl<M: Material> Shade<M> {
     /// # Errors
     ///
     /// [`ShadeError::Gpu`] if a buffer, layout or pipeline is refused.
-    pub fn with_material(
+    pub(crate) fn with_material(
         gpu: &Gpu,
         slots: SlotLayout,
         path: ShadePath,
@@ -400,27 +402,16 @@ impl<M: Material> Shade<M> {
     }
 
     /// How the pass runs.
+    #[cfg(test)]
     #[must_use]
-    pub const fn path(&self) -> ShadePath {
+    pub(crate) const fn path(&self) -> ShadePath {
         self.path
-    }
-
-    /// What the shading shows.
-    #[must_use]
-    pub const fn settings(&self) -> ShadeSettings {
-        self.settings
-    }
-
-    /// The material.
-    #[must_use]
-    pub const fn material(&self) -> &M {
-        &self.material
     }
 
     /// The target: [`HDR_FORMAT`], the size of the visibility buffer last shaded; `None` before
     /// the first pass.
     #[must_use]
-    pub fn target(&self) -> Option<&Texture> {
+    pub(crate) fn target(&self) -> Option<&Texture> {
         self.target.as_ref().map(|target| &target.texture)
     }
 
@@ -432,7 +423,7 @@ impl<M: Material> Shade<M> {
     ///
     /// [`ShadeError::Slots`] if the slot buffers don't fit the layout the pass was built for;
     /// [`ShadeError::Gpu`] if a bind group or the target is refused.
-    pub fn encode(
+    pub(crate) fn encode(
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
@@ -486,7 +477,7 @@ impl<M: Material> Shade<M> {
     /// # Errors
     ///
     /// [`ShadeError::Gpu`] if the target is refused.
-    pub fn encode_again(
+    pub(crate) fn encode_again(
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
@@ -522,7 +513,7 @@ impl<M: Material> Shade<M> {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &bound.frame, &[]);
                 pass.set_bind_group(1, &bound.slots, &[]);
-                pass.set_bind_group(2, self.material.bind_group(), &[]);
+                pass.set_bind_group(MATERIAL_GROUP, self.material.bind_group(), &[]);
                 pass.set_bind_group(3, target.output.as_ref(), &[]);
                 pass.dispatch_workgroups(
                     size.0.div_ceil(GROUP_SIDE),
@@ -547,7 +538,7 @@ impl<M: Material> Shade<M> {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &bound.frame, &[]);
                 pass.set_bind_group(1, &bound.slots, &[]);
-                pass.set_bind_group(2, self.material.bind_group(), &[]);
+                pass.set_bind_group(MATERIAL_GROUP, self.material.bind_group(), &[]);
                 pass.draw(0..3, 0..1);
             }
         }

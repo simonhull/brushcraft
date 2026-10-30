@@ -99,7 +99,7 @@ impl FramePasses {
     ///
     /// # Errors
     ///
-    /// As [`Lod::new`], [`Raster::new`], [`PyramidPass::new`] and [`Shade::new`].
+    /// As [`Lod::new`], [`Raster::new`], [`PyramidPass::new`] and `Shade::new`.
     pub fn new(
         gpu: &Gpu,
         capacity: u32,
@@ -139,7 +139,7 @@ impl FramePasses {
 
     /// The shading pass: its target, its settings.
     #[must_use]
-    pub const fn shade(&self) -> &Shade {
+    pub(crate) const fn shade(&self) -> &Shade {
         &self.shade
     }
 
@@ -155,7 +155,7 @@ impl FramePasses {
     ///
     /// # Errors
     ///
-    /// [`FrameError::Shade`] as [`Shade::encode`].
+    /// [`FrameError::Shade`] as `Shade::encode`.
     pub fn encode_shading(
         &mut self,
         gpu: &Gpu,
@@ -172,11 +172,11 @@ impl FramePasses {
     }
 
     /// Encodes the shading pass again over the last visibility buffer shaded, with no raster:
-    /// [`Shade::encode_again`]. Returns whether there was one.
+    /// `Shade::encode_again`. Returns whether there was one.
     ///
     /// # Errors
     ///
-    /// [`FrameError::Shade`] as [`Shade::encode_again`].
+    /// [`FrameError::Shade`] as `Shade::encode_again`.
     pub fn encode_shading_again(
         &mut self,
         gpu: &Gpu,

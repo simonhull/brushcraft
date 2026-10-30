@@ -4,7 +4,7 @@
 //! # The interface
 //!
 //! The shading pass ([`crate::shade`]) rebuilds, at each pixel, the surface the raster drew
-//! there and hands it to the material as WGSL's `Surface` ([`SURFACE_WGSL`]):
+//! there and hands it to the material as WGSL's `Surface` (`SURFACE_WGSL`):
 //!
 //! - `position`: the point, world units;
 //! - `normal`: the unit normal, interpolated across the triangle from its vertices' normals;
@@ -18,18 +18,18 @@
 //! with the view as WGSL's `Eye` (the unit direction to the eye, and the view's up and right).
 //! A material is WGSL defining `fn material(surface: Surface, eye: Eye) -> vec3<f32>`, which
 //! returns **linear** colour (HDR: values past 1 are kept by the 16-bit float target, the tone map
-//! rolls them off), plus its own resources at bind group [`MATERIAL_GROUP`]: [`Material`]. The pass
+//! rolls them off), plus its own resources at bind group `MATERIAL_GROUP`: `Material`. The pass
 //! is built once from it, so a change to the material's settings is a uniform write and one
 //! shading pass, with no raster: independent of the mesh (spec target).
 //!
 //! PBR (image-based lighting, material channels in the display layer, depth-based ambient
-//! occlusion) comes with painting, as another [`Material`]: the interface already carries what it
+//! occlusion) comes with painting, as another `Material`: the interface already carries what it
 //! needs (position, the normal, the roughness term, channels).
 //!
 //! # MatCap
 //!
 //! A MatCap is a sphere's image, lit, seen head on: the colour a surface shows is the sphere's
-//! where its normal points the same way. [`MatCap`] looks the normal up in the view's frame turned
+//! where its normal points the same way. `MatCap` looks the normal up in the view's frame turned
 //! towards the pixel's line of sight (so a surface at the image's edge isn't stretched), and
 //! widens the lookup by the roughness term (Toksvig): it samples a mip level of the image as
 //! blurred as the normals under the vertex are spread, so detail filtered out of the geometry
@@ -58,13 +58,13 @@ use crate::gpu::{Gpu, GpuError};
 
 /// The bind group a material's resources sit at in the shading pass (groups 0 and 1 are the
 /// pass's own: the frame's buffers and the slot buffers).
-pub const MATERIAL_GROUP: u32 = 2;
+pub(crate) const MATERIAL_GROUP: u32 = 2;
 
 /// The WGSL of the material interface: `Surface` and `Eye`.
 ///
 /// `Surface` is what the shading pass rebuilt at a pixel, `Eye` the view. A material defines
 /// `fn material(surface: Surface, eye: Eye) -> vec3<f32>` after it, returning linear colour.
-pub const SURFACE_WGSL: &str = r"
+pub(crate) const SURFACE_WGSL: &str = r"
 // A point of the drawn surface, as the shading pass rebuilt it (render::material, the material
 // interface).
 struct Surface {
@@ -99,7 +99,7 @@ struct Eye {
 /// buffers its group binds count against the shading pass's per-stage limits (on Metal storage
 /// and uniform buffers share one table), so it declares them: the pass refuses a slot layout
 /// they leave no room for.
-pub trait Material: std::fmt::Debug {
+pub(crate) trait Material: std::fmt::Debug {
     /// What can change about it without a new pipeline.
     type Settings: Copy + PartialEq + std::fmt::Debug;
 
@@ -118,9 +118,6 @@ pub trait Material: std::fmt::Debug {
 
     /// Its bind group.
     fn bind_group(&self) -> &BindGroup;
-
-    /// Its settings now.
-    fn settings(&self) -> Self::Settings;
 
     /// Sets its settings, from the next shading pass on.
     fn set_settings(&mut self, gpu: &Gpu, settings: Self::Settings);
@@ -196,9 +193,7 @@ fn material(surface: Surface, eye: Eye) -> vec3<f32> {
 /// The MatCap material: every [`MatCapStyle`]'s image, generated at startup, and which one is
 /// shown.
 #[derive(Debug)]
-pub struct MatCap {
-    /// The images, one layer a style.
-    images: Texture,
+pub(crate) struct MatCap {
     /// Its settings.
     params: Buffer,
     /// The style shown.
@@ -216,7 +211,7 @@ impl MatCap {
     /// # Errors
     ///
     /// As [`Gpu::scoped`], if the image, its sampler or its bind group is refused.
-    pub fn new(gpu: &Gpu, style: MatCapStyle) -> Result<Self, GpuError> {
+    pub(crate) fn new(gpu: &Gpu, style: MatCapStyle) -> Result<Self, GpuError> {
         let device = gpu.device();
         let images = images(gpu)?;
         let sampler = device.create_sampler(&SamplerDescriptor {
@@ -288,7 +283,6 @@ impl MatCap {
             })
         })?;
         let mut material = Self {
-            images,
             params,
             style,
             layout,
@@ -299,7 +293,7 @@ impl MatCap {
     }
 
     /// Shows `style` from the next shading pass on: a uniform write, no new pipeline.
-    pub fn set_style(&mut self, gpu: &Gpu, style: MatCapStyle) {
+    pub(crate) fn set_style(&mut self, gpu: &Gpu, style: MatCapStyle) {
         self.style = style;
         let params = GpuMatCapParams {
             layer: style.layer(),
@@ -309,18 +303,6 @@ impl MatCap {
         };
         gpu.queue()
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
-    }
-
-    /// The style shown.
-    #[must_use]
-    pub const fn style(&self) -> MatCapStyle {
-        self.style
-    }
-
-    /// The images, one layer a style: for tests and tools.
-    #[must_use]
-    pub const fn images(&self) -> &Texture {
-        &self.images
     }
 }
 
@@ -343,10 +325,6 @@ impl Material for MatCap {
 
     fn bind_group(&self) -> &BindGroup {
         &self.group
-    }
-
-    fn settings(&self) -> MatCapStyle {
-        self.style
     }
 
     fn set_settings(&mut self, gpu: &Gpu, settings: MatCapStyle) {

@@ -12,7 +12,7 @@
 //! and [`lod`] choose the tiles a frame draws, and [`raster`] draws their clusters (the
 //! triangles of `indices`) into a visibility buffer, watertight at every seam. [`shade`] rebuilds
 //! the surface drawn at each pixel and shades it through a [`material`] (MatCap, ours, generated)
-//! into a linear HDR image, which [`tone`] brings to the frame's format; `visibility_view` shows
+//! into a linear HDR image, which `tone` brings to the frame's format; `visibility_view` shows
 //! the visibility buffer as colours instead, a debug view.
 //!
 //! The crates below this one (`geom`, `store`, `brush`) never learn about the GPU: this crate
@@ -36,7 +36,7 @@ pub mod shade;
 #[cfg(feature = "spike")]
 pub mod spike;
 pub mod surface;
-pub mod tone;
+pub(crate) mod tone;
 pub mod tree;
 pub mod upload;
 mod visibility_view;
