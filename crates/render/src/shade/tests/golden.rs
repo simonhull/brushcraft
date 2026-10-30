@@ -396,6 +396,58 @@ fn largest_screen_error(
     (errors.iter().copied().fold(0.0, f64::max), errors.len())
 }
 
+/// How far, in pixels, the silhouettes of two images lie apart.
+///
+/// That is the largest distance from a pixel only one of them draws to the nearest pixel the
+/// other draws, searched up to `reach` pixels (`reach + 1` if none is that near). The ≤ 1 px
+/// check skips grazing pixels, where the silhouette is; this measures it.
+fn silhouette_gap(
+    size: (usize, usize),
+    first: &[Option<Probed>],
+    second: &[Option<Probed>],
+    reach: usize,
+) -> f64 {
+    let (width, height) = size;
+    let drawn = |image: &[Option<Probed>], x: usize, y: usize| {
+        image.get(y * width + x).is_some_and(Option::is_some)
+    };
+    let nearest = |image: &[Option<Probed>], x: usize, y: usize| {
+        let window = (y.saturating_sub(reach)..=(y + reach).min(height - 1)).flat_map(|v| {
+            (x.saturating_sub(reach)..=(x + reach).min(width - 1)).map(move |u| (u, v))
+        });
+        let found = window.filter(|&(u, v)| drawn(image, u, v)).map(|(u, v)| {
+            let (du, dv) = (u.abs_diff(x), v.abs_diff(y));
+            let squared = u32::try_from(du * du + dv * dv).expect("small");
+            f64::from(squared).sqrt()
+        });
+        let limit = f64::from(u32::try_from(reach + 1).expect("small"));
+        found.fold(limit, f64::min)
+    };
+    let pixels = (0..height).flat_map(|y| (0..width).map(move |x| (x, y)));
+    let gaps = pixels.filter_map(|(x, y)| match (drawn(first, x, y), drawn(second, x, y)) {
+        (true, false) => Some(nearest(second, x, y)),
+        (false, true) => Some(nearest(first, x, y)),
+        _ => None,
+    });
+    gaps.fold(0.0, f64::max)
+}
+
+/// The test viewport's width and height.
+fn frame_size() -> (usize, usize) {
+    let size = crate::raster::tests::size();
+    (
+        usize::try_from(size.width()).expect("small"),
+        usize::try_from(size.height()).expect("small"),
+    )
+}
+
+/// The farthest a pixel drawn by only one of two frames may lie from the other's silhouette.
+///
+/// The frames are the level choice's and the finest level's; the gap is the pixel of error the
+/// level choice allows, a diagonal neighbour (√2) included. Measured: 1 px from the farther
+/// cameras, 0 close up; a level choice at 4 px puts them 2 px apart.
+const SILHOUETTE_GAP: f64 = 1.5;
+
 #[test]
 fn the_level_choice_s_shaded_frames_match_the_finest_level_and_stay_within_a_pixel_of_it() {
     GpuTest::run(|gpu| {
@@ -417,6 +469,11 @@ fn the_level_choice_s_shaded_frames_match_the_finest_level_and_stay_within_a_pix
                 largest <= 1.0,
                 "camera {k}: {largest} px from the finest level"
             );
+            let gap = silhouette_gap(frame_size(), &surface, &finest_surface, 6);
+            assert!(
+                gap <= SILHOUETTE_GAP,
+                "camera {k}: silhouettes {gap} px apart"
+            );
         }
     });
 }
@@ -425,14 +482,20 @@ fn the_level_choice_s_shaded_frames_match_the_finest_level_and_stay_within_a_pix
 fn the_comparisons_with_the_finest_level_bite_on_a_level_choice_four_times_too_coarse() {
     GpuTest::run(|gpu| {
         let world = World::new(gpu);
-        let (mut worst_flip, mut worst_px) = (0.0_f32, 0.0_f64);
+        let (mut worst_flip, mut worst_px, mut worst_gap) = (0.0_f32, 0.0_f64, 0.0_f64);
         for view in &cameras() {
             let (reference, finest_surface) = finest(gpu, &world, view);
             let (image, surface) = chosen(gpu, &world, view, 4.0);
             worst_flip = worst_flip.max(flip(&reference, &image).percentile(99));
             worst_px = worst_px.max(largest_screen_error(view, &surface, &finest_surface).0);
+            let gap = silhouette_gap(frame_size(), &surface, &finest_surface, 6);
+            worst_gap = worst_gap.max(gap);
         }
         assert!(worst_px > 1.5, "a 4 px threshold shows: {worst_px} px");
+        assert!(
+            worst_gap > SILHOUETTE_GAP,
+            "and at the silhouette: {worst_gap} px"
+        );
         assert!(
             worst_flip > FINEST_P99,
             "and the FLIP-style check sees it: {worst_flip}"
