@@ -1,7 +1,8 @@
 // The geomorph's stamp pass (render::raster): when each tile of this frame's cut came into it,
-// for the morph's time factor. One thread per cut entry.
+// for the morph's time factor, and its drawn edges, for the shading pass. One thread per cut
+// entry.
 //
-// After tree::NODE_WGSL and raster::MORPH_WGSL. A tile keeps its stamp while it stays in the
+// After tree::NODE_WGSL, lod::CLUSTER_WGSL and raster::MORPH_WGSL. A tile keeps its stamp while it stays in the
 // cut from frame to frame. A tile new to the cut is stamped now, so it morphs in over the
 // duration, only when it refines what was drawn last frame (an ancestor was in the cut) and the
 // camera is still: that is a level change made with the camera still (an arrival, a refresh),
@@ -20,6 +21,9 @@
 @group(0) @binding(3) var<storage, read_write> morph: array<MorphState>;
 // The frame's settings.
 @group(0) @binding(4) var<uniform> params: RasterParams;
+// Per node, its tile's drawn edges as the cut entry gives them (render::lod::DrawnEdges): the
+// shading pass rebuilds a visibility id's cluster from them.
+@group(0) @binding(5) var<storage, read_write> drawn_edges: array<u32>;
 
 // One tile of the cut (render::lod's GpuCutEntry): 16 bytes.
 struct CutEntry {
@@ -55,7 +59,7 @@ fn refines_last_frame(n: u32) -> bool {
     return false;
 }
 
-// Stamps the tile of one cut entry.
+// Stamps the tile of one cut entry and keeps its drawn edges.
 @compute @workgroup_size(64)
 fn stamp(@builtin(global_invocation_id) id: vec3<u32>) {
     let count = min(counts[params.count_word], arrayLength(&cut));
@@ -78,4 +82,5 @@ fn stamp(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     morph[n] = MorphState(entry.face, entry.place, params.frame, start);
+    drawn_edges[n] = (entry.flags >> CUT_EDGES_SHIFT) & 0xffu;
 }

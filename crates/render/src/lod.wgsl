@@ -165,7 +165,7 @@ struct CutEntry {
     place: u32,
     // Its node.
     node: u32,
-    // CUT_DRAWN once drawn by either phase.
+    // CUT_DRAWN once drawn by either phase; bits CUT_EDGES_SHIFT.. the tile's drawn edges.
     flags: u32,
 }
 
@@ -819,16 +819,19 @@ fn finer_edges(n: u32) -> u32 {
     return mask;
 }
 
+// Node `n`'s drawn edges (render::lod::DrawnEdges): coarser in bits 0..4, finer in 4..8.
+fn drawn_edges(n: u32) -> u32 {
+    return coarser_edges(n) | (finer_edges(n) << 4u);
+}
+
 // Appends node `n`'s clusters to the phase's list (`phase` 0: main, 1: post) and marks it
 // drawn.
 fn draw(n: u32, phase: u32) {
     let level = level_of(tree[n].place);
     let quads = quads_of(level);
     let per = max(quads / 8u, 1u);
-    let cluster_quads = min(quads, 8u);
     let count = per * per;
-    let mask = coarser_edges(n);
-    let finer = finer_edges(n);
+    let edges = drawn_edges(n);
     var first = 0u;
     if phase == 0u {
         first = atomicAdd(&frame.main.instance_count, count);
@@ -843,24 +846,7 @@ fn draw(n: u32, phase: u32) {
             atomicAdd(&frame.cluster_overflow, 1u);
             continue;
         }
-        let cx = c % per;
-        let cy = c / per;
-        // The tile's edges the cluster lies on.
-        var on = 0u;
-        if cy == 0u {
-            on |= 1u;
-        }
-        if cx == per - 1u {
-            on |= 2u;
-        }
-        if cy == per - 1u {
-            on |= 4u;
-        }
-        if cx == 0u {
-            on |= 8u;
-        }
-        let edges = ((mask & on) << 24u) | ((finer & on) << 28u);
-        clusters[at] = Cluster(n, cx | (cy << 8u) | (cluster_quads << 16u) | edges);
+        clusters[at] = Cluster(n, cluster_cell(c % per, c / per, quads, edges));
     }
     let entry = work[n].cut_index;
     if entry != NONE {
@@ -954,7 +940,7 @@ fn emit(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let index = atomicAdd(&frame.cut_count, 1u);
     if index < params.cut_capacity {
-        cut[index] = CutEntry(face, place, n, 0u);
+        cut[index] = CutEntry(face, place, n, drawn_edges(n) << CUT_EDGES_SHIFT);
         work[n].cut_index = index;
     } else {
         atomicAdd(&frame.cut_overflow, 1u);

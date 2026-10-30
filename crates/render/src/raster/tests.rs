@@ -27,7 +27,9 @@ use crate::cull::BoundsUpdate;
 use crate::cull::tests::Rng;
 use crate::gpu::GpuTest;
 use crate::indices::{ClusterSize, GridVertex, Variant, remap};
-use crate::lod::{GpuCluster, GpuCutEntry, Lod, LodConfig, MainInputs, Thresholds};
+use crate::lod::{
+    CUT_EDGES_SHIFT, DrawnEdges, GpuCluster, GpuCutEntry, Lod, LodConfig, MainInputs, Thresholds,
+};
 use crate::residency::{CLASSES, REQUEST_HEADER, SizeClass, Slot, SlotLayout};
 use crate::surface::Size;
 use crate::tree::{NODE_BYTES, NODE_FINEST, Place, TileTree};
@@ -46,7 +48,7 @@ fn level(l: u8) -> Level {
 }
 
 /// The test viewport.
-fn size() -> Size {
+pub(crate) fn size() -> Size {
     Size::new(400, 300).expect("non-zero")
 }
 
@@ -121,7 +123,7 @@ pub(crate) struct World {
 
 impl World {
     /// Every tile resident to [`FINEST`], its data uploaded and its node written.
-    fn new(gpu: &Gpu) -> Self {
+    pub(crate) fn new(gpu: &Gpu) -> Self {
         Self::with_finest(gpu, FINEST)
     }
 
@@ -354,14 +356,19 @@ fn across(world: &World, cut: &BTreeSet<Place>, place: Place) -> [Across; 4] {
 }
 
 /// A random cut of tiles from level `low` to the finest, neighbours at most a level apart.
-fn random_cut(rng: &mut Rng, world: &World, low: u8) -> BTreeSet<Place> {
+pub(crate) fn random_cut(rng: &mut Rng, world: &World, low: u8) -> BTreeSet<Place> {
     let start = world.tiles.keys().filter(|p| p.level().get() == low);
     let cut: BTreeSet<Place> = start.copied().collect();
     grown(rng, world, cut, 5)
 }
 
 /// `cut` with each tile refined at random (two in five, in each of `rounds`), then relaxed.
-fn grown(rng: &mut Rng, world: &World, mut cut: BTreeSet<Place>, rounds: u32) -> BTreeSet<Place> {
+pub(crate) fn grown(
+    rng: &mut Rng,
+    world: &World,
+    mut cut: BTreeSet<Place>,
+    rounds: u32,
+) -> BTreeSet<Place> {
     for _ in 0..rounds {
         let tiles: Vec<Place> = cut.iter().copied().collect();
         for place in tiles {
@@ -385,45 +392,44 @@ fn grown(rng: &mut Rng, world: &World, mut cut: BTreeSet<Place>, rounds: u32) ->
 }
 
 /// Replaces `place` in `cut` by its children.
-fn refine(cut: &mut BTreeSet<Place>, place: Place) {
+pub(crate) fn refine(cut: &mut BTreeSet<Place>, place: Place) {
     cut.remove(&place);
     cut.extend(place.children().into_iter().flatten());
+}
+
+/// The drawn edges `emit` would record for `place` in `cut`: coarser where the neighbour is
+/// coarser, unless `variants` is false (the broken seam rule); finer where it is finer.
+fn drawn_edges(world: &World, cut: &BTreeSet<Place>, place: Place, variants: bool) -> DrawnEdges {
+    let sides = across(world, cut, place);
+    let mask = |kind: Across| {
+        sides
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == kind)
+            .fold(0_u8, |m, (k, _)| m | (1 << k))
+    };
+    let coarser = if variants { mask(Across::Coarser) } else { 0 };
+    DrawnEdges::new(coarser, mask(Across::Finer))
 }
 
 /// The clusters `emit` would list for `cut` with nothing culled: edge variants where the
 /// neighbour is coarser, unless `variants` is false (the broken seam rule); finer edges where
 /// it is finer.
-fn cut_clusters(world: &World, cut: &BTreeSet<Place>, variants: bool) -> Vec<GpuCluster> {
+pub(crate) fn cut_clusters(
+    world: &World,
+    cut: &BTreeSet<Place>,
+    variants: bool,
+) -> Vec<GpuCluster> {
     let mut clusters = Vec::new();
     for &place in cut {
-        let sides = across(world, cut, place);
-        let mask = |kind: Across| {
-            sides
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| **s == kind)
-                .fold(0_u32, |m, (k, _)| m | (1 << k))
-        };
-        let (coarser, finer) = (
-            if variants { mask(Across::Coarser) } else { 0 },
-            mask(Across::Finer),
-        );
+        let edges = drawn_edges(world, cut, place, variants);
         let quads = place.level().tile_quads();
         let per = (quads / 8).max(1);
         for cy in 0..per {
             for cx in 0..per {
-                let on = u32::from(cy == 0)
-                    | (u32::from(cx == per - 1) << 1)
-                    | (u32::from(cy == per - 1) << 2)
-                    | (u32::from(cx == 0) << 3);
-                let cell = cx
-                    | (cy << 8)
-                    | (quads.min(8) << 16)
-                    | ((coarser & on) << 24)
-                    | ((finer & on) << 28);
                 clusters.push(GpuCluster {
                     node: world.node(place),
-                    cell,
+                    cell: edges.cell(cx, cy, quads),
                 });
             }
         }
@@ -461,7 +467,7 @@ fn cut_buffers(gpu: &Gpu, world: &World, cut: &BTreeSet<Place>) -> (Buffer, Buff
             face: p.face().index(),
             place: p.packed(),
             node: world.node(p),
-            flags: 0,
+            flags: u32::from(drawn_edges(world, cut, p, true).bits()) << CUT_EDGES_SHIFT,
         })
         .collect();
     let list = device.create_buffer_init(&BufferInitDescriptor {
@@ -479,7 +485,7 @@ fn cut_buffers(gpu: &Gpu, world: &World, cut: &BTreeSet<Place>) -> (Buffer, Buff
 }
 
 /// Waits for the GPU, checking it raised nothing.
-fn finish(gpu: &Gpu) {
+pub(crate) fn finish(gpu: &Gpu) {
     gpu.device()
         .poll(PollType::Wait {
             submission_index: None,
@@ -496,7 +502,7 @@ fn read_visibility(gpu: &Gpu, raster: &Raster) -> Vec<u32> {
 
 /// Draws `cut` (its clusters `clusters`) as one frame at `time`, stamping it first, and returns
 /// the visibility buffer.
-fn draw_cut(
+pub(crate) fn draw_cut(
     gpu: &Gpu,
     raster: &mut Raster,
     world: &World,
@@ -534,7 +540,7 @@ fn draw_cut(
 
 /// A random view of the sphere: from `distance` (a random one in its range) along a random
 /// direction, towards a point near the centre.
-fn random_view(rng: &mut Rng, distances: (f32, f32)) -> (View, f64) {
+pub(crate) fn random_view(rng: &mut Rng, distances: (f32, f32)) -> (View, f64) {
     loop {
         let d = [
             rng.range(-1.0, 1.0),
@@ -563,13 +569,13 @@ fn random_view(rng: &mut Rng, distances: (f32, f32)) -> (View, f64) {
 }
 
 /// Every finest tile, the reference cut.
-fn finest_cut(world: &World) -> BTreeSet<Place> {
+pub(crate) fn finest_cut(world: &World) -> BTreeSet<Place> {
     let finest = world.tiles.keys().filter(|p| p.level() == world.finest);
     finest.copied().collect()
 }
 
 /// A raster that never morphs: every vertex where it is.
-fn still_raster(gpu: &Gpu, world: &World) -> Raster {
+pub(crate) fn still_raster(gpu: &Gpu, world: &World) -> Raster {
     let config = RasterConfig::default()
         .with_morph(Duration::ZERO)
         .with_ramp(MorphThreshold::OFF);
@@ -1020,7 +1026,7 @@ fn the_pinhole_test_bites_a_finer_tile_drawing_its_odd_vertices_beside_a_coarser
 }
 
 /// The level choice for `world`, refining by `e` alone (no quad cap), with a request buffer.
-fn level_choice(gpu: &Gpu, world: &World) -> (Lod, Buffer) {
+pub(crate) fn level_choice(gpu: &Gpu, world: &World) -> (Lod, Buffer) {
     let thresholds = Thresholds {
         refine_quad: 1e9,
         coarsen_quad: 1e9,
@@ -1040,7 +1046,7 @@ fn level_choice(gpu: &Gpu, world: &World) -> (Lod, Buffer) {
 /// One frame through the level choice's first phase and the raster: bounds (on the first
 /// frame), the choice, the stamps, the draw. Returns the visibility buffer, the clusters listed
 /// and the cut's places.
-fn lod_frame(
+pub(crate) fn lod_frame(
     gpu: &Gpu,
     world: &World,
     lod: &mut Lod,
@@ -1145,6 +1151,66 @@ fn the_pinhole_test_holds_for_the_level_choice_s_cuts_morphing_by_distance() {
         }
         // The sphere's true bounds are small: the level choice draws it at two levels from here.
         assert!(levels.len() >= 2, "mixed levels: {levels:?}");
+    });
+}
+
+#[test]
+fn the_stamp_pass_keeps_each_drawn_tile_s_edges_and_they_give_back_its_clusters() {
+    GpuTest::run(|gpu| {
+        let world = World::new(gpu);
+        let places: BTreeMap<u32, Place> = world
+            .tiles
+            .iter()
+            .map(|(&place, tile)| (tile.node, place))
+            .collect();
+        let mut rng = Rng(17);
+        let (mut lod, requests) = level_choice(gpu, &world);
+        let mut raster = Raster::new(
+            gpu,
+            world.tree.capacity(),
+            world.layout(),
+            RasterConfig::default(),
+        )
+        .expect("the raster");
+        let (mut checked, mut seams) = (0, 0);
+        for seed in 0..8 {
+            let (view, _) = random_view(&mut rng, (1.2, 4.0));
+            let frame = RasterFrame {
+                view: &view,
+                time: Duration::from_secs(1),
+                moving: true,
+            };
+            let (_, clusters, _) = lod_frame(
+                gpu,
+                &world,
+                &mut lod,
+                &requests,
+                &mut raster,
+                &frame,
+                seed == 0,
+            );
+            let kept: Vec<u32> = gpu.read_buffer(&raster.drawn_edges).expect("read back");
+            for cluster in &clusters {
+                let bits = kept[usize::try_from(cluster.node).expect("small")];
+                let edges = DrawnEdges::new(
+                    u8::try_from(bits & 0xF).expect("a nibble"),
+                    u8::try_from(bits >> 4).expect("a nibble"),
+                );
+                let quads = places[&cluster.node].level().tile_quads();
+                let (cx, cy) = cluster.position();
+                assert_eq!(edges.cell(cx, cy, quads), cluster.cell, "{cluster:?}");
+                checked += 1;
+                // Without the kept edges, these would come back wrong.
+                if cluster.variant() != 0 || cluster.finer() != 0 {
+                    seams += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 500,
+            "{checked} clusters checked, {seams} on seams"
+        );
+        assert!(seams > 50, "{seams} clusters on a seam between levels");
     });
 }
 

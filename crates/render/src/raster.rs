@@ -87,6 +87,24 @@
 //! linearity in each vertex, every morph state (`cull.rs`, "What the cone holds", 4): the level
 //! choice culls a tile by its cone, morphing or not, without dropping a sliver facing the eye.
 //!
+//! # For the shading pass
+//!
+//! The shading pass rebuilds the triangles drawn at each pixel from its
+//! [`VisibilityId`], which names the node, the cluster and the quad, but not what else placed the
+//! quad's corners: the cluster's edge variant and finer edges, and the morph. Both come from
+//! buffers the raster keeps per node, read with the same code the vertex shader runs
+//! (`place.wgsl`'s `place_vertex`):
+//!
+//! - **The drawn edges** ([`crate::lod::DrawnEdges`]): the level choice's `emit` records, in each
+//!   cut entry, across which of the tile's edges the neighbour is drawn coarser and finer, and the
+//!   stamp pass keeps that byte per node. A cluster's variant and finer bits are the tile's on the
+//!   edges the cluster lies on, so the byte and the cluster's place give back the very
+//!   `Cluster.cell` emit listed (`lod.rs`' `CLUSTER_WGSL`, `cluster_cell`, which emit lists
+//!   clusters with too).
+//! - **The morph:** the stamps, the frame's settings and its view, as the frame drawn left them.
+//!   They change only when the next frame is begun, so a shading pass run again without a raster (a
+//!   material change) still places every vertex as it was drawn.
+//!
 //! # Slot buffers
 //!
 //! One draw reads tiles from every slot buffer, so the raster binds them all at once, one binding
@@ -105,9 +123,10 @@
 //!
 //! [`Raster::begin_frame`] (the frame's view, time and whether the camera moves, written through
 //! the queue: once per submission), then after the level choice's first phase
-//! [`Raster::encode_stamp`] over its cut, then [`Raster::encode_draw`] of each phase's list,
-//! clearing first ([`Phase::First`]), keeping after ([`Phase::Second`]). [`FramePasses`] runs
-//! the whole frame in that order with the level choice and the two depth pyramids.
+//! [`Raster::encode_stamp`] over its cut (the stamps and the drawn edges), then
+//! [`Raster::encode_draw`] of each phase's list, clearing first ([`Phase::First`]), keeping after
+//! ([`Phase::Second`]). [`FramePasses`] runs the whole frame in that order with the level choice
+//! and the two depth pyramids.
 
 use std::time::Duration;
 
@@ -147,7 +166,14 @@ pub use frame::{FrameError, FramePasses, SceneInputs};
 /// The raster's own source, after the declarations it uses and the generated slot bindings.
 const RASTER_WGSL: &str = include_str!("raster.wgsl");
 
-/// The stamp pass's own source, after [`NODE_WGSL`] and [`MORPH_WGSL`].
+/// Where a cluster vertex is drawn: the geomorph.
+///
+/// Shared by the raster's vertex shader and the shading pass, so what is shaded is what was
+/// drawn. After the declarations [`RASTER_WGSL`] lists; the including shader
+/// declares the globals it reads.
+pub(crate) const PLACE_WGSL: &str = include_str!("place.wgsl");
+
+/// The stamp pass's own source, after [`NODE_WGSL`], [`CLUSTER_WGSL`] and [`MORPH_WGSL`].
 const STAMP_WGSL: &str = include_str!("morph.wgsl");
 
 /// The WGSL declarations the raster and its stamp pass share: `RasterParams`
@@ -551,6 +577,9 @@ pub struct Raster {
     remap: Buffer,
     /// Per node, [`GpuMorphState`].
     stamps: Buffer,
+    /// Per node, its tile's [`crate::lod::DrawnEdges`] as the stamp pass last kept them, one
+    /// `u32` each: for the shading pass.
+    drawn_edges: Buffer,
     /// [`GpuRasterParams`].
     params: Buffer,
     /// The frame's [`GpuView`].
@@ -671,6 +700,8 @@ impl Raster {
         })?;
         let stamp_bytes = u64::from(capacity.max(1)) * size_of::<GpuMorphState>() as u64;
         let stamps = storage_buffer(gpu, "raster stamps", stamp_bytes)?;
+        let drawn_edges =
+            storage_buffer(gpu, "raster drawn edges", u64::from(capacity.max(1)) * 4)?;
         let params = uniform_buffer(gpu, "raster params", size_of::<GpuRasterParams>() as u64)?;
         let view = uniform_buffer(gpu, "raster view", size_of::<GpuView>() as u64)?;
         let uniform = BufferBindingType::Uniform;
@@ -696,10 +727,11 @@ impl Raster {
                     read_entry(2),
                     written_entry(3),
                     buffer_entry(4, uniform),
+                    written_entry(5),
                 ],
             })
         })?;
-        let stamp_source = format!("{NODE_WGSL}{MORPH_WGSL}{STAMP_WGSL}");
+        let stamp_source = format!("{NODE_WGSL}{CLUSTER_WGSL}{MORPH_WGSL}{STAMP_WGSL}");
         let stamp = pipeline(
             gpu,
             "raster stamp",
@@ -717,6 +749,7 @@ impl Raster {
             indices,
             remap,
             stamps,
+            drawn_edges,
             params,
             view,
             layout,
@@ -797,6 +830,7 @@ impl Raster {
                     entry(2, cut.counts),
                     entry(3, &self.stamps),
                     entry(4, &self.params),
+                    entry(5, &self.drawn_edges),
                 ],
             })
         })?;
@@ -1093,7 +1127,7 @@ impl SlotPipeline {
 fn shader_source(layout: &SlotLayout, patches: &[(&str, &str)]) -> String {
     let source = format!(
         "{NODE_WGSL}{VERTEX_WGSL}{CULL_WGSL}{CLUSTER_WGSL}\
-         {INDICES_WGSL}{MORPH_WGSL}{}{RASTER_WGSL}",
+         {INDICES_WGSL}{MORPH_WGSL}{}{PLACE_WGSL}{RASTER_WGSL}",
         slot_source(layout)
     );
     patches.iter().fold(source, |source, (from, to)| {

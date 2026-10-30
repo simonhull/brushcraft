@@ -133,6 +133,43 @@ struct Cluster {
     // bit 28 + k set where it lies on edge k and the neighbour across it is refined (finer).
     cell: u32,
 }
+
+// Where a cut entry's flags (CutEntry.flags) keep its tile's drawn edges: bits 8..16, the edges
+// whose neighbour is drawn a level coarser in the low nibble and finer in the high one
+// (render::lod::DrawnEdges), recorded by emit for every tile of the cut.
+const CUT_EDGES_SHIFT: u32 = 8u;
+
+// The edges of a tile of `per` x `per` clusters that its cluster (cx, cy) lies on: bit k for
+// edge k, in the tile tree's neighbour order.
+fn cluster_on_edges(cx: u32, cy: u32, per: u32) -> u32 {
+    var on = 0u;
+    if cy == 0u {
+        on |= 1u;
+    }
+    if cx == per - 1u {
+        on |= 2u;
+    }
+    if cy == per - 1u {
+        on |= 4u;
+    }
+    if cx == 0u {
+        on |= 8u;
+    }
+    return on;
+}
+
+// Cluster.cell of cluster (cx, cy) of a tile `quads` quads a side whose drawn edges are `edges`
+// (render::lod::DrawnEdges's bits): the edge variant and the finer edges are the tile's, on the
+// edges the cluster lies on. Emit lists clusters with it, and the shading pass rebuilds a
+// visibility id's cluster with it, from the edges the stamp pass kept per node.
+fn cluster_cell(cx: u32, cy: u32, quads: u32, edges: u32) -> u32 {
+    let per = max(quads / 8u, 1u);
+    let on = cluster_on_edges(cx, cy, per);
+    let coarser = edges & 0xfu;
+    let finer = (edges >> 4u) & 0xfu;
+    let bits = ((coarser & on) << 24u) | ((finer & on) << 28u);
+    return cx | (cy << 8u) | (min(quads, 8u) << 16u) | bits;
+}
 ";
 
 /// Indices one cluster draws: 8 × 8 quads, two triangles each. A cluster of a smaller tile, or
@@ -204,6 +241,61 @@ impl GpuCluster {
     }
 }
 
+/// A tile's drawn edges: where the neighbour is drawn a level coarser, and where finer.
+///
+/// Bits 0 to 4 are the edges whose neighbour is drawn a level coarser (bit `k` for edge `k`, in
+/// the tile tree's neighbour order), bits 4 to 8 those whose neighbour is drawn finer.
+///
+/// The level choice's `emit` records them for every tile of the cut, in its cut entry's flags
+/// (WGSL's `CutEntry.flags`, bits 8 to 16); the raster's stamp pass keeps them per node
+/// ([`crate::raster::Raster`]), for the shading pass, which needs a visibility id's cluster's edge
+/// variant and finer edges ([`GpuCluster::variant`], [`GpuCluster::finer`]) to rebuild the
+/// triangles drawn there: the id carries only the node, the cluster and the quad. The cluster's
+/// own bits are the tile's on the edges the cluster lies on ([`DrawnEdges::cell`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct DrawnEdges(u8);
+
+impl DrawnEdges {
+    /// The edges whose neighbour is drawn a level `coarser` and `finer` (bit `k` for edge `k`;
+    /// bits past the fourth are dropped).
+    #[must_use]
+    pub const fn new(coarser: u8, finer: u8) -> Self {
+        Self((coarser & 0xF) | ((finer & 0xF) << 4))
+    }
+
+    /// The edges whose neighbour is drawn a level coarser.
+    #[must_use]
+    pub const fn coarser(self) -> u8 {
+        self.0 & 0xF
+    }
+
+    /// The edges whose neighbour is drawn finer.
+    #[must_use]
+    pub const fn finer(self) -> u8 {
+        self.0 >> 4
+    }
+
+    /// The byte, as the GPU keeps it.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// [`GpuCluster::cell`] of cluster `(cx, cy)` of a tile `quads` quads a side whose drawn
+    /// edges these are, as `emit` lists it (WGSL's `cluster_cell`).
+    #[must_use]
+    pub fn cell(self, cx: u32, cy: u32, quads: u32) -> u32 {
+        let per = (quads / 8).max(1);
+        let on = u32::from(cy == 0)
+            | (u32::from(cx + 1 == per) << 1)
+            | (u32::from(cy + 1 == per) << 2)
+            | (u32::from(cx == 0) << 3);
+        let coarser = u32::from(self.coarser()) & on;
+        let finer = u32::from(self.finer()) & on;
+        cx | (cy << 8) | (quads.min(8) << 16) | (coarser << 24) | (finer << 28)
+    }
+}
+
 /// One tile of the cut as the GPU writes it: WGSL's `CutEntry`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
@@ -214,9 +306,14 @@ pub(crate) struct GpuCutEntry {
     pub(crate) place: u32,
     /// Its node.
     pub(crate) node: u32,
-    /// [`CUT_DRAWN`] once drawn.
+    /// [`CUT_DRAWN`] once drawn; bits 8 to 16 its [`DrawnEdges`] ([`CUT_EDGES_SHIFT`]).
     pub(crate) flags: u32,
 }
+
+/// Where [`GpuCutEntry::flags`] keeps the tile's [`DrawnEdges`] (WGSL's `CUT_EDGES_SHIFT`, which
+/// the GPU uses; the tests write cut entries with it).
+#[cfg(test)]
+pub(crate) const CUT_EDGES_SHIFT: u32 = 8;
 
 /// [`GpuCutEntry::flags`]: drawn by either phase.
 const CUT_DRAWN: u32 = 1;
