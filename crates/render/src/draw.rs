@@ -49,7 +49,8 @@ pub struct FrameInputs<'a> {
     pub clear: Color,
     /// The overlay's text image, drawn last over the top-left corner; `None` for no overlay.
     pub overlay: Option<&'a TextImage>,
-    /// Frame pixels per overlay texel: the window's scale factor, rounded, at least 1.
+    /// Frame pixels per overlay texel: the window's scale factor, rounded, at least 1. The
+    /// wireframe's lines are as many pixels a point.
     pub overlay_scale: u32,
     /// The scene: drawn, shaded again as it was, or none. A renderer without [`FramePasses`]
     /// draws none.
@@ -282,7 +283,7 @@ impl Renderer {
         } = image_passes;
         overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         if let Some(passes) = scene_passes.as_mut() {
-            passes.set_shading(gpu, inputs.look.shading, inputs.look.material);
+            passes.set_shading(gpu, inputs.look, inputs.overlay_scale);
         }
         let to_draw = scene_passes.as_mut().map(|passes| (inputs.scene, passes));
         let drawing = matches!(to_draw, Some((Scene::Draw(_), _)));

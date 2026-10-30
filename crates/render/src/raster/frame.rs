@@ -23,13 +23,14 @@ use thiserror::Error;
 use wgpu::{Buffer, CommandEncoder};
 
 use super::{ClusterDraw, Phase, Raster, RasterConfig, RasterError, RasterFrame};
+use crate::Look;
 use crate::camera::View;
 use crate::cull::{BoundsUpdate, DepthPyramid, PyramidPass, SlotBuffers};
 use crate::gpu::{Gpu, GpuError};
 use crate::lod::{CutReadback, Lod, LodConfig, LodError, MainInputs};
 use crate::material::MatCapStyle;
 use crate::residency::SlotLayout;
-use crate::shade::{Shade, ShadeError, ShadePath, ShadeScene, ShadeSettings};
+use crate::shade::{Shade, ShadeError, ShadePath, ShadeScene};
 
 /// Why a frame's passes couldn't be set up or encoded.
 #[derive(Debug, Error)]
@@ -143,11 +144,13 @@ impl FramePasses {
         &self.shade
     }
 
-    /// Sets what the shading shows (the wireframe) and the MatCap's style, from the next
-    /// shading pass on.
-    pub fn set_shading(&mut self, gpu: &Gpu, settings: ShadeSettings, style: MatCapStyle) {
-        self.shade.set_settings(settings);
-        self.shade.set_material(gpu, style);
+    /// Sets how the shading shows the scene, `look`'s wireframe and MatCap style, the wireframe's
+    /// lines `pixel_scale` frame pixels a point (the window's scale factor), from the next shading
+    /// pass on.
+    pub fn set_shading(&mut self, gpu: &Gpu, look: Look, pixel_scale: u32) {
+        self.shade.set_settings(look.shading);
+        self.shade.set_material(gpu, look.material);
+        self.shade.set_pixel_scale(pixel_scale);
     }
 
     /// Encodes the shading pass over the visibility buffer [`FramePasses::encode`] just drew

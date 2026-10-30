@@ -590,6 +590,20 @@ fn a_material_or_wireframe_change_is_a_shading_pass_alone() {
             lined > lit / 20 && lined < lit / 2,
             "the wireframe covers {lined} of {lit}"
         );
+        // At a display scale of 2 its lines are twice as wide: with the pixel's ramp each side,
+        // a band of three pixels for two.
+        shade.set_pixel_scale(2);
+        let doubled = again(&mut shade, (MatCapStyle::Glossy, true));
+        shade.set_pixel_scale(1);
+        let wider = glossy
+            .iter()
+            .zip(&doubled)
+            .filter(|(a, b)| bits(a) != bits(b))
+            .count();
+        assert!(
+            wider > lined * 5 / 4,
+            "{wider} pixels at scale 2, {lined} at 1"
+        );
         // Background stays background.
         let background = clay.iter().zip(&wired).filter(|(a, _)| a[3] == 0.0);
         assert!(background.clone().count() > 1000, "background in view");

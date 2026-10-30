@@ -62,7 +62,8 @@
 //! and `Eye` (`crate::material::SURFACE_WGSL`), and returns linear colour. The **wireframe**
 //! is analytic: each barycentric coordinate over its rate of change across the screen is the
 //! pixel's distance to the triangle's edge opposite that corner, and a line of
-//! `WIRE_WIDTH` pixels with a pixel's ramp is mixed over the colour
+//! `WIRE_WIDTH` pixels times the display's scale (so a high-density screen draws it as thick),
+//! with a pixel's ramp, is mixed over the colour
 //! ([`ShadeSettings::wireframe`]). Background pixels are written as zero (alpha 0), for the tone
 //! map to leave the frame's clear colour there.
 //!
@@ -139,7 +140,8 @@ pub(crate) const fn fixed_buffers<M: Material>() -> (u32, u32) {
 /// Pixels a side of a compute workgroup.
 const GROUP_SIDE: u32 = 8;
 
-/// The wireframe's lines' width, pixels.
+/// The wireframe's lines' width, pixels at a scale of 1: [`Shade::set_pixel_scale`] multiplies
+/// it.
 pub(crate) const WIRE_WIDTH: f32 = 1.0;
 
 /// The wireframe's colour, linear: a dark slate, readable over every MatCap.
@@ -281,8 +283,10 @@ pub(crate) struct Shade<M: Material = MatCap> {
     params: Buffer,
     /// A small buffer bound for each slot buffer of the layout not made yet.
     placeholder: Buffer,
-    /// The wireframe and the style.
+    /// The wireframe.
     settings: ShadeSettings,
+    /// Frame pixels per point of the display: the wireframe's width is in points.
+    pixel_scale: u32,
     /// The target, once a frame was shaded.
     target: Option<Target>,
     /// The last scene shaded.
@@ -315,6 +319,12 @@ impl<M: Material> Shade<M> {
     /// no new pipeline).
     pub(crate) fn set_settings(&mut self, settings: ShadeSettings) {
         self.settings = settings;
+    }
+
+    /// Draws the wireframe `scale` frame pixels per point (the window's scale factor, rounded, at
+    /// least 1), from the next pass on.
+    pub(crate) fn set_pixel_scale(&mut self, scale: u32) {
+        self.pixel_scale = scale.max(1);
     }
 
     /// Sets the material's settings, from the next pass on (its own buffers: no new pipeline).
@@ -394,6 +404,7 @@ impl<M: Material> Shade<M> {
             params,
             placeholder,
             settings: ShadeSettings::default(),
+            pixel_scale: 1,
             target: None,
             bound: None,
             #[cfg(test)]
@@ -490,7 +501,12 @@ impl<M: Material> Shade<M> {
         let params = GpuShadeParams {
             up,
             right,
-            wire: [WIRE_COLOUR[0], WIRE_COLOUR[1], WIRE_COLOUR[2], WIRE_WIDTH],
+            wire: [
+                WIRE_COLOUR[0],
+                WIRE_COLOUR[1],
+                WIRE_COLOUR[2],
+                WIRE_WIDTH * f32::from(u16::try_from(self.pixel_scale).unwrap_or(u16::MAX)),
+            ],
             flags: if self.settings.wireframe {
                 WIREFRAME
             } else {
