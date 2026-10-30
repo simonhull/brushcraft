@@ -187,9 +187,9 @@ struct Rebuilt {
 // coordinates: where they put the centre outside it and the other triangle holds it better
 // (the rasterizer's tie rule on the diagonal), it is the other. With a corner behind the eye,
 // which the screen can't hold, it is the triangle holding the centre best. A triangle an edge
-// variant collapsed holds nothing (barycentric's NO_TRIANGLE), so it is never chosen. The point, normal and roughness term are the corners' mixed by
-// the perspective-correct barycentric coordinates of the pixel's centre, as the rasterizer
-// interpolates.
+// variant collapsed holds nothing (barycentric's NO_TRIANGLE), so it is never chosen. The point,
+// normal and roughness term are the corners' mixed by the perspective-correct barycentric
+// coordinates of the pixel's centre, as the rasterizer interpolates.
 fn rebuild(pixel: vec2<u32>) -> Rebuilt {
     var out = Rebuilt(false, vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), 1.0, 1e9, false);
     let id = textureLoad(ids, pixel, 0).r;
@@ -206,66 +206,75 @@ fn rebuild(pixel: vec2<u32>) -> Rebuilt {
     let per = clusters_per_side(side);
     let cell = cluster_cell(cluster % per, cluster / per, side - 1u, drawn_edges[n]);
     let base = (quad / CLUSTER_QUADS) * CLUSTER_SIDE + quad % CLUSTER_QUADS;
-    // The quad's corners: p00, p10, p11, p01.
-    let placed = array<Placed, 4>(
-        place_vertex(n, cell, base),
-        place_vertex(n, cell, base + 1u),
-        place_vertex(n, cell, base + 1u + CLUSTER_SIDE),
-        place_vertex(n, cell, base + CLUSTER_SIDE),
-    );
-    var relative: array<vec3<f32>, 4>;
-    var clip: array<vec4<f32>, 4>;
-    var in_front = true;
-    for (var k = 0u; k < 4u; k++) {
-        relative[k] = placed[k].position - view.eye.xyz;
-        clip[k] = view.view_proj * vec4<f32>(relative[k], 1.0);
-        in_front = in_front && clip[k].w > 0.0;
-    }
+    // The quad's corners: p00, p10, p11, p01. Each is a variable of its own, picked below by
+    // `select` or a branch: never an array indexed at run time (the crate's notes, "Shaders").
+    let placed0 = place_vertex(n, cell, base);
+    let placed1 = place_vertex(n, cell, base + 1u);
+    let placed2 = place_vertex(n, cell, base + 1u + CLUSTER_SIDE);
+    let placed3 = place_vertex(n, cell, base + CLUSTER_SIDE);
+    let relative0 = placed0.position - view.eye.xyz;
+    let relative1 = placed1.position - view.eye.xyz;
+    let relative2 = placed2.position - view.eye.xyz;
+    let relative3 = placed3.position - view.eye.xyz;
+    let clip0 = view.view_proj * vec4<f32>(relative0, 1.0);
+    let clip1 = view.view_proj * vec4<f32>(relative1, 1.0);
+    let clip2 = view.view_proj * vec4<f32>(relative2, 1.0);
+    let clip3 = view.view_proj * vec4<f32>(relative3, 1.0);
+    let in_front = clip0.w > 0.0 && clip1.w > 0.0 && clip2.w > 0.0 && clip3.w > 0.0;
     let centre = vec2<f32>(pixel) + vec2<f32>(0.5);
     let p = homogeneous(centre);
     // Triangle 0 is (p00, p10, p11), triangle 1 (p00, p11, p01).
-    let first = Candidate(
-        barycentric(clip[0].xyw, clip[1].xyw, clip[2].xyw, p),
-        facing(relative[0], relative[1], relative[2]),
+    var first = Candidate(
+        barycentric(clip0.xyw, clip1.xyw, clip2.xyw, p),
+        facing(relative0, relative1, relative2),
         0.0,
     );
-    let second_tri = Candidate(
-        barycentric(clip[0].xyw, clip[2].xyw, clip[3].xyw, p),
-        facing(relative[0], relative[2], relative[3]),
+    var second_tri = Candidate(
+        barycentric(clip0.xyw, clip2.xyw, clip3.xyw, p),
+        facing(relative0, relative2, relative3),
         0.0,
     );
-    var candidates = array<Candidate, 2>(first, second_tri);
-    candidates[0].depth = depth_of(clip[0], clip[1], clip[2], candidates[0].b);
-    candidates[1].depth = depth_of(clip[0], clip[2], clip[3], candidates[1].b);
-    var second = select(0u, 1u, inside(candidates[1].b) > inside(candidates[0].b));
+    first.depth = depth_of(clip0, clip1, clip2, first.b);
+    second_tri.depth = depth_of(clip0, clip2, clip3, second_tri.b);
+    var second = select(0u, 1u, inside(second_tri.b) > inside(first.b));
     if in_front {
-        second = quad_triangle(
-            screen(clip[0]),
-            screen(clip[1]),
-            screen(clip[2]),
-            screen(clip[3]),
-            centre,
-        );
+        second = quad_triangle(screen(clip0), screen(clip1), screen(clip2), screen(clip3), centre);
+    }
+    // The triangle on the diagonal's side, and the other.
+    var chosen = first;
+    var other = second_tri;
+    if second == 1u {
+        chosen = second_tri;
+        other = first;
     }
     // The rasterizer drew a triangle facing the eye whose visible part holds the centre, the
     // nearer where two do (a quad folded over itself, seen grazing, puts both on the pixel).
     // The diagonal's side can miss that: a centre within rounding of the diagonal goes by the
     // rasterizer's tie rule, a fold puts the centre on the side of a triangle hidden behind the
     // other or facing away, and with a corner behind the eye there is no screen to test on.
-    if better(candidates[1u - second], candidates[second]) {
+    if better(other, chosen) {
         second = 1u - second;
+        chosen = other;
     }
-    let corner = vec3<u32>(0u, 1u + second, 2u + second);
-    let c0 = clip[corner.x].xyw;
-    let c1 = clip[corner.y].xyw;
-    let c2 = clip[corner.z].xyw;
-    let b = candidates[second].b;
+    // The triangle's corners: p00, then p10 and p11 (triangle 0) or p11 and p01 (triangle 1).
+    let on_second = second == 1u;
+    let c0 = clip0.xyw;
+    let c1 = select(clip1, clip2, on_second).xyw;
+    let c2 = select(clip2, clip3, on_second).xyw;
+    let b = chosen.b;
     out.drawn = true;
     out.behind = !in_front;
-    out.relative = relative[corner.x] * b.x + relative[corner.y] * b.y + relative[corner.z] * b.z;
-    let a0 = attributes(n, placed[corner.x]);
-    let a1 = attributes(n, placed[corner.y]);
-    let a2 = attributes(n, placed[corner.z]);
+    out.relative = relative0 * b.x + select(relative1, relative2, on_second) * b.y
+        + select(relative2, relative3, on_second) * b.z;
+    var corner1 = placed1;
+    var corner2 = placed2;
+    if on_second {
+        corner1 = placed2;
+        corner2 = placed3;
+    }
+    let a0 = attributes(n, placed0);
+    let a1 = attributes(n, corner1);
+    let a2 = attributes(n, corner2);
     let mixed = a0 * b.x + a1 * b.y + a2 * b.z;
     let reach = sqrt(dot(mixed.xyz, mixed.xyz));
     if reach > 0.0 {

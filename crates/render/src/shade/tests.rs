@@ -455,10 +455,7 @@ fn the_rebuild_check_bites_when_the_drawn_edges_the_morph_or_the_diagonal_is_ign
                 "diagonal",
                 &[
                     ("second = quad_triangle(", "second = 0u * quad_triangle("),
-                    (
-                        "if better(candidates[1u - second], candidates[second]) {",
-                        "if false {",
-                    ),
+                    ("if better(other, chosen) {", "if false {"),
                 ],
             ),
         ];
@@ -764,13 +761,12 @@ fn quads_reaching_behind_the_eye_are_rebuilt_as_drawn_collapsed_triangles_never_
                 "        return vec3<f32>(1.0, 0.0, 0.0);",
             ),
             (
-                "var second = select(0u, 1u, inside(candidates[1].b) > inside(candidates[0].b));",
+                "var second = select(0u, 1u, inside(second_tri.b) > inside(first.b));",
                 "var second = 0u;",
             ),
             (
-                "if better(candidates[1u - second], candidates[second]) {",
-                "if in_front && inside(candidates[second].b) < 0.0 \
-                 && inside(candidates[1u - second].b) > inside(candidates[second].b) {",
+                "if better(other, chosen) {",
+                "if in_front && inside(chosen.b) < 0.0 && inside(other.b) > inside(chosen.b) {",
             ),
         ];
         let fold_blind = [
