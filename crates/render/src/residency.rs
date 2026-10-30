@@ -1059,6 +1059,13 @@ impl Residency {
         self.wanted.extend(fresh);
     }
 
+    /// The tiles wanted and not resident yet, each with its screen error: the latest requests,
+    /// and floor tiles not staged yet. For a source that makes tiles elsewhere
+    /// ([`TileSource::deferred`]), to know which to make.
+    pub fn wanted(&self) -> impl Iterator<Item = (TileKey, f32)> + '_ {
+        self.wanted.iter().map(|(key, want)| (*key, want.error))
+    }
+
     /// Takes what the level choice used this frame: `frame.drawn`'s tiles are renewed as most
     /// recently drawn, and until the next call `frame.cut`'s tiles and every ancestor of
     /// either's are never evicted.
@@ -1428,7 +1435,8 @@ impl Residency {
     /// Stages the requested tiles, largest screen error first, readied a batch at a time,
     /// until `deadline` or the ring is full. Tiles first requested this frame wait for the
     /// next, but for display tiles the source has at hand ([`TileSource::at_hand`]): a finest
-    /// tile's page-in, or a display record's read ahead, has that frame to land.
+    /// tile's page-in, or a display record's read ahead, has that frame to land. Tiles the source
+    /// is still making elsewhere ([`TileSource::deferred`]) wait, wanted, for a later frame.
     ///
     /// # Errors
     ///
@@ -1466,6 +1474,9 @@ impl Residency {
             for &(key, due) in chunk {
                 if self.entries.contains_key(&key) || self.unavailable.contains(&key) {
                     self.wanted.remove(&key);
+                } else if source.deferred(key) {
+                    // Being made elsewhere: it stays wanted, for a later frame, and the owner
+                    // never waits on it here.
                 } else if due || source.at_hand(key) {
                     ready.push(key);
                 }

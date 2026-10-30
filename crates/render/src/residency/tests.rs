@@ -81,6 +81,10 @@ struct Model {
     /// column), for the randomized tests to stage some display tiles in the frame they are
     /// first requested in.
     half_at_hand: bool,
+    /// Tiles the model is still making elsewhere ([`TileSource::deferred`]).
+    deferred: BTreeSet<TileKey>,
+    /// Reads of tiles while they were deferred: none should be.
+    deferred_reads: usize,
 }
 
 impl Model {
@@ -113,6 +117,8 @@ impl Model {
             closed: Vec::new(),
             at_hand: BTreeSet::new(),
             half_at_hand: false,
+            deferred: BTreeSet::new(),
+            deferred_reads: 0,
         }
     }
 
@@ -194,7 +200,14 @@ impl TileSource for Model {
         self.at_hand.contains(&key) || (self.half_at_hand && half)
     }
 
+    fn deferred(&mut self, key: TileKey) -> bool {
+        self.deferred.contains(&key)
+    }
+
     fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, Failure> {
+        if self.deferred.contains(&key) {
+            self.deferred_reads += 1;
+        }
         self.reads += 1;
         if self.fail_one_in > 0 && self.reads.is_multiple_of(self.fail_one_in) {
             return Err(Failure);
@@ -1031,6 +1044,40 @@ fn a_display_tile_at_hand_is_staged_in_the_frame_it_is_requested_in() {
                 "{key:?}: staged the next frame"
             );
         }
+        gpu_view(gpu, &residency);
+    });
+}
+
+/// A requested tile the source defers is never read, and stays wanted while the tiles around it
+/// are staged; once the source has it, it is staged that frame.
+#[test]
+fn a_deferred_tile_stays_wanted_unread_until_the_source_has_it() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), ResidencyConfig::default())
+            .expect("residency");
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        let finest = |face| TileKey::displacement(geom::FaceId::new(face), level(FINEST), 0, 0);
+        let deferred = finest(2).expect("a finest tile");
+        let other = finest(3).expect("a finest tile");
+        model.deferred.insert(deferred);
+        let asking = [deferred, other];
+        for _ in 0..4 {
+            quiet_frame(gpu, &mut residency, &mut model, &asking);
+        }
+        assert!(residency.slot(&other).is_some(), "the other tile staged");
+        assert!(residency.slot(&deferred).is_none(), "the deferred one not");
+        assert_eq!(model.deferred_reads, 0, "nor ever read");
+        let wanted: Vec<(TileKey, f32)> = residency.wanted().collect();
+        assert_eq!(wanted, vec![(deferred, 1.0)], "and still wanted");
+        model.deferred.clear();
+        quiet_frame(gpu, &mut residency, &mut model, &asking);
+        assert!(
+            residency.slot(&deferred).is_some(),
+            "staged in the frame the source has it: it was requested long before"
+        );
+        assert_eq!(residency.wanted().count(), 0, "nothing wanted");
         gpu_view(gpu, &residency);
     });
 }

@@ -221,6 +221,20 @@ pub trait TileSource {
         false
     }
 
+    /// Whether requested tile `key` is being made elsewhere and isn't ready yet, so reading it
+    /// now would block on that work: a finest tile in the store's queued evaluation
+    /// ([`FinestEvaluations`]). Such a tile is never read for its request; it stays wanted, and
+    /// is staged in a later frame, once this says no. Tiles a pending epoch names are read
+    /// whatever this says, since the epoch switches whole. The default says no: nothing is made
+    /// elsewhere.
+    #[expect(
+        unused_variables,
+        reason = "the default makes nothing elsewhere; a source that does overrides it"
+    )]
+    fn deferred(&mut self, key: TileKey) -> bool {
+        false
+    }
+
     /// Writes `key` into `out`, its vertices or (a finest tile) its positions with the ring, and
     /// returns its bound `e` and its finest normals' cone, or `None` if the source has nothing
     /// to draw for it yet (a display tile not built, or made unknown by edits): it is then drawn
