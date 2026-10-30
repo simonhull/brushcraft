@@ -803,6 +803,22 @@ fn coarser_edges(n: u32) -> u32 {
     return mask;
 }
 
+// The edges of node `n` whose neighbour at its level is refined in the end, so drawn finer:
+// bit k for edge k.
+fn finer_edges(n: u32) -> u32 {
+    var mask = 0u;
+    for (var k = 0u; k < 4u; k++) {
+        if ((tree[n].edges >> k) & 1u) == 0u {
+            continue;
+        }
+        let m = tree[n].neighbours[k];
+        if m != NONE && reached_final(m) && (flags_of(m) & W_FINAL) != 0u {
+            mask |= 1u << k;
+        }
+    }
+    return mask;
+}
+
 // Appends node `n`'s clusters to the phase's list (`phase` 0: main, 1: post) and marks it
 // drawn.
 fn draw(n: u32, phase: u32) {
@@ -812,6 +828,7 @@ fn draw(n: u32, phase: u32) {
     let cluster_quads = min(quads, 8u);
     let count = per * per;
     let mask = coarser_edges(n);
+    let finer = finer_edges(n);
     var first = 0u;
     if phase == 0u {
         first = atomicAdd(&frame.main.instance_count, count);
@@ -828,20 +845,22 @@ fn draw(n: u32, phase: u32) {
         }
         let cx = c % per;
         let cy = c / per;
-        var variant = 0u;
+        // The tile's edges the cluster lies on.
+        var on = 0u;
         if cy == 0u {
-            variant |= mask & 1u;
+            on |= 1u;
         }
         if cx == per - 1u {
-            variant |= mask & 2u;
+            on |= 2u;
         }
         if cy == per - 1u {
-            variant |= mask & 4u;
+            on |= 4u;
         }
         if cx == 0u {
-            variant |= mask & 8u;
+            on |= 8u;
         }
-        clusters[at] = Cluster(n, cx | (cy << 8u) | (cluster_quads << 16u) | (variant << 24u));
+        let edges = ((mask & on) << 24u) | ((finer & on) << 28u);
+        clusters[at] = Cluster(n, cx | (cy << 8u) | (cluster_quads << 16u) | edges);
     }
     let entry = work[n].cut_index;
     if entry != NONE {

@@ -123,7 +123,8 @@ struct Cluster {
     node: u32,
     // Bits 0..8: the cluster's column in the tile, 8..16 its row, 16..24 its quads a side
     // (8, or fewer for a tile under 8 quads), 24..28 its edge variant: bit k set where the
-    // cluster lies on the tile's edge k and the neighbour across it is a level coarser.
+    // cluster lies on the tile's edge k and the neighbour across it is a level coarser; 28..32
+    // bit 28 + k set where it lies on edge k and the neighbour across it is refined (finer).
     cell: u32,
 }
 ";
@@ -163,7 +164,8 @@ const STAGES: u32 = 6;
 pub struct GpuCluster {
     /// The tile's node in the tile tree.
     pub node: u32,
-    /// Column (bits 0–8), row (8–16), quads a side (16–24) and edge variant (24–28).
+    /// Column (bits 0–8), row (8–16), quads a side (16–24), edge variant (24–28) and finer
+    /// edges (28–32).
     pub cell: u32,
 }
 
@@ -185,6 +187,14 @@ impl GpuCluster {
     #[must_use]
     pub const fn variant(self) -> u32 {
         (self.cell >> 24) & 0xF
+    }
+
+    /// The finer edges: bit `k` set where the cluster lies on its tile's edge `k` and the
+    /// neighbour across it is refined, so drawn finer. The raster draws that edge's odd vertices
+    /// where they are, unmorphed, since the finer side draws them as its even vertices.
+    #[must_use]
+    pub const fn finer(self) -> u32 {
+        self.cell >> 28
     }
 }
 

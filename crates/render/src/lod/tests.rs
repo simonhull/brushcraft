@@ -415,8 +415,11 @@ fn check_neighbours(scene: &Scene, output: &LodOutput, view: Option<&View>) {
     }
 }
 
-/// Every cluster of the first list belongs to a drawn tile, every drawn tile has all its
-/// clusters, and each cluster's edge variant marks exactly its coarser neighbours.
+/// The first cluster list is exactly the drawn tiles' clusters, with the right edges marked.
+///
+/// Every cluster belongs to a drawn tile, every drawn tile has all its clusters, and each
+/// cluster's edge variant marks exactly its coarser neighbours, its finer edges exactly its
+/// refined ones.
 fn check_clusters(gpu: &Gpu, lod: &Lod, scene: &Scene, output: &LodOutput) {
     let (args, offset) = lod.draw_args(false);
     let words: Vec<u32> = gpu.read_buffer(args).expect("read back");
@@ -452,6 +455,13 @@ fn check_clusters(gpu: &Gpu, lod: &Lod, scene: &Scene, output: &LodOutput) {
                 cluster.variant() & (1 << edge) != 0,
                 on_edge[edge] && coarser,
                 "{place:?} cluster ({cx}, {cy}) edge {edge}"
+            );
+            // Neither coarser nor in the cut itself: refined, its area drawn finer.
+            let finer = neighbours[edge].is_some_and(|m| !coarser && !cut.contains(&m));
+            assert_eq!(
+                cluster.finer() & (1 << edge) != 0,
+                on_edge[edge] && finer,
+                "{place:?} cluster ({cx}, {cy}) edge {edge}: finer"
             );
         }
     }
