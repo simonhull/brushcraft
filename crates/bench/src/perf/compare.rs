@@ -15,7 +15,7 @@
 
 use std::fmt;
 
-use crate::perf::metric::{Measured, Metric};
+use crate::perf::metric::{Measured, Metric, Outcome};
 
 /// The least relative change ever flagged.
 pub(crate) const MIN_CHANGE: f64 = 0.05;
@@ -128,18 +128,29 @@ pub(crate) enum Target {
         /// How far over, in the metric's unit.
         by: f64,
     },
+    /// A timed metric whose end the run never reached ([`Outcome::NotReached`]): a miss like
+    /// any value over the ceiling, flagged.
+    NotReached,
 }
 
 impl Target {
     /// `metric` against its ceiling.
     pub(crate) fn check(metric: &Metric) -> Self {
-        match metric.ceiling {
-            None => Self::Unset,
-            Some(ceiling) if metric.value.median() <= ceiling => Self::Met,
-            Some(ceiling) => Self::Missed {
-                by: metric.value.median() - ceiling,
+        let Some(ceiling) = metric.ceiling else {
+            return Self::Unset;
+        };
+        match &metric.value {
+            Outcome::NotReached => Self::NotReached,
+            Outcome::Measured(value) if value.median() <= ceiling => Self::Met,
+            Outcome::Measured(value) => Self::Missed {
+                by: value.median() - ceiling,
             },
         }
+    }
+
+    /// Whether the metric missed its ceiling, over it or never reached: flagged.
+    pub(crate) const fn missed(self) -> bool {
+        matches!(self, Self::Missed { .. } | Self::NotReached)
     }
 }
 
@@ -268,7 +279,7 @@ mod tests {
         let metric = |median: f64, ceiling| Metric {
             name: "medium.budget.peak_rss_mib".parse().unwrap(),
             unit: crate::perf::metric::Unit::Mib,
-            value: value(median, 0.0),
+            value: value(median, 0.0).into(),
             ceiling,
         };
         assert_eq!(
@@ -286,6 +297,18 @@ mod tests {
             Target::Missed { by: 64.0 },
             "over it"
         );
+        let never = Metric {
+            value: Outcome::NotReached,
+            ..metric(0.0, Some(100.0))
+        };
+        assert_eq!(Target::check(&never), Target::NotReached, "never reached");
+        assert!(Target::check(&never).missed(), "a miss");
+        assert!(!Target::check(&metric(1536.0, Some(1536.0))).missed());
+        let no_ceiling = Metric {
+            ceiling: None,
+            ..never
+        };
+        assert_eq!(Target::check(&no_ceiling), Target::Unset, "nothing to miss");
     }
 
     #[test]

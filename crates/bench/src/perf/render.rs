@@ -24,15 +24,19 @@
 //! A run whose record lacks one (no timestamp queries, no flick) gives no sample of it, and the
 //! part says so. A run that never reaches a timed metric's end (no frame caught up after the
 //! flick, none correct within the open segment) gives no sample either, and the part says it
-//! was not reached ([`Reached::Not`]): never a number standing in for the run's end. With no GPU
-//! (the app exits 69 when no adapter matches), the part doesn't run: "not run: no adapter".
+//! was not reached ([`Reached::Not`]): never a number standing in for the run's end. Where the
+//! metric has a ceiling (the benchmark project's), not reached is a target miss: the metric is
+//! [`Outcome::NotReached`] if any run failed to reach it, the stricter call when others did
+//! ([`judge_unreached`]). With no GPU (the app exits 69 when no adapter matches), the part
+//! doesn't run: "not run: no adapter".
 
+use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow, ensure};
 
 use crate::perf::json::{Json, Object};
-use crate::perf::metric::{Metric, MetricName, Unit};
+use crate::perf::metric::{Metric, MetricName, Outcome, Unit};
 use crate::perf::project::{Scale, Source, WorkDir};
 use crate::perf::suite::{AppExit, Runner, Samples};
 
@@ -388,26 +392,106 @@ impl RenderMetrics {
         ]
     }
 
-    /// Adds this run's metrics to `samples` under `scale`'s names; returns a note for each it
-    /// had none of: "no `name`" where the record lacks it, "`name` not reached" where the run
-    /// never reached its end.
+    /// Adds this run's metrics to `samples` under `scale`'s names; returns those it had none
+    /// of, and why.
     ///
     /// # Errors
     ///
     /// If a name isn't a metric name, or a unit clashes.
-    fn sample(&self, scale: Scale, samples: &mut Samples) -> Result<Vec<String>> {
-        let mut lacking = Vec::new();
+    fn sample(&self, scale: Scale, samples: &mut Samples) -> Result<Vec<Gap>> {
+        let mut gaps = Vec::new();
         for (name, unit, value) in self.named() {
             match value {
                 Value::Of(value) => {
                     samples.push(MetricName::join(scale.name(), name)?, unit, value)?;
                 }
-                Value::Lacking => lacking.push(format!("no {name}")),
-                Value::NotReached => lacking.push(format!("{name} not reached")),
+                Value::Lacking => gaps.push(Gap::Lacking(name)),
+                Value::NotReached => gaps.push(Gap::NotReached(name, unit)),
             }
         }
-        Ok(lacking)
+        Ok(gaps)
     }
+}
+
+/// A metric a run gave no sample of, by its name after the scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gap {
+    /// The record lacks what it is taken from: "no `name`".
+    Lacking(&'static str),
+    /// The run never reached its end: "`name` not reached".
+    NotReached(&'static str, Unit),
+}
+
+impl fmt::Display for Gap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lacking(name) => write!(f, "no {name}"),
+            Self::NotReached(name, _) => write!(f, "{name} not reached"),
+        }
+    }
+}
+
+/// A timed metric some runs never reached: its name after the scale, unit, and in how many runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unreached {
+    /// The name after the scale.
+    name: &'static str,
+    /// Its unit.
+    unit: Unit,
+    /// The runs that never reached it.
+    runs: usize,
+}
+
+/// `metrics` of `scale` (ceilings given) with the timed ones in `unreached` judged, of `runs`
+/// runs, and a note for each.
+///
+/// Against a ceiling, not reached is a miss: the metric becomes [`Outcome::NotReached`], even if
+/// other runs reached it (the stricter call; their samples are dropped, and the note says so).
+/// Without one, the runs that reached it measure it, and the note says how many didn't.
+///
+/// # Errors
+///
+/// If a name isn't a metric name.
+fn judge_unreached(
+    mut metrics: Vec<Metric>,
+    unreached: &[Unreached],
+    runs: usize,
+    scale: Scale,
+) -> Result<(Vec<Metric>, Vec<String>)> {
+    let mut notes = Vec::new();
+    for gap in unreached {
+        let name = MetricName::join(scale.name(), gap.name)?;
+        let (count, of) = (gap.runs, runs);
+        let Some(ceiling) = ceiling_of(&name, scale) else {
+            notes.push(format!(
+                "{} not reached in {count} of {of} runs: no ceiling, measured from the others",
+                gap.name
+            ));
+            continue;
+        };
+        metrics.retain(|metric| metric.name != name);
+        notes.push(if count < of {
+            format!(
+                "{} not reached in {count} of {of} runs: judged not reached against its ceiling \
+                 ({ceiling:.0} {}), the stricter call",
+                gap.name,
+                gap.unit.name()
+            )
+        } else {
+            format!(
+                "{} not reached in any of {of} runs: a miss against its ceiling ({ceiling:.0} {})",
+                gap.name,
+                gap.unit.name()
+            )
+        });
+        metrics.push(Metric {
+            name,
+            unit: gap.unit,
+            value: Outcome::NotReached,
+            ceiling: Some(ceiling),
+        });
+    }
+    Ok((metrics, notes))
 }
 
 /// What the render part came to.
@@ -471,6 +555,7 @@ fn measure(
     ])?;
     let mut samples = Samples::default();
     let mut notes = Vec::new();
+    let mut unreached: Vec<Unreached> = Vec::new();
     for run in 0..setting.runs {
         let record = dir.join(format!("render-{run}.jsonl"));
         let args = [
@@ -495,30 +580,49 @@ fn measure(
         let text = std::fs::read_to_string(&record)
             .with_context(|| format!("reading {}", record.display()))?;
         let recorded = Recorded::parse(&text).with_context(|| format!("{}", record.display()))?;
-        let lacking = derive(&recorded).sample(scale, &mut samples)?;
-        if !lacking.is_empty() {
-            notes.push(format!("run {}: {}", run + 1, lacking.join(", ")));
+        let gaps = derive(&recorded).sample(scale, &mut samples)?;
+        if !gaps.is_empty() {
+            let said: Vec<String> = gaps.iter().map(Gap::to_string).collect();
+            notes.push(format!("run {}: {}", run + 1, said.join(", ")));
+        }
+        for gap in gaps {
+            let Gap::NotReached(name, unit) = gap else {
+                continue;
+            };
+            match unreached.iter_mut().find(|u| u.name == name) {
+                Some(known) => known.runs += 1,
+                None => unreached.push(Unreached {
+                    name,
+                    unit,
+                    runs: 1,
+                }),
+            }
         }
     }
     let metrics = with_targets(samples.measure()?, scale);
+    let (metrics, judged) = judge_unreached(metrics, &unreached, setting.runs, scale)?;
+    notes.extend(judged);
     Ok(RenderPart::Measured { metrics, notes })
+}
+
+/// The ceiling on metric `name` at `scale`: the spec's target ([`TARGETS`]) on the benchmark
+/// project, none on the other scales.
+fn ceiling_of(name: &MetricName, scale: Scale) -> Option<f64> {
+    let target = TARGETS
+        .iter()
+        .find(|(target, _)| name.as_str().ends_with(target));
+    target
+        .filter(|_| scale == Scale::Full)
+        .map(|&(_, ceiling)| ceiling)
 }
 
 /// `metrics` of `scale`, those the spec sets a target for given it as their ceiling on the
 /// benchmark project ([`TARGETS`]); the other scales' are only compared with their history.
 fn with_targets(metrics: Vec<Metric>, scale: Scale) -> Vec<Metric> {
-    let ceiling = |metric: &Metric| {
-        let target = TARGETS
-            .iter()
-            .find(|(name, _)| metric.name.as_str().ends_with(name));
-        target
-            .filter(|_| scale == Scale::Full)
-            .map(|&(_, ceiling)| ceiling)
-    };
     metrics
         .into_iter()
         .map(|metric| Metric {
-            ceiling: ceiling(&metric),
+            ceiling: ceiling_of(&metric.name, scale),
             ..metric
         })
         .collect()

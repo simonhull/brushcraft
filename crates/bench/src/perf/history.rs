@@ -5,6 +5,10 @@
 //! loaded, the value), so a line can be read, compared or plotted alone. Baselines are lines
 //! marked `"baseline":true`; the latest baseline line of a metric, on the same hardware, is what
 //! a run is compared against.
+//!
+//! A timed metric whose end a run never reached ([`Outcome::NotReached`]) is a line marked
+//! `"reached":false`, with no median, spread or samples: kept so the miss shows in the history,
+//! never a baseline, since there is no value to compare with.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,7 +20,7 @@ use store::Workers;
 
 use crate::perf::json::{Json, Object};
 use crate::perf::machine::{Commit, Fingerprint, Timestamp};
-use crate::perf::metric::{Measured, Metric, MetricName, Unit};
+use crate::perf::metric::{Measured, Metric, MetricName, Outcome, Unit};
 use crate::perf::quiet::{Load, Settled};
 use crate::report::Record;
 
@@ -137,10 +141,15 @@ impl Entry {
         let metric = &self.metric;
         let record = Record::new("perf", "metric")
             .with("metric", metric.name.as_str())
-            .with("unit", metric.unit.name())
-            .with("median", metric.value.median())
-            .with("spread", metric.value.spread())
-            .with("samples", metric.value.samples().to_vec())
+            .with("unit", metric.unit.name());
+        let record = match &metric.value {
+            Outcome::Measured(value) => record
+                .with("median", value.median())
+                .with("spread", value.spread())
+                .with("samples", value.samples().to_vec()),
+            Outcome::NotReached => record.with("reached", false),
+        };
+        let record = record
             .with("run", info.run.as_str())
             .with("label", info.label.name())
             .with("baseline", info.baseline)
@@ -192,17 +201,27 @@ impl Entry {
         if (text("bench")?, text("result")?) != ("perf".to_owned(), "metric".to_owned()) {
             bail!("not a perf metric record");
         }
-        let samples = match get("samples")? {
-            Json::Array(items) => items
-                .iter()
-                .map(|x| {
-                    x.as_number()
-                        .ok_or_else(|| anyhow!("a sample isn't a number"))
-                })
-                .collect::<Result<Vec<_>>>()?,
-            Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => {
-                bail!("\"samples\" isn't an array")
-            }
+        // Lines written before "reached" was kept are all reached.
+        let reached = match object.get("reached") {
+            Some(_) => flag("reached")?,
+            None => true,
+        };
+        let value = if reached {
+            let samples = match get("samples")? {
+                Json::Array(items) => items
+                    .iter()
+                    .map(|x| {
+                        x.as_number()
+                            .ok_or_else(|| anyhow!("a sample isn't a number"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => {
+                    bail!("\"samples\" isn't an array")
+                }
+            };
+            Measured::recorded(number("median")?, number("spread")?, samples)?.into()
+        } else {
+            Outcome::NotReached
         };
         let unit = text("unit")?;
         let label = text("label")?;
@@ -246,7 +265,7 @@ impl Entry {
             metric: Metric {
                 name: text("metric")?.parse()?,
                 unit: Unit::named(&unit).ok_or_else(|| anyhow!("unknown unit {unit:?}"))?,
-                value: Measured::recorded(number("median")?, number("spread")?, samples)?,
+                value,
                 ceiling: match object.get("ceiling") {
                     Some(_) => Some(number("ceiling")?),
                     None => None,
@@ -303,7 +322,8 @@ pub(crate) fn read(path: &Path) -> Result<History> {
 /// The latest baseline of each metric among `entries` (in file order) measured as `run` is.
 ///
 /// That is on hardware with the same fingerprint and with the same evaluation workers setting:
-/// a run at 32 workers says nothing about one at 16.
+/// a run at 32 workers says nothing about one at 16. A line never reached
+/// ([`Outcome::NotReached`]) is no baseline, having no value: the one before it stands.
 pub(crate) fn baselines<'a>(
     entries: &'a [Entry],
     run: &RunInfo,
@@ -312,6 +332,7 @@ pub(crate) fn baselines<'a>(
         .iter()
         .filter(|e| {
             e.info.baseline
+                && e.metric.value.measured().is_some()
                 && e.info.fingerprint == run.fingerprint
                 && e.info.workers == run.workers
         })
@@ -396,7 +417,9 @@ pub(crate) mod tests {
             metric: Metric {
                 name: metric.parse().unwrap(),
                 unit: Unit::Ms,
-                value: Measured::of(vec![median * 0.99, median, median * 1.02]).unwrap(),
+                value: Measured::of(vec![median * 0.99, median, median * 1.02])
+                    .unwrap()
+                    .into(),
                 ceiling: None,
             },
         }
@@ -684,6 +707,44 @@ pub(crate) mod tests {
         assert_eq!(read(&path).unwrap().torn, Some(1), "a torn only line");
         std::fs::write(&path, format!("{}\n{whole}\n", &whole[..40])).unwrap();
         assert!(read(&path).is_err(), "a malformed interior line is refused");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A line never reached reads back, is never a baseline, and leaves later runs compared with
+    /// the baseline before it.
+    #[test]
+    fn a_metric_never_reached_is_kept_but_never_compared_with() {
+        let path = std::env::temp_dir().join(format!(
+            "brushcraft-perf-unreached-{}.jsonl",
+            std::process::id()
+        ));
+        drop(std::fs::remove_file(&path));
+        let name = "full.render.spin_catch_up_ms";
+        let mut reached = entry(name, 90.0, "2026-10-24T00:00:01Z", true, "gpu");
+        reached.metric.ceiling = Some(100.0);
+        let mut never = entry(name, 0.0, "2026-10-24T00:00:02Z", true, "gpu");
+        never.metric.value = Outcome::NotReached;
+        never.metric.ceiling = Some(100.0);
+        let line = never.to_record().to_json();
+        assert!(
+            line.contains(r#""reached":false"#)
+                && !line.contains(r#""median""#)
+                && !line.contains(r#""samples""#),
+            "{line}"
+        );
+        append(&path, &[reached.clone(), never.clone()]).unwrap();
+        let read_back = read(&path).unwrap().entries;
+        assert_eq!(read_back, [reached.clone(), never], "both read back");
+        // A later run compares with the last baseline that has a value.
+        let later = entry(name, 91.0, "2026-10-24T00:00:03Z", false, "gpu");
+        append(&path, std::slice::from_ref(&later)).unwrap();
+        let entries = read(&path).unwrap().entries;
+        let baselines = baselines(&entries, &later.info);
+        assert_eq!(baselines.get(&later.metric.name), Some(&&reached));
+        let base = baselines[&later.metric.name].metric.value.measured();
+        let verdict =
+            crate::perf::compare::Verdict::judge(base, later.metric.value.measured().unwrap());
+        assert_eq!(verdict.word(), "same", "{verdict:?}");
         std::fs::remove_file(&path).unwrap();
     }
 }

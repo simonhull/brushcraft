@@ -27,7 +27,9 @@
 //! `--history DIR`, is appended to `DIR/<machine>.jsonl` ([`history`]). The run is compared
 //! against the latest baseline of each metric on the same hardware, and a change beyond the
 //! metric's noise is flagged ([`compare`]); a flagged slowdown makes the exit status 3, and
-//! failing that a comparison too noisy to conclude makes it 4.
+//! failing that a comparison too noisy to conclude makes it 4. A metric over its ceiling (the
+//! spec's target) is flagged too, and so is a timed one with a ceiling that the run never
+//! reached: printed `NOT REACHED (ceiling …)`, recorded with `"reached":false`.
 //! `--baseline` marks the run as the new baseline, which a loaded run can't be, nor one whose
 //! binary wasn't built from a clean tree at the commit checked out. Records name the commit the
 //! binary was built from (embedded by `build.rs`).
@@ -385,31 +387,48 @@ fn measure_project<J: Write, H: Write>(
     Ok(())
 }
 
-/// The comparison table's line for `entry` judged `verdict` against `baseline`.
-fn table_line(entry: &Entry, baseline: Option<&Entry>, verdict: Verdict, target: Target) -> String {
+/// The comparison table's line for `entry` judged `verdict` against `baseline` (no verdict for
+/// a metric never reached).
+fn table_line(
+    entry: &Entry,
+    baseline: Option<&Entry>,
+    verdict: Option<Verdict>,
+    target: Target,
+) -> String {
     let m = &entry.metric;
-    let now = format!(
-        "{:<40} {:>10.3} {:<3} ±{:>4.1} %",
-        m.name.as_str(),
-        m.value.median(),
-        m.unit.name(),
-        m.value.spread() * 100.0
-    );
-    let was = baseline.map(|base| format!("was {:>10.3}", base.metric.value.median()));
-    let change = verdict.change().map(|change| change.to_string());
+    let now = match m.value.measured() {
+        Some(value) => format!(
+            "{:<40} {:>10.3} {:<3} ±{:>4.1} %",
+            m.name.as_str(),
+            value.median(),
+            m.unit.name(),
+            value.spread() * 100.0
+        ),
+        None => format!("{:<40} {:>10} {:<3}", m.name.as_str(), "-", m.unit.name()),
+    };
+    let was = baseline
+        .and_then(|base| base.metric.value.measured())
+        .map(|base| format!("was {:>10.3}", base.median()));
+    let change = verdict
+        .and_then(|verdict| verdict.change())
+        .map(|change| change.to_string());
     let ceiling = match (target, m.ceiling) {
         (Target::Missed { by }, Some(ceiling)) => Some(format!(
             "OVER TARGET by {by:.1} {} (ceiling {ceiling:.0})",
             m.unit.name()
         )),
+        (Target::NotReached, Some(ceiling)) => Some(format!(
+            "NOT REACHED (ceiling {ceiling:.0} {})",
+            m.unit.name()
+        )),
         (Target::Met, Some(ceiling)) => Some(format!("within target ({ceiling:.0})")),
-        (Target::Unset | Target::Met | Target::Missed { .. }, _) => None,
+        (Target::Unset | Target::Met | Target::Missed { .. } | Target::NotReached, _) => None,
     };
     [
         Some(now),
         was,
         change,
-        Some(verdict.word().to_owned()),
+        verdict.map(|verdict| verdict.word().to_owned()),
         ceiling,
     ]
     .into_iter()
@@ -482,14 +501,19 @@ fn report<J: Write, H: Write>(
     for entry in entries {
         out.record(&entry.to_record())?;
         let base = baselines.get(&entry.metric.name).copied();
-        let verdict = Verdict::judge(base.map(|b| &b.metric.value), &entry.metric.value);
+        let base_value = base.and_then(|b| b.metric.value.measured());
+        let verdict = entry
+            .metric
+            .value
+            .measured()
+            .map(|now| Verdict::judge(base_value, now));
         match verdict {
-            Verdict::Worse(_) => flagged += 1,
-            Verdict::Noisy(_) => noisy += 1,
-            Verdict::New | Verdict::Same(_) | Verdict::Better(_) => {}
+            Some(Verdict::Worse(_)) => flagged += 1,
+            Some(Verdict::Noisy(_)) => noisy += 1,
+            Some(Verdict::New | Verdict::Same(_) | Verdict::Better(_)) | None => {}
         }
         let target = Target::check(&entry.metric);
-        if let Target::Missed { .. } = target {
+        if target.missed() {
             flagged += 1;
         }
         out.say(&table_line(entry, base, verdict, target))?;
@@ -628,7 +652,7 @@ fn status<J: Write, H: Write>(
 ) -> Result<Status> {
     if flagged > 0 {
         out.say(&format!(
-            "perf: {flagged} metrics got worse beyond their noise"
+            "perf: {flagged} metrics got worse beyond their noise or missed their target"
         ))?;
         return Ok(Status::Flagged);
     }
@@ -708,6 +732,7 @@ mod tests {
     use super::*;
     use crate::cli::Command;
     use crate::perf::history::tests::entry;
+    use crate::perf::metric::Outcome;
 
     /// The plan the command line `args` (split on spaces) asks for.
     ///
@@ -825,19 +850,66 @@ mod tests {
             true,
             "cpu",
         );
-        let verdict = Verdict::judge(Some(&base.metric.value), &now.metric.value);
-        let line = table_line(&now, Some(&base), verdict, Target::Unset);
+        let now_value = now.metric.value.measured().unwrap();
+        let verdict = Verdict::judge(base.metric.value.measured(), now_value);
+        let line = table_line(&now, Some(&base), Some(verdict), Target::Unset);
         assert!(line.starts_with("medium.brush.p99_ms"), "{line}");
         assert!(
             line.contains("was      2.000") && line.ends_with("WORSE"),
             "{line}"
         );
-        let new = table_line(&now, None, Verdict::New, Target::Unset);
+        let new = table_line(&now, None, Some(Verdict::New), Target::Unset);
         assert!(new.ends_with("new") && !new.contains("was"), "{new}");
         let mut capped = now;
         capped.metric.ceiling = Some(2.0);
         let target = Target::check(&capped.metric);
-        let over = table_line(&capped, None, Verdict::New, target);
+        let over = table_line(&capped, None, Some(Verdict::New), target);
         assert!(over.contains("OVER TARGET by 0.2 ms (ceiling 2)"), "{over}");
+    }
+
+    /// A timed metric never reached against its ceiling is a target miss: printed as such, and
+    /// the run flagged, whatever its baseline.
+    #[test]
+    fn a_metric_never_reached_against_its_ceiling_flags_the_run() {
+        let mut never = entry(
+            "full.render.spin_catch_up_ms",
+            0.0,
+            "2026-10-24T00:00:02Z",
+            false,
+            "gpu",
+        );
+        never.metric.value = Outcome::NotReached;
+        never.metric.ceiling = Some(100.0);
+        let base = entry(
+            "full.render.spin_catch_up_ms",
+            90.0,
+            "2026-10-24T00:00:01Z",
+            true,
+            "gpu",
+        );
+        let mut out = Output::new(Vec::new(), Vec::new());
+        let (flagged, noisy) = report(
+            std::slice::from_ref(&never),
+            &[base],
+            Label::Quiet,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!((flagged, noisy), (1, 0), "a miss, nothing to compare");
+        assert_eq!(status(flagged, noisy, &mut out).unwrap(), Status::Flagged);
+        let (json, human) = out.into_parts();
+        let human = String::from_utf8(human).unwrap();
+        let line = human
+            .lines()
+            .find(|line| line.starts_with("full.render.spin_catch_up_ms"))
+            .unwrap();
+        assert!(line.contains("NOT REACHED (ceiling 100 ms)"), "{line}");
+        assert!(line.contains("was     90.000"), "{line}");
+        assert!(human.contains("missed their target"), "{human}");
+        let json = String::from_utf8(json).unwrap();
+        assert!(
+            json.contains(r#""reached":false"#) && !json.contains(r#""median""#),
+            "{json}"
+        );
     }
 }

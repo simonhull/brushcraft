@@ -213,6 +213,33 @@ impl Measured {
     }
 }
 
+/// What a run's metric came to: a value, or, for a timed metric (from an event until a
+/// condition holds), the condition never holding.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Outcome {
+    /// Measured.
+    Measured(Measured),
+    /// The condition the metric times until never held: no value, and against a ceiling a miss
+    /// (see [`crate::perf::compare::Target`]).
+    NotReached,
+}
+
+impl Outcome {
+    /// The value, if it was measured.
+    pub(crate) const fn measured(&self) -> Option<&Measured> {
+        match self {
+            Self::Measured(measured) => Some(measured),
+            Self::NotReached => None,
+        }
+    }
+}
+
+impl From<Measured> for Outcome {
+    fn from(measured: Measured) -> Self {
+        Self::Measured(measured)
+    }
+}
+
 /// One metric of one run: its name, unit and value, and the spec's ceiling on it if it has one.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Metric {
@@ -220,8 +247,8 @@ pub(crate) struct Metric {
     pub(crate) name: MetricName,
     /// Its unit.
     pub(crate) unit: Unit,
-    /// Its value.
-    pub(crate) value: Measured,
+    /// Its value, or that it was never reached.
+    pub(crate) value: Outcome,
     /// A target the median must stay at or under, in the metric's unit, judged on every run
     /// whatever the baseline (see [`crate::perf::compare::Target`]); `None` for most metrics.
     pub(crate) ceiling: Option<f64>,

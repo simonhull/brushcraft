@@ -278,7 +278,7 @@ impl Samples {
                 Ok(Metric {
                     name,
                     unit,
-                    value,
+                    value: value.into(),
                     ceiling: None,
                 })
             })
@@ -748,7 +748,11 @@ mod tests {
         let outputs = ["99", "30", "31", "32"].map(|m| Ok(table(m)));
         let metrics = stage_samples(outputs.into_iter(), 3).unwrap();
         assert_eq!(metrics.len(), 1, "{metrics:?}");
-        assert_eq!(metrics[0].value.samples(), [30.0, 31.0, 32.0], "no 99");
+        assert_eq!(
+            metrics[0].value.measured().unwrap().samples(),
+            [30.0, 31.0, 32.0],
+            "no 99"
+        );
         let short = ["99", "30"].map(|m| Ok(table(m)));
         assert!(
             stage_samples(short.into_iter(), 3).is_err(),
@@ -789,11 +793,11 @@ mod tests {
         assert_eq!(metrics.len(), 2, "{metrics:?}");
         assert_eq!(metrics[0].name, p99, "first seen first");
         assert!(
-            (metrics[0].value.median() - 2.0).abs() < 1e-12,
+            (metrics[0].value.measured().unwrap().median() - 2.0).abs() < 1e-12,
             "{metrics:?}"
         );
         assert!(
-            (metrics[1].value.median() - 105.0).abs() < 1e-12,
+            (metrics[1].value.measured().unwrap().median() - 105.0).abs() < 1e-12,
             "{metrics:?}"
         );
     }

@@ -60,8 +60,8 @@ fn the_metrics_are_named_for_the_scale_and_sampled_once_a_run() {
     let metrics = derive(&Recorded::parse(RECORDED).unwrap());
     let mut samples = Samples::default();
     for _ in 0..3 {
-        let lacking = metrics.sample(Scale::Medium, &mut samples).unwrap();
-        assert_eq!(lacking, Vec::<String>::new(), "every metric");
+        let gaps = metrics.sample(Scale::Medium, &mut samples).unwrap();
+        assert_eq!(gaps, Vec::<Gap>::new(), "every metric");
     }
     let measured = samples.measure().unwrap();
     let names: Vec<&str> = measured.iter().map(|m| m.name.as_str()).collect();
@@ -77,7 +77,11 @@ fn the_metrics_are_named_for_the_scale_and_sampled_once_a_run() {
             "medium.render.open_to_correct_ms",
         ]
     );
-    assert!(measured.iter().all(|m| m.value.samples().len() == 3));
+    assert!(
+        measured
+            .iter()
+            .all(|m| m.value.measured().unwrap().samples().len() == 3)
+    );
     assert_eq!(measured[4].unit, Unit::Tiles);
 }
 
@@ -86,7 +90,7 @@ fn only_the_benchmark_project_is_held_to_the_spec_targets() {
     let metric = |name: &str| Metric {
         name: name.parse().unwrap(),
         unit: Unit::Ms,
-        value: Measured::of(vec![1.0]).unwrap(),
+        value: Measured::of(vec![1.0]).unwrap().into(),
         ceiling: None,
     };
     let names = [
@@ -176,9 +180,10 @@ fn a_run_with_no_gpu_times_and_never_correct_lacks_those_metrics_only() {
         "the first still frame with nothing over 1 px, wanted or requested, as shown"
     );
     let mut samples = Samples::default();
-    let lacking = metrics.sample(Scale::Tiny, &mut samples).unwrap();
+    let gaps = metrics.sample(Scale::Tiny, &mut samples).unwrap();
+    let said: Vec<String> = gaps.iter().map(Gap::to_string).collect();
     assert_eq!(
-        lacking,
+        said,
         [
             "no render.orbit_gpu_p50_ms",
             "no render.orbit_gpu_p99_ms",
@@ -200,10 +205,14 @@ fn a_run_that_never_catches_up_says_so_rather_than_timing_its_end() {
     let metrics = derive(&run(100.0, frames));
     assert_eq!(metrics.spin_catch_up_ms, Some(Reached::Not));
     let mut samples = Samples::default();
-    let lacking = metrics.sample(Scale::Tiny, &mut samples).unwrap();
+    let gaps = metrics.sample(Scale::Tiny, &mut samples).unwrap();
     assert!(
-        lacking.contains(&"render.spin_catch_up_ms not reached".to_owned()),
-        "{lacking:?}"
+        gaps.contains(&Gap::NotReached("render.spin_catch_up_ms", Unit::Ms)),
+        "{gaps:?}"
+    );
+    assert_eq!(
+        Gap::NotReached("render.spin_catch_up_ms", Unit::Ms).to_string(),
+        "render.spin_catch_up_ms not reached"
     );
     let measured = samples.measure().unwrap();
     assert!(
@@ -280,4 +289,86 @@ fn the_measured_scales_run_on_a_hardware_gpu_at_4k_and_the_tiny_check_on_lavapip
         assert!(setting.runs >= 3);
     }
     assert_eq!(Setting::of(Scale::Tiny).adapter, "software");
+}
+
+/// Three runs of a project at `scale`, the spin catch-up reached in the first `reached` (at 50
+/// and 60 ms) and never in the rest: the part's metrics and notes for it.
+fn three_runs(scale: Scale, reached: usize) -> (Vec<Metric>, Vec<String>) {
+    let mut samples = Samples::default();
+    let mut unreached: Vec<Unreached> = Vec::new();
+    for run in 0..3 {
+        let catch_up = [50.0, 60.0]
+            .get(run)
+            .filter(|_| run < reached)
+            .map_or(Reached::Not, |&ms| Reached::After(ms));
+        let metrics = RenderMetrics {
+            spin_catch_up_ms: Some(catch_up),
+            ..RenderMetrics::default()
+        };
+        for gap in metrics.sample(scale, &mut samples).unwrap() {
+            if let Gap::NotReached(name, unit) = gap {
+                match unreached.iter_mut().find(|u| u.name == name) {
+                    Some(known) => known.runs += 1,
+                    None => unreached.push(Unreached {
+                        name,
+                        unit,
+                        runs: 1,
+                    }),
+                }
+            }
+        }
+    }
+    let metrics = with_targets(samples.measure().unwrap(), scale);
+    judge_unreached(metrics, &unreached, 3, scale).unwrap()
+}
+
+#[test]
+fn on_the_benchmark_project_a_catch_up_never_reached_is_a_miss_even_if_other_runs_reached_it() {
+    let (metrics, notes) = three_runs(Scale::Full, 2);
+    let catch_up: Vec<&Metric> = metrics
+        .iter()
+        .filter(|m| m.name.as_str() == "full.render.spin_catch_up_ms")
+        .collect();
+    assert_eq!(catch_up.len(), 1, "{metrics:?}");
+    assert_eq!(catch_up[0].value, Outcome::NotReached, "the stricter call");
+    assert_eq!(catch_up[0].ceiling, Some(100.0));
+    assert_eq!(
+        notes,
+        [
+            "render.spin_catch_up_ms not reached in 1 of 3 runs: judged not reached against its \
+             ceiling (100 ms), the stricter call"
+        ]
+    );
+    let (none, none_notes) = three_runs(Scale::Full, 0);
+    assert!(
+        none.iter()
+            .any(|m| m.name.as_str() == "full.render.spin_catch_up_ms"
+                && m.value == Outcome::NotReached),
+        "recorded though no run gave a number: {none:?}"
+    );
+    assert!(
+        none_notes[0].contains("not reached in any of 3 runs"),
+        "{none_notes:?}"
+    );
+}
+
+#[test]
+fn without_a_ceiling_a_catch_up_never_reached_stays_a_note() {
+    let (metrics, notes) = three_runs(Scale::Medium, 2);
+    let catch_up = metrics
+        .iter()
+        .find(|m| m.name.as_str() == "medium.render.spin_catch_up_ms")
+        .unwrap();
+    assert_eq!(catch_up.ceiling, None);
+    assert_eq!(
+        catch_up.value.measured().map(Measured::samples),
+        Some(&[50.0, 60.0][..]),
+        "measured from the runs that reached it"
+    );
+    assert_eq!(
+        notes,
+        [
+            "render.spin_catch_up_ms not reached in 1 of 3 runs: no ceiling, measured from the others"
+        ]
+    );
 }
