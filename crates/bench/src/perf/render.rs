@@ -15,14 +15,17 @@
 //!   render thread's encode and submit), over the orbit segment's frames;
 //! - **tiles over budget** during the orbit: the most tiles in view any orbit frame left over 1 px
 //!   (the level choice's count; the spec's target is 0 on desktop);
-//! - **spin catch-up**: from the flick's end until the first frame shown with nothing wanted
-//!   (residency) and nothing requested (its level choice) (spec: ≤ 100 ms);
+//! - **spin catch-up**: from the flick's end until the first frame shown with every visible tile at
+//!   its chosen level (no tile over 1 px, nothing requested by its level choice) and nothing wanted
+//!   by residency (spec: ≤ 100 ms);
 //! - **open to correct**: from the project beginning to open until the first frame of the open
 //!   segment shown with no tile over 1 px and nothing requested (spec: ≤ 1 s on desktop).
 //!
-//! A run whose record lacks one (no timestamp queries, no frame correct within its segment)
-//! gives no sample of it, and the part says so. With no GPU (the app exits 69 when no adapter
-//! matches), the part doesn't run: "not run: no adapter".
+//! A run whose record lacks one (no timestamp queries, no flick) gives no sample of it, and the
+//! part says so. A run that never reaches a timed metric's end (no frame caught up after the
+//! flick, none correct within the open segment) gives no sample either, and the part says it
+//! was not reached ([`Reached::Not`]): never a number standing in for the run's end. With no GPU
+//! (the app exits 69 when no adapter matches), the part doesn't run: "not run: no adapter".
 
 use std::path::Path;
 
@@ -120,10 +123,13 @@ impl Frame {
         self.drawn && self.over_budget == Some(0.0) && self.requested == Some(0.0)
     }
 
-    /// Whether nothing was left to arrive: its cut came back requesting nothing, and residency
-    /// wanted nothing as it was staged.
+    /// Whether every visible tile was at its chosen level and nothing was left to arrive: it
+    /// was [correct](Self::correct), and residency wanted nothing as it was staged.
+    ///
+    /// Residency going quiet alone isn't enough: a level choice holding a tile over 1 px with
+    /// nothing to request (held back by its neighbours) would end the catch-up early.
     fn caught_up(&self) -> bool {
-        self.drawn && self.requested == Some(0.0) && self.wanted == Some(0.0)
+        self.correct() && self.wanted == Some(0.0)
     }
 }
 
@@ -236,7 +242,59 @@ fn percentile(values: &[f64], q: usize) -> Option<f64> {
     sorted.get(index).copied()
 }
 
-/// One run's render metrics; `None` for one its record can't give.
+/// Whether a run reached a timed metric's end, and when.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Reached {
+    /// After this long, in ms.
+    After(f64),
+    /// Never: no frame met the end condition before the run (or the metric's segment) ended.
+    Not,
+}
+
+impl Reached {
+    /// The time to the first of `frames` meeting `end`, measured by `time`; [`Reached::Not`] if
+    /// none does.
+    fn first<'a>(
+        frames: impl IntoIterator<Item = &'a Frame>,
+        end: impl Fn(&Frame) -> bool,
+        time: impl Fn(&Frame) -> f64,
+    ) -> Self {
+        let mut frames = frames.into_iter();
+        frames
+            .find(|frame| end(frame))
+            .map_or(Self::Not, |frame| Self::After(time(frame)))
+    }
+}
+
+/// One run's value of one metric, as [`RenderMetrics::named`] gives it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Value {
+    /// A sample.
+    Of(f64),
+    /// The record lacks what the metric is taken from.
+    Lacking,
+    /// The run never reached the metric's end.
+    NotReached,
+}
+
+impl From<Option<f64>> for Value {
+    fn from(value: Option<f64>) -> Self {
+        value.map_or(Self::Lacking, Self::Of)
+    }
+}
+
+impl From<Option<Reached>> for Value {
+    fn from(value: Option<Reached>) -> Self {
+        match value {
+            Some(Reached::After(ms)) => Self::Of(ms),
+            Some(Reached::Not) => Self::NotReached,
+            None => Self::Lacking,
+        }
+    }
+}
+
+/// One run's render metrics; `None` for one its record can't give, [`Reached::Not`] for a timed
+/// one it never reached.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct RenderMetrics {
     /// The orbit's GPU frame time, p50 and p99, in ms.
@@ -245,10 +303,11 @@ pub(crate) struct RenderMetrics {
     pub(crate) orbit_cpu: Option<(f64, f64)>,
     /// The most tiles over budget in any orbit frame whose cut came back.
     pub(crate) orbit_over_budget: Option<f64>,
-    /// From the flick's end to the first frame caught up, in ms.
-    pub(crate) spin_catch_up_ms: Option<f64>,
-    /// From the project beginning to open to the first correct frame of the open segment, in ms.
-    pub(crate) open_to_correct_ms: Option<f64>,
+    /// From the flick's end to the first frame caught up, in ms; `None` if the run had no flick.
+    pub(crate) spin_catch_up_ms: Option<Reached>,
+    /// From the project beginning to open to the first correct frame of the open segment, in ms;
+    /// `None` if the run had no open segment.
+    pub(crate) open_to_correct_ms: Option<Reached>,
 }
 
 /// The render metrics of `recorded` (the module notes say how each is taken).
@@ -267,15 +326,17 @@ pub(crate) fn derive(recorded: &Recorded) -> RenderMetrics {
         .filter(|frame| frame.drawn)
         .filter_map(|frame| frame.over_budget);
     let orbit_over_budget = over.reduce(f64::max);
-    let spin_catch_up_ms = recorded.end_of(FLICK).and_then(|flick_end| {
+    let spin_catch_up_ms = recorded.end_of(FLICK).map(|flick_end| {
         let still = recorded.frames.iter().filter(|f| f.time_ms >= flick_end);
-        let first = still.into_iter().find(|frame| frame.caught_up())?;
-        Some((first.shown_ms() - flick_end).max(0.0))
+        Reached::first(still, Frame::caught_up, |frame| {
+            (frame.shown_ms() - flick_end).max(0.0)
+        })
     });
-    let open_to_correct_ms = recorded
-        .in_segment(OPEN)
-        .find(|frame| frame.correct())
-        .map(|frame| recorded.open_ms + frame.shown_ms());
+    let open_to_correct_ms = recorded.end_of(OPEN).map(|_| {
+        Reached::first(recorded.in_segment(OPEN), Frame::correct, |frame| {
+            recorded.open_ms + frame.shown_ms()
+        })
+    });
     RenderMetrics {
         orbit_gpu: spread(gpu),
         orbit_cpu: spread(cpu),
@@ -286,58 +347,66 @@ pub(crate) fn derive(recorded: &Recorded) -> RenderMetrics {
 }
 
 impl RenderMetrics {
-    /// Each metric as `(name after the scale, unit, value)`, `None` where the run gave none.
-    fn named(&self) -> [(&'static str, Unit, Option<f64>); 7] {
+    /// Each metric as `(name after the scale, unit, value)`.
+    fn named(&self) -> [(&'static str, Unit, Value); 7] {
         [
             (
                 "render.orbit_gpu_p50_ms",
                 Unit::Ms,
-                self.orbit_gpu.map(|g| g.0),
+                self.orbit_gpu.map(|g| g.0).into(),
             ),
             (
                 "render.orbit_gpu_p99_ms",
                 Unit::Ms,
-                self.orbit_gpu.map(|g| g.1),
+                self.orbit_gpu.map(|g| g.1).into(),
             ),
             (
                 "render.orbit_cpu_p50_ms",
                 Unit::Ms,
-                self.orbit_cpu.map(|c| c.0),
+                self.orbit_cpu.map(|c| c.0).into(),
             ),
             (
                 "render.orbit_cpu_p99_ms",
                 Unit::Ms,
-                self.orbit_cpu.map(|c| c.1),
+                self.orbit_cpu.map(|c| c.1).into(),
             ),
             (
                 "render.orbit_over_budget",
                 Unit::Tiles,
-                self.orbit_over_budget,
+                self.orbit_over_budget.into(),
             ),
-            ("render.spin_catch_up_ms", Unit::Ms, self.spin_catch_up_ms),
+            (
+                "render.spin_catch_up_ms",
+                Unit::Ms,
+                self.spin_catch_up_ms.into(),
+            ),
             (
                 "render.open_to_correct_ms",
                 Unit::Ms,
-                self.open_to_correct_ms,
+                self.open_to_correct_ms.into(),
             ),
         ]
     }
 
-    /// Adds this run's metrics to `samples` under `scale`'s names; returns the names of those it
-    /// had none of.
+    /// Adds this run's metrics to `samples` under `scale`'s names; returns a note for each it
+    /// had none of: "no `name`" where the record lacks it, "`name` not reached" where the run
+    /// never reached its end.
     ///
     /// # Errors
     ///
     /// If a name isn't a metric name, or a unit clashes.
-    fn sample(&self, scale: Scale, samples: &mut Samples) -> Result<Vec<&'static str>> {
-        let mut missing = Vec::new();
+    fn sample(&self, scale: Scale, samples: &mut Samples) -> Result<Vec<String>> {
+        let mut lacking = Vec::new();
         for (name, unit, value) in self.named() {
             match value {
-                Some(value) => samples.push(MetricName::join(scale.name(), name)?, unit, value)?,
-                None => missing.push(name),
+                Value::Of(value) => {
+                    samples.push(MetricName::join(scale.name(), name)?, unit, value)?;
+                }
+                Value::Lacking => lacking.push(format!("no {name}")),
+                Value::NotReached => lacking.push(format!("{name} not reached")),
             }
         }
-        Ok(missing)
+        Ok(lacking)
     }
 }
 
@@ -426,9 +495,9 @@ fn measure(
         let text = std::fs::read_to_string(&record)
             .with_context(|| format!("reading {}", record.display()))?;
         let recorded = Recorded::parse(&text).with_context(|| format!("{}", record.display()))?;
-        let missing = derive(&recorded).sample(scale, &mut samples)?;
-        if !missing.is_empty() {
-            notes.push(format!("run {}: no {}", run + 1, missing.join(", ")));
+        let lacking = derive(&recorded).sample(scale, &mut samples)?;
+        if !lacking.is_empty() {
+            notes.push(format!("run {}: {}", run + 1, lacking.join(", ")));
         }
     }
     let metrics = with_targets(samples.measure()?, scale);

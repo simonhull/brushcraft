@@ -7,7 +7,9 @@
 //! The expected values for the recorded run were worked out apart from this code, with `jq` over
 //! the fixture: the orbit's GPU and CPU times sorted and taken at the nearest rank above, the
 //! first correct frame of the open segment (frame 5), the first caught-up frame after the flick
-//! (frame 227).
+//! (frame 227: shown with nothing over 1 px, requested or wanted; the run's frames after the
+//! flick are all at their chosen levels, so the hand-made runs below cover a frame quiet in
+//! residency but over 1 px).
 
 use super::*;
 use crate::perf::metric::Measured;
@@ -39,12 +41,16 @@ fn a_recorded_run_reads_back_and_gives_every_metric() {
         "{metrics:?}"
     );
     assert_eq!(metrics.orbit_over_budget, Some(0.0));
+    let after = |reached: Option<Reached>| match reached {
+        Some(Reached::After(ms)) => ms,
+        other => panic!("reached: {other:?}"),
+    };
     assert!(
-        close(metrics.open_to_correct_ms.unwrap(), 288.247_405),
+        close(after(metrics.open_to_correct_ms), 288.247_405),
         "{metrics:?}"
     );
     assert!(
-        close(metrics.spin_catch_up_ms.unwrap(), 9.081_083),
+        close(after(metrics.spin_catch_up_ms), 9.081_083),
         "{metrics:?}"
     );
 }
@@ -54,8 +60,8 @@ fn the_metrics_are_named_for_the_scale_and_sampled_once_a_run() {
     let metrics = derive(&Recorded::parse(RECORDED).unwrap());
     let mut samples = Samples::default();
     for _ in 0..3 {
-        let missing = metrics.sample(Scale::Medium, &mut samples).unwrap();
-        assert_eq!(missing, Vec::<&str>::new(), "every metric");
+        let lacking = metrics.sample(Scale::Medium, &mut samples).unwrap();
+        assert_eq!(lacking, Vec::<String>::new(), "every metric");
     }
     let measured = samples.measure().unwrap();
     let names: Vec<&str> = measured.iter().map(|m| m.name.as_str()).collect();
@@ -147,7 +153,9 @@ fn a_run_with_no_gpu_times_and_never_correct_lacks_those_metrics_only() {
         frame(15_100.0, "flick", (0.0, 0.0, 0.0)),
         frame(15_160.0, "settle", (0.0, 2.0, 1.0)),
         frame(15_190.0, "settle", (0.0, 0.0, 1.0)),
-        frame(15_220.0, "settle", (0.0, 0.0, 0.0)),
+        // Residency quiet, but a tile held over 1 px: not every tile at its chosen level.
+        frame(15_220.0, "settle", (3.0, 0.0, 0.0)),
+        frame(15_250.0, "settle", (0.0, 0.0, 0.0)),
     ];
     let metrics = derive(&run(400.0, frames));
     assert_eq!(metrics.orbit_gpu, None, "no timestamp queries");
@@ -158,24 +166,56 @@ fn a_run_with_no_gpu_times_and_never_correct_lacks_those_metrics_only() {
         "the most in any orbit frame"
     );
     assert_eq!(
-        metrics.open_to_correct_ms, None,
+        metrics.open_to_correct_ms,
+        Some(Reached::Not),
         "never correct while opening"
     );
     assert_eq!(
         metrics.spin_catch_up_ms,
-        Some(15_221.0 - 15_150.0),
-        "the first still frame with nothing wanted or requested, as shown"
+        Some(Reached::After(15_251.0 - 15_150.0)),
+        "the first still frame with nothing over 1 px, wanted or requested, as shown"
     );
     let mut samples = Samples::default();
-    let missing = metrics.sample(Scale::Tiny, &mut samples).unwrap();
+    let lacking = metrics.sample(Scale::Tiny, &mut samples).unwrap();
     assert_eq!(
-        missing,
+        lacking,
         [
-            "render.orbit_gpu_p50_ms",
-            "render.orbit_gpu_p99_ms",
-            "render.open_to_correct_ms"
+            "no render.orbit_gpu_p50_ms",
+            "no render.orbit_gpu_p99_ms",
+            "render.open_to_correct_ms not reached"
         ]
     );
+}
+
+#[test]
+fn a_run_that_never_catches_up_says_so_rather_than_timing_its_end() {
+    let frames = vec![
+        frame(0.0, "open", (0.0, 0.0, 0.0)),
+        frame(14_000.0, "zoom", (0.0, 0.0, 0.0)),
+        // Residency quiet to the end, but tiles held over 1 px the whole settle.
+        frame(15_160.0, "settle", (12.0, 0.0, 0.0)),
+        frame(16_500.0, "settle", (12.0, 0.0, 0.0)),
+        frame(18_140.0, "settle", (12.0, 0.0, 0.0)),
+    ];
+    let metrics = derive(&run(100.0, frames));
+    assert_eq!(metrics.spin_catch_up_ms, Some(Reached::Not));
+    let mut samples = Samples::default();
+    let lacking = metrics.sample(Scale::Tiny, &mut samples).unwrap();
+    assert!(
+        lacking.contains(&"render.spin_catch_up_ms not reached".to_owned()),
+        "{lacking:?}"
+    );
+    let measured = samples.measure().unwrap();
+    assert!(
+        measured
+            .iter()
+            .all(|m| m.name.as_str() != "tiny.render.spin_catch_up_ms"),
+        "no number stands in for it"
+    );
+    // A run with no flick lacks the metric; it isn't "not reached".
+    let mut flickless = run(100.0, Vec::new());
+    flickless.segments.retain(|(name, _, _)| name != "flick");
+    assert_eq!(derive(&flickless).spin_catch_up_ms, None);
 }
 
 #[test]
@@ -190,10 +230,14 @@ fn open_to_correct_counts_the_open_itself_and_skips_frames_whose_cut_never_came(
     let metrics = derive(&run(250.0, frames));
     assert_eq!(
         metrics.open_to_correct_ms,
-        Some(250.0 + 201.0),
+        Some(Reached::After(250.0 + 201.0)),
         "the open, then until frame 3 was shown (wanted tiles off screen don't matter)"
     );
-    assert_eq!(metrics.spin_catch_up_ms, None, "no frame after the flick");
+    assert_eq!(
+        metrics.spin_catch_up_ms,
+        Some(Reached::Not),
+        "no frame after the flick"
+    );
 }
 
 #[test]
