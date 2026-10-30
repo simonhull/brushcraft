@@ -367,6 +367,8 @@ impl TileStore {
         if stamp != self.last_write || bounds != self.derived_changes() {
             return Err(CacheError::StaleSave);
         }
+        // The floor records the new files hold as copies: taken before the book moves on.
+        let floor_carried = self.floor_carried();
         if base.meta().mesh_hash() != self.mesh_hash || working.meta().mesh_hash() != self.mesh_hash
         {
             return Err(CacheError::MeshMismatch);
@@ -419,6 +421,7 @@ impl TileStore {
         self.op = None;
         self.base = Some(base);
         let old = std::mem::replace(&mut self.file, working);
+        self.repoint_floor(&floor_carried);
         for key in &pinned {
             self.reload_lost(key);
         }
@@ -619,6 +622,8 @@ impl TileStore {
         if stamp != self.last_write || bounds != self.derived_changes() {
             return Err(CacheError::StaleSave);
         }
+        // The floor records the new files hold as copies: taken before the book moves on.
+        let floor_carried = self.floor_carried();
         // Drained first, so the feed can't bring a lost key back.
         self.drain_saves();
         // A lost tile's slot, if it has one, is broken: dropped as a rebase drops one, or, if a
@@ -660,6 +665,7 @@ impl TileStore {
         // The workers' jobs name records of the old file.
         self.prefetch = Prefetcher::new();
         let old = std::mem::replace(&mut self.file, file);
+        self.repoint_floor(&floor_carried);
         for key in &pinned {
             self.reload_lost(key);
         }

@@ -41,7 +41,7 @@ use super::read_ahead::Held;
 use crate::bounds::{Book, Derived as _, Kept};
 use crate::display::{Display, DisplayRecord, StoredDisplay};
 use crate::file::{
-    BaseFile, FileError, FramedDisplay, ProjectFile, display_record, frame_display_on,
+    BaseFile, FileError, FramedDisplay, Loc, ProjectFile, display_record, frame_display_on,
     unknown_display_len,
 };
 use crate::meta::Role;
@@ -529,6 +529,46 @@ impl TileStore {
             return None;
         }
         self.floor.get(key)
+    }
+
+    /// The floor tiles whose floor copy is the files' latest record and that the book holds no
+    /// change of, or holds as written there ([`Kept::Written`]): what a save or a roll-over
+    /// copies into its new file as it is. Taken before the store moves onto the new files, for
+    /// [`TileStore::repoint_floor`].
+    pub(super) fn floor_carried(&self) -> Vec<(TileKey, Loc)> {
+        self.floor_read
+            .iter()
+            .filter(|(key, _)| matches!(self.display.kept(key), Some(Kept::Written) | None))
+            .filter(|(key, _)| self.floor_record(key).is_some())
+            .map(|(key, (_, loc))| (*key, *loc))
+            .collect()
+    }
+
+    /// After the store moved onto new files (a save's rebase, a roll-over): points each of
+    /// `carried` ([`TileStore::floor_carried`]) at its record's new place, where the new files
+    /// hold a record of the same length (a copy of it; a record that didn't read is copied as
+    /// unknown, of another length), so the floor keeps being drawn from memory; and drops every
+    /// other entry that no longer names the files' latest record.
+    pub(super) fn repoint_floor(&mut self, carried: &[(TileKey, Loc)]) {
+        for (key, old) in carried {
+            match self.record_place(key) {
+                Some(place) if place.1.len() == old.len() => {
+                    self.floor_read.insert(*key, place);
+                }
+                Some(_) | None => {
+                    self.floor_read.remove(key);
+                }
+            }
+        }
+        let stale: Vec<TileKey> = self
+            .floor_read
+            .keys()
+            .filter(|key| self.floor_record(key).is_none())
+            .copied()
+            .collect();
+        for key in &stale {
+            self.floor_read.remove(key);
+        }
     }
 
     /// Whether the store knows `key`'s display tile (it would read one back), without decoding

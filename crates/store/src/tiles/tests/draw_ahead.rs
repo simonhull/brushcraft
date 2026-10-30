@@ -684,3 +684,41 @@ fn a_foreign_layer_on_open_is_never_drawn_from_the_files() {
     run_all(&mut store);
     assert_drawn_as_stored(&mut store, &floor, "rebuilt");
 }
+
+/// Asserts that every one of `floor` is drawn from the floor's copy, without a read, and as the
+/// files hold it.
+fn assert_floor_in_memory(store: &mut TileStore, floor: &[TileKey], when: &str) {
+    for key in floor {
+        assert!(!store.display_needs_read(key), "{when}: {key:?} in memory");
+    }
+    assert_drawn_as_stored(store, floor, when);
+}
+
+/// The floor's copies stay the files' records across a roll-over, which copies them into the
+/// new working file: drawn from memory still.
+#[test]
+fn the_floor_stays_in_memory_across_a_roll_over() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let floor = display_at(&mesh, 0..=5);
+    let mut store = reopened(&dir, &mesh);
+    assert_floor_in_memory(&mut store, &floor, "opened");
+    roll_over(&mut store, &dir, "copied.bcp");
+    for key in &floor {
+        assert!(store.file.locate(key).is_some(), "{key:?}: copied across");
+    }
+    assert_floor_in_memory(&mut store, &floor, "rolled over");
+}
+
+/// The floor's copies stay the files' records across a save, which moves the store onto a new
+/// save point: drawn from memory still.
+#[test]
+fn the_floor_stays_in_memory_across_a_save() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let floor = display_at(&mesh, 0..=5);
+    let (mut store, mut project) = layered(&dir, &mesh);
+    assert_floor_in_memory(&mut store, &floor, "layered");
+    save_and_rebase(&mut store, &mut project, &dir, "r2.bcrf");
+    assert_floor_in_memory(&mut store, &floor, "saved");
+}
