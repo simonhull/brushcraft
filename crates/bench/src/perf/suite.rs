@@ -29,6 +29,18 @@ pub(crate) struct Runner {
     repo: PathBuf,
 }
 
+/// The app's exit status when no GPU matches its `--adapter` (`EX_UNAVAILABLE`).
+const APP_NO_ADAPTER: i32 = 69;
+
+/// How a run of the app ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppExit {
+    /// It ran through.
+    Done,
+    /// No GPU matched its `--adapter`: nothing was run.
+    NoAdapter,
+}
+
 /// Which allowed CPU the stage benches are pinned to, counted from 0 among those the affinity
 /// mask allows.
 ///
@@ -146,6 +158,53 @@ impl Runner {
             .filter(|line| !line.trim().is_empty())
             .map(|line| Object::parse(line).with_context(|| format!("a result line: {line:?}")))
             .collect()
+    }
+
+    /// The app's binary, `brushcraft`, built beside this one (`cargo build -p app` in the same
+    /// profile; `scripts/perf.sh` builds both).
+    ///
+    /// # Errors
+    ///
+    /// If it isn't there.
+    fn app_exe(&self) -> Result<PathBuf> {
+        let app = self.exe.with_file_name("brushcraft");
+        ensure!(
+            app.is_file(),
+            "{} isn't built: the render part runs the app (cargo build --release -p app beside \
+             brushcraft-bench, as scripts/perf.sh does)",
+            app.display()
+        );
+        Ok(app)
+    }
+
+    /// Runs the app with `args`, its state (recovery files) in `state`, its output passed
+    /// through to stderr; returns how it ended.
+    ///
+    /// # Errors
+    ///
+    /// If it isn't built, can't be started, or fails other than by finding no GPU.
+    pub(crate) fn app(&self, args: &[OsString], state: &Path) -> Result<AppExit> {
+        let app = self.app_exe()?;
+        let shown = || {
+            let words: Vec<String> = args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            format!("{} {}", app.display(), words.join(" "))
+        };
+        let status = Command::new(&app)
+            .args(args)
+            .env("XDG_STATE_HOME", state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(std::io::stderr()))
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("running {}", shown()))?;
+        if status.code() == Some(APP_NO_ADAPTER) {
+            return Ok(AppExit::NoAdapter);
+        }
+        ensure!(status.success(), "{} failed: {status}", shown());
+        Ok(AppExit::Done)
     }
 
     /// Runs the stage benches once, built in `profile`, pinned to one allowed CPU

@@ -31,6 +31,8 @@ RUSTDOCFLAGS='--cfg test -D warnings' cargo doc --workspace --no-deps --document
 # built first exactly as perf --tiny builds it (the bench-fast profile), so the run doesn't
 # rebuild with other features.
 cargo bench --no-run --profile bench-fast -p geom --bench stages --features bench-stages
+# The render part runs the app, found beside the bench: built first, in the same profile.
+cargo build -p app
 cargo run -p brushcraft-bench -- perf --tiny
 # The app opens a project and closes it headless, on its default adapter: here, lavapipe.
 scripts/app-headless.sh

@@ -13,6 +13,10 @@
 //!   ([`suite`]);
 //! - **the display layer** on each project: its rebuild, file growth, refresh per brush step, floor
 //!   size and open time, each run in a fresh copy;
+//! - **the renderer** on each project: the app's scripted camera path (`brushcraft --script`,
+//!   offscreen, on a hardware GPU at 4K) in a copy with its display layer saved: orbit frame time
+//!   on the GPU and the CPU, tiles over budget during the orbit, spin catch-up and open to correct
+//!   ([`render`]); "not run: no adapter" on a machine with no GPU;
 //! - with `--full`, **the full project** (the benchmark sphere, measured through a reflinked copy):
 //!   the same set, for milestones.
 //!
@@ -36,6 +40,7 @@ mod machine;
 mod metric;
 mod project;
 mod quiet;
+mod render;
 mod stages;
 mod suite;
 
@@ -55,8 +60,9 @@ use crate::perf::project::{
     Copied, Scale, Source, Sweep, WorkDir, WorkRoot, cache_key, cached_file, remove_stale,
 };
 use crate::perf::quiet::{Load, LoadLog, Quiet, Settled, others_peak};
+use crate::perf::render::RenderPart;
 use crate::perf::suite::{Runner, StageProfile};
-use crate::report::Output;
+use crate::report::{Output, Record};
 
 /// Rounds of the stage benches: each takes a fraction of a second.
 const STAGE_ROUNDS: usize = 5;
@@ -345,7 +351,38 @@ fn measure_project<J: Write, H: Write>(
     })?;
     session.part(&format!("{s} display"), project, out, |r| {
         suite::display_part(r, work, file, scale)
-    })
+    })?;
+    let mut notes = Vec::new();
+    let mut not_run = None;
+    session.part(
+        &format!("{s} render"),
+        project,
+        out,
+        |r| match render::render_part(r, work, file, scale)? {
+            RenderPart::Measured {
+                metrics,
+                notes: lacked,
+            } => {
+                notes = lacked;
+                Ok(metrics)
+            }
+            RenderPart::NotRun(why) => {
+                not_run = Some(why);
+                Ok(Vec::new())
+            }
+        },
+    )?;
+    for note in notes {
+        out.say(&format!("perf: {s} render: {note}"))?;
+    }
+    if let Some(why) = not_run {
+        out.say(&format!("perf: {s} render: not run: {why}"))?;
+        let record = Record::new("perf", "not_run")
+            .with("part", format!("{s} render"))
+            .with("why", why);
+        out.record(&record)?;
+    }
+    Ok(())
 }
 
 /// The comparison table's line for `entry` judged `verdict` against `baseline`.

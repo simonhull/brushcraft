@@ -26,7 +26,9 @@ subcommands:
              (the save goes into the project: it gains a save point each run)
   budget     a random walk (evaluate, brush, pan) under a budget, sampling RSS every 100 ms
   perf       the tracked performance suite: stage benches and a cached medium project (and
-             with --full the benchmark project), compared with the history's baseline
+             with --full the benchmark project), compared with the history's baseline; its
+             render part runs the app's scripted camera path (brushcraft, built beside this
+             binary), on a hardware GPU (lavapipe for --tiny), or says it was not run
   display    the display layer kept: rebuilt level by level, saved (file growth), then the
              brush stroke with its refresh after each step (saves into the project)
   display-save  the display layer rebuilt and saved, nothing else: a project that opens with
