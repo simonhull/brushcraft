@@ -18,7 +18,7 @@ use wgpu::{
 use super::*;
 use crate::gpu::GpuTest;
 use crate::tree::{GpuNode, NODE_LIVE, Place};
-use crate::upload::{GpuVertex, TileDetail, TileSource};
+use crate::upload::{GpuVertex, TileData, TileDetail, TileSource};
 
 /// The test projects' finest level: level 7, where a face has 2 × 2 tiles.
 const FINEST: u8 = 7;
@@ -180,7 +180,7 @@ impl TileSource for Model {
         Ok(())
     }
 
-    fn read(&mut self, key: TileKey, out: &mut [GpuVertex]) -> Result<Option<TileDetail>, Failure> {
+    fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, Failure> {
         self.reads += 1;
         if self.fail_one_in > 0 && self.reads.is_multiple_of(self.fail_one_in) {
             return Err(Failure);
@@ -193,7 +193,7 @@ impl TileSource for Model {
         if self.missing.contains(&key) {
             return Ok(None);
         }
-        out.fill(tag(&key, version));
+        out.vertices().fill(tag(&key, version));
         Ok(Some(detail_tag(version)))
     }
 }

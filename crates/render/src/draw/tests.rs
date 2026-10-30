@@ -17,7 +17,7 @@ use crate::raster::tests::World;
 use crate::raster::{BACKGROUND, MORPH, VisibilityId};
 use crate::residency::{REQUEST_HEADER, Residency, ResidencyConfig};
 use crate::surface::Offscreen;
-use crate::upload::{GpuVertex, TileDetail, TileSource};
+use crate::upload::{GpuVertex, TileData, TileDetail, TileSource};
 
 /// The clear colour the tests draw with, linear.
 const CLEAR: Color = Color {
@@ -118,12 +118,8 @@ struct ByLevel;
 impl TileSource for ByLevel {
     type Error = Infallible;
 
-    fn read(
-        &mut self,
-        key: TileKey,
-        out: &mut [GpuVertex],
-    ) -> Result<Option<TileDetail>, Infallible> {
-        out.fill(Self::vertex(key));
+    fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, Infallible> {
+        out.vertices().fill(Self::vertex(key));
         Ok(Some(TileDetail::FINEST))
     }
 }

@@ -54,7 +54,7 @@ const fn array(v: Vec3) -> [f32; 3] {
 }
 
 #[test]
-fn the_stores_tiles_land_in_their_slots_bit_for_bit() {
+fn the_stores_tiles_land_in_their_slots_their_positions_bit_for_bit() {
     GpuTest::run(|gpu| {
         let dir = TempDir::new("store-source");
         let mesh = cube_sphere(1).expect("a mesh");
@@ -122,9 +122,14 @@ fn the_stores_tiles_land_in_their_slots_bit_for_bit() {
             .collect();
         let held = slot_contents(gpu, &residency, &fine);
         let held_positions: Vec<[f32; 3]> = held.iter().map(|v| v.position).collect();
-        let held_normals: Vec<[f32; 3]> = held.iter().map(|v| v.normal).collect();
         assert_eq!(held_positions, positions, "the finest tile's positions");
-        assert_eq!(held_normals, normals, "and its normals");
+        // Its normals are the GPU's, from its ring: the store's formula, its rounding the GPU's
+        // (`normals::tests` bounds the angle and checks the seams).
+        let normals_agree = held.iter().zip(&normals).all(|(vertex, normal)| {
+            let dot: f32 = vertex.normal.iter().zip(normal).map(|(a, b)| a * b).sum();
+            dot > 1.0 - 1e-6
+        });
+        assert!(normals_agree, "and its normals, computed on the GPU");
 
         for key in [coarse, floor] {
             let tile = store

@@ -6,11 +6,16 @@
 //! side: `2^l + 1` at levels up to 6, where a tile is a whole face, and 65 above. Each class is
 //! a few storage buffers, the first 64 MiB and each next twice the last, up to as large as the
 //! device binds (`max_storage_buffer_binding_size`; see [`Tier`]), cut into equal slots of
-//! [`GpuVertex`]es, created as the budget ([`ResidencyConfig::budget_bytes`], from the capability
-//! tier) allows and kept; a [`Slot`] is (class, buffer, index). A tile keeps its slot until an
-//! epoch large enough for shadow slots moves it; what stays the tile's while it is resident is its
-//! node index in the tile tree ([`crate::tree`]), and that is what the visibility buffer's cluster
-//! id derives from.
+//! [`GpuVertex`](crate::upload::GpuVertex)es, created as the budget
+//! ([`ResidencyConfig::budget_bytes`], from the capability tier) allows and kept; a [`Slot`] is
+//! (class, buffer, index). A tile keeps its slot until an epoch large enough for shadow slots
+//! moves it; what stays the tile's while it is resident is its node index in the tile tree
+//! ([`crate::tree`]), and that is what the visibility buffer's cluster id derives from.
+//!
+//! A finest tile's slot is like any other of its side: its one-vertex ring isn't stored. The tile
+//! is staged as its positions with the ring ([`crate::normals::RingRecord`]), and the frame's
+//! normal pass writes its slot's vertices from them ([`crate::normals`]). Room and the forced
+//! bytes are counted by the slot, a little over twice the record, so on the safe side.
 //!
 //! # What stays
 //!
@@ -70,9 +75,10 @@ use thiserror::Error;
 use wgpu::{Buffer, MAP_ALIGNMENT, PollType};
 
 use crate::gpu::{Gpu, GpuError};
+use crate::normals::NormalPass;
 use crate::tree::{NODE_BYTES, NODE_FINEST, NODE_FLOOR, Place, TileTree, TreeError};
 use crate::upload::{
-    Batch, FrameOutcome, FrameUploads, GpuVertex, StagingRing, TileDetail, TileSource, VERTEX_BYTES,
+    Batch, FrameOutcome, FrameUploads, StagingRing, TileData, TileDetail, TileSource, VERTEX_BYTES,
 };
 
 mod pool;
@@ -131,7 +137,7 @@ impl SizeClass {
         self.side() * self.side()
     }
 
-    /// Bytes per slot: [`SizeClass::vertices`] [`GpuVertex`]es.
+    /// Bytes per slot: [`SizeClass::vertices`] [`GpuVertex`](crate::upload::GpuVertex)es.
     #[must_use]
     pub const fn slot_bytes(self) -> u64 {
         self.vertices() as u64 * VERTEX_BYTES
@@ -748,8 +754,11 @@ pub struct Residency {
     layout: SlotLayout,
     /// Counts.
     stats: ResidencyStats,
-    /// A tile's vertices, as read from the source.
-    scratch: Vec<GpuVertex>,
+    /// A tile as read from the source: its vertices, or a finest tile's ring.
+    data: TileData,
+    /// The normal pass: the frame's finest tiles' records, and the work that turns them into
+    /// their slots' vertices.
+    normals: NormalPass,
 }
 
 impl Residency {
@@ -838,6 +847,8 @@ impl Residency {
         let staging_bytes = config.staging_bytes.max(largest);
         let staging_cap = config.staging_cap.max(staging_bytes);
         let (outcome_sender, outcomes) = mpsc::channel();
+        // A record chunk holds what a staging buffer does.
+        let normals = NormalPass::new(gpu, staging_bytes)?;
         Ok(Self {
             ring: StagingRing::new(staging_bytes, staging_cap),
             config,
@@ -869,7 +880,8 @@ impl Residency {
             requests,
             layout,
             stats: ResidencyStats::default(),
-            scratch: Vec::new(),
+            data: TileData::default(),
+            normals,
         })
     }
 
@@ -886,8 +898,8 @@ impl Residency {
     }
 
     /// `class`'s slot buffers, by buffer index ([`Slot::buffer`]): each holds whole slots of
-    /// [`GpuVertex`]es. A class gains buffers as tiles arrive (rebind when the count changes);
-    /// a buffer, once made, stays.
+    /// [`GpuVertex`](crate::upload::GpuVertex)es. A class gains buffers as tiles arrive (rebind
+    /// when the count changes); a buffer, once made, stays.
     #[must_use]
     pub fn slot_buffers(&self, class: SizeClass) -> &[Buffer] {
         self.pools.buffers(class)
@@ -1266,6 +1278,7 @@ impl Residency {
         self.fresh.clear();
         self.forced_now = 0;
         self.scanned.fill(None);
+        self.normals.begin();
         self.pending = self
             .groups
             .iter()
@@ -1275,6 +1288,10 @@ impl Residency {
         let mut batch = Batch::new(&self.ring);
         match self.stage_into(gpu, &mut batch, source, deadline) {
             Ok(()) => {
+                let normals = match self.normals.finish(gpu, &mut batch, &mut self.ring) {
+                    Ok(normals) => normals,
+                    Err(error) => return Err(self.fail(batch, error.into())),
+                };
                 let requests = match self.requests.copy(gpu, self.frame) {
                     Ok(requests) => requests,
                     Err(error) => return Err(self.fail(batch, error.into())),
@@ -1284,7 +1301,7 @@ impl Residency {
                 self.next_upload += 1;
                 self.in_flight
                     .insert(frame, std::mem::take(&mut self.touched));
-                Ok(batch.finish(frame, requests, self.outcome_sender.clone()))
+                Ok(batch.finish(frame, normals, requests, self.outcome_sender.clone()))
             }
             Err(error) => Err(self.fail(batch, error)),
         }
@@ -1737,17 +1754,40 @@ impl Residency {
             return Ok(Read::NoRoom);
         }
         let vertices = usize::try_from(slot.class.vertices()).unwrap_or(usize::MAX);
-        self.scratch.clear();
-        self.scratch.resize(vertices, GpuVertex::default());
-        let Some(detail) = source.read(key, &mut self.scratch).map_err(Into::into)? else {
+        self.data.reset(vertices);
+        let Some(detail) = source.read(key, &mut self.data).map_err(Into::into)? else {
             return Ok(Read::Missing);
         };
         let (buffer, offset) = self
             .pools
             .locate(slot)
             .ok_or(ResidencyError::Invariant("a slot without a buffer"))?;
-        let data: &[u8] = bytemuck::cast_slice(&self.scratch);
-        if batch.write(gpu, &mut self.ring, data, buffer, offset, forced)? {
+        let written = if let Some(record) = self.data.ring_record() {
+            // A finest tile's positions with its ring: the normal pass writes the slot.
+            if record.quads() + 1 != slot.class.side() {
+                return Err(ResidencyError::Invariant(
+                    "a ring of another side than its slot",
+                ));
+            }
+            self.normals.stage(
+                gpu,
+                batch,
+                &mut self.ring,
+                record,
+                slot,
+                (buffer, offset),
+                forced,
+            )?
+        } else {
+            let data = self.data.vertex_bytes();
+            let written = batch.write(gpu, &mut self.ring, data, buffer, offset, forced)?;
+            if written {
+                // Copied in, not computed: an earlier record for the slot mustn't overwrite it.
+                self.normals.forget(slot);
+            }
+            written
+        };
+        if written {
             self.touched.push((key, slot));
             self.fresh.insert(key);
             Ok(Read::Staged(detail))

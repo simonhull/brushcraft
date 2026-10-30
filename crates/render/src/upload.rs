@@ -2,11 +2,14 @@
 //! and handed to the render thread once per frame (plan decision 5).
 //!
 //! The owner thread reads each tile from a [`TileSource`] (the store, through [`StoreSource`])
-//! as [`GpuVertex`]es and writes them, with the tile tree's changed nodes, into staging buffers
+//! into a [`TileData`]: a display tile as [`GpuVertex`]es, a finest tile as its positions with
+//! the one-vertex ring (a [`RingRecord`], from which the GPU computes its vertices,
+//! [`crate::normals`]). It writes them, with the tile tree's changed nodes, into staging buffers
 //! mapped for writing. When the frame's uploads are staged, the buffers are unmapped and the
 //! copies they need become a [`FrameUploads`], which the render thread encodes into the frame's
-//! command buffer ahead of every pass and submits ([`FrameUploads::submit`], which takes
-//! the passes, so they can only follow the copies): each staging buffer is then mapped for writing
+//! command buffer ahead of every pass, the normal pass right after them, and submits
+//! ([`FrameUploads::submit`], which takes the passes, so they can only follow the copies and the
+//! normal pass): each staging buffer is then mapped for writing
 //! again and returns to the ring when the GPU is done with it, without the owner thread ever
 //! waiting on the GPU. A frame dropped instead (staging failed, or the render thread gave up on it)
 //! gives its buffers back too.
@@ -14,7 +17,7 @@
 //! Everything a frame stages goes into one submission, so a group of tiles staged together
 //! (an epoch, [`crate::residency`]) and the tree nodes pointing at them switch at once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use bytemuck::{Pod, Zeroable};
@@ -23,6 +26,8 @@ use store::{CacheError, Evaluation, TileStore};
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode, Queue};
 
 use crate::gpu::{Gpu, GpuError};
+use crate::normals::NormalWork;
+pub use crate::normals::RingRecord;
 use crate::residency::Requests;
 
 #[cfg(test)]
@@ -32,7 +37,8 @@ mod tests;
 /// One vertex of a resident tile as the GPU reads it: 32 bytes, two `vec4`s.
 ///
 /// Positions are decoded `f32` (plan decision 1). Normals are unit normals: a display tile's
-/// averaged normal, unpacked; a finest tile's normal as the store computes it.
+/// averaged normal, unpacked; a finest tile's computed on the GPU from its positions and ring
+/// ([`crate::normals`]), by the formula the store's normals use.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct GpuVertex {
@@ -101,6 +107,61 @@ impl TileDetail {
     }
 }
 
+/// What a [`TileSource`] writes one tile into: its vertices, or a finest tile's positions with
+/// its ring.
+///
+/// Residency hands it over set to the tile's `side²` vertices, zeroed; a source fills them
+/// ([`TileData::vertices`]) or writes the ring instead ([`TileData::ring`]), and whichever it
+/// did last is what is uploaded.
+#[derive(Debug, Default)]
+pub struct TileData {
+    /// The vertices, row-major `side²`.
+    vertices: Vec<GpuVertex>,
+    /// The ring's record.
+    ring: RingRecord,
+    /// Whether the ring is what was written.
+    is_ring: bool,
+}
+
+impl TileData {
+    /// `vertices` zeroed vertices to fill, and no ring.
+    pub(crate) fn reset(&mut self, vertices: usize) {
+        self.vertices.clear();
+        self.vertices.resize(vertices, GpuVertex::default());
+        self.is_ring = false;
+    }
+
+    /// The tile's vertices, row-major `side²`, to fill: they are what is uploaded.
+    pub fn vertices(&mut self) -> &mut [GpuVertex] {
+        self.is_ring = false;
+        &mut self.vertices
+    }
+
+    /// Writes a finest tile as `block`, its positions with its one-vertex ring and its
+    /// base-vertex rings, gathered over `mesh`: that is what is uploaded, and the GPU computes the
+    /// tile's vertices from it ([`crate::normals`]). `block` must be of the tile's side.
+    pub fn ring(&mut self, mesh: &geom::BaseMesh, block: &geom::GatheredBlock) {
+        self.ring.write(mesh, block);
+        self.is_ring = true;
+    }
+
+    /// The ring's record, if the ring is what was written.
+    pub(crate) fn ring_record(&self) -> Option<&RingRecord> {
+        self.is_ring.then_some(&self.ring)
+    }
+
+    /// The ring's record, if the ring is what was written, for tests that change it.
+    #[cfg(test)]
+    pub(crate) fn ring_record_mut(&mut self) -> Option<&mut RingRecord> {
+        self.is_ring.then_some(&mut self.ring)
+    }
+
+    /// The vertices' bytes.
+    pub(crate) fn vertex_bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.vertices)
+    }
+}
+
 /// Where the data of resident tiles comes from: the store, or a model of it in tests.
 ///
 /// Read on the owner thread, a tile at a time, while the frame's uploads are staged.
@@ -122,7 +183,7 @@ pub trait TileSource {
         Ok(())
     }
 
-    /// Writes `key`'s vertices into `out` (row-major `side²`, as many as `out` holds) and
+    /// Writes `key` into `out`, its vertices or (a finest tile) its positions with the ring, and
     /// returns its bound `e` and its finest normals' cone, or `None` if the source has nothing
     /// to draw for it yet (a display tile not built, or made unknown by edits): it is then drawn
     /// finer, or by an ancestor.
@@ -130,21 +191,16 @@ pub trait TileSource {
     /// # Errors
     ///
     /// As the source reports them; staging stops there.
-    fn read(
-        &mut self,
-        key: TileKey,
-        out: &mut [GpuVertex],
-    ) -> Result<Option<TileDetail>, Self::Error>;
+    fn read(&mut self, key: TileKey, out: &mut TileData)
+    -> Result<Option<TileDetail>, Self::Error>;
 }
 
 /// [`TileSource`] over the store: display tiles from [`TileStore::display_for_draw`], finest
-/// tiles from [`TileStore::normals`] and [`TileStore::evaluate`].
+/// tiles from [`TileStore::positions_with_ring`].
 ///
-/// A finest tile uploads its positions and the store's normals. Plan decision 1 wants its
-/// positions with the one-vertex ring instead, the normals computed on the GPU, but the store
-/// has no read of a tile with its ring (corner rings at base vertices included); until it does,
-/// the store's normals are what both sides of every seam agree on (it gives every copy of a
-/// shared vertex the same bits).
+/// A finest tile uploads its positions with the one-vertex ring and its corners' base-vertex
+/// rings (plan decision 1), every vertex its owner's bits, and the GPU computes its normals
+/// ([`crate::normals`]); the store's CPU normals aren't computed.
 #[derive(Debug)]
 pub struct StoreSource<'a> {
     /// The store read.
@@ -172,7 +228,14 @@ impl TileSource for StoreSource<'_> {
             .iter()
             .partition(|key| key.channel() == Channel::DISPLAY);
         if !finest.is_empty() {
-            self.store.evaluate_many(&finest, Evaluation::Normals)?;
+            // Positions only, of every tile the rings read: the tiles, their aprons and the
+            // tiles round their corners' base vertices.
+            let mut inputs = BTreeSet::new();
+            for key in &finest {
+                inputs.extend(self.store.normal_inputs(key)?.iter().copied());
+            }
+            let inputs: Vec<TileKey> = inputs.into_iter().collect();
+            self.store.evaluate_many(&inputs, Evaluation::Positions)?;
         }
         if !display.is_empty() {
             let tiles = self.store.display_for_draw(&display)?;
@@ -181,11 +244,7 @@ impl TileSource for StoreSource<'_> {
         Ok(())
     }
 
-    fn read(
-        &mut self,
-        key: TileKey,
-        out: &mut [GpuVertex],
-    ) -> Result<Option<TileDetail>, CacheError> {
+    fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, CacheError> {
         if key.channel() == Channel::DISPLAY {
             let tile = match self.display.remove(&key) {
                 Some(tile) => tile,
@@ -195,6 +254,7 @@ impl TileSource for StoreSource<'_> {
                 return Ok(None);
             };
             let vertices = out
+                .vertices()
                 .iter_mut()
                 .zip(tile.positions())
                 .zip(tile.normals())
@@ -209,18 +269,12 @@ impl TileSource for StoreSource<'_> {
             }
             return Ok(Some(TileDetail::of_display(&tile)));
         }
-        let normals = self.store.normals(key)?;
-        let with_normals = out.iter_mut().zip(normals);
-        for (vertex, normal) in with_normals {
-            vertex.normal = components(*normal);
-            vertex.roughness = 1.0;
-            vertex.reserved = 0;
-        }
-        let positions = self.store.evaluate(key)?;
-        let with_positions = out.iter_mut().zip(positions);
-        for (vertex, position) in with_positions {
-            vertex.position = components(*position);
-        }
+        // Prepared tiles are cached and current: the gather reads them, evaluating nothing.
+        let block = match self.store.cached_positions_with_ring(&key)? {
+            Some(block) => block,
+            None => self.store.positions_with_ring(key)?,
+        };
+        out.ring(self.store.mesh(), &block);
         Ok(Some(TileDetail::FINEST))
     }
 }
@@ -508,12 +562,13 @@ impl Batch {
         Ok(Some((self.staging.len() - 1, 0)))
     }
 
-    /// Ends the frame's staging: unmaps its buffers and hands them, with their copies and the
-    /// request readback, to the render thread as frame `frame`, whose outcome goes to
-    /// `outcomes`.
+    /// Ends the frame's staging: unmaps its buffers and hands them, with their copies, the
+    /// normal pass and the request readback, to the render thread as frame `frame`, whose
+    /// outcome goes to `outcomes`.
     pub(crate) fn finish(
         mut self,
         frame: u64,
+        normals: Option<NormalWork>,
         requests: Option<RequestCopy>,
         outcomes: Sender<FrameOutcome>,
     ) -> FrameUploads {
@@ -525,6 +580,7 @@ impl Batch {
             frame: Some(frame),
             staging,
             copies: std::mem::take(&mut self.copies),
+            normals,
             bytes: self.bytes,
             requests,
             level_choice: true,
@@ -600,6 +656,9 @@ pub struct FrameUploads {
     staging: Vec<Staging>,
     /// Its copies, in order.
     copies: Vec<CopyOp>,
+    /// The normal pass computing its finest tiles' vertices from their records, if it staged
+    /// any.
+    normals: Option<NormalWork>,
     /// Bytes staged.
     bytes: u64,
     /// The request readback, if a readback buffer was free.
@@ -652,12 +711,13 @@ impl FrameUploads {
         }
     }
 
-    /// Encodes and submits the frame: into `encoder`, the copies first, then `passes` (which
-    /// read the tiles they bring), then the request readback (the request buffer is copied
-    /// out, then its count cleared for the next frame); submits the command buffer, and only then
-    /// maps the staging buffers for writing again (they return to the ring when the GPU is done
-    /// with them) and the readback buffer for reading. The callbacks run when the device is
-    /// polled ([`crate::residency::Residency::begin_frame`] does).
+    /// Encodes and submits the frame: into `encoder`, the copies first, then the normal pass
+    /// (which writes the finest tiles' vertices from the records the copies bring), then
+    /// `passes` (which read the tiles they bring), then the request readback (the request buffer is
+    /// copied out, then its count cleared for the next frame); submits the command buffer, and
+    /// only then maps the staging buffers for writing again (they return to the ring when the
+    /// GPU is done with them) and the readback buffer for reading. The callbacks run when the
+    /// device is polled ([`crate::residency::Residency::begin_frame`] does).
     ///
     /// Taking the passes keeps the order fixed: no pass can be encoded before the copies.
     pub fn submit(
@@ -667,6 +727,9 @@ impl FrameUploads {
         passes: impl FnOnce(&mut CommandEncoder),
     ) {
         self.encode(&mut encoder);
+        if let Some(normals) = &self.normals {
+            normals.encode(&mut encoder);
+        }
         passes(&mut encoder);
         if !self.level_choice
             && let Some(RequestCopy {
