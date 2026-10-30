@@ -427,6 +427,47 @@ fn a_budget_that_cannot_hold_the_floor_is_refused() {
 }
 
 #[test]
+fn a_budget_of_more_slot_buffers_than_one_draw_binds_is_refused_when_residency_is_built() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let big = SizeClass::of(level(FINEST)).slot_bytes();
+        // One side-65 slot a buffer: the class's 30 tiles and their shadow headroom would take
+        // 60 buffers, past what lavapipe's 48 storage buffers a stage leave the raster.
+        let config = ResidencyConfig::default()
+            .with_buffer_bytes(big)
+            .expect("an aligned size");
+        let refused = Residency::new(gpu, &mesh, level(FINEST), config).expect_err("too many");
+        let limit = crate::raster::slot_buffer_limit(gpu);
+        assert!(
+            matches!(
+                refused,
+                ResidencyError::Config(ConfigError::TooManySlotBuffers { buffers, limit: l })
+                    if buffers > l && l == limit
+            ),
+            "{refused}"
+        );
+        // The tiny budget fits: its layout is each class's most buffers, made or not.
+        let residency = Residency::new(gpu, &mesh, level(FINEST), tiny(&mesh, 3)).expect("it fits");
+        let layout = residency.slot_layout();
+        assert!(layout.total() <= limit, "{layout:?}");
+        let classes = (0..CLASSES).filter_map(|c| u8::try_from(c).ok().and_then(SizeClass::new));
+        for class in classes {
+            let made = residency.slot_buffers(class).len();
+            assert!(
+                made <= usize::from(layout.buffers(class)),
+                "{class:?}: {layout:?}"
+            );
+        }
+        // At least the buffers the budget buys beyond the floor (3): the most counts the whole
+        // budget, the floor's share too, so it is never short.
+        assert!(
+            layout.buffers(SizeClass::of(level(FINEST))) >= 3,
+            "{layout:?}"
+        );
+    });
+}
+
+#[test]
 fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_childs_parent() {
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");

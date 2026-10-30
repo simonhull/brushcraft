@@ -209,6 +209,18 @@ impl Pools {
         Some((buffer, u64::from(slot.index) * slot.class.slot_bytes()))
     }
 
+    /// The most buffers `class` can ever have: its most slots (its tiles and their headroom),
+    /// or those the whole budget would buy, whichever is fewer, in buffers of its size.
+    pub(crate) fn most_buffers(&self, class: SizeClass) -> u16 {
+        self.classes
+            .get(usize::from(class.get()))
+            .map_or(0, |pool| {
+                let slots = pool.most_slots().min(self.budget / class.slot_bytes());
+                let buffers = slots.div_ceil(pool.slots_per_buffer);
+                u16::try_from(buffers.min(MAX_BUFFERS as u64)).unwrap_or(u16::MAX)
+            })
+    }
+
     /// `class`'s buffers, in slot order: a slot's buffer is its index here.
     pub(crate) fn buffers(&self, class: SizeClass) -> &[Buffer] {
         self.classes

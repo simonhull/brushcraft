@@ -238,14 +238,16 @@ struct Path {
 /// the parent's bound alone, 0 below the threshold and 1 at twice it.
 fn ramp_raster(gpu: &Gpu, world: &World, old: bool) -> Raster {
     let config = RasterConfig::default().with_morph(Duration::ZERO);
-    let mut raster = Raster::new(gpu, world.tree.capacity(), config).expect("the raster");
-    if old {
-        raster.patches = vec![(
+    let patches: &[(&str, &str)] = if old {
+        &[(
             "return clamp((x - r) / (x - y), 0.0, 1.0);",
             "return clamp(x / r - 1.0, 0.0, 1.0);",
-        )];
-    }
-    raster
+        )]
+    } else {
+        &[]
+    };
+    Raster::patched(gpu, world.tree.capacity(), world.layout(), config, patches)
+        .expect("the raster")
 }
 
 #[test]

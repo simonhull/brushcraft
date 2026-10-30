@@ -24,6 +24,7 @@ use crate::camera::View;
 use crate::cull::{BoundsUpdate, DepthPyramid, PyramidPass, SlotBuffers};
 use crate::gpu::{Gpu, GpuError};
 use crate::lod::{CutReadback, Lod, LodConfig, LodError, MainInputs};
+use crate::residency::SlotLayout;
 
 /// Why a frame's passes couldn't be set up or encoded.
 #[derive(Debug, Error)]
@@ -77,7 +78,8 @@ pub struct FramePasses {
 }
 
 impl FramePasses {
-    /// The passes for a tile tree of `capacity` nodes, the level choice set up by `lod` and the
+    /// The passes for a tile tree of `capacity` nodes and slot buffers of `slots` (residency's,
+    /// [`crate::residency::Residency::slot_layout`]), the level choice set up by `lod` and the
     /// geomorph holding the drawn error to its refine threshold
     /// ([`RasterConfig::for_level_choice`]), level changes made with the camera still morphing
     /// over `morph`.
@@ -88,13 +90,14 @@ impl FramePasses {
     pub fn new(
         gpu: &Gpu,
         capacity: u32,
+        slots: SlotLayout,
         lod: LodConfig,
         morph: Duration,
     ) -> Result<Self, FrameError> {
         let raster = RasterConfig::for_level_choice(&lod).with_morph(morph);
         Ok(Self {
             lod: Lod::new(gpu, capacity, lod)?,
-            raster: Raster::new(gpu, capacity, raster)?,
+            raster: Raster::new(gpu, capacity, slots, raster)?,
             pyramids: PyramidPass::new(gpu)?,
             current: None,
             previous: None,
@@ -182,7 +185,7 @@ impl FramePasses {
     ///
     /// As [`FramePasses::encode`].
     fn draw_both(
-        &mut self,
+        &self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
         inputs: &SceneInputs<'_>,

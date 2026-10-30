@@ -29,7 +29,7 @@ use crate::cull::tests::Rng;
 use crate::gpu::GpuTest;
 use crate::indices::{ClusterSize, GridVertex, Variant, remap};
 use crate::lod::{GpuCluster, GpuCutEntry, Lod, LodConfig, MainInputs, Thresholds};
-use crate::residency::{CLASSES, REQUEST_HEADER, SizeClass, Slot};
+use crate::residency::{CLASSES, REQUEST_HEADER, SizeClass, Slot, SlotLayout};
 use crate::surface::Size;
 use crate::tree::{NODE_BYTES, NODE_FINEST, Place, TileTree};
 use crate::upload::{GpuVertex, TileDetail};
@@ -239,6 +239,17 @@ impl World {
     /// The node of `place`.
     fn node(&self, place: Place) -> u32 {
         self.tiles[&place].node
+    }
+
+    /// The slot layout the raster binds: one buffer more of each class than it has, as
+    /// residency's most is more than it has made, so every draw binds placeholders too.
+    fn layout(&self) -> SlotLayout {
+        let mut per_class = [0_u16; CLASSES];
+        let classes = per_class.iter_mut().zip(self.slots.classes());
+        for (most, buffers) in classes {
+            *most = u16::try_from(buffers.len() + 1).expect("small");
+        }
+        SlotLayout::new(per_class)
     }
 
     /// The place of `node`.
@@ -598,7 +609,7 @@ fn still_raster(gpu: &Gpu, world: &World) -> Raster {
     let config = RasterConfig::default()
         .with_morph(Duration::ZERO)
         .with_ramp(MorphThreshold::OFF);
-    Raster::new(gpu, world.tree.capacity(), config).expect("the raster")
+    Raster::new(gpu, world.tree.capacity(), world.layout(), config).expect("the raster")
 }
 
 /// The reference: the finest level, every vertex where it is, from `view`.
@@ -836,7 +847,8 @@ fn the_pinhole_test_a_seam_between_morphs_takes_both_sides_shared_factors() {
         // By time: at 1040 ms face 0 is 93 % through its morph and its neighbour 27 %, so
         // their seam is drawn by the less advanced stamp on both sides.
         let by_time = RasterConfig::default().with_ramp(MorphThreshold::OFF);
-        let mut raster = Raster::new(gpu, world.tree.capacity(), by_time).expect("the raster");
+        let mut raster =
+            Raster::new(gpu, world.tree.capacity(), world.layout(), by_time).expect("the raster");
         for (seen_from, view, mask) in &views {
             let at = |ms: u64| RasterFrame {
                 view,
@@ -871,7 +883,8 @@ fn the_pinhole_test_a_seam_between_morphs_takes_both_sides_shared_factors() {
         world.write_tree(gpu);
         let by_distance = RasterConfig::default().with_morph(Duration::ZERO);
         let mut distance_raster =
-            Raster::new(gpu, world.tree.capacity(), by_distance).expect("the raster");
+            Raster::new(gpu, world.tree.capacity(), world.layout(), by_distance)
+                .expect("the raster");
         for (seen_from, view, mask) in &views {
             let frame = RasterFrame {
                 view,
@@ -903,7 +916,8 @@ fn the_pinhole_test_random_cameras_and_random_mixed_level_cuts_show_no_backgroun
         // Morphing by time alone, so every refined tile's odd vertices move (the distance
         // factor is the level-choice pinhole test's).
         let config = RasterConfig::default().with_ramp(MorphThreshold::OFF);
-        let mut raster = Raster::new(gpu, world.tree.capacity(), config).expect("the raster");
+        let mut raster =
+            Raster::new(gpu, world.tree.capacity(), world.layout(), config).expect("the raster");
         let mut seen = BTreeSet::new();
         let mut checked = 0;
         // Random cuts from random cameras, refined twice with the camera still, so tiles of
@@ -1131,8 +1145,13 @@ fn the_pinhole_test_holds_for_the_level_choice_s_cuts_morphing_by_distance() {
         let world = World::new(gpu);
         let mut rng = Rng(7);
         let (mut lod, requests) = level_choice(gpu, &world);
-        let mut raster =
-            Raster::new(gpu, world.tree.capacity(), RasterConfig::default()).expect("the raster");
+        let mut raster = Raster::new(
+            gpu,
+            world.tree.capacity(),
+            world.layout(),
+            RasterConfig::default(),
+        )
+        .expect("the raster");
         let mut levels = BTreeSet::new();
         for seed in 0..5 {
             let (view, _) = random_view(&mut rng, (1.6, 6.0));
@@ -1430,8 +1449,13 @@ fn with_the_camera_still_the_ids_are_the_same_frame_after_frame() {
         let world = World::new(gpu);
         let mut rng = Rng(11);
         let (mut lod, requests) = level_choice(gpu, &world);
-        let mut raster =
-            Raster::new(gpu, world.tree.capacity(), RasterConfig::default()).expect("the raster");
+        let mut raster = Raster::new(
+            gpu,
+            world.tree.capacity(),
+            world.layout(),
+            RasterConfig::default(),
+        )
+        .expect("the raster");
         let (view, _) = random_view(&mut rng, (1.8, 3.0));
         let at = |ms: u64, moving: bool| RasterFrame {
             view: &view,
@@ -1504,7 +1528,7 @@ fn probe(
     probes: &[[u32; 2]],
 ) -> Vec<[f32; 4]> {
     let device = gpu.device();
-    let slot_pipeline = raster.pipeline.as_ref().expect("a draw built the pipeline");
+    let slot_pipeline = &raster.pipeline;
     let probe_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("probe"),
         entries: &[read_entry(0), written_entry(1)],
@@ -1543,9 +1567,7 @@ fn probe(
         clusters,
         args: (clusters, 0),
     };
-    let (group, slot_group) = raster
-        .groups(gpu, &draw, slot_pipeline)
-        .expect("bind groups");
+    let (group, slot_group) = raster.groups(gpu, &draw).expect("bind groups");
     let probe_group = device.create_bind_group(&BindGroupDescriptor {
         label: Some("probe"),
         layout: &probe_layout,
@@ -1694,7 +1716,8 @@ fn the_geomorph_moves_odd_vertices_from_their_midpoint_to_their_place_over_150_m
         let world = World::new(gpu);
         let case = MorphCase::new(gpu, &world);
         let config = RasterConfig::default().with_ramp(MorphThreshold::OFF);
-        let mut raster = Raster::new(gpu, world.tree.capacity(), config).expect("the raster");
+        let mut raster =
+            Raster::new(gpu, world.tree.capacity(), world.layout(), config).expect("the raster");
         // Frame 1 draws every face at level 3; frame 2 refines one with the camera still, so
         // its time factor starts at 0.
         let base_clusters = cut_clusters(&world, &case.base, true);
@@ -1758,7 +1781,8 @@ fn the_geomorph_by_distance_holds_the_drawn_error_at_the_threshold_till_the_tile
         let config = RasterConfig::default()
             .with_morph(Duration::ZERO)
             .with_ramp(MorphThreshold::new(threshold).expect("a threshold"));
-        let mut raster = Raster::new(gpu, world.tree.capacity(), config).expect("the raster");
+        let mut raster =
+            Raster::new(gpu, world.tree.capacity(), world.layout(), config).expect("the raster");
         // Pixels a length of `e` covers at `p`, seen from the case's eye (0, 0, 3) along -z.
         let ppu = case.view.pixels_per_unit();
         let pixels = |e: f32, p: [f32; 3]| f64::from(e) * ppu / (3.0 - f64::from(p[2]));
@@ -1901,7 +1925,8 @@ fn a_frame_draws_both_phases_lists_watertight_the_second_drawing_what_the_first_
         };
         let config = LodConfig::default().with_thresholds(thresholds);
         let mut passes =
-            FramePasses::new(gpu, world.tree.capacity(), config, MORPH).expect("the passes");
+            FramePasses::new(gpu, world.tree.capacity(), world.layout(), config, MORPH)
+                .expect("the passes");
         // A half turn between frames (a flick): what comes into view was behind the sphere in
         // the previous frame's depth, so the first phase hides it and the second draws it.
         let look = |eye: Vec3| {

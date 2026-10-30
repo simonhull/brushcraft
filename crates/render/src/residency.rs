@@ -205,8 +205,12 @@ impl Slot {
 /// | (gate) | lavapipe (Vulkan) | 128 MiB | 2047 MiB | 48 | 32 |
 /// | Mobile high | Adreno 730 | pending (M1c) | | | |
 ///
-/// Where a tier's buffers per class would still exceed `max_storage_buffers_per_shader_stage`,
-/// the passes bind one slot buffer per bind group instead; binding arrays are not used.
+/// The bounds pass binds one slot buffer per dispatch. The raster's one draw a phase binds every
+/// slot buffer at once, so [`Residency::new`] refuses a configuration whose most buffers
+/// ([`SlotLayout`]) don't fit `max_storage_buffers_per_shader_stage` beside the raster's own
+/// ([`ConfigError::TooManySlotBuffers`]; binding arrays are not used, not being on every
+/// backend). A tier past that would draw one indirect draw per slot buffer, from cluster lists
+/// the level choice splits by buffer; not built, no tier measured needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Tier {
@@ -253,6 +257,15 @@ pub enum ConfigError {
         /// The tiles the budget allows.
         tiles: u64,
     },
+    /// The most slot buffers the budget allows, every class together, don't fit one draw's
+    /// bindings beside the raster's own.
+    #[error("the budget allows {buffers} slot buffers; one draw binds at most {limit} of them")]
+    TooManySlotBuffers {
+        /// The most slot buffers, every class together.
+        buffers: u32,
+        /// The most one draw binds here.
+        limit: u32,
+    },
     /// The budget can't hold the floor: some of its tiles would never get a slot, and the floor
     /// is pinned and wanted until it is all resident.
     #[error("the budget holds {slots} tiles of side {side}, but the floor has {tiles} of them")]
@@ -264,6 +277,37 @@ pub enum ConfigError {
         /// The most of them the budget allows at once.
         slots: u64,
     },
+}
+
+/// The most slot buffers each size class can ever have: what the raster's pipeline is built to
+/// bind, once ([`crate::raster::Raster::new`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlotLayout([u16; CLASSES]);
+
+impl SlotLayout {
+    /// `buffers[c]` buffers of each class `c`.
+    #[must_use]
+    pub const fn new(buffers: [u16; CLASSES]) -> Self {
+        Self(buffers)
+    }
+
+    /// The most buffers of `class`.
+    #[must_use]
+    pub fn buffers(&self, class: SizeClass) -> u16 {
+        self.0.get(usize::from(class.get())).copied().unwrap_or(0)
+    }
+
+    /// Per class, its most buffers.
+    #[must_use]
+    pub const fn per_class(&self) -> &[u16; CLASSES] {
+        &self.0
+    }
+
+    /// Every class's together.
+    #[must_use]
+    pub fn total(&self) -> u32 {
+        self.0.iter().map(|&b| u32::from(b)).sum()
+    }
 }
 
 /// The most requests a request buffer may hold.
@@ -690,6 +734,8 @@ pub struct Residency {
     ring: StagingRing,
     /// The request buffer and its readbacks.
     requests: RequestBuffer,
+    /// The most slot buffers each class can have.
+    layout: SlotLayout,
     /// Counts.
     stats: ResidencyStats,
     /// A tile's vertices, as read from the source.
@@ -708,8 +754,10 @@ impl Residency {
     ///
     /// [`ResidencyError::Config`] if a slot buffer can't hold a tile of the finest class, or
     /// the budget allows more resident tiles than the tile tree can index or the device bind, or
-    /// can't hold the floor ([`ConfigError::FloorTooBig`]: its tiles would be wanted forever);
-    /// [`ResidencyError::Gpu`] or [`ResidencyError::Tree`] if a buffer can't be created.
+    /// can't hold the floor ([`ConfigError::FloorTooBig`]: its tiles would be wanted forever), or
+    /// allows more slot buffers than the raster's one draw binds
+    /// ([`ConfigError::TooManySlotBuffers`]); [`ResidencyError::Gpu`] or
+    /// [`ResidencyError::Tree`] if a buffer can't be created.
     pub fn new(
         gpu: &Gpu,
         mesh: &BaseMesh,
@@ -731,6 +779,20 @@ impl Residency {
         }
         let faces = mesh.face_count();
         let mut pools = Pools::new(faces, finest, buffer_bytes, config.budget_bytes);
+        let classes = (0..CLASSES).filter_map(|c| u8::try_from(c).ok().and_then(SizeClass::new));
+        let mut most = [0_u16; CLASSES];
+        for (slot, class) in most.iter_mut().zip(classes) {
+            *slot = pools.most_buffers(class);
+        }
+        let layout = SlotLayout::new(most);
+        let limit = crate::raster::slot_buffer_limit(gpu);
+        if layout.total() > limit {
+            return Err(ConfigError::TooManySlotBuffers {
+                buffers: layout.total(),
+                limit,
+            }
+            .into());
+        }
         let tiles = pools.max_resident();
         let capacity = u32::try_from(tiles)
             .ok()
@@ -794,6 +856,7 @@ impl Residency {
             outcome_sender,
             outcomes,
             requests,
+            layout,
             stats: ResidencyStats::default(),
             scratch: Vec::new(),
         })
@@ -817,6 +880,12 @@ impl Residency {
     #[must_use]
     pub fn slot_buffers(&self, class: SizeClass) -> &[Buffer] {
         self.pools.buffers(class)
+    }
+
+    /// The most slot buffers each class can ever have, which the raster is built to bind.
+    #[must_use]
+    pub const fn slot_layout(&self) -> SlotLayout {
+        self.layout
     }
 
     /// The request buffer the level choice appends wanted tiles to ([`REQUESTS_WGSL`]).

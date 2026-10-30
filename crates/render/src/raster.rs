@@ -90,11 +90,15 @@
 //! # Slot buffers
 //!
 //! One draw reads tiles from every slot buffer, so the raster binds them all at once, one binding
-//! each (group 1), and selects between them in WGSL by class and buffer: the shader is generated
-//! for the frame's buffer counts per class and rebuilt when they change (residency only ever adds
-//! buffers, a few times a session). Every tier measured has room in
-//! `max_storage_buffers_per_shader_stage` (desktop: 8 buffers; lavapipe, the gate: 38 of 48);
-//! past it [`RasterError::TooManySlotBuffers`].
+//! each (group 1), and selects between them in WGSL by class and buffer. The pipeline is built
+//! once, in [`Raster::new`], for the most buffers each class can ever have
+//! ([`crate::residency::SlotLayout`], from the budget and each class's tiles with their shadow
+//! headroom), a placeholder bound for each not made yet, so nothing is recompiled mid-session.
+//! Residency refuses a budget whose most buffers don't fit `max_storage_buffers_per_shader_stage`
+//! beside the raster's own four ([`slot_buffer_limit`]; on Metal its two uniform buffers count
+//! against the same table); every tier measured fits (desktop: 8 buffers; lavapipe, the gate: 38
+//! of 48). A tier past it would draw one indirect draw per slot buffer from cluster lists split
+//! by buffer: not built (plan, "Gaps found while executing", the "Task 4 review" bullet).
 //!
 //! # A frame
 //!
@@ -110,16 +114,17 @@ use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferUsages, Color,
-    ColorTargetState, ColorWrites, CommandEncoder, CompareFunction, ComputePassDescriptor,
-    ComputePipeline, DepthBiasState, DepthStencilState, Extent3d, Face, FragmentState, FrontFace,
-    IndexFormat, LoadOp, MultisampleState, Operations, PipelineCompilationOptions,
-    PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology,
-    RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
-    RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
-    StencilState, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages, TextureView, TextureViewDescriptor, VertexState,
+    Backend, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
+    BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType,
+    BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder, CompareFunction,
+    ComputePassDescriptor, ComputePipeline, DepthBiasState, DepthStencilState, Extent3d, Face,
+    FragmentState, FrontFace, IndexFormat, LoadOp, MultisampleState, Operations,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState,
+    PrimitiveTopology, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor,
+    ShaderSource, ShaderStages, StencilState, StoreOp, Texture, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+    VertexState,
 };
 
 use crate::camera::{GpuView, View};
@@ -127,8 +132,9 @@ use crate::cull::{CULL_WGSL, SlotBuffers, entry, pipeline, storage_buffer, unifo
 use crate::gpu::{Gpu, GpuError};
 use crate::indices::{self, INDICES_WGSL};
 use crate::lod::{CLUSTER_WGSL, CutList, LodConfig};
+use crate::residency::{CLASSES, SizeClass, SlotLayout};
 use crate::tree::NODE_WGSL;
-use crate::upload::VERTEX_WGSL;
+use crate::upload::{VERTEX_BYTES, VERTEX_WGSL};
 
 mod frame;
 #[cfg(test)]
@@ -266,6 +272,27 @@ const GROUP: u32 = 64;
 /// Storage buffers of group 0 the vertex stage reads: the tree, the clusters, the remap tables
 /// and the stamps.
 const FIXED_STORAGE: u32 = 4;
+
+/// Uniform buffers of group 0 the vertex stage reads: the settings and the view.
+const FIXED_UNIFORMS: u32 = 2;
+
+/// The most slot buffers the raster's one draw can bind beside its own on `gpu`'s device.
+///
+/// That is `max_storage_buffers_per_shader_stage` less its four storage buffers, and on Metal,
+/// whose buffer argument table holds storage and uniform buffers alike, less its two uniform
+/// buffers too.
+#[must_use]
+pub fn slot_buffer_limit(gpu: &Gpu) -> u32 {
+    let shared = if gpu.adapter_info().backend == Backend::Metal {
+        FIXED_UNIFORMS
+    } else {
+        0
+    };
+    gpu.device()
+        .limits()
+        .max_storage_buffers_per_shader_stage
+        .saturating_sub(FIXED_STORAGE + shared)
+}
 
 /// One pixel of the visibility buffer, decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -421,6 +448,16 @@ pub enum RasterError {
         /// The most the device allows.
         limit: u32,
     },
+    /// A draw's slot buffers hold more of a class than the layout the raster was built for.
+    #[error("{buffers} slot buffers of size class {class}, past the {most} the raster binds")]
+    PastLayout {
+        /// The size class.
+        class: u8,
+        /// Its buffers in the draw.
+        buffers: usize,
+        /// The most the layout has.
+        most: u16,
+    },
     /// [`Raster::encode_stamp`] or [`Raster::encode_draw`] before [`Raster::begin_frame`].
     #[error("the raster has no frame begun")]
     NoFrame,
@@ -463,11 +500,11 @@ pub(crate) struct GpuMorphState {
     start: u32,
 }
 
-/// The render pipeline for one set of slot-buffer counts.
+/// The render pipeline, for the most slot buffers each class can have.
 #[derive(Debug)]
 struct SlotPipeline {
     /// Buffers per class it binds.
-    counts: Vec<usize>,
+    layout: SlotLayout,
     /// Group 1's layout: one binding a slot buffer.
     slot_layout: BindGroupLayout,
     /// The pipeline.
@@ -517,13 +554,13 @@ pub struct Raster {
     stamp_layout: BindGroupLayout,
     /// The stamp pass.
     stamp: ComputePipeline,
-    /// The render pipeline for the slot buffers last drawn from.
-    pipeline: Option<SlotPipeline>,
+    /// The render pipeline.
+    pipeline: SlotPipeline,
+    /// A small buffer bound for each slot buffer of the layout not made yet (nothing reads it:
+    /// no slot names it).
+    placeholder: Buffer,
     /// The targets, sized to the last frame's view (1 × 1 before the first).
     targets: Targets,
-    /// Text replacements made in the render pipeline's shader: none outside the tests, whose
-    /// bite checks break a rule on purpose to see a test fail.
-    pub(crate) patches: Vec<(&'static str, &'static str)>,
 }
 
 /// A layout entry for a read-only storage buffer seen by the vertex and compute stages.
@@ -554,17 +591,62 @@ const fn written_entry(binding: u32) -> BindGroupLayoutEntry {
 }
 
 impl Raster {
-    /// The raster for a tile tree of `capacity` nodes, morphing by `config`.
+    /// The raster for a tile tree of `capacity` nodes, morphing by `config`, binding the slot
+    /// buffers of `layout` (residency's, [`crate::residency::Residency::slot_layout`]).
     ///
     /// # Errors
     ///
-    /// [`RasterError::Capacity`] above [`MAX_NODES`]; [`RasterError::Gpu`] if a buffer or
+    /// [`RasterError::Capacity`] above [`MAX_NODES`]; [`RasterError::TooManySlotBuffers`] if
+    /// `layout`'s buffers don't fit [`slot_buffer_limit`]; [`RasterError::Gpu`] if a buffer or
     /// pipeline can't be made.
-    pub fn new(gpu: &Gpu, capacity: u32, config: RasterConfig) -> Result<Self, RasterError> {
+    pub fn new(
+        gpu: &Gpu,
+        capacity: u32,
+        layout: SlotLayout,
+        config: RasterConfig,
+    ) -> Result<Self, RasterError> {
+        Self::build(gpu, capacity, layout, config, &[])
+    }
+
+    /// [`Raster::new`] with text replacements in the render pipeline's shader, for the tests'
+    /// bite checks, which break a rule on purpose to see a test fail.
+    ///
+    /// # Errors
+    ///
+    /// As [`Raster::new`].
+    #[cfg(test)]
+    pub(crate) fn patched(
+        gpu: &Gpu,
+        capacity: u32,
+        layout: SlotLayout,
+        config: RasterConfig,
+        patches: &[(&str, &str)],
+    ) -> Result<Self, RasterError> {
+        Self::build(gpu, capacity, layout, config, patches)
+    }
+
+    /// [`Raster::new`], `patches` made in the shader.
+    ///
+    /// # Errors
+    ///
+    /// As [`Raster::new`].
+    fn build(
+        gpu: &Gpu,
+        capacity: u32,
+        slot_layout: SlotLayout,
+        config: RasterConfig,
+        patches: &[(&str, &str)],
+    ) -> Result<Self, RasterError> {
         if capacity > MAX_NODES {
             return Err(RasterError::Capacity(capacity));
         }
-
+        let limit = slot_buffer_limit(gpu);
+        if slot_layout.total() > limit {
+            return Err(RasterError::TooManySlotBuffers {
+                buffers: slot_layout.total(),
+                limit,
+            });
+        }
         let device = gpu.device();
         let indices = gpu.scoped("cluster indices", || {
             device.create_buffer_init(&BufferInitDescriptor {
@@ -618,6 +700,9 @@ impl Raster {
             &[&stamp_layout],
             "stamp",
         )?;
+        let placeholder = storage_buffer(gpu, "raster slot placeholder", VERTEX_BYTES)?;
+        let source = shader_source(&slot_layout, patches);
+        let slot_pipeline = SlotPipeline::new(gpu, &layout, slot_layout, &source)?;
         Ok(Self {
             capacity,
             config,
@@ -630,9 +715,9 @@ impl Raster {
             layout,
             stamp_layout,
             stamp,
-            pipeline: None,
+            pipeline: slot_pipeline,
+            placeholder,
             targets: Targets::new(gpu, 1, 1)?,
-            patches: Vec::new(),
         })
     }
 
@@ -724,11 +809,11 @@ impl Raster {
     ///
     /// # Errors
     ///
-    /// [`RasterError::NoFrame`] before [`Raster::begin_frame`];
-    /// [`RasterError::TooManySlotBuffers`] if the slot buffers don't fit beside the raster's own;
-    /// [`RasterError::Gpu`] if the pipeline or a bind group can't be made.
+    /// [`RasterError::NoFrame`] before [`Raster::begin_frame`]; [`RasterError::PastLayout`] if
+    /// `draw`'s slot buffers have more of a class than the raster was built for;
+    /// [`RasterError::Gpu`] if a bind group can't be made.
     pub fn encode_draw(
-        &mut self,
+        &self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
         draw: &ClusterDraw<'_>,
@@ -737,12 +822,9 @@ impl Raster {
         if self.frame.is_none() {
             return Err(RasterError::NoFrame);
         }
-        self.prepare_pipeline(gpu, draw.slots)?;
         let targets = &self.targets;
-        let Some(slot_pipeline) = &self.pipeline else {
-            return Err(RasterError::NoFrame);
-        };
-        let (group, slot_group) = self.groups(gpu, draw, slot_pipeline)?;
+        let slot_pipeline = &self.pipeline;
+        let (group, slot_group) = self.groups(gpu, draw)?;
         let clear = phase == Phase::First;
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("raster"),
@@ -786,18 +868,32 @@ impl Raster {
         Ok(())
     }
 
-    /// Group 0 and group 1 of a draw.
+    /// Group 0 and group 1 of a draw: group 1 binds every buffer of the layout, the
+    /// placeholder for each not made yet.
     ///
     /// # Errors
     ///
-    /// As [`Gpu::scoped`].
+    /// [`RasterError::PastLayout`]; as [`Gpu::scoped`].
     fn groups(
         &self,
         gpu: &Gpu,
         draw: &ClusterDraw<'_>,
-        slot_pipeline: &SlotPipeline,
-    ) -> Result<(BindGroup, BindGroup), GpuError> {
+    ) -> Result<(BindGroup, BindGroup), RasterError> {
         let device = gpu.device();
+        let classes = draw.slots.classes();
+        let layout = self.pipeline.layout;
+        let every = (0..CLASSES).filter_map(|c| u8::try_from(c).ok().and_then(SizeClass::new));
+        for class in every {
+            let buffers = classes.get(usize::from(class.get())).map_or(0, Vec::len);
+            let most = layout.buffers(class);
+            if buffers > usize::from(most) {
+                return Err(RasterError::PastLayout {
+                    class: class.get(),
+                    buffers,
+                    most,
+                });
+            }
+        }
         let group = gpu.scoped("raster bind group", || {
             device.create_bind_group(&BindGroupDescriptor {
                 label: Some("raster"),
@@ -812,61 +908,26 @@ impl Raster {
                 ],
             })
         })?;
-        let buffers = draw.slots.classes().iter().flatten();
-        let entries = buffers
+        let bound = layout
+            .per_class()
+            .iter()
+            .enumerate()
+            .flat_map(|(class, &most)| {
+                let made = classes.get(class).map_or(&[][..], Vec::as_slice);
+                (0..usize::from(most)).map(move |b| made.get(b))
+            });
+        let entries = bound
             .zip(0..)
-            .map(|(buffer, binding)| entry(binding, buffer));
+            .map(|(buffer, binding)| entry(binding, buffer.unwrap_or(&self.placeholder)));
         let entries: Vec<BindGroupEntry<'_>> = entries.collect();
         let slot_group = gpu.scoped("raster slot bind group", || {
             device.create_bind_group(&BindGroupDescriptor {
                 label: Some("raster slots"),
-                layout: &slot_pipeline.slot_layout,
+                layout: &self.pipeline.slot_layout,
                 entries: &entries,
             })
         })?;
         Ok((group, slot_group))
-    }
-
-    /// Makes sure the pipeline binds `slots`' buffer counts, rebuilding it if they changed.
-    ///
-    /// # Errors
-    ///
-    /// [`RasterError::TooManySlotBuffers`]; [`RasterError::Gpu`] if the pipeline can't be made.
-    fn prepare_pipeline(&mut self, gpu: &Gpu, slots: &SlotBuffers) -> Result<(), RasterError> {
-        let counts: Vec<usize> = slots.classes().iter().map(Vec::len).collect();
-        if self.pipeline.as_ref().is_some_and(|p| p.counts == counts) {
-            return Ok(());
-        }
-        let buffers = u32::try_from(counts.iter().sum::<usize>()).unwrap_or(u32::MAX);
-        let limit = gpu
-            .device()
-            .limits()
-            .max_storage_buffers_per_shader_stage
-            .saturating_sub(FIXED_STORAGE);
-        if buffers > limit {
-            return Err(RasterError::TooManySlotBuffers { buffers, limit });
-        }
-        let source = self.shader_source(&counts);
-        self.pipeline = Some(SlotPipeline::new(gpu, &self.layout, counts, &source)?);
-        Ok(())
-    }
-
-    /// The render pipeline's shader for `counts` slot buffers a class, with
-    /// [`Raster::patches`] made.
-    ///
-    /// # Panics
-    ///
-    /// If a patch doesn't apply: only the tests make any.
-    fn shader_source(&self, counts: &[usize]) -> String {
-        let source = format!(
-            "{NODE_WGSL}{VERTEX_WGSL}{CULL_WGSL}{CLUSTER_WGSL}\
-             {INDICES_WGSL}{MORPH_WGSL}{}{RASTER_WGSL}",
-            slot_source(counts)
-        );
-        self.patches.iter().fold(source, |source, (from, to)| {
-            assert!(source.contains(from), "the patch {from:?} applies");
-            source.replace(from, to)
-        })
     }
 
     /// The visibility buffer: [`VISIBILITY_FORMAT`], the last begun frame's size (1 × 1 before
@@ -890,7 +951,7 @@ impl Raster {
 }
 
 impl SlotPipeline {
-    /// The pipeline binding `counts[c]` slot buffers of each class `c`, group 0 on `layout`.
+    /// The pipeline binding `slots`' buffers, group 0 on `layout`, from `source`.
     ///
     /// # Errors
     ///
@@ -898,11 +959,11 @@ impl SlotPipeline {
     fn new(
         gpu: &Gpu,
         layout: &BindGroupLayout,
-        counts: Vec<usize>,
+        slots: SlotLayout,
         source: &str,
     ) -> Result<Self, GpuError> {
         let device = gpu.device();
-        let bindings = u32::try_from(counts.iter().sum::<usize>()).unwrap_or(0);
+        let bindings = slots.total();
         let entries = (0..bindings).map(read_entry);
         let entries: Vec<BindGroupLayoutEntry> = entries.collect();
         let slot_layout = gpu.scoped("raster slot layout", || {
@@ -962,7 +1023,7 @@ impl SlotPipeline {
             })
         })?;
         Ok(Self {
-            counts,
+            layout: slots,
             slot_layout,
             pipeline,
             #[cfg(test)]
@@ -971,16 +1032,35 @@ impl SlotPipeline {
     }
 }
 
-/// The generated WGSL of the slot bindings, for `counts[c]` buffers of each class `c`.
+/// The render pipeline's shader for `layout`'s slot buffers, `patches` made (only the tests
+/// make any).
+///
+/// # Panics
+///
+/// If a patch doesn't apply.
+fn shader_source(layout: &SlotLayout, patches: &[(&str, &str)]) -> String {
+    let source = format!(
+        "{NODE_WGSL}{VERTEX_WGSL}{CULL_WGSL}{CLUSTER_WGSL}\
+         {INDICES_WGSL}{MORPH_WGSL}{}{RASTER_WGSL}",
+        slot_source(layout)
+    );
+    patches.iter().fold(source, |source, (from, to)| {
+        assert!(source.contains(from), "the patch {from:?} applies");
+        source.replace(from, to)
+    })
+}
+
+/// The generated WGSL of the slot bindings, for `layout`'s buffers of each class.
 ///
 /// `slots_<class>_<buffer>` at group 1, one binding each in class then buffer order, and
 /// `slot_vertex(size_class, slot_buffer, i)` reading vertex `i` of that buffer (a zeroed vertex
 /// for a buffer not bound).
-fn slot_source(counts: &[usize]) -> String {
-    let buffers = counts
+fn slot_source(layout: &SlotLayout) -> String {
+    let buffers = layout
+        .per_class()
         .iter()
         .enumerate()
-        .flat_map(|(class, &count)| (0..count).map(move |buffer| (class, buffer)));
+        .flat_map(|(class, &count)| (0..usize::from(count)).map(move |buffer| (class, buffer)));
     let buffers: Vec<(usize, usize)> = buffers.collect();
     let declarations = buffers
         .iter()

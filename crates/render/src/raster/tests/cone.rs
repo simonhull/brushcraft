@@ -48,8 +48,13 @@ fn a_tile_culled_by_its_cone_has_no_triangle_facing_the_eye_mid_morph() {
         }
         let mut rng = Rng(17);
         let (mut lod, requests) = level_choice(gpu, &world);
-        let mut raster =
-            Raster::new(gpu, world.tree.capacity(), RasterConfig::default()).expect("the raster");
+        let mut raster = Raster::new(
+            gpu,
+            world.tree.capacity(),
+            world.layout(),
+            RasterConfig::default(),
+        )
+        .expect("the raster");
         let (mut culled_tiles, mut checked) = (0, 0);
         for seed in 0..4 {
             // Moving to a view, then a little closer with the camera taken as still, so the
