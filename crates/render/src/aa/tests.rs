@@ -218,7 +218,7 @@ impl Session {
     /// the tiles it names.
     fn records(&self, gpu: &Gpu) -> Vec<Record> {
         let buffer = self.passes().aa().record().expect("accumulated");
-        let words: Vec<[u32; 3]> = gpu.read_buffer(buffer).expect("read back");
+        let words: Vec<[u32; 4]> = gpu.read_buffer(buffer).expect("read back");
         words.iter().map(|&w| Record::of(w)).collect()
     }
 
@@ -250,7 +250,7 @@ struct Record {
     /// Whether it saw more tiles than it names.
     overflow: bool,
     /// The tiles it names, [`EMPTY`] for none.
-    seen: [u32; 3],
+    seen: [u32; 4],
 }
 
 /// No tile, in a record.
@@ -258,12 +258,17 @@ const EMPTY: u32 = 0xF_FFFF;
 
 impl Record {
     /// The record of `words`.
-    const fn of(words: [u32; 3]) -> Self {
-        let [w0, w1, w2] = words;
+    const fn of(words: [u32; 4]) -> Self {
+        let [w0, w1, w2, w3] = words;
         Self {
             start: w0 & 0x7FFF_FFFF,
             overflow: w0 >> 31 == 1,
-            seen: [w1 & EMPTY, w2 & EMPTY, (w1 >> 20) | ((w2 >> 20) << 12)],
+            seen: [
+                w1 & EMPTY,
+                w2 & EMPTY,
+                w3 & EMPTY,
+                (w1 >> 20) | ((w2 >> 20) << 12),
+            ],
         }
     }
 
@@ -559,33 +564,54 @@ const NAMED_CHECK: (&str, &str) = (
     "reset = reset || false;",
 );
 
-/// What a single changed tile resets in `session` (converged): the tile, and per pixel whether
-/// it reset and whether it should have (its record named the tile, or it overflowed).
-fn change_one_tile(gpu: &Gpu, world: &mut World, session: &mut Session) -> Vec<(bool, bool)> {
+/// What a change made to a converged scene did.
+struct Changed {
+    /// The tile it was made to.
+    tile: u32,
+    /// Every pixel's record before it.
+    before: Vec<Record>,
+    /// Per pixel, whether its history started again with the frame after it.
+    reset: Vec<bool>,
+}
+
+impl Changed {
+    /// Per pixel, whether it reset and whether it should have: its record named the tile, or it
+    /// was crowded.
+    fn against_records(&self) -> Vec<(bool, bool)> {
+        let wanted = self
+            .before
+            .iter()
+            .map(|old| old.names(self.tile) || old.overflow);
+        self.reset.iter().copied().zip(wanted).collect()
+    }
+}
+
+/// Converges `session`, picks a tile (the smallest with at least 100 pixels: a patch with
+/// neighbours all round), makes `change` to it, draws a still frame and reports.
+fn after_change(
+    gpu: &Gpu,
+    world: &mut World,
+    session: &mut Session,
+    change: impl FnOnce(&Gpu, &mut World, u32),
+) -> Changed {
     session.converge(gpu, world);
     let before = session.records(gpu);
     let ids = session.ids(gpu);
     let mut tally: BTreeMap<u32, usize> = BTreeMap::new();
-    for node in ids.iter().filter_map(|&id| node_of(id)) {
+    let nodes = ids.iter().filter_map(|&id| node_of(id));
+    for node in nodes {
         *tally.entry(node).or_default() += 1;
     }
-    // The smallest tile of a fair size: a patch of the frame with neighbours all round.
     let (&tile, _) = tally
         .iter()
         .filter(|&(_, &n)| n >= 100)
         .min_by_key(|&(_, &n)| n)
         .expect("a tile in view");
-    world.restamp(gpu, tile);
-    let update = BoundsUpdate::since(&world.tree, session.generation);
-    assert_eq!(
-        update.nodes().collect::<Vec<_>>(),
-        [tile],
-        "the epoch names it"
-    );
+    change(gpu, world, tile);
     session.draw(gpu, world, false);
     let frame = session.passes().aa().frame();
     let after = session.records(gpu);
-    before
+    let reset = before
         .iter()
         .zip(&after)
         .map(|(old, new)| {
@@ -594,9 +620,23 @@ fn change_one_tile(gpu: &Gpu, world: &mut World, session: &mut Session) -> Vec<(
                 reset || new.start == old.start,
                 "kept or reset, nothing else"
             );
-            (reset, old.names(tile) || old.overflow)
+            reset
         })
-        .collect()
+        .collect();
+    Changed {
+        tile,
+        before,
+        reset,
+    }
+}
+
+/// A new epoch for one tile, its data unchanged: only the bounds update names it.
+fn restamped(gpu: &Gpu, world: &mut World, tile: u32) {
+    let generation = world.tree.generation();
+    world.restamp(gpu, tile);
+    let update = BoundsUpdate::since(&world.tree, generation);
+    let named: Vec<u32> = update.nodes().collect();
+    assert_eq!(named, [tile], "the epoch names it");
 }
 
 #[test]
@@ -604,10 +644,19 @@ fn a_single_changed_tile_resets_only_the_pixels_that_saw_it() {
     GpuTest::run(|gpu| {
         let mut world = World::with_finest(gpu, 4);
         let mut session = Session::new(gpu, &world, EYE, size());
-        let pixels = change_one_tile(gpu, &mut world, &mut session);
+        let changed = after_change(gpu, &mut world, &mut session, restamped);
+        let pixels = changed.against_records();
         let resets = pixels.iter().filter(|&&(reset, _)| reset).count();
         let saw = pixels.iter().filter(|&&(_, wanted)| wanted).count();
-        eprintln!("{resets} reset, {saw} saw the tile, of {}", pixels.len());
+        let crowded = changed.before.iter().filter(|r| r.overflow).count();
+        eprintln!(
+            "{resets} reset, {saw} saw the tile, {crowded} crowded, of {}",
+            pixels.len()
+        );
+        assert_eq!(
+            crowded, 0,
+            "four tiles a record: no pixel of the scene is crowded"
+        );
         assert!(saw > 20, "the tile covers a patch: {saw}");
         assert!(saw < pixels.len() / 4, "and not most of the frame");
         assert!(
@@ -617,7 +666,51 @@ fn a_single_changed_tile_resets_only_the_pixels_that_saw_it() {
         // The bite: ignoring the tiles a record names, pixels at the tile's edge whose sample now
         // sees a neighbour keep stale samples of it.
         session.patch(gpu, &world, &[NAMED_CHECK]);
-        let patched = change_one_tile(gpu, &mut world, &mut session);
+        let patched = after_change(gpu, &mut world, &mut session, restamped).against_records();
+        let missed = patched
+            .iter()
+            .filter(|&&(reset, wanted)| wanted && !reset)
+            .count();
+        assert!(missed > 0, "the check bites");
+    });
+}
+
+/// Records of one tile, as a stand-in to crowd pixels: the second to fourth names never fill.
+const ONE_NAME: [(&str, &str); 3] = [
+    ("} else if seen[1] == EMPTY {", "} else if false {"),
+    ("} else if seen[2] == EMPTY {", "} else if false {"),
+    ("} else if seen[3] == EMPTY {", "} else if false {"),
+];
+
+/// The crowded term of the reset rule, and its stand-in that drops it.
+const CROWDED_CHECK: (&str, &str) = ("(crowded && latest[0] > since)", "false");
+
+#[test]
+fn a_crowded_pixel_resets_on_any_change() {
+    GpuTest::run(|gpu| {
+        let mut world = World::with_finest(gpu, 4);
+        let mut session = Session::new(gpu, &world, EYE, size());
+        // Records naming one tile crowd every pixel that sees two: seams and silhouettes.
+        session.patch(gpu, &world, &ONE_NAME);
+        let changed = after_change(gpu, &mut world, &mut session, restamped);
+        let crowded_elsewhere = changed
+            .before
+            .iter()
+            .filter(|r| r.overflow && !r.names(changed.tile))
+            .count();
+        eprintln!("{crowded_elsewhere} crowded pixels not naming the tile");
+        assert!(crowded_elsewhere > 20, "crowded pixels away from the tile");
+        let pixels = changed.against_records();
+        assert!(
+            pixels.iter().all(|&(reset, wanted)| reset == wanted),
+            "the tile's pixels and every crowded one reset"
+        );
+        // The bite: without the crowded term, a crowded pixel keeps samples of tiles it no longer
+        // names.
+        let mut without_crowded = ONE_NAME.to_vec();
+        without_crowded.push(CROWDED_CHECK);
+        session.patch(gpu, &world, &without_crowded);
+        let patched = after_change(gpu, &mut world, &mut session, restamped).against_records();
         let missed = patched
             .iter()
             .filter(|&&(reset, wanted)| wanted && !reset)

@@ -1,8 +1,8 @@
 // Accumulation's pixel pass (render::aa): each pixel's reset rule, then the frame's sample into
 // its running mean. After aa::PARAMS_WGSL; one invocation a pixel, in 8 × 8 groups.
 //
-// A pixel's history (render::aa, "A pixel's history"): the frame it started in, whether it saw
-// more tiles than it can name, the tiles it saw (up to three), and the mean of its samples, the
+// A pixel's history (render::aa, "The reset rule"): the frame it started in, whether it saw more
+// tiles than it can name, the tiles it saw (up to four), and the mean of its samples, the
 // shading's premultiplied colour and coverage, half floats.
 
 // This frame's visibility buffer, drawn at its jitter.
@@ -15,9 +15,10 @@
 @group(0) @binding(3) var<storage, read> latest: array<u32>;
 // Per pixel, the mean: red and green, blue and coverage, each pair two half floats.
 @group(0) @binding(4) var<storage, read_write> colour: array<vec2<u32>>;
-// Per pixel, three words: the start frame (bits 0..31) and OVERFLOW; the first tile (bits
-// 0..20) and the third's low 12 bits; the second tile (bits 0..20) and the third's high 8 bits.
-@group(0) @binding(5) var<storage, read_write> record: array<u32>;
+// Per pixel, four words (bit ranges inclusive): the start frame (bits 0..30) and OVERFLOW (bit
+// 31); the first tile (bits 0..19) and the fourth's low 12 bits (20..31); the second tile (bits
+// 0..19) and the fourth's high 8 bits (20..27); the third tile (bits 0..19).
+@group(0) @binding(5) var<storage, read_write> record: array<vec4<u32>>;
 // The frame's settings.
 @group(0) @binding(6) var<uniform> params: AaParams;
 
@@ -42,19 +43,17 @@ fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     let node = textureLoad(ids, id.xy, 0).x >> NODE_SHIFT;
     var start = params.frame;
     var overflow = false;
-    var seen = array<u32, 3>(EMPTY, EMPTY, EMPTY);
+    var seen = array<u32, 4>(EMPTY, EMPTY, EMPTY, EMPTY);
     var mean = vec4<f32>(0.0);
     if (params.flags & RESTART) == 0u {
-        let w0 = record[3u * i];
-        let w1 = record[3u * i + 1u];
-        let w2 = record[3u * i + 2u];
-        let since = w0 & ~OVERFLOW;
-        let old = array<u32, 3>(w1 & EMPTY, w2 & EMPTY, (w1 >> 20u) | ((w2 >> 20u) << 12u));
-        let crowded = (w0 & OVERFLOW) != 0u;
+        let w = record[i];
+        let since = w.x & ~OVERFLOW;
+        let old = array<u32, 4>(w.y & EMPTY, w.z & EMPTY, w.w & EMPTY, (w.y >> 20u) | ((w.z >> 20u) << 12u));
+        let crowded = (w.x & OVERFLOW) != 0u;
         // The reset rule: a tile it saw changed, the tile this sample sees changed (it may now
         // cover what the history saw), or, past its record, any tile changed.
         var reset = changed_after(node, since) || (crowded && latest[0] > since);
-        for (var k = 0u; k < 3u; k++) {
+        for (var k = 0u; k < 4u; k++) {
             reset = reset || (old[k] != EMPTY && changed_after(old[k], since));
         }
         if !reset {
@@ -71,19 +70,25 @@ fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     mean += (textureLoad(shaded, id.xy, 0) - mean) / f32(n);
-    if node != EMPTY && seen[0] != node && seen[1] != node && seen[2] != node {
+    let held = seen[0] == node || seen[1] == node || seen[2] == node || seen[3] == node;
+    if node != EMPTY && !held {
         if seen[0] == EMPTY {
             seen[0] = node;
         } else if seen[1] == EMPTY {
             seen[1] = node;
         } else if seen[2] == EMPTY {
             seen[2] = node;
+        } else if seen[3] == EMPTY {
+            seen[3] = node;
         } else {
             overflow = true;
         }
     }
     colour[i] = vec2<u32>(pack2x16float(mean.xy), pack2x16float(mean.zw));
-    record[3u * i] = start | select(0u, OVERFLOW, overflow);
-    record[3u * i + 1u] = seen[0] | ((seen[2] & 0xfffu) << 20u);
-    record[3u * i + 2u] = seen[1] | ((seen[2] >> 12u) << 20u);
+    record[i] = vec4<u32>(
+        start | select(0u, OVERFLOW, overflow),
+        seen[0] | ((seen[3] & 0xfffu) << 20u),
+        seen[1] | ((seen[3] >> 12u) << 20u),
+        seen[2],
+    );
 }

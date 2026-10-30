@@ -39,10 +39,11 @@
 //! edges, its links); and the seam inputs (`e`, parent `e`, morph clock) of its edge neighbours,
 //! which its seam vertices read. Each node gets the latest frame its drawing changed.
 //!
-//! A pixel keeps the frame its history started and the tiles it saw (up to three: a tile corner
-//! under a pixel sees three; past that it is marked crowded). **A pixel resets** when a tile it
-//! saw changed after its start, when the tile this frame's sample sees changed after its start,
-//! or, crowded, when any tile changed after its start.
+//! A pixel keeps the frame its history started and the tiles it saw: up to four, as many as meet
+//! at a valence-4 tile corner, which a pixel holding it sees within a cycle; past that (a corner
+//! of higher valence, or one under a silhouette) it is marked crowded. **A pixel resets** when a
+//! tile it saw changed after its start, when the tile this frame's sample sees changed after its
+//! start, or, crowded, when any tile changed after its start.
 //!
 //! *Why it is enough.* Fix a jitter offset. With every tile's drawing unchanged, the nearest
 //! surface along that offset's ray is the same tile at the same point, so the sample is the same.
@@ -87,11 +88,12 @@
 //!
 //! # Memory
 //!
-//! Per pixel, [`PIXEL_BYTES`] (20): the mean as four half floats (8) and the record (12). At 4K
-//! (3840 × 2160) that is 166 MB (8.3 M pixels; 66 + 100 MB, each buffer under the 128 MiB
-//! default binding limit), at 1080p 41 MB. The tone map reads the mean directly, so there is no
-//! resolved image. Per node of the tile tree, 56 bytes (its key, its change frames, and its
-//! change frame for the pixels).
+//! Per pixel, [`PIXEL_BYTES`] (24): the mean as four half floats (8) and the record (16). At 4K
+//! (3840 × 2160, 8.3 M pixels) that is 199 MB: 66 MB of means and 132.7 MB of records, the
+//! larger just under 128 MiB (134.2 MB), the binding limit of the smallest devices we open (the
+//! device takes the adapter's limits; past them see "When it can't"). At 1080p, 50 MB. The tone map
+//! reads the mean directly, so there is no resolved image. Per node of the tile tree, 56 bytes (its
+//! key, its change frames, and its change frame for the pixels).
 
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
@@ -120,7 +122,7 @@ mod tests;
 /// at 60 Hz they take about half a second.
 pub const SAMPLES: u32 = 32;
 
-/// Bytes per pixel the accumulation keeps: the mean (four half floats) and the record (three
+/// Bytes per pixel the accumulation keeps: the mean (four half floats) and the record (four
 /// words).
 pub const PIXEL_BYTES: u64 = MEAN_BYTES + RECORD_BYTES;
 
@@ -128,7 +130,7 @@ pub const PIXEL_BYTES: u64 = MEAN_BYTES + RECORD_BYTES;
 const MEAN_BYTES: u64 = 8;
 
 /// Bytes per pixel of the record.
-const RECORD_BYTES: u64 = 12;
+const RECORD_BYTES: u64 = 16;
 
 /// Words per node of `aa.wgsl`'s `AaNode`: its key (11) and its two change frames.
 const NODE_WORDS: u64 = 13;
@@ -338,7 +340,7 @@ struct History {
     size: (u32, u32),
     /// Per pixel, the mean: four half floats.
     mean: Buffer,
-    /// Per pixel, the record: three words.
+    /// Per pixel, the record: four words.
     record: Buffer,
 }
 
@@ -552,7 +554,7 @@ impl Accumulation {
         self.history.as_ref().map(|history| &history.mean)
     }
 
-    /// The per-pixel records, three words a pixel (`aa_pixels.wgsl`), for the tests.
+    /// The per-pixel records, four words a pixel (`aa_pixels.wgsl`), for the tests.
     #[cfg(test)]
     pub(crate) fn record(&self) -> Option<&Buffer> {
         self.history.as_ref().map(|history| &history.record)
@@ -746,6 +748,6 @@ fn new_history(gpu: &Gpu, size: (u32, u32), limit: u64) -> Result<History, AaErr
     Ok(History {
         size,
         mean: storage_buffer(gpu, "aa means", (pixels * MEAN_BYTES).max(8))?,
-        record: storage_buffer(gpu, "aa records", (pixels * RECORD_BYTES).max(12))?,
+        record: storage_buffer(gpu, "aa records", (pixels * RECORD_BYTES).max(RECORD_BYTES))?,
     })
 }
