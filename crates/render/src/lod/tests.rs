@@ -371,29 +371,38 @@ fn maybe_outside(scene: &Scene, view: &View, place: Place) -> bool {
 /// Neighbours in the cut are at most one level apart across every edge.
 ///
 /// Given the `view` whose off-screen seams are exempt, a seam is skipped where a tile of it
-/// (either side, their parents, the finer side's edge children) might lie outside its frustum.
+/// (either side, their parents, the finer side's edge children, the cut's tile across and the
+/// finer side's ancestors down to its level) might lie outside its frustum.
 fn check_neighbours(scene: &Scene, output: &LodOutput, view: Option<&View>) {
     let cut = places(output);
     let topology = scene.mesh.topology();
     for &c in &cut {
         for (edge, m) in c.neighbours(topology).into_iter().enumerate() {
             let Some(m) = m else { continue };
-            if let Some(view) = view {
-                let involved = [Some(c), c.parent(), Some(m), m.parent()]
-                    .into_iter()
-                    .flatten()
-                    .chain(m.children().into_iter().flatten());
-                let mut involved = involved;
-                if involved.any(|place| maybe_outside(scene, view, place)) {
-                    continue;
-                }
-            }
             let mut covering = Some(m);
             while let Some(p) = covering {
                 if cut.contains(&p) {
                     break;
                 }
                 covering = p.parent();
+            }
+            if let Some(view) = view {
+                // The tile of the cut across, and c's ancestors down to its level: a seam is
+                // judged at its coarser side's level.
+                let coarser_side = covering.into_iter().chain(
+                    std::iter::successors(c.parent(), |p| p.parent()).take_while(|p| {
+                        covering.is_some_and(|q| p.level().get() >= q.level().get())
+                    }),
+                );
+                let involved = [Some(c), c.parent(), Some(m), m.parent()]
+                    .into_iter()
+                    .flatten()
+                    .chain(m.children().into_iter().flatten())
+                    .chain(coarser_side);
+                let mut involved = involved;
+                if involved.any(|place| maybe_outside(scene, view, place)) {
+                    continue;
+                }
             }
             if let Some(p) = covering {
                 assert!(
@@ -587,6 +596,71 @@ fn seams_off_the_screen_are_exempt_from_the_neighbour_rule_and_save_triangles() 
             saved += all.stats.cut_triangles - some.stats.cut_triangles;
         }
         assert!(saved > 0, "the exemption saves triangles somewhere");
+    });
+}
+
+#[test]
+fn a_tile_whose_neighbour_is_absent_under_an_off_screen_parent_is_still_refined() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let finest = level(8);
+        // Close to the surface, looking along it: the frustum's sides cross the sphere.
+        let eye = Vec3::new(0.2, 1.05, 0.1);
+        let view = look(eye, eye + Vec3::new(1.0, -0.2, 0.3));
+        let frustum = view.gpu();
+        let error = 0.3;
+        // Residency as requests leave it: a tile's children are resident only if it is in view,
+        // so a tile on the screen can have its neighbour across an edge absent, that neighbour's
+        // parent outside the frustum.
+        let in_view = |place: Place| {
+            let (data, side) = vertices(&mesh, place, finest);
+            let b = bounds_of(&data, side);
+            in_frustum(&frustum, b.center, b.radius + error * b.quad_edge)
+        };
+        let mut resident: BTreeSet<Place> = BTreeSet::new();
+        for place in all_places(&mesh, finest) {
+            let keep = place
+                .parent()
+                .is_none_or(|parent| resident.contains(&parent) && in_view(parent));
+            if keep {
+                resident.insert(place);
+            }
+        }
+        let topology = mesh.topology();
+        let held_apart = resident.iter().any(|&place| {
+            let absent = place
+                .neighbours(topology)
+                .into_iter()
+                .flatten()
+                .filter(|m| !resident.contains(m));
+            let mut absent = absent;
+            in_view(place) && absent.any(|m| m.parent().is_some_and(|p| !in_view(p)))
+        });
+        assert!(
+            held_apart,
+            "some tile in view has an absent neighbour under an off-screen parent"
+        );
+        let mut scene = Scene::new(
+            gpu,
+            mesh,
+            finest,
+            |place| resident.contains(&place),
+            |_| error,
+        );
+        let config = LodConfig::default()
+            .with_relax_passes(MAX_RELAX_PASSES)
+            .expect("valid");
+        let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+        let requests = request_buffer(gpu, 4096);
+        // Twice: the second frame sees the first's choice as its memory, as a still camera does.
+        for _ in 0..2 {
+            let output = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
+            check_partition(&scene, &output);
+            check_neighbours(&scene, &output, Some(&view));
+            assert_eq!(output.stats.over_pixel, 0, "{:?}", output.stats);
+            assert_eq!(output.stats.shortfall, 0, "{:?}", output.stats);
+            assert_eq!(output.stats.held_by_neighbours, 0, "{:?}", output.stats);
+        }
     });
 }
 

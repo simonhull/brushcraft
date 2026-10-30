@@ -359,13 +359,35 @@ fn edge_refined(m: u32, edge: u32, bit: u32) -> bool {
     return (a != NONE && (flags_of(a) & bit) != 0u) || (b != NONE && (flags_of(b) & bit) != 0u);
 }
 
-// Whether the seam between node `n` and node `m` (NONE: not resident) is exempt from the
-// neighbour rule: either side lies outside the frustum, so the edge they share is off-screen.
-fn offscreen_seam(n: u32, m: u32) -> bool {
+// Whether the seam across edge `k` of node `n` (reached by `bit`) is exempt from the neighbour
+// rule: off the screen, judged at the level of its coarser side. That side is the tile of the
+// cut across the edge: n's neighbour at its level if reached, else the neighbour at the first
+// coarser level that is (n's edge k lies on its ancestors' edge k: a neighbour that isn't
+// reached isn't a sibling, the parent being refined, so complete). The seam is off the screen
+// when that tile or n's ancestor at its level lies outside the frustum. Relax (violates, from
+// the coarser side) and the sweep (from the finer side) both judge a seam by this, so they
+// agree: a seam the relaxation leaves two levels apart because it is off the screen, the sweep
+// keeps, and one the sweep would take back, the relaxation raises or requests.
+fn offscreen_seam(n: u32, k: u32, bit: u32) -> bool {
     if (params.options & OPTION_OFFSCREEN_SEAMS) == 0u {
         return false;
     }
-    return (flags_of(n) & W_OUTSIDE) != 0u || (m != NONE && (flags_of(m) & W_OUTSIDE) != 0u);
+    var near = n;
+    var far = tree[n].neighbours[k];
+    // At most one step per level: level 0 is always reached (the pinned floor).
+    for (var guard = 0u; guard < 16u; guard++) {
+        if far != NONE && reached(far, bit) {
+            break;
+        }
+        let up = tree[near].parent;
+        if up == NONE {
+            break;
+        }
+        near = up;
+        far = tree[near].neighbours[k];
+    }
+    return (flags_of(near) & W_OUTSIDE) != 0u
+        || (far != NONE && (flags_of(far) & W_OUTSIDE) != 0u);
 }
 
 // Whether node `n`, in the cut by `bit`, touches an area two levels finer: a neighbour at its
@@ -377,7 +399,7 @@ fn violates(n: u32, bit: u32) -> bool {
             continue;
         }
         let m = tree[n].neighbours[k];
-        if m == NONE || (flags_of(m) & bit) == 0u || offscreen_seam(n, m) {
+        if m == NONE || (flags_of(m) & bit) == 0u || offscreen_seam(n, k, bit) {
             continue;
         }
         for (var back = 0u; back < 4u; back++) {
@@ -753,7 +775,7 @@ fn sweep(@builtin(global_invocation_id) id: vec3<u32>) {
             continue;
         }
         let m = tree[n].neighbours[k];
-        if (m == NONE || !reached_final(m)) && !offscreen_seam(n, m) {
+        if (m == NONE || !reached_final(m)) && !offscreen_seam(n, k, W_FINAL) {
             ok = false;
         }
     }

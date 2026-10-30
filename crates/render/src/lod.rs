@@ -37,7 +37,10 @@
 //!   ([`LodStats::shortfall`]). The rule is for seams between drawn tiles: a seam where either tile
 //!   lies outside the frustum (by the sphere of what it draws) is off-screen and exempt
 //!   ([`LodConfig::with_offscreen_seams`]); a tile culled by its cone is not, its seams may be on
-//!   the silhouette.
+//!   the silhouette. A seam is judged at the level of its coarser side: the cut's tile across it,
+//!   and the finer side's ancestor at that level. The passes (from the coarser side) and the sweep
+//!   (from the finer side, where the neighbour at its own level may not even be resident) judge it
+//!   alike, so the sweep never takes back a refinement the passes left alone as off-screen.
 //! - **Requests.** A tile in the cut that wants refining and lacks children requests them, with its
 //!   screen error, in residency's request buffer ([`crate::residency::REQUESTS_WGSL`]).
 //!
