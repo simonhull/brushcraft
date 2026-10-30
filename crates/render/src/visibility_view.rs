@@ -1,5 +1,5 @@
-//! The visibility buffer shown as colours: the frame's debug view of the scene until shading
-//! (M1a3 Task 5) replaces it.
+//! The visibility buffer shown as colours: the frame's debug view of the scene
+//! ([`crate::SceneView::Clusters`]), in place of the shaded image.
 //!
 //! A fullscreen pass (`visibility_view.wgsl`) reads each pixel's [`crate::raster::VisibilityId`]
 //! and colours it by its cluster, hashed, so every cluster the raster drew shows as a patch of its

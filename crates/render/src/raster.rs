@@ -89,7 +89,7 @@
 //!
 //! # For the shading pass
 //!
-//! The shading pass rebuilds the triangles drawn at each pixel from its
+//! The shading pass ([`crate::shade`]) rebuilds the triangles drawn at each pixel from its
 //! [`VisibilityId`], which names the node, the cluster and the quad, but not what else placed the
 //! quad's corners: the cluster's edge variant and finer edges, and the morph. Both come from
 //! buffers the raster keeps per node, read with the same code the vertex shader runs
@@ -168,8 +168,8 @@ const RASTER_WGSL: &str = include_str!("raster.wgsl");
 
 /// Where a cluster vertex is drawn: the geomorph.
 ///
-/// Shared by the raster's vertex shader and the shading pass, so what is shaded is what was
-/// drawn. After the declarations [`RASTER_WGSL`] lists; the including shader
+/// Shared by the raster's vertex shader and the shading pass ([`crate::shade`]), so what is
+/// shaded is what was drawn. After the declarations [`RASTER_WGSL`] lists; the including shader
 /// declares the globals it reads.
 pub(crate) const PLACE_WGSL: &str = include_str!("place.wgsl");
 
@@ -178,7 +178,7 @@ const STAMP_WGSL: &str = include_str!("morph.wgsl");
 
 /// The WGSL declarations the raster and its stamp pass share: `RasterParams`
 /// ([`GpuRasterParams`]), `MorphState` ([`GpuMorphState`]) and `MOVING`.
-const MORPH_WGSL: &str = r"
+pub(crate) const MORPH_WGSL: &str = r"
 // The raster's frame settings (render::raster::GpuRasterParams): 32 bytes.
 struct RasterParams {
     // The frame's number: stamps of this frame are this, of the last one this minus one.
@@ -303,22 +303,25 @@ const FIXED_STORAGE: u32 = 4;
 /// Uniform buffers of group 0 the vertex stage reads: the settings and the view.
 const FIXED_UNIFORMS: u32 = 2;
 
-/// The most slot buffers the raster's one draw can bind beside its own on `gpu`'s device.
+/// The most slot buffers the raster's one draw, and the shading pass, can bind beside their own
+/// on `gpu`'s device.
 ///
-/// That is `max_storage_buffers_per_shader_stage` less its four storage buffers, and on Metal,
-/// whose buffer argument table holds storage and uniform buffers alike, less its two uniform
-/// buffers too.
+/// That is `max_storage_buffers_per_shader_stage` less the larger of the two passes' storage
+/// buffers (four each), and on Metal, whose buffer argument table holds storage and uniform
+/// buffers alike, less the larger of their uniform buffers too (the raster's two, the shading
+/// pass's four with its material's).
 #[must_use]
 pub fn slot_buffer_limit(gpu: &Gpu) -> u32 {
     let shared = if gpu.adapter_info().backend == Backend::Metal {
-        FIXED_UNIFORMS
+        FIXED_UNIFORMS.max(crate::shade::FIXED_UNIFORMS)
     } else {
         0
     };
+    let storage = FIXED_STORAGE.max(crate::shade::FIXED_STORAGE);
     gpu.device()
         .limits()
         .max_storage_buffers_per_shader_stage
-        .saturating_sub(FIXED_STORAGE + shared)
+        .saturating_sub(storage + shared)
 }
 
 /// One pixel of the visibility buffer, decoded.
@@ -531,6 +534,22 @@ pub(crate) struct GpuMorphState {
     frame: u32,
     /// When it came in, milliseconds.
     start: u32,
+}
+
+/// The raster's buffers [`PLACE_WGSL`] reads beside the tile tree and the slots, as the last
+/// frame drawn left them: the shading pass binds them to place each vertex where it was drawn.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Placing<'a> {
+    /// The edge variants' remap tables.
+    pub(crate) remap: &'a Buffer,
+    /// Per node, [`GpuMorphState`].
+    pub(crate) stamps: &'a Buffer,
+    /// Per node, its [`crate::lod::DrawnEdges`].
+    pub(crate) drawn_edges: &'a Buffer,
+    /// [`GpuRasterParams`].
+    pub(crate) params: &'a Buffer,
+    /// The frame's [`GpuView`].
+    pub(crate) view: &'a Buffer,
 }
 
 /// The render pipeline, for the most slot buffers each class can have.
@@ -921,20 +940,13 @@ impl Raster {
         draw: &ClusterDraw<'_>,
     ) -> Result<(BindGroup, BindGroup), RasterError> {
         let device = gpu.device();
-        let classes = draw.slots.classes();
-        let layout = self.pipeline.layout;
-        let every = (0..CLASSES).filter_map(|c| u8::try_from(c).ok().and_then(SizeClass::new));
-        for class in every {
-            let buffers = classes.get(usize::from(class.get())).map_or(0, Vec::len);
-            let most = layout.buffers(class);
-            if buffers > usize::from(most) {
-                return Err(RasterError::PastLayout {
-                    class: class.get(),
-                    buffers,
-                    most,
-                });
-            }
-        }
+        let slot_group = slot_group(
+            gpu,
+            &self.pipeline.slot_layout,
+            self.pipeline.layout,
+            draw.slots,
+            &self.placeholder,
+        )?;
         let group = gpu.scoped("raster bind group", || {
             device.create_bind_group(&BindGroupDescriptor {
                 label: Some("raster"),
@@ -949,26 +961,19 @@ impl Raster {
                 ],
             })
         })?;
-        let bound = layout
-            .per_class()
-            .iter()
-            .enumerate()
-            .flat_map(|(class, &most)| {
-                let made = classes.get(class).map_or(&[][..], Vec::as_slice);
-                (0..usize::from(most)).map(move |b| made.get(b))
-            });
-        let entries = bound
-            .zip(0..)
-            .map(|(buffer, binding)| entry(binding, buffer.unwrap_or(&self.placeholder)));
-        let entries: Vec<BindGroupEntry<'_>> = entries.collect();
-        let slot_group = gpu.scoped("raster slot bind group", || {
-            device.create_bind_group(&BindGroupDescriptor {
-                label: Some("raster slots"),
-                layout: &self.pipeline.slot_layout,
-                entries: &entries,
-            })
-        })?;
         Ok((group, slot_group))
+    }
+
+    /// What the shading pass reads of the last frame drawn to rebuild its triangles: the remap
+    /// tables, the stamps, the drawn edges, the frame's settings and its view.
+    pub(crate) const fn placing(&self) -> Placing<'_> {
+        Placing {
+            remap: &self.remap,
+            stamps: &self.stamps,
+            drawn_edges: &self.drawn_edges,
+            params: &self.params,
+            view: &self.view,
+        }
     }
 
     /// The visibility buffer: [`VISIBILITY_FORMAT`], the last begun frame's size (1 × 1 before
@@ -1118,6 +1123,55 @@ impl SlotPipeline {
     }
 }
 
+/// The bind group of `slots` for a pass whose slot bindings (`bind_layout`, generated by
+/// [`slot_source`]) are those of `layout`: every buffer of the layout, `placeholder` for each not
+/// made yet.
+///
+/// # Errors
+///
+/// [`RasterError::PastLayout`] if `slots` hold more buffers of a class than `layout`; as
+/// [`Gpu::scoped`].
+pub(crate) fn slot_group(
+    gpu: &Gpu,
+    bind_layout: &BindGroupLayout,
+    layout: SlotLayout,
+    slots: &SlotBuffers,
+    placeholder: &Buffer,
+) -> Result<BindGroup, RasterError> {
+    let classes = slots.classes();
+    let every = (0..CLASSES).filter_map(|c| u8::try_from(c).ok().and_then(SizeClass::new));
+    for class in every {
+        let buffers = classes.get(usize::from(class.get())).map_or(0, Vec::len);
+        let most = layout.buffers(class);
+        if buffers > usize::from(most) {
+            return Err(RasterError::PastLayout {
+                class: class.get(),
+                buffers,
+                most,
+            });
+        }
+    }
+    let bound = layout
+        .per_class()
+        .iter()
+        .enumerate()
+        .flat_map(|(class, &most)| {
+            let made = classes.get(class).map_or(&[][..], Vec::as_slice);
+            (0..usize::from(most)).map(move |b| made.get(b))
+        });
+    let entries = bound
+        .zip(0..)
+        .map(|(buffer, binding)| entry(binding, buffer.unwrap_or(placeholder)));
+    let entries: Vec<BindGroupEntry<'_>> = entries.collect();
+    Ok(gpu.scoped("slot bind group", || {
+        gpu.device().create_bind_group(&BindGroupDescriptor {
+            label: Some("slots"),
+            layout: bind_layout,
+            entries: &entries,
+        })
+    })?)
+}
+
 /// The render pipeline's shader for `layout`'s slot buffers, `patches` made (only the tests
 /// make any).
 ///
@@ -1141,7 +1195,7 @@ fn shader_source(layout: &SlotLayout, patches: &[(&str, &str)]) -> String {
 /// `slots_<class>_<buffer>` at group 1, one binding each in class then buffer order, and
 /// `slot_vertex(size_class, slot_buffer, i)` reading vertex `i` of that buffer (a zeroed vertex
 /// for a buffer not bound).
-fn slot_source(layout: &SlotLayout) -> String {
+pub(crate) fn slot_source(layout: &SlotLayout) -> String {
     let buffers = layout
         .per_class()
         .iter()

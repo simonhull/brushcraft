@@ -568,6 +568,12 @@ pub(crate) fn random_view(rng: &mut Rng, distances: (f32, f32)) -> (View, f64) {
     }
 }
 
+/// Every tile at level `l`: a cut of one level.
+pub(crate) fn level_cut(world: &World, l: u8) -> BTreeSet<Place> {
+    let tiles = world.tiles.keys().filter(|p| p.level().get() == l);
+    tiles.copied().collect()
+}
+
 /// Every finest tile, the reference cut.
 pub(crate) fn finest_cut(world: &World) -> BTreeSet<Place> {
     let finest = world.tiles.keys().filter(|p| p.level() == world.finest);
@@ -1189,7 +1195,9 @@ fn the_stamp_pass_keeps_each_drawn_tile_s_edges_and_they_give_back_its_clusters(
                 &frame,
                 seed == 0,
             );
-            let kept: Vec<u32> = gpu.read_buffer(&raster.drawn_edges).expect("read back");
+            let kept: Vec<u32> = gpu
+                .read_buffer(raster.placing().drawn_edges)
+                .expect("read back");
             for cluster in &clusters {
                 let bits = kept[usize::try_from(cluster.node).expect("small")];
                 let edges = DrawnEdges::new(
@@ -1959,9 +1967,15 @@ fn a_frame_draws_both_phases_lists_watertight_the_second_drawing_what_the_first_
             ..Thresholds::SPEC
         };
         let config = LodConfig::default().with_thresholds(thresholds);
-        let mut passes =
-            FramePasses::new(gpu, world.tree.capacity(), world.layout(), config, MORPH)
-                .expect("the passes");
+        let mut passes = FramePasses::new(
+            gpu,
+            world.tree.capacity(),
+            world.layout(),
+            config,
+            MORPH,
+            crate::shade::ShadePath::Compute,
+        )
+        .expect("the passes");
         // A half turn between frames (a flick): what comes into view was behind the sphere in
         // the previous frame's depth, so the first phase hides it and the second draws it.
         let look = |eye: Vec3| {

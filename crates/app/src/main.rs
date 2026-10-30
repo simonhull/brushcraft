@@ -6,9 +6,10 @@
 //! ([`render_thread`]), which encodes the uploads and the passes, submits and presents them,
 //! while the main thread runs the store's jobs. Frames are made only when something asks for
 //! one ([`frame::schedule`]). A frame draws the project's surface: the level choice picks the
-//! resident tiles to draw, the raster draws their clusters into a visibility buffer, shown as a
-//! colour per cluster (a debug view until shading) under the debug overlay ([`overlay`]); the
-//! camera orbits, pans and zooms with the mouse and the pen ([`navigate`], [`camera`]).
+//! resident tiles to draw, the raster draws their clusters into a visibility buffer, and the
+//! shading pass shades it through a MatCap into a linear HDR image, tone mapped, under the debug
+//! overlay ([`overlay`]); the camera orbits, pans and zooms with the mouse and the pen
+//! ([`navigate`], [`camera`]).
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and

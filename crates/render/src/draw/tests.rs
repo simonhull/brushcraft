@@ -16,6 +16,7 @@ use crate::overlay::MARGIN;
 use crate::raster::tests::World;
 use crate::raster::{BACKGROUND, MORPH, VisibilityId};
 use crate::residency::{REQUEST_HEADER, Residency, ResidencyConfig};
+use crate::shade::ShadePath;
 use crate::surface::Offscreen;
 use crate::upload::{GpuVertex, TileData, TileDetail, TileSource};
 
@@ -59,7 +60,8 @@ fn draw(gpu: &Gpu, size: Size, overlay: Option<&TextImage>, scale: u32) -> (Draw
         clear: CLEAR,
         overlay,
         overlay_scale: scale,
-        scene: None,
+        scene: Scene::None,
+        look: Look::default(),
     };
     let drawn = renderer
         .draw(gpu, &mut target, &inputs, None, || called = true)
@@ -185,7 +187,8 @@ fn a_frames_uploads_go_in_its_submission_before_the_passes() {
             clear: CLEAR,
             overlay: None,
             overlay_scale: 1,
-            scene: None,
+            scene: Scene::None,
+            look: Look::default(),
         };
         let drawn = renderer
             .draw(gpu, &mut target, &inputs, Some(uploads), || {})
@@ -221,6 +224,15 @@ fn a_text_image_holds_exactly_its_texels() {
     assert_eq!(image.texel(3, 0), None, "outside");
 }
 
+/// The debug view's look.
+const CLUSTERS: Look = Look {
+    view: SceneView::Clusters,
+    shading: ShadeSettings {
+        style: crate::material::MatCapStyle::Clay,
+        wireframe: false,
+    },
+};
+
 /// What [`draw_scene`] drew: the frame's pixels, its visibility buffer and its cut read back.
 struct SceneFrame {
     /// The frame, as the target holds it.
@@ -231,17 +243,21 @@ struct SceneFrame {
     cut: LodOutput,
     /// Whether the renderer says it drew the scene.
     drawn: bool,
+    /// The renderer, to draw more frames with.
+    renderer: Renderer,
+    /// The target.
+    target: Target,
 }
 
 /// Draws `world` seen from `eye` into a fresh offscreen target of `size` with a fresh renderer,
-/// the camera still at `time`, as frame `frame`, and reads it all back.
+/// the camera still at `time`, as frame `frame`, shown as `look` says, and reads it all back.
 fn draw_scene(
     gpu: &Gpu,
     world: &World,
     size: Size,
     eye: Vec3,
-    time: Duration,
-    frame: u64,
+    (time, frame): (Duration, u64),
+    look: Look,
 ) -> SceneFrame {
     let mut target = Target::Offscreen(Offscreen::new(gpu, size).expect("target"));
     let mut renderer = Renderer::new(gpu, target.format()).expect("renderer");
@@ -251,6 +267,7 @@ fn draw_scene(
         world.layout(),
         LodConfig::default(),
         MORPH,
+        ShadePath::Compute,
     )
     .expect("the scene's passes");
     let reader = passes.lod_mut().take_reader().expect("the reader");
@@ -287,7 +304,8 @@ fn draw_scene(
         clear: CLEAR,
         overlay: None,
         overlay_scale: 1,
-        scene: Some(&scene),
+        scene: Scene::Draw(&scene),
+        look,
     };
     let drawn = renderer
         .draw(gpu, &mut target, &inputs, None, || {})
@@ -305,15 +323,80 @@ fn draw_scene(
         .raster()
         .read_visibility(gpu)
         .expect("read back");
-    let Target::Offscreen(offscreen) = &target else {
-        unreachable!("made offscreen");
-    };
     SceneFrame {
-        pixels: offscreen.read_pixels(gpu).expect("read back"),
+        pixels: pixels(gpu, &target),
         ids,
         cut,
         drawn: drawn.scene,
+        renderer,
+        target,
     }
+}
+
+/// The pixels of `target`, an offscreen one.
+fn pixels(gpu: &Gpu, target: &Target) -> Vec<[u8; 4]> {
+    let Target::Offscreen(offscreen) = target else {
+        unreachable!("made offscreen");
+    };
+    offscreen.read_pixels(gpu).expect("read back")
+}
+
+/// `look` with the MatCap's `style`.
+const fn styled(style: crate::material::MatCapStyle) -> Look {
+    Look {
+        view: SceneView::Shaded,
+        shading: ShadeSettings {
+            style,
+            wireframe: false,
+        },
+    }
+}
+
+#[test]
+fn a_frame_shading_the_last_scene_again_shows_it_in_the_new_look_without_drawing_it() {
+    use crate::material::MatCapStyle;
+    GpuTest::run(|gpu| {
+        let world = World::with_finest(gpu, 4);
+        let size = Size::new(96, 64).expect("non-zero");
+        let eye = Vec3::new(0.4, 0.3, 2.6);
+        let at = (Duration::from_secs(1), 3);
+        let mut clay = draw_scene(gpu, &world, size, eye, at, styled(MatCapStyle::Clay));
+        let glossy = draw_scene(gpu, &world, size, eye, at, styled(MatCapStyle::Glossy));
+        assert_ne!(clay.pixels, glossy.pixels, "the styles differ");
+        let again = |frame: &mut SceneFrame, at_size: Size, look: Look| {
+            let inputs = FrameInputs {
+                size: at_size,
+                clear: CLEAR,
+                overlay: None,
+                overlay_scale: 1,
+                scene: Scene::Reshade,
+                look,
+            };
+            let drawn = frame
+                .renderer
+                .draw(gpu, &mut frame.target, &inputs, None, || {})
+                .expect("drawn");
+            gpu.device()
+                .poll(PollType::wait_indefinitely())
+                .expect("the GPU finishes");
+            drawn
+        };
+        let drawn = again(&mut clay, size, styled(MatCapStyle::Glossy));
+        assert!(!drawn.scene, "no level choice or raster");
+        assert!(drawn.shown, "the scene shown");
+        assert_eq!(
+            pixels(gpu, &clay.target),
+            glossy.pixels,
+            "as if drawn whole in the new look"
+        );
+        // At another size there is nothing to shade again: the clear colour alone.
+        let other = Size::new(64, 48).expect("non-zero");
+        let resized = again(&mut clay, other, styled(MatCapStyle::Pale));
+        assert!(!resized.shown, "nothing shown");
+        let clear = [srgb(CLEAR.r), srgb(CLEAR.g), srgb(CLEAR.b), 255];
+        let image = pixels(gpu, &clay.target);
+        assert!(image.iter().all(|&p| near(p, clear)), "the clear colour");
+    });
 }
 
 #[test]
@@ -322,7 +405,14 @@ fn a_frames_scene_is_drawn_into_the_visibility_buffer_and_shown_in_colours() {
         let world = World::with_finest(gpu, 4);
         let size = Size::new(96, 64).expect("non-zero");
         let eye = Vec3::new(0.4, 0.3, 2.6);
-        let frame = draw_scene(gpu, &world, size, eye, Duration::from_secs(1), 7);
+        let frame = draw_scene(
+            gpu,
+            &world,
+            size,
+            eye,
+            (Duration::from_secs(1), 7),
+            CLUSTERS,
+        );
         assert!(frame.drawn, "the renderer drew the scene");
         assert_eq!(frame.cut.frame, 7, "the readback says which frame it is of");
         assert!(!frame.cut.cut.is_empty(), "the cut came back");
@@ -363,8 +453,8 @@ fn the_same_scene_at_the_same_time_draws_the_same_frame() {
         let size = Size::new(96, 64).expect("non-zero");
         let eye = Vec3::new(-0.5, 0.8, 2.2);
         let time = Duration::from_millis(1234);
-        let first = draw_scene(gpu, &world, size, eye, time, 1);
-        let second = draw_scene(gpu, &world, size, eye, time, 1);
+        let first = draw_scene(gpu, &world, size, eye, (time, 1), Look::default());
+        let second = draw_scene(gpu, &world, size, eye, (time, 1), Look::default());
         assert!(first.ids.iter().any(|&id| id != BACKGROUND));
         assert_eq!(first.ids, second.ids, "the visibility buffers agree");
         assert_eq!(first.pixels, second.pixels, "and so do the frames");

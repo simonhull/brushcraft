@@ -7,11 +7,15 @@
 //! 1. the scene's, when the frame has one and the renderer has its [`FramePasses`]
 //!    ([`Renderer::set_passes`]): the bounds of the tiles whose data changed, the level choice and
 //!    the raster into the visibility buffer, and the cut's readback;
-//! 2. the target cleared to the frame's colour, with the visibility buffer shown over it as colours
-//!    ([`crate::visibility_view`], a debug view until shading);
-//! 3. the overlay ([`crate::overlay`]), always last.
+//! 2. the shading pass ([`crate::shade`]), shading the visibility buffer into the linear HDR image;
+//!    a frame whose scene is unchanged and whose shading isn't ([`Scene::Reshade`]: a material or
+//!    wireframe change) runs this pass alone, with no level choice or raster;
+//! 3. the target cleared to the frame's colour, with the scene shown over it: the shaded image tone
+//!    mapped ([`crate::tone`]), or, as a debug view ([`SceneView::Clusters`]), the visibility
+//!    buffer as a colour per cluster ([`crate::visibility_view`]);
+//! 4. the overlay ([`crate::overlay`]), always last.
 //!
-//! Shading and anti-aliasing (M1a3's later tasks) take the debug view's place.
+//! Anti-aliasing (M1a3 Task 6) goes between the shading and the tone map.
 
 use std::time::{Duration, Instant};
 
@@ -25,7 +29,9 @@ use crate::gpu::{Gpu, GpuError};
 use crate::lod::CutReadback;
 use crate::overlay::{OverlayPass, TextImage};
 use crate::raster::{FrameError, FramePasses, SceneInputs};
+use crate::shade::ShadeSettings;
 use crate::surface::{Acquired, Size, SurfaceError, Target};
+use crate::tone::ToneMap;
 use crate::upload::FrameUploads;
 use crate::visibility_view::VisibilityView;
 
@@ -44,9 +50,45 @@ pub struct FrameInputs<'a> {
     pub overlay: Option<&'a TextImage>,
     /// Frame pixels per overlay texel: the window's scale factor, rounded, at least 1.
     pub overlay_scale: u32,
-    /// The scene: the tiles the frame draws, its view (of the frame's size) and its time.
-    /// `None`, or a renderer without [`FramePasses`], draws no scene.
-    pub scene: Option<&'a SceneInputs<'a>>,
+    /// The scene: drawn, shaded again as it was, or none. A renderer without [`FramePasses`]
+    /// draws none.
+    pub scene: Scene<'a>,
+    /// How the scene is shown.
+    pub look: Look,
+}
+
+/// What a frame does with the scene.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum Scene<'a> {
+    /// No scene: the clear colour and the overlay.
+    #[default]
+    None,
+    /// Draws it: the tiles the frame draws, its view (of the frame's size) and its time.
+    Draw(&'a SceneInputs<'a>),
+    /// Shows the last scene drawn again, shaded with this frame's [`Look`]: the shading pass
+    /// alone, no level choice or raster, for a change of material or wireframe with nothing else
+    /// changed (spec target: a shading pass only, independent of the mesh). Shows no scene if the
+    /// last one drawn was of another size than the frame, or there was none.
+    Reshade,
+}
+
+/// How the scene is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Look {
+    /// Shaded, or the debug view.
+    pub view: SceneView,
+    /// The shading's settings: the MatCap's style and the wireframe.
+    pub shading: ShadeSettings,
+}
+
+/// Which image of the scene a frame shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SceneView {
+    /// The shaded image, tone mapped.
+    #[default]
+    Shaded,
+    /// The debug view: the visibility buffer as a colour per cluster, its quads a checker.
+    Clusters,
 }
 
 /// How long a frame's phases took.
@@ -81,8 +123,11 @@ pub struct Drawn {
     /// encode time is submitting its uploads alone, if it had any.
     pub times: DrawTimes,
     /// Whether the scene's passes were submitted: the bounds update the frame carried is then on
-    /// the GPU, and its cut is read back. False for a frame with no scene, or no image.
+    /// the GPU, and its cut is read back. False for a frame with no scene, or no image, or one
+    /// that only shaded the last scene again ([`Scene::Reshade`]).
     pub scene: bool,
+    /// Whether a scene was shown: drawn, or shaded again.
+    pub shown: bool,
 }
 
 /// Why a frame couldn't be drawn.
@@ -97,10 +142,11 @@ pub enum DrawError {
     /// overlay, or a validation error in the frame's submission (the frame was submitted).
     #[error(transparent)]
     Gpu(#[from] GpuError),
-    /// The scene's passes (the level choice, the raster, the debug view's binding) couldn't be
-    /// encoded. The frame was submitted all the same, its uploads first, with the passes encoded
-    /// before the failure (whole passes only), so its tiles arrive; its cut readback is given
-    /// back unread, and the acquired image is dropped unpresented.
+    /// The scene's passes (the level choice, the raster, the shading, the tone map's or the
+    /// debug view's binding) couldn't be encoded. The frame was submitted all the same, its uploads
+    /// first, with the passes encoded before the failure (whole passes only), so its tiles
+    /// arrive; its cut readback is given back unread, and the acquired image is dropped
+    /// unpresented.
     #[error("encoding the scene's passes")]
     Scene(#[from] FrameError),
 }
@@ -112,6 +158,8 @@ struct ImagePasses {
     format: TextureFormat,
     /// The visibility buffer's debug view.
     view: VisibilityView,
+    /// The tone map.
+    tone: ToneMap,
     /// The overlay pass.
     overlay: OverlayPass,
 }
@@ -126,14 +174,21 @@ impl ImagePasses {
         Ok(Self {
             format,
             view: VisibilityView::new(gpu, format)?,
+            tone: ToneMap::new(gpu, format)?,
             overlay: OverlayPass::new(gpu, format)?,
         })
     }
 }
 
-/// A frame's scene, encoded, its visibility buffer bound for the debug view: its readback, to
-/// mark submitted once the frame is; `None` if every readback buffer was in flight.
-type EncodedScene = Option<CutReadback>;
+/// A frame's scene, encoded, its image bound for the pass that shows it.
+#[derive(Debug)]
+struct EncodedScene {
+    /// Its readback, to mark submitted once the frame is; `None` if every readback buffer was
+    /// in flight, or the scene was only shaded again.
+    readback: Option<CutReadback>,
+    /// Whether there is an image to show.
+    shown: bool,
+}
 
 /// Draws frames: the passes and their GPU state.
 #[derive(Debug)]
@@ -213,29 +268,43 @@ impl Renderer {
             image: image_passes,
             passes: scene_passes,
         } = self;
-        let ImagePasses { view, overlay, .. } = image_passes;
+        let ImagePasses {
+            view,
+            tone,
+            overlay,
+            ..
+        } = image_passes;
         overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
-        let to_draw = inputs.scene.zip(scene_passes.as_mut());
-        // A frame with no scene runs no level choice: its request readback reads nothing.
+        if let Some(passes) = scene_passes.as_mut() {
+            passes.set_shading(gpu, inputs.look.shading);
+        }
+        let to_draw = scene_passes.as_mut().map(|passes| (inputs.scene, passes));
+        let drawing = matches!(to_draw, Some((Scene::Draw(_), _)));
+        // A frame drawing no scene runs no level choice: its request readback reads nothing.
         let uploads = uploads.map(|uploads| {
-            if to_draw.is_some() {
+            if drawing {
                 uploads
             } else {
                 uploads.without_level_choice()
             }
         });
+        let showing = Showing {
+            look: inputs.look,
+            size: inputs.size,
+        };
         let outcome = gpu.scoped("encoding a frame", || {
             let commands = gpu
                 .device()
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("frame"),
                 });
-            let mut drawn = None;
+            let mut encoded = None;
             let passes = |frame: &mut CommandEncoder| {
-                drawn =
-                    to_draw.map(|(scene, passes)| encode_scene(gpu, frame, scene, passes, view));
+                encoded = to_draw.and_then(|(scene, passes)| {
+                    encode_scene(gpu, frame, scene, passes, (view, tone), showing)
+                });
                 let mut pass = frame.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("visibility view and overlay"),
+                    label: Some("scene and overlay"),
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: image.view(),
                         depth_slice: None,
@@ -247,24 +316,27 @@ impl Renderer {
                     })],
                     ..RenderPassDescriptor::default()
                 });
-                if let Some(Ok(_)) = &drawn {
-                    view.draw(&mut pass);
+                if let Some(Ok(EncodedScene { shown: true, .. })) = &encoded {
+                    match inputs.look.view {
+                        SceneView::Shaded => tone.draw(&mut pass),
+                        SceneView::Clusters => view.draw(&mut pass),
+                    }
                 }
                 // The last pass: the overlay over everything.
                 overlay.draw(&mut pass);
             };
             submit(gpu, uploads, commands, passes);
-            drawn
+            encoded
         })?;
-        let scene = match outcome {
-            Some(Ok(readback)) => {
-                if let Some(readback) = readback {
+        let (scene, visible) = match outcome {
+            Some(Ok(encoded)) => {
+                if let Some(readback) = encoded.readback {
                     readback.submitted();
                 }
-                true
+                (drawing, encoded.shown)
             }
             Some(Err(error)) => return Err(error.into()),
-            None => false,
+            None => (false, false),
         };
         times.encode = encoding.elapsed();
         let presenting = Instant::now();
@@ -276,27 +348,73 @@ impl Renderer {
             outcome: Outcome::Presented,
             times,
             scene,
+            shown: visible,
         })
     }
 }
 
-/// Encodes `scene` with `passes` into `frame`, after the uploads, and binds its visibility
-/// buffer for the debug `view`.
+/// How a frame shows its scene: its look, and its size (a scene shaded again must be of it).
+#[derive(Debug, Clone, Copy)]
+struct Showing {
+    /// The look.
+    look: Look,
+    /// The frame's size.
+    size: Size,
+}
+
+/// Encodes `scene` with `passes` into `frame`, after the uploads (drawn, or shaded again), and
+/// binds the image the frame shows ([`Showing::look`]) for the tone map or the debug view;
+/// `None` for no scene.
+///
+/// A scene drawn is always shaded, the debug view or not, so the shading pass's view and bind
+/// groups are the last scene's when a later frame shades it again.
 ///
 /// # Errors
 ///
-/// As [`FramePasses::encode`]; [`FrameError::Gpu`] if the debug view can't bind the visibility
-/// buffer.
+/// As [`FramePasses::encode`] and [`FramePasses::encode_shading`]; [`FrameError::Gpu`] if the
+/// tone map or the debug view can't bind its image.
 fn encode_scene(
     gpu: &Gpu,
     frame: &mut CommandEncoder,
-    scene: &SceneInputs<'_>,
+    scene: Scene<'_>,
     passes: &mut FramePasses,
-    view: &mut VisibilityView,
-) -> Result<EncodedScene, FrameError> {
-    let readback = passes.encode(gpu, frame, scene)?;
-    view.bind(gpu, passes.raster().visibility())?;
-    Ok(readback)
+    (view, tone): (&mut VisibilityView, &mut ToneMap),
+    showing: Showing,
+) -> Option<Result<EncodedScene, FrameError>> {
+    let shaded = showing.look.view == SceneView::Shaded;
+    let encoded = match scene {
+        Scene::None => return None,
+        Scene::Draw(scene) => (|| {
+            let readback = passes.encode(gpu, frame, scene)?;
+            passes.encode_shading(gpu, frame, scene)?;
+            Ok(EncodedScene {
+                readback,
+                shown: true,
+            })
+        })(),
+        Scene::Reshade => (|| {
+            let visibility = passes.raster().visibility();
+            let same_size = (visibility.width(), visibility.height())
+                == (showing.size.width(), showing.size.height());
+            let visible = same_size && (!shaded || passes.encode_shading_again(gpu, frame)?);
+            Ok(EncodedScene {
+                readback: None,
+                shown: visible,
+            })
+        })(),
+    };
+    Some(encoded.and_then(|encoded| {
+        if encoded.shown {
+            if shaded {
+                if let Some(target) = passes.shade().target() {
+                    tone.bind(gpu, target)?;
+                }
+            } else {
+                view.bind(gpu, passes.raster().visibility())?;
+            }
+        }
+        Ok(encoded)
+    }))
 }
 
 /// Encodes `passes` into `encoder` and submits it.
@@ -349,5 +467,6 @@ fn not_drawn(
         outcome,
         times,
         scene: false,
+        shown: false,
     })
 }

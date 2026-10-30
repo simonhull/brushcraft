@@ -71,6 +71,7 @@ use render::gpu::Gpu;
 use render::lod::{CutReader, LodConfig, LodStats};
 use render::raster::{FramePasses, MORPH};
 use render::residency::{FrameUse, Residency, ResidencyConfig, ResidencyStats, Tier};
+use render::shade::ShadePath;
 use render::upload::{FrameUploads, StoreSource, prefetch_requests};
 use store::TileStore;
 
@@ -186,6 +187,7 @@ impl GpuResidency {
                     residency.slot_layout(),
                     LodConfig::for_tier(TIER),
                     MORPH,
+                    ShadePath::for_tier(TIER),
                 )
             })?
             .context("building the level choice and the raster for this GPU")?;

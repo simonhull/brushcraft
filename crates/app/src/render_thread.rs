@@ -22,7 +22,7 @@ use render::gpu::Gpu;
 use render::raster::{FramePasses, SceneInputs};
 use render::surface::{Presentation, Size, Target};
 use render::upload::FrameUploads;
-use render::{DrawTimes, FrameInputs, Outcome, Renderer};
+use render::{DrawTimes, FrameInputs, Look, Outcome, Renderer, Scene};
 use wgpu::{Buffer, Color};
 
 use crate::overlay::TextLayout;
@@ -420,7 +420,8 @@ pub(crate) fn draw_frame(
         clear: CLEAR,
         overlay: image.as_ref(),
         overlay_scale: frame.overlay_scale,
-        scene: scene.as_ref(),
+        scene: scene.as_ref().map_or(Scene::None, Scene::Draw),
+        look: Look::default(),
     };
     let uploads = frame.uploads.take();
     let drawn = renderer

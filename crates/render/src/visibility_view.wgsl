@@ -1,4 +1,4 @@
-// The visibility buffer shown as colours: a debug view until the shading pass (M1a3 Task 5).
+// The visibility buffer shown as colours: the debug view, in place of the shaded image.
 // Each cluster (the id's node and cluster bits) gets a colour hashed from them, its quads a
 // checker of two shades of it; the background is left to the clear colour (see
 // visibility_view.rs).

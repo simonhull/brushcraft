@@ -1,7 +1,7 @@
 avoid-breaking-exported-api = false
 check-private-items = true
 warn-on-all-wildcard-imports = true
-doc-valid-idents = ["BrushCraft", "wgpu", "Catmull", ".."]
+doc-valid-idents = ["BrushCraft", "wgpu", "Catmull", "MatCap", "MatCaps", ".."]
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true

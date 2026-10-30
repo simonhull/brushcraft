@@ -9,8 +9,12 @@
 //! tests against everything this frame drew. A frame of another size than the last has no
 //! previous pyramid: nothing is occlusion-culled in its first phase.
 //!
-//! [`crate::Renderer::draw`] runs it each frame the app hands it a scene, after the frame's
-//! uploads and before the visibility buffer is shown; the tests draw through it too.
+//! [`FramePasses::encode_shading`] then shades the visibility buffer ([`crate::shade`]) into the
+//! linear HDR image the tone map shows, and [`FramePasses::encode_shading_again`] shades it again
+//! with no raster, for a change of material or wireframe alone.
+//!
+//! [`crate::Renderer::draw`] runs them each frame the app hands it a scene, after the frame's
+//! uploads and before the image is shown; the tests draw through it too.
 
 use std::time::Duration;
 
@@ -24,6 +28,7 @@ use crate::cull::{BoundsUpdate, DepthPyramid, PyramidPass, SlotBuffers};
 use crate::gpu::{Gpu, GpuError};
 use crate::lod::{CutReadback, Lod, LodConfig, LodError, MainInputs};
 use crate::residency::SlotLayout;
+use crate::shade::{Shade, ShadeError, ShadePath, ShadeScene, ShadeSettings};
 
 /// Why a frame's passes couldn't be set up or encoded.
 #[derive(Debug, Error)]
@@ -38,6 +43,9 @@ pub enum FrameError {
     /// The GPU failed: a pyramid, a bind group.
     #[error(transparent)]
     Gpu(#[from] GpuError),
+    /// The shading pass failed.
+    #[error(transparent)]
+    Shade(#[from] ShadeError),
 }
 
 /// What one frame's passes read.
@@ -77,6 +85,8 @@ pub struct FramePasses {
     current: Option<DepthPyramid>,
     /// The previous frame's view and its whole depth's pyramid.
     previous: Option<(View, DepthPyramid)>,
+    /// The shading pass.
+    shade: Shade,
 }
 
 impl FramePasses {
@@ -84,17 +94,18 @@ impl FramePasses {
     /// [`crate::residency::Residency::slot_layout`]), the level choice set up by `lod` and the
     /// geomorph holding the drawn error to its refine threshold
     /// ([`RasterConfig::for_level_choice`]), level changes made with the camera still morphing
-    /// over `morph`.
+    /// over `morph`, and the shading pass running as `path` ([`ShadePath::for_tier`]).
     ///
     /// # Errors
     ///
-    /// As [`Lod::new`], [`Raster::new`] and [`PyramidPass::new`].
+    /// As [`Lod::new`], [`Raster::new`], [`PyramidPass::new`] and [`Shade::new`].
     pub fn new(
         gpu: &Gpu,
         capacity: u32,
         slots: SlotLayout,
         lod: LodConfig,
         morph: Duration,
+        path: ShadePath,
     ) -> Result<Self, FrameError> {
         let raster = RasterConfig::for_level_choice(&lod).with_morph(morph);
         Ok(Self {
@@ -103,6 +114,7 @@ impl FramePasses {
             pyramids: PyramidPass::new(gpu)?,
             current: None,
             previous: None,
+            shade: Shade::new(gpu, slots, path, ShadeSettings::default())?,
         })
     }
 
@@ -122,6 +134,52 @@ impl FramePasses {
     #[must_use]
     pub const fn raster(&self) -> &Raster {
         &self.raster
+    }
+
+    /// The shading pass: its target, its settings.
+    #[must_use]
+    pub const fn shade(&self) -> &Shade {
+        &self.shade
+    }
+
+    /// Sets what the shading shows from the next shading pass on.
+    pub fn set_shading(&mut self, gpu: &Gpu, settings: ShadeSettings) {
+        self.shade.set_settings(gpu, settings);
+    }
+
+    /// Encodes the shading pass over the visibility buffer [`FramePasses::encode`] just drew
+    /// from `inputs`, in the same submission.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError::Shade`] as [`Shade::encode`].
+    pub fn encode_shading(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        inputs: &SceneInputs<'_>,
+    ) -> Result<(), FrameError> {
+        let scene = ShadeScene {
+            tree: inputs.tree,
+            slots: inputs.slots,
+            raster: &self.raster,
+            view: inputs.view,
+        };
+        Ok(self.shade.encode(gpu, encoder, &scene)?)
+    }
+
+    /// Encodes the shading pass again over the last visibility buffer shaded, with no raster:
+    /// [`Shade::encode_again`]. Returns whether there was one.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError::Shade`] as [`Shade::encode_again`].
+    pub fn encode_shading_again(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+    ) -> Result<bool, FrameError> {
+        Ok(self.shade.encode_again(gpu, encoder)?)
     }
 
     /// How long a level change made with the camera still morphs: frames should keep coming
