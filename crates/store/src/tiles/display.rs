@@ -417,6 +417,13 @@ impl TileStore {
     /// unknown as it was last recorded, its bound the largest there is and its cone covering
     /// everything; `None` where none of these is known, and the tile must be drawn finer.
     ///
+    /// Records are taken from memory where the store holds them: recorded, the floor's copy of
+    /// the files' record, or read ahead ([`TileStore::read_display_ahead`]); the others are read
+    /// from the files here. A record read ahead is used, not consumed: it stays until the caller
+    /// says the tile is staged ([`TileStore::forget_drawn`]) or no longer wants it. With
+    /// 64 keys or more (`PARALLEL_DECODE`), the tiles are decoded on the workers, and this
+    /// thread waits for them; fewer are decoded here.
+    ///
     /// # Errors
     ///
     /// As [`TileStore::stored_display`].
@@ -436,14 +443,12 @@ impl TileStore {
             DisplayTile::decode(*key, to.bound, to.cone, &to.record.encoded).ok()
         };
         // Many tiles at once (the floor, in an open's first frame) are decoded on the workers.
-        let tiles = if keys.len() >= PARALLEL_DECODE {
+        let tiles: Vec<Option<DisplayTile>> = if keys.len() >= PARALLEL_DECODE {
             self.workers
                 .install(|| keys.par_iter().zip(found.par_iter()).map(decode).collect())
         } else {
             keys.iter().zip(&found).map(decode).collect()
         };
-        drop(found);
-        self.drawn_ahead(keys);
         Ok(tiles)
     }
 
@@ -496,17 +501,22 @@ impl TileStore {
 
     /// [`TileStore::display_needs_read`], with what the workers read taken in by the caller.
     pub(super) fn needs_read(&self, key: &TileKey) -> bool {
+        !self.in_memory(key)
+            && self.read_ahead_record(key).is_none()
+            && self.record_place(key).is_some()
+    }
+
+    /// Whether drawing `key` takes what the store holds in memory, read ahead aside: a stroke's
+    /// bump, a record the book holds (or knows unknown), or the floor's copy of the files'
+    /// record.
+    pub(super) fn in_memory(&self, key: &TileKey) -> bool {
         if self.bumped.contains_key(key) {
-            return false;
+            return true;
         }
         match self.display.kept(key) {
-            Some(Kept::Known(_) | Kept::Unknown) => return false,
-            Some(Kept::Written) | None => {}
+            Some(Kept::Known(_) | Kept::Unknown) => true,
+            Some(Kept::Written) | None => self.floor_record(key).is_some(),
         }
-        if self.floor_record(key).is_some() || self.read_ahead_record(key).is_some() {
-            return false;
-        }
-        self.record_place(key).is_some()
     }
 
     /// The floor's copy of `key`'s record, if it is the record the files hold as their latest:

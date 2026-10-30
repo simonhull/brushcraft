@@ -44,7 +44,7 @@ fn from_file(store: &TileStore, key: &TileKey) -> Option<geom::DisplayTile> {
 }
 
 #[test]
-fn records_read_ahead_are_drawn_without_a_read_and_then_forgotten() {
+fn records_read_ahead_are_drawn_without_a_read_and_forgotten_once_staged() {
     let dir = TestDir::new();
     let mesh = mesh();
     let mut store = reopened(&dir, &mesh);
@@ -66,14 +66,80 @@ fn records_read_ahead_are_drawn_without_a_read_and_then_forgotten() {
     for (key, tile) in keys.iter().zip(drawn) {
         assert_eq!(tile, from_file(&store, key), "{key:?}: the file's record");
         assert!(
+            !store.display_needs_read(key),
+            "{key:?}: drawn but not staged, kept for the next frame"
+        );
+    }
+    // The first two staged, the others starved (no room, no slot) this frame.
+    let (staged, starved) = keys.split_at(2);
+    store.forget_drawn(staged);
+    for key in staged {
+        assert!(
             !store.read_ahead.read.tiles.contains_key(key),
-            "{key:?}: forgotten once drawn"
+            "{key:?}: forgotten once staged"
         );
         assert!(
             store.display_needs_read(key),
             "{key:?}: read again if drawn again"
         );
     }
+    for key in starved {
+        assert!(!store.display_needs_read(key), "{key:?}: still read ahead");
+    }
+}
+
+/// A stroke's records read around its dabs survive the same tiles being requested, drawn and
+/// staged, and are still there for the stroke's next dabs; and they don't take the draw's
+/// share.
+#[test]
+fn a_strokes_records_read_around_survive_being_requested_and_drawn() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = reopened(&dir, &mesh);
+    let reached = TileKey::display(FaceId::new(0), level(TOP - 1), 0, 0).unwrap();
+    store.read_around(&BTreeSet::from([reached]));
+    settle_reads(&mut store);
+    let around: Vec<TileKey> = store.read_ahead.read.tiles.keys().copied().collect();
+    assert!(!around.is_empty(), "the tiles around it were read");
+    assert_eq!(
+        store.read_display_ahead(&around),
+        0,
+        "a stroke's records are used as they are, not read again"
+    );
+    let drawn = store.display_for_draw(&around).unwrap();
+    for (key, tile) in around.iter().zip(drawn) {
+        assert_eq!(tile, from_file(&store, key), "{key:?}: the file's record");
+    }
+    store.forget_drawn(&around);
+    // The request moves on, then goes.
+    store.read_display_ahead(&display_at(&mesh, 6..=6));
+    store.read_display_ahead(&[]);
+    settle_reads(&mut store);
+    for key in &around {
+        assert!(
+            store.read_ahead.read.tiles.contains_key(key),
+            "{key:?}: the stroke's record survives"
+        );
+    }
+    // And a tile the book knows takes no share: the whole share is left for the others.
+    let layer = display_layer(&mut store);
+    let tile = layer
+        .iter()
+        .find(|tile| tile.key().level() > level(5) && !around.contains(tile.key()))
+        .unwrap();
+    let known = *tile.key();
+    store.record_display(std::slice::from_ref(tile)).unwrap();
+    let others: Vec<TileKey> = display_at(&mesh, 6..=7)
+        .into_iter()
+        .filter(|key| *key != known && !around.contains(key))
+        .collect();
+    let mut asked = vec![known];
+    asked.extend(&others);
+    assert_eq!(
+        store.read_display_ahead(&asked),
+        store.draw_ahead_cap().min(others.len()),
+        "the share, all of it for tiles needing a read"
+    );
 }
 
 #[test]

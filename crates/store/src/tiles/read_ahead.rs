@@ -12,15 +12,23 @@
 //! [`TileStore::display_for_draw`] finds them here rather than reading each on the owner thread
 //! (about 140 µs a record on the benchmark project). Those reads are only for the tiles it
 //! wants now: each call names them all, a tile it no longer names isn't read (a worker skips it)
-//! and its record, read, goes. They share the cache's cap with the stroke's, three quarters of
-//! it at most ([`TileStore::draw_ahead_cap`]), so a stroke's reads always have room.
+//! and its record, read, goes; a tile staged goes too ([`TileStore::forget_drawn`]). They share
+//! the cache's cap with the stroke's, three quarters of it at most
+//! ([`TileStore::draw_ahead_cap`]), so a stroke's reads always have room. At the least budget
+//! the cache holds 16 records (`CacheCaps::MIN_READ_AHEAD`), so 12 are read ahead for drawing
+//! at once, about a frame's worth of staging; at the display caches' largest share, 256 MiB,
+//! it holds 372, and 279 for drawing.
+//!
+//! Each record held remembers whom it was read for: a draw's requests adopt, and drop, only
+//! records read for drawing, so a stroke's read-around records survive the tiles being
+//! requested and drawn (a draw still uses them, as any record in memory).
 //!
 //! A record read ahead is used only while it is still the one the store would read: the same
 //! open file, at the same place. Files are append-only while open, so a record superseded since
 //! (by a flush, say) is at another place, and a file swapped since is another file; either way it
 //! is read again, as it would have been.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
 use geom::{Channel, TileKey};
@@ -40,6 +48,8 @@ pub(super) struct ReadRecord {
     loc: Loc,
     /// The record.
     record: StoredDisplay,
+    /// Whom it was read for.
+    purpose: Purpose,
 }
 
 /// Where a display record is, for a bump (see [`TileStore::bump_record`]).
@@ -63,11 +73,11 @@ enum Purpose {
     Draw,
 }
 
-/// A record a worker read, sent back to the owner thread, and whom for.
+/// A record a worker read, sent back to the owner thread.
 ///
 /// `None` if the read failed (the read on the owner thread reports it, if it comes to that), or,
 /// read for drawing, if the tile was no longer wanted, and not read.
-type Read = (TileKey, Option<ReadRecord>, Purpose);
+type Read = (TileKey, Option<ReadRecord>);
 
 /// The tiles whose records are read ahead for drawing: shared with the workers, which skip a
 /// tile no longer in it.
@@ -80,8 +90,8 @@ pub(super) struct ReadAhead {
     sender: mpsc::Sender<Read>,
     /// What they read, taken on the owner thread.
     receiver: mpsc::Receiver<Read>,
-    /// The tiles being read.
-    asked: BTreeSet<TileKey>,
+    /// The tiles being read, and whom for.
+    asked: BTreeMap<TileKey, Purpose>,
     /// The tiles a read-ahead looked at lately (read, or found needing none): looked at again
     /// only once it is emptied, at [`ReadAhead::LOOKED`] of them.
     looked: crate::hash::TileSet,
@@ -96,6 +106,10 @@ pub(super) struct ReadAhead {
 impl ReadAhead {
     /// The most records one worker task reads for drawing: a few, so the reads spread over the
     /// workers (one is about 140 µs on the benchmark project), at a task's spawn each.
+    ///
+    /// Chosen, not tuned: a request of 32 records spreads over 8 tasks, and the timing test
+    /// `render::upload::tests::owner_time_staging_display_tiles` found them all read within the
+    /// 100 ms it waits. The owner's cost is the spawns, a few microseconds each.
     const DRAW_TASK: usize = 4;
     /// The most tiles it remembers looking at.
     const LOOKED: usize = 4096;
@@ -106,7 +120,7 @@ impl ReadAhead {
         Self {
             sender,
             receiver,
-            asked: BTreeSet::new(),
+            asked: BTreeMap::new(),
             looked: crate::hash::TileSet::default(),
             drawing: Arc::default(),
             read: TileCache::new(cap),
@@ -152,8 +166,9 @@ fn read_records(
             reader,
             loc,
             record,
+            purpose,
         });
-        if sender.send((key, read, purpose)).is_err() {
+        if sender.send((key, read)).is_err() {
             return;
         }
     }
@@ -173,9 +188,28 @@ impl TileStore {
     /// `key`'s display record as read ahead, if it was and is still the record the store's
     /// files hold; `None` if it must be read.
     pub(super) fn read_ahead_record(&self, key: &TileKey) -> Option<&StoredDisplay> {
+        self.read_ahead_entry(key).map(|found| &found.record)
+    }
+
+    /// [`TileStore::read_ahead_record`], with whom it was read for.
+    fn read_ahead_entry(&self, key: &TileKey) -> Option<&ReadRecord> {
         let found = self.read_ahead.read.tiles.get(key)?;
         let (reader, loc) = self.record_place(key)?;
-        (found.loc == loc && found.reader.same_file(&reader)).then_some(&found.record)
+        (found.loc == loc && found.reader.same_file(&reader)).then_some(found)
+    }
+
+    /// Drops `key`'s record read ahead if it was read for drawing (freed with the cache's own);
+    /// a stroke's stays.
+    fn drop_drawn_record(&mut self, key: &TileKey) {
+        let for_draw = self
+            .read_ahead
+            .read
+            .tiles
+            .get(key)
+            .is_some_and(|found| found.purpose == Purpose::Draw);
+        if for_draw {
+            drop(self.read_ahead.read.remove(key));
+        }
     }
 
     /// Where `key`'s display record is for a bump, which keeps it: in memory (the book's, or
@@ -203,12 +237,12 @@ impl TileStore {
     /// Takes in the records the workers have read ahead. One read for drawing a tile no longer
     /// wanted is dropped.
     pub(super) fn take_read_ahead(&mut self) {
-        while let Ok((key, read, purpose)) = self.read_ahead.receiver.try_recv() {
+        while let Ok((key, read)) = self.read_ahead.receiver.try_recv() {
             self.read_ahead.asked.remove(&key);
             let Some(read) = read else {
                 continue;
             };
-            if purpose == Purpose::Draw
+            if read.purpose == Purpose::Draw
                 && !self.read_ahead.drawing(|drawing| drawing.contains(&key))
             {
                 continue;
@@ -230,12 +264,15 @@ impl TileStore {
     /// in memory rather than reading them on this thread. Returns how many reads it queued.
     ///
     /// Each call replaces the last: a tile it doesn't name is no longer read (a worker skips
-    /// it), and its record, if read, goes. A record is used, and goes, when the tile is drawn.
-    /// Tiles drawn without a file read are skipped (see [`TileStore::display_needs_read`]), as
-    /// are keys that aren't the store's display tiles. The records read ahead for drawing
-    /// share the read-ahead cache's cap, a part of the display caches' share of the budget
+    /// it), and its record, if read, goes. A record is used when the tile is drawn
+    /// ([`TileStore::display_for_draw`]), and goes once the caller says it is staged
+    /// ([`TileStore::forget_drawn`]). Tiles drawn without a file read are skipped (see
+    /// [`TileStore::display_needs_read`]), a stroke's records read around included, as are keys
+    /// that aren't the store's display tiles. The records read ahead for drawing share the
+    /// read-ahead cache's cap, a part of the display caches' share of the budget
     /// ([`StoreConfig::display_cache_bytes`](super::StoreConfig::display_cache_bytes)): at most
-    /// three quarters of it, the first of `keys` taking it, the rest left to be read when drawn.
+    /// three quarters of it (12 records at the least budget), the first of `keys` taking it,
+    /// the rest left to be read when drawn.
     pub fn read_display_ahead(&mut self, keys: &[TileKey]) -> usize {
         self.take_read_ahead();
         let cap = self.draw_ahead_cap();
@@ -253,15 +290,21 @@ impl TileStore {
             if !ours || wanted.contains(key) {
                 continue;
             }
-            if self.read_ahead.asked.contains(key) || self.read_ahead_record(key).is_some() {
-                wanted.insert(*key);
+            if self.in_memory(key) {
                 continue;
             }
-            if !self.needs_read(key) {
-                continue;
+            // Held or being read: adopted if for drawing; a stroke's is used as it is.
+            let held = self.read_ahead_entry(key).map(|found| found.purpose);
+            match held.or_else(|| self.read_ahead.asked.get(key).copied()) {
+                Some(Purpose::Draw) => {
+                    wanted.insert(*key);
+                    continue;
+                }
+                Some(Purpose::Stroke) => continue,
+                None => {}
             }
             if let Some((reader, loc)) = self.record_place(key) {
-                self.read_ahead.asked.insert(*key);
+                self.read_ahead.asked.insert(*key, Purpose::Draw);
                 wanted.insert(*key);
                 reads.push((*key, reader, loc));
             }
@@ -273,8 +316,7 @@ impl TileStore {
                 .collect()
         });
         for key in &gone {
-            // Freed with the cache's own.
-            drop(self.read_ahead.read.remove(key));
+            self.drop_drawn_record(key);
         }
         let queued = reads.len();
         let mut reads = reads.into_iter().peekable();
@@ -295,9 +337,11 @@ impl TileStore {
         self.read_ahead.asked.len()
     }
 
-    /// Forgets the records read ahead for drawing `keys`, which were just drawn: they are on the
-    /// GPU now, and drawing them again reads them again.
-    pub(super) fn drawn_ahead(&mut self, keys: &[TileKey]) {
+    /// Forgets the records read ahead for drawing `keys`, which the caller has staged: they
+    /// are on their way to the GPU, and drawing them again reads them again. A tile drawn but
+    /// not staged (no room, no slot this frame) keeps its record for the next frame. A stroke's
+    /// records read around stay.
+    pub fn forget_drawn(&mut self, keys: &[TileKey]) {
         let drawn: Vec<TileKey> = self.read_ahead.drawing(|drawing| {
             keys.iter()
                 .filter(|key| drawing.remove(key))
@@ -305,9 +349,7 @@ impl TileStore {
                 .collect()
         });
         for key in &drawn {
-            if !self.read_ahead.asked.contains(key) {
-                drop(self.read_ahead.read.remove(key));
-            }
+            self.drop_drawn_record(key);
         }
     }
 
@@ -335,14 +377,14 @@ impl TileStore {
         let mut reads = Vec::new();
         for key in around.difference(reached) {
             if !self.read_ahead.looked.insert(*key)
-                || self.read_ahead.asked.contains(key)
+                || self.read_ahead.asked.contains_key(key)
                 || matches!(self.display.kept(key), Some(Kept::Known(_) | Kept::Unknown))
                 || self.read_ahead_record(key).is_some()
             {
                 continue;
             }
             if let Some((reader, loc)) = self.record_place(key) {
-                self.read_ahead.asked.insert(*key);
+                self.read_ahead.asked.insert(*key, Purpose::Stroke);
                 reads.push((*key, reader, loc));
             }
         }
