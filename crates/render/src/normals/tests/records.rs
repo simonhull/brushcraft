@@ -1,6 +1,7 @@
-//! The normal pass on records built by hand, outside residency: its record chunks, a slot
-//! written with vertices after a record in the same frame, and the fallback and NaN normals of
-//! degenerate and non-finite inputs.
+//! The normal pass on records built by hand, outside residency.
+//!
+//! Its record chunks, a slot written with vertices after a record in the same frame, and the
+//! fallback and NaN normals of degenerate and non-finite inputs.
 
 use std::sync::mpsc;
 
