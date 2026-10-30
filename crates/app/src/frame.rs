@@ -471,6 +471,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             gpu_timing: record.gpu_timing,
             lod_timing: record.lod_timing,
             open: now.saturating_duration_since(record.opening),
+            clock_unix: crate::record::since_epoch(now),
+            refresh: setup.interval,
         });
         Self {
             project,

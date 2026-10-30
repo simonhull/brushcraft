@@ -198,6 +198,8 @@ fn a_run_writes_its_setting_its_segments_then_its_frames() {
         gpu_timing: true,
         lod_timing: false,
         open: ms(250),
+        clock_unix: Some(Duration::from_micros(1_793_401_426_346_500)),
+        refresh: Duration::from_micros(6944),
     };
     let script = Script::benchmark(Speed::ONE);
     let lines = recorder.lines(&info, &script);
@@ -218,9 +220,29 @@ fn a_run_writes_its_setting_its_segments_then_its_frames() {
         "{}",
         lines[0]
     );
+    assert!(
+        lines[0].contains(r#""clock_unix_us":1793401426346500,"refresh_ms":6.944,"#),
+        "{}",
+        lines[0]
+    );
     assert_eq!(
         lines[2],
         r#"{"bench":"render","result":"segment","segment":"orbit","start_ms":3000,"end_ms":11000}"#
     );
     assert!(lines[6].contains(r#""frame":1,"#) && lines[7].contains(r#""frame":2,"#));
+}
+
+#[test]
+fn a_moment_by_the_frame_loop_clock_is_placed_on_the_system_clock() {
+    let start = Instant::now();
+    let before = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let placed = since_epoch(start).unwrap();
+    let off = placed.abs_diff(before);
+    assert!(
+        off < Duration::from_millis(5),
+        "{off:?} from the clock read beside it"
+    );
 }

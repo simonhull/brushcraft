@@ -13,7 +13,11 @@
 //! `"bench":"render"` and its `"result"`: one `run` line (the setting), one `segment` line per
 //! segment of the script, then one `frame` line per frame, in order. Times are in milliseconds;
 //! `time_ms` and `presented_ms` are on the frame loop's clock (from its first frame), and
-//! `open_ms` is how long before that the project began to open. The frame line's fields:
+//! `open_ms` is how long before that the project began to open. The run line also gives
+//! `clock_unix_us`, the frame loop's clock's start by the system clock (microseconds since the
+//! Unix epoch), so samples taken beside the run by another process (the performance suite's GPU
+//! clocks) can be joined to frames; and `refresh_ms`, the interval frames are paced to as the run
+//! starts (the display's refresh, 1/60 s offscreen). The frame line's fields:
 //!
 //! - `frame`, `time_ms` (its start), `presented_ms` (when the owner heard it was shown), `segment`,
 //!   `moving` (whether the view changed since the last frame);
@@ -33,7 +37,7 @@
 //!   `uploaded_bytes` and `uploaded_tiles`.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use render::DrawTimes;
 use render::lod::{LodStats, LodTimings};
@@ -337,6 +341,28 @@ pub(crate) struct RunInfo {
     pub(crate) lod_timing: bool,
     /// From the project beginning to open to the frame loop's clock starting.
     pub(crate) open: Duration,
+    /// The frame loop's clock's start, as time since the Unix epoch by the system clock; `None`
+    /// if the system clock is set before the epoch.
+    pub(crate) clock_unix: Option<Duration>,
+    /// The interval frames are paced to as the run starts: the display's refresh, or 1/60 s
+    /// offscreen.
+    pub(crate) refresh: Duration,
+}
+
+/// The moment `at` (now or earlier) as time since the Unix epoch by the system clock; `None` if
+/// the system clock is set before the epoch.
+pub(crate) fn since_epoch(at: Instant) -> Option<Duration> {
+    let ago = Instant::now().saturating_duration_since(at);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    now.checked_sub(ago)
+}
+
+/// `d` in whole microseconds, for a field a float of milliseconds would round (a time since the
+/// epoch).
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Collects a scripted run's frames as their facts arrive (the module notes).
@@ -439,6 +465,8 @@ impl Recorder {
             .with("gpu_timing", info.gpu_timing)
             .with("lod_timing", info.lod_timing)
             .with("open_ms", info.open)
+            .with("clock_unix_us", info.clock_unix.map(micros))
+            .with("refresh_ms", info.refresh)
             .with("frames", self.frames.len());
         let segments = script.segments().into_iter().map(|(segment, start, end)| {
             Line::new("segment")
