@@ -689,25 +689,35 @@ mod tests {
     fn a_camera_move_holds_accumulation_off_until_it_stops_then_it_starts_again() {
         let (mut scheduler, start) = scheduler();
         let mut now = start;
-        // The camera moves for ten frames: each frame's input asks for SAMPLES frames after it
-        // (the frame loop's rule), so the count starts again from the last moving frame.
+        // The camera moves for ten frames: each moving frame asks for the next (the frame loop's
+        // rule), which, still, restarts the image.
         for _ in 0..10 {
             scheduler.want(Reason::Input);
             assert!(matches!(scheduler.next(now), Next::Frame { .. }));
             let reasons = scheduler.started(now);
             assert!(reasons.contains(Reason::Input));
             scheduler.shown(Outcome::Presented);
-            scheduler.accumulate(SAMPLES);
+            scheduler.accumulate(1);
             now += INTERVAL;
         }
-        let still = frames_from(&mut scheduler, now, &[]);
+        assert!(
+            matches!(scheduler.next(now), Next::Frame { .. }),
+            "one still frame"
+        );
+        let reasons = scheduler.started(now);
+        assert_eq!(reasons, Reasons::default().with(Reason::Accumulating));
+        scheduler.shown(Outcome::Presented);
+        // Its report says the image restarted: the rest of its samples.
+        scheduler.accumulate(SAMPLES - 1);
+        let rest = frames_from(&mut scheduler, now + INTERVAL, &[]);
+        let still_frames = rest.len() + 1;
         assert_eq!(
-            still.len(),
+            still_frames,
             usize::try_from(SAMPLES).expect("small"),
-            "SAMPLES still frames after the last move"
+            "SAMPLES still frames after the last move, not twice that"
         );
         // A scene change wants twice as many: a cycle to notice, a cycle to converge.
-        let later = *still.last().expect("frames") + INTERVAL * 10;
+        let later = *rest.last().expect("frames") + INTERVAL * 10;
         scheduler.want(Reason::Uploads);
         scheduler.started(later);
         scheduler.shown(Outcome::Presented);

@@ -313,6 +313,9 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     scene_shown: bool,
     /// Picks the surface under the pointer in the input phase; `None` if the loop doesn't pick.
     picker: Option<Picker>,
+    /// Whether the image can accumulate: false once the renderer said a still frame was
+    /// filtered instead (its histories don't fit the device), until it restarts them.
+    accumulates: bool,
 }
 
 /// Every frame's phase times in a scripted run, for the summary printed at its end.
@@ -433,6 +436,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             look: Look::default(),
             scene_shown: false,
             picker: None,
+            accumulates: true,
         }
     }
 
@@ -612,7 +616,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 moving: moved,
             })
         });
-        self.want_accumulation(reasons, &uploads, scene.is_some() || reshade);
+        self.want_accumulation(reasons, &uploads, (scene.is_some() || reshade, moved));
 
         let snapshot = Snapshot {
             frame: self.started,
@@ -629,6 +633,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             camera: self.camera,
             look: self.look,
             pick: self.picker.as_ref().map(Picker::report),
+            filter_only: !self.accumulates,
         };
         let overlay = overlay::lines(&snapshot);
         hand_off(FrameRequest {
@@ -691,22 +696,33 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// Wants the frames the image needs to accumulate its samples after a frame wanted for
-    /// `reasons`, whose uploads said `uploads`, which shows a scene (`showing`) or not (the
-    /// renderer's accumulation, `render::aa`).
+    /// `reasons`, whose uploads said `uploads`, which shows a scene or not and moved the view or
+    /// not (`(showing, moved)`; the renderer's accumulation, `render::aa`).
     ///
+    /// - A frame that moved the view: the next one, still, which restarts the image; the restart
+    ///   then asks for the rest (`Owner::shown`).
     /// - A frame that may change the scene (store work converging, uploads, requests, a morph, a
     ///   script, anything staged) can reset pixels the renderer only notices on the frame that
     ///   samples them again: `2 · SAMPLES` frames, one cycle of jitters to notice, one to converge.
-    /// - A frame that may restart the image without changing the scene (input, the window exposed,
-    ///   a look change): `SAMPLES`.
-    /// - A frame wanted only to accumulate or for the pick line: nothing more. The pick line alone
-    ///   shades nothing when the image holds the look already (`render::Scene::Reshade` shows the
-    ///   accumulated image as it is); while accumulating, a pick comes with `Accumulating`, so it
-    ///   draws the next sample, and the view being unchanged, continues it.
+    /// - Any other frame: none. One that restarts the image (a look change, a lost frame, a new
+    ///   size) asks for `SAMPLES − 1` more as it is shown, from the renderer's report, so input
+    ///   that didn't move the view, or the window exposed, costs nothing while the image goes on.
+    ///   The pick line alone shades nothing when the image holds the look already
+    ///   (`render::Scene::Reshade` shows the accumulated image as it is); while accumulating, a
+    ///   pick comes with `Accumulating`, so it draws the next sample and continues it.
     ///
-    /// The debug view of clusters doesn't accumulate.
-    fn want_accumulation(&mut self, reasons: Reasons, uploads: &UploadStatus, showing: bool) {
-        if !showing || self.look.view != SceneView::Shaded {
+    /// Neither the debug view of clusters nor an image too large to accumulate asks for any.
+    fn want_accumulation(
+        &mut self,
+        reasons: Reasons,
+        uploads: &UploadStatus,
+        (showing, moved): (bool, bool),
+    ) {
+        if !showing || self.look.view != SceneView::Shaded || !self.accumulates {
+            return;
+        }
+        if moved {
+            self.scheduler.accumulate(1);
             return;
         }
         let changing = [
@@ -719,13 +735,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         .into_iter()
         .any(|reason| reasons.contains(reason))
             || !quiet(uploads);
-        let settling = Reasons::default()
-            .with(Reason::Accumulating)
-            .with(Reason::Pick);
         if changing {
             self.scheduler.accumulate(2 * aa::SAMPLES);
-        } else if !reasons.within(settling) {
-            self.scheduler.accumulate(aa::SAMPLES);
         }
     }
 
@@ -753,6 +764,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// The render thread finished a frame.
     pub(crate) fn shown(&mut self, presented: Presented) {
         self.uploads.shown(presented.scene);
+        if presented.aa.filtered_instead {
+            self.accumulates = false;
+        } else if presented.aa.restarted {
+            // A restart (the camera stopped, a look change, a lost frame, a new size) wants the
+            // rest of its samples; whatever the countdown said, it starts again here.
+            self.accumulates = true;
+            self.scheduler.accumulate(aa::SAMPLES - 1);
+        }
         self.finished += 1;
         self.scene_shown = presented.shown;
         self.render = Some(presented.times);

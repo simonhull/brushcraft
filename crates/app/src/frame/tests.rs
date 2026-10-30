@@ -73,6 +73,10 @@ const fn presented(number: u64) -> Presented {
         },
         scene: false,
         shown: false,
+        aa: aa::AaReport {
+            restarted: false,
+            filtered_instead: false,
+        },
     }
 }
 
@@ -982,6 +986,25 @@ fn a_change_of_look_is_drawn_whole_while_anything_else_wants_the_frame() {
         owner.shown(presented);
         settle(&gpu, &mut owner, &mut screen);
     }
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_converged_image_drawn_again_unchanged_wants_no_more_frames() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut owner = resident_owner(&dir, &gpu);
+    let mut screen = Screen::new(&gpu);
+    settle(&gpu, &mut owner, &mut screen);
+    // The window exposed, nothing changed: one frame, which carries the image on.
+    owner.expose();
+    let mut made = 0;
+    while let Next::Frame { deadline } = owner.next(Instant::now() + INTERVAL) {
+        draw_one(&gpu, &mut owner, &mut screen, Instant::now(), deadline);
+        made += 1;
+        assert!(made < 10, "frames never stopped");
+    }
+    assert_eq!(made, 1, "no samples asked for: the image goes on");
     owner.close().expect("closed");
 }
 

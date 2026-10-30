@@ -283,6 +283,7 @@ fn settle(owner: &mut Owner<NoBrush, NoUploads>) -> u32 {
                     times: DrawTimes::default(),
                     scene: false,
                     shown: false,
+                    aa: render::aa::AaReport::default(),
                 });
                 made += 1;
             }

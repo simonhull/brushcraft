@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use geom::Level;
+use render::aa::AaReport;
 use render::camera::View;
 use render::cull::{BoundsUpdate, SlotBuffers};
 use render::gpu::Gpu;
@@ -134,6 +135,8 @@ pub(crate) struct Presented {
     pub(crate) scene: bool,
     /// Whether a scene was shown, drawn or shaded again (`render::Drawn::shown`).
     pub(crate) shown: bool,
+    /// What its anti-aliasing did (`render::Drawn::aa`).
+    pub(crate) aa: AaReport,
 }
 
 /// A hook the render thread calls.
@@ -446,6 +449,7 @@ pub(crate) fn draw_frame(
         times: drawn.times,
         scene: drawn.scene,
         shown: drawn.shown,
+        aa: drawn.aa,
     })
 }
 

@@ -74,7 +74,7 @@
 //!
 //! The histories are two storage buffers bound whole, so an image whose buffers pass the device's
 //! `max_storage_buffer_binding_size` (often 128 MiB on mobile: 5K and up) isn't accumulated:
-//! [`Accumulation::fits`] says so when the size is known, and still frames are filtered as moving
+//! `Accumulation::fits` says so when the size is known, and still frames are filtered as moving
 //! ones are ([`AaReport::filtered_instead`]). So is a frame whose accumulation the GPU refuses: the
 //! frame is shown, never failed. Splitting the buffers into bands of rows would lift the limit;
 //! nothing needs it yet.

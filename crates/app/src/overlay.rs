@@ -54,6 +54,9 @@ pub(crate) struct Snapshot<'a> {
     pub(crate) look: Look,
     /// The last pick under the pointer; `None` if the frame loop doesn't pick.
     pub(crate) pick: Option<&'a PickReport>,
+    /// Whether still frames are filtered instead of accumulated (the image is too large for the
+    /// device to accumulate).
+    pub(crate) filter_only: bool,
 }
 
 /// `duration` in milliseconds, to two places.
@@ -83,6 +86,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         camera,
         look,
         pick,
+        filter_only,
     } = *snapshot;
     let view = match look.view {
         SceneView::Shaded => format!("matcap {}", look.material.name()),
@@ -137,6 +141,14 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         ),
         format!(
             "look       {view}  wireframe {wireframe}  (keys: M matcap, W wireframe, C clusters)"
+        ),
+        format!(
+            "aa         {}",
+            if filter_only {
+                "filtered only: too large to accumulate on this GPU"
+            } else {
+                "accumulating while still, filtered while moving"
+            }
         ),
         format!("pick       {}", crate::pick::summary(pick)),
     ]
@@ -299,6 +311,7 @@ mod tests {
                 material: render::material::MatCapStyle::Glossy,
             },
             pick: None,
+            filter_only: false,
         };
         let text = lines(&snapshot).join("\n");
         for expected in [
