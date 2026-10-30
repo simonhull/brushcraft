@@ -464,6 +464,11 @@ fn a_record_is_its_header_its_positions_and_its_rings() {
         words[HEADER_STENCILS], STENCIL_CORNER,
         "corner 0 reads its ring"
     );
+    assert_eq!(
+        words[HEADER_STENCILS + STENCILS - 1],
+        encode(OWN_AXES),
+        "the inside's stencil is in the record too"
+    );
     let header = |at: usize| usize::try_from(words[at]).expect("small");
     assert_eq!(
         header(HEADER_RINGS),

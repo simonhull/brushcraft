@@ -32,20 +32,18 @@ struct Job {
 const GROUP: u32 = 64u;
 // Record header: quads per side.
 const HEADER_QUADS: u32 = 0u;
-// Record header: the stencils, block corners 0 to 3 then tile edges 0 to 3.
+// Record header: the stencils, block corners 0 to 3, tile edges 0 to 3, then inside the tile.
 const HEADER_STENCILS: u32 = 1u;
 // Record header: per block corner, its ring's first edge point, in words from the record's start.
-const HEADER_RINGS: u32 = 9u;
+const HEADER_RINGS: u32 = 10u;
 // Record header: per block corner, its ring's valence (0 where the corner isn't a base vertex).
-const HEADER_VALENCES: u32 = 13u;
+const HEADER_VALENCES: u32 = 14u;
 // Words before the positions.
 const HEADER_WORDS: u32 = 20u;
 // A stencil reading the ring of block corner `stencil & 3`.
 const STENCIL_CORNER: u32 = 0x80000000u;
 // A stencil off the face: NaN.
 const STENCIL_OUTSIDE: u32 = 0x40000000u;
-// The block's own axes, u = (1, 0) and v = (0, 1), each step stored plus one in two bits.
-const STENCIL_OWN: u32 = 150u;
 // The smallest normal f32: lengths at or below it have no direction.
 const MIN_POSITIVE: f32 = 1.17549435e-38;
 // A quiet NaN's bits.
@@ -117,10 +115,11 @@ fn unit_or_fallback(n: vec3<f32>, inputs_finite: bool, zero: u32) -> vec3<f32> {
 
 // The normal at the base vertex `v` at block corner `c` of the record at `record`, from its
 // ring: the sum over k of (e_k - v) × (e_(k+1) - v), from the owner round the ring, wrapping,
-// at unit length. NaN without a ring, or for a ring that isn't finite.
+// at unit length. NaN without a ring of two points at least (as geom's corner frame), or for a
+// ring that isn't finite.
 fn corner_normal(record: u32, c: u32, v: vec3<f32>, zero: u32) -> vec3<f32> {
     let valence = records[record + HEADER_VALENCES + c];
-    if valence == 0u {
+    if valence < 2u {
         return nan3(zero);
     }
     let first = record + records[record + HEADER_RINGS + c];
@@ -141,40 +140,31 @@ fn corner_normal(record: u32, c: u32, v: vec3<f32>, zero: u32) -> vec3<f32> {
     return unit_or_fallback(sum, true, zero);
 }
 
-// The stencil of block vertex (i, j) of a tile of `q` quads a side: a block corner's own, a
-// tile edge's (every vertex strictly inside an edge has the same), or the block's own axes
-// inside the tile.
-fn stencil_at(record: u32, q: u32, i: u32, j: u32) -> u32 {
+// Which of the record's stencils block vertex (i, j) of a tile of `q` quads a side takes:
+// block corners (0, 0), (q, 0), (q, q), (0, q) are 0 to 3; the vertices strictly inside tile edges
+// j = 0, i = q, j = q, i = 0 are 4 to 7; the vertices inside the tile 8. Every one is read from
+// the record, so no vertex takes a stencil the compiler knows.
+fn stencil_index(q: u32, i: u32, j: u32) -> u32 {
     let low_i = i == 0u;
     let high_i = i == q;
     let low_j = j == 0u;
     let high_j = j == q;
     if (low_i || high_i) && (low_j || high_j) {
-        // Corners (0, 0), (q, 0), (q, q), (0, q): 0, 1, 2, 3.
-        var c = 0u;
-        if high_i && low_j {
-            c = 1u;
-        } else if high_i && high_j {
-            c = 2u;
-        } else if low_i && high_j {
-            c = 3u;
-        }
-        return records[record + HEADER_STENCILS + c];
+        return select(select(0u, 3u, high_j), select(1u, 2u, high_j), high_i);
     }
-    // Edges j = 0, i = q, j = q, i = 0: 0, 1, 2, 3.
     if low_j {
-        return records[record + HEADER_STENCILS + 4u];
+        return 4u;
     }
     if high_i {
-        return records[record + HEADER_STENCILS + 5u];
+        return 5u;
     }
     if high_j {
-        return records[record + HEADER_STENCILS + 6u];
+        return 6u;
     }
     if low_i {
-        return records[record + HEADER_STENCILS + 7u];
+        return 7u;
     }
-    return STENCIL_OWN;
+    return 8u;
 }
 
 // The grid step stored in two bits of a stencil from bit `shift`, plus one.
@@ -203,7 +193,7 @@ fn finest_normals(
     let zero = q & 0u;
     let g = vec2<i32>(i32(i), i32(j));
     let here = position(record, padded, g);
-    let stencil = stencil_at(record, q, i, j);
+    let stencil = records[record + HEADER_STENCILS + stencil_index(q, i, j)];
     var normal: vec3<f32>;
     if (stencil & STENCIL_CORNER) != 0u {
         normal = corner_normal(record, stencil & 3u, here, zero);

@@ -29,7 +29,12 @@
 //! [`geom::GatheredBlock`]'s notes spell out what the CPU computes, in `f32` without fused
 //! multiply-adds; the shader writes the same expressions in the same order. Bit equality with the
 //! CPU isn't promised: a GPU's square root and division are within a few ULP rather than correctly
-//! rounded, and its compiler may fuse a product into a subtraction. What is promised is the seam:
+//! rounded, its compiler may fuse a product into a subtraction, and it may flush denormals to zero
+//! (WGSL allows it): where the CPU normalizes a normal whose squared length is denormal (a cross
+//! product below about 1e-19), such a GPU takes it as zero and gives the fallback `(0, 0, 1)`.
+//! Matching it would mean changing the CPU's formula in `geom` too; at the scales a sculpt has
+//! (positions of order 1, finest steps of order 1e-3, squared lengths of order 1e-12) it doesn't
+//! arise. What is promised is the seam:
 //! every vertex runs the same code, its stencil read as data, so two tiles holding a vertex compute
 //! it with the same instructions from the same bits (the store gives every copy of a vertex its
 //! owner's bits, and every face's copy of a base vertex's ring the owner's order).
@@ -40,12 +45,13 @@
 //! tile, the block's own axes; on a tile edge, one stencil for every vertex strictly inside that
 //! edge (the edge lies inside the face, with the block's own axes, or along one face edge, with
 //! the axes of the face owning it); at a block corner, its own (a base vertex's ring, or a face
-//! edge's axes). So a record carries eight stencils, the four corners' and one per edge, taken from
-//! `vertex_stencil` at the corners and the edges' middle vertices.
+//! edge's axes). So a record carries nine stencils, the four corners' and one per edge, taken from
+//! `vertex_stencil` at the corners and the edges' middle vertices, and the inside's; a vertex picks
+//! one by its place and reads it from the record, so every vertex runs the same code on data.
 
 use std::collections::BTreeMap;
 
-use geom::{BaseMesh, GatheredBlock, VertexStencil, vertex_stencil};
+use geom::{BaseMesh, GatheredBlock, Vec3, VertexStencil, vertex_stencil};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding, BufferBindingType,
@@ -70,15 +76,20 @@ const GROUP: u32 = 64;
 /// Header word: quads per side.
 const HEADER_QUADS: usize = 0;
 
-/// Header words: the stencils of block corners 0 to 3, then of tile edges 0 to 3 (`j = 0`,
-/// `i = q`, `j = q`, `i = 0`).
+/// Header words: the stencils, by the index `normals.wgsl`'s `stencil_index` gives a vertex.
+///
+/// Block corners 0 to 3, then tile edges 0 to 3 (`j = 0`, `i = q`, `j = q`, `i = 0`), then the
+/// vertices inside the tile ([`OWN_AXES`]).
 const HEADER_STENCILS: usize = 1;
 
+/// How many stencils a record holds.
+const STENCILS: usize = 9;
+
 /// Header words: per block corner, its ring's first edge point, in words from the record's start.
-const HEADER_RINGS: usize = 9;
+const HEADER_RINGS: usize = HEADER_STENCILS + STENCILS;
 
 /// Header words: per block corner, its ring's valence (0 where the corner isn't a base vertex).
-const HEADER_VALENCES: usize = 13;
+const HEADER_VALENCES: usize = HEADER_RINGS + 4;
 
 /// Words before the positions: the header, padded.
 const HEADER_WORDS: usize = 20;
@@ -99,12 +110,13 @@ const OWN_AXES: VertexStencil = VertexStencil::Axes([[1, 0], [0, 1]]);
 /// Layout, in words:
 ///
 /// - `0`: `q`, the quads per side (64 for a tile of 65² vertices);
-/// - `1..9`: the stencils of block corners `(0, 0)`, `(q, 0)`, `(q, q)`, `(0, q)`, then of the
-///   vertices strictly inside tile edges `j = 0`, `i = q`, `j = q`, `i = 0`: `STENCIL_CORNER` with
-///   the corner, `STENCIL_OUTSIDE`, or the axes `[[ui, uj], [vi, vj]]`, each step plus one in two
-///   bits from bit 0;
-/// - `9..13`: per block corner, the word its ring's edge points start at;
-/// - `13..17`: per block corner, its ring's valence, 0 where it isn't a base vertex;
+/// - `1..10`: the stencils of block corners `(0, 0)`, `(q, 0)`, `(q, q)`, `(0, q)`, then of the
+///   vertices strictly inside tile edges `j = 0`, `i = q`, `j = q`, `i = 0`, then of the vertices
+///   inside the tile (the block's own axes): `STENCIL_CORNER` with the corner, `STENCIL_OUTSIDE`,
+///   or the axes `[[ui, uj], [vi, vj]]`, each step plus one in two bits from bit 0. Every vertex
+///   reads its stencil from here, none takes one the shader knows;
+/// - `10..14`: per block corner, the word its ring's edge points start at;
+/// - `14..18`: per block corner, its ring's valence, 0 where it isn't a base vertex;
 /// - `20..`: the `(q + 3)²` positions, row-major from `(-1, -1)`, three words each (as
 ///   [`GatheredBlock::padded`]), then each base vertex's edge points, owner first, three words
 ///   each; padded to a whole number of 8 bytes, as staging copies need.
@@ -117,39 +129,52 @@ pub struct RingRecord {
 impl RingRecord {
     /// Makes this the record of `block`, gathered over `mesh` (whose topology gives the
     /// stencils), reusing its memory.
-    pub fn write(&mut self, mesh: &BaseMesh, block: &GatheredBlock) {
+    pub(crate) fn write(&mut self, mesh: &BaseMesh, block: &GatheredBlock) {
         let region = block.region();
         let q = region.quads();
-        let words = &mut self.words;
-        words.clear();
-        words.resize(HEADER_WORDS, 0);
         let corners = [(0, 0), (q, 0), (q, q), (0, q)];
         let middle = q / 2;
         let edges = [(middle, 0), (q, middle), (middle, q), (0, middle)];
-        let at = corners.into_iter().chain(edges);
-        let stencils = at.enumerate().map(|(k, (i, j))| {
+        let mut stencils = [encode(OWN_AXES); STENCILS];
+        let at = corners.into_iter().chain(edges).enumerate();
+        for ((k, (i, j)), stencil) in at.zip(&mut stencils) {
             // Every vertex of a tile edge is one of its corners when the tile is one quad wide.
-            if k >= 4 && q < 2 {
-                encode(OWN_AXES)
-            } else {
-                encode(vertex_stencil(mesh, region, i, j))
+            if k < 4 || q >= 2 {
+                *stencil = encode(vertex_stencil(mesh, region, i, j));
             }
-        });
-        for (slot, stencil) in words.iter_mut().skip(HEADER_STENCILS).zip(stencils) {
-            *slot = stencil;
         }
+        let rings = [0, 1, 2, 3].map(|c| block.corner(c).map(geom::GatheredRing::edges));
+        self.assemble(q, &stencils, block.padded(), rings);
+    }
+
+    /// Makes this the record of a tile of `q` quads a side: its stencils (by `stencil_index`), its
+    /// `(q + 3)²` positions with the ring, and per block corner the edge points of the base
+    /// vertex's ring there, if it is one.
+    pub(crate) fn assemble(
+        &mut self,
+        q: u32,
+        stencils: &[u32; STENCILS],
+        padded: &[Vec3],
+        rings: [Option<&[Vec3]>; 4],
+    ) {
+        let words = &mut self.words;
+        words.clear();
+        words.resize(HEADER_WORDS, 0);
         if let Some(first) = words.get_mut(HEADER_QUADS) {
             *first = q;
         }
-        let points = block.padded().iter().flat_map(|p| p.to_bits());
-        words.extend(points);
-        for c in 0..4 {
-            let Some(ring) = block.corner(c) else {
+        let header = words.iter_mut().skip(HEADER_STENCILS).zip(stencils);
+        for (slot, stencil) in header {
+            *slot = *stencil;
+        }
+        words.extend(padded.iter().flat_map(|p| p.to_bits()));
+        for (c, ring) in rings.into_iter().enumerate() {
+            let Some(edges) = ring else {
                 continue;
             };
             let start = u32::try_from(words.len()).unwrap_or(u32::MAX);
-            let valence = u32::try_from(ring.valence()).unwrap_or(0);
-            words.extend(ring.edges().iter().flat_map(|e| e.to_bits()));
+            let valence = u32::try_from(edges.len()).unwrap_or(0);
+            words.extend(edges.iter().flat_map(|e| e.to_bits()));
             if let Some(slot) = words.get_mut(HEADER_RINGS + c) {
                 *slot = start;
             }
@@ -182,7 +207,7 @@ impl RingRecord {
 }
 
 /// `stencil` as a record's header word.
-fn encode(stencil: VertexStencil) -> u32 {
+pub(crate) fn encode(stencil: VertexStencil) -> u32 {
     /// A grid step (-1, 0 or 1), plus one, in two bits.
     fn step(x: i32) -> u32 {
         (x.clamp(-1, 1) + 1).unsigned_abs()
