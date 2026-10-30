@@ -162,6 +162,12 @@ impl FramePasses {
         self.aa = Accumulation::patched(gpu, capacity, patches).expect("the patched pass");
     }
 
+    /// The accumulation, to set a smaller binding limit in the tests.
+    #[cfg(test)]
+    pub(crate) const fn aa_mut(&mut self) -> &mut Accumulation {
+        &mut self.aa
+    }
+
     /// The accumulation: its means, which the tone map shows while the camera is still.
     pub(crate) const fn aa(&self) -> &Accumulation {
         &self.aa

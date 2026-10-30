@@ -26,12 +26,13 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use wgpu::{
-    Color, CommandEncoder, CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
-    RenderPassDescriptor, StoreOp, TextureFormat,
+    Buffer, Color, CommandEncoder, CommandEncoderDescriptor, LoadOp, Operations,
+    RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureFormat,
 };
 
-use crate::aa::{AaFrame, AaState};
+use crate::aa::{AaFrame, AaReport, AaState};
 use crate::camera::Jitter;
+use crate::cull::BoundsUpdate;
 use crate::gpu::{Gpu, GpuError};
 use crate::lod::CutReadback;
 use crate::material::MatCapStyle;
@@ -143,6 +144,8 @@ pub struct Drawn {
     pub scene: bool,
     /// Whether a scene was shown: drawn, or shaded again.
     pub shown: bool,
+    /// What its anti-aliasing did ([`crate::aa`]).
+    pub aa: AaReport,
 }
 
 /// Why a frame couldn't be drawn.
@@ -203,6 +206,8 @@ struct EncodedScene {
     readback: Option<CutReadback>,
     /// Whether there is an image to show.
     shown: bool,
+    /// What its anti-aliasing did.
+    aa: AaReport,
 }
 
 /// Draws frames: the passes and their GPU state.
@@ -349,7 +354,7 @@ impl Renderer {
             submit(gpu, uploads, commands, passes);
             encoded
         })?;
-        let (scene, visible) = settle(outcome, drawing, &mut self.aa)?;
+        let (scene, visible, report) = settle(outcome, drawing, &mut self.aa)?;
         times.encode = encoding.elapsed();
         let presenting = Instant::now();
         before_present();
@@ -361,6 +366,7 @@ impl Renderer {
             times,
             scene,
             shown: visible,
+            aa: report,
         })
     }
 }
@@ -403,24 +409,25 @@ fn encode_scene(
     let encoded = match scene {
         Scene::None => return None,
         Scene::Draw(scene) => (|| {
-            let step = aa.draw(!scene.moving, showing.look, showing.size);
+            let accumulable = passes.aa().fits(showing.size);
+            let still = !scene.moving;
+            let step = aa.draw(still, accumulable, showing.look, showing.size);
             let jitter = match step {
                 AaFrame::Accumulate { jitter, .. } => jitter,
                 AaFrame::Plain | AaFrame::Filter | AaFrame::Show => Jitter::CENTRE,
             };
             let readback = passes.encode_jittered(gpu, frame, scene, jitter)?;
             passes.encode_shading(gpu, frame, scene)?;
-            if let AaFrame::Accumulate { restart, .. } = step {
-                let changes = Some(scene.bounds);
-                passes.encode_accumulation(gpu, frame, Some(scene.tree), changes, restart)?;
-            }
-            Ok((
-                EncodedScene {
-                    readback,
-                    shown: true,
-                },
-                step,
-            ))
+            let tree = Some(scene.tree);
+            let (step, mut report) =
+                accumulate(gpu, frame, passes, aa, step, (tree, Some(scene.bounds)));
+            report.filtered_instead |= shaded && still && !accumulable;
+            let encoded = EncodedScene {
+                readback,
+                shown: true,
+                aa: report,
+            };
+            Ok((encoded, step))
         })(),
         Scene::Reshade => (|| {
             let visibility = passes.raster().visibility();
@@ -431,24 +438,30 @@ fn encode_scene(
                 let nothing = EncodedScene {
                     readback: None,
                     shown: false,
+                    aa: AaReport::default(),
                 };
                 return Ok((nothing, AaFrame::Plain));
             }
-            let step = aa.reshade(showing.look, showing.size);
-            let visible = match step {
-                AaFrame::Show => passes.aa().mean().is_some(),
-                AaFrame::Accumulate { restart, .. } => {
+            let accumulable = passes.aa().fits(showing.size);
+            let step = aa.reshade(accumulable, showing.look, showing.size);
+            let (visible, step, mut report) = match step {
+                AaFrame::Show => (passes.aa().mean().is_some(), step, AaReport::default()),
+                AaFrame::Accumulate { .. } | AaFrame::Filter => {
                     let again = passes.encode_shading_again(gpu, frame)?;
-                    if again {
-                        passes.encode_accumulation(gpu, frame, None, None, restart)?;
-                    }
-                    again
+                    let (step, report) = if again {
+                        accumulate(gpu, frame, passes, aa, step, (None, None))
+                    } else {
+                        (step, AaReport::default())
+                    };
+                    (again, step, report)
                 }
-                AaFrame::Plain | AaFrame::Filter => true,
+                AaFrame::Plain => (true, step, AaReport::default()),
             };
+            report.filtered_instead |= shaded && !accumulable;
             let encoded = EncodedScene {
                 readback: None,
                 shown: visible,
+                aa: report,
             };
             Ok((encoded, step))
         })(),
@@ -463,6 +476,42 @@ fn encode_scene(
         }
         Ok(encoded)
     }))
+}
+
+/// Encodes the accumulation of the frame just shaded, if `step` accumulates; returns the step
+/// taken and what it did.
+///
+/// It reads `inputs`: the tile tree's buffer and the tiles whose data changed (`None` for the
+/// last tree, and none). A refusal never fails the frame: the histories are dropped (`aa`
+/// restarts next time) and the frame is filtered instead.
+fn accumulate(
+    gpu: &Gpu,
+    frame: &mut CommandEncoder,
+    passes: &mut FramePasses,
+    aa: &mut AaState,
+    step: AaFrame,
+    (tree, changes): (Option<&Buffer>, Option<&BoundsUpdate>),
+) -> (AaFrame, AaReport) {
+    let AaFrame::Accumulate { restart, .. } = step else {
+        return (step, AaReport::default());
+    };
+    match passes.encode_accumulation(gpu, frame, tree, changes, restart) {
+        Ok(()) => (
+            step,
+            AaReport {
+                restarted: restart,
+                filtered_instead: false,
+            },
+        ),
+        Err(_refused) => {
+            aa.lost();
+            let report = AaReport {
+                restarted: false,
+                filtered_instead: true,
+            };
+            (AaFrame::Filter, report)
+        }
+    }
 }
 
 /// Binds the image a shaded frame shows for the tone map, as `step` made it: the histories'
@@ -495,8 +544,10 @@ fn bind_shaded(
     Ok(())
 }
 
-/// What a submitted frame's scene came to: whether it was drawn (`drawing`, if encoded) and
-/// shown. Its readback is marked submitted; a scene not shown leaves `aa` no history to continue.
+/// What a submitted frame's scene came to: drawn, shown, and its anti-aliasing.
+///
+/// Drawn means `drawing`, if it was encoded. Its readback is marked submitted; a scene not shown
+/// leaves `aa` no history to continue.
 ///
 /// # Errors
 ///
@@ -505,19 +556,19 @@ fn settle(
     outcome: Option<Result<EncodedScene, FrameError>>,
     drawing: bool,
     aa: &mut AaState,
-) -> Result<(bool, bool), FrameError> {
+) -> Result<(bool, bool, AaReport), FrameError> {
     let settled = match outcome {
         Some(Ok(encoded)) => {
             if let Some(readback) = encoded.readback {
                 readback.submitted();
             }
-            (drawing, encoded.shown)
+            (drawing, encoded.shown, encoded.aa)
         }
         Some(Err(error)) => {
             aa.lost();
             return Err(error);
         }
-        None => (false, false),
+        None => (false, false, AaReport::default()),
     };
     if !settled.1 {
         aa.lost();
@@ -576,5 +627,6 @@ fn not_drawn(
         times,
         scene: false,
         shown: false,
+        aa: AaReport::default(),
     })
 }

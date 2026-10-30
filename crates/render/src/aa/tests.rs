@@ -409,7 +409,7 @@ fn the_jitters_are_the_halton_points_about_the_pixels_centre() {
 fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
     let mut state = AaState::default();
     let size = size();
-    let first = state.draw(true, LOOK, size);
+    let first = state.draw(true, true, LOOK, size);
     assert_eq!(
         first,
         AaFrame::Accumulate {
@@ -417,7 +417,7 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
             restart: true
         }
     );
-    let second = state.draw(true, LOOK, size);
+    let second = state.draw(true, true, LOOK, size);
     assert_eq!(
         second,
         AaFrame::Accumulate {
@@ -426,7 +426,7 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
         }
     );
     assert_eq!(
-        state.reshade(LOOK, size),
+        state.reshade(true, LOOK, size),
         AaFrame::Show,
         "nothing new to shade"
     );
@@ -435,7 +435,7 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
         ..LOOK
     };
     assert_eq!(
-        state.reshade(glossy, size),
+        state.reshade(true, glossy, size),
         AaFrame::Accumulate {
             jitter: jitter(1),
             restart: true
@@ -443,15 +443,19 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
         "the last raster's sample, shaded anew, starts the history"
     );
     assert_eq!(
-        state.draw(true, glossy, size),
+        state.draw(true, true, glossy, size),
         AaFrame::Accumulate {
             jitter: jitter(2),
             restart: false
         }
     );
-    assert_eq!(state.draw(false, glossy, size), AaFrame::Filter, "moving");
     assert_eq!(
-        state.draw(true, glossy, size),
+        state.draw(false, true, glossy, size),
+        AaFrame::Filter,
+        "moving"
+    );
+    assert_eq!(
+        state.draw(true, true, glossy, size),
         AaFrame::Accumulate {
             jitter: Jitter::CENTRE,
             restart: true
@@ -460,17 +464,17 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
     );
     let other = Size::new(64, 64).expect("non-zero");
     assert!(matches!(
-        state.draw(true, glossy, other),
+        state.draw(true, true, glossy, other),
         AaFrame::Accumulate { restart: true, .. }
     ));
     let clusters = Look {
         view: SceneView::Clusters,
         ..LOOK
     };
-    assert_eq!(state.draw(true, clusters, other), AaFrame::Plain);
+    assert_eq!(state.draw(true, true, clusters, other), AaFrame::Plain);
     state.lost();
     assert!(matches!(
-        state.draw(true, glossy, other),
+        state.draw(true, true, glossy, other),
         AaFrame::Accumulate { restart: true, .. }
     ));
 }
@@ -762,5 +766,36 @@ fn shading_again_in_the_same_look_keeps_the_image_and_a_new_look_restarts_it() {
             "restarted"
         );
         assert_ne!(session.pixels(gpu), pixels, "in the new look");
+    });
+}
+
+#[test]
+fn an_image_too_large_to_accumulate_is_filtered_while_still_and_never_fails() {
+    GpuTest::run(|gpu| {
+        let world = World::with_finest(gpu, 4);
+        let mut moving = Session::new(gpu, &world, EYE, size());
+        moving.draw(gpu, &world, true);
+        let filtered = moving.pixels(gpu);
+        // A device binding less than this image's histories need (a 5K window on 128 MiB).
+        let mut small = Session::new(gpu, &world, EYE, size());
+        let mut passes = passes_for(gpu, &world);
+        let pixels = u64::from(size().width() * size().height());
+        passes.aa_mut().set_limit(pixels * 8 - 1);
+        small.renderer.set_passes(passes);
+        for _ in 0..3 {
+            let drawn = small.draw(gpu, &world, false);
+            assert!(drawn.shown, "still shown: {drawn:?}");
+            assert!(
+                drawn.aa.filtered_instead && !drawn.aa.restarted,
+                "{drawn:?}"
+            );
+            assert_eq!(small.pixels(gpu), filtered, "filtered as a moving frame is");
+        }
+        let again = small.reshade(gpu, LOOK);
+        assert!(
+            again.shown && again.aa.filtered_instead,
+            "shading again too: {again:?}"
+        );
+        assert!(small.passes().aa().record().is_none(), "no histories made");
     });
 }

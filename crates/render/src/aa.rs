@@ -69,6 +69,15 @@
 //! ([`SAMPLES`] after the camera stops or the look changes, twice that after a scene change:
 //! one cycle for every pixel the change reaches to notice it, one to converge), then stops.
 //!
+//! # When it can't
+//!
+//! The histories are two storage buffers bound whole, so an image whose buffers pass the device's
+//! `max_storage_buffer_binding_size` (often 128 MiB on mobile: 5K and up) isn't accumulated:
+//! [`Accumulation::fits`] says so when the size is known, and still frames are filtered as moving
+//! ones are ([`AaReport::filtered_instead`]). So is a frame whose accumulation the GPU refuses: the
+//! frame is shown, never failed. Splitting the buffers into bands of rows would lift the limit;
+//! nothing needs it yet.
+//!
 //! # Moving
 //!
 //! A frame with the camera moving isn't jittered or accumulated: the tone map filters it
@@ -185,9 +194,16 @@ pub(crate) struct AaState {
 }
 
 impl AaState {
-    /// A frame drawing its scene with the camera `still` or not, shown as `look` at `size`.
-    pub(crate) fn draw(&mut self, still: bool, look: Look, size: Size) -> AaFrame {
-        if look.view != SceneView::Shaded || !still {
+    /// A frame drawing its scene with the camera `still` or not, shown as `look` at `size`; with
+    /// `accumulable` false (the histories don't fit), filtered even when still.
+    pub(crate) fn draw(
+        &mut self,
+        still: bool,
+        accumulable: bool,
+        look: Look,
+        size: Size,
+    ) -> AaFrame {
+        if look.view != SceneView::Shaded || !still || !accumulable {
             self.held = None;
             self.index = 0;
             return if look.view == SceneView::Shaded {
@@ -211,11 +227,16 @@ impl AaState {
 
     /// A frame shading the last scene again, shown as `look` at `size`: nothing to do if the
     /// histories are already of it ([`AaFrame::Show`]); otherwise the shading again is the first
-    /// sample of new histories, at the last raster's jitter.
-    pub(crate) fn reshade(&mut self, look: Look, size: Size) -> AaFrame {
+    /// sample of new histories, at the last raster's jitter. With `accumulable` false, the shading
+    /// again is filtered.
+    pub(crate) fn reshade(&mut self, accumulable: bool, look: Look, size: Size) -> AaFrame {
         if look.view != SceneView::Shaded {
             self.held = None;
             return AaFrame::Plain;
+        }
+        if !accumulable {
+            self.held = None;
+            return AaFrame::Filter;
         }
         if self.held == Some((look, size)) {
             return AaFrame::Show;
@@ -231,6 +252,17 @@ impl AaState {
     pub(crate) fn lost(&mut self) {
         self.held = None;
     }
+}
+
+/// What a frame's anti-aliasing did, for the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AaReport {
+    /// Every pixel's history started again with this frame's sample: [`SAMPLES`] − 1 frames more
+    /// converge it.
+    pub restarted: bool,
+    /// The camera was still, but the image couldn't accumulate (its histories don't fit the
+    /// device's bindings, or the GPU refused them): it was filtered instead.
+    pub filtered_instead: bool,
 }
 
 /// Why accumulation couldn't be set up or encoded.
@@ -360,6 +392,8 @@ pub(crate) struct Accumulation {
     tree: Option<Buffer>,
     /// The last frame's number; 0 before the first.
     frame: u32,
+    /// The largest buffer the device binds.
+    limit: u64,
 }
 
 impl Accumulation {
@@ -495,7 +529,20 @@ impl Accumulation {
             history: None,
             tree: None,
             frame: 0,
+            limit: device.limits().max_storage_buffer_binding_size,
         })
+    }
+
+    /// Whether an image of `size` can accumulate: both its history buffers fit a binding.
+    pub(crate) fn fits(&self, size: Size) -> bool {
+        let pixels = u64::from(size.width()) * u64::from(size.height());
+        pixels * MEAN_BYTES.max(RECORD_BYTES) <= self.limit
+    }
+
+    /// Binds at most `limit` bytes a buffer from now on, as a smaller device would.
+    #[cfg(test)]
+    pub(crate) const fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
     }
 
     /// The per-pixel means, four half floats a pixel (red and green, blue and coverage, each
@@ -546,7 +593,7 @@ impl Accumulation {
             .is_none_or(|history| history.size != size);
         if resized {
             self.history = None;
-            self.history = Some(new_history(gpu, size)?);
+            self.history = Some(new_history(gpu, size, self.limit)?);
         }
         let renumbered = self.next_frame(encoder);
         let restart = inputs.restart || resized || renumbered;
@@ -688,10 +735,9 @@ impl Accumulation {
 ///
 /// # Errors
 ///
-/// [`AaError::TooLarge`] past the device's binding limit; [`AaError::Gpu`] if refused.
-fn new_history(gpu: &Gpu, size: (u32, u32)) -> Result<History, AaError> {
+/// [`AaError::TooLarge`] past `limit`, the device's binding limit; [`AaError::Gpu`] if refused.
+fn new_history(gpu: &Gpu, size: (u32, u32), limit: u64) -> Result<History, AaError> {
     let pixels = u64::from(size.0) * u64::from(size.1);
-    let limit = gpu.device().limits().max_storage_buffer_binding_size;
     for bytes in [pixels * MEAN_BYTES, pixels * RECORD_BYTES] {
         if bytes > limit {
             return Err(AaError::TooLarge { bytes, limit });
