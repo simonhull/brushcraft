@@ -27,7 +27,8 @@
 //! - from the frame's cut: `drawn` (whether it came back), `triangles`, `cut`, `tiles_per_level`
 //!   (the cut's tiles at each level from 0), `over_budget` (tiles in view left over 1 px, the
 //!   spec's count), `waiting`, `budget_limited` and `held_by_neighbours` (why), `shortfall`,
-//!   `requested`, `relax_passes`;
+//!   `cone_culled` (tiles culled by their normal cone) and `cone_exempt` (tiles their cone would
+//!   cull, drawn because their morph isn't settled), `requested`, `relax_passes`;
 //! - residency as the frame was staged: `resident`, `wanted`, `evicted` (this frame),
 //!   `uploaded_bytes` and `uploaded_tiles`.
 
@@ -314,6 +315,8 @@ impl FrameRecord {
             .with("budget_limited", stat(|s| s.budget_limited))
             .with("held_by_neighbours", stat(|s| s.held_by_neighbours))
             .with("shortfall", stat(|s| s.shortfall))
+            .with("cone_culled", stat(|s| s.culled.1))
+            .with("cone_exempt", stat(|s| s.cone_exempt))
             .with("requested", stat(|s| s.requested))
             .with("relax_passes", scene.map(|s| s.stats.passes_used()))
     }
