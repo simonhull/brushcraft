@@ -53,7 +53,7 @@ fn take_all(store: &mut TileStore, budget: Duration) -> Vec<EvaluatedTile> {
 }
 
 /// Asserts that `tile` is the dense evaluation of `map`'s: positions, ring and normals, bit
-/// for bit.
+/// for bit (no normals at all for a tile queued for its positions alone).
 fn assert_dense(mesh: &BaseMesh, dense: &DenseEvaluation, tile: &EvaluatedTile, what: &str) {
     let key = tile.key();
     let positions: Vec<Vec3> = tile.rows().flatten().copied().collect();
@@ -75,6 +75,10 @@ fn assert_dense(mesh: &BaseMesh, dense: &DenseEvaluation, tile: &EvaluatedTile, 
         bits(ring.padded()),
         "{what} {key:?}: the ring"
     );
+    if tile.what() == Evaluation::Positions {
+        assert!(tile.normals().is_empty(), "{what} {key:?}: no normals");
+        return;
+    }
     let want = normals(mesh, dense, region).unwrap();
     assert_tile(
         tile.normals(),
@@ -120,6 +124,74 @@ fn queued_tiles_finish_highest_priority_first_as_the_dense_evaluation_has_them()
         store.take_evaluated().is_empty(),
         "each tile is handed over once"
     );
+}
+
+/// Queued for their positions alone, tiles come with their positions and ring as the dense
+/// evaluation has them, no normals, and none computed for them.
+#[test]
+fn tiles_queued_for_their_positions_alone_come_right_without_normals() {
+    let mesh = mesh();
+    for config in [roomy(), tight()] {
+        let dir = TestDir::new();
+        let (mut store, map) = edited(&dir, &mesh, config);
+        let wanted = prioritized(&mesh, 31);
+        let wanted = &wanted[..24];
+        store
+            .queue_evaluation_as(wanted, Evaluation::Positions)
+            .unwrap();
+        let taken = take_all(&mut store, Duration::from_millis(2));
+        assert_eq!(taken.len(), wanted.len(), "every tile");
+        let dense = dense(&mesh, &map);
+        for tile in &taken {
+            assert_eq!(tile.what(), Evaluation::Positions, "positions alone");
+            assert_dense(&mesh, &dense, tile, "positions alone");
+            assert!(
+                !store.is_cached(&tile.key()),
+                "{:?}: its normals never computed",
+                tile.key()
+            );
+        }
+        drop(store);
+    }
+}
+
+/// A write under a finished tile queued for its positions alone: it is evaluated again for its
+/// positions alone, never handed over stale.
+#[test]
+fn a_tile_of_positions_alone_outdated_by_a_write_stays_positions_alone() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, mut map) = edited(&dir, &mesh, roomy());
+    let wanted = prioritized(&mesh, 37);
+    store
+        .queue_evaluation_as(&wanted[..12], Evaluation::Positions)
+        .unwrap();
+    store.hooks.hold_evaluated = true;
+    let began = Instant::now();
+    while store.hooks.held_evaluated.is_empty() {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(1))
+            .unwrap();
+        assert!(began.elapsed() < Duration::from_secs(30), "one finishes");
+    }
+    let held = store.hooks.held_evaluated[0].key();
+    let region = Region::of_tile(&held);
+    let write = Edit {
+        face: held.face(),
+        level: level(TOP),
+        i: region.x0() + 30,
+        j: region.y0() + 30,
+        c: Vec3::new(0.01, -0.02, 0.015),
+    };
+    apply(&mut store, &mut map, &[write]);
+    store.hooks.hold_evaluated = false;
+    let taken = take_all(&mut store, Duration::from_millis(2));
+    assert_eq!(taken.len(), 12, "every tile, the held one again");
+    let dense = dense(&mesh, &map);
+    for tile in &taken {
+        assert_eq!(tile.what(), Evaluation::Positions, "positions alone");
+        assert_dense(&mesh, &dense, tile, "after a write");
+    }
 }
 
 #[test]

@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{GatheredBlock, TileKey, Vec3};
 
+use crate::Evaluation;
 use crate::jobs::ConeSteps;
 
 /// How much a caller wants a tile evaluated: higher first.
@@ -62,7 +63,8 @@ impl Ord for Priority {
 }
 
 /// A finest tile the queued evaluation finished: its evaluated positions with the one-vertex
-/// ring, and its unit normals, copied out of the store's cache.
+/// ring, and its unit normals unless it was queued for its positions alone, copied out of the
+/// store's cache.
 ///
 /// Handed over by [`TileStore::take_evaluated`](crate::TileStore::take_evaluated) only while
 /// it is still the tile as the store holds it: a write whose evaluations reach the tile or any
@@ -76,9 +78,9 @@ impl Ord for Priority {
 /// every evaluated tile whose positions moved, and a tile whose ring reads one of them has
 /// normals to compute again.
 ///
-/// The normals are the store's CPU normals, for a renderer that uploads them. Once the GPU
-/// computes finest normals from the ring itself (M1a3 Task 5), they are only a reference, and
-/// can go.
+/// The normals are the store's CPU normals. A renderer that computes them on the GPU from the
+/// ring queues its tiles for their positions alone
+/// ([`TileStore::queue_evaluation_as`](crate::TileStore::queue_evaluation_as)), and gets none.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvaluatedTile {
     /// The tile.
@@ -89,8 +91,10 @@ pub struct EvaluatedTile {
     /// [`TileStore::positions_with_ring`](crate::TileStore::positions_with_ring)).
     ring: GatheredBlock,
     /// Its unit normals, row-major `side²`, as [`TileStore::normals`](crate::TileStore::normals)
-    /// gives them.
+    /// gives them; empty for a tile queued for its positions alone.
     normals: Vec<Vec3>,
+    /// What it was evaluated for: its positions alone, or its normals too.
+    what: Evaluation,
     /// The tiles its copy was read from (its own and its ring's, [`TileStore::normal_inputs`]
     /// in key order): a write whose evaluations reach one outdates the copy.
     ///
@@ -111,7 +115,7 @@ impl EvaluatedTile {
         (padded * padded + side * side) * size_of::<Vec3>() + size_of::<Self>()
     };
 
-    /// A finished tile, current, copied from `inputs`.
+    /// A finished tile with its normals, current, copied from `inputs`.
     pub(crate) const fn new(
         key: TileKey,
         priority: f32,
@@ -124,9 +128,36 @@ impl EvaluatedTile {
             priority,
             ring,
             normals,
+            what: Evaluation::Normals,
             inputs,
             current: true,
         }
+    }
+
+    /// A finished tile of its positions alone, current, copied from `inputs`.
+    pub(crate) const fn positions(
+        key: TileKey,
+        priority: f32,
+        ring: GatheredBlock,
+        inputs: Vec<TileKey>,
+    ) -> Self {
+        Self {
+            key,
+            priority,
+            ring,
+            normals: Vec::new(),
+            what: Evaluation::Positions,
+            inputs,
+            current: true,
+        }
+    }
+
+    /// What it was evaluated for: [`Evaluation::Positions`] for a tile queued for its positions
+    /// alone ([`TileStore::queue_evaluation_as`](crate::TileStore::queue_evaluation_as)), whose
+    /// normals are empty; else [`Evaluation::Normals`].
+    #[must_use]
+    pub const fn what(&self) -> Evaluation {
+        self.what
     }
 
     /// The tile.
@@ -156,7 +187,8 @@ impl EvaluatedTile {
         rows.map(move |j| self.ring.row(j).get(1..=side).unwrap_or_default())
     }
 
-    /// Its unit normals, row-major `side²`: the store's, bit for bit.
+    /// Its unit normals, row-major `side²`: the store's, bit for bit. Empty for a tile queued
+    /// for its positions alone.
     #[must_use]
     pub fn normals(&self) -> &[Vec3] {
         &self.normals
@@ -237,6 +269,8 @@ impl Rank {
 pub(crate) struct EvaluationQueue {
     /// The tiles wanted and not finished, with their places in the queue.
     wanted: BTreeMap<TileKey, Rank>,
+    /// Those of them wanted for their positions alone, without normals.
+    positions_only: BTreeSet<TileKey>,
     /// The same, in the order they are evaluated: first by [`Rank`], then by key.
     order: BTreeSet<(Rank, TileKey)>,
     /// The cone of the tiles being evaluated (see `TileStore::step_cone`).
@@ -252,6 +286,7 @@ impl EvaluationQueue {
     pub(crate) const fn new(caps: EvaluationCaps) -> Self {
         Self {
             wanted: BTreeMap::new(),
+            positions_only: BTreeSet::new(),
             order: BTreeSet::new(),
             steps: ConeSteps::new(),
             finished: Vec::new(),
@@ -265,12 +300,37 @@ impl EvaluationQueue {
         self.rank(key, Rank::new(false, priority));
     }
 
-    /// Wants `key` again at `priority`, a write having outdated its copy: behind every tile
-    /// queued for the first time, so a tile a brush keeps writing under can't keep the job from
-    /// the rest. A tile queued already keeps its place.
-    pub(crate) fn want_again(&mut self, key: TileKey, priority: Priority) {
+    /// [`EvaluationQueue::want`], for `what`: its positions alone, or its normals too (the
+    /// latest call says which).
+    pub(crate) fn want_as(&mut self, key: TileKey, priority: Priority, what: Evaluation) {
+        self.want(key, priority);
+        self.set_what(key, what);
+    }
+
+    /// Notes what `key` is wanted for.
+    fn set_what(&mut self, key: TileKey, what: Evaluation) {
+        match what {
+            Evaluation::Positions => self.positions_only.insert(key),
+            Evaluation::Normals => self.positions_only.remove(&key),
+        };
+    }
+
+    /// What `key` is wanted for: its positions alone, or its normals too (the default).
+    pub(crate) fn what(&self, key: &TileKey) -> Evaluation {
+        if self.positions_only.contains(key) {
+            Evaluation::Positions
+        } else {
+            Evaluation::Normals
+        }
+    }
+
+    /// Wants `key` again at `priority`, for `what`, a write having outdated its copy: behind
+    /// every tile queued for the first time, so a tile a brush keeps writing under can't keep
+    /// the job from the rest. A tile queued already keeps its place.
+    pub(crate) fn want_again(&mut self, key: TileKey, priority: Priority, what: Evaluation) {
         if !self.wanted.contains_key(&key) {
             self.rank(key, Rank::new(true, priority));
+            self.set_what(key, what);
         }
     }
 
@@ -291,6 +351,7 @@ impl EvaluationQueue {
                 break;
             };
             self.wanted.remove(&key);
+            self.positions_only.remove(&key);
             dropped += 1;
         }
         self.drop_lost_cone();
@@ -318,6 +379,7 @@ impl EvaluationQueue {
         self.wanted.retain(|key, _| keep(key));
         let wanted = &self.wanted;
         self.order.retain(|(_, key)| wanted.contains_key(key));
+        self.positions_only.retain(|key| wanted.contains_key(key));
         self.finished.retain(|tile| keep(&tile.key));
         self.drop_lost_cone()
     }
@@ -332,6 +394,7 @@ impl EvaluationQueue {
         if let Some(rank) = self.wanted.remove(key) {
             self.order.remove(&(rank, *key));
         }
+        self.positions_only.remove(key);
     }
 
     /// Keeps `tile` for the caller, in place of a copy of the same tile not taken yet (a tile
@@ -376,6 +439,7 @@ impl EvaluationQueue {
     /// Forgets every wanted tile and the cone; the finished tiles stay, to be taken.
     pub(crate) fn clear(&mut self) {
         self.wanted.clear();
+        self.positions_only.clear();
         self.order.clear();
         self.steps.reset();
     }

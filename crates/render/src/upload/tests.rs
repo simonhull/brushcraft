@@ -386,8 +386,9 @@ fn report(what: &str, runs: &[(Duration, u64)]) {
         .expect("a run");
     let per_tile = took.as_secs_f64() * 1e6 / f64::from(u32::try_from(tiles).expect("small"));
     eprintln!(
-        "{what}: {tiles} tiles in {:.1} ms, {per_tile:.1} µs a tile (least of {})",
+        "{what}: {tiles} tiles in {:.1} ms, {per_tile:.1} µs a tile, {:.2} tiles/ms (least of {})",
         took.as_secs_f64() * 1e3,
+        1e3 / per_tile,
         runs.len()
     );
 }

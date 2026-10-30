@@ -51,11 +51,28 @@ impl TileStore {
     /// [`CacheError::NotATile`] for a key that isn't a tile of the store, before anything is
     /// queued.
     pub fn queue_evaluation(&mut self, keys: &[(TileKey, f32)]) -> Result<usize, CacheError> {
+        self.queue_evaluation_as(keys, Evaluation::Normals)
+    }
+
+    /// [`TileStore::queue_evaluation`], for `what`: with [`Evaluation::Positions`], the tiles
+    /// are evaluated for their positions and their ring's alone, and handed over without
+    /// normals ([`EvaluatedTile::normals`] is empty), for a renderer that computes them itself
+    /// from the ring; that skips the normals' work. A tile queued already takes the latest
+    /// call's `what`.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::queue_evaluation`].
+    pub fn queue_evaluation_as(
+        &mut self,
+        keys: &[(TileKey, f32)],
+        what: Evaluation,
+    ) -> Result<usize, CacheError> {
         for (key, _) in keys {
             self.check_key(key)?;
         }
         for &(key, priority) in keys {
-            self.evaluation.want(key, Priority::new(priority));
+            self.evaluation.want_as(key, Priority::new(priority), what);
         }
         Ok(self.evaluation.trim())
     }
@@ -201,20 +218,27 @@ impl TileStore {
             return Ok(Turn::Idle);
         }
         let t0 = Instant::now();
-        self.evaluate_many(&keys, Evaluation::Normals)?;
+        // Positions are current through the cone: only the tiles wanted with normals have work
+        // left.
+        let with_normals: Vec<TileKey> = keys
+            .iter()
+            .copied()
+            .filter(|key| queue.what(key) == Evaluation::Normals)
+            .collect();
+        if !with_normals.is_empty() {
+            self.evaluate_many(&with_normals, Evaluation::Normals)?;
+        }
         queue.steps.took(t0.elapsed(), keys.len());
         for key in keys {
             let priority = queue
                 .priority(&key)
                 .map_or(f32::NEG_INFINITY, Priority::get);
-            let tile = if let Some(tile) = self.copy_evaluated(key, priority)? {
+            let what = queue.what(&key);
+            let tile = if let Some(tile) = self.copy_evaluated(key, priority, what)? {
                 tile
             } else {
                 // Evicted by the round after it (a budget about the size of the batch).
-                let ring = self.positions_with_ring(key)?;
-                let normals = self.normals(key)?.to_vec();
-                let inputs = self.normal_inputs(&key)?.into_owned();
-                EvaluatedTile::new(key, priority, ring, normals, inputs)
+                self.evaluated_copy(key, priority, what)?
             };
             queue.done(&key);
             report.queue_finished += 1;
@@ -249,22 +273,23 @@ impl TileStore {
                 break;
             }
             any = true;
-            let (key, priority) = (tile.key(), tile.priority());
-            if let Some(fresh) = self.copy_evaluated(key, priority)? {
+            let (key, priority, what) = (tile.key(), tile.priority(), tile.what());
+            if let Some(fresh) = self.copy_evaluated(key, priority, what)? {
                 if let Some(slot) = queue.finished.get_mut(at) {
                     *slot = fresh;
                 }
                 at += 1;
             } else {
                 queue.finished.remove(at);
-                queue.want_again(key, Priority::new(priority));
+                queue.want_again(key, Priority::new(priority), what);
             }
         }
         Ok(any)
     }
 
-    /// `key` copied out of the cache for the caller, at `priority`: its positions with the ring
-    /// and its normals, as of now. `None` unless it, and every tile its ring reads, is cached
+    /// `key` copied out of the cache for the caller, at `priority`, for `what`: its positions
+    /// with the ring, and its normals unless `what` is [`Evaluation::Positions`], as of now.
+    /// `None` unless it (with its normals, if wanted), and every tile its ring reads, is cached
     /// and current.
     ///
     /// # Errors
@@ -274,20 +299,45 @@ impl TileStore {
         &self,
         key: TileKey,
         priority: f32,
+        what: Evaluation,
     ) -> Result<Option<EvaluatedTile>, CacheError> {
-        let Some(normals) = self.cached_normals(&key) else {
-            return Ok(None);
+        let normals = match what {
+            Evaluation::Positions => None,
+            Evaluation::Normals => match self.cached_normals(&key) {
+                Some(normals) => Some(normals.to_vec()),
+                None => return Ok(None),
+            },
         };
         let Some(ring) = self.cached_positions_with_ring(&key)? else {
             return Ok(None);
         };
         let inputs = self.normal_inputs(&key)?.into_owned();
-        Ok(Some(EvaluatedTile::new(
-            key,
-            priority,
-            ring,
-            normals.to_vec(),
-            inputs,
-        )))
+        Ok(Some(match normals {
+            Some(normals) => EvaluatedTile::new(key, priority, ring, normals, inputs),
+            None => EvaluatedTile::positions(key, priority, ring, inputs),
+        }))
+    }
+
+    /// `key` evaluated and copied for the caller, at `priority`, for `what`, whatever the cache
+    /// holds: for a tile the cache let go of before it was copied.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::positions_with_ring`] and [`TileStore::normals`].
+    fn evaluated_copy(
+        &mut self,
+        key: TileKey,
+        priority: f32,
+        what: Evaluation,
+    ) -> Result<EvaluatedTile, CacheError> {
+        let ring = self.positions_with_ring(key)?;
+        let inputs = self.normal_inputs(&key)?.into_owned();
+        Ok(match what {
+            Evaluation::Positions => EvaluatedTile::positions(key, priority, ring, inputs),
+            Evaluation::Normals => {
+                let normals = self.normals(key)?.to_vec();
+                EvaluatedTile::new(key, priority, ring, normals, inputs)
+            }
+        })
     }
 }

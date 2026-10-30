@@ -4,7 +4,8 @@
 //! cone, which may have to be read from the file first (about 0.8 ms a tile cold). Evaluated
 //! while staging, that blocked the owner thread before the frame was handed off. Instead the
 //! requested finest tiles go to the store's queued evaluation
-//! ([`TileStore::queue_evaluation`]), which runs in the frame loop's jobs phase after the
+//! ([`TileStore::queue_evaluation_as`], for their positions and ring alone: the GPU computes
+//! their normals), which runs in the frame loop's jobs phase after the
 //! hand-off ([`TileStore::run_jobs`], taking turns with the display jobs). What it finished is
 //! taken ([`TileStore::take_evaluated`]) and held here, each tile a copy of its positions with
 //! the ring ([`EvaluatedTile`]), until residency stages it: [`StoreSource`] reads a requested
@@ -24,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{Channel, TileKey};
-use store::{CacheError, Drained, EvaluatedTile, TileStore};
+use store::{CacheError, Drained, EvaluatedTile, Evaluation, TileStore};
 
 #[cfg(doc)]
 use super::StoreSource;
@@ -64,14 +65,14 @@ impl FinestEvaluations {
     /// stages: takes the copies the job finished, keeps those of finest tiles still wanted,
     /// and queues every other wanted finest tile at its screen error, withdrawing the rest
     /// from the queue. Returns how many queued keys the store dropped to keep its queue within
-    /// its budget share ([`TileStore::queue_evaluation`]).
+    /// its budget share ([`TileStore::queue_evaluation_as`]).
     ///
     /// Call it every frame, after [`Residency::want`]: a tile whose copy was outdated is
     /// queued again here.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::queue_evaluation`] (never, for the tiles of the store's mesh that
+    /// As [`TileStore::queue_evaluation_as`] (never, for the tiles of the store's mesh that
     /// residency wants).
     pub fn request(
         &mut self,
@@ -92,7 +93,7 @@ impl FinestEvaluations {
         let queue: Vec<(TileKey, f32)> = queue.collect();
         let queued: BTreeSet<TileKey> = queue.iter().map(|(key, _)| *key).collect();
         store.retain_evaluation(|key| queued.contains(key));
-        store.queue_evaluation(&queue)
+        store.queue_evaluation_as(&queue, Evaluation::Positions)
     }
 
     /// The copy held of `key`, if one is: evaluated, and current as of the last drain given
