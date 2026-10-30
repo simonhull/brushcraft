@@ -610,6 +610,8 @@ struct Changed {
     before: Vec<Record>,
     /// Per pixel, whether its history started again with the frame after it.
     reset: Vec<bool>,
+    /// That frame's visibility buffer.
+    ids: Vec<u32>,
 }
 
 impl Changed {
@@ -624,17 +626,8 @@ impl Changed {
     }
 }
 
-/// Converges `session`, picks a tile (the smallest with at least 100 pixels: a patch with
-/// neighbours all round), makes `change` to it, draws a still frame and reports.
-fn after_change(
-    gpu: &Gpu,
-    world: &mut World,
-    session: &mut Session,
-    change: impl FnOnce(&Gpu, &mut World, u32),
-) -> Changed {
-    session.converge(gpu, world);
-    let before = session.records(gpu);
-    let ids = session.ids(gpu);
+/// The smallest tile with at least 100 pixels in `ids`: a patch with neighbours all round.
+fn fair_tile(ids: &[u32]) -> u32 {
     let mut tally: BTreeMap<u32, usize> = BTreeMap::new();
     let nodes = ids.iter().filter_map(|&id| node_of(id));
     for node in nodes {
@@ -645,6 +638,52 @@ fn after_change(
         .filter(|&(_, &n)| n >= 100)
         .min_by_key(|&(_, &n)| n)
         .expect("a tile in view");
+    tile
+}
+
+/// The tile in `ids` (the test frame's size) with the most pixels beside the background: on the
+/// silhouette.
+fn silhouette_tile(ids: &[u32]) -> u32 {
+    let width = usize::try_from(size().width()).expect("small");
+    let mut tally: BTreeMap<u32, usize> = BTreeMap::new();
+    for (i, &id) in ids.iter().enumerate() {
+        let Some(node) = node_of(id) else {
+            continue;
+        };
+        let around = [i.wrapping_sub(1), i + 1, i.wrapping_sub(width), i + width];
+        let beside = around
+            .iter()
+            .any(|&j| ids.get(j).is_some_and(|&other| node_of(other).is_none()));
+        if beside {
+            *tally.entry(node).or_default() += 1;
+        }
+    }
+    let (&tile, _) = tally.iter().max_by_key(|&(_, &n)| n).expect("a silhouette");
+    tile
+}
+
+/// [`after_change_to`] the [`fair_tile`].
+fn after_change(
+    gpu: &Gpu,
+    world: &mut World,
+    session: &mut Session,
+    change: impl FnOnce(&Gpu, &mut World, u32),
+) -> Changed {
+    after_change_to(gpu, world, session, fair_tile, change)
+}
+
+/// Converges `session`, picks a tile from its visibility buffer with `pick`, makes `change` to
+/// it, draws a still frame and reports.
+fn after_change_to(
+    gpu: &Gpu,
+    world: &mut World,
+    session: &mut Session,
+    pick: fn(&[u32]) -> u32,
+    change: impl FnOnce(&Gpu, &mut World, u32),
+) -> Changed {
+    session.converge(gpu, world);
+    let before = session.records(gpu);
+    let tile = pick(&session.ids(gpu));
     change(gpu, world, tile);
     session.draw(gpu, world, false);
     let frame = session.passes().aa().frame();
@@ -665,6 +704,7 @@ fn after_change(
         tile,
         before,
         reset,
+        ids: session.ids(gpu),
     }
 }
 
@@ -963,5 +1003,205 @@ fn the_first_still_frames_after_a_move_are_filtered_fading_as_samples_come() {
             "less and less: {filtered:?}"
         );
         assert_eq!(filtered[4], 0, "none from five samples: {filtered:?}");
+    });
+}
+
+/// The seam spread of `aa.wgsl`, and its stand-in that drops it.
+const SEAM_SPREAD: (&str, &str) = ("at = max(at, nodes[m].seam);", "at = at;");
+
+/// Raises one tile's `e` by an ulp straight in the tree's buffer: its key changes, no epoch.
+fn nudge_error(gpu: &Gpu, world: &mut World, tile: u32) {
+    let mut node = world.tree.gpu_node(tile);
+    node.error = node.error.next_up();
+    world.overwrite_node(gpu, tile, node);
+}
+
+/// Per pixel of `changed` (a change to its tile's seam inputs): whether it reset, whether it
+/// named the tile, and whether it named one of `neighbours` and not the tile.
+fn seam_pixels(changed: &Changed, neighbours: &[u32]) -> Vec<(bool, bool, bool)> {
+    let records = changed.before.iter().zip(&changed.reset);
+    records
+        .map(|(old, &reset)| {
+            let tile = old.names(changed.tile);
+            let beside = !tile && neighbours.iter().any(|&m| old.names(m));
+            (reset, tile, beside)
+        })
+        .collect()
+}
+
+#[test]
+fn a_change_to_a_tiles_seam_inputs_resets_its_neighbours_pixels_too() {
+    GpuTest::run(|gpu| {
+        let mut world = World::with_finest(gpu, 4);
+        let mut session = Session::new(gpu, &world, EYE, size());
+        let changed = after_change(gpu, &mut world, &mut session, nudge_error);
+        let links = world.tree.gpu_node(changed.tile).neighbours;
+        let neighbours: Vec<u32> = links.into_iter().filter(|&m| m != u32::MAX).collect();
+        let pixels = seam_pixels(&changed, &neighbours);
+        let next_to = pixels.iter().filter(|&&(_, _, beside)| beside).count();
+        eprintln!("{next_to} pixels name a neighbour of the tile and not the tile");
+        assert!(next_to > 20, "neighbours in view: {next_to}");
+        assert!(
+            pixels
+                .iter()
+                .all(|&(reset, tile, beside)| reset == (tile || beside)),
+            "the tile's pixels and its neighbours', and no others"
+        );
+        // The bite: without the seam spread, the neighbours' pixels keep their samples.
+        session.patch(gpu, &world, &[SEAM_SPREAD]);
+        let patched = after_change(gpu, &mut world, &mut session, nudge_error);
+        let missed = seam_pixels(&patched, &neighbours)
+            .iter()
+            .filter(|&&(reset, _, beside)| beside && !reset)
+            .count();
+        assert!(missed > 0, "the check bites");
+    });
+}
+
+/// The current sample's term of the reset rule, and its stand-in that drops it.
+const CURRENT_CHECK: (&str, &str) = ("var reset = changed_after(node, since) || ", "var reset = ");
+
+/// Moves one tile a tenth of the radius outwards: over pixels that saw only the background.
+fn pushed_out(gpu: &Gpu, world: &mut World, tile: u32) {
+    world.displace(gpu, tile, 1.1);
+}
+
+/// Pixels of `changed` whose history saw only the background and whose sample now sees the
+/// tile: how many, and how many of those reset.
+fn newly_covered(changed: &Changed) -> (usize, usize) {
+    let pixels = changed.before.iter().zip(&changed.reset).zip(&changed.ids);
+    let covered: Vec<bool> = pixels
+        .filter(|&((old, _), &id)| {
+            !old.overflow
+                && old.seen.iter().all(|&n| n == EMPTY)
+                && node_of(id) == Some(changed.tile)
+        })
+        .map(|((_, &reset), _)| reset)
+        .collect();
+    let reset = covered.iter().filter(|&&reset| reset).count();
+    (covered.len(), reset)
+}
+
+#[test]
+fn a_tile_moved_over_the_background_resets_the_pixels_it_now_covers() {
+    GpuTest::run(|gpu| {
+        let mut world = World::with_finest(gpu, 4);
+        let mut session = Session::new(gpu, &world, EYE, size());
+        let changed = after_change_to(gpu, &mut world, &mut session, silhouette_tile, pushed_out);
+        let (covered, reset) = newly_covered(&changed);
+        eprintln!("{covered} background pixels now see the tile, {reset} reset");
+        assert!(
+            covered > 10,
+            "the tile moved out over the background: {covered}"
+        );
+        assert_eq!(reset, covered, "every one of them");
+        // The bite: no record names the tile there, so only the current sample's term catches it.
+        let mut fresh = World::with_finest(gpu, 4);
+        session.patch(gpu, &fresh, &[CURRENT_CHECK]);
+        let patched = after_change_to(gpu, &mut fresh, &mut session, silhouette_tile, pushed_out);
+        let (seen, caught) = newly_covered(&patched);
+        assert!(seen > caught, "the check bites: {caught} of {seen}");
+    });
+}
+
+/// The key compare's record of a node's own change, and its stand-in that drops it.
+const KEY_COMPARE: (&str, &str) = ("if own {", "if false {");
+
+/// Points one tile at another tile's slot of its class straight in the tree's buffer: its key
+/// changes (it draws other data), no epoch.
+fn other_slot(gpu: &Gpu, world: &mut World, tile: u32) {
+    let mut node = world.tree.gpu_node(tile);
+    let class = node.slot >> 29;
+    let mut others = (0..world.tree.capacity()).map(|n| world.tree.gpu_node(n).slot);
+    let slot = others
+        .rfind(|&slot| slot >> 29 == class && slot != node.slot)
+        .expect("another slot of the class");
+    node.slot = slot;
+    world.overwrite_node(gpu, tile, node);
+}
+
+#[test]
+fn a_tile_moved_to_another_slot_resets_the_pixels_that_saw_it() {
+    GpuTest::run(|gpu| {
+        let mut world = World::with_finest(gpu, 4);
+        let mut session = Session::new(gpu, &world, EYE, size());
+        let changed = after_change(gpu, &mut world, &mut session, other_slot);
+        let named: Vec<bool> = changed
+            .before
+            .iter()
+            .zip(&changed.reset)
+            .filter(|(old, _)| old.names(changed.tile))
+            .map(|(_, &reset)| reset)
+            .collect();
+        assert!(named.len() > 20, "the tile was in view");
+        assert!(named.iter().all(|&reset| reset), "every pixel that saw it");
+        // The bite: without the key compare, pixels whose sample no longer sees it keep it.
+        let mut fresh = World::with_finest(gpu, 4);
+        session.patch(gpu, &fresh, &[KEY_COMPARE]);
+        let patched = after_change(gpu, &mut fresh, &mut session, other_slot);
+        let missed = patched
+            .before
+            .iter()
+            .zip(&patched.reset)
+            .filter(|&(old, &reset)| old.names(patched.tile) && !reset)
+            .count();
+        assert!(missed > 0, "the check bites");
+    });
+}
+
+#[test]
+fn the_frame_numbering_starts_over_with_every_pixel() {
+    GpuTest::run(|gpu| {
+        let world = World::with_finest(gpu, 4);
+        let mut session = Session::new(gpu, &world, EYE, size());
+        session.converge(gpu, &world);
+        let Some(passes) = session.renderer.passes_mut() else {
+            unreachable!("given");
+        };
+        passes.aa_mut().set_frame(FRAME_LIMIT);
+        let drawn = session.draw(gpu, &world, false);
+        assert!(drawn.shown && drawn.aa.restarted, "{drawn:?}");
+        assert_eq!(session.passes().aa().frame(), 1, "from 1 again");
+        assert!(session.records(gpu).iter().all(|r| r.start == 1));
+        let frames = session.converge(gpu, &world);
+        assert_eq!(frames, SAMPLES - 1, "a cycle to converge again");
+    });
+}
+
+/// The pixel pass's sample, and in its place two colours, one at odd samples and one at even: a
+/// constant colour's mean is exact after its first sample, an alternating one's rounds every time.
+const ALTERNATING_SAMPLE: (&str, &str) = (
+    "mean += (textureLoad(shaded, id.xy, 0) - mean) / f32(n);",
+    "mean += (select(vec4<f32>(0.9, 0.517, 0.0123, 1.0), vec4<f32>(0.7, 0.483, 0.0177, 1.0), \
+     (n & 1u) == 0u) - mean) / f32(n);",
+);
+
+/// The most a half-float running mean may drift from the exact mean over [`SAMPLES`] samples, in
+/// ulps of the mean: half a sample count.
+const DRIFT_ULPS: f32 = 16.0;
+
+#[test]
+fn the_half_float_mean_drifts_a_few_ulps_at_most() {
+    GpuTest::run(|gpu| {
+        let world = World::with_finest(gpu, 4);
+        let mut session = Session::new(gpu, &world, EYE, size());
+        session.patch(gpu, &world, &[ALTERNATING_SAMPLE]);
+        session.converge(gpu, &world);
+        let exact = [0.8_f32, 0.5, 0.015, 1.0];
+        let ulp = |c: f32| 2_f32.powf(c.log2().floor() - 10.0);
+        let drift = session
+            .means(gpu)
+            .iter()
+            .flat_map(|mean| {
+                let channels = mean.iter().zip(exact);
+                channels.map(|(&m, c)| (m - c).abs() / ulp(c))
+            })
+            .fold(0.0_f32, f32::max);
+        eprintln!("the means drift at most {drift:.2} ulps over {SAMPLES} samples");
+        assert!(drift <= DRIFT_ULPS, "{drift} ulps");
+        assert!(
+            drift > 0.0,
+            "the test rounds: an exact mean would say nothing"
+        );
     });
 }

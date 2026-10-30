@@ -175,7 +175,8 @@ impl FramePasses {
 
     /// Encodes the accumulation of the frame just shaded ([`crate::aa`]): `changes` names the
     /// tiles whose data changed this frame, `restart` starts every pixel's history again; `tree`
-    /// is the tile tree's buffer, `None` for the last one given.
+    /// is the tile tree's buffer, `None` for the last one given. Returns whether every pixel's
+    /// history started again.
     ///
     /// # Errors
     ///
@@ -188,9 +189,9 @@ impl FramePasses {
         tree: Option<&Buffer>,
         changes: Option<&BoundsUpdate>,
         restart: bool,
-    ) -> Result<(), FrameError> {
+    ) -> Result<bool, FrameError> {
         let Some(shaded) = self.shade.target() else {
-            return Ok(());
+            return Ok(false);
         };
         let inputs = AccumulateInputs {
             tree,

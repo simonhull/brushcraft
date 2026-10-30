@@ -249,6 +249,12 @@ impl Renderer {
         self.passes.as_ref()
     }
 
+    /// The scene's passes, once given, to change in the tests.
+    #[cfg(test)]
+    pub(crate) const fn passes_mut(&mut self) -> Option<&mut FramePasses> {
+        self.passes.as_mut()
+    }
+
     /// Draws one frame into `target` and presents it: resizes the target to the frame,
     /// acquires its next image, encodes the frame's `uploads` (staged by the owner thread's
     /// [`crate::residency::Residency::stage`]) and then the passes (the module notes say which),
@@ -496,10 +502,10 @@ fn accumulate(
         return (step, AaReport::default());
     };
     match passes.encode_accumulation(gpu, frame, tree, changes, restart) {
-        Ok(()) => (
+        Ok(restarted) => (
             step,
             AaReport {
-                restarted: restart,
+                restarted,
                 filtered_instead: false,
             },
         ),

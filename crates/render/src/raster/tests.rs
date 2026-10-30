@@ -32,7 +32,7 @@ use crate::lod::{
 };
 use crate::residency::{CLASSES, REQUEST_HEADER, SizeClass, Slot, SlotLayout};
 use crate::surface::Size;
-use crate::tree::{NODE_BYTES, NODE_FINEST, Place, TileTree};
+use crate::tree::{GpuNode, NODE_BYTES, NODE_FINEST, Place, TileTree};
 use crate::upload::{GpuVertex, TileDetail};
 
 mod cone;
@@ -217,7 +217,7 @@ impl World {
             vec![gpu.device().create_buffer_init(&BufferInitDescriptor {
                 label: Some("test slots"),
                 contents: bytemuck::cast_slice(data),
-                usage: BufferUsages::STORAGE,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             })]
         });
         let mut world = Self {
@@ -249,6 +249,39 @@ impl World {
         let tile = &self.tiles[&place];
         self.tree.move_to(place, tile.slot, tile.detail);
         self.write_tree(gpu);
+    }
+
+    /// Moves the tile at `node` away from the sphere's centre by `scale` (its data rewritten in
+    /// its slot) and records the new data, as an epoch does.
+    pub(crate) fn displace(&mut self, gpu: &Gpu, node: u32, scale: f32) {
+        let place = self.place_of(node);
+        let tile = &self.tiles[&place];
+        let moved: Vec<GpuVertex> = tile
+            .vertices
+            .iter()
+            .map(|v| GpuVertex {
+                position: v.position.map(|c| c * scale),
+                ..*v
+            })
+            .collect();
+        let slot = tile.slot;
+        let buffer =
+            &self.slots.classes()[usize::from(slot.class().get())][usize::from(slot.buffer())];
+        let offset =
+            u64::from(slot.index() * slot.class().vertices()) * size_of::<GpuVertex>() as u64;
+        gpu.queue()
+            .write_buffer(buffer, offset, bytemuck::cast_slice(&moved));
+        self.restamp(gpu, node);
+    }
+
+    /// Writes `gpu_node` as node `node` straight into the tree's buffer, behind the tree's back:
+    /// no epoch, so no bounds update names it.
+    pub(crate) fn overwrite_node(&self, gpu: &Gpu, node: u32, gpu_node: GpuNode) {
+        gpu.queue().write_buffer(
+            self.tree.buffer(),
+            u64::from(node) * NODE_BYTES,
+            bytemuck::bytes_of(&gpu_node),
+        );
     }
 
     /// The node of `place`.

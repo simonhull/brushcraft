@@ -98,6 +98,14 @@
 //! device takes the adapter's limits; past them see "When it can't"). At 1080p, 50 MB. The tone map
 //! reads the mean directly, so there is no resolved image. Per node of the tile tree, 56 bytes (its
 //! key, its change frames, and its change frame for the pixels).
+//!
+//! The mean is a running mean in half floats, `m += (s − m) / n`, rounded to half precision at
+//! each sample, which WGSL lets round either way. Sample k of n carries its rounding (at most an
+//! ulp) into the end scaled by k / n, so after 32 samples the mean is within about 16 ulps (n / 2)
+//! of the exact one: under 1.6 % of it at worst, for a value just above a power of two. Rounding
+//! to nearest halves that, and in practice it is far less: lavapipe drifts 0.4 ulps over 32
+//! samples of two alternating colours (a test measures it). Summing in `f32` instead would double
+//! the means' memory.
 
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
@@ -412,8 +420,8 @@ impl Accumulation {
         Self::build(gpu, capacity, &[])
     }
 
-    /// [`Accumulation::new`] with text replacements in the pixel pass's shader, for the tests'
-    /// bite checks.
+    /// [`Accumulation::new`] with text replacements in its shaders (each in whichever holds it),
+    /// for the tests' bite checks.
     ///
     /// # Errors
     ///
@@ -427,7 +435,7 @@ impl Accumulation {
         Self::build(gpu, capacity, patches)
     }
 
-    /// [`Accumulation::new`], `patches` made in the pixel pass's shader.
+    /// [`Accumulation::new`], `patches` made in its shaders.
     ///
     /// # Errors
     ///
@@ -436,10 +444,6 @@ impl Accumulation {
     /// # Panics
     ///
     /// If a patch doesn't apply (only the tests make any).
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "a patch that doesn't apply is a broken test, not an error to return"
-    )]
     fn build(gpu: &Gpu, capacity: u32, patches: &[(&str, &str)]) -> Result<Self, AaError> {
         let device = gpu.device();
         let storage = |binding, read_only| BindGroupLayoutEntry {
@@ -500,17 +504,12 @@ impl Accumulation {
                 ],
             })
         })?;
-        let nodes_source = format!("{NODE_WGSL}{MORPH_WGSL}{PARAMS_WGSL}{NODES_WGSL}");
+        let (nodes_source, pixels_source) = sources(patches);
         let node_pipeline =
             |name: &str| pipeline(gpu, "aa nodes", &nodes_source, &[&node_layout], name);
         let mark = node_pipeline("mark")?;
         let compare = node_pipeline("compare")?;
         let spread = node_pipeline("spread")?;
-        let pixels_source = format!("{PARAMS_WGSL}{PIXELS_WGSL}");
-        let pixels_source = patches.iter().fold(pixels_source, |source, (from, to)| {
-            assert!(source.contains(from), "the patch {from:?} applies");
-            source.replace(from, to)
-        });
         let accumulate = pipeline(
             gpu,
             "aa pixels",
@@ -545,6 +544,12 @@ impl Accumulation {
         pixels * MEAN_BYTES.max(RECORD_BYTES) <= self.limit
     }
 
+    /// Sets the last frame's number, to reach [`FRAME_LIMIT`] in the tests.
+    #[cfg(test)]
+    pub(crate) const fn set_frame(&mut self, frame: u32) {
+        self.frame = frame;
+    }
+
     /// Binds at most `limit` bytes a buffer from now on, as a smaller device would.
     #[cfg(test)]
     pub(crate) const fn set_limit(&mut self, limit: u64) {
@@ -572,7 +577,8 @@ impl Accumulation {
 
     /// Encodes a frame's accumulation into `encoder`, after its shading: the node passes, then
     /// the pixel pass over `inputs.shaded`. Settings go through the queue: one frame a
-    /// submission.
+    /// submission. Returns whether every pixel's history started again: asked, or new histories,
+    /// or the numbering started over.
     ///
     /// # Errors
     ///
@@ -583,12 +589,12 @@ impl Accumulation {
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
         inputs: &AccumulateInputs<'_>,
-    ) -> Result<(), AaError> {
+    ) -> Result<bool, AaError> {
         if let Some(tree) = inputs.tree {
             self.tree = Some(tree.clone());
         }
         let Some(tree) = self.tree.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         let visibility = inputs.raster.visibility();
         let size = (visibility.width(), visibility.height());
@@ -614,7 +620,7 @@ impl Accumulation {
         gpu.queue()
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         let Some(history) = &self.history else {
-            return Ok(());
+            return Ok(false);
         };
         let (node_group, pixel_group) = self.groups(gpu, &tree, inputs, history)?;
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -638,7 +644,7 @@ impl Accumulation {
             size.1.div_ceil(PIXEL_GROUP),
             1,
         );
-        Ok(())
+        Ok(restart)
     }
 
     /// Moves on to the next frame number; past [`FRAME_LIMIT`], starts the numbering over
@@ -734,6 +740,27 @@ impl Accumulation {
         }
         Ok(u32::try_from(nodes.len()).unwrap_or(u32::MAX))
     }
+}
+
+/// The node passes' and the pixel pass's shaders, `patches` made in whichever holds each (only
+/// the tests make any).
+///
+/// # Panics
+///
+/// If a patch doesn't apply.
+fn sources(patches: &[(&str, &str)]) -> (String, String) {
+    let mut nodes = format!("{NODE_WGSL}{MORPH_WGSL}{PARAMS_WGSL}{NODES_WGSL}");
+    let mut pixels = format!("{PARAMS_WGSL}{PIXELS_WGSL}");
+    for (from, to) in patches {
+        let source = if nodes.contains(from) {
+            &mut nodes
+        } else {
+            &mut pixels
+        };
+        assert!(source.contains(from), "the patch {from:?} applies");
+        *source = source.replace(from, to);
+    }
+    (nodes, pixels)
 }
 
 /// Histories for an image of `size`, zeroed (the first frame restarts every pixel).
