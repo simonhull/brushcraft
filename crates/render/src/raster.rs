@@ -89,7 +89,8 @@
 //! [`Raster::begin_frame`] (the frame's view, time and whether the camera moves, written through
 //! the queue: once per submission), then after the level choice's first phase
 //! [`Raster::encode_stamp`] over its cut, then [`Raster::encode_draw`] of each phase's list,
-//! clearing first ([`Phase::First`]), keeping after ([`Phase::Second`]).
+//! clearing first ([`Phase::First`]), keeping after ([`Phase::Second`]). [`FramePasses`] runs
+//! the whole frame in that order with the level choice and the two depth pyramids.
 
 use std::time::Duration;
 
@@ -118,9 +119,12 @@ use crate::surface::Size;
 use crate::tree::NODE_WGSL;
 use crate::upload::VERTEX_WGSL;
 
+mod frame;
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 pub(crate) mod tests;
+
+pub use frame::{FrameError, FramePasses, SceneInputs};
 
 /// The raster's own source, after the declarations it uses and the generated slot bindings.
 const RASTER_WGSL: &str = include_str!("raster.wgsl");

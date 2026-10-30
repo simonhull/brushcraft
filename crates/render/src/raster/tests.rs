@@ -1651,3 +1651,105 @@ fn the_draw_draws_exactly_the_clusters_the_level_choice_listed() {
         }
     });
 }
+
+#[test]
+fn a_frame_draws_both_phases_lists_watertight_the_second_drawing_what_the_first_hid() {
+    GpuTest::run(|gpu| {
+        let world = World::new(gpu);
+        let (_, requests) = level_choice(gpu, &world);
+        let thresholds = Thresholds {
+            refine_quad: 1e9,
+            coarsen_quad: 1e9,
+            ..Thresholds::SPEC
+        };
+        let config = LodConfig::default().with_thresholds(thresholds);
+        let mut passes =
+            FramePasses::new(gpu, world.tree.capacity(), config, RasterConfig::default())
+                .expect("the passes");
+        // A half turn between frames (a flick): what comes into view was behind the sphere in
+        // the previous frame's depth, so the first phase hides it and the second draws it.
+        let look = |eye: Vec3| {
+            View::look_at(
+                eye,
+                Vec3::default(),
+                Vec3::new(0.0, 1.0, 0.0),
+                45_f64.to_radians(),
+                size(),
+                0.01,
+            )
+            .expect("a view")
+        };
+        let views = [
+            look(Vec3::new(0.0, 0.0, 1.6)),
+            look(Vec3::new(0.0, 0.0, -1.6)),
+        ];
+        let mut bounds = BoundsUpdate::since(&world.tree, 0);
+        let mut last = None;
+        for view in &views {
+            gpu.queue().write_buffer(&requests, 0, &[0; 16]);
+            let inputs = SceneInputs {
+                tree: world.tree.buffer(),
+                requests: &requests,
+                slots: &world.slots,
+                bounds: &bounds,
+                view,
+                time: Duration::from_secs(1),
+                moving: true,
+                finest: world.finest,
+            };
+            let mut encoder = gpu
+                .device()
+                .create_command_encoder(&CommandEncoderDescriptor::default());
+            let readback = passes
+                .encode(gpu, &mut encoder, &inputs)
+                .expect("encoded")
+                .expect("a readback buffer");
+            gpu.queue().submit([encoder.finish()]);
+            readback.submitted();
+            finish(gpu);
+            bounds = BoundsUpdate::since(&world.tree, bounds.generation());
+            last = passes.lod_mut().collect(world.finest).expect("read");
+        }
+        let output = last.expect("the second frame's results");
+        assert!(
+            output.stats.drawn.1 > 0,
+            "the second phase drew: {:?}",
+            output.stats
+        );
+        let main = cluster_keys(&world, &listed(gpu, passes.lod(), false));
+        let post = cluster_keys(&world, &listed(gpu, passes.lod(), true));
+        let image = read_visibility(gpu, passes.raster());
+        let seen: BTreeSet<(u32, u32)> = image
+            .iter()
+            .filter_map(|&pixel| VisibilityId::decode(pixel))
+            .map(|id| (id.node, id.cluster))
+            .collect();
+        let both: BTreeSet<(u32, u32)> = main.union(&post).copied().collect();
+        assert!(
+            seen.is_subset(&both),
+            "every id drawn was listed by a phase"
+        );
+        assert!(!seen.is_disjoint(&post), "the second phase's clusters show");
+        let holes = pinholes(&inside(&reference(gpu, &world, &views[1]), 4), &image);
+        assert_eq!(holes, 0, "{holes} pinholes");
+    });
+}
+
+/// A phase's cluster list as the level choice wrote it: `post` the second phase's.
+fn listed(gpu: &Gpu, lod: &Lod, post: bool) -> Vec<GpuCluster> {
+    let (args, offset) = lod.draw_args(post);
+    let words: Vec<u32> = gpu.read_buffer(args).expect("read back");
+    let count = words[usize::try_from(offset / 4).expect("small") + 1];
+    let all: Vec<GpuCluster> = gpu.read_buffer(lod.clusters(post)).expect("read back");
+    all[..usize::try_from(count).expect("small")].to_vec()
+}
+
+/// Each cluster as the visibility buffer names it: its node and its index in its tile.
+fn cluster_keys(world: &World, clusters: &[GpuCluster]) -> BTreeSet<(u32, u32)> {
+    let keys = clusters.iter().map(|c| {
+        let per = (world.place_of(c.node).level().tile_quads() / 8).max(1);
+        let (cx, cy) = c.position();
+        (c.node, cy * per + cx)
+    });
+    keys.collect()
+}
