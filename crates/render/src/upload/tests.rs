@@ -158,13 +158,23 @@ fn the_stores_tiles_land_in_their_slots_their_positions_bit_for_bit() {
 }
 
 /// Stages one frame of `residency` from `store`, wanting `requests`, and submits its uploads.
-fn frame(gpu: &Gpu, residency: &mut Residency, store: &mut TileStore, requests: &Requests) {
+///
+/// Returns the owner thread's time: the frame's beginning, its requests and its staging, not
+/// the submission (the render thread's).
+fn frame(
+    gpu: &Gpu,
+    residency: &mut Residency,
+    store: &mut TileStore,
+    requests: &Requests,
+) -> Duration {
+    let began = Instant::now();
     residency.begin_frame(gpu).expect("begins");
     residency.want(requests);
     let deadline = Instant::now() + Duration::from_secs(60);
     let uploads = residency
         .stage(gpu, &mut StoreSource::new(store), deadline)
         .expect("staged");
+    let took = began.elapsed();
     gpu.scoped("frame", || {
         let encoder = gpu
             .device()
@@ -172,6 +182,7 @@ fn frame(gpu: &Gpu, residency: &mut Residency, store: &mut TileStore, requests: 
         uploads.submit(gpu.queue(), encoder, |_| {});
     })
     .expect("submits");
+    took
 }
 
 /// The `e` and cone resident tile `key`'s node holds.
@@ -393,9 +404,8 @@ fn time_the_floor(gpu: &Gpu, dir: &TempDir) {
         let store = project.store();
         let mut residency =
             Residency::new(gpu, &mesh, finest, ResidencyConfig::default()).expect("residency");
-        let began = Instant::now();
-        frame(gpu, &mut residency, store, &Requests::new([], 0));
-        runs.push((began.elapsed(), residency.stats().staged_tiles));
+        let took = frame(gpu, &mut residency, store, &Requests::new([], 0));
+        runs.push((took, residency.stats().staged_tiles));
         assert!(residency.floor_ready(), "the floor arrived");
         drop(project.close(false));
     }
@@ -423,9 +433,7 @@ fn staged_reading_on_the_owner(
     let requests = requests_of(keys);
     let (mut took, mut staged) = (Duration::ZERO, 0);
     for _ in 0..2 {
-        let began = Instant::now();
-        frame(gpu, &mut residency, store, &requests);
-        took += began.elapsed();
+        took += frame(gpu, &mut residency, store, &requests);
         staged += residency.stats().staged_tiles;
     }
     assert_eq!(staged, keys.len() as u64, "every tile staged");
@@ -451,9 +459,7 @@ fn staged_read_ahead(
             "every one read ahead"
         );
         std::thread::sleep(Duration::from_millis(100));
-        let began = Instant::now();
-        frame(gpu, &mut residency, store, &requests);
-        took += began.elapsed();
+        took += frame(gpu, &mut residency, store, &requests);
         staged += residency.stats().staged_tiles;
         assert!(
             chunk.iter().all(|key| residency.slot(key).is_some()),
