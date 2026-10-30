@@ -14,28 +14,39 @@
 //!
 //! The level choice and raster are built here, beside residency, for its tile tree and slot
 //! layout, so a device that can't take them fails as the app starts ([`GpuResidency::new`]), never
-//! mid-session. They go to the render thread with the first frame's scene and stay there; the
-//! level choice's readbacks come back here ([`CutReader`]).
+//! mid-session. They go to the render thread with the first frame (beside its scene, so a frame
+//! with no scene still takes them) and stay there; the level choice's readbacks come back here
+//! ([`CutReader`]).
 //!
 //! # Readbacks
 //!
 //! A frame's level choice writes the tiles it wants and finds missing into residency's request
 //! buffer, and its cut into its own readback; both are copied out in the frame's submission and
-//! mapped when the GPU finishes it, so the device poll in a later frame's
-//! [`Residency::begin_frame`] hears of both at once. Each says which frame it is of (residency's
-//! frame number, [`Residency::requests_heard`], [`render::lod::LodOutput::frame`]):
+//! mapped when the GPU finishes it. The device poll in a later frame's
+//! [`Residency::begin_frame`] hears of both at once: the render thread registers both maps (the
+//! requests' in `FrameUploads::submit`, the cut's right after it) before it reports the frame
+//! shown, the owner polls only at the start of a frame, and only one frame is in flight, so no
+//! poll falls between the two, and maps of one submission complete in the same poll. Each says
+//! which frame it is of (residency's frame number, [`Residency::requests_heard`],
+//! [`render::lod::LodOutput::frame`]):
 //!
 //! - **the requests** are paged in and wanted ([`Residency::take_requests`], [`Residency::want`]);
 //! - **the cut** is the frame's use ([`Residency::use_frame`]): the tiles it drew renewed as
 //!   recently drawn, its tiles and their ancestors never evicted while it is the latest. A frame
 //!   whose readback hasn't arrived is covered by residency's rules as they are (the latest use
 //!   holds; the floor is never evicted). A cut that differs from the one before
-//!   ([`Residency::cut`]) reports its frame's time, so the scheduler keeps frames coming until the
-//!   morph it started is over.
+//!   ([`Residency::cut`]) reports its frame's time, if the camera was still in that frame, so the
+//!   scheduler keeps frames coming until the morph it started is over. A moving frame's level
+//!   changes don't morph by time (the raster stamps them a whole duration ago), so they want no
+//!   morph frames.
 //!
 //! Frames keep coming after a change (the view moved, tiles arrived, the requests changed) until
-//! a request readback from then on is read ([`settle`]): so the last view's requests and cut are
-//! never left unread until the next event.
+//! a request readback from then on is read, and a cut readback too once a frame from then on has
+//! drawn its scene ([`settle`]): so the last view's requests and cut are never left unread until
+//! the next event. A request readback that overflowed the request buffer
+//! ([`render::residency::Requests::dropped`]) holds whichever requests the GPU's atomics let in
+//! first, so it isn't compared with the last: it says only that more is wanted than fits, which
+//! the pending requests already keep frames coming for.
 //!
 //! # Bounds
 //!
@@ -72,6 +83,21 @@ const MIB: f64 = 1024.0 * 1024.0;
 /// The capability tier the app runs at.
 const TIER: Tier = Tier::Desktop;
 
+/// The most frames whose times are kept for their cut readbacks.
+///
+/// A few more than can be in flight (one frame at a time, its readbacks a frame or two behind),
+/// so frames whose scene was never drawn, or whose readback was skipped, don't pile up.
+const TIMES_KEPT: usize = 8;
+
+/// A staged frame's time and whether its camera moved, kept until its cut is heard of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    /// Its time on the frame loop's clock.
+    time: Duration,
+    /// Whether the camera moved in it.
+    moving: bool,
+}
+
 /// The project's tiles on the GPU: residency, the scene's passes until the render thread has
 /// them, and what the frame loop needs around them.
 #[derive(Debug)]
@@ -80,7 +106,7 @@ pub(crate) struct GpuResidency {
     gpu: Arc<Gpu>,
     /// Which tiles are on it.
     residency: Residency,
-    /// The scene's passes, until the first frame's scene takes them to the render thread.
+    /// The scene's passes, until the first frame takes them to the render thread.
     passes: Option<FramePasses>,
     /// Where the level choice's cut readbacks arrive.
     reader: CutReader,
@@ -97,8 +123,18 @@ pub(crate) struct GpuResidency {
     /// level choice asks for may differ from then on, and only that frame's readback (or a
     /// later one) says.
     settle_from: Option<u64>,
-    /// The time of each frame staged whose cut hasn't been heard of yet, by its number.
-    times: BTreeMap<u64, Duration>,
+    /// Like `settle_from`, for the cut readback: the first frame whose cut must be heard of before
+    /// the cut is settled, waited for only once a frame from then on has drawn its scene.
+    cut_from: Option<u64>,
+    /// The newest frame whose cut readback has been heard of.
+    cut_heard: Option<u64>,
+    /// The newest frame whose scene was drawn.
+    drawn: Option<u64>,
+    /// The last frame staged: the one [`Uploads::shown`] reports on.
+    staged: Option<u64>,
+    /// The stamp of each frame staged whose cut hasn't been heard of yet, by its number: at most
+    /// [`TIMES_KEPT`].
+    times: BTreeMap<u64, Stamp>,
     /// The tile tree's generation the GPU's bounds are at.
     bounds_at: u64,
     /// The generation the last frame's bounds update brings them to, once its scene is drawn.
@@ -121,10 +157,22 @@ impl GpuResidency {
     /// bind: `render::residency::ConfigError::TooManySlotBuffers`), or the level choice or the
     /// raster can't be built for it.
     pub(crate) fn new(gpu: Arc<Gpu>, store: &TileStore) -> Result<Self> {
+        Self::with_config(gpu, store, ResidencyConfig::for_tier(TIER))
+    }
+
+    /// [`GpuResidency::new`], residency set up by `config`: for tests of a tiny budget.
+    ///
+    /// # Errors
+    ///
+    /// As [`GpuResidency::new`].
+    pub(crate) fn with_config(
+        gpu: Arc<Gpu>,
+        store: &TileStore,
+        config: ResidencyConfig,
+    ) -> Result<Self> {
         let finest = store
             .display_finest()
             .context("the store keeps no display layer to draw")?;
-        let config = ResidencyConfig::for_tier(TIER);
         let residency = gpu
             .scoped("setting up GPU residency", || {
                 Residency::new(&gpu, store.mesh(), finest, config)
@@ -155,6 +203,10 @@ impl GpuResidency {
             requested: BTreeSet::new(),
             starved: 0,
             settle_from: None,
+            cut_from: None,
+            cut_heard: None,
+            drawn: None,
+            staged: None,
             times: BTreeMap::new(),
             bounds_at: 0,
             bounds_sent: None,
@@ -205,17 +257,25 @@ impl GpuResidency {
             .begin_frame(gpu)
             .context("hearing what became of earlier frames")?;
         let frame = residency.frame();
-        self.times.insert(frame, time);
+        self.times.insert(
+            frame,
+            Stamp {
+                time,
+                moving: moved,
+            },
+        );
+        while self.times.len() > TIMES_KEPT {
+            self.times.pop_first();
+        }
         let mut changed = moved;
         residency.apply(drained);
         if let Some(requests) = residency.take_requests() {
             prefetch_requests(store, &requests).context("paging in requested tiles")?;
             residency.want(&requests);
             let requested: BTreeSet<TileKey> = requests.iter().map(|r| r.key).collect();
-            if requested != self.requested {
-                self.requested = requested;
-                changed = true;
-            }
+            // An overflowed readback's set is the GPU's atomic order: not compared (see above).
+            changed |= requests.dropped() == 0 && requested != self.requested;
+            self.requested = requested;
         }
         let mut cut_changed = None;
         let cut = self
@@ -224,10 +284,12 @@ impl GpuResidency {
             .context("reading the level choice's cut back")?;
         if let Some(output) = cut {
             if residency.cut() != &output.cut {
-                cut_changed = self.times.get(&output.frame).copied();
+                let still = self.times.get(&output.frame).filter(|stamp| !stamp.moving);
+                cut_changed = still.map(|stamp| stamp.time);
             }
             // Frames up to this one have nothing more to hear.
             self.times = self.times.split_off(&(output.frame + 1));
+            self.cut_heard = self.cut_heard.max(Some(output.frame));
             self.cuts_heard += 1;
             self.scene = Some(output.stats);
             residency.use_frame(FrameUse::new(output.cut, output.drawn));
@@ -239,6 +301,8 @@ impl GpuResidency {
         changed |= !uploads.is_empty();
         let heard = residency.requests_heard();
         self.settle_from = settle(self.settle_from, changed.then_some(frame), heard);
+        self.cut_from = settle(self.cut_from, changed.then_some(frame), self.cut_heard);
+        self.staged = Some(frame);
         let bounds = BoundsUpdate::since(residency.tree(), self.bounds_at);
         self.bounds_sent = Some(bounds.generation());
         let scene = ResidentScene {
@@ -248,7 +312,6 @@ impl GpuResidency {
             bounds,
             finest: residency.finest(),
             frame,
-            passes: self.passes.take(),
         };
         Ok(Staged {
             uploads,
@@ -279,7 +342,7 @@ impl Uploads for GpuResidency {
         let work = Work {
             floor_ready: self.residency.floor_ready(),
             starved_now,
-            settling: self.settle_from.is_some(),
+            settling: self.settle_from.is_some() || awaits_cut(self.cut_from, self.drawn),
         };
         let pending = pending(&stats, work);
         Ok(UploadStatus {
@@ -289,13 +352,20 @@ impl Uploads for GpuResidency {
             summary: Some(summary(&stats, self.floor_tiles())),
             frame: Some(staged.uploads),
             scene: Some(staged.scene),
+            passes: self.passes.take(),
         })
     }
 
     fn shown(&mut self, drawn: bool) {
         let sent = self.bounds_sent.take();
-        if drawn && let Some(generation) = sent {
-            self.bounds_at = generation;
+        if drawn {
+            if let Some(generation) = sent {
+                self.bounds_at = generation;
+            }
+            self.drawn = self.drawn.max(self.staged);
+        } else if let Some(frame) = self.staged {
+            // No scene, no cut readback: its time has nothing to wait for.
+            self.times.remove(&frame);
         }
     }
 
@@ -315,7 +385,7 @@ pub(crate) struct Work {
     pub(crate) floor_ready: bool,
     /// How many of the wanted tiles found no slot this frame.
     pub(crate) starved_now: u64,
-    /// Whether a request readback is still to be read before the requests are settled.
+    /// Whether a readback is still to be read before the requests and the cut are settled.
     pub(crate) settling: bool,
 }
 
@@ -353,6 +423,15 @@ pub(crate) const fn pending(stats: &ResidencyStats, work: Work) -> Pending {
 /// once a readback that recent is in hand.
 pub(crate) fn settle(from: Option<u64>, changed: Option<u64>, heard: Option<u64>) -> Option<u64> {
     from.max(changed).filter(|&frame| heard < Some(frame))
+}
+
+/// Whether a cut readback is still awaited.
+///
+/// One from frame `from` on (the last change's, if one is unheard), once a frame from then on
+/// (`drawn`, the newest whose scene was drawn) has made one. Until a frame draws its scene, none
+/// will come, so none is waited for.
+pub(crate) fn awaits_cut(from: Option<u64>, drawn: Option<u64>) -> bool {
+    from.is_some_and(|from| drawn >= Some(from))
 }
 
 /// The overlay's line for what the GPU holds.
@@ -495,6 +574,27 @@ mod tests {
             None,
             "a later readback will do"
         );
+    }
+
+    #[test]
+    fn a_cut_is_awaited_once_a_frame_since_the_change_has_drawn_its_scene() {
+        assert!(
+            !awaits_cut(None, Some(9)),
+            "nothing changed, or heard already"
+        );
+        assert!(
+            !awaits_cut(Some(5), None),
+            "no scene drawn: no cut will come"
+        );
+        assert!(
+            !awaits_cut(Some(5), Some(4)),
+            "drawn only before the change"
+        );
+        assert!(
+            awaits_cut(Some(5), Some(5)),
+            "the changed frame drew: its cut comes"
+        );
+        assert!(awaits_cut(Some(5), Some(7)), "a later one did");
     }
 
     #[test]

@@ -35,8 +35,13 @@ const INTERVAL: Duration = Duration::from_micros(16_667);
 /// A never-saved project over a six-face cube sphere, keeping a display layer under level
 /// [`FINEST`], its recovery file in `dir`.
 fn project(dir: &TestDir) -> Project {
+    project_to(dir, FINEST)
+}
+
+/// [`project`], its display layer under level `finest`.
+fn project_to(dir: &TestDir, finest: u8) -> Project {
     let mesh = cube_sphere(1).expect("a cube sphere");
-    let finest = Level::new(FINEST).expect("a level");
+    let finest = Level::new(finest).expect("a level");
     let config = ProjectConfig {
         store: StoreConfig::new(512 << 20, 1).with_display(finest),
         recovery_dir: dir.path().join("recovery"),
@@ -883,4 +888,238 @@ fn the_same_inputs_draw_the_same_frames() {
     for (k, (a, b)) in first.iter().zip(&second).enumerate() {
         assert!(a == b, "frame {k} differs between the runs");
     }
+}
+
+/// `project`'s display layer, built.
+fn build_display(project: &mut Project) {
+    while project.store().has_jobs() {
+        project
+            .store()
+            .run_jobs(Instant::now() + Duration::from_secs(1))
+            .expect("the display layer builds");
+    }
+}
+
+/// Makes a frame at `now` with all the time it wants, hands it off and returns it unshown.
+fn hand_off(owner: &mut Owner<NoBrush, GpuResidency>, now: Instant) -> FrameRequest {
+    let mut handed = None;
+    owner
+        .frame(now, now + Duration::from_secs(600), |request| {
+            handed = Some(request);
+            Ok(())
+        })
+        .expect("a frame");
+    handed.expect("the frame was handed off")
+}
+
+/// The bounds a frame's scene asks to recompute: how many tiles.
+fn bounds_of(request: &FrameRequest) -> usize {
+    request
+        .scene
+        .as_ref()
+        .expect("a scene")
+        .resident
+        .bounds
+        .len()
+}
+
+#[test]
+fn a_frame_whose_scene_wasnt_drawn_leaves_its_bounds_to_the_next() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut owner = resident_owner(&dir, &gpu);
+    let mut screen = Screen::new(&gpu);
+    let floor = owner.uploads().floor_tiles();
+    let first = hand_off(&mut owner, Instant::now());
+    assert_eq!(bounds_of(&first), floor, "the floor's bounds, all of them");
+    // Drawn, but reported with no scene (as for a frame with no image).
+    let presented = screen.draw(&gpu, first);
+    owner.shown(Presented {
+        scene: false,
+        ..presented
+    });
+    let again = hand_off(&mut owner, Instant::now());
+    assert!(
+        bounds_of(&again) >= floor,
+        "the floor's bounds asked for again: {}",
+        bounds_of(&again)
+    );
+    let drawn = screen.draw(&gpu, again);
+    assert!(drawn.scene, "drawn this time");
+    owner.shown(drawn);
+    let after = hand_off(&mut owner, Instant::now());
+    assert!(
+        bounds_of(&after) < floor,
+        "committed: only tiles new since: {}",
+        bounds_of(&after)
+    );
+    owner.shown(screen.draw(&gpu, after));
+    owner.close().expect("closed");
+}
+
+#[test]
+fn the_passes_reach_the_renderer_with_the_first_frame_even_with_no_scene() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut owner = resident_owner(&dir, &gpu);
+    let mut first = hand_off(&mut owner, Instant::now());
+    assert!(first.passes.is_some(), "the first frame brings the passes");
+    // As if the camera had no view to draw: no scene, the passes still delivered.
+    first.scene = None;
+    let mut screen = Screen::new(&gpu);
+    let presented = screen.draw(&gpu, first);
+    assert!(!presented.scene, "no scene drawn");
+    assert!(
+        screen.renderer.passes().is_some(),
+        "but the passes are kept"
+    );
+    owner.shown(presented);
+    let second = hand_off(&mut owner, Instant::now());
+    assert!(second.passes.is_none(), "sent once");
+    let next = screen.draw(&gpu, second);
+    assert!(next.scene, "the next frame draws its scene");
+    owner.shown(next);
+    owner.close().expect("closed");
+}
+
+/// One frame of `residency` on its own, the default camera's view at `stamp`'s time, moving or
+/// not, drawn on `screen` and shown; returns the cut change the uploads told.
+fn residency_frame(
+    gpu: &Gpu,
+    residency: &mut GpuResidency,
+    project: &mut Project,
+    screen: &mut Screen,
+    stamp: (Duration, bool),
+) -> Told {
+    let (time, moving) = stamp;
+    let size = setup(None).size.expect("a size");
+    let update = FrameUpdate {
+        drained: Drained::Epochs(Vec::new()),
+        deadline: Instant::now() + Duration::from_secs(600),
+        moved: moving,
+        time,
+    };
+    let mut status = residency
+        .apply(update, project.store())
+        .expect("residency's frame");
+    let scene = status.scene.take().map(|resident| SceneRequest {
+        resident,
+        view: Camera::default().view(size).expect("a view"),
+        time,
+        moving,
+    });
+    let request = FrameRequest {
+        number: 1,
+        size,
+        overlay_scale: 1,
+        overlay: Vec::new(),
+        uploads: status.frame.take(),
+        scene,
+        passes: status.passes.take(),
+    };
+    let presented = screen.draw(gpu, request);
+    residency.shown(presented.scene);
+    Told(status.cut_changed)
+}
+
+/// The cut change a frame's uploads told: the time of the frame whose cut changed, if one did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Told(Option<Duration>);
+
+#[test]
+fn a_cut_change_is_told_with_its_own_frames_time_and_only_for_a_still_camera() {
+    let gpu = software_gpu();
+    for moving in [false, true] {
+        let dir = TestDir::new();
+        let mut project = project(&dir);
+        build_display(&mut project);
+        let mut residency =
+            GpuResidency::new(Arc::clone(&gpu), project.store()).expect("residency");
+        let mut screen = Screen::new(&gpu);
+        let first = Duration::from_secs(1);
+        let unheard = residency_frame(
+            &gpu,
+            &mut residency,
+            &mut project,
+            &mut screen,
+            (first, moving),
+        );
+        assert_eq!(unheard, Told(None), "no cut heard yet");
+        // The first frame's cut (new: there was none) is heard in the second, a second later.
+        let stamp = (Duration::from_secs(2), false);
+        let changed = residency_frame(&gpu, &mut residency, &mut project, &mut screen, stamp);
+        if moving {
+            assert_eq!(
+                changed,
+                Told(None),
+                "a moving frame's cut change morphs by distance only"
+            );
+        } else {
+            assert_eq!(
+                changed,
+                Told(Some(first)),
+                "told with the cut's own frame's time"
+            );
+        }
+        project.close(false).expect("closed");
+    }
+}
+
+#[test]
+fn eviction_under_a_tiny_budget_keeps_the_cut_read_back_and_its_ancestors() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    // Display tiles to level 8: the finest class (side 65) has 126 tiles; the budget holds the
+    // floor's classes and twelve of them, in buffers of four.
+    let mut project = project_to(&dir, 8);
+    build_display(&mut project);
+    let big = render::residency::SizeClass::new(6)
+        .expect("a class")
+        .slot_bytes();
+    let floor_bytes: u64 = (0..6)
+        .filter_map(render::residency::SizeClass::new)
+        .map(|class| 2 * 6 * class.slot_bytes())
+        .sum();
+    let config = render::residency::ResidencyConfig::default()
+        .with_budget(floor_bytes + 12 * big)
+        .and_then(|config| config.with_buffer_bytes(4 * big))
+        .expect("a valid configuration");
+    let small =
+        GpuResidency::with_config(Arc::clone(&gpu), project.store(), config).expect("residency");
+    let mut owner = Owner::new(project, NoBrush, small, setup(None), Instant::now());
+    owner.camera.zoom(0.5);
+    let mut screen = Screen::new(&gpu);
+    let turn = crate::camera::Rotation::about(crate::camera::Vec3::new(0.0, 1.0, 0.0), 0.15);
+    let mut deepest = 0;
+    for _ in 0..40 {
+        owner.camera.orbit(turn);
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(600);
+        assert!(draw_one(&gpu, &mut owner, &mut screen, now, deadline));
+        // The cut residency heard this frame, and every ancestor of it, survived its staging.
+        let residency = owner.uploads().residency();
+        for key in residency.cut() {
+            assert!(
+                residency.slot(key).is_some(),
+                "{key:?} of the cut is resident"
+            );
+            let mut above = Place::of(key).parent();
+            while let Some(place) = above {
+                let ancestor = place.key(residency.finest()).expect("a tile");
+                assert!(
+                    residency.slot(&ancestor).is_some(),
+                    "{ancestor:?} above the cut"
+                );
+                above = place.parent();
+            }
+            deepest = deepest.max(key.level().get());
+        }
+    }
+    let stats = owner.uploads().stats();
+    assert!(
+        stats.evictions > 0,
+        "the budget was tight enough to evict: {stats:?}"
+    );
+    assert!(deepest > 6, "cuts reached past the floor: level {deepest}");
+    owner.close().expect("closed");
 }

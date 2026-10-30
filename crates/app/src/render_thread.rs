@@ -5,7 +5,7 @@
 //! arrive one at a time over a channel ([`FrameRequest`]); each has its overlay text laid out,
 //! is drawn ([`draw_frame`]: the uploads, the scene, the overlay) and presented, and what
 //! happened goes back ([`Presented`]), with a wake-up for the owner's event loop. The scene's
-//! passes come with the first frame's scene ([`ResidentScene::passes`]) and stay here. Dropping the
+//! passes come with the first frame ([`FrameRequest::passes`]) and stay here. Dropping the
 //! sender ends the thread, which hands the target back. The thread wakes the owner as it ends,
 //! however it ends (a panic included), so the owner always learns of it.
 
@@ -54,6 +54,9 @@ pub(crate) struct FrameRequest {
     pub(crate) uploads: Option<FrameUploads>,
     /// The scene to draw; `None` with no GPU residency (or no view to draw it from).
     pub(crate) scene: Option<SceneRequest>,
+    /// The scene's passes, with the first frame only, whether or not it has a scene: the render
+    /// thread keeps them.
+    pub(crate) passes: Option<FramePasses>,
 }
 
 /// What residency gives a frame's scene: the buffers the scene's passes read, owned (a
@@ -73,8 +76,6 @@ pub(crate) struct ResidentScene {
     pub(crate) finest: Level,
     /// Residency's frame number, which the cut's readback carries back.
     pub(crate) frame: u64,
-    /// The scene's passes, with the first frame's scene only: the render thread keeps them.
-    pub(crate) passes: Option<FramePasses>,
 }
 
 /// A frame's scene: residency's part and the frame loop's.
@@ -410,11 +411,7 @@ pub(crate) fn draw_frame(
     pre_present: impl FnOnce(),
 ) -> Result<Presented> {
     let image = TextLayout::new(&frame.overlay).image();
-    let passes = frame
-        .scene
-        .as_mut()
-        .and_then(|scene| scene.resident.passes.take());
-    if let Some(passes) = passes {
+    if let Some(passes) = frame.passes.take() {
         renderer.set_passes(passes);
     }
     let scene = frame.scene.as_ref().map(SceneRequest::inputs);
@@ -464,6 +461,7 @@ mod tests {
             overlay: lines.iter().map(|&line| line.to_owned()).collect(),
             uploads: None,
             scene: None,
+            passes: None,
         }
     }
 

@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use render::DrawTimes;
 use render::lod::LodStats;
+use render::raster::FramePasses;
 use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
 use store::{Drained, JobsReport, Project, StaleCursor, TileStore};
@@ -91,6 +92,8 @@ pub(crate) struct UploadStatus {
     pub(crate) frame: Option<FrameUploads>,
     /// What residency gives the frame's scene; `None` if there is no GPU residency.
     pub(crate) scene: Option<ResidentScene>,
+    /// The scene's passes, from the first frame only, for the render thread to keep.
+    pub(crate) passes: Option<FramePasses>,
 }
 
 /// The uploads' place in the frame: GPU residency ([`crate::uploads::GpuResidency`]).
@@ -540,6 +543,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             overlay,
             uploads: uploads.frame.take(),
             scene,
+            passes: uploads.passes.take(),
         })?;
         lap.next();
 
