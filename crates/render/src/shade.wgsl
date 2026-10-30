@@ -85,14 +85,79 @@ fn homogeneous(p: vec2<f32>) -> vec3<f32> {
 // coordinates are `p`, of the triangle whose corners have clip coordinates (x, y, w) `c0`,
 // `c1`, `c2`: the weights b with sum 1 such that the corners mixed by b project to `p`, by
 // Cramer's rule. They hold for corners behind the eye too, where projecting to the screen
-// doesn't; the point the eye sees has them all in 0..1.
+// doesn't; the point the eye sees has them all in 0..1. A degenerate triangle (an edge variant
+// collapses one of each border quad's two) has none: its weights' sum is zero, or rounding
+// away from it, and it gets NO_TRIANGLE, which no triangle's coordinates are ever below, so it
+// never holds a pixel.
 fn barycentric(c0: vec3<f32>, c1: vec3<f32>, c2: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     let b = vec3<f32>(dot(p, cross(c1, c2)), dot(p, cross(c2, c0)), dot(p, cross(c0, c1)));
     let sum = b.x + b.y + b.z;
-    if sum == 0.0 {
-        return vec3<f32>(1.0, 0.0, 0.0);
+    let scale = abs(b.x) + abs(b.y) + abs(b.z);
+    if !(abs(sum) > DEGENERATE * scale) {
+        return NO_TRIANGLE;
     }
     return b / sum;
+}
+
+// The coordinates of a degenerate triangle: lower than any real triangle's.
+const NO_TRIANGLE: vec3<f32> = vec3<f32>(-3.4e38, -3.4e38, -3.4e38);
+// The weights' sum, against the sum of their sizes, below which a triangle is degenerate.
+const DEGENERATE: f32 = 1e-6;
+
+// The smallest of `b`: how far inside its triangle a point is (negative outside).
+fn inside(b: vec3<f32>) -> f32 {
+    return min(min(b.x, b.y), b.z);
+}
+
+// Whether the triangle with corners `r0`, `r1`, `r2` (relative to the eye) faces the eye: its
+// corners run counter-clockwise seen from the eye, as the raster's front faces do. Unlike a test
+// on the screen, this holds for corners behind the eye.
+fn facing(r0: vec3<f32>, r1: vec3<f32>, r2: vec3<f32>) -> bool {
+    return dot(cross(r1 - r0, r2 - r0), r0) < 0.0;
+}
+
+// The reversed-Z depth, at barycentric coordinates `b`, of the triangle whose corners have clip
+// coordinates `c0`, `c1`, `c2`; negative where the point lies behind the eye (the ray meets the
+// triangle's plane only there).
+fn depth_of(c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, b: vec3<f32>) -> f32 {
+    let c = c0 * b.x + c1 * b.y + c2 * b.z;
+    if !(c.w > 0.0) {
+        return -1.0;
+    }
+    return c.z / c.w;
+}
+
+// One of a quad's two triangles, at a pixel's centre.
+struct Candidate {
+    // Its barycentric coordinates there (NO_TRIANGLE for a degenerate one).
+    b: vec3<f32>,
+    // Whether it faces the eye: the raster culls it otherwise.
+    faces: bool,
+    // Its depth there: negative behind the eye.
+    depth: f32,
+}
+
+// Whether the raster could have drawn `t` at the centre at all: facing the eye, the centre in
+// front of the eye, and not degenerate.
+fn drawable(t: Candidate) -> bool {
+    return t.faces && t.depth > 0.0 && inside(t.b) > -1e30;
+}
+
+// Whether `other` is the triangle the raster drew rather than `chosen`: it could have been drawn
+// and `chosen` couldn't; or `chosen` doesn't hold the centre and `other` holds it better; or both
+// hold it and `other` is nearer (the depth test).
+fn better(other: Candidate, chosen: Candidate) -> bool {
+    if !drawable(other) {
+        return false;
+    }
+    if !drawable(chosen) {
+        return true;
+    }
+    let held = inside(chosen.b) >= 0.0;
+    if !held {
+        return inside(other.b) > inside(chosen.b);
+    }
+    return inside(other.b) >= 0.0 && other.depth > chosen.depth;
 }
 
 // A pixel of the drawn surface, rebuilt.
@@ -107,6 +172,9 @@ struct Rebuilt {
     roughness: f32,
     // The distance from the pixel's centre to the nearest edge of its triangle, pixels.
     edge: f32,
+    // Whether a corner of the pixel's quad lies behind the eye (the triangle was chosen without
+    // the screen).
+    behind: bool,
 }
 
 // Rebuilds the triangle the raster drew at `pixel` and the surface at the pixel's centre.
@@ -117,12 +185,13 @@ struct Rebuilt {
 // frame left them). Which of the quad's triangles holds the pixel is quad_triangle's answer
 // (the side of the diagonal), as projected to the screen, confirmed by the barycentric
 // coordinates: where they put the centre outside it and the other triangle holds it better
-// (the rasterizer's tie rule on the diagonal; or a corner behind the eye, which the screen
-// can't hold), it is the other. The point, normal and roughness term are the corners' mixed by
+// (the rasterizer's tie rule on the diagonal), it is the other. With a corner behind the eye,
+// which the screen can't hold, it is the triangle holding the centre best. A triangle an edge
+// variant collapsed holds nothing (barycentric's NO_TRIANGLE), so it is never chosen. The point, normal and roughness term are the corners' mixed by
 // the perspective-correct barycentric coordinates of the pixel's centre, as the rasterizer
 // interpolates.
 fn rebuild(pixel: vec2<u32>) -> Rebuilt {
-    var out = Rebuilt(false, vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), 1.0, 1e9);
+    var out = Rebuilt(false, vec3<f32>(0.0), vec3<f32>(0.0, 0.0, 1.0), 1.0, 1e9, false);
     let id = textureLoad(ids, pixel, 0).r;
     if id == BACKGROUND {
         return out;
@@ -155,7 +224,20 @@ fn rebuild(pixel: vec2<u32>) -> Rebuilt {
     let centre = vec2<f32>(pixel) + vec2<f32>(0.5);
     let p = homogeneous(centre);
     // Triangle 0 is (p00, p10, p11), triangle 1 (p00, p11, p01).
-    var second = 0u;
+    let first = Candidate(
+        barycentric(clip[0].xyw, clip[1].xyw, clip[2].xyw, p),
+        facing(relative[0], relative[1], relative[2]),
+        0.0,
+    );
+    let second_tri = Candidate(
+        barycentric(clip[0].xyw, clip[2].xyw, clip[3].xyw, p),
+        facing(relative[0], relative[2], relative[3]),
+        0.0,
+    );
+    var candidates = array<Candidate, 2>(first, second_tri);
+    candidates[0].depth = depth_of(clip[0], clip[1], clip[2], candidates[0].b);
+    candidates[1].depth = depth_of(clip[0], clip[2], clip[3], candidates[1].b);
+    var second = select(0u, 1u, inside(candidates[1].b) > inside(candidates[0].b));
     if in_front {
         second = quad_triangle(
             screen(clip[0]),
@@ -165,31 +247,21 @@ fn rebuild(pixel: vec2<u32>) -> Rebuilt {
             centre,
         );
     }
-    var corner = vec3<u32>(0u, 1u + second, 2u + second);
-    var c0 = clip[corner.x].xyw;
-    var c1 = clip[corner.y].xyw;
-    var c2 = clip[corner.z].xyw;
-    var b = barycentric(c0, c1, c2, p);
-    // A pixel centre within rounding of the diagonal can be the other triangle's by the
-    // rasterizer's tie rule (seen on grazing quads, where the other plane extrapolated lies far
-    // off); and with a corner behind the eye there is no screen to test on. Where the chosen
-    // triangle doesn't hold the centre and the other holds it better, it is the other.
-    let outside = min(min(b.x, b.y), b.z);
-    if outside < 0.0 {
-        let other = vec3<u32>(0u, 2u - second, 3u - second);
-        let o0 = clip[other.x].xyw;
-        let o1 = clip[other.y].xyw;
-        let o2 = clip[other.z].xyw;
-        let ob = barycentric(o0, o1, o2, p);
-        if min(min(ob.x, ob.y), ob.z) > outside {
-            corner = other;
-            c0 = o0;
-            c1 = o1;
-            c2 = o2;
-            b = ob;
-        }
+    // The rasterizer drew a triangle facing the eye whose visible part holds the centre, the
+    // nearer where two do (a quad folded over itself, seen grazing, puts both on the pixel).
+    // The diagonal's side can miss that: a centre within rounding of the diagonal goes by the
+    // rasterizer's tie rule, a fold puts the centre on the side of a triangle hidden behind the
+    // other or facing away, and with a corner behind the eye there is no screen to test on.
+    if better(candidates[1u - second], candidates[second]) {
+        second = 1u - second;
     }
+    let corner = vec3<u32>(0u, 1u + second, 2u + second);
+    let c0 = clip[corner.x].xyw;
+    let c1 = clip[corner.y].xyw;
+    let c2 = clip[corner.z].xyw;
+    let b = candidates[second].b;
     out.drawn = true;
+    out.behind = !in_front;
     out.relative = relative[corner.x] * b.x + relative[corner.y] * b.y + relative[corner.z] * b.z;
     let a0 = attributes(n, placed[corner.x]);
     let a1 = attributes(n, placed[corner.y]);

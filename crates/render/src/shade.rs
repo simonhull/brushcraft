@@ -27,12 +27,19 @@
 //! So each corner is the same function of the same data as in the vertex shader, and projects
 //! through the same expression (`view_proj · (p − eye)`). **Which triangle** of the quad holds the
 //! pixel is [`crate::raster::quad_triangle`]'s answer (the side of the diagonal the pixel's
-//! centre is on, tested against the rasterizer in the raster's tests), confirmed by the
-//! barycentric coordinates: where they put the centre outside the chosen triangle and the other
-//! holds it better, it is the other. That catches the rasterizer's tie rule on the diagonal (a
-//! centre within rounding of it; on a grazing quad the other plane, extrapolated, lies far off:
-//! 2 pixels in 95,000 of the tests' scenes, 8 % off in depth, before the check), and a corner
-//! behind the eye, which the screen can't hold. The point, the normal and the roughness term are
+//! centre is on, tested against the rasterizer in the raster's tests), checked against what the
+//! rasterizer can have drawn: a triangle facing the eye (back faces are culled; facing is
+//! tested in world space, so it holds for corners behind the eye), not degenerate (an edge
+//! variant collapses one triangle of each border quad; its barycentric coordinates are none), and
+//! holding the centre in front of the eye, the nearer where both do. The other triangle is taken
+//! where only it can have been drawn, where the chosen one doesn't hold the centre and the other
+//! holds it better, or where both hold it and the other is nearer. That catches the
+//! rasterizer's tie rule on the diagonal (a centre within rounding of it; on a grazing quad the
+//! other plane, extrapolated, lies far off: 2 pixels in 95,000 of the tests' scenes, 8 % off
+//! in depth, before the check); a quad folded over itself, seen grazing, whose hidden or
+//! back-facing triangle lies on the centre's side of the diagonal; and a corner behind the eye,
+//! which the screen can't hold, where the choice is the triangle holding the centre best. The
+//! point, the normal and the roughness term are
 //! the corners' mixed by the **perspective-correct barycentric coordinates** of the pixel's centre,
 //! solved in homogeneous clip coordinates (Cramer's rule: no division by a corner's `w`), as the
 //! rasterizer interpolates. A morphing vertex's normal and roughness term are carried from its

@@ -34,7 +34,7 @@ mod png;
 /// relative to the eye and its depth (`w`, -1 where nothing is drawn), then its normal and
 /// roughness term.
 const PROBE_WGSL: &str = r"
-// Two vec4s a pixel: (relative, depth), (normal, roughness).
+// Three vec4s a pixel: (relative, depth), (normal, roughness), (behind, 0, 0, 0).
 @group(3) @binding(1) var<storage, read_write> probed: array<vec4<f32>>;
 
 // Rebuilds one pixel and writes what it found.
@@ -44,16 +44,18 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= size.x || id.y >= size.y {
         return;
     }
-    let at = 2u * (id.y * size.x + id.x);
+    let at = 3u * (id.y * size.x + id.x);
     let r = rebuild(id.xy);
     if !r.drawn {
         probed[at] = vec4<f32>(0.0, 0.0, 0.0, -1.0);
         probed[at + 1u] = vec4<f32>(0.0);
+        probed[at + 2u] = vec4<f32>(0.0);
         return;
     }
     let clip = view.view_proj * vec4<f32>(r.relative, 1.0);
     probed[at] = vec4<f32>(r.relative, clip.z / clip.w);
     probed[at + 1u] = vec4<f32>(r.normal, r.roughness);
+    probed[at + 2u] = vec4<f32>(select(0.0, 1.0, r.behind), 0.0, 0.0, 0.0);
 }
 ";
 
@@ -68,6 +70,8 @@ pub(crate) struct Probed {
     pub(crate) normal: [f32; 3],
     /// The roughness term.
     pub(crate) roughness: f32,
+    /// Whether a corner of its quad lies behind the eye.
+    pub(crate) behind: bool,
 }
 
 /// The pass for `world`'s slots, compute, clay, no wireframe.
@@ -217,7 +221,7 @@ pub(crate) fn probe(gpu: &Gpu, shade: &Shade) -> Vec<Option<Probed>> {
         cache: None,
     });
     let pixels = u64::from(width) * u64::from(height);
-    let output = storage_buffer(gpu, "probed", pixels * 32).expect("a buffer");
+    let output = storage_buffer(gpu, "probed", pixels * 48).expect("a buffer");
     let group = device.create_bind_group(&BindGroupDescriptor {
         label: Some("probe"),
         layout: &probe_layout,
@@ -237,15 +241,16 @@ pub(crate) fn probe(gpu: &Gpu, shade: &Shade) -> Vec<Option<Probed>> {
     finish(gpu);
     let words: Vec<[f32; 4]> = gpu.read_buffer(&output).expect("read back");
     words
-        .as_chunks::<2>()
+        .as_chunks::<3>()
         .0
         .iter()
-        .map(|&[first, second]| {
+        .map(|&[first, second, third]| {
             (first[3] >= 0.0).then_some(Probed {
                 relative: [first[0], first[1], first[2]],
                 depth: first[3],
                 normal: [second[0], second[1], second[2]],
                 roughness: second[3],
+                behind: third[0] > 0.5,
             })
         })
         .collect()
@@ -256,9 +261,11 @@ fn bits(texel: &[f32; 4]) -> [u32; 4] {
     texel.map(f32::to_bits)
 }
 
-/// How far the rebuilt depth may be from the raster's, relative: float rounding of the same
-/// plane, interpolated two ways.
-const DEPTH_TOLERANCE: f32 = 1e-4;
+/// How far the rebuilt depth may be from the raster's, relative.
+///
+/// That is float rounding of the same plane, interpolated two ways (up to 1.4e-4 seen on a fold
+/// a few hundredths from the eye, where its two triangles lie within rounding of each other).
+const DEPTH_TOLERANCE: f32 = 3e-4;
 
 /// Pixels where `shade`'s rebuilt surface disagrees with what the raster drew: drawn on one side
 /// only, or at a depth more than [`DEPTH_TOLERANCE`] off. And the drawn pixels.
@@ -453,7 +460,10 @@ fn the_rebuild_check_bites_when_the_drawn_edges_the_morph_or_the_diagonal_is_ign
                 "diagonal",
                 &[
                     ("second = quad_triangle(", "second = 0u * quad_triangle("),
-                    ("if outside < 0.0 {", "if false {"),
+                    (
+                        "if better(candidates[1u - second], candidates[second]) {",
+                        "if false {",
+                    ),
                 ],
             ),
         ];
@@ -616,5 +626,179 @@ fn shading_again_with_nothing_shaded_does_nothing() {
             .create_command_encoder(&CommandEncoderDescriptor::default());
         assert!(!shade.encode_again(gpu, &mut encoder).expect("encoded"));
         assert!(shade.target().is_none(), "no target yet");
+    });
+}
+
+/// Scenes seen from just above the surface, along it, each with its clusters.
+///
+/// In random mixed-level cuts, big quads under the eye reach behind it, edge variants among
+/// them, so the triangle is chosen without the screen; and quads seen grazing fold over
+/// themselves.
+fn grazing_scenes(gpu: &Gpu, world: &World) -> Vec<Drawn> {
+    let mut out = grazing(gpu, world, 41, false);
+    out.extend(grazing(gpu, world, 41, true));
+    out
+}
+
+/// Six scenes for [`grazing_scenes`] from `seed`: of coarse cuts (levels 2 and 3), whose quads
+/// under the eye reach behind it, or of random cuts from level 2, whose quads seen grazing
+/// fold over themselves.
+fn grazing(gpu: &Gpu, world: &World, seed: u64, coarse: bool) -> Vec<Drawn> {
+    let mut rng = Rng(seed);
+    let mut out = Vec::new();
+    while out.len() < 6 {
+        let d = [
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+        ]
+        .map(f64::from);
+        let Some(down) = Vec3::new(d[0], d[1], d[2]).normalized() else {
+            continue;
+        };
+        let Some(along) = down.cross(Vec3::new(0.3, 1.0, 0.2)).normalized() else {
+            continue;
+        };
+        let eye = down * 1.004;
+        let target = eye + along - down * 0.25;
+        let Some(view) = View::look_at(
+            eye,
+            target,
+            down,
+            70_f64.to_radians(),
+            crate::raster::tests::size(),
+            0.0005,
+        ) else {
+            continue;
+        };
+        let cut = if coarse {
+            let level_2 = crate::raster::tests::level_cut(world, 2);
+            grown(&mut rng, world, level_2, 1)
+        } else {
+            random_cut(&mut rng, world, 2)
+        };
+        let clusters = crate::raster::tests::cut_clusters(world, &cut, true);
+        let frame = RasterFrame {
+            view: &view,
+            time: Duration::from_secs(1),
+            moving: false,
+        };
+        let mut raster = crate::raster::tests::still_raster(gpu, world);
+        draw_cut(gpu, &mut raster, world, &cut, &clusters, &frame);
+        out.push(Drawn {
+            raster,
+            view,
+            clusters,
+        });
+    }
+    out
+}
+
+/// A bite check: what it breaks, the patches that break it, and the fewest pixels it must put
+/// off.
+type Bite<'a> = (&'a str, &'a [(&'a str, &'a str)], usize);
+
+/// Pixels of `pixels` (the probe's) whose quad reaches behind the eye and lies on an edge whose
+/// variant collapses one of its triangles, in `scene`.
+fn behind_on_collapsed_edges(
+    gpu: &Gpu,
+    world: &World,
+    scene: &Drawn,
+    pixels: &[Option<Probed>],
+) -> usize {
+    let ids = scene.raster.read_visibility(gpu).expect("read back");
+    let behind = ids
+        .iter()
+        .zip(pixels)
+        .filter(|(_, p)| p.is_some_and(|p| p.behind))
+        .filter_map(|(&id, _)| crate::raster::VisibilityId::decode(id));
+    let on_variant = behind.filter(|id| {
+        let quads = world.place_of(id.node).level().tile_quads();
+        let per = (quads / 8).max(1);
+        let (cx, cy) = (id.cluster % per, id.cluster / per);
+        let Some(cluster) = scene
+            .clusters
+            .iter()
+            .find(|c| c.node == id.node && c.position() == (cx, cy))
+        else {
+            return false;
+        };
+        let last = cluster.quads() - 1;
+        let (qx, qy) = (id.quad % 8, id.quad / 8);
+        let on = u32::from(qy == 0)
+            | (u32::from(qx == last) << 1)
+            | (u32::from(qy == last) << 2)
+            | (u32::from(qx == 0) << 3);
+        cluster.variant() & on != 0
+    });
+    on_variant.count()
+}
+
+#[test]
+fn quads_reaching_behind_the_eye_are_rebuilt_as_drawn_collapsed_triangles_never_chosen() {
+    GpuTest::run(|gpu| {
+        let world = World::new(gpu);
+        let scenes = grazing_scenes(gpu, &world);
+        let mut shade = shade_for(gpu, &world);
+        let mut exercised = 0;
+        for (k, scene) in scenes.iter().enumerate() {
+            shade_frame(gpu, &mut shade, &world, &scene.raster, &scene.view);
+            let (wrong, drawn) = disagreements(gpu, &shade, &scene.raster);
+            assert_eq!(
+                wrong, 0,
+                "scene {k}: {wrong} of {drawn} pixels rebuilt elsewhere"
+            );
+            let pixels = probe(gpu, &shade);
+            exercised += behind_on_collapsed_edges(gpu, &world, scene, &pixels);
+        }
+        assert!(
+            exercised > 100,
+            "{exercised} pixels of collapsed border quads reach behind the eye"
+        );
+        // The bites. The choice as it was: the diagonal's side, the other triangle only where it
+        // holds the centre better, nothing with a corner behind the eye, and a degenerate
+        // triangle's coordinates as a point inside it. And a fold seen grazing, with neither the
+        // facing test nor the nearer of two triangles holding the centre (either alone settles
+        // it).
+        let old_choice = [
+            (
+                "        return NO_TRIANGLE;",
+                "        return vec3<f32>(1.0, 0.0, 0.0);",
+            ),
+            (
+                "var second = select(0u, 1u, inside(candidates[1].b) > inside(candidates[0].b));",
+                "var second = 0u;",
+            ),
+            (
+                "if better(candidates[1u - second], candidates[second]) {",
+                "if in_front && inside(candidates[second].b) < 0.0 \
+                 && inside(candidates[1u - second].b) > inside(candidates[second].b) {",
+            ),
+        ];
+        let fold_blind = [
+            (
+                "return inside(other.b) >= 0.0 && other.depth > chosen.depth;",
+                "return false;",
+            ),
+            (
+                "return t.faces && t.depth > 0.0 && inside(t.b) > -1e30;",
+                "return t.depth > 0.0 && inside(t.b) > -1e30;",
+            ),
+        ];
+        let bites: [Bite<'_>; 2] = [
+            ("the old choice", &old_choice, 1000),
+            ("a fold's hidden triangle chosen", &fold_blind, 5),
+        ];
+        for (what, patches, least) in bites {
+            let mut broken = patched(gpu, &world, patches);
+            let wrong: usize = scenes
+                .iter()
+                .map(|scene| {
+                    shade_frame(gpu, &mut broken, &world, &scene.raster, &scene.view);
+                    disagreements(gpu, &broken, &scene.raster).0
+                })
+                .sum();
+            assert!(wrong > least, "{what}: {wrong} pixels off");
+        }
     });
 }
