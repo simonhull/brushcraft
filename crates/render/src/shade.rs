@@ -237,8 +237,8 @@ struct Target {
     texture: Texture,
     /// A view of it.
     view: TextureView,
-    /// Group 3, the compute path's storage image.
-    output: BindGroup,
+    /// Group 3, the compute path's storage image; `None` on the fragment path.
+    output: Option<BindGroup>,
 }
 
 /// The last scene shaded: its bind groups, kept for [`Shade::encode_again`].
@@ -520,7 +520,7 @@ impl<M: Material> Shade<M> {
                 pass.set_bind_group(0, &bound.frame, &[]);
                 pass.set_bind_group(1, &bound.slots, &[]);
                 pass.set_bind_group(2, self.material.bind_group(), &[]);
-                pass.set_bind_group(3, &target.output, &[]);
+                pass.set_bind_group(3, target.output.as_ref(), &[]);
                 pass.dispatch_workgroups(
                     size.0.div_ceil(GROUP_SIDE),
                     size.1.div_ceil(GROUP_SIDE),
@@ -552,13 +552,19 @@ impl<M: Material> Shade<M> {
         Ok(true)
     }
 
-    /// A target of `size`.
+    /// A target of `size`, used as the pass's path writes it: a storage image on the compute
+    /// path, a colour attachment on the fragment path; read by the tone map, and copied out by
+    /// the tests.
     ///
     /// # Errors
     ///
     /// As [`Gpu::scoped`].
     fn new_target(&self, gpu: &Gpu, size: (u32, u32)) -> Result<Target, GpuError> {
         let device = gpu.device();
+        let written = match self.path {
+            ShadePath::Compute => TextureUsages::STORAGE_BINDING,
+            ShadePath::Fragment => TextureUsages::RENDER_ATTACHMENT,
+        };
         gpu.scoped("shade target", || {
             let texture = device.create_texture(&TextureDescriptor {
                 label: Some("shaded"),
@@ -571,20 +577,19 @@ impl<M: Material> Shade<M> {
                 sample_count: 1,
                 dimension: TextureDimension::D2,
                 format: HDR_FORMAT,
-                usage: TextureUsages::STORAGE_BINDING
-                    | TextureUsages::RENDER_ATTACHMENT
-                    | TextureUsages::TEXTURE_BINDING
-                    | TextureUsages::COPY_SRC,
+                usage: written | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view = texture.create_view(&TextureViewDescriptor::default());
-            let output = device.create_bind_group(&BindGroupDescriptor {
-                label: Some("shade output"),
-                layout: &self.output_layout,
-                entries: &[BindGroupEntry {
-                    binding: 0,
-                    resource: BindingResource::TextureView(&view),
-                }],
+            let output = (self.path == ShadePath::Compute).then(|| {
+                device.create_bind_group(&BindGroupDescriptor {
+                    label: Some("shade output"),
+                    layout: &self.output_layout,
+                    entries: &[BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&view),
+                    }],
+                })
             });
             Target {
                 texture,
