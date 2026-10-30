@@ -115,7 +115,6 @@ use crate::cull::{CULL_WGSL, SlotBuffers, entry, pipeline, storage_buffer, unifo
 use crate::gpu::{Gpu, GpuError};
 use crate::indices::{self, INDICES_WGSL};
 use crate::lod::{CLUSTER_WGSL, CutList};
-use crate::surface::Size;
 use crate::tree::NODE_WGSL;
 use crate::upload::VERTEX_WGSL;
 
@@ -391,8 +390,8 @@ struct SlotPipeline {
 /// The visibility and depth images.
 #[derive(Debug)]
 struct Targets {
-    /// Their size.
-    size: Size,
+    /// Their width and height.
+    size: (u32, u32),
     /// The visibility buffer.
     visibility: Texture,
     /// A view of it.
@@ -430,8 +429,8 @@ pub struct Raster {
     stamp: ComputePipeline,
     /// The render pipeline for the slot buffers last drawn from.
     pipeline: Option<SlotPipeline>,
-    /// The targets, sized to the frame's view.
-    targets: Option<Targets>,
+    /// The targets, sized to the last frame's view (1 × 1 before the first).
+    targets: Targets,
 }
 
 /// A layout entry for a read-only storage buffer seen by the vertex and compute stages.
@@ -541,7 +540,7 @@ impl Raster {
             stamp_layout,
             stamp,
             pipeline: None,
-            targets: None,
+            targets: Targets::new(gpu, 1, 1)?,
         })
     }
 
@@ -574,8 +573,8 @@ impl Raster {
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         queue.write_buffer(&self.view, 0, bytemuck::bytes_of(&frame.view.gpu()));
         let size = frame.view.size();
-        if self.targets.as_ref().is_none_or(|t| t.size != size) {
-            self.targets = Some(Targets::new(gpu, size)?);
+        if self.targets.size != (size.width(), size.height()) {
+            self.targets = Targets::new(gpu, size.width(), size.height())?;
         }
         Ok(())
     }
@@ -647,7 +646,8 @@ impl Raster {
             return Err(RasterError::NoFrame);
         }
         self.prepare_pipeline(gpu, draw.slots)?;
-        let (Some(targets), Some(slot_pipeline)) = (&self.targets, &self.pipeline) else {
+        let targets = &self.targets;
+        let Some(slot_pipeline) = &self.pipeline else {
             return Err(RasterError::NoFrame);
         };
         let (group, slot_group) = self.groups(gpu, draw, slot_pipeline)?;
@@ -746,12 +746,11 @@ impl Raster {
             return Ok(());
         }
         let buffers = u32::try_from(counts.iter().sum::<usize>()).unwrap_or(u32::MAX);
-        // The probe's two buffers count against the compute stage's limit too.
         let limit = gpu
             .device()
             .limits()
             .max_storage_buffers_per_shader_stage
-            .saturating_sub(FIXED_STORAGE + 2);
+            .saturating_sub(FIXED_STORAGE);
         if buffers > limit {
             return Err(RasterError::TooManySlotBuffers { buffers, limit });
         }
@@ -759,22 +758,23 @@ impl Raster {
         Ok(())
     }
 
-    /// The visibility buffer, once a frame has begun: [`VISIBILITY_FORMAT`], the view's size.
+    /// The visibility buffer: [`VISIBILITY_FORMAT`], the last begun frame's size (1 × 1 before
+    /// the first).
     #[must_use]
-    pub fn visibility(&self) -> Option<&Texture> {
-        self.targets.as_ref().map(|t| &t.visibility)
+    pub const fn visibility(&self) -> &Texture {
+        &self.targets.visibility
     }
 
-    /// The depth buffer, once a frame has begun: [`DEPTH_FORMAT`], the view's size.
+    /// The depth buffer: [`DEPTH_FORMAT`], the size of [`Raster::visibility`].
     #[must_use]
-    pub fn depth(&self) -> Option<&Texture> {
-        self.targets.as_ref().map(|t| &t.depth)
+    pub const fn depth(&self) -> &Texture {
+        &self.targets.depth
     }
 
     /// A view of the depth buffer, for the depth pyramid ([`crate::cull::PyramidPass::build`]).
     #[must_use]
-    pub fn depth_view(&self) -> Option<&TextureView> {
-        self.targets.as_ref().map(|t| &t.depth_view)
+    pub const fn depth_view(&self) -> &TextureView {
+        &self.targets.depth_view
     }
 }
 
@@ -902,16 +902,16 @@ fn slot_vertex(size_class: u32, slot_buffer: u32, i: u32) -> TileVertex {{
 }
 
 impl Targets {
-    /// Visibility and depth images of `size`.
+    /// Visibility and depth images `width` × `height`, both positive.
     ///
     /// # Errors
     ///
     /// As [`Gpu::scoped`].
-    fn new(gpu: &Gpu, size: Size) -> Result<Self, GpuError> {
+    fn new(gpu: &Gpu, width: u32, height: u32) -> Result<Self, GpuError> {
         let device = gpu.device();
         let extent = Extent3d {
-            width: size.width(),
-            height: size.height(),
+            width,
+            height,
             depth_or_array_layers: 1,
         };
         let image = |label, format| {
@@ -932,7 +932,7 @@ impl Targets {
             let visibility = image("visibility", VISIBILITY_FORMAT);
             let depth = image("depth", DEPTH_FORMAT);
             Self {
-                size,
+                size: (width, height),
                 visibility_view: visibility.create_view(&TextureViewDescriptor::default()),
                 visibility,
                 depth_view: depth.create_view(&TextureViewDescriptor::default()),

@@ -209,20 +209,3 @@ fn cluster_vertex(
 fn visibility(vertex_out: ClusterOut, @builtin(primitive_index) triangle: u32) -> @location(0) u32 {
     return vertex_out.id | (triangle & TRIANGLE_MASK);
 }
-
-// For tests: probes[k] is (cluster instance, grid vertex); probed[k] gets the vertex where the
-// vertex shader puts it, w its node.
-@group(2) @binding(0) var<storage, read> probes: array<vec2<u32>>;
-// See probes.
-@group(2) @binding(1) var<storage, read_write> probed: array<vec4<f32>>;
-
-// Runs cluster_point for each probe.
-@compute @workgroup_size(64)
-fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
-    let k = id.x;
-    if k >= arrayLength(&probes) {
-        return;
-    }
-    let placed = cluster_point(probes[k].x, probes[k].y);
-    probed[k] = vec4<f32>(placed.position, f32(placed.id >> NODE_SHIFT));
-}

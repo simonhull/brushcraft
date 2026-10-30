@@ -30,6 +30,7 @@ use crate::gpu::GpuTest;
 use crate::indices::{ClusterSize, GridVertex, Variant, remap};
 use crate::lod::{GpuCluster, GpuCutEntry, Lod, LodConfig, MainInputs, Thresholds};
 use crate::residency::{CLASSES, REQUEST_HEADER, SizeClass, Slot};
+use crate::surface::Size;
 use crate::tree::{NODE_BYTES, NODE_FINEST, Place, TileTree};
 use crate::upload::{GpuVertex, TileDetail};
 
@@ -471,7 +472,8 @@ fn finish(gpu: &Gpu) {
 
 /// The visibility buffer, row by row.
 fn read_visibility(gpu: &Gpu, raster: &Raster) -> Vec<u32> {
-    let texture = raster.visibility().expect("a frame was drawn");
+    let texture = raster.visibility();
+
     let (width, height) = (texture.width(), texture.height());
     let row = (width * 4).next_multiple_of(256);
     let buffer = gpu.device().create_buffer(&BufferDescriptor {
@@ -1300,6 +1302,26 @@ fn with_the_camera_still_the_ids_are_the_same_frame_after_frame() {
     });
 }
 
+/// The probe, appended to the raster's shader in tests only: `probes[k]` is (cluster instance,
+/// grid vertex), and `probed[k]` gets where the vertex shader puts that vertex, `w` its node.
+const PROBE_WGSL: &str = r"
+// The probes: (cluster instance, grid vertex).
+@group(2) @binding(0) var<storage, read> probes: array<vec2<u32>>;
+// Where each probe's vertex is drawn, w its node.
+@group(2) @binding(1) var<storage, read_write> probed: array<vec4<f32>>;
+
+// Runs cluster_point for each probe.
+@compute @workgroup_size(64)
+fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
+    let k = id.x;
+    if k >= arrayLength(&probes) {
+        return;
+    }
+    let placed = cluster_point(probes[k].x, probes[k].y);
+    probed[k] = vec4<f32>(placed.position, f32(placed.id >> NODE_SHIFT));
+}
+";
+
 /// Where the vertex shader puts each `(cluster, grid vertex)` of `probes`, from the list
 /// `clusters`, with the raster's frame as last begun and stamped: its position and node.
 fn probe(
@@ -1315,9 +1337,10 @@ fn probe(
         label: Some("probe"),
         entries: &[read_entry(0), written_entry(1)],
     });
+    let source = format!("{}{PROBE_WGSL}", slot_pipeline.source);
     let module = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("probe"),
-        source: ShaderSource::Wgsl(slot_pipeline.source.as_str().into()),
+        source: ShaderSource::Wgsl(source.into()),
     });
     let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("probe"),

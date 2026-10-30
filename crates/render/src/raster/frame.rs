@@ -9,8 +9,9 @@
 //! tests against everything this frame drew. A frame of another size than the last has no
 //! previous pyramid: nothing is occlusion-culled in its first phase.
 //!
-//! This is the composition [`crate::Renderer::draw`] runs once the app hands it the tile tree
-//! and residency (not wired yet: see the plan's Task 4 notes); the tests draw through it.
+//! This is the composition [`crate::Renderer::draw`] is to run once the app hands it the tile
+//! tree and residency: not wired yet, its own step (plan, "Gaps found while executing", the
+//! "Task 4 review" bullet). The tests draw through it.
 
 use std::time::Duration;
 
@@ -129,13 +130,10 @@ impl FramePasses {
     ) -> Result<Option<CutReadback>, FrameError> {
         let size = inputs.view.size();
         let wanted = (size.width(), size.height());
-        if self
-            .current
-            .as_ref()
-            .is_none_or(|p| p.depth_size() != wanted)
-        {
-            self.current = Some(DepthPyramid::new(gpu, size)?);
-        }
+        let current = match self.current.take() {
+            Some(pyramid) if pyramid.depth_size() == wanted => pyramid,
+            _ => DepthPyramid::new(gpu, size)?,
+        };
         if self
             .previous
             .as_ref()
@@ -165,7 +163,6 @@ impl FramePasses {
         self.raster.begin_frame(gpu, &frame)?;
         self.raster
             .encode_stamp(gpu, encoder, inputs.tree, self.lod.cut_list())?;
-        let current = self.current.take().ok_or(RasterError::NoFrame)?;
         let drawn = self.draw_both(gpu, encoder, inputs, &current);
         // The swap: this frame's pyramid is the next one's previous, and the old previous is
         // built over next.
@@ -198,7 +195,7 @@ impl FramePasses {
                 args: self.lod.draw_args(post),
             };
             self.raster.encode_draw(gpu, encoder, &draw, phase)?;
-            let depth = self.raster.depth_view().ok_or(RasterError::NoFrame)?;
+            let depth = self.raster.depth_view();
             self.pyramids.build(gpu, encoder, depth, current, None)?;
         }
         Ok(())
