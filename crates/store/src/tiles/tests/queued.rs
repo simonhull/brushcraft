@@ -363,6 +363,36 @@ fn run_jobs_ends_near_its_deadline_on_the_real_clock() {
     }
 }
 
+/// With the queue alone, for positions alone, a call still ends near its deadline: its larger
+/// rounds keep to the time left, each slice within a round's time and a step's fixed cost.
+#[test]
+fn run_jobs_alone_ends_near_its_deadline_on_the_real_clock() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, _) = edited(&dir, &mesh, roomy());
+    store
+        .queue_evaluation_as(&prioritized(&mesh, 41), Evaluation::Positions)
+        .unwrap();
+    let budget = Duration::from_millis(3);
+    let allowance = Duration::from_millis(50);
+    for call in 0..50 {
+        let start = Instant::now();
+        let report = store.run_jobs(start + budget).unwrap();
+        let spent = start.elapsed();
+        assert!(
+            spent <= budget + report.longest_slice + allowance,
+            "call {call}: {spent:?} for {budget:?}, longest slice {:?}",
+            report.longest_slice
+        );
+        assert!(
+            report.longest_slice <= crate::jobs::ROUND_TIME_ALONE + allowance,
+            "call {call}: a slice within a round's time: {:?}",
+            report.longest_slice
+        );
+        drop(store.take_evaluated());
+    }
+}
+
 /// During a brush stroke (a write between every call and take), the tiles away from the
 /// brush are handed over as they finish, and none under it, nor reading it through its ring,
 /// ever is stale.

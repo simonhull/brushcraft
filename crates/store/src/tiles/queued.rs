@@ -11,13 +11,21 @@ use super::TileStore;
 use super::config::Evaluation;
 use super::error::CacheError;
 use super::upkeep::ConeStep;
-use crate::jobs::JobsReport;
+use crate::jobs::{ConeSteps, JobsReport};
 use crate::pool::Freshness;
 use crate::queued::{EvaluatedTile, EvaluationQueue, Priority};
 
 /// About how long a slice spends bringing finished tiles up to date after a correction
 /// changed (a copy each, a few dozen microseconds): it leaves the rest for the next slices.
 const REFRESH_TIME: Duration = Duration::from_micros(300);
+
+/// The fewest tiles of a cone a step of the queued evaluation alone evaluates.
+///
+/// Whatever the time left: a round has a fixed cost (about 80–100 µs, handing work to the workers),
+/// so a step of one or two tiles would spend a call's last moments mostly on it. Eight tiles more
+/// than the time left holds overrun the deadline by a few hundred microseconds at most,
+/// within the slice, and every call moves on.
+const MIN_STEP_TILES: usize = 8;
 
 /// What a slice of the queued evaluation did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,15 +220,20 @@ impl TileStore {
         // tiles (one at least) and the round's time at the cost measured lately, and the cone
         // is of that many tiles, so a slice evaluates no more than one round, its normals or,
         // past an evicted cone, that many tiles whole.
-        let round = if let Some(left) = alone {
-            queue.steps.round_alone(left)
+        let round = if alone.is_some() {
+            queue.steps.round_alone()
         } else {
             let workers = self.workers.current_num_threads().max(1);
             let busy: usize = self.jobs.iter_mut().map(|job| job.upkeep().busy()).sum();
             queue.steps.round_size(workers.saturating_sub(busy).max(1))
         };
         let first = queue.first(room.min(round));
-        let mut keys = match self.step_cone(&mut queue.steps, || first, round)? {
+        let step = if let Some(left) = alone {
+            self.step_whole_cone(&mut queue.steps, || first, left)?
+        } else {
+            self.step_cone(&mut queue.steps, || first, round)?
+        };
+        let mut keys = match step {
             ConeStep::Round => return Ok(Turn::Worked),
             ConeStep::Reading => return Ok(Turn::Reading),
             ConeStep::Current(keys) => keys,
@@ -267,6 +280,107 @@ impl TileStore {
             queue.keep(tile);
         }
         Ok(Turn::Worked)
+    }
+
+    /// One step of the queued evaluation through the cone `steps` holds (listed as
+    /// [`TileStore::step_cone`] lists it), when it has the jobs to itself, with `left` before
+    /// the call's deadline: as much of the whole cone as can be evaluated without waiting on
+    /// the disk and in the time left, in one round.
+    ///
+    /// Every correction the cone still lacks is prefetched at once. The tiles evaluated are
+    /// the cone's, coarsest first, down to the first level not wholly in memory and those of
+    /// that level that are, as many as the time left holds at the cost measured lately
+    /// ([`ConeSteps::tiles_alone`]), and at least [`MIN_STEP_TILES`]. With the whole cone in memory
+    /// and time for it, the cone is evaluated and its finest tiles handed back current
+    /// ([`ConeStep::Current`]) in the same step. With nothing in memory to
+    /// evaluate and reads in flight, it waits for them ([`ConeStep::Reading`]); with none in
+    /// flight (their reads landed and weren't kept), it reads one here. A tile an earlier step
+    /// of this cone evaluated, asked for again (a budget too small to keep the cone cached),
+    /// hands the finest tiles back to be evaluated whole, so the work always ends.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`] and [`TileStore::prefetch`].
+    fn step_whole_cone(
+        &mut self,
+        steps: &mut ConeSteps,
+        keys: impl FnOnce() -> Vec<TileKey>,
+        left: Duration,
+    ) -> Result<ConeStep, CacheError> {
+        let began = Instant::now();
+        let keys = self.list_cone(steps, keys)?;
+        let stale_levels = self.stale_levels(steps);
+        if stale_levels.is_empty() {
+            steps.reset();
+            return Ok(ConeStep::Current(keys));
+        }
+        let wanting: Vec<TileKey> = stale_levels.iter().flatten().copied().collect();
+        self.prefetch(&wanting)?;
+        self.poll()?;
+        // Coarsest first, down to the first level not wholly in memory and what of it is, as
+        // many tiles as the time left holds (what the listing, the prefetch and installing the
+        // reads took comes off it).
+        let most = steps
+            .tiles_alone(left.saturating_sub(began.elapsed()))
+            .max(MIN_STEP_TILES);
+        let mut targets: Vec<TileKey> = Vec::new();
+        let mut whole = true;
+        for level in &stale_levels {
+            let (ready, unread): (Vec<TileKey>, Vec<TileKey>) =
+                level.iter().copied().partition(|key| {
+                    self.corrections.find(key).is_some() || self.locate(key).is_none()
+                });
+            let room = most.saturating_sub(targets.len());
+            if unread.is_empty() && ready.len() <= room {
+                targets.extend(ready);
+                continue;
+            }
+            whole = false;
+            targets.extend(ready.into_iter().take(room));
+            break;
+        }
+        if targets.is_empty() {
+            if self.prefetching() > 0 {
+                return Ok(ConeStep::Reading);
+            }
+            // The reads landed and weren't kept (no room for them): read one here.
+            targets.extend(stale_levels.first().and_then(|level| level.first()));
+        }
+        if targets.iter().any(|key| steps.seen.contains(key)) {
+            steps.reset();
+            return Ok(ConeStep::Current(keys));
+        }
+        let evaluating = Instant::now();
+        self.evaluate_many(&targets, Evaluation::Positions)?;
+        steps.took_tiles_alone(evaluating.elapsed(), targets.len());
+        steps.spent += began.elapsed();
+        steps.seen.extend(targets);
+        if whole {
+            steps.took_keys(steps.spent, keys.len());
+            steps.reset();
+            return Ok(ConeStep::Current(keys));
+        }
+        Ok(ConeStep::Round)
+    }
+
+    /// The tiles of `steps`' cone whose positions aren't current, level by level, coarsest
+    /// first, the levels with none left out.
+    fn stale_levels(&mut self, steps: &mut ConeSteps) -> Vec<Vec<TileKey>> {
+        let mut stale_levels = Vec::new();
+        if let Some(cone) = steps.cone.take() {
+            for level in &cone.levels {
+                let stale: Vec<TileKey> = level
+                    .iter()
+                    .copied()
+                    .filter(|key| !self.is_current(key))
+                    .collect();
+                if !stale.is_empty() {
+                    stale_levels.push(stale);
+                }
+            }
+            steps.cone = Some(cone);
+        }
+        stale_levels
     }
 
     /// Brings the finished tiles a write outdated up to date, for about [`REFRESH_TIME`]: each

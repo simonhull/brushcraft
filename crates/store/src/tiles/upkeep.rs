@@ -1268,22 +1268,7 @@ impl TileStore {
         keys: impl FnOnce() -> Vec<TileKey>,
         round: usize,
     ) -> Result<ConeStep, CacheError> {
-        // The tiles a cone is being stepped through for stay the ones evaluated until it is
-        // done, so a step never starts over.
-        let keys: Vec<TileKey> = match &steps.cone {
-            Some(cone) if cone.as_of == self.edits => cone.keys.clone(),
-            _ => {
-                let keys = keys();
-                let levels = self.normals_cone(&keys)?;
-                steps.cone = Some(Cone {
-                    keys: keys.clone(),
-                    levels,
-                    as_of: self.edits,
-                });
-                steps.seen.clear();
-                keys
-            }
-        };
+        let keys = self.list_cone(steps, keys)?;
         let mut coarsest = None;
         if let Some(Cone { levels: cone, .. }) = &steps.cone {
             for level in cone {
@@ -1325,6 +1310,35 @@ impl TileStore {
         }
         steps.reset();
         Ok(ConeStep::Current(keys))
+    }
+
+    /// The finest tiles `steps`' cone is for: the cone held, unless a correction change since
+    /// it was listed outdated it, else one listed anew for the tiles `keys` gives.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] (not for tiles of the store's mesh).
+    pub(super) fn list_cone(
+        &mut self,
+        steps: &mut ConeSteps,
+        keys: impl FnOnce() -> Vec<TileKey>,
+    ) -> Result<Vec<TileKey>, CacheError> {
+        // The tiles a cone is being stepped through for stay the ones evaluated until it is
+        // done, so a step never starts over.
+        Ok(match &steps.cone {
+            Some(cone) if cone.as_of == self.edits => cone.keys.clone(),
+            _ => {
+                let keys = keys();
+                let levels = self.normals_cone(&keys)?;
+                steps.cone = Some(Cone {
+                    keys: keys.clone(),
+                    levels,
+                    as_of: self.edits,
+                });
+                steps.seen.clear();
+                keys
+            }
+        })
     }
 
     /// Why display tile `key` wouldn't build, if it failed since the last correction change.

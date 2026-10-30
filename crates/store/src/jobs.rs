@@ -44,6 +44,25 @@ pub(crate) const ROUND_MAX_ALONE: usize = 64;
 /// itself: a few milliseconds of a frame's jobs phase, and never past the call's deadline.
 pub(crate) const ROUND_TIME_ALONE: Duration = Duration::from_millis(4);
 
+/// About how long the steps through one cone of the queued evaluation alone should take.
+///
+/// A frame's jobs phase, so the cone's tiles are handed over within a frame or two of
+/// being queued, and its rounds are large enough to spread over the workers.
+const CONE_TIME_ALONE: Duration = Duration::from_millis(8);
+
+/// What a finest tile of the queued evaluation alone is assumed to take, with its cone.
+///
+/// Assumed before a round alone has measured it: on the safe side (a cold cone's first round,
+/// whose coarse levels every tile shares, measured about 340 µs a tile), so the first round
+/// doesn't run past its time.
+const KEY_COST: Duration = Duration::from_micros(400);
+
+/// What a tile of a cone is assumed to take in a step of the queued evaluation alone.
+///
+/// Assumed before a step has measured it: a step evaluates many at once over the workers, measured
+/// at about 20–30 µs a tile, so this is on the safe side.
+const CONE_TILE_COST: Duration = Duration::from_micros(50);
+
 /// What evaluating a tile is assumed to take before a job has measured it.
 const TILE_COST: Duration = Duration::from_micros(150);
 
@@ -207,6 +226,16 @@ pub(crate) struct ConeSteps {
     /// What evaluating one tile has taken lately, wall time over the tiles of a round (a
     /// moving average): how many a slice's round holds.
     tile_cost: Duration,
+    /// What a finest tile of the queued evaluation's has taken lately when it has the jobs to
+    /// itself: the steps through its cone, wall time over the cone's finest tiles (a moving
+    /// average). How many [`ConeSteps::round_alone`] holds.
+    key_cost: Duration,
+    /// What a tile of a cone has taken lately in a step of the queued evaluation alone, wall
+    /// time over the tiles the step evaluated (a moving average): how many
+    /// [`ConeSteps::tiles_alone`] lets a step evaluate.
+    cone_tile_cost: Duration,
+    /// The time the steps through the cone held have taken so far.
+    pub(crate) spent: Duration,
 }
 
 impl Default for ConeSteps {
@@ -216,12 +245,16 @@ impl Default for ConeSteps {
 }
 
 impl ConeSteps {
-    /// No cone yet, evaluating a tile assumed to take [`TILE_COST`].
+    /// No cone yet, evaluating a tile assumed to take [`TILE_COST`], and a finest tile alone
+    /// [`KEY_COST`].
     pub(crate) const fn new() -> Self {
         Self {
             cone: None,
             seen: BTreeSet::new(),
             tile_cost: TILE_COST,
+            key_cost: KEY_COST,
+            cone_tile_cost: CONE_TILE_COST,
+            spent: Duration::ZERO,
         }
     }
 
@@ -229,6 +262,7 @@ impl ConeSteps {
     pub(crate) fn reset(&mut self) {
         self.cone = None;
         self.seen.clear();
+        self.spent = Duration::ZERO;
     }
 
     /// How many tiles the next round of evaluation holds, with `free` workers not building
@@ -242,16 +276,47 @@ impl ConeSteps {
             .clamp(1, ROUND_MAX)
     }
 
-    /// How many tiles the next round of the queued evaluation holds when it has the jobs to
-    /// itself, with `left` before the call's deadline: as many as fit in the lesser of `left`
-    /// and [`ROUND_TIME_ALONE`] at the cost measured lately, at least one, at most
-    /// [`ROUND_MAX_ALONE`]. The workers aren't counted: a round's cone spreads over them.
-    pub(crate) fn round_alone(&self, left: Duration) -> usize {
-        let time = left.min(ROUND_TIME_ALONE);
-        let fits = time.as_nanos() / self.tile_cost.as_nanos().max(1);
+    /// How many finest tiles the next cone of the queued evaluation holds when it has the jobs
+    /// to itself: as many as [`CONE_TIME_ALONE`] fits at the cost a finest tile's cone has
+    /// taken lately ([`ConeSteps::took_keys`]), at least one, at most [`ROUND_MAX_ALONE`]. Its
+    /// steps keep to the time left ([`ConeSteps::tiles_alone`]), so the cone isn't sized by it:
+    /// a cone of a few tiles, at the end of a call, would pay a round's fixed costs for little.
+    pub(crate) fn round_alone(&self) -> usize {
+        let fits = CONE_TIME_ALONE.as_nanos() / self.key_cost.as_nanos().max(1);
         usize::try_from(fits)
             .unwrap_or(usize::MAX)
             .clamp(1, ROUND_MAX_ALONE)
+    }
+
+    /// How many tiles of a cone a step of the queued evaluation alone may evaluate with `left`
+    /// before the call's deadline: as many as fit in the lesser of `left` and
+    /// [`ROUND_TIME_ALONE`] at the cost a cone's tile has taken lately, at least one. What keeps
+    /// a step within its time however cold the cone, since a finest tile's share of its cone
+    /// varies.
+    pub(crate) fn tiles_alone(&self, left: Duration) -> usize {
+        let time = left.min(ROUND_TIME_ALONE);
+        let fits = time.as_nanos() / self.cone_tile_cost.as_nanos().max(1);
+        usize::try_from(fits).unwrap_or(usize::MAX).max(1)
+    }
+
+    /// Notes that a step of the queued evaluation alone took `wall` to evaluate `tiles` tiles
+    /// of a cone, for [`ConeSteps::tiles_alone`].
+    pub(crate) fn took_tiles_alone(&mut self, wall: Duration, tiles: usize) {
+        let Some(each) = u32::try_from(tiles.max(1)).ok().map(|n| wall / n) else {
+            return;
+        };
+        self.cone_tile_cost = (self.cone_tile_cost + each) / 2;
+    }
+
+    /// Notes that the queued evaluation, alone, took `wall` for `keys` finest tiles and their
+    /// cone, for [`ConeSteps::round_alone`].
+    pub(crate) fn took_keys(&mut self, wall: Duration, keys: usize) {
+        let Some(each) = u32::try_from(keys.max(1)).ok().map(|n| wall / n) else {
+            return;
+        };
+        // Half and half: a cone's first round, which evaluates its coarse levels, costs more a
+        // tile than the next, so the estimate follows the change within a round or two.
+        self.key_cost = (self.key_cost + each) / 2;
     }
 
     /// Notes that a round of `tiles` tiles took `wall`, for [`ConeSteps::round_size`].
