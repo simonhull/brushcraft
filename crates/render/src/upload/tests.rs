@@ -9,7 +9,7 @@ use wgpu::CommandEncoderDescriptor;
 
 use super::*;
 use crate::gpu::GpuTest;
-use crate::residency::{Request, Requests, Residency, ResidencyConfig};
+use crate::residency::{Request, Requests, Residency, ResidencyConfig, SizeClass};
 
 /// A fresh recovery directory under the system temp dir, removed with everything in it on drop.
 struct TempDir(PathBuf);
@@ -390,6 +390,48 @@ fn report(what: &str, runs: &[(Duration, u64)]) {
         took.as_secs_f64() * 1e3,
         runs.len()
     );
+}
+
+/// A display tile prepared but not staged (its frame ran out of room or slots) keeps its record
+/// read ahead for the next frame; one staged lets it go.
+#[test]
+fn a_starved_tile_keeps_its_record_read_ahead_for_the_next_frame() {
+    let dir = TempDir::new("starved");
+    let mesh = cube_sphere(1).expect("a mesh");
+    let finest = level(7);
+    let (path, config) = saved(&dir, "starved.bcp", &mesh, finest);
+    let mut project = Project::open(&path, config).expect("opened");
+    let store = project.store();
+    let face = FaceId::new(1);
+    let staged = TileKey::display(face, level(6), 0, 0).expect("a display tile");
+    let starved = TileKey::display(FaceId::new(2), level(6), 0, 0).expect("a display tile");
+    let requests = requests_of(&[staged, starved]);
+    assert_eq!(
+        prefetch_requests(store, &requests).ok(),
+        Some(2),
+        "both read ahead"
+    );
+    let began = Instant::now();
+    while store.display_needs_read(&staged) || store.display_needs_read(&starved) {
+        assert!(began.elapsed() < Duration::from_secs(10), "read ahead");
+        std::thread::yield_now();
+    }
+    let mut source = StoreSource::new(store);
+    source.prepare(&[staged, starved]).expect("prepared");
+    let mut data = TileData::default();
+    data.reset(usize::try_from(SizeClass::of(level(6)).vertices()).expect("small"));
+    let detail = source.read(staged, &mut data).expect("reads");
+    assert!(detail.is_some(), "the staged tile has data");
+    drop(source);
+    assert!(
+        store.display_needs_read(&staged),
+        "staged: its record let go"
+    );
+    assert!(
+        !store.display_needs_read(&starved),
+        "starved: its record kept for the next frame"
+    );
+    drop(project.close(false));
 }
 
 /// Frame 1's owner time on a project of the benchmark project's 2,400 faces, opened afresh

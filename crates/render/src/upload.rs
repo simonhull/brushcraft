@@ -292,6 +292,9 @@ impl TileSource for StoreSource<'_> {
                 Some(tile) => tile,
                 None => self.store.display_for_draw(&[key])?.pop().flatten(),
             };
+            // Staged now: its record read ahead, if any, has done its work. A tile prepared but
+            // never read here (no room or slot this frame) keeps its record for the next.
+            self.store.forget_drawn(&[key]);
             let Some(tile) = tile else {
                 return Ok(None);
             };
