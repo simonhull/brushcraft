@@ -35,6 +35,16 @@ fn a_recorded_run_reads_back_and_gives_every_metric() {
         close(gpu50, 6.768_356) && close(gpu99, 7.810_756),
         "{metrics:?}"
     );
+    assert_eq!(
+        metrics.orbit_gpu_full_clock, metrics.orbit_gpu,
+        "no clocks sampled: every orbit frame"
+    );
+    assert_eq!(metrics.clocks, Clocks::Unknown(NoClocks::NotSampled));
+    assert_eq!(
+        metrics.orbit_frames_over_refresh,
+        Some(0.0),
+        "none over 1/60 s"
+    );
     let (cpu50, cpu99) = metrics.orbit_cpu.unwrap();
     assert!(
         close(cpu50, 0.683_362) && close(cpu99, 0.987_497),
@@ -70,6 +80,9 @@ fn the_metrics_are_named_for_the_scale_and_sampled_once_a_run() {
         [
             "medium.render.orbit_gpu_p50_ms",
             "medium.render.orbit_gpu_p99_ms",
+            "medium.render.orbit_gpu_p50_full_clock_ms",
+            "medium.render.orbit_gpu_p99_full_clock_ms",
+            "medium.render.orbit_frames_over_refresh",
             "medium.render.orbit_cpu_p50_ms",
             "medium.render.orbit_cpu_p99_ms",
             "medium.render.orbit_over_budget",
@@ -82,7 +95,8 @@ fn the_metrics_are_named_for_the_scale_and_sampled_once_a_run() {
             .iter()
             .all(|m| m.value.measured().unwrap().samples().len() == 3)
     );
-    assert_eq!(measured[4].unit, Unit::Tiles);
+    assert_eq!(measured[4].unit, Unit::Frames);
+    assert_eq!(measured[7].unit, Unit::Tiles);
 }
 
 #[test]
@@ -95,13 +109,27 @@ fn only_the_benchmark_project_is_held_to_the_spec_targets() {
     };
     let names = [
         "full.render.orbit_gpu_p99_ms",
+        "full.render.orbit_gpu_p50_full_clock_ms",
+        "full.render.orbit_gpu_p99_full_clock_ms",
+        "full.render.orbit_frames_over_refresh",
         "full.render.orbit_over_budget",
         "full.render.spin_catch_up_ms",
         "full.render.open_to_correct_ms",
     ];
     let full = with_targets(names.map(metric).to_vec(), Scale::Full);
     let ceilings: Vec<Option<f64>> = full.iter().map(|m| m.ceiling).collect();
-    assert_eq!(ceilings, [None, Some(0.0), Some(100.0), Some(1000.0)]);
+    assert_eq!(
+        ceilings,
+        [
+            None,
+            None,
+            Some(3.0),
+            Some(0.0),
+            Some(0.0),
+            Some(100.0),
+            Some(1000.0)
+        ]
+    );
     let medium = with_targets(
         vec![metric("medium.render.spin_catch_up_ms")],
         Scale::Medium,
@@ -122,6 +150,7 @@ fn frame(time_ms: f64, segment: &str, (over, requested, wanted): (f64, f64, f64)
         over_budget: Some(over),
         requested: Some(requested),
         wanted: Some(wanted),
+        clock: None,
     }
 }
 
@@ -141,6 +170,7 @@ fn run(open_ms: f64, frames: Vec<Frame>) -> Recorded {
             .map(|&(name, start, end)| (name.to_owned(), start, end))
             .collect(),
         frames,
+        ..Recorded::default()
     }
 }
 
@@ -187,6 +217,9 @@ fn a_run_with_no_gpu_times_and_never_correct_lacks_those_metrics_only() {
         [
             "no render.orbit_gpu_p50_ms",
             "no render.orbit_gpu_p99_ms",
+            "no render.orbit_gpu_p50_full_clock_ms",
+            "no render.orbit_gpu_p99_full_clock_ms",
+            "no render.orbit_frames_over_refresh",
             "render.open_to_correct_ms not reached"
         ]
     );
@@ -371,4 +404,174 @@ fn without_a_ceiling_a_catch_up_never_reached_stays_a_note() {
             "render.spin_catch_up_ms not reached in 1 of 3 runs: no ceiling, measured from the others"
         ]
     );
+}
+
+/// The system clock's time, in ms since the epoch, of the hand-made clocked runs' frame loop's
+/// clock starting.
+const ORIGIN_MS: f64 = 1_793_401_426_000.0;
+
+/// A sample of GPU 0's clocks `at` ms after [`ORIGIN_MS`]: graphics clock `mhz`, power state
+/// `state`.
+fn sample(at: f64, mhz: f64, state: &str) -> ClockSample {
+    ClockSample {
+        at_unix_ms: ORIGIN_MS + at,
+        gpu: 0,
+        graphics_mhz: mhz,
+        memory_mhz: Some(10_501.0),
+        pstate: Some(state.parse().unwrap()),
+    }
+}
+
+/// A run on an NVIDIA GPU placed at [`ORIGIN_MS`], its orbit frames at `(time_ms, gpu_ms)`.
+fn clocked_run(frames: &[(f64, f64)]) -> Recorded {
+    let orbit = frames.iter().map(|&(time_ms, gpu_ms)| Frame {
+        gpu_ms: Some(gpu_ms),
+        ..frame(time_ms, "orbit", (0.0, 0.0, 0.0))
+    });
+    Recorded {
+        adapter: "NVIDIA GeForce RTX 4090 (Vulkan)".to_owned(),
+        clock_unix_ms: Some(ORIGIN_MS),
+        ..run(100.0, orbit.collect())
+    }
+}
+
+/// The orbit frames of the clocked runs: start and GPU time, in ms.
+const ORBIT_FRAMES: [(f64, f64); 6] = [
+    (3000.0, 0.25),
+    (3040.0, 0.30),
+    (3090.0, 0.70),
+    (3140.0, 0.60),
+    (3210.0, 20.0),
+    // Nothing sampled within 100 ms: its clock is unknown.
+    (3500.0, 0.90),
+];
+
+/// Samples beside the clocked runs: the highest graphics clock 2700 MHz, so full clocks are
+/// P0 at 2430 MHz or more.
+fn orbit_samples() -> Vec<ClockSample> {
+    vec![
+        sample(3200.0, 2700.0, "P0"),
+        sample(3000.0, 2700.0, "P0"),
+        sample(3050.0, 2650.0, "P0"),
+        // A low clock state.
+        sample(3100.0, 1005.0, "P3"),
+        // P0, but below 90 % of the highest.
+        sample(3150.0, 2400.0, "P0"),
+    ]
+}
+
+#[test]
+fn each_frame_takes_the_clocks_nearest_its_start_and_only_full_clocks_count() {
+    let mut recorded = clocked_run(&ORBIT_FRAMES);
+    recorded.join_clocks(Ok(orbit_samples()));
+    let Clocks::Joined(full) = recorded.clocks else {
+        panic!("joined: {:?}", recorded.clocks);
+    };
+    assert!((full.floor_mhz - 2430.0).abs() < 1e-9, "{full:?}");
+    let joined: Vec<Option<f64>> = recorded
+        .frames
+        .iter()
+        .map(|f| f.clock.map(|c| c.graphics_mhz))
+        .collect();
+    assert_eq!(
+        joined,
+        [
+            Some(2700.0),
+            Some(2650.0),
+            Some(1005.0),
+            Some(2400.0),
+            Some(2700.0),
+            None
+        ]
+    );
+    let metrics = derive(&recorded);
+    assert_eq!(
+        metrics.orbit_gpu_full_clock,
+        Some((0.30, 20.0)),
+        "frames 1, 2 and 5: p50 and p99 by the nearest rank above"
+    );
+    assert_eq!(metrics.full_clock_frames, (3, 5), "of five with a clock");
+    let (p50, p99) = metrics.orbit_gpu.unwrap();
+    assert!(
+        (p50 - 0.70).abs() < 1e-12 && (p99 - 20.0).abs() < 1e-12,
+        "every frame as before"
+    );
+    assert_eq!(
+        metrics.orbit_frames_over_refresh,
+        Some(1.0),
+        "20 ms over 1/60 s, at full clocks or not"
+    );
+    assert_eq!(
+        metrics.clock_note(),
+        "3 of 5 timed orbit frames at full clocks (P0, graphics at least 2430 MHz)"
+    );
+}
+
+#[test]
+fn the_refresh_is_the_records_where_it_gives_one() {
+    let mut recorded = clocked_run(&[(3000.0, 20.0), (3020.0, 7.5), (3040.0, 6.5)]);
+    recorded.refresh_ms = Some(1000.0 / 144.0);
+    assert_eq!(derive(&recorded).orbit_frames_over_refresh, Some(2.0));
+    recorded.refresh_ms = Some(25.0);
+    assert_eq!(derive(&recorded).orbit_frames_over_refresh, Some(0.0));
+}
+
+#[test]
+fn without_clocks_the_full_clock_metrics_fall_back_to_every_frame_and_say_why() {
+    let other = Recorded {
+        adapter: "llvmpipe (LLVM 23.1.3, 256 bits) (Vulkan)".to_owned(),
+        ..clocked_run(&ORBIT_FRAMES)
+    };
+    let placeless = Recorded {
+        clock_unix_ms: None,
+        ..clocked_run(&ORBIT_FRAMES)
+    };
+    let mut two_gpus = orbit_samples();
+    two_gpus.push(ClockSample {
+        gpu: 1,
+        ..sample(3000.0, 2100.0, "P0")
+    });
+    let not_found = NoClocks::NoSampler(std::io::ErrorKind::NotFound);
+    let cases = [
+        (clocked_run(&ORBIT_FRAMES), Err(not_found), not_found),
+        (
+            clocked_run(&ORBIT_FRAMES),
+            Ok(Vec::new()),
+            NoClocks::NoSamples,
+        ),
+        (
+            clocked_run(&ORBIT_FRAMES),
+            Ok(two_gpus),
+            NoClocks::SeveralGpus,
+        ),
+        (other, Ok(orbit_samples()), NoClocks::OtherAdapter),
+        (placeless, Ok(orbit_samples()), NoClocks::NoClockOrigin),
+    ];
+    for (mut recorded, sampled, why) in cases {
+        recorded.join_clocks(sampled);
+        assert_eq!(recorded.clocks, Clocks::Unknown(why));
+        assert!(recorded.frames.iter().all(|f| f.clock.is_none()), "{why}");
+        let metrics = derive(&recorded);
+        assert_eq!(metrics.orbit_gpu_full_clock, metrics.orbit_gpu, "{why}");
+        assert_eq!(metrics.orbit_frames_over_refresh, Some(1.0), "{why}");
+        assert_eq!(
+            metrics.clock_note(),
+            format!("no GPU clocks ({why}): the full-clock metrics are over every orbit frame")
+        );
+    }
+    assert_eq!(
+        not_found.to_string(),
+        "nvidia-smi didn't start: entity not found"
+    );
+}
+
+#[test]
+fn the_run_line_places_the_clock_and_gives_the_refresh() {
+    let text = r#"{"bench":"render","result":"run","adapter":"NVIDIA GeForce RTX 4090 (Vulkan)","open_ms":12.5,"clock_unix_us":1793401426346500,"refresh_ms":6.944}"#;
+    let recorded = Recorded::parse(text).unwrap();
+    assert_eq!(recorded.adapter, "NVIDIA GeForce RTX 4090 (Vulkan)");
+    assert_eq!(recorded.clock_unix_ms, Some(1_793_401_426_346.5));
+    assert_eq!(recorded.refresh_ms, Some(6.944));
+    let older = Recorded::parse(RECORDED).unwrap();
+    assert_eq!((older.clock_unix_ms, older.refresh_ms), (None, None));
 }

@@ -59,7 +59,7 @@ impl fmt::Display for MetricName {
 }
 
 /// The unit a metric is in. Every metric is better lower: times, memory, bytes, tiles over
-/// budget.
+/// budget, frames over the refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unit {
     /// Milliseconds.
@@ -72,11 +72,20 @@ pub(crate) enum Unit {
     Bytes,
     /// Tiles: a count of them.
     Tiles,
+    /// Frames: a count of them.
+    Frames,
 }
 
 impl Unit {
     /// Every unit.
-    const ALL: [Self; 5] = [Self::Ms, Self::Us, Self::Mib, Self::Bytes, Self::Tiles];
+    const ALL: [Self; 6] = [
+        Self::Ms,
+        Self::Us,
+        Self::Mib,
+        Self::Bytes,
+        Self::Tiles,
+        Self::Frames,
+    ];
 
     /// The unit's name in history records and tables (ASCII, so `us` for microseconds).
     pub(crate) const fn name(self) -> &'static str {
@@ -86,6 +95,7 @@ impl Unit {
             Self::Mib => "MiB",
             Self::Bytes => "B",
             Self::Tiles => "tiles",
+            Self::Frames => "frames",
         }
     }
 

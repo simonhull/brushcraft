@@ -13,6 +13,17 @@
 //! - **orbit frame time**, p50 and p99, on the GPU (the whole frame, timestamp to timestamp) and on
 //!   the CPU (the frame's latency path: the owner thread's input, brush, feed and uploads, then the
 //!   render thread's encode and submit), over the orbit segment's frames;
+//! - **orbit GPU frame time at full clocks**, p50 and p99: the same over the orbit frames the GPU
+//!   drew at full clocks ([`clocks`]: the GPU's clocks sampled beside the run and joined to its
+//!   frames), which the spec's GPU budget (≈ 3 ms at 4K) is judged on. A low clock state the driver
+//!   drops to when the frame leaves the GPU mostly idle slows every pass two or three times, a cost
+//!   of the clocks rather than of the work. Where the clocks aren't known (no NVIDIA GPU, or
+//!   lavapipe), every orbit frame, and the part notes it;
+//! - **orbit frames over the refresh**: the orbit frames whose GPU time exceeded the refresh
+//!   interval (the record's `refresh_ms`: the display's, 1/60 s offscreen, which is also the
+//!   fallback for a record without it), at whatever clock the driver picked. The GPU time, not the
+//!   time between frames shown: the frame loop paces frames to the interval, so the latter measures
+//!   the pacing; the CPU's side has its own metrics;
 //! - **tiles over budget** during the orbit: the most tiles in view any orbit frame left over 1 px
 //!   (the level choice's count; the spec's target is 0 on desktop);
 //! - **spin catch-up**: from the flick's end until the first frame shown with every visible tile at
@@ -40,9 +51,12 @@ use crate::perf::metric::{Metric, MetricName, Outcome, Unit};
 use crate::perf::project::{Scale, Source, WorkDir};
 use crate::perf::suite::{AppExit, Runner, Samples};
 
+mod clocks;
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
+
+use clocks::{ClockSample, ClockSampler, Clocks, FullClocks, NoClocks};
 
 /// The record's segment the orbit metrics come from.
 const ORBIT: &str = "orbit";
@@ -51,9 +65,16 @@ const FLICK: &str = "flick";
 /// The record's segment open-to-correct must be reached in.
 const OPEN: &str = "open";
 
-/// The spec's targets, judged on the benchmark project only: tiles over budget during the
-/// orbit, spin catch-up and open to correct, in the metrics' units.
-const TARGETS: [(&str, f64); 3] = [
+/// The refresh interval a record that doesn't give its own is judged against: 1/60 s, in ms.
+const DEFAULT_REFRESH_MS: f64 = 1000.0 / 60.0;
+
+/// The spec's targets, judged on the benchmark project only, in the metrics' units.
+///
+/// The GPU frame at full clocks (p99), orbit frames over the refresh, tiles over budget during
+/// the orbit, spin catch-up and open to correct.
+const TARGETS: [(&str, f64); 5] = [
+    ("render.orbit_gpu_p99_full_clock_ms", 3.0),
+    ("render.orbit_frames_over_refresh", 0.0),
     ("render.orbit_over_budget", 0.0),
     ("render.spin_catch_up_ms", 100.0),
     ("render.open_to_correct_ms", 1000.0),
@@ -113,6 +134,8 @@ pub(crate) struct Frame {
     pub(crate) requested: Option<f64>,
     /// Tiles residency still wanted as it was staged.
     pub(crate) wanted: Option<f64>,
+    /// The GPU's clocks nearest its start, if sampled ([`Recorded::join_clocks`]).
+    pub(crate) clock: Option<ClockSample>,
 }
 
 impl Frame {
@@ -140,12 +163,21 @@ impl Frame {
 /// A recorded run, as much of it as the metrics read.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Recorded {
+    /// The GPU's name and backend, as the app gave it.
+    pub(crate) adapter: String,
     /// From the project beginning to open to the frame loop's clock starting, in ms.
     pub(crate) open_ms: f64,
+    /// The frame loop's clock's start, in ms since the Unix epoch by the system clock, if the
+    /// record gives it.
+    pub(crate) clock_unix_ms: Option<f64>,
+    /// The interval frames were paced to, in ms, if the record gives it.
+    pub(crate) refresh_ms: Option<f64>,
     /// Each segment's name, start and end on the frame loop's clock, in ms.
     pub(crate) segments: Vec<(String, f64, f64)>,
     /// Every frame, in order.
     pub(crate) frames: Vec<Frame>,
+    /// The GPU's clocks over the run, as joined to the frames.
+    pub(crate) clocks: Clocks,
 }
 
 /// `object`'s number `name`; `None` for `null` or a field that isn't there.
@@ -192,7 +224,11 @@ impl Recorded {
     fn take(&mut self, object: &Object) -> Result<bool> {
         match object.get("result").and_then(Json::as_str) {
             Some("run") => {
+                let adapter = object.get("adapter").and_then(Json::as_str);
+                adapter.unwrap_or_default().clone_into(&mut self.adapter);
                 self.open_ms = required(object, "open_ms")?;
+                self.clock_unix_ms = number(object, "clock_unix_us").map(|us| us / 1e3);
+                self.refresh_ms = number(object, "refresh_ms");
                 return Ok(true);
             }
             Some("segment") => {
@@ -215,10 +251,44 @@ impl Recorded {
                 over_budget: number(object, "over_budget"),
                 requested: number(object, "requested"),
                 wanted: number(object, "wanted"),
+                clock: None,
             }),
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Joins the GPU's clocks `sampled` beside the run (or why there are none) to its frames:
+    /// each frame the sample nearest its start, within [`clocks::JOIN_MS`]
+    /// ([`clocks::nearest`]); and judges which are full clocks over all of them.
+    pub(crate) fn join_clocks(&mut self, sampled: Result<Vec<ClockSample>, NoClocks>) {
+        self.clocks = match self.try_join(sampled) {
+            Ok(full) => Clocks::Joined(full),
+            Err(why) => Clocks::Unknown(why),
+        };
+    }
+
+    /// [`Recorded::join_clocks`]'s work; what counts as full clocks in the run.
+    ///
+    /// # Errors
+    ///
+    /// Why the frames can't have clocks: none sampled, of several GPUs, or a record that
+    /// doesn't place its clock.
+    fn try_join(
+        &mut self,
+        sampled: Result<Vec<ClockSample>, NoClocks>,
+    ) -> Result<FullClocks, NoClocks> {
+        let mut by_time = sampled?;
+        if !self.adapter.to_ascii_lowercase().contains("nvidia") {
+            return Err(NoClocks::OtherAdapter);
+        }
+        let full = FullClocks::of(&by_time)?;
+        let origin = self.clock_unix_ms.ok_or(NoClocks::NoClockOrigin)?;
+        by_time.sort_by(|a, b| a.at_unix_ms.total_cmp(&b.at_unix_ms));
+        for frame in &mut self.frames {
+            frame.clock = clocks::nearest(&by_time, origin + frame.time_ms).copied();
+        }
+        Ok(full)
     }
 
     /// When segment `name` ends, in ms, if the run had it.
@@ -303,6 +373,15 @@ impl From<Option<Reached>> for Value {
 pub(crate) struct RenderMetrics {
     /// The orbit's GPU frame time, p50 and p99, in ms.
     pub(crate) orbit_gpu: Option<(f64, f64)>,
+    /// The orbit's GPU frame time at full clocks, p50 and p99, in ms; over every orbit frame
+    /// where the clocks aren't known ([`RenderMetrics::clocks`]).
+    pub(crate) orbit_gpu_full_clock: Option<(f64, f64)>,
+    /// The orbit frames whose GPU time exceeded the refresh interval; `None` with no GPU times.
+    pub(crate) orbit_frames_over_refresh: Option<f64>,
+    /// The run's clocks: what counts as full clocks, or why they aren't known.
+    pub(crate) clocks: Clocks,
+    /// With the clocks known, the timed orbit frames at full clocks, and those with a clock.
+    pub(crate) full_clock_frames: (usize, usize),
     /// The orbit's CPU frame time, p50 and p99, in ms.
     pub(crate) orbit_cpu: Option<(f64, f64)>,
     /// The most tiles over budget in any orbit frame whose cut came back.
@@ -321,6 +400,28 @@ pub(crate) fn derive(recorded: &Recorded) -> RenderMetrics {
         .in_segment(ORBIT)
         .filter_map(|f| f.gpu_ms)
         .collect();
+    let timed: Vec<(f64, Option<ClockSample>)> = recorded
+        .in_segment(ORBIT)
+        .filter_map(|f| Some((f.gpu_ms?, f.clock)))
+        .collect();
+    let (full_clock, full_clock_frames) = match recorded.clocks {
+        Clocks::Joined(full) => {
+            let at_full = timed
+                .iter()
+                .filter(|(_, clock)| clock.is_some_and(|clock| full.holds(&clock)));
+            let at_full: Vec<f64> = at_full.map(|&(ms, _)| ms).collect();
+            let known = timed.iter().filter(|(_, clock)| clock.is_some()).count();
+            let count = at_full.len();
+            (at_full, (count, known))
+        }
+        Clocks::Unknown(_) => (gpu.clone(), (0, 0)),
+    };
+    let refresh_ms = recorded.refresh_ms.unwrap_or(DEFAULT_REFRESH_MS);
+    let over_refresh: f64 = gpu
+        .iter()
+        .map(|&ms| if ms > refresh_ms { 1.0 } else { 0.0 })
+        .sum();
+    let orbit_frames_over_refresh = (!gpu.is_empty()).then_some(over_refresh);
     let cpu: Vec<f64> = recorded
         .in_segment(ORBIT)
         .filter_map(|f| f.cpu_ms)
@@ -343,6 +444,10 @@ pub(crate) fn derive(recorded: &Recorded) -> RenderMetrics {
     });
     RenderMetrics {
         orbit_gpu: spread(gpu),
+        orbit_gpu_full_clock: spread(full_clock),
+        orbit_frames_over_refresh,
+        clocks: recorded.clocks,
+        full_clock_frames,
         orbit_cpu: spread(cpu),
         orbit_over_budget,
         spin_catch_up_ms,
@@ -352,7 +457,7 @@ pub(crate) fn derive(recorded: &Recorded) -> RenderMetrics {
 
 impl RenderMetrics {
     /// Each metric as `(name after the scale, unit, value)`.
-    fn named(&self) -> [(&'static str, Unit, Value); 7] {
+    fn named(&self) -> [(&'static str, Unit, Value); 10] {
         [
             (
                 "render.orbit_gpu_p50_ms",
@@ -363,6 +468,21 @@ impl RenderMetrics {
                 "render.orbit_gpu_p99_ms",
                 Unit::Ms,
                 self.orbit_gpu.map(|g| g.1).into(),
+            ),
+            (
+                "render.orbit_gpu_p50_full_clock_ms",
+                Unit::Ms,
+                self.orbit_gpu_full_clock.map(|g| g.0).into(),
+            ),
+            (
+                "render.orbit_gpu_p99_full_clock_ms",
+                Unit::Ms,
+                self.orbit_gpu_full_clock.map(|g| g.1).into(),
+            ),
+            (
+                "render.orbit_frames_over_refresh",
+                Unit::Frames,
+                self.orbit_frames_over_refresh.into(),
             ),
             (
                 "render.orbit_cpu_p50_ms",
@@ -390,6 +510,25 @@ impl RenderMetrics {
                 self.open_to_correct_ms.into(),
             ),
         ]
+    }
+
+    /// What the run's clocks came to, for the part's notes: how many timed orbit frames were at
+    /// full clocks, or why the clocks aren't known and the full-clock metrics are over every
+    /// orbit frame.
+    fn clock_note(&self) -> String {
+        match self.clocks {
+            Clocks::Joined(full) => {
+                let (at_full, known) = self.full_clock_frames;
+                format!(
+                    "{at_full} of {known} timed orbit frames at full clocks (P0, graphics at least \
+                     {:.0} MHz)",
+                    full.floor_mhz
+                )
+            }
+            Clocks::Unknown(why) => {
+                format!("no GPU clocks ({why}): the full-clock metrics are over every orbit frame")
+            }
+        }
     }
 
     /// Adds this run's metrics to `samples` under `scale`'s names; returns those it had none
@@ -573,18 +712,23 @@ fn measure(
             "--size".into(),
             setting.size.into(),
         ];
-        match runner.app(&args, &dir.join("state"))? {
+        let sampling = ClockSampler::start();
+        let exit = runner.app(&args, &dir.join("state"));
+        let clock_samples = sampling.map(ClockSampler::stop);
+        match exit? {
             AppExit::NoAdapter => return Ok(RenderPart::NotRun("no adapter".to_owned())),
             AppExit::Done => {}
         }
         let text = std::fs::read_to_string(&record)
             .with_context(|| format!("reading {}", record.display()))?;
-        let recorded = Recorded::parse(&text).with_context(|| format!("{}", record.display()))?;
-        let gaps = derive(&recorded).sample(scale, &mut samples)?;
-        if !gaps.is_empty() {
-            let said: Vec<String> = gaps.iter().map(Gap::to_string).collect();
-            notes.push(format!("run {}: {}", run + 1, said.join(", ")));
-        }
+        let mut recorded =
+            Recorded::parse(&text).with_context(|| format!("{}", record.display()))?;
+        recorded.join_clocks(clock_samples);
+        let metrics = derive(&recorded);
+        let gaps = metrics.sample(scale, &mut samples)?;
+        let mut said: Vec<String> = gaps.iter().map(Gap::to_string).collect();
+        said.push(metrics.clock_note());
+        notes.push(format!("run {}: {}", run + 1, said.join(", ")));
         for gap in gaps {
             let Gap::NotReached(name, unit) = gap else {
                 continue;
