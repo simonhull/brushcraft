@@ -51,15 +51,16 @@
 //!   pyramid is built, the tiles that failed it and pass against the new pyramid.
 //! - **For residency:** the cut and the tiles drawn, read back as a [`LodOutput`] whose
 //!   [`LodOutput::frame_use`] is the [`FrameUse`] residency takes. **Latency:** the readback is
-//!   copied at the end of frame `F` and mapped when the GPU finishes it, so [`Lod::collect`] has it
-//!   at the start of frame `F + 1` at best, `F + 2` when the GPU runs a frame behind; residency
-//!   then protects a cut a frame or two old, with every ancestor of it (the refined set). What that
-//!   covers: the GPU never reads a slot that was freed, since residency changes reach the tree in
-//!   the same submission as the tile data they point at and each frame's level choice sees the tree
-//!   as it is; and the cut never has a hole, since a tile whose ancestor left is unreachable and
-//!   its ancestor's ancestor is drawn instead (the floor is never evicted). What it doesn't: a tile
-//!   the GPU started using in the last frame or two isn't protected yet, so under budget pressure
-//!   it can be evicted and drawn coarser for a frame, then requested again.
+//!   copied at the end of frame `F` and mapped when the GPU finishes it, so [`Lod::collect`] (or
+//!   the [`CutReader`] moved to the thread that polls the device) has it, tagged `F`
+//!   ([`LodOutput::frame`]), at the start of frame `F + 1` at best, `F + 2` when the GPU runs a
+//!   frame behind; residency then protects a cut a frame or two old, with every ancestor of it (the
+//!   refined set). What that covers: the GPU never reads a slot that was freed, since residency
+//!   changes reach the tree in the same submission as the tile data they point at and each frame's
+//!   level choice sees the tree as it is; and the cut never has a hole, since a tile whose ancestor
+//!   left is unreachable and its ancestor's ancestor is drawn instead (the floor is never evicted).
+//!   What it doesn't: a tile the GPU started using in the last frame or two isn't protected yet, so
+//!   under budget pressure it can be evicted and drawn coarser for a frame, then requested again.
 //!
 //! # A frame
 //!
@@ -68,9 +69,10 @@
 //! stamp pass over the cut ([`crate::raster::Raster::encode_stamp`], [`Lod::cut_list`]: when
 //! each tile came into the cut, for the geomorph), the first raster, the depth pyramid
 //! ([`crate::cull::PyramidPass`]), [`Lod::encode_post`], the second raster, the pyramid again,
-//! [`Lod::encode_readback`]; submit; then [`CutReadback::submitted`]. The owner thread takes
-//! [`Lod::collect`]'s output a frame or two later. [`crate::raster::FramePasses`] encodes it all
-//! in this order.
+//! [`Lod::encode_readback`]; submit; then [`CutReadback::submitted`]. The owner thread reads the
+//! output a frame or two later through the [`CutReader`] ([`Lod::take_reader`]), where it polls
+//! the device, beside residency's requests of the same frame. [`crate::raster::FramePasses`]
+//! encodes it all in this order.
 //!
 //! **The pyramids (decided for, and built in, Task 4):** the renderer keeps two, `current` and
 //! `previous`.
@@ -718,8 +720,8 @@ pub struct CutReadback {
 }
 
 impl CutReadback {
-    /// Maps the buffer, now that its frame is submitted: [`Lod::collect`] reads it once the
-    /// device is polled after the GPU finishes the frame.
+    /// Maps the buffer, now that its frame is submitted: [`CutReader::collect`] reads it once
+    /// the device is polled after the GPU finishes the frame.
     pub fn submitted(mut self) {
         if let Some(buffer) = self.buffer.take() {
             let back = buffer.clone();

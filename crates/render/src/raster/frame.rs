@@ -106,7 +106,8 @@ impl FramePasses {
         })
     }
 
-    /// The level choice: its cluster lists, and [`Lod::collect`] for the readbacks.
+    /// The level choice: its cluster lists, and [`Lod::collect`] (or [`Lod::take_reader`]) for
+    /// the readbacks.
     #[must_use]
     pub const fn lod(&self) -> &Lod {
         &self.lod
