@@ -1,7 +1,8 @@
 // The level choice (render::lod): which resident tiles a frame draws, culled, with requests
 // for the tiles it wanted and found missing.
 //
-// Appended to tree::NODE_WGSL, residency::REQUESTS_WGSL, cull::CULL_WGSL and lod::CLUSTER_WGSL.
+// Appended to tree::NODE_WGSL, residency::REQUESTS_WGSL, cull::CULL_WGSL, lod::CLUSTER_WGSL and
+// raster::MORPH_WGSL.
 // One thread per node of the tile tree in every pass but threshold, finish and post. The
 // passes, in order (lod.rs dispatches them):
 //
@@ -22,7 +23,7 @@
 //    neighbour across its edges is reached at its level, so neighbours in the cut are at most
 //    one level apart by construction; refinements taken back are the shortfall.
 // 8. emit: the cut (tiles reached and not refined), read back for residency; requests;
-//    frustum, cone and first-phase occlusion culling (the previous frame's pyramid, seen from
+//    frustum, cone (only for tiles whose morph is settled) and first-phase occlusion culling (the previous frame's pyramid, seen from
 //    the previous frame's view); the visible clusters and their draw arguments, and the tiles
 //    to test again.
 // 9. finish: clamps the counts and sets the second phase's dispatch.
@@ -48,6 +49,12 @@
 @group(0) @binding(8) var<uniform> view: View;
 // The pass index: the level for sweep, the pass for relax.
 @group(0) @binding(9) var<uniform> cursor: Step;
+// The raster's stamps as last frame's stamp pass left them (render::raster), or one zeroed
+// stamp without a raster: emit's settled test reads them.
+@group(0) @binding(10) var<storage, read> stamps: array<MorphState>;
+// The raster's settings for this frame (its frame number, time, morph duration, flags and
+// distance ramp), or all zero without a raster (nothing morphs).
+@group(0) @binding(11) var<uniform> morph_params: RasterParams;
 // The phase's visible clusters (the first phase's list in main, the second's in post).
 @group(1) @binding(0) var<storage, read_write> clusters: array<Cluster>;
 // The phase's depth pyramid: the previous frame's in main, this frame's in post.
@@ -149,8 +156,9 @@ struct LodFrame {
     refused: atomic<u32>,
     // Tiles a relaxation pass couldn't raise for missing children.
     stuck: atomic<u32>,
-    // Zero.
-    reserved: u32,
+    // Tiles in the cut, in the frustum, that their cone would cull but whose morph isn't
+    // settled (drawn instead).
+    cone_exempt: atomic<u32>,
     // Tiles raised by each relaxation pass.
     raises: array<atomic<u32>, 16>,
     // Budget units each possible refinement adds, by bucket of its capped screen error.
@@ -430,7 +438,7 @@ fn begin(@builtin(local_invocation_index) t: u32) {
     atomicStore(&frame.shortfall, 0u);
     atomicStore(&frame.refused, 0u);
     atomicStore(&frame.stuck, 0u);
-    frame.reserved = 0u;
+    atomicStore(&frame.cone_exempt, 0u);
 }
 
 // One step of a finest-normal cone's half-angle (geom::FinestNormalCone): pi / 4095, as the
@@ -912,6 +920,123 @@ fn occluded(v: View, center: vec3<f32>, radius: f32) -> bool {
     return nearest < far;
 }
 
+// The settled test's slack for rounding (render::lod, "Cone culling and the morph"): in e's
+// order, 1 + 2^-16.
+const ORDER: f32 = 1.0000152587890625;
+// ... in a projected bound against the ramp: 1 + 2^-8.
+const RATIO: f32 = 1.00390625;
+// ... in the sphere's view depths: widened by this much of its farthest distance, 2^-10.
+const NEAR_SLACK: f32 = 0.0009765625;
+// The least a parent e may project to at any vertex for the settled test to trust its order: a
+// normal f32 with room to spare.
+const SMALLEST: f32 = 1e-30;
+
+// The e of node `n`'s parent, as place.wgsl's parent_error reads it: negative without one.
+fn morph_parent_error(n: u32) -> f32 {
+    let parent = tree[n].parent;
+    if parent == NONE {
+        return -1.0;
+    }
+    return tree[parent].error;
+}
+
+// Whether node `n`'s morph clock (place.wgsl's morph_time) is certainly 1 this frame, from its
+// stamp as last frame's stamp pass left it and what this frame's stamp pass will make of it
+// (morph.wgsl): no duration; a tile staying in the cut whose stamp is at least a duration old; a
+// tile new to the cut while the camera moves (stamped a whole duration ago). A tile new to the
+// cut with the camera still may be stamped now, so it isn't. A tile this frame's cut lacks reads
+// 1 in place.wgsl whatever this says.
+fn time_done(n: u32) -> bool {
+    let p = morph_params;
+    if p.duration == 0u {
+        return true;
+    }
+    if n >= arrayLength(&stamps) {
+        return false;
+    }
+    let s = stamps[n];
+    let staying = s.face == tree[n].face && s.place == tree[n].place
+        && (s.frame == p.frame - 1u || s.frame == p.frame);
+    if staying {
+        return p.now - s.start >= p.duration;
+    }
+    return (p.flags & MOVING) != 0u;
+}
+
+// Whether every odd vertex of node `n`'s tile is certainly drawn where it is (t = 1) this
+// frame, its finer edges `finer` (render::lod, "Cone culling and the morph": the end case).
+fn settled_at_end(n: u32, finer: u32) -> bool {
+    if morph_parent_error(n) < 0.0 {
+        return true;
+    }
+    if morph_params.ramp > 0.0 || !time_done(n) {
+        return false;
+    }
+    let node = tree[n];
+    for (var edge = 0u; edge < 4u; edge++) {
+        let m = node.neighbours[edge];
+        let seam = ((node.edges >> edge) & 1u) != 0u && m != NONE;
+        if ((finer >> edge) & 1u) == 0u && seam && !time_done(m) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Whether odd vertices whose distance factor reads the parent bound `x` and the own bound `y`
+// (world units), at view depths between `near` and `far`, certainly get a distance factor of 0
+// (render::lod, "Cone culling and the morph": the start case): `x` larger and projecting within
+// the ramp at the nearest depth, or not larger and `y` projecting over it at the farthest.
+fn starts(x: f32, y: f32, near: f32, far: f32) -> bool {
+    let r = morph_params.ramp;
+    let f = view.viewport.z;
+    if x > y * ORDER {
+        return x * f / far >= SMALLEST && x * f / near * RATIO <= r;
+    }
+    return x <= y && y * f / far > r * RATIO;
+}
+
+// Whether every odd vertex of node `n`'s tile is certainly drawn where its morph starts (t = 0)
+// this frame, its bounds `b` and finer edges `finer` (render::lod, "Cone culling and the
+// morph": the start case).
+fn settled_at_start(n: u32, b: TileBounds, finer: u32) -> bool {
+    let e = morph_parent_error(n);
+    if morph_params.ramp <= 0.0 || finer != 0u || e < 0.0 || b.radius < 0.0 {
+        return false;
+    }
+    let q = b.center - view.eye.xyz;
+    let depth = dot(view.planes[4].xyz, q);
+    let slack = NEAR_SLACK * (length(q) + b.radius);
+    let near = depth - b.radius - slack;
+    let far = depth + b.radius + slack;
+    if near <= view.viewport.w {
+        return false;
+    }
+    let node = tree[n];
+    if !starts(e, node.error, near, far) {
+        return false;
+    }
+    for (var edge = 0u; edge < 4u; edge++) {
+        let m = node.neighbours[edge];
+        if ((node.edges >> edge) & 1u) == 0u || m == NONE {
+            continue;
+        }
+        let other = morph_parent_error(m);
+        if other < 0.0 || !starts(max(e, other), max(node.error, tree[m].error), near, far) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Whether node `n`'s tile is drawn this frame with every odd vertex at one end of its morph
+// (render::lod, "Cone culling and the morph"), so its drawn triangles are its own (or its
+// variant's fans) or lie in its parent triangulation: those its cone holds. Conservative: never
+// true while any of them is on its way.
+fn settled(n: u32, b: TileBounds, finer: u32) -> bool {
+    return settled_at_end(n, finer) || settled_at_start(n, b, finer);
+}
+
 // Per tile: the cut, requests, culling, the first phase's clusters, last frame's choice for
 // the next frame's hysteresis.
 @compute @workgroup_size(64)
@@ -970,9 +1095,13 @@ fn emit(@builtin(global_invocation_id) id: vec3<u32>) {
             atomicAdd(&frame.culled_frustum, 1u);
             return;
         }
+        // The cone holds the tile's triangles only at either end of the morph, not on the way.
         if backfacing(b, view.eye.xyz, 0.0) {
-            atomicAdd(&frame.culled_cone, 1u);
-            return;
+            if settled(n, b, edges >> 4u) {
+                atomicAdd(&frame.culled_cone, 1u);
+                return;
+            }
+            atomicAdd(&frame.cone_exempt, 1u);
         }
         if params.previous != 0u && occluded(occlusion_view, b.center, b.radius) {
             atomicAdd(&frame.culled_occlusion, 1u);

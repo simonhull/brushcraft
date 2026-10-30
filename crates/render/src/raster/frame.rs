@@ -329,6 +329,7 @@ impl FramePasses {
             view: inputs.view,
             previous,
             finest: inputs.finest,
+            morph: Some(self.raster.morph_inputs()),
         };
         self.lod.encode_main(gpu, encoder, &main)?;
         marks.end(encoder, GpuPhase::LevelChoice);

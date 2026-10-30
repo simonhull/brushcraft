@@ -28,7 +28,8 @@ use crate::cull::tests::Rng;
 use crate::gpu::GpuTest;
 use crate::indices::{ClusterSize, GridVertex, Variant, remap};
 use crate::lod::{
-    CUT_EDGES_SHIFT, DrawnEdges, GpuCluster, GpuCutEntry, Lod, LodConfig, MainInputs, Thresholds,
+    CUT_EDGES_SHIFT, DrawnEdges, GpuCluster, GpuCutEntry, Lod, LodConfig, LodOutput, MainInputs,
+    Thresholds,
 };
 use crate::residency::{CLASSES, REQUEST_HEADER, SizeClass, Slot, SlotLayout};
 use crate::surface::Size;
@@ -1075,13 +1076,22 @@ fn the_pinhole_test_bites_a_finer_tile_drawing_its_odd_vertices_beside_a_coarser
 
 /// The level choice for `world`, refining by `e` alone (no quad cap), with a request buffer.
 pub(crate) fn level_choice(gpu: &Gpu, world: &World) -> (Lod, Buffer) {
+    level_choice_patched(gpu, world, &[])
+}
+
+/// [`level_choice`] with `patches` made in its shader ([`Lod::patched`]).
+pub(crate) fn level_choice_patched(
+    gpu: &Gpu,
+    world: &World,
+    patches: &[(&str, &str)],
+) -> (Lod, Buffer) {
     let thresholds = Thresholds {
         refine_quad: 1e9,
         coarsen_quad: 1e9,
         ..Thresholds::SPEC
     };
     let config = LodConfig::default().with_thresholds(thresholds);
-    let lod = Lod::new(gpu, world.tree.capacity(), config).expect("the level choice");
+    let lod = Lod::patched(gpu, world.tree.capacity(), config, patches).expect("the level choice");
     let requests = gpu.device().create_buffer(&BufferDescriptor {
         label: Some("test requests"),
         size: REQUEST_HEADER + 64 * 16,
@@ -1103,6 +1113,22 @@ pub(crate) fn lod_frame(
     frame: &RasterFrame<'_>,
     bounds: bool,
 ) -> (Vec<u32>, Vec<GpuCluster>, BTreeSet<Place>) {
+    let (image, listed, output) =
+        lod_frame_output(gpu, world, lod, requests, raster, frame, bounds);
+    let cut = output.nodes.iter().map(|(_, p)| *p).collect();
+    (image, listed, cut)
+}
+
+/// [`lod_frame`], with the level choice's whole output in place of the cut's places.
+pub(crate) fn lod_frame_output(
+    gpu: &Gpu,
+    world: &World,
+    lod: &mut Lod,
+    requests: &Buffer,
+    raster: &mut Raster,
+    frame: &RasterFrame<'_>,
+    bounds: bool,
+) -> (Vec<u32>, Vec<GpuCluster>, LodOutput) {
     raster.begin_frame(gpu, frame).expect("a frame");
     gpu.queue().write_buffer(requests, 0, &[0; 16]);
     let mut encoder = gpu
@@ -1125,6 +1151,7 @@ pub(crate) fn lod_frame(
         view: frame.view,
         previous: None,
         finest: world.finest,
+        morph: Some(raster.morph_inputs()),
     };
     lod.encode_main(gpu, &mut encoder, &inputs)
         .expect("encoded");
@@ -1155,8 +1182,7 @@ pub(crate) fn lod_frame(
     let count =
         usize::try_from(words[usize::try_from(offset / 4).expect("small") + 1]).expect("small");
     let listed: Vec<GpuCluster> = gpu.read_buffer(lod.clusters(false)).expect("read back");
-    let cut = output.nodes.iter().map(|(_, p)| *p).collect();
-    (image, listed[..count].to_vec(), cut)
+    (image, listed[..count].to_vec(), output)
 }
 
 #[test]
@@ -1581,12 +1607,15 @@ fn with_the_camera_still_the_ids_are_the_same_frame_after_frame() {
     });
 }
 
-/// The probe, appended to the raster's shader in tests only: `probes[k]` is (cluster instance,
-/// grid vertex), and `probed[k]` gets where the vertex shader puts that vertex, `w` its node.
+/// The probe, appended to the raster's shader in tests only.
+///
+/// `probes[k]` is (cluster instance, grid vertex), and `probed[k]` gets where the vertex shader
+/// puts that vertex, `w` what [`PROBE_W`] stands for (its node, unless [`probe_with`] says
+/// otherwise).
 const PROBE_WGSL: &str = r"
 // The probes: (cluster instance, grid vertex).
 @group(2) @binding(0) var<storage, read> probes: array<vec2<u32>>;
-// Where each probe's vertex is drawn, w its node.
+// Where each probe's vertex is drawn, w as the probe's caller chose.
 @group(2) @binding(1) var<storage, read_write> probed: array<vec4<f32>>;
 
 // Runs cluster_point for each probe.
@@ -1597,9 +1626,12 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let placed = cluster_point(probes[k].x, probes[k].y);
-    probed[k] = vec4<f32>(placed.position, f32(placed.id >> NODE_SHIFT));
+    probed[k] = vec4<f32>(placed.position, PROBE_W);
 }
 ";
+
+/// The text in [`PROBE_WGSL`] that `w`'s expression replaces, over `placed` (a `Placed`).
+const PROBE_W: &str = "PROBE_W";
 
 /// Where the vertex shader puts each `(cluster, grid vertex)` of `probes`, from the list
 /// `clusters`, with the raster's frame as last begun and stamped: its position and node.
@@ -1610,13 +1642,32 @@ fn probe(
     clusters: &Buffer,
     probes: &[[u32; 2]],
 ) -> Vec<[f32; 4]> {
+    probe_with(
+        gpu,
+        raster,
+        world,
+        clusters,
+        probes,
+        "f32(placed.id >> NODE_SHIFT)",
+    )
+}
+
+/// [`probe`], `w` the WGSL expression `w` over the vertex's `placed` instead of its node.
+fn probe_with(
+    gpu: &Gpu,
+    raster: &Raster,
+    world: &World,
+    clusters: &Buffer,
+    probes: &[[u32; 2]],
+    w: &str,
+) -> Vec<[f32; 4]> {
     let device = gpu.device();
     let slot_pipeline = &raster.pipeline;
     let probe_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("probe"),
         entries: &[read_entry(0), written_entry(1)],
     });
-    let source = format!("{}{PROBE_WGSL}", slot_pipeline.source);
+    let source = format!("{}{}", slot_pipeline.source, PROBE_WGSL.replace(PROBE_W, w));
     let module = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("probe"),
         source: ShaderSource::Wgsl(source.into()),

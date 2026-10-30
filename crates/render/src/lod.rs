@@ -41,6 +41,80 @@
 //! - **Requests.** A tile in the cut that wants refining and lacks children requests them, with its
 //!   screen error, in residency's request buffer ([`crate::residency::REQUESTS_WGSL`]).
 //!
+//! # Cone culling and the morph
+//!
+//! `emit` culls a tile in the cut by its normal cone ([`crate::cull`], "What the cone holds": its
+//! own triangles, its parent triangulation and every edge variant's fans, at their places) only
+//! when its morph is **settled**: every odd vertex of the tile drawn this frame at one end of its
+//! geomorph, all at `t = 1` or all at `t = 0` ([`crate::raster`], "The geomorph"). On the way, a
+//! triangle's two or three odd vertices move by factors of their own and its normal can leave the
+//! cone, so a tile whose morph isn't settled is drawn, never cone-culled, and counted
+//! ([`LodStats::cone_exempt`]): a sliver of it facing the eye at the silhouette can't vanish. The
+//! raster culls its back faces anyway. Settled, its drawn triangles are its own or its variant's
+//! fans (`t = 1`), or each lies in a triangle of its parent triangulation, oriented alike (`t =
+//! 0`: every odd vertex at the midpoint of its decision-4 parents), so the cone holds them.
+//!
+//! Emit reads what the raster's `place.wgsl` reads: the tree (each tile's `e`, its parent's, its
+//! neighbours and edges), the raster's stamps as the last frame's stamp pass left them, the
+//! raster's settings for this frame ([`MainInputs::morph`]: frame, time, duration, whether the
+//! camera moves, the distance ramp `r`), and the view. The raster draws from the same view,
+//! jittered at most, which moves neither the eye, the near plane nor the focal length that the
+//! distance factor reads. Without a raster nothing morphs: every tile is settled. A tile is
+//! settled when either holds:
+//!
+//! - **At the end** (`settled_at_end`): the tile has no parent, or the ramp is off (`r ≤ 0`) and
+//!   the time factor is certainly 1 for the tile and for each same-level neighbour across an edge
+//!   not drawn finer (`time_done`: no duration; a stamp of the tile staying in the cut at least a
+//!   duration old; a tile new to the cut while the camera moves).
+//! - **At the start** (`settled_at_start`, `starts`): the ramp is on, the tile has a parent and so
+//!   has each same-level neighbour across its edges, no edge is drawn finer, the sphere's view
+//!   depths `[z₀, z₁]` (its centre's depth ∓ its radius, widened by `2⁻¹⁰` of its farthest distance
+//!   from the eye) clear the near plane, and for the tile and each such neighbour's shared edge,
+//!   with `X` the parent `e` (there the larger of the two parents') and `Y` the own `e` (the larger
+//!   of the two), either `X > Y·(1 + 2⁻¹⁶)` and `X·f / z₀·(1 + 2⁻⁸) ≤ r`, or `X ≤ Y` and `r·(1 +
+//!   2⁻⁸) < Y·f / z₁` (`f` the pixels a length covers at distance 1).
+//!
+//! *Why this is conservative* (never settled while any odd vertex of the tile is on its way).
+//! `place.wgsl` draws an odd vertex `p` at `mix(mid, p, t)` with `t = min(time, distance)`; even
+//! vertices never move. Inside the tile `time` is the tile's clock and the distance factor reads
+//! the tile's parent `e` (`x`, projected at `p`) and own `e` (`y`); on an edge shared with a
+//! same-level neighbour, the larger parent `e`, the larger own `e` and the smaller clock of the
+//! two; on an edge drawn finer, `t = 1`; on an edge drawn coarser the variant draws no odd border
+//! vertex; with a parent `e` negative (no parent, either side of a seam), `t = 1`.
+//!
+//! - *End.* With no parent, every odd vertex reads a negative parent `e` (inside, or on a seam
+//!   through `max`, which `place.wgsl` replaces by `-1` when either is negative): `t = 1`. With the
+//!   ramp off the distance factor is 1, so `t` is the clock: the tile's inside, the smaller of the
+//!   tile's and the neighbour's on a shared edge, 1 on a finer one. `time_done` mirrors the stamp
+//!   pass (`morph.wgsl`), which runs after emit: a tile staying in the cut keeps its stamp, and
+//!   `now − start ≥ duration` makes `place.wgsl`'s `min(f32(now − start) / f32(duration), 1)`
+//!   exactly 1 (the conversions are monotone and a quotient of floats `a ≥ b > 0` rounds to at
+//!   least 1); a tile new to the cut while moving is stamped `now − duration`, so its clock is
+//!   exactly 1; a neighbour not in this frame's cut reads 1 in `place.wgsl` whatever its stamp.
+//!   Every clock read is 1, so every `t` is.
+//! - *Start.* No finer edge, and every parent `e` read is not negative, so every odd vertex goes
+//!   through the distance factor with the `X` and `Y` of its class (inside, or its shared edge).
+//!   Every vertex lies in the sphere, so its view depth `z`, as `place.wgsl` computes it, lies in
+//!   `[z₀, z₁]`: the widening is thousands of times the rounding of either side (a few units in the
+//!   last place of the farthest distance). So no vertex takes the near-plane branch (where the
+//!   factor is 1). `place.wgsl` computes `x = X·f / z` and `y = Y·f / z`, each two correctly
+//!   rounded operations (within `2⁻²⁴` each), with the same `z`. If `X > Y·(1 + 2⁻¹⁶)`, rounding
+//!   keeps `x > y` while `x` is a normal float, which the `SMALLEST` floor on `X·f / z₁` makes it;
+//!   so `place.wgsl` takes the ramp branch, `clamp((x − r) / (x − y), 0, 1)`, and `x ≤ X·f / z₀ ≤
+//!   r` (the `1 + 2⁻⁸` covering the roundings) makes it 0: `x − r` rounds to a value not positive
+//!   and `x − y` to a positive one. If `X ≤ Y`, the roundings are monotone, so `x ≤ y` and
+//!   `place.wgsl` returns 1 only if `y ≤ r`; but `y ≥ Y·f / z₁ > r` (the factor again), so it
+//!   returns 0. So every distance factor is exactly 0, `t = min(time, 0) = 0` whatever the clocks,
+//!   and `mix(mid, p, 0)` is `mid` exactly.
+//!
+//! What it gives up: with the ramp on (the default), a tile drawn between its two levels, its own
+//! `e` under `r` and its parent's over it somewhere on it, morphs by distance at every frame, so
+//! it is never cone-culled; the cone still culls level-0 tiles and those certainly drawn wholly at
+//! their start. In the cone tests' scene (`raster/tests/cone.rs`), 2 of 26 tiles facing away are
+//! culled with the ramp on; by time alone, all 26 once their morph has run. That keeps the bounds
+//! pass at the tile's drawn cone (a cone holding every morph state cost 3.7 times as much a tile,
+//! paid on every arrival; plan, the "Task 4 review" bullet).
+//!
 //! # Outputs
 //!
 //! - **For the raster (Task 4):** two lists of visible clusters ([`Lod::clusters`]: 8 × 8-quad
@@ -110,6 +184,7 @@ use crate::cull::{
     UNIFORM_STRIDE, entry, pipeline, storage_buffer, uniform_buffer,
 };
 use crate::gpu::{Gpu, GpuError};
+use crate::raster::{GpuMorphState, GpuRasterParams, MORPH_WGSL};
 use crate::residency::{FrameUse, REQUESTS_WGSL, Tier};
 use crate::timing::ticks_to_duration;
 use crate::tree::{NODE_BYTES, NODE_WGSL, Place};
@@ -118,8 +193,8 @@ use crate::tree::{NODE_BYTES, NODE_WGSL, Place};
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
 
-/// The level choice's own source, after [`NODE_WGSL`], [`REQUESTS_WGSL`], [`CULL_WGSL`] and
-/// [`CLUSTER_WGSL`].
+/// The level choice's own source, after [`NODE_WGSL`], [`REQUESTS_WGSL`], [`CULL_WGSL`],
+/// [`CLUSTER_WGSL`] and the raster's `MORPH_WGSL`.
 const LOD_WGSL: &str = include_str!("lod.wgsl");
 
 /// The WGSL declaration of [`GpuCluster`], for the raster that reads the cluster lists.
@@ -442,8 +517,8 @@ struct GpuFrame {
     refused: u32,
     /// Raises missing children.
     stuck: u32,
-    /// Zero.
-    reserved: u32,
+    /// Tiles their cone would cull, drawn because their morph isn't settled.
+    cone_exempt: u32,
     /// Tiles raised per relaxation pass.
     raises: [u32; MAX_RELAX_PASSES as usize],
     /// The budget's histogram.
@@ -727,6 +802,9 @@ pub struct LodStats {
     pub refused: u32,
     /// Tiles a relaxation pass wanted to raise and whose children weren't resident.
     pub stuck: u32,
+    /// Tiles in the cut, in the frustum, that their normal cone would cull but whose morph isn't
+    /// settled, so they are drawn ("Cone culling and the morph").
+    pub cone_exempt: u32,
     /// Tiles each relaxation pass raised, for the passes run.
     pub raises: Vec<u32>,
     /// Clusters, retries and cut entries past their lists' ends: zero unless a list is too
@@ -787,6 +865,23 @@ pub struct MainInputs<'a> {
     pub previous: Option<(&'a View, &'a DepthPyramid)>,
     /// The project's finest level.
     pub finest: Level,
+    /// The raster's morph ([`crate::raster::Raster::morph_inputs`]), for cone culling only
+    /// tiles whose morph is settled; `None` without a raster: nothing morphs, every tile is
+    /// settled.
+    pub morph: Option<MorphInputs<'a>>,
+}
+
+/// The raster's buffers the level choice reads to tell whether a tile's morph is settled.
+///
+/// See "Cone culling and the morph": its stamps, as the last frame's stamp pass left them, and
+/// its settings for this frame ([`crate::raster::Raster::begin_frame`] writes them through the
+/// queue, so before or after [`Lod::encode_main`] in the same submission).
+#[derive(Debug, Clone, Copy)]
+pub struct MorphInputs<'a> {
+    /// Per node, its stamp.
+    pub stamps: &'a Buffer,
+    /// The raster's frame settings.
+    pub params: &'a Buffer,
 }
 
 /// A readback buffer coming back to its reader.
@@ -986,6 +1081,10 @@ pub struct Lod {
     gate_group: BindGroup,
     /// A 1 × 1 pyramid holding the far depth, bound when there is no previous one.
     empty_pyramid: DepthPyramid,
+    /// One zeroed stamp, bound when the frame has no raster ([`MainInputs::morph`]).
+    no_stamps: Buffer,
+    /// Zeroed raster settings (no duration, no ramp: nothing morphs), bound with `no_stamps`.
+    no_morph: Buffer,
     /// Group 0's layout.
     layout: BindGroupLayout,
     /// Group 1's layout.
@@ -1066,6 +1165,36 @@ impl Lod {
     /// [`LodError::Capacity`] above [`MAX_NODES`]; [`LodError::Gpu`] or [`LodError::Cull`] if a
     /// buffer or pipeline can't be made.
     pub fn new(gpu: &Gpu, capacity: u32, config: LodConfig) -> Result<Self, LodError> {
+        Self::build(gpu, capacity, config, &[])
+    }
+
+    /// [`Lod::new`] with text replacements in the level choice's shader, for the tests' bite
+    /// checks, which break a rule on purpose to see a test fail.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lod::new`].
+    #[cfg(test)]
+    pub(crate) fn patched(
+        gpu: &Gpu,
+        capacity: u32,
+        config: LodConfig,
+        patches: &[(&str, &str)],
+    ) -> Result<Self, LodError> {
+        Self::build(gpu, capacity, config, patches)
+    }
+
+    /// [`Lod::new`], `patches` made in the shader.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lod::new`].
+    fn build(
+        gpu: &Gpu,
+        capacity: u32,
+        config: LodConfig,
+        patches: &[(&str, &str)],
+    ) -> Result<Self, LodError> {
         if capacity > MAX_NODES {
             return Err(LodError::Capacity(capacity));
         }
@@ -1097,9 +1226,11 @@ impl Lod {
         let previous_view = uniform_buffer(gpu, "lod previous view", size_of::<GpuView>() as u64)?;
         let steps = steps(gpu)?;
         let empty_pyramid = DepthPyramid::empty(gpu)?;
+        let no_stamps = storage_buffer(gpu, "lod no stamps", size_of::<GpuMorphState>() as u64)?;
+        let no_morph = uniform_buffer(gpu, "lod no morph", size_of::<GpuRasterParams>() as u64)?;
         let (layout, phase_layout) = layouts(gpu)?;
         let gate_layout = gate_layout(gpu)?;
-        let pipelines = Pipelines::new(gpu, &layout, &phase_layout, &gate_layout)?;
+        let pipelines = Pipelines::new(gpu, &layout, &phase_layout, &gate_layout, patches)?;
         let dispatches = gpu.scoped("lod dispatches", || {
             device.create_buffer(&BufferDescriptor {
                 label: Some("lod dispatches"),
@@ -1143,6 +1274,8 @@ impl Lod {
             dispatches,
             gate_group,
             empty_pyramid,
+            no_stamps,
+            no_morph,
             layout,
             phase_layout,
             pipelines,
@@ -1244,7 +1377,7 @@ impl Lod {
         self.check(inputs)?;
         self.write_settings(gpu, inputs);
         let passes = self.config.relax_passes;
-        let group = self.group(gpu, inputs.tree, inputs.requests)?;
+        let group = self.group(gpu, inputs)?;
         let pyramid = inputs
             .previous
             .map_or(&self.empty_pyramid, |(_, pyramid)| pyramid);
@@ -1558,12 +1691,17 @@ impl Lod {
         Ok(Some(LodTimings::from_ticks(&ticks, timer.period)))
     }
 
-    /// Group 0 for this frame: the tree and request buffers are the caller's.
+    /// Group 0 for this frame: the tree, request and morph buffers are the caller's (the
+    /// placeholders without a raster).
     ///
     /// # Errors
     ///
     /// As [`Gpu::scoped`].
-    fn group(&self, gpu: &Gpu, tree: &Buffer, requests: &Buffer) -> Result<BindGroup, GpuError> {
+    fn group(&self, gpu: &Gpu, inputs: &MainInputs<'_>) -> Result<BindGroup, GpuError> {
+        let (stamps, morph) = inputs
+            .morph
+            .map_or((&self.no_stamps, &self.no_morph), |m| (m.stamps, m.params));
+        let (tree, requests) = (inputs.tree, inputs.requests);
         gpu.scoped("lod bind group", || {
             gpu.device().create_bind_group(&BindGroupDescriptor {
                 label: Some("lod"),
@@ -1579,6 +1717,8 @@ impl Lod {
                     entry(7, &self.params),
                     entry(8, &self.view),
                     step_entry(9, &self.steps),
+                    entry(10, stamps),
+                    entry(11, morph),
                 ],
             })
         })
@@ -1666,6 +1806,8 @@ fn layouts(gpu: &Gpu) -> Result<(BindGroupLayout, BindGroupLayout), GpuError> {
                 buffer_entry(7, uniform, false),
                 buffer_entry(8, uniform, false),
                 step_layout_entry(9),
+                buffer_entry(10, READ, false),
+                buffer_entry(11, uniform, false),
             ],
         })
     })?;
@@ -1738,7 +1880,8 @@ const fn step_entry(binding: u32, steps: &Buffer) -> BindGroupEntry<'_> {
 }
 
 impl Pipelines {
-    /// Every entry point of `lod.wgsl`, on `layout` and `phase_layout`.
+    /// Every entry point of `lod.wgsl`, on `layout` and `phase_layout`, `patches` made in its
+    /// source (none but in the tests' bite checks).
     ///
     /// # Errors
     ///
@@ -1748,10 +1891,15 @@ impl Pipelines {
         layout: &BindGroupLayout,
         phase_layout: &BindGroupLayout,
         gate_layout: &BindGroupLayout,
+        patches: &[(&str, &str)],
     ) -> Result<Self, GpuError> {
         let gate_source = format!("const RAISES: u32 = {RAISES_WORD}u;\n{GATE_WGSL}");
         let gate = pipeline(gpu, "lod gate", &gate_source, &[gate_layout], "gate")?;
-        let source = format!("{NODE_WGSL}{REQUESTS_WGSL}{CULL_WGSL}{CLUSTER_WGSL}{LOD_WGSL}");
+        let mut source =
+            format!("{NODE_WGSL}{REQUESTS_WGSL}{CULL_WGSL}{CLUSTER_WGSL}{MORPH_WGSL}{LOD_WGSL}");
+        for (from, to) in patches {
+            source = source.replace(from, to);
+        }
         let groups = [layout, phase_layout];
         let make = |entry_point: &str| {
             pipeline(
@@ -1877,6 +2025,7 @@ fn stats(frame: &GpuFrame) -> LodStats {
         shortfall: frame.shortfall,
         refused: frame.refused,
         stuck: frame.stuck,
+        cone_exempt: frame.cone_exempt,
         raises: frame.raises.to_vec(),
         overflow: (
             frame.cluster_overflow,

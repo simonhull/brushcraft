@@ -150,7 +150,7 @@ use crate::camera::{GpuView, View};
 use crate::cull::{CULL_WGSL, SlotBuffers, entry, pipeline, storage_buffer, uniform_buffer};
 use crate::gpu::{Gpu, GpuError};
 use crate::indices::{self, INDICES_WGSL};
-use crate::lod::{CLUSTER_WGSL, CutList, LodConfig};
+use crate::lod::{CLUSTER_WGSL, CutList, LodConfig, MorphInputs};
 use crate::residency::{CLASSES, SizeClass, SlotLayout};
 use crate::tree::NODE_WGSL;
 use crate::upload::{VERTEX_BYTES, VERTEX_WGSL};
@@ -967,6 +967,16 @@ impl Raster {
             })
         })?;
         Ok((group, slot_group))
+    }
+
+    /// What the level choice reads to cone-cull only tiles whose morph is settled: the stamps and
+    /// the frame's settings ([`crate::lod::MainInputs::morph`]).
+    #[must_use]
+    pub const fn morph_inputs(&self) -> MorphInputs<'_> {
+        MorphInputs {
+            stamps: &self.stamps,
+            params: &self.params,
+        }
     }
 
     /// What the shading pass reads of the last frame drawn to rebuild its triangles: the remap

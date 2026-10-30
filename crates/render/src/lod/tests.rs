@@ -276,6 +276,7 @@ fn run(
         view,
         previous,
         finest: scene.finest,
+        morph: None,
     };
     lod.encode_main(gpu, &mut encoder, &inputs)
         .expect("encoded");
@@ -517,6 +518,7 @@ fn a_tree_too_small_or_a_pyramid_of_another_size_is_refused() {
             view: &view,
             previous: None,
             finest: level(8),
+            morph: None,
         };
         let refused = lod.encode_main(gpu, &mut encoder, &inputs);
         assert!(
