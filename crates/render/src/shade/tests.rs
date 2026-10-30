@@ -76,13 +76,8 @@ pub(crate) struct Probed {
 
 /// The pass for `world`'s slots, compute, clay, no wireframe.
 pub(crate) fn shade_for(gpu: &Gpu, world: &World) -> Shade {
-    Shade::new(
-        gpu,
-        world.layout(),
-        ShadePath::Compute,
-        ShadeSettings::default(),
-    )
-    .expect("the shading pass")
+    Shade::new(gpu, world.layout(), ShadePath::Compute, MatCapStyle::Clay)
+        .expect("the shading pass")
 }
 
 /// The pass for `world`'s slots, compute, with `patches` in its shader.
@@ -522,15 +517,12 @@ fn the_fragment_path_shades_as_the_compute_path_does() {
     GpuTest::run(|gpu| {
         let world = World::new(gpu);
         let scene = scenes(gpu, &world).remove(2);
-        let settings = ShadeSettings {
-            style: MatCapStyle::Glossy,
-            wireframe: true,
-        };
         let images: Vec<Vec<[f32; 4]>> = [ShadePath::Compute, ShadePath::Fragment]
             .into_iter()
             .map(|path| {
-                let mut shade =
-                    Shade::new(gpu, world.layout(), path, settings).expect("the shading pass");
+                let mut shade = Shade::new(gpu, world.layout(), path, MatCapStyle::Glossy)
+                    .expect("the shading pass");
+                shade.set_settings(ShadeSettings { wireframe: true });
                 assert_eq!(shade.path(), path);
                 shade_frame(gpu, &mut shade, &world, &scene.raster, &scene.view);
                 read_shaded(gpu, &shade)
@@ -556,8 +548,9 @@ fn a_material_or_wireframe_change_is_a_shading_pass_alone() {
         let mut shade = shade_for(gpu, &world);
         shade_frame(gpu, &mut shade, &world, &scene.raster, &scene.view);
         let clay = read_shaded(gpu, &shade);
-        let again = |pass: &mut Shade, settings| {
-            pass.set_settings(gpu, settings);
+        let again = |pass: &mut Shade, (style, wireframe)| {
+            pass.set_material(gpu, style);
+            pass.set_settings(ShadeSettings { wireframe });
             let mut encoder = gpu
                 .device()
                 .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -569,13 +562,9 @@ fn a_material_or_wireframe_change_is_a_shading_pass_alone() {
             finish(gpu);
             read_shaded(gpu, pass)
         };
-        let glossy_settings = ShadeSettings {
-            style: MatCapStyle::Glossy,
-            wireframe: false,
-        };
-        let glossy = again(&mut shade, glossy_settings);
+        let glossy = again(&mut shade, (MatCapStyle::Glossy, false));
         // The same as a whole frame drawn and shaded glossy.
-        let mut fresh = Shade::new(gpu, world.layout(), ShadePath::Compute, glossy_settings)
+        let mut fresh = Shade::new(gpu, world.layout(), ShadePath::Compute, MatCapStyle::Glossy)
             .expect("the shading pass");
         shade_frame(gpu, &mut fresh, &world, &scene.raster, &scene.view);
         assert_eq!(glossy, read_shaded(gpu, &fresh), "as if drawn again");
@@ -590,13 +579,7 @@ fn a_material_or_wireframe_change_is_a_shading_pass_alone() {
             "the material changed: {changed} of {lit}"
         );
         // The wireframe: lines over the triangles, not over everything.
-        let wired = again(
-            &mut shade,
-            ShadeSettings {
-                wireframe: true,
-                ..glossy_settings
-            },
-        );
+        let wired = again(&mut shade, (MatCapStyle::Glossy, true));
         let lined = glossy
             .iter()
             .zip(&wired)

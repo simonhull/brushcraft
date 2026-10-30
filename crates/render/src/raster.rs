@@ -134,17 +134,16 @@ use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
-    Backend, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
-    BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType,
-    BufferUsages, Color, ColorTargetState, ColorWrites, CommandEncoder, CompareFunction,
-    ComputePassDescriptor, ComputePipeline, DepthBiasState, DepthStencilState, Extent3d, Face,
-    FragmentState, FrontFace, IndexFormat, LoadOp, MultisampleState, Operations,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState,
-    PrimitiveTopology, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, StencilState, StoreOp, Texture, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
-    VertexState,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferUsages, Color,
+    ColorTargetState, ColorWrites, CommandEncoder, CompareFunction, ComputePassDescriptor,
+    ComputePipeline, DepthBiasState, DepthStencilState, Extent3d, Face, FragmentState, FrontFace,
+    IndexFormat, LoadOp, MultisampleState, Operations, PipelineCompilationOptions,
+    PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology,
+    RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
+    RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    StencilState, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages, TextureView, TextureViewDescriptor, VertexState,
 };
 
 use crate::camera::{GpuView, View};
@@ -303,25 +302,31 @@ const FIXED_STORAGE: u32 = 4;
 /// Uniform buffers of group 0 the vertex stage reads: the settings and the view.
 const FIXED_UNIFORMS: u32 = 2;
 
-/// The most slot buffers the raster's one draw, and the shading pass, can bind beside their own
-/// on `gpu`'s device.
+/// The most slot buffers the raster's one draw, and the shading pass, can bind on `gpu`'s device.
 ///
-/// That is `max_storage_buffers_per_shader_stage` less the larger of the two passes' storage
-/// buffers (four each), and on Metal, whose buffer argument table holds storage and uniform
-/// buffers alike, less the larger of their uniform buffers too (the raster's two, the shading
-/// pass's four with its material's).
+/// That is the smaller of the two passes' room beside their own buffers (the shading pass with
+/// the renderer's material, the MatCap), within the device's per-stage limits.
 #[must_use]
 pub fn slot_buffer_limit(gpu: &Gpu) -> u32 {
-    let shared = if gpu.adapter_info().backend == Backend::Metal {
-        FIXED_UNIFORMS.max(crate::shade::FIXED_UNIFORMS)
-    } else {
-        0
-    };
-    let storage = FIXED_STORAGE.max(crate::shade::FIXED_STORAGE);
-    gpu.device()
-        .limits()
+    let (storage, uniforms) = crate::shade::fixed_buffers::<crate::material::MatCap>();
+    slots_beside(gpu, FIXED_STORAGE, FIXED_UNIFORMS).min(slots_beside(gpu, storage, uniforms))
+}
+
+/// The most slot buffers a stage can bind on `gpu`'s device beside other buffers.
+///
+/// Those are `storage` other storage buffers and `uniforms` uniform buffers. The slots stay
+/// within `max_storage_buffers_per_shader_stage`, and within
+/// `max_buffers_and_acceleration_structures_per_shader_stage`, the table Metal's storage and
+/// uniform buffers share (other backends report no such bound).
+pub(crate) fn slots_beside(gpu: &Gpu, storage: u32, uniforms: u32) -> u32 {
+    let limits = gpu.device().limits();
+    let alone = limits
         .max_storage_buffers_per_shader_stage
-        .saturating_sub(storage + shared)
+        .saturating_sub(storage);
+    let shared = limits
+        .max_buffers_and_acceleration_structures_per_shader_stage
+        .saturating_sub(storage + uniforms);
+    alone.min(shared)
 }
 
 /// One pixel of the visibility buffer, decoded.

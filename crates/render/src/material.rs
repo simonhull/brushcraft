@@ -95,8 +95,20 @@ struct Eye {
 ///
 /// The shading pass builds its pipelines once from [`Material::source`] and
 /// [`Material::layout`], and binds [`Material::bind_group`] each time it runs: a material's
-/// settings change through its own buffers, with no new pipeline.
+/// settings ([`Material::Settings`]) change through its own buffers, with no new pipeline. The
+/// buffers its group binds count against the shading pass's per-stage limits (on Metal storage
+/// and uniform buffers share one table), so it declares them: the pass refuses a slot layout
+/// they leave no room for.
 pub trait Material: std::fmt::Debug {
+    /// What can change about it without a new pipeline.
+    type Settings: Copy + PartialEq + std::fmt::Debug;
+
+    /// Uniform buffers its bind group holds.
+    const UNIFORM_BUFFERS: u32;
+
+    /// Storage buffers its bind group holds.
+    const STORAGE_BUFFERS: u32;
+
     /// The WGSL: `material` and the bindings it reads, at group [`MATERIAL_GROUP`], seen by
     /// the compute and fragment stages (the shading pass runs as either).
     fn source(&self) -> &str;
@@ -106,6 +118,12 @@ pub trait Material: std::fmt::Debug {
 
     /// Its bind group.
     fn bind_group(&self) -> &BindGroup;
+
+    /// Its settings now.
+    fn settings(&self) -> Self::Settings;
+
+    /// Sets its settings, from the next shading pass on.
+    fn set_settings(&mut self, gpu: &Gpu, settings: Self::Settings);
 }
 
 /// The MatCap's settings as the GPU reads them: WGSL's `MatCapParams`, 16 bytes.
@@ -301,6 +319,14 @@ impl MatCap {
 }
 
 impl Material for MatCap {
+    /// The style shown.
+    type Settings = MatCapStyle;
+
+    /// None: the images are a texture.
+    const STORAGE_BUFFERS: u32 = 0;
+    /// Its settings' uniform: the style's layer and the images' size.
+    const UNIFORM_BUFFERS: u32 = 1;
+
     fn source(&self) -> &str {
         MATCAP_WGSL
     }
@@ -311,6 +337,16 @@ impl Material for MatCap {
 
     fn bind_group(&self) -> &BindGroup {
         &self.group
+    }
+
+    fn settings(&self) -> MatCapStyle {
+        self.style
+    }
+
+    fn set_settings(&mut self, gpu: &Gpu, settings: MatCapStyle) {
+        if settings != self.style {
+            self.set_style(gpu, settings);
+        }
     }
 }
 

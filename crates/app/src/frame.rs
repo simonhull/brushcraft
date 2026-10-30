@@ -97,7 +97,7 @@ impl LookChange {
     pub(crate) fn apply(self, mut look: Look) -> Look {
         match self {
             Self::Wireframe => look.shading.wireframe = !look.shading.wireframe,
-            Self::MatCap => look.shading.style = look.shading.style.next(),
+            Self::MatCap => look.material = look.material.next(),
             Self::Clusters => {
                 look.view = match look.view {
                     SceneView::Shaded => SceneView::Clusters,

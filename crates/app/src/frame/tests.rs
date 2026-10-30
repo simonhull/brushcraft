@@ -957,7 +957,7 @@ fn a_change_of_look_alone_shades_the_last_scene_again_and_draws_nothing_new() {
     let clay = screen.pixels(&gpu);
     let ids = screen.ids(&gpu);
     owner.change_look(LookChange::MatCap);
-    assert_eq!(owner.look().shading.style, MatCapStyle::Glossy);
+    assert_eq!(owner.look().material, MatCapStyle::Glossy);
     assert!(
         matches!(owner.next(Instant::now() + INTERVAL), Next::Frame { .. }),
         "the change wants a frame"
@@ -965,7 +965,7 @@ fn a_change_of_look_alone_shades_the_last_scene_again_and_draws_nothing_new() {
     let request = hand_off(&mut owner, Instant::now());
     assert!(request.reshade, "the shading alone");
     assert!(request.scene.is_none(), "no level choice or raster");
-    assert_eq!(request.look.shading.style, MatCapStyle::Glossy);
+    assert_eq!(request.look.material, MatCapStyle::Glossy);
     let presented = screen.draw(&gpu, request);
     assert!(
         !presented.scene && presented.shown,
@@ -1010,7 +1010,7 @@ fn each_key_changes_the_look_its_own_way() {
     let styles: Vec<MatCapStyle> =
         std::iter::successors(Some(look), |l| Some(LookChange::MatCap.apply(*l)))
             .take(4)
-            .map(|l| l.shading.style)
+            .map(|l| l.material)
             .collect();
     assert_eq!(
         styles,

@@ -227,10 +227,8 @@ fn a_text_image_holds_exactly_its_texels() {
 /// The debug view's look.
 const CLUSTERS: Look = Look {
     view: SceneView::Clusters,
-    shading: ShadeSettings {
-        style: crate::material::MatCapStyle::Clay,
-        wireframe: false,
-    },
+    shading: ShadeSettings { wireframe: false },
+    material: MatCapStyle::Clay,
 };
 
 /// What [`draw_scene`] drew: the frame's pixels, its visibility buffer and its cut read back.
@@ -342,13 +340,11 @@ fn pixels(gpu: &Gpu, target: &Target) -> Vec<[u8; 4]> {
 }
 
 /// `look` with the MatCap's `style`.
-const fn styled(style: crate::material::MatCapStyle) -> Look {
+const fn styled(style: MatCapStyle) -> Look {
     Look {
         view: SceneView::Shaded,
-        shading: ShadeSettings {
-            style,
-            wireframe: false,
-        },
+        shading: ShadeSettings { wireframe: false },
+        material: style,
     }
 }
 

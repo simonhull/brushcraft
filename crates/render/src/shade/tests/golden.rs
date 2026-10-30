@@ -146,30 +146,21 @@ fn render(gpu: &Gpu, world: &World, size: Size, eye: Vec3, look: Look) -> Rgb {
     }
 }
 
+/// The shaded look of `style`, with the wireframe or not.
+const fn look(style: MatCapStyle, wireframe: bool) -> Look {
+    Look {
+        view: SceneView::Shaded,
+        shading: ShadeSettings { wireframe },
+        material: style,
+    }
+}
+
 /// The goldens: a name and the look it shows.
-fn goldens() -> [(&'static str, ShadeSettings); 3] {
+fn goldens() -> [(&'static str, Look); 3] {
     [
-        (
-            "matcap-clay",
-            ShadeSettings {
-                style: MatCapStyle::Clay,
-                wireframe: false,
-            },
-        ),
-        (
-            "matcap-glossy",
-            ShadeSettings {
-                style: MatCapStyle::Glossy,
-                wireframe: false,
-            },
-        ),
-        (
-            "matcap-pale-wireframe",
-            ShadeSettings {
-                style: MatCapStyle::Pale,
-                wireframe: true,
-            },
-        ),
+        ("matcap-clay", look(MatCapStyle::Clay, false)),
+        ("matcap-glossy", look(MatCapStyle::Glossy, false)),
+        ("matcap-pale-wireframe", look(MatCapStyle::Pale, true)),
     ]
 }
 
@@ -183,13 +174,9 @@ const GOLDEN_P99: f32 = 0.05;
 /// view.
 const GOLDEN_EYE: Vec3 = Vec3::new(1.1, 0.9, 3.3);
 
-/// The sphere for a golden, `world`, shaded as `settings` say.
-fn golden_sphere(gpu: &Gpu, settings: ShadeSettings, world: &World) -> Rgb {
+/// The sphere for a golden, `world`, shown as `look` says.
+fn golden_sphere(gpu: &Gpu, look: Look, world: &World) -> Rgb {
     let size = Size::new(GOLDEN_SIDE, GOLDEN_SIDE).expect("non-zero");
-    let look = Look {
-        view: SceneView::Shaded,
-        shading: settings,
-    };
     render(gpu, world, size, GOLDEN_EYE, look)
 }
 
@@ -202,9 +189,13 @@ fn the_matcap_goldens_match_their_files() {
         let write = std::env::var_os(WRITE).is_some();
         let dir = golden_dir();
         let mut frames = Vec::new();
-        for (name, settings) in goldens() {
-            let world = if settings.wireframe { &coarse } else { &fine };
-            let frame = golden_sphere(gpu, settings, world);
+        for (name, look) in goldens() {
+            let world = if look.shading.wireframe {
+                &coarse
+            } else {
+                &fine
+            };
+            let frame = golden_sphere(gpu, look, world);
             let path = dir.join(format!("{name}.png"));
             if write {
                 std::fs::create_dir_all(&dir).expect("the golden directory");
@@ -222,17 +213,24 @@ fn the_matcap_goldens_match_their_files() {
             );
             frames.push((name, frame, golden));
         }
-        // The bite: each frame against another style's golden is refused.
-        for (k, (name, frame, _)) in frames.iter().enumerate() {
-            let (other, _, golden) = &frames[(k + 1) % frames.len()];
+        // The bites: each frame against another style's golden is refused; and the wireframe's
+        // golden refuses its sphere without the wireframe, the same style and world.
+        let refused = |name: &str, frame: &Rgb, golden: &Rgb| {
             let errors = flip(&linear_of(golden), &linear_of(frame));
             assert!(
                 errors.mean() > 4.0 * GOLDEN_MEAN && errors.percentile(99) > GOLDEN_P99,
-                "{name} against {other}'s golden: mean {}, p99 {}",
+                "{name}: mean {}, p99 {}",
                 errors.mean(),
                 errors.percentile(99)
             );
+        };
+        for (k, (name, frame, _)) in frames.iter().enumerate() {
+            let (other, _, golden) = &frames[(k + 1) % frames.len()];
+            refused(&format!("{name} against {other}'s golden"), frame, golden);
         }
+        let unwired = golden_sphere(gpu, look(MatCapStyle::Pale, false), &coarse);
+        let (_, _, wired) = &frames[2];
+        refused("pale without the wireframe", &unwired, wired);
     });
 }
 
@@ -246,14 +244,7 @@ fn a_large_shaded_sphere_for_people_to_look_at() {
         let size = Size::new(640, 640).expect("non-zero");
         let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
         for style in MatCapStyle::ALL {
-            let look = Look {
-                view: SceneView::Shaded,
-                shading: ShadeSettings {
-                    style,
-                    wireframe: false,
-                },
-            };
-            let frame = render(gpu, &world, size, GOLDEN_EYE, look);
+            let frame = render(gpu, &world, size, GOLDEN_EYE, look(style, false));
             let path = out.join(format!("shaded-sphere-{}.png", style.name()));
             std::fs::write(&path, png::encode(&frame)).expect("written");
         }

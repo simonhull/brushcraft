@@ -27,6 +27,7 @@ use crate::camera::View;
 use crate::cull::{BoundsUpdate, DepthPyramid, PyramidPass, SlotBuffers};
 use crate::gpu::{Gpu, GpuError};
 use crate::lod::{CutReadback, Lod, LodConfig, LodError, MainInputs};
+use crate::material::MatCapStyle;
 use crate::residency::SlotLayout;
 use crate::shade::{Shade, ShadeError, ShadePath, ShadeScene, ShadeSettings};
 
@@ -114,7 +115,7 @@ impl FramePasses {
             pyramids: PyramidPass::new(gpu)?,
             current: None,
             previous: None,
-            shade: Shade::new(gpu, slots, path, ShadeSettings::default())?,
+            shade: Shade::new(gpu, slots, path, MatCapStyle::default())?,
         })
     }
 
@@ -142,9 +143,11 @@ impl FramePasses {
         &self.shade
     }
 
-    /// Sets what the shading shows from the next shading pass on.
-    pub fn set_shading(&mut self, gpu: &Gpu, settings: ShadeSettings) {
-        self.shade.set_settings(gpu, settings);
+    /// Sets what the shading shows (the wireframe) and the MatCap's style, from the next
+    /// shading pass on.
+    pub fn set_shading(&mut self, gpu: &Gpu, settings: ShadeSettings, style: MatCapStyle) {
+        self.shade.set_settings(settings);
+        self.shade.set_material(gpu, style);
     }
 
     /// Encodes the shading pass over the visibility buffer [`FramePasses::encode`] just drew

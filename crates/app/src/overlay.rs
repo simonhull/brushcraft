@@ -81,7 +81,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         look,
     } = *snapshot;
     let view = match look.view {
-        SceneView::Shaded => format!("matcap {}", look.shading.style.name()),
+        SceneView::Shaded => format!("matcap {}", look.material.name()),
         SceneView::Clusters => "clusters (debug view)".to_owned(),
     };
     let wireframe = if look.shading.wireframe { "on" } else { "off" };
@@ -290,10 +290,8 @@ mod tests {
             camera: Camera::default(),
             look: Look {
                 view: SceneView::Shaded,
-                shading: render::shade::ShadeSettings {
-                    style: render::material::MatCapStyle::Glossy,
-                    wireframe: true,
-                },
+                shading: render::shade::ShadeSettings { wireframe: true },
+                material: render::material::MatCapStyle::Glossy,
             },
         };
         let text = lines(&snapshot).join("\n");

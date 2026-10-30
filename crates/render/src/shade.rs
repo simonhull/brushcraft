@@ -114,13 +114,22 @@ const SHADE_WGSL: &str = include_str!("shade.wgsl");
 /// The format the pass shades into: linear, 16-bit float, HDR.
 pub const HDR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
-/// Storage buffers the pass binds beside the slot buffers: the tree, the remap tables, the stamps
-/// and the drawn edges.
-pub(crate) const FIXED_STORAGE: u32 = 4;
+/// Storage buffers the pass binds itself beside the slot buffers and its material's: the tree,
+/// the remap tables, the stamps and the drawn edges.
+const OWN_STORAGE: u32 = 4;
 
-/// Uniform buffers it binds (on Metal they share the storage buffers' table): the raster's
-/// settings and view, its own settings, and its material's (one, for the MatCap).
-pub(crate) const FIXED_UNIFORMS: u32 = 4;
+/// Uniform buffers it binds itself beside its material's: the raster's settings and view, and
+/// its own settings.
+const OWN_UNIFORMS: u32 = 3;
+
+/// The storage and uniform buffers the pass binds beside the slot buffers with material `M`:
+/// its own and the material's ([`Material::STORAGE_BUFFERS`], [`Material::UNIFORM_BUFFERS`]).
+pub(crate) const fn fixed_buffers<M: Material>() -> (u32, u32) {
+    (
+        OWN_STORAGE + M::STORAGE_BUFFERS,
+        OWN_UNIFORMS + M::UNIFORM_BUFFERS,
+    )
+}
 
 /// Pixels a side of a compute workgroup.
 const GROUP_SIDE: u32 = 8;
@@ -152,12 +161,10 @@ impl ShadePath {
     }
 }
 
-/// What the shading shows, beside the material's own settings: a change of these alone needs
-/// only the shading pass ([`Shade::encode_again`]).
+/// What the shading shows beside its material's own settings ([`Material::Settings`]): a
+/// change of these alone needs only the shading pass ([`Shade::encode_again`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ShadeSettings {
-    /// The MatCap's style.
-    pub style: MatCapStyle,
     /// Whether the wireframe is drawn over the shading.
     pub wireframe: bool,
 }
@@ -191,6 +198,14 @@ pub enum ShadeError {
     /// The slot buffers don't fit the layout the pass was built for.
     #[error(transparent)]
     Slots(#[from] RasterError),
+    /// The slot layout's buffers don't fit beside the pass's own and its material's.
+    #[error("{buffers} slot buffers: the shading pass binds at most {limit} beside its own")]
+    TooManySlotBuffers {
+        /// The slot buffers.
+        buffers: u32,
+        /// The most the device allows beside the pass's own.
+        limit: u32,
+    },
 }
 
 /// What a frame's shading reads: the scene the raster drew.
@@ -273,8 +288,8 @@ pub struct Shade<M: Material = MatCap> {
 }
 
 impl Shade<MatCap> {
-    /// The pass with a [`MatCap`] of `settings`' style, for slot buffers of `slots` (residency's,
-    /// as the raster's), running as `path`.
+    /// The pass with a [`MatCap`] showing `style`, for slot buffers of `slots` (residency's, as
+    /// the raster's), running as `path`.
     ///
     /// # Errors
     ///
@@ -283,25 +298,25 @@ impl Shade<MatCap> {
         gpu: &Gpu,
         slots: SlotLayout,
         path: ShadePath,
-        settings: ShadeSettings,
+        style: MatCapStyle,
     ) -> Result<Self, ShadeError> {
-        let material = MatCap::new(gpu, settings.style)?;
-        let mut shade = Self::with_material(gpu, slots, path, material)?;
-        shade.settings = settings;
-        Ok(shade)
-    }
-
-    /// Sets what the shading shows: the MatCap's style and the wireframe, from the next pass on
-    /// (uniform writes: no new pipeline).
-    pub fn set_settings(&mut self, gpu: &Gpu, settings: ShadeSettings) {
-        if settings.style != self.material.style() {
-            self.material.set_style(gpu, settings.style);
-        }
-        self.settings = settings;
+        let material = MatCap::new(gpu, style)?;
+        Self::with_material(gpu, slots, path, material)
     }
 }
 
 impl<M: Material> Shade<M> {
+    /// Sets what the shading shows beside the material, from the next pass on (a uniform write:
+    /// no new pipeline).
+    pub fn set_settings(&mut self, settings: ShadeSettings) {
+        self.settings = settings;
+    }
+
+    /// Sets the material's settings, from the next pass on (its own buffers: no new pipeline).
+    pub fn set_material(&mut self, gpu: &Gpu, settings: M::Settings) {
+        self.material.set_settings(gpu, settings);
+    }
+
     /// The pass shading through `material`, for slot buffers of `slots`, running as `path`.
     ///
     /// # Errors
@@ -345,6 +360,14 @@ impl<M: Material> Shade<M> {
         material: M,
         patches: &[(&str, &str)],
     ) -> Result<Self, ShadeError> {
+        let (storage, uniforms) = fixed_buffers::<M>();
+        let limit = crate::raster::slots_beside(gpu, storage, uniforms);
+        if slots.total() > limit {
+            return Err(ShadeError::TooManySlotBuffers {
+                buffers: slots.total(),
+                limit,
+            });
+        }
         let layouts = Layouts::new(gpu, slots)?;
         let source = shade_source(slots, material.source(), patches);
         let pipeline = layouts.pipeline(gpu, path, &source, material.layout())?;

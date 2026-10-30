@@ -27,6 +27,7 @@ use wgpu::{
 
 use crate::gpu::{Gpu, GpuError};
 use crate::lod::CutReadback;
+use crate::material::MatCapStyle;
 use crate::overlay::{OverlayPass, TextImage};
 use crate::raster::{FrameError, FramePasses, SceneInputs};
 use crate::shade::ShadeSettings;
@@ -80,8 +81,10 @@ pub enum Scene<'a> {
 pub struct Look {
     /// Shaded, or the debug view.
     pub view: SceneView,
-    /// The shading's settings: the MatCap's style and the wireframe.
+    /// The shading's settings beside the material: the wireframe.
     pub shading: ShadeSettings,
+    /// The MatCap's style.
+    pub material: MatCapStyle,
 }
 
 /// Which image of the scene a frame shows.
@@ -279,7 +282,7 @@ impl Renderer {
         } = image_passes;
         overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         if let Some(passes) = scene_passes.as_mut() {
-            passes.set_shading(gpu, inputs.look.shading);
+            passes.set_shading(gpu, inputs.look.shading, inputs.look.material);
         }
         let to_draw = scene_passes.as_mut().map(|passes| (inputs.scene, passes));
         let drawing = matches!(to_draw, Some((Scene::Draw(_), _)));
