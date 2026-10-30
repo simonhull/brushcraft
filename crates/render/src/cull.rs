@@ -11,8 +11,8 @@
 //! ([`crate::tree::TileTree::changed_since`]), the owner thread gathers those nodes into a
 //! [`BoundsUpdate`], and the render thread encodes the pass right after the frame's uploads.
 //!
-//! **What the cone holds**, and so what the raster (Task 4) may draw from a tile without leaving
-//! slivers at the silhouette:
+//! **What the cone holds**, and so what the raster may draw from a tile, morphing or not,
+//! without a culled tile leaving slivers at the silhouette:
 //!
 //! 1. the tile's own triangles: each quad split along `(i, j)–(i + 1, j + 1)` (decision 4);
 //! 2. its **parent triangulation**: each 2 × 2-quad block split along its `(0, 0)–(2, 2)` diagonal.
@@ -22,13 +22,17 @@
 //!    `o` (between the even border vertices `a` and `b`; `m`, `ma` and `mb` the vertices one row in
 //!    from `o`, `a` and `b`) is dropped, and the two border quads sharing it become the fan `(a, b,
 //!    m)`, `(a, m, ma)`, `(b, mb, m)`. **The variant index buffers must use exactly this
-//!    triangulation** (`bounds.wgsl`'s `extra_normal`).
-//!
-//! In between, a morphing triangle with one moving vertex has a normal on the arc between its
-//! two ends, so inside the cone (cones are convex). One whose two or three vertices move together
-//! has a normal quadratic in the morph factor, which can leave the cone: the raster must either
-//! keep such a triangle's moving vertices from moving at once or widen the cone test (a margin on
-//! `cone_cos`) while a morph runs.
+//!    triangulation** (`bounds.wgsl`'s `extra_normal`);
+//! 4. every **morph state** (`morph_normal`): each own and fan triangle's moving vertices are its
+//!    two or three odd ones, each with its own factor (the raster's seams and distance factor vary
+//!    it per vertex). The triangle's normal is linear in each vertex's place, so with the vertices
+//!    anywhere on their ways it is a sum, with weights not negative, of the normals of its eight
+//!    corners: each vertex at its start or its end. All at the start lie in the parent
+//!    triangulation's plane (2), all at the end are the triangle itself (1, 3); the cone also holds
+//!    the six mixed ones, so it holds every morph state (a cone narrower than a half-space is
+//!    convex). That is twelve normals a quad and 48 an odd border vertex, about 3.4 times the
+//!    tile's own triangles for the bounds pass to fold in (a cost per arrival, not per frame; not
+//!    measured).
 //!
 //! # Tests
 //!

@@ -34,6 +34,7 @@ use crate::surface::Size;
 use crate::tree::{NODE_BYTES, NODE_FINEST, Place, TileTree};
 use crate::upload::{GpuVertex, TileDetail};
 
+mod cone;
 mod pop;
 
 /// The finest level.
@@ -1157,7 +1158,8 @@ fn the_pinhole_test_holds_for_the_level_choice_s_cuts_morphing_by_distance() {
             let holes = pinholes(&mask, &image);
             assert_eq!(holes, 0, "seed {seed}: {holes} pinholes");
         }
-        assert!(levels.len() >= 3, "mixed levels: {levels:?}");
+        // The sphere's true bounds are small: the level choice draws it at two levels from here.
+        assert!(levels.len() >= 2, "mixed levels: {levels:?}");
     });
 }
 

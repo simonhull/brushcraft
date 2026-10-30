@@ -81,12 +81,11 @@
 //! isn't morphed (`t` = 1): the finer side draws it as an even vertex, which never moves. Beside a
 //! coarser one, the variant has already replaced it by an even vertex.
 //!
-//! **The cone:** a morphing triangle's normal stays in the tile's cone when one of its vertices
-//! moves (the cone holds both ends, `cull.rs`), but this grid's triangles have two odd vertices
-//! each, moving together, whose normal is quadratic in `t` and can leave it slightly while a morph
-//! runs. The level choice doesn't widen its drawing cone test for that yet: a tile all of whose
-//! triangles face away at both ends of a morph could, mid-morph, have a sliver facing the eye at
-//! the silhouette and still be culled. To settle with Task 5's golden images.
+//! **The cone:** this grid's triangles have two or three odd vertices each, every one with its
+//! own factor, so a morphing triangle's normal isn't on the arc between its two ends. The bounds
+//! pass's cone holds every mix of its vertices at their start and their end, and so, by
+//! linearity in each vertex, every morph state (`cull.rs`, "What the cone holds", 4): the level
+//! choice culls a tile by its cone, morphing or not, without dropping a sliver facing the eye.
 //!
 //! # Slot buffers
 //!

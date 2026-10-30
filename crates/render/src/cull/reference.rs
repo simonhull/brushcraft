@@ -69,7 +69,7 @@ pub(crate) fn quad_triangles(
 }
 
 /// A grid vertex, `(column, row)`.
-type Grid = (i32, i32);
+pub(crate) type Grid = (i32, i32);
 
 /// The tile's extra triangles on a `side`-vertex grid.
 ///
@@ -118,12 +118,112 @@ pub(crate) fn extra_triangles(side: usize) -> Vec<[Grid; 3]> {
     out
 }
 
+/// A grid vertex of a morph triangle, and whether it stands where its morph starts (the
+/// midpoint of its decision-4 parents) rather than where it is.
+pub(crate) type MorphCorner = (Grid, bool);
+
+/// The tile's morph triangles on a `side`-vertex grid, in `bounds.wgsl`'s `morph_normal` order.
+///
+/// Each own triangle and each fan triangle with moving vertices six times, once per mix of its
+/// vertices at their start (bit `k` of 1 to 6 for vertex `k`) and at their end, counter-clockwise
+/// in the grid. None for a single quad. An even vertex's start is where it is.
+///
+/// # Panics
+///
+/// If `side` is 0 or past `i32`.
+pub(crate) fn morph_triangles(side: usize) -> Vec<[MorphCorner; 3]> {
+    let quads = i32::try_from(side - 1).expect("small");
+    if quads < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut push = |[g0, g1, g2]: [Grid; 3]| {
+        for starts in 1..=6_u8 {
+            out.push([
+                (g0, starts & 1 != 0),
+                (g1, starts & 2 != 0),
+                (g2, starts & 4 != 0),
+            ]);
+        }
+    };
+    for j in 0..quads {
+        for i in 0..quads {
+            let (p00, p10, p11, p01) = ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1));
+            push([p00, p10, p11]);
+            push([p00, p11, p01]);
+        }
+    }
+    let half = quads / 2;
+    for edge in 0..4 {
+        for s in 0..half {
+            let o = 2 * s + 1;
+            let (a, b, inward) = match edge {
+                0 => ((o - 1, 0), (o + 1, 0), (0, 1)),
+                1 => ((quads, o - 1), (quads, o + 1), (-1, 0)),
+                2 => ((o - 1, quads), (o + 1, quads), (0, -1)),
+                _ => ((0, o - 1), (0, o + 1), (1, 0)),
+            };
+            let step = |g: Grid| (g.0 + inward.0, g.1 + inward.1);
+            let m = step((i32::midpoint(a.0, b.0), i32::midpoint(a.1, b.1)));
+            push([a, m, step(a)]);
+            push([b, step(b), m]);
+        }
+    }
+    out
+}
+
+/// Where a morph corner stands on a `side`-vertex grid of `points`.
+///
+/// # Panics
+///
+/// If the corner is off the grid.
+pub(crate) fn morph_corner(points: &[[f32; 3]], side: usize, (g, start): MorphCorner) -> [f32; 3] {
+    let at = |(x, y): Grid| {
+        points[usize::try_from(y).expect("on the grid") * side
+            + usize::try_from(x).expect("on the grid")]
+    };
+    if !start {
+        return at(g);
+    }
+    let d = (g.0 & 1, g.1 & 1);
+    let (low, high) = (at((g.0 - d.0, g.1 - d.1)), at((g.0 + d.0, g.1 + d.1)));
+    #[expect(
+        clippy::manual_midpoint,
+        reason = "the bounds pass's arithmetic, (a + b) · 0.5, bit for bit"
+    )]
+    let mid = [0, 1, 2].map(|k| (low[k] + high[k]) * 0.5);
+    mid
+}
+
+/// The unit normal of a morph triangle, counter-clockwise in the grid as the bounds pass takes
+/// it.
+pub(crate) fn morph_normal(points: &[[f32; 3]], side: usize, t: [MorphCorner; 3]) -> [f32; 3] {
+    let [p0, p1, p2] = t.map(|c| morph_corner(points, side, c));
+    let [(g0, _), (g1, _), (g2, _)] = t;
+    let cross = (g1.0 - g0.0) * (g2.1 - g0.1) - (g1.1 - g0.1) * (g2.0 - g0.0);
+    if cross < 0 {
+        face_normal(p0, p2, p1)
+    } else {
+        face_normal(p0, p1, p2)
+    }
+}
+
 /// The bounds of a tile of `side` × `side` vertices, as the bounds pass computes them.
 ///
 /// # Panics
 ///
 /// If `vertices` holds fewer than `side²`.
 pub(crate) fn bounds_of(vertices: &[GpuVertex], side: usize) -> GpuBounds {
+    bounds_with(vertices, side, true)
+}
+
+/// [`bounds_of`], its cone holding the morph triangles only if `morphs` (without, as the first
+/// cut of the raster had it, for the tests' bite check).
+///
+/// # Panics
+///
+/// If `vertices` holds fewer than `side²`.
+pub(crate) fn bounds_with(vertices: &[GpuVertex], side: usize, morphs: bool) -> GpuBounds {
     let points: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
     let mut lo = [f32::MAX; 3];
     let mut hi = [f32::MIN; 3];
@@ -156,10 +256,19 @@ pub(crate) fn bounds_of(vertices: &[GpuVertex], side: usize) -> GpuBounds {
     let extras = extra_triangles(side)
         .into_iter()
         .map(|[a, b, c]| face_normal(at(a), at(b), at(c)));
+    let morph_set = if morphs {
+        morph_triangles(side)
+    } else {
+        Vec::new()
+    };
+    let morph_normals = morph_set
+        .into_iter()
+        .map(|t| morph_normal(&points, side, t));
     let normals: Vec<[f32; 3]> = (0..quads * quads)
         .flat_map(|q| quad_triangles(&points, side, q % quads, q / quads))
         .map(|[a, b, c]| face_normal(a, b, c))
         .chain(extras)
+        .chain(morph_normals)
         .collect();
     let sum = normals
         .iter()
