@@ -114,10 +114,10 @@ impl MatCapStyle {
             } else {
                 0.0
             };
-            for (c, (albedo, tint)) in colour
+            let channels = colour
                 .iter_mut()
-                .zip(finish.albedo.iter().zip(light.colour))
-            {
+                .zip(finish.albedo.iter().zip(light.colour));
+            for (c, (albedo, tint)) in channels {
                 *c += tint * light.power * (albedo * diffuse + finish.sheen * highlight);
             }
         }
@@ -127,7 +127,8 @@ impl MatCapStyle {
         let reflected_up = 2.0 * facing_eye * n[1];
         let reflection = sky(reflected_up).map(|c| c * 4.0);
         let mirror = finish.mirror * fresnel;
-        for (c, r) in colour.iter_mut().zip(reflection) {
+        let reflected = colour.iter_mut().zip(reflection);
+        for (c, r) in reflected {
             *c += mirror * r;
         }
         // Clay darkens towards the outline, as a matte surface does where it turns away.
@@ -194,7 +195,8 @@ fn sky(up: f32) -> [f32; 3] {
     let above = [0.11, 0.115, 0.125];
     let t = (up * 0.5 + 0.5).clamp(0.0, 1.0);
     let mut colour = ground;
-    for (c, high) in colour.iter_mut().zip(above) {
+    let towards = colour.iter_mut().zip(above);
+    for (c, high) in towards {
         *c += (high - *c) * t;
     }
     colour
@@ -253,27 +255,28 @@ impl Image {
     fn halved(&self) -> Self {
         let side = (self.side / 2).max(1);
         let from = usize::try_from(self.side).unwrap_or(usize::MAX);
-        let mut texels = Vec::new();
-        for t in 0..side {
-            for s in 0..side {
-                let (s, t) = (
-                    usize::try_from(s).unwrap_or(0),
-                    usize::try_from(t).unwrap_or(0),
-                );
-                let corners = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(ds, dt)| {
-                    let at = (2 * t + dt).min(from - 1) * from + (2 * s + ds).min(from - 1);
-                    self.texels.get(at).copied().unwrap_or_default()
-                });
-                let mut mean = [0.0; 4];
-                for corner in corners {
-                    for (m, c) in mean.iter_mut().zip(corner) {
-                        *m += c / 4.0;
-                    }
+        let to = usize::try_from(side).unwrap_or(0);
+        let texel = |s: usize, t: usize| {
+            let at = t.min(from - 1) * from + s.min(from - 1);
+            self.texels.get(at).copied().unwrap_or_default()
+        };
+        let grid = (0..to).flat_map(|t| (0..to).map(move |s| (s, t)));
+        let means = grid.map(|(s, t)| {
+            let corners =
+                [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(ds, dt)| texel(2 * s + ds, 2 * t + dt));
+            let mut mean = [0.0; 4];
+            for corner in corners {
+                let channels = mean.iter_mut().zip(corner);
+                for (m, c) in channels {
+                    *m += c / 4.0;
                 }
-                texels.push(mean);
             }
+            mean
+        });
+        Self {
+            side,
+            texels: means.collect(),
         }
-        Self { side, texels }
     }
 }
 

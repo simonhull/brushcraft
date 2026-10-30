@@ -125,7 +125,8 @@ fn each_mip_level_halves_the_one_before_and_keeps_its_mean() {
         image.iter().map(|t| f64::from(t[0])).sum::<f64>() / n
     };
     let first = mean(levels[0].texels());
-    for (k, pair) in levels.windows(2).enumerate() {
+    let pairs = levels.windows(2).enumerate();
+    for (k, pair) in pairs {
         assert_eq!(pair[1].side(), pair[0].side() / 2, "level {k}");
         let next = mean(pair[1].texels());
         assert!(

@@ -59,7 +59,8 @@ fn chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
 pub(crate) fn encode(image: &Rgb) -> Vec<u8> {
     let width = usize::try_from(image.width).expect("small");
     let mut raw = Vec::new();
-    for row in image.pixels.chunks(width) {
+    let rows = image.pixels.chunks(width);
+    for row in rows {
         raw.push(0);
         raw.extend(row.iter().flatten());
     }
@@ -132,7 +133,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Rgb> {
     }
     let row = 1 + 3 * usize::try_from(width).ok()?;
     let mut pixels = Vec::new();
-    for line in raw.chunks(row) {
+    let lines = raw.chunks(row);
+    for line in lines {
         if line.first() != Some(&0) || line.len() != row {
             return None;
         }

@@ -379,8 +379,10 @@ fn images(gpu: &Gpu) -> Result<Texture, GpuError> {
             view_formats: &[],
         })
     })?;
-    for (layer, each) in (0..).zip(MatCapStyle::ALL) {
-        for (level, image) in (0..).zip(matcap::mips(each)) {
+    let styles = (0..).zip(MatCapStyle::ALL);
+    for (layer, each) in styles {
+        let levels = (0..).zip(matcap::mips(each));
+        for (level, image) in levels {
             let side = image.side();
             gpu.queue().write_texture(
                 TexelCopyTextureInfo {

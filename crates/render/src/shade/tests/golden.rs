@@ -224,7 +224,8 @@ fn the_matcap_goldens_match_their_files() {
                 errors.percentile(99)
             );
         };
-        for (k, (name, frame, _)) in frames.iter().enumerate() {
+        let numbered = frames.iter().enumerate();
+        for (k, (name, frame, _)) in numbered {
             let (other, _, golden) = &frames[(k + 1) % frames.len()];
             refused(&format!("{name} against {other}'s golden"), frame, golden);
         }
@@ -399,7 +400,9 @@ fn largest_screen_error(
 fn the_level_choice_s_shaded_frames_match_the_finest_level_and_stay_within_a_pixel_of_it() {
     GpuTest::run(|gpu| {
         let world = World::new(gpu);
-        for (k, view) in cameras().iter().enumerate() {
+        let views = cameras();
+        let numbered = views.iter().enumerate();
+        for (k, view) in numbered {
             let (reference, finest_surface) = finest(gpu, &world, view);
             let (image, surface) = chosen(gpu, &world, view, 1.0);
             let errors = flip(&reference, &image);

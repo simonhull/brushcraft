@@ -189,7 +189,8 @@ fn convolve(plane: &[f32], width: usize, weights: &[f32], along_rows: bool) -> V
     for y in 0..height {
         for x in 0..width {
             let mut sum = 0.0;
-            for (k, weight) in (-radius..=radius).zip(weights) {
+            let taps = (-radius..=radius).zip(weights);
+            for (k, weight) in taps {
                 let (sx, sy) = if along_rows {
                     (clamp(x, k, width), y)
                 } else {

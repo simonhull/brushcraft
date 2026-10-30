@@ -24,7 +24,6 @@ use crate::raster::tests::{
     World, draw_cut, finish, grown, level_choice, lod_frame, random_cut, random_view, refine,
 };
 use crate::raster::{RasterConfig, RasterFrame};
-use crate::tree::Place;
 
 mod flip;
 mod golden;
@@ -270,7 +269,8 @@ fn disagreements(gpu: &Gpu, shade: &Shade, raster: &Raster) -> (usize, usize) {
     let pixels = probe(gpu, shade);
     let mut wrong = 0;
     let mut drawn = 0;
-    for ((&id, &drawn_depth), rebuilt) in ids.iter().zip(&depth).zip(&pixels) {
+    let compared = ids.iter().zip(&depth).zip(&pixels);
+    for ((&id, &drawn_depth), rebuilt) in compared {
         match (id == crate::raster::BACKGROUND, rebuilt) {
             (true, None) => {}
             (false, Some(p)) => {
@@ -377,8 +377,8 @@ fn scenes(gpu: &Gpu, world: &World) -> Vec<Drawn> {
     let (view, _) = random_view(&mut rng, (2.0, 2.6));
     let coarse = random_cut(&mut rng, world, 3);
     let mut fine = coarse.clone();
-    let tiles: Vec<Place> = coarse.iter().copied().collect();
-    for place in tiles.into_iter().step_by(3) {
+    let every_third = coarse.iter().copied().step_by(3);
+    for place in every_third {
         if place.level() < world.finest {
             refine(&mut fine, place);
         }
@@ -485,7 +485,8 @@ fn the_rebuilt_normals_are_unit_and_face_the_way_the_sphere_does() {
         shade_frame(gpu, &mut shade, &world, &scene.raster, &scene.view);
         let eye = scene.view.eye();
         let mut checked = 0;
-        for p in probe(gpu, &shade).into_iter().flatten() {
+        let rebuilt = probe(gpu, &shade).into_iter().flatten();
+        for p in rebuilt {
             let n = p.normal;
             let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             assert!((length - 1.0).abs() < 1e-4, "unit: {length}");
