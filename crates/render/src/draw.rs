@@ -67,8 +67,11 @@ pub enum Scene<'a> {
     Draw(&'a SceneInputs<'a>),
     /// Shows the last scene drawn again, shaded with this frame's [`Look`]: the shading pass
     /// alone, no level choice or raster, for a change of material or wireframe with nothing else
-    /// changed (spec target: a shading pass only, independent of the mesh). Shows no scene if the
-    /// last one drawn was of another size than the frame, or there was none.
+    /// changed (spec target: a shading pass only, independent of the mesh). Shows no scene
+    /// ([`Drawn::shown`] false) if the last one drawn was of another size than the frame, or there
+    /// was none, or the frame brings uploads: those may change the tiles the visibility buffer's
+    /// ids name, so shading the last scene again would read data it wasn't drawn from. Send such
+    /// a frame as [`Scene::Draw`].
     Reshade,
 }
 
@@ -291,6 +294,7 @@ impl Renderer {
         let showing = Showing {
             look: inputs.look,
             size: inputs.size,
+            staged: uploads.as_ref().is_some_and(|uploads| !uploads.is_empty()),
         };
         let outcome = gpu.scoped("encoding a frame", || {
             let commands = gpu
@@ -360,6 +364,8 @@ struct Showing {
     look: Look,
     /// The frame's size.
     size: Size,
+    /// Whether the frame brings uploads: a scene shaded again must not.
+    staged: bool,
 }
 
 /// Encodes `scene` with `passes` into `frame`, after the uploads (drawn, or shaded again), and
@@ -396,7 +402,8 @@ fn encode_scene(
             let visibility = passes.raster().visibility();
             let same_size = (visibility.width(), visibility.height())
                 == (showing.size.width(), showing.size.height());
-            let visible = same_size && (!shaded || passes.encode_shading_again(gpu, frame)?);
+            let unchanged = same_size && !showing.staged;
+            let visible = unchanged && (!shaded || passes.encode_shading_again(gpu, frame)?);
             Ok(EncodedScene {
                 readback: None,
                 shown: visible,

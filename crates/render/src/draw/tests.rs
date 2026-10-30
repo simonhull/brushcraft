@@ -363,25 +363,26 @@ fn a_frame_shading_the_last_scene_again_shows_it_in_the_new_look_without_drawing
         let mut clay = draw_scene(gpu, &world, size, eye, at, styled(MatCapStyle::Clay));
         let glossy = draw_scene(gpu, &world, size, eye, at, styled(MatCapStyle::Glossy));
         assert_ne!(clay.pixels, glossy.pixels, "the styles differ");
-        let again = |frame: &mut SceneFrame, at_size: Size, look: Look| {
-            let inputs = FrameInputs {
-                size: at_size,
-                clear: CLEAR,
-                overlay: None,
-                overlay_scale: 1,
-                scene: Scene::Reshade,
-                look,
+        let again =
+            |frame: &mut SceneFrame, at_size: Size, look: Look, uploads: Option<FrameUploads>| {
+                let inputs = FrameInputs {
+                    size: at_size,
+                    clear: CLEAR,
+                    overlay: None,
+                    overlay_scale: 1,
+                    scene: Scene::Reshade,
+                    look,
+                };
+                let drawn = frame
+                    .renderer
+                    .draw(gpu, &mut frame.target, &inputs, uploads, || {})
+                    .expect("drawn");
+                gpu.device()
+                    .poll(PollType::wait_indefinitely())
+                    .expect("the GPU finishes");
+                drawn
             };
-            let drawn = frame
-                .renderer
-                .draw(gpu, &mut frame.target, &inputs, None, || {})
-                .expect("drawn");
-            gpu.device()
-                .poll(PollType::wait_indefinitely())
-                .expect("the GPU finishes");
-            drawn
-        };
-        let drawn = again(&mut clay, size, styled(MatCapStyle::Glossy));
+        let drawn = again(&mut clay, size, styled(MatCapStyle::Glossy), None);
         assert!(!drawn.scene, "no level choice or raster");
         assert!(drawn.shown, "the scene shown");
         assert_eq!(
@@ -389,13 +390,20 @@ fn a_frame_shading_the_last_scene_again_shows_it_in_the_new_look_without_drawing
             glossy.pixels,
             "as if drawn whole in the new look"
         );
-        // At another size there is nothing to shade again: the clear colour alone.
-        let other = Size::new(64, 48).expect("non-zero");
-        let resized = again(&mut clay, other, styled(MatCapStyle::Pale));
-        assert!(!resized.shown, "nothing shown");
+        // A frame bringing uploads may change what the ids name: refused, the clear colour alone.
         let clear = [srgb(CLEAR.r), srgb(CLEAR.g), srgb(CLEAR.b), 255];
+        let (_residency, uploads) = floor_uploads(gpu);
+        assert!(!uploads.is_empty(), "uploads staged");
+        let staged = again(&mut clay, size, styled(MatCapStyle::Pale), Some(uploads));
+        assert!(!staged.shown, "not shaded from stale data");
         let image = pixels(gpu, &clay.target);
         assert!(image.iter().all(|&p| near(p, clear)), "the clear colour");
+        // At another size there is nothing to shade again either.
+        let other = Size::new(64, 48).expect("non-zero");
+        let resized = again(&mut clay, other, styled(MatCapStyle::Pale), None);
+        assert!(!resized.shown, "nothing shown");
+        let smaller = pixels(gpu, &clay.target);
+        assert!(smaller.iter().all(|&p| near(p, clear)), "the clear colour");
     });
 }
 

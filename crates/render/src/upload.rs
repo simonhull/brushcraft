@@ -705,10 +705,10 @@ impl FrameUploads {
         self.bytes
     }
 
-    /// Whether nothing was staged.
+    /// Whether nothing was staged: no copies and no normal pass.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.copies.is_empty()
+        self.copies.is_empty() && self.normals.is_none()
     }
 
     /// The same uploads, for a frame whose passes don't run the level choice (a frame with no
