@@ -19,6 +19,7 @@ use store::JobsReport;
 
 use crate::camera::{Camera, Vec3};
 use crate::frame::{FeedStats, OwnerPhases};
+use crate::pick::Report as PickReport;
 
 /// Everything the overlay reports about one frame.
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +52,8 @@ pub(crate) struct Snapshot<'a> {
     pub(crate) camera: Camera,
     /// How the scene is shown.
     pub(crate) look: Look,
+    /// The last pick under the pointer; `None` if the frame loop doesn't pick.
+    pub(crate) pick: Option<&'a PickReport>,
 }
 
 /// `duration` in milliseconds, to two places.
@@ -79,6 +82,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         scene,
         camera,
         look,
+        pick,
     } = *snapshot;
     let view = match look.view {
         SceneView::Shaded => format!("matcap {}", look.material.name()),
@@ -134,6 +138,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         format!(
             "look       {view}  wireframe {wireframe}  (keys: M matcap, W wireframe, C clusters)"
         ),
+        format!("pick       {}", crate::pick::summary(pick)),
     ]
 }
 
@@ -293,6 +298,7 @@ mod tests {
                 shading: render::shade::ShadeSettings { wireframe: true },
                 material: render::material::MatCapStyle::Glossy,
             },
+            pick: None,
         };
         let text = lines(&snapshot).join("\n");
         for expected in [
@@ -307,6 +313,7 @@ mod tests {
             "no cut read back yet",
             "eye (0.00, 0.00, 3.00)",
             "matcap glossy  wireframe on",
+            "pick       off (no spatial index)",
         ] {
             assert!(text.contains(expected), "{expected:?} in:\n{text}");
         }

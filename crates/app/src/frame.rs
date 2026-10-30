@@ -4,7 +4,8 @@
 //! [`Owner`] holds the project, so it lives on the one thread that may touch the store, and
 //! makes each frame in a fixed order:
 //!
-//! 1. **input**: the pointer input queued since the last frame moves the camera;
+//! 1. **input**: the pointer input queued since the last frame moves the camera, then the surface
+//!    under the pointer is picked if the pointer or the view changed ([`crate::pick`]);
 //! 2. **brush**: a seam for M1a4's brush step ([`Brush`]; [`NoBrush`] until then), which sees the
 //!    camera as the input left it;
 //! 3. **feed**: the stale-tile feed is drained: the epochs closed since the last frame;
@@ -52,9 +53,10 @@ use render::{DrawTimes, Look, SceneView};
 use store::{Drained, JobsReport, Project, StaleCursor, TileStore};
 
 use self::schedule::{Next, Reason, Reasons, Scheduler};
-use crate::camera::{Arcball, Camera};
+use crate::camera::{Arcball, Camera, Pixel};
 use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
+use crate::pick::Picker;
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
 
 /// The brush's place in the frame: M1a4's brush step, run on the owner thread after input and
@@ -309,6 +311,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// Whether the last frame finished showed a scene (drawn or shaded again), which a frame
     /// shading it again needs.
     scene_shown: bool,
+    /// Picks the surface under the pointer in the input phase; `None` if the loop doesn't pick.
+    picker: Option<Picker>,
 }
 
 /// Every frame's phase times in a scripted run, for the summary printed at its end.
@@ -428,6 +432,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             clock: now,
             look: Look::default(),
             scene_shown: false,
+            picker: None,
         }
     }
 
@@ -449,7 +454,38 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if self.navigator.may_move(&self.input, &input) {
             self.scheduler.want(Reason::Input);
         }
+        if let Input::Move { at } | Input::Press { at, .. } = input {
+            self.point(Some(at));
+        }
         self.input.push(input);
+    }
+
+    /// The pointer left the window: nothing is under it to pick.
+    pub(crate) fn pointer_left(&mut self) {
+        self.point(None);
+    }
+
+    /// The pointer is at `at` (`None`: outside the window): the picker hears of it, and a frame
+    /// is wanted for the overlay's pick line if that moved it.
+    fn point(&mut self, at: Option<Pixel>) {
+        if let Some(picker) = &mut self.picker
+            && picker.point(at)
+        {
+            self.scheduler.want(Reason::Pick);
+        }
+    }
+
+    /// This frame loop picking the surface under the pointer with `picker` ([`crate::pick`]).
+    #[must_use]
+    pub(crate) fn with_picker(mut self, picker: Picker) -> Self {
+        self.picker = Some(picker);
+        self
+    }
+
+    /// The picker, if the loop picks.
+    #[cfg(test)]
+    pub(crate) const fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
     }
 
     /// The frame size changed to `size` (`None`: the window has none, so no frames).
@@ -535,13 +571,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         };
         let mut lap = Lap::new();
 
-        let arcball = Arcball::new(size);
-        let height = f64::from(size.height());
-        let input = std::mem::take(&mut self.input);
-        for event in input {
-            self.navigator
-                .apply(event, &mut self.camera, &arcball, height);
-        }
+        self.take_input(size)?;
         phases.input = lap.next();
 
         self.brush
@@ -567,8 +597,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .apply(update, self.project.store())
             .context("uploading tiles")?;
         phases.uploads = lap.next();
+        let shading_only = Reasons::default().with(Reason::Look).with(Reason::Pick);
         let reshade = self.scene_shown
-            && reasons == Reasons::default().with(Reason::Look)
+            && !reasons.is_empty()
+            && reasons.within(shading_only)
             && !moved
             && quiet(&uploads);
         let resident = uploads.scene.take().filter(|_| !reshade);
@@ -595,6 +627,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             scene: self.uploads.scene(),
             camera: self.camera,
             look: self.look,
+            pick: self.picker.as_ref().map(Picker::report),
         };
         let overlay = overlay::lines(&snapshot);
         hand_off(FrameRequest {
@@ -630,6 +663,29 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
 
         self.want_next(&uploads);
+        Ok(())
+    }
+
+    /// The input phase of a frame of `size`: the input queued since the last frame moves the
+    /// camera, then the surface under the pointer is picked if the pointer or the view changed.
+    ///
+    /// # Errors
+    ///
+    /// If the pick can't evaluate a tile.
+    fn take_input(&mut self, size: Size) -> Result<()> {
+        let arcball = Arcball::new(size);
+        let height = f64::from(size.height());
+        let input = std::mem::take(&mut self.input);
+        for event in input {
+            self.navigator
+                .apply(event, &mut self.camera, &arcball, height);
+        }
+        if let Some(picker) = &mut self.picker {
+            let view = self.camera.view(size);
+            picker
+                .update(self.project.store(), view.as_ref())
+                .context("picking")?;
+        }
         Ok(())
     }
 

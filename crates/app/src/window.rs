@@ -234,7 +234,10 @@ impl WindowApp {
                     ctrl: state.control_key(),
                 }));
             }
-            WindowEvent::PointerMoved { position, .. } => owner.input(Input::Move {
+            WindowEvent::PointerLeft { .. } => owner.pointer_left(),
+            // Physical pixels, as the frame size: the mouse's, and the pen's while it hovers.
+            WindowEvent::PointerMoved { position, .. }
+            | WindowEvent::PointerEntered { position, .. } => owner.input(Input::Move {
                 at: Pixel {
                     x: position.x,
                     y: position.y,

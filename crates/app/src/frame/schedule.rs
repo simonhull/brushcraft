@@ -52,11 +52,14 @@ pub(crate) enum Reason {
     /// How the scene is shown changed (the material, the wireframe, the debug view): a frame
     /// wanted for this alone shades the last scene again, with no raster.
     Look,
+    /// The pointer moved, so the overlay's pick line changes ([`crate::pick`]): like
+    /// [`Reason::Look`], a frame wanted for this alone shades the last scene again.
+    Pick,
 }
 
 impl Reason {
     /// This reason's bit in [`Reasons`].
-    const fn bit(self) -> u8 {
+    const fn bit(self) -> u16 {
         match self {
             Self::Input => 1,
             Self::Exposed => 1 << 1,
@@ -66,13 +69,14 @@ impl Reason {
             Self::Morphing => 1 << 5,
             Self::Scripted => 1 << 6,
             Self::Look => 1 << 7,
+            Self::Pick => 1 << 8,
         }
     }
 }
 
 /// A set of [`Reason`]s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct Reasons(u8);
+pub(crate) struct Reasons(u16);
 
 impl Reasons {
     /// Whether the set is empty.
@@ -83,6 +87,11 @@ impl Reasons {
     /// Whether `reason` is in the set.
     pub(crate) const fn contains(self, reason: Reason) -> bool {
         self.0 & reason.bit() != 0
+    }
+
+    /// Whether every reason in the set is also in `other`.
+    pub(crate) const fn within(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
     }
 
     /// The set with `reason` added.
@@ -104,6 +113,7 @@ impl fmt::Display for Reasons {
             (Reason::Morphing, "morphing"),
             (Reason::Scripted, "scripted"),
             (Reason::Look, "look"),
+            (Reason::Pick, "pick"),
         ];
         let names: Vec<&str> = all
             .into_iter()
@@ -612,5 +622,18 @@ mod tests {
             .with(Reason::Requests)
             .with(Reason::Uploads);
         assert_eq!(busy.to_string(), "uploads+requests+morphing");
+    }
+
+    #[test]
+    fn a_set_is_within_another_holding_all_its_reasons() {
+        let shading = Reasons::default().with(Reason::Look).with(Reason::Pick);
+        assert_eq!(shading.to_string(), "look+pick");
+        let pick = Reasons::default().with(Reason::Pick);
+        assert!(pick.within(shading), "a pick alone shades again");
+        assert!(Reasons::default().within(shading), "the empty set");
+        assert!(
+            !pick.with(Reason::Input).within(shading),
+            "input draws the scene"
+        );
     }
 }

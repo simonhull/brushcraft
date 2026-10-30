@@ -9,8 +9,9 @@
 //! resident tiles to draw, the raster draws their clusters into a visibility buffer, and the
 //! shading pass shades it through a MatCap into a linear HDR image, tone mapped, under the debug
 //! overlay ([`overlay`]); the camera orbits, pans and zooms with the mouse and the pen
-//! ([`navigate`], [`camera`]). Keys change how the scene is shown (M the MatCap, W the
-//! wireframe, C the debug view of a colour per cluster), each a shading pass alone.
+//! ([`navigate`], [`camera`]), and the overlay shows the point of the surface under the
+//! pointer, picked by the spatial index ([`pick`]). Keys change how the scene is shown (M the
+//! MatCap, W the wireframe, C the debug view of a colour per cluster), each a shading pass alone.
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
@@ -22,6 +23,7 @@ mod frame;
 mod navigate;
 mod overlay;
 mod paths;
+mod pick;
 mod render_thread;
 #[cfg(test)]
 mod test_dir;
@@ -42,6 +44,7 @@ use winit::event_loop::EventLoop;
 use crate::cli::{Mode, Options};
 use crate::frame::schedule::Next;
 use crate::frame::{NoBrush, Owner, Setup, Uploads as _};
+use crate::pick::Picker;
 use crate::render_thread::{Hooks, RenderThread};
 use crate::uploads::GpuResidency;
 use crate::window::WindowApp;
@@ -53,21 +56,24 @@ const SITE: u16 = 1;
 pub(crate) type AppOwner = Owner<NoBrush, GpuResidency>;
 
 /// The frame loop over `project` as `setup` says, its tiles kept on `gpu`, wanting its first
-/// frame now.
+/// frame now, picking the surface under the pointer by the project's spatial index.
 ///
 /// # Errors
 ///
 /// If GPU residency or the scene's passes (the level choice, the raster) can't be set up on
-/// this GPU: at startup, never mid-session. The project is closed first.
+/// this GPU, or the spatial index can't be loaded: at startup, never mid-session. The project
+/// is closed first.
 pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, setup: Setup) -> Result<AppOwner> {
-    match GpuResidency::new(gpu, project.store()) {
-        Ok(residency) => Ok(Owner::new(
-            project,
-            NoBrush,
-            residency,
-            setup,
-            Instant::now(),
-        )),
+    let ready = GpuResidency::new(gpu, project.store())
+        .and_then(|residency| Ok((residency, Picker::load(&mut project)?)));
+    match ready {
+        Ok((residency, picker)) => {
+            let owner = Owner::new(project, NoBrush, residency, setup, Instant::now());
+            Ok(match picker {
+                Some(picker) => owner.with_picker(picker),
+                None => owner,
+            })
+        }
         Err(error) => {
             let keep = project.has_unsaved_edits();
             match project.close(keep) {
