@@ -355,20 +355,24 @@ pub(crate) fn settle(from: Option<u64>, changed: Option<u64>, heard: Option<u64>
     from.max(changed).filter(|&frame| heard < Some(frame))
 }
 
-/// The overlay's line for what the GPU holds: resident tiles (the floor's of
-/// `floor_tiles`), slot memory, what is still wanted and pending, and what the last frame
-/// staged.
+/// The overlay's line for what the GPU holds.
+///
+/// Resident tiles (the floor's of `floor_tiles`), slot memory used of that allocated (the
+/// floor's classes are allocated twice over, for a resync, so used is below allocated even when
+/// every tile is resident), what is still wanted and pending, and what the last frame staged.
 pub(crate) fn summary(stats: &ResidencyStats, floor_tiles: usize) -> String {
     #[expect(
         clippy::cast_precision_loss,
         reason = "byte counts shown to two places in MiB: far below f64's exact range"
     )]
-    let (allocated, staged) = (
+    let (used, allocated, staged) = (
+        stats.used_bytes as f64 / MIB,
         stats.allocated_bytes as f64 / MIB,
         stats.staged_bytes as f64 / MIB,
     );
     format!(
-        "{} resident (floor {}/{floor_tiles})  {allocated:.1} MiB  {} wanted  {} epochs \
+        "{} resident (floor {}/{floor_tiles})  {used:.1} of {allocated:.1} MiB used  {} \
+         wanted  {} epochs \
          pending  staged {staged:.2} MiB  {} evicted  {} lost frames",
         stats.resident,
         stats.floor,
@@ -490,6 +494,22 @@ mod tests {
             settle(Some(6), None, Some(9)),
             None,
             "a later readback will do"
+        );
+    }
+
+    #[test]
+    fn the_tiles_line_shows_slot_memory_used_and_allocated() {
+        let stats = ResidencyStats {
+            resident: 7,
+            floor: 5,
+            used_bytes: 3 << 20,
+            allocated_bytes: 10 << 20,
+            ..ResidencyStats::default()
+        };
+        let line = summary(&stats, 5);
+        assert!(
+            line.starts_with("7 resident (floor 5/5)  3.0 of 10.0 MiB used  0 wanted"),
+            "{line}"
         );
     }
 
