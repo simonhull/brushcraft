@@ -34,6 +34,16 @@ pub(crate) const ROUND_MAX: usize = 8;
 /// millisecond, the rest of the slice being collecting and handing out.
 const ROUND_TIME: Duration = Duration::from_micros(250);
 
+/// The most tiles a round of the queued evaluation holds when it has the jobs to itself.
+///
+/// The display jobs then have nothing to do on the owner thread, so a round may take the
+/// frame's idle time (see [`ConeSteps::round_alone`]).
+pub(crate) const ROUND_MAX_ALONE: usize = 64;
+
+/// The longest a round of the queued evaluation is made to take when it has the jobs to
+/// itself: a few milliseconds of a frame's jobs phase, and never past the call's deadline.
+pub(crate) const ROUND_TIME_ALONE: Duration = Duration::from_millis(4);
+
 /// What evaluating a tile is assumed to take before a job has measured it.
 const TILE_COST: Duration = Duration::from_micros(150);
 
@@ -230,6 +240,18 @@ impl ConeSteps {
             .unwrap_or(usize::MAX)
             .min(free)
             .clamp(1, ROUND_MAX)
+    }
+
+    /// How many tiles the next round of the queued evaluation holds when it has the jobs to
+    /// itself, with `left` before the call's deadline: as many as fit in the lesser of `left`
+    /// and [`ROUND_TIME_ALONE`] at the cost measured lately, at least one, at most
+    /// [`ROUND_MAX_ALONE`]. The workers aren't counted: a round's cone spreads over them.
+    pub(crate) fn round_alone(&self, left: Duration) -> usize {
+        let time = left.min(ROUND_TIME_ALONE);
+        let fits = time.as_nanos() / self.tile_cost.as_nanos().max(1);
+        usize::try_from(fits)
+            .unwrap_or(usize::MAX)
+            .clamp(1, ROUND_MAX_ALONE)
     }
 
     /// Notes that a round of `tiles` tiles took `wall`, for [`ConeSteps::round_size`].

@@ -164,13 +164,22 @@ impl TileStore {
     /// [`TileStore::step_cone`]) and, once it is current, computes their normals and copies
     /// them for the caller.
     ///
+    /// `alone` is the time left before the call's deadline when the display jobs have nothing
+    /// to do on the owner thread: the round then grows to fit it, up to
+    /// [`ROUND_TIME_ALONE`](crate::jobs::ROUND_TIME_ALONE). Beside the display jobs (`None`),
+    /// a round is sized as a display job's.
+    ///
     /// # Errors
     ///
     /// As [`TileStore::evaluate_many`] and [`TileStore::prefetch`]; the tiles stay queued.
-    pub(super) fn evaluation_slice(&mut self, report: &mut JobsReport) -> Result<Turn, CacheError> {
+    pub(super) fn evaluation_slice(
+        &mut self,
+        report: &mut JobsReport,
+        alone: Option<Duration>,
+    ) -> Result<Turn, CacheError> {
         let caps = self.evaluation.caps;
         let mut queue = std::mem::replace(&mut self.evaluation, EvaluationQueue::new(caps));
-        let turn = self.evaluation_step(&mut queue, report);
+        let turn = self.evaluation_step(&mut queue, report, alone);
         self.evaluation = queue;
         turn
     }
@@ -184,6 +193,7 @@ impl TileStore {
         &mut self,
         queue: &mut EvaluationQueue,
         report: &mut JobsReport,
+        alone: Option<Duration>,
     ) -> Result<Turn, CacheError> {
         #[cfg(test)]
         if !self.hooks.hold_evaluated {
@@ -202,9 +212,13 @@ impl TileStore {
         // tiles (one at least) and the round's time at the cost measured lately, and the cone
         // is of that many tiles, so a slice evaluates no more than one round, its normals or,
         // past an evicted cone, that many tiles whole.
-        let workers = self.workers.current_num_threads().max(1);
-        let busy: usize = self.jobs.iter_mut().map(|job| job.upkeep().busy()).sum();
-        let round = queue.steps.round_size(workers.saturating_sub(busy).max(1));
+        let round = if let Some(left) = alone {
+            queue.steps.round_alone(left)
+        } else {
+            let workers = self.workers.current_num_threads().max(1);
+            let busy: usize = self.jobs.iter_mut().map(|job| job.upkeep().busy()).sum();
+            queue.steps.round_size(workers.saturating_sub(busy).max(1))
+        };
         let first = queue.first(room.min(round));
         let mut keys = match self.step_cone(&mut queue.steps, || first, round)? {
             ConeStep::Round => return Ok(Turn::Worked),
@@ -214,6 +228,9 @@ impl TileStore {
         // Highest priority first, as they are handed over; withdrawn ones left out.
         keys.retain(|key| queue.priority(key).is_some());
         keys.sort_by_key(|key| (Reverse(queue.priority(key)), *key));
+        // A cone listed for a larger round (the job had the jobs to itself then) finishes a
+        // round's worth now; the rest stay queued, current, for the next slices.
+        keys.truncate(round);
         if keys.is_empty() {
             return Ok(Turn::Idle);
         }
@@ -227,8 +244,8 @@ impl TileStore {
             .collect();
         if !with_normals.is_empty() {
             self.evaluate_many(&with_normals, Evaluation::Normals)?;
+            queue.steps.took(t0.elapsed(), with_normals.len());
         }
-        queue.steps.took(t0.elapsed(), keys.len());
         for key in keys {
             let priority = queue
                 .priority(&key)

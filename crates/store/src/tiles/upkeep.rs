@@ -615,7 +615,10 @@ impl TileStore {
     /// gives its turn to the other; only when neither has anything to do does the call wait,
     /// until a display tile is finished, a moment for reads, or the deadline. The turn carries
     /// across calls (a call's first slice goes to the side that didn't run last), so neither
-    /// side starves however short the calls.
+    /// side starves however short the calls. With the display jobs idle or waiting on the
+    /// workers, a slice of the queued evaluation grows to fit the time left (up to a few
+    /// milliseconds, at the cost it measured lately), so its rounds keep up with a renderer's
+    /// requests; beside display work, it is a display job's size.
     ///
     /// # Errors
     ///
@@ -680,7 +683,12 @@ impl TileStore {
                 .begin_turn(run_queue, display_ready && queue_ready);
             let began = Instant::now();
             if run_queue {
-                let turn = self.evaluation_slice(report);
+                // With the display jobs idle or waiting on the workers, a round may take more of
+                // the time left.
+                let left = deadline.saturating_duration_since(self.now());
+                let alone =
+                    (!display_ready).then_some(left.saturating_sub(crate::jobs::WAKE_MARGIN));
+                let turn = self.evaluation_slice(report, alone);
                 note_slice(report, began.elapsed());
                 #[cfg(test)]
                 self.hooks.end_turn(work);
@@ -1293,11 +1301,8 @@ impl TileStore {
         if let Some(stale) = coarsest
             && !stale.iter().any(|key| steps.seen.contains(key))
         {
-            self.prefetch(
-                stale
-                    .get(..stale.len().min(PREFETCH_AHEAD))
-                    .unwrap_or_default(),
-            )?;
+            let ahead = PREFETCH_AHEAD.max(2 * round);
+            self.prefetch(stale.get(..stale.len().min(ahead)).unwrap_or_default())?;
             self.poll()?;
             let mut ready: Vec<TileKey> = stale
                 .iter()

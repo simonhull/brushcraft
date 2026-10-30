@@ -11,7 +11,7 @@ use geom::gather_block;
 use super::super::hooks::{TestClock, Turned};
 use super::*;
 use crate::JobsReport;
-use crate::jobs::ROUND_MAX;
+use crate::jobs::{ROUND_MAX, ROUND_MAX_ALONE};
 use crate::queued::{EvaluatedTile, EvaluationCaps};
 
 /// Every finest tile of the cube, each with a priority from `seed`, all distinct.
@@ -305,11 +305,27 @@ fn run_jobs_keeps_its_deadline_in_slices_and_both_jobs_move_on_together() {
         assert!(began.elapsed() < Duration::from_secs(60), "the jobs end");
     }
     let turns = &store.hooks.turns;
+    // A round beside work of the display jobs' is theirs at most; the queue alone may take
+    // more of the time left.
     let heavy: Vec<&Turned> = turns
         .iter()
-        .filter(|turn| turn.positions > ROUND_MAX || turn.normals > ROUND_MAX)
+        .filter(|turn| {
+            let most = if turn.contested {
+                ROUND_MAX
+            } else {
+                ROUND_MAX_ALONE
+            };
+            turn.positions > most || turn.normals > most
+        })
         .collect();
     assert!(heavy.is_empty(), "no slice past a round: {heavy:?}");
+    assert!(
+        turns
+            .iter()
+            .filter(|turn| turn.contested)
+            .all(|turn| turn.positions <= ROUND_MAX && turn.normals <= ROUND_MAX),
+        "beside the display jobs, a display job's round"
+    );
     assert!(
         turns.iter().any(|turn| turn.positions > 0),
         "slices evaluated"
