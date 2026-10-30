@@ -538,8 +538,10 @@ impl View {
         let shift = [-2.0 * jitter.x / width, 2.0 * jitter.y / height];
         let mut clip_from_world = self.clip_from_world;
         let [r0, r1, _, r3] = &mut clip_from_world.rows;
-        for (row, by) in [r0, r1].into_iter().zip(shift) {
-            for (value, last) in row.iter_mut().zip(*r3) {
+        let shifted_rows = [r0, r1].into_iter().zip(shift);
+        for (row, by) in shifted_rows {
+            let entries = row.iter_mut().zip(*r3);
+            for (value, last) in entries {
                 *value += by * last;
             }
         }

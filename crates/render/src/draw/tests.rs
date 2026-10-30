@@ -216,6 +216,21 @@ fn a_frame_with_no_image_still_submits_its_uploads() {
 }
 
 #[test]
+fn the_clear_colour_is_stored_encoded_where_the_tone_map_encodes() {
+    let srgb_format = TextureFormat::Rgba8UnormSrgb;
+    assert_eq!(
+        stored_clear(CLEAR, srgb_format),
+        CLEAR,
+        "the hardware encodes it"
+    );
+    let stored = stored_clear(CLEAR, TextureFormat::Bgra8Unorm);
+    let codes = [stored.r, stored.g, stored.b].map(|c| (c * 255.0).round());
+    let wanted = [CLEAR.r, CLEAR.g, CLEAR.b].map(|c| f64::from(srgb(c)));
+    assert_eq!(codes, wanted, "as the tone map's sRGB encoding stores it");
+    assert!((stored.a - CLEAR.a).abs() < f64::EPSILON);
+}
+
+#[test]
 fn a_text_image_holds_exactly_its_texels() {
     assert!(TextImage::new(3, 2, vec![0; 5]).is_none());
     let image = TextImage::new(3, 2, vec![0, 1, 2, 3, 4, 5]).expect("six texels");

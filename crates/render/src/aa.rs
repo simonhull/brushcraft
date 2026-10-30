@@ -197,26 +197,33 @@ pub(crate) enum AaFrame {
     Show,
 }
 
-/// The renderer's side of accumulation: whether the histories are of the look and size being
-/// shown, and the jitter the last raster used.
+/// What a shaded image depends on beside the scene: its look, its size, and the display's scale
+/// (the wireframe's lines are as many pixels a point). Histories continue only while it stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shown {
+    /// The look.
+    pub(crate) look: Look,
+    /// The size.
+    pub(crate) size: Size,
+    /// Frame pixels a point.
+    pub(crate) scale: u32,
+}
+
+/// The renderer's side of accumulation: whether the histories are of the image being shown,
+/// and the jitter the last raster used.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AaState {
-    /// The look and size the histories hold; `None` when there are none to continue.
-    held: Option<(Look, Size)>,
+    /// What the histories show; `None` when there are none to continue.
+    held: Option<Shown>,
     /// The index of the jitter the last raster used.
     index: u32,
 }
 
 impl AaState {
-    /// A frame drawing its scene with the camera `still` or not, shown as `look` at `size`; with
-    /// `accumulable` false (the histories don't fit), filtered even when still.
-    pub(crate) fn draw(
-        &mut self,
-        still: bool,
-        accumulable: bool,
-        look: Look,
-        size: Size,
-    ) -> AaFrame {
+    /// A frame drawing its scene with the camera `still` or not, `shown` so; with `accumulable`
+    /// false (the histories don't fit), filtered even when still.
+    pub(crate) fn draw(&mut self, still: bool, accumulable: bool, shown: Shown) -> AaFrame {
+        let look = shown.look;
         if look.view != SceneView::Shaded || !still || !accumulable {
             self.held = None;
             self.index = 0;
@@ -226,25 +233,25 @@ impl AaState {
                 AaFrame::Plain
             };
         }
-        let continuing = self.held == Some((look, size));
+        let continuing = self.held == Some(shown);
         self.index = if continuing {
             (self.index + 1) % SAMPLES
         } else {
             0
         };
-        self.held = Some((look, size));
+        self.held = Some(shown);
         AaFrame::Accumulate {
             jitter: jitter(self.index),
             restart: !continuing,
         }
     }
 
-    /// A frame shading the last scene again, shown as `look` at `size`: nothing to do if the
+    /// A frame shading the last scene again, `shown` so: nothing to do if the
     /// histories are already of it ([`AaFrame::Show`]); otherwise the shading again is the first
     /// sample of new histories, at the last raster's jitter. With `accumulable` false, the shading
     /// again is filtered.
-    pub(crate) fn reshade(&mut self, accumulable: bool, look: Look, size: Size) -> AaFrame {
-        if look.view != SceneView::Shaded {
+    pub(crate) fn reshade(&mut self, accumulable: bool, shown: Shown) -> AaFrame {
+        if shown.look.view != SceneView::Shaded {
             self.held = None;
             return AaFrame::Plain;
         }
@@ -252,10 +259,10 @@ impl AaState {
             self.held = None;
             return AaFrame::Filter;
         }
-        if self.held == Some((look, size)) {
+        if self.held == Some(shown) {
             return AaFrame::Show;
         }
-        self.held = Some((look, size));
+        self.held = Some(shown);
         AaFrame::Accumulate {
             jitter: jitter(self.index),
             restart: true,

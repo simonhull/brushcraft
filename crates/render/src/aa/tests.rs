@@ -339,7 +339,8 @@ fn supersampled(gpu: &Gpu, world: &World, eye: Vec3, size: Size, grid: u32) -> V
     let jitters = (0..grid * grid).map(|k| Jitter::new(offset(k % grid), offset(k / grid)));
     let frames: Vec<Option<Jitter>> = std::iter::repeat_n(None, warm).chain(jitters).collect();
     let mut generation = 0;
-    for (frame, jitter) in (1_u64..).zip(&frames) {
+    let numbered = (1_u64..).zip(&frames);
+    for (frame, jitter) in numbered {
         let bounds = BoundsUpdate::since(&world.tree, generation);
         generation = bounds.generation();
         let scene = SceneInputs {
@@ -370,8 +371,10 @@ fn supersampled(gpu: &Gpu, world: &World, eye: Vec3, size: Size, grid: u32) -> V
         finish(gpu);
         if jitter.is_some() {
             let shaded = read_shaded(gpu, passes.shade());
-            for (total, texel) in sum.iter_mut().zip(shaded) {
-                for (t, c) in total.iter_mut().zip(texel) {
+            let totals = sum.iter_mut().zip(shaded);
+            for (total, texel) in totals {
+                let channels = total.iter_mut().zip(texel);
+                for (t, c) in channels {
                     *t += c;
                 }
             }
@@ -425,7 +428,8 @@ fn the_jitters_are_the_halton_points_about_the_pixels_centre() {
     assert_eq!(jitter(0), Jitter::CENTRE, "the first sample is the centre");
     assert_eq!(jitter(SAMPLES + 3), jitter(3), "a cycle of SAMPLES");
     let points: Vec<Jitter> = (0..SAMPLES).map(jitter).collect();
-    for (k, p) in points.iter().enumerate() {
+    let numbered = points.iter().enumerate();
+    for (k, p) in numbered {
         assert!((-0.5..0.5).contains(&p.x()) && (-0.5..0.5).contains(&p.y()));
         assert!(!points[..k].contains(p), "distinct: {p:?}");
     }
@@ -448,11 +452,20 @@ fn the_jitters_are_the_halton_points_about_the_pixels_centre() {
     );
 }
 
+/// `look` at `size`, at a scale of 1.
+const fn at(look: Look, size: Size) -> Shown {
+    Shown {
+        look,
+        size,
+        scale: 1,
+    }
+}
+
 #[test]
 fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
     let mut state = AaState::default();
     let size = size();
-    let first = state.draw(true, true, LOOK, size);
+    let first = state.draw(true, true, at(LOOK, size));
     assert_eq!(
         first,
         AaFrame::Accumulate {
@@ -460,7 +473,7 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
             restart: true
         }
     );
-    let second = state.draw(true, true, LOOK, size);
+    let second = state.draw(true, true, at(LOOK, size));
     assert_eq!(
         second,
         AaFrame::Accumulate {
@@ -469,7 +482,7 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
         }
     );
     assert_eq!(
-        state.reshade(true, LOOK, size),
+        state.reshade(true, at(LOOK, size)),
         AaFrame::Show,
         "nothing new to shade"
     );
@@ -478,7 +491,7 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
         ..LOOK
     };
     assert_eq!(
-        state.reshade(true, glossy, size),
+        state.reshade(true, at(glossy, size)),
         AaFrame::Accumulate {
             jitter: jitter(1),
             restart: true
@@ -486,19 +499,19 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
         "the last raster's sample, shaded anew, starts the history"
     );
     assert_eq!(
-        state.draw(true, true, glossy, size),
+        state.draw(true, true, at(glossy, size)),
         AaFrame::Accumulate {
             jitter: jitter(2),
             restart: false
         }
     );
     assert_eq!(
-        state.draw(false, true, glossy, size),
+        state.draw(false, true, at(glossy, size)),
         AaFrame::Filter,
         "moving"
     );
     assert_eq!(
-        state.draw(true, true, glossy, size),
+        state.draw(true, true, at(glossy, size)),
         AaFrame::Accumulate {
             jitter: Jitter::CENTRE,
             restart: true
@@ -507,19 +520,30 @@ fn still_frames_accumulate_moving_ones_filter_and_a_look_change_restarts() {
     );
     let other = Size::new(64, 64).expect("non-zero");
     assert!(matches!(
-        state.draw(true, true, glossy, other),
+        state.draw(true, true, at(glossy, other)),
         AaFrame::Accumulate { restart: true, .. }
     ));
     let clusters = Look {
         view: SceneView::Clusters,
         ..LOOK
     };
-    assert_eq!(state.draw(true, true, clusters, other), AaFrame::Plain);
+    assert_eq!(state.draw(true, true, at(clusters, other)), AaFrame::Plain);
     state.lost();
     assert!(matches!(
-        state.draw(true, true, glossy, other),
+        state.draw(true, true, at(glossy, other)),
         AaFrame::Accumulate { restart: true, .. }
     ));
+    let doubled = Shown {
+        scale: 2,
+        ..at(glossy, other)
+    };
+    assert!(
+        matches!(
+            state.draw(true, true, doubled),
+            AaFrame::Accumulate { restart: true, .. }
+        ),
+        "another display scale: the wireframe's width changed"
+    );
 }
 
 /// The convergence test's bounds: the accumulated frame's error against the reference...
@@ -646,7 +670,8 @@ fn fair_tile(ids: &[u32]) -> u32 {
 fn silhouette_tile(ids: &[u32]) -> u32 {
     let width = usize::try_from(size().width()).expect("small");
     let mut tally: BTreeMap<u32, usize> = BTreeMap::new();
-    for (i, &id) in ids.iter().enumerate() {
+    let pixels = ids.iter().enumerate();
+    for (i, &id) in pixels {
         let Some(node) = node_of(id) else {
             continue;
         };
@@ -814,7 +839,8 @@ fn self_resets(gpu: &Gpu, world: &World, session: &mut Session, frames: u32) -> 
     for _ in 0..frames {
         session.draw(gpu, world, false);
         let ids = session.ids(gpu);
-        for ((flag, a), b) in moved.iter_mut().zip(&first).zip(&ids) {
+        let pixels = moved.iter_mut().zip(&first).zip(&ids);
+        for ((flag, a), b) in pixels {
             *flag |= a != b;
         }
     }

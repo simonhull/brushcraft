@@ -30,7 +30,7 @@ use wgpu::{
     RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureFormat,
 };
 
-use crate::aa::{AaFrame, AaReport, AaState};
+use crate::aa::{AaFrame, AaReport, AaState, Shown};
 use crate::camera::Jitter;
 use crate::cull::BoundsUpdate;
 use crate::gpu::{Gpu, GpuError};
@@ -293,6 +293,7 @@ impl Renderer {
             Acquired::Hidden => return Ok(not_drawn(gpu, uploads, Outcome::Hidden, times)?),
         };
         let encoding = Instant::now();
+        let format = self.image.format;
         let Self {
             image: image_passes,
             passes: scene_passes,
@@ -323,6 +324,7 @@ impl Renderer {
             size: inputs.size,
             staged: uploads.as_ref().is_some_and(|uploads| !uploads.is_empty()),
             clear: inputs.clear,
+            scale: inputs.overlay_scale,
         };
         let outcome = gpu.scoped("encoding a frame", || {
             let commands = gpu
@@ -342,7 +344,7 @@ impl Renderer {
                         depth_slice: None,
                         resolve_target: None,
                         ops: Operations {
-                            load: LoadOp::Clear(inputs.clear),
+                            load: LoadOp::Clear(stored_clear(inputs.clear, format)),
                             store: StoreOp::Store,
                         },
                     })],
@@ -388,6 +390,19 @@ struct Showing {
     staged: bool,
     /// The frame's clear colour, which the tone map composites over.
     clear: Color,
+    /// Frame pixels a point: the wireframe's width.
+    scale: u32,
+}
+
+impl Showing {
+    /// What the shaded image depends on beside the scene.
+    const fn shown(&self) -> Shown {
+        Shown {
+            look: self.look,
+            size: self.size,
+            scale: self.scale,
+        }
+    }
 }
 
 /// Encodes `scene` with `passes` into `frame`, after the uploads; `None` for no scene.
@@ -417,7 +432,7 @@ fn encode_scene(
         Scene::Draw(scene) => (|| {
             let accumulable = passes.aa().fits(showing.size);
             let still = !scene.moving;
-            let step = aa.draw(still, accumulable, showing.look, showing.size);
+            let step = aa.draw(still, accumulable, showing.shown());
             let jitter = match step {
                 AaFrame::Accumulate { jitter, .. } => jitter,
                 AaFrame::Plain | AaFrame::Filter | AaFrame::Show => Jitter::CENTRE,
@@ -449,7 +464,7 @@ fn encode_scene(
                 return Ok((nothing, AaFrame::Plain));
             }
             let accumulable = passes.aa().fits(showing.size);
-            let step = aa.reshade(accumulable, showing.look, showing.size);
+            let step = aa.reshade(accumulable, showing.shown());
             let (visible, step, mut report) = match step {
                 AaFrame::Show => (passes.aa().mean().is_some(), step, AaReport::default()),
                 AaFrame::Accumulate { .. } | AaFrame::Filter => {
@@ -585,6 +600,31 @@ fn settle(
         aa.lost();
     }
     Ok(settled)
+}
+
+/// `clear` (linear) as a frame of `format` stores it.
+///
+/// As it is on an sRGB format, whose hardware encodes it; sRGB-encoded on any other, as the tone
+/// map encodes what it writes there, so a silhouette blended over it matches the background (no
+/// halo).
+fn stored_clear(clear: Color, format: TextureFormat) -> Color {
+    if format.is_srgb() {
+        return clear;
+    }
+    let encode = |c: f64| {
+        let c = c.clamp(0.0, 1.0);
+        if c <= 0.003_130_8 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    Color {
+        r: encode(clear.r),
+        g: encode(clear.g),
+        b: encode(clear.b),
+        a: clear.a,
+    }
 }
 
 /// Encodes `passes` into `encoder` and submits it.

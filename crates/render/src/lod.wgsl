@@ -880,7 +880,9 @@ fn occluded(v: View, center: vec3<f32>, radius: f32) -> bool {
     if nearest >= 1.0 {
         return false;
     }
-    // The rectangle, dilated by a pixel against rounding in the projection.
+    // The rectangle, dilated by a pixel against rounding in the projection and against the half
+    // pixel a jittered sample moves while still (render::aa: the raster jitters, this view
+    // doesn't): don't tighten it below that.
     let size = v.viewport.xy;
     let x0 = (lo.x * 0.5 + 0.5) * size.x - 1.0;
     let x1 = (hi.x * 0.5 + 0.5) * size.x + 1.0;
