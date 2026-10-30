@@ -75,6 +75,12 @@ struct Model {
     unprepared: usize,
     /// Every epoch closed, delivered or lost.
     closed: Vec<Epoch>,
+    /// Tiles whose data the model says it has at hand ([`TileSource::at_hand`]).
+    at_hand: BTreeSet<TileKey>,
+    /// Whether it says so of half the display tiles besides (those of an even face and
+    /// column), for the randomized tests to stage some display tiles in the frame they are
+    /// first requested in.
+    half_at_hand: bool,
 }
 
 impl Model {
@@ -105,6 +111,8 @@ impl Model {
             prepared: BTreeMap::new(),
             unprepared: 0,
             closed: Vec::new(),
+            at_hand: BTreeSet::new(),
+            half_at_hand: false,
         }
     }
 
@@ -178,6 +186,12 @@ impl TileSource for Model {
             self.prepared.insert(*key, self.version(key));
         }
         Ok(())
+    }
+
+    fn at_hand(&mut self, key: TileKey) -> bool {
+        let half = key.channel() == Channel::DISPLAY
+            && (key.face().index() + u32::from(key.tx())).is_multiple_of(2);
+        self.at_hand.contains(&key) || (self.half_at_hand && half)
     }
 
     fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, Failure> {
@@ -466,12 +480,13 @@ fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");
         let mut model = Model::new(&mesh, level(FINEST));
+        model.half_at_hand = true;
         let config = tiny(&mesh, 3);
         let budget = config.budget_bytes();
         let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
         let mut rng = Rng(11);
         let mut drawn: BTreeSet<TileKey> = BTreeSet::new();
-        let mut evicted = 0;
+        let (mut evicted, mut early) = (0, 0);
         for step in 0..300 {
             let count = 1 + rng.below(3);
             let cut = random_cut(&mut rng, &residency, count);
@@ -484,6 +499,7 @@ fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_
             let mut kept: BTreeSet<TileKey> = parents.collect();
             kept.extend(cut.iter().copied());
             let asked = 1 + rng.below(6);
+            let asked_before: BTreeSet<TileKey> = model.asking.keys().copied().collect();
             let requests = random_requests(&mut rng, &mut model, &residency, asked);
             if rng.one_in(5) {
                 let seed = model.any(&mut rng);
@@ -508,6 +524,11 @@ fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_
                 assert!(after.contains_key(key), "step {step}: {key:?} was evicted");
             }
             evicted += before.difference(&cpu).count();
+            // Display tiles at hand, staged in the frame first requested in.
+            early += requests
+                .iter()
+                .filter(|r| !asked_before.contains(&r.key) && cpu.contains(&r.key))
+                .count();
             assert!(
                 residency.stats().allocated_bytes <= budget,
                 "step {step}: within the budget"
@@ -518,6 +539,7 @@ fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_
             evicted > 50,
             "the budget is tiny enough to evict: {evicted}"
         );
+        assert!(early > 20, "tiles at hand were staged at once: {early}");
     });
 }
 
@@ -680,6 +702,7 @@ fn epochs_apply_whole(extra: u64, seed: u64) {
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");
         let mut model = Model::new(&mesh, level(FINEST));
+        model.half_at_hand = true;
         let config = tiny(&mesh, extra);
         let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
         let mut rng = Rng(seed);
@@ -968,6 +991,48 @@ fn quiet_frame(gpu: &Gpu, residency: &mut Residency, model: &mut Model, asking: 
         FrameUse::default(),
         Some(&requests),
     );
+}
+
+/// A display tile requested in frame N is staged in N if the source has its data at hand, else
+/// in N + 1; a finest tile waits for its page-in until N + 1 whatever the source says.
+#[test]
+fn a_display_tile_at_hand_is_staged_in_the_frame_it_is_requested_in() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), ResidencyConfig::default())
+            .expect("residency");
+        quiet_frame(gpu, &mut residency, &mut model, &[]);
+        assert!(residency.floor_ready(), "the floor first");
+        let display = |face| TileKey::display(geom::FaceId::new(face), level(6), 0, 0);
+        let at_hand = display(0).expect("a display tile");
+        let not_yet = display(1).expect("a display tile");
+        let finest = TileKey::displacement(geom::FaceId::new(2), level(FINEST), 0, 0)
+            .expect("a finest tile");
+        model.at_hand.extend([at_hand, finest]);
+        let asking = [at_hand, not_yet, finest];
+        quiet_frame(gpu, &mut residency, &mut model, &asking);
+        assert!(
+            residency.slot(&at_hand).is_some(),
+            "at hand: staged at once"
+        );
+        assert!(
+            residency.slot(&not_yet).is_none(),
+            "not at hand: waits a frame"
+        );
+        assert!(
+            residency.slot(&finest).is_none(),
+            "a finest tile waits for its page-in"
+        );
+        quiet_frame(gpu, &mut residency, &mut model, &asking);
+        for key in asking {
+            assert!(
+                residency.slot(&key).is_some(),
+                "{key:?}: staged the next frame"
+            );
+        }
+        gpu_view(gpu, &residency);
+    });
 }
 
 #[test]
@@ -1536,6 +1601,7 @@ fn eviction_under_a_tiny_budget_never_removes_an_ancestor_of_the_cut() {
         let finest = level(8);
         let mesh = cube_sphere(1).expect("a mesh");
         let mut model = Model::new(&mesh, finest);
+        model.half_at_hand = true;
         let config = tiny(&mesh, 6);
         let mut residency = Residency::new(gpu, &mesh, finest, config).expect("residency");
         let mut rng = Rng(29);

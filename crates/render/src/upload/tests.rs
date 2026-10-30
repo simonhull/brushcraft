@@ -309,3 +309,187 @@ fn a_dab_makes_a_resident_display_tile_cover_everything_until_its_refresh() {
         drop(project.close(false));
     });
 }
+
+/// Builds a project over `mesh` keeping its display layer under `finest` and saves it as `name`
+/// in `dir`; returns its path and configuration, to open it with.
+fn saved(
+    dir: &TempDir,
+    name: &str,
+    mesh: &geom::BaseMesh,
+    finest: Level,
+) -> (PathBuf, ProjectConfig) {
+    let config = ProjectConfig {
+        store: StoreConfig::new(1 << 30, 1).with_display(finest),
+        recovery_dir: dir.0.clone(),
+    };
+    let mut project = Project::new(mesh.clone(), config.clone()).expect("a project");
+    let store = project.store();
+    store.queue_display_rebuild(finest);
+    while store.has_jobs() {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(50))
+            .expect("the display layer builds");
+    }
+    let path = dir.0.join(name);
+    drop(project.save_as(&path).expect("saved"));
+    drop(project.close(false));
+    (path, config)
+}
+
+/// Every display tile of `mesh` at `levels`.
+fn display_tiles(mesh: &geom::BaseMesh, levels: &[u8]) -> Vec<TileKey> {
+    let mut keys = Vec::new();
+    for face in mesh.faces() {
+        for &l in levels {
+            let per_side = u16::try_from(level(l).tiles_per_side()).expect("small");
+            for ty in 0..per_side {
+                for tx in 0..per_side {
+                    keys.push(TileKey::display(face, level(l), tx, ty).expect("a tile"));
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// Requests for `keys`, of one screen error.
+fn requests_of(keys: &[TileKey]) -> Requests {
+    Requests::new(
+        keys.iter().map(|&key| Request {
+            key,
+            screen_error: 2.0,
+        }),
+        0,
+    )
+}
+
+/// How many times each timing is taken: the least is printed.
+const REPEATS: usize = 3;
+
+/// Prints `what`'s least time of `runs`, each the time and the tiles it staged.
+fn report(what: &str, runs: &[(Duration, u64)]) {
+    let (took, tiles) = runs
+        .iter()
+        .min_by_key(|(took, _)| *took)
+        .copied()
+        .expect("a run");
+    let per_tile = took.as_secs_f64() * 1e6 / f64::from(u32::try_from(tiles).expect("small"));
+    eprintln!(
+        "{what}: {tiles} tiles in {:.1} ms, {per_tile:.1} µs a tile (least of {})",
+        took.as_secs_f64() * 1e3,
+        runs.len()
+    );
+}
+
+/// Frame 1's owner time on a project of the benchmark project's 2,400 faces, opened afresh
+/// each run: the floor, read on open, staged whole.
+fn time_the_floor(gpu: &Gpu, dir: &TempDir) {
+    let mesh = cube_sphere(20).expect("a mesh");
+    let finest = level(6);
+    let (path, config) = saved(dir, "floor.bcp", &mesh, finest);
+    let mut runs = Vec::new();
+    for _ in 0..REPEATS {
+        let mut project = Project::open(&path, config.clone()).expect("opened");
+        let store = project.store();
+        let mut residency =
+            Residency::new(gpu, &mesh, finest, ResidencyConfig::default()).expect("residency");
+        let began = Instant::now();
+        frame(gpu, &mut residency, store, &Requests::new([], 0));
+        runs.push((began.elapsed(), residency.stats().staged_tiles));
+        assert!(residency.floor_ready(), "the floor arrived");
+        drop(project.close(false));
+    }
+    report("frame 1, the floor", &runs);
+}
+
+/// A residency over `mesh` with the floor staged from `store`.
+fn with_floor(gpu: &Gpu, mesh: &geom::BaseMesh, finest: Level, store: &mut TileStore) -> Residency {
+    let mut residency =
+        Residency::new(gpu, mesh, finest, ResidencyConfig::default()).expect("residency");
+    frame(gpu, &mut residency, store, &Requests::new([], 0));
+    residency
+}
+
+/// Stages `keys` all requested at once, each record read on the owner thread as it is staged:
+/// the owner time and the tiles staged.
+fn staged_reading_on_the_owner(
+    gpu: &Gpu,
+    mesh: &geom::BaseMesh,
+    finest: Level,
+    store: &mut TileStore,
+    keys: &[TileKey],
+) -> (Duration, u64) {
+    let mut residency = with_floor(gpu, mesh, finest, store);
+    let requests = requests_of(keys);
+    let (mut took, mut staged) = (Duration::ZERO, 0);
+    for _ in 0..2 {
+        let began = Instant::now();
+        frame(gpu, &mut residency, store, &requests);
+        took += began.elapsed();
+        staged += residency.stats().staged_tiles;
+    }
+    assert_eq!(staged, keys.len() as u64, "every tile staged");
+    (took, staged)
+}
+
+/// Stages `keys` requested a few at a time, fewer than the read-ahead holds, each record read on
+/// the workers before the frame that stages it: the owner time and the tiles staged.
+fn staged_read_ahead(
+    gpu: &Gpu,
+    mesh: &geom::BaseMesh,
+    finest: Level,
+    store: &mut TileStore,
+    keys: &[TileKey],
+) -> (Duration, u64) {
+    let mut residency = with_floor(gpu, mesh, finest, store);
+    let (mut took, mut staged) = (Duration::ZERO, 0);
+    for chunk in keys.chunks(32) {
+        let requests = requests_of(chunk);
+        assert_eq!(
+            prefetch_requests(store, &requests).ok(),
+            Some(chunk.len()),
+            "every one read ahead"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let began = Instant::now();
+        frame(gpu, &mut residency, store, &requests);
+        took += began.elapsed();
+        staged += residency.stats().staged_tiles;
+        assert!(
+            chunk.iter().all(|key| residency.slot(key).is_some()),
+            "staged in the frame they were requested in"
+        );
+    }
+    (took, staged)
+}
+
+/// The owner thread's time staging display tiles read from the file.
+///
+/// Frame 1's floor (on a mesh of the benchmark project's 2,400 faces), and requested level-6
+/// and level-7 tiles, read on the owner thread and read ahead. A timing, not a check: run it in
+/// release, with `--run-ignored only`.
+#[test]
+#[ignore = "a timing, for release builds"]
+fn owner_time_staging_display_tiles() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("owner-time");
+        time_the_floor(gpu, &dir);
+
+        let mesh = cube_sphere(3).expect("a mesh");
+        let finest = level(8);
+        let (path, config) = saved(&dir, "display.bcp", &mesh, finest);
+        let mut project = Project::open(&path, config).expect("opened");
+        let store = project.store();
+        let keys = display_tiles(&mesh, &[6, 7]);
+        let (mut on_owner, mut ahead) = (Vec::new(), Vec::new());
+        for _ in 0..REPEATS {
+            on_owner.push(staged_reading_on_the_owner(
+                gpu, &mesh, finest, store, &keys,
+            ));
+            ahead.push(staged_read_ahead(gpu, &mesh, finest, store, &keys));
+        }
+        report("requested display tiles, read on the owner", &on_owner);
+        report("requested display tiles, read ahead", &ahead);
+        drop(project.close(false));
+    });
+}

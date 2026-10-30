@@ -53,7 +53,8 @@
 //! 2. [`Residency::apply`] the drained feed; [`Residency::use_frame`] with the cut and what was
 //!    drawn; [`Residency::take_requests`], the requests a frame's readback gave, to
 //!    [`crate::upload::prefetch_requests`] and [`Residency::want`] (staged from the next frame on,
-//!    so the page-in has a frame to land).
+//!    so the page-in or the read ahead has a frame to land; a display tile whose data is at hand
+//!    already, from this one).
 //! 3. [`Residency::stage`]: reads tiles from the source until the deadline, writes them and the
 //!    tile tree's changed nodes into the staging ring, and returns the frame's [`FrameUploads`] for
 //!    the render thread.
@@ -621,7 +622,8 @@ struct Entry {
 struct Want {
     /// Its screen error: larger is staged first.
     error: f32,
-    /// The frame it was first requested in: it is staged from the next one on.
+    /// The frame it was first requested in: it is staged from the next one on (a display tile
+    /// whose data is at hand, from this one).
     since: u64,
 }
 
@@ -1025,8 +1027,9 @@ impl Residency {
 
     /// Wants the tiles of `requests` resident, larger screen error first: they replace the
     /// requests wanted before (the floor stays wanted until resident). A tile is staged from
-    /// the frame after it was first requested on, so a page-in started now
-    /// ([`crate::upload::prefetch_requests`]) has a frame to land. Resident tiles, tiles of no
+    /// the frame after it was first requested on, so a page-in or a read ahead started now
+    /// ([`crate::upload::prefetch_requests`]) has a frame to land; a display tile whose data the
+    /// source has at hand ([`TileSource::at_hand`]) from this frame on. Resident tiles, tiles of no
     /// face of the mesh or below its finest level, and tiles the source had nothing for are
     /// skipped.
     pub fn want(&mut self, requests: &Requests) {
@@ -1424,7 +1427,8 @@ impl Residency {
 
     /// Stages the requested tiles, largest screen error first, readied a batch at a time,
     /// until `deadline` or the ring is full. Tiles first requested this frame wait for the
-    /// next.
+    /// next, but for display tiles the source has at hand ([`TileSource::at_hand`]): a finest
+    /// tile's page-in, or a display record's read ahead, has that frame to land.
     ///
     /// # Errors
     ///
@@ -1440,23 +1444,30 @@ impl Residency {
         S::Error: Into<ResidencyError>,
     {
         let frame = self.frame;
-        let due = self.wanted.iter().filter(|(_, want)| want.since < frame);
-        let mut by_error: Vec<(TileKey, f32)> = due.map(|(k, want)| (*k, want.error)).collect();
+        // A finest tile waits a frame for its page-in; a display tile only if its record isn't
+        // at hand yet (asked of the source as its turn comes, so reads landing meanwhile count).
+        let could = self
+            .wanted
+            .iter()
+            .filter(|(key, want)| want.since < frame || key.channel() == Channel::DISPLAY);
+        let mut by_error: Vec<(TileKey, f32, bool)> = could
+            .map(|(k, want)| (*k, want.error, want.since < frame))
+            .collect();
         by_error.sort_by(|a, b| b.1.total_cmp(&a.1));
         let waiting = by_error
             .iter()
-            .filter(|(key, _)| !self.is_pending_arrival(key));
-        let order: Vec<TileKey> = waiting.map(|(key, _)| *key).collect();
+            .filter(|(key, _, _)| !self.is_pending_arrival(key));
+        let order: Vec<(TileKey, bool)> = waiting.map(|(key, _, due)| (*key, *due)).collect();
         for chunk in order.chunks(PREPARE_BATCH) {
             if Instant::now() >= deadline {
                 break;
             }
             let mut ready = Vec::with_capacity(chunk.len());
-            for key in chunk {
-                if self.entries.contains_key(key) || self.unavailable.contains(key) {
-                    self.wanted.remove(key);
-                } else {
-                    ready.push(*key);
+            for &(key, due) in chunk {
+                if self.entries.contains_key(&key) || self.unavailable.contains(&key) {
+                    self.wanted.remove(&key);
+                } else if due || source.at_hand(key) {
+                    ready.push(key);
                 }
             }
             let Some(first) = ready.first() else {

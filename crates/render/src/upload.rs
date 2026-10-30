@@ -27,7 +27,7 @@ use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode, Queu
 
 use crate::gpu::{Gpu, GpuError};
 use crate::normals::{NormalWork, RingRecord};
-use crate::residency::Requests;
+use crate::residency::{Request, Requests};
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -209,6 +209,18 @@ pub trait TileSource {
         Ok(())
     }
 
+    /// Whether display tile `key` reads now without waiting on a file: its data is in memory,
+    /// or was read ahead ([`prefetch_requests`]). Such a tile is staged in the frame it is first
+    /// requested in; any other waits a frame for its read ahead to land. The default says no:
+    /// every tile waits.
+    #[expect(
+        unused_variables,
+        reason = "the default knows of no data in memory; a source that does overrides it"
+    )]
+    fn at_hand(&mut self, key: TileKey) -> bool {
+        false
+    }
+
     /// Writes `key` into `out`, its vertices or (a finest tile) its positions with the ring, and
     /// returns its bound `e` and its finest normals' cone, or `None` if the source has nothing
     /// to draw for it yet (a display tile not built, or made unknown by edits): it is then drawn
@@ -270,6 +282,10 @@ impl TileSource for StoreSource<'_> {
         Ok(())
     }
 
+    fn at_hand(&mut self, key: TileKey) -> bool {
+        self.display.contains_key(&key) || !self.store.display_needs_read(&key)
+    }
+
     fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, CacheError> {
         if key.channel() == Channel::DISPLAY {
             let tile = match self.display.remove(&key) {
@@ -310,9 +326,13 @@ const fn components(v: Vec3) -> [f32; 3] {
     [v.x, v.y, v.z]
 }
 
-/// Asks the store to page in the correction tiles of the finest tiles among `requests`.
+/// Asks the store to page in the requested tiles' data on its workers.
 ///
-/// Reading them later then finds them resident: what the owner thread does with the
+/// The correction tiles of the finest tiles among `requests` are paged in, and the records of
+/// the display tiles among them read ahead, larger screen error first
+/// ([`TileStore::read_display_ahead`]).
+///
+/// Reading them later then finds them in memory: what the owner thread does with the
 /// requests a frame's readback gave ([`crate::residency::Residency::take_requests`]) before
 /// handing them to [`crate::residency::Residency::want`]. Returns how many reads were queued.
 ///
@@ -320,12 +340,14 @@ const fn components(v: Vec3) -> [f32; 3] {
 ///
 /// As [`TileStore::prefetch`].
 pub fn prefetch_requests(store: &mut TileStore, requests: &Requests) -> Result<usize, CacheError> {
-    let finest: Vec<TileKey> = requests
+    let (mut display, finest): (Vec<&Request>, Vec<&Request>) = requests
         .iter()
-        .map(|request| request.key)
-        .filter(|key| key.channel() != Channel::DISPLAY)
-        .collect();
-    store.prefetch(&finest)
+        .partition(|request| request.key.channel() == Channel::DISPLAY);
+    let finest: Vec<TileKey> = finest.iter().map(|request| request.key).collect();
+    display.sort_by(|a, b| b.screen_error.total_cmp(&a.screen_error));
+    let display: Vec<TileKey> = display.iter().map(|request| request.key).collect();
+    let read_ahead = store.read_display_ahead(&display);
+    Ok(store.prefetch(&finest)? + read_ahead)
 }
 
 /// A staging buffer coming back to the ring: from the render thread's map callback once the
