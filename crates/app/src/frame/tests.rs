@@ -933,20 +933,16 @@ fn bounds_of(request: &FrameRequest) -> usize {
         .len()
 }
 
-#[test]
-fn a_change_of_look_alone_shades_the_last_scene_again_and_draws_nothing_new() {
-    let dir = TestDir::new();
-    let gpu = software_gpu();
-    let mut owner = resident_owner(&dir, &gpu);
-    let mut screen = Screen::new(&gpu);
-    // Until frames stop by themselves: everything resident, every morph over.
+/// Makes frames on `screen` until they stop by themselves: everything resident, every morph
+/// over.
+fn settle(gpu: &Gpu, owner: &mut Owner<NoBrush, GpuResidency>, screen: &mut Screen) {
     let mut made = 0;
     loop {
         assert!(made < 300, "frames never stopped");
         let now = Instant::now();
         match owner.next(now) {
             Next::Frame { deadline } => {
-                draw_one(&gpu, &mut owner, &mut screen, now, deadline);
+                draw_one(gpu, owner, screen, now, deadline);
                 made += 1;
             }
             Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
@@ -954,6 +950,68 @@ fn a_change_of_look_alone_shades_the_last_scene_again_and_draws_nothing_new() {
             Next::Idle { .. } => break,
         }
     }
+}
+
+/// Something else a frame is wanted for: its name, and how the scheduler hears of it.
+type Also = (&'static str, fn(&mut Scheduler));
+
+#[test]
+fn a_change_of_look_is_drawn_whole_while_anything_else_wants_the_frame() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut owner = resident_owner(&dir, &gpu);
+    let mut screen = Screen::new(&gpu);
+    settle(&gpu, &mut owner, &mut screen);
+    // Beside uploads in flight, requests settling, or a morph under way, the frame draws its
+    // scene whole, in the new look.
+    let others: [Also; 3] = [
+        ("uploads", |s| s.want(Reason::Uploads)),
+        ("requests", |s| s.want(Reason::Requests)),
+        ("a morph", |s| s.cut_changed(Instant::now())),
+    ];
+    for (what, also) in others {
+        owner.change_look(LookChange::MatCap);
+        also(&mut owner.scheduler);
+        let request = hand_off(&mut owner, Instant::now());
+        assert!(!request.reshade, "with {what}: drawn whole");
+        assert!(request.scene.is_some(), "with {what}: its scene");
+        let presented = screen.draw(&gpu, request);
+        assert!(presented.scene, "with {what}: drawn");
+        owner.shown(presented);
+        settle(&gpu, &mut owner, &mut screen);
+    }
+    owner.close().expect("closed");
+}
+
+#[test]
+fn only_uploads_with_nothing_new_leave_a_frame_quiet_enough_to_shade_again() {
+    assert!(quiet(&UploadStatus::default()), "nothing at all");
+    let busy = [
+        UploadStatus {
+            uploading: true,
+            ..UploadStatus::default()
+        },
+        UploadStatus {
+            requesting: true,
+            ..UploadStatus::default()
+        },
+        UploadStatus {
+            cut_changed: Some(Duration::from_millis(5)),
+            ..UploadStatus::default()
+        },
+    ];
+    for status in &busy {
+        assert!(!quiet(status), "{status:?}");
+    }
+}
+
+#[test]
+fn a_change_of_look_alone_shades_the_last_scene_again_and_draws_nothing_new() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut owner = resident_owner(&dir, &gpu);
+    let mut screen = Screen::new(&gpu);
+    settle(&gpu, &mut owner, &mut screen);
     let clay = screen.pixels(&gpu);
     let ids = screen.ids(&gpu);
     owner.change_look(LookChange::MatCap);
