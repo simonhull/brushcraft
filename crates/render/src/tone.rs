@@ -29,6 +29,16 @@
 //! edge become a ramp. A pixel standing out from its 3 × 3 neighbourhood (a sub-pixel feature)
 //! blends by how much it does, up to 0.75. Blending is of the premultiplied HDR colour, so an edge
 //! against the background blends coverage.
+//!
+//! # Few samples
+//!
+//! A mean of few samples is about as aliased as one frame: the first still frame after a move,
+//! a look change, or a pixel reset during a stroke or a morph. So means are filtered too, by a
+//! weight fading with the pixel's own sample count, read from its record (`frame − start + 1`):
+//! all of the filter at one sample, ¾, ½, ¼, none from five. Per pixel rather than one weight a
+//! frame, so pixels reset alone are smoothed too; it costs a word read a pixel, and the filter
+//! itself only where the weight isn't 0. The image doesn't pop as the camera stops: the first
+//! still frame is drawn at the pixel centre and filtered exactly as the moving frame before it.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::{
@@ -72,10 +82,14 @@ pub(crate) enum ToneSource<'a> {
         shaded: &'a Texture,
         /// The means.
         means: &'a Buffer,
+        /// The records (four words a pixel), whose starts say how many samples each mean holds.
+        records: &'a Buffer,
+        /// Accumulation's last frame.
+        frame: u32,
     },
 }
 
-/// The pass's settings as the GPU reads them: WGSL's `ToneSettings`, 32 bytes.
+/// The pass's settings as the GPU reads them: WGSL's `ToneSettings`, 48 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 struct GpuToneSettings {
@@ -87,6 +101,10 @@ struct GpuToneSettings {
     source: u32,
     /// 1 to filter.
     filter: u32,
+    /// Accumulation's frame.
+    frame: u32,
+    /// Zero.
+    reserved: [u32; 3],
 }
 
 /// [`GpuToneSettings::source`]: the means.
@@ -99,7 +117,7 @@ pub(crate) struct ToneMap {
     pipeline: RenderPipeline,
     /// [`GpuToneSettings`].
     settings: Buffer,
-    /// Bound in place of the means when the shaded image is shown.
+    /// Bound in place of the means and records when the shaded image is shown.
     placeholder: Buffer,
     /// The image and means bound, and their bind group: kept while they are the same.
     bound: Option<(Texture, Option<Buffer>, BindGroup)>,
@@ -156,7 +174,7 @@ impl ToneMap {
         Ok(Self {
             pipeline,
             settings: uniform_buffer(gpu, "tone settings", size_of::<GpuToneSettings>() as u64)?,
-            placeholder: storage_buffer(gpu, "tone means placeholder", 8)?,
+            placeholder: storage_buffer(gpu, "tone means placeholder", 16)?,
             bound: None,
         })
     }
@@ -174,9 +192,14 @@ impl ToneMap {
         source: ToneSource<'_>,
         clear: Color,
     ) -> Result<(), GpuError> {
-        let (image, means, filter) = match source {
-            ToneSource::Shaded { image, filter } => (image, None, filter),
-            ToneSource::Means { shaded, means } => (shaded, Some(means), false),
+        let (image, means, filter, frame) = match source {
+            ToneSource::Shaded { image, filter } => (image, None, filter, 0),
+            ToneSource::Means {
+                shaded,
+                means,
+                records,
+                frame,
+            } => (shaded, Some((means, records)), false, frame),
         };
         #[expect(
             clippy::cast_possible_truncation,
@@ -188,13 +211,14 @@ impl ToneMap {
             size: [image.width(), image.height()],
             source: if means.is_some() { SOURCE_MEANS } else { 0 },
             filter: u32::from(filter),
+            frame,
+            reserved: [0; 3],
         };
         gpu.queue()
             .write_buffer(&self.settings, 0, bytemuck::bytes_of(&settings));
-        let same = self
-            .bound
-            .as_ref()
-            .is_some_and(|(texture, buffer, _)| texture == image && buffer.as_ref() == means);
+        let same = self.bound.as_ref().is_some_and(|(texture, buffer, _)| {
+            texture == image && buffer.as_ref() == means.map(|(means, _)| means)
+        });
         if same {
             return Ok(());
         }
@@ -209,12 +233,13 @@ impl ToneMap {
                         binding: 0,
                         resource: BindingResource::TextureView(&view),
                     },
-                    entry(1, means.unwrap_or(&self.placeholder)),
+                    entry(1, means.map_or(&self.placeholder, |(means, _)| means)),
                     entry(2, &self.settings),
+                    entry(3, means.map_or(&self.placeholder, |(_, records)| records)),
                 ],
             })
         })?;
-        self.bound = Some((image.clone(), means.cloned(), group));
+        self.bound = Some((image.clone(), means.map(|(means, _)| means.clone()), group));
         Ok(())
     }
 

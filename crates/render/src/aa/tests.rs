@@ -22,7 +22,7 @@ use crate::raster::tests::World;
 use crate::raster::{FramePasses, MORPH, SceneInputs};
 use crate::residency::REQUEST_HEADER;
 use crate::shade::tests::png::{self, Rgb};
-use crate::shade::tests::read_shaded;
+use crate::shade::tests::{half, read_shaded};
 use crate::shade::{ShadePath, ShadeSettings};
 use crate::surface::{Offscreen, Target};
 use crate::{Renderer, tone};
@@ -162,6 +162,44 @@ impl Session {
             .expect("drawn");
         finish(gpu);
         drawn
+    }
+
+    /// Every pixel's mean, premultiplied linear.
+    fn means(&self, gpu: &Gpu) -> Vec<[f32; 4]> {
+        let buffer = self.passes().aa().mean().expect("accumulated");
+        let halves: Vec<[u16; 4]> = gpu.read_buffer(buffer).expect("read back");
+        halves.iter().map(|texel| texel.map(half)).collect()
+    }
+
+    /// The means shown unfiltered, as sRGB bytes: after one frame, the one-sample image.
+    fn unfiltered(&self, gpu: &Gpu) -> Vec<[u8; 4]> {
+        let means = self.means(gpu);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "rounded from 0..=255"
+        )]
+        let byte = |c: f32| (c * 255.0).round() as u8;
+        means
+            .into_iter()
+            .map(|mean| {
+                let [r, g, b] = shown(mean).map(byte);
+                [r, g, b, 255]
+            })
+            .collect()
+    }
+
+    /// How many pixels of the frame differ by more than a code from the means shown unfiltered.
+    fn filtered_pixels(&self, gpu: &Gpu) -> usize {
+        let frame = self.pixels(gpu);
+        let means = self.means(gpu);
+        let unfiltered = means.into_iter().map(shown);
+        let pairs = frame.iter().zip(unfiltered);
+        pairs
+            .filter(|(pixel, want)| {
+                (0..3).any(|k| (f32::from(pixel[k]) - want[k] * 255.0).abs() > 1.5)
+            })
+            .count()
     }
 
     /// Shows the last scene again, as `look` (a look change, or a frame for the overlay alone).
@@ -498,7 +536,7 @@ fn a_still_scene_converges_to_the_supersampled_reference() {
         let reference: Vec<[f32; 3]> = reference.into_iter().map(shown).collect();
         let mut session = Session::new(gpu, &world, EYE, size());
         session.draw(gpu, &world, false);
-        let aliased = session.pixels(gpu);
+        let aliased = session.unfiltered(gpu);
         let frames = session.converge(gpu, &world);
         let converged = session.pixels(gpu);
         let (before, after) = (rmse(&aliased, &reference), rmse(&converged, &reference));
@@ -533,7 +571,7 @@ fn write_pair(gpu: &Gpu, world: &World, dir: &std::path::Path) {
     .expect("a view");
     let mut session = Session::with_view(gpu, world, &view);
     session.draw(gpu, world, false);
-    let aliased = session.pixels(gpu);
+    let aliased = session.unfiltered(gpu);
     session.converge(gpu, world);
     let converged = session.pixels(gpu);
     for (name, pixels) in [("aliased", aliased), ("accumulated", converged)] {
@@ -799,7 +837,7 @@ fn the_filter_smooths_a_moving_frames_edges_and_leaves_flat_regions_alone() {
         let filtered = moving.pixels(gpu);
         let mut still = Session::new(gpu, &world, EYE, size());
         still.draw(gpu, &world, false);
-        let plain = still.pixels(gpu);
+        let plain = still.unfiltered(gpu);
         let (filtered_error, plain_error) = (rmse(&filtered, &reference), rmse(&plain, &reference));
         eprintln!("filtered {filtered_error:.5}, unfiltered {plain_error:.5}");
         assert!(
@@ -822,7 +860,8 @@ fn the_filter_smooths_a_moving_frames_edges_and_leaves_flat_regions_alone() {
                     let hi = around.iter().map(|p| p[c]).max().unwrap_or(0);
                     hi - lo <= 2
                 });
-                let same = at(&filtered, x, y) == at(&plain, x, y);
+                let (a, b) = (at(&filtered, x, y), at(&plain, x, y));
+                let same = a.iter().zip(b).all(|(p, q)| p.abs_diff(q) <= 1);
                 if spread {
                     flat += 1;
                     assert!(same, "a flat pixel ({x}, {y}) is unchanged");
@@ -890,5 +929,39 @@ fn an_image_too_large_to_accumulate_is_filtered_while_still_and_never_fails() {
             "shading again too: {again:?}"
         );
         assert!(small.passes().aa().record().is_none(), "no histories made");
+    });
+}
+
+#[test]
+fn the_first_still_frames_after_a_move_are_filtered_fading_as_samples_come() {
+    GpuTest::run(|gpu| {
+        let world = World::with_finest(gpu, 4);
+        let mut session = Session::new(gpu, &world, EYE, size());
+        session.draw(gpu, &world, true);
+        let moving = session.pixels(gpu);
+        let first = session.draw(gpu, &world, false);
+        assert!(first.aa.restarted, "the camera stopped: {first:?}");
+        let still = session.pixels(gpu);
+        let differing = moving
+            .iter()
+            .zip(&still)
+            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 1))
+            .count();
+        assert_eq!(
+            differing, 0,
+            "no pop: the moving frame's filtered image again"
+        );
+        let mut filtered = vec![session.filtered_pixels(gpu)];
+        for _ in 0..5 {
+            session.draw(gpu, &world, false);
+            filtered.push(session.filtered_pixels(gpu));
+        }
+        eprintln!("pixels filtered at 1 to 6 samples: {filtered:?}");
+        assert!(filtered[0] > 20, "one sample is filtered at its edges");
+        assert!(
+            filtered.windows(2).take(4).all(|w| w[1] <= w[0]),
+            "less and less: {filtered:?}"
+        );
+        assert_eq!(filtered[4], 0, "none from five samples: {filtered:?}");
     });
 }

@@ -1,9 +1,9 @@
 //! Golden images (lavapipe), compared with the FLIP-style measure ([`super::flip`]):
 //!
 //! - **MatCap goldens:** a sphere shaded with each style (and the wireframe), drawn through the
-//!   renderer's whole frame as the app draws it, against PNG files under the crate's
-//!   `testdata/golden/`. Set `BRUSHCRAFT_WRITE_GOLDEN=1` to write them anew instead (then look at
-//!   them, and commit them).
+//!   renderer's whole frame as the app draws it (a first still frame: one sample, edge-filtered as
+//!   few samples are, `crate::tone`), against PNG files under the crate's `testdata/golden/`. Set
+//!   `BRUSHCRAFT_WRITE_GOLDEN=1` to write them anew instead (then look at them, and commit them).
 //! - **Against the finest level:** the level choice's frame, shaded, against a reference drawn
 //!   entirely at the finest level, from a set of cameras.
 //! - **The ≤ 1 px claim, on screen:** for the same cameras, how far the drawn surface lies from the

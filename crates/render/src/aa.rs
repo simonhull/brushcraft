@@ -81,6 +81,10 @@
 //!
 //! # Moving
 //!
+//! While a pixel's mean holds few samples the tone map filters it too, fading out by the fourth
+//! (`crate::tone`, "Few samples"), so stopping the camera doesn't pop and pixels reset during a
+//! stroke don't crawl.
+//!
 //! A frame with the camera moving isn't jittered or accumulated: the tone map filters it
 //! (`tone.wgsl`), an edge filter of our own after FXAA's idea (find a luma edge and its
 //! orientation, walk along it to its ends, blend across it by where the pixel lies on it, plus a
@@ -554,15 +558,14 @@ impl Accumulation {
         self.history.as_ref().map(|history| &history.mean)
     }
 
-    /// The per-pixel records, four words a pixel (`aa_pixels.wgsl`), for the tests.
-    #[cfg(test)]
+    /// The per-pixel records, four words a pixel (`aa_pixels.wgsl`): the tone map reads how many
+    /// samples each mean holds from them.
     pub(crate) fn record(&self) -> Option<&Buffer> {
         self.history.as_ref().map(|history| &history.record)
     }
 
     /// The last frame's number, from 1: a pixel whose record starts at `s` holds
     /// `min(frame − s + 1, SAMPLES)` samples.
-    #[cfg(test)]
     pub(crate) const fn frame(&self) -> u32 {
         self.frame
     }

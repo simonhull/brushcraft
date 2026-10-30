@@ -12,8 +12,11 @@
 @group(0) @binding(1) var<storage, read> means: array<vec2<u32>>;
 // The pass's settings.
 @group(0) @binding(2) var<uniform> settings: ToneSettings;
+// Accumulation's records, four words a pixel, the first the frame its history started (bits
+// 0..30): how many samples a mean holds (render::aa).
+@group(0) @binding(3) var<storage, read> records: array<vec4<u32>>;
 
-// The pass's settings (render::tone::GpuToneSettings): 32 bytes.
+// The pass's settings (render::tone::GpuToneSettings): 48 bytes.
 struct ToneSettings {
     // The frame's clear colour, linear; `w` unused.
     clear: vec4<f32>,
@@ -21,9 +24,22 @@ struct ToneSettings {
     size: vec2<u32>,
     // SOURCE_MEANS to read `means`, else `shaded`.
     source: u32,
-    // 1 to filter edges.
+    // 1 to filter edges (the shaded image).
     edge_filter: u32,
+    // With SOURCE_MEANS: accumulation's frame, against which the records' starts count samples.
+    frame: u32,
+    // Zero.
+    reserved0: u32,
+    // Zero.
+    reserved1: u32,
+    // Zero.
+    reserved2: u32,
 }
+
+// The samples over which a mean's filtering fades out: full at one, none from FADE + 1.
+const FADE: f32 = 4.0;
+// A record's start frame.
+const START: u32 = 0x7fffffffu;
 
 // ToneSettings.source: accumulation's means.
 const SOURCE_MEANS: u32 = 1u;
@@ -162,14 +178,26 @@ fn filtered(p: vec2<i32>) -> vec4<f32> {
     return mix(m, fetch(p + step), blend);
 }
 
-// A pixel of the image, filtered if asked, tone mapped over the clear colour; nothing where it
-// has no coverage.
+// How much of the edge filter pixel `p` takes: all of it for the shaded image when asked; for a
+// mean, by how few samples it holds (render::tone, "Few samples").
+fn filter_weight(p: vec2<i32>) -> f32 {
+    if settings.source != SOURCE_MEANS {
+        return select(0.0, 1.0, settings.edge_filter != 0u);
+    }
+    let start = records[u32(p.y) * settings.size.x + u32(p.x)].x & START;
+    let samples = settings.frame - start + 1u;
+    return clamp(1.0 - f32(samples - 1u) / FADE, 0.0, 1.0);
+}
+
+// A pixel of the image, filtered as much as `filter_weight` says, tone mapped over the clear
+// colour; nothing where it has no coverage.
 @fragment
 fn map(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let p = vec2<i32>(position.xy);
     var c = fetch(p);
-    if settings.edge_filter != 0u {
-        c = filtered(p);
+    let weight = filter_weight(p);
+    if weight > 0.0 {
+        c = mix(c, filtered(p), weight);
     }
     if c.a <= 0.0 {
         discard;

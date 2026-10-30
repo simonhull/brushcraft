@@ -530,11 +530,16 @@ fn bind_shaded(
     let Some(target) = passes.shade().target() else {
         return Ok(());
     };
-    let source = match (step, passes.aa().mean()) {
-        (AaFrame::Accumulate { .. } | AaFrame::Show, Some(means)) => ToneSource::Means {
-            shaded: target,
-            means,
-        },
+    let aa = passes.aa();
+    let source = match (step, aa.mean(), aa.record()) {
+        (AaFrame::Accumulate { .. } | AaFrame::Show, Some(means), Some(records)) => {
+            ToneSource::Means {
+                shaded: target,
+                means,
+                records,
+                frame: aa.frame(),
+            }
+        }
         _ => ToneSource::Shaded {
             image: target,
             filter: step == AaFrame::Filter,
