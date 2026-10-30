@@ -170,6 +170,11 @@ impl SlotBuffers {
         Self { classes }
     }
 
+    /// Every class's buffers: `classes()[c]` is class `c`'s, in buffer-index order.
+    pub(crate) fn classes(&self) -> &[Vec<Buffer>] {
+        &self.classes
+    }
+
     /// Buffer `buffer` of class `class`.
     fn get(&self, class: u8, buffer: u16) -> Option<&Buffer> {
         self.classes

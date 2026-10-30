@@ -353,3 +353,21 @@ pub fn drawn(size: ClusterSize, variant: Variant) -> impl Iterator<Item = Option
         (a != b && b != c && c != a).then_some([a, b, c])
     })
 }
+
+/// The WGSL of the cluster grid, for the raster: its constants and the remap lookup, reading the
+/// tables from a `remap_tables: array<u32>` binding.
+pub(crate) const INDICES_WGSL: &str = r"
+// Vertices along a full cluster's side (render::indices::CLUSTER_SIDE).
+const CLUSTER_SIDE: u32 = 9u;
+// Vertices of a full cluster.
+const CLUSTER_VERTICES: u32 = 81u;
+// Edge variants a cluster size has.
+const VARIANTS: u32 = 16u;
+
+// The vertex a cluster of 2^size_index quads a side and edge variant `variant` draws in place of
+// grid vertex `vertex` (render::indices::remap, from its tables).
+fn remapped(size_index: u32, variant: u32, vertex: u32) -> u32 {
+    let entry = (size_index * VARIANTS + variant) * CLUSTER_VERTICES + vertex;
+    return (remap_tables[entry / 4u] >> (8u * (entry % 4u))) & 0xffu;
+}
+";

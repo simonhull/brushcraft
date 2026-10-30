@@ -201,15 +201,15 @@ impl GpuCluster {
 /// One tile of the cut as the GPU writes it: WGSL's `CutEntry`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
-struct GpuCutEntry {
+pub(crate) struct GpuCutEntry {
     /// Its face.
-    face: u32,
+    pub(crate) face: u32,
     /// Its place ([`Place::packed`]).
-    place: u32,
+    pub(crate) place: u32,
     /// Its node.
-    node: u32,
+    pub(crate) node: u32,
     /// [`CUT_DRAWN`] once drawn.
-    flags: u32,
+    pub(crate) flags: u32,
 }
 
 /// [`GpuCutEntry::flags`]: drawn by either phase.
@@ -217,6 +217,28 @@ const CUT_DRAWN: u32 = 1;
 
 /// The bytes of one [`GpuCutEntry`].
 const CUT_BYTES: u64 = size_of::<GpuCutEntry>() as u64;
+
+/// Word offset of [`GpuFrame::cut_count`] in the frame buffer.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a word offset early in a struct of a few hundred words"
+)]
+const CUT_COUNT_WORD: u32 = (std::mem::offset_of!(GpuFrame, cut_count) / 4) as u32;
+
+/// The cut as the GPU holds it after [`Lod::encode_main`], for the passes after the level
+/// choice in the same frame (the raster's stamp pass, [`crate::raster`]).
+///
+/// The entries are `CutEntry`s of 16 bytes (face, place packed as [`Place::packed`], node,
+/// flags), the first `counts[count_word]` of them written.
+#[derive(Debug, Clone, Copy)]
+pub struct CutList<'a> {
+    /// The entries.
+    pub entries: &'a Buffer,
+    /// The buffer holding the count, as 32-bit words.
+    pub counts: &'a Buffer,
+    /// The count's word in `counts`.
+    pub count_word: u32,
+}
 
 /// Per node, WGSL's `NodeWork`: last frame's choice and this frame's state.
 #[repr(C)]
@@ -970,6 +992,16 @@ impl Lod {
     #[must_use]
     pub const fn draw_args(&self, post: bool) -> (&Buffer, u64) {
         (&self.frame, if post { POST_ARGS } else { 0 })
+    }
+
+    /// The frame's cut, as [`Lod::encode_main`] writes it.
+    #[must_use]
+    pub const fn cut_list(&self) -> CutList<'_> {
+        CutList {
+            entries: &self.cut,
+            counts: &self.frame,
+            count_word: CUT_COUNT_WORD,
+        }
     }
 
     /// Encodes the bounds pass for `update`'s tiles ([`BoundsPass::encode`]), timed when timing

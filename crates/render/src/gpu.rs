@@ -31,9 +31,11 @@ mod tests;
 
 /// The optional features GPU work here uses when the adapter offers them.
 ///
-/// Their absence is never fatal: [`Gpu`] reports what it got, and the work that needs one
-/// (timing a dispatch) is skipped or reported as unavailable.
-const OPTIONAL_FEATURES: Features = Features::TIMESTAMP_QUERY;
+/// Their absence is never fatal here: [`Gpu`] reports what it got, and the work that needs one
+/// is skipped or reported as unavailable (timing a dispatch), or refuses to start with an error
+/// that names it (the raster's visibility buffer needs the primitive index,
+/// [`crate::raster::RasterError::NoPrimitiveIndex`]).
+const OPTIONAL_FEATURES: Features = Features::TIMESTAMP_QUERY.union(Features::PRIMITIVE_INDEX);
 
 /// Which adapter [`Gpu::open`] should use.
 #[derive(Debug, Clone, PartialEq, Eq)]
