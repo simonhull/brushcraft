@@ -319,6 +319,7 @@ impl Drawing {
                 clear: CLEAR,
                 overlay: image.as_ref(),
                 overlay_scale: frame.overlay_scale,
+                scene: None,
             };
             let uploads = frame.uploads.take();
             let drawn = self

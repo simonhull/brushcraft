@@ -284,7 +284,7 @@ fn run(
             .expect("encoded");
     }
     let readback = lod
-        .encode_readback(gpu, &mut encoder)
+        .encode_readback(gpu, &mut encoder, 0)
         .expect("encoded")
         .expect("a readback buffer is free");
     gpu.queue().submit([encoder.finish()]);

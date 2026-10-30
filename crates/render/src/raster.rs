@@ -369,6 +369,12 @@ impl RasterConfig {
         }
     }
 
+    /// The time factor's duration: how long a level change made with the camera still morphs.
+    #[must_use]
+    pub const fn morph(&self) -> Duration {
+        self.morph
+    }
+
     /// The morph over `duration` (zero: no time factor).
     #[must_use]
     pub const fn with_morph(self, duration: Duration) -> Self {
@@ -947,6 +953,51 @@ impl Raster {
     #[must_use]
     pub const fn depth_view(&self) -> &TextureView {
         &self.targets.depth_view
+    }
+
+    /// The visibility buffer's pixels, row by row from the top, once everything submitted so far
+    /// has finished. It blocks, so it is for tests and tools ([`Gpu::read_buffer`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::read_buffer`], and as [`Gpu::scoped`] for the copy out of the texture.
+    pub fn read_visibility(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
+        let texture = self.visibility();
+        let (width, height) = (texture.width(), texture.height());
+        let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let device = gpu.device();
+        let buffer = gpu.scoped("visibility readback", || {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("visibility readback"),
+                size: u64::from(row) * u64::from(height),
+                usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("visibility readback"),
+            });
+            encoder.copy_texture_to_buffer(
+                texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                texture.size(),
+            );
+            gpu.queue().submit([encoder.finish()]);
+            buffer
+        })?;
+        let padded: Vec<u32> = gpu.read_buffer(&buffer)?;
+        let stride = usize::try_from(row / 4).unwrap_or(usize::MAX);
+        let width = usize::try_from(width).unwrap_or(usize::MAX);
+        let rows = padded
+            .chunks(stride)
+            .flat_map(|pixels| pixels.iter().take(width).copied());
+        Ok(rows.collect())
     }
 }
 

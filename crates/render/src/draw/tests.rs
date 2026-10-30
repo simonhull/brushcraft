@@ -1,15 +1,21 @@
-//! A frame drawn offscreen on lavapipe and read back: the clear colour, with the overlay over
-//! its corner.
+//! A frame drawn offscreen on lavapipe and read back: the clear colour, the scene's visibility
+//! buffer shown over it, and the overlay over its corner.
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 
 use geom::{Level, TileKey, cube_sphere};
-use wgpu::PollType;
+use wgpu::{BufferDescriptor, BufferUsages, PollType};
 
 use super::*;
+use crate::camera::{Vec3, View};
+use crate::cull::BoundsUpdate;
 use crate::gpu::GpuTest;
+use crate::lod::{LodConfig, LodOutput};
 use crate::overlay::MARGIN;
-use crate::residency::{Residency, ResidencyConfig};
+use crate::raster::tests::World;
+use crate::raster::{BACKGROUND, MORPH, VisibilityId};
+use crate::residency::{REQUEST_HEADER, Residency, ResidencyConfig};
 use crate::surface::Offscreen;
 use crate::upload::{GpuVertex, TileDetail, TileSource};
 
@@ -53,6 +59,7 @@ fn draw(gpu: &Gpu, size: Size, overlay: Option<&TextImage>, scale: u32) -> (Draw
         clear: CLEAR,
         overlay,
         overlay_scale: scale,
+        scene: None,
     };
     let drawn = renderer
         .draw(gpu, &mut target, &inputs, None, || called = true)
@@ -182,6 +189,7 @@ fn a_frames_uploads_go_in_its_submission_before_the_passes() {
             clear: CLEAR,
             overlay: None,
             overlay_scale: 1,
+            scene: None,
         };
         let drawn = renderer
             .draw(gpu, &mut target, &inputs, Some(uploads), || {})
@@ -215,4 +223,155 @@ fn a_text_image_holds_exactly_its_texels() {
     assert_eq!((image.width(), image.height()), (3, 2));
     assert_eq!(image.texel(2, 1), Some(5));
     assert_eq!(image.texel(3, 0), None, "outside");
+}
+
+/// What [`draw_scene`] drew: the frame's pixels, its visibility buffer and its cut read back.
+struct SceneFrame {
+    /// The frame, as the target holds it.
+    pixels: Vec<[u8; 4]>,
+    /// The visibility buffer.
+    ids: Vec<u32>,
+    /// The cut, read back as the app reads it: off the renderer.
+    cut: LodOutput,
+    /// Whether the renderer says it drew the scene.
+    drawn: bool,
+}
+
+/// Draws `world` seen from `eye` into a fresh offscreen target of `size` with a fresh renderer,
+/// the camera still at `time`, as frame `frame`, and reads it all back.
+fn draw_scene(
+    gpu: &Gpu,
+    world: &World,
+    size: Size,
+    eye: Vec3,
+    time: Duration,
+    frame: u64,
+) -> SceneFrame {
+    let mut target = Target::Offscreen(Offscreen::new(gpu, size).expect("target"));
+    let mut renderer = Renderer::new(gpu, target.format()).expect("renderer");
+    let mut passes = FramePasses::new(
+        gpu,
+        world.tree.capacity(),
+        world.layout(),
+        LodConfig::default(),
+        MORPH,
+    )
+    .expect("the scene's passes");
+    let reader = passes.lod_mut().take_reader().expect("the reader");
+    renderer.set_passes(passes);
+    let requests = gpu.device().create_buffer(&BufferDescriptor {
+        label: Some("test requests"),
+        size: REQUEST_HEADER + 64 * 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let view = View::look_at(
+        eye,
+        Vec3::default(),
+        Vec3::new(0.0, 1.0, 0.0),
+        45_f64.to_radians(),
+        size,
+        0.01,
+    )
+    .expect("a view");
+    let bounds = BoundsUpdate::since(&world.tree, 0);
+    let scene = SceneInputs {
+        tree: world.tree.buffer(),
+        requests: &requests,
+        slots: &world.slots,
+        bounds: &bounds,
+        view: &view,
+        time,
+        moving: false,
+        finest: world.finest,
+        frame,
+    };
+    let inputs = FrameInputs {
+        size,
+        clear: CLEAR,
+        overlay: None,
+        overlay_scale: 1,
+        scene: Some(&scene),
+    };
+    let drawn = renderer
+        .draw(gpu, &mut target, &inputs, None, || {})
+        .expect("drawn");
+    gpu.device()
+        .poll(PollType::wait_indefinitely())
+        .expect("the GPU finishes");
+    let cut = reader
+        .collect(world.finest)
+        .expect("read")
+        .expect("the frame's cut arrived");
+    let ids = renderer
+        .passes()
+        .expect("given")
+        .raster()
+        .read_visibility(gpu)
+        .expect("read back");
+    let Target::Offscreen(offscreen) = &target else {
+        unreachable!("made offscreen");
+    };
+    SceneFrame {
+        pixels: offscreen.read_pixels(gpu).expect("read back"),
+        ids,
+        cut,
+        drawn: drawn.scene,
+    }
+}
+
+#[test]
+fn a_frames_scene_is_drawn_into_the_visibility_buffer_and_shown_in_colours() {
+    GpuTest::run(|gpu| {
+        let world = World::with_finest(gpu, 4);
+        let size = Size::new(96, 64).expect("non-zero");
+        let eye = Vec3::new(0.4, 0.3, 2.6);
+        let frame = draw_scene(gpu, &world, size, eye, Duration::from_secs(1), 7);
+        assert!(frame.drawn, "the renderer drew the scene");
+        assert_eq!(frame.cut.frame, 7, "the readback says which frame it is of");
+        assert!(!frame.cut.cut.is_empty(), "the cut came back");
+        let drawn: Vec<VisibilityId> = frame
+            .ids
+            .iter()
+            .filter_map(|&id| VisibilityId::decode(id))
+            .collect();
+        assert!(
+            drawn.len() > frame.ids.len() / 8,
+            "the sphere covers the frame's middle: {} of {} pixels",
+            drawn.len(),
+            frame.ids.len()
+        );
+        let nodes: BTreeSet<u32> = drawn.iter().map(|id| id.node).collect();
+        for &node in &nodes {
+            // Panics for a node the tree doesn't hold.
+            world.place_of(node);
+        }
+        assert!(nodes.len() > 1, "several tiles show: {nodes:?}");
+        let clear = [srgb(CLEAR.r), srgb(CLEAR.g), srgb(CLEAR.b), 255];
+        for (&id, &pixel) in frame.ids.iter().zip(&frame.pixels) {
+            if id == BACKGROUND {
+                assert!(near(pixel, clear), "the background is the clear colour");
+            } else {
+                assert!(!near(pixel, clear), "a drawn pixel is coloured: {pixel:?}");
+            }
+        }
+        let colours: BTreeSet<[u8; 4]> = frame.pixels.iter().copied().collect();
+        assert!(colours.len() > 4, "clusters get colours of their own");
+    });
+}
+
+#[test]
+fn the_same_scene_at_the_same_time_draws_the_same_frame() {
+    GpuTest::run(|gpu| {
+        let world = World::with_finest(gpu, 4);
+        let size = Size::new(96, 64).expect("non-zero");
+        let eye = Vec3::new(-0.5, 0.8, 2.2);
+        let time = Duration::from_millis(1234);
+        let first = draw_scene(gpu, &world, size, eye, time, 1);
+        let second = draw_scene(gpu, &world, size, eye, time, 1);
+        assert!(first.ids.iter().any(|&id| id != BACKGROUND));
+        assert_eq!(first.ids, second.ids, "the visibility buffers agree");
+        assert_eq!(first.pixels, second.pixels, "and so do the frames");
+        assert_eq!(first.cut.cut, second.cut.cut, "as do the cuts");
+    });
 }

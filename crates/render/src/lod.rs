@@ -647,6 +647,9 @@ impl LodStats {
 /// A frame's cut and the tiles it drew, read back: what residency takes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LodOutput {
+    /// The frame it is of: the number its readback was encoded with
+    /// ([`Lod::encode_readback`]).
+    pub frame: u64,
     /// The tiles of the cut.
     pub cut: BTreeSet<TileKey>,
     /// The tiles drawn, by either phase.
@@ -681,13 +684,22 @@ pub struct MainInputs<'a> {
     pub finest: Level,
 }
 
-/// A readback buffer coming back.
+/// A readback buffer coming back to its reader.
 #[derive(Debug)]
 enum Readback {
-    /// Mapped, the frame's results in it.
-    Mapped(Buffer),
+    /// Mapped, the results of frame `1` in it.
+    Mapped(Buffer, u64),
     /// Mapping failed; the buffer is gone.
     Failed,
+}
+
+/// A readback buffer going back to the level choice that made it.
+#[derive(Debug)]
+enum Returned {
+    /// Free for another frame: read, or never submitted.
+    Free(Buffer),
+    /// Gone: its mapping failed.
+    Lost,
 }
 
 /// A frame's readback, encoded: call [`CutReadback::submitted`] once its command buffer is
@@ -697,10 +709,12 @@ enum Readback {
 pub struct CutReadback {
     /// The buffer the results were copied to.
     buffer: Option<Buffer>,
-    /// Where it goes back.
+    /// The frame it is of.
+    frame: u64,
+    /// Where it goes once mapped: to the reader.
     done: Sender<Readback>,
     /// Where an unread one goes back.
-    unused: Sender<Buffer>,
+    unused: Sender<Returned>,
 }
 
 impl CutReadback {
@@ -710,9 +724,10 @@ impl CutReadback {
         if let Some(buffer) = self.buffer.take() {
             let back = buffer.clone();
             let done = self.done.clone();
+            let frame = self.frame;
             buffer.map_async(MapMode::Read, .., move |result| {
                 let readback = if result.is_ok() {
-                    Readback::Mapped(back)
+                    Readback::Mapped(back, frame)
                 } else {
                     Readback::Failed
                 };
@@ -727,8 +742,48 @@ impl Drop for CutReadback {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
             // A level choice that's gone has nothing to take back.
-            drop(self.unused.send(buffer));
+            drop(self.unused.send(Returned::Free(buffer)));
         }
+    }
+}
+
+/// Where a level choice's readbacks arrive, read on whichever thread polls the device.
+///
+/// The level choice holds it until [`Lod::take_reader`] moves it out: the app reads each frame's
+/// cut on the owner thread, which polls the device, while the render thread keeps the level
+/// choice. Read buffers go back to the level choice for later frames.
+#[derive(Debug)]
+pub struct CutReader {
+    /// Where mapped readbacks arrive.
+    mapped: Receiver<Readback>,
+    /// Where read ones go back.
+    back: Sender<Returned>,
+}
+
+impl CutReader {
+    /// The latest frame's results read back, if a readback completed since the last call (the
+    /// device must have been polled since; older completed readbacks are dropped): its cut and
+    /// drawn tiles as keys of a project whose finest level is `finest`, its counts, and the frame
+    /// it is of.
+    ///
+    /// # Errors
+    ///
+    /// [`LodError::Gpu`] if a mapped buffer can't be viewed.
+    pub fn collect(&self, finest: Level) -> Result<Option<LodOutput>, LodError> {
+        let mut latest = None;
+        while let Ok(back) = self.mapped.try_recv() {
+            let Readback::Mapped(buffer, frame) = back else {
+                // A level choice that's gone has no count to correct.
+                drop(self.back.send(Returned::Lost));
+                continue;
+            };
+            let read = read_output(&buffer, finest, frame);
+            buffer.unmap();
+            // A level choice that's gone has nothing to take back.
+            drop(self.back.send(Returned::Free(buffer)));
+            latest = Some(read?);
+        }
+        Ok(latest)
     }
 }
 
@@ -812,14 +867,14 @@ pub struct Lod {
     free: Vec<Buffer>,
     /// Readback buffers made.
     made: usize,
-    /// Given to each readback, to send its buffer back mapped.
+    /// Given to each readback, to send its buffer to the reader once mapped.
     done: Sender<Readback>,
-    /// Where mapped readbacks arrive.
-    mapped: Receiver<Readback>,
-    /// Given to each readback, to send its buffer back unused.
-    unused_sender: Sender<Buffer>,
-    /// Where unused readbacks arrive.
-    unused: Receiver<Buffer>,
+    /// Where mapped readbacks arrive, until [`Lod::take_reader`] moves it out.
+    reader: Option<CutReader>,
+    /// Given to each readback and to the reader, to send buffers back.
+    returns: Sender<Returned>,
+    /// Where buffers come back: read, unread, or lost.
+    returned: Receiver<Returned>,
     /// Timestamp queries, once [`Lod::enable_timing`] is called on a device that has them.
     timer: Option<Timer>,
 }
@@ -934,7 +989,11 @@ impl Lod {
             })
         })?;
         let (done, mapped) = mpsc::channel();
-        let (unused_sender, unused) = mpsc::channel();
+        let (returns, returned) = mpsc::channel();
+        let reader = CutReader {
+            mapped,
+            back: returns.clone(),
+        };
         Ok(Self {
             config,
             capacity,
@@ -960,9 +1019,9 @@ impl Lod {
             free: Vec::new(),
             made: 0,
             done,
-            mapped,
-            unused_sender,
-            unused,
+            reader: Some(reader),
+            returns,
+            returned,
             timer: None,
         })
     }
@@ -1225,8 +1284,9 @@ impl Lod {
         Ok(())
     }
 
-    /// Encodes copying the frame's counts and cut to a readback buffer, after both phases; `None`
-    /// if every readback buffer is in flight (this frame's results are skipped). Call
+    /// Encodes copying the frame's counts and cut to a readback buffer, after both phases, as the
+    /// results of `frame` (any number the caller tells its frames by: [`LodOutput::frame`]);
+    /// `None` if every readback buffer is in flight (this frame's results are skipped). Call
     /// [`CutReadback::submitted`] on it once the command buffer is submitted.
     ///
     /// # Errors
@@ -1236,6 +1296,7 @@ impl Lod {
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
+        frame: u64,
     ) -> Result<Option<CutReadback>, LodError> {
         self.take_unused();
         let buffer = match self.free.pop() {
@@ -1262,38 +1323,40 @@ impl Lod {
         }
         Ok(Some(CutReadback {
             buffer: Some(buffer),
+            frame,
             done: self.done.clone(),
-            unused: self.unused_sender.clone(),
+            unused: self.returns.clone(),
         }))
     }
 
-    /// The latest frame's results read back, if a readback completed since the last call (the
-    /// device must have been polled since; older completed readbacks are dropped): its cut and
-    /// drawn tiles as keys of a project whose finest level is `finest`, and its counts.
+    /// The latest frame's results read back, as [`CutReader::collect`]; `None` once
+    /// [`Lod::take_reader`] has moved the reader out.
     ///
     /// # Errors
     ///
     /// [`LodError::Gpu`] if a mapped buffer can't be viewed.
     pub fn collect(&mut self, finest: Level) -> Result<Option<LodOutput>, LodError> {
+        let latest = match &self.reader {
+            Some(reader) => reader.collect(finest)?,
+            None => None,
+        };
         self.take_unused();
-        let mut latest = None;
-        while let Ok(back) = self.mapped.try_recv() {
-            let Readback::Mapped(buffer) = back else {
-                self.made = self.made.saturating_sub(1);
-                continue;
-            };
-            let read = read_output(&buffer, finest);
-            buffer.unmap();
-            self.free.push(buffer);
-            latest = Some(read?);
-        }
         Ok(latest)
     }
 
-    /// Takes back readback buffers dropped unread.
+    /// Moves where the readbacks arrive out of the level choice, to read them on another thread
+    /// ([`CutReader`]); `None` if it was taken already.
+    pub const fn take_reader(&mut self) -> Option<CutReader> {
+        self.reader.take()
+    }
+
+    /// Takes back readback buffers read, dropped unread, or lost.
     fn take_unused(&mut self) {
-        while let Ok(buffer) = self.unused.try_recv() {
-            self.free.push(buffer);
+        while let Ok(returned) = self.returned.try_recv() {
+            match returned {
+                Returned::Free(buffer) => self.free.push(buffer),
+                Returned::Lost => self.made = self.made.saturating_sub(1),
+            }
         }
     }
 
@@ -1606,12 +1669,12 @@ impl Timer {
     }
 }
 
-/// The results in a mapped readback buffer.
+/// The results in a mapped readback buffer, of frame `tag`.
 ///
 /// # Errors
 ///
 /// [`LodError::Gpu`] if it can't be viewed.
-fn read_output(buffer: &Buffer, finest: Level) -> Result<LodOutput, LodError> {
+fn read_output(buffer: &Buffer, finest: Level, tag: u64) -> Result<LodOutput, LodError> {
     let view = buffer.get_mapped_range(..).map_err(GpuError::from)?;
     let frame_end = usize::try_from(FRAME_BYTES).unwrap_or(usize::MAX);
     let frame: GpuFrame = view
@@ -1626,6 +1689,7 @@ fn read_output(buffer: &Buffer, finest: Level) -> Result<LodOutput, LodError> {
         .iter()
         .take(usize::try_from(frame.cut_count).unwrap_or(usize::MAX));
     let mut output = LodOutput {
+        frame: tag,
         stats: stats(&frame),
         ..LodOutput::default()
     };

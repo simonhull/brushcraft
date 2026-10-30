@@ -18,8 +18,7 @@ use geom::{BaseMesh, FaceId, FinestNormalCone, Level, TileKey, cube_sphere};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
     BindGroupDescriptor, BufferDescriptor, CommandEncoderDescriptor, ComputePassDescriptor,
-    ComputePipelineDescriptor, Origin3d, PollType, TexelCopyBufferInfo, TexelCopyBufferLayout,
-    TexelCopyTextureInfo, TextureAspect,
+    ComputePipelineDescriptor, PollType,
 };
 
 use super::*;
@@ -107,17 +106,17 @@ struct Tile {
 
 /// The synthetic tree: every tile of the sphere to its finest level, resident, with its data in
 /// slot buffers (one per class).
-struct World {
+pub(crate) struct World {
     /// The mesh.
     mesh: BaseMesh,
     /// The finest level.
-    finest: Level,
+    pub(crate) finest: Level,
     /// The tree.
-    tree: TileTree,
+    pub(crate) tree: TileTree,
     /// Every tile.
     tiles: BTreeMap<Place, Tile>,
     /// The slot buffers.
-    slots: SlotBuffers,
+    pub(crate) slots: SlotBuffers,
 }
 
 impl World {
@@ -127,7 +126,7 @@ impl World {
     }
 
     /// Every tile resident to level `top`, its data uploaded and its node written.
-    fn with_finest(gpu: &Gpu, top: u8) -> Self {
+    pub(crate) fn with_finest(gpu: &Gpu, top: u8) -> Self {
         let mesh = cube_sphere(1).expect("a mesh");
         let finest = level(top);
         let n = finest.face_quads();
@@ -248,7 +247,7 @@ impl World {
 
     /// The slot layout the raster binds: one buffer more of each class than it has, as
     /// residency's most is more than it has made, so every draw binds placeholders too.
-    fn layout(&self) -> SlotLayout {
+    pub(crate) fn layout(&self) -> SlotLayout {
         let mut per_class = [0_u16; CLASSES];
         let classes = per_class.iter_mut().zip(self.slots.classes());
         for (most, buffers) in classes {
@@ -258,7 +257,7 @@ impl World {
     }
 
     /// The place of `node`.
-    fn place_of(&self, node: u32) -> Place {
+    pub(crate) fn place_of(&self, node: u32) -> Place {
         let found = self.tiles.iter().find(|(_, tile)| tile.node == node);
         *found.expect("a resident node").0
     }
@@ -492,48 +491,7 @@ fn finish(gpu: &Gpu) {
 
 /// The visibility buffer, row by row.
 fn read_visibility(gpu: &Gpu, raster: &Raster) -> Vec<u32> {
-    let texture = raster.visibility();
-
-    let (width, height) = (texture.width(), texture.height());
-    let row = (width * 4).next_multiple_of(256);
-    let buffer = gpu.device().create_buffer(&BufferDescriptor {
-        label: Some("visibility readback"),
-        size: u64::from(row * height),
-        usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let mut encoder = gpu
-        .device()
-        .create_command_encoder(&CommandEncoderDescriptor::default());
-    encoder.copy_texture_to_buffer(
-        TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: Origin3d::ZERO,
-            aspect: TextureAspect::All,
-        },
-        TexelCopyBufferInfo {
-            buffer: &buffer,
-            layout: TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(height),
-            },
-        },
-        Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    gpu.queue().submit([encoder.finish()]);
-    let padded: Vec<u32> = gpu.read_buffer(&buffer).expect("read back");
-    let stride = usize::try_from(row / 4).expect("small");
-    let width = usize::try_from(width).expect("small");
-    padded
-        .chunks(stride)
-        .flat_map(|r| r[..width].to_vec())
-        .collect()
+    raster.read_visibility(gpu).expect("read back")
 }
 
 /// Draws `cut` (its clusters `clusters`) as one frame at `time`, stamping it first, and returns
@@ -1131,7 +1089,7 @@ fn lod_frame(
         .encode_draw(gpu, &mut encoder, &draw, Phase::First)
         .expect("encoded");
     let readback = lod
-        .encode_readback(gpu, &mut encoder)
+        .encode_readback(gpu, &mut encoder, 0)
         .expect("encoded")
         .expect("a readback buffer");
     gpu.queue().submit([encoder.finish()]);
@@ -1968,6 +1926,7 @@ fn a_frame_draws_both_phases_lists_watertight_the_second_drawing_what_the_first_
                 time: Duration::from_secs(1),
                 moving: true,
                 finest: world.finest,
+                frame: 0,
             };
             let mut encoder = gpu
                 .device()

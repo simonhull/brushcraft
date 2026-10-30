@@ -397,7 +397,7 @@ fn bounds_timing(gpu: &Gpu) {
             .create_command_encoder(&CommandEncoderDescriptor::default());
         lod.encode_bounds(gpu, &mut encoder, tree.buffer(), &update, &slot_set)
             .expect("encoded");
-        let readback = lod.encode_readback(gpu, &mut encoder).expect("encoded");
+        let readback = lod.encode_readback(gpu, &mut encoder, 0).expect("encoded");
         gpu.queue().submit([encoder.finish()]);
         drop(readback);
         if let Some(timings) = lod.read_timings(gpu).expect("timings") {

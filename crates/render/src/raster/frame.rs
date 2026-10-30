@@ -9,9 +9,8 @@
 //! tests against everything this frame drew. A frame of another size than the last has no
 //! previous pyramid: nothing is occlusion-culled in its first phase.
 //!
-//! This is the composition [`crate::Renderer::draw`] is to run once the app hands it the tile
-//! tree and residency: not wired yet, its own step (plan, "Gaps found while executing", the
-//! "Task 4 review" bullet). The tests draw through it.
+//! [`crate::Renderer::draw`] runs it each frame the app hands it a scene, after the frame's
+//! uploads and before the visibility buffer is shown; the tests draw through it too.
 
 use std::time::Duration;
 
@@ -60,6 +59,9 @@ pub struct SceneInputs<'a> {
     pub moving: bool,
     /// The project's finest level.
     pub finest: Level,
+    /// The number the frame's readback carries ([`crate::lod::LodOutput::frame`]): the app's
+    /// residency frame, so the cut comes back beside that frame's requests.
+    pub frame: u64,
 }
 
 /// The level choice, the raster and the depth pyramids of a frame.
@@ -121,6 +123,13 @@ impl FramePasses {
         &self.raster
     }
 
+    /// How long a level change made with the camera still morphs: frames should keep coming
+    /// for that long after the cut changes, so the morph is seen through to its end.
+    #[must_use]
+    pub const fn morph(&self) -> Duration {
+        self.raster.config().morph()
+    }
+
     /// Encodes the frame's passes into `encoder` (after its uploads) and returns its readback,
     /// `None` if every readback buffer is in flight. Settings go through the queue, so encode
     /// one frame per submission, and call [`CutReadback::submitted`] once it is submitted.
@@ -176,7 +185,7 @@ impl FramePasses {
         let older = self.previous.replace((*inputs.view, current));
         self.current = older.map(|(_, pyramid)| pyramid);
         drawn?;
-        Ok(self.lod.encode_readback(gpu, encoder)?)
+        Ok(self.lod.encode_readback(gpu, encoder, inputs.frame)?)
     }
 
     /// The two draws around the second phase, building `current` after each.

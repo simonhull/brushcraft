@@ -8,7 +8,8 @@
 //! [`residency`] keeps tiles on the GPU within a budget, uploaded through [`upload`]'s staging
 //! ring an epoch at a time, and [`tree`] is the tree of resident tiles the GPU walks. [`cull`]
 //! and [`lod`] choose the tiles a frame draws, and [`raster`] draws their clusters (the
-//! triangles of `indices`) into a visibility buffer, watertight at every seam.
+//! triangles of `indices`) into a visibility buffer, watertight at every seam, which
+//! `visibility_view` shows as colours until the shading pass does better.
 //!
 //! The crates below this one (`geom`, `store`, `brush`) never learn about the GPU: this crate
 //! reads their data and uploads it.
@@ -30,5 +31,6 @@ pub mod spike;
 pub mod surface;
 pub mod tree;
 pub mod upload;
+mod visibility_view;
 
-pub use draw::{DrawTimes, Drawn, FrameInputs, Outcome, Renderer};
+pub use draw::{DrawError, DrawTimes, Drawn, FrameInputs, Outcome, Renderer};
