@@ -7,8 +7,8 @@
 //! [`Renderer::draw`] draws a frame there: its passes in order, the [`overlay`] last.
 //! [`residency`] keeps tiles on the GPU within a budget, uploaded through [`upload`]'s staging
 //! ring an epoch at a time (a finest tile as its positions with the one-vertex ring, whose
-//! normals [`normals`] computes on the GPU), and [`tree`] is the tree of resident tiles the GPU
-//! walks. [`cull`]
+//! normals the `normals` module computes on the GPU), and [`tree`] is the tree of resident tiles
+//! the GPU walks. [`cull`]
 //! and [`lod`] choose the tiles a frame draws, and [`raster`] draws their clusters (the
 //! triangles of `indices`) into a visibility buffer, watertight at every seam, which
 //! `visibility_view` shows as colours until the shading pass does better.
@@ -25,7 +25,7 @@ mod draw;
 pub mod gpu;
 pub(crate) mod indices;
 pub mod lod;
-pub mod normals;
+pub(crate) mod normals;
 pub mod overlay;
 pub mod raster;
 pub mod residency;

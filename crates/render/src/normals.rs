@@ -121,7 +121,7 @@ const OWN_AXES: VertexStencil = VertexStencil::Axes([[1, 0], [0, 1]]);
 ///   [`GatheredBlock::padded`]), then each base vertex's edge points, owner first, three words
 ///   each; padded to a whole number of 8 bytes, as staging copies need.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RingRecord {
+pub(crate) struct RingRecord {
     /// The words.
     words: Vec<u32>,
 }
@@ -189,13 +189,13 @@ impl RingRecord {
 
     /// Quads per side of the tile; 0 for a record never written.
     #[must_use]
-    pub fn quads(&self) -> u32 {
+    pub(crate) fn quads(&self) -> u32 {
         self.words.get(HEADER_QUADS).copied().unwrap_or(0)
     }
 
     /// The record's bytes, as staged.
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.words)
     }
 

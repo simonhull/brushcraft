@@ -13,8 +13,8 @@
 //! ([`crate::tree`]), and that is what the visibility buffer's cluster id derives from.
 //!
 //! A finest tile's slot is like any other of its side: its one-vertex ring isn't stored. The tile
-//! is staged as its positions with the ring ([`crate::normals::RingRecord`]), and the frame's
-//! normal pass writes its slot's vertices from them ([`crate::normals`]). Room and the forced
+//! is staged as its positions with the ring (a ring record), and the frame's normal pass writes
+//! its slot's vertices from them (the crate's `normals` module). Room and the forced
 //! bytes are counted by the slot, a little over twice the record, so on the safe side.
 //!
 //! # What stays
@@ -78,7 +78,8 @@ use crate::gpu::{Gpu, GpuError};
 use crate::normals::NormalPass;
 use crate::tree::{NODE_BYTES, NODE_FINEST, NODE_FLOOR, Place, TileTree, TreeError};
 use crate::upload::{
-    Batch, FrameOutcome, FrameUploads, StagingRing, TileData, TileDetail, TileSource, VERTEX_BYTES,
+    Batch, FrameOutcome, FrameUploads, StagingRing, TileData, TileDetail, TileSource, Upload,
+    VERTEX_BYTES,
 };
 
 mod pool;
@@ -1762,30 +1763,33 @@ impl Residency {
             .pools
             .locate(slot)
             .ok_or(ResidencyError::Invariant("a slot without a buffer"))?;
-        let written = if let Some(record) = self.data.ring_record() {
-            // A finest tile's positions with its ring: the normal pass writes the slot.
-            if record.quads() + 1 != slot.class.side() {
-                return Err(ResidencyError::Invariant(
-                    "a ring of another side than its slot",
-                ));
+        let written = match self.data.upload() {
+            Upload::Ring(record) => {
+                // A finest tile's positions with its ring: the normal pass writes the slot.
+                if record.quads() + 1 != slot.class.side() {
+                    return Err(ResidencyError::Invariant(
+                        "a ring of another side than its slot",
+                    ));
+                }
+                self.normals.stage(
+                    gpu,
+                    batch,
+                    &mut self.ring,
+                    record,
+                    slot,
+                    (buffer, offset),
+                    forced,
+                )?
             }
-            self.normals.stage(
-                gpu,
-                batch,
-                &mut self.ring,
-                record,
-                slot,
-                (buffer, offset),
-                forced,
-            )?
-        } else {
-            let data = self.data.vertex_bytes();
-            let written = batch.write(gpu, &mut self.ring, data, buffer, offset, forced)?;
-            if written {
-                // Copied in, not computed: an earlier record for the slot mustn't overwrite it.
-                self.normals.forget(slot);
+            Upload::Vertices(data) => {
+                let written = batch.write(gpu, &mut self.ring, data, buffer, offset, forced)?;
+                if written {
+                    // Copied in, not computed: an earlier record for the slot mustn't overwrite
+                    // it.
+                    self.normals.forget(slot);
+                }
+                written
             }
-            written
         };
         if written {
             self.touched.push((key, slot));

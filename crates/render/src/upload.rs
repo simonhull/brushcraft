@@ -3,8 +3,8 @@
 //!
 //! The owner thread reads each tile from a [`TileSource`] (the store, through [`StoreSource`])
 //! into a [`TileData`]: a display tile as [`GpuVertex`]es, a finest tile as its positions with
-//! the one-vertex ring (a [`RingRecord`], from which the GPU computes its vertices,
-//! [`crate::normals`]). It writes them, with the tile tree's changed nodes, into staging buffers
+//! the one-vertex ring (a ring record, from which the GPU computes its vertices: the crate's
+//! `normals` module). It writes them, with the tile tree's changed nodes, into staging buffers
 //! mapped for writing. When the frame's uploads are staged, the buffers are unmapped and the
 //! copies they need become a [`FrameUploads`], which the render thread encodes into the frame's
 //! command buffer ahead of every pass, the normal pass right after them, and submits
@@ -26,8 +26,7 @@ use store::{CacheError, Evaluation, TileStore};
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode, Queue};
 
 use crate::gpu::{Gpu, GpuError};
-use crate::normals::NormalWork;
-pub use crate::normals::RingRecord;
+use crate::normals::{NormalWork, RingRecord};
 use crate::residency::Requests;
 
 #[cfg(test)]
@@ -38,7 +37,7 @@ mod tests;
 ///
 /// Positions are decoded `f32` (plan decision 1). Normals are unit normals: a display tile's
 /// averaged normal, unpacked; a finest tile's computed on the GPU from its positions and ring
-/// ([`crate::normals`]), by the formula the store's normals use.
+/// (the crate's `normals` module), by the formula the store's normals use.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub struct GpuVertex {
@@ -110,55 +109,82 @@ impl TileDetail {
 /// What a [`TileSource`] writes one tile into: its vertices, or a finest tile's positions with
 /// its ring.
 ///
-/// Residency hands it over set to the tile's `side²` vertices, zeroed; a source fills them
+/// Residency hands it over for a tile of `side²` vertices; a source fills them
 /// ([`TileData::vertices`]) or writes the ring instead ([`TileData::ring`]), and whichever it
-/// did last is what is uploaded.
+/// did last is what is uploaded (zeroed vertices if it did neither). The vertices are zeroed only
+/// when they are asked for, so a finest tile's read never touches them.
 #[derive(Debug, Default)]
 pub struct TileData {
-    /// The vertices, row-major `side²`.
+    /// The vertices, row-major: `side²` of them once asked for in this read.
     vertices: Vec<GpuVertex>,
+    /// How many vertices the tile has.
+    count: usize,
     /// The ring's record.
     ring: RingRecord,
-    /// Whether the ring is what was written.
-    is_ring: bool,
+    /// What the source wrote in this read.
+    written: Written,
+}
+
+/// What a source wrote into a [`TileData`] in one read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Written {
+    /// Nothing yet: the tile uploads zeroed vertices.
+    #[default]
+    Nothing,
+    /// The vertices.
+    Vertices,
+    /// A finest tile's ring.
+    Ring,
+}
+
+/// What one read of a [`TileData`] uploads.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Upload<'a> {
+    /// Vertices, copied into the slot as they are: their bytes.
+    Vertices(&'a [u8]),
+    /// A finest tile's record, which the normal pass turns into the slot's vertices.
+    Ring(&'a RingRecord),
 }
 
 impl TileData {
-    /// `vertices` zeroed vertices to fill, and no ring.
-    pub(crate) fn reset(&mut self, vertices: usize) {
-        self.vertices.clear();
-        self.vertices.resize(vertices, GpuVertex::default());
-        self.is_ring = false;
+    /// Starts a read of a tile of `count` vertices: nothing written.
+    pub(crate) const fn reset(&mut self, count: usize) {
+        self.count = count;
+        self.written = Written::Nothing;
     }
 
-    /// The tile's vertices, row-major `side²`, to fill: they are what is uploaded.
+    /// The tile's vertices, row-major `side²`, zeroed at the first call of a read, to fill: they
+    /// are what is uploaded.
     pub fn vertices(&mut self) -> &mut [GpuVertex] {
-        self.is_ring = false;
+        if self.written != Written::Vertices {
+            self.vertices.clear();
+            self.vertices.resize(self.count, GpuVertex::default());
+            self.written = Written::Vertices;
+        }
         &mut self.vertices
     }
 
     /// Writes a finest tile as `block`, its positions with its one-vertex ring and its
     /// base-vertex rings, gathered over `mesh`: that is what is uploaded, and the GPU computes the
-    /// tile's vertices from it ([`crate::normals`]). `block` must be of the tile's side.
+    /// tile's vertices from it. `block` must be of the tile's side.
     pub fn ring(&mut self, mesh: &geom::BaseMesh, block: &geom::GatheredBlock) {
         self.ring.write(mesh, block);
-        self.is_ring = true;
+        self.written = Written::Ring;
     }
 
-    /// The ring's record, if the ring is what was written.
-    pub(crate) fn ring_record(&self) -> Option<&RingRecord> {
-        self.is_ring.then_some(&self.ring)
+    /// What this read uploads: the ring's record if the ring was written last, else the
+    /// vertices (zeroed if nothing was written).
+    pub(crate) fn upload(&mut self) -> Upload<'_> {
+        if self.written == Written::Ring {
+            return Upload::Ring(&self.ring);
+        }
+        Upload::Vertices(bytemuck::cast_slice(self.vertices()))
     }
 
     /// The ring's record, if the ring is what was written, for tests that change it.
     #[cfg(test)]
     pub(crate) fn ring_record_mut(&mut self) -> Option<&mut RingRecord> {
-        self.is_ring.then_some(&mut self.ring)
-    }
-
-    /// The vertices' bytes.
-    pub(crate) fn vertex_bytes(&self) -> &[u8] {
-        bytemuck::cast_slice(&self.vertices)
+        (self.written == Written::Ring).then_some(&mut self.ring)
     }
 }
 
@@ -199,8 +225,8 @@ pub trait TileSource {
 /// tiles from [`TileStore::positions_with_ring`].
 ///
 /// A finest tile uploads its positions with the one-vertex ring and its corners' base-vertex
-/// rings (plan decision 1), every vertex its owner's bits, and the GPU computes its normals
-/// ([`crate::normals`]); the store's CPU normals aren't computed.
+/// rings (plan decision 1), every vertex its owner's bits, and the GPU computes its normals; the
+/// store's CPU normals aren't computed.
 #[derive(Debug)]
 pub struct StoreSource<'a> {
     /// The store read.
