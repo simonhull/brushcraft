@@ -36,6 +36,7 @@ use crate::upload::{GpuVertex, TileDetail};
 
 mod cone;
 mod pop;
+mod seams;
 
 /// The finest level.
 const FINEST: u8 = 7;
@@ -74,8 +75,7 @@ fn sphere_point(mesh: &BaseMesh, face: FaceId, u: f32, v: f32) -> [f32; 3] {
 
 /// The finest level's vertex `(x, y)` of `face`'s grid: from its copy on the face of lowest
 /// index, so every face holding it agrees.
-fn finest_point(mesh: &BaseMesh, face: FaceId, x: u32, y: u32) -> [f32; 3] {
-    let finest = level(FINEST);
+fn finest_point(mesh: &BaseMesh, finest: Level, face: FaceId, x: u32, y: u32) -> [f32; 3] {
     let n = finest.face_quads();
     let tile = finest.tile_quads();
     let (face, x, y) = if x == 0 || y == 0 || x == n || y == n {
@@ -105,8 +105,8 @@ struct Tile {
     detail: TileDetail,
 }
 
-/// The synthetic tree: every tile of the sphere to [`FINEST`], resident, with its data in slot
-/// buffers (one per class).
+/// The synthetic tree: every tile of the sphere to its finest level, resident, with its data in
+/// slot buffers (one per class).
 struct World {
     /// The mesh.
     mesh: BaseMesh,
@@ -121,20 +121,25 @@ struct World {
 }
 
 impl World {
-    /// Every tile resident, its data uploaded and its node written.
+    /// Every tile resident to [`FINEST`], its data uploaded and its node written.
     fn new(gpu: &Gpu) -> Self {
+        Self::with_finest(gpu, FINEST)
+    }
+
+    /// Every tile resident to level `top`, its data uploaded and its node written.
+    fn with_finest(gpu: &Gpu, top: u8) -> Self {
         let mesh = cube_sphere(1).expect("a mesh");
-        let finest = level(FINEST);
+        let finest = level(top);
         let n = finest.face_quads();
         let grids: BTreeMap<u32, Vec<[f32; 3]>> = mesh
             .faces()
             .map(|face| {
                 let grid = (0..=n).flat_map(|y| (0..=n).map(move |x| (x, y)));
-                let points = grid.map(|(x, y)| finest_point(&mesh, face, x, y));
+                let points = grid.map(|(x, y)| finest_point(&mesh, finest, face, x, y));
                 (face.index(), points.collect())
             })
             .collect();
-        let places: Vec<Place> = (0..=FINEST)
+        let places: Vec<Place> = (0..=top)
             .flat_map(|l| {
                 let at = level(l);
                 let per_side = u16::try_from(at.tiles_per_side()).expect("small");
@@ -182,7 +187,7 @@ impl World {
                     .map(|v| geom::Vec3::new(v.normal[0], v.normal[1], v.normal[2]))
                     .collect();
                 TileDetail {
-                    error: measured_error(place, &vertices, grid, n, scale),
+                    error: measured_error(place, finest, &vertices, grid, scale),
                     cone: FinestNormalCone::covering(&normals).expect("normals"),
                 }
             };
@@ -273,14 +278,15 @@ impl World {
 /// so the distance between the two surfaces is largest at a finest vertex.
 fn measured_error(
     place: Place,
+    finest: Level,
     vertices: &[GpuVertex],
     grid: &[[f32; 3]],
-    n: u32,
     scale: u32,
 ) -> f32 {
+    let n = finest.face_quads();
     let quads = place.level().tile_quads();
     let side = quads + 1;
-    let key = place.key(level(FINEST)).expect("a tile");
+    let key = place.key(finest).expect("a tile");
     let (x0, y0) = (
         u32::from(key.tx()) * quads * scale,
         u32::from(key.ty()) * quads * scale,
