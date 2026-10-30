@@ -54,7 +54,10 @@
 //!    drawn; [`Residency::take_requests`], the requests a frame's readback gave, to
 //!    [`crate::upload::prefetch_requests`] and [`Residency::want`] (staged from the next frame on,
 //!    so the page-in or the read ahead has a frame to land; a display tile whose data is at hand
-//!    already, from this one).
+//!    already, from this one). The drain goes to [`crate::upload::FinestEvaluations::outdate`]
+//!    first, and the wanted finest tiles to
+//!    [`FinestEvaluations::request`](crate::upload::FinestEvaluations::request): they are evaluated
+//!    in the store's jobs after the hand-off, and staged once evaluated.
 //! 3. [`Residency::stage`]: reads tiles from the source until the deadline, writes them and the
 //!    tile tree's changed nodes into the staging ring, and returns the frame's [`FrameUploads`] for
 //!    the render thread.

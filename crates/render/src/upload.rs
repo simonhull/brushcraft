@@ -4,9 +4,11 @@
 //! The owner thread reads each tile from a [`TileSource`] (the store, through [`StoreSource`])
 //! into a [`TileData`]: a display tile as [`GpuVertex`]es, a finest tile as its positions with
 //! the one-vertex ring (a ring record, from which the GPU computes its vertices: the crate's
-//! `normals` module). It writes them, with the tile tree's changed nodes, into staging buffers
-//! mapped for writing. When the frame's uploads are staged, the buffers are unmapped and the
-//! copies they need become a [`FrameUploads`], which the render thread encodes into the frame's
+//! `normals` module). A requested finest tile is read from the copy the store's queued
+//! evaluation made in an earlier frame's jobs ([`FinestEvaluations`]), never evaluated while
+//! staging. The owner writes the tiles, with the tile tree's changed nodes, into staging
+//! buffers mapped for writing. When the frame's uploads are staged, the buffers are unmapped and
+//! the copies they need become a [`FrameUploads`], which the render thread encodes into the frame's
 //! command buffer ahead of every pass, the normal pass right after them, and submits
 //! ([`FrameUploads::submit`], which takes the passes, so they can only follow the copies and the
 //! normal pass): each staging buffer is then mapped for writing
@@ -22,16 +24,19 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use bytemuck::{Pod, Zeroable};
 use geom::{Channel, DisplayTile, FinestNormalCone, TileKey, Vec3};
-use store::{CacheError, Evaluation, TileStore};
+use store::{CacheError, EvaluatedTile, Evaluation, TileStore};
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode, Queue};
 
 use crate::gpu::{Gpu, GpuError};
 use crate::normals::{NormalWork, RingRecord};
 use crate::residency::{Request, Requests};
 
+mod finest;
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
+
+pub use finest::FinestEvaluations;
 
 /// One vertex of a resident tile as the GPU reads it: 32 bytes, two `vec4`s.
 ///
@@ -248,11 +253,18 @@ pub trait TileSource {
 }
 
 /// [`TileSource`] over the store: display tiles from [`TileStore::display_for_draw`], finest
-/// tiles from [`TileStore::positions_with_ring`].
+/// tiles from the copies the store's queued evaluation made ([`FinestEvaluations`]) or from
+/// [`TileStore::positions_with_ring`].
 ///
 /// A finest tile uploads its positions with the one-vertex ring and its corners' base-vertex
-/// rings (plan decision 1), every vertex its owner's bits, and the GPU computes its normals; the
-/// store's CPU normals aren't computed.
+/// rings (plan decision 1), every vertex its owner's bits, and the GPU computes its normals.
+///
+/// Built [`with_evaluations`](StoreSource::with_evaluations), a requested finest tile is read
+/// only from its evaluated copy, and deferred until there is one: the owner never evaluates it
+/// while staging. Finest tiles a pending epoch names (resident tiles an edit changed) are still
+/// evaluated here, together, since an epoch switches whole in the frame its last tile is
+/// staged; after a brush step they are mostly cached already. Built [`new`](StoreSource::new),
+/// every finest tile is evaluated here.
 #[derive(Debug)]
 pub struct StoreSource<'a> {
     /// The store read.
@@ -260,15 +272,51 @@ pub struct StoreSource<'a> {
     /// Display tiles read ahead by [`TileSource::prepare`], until [`TileSource::read`] takes
     /// them.
     display: BTreeMap<TileKey, Option<DisplayTile>>,
+    /// The finest tiles the store's queued evaluation made, if requested finest tiles are read
+    /// only from them.
+    evaluations: Option<&'a FinestEvaluations>,
+    /// Finest tiles read through the store's own evaluation on this thread, not from a copy.
+    evaluated_here: usize,
 }
 
 impl<'a> StoreSource<'a> {
-    /// Reads tiles from `store`.
+    /// Reads tiles from `store`, evaluating finest tiles as they are prepared.
     pub const fn new(store: &'a mut TileStore) -> Self {
         Self {
             store,
             display: BTreeMap::new(),
+            evaluations: None,
+            evaluated_here: 0,
         }
+    }
+
+    /// Reads tiles from `store`, a finest tile from its copy in `evaluations` if one is held;
+    /// requested finest tiles without one are deferred ([`TileSource::deferred`]).
+    pub const fn with_evaluations(
+        store: &'a mut TileStore,
+        evaluations: &'a FinestEvaluations,
+    ) -> Self {
+        Self {
+            store,
+            display: BTreeMap::new(),
+            evaluations: Some(evaluations),
+            evaluated_here: 0,
+        }
+    }
+
+    /// How many finest tiles were read through the store's evaluation on this thread, not from
+    /// a copy the queued evaluation made: tiles a pending epoch names, or every finest tile
+    /// for a source built [`new`](StoreSource::new). Each may have evaluated (and read from the
+    /// file) while staging.
+    #[must_use]
+    pub const fn evaluated_here(&self) -> usize {
+        self.evaluated_here
+    }
+
+    /// The copy of finest tile `key` the queued evaluation made, if one is held.
+    fn evaluated(&self, key: &TileKey) -> Option<&'a EvaluatedTile> {
+        self.evaluations
+            .and_then(|evaluations| evaluations.get(key))
     }
 }
 
@@ -279,6 +327,11 @@ impl TileSource for StoreSource<'_> {
         let (display, finest): (Vec<TileKey>, Vec<TileKey>) = keys
             .iter()
             .partition(|key| key.channel() == Channel::DISPLAY);
+        // A tile with a copy reads it: nothing to evaluate.
+        let finest: Vec<TileKey> = finest
+            .into_iter()
+            .filter(|key| self.evaluated(key).is_none())
+            .collect();
         if !finest.is_empty() {
             // Positions only, of every tile the rings read: the tiles, their aprons and the
             // tiles round their corners' base vertices.
@@ -298,6 +351,12 @@ impl TileSource for StoreSource<'_> {
 
     fn at_hand(&mut self, key: TileKey) -> bool {
         self.display.contains_key(&key) || !self.store.display_needs_read(&key)
+    }
+
+    fn deferred(&mut self, key: TileKey) -> bool {
+        self.evaluations.is_some()
+            && key.channel() != Channel::DISPLAY
+            && self.evaluated(&key).is_none()
     }
 
     fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, CacheError> {
@@ -328,6 +387,11 @@ impl TileSource for StoreSource<'_> {
             }
             return Ok(Some(TileDetail::of_display(&tile)));
         }
+        if let Some(tile) = self.evaluated(&key) {
+            out.ring(self.store.mesh(), tile.ring());
+            return Ok(Some(TileDetail::FINEST));
+        }
+        self.evaluated_here += 1;
         // Prepared tiles are cached and current: the gather reads them, evaluating nothing.
         let block = match self.store.cached_positions_with_ring(&key)? {
             Some(block) => block,
