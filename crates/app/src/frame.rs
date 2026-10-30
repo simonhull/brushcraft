@@ -12,7 +12,8 @@
 //!    epochs and stages the frame's tiles from the store, until half the way to the frame's
 //!    deadline;
 //! 5. **hand-off**: the frame goes to the render thread, as a [`FrameRequest`] carrying the staged
-//!    uploads, which it starts encoding at once (the uploads first, then the passes);
+//!    uploads and the scene (residency's buffers, the camera's view, the frame's time and whether
+//!    the camera moves), which it starts encoding at once (the uploads first, then the passes);
 //! 6. **upkeep**: meanwhile the project's recovery writer is ticked and polled;
 //! 7. **jobs**: and the store's resumable jobs (display-layer refresh and rebuild) run until the
 //!    frame's deadline, at least one slice of them. This frame draws nothing they produce: the
@@ -22,9 +23,14 @@
 //! amended by the Task 1 review).
 //!
 //! Frames are made on demand: [`schedule::Scheduler`] decides when, from why they are wanted.
-//! A frame that leaves store jobs queued, uploads pending, or epochs in the feed it hasn't
-//! drained (closed by its jobs or upkeep) wants the next one, as does upkeep between frames
-//! that closes epochs; input that moves the camera wants one; nothing else does.
+//! A frame that leaves store jobs queued, uploads in flight, requests pending, or epochs in the
+//! feed it hasn't drained (closed by its jobs or upkeep) wants the next one, as does upkeep
+//! between frames that closes epochs; a cut change the uploads hear of keeps frames coming until
+//! the morph it started is over; input that moves the camera wants one; nothing else does.
+//!
+//! **The morph's clock** is the frame loop's own: each frame is stamped with its start's time
+//! since the loop began, on this thread, and the stamp travels with the frame, so the render
+//! thread never reads a clock and a frame is the same given its inputs.
 
 pub(crate) mod schedule;
 
@@ -32,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use render::DrawTimes;
+use render::lod::LodStats;
 use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
 use store::{Drained, JobsReport, Project, StaleCursor, TileStore};
@@ -40,7 +47,7 @@ use self::schedule::{Next, Reason, Scheduler};
 use crate::camera::{Arcball, Camera};
 use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
-use crate::render_thread::{FrameRequest, Presented};
+use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
 
 /// The brush's place in the frame: M1a4's brush step, run on the owner thread after input and
 /// before the feed is drained, so the epochs its edits close reach the GPU in the same frame.
@@ -68,14 +75,22 @@ impl Brush for NoBrush {
 /// What the uploads did with a frame's epochs, and what they staged for it.
 #[derive(Debug, Default)]
 pub(crate) struct UploadStatus {
-    /// Whether uploads are still pending (the floor not all up, an epoch going up over several
-    /// frames, requested tiles still to come): the next frame is wanted.
-    pub(crate) converging: bool,
+    /// Whether uploads are in flight (the floor not all up, an epoch going up over several
+    /// frames): the next frame is wanted.
+    pub(crate) uploading: bool,
+    /// Whether requests are pending (requested tiles still to come, a request readback still to
+    /// read): the next frame is wanted.
+    pub(crate) requesting: bool,
+    /// The time (on the frame loop's clock, [`FrameUpdate::time`]) of the newest frame heard of
+    /// this frame whose cut changed: frames are wanted until the morph it started is over.
+    pub(crate) cut_changed: Option<Duration>,
     /// What the GPU holds, for the overlay's tiles line; `None` while it holds nothing.
     pub(crate) summary: Option<String>,
     /// The frame's staged uploads, which travel to the render thread in its
     /// [`FrameRequest`]; `None` if there is no GPU residency.
     pub(crate) frame: Option<FrameUploads>,
+    /// What residency gives the frame's scene; `None` if there is no GPU residency.
+    pub(crate) scene: Option<ResidentScene>,
 }
 
 /// The uploads' place in the frame: GPU residency ([`crate::uploads::GpuResidency`]).
@@ -92,6 +107,22 @@ pub(crate) trait Uploads {
     ///
     /// If the store can't give a tile, or the GPU refuses an upload.
     fn apply(&mut self, update: FrameUpdate, store: &mut TileStore) -> Result<UploadStatus>;
+
+    /// The render thread finished the last frame applied: `drawn` if its scene was drawn, so
+    /// what the scene's passes carried (the bounds of the tiles that changed) is on the GPU.
+    fn shown(&mut self, _drawn: bool) {}
+
+    /// How long a level change morphs: frames keep coming that long after a cut change. Zero
+    /// with no scene.
+    fn morph(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// The latest cut readback's counts, for the overlay; `None` with no scene, or before the
+    /// first.
+    fn scene(&self) -> Option<&LodStats> {
+        None
+    }
 }
 
 /// What a frame gives the uploads.
@@ -104,6 +135,8 @@ pub(crate) struct FrameUpdate {
     /// Whether the view (the camera or the frame size) changed since the last frame: what the
     /// level choice asks for may change with it.
     pub(crate) moved: bool,
+    /// The frame's time: its start, since the frame loop's clock began.
+    pub(crate) time: Duration,
 }
 
 /// No GPU residency, for the frame loop's tests without a GPU: nothing is uploaded, and the
@@ -230,6 +263,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     log: Option<PhaseLog>,
     /// The view (camera and frame size) the last frame was made with; `None` before the first.
     last_view: Option<(Camera, Size)>,
+    /// The frame loop's clock: frames are stamped with their time since it.
+    clock: Instant,
 }
 
 /// Every frame's phase times in a scripted run, for the summary printed at its end.
@@ -320,7 +355,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         now: Instant,
     ) -> Self {
         let cursor = project.store().subscribe_stale();
-        let mut scheduler = Scheduler::new(setup.interval, now);
+        let mut scheduler = Scheduler::new(setup.interval, now).with_morph(uploads.morph());
         scheduler.want(Reason::Exposed);
         if setup.frames.is_some() {
             scheduler.want(Reason::Scripted);
@@ -346,6 +381,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             after_hand_off: AfterHandOff::default(),
             log: setup.frames.map(|_| PhaseLog::default()),
             last_view: None,
+            clock: now,
         }
     }
 
@@ -459,17 +495,28 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.feed.count(&drained);
         phases.feed = lap.next();
 
-        let view = (self.camera, size);
+        let this_view = (self.camera, size);
+        let moved = self.last_view.replace(this_view) != Some(this_view);
+        let time = now.saturating_duration_since(self.clock);
         let update = FrameUpdate {
             drained,
             deadline: uploads_deadline(now, deadline),
-            moved: self.last_view.replace(view) != Some(view),
+            moved,
+            time,
         };
         let mut uploads = self
             .uploads
             .apply(update, self.project.store())
             .context("uploading tiles")?;
         phases.uploads = lap.next();
+        let scene = uploads.scene.take().and_then(|resident| {
+            Some(SceneRequest {
+                resident,
+                view: self.camera.view(size)?,
+                time,
+                moving: moved,
+            })
+        });
 
         let snapshot = Snapshot {
             frame: self.started,
@@ -482,6 +529,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             feed: self.feed,
             jobs: self.after_hand_off.report,
             tiles: uploads.summary.as_deref(),
+            scene: self.uploads.scene(),
             camera: self.camera,
         };
         let overlay = overlay::lines(&snapshot);
@@ -491,6 +539,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             overlay_scale: self.overlay_scale,
             overlay,
             uploads: uploads.frame.take(),
+            scene,
         })?;
         lap.next();
 
@@ -513,17 +562,34 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             });
         }
 
-        if uploads.converging || self.project.store().has_jobs() || self.has_stale() {
+        self.want_next(&uploads);
+        Ok(())
+    }
+
+    /// Tells the scheduler what, after a frame whose uploads said `uploads`, wants the next:
+    /// store jobs or undrained epochs, uploads in flight, requests pending, a cut change (until
+    /// its morph is over), a script's frames still to make.
+    fn want_next(&mut self, uploads: &UploadStatus) {
+        if self.project.store().has_jobs() || self.has_stale() {
             self.scheduler.want(Reason::Converging);
+        }
+        if uploads.uploading {
+            self.scheduler.want(Reason::Uploads);
+        }
+        if uploads.requesting {
+            self.scheduler.want(Reason::Requests);
+        }
+        if let Some(changed) = uploads.cut_changed {
+            self.scheduler.cut_changed(self.clock + changed);
         }
         if self.limit.is_some_and(|limit| self.started < limit) {
             self.scheduler.want(Reason::Scripted);
         }
-        Ok(())
     }
 
     /// The render thread finished a frame.
     pub(crate) fn shown(&mut self, presented: Presented) {
+        self.uploads.shown(presented.scene);
         self.finished += 1;
         self.render = Some(presented.times);
         if let Some(log) = &mut self.log {

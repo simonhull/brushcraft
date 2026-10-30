@@ -3,21 +3,27 @@
 //!
 //! It owns the [`Target`] and a [`Renderer`], which holds the frame's passes in order. Frames
 //! arrive one at a time over a channel ([`FrameRequest`]); each has its overlay text laid out,
-//! is drawn and presented, and what happened goes back ([`Presented`]), with a wake-up for the
-//! owner's event loop. Dropping the sender ends the thread, which hands the target back. The
-//! thread wakes the owner as it ends, however it ends (a panic included), so the owner always
-//! learns of it.
+//! is drawn ([`draw_frame`]: the uploads, the scene, the overlay) and presented, and what
+//! happened goes back ([`Presented`]), with a wake-up for the owner's event loop. The scene's
+//! passes come with the first frame's scene ([`ResidentScene::passes`]) and stay here. Dropping the
+//! sender ends the thread, which hands the target back. The thread wakes the owner as it ends,
+//! however it ends (a panic included), so the owner always learns of it.
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
+use geom::Level;
+use render::camera::View;
+use render::cull::{BoundsUpdate, SlotBuffers};
 use render::gpu::Gpu;
+use render::raster::{FramePasses, SceneInputs};
 use render::surface::{Presentation, Size, Target};
 use render::upload::FrameUploads;
 use render::{DrawTimes, FrameInputs, Outcome, Renderer};
-use wgpu::Color;
+use wgpu::{Buffer, Color};
 
 use crate::overlay::TextLayout;
 
@@ -46,6 +52,62 @@ pub(crate) struct FrameRequest {
     /// run) or the request is never drawn: that frame makes no request readback, so residency
     /// keeps wanting frames, and the next one hears of the loss and stages the tiles again.
     pub(crate) uploads: Option<FrameUploads>,
+    /// The scene to draw; `None` with no GPU residency (or no view to draw it from).
+    pub(crate) scene: Option<SceneRequest>,
+}
+
+/// What residency gives a frame's scene: the buffers the scene's passes read, owned (a
+/// [`Buffer`] is a shared handle), made on the owner thread.
+#[derive(Debug)]
+pub(crate) struct ResidentScene {
+    /// The tile tree's buffer.
+    pub(crate) tree: Buffer,
+    /// Residency's request buffer, which the level choice appends to.
+    pub(crate) requests: Buffer,
+    /// The slot buffers the tree's slots name.
+    pub(crate) slots: SlotBuffers,
+    /// The tiles whose bounds the frame recomputes: those whose data changed since the bounds the
+    /// GPU has.
+    pub(crate) bounds: BoundsUpdate,
+    /// The project's finest level.
+    pub(crate) finest: Level,
+    /// Residency's frame number, which the cut's readback carries back.
+    pub(crate) frame: u64,
+    /// The scene's passes, with the first frame's scene only: the render thread keeps them.
+    pub(crate) passes: Option<FramePasses>,
+}
+
+/// A frame's scene: residency's part and the frame loop's.
+#[derive(Debug)]
+pub(crate) struct SceneRequest {
+    /// What residency gives it.
+    pub(crate) resident: ResidentScene,
+    /// The view, of the frame's size.
+    pub(crate) view: View,
+    /// The frame's time on the frame loop's clock: the morph's time, stamped on the owner
+    /// thread so the render thread never reads a clock and a frame is the same given its inputs.
+    pub(crate) time: Duration,
+    /// Whether the camera moves this frame (the view changed since the last): level changes
+    /// then don't morph by time.
+    pub(crate) moving: bool,
+}
+
+impl SceneRequest {
+    /// The scene's passes' inputs.
+    fn inputs(&self) -> SceneInputs<'_> {
+        let resident = &self.resident;
+        SceneInputs {
+            tree: &resident.tree,
+            requests: &resident.requests,
+            slots: &resident.slots,
+            bounds: &resident.bounds,
+            view: &self.view,
+            time: self.time,
+            moving: self.moving,
+            finest: resident.finest,
+            frame: resident.frame,
+        }
+    }
 }
 
 /// What the render thread did with a frame.
@@ -61,6 +123,8 @@ pub(crate) struct Presented {
     pub(crate) outcome: Outcome,
     /// How long its phases took.
     pub(crate) times: DrawTimes,
+    /// Whether its scene was drawn (`render::Drawn::scene`).
+    pub(crate) scene: bool,
 }
 
 /// A hook the render thread calls.
@@ -310,27 +374,16 @@ impl Drawing {
         wake: &dyn Fn(),
         pre_present: &dyn Fn(),
     ) -> Result<()> {
-        while let Ok(mut frame) = frames.recv() {
+        while let Ok(frame) = frames.recv() {
             #[cfg(test)]
             (self.before_draw)(&frame);
-            let image = TextLayout::new(&frame.overlay).image();
-            let inputs = FrameInputs {
-                size: frame.size,
-                clear: CLEAR,
-                overlay: image.as_ref(),
-                overlay_scale: frame.overlay_scale,
-                scene: None,
-            };
-            let uploads = frame.uploads.take();
-            let drawn = self
-                .renderer
-                .draw(&self.gpu, &mut self.target, &inputs, uploads, pre_present)
-                .with_context(|| format!("drawing frame {}", frame.number))?;
-            let report = Presented {
-                number: frame.number,
-                outcome: drawn.outcome,
-                times: drawn.times,
-            };
+            let report = draw_frame(
+                &mut self.renderer,
+                &self.gpu,
+                &mut self.target,
+                frame,
+                pre_present,
+            )?;
             if presented.send(report).is_err() {
                 // The owner has stopped listening; it will hang up next.
                 break;
@@ -339,6 +392,49 @@ impl Drawing {
         }
         Ok(())
     }
+}
+
+/// Draws `frame` into `target` with `renderer`, calling `pre_present` before presenting.
+///
+/// Lays out its overlay, takes the scene's passes if it brings them, and draws its uploads, its
+/// scene and the overlay ([`Renderer::draw`]).
+///
+/// # Errors
+///
+/// If the frame can't be drawn.
+pub(crate) fn draw_frame(
+    renderer: &mut Renderer,
+    gpu: &Gpu,
+    target: &mut Target,
+    mut frame: FrameRequest,
+    pre_present: impl FnOnce(),
+) -> Result<Presented> {
+    let image = TextLayout::new(&frame.overlay).image();
+    let passes = frame
+        .scene
+        .as_mut()
+        .and_then(|scene| scene.resident.passes.take());
+    if let Some(passes) = passes {
+        renderer.set_passes(passes);
+    }
+    let scene = frame.scene.as_ref().map(SceneRequest::inputs);
+    let inputs = FrameInputs {
+        size: frame.size,
+        clear: CLEAR,
+        overlay: image.as_ref(),
+        overlay_scale: frame.overlay_scale,
+        scene: scene.as_ref(),
+    };
+    let uploads = frame.uploads.take();
+    let drawn = renderer
+        .draw(gpu, target, &inputs, uploads, pre_present)
+        .with_context(|| format!("drawing frame {}", frame.number))?;
+    Ok(Presented {
+        number: frame.number,
+        outcome: drawn.outcome,
+        times: drawn.times,
+        scene: drawn.scene,
+    })
 }
 
 #[cfg(test)]
@@ -367,6 +463,7 @@ mod tests {
             overlay_scale: 1,
             overlay: lines.iter().map(|&line| line.to_owned()).collect(),
             uploads: None,
+            scene: None,
         }
     }
 

@@ -905,6 +905,13 @@ impl Residency {
         self.entries.keys()
     }
 
+    /// The cut the last [`Residency::use_frame`] gave (empty before the first): what a newer
+    /// frame's cut is compared with, to tell whether it changed.
+    #[must_use]
+    pub const fn cut(&self) -> &BTreeSet<TileKey> {
+        &self.cut
+    }
+
     /// The floor: every face's display tiles up to [`ResidencyConfig::floor_top`], pinned.
     #[must_use]
     pub const fn floor(&self) -> &BTreeSet<TileKey> {

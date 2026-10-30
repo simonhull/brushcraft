@@ -5,9 +5,10 @@
 //! project's tiles on the GPU ([`uploads`]), then the frame handed to the render thread
 //! ([`render_thread`]), which encodes the uploads and the passes, submits and presents them,
 //! while the main thread runs the store's jobs. Frames are made only when something asks for
-//! one ([`frame::schedule`]). For now a frame is a clear colour under the debug overlay
-//! ([`overlay`]); the camera orbits, pans and zooms with the mouse and the pen ([`navigate`],
-//! [`camera`]).
+//! one ([`frame::schedule`]). A frame draws the project's surface: the level choice picks the
+//! resident tiles to draw, the raster draws their clusters into a visibility buffer, shown as a
+//! colour per cluster (a debug view until shading) under the debug overlay ([`overlay`]); the
+//! camera orbits, pans and zooms with the mouse and the pen ([`navigate`], [`camera`]).
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
@@ -38,7 +39,7 @@ use winit::event_loop::EventLoop;
 
 use crate::cli::{Mode, Options};
 use crate::frame::schedule::Next;
-use crate::frame::{NoBrush, Owner, Setup};
+use crate::frame::{NoBrush, Owner, Setup, Uploads as _};
 use crate::render_thread::{Hooks, RenderThread};
 use crate::uploads::GpuResidency;
 use crate::window::WindowApp;
@@ -54,7 +55,8 @@ pub(crate) type AppOwner = Owner<NoBrush, GpuResidency>;
 ///
 /// # Errors
 ///
-/// If GPU residency can't be set up; the project is closed first.
+/// If GPU residency or the scene's passes (the level choice, the raster) can't be set up on
+/// this GPU: at startup, never mid-session. The project is closed first.
 pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, setup: Setup) -> Result<AppOwner> {
     match GpuResidency::new(gpu, project.store()) {
         Ok(residency) => Ok(Owner::new(
@@ -87,6 +89,8 @@ pub(crate) struct Summary {
     pub(crate) presentation: Presentation,
     /// What the GPU held at the end, as the overlay's tiles line shows it.
     pub(crate) tiles: String,
+    /// What the last frame read back drew, as the overlay's scene line shows it.
+    pub(crate) scene: String,
     /// A scripted run's phase times ([`frame::PhaseLog::lines`]); empty for an open-ended run.
     pub(crate) phases: Vec<String>,
 }
@@ -101,6 +105,7 @@ impl Summary {
             adapter,
             presentation,
             tiles: uploads::summary(&residency.stats(), residency.floor_tiles()),
+            scene: uploads::scene_summary(residency.scene()),
             phases: owner
                 .phase_log()
                 .map(frame::PhaseLog::lines)
@@ -250,6 +255,7 @@ fn main() -> Result<()> {
         options.project.display()
     )?;
     writeln!(out, "tiles: {}", summary.tiles)?;
+    writeln!(out, "scene: {}", summary.scene)?;
     for line in &summary.phases {
         writeln!(out, "{line}")?;
     }

@@ -1,9 +1,9 @@
 //! When to render: the frame scheduler, a pure state machine.
 //!
 //! Frames are made on demand (the M1 spec's "When to render"): only when input arrived, the
-//! window needs drawing, a script asks, or something is converging (store jobs left to run,
-//! tiles still to upload, later morphs and accumulation). With none of those there is no
-//! frame, and about zero GPU work. The scheduler is told why frames are wanted
+//! window needs drawing, a script asks, or something is converging: store jobs left to run,
+//! uploads in flight, requests pending, a morph under way (later, accumulation). With none of
+//! those there is no frame, and about zero GPU work. The scheduler is told why frames are wanted
 //! ([`Scheduler::want`]) and when one starts and is shown, and answers what to do next
 //! ([`Scheduler::next`]); it never looks at a clock or a window itself, so every rule is
 //! tested with made-up times.
@@ -21,6 +21,10 @@
 //!   no event says so.
 //! - Upkeep (the recovery writer's flushes) is due every [`UPKEEP_INTERVAL`] after the last, which
 //!   a frame also runs; while idle the loop wakes for it, with no frame.
+//! - A frame whose cut changed ([`Scheduler::cut_changed`], heard a frame or two later from its
+//!   readback) keeps frames coming for the morph's duration after it: until a frame starts at or
+//!   past that frame's time plus the morph, so the last frame drawn shows the morph finished. The
+//!   duration is the raster's ([`Scheduler::with_morph`]).
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -35,8 +39,14 @@ pub(crate) enum Reason {
     /// The window needs drawing: first shown, resized, uncovered, or the last frame couldn't
     /// be shown.
     Exposed,
-    /// Something is converging: store jobs left, tiles to upload.
+    /// Something is converging: store jobs left, epochs in the feed to take.
     Converging,
+    /// Uploads are in flight: the floor not all up, an epoch still switching.
+    Uploads,
+    /// Requests are pending: requested tiles still to come, or a request readback still to read.
+    Requests,
+    /// A level change is morphing: the cut changed within the morph's duration.
+    Morphing,
     /// A scripted run (`--frames`) wants every frame.
     Scripted,
 }
@@ -48,7 +58,10 @@ impl Reason {
             Self::Input => 1,
             Self::Exposed => 1 << 1,
             Self::Converging => 1 << 2,
-            Self::Scripted => 1 << 3,
+            Self::Uploads => 1 << 3,
+            Self::Requests => 1 << 4,
+            Self::Morphing => 1 << 5,
+            Self::Scripted => 1 << 6,
         }
     }
 }
@@ -82,6 +95,9 @@ impl fmt::Display for Reasons {
             (Reason::Input, "input"),
             (Reason::Exposed, "exposed"),
             (Reason::Converging, "converging"),
+            (Reason::Uploads, "uploads"),
+            (Reason::Requests, "requests"),
+            (Reason::Morphing, "morphing"),
             (Reason::Scripted, "scripted"),
         ];
         let names: Vec<&str> = all
@@ -141,10 +157,15 @@ pub(crate) struct Scheduler {
     upkept: Instant,
     /// Whether the window's last frame came back hidden, and none has been shown since.
     hidden: bool,
+    /// How long a level change morphs: the raster's duration.
+    morph: Duration,
+    /// While a morph is under way, when it ends: frames are wanted until one starts then or
+    /// later.
+    morph_end: Option<Instant>,
 }
 
 impl Scheduler {
-    /// A scheduler pacing frames to `interval`, wanting none yet, at `now`.
+    /// A scheduler pacing frames to `interval`, wanting none yet, at `now`, with no morph.
     pub(crate) const fn new(interval: Duration, now: Instant) -> Self {
         Self {
             interval,
@@ -153,7 +174,23 @@ impl Scheduler {
             last_start: None,
             upkept: now,
             hidden: false,
+            morph: Duration::ZERO,
+            morph_end: None,
         }
+    }
+
+    /// The same scheduler, a level change morphing over `morph` (the raster's duration,
+    /// `render::raster::RasterConfig::morph`).
+    #[must_use]
+    pub(crate) const fn with_morph(self, morph: Duration) -> Self {
+        Self { morph, ..self }
+    }
+
+    /// A frame that started at `at` changed the cut: frames are wanted until one starts at or
+    /// after `at` plus the morph.
+    pub(crate) fn cut_changed(&mut self, at: Instant) {
+        let end = at + self.morph;
+        self.morph_end = Some(self.morph_end.map_or(end, |later| later.max(end)));
     }
 
     /// The refresh interval frames are paced to.
@@ -173,8 +210,17 @@ impl Scheduler {
 
     /// Why a frame is wanted now.
     #[cfg(test)]
-    pub(crate) const fn wanted(&self) -> Reasons {
-        self.wanted
+    pub(crate) fn wanted(&self) -> Reasons {
+        self.reasons()
+    }
+
+    /// Why a frame is wanted: what was asked for, and a morph under way.
+    fn reasons(&self) -> Reasons {
+        if self.morph_end.is_some() {
+            self.wanted.with(Reason::Morphing)
+        } else {
+            self.wanted
+        }
     }
 
     /// When upkeep is next due: [`UPKEEP_INTERVAL`] after it last ran (it may be past).
@@ -187,7 +233,7 @@ impl Scheduler {
         if self.in_flight {
             return Next::Render;
         }
-        if self.wanted.is_empty() {
+        if self.reasons().is_empty() {
             return Next::Idle {
                 upkeep: self.upkeep_due(),
             };
@@ -208,12 +254,17 @@ impl Scheduler {
     }
 
     /// A frame started at `now`: what was wanted is taken (and returned), and the frame is in
-    /// flight until [`Scheduler::shown`].
+    /// flight until [`Scheduler::shown`]. A morph ends with the first frame at or past its end.
     pub(crate) fn started(&mut self, now: Instant) -> Reasons {
+        let reasons = self.reasons();
         self.in_flight = true;
         self.last_start = Some(now);
         self.upkept = now;
-        std::mem::take(&mut self.wanted)
+        self.wanted = Reasons::default();
+        if self.morph_end.is_some_and(|end| end <= now) {
+            self.morph_end = None;
+        }
+        reasons
     }
 
     /// The render thread finished the frame in flight, with `outcome`.
@@ -436,6 +487,113 @@ mod tests {
         );
     }
 
+    /// The raster's morph, as the app's scheduler is given it.
+    const MORPH: Duration = render::raster::MORPH;
+
+    /// Makes frames at every interval from `from` while the scheduler wants them, each shown at
+    /// once and given `wanted` first; returns when each started.
+    fn frames_from(scheduler: &mut Scheduler, from: Instant, wanted: &[Reason]) -> Vec<Instant> {
+        let mut starts = Vec::new();
+        let mut now = from;
+        for _ in 0..1000 {
+            for &reason in wanted {
+                scheduler.want(reason);
+            }
+            match scheduler.next(now) {
+                Next::Frame { .. } => {
+                    scheduler.started(now);
+                    scheduler.shown(Outcome::Presented);
+                    starts.push(now);
+                    now += INTERVAL;
+                }
+                Next::Wait { until } => now = until,
+                Next::Idle { .. } => return starts,
+                Next::Render => unreachable!("every frame is shown at once"),
+            }
+        }
+        panic!("frames never stopped");
+    }
+
+    #[test]
+    fn a_cut_change_keeps_frames_coming_for_exactly_the_morph_then_none() {
+        let (scheduler, start) = scheduler();
+        let mut scheduler = scheduler.with_morph(MORPH);
+        scheduler.want(Reason::Input);
+        scheduler.started(start);
+        scheduler.shown(Outcome::Presented);
+        // That frame's readback says its cut changed, heard as a later frame is made.
+        scheduler.cut_changed(start);
+        assert!(scheduler.wanted().contains(Reason::Morphing));
+        let starts = frames_from(&mut scheduler, start + INTERVAL, &[]);
+        let after: Vec<Duration> = starts.iter().map(|&t| t - start).collect();
+        let last = *starts.last().expect("frames came");
+        assert!(
+            last >= start + MORPH,
+            "the last frame shows the morph finished: {after:?}"
+        );
+        let before_last = starts.iter().rev().nth(1);
+        assert!(
+            before_last.is_none_or(|&before| before < start + MORPH),
+            "and the frame before it didn't: {after:?}"
+        );
+        assert_eq!(
+            starts.len(),
+            9,
+            "150 ms at 60 Hz: the 9 frames after the change: {after:?}"
+        );
+        assert!(matches!(scheduler.next(last + INTERVAL), Next::Idle { .. }));
+        assert!(scheduler.wanted().is_empty(), "the morph is over");
+    }
+
+    #[test]
+    fn a_later_cut_change_moves_the_morphs_end_and_an_earlier_one_does_not() {
+        let (scheduler, start) = scheduler();
+        let mut scheduler = scheduler.with_morph(MORPH);
+        let later = start + Duration::from_millis(100);
+        scheduler.cut_changed(later);
+        scheduler.cut_changed(start);
+        let starts = frames_from(&mut scheduler, start, &[]);
+        let last = *starts.last().expect("frames came");
+        assert!(last >= later + MORPH && last < later + MORPH + INTERVAL);
+    }
+
+    #[test]
+    fn with_no_morph_a_cut_change_wants_one_frame() {
+        let (mut scheduler, start) = scheduler();
+        scheduler.cut_changed(start);
+        let starts = frames_from(&mut scheduler, start, &[]);
+        assert_eq!(starts, vec![start], "the frame at its end");
+    }
+
+    #[test]
+    fn pending_requests_and_uploads_keep_frames_coming_past_the_morph() {
+        for reason in [Reason::Requests, Reason::Uploads] {
+            let (scheduler, start) = scheduler();
+            let mut scheduler = scheduler.with_morph(MORPH);
+            scheduler.cut_changed(start);
+            // Pending for half a second: frames come all that time, past the morph.
+            let mut now = start;
+            let mut frames = 0;
+            while now < start + Duration::from_millis(500) {
+                scheduler.want(reason);
+                assert!(
+                    matches!(scheduler.next(now), Next::Frame { .. }),
+                    "{reason:?} wants a frame at {:?}",
+                    now - start
+                );
+                scheduler.started(now);
+                scheduler.shown(Outcome::Presented);
+                frames += 1;
+                now += INTERVAL;
+            }
+            assert!(frames > 9, "more than the morph's frames: {frames}");
+            assert!(
+                matches!(scheduler.next(now), Next::Idle { .. }),
+                "settled, and the morph long over: none"
+            );
+        }
+    }
+
     #[test]
     fn reasons_name_themselves() {
         assert_eq!(Reasons::default().to_string(), "none");
@@ -444,5 +602,10 @@ mod tests {
             .with(Reason::Input);
         assert_eq!(both.to_string(), "input+scripted");
         assert!(!both.contains(Reason::Converging));
+        let busy = Reasons::default()
+            .with(Reason::Morphing)
+            .with(Reason::Requests)
+            .with(Reason::Uploads);
+        assert_eq!(busy.to_string(), "uploads+requests+morphing");
     }
 }

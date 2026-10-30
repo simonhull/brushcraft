@@ -1,6 +1,7 @@
 //! `brushcraft --offscreen --frames N` end to end, through the built binary, on the software
 //! adapter (lavapipe in the gate): the app opens a saved project, uploads its floor of display
-//! tiles to the GPU, draws its frames with no window, closes it, and leaves nothing behind.
+//! tiles to the GPU, draws its surface in its frames with no window (the finest tiles the level
+//! choice asks for arriving), closes it, and leaves nothing behind.
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -98,8 +99,20 @@ mod tests {
         // The floor (24 faces' display tiles at levels 0 to 3, under level 4) went up to the
         // GPU and is resident, and no frame's uploads were lost.
         assert!(
-            stdout.contains("tiles: 96 resident (floor 96/96)") && stdout.contains("0 lost frames"),
+            stdout.contains("(floor 96/96)") && stdout.contains("0 lost frames"),
             "the floor is resident: {stdout}"
+        );
+        // The level choice drew the surface and asked for finest tiles, which arrived: more than
+        // the floor is resident, and the last cut read back wants nothing more.
+        let tiles = line(&stdout, "tiles: ");
+        let resident = number_before(tiles, " resident");
+        assert!(resident > 96, "finest tiles arrived: {tiles}");
+        let scene = line(&stdout, "scene: ");
+        let cut = number_after(scene, "cut ");
+        assert!(cut >= 24, "a cut covering every face came back: {scene}");
+        assert!(
+            scene.contains(" 0 requested"),
+            "every request served: {scene}"
         );
         let recovery = state.join("brushcraft").join("recovery");
         let left: Vec<_> = std::fs::read_dir(&recovery)
@@ -112,6 +125,26 @@ mod tests {
         // Closed and unlocked: it opens again.
         let reopened = Project::open(&project, config(&scratch.0.join("again"))).unwrap();
         reopened.close(false).unwrap();
+    }
+
+    /// The rest of the line of `text` that starts with `prefix`.
+    fn line<'a>(text: &'a str, prefix: &str) -> &'a str {
+        text.lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{text}"))
+    }
+
+    /// The number `text` starts with, up to `marker`.
+    fn number_before(text: &str, marker: &str) -> usize {
+        let (number, _) = text.split_once(marker).expect("the marker");
+        number.trim().parse().expect("a number")
+    }
+
+    /// The number right after `marker` in `text`.
+    fn number_after(text: &str, marker: &str) -> usize {
+        let (_, rest) = text.split_once(marker).expect("the marker");
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().expect("a number")
     }
 
     #[test]

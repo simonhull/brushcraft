@@ -14,14 +14,15 @@
 //! Math is `f64`: the camera is a handful of numbers, and accumulated drags then stay unit
 //! length for far longer.
 //!
-//! Where this goes next: culling and level choice (M1a3 Task 3) need the view and projection
-//! as matrices, on the render side. Before then the camera itself ([`Camera`], [`Rotation`]
-//! and their `f64` vector) moves into `render` (a `render::camera` module that also builds the
-//! view-projection matrices, in `f64`, handed to the GPU as `f32`), and this module keeps only
-//! the arcball and what navigation does with it. `geom::Vec3` is `f32` and stays the mesh's.
+//! The renderer takes the view as `render::camera::View` (`f64`, handed to the GPU
+//! eye-relative), which [`Camera::view`] makes from this camera's eye, target and up. `render`
+//! has a camera of its own with the same model; moving this one there, leaving this module the
+//! arcball and what navigation does with it, is still to do. `geom::Vec3` is `f32` and stays the
+//! mesh's.
 
 use std::ops::{Add, Mul, Neg, Sub};
 
+use render::camera::{NEAR_FRACTION, Vec3 as RenderVec3, View};
 use render::surface::Size;
 
 /// A vector in 3D, `f64`.
@@ -275,6 +276,22 @@ impl Camera {
         if factor.is_finite() && factor > 0.0 {
             self.distance = (self.distance * factor).clamp(Self::MIN_DISTANCE, Self::MAX_DISTANCE);
         }
+    }
+
+    /// The renderer's view (`f64`; the GPU gets it eye-relative) into a viewport of `size`: from
+    /// the eye towards the target, the view's up as this camera's, the near plane at
+    /// [`render::camera::NEAR_FRACTION`] of the distance. `None` only if rounding made the
+    /// camera degenerate, which its own operations never do.
+    pub(crate) fn view(&self, size: Size) -> Option<View> {
+        let point = |v: Vec3| RenderVec3::new(v.x, v.y, v.z);
+        View::look_at(
+            point(self.eye()),
+            point(self.target),
+            point(self.axis(Vec3::new(0.0, 1.0, 0.0))),
+            self.fov_y,
+            size,
+            self.distance * NEAR_FRACTION,
+        )
     }
 }
 

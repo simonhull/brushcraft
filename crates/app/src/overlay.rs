@@ -12,6 +12,7 @@ mod font;
 use std::time::Duration;
 
 use render::DrawTimes;
+use render::lod::LodStats;
 use render::overlay::TextImage;
 use render::surface::{Presentation, Size};
 use store::JobsReport;
@@ -44,6 +45,8 @@ pub(crate) struct Snapshot<'a> {
     /// What the GPU holds (tiles per level, over-budget count, residency), from the uploads;
     /// `None` while nothing is uploaded.
     pub(crate) tiles: Option<&'a str>,
+    /// What the latest frame read back drew; `None` before the first, or with no scene.
+    pub(crate) scene: Option<&'a LodStats>,
     /// The camera.
     pub(crate) camera: Camera,
 }
@@ -71,6 +74,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         feed,
         jobs,
         tiles,
+        scene,
         camera,
     } = *snapshot;
     let render_line = render.map_or_else(
@@ -112,6 +116,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
             jobs.left
         ),
         format!("tiles      {}", tiles.unwrap_or("none on the GPU yet")),
+        format!("scene      {}", crate::uploads::scene_summary(scene)),
         format!(
             "camera     eye {}  target {}  distance {:.3}",
             vec3(camera.eye()),
@@ -270,6 +275,7 @@ mod tests {
             },
             jobs,
             tiles: None,
+            scene: None,
             camera: Camera::default(),
         };
         let text = lines(&snapshot).join("\n");
@@ -282,6 +288,7 @@ mod tests {
             "3 epochs  45 tiles  1 resyncs",
             "1234 display tiles left",
             "none on the GPU yet",
+            "no cut read back yet",
             "eye (0.00, 0.00, 3.00)",
         ] {
             assert!(text.contains(expected), "{expected:?} in:\n{text}");

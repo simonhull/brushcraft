@@ -2,19 +2,26 @@
 //! demand, and closing.
 //!
 //! Mostly with no GPU; with GPU residency on lavapipe, the floor uploaded, a lost frame
-//! recovered, and an idle residency asking for no frames.
+//! recovered, and an idle residency asking for no frames; and with the renderer too, the surface
+//! drawn through the level choice and the raster, its cut read back into residency, and the same
+//! frames drawn from the same inputs.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::bail;
 use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
-use render::Outcome;
 use render::gpu::{AdapterRequest, Gpu};
+use render::raster::{BACKGROUND, VisibilityId};
+use render::surface::{Offscreen, Target};
+use render::tree::Place;
+use render::{Outcome, Renderer};
 use store::{Epoch, ProjectConfig, StoreConfig};
 
 use super::*;
 use crate::camera::Pixel;
 use crate::navigate::Button;
+use crate::render_thread::draw_frame;
 use crate::test_dir::TestDir;
 use crate::uploads::GpuResidency;
 
@@ -48,7 +55,7 @@ fn setup(frames: Option<u64>) -> Setup {
     }
 }
 
-/// The render thread's report of frame `number`, shown.
+/// The render thread's report of frame `number`, shown, with no scene drawn.
 const fn presented(number: u64) -> Presented {
     Presented {
         number,
@@ -58,6 +65,7 @@ const fn presented(number: u64) -> Presented {
             encode: Duration::ZERO,
             present: Duration::ZERO,
         },
+        scene: false,
     }
 }
 
@@ -152,9 +160,9 @@ impl Uploads for Recording {
         self.converging_for = self.converging_for.saturating_sub(1);
         self.times.push((Instant::now(), update.deadline));
         Ok(UploadStatus {
-            converging,
+            uploading: converging,
             summary: Some("3 tiles".to_owned()),
-            frame: None,
+            ..UploadStatus::default()
         })
     }
 }
@@ -481,8 +489,17 @@ fn software_gpu() -> Arc<Gpu> {
 }
 
 /// The frame loop over a test project in `dir` whose display layer is built already, its
-/// tiles kept on `gpu`.
+/// tiles kept on `gpu`, its clock started now.
 fn resident_owner(dir: &TestDir, gpu: &Arc<Gpu>) -> Owner<NoBrush, GpuResidency> {
+    resident_owner_at(dir, gpu, Instant::now())
+}
+
+/// [`resident_owner`], its clock started at `clock`.
+fn resident_owner_at(
+    dir: &TestDir,
+    gpu: &Arc<Gpu>,
+    clock: Instant,
+) -> Owner<NoBrush, GpuResidency> {
     let mut project = project(dir);
     while project.store().has_jobs() {
         project
@@ -491,7 +508,7 @@ fn resident_owner(dir: &TestDir, gpu: &Arc<Gpu>) -> Owner<NoBrush, GpuResidency>
             .expect("the display layer builds");
     }
     let residency = GpuResidency::new(Arc::clone(gpu), project.store()).expect("residency");
-    Owner::new(project, NoBrush, residency, setup(None), Instant::now())
+    Owner::new(project, NoBrush, residency, setup(None), clock)
 }
 
 /// Submits `request`'s uploads alone, as the render thread does ahead of its passes, and waits
@@ -633,7 +650,7 @@ fn a_frame_whose_uploads_are_dropped_is_recovered_by_the_next() {
 /// The request buffer's bytes as a level choice that wants `key` alone leaves them: the count
 /// 1, nothing dropped, then the one entry ([`render::residency::REQUESTS_WGSL`]).
 fn one_request(key: &TileKey) -> Vec<u8> {
-    let place = render::tree::Place::of(key);
+    let place = Place::of(key);
     let words = [1_u32, 0, 0, 0, key.face().index(), place.packed()];
     let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     bytes.extend(100.0_f32.to_le_bytes());
@@ -689,4 +706,181 @@ fn the_last_moves_requests_are_read_back_with_no_further_event() {
         "and once the readbacks agree, nothing more is wanted"
     );
     owner.close().expect("closed");
+}
+
+/// Where the GPU tests draw frames as the render thread does: a renderer and an offscreen
+/// target.
+struct Screen {
+    /// The renderer: the scene's passes arrive with the first frame.
+    renderer: Renderer,
+    /// The target.
+    target: Target,
+}
+
+impl Screen {
+    /// A renderer and an offscreen target of [`setup`]'s size on `gpu`.
+    fn new(gpu: &Gpu) -> Self {
+        let size = setup(None).size.expect("a size");
+        let target = Target::Offscreen(Offscreen::new(gpu, size).expect("a target"));
+        let renderer = Renderer::new(gpu, target.format()).expect("a renderer");
+        Self { renderer, target }
+    }
+
+    /// Draws `request` as the render thread would, and waits for the GPU, so its readbacks are
+    /// in by the next frame.
+    fn draw(&mut self, gpu: &Gpu, request: FrameRequest) -> Presented {
+        let presented = draw_frame(&mut self.renderer, gpu, &mut self.target, request, || {})
+            .expect("the frame is drawn");
+        gpu.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        presented
+    }
+
+    /// The visibility buffer, as the last frame left it.
+    fn ids(&self, gpu: &Gpu) -> Vec<u32> {
+        self.renderer
+            .passes()
+            .expect("the first frame brought the passes")
+            .raster()
+            .read_visibility(gpu)
+            .expect("read back")
+    }
+}
+
+/// Makes a frame started at `now`, its jobs and uploads given until `deadline`, draws it on
+/// `screen` and reports it shown; returns whether its scene was drawn.
+fn draw_one(
+    gpu: &Gpu,
+    owner: &mut Owner<NoBrush, GpuResidency>,
+    screen: &mut Screen,
+    now: Instant,
+    deadline: Instant,
+) -> bool {
+    let mut handed = None;
+    owner
+        .frame(now, deadline, |request| {
+            handed = Some(request);
+            Ok(())
+        })
+        .expect("a frame");
+    let presented = screen.draw(gpu, handed.expect("the frame was handed off"));
+    let scene = presented.scene;
+    owner.shown(presented);
+    scene
+}
+
+#[test]
+fn the_app_draws_the_surface_through_residency_and_hears_its_cuts() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut owner = resident_owner(&dir, &gpu);
+    let mut screen = Screen::new(&gpu);
+    let floor = owner.uploads().floor_tiles();
+    // On the real clock, for as long as frames are wanted.
+    let (mut made, mut most_requested) = (0, 0);
+    loop {
+        assert!(made < 300, "frames never stopped");
+        let now = Instant::now();
+        match owner.next(now) {
+            Next::Frame { deadline } => {
+                assert!(draw_one(&gpu, &mut owner, &mut screen, now, deadline));
+                made += 1;
+                let requested = owner.uploads().scene().map_or(0, |scene| scene.requested);
+                most_requested = most_requested.max(requested);
+            }
+            Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
+            Next::Render => panic!("every frame was shown"),
+            // Nothing converging: frames stopped by themselves.
+            Next::Idle { .. } => break,
+        }
+    }
+    // The cut came back, frame by frame, into residency.
+    let residency = owner.uploads().residency();
+    assert!(owner.uploads().cuts_heard() > 1, "cuts were read back");
+    assert!(!residency.cut().is_empty(), "residency holds the cut");
+    // The level choice asked for finest tiles, which arrived and are drawn.
+    assert!(most_requested > 0, "the level choice requested tiles");
+    let scene = owner.uploads().scene().expect("a cut").clone();
+    assert_eq!(scene.requested, 0, "every request served: {scene:?}");
+    let stats = residency.stats();
+    assert!(stats.resident > floor, "requested tiles arrived: {stats:?}");
+    assert_eq!(stats.wanted, 0, "and none is wanted still");
+    // The surface is in the visibility buffer, and every id names a resident tile.
+    let finest = Level::new(FINEST).expect("a level");
+    let ids: Vec<VisibilityId> = screen
+        .ids(&gpu)
+        .into_iter()
+        .filter_map(VisibilityId::decode)
+        .collect();
+    assert!(
+        ids.len() > 1000,
+        "the sphere covers the frame: {}",
+        ids.len()
+    );
+    let tree = residency.tree();
+    let keys: BTreeSet<TileKey> = ids
+        .iter()
+        .map(|id| {
+            let node = tree.gpu_node(id.node);
+            Place::from_packed(node.face, node.place)
+                .and_then(|place| place.key(finest))
+                .expect("a live node's tile")
+        })
+        .collect();
+    for key in &keys {
+        assert!(residency.slot(key).is_some(), "{key:?} is resident");
+    }
+    assert!(
+        keys.iter().any(|key| key.level() == finest),
+        "finest tiles are drawn: {keys:?}"
+    );
+    owner.close().expect("closed");
+}
+
+/// Each frame's visibility buffer, of `frames` frames of a fresh test project on `gpu`.
+///
+/// The camera is still; each frame starts an interval after the last on a clock begun at
+/// `clock`, and has all the time it wants.
+fn scripted_run(gpu: &Arc<Gpu>, clock: Instant, frames: u32) -> Vec<Vec<u32>> {
+    let dir = TestDir::new();
+    let mut owner = resident_owner_at(&dir, gpu, clock);
+    let mut screen = Screen::new(gpu);
+    let buffers = (0..frames).map(|k| {
+        let now = clock + INTERVAL * k;
+        let drawn = draw_one(
+            gpu,
+            &mut owner,
+            &mut screen,
+            now,
+            now + Duration::from_secs(600),
+        );
+        assert!(drawn, "frame {k}'s scene was drawn");
+        screen.ids(gpu)
+    });
+    let buffers: Vec<Vec<u32>> = buffers.collect();
+    owner.close().expect("closed");
+    buffers
+}
+
+#[test]
+fn the_same_inputs_draw_the_same_frames() {
+    let gpu = software_gpu();
+    // Long enough for the requested tiles to arrive and morph in, the camera still.
+    let frames = 14;
+    let first = scripted_run(&gpu, Instant::now(), frames);
+    let second = scripted_run(&gpu, Instant::now(), frames);
+    let drawn = |buffer: &[u32]| buffer.iter().filter(|&&id| id != BACKGROUND).count();
+    assert!(
+        first.iter().all(|buffer| drawn(buffer) > 1000),
+        "every frame draws the surface"
+    );
+    assert_ne!(
+        first.first(),
+        first.last(),
+        "the frames changed as tiles arrived"
+    );
+    for (k, (a, b)) in first.iter().zip(&second).enumerate() {
+        assert!(a == b, "frame {k} differs between the runs");
+    }
 }
