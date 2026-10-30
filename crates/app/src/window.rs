@@ -21,12 +21,13 @@ use winit::event::{
     ButtonSource, ElementState, MouseButton, MouseScrollDelta, TabletToolButton, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::camera::Pixel;
 use crate::cli::Options;
-use crate::frame::Setup;
 use crate::frame::schedule::Next;
+use crate::frame::{LookChange, Setup};
 use crate::navigate::{Button, Input, Modifiers};
 use crate::render_thread::{Hooks, RenderThread};
 use crate::{AppOwner, ProjectToOpen, Summary, describe_adapter, start};
@@ -263,8 +264,32 @@ impl WindowApp {
                     owner.input(Input::Wheel { notches });
                 }
             }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some(change) = look_change(event.physical_key)
+                {
+                    owner.change_look(change);
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// The change of look a key makes, if it makes one: by the key's place on the keyboard, so
+/// every layout has them where a QWERTY one does. M the next MatCap, W the wireframe, C the
+/// debug view of clusters.
+fn look_change(key: PhysicalKey) -> Option<LookChange> {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "KeyCode is non-exhaustive, and only these keys change the look"
+    )]
+    match key {
+        PhysicalKey::Code(KeyCode::KeyM) => Some(LookChange::MatCap),
+        PhysicalKey::Code(KeyCode::KeyW) => Some(LookChange::Wireframe),
+        PhysicalKey::Code(KeyCode::KeyC) => Some(LookChange::Clusters),
+        _ => None,
     }
 }
 

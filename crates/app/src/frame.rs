@@ -22,6 +22,13 @@
 //! Handing off before the jobs keeps them out of the input's latency (the plan's order,
 //! amended by the Task 1 review).
 //!
+//! **How the scene is shown** ([`Look`]: the MatCap's style, the wireframe, or the debug view of
+//! clusters) changes from the keyboard ([`LookChange`]). A frame wanted for that alone, with the
+//! view still and nothing staged, waiting or morphing, **shades the last scene again**: the
+//! shading pass only, no level choice or raster (the spec's target for a light or material
+//! change: one shading pass, independent of the mesh). Any other frame draws the scene whole, in
+//! the new look.
+//!
 //! Frames are made on demand: [`schedule::Scheduler`] decides when, from why they are wanted.
 //! A frame that leaves store jobs queued, uploads in flight, requests pending, or epochs in the
 //! feed it hasn't drained (closed by its jobs or upkeep) wants the next one, as does upkeep
@@ -37,14 +44,14 @@ pub(crate) mod schedule;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use render::DrawTimes;
 use render::lod::LodStats;
 use render::raster::FramePasses;
 use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
+use render::{DrawTimes, Look, SceneView};
 use store::{Drained, JobsReport, Project, StaleCursor, TileStore};
 
-use self::schedule::{Next, Reason, Scheduler};
+use self::schedule::{Next, Reason, Reasons, Scheduler};
 use crate::camera::{Arcball, Camera};
 use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
@@ -70,6 +77,35 @@ pub(crate) struct NoBrush;
 impl Brush for NoBrush {
     fn step(&mut self, _project: &mut Project, _camera: &Camera) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A change to how the scene is shown, from the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LookChange {
+    /// The wireframe over the shading, on or off.
+    Wireframe,
+    /// The next MatCap style.
+    MatCap,
+    /// The debug view of clusters in place of the shading, or back.
+    Clusters,
+}
+
+impl LookChange {
+    /// `look` changed by this.
+    #[must_use]
+    pub(crate) fn apply(self, mut look: Look) -> Look {
+        match self {
+            Self::Wireframe => look.shading.wireframe = !look.shading.wireframe,
+            Self::MatCap => look.shading.style = look.shading.style.next(),
+            Self::Clusters => {
+                look.view = match look.view {
+                    SceneView::Shaded => SceneView::Clusters,
+                    SceneView::Clusters => SceneView::Shaded,
+                };
+            }
+        }
+        look
     }
 }
 
@@ -268,6 +304,11 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     last_view: Option<(Camera, Size)>,
     /// The frame loop's clock: frames are stamped with their time since it.
     clock: Instant,
+    /// How the scene is shown.
+    look: Look,
+    /// Whether the last frame finished showed a scene (drawn or shaded again), which a frame
+    /// shading it again needs.
+    scene_shown: bool,
 }
 
 /// Every frame's phase times in a scripted run, for the summary printed at its end.
@@ -385,7 +426,21 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             log: setup.frames.map(|_| PhaseLog::default()),
             last_view: None,
             clock: now,
+            look: Look::default(),
+            scene_shown: false,
         }
+    }
+
+    /// Changes how the scene is shown, and wants a frame to show it.
+    pub(crate) fn change_look(&mut self, change: LookChange) {
+        self.look = change.apply(self.look);
+        self.scheduler.want(Reason::Look);
+    }
+
+    /// How the scene is shown.
+    #[cfg(test)]
+    pub(crate) const fn look(&self) -> Look {
+        self.look
     }
 
     /// Queues pointer input for the next frame's input phase, and wants that frame if the
@@ -471,7 +526,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let size = self
             .size
             .context("a frame was started with no frame size")?;
-        self.scheduler.started(now);
+        let reasons = self.scheduler.started(now);
         self.started += 1;
         let mut phases = OwnerPhases {
             upkeep: self.after_hand_off.upkeep,
@@ -512,7 +567,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .apply(update, self.project.store())
             .context("uploading tiles")?;
         phases.uploads = lap.next();
-        let scene = uploads.scene.take().and_then(|resident| {
+        let reshade = self.scene_shown
+            && reasons == Reasons::default().with(Reason::Look)
+            && !moved
+            && quiet(&uploads);
+        let resident = uploads.scene.take().filter(|_| !reshade);
+        let scene = resident.and_then(|resident| {
             Some(SceneRequest {
                 resident,
                 view: self.camera.view(size)?,
@@ -534,6 +594,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             tiles: uploads.summary.as_deref(),
             scene: self.uploads.scene(),
             camera: self.camera,
+            look: self.look,
         };
         let overlay = overlay::lines(&snapshot);
         hand_off(FrameRequest {
@@ -543,6 +604,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             overlay,
             uploads: uploads.frame.take(),
             scene,
+            reshade,
+            look: self.look,
             passes: uploads.passes.take(),
         })?;
         lap.next();
@@ -595,6 +658,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) fn shown(&mut self, presented: Presented) {
         self.uploads.shown(presented.scene);
         self.finished += 1;
+        self.scene_shown = presented.shown;
         self.render = Some(presented.times);
         if let Some(log) = &mut self.log {
             log.render.push(presented.times);
@@ -662,6 +726,18 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) const fn project(&mut self) -> &mut Project {
         &mut self.project
     }
+}
+
+/// Whether the uploads left a frame nothing new to draw.
+///
+/// That is nothing staged in it, in flight or requested, and no cut change heard (so no morph
+/// started): shading the last scene again then shows what a whole frame would.
+fn quiet(uploads: &UploadStatus) -> bool {
+    uploads.frame.as_ref().is_none_or(FrameUploads::is_empty)
+        && !uploads.uploading
+        && !uploads.requesting
+        && uploads.cut_changed.is_none()
+        && uploads.passes.is_none()
 }
 
 /// Times consecutive phases: each [`Lap::next`] is the time since the last.

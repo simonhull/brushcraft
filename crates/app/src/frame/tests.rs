@@ -12,6 +12,7 @@ use std::sync::Arc;
 use anyhow::bail;
 use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
 use render::gpu::{AdapterRequest, Gpu};
+use render::material::MatCapStyle;
 use render::raster::{BACKGROUND, VisibilityId};
 use render::surface::{Offscreen, Target};
 use render::tree::Place;
@@ -71,6 +72,7 @@ const fn presented(number: u64) -> Presented {
             present: Duration::ZERO,
         },
         scene: false,
+        shown: false,
     }
 }
 
@@ -742,6 +744,14 @@ impl Screen {
         presented
     }
 
+    /// The frame's pixels, as the last frame left them.
+    fn pixels(&self, gpu: &Gpu) -> Vec<[u8; 4]> {
+        let Target::Offscreen(offscreen) = &self.target else {
+            unreachable!("made offscreen");
+        };
+        offscreen.read_pixels(gpu).expect("read back")
+    }
+
     /// The visibility buffer, as the last frame left it.
     fn ids(&self, gpu: &Gpu) -> Vec<u32> {
         self.renderer
@@ -924,6 +934,100 @@ fn bounds_of(request: &FrameRequest) -> usize {
 }
 
 #[test]
+fn a_change_of_look_alone_shades_the_last_scene_again_and_draws_nothing_new() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut owner = resident_owner(&dir, &gpu);
+    let mut screen = Screen::new(&gpu);
+    // Until frames stop by themselves: everything resident, every morph over.
+    let mut made = 0;
+    loop {
+        assert!(made < 300, "frames never stopped");
+        let now = Instant::now();
+        match owner.next(now) {
+            Next::Frame { deadline } => {
+                draw_one(&gpu, &mut owner, &mut screen, now, deadline);
+                made += 1;
+            }
+            Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
+            Next::Render => panic!("every frame was shown"),
+            Next::Idle { .. } => break,
+        }
+    }
+    let clay = screen.pixels(&gpu);
+    let ids = screen.ids(&gpu);
+    owner.change_look(LookChange::MatCap);
+    assert_eq!(owner.look().shading.style, MatCapStyle::Glossy);
+    assert!(
+        matches!(owner.next(Instant::now() + INTERVAL), Next::Frame { .. }),
+        "the change wants a frame"
+    );
+    let request = hand_off(&mut owner, Instant::now());
+    assert!(request.reshade, "the shading alone");
+    assert!(request.scene.is_none(), "no level choice or raster");
+    assert_eq!(request.look.shading.style, MatCapStyle::Glossy);
+    let presented = screen.draw(&gpu, request);
+    assert!(
+        !presented.scene && presented.shown,
+        "shaded again: {presented:?}"
+    );
+    owner.shown(presented);
+    assert_eq!(screen.ids(&gpu), ids, "nothing drawn anew");
+    let glossy = screen.pixels(&gpu);
+    let changed = clay.iter().zip(&glossy).filter(|(a, b)| a != b).count();
+    assert!(
+        changed > clay.len() / 20,
+        "the new MatCap shows: {changed} pixels"
+    );
+    // The debug view, the same way.
+    owner.change_look(LookChange::Clusters);
+    let debug = hand_off(&mut owner, Instant::now());
+    assert!(debug.reshade, "the debug view shows the same scene");
+    let debug_shown = screen.draw(&gpu, debug);
+    assert!(debug_shown.shown, "shown");
+    owner.shown(debug_shown);
+    assert_ne!(screen.pixels(&gpu), glossy, "as clusters");
+    // A change of look with the view changed too draws the scene whole.
+    owner.change_look(LookChange::Clusters);
+    owner.resize(Size::new(300, 200));
+    let whole = hand_off(&mut owner, Instant::now());
+    assert!(!whole.reshade, "drawn whole");
+    assert!(whole.scene.is_some(), "with its scene");
+    let whole_shown = screen.draw(&gpu, whole);
+    assert!(
+        whole_shown.scene && whole_shown.shown,
+        "drawn: {whole_shown:?}"
+    );
+    owner.shown(whole_shown);
+    owner.close().expect("closed");
+}
+
+#[test]
+fn each_key_changes_the_look_its_own_way() {
+    let look = Look::default();
+    let wired = LookChange::Wireframe.apply(look);
+    assert!(wired.shading.wireframe && !LookChange::Wireframe.apply(wired).shading.wireframe);
+    let styles: Vec<MatCapStyle> =
+        std::iter::successors(Some(look), |l| Some(LookChange::MatCap.apply(*l)))
+            .take(4)
+            .map(|l| l.shading.style)
+            .collect();
+    assert_eq!(
+        styles,
+        [
+            MatCapStyle::Clay,
+            MatCapStyle::Glossy,
+            MatCapStyle::Pale,
+            MatCapStyle::Clay
+        ],
+        "round the styles"
+    );
+    let debug = LookChange::Clusters.apply(look);
+    assert_eq!(debug.view, SceneView::Clusters);
+    assert_eq!(LookChange::Clusters.apply(debug), look, "and back");
+}
+
+#[test]
 fn a_frame_whose_scene_wasnt_drawn_leaves_its_bounds_to_the_next() {
     let dir = TestDir::new();
     let gpu = software_gpu();
@@ -1015,6 +1119,8 @@ fn residency_frame(
         overlay: Vec::new(),
         uploads: status.frame.take(),
         scene,
+        reshade: false,
+        look: Look::default(),
         passes: status.passes.take(),
     };
     let presented = screen.draw(gpu, request);

@@ -1,12 +1,12 @@
 //! When to render: the frame scheduler, a pure state machine.
 //!
 //! Frames are made on demand (the M1 spec's "When to render"): only when input arrived, the
-//! window needs drawing, a script asks, or something is converging: store jobs left to run,
-//! uploads in flight, requests pending, a morph under way (later, accumulation). With none of
-//! those there is no frame, and about zero GPU work. The scheduler is told why frames are wanted
-//! ([`Scheduler::want`]) and when one starts and is shown, and answers what to do next
-//! ([`Scheduler::next`]); it never looks at a clock or a window itself, so every rule is
-//! tested with made-up times.
+//! window needs drawing, a script asks, how the scene is shown changed, or something is
+//! converging: store jobs left to run, uploads in flight, requests pending, a morph under way
+//! (later, accumulation). With none of those there is no frame, and about zero GPU work. The
+//! scheduler is told why frames are wanted ([`Scheduler::want`]) and when one starts and is shown,
+//! and answers what to do next ([`Scheduler::next`]); it never looks at a clock or a window itself,
+//! so every rule is tested with made-up times.
 //!
 //! Its rules:
 //!
@@ -49,6 +49,9 @@ pub(crate) enum Reason {
     Morphing,
     /// A scripted run (`--frames`) wants every frame.
     Scripted,
+    /// How the scene is shown changed (the material, the wireframe, the debug view): a frame
+    /// wanted for this alone shades the last scene again, with no raster.
+    Look,
 }
 
 impl Reason {
@@ -62,6 +65,7 @@ impl Reason {
             Self::Requests => 1 << 4,
             Self::Morphing => 1 << 5,
             Self::Scripted => 1 << 6,
+            Self::Look => 1 << 7,
         }
     }
 }
@@ -99,6 +103,7 @@ impl fmt::Display for Reasons {
             (Reason::Requests, "requests"),
             (Reason::Morphing, "morphing"),
             (Reason::Scripted, "scripted"),
+            (Reason::Look, "look"),
         ];
         let names: Vec<&str> = all
             .into_iter()

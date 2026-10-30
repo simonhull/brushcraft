@@ -9,7 +9,8 @@
 //! resident tiles to draw, the raster draws their clusters into a visibility buffer, and the
 //! shading pass shades it through a MatCap into a linear HDR image, tone mapped, under the debug
 //! overlay ([`overlay`]); the camera orbits, pans and zooms with the mouse and the pen
-//! ([`navigate`], [`camera`]).
+//! ([`navigate`], [`camera`]). Keys change how the scene is shown (M the MatCap, W the
+//! wireframe, C the debug view of a colour per cluster), each a shading pass alone.
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and

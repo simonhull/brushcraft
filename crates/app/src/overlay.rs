@@ -11,10 +11,10 @@ mod font;
 
 use std::time::Duration;
 
-use render::DrawTimes;
 use render::lod::LodStats;
 use render::overlay::TextImage;
 use render::surface::{Presentation, Size};
+use render::{DrawTimes, Look, SceneView};
 use store::JobsReport;
 
 use crate::camera::{Camera, Vec3};
@@ -49,6 +49,8 @@ pub(crate) struct Snapshot<'a> {
     pub(crate) scene: Option<&'a LodStats>,
     /// The camera.
     pub(crate) camera: Camera,
+    /// How the scene is shown.
+    pub(crate) look: Look,
 }
 
 /// `duration` in milliseconds, to two places.
@@ -76,7 +78,13 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         tiles,
         scene,
         camera,
+        look,
     } = *snapshot;
+    let view = match look.view {
+        SceneView::Shaded => format!("matcap {}", look.shading.style.name()),
+        SceneView::Clusters => "clusters (debug view)".to_owned(),
+    };
+    let wireframe = if look.shading.wireframe { "on" } else { "off" };
     let render_line = render.map_or_else(
         || "render ms  -".to_owned(),
         |phases| {
@@ -122,6 +130,9 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
             vec3(camera.eye()),
             vec3(camera.target()),
             camera.distance()
+        ),
+        format!(
+            "look       {view}  wireframe {wireframe}  (keys: M matcap, W wireframe, C clusters)"
         ),
     ]
 }
@@ -277,6 +288,13 @@ mod tests {
             tiles: None,
             scene: None,
             camera: Camera::default(),
+            look: Look {
+                view: SceneView::Shaded,
+                shading: render::shade::ShadeSettings {
+                    style: render::material::MatCapStyle::Glossy,
+                    wireframe: true,
+                },
+            },
         };
         let text = lines(&snapshot).join("\n");
         for expected in [
@@ -290,6 +308,7 @@ mod tests {
             "none on the GPU yet",
             "no cut read back yet",
             "eye (0.00, 0.00, 3.00)",
+            "matcap glossy  wireframe on",
         ] {
             assert!(text.contains(expected), "{expected:?} in:\n{text}");
         }

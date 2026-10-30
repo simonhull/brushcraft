@@ -52,8 +52,14 @@ pub(crate) struct FrameRequest {
     /// run) or the request is never drawn: that frame makes no request readback, so residency
     /// keeps wanting frames, and the next one hears of the loss and stages the tiles again.
     pub(crate) uploads: Option<FrameUploads>,
-    /// The scene to draw; `None` with no GPU residency (or no view to draw it from).
+    /// The scene to draw; `None` with no GPU residency (or no view to draw it from), or when
+    /// the frame only shades the last scene again ([`FrameRequest::reshade`]).
     pub(crate) scene: Option<SceneRequest>,
+    /// With no scene: shade the last scene drawn again, with this frame's look (a change of look
+    /// alone, nothing else changed; `render::Scene::Reshade`).
+    pub(crate) reshade: bool,
+    /// How the scene is shown.
+    pub(crate) look: Look,
     /// The scene's passes, with the first frame only, whether or not it has a scene: the render
     /// thread keeps them.
     pub(crate) passes: Option<FramePasses>,
@@ -126,6 +132,8 @@ pub(crate) struct Presented {
     pub(crate) times: DrawTimes,
     /// Whether its scene was drawn (`render::Drawn::scene`).
     pub(crate) scene: bool,
+    /// Whether a scene was shown, drawn or shaded again (`render::Drawn::shown`).
+    pub(crate) shown: bool,
 }
 
 /// A hook the render thread calls.
@@ -414,14 +422,19 @@ pub(crate) fn draw_frame(
     if let Some(passes) = frame.passes.take() {
         renderer.set_passes(passes);
     }
-    let scene = frame.scene.as_ref().map(SceneRequest::inputs);
+    let scene_inputs = frame.scene.as_ref().map(SceneRequest::inputs);
+    let scene = match (&scene_inputs, frame.reshade) {
+        (Some(inputs), _) => Scene::Draw(inputs),
+        (None, true) => Scene::Reshade,
+        (None, false) => Scene::None,
+    };
     let inputs = FrameInputs {
         size: frame.size,
         clear: CLEAR,
         overlay: image.as_ref(),
         overlay_scale: frame.overlay_scale,
-        scene: scene.as_ref().map_or(Scene::None, Scene::Draw),
-        look: Look::default(),
+        scene,
+        look: frame.look,
     };
     let uploads = frame.uploads.take();
     let drawn = renderer
@@ -432,6 +445,7 @@ pub(crate) fn draw_frame(
         outcome: drawn.outcome,
         times: drawn.times,
         scene: drawn.scene,
+        shown: drawn.shown,
     })
 }
 
@@ -462,6 +476,8 @@ mod tests {
             overlay: lines.iter().map(|&line| line.to_owned()).collect(),
             uploads: None,
             scene: None,
+            reshade: false,
+            look: Look::default(),
             passes: None,
         }
     }
