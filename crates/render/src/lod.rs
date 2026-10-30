@@ -1683,13 +1683,17 @@ fn read_output(buffer: &Buffer, finest: Level, tag: u64) -> Result<LodOutput, Lo
         .get(..frame_end)
         .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
         .unwrap_or_else(GpuFrame::zeroed);
+    // Only the entries written: the buffer holds the whole capacity's.
+    let written_bytes = u64::from(frame.cut_count).saturating_mul(CUT_BYTES);
+    let cut_end = usize::try_from(written_bytes)
+        .unwrap_or(usize::MAX)
+        .saturating_add(frame_end)
+        .min(view.len());
     let entries: Vec<GpuCutEntry> = view
-        .get(frame_end..)
+        .get(frame_end..cut_end)
         .map(bytemuck::pod_collect_to_vec)
         .unwrap_or_default();
-    let written = entries
-        .iter()
-        .take(usize::try_from(frame.cut_count).unwrap_or(usize::MAX));
+    let written = entries.iter();
     let mut output = LodOutput {
         frame: tag,
         stats: stats(&frame),

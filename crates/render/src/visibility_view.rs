@@ -16,11 +16,14 @@ use wgpu::{
 
 use crate::gpu::{Gpu, GpuError};
 
-/// The debug view's pipeline.
+/// The debug view's pipeline, and the bind group of the visibility buffer it last showed.
 #[derive(Debug)]
 pub(crate) struct VisibilityView {
     /// Draws the fullscreen triangle.
     pipeline: RenderPipeline,
+    /// The visibility buffer bound, and its bind group: kept while the raster keeps the buffer
+    /// (it makes a new one only when the frame's size changes).
+    bound: Option<(Texture, BindGroup)>,
 }
 
 impl VisibilityView {
@@ -64,18 +67,30 @@ impl VisibilityView {
                 multiview_mask: None,
                 cache: None,
             });
-            Self { pipeline }
+            Self {
+                pipeline,
+                bound: None,
+            }
         })
     }
 
-    /// The bind group that shows `visibility` (the raster's visibility buffer, the frame's
-    /// size): made each frame, since the raster remakes its buffer when the frame's size changes.
+    /// Binds `visibility` (the raster's visibility buffer, the frame's size) for
+    /// [`VisibilityView::draw`]: the bind group is made only when the buffer is another than
+    /// the last one bound.
     ///
     /// # Errors
     ///
     /// As [`Gpu::scoped`].
-    pub(crate) fn bind(&self, gpu: &Gpu, visibility: &Texture) -> Result<BindGroup, GpuError> {
-        gpu.scoped("visibility view bind group", || {
+    pub(crate) fn bind(&mut self, gpu: &Gpu, visibility: &Texture) -> Result<(), GpuError> {
+        if self
+            .bound
+            .as_ref()
+            .is_some_and(|(texture, _)| texture == visibility)
+        {
+            return Ok(());
+        }
+        self.bound = None;
+        let group = gpu.scoped("visibility view bind group", || {
             let view = visibility.create_view(&TextureViewDescriptor::default());
             gpu.device().create_bind_group(&BindGroupDescriptor {
                 label: Some("visibility view"),
@@ -85,13 +100,18 @@ impl VisibilityView {
                     resource: BindingResource::TextureView(&view),
                 }],
             })
-        })
+        })?;
+        self.bound = Some((visibility.clone(), group));
+        Ok(())
     }
 
-    /// Draws the visibility buffer `group` binds ([`VisibilityView::bind`]) into `pass`.
-    pub(crate) fn draw(&self, pass: &mut RenderPass<'_>, group: &BindGroup) {
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, group, &[]);
-        pass.draw(0..3, 0..1);
+    /// Draws the visibility buffer last bound ([`VisibilityView::bind`]) into `pass`; nothing
+    /// if none is.
+    pub(crate) fn draw(&self, pass: &mut RenderPass<'_>) {
+        if let Some((_, group)) = &self.bound {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 }

@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use wgpu::{
-    BindGroup, Color, CommandEncoder, CommandEncoderDescriptor, LoadOp, Operations,
-    RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureFormat,
+    Color, CommandEncoder, CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
+    RenderPassDescriptor, StoreOp, TextureFormat,
 };
 
 use crate::gpu::{Gpu, GpuError};
@@ -89,18 +89,20 @@ pub struct Drawn {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DrawError {
-    /// The target (resizing, acquiring, presenting), or the GPU under it.
+    /// The target: resizing, acquiring or presenting it. The frame's uploads are dropped
+    /// unsubmitted (their residency hears of it and recovers).
     #[error(transparent)]
     Surface(#[from] SurfaceError),
-    /// The scene's passes couldn't be encoded. The frame's uploads were submitted all the same.
+    /// The GPU refused the frame's own work: rebuilding a pass for a new format, uploading the
+    /// overlay, or a validation error in the frame's submission (the frame was submitted).
+    #[error(transparent)]
+    Gpu(#[from] GpuError),
+    /// The scene's passes (the level choice, the raster, the debug view's binding) couldn't be
+    /// encoded. The frame was submitted all the same, its uploads first, with the passes encoded
+    /// before the failure (whole passes only), so its tiles arrive; its cut readback is given
+    /// back unread, and the acquired image is dropped unpresented.
     #[error("encoding the scene's passes")]
     Scene(#[from] FrameError),
-}
-
-impl From<GpuError> for DrawError {
-    fn from(error: GpuError) -> Self {
-        Self::Surface(SurfaceError::Gpu(error))
-    }
 }
 
 /// The passes that draw into the frame's image, built for its format.
@@ -129,14 +131,9 @@ impl ImagePasses {
     }
 }
 
-/// A frame's scene, encoded: its readback, and how its visibility buffer is shown.
-struct EncodedScene {
-    /// The cut's readback, to mark submitted once the frame is; `None` if every readback buffer
-    /// was in flight.
-    readback: Option<CutReadback>,
-    /// The debug view's bind group over the frame's visibility buffer.
-    view: BindGroup,
-}
+/// A frame's scene, encoded, its visibility buffer bound for the debug view: its readback, to
+/// mark submitted once the frame is; `None` if every readback buffer was in flight.
+type EncodedScene = Option<CutReadback>;
 
 /// Draws frames: the passes and their GPU state.
 #[derive(Debug)]
@@ -216,9 +213,8 @@ impl Renderer {
             image: image_passes,
             passes: scene_passes,
         } = self;
-        image_passes
-            .overlay
-            .prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
+        let ImagePasses { view, overlay, .. } = image_passes;
+        overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         let to_draw = inputs.scene.zip(scene_passes.as_mut());
         // A frame with no scene runs no level choice: its request readback reads nothing.
         let uploads = uploads.map(|uploads| {
@@ -236,9 +232,8 @@ impl Renderer {
                 });
             let mut drawn = None;
             let passes = |frame: &mut CommandEncoder| {
-                drawn = to_draw.map(|(scene, passes)| {
-                    encode_scene(gpu, frame, scene, passes, &image_passes.view)
-                });
+                drawn =
+                    to_draw.map(|(scene, passes)| encode_scene(gpu, frame, scene, passes, view));
                 let mut pass = frame.begin_render_pass(&RenderPassDescriptor {
                     label: Some("visibility view and overlay"),
                     color_attachments: &[Some(RenderPassColorAttachment {
@@ -252,23 +247,23 @@ impl Renderer {
                     })],
                     ..RenderPassDescriptor::default()
                 });
-                if let Some(Ok(encoded)) = &drawn {
-                    image_passes.view.draw(&mut pass, &encoded.view);
+                if let Some(Ok(_)) = &drawn {
+                    view.draw(&mut pass);
                 }
                 // The last pass: the overlay over everything.
-                image_passes.overlay.draw(&mut pass);
+                overlay.draw(&mut pass);
             };
             submit(gpu, uploads, commands, passes);
             drawn
         })?;
         let scene = match outcome {
-            Some(Ok(encoded)) => {
-                if let Some(readback) = encoded.readback {
+            Some(Ok(readback)) => {
+                if let Some(readback) = readback {
                     readback.submitted();
                 }
                 true
             }
-            Some(Err(error)) => return Err(error),
+            Some(Err(error)) => return Err(error.into()),
             None => false,
         };
         times.encode = encoding.elapsed();
@@ -290,18 +285,18 @@ impl Renderer {
 ///
 /// # Errors
 ///
-/// [`DrawError::Scene`] as [`FramePasses::encode`]; [`DrawError::Surface`] if the debug view
-/// can't bind the visibility buffer.
+/// As [`FramePasses::encode`]; [`FrameError::Gpu`] if the debug view can't bind the visibility
+/// buffer.
 fn encode_scene(
     gpu: &Gpu,
     frame: &mut CommandEncoder,
     scene: &SceneInputs<'_>,
     passes: &mut FramePasses,
-    view: &VisibilityView,
-) -> Result<EncodedScene, DrawError> {
+    view: &mut VisibilityView,
+) -> Result<EncodedScene, FrameError> {
     let readback = passes.encode(gpu, frame, scene)?;
-    let view = view.bind(gpu, passes.raster().visibility())?;
-    Ok(EncodedScene { readback, view })
+    view.bind(gpu, passes.raster().visibility())?;
+    Ok(readback)
 }
 
 /// Encodes `passes` into `encoder` and submits it.

@@ -721,6 +721,8 @@ pub struct Residency {
     cut: BTreeSet<TileKey>,
     /// The places with a descendant in the cut or drawn: every ancestor of either.
     shielded: BTreeSet<Place>,
+    /// Whether `shielded` came from the cut alone (every tile drawn was in it).
+    shielded_from_cut: bool,
     /// The tiles the frame being staged wrote, with the slot each was written to.
     touched: Vec<(TileKey, Slot)>,
     /// The same tiles, as a set: never evicted by the frame that wrote them.
@@ -855,6 +857,7 @@ impl Residency {
             frame: 0,
             cut: BTreeSet::new(),
             shielded: BTreeSet::new(),
+            shielded_from_cut: true,
             touched: Vec::new(),
             fresh: BTreeSet::new(),
             forced_now: 0,
@@ -1050,6 +1053,13 @@ impl Residency {
                 entry.last_drawn = self.frame;
             }
         }
+        // The drawn tiles are the cut's after culling: with the cut as it was, and the shielded
+        // set made from it alone, the set is the same, and isn't made again.
+        let cut_only = drawn.is_subset(&cut);
+        if cut_only && self.shielded_from_cut && cut == self.cut {
+            return;
+        }
+        self.shielded_from_cut = cut_only;
         let mut shielded = BTreeSet::new();
         for key in cut.iter().chain(&drawn) {
             let mut above = Place::of(key).parent();
