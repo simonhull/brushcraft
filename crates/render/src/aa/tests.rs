@@ -624,8 +624,8 @@ fn magnified(pixels: &[[u8; 4]], size: Size, by: u32) -> Rgb {
 
 /// The pixel pass's check of the tiles a record names, and its stand-in that ignores them.
 const NAMED_CHECK: (&str, &str) = (
-    "reset = reset || (old[k] != EMPTY && changed_after(old[k], since));",
-    "reset = reset || false;",
+    "return tile != EMPTY && changed_after(tile, start);",
+    "return false;",
 );
 
 /// What a change made to a converged scene did.
@@ -1232,4 +1232,3 @@ fn the_half_float_mean_drifts_a_few_ulps_at_most() {
             "the test rounds: an exact mean would say nothing"
         );
     });
-}

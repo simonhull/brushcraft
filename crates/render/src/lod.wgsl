@@ -996,7 +996,7 @@ fn settled_at_end(n: u32, finer: u32) -> bool {
     }
     let node = tree[n];
     for (var edge = 0u; edge < 4u; edge++) {
-        let m = node.neighbours[edge];
+        let m = tree[n].neighbours[edge];
         let seam = ((node.edges >> edge) & 1u) != 0u && m != NONE;
         if ((finer >> edge) & 1u) == 0u && seam && !time_done(m) {
             return false;
@@ -1039,7 +1039,7 @@ fn settled_at_start(n: u32, b: TileBounds, finer: u32) -> bool {
         return false;
     }
     for (var edge = 0u; edge < 4u; edge++) {
-        let m = node.neighbours[edge];
+        let m = tree[n].neighbours[edge];
         if ((node.edges >> edge) & 1u) == 0u || m == NONE {
             continue;
         }

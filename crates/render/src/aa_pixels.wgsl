@@ -34,6 +34,11 @@ fn changed_after(n: u32, start: u32) -> bool {
     return n < arrayLength(&changed) && changed[n] > start;
 }
 
+// Whether `tile`, a tile a pixel's record names (EMPTY for none), changed after frame `start`.
+fn seen_changed(tile: u32, start: u32) -> bool {
+    return tile != EMPTY && changed_after(tile, start);
+}
+
 @compute @workgroup_size(8, 8)
 fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.size.x || id.y >= params.size.y {
@@ -53,9 +58,9 @@ fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
         // The reset rule: a tile it saw changed, the tile this sample sees changed (it may now
         // cover what the history saw), or, past its record, any tile changed.
         var reset = changed_after(node, since) || (crowded && latest[0] > since);
-        for (var k = 0u; k < 4u; k++) {
-            reset = reset || (old[k] != EMPTY && changed_after(old[k], since));
-        }
+        // Each of the four by a constant index (the crate's notes, "Shaders").
+        reset = reset || seen_changed(old[0], since) || seen_changed(old[1], since)
+            || seen_changed(old[2], since) || seen_changed(old[3], since);
         if !reset {
             start = since;
             overflow = crowded;

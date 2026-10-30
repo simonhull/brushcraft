@@ -173,7 +173,9 @@ fn place_vertex(n: u32, cell: u32, index: u32) -> Placed {
         if ((finer >> edge) & 1u) != 0u {
             return still;
         }
-        let m = node.neighbours[edge];
+        // From the tree, not `node`: indexing a local copy's array at run time is what the
+        // crate's notes ("Shaders") rule out.
+        let m = tree[n].neighbours[edge];
         if ((node.edges >> edge) & 1u) != 0u && m != NONE {
             let other = parent_error(m);
             e = select(max(e, other), -1.0, other < 0.0 || e < 0.0);
