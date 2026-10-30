@@ -65,7 +65,7 @@ use crate::upload::{Batch, GpuVertex, StagingRing, VERTEX_WGSL};
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
-mod tests;
+pub(crate) mod tests;
 
 /// The normal pass's own source, after [`VERTEX_WGSL`].
 const NORMALS_WGSL: &str = include_str!("normals.wgsl");

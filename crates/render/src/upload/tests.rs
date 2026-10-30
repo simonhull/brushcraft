@@ -124,12 +124,14 @@ fn the_stores_tiles_land_in_their_slots_their_positions_bit_for_bit() {
         let held_positions: Vec<[f32; 3]> = held.iter().map(|v| v.position).collect();
         assert_eq!(held_positions, positions, "the finest tile's positions");
         // Its normals are the GPU's, from its ring: the store's formula, its rounding the GPU's
-        // (`normals::tests` bounds the angle and checks the seams).
-        let normals_agree = held.iter().zip(&normals).all(|(vertex, normal)| {
-            let dot: f32 = vertex.normal.iter().zip(normal).map(|(a, b)| a * b).sum();
-            dot > 1.0 - 1e-6
-        });
-        assert!(normals_agree, "and its normals, computed on the GPU");
+        // (`normals::tests` checks the seams), within the same angle.
+        for (vertex, &[x, y, z]) in held.iter().zip(&normals) {
+            let off = crate::normals::tests::angle(vertex.normal, Vec3::new(x, y, z));
+            assert!(
+                off <= crate::normals::tests::MAX_ANGLE,
+                "its normals, computed on the GPU: {off:e} rad off the store's"
+            );
+        }
 
         for key in [coarse, floor] {
             let tile = store
