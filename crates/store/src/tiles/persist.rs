@@ -168,6 +168,7 @@ impl TileStore {
             epoch_writes: BTreeSet::new(),
             epoch_keys: BTreeSet::new(),
             floor: std::collections::BTreeMap::new(),
+            floor_read: std::collections::BTreeMap::new(),
             floor_top: config.floor_top,
             feed,
             save_consumer,

@@ -402,6 +402,11 @@ pub struct TileStore {
     /// The display layer's floor (see [`StoreConfig::floor_top`]): every face's display tiles up
     /// to [`TileStore::floor_top`], as last recorded, kept for the store's life.
     floor: std::collections::BTreeMap<TileKey, crate::display::DisplayRecord>,
+    /// Where in the files each floor record loaded on open was read from, until the store
+    /// records the tile again: while that place is still the files' latest record of the tile,
+    /// the floor's copy is that record, and a draw takes it rather than reading the file again
+    /// (see [`TileStore::floor_record`]).
+    floor_read: std::collections::BTreeMap<TileKey, (crate::file::FileReader, crate::file::Loc)>,
     /// The top level of the floor.
     floor_top: geom::Level,
     /// The stale-tile feed (see [`crate::stale`]).

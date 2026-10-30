@@ -211,7 +211,12 @@ fn a_damaged_display_record_is_unknown_not_trusted() {
 
 /// A project file keeping a display layer under [`TOP`], every tile built and saved, at `name`
 /// in `dir`, with the edits `seed` makes; returns the store's display tiles.
-fn saved_layer(dir: &TestDir, name: &str, mesh: &Arc<BaseMesh>, seed: u64) -> Vec<DisplayTile> {
+pub(super) fn saved_layer(
+    dir: &TestDir,
+    name: &str,
+    mesh: &Arc<BaseMesh>,
+    seed: u64,
+) -> Vec<DisplayTile> {
     let mut store = new_store(dir, name, mesh, roomy().with_display(level(TOP)));
     apply(
         &mut store,
@@ -518,6 +523,7 @@ fn a_record_read_ahead_is_used_only_while_it_is_the_files_latest() {
     assert_eq!(
         store
             .read_ahead_record(&read)
+            .cloned()
             .and_then(crate::display::StoredDisplay::known),
         Some(from_file),
         "the file's latest record, read ahead"

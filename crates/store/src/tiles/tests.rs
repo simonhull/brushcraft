@@ -38,6 +38,7 @@ use crate::workers::Workers;
 mod budget;
 mod differential;
 mod display;
+mod draw_ahead;
 mod edit;
 mod epochs;
 mod evaluate;

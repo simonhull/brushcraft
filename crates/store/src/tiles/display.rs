@@ -27,10 +27,13 @@
 //!   point, so a record built from it and placed at the cut would be named stale. The records wait
 //!   until the save point is written.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{DisplayTile, FinestNormalCone, Level, TileKey};
-use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+use rayon::iter::{
+    IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
+};
 
 use super::TileStore;
 use super::error::CacheError;
@@ -60,6 +63,23 @@ pub(super) enum Floor {
     /// A floor record was built from another finest level: a layer built for another surface,
     /// which is rebuilt whole.
     Foreign,
+}
+
+/// The fewest tiles [`TileStore::display_for_draw`] decodes on the workers, together.
+///
+/// Fewer are decoded on the owner thread, as a hand-off to the workers would cost more than it
+/// saves (and waits for any job slice they are running).
+const PARALLEL_DECODE: usize = 64;
+
+/// A display record to decode for drawing, with the bound and cone to decode it with.
+#[derive(Debug)]
+struct ToDecode<'a> {
+    /// The record, borrowed where the store holds it.
+    record: Cow<'a, DisplayRecord>,
+    /// The bound `e` the tile is drawn with.
+    bound: f32,
+    /// The finest normals' cone it is drawn with.
+    cone: FinestNormalCone,
 }
 
 impl TileStore {
@@ -108,6 +128,8 @@ impl TileStore {
             if tile.key().level() <= self.floor_top {
                 self.floor
                     .insert(*tile.key(), DisplayRecord::of(tile, finest));
+                // No longer the record the files held on open.
+                self.floor_read.remove(tile.key());
             }
         }
         self.note_epoch_keys(tiles.iter().map(|tile| *tile.key()));
@@ -194,6 +216,11 @@ impl TileStore {
             match record {
                 Some(record) if record.finest == finest => {
                     self.floor.insert(key, record);
+                    // Where it was read from: the files' latest record of the tile, which
+                    // `read_display` read (the working file's, else the base's).
+                    if let Some(place) = self.record_place(&key) {
+                        self.floor_read.insert(key, place);
+                    }
                 }
                 Some(_) => state = Floor::Foreign,
                 // Unknown, or a record that doesn't read. One whose length says known is read
@@ -399,27 +426,99 @@ impl TileStore {
     ) -> Result<Vec<Option<DisplayTile>>, CacheError> {
         self.drop_uncovered_bumps()?;
         self.display.settle(&self.mesh, &self.deps)?;
-        keys.iter()
-            .map(|key| {
-                if let Some((record, extra)) = self.bumped.get(key) {
-                    // Rounded up, so it stays a bound.
-                    let bound = (record.error + extra).next_up();
-                    // A dab turns normals too: the cone before it holds them no longer.
-                    let cone = FinestNormalCone::EVERYTHING;
-                    return Ok(DisplayTile::decode(*key, bound, cone, &record.encoded).ok());
-                }
-                if let Some(record) = self.display_record(key)? {
-                    return Ok(record.decode(key));
-                }
-                // A floor tile writes made unknown, and no stroke's bump covers: drawn as it was,
-                // its bound the largest there is and its cone covering everything, so a view finer
-                // than it is chosen whenever there is one, and never nothing.
-                Ok(self.floor.get(key).and_then(|r| {
-                    DisplayTile::decode(*key, f32::MAX, FinestNormalCone::EVERYTHING, &r.encoded)
-                        .ok()
-                }))
-            })
-            .collect()
+        self.take_read_ahead();
+        let found: Vec<Option<ToDecode<'_>>> = keys
+            .iter()
+            .map(|key| self.to_draw(key))
+            .collect::<Result<_, CacheError>>()?;
+        let decode = |(key, to): (&TileKey, &Option<ToDecode<'_>>)| {
+            let to = to.as_ref()?;
+            DisplayTile::decode(*key, to.bound, to.cone, &to.record.encoded).ok()
+        };
+        // Many tiles at once (the floor, in an open's first frame) are decoded on the workers.
+        let tiles = if keys.len() >= PARALLEL_DECODE {
+            self.workers
+                .install(|| keys.par_iter().zip(found.par_iter()).map(decode).collect())
+        } else {
+            keys.iter().zip(&found).map(decode).collect()
+        };
+        drop(found);
+        self.drawn_ahead(keys);
+        Ok(tiles)
+    }
+
+    /// What [`TileStore::display_for_draw`] decodes for `key`: the record, with the bound and
+    /// cone to decode it with; `None` if it has nothing to draw. Settled by the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] if a read fails.
+    fn to_draw(&self, key: &TileKey) -> Result<Option<ToDecode<'_>>, CacheError> {
+        if let Some((record, extra)) = self.bumped.get(key) {
+            return Ok(Some(ToDecode {
+                record: Cow::Borrowed(record),
+                // Rounded up, so it stays a bound.
+                bound: (record.error + extra).next_up(),
+                // A dab turns normals too: the cone before it holds them no longer.
+                cone: FinestNormalCone::EVERYTHING,
+            }));
+        }
+        if let Some(record) = self.display_source(key)? {
+            let (bound, cone) = (record.error, record.cone);
+            return Ok(Some(ToDecode {
+                record,
+                bound,
+                cone,
+            }));
+        }
+        // A floor tile writes made unknown, and no stroke's bump covers: drawn as it was, its
+        // bound the largest there is and its cone covering everything, so a view finer than it
+        // is chosen whenever there is one, and never nothing.
+        Ok(self.floor.get(key).map(|record| ToDecode {
+            record: Cow::Borrowed(record),
+            bound: f32::MAX,
+            cone: FinestNormalCone::EVERYTHING,
+        }))
+    }
+
+    /// Whether drawing `key` now would read its display record from a file: it is in none of the
+    /// store's memory (the records recorded, a stroke's bumps, the floor), nor read ahead
+    /// ([`TileStore::read_display_ahead`]), and the files hold one. A tile with no record at
+    /// all reads nothing.
+    ///
+    /// Writes not yet settled can only make a tile unknown, so it may say a read is needed
+    /// where, settled, none is; never the other way round.
+    #[must_use]
+    pub fn display_needs_read(&mut self, key: &TileKey) -> bool {
+        self.take_read_ahead();
+        self.needs_read(key)
+    }
+
+    /// [`TileStore::display_needs_read`], with what the workers read taken in by the caller.
+    pub(super) fn needs_read(&self, key: &TileKey) -> bool {
+        if self.bumped.contains_key(key) {
+            return false;
+        }
+        match self.display.kept(key) {
+            Some(Kept::Known(_) | Kept::Unknown) => return false,
+            Some(Kept::Written) | None => {}
+        }
+        if self.floor_record(key).is_some() || self.read_ahead_record(key).is_some() {
+            return false;
+        }
+        self.record_place(key).is_some()
+    }
+
+    /// The floor's copy of `key`'s record, if it is the record the files hold as their latest:
+    /// the one loaded on open, still at the place it was read from. For a tile the book holds no
+    /// change of (a change it holds is the latest).
+    fn floor_record(&self, key: &TileKey) -> Option<&DisplayRecord> {
+        let (reader, loc) = self.floor_read.get(key)?;
+        let (now, at) = self.record_place(key)?;
+        if at != *loc || !now.same_file(reader) {
+            return None;
+        }
+        self.floor.get(key)
     }
 
     /// Whether the store knows `key`'s display tile (it would read one back), without decoding
@@ -443,15 +542,31 @@ impl TileStore {
         &self,
         key: &TileKey,
     ) -> Result<Option<DisplayRecord>, CacheError> {
+        Ok(self.display_source(key)?.map(Cow::into_owned))
+    }
+
+    /// `key`'s display record as [`TileStore::display_record`] reads it, borrowed where the
+    /// store holds it in memory: recorded, the floor's copy of the files' record, or read
+    /// ahead; settled by the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] if a read fails.
+    fn display_source(&self, key: &TileKey) -> Result<Option<Cow<'_, DisplayRecord>>, CacheError> {
         match self.display.kept(key) {
-            Some(Kept::Known(record)) => return Ok(Some(record.clone())),
+            Some(Kept::Known(record)) => return Ok(Some(Cow::Borrowed(record))),
             Some(Kept::Unknown) => return Ok(None),
             Some(Kept::Written) | None => {}
         }
+        // Loaded on open with the floor, built from the store's finest level.
+        if let Some(record) = self.floor_record(key) {
+            return Ok(Some(Cow::Borrowed(record)));
+        }
         // A record built from another finest level bounds another surface: unknown here.
         let record = match self.read_ahead_record(key) {
-            Some(read) => read.known(),
-            None => read_display(&self.file, self.base.as_ref(), key)?,
+            Some(StoredDisplay::Known(record)) => Some(Cow::Borrowed(record)),
+            Some(StoredDisplay::Unknown) => None,
+            None => read_display(&self.file, self.base.as_ref(), key)?.map(Cow::Owned),
         };
         Ok(record.filter(|record| Some(record.finest) == self.display_finest))
     }
