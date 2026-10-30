@@ -3,6 +3,7 @@
 
 use super::display::saved_layer;
 use super::*;
+use crate::bounds::Kept;
 
 /// The display tiles of the tests' mesh at `levels`, in key order.
 fn display_at(mesh: &BaseMesh, levels: std::ops::RangeInclusive<u8>) -> Vec<TileKey> {
@@ -233,4 +234,453 @@ fn the_floor_loaded_on_open_is_drawn_without_reading_the_file() {
             "{key:?}: as the file holds it"
         );
     }
+}
+
+// Staleness: a record held in memory (the floor's copy, or one read ahead) is drawn only while
+// it is the record the store would read. Each test below compares every draw with `expected`,
+// which reads the files (or the book) directly, never the floor's copy or the read-ahead.
+
+/// What drawing `key` must give, worked out without the floor's copy or a record read ahead.
+///
+/// That is a stroke's bump, the book's record (none if unknown), else the files' latest record;
+/// and where none is known, the floor's copy as last recorded, its bound the largest there is
+/// and its cone covering everything. Call it after a draw, which settles the writes.
+fn expected(store: &TileStore, key: &TileKey) -> Option<geom::DisplayTile> {
+    if let Some((record, extra)) = store.bumped.get(key) {
+        let bound = (record.error + extra).next_up();
+        let everything = geom::FinestNormalCone::EVERYTHING;
+        return geom::DisplayTile::decode(*key, bound, everything, &record.encoded).ok();
+    }
+    let record = match store.display.kept(key) {
+        Some(Kept::Known(record)) => Some(record.clone()),
+        Some(Kept::Unknown) => None,
+        Some(Kept::Written) | None => {
+            crate::tiles::display::read_display(&store.file, store.base.as_ref(), key).unwrap()
+        }
+    };
+    match record.filter(|record| Some(record.finest) == store.display_finest) {
+        Some(record) => record.decode(key),
+        None => store.floor.get(key).and_then(|copy| {
+            let everything = geom::FinestNormalCone::EVERYTHING;
+            geom::DisplayTile::decode(*key, f32::MAX, everything, &copy.encoded).ok()
+        }),
+    }
+}
+
+/// Draws `keys` and checks each is what the files (or the book) give (see [`expected`]).
+fn assert_drawn_as_stored(store: &mut TileStore, keys: &[TileKey], when: &str) {
+    let drawn = store.display_for_draw(keys).unwrap();
+    for (key, tile) in keys.iter().zip(drawn) {
+        assert_eq!(tile, expected(store, key), "{when}: {key:?}");
+    }
+}
+
+/// Whether `tile` is drawn as a tile nothing is trusted of: the largest bound, the cone covering
+/// everything.
+fn untrusted(tile: &geom::DisplayTile) -> bool {
+    tile.error().to_bits() == f32::MAX.to_bits() && tile.cone().covers_everything()
+}
+
+/// The store's own fresh recovery file at `name` in `dir`, for a roll-over.
+fn fresh_like(store: &TileStore, dir: &TestDir, name: &str) -> ProjectFile {
+    let meta = store.file.meta().clone();
+    ProjectFile::create_like(&dir.path(name), meta, &store.file).unwrap()
+}
+
+/// Rolls `store` over onto a fresh working file `name` in `dir`.
+fn roll_over(store: &mut TileStore, dir: &TestDir, name: &str) {
+    let fresh = fresh_like(store, dir, name);
+    let filled = store.fill_roll_over(fresh).unwrap();
+    let (old, lost) = store.roll_over(filled).unwrap();
+    drop(old);
+    assert!(lost.is_empty(), "nothing lost");
+}
+
+/// A store over a fresh recovery file layered on a saved display layer (the project file
+/// `work.bcp` in `dir`, also returned, to save into): the floor and every record in the base.
+fn layered(dir: &TestDir, mesh: &Arc<BaseMesh>) -> (TileStore, ProjectFile) {
+    saved_layer(dir, "work.bcp", mesh, 81);
+    let project = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let base = project.base().unwrap();
+    let role = crate::meta::Role::Recovery {
+        base: Some(base.save_point()),
+    };
+    let meta = project.meta().with_role(role);
+    let working = ProjectFile::create_like(&dir.path("r1.bcrf"), meta, &project).unwrap();
+    let config = roomy().with_display(level(TOP));
+    let store = TileStore::open_layered(working, Some(base), config).unwrap();
+    (store, project)
+}
+
+/// Saves `store` into `project` and moves it onto a fresh recovery file `name` in `dir`, as a
+/// project's save does.
+fn save_and_rebase(store: &mut TileStore, project: &mut ProjectFile, dir: &TestDir, name: &str) {
+    let saved = store.save_into(project).unwrap();
+    let base = project.base().unwrap();
+    let role = crate::meta::Role::Recovery {
+        base: Some(base.save_point()),
+    };
+    let meta = project.meta().with_role(role);
+    let fresh = ProjectFile::create_like(&dir.path(name), meta, project).unwrap();
+    drop(store.rebase(saved, fresh).unwrap());
+}
+
+/// The first `count` display tiles above the floor, read ahead and landed.
+fn read_ahead_some(store: &mut TileStore, mesh: &BaseMesh, count: usize) -> Vec<TileKey> {
+    let keys: Vec<TileKey> = display_at(mesh, 6..=7).into_iter().take(count).collect();
+    assert_eq!(store.read_display_ahead(&keys), keys.len(), "read ahead");
+    settle_reads(store);
+    for key in &keys {
+        assert!(!store.display_needs_read(key), "{key:?}: read ahead");
+    }
+    keys
+}
+
+#[test]
+fn a_tile_recorded_after_its_read_ahead_is_drawn_as_recorded() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = reopened(&dir, &mesh);
+    let keys = read_ahead_some(&mut store, &mesh, 6);
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 91),
+    );
+    let layer = display_layer(&mut store);
+    store.record_display(&layer).unwrap();
+    let drawn = store.display_for_draw(&keys).unwrap();
+    for (key, tile) in keys.iter().zip(drawn) {
+        let built = layer.iter().find(|built| built.key() == key).unwrap();
+        assert_eq!(tile.as_ref(), Some(built), "{key:?}: the new record");
+    }
+    assert_drawn_as_stored(&mut store, &keys, "recorded");
+}
+
+/// A read for drawing still in flight when the record moves (written through at a new place)
+/// lands, and is never taken for the tile: the draw reads the new record.
+#[test]
+fn a_read_landing_after_its_record_moved_is_rejected() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = reopened(&dir, &mesh);
+    store.hold_display_waiting_to(0);
+    let keys: Vec<TileKey> = display_at(&mesh, 6..=7).into_iter().take(6).collect();
+    assert_eq!(store.read_display_ahead(&keys), keys.len(), "read ahead");
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 92),
+    );
+    let layer = display_layer(&mut store);
+    // Written through at once: every record at a new place in the working file.
+    store.record_display(&layer).unwrap();
+    for key in &keys {
+        assert!(
+            matches!(store.display.kept(key), Some(Kept::Written)),
+            "{key:?}: written through"
+        );
+    }
+    settle_reads(&mut store);
+    for key in &keys {
+        assert!(
+            store.read_ahead_record(key).is_none(),
+            "{key:?}: the read landed for the old place, rejected"
+        );
+    }
+    let drawn = store.display_for_draw(&keys).unwrap();
+    for (key, tile) in keys.iter().zip(drawn) {
+        let built = layer.iter().find(|built| built.key() == key).unwrap();
+        assert_eq!(tile.as_ref(), Some(built), "{key:?}: the new record");
+    }
+    assert_drawn_as_stored(&mut store, &keys, "written through");
+}
+
+#[test]
+fn a_tile_bumped_after_its_read_ahead_is_drawn_bumped() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = reopened(&dir, &mesh);
+    let face = FaceId::new(0);
+    let mut keys = vec![TileKey::display(face, level(6), 0, 0).unwrap()];
+    for (tx, ty) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        keys.push(TileKey::display(face, level(7), tx, ty).unwrap());
+    }
+    assert_eq!(store.read_display_ahead(&keys), keys.len(), "read ahead");
+    settle_reads(&mut store);
+    let lift = 0.002_f32;
+    let (edited, li, lj) = TileKey::containing(
+        LayerId::BASE,
+        Channel::DISPLACEMENT,
+        face,
+        level(TOP),
+        40,
+        50,
+    )
+    .unwrap();
+    store.begin_op().unwrap();
+    let c = store.correction(edited).unwrap().get(li, lj).unwrap();
+    store
+        .set_correction(face, level(TOP), 40, 50, c + Vec3::new(0.0, 0.0, lift))
+        .unwrap();
+    store.bump_display_error(&[edited], lift).unwrap();
+    let bumped: Vec<TileKey> = keys
+        .iter()
+        .filter(|key| store.bumped.contains_key(key))
+        .copied()
+        .collect();
+    assert!(
+        bumped.len() >= 2,
+        "the dab reaches tiles read ahead: {bumped:?}"
+    );
+    let drawn = store.display_for_draw(&bumped).unwrap();
+    for (key, tile) in bumped.iter().zip(drawn) {
+        let tile = tile.unwrap();
+        let (record, extra) = &store.bumped[key];
+        assert_eq!(
+            tile.error(),
+            (record.error + extra).next_up(),
+            "{key:?}: the bumped bound"
+        );
+        assert!(tile.cone().covers_everything(), "{key:?}: the cone");
+    }
+    assert_drawn_as_stored(&mut store, &keys, "bumped");
+}
+
+/// Both caches full (records read ahead, the floor's copies), then some tiles recorded again,
+/// then a roll-over: every draw is the files' latest, the changed tiles' cached copies unused.
+#[test]
+fn draws_after_a_roll_over_are_the_files_latest() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, _project) = layered(&dir, &mesh);
+    let ahead = read_ahead_some(&mut store, &mesh, 8);
+    let floor = display_at(&mesh, 0..=5);
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 93),
+    );
+    let layer = display_layer(&mut store);
+    // Half the layer recorded again; the rest the edits made unknown, or left as it was.
+    let half: Vec<&geom::DisplayTile> = layer.iter().step_by(2).collect();
+    store.record_display(&half).unwrap();
+    roll_over(&mut store, &dir, "r2.bcrf");
+    let mut keys = floor;
+    keys.extend(&ahead);
+    assert_drawn_as_stored(&mut store, &keys, "rolled over");
+    for tile in &half {
+        if keys.contains(tile.key()) {
+            let drawn = store.display_for_draw(&[*tile.key()]).unwrap();
+            assert_eq!(drawn[0].as_ref(), Some(*tile), "{:?}: recorded", tile.key());
+        }
+    }
+    // And again once the store has flushed nothing more: still the files' latest.
+    roll_over(&mut store, &dir, "r3.bcrf");
+    assert_drawn_as_stored(&mut store, &keys, "rolled over twice");
+}
+
+/// The same across a project's save: the store moves onto the new save point and a fresh
+/// recovery file.
+#[test]
+fn draws_after_a_save_are_the_files_latest() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, mut project) = layered(&dir, &mesh);
+    let ahead = read_ahead_some(&mut store, &mesh, 8);
+    let floor = display_at(&mesh, 0..=5);
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 94),
+    );
+    let layer = display_layer(&mut store);
+    let half: Vec<&geom::DisplayTile> = layer.iter().step_by(2).collect();
+    store.record_display(&half).unwrap();
+    save_and_rebase(&mut store, &mut project, &dir, "r2.bcrf");
+    let mut keys = floor;
+    keys.extend(&ahead);
+    assert_drawn_as_stored(&mut store, &keys, "saved");
+    for tile in &half {
+        if keys.contains(tile.key()) {
+            let drawn = store.display_for_draw(&[*tile.key()]).unwrap();
+            assert_eq!(drawn[0].as_ref(), Some(*tile), "{:?}: recorded", tile.key());
+        }
+    }
+}
+
+/// A refresh through the jobs records floor tiles again, written through at once.
+///
+/// The book says the working file holds them ([`Kept::Written`]), so a draw looks past it to the
+/// floor's copy, and must find the new record, not the one loaded on open.
+#[test]
+fn a_floor_tile_refreshed_and_written_through_is_drawn_as_refreshed() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = reopened(&dir, &mesh);
+    store.hold_display_waiting_to(0);
+    let floor = display_at(&mesh, 0..=5);
+    let before = store.display_for_draw(&floor).unwrap();
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 95),
+    );
+    loop {
+        store
+            .run_jobs(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        if !store.has_jobs() {
+            break;
+        }
+    }
+    let refreshed: Vec<TileKey> = floor
+        .iter()
+        .filter(|key| matches!(store.display.kept(key), Some(Kept::Written)))
+        .copied()
+        .collect();
+    assert!(
+        !refreshed.is_empty(),
+        "floor tiles refreshed, written through"
+    );
+    for key in &refreshed {
+        assert!(
+            !store.floor_read.contains_key(key),
+            "{key:?}: no longer named as the record loaded on open"
+        );
+    }
+    assert_drawn_as_stored(&mut store, &floor, "refreshed");
+    let drawn = store.display_for_draw(&floor).unwrap();
+    let changed = floor
+        .iter()
+        .zip(before.iter().zip(&drawn))
+        .filter(|(key, (old, new))| refreshed.contains(key) && old != new)
+        .count();
+    assert!(changed > 0, "the refresh changed floor tiles");
+}
+
+/// Asserts that every one of `unknown` is drawn untrusted, from the floor's copy.
+fn assert_untrusted(store: &mut TileStore, unknown: &[TileKey], when: &str) {
+    let drawn = store.display_for_draw(unknown).unwrap();
+    for (key, tile) in unknown.iter().zip(drawn) {
+        let tile = tile.unwrap_or_else(|| panic!("{when}: {key:?} drawn"));
+        assert!(untrusted(&tile), "{when}: {key:?} drawn untrusted");
+    }
+    assert_drawn_as_stored(store, unknown, when);
+}
+
+/// Floor tiles an edit made unknown are drawn untrusted: the largest bound, the cone covering
+/// everything.
+///
+/// So unflushed, after a roll-over, and after a save, when the files hold them as unknown and
+/// the book no longer says so.
+#[test]
+fn a_floor_tile_made_unknown_is_drawn_untrusted_through_roll_over_and_save() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, mut project) = layered(&dir, &mesh);
+    let floor = display_at(&mesh, 0..=5);
+    apply(
+        &mut store,
+        &mut CorrectionMap::new(),
+        &random_edits(&mesh, TOP, 20, 96),
+    );
+    drop(store.display_for_draw(&floor).unwrap());
+    let unknown: Vec<TileKey> = floor
+        .iter()
+        .filter(|key| matches!(store.display.kept(key), Some(Kept::Unknown)))
+        .copied()
+        .collect();
+    assert!(!unknown.is_empty(), "the edits made floor tiles unknown");
+    assert_untrusted(&mut store, &unknown, "unflushed");
+    roll_over(&mut store, &dir, "r2.bcrf");
+    assert_untrusted(&mut store, &unknown, "rolled over");
+    save_and_rebase(&mut store, &mut project, &dir, "r3.bcrf");
+    for key in &unknown {
+        assert!(
+            store.display.kept(key).is_none(),
+            "{key:?}: the book moved on"
+        );
+    }
+    assert_untrusted(&mut store, &unknown, "saved");
+    assert_drawn_as_stored(&mut store, &floor, "saved, the whole floor");
+}
+
+/// Runs the store's jobs to the end.
+fn run_all(store: &mut TileStore) {
+    loop {
+        store
+            .run_jobs(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        if !store.has_jobs() {
+            return;
+        }
+    }
+}
+
+/// A layer with another version's records among it is never drawn from the files on open.
+///
+/// A floor tile is drawn untrusted where the store holds a copy of it, else not at all, until
+/// the rebuild records it.
+#[test]
+fn an_outdated_layer_on_open_is_drawn_untrusted_until_rebuilt() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    saved_layer(&dir, "work.bcp", &mesh, 97);
+    let floor = display_at(&mesh, 0..=5);
+    // One floor record of an older version among the rest.
+    let mut written = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let old = floor[3];
+    let record = written
+        .read_display(&old)
+        .unwrap()
+        .unwrap()
+        .known()
+        .unwrap();
+    written
+        .append_display_raw(&old, &crate::file::version_2_record(old, Some(&record)))
+        .unwrap();
+    written.save().unwrap();
+    drop(written);
+    let file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let mut store = TileStore::open(file, roomy().with_display(level(TOP))).unwrap();
+    let drawn = store.display_for_draw(&floor).unwrap();
+    let mut held = 0;
+    for (key, tile) in floor.iter().zip(&drawn) {
+        if let Some(tile) = tile {
+            assert!(untrusted(tile), "{key:?} drawn untrusted");
+            held += 1;
+        }
+    }
+    assert!(held > 0, "the current floor records are held");
+    assert_drawn_as_stored(&mut store, &floor, "outdated");
+    run_all(&mut store);
+    assert_drawn_as_stored(&mut store, &floor, "rebuilt");
+}
+
+/// A layer built from another finest level is never drawn from the files on open: the store
+/// holds no floor copy of it, and names none as loaded.
+#[test]
+fn a_foreign_layer_on_open_is_never_drawn_from_the_files() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    saved_layer(&dir, "work.bcp", &mesh, 98);
+    let file = ProjectFile::open(&dir.path("work.bcp")).unwrap();
+    let other = level(TOP - 1);
+    let mut store = TileStore::open(file, roomy().with_display(other)).unwrap();
+    let floor: Vec<TileKey> = display_at(&mesh, 0..=5)
+        .into_iter()
+        .filter(|k| k.level() < other)
+        .collect();
+    let drawn = store.display_for_draw(&floor).unwrap();
+    for (key, tile) in floor.iter().zip(&drawn) {
+        assert!(
+            tile.as_ref().is_none_or(untrusted),
+            "{key:?} never drawn from the files"
+        );
+    }
+    assert!(store.floor_read.is_empty(), "nothing named as loaded");
+    assert_drawn_as_stored(&mut store, &floor, "foreign");
+    run_all(&mut store);
+    assert_drawn_as_stored(&mut store, &floor, "rebuilt");
 }
