@@ -21,16 +21,22 @@
 //! # The visibility buffer
 //!
 //! [`VISIBILITY_FORMAT`] (`R32Uint`): per pixel, a [`VisibilityId`], the tile tree's node
-//! (bits 13 to 32), the cluster within the tile (7 to 13) and the triangle within the cluster
-//! (0 to 7, its place in the static index buffer), or [`BACKGROUND`]. The node, not the slot,
-//! because a large epoch can move a tile to a shadow slot while its node stays (plan, "Gaps found
-//! while executing"), so the ids are stable while the camera is still. Nineteen bits of node
-//! allow [`MAX_NODES`] nodes, past the benchmark tree's 218,400. The triangle comes from the
-//! primitive index, which restarts with each instance: [`wgpu::Features::PRIMITIVE_INDEX`], which
-//! Vulkan has where the device has geometry shaders (lavapipe has; Metal on some GPUs, to check on
-//! the M4; the tablet's in M1c). Depth is reversed-Z [`DEPTH_FORMAT`]
-//! (`Depth32Float`), cleared to 0 (infinitely far), nearer passing; back faces are culled, as the
-//! cone culling assumes.
+//! (bits 12 to 32), the cluster within the tile (6 to 12) and the quad within the cluster (0 to
+//! 6, `8y + x`), or [`BACKGROUND`] (user decision, 2026-10-29). The node, not the slot, because a
+//! large epoch can move a tile to a shadow slot while its node stays (plan, "Gaps found while
+//! executing"), so the ids are stable while the camera is still. Twenty bits of node allow
+//! [`MAX_NODES`] nodes, past the benchmark tree's 218,400.
+//!
+//! The quad comes flat from each triangle's provoking vertex, its first (WGSL's
+//! `@interpolate(flat, first)`): both of quad `(x, y)`'s triangles start at its `p00`, grid
+//! vertex `(x, y)`, and every vertex hands on the quad its *unremapped* grid index starts, so the
+//! edge variants don't change it (a vertex a variant collapses still provokes its quad's
+//! surviving triangle). No geometry-shader feature is needed (`PRIMITIVE_INDEX` is missing on
+//! Mali and `PowerVR` GPUs). Which of the quad's two triangles a pixel is in, the shading pass
+//! tells by one test against the quad's diagonal: [`quad_triangle`], and [`QUAD_WGSL`] for the GPU.
+//!
+//! Depth is reversed-Z [`DEPTH_FORMAT`] (`Depth32Float`), cleared to 0 (infinitely far), nearer
+//! passing; back faces are culled, as the cone culling assumes.
 //!
 //! # The geomorph
 //!
@@ -101,8 +107,8 @@ use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferUsages, Color,
     ColorTargetState, ColorWrites, CommandEncoder, CompareFunction, ComputePassDescriptor,
-    ComputePipeline, DepthBiasState, DepthStencilState, Extent3d, Face, Features, FragmentState,
-    FrontFace, IndexFormat, LoadOp, MultisampleState, Operations, PipelineCompilationOptions,
+    ComputePipeline, DepthBiasState, DepthStencilState, Extent3d, Face, FragmentState, FrontFace,
+    IndexFormat, LoadOp, MultisampleState, Operations, PipelineCompilationOptions,
     PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology,
     RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
     RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
@@ -181,14 +187,65 @@ pub const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
 pub const BACKGROUND: u32 = u32::MAX;
 
 /// Bits of a [`VisibilityId`] below its node.
-const NODE_SHIFT: u32 = 13;
+const NODE_SHIFT: u32 = 12;
 
 /// Bits of a [`VisibilityId`] below its cluster.
-const CLUSTER_SHIFT: u32 = 7;
+const CLUSTER_SHIFT: u32 = 6;
 
-/// The most nodes the raster covers: those whose ids fit in 19 bits, all but the last (whose
+/// The most nodes the raster covers: those whose ids fit in 20 bits, all but the last (whose
 /// last id would be [`BACKGROUND`]).
 pub const MAX_NODES: u32 = (u32::MAX >> NODE_SHIFT) - 1;
+
+/// The WGSL of [`quad_triangle`], for the shading pass: `quad_triangle(p00, p10, p11, p01,
+/// pixel) -> u32`, the corners and the pixel in any one 2D frame (pixels).
+pub const QUAD_WGSL: &str = r"
+// Which triangle of a quad a pixel is in (render::raster::quad_triangle): 0 for (p00, p10,
+// p11), 1 for (p00, p11, p01). The corners are where they are drawn (remapped and morphed),
+// projected; the two triangles lie on either side of their diagonal p00-p11, and one an edge
+// variant collapsed covers nothing.
+fn quad_triangle(
+    p00: vec2<f32>,
+    p10: vec2<f32>,
+    p11: vec2<f32>,
+    p01: vec2<f32>,
+    pixel: vec2<f32>,
+) -> u32 {
+    let d = p11 - p00;
+    let side = d.x * (pixel.y - p00.y) - d.y * (pixel.x - p00.x);
+    let lower = d.x * (p10.y - p00.y) - d.y * (p10.x - p00.x);
+    let upper = d.x * (p01.y - p00.y) - d.y * (p01.x - p00.x);
+    if lower == 0.0 {
+        return 1u;
+    }
+    if upper == 0.0 {
+        return 0u;
+    }
+    return select(0u, 1u, (side > 0.0) == (upper > 0.0));
+}
+";
+
+/// Which triangle of a quad a pixel is in: 0 for `(p00, p10, p11)`, 1 for `(p00, p11, p01)`,
+/// their places in the quad's pair of the static index buffer ([`crate::indices::triangles`]).
+///
+/// `corners` are `[p00, p10, p11, p01]` where they are drawn (remapped by the cluster's edge
+/// variant and morphed), projected, and `pixel` in the same frame. The two triangles lie on either
+/// side of their shared diagonal `p00`–`p11`, so one side test tells them apart; one an edge
+/// variant collapsed (its `p10` or `p01` on the diagonal) covers nothing, and the other is chosen.
+/// A pixel on the diagonal itself goes to triangle 0; the rasterizer's tie rule may differ there.
+#[must_use]
+pub fn quad_triangle(corners: [[f32; 2]; 4], pixel: [f32; 2]) -> u32 {
+    let [p00, p10, p11, p01] = corners;
+    let d = [p11[0] - p00[0], p11[1] - p00[1]];
+    let cross = |q: [f32; 2]| d[0] * (q[1] - p00[1]) - d[1] * (q[0] - p00[0]);
+    let (side, lower, upper) = (cross(pixel), cross(p10), cross(p01));
+    if lower == 0.0 {
+        return 1;
+    }
+    if upper == 0.0 {
+        return 0;
+    }
+    u32::from((side > 0.0) == (upper > 0.0))
+}
 
 /// The morph's duration by default (spec, "Seams without cracks").
 pub const MORPH: Duration = Duration::from_millis(150);
@@ -211,9 +268,9 @@ pub struct VisibilityId {
     pub node: u32,
     /// The cluster within the tile, `cy · per + cx` for a tile of `per × per` clusters.
     pub cluster: u32,
-    /// The triangle within the cluster: its place in the static index buffer
-    /// ([`crate::indices::triangles`]).
-    pub triangle: u32,
+    /// The quad within the cluster, `8y + x`: its triangles are the static index buffer's
+    /// `2 (8y + x)` and the one after ([`quad_triangle`] tells which).
+    pub quad: u32,
 }
 
 impl VisibilityId {
@@ -226,14 +283,14 @@ impl VisibilityId {
         Some(Self {
             node: pixel >> NODE_SHIFT,
             cluster: (pixel >> CLUSTER_SHIFT) & ((1 << (NODE_SHIFT - CLUSTER_SHIFT)) - 1),
-            triangle: pixel & ((1 << CLUSTER_SHIFT) - 1),
+            quad: pixel & ((1 << CLUSTER_SHIFT) - 1),
         })
     }
 
     /// The pixel's value.
     #[must_use]
     pub const fn encode(self) -> u32 {
-        (self.node << NODE_SHIFT) | (self.cluster << CLUSTER_SHIFT) | self.triangle
+        (self.node << NODE_SHIFT) | (self.cluster << CLUSTER_SHIFT) | self.quad
     }
 }
 
@@ -320,9 +377,7 @@ pub enum RasterError {
     /// More nodes than a visibility id holds.
     #[error("{0} nodes: the visibility buffer's ids hold at most {MAX_NODES}")]
     Capacity(u32),
-    /// The device can't give a fragment its primitive index.
-    #[error("the device has no primitive index (wgpu's PRIMITIVE_INDEX feature)")]
-    NoPrimitiveIndex,
+
     /// More slot buffers than one draw can bind.
     #[error("{buffers} slot buffers: one draw binds at most {limit} beside its own")]
     TooManySlotBuffers {
@@ -465,15 +520,13 @@ impl Raster {
     ///
     /// # Errors
     ///
-    /// [`RasterError::Capacity`] above [`MAX_NODES`]; [`RasterError::NoPrimitiveIndex`] if the
-    /// device lacks the feature; [`RasterError::Gpu`] if a buffer or pipeline can't be made.
+    /// [`RasterError::Capacity`] above [`MAX_NODES`]; [`RasterError::Gpu`] if a buffer or
+    /// pipeline can't be made.
     pub fn new(gpu: &Gpu, capacity: u32, config: RasterConfig) -> Result<Self, RasterError> {
         if capacity > MAX_NODES {
             return Err(RasterError::Capacity(capacity));
         }
-        if !gpu.device().features().contains(Features::PRIMITIVE_INDEX) {
-            return Err(RasterError::NoPrimitiveIndex);
-        }
+
         let device = gpu.device();
         let indices = gpu.scoped("cluster indices", || {
             device.create_buffer_init(&BufferInitDescriptor {
@@ -796,7 +849,7 @@ impl SlotPipeline {
             })
         })?;
         let source = format!(
-            "enable primitive_index;\n{NODE_WGSL}{VERTEX_WGSL}{CULL_WGSL}{CLUSTER_WGSL}\
+            "{NODE_WGSL}{VERTEX_WGSL}{CULL_WGSL}{CLUSTER_WGSL}\
              {INDICES_WGSL}{MORPH_WGSL}{}{RASTER_WGSL}",
             slot_source(&counts)
         );

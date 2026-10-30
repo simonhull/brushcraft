@@ -1,16 +1,20 @@
 // The raster (render::raster): every visible cluster into the visibility buffer, one instanced
 // indexed indirect draw per phase, and the geomorph that moves each cluster's odd vertices.
 //
-// After `enable primitive_index;`, tree::NODE_WGSL, upload::VERTEX_WGSL, cull::CULL_WGSL,
+// After tree::NODE_WGSL, upload::VERTEX_WGSL, cull::CULL_WGSL,
 // lod::CLUSTER_WGSL, raster::INDICES_WGSL and the slot bindings raster.rs generates for the
 // frame's slot buffers (group 1, read through `slot_vertex`). One instance a cluster of the
 // phase's list; the index buffer is the cluster's static triangles (render::indices), each
 // index a grid vertex the cluster's edge variant remaps.
 //
-// The visibility buffer holds, per pixel, the node of the tile tree drawn there (bits 13..32),
-// the cluster within its tile (7..13) and the triangle within the cluster (0..7): stable while
-// the camera is still, since a node stays its tile's while resident. 0xffffffff where nothing
-// is drawn.
+// The visibility buffer holds, per pixel, the node of the tile tree drawn there (bits 12..32),
+// the cluster within its tile (6..12) and the quad within the cluster (0..6, 8y + x): stable
+// while the camera is still, since a node stays its tile's while resident. 0xffffffff where
+// nothing is drawn. The quad comes flat from each triangle's provoking vertex, its first: both
+// triangles of quad (x, y) start at its p00, grid vertex (x, y) of the static index buffer, so
+// every vertex hands on the quad its unremapped grid index starts (a vertex an edge variant
+// collapses still provokes its quad's surviving triangle). Which of the quad's two triangles a
+// pixel is in, the shading pass tells by the diagonal (raster.rs, QUAD_WGSL).
 
 // The tile tree.
 @group(0) @binding(0) var<storage, read> tree: array<TileNode>;
@@ -29,16 +33,14 @@
 struct ClusterOut {
     // The vertex in clip space.
     @builtin(position) clip: vec4<f32>,
-    // The visibility id without the triangle: node and cluster, the same for every vertex.
-    @location(0) @interpolate(flat) id: u32,
+    // The visibility id of the quad this vertex starts (when it is a triangle's first).
+    @location(0) @interpolate(flat, first) id: u32,
 }
 
 // Where the visibility id's node starts.
-const NODE_SHIFT: u32 = 13u;
+const NODE_SHIFT: u32 = 12u;
 // Where its cluster within the tile starts.
-const CLUSTER_SHIFT: u32 = 7u;
-// Its triangle within the cluster.
-const TRIANGLE_MASK: u32 = 127u;
+const CLUSTER_SHIFT: u32 = 6u;
 // Bits of TileNode.slot below the size class.
 const CLASS_SHIFT: u32 = 29u;
 // TileNode.slot's buffer within its class, after shifting.
@@ -200,12 +202,16 @@ fn cluster_vertex(
 ) -> ClusterOut {
     let placed = cluster_point(instance, index);
     let clip = view.view_proj * vec4<f32>(placed.position - view.eye.xyz, 1.0);
-    return ClusterOut(clip, placed.id);
+    // The quad whose p00 is this grid vertex, unremapped; the last row and column start
+    // none, and never provoke.
+    let u = min(index % CLUSTER_SIDE, CLUSTER_QUADS - 1u);
+    let v = min(index / CLUSTER_SIDE, CLUSTER_QUADS - 1u);
+    return ClusterOut(clip, placed.id | (v * CLUSTER_QUADS + u));
 }
 
-// The visibility id: the cluster's, and the triangle's place in the static index buffer
-// (primitive indices restart with every instance).
+// The visibility id, as the triangle's first vertex gave it.
 @fragment
-fn visibility(vertex_out: ClusterOut, @builtin(primitive_index) triangle: u32) -> @location(0) u32 {
-    return vertex_out.id | (triangle & TRIANGLE_MASK);
+fn visibility(vertex_out: ClusterOut) -> @location(0) u32 {
+    return vertex_out.id;
 }
+

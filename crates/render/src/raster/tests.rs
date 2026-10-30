@@ -1159,13 +1159,14 @@ fn the_pinhole_test_holds_for_the_level_choice_s_cuts_morphing_by_distance() {
     });
 }
 
-/// The triangle a visibility id names, as its three corners in pixels, morphing off.
-fn named_triangle(
+/// The quad a visibility id names, as its corners `[p00, p10, p11, p01]` in pixels, where the
+/// cluster's edge variant draws them (morphing off).
+fn named_quad(
     world: &World,
     clusters: &[GpuCluster],
     id: VisibilityId,
     view: &View,
-) -> [(f64, f64); 3] {
+) -> [(f64, f64); 4] {
     let place = world.place_of(id.node);
     let quads = place.level().tile_quads();
     let per = (quads / 8).max(1);
@@ -1177,12 +1178,14 @@ fn named_triangle(
     let size = ClusterSize::of_quads(cluster.quads()).expect("a size");
     let variant =
         Variant::new(u8::try_from(cluster.variant()).expect("4 bits")).expect("a variant");
-    let triangle = indices::triangles()
-        .nth(usize::try_from(id.triangle).expect("small"))
-        .expect("a triangle of the cluster");
+    let (qx, qy) = (
+        u8::try_from(id.quad % 8).expect("small"),
+        u8::try_from(id.quad / 8).expect("small"),
+    );
     let tile = &world.tiles[&place];
     let row = quads + 1;
-    triangle.map(|corner: GridVertex| {
+    [(0, 0), (1, 0), (1, 1), (0, 1)].map(|(du, dv)| {
+        let corner = GridVertex::new(qx + du, qy + dv).expect("on the grid");
         let drawn = remap(size, variant, corner);
         let column = cx * 8 + u32::from(drawn.u());
         let line = cy * 8 + u32::from(drawn.v());
@@ -1191,6 +1194,16 @@ fn named_triangle(
         let (x, y, _) = view.pixel(point).expect("in front");
         (x, y)
     })
+}
+
+/// Quad `corners`' triangle `which`: 0 `(p00, p10, p11)`, 1 `(p00, p11, p01)`.
+const fn quad_half(corners: [(f64, f64); 4], which: u32) -> [(f64, f64); 3] {
+    let [p00, p10, p11, p01] = corners;
+    if which == 0 {
+        [p00, p10, p11]
+    } else {
+        [p00, p11, p01]
+    }
 }
 
 /// Whether `pixel` (a centre) lies in `triangle`, or within `slack` pixels of it.
@@ -1209,8 +1222,27 @@ fn covers(triangle: [(f64, f64); 3], pixel: (f64, f64), slack: f64) -> bool {
         && edge(third, first) >= -slack
 }
 
+/// The centre of pixel `index` of the test viewport.
+fn pixel_centre(index: usize) -> (f64, f64) {
+    let index = u32::try_from(index).expect("small");
+    let width = size().width();
+    (
+        f64::from(index % width) + 0.5,
+        f64::from(index / width) + 0.5,
+    )
+}
+
+/// `corners` in `f32`, for [`quad_triangle`].
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "pixels on a small viewport, as a shading pass holds them"
+)]
+fn narrow_corners(corners: [(f64, f64); 4]) -> [[f32; 2]; 4] {
+    corners.map(|(x, y)| [x as f32, y as f32])
+}
+
 #[test]
-fn every_visibility_id_decodes_to_the_node_cluster_and_triangle_drawn_there() {
+fn every_visibility_id_decodes_to_the_node_cluster_and_quad_drawn_there() {
     GpuTest::run(|gpu| {
         let world = World::new(gpu);
         let mut rng = Rng(5);
@@ -1226,29 +1258,165 @@ fn every_visibility_id_decodes_to_the_node_cluster_and_triangle_drawn_there() {
                 moving: false,
             };
             let image = draw_cut(gpu, &mut raster, &world, &cut, &clusters, &frame);
-            let width = size().width();
-            for (index, &pixel) in image.iter().enumerate().step_by(7) {
+            let sampled = image.iter().enumerate().step_by(7);
+            for (index, &pixel) in sampled {
                 let Some(id) = VisibilityId::decode(pixel) else {
                     continue;
                 };
                 assert_eq!(id.encode(), pixel, "round trip");
                 let place = world.place_of(id.node);
                 assert!(cut.contains(&place), "{place:?} is in the cut");
-                assert!(id.triangle < 128, "a triangle of the cluster");
-                let index = u32::try_from(index).expect("small");
-                let (x, y) = (
-                    f64::from(index % width) + 0.5,
-                    f64::from(index / width) + 0.5,
-                );
-                let triangle = named_triangle(&world, &clusters, id, &view);
+                assert!(id.quad < 64, "a quad of the cluster");
+                // The quad is the first vertex's: were it another's, the id would name a
+                // neighbouring quad, which doesn't hold the pixel.
+                let centre = pixel_centre(index);
+                let quad = named_quad(&world, &clusters, id, &view);
                 assert!(
-                    covers(triangle, (x, y), 0.01),
-                    "pixel ({x}, {y}): {id:?} of {place:?} is {triangle:?}"
+                    (0..2).any(|which| covers(quad_half(quad, which), centre, 0.01)),
+                    "pixel {centre:?}: {id:?} of {place:?} is {quad:?}"
                 );
                 checked += 1;
             }
         }
         assert!(checked > 2000, "{checked} pixels checked");
+    });
+}
+
+#[test]
+fn the_diagonal_test_picks_the_triangle_the_rasterizer_drew() {
+    GpuTest::run(|gpu| {
+        let world = World::new(gpu);
+        let mut rng = Rng(9);
+        let mut full = still_raster(gpu, &world);
+        // The same raster with every quad's second triangle degenerate: a pixel keeps its id
+        // only where the first triangle drew it (nothing faces the eye behind a convex sphere).
+        let mut first_only = still_raster(gpu, &world);
+        let mut halves = indices::indices();
+        for quad in halves.chunks_mut(6) {
+            let p00 = quad[0];
+            quad[3..].fill(p00);
+        }
+        first_only.indices = gpu.device().create_buffer_init(&BufferInitDescriptor {
+            label: Some("first triangles"),
+            contents: bytemuck::cast_slice(&halves),
+            usage: BufferUsages::INDEX,
+        });
+        let (mut checked, mut seconds) = (0, 0);
+        for _ in 0..2 {
+            let (view, _) = random_view(&mut rng, (2.0, 3.0));
+            let cut = random_cut(&mut rng, &world, 3);
+            let clusters = cut_clusters(&world, &cut, true);
+            let frame = RasterFrame {
+                view: &view,
+                time: Duration::ZERO,
+                moving: false,
+            };
+            let image = draw_cut(gpu, &mut full, &world, &cut, &clusters, &frame);
+            let firsts = draw_cut(gpu, &mut first_only, &world, &cut, &clusters, &frame);
+            let pixels = image.iter().zip(&firsts).enumerate();
+            for (index, (&pixel, &first)) in pixels {
+                let Some(id) = VisibilityId::decode(pixel) else {
+                    continue;
+                };
+                let drew = u32::from(first != pixel);
+                let centre = pixel_centre(index);
+                let quad = named_quad(&world, &clusters, id, &view);
+                // Pixels within a hundredth of a pixel of the diagonal go by the rasterizer's
+                // tie rule, which the side test needn't follow.
+                let [p00, _, p11, _] = quad;
+                let (dx, dy) = (p11.0 - p00.0, p11.1 - p00.1);
+                let off = (dx * (centre.1 - p00.1) - dy * (centre.0 - p00.0)) / dx.hypot(dy);
+                if off.abs() < 0.01 {
+                    continue;
+                }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a pixel centre on a small viewport"
+                )]
+                let at = [centre.0 as f32, centre.1 as f32];
+                let picked = quad_triangle(narrow_corners(quad), at);
+                assert_eq!(picked, drew, "pixel {centre:?} of {id:?}");
+                checked += 1;
+                seconds += drew;
+            }
+        }
+        assert!(checked > 20_000, "{checked} pixels checked");
+        assert!(
+            seconds > checked / 4,
+            "both triangles drawn: {seconds} of {checked}"
+        );
+    });
+}
+
+/// The WGSL decode run over `cases` (corners and pixel): its answer for each.
+fn quad_triangle_on_gpu(gpu: &Gpu, cases: &[[[f32; 2]; 5]]) -> Vec<u32> {
+    let source = format!(
+        "{QUAD_WGSL}
+@group(0) @binding(0) var<storage, read> cases: array<array<vec2<f32>, 5>>;
+@group(0) @binding(1) var<storage, read_write> picked: array<u32>;
+@compute @workgroup_size(64)
+fn decode(@builtin(global_invocation_id) id: vec3<u32>) {{
+    if id.x < arrayLength(&cases) {{
+        let c = cases[id.x];
+        picked[id.x] = quad_triangle(c[0], c[1], c[2], c[3], c[4]);
+    }}
+}}
+"
+    );
+    let pipeline = gpu
+        .compute_pipeline("quad decode", ShaderSource::Wgsl(source.into()), "decode")
+        .expect("the decode");
+    let device = gpu.device();
+    let input = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("cases"),
+        contents: bytemuck::cast_slice(cases),
+        usage: BufferUsages::STORAGE,
+    });
+    let output = storage_buffer(gpu, "picked", cases.len() as u64 * 4).expect("a buffer");
+    let group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("quad decode"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[entry(0, &input), entry(1, &output)],
+    });
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        let groups = u32::try_from(cases.len()).expect("small").div_ceil(64);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+    gpu.queue().submit([encoder.finish()]);
+    finish(gpu);
+    gpu.read_buffer(&output).expect("read back")
+}
+
+#[test]
+fn the_shading_pass_s_diagonal_test_answers_as_the_cpu_s() {
+    GpuTest::run(|gpu| {
+        let mut rng = Rng(13);
+        let mut cases = Vec::new();
+        for k in 0..4096 {
+            let mut point = || [rng.range(-50.0, 50.0), rng.range(-50.0, 50.0)];
+            let (p00, mut p10, p11, mut p01) = (point(), point(), point(), point());
+            // Collapsed triangles too, as the edge variants make them.
+            if k % 7 == 0 {
+                p10 = p11;
+            }
+            if k % 11 == 0 {
+                p01 = p00;
+            }
+            cases.push([p00, p10, p11, p01, point()]);
+        }
+        let picked = quad_triangle_on_gpu(gpu, &cases);
+        for (case, gpu_pick) in cases.iter().zip(&picked) {
+            let [p00, p10, p11, p01, pixel] = *case;
+            assert_eq!(
+                *gpu_pick,
+                quad_triangle([p00, p10, p11, p01], pixel),
+                "{case:?}"
+            );
+        }
     });
 }
 
