@@ -45,12 +45,17 @@
 //! parent level draws that point), to `p`, its position. Even vertices never move. `t` is the
 //! smaller of two factors:
 //!
-//! - **Distance:** 0 while the parent's `e` (the bound the level change trades) projects at `p` to
-//!   under [`RasterConfig::with_ramp`] pixels (by default the level choice's 1 px refine
-//!   threshold), rising to 1 at twice that. The level choice refines by a conservative bound over
-//!   the tile's sphere, so a tile is usually drawn as its parent at first, and grows its detail as
-//!   the camera nears; the drawn surface stays within the threshold of the finest surface meanwhile
-//!   (it is the parent's surface while `t` is 0).
+//! - **Distance** (user decision, 2026-10-29): `t = (x − r) / (x − y)`, clamped to `[0, 1]`, with
+//!   `x` the parent's `e` (the bound the level change trades) and `y` the tile's own, both
+//!   projected at `p` in pixels, and `r` the level choice's refine threshold
+//!   ([`RasterConfig::for_level_choice`], 1 px by default). The drawn surface's error, about `(1 −
+//!   t) x + t y`, then stays at `r` while it can, and the morph ends just as the tile's own `e`
+//!   reaches `r`, where the level choice refines the tile (by its conservative bound, a little
+//!   earlier): the tile's odd vertices are where its children's even ones will be, so the
+//!   refinement doesn't pop but by that bound's slack. Where `x − y` is 0 or less (a parent bound
+//!   no larger than the tile's own), `t` is 1 if `y` is within `r`, else 0. At `t = 0` the surface
+//!   is the tile's even vertices, which are the parent's vertices re-quantized at the parent's step
+//!   (≤ 1/64 of a quad, about 0.06 px at the threshold), not the parent's bits.
 //! - **Time:** for a level change made while the camera is still, 0 when the tile came into the
 //!   cut, rising to 1 over [`RasterConfig::with_morph`] (150 ms, spec). Where it lives (the design
 //!   question): **on the GPU, a stamp per node** (WGSL's `MorphState`: the tile, the frame it was
@@ -63,13 +68,15 @@
 //!   only when it refines what was drawn last frame and the camera is still; otherwise it is
 //!   stamped a whole duration ago (no morph): moving, the distance factor alone morphs; a tile
 //!   replacing finer ones, or one with nothing drawn before it, has nothing to morph from. **Not
-//!   covered:** a coarsening made with the camera still (a refresh that lowers `e`) still pops, by
-//!   at most the threshold: morphing out would need the finer tiles drawn for the duration after
-//!   the level choice dropped them.
+//!   covered, recorded (user decision, 2026-10-29; plan, "Gaps found while executing", the "Task 4
+//!   review" bullet):** a coarsening made with the camera still (a refresh that lowers `e`) pops,
+//!   by at most the threshold: morphing out would need the finer tiles drawn for the duration after
+//!   the level choice dropped them. To revisit with Task 5's golden images.
 //!
 //! **At seams** a border vertex's factors come from inputs both tiles share, so both draw it at
-//! the same bits: the larger of the two tiles' parent `e`, the less advanced of their stamps,
-//! and the vertex's own position (bit-identical on both sides, spec "Display layer"); the
+//! the same bits: the larger of the two tiles' parent `e`, the larger of their own `e`, the less
+//! advanced of their stamps, and the vertex's own position (bit-identical on both sides, spec
+//! "Display layer"); the
 //! midpoint's two parents are border vertices too. Where the neighbour is drawn finer the vertex
 //! isn't morphed (`t` = 1): the finer side draws it as an even vertex, which never moves. Beside a
 //! coarser one, the variant has already replaced it by an even vertex.
@@ -120,7 +127,7 @@ use crate::camera::{GpuView, View};
 use crate::cull::{CULL_WGSL, SlotBuffers, entry, pipeline, storage_buffer, uniform_buffer};
 use crate::gpu::{Gpu, GpuError};
 use crate::indices::{self, INDICES_WGSL};
-use crate::lod::{CLUSTER_WGSL, CutList};
+use crate::lod::{CLUSTER_WGSL, CutList, LodConfig};
 use crate::tree::NODE_WGSL;
 use crate::upload::VERTEX_WGSL;
 
@@ -299,11 +306,43 @@ impl VisibilityId {
 pub struct RasterConfig {
     /// The time factor's duration.
     morph: Duration,
-    /// The distance factor's ramp, pixels.
-    ramp: f32,
+    /// The distance factor's threshold.
+    ramp: MorphThreshold,
+}
+
+/// The error, in pixels, the distance factor holds the drawn surface to: finite and not
+/// negative; [`MorphThreshold::OFF`] for no distance factor (the morph by time alone).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+pub struct MorphThreshold(f32);
+
+impl MorphThreshold {
+    /// No distance factor: odd vertices morph by time alone.
+    pub const OFF: Self = Self(0.0);
+
+    /// `pixels`, if finite and not negative (0 is [`MorphThreshold::OFF`]).
+    #[must_use]
+    pub fn new(pixels: f32) -> Option<Self> {
+        (pixels.is_finite() && pixels >= 0.0).then_some(Self(pixels))
+    }
+
+    /// The pixels.
+    #[must_use]
+    pub const fn pixels(self) -> f32 {
+        self.0
+    }
 }
 
 impl RasterConfig {
+    /// The raster for `lod`'s level choice: the distance factor at its refine threshold (no
+    /// distance factor if that isn't a valid threshold), the time factor over [`MORPH`].
+    #[must_use]
+    pub fn for_level_choice(lod: &LodConfig) -> Self {
+        Self {
+            morph: MORPH,
+            ramp: MorphThreshold::new(lod.thresholds().refine_error).unwrap_or(MorphThreshold::OFF),
+        }
+    }
+
     /// The morph over `duration` (zero: no time factor).
     #[must_use]
     pub const fn with_morph(self, duration: Duration) -> Self {
@@ -313,24 +352,21 @@ impl RasterConfig {
         }
     }
 
-    /// The distance factor 0 while the parent's `e` projects under `pixels`, 1 from twice that
-    /// (0 or less: no distance factor).
+    /// The distance factor at `threshold` instead of the level choice's: for tests and tools
+    /// ([`MorphThreshold::OFF`] morphs by time alone).
     #[must_use]
-    pub const fn with_ramp(self, pixels: f32) -> Self {
+    pub const fn with_ramp(self, threshold: MorphThreshold) -> Self {
         Self {
-            ramp: pixels,
+            ramp: threshold,
             ..self
         }
     }
 }
 
 impl Default for RasterConfig {
-    /// [`MORPH`], and the ramp at the level choice's refine threshold, 1 px.
+    /// The raster for the default level choice: [`RasterConfig::for_level_choice`].
     fn default() -> Self {
-        Self {
-            morph: MORPH,
-            ramp: crate::lod::Thresholds::SPEC.refine_error,
-        }
+        Self::for_level_choice(&LodConfig::default())
     }
 }
 
@@ -486,6 +522,9 @@ pub struct Raster {
     pipeline: Option<SlotPipeline>,
     /// The targets, sized to the last frame's view (1 × 1 before the first).
     targets: Targets,
+    /// Text replacements made in the render pipeline's shader: none outside the tests, whose
+    /// bite checks break a rule on purpose to see a test fail.
+    pub(crate) patches: Vec<(&'static str, &'static str)>,
 }
 
 /// A layout entry for a read-only storage buffer seen by the vertex and compute stages.
@@ -594,6 +633,7 @@ impl Raster {
             stamp,
             pipeline: None,
             targets: Targets::new(gpu, 1, 1)?,
+            patches: Vec::new(),
         })
     }
 
@@ -618,7 +658,7 @@ impl Raster {
             now: millis(frame.time),
             duration: u32::try_from(self.config.morph.as_millis()).unwrap_or(u32::MAX),
             flags: if frame.moving { MOVING } else { 0 },
-            ramp: self.config.ramp,
+            ramp: self.config.ramp.pixels(),
             count_word: 0,
             reserved: [0; 2],
         };
@@ -807,8 +847,27 @@ impl Raster {
         if buffers > limit {
             return Err(RasterError::TooManySlotBuffers { buffers, limit });
         }
-        self.pipeline = Some(SlotPipeline::new(gpu, &self.layout, counts)?);
+        let source = self.shader_source(&counts);
+        self.pipeline = Some(SlotPipeline::new(gpu, &self.layout, counts, &source)?);
         Ok(())
+    }
+
+    /// The render pipeline's shader for `counts` slot buffers a class, with
+    /// [`Raster::patches`] made.
+    ///
+    /// # Panics
+    ///
+    /// If a patch doesn't apply: only the tests make any.
+    fn shader_source(&self, counts: &[usize]) -> String {
+        let source = format!(
+            "{NODE_WGSL}{VERTEX_WGSL}{CULL_WGSL}{CLUSTER_WGSL}\
+             {INDICES_WGSL}{MORPH_WGSL}{}{RASTER_WGSL}",
+            slot_source(counts)
+        );
+        self.patches.iter().fold(source, |source, (from, to)| {
+            assert!(source.contains(from), "the patch {from:?} applies");
+            source.replace(from, to)
+        })
     }
 
     /// The visibility buffer: [`VISIBILITY_FORMAT`], the last begun frame's size (1 × 1 before
@@ -837,7 +896,12 @@ impl SlotPipeline {
     /// # Errors
     ///
     /// As [`Gpu::scoped`].
-    fn new(gpu: &Gpu, layout: &BindGroupLayout, counts: Vec<usize>) -> Result<Self, GpuError> {
+    fn new(
+        gpu: &Gpu,
+        layout: &BindGroupLayout,
+        counts: Vec<usize>,
+        source: &str,
+    ) -> Result<Self, GpuError> {
         let device = gpu.device();
         let bindings = u32::try_from(counts.iter().sum::<usize>()).unwrap_or(0);
         let entries = (0..bindings).map(read_entry);
@@ -848,15 +912,10 @@ impl SlotPipeline {
                 entries: &entries,
             })
         })?;
-        let source = format!(
-            "{NODE_WGSL}{VERTEX_WGSL}{CULL_WGSL}{CLUSTER_WGSL}\
-             {INDICES_WGSL}{MORPH_WGSL}{}{RASTER_WGSL}",
-            slot_source(&counts)
-        );
         let pipeline = gpu.scoped("raster pipeline", || {
             let module = device.create_shader_module(ShaderModuleDescriptor {
                 label: Some("raster"),
-                source: ShaderSource::Wgsl(source.as_str().into()),
+                source: ShaderSource::Wgsl(source.into()),
             });
             let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("raster"),
@@ -908,7 +967,7 @@ impl SlotPipeline {
             slot_layout,
             pipeline,
             #[cfg(test)]
-            source,
+            source: source.to_owned(),
         })
     }
 }

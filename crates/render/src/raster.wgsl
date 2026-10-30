@@ -84,19 +84,28 @@ fn morph_time(n: u32) -> f32 {
     return min(f32(elapsed) / f32(params.duration), 1.0);
 }
 
-// How far the morph has run by distance, 0 to 1, for `e` at `p`: 0 while `e` projects at `p`
-// to under `ramp` pixels (the level is drawn as the one above it, within that much of the
-// finest surface), 1 from twice that on; 1 with no ramp, or at and behind the near plane.
-fn morph_distance(e: f32, p: vec3<f32>) -> f32 {
-    if params.ramp <= 0.0 {
+// How far the morph has run by distance, 0 to 1, at `p`, for the parent's bound `parent` and
+// the tile's own `own` (world units): t = (x - r) / (x - y) clamped, with x and y those bounds
+// projected at `p` in pixels and r the threshold (params.ramp), so that the drawn error,
+// (1 - t) x + t y, stays at r while it can, and the morph ends as the tile's own bound reaches r
+// (user decision, 2026-10-29). Where x - y is 0 or less (a parent bound no larger than the
+// tile's own), 1 if y is within r, else 0. 1 with no threshold, or at and behind the near
+// plane.
+fn morph_distance(parent: f32, own: f32, p: vec3<f32>) -> f32 {
+    let r = params.ramp;
+    if r <= 0.0 {
         return 1.0;
     }
     let depth = dot(view.planes[4].xyz, p - view.eye.xyz);
     if depth <= view.viewport.w {
         return 1.0;
     }
-    let pixels = e * view.viewport.z / depth;
-    return clamp(pixels / params.ramp - 1.0, 0.0, 1.0);
+    let x = parent * view.viewport.z / depth;
+    let y = own * view.viewport.z / depth;
+    if x - y <= 0.0 {
+        return select(0.0, 1.0, y <= r);
+    }
+    return clamp((x - r) / (x - y), 0.0, 1.0);
 }
 
 // The edge of a tile of `quads` quads a side that its vertex (i, j) lies on, 4 inside. Only
@@ -132,11 +141,11 @@ struct Placed {
 // An odd vertex (odd i or j in its tile: not in the parent level's grid) moves from the
 // midpoint of its two parents in decision 4's triangulation (the edge's ends, or the
 // (i - 1, j - 1)-(i + 1, j + 1) diagonal) towards its position, by the smaller of the morph's
-// time and distance factors. On a tile edge the factors are the seam's, from both tiles'
-// shared inputs: the larger parent e, the less advanced stamp, the vertex's own bits, so both
-// sides place it the same; where the neighbour is drawn finer the vertex stays where it is, as
-// the finer side's even vertex there does; beside a coarser one the variant has already
-// replaced it by an even vertex. Even vertices never move.
+// time and distance factors. On a tile edge the factors are the seam's, from inputs both
+// tiles share: the larger parent e, the larger own e, the less advanced stamp and the vertex's
+// own bits, so both sides place it the same; where the neighbour is drawn finer the vertex
+// stays where it is, as the finer side's even vertex there does; beside a coarser one the
+// variant has already replaced it by an even vertex. Even vertices never move.
 fn cluster_point(instance: u32, index: u32) -> Placed {
     let c = clusters[instance];
     let n = c.node;
@@ -160,6 +169,7 @@ fn cluster_point(instance: u32, index: u32) -> Placed {
         return Placed(p, id);
     }
     var e = parent_error(n);
+    var own = tree[n].error;
     var time = morph_time(n);
     let edge = edge_of(i, j, quads);
     if edge < 4u {
@@ -170,13 +180,14 @@ fn cluster_point(instance: u32, index: u32) -> Placed {
         if ((node.edges >> edge) & 1u) != 0u && m != NONE {
             let other = parent_error(m);
             e = select(max(e, other), -1.0, other < 0.0 || e < 0.0);
+            own = max(own, tree[m].error);
             time = min(time, morph_time(m));
         }
     }
     if e < 0.0 {
         return Placed(p, id);
     }
-    let t = min(time, morph_distance(e, p));
+    let t = min(time, morph_distance(e, own, p));
     if t >= 1.0 {
         return Placed(p, id);
     }

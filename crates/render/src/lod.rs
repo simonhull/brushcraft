@@ -527,6 +527,13 @@ impl LodConfig {
         self.triangle_budget
     }
 
+    /// The screen-error thresholds: the raster's geomorph holds the drawn error to the refine
+    /// threshold ([`crate::raster::RasterConfig::for_level_choice`]).
+    #[must_use]
+    pub const fn thresholds(&self) -> &Thresholds {
+        &self.thresholds
+    }
+
     /// Relaxation passes a frame.
     #[must_use]
     pub const fn relax_passes(&self) -> u32 {

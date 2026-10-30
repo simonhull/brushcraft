@@ -34,6 +34,8 @@ use crate::surface::Size;
 use crate::tree::{NODE_BYTES, NODE_FINEST, Place, TileTree};
 use crate::upload::{GpuVertex, TileDetail};
 
+mod pop;
+
 /// The finest level.
 const FINEST: u8 = 7;
 
@@ -594,7 +596,7 @@ fn finest_cut(world: &World) -> BTreeSet<Place> {
 fn still_raster(gpu: &Gpu, world: &World) -> Raster {
     let config = RasterConfig::default()
         .with_morph(Duration::ZERO)
-        .with_ramp(0.0);
+        .with_ramp(MorphThreshold::OFF);
     Raster::new(gpu, world.tree.capacity(), config).expect("the raster")
 }
 
@@ -832,7 +834,7 @@ fn the_pinhole_test_a_seam_between_morphs_takes_both_sides_shared_factors() {
         let last_clusters = cut_clusters(&world, last, true);
         // By time: at 1040 ms face 0 is 93 % through its morph and its neighbour 27 %, so
         // their seam is drawn by the less advanced stamp on both sides.
-        let by_time = RasterConfig::default().with_ramp(0.0);
+        let by_time = RasterConfig::default().with_ramp(MorphThreshold::OFF);
         let mut raster = Raster::new(gpu, world.tree.capacity(), by_time).expect("the raster");
         for (seen_from, view, mask) in &views {
             let at = |ms: u64| RasterFrame {
@@ -899,7 +901,7 @@ fn the_pinhole_test_random_cameras_and_random_mixed_level_cuts_show_no_backgroun
         let mut rng = Rng(41);
         // Morphing by time alone, so every refined tile's odd vertices move (the distance
         // factor is the level-choice pinhole test's).
-        let config = RasterConfig::default().with_ramp(0.0);
+        let config = RasterConfig::default().with_ramp(MorphThreshold::OFF);
         let mut raster = Raster::new(gpu, world.tree.capacity(), config).expect("the raster");
         let mut seen = BTreeSet::new();
         let mut checked = 0;
@@ -1689,7 +1691,7 @@ fn the_geomorph_moves_odd_vertices_from_their_midpoint_to_their_place_over_150_m
     GpuTest::run(|gpu| {
         let world = World::new(gpu);
         let case = MorphCase::new(gpu, &world);
-        let config = RasterConfig::default().with_ramp(0.0);
+        let config = RasterConfig::default().with_ramp(MorphThreshold::OFF);
         let mut raster = Raster::new(gpu, world.tree.capacity(), config).expect("the raster");
         // Frame 1 draws every face at level 3; frame 2 refines one with the camera still, so
         // its time factor starts at 0.
@@ -1729,28 +1731,70 @@ fn the_geomorph_moves_odd_vertices_from_their_midpoint_to_their_place_over_150_m
     });
 }
 
+/// Sets the bound `e` the tree holds for `place` (its data unchanged).
+fn set_error(gpu: &Gpu, world: &mut World, place: Place, error: f32) {
+    let tile = &world.tiles[&place];
+    let detail = TileDetail {
+        error,
+        ..tile.detail
+    };
+    let slot = tile.slot;
+    assert!(world.tree.move_to(place, slot, detail).is_some());
+    if let Some(stored) = world.tiles.get_mut(&place) {
+        stored.detail = detail;
+    }
+    world.write_tree(gpu);
+}
+
 #[test]
-fn the_geomorph_by_distance_holds_the_midpoint_below_the_ramp_and_lets_go_above_twice_it() {
+fn the_geomorph_by_distance_holds_the_drawn_error_at_the_threshold_till_the_tile_s_own_reaches_it()
+{
     GpuTest::run(|gpu| {
         let mut world = World::new(gpu);
         let case = MorphCase::new(gpu, &world);
+        let threshold = 1.0_f32;
         let config = RasterConfig::default()
             .with_morph(Duration::ZERO)
-            .with_ramp(1.0);
+            .with_ramp(MorphThreshold::new(threshold).expect("a threshold"));
         let mut raster = Raster::new(gpu, world.tree.capacity(), config).expect("the raster");
-        // The parent's e set to project far under the ramp, then far over twice it. The camera
-        // moves, so there is no time factor either way.
-        for (error, expected) in [(1e-7_f32, case.starts), (1.0, case.ends)] {
-            let parent = &world.tiles[&case.refined];
-            let detail = TileDetail {
-                error,
-                ..parent.detail
-            };
-            let slot = parent.slot;
-            assert!(world.tree.move_to(case.refined, slot, detail).is_some());
-            world.write_tree(gpu);
+        // Pixels a length of `e` covers at `p`, seen from the case's eye (0, 0, 3) along -z.
+        let ppu = case.view.pixels_per_unit();
+        let pixels = |e: f32, p: [f32; 3]| f64::from(e) * ppu / (3.0 - f64::from(p[2]));
+        // (parent e, own e): the parent's under the threshold everywhere (no morph); far over
+        // it with the tile's own at it or over (done); and in between, where each odd vertex
+        // stands at t = (x - r) / (x - y) of its way, x and y the bounds in pixels at it. The
+        // camera moves: no time factor.
+        let cases = [(1e-7_f32, 0.0_f32), (1.0, 0.5), (0.012, 0.002), (0.02, 0.0)];
+        for (parent, own) in cases {
+            set_error(gpu, &mut world, case.refined, parent);
+            set_error(gpu, &mut world, case.tile, own);
             let placed = case.draw_and_probe(gpu, &mut raster, &world, &case.at(2000, true));
-            assert_eq!(placed, expected.to_vec(), "parent e {error}");
+            for (k, at) in placed.iter().enumerate() {
+                let (from, to) = (case.starts[k], case.ends[k]);
+                let (x, y) = (pixels(parent, to), pixels(own, to));
+                let r = f64::from(threshold);
+                let t = if x - y <= 0.0 {
+                    if y <= r { 1.0 } else { 0.0 }
+                } else {
+                    ((x - r) / (x - y)).clamp(0.0, 1.0)
+                };
+                let expected: [f64; 3] = [0, 1, 2]
+                    .map(|a| f64::from(from[a]) + t * (f64::from(to[a]) - f64::from(from[a])));
+                let off = (0..3)
+                    .map(|a| (f64::from(at[a]) - expected[a]).abs())
+                    .fold(0.0, f64::max);
+                assert!(
+                    off < 1e-6,
+                    "e ({parent}, {own}) vertex {k}: t {t}, {at:?} for {expected:?}"
+                );
+                if t <= 0.0 || t >= 1.0 {
+                    let exact = if t <= 0.0 { from } else { to };
+                    assert_eq!(
+                        *at, exact,
+                        "e ({parent}, {own}) vertex {k}: an endpoint, exactly"
+                    );
+                }
+            }
         }
     });
 }
@@ -1855,8 +1899,7 @@ fn a_frame_draws_both_phases_lists_watertight_the_second_drawing_what_the_first_
         };
         let config = LodConfig::default().with_thresholds(thresholds);
         let mut passes =
-            FramePasses::new(gpu, world.tree.capacity(), config, RasterConfig::default())
-                .expect("the passes");
+            FramePasses::new(gpu, world.tree.capacity(), config, MORPH).expect("the passes");
         // A half turn between frames (a flick): what comes into view was behind the sphere in
         // the previous frame's depth, so the first phase hides it and the second draws it.
         let look = |eye: Vec3| {

@@ -77,7 +77,10 @@ pub struct FramePasses {
 }
 
 impl FramePasses {
-    /// The passes for a tile tree of `capacity` nodes.
+    /// The passes for a tile tree of `capacity` nodes, the level choice set up by `lod` and the
+    /// geomorph holding the drawn error to its refine threshold
+    /// ([`RasterConfig::for_level_choice`]), level changes made with the camera still morphing
+    /// over `morph`.
     ///
     /// # Errors
     ///
@@ -86,8 +89,9 @@ impl FramePasses {
         gpu: &Gpu,
         capacity: u32,
         lod: LodConfig,
-        raster: RasterConfig,
+        morph: Duration,
     ) -> Result<Self, FrameError> {
+        let raster = RasterConfig::for_level_choice(&lod).with_morph(morph);
         Ok(Self {
             lod: Lod::new(gpu, capacity, lod)?,
             raster: Raster::new(gpu, capacity, raster)?,
