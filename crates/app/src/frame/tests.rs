@@ -58,6 +58,8 @@ fn setup(frames: Option<u64>) -> Setup {
         presentation: Presentation::Offscreen,
         adapter: "test".to_owned(),
         frames,
+        script: None,
+        record: None,
     }
 }
 
@@ -77,6 +79,7 @@ const fn presented(number: u64) -> Presented {
             restarted: false,
             filtered_instead: false,
         },
+        gpu: Vec::new(),
     }
 }
 

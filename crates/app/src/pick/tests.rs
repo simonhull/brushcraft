@@ -284,6 +284,7 @@ fn settle(owner: &mut Owner<NoBrush, NoUploads>) -> u32 {
                     scene: false,
                     shown: false,
                     aa: render::aa::AaReport::default(),
+                    gpu: Vec::new(),
                 });
                 made += 1;
             }
@@ -316,6 +317,8 @@ fn the_frame_loop_picks_only_when_the_pointer_or_the_view_changed() {
         presentation: Presentation::Offscreen,
         adapter: "test".to_owned(),
         frames: None,
+        script: None,
+        record: None,
     };
     let mut owner =
         Owner::new(project, NoBrush, NoUploads, setup, Instant::now()).with_picker(picker);

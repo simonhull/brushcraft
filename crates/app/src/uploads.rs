@@ -68,14 +68,15 @@ use anyhow::{Context as _, Result};
 use geom::TileKey;
 use render::cull::{BoundsUpdate, SlotBuffers};
 use render::gpu::Gpu;
-use render::lod::{CutReader, LodConfig, LodStats};
+use render::lod::{CutReader, LodConfig, LodOutput, LodStats};
 use render::raster::{FramePasses, MORPH};
 use render::residency::{FrameUse, Residency, ResidencyConfig, ResidencyStats, Tier};
 use render::shade::ShadePath;
 use render::upload::{FrameUploads, StoreSource, prefetch_requests};
 use store::TileStore;
 
-use crate::frame::{FrameUpdate, UploadStatus, Uploads};
+use crate::frame::{CutHeard, FrameUpdate, UploadStatus, Uploads};
+use crate::record::SceneRecord;
 use crate::render_thread::ResidentScene;
 
 /// A mebibyte, for the overlay's sizes.
@@ -284,6 +285,7 @@ impl GpuResidency {
             .reader
             .collect(residency.finest())
             .context("reading the level choice's cut back")?;
+        let heard_cut = cut.as_ref().map(heard_of);
         if let Some(output) = cut {
             if residency.cut() != &output.cut {
                 let still = self.times.get(&output.frame).filter(|stamp| !stamp.moving);
@@ -319,7 +321,48 @@ impl GpuResidency {
             uploads,
             scene,
             cut_changed,
+            frame,
+            heard: heard_cut,
         })
+    }
+
+    /// Turns on timing the level choice's stages on the GPU, read back with each cut
+    /// ([`render::lod::Lod::enable_timing`]), if the device can; whether it does. Call it before
+    /// the first frame, which takes the passes to the render thread; after, it does nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the queries can't be made.
+    pub(crate) fn enable_timing(&mut self) -> Result<bool> {
+        let Some(passes) = self.passes.as_mut() else {
+            return Ok(false);
+        };
+        passes
+            .lod_mut()
+            .enable_timing(&self.gpu)
+            .context("timing the level choice's stages")
+    }
+}
+
+/// What a scripted run's record keeps of the cut `output`.
+fn heard_of(output: &LodOutput) -> CutHeard {
+    let mut levels: Vec<u64> = Vec::new();
+    for key in &output.cut {
+        let level = usize::from(key.level().get());
+        if levels.len() <= level {
+            levels.resize(level + 1, 0);
+        }
+        if let Some(count) = levels.get_mut(level) {
+            *count += 1;
+        }
+    }
+    CutHeard {
+        frame: output.frame,
+        scene: SceneRecord {
+            stats: output.stats.clone(),
+            levels,
+            stages: output.timings,
+        },
     }
 }
 
@@ -332,6 +375,10 @@ struct Staged {
     scene: ResidentScene,
     /// The time of the newest frame heard of whose cut changed, if one did.
     cut_changed: Option<Duration>,
+    /// Residency's number for the frame.
+    frame: u64,
+    /// The cut heard this frame, if one was.
+    heard: Option<CutHeard>,
 }
 
 impl Uploads for GpuResidency {
@@ -355,6 +402,9 @@ impl Uploads for GpuResidency {
             frame: Some(staged.uploads),
             scene: Some(staged.scene),
             passes: self.passes.take(),
+            staged_frame: Some(staged.frame),
+            stats: Some(stats),
+            heard: staged.heard,
         })
     }
 

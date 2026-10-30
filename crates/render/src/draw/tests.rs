@@ -62,6 +62,7 @@ fn draw(gpu: &Gpu, size: Size, overlay: Option<&TextImage>, scale: u32) -> (Draw
         overlay_scale: scale,
         scene: Scene::None,
         look: Look::default(),
+        frame: 1,
     };
     let drawn = renderer
         .draw(gpu, &mut target, &inputs, None, || called = true)
@@ -189,6 +190,7 @@ fn a_frames_uploads_go_in_its_submission_before_the_passes() {
             overlay_scale: 1,
             scene: Scene::None,
             look: Look::default(),
+            frame: 1,
         };
         let drawn = renderer
             .draw(gpu, &mut target, &inputs, Some(uploads), || {})
@@ -256,6 +258,8 @@ struct SceneFrame {
     cut: LodOutput,
     /// Whether the renderer says it drew the scene.
     drawn: bool,
+    /// The frame's GPU times, if it was timed and they came back.
+    gpu_times: Vec<GpuTimes>,
     /// The renderer, to draw more frames with.
     renderer: Renderer,
     /// The target.
@@ -269,11 +273,28 @@ fn draw_scene(
     world: &World,
     size: Size,
     eye: Vec3,
+    at: (Duration, u64),
+    look: Look,
+) -> SceneFrame {
+    draw_scene_timed(gpu, world, size, eye, at, look, false)
+}
+
+/// [`draw_scene`], with the frame's phases and the level choice's stages timed on the GPU if
+/// `timed` (and the device has timestamp queries).
+fn draw_scene_timed(
+    gpu: &Gpu,
+    world: &World,
+    size: Size,
+    eye: Vec3,
     (time, frame): (Duration, u64),
     look: Look,
+    timed: bool,
 ) -> SceneFrame {
     let mut target = Target::Offscreen(Offscreen::new(gpu, size).expect("target"));
     let mut renderer = Renderer::new(gpu, target.format()).expect("renderer");
+    if timed {
+        renderer.enable_timing(gpu).expect("the frame timer");
+    }
     let mut passes = FramePasses::new(
         gpu,
         world.tree.capacity(),
@@ -283,6 +304,12 @@ fn draw_scene(
         ShadePath::Compute,
     )
     .expect("the scene's passes");
+    if timed {
+        passes
+            .lod_mut()
+            .enable_timing(gpu)
+            .expect("the stage timer");
+    }
     let reader = passes.lod_mut().take_reader().expect("the reader");
     renderer.set_passes(passes);
     let requests = gpu.device().create_buffer(&BufferDescriptor {
@@ -319,6 +346,7 @@ fn draw_scene(
         overlay_scale: 1,
         scene: Scene::Draw(&scene),
         look,
+        frame,
     };
     let drawn = renderer
         .draw(gpu, &mut target, &inputs, None, || {})
@@ -336,14 +364,67 @@ fn draw_scene(
         .raster()
         .read_visibility(gpu)
         .expect("read back");
+    let gpu_times = renderer.take_timings();
     SceneFrame {
         pixels: pixels(gpu, &target),
         ids,
         cut,
         drawn: drawn.scene,
+        gpu_times,
         renderer,
         target,
     }
+}
+
+#[test]
+fn a_timed_frame_reports_its_phases_and_stages_on_the_gpu_when_the_device_can() {
+    GpuTest::run(|gpu| {
+        let world = World::with_finest(gpu, 4);
+        let size = Size::new(96, 64).expect("non-zero");
+        let eye = Vec3::new(0.4, 0.3, 2.6);
+        let at = (Duration::from_secs(1), 5);
+        let look = styled(MatCapStyle::Clay);
+        let frame = draw_scene_timed(gpu, &world, size, eye, at, look, true);
+        if gpu.timestamp_period().is_none() {
+            assert!(frame.gpu_times.is_empty(), "no queries, no times");
+            assert_eq!(frame.cut.timings, None, "nor stage times");
+            return;
+        }
+        let [times] = frame.gpu_times.as_slice() else {
+            panic!("one frame timed: {:?}", frame.gpu_times);
+        };
+        assert_eq!(times.frame(), 5, "tagged with its frame");
+        let every = [
+            GpuPhase::Uploads,
+            GpuPhase::Bounds,
+            GpuPhase::LevelChoice,
+            GpuPhase::Raster,
+            GpuPhase::Readback,
+            GpuPhase::Shade,
+            GpuPhase::Accumulate,
+            GpuPhase::Tone,
+        ];
+        let phases: Vec<Duration> = every
+            .iter()
+            .map(|&phase| times.phase(phase).expect("every phase ran"))
+            .collect();
+        let sum: Duration = phases.iter().sum();
+        // Each phase rounds down to whole nanoseconds on its own.
+        let rounding = Duration::from_nanos(every.len() as u64);
+        assert!(
+            times
+                .total()
+                .checked_sub(sum)
+                .is_some_and(|left| left <= rounding),
+            "the phases tile the frame: {sum:?} of {:?}",
+            times.total()
+        );
+        assert!(times.total() > Duration::ZERO, "the frame took time");
+        assert!(frame.cut.timings.is_some(), "the stages came with the cut");
+        let untimed = draw_scene(gpu, &world, size, eye, at, look);
+        assert!(untimed.gpu_times.is_empty(), "off unless asked for");
+        assert_eq!(untimed.cut.timings, None, "the stages too");
+    });
 }
 
 /// The pixels of `target`, an offscreen one.
@@ -383,6 +464,7 @@ fn a_frame_shading_the_last_scene_again_shows_it_in_the_new_look_without_drawing
                     overlay_scale: 1,
                     scene: Scene::Reshade,
                     look,
+                    frame: 2,
                 };
                 let drawn = frame
                     .renderer

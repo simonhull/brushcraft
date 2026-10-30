@@ -129,6 +129,7 @@ fn render(gpu: &Gpu, world: &World, size: Size, eye: Vec3, look: Look) -> Rgb {
         overlay_scale: 1,
         scene: Scene::Draw(&scene),
         look,
+        frame: 1,
     };
     let drawn = renderer
         .draw(gpu, &mut target, &inputs, None, || {})

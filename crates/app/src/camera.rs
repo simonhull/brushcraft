@@ -141,7 +141,6 @@ impl Rotation {
 
     /// The rotation by `angle` radians about the unit vector `axis`, counter-clockwise looking
     /// down the axis.
-    #[cfg(test)]
     pub(crate) fn about(axis: Vec3, angle: f64) -> Self {
         let (sin, cos) = (angle / 2.0).sin_cos();
         Self {
@@ -231,6 +230,22 @@ impl Camera {
     pub(crate) const MAX_DISTANCE: f64 = 1e4;
     /// The closest the eye comes to the target.
     pub(crate) const MIN_DISTANCE: f64 = 1e-4;
+
+    /// The default camera ([`Camera::default`]: looking at the origin, y up) turned to look from
+    /// `yaw` radians about the world's y axis (counter-clockwise from above, from +z towards +x)
+    /// and `pitch` radians above the horizon, `distance` away (clamped as [`Camera::zoom`]
+    /// clamps): a scripted camera's pose ([`crate::script`]).
+    pub(crate) fn orbiting(yaw: f64, pitch: f64, distance: f64) -> Self {
+        // The view's own x axis is the world's x before the yaw: pitch about it first (the eye
+        // rises towards +y, so the view turns by −pitch), then yaw about the world's up.
+        let tilt = Rotation::about(Vec3::new(1.0, 0.0, 0.0), -pitch);
+        let turn = Rotation::about(Vec3::new(0.0, 1.0, 0.0), yaw);
+        Self {
+            orientation: tilt.then(turn),
+            distance: distance.clamp(Self::MIN_DISTANCE, Self::MAX_DISTANCE),
+            ..Self::default()
+        }
+    }
 
     /// The point it looks at.
     pub(crate) const fn target(&self) -> Vec3 {

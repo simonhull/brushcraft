@@ -18,6 +18,9 @@
 //! [`aa`] smooths edges: frames accumulated at jittered sample points while the camera is still,
 //! an edge filter in the tone map while it moves.
 //!
+//! [`timing`] times a frame's phases on the GPU by timestamp queries, read back without
+//! waiting, where the device has them ([`Renderer::enable_timing`]).
+//!
 //! The crates below this one (`geom`, `store`, `brush`) never learn about the GPU: this crate
 //! reads their data and uploads it.
 //!
@@ -40,6 +43,7 @@ pub mod shade;
 #[cfg(feature = "spike")]
 pub mod spike;
 pub mod surface;
+pub mod timing;
 pub(crate) mod tone;
 pub mod tree;
 pub mod upload;

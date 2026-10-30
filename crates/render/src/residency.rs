@@ -601,6 +601,8 @@ pub struct ResidencyStats {
     pub resyncs: u64,
     /// Bytes the last frame staged.
     pub staged_bytes: u64,
+    /// Tiles the last frame staged.
+    pub staged_tiles: u64,
 }
 
 /// A resident tile.
@@ -1303,6 +1305,7 @@ impl Residency {
                     Err(error) => return Err(self.fail(batch, error.into())),
                 };
                 self.stats.staged_bytes = batch.bytes();
+                self.stats.staged_tiles = self.touched.len() as u64;
                 let frame = self.next_upload;
                 self.next_upload += 1;
                 self.in_flight

@@ -22,6 +22,7 @@ use render::cull::{BoundsUpdate, SlotBuffers};
 use render::gpu::Gpu;
 use render::raster::{FramePasses, SceneInputs};
 use render::surface::{Presentation, Size, Target};
+use render::timing::GpuTimes;
 use render::upload::FrameUploads;
 use render::{DrawTimes, FrameInputs, Look, Outcome, Renderer, Scene};
 use wgpu::{Buffer, Color};
@@ -123,7 +124,7 @@ impl SceneRequest {
 /// The frame's request readback (tiles wanted but missing) doesn't come back here: residency
 /// hears of it itself, through the readback buffer's mapping
 /// ([`render::residency::Residency::take_requests`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Presented {
     /// The frame's number.
     pub(crate) number: u64,
@@ -137,6 +138,9 @@ pub(crate) struct Presented {
     pub(crate) shown: bool,
     /// What its anti-aliasing did (`render::Drawn::aa`).
     pub(crate) aa: AaReport,
+    /// The GPU times of earlier frames read back by now, each naming its frame
+    /// ([`Renderer::take_timings`]); empty unless the thread times the GPU.
+    pub(crate) gpu: Vec<GpuTimes>,
 }
 
 /// A hook the render thread calls.
@@ -202,18 +206,26 @@ pub(crate) struct RenderThread {
     handle: Option<JoinHandle<Result<Target>>>,
     /// How the target presents.
     presentation: Presentation,
+    /// Whether it times each frame's phases on the GPU.
+    timing: bool,
 }
 
 impl RenderThread {
-    /// Starts the render thread, drawing into `target` on `gpu`.
+    /// Starts the render thread, drawing into `target` on `gpu`, timing each frame's phases on
+    /// the GPU if `timing` asks and the device can ([`RenderThread::timing`]).
     ///
     /// # Errors
     ///
-    /// If the renderer's passes can't be built, or the thread can't be started.
-    pub(crate) fn spawn(gpu: Arc<Gpu>, target: Target, hooks: Hooks) -> Result<Self> {
+    /// If the renderer's passes (or its GPU timer) can't be built, or the thread can't be
+    /// started.
+    pub(crate) fn spawn(gpu: Arc<Gpu>, target: Target, hooks: Hooks, timing: bool) -> Result<Self> {
         let presentation = target.presentation();
-        let renderer =
+        let mut renderer =
             Renderer::new(&gpu, target.format()).context("building the renderer's passes")?;
+        let timing = timing
+            && renderer
+                .enable_timing(&gpu)
+                .context("building the GPU's frame timer")?;
         // One frame at a time: the scheduler never sends another before this one is presented.
         let (frames, incoming) = mpsc::sync_channel(1);
         let (outgoing, presented) = mpsc::channel();
@@ -248,12 +260,19 @@ impl RenderThread {
             presented,
             handle: Some(handle),
             presentation,
+            timing,
         })
     }
 
     /// How the target presents.
     pub(crate) const fn presentation(&self) -> Presentation {
         self.presentation
+    }
+
+    /// Whether it times each frame's phases on the GPU: asked to, on a device with timestamp
+    /// queries.
+    pub(crate) const fn timing(&self) -> bool {
+        self.timing
     }
 
     /// Hands `frame` to the thread.
@@ -438,6 +457,7 @@ pub(crate) fn draw_frame(
         overlay_scale: frame.overlay_scale,
         scene,
         look: frame.look,
+        frame: frame.number,
     };
     let uploads = frame.uploads.take();
     let drawn = renderer
@@ -450,6 +470,7 @@ pub(crate) fn draw_frame(
         scene: drawn.scene,
         shown: drawn.shown,
         aa: drawn.aa,
+        gpu: renderer.take_timings(),
     })
 }
 
@@ -490,8 +511,8 @@ mod tests {
     fn the_thread_lays_out_the_overlay_text_and_draws_it() {
         let size = Size::new(160, 64).expect("non-zero");
         let (gpu, target) = offscreen(size);
-        let mut thread =
-            RenderThread::spawn(Arc::clone(&gpu), target, Hooks::none()).expect("render thread");
+        let mut thread = RenderThread::spawn(Arc::clone(&gpu), target, Hooks::none(), false)
+            .expect("render thread");
         assert_eq!(thread.presentation(), Presentation::Offscreen);
         thread.send(request(size, &["#"])).expect("sent");
         let presented = thread.wait().expect("drawn");
@@ -513,7 +534,8 @@ mod tests {
     fn a_stopped_thread_hands_its_target_back_and_reports_nothing_more() {
         let size = Size::new(8, 8).expect("non-zero");
         let (gpu, target) = offscreen(size);
-        let mut thread = RenderThread::spawn(gpu, target, Hooks::none()).expect("render thread");
+        let mut thread =
+            RenderThread::spawn(gpu, target, Hooks::none(), false).expect("render thread");
         assert_eq!(thread.finished().expect("running"), Vec::new());
         let returned = thread.stop().expect("stopped cleanly");
         assert_eq!(returned.size(), size);
@@ -526,7 +548,7 @@ mod tests {
         let (woken, wakes) = mpsc::channel();
         let mut hooks = Hooks::new(move || woken.send(()).unwrap_or(()), || {});
         hooks.before_draw = Box::new(|_| panic!("a bug in a pass"));
-        let mut thread = RenderThread::spawn(gpu, target, hooks).expect("render thread");
+        let mut thread = RenderThread::spawn(gpu, target, hooks, false).expect("render thread");
         thread.send(request(size, &[])).expect("sent");
         wakes
             .recv_timeout(Duration::from_secs(30))

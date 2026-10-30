@@ -111,6 +111,7 @@ use crate::cull::{
 };
 use crate::gpu::{Gpu, GpuError};
 use crate::residency::{FrameUse, REQUESTS_WGSL, Tier};
+use crate::timing::ticks_to_duration;
 use crate::tree::{NODE_BYTES, NODE_WGSL, Place};
 
 #[cfg(test)]
@@ -759,6 +760,9 @@ pub struct LodOutput {
     pub nodes: Vec<(u32, Place)>,
     /// Counts.
     pub stats: LodStats,
+    /// How long each stage took on the GPU, read back with the cut once timing is on
+    /// ([`Lod::enable_timing`]); `None` without timing.
+    pub timings: Option<LodTimings>,
 }
 
 impl LodOutput {
@@ -788,8 +792,9 @@ pub struct MainInputs<'a> {
 /// A readback buffer coming back to its reader.
 #[derive(Debug)]
 enum Readback {
-    /// Mapped, the results of frame `1` in it.
-    Mapped(Buffer, u64),
+    /// Mapped, the results of frame `1` in it, and its stages' timestamps at its end if `2`
+    /// says how long a tick is.
+    Mapped(Buffer, u64, Option<f32>),
     /// Mapping failed; the buffer is gone.
     Failed,
 }
@@ -812,6 +817,8 @@ pub struct CutReadback {
     buffer: Option<Buffer>,
     /// The frame it is of.
     frame: u64,
+    /// Nanoseconds a timestamp tick, if the stages' timestamps were copied to the buffer's end.
+    period: Option<f32>,
     /// Where it goes once mapped: to the reader.
     done: Sender<Readback>,
     /// Where an unread one goes back.
@@ -825,10 +832,10 @@ impl CutReadback {
         if let Some(buffer) = self.buffer.take() {
             let back = buffer.clone();
             let done = self.done.clone();
-            let frame = self.frame;
+            let (frame, period) = (self.frame, self.period);
             buffer.map_async(MapMode::Read, .., move |result| {
                 let readback = if result.is_ok() {
-                    Readback::Mapped(back, frame)
+                    Readback::Mapped(back, frame, period)
                 } else {
                     Readback::Failed
                 };
@@ -873,12 +880,12 @@ impl CutReader {
     pub fn collect(&self, finest: Level) -> Result<Option<LodOutput>, LodError> {
         let mut latest = None;
         while let Ok(back) = self.mapped.try_recv() {
-            let Readback::Mapped(buffer, frame) = back else {
+            let Readback::Mapped(buffer, frame, period) = back else {
                 // A level choice that's gone has no count to correct.
                 drop(self.back.send(Returned::Lost));
                 continue;
             };
-            let read = read_output(&buffer, finest, frame);
+            let read = read_output(&buffer, finest, frame, period);
             buffer.unmap();
             // A level choice that's gone has nothing to take back.
             drop(self.back.send(Returned::Free(buffer)));
@@ -904,6 +911,29 @@ pub struct LodTimings {
     /// The second phase.
     pub post: Duration,
 }
+
+impl LodTimings {
+    /// The stages' times from their timestamps, two a stage (begin, end) in stage order, a tick
+    /// `period` nanoseconds; a stage with no ticks reads as zero.
+    fn from_ticks(ticks: &[u64], period: f32) -> Self {
+        let stage = |index: usize| {
+            let begin = ticks.get(2 * index).copied().unwrap_or(0);
+            let end = ticks.get(2 * index + 1).copied().unwrap_or(0);
+            ticks_to_duration(end.saturating_sub(begin), period)
+        };
+        Self {
+            bounds: stage(0),
+            choose: stage(1),
+            relax: stage(2),
+            sweep: stage(3),
+            emit: stage(4),
+            post: stage(5),
+        }
+    }
+}
+
+/// Bytes of the stages' timestamps: two a stage.
+const TIMER_BYTES: u64 = 2 * STAGES as u64 * QUERY_SIZE as u64;
 
 /// Timestamp queries around each stage.
 #[derive(Debug)]
@@ -1403,7 +1433,8 @@ impl Lod {
         let buffer = match self.free.pop() {
             Some(buffer) => buffer,
             None if self.made < READBACKS => {
-                let size = FRAME_BYTES + self.cut.size();
+                let timer = if self.timer.is_some() { TIMER_BYTES } else { 0 };
+                let size = FRAME_BYTES + self.cut.size() + timer;
                 let buffer = gpu.scoped("lod readback", || {
                     gpu.device().create_buffer(&BufferDescriptor {
                         label: Some("lod readback"),
@@ -1419,12 +1450,21 @@ impl Lod {
         };
         encoder.copy_buffer_to_buffer(&self.frame, 0, &buffer, 0, FRAME_BYTES);
         encoder.copy_buffer_to_buffer(&self.cut, 0, &buffer, FRAME_BYTES, self.cut.size());
+        let mut period = None;
         if let Some(timer) = &self.timer {
             encoder.resolve_query_set(&timer.queries, 0..2 * STAGES, &timer.resolved, 0);
+            // At the buffer's end, if it was made with room for them (made before timing was
+            // turned on, it wasn't).
+            if buffer.size() >= FRAME_BYTES + self.cut.size() + TIMER_BYTES {
+                let at = buffer.size() - TIMER_BYTES;
+                encoder.copy_buffer_to_buffer(&timer.resolved, 0, &buffer, at, TIMER_BYTES);
+                period = Some(timer.period);
+            }
         }
         Ok(Some(CutReadback {
             buffer: Some(buffer),
             frame,
+            period,
             done: self.done.clone(),
             unused: self.returns.clone(),
         }))
@@ -1515,27 +1555,7 @@ impl Lod {
             return Ok(None);
         };
         let ticks: Vec<u64> = gpu.read_buffer_with(&timer.resolved, &timer.staging)?;
-        let stage = |index: usize| {
-            let begin = ticks.get(2 * index).copied().unwrap_or(0);
-            let end = ticks.get(2 * index + 1).copied().unwrap_or(0);
-            let elapsed = end.saturating_sub(begin);
-            #[expect(
-                clippy::cast_precision_loss,
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "a stage's ticks are far below 2^52, and the product is nanoseconds"
-            )]
-            let nanos = (elapsed as f64 * f64::from(timer.period)) as u64;
-            Duration::from_nanos(nanos)
-        };
-        Ok(Some(LodTimings {
-            bounds: stage(0),
-            choose: stage(1),
-            relax: stage(2),
-            sweep: stage(3),
-            emit: stage(4),
-            post: stage(5),
-        }))
+        Ok(Some(LodTimings::from_ticks(&ticks, timer.period)))
     }
 
     /// Group 0 for this frame: the tree and request buffers are the caller's.
@@ -1770,24 +1790,43 @@ impl Timer {
     }
 }
 
-/// The results in a mapped readback buffer, of frame `tag`.
+/// The results in a mapped readback buffer, of frame `tag`, with the stages' timestamps at its
+/// end if `period` (nanoseconds a tick) is given.
 ///
 /// # Errors
 ///
 /// [`LodError::Gpu`] if it can't be viewed.
-fn read_output(buffer: &Buffer, finest: Level, tag: u64) -> Result<LodOutput, LodError> {
+fn read_output(
+    buffer: &Buffer,
+    finest: Level,
+    tag: u64,
+    period: Option<f32>,
+) -> Result<LodOutput, LodError> {
     let view = buffer.get_mapped_range(..).map_err(GpuError::from)?;
     let frame_end = usize::try_from(FRAME_BYTES).unwrap_or(usize::MAX);
     let frame: GpuFrame = view
         .get(..frame_end)
         .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
         .unwrap_or_else(GpuFrame::zeroed);
+    let timer_start = match period {
+        Some(_) => view
+            .len()
+            .saturating_sub(usize::try_from(TIMER_BYTES).unwrap_or(usize::MAX)),
+        None => view.len(),
+    };
+    let timings = period.map(|period| {
+        let ticks: Vec<u64> = view
+            .get(timer_start..)
+            .map(bytemuck::pod_collect_to_vec)
+            .unwrap_or_default();
+        LodTimings::from_ticks(&ticks, period)
+    });
     // Only the entries written: the buffer holds the whole capacity's.
     let written_bytes = u64::from(frame.cut_count).saturating_mul(CUT_BYTES);
     let cut_end = usize::try_from(written_bytes)
         .unwrap_or(usize::MAX)
         .saturating_add(frame_end)
-        .min(view.len());
+        .min(timer_start);
     let entries: Vec<GpuCutEntry> = view
         .get(frame_end..cut_end)
         .map(bytemuck::pod_collect_to_vec)
@@ -1796,6 +1835,7 @@ fn read_output(buffer: &Buffer, finest: Level, tag: u64) -> Result<LodOutput, Lo
     let mut output = LodOutput {
         frame: tag,
         stats: stats(&frame),
+        timings,
         ..LodOutput::default()
     };
     for entry in written {

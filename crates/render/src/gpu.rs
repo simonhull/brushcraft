@@ -40,6 +40,9 @@ const OPTIONAL_FEATURES: Features = Features::TIMESTAMP_QUERY;
 pub enum AdapterRequest {
     /// The system's preferred high-performance adapter: the discrete GPU where there is one.
     Default,
+    /// [`AdapterRequest::Default`], unless it is a software rasterizer: for measurements, which
+    /// mean nothing on one (a machine with no GPU has no such adapter).
+    Hardware,
     /// A software rasterizer, an adapter whose device type is [`DeviceType::Cpu`]: lavapipe on
     /// Linux. The gate runs every GPU test on it, so a test never depends on the machine's GPU.
     Software,
@@ -52,6 +55,7 @@ impl fmt::Display for AdapterRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Default => f.write_str("the default adapter"),
+            Self::Hardware => f.write_str("a hardware (not software) adapter"),
             Self::Software => f.write_str("a software (CPU) adapter"),
             Self::Named(name) => write!(f, "an adapter named like {name:?}"),
         }
@@ -572,15 +576,21 @@ pub(crate) async fn choose(
 ) -> Result<Adapter, GpuError> {
     let presents =
         |adapter: &Adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface));
-    let found = match request {
-        AdapterRequest::Default => instance
+    let preferred = async || {
+        instance
             .request_adapter(&RequestAdapterOptions {
                 power_preference: PowerPreference::HighPerformance,
                 compatible_surface: surface,
                 ..RequestAdapterOptions::default()
             })
             .await
-            .ok(),
+            .ok()
+    };
+    let found = match request {
+        AdapterRequest::Default => preferred().await,
+        AdapterRequest::Hardware => preferred()
+            .await
+            .filter(|adapter| adapter.get_info().device_type != DeviceType::Cpu),
         AdapterRequest::Software => instance
             .enumerate_adapters(Backends::all())
             .await

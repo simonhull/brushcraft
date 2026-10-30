@@ -155,6 +155,7 @@ impl Session {
             overlay_scale: 1,
             scene: Scene::Draw(&scene),
             look: LOOK,
+            frame: self.frames,
         };
         let drawn = self
             .renderer
@@ -211,6 +212,7 @@ impl Session {
             overlay_scale: 1,
             scene: Scene::Reshade,
             look,
+            frame: self.frames,
         };
         let drawn = self
             .renderer

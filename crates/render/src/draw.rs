@@ -40,6 +40,7 @@ use crate::overlay::{OverlayPass, TextImage};
 use crate::raster::{FrameError, FramePasses, SceneInputs};
 use crate::shade::ShadeSettings;
 use crate::surface::{Acquired, Size, SurfaceError, Target};
+use crate::timing::{GpuPhase, GpuTimer, GpuTimes, Mark, Marks, TimedFrame};
 use crate::tone::{ToneMap, ToneSource};
 use crate::upload::FrameUploads;
 use crate::visibility_view::VisibilityView;
@@ -65,6 +66,9 @@ pub struct FrameInputs<'a> {
     pub scene: Scene<'a>,
     /// How the scene is shown.
     pub look: Look,
+    /// The frame's number, which its GPU times are reported under ([`GpuTimes::frame`]) when
+    /// timing is on ([`Renderer::enable_timing`]).
+    pub frame: u64,
 }
 
 /// What a frame does with the scene.
@@ -219,6 +223,9 @@ pub struct Renderer {
     passes: Option<FramePasses>,
     /// Whether the accumulation's histories carry on, and the last jitter.
     aa: AaState,
+    /// Times each frame's phases on the GPU, once [`Renderer::enable_timing`] found timestamp
+    /// queries.
+    timer: Option<GpuTimer>,
 }
 
 impl Renderer {
@@ -233,7 +240,32 @@ impl Renderer {
             image: ImagePasses::new(gpu, format)?,
             passes: None,
             aa: AaState::default(),
+            timer: None,
         })
+    }
+
+    /// Turns on timing every frame's phases on the GPU with timestamp queries
+    /// ([`crate::timing`]), if the device has them; whether it does. Frames drawn from then on
+    /// are read back without waiting: [`Renderer::take_timings`] has them a frame or two later.
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::scoped`], if the queries or their buffer can't be made.
+    pub fn enable_timing(&mut self, gpu: &Gpu) -> Result<bool, GpuError> {
+        if self.timer.is_none() {
+            self.timer = GpuTimer::new(gpu)?;
+        }
+        Ok(self.timer.is_some())
+    }
+
+    /// The GPU times of every timed frame read back since the last call, each tagged with its
+    /// frame ([`FrameInputs::frame`]): those whose readback a device poll has completed (the
+    /// app's owner thread polls at the start of each frame). Empty without timing.
+    pub fn take_timings(&mut self) -> Vec<GpuTimes> {
+        self.timer
+            .as_mut()
+            .map(GpuTimer::collect)
+            .unwrap_or_default()
     }
 
     /// Draws each frame's scene with `passes` from now on. They are built where residency is,
@@ -295,30 +327,25 @@ impl Renderer {
         let encoding = Instant::now();
         let format = self.image.format;
         let Self {
-            image: image_passes,
+            image:
+                ImagePasses {
+                    view,
+                    tone,
+                    overlay,
+                    ..
+                },
             passes: scene_passes,
             aa,
+            timer,
         } = self;
-        let ImagePasses {
-            view,
-            tone,
-            overlay,
-            ..
-        } = image_passes;
+        let (mut marks, mut tick_readback) = (Marks::of(timer.as_ref(), inputs.frame), None);
         overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         if let Some(passes) = scene_passes.as_mut() {
             passes.set_shading(gpu, inputs.look, inputs.overlay_scale);
         }
         let to_draw = scene_passes.as_mut().map(|passes| (inputs.scene, passes));
         let drawing = matches!(to_draw, Some((Scene::Draw(_), _)));
-        // A frame drawing no scene runs no level choice: its request readback reads nothing.
-        let uploads = uploads.map(|uploads| {
-            if drawing {
-                uploads
-            } else {
-                uploads.without_level_choice()
-            }
-        });
+        let uploads = uploads.map(|uploads| for_frame(uploads, drawing));
         let showing = Showing {
             look: inputs.look,
             size: inputs.size,
@@ -327,15 +354,18 @@ impl Renderer {
             scale: inputs.overlay_scale,
         };
         let outcome = gpu.scoped("encoding a frame", || {
-            let commands = gpu
+            let mut commands = gpu
                 .device()
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("frame"),
                 });
+            marks.mark(&mut commands, Mark::Start);
             let mut encoded = None;
             let passes = |frame: &mut CommandEncoder| {
+                marks.end(frame, GpuPhase::Uploads);
                 encoded = to_draw.and_then(|(scene, passes)| {
-                    encode_scene(gpu, frame, scene, passes, (view, tone, &mut *aa), showing)
+                    let images = (&mut *view, &mut *tone, &mut *aa);
+                    encode_scene(gpu, frame, scene, passes, images, showing, &mut marks)
                 });
                 let mut pass = frame.begin_render_pass(&RenderPassDescriptor {
                     label: Some("scene and overlay"),
@@ -358,8 +388,14 @@ impl Renderer {
                 }
                 // The last pass: the overlay over everything.
                 overlay.draw(&mut pass);
+                drop(pass);
+                marks.end(frame, GpuPhase::Tone);
+                tick_readback = finish_marks(timer.as_mut(), gpu, frame, &mut marks);
             };
             submit(gpu, uploads, commands, passes);
+            if let Some(readback) = tick_readback.take() {
+                readback.submitted();
+            }
             encoded
         })?;
         let (scene, visible, report) = settle(outcome, drawing, &mut self.aa)?;
@@ -377,6 +413,30 @@ impl Renderer {
             aa: report,
         })
     }
+}
+
+/// A frame's `uploads`, as a frame `drawing` its scene or not submits them: a frame drawing no
+/// scene runs no level choice, so its request readback reads nothing.
+fn for_frame(uploads: FrameUploads, drawing: bool) -> FrameUploads {
+    if drawing {
+        uploads
+    } else {
+        uploads.without_level_choice()
+    }
+}
+
+/// Encodes reading a frame's `marks` back into `frame` with `timer`, after its last pass.
+///
+/// Leaves `marks` off; `None` if not timed (no timer). A frame whose readback can't be made is
+/// not timed; it draws the same.
+fn finish_marks(
+    timer: Option<&mut GpuTimer>,
+    gpu: &Gpu,
+    frame: &mut CommandEncoder,
+    marks: &mut Marks,
+) -> Option<TimedFrame> {
+    let marked = std::mem::replace(marks, Marks::off());
+    timer?.finish(gpu, frame, marked).ok().flatten()
 }
 
 /// How a frame shows its scene: its look, and its size (a scene shaded again must be of it).
@@ -408,7 +468,8 @@ impl Showing {
 /// Encodes `scene` with `passes` into `frame`, after the uploads; `None` for no scene.
 ///
 /// The scene is drawn or shaded again, with its accumulation as `aa` decides, and the image the
-/// frame shows ([`Showing::look`]) is bound for the tone map or the debug view.
+/// frame shows ([`Showing::look`]) is bound for the tone map or the debug view. `marks` times the
+/// phases on the GPU: each phase encoded is marked at its end.
 ///
 /// A scene drawn is always shaded, the debug view or not, so the shading pass's view and bind
 /// groups are the last scene's when a later frame shades it again.
@@ -425,6 +486,7 @@ fn encode_scene(
     passes: &mut FramePasses,
     (view, tone, aa): (&mut VisibilityView, &mut ToneMap, &mut AaState),
     showing: Showing,
+    marks: &mut Marks,
 ) -> Option<Result<EncodedScene, FrameError>> {
     let shaded = showing.look.view == SceneView::Shaded;
     let encoded = match scene {
@@ -437,11 +499,13 @@ fn encode_scene(
                 AaFrame::Accumulate { jitter, .. } => jitter,
                 AaFrame::Plain | AaFrame::Filter | AaFrame::Show => Jitter::CENTRE,
             };
-            let readback = passes.encode_jittered(gpu, frame, scene, jitter)?;
+            let readback = passes.encode_marked(gpu, frame, scene, jitter, marks)?;
             passes.encode_shading(gpu, frame, scene)?;
+            marks.end(frame, GpuPhase::Shade);
             let tree = Some(scene.tree);
             let (step, mut report) =
                 accumulate(gpu, frame, passes, aa, step, (tree, Some(scene.bounds)));
+            marks.end(frame, GpuPhase::Accumulate);
             report.filtered_instead |= shaded && still && !accumulable;
             let encoded = EncodedScene {
                 readback,
@@ -469,11 +533,13 @@ fn encode_scene(
                 AaFrame::Show => (passes.aa().mean().is_some(), step, AaReport::default()),
                 AaFrame::Accumulate { .. } | AaFrame::Filter => {
                     let again = passes.encode_shading_again(gpu, frame)?;
+                    marks.end(frame, GpuPhase::Shade);
                     let (step, report) = if again {
                         accumulate(gpu, frame, passes, aa, step, (None, None))
                     } else {
                         (step, AaReport::default())
                     };
+                    marks.end(frame, GpuPhase::Accumulate);
                     (again, step, report)
                 }
                 AaFrame::Plain => (true, step, AaReport::default()),

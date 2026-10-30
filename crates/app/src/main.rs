@@ -15,7 +15,10 @@
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
-//! closes a project on lavapipe with no display. Usage: [`cli::USAGE`].
+//! closes a project on lavapipe with no display. With `--script` the camera follows the
+//! benchmark path ([`script`]) and every frame is recorded, written with `--record` as JSON lines
+//! ([`record`]): the renderer's measured run, which `brushcraft-bench perf` makes its render
+//! metrics from. Usage: [`cli::USAGE`].
 
 mod camera;
 mod cli;
@@ -24,7 +27,9 @@ mod navigate;
 mod overlay;
 mod paths;
 mod pick;
+mod record;
 mod render_thread;
+mod script;
 #[cfg(test)]
 mod test_dir;
 mod uploads;
@@ -32,16 +37,17 @@ mod window;
 
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use render::gpu::Gpu;
+use render::gpu::{Gpu, GpuError};
 use render::surface::{Offscreen, Presentation, Target};
 use store::{Project, ProjectConfig, StoreConfig, default_recovery_dir};
 use winit::event_loop::EventLoop;
 
-use crate::cli::{Mode, Options};
+use crate::cli::Options;
 use crate::frame::schedule::Next;
 use crate::frame::{NoBrush, Owner, Setup, Uploads as _};
 use crate::pick::Picker;
@@ -63,8 +69,15 @@ pub(crate) type AppOwner = Owner<NoBrush, GpuResidency>;
 /// If GPU residency or the scene's passes (the level choice, the raster) can't be set up on
 /// this GPU, or the spatial index can't be loaded: at startup, never mid-session. The project
 /// is closed first.
-pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, setup: Setup) -> Result<AppOwner> {
+pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, mut setup: Setup) -> Result<AppOwner> {
     let ready = GpuResidency::new(gpu, project.store())
+        .and_then(|mut residency| {
+            // A recorded run with the GPU timed times the level choice's stages too.
+            if let Some(record) = setup.record.as_mut().filter(|record| record.gpu_timing) {
+                record.lod_timing = residency.enable_timing()?;
+            }
+            Ok(residency)
+        })
         .and_then(|residency| Ok((residency, Picker::load(&mut project)?)));
     match ready {
         Ok((residency, picker)) => {
@@ -101,6 +114,8 @@ pub(crate) struct Summary {
     pub(crate) scene: String,
     /// A scripted run's phase times ([`frame::PhaseLog::lines`]); empty for an open-ended run.
     pub(crate) phases: Vec<String>,
+    /// A recorded run's record lines ([`record`]); empty for any other run.
+    pub(crate) records: Vec<String>,
 }
 
 impl Summary {
@@ -118,6 +133,7 @@ impl Summary {
                 .phase_log()
                 .map(frame::PhaseLog::lines)
                 .unwrap_or_default(),
+            records: owner.record_lines(),
         }
     }
 }
@@ -196,11 +212,13 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
 ///
 /// If the GPU or the target can't be opened, the project doesn't open, a frame fails, or the
 /// project doesn't close.
-fn run_offscreen(options: &Options, project: ProjectToOpen, frames: u64) -> Result<Summary> {
+fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
     let gpu = Arc::new(Gpu::open(&options.adapter).context("opening the GPU")?);
     let adapter = describe_adapter(gpu.adapter_info());
     let target = Target::Offscreen(Offscreen::new(&gpu, options.size)?);
-    let mut render = RenderThread::spawn(Arc::clone(&gpu), target, Hooks::none())?;
+    let timing = options.times_gpu();
+    let mut render = RenderThread::spawn(Arc::clone(&gpu), target, Hooks::none(), timing)?;
+    let opening = Instant::now();
     let project = project.open()?;
     let presentation = render.presentation();
     let setup = Setup {
@@ -208,7 +226,9 @@ fn run_offscreen(options: &Options, project: ProjectToOpen, frames: u64) -> Resu
         interval: window::DEFAULT_INTERVAL,
         presentation,
         adapter: adapter.clone(),
-        frames: Some(frames),
+        frames: options.frames(),
+        script: options.script(),
+        record: options.record_setup(render.timing(), opening),
     };
     let mut owner = start(project, gpu, setup)?;
     let ran = drive_offscreen(&mut owner, &mut render);
@@ -241,18 +261,51 @@ fn drive_offscreen(owner: &mut AppOwner, render: &mut RenderThread) -> Result<()
     Ok(())
 }
 
-/// Parses the command line, checks the project, runs, and prints a line saying how it went.
+/// The exit status when no GPU matches `--adapter`: `EX_UNAVAILABLE`, so a caller (the
+/// performance suite) can tell a machine with no GPU from a run that failed.
+const NO_ADAPTER: u8 = 69;
+
+/// Runs the app ([`run`]); on an error, prints it and exits with a failure, [`NO_ADAPTER`] if
+/// no GPU matched.
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // Nothing more to do if stderr is gone.
+            drop(writeln!(std::io::stderr(), "Error: {error:?}"));
+            let no_adapter = error
+                .chain()
+                .any(|cause| matches!(cause.downcast_ref(), Some(GpuError::NoAdapter { .. })));
+            if no_adapter {
+                ExitCode::from(NO_ADAPTER)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+/// Parses the command line, checks the project, runs, writes a recorded run's record, and
+/// prints a line saying how it went.
 ///
 /// # Errors
 ///
-/// If the arguments don't parse, the project doesn't open, or the run fails.
-fn main() -> Result<()> {
+/// If the arguments don't parse, the project doesn't open, the run fails, or the record can't
+/// be written.
+fn run() -> Result<()> {
     let options = Options::parse(std::env::args_os().skip(1))?;
     let project = ProjectToOpen::new(&options)?;
-    let summary = match options.mode {
-        Mode::Offscreen { frames } => run_offscreen(&options, project, frames)?,
-        Mode::Window { .. } => run_window(options.clone(), project)?,
+    let summary = if options.mode.offscreen {
+        run_offscreen(&options, project)?
+    } else {
+        run_window(options.clone(), project)?
     };
+    if let Some(path) = &options.record {
+        let mut text = summary.records.join("\n");
+        text.push('\n');
+        std::fs::write(path, text)
+            .with_context(|| format!("writing the record to {}", path.display()))?;
+    }
     let mut out = std::io::stdout().lock();
     writeln!(
         out,

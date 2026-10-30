@@ -116,18 +116,18 @@ impl WindowApp {
             move || proxy.wake_up(),
             move || presenting.pre_present_notify(),
         );
-        let render = RenderThread::spawn(Arc::clone(&gpu), Target::Window(surface), hooks)?;
+        let timing = self.options.times_gpu();
+        let render = RenderThread::spawn(Arc::clone(&gpu), Target::Window(surface), hooks, timing)?;
+        let opening = Instant::now();
         let project = project.open()?;
-        let frames = match self.options.mode {
-            crate::cli::Mode::Window { frames } => frames,
-            crate::cli::Mode::Offscreen { .. } => None,
-        };
         let setup = Setup {
             size: frame_size(window.surface_size()),
             interval: refresh_interval(window.as_ref()),
             presentation: render.presentation(),
             adapter: adapter.clone(),
-            frames,
+            frames: self.options.frames(),
+            script: self.options.script(),
+            record: self.options.record_setup(render.timing(), opening),
         };
         let mut owner = start(project, gpu, setup)?;
         owner.set_scale(window.scale_factor());

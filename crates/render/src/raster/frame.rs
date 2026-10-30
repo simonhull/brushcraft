@@ -32,6 +32,7 @@ use crate::lod::{CutReadback, Lod, LodConfig, LodError, MainInputs};
 use crate::material::MatCapStyle;
 use crate::residency::SlotLayout;
 use crate::shade::{Shade, ShadeError, ShadePath, ShadeScene};
+use crate::timing::{GpuPhase, Marks};
 
 /// Why a frame's passes couldn't be set up or encoded.
 #[derive(Debug, Error)]
@@ -285,6 +286,23 @@ impl FramePasses {
         inputs: &SceneInputs<'_>,
         jitter: Jitter,
     ) -> Result<Option<CutReadback>, FrameError> {
+        self.encode_marked(gpu, encoder, inputs, jitter, &mut Marks::off())
+    }
+
+    /// [`FramePasses::encode_jittered`], timed on the GPU by `marks` ([`crate::timing`]): each
+    /// phase marked at its end, the bounds, the level choice, the raster and the readback.
+    ///
+    /// # Errors
+    ///
+    /// As [`FramePasses::encode`].
+    pub(crate) fn encode_marked(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        inputs: &SceneInputs<'_>,
+        jitter: Jitter,
+        marks: &mut Marks,
+    ) -> Result<Option<CutReadback>, FrameError> {
         let size = inputs.view.size();
         let wanted = (size.width(), size.height());
         let current = match self.current.take() {
@@ -300,6 +318,7 @@ impl FramePasses {
         }
         self.lod
             .encode_bounds(gpu, encoder, inputs.tree, inputs.bounds, inputs.slots)?;
+        marks.end(encoder, GpuPhase::Bounds);
         let previous = self
             .previous
             .as_ref()
@@ -312,6 +331,7 @@ impl FramePasses {
             finest: inputs.finest,
         };
         self.lod.encode_main(gpu, encoder, &main)?;
+        marks.end(encoder, GpuPhase::LevelChoice);
         let jittered = inputs.view.jittered(jitter);
         let frame = RasterFrame {
             view: &jittered,
@@ -327,7 +347,10 @@ impl FramePasses {
         let older = self.previous.replace((*inputs.view, current));
         self.current = older.map(|(_, pyramid)| pyramid);
         drawn?;
-        Ok(self.lod.encode_readback(gpu, encoder, inputs.frame)?)
+        marks.end(encoder, GpuPhase::Raster);
+        let readback = self.lod.encode_readback(gpu, encoder, inputs.frame)?;
+        marks.end(encoder, GpuPhase::Readback);
+        Ok(readback)
     }
 
     /// The two draws around the second phase, building `current` after each.

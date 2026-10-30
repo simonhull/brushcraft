@@ -39,6 +39,10 @@
 //! **The morph's clock** is the frame loop's own: each frame is stamped with its start's time
 //! since the loop began, on this thread, and the stamp travels with the frame, so the render
 //! thread never reads a clock and a frame is the same given its inputs.
+//!
+//! **A scripted run** (`--script`, [`crate::script`]) puts the camera where its path has it at
+//! each frame's stamp, before the input phase (pointer input is dropped), wants every frame until
+//! the path is over, and records every frame ([`crate::record`]).
 
 pub(crate) mod schedule;
 
@@ -47,6 +51,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use render::lod::LodStats;
 use render::raster::FramePasses;
+use render::residency::ResidencyStats;
 use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
 use render::{DrawTimes, Look, SceneView, aa};
@@ -57,7 +62,9 @@ use crate::camera::{Arcball, Camera, Pixel};
 use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
 use crate::pick::Picker;
+use crate::record::{Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
+use crate::script::{Script, Segment};
 
 /// The brush's place in the frame: M1a4's brush step, run on the owner thread after input and
 /// before the feed is drained, so the epochs its edits close reach the GPU in the same frame.
@@ -132,6 +139,22 @@ pub(crate) struct UploadStatus {
     pub(crate) scene: Option<ResidentScene>,
     /// The scene's passes, from the first frame only, for the render thread to keep.
     pub(crate) passes: Option<FramePasses>,
+    /// The number residency staged the frame as, which its cut readback comes back under;
+    /// `None` if there is no GPU residency.
+    pub(crate) staged_frame: Option<u64>,
+    /// Residency's counts as the frame was staged; `None` if there is no GPU residency.
+    pub(crate) stats: Option<ResidencyStats>,
+    /// A cut readback heard this frame (of an earlier one), for a scripted run's record.
+    pub(crate) heard: Option<CutHeard>,
+}
+
+/// A frame's cut, read back: what a scripted run's record keeps of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CutHeard {
+    /// The number residency staged its frame as ([`UploadStatus::staged_frame`]).
+    pub(crate) frame: u64,
+    /// What it drew.
+    pub(crate) scene: SceneRecord,
 }
 
 /// The uploads' place in the frame: GPU residency ([`crate::uploads::GpuResidency`]).
@@ -258,6 +281,25 @@ pub(crate) struct Setup {
     /// been made, and the run is then [`Owner::done`]. `None` renders on demand for as long as
     /// the window is open.
     pub(crate) frames: Option<u64>,
+    /// A camera path (`--script`): the camera follows it by the frame loop's clock, every frame
+    /// is wanted until it is over, and the run is then [`Owner::done`]. Its frames are recorded.
+    pub(crate) script: Option<Script>,
+    /// What a scripted run's record says of its setting; `None` for no record.
+    pub(crate) record: Option<RecordSetup>,
+}
+
+/// What a scripted run's record says of its setting, beside what the [`Setup`] says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordSetup {
+    /// The project file, as given.
+    pub(crate) project: String,
+    /// Whether the render thread times the GPU's phases.
+    pub(crate) gpu_timing: bool,
+    /// Whether the level choice times its stages.
+    pub(crate) lod_timing: bool,
+    /// When the project began to open: the record's `open_ms` runs from it to the frame loop's
+    /// clock.
+    pub(crate) opening: Instant,
 }
 
 /// The owner thread's frame loop state: the project, the view, and what the overlay reports.
@@ -316,6 +358,14 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// Whether the image can accumulate: false once the renderer said a still frame was
     /// filtered instead (its histories don't fit the device), until it restarts them.
     accumulates: bool,
+    /// The camera path the camera follows, in a scripted run.
+    script: Option<Script>,
+    /// Whether the script is over: a frame has been started at or past its end.
+    script_over: bool,
+    /// Every frame's record, in a scripted run.
+    recorder: Option<Recorder>,
+    /// The record's setting, if the run is recorded.
+    run_info: Option<RunInfo>,
 }
 
 /// Every frame's phase times in a scripted run, for the summary printed at its end.
@@ -408,9 +458,20 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let cursor = project.store().subscribe_stale();
         let mut scheduler = Scheduler::new(setup.interval, now).with_morph(uploads.morph());
         scheduler.want(Reason::Exposed);
-        if setup.frames.is_some() {
+        let scripted = setup.frames.is_some() || setup.script.is_some();
+        if scripted {
             scheduler.want(Reason::Scripted);
         }
+        let run_info = setup.record.map(|record| RunInfo {
+            project: record.project,
+            adapter: setup.adapter.clone(),
+            size: setup
+                .size
+                .map_or((0, 0), |size| (size.width(), size.height())),
+            gpu_timing: record.gpu_timing,
+            lod_timing: record.lod_timing,
+            open: now.saturating_duration_since(record.opening),
+        });
         Self {
             project,
             cursor,
@@ -430,13 +491,25 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             feed: FeedStats::default(),
             render: None,
             after_hand_off: AfterHandOff::default(),
-            log: setup.frames.map(|_| PhaseLog::default()),
+            log: scripted.then(PhaseLog::default),
             last_view: None,
             clock: now,
             look: Look::default(),
             scene_shown: false,
             picker: None,
             accumulates: true,
+            recorder: setup.script.as_ref().map(|_| Recorder::default()),
+            script: setup.script,
+            script_over: false,
+            run_info,
+        }
+    }
+
+    /// A recorded scripted run's record lines ([`crate::record`]); empty for any other run.
+    pub(crate) fn record_lines(&self) -> Vec<String> {
+        match (&self.recorder, &self.run_info, &self.script) {
+            (Some(recorder), Some(info), Some(script)) => recorder.lines(info, script),
+            _ => Vec::new(),
         }
     }
 
@@ -525,12 +598,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// What to do at `now`: as the scheduler says, but no frame while there is no frame size
-    /// (a minimised window) or once a scripted run has made its frames; upkeep stays due on
-    /// its own clock meanwhile.
+    /// (a minimised window) or once a scripted run has made its frames (or its script is over);
+    /// upkeep stays due on its own clock meanwhile.
     pub(crate) fn next(&self, now: Instant) -> Next {
         let next = self.scheduler.next(now);
-        let no_frames =
-            self.size.is_none() || self.limit.is_some_and(|limit| self.started >= limit);
+        let no_frames = self.size.is_none()
+            || self.limit.is_some_and(|limit| self.started >= limit)
+            || self.script_over;
         match next {
             Next::Frame { .. } | Next::Wait { .. } if no_frames => Next::Idle {
                 upkeep: self.scheduler.upkeep_due(),
@@ -539,9 +613,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
     }
 
-    /// Whether a scripted run has made all its frames and the render thread has finished them.
+    /// Whether a scripted run has made all its frames (or run its script through) and the
+    /// render thread has finished them.
     pub(crate) fn done(&self) -> bool {
         self.limit.is_some_and(|limit| self.finished >= limit)
+            || (self.script_over && self.finished >= self.started)
     }
 
     /// Frames the render thread has finished.
@@ -574,7 +650,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             ..OwnerPhases::default()
         };
         let mut lap = Lap::new();
+        let time = now.saturating_duration_since(self.clock);
 
+        let segment = self.follow_script(time);
         self.take_input(size)?;
         phases.input = lap.next();
 
@@ -589,7 +667,6 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
         let this_view = (self.camera, size);
         let moved = self.last_view.replace(this_view) != Some(this_view);
-        let time = now.saturating_duration_since(self.clock);
         let update = FrameUpdate {
             drained,
             deadline: uploads_deadline(now, deadline),
@@ -601,6 +678,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .apply(update, self.project.store())
             .context("uploading tiles")?;
         phases.uploads = lap.next();
+        self.record_staged((time, segment, moved), &mut uploads);
         let shading_only = Reasons::default().with(Reason::Look).with(Reason::Pick);
         let reshade = self.scene_shown
             && !reasons.is_empty()
@@ -660,16 +738,54 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .run_jobs(deadline)
             .context("running the store's jobs")?;
         self.after_hand_off.jobs = lap.next();
-        if let Some(log) = &mut self.log {
-            log.owner.push(OwnerPhases {
-                upkeep: self.after_hand_off.upkeep,
-                jobs: self.after_hand_off.jobs,
-                ..phases
-            });
-        }
+        self.log_phases(OwnerPhases {
+            upkeep: self.after_hand_off.upkeep,
+            jobs: self.after_hand_off.jobs,
+            ..phases
+        });
 
         self.want_next(&uploads);
         Ok(())
+    }
+
+    /// In a recorded run, files the frame just started (at `time`, in `segment`, its view
+    /// `moved` or not) and what its uploads said: residency's counts as it was staged, and the
+    /// cut heard during it, which is an earlier frame's.
+    fn record_staged(
+        &mut self,
+        (time, segment, moved): (Duration, Option<Segment>, bool),
+        uploads: &mut UploadStatus,
+    ) {
+        let Some(recorder) = &mut self.recorder else {
+            return;
+        };
+        recorder.started(self.started, time, segment, moved);
+        recorder.staged(self.started, uploads.staged_frame, uploads.stats.as_ref());
+        if let Some(cut) = uploads.heard.take() {
+            recorder.cut(cut);
+        }
+    }
+
+    /// Logs the frame just made's owner thread `phases`, its upkeep and jobs included, in a
+    /// scripted run.
+    fn log_phases(&mut self, phases: OwnerPhases) {
+        if let Some(log) = &mut self.log {
+            log.owner.push(phases);
+        }
+        if let Some(recorder) = &mut self.recorder {
+            recorder.owner(self.started, phases);
+        }
+    }
+
+    /// In a scripted run, puts the camera where the script has it `time` into the run (the
+    /// queued pointer input is dropped: the script drives the view), and marks the script over
+    /// once `time` reaches its end; returns the segment running. `None` with no script.
+    fn follow_script(&mut self, time: Duration) -> Option<Segment> {
+        let moment = self.script.as_ref()?.at(time);
+        self.camera = moment.pose.camera();
+        self.input.clear();
+        self.script_over |= moment.over;
+        Some(moment.segment)
     }
 
     /// The input phase of a frame of `size`: the input queued since the last frame moves the
@@ -756,13 +872,23 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if let Some(changed) = uploads.cut_changed {
             self.scheduler.cut_changed(self.clock + changed);
         }
-        if self.limit.is_some_and(|limit| self.started < limit) {
+        let scripted = self.limit.is_some_and(|limit| self.started < limit)
+            || (self.script.is_some() && !self.script_over);
+        if scripted {
             self.scheduler.want(Reason::Scripted);
         }
     }
 
     /// The render thread finished a frame.
-    pub(crate) fn shown(&mut self, presented: Presented) {
+    pub(crate) fn shown(&mut self, mut presented: Presented) {
+        let gpu = std::mem::take(&mut presented.gpu);
+        if let Some(recorder) = &mut self.recorder {
+            let at = Instant::now().saturating_duration_since(self.clock);
+            recorder.shown(presented.number, presented.times, at);
+            for times in gpu {
+                recorder.gpu(times);
+            }
+        }
         self.uploads.shown(presented.scene);
         if presented.aa.filtered_instead {
             self.accumulates = false;

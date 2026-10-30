@@ -19,6 +19,7 @@ checkout.workspace = true
 geom.workspace = true
 render.workspace = true
 store.workspace = true
+thiserror.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 

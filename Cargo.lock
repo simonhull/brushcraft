@@ -63,6 +63,7 @@ dependencies = [
  "geom",
  "render",
  "store",
+ "thiserror 2.0.21",
  "wgpu",
  "winit",
 ]

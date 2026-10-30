@@ -164,7 +164,11 @@ mod tests {
                 "no such adapter, surely",
             ],
         );
-        assert!(!output.status.success());
+        assert_eq!(
+            output.status.code(),
+            Some(69),
+            "no GPU has a status of its own"
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("no adapter matches"), "{stderr}");
         let recovery = state.join("brushcraft").join("recovery");
@@ -172,6 +176,120 @@ mod tests {
             .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
             .unwrap_or_default();
         assert!(left.is_empty(), "nothing left behind: {left:?}");
+    }
+
+    /// The value of `field` in the JSON line `line`, as written: up to the next comma or brace
+    /// (arrays and strings with commas aren't asked for).
+    fn field<'a>(line: &'a str, field: &str) -> &'a str {
+        let key = format!("\"{field}\":");
+        let (_, rest) = line
+            .split_once(&key)
+            .unwrap_or_else(|| panic!("no {field} in {line}"));
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Runs the benchmark script at 8× on a small project on lavapipe, offscreen, timing the GPU
+    /// or not, and returns its record's lines.
+    fn scripted_record(name: &str, timed: bool) -> Vec<String> {
+        let scratch = Scratch::new(name);
+        let project = scratch.0.join("small.bcrf");
+        let record = scratch.0.join("record.jsonl");
+        save_project(&project, &scratch.0.join("setup"));
+        let record_arg = record.to_str().unwrap();
+        let mut args = vec![
+            "--offscreen",
+            "--script",
+            "--script-speed",
+            "8",
+            "--record",
+            record_arg,
+            "--adapter",
+            "software",
+            "--level",
+            "4",
+            "--size",
+            "160x100",
+        ];
+        if !timed {
+            args.push("--no-gpu-timing");
+        }
+        let output = brushcraft(&project, &scratch.0.join("state"), &args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "exit {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        let text = std::fs::read_to_string(&record).unwrap();
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// A scripted run's record: its setting, the five segments, then every frame in order, the
+    /// camera following the path to its end; the GPU's phases timed where asked and the device
+    /// can, `null` where not.
+    fn check_record(lines: &[String], timed: bool) {
+        let run = &lines[0];
+        assert!(
+            run.starts_with(r#"{"bench":"render","result":"run""#),
+            "{run}"
+        );
+        let timing = field(run, "gpu_timing");
+        if !timed {
+            assert_eq!(timing, "false", "not asked: {run}");
+        }
+        let segments: Vec<&str> = lines[1..6].iter().map(|l| field(l, "segment")).collect();
+        assert_eq!(
+            segments,
+            [
+                r#""open""#,
+                r#""orbit""#,
+                r#""zoom""#,
+                r#""flick""#,
+                r#""settle""#
+            ]
+        );
+        let frames = &lines[6..];
+        let count: usize = field(run, "frames").parse().unwrap();
+        assert_eq!(frames.len(), count, "a line a frame");
+        assert!(count >= 5, "frames through every segment: {count}");
+        for (number, frame) in (1..).zip(frames) {
+            assert!(frame.contains(r#""result":"frame""#), "{frame}");
+            assert_eq!(field(frame, "frame"), number.to_string(), "in order");
+        }
+        let last = frames.last().unwrap();
+        assert_eq!(field(last, "segment"), r#""settle""#, "run to its end");
+        let timed_frames = frames
+            .iter()
+            .filter(|f| field(f, "gpu_ms") != "null")
+            .count();
+        if timing == "true" {
+            assert!(timed_frames > 0, "GPU times came back");
+            let stages = frames
+                .iter()
+                .filter(|f| field(f, "lod_choose_ms") != "null");
+            assert!(stages.count() > 0, "the level choice's stages too");
+        } else {
+            assert_eq!(timed_frames, 0, "no GPU times without timing");
+        }
+        let drawn = frames
+            .iter()
+            .filter(|f| field(f, "drawn") == "true")
+            .count();
+        assert!(drawn > 0, "cuts came back");
+        assert!(
+            frames.iter().any(|f| field(f, "moving") == "true"),
+            "the camera moved"
+        );
+    }
+
+    #[test]
+    fn a_scripted_run_follows_the_path_and_records_every_frame() {
+        let timed = scripted_record("script-timed", true);
+        check_record(&timed, true);
+        let untimed = scripted_record("script-untimed", false);
+        check_record(&untimed, false);
     }
 
     #[test]
