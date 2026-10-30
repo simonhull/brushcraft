@@ -67,8 +67,13 @@ pub(super) enum Floor {
 
 /// The fewest tiles [`TileStore::display_for_draw`] decodes on the workers, together.
 ///
-/// Fewer are decoded on the owner thread, as a hand-off to the workers would cost more than it
-/// saves (and waits for any job slice they are running).
+/// Fewer are decoded on the owner thread. Set for the floor's batch on open (14,400 tiles), not
+/// tuned: the `display_draw` bench (level-5 tiles, an idle pool, 16 workers on the dev box)
+/// decodes about 13.4 µs a tile on one thread, and on the workers 64 tiles in about 130 µs and
+/// 16 in about 40 µs, so on an idle pool the hand-off pays from about 3 tiles. It is kept high
+/// because the hand-off queues behind whatever the workers have queued (reads ahead, job
+/// slices), which the owner thread then waits out; a lower value, for staging's batches of 16,
+/// needs measuring under that load first.
 const PARALLEL_DECODE: usize = 64;
 
 /// A display record to decode for drawing, with the bound and cone to decode it with.

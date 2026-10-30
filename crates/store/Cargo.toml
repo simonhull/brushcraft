@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "index"
 harness = false
+
+[[bench]]
+name = "display_draw"
+harness = false
