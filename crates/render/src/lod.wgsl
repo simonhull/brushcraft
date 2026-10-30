@@ -824,14 +824,13 @@ fn drawn_edges(n: u32) -> u32 {
     return coarser_edges(n) | (finer_edges(n) << 4u);
 }
 
-// Appends node `n`'s clusters to the phase's list (`phase` 0: main, 1: post) and marks it
-// drawn.
-fn draw(n: u32, phase: u32) {
+// Appends node `n`'s clusters to the phase's list (`phase` 0: main, 1: post), its drawn edges
+// `edges` (drawn_edges, computed once by the caller), and marks it drawn.
+fn draw(n: u32, phase: u32, edges: u32) {
     let level = level_of(tree[n].place);
     let quads = quads_of(level);
     let per = max(quads / 8u, 1u);
     let count = per * per;
-    let edges = drawn_edges(n);
     var first = 0u;
     if phase == 0u {
         first = atomicAdd(&frame.main.instance_count, count);
@@ -938,9 +937,10 @@ fn emit(@builtin(global_invocation_id) id: vec3<u32>) {
     if refined || !reached_final(n) {
         return;
     }
+    let edges = drawn_edges(n);
     let index = atomicAdd(&frame.cut_count, 1u);
     if index < params.cut_capacity {
-        cut[index] = CutEntry(face, place, n, drawn_edges(n) << CUT_EDGES_SHIFT);
+        cut[index] = CutEntry(face, place, n, edges << CUT_EDGES_SHIFT);
         work[n].cut_index = index;
     } else {
         atomicAdd(&frame.cut_overflow, 1u);
@@ -982,7 +982,7 @@ fn emit(@builtin(global_invocation_id) id: vec3<u32>) {
             atomicAdd(&frame.retry_overflow, 1u);
         }
     }
-    draw(n, 0u);
+    draw(n, 0u, edges);
 }
 
 // Clamps the first phase's counts and sets the second phase's dispatch.
@@ -1009,7 +1009,7 @@ fn post(@builtin(global_invocation_id) id: vec3<u32>) {
         atomicAdd(&frame.culled_occlusion_post, 1u);
         return;
     }
-    draw(n, 1u);
+    draw(n, 1u, drawn_edges(n));
 }
 
 // Clamps the second phase's cluster count.
