@@ -7,7 +7,7 @@ use wgpu::{BufferUsages, CommandEncoderDescriptor, TextureViewDescriptor};
 
 use super::reference::{
     CpuPyramid, bounds_of, depth_texture, distance, dot, extra_triangles, face_normal,
-    morph_normal, morph_triangles, quad_triangles, read_mip,
+    quad_triangles, read_mip,
 };
 use super::*;
 use crate::gpu::GpuTest;
@@ -197,21 +197,6 @@ fn assert_holds(gpu_bounds: &GpuBounds, vertices: &[GpuVertex], side: usize) {
             "the cone holds the extra triangle {a:?} {b:?} {c:?}"
         );
         assert!(dot(n, at(a)) > 0.0, "{a:?} {b:?} {c:?} faces outward");
-    }
-    // And each morph triangle: an own or fan triangle with one odd vertex at its start.
-    let morphs = morph_triangles(side);
-    let expected = if quads < 2 {
-        0
-    } else {
-        12 * quads * quads + 48 * half
-    };
-    assert_eq!(morphs.len(), expected, "every morph triangle");
-    for t in morphs {
-        let n = morph_normal(&points, side, t);
-        assert!(
-            dot(n, n) == 0.0 || dot(n, gpu_bounds.axis) >= gpu_bounds.cone_cos,
-            "the cone holds the morph triangle {t:?}"
-        );
     }
 }
 

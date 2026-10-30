@@ -73,13 +73,8 @@ fn settled(ts: impl Iterator<Item = f32>) -> bool {
 /// for the cone to cull some. From four random views, a frame moving, then a little closer with
 /// the camera still, then 50 ms on, so tiles refining there morph by time a third of the way (and
 /// by distance wherever their bounds put them, under `config`'s ramp). The level choice's shader
-/// gets `patches`; the raster's `raster_patches`. Each third frame's culled tiles are probed.
-fn culled_mid_morph(
-    gpu: &Gpu,
-    config: RasterConfig,
-    patches: &[(&str, &str)],
-    raster_patches: &[(&str, &str)],
-) -> Culled {
+/// gets `patches`. Each third frame's culled tiles are probed.
+fn culled_mid_morph(gpu: &Gpu, config: RasterConfig, patches: &[(&str, &str)]) -> Culled {
     let mut world = World::new(gpu);
     let display = world.tiles.keys().filter(|p| p.level() < world.finest);
     let display: Vec<Place> = display.copied().collect();
@@ -89,14 +84,8 @@ fn culled_mid_morph(
     }
     let mut rng = Rng(17);
     let (mut lod, requests) = level_choice_patched(gpu, &world, patches);
-    let mut raster = Raster::patched(
-        gpu,
-        world.tree.capacity(),
-        world.layout(),
-        config,
-        raster_patches,
-    )
-    .expect("the raster");
+    let mut raster =
+        Raster::new(gpu, world.tree.capacity(), world.layout(), config).expect("the raster");
     let mut culled = Culled::default();
     for seed in 0..4 {
         let (far, distance) = random_view(&mut rng, (1.5, 3.0));
@@ -209,13 +198,17 @@ fn a_tile_culled_by_its_cone_has_no_triangle_facing_the_eye_mid_morph() {
     GpuTest::run(|gpu| {
         let (mut tiles, mut triangles) = (0, 0);
         for config in configs() {
-            let culled = culled_mid_morph(gpu, config, &[], &[]);
+            let culled = culled_mid_morph(gpu, config, &[]);
             println!("{culled:?}");
             assert_eq!(culled.facing, 0, "a culled tile's triangle faces the eye");
             tiles += culled.tiles;
             triangles += culled.triangles;
         }
         assert!(tiles > 0 && triangles > 10_000, "culling was tested");
+        // No bite here: this sphere's tiles are so curved that their cones are wide, and no
+        // morph turns a triangle past them. `cull/tests/morph.rs` bites on bumpy tiles: there the
+        // drawn cone, culling mid-morph, loses slivers that face an eye it says they face away
+        // from; and the test below shows emit culling tiles mid-morph without its settled test.
     });
 }
 
@@ -224,14 +217,14 @@ fn the_level_choice_cone_culls_only_tiles_whose_morph_is_settled() {
     GpuTest::run(|gpu| {
         let (mut tiles, mut exempt, mut bitten) = (0, 0, 0);
         for config in configs() {
-            let culled = culled_mid_morph(gpu, config, &[], &[]);
+            let culled = culled_mid_morph(gpu, config, &[]);
             println!("{culled:?}");
             assert_eq!(culled.unsettled, 0, "a culled tile was morphing");
             tiles += culled.tiles;
             exempt += culled.exempt;
             // The bite: without the settled test, tiles mid-morph are culled (by distance; by
             // time alone, this scene's tiles still morphing are those refined, facing the eye).
-            let without = culled_mid_morph(gpu, config, &[CULL_WHILE_MORPHING], &[]);
+            let without = culled_mid_morph(gpu, config, &[CULL_WHILE_MORPHING]);
             println!("without the settled test: {without:?}");
             bitten += without.unsettled;
         }

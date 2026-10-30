@@ -8,9 +8,7 @@
 // cross(p10 - p00, p11 - p00) and cross(p11 - p00, p01 - p00).
 //
 // The cone also holds the tile's other triangulations (extra_normal): its parent
-// triangulation, where the geomorph starts, every edge variant's fan, and each of the tile's
-// own and fan triangles with some of its odd vertices where their morph starts and the rest
-// where it ends (morph_normal), so every morph's triangles too (see cull.rs).
+// triangulation, where the geomorph starts, and every edge variant's fan (see cull.rs).
 
 // The tile tree: every tile's slot.
 @group(0) @binding(0) var<storage, read> tree: array<TileNode>;
@@ -85,101 +83,10 @@ fn oriented(base: u32, side: u32, g0: vec2<i32>, g1: vec2<i32>, g2: vec2<i32>) -
 }
 
 // How many extra triangles a tile of `quads` quads a side has: two per 2 × 2 block of its
-// parent triangulation, three per odd border vertex of each edge's variant, then the morph's
-// (morph_count).
+// parent triangulation, three per odd border vertex of each edge's variant.
 fn extra_count(quads: u32) -> u32 {
     let half = quads / 2u;
-    return 2u * half * half + 12u * half + morph_count(quads);
-}
-
-// How many morph triangles a tile of `quads` quads a side has (none for a single quad, which
-// never morphs): each of its own triangles, and each variant fan triangle with moving vertices
-// ((a, m, ma) and (b, mb, m) per odd border vertex of each edge), six times: once per mix of
-// its three vertices at their start and at their end but all at one end.
-fn morph_count(quads: u32) -> u32 {
-    if quads < 2u {
-        return 0u;
-    }
-    return 12u * quads * quads + 48u * (quads / 2u);
-}
-
-// Grid vertex g where its morph starts, the midpoint of its decision-4 parents, if `start`;
-// else where it is.
-fn morph_point(base: u32, side: u32, g: vec2<i32>, start: bool) -> vec3<f32> {
-    if !start {
-        return at_grid(base, side, g);
-    }
-    let d = vec2<i32>(g.x & 1, g.y & 1);
-    return (at_grid(base, side, g - d) + at_grid(base, side, g + d)) * 0.5;
-}
-
-
-// The unit normal of triangle (g0, g1, g2), counter-clockwise in the grid, with vertex k where
-// its morph starts for each bit k of `starts` and where it is otherwise (an even vertex is
-// where it is either way).
-fn morph_oriented(base: u32, side: u32, g0: vec2<i32>, g1: vec2<i32>, g2: vec2<i32>, starts: u32) -> vec3<f32> {
-    let p = array<vec3<f32>, 3>(
-        morph_point(base, side, g0, (starts & 1u) != 0u),
-        morph_point(base, side, g1, (starts & 2u) != 0u),
-        morph_point(base, side, g2, (starts & 4u) != 0u),
-    );
-    let u = g1 - g0;
-    let v = g2 - g0;
-    if u.x * v.y - u.y * v.x < 0 {
-        return face_normal(p[0], p[2], p[1]);
-    }
-    return face_normal(p[0], p[1], p[2]);
-}
-
-// Morph triangle `x`'s unit normal (zero if degenerate). Each of these triangles has two or
-// three odd vertices, each with its own morph factor; with all at their start it lies in the
-// parent triangulation's plane, with all at their end it is the tile's own (or fan) triangle,
-// and here it is taken with some at each end (`starts`, 1 to 6). A triangle whose moving
-// vertices stand anywhere on their ways has, its normal being linear in each vertex, a normal
-// that is a sum, with weights not negative, of its eight corner normals: in the cone, which is
-// convex, so the cone holds every morph state. First each own triangle (quad by quad, its two
-// halves), then per edge, per odd border vertex, the fan triangles (a, m, ma) and (b, mb, m).
-fn morph_normal(base: u32, side: u32, x: u32) -> vec3<f32> {
-    let quads = side - 1u;
-    let own = 12u * quads * quads;
-    let starts = x % 6u + 1u;
-    if x < own {
-        let quad = x / 12u;
-        let p00 = vec2<i32>(i32(quad % quads), i32(quad / quads));
-        let p11 = p00 + vec2<i32>(1, 1);
-        if (x / 6u) % 2u == 0u {
-            return morph_oriented(base, side, p00, p00 + vec2<i32>(1, 0), p11, starts);
-        }
-        return morph_oriented(base, side, p00, p11, p00 + vec2<i32>(0, 1), starts);
-    }
-    let y = x - own;
-    let half = quads / 2u;
-    let o = i32(2u * ((y / 12u) % half) + 1u);
-    let edge = y / (12u * half);
-    let fan = fan_of(edge, o, i32(quads));
-    let a = fan[0];
-    let b = fan[1];
-    let inward = fan[2];
-    let m = (a + b) / 2 + inward;
-    if (y / 6u) % 2u == 0u {
-        return morph_oriented(base, side, a, m, a + inward, starts);
-    }
-    return morph_oriented(base, side, b, b + inward, m, starts);
-}
-
-// The odd border vertex o of edge `edge`'s even neighbours a and b, and the step inward from
-// the edge, of a tile of `q` quads a side.
-fn fan_of(edge: u32, o: i32, q: i32) -> array<vec2<i32>, 3> {
-    if edge == 1u {
-        return array<vec2<i32>, 3>(vec2<i32>(q, o - 1), vec2<i32>(q, o + 1), vec2<i32>(-1, 0));
-    }
-    if edge == 2u {
-        return array<vec2<i32>, 3>(vec2<i32>(o - 1, q), vec2<i32>(o + 1, q), vec2<i32>(0, -1));
-    }
-    if edge == 3u {
-        return array<vec2<i32>, 3>(vec2<i32>(0, o - 1), vec2<i32>(0, o + 1), vec2<i32>(1, 0));
-    }
-    return array<vec2<i32>, 3>(vec2<i32>(o - 1, 0), vec2<i32>(o + 1, 0), vec2<i32>(0, 1));
+    return 2u * half * half + 12u * half;
 }
 
 // Extra triangle `x`'s unit normal (zero if degenerate). First the parent triangulation: each
@@ -190,9 +97,6 @@ fn extra_normal(base: u32, side: u32, x: u32) -> vec3<f32> {
     let quads = side - 1u;
     let half = quads / 2u;
     let blocks = 2u * half * half;
-    if x >= blocks + 12u * half {
-        return morph_normal(base, side, x - blocks - 12u * half);
-    }
     if x < blocks {
         let block = x / 2u;
         let p00 = vec2<i32>(2 * i32(block % half), 2 * i32(block / half));

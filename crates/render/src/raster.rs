@@ -82,10 +82,15 @@
 //! coarser one, the variant has already replaced it by an even vertex.
 //!
 //! **The cone:** this grid's triangles have two or three odd vertices each, every one with its
-//! own factor, so a morphing triangle's normal isn't on the arc between its two ends. The bounds
-//! pass's cone holds every mix of its vertices at their start and their end, and so, by
-//! linearity in each vertex, every morph state (`cull.rs`, "What the cone holds", 4): the level
-//! choice culls a tile by its cone, morphing or not, without dropping a sliver facing the eye.
+//! own factor, so a morphing triangle's normal isn't on the arc between its two ends and can leave
+//! the tile's cone, which holds its drawn triangles at either end of the morph only (`cull.rs`,
+//! "What the cone holds"). The level choice reads this module's stamps and frame settings and
+//! culls a tile by its cone only when every odd vertex is certainly at one end
+//! ([`crate::lod::MorphInputs`]; `lod.rs`, "Cone culling and the morph"), so no sliver facing the
+//! eye is dropped mid-morph. Nothing else here depends on the cone: the shading pass rebuilds only
+//! what was drawn, and the anti-aliasing's reset rule (`aa.wgsl`) needs nothing new, since a
+//! settled tile its cone faces away draws only back faces, which the raster culls: culled or drawn,
+//! the image is the same.
 //!
 //! # For the shading pass
 //!

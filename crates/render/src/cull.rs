@@ -11,28 +11,27 @@
 //! ([`crate::tree::TileTree::changed_since`]), the owner thread gathers those nodes into a
 //! [`BoundsUpdate`], and the render thread encodes the pass right after the frame's uploads.
 //!
-//! **What the cone holds**, and so what the raster may draw from a tile, morphing or not,
-//! without a culled tile leaving slivers at the silhouette:
+//! **What the cone holds**, the tile's **drawn** triangles at either end of the geomorph:
 //!
-//! 1. the tile's own triangles: each quad split along `(i, j)–(i + 1, j + 1)` (decision 4);
+//! 1. the tile's own triangles: each quad split along `(i, j)–(i + 1, j + 1)` (decision 4), where
+//!    the morph ends;
 //! 2. its **parent triangulation**: each 2 × 2-quad block split along its `(0, 0)–(2, 2)` diagonal.
 //!    This is where the geomorph starts: with every odd vertex at its decision-4 midpoint, each of
-//!    the tile's triangles lies in one of these, so has its normal;
+//!    the tile's triangles (and each variant fan's) lies in one of these, oriented alike, so has
+//!    its normal;
 //! 3. every **edge variant**: on an edge whose neighbour is a level coarser, each odd border vertex
 //!    `o` (between the even border vertices `a` and `b`; `m`, `ma` and `mb` the vertices one row in
 //!    from `o`, `a` and `b`) is dropped, and the two border quads sharing it become the fan `(a, b,
 //!    m)`, `(a, m, ma)`, `(b, mb, m)`. **The variant index buffers must use exactly this
 //!    triangulation** (`bounds.wgsl`'s `extra_normal`);
-//! 4. every **morph state** (`morph_normal`): each own and fan triangle's moving vertices are its
-//!    two or three odd ones, each with its own factor (the raster's seams and distance factor vary
-//!    it per vertex). The triangle's normal is linear in each vertex's place, so with the vertices
-//!    anywhere on their ways it is a sum, with weights not negative, of the normals of its eight
-//!    corners: each vertex at its start or its end. All at the start lie in the parent
-//!    triangulation's plane (2), all at the end are the triangle itself (1, 3); the cone also holds
-//!    the six mixed ones, so it holds every morph state (a cone narrower than a half-space is
-//!    convex). That is twelve normals a quad and 48 an odd border vertex, about 3.4 times the
-//!    tile's own triangles for the bounds pass to fold in (a cost per arrival, not per frame; not
-//!    measured).
+//! 4. **not the morph on its way.** A triangle here has two or three odd vertices, each moving by
+//!    its own factor (the raster's seams and distance factor vary it per vertex), and its normal
+//!    then leaves the arc between its two ends and can leave the cone. So the level choice culls a
+//!    tile by its cone only when its morph is settled, every odd vertex at one end, and draws the
+//!    others ([`crate::lod`], "Cone culling and the morph"). A cone holding every morph state
+//!    (folding in the six mixed corners of each triangle, each vertex at its start or its end) made
+//!    the bounds pass 3.7 times as costly a tile, 0.67 to 2.50 µs on the 4090, paid by every
+//!    arriving tile (plan, the "Task 4 review" bullet).
 //!
 //! # Tests
 //!
