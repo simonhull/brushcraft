@@ -7,16 +7,16 @@
 //! ([`crate::lod::GpuCluster`]: a tile's node, the cluster's place in the tile, its edge variant
 //! and its finer edges) with indexed indirect draw arguments. The raster draws a list in **one
 //! instanced indexed indirect draw** ([`Raster::encode_draw`]), one instance a cluster, over one
-//! static index buffer of the cluster's 128 triangles ([`crate::indices`]). The vertex shader
+//! static index buffer of the cluster's 128 triangles (`indices.rs`). The vertex shader
 //! (`raster.wgsl`) remaps the index it is given by the cluster's edge variant (the 16 variants are
-//! tables of one static buffer, [`crate::indices::remap_table`]), reads the vertex from its
+//! tables of one static buffer, `indices.rs`' `remap_table`), reads the vertex from its
 //! tile's slot and geomorphs it; the fragment shader writes the visibility id.
 //!
 //! **Which variant** is the level choice's: `emit` sets bit `k` of a cluster on its tile's edge
 //! `k` where the neighbour across it at the tile's level isn't reached, so the area there is drawn
 //! by an ancestor, a level coarser by the neighbour rule (or off-screen, where it doesn't
 //! matter); its finer bits where that neighbour is refined. This is what the bounds pass's cone
-//! assumes (the variant's fans; see [`crate::indices`] for the triangles).
+//! assumes (the variant's fans; see `indices.rs` for the triangles).
 //!
 //! # The visibility buffer
 //!
@@ -237,7 +237,7 @@ fn quad_triangle(
 ";
 
 /// Which triangle of a quad a pixel is in: 0 for `(p00, p10, p11)`, 1 for `(p00, p11, p01)`,
-/// their places in the quad's pair of the static index buffer ([`crate::indices::triangles`]).
+/// their places in the quad's pair of the static index buffer (`indices.rs`).
 ///
 /// `corners` are `[p00, p10, p11, p01]` where they are drawn (remapped by the cluster's edge
 /// variant and morphed), projected, and `pixel` in the same frame. The two triangles lie on either

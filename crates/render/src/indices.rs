@@ -54,16 +54,17 @@ use crate::lod::CLUSTER_INDICES;
 mod tests;
 
 /// Quads along a full cluster's side.
-pub const CLUSTER_QUADS: u8 = 8;
+pub(crate) const CLUSTER_QUADS: u8 = 8;
 
 /// Vertices along a full cluster's side.
-pub const CLUSTER_SIDE: u8 = CLUSTER_QUADS + 1;
+pub(crate) const CLUSTER_SIDE: u8 = CLUSTER_QUADS + 1;
 
 /// Vertices of a full cluster: its grid's.
-pub const CLUSTER_VERTICES: usize = CLUSTER_SIDE as usize * CLUSTER_SIDE as usize;
+#[cfg(test)]
+pub(crate) const CLUSTER_VERTICES: usize = CLUSTER_SIDE as usize * CLUSTER_SIDE as usize;
 
 /// Triangles of a full cluster: two a quad.
-pub const CLUSTER_TRIANGLES: usize = 2 * CLUSTER_QUADS as usize * CLUSTER_QUADS as usize;
+pub(crate) const CLUSTER_TRIANGLES: usize = 2 * CLUSTER_QUADS as usize * CLUSTER_QUADS as usize;
 
 // The level choice's draw arguments ask for exactly this cluster's indices.
 const _: () = assert!(
@@ -72,12 +73,13 @@ const _: () = assert!(
 );
 
 /// Remap tables: one per cluster size and variant.
-pub const TABLES: usize = ClusterSize::ALL.len() * Variant::COUNT;
+#[cfg(test)]
+pub(crate) const TABLES: usize = ClusterSize::ALL.len() * Variant::COUNT;
 
 /// An edge of a tile or of a cluster, in the order of the tile tree's neighbours
 /// ([`crate::tree::GpuNode::neighbours`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Edge {
+pub(crate) enum Edge {
     /// The edge at `v = 0` (the tile's `j = 0`).
     Bottom,
     /// The edge at `u = last`.
@@ -90,23 +92,25 @@ pub enum Edge {
 
 impl Edge {
     /// Every edge, in neighbour order.
-    pub const ALL: [Self; 4] = [Self::Bottom, Self::Right, Self::Top, Self::Left];
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 4] = [Self::Bottom, Self::Right, Self::Top, Self::Left];
 
     /// Its number: its place in neighbour order and its bit in a [`Variant`].
     #[must_use]
-    pub const fn index(self) -> u8 {
+    pub(crate) const fn index(self) -> u8 {
         self as u8
     }
 
     /// Its bit in a [`Variant`] or an edge mask.
     #[must_use]
-    pub const fn bit(self) -> u8 {
+    pub(crate) const fn bit(self) -> u8 {
         1 << self.index()
     }
 
     /// Whether `vertex` of a cluster of `size` lies on this edge (corners on two edges).
     #[must_use]
-    pub const fn holds(self, size: ClusterSize, vertex: GridVertex) -> bool {
+    #[cfg(test)]
+    pub(crate) const fn holds(self, size: ClusterSize, vertex: GridVertex) -> bool {
         let last = size.quads();
         match self {
             Self::Bottom => vertex.v == 0,
@@ -121,17 +125,19 @@ impl Edge {
 /// edge `k` of [`Edge::ALL`], as the level choice writes it into a cluster
 /// ([`crate::lod::GpuCluster`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Variant(u8);
+pub(crate) struct Variant(u8);
 
 impl Variant {
     /// How many variants there are.
-    pub const COUNT: usize = 16;
+    pub(crate) const COUNT: usize = 16;
     /// No edge beside a coarser neighbour: the static triangles as they are.
-    pub const PLAIN: Self = Self(0);
+    #[cfg(test)]
+    pub(crate) const PLAIN: Self = Self(0);
 
     /// The variant of `bits` (bit `k` for edge `k`), if below 16.
     #[must_use]
-    pub const fn new(bits: u8) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) const fn new(bits: u8) -> Option<Self> {
         if (bits as usize) < Self::COUNT {
             Some(Self(bits))
         } else {
@@ -141,24 +147,26 @@ impl Variant {
 
     /// The variant skipping the odd vertices of every edge in `edges`.
     #[must_use]
-    pub fn of_edges(edges: &[Edge]) -> Self {
+    #[cfg(test)]
+    pub(crate) fn of_edges(edges: &[Edge]) -> Self {
         Self(edges.iter().fold(0, |bits, edge| bits | edge.bit()))
     }
 
     /// Its bits.
     #[must_use]
-    pub const fn bits(self) -> u8 {
+    #[cfg(test)]
+    pub(crate) const fn bits(self) -> u8 {
         self.0
     }
 
     /// Whether the neighbour across `edge` is a level coarser.
     #[must_use]
-    pub const fn has(self, edge: Edge) -> bool {
+    pub(crate) const fn has(self, edge: Edge) -> bool {
         self.0 & edge.bit() != 0
     }
 
     /// Every variant, in bit order.
-    pub fn all() -> impl Iterator<Item = Self> {
+    pub(crate) fn all() -> impl Iterator<Item = Self> {
         (0..Self::COUNT).filter_map(|bits| u8::try_from(bits).ok().map(Self))
     }
 }
@@ -171,7 +179,7 @@ impl fmt::Display for Variant {
 
 /// Quads along a cluster's side: 8, or a whole tile of fewer (the levels below 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ClusterSize {
+pub(crate) enum ClusterSize {
     /// One quad: a level-0 tile.
     One,
     /// Two quads: a level-1 tile.
@@ -184,11 +192,12 @@ pub enum ClusterSize {
 
 impl ClusterSize {
     /// Every size, smallest first: its place here is [`ClusterSize::index`].
-    pub const ALL: [Self; 4] = [Self::One, Self::Two, Self::Four, Self::Eight];
+    pub(crate) const ALL: [Self; 4] = [Self::One, Self::Two, Self::Four, Self::Eight];
 
     /// The size of `quads` quads a side, if it is 1, 2, 4 or 8.
     #[must_use]
-    pub const fn of_quads(quads: u32) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) const fn of_quads(quads: u32) -> Option<Self> {
         match quads {
             1 => Some(Self::One),
             2 => Some(Self::Two),
@@ -200,20 +209,20 @@ impl ClusterSize {
 
     /// Quads a side.
     #[must_use]
-    pub const fn quads(self) -> u8 {
+    pub(crate) const fn quads(self) -> u8 {
         1 << self.index()
     }
 
     /// Its place in [`ClusterSize::ALL`]: the base-2 logarithm of its quads.
     #[must_use]
-    pub const fn index(self) -> u8 {
+    pub(crate) const fn index(self) -> u8 {
         self as u8
     }
 }
 
 /// A vertex of the cluster grid: `u` along the tile's `i`, `v` along its `j`, both `0 ..= 8`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GridVertex {
+pub(crate) struct GridVertex {
     /// The column.
     u: u8,
     /// The row.
@@ -223,7 +232,8 @@ pub struct GridVertex {
 impl GridVertex {
     /// The vertex `(u, v)`, if both are on the grid (at most 8).
     #[must_use]
-    pub const fn new(u: u8, v: u8) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) const fn new(u: u8, v: u8) -> Option<Self> {
         if u < CLUSTER_SIDE && v < CLUSTER_SIDE {
             Some(Self { u, v })
         } else {
@@ -231,39 +241,35 @@ impl GridVertex {
         }
     }
 
-    /// The vertex numbered `index` (`v · 9 + u`), if below 81.
-    #[must_use]
-    pub const fn from_index(index: u8) -> Option<Self> {
-        Self::new(index % CLUSTER_SIDE, index / CLUSTER_SIDE)
-    }
-
     /// The column.
     #[must_use]
-    pub const fn u(self) -> u8 {
+    #[cfg(test)]
+    pub(crate) const fn u(self) -> u8 {
         self.u
     }
 
     /// The row.
     #[must_use]
-    pub const fn v(self) -> u8 {
+    #[cfg(test)]
+    pub(crate) const fn v(self) -> u8 {
         self.v
     }
 
     /// Its number, `v · 9 + u`: the value an index holds.
     #[must_use]
-    pub const fn index(self) -> u8 {
+    pub(crate) const fn index(self) -> u8 {
         self.v * CLUSTER_SIDE + self.u
     }
 
     /// Every vertex of the grid, in index order.
-    pub fn all() -> impl Iterator<Item = Self> {
+    pub(crate) fn all() -> impl Iterator<Item = Self> {
         (0..CLUSTER_SIDE).flat_map(|v| (0..CLUSTER_SIDE).map(move |u| Self { u, v }))
     }
 }
 
 /// The static triangles of a full cluster, in index-buffer order: per quad `(x, y)`, row by row,
 /// `(p00, p10, p11)` then `(p00, p11, p01)`, split along the `(x, y)`–`(x + 1, y + 1)` diagonal.
-pub fn triangles() -> impl Iterator<Item = [GridVertex; 3]> {
+pub(crate) fn triangles() -> impl Iterator<Item = [GridVertex; 3]> {
     (0..CLUSTER_QUADS).flat_map(|y| {
         (0..CLUSTER_QUADS).flat_map(move |x| {
             let at = |dx: u8, dy: u8| GridVertex {
@@ -280,7 +286,7 @@ pub fn triangles() -> impl Iterator<Item = [GridVertex; 3]> {
 
 /// The static index buffer: [`triangles`]' vertex numbers, [`CLUSTER_INDICES`] of them.
 #[must_use]
-pub fn indices() -> Vec<u16> {
+pub(crate) fn indices() -> Vec<u16> {
     triangles()
         .flatten()
         .map(|vertex| u16::from(vertex.index()))
@@ -293,7 +299,7 @@ pub fn indices() -> Vec<u16> {
 /// edge the variant names, the even neighbour on that edge that takes its place (see the
 /// module's rustdoc).
 #[must_use]
-pub const fn remap(size: ClusterSize, variant: Variant, vertex: GridVertex) -> GridVertex {
+pub(crate) const fn remap(size: ClusterSize, variant: Variant, vertex: GridVertex) -> GridVertex {
     let last = size.quads();
     let u = if vertex.u < last { vertex.u } else { last };
     let v = if vertex.v < last { vertex.v } else { last };
@@ -317,7 +323,8 @@ pub const fn remap(size: ClusterSize, variant: Variant, vertex: GridVertex) -> G
 /// Where the remap table of `size` and `variant` starts in [`remap_table`], in entries (one a
 /// grid vertex).
 #[must_use]
-pub const fn table_offset(size: ClusterSize, variant: Variant) -> usize {
+#[cfg(test)]
+pub(crate) const fn table_offset(size: ClusterSize, variant: Variant) -> usize {
     (size.index() as usize * Variant::COUNT + variant.bits() as usize) * CLUSTER_VERTICES
 }
 
@@ -326,7 +333,7 @@ pub const fn table_offset(size: ClusterSize, variant: Variant) -> usize {
 /// [`TABLES`] tables of [`CLUSTER_VERTICES`] entries, the table of `size` and `variant` at
 /// [`table_offset`], each entry the number of the vertex [`remap`] draws.
 #[must_use]
-pub fn remap_table() -> Vec<u32> {
+pub(crate) fn remap_table() -> Vec<u32> {
     let entries = ClusterSize::ALL.into_iter().flat_map(|size| {
         Variant::all().flat_map(move |variant| {
             GridVertex::all().map(move |vertex| remap(size, variant, vertex).index())
@@ -347,7 +354,11 @@ pub fn remap_table() -> Vec<u32> {
 ///
 /// They are [`triangles`] mapped through [`remap`], `None` where one degenerates (two of its
 /// vertices the same: the variant's or the size's padding).
-pub fn drawn(size: ClusterSize, variant: Variant) -> impl Iterator<Item = Option<[GridVertex; 3]>> {
+#[cfg(test)]
+pub(crate) fn drawn(
+    size: ClusterSize,
+    variant: Variant,
+) -> impl Iterator<Item = Option<[GridVertex; 3]>> {
     triangles().map(move |triangle| {
         let [a, b, c] = triangle.map(|vertex| remap(size, variant, vertex));
         (a != b && b != c && c != a).then_some([a, b, c])

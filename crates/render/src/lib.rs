@@ -8,7 +8,7 @@
 //! [`residency`] keeps tiles on the GPU within a budget, uploaded through [`upload`]'s staging
 //! ring an epoch at a time, and [`tree`] is the tree of resident tiles the GPU walks. [`cull`]
 //! and [`lod`] choose the tiles a frame draws, and [`raster`] draws their clusters (the
-//! triangles of [`indices`]) into a visibility buffer, watertight at every seam.
+//! triangles of `indices`) into a visibility buffer, watertight at every seam.
 //!
 //! The crates below this one (`geom`, `store`, `brush`) never learn about the GPU: this crate
 //! reads their data and uploads it.
@@ -20,7 +20,7 @@ pub mod camera;
 pub mod cull;
 mod draw;
 pub mod gpu;
-pub mod indices;
+pub(crate) mod indices;
 pub mod lod;
 pub mod overlay;
 pub mod raster;

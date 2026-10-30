@@ -378,7 +378,8 @@ fn shared_border_vertices_are_bit_identical_on_both_sides_of_every_variant_pairi
             };
             // Their edge facing ours is plain on their side (their neighbour, ours, is not
             // coarser), whatever their other edges' variant.
-            for their_variant in Variant::all().filter(|v| !v.has(facing)) {
+            let pairings = Variant::all().filter(|v| !v.has(facing));
+            for their_variant in pairings {
                 let theirs_tris = real(size, their_variant);
                 let theirs = drawn_border(size, &theirs_tris, facing, &theirs_positions);
                 let shared = theirs

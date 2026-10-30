@@ -139,7 +139,8 @@ fn compare_seams(gpu: &Gpu, world: &World, raster: &mut Raster) -> (usize, usize
         let probes: Vec<[u32; 2]> = pairs.iter().flat_map(|p| [p.ours, p.theirs]).collect();
         let (list, _) = cluster_buffers(gpu, &clusters);
         let placed = probe(gpu, raster, world, &list, &probes);
-        for (pair, both) in pairs.iter().zip(placed.chunks(2)) {
+        let compared_pairs = pairs.iter().zip(placed.chunks(2));
+        for (pair, both) in compared_pairs {
             compared += 1;
             faces += usize::from(pair.across_faces);
             cousins += usize::from(pair.cousins);

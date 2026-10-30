@@ -28,7 +28,8 @@ fn probe_odd(
 ) -> Vec<Odd> {
     let mut probes = Vec::new();
     let mut odds = Vec::new();
-    for (instance, cluster) in clusters.iter().enumerate() {
+    let listed = clusters.iter().enumerate();
+    for (instance, cluster) in listed {
         let tile = world.place_of(cluster.node);
         if tile.level() == world.finest {
             continue;
@@ -75,7 +76,8 @@ fn probe_odd(
         return odds;
     }
     let placed = probe(gpu, raster, world, list, &probes);
-    for (odd, p) in odds.iter_mut().zip(&placed) {
+    let probed_odds = odds.iter_mut().zip(&placed);
+    for (odd, p) in probed_odds {
         odd.drawn = [p[0], p[1], p[2]];
     }
     odds

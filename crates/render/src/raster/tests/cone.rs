@@ -83,7 +83,8 @@ fn a_tile_culled_by_its_cone_has_no_triangle_facing_the_eye_mid_morph() {
                 (&view, 1050, false),
             ];
             let mut last = None;
-            for (k, (at, ms, moving)) in frames.into_iter().enumerate() {
+            let steps = frames.into_iter().enumerate();
+            for (k, (at, ms, moving)) in steps {
                 let frame = RasterFrame {
                     view: at,
                     time: Duration::from_millis(ms),

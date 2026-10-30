@@ -64,12 +64,16 @@
 //! # A frame
 //!
 //! On the render thread, after the frame's uploads are encoded:
-//! [`Lod::encode_bounds`] (the tiles whose data changed), [`Lod::encode_main`], the first
-//! raster, the depth pyramid ([`crate::cull::PyramidPass`]), [`Lod::encode_post`], the second
-//! raster, [`Lod::encode_readback`]; submit; then [`CutReadback::submitted`]. The owner thread
-//! takes [`Lod::collect`]'s output a frame or two later.
+//! [`Lod::encode_bounds`] (the tiles whose data changed), [`Lod::encode_main`], the raster's
+//! stamp pass over the cut ([`crate::raster::Raster::encode_stamp`], [`Lod::cut_list`]: when
+//! each tile came into the cut, for the geomorph), the first raster, the depth pyramid
+//! ([`crate::cull::PyramidPass`]), [`Lod::encode_post`], the second raster, the pyramid again,
+//! [`Lod::encode_readback`]; submit; then [`CutReadback::submitted`]. The owner thread takes
+//! [`Lod::collect`]'s output a frame or two later. [`crate::raster::FramePasses`] encodes it all
+//! in this order.
 //!
-//! **The pyramids (decided for Task 4):** the renderer keeps two, `current` and `previous`.
+//! **The pyramids (decided for, and built in, Task 4):** the renderer keeps two, `current` and
+//! `previous`.
 //! After the first raster, `current` is built from the depth and [`Lod::encode_post`] tests
 //! against it; after the second raster, `current` is **built again**, from the frame's whole
 //! depth, and the two swap, so the next frame's first phase tests against everything this frame

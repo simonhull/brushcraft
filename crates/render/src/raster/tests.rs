@@ -794,10 +794,10 @@ fn the_pinhole_test_every_edge_variant_of_a_lone_cluster_shows_no_background_ins
                 );
             }
         }
-        for (quads, variant) in [8, 4]
+        let wanted = [8, 4]
             .into_iter()
-            .flat_map(|q| Variant::all().map(move |v| (q, v)))
-        {
+            .flat_map(|q| Variant::all().map(move |v| (q, v)));
+        for (quads, variant) in wanted {
             assert!(
                 seen.contains(&(quads, u32::from(variant.bits()))),
                 "variant {variant} of {quads} quads drawn"
@@ -931,7 +931,8 @@ fn the_pinhole_test_random_cameras_and_random_mixed_level_cuts_show_no_backgroun
         // cut refining them, at 900 ms; frame 3 that cut refined again, at 1000 ms. At 1040 ms
         // the first refinement's tiles are 93 % through their morph, the second's 27 %; at
         // 1200 ms all are done.
-        for (seed, &low) in LOWS.iter().enumerate() {
+        let seeds = LOWS.iter().enumerate();
+        for (seed, &low) in seeds {
             let (view, distance) = random_view(&mut rng, (2.0, 3.2));
             let base: BTreeSet<Place> = world
                 .tiles
@@ -1027,7 +1028,8 @@ fn the_pinhole_test_bites_a_finer_tile_drawing_its_odd_vertices_beside_a_coarser
         let face = FaceId::new(0);
         let centre = Place::of(&TileKey::display(face, level(3), 0, 0).expect("a key"));
         let neighbours = centre.neighbours(world.mesh.topology());
-        for (edge, m) in indices::Edge::ALL.into_iter().zip(neighbours) {
+        let edges = indices::Edge::ALL.into_iter().zip(neighbours);
+        for (edge, m) in edges {
             let coarser_face = m.expect("a closed mesh").face();
             let view = facing(&world, coarser_face);
             let cut = variant_cut(&world, face, 3, Variant::of_edges(&[edge]));
@@ -1438,7 +1440,8 @@ fn the_shading_pass_s_diagonal_test_answers_as_the_cpu_s() {
             cases.push([p00, p10, p11, p01, point()]);
         }
         let picked = quad_triangle_on_gpu(gpu, &cases);
-        for (case, gpu_pick) in cases.iter().zip(&picked) {
+        let answers = cases.iter().zip(&picked);
+        for (case, gpu_pick) in answers {
             let [p00, p10, p11, p01, pixel] = *case;
             assert_eq!(
                 *gpu_pick,
@@ -1742,11 +1745,11 @@ fn the_geomorph_moves_odd_vertices_from_their_midpoint_to_their_place_over_150_m
             .iter()
             .zip(case.starts.iter().zip(&case.ends))
             .enumerate();
-        for (k, (now, (from, to))) in odd.take(4).skip(1) {
+        let middle = odd.take(4).skip(1);
+        for (k, (now, (from, to))) in middle {
             let along = |q: [f32; 3]| {
-                (0..3)
-                    .map(|a| (q[a] - from[a]) * (to[a] - from[a]))
-                    .sum::<f32>()
+                let product: f32 = (0..3).map(|a| (q[a] - from[a]) * (to[a] - from[a])).sum();
+                product
             };
             let fraction = along(*now) / along(*to);
             assert!(
@@ -1801,7 +1804,8 @@ fn the_geomorph_by_distance_holds_the_drawn_error_at_the_threshold_till_the_tile
             set_error(gpu, &mut world, case.refined, parent);
             set_error(gpu, &mut world, case.tile, own);
             let placed = case.draw_and_probe(gpu, &mut raster, &world, &case.at(2000, true));
-            for (k, at) in placed.iter().enumerate() {
+            let vertices = placed.iter().enumerate();
+            for (k, at) in vertices {
                 let (from, to) = (case.starts[k], case.ends[k]);
                 let (x, y) = (pixels(parent, to), pixels(own, to));
                 let r = f64::from(threshold);
@@ -1893,19 +1897,20 @@ fn the_draw_draws_exactly_the_clusters_the_level_choice_listed() {
                     let p = tile.vertices[usize::try_from(j * side + i).expect("small")].position;
                     view.pixel(Vec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2])))
                 });
-                let Some(corners) = corners.into_iter().collect::<Option<Vec<_>>>() else {
+                let corners: Option<Vec<(f64, f64, f64)>> = corners.into_iter().collect();
+                let Some(corners) = corners else {
                     continue;
                 };
                 let inside_view = corners
                     .iter()
                     .all(|&(x, y, _)| (2.0..398.0).contains(&x) && (2.0..298.0).contains(&y));
-                let area = (0..4)
+                let doubled: f64 = (0..4)
                     .map(|k| {
                         let (a, b) = (corners[k], corners[(k + 1) % 4]);
                         a.0 * b.1 - b.0 * a.1
                     })
-                    .sum::<f64>()
-                    / 2.0;
+                    .sum();
+                let area = doubled / 2.0;
                 // Counter-clockwise on screen with y down: negative signed area faces the eye.
                 if inside_view && -area > 40.0 {
                     let key = (c.node, cy * per + cx);
