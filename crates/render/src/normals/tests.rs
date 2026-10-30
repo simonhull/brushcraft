@@ -301,6 +301,13 @@ fn the_gpu_normals_are_the_cpus_within_a_tight_angle() {
             let block = source.store.positions_with_ring(*key).expect("a ring");
             let corners = (0..4).filter_map(|c| block.corner(c));
             valences.extend(corners.map(geom::GatheredRing::valence));
+            let mut record = RingRecord::default();
+            record.write(&mesh, &block);
+            assert_eq!(
+                residency.upload_bytes(key),
+                record.bytes().len() as u64 + JOB_BYTES,
+                "{key:?}: residency counts its upload exactly"
+            );
             let cpu = ring_normals(&mesh, &block);
             let gpu_vertices = &held[key];
             let q = i64::from(block.quads());

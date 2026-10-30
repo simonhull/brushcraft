@@ -206,6 +206,15 @@ impl RingRecord {
     }
 }
 
+/// The bytes of the record of a tile of `q` quads a side whose corners' base vertices have
+/// `ring_points` edge points together: what [`RingRecord::bytes`] is for it.
+pub(crate) fn record_bytes(q: u32, ring_points: u32) -> u64 {
+    let padded = u64::from(q) + 3;
+    let header = HEADER_WORDS as u64;
+    let words = header + 3 * padded * padded + 3 * u64::from(ring_points);
+    words.next_multiple_of(2) * 4
+}
+
 /// `stencil` as a record's header word.
 pub(crate) fn encode(stencil: VertexStencil) -> u32 {
     /// A grid step (-1, 0 or 1), plus one, in two bits.
@@ -249,7 +258,7 @@ struct GpuJob {
 }
 
 /// The bytes of one [`GpuJob`].
-const JOB_BYTES: u64 = size_of::<GpuJob>() as u64;
+pub(crate) const JOB_BYTES: u64 = size_of::<GpuJob>() as u64;
 
 /// The normal pass: the records a frame stages for its finest tiles, and the pipeline that turns
 /// them into the tiles' vertices.

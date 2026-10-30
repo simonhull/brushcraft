@@ -231,9 +231,10 @@ fn level(l: u8) -> Level {
 
 /// The configuration of the tiny-budget tests, `extra` slot buffers beyond the floor's.
 ///
-/// Slot buffers hold two side-65 slots, the staging ring four such tiles, every epoch of two
-/// or more side-65 tiles goes through shadow slots, and four such tiles may be forced into a
-/// frame. The floor's classes take twice the floor (their shadow headroom), reserved first.
+/// Slot buffers hold two side-65 slots and the staging ring four such tiles. Finest tiles are
+/// counted by their ring records (about 54 KB, though [`Model`] writes their vertices), so every
+/// epoch of three or more goes through shadow slots, and ten may be forced into a frame. The
+/// floor's classes take twice the floor (their shadow headroom), reserved first.
 fn tiny(mesh: &BaseMesh, extra: u64) -> ResidencyConfig {
     let big = SizeClass::of(level(FINEST)).slot_bytes();
     let faces = u64::from(mesh.face_count());
@@ -241,16 +242,9 @@ fn tiny(mesh: &BaseMesh, extra: u64) -> ResidencyConfig {
         .filter_map(SizeClass::new)
         .map(|class| 2 * class.slot_bytes() * faces)
         .sum();
-    ResidencyConfig::new(
-        floor + extra * 2 * big,
-        2 * big,
-        4 * big,
-        big + big / 2,
-        64,
-        level(5),
-    )
-    .and_then(|config| config.with_buffer_bytes(2 * big))
-    .expect("a valid configuration")
+    ResidencyConfig::new(floor + extra * 2 * big, 2 * big, 4 * big, big, 64, level(5))
+        .and_then(|config| config.with_buffer_bytes(2 * big))
+        .expect("a valid configuration")
 }
 
 /// What the GPU holds: every live node's tile, with the version its slot's first vertex

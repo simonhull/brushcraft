@@ -69,7 +69,7 @@ use std::ops::Bound;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
-use geom::{BaseMesh, Level, TileKey};
+use geom::{BaseMesh, Channel, Level, TileKey};
 use store::{CacheError, Drained, Epoch};
 use thiserror::Error;
 use wgpu::{Buffer, MAP_ALIGNMENT, PollType};
@@ -699,6 +699,9 @@ pub struct Residency {
     finest: Level,
     /// How many faces the base mesh has.
     faces: u32,
+    /// Per face, the valence of the base vertex at each of its corners, by
+    /// [`corner_index`]: what a finest tile touching it uploads of its ring.
+    corner_valences: Vec<[u32; 4]>,
     /// The slot pools.
     pools: Pools,
     /// The resident tile tree.
@@ -855,6 +858,7 @@ impl Residency {
             config,
             finest,
             faces,
+            corner_valences: corner_valences(mesh, finest),
             pools,
             tree,
             entries: BTreeMap::new(),
@@ -1129,10 +1133,7 @@ impl Residency {
         if live.is_empty() && touching.is_empty() {
             return;
         }
-        let bytes: u64 = live
-            .iter()
-            .map(|key| SizeClass::of(key.level()).slot_bytes())
-            .sum();
+        let bytes: u64 = live.iter().map(|key| self.upload_bytes(key)).sum();
         let mut merged = Group {
             urgent: !touching.is_empty() && bytes <= self.config.small_epoch_bytes,
             todo: live,
@@ -1406,7 +1407,7 @@ impl Residency {
         }
         source.prepare(&missing).map_err(Into::into)?;
         for key in missing {
-            self.forced_now += SizeClass::of(key.level()).slot_bytes();
+            self.forced_now += self.upload_bytes(&key);
             if self.arrive(gpu, batch, source, key, true)? != Read::NoSlot {
                 self.wanted.remove(&key);
             }
@@ -1454,7 +1455,7 @@ impl Residency {
             let Some(first) = ready.first() else {
                 continue;
             };
-            if batch.room(&self.ring) < SizeClass::of(first.level()).slot_bytes() {
+            if batch.room(&self.ring) < self.upload_bytes(first) {
                 break;
             }
             source.prepare(&ready).map_err(Into::into)?;
@@ -1553,10 +1554,7 @@ impl Residency {
         S::Error: Into<ResidencyError>,
     {
         let todo: Vec<TileKey> = group.todo.iter().copied().collect();
-        let remaining: u64 = todo
-            .iter()
-            .map(|key| SizeClass::of(key.level()).slot_bytes())
-            .sum();
+        let remaining: u64 = todo.iter().map(|key| self.upload_bytes(key)).sum();
         let small =
             remaining <= self.config.small_epoch_bytes && remaining <= batch.room(&self.ring);
         let within = self.forced_now + remaining <= self.config.forced_bytes;
@@ -1750,7 +1748,7 @@ impl Residency {
     where
         S::Error: Into<ResidencyError>,
     {
-        let bytes = slot.class.slot_bytes();
+        let bytes = self.upload_bytes(&key);
         if !forced && batch.room(&self.ring) < bytes {
             return Ok(Read::NoRoom);
         }
@@ -1909,6 +1907,57 @@ impl Residency {
         self.tree.remove(Place::of(key));
         self.pools.release(entry.slot);
     }
+
+    /// The bytes staging `key` takes: a finest tile's ring record and its job (exact for one
+    /// read with its ring, as [`crate::upload::StoreSource`] reads them), any other tile's slot.
+    ///
+    /// What the staging ring's room, the forced bytes and the small-epoch size are counted in.
+    /// A source writing a finest tile's vertices instead stages its slot, more: its write then
+    /// finds no room where the count said there was, and the tile waits for the next frame.
+    pub(crate) fn upload_bytes(&self, key: &TileKey) -> u64 {
+        let class = SizeClass::of(key.level());
+        if key.level() != self.finest || key.channel() == Channel::DISPLAY {
+            return class.slot_bytes();
+        }
+        let q = class.side() - 1;
+        let n = self.finest.face_quads();
+        let (x0, y0) = (u32::from(key.tx()) * q, u32::from(key.ty()) * q);
+        let corners = [(x0, y0), (x0 + q, y0), (x0 + q, y0 + q), (x0, y0 + q)];
+        let valences = self
+            .corner_valences
+            .get(usize::try_from(key.face().index()).unwrap_or(usize::MAX));
+        let ring_points: u32 = corners
+            .into_iter()
+            .filter_map(|(fi, fj)| corner_index(fi, fj, n))
+            .filter_map(|c| valences.and_then(|v| v.get(c)).copied())
+            .sum();
+        crate::normals::record_bytes(q, ring_points) + crate::normals::JOB_BYTES
+    }
+}
+
+/// Which corner of its face face-grid vertex `(fi, fj)` is, `n` quads a side, if it is one:
+/// `(0, 0)`, `(n, 0)`, `(0, n)`, `(n, n)` are 0 to 3.
+fn corner_index(fi: u32, fj: u32, n: u32) -> Option<usize> {
+    let on = |x: u32| x == 0 || x == n;
+    (on(fi) && on(fj)).then(|| usize::from(fi == n) + 2 * usize::from(fj == n))
+}
+
+/// Per face of `mesh`, the valence of the base vertex at each corner (by [`corner_index`]): the
+/// faces holding a copy of it at `level`.
+fn corner_valences(mesh: &BaseMesh, level: Level) -> Vec<[u32; 4]> {
+    let n = level.face_quads();
+    let topology = mesh.topology();
+    let per_face = mesh.faces().map(|face| {
+        [(0, 0), (n, 0), (0, n), (n, n)].map(|(fi, fj)| {
+            let faces: BTreeSet<u32> = topology
+                .copies(face, level, fi, fj)
+                .iter()
+                .map(|copy| copy.face.index())
+                .collect();
+            u32::try_from(faces.len()).unwrap_or(u32::MAX)
+        })
+    });
+    per_face.collect()
 }
 
 /// Checks that `pools` can hold every tile of `floor` at once.
