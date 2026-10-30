@@ -607,11 +607,13 @@ fn the_first_frame_uploads_the_floor_and_then_nothing_spins() {
     assert_eq!(stats.floor, floor);
     assert_eq!(stats.lost_frames, 0);
     // The floor is up and nothing else is asked for: once the floor frame's readback is read
-    // (it agrees: nothing requested), no more frames are wanted.
-    let settling = run_on_gpu(&gpu, &mut owner, 100);
+    // (it agrees: nothing requested) and the image has accumulated its samples (twice SAMPLES
+    // after the frame that uploaded), no more frames are wanted.
+    let settling = run_on_gpu(&gpu, &mut owner, 200);
+    let accumulating = u64::from(2 * aa::SAMPLES);
     assert!(
-        (1..=3).contains(&settling),
-        "a frame or so to read the readback, then none: {settling}"
+        (accumulating..=accumulating + 3).contains(&settling),
+        "a frame or so to read the readback, the samples, then none: {settling}"
     );
     assert!(matches!(owner.next(Instant::now()), Next::Idle { .. }));
     owner.close().expect("closed");
@@ -1037,6 +1039,12 @@ fn a_change_of_look_alone_shades_the_last_scene_again_and_draws_nothing_new() {
         changed > clay.len() / 20,
         "the new MatCap shows: {changed} pixels"
     );
+    // The shading again restarted the image's samples: frames come until they are all taken.
+    assert!(
+        matches!(owner.next(Instant::now() + INTERVAL), Next::Frame { .. }),
+        "accumulating"
+    );
+    settle(&gpu, &mut owner, &mut screen);
     // The debug view, the same way.
     owner.change_look(LookChange::Clusters);
     let debug = hand_off(&mut owner, Instant::now());

@@ -49,7 +49,7 @@ use render::lod::LodStats;
 use render::raster::FramePasses;
 use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
-use render::{DrawTimes, Look, SceneView};
+use render::{DrawTimes, Look, SceneView, aa};
 use store::{Drained, JobsReport, Project, StaleCursor, TileStore};
 
 use self::schedule::{Next, Reason, Reasons, Scheduler};
@@ -612,6 +612,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 moving: moved,
             })
         });
+        self.want_accumulation(reasons, &uploads, scene.is_some() || reshade);
 
         let snapshot = Snapshot {
             frame: self.started,
@@ -687,6 +688,45 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 .context("picking")?;
         }
         Ok(())
+    }
+
+    /// Wants the frames the image needs to accumulate its samples after a frame wanted for
+    /// `reasons`, whose uploads said `uploads`, which shows a scene (`showing`) or not (the
+    /// renderer's accumulation, `render::aa`).
+    ///
+    /// - A frame that may change the scene (store work converging, uploads, requests, a morph, a
+    ///   script, anything staged) can reset pixels the renderer only notices on the frame that
+    ///   samples them again: `2 · SAMPLES` frames, one cycle of jitters to notice, one to converge.
+    /// - A frame that may restart the image without changing the scene (input, the window exposed,
+    ///   a look change): `SAMPLES`.
+    /// - A frame wanted only to accumulate or for the pick line: nothing more. The pick line alone
+    ///   shades nothing when the image holds the look already (`render::Scene::Reshade` shows the
+    ///   accumulated image as it is); while accumulating, a pick comes with `Accumulating`, so it
+    ///   draws the next sample, and the view being unchanged, continues it.
+    ///
+    /// The debug view of clusters doesn't accumulate.
+    fn want_accumulation(&mut self, reasons: Reasons, uploads: &UploadStatus, showing: bool) {
+        if !showing || self.look.view != SceneView::Shaded {
+            return;
+        }
+        let changing = [
+            Reason::Converging,
+            Reason::Uploads,
+            Reason::Requests,
+            Reason::Morphing,
+            Reason::Scripted,
+        ]
+        .into_iter()
+        .any(|reason| reasons.contains(reason))
+            || !quiet(uploads);
+        let settling = Reasons::default()
+            .with(Reason::Accumulating)
+            .with(Reason::Pick);
+        if changing {
+            self.scheduler.accumulate(2 * aa::SAMPLES);
+        } else if !reasons.within(settling) {
+            self.scheduler.accumulate(aa::SAMPLES);
+        }
     }
 
     /// Tells the scheduler what, after a frame whose uploads said `uploads`, wants the next:

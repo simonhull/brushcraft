@@ -2,11 +2,11 @@
 //!
 //! Frames are made on demand (the M1 spec's "When to render"): only when input arrived, the
 //! window needs drawing, a script asks, how the scene is shown changed, or something is
-//! converging: store jobs left to run, uploads in flight, requests pending, a morph under way
-//! (later, accumulation). With none of those there is no frame, and about zero GPU work. The
-//! scheduler is told why frames are wanted ([`Scheduler::want`]) and when one starts and is shown,
-//! and answers what to do next ([`Scheduler::next`]); it never looks at a clock or a window itself,
-//! so every rule is tested with made-up times.
+//! converging: store jobs left to run, uploads in flight, requests pending, a morph under way,
+//! an image still accumulating samples. With none of those there is no frame, and about zero GPU
+//! work. The scheduler is told why frames are wanted ([`Scheduler::want`]) and when one starts and
+//! is shown, and answers what to do next ([`Scheduler::next`]); it never looks at a clock or a
+//! window itself, so every rule is tested with made-up times.
 //!
 //! Its rules:
 //!
@@ -25,6 +25,10 @@
 //!   readback) keeps frames coming for the morph's duration after it: until a frame starts at or
 //!   past that frame's time plus the morph, so the last frame drawn shows the morph finished. The
 //!   duration is the raster's ([`Scheduler::with_morph`]).
+//! - While the camera is still the renderer accumulates samples (`render::aa`): the frame loop asks
+//!   for so many frames more after a frame that may restart or reset the image
+//!   ([`Scheduler::accumulate`]), and they come as [`Reason::Accumulating`], one fewer each frame
+//!   started, until none is left.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -55,6 +59,9 @@ pub(crate) enum Reason {
     /// The pointer moved, so the overlay's pick line changes ([`crate::pick`]): like
     /// [`Reason::Look`], a frame wanted for this alone shades the last scene again.
     Pick,
+    /// The image is still accumulating samples with the camera still (`render::aa`): wanted for
+    /// as many frames as [`Scheduler::accumulate`] last asked.
+    Accumulating,
 }
 
 impl Reason {
@@ -70,6 +77,7 @@ impl Reason {
             Self::Scripted => 1 << 6,
             Self::Look => 1 << 7,
             Self::Pick => 1 << 8,
+            Self::Accumulating => 1 << 9,
         }
     }
 }
@@ -114,6 +122,7 @@ impl fmt::Display for Reasons {
             (Reason::Scripted, "scripted"),
             (Reason::Look, "look"),
             (Reason::Pick, "pick"),
+            (Reason::Accumulating, "accumulating"),
         ];
         let names: Vec<&str> = all
             .into_iter()
@@ -177,6 +186,8 @@ pub(crate) struct Scheduler {
     /// While a morph is under way, when it ends: frames are wanted until one starts then or
     /// later.
     morph_end: Option<Instant>,
+    /// Frames still wanted for accumulation.
+    accumulating: u32,
 }
 
 impl Scheduler {
@@ -191,6 +202,7 @@ impl Scheduler {
             hidden: false,
             morph: Duration::ZERO,
             morph_end: None,
+            accumulating: 0,
         }
     }
 
@@ -229,13 +241,22 @@ impl Scheduler {
         self.reasons()
     }
 
-    /// Why a frame is wanted: what was asked for, and a morph under way.
+    /// Wants the next `frames` frames at least, for the image to accumulate its samples
+    /// ([`Reason::Accumulating`]): asking for fewer than are still wanted changes nothing.
+    pub(crate) fn accumulate(&mut self, frames: u32) {
+        self.accumulating = self.accumulating.max(frames);
+    }
+
+    /// Why a frame is wanted: what was asked for, a morph under way, and accumulation.
     fn reasons(&self) -> Reasons {
+        let mut reasons = self.wanted;
         if self.morph_end.is_some() {
-            self.wanted.with(Reason::Morphing)
-        } else {
-            self.wanted
+            reasons = reasons.with(Reason::Morphing);
         }
+        if self.accumulating > 0 {
+            reasons = reasons.with(Reason::Accumulating);
+        }
+        reasons
     }
 
     /// When upkeep is next due: [`UPKEEP_INTERVAL`] after it last ran (it may be past).
@@ -269,7 +290,8 @@ impl Scheduler {
     }
 
     /// A frame started at `now`: what was wanted is taken (and returned), and the frame is in
-    /// flight until [`Scheduler::shown`]. A morph ends with the first frame at or past its end.
+    /// flight until [`Scheduler::shown`]. A morph ends with the first frame at or past its end;
+    /// each frame takes one of those accumulation wants.
     pub(crate) fn started(&mut self, now: Instant) -> Reasons {
         let reasons = self.reasons();
         self.in_flight = true;
@@ -279,6 +301,7 @@ impl Scheduler {
         if self.morph_end.is_some_and(|end| end <= now) {
             self.morph_end = None;
         }
+        self.accumulating = self.accumulating.saturating_sub(1);
         reasons
     }
 
@@ -634,6 +657,67 @@ mod tests {
         assert!(
             !pick.with(Reason::Input).within(shading),
             "input draws the scene"
+        );
+    }
+
+    /// The samples the renderer's accumulation takes.
+    const SAMPLES: u32 = render::aa::SAMPLES;
+
+    #[test]
+    fn accumulation_keeps_frames_coming_for_its_samples_then_none() {
+        let (mut scheduler, start) = scheduler();
+        scheduler.want(Reason::Input);
+        scheduler.started(start);
+        scheduler.shown(Outcome::Presented);
+        // The frame loop: that frame may have restarted the image.
+        scheduler.accumulate(SAMPLES);
+        assert!(scheduler.wanted().contains(Reason::Accumulating));
+        let starts = frames_from(&mut scheduler, start + INTERVAL, &[]);
+        assert_eq!(
+            starts.len(),
+            usize::try_from(SAMPLES).expect("small"),
+            "one frame a sample"
+        );
+        assert!(scheduler.wanted().is_empty(), "converged: idle");
+        assert_eq!(
+            Reasons::default().with(Reason::Accumulating).to_string(),
+            "accumulating"
+        );
+    }
+
+    #[test]
+    fn a_camera_move_holds_accumulation_off_until_it_stops_then_it_starts_again() {
+        let (mut scheduler, start) = scheduler();
+        let mut now = start;
+        // The camera moves for ten frames: each frame's input asks for SAMPLES frames after it
+        // (the frame loop's rule), so the count starts again from the last moving frame.
+        for _ in 0..10 {
+            scheduler.want(Reason::Input);
+            assert!(matches!(scheduler.next(now), Next::Frame { .. }));
+            let reasons = scheduler.started(now);
+            assert!(reasons.contains(Reason::Input));
+            scheduler.shown(Outcome::Presented);
+            scheduler.accumulate(SAMPLES);
+            now += INTERVAL;
+        }
+        let still = frames_from(&mut scheduler, now, &[]);
+        assert_eq!(
+            still.len(),
+            usize::try_from(SAMPLES).expect("small"),
+            "SAMPLES still frames after the last move"
+        );
+        // A scene change wants twice as many: a cycle to notice, a cycle to converge.
+        let later = *still.last().expect("frames") + INTERVAL * 10;
+        scheduler.want(Reason::Uploads);
+        scheduler.started(later);
+        scheduler.shown(Outcome::Presented);
+        scheduler.accumulate(2 * SAMPLES);
+        scheduler.accumulate(SAMPLES);
+        let after = frames_from(&mut scheduler, later + INTERVAL, &[]);
+        assert_eq!(
+            after.len(),
+            usize::try_from(2 * SAMPLES).expect("small"),
+            "asking for fewer changes nothing"
         );
     }
 }
