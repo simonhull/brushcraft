@@ -3,14 +3,14 @@
 
 use std::time::{Duration, Instant};
 
-use geom::{Channel, FaceId, LayerId, TileKey, Vec3, cube_sphere};
+use geom::{Channel, FaceId, LayerId, Level, TileKey, Vec3, cube_sphere};
 use store::{Drained, Project, ProjectConfig, StaleCursor, StoreConfig, TileStore};
 use wgpu::CommandEncoderDescriptor;
 
-use super::{TempDir, array, level, slot_contents, with_floor};
+use super::{REPEATS, TempDir, array, level, report, slot_contents, with_floor};
 use crate::gpu::{Gpu, GpuTest};
 use crate::residency::{Request, Requests, Residency};
-use crate::upload::{FinestEvaluations, StoreSource};
+use crate::upload::{FinestEvaluations, StoreSource, prefetch_requests};
 
 /// The finest level of the small tests' projects.
 const FINEST: u8 = 7;
@@ -431,5 +431,177 @@ fn the_queued_evaluation_keeps_to_the_jobs_share() {
             "the display jobs and the queue took turns within a call: (display, queue) by call {calls:?}"
         );
         drop(project.close(false));
+    });
+}
+
+/// A project of `mesh` with a correction in every correction tile, saved; its path and
+/// configuration.
+///
+/// Its display layer is kept under `finest`; a correction is written at the middle of every
+/// correction tile at every level from 1 (so a finest tile's cone has something to read at
+/// each), and it is saved as `name` in `dir`.
+fn saved_edited(
+    dir: &TempDir,
+    name: &str,
+    mesh: &geom::BaseMesh,
+    finest: Level,
+) -> (std::path::PathBuf, ProjectConfig) {
+    let config = ProjectConfig {
+        store: StoreConfig::new(1 << 30, 1).with_display(finest),
+        recovery_dir: dir.0.clone(),
+    };
+    let mut project = Project::new(mesh.clone(), config.clone()).expect("a project");
+    let store = project.store();
+    store.begin_op().expect("an op");
+    let mut n = 0_u32;
+    for face in mesh.faces() {
+        for l in 1..=finest.get() {
+            let at = level(l);
+            let q = at.tile_quads();
+            let per_side = at.tiles_per_side();
+            for ty in 0..per_side {
+                for tx in 0..per_side {
+                    n += 1;
+                    let lift = 1e-3 * f32::from(u16::try_from(n % 7).expect("small"));
+                    let (i, j) = (tx * q + q / 2, ty * q + q / 2);
+                    store
+                        .set_correction(face, at, i, j, Vec3::new(lift, -lift, lift))
+                        .expect("written");
+                }
+            }
+        }
+    }
+    store.queue_display_rebuild(finest);
+    run_all_jobs(store);
+    let path = dir.0.join(name);
+    drop(project.save_as(&path).expect("saved"));
+    drop(project.close(false));
+    (path, config)
+}
+
+/// The finest tiles of `mesh`'s first `faces` faces at `finest`.
+fn finest_tiles(mesh: &geom::BaseMesh, finest: Level, faces: u32) -> Vec<TileKey> {
+    let per_side = u16::try_from(finest.tiles_per_side()).expect("small");
+    let mut keys = Vec::new();
+    for face in mesh.faces().take(usize::try_from(faces).expect("small")) {
+        for ty in 0..per_side {
+            for tx in 0..per_side {
+                keys.push(TileKey::displacement(face, finest, tx, ty).expect("a tile"));
+            }
+        }
+    }
+    keys
+}
+
+/// Stages `keys`, each finest tile evaluated while staging, as before the queued evaluation.
+///
+/// They are requested at once and paged in on request, from a store opened afresh (its cones
+/// cold). Returns the owner's staging time and the tiles staged.
+fn staged_evaluating_while_staging(
+    gpu: &Gpu,
+    path: &std::path::Path,
+    config: &ProjectConfig,
+    keys: &[TileKey],
+) -> (Duration, u64) {
+    let mut project = Project::open(path, config.clone()).expect("opened");
+    let store = project.store();
+    let mesh = store.mesh().clone();
+    let finest = store.display_finest().expect("a display layer");
+    let mut residency = with_floor(gpu, &mesh, finest, store);
+    let requests = super::requests_of(keys);
+    prefetch_requests(store, &requests).expect("paged in");
+    let (mut took, mut staged) = (Duration::ZERO, 0);
+    for _ in 0..2 {
+        // A frame's interval for the page-in to land, as in the app.
+        std::thread::sleep(Duration::from_micros(16_700));
+        took += super::frame(gpu, &mut residency, store, &requests);
+        staged += residency.stats().staged_tiles;
+    }
+    assert_eq!(staged, keys.len() as u64, "every tile staged");
+    drop(project.close(false));
+    (took, staged)
+}
+
+/// [`staged_evaluating_while_staging`] through the queued evaluation.
+///
+/// The jobs are given `jobs` after each frame's staging, frames until every tile is staged.
+/// Returns the owner's staging time, the tiles staged, and the jobs' time.
+fn staged_from_the_queue(
+    gpu: &Gpu,
+    path: &std::path::Path,
+    config: &ProjectConfig,
+    keys: &[TileKey],
+    jobs: Duration,
+) -> ((Duration, u64), Duration) {
+    let mut project = Project::open(path, config.clone()).expect("opened");
+    let store = project.store();
+    let cursor = store.subscribe_stale();
+    let mesh = store.mesh().clone();
+    let finest = store.display_finest().expect("a display layer");
+    let mut residency = with_floor(gpu, &mesh, finest, store);
+    let mut evaluations = FinestEvaluations::new();
+    let requests = super::requests_of(keys);
+    prefetch_requests(store, &requests).expect("paged in");
+    let (mut took, mut staged, mut in_jobs) = (Duration::ZERO, 0, Duration::ZERO);
+    let mut frames = 0;
+    while staged < keys.len() as u64 {
+        frames += 1;
+        assert!(frames < 1000, "every tile staged");
+        let began = Instant::now();
+        let here = frame(
+            gpu,
+            &mut residency,
+            &mut evaluations,
+            store,
+            &cursor,
+            &requests,
+        );
+        took += began.elapsed();
+        assert_eq!(here, 0, "staging evaluated nothing");
+        staged += residency.stats().staged_tiles;
+        let jobs_began = Instant::now();
+        store.run_jobs(jobs_began + jobs).expect("the jobs run");
+        in_jobs += jobs_began.elapsed();
+    }
+    eprintln!(
+        "  through the queue: {staged} tiles staged over {frames} frames, the jobs given {:.1} ms \
+         a frame",
+        jobs.as_secs_f64() * 1e3
+    );
+    drop(project.close(false));
+    ((took, staged), in_jobs)
+}
+
+/// The owner thread's time staging requested finest tiles from a cold store.
+///
+/// Evaluated while staging (as before the queued evaluation) against evaluated in the jobs and
+/// staged from their copies. A timing, not a check: run it in release, with
+/// `--run-ignored only`.
+#[test]
+#[ignore = "a timing, for release builds"]
+fn owner_time_staging_finest_tiles() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("finest-owner-time");
+        let mesh = cube_sphere(3).expect("a mesh");
+        let finest = level(8);
+        let (path, config) = saved_edited(&dir, "finest.bcp", &mesh, finest);
+        let keys = finest_tiles(&mesh, finest, 4);
+        let jobs = Duration::from_millis(8);
+        let (mut before, mut after, mut in_jobs) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..REPEATS {
+            before.push(staged_evaluating_while_staging(gpu, &path, &config, &keys));
+            let (run, jobs_took) = staged_from_the_queue(gpu, &path, &config, &keys, jobs);
+            after.push(run);
+            in_jobs.push((jobs_took, run.1));
+        }
+        report("finest tiles evaluated while staging (before)", &before);
+        report(
+            "finest tiles staged from the queue's copies (after)",
+            &after,
+        );
+        report(
+            "finest tiles evaluated in the jobs phase, after the hand-off",
+            &in_jobs,
+        );
     });
 }
