@@ -11,7 +11,14 @@
 //! Its rules:
 //!
 //! - One frame at a time: none starts while the render thread has the last one.
-//! - Paced to the display: a frame starts no sooner than one refresh interval after the last.
+//! - Never outrunning the GPU: none starts while the GPU has [`render::FRAMES_IN_FLIGHT`] frames it
+//!   hasn't finished (the frame the render thread has counts among them). The loop learns of
+//!   finished frames by polling the device, never by waiting on it ([`Scheduler::gpu_finished`]),
+//!   and does its jobs and upkeep meanwhile ([`Next::Gpu`]). So when the GPU is slower than the
+//!   display, frames come at the GPU's rate, input waits behind at most that many frames, and each
+//!   frame's readbacks find a buffer.
+//! - Paced to the display: a frame starts no sooner than one refresh interval after the last. The
+//!   pace is waited for first, precisely, so a GPU keeping up costs no wait of its own.
 //! - A frame's store jobs run until three quarters of an interval after it starts, leaving the rest
 //!   for handling the window's events.
 //! - A frame that couldn't be shown (the surface changed) is wanted again at once.
@@ -152,6 +159,10 @@ pub(crate) enum Next {
     },
     /// The render thread has the last frame: wait until it is shown.
     Render,
+    /// A frame is due, but the GPU has [`render::FRAMES_IN_FLIGHT`] frames it hasn't finished:
+    /// poll it (never wait on it), and do the store's jobs and upkeep meanwhile, until it
+    /// finishes one ([`Scheduler::gpu_finished`]).
+    Gpu,
     /// No frame is wanted. Sleep until an event, or until `upkeep`, when the store's upkeep is
     /// due.
     Idle {
@@ -175,6 +186,13 @@ pub(crate) struct Scheduler {
     wanted: Reasons,
     /// Whether the render thread has a frame it hasn't finished.
     in_flight: bool,
+    /// Frames started, ever: the last one's number.
+    started: u64,
+    /// The newest frame the GPU has finished (and every one before it); 0 for none.
+    gpu_finished: u64,
+    /// The most frames the GPU may have unfinished as a frame starts, the new one not counted:
+    /// [`render::FRAMES_IN_FLIGHT`].
+    gpu_bound: u64,
     /// When the last frame started.
     last_start: Option<Instant>,
     /// When upkeep last ran (a frame runs it too).
@@ -197,6 +215,9 @@ impl Scheduler {
             interval,
             wanted: Reasons(0),
             in_flight: false,
+            started: 0,
+            gpu_finished: 0,
+            gpu_bound: render::FRAMES_IN_FLIGHT as u64,
             last_start: None,
             upkept: now,
             hidden: false,
@@ -206,11 +227,39 @@ impl Scheduler {
         }
     }
 
+    /// The same scheduler, keeping at most `bound` frames unfinished on the GPU instead of
+    /// [`render::FRAMES_IN_FLIGHT`]: for a model of what happens without the bound.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_gpu_bound(self, bound: u64) -> Self {
+        Self {
+            gpu_bound: bound,
+            ..self
+        }
+    }
+
     /// The same scheduler, a level change morphing over `morph` (the raster's duration,
     /// `render::raster::RasterConfig::morph`).
     #[must_use]
     pub(crate) const fn with_morph(self, morph: Duration) -> Self {
         Self { morph, ..self }
+    }
+
+    /// The GPU has finished frame `frame` and every one before it (frames are numbered from 1,
+    /// as they start). An older frame than one heard of already changes nothing.
+    pub(crate) fn gpu_finished(&mut self, frame: u64) {
+        self.gpu_finished = self.gpu_finished.max(frame.min(self.started));
+    }
+
+    /// Frames started that the GPU hasn't finished: submitted, or still with the render thread.
+    pub(crate) const fn gpu_in_flight(&self) -> u64 {
+        self.started.saturating_sub(self.gpu_finished)
+    }
+
+    /// Whether the GPU has as many frames unfinished as it may: no frame starts until it
+    /// finishes one.
+    pub(crate) const fn gpu_busy(&self) -> bool {
+        self.gpu_in_flight() >= self.gpu_bound
     }
 
     /// A frame that started at `at` changed the cut: frames are wanted until one starts at or
@@ -284,17 +333,22 @@ impl Scheduler {
         {
             return Next::Wait { until: last + pace };
         }
+        if self.gpu_busy() {
+            return Next::Gpu;
+        }
         Next::Frame {
             deadline: now + self.interval * JOB_QUARTERS / 4,
         }
     }
 
     /// A frame started at `now`: what was wanted is taken (and returned), and the frame is in
-    /// flight until [`Scheduler::shown`]. A morph ends with the first frame at or past its end;
-    /// each frame takes one of those accumulation wants.
+    /// flight until [`Scheduler::shown`], and on the GPU until [`Scheduler::gpu_finished`]. A morph
+    /// ends with the first frame at or past its end; each frame takes one of those accumulation
+    /// wants.
     pub(crate) fn started(&mut self, now: Instant) -> Reasons {
         let reasons = self.reasons();
         self.in_flight = true;
+        self.started += 1;
         self.last_start = Some(now);
         self.upkept = now;
         self.wanted = Reasons::default();
@@ -328,6 +382,15 @@ mod tests {
 
     /// A 60 Hz display's interval, rounded to whole microseconds.
     const INTERVAL: Duration = Duration::from_micros(16_667);
+
+    impl Scheduler {
+        /// The render thread finished the frame in flight with `outcome`, and the GPU finished
+        /// it at once: a GPU that keeps up.
+        fn shown_on_gpu(&mut self, outcome: Outcome) {
+            self.shown(outcome);
+            self.gpu_finished(self.started);
+        }
+    }
 
     /// A scheduler at 60 Hz, and the time it was made.
     fn scheduler() -> (Scheduler, Instant) {
@@ -382,7 +445,7 @@ mod tests {
         scheduler.want(Reason::Input);
         let much_later = start + INTERVAL * 10;
         assert_eq!(scheduler.next(much_later), Next::Render, "in flight");
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         assert!(
             matches!(scheduler.next(much_later), Next::Frame { .. }),
             "the input that came meanwhile gets its frame"
@@ -394,7 +457,7 @@ mod tests {
         let (mut scheduler, start) = scheduler();
         scheduler.want(Reason::Input);
         scheduler.started(start);
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         scheduler.want(Reason::Input);
         let soon = start + Duration::from_millis(5);
         assert_eq!(
@@ -420,7 +483,7 @@ mod tests {
             scheduler.want(Reason::Converging);
             assert!(matches!(scheduler.next(now), Next::Frame { .. }));
             scheduler.started(now);
-            scheduler.shown(Outcome::Presented);
+            scheduler.shown_on_gpu(Outcome::Presented);
             now += INTERVAL;
         }
         assert!(
@@ -434,7 +497,7 @@ mod tests {
         let (mut scheduler, start) = scheduler();
         scheduler.want(Reason::Exposed);
         scheduler.started(start);
-        scheduler.shown(Outcome::Retry);
+        scheduler.shown_on_gpu(Outcome::Retry);
         assert!(scheduler.wanted().contains(Reason::Exposed), "retried");
         assert!(matches!(
             scheduler.next(start + INTERVAL),
@@ -447,7 +510,7 @@ mod tests {
         let (mut scheduler, start) = scheduler();
         scheduler.want(Reason::Converging);
         scheduler.started(start);
-        scheduler.shown(Outcome::Hidden);
+        scheduler.shown_on_gpu(Outcome::Hidden);
         scheduler.want(Reason::Converging);
         assert_eq!(
             scheduler.next(start + INTERVAL),
@@ -467,7 +530,7 @@ mod tests {
         );
         let shown = start + UPKEEP_INTERVAL;
         scheduler.started(shown);
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         scheduler.want(Reason::Converging);
         assert_eq!(
             scheduler.next(shown),
@@ -498,7 +561,7 @@ mod tests {
         let later = start + Duration::from_secs(3);
         scheduler.want(Reason::Scripted);
         scheduler.started(later);
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         assert_eq!(
             scheduler.next(later),
             Next::Idle {
@@ -515,7 +578,7 @@ mod tests {
         assert_eq!(scheduler.interval(), slower);
         scheduler.want(Reason::Input);
         scheduler.started(start);
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         scheduler.want(Reason::Input);
         assert_eq!(
             scheduler.next(start + INTERVAL),
@@ -540,13 +603,15 @@ mod tests {
             match scheduler.next(now) {
                 Next::Frame { .. } => {
                     scheduler.started(now);
-                    scheduler.shown(Outcome::Presented);
+                    scheduler.shown_on_gpu(Outcome::Presented);
                     starts.push(now);
                     now += INTERVAL;
                 }
                 Next::Wait { until } => now = until,
                 Next::Idle { .. } => return starts,
-                Next::Render => unreachable!("every frame is shown at once"),
+                Next::Render | Next::Gpu => {
+                    unreachable!("every frame is shown and finished at once")
+                }
             }
         }
         panic!("frames never stopped");
@@ -558,7 +623,7 @@ mod tests {
         let mut scheduler = scheduler.with_morph(MORPH);
         scheduler.want(Reason::Input);
         scheduler.started(start);
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         // That frame's readback says its cut changed, heard as a later frame is made.
         scheduler.cut_changed(start);
         assert!(scheduler.wanted().contains(Reason::Morphing));
@@ -620,7 +685,7 @@ mod tests {
                     now - start
                 );
                 scheduler.started(now);
-                scheduler.shown(Outcome::Presented);
+                scheduler.shown_on_gpu(Outcome::Presented);
                 frames += 1;
                 now += INTERVAL;
             }
@@ -668,7 +733,7 @@ mod tests {
         let (mut scheduler, start) = scheduler();
         scheduler.want(Reason::Input);
         scheduler.started(start);
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         // The frame loop: that frame may have restarted the image.
         scheduler.accumulate(SAMPLES);
         assert!(scheduler.wanted().contains(Reason::Accumulating));
@@ -696,7 +761,7 @@ mod tests {
             assert!(matches!(scheduler.next(now), Next::Frame { .. }));
             let reasons = scheduler.started(now);
             assert!(reasons.contains(Reason::Input));
-            scheduler.shown(Outcome::Presented);
+            scheduler.shown_on_gpu(Outcome::Presented);
             scheduler.accumulate(1);
             now += INTERVAL;
         }
@@ -706,7 +771,7 @@ mod tests {
         );
         let reasons = scheduler.started(now);
         assert_eq!(reasons, Reasons::default().with(Reason::Accumulating));
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         // Its report says the image restarted: the rest of its samples.
         scheduler.accumulate(SAMPLES - 1);
         let rest = frames_from(&mut scheduler, now + INTERVAL, &[]);
@@ -720,7 +785,7 @@ mod tests {
         let later = *rest.last().expect("frames") + INTERVAL * 10;
         scheduler.want(Reason::Uploads);
         scheduler.started(later);
-        scheduler.shown(Outcome::Presented);
+        scheduler.shown_on_gpu(Outcome::Presented);
         scheduler.accumulate(2 * SAMPLES);
         scheduler.accumulate(SAMPLES);
         let after = frames_from(&mut scheduler, later + INTERVAL, &[]);
@@ -729,5 +794,317 @@ mod tests {
             usize::try_from(2 * SAMPLES).expect("small"),
             "asking for fewer changes nothing"
         );
+    }
+
+    /// The most frames the GPU may have unfinished.
+    const BOUND: u64 = render::FRAMES_IN_FLIGHT as u64;
+
+    /// A GPU that takes `per_frame` over each frame, one after another, with a readback ring.
+    ///
+    /// The ring is the renderer's (`render::lod`'s: one buffer more than the frames in flight). A
+    /// frame takes a buffer as it is submitted, or drops its readback; the buffer is mapped once
+    /// the GPU has finished the frame and a poll hears of it, and goes back to the ring once read,
+    /// at the start of the next frame (residency's `begin_frame`, which polls first).
+    #[derive(Debug)]
+    struct ModelGpu {
+        /// The GPU's time per frame.
+        per_frame: Duration,
+        /// Frames submitted and not finished as last polled: each with when it finishes.
+        queue: std::collections::VecDeque<(u64, Instant)>,
+        /// When the GPU is free of what it was given.
+        free_at: Option<Instant>,
+        /// The newest frame finished, as last polled.
+        finished: u64,
+        /// Readback buffers free.
+        buffers: usize,
+        /// Frames whose readback is mapped and not read.
+        mapped: Vec<u64>,
+        /// Frames whose readback was read, in order.
+        read: Vec<u64>,
+        /// Frames that found no buffer.
+        dropped: Vec<u64>,
+        /// The most frames it had unfinished as one was submitted, that one included.
+        most_in_flight: u64,
+    }
+
+    impl ModelGpu {
+        /// A GPU taking `per_frame` a frame, idle.
+        fn new(per_frame: Duration) -> Self {
+            Self {
+                per_frame,
+                queue: std::collections::VecDeque::new(),
+                free_at: None,
+                finished: 0,
+                buffers: render::FRAMES_IN_FLIGHT + 1,
+                mapped: Vec::new(),
+                read: Vec::new(),
+                dropped: Vec::new(),
+                most_in_flight: 0,
+            }
+        }
+
+        /// Hears at `now` of the frames finished by then (their readbacks mapped); returns the
+        /// newest finished.
+        fn poll(&mut self, now: Instant) -> u64 {
+            while let Some(&(frame, done)) = self.queue.front()
+                && done <= now
+            {
+                self.queue.pop_front();
+                self.finished = frame;
+                self.mapped.push(frame);
+            }
+            self.finished
+        }
+
+        /// The start of a frame at `now`: polls, then reads the mapped readbacks, freeing their
+        /// buffers; returns the newest finished.
+        fn begin_frame(&mut self, now: Instant) -> u64 {
+            let finished = self.poll(now);
+            self.buffers += self.mapped.len();
+            self.read.append(&mut self.mapped);
+            finished
+        }
+
+        /// Frame `frame` is submitted at `now`, its readback with it if a buffer is free.
+        fn submit(&mut self, frame: u64, now: Instant) {
+            if self.buffers == 0 {
+                self.dropped.push(frame);
+            } else {
+                self.buffers -= 1;
+            }
+            let start = self.free_at.map_or(now, |free| free.max(now));
+            let done = start + self.per_frame;
+            self.free_at = Some(done);
+            self.queue.push_back((frame, done));
+            self.most_in_flight = self.most_in_flight.max(self.queue.len() as u64);
+        }
+    }
+
+    /// Runs `scheduler` for `run` from `start` on `gpu`; returns when each frame started.
+    ///
+    /// Every frame is wanted (a scripted run), the render thread is instant, and the owner polls
+    /// the GPU every [`crate::frame::GPU_POLL`] while it is busy. At the end the GPU finishes and
+    /// what is left is read.
+    fn run_on(
+        scheduler: &mut Scheduler,
+        gpu: &mut ModelGpu,
+        start: Instant,
+        run: Duration,
+    ) -> Vec<Instant> {
+        let mut starts = Vec::new();
+        let mut now = start;
+        while now < start + run {
+            scheduler.want(Reason::Scripted);
+            match scheduler.next(now) {
+                Next::Frame { .. } => {
+                    scheduler.gpu_finished(gpu.begin_frame(now));
+                    scheduler.started(now);
+                    starts.push(now);
+                    gpu.submit(starts.len() as u64, now);
+                    scheduler.shown(Outcome::Presented);
+                }
+                Next::Wait { until } => now = until,
+                Next::Gpu => {
+                    now += crate::frame::GPU_POLL;
+                    scheduler.gpu_finished(gpu.poll(now));
+                }
+                Next::Render | Next::Idle { .. } => unreachable!("frames are wanted, and shown"),
+            }
+        }
+        gpu.begin_frame(now + Duration::from_secs(10));
+        starts
+    }
+
+    #[test]
+    fn a_gpu_slower_than_the_display_gets_frames_at_its_own_rate_and_drops_no_readback() {
+        let (mut scheduler, start) = scheduler();
+        // The M4 at 4K in the zoom and settle: 36–48 ms a frame.
+        let per_frame = Duration::from_millis(40);
+        let mut gpu = ModelGpu::new(per_frame);
+        let starts = run_on(&mut scheduler, &mut gpu, start, Duration::from_secs(2));
+        let made = starts.len() as u64;
+        assert!(
+            gpu.most_in_flight <= BOUND,
+            "never more than {BOUND} frames on the GPU: {}",
+            gpu.most_in_flight
+        );
+        assert_eq!(gpu.dropped, Vec::<u64>::new(), "every frame found a buffer");
+        let all: Vec<u64> = (1..=made).collect();
+        assert_eq!(gpu.read, all, "every frame's readback was read, in order");
+        let intervals: Vec<Duration> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+        let late = intervals.iter().skip(render::FRAMES_IN_FLIGHT);
+        assert!(
+            late.clone()
+                .all(|&i| i.abs_diff(per_frame) <= crate::frame::GPU_POLL),
+            "at the GPU's rate, each frame within a poll of the GPU finishing: {intervals:?}"
+        );
+        assert!((49..=51).contains(&made), "2 s at 40 ms: {made}");
+    }
+
+    #[test]
+    fn without_the_bound_the_same_gpu_falls_behind_and_readbacks_are_dropped() {
+        let (scheduler, start) = scheduler();
+        let mut scheduler = scheduler.with_gpu_bound(u64::MAX);
+        let mut gpu = ModelGpu::new(Duration::from_millis(40));
+        let starts = run_on(&mut scheduler, &mut gpu, start, Duration::from_secs(2));
+        assert_eq!(starts.len(), 120, "at the display's rate");
+        assert!(gpu.most_in_flight > 50, "a queue: {}", gpu.most_in_flight);
+        assert!(
+            gpu.dropped.len() > 60,
+            "most readbacks lost: {}",
+            gpu.dropped.len()
+        );
+    }
+
+    #[test]
+    fn a_gpu_keeping_up_never_makes_a_frame_wait_for_it() {
+        let (mut scheduler, start) = scheduler();
+        let mut gpu = ModelGpu::new(Duration::from_millis(5));
+        let mut now = start;
+        let mut frames = 0;
+        while frames < 60 {
+            scheduler.want(Reason::Scripted);
+            match scheduler.next(now) {
+                Next::Frame { .. } => {
+                    scheduler.gpu_finished(gpu.begin_frame(now));
+                    scheduler.started(now);
+                    frames += 1;
+                    gpu.submit(frames, now);
+                    scheduler.shown(Outcome::Presented);
+                }
+                Next::Wait { until } => now = until,
+                other @ (Next::Render | Next::Gpu | Next::Idle { .. }) => {
+                    panic!("only frames and the pace's waits: {other:?}")
+                }
+            }
+        }
+        assert_eq!(gpu.dropped, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn the_pace_is_waited_for_first_then_the_gpu() {
+        let (mut scheduler, start) = scheduler();
+        for frame in 0..BOUND {
+            scheduler.want(Reason::Input);
+            let at = start + INTERVAL * u32::try_from(frame).expect("small");
+            assert!(matches!(scheduler.next(at), Next::Frame { .. }));
+            scheduler.started(at);
+            scheduler.shown(Outcome::Presented);
+        }
+        assert!(scheduler.gpu_busy(), "{BOUND} frames unfinished");
+        scheduler.want(Reason::Input);
+        let last = start + INTERVAL * u32::try_from(BOUND - 1).expect("small");
+        assert_eq!(
+            scheduler.next(last + Duration::from_millis(1)),
+            Next::Wait {
+                until: last + INTERVAL
+            },
+            "not due yet: the pace's precise wait"
+        );
+        assert_eq!(
+            scheduler.next(last + INTERVAL),
+            Next::Gpu,
+            "due, the GPU busy"
+        );
+        scheduler.gpu_finished(1);
+        assert!(
+            matches!(scheduler.next(last + INTERVAL), Next::Frame { .. }),
+            "one finished: room for the next"
+        );
+    }
+
+    #[test]
+    fn a_busy_gpu_with_nothing_wanted_is_idle_and_polled_for_nothing() {
+        let (mut scheduler, start) = scheduler();
+        for frame in 0..BOUND {
+            scheduler.want(Reason::Input);
+            scheduler.started(start + INTERVAL * u32::try_from(frame).expect("small"));
+            scheduler.shown(Outcome::Presented);
+        }
+        assert!(scheduler.gpu_busy());
+        let later = start + Duration::from_secs(1);
+        assert!(
+            matches!(scheduler.next(later), Next::Idle { .. }),
+            "render on demand: no frame wanted, nothing to wait for"
+        );
+        scheduler.want(Reason::Converging);
+        assert_eq!(scheduler.next(later), Next::Gpu, "wanted now");
+    }
+
+    #[test]
+    fn the_render_thread_holding_a_frame_comes_before_the_gpu() {
+        let (mut scheduler, start) = scheduler();
+        scheduler.want(Reason::Input);
+        scheduler.started(start);
+        scheduler.want(Reason::Input);
+        assert_eq!(
+            scheduler.gpu_in_flight(),
+            1,
+            "the render thread's frame counts"
+        );
+        assert_eq!(scheduler.next(start + INTERVAL), Next::Render);
+    }
+
+    #[test]
+    fn finished_frames_only_move_forward_and_never_past_those_started() {
+        let (mut scheduler, start) = scheduler();
+        for frame in 0..3 {
+            scheduler.want(Reason::Input);
+            scheduler.started(start + INTERVAL * frame);
+            scheduler.shown(Outcome::Presented);
+            scheduler.gpu_finished(u64::from(frame) + 1);
+        }
+        scheduler.gpu_finished(1);
+        assert_eq!(
+            scheduler.gpu_in_flight(),
+            0,
+            "an older frame changes nothing"
+        );
+        scheduler.gpu_finished(99);
+        assert_eq!(scheduler.gpu_in_flight(), 0, "not past the frames started");
+        scheduler.want(Reason::Input);
+        scheduler.started(start + INTERVAL * 3);
+        assert_eq!(scheduler.gpu_in_flight(), 1, "the next frame counts");
+    }
+
+    #[test]
+    fn accumulation_and_a_morph_finish_at_the_gpus_rate() {
+        let (scheduler, start) = scheduler();
+        let mut scheduler = scheduler.with_morph(MORPH);
+        let mut gpu = ModelGpu::new(Duration::from_millis(40));
+        scheduler.want(Reason::Input);
+        scheduler.started(start);
+        gpu.submit(1, start);
+        scheduler.shown(Outcome::Presented);
+        scheduler.accumulate(SAMPLES);
+        scheduler.cut_changed(start);
+        let mut now = start + INTERVAL;
+        let mut starts = Vec::new();
+        loop {
+            match scheduler.next(now) {
+                Next::Frame { .. } => {
+                    scheduler.gpu_finished(gpu.begin_frame(now));
+                    scheduler.started(now);
+                    starts.push(now);
+                    gpu.submit(starts.len() as u64 + 1, now);
+                    scheduler.shown(Outcome::Presented);
+                }
+                Next::Wait { until } => now = until,
+                Next::Gpu => {
+                    now += crate::frame::GPU_POLL;
+                    scheduler.gpu_finished(gpu.poll(now));
+                }
+                Next::Idle { .. } => break,
+                Next::Render => unreachable!("shown at once"),
+            }
+        }
+        let last = *starts.last().expect("frames came");
+        assert!(last >= start + MORPH, "the morph is shown finished");
+        assert!(
+            starts.len() >= usize::try_from(SAMPLES).expect("small"),
+            "every sample drawn: {}",
+            starts.len()
+        );
+        assert_eq!(gpu.dropped, Vec::<u64>::new());
     }
 }

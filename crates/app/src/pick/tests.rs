@@ -285,11 +285,13 @@ fn settle(owner: &mut Owner<NoBrush, NoUploads>) -> u32 {
                     shown: false,
                     aa: render::aa::AaReport::default(),
                     gpu: Vec::new(),
+                    dropped: render::DroppedReadbacks::default(),
+                    gpu_finished: number,
                 });
                 made += 1;
             }
             Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
-            Next::Render | Next::Idle { .. } => break,
+            Next::Render | Next::Gpu | Next::Idle { .. } => break,
         }
     }
     made

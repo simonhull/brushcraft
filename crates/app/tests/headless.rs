@@ -239,6 +239,11 @@ mod tests {
         if !timed {
             assert_eq!(timing, "false", "not asked: {run}");
         }
+        assert_eq!(
+            field(run, "readbacks_dropped"),
+            "0",
+            "every frame found a readback buffer: {run}"
+        );
         let segments: Vec<&str> = lines[1..6].iter().map(|l| field(l, "segment")).collect();
         assert_eq!(
             segments,

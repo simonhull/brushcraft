@@ -24,6 +24,12 @@
 //! - `cpu_ms`: the frame's CPU time on its latency path: the owner thread's input, brush, feed and
 //!   uploads, then the render thread's encode and submit; and those phases, with the owner's upkeep
 //!   and jobs (after the hand-off) and the render thread's acquire and present, each `<phase>_ms`;
+//! - `gpu_wait_ms`: how long the frame waited, once due, for the GPU to finish an earlier one (the
+//!   frame loop keeps at most [`render::FRAMES_IN_FLIGHT`] unfinished): 0 while the GPU keeps up;
+//! - `cut_readback_dropped`, `request_readback_dropped`, `timing_readback_dropped`: whether the
+//!   frame made none of that readback for want of a free buffer (`null` before it is known). Each
+//!   ring holds more buffers than the frames in flight, so these stay false; the run line totals
+//!   them as `readbacks_dropped`, so a regression shows;
 //! - `gpu_ms`: the whole frame on the GPU, and each of its phases ([`GpuPhase`]) as
 //!   `gpu_<phase>_ms`, the sum of its passes (`null` for a phase the frame didn't run, or whose
 //!   timestamps the GPU didn't write);
@@ -40,10 +46,10 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
-use render::DrawTimes;
 use render::lod::{LodStats, LodTimings};
 use render::residency::ResidencyStats;
 use render::timing::{GpuPhase, GpuTimes};
+use render::{DrawTimes, DroppedReadbacks};
 
 use crate::frame::{CutHeard, OwnerPhases};
 use crate::script::{Script, Segment};
@@ -216,6 +222,8 @@ pub(crate) struct ResidencyCounts {
     pub(crate) uploaded_bytes: u64,
     /// Tiles the frame staged.
     pub(crate) uploaded_tiles: u64,
+    /// Whether the frame made no request readback for want of a free buffer.
+    pub(crate) request_readback_dropped: bool,
 }
 
 /// What a frame's cut readback said.
@@ -248,6 +256,8 @@ pub(crate) struct FrameRecord {
     pub(crate) render: Option<DrawTimes>,
     /// Its GPU times, once read back.
     pub(crate) gpu: Option<GpuTimes>,
+    /// The readbacks the render thread made none of for it, once shown.
+    pub(crate) dropped: Option<DroppedReadbacks>,
     /// Residency as it was staged.
     pub(crate) residency: Option<ResidencyCounts>,
     /// Its cut, once read back.
@@ -276,6 +286,7 @@ impl FrameRecord {
             .with("segment", self.segment.map(Segment::name))
             .with("moving", self.moving)
             .with("cpu_ms", self.cpu())
+            .with("gpu_wait_ms", owner_ms(owner.gpu_wait))
             .with("input_ms", owner_ms(owner.input))
             .with("brush_ms", owner_ms(owner.brush))
             .with("feed_ms", owner_ms(owner.feed))
@@ -299,8 +310,22 @@ impl FrameRecord {
             .with("lod_sweep_ms", stage(|s| s.sweep))
             .with("lod_emit_ms", stage(|s| s.emit))
             .with("lod_post_ms", stage(|s| s.post));
+        let dropped = self.dropped;
         self.scene_fields(stages_line)
             .residency_fields(self.residency)
+            .with("cut_readback_dropped", dropped.map(|d| d.cut > 0))
+            .with(
+                "request_readback_dropped",
+                self.residency.map(|c| c.request_readback_dropped),
+            )
+            .with("timing_readback_dropped", dropped.map(|d| d.timing > 0))
+    }
+
+    /// How many readbacks the frame made none of: cut, request and timing.
+    fn readbacks_dropped(&self) -> u64 {
+        let render = self.dropped.map_or(0, |d| d.cut + d.timing);
+        let requests = self.residency.is_some_and(|c| c.request_readback_dropped);
+        render + u64::from(requests)
     }
 
     /// `line` with the cut's fields.
@@ -375,6 +400,8 @@ pub(crate) struct Recorder {
     residency_frames: BTreeMap<u64, u64>,
     /// Residency's evictions ever, as the last frame was staged.
     evictions: u64,
+    /// Residency's request readbacks dropped ever, as the last frame was staged.
+    requests_dropped: u64,
 }
 
 impl Recorder {
@@ -414,6 +441,8 @@ impl Recorder {
         };
         let evicted = stats.evictions.saturating_sub(self.evictions);
         self.evictions = stats.evictions;
+        let requests_dropped = stats.request_readbacks_dropped > self.requests_dropped;
+        self.requests_dropped = stats.request_readbacks_dropped;
         if let Some(record) = self.frames.get_mut(&frame) {
             record.residency = Some(ResidencyCounts {
                 resident: stats.resident,
@@ -421,6 +450,7 @@ impl Recorder {
                 evicted,
                 uploaded_bytes: stats.staged_bytes,
                 uploaded_tiles: stats.staged_tiles,
+                request_readback_dropped: requests_dropped,
             });
         }
     }
@@ -437,6 +467,13 @@ impl Recorder {
         if let Some(record) = self.frames.get_mut(&frame) {
             record.render = Some(times);
             record.presented = Some(at);
+        }
+    }
+
+    /// Frame `frame`'s render thread made none of `dropped`'s readbacks.
+    pub(crate) fn dropped(&mut self, frame: u64, dropped: DroppedReadbacks) {
+        if let Some(record) = self.frames.get_mut(&frame) {
+            record.dropped = Some(dropped);
         }
     }
 
@@ -457,6 +494,11 @@ impl Recorder {
 
     /// The record's lines: the run's (`info`), each of `script`'s segments', then each frame's.
     pub(crate) fn lines(&self, info: &RunInfo, script: &Script) -> Vec<String> {
+        let dropped: u64 = self
+            .frames
+            .values()
+            .map(FrameRecord::readbacks_dropped)
+            .sum();
         let run = Line::new("run")
             .with("project", info.project.as_str())
             .with("adapter", info.adapter.as_str())
@@ -468,7 +510,8 @@ impl Recorder {
             .with("open_ms", info.open)
             .with("clock_unix_us", info.clock_unix.map(micros))
             .with("refresh_ms", info.refresh)
-            .with("frames", self.frames.len());
+            .with("frames", self.frames.len())
+            .with("readbacks_dropped", dropped);
         let segments = script.segments().into_iter().map(|(segment, start, end)| {
             Line::new("segment")
                 .with("segment", segment.name())

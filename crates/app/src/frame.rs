@@ -30,6 +30,13 @@
 //! change: one shading pass, independent of the mesh). Any other frame draws the scene whole, in
 //! the new look.
 //!
+//! **Never outrunning the GPU:** a frame starts only while the GPU has fewer than
+//! [`render::FRAMES_IN_FLIGHT`] frames unfinished ([`schedule`]). The owner never waits on the
+//! GPU: when a frame is due and the GPU is that far behind ([`Next::Gpu`]), the loop polls the
+//! device for finished frames ([`Owner::gpu_finished`]) and meanwhile runs the store's jobs and
+//! the upkeep ([`Owner::while_gpu_busy`]), sleeping only when there are none. The time a frame
+//! waited so is its `gpu_wait` ([`OwnerPhases::gpu_wait`]).
+//!
 //! Frames are made on demand: [`schedule::Scheduler`] decides when, from why they are wanted.
 //! A frame that leaves store jobs queued, uploads in flight, requests pending, or epochs in the
 //! feed it hasn't drained (closed by its jobs or upkeep) wants the next one, as does upkeep
@@ -144,8 +151,9 @@ pub(crate) struct UploadStatus {
     pub(crate) staged_frame: Option<u64>,
     /// Residency's counts as the frame was staged; `None` if there is no GPU residency.
     pub(crate) stats: Option<ResidencyStats>,
-    /// A cut readback heard this frame (of an earlier one), for a scripted run's record.
-    pub(crate) heard: Option<CutHeard>,
+    /// The cut readbacks heard this frame (of earlier ones), oldest first, for a scripted run's
+    /// record.
+    pub(crate) heard: Vec<CutHeard>,
 }
 
 /// A frame's cut, read back: what a scripted run's record keeps of it.
@@ -224,9 +232,18 @@ fn uploads_deadline(now: Instant, deadline: Instant) -> Instant {
     now + deadline.saturating_duration_since(now) / 2
 }
 
+/// How long the loop waits between polls of the device while the GPU is busy and there are no
+/// jobs to run ([`Next::Gpu`]): a frame starts at most about this late after the GPU finishes
+/// the one it waited for.
+pub(crate) const GPU_POLL: Duration = Duration::from_millis(1);
+
 /// How long one frame's phases took on the owner thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct OwnerPhases {
+    /// Waiting for the GPU to finish a frame before this one could start ([`Next::Gpu`]): from
+    /// when it was due to when it started, jobs run meanwhile included. Zero when the GPU kept
+    /// up.
+    pub(crate) gpu_wait: Duration,
     /// Applying the queued input.
     pub(crate) input: Duration,
     /// The brush step.
@@ -346,6 +363,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     log: Option<PhaseLog>,
     /// The view (camera and frame size) the last frame was made with; `None` before the first.
     last_view: Option<(Camera, Size)>,
+    /// Since when the next frame has waited for the GPU ([`Next::Gpu`]); `None` while it hasn't.
+    gpu_wait_from: Option<Instant>,
     /// The frame loop's clock: frames are stamped with their time since it.
     clock: Instant,
     /// How the scene is shown.
@@ -495,6 +514,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             after_hand_off: AfterHandOff::default(),
             log: scripted.then(PhaseLog::default),
             last_view: None,
+            gpu_wait_from: None,
             clock: now,
             look: Look::default(),
             scene_shown: false,
@@ -608,11 +628,59 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             || self.limit.is_some_and(|limit| self.started >= limit)
             || self.script_over;
         match next {
-            Next::Frame { .. } | Next::Wait { .. } if no_frames => Next::Idle {
+            Next::Frame { .. } | Next::Wait { .. } | Next::Gpu if no_frames => Next::Idle {
                 upkeep: self.scheduler.upkeep_due(),
             },
-            Next::Frame { .. } | Next::Wait { .. } | Next::Render | Next::Idle { .. } => next,
+            Next::Frame { .. }
+            | Next::Wait { .. }
+            | Next::Gpu
+            | Next::Render
+            | Next::Idle { .. } => next,
         }
+    }
+
+    /// The GPU has finished frame `frame` and every one before it: as the render thread's
+    /// completion count says ([`crate::render_thread::RenderThread::gpu_finished`]).
+    pub(crate) fn gpu_finished(&mut self, frame: u64) {
+        self.scheduler.gpu_finished(frame);
+    }
+
+    /// How long the frame starting at `now` waited for the GPU ([`OwnerPhases::gpu_wait`]); the
+    /// wait is over.
+    fn gpu_waited(&mut self, now: Instant) -> Duration {
+        self.gpu_wait_from
+            .take()
+            .map_or(Duration::ZERO, |from| now.saturating_duration_since(from))
+    }
+
+    /// What the loop does while a frame waits for the GPU ([`Next::Gpu`]), at `now`: the upkeep
+    /// if it is due, then the store's jobs until `until` (at least a slice), if there are any.
+    /// Returns whether it ran any jobs: if not, the loop has nothing to do but wait a little
+    /// ([`GPU_POLL`]) and poll again. The wait counts toward the next frame's
+    /// [`OwnerPhases::gpu_wait`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::tick`], [`Project::poll`] and the store's jobs.
+    pub(crate) fn while_gpu_busy(&mut self, now: Instant, until: Instant) -> Result<bool> {
+        self.gpu_wait_from.get_or_insert(now);
+        if now >= self.scheduler.upkeep_due() {
+            self.upkeep(now)?;
+        }
+        if !self.project.store().has_jobs() {
+            return Ok(false);
+        }
+        let report = self
+            .project
+            .store()
+            .run_jobs(until.max(Instant::now() + JobsReport::SLICE_TARGET))
+            .context("running the store's jobs")?;
+        self.after_hand_off.report = report;
+        // What the jobs closed is the next frame's: it is wanted already, waiting for the GPU.
+        if self.project.store().has_jobs() || self.has_stale() {
+            self.scheduler.want(Reason::Converging);
+        }
+        Ok(true)
     }
 
     /// Whether a scripted run has made all its frames (or run its script through) and the
@@ -647,6 +715,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let reasons = self.scheduler.started(now);
         self.started += 1;
         let mut phases = OwnerPhases {
+            gpu_wait: self.gpu_waited(now),
             upkeep: self.after_hand_off.upkeep,
             jobs: self.after_hand_off.jobs,
             ..OwnerPhases::default()
@@ -763,7 +832,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         };
         recorder.started(self.started, time, segment, moved);
         recorder.staged(self.started, uploads.staged_frame, uploads.stats.as_ref());
-        if let Some(cut) = uploads.heard.take() {
+        for cut in std::mem::take(&mut uploads.heard) {
             recorder.cut(cut);
         }
     }
@@ -887,10 +956,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if let Some(recorder) = &mut self.recorder {
             let at = Instant::now().saturating_duration_since(self.clock);
             recorder.shown(presented.number, presented.times, at);
+            recorder.dropped(presented.number, presented.dropped);
             for times in gpu {
                 recorder.gpu(times);
             }
         }
+        self.scheduler.gpu_finished(presented.gpu_finished);
         self.uploads.shown(presented.scene);
         if presented.aa.filtered_instead {
             self.accumulates = false;

@@ -5,7 +5,9 @@
 //! modifiers, as [`Input`]) and its window state (size, scale, exposure). After each batch of
 //! events, [`WindowApp::drive`] asks the [`Owner`](crate::frame::Owner) what to do next: make a
 //! frame and hand it to the render thread, wait until the next frame may start, wait for the render
-//! thread (which wakes the loop when it has presented), or sleep until an event or the next upkeep.
+//! thread (which wakes the loop when it has presented), wait for the GPU to finish a frame
+//! (polling it every [`GPU_POLL`], running the store's jobs meanwhile), or sleep until an event or
+//! the next upkeep.
 //! The pen navigates through winit's tablet events; `input`'s own pen backend is the brush's, in
 //! M1a4.
 
@@ -27,7 +29,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::camera::Pixel;
 use crate::cli::Options;
 use crate::frame::schedule::Next;
-use crate::frame::{LookChange, Setup};
+use crate::frame::{GPU_POLL, LookChange, Setup};
 use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::render_thread::{Hooks, RenderThread};
@@ -191,6 +193,22 @@ impl WindowApp {
                 },
                 Next::Render => {
                     event_loop.set_control_flow(ControlFlow::Wait);
+                    return Ok(());
+                }
+                Next::Gpu => {
+                    running.owner.gpu_finished(running.render.gpu_finished()?);
+                    if !matches!(running.owner.next(now), Next::Gpu) {
+                        continue;
+                    }
+                    // Still busy: a slice of jobs, then back to the event loop for its events;
+                    // with none, poll again shortly.
+                    let worked = running.owner.while_gpu_busy(now, now + GPU_POLL)?;
+                    let flow = if worked {
+                        ControlFlow::Poll
+                    } else {
+                        ControlFlow::WaitUntil(now + GPU_POLL)
+                    };
+                    event_loop.set_control_flow(flow);
                     return Ok(());
                 }
                 Next::Idle { upkeep } if now < upkeep => {

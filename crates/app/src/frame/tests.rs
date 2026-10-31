@@ -16,7 +16,7 @@ use render::material::MatCapStyle;
 use render::raster::{BACKGROUND, VisibilityId};
 use render::surface::{Offscreen, Target};
 use render::tree::Place;
-use render::{Outcome, Renderer};
+use render::{DroppedReadbacks, Outcome, Renderer};
 use store::{Epoch, ProjectConfig, StoreConfig};
 
 use super::*;
@@ -63,7 +63,8 @@ fn setup(frames: Option<u64>) -> Setup {
     }
 }
 
-/// The render thread's report of frame `number`, shown, with no scene drawn.
+/// The render thread's report of frame `number`, shown, with no scene drawn, and finished on the
+/// GPU at once.
 const fn presented(number: u64) -> Presented {
     Presented {
         number,
@@ -80,6 +81,8 @@ const fn presented(number: u64) -> Presented {
             filtered_instead: false,
         },
         gpu: Vec::new(),
+        dropped: DroppedReadbacks { cut: 0, timing: 0 },
+        gpu_finished: number,
     }
 }
 
@@ -110,7 +113,7 @@ fn run<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, most: u64) -> u64 {
                 made += 1;
             }
             Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
-            Next::Render => panic!("the frame was shown"),
+            Next::Render | Next::Gpu => panic!("the frame was shown and finished"),
             Next::Idle { .. } => break,
         }
     }
@@ -584,7 +587,7 @@ fn run_on_gpu(gpu: &Gpu, owner: &mut Owner<NoBrush, GpuResidency>, most: u64) ->
                 made += 1;
             }
             Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
-            Next::Render => panic!("the frame was shown"),
+            Next::Render | Next::Gpu => panic!("the frame was shown and finished"),
             Next::Idle { .. } => break,
         }
     }
@@ -743,14 +746,17 @@ impl Screen {
     }
 
     /// Draws `request` as the render thread would, and waits for the GPU, so its readbacks are
-    /// in by the next frame.
+    /// in by the next frame and it is reported finished.
     fn draw(&mut self, gpu: &Gpu, request: FrameRequest) -> Presented {
         let presented = draw_frame(&mut self.renderer, gpu, &mut self.target, request, || {})
             .expect("the frame is drawn");
         gpu.device()
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("the GPU finishes");
-        presented
+        Presented {
+            gpu_finished: presented.number,
+            ..presented
+        }
     }
 
     /// The frame's pixels, as the last frame left them.
@@ -814,7 +820,7 @@ fn the_app_draws_the_surface_through_residency_and_hears_its_cuts() {
                 most_requested = most_requested.max(requested);
             }
             Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
-            Next::Render => panic!("every frame was shown"),
+            Next::Render | Next::Gpu => panic!("every frame was shown and finished"),
             // Nothing converging: frames stopped by themselves.
             Next::Idle { .. } => break,
         }
@@ -955,7 +961,7 @@ fn settle(gpu: &Gpu, owner: &mut Owner<NoBrush, GpuResidency>, screen: &mut Scre
                 made += 1;
             }
             Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
-            Next::Render => panic!("every frame was shown"),
+            Next::Render | Next::Gpu => panic!("every frame was shown and finished"),
             Next::Idle { .. } => break,
         }
     }
@@ -1320,4 +1326,84 @@ fn eviction_under_a_tiny_budget_keeps_the_cut_read_back_and_its_ancestors() {
     );
     assert!(deepest > 6, "cuts reached past the floor: level {deepest}");
     owner.close().expect("closed");
+}
+
+/// `field`'s value in the record line `line`, as written.
+fn record_field<'a>(line: &'a str, field: &str) -> &'a str {
+    let key = format!("\"{field}\":");
+    let (_, rest) = line
+        .split_once(&key)
+        .unwrap_or_else(|| panic!("no {field} in {line}"));
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The real loop on lavapipe, its display far faster than lavapipe draws (2000 Hz).
+///
+/// The completions the render thread asks the queue for reach the owner as it polls (else the
+/// loop would wait for the GPU forever after two frames), every frame's cut and GPU times are
+/// read back, and none is dropped.
+///
+/// Lavapipe can't show the GPU falling behind: its submission waits for the work before it, so
+/// it never has more than a frame or so unfinished. The model in `schedule`'s tests shows the
+/// bound holding against a GPU that queues.
+#[test]
+fn a_display_faster_than_the_gpu_gets_every_frame_read_back() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut project = project(&dir);
+    while project.store().has_jobs() {
+        project
+            .store()
+            .run_jobs(Instant::now() + Duration::from_secs(1))
+            .expect("the display layer builds");
+    }
+    let size = setup(None).size.expect("a size");
+    let target = Target::Offscreen(Offscreen::new(&gpu, size).expect("a target"));
+    let hooks = crate::render_thread::Hooks::none();
+    let mut render =
+        crate::render_thread::RenderThread::spawn(Arc::clone(&gpu), target, hooks, true)
+            .expect("the render thread");
+    let mut residency = GpuResidency::new(Arc::clone(&gpu), project.store()).expect("residency");
+    let lod_timing = residency.enable_timing().expect("the level choice's timer");
+    let opening = Instant::now();
+    let speed: crate::script::Speed = "16".parse().expect("a speed");
+    let setup = Setup {
+        interval: Duration::from_micros(500),
+        script: Some(Script::benchmark(speed)),
+        record: Some(RecordSetup {
+            project: "test".to_owned(),
+            gpu_timing: render.timing(),
+            lod_timing,
+            opening,
+        }),
+        ..setup(None)
+    };
+    let mut owner = Owner::new(project, NoBrush, residency, setup, Instant::now());
+    crate::drive_offscreen(&mut owner, &mut render).expect("the run");
+    render.stop().expect("stopped cleanly");
+    let lines = owner.record_lines();
+    owner.close().expect("closed");
+    let run = &lines[0];
+    assert_eq!(record_field(run, "readbacks_dropped"), "0", "{run}");
+    let frames = lines.get(6..).expect("frame lines");
+    assert!(frames.len() > 20, "frames along the path: {}", frames.len());
+    // The last frames' readbacks may still be on their way as the run ends; none before them.
+    let settled = frames.len() - render::FRAMES_IN_FLIGHT;
+    for frame in frames.get(..settled).expect("frames") {
+        assert_eq!(
+            record_field(frame, "drawn"),
+            "true",
+            "its cut came back: {frame}"
+        );
+        assert_ne!(
+            record_field(frame, "gpu_ms"),
+            "null",
+            "its times came back: {frame}"
+        );
+        for readback in ["cut", "request", "timing"] {
+            let name = format!("{readback}_readback_dropped");
+            assert_eq!(record_field(frame, &name), "false", "{frame}");
+        }
+    }
 }

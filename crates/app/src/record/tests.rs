@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 50] = [
+const FRAME_FIELDS: [&str; 54] = [
     "bench",
     "result",
     "frame",
@@ -14,6 +14,7 @@ const FRAME_FIELDS: [&str; 50] = [
     "segment",
     "moving",
     "cpu_ms",
+    "gpu_wait_ms",
     "input_ms",
     "brush_ms",
     "feed_ms",
@@ -56,6 +57,9 @@ const FRAME_FIELDS: [&str; 50] = [
     "evicted",
     "uploaded_bytes",
     "uploaded_tiles",
+    "cut_readback_dropped",
+    "request_readback_dropped",
+    "timing_readback_dropped",
 ];
 
 /// The names of `line`'s fields, in order.
@@ -99,7 +103,11 @@ fn a_frame_line_names_every_field_and_nulls_what_never_came() {
     for name in [
         "presented_ms",
         "cpu_ms",
+        "gpu_wait_ms",
         "gpu_ms",
+        "cut_readback_dropped",
+        "request_readback_dropped",
+        "timing_readback_dropped",
         "lod_post_ms",
         "over_budget",
         "wanted",
@@ -230,6 +238,63 @@ fn a_run_writes_its_setting_its_segments_then_its_frames() {
         r#"{"bench":"render","result":"segment","segment":"orbit","start_ms":3000,"end_ms":11000}"#
     );
     assert!(lines[6].contains(r#""frame":1,"#) && lines[7].contains(r#""frame":2,"#));
+    assert!(
+        lines[0].contains(r#""readbacks_dropped":0"#),
+        "{}",
+        lines[0]
+    );
+}
+
+#[test]
+fn dropped_readbacks_are_marked_on_their_frame_and_totalled_on_the_run_line() {
+    let mut recorder = Recorder::default();
+    for frame in 1..=3 {
+        recorder.started(frame, ms(frame * 16), Some(Segment::Zoom), true);
+    }
+    // Residency's request readbacks dropped ever: none, then one as frame 2 was staged.
+    let dropping = |dropped| ResidencyStats {
+        request_readbacks_dropped: dropped,
+        ..stats(0)
+    };
+    recorder.staged(1, Some(1), Some(&dropping(0)));
+    recorder.staged(2, Some(2), Some(&dropping(1)));
+    recorder.staged(3, Some(3), Some(&dropping(1)));
+    recorder.dropped(1, DroppedReadbacks::default());
+    recorder.dropped(2, DroppedReadbacks { cut: 1, timing: 0 });
+    recorder.dropped(3, DroppedReadbacks { cut: 1, timing: 1 });
+    let flags = |frame| {
+        let line = recorder.frames[&frame].line();
+        [
+            "cut_readback_dropped",
+            "request_readback_dropped",
+            "timing_readback_dropped",
+        ]
+        .map(|name| value(&line, name).clone())
+    };
+    let (yes, no) = (Value::Bool(true), Value::Bool(false));
+    assert_eq!(flags(1), [no.clone(), no.clone(), no.clone()]);
+    assert_eq!(flags(2), [yes.clone(), yes.clone(), no.clone()]);
+    assert_eq!(
+        flags(3),
+        [yes.clone(), no, yes],
+        "this frame's request readback, not every one ever"
+    );
+    let info = RunInfo {
+        project: "p".to_owned(),
+        adapter: "a".to_owned(),
+        size: (8, 8),
+        gpu_timing: true,
+        lod_timing: true,
+        open: ms(0),
+        clock_unix: None,
+        refresh: ms(16),
+    };
+    let lines = recorder.lines(&info, &Script::benchmark(Speed::ONE));
+    assert!(
+        lines[0].contains(r#""readbacks_dropped":4"#),
+        "{}",
+        lines[0]
+    );
 }
 
 #[test]

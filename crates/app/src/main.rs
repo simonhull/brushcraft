@@ -244,11 +244,13 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
 /// Runs the frame loop with no event loop until the scripted frames are done.
 ///
 /// Where a window would wait for events it waits for the next frame precisely ([`pace`]), and
-/// for the upkeep by a plain sleep; it waits on the render thread directly.
+/// for the upkeep by a plain sleep; it waits on the render thread directly (which only encodes
+/// and submits). It never waits on the GPU: while the GPU is too far behind for the next frame
+/// it polls the device every [`frame::GPU_POLL`], running the store's jobs meanwhile.
 ///
 /// # Errors
 ///
-/// If a frame, the upkeep or the render thread fails.
+/// If a frame, the upkeep, the store's jobs or the render thread fails, or the device is lost.
 fn drive_offscreen(owner: &mut AppOwner, render: &mut RenderThread) -> Result<()> {
     let mut pacer = Pacer::default();
     while !owner.done() {
@@ -256,6 +258,13 @@ fn drive_offscreen(owner: &mut AppOwner, render: &mut RenderThread) -> Result<()
         match owner.next(now) {
             Next::Frame { deadline } => owner.frame(now, deadline, |frame| render.send(frame))?,
             Next::Render => owner.shown(render.wait()?),
+            Next::Gpu => {
+                owner.gpu_finished(render.gpu_finished()?);
+                let still = matches!(owner.next(now), Next::Gpu);
+                if still && !owner.while_gpu_busy(now, now + frame::GPU_POLL)? {
+                    std::thread::sleep(frame::GPU_POLL);
+                }
+            }
             Next::Wait { until } => drop(pacer.wait_until(&mut SystemTimer, until)),
             Next::Idle { upkeep } => {
                 std::thread::sleep(upkeep.saturating_duration_since(now));

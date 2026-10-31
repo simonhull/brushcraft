@@ -281,15 +281,16 @@ impl GpuResidency {
             self.requested = requested;
         }
         let mut cut_changed = None;
-        let cut = self
+        // Oldest first: each is the frame's use in turn, as if heard of one at a time.
+        let cuts = self
             .reader
-            .collect(residency.finest())
+            .collect_all(residency.finest())
             .context("reading the level choice's cut back")?;
-        let heard_cut = cut.as_ref().map(heard_of);
-        if let Some(output) = cut {
+        let heard_cuts: Vec<CutHeard> = cuts.iter().map(heard_of).collect();
+        for output in cuts {
             if residency.cut() != &output.cut {
                 let still = self.times.get(&output.frame).filter(|stamp| !stamp.moving);
-                cut_changed = still.map(|stamp| stamp.time);
+                cut_changed = still.map(|stamp| stamp.time).or(cut_changed);
             }
             // Frames up to this one have nothing more to hear.
             self.times = self.times.split_off(&(output.frame + 1));
@@ -322,7 +323,7 @@ impl GpuResidency {
             scene,
             cut_changed,
             frame,
-            heard: heard_cut,
+            heard: heard_cuts,
         })
     }
 
@@ -377,8 +378,8 @@ struct Staged {
     cut_changed: Option<Duration>,
     /// Residency's number for the frame.
     frame: u64,
-    /// The cut heard this frame, if one was.
-    heard: Option<CutHeard>,
+    /// The cuts heard this frame, oldest first.
+    heard: Vec<CutHeard>,
 }
 
 impl Uploads for GpuResidency {

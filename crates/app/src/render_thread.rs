@@ -8,8 +8,16 @@
 //! passes come with the first frame ([`FrameRequest::passes`]) and stay here. Dropping the
 //! sender ends the thread, which hands the target back. The thread wakes the owner as it ends,
 //! however it ends (a panic included), so the owner always learns of it.
+//!
+//! **When the GPU finishes a frame:** after drawing each frame the thread asks the queue to say
+//! when the work submitted so far is done (`Queue::on_submitted_work_done`), and the callback
+//! records the frame's number as finished. Callbacks run in whichever thread polls the device next:
+//! the owner, through [`RenderThread::gpu_finished`] while it waits for the GPU, or at the start
+//! of its next frame. Nothing waits on the GPU for it, so the owner can keep at most
+//! [`render::FRAMES_IN_FLIGHT`] frames unfinished on the GPU without ever blocking.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,8 +32,8 @@ use render::raster::{FramePasses, SceneInputs};
 use render::surface::{Presentation, Size, Target};
 use render::timing::GpuTimes;
 use render::upload::FrameUploads;
-use render::{DrawTimes, FrameInputs, Look, Outcome, Renderer, Scene};
-use wgpu::{Buffer, Color};
+use render::{DrawTimes, DroppedReadbacks, FrameInputs, Look, Outcome, Renderer, Scene};
+use wgpu::{Buffer, Color, PollType};
 
 use crate::overlay::TextLayout;
 
@@ -141,6 +149,12 @@ pub(crate) struct Presented {
     /// The GPU times of earlier frames read back by now, each naming its frame
     /// ([`Renderer::take_timings`]); empty unless the thread times the GPU.
     pub(crate) gpu: Vec<GpuTimes>,
+    /// The readbacks this frame made none of for want of a free buffer: none while the GPU is
+    /// kept within [`render::FRAMES_IN_FLIGHT`] frames.
+    pub(crate) dropped: DroppedReadbacks,
+    /// The newest frame the GPU had finished as this one was reported (every one before it
+    /// too); 0 for none.
+    pub(crate) gpu_finished: u64,
 }
 
 /// A hook the render thread calls.
@@ -208,6 +222,10 @@ pub(crate) struct RenderThread {
     presentation: Presentation,
     /// Whether it times each frame's phases on the GPU.
     timing: bool,
+    /// The GPU, polled for finished frames.
+    gpu: Arc<Gpu>,
+    /// The newest frame the GPU has finished, as its completion callbacks say.
+    finished: Arc<AtomicU64>,
 }
 
 impl RenderThread {
@@ -235,10 +253,13 @@ impl RenderThread {
             #[cfg(test)]
             before_draw,
         } = hooks;
+        let finished = Arc::new(AtomicU64::new(0));
+        let polled = Arc::clone(&gpu);
         let mut thread = Drawing {
             gpu,
             target,
             renderer,
+            finished: Arc::clone(&finished),
             #[cfg(test)]
             before_draw,
         };
@@ -261,7 +282,27 @@ impl RenderThread {
             handle: Some(handle),
             presentation,
             timing,
+            gpu: polled,
+            finished,
         })
+    }
+
+    /// The newest frame the GPU has finished (every one before it too; 0 for none), polling
+    /// the device first without waiting, so the callbacks of frames finished since run now.
+    ///
+    /// Call it only while the thread holds no frame (between a frame's [`Presented`] and the
+    /// next [`RenderThread::send`]): every readback of the frames it has drawn is mapped by
+    /// then, so a poll never falls between two maps of one frame and hears of one alone.
+    ///
+    /// # Errors
+    ///
+    /// If polling the device fails (the device was lost).
+    pub(crate) fn gpu_finished(&self) -> Result<u64> {
+        self.gpu
+            .device()
+            .poll(PollType::Poll)
+            .context("polling the GPU for finished frames")?;
+        Ok(self.finished.load(Ordering::Acquire))
     }
 
     /// How the target presents.
@@ -377,6 +418,8 @@ struct Drawing {
     target: Target,
     /// The frame's passes.
     renderer: Renderer,
+    /// The newest frame the GPU has finished: each frame drawn asks the queue to set it.
+    finished: Arc<AtomicU64>,
     /// Test hook: called with each frame before it is drawn.
     #[cfg(test)]
     before_draw: Box<dyn Fn(&FrameRequest) + Send>,
@@ -408,13 +451,21 @@ impl Drawing {
         while let Ok(frame) = frames.recv() {
             #[cfg(test)]
             (self.before_draw)(&frame);
-            let report = draw_frame(
+            let mut report = draw_frame(
                 &mut self.renderer,
                 &self.gpu,
                 &mut self.target,
                 frame,
                 pre_present,
             )?;
+            // Once the GPU has done what this frame submitted (and all before it; a frame that
+            // submitted nothing is done with the one before), it is finished.
+            let finished = Arc::clone(&self.finished);
+            let number = report.number;
+            self.gpu.queue().on_submitted_work_done(move || {
+                finished.fetch_max(number, Ordering::AcqRel);
+            });
+            report.gpu_finished = self.finished.load(Ordering::Acquire);
             if presented.send(report).is_err() {
                 // The owner has stopped listening; it will hang up next.
                 break;
@@ -460,6 +511,7 @@ pub(crate) fn draw_frame(
         frame: frame.number,
     };
     let uploads = frame.uploads.take();
+    let dropped_before = renderer.dropped_readbacks();
     let drawn = renderer
         .draw(gpu, target, &inputs, uploads, pre_present)
         .with_context(|| format!("drawing frame {}", frame.number))?;
@@ -471,6 +523,8 @@ pub(crate) fn draw_frame(
         shown: drawn.shown,
         aa: drawn.aa,
         gpu: renderer.take_timings(),
+        dropped: renderer.dropped_readbacks().since(dropped_before),
+        gpu_finished: 0,
     })
 }
 
