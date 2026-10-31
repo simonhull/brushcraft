@@ -555,19 +555,19 @@ impl WorkDir {
 
     /// A copy of the project `source` as project `name` (see [`WorkDir::project`]): a reflink
     /// where the file system shares extents (no data copied, so a 1.7 GB project costs nothing),
-    /// else a plain copy. It reads `source`'s open handle from its start, whatever its name now
-    /// points at.
+    /// else a plain copy ([`reflink`]). It reads `source`'s open handle from its start, whatever
+    /// its name now points at.
     ///
     /// # Errors
     ///
     /// If the source can't be read or the copy written.
     pub(crate) fn copy(&self, source: &Source, name: &str) -> Result<(PathBuf, Copied)> {
         let target = self.project(name)?;
-        let mut to =
-            File::create(&target).with_context(|| format!("creating {}", target.display()))?;
-        if rustix::fs::ioctl_ficlone(&to, &source.file).is_ok() {
+        if reflink(&source.file, &target) {
             return Ok((target, Copied::Reflinked));
         }
+        let mut to =
+            File::create(&target).with_context(|| format!("creating {}", target.display()))?;
         let mut from = &source.file;
         from.seek(SeekFrom::Start(0))
             .and_then(|_| std::io::copy(&mut from, &mut to))
@@ -582,6 +582,32 @@ impl WorkDir {
     pub(crate) fn path(&self) -> &Path {
         &self.dir
     }
+}
+
+/// Makes `target` a reflink of `source`, sharing its extents; whether it could.
+///
+/// On Linux it creates `target` and clones into it (`FICLONE`: Btrfs, XFS, bcachefs).
+#[cfg(target_os = "linux")]
+fn reflink(source: &File, target: &Path) -> bool {
+    File::create(target).is_ok_and(|to| rustix::fs::ioctl_ficlone(&to, source).is_ok())
+}
+
+/// Makes `target` a reflink of `source`, sharing its extents; whether it could.
+///
+/// On macOS it is `fclonefileat` (APFS), which makes `target` itself and refuses one that
+/// exists, so any file there is removed first.
+#[cfg(target_vendor = "apple")]
+fn reflink(source: &File, target: &Path) -> bool {
+    // A file left there would refuse the clone; one that can't be removed refuses it anyway.
+    drop(std::fs::remove_file(target));
+    let flags = rustix::fs::CloneFlags::empty();
+    rustix::fs::fclonefileat(source, rustix::fs::CWD, target, flags).is_ok()
+}
+
+/// No reflinks on this system: always a plain copy.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn reflink(_source: &File, _target: &Path) -> bool {
+    false
 }
 
 impl Drop for WorkDir {

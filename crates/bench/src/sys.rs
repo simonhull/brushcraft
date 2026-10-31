@@ -1,6 +1,8 @@
 //! What the harness asks of the operating system: the process's resident memory and page
-//! faults, and dropping a file's pages from the page cache. Linux only for now (macOS comes with
-//! the `kit` runs).
+//! faults, and dropping a file's pages from the page cache.
+//!
+//! Linux in full. Elsewhere it builds, but the memory and faults come from `/proc`, so reading
+//! them fails, and a file's pages aren't dropped ([`drop_page_cache`] says so).
 
 use std::fs::File;
 use std::path::Path;
@@ -10,7 +12,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
-use rustix::fs::{Advice, fadvise};
 
 /// The process's resident memory, from `/proc/self/status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,19 +113,63 @@ pub(crate) fn reset_peak() -> Result<()> {
     std::fs::write("/proc/self/clear_refs", "5").context("resetting VmHWM in /proc/self/clear_refs")
 }
 
-/// Drops `path`'s pages from the page cache (`posix_fadvise(DONTNEED)` over the whole file),
-/// so the next reads of it come from the disk: a cold read.
+/// Whether [`drop_page_cache`] dropped a file's pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheDrop {
+    /// Dropped: the next reads come from the disk.
+    #[cfg_attr(
+        not(any(target_os = "linux", test)),
+        expect(dead_code, reason = "only Linux can drop a file's pages")
+    )]
+    Dropped,
+    /// Not dropped, on a system with no way to: the next reads may come from the cache, so a
+    /// "cold" measurement is not guaranteed cold.
+    NotGuaranteed,
+}
+
+/// Drops `path`'s pages from the page cache, so the next reads of it come from the disk: a cold
+/// read.
 ///
-/// The kernel drops only clean pages; the harness calls it on files it has finished writing.
+/// On Linux it is `posix_fadvise(DONTNEED)` over the whole file; the kernel drops only clean
+/// pages, and the harness calls it on files it has finished writing.
+///
+/// Elsewhere nothing is dropped ([`CacheDrop::NotGuaranteed`]). macOS has no call that evicts
+/// a file's cached pages short of `purge` (all of them, as root) or `msync(MS_INVALIDATE)` over
+/// a mapping (`unsafe` here). `fcntl(F_NOCACHE)` only stops caching what is read through the
+/// descriptor that sets it, and `F_GLOBAL_NOCACHE` changes how the file is read afterwards
+/// rather than emptying the cache, so neither makes the store's next read cold.
 ///
 /// # Errors
 ///
 /// If the file can't be opened or the advice is refused.
-pub(crate) fn drop_page_cache(path: &Path) -> Result<()> {
+pub(crate) fn drop_page_cache(path: &Path) -> Result<CacheDrop> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    fadvise(&file, 0, None, Advice::DontNeed)
-        .with_context(|| format!("dropping {}'s pages", path.display()))?;
-    Ok(())
+    drop_pages(&file).with_context(|| format!("dropping {}'s pages", path.display()))
+}
+
+/// Drops `file`'s pages from the page cache: `posix_fadvise(DONTNEED)`.
+///
+/// # Errors
+///
+/// If the advice is refused.
+#[cfg(target_os = "linux")]
+fn drop_pages(file: &File) -> rustix::io::Result<CacheDrop> {
+    rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::DontNeed)?;
+    Ok(CacheDrop::Dropped)
+}
+
+/// Can't drop `file`'s pages on this system ([`drop_page_cache`]).
+///
+/// # Errors
+///
+/// Never: an `Ok` the Linux version's signature asks for.
+#[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as Linux's, which can fail"
+)]
+fn drop_pages(_file: &File) -> rustix::io::Result<CacheDrop> {
+    Ok(CacheDrop::NotGuaranteed)
 }
 
 /// Samples the process's resident memory on a thread of its own, every [`RssSampler::EVERY`],
@@ -253,7 +298,13 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("brushcraft-bench-fadvise-{}", std::process::id()));
         std::fs::write(&path, vec![7_u8; 1 << 16]).unwrap();
-        drop_page_cache(&path).unwrap();
+        let dropped = drop_page_cache(&path).unwrap();
+        let wanted = if cfg!(target_os = "linux") {
+            CacheDrop::Dropped
+        } else {
+            CacheDrop::NotGuaranteed
+        };
+        assert_eq!(dropped, wanted);
         assert_eq!(
             std::fs::read(&path).unwrap().len(),
             1 << 16,

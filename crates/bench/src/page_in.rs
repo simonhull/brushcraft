@@ -10,7 +10,8 @@
 //! the tiles nearest it, empties the store, and times one [`store::TileStore::pin`] of them:
 //! every tile evaluated coarse to fine from its corrections, and pinned with them. Cold-file
 //! samples first drop the file's pages with `posix_fadvise(DONTNEED)`; each warm-file sample
-//! repeats its cold-file sample's region right after.
+//! repeats its cold-file sample's region right after. Where the pages can't be dropped (macOS),
+//! the record says `"cold_cache": "not guaranteed"` and the line says so too.
 //!
 //! How the store is emptied is the pool state measured (`--pool`, see [`Pool`]):
 //!
@@ -44,7 +45,7 @@ use crate::paths::Paths;
 use crate::report::{Output, Record, Spread, mib};
 use crate::session;
 use crate::surface::{nearest_tiles, tile_directions};
-use crate::sys::{drop_page_cache, minor_faults};
+use crate::sys::{CacheDrop, drop_page_cache, minor_faults};
 
 /// Empties the store, every tile evicted (none is dirty here), leaving its pool in the state
 /// `pool` names: chunks given back for [`Pool::Cold`], kept mapped for [`Pool::Warm`].
@@ -103,6 +104,8 @@ struct Samples {
     warmed_bytes: Option<usize>,
     /// Bytes the pool held after the last sample.
     final_bytes: usize,
+    /// Whether every cold-file sample found the file's pages dropped; `None` with no sample.
+    cold_cache: Option<CacheDrop>,
 }
 
 /// Measures a cold-file and a warm-file pin of each of `regions` (each a sample's tiles), with
@@ -128,7 +131,10 @@ fn measure(
     }
     for keys in regions {
         empty(store, pool)?;
-        drop_page_cache(&paths.project)?;
+        let dropped = drop_page_cache(&paths.project)?;
+        if samples.cold_cache != Some(CacheDrop::NotGuaranteed) {
+            samples.cold_cache = Some(dropped);
+        }
         samples.cold_file.push(time_pin(store, keys)?);
         empty(store, pool)?;
         samples.warm_file.push(time_pin(store, keys)?);
@@ -223,6 +229,10 @@ pub(crate) fn run<J: Write, H: Write>(
                     " grew {:.0} MiB after warming;",
                     mib(u64::try_from(growth)?)
                 )?;
+            }
+            if samples.cold_cache == Some(CacheDrop::NotGuaranteed) {
+                record = record.with("cold_cache", "not guaranteed");
+                line.push_str(" cold cache not guaranteed;");
             }
             record = add_samples(record, &mut line, "cold", &samples.cold_file)?;
             record = add_samples(record, &mut line, "warm", &samples.warm_file)?;

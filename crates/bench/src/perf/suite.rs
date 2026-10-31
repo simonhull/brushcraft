@@ -81,11 +81,24 @@ impl StageProfile {
 /// # Errors
 ///
 /// If the mask can't be read.
+#[cfg(target_os = "linux")]
 fn allowed_cpus() -> Result<Vec<usize>> {
     let mask = rustix::thread::sched_getaffinity(None).context("reading the affinity mask")?;
     Ok((0..rustix::thread::CpuSet::MAX_CPU)
         .filter(|&cpu| mask.is_set(cpu))
         .collect())
+}
+
+/// The CPUs this process may run on, ascending: on a system with no affinity mask to read
+/// (macOS), the first [`std::thread::available_parallelism`] of them.
+///
+/// # Errors
+///
+/// If the parallelism can't be read.
+#[cfg(not(target_os = "linux"))]
+fn allowed_cpus() -> Result<Vec<usize>> {
+    let cpus = std::thread::available_parallelism().context("reading the CPU count")?;
+    Ok((0..cpus.get()).collect())
 }
 
 impl Runner {
