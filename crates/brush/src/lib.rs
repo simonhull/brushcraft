@@ -9,13 +9,17 @@
 //! [`Falloff`], so each built-in brush is monomorphised into straight-line code.
 //!
 //! M0 has one brush, [`draw`](fn@draw), with a [`Smoothstep`] falloff: enough to measure edit
-//! latency. [`draw_vertex`] is its step for one vertex.
+//! latency. [`draw_vertex`] is its step for one vertex. A placed dab reaches an action as an
+//! [`Imprint`]: [`draw_imprint`] and [`draw_imprint_vertex`] are the draw brush for one, its
+//! falloff [`Hardened`] by the dab's hardness.
 
 #![no_std]
 
 mod draw;
 mod falloff;
+mod imprint;
 mod math;
 
 pub use draw::{draw, draw_vertex};
 pub use falloff::{Falloff, Smoothstep};
+pub use imprint::{Hardened, Imprint, draw_imprint, draw_imprint_vertex};
