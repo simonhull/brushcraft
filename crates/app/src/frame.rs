@@ -980,6 +980,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.scheduler.shown(presented.outcome);
     }
 
+    /// GPU times read back as the render thread stopped (`render_thread::Stopped::gpu`): the
+    /// last frames', for a recorded run.
+    pub(crate) fn last_gpu_times(&mut self, last: Vec<render::timing::GpuTimes>) {
+        if let Some(recorder) = &mut self.recorder {
+            for times in last {
+                recorder.gpu(times);
+            }
+        }
+    }
+
     /// Every frame's phases so far, in a scripted run; `None` in an open-ended one.
     pub(crate) const fn phase_log(&self) -> Option<&PhaseLog> {
         self.log.as_ref()

@@ -30,7 +30,8 @@
 //!   latest.
 //! - **wgpu-core** resets a pass's two queries as the pass begins, and resolves a query not written
 //!   in the same command encoder from what it last held (zero if never written). A frame here
-//!   resolves only queries it wrote.
+//!   resolves only queries it wrote, its own in a later encoding, where they hold what it wrote: no
+//!   other frame writes its slot's queries meanwhile.
 //!
 //! **A frame's start is no earlier than the frame before it ended.** The start pass touches no
 //! resource, so nothing orders it after the earlier frame's work: on Metal, with the GPU behind,
@@ -50,24 +51,41 @@
 //! the frame borrows those stamps (`Stamps::lod`) and resolves the level choice's queries
 //! alongside its own.
 //!
-//! Each timed frame resolves its queries into a readback buffer of a small ring, mapped once the
-//! frame is submitted; whichever thread polls the device next (the app's owner thread, at the
-//! start of its frame) completes the mapping, and [`crate::Renderer::take_timings`] reads every
-//! timed frame that has come back since, tagged with the frame it is of. The ring holds more
-//! buffers than the frames the GPU may have at once ([`crate::FRAMES_IN_FLIGHT`]), so a frame
-//! finds no free buffer only if its user lets the GPU fall further behind; it is then not timed
-//! (its times are absent, never wrong) and counted ([`crate::DroppedReadbacks::timing`]).
+//! **A frame's own queries are resolved once the GPU has finished it**, by a later encoding.
+//! Resolving them at the end of the frame's own command buffer read the last pass (the tone map
+//! and overlay) as unwritten in every frame on an Apple M4. On Metal a render pass's end is
+//! sampled as its fragment stage finishes, and the resolve (a blit) depends on no resource that
+//! pass writes, so nothing orders it after that sample; every other pass is followed by one that
+//! reads what it wrote, which is why only the last read as unwritten. So each frame takes a slot
+//! of a small ring (its own query set and readback buffer); once the queue says the GPU has
+//! finished the frame (`Queue::on_submitted_work_done`, heard at a device poll), the next frame's
+//! encoding (or [`crate::Renderer::flush_timings`]) resolves the slot's queries and copies them
+//! to its buffer, mapped once that submission is in. The level choice's queries, reused every
+//! frame, are still resolved with the frame that borrowed them: its passes are followed by
+//! passes that read what they wrote.
+//!
+//! Whichever thread polls the device next (the app's owner thread) completes the mapping, and
+//! [`crate::Renderer::take_timings`] reads every timed frame that has come back since, tagged
+//! with the frame it is of: two or three frames after it, a frame or so later than a resolve in
+//! its own submission. The ring holds more slots than the frames the GPU may have at once
+//! ([`crate::FRAMES_IN_FLIGHT`]), so a frame finds no free slot only if its user lets the GPU
+//! fall further behind; it is then not timed (its times are absent, never wrong) and counted
+//! ([`crate::DroppedReadbacks::timing`]).
 //!
 //! Without timestamp queries there is no timer (`GpuTimer`): frames are drawn the same, and
 //! their times are absent.
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use wgpu::{
-    Buffer, BufferAddress, BufferDescriptor, BufferUsages, CommandEncoder, ComputePassDescriptor,
-    ComputePassTimestampWrites, ComputePipeline, MapMode, QUERY_SIZE, QuerySet, QuerySetDescriptor,
-    QueryType, RenderPassTimestampWrites, ShaderSource,
+    Buffer, BufferAddress, BufferDescriptor, BufferUsages, CommandEncoder,
+    CommandEncoderDescriptor, ComputePassDescriptor, ComputePassTimestampWrites, ComputePipeline,
+    MapMode, PollType, QUERY_SIZE, QuerySet, QuerySetDescriptor, QueryType, Queue,
+    RenderPassTimestampWrites, ShaderSource,
 };
 
 use crate::gpu::{Gpu, GpuError};
@@ -367,51 +385,97 @@ const LOD_AT: BufferAddress = {
 /// Bytes of the resolved and readback buffers.
 const BYTES: BufferAddress = LOD_AT + LOD_CAPACITY as BufferAddress * QUERY_SIZE as BufferAddress;
 
-/// Readback buffers in the ring.
+/// Slots in the ring: a slot is a frame's own queries and the buffer they are read back through.
 ///
-/// More than the frames the GPU may have at once ([`crate::FRAMES_IN_FLIGHT`]), so a frame
-/// submitted within that bound always has one. A buffer comes back to the ring only when the
-/// render thread next takes it back, after a device poll mapped it: one more than the level
-/// choice's ring for that.
-const RING: usize = crate::FRAMES_IN_FLIGHT + 2;
+/// A slot is busy from its frame's encoding until the render thread takes its readback back:
+/// while the GPU runs the frame (at most [`crate::FRAMES_IN_FLIGHT`] frames), until a later
+/// frame's encoding resolves its queries (or [`GpuTimer::flush`]), and until that submission is
+/// done and a poll maps the buffer. So a frame finds a free slot while the GPU is kept within the
+/// bound, with three to spare.
+const RING: usize = crate::FRAMES_IN_FLIGHT + 3;
+
+/// Bytes between slots' regions of the resolve buffer: a slot's own ticks, then the level
+/// choice's at [`LOD_AT`], at a query resolve's alignment.
+const STRIDE: BufferAddress = BYTES.next_multiple_of(wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT);
 
 /// The start pass's shader: one thread that does nothing, so the pass has work and every
 /// backend writes its timestamps.
 const START_WGSL: &str = "@compute @workgroup_size(1) fn start() {}";
 
-/// A timed frame's readback buffer, on its way back to the timer.
+/// A frame's own queries and the buffer they are read back through.
+#[derive(Debug)]
+struct Slot {
+    /// The queries the frame's passes write.
+    queries: QuerySet,
+    /// Where the resolved ticks are copied, to map.
+    readback: Buffer,
+}
+
+/// A timed frame's slot on its way back to the timer.
 #[derive(Debug)]
 enum Returned {
-    /// Mapped: the ticks of frame `frame`'s `spans`.
+    /// Mapped: the ticks of frame `frame`'s `spans`, in slot `slot`'s buffer.
     Mapped {
-        /// The buffer, mapped.
-        buffer: Buffer,
+        /// The slot.
+        slot: usize,
         /// The frame it is of.
         frame: u64,
         /// The spans it holds the ticks of, in order.
         spans: Vec<Span>,
     },
-    /// Never submitted: free again, nothing to read.
-    Unread(Buffer),
-    /// Its mapping failed: the buffer is gone.
+    /// Never submitted, or never written: free again, nothing to read.
+    Unread(usize),
+    /// Frame `0` was never submitted: its slot waits for nothing.
+    Abandoned(u64),
+    /// Its mapping failed: the slot is gone.
     Failed,
 }
 
-/// Times frames on the GPU by timestamp queries: the queries every frame's passes write, the
-/// start pass, and the ring of buffers they are read back through.
+/// A frame stamped and submitted whose own queries aren't resolved yet: they are, by a later
+/// encoding, once the GPU has finished it ([`GpuTimer::resolve_finished`]).
+#[derive(Debug)]
+struct Pending {
+    /// Its slot.
+    slot: usize,
+    /// The frame.
+    frame: u64,
+    /// Its spans, in order.
+    spans: Vec<Span>,
+    /// Its own queries written.
+    used: u32,
+    /// Set once the GPU has finished the frame (`Queue::on_submitted_work_done`).
+    finished: Arc<AtomicBool>,
+}
+
+/// A slot whose queries a submission resolves: mapped once that submission is.
+#[derive(Debug)]
+struct Resolving {
+    /// The slot.
+    slot: usize,
+    /// The frame it is of.
+    frame: u64,
+    /// Its spans, in order.
+    spans: Vec<Span>,
+    /// The slot's readback buffer, to map.
+    readback: Buffer,
+}
+
+/// Times frames on the GPU by timestamp queries: a ring of slots (each a frame's queries and its
+/// readback buffer), the start pass, and the buffer queries are resolved into.
 #[derive(Debug)]
 pub(crate) struct GpuTimer {
-    /// The frame's own queries, reused by every frame.
-    queries: QuerySet,
+    /// The slots made, by index; a slot whose mapping failed is never used again.
+    slots: Vec<Slot>,
+    /// Slots free, by index.
+    free: Vec<usize>,
+    /// Frames stamped and submitted, oldest first, their own queries not resolved yet.
+    pending: VecDeque<Pending>,
     /// The start pass's pipeline.
     start: ComputePipeline,
-    /// Where a frame's queries are resolved: its own, then the level choice's at [`LOD_AT`].
+    /// Where queries are resolved: a region of [`STRIDE`] bytes a slot, its own ticks first,
+    /// then the level choice's at [`LOD_AT`].
     resolved: Buffer,
-    /// Readback buffers free.
-    free: Vec<Buffer>,
-    /// Readback buffers made, at most [`RING`]; one whose mapping failed is no longer counted.
-    made: usize,
-    /// Frames stamped but not timed for want of a free readback buffer, ever.
+    /// Frames not timed for want of a free slot, ever.
     dropped: u64,
     /// Nanoseconds a tick.
     period: f32,
@@ -430,26 +494,19 @@ impl GpuTimer {
     ///
     /// # Errors
     ///
-    /// As [`Gpu::scoped`], if the queries or their buffer can't be made; as
-    /// [`Gpu::compute_pipeline`] for the start pass.
+    /// As [`Gpu::scoped`], if the resolve buffer can't be made; as [`Gpu::compute_pipeline`] for
+    /// the start pass.
     pub(crate) fn new(gpu: &Gpu) -> Result<Option<Self>, GpuError> {
         let Some(period) = gpu.timestamp_period() else {
             return Ok(None);
         };
-        let device = gpu.device();
-        let (queries, resolved) = gpu.scoped("frame timer", || {
-            let queries = device.create_query_set(&QuerySetDescriptor {
-                label: Some("frame timestamps"),
-                ty: QueryType::Timestamp,
-                count: CAPACITY,
-            });
-            let resolved = device.create_buffer(&BufferDescriptor {
+        let resolved = gpu.scoped("frame timer", || {
+            gpu.device().create_buffer(&BufferDescriptor {
                 label: Some("frame timestamps resolved"),
-                size: BYTES,
+                size: STRIDE * RING as BufferAddress,
                 usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
-            });
-            (queries, resolved)
+            })
         })?;
         let start = gpu.compute_pipeline(
             "frame timer start",
@@ -458,11 +515,11 @@ impl GpuTimer {
         )?;
         let (done, returned) = mpsc::channel();
         Ok(Some(Self {
-            queries,
+            slots: Vec::new(),
+            free: Vec::new(),
+            pending: VecDeque::new(),
             start,
             resolved,
-            free: Vec::new(),
-            made: 0,
             dropped: 0,
             period,
             done,
@@ -472,11 +529,20 @@ impl GpuTimer {
         }))
     }
 
-    /// The stamps of frame `frame`, to give its passes as it is encoded.
-    pub(crate) fn begin(&self, frame: u64) -> Stamps {
+    /// The stamps of frame `frame`, to give its passes as it is encoded: off if no slot is free
+    /// (counted, [`GpuTimer::dropped_readbacks`]) or a new one can't be made.
+    pub(crate) fn begin(&mut self, gpu: &Gpu, frame: u64) -> Stamps {
+        self.take_back();
+        let Some(slot) = self.free.pop().or_else(|| self.make_slot(gpu)) else {
+            return Stamps::off();
+        };
+        let Some(queries) = self.slots.get(slot).map(|slot| slot.queries.clone()) else {
+            return Stamps::off();
+        };
         Stamps {
             on: Some(On {
-                queries: self.queries.clone(),
+                slot,
+                queries,
                 start: self.start.clone(),
                 used: 0,
                 lod: None,
@@ -487,59 +553,148 @@ impl GpuTimer {
         }
     }
 
-    /// Encodes reading `stamps` back, after the last of their passes: `None` if they time no
-    /// pass, ran out of queries, or every readback buffer is in flight. Call
+    /// A new slot, if the ring has room for one (else the frame is counted dropped) and the GPU
+    /// makes it.
+    fn make_slot(&mut self, gpu: &Gpu) -> Option<usize> {
+        if self.slots.len() >= RING {
+            self.dropped += 1;
+            return None;
+        }
+        let device = gpu.device();
+        let slot = gpu
+            .scoped("frame timer slot", || Slot {
+                queries: device.create_query_set(&QuerySetDescriptor {
+                    label: Some("frame timestamps"),
+                    ty: QueryType::Timestamp,
+                    count: CAPACITY,
+                }),
+                readback: device.create_buffer(&BufferDescriptor {
+                    label: Some("frame timestamps readback"),
+                    size: BYTES,
+                    usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+            })
+            .ok()?;
+        self.slots.push(slot);
+        Some(self.slots.len() - 1)
+    }
+
+    /// Where slot `slot`'s region of the resolve buffer starts.
+    fn region(slot: usize) -> BufferAddress {
+        STRIDE * slot as BufferAddress
+    }
+
+    /// Encodes resolving the own queries of every pending frame the GPU has finished (the device
+    /// polled since), oldest first, and copying them to their slots' buffers; returns them, to
+    /// map once `encoder` is submitted.
+    fn resolve_finished(&mut self, encoder: &mut CommandEncoder) -> Vec<Resolving> {
+        let mut resolving = Vec::new();
+        while let Some(oldest) = self.pending.front()
+            && oldest.finished.load(Ordering::Acquire)
+        {
+            let Some(pending) = self.pending.pop_front() else {
+                break;
+            };
+            let Some(slot) = self.slots.get(pending.slot) else {
+                continue;
+            };
+            let at = Self::region(pending.slot);
+            encoder.resolve_query_set(&slot.queries, 0..pending.used, &self.resolved, at);
+            let own = u64::from(pending.used) * u64::from(QUERY_SIZE);
+            encoder.copy_buffer_to_buffer(&self.resolved, at, &slot.readback, 0, own);
+            resolving.push(Resolving {
+                slot: pending.slot,
+                frame: pending.frame,
+                spans: pending.spans,
+                readback: slot.readback.clone(),
+            });
+        }
+        resolving
+    }
+
+    /// Encodes, after the last of `stamps`' passes, resolving the level choice's queries it
+    /// borrowed (reused by the next frame) and the own queries of earlier frames the GPU has
+    /// finished; this frame's own wait until it has finished too. Call
     /// [`TimedFrame::submitted`] once the frame is submitted.
+    ///
+    /// A frame's own queries are resolved only once the GPU is done with it: on Metal a resolve
+    /// in the same command buffer can run before the last pass's end is sampled (the module
+    /// notes).
+    pub(crate) fn finish(&mut self, encoder: &mut CommandEncoder, stamps: Stamps) -> TimedFrame {
+        self.take_back();
+        let resolving = self.resolve_finished(encoder);
+        let Stamps { on, spans, frame } = stamps;
+        let mut timed = TimedFrame {
+            resolving,
+            this: None,
+            done: self.done.clone(),
+        };
+        let Some(on) = on else {
+            return timed;
+        };
+        if on.overflowed || on.used == 0 {
+            // Back unread: nothing worth resolving was written.
+            drop(self.done.send(Returned::Unread(on.slot)));
+            return timed;
+        }
+        if let Some((lod, count)) = &on.lod
+            && let Some(slot) = self.slots.get(on.slot)
+        {
+            let at = Self::region(on.slot) + LOD_AT;
+            encoder.resolve_query_set(lod, 0..*count, &self.resolved, at);
+            let bytes = u64::from(*count) * u64::from(QUERY_SIZE);
+            encoder.copy_buffer_to_buffer(&self.resolved, at, &slot.readback, LOD_AT, bytes);
+        }
+        let finished = Arc::new(AtomicBool::new(false));
+        self.pending.push_back(Pending {
+            slot: on.slot,
+            frame,
+            spans,
+            used: on.used,
+            finished: Arc::clone(&finished),
+        });
+        timed.this = Some((frame, finished));
+        timed
+    }
+
+    /// Resolves, in a submission of its own, the own queries of every frame the GPU has finished
+    /// (polling the device first, without waiting), so their times come back without waiting for
+    /// a later frame: for the end of a run, and for tests.
     ///
     /// # Errors
     ///
-    /// As [`Gpu::scoped`], if a readback buffer can't be made.
-    pub(crate) fn finish(
-        &mut self,
-        gpu: &Gpu,
-        encoder: &mut CommandEncoder,
-        stamps: Stamps,
-    ) -> Result<Option<TimedFrame>, GpuError> {
+    /// As [`Gpu::scoped`], if polling or the submission fails.
+    pub(crate) fn flush(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        gpu.device().poll(PollType::Poll)?;
         self.take_back();
-        let Stamps { on, spans, frame } = stamps;
-        let Some(on) = on.filter(|on| !on.overflowed && on.used > 0) else {
-            return Ok(None);
-        };
-        let buffer = match self.free.pop() {
-            Some(buffer) => buffer,
-            None if self.made < RING => {
-                let buffer = gpu.scoped("frame timestamps readback", || {
-                    gpu.device().create_buffer(&BufferDescriptor {
-                        label: Some("frame timestamps readback"),
-                        size: BYTES,
-                        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-                        mapped_at_creation: false,
-                    })
-                })?;
-                self.made += 1;
-                buffer
-            }
-            None => {
-                self.dropped += 1;
-                return Ok(None);
-            }
-        };
-        encoder.resolve_query_set(&self.queries, 0..on.used, &self.resolved, 0);
-        if let Some((lod, count)) = &on.lod {
-            encoder.resolve_query_set(lod, 0..*count, &self.resolved, LOD_AT);
+        if !self
+            .pending
+            .front()
+            .is_some_and(|pending| pending.finished.load(Ordering::Acquire))
+        {
+            return Ok(());
         }
-        encoder.copy_buffer_to_buffer(&self.resolved, 0, &buffer, 0, BYTES);
-        Ok(Some(TimedFrame {
-            buffer: Some(buffer),
-            frame,
-            spans,
-            done: self.done.clone(),
-        }))
+        let timed = gpu.scoped("flushing the frame timer", || {
+            let mut encoder = gpu
+                .device()
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("frame timer flush"),
+                });
+            let resolving = self.resolve_finished(&mut encoder);
+            gpu.queue().submit([encoder.finish()]);
+            TimedFrame {
+                resolving,
+                this: None,
+                done: self.done.clone(),
+            }
+        })?;
+        timed.submitted(gpu.queue());
+        Ok(())
     }
 
-    /// Frames stamped but not timed because every readback buffer was in flight, ever
-    /// ([`GpuTimer::finish`] gave `None` for that). Zero while the GPU is kept within
-    /// [`crate::FRAMES_IN_FLIGHT`] frames.
+    /// Frames not timed because no slot was free, ever ([`GpuTimer::begin`] gave stamps that are
+    /// off for that). Zero while the GPU is kept within [`crate::FRAMES_IN_FLIGHT`] frames.
     pub(crate) const fn dropped_readbacks(&self) -> u64 {
         self.dropped
     }
@@ -551,23 +706,22 @@ impl GpuTimer {
         std::mem::take(&mut self.ready)
     }
 
-    /// Takes back every readback buffer returned, reading the ticks of those mapped into
+    /// Takes back every slot returned, reading the ticks of those mapped into
     /// [`GpuTimer::ready`].
     fn take_back(&mut self) {
         while let Ok(returned) = self.returned.try_recv() {
             match returned {
-                Returned::Mapped {
-                    buffer,
-                    frame,
-                    spans,
-                } => {
+                Returned::Mapped { slot, frame, spans } => {
+                    let Some(buffer) = self.slots.get(slot).map(|slot| &slot.readback) else {
+                        continue;
+                    };
                     let ticks: Vec<u64> = buffer
                         .get_mapped_range(..)
                         .ok()
                         .and_then(|view| view.get(..).map(bytemuck::pod_collect_to_vec))
                         .unwrap_or_default();
                     buffer.unmap();
-                    self.free.push(buffer);
+                    self.free.push(slot);
                     let lod_from =
                         usize::try_from(LOD_AT / u64::from(QUERY_SIZE)).unwrap_or(usize::MAX);
                     let ticks = Ticks {
@@ -579,17 +733,28 @@ impl GpuTimer {
                     self.last_tick = last_tick(&spans, ticks).max(self.last_tick);
                     self.ready.extend(read);
                 }
-                Returned::Unread(buffer) => self.free.push(buffer),
-                Returned::Failed => self.made = self.made.saturating_sub(1),
+                Returned::Unread(slot) => self.free.push(slot),
+                Returned::Abandoned(frame) => {
+                    let (abandoned, kept): (VecDeque<Pending>, VecDeque<Pending>) =
+                        std::mem::take(&mut self.pending)
+                            .into_iter()
+                            .partition(|pending| pending.frame == frame);
+                    self.pending = kept;
+                    self.free
+                        .extend(abandoned.iter().map(|pending| pending.slot));
+                }
+                Returned::Failed => {}
             }
         }
     }
 }
 
-/// A timed frame's queries and start pass, while it is encoded.
+/// A timed frame's slot and start pass, while it is encoded.
 #[derive(Debug)]
 struct On {
-    /// The timer's queries.
+    /// Its slot.
+    slot: usize,
+    /// The slot's queries.
     queries: QuerySet,
     /// The start pass's pipeline.
     start: ComputePipeline,
@@ -614,9 +779,10 @@ pub(crate) struct Stamps {
 }
 
 impl Stamps {
-    /// The stamps of frame `frame` with `timer` ([`GpuTimer::begin`]), or off without one.
-    pub(crate) fn of(timer: Option<&GpuTimer>, frame: u64) -> Self {
-        timer.map_or_else(Self::off, |timer| timer.begin(frame))
+    /// The stamps of frame `frame` with `timer` on `gpu` ([`GpuTimer::begin`]), or off without
+    /// one.
+    pub(crate) fn of(timer: Option<&mut GpuTimer>, gpu: &Gpu, frame: u64) -> Self {
+        timer.map_or_else(Self::off, |timer| timer.begin(gpu, frame))
     }
 
     /// Stamps that write nothing: a frame not timed.
@@ -717,53 +883,59 @@ impl Stamps {
     }
 }
 
-/// A timed frame's readback, encoded: mark it submitted once its frame is, or drop it to give
-/// the buffer back unread.
+/// What a frame's encoding resolved and stamped, for the timer: mark it submitted once the
+/// frame is, or drop it to give its slots back unread.
 #[derive(Debug)]
 #[must_use = "a timed frame not marked submitted is never read"]
 pub(crate) struct TimedFrame {
-    /// The buffer its ticks are copied to.
-    buffer: Option<Buffer>,
-    /// The frame.
-    frame: u64,
-    /// Its spans, in order.
-    spans: Vec<Span>,
-    /// Where it goes once mapped.
+    /// Earlier frames whose queries this submission resolves.
+    resolving: Vec<Resolving>,
+    /// This frame, if it was stamped: its number, and the flag the GPU's finishing it sets.
+    this: Option<(u64, Arc<AtomicBool>)>,
+    /// Where slots go back.
     done: Sender<Returned>,
 }
 
 impl TimedFrame {
-    /// Maps the buffer, now that its frame is submitted: [`GpuTimer::collect`] reads it once
-    /// the device is polled after the GPU finishes the frame.
-    pub(crate) fn submitted(mut self) {
-        let Some(buffer) = self.buffer.take() else {
-            return;
-        };
-        let back = buffer.clone();
-        let done = self.done.clone();
-        let frame = self.frame;
-        let spans = std::mem::take(&mut self.spans);
-        buffer.map_async(MapMode::Read, .., move |result| {
-            let returned = if result.is_ok() {
-                Returned::Mapped {
-                    buffer: back,
-                    frame,
-                    spans,
-                }
-            } else {
-                Returned::Failed
-            };
-            // A timer that's gone has nothing to read.
-            drop(done.send(returned));
-        });
+    /// Now that its submission is in `queue`: maps the slots it resolved
+    /// ([`GpuTimer::collect`] reads them once the device is polled after the GPU finishes it),
+    /// and asks the queue to say when the GPU has finished this frame, so a later encoding
+    /// resolves its queries.
+    pub(crate) fn submitted(mut self, queue: &Queue) {
+        let resolving = std::mem::take(&mut self.resolving);
+        for Resolving {
+            slot,
+            frame,
+            spans,
+            readback,
+        } in resolving
+        {
+            let done = self.done.clone();
+            readback.map_async(MapMode::Read, .., move |result| {
+                let returned = if result.is_ok() {
+                    Returned::Mapped { slot, frame, spans }
+                } else {
+                    Returned::Failed
+                };
+                // A timer that's gone has nothing to read.
+                drop(done.send(returned));
+            });
+        }
+        if let Some((_, finished)) = self.this.take() {
+            queue.on_submitted_work_done(move || finished.store(true, Ordering::Release));
+        }
     }
 }
 
 impl Drop for TimedFrame {
     fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            // Unsubmitted: back to the ring unread. A timer that's gone has nothing to take back.
-            drop(self.done.send(Returned::Unread(buffer)));
+        // Unsubmitted: what it resolved goes back unread, and its own frame waits for nothing.
+        // A timer that's gone has nothing to take back.
+        for resolving in self.resolving.drain(..) {
+            drop(self.done.send(Returned::Unread(resolving.slot)));
+        }
+        if let Some((frame, _)) = self.this.take() {
+            drop(self.done.send(Returned::Abandoned(frame)));
         }
     }
 }

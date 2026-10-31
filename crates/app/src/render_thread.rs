@@ -209,6 +209,24 @@ impl Drop for WakeOnExit {
     }
 }
 
+/// What a render thread hands back as it stops.
+#[derive(Debug)]
+pub(crate) struct Stopped {
+    /// Its target.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the app drops the target as the thread stops; tests read its pixels"
+        )
+    )]
+    pub(crate) target: Target,
+    /// The GPU times of its last frames, which no later frame resolved
+    /// ([`Renderer::flush_timings`]): read back once the GPU has finished every frame. Empty
+    /// unless the thread times the GPU.
+    pub(crate) gpu: Vec<GpuTimes>,
+}
+
 /// The render thread, from the owner's side.
 #[derive(Debug)]
 pub(crate) struct RenderThread {
@@ -217,7 +235,7 @@ pub(crate) struct RenderThread {
     /// What happened to them.
     presented: Receiver<Presented>,
     /// The thread, which hands the target back when it ends; `None` once joined.
-    handle: Option<JoinHandle<Result<Target>>>,
+    handle: Option<JoinHandle<Result<Stopped>>>,
     /// How the target presents.
     presentation: Presentation,
     /// Whether it times each frame's phases on the GPU.
@@ -271,9 +289,12 @@ impl RenderThread {
                 // a panic.
                 let wake = WakeOnExit(wake);
                 let outgoing = outgoing;
-                thread
-                    .run(&incoming, &outgoing, &*wake.0, &*pre_present)
-                    .map(|()| thread.target)
+                thread.run(&incoming, &outgoing, &*wake.0, &*pre_present)?;
+                let last = thread.last_timings()?;
+                Ok(Stopped {
+                    target: thread.target,
+                    gpu: last,
+                })
             })
             .context("starting the render thread")?;
         Ok(Self {
@@ -363,12 +384,14 @@ impl RenderThread {
         }
     }
 
-    /// Stops the thread once it has finished its frame, and hands the target back.
+    /// Stops the thread once it has finished its frame, and hands the target back with the
+    /// GPU times of the last frames. The thread waits for the GPU to finish them first.
     ///
     /// # Errors
     ///
-    /// The error that stopped the thread early, or that it panicked.
-    pub(crate) fn stop(mut self) -> Result<Target> {
+    /// The error that stopped the thread early, that it panicked, or that the GPU failed as it
+    /// finished.
+    pub(crate) fn stop(mut self) -> Result<Stopped> {
         self.frames = None;
         self.join()
     }
@@ -378,7 +401,7 @@ impl RenderThread {
     /// # Errors
     ///
     /// Its error, or that it panicked or was joined already.
-    fn join(&mut self) -> Result<Target> {
+    fn join(&mut self) -> Result<Stopped> {
         let handle = self
             .handle
             .take()
@@ -473,6 +496,26 @@ impl Drawing {
             wake();
         }
         Ok(())
+    }
+
+    /// The GPU times of the last frames drawn, which no later frame's encoding resolved, once the
+    /// GPU has finished them: waits for the GPU (the thread is stopping; nothing waits on it).
+    ///
+    /// # Errors
+    ///
+    /// If waiting for the GPU or resolving the times fails.
+    fn last_timings(&mut self) -> Result<Vec<GpuTimes>> {
+        let device = self.gpu.device();
+        device
+            .poll(PollType::wait_indefinitely())
+            .context("waiting for the last frames")?;
+        self.renderer
+            .flush_timings(&self.gpu)
+            .context("resolving the last frames' times")?;
+        device
+            .poll(PollType::wait_indefinitely())
+            .context("reading the last frames' times back")?;
+        Ok(self.renderer.take_timings())
     }
 }
 
@@ -572,7 +615,7 @@ mod tests {
         let presented = thread.wait().expect("drawn");
         assert_eq!(presented.number, 1);
         assert_eq!(presented.outcome, Outcome::Presented);
-        let Target::Offscreen(offscreen) = thread.stop().expect("stopped cleanly") else {
+        let Target::Offscreen(offscreen) = thread.stop().expect("stopped cleanly").target else {
             unreachable!("made offscreen");
         };
         let pixels = offscreen.read_pixels(&gpu).expect("read back");
@@ -592,7 +635,7 @@ mod tests {
             RenderThread::spawn(gpu, target, Hooks::none(), false).expect("render thread");
         assert_eq!(thread.finished().expect("running"), Vec::new());
         let returned = thread.stop().expect("stopped cleanly");
-        assert_eq!(returned.size(), size);
+        assert_eq!(returned.target.size(), size);
     }
 
     #[test]

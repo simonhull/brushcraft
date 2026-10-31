@@ -232,14 +232,16 @@ impl WindowApp {
         let outcome = match self.running.take() {
             Some(running) => {
                 let Running {
-                    owner,
+                    mut owner,
                     render,
                     window,
                     adapter,
                     ..
                 } = running;
                 let presentation = render.presentation();
-                let stopped = render.stop().map(drop);
+                let stopped = render
+                    .stop()
+                    .map(|stopped| owner.last_gpu_times(stopped.gpu));
                 let summary = Summary::of(&owner, adapter, presentation);
                 let closed = owner.close();
                 drop(window);

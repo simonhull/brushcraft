@@ -234,7 +234,9 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
     };
     let mut owner = start(project, gpu, setup)?;
     let ran = drive_offscreen(&mut owner, &mut render);
-    let stopped = render.stop().map(drop);
+    let stopped = render
+        .stop()
+        .map(|stopped| owner.last_gpu_times(stopped.gpu));
     let summary = Summary::of(&owner, adapter, presentation);
     let closed = owner.close();
     ran.and(stopped).and(closed)?;

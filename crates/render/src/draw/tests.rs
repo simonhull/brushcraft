@@ -375,6 +375,11 @@ fn draw_scene_timed(
         .raster()
         .read_visibility(gpu)
         .expect("read back");
+    // The frame's own stamps are resolved once the GPU has finished it, by a later submission.
+    renderer.flush_timings(gpu).expect("the stamps resolve");
+    gpu.device()
+        .poll(PollType::wait_indefinitely())
+        .expect("the GPU finishes");
     let gpu_times = renderer.take_timings();
     SceneFrame {
         pixels: pixels(gpu, &target),
@@ -602,5 +607,54 @@ fn the_same_scene_at_the_same_time_draws_the_same_frame() {
         assert_eq!(first.ids, second.ids, "the visibility buffers agree");
         assert_eq!(first.pixels, second.pixels, "and so do the frames");
         assert_eq!(first.cut.cut, second.cut.cut, "as do the cuts");
+    });
+}
+
+#[test]
+fn frames_submitted_back_to_back_are_each_timed_once_their_last_pass_included() {
+    GpuTest::run(|gpu| {
+        if gpu.timestamp_period().is_none() {
+            return;
+        }
+        let size = Size::new(32, 16).expect("non-zero");
+        let mut target = Target::Offscreen(Offscreen::new(gpu, size).expect("target"));
+        let mut renderer = Renderer::new(gpu, target.format()).expect("renderer");
+        renderer.enable_timing(gpu).expect("the frame timer");
+        let frames = 1..=u64::try_from(crate::FRAMES_IN_FLIGHT).expect("small") + 1;
+        let mut timed = Vec::new();
+        for frame in frames.clone() {
+            let inputs = FrameInputs {
+                size,
+                clear: CLEAR,
+                overlay: None,
+                overlay_scale: 1,
+                scene: Scene::None,
+                look: Look::default(),
+                frame,
+            };
+            // Not waited for: each frame's encoding resolves what the GPU has finished by then.
+            renderer
+                .draw(gpu, &mut target, &inputs, None, || {})
+                .expect("drawn");
+            timed.extend(renderer.take_timings());
+        }
+        gpu.device()
+            .poll(PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        renderer.flush_timings(gpu).expect("the rest resolve");
+        gpu.device()
+            .poll(PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        timed.extend(renderer.take_timings());
+        let numbers: Vec<u64> = timed.iter().map(GpuTimes::frame).collect();
+        let all: Vec<u64> = frames.collect();
+        assert_eq!(numbers, all, "each frame once, in order");
+        for times in &timed {
+            assert!(
+                times.phase(GpuPhase::Tone).is_some(),
+                "the last pass's stamps are read once the GPU is done: {times:?}"
+            );
+        }
+        assert_eq!(renderer.dropped_readbacks().timing, 0);
     });
 }

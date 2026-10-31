@@ -1381,7 +1381,8 @@ fn a_display_faster_than_the_gpu_gets_every_frame_read_back() {
     };
     let mut owner = Owner::new(project, NoBrush, residency, setup, Instant::now());
     crate::drive_offscreen(&mut owner, &mut render).expect("the run");
-    render.stop().expect("stopped cleanly");
+    let stopped = render.stop().expect("stopped cleanly");
+    owner.last_gpu_times(stopped.gpu);
     let lines = owner.record_lines();
     owner.close().expect("closed");
     let run = &lines[0];
@@ -1389,17 +1390,20 @@ fn a_display_faster_than_the_gpu_gets_every_frame_read_back() {
     let frames = lines.get(6..).expect("frame lines");
     assert!(frames.len() > 20, "frames along the path: {}", frames.len());
     // The last frames' readbacks may still be on their way as the run ends; none before them.
+    // Their GPU times are read as the render thread stops.
+    for frame in frames {
+        assert_ne!(
+            record_field(frame, "gpu_ms"),
+            "null",
+            "its times came back: {frame}"
+        );
+    }
     let settled = frames.len() - render::FRAMES_IN_FLIGHT;
     for frame in frames.get(..settled).expect("frames") {
         assert_eq!(
             record_field(frame, "drawn"),
             "true",
             "its cut came back: {frame}"
-        );
-        assert_ne!(
-            record_field(frame, "gpu_ms"),
-            "null",
-            "its times came back: {frame}"
         );
         for readback in ["cut", "request", "timing"] {
             let name = format!("{readback}_readback_dropped");

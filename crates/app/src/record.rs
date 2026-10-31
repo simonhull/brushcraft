@@ -2,8 +2,9 @@
 //! lines in the style of `brushcraft-bench`'s records, which `brushcraft-bench perf` reads.
 //!
 //! A frame's facts arrive at different times: its owner thread phases as it is made (its upkeep
-//! and jobs once they have run), its render thread phases when it is shown, its GPU times a frame
-//! or two later (read back without waiting, [`render::timing`]), and its cut (what the level
+//! and jobs once they have run), its render thread phases when it is shown, its GPU times two or
+//! three frames later (read back without waiting, [`render::timing`]; the last frames' as the
+//! render thread stops), and its cut (what the level
 //! choice drew, with the level choice's own stage times) when residency reads that back. The
 //! [`Recorder`] keeps each frame's [`FrameRecord`] by number and fills it in as they come; the
 //! lines are written once the run is over ([`Recorder::lines`]). A fact that never came (the last

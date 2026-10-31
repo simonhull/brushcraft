@@ -304,6 +304,18 @@ impl Renderer {
         }
     }
 
+    /// Resolves, in a submission of its own, the timestamps of every timed frame the GPU has
+    /// finished (polling the device first, without waiting), so [`Renderer::take_timings`] has
+    /// them once the device is polled again after it, without waiting for a later frame to
+    /// resolve them. Does nothing without timing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::scoped`], if polling or the submission fails.
+    pub fn flush_timings(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.timer.as_mut().map_or(Ok(()), |timer| timer.flush(gpu))
+    }
+
     /// Draws each frame's scene with `passes` from now on. They are built where residency is,
     /// for its tile tree and slot layout ([`FramePasses::new`]), so a device that can't take
     /// them fails at startup, not mid-session.
@@ -374,7 +386,7 @@ impl Renderer {
             aa,
             timer,
         } = self;
-        let (mut stamps, mut tick_readback) = (Stamps::of(timer.as_ref(), inputs.frame), None);
+        let (mut stamps, mut tick_readback) = (Stamps::of(timer.as_mut(), gpu, inputs.frame), None);
         overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         if let Some(passes) = scene_passes.as_mut() {
             passes.set_shading(gpu, inputs.look, inputs.overlay_scale);
@@ -425,11 +437,11 @@ impl Renderer {
                 // The last pass: the overlay over everything.
                 overlay.draw(&mut pass);
                 drop(pass);
-                tick_readback = finish_stamps(timer.as_mut(), gpu, frame, &mut stamps);
+                tick_readback = finish_stamps(timer.as_mut(), frame, &mut stamps);
             };
             submit(gpu, uploads, commands, passes);
             if let Some(readback) = tick_readback.take() {
-                readback.submitted();
+                readback.submitted(gpu.queue());
             }
             encoded
         })?;
@@ -466,12 +478,11 @@ fn for_frame(uploads: FrameUploads, drawing: bool) -> FrameUploads {
 /// not timed; it draws the same.
 fn finish_stamps(
     timer: Option<&mut GpuTimer>,
-    gpu: &Gpu,
     frame: &mut CommandEncoder,
     stamps: &mut Stamps,
 ) -> Option<TimedFrame> {
     let stamped = std::mem::replace(stamps, Stamps::off());
-    timer?.finish(gpu, frame, stamped).ok().flatten()
+    Some(timer?.finish(frame, stamped))
 }
 
 /// How a frame shows its scene: its look, and its size (a scene shaded again must be of it).
