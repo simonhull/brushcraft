@@ -1340,6 +1340,9 @@ fn record_field<'a>(line: &'a str, field: &str) -> &'a str {
 
 /// The real loop on lavapipe, its display far faster than lavapipe draws (2000 Hz).
 ///
+/// It makes a set number of frames (the camera on the benchmark path at real speed, which takes
+/// far longer), so how many it makes doesn't depend on the machine's load.
+///
 /// The completions the render thread asks the queue for reach the owner as it polls (else the
 /// loop would wait for the GPU forever after two frames), every frame's cut and GPU times are
 /// read back, and none is dropped.
@@ -1367,10 +1370,11 @@ fn a_display_faster_than_the_gpu_gets_every_frame_read_back() {
     let mut residency = GpuResidency::new(Arc::clone(&gpu), project.store()).expect("residency");
     let lod_timing = residency.enable_timing().expect("the level choice's timer");
     let opening = Instant::now();
-    let speed: crate::script::Speed = "16".parse().expect("a speed");
+    let made = 40;
     let setup = Setup {
         interval: Duration::from_micros(500),
-        script: Some(Script::benchmark(speed)),
+        frames: Some(made),
+        script: Some(Script::benchmark(crate::script::Speed::ONE)),
         record: Some(RecordSetup {
             project: "test".to_owned(),
             gpu_timing: render.timing(),
@@ -1388,7 +1392,11 @@ fn a_display_faster_than_the_gpu_gets_every_frame_read_back() {
     let run = &lines[0];
     assert_eq!(record_field(run, "readbacks_dropped"), "0", "{run}");
     let frames = lines.get(6..).expect("frame lines");
-    assert!(frames.len() > 20, "frames along the path: {}", frames.len());
+    assert_eq!(
+        frames.len(),
+        usize::try_from(made).expect("small"),
+        "the frames asked for"
+    );
     // The last frames' readbacks may still be on their way as the run ends; none before them.
     // Their GPU times are read as the render thread stops.
     for frame in frames {
