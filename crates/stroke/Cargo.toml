@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+geom.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

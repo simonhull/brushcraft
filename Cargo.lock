@@ -1834,6 +1834,7 @@ version = "0.0.0"
 dependencies = [
  "bolero",
  "bytemuck",
+ "geom",
  "thiserror 2.0.21",
 ]
 

@@ -9,7 +9,8 @@
 //! ```
 //!
 //! This crate is headless: it never sees the GPU, the window or the store. What it knows of the
-//! scene will come through traits its callers implement, with placement.
+//! scene comes through two traits its callers implement: a [`Projector`] from the camera and a
+//! [`Surface`] to place dabs on.
 //!
 //! What is here so far:
 //! - **Input:** [`Sample`], one pen report in physical pixels and seconds on the pen's clock. The
@@ -20,6 +21,9 @@
 //! - **Size:** [`Radius`] and [`SizeMode`].
 //! - **Dynamics:** [`Dynamics`], a table of [`Entry`]s mapping an [`Input`] through a [`Curve`]
 //!   onto a [`Param`]; [`StrokeRandom`] for the random input.
+//! - **The scene:** [`Projector`] (screen to world [`Ray`]s, and pixel size at a depth) and
+//!   [`Surface`] (raycasts, continuity, and the closest point on the stroke's region), in `f64`
+//!   world space ([`DVec3`]), with [`Hit`]s on the base mesh.
 //! - **Settings:** [`StrokeSettings`], validated plain data with a versioned byte form.
 //! - **Output:** [`Dab`], plain data shared by the CPU and the GPU.
 //!
@@ -34,7 +38,9 @@ mod path;
 mod sample;
 mod settings;
 mod size;
+mod surface;
 mod unit;
+mod vector;
 
 pub use curve::{Curve, CurveError, CurvePoint, MAX_CURVE_POINTS, MIN_CURVE_POINTS};
 pub use dab::Dab;
@@ -49,4 +55,6 @@ pub use settings::{
     SymmetryError,
 };
 pub use size::{Radius, RadiusError, SizeMode};
+pub use surface::{Hit, Projector, Ray, Surface};
 pub use unit::{NotUnit, Unit};
+pub use vector::DVec3;
