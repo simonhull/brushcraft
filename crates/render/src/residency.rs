@@ -348,8 +348,8 @@ pub struct ResidencyConfig {
     request_capacity: u32,
     /// The finest level of the floor: every face's display tiles up to it are pinned.
     floor_top: Level,
-    /// The most finest tiles one frame's stand-ins read ([`crate::standin`]): the scratch's
-    /// size.
+    /// The finest tiles the stand-ins' kept scratch holds ([`crate::standin`]): a frame whose
+    /// stand-ins read more makes a one-off scratch.
     stand_in_tiles: u32,
     /// The most display tiles standing in at once.
     stand_in_rows: u32,
@@ -368,13 +368,18 @@ const FLOOR_TOP: Level = match Level::new(5) {
 /// [`ResidencyConfig::forced_bytes`]: so a tiny budget can't keep an epoch from ever applying.
 pub const LONG_STALL: u32 = 8;
 
-/// The finest tiles a frame's stand-ins read by default: the largest brush step below the
-/// footprint limit F (about 150 tiles, spec "Big brushes") and some to spare.
+/// The finest tiles the stand-ins' kept scratch holds by default: the largest brush step below
+/// the footprint limit F (about 150 tiles, spec "Big brushes") and some to spare.
 const STAND_IN_TILES: u32 = 160;
 
 /// The display tiles standing in at once by default: every resident ancestor of the tiles a
 /// long stroke edited before the refresh catches up.
 const STAND_IN_ROWS: u32 = 8192;
+
+/// The most brush steps kept for display tiles to catch up with ([`Residency::apply_step`]):
+/// a long stroke's worth while the refresh lags, bounding what a store whose refresh never
+/// comes costs.
+pub const MAX_STEPS: usize = 4096;
 
 /// Keys readied at once by [`TileSource::prepare`]: the deadline is checked between such
 /// batches, so a frame overruns it by at most one batch of tiles.
@@ -479,7 +484,7 @@ impl ResidencyConfig {
         Ok(config)
     }
 
-    /// This configuration with stand-ins reading at most `tiles` finest tiles a frame, and at
+    /// This configuration with the stand-ins' kept scratch holding `tiles` finest tiles, and at
     /// most `rows` display tiles standing in at once (each at least 1).
     #[must_use]
     pub fn with_stand_ins(self, tiles: u32, rows: u32) -> Self {
@@ -615,10 +620,14 @@ pub struct ResidencyStats {
     pub stand_in_bytes: u64,
     /// Display tiles stood in, ever (a tile once per frame it stands in).
     pub stand_ins: u64,
-    /// Display tiles that wanted to stand in and couldn't in their frame, ever: the scratch or
-    /// the rows were full, or the source had nothing for a finest tile they read. They try
-    /// again the next frame.
+    /// Display tiles that wanted to stand in and couldn't in their frame, ever: more finest
+    /// tiles than a scratch binds, every row taken, or the source had nothing for a finest tile
+    /// they read. They try again the next frame.
     pub stand_ins_skipped: u64,
+    /// Brush steps forgotten before every display tile above them caught up, ever: more were
+    /// kept than [`MAX_STEPS`] (a store whose refresh never comes). A display tile still behind
+    /// one, arriving later, doesn't stand in for it.
+    pub stand_in_steps_dropped: u64,
     /// Tiles requested and not resident yet.
     pub wanted: usize,
     /// Tiles the source had nothing for, waiting for an epoch naming them.

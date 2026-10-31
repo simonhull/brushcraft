@@ -334,10 +334,15 @@ pub(crate) struct StandInPass {
     settle: ComputePipeline,
     /// Its bind group layout.
     settle_layout: BindGroupLayout,
-    /// The scratch: [`TILE_WORDS`] words per finest tile.
+    /// The scratch kept between frames: [`TILE_WORDS`] words per finest tile.
     scratch: Buffer,
     /// How many finest tiles it holds.
     scratch_tiles: u32,
+    /// The most finest tiles a scratch can hold: as many as the device binds.
+    most_tiles: u32,
+    /// A scratch made for the frame being staged alone, which needs more finest tiles than the
+    /// kept one holds: held by the frame's bind groups, and dropped with them.
+    one_off: Option<Buffer>,
     /// The rows.
     rows: Buffer,
     /// The job list the frame's dispatches read, grown as a frame needs.
@@ -439,15 +444,46 @@ impl StandInPass {
             settle_layout,
             scratch,
             scratch_tiles,
+            most_tiles: u32::try_from(
+                limits
+                    .max_storage_buffer_binding_size
+                    .min(limits.max_buffer_size)
+                    / TILE_BYTES,
+            )
+            .unwrap_or(u32::MAX),
+            one_off: None,
             rows: row_buffer,
             jobs: storage_buffer(gpu, "stand-in jobs", 4096)?,
             job_alignment: u64::from(limits.min_storage_buffer_offset_alignment).max(JOB_BYTES),
         })
     }
 
-    /// How many finest tiles the scratch holds: the most a frame's stand-ins can read.
-    pub(crate) const fn scratch_tiles(&self) -> u32 {
-        self.scratch_tiles
+    /// The most finest tiles a frame's stand-ins can read: as many as a scratch the device
+    /// binds holds.
+    pub(crate) const fn most_tiles(&self) -> u32 {
+        self.most_tiles
+    }
+
+    /// Starts a frame whose stand-ins read `tiles` finest tiles (at most
+    /// [`StandInPass::most_tiles`]): the kept scratch if it holds them, else a one-off scratch
+    /// made for the frame.
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::scoped`], making the one-off scratch.
+    pub(crate) fn begin(&mut self, gpu: &Gpu, tiles: u32) -> Result<(), GpuError> {
+        self.one_off = if tiles > self.scratch_tiles {
+            let bytes = u64::from(tiles) * TILE_BYTES;
+            Some(storage_buffer(gpu, "one-off stand-in scratch", bytes)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// The frame's scratch: its one-off one, if it made one, else the kept one.
+    fn frame_scratch(&self) -> &Buffer {
+        self.one_off.as_ref().unwrap_or(&self.scratch)
     }
 
     /// Bytes of GPU memory it keeps, outside the slot budget: the scratch, the rows and the job
@@ -479,7 +515,7 @@ impl StandInPass {
             gpu,
             ring,
             bytemuck::cast_slice(&words),
-            &self.scratch,
+            self.frame_scratch(),
             u64::from(index) * TILE_BYTES,
             true,
         )?;
@@ -559,6 +595,9 @@ impl StandInPass {
         locate: impl Fn(Slot) -> Option<(Buffer, u64)>,
         rows: u32,
     ) -> Result<Option<StandInWork>, GpuError> {
+        // The frame's one-off scratch, if it made one: its bind groups hold it from here.
+        let one_off = self.one_off.take();
+        let scratch = one_off.as_ref().unwrap_or(&self.scratch);
         if stand_ins.is_empty() && rows == 0 {
             return Ok(None);
         }
@@ -610,7 +649,7 @@ impl StandInPass {
                     layout: &self.replace_layout,
                     entries: &[
                         entry(0, target),
-                        entry(1, &self.scratch),
+                        entry(1, scratch),
                         BindGroupEntry {
                             binding: 2,
                             resource: BindingResource::Buffer(BufferBinding {

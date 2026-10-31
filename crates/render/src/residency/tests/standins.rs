@@ -185,8 +185,14 @@ impl TileSource for Sphere {
 
 /// Residency for the sphere with the floor up to `floor_top` and room to spare.
 fn residency(gpu: &Gpu, sphere: &Sphere, floor_top: u8) -> Residency {
+    residency_with(gpu, sphere, floor_top, 160)
+}
+
+/// [`residency`] with a kept scratch of `scratch` finest tiles.
+fn residency_with(gpu: &Gpu, sphere: &Sphere, floor_top: u8, scratch: u32) -> Residency {
     let config = ResidencyConfig::new(256 << 20, 16 << 20, 64 << 20, 8 << 20, 64, level(floor_top))
-        .expect("a valid configuration");
+        .expect("a valid configuration")
+        .with_stand_ins(scratch, 64);
     Residency::new(gpu, &sphere.mesh, sphere.finest, config).expect("residency")
 }
 
@@ -308,60 +314,71 @@ fn above(epoch: &Epoch) -> BTreeSet<Place> {
 
 #[test]
 fn two_steps_seen_from_a_distance_stand_in_for_every_display_tile_above_them() {
-    GpuTest::run(|gpu| {
-        let mut sphere = Sphere::new();
-        let mut residency = residency(gpu, &sphere, 6);
+    GpuTest::run(|gpu| two_steps(gpu, 160));
+}
+
+#[test]
+fn a_frame_reading_more_finest_tiles_than_the_kept_scratch_makes_a_one_off_one() {
+    GpuTest::run(|gpu| two_steps(gpu, 1));
+}
+
+/// Two steps seen from a distance, with a kept scratch of `scratch` finest tiles.
+///
+/// Every display tile above them stands in, its seams closed and its bound a bound, and a frame
+/// writing the whole tree again keeps the bounds.
+fn two_steps(gpu: &Gpu, scratch: u32) {
+    let mut sphere = Sphere::new();
+    let mut residency = residency_with(gpu, &sphere, 6, scratch);
+    frame(
+        gpu,
+        &mut residency,
+        &mut sphere,
+        Drained::Epochs(Vec::new()),
+        None,
+        None,
+    );
+    for (step, amplitude) in [0.02, -0.015].into_iter().enumerate() {
+        let (epoch, displacement) = sphere.step(amplitude);
+        let stood = above(&epoch);
+        let drained = Drained::Epochs(vec![epoch]);
         frame(
             gpu,
             &mut residency,
             &mut sphere,
-            Drained::Epochs(Vec::new()),
-            None,
-            None,
-        );
-        for (step, amplitude) in [0.02, -0.015].into_iter().enumerate() {
-            let (epoch, displacement) = sphere.step(amplitude);
-            let stood = above(&epoch);
-            let drained = Drained::Epochs(vec![epoch]);
-            frame(
-                gpu,
-                &mut residency,
-                &mut sphere,
-                drained,
-                Some(displacement),
-                None,
-            );
-            assert!(
-                residency.resident().all(|key| key.level() < sphere.finest),
-                "seen from a distance: no finest tile resident"
-            );
-            let stats = residency.stats();
-            assert_eq!(stats.stand_ins_skipped, 0);
-            assert_eq!(
-                stats.stand_ins,
-                (stood.len() * (step + 1)) as u64,
-                "step {step}: every display tile above it stood in"
-            );
-            check(gpu, &residency, &sphere);
-        }
-        // A frame writing the whole tree again keeps the stand-ins' bounds: the settle writes
-        // them over the stored ones the upload brings.
-        let before = display_tiles(gpu, &residency);
-        residency.tree.mark_all_dirty();
-        frame(
-            gpu,
-            &mut residency,
-            &mut sphere,
-            Drained::Epochs(Vec::new()),
-            None,
+            drained,
+            Some(displacement),
             None,
         );
-        let after = display_tiles(gpu, &residency);
-        for (place, (_, node)) in &after {
-            assert_eq!(node.error, before[place].1.error, "{place:?}'s bound kept");
-        }
+        assert!(
+            residency.resident().all(|key| key.level() < sphere.finest),
+            "seen from a distance: no finest tile resident"
+        );
+        let stats = residency.stats();
+        assert_eq!(stats.stand_ins_skipped, 0);
+        assert_eq!(
+            stats.stand_ins,
+            (stood.len() * (step + 1)) as u64,
+            "step {step}: every display tile above it stood in"
+        );
         check(gpu, &residency, &sphere);
-    });
+    }
+    // A frame writing the whole tree again keeps the stand-ins' bounds: the settle writes
+    // them over the stored ones the upload brings.
+    let before = display_tiles(gpu, &residency);
+    residency.tree.mark_all_dirty();
+    frame(
+        gpu,
+        &mut residency,
+        &mut sphere,
+        Drained::Epochs(Vec::new()),
+        None,
+        None,
+    );
+    let after = display_tiles(gpu, &residency);
+    for (place, (_, node)) in &after {
+        assert_eq!(node.error, before[place].1.error, "{place:?}'s bound kept");
+    }
+    check(gpu, &residency, &sphere);
 }
 
 #[test]

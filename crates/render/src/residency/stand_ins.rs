@@ -85,8 +85,9 @@ impl Residency {
     /// rows' steps; the tiles standing in are touched in the tree, so the bounds pass
     /// recomputes them.
     ///
-    /// The tiles behind a step stand in together, as many as the scratch and the rows allow,
-    /// the oldest data first; the rest are counted as skipped and try again the next frame.
+    /// The tiles behind a step stand in together, the oldest data first: a frame needing more
+    /// finest tiles than the kept scratch holds makes a one-off one. Tiles past what a scratch
+    /// can bind, or with no row left, are counted as skipped and try again the next frame.
     ///
     /// # Errors
     ///
@@ -115,7 +116,7 @@ impl Residency {
         if behind.is_empty() {
             return Ok(());
         }
-        let capacity = usize::try_from(self.stand_ins.pass.scratch_tiles()).unwrap_or(usize::MAX);
+        let capacity = usize::try_from(self.stand_ins.pass.most_tiles()).unwrap_or(usize::MAX);
         let mut reads: BTreeSet<TileKey> = BTreeSet::new();
         let mut chosen: Vec<(TileKey, Behind)> = Vec::new();
         for (key, tile) in behind {
@@ -128,6 +129,8 @@ impl Residency {
             }
         }
         let read: Vec<TileKey> = reads.into_iter().collect();
+        let tiles = u32::try_from(read.len()).unwrap_or(u32::MAX);
+        self.stand_ins.pass.begin(gpu, tiles)?;
         source.prepare(&read).map_err(Into::into)?;
         let vertices = usize::try_from(SizeClass::of(self.finest).vertices()).unwrap_or(0);
         let mut scratch: BTreeMap<TileKey, u32> = BTreeMap::new();
@@ -353,6 +356,15 @@ impl Residency {
                 false
             })
         });
+        let excess = self
+            .stand_ins
+            .history
+            .len()
+            .saturating_sub(super::MAX_STEPS);
+        if excess > 0 {
+            self.stand_ins.history.drain(..excess);
+            self.stats.stand_in_steps_dropped += excess as u64;
+        }
         match self.stand_ins.history.first() {
             None => self.stand_ins.refreshed.clear(),
             Some(oldest) => {
