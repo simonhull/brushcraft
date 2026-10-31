@@ -3,7 +3,7 @@
 // The two passes' shared declarations; each pass's own source follows them
 // (standin_replace.wgsl, standin_settle.wgsl), after upload::VERTEX_WGSL, tree::NODE_WGSL and the
 // constants render::standin prefixes: TILE_WORDS (a finest tile's words in the scratch), PENDING,
-// FRESH, EVERYTHING (the cone that covers everything, as its bits) and SLACK.
+// EVERYTHING (the cone that covers everything, as its bits) and SLACK.
 //
 // `replace` runs one workgroup per job: a drawn display tile and one edited finest tile under
 // it. Every vertex of the display tile that the finest tile holds takes the finest vertex's
@@ -45,7 +45,8 @@ struct Row {
     place: u32,
     // Zero.
     reserved: u32,
-    // PENDING: a step was replaced in this frame; FRESH: the bound before it is the node's.
+    // PENDING: a step was replaced in this frame, its bound to be raised from `error` (a new
+    // row's, the tile's stored bound).
     flags: u32,
     // The step's displacement bound, f32 bits: how far a finest vertex under the tile moved
     // since the data its bound before is of.

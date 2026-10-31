@@ -33,9 +33,10 @@ fn epochs_arrive_once_whole_and_in_order_or_as_a_resync() {
             let mut next = [0_u64; 3];
             for &(op, size) in ops {
                 let count = u32::from(size % 8);
-                feed.close(keys(u32::from(op), count));
+                feed.close(keys(u32::from(op), count), EpochKind::Refresh);
                 if count > 0 {
                     closed.push(Epoch {
+                        kind: EpochKind::Refresh,
                         seq: u64::try_from(closed.len()).unwrap(),
                         keys: keys(u32::from(op), count),
                     });
@@ -60,7 +61,7 @@ fn epochs_arrive_once_whole_and_in_order_or_as_a_resync() {
                                 next[n] = epoch.seq + 1;
                             }
                         }
-                        Drained::Resync => {
+                        Drained::Resync(_) => {
                             next[n] = u64::try_from(closed.len()).unwrap();
                         }
                     }
@@ -73,7 +74,7 @@ fn epochs_arrive_once_whole_and_in_order_or_as_a_resync() {
                     assert!(owed <= cap, "kept only within the cap");
                     assert_eq!(epochs, closed, "the stalled consumer gets every epoch");
                 }
-                Drained::Resync => assert!(owed > cap, "told to resync only past the cap"),
+                Drained::Resync(_) => assert!(owed > cap, "told to resync only past the cap"),
             }
         });
 }
@@ -86,8 +87,8 @@ fn an_unsubscribed_cursor_is_told_to_resync() {
     let kept = cursor.clone();
     feed.unsubscribe(cursor);
     assert!(!feed.is_listened(), "no one listens");
-    feed.close(keys(0, 3));
-    assert_eq!(feed.drain(&kept), Drained::Resync, "gone");
+    feed.close(keys(0, 3), EpochKind::Refresh);
+    assert_eq!(feed.drain(&kept), Drained::Resync(Vec::new()), "gone");
 }
 
 /// A cursor from one feed is never taken for another feed's.
@@ -99,13 +100,14 @@ fn a_cursor_of_another_feed_is_told_to_resync() {
     let (mut a, mut b) = (StaleFeed::new(10), StaleFeed::new(10));
     let from_a = a.subscribe();
     let from_b = b.subscribe();
-    b.close(keys(0, 2));
-    assert_eq!(b.drain(&from_a), Drained::Resync, "not b's");
+    b.close(keys(0, 2), EpochKind::Refresh);
+    assert_eq!(b.drain(&from_a), Drained::Resync(Vec::new()), "not b's");
     b.unsubscribe(from_a);
     assert!(b.is_listened(), "b's consumer stays");
     assert_eq!(
         b.drain(&from_b),
         Drained::Epochs(vec![Epoch {
+            kind: EpochKind::Refresh,
             seq: 0,
             keys: keys(0, 2),
         }]),
@@ -119,13 +121,13 @@ fn has_pending_says_whether_a_drain_would_give_anything() {
     let mut feed = StaleFeed::new(4);
     let cursor = feed.subscribe();
     assert!(!feed.has_pending(&cursor), "nothing closed yet");
-    feed.close(keys(0, 2));
+    feed.close(keys(0, 2), EpochKind::Refresh);
     assert!(feed.has_pending(&cursor), "an epoch waits");
     assert_ne!(feed.drain(&cursor), Drained::Epochs(Vec::new()));
     assert!(!feed.has_pending(&cursor), "drained");
-    feed.close(keys(0, 5));
+    feed.close(keys(0, 5), EpochKind::Refresh);
     assert!(feed.has_pending(&cursor), "past the cap: a resync waits");
-    assert_eq!(feed.drain(&cursor), Drained::Resync);
+    assert_eq!(feed.drain(&cursor), Drained::Resync(Vec::new()));
     assert!(!feed.has_pending(&cursor), "resynced");
     let other = StaleFeed::new(4).subscribe();
     assert!(

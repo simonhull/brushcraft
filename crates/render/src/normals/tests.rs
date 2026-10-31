@@ -623,7 +623,7 @@ fn strokes_reach_every_tile_reading_them(gpu: &Gpu, name: &str, config: Residenc
     assert_parity(&mesh, source.store, &residency, &after);
 
     // A resync: every tile read again, as one epoch.
-    residency.apply(Drained::Resync);
+    residency.apply(Drained::Resync(Vec::new()));
     settle(gpu, &mut residency, &mut source, &keys, &mesh);
     assert_eq!(residency.stats().resyncs, 1, "resynced");
     let resynced = slots(gpu, &residency, &keys);

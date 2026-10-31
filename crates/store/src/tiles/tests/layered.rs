@@ -1095,6 +1095,6 @@ fn a_tile_lost_to_a_rebase_is_named_by_the_feed() {
             epochs.iter().any(|e| e.keys.contains(&lost)),
             "the lost tile is named"
         ),
-        crate::stale::Drained::Resync => panic!("no resync expected"),
+        crate::stale::Drained::Resync(_) => panic!("no resync expected"),
     }
 }

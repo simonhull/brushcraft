@@ -176,6 +176,17 @@ impl StoreId {
     }
 }
 
+/// A display tile a brush stroke is changing, as [`TileStore::bump_display_error`] keeps it.
+#[derive(Debug, Clone)]
+struct Bumped {
+    /// Its record as it was before the stroke's first dab reached it.
+    record: crate::display::DisplayRecord,
+    /// What the dabs since have added to its bound: twice their displacements, summed.
+    extra: f32,
+    /// The finest tiles under it the dabs moved.
+    finest: BTreeSet<TileKey>,
+}
+
 /// A project held out of core: the base mesh, its files, budgeted pools of correction and
 /// evaluated tiles, the change feed and the op generator.
 ///
@@ -372,7 +383,7 @@ pub struct TileStore {
     /// with what the dabs since have added to their bound (see
     /// [`TileStore::bump_display_error`]): drawn in their place until a refresh records them.
     /// Memory only: never written.
-    bumped: std::collections::BTreeMap<TileKey, (crate::display::DisplayRecord, f32)>,
+    bumped: std::collections::BTreeMap<TileKey, Bumped>,
     /// The display tiles that wouldn't build, each with why and the count of correction changes
     /// ([`TileStore::edits`]) it failed at: unknown, and left out of every job until a change
     /// lands (see [`TileStore::failed_display`]).
@@ -416,6 +427,10 @@ pub struct TileStore {
     /// The other tiles the open epoch changed (display tiles recorded), noted while a consumer
     /// listens.
     epoch_keys: BTreeSet<TileKey>,
+    /// The open epoch's brush steps, if it has any: the largest displacement their bumps
+    /// raised display bounds by, and the correction tiles those bumps covered. The epoch is a
+    /// step's if they cover every write in it ([`crate::EpochKind`]).
+    epoch_step: Option<(f32, BTreeSet<TileKey>)>,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,
     /// The queued evaluation (see [`crate::queued`]): finest tiles wanted by priority, run in

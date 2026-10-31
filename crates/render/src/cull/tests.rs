@@ -210,6 +210,7 @@ fn a_bounds_pass_that_fails_leaves_its_tiles_unknown_not_stale() {
         // A display tile, its e and cone unused here (the bounds pass reads neither): e 0 and
         // the cone that covers everything.
         let unused = TileDetail {
+            stored: None,
             error: 0.0,
             cone: geom::FinestNormalCone::EVERYTHING,
         };

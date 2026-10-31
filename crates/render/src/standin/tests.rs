@@ -3,7 +3,7 @@
 //! A project with its display layer built, seen from a distance (every display tile resident,
 //! no finest tile), edited by corrections the way a
 //! brush step writes them (its display bounds bumped too), and the step's epoch applied with
-//! [`Residency::apply_step`]: the edited finest tiles reach the scratch as the store's rings,
+//! [`Residency::apply`]: the edited finest tiles reach the scratch as the store's rings,
 //! the store's own epoch names every finest tile holding a moved vertex (across faces, round a
 //! base vertex), and every resident display tile's border is the store's finest bits after it.
 //! Then the refresh replaces the stand-ins.
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use geom::{BaseMesh, Channel, FaceId, Level, TileKey, Vec3, cube_sphere};
-use store::{Drained, Project, ProjectConfig, StaleCursor, StoreConfig, TileStore};
+use store::{Drained, EpochKind, Project, ProjectConfig, StaleCursor, StoreConfig, TileStore};
 use wgpu::{CommandEncoderDescriptor, PollType};
 
 use super::*;
@@ -62,20 +62,10 @@ fn run_jobs(store: &mut TileStore) {
     }
 }
 
-/// One frame over the store: the drain applied (after a step of `displacement`, if given),
-/// staged, submitted and waited for.
-fn frame(
-    gpu: &Gpu,
-    residency: &mut Residency,
-    store: &mut TileStore,
-    drained: Drained,
-    displacement: Option<Displacement>,
-) {
+/// One frame over the store: the drain applied, staged, submitted and waited for.
+fn frame(gpu: &Gpu, residency: &mut Residency, store: &mut TileStore, drained: Drained) {
     residency.begin_frame(gpu).expect("a frame begins");
-    match displacement {
-        Some(displacement) => residency.apply_step(drained, displacement),
-        None => residency.apply(drained),
-    }
+    residency.apply(drained);
     residency.use_frame(FrameUse::default());
     let mut source = StoreSource::new(store);
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -245,15 +235,15 @@ fn finest_of(drained: &Drained) -> BTreeSet<TileKey> {
 /// A brush step on `face` by corrections, as the edit path writes one.
 ///
 /// It lifts by `lift` the face's corner (a base vertex), a vertex along its border and two at
-/// its centre, with the display bounds bumped as the edit path bumps them. Returns its drain and
-/// its displacement bound, measured on the store's finest level.
+/// its centre, with the display bounds bumped as the edit path bumps them, by the displacement
+/// measured on the store's finest level. Returns its drain.
 fn step(
     store: &mut TileStore,
     mesh: &BaseMesh,
     cursor: &StaleCursor,
     face: FaceId,
     lift: Vec3,
-) -> (Drained, Displacement) {
+) -> Drained {
     let finest = level(FINEST);
     let n = finest.face_quads();
     let before = finest_grids(store, mesh);
@@ -282,6 +272,12 @@ fn step(
         store
             .set_correction(face, finest, fi, fj, c + lift)
             .expect("written");
+        // The write goes to the vertex's owner copy, which may be another face's tile.
+        let copies = mesh.topology().copies(face, finest, fi, fj);
+        let holders = copies
+            .iter()
+            .filter_map(|copy| TileKey::displacement(copy.face, finest, copy.tx, copy.ty).ok());
+        edited.extend(holders);
         edited.push(key);
     }
     let after = finest_grids(store, mesh);
@@ -299,8 +295,7 @@ fn step(
     let worst = (worst as f32).next_up();
     store.bump_display_error(&edited, worst).expect("bumped");
     store.close_epoch().expect("closed");
-    let displacement = Displacement::new(worst).expect("finite");
-    (store.drain_stale(cursor), displacement)
+    store.drain_stale(cursor)
 }
 
 #[test]
@@ -320,24 +315,19 @@ fn a_step_on_the_store_stands_in_for_every_display_tile_above_it_and_the_refresh
         let budget = ResidencyConfig::new(1 << 30, 16 << 20, 64 << 20, 8 << 20, 64, level(6))
             .expect("a configuration");
         let mut residency = Residency::new(gpu, &mesh, finest, budget).expect("residency");
-        frame(
-            gpu,
-            &mut residency,
-            store,
-            Drained::Epochs(Vec::new()),
-            None,
-        );
+        frame(gpu, &mut residency, store, Drained::Epochs(Vec::new()));
         let built = finest_grids(store, &mesh);
         let checked = check(gpu, &residency, &built, &BTreeSet::new());
         assert!(checked > 1000, "{checked} border vertices");
 
         let face = FaceId::new(2);
         for lift in [Vec3::new(0.0, 0.01, 0.03), Vec3::new(0.02, -0.01, 0.0)] {
-            let (drained, displacement) = step(store, &mesh, &cursor, face, lift);
+            let drained = step(store, &mesh, &cursor, face, lift);
+            assert_step(&drained);
             let edited = finest_of(&drained);
             let faces: BTreeSet<FaceId> = edited.iter().map(TileKey::face).collect();
             assert!(faces.len() >= 3, "the corner's three faces: {faces:?}");
-            frame(gpu, &mut residency, store, drained, Some(displacement));
+            frame(gpu, &mut residency, store, drained);
             assert!(
                 residency
                     .resident()
@@ -355,14 +345,8 @@ fn a_step_on_the_store_stands_in_for_every_display_tile_above_it_and_the_refresh
         // The refresh: its epochs replace every stand-in.
         run_jobs(store);
         let drained = store.drain_stale(&cursor);
-        frame(gpu, &mut residency, store, drained, None);
-        frame(
-            gpu,
-            &mut residency,
-            store,
-            Drained::Epochs(Vec::new()),
-            None,
-        );
+        frame(gpu, &mut residency, store, drained);
+        frame(gpu, &mut residency, store, Drained::Epochs(Vec::new()));
         let refreshed = finest_grids(store, &mesh);
         check(gpu, &residency, &refreshed, &BTreeSet::new());
         for (place, (_, node)) in display_tiles(gpu, &residency) {
@@ -384,6 +368,18 @@ fn a_step_on_the_store_stands_in_for_every_display_tile_above_it_and_the_refresh
     });
 }
 
+/// Checks that `drained` holds one epoch, a step's.
+fn assert_step(drained: &Drained) {
+    let Drained::Epochs(epochs) = drained else {
+        panic!("epochs, not a resync");
+    };
+    let kinds: Vec<EpochKind> = epochs.iter().map(|epoch| epoch.kind).collect();
+    assert!(
+        matches!(kinds.as_slice(), [EpochKind::Step { displacement }] if *displacement > 0.0),
+        "one step's epoch: {kinds:?}"
+    );
+}
+
 /// Builds the store's display layer whole.
 fn run_jobs_after_rebuild(store: &mut TileStore, finest: Level) {
     store.queue_display_rebuild(finest);
@@ -397,4 +393,129 @@ fn the_passes_index_no_local_array_at_run_time() {
         let indexed = crate::shader_check::run_time_indexed_locals(&format!("{prefix}{own}"));
         assert!(indexed.is_empty(), "{indexed:?}");
     }
+}
+
+/// A project over the cube sphere to [`FINEST`], its display layer built, with `store`'s
+/// configuration changed by `configure`.
+fn project(
+    dir: &TempDir,
+    configure: impl FnOnce(StoreConfig) -> StoreConfig,
+) -> (Project, BaseMesh) {
+    let mesh = cube_sphere(1).expect("a mesh");
+    let finest = level(FINEST);
+    let config = ProjectConfig {
+        store: configure(StoreConfig::new(256 << 20, 1).with_display(finest)),
+        recovery_dir: dir.0.clone(),
+    };
+    let mut project = Project::new(mesh.clone(), config).expect("a project");
+    run_jobs_after_rebuild(project.store(), finest);
+    (project, mesh)
+}
+
+/// Residency seen from a distance (every display tile resident, no finest tile), its floor up.
+fn far_residency(gpu: &Gpu, mesh: &BaseMesh, store: &mut TileStore) -> Residency {
+    let config = ResidencyConfig::new(1 << 30, 16 << 20, 64 << 20, 8 << 20, 64, level(6))
+        .expect("a configuration");
+    let mut residency = Residency::new(gpu, mesh, level(FINEST), config).expect("residency");
+    frame(gpu, &mut residency, store, Drained::Epochs(Vec::new()));
+    residency
+}
+
+#[test]
+fn a_resync_hands_over_what_the_stroke_changed_and_the_stand_ins_come_back() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("resync");
+        // A feed holding a few keys: a step's epoch loses the consumer its epochs.
+        let (mut project, mesh) = project(&dir, |config| config.with_stale_cap(4));
+        let store = project.store();
+        let cursor = store.subscribe_stale();
+        let mut residency = far_residency(gpu, &mesh, store);
+        let face = FaceId::new(2);
+        let drained = step(store, &mesh, &cursor, face, Vec3::new(0.0, 0.01, 0.03));
+        let Drained::Resync(unrefreshed) = &drained else {
+            panic!("a resync");
+        };
+        assert!(
+            !unrefreshed.is_empty(),
+            "the stroke's display tiles handed over"
+        );
+        let edited: BTreeSet<TileKey> = unrefreshed
+            .iter()
+            .flat_map(|tile| tile.finest.iter().copied())
+            .collect();
+        frame(gpu, &mut residency, store, drained);
+        frame(gpu, &mut residency, store, Drained::Epochs(Vec::new()));
+        assert_eq!(residency.stats().resyncs, 1);
+        assert!(residency.stats().stand_ins > 0, "stood in again");
+        let grids = finest_grids(store, &mesh);
+        check(gpu, &residency, &grids, &above(&edited));
+        store.unsubscribe_stale(cursor);
+        drop(project.close(false));
+    });
+}
+
+#[test]
+fn a_failed_step_before_an_upkeep_refresh_never_passes_for_a_refresh() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("failed-step");
+        let (mut project, mesh) = project(&dir, |config| config);
+        let store = project.store();
+        let cursor = store.subscribe_stale();
+        let mut residency = far_residency(gpu, &mesh, store);
+        // A step that failed after its writes, before its bump: no displacement known.
+        store.begin_op().expect("an op");
+        let finest = level(FINEST);
+        let (key, li, lj) = TileKey::containing(
+            geom::LayerId::BASE,
+            Channel::DISPLACEMENT,
+            FaceId::new(2),
+            finest,
+            40,
+            50,
+        )
+        .expect("a finest tile");
+        let c = store
+            .correction(key)
+            .expect("reads")
+            .get(li, lj)
+            .expect("a vertex");
+        store
+            .set_correction(
+                FaceId::new(2),
+                finest,
+                40,
+                50,
+                c + Vec3::new(0.0, 0.0, 0.02),
+            )
+            .expect("written");
+        // The upkeep's refresh runs next, closing epochs of its own.
+        run_jobs(store);
+        let drained = store.drain_stale(&cursor);
+        let Drained::Epochs(epochs) = &drained else {
+            panic!("epochs");
+        };
+        for epoch in epochs {
+            let moved = epoch
+                .keys
+                .iter()
+                .any(|named| named.channel() != Channel::DISPLAY);
+            if moved {
+                assert_eq!(
+                    epoch.kind,
+                    EpochKind::Revert,
+                    "the writes' epoch: {epoch:?}"
+                );
+            }
+        }
+        assert!(epochs.iter().any(|epoch| epoch.kind == EpochKind::Revert));
+        frame(gpu, &mut residency, store, drained);
+        run_jobs(store);
+        let refreshed = store.drain_stale(&cursor);
+        frame(gpu, &mut residency, store, refreshed);
+        frame(gpu, &mut residency, store, Drained::Epochs(Vec::new()));
+        let grids = finest_grids(store, &mesh);
+        check(gpu, &residency, &grids, &BTreeSet::new());
+        store.unsubscribe_stale(cursor);
+        drop(project.close(false));
+    });
 }

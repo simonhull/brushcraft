@@ -303,7 +303,7 @@ impl GpuResidency {
             .stage(gpu, &mut StoreSource::new(store), deadline)
             .context("staging tiles")?;
         // Tiles arriving or leaving change what the level choice asks for too.
-        changed |= !uploads.is_empty();
+        changed |= uploads.changes_scene();
         let heard = residency.requests_heard();
         self.settle_from = settle(self.settle_from, changed.then_some(frame), heard);
         self.cut_from = settle(self.cut_from, changed.then_some(frame), self.cut_heard);

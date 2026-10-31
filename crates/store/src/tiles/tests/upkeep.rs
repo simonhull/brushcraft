@@ -410,7 +410,7 @@ fn a_dab_makes_the_cones_it_reaches_cover_everything_until_the_refresh() {
 fn named_since(store: &mut TileStore, cursor: &crate::stale::StaleCursor) -> BTreeSet<TileKey> {
     match store.drain_stale(cursor) {
         crate::stale::Drained::Epochs(epochs) => epochs.into_iter().flat_map(|e| e.keys).collect(),
-        crate::stale::Drained::Resync => panic!("the consumer keeps up"),
+        crate::stale::Drained::Resync(_) => panic!("the consumer keeps up"),
     }
 }
 

@@ -84,9 +84,8 @@ const GROUP: u32 = 64;
 /// A row's flag: a step replaced its tile's vertices this frame, and its bound is to be raised.
 const PENDING: u32 = 1;
 
-/// A row's flag: the bound before the step is the node's (the tile's stored `e`), not the
-/// row's (a row made this frame).
-const FRESH: u32 = 2;
+/// Frames the one-off scratch is kept without a frame using it: a few seconds.
+const ONE_OFF_FRAMES: u32 = 240;
 
 /// What the settled bound is multiplied by: `1 + 2⁻¹⁶`, more than the rounding of its sum and
 /// of the distances measured (a few `f32` steps, `2⁻²⁴` each, of each) can have taken off.
@@ -105,21 +104,36 @@ const TILE_BYTES: u64 = TILE_WORDS as u64 * 4;
 /// A bound on how far a brush step moved any finest vertex, in world units: what a stand-in's
 /// bound grows by ([module notes](self), "The bound").
 ///
-/// The edit path knows it (the in-stroke bound uses it too) and hands it to
-/// [`crate::residency::Residency::apply_step`] with the step's epochs.
+/// The store's step epoch carries it ([`store::EpochKind::Step`]): the edit path computes it
+/// for the store's in-stroke bound.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
 pub struct Displacement(f32);
+
+/// A displacement bound that isn't one: not finite, or negative.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("{0} is no displacement bound: it must be finite and not negative")]
+pub struct NotADisplacement(pub f32);
+
+impl TryFrom<f32> for Displacement {
+    type Error = NotADisplacement;
+
+    /// A displacement bound of `bound` world units.
+    ///
+    /// # Errors
+    ///
+    /// [`NotADisplacement`] unless it is finite and not negative.
+    fn try_from(bound: f32) -> Result<Self, NotADisplacement> {
+        if bound.is_finite() && bound >= 0.0 {
+            Ok(Self(bound))
+        } else {
+            Err(NotADisplacement(bound))
+        }
+    }
+}
 
 impl Displacement {
     /// No movement.
     pub const ZERO: Self = Self(0.0);
-
-    /// A displacement bound of `bound` world units, or `None` unless it is finite and not
-    /// negative.
-    #[must_use]
-    pub fn new(bound: f32) -> Option<Self> {
-        (bound.is_finite() && bound >= 0.0).then_some(Self(bound))
-    }
 
     /// The bound, world units.
     #[must_use]
@@ -179,7 +193,7 @@ pub(crate) struct GpuRow {
     pub(crate) place: u32,
     /// Zero.
     pub(crate) reserved: u32,
-    /// [`PENDING`] and [`FRESH`].
+    /// [`PENDING`].
     pub(crate) flags: u32,
     /// The step's displacement bound, `f32` bits.
     pub(crate) displacement: u32,
@@ -213,13 +227,16 @@ const ROW_STEP_OFFSET: u64 = 16;
 /// What a frame writes into one row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum RowWrite {
-    /// The row is the tile at `place`'s, at `node`, made now: its bound before the step is the
-    /// node's.
+    /// The row is the tile at `place`'s, at `node`, made now: its bound before the step is
+    /// `stored`, the bound the tile's data was stored with (not a stroke's raise of it, which
+    /// would count the stroke's steps twice).
     Fresh {
         /// The tile's node.
         node: u32,
         /// The tile.
         place: Place,
+        /// Its stored bound.
+        stored: f32,
         /// The step's displacement bound.
         displacement: Displacement,
     },
@@ -340,9 +357,14 @@ pub(crate) struct StandInPass {
     scratch_tiles: u32,
     /// The most finest tiles a scratch can hold: as many as the device binds.
     most_tiles: u32,
-    /// A scratch made for the frame being staged alone, which needs more finest tiles than the
-    /// kept one holds: held by the frame's bind groups, and dropped with them.
+    /// A larger scratch for frames that read more finest tiles than the kept one holds: made
+    /// as one needs it, grown by half again past the need, dropped after
+    /// [`ONE_OFF_FRAMES`] frames without one.
     one_off: Option<Buffer>,
+    /// Whether the frame being staged uses the one-off scratch.
+    use_one_off: bool,
+    /// Frames since one last used the one-off scratch.
+    one_off_idle: u32,
     /// The rows.
     rows: Buffer,
     /// The job list the frame's dispatches read, grown as a frame needs.
@@ -359,7 +381,7 @@ impl StandInPass {
     ///
     /// As [`Gpu::scoped`], making the pipelines or the buffers.
     pub(crate) fn new(gpu: &Gpu, scratch_tiles: u32, rows: u32) -> Result<Self, GpuError> {
-        Self::with_patches(gpu, scratch_tiles, rows, &[])
+        Self::build(gpu, scratch_tiles, rows, &[])
     }
 
     /// [`StandInPass::new`] with each `(from, to)` of `patches` replaced in both passes'
@@ -368,7 +390,30 @@ impl StandInPass {
     /// # Errors
     ///
     /// As [`StandInPass::new`].
+    #[cfg(test)]
     pub(crate) fn with_patches(
+        gpu: &Gpu,
+        scratch_tiles: u32,
+        rows: u32,
+        patches: &[(&str, &str)],
+    ) -> Result<Self, GpuError> {
+        Self::build(gpu, scratch_tiles, rows, patches)
+    }
+
+    /// The most finest tiles a frame's stand-ins can read, made smaller for the tests of what
+    /// happens past it.
+    #[cfg(test)]
+    pub(crate) const fn set_most_tiles(&mut self, most: u32) {
+        self.most_tiles = most;
+    }
+
+    /// The pass, its sources with each `(from, to)` of `patches` replaced (none but in the
+    /// tests' bites).
+    ///
+    /// # Errors
+    ///
+    /// As [`StandInPass::new`].
+    fn build(
         gpu: &Gpu,
         scratch_tiles: u32,
         rows: u32,
@@ -452,6 +497,8 @@ impl StandInPass {
             )
             .unwrap_or(u32::MAX),
             one_off: None,
+            use_one_off: false,
+            one_off_idle: 0,
             rows: row_buffer,
             jobs: storage_buffer(gpu, "stand-in jobs", 4096)?,
             job_alignment: u64::from(limits.min_storage_buffer_offset_alignment).max(JOB_BYTES),
@@ -465,25 +512,47 @@ impl StandInPass {
     }
 
     /// Starts a frame whose stand-ins read `tiles` finest tiles (at most
-    /// [`StandInPass::most_tiles`]): the kept scratch if it holds them, else a one-off scratch
-    /// made for the frame.
+    /// [`StandInPass::most_tiles`]): the kept scratch if it holds them, else the one-off
+    /// scratch, made or grown (by half again past the need, up to what the device binds) if
+    /// it is too small.
     ///
     /// # Errors
     ///
     /// As [`Gpu::scoped`], making the one-off scratch.
     pub(crate) fn begin(&mut self, gpu: &Gpu, tiles: u32) -> Result<(), GpuError> {
-        self.one_off = if tiles > self.scratch_tiles {
-            let bytes = u64::from(tiles) * TILE_BYTES;
-            Some(storage_buffer(gpu, "one-off stand-in scratch", bytes)?)
-        } else {
-            None
-        };
+        self.use_one_off = tiles > self.scratch_tiles;
+        if !self.use_one_off {
+            self.one_off_idle = self.one_off_idle.saturating_add(1);
+            if self.one_off_idle > ONE_OFF_FRAMES {
+                self.one_off = None;
+            }
+            return Ok(());
+        }
+        self.one_off_idle = 0;
+        let need = u64::from(tiles) * TILE_BYTES;
+        if self
+            .one_off
+            .as_ref()
+            .is_none_or(|buffer| buffer.size() < need)
+        {
+            let grown = (need + need / 2).min(u64::from(self.most_tiles) * TILE_BYTES);
+            let bytes = grown.max(need);
+            self.one_off = Some(storage_buffer(gpu, "one-off stand-in scratch", bytes)?);
+        }
         Ok(())
     }
 
-    /// The frame's scratch: its one-off one, if it made one, else the kept one.
+    /// Bytes of the one-off scratch, while it is kept.
+    pub(crate) fn one_off_bytes(&self) -> u64 {
+        self.one_off.as_ref().map_or(0, Buffer::size)
+    }
+
+    /// The frame's scratch: the one-off one, if the frame uses it, else the kept one.
     fn frame_scratch(&self) -> &Buffer {
-        self.one_off.as_ref().unwrap_or(&self.scratch)
+        match &self.one_off {
+            Some(one_off) if self.use_one_off => one_off,
+            _ => &self.scratch,
+        }
     }
 
     /// Bytes of GPU memory it keeps, outside the slot budget: the scratch, the rows and the job
@@ -493,7 +562,8 @@ impl StandInPass {
     }
 
     /// Stages finest tile `index` of the scratch: `positions`, its vertices' positions as
-    /// `f32` bits, three words a vertex, row-major (at most [`TILE_WORDS`] − 1 words).
+    /// `f32` bits, three words a vertex, row-major, padded to a whole number of 8-byte words as
+    /// staging copies need (at most [`TILE_WORDS`] words).
     ///
     /// # Errors
     ///
@@ -506,15 +576,10 @@ impl StandInPass {
         index: u32,
         positions: &[u32],
     ) -> Result<(), GpuError> {
-        let mut words = positions.to_vec();
-        // A whole number of 8-byte words, as staging copies need.
-        if !words.len().is_multiple_of(2) {
-            words.push(0);
-        }
         batch.write(
             gpu,
             ring,
-            bytemuck::cast_slice(&words),
+            bytemuck::cast_slice(positions),
             self.frame_scratch(),
             u64::from(index) * TILE_BYTES,
             true,
@@ -540,14 +605,16 @@ impl StandInPass {
             RowWrite::Fresh {
                 node,
                 place,
+                stored,
                 displacement,
             } => {
                 let fresh = GpuRow {
                     node,
                     face: place.face().index(),
                     place: place.packed(),
-                    flags: PENDING | FRESH,
+                    flags: PENDING,
                     displacement: displacement.get().to_bits(),
+                    error: stored.to_bits(),
                     ..GpuRow::FREE
                 };
                 batch.write(gpu, ring, bytemuck::bytes_of(&fresh), &self.rows, at, true)?;
@@ -595,9 +662,6 @@ impl StandInPass {
         locate: impl Fn(Slot) -> Option<(Buffer, u64)>,
         rows: u32,
     ) -> Result<Option<StandInWork>, GpuError> {
-        // The frame's one-off scratch, if it made one: its bind groups hold it from here.
-        let one_off = self.one_off.take();
-        let scratch = one_off.as_ref().unwrap_or(&self.scratch);
         if stand_ins.is_empty() && rows == 0 {
             return Ok(None);
         }
@@ -642,6 +706,7 @@ impl StandInPass {
         if !list.is_empty() {
             batch.write(gpu, ring, bytemuck::cast_slice(&list), &self.jobs, 0, true)?;
         }
+        let scratch = self.frame_scratch();
         let replaces = spans.iter().map(|&(target, start, count)| {
             let group = gpu.scoped("stand-in replace bind group", || {
                 gpu.device().create_bind_group(&BindGroupDescriptor {
@@ -689,7 +754,6 @@ fn shared_source() -> String {
         "{VERTEX_WGSL}{NODE_WGSL}\
          const TILE_WORDS: u32 = {TILE_WORDS}u;\n\
          const PENDING: u32 = {PENDING}u;\n\
-         const FRESH: u32 = {FRESH}u;\n\
          const EVERYTHING: u32 = {everything}u;\n\
          const SLACK: f32 = {SLACK:?};\n\
          {STANDIN_WGSL}"
@@ -755,6 +819,11 @@ pub(crate) struct StandInWork {
 }
 
 impl StandInWork {
+    /// Whether it makes a stand-in (else it only settles bounds into the tree).
+    pub(crate) fn replaces(&self) -> bool {
+        !self.replaces.is_empty()
+    }
+
     /// Encodes the pass into `encoder`: after the copies that bring the scratch, the rows and
     /// the tree, before any pass that reads the slots or the tree.
     pub(crate) fn encode(&self, encoder: &mut CommandEncoder) {

@@ -191,11 +191,10 @@ impl World {
             let detail = if finest_tile {
                 TileDetail::FINEST
             } else {
-                let normals: Vec<geom::Vec3> = vertices
-                    .iter()
-                    .map(|v| geom::Vec3::new(v.normal[0], v.normal[1], v.normal[2]))
-                    .collect();
+                let normal = |v: &GpuVertex| geom::Vec3::new(v.normal[0], v.normal[1], v.normal[2]);
+                let normals: Vec<geom::Vec3> = vertices.iter().map(normal).collect();
                 TileDetail {
+                    stored: None,
                     error: measured_error(place, finest, &vertices, grid, scale),
                     cone: FinestNormalCone::covering(&normals).expect("normals"),
                 }
@@ -900,6 +899,7 @@ fn the_pinhole_test_a_seam_between_morphs_takes_both_sides_shared_factors() {
             let parent = Place::of(&TileKey::display(f, level(2), 0, 0).expect("a key"));
             let tile = &world.tiles[&parent];
             let detail = TileDetail {
+                stored: None,
                 error,
                 ..tile.detail
             };
@@ -1901,6 +1901,7 @@ fn the_geomorph_moves_odd_vertices_from_their_midpoint_to_their_place_over_150_m
 fn set_error(gpu: &Gpu, world: &mut World, place: Place, error: f32) {
     let tile = &world.tiles[&place];
     let detail = TileDetail {
+        stored: None,
         error,
         ..tile.detail
     };

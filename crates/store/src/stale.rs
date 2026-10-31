@@ -40,24 +40,57 @@ pub struct StaleCursor {
     consumer: u64,
 }
 
+/// What kind of operation closed an epoch: what a renderer may assume of the tiles it names.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EpochKind {
+    /// A brush step: its writes moved no finest vertex farther than `displacement` (world
+    /// units), and the display tiles it names had only their bound raised
+    /// ([`TileStore::bump_display_error`](crate::TileStore::bump_display_error)).
+    Step {
+        /// A bound on how far the step moved any finest vertex.
+        displacement: f32,
+    },
+    /// A refresh: the display tiles it names were rebuilt from the finest level as it is.
+    Refresh,
+    /// Anything else that moved finest vertices by an unknown amount: a lost tile going back
+    /// to its record, a write outside a step. Display tiles above its finest tiles are only
+    /// what the store holds for them.
+    Revert,
+}
+
+/// A display tile a stroke changed since its last refresh, as a resync hands it over: what a
+/// renderer needs to stand in for it again ([`Drained::Resync`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unrefreshed {
+    /// The display tile.
+    pub tile: TileKey,
+    /// A bound on how far the steps since its record moved any finest vertex under it.
+    pub displacement: f32,
+    /// The finest tiles under it those steps moved.
+    pub finest: BTreeSet<TileKey>,
+}
+
 /// The evaluated tiles one store operation changed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Epoch {
     /// The epoch's number: one more than the epoch before it, store-wide.
     pub seq: u64,
+    /// What closed it.
+    pub kind: EpochKind,
     /// The finest tiles and display tiles whose decoded positions (or, for a finest tile, the
     /// ring of neighbouring positions uploaded with it) changed, in key order.
     pub keys: BTreeSet<TileKey>,
 }
 
 /// What a drain gives a consumer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Drained {
     /// Every epoch closed since the last drain, in order, each whole.
     Epochs(Vec<Epoch>),
     /// The consumer fell more than the cap behind and lost its epochs: it must ask for
-    /// everything it shows again. Its cursor goes on from now.
-    Resync,
+    /// everything it shows again. Its cursor goes on from now. It carries every display tile a
+    /// stroke changed since its last refresh ([`Unrefreshed`]), which the lost epochs named.
+    Resync(Vec<Unrefreshed>),
 }
 
 /// One consumer's pending epochs.
@@ -129,14 +162,15 @@ impl StaleFeed {
         }
     }
 
-    /// Closes an epoch of `keys`, handing it to every consumer; a consumer it would take past
-    /// the cap loses its epochs instead. Nothing is closed for no keys.
-    pub(crate) fn close(&mut self, keys: BTreeSet<TileKey>) {
+    /// Closes an epoch of `keys`, of `kind`, handing it to every consumer; a consumer it would
+    /// take past the cap loses its epochs instead. Nothing is closed for no keys.
+    pub(crate) fn close(&mut self, keys: BTreeSet<TileKey>, kind: EpochKind) {
         if keys.is_empty() || self.consumers.is_empty() {
             return;
         }
         let epoch = Epoch {
             seq: self.next_seq,
+            kind,
             keys,
         };
         self.next_seq += 1;
@@ -160,13 +194,13 @@ impl StaleFeed {
     /// past the cap; an unknown cursor (unsubscribed, or another feed's) is told to resync.
     pub(crate) fn drain(&mut self, cursor: &StaleCursor) -> Drained {
         if cursor.feed != self.id {
-            return Drained::Resync;
+            return Drained::Resync(Vec::new());
         }
         let Some(consumer) = self.consumers.get_mut(&cursor.consumer) else {
-            return Drained::Resync;
+            return Drained::Resync(Vec::new());
         };
         if std::mem::take(&mut consumer.lost) {
-            return Drained::Resync;
+            return Drained::Resync(Vec::new());
         }
         consumer.keys = 0;
         Drained::Epochs(consumer.pending.drain(..).collect())

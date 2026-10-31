@@ -246,7 +246,7 @@ fn the_floor_loaded_on_open_is_drawn_without_reading_the_file() {
 /// and where none is known, the floor's copy as last recorded, its bound the largest there is
 /// and its cone covering everything. Call it after a draw, which settles the writes.
 fn expected(store: &TileStore, key: &TileKey) -> Option<geom::DisplayTile> {
-    if let Some((record, extra)) = store.bumped.get(key) {
+    if let Some(Bumped { record, extra, .. }) = store.bumped.get(key) {
         let bound = (record.error + extra).next_up();
         let everything = geom::FinestNormalCone::EVERYTHING;
         return geom::DisplayTile::decode(*key, bound, everything, &record.encoded).ok();
@@ -436,7 +436,7 @@ fn a_tile_bumped_after_its_read_ahead_is_drawn_bumped() {
     let drawn = store.display_for_draw(&bumped).unwrap();
     for (key, tile) in bumped.iter().zip(drawn) {
         let tile = tile.unwrap();
-        let (record, extra) = &store.bumped[key];
+        let Bumped { record, extra, .. } = &store.bumped[key];
         assert_eq!(
             tile.error(),
             (record.error + extra).next_up(),

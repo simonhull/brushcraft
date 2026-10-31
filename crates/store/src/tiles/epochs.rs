@@ -13,7 +13,7 @@ use geom::{Level, TileKey};
 
 use super::TileStore;
 use super::error::CacheError;
-use crate::stale::{Drained, StaleCursor};
+use crate::stale::{Drained, EpochKind, StaleCursor};
 
 impl TileStore {
     /// A new consumer of the stale-tile feed: its first drain gives the epochs closed after now
@@ -35,7 +35,10 @@ impl TileStore {
     /// [`Drained::Resync`] if it fell more than [`StoreConfig::stale_cap`](super::StoreConfig)
     /// keys behind.
     pub fn drain_stale(&mut self, cursor: &StaleCursor) -> Drained {
-        self.stale.drain(cursor)
+        match self.stale.drain(cursor) {
+            Drained::Resync(_) => Drained::Resync(self.unrefreshed_display()),
+            epochs @ Drained::Epochs(_) => epochs,
+        }
     }
 
     /// Whether [`TileStore::drain_stale`] with `cursor` would give anything now: epochs closed
@@ -48,6 +51,10 @@ impl TileStore {
 
     /// Closes the epoch of the operation since the last one: every finest tile whose evaluated
     /// positions, or ring, the writes since changed, and every display tile recorded since.
+    ///
+    /// Its kind ([`EpochKind`]): a step's if brush steps' bumps
+    /// ([`TileStore::bump_display_error`]) covered every write in it, with the largest of their
+    /// displacements; a revert's if it has writes no bump covered; else a refresh's.
     /// What a brush step calls once its edits and their re-evaluation are done; the store calls
     /// it itself after a refresh slice and the reload of a lost tile.
     ///
@@ -59,6 +66,7 @@ impl TileStore {
         if !self.stale.is_listened() {
             self.epoch_writes.clear();
             self.epoch_keys.clear();
+            self.epoch_step = None;
             return Ok(());
         }
         // The fallible part first: on an error, the epoch's keys and writes stay noted.
@@ -76,11 +84,30 @@ impl TileStore {
                 &BTreeSet::from([finest]),
             )?
         };
+        let step = self.epoch_step.take();
+        let kind = match step {
+            Some((displacement, covered)) if self.epoch_writes.is_subset(&covered) => {
+                EpochKind::Step { displacement }
+            }
+            _ if !self.epoch_writes.is_empty() => EpochKind::Revert,
+            Some((displacement, _)) => EpochKind::Step { displacement },
+            None => EpochKind::Refresh,
+        };
         self.epoch_writes.clear();
         let mut keys = std::mem::take(&mut self.epoch_keys);
         keys.extend(moved);
-        self.stale.close(keys);
+        self.stale.close(keys, kind);
         Ok(())
+    }
+
+    /// Notes a brush step's bump for the open epoch, while a consumer listens: it moved no finest
+    /// vertex farther than `displacement`, with writes to the `edited` tiles.
+    pub(super) fn note_step(&mut self, edited: &BTreeSet<TileKey>, displacement: f32) {
+        if self.stale.is_listened() {
+            let (most, covered) = self.epoch_step.get_or_insert_with(Default::default);
+            *most = most.max(displacement);
+            covered.extend(edited.iter().copied());
+        }
     }
 
     /// Notes a correction write of `key` for the open epoch, while a consumer listens.

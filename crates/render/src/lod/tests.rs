@@ -169,6 +169,7 @@ impl Scene {
                 TileDetail::FINEST
             } else {
                 TileDetail {
+                    stored: None,
                     error: error(place) * b.quad_edge,
                     cone: sphere_cone(&data),
                 }
@@ -1243,6 +1244,7 @@ fn a_silhouette_tile_whose_finest_detail_faces_the_camera_is_refined_though_it_f
         scene.set_detail(
             place,
             TileDetail {
+                stored: None,
                 error: e,
                 cone: past,
             },
@@ -1257,6 +1259,7 @@ fn a_silhouette_tile_whose_finest_detail_faces_the_camera_is_refined_though_it_f
         scene.set_detail(
             place,
             TileDetail {
+                stored: None,
                 error: e,
                 cone: drawn,
             },
@@ -1285,6 +1288,7 @@ fn a_tile_whose_finest_normals_all_face_away_too_is_not_refined() {
         scene.set_detail(
             place,
             TileDetail {
+                stored: None,
                 error: e,
                 cone: all_away,
             },
@@ -1321,6 +1325,7 @@ fn a_tile_whose_finest_normals_face_away_but_whose_own_triangles_face_the_eye_is
         scene.set_detail(
             place,
             TileDetail {
+                stored: None,
                 error: e,
                 cone: all_away,
             },
@@ -1346,6 +1351,7 @@ fn a_tile_whose_finest_cone_covers_everything_is_refined_whenever_its_error_asks
         let eyes = [front, behind, center + perpendicular(away) * 3.0];
         let sphere = scene.details[&place];
         let unknown = TileDetail {
+            stored: None,
             error: e,
             cone: FinestNormalCone::EVERYTHING,
         };
@@ -1411,6 +1417,7 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
             for &place in &roots {
                 scene.bounds.insert(place, random_bounds(&mut rng));
                 let detail = TileDetail {
+                    stored: None,
                     error: rng.range(0.02, 0.3),
                     cone: random_cone(&mut rng),
                 };
@@ -1431,7 +1438,7 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
             let cut = places(&output);
             for &place in &roots {
                 let b = scene.bounds[&place];
-                let TileDetail { error: e, cone } = scene.details[&place];
+                let TileDetail { error: e, cone, .. } = scene.details[&place];
                 if projected(&gview, &b, e, e) < 1.5 * Thresholds::SPEC.refine_error {
                     continue;
                 }

@@ -35,9 +35,9 @@ use rayon::iter::{
     IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
 };
 
-use super::TileStore;
 use super::error::CacheError;
 use super::read_ahead::Held;
+use super::{Bumped, TileStore};
 use crate::bounds::{Book, Derived as _, Kept};
 use crate::display::{Display, DisplayRecord, StoredDisplay};
 use crate::file::{
@@ -282,8 +282,17 @@ impl TileStore {
     /// open epoch of the stale-tile feed, so a consumer that listens reads them again when the
     /// dab's epoch closes; the refresh that rebuilds them names them in its own epoch.
     ///
-    /// Twice: the finest vertex and the display vertex compared with it can each move that far
-    /// (the renderer's stand-ins move display vertices too). Call it after each dab's writes
+    /// Twice, for a tile drawn as it was before the stroke: its vertices stay, so a finest vertex
+    /// moving `D` from the surface it was within `e` of is within `e + D`; the second `D` is
+    /// margin for a reader that moves the display vertices too. A renderer standing in for the
+    /// tile ([`crate::EpochKind::Step`]) bounds it itself, as `e + D + max(D, M)` from the stored
+    /// bound ([`TileStore::display_stored_error`], `M` how far it moved a display vertex), not
+    /// from this raise, so the stroke's steps count once.
+    ///
+    /// The dab's displacement is noted for its epoch, which closes as a step's
+    /// ([`crate::EpochKind::Step`]) if the bumps cover every write in it; the finest tiles the
+    /// writes move are kept with each tile bumped, for a resync
+    /// ([`TileStore::unrefreshed_display`]). Call it after each dab's writes
     /// ([`TileStore::update_tiles`], which settles every write before them), before anything
     /// reads the store's display tiles: the first dab of a stroke keeps each tile as it was
     /// before the stroke. A write since the last bump that isn't one of `edited` (a lost tile's
@@ -311,14 +320,27 @@ impl TileStore {
             self.bumped.remove(key);
         }
         let readers = crate::display::readers(&self.mesh, &self.deps, &edited, &levels)?;
+        // The finest tiles the dab's writes move, each display tile above them keeping those
+        // under it: what a renderer standing in for it after a resync reads.
+        let finest_level = self.display_finest.unwrap_or(Level::ZERO);
+        let moved = crate::bounds::readers(
+            &self.mesh,
+            &self.deps,
+            &edited,
+            &BTreeSet::from([finest_level]),
+        )?;
         let raise = 2.0 * max_displacement.abs();
+        self.note_step(&edited, max_displacement.abs());
         self.take_read_ahead();
         let mut reached = BTreeSet::new();
         let mut grown = Vec::new();
         let mut to_read = Vec::new();
         for key in readers.difference(&stale) {
-            if let Some((_, extra)) = self.bumped.get_mut(key) {
-                *extra += raise;
+            if let Some(bumped) = self.bumped.get_mut(key) {
+                bumped.extra += raise;
+                bumped
+                    .finest
+                    .extend(moved.iter().filter(|f| covers(key, f)));
                 grown.push(*key);
                 continue;
             }
@@ -326,7 +348,13 @@ impl TileStore {
             // settled, theirs not yet.
             match self.bump_record(key) {
                 Held::Record(record) => {
-                    self.bumped.insert(*key, (record, raise));
+                    let finest = moved.iter().filter(|f| covers(key, f)).copied().collect();
+                    let bumped = Bumped {
+                        record,
+                        extra: raise,
+                        finest,
+                    };
+                    self.bumped.insert(*key, bumped);
                     reached.insert(*key);
                 }
                 Held::In(reader, loc) => to_read.push((*key, reader, loc)),
@@ -349,7 +377,13 @@ impl TileStore {
         let reads = to_read.iter().zip(read);
         for ((key, _, _), record) in reads {
             if let Some(record) = record?.filter(|record| Some(record.finest) == finest) {
-                self.bumped.insert(*key, (record, raise));
+                let under = moved.iter().filter(|f| covers(key, f)).copied().collect();
+                let bumped = Bumped {
+                    record,
+                    extra: raise,
+                    finest: under,
+                };
+                self.bumped.insert(*key, bumped);
                 reached.insert(*key);
             }
         }
@@ -382,6 +416,27 @@ impl TileStore {
             return Ok(());
         }
         Ok(self.display.settle(&self.mesh, &self.deps)?)
+    }
+
+    /// The bound display tile `key` was stored with, if a stroke has raised the bound it is
+    /// drawn with ([`TileStore::display_for_draw`]) past it: what a renderer standing in for the
+    /// tile bounds its own raise from, so the stroke's displacements count once.
+    #[must_use]
+    pub fn display_stored_error(&self, key: &TileKey) -> Option<f32> {
+        self.bumped.get(key).map(|bumped| bumped.record.error)
+    }
+
+    /// Every display tile a stroke changed since its last refresh: its bump's displacements,
+    /// summed (rounded up), and the finest tiles under it they moved. What a resync hands a
+    /// renderer, so it can stand in for them again ([`crate::Drained::Resync`]).
+    #[must_use]
+    pub fn unrefreshed_display(&self) -> Vec<crate::Unrefreshed> {
+        let unrefreshed = self.bumped.iter().map(|(key, bumped)| crate::Unrefreshed {
+            tile: *key,
+            displacement: (bumped.extra * 0.5).next_up(),
+            finest: bumped.finest.clone(),
+        });
+        unrefreshed.collect()
     }
 
     /// Notes a change of `key`'s corrections no bump has covered yet, while any tile is bumped.
@@ -464,7 +519,7 @@ impl TileStore {
     ///
     /// [`CacheError::Store`] if a read fails.
     fn to_draw(&self, key: &TileKey) -> Result<Option<ToDecode<'_>>, CacheError> {
-        if let Some((record, extra)) = self.bumped.get(key) {
+        if let Some(Bumped { record, extra, .. }) = self.bumped.get(key) {
             return Ok(Some(ToDecode {
                 record: Cow::Borrowed(record),
                 // Rounded up, so it stays a bound.
@@ -946,4 +1001,15 @@ pub(super) fn read_display(
         Some(base) => base.read_display(key)?.and_then(StoredDisplay::known),
         None => None,
     })
+}
+
+/// Whether finest tile `finest` lies under display tile `display`: on its face, in the block of
+/// finest tiles its place covers.
+fn covers(display: &TileKey, finest: &TileKey) -> bool {
+    if display.face() != finest.face() || display.level() >= finest.level() {
+        return false;
+    }
+    let ratio = finest.level().tiles_per_side() / display.level().tiles_per_side().max(1);
+    let ratio = u16::try_from(ratio.max(1)).unwrap_or(u16::MAX);
+    finest.tx() / ratio == display.tx() && finest.ty() / ratio == display.ty()
 }

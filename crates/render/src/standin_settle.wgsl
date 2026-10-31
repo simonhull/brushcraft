@@ -25,13 +25,11 @@ fn settle(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     var error = bitcast<f32>(rows[i].error);
-    let flags = rows[i].flags;
-    if (flags & PENDING) != 0u {
+    if (rows[i].flags & PENDING) != 0u {
         let d = bitcast<f32>(rows[i].displacement);
         let moved = bitcast<f32>(atomicLoad(&rows[i].moved));
-        let before = select(error, tree[n].error, (flags & FRESH) != 0u);
         // At most the largest finite f32: a bound that overflows is the store's unknown one.
-        error = min((before + d + max(d, moved)) * SLACK, F32_MAX);
+        error = min((error + d + max(d, moved)) * SLACK, F32_MAX);
         rows[i].error = bitcast<u32>(error);
         rows[i].flags = 0u;
         atomicStore(&rows[i].moved, 0u);

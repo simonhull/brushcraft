@@ -167,6 +167,7 @@ impl TileStore {
             stale: crate::stale::StaleFeed::new(config.stale_cap),
             epoch_writes: BTreeSet::new(),
             epoch_keys: BTreeSet::new(),
+            epoch_step: None,
             floor: std::collections::BTreeMap::new(),
             floor_read: std::collections::BTreeMap::new(),
             floor_top: config.floor_top,

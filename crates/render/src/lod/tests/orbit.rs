@@ -139,6 +139,7 @@ fn benchmark_scene(gpu: &Gpu, shape: Shape, rough: bool) -> Scene {
             TileDetail::FINEST
         } else {
             TileDetail {
+                stored: None,
                 error: 0.25 * factor * b.quad_edge,
                 cone,
             }

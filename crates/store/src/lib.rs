@@ -60,7 +60,7 @@ pub use project::{
 };
 pub use queued::EvaluatedTile;
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
-pub use stale::{DEFAULT_STALE_CAP, Drained, Epoch, StaleCursor};
+pub use stale::{DEFAULT_STALE_CAP, Drained, Epoch, EpochKind, StaleCursor, Unrefreshed};
 pub use tiles::{
     CacheError, Evaluation, Invariant, PinGuard, StoreConfig, StoreId, TileEdit, TileStore,
 };

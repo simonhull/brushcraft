@@ -31,6 +31,7 @@ fn level(l: u8) -> Level {
 fn detail(error: f32, tag: usize) -> TileDetail {
     let bits = u32::try_from(tag).expect("small").wrapping_mul(0x9E37_79B9);
     TileDetail {
+        stored: None,
         error,
         cone: geom::FinestNormalCone::from_bits(bits),
     }

@@ -88,7 +88,7 @@ fn epochs_name_every_changed_tile_and_a_stalled_consumer_resyncs() {
                     named.extend(epoch.keys);
                 }
             }
-            Drained::Resync => panic!("op {op}: the fast consumer keeps up"),
+            Drained::Resync(_) => panic!("op {op}: the fast consumer keeps up"),
         }
         let finest_after = finest_state(&mut store, &mesh);
         for (key, was) in &finest_before {
@@ -110,14 +110,13 @@ fn epochs_name_every_changed_tile_and_a_stalled_consumer_resyncs() {
             "op {op}: memory within the cap"
         );
     }
-    assert_eq!(
-        store.drain_stale(&stalled),
-        Drained::Resync,
+    assert!(
+        matches!(store.drain_stale(&stalled), Drained::Resync(_)),
         "the stalled consumer fell past the cap"
     );
     match store.drain_stale(&stalled) {
         Drained::Epochs(epochs) => assert!(epochs.is_empty(), "and goes on from now"),
-        Drained::Resync => panic!("one resync"),
+        Drained::Resync(_) => panic!("one resync"),
     }
 }
 
@@ -144,7 +143,7 @@ fn a_failed_close_keeps_the_epoch_open() {
             epochs.iter().any(|e| e.keys.contains(&shown)),
             "the key noted before the failed close: {epochs:?}"
         ),
-        Drained::Resync => panic!("no resync expected"),
+        Drained::Resync(_) => panic!("no resync expected"),
     }
 }
 
@@ -189,7 +188,7 @@ fn observe(store: &mut TileStore, mesh: &BaseMesh, watcher: &mut Watcher, n: usi
             }
         }
         // Past the cap: it shows everything again, from now on.
-        Drained::Resync => watcher.next = None,
+        Drained::Resync(_) => watcher.next = None,
     }
     watcher.finest = finest;
     watcher.display = display;
@@ -310,6 +309,6 @@ fn the_feed_names_every_change_under_random_operations_and_drains() {
                 );
             }
         }
-        Drained::Resync => {}
+        Drained::Resync(_) => {}
     }
 }

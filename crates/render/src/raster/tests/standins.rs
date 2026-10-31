@@ -104,7 +104,7 @@ impl Edit {
             clippy::cast_possible_truncation,
             reason = "rounded to an f32, then up a step"
         )]
-        let displacement = Displacement::new((worst as f32).next_up()).expect("finite");
+        let displacement = Displacement::try_from((worst as f32).next_up()).expect("finite");
         let finest = world.tiles.keys().filter(|p| p.level() == world.finest);
         let edited = finest
             .filter(|&&place| {
@@ -227,10 +227,12 @@ fn stand_in(
     for (index, &place) in edited.iter().enumerate() {
         let (x0, y0, size) = block(world, place);
         let grid = &edit.grids[&place.face().index()];
-        let words: Vec<u32> = (y0..=y0 + size)
+        let mut words: Vec<u32> = (y0..=y0 + size)
             .flat_map(|y| (x0..=x0 + size).map(move |x| (x, y)))
             .flat_map(|(x, y)| at(grid, n, x, y).map(f32::to_bits))
             .collect();
+        // A whole number of 8-byte words, as staging copies need.
+        words.push(0);
         let index = u32::try_from(index).expect("small");
         pass.stage_tile(gpu, &mut batch, &mut ring, index, &words)
             .expect("staged");
@@ -242,6 +244,7 @@ fn stand_in(
         let write = RowWrite::Fresh {
             node,
             place,
+            stored: world.tiles[&place].detail.error,
             displacement: edit.displacement,
         };
         pass.write_row(gpu, &mut batch, &mut ring, row, write)
@@ -291,6 +294,7 @@ fn stand_in(
         let vertices = world.read_slot(gpu, place);
         let node = nodes[usize::try_from(world.node(place)).expect("small")];
         let detail = TileDetail {
+            stored: None,
             error: node.error,
             cone: FinestNormalCone::from_bits(node.finest_cone),
         };
@@ -576,8 +580,8 @@ fn a_stand_in_s_bound_holds_every_finest_vertex_under_it_and_its_cone_covers_eve
 fn the_bound_test_bites_a_stand_in_whose_bound_isnt_raised() {
     GpuTest::run(|gpu| {
         let no_raise = [(
-            "error = min((before + d + max(d, moved)) * SLACK, F32_MAX);",
-            "error = before;",
+            "error = min((error + d + max(d, moved)) * SLACK, F32_MAX);",
+            "error = error;",
         )];
         let (world, edit, stood) = bumped_world(gpu, FINEST, AMPLITUDE, &no_raise);
         let broken = stood.iter().filter(|&&place| {
@@ -635,6 +639,7 @@ fn refreshed(world: &World, edit: &Edit, place: Place) -> (Vec<GpuVertex>, TileD
     (
         vertices,
         TileDetail {
+            stored: None,
             error,
             cone: FinestNormalCone::EVERYTHING,
         },

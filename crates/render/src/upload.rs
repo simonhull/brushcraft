@@ -88,6 +88,10 @@ pub struct TileDetail {
     /// tile by its own triangles, which are the finest surface) and for any tile whose finest
     /// normals aren't known: never facing away, so refined whenever its error asks.
     pub cone: FinestNormalCone,
+    /// The bound the tile's data was stored with, where `error` is a stroke's raise of it
+    /// ([`TileStore::bump_display_error`]): what a stand-in's bound grows from
+    /// ([`crate::standin`]), so the stroke's steps count once. `None` where `error` is it.
+    pub stored: Option<f32>,
 }
 
 impl TileDetail {
@@ -95,6 +99,7 @@ impl TileDetail {
     pub const FINEST: Self = Self {
         error: 0.0,
         cone: FinestNormalCone::EVERYTHING,
+        stored: None,
     };
 
     /// A display tile's: its `e` and its finest normals' cone.
@@ -103,6 +108,7 @@ impl TileDetail {
         Self {
             error: tile.error(),
             cone: tile.cone(),
+            stored: None,
         }
     }
 }
@@ -243,6 +249,39 @@ pub trait TileSource {
     /// As the source reports them; staging stops there.
     fn read(&mut self, key: TileKey, out: &mut TileData)
     -> Result<Option<TileDetail>, Self::Error>;
+
+    /// Readies finest tiles `keys` for [`TileSource::read_positions`]. Optional: the default
+    /// readies them as [`TileSource::prepare`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileSource::prepare`].
+    fn prepare_positions(&mut self, keys: &[TileKey]) -> Result<(), Self::Error> {
+        self.prepare(keys)
+    }
+
+    /// Appends finest tile `key`'s own positions to `out`, as `f32` bits, three words a vertex,
+    /// row-major: what a stand-in reads ([`crate::standin`]). Whether the source had them. The
+    /// default reads the tile with [`TileSource::read`] into `scratch`; a source that can give
+    /// the positions alone, without the ring, overrides it.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileSource::read`].
+    fn read_positions(
+        &mut self,
+        key: TileKey,
+        scratch: &mut TileData,
+        out: &mut Vec<u32>,
+    ) -> Result<bool, Self::Error> {
+        let vertices = usize::try_from(key.side() * key.side()).unwrap_or(0);
+        scratch.reset(vertices);
+        if self.read(key, scratch)?.is_none() {
+            return Ok(false);
+        }
+        scratch.positions(out);
+        Ok(true)
+    }
 }
 
 /// [`TileSource`] over the store: display tiles from [`TileStore::display_for_draw`], finest
@@ -298,6 +337,23 @@ impl TileSource for StoreSource<'_> {
         self.display.contains_key(&key) || !self.store.display_needs_read(&key)
     }
 
+    fn prepare_positions(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {
+        self.store.evaluate_many(keys, Evaluation::Positions)?;
+        Ok(())
+    }
+
+    fn read_positions(
+        &mut self,
+        key: TileKey,
+        _scratch: &mut TileData,
+        out: &mut Vec<u32>,
+    ) -> Result<bool, CacheError> {
+        // The tile's positions alone, as evaluated: no ring gathered.
+        let positions = self.store.evaluate(key)?;
+        out.extend(positions.iter().flat_map(|p| p.to_bits()));
+        Ok(true)
+    }
+
     fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, CacheError> {
         if key.channel() == Channel::DISPLAY {
             let tile = match self.display.remove(&key) {
@@ -324,7 +380,11 @@ impl TileSource for StoreSource<'_> {
                     reserved: 0,
                 };
             }
-            return Ok(Some(TileDetail::of_display(&tile)));
+            let detail = TileDetail {
+                stored: self.store.display_stored_error(&key),
+                ..TileDetail::of_display(&tile)
+            };
+            return Ok(Some(detail));
         }
         // Prepared tiles are cached and current: the gather reads them, evaluating nothing.
         let block = match self.store.cached_positions_with_ring(&key)? {
@@ -751,6 +811,16 @@ impl FrameUploads {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.copies.is_empty() && self.normals.is_none() && self.stand_ins.is_none()
+    }
+
+    /// Whether the uploads change what a frame draws: tiles or the tree written, or a stand-in
+    /// made. Settling the stand-ins' bounds again into the tree (after an upload of nodes
+    /// that have them) changes nothing drawn, and isn't a reason to draw.
+    #[must_use]
+    pub fn changes_scene(&self) -> bool {
+        !self.copies.is_empty()
+            || self.normals.is_some()
+            || self.stand_ins.as_ref().is_some_and(StandInWork::replaces)
     }
 
     /// The same uploads, for a frame whose passes don't run the level choice (a frame with no

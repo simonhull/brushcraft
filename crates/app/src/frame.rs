@@ -299,7 +299,7 @@ impl FeedStats {
                 self.epochs += epochs.len() as u64;
                 self.keys += keys;
             }
-            Drained::Resync => self.resyncs += 1,
+            Drained::Resync(_) => self.resyncs += 1,
         }
     }
 }

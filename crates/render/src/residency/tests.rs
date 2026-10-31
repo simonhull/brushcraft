@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use geom::{BaseMesh, Level, TileKey, cube_sphere};
-use store::{Drained, Epoch};
+use store::{Drained, Epoch, EpochKind};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BufferUsages, CommandEncoderDescriptor,
@@ -146,17 +146,22 @@ impl Model {
             self.prepared.remove(key);
         }
         self.closed.push(Epoch {
+            kind: EpochKind::Refresh,
             seq,
             keys: keys.clone(),
         });
-        self.undrained.push(Epoch { seq, keys });
+        self.undrained.push(Epoch {
+            seq,
+            kind: EpochKind::Refresh,
+            keys,
+        });
     }
 
     /// What a drain gives: the epochs since the last, or a resync if they were lost.
     fn drain(&mut self) -> (Drained, Vec<Epoch>) {
         let epochs = std::mem::take(&mut self.undrained);
         if std::mem::take(&mut self.lost) {
-            (Drained::Resync, Vec::new())
+            (Drained::Resync(Vec::new()), Vec::new())
         } else {
             (Drained::Epochs(epochs.clone()), epochs)
         }
@@ -216,6 +221,7 @@ impl TileSource for Model {
 /// whose bits follow from it (any bits are a cone), so the tree shows which data's they are.
 fn detail_tag(version: u32) -> TileDetail {
     TileDetail {
+        stored: None,
         error: f32::from(u16::try_from(version).expect("small values")),
         cone: geom::FinestNormalCone::from_bits(version.wrapping_mul(0x9E37_79B9)),
     }

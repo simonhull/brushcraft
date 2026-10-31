@@ -185,13 +185,14 @@ fn frame(
     took
 }
 
-/// The `e` and cone resident tile `key`'s node holds.
-fn node_detail(residency: &Residency, key: &TileKey) -> (f32, FinestNormalCone) {
+/// The `e` and cone resident tile `key`'s node holds on the GPU: a stand-in's settled there.
+fn node_detail(gpu: &Gpu, residency: &Residency, key: &TileKey) -> (f32, FinestNormalCone) {
     let tree = residency.tree();
     let index = tree
         .node(crate::tree::Place::of(key))
         .unwrap_or_else(|| panic!("{key:?} resident"));
-    let node = tree.gpu_node(index);
+    let nodes: Vec<crate::tree::GpuNode> = gpu.read_buffer(tree.buffer()).expect("reads back");
+    let node = nodes[usize::try_from(index).expect("small")];
     (node.error, FinestNormalCone::from_bits(node.finest_cone))
 }
 
@@ -209,14 +210,14 @@ fn frames_until(
     for _ in 0..4 {
         residency.apply(store.drain_stale(cursor));
         frame(gpu, residency, store, &none);
-        let detail = node_detail(residency, key);
+        let detail = node_detail(gpu, residency, key);
         if done(detail) {
             return detail;
         }
     }
     panic!(
         "{key:?}'s node never changed: {:?}",
-        node_detail(residency, key)
+        node_detail(gpu, residency, key)
     );
 }
 
@@ -260,7 +261,7 @@ fn a_dab_makes_a_resident_display_tile_cover_everything_until_its_refresh() {
             .pop()
             .flatten()
             .expect("built");
-        let (e, cone) = node_detail(&residency, &coarse);
+        let (e, cone) = node_detail(gpu, &residency, &coarse);
         assert_eq!((e, cone), (built.error(), built.cone()), "the record's");
         assert!(!cone.covers_everything(), "a tight cone to begin with");
 
