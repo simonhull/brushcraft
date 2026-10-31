@@ -10,9 +10,11 @@
 //! ([`render::raster::FramePasses`], in [`render::Renderer::draw`]), and submits them together;
 //! a frame whose uploads never reach the GPU is recovered by the next [`Residency::begin_frame`].
 //!
-//! Requested finest tiles are never evaluated while staging: they go to the store's queued
-//! evaluation ([`FinestEvaluations`]), which the frame loop runs after the hand-off with the
-//! store's other jobs, and are staged in a later frame from the copies it made.
+//! Requested finest tiles go to the store's queued evaluation ([`FinestEvaluations`]), which
+//! the frame loop runs after the hand-off with the store's other jobs, and are staged from the
+//! copies it made. One due before the queue has made it is evaluated while staging if the time
+//! left before the staging deadline holds it ([`StoreSource::evaluating_until`]), as before
+//! the queue, and withdrawn from it; the rest wait for the queue.
 //!
 //! # The passes
 //!
@@ -152,10 +154,6 @@ pub(crate) struct GpuResidency {
     scene: Option<LodStats>,
     /// How many cut readbacks have been heard.
     cuts_heard: u64,
-    /// How many finest tiles staging has read through the store's own evaluation, ever: tiles
-    /// pending epochs named, never requested ones.
-    #[cfg(test)]
-    evaluated_while_staging: usize,
 }
 
 impl GpuResidency {
@@ -227,8 +225,6 @@ impl GpuResidency {
             bounds_sent: None,
             scene: None,
             cuts_heard: 0,
-            #[cfg(test)]
-            evaluated_while_staging: 0,
         })
     }
 
@@ -247,12 +243,6 @@ impl GpuResidency {
     #[cfg(test)]
     pub(crate) const fn cuts_heard(&self) -> u64 {
         self.cuts_heard
-    }
-
-    /// How many finest tiles staging has read through the store's own evaluation, ever.
-    #[cfg(test)]
-    pub(crate) const fn evaluated_while_staging(&self) -> usize {
-        self.evaluated_while_staging
     }
 
     /// How many tiles the floor has, resident or not.
@@ -324,14 +314,13 @@ impl GpuResidency {
             self.scene = Some(output.stats);
             residency.use_frame(FrameUse::new(output.cut, output.drawn));
         }
-        let mut source = StoreSource::with_evaluations(store, &self.evaluations);
+        // Requested finest tiles the queue hasn't made yet are evaluated here while the frame
+        // has the time, as before the queue; the rest wait for it.
+        let mut source =
+            StoreSource::with_evaluations(store, &mut self.evaluations).evaluating_until(deadline);
         let uploads = residency
             .stage(gpu, &mut source, deadline)
             .context("staging tiles")?;
-        #[cfg(test)]
-        {
-            self.evaluated_while_staging += source.evaluated_here();
-        }
         // Tiles arriving or leaving change what the level choice asks for too.
         changed |= !uploads.is_empty();
         let heard = residency.requests_heard();

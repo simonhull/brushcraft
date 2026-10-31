@@ -5,13 +5,14 @@
 //! into a [`TileData`]: a display tile as [`GpuVertex`]es, a finest tile as its positions with
 //! the one-vertex ring (a ring record, from which the GPU computes its vertices: the crate's
 //! `normals` module). A requested finest tile is read from the copy the store's queued
-//! evaluation made in an earlier frame's jobs ([`FinestEvaluations`]), never evaluated while
-//! staging. The owner writes the tiles, with the tile tree's changed nodes, into staging
-//! buffers mapped for writing. When the frame's uploads are staged, the buffers are unmapped and
-//! the copies they need become a [`FrameUploads`], which the render thread encodes into the frame's
-//! command buffer ahead of every pass, the normal pass right after them, and submits
-//! ([`FrameUploads::submit`], which takes the passes, so they can only follow the copies and the
-//! normal pass): each staging buffer is then mapped for writing
+//! evaluation made in an earlier frame's jobs ([`FinestEvaluations`]), or evaluated while
+//! staging only if the time left before the staging deadline holds it
+//! ([`StoreSource::evaluating_until`]). The owner writes the tiles, with the tile tree's changed
+//! nodes, into staging buffers mapped for writing. When the frame's uploads are staged, the buffers
+//! are unmapped and the copies they need become a [`FrameUploads`], which the render thread encodes
+//! into the frame's command buffer ahead of every pass, the normal pass right after them, and
+//! submits ([`FrameUploads::submit`], which takes the passes, so they can only follow the copies
+//! and the normal pass): each staging buffer is then mapped for writing
 //! again and returns to the ring when the GPU is done with it, without the owner thread ever
 //! waiting on the GPU. A frame dropped instead (staging failed, or the render thread gave up on it)
 //! gives its buffers back too.
@@ -21,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use geom::{Channel, DisplayTile, FinestNormalCone, TileKey, Vec3};
@@ -260,8 +262,12 @@ pub trait TileSource {
 /// rings (plan decision 1), every vertex its owner's bits, and the GPU computes its normals.
 ///
 /// Built [`with_evaluations`](StoreSource::with_evaluations), a requested finest tile is read
-/// only from its evaluated copy, and deferred until there is one: the owner never evaluates it
-/// while staging. Finest tiles a pending epoch names (resident tiles an edit changed) are still
+/// from its evaluated copy if one is held, and else deferred until there is one: the owner
+/// never evaluates it while staging. Given a deadline as well
+/// ([`evaluating_until`](StoreSource::evaluating_until)), a requested finest tile without a
+/// copy is evaluated here while the time left before the deadline holds it, at the cost
+/// measured lately (with [`STAGE_MARGIN`] kept free), and withdrawn from the queue; the rest
+/// are deferred. Finest tiles a pending epoch names (resident tiles an edit changed) are still
 /// evaluated here, together, since an epoch switches whole in the frame its last tile is
 /// staged; after a brush step they are mostly cached already. Built [`new`](StoreSource::new),
 /// every finest tile is evaluated here.
@@ -273,10 +279,21 @@ pub struct StoreSource<'a> {
     /// them.
     display: BTreeMap<TileKey, Option<DisplayTile>>,
     /// The finest tiles the store's queued evaluation made, if requested finest tiles are read
-    /// only from them.
-    evaluations: Option<&'a FinestEvaluations>,
+    /// from them first.
+    evaluations: Option<&'a mut FinestEvaluations>,
+    /// The deadline requested finest tiles without a copy may be evaluated here until, if any
+    /// may.
+    until: Option<Instant>,
+    /// Requested finest tiles without a copy that [`TileSource::deferred`] let through since
+    /// the last [`TileSource::prepare`]: what that prepare evaluates here, counted against the
+    /// time left.
+    reserved: BTreeSet<TileKey>,
     /// Finest tiles read through the store's own evaluation on this thread, not from a copy.
     evaluated_here: usize,
+    /// A delay added to each requested finest tile evaluated here, for the tests of a slow
+    /// evaluation.
+    #[cfg(test)]
+    slow: std::time::Duration,
 }
 
 impl<'a> StoreSource<'a> {
@@ -286,22 +303,46 @@ impl<'a> StoreSource<'a> {
             store,
             display: BTreeMap::new(),
             evaluations: None,
+            until: None,
+            reserved: BTreeSet::new(),
             evaluated_here: 0,
+            #[cfg(test)]
+            slow: std::time::Duration::ZERO,
         }
     }
 
     /// Reads tiles from `store`, a finest tile from its copy in `evaluations` if one is held;
-    /// requested finest tiles without one are deferred ([`TileSource::deferred`]).
+    /// requested finest tiles without one are deferred ([`TileSource::deferred`]), unless
+    /// [`StoreSource::evaluating_until`] gives them time.
     pub const fn with_evaluations(
         store: &'a mut TileStore,
-        evaluations: &'a FinestEvaluations,
+        evaluations: &'a mut FinestEvaluations,
     ) -> Self {
         Self {
             store,
             display: BTreeMap::new(),
             evaluations: Some(evaluations),
+            until: None,
+            reserved: BTreeSet::new(),
             evaluated_here: 0,
+            #[cfg(test)]
+            slow: std::time::Duration::ZERO,
         }
+    }
+
+    /// Lets requested finest tiles without a copy be evaluated here while the frame has the
+    /// time, as staging without the queue does.
+    ///
+    /// Each is let through ([`TileSource::deferred`] says no) while the tiles let through since
+    /// the last [`TileSource::prepare`], at the cost per tile measured lately
+    /// ([`FinestEvaluations::cost`]) and a quarter more, fit before `deadline` less
+    /// [`STAGE_MARGIN`]; with no cost measured yet, one tile at a time, if [`PROBE_COST`] fits.
+    /// Each tile evaluated here is withdrawn from the queue, so none is evaluated twice.
+    /// Without evaluations ([`StoreSource::new`]), it changes nothing.
+    #[must_use]
+    pub const fn evaluating_until(mut self, deadline: Instant) -> Self {
+        self.until = Some(deadline);
+        self
     }
 
     /// How many finest tiles were read through the store's evaluation on this thread, not from
@@ -314,11 +355,46 @@ impl<'a> StoreSource<'a> {
     }
 
     /// The copy of finest tile `key` the queued evaluation made, if one is held.
-    fn evaluated(&self, key: &TileKey) -> Option<&'a EvaluatedTile> {
+    fn evaluated(&self, key: &TileKey) -> Option<&EvaluatedTile> {
         self.evaluations
+            .as_deref()
             .and_then(|evaluations| evaluations.get(key))
     }
+
+    /// Whether requested finest tile `key`, without a copy, fits in the time left to be
+    /// evaluated here: see [`StoreSource::evaluating_until`].
+    fn fits_here(&self, key: &TileKey) -> bool {
+        let (Some(until), Some(evaluations)) = (self.until, self.evaluations.as_deref()) else {
+            return false;
+        };
+        if self.reserved.contains(key) {
+            return true;
+        }
+        let room = until
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(STAGE_MARGIN);
+        match evaluations.cost() {
+            None => self.reserved.is_empty() && room >= PROBE_COST,
+            Some(cost) => {
+                let tiles = u32::try_from(self.reserved.len() + 1).unwrap_or(u32::MAX);
+                cost.saturating_add(cost / 4).saturating_mul(tiles) <= room
+            }
+        }
+    }
 }
+
+/// The time kept free before the staging deadline when requested finest tiles are evaluated
+/// while staging ([`StoreSource::evaluating_until`]).
+///
+/// It is for the rest of staging after them: writing their records and the tile tree's nodes.
+pub const STAGE_MARGIN: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// What a requested finest tile is taken to cost when no cost has been measured.
+///
+/// The time left must hold it before the first is evaluated while staging, alone, to measure
+/// one (a cold tile, its cone read from the file, measured about 0.8 ms on the benchmark
+/// project).
+pub const PROBE_COST: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl TileSource for StoreSource<'_> {
     type Error = CacheError;
@@ -332,7 +408,15 @@ impl TileSource for StoreSource<'_> {
             .into_iter()
             .filter(|key| self.evaluated(key).is_none())
             .collect();
+        // The requested tiles let through to be evaluated here, timed for the next.
+        let reserved = std::mem::take(&mut self.reserved);
+        let requested: Vec<TileKey> = finest
+            .iter()
+            .copied()
+            .filter(|key| reserved.contains(key))
+            .collect();
         if !finest.is_empty() {
+            let began = Instant::now();
             // Positions only, of every tile the rings read: the tiles, their aprons and the
             // tiles round their corners' base vertices.
             let mut inputs = BTreeSet::new();
@@ -341,6 +425,18 @@ impl TileSource for StoreSource<'_> {
             }
             let inputs: Vec<TileKey> = inputs.into_iter().collect();
             self.store.evaluate_many(&inputs, Evaluation::Positions)?;
+            #[cfg(test)]
+            std::thread::sleep(self.slow * u32::try_from(requested.len()).unwrap_or(0));
+            if let Some(evaluations) = self.evaluations.as_deref_mut()
+                && let Ok(count) = u32::try_from(requested.len())
+                && count > 0
+            {
+                evaluations.note_cost(began.elapsed() / count);
+            }
+        }
+        if !requested.is_empty() {
+            // Evaluated here: the queue lets them go, so none is evaluated twice.
+            self.store.retain_evaluation(|key| !requested.contains(key));
         }
         if !display.is_empty() {
             let tiles = self.store.display_for_draw(&display)?;
@@ -354,9 +450,17 @@ impl TileSource for StoreSource<'_> {
     }
 
     fn deferred(&mut self, key: TileKey) -> bool {
-        self.evaluations.is_some()
-            && key.channel() != Channel::DISPLAY
-            && self.evaluated(&key).is_none()
+        if self.evaluations.is_none()
+            || key.channel() == Channel::DISPLAY
+            || self.evaluated(&key).is_some()
+        {
+            return false;
+        }
+        if self.fits_here(&key) {
+            self.reserved.insert(key);
+            return false;
+        }
+        true
     }
 
     fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, CacheError> {

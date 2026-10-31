@@ -62,7 +62,7 @@ fn requested() -> (TileKey, Requests) {
     (key, requests)
 }
 
-/// One frame of the owner thread before the hand-off, as the app runs it.
+/// One frame of the owner thread before the hand-off, with no time to evaluate while staging.
 ///
 /// The feed's drain (given to `evaluations` first), `requests` wanted, the queued evaluation
 /// brought in line, and the uploads staged with requested finest tiles read only from their
@@ -76,6 +76,42 @@ fn frame(
     cursor: &StaleCursor,
     requests: &Requests,
 ) -> usize {
+    let staging = Staging {
+        until: None,
+        slow: Duration::ZERO,
+    };
+    hybrid_frame(
+        gpu,
+        residency,
+        evaluations,
+        store,
+        cursor,
+        requests,
+        staging,
+    )
+    .0
+}
+
+/// How a test frame stages requested finest tiles without a copy.
+#[derive(Debug, Clone, Copy)]
+struct Staging {
+    /// The staging deadline they may be evaluated until, if they may be at all.
+    until: Option<Instant>,
+    /// A delay added to each evaluated while staging.
+    slow: Duration,
+}
+
+/// [`frame`], staging as `staging` says, as the app does: returns how many finest tiles were
+/// read through the store's evaluation while staging, and when staging ended.
+fn hybrid_frame(
+    gpu: &Gpu,
+    residency: &mut Residency,
+    evaluations: &mut FinestEvaluations,
+    store: &mut TileStore,
+    cursor: &StaleCursor,
+    requests: &Requests,
+    staging: Staging,
+) -> (usize, Instant) {
     residency.begin_frame(gpu).expect("begins");
     let drained = store.drain_stale(cursor);
     evaluations.outdate(&drained);
@@ -84,9 +120,16 @@ fn frame(
     evaluations
         .request(store, residency)
         .expect("queues the requests");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = staging
+        .until
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(60));
     let mut source = StoreSource::with_evaluations(store, evaluations);
+    if let Some(until) = staging.until {
+        source = source.evaluating_until(until);
+    }
+    source.slow = staging.slow;
     let uploads = residency.stage(gpu, &mut source, deadline).expect("staged");
+    let ended = Instant::now();
     let evaluated_here = source.evaluated_here();
     gpu.scoped("frame", || {
         let encoder = gpu
@@ -95,7 +138,12 @@ fn frame(
         uploads.submit(gpu.queue(), encoder, |_| {});
     })
     .expect("submits");
-    evaluated_here
+    // The GPU done with the frame, as it is by the next in the app: its staging buffers come
+    // back to the ring instead of new ones being made.
+    gpu.device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("the GPU finishes");
+    (evaluated_here, ended)
 }
 
 /// `key`'s positions as the store evaluates them now.
@@ -363,6 +411,233 @@ fn a_request_withdrawn_drops_its_queued_work_and_its_copy() {
     });
 }
 
+/// Requests for every finest tile of `store`'s mesh.
+fn every_finest(store: &TileStore) -> Requests {
+    let mesh = store.mesh();
+    let keys = mesh.faces().flat_map(|face| {
+        (0..4_u16)
+            .filter_map(move |n| TileKey::displacement(face, level(FINEST), n % 2, n / 2).ok())
+    });
+    Requests::new(
+        keys.map(|key| Request {
+            key,
+            screen_error: 2.0,
+        }),
+        0,
+    )
+}
+
+/// A staging deadline that stages copies but leaves no time to evaluate a tile: less than
+/// [`STAGE_MARGIN`](crate::upload::STAGE_MARGIN) and [`PROBE_COST`](crate::upload::PROBE_COST)
+/// together.
+const NO_SLACK: Duration = Duration::from_micros(1500);
+
+/// Staging that may evaluate until `slack` from now, each tile `slow` slower.
+fn slack(slack: Duration, slow: Duration) -> Staging {
+    Staging {
+        until: Some(Instant::now() + slack),
+        slow,
+    }
+}
+
+/// With time in the frame, a requested tile the queue hasn't made is evaluated while staging
+/// in the frame it is due, and withdrawn from the queue: the jobs never evaluate it again.
+#[test]
+fn with_slack_a_due_tile_is_staged_in_its_frame_while_staging() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("hybrid-slack");
+        let (mut project, cursor) = small_project(&dir);
+        let store = project.store();
+        let mesh = store.mesh().clone();
+        let mut residency = with_floor(gpu, &mesh, level(FINEST), store);
+        let mut evaluations = FinestEvaluations::new();
+        let (key, requests) = requested();
+        let roomy = || slack(Duration::from_secs(1), Duration::ZERO);
+        let (here, _) = hybrid_frame(
+            gpu,
+            &mut residency,
+            &mut evaluations,
+            store,
+            &cursor,
+            &requests,
+            roomy(),
+        );
+        assert_eq!(here, 0, "not due in the frame it is requested in");
+        assert_eq!(store.queued_evaluations(), 1, "queued meanwhile");
+        let (due, _) = hybrid_frame(
+            gpu,
+            &mut residency,
+            &mut evaluations,
+            store,
+            &cursor,
+            &requests,
+            roomy(),
+        );
+        assert_eq!(due, 1, "evaluated while staging, the frame it is due");
+        assert!(residency.slot(&key).is_some(), "staged");
+        assert_eq!(shown(gpu, &residency, &key), evaluated(store, key));
+        assert_eq!(store.queued_evaluations(), 0, "withdrawn from the queue");
+        let report = store
+            .run_jobs(Instant::now() + Duration::from_millis(50))
+            .expect("the jobs run");
+        assert_eq!(report.queue_finished, 0, "never evaluated again");
+        assert!(evaluations.cost().is_some(), "its cost measured");
+        drop(project.close(false));
+    });
+}
+
+/// With no time left in the frame, a due tile waits for the queue, and is staged from its copy.
+#[test]
+fn without_slack_a_due_tile_is_staged_from_the_queue() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("hybrid-no-slack");
+        let (mut project, cursor) = small_project(&dir);
+        let store = project.store();
+        let mesh = store.mesh().clone();
+        let mut residency = with_floor(gpu, &mesh, level(FINEST), store);
+        let mut evaluations = FinestEvaluations::new();
+        let (key, requests) = requested();
+        let tight = || slack(NO_SLACK, Duration::ZERO);
+        for _ in 0..3 {
+            let (here, _) = hybrid_frame(
+                gpu,
+                &mut residency,
+                &mut evaluations,
+                store,
+                &cursor,
+                &requests,
+                tight(),
+            );
+            assert_eq!(here, 0, "no time: nothing evaluated while staging");
+            assert!(residency.slot(&key).is_none(), "deferred");
+        }
+        run_all_jobs(store);
+        let (here, _) = hybrid_frame(
+            gpu,
+            &mut residency,
+            &mut evaluations,
+            store,
+            &cursor,
+            &requests,
+            tight(),
+        );
+        assert_eq!(here, 0, "staged from its copy");
+        assert!(residency.slot(&key).is_some(), "staged");
+        assert_eq!(shown(gpu, &residency, &key), evaluated(store, key));
+        drop(project.close(false));
+    });
+}
+
+/// Some tiles evaluated while staging, the rest left to the queue and staged from its copies:
+/// every tile is evaluated once, by one or the other, and staged.
+#[test]
+fn no_tile_is_evaluated_twice_between_staging_and_the_queue() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("hybrid-once");
+        let (mut project, cursor) = small_project(&dir);
+        let store = project.store();
+        let mesh = store.mesh().clone();
+        let mut residency = with_floor(gpu, &mesh, level(FINEST), store);
+        let mut evaluations = FinestEvaluations::new();
+        let requests = every_finest(store);
+        let count = requests.iter().count();
+        // Heard: queued, not due.
+        frame(
+            gpu,
+            &mut residency,
+            &mut evaluations,
+            store,
+            &cursor,
+            &requests,
+        );
+        let mut by_queue = 0;
+        // Due, with time for a few while staging (each made slow), the rest left over.
+        let (mut by_staging, _) = hybrid_frame(
+            gpu,
+            &mut residency,
+            &mut evaluations,
+            store,
+            &cursor,
+            &requests,
+            slack(Duration::from_millis(15), Duration::from_millis(3)),
+        );
+        assert!(by_staging > 0, "some evaluated while staging");
+        let began = Instant::now();
+        while requests.iter().any(|r| residency.slot(&r.key).is_none()) {
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "every tile staged"
+            );
+            by_queue += store
+                .run_jobs(Instant::now() + Duration::from_millis(50))
+                .expect("the jobs run")
+                .queue_finished;
+            let (here, _) = hybrid_frame(
+                gpu,
+                &mut residency,
+                &mut evaluations,
+                store,
+                &cursor,
+                &requests,
+                slack(NO_SLACK, Duration::ZERO),
+            );
+            by_staging += here;
+        }
+        assert!(by_queue > 0, "some made by the queue");
+        assert_eq!(
+            by_queue + by_staging,
+            count,
+            "each tile evaluated once: {by_queue} by the queue, {by_staging} while staging"
+        );
+        drop(project.close(false));
+    });
+}
+
+/// Evaluating while staging keeps to the staging deadline however slow the evaluation: the
+/// batches are sized from the cost measured, the first tile alone.
+#[test]
+fn staging_keeps_its_deadline_under_a_slow_evaluation() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("hybrid-slow");
+        let (mut project, cursor) = small_project(&dir);
+        let store = project.store();
+        let mesh = store.mesh().clone();
+        let mut residency = with_floor(gpu, &mesh, level(FINEST), store);
+        let mut evaluations = FinestEvaluations::new();
+        let requests = every_finest(store);
+        frame(
+            gpu,
+            &mut residency,
+            &mut evaluations,
+            store,
+            &cursor,
+            &requests,
+        );
+        let mut staged_here = 0;
+        for _ in 0..4 {
+            let staging = slack(Duration::from_millis(12), Duration::from_millis(4));
+            let until = staging.until.expect("a deadline");
+            let (here, ended) = hybrid_frame(
+                gpu,
+                &mut residency,
+                &mut evaluations,
+                store,
+                &cursor,
+                &requests,
+                staging,
+            );
+            assert!(
+                ended <= until,
+                "staging ended {:?} past its deadline, {here} tiles evaluated",
+                ended.saturating_duration_since(until)
+            );
+            staged_here += here;
+        }
+        assert!(staged_here > 0, "some evaluated while staging");
+        drop(project.close(false));
+    });
+}
+
 /// The queued evaluation keeps to the jobs' turns.
 ///
 /// With a display rebuild queued beside it, each call of the jobs ends near its deadline, and
@@ -572,10 +847,152 @@ fn staged_from_the_queue(
     ((took, staged), in_jobs)
 }
 
+/// How a paced run stages requested finest tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Every one evaluated while staging, as before the queued evaluation.
+    Staging,
+    /// Every one through the queue, staged from its copy.
+    Queue,
+    /// Evaluated while staging while the frame has the time, else through the queue.
+    Hybrid,
+}
+
+/// What a paced run came to.
+#[derive(Debug, Clone, Copy, Default)]
+struct Paced {
+    /// Frames until every tile was staged.
+    frames: u32,
+    /// The owner's staging time, over every frame.
+    staging: Duration,
+    /// The most a frame's staging ran past its deadline.
+    worst_over: Duration,
+    /// Tiles evaluated while staging.
+    here: usize,
+    /// Tiles staged.
+    staged: u64,
+}
+
+/// A frame's interval, at 60 Hz.
+const INTERVAL: Duration = Duration::from_micros(16_700);
+
+/// Where a frame's staging deadline falls, from its start (the app's, as the investigation
+/// measured it).
+const STAGING: Duration = Duration::from_micros(6_250);
+
+/// How long a frame's jobs phase runs after staging (about the idle time a frame has during
+/// a catch-up).
+const JOBS: Duration = Duration::from_millis(8);
+
+/// Stages `keys` in frames paced as the app's, as `mode` says.
+///
+/// They are requested at once and paged in on request, from a store opened afresh (its cones
+/// cold). Each frame stages until [`STAGING`] into the frame, then runs the jobs for [`JOBS`]
+/// (but in [`Mode::Staging`]), then idles out the rest of the [`INTERVAL`].
+fn paced(
+    gpu: &Gpu,
+    path: &std::path::Path,
+    config: &ProjectConfig,
+    keys: &[TileKey],
+    mode: Mode,
+) -> Paced {
+    let mut project = Project::open(path, config.clone()).expect("opened");
+    let store = project.store();
+    let cursor = store.subscribe_stale();
+    let mesh = store.mesh().clone();
+    let finest = store.display_finest().expect("a display layer");
+    let mut residency = with_floor(gpu, &mesh, finest, store);
+    let mut evaluations = FinestEvaluations::new();
+    let requests = super::requests_of(keys);
+    prefetch_requests(store, &requests).expect("paged in");
+    let mut run = Paced::default();
+    while run.staged < keys.len() as u64 {
+        run.frames += 1;
+        assert!(run.frames < 1000, "every tile staged");
+        let began = Instant::now();
+        let deadline = began + STAGING;
+        residency.begin_frame(gpu).expect("begins");
+        let drained = store.drain_stale(&cursor);
+        evaluations.outdate(&drained);
+        residency.apply(drained);
+        residency.want(&requests);
+        let uploads = if mode == Mode::Staging {
+            let mut source = StoreSource::new(store);
+            let uploads = residency.stage(gpu, &mut source, deadline);
+            run.here += source.evaluated_here();
+            uploads
+        } else {
+            evaluations
+                .request(store, &residency)
+                .expect("queues the requests");
+            let mut source = StoreSource::with_evaluations(store, &mut evaluations);
+            if mode == Mode::Hybrid {
+                source = source.evaluating_until(deadline);
+            }
+            let uploads = residency.stage(gpu, &mut source, deadline);
+            run.here += source.evaluated_here();
+            uploads
+        }
+        .expect("staged");
+        let ended = Instant::now();
+        run.staging += ended - began;
+        run.worst_over = run
+            .worst_over
+            .max(ended.saturating_duration_since(deadline));
+        run.staged += residency.stats().staged_tiles;
+        gpu.scoped("frame", || {
+            let encoder = gpu
+                .device()
+                .create_command_encoder(&CommandEncoderDescriptor::default());
+            uploads.submit(gpu.queue(), encoder, |_| {});
+        })
+        .expect("submits");
+        gpu.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        if mode != Mode::Staging {
+            store
+                .run_jobs(Instant::now().max(deadline) + JOBS)
+                .expect("the jobs run");
+        }
+        std::thread::sleep((began + INTERVAL).saturating_duration_since(Instant::now()));
+    }
+    drop(project.close(false));
+    run
+}
+
+/// Prints the paced runs `runs` of `what`: the one with the fewest frames, then the least
+/// staging time, and the worst overrun of any.
+fn report_paced(what: &str, runs: &[Paced]) {
+    let best = runs
+        .iter()
+        .min_by_key(|run| (run.frames, run.staging))
+        .copied()
+        .expect("a run");
+    let worst = runs
+        .iter()
+        .map(|run| run.worst_over)
+        .max()
+        .unwrap_or_default();
+    let per_tile =
+        best.staging.as_secs_f64() * 1e6 / f64::from(u32::try_from(best.staged).expect("small"));
+    eprintln!(
+        "{what}: {} tiles staged by frame {}, staging {:.1} ms in all ({per_tile:.1} µs a tile), \
+         {} evaluated while staging; worst staging overrun {:.2} ms (of {} runs)",
+        best.staged,
+        best.frames,
+        best.staging.as_secs_f64() * 1e3,
+        best.here,
+        worst.as_secs_f64() * 1e3,
+        runs.len()
+    );
+}
+
 /// The owner thread's time staging requested finest tiles from a cold store.
 ///
 /// Evaluated while staging (as before the queued evaluation) against evaluated in the jobs and
-/// staged from their copies. A timing, not a check: run it in release, with
+/// staged from their copies, then the three ways in frames paced as the app's (staging
+/// deadline, jobs phase, interval). A timing, not a check: run it in release, with
 /// `--run-ignored only`.
 #[test]
 #[ignore = "a timing, for release builds"]
@@ -603,5 +1020,19 @@ fn owner_time_staging_finest_tiles() {
             "finest tiles evaluated in the jobs phase, after the hand-off",
             &in_jobs,
         );
+        // The 64 tiles, and 256 at once: more than a jobs phase evaluates.
+        let many = finest_tiles(&mesh, finest, 16);
+        for tiles in [&keys, &many] {
+            for (mode, what) in [
+                (Mode::Staging, "paced, evaluated while staging (main)"),
+                (Mode::Queue, "paced, through the queue"),
+                (Mode::Hybrid, "paced, hybrid"),
+            ] {
+                let runs: Vec<Paced> = (0..REPEATS)
+                    .map(|_| paced(gpu, &path, &config, tiles, mode))
+                    .collect();
+                report_paced(what, &runs);
+            }
+        }
     });
 }

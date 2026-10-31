@@ -1,4 +1,5 @@
-//! Requested finest tiles, evaluated in the store's jobs rather than while a frame is staged.
+//! Requested finest tiles, evaluated in the store's jobs, or while a frame is staged when it has
+//! the time.
 //!
 //! A finest tile has no stored record: its positions are evaluated from the corrections of its
 //! cone, which may have to be read from the file first (about 0.8 ms a tile cold). Evaluated
@@ -9,8 +10,10 @@
 //! hand-off ([`TileStore::run_jobs`], taking turns with the display jobs). What it finished is
 //! taken ([`TileStore::take_evaluated`]) and held here, each tile a copy of its positions with
 //! the ring ([`EvaluatedTile`]), until residency stages it: [`StoreSource`] reads a requested
-//! finest tile only from a copy held here and defers it until there is one
-//! ([`TileSource::deferred`]).
+//! finest tile from a copy held here first. Without one, it evaluates the tile while staging if
+//! the frame has the time for it, at the cost measured lately
+//! ([`StoreSource::evaluating_until`], [`FinestEvaluations::cost`]), and withdraws it from the
+//! queue; else it defers it until the queue has made it ([`TileSource::deferred`]).
 //!
 //! # Never stale
 //!
@@ -23,6 +26,7 @@
 //! [`TileSource::deferred`]: super::TileSource::deferred
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use geom::{Channel, TileKey};
 use store::{CacheError, Drained, EvaluatedTile, Evaluation, TileStore};
@@ -39,6 +43,8 @@ use crate::residency::Residency;
 pub struct FinestEvaluations {
     /// Copies taken from the store and not outdated since, until staged.
     held: BTreeMap<TileKey, EvaluatedTile>,
+    /// What a requested finest tile evaluated while staging has cost lately, if one has.
+    cost: Option<Duration>,
 }
 
 impl FinestEvaluations {
@@ -101,6 +107,23 @@ impl FinestEvaluations {
     #[must_use]
     pub fn get(&self, key: &TileKey) -> Option<&EvaluatedTile> {
         self.held.get(key)
+    }
+
+    /// What a requested finest tile evaluated while staging has cost lately, if one has been
+    /// ([`StoreSource::evaluating_until`](super::StoreSource::evaluating_until)): what the time
+    /// left is counted in. It follows a dearer tile at once and a cheaper one by a quarter, so
+    /// it stays on the dear side.
+    #[must_use]
+    pub const fn cost(&self) -> Option<Duration> {
+        self.cost
+    }
+
+    /// Notes that a requested finest tile evaluated while staging cost `each`.
+    pub(crate) fn note_cost(&mut self, each: Duration) {
+        self.cost = Some(match self.cost {
+            Some(cost) if each < cost => (cost * 3 + each) / 4,
+            _ => each,
+        });
     }
 
     /// How many copies are held, waiting to be staged.
