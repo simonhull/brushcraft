@@ -79,9 +79,12 @@ fn stamp(@builtin(global_invocation_id) id: vec3<u32>) {
     // but what it draws changed (render::standin). Stamped once, in its frame's first phase.
     let morph_in = (tree[n].flags & NODE_MORPH_IN) != 0u && s.frame != params.frame;
     var start = s.start;
-    if !staying || morph_in {
+    if morph_in {
+        // Moving or still: what it draws changed in place.
+        start = params.now;
+    } else if !staying {
         start = params.now - params.duration;
-        if (params.flags & MOVING) == 0u && (morph_in || refines_last_frame(n)) {
+        if (params.flags & MOVING) == 0u && refines_last_frame(n) {
             start = params.now;
         }
     }
