@@ -239,8 +239,13 @@ fn withdrawn_tiles_are_neither_evaluated_nor_handed_over() {
     );
     store.retain_evaluation(|key| keep.contains(key));
     assert!(
-        store.evaluation.steps.cone.is_none(),
-        "the cone of a withdrawn tile is dropped"
+        store
+            .evaluation
+            .steps
+            .cone
+            .as_ref()
+            .is_none_or(|cone| cone.keys.iter().all(|key| keep.contains(key))),
+        "a withdrawn tile leaves the cone being stepped through"
     );
     let evaluated_before = store.hooks.log.normals.len();
     let taken = take_all(&mut store, Duration::from_millis(2));

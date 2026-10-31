@@ -31,6 +31,15 @@ const MIN_STEP_TILES: usize = 8;
 /// between groups, so this is about what an estimate too cheap can overrun the deadline by.
 const GROUP_TIME_ALONE: Duration = Duration::from_micros(700);
 
+/// The least time left for a step of the queued evaluation alone that isn't its call's first:
+/// a step lists its cone, asks for and installs its reads before it evaluates anything.
+const LEAST_STEP_TIME: Duration = Duration::from_millis(1);
+
+/// About what listing a finest tile's cone takes the first time (its dependencies listed),
+/// measured at about 70 µs on the benchmark project: a new cone holds no more tiles than the
+/// time left lists.
+const LIST_COST: Duration = Duration::from_micros(100);
+
 /// The time a slice of the queued evaluation may take when it has the jobs to itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Alone {
@@ -112,7 +121,8 @@ impl TileStore {
 
     /// Withdraws the queued tiles no longer wanted: keeps only those `keep` holds of, and only
     /// the finished tiles waiting to be taken it holds of. A tile being evaluated when it is
-    /// withdrawn is dropped where it is (what was evaluated of it stays cached).
+    /// withdrawn is dropped where it is (what was evaluated of it stays cached), and the cone
+    /// goes on for the others being evaluated with it.
     pub fn retain_evaluation(&mut self, keep: impl FnMut(&TileKey) -> bool) {
         self.evaluation.retain(keep);
     }
@@ -181,6 +191,35 @@ impl TileStore {
         self.evaluation.len()
     }
 
+    /// The work evaluating the positions `key`'s ring reads (as
+    /// [`TileStore::positions_with_ring`] needs them) would be: how many tiles of its cone
+    /// aren't current, if every one of them has its corrections in memory (resident, or none
+    /// stored); `None` if one would be read from the file, synchronously, a few milliseconds a
+    /// cold tile. Lists the cone as the queued evaluation does (it doesn't prefetch). Tiles
+    /// shared with other cones are counted in each.
+    ///
+    /// For a caller that evaluates tiles against a deadline: their cost is about this many
+    /// tiles' computing, which it can measure and bound, and none of the file's.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::NotATile`]; [`CacheError::Eval`] (not for a valid key).
+    pub fn cone_work(&mut self, key: &TileKey) -> Result<Option<usize>, CacheError> {
+        self.check_key(key)?;
+        let levels = self.normals_cone(std::slice::from_ref(key))?;
+        let mut work = 0;
+        for tile in levels.iter().flatten() {
+            if self.is_current(tile) {
+                continue;
+            }
+            if self.corrections.find(tile).is_none() && self.locate(tile).is_some() {
+                return Ok(None);
+            }
+            work += 1;
+        }
+        Ok(Some(work))
+    }
+
     /// Whether `key`'s positions and unit normals are cached and current: what
     /// [`TileStore::cached_positions`] and [`TileStore::cached_normals`] then read. Never
     /// evaluates, and doesn't count as a use of the tile.
@@ -246,8 +285,12 @@ impl TileStore {
         // tiles (one at least) and the round's time at the cost measured lately, and the cone
         // is of that many tiles, so a slice evaluates no more than one round, its normals or,
         // past an evicted cone, that many tiles whole.
-        let round = if alone.is_some() {
-            queue.steps.round_alone()
+        let round = if let Some(alone) = alone {
+            // Listing a new cone takes about LIST_COST a tile (its dependencies, once): the
+            // cone holds no more than the time left lists.
+            let lists = alone.left.as_nanos() / LIST_COST.as_nanos();
+            let lists = usize::try_from(lists).unwrap_or(usize::MAX).max(1);
+            queue.steps.round_alone().min(lists)
         } else {
             let workers = self.workers.current_num_threads().max(1);
             let busy: usize = self.jobs.iter_mut().map(|job| job.upkeep().busy()).sum();
@@ -347,7 +390,7 @@ impl TileStore {
         alone: Alone,
     ) -> Result<WholeStep, CacheError> {
         let began = Instant::now();
-        if !alone.first && alone.left < steps.least_step(MIN_STEP_TILES) {
+        if !alone.first && alone.left < steps.least_step(MIN_STEP_TILES).max(LEAST_STEP_TIME) {
             return Ok(WholeStep::Spent);
         }
         let keys = self.list_cone(steps, keys)?;
@@ -395,9 +438,39 @@ impl TileStore {
             steps.reset();
             return Ok(WholeStep::Step(ConeStep::Current(keys)));
         }
-        // A group at a time, the clock read before each, so a cost estimated too cheap overruns
-        // by a group at most: a call's first group is one tile, measured, and the next are sized
-        // at the dearer of that and the estimate. The call's first slice goes whatever the time.
+        let done = self.evaluate_groups(steps, &targets, alone, began)?;
+        steps.spent += began.elapsed();
+        if done == 0 {
+            return Ok(WholeStep::Spent);
+        }
+        let whole = whole && done == targets.len();
+        steps
+            .seen
+            .extend(targets.get(..done).unwrap_or_default().iter().copied());
+        if whole {
+            steps.took_keys(steps.spent, keys.len());
+            steps.reset();
+            return Ok(WholeStep::Step(ConeStep::Current(keys)));
+        }
+        Ok(WholeStep::Step(ConeStep::Round))
+    }
+
+    /// Evaluates `targets` (coarsest first) for a step through a whole cone begun at `began`,
+    /// a group at a time, the clock read before each, so a cost estimated too cheap overruns by
+    /// a group at most: a call's first group is one tile, measured, and the next are sized at
+    /// the dearer of that and the estimate. The call's first slice goes whatever the time.
+    /// Returns how many it evaluated, from the first.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`].
+    fn evaluate_groups(
+        &mut self,
+        steps: &mut ConeSteps,
+        targets: &[TileKey],
+        alone: Alone,
+        began: Instant,
+    ) -> Result<usize, CacheError> {
         if alone.first {
             steps.call_cost = None;
         }
@@ -436,20 +509,7 @@ impl TileStore {
             steps.call_cost = Some(steps.call_cost.map_or(measured, |cost| cost.max(measured)));
             done += group;
         }
-        steps.spent += began.elapsed();
-        if done == 0 {
-            return Ok(WholeStep::Spent);
-        }
-        let whole = whole && done == targets.len();
-        steps
-            .seen
-            .extend(targets.get(..done).unwrap_or_default().iter().copied());
-        if whole {
-            steps.took_keys(steps.spent, keys.len());
-            steps.reset();
-            return Ok(WholeStep::Step(ConeStep::Current(keys)));
-        }
-        Ok(WholeStep::Step(ConeStep::Round))
+        Ok(done)
     }
 
     /// The tiles of `steps`' cone whose positions aren't current, level by level, coarsest

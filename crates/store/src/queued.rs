@@ -342,8 +342,8 @@ impl EvaluationQueue {
         self.order.insert((rank, key));
     }
 
-    /// Drops the lowest-priority keys past the cap; returns how many. A cone being stepped
-    /// through for a key dropped is dropped too.
+    /// Drops the lowest-priority keys past the cap; returns how many. Those dropped leave the
+    /// cone being stepped through.
     pub(crate) fn trim(&mut self) -> usize {
         let mut dropped = 0;
         while self.wanted.len() > self.caps.queued {
@@ -358,16 +358,21 @@ impl EvaluationQueue {
         dropped
     }
 
-    /// Forgets the cone being stepped through if a tile it is for is no longer wanted; returns
-    /// whether it did.
+    /// Drops the tiles no longer wanted from the cone being stepped through, and forgets the
+    /// cone if none is left; returns whether it lost one.
+    ///
+    /// The cone itself is kept for the rest: stepping through it again from the start would
+    /// list it and look over its levels anew, and a tile withdrawn because a caller evaluated it
+    /// itself (a renderer staging it) has left its part of the cone current.
     fn drop_lost_cone(&mut self) -> bool {
         let wanted = &self.wanted;
-        let lost = self
-            .steps
-            .cone
-            .as_ref()
-            .is_some_and(|cone| cone.keys.iter().any(|key| !wanted.contains_key(key)));
-        if lost {
+        let Some(cone) = self.steps.cone.as_mut() else {
+            return false;
+        };
+        let before = cone.keys.len();
+        cone.keys.retain(|key| wanted.contains_key(key));
+        let lost = cone.keys.len() < before;
+        if cone.keys.is_empty() {
             self.steps.reset();
         }
         lost
