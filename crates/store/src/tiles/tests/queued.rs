@@ -363,6 +363,36 @@ fn run_jobs_ends_near_its_deadline_on_the_real_clock() {
     }
 }
 
+/// With the queue alone and every cone tile made slow, a call still ends near its deadline.
+///
+/// Within about a millisecond: each step is sized from the dear cost measured, the
+/// copies keep to the time left, and a step with too little time waits for the next call.
+#[test]
+fn run_jobs_alone_keeps_its_deadline_under_a_slow_evaluation() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let (mut store, _) = edited(&dir, &mesh, roomy());
+    store
+        .queue_evaluation_as(&prioritized(&mesh, 43), Evaluation::Positions)
+        .unwrap();
+    store.hooks.slow_cone_tile = Duration::from_micros(100);
+    let budget = Duration::from_millis(8);
+    let (mut worst, mut finished) = (Duration::ZERO, 0);
+    for _ in 0..20 {
+        let start = Instant::now();
+        let report = store.run_jobs(start + budget).unwrap();
+        worst = worst.max(start.elapsed().saturating_sub(budget));
+        finished += report.queue_finished;
+        drop(store.take_evaluated());
+    }
+    assert!(finished > 0, "tiles finished");
+    // A millisecond, and as much again for a loaded machine's scheduler.
+    assert!(
+        worst <= Duration::from_millis(2),
+        "a call ran {worst:?} past its deadline"
+    );
+}
+
 /// With the queue alone, for positions alone, a call still ends near its deadline: its larger
 /// rounds keep to the time left, each slice within a round's time and a step's fixed cost.
 #[test]

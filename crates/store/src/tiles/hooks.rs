@@ -76,6 +76,9 @@ pub(super) struct TestHooks {
     /// tile, as it would for a tile holding a border vertex twice: for tests of the edits'
     /// fallback, which no valid mesh reaches.
     pub(super) without_tile_borders: bool,
+    /// A delay added to each tile a step of the queued evaluation alone evaluates: for tests of
+    /// a slow evaluation's deadlines.
+    pub(super) slow_cone_tile: std::time::Duration,
 }
 
 /// One slice [`TileStore::run_jobs`](super::TileStore::run_jobs) ran, as the tests see it.

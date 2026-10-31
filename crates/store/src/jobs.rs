@@ -57,12 +57,6 @@ const CONE_TIME_ALONE: Duration = Duration::from_millis(8);
 /// doesn't run past its time.
 const KEY_COST: Duration = Duration::from_micros(400);
 
-/// What a tile of a cone is assumed to take in a step of the queued evaluation alone.
-///
-/// Assumed before a step has measured it: a step evaluates many at once over the workers, measured
-/// at about 20–30 µs a tile, so this is on the safe side.
-const CONE_TILE_COST: Duration = Duration::from_micros(50);
-
 /// What evaluating a tile is assumed to take before a job has measured it.
 const TILE_COST: Duration = Duration::from_micros(150);
 
@@ -233,7 +227,9 @@ pub(crate) struct ConeSteps {
     /// What a tile of a cone has taken lately in a step of the queued evaluation alone, wall
     /// time over the tiles the step evaluated (a moving average): how many
     /// [`ConeSteps::tiles_alone`] lets a step evaluate.
-    cone_tile_cost: Duration,
+    /// `None` until a step has measured it: the first step then evaluates the fewest tiles a
+    /// step does, to measure them.
+    cone_tile_cost: Option<Duration>,
     /// The time the steps through the cone held have taken so far.
     pub(crate) spent: Duration,
 }
@@ -253,7 +249,7 @@ impl ConeSteps {
             seen: BTreeSet::new(),
             tile_cost: TILE_COST,
             key_cost: KEY_COST,
-            cone_tile_cost: CONE_TILE_COST,
+            cone_tile_cost: None,
             spent: Duration::ZERO,
         }
     }
@@ -290,12 +286,15 @@ impl ConeSteps {
 
     /// How many tiles of a cone a step of the queued evaluation alone may evaluate with `left`
     /// before the call's deadline: as many as fit in the lesser of `left` and
-    /// [`ROUND_TIME_ALONE`] at the cost a cone's tile has taken lately, at least one. What keeps
-    /// a step within its time however cold the cone, since a finest tile's share of its cone
-    /// varies.
+    /// [`ROUND_TIME_ALONE`] at the cost a cone's tile has taken lately, at least one; one with
+    /// none measured yet. What keeps a step within its time however cold the cone, since a
+    /// finest tile's share of its cone varies.
     pub(crate) fn tiles_alone(&self, left: Duration) -> usize {
+        let Some(cost) = self.cone_tile_cost else {
+            return 1;
+        };
         let time = left.min(ROUND_TIME_ALONE);
-        let fits = time.as_nanos() / self.cone_tile_cost.as_nanos().max(1);
+        let fits = time.as_nanos() / cost.as_nanos().max(1);
         usize::try_from(fits).unwrap_or(usize::MAX).max(1)
     }
 
@@ -305,7 +304,21 @@ impl ConeSteps {
         let Some(each) = u32::try_from(tiles.max(1)).ok().map(|n| wall / n) else {
             return;
         };
-        self.cone_tile_cost = (self.cone_tile_cost + each) / 2;
+        // On the dear side: a dearer tile at once, a cheaper one half way, so a step sized by it
+        // keeps to its time when the cone turns cold.
+        self.cone_tile_cost = Some(match self.cone_tile_cost {
+            Some(cost) if each <= cost => (cost + each) / 2,
+            _ => each,
+        });
+    }
+
+    /// The time a step of the queued evaluation alone needs at the least, for
+    /// `tiles` tiles (the fewest a step evaluates) at the cost a cone's tile has
+    /// taken lately: with less left, a step that isn't the call's first waits for the next call.
+    pub(crate) fn least_step(&self, tiles: usize) -> Duration {
+        self.cone_tile_cost
+            .unwrap_or_default()
+            .saturating_mul(u32::try_from(tiles).unwrap_or(u32::MAX))
     }
 
     /// Notes that the queued evaluation, alone, took `wall` for `keys` finest tiles and their

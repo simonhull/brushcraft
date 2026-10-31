@@ -418,6 +418,8 @@ struct Sides {
     queue: Option<Turn>,
     /// Whether the next turn, both sides having work, is the queued evaluation's.
     queue_next: bool,
+    /// Whether the queued evaluation has run a slice in this call.
+    queue_ran: bool,
 }
 
 /// Counts a slice that took `took` in `report`.
@@ -686,15 +688,18 @@ impl TileStore {
                 // With the display jobs idle or waiting on the workers, a round may take more of
                 // the time left.
                 let left = deadline.saturating_duration_since(self.now());
-                let alone =
-                    (!display_ready).then_some(left.saturating_sub(crate::jobs::WAKE_MARGIN));
+                let alone = (!display_ready).then_some(super::queued::Alone {
+                    left: left.saturating_sub(crate::jobs::WAKE_MARGIN),
+                    first: !sides.queue_ran,
+                });
+                sides.queue_ran = true;
                 let turn = self.evaluation_slice(report, alone);
                 note_slice(report, began.elapsed());
                 #[cfg(test)]
                 self.hooks.end_turn(work);
                 sides.queue = match turn? {
                     Turn::Worked => None,
-                    waiting @ (Turn::Reading | Turn::Idle) => Some(waiting),
+                    waiting @ (Turn::Reading | Turn::Idle | Turn::Spent) => Some(waiting),
                 };
                 // The display jobs may have something to collect by now.
                 sides.display = None;
