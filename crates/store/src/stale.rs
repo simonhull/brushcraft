@@ -43,11 +43,12 @@ pub struct StaleCursor {
 /// What kind of operation closed an epoch: what a renderer may assume of the tiles it names.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EpochKind {
-    /// A brush step: its writes moved no finest vertex farther than `displacement` (world
-    /// units), and the display tiles it names had only their bound raised
+    /// One or more brush steps: their writes moved no finest vertex farther than
+    /// `displacement` (world units; several steps' displacements summed), and the display
+    /// tiles it names had only their bound raised
     /// ([`TileStore::bump_display_error`](crate::TileStore::bump_display_error)).
     Step {
-        /// A bound on how far the step moved any finest vertex.
+        /// A bound on how far the steps moved any finest vertex.
         displacement: f32,
     },
     /// A refresh: the display tiles it names were rebuilt from the finest level as it is.

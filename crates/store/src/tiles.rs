@@ -427,9 +427,9 @@ pub struct TileStore {
     /// The other tiles the open epoch changed (display tiles recorded), noted while a consumer
     /// listens.
     epoch_keys: BTreeSet<TileKey>,
-    /// The open epoch's brush steps, if it has any: the largest displacement their bumps
-    /// raised display bounds by, and the correction tiles those bumps covered. The epoch is a
-    /// step's if they cover every write in it ([`crate::EpochKind`]).
+    /// The open epoch's brush steps, if it has any: the displacements their bumps raised
+    /// display bounds by, summed (rounded up), and the correction tiles those bumps covered. The
+    /// epoch is a step's if they cover every write in it ([`crate::EpochKind`]).
     epoch_step: Option<(f32, BTreeSet<TileKey>)>,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,

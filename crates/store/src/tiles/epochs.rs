@@ -53,8 +53,10 @@ impl TileStore {
     /// positions, or ring, the writes since changed, and every display tile recorded since.
     ///
     /// Its kind ([`EpochKind`]): a step's if brush steps' bumps
-    /// ([`TileStore::bump_display_error`]) covered every write in it, with the largest of their
-    /// displacements; a revert's if it has writes no bump covered; else a refresh's.
+    /// ([`TileStore::bump_display_error`]) covered every write in it, with their displacements
+    /// summed (rounded up: the steps moved a vertex one after another); a revert's if it has
+    /// writes no bump covered; else a refresh's. A refresh slice closes any epoch holding writes
+    /// before it records its tiles, so a refresh's epoch holds refreshed tiles alone.
     /// What a brush step calls once its edits and their re-evaluation are done; the store calls
     /// it itself after a refresh slice and the reload of a lost tile.
     ///
@@ -69,7 +71,10 @@ impl TileStore {
             self.epoch_step = None;
             return Ok(());
         }
-        // The fallible part first: on an error, the epoch's keys and writes stay noted.
+        // Taken first: if listing the readers fails, the writes stay noted without it, and the
+        // epoch they close in is a revert's (nothing bounds how far they moved).
+        let step = self.epoch_step.take();
+        // The fallible part next: on an error, the epoch's keys and writes stay noted.
         let moved = if self.epoch_writes.is_empty() {
             BTreeSet::new()
         } else {
@@ -84,14 +89,12 @@ impl TileStore {
                 &BTreeSet::from([finest]),
             )?
         };
-        let step = self.epoch_step.take();
         let kind = match step {
             Some((displacement, covered)) if self.epoch_writes.is_subset(&covered) => {
                 EpochKind::Step { displacement }
             }
             _ if !self.epoch_writes.is_empty() => EpochKind::Revert,
-            Some((displacement, _)) => EpochKind::Step { displacement },
-            None => EpochKind::Refresh,
+            _ => EpochKind::Refresh,
         };
         self.epoch_writes.clear();
         let mut keys = std::mem::take(&mut self.epoch_keys);
@@ -101,13 +104,33 @@ impl TileStore {
     }
 
     /// Notes a brush step's bump for the open epoch, while a consumer listens: it moved no finest
-    /// vertex farther than `displacement`, with writes to the `edited` tiles.
+    /// vertex farther than `displacement`, with writes to the `edited` tiles. An epoch of
+    /// several steps (a frame of dabs) sums them, rounded up: each moved a vertex after the
+    /// last.
     pub(super) fn note_step(&mut self, edited: &BTreeSet<TileKey>, displacement: f32) {
         if self.stale.is_listened() {
-            let (most, covered) = self.epoch_step.get_or_insert_with(Default::default);
-            *most = most.max(displacement);
+            let (sum, covered) = self.epoch_step.get_or_insert_with(Default::default);
+            *sum = if *sum == 0.0 {
+                displacement
+            } else {
+                (*sum + displacement).next_up()
+            };
             covered.extend(edited.iter().copied());
         }
+    }
+
+    /// Closes the open epoch if it holds writes (or a step's bump), before a refresh records
+    /// its tiles: a refresh's epoch then holds refreshed tiles alone, and never passes writes
+    /// off as a refresh, nor a refresh as a revert.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::close_epoch`].
+    pub(super) fn close_writes(&mut self) -> Result<(), CacheError> {
+        if self.epoch_writes.is_empty() && self.epoch_step.is_none() {
+            return Ok(());
+        }
+        self.close_epoch()
     }
 
     /// Notes a correction write of `key` for the open epoch, while a consumer listens.

@@ -112,6 +112,9 @@ impl TileStore {
     /// The writes since the last call are settled first, so the display tiles they made unknown
     /// are replaced, not the other way round.
     ///
+    /// An open epoch holding writes closes first, in its own epoch (a step's or a revert's): the
+    /// tiles recorded here close in a refresh's, which holds refreshed tiles alone.
+    ///
     /// # Errors
     ///
     /// [`CacheError::Display`] ([`geom::DisplayError::NoDisplayLevel`]) if the store keeps no
@@ -124,6 +127,9 @@ impl TileStore {
         let finest = self
             .display_finest
             .ok_or(geom::DisplayError::NoDisplayLevel(Level::ZERO))?;
+        // Writes since the last epoch close in their own (a step's or a revert's): the tiles
+        // recorded here close in a refresh's.
+        self.close_writes()?;
         self.display_builds += 1;
         let tiles: Vec<&DisplayTile> = tiles.iter().map(std::borrow::Borrow::borrow).collect();
         for &tile in &tiles {
