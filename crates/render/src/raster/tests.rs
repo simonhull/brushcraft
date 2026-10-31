@@ -39,6 +39,7 @@ use crate::upload::{GpuVertex, TileDetail};
 mod cone;
 mod pop;
 mod seams;
+pub(crate) mod standins;
 
 /// The finest level.
 const FINEST: u8 = 7;
@@ -77,7 +78,13 @@ fn sphere_point(mesh: &BaseMesh, face: FaceId, u: f32, v: f32) -> [f32; 3] {
 
 /// The finest level's vertex `(x, y)` of `face`'s grid: from its copy on the face of lowest
 /// index, so every face holding it agrees.
-fn finest_point(mesh: &BaseMesh, finest: Level, face: FaceId, x: u32, y: u32) -> [f32; 3] {
+pub(crate) fn finest_point(
+    mesh: &BaseMesh,
+    finest: Level,
+    face: FaceId,
+    x: u32,
+    y: u32,
+) -> [f32; 3] {
     let n = finest.face_quads();
     let tile = finest.tile_quads();
     let (face, x, y) = if x == 0 || y == 0 || x == n || y == n {
@@ -218,7 +225,7 @@ impl World {
             vec![gpu.device().create_buffer_init(&BufferInitDescriptor {
                 label: Some("test slots"),
                 contents: bytemuck::cast_slice(data),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             })]
         });
         let mut world = Self {
@@ -320,7 +327,7 @@ impl World {
 ///
 /// The finest surface's triangles each lie in one of the tile's (decision 4's diagonals nest),
 /// so the distance between the two surfaces is largest at a finest vertex.
-fn measured_error(
+pub(crate) fn measured_error(
     place: Place,
     finest: Level,
     vertices: &[GpuVertex],

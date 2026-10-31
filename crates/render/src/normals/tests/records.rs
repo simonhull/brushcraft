@@ -88,7 +88,7 @@ pub(super) fn frame(
     }
     let work = pass.finish(gpu, &mut batch, &mut ring).expect("finished");
     let (outcomes, _heard) = mpsc::channel();
-    let uploads = batch.finish(0, work, None, outcomes);
+    let uploads = batch.finish(0, work, None, None, outcomes);
     gpu.scoped("frame", || {
         let encoder = gpu
             .device()

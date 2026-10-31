@@ -41,6 +41,9 @@ pub const NODE_LIVE: u32 = 1;
 pub const NODE_FLOOR: u32 = 1 << 1;
 /// [`GpuNode::flags`]: the tile is a finest tile (evaluated positions), not a display tile.
 pub const NODE_FINEST: u32 = 1 << 2;
+/// [`GpuNode::flags`], for one frame: the tile's data replaced a stand-in
+/// ([`crate::standin`]), and it morphs in as an arrival does, though it stayed in the cut.
+pub const NODE_MORPH_IN: u32 = 1 << 3;
 
 /// The WGSL declaration of [`GpuNode`], for the passes that walk the tree: `TileNode`, with the
 /// same fields in the same order, and the constants above.
@@ -53,7 +56,7 @@ struct TileNode {
     place: u32,
     // Its slot: size class (bits 29..32), buffer (bits 21..29), index in the buffer (0..21).
     slot: u32,
-    // NODE_LIVE, NODE_FLOOR, NODE_FINEST.
+    // NODE_LIVE, NODE_FLOOR, NODE_FINEST, NODE_MORPH_IN.
     flags: u32,
     // The parent's node index, or NONE.
     parent: u32,
@@ -84,6 +87,8 @@ const NODE_LIVE: u32 = 1u;
 const NODE_FLOOR: u32 = 2u;
 // TileNode.flags: the tile is a finest tile.
 const NODE_FINEST: u32 = 4u;
+// TileNode.flags, for one frame: the tile's data replaced a stand-in, and it morphs in.
+const NODE_MORPH_IN: u32 = 8u;
 ";
 
 /// Bits of [`Place::packed`] holding the row; the column sits above them, the level above that.
@@ -136,6 +141,18 @@ impl Place {
     #[must_use]
     pub const fn level(self) -> Level {
         self.level
+    }
+
+    /// The column in the face's tile grid at the level.
+    #[must_use]
+    pub const fn tx(self) -> u16 {
+        self.tx
+    }
+
+    /// The row in the face's tile grid at the level.
+    #[must_use]
+    pub const fn ty(self) -> u16 {
+        self.ty
     }
 
     /// The next coarser tile covering this one, or `None` at level 0.
@@ -251,7 +268,7 @@ pub struct GpuNode {
     pub place: u32,
     /// Its slot ([`Slot::packed`]).
     pub slot: u32,
-    /// [`NODE_LIVE`], [`NODE_FLOOR`], [`NODE_FINEST`]; 0 for an empty node.
+    /// [`NODE_LIVE`], [`NODE_FLOOR`], [`NODE_FINEST`], [`NODE_MORPH_IN`]; 0 for an empty node.
     pub flags: u32,
     /// The parent's node index, or [`NONE`].
     pub parent: u32,
@@ -313,7 +330,8 @@ struct Node {
     slot: Slot,
     /// Its bound `e` and its finest normals' cone.
     detail: TileDetail,
-    /// [`NODE_FLOOR`] and [`NODE_FINEST`] as they apply ([`NODE_LIVE`] is implied).
+    /// [`NODE_FLOOR`], [`NODE_FINEST`] and [`NODE_MORPH_IN`] as they apply ([`NODE_LIVE`] is
+    /// implied).
     flags: u32,
     /// Its edge neighbours' places, found once on arrival.
     neighbours: [Option<Place>; 4],
@@ -487,6 +505,39 @@ impl TileTree {
         self.dirty.insert(index);
         self.stamp(index);
         Some(old)
+    }
+
+    /// Records that the resident tile at `place` has new data written over its slot in this
+    /// frame (a stand-in's, [`crate::standin`]): its node is written again and listed by
+    /// [`TileTree::changed_since`], so the bounds pass computes its bounds from the new data.
+    /// Returns its node index, or `None` if `place` isn't resident.
+    pub(crate) fn touch(&mut self, place: Place) -> Option<u32> {
+        let index = *self.by_place.get(&place)?;
+        self.dirty.insert(index);
+        self.stamp(index);
+        Some(index)
+    }
+
+    /// Sets or clears [`NODE_MORPH_IN`] on the resident tile at `place`, marking its node to be
+    /// written; whether it is resident.
+    pub(crate) fn set_morph_in(&mut self, place: Place, on: bool) -> bool {
+        let Some(&index) = self.by_place.get(&place) else {
+            return false;
+        };
+        let node = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.nodes.get_mut(i))
+            .and_then(Option::as_mut);
+        let Some(node) = node else {
+            return false;
+        };
+        if on {
+            node.flags |= NODE_MORPH_IN;
+        } else {
+            node.flags &= !NODE_MORPH_IN;
+        }
+        self.dirty.insert(index);
+        true
     }
 
     /// Records that node `index`'s tile data changed, in a new generation.

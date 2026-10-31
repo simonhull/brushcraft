@@ -77,6 +77,7 @@ use wgpu::{Buffer, MAP_ALIGNMENT, PollType};
 
 use crate::gpu::{Gpu, GpuError};
 use crate::normals::NormalPass;
+use crate::standin::Displacement;
 use crate::tree::{NODE_BYTES, NODE_FINEST, NODE_FLOOR, Place, TileTree, TreeError};
 use crate::upload::{
     Batch, FrameOutcome, FrameUploads, StagingRing, TileData, TileDetail, TileSource, Upload,
@@ -85,6 +86,7 @@ use crate::upload::{
 
 mod pool;
 mod requests;
+mod stand_ins;
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
@@ -92,6 +94,7 @@ mod tests;
 use pool::Pools;
 use requests::RequestBuffer;
 pub use requests::{GpuRequest, REQUEST_HEADER, REQUESTS_WGSL, Request, Requests};
+use stand_ins::StandIns;
 
 /// How many size classes there are: tile sides 2, 3, 5, 9, 17, 33 and 65.
 pub const CLASSES: usize = 7;
@@ -345,6 +348,11 @@ pub struct ResidencyConfig {
     request_capacity: u32,
     /// The finest level of the floor: every face's display tiles up to it are pinned.
     floor_top: Level,
+    /// The most finest tiles one frame's stand-ins read ([`crate::standin`]): the scratch's
+    /// size.
+    stand_in_tiles: u32,
+    /// The most display tiles standing in at once.
+    stand_in_rows: u32,
 }
 
 /// A mebibyte.
@@ -359,6 +367,14 @@ const FLOOR_TOP: Level = match Level::new(5) {
 /// Frames a pending epoch may stall before it is forced whole past
 /// [`ResidencyConfig::forced_bytes`]: so a tiny budget can't keep an epoch from ever applying.
 pub const LONG_STALL: u32 = 8;
+
+/// The finest tiles a frame's stand-ins read by default: the largest brush step below the
+/// footprint limit F (about 150 tiles, spec "Big brushes") and some to spare.
+const STAND_IN_TILES: u32 = 160;
+
+/// The display tiles standing in at once by default: every resident ancestor of the tiles a
+/// long stroke edited before the refresh catches up.
+const STAND_IN_ROWS: u32 = 8192;
 
 /// Keys readied at once by [`TileSource::prepare`]: the deadline is checked between such
 /// batches, so a frame overruns it by at most one batch of tiles.
@@ -381,6 +397,8 @@ impl ResidencyConfig {
             forced_bytes: 4 * staging_bytes,
             request_capacity: 4096,
             floor_top: FLOOR_TOP,
+            stand_in_tiles: STAND_IN_TILES,
+            stand_in_rows: STAND_IN_ROWS,
         }
     }
 
@@ -411,6 +429,8 @@ impl ResidencyConfig {
             forced_bytes: staging_cap,
             request_capacity,
             floor_top,
+            stand_in_tiles: STAND_IN_TILES,
+            stand_in_rows: STAND_IN_ROWS,
         };
         config.check()?;
         Ok(config)
@@ -457,6 +477,17 @@ impl ResidencyConfig {
         };
         config.check()?;
         Ok(config)
+    }
+
+    /// This configuration with stand-ins reading at most `tiles` finest tiles a frame, and at
+    /// most `rows` display tiles standing in at once (each at least 1).
+    #[must_use]
+    pub fn with_stand_ins(self, tiles: u32, rows: u32) -> Self {
+        Self {
+            stand_in_tiles: tiles.max(1),
+            stand_in_rows: rows.max(1),
+            ..self
+        }
     }
 
     /// The most bytes the slot buffers may take together.
@@ -580,6 +611,14 @@ pub struct ResidencyStats {
     /// Bytes the normal pass keeps between frames, outside the slot budget: its record chunks
     /// (as many as hold the staging ring's cap) and its job list.
     pub record_bytes: u64,
+    /// Bytes the stand-in pass keeps, outside the slot budget: its scratch, rows and job list.
+    pub stand_in_bytes: u64,
+    /// Display tiles stood in, ever (a tile once per frame it stands in).
+    pub stand_ins: u64,
+    /// Display tiles that wanted to stand in and couldn't in their frame, ever: the scratch or
+    /// the rows were full, or the source had nothing for a finest tile they read. They try
+    /// again the next frame.
+    pub stand_ins_skipped: u64,
     /// Tiles requested and not resident yet.
     pub wanted: usize,
     /// Tiles the source had nothing for, waiting for an epoch naming them.
@@ -618,6 +657,47 @@ struct Entry {
     last_drawn: u64,
     /// Whether it is part of the floor.
     floor: bool,
+    /// The brush steps its data includes, for a display tile: every step of epoch number below
+    /// this one ([`Residency::apply_step`]). Its stored data includes the steps up to the last
+    /// refresh epoch naming it; a stand-in, every step it read.
+    version: u64,
+}
+
+/// A brush step's edits, kept until every display tile above them has caught up with it.
+#[derive(Debug, Clone, PartialEq)]
+struct Step {
+    /// The step's epoch number.
+    seq: u64,
+    /// How far it moved any finest vertex, at most.
+    displacement: Displacement,
+    /// The finest tiles its epoch named.
+    keys: Vec<TileKey>,
+}
+
+/// What a resident display tile needs to stand in: the steps since its data's version.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Behind {
+    /// The steps' displacement bounds, summed: how far a finest vertex under it moved since.
+    displacement: Displacement,
+    /// The newest step's epoch number.
+    newest: u64,
+    /// The finest tiles the steps edited under it.
+    under: BTreeSet<TileKey>,
+}
+
+/// A tile a frame stood in, undone if the frame is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stood {
+    /// The tile.
+    key: TileKey,
+    /// Its slot.
+    slot: Slot,
+    /// Its data's version before.
+    before: u64,
+    /// Its row.
+    row: u32,
+    /// Whether the row was made in the frame.
+    fresh: bool,
 }
 
 /// A tile requested.
@@ -773,6 +853,8 @@ pub struct Residency {
     /// The normal pass: the frame's finest tiles' records, and the work that turns them into
     /// their slots' vertices.
     normals: NormalPass,
+    /// The stand-ins ([`crate::standin`]): the pass, the rows and the steps kept.
+    stand_ins: StandIns,
 }
 
 impl Residency {
@@ -845,24 +927,14 @@ impl Residency {
                 pools.reserve(gpu, class)?;
             }
         }
-        let floor: BTreeSet<TileKey> = mesh
-            .faces()
-            .flat_map(|face| {
-                floor_levels.iter().flat_map(move |&level| {
-                    let per_side = u16::try_from(level.tiles_per_side()).unwrap_or(0);
-                    (0..per_side).flat_map(move |ty| {
-                        (0..per_side)
-                            .filter_map(move |tx| TileKey::display(face, level, tx, ty).ok())
-                    })
-                })
-            })
-            .collect();
+        let floor = floor_keys(mesh, &floor_levels);
         check_floor_fits(&pools, &floor)?;
         let staging_bytes = config.staging_bytes.max(largest);
         let staging_cap = config.staging_cap.max(staging_bytes);
         let (outcome_sender, outcomes) = mpsc::channel();
         // A record chunk holds what a staging buffer does; as many are kept as hold the ring.
         let normals = NormalPass::new(gpu, staging_bytes, staging_cap)?;
+        let stand_ins = StandIns::new(gpu, config.stand_in_tiles, config.stand_in_rows)?;
         Ok(Self {
             ring: StagingRing::new(staging_bytes, staging_cap),
             config,
@@ -897,6 +969,7 @@ impl Residency {
             stats: ResidencyStats::default(),
             data: TileData::default(),
             normals,
+            stand_ins,
         })
     }
 
@@ -972,6 +1045,7 @@ impl Residency {
             allocated_bytes: self.pools.allocated(),
             used_bytes: self.pools.used(),
             record_bytes: self.normals.kept_bytes(),
+            stand_in_bytes: self.stand_ins.pass.kept_bytes(),
             wanted: self.wanted.len(),
             unavailable: self.unavailable.len(),
             pending_epochs: self.groups.len(),
@@ -996,8 +1070,12 @@ impl Residency {
             match outcome {
                 FrameOutcome::Submitted(frame) => {
                     self.in_flight.remove(&frame);
+                    self.stand_ins.stood_in_flight.remove(&frame);
                 }
                 FrameOutcome::Lost(frame) => {
+                    if let Some(stood) = self.stand_ins.stood_in_flight.remove(&frame) {
+                        self.unstand(stood);
+                    }
                     if let Some(touched) = self.in_flight.remove(&frame) {
                         self.recover(&touched, false);
                     }
@@ -1105,6 +1183,36 @@ impl Residency {
         self.cut = cut;
     }
 
+    /// Applies what the store's stale-tile feed gave after a brush step: as
+    /// [`Residency::apply`], and the finest tiles its epochs name stand in for their resident
+    /// display ancestors in the next frame staged ([`crate::standin`]), with `displacement` a
+    /// bound on how far the steps those epochs close moved any finest vertex.
+    ///
+    /// Epochs of anything else (a refresh, a page-in, an undo) go through
+    /// [`Residency::apply`]: no stand-in is made for them.
+    pub fn apply_step(&mut self, drained: Drained, displacement: Displacement) {
+        if let Drained::Epochs(epochs) = &drained {
+            for epoch in epochs {
+                let edited = epoch.keys.iter().filter(|key| self.is_finest(key));
+                let keys: Vec<TileKey> = edited.copied().collect();
+                if !keys.is_empty() {
+                    self.stand_ins.history.push(Step {
+                        seq: epoch.seq,
+                        displacement,
+                        keys,
+                    });
+                    self.stand_ins.due = true;
+                }
+            }
+        }
+        self.apply(drained);
+    }
+
+    /// Whether `key` is a finest tile of the project (evaluated positions, not a display tile).
+    fn is_finest(&self, key: &TileKey) -> bool {
+        key.level() == self.finest && key.channel() != Channel::DISPLAY
+    }
+
     /// Applies what the store's stale-tile feed gave: each epoch becomes pending, to switch
     /// whole; [`Drained::Resync`] re-reads every tile kept.
     pub fn apply(&mut self, drained: Drained) {
@@ -1123,6 +1231,14 @@ impl Residency {
     /// epoch merged into a pending one makes it urgent: it goes whole in the next frame.
     fn apply_epoch(&mut self, epoch: Epoch) {
         let keys = epoch.keys;
+        // A refreshed display tile's data includes every step before this epoch. An epoch that
+        // also names finest tiles is an edit's: the display tiles it names had their bound
+        // raised (the store's in-stroke bound), their positions as they were.
+        if !keys.iter().any(|key| self.is_finest(key)) {
+            for key in &keys {
+                self.stand_ins.refreshed.insert(Place::of(key), epoch.seq);
+            }
+        }
         for key in &keys {
             if self.forget_unavailable(key) && self.floor.contains(key) {
                 self.wanted.insert(
@@ -1294,6 +1410,11 @@ impl Residency {
         self.forced_now = 0;
         self.scanned.fill(None);
         self.normals.begin();
+        self.stand_ins.planned.clear();
+        self.stand_ins.stood.clear();
+        for place in std::mem::take(&mut self.stand_ins.morph_in) {
+            self.tree.set_morph_in(place, false);
+        }
         self.pending = self
             .groups
             .iter()
@@ -1307,6 +1428,27 @@ impl Residency {
                     Ok(normals) => normals,
                     Err(error) => return Err(self.fail(batch, error.into())),
                 };
+                let planned = std::mem::take(&mut self.stand_ins.planned);
+                let rows = if self.stand_ins.rows.is_empty() {
+                    0
+                } else {
+                    self.stand_ins.rows.high()
+                };
+                let pools = &self.pools;
+                let stand_ins = self.stand_ins.pass.finish(
+                    gpu,
+                    &mut batch,
+                    &mut self.ring,
+                    self.tree.buffer(),
+                    self.finest,
+                    &planned,
+                    |slot| pools.locate(slot).map(|(b, o)| (b.clone(), o)),
+                    rows,
+                );
+                let stand_ins = match stand_ins {
+                    Ok(stand_ins) => stand_ins,
+                    Err(error) => return Err(self.fail(batch, error.into())),
+                };
                 let requests = match self.requests.copy(gpu, self.frame) {
                     Ok(requests) => requests,
                     Err(error) => return Err(self.fail(batch, error.into())),
@@ -1317,7 +1459,17 @@ impl Residency {
                 self.next_upload += 1;
                 self.in_flight
                     .insert(frame, std::mem::take(&mut self.touched));
-                Ok(batch.finish(frame, normals, requests, self.outcome_sender.clone()))
+                self.stand_ins
+                    .stood_in_flight
+                    .insert(frame, std::mem::take(&mut self.stand_ins.stood));
+                self.prune_history();
+                Ok(batch.finish(
+                    frame,
+                    normals,
+                    stand_ins,
+                    requests,
+                    self.outcome_sender.clone(),
+                ))
             }
             Err(error) => Err(self.fail(batch, error)),
         }
@@ -1327,6 +1479,8 @@ impl Residency {
     /// the tiles it wrote are dropped. Returns `error`.
     fn fail(&mut self, batch: Batch, error: ResidencyError) -> ResidencyError {
         drop(batch);
+        let stood = std::mem::take(&mut self.stand_ins.stood);
+        self.unstand(stood);
         let touched = std::mem::take(&mut self.touched);
         self.recover(&touched, true);
         error
@@ -1373,6 +1527,7 @@ impl Residency {
             return Err(error);
         }
         self.stage_wanted(gpu, batch, source, deadline)?;
+        self.stage_stand_ins(gpu, batch, source)?;
         for (start, nodes) in self.tree.take_dirty() {
             let offset = u64::from(start) * NODE_BYTES;
             batch.write(
@@ -1706,13 +1861,25 @@ impl Residency {
             let place = Place::of(&key);
             match staged {
                 Staged::Data { slot, detail } => {
+                    let version = self.data_version(&key);
                     if let Some(entry) = self.entries.get_mut(&key) {
                         let old = entry.slot;
                         entry.slot = slot;
+                        entry.version = version;
                         self.tree.move_to(place, slot, detail);
                         if old != slot {
                             self.pools.release(old);
                         }
+                        // New data from the store: a stand-in it replaces morphs out, if the
+                        // data is caught up (else it stands in again, in this frame).
+                        if let Some(row) = self.stand_ins.rows.release(place) {
+                            self.stand_ins.row_frees.push(row);
+                            if !self.is_behind(place, version) {
+                                self.tree.set_morph_in(place, true);
+                                self.stand_ins.morph_in.push(place);
+                            }
+                        }
+                        self.stand_ins.due |= !self.stand_ins.history.is_empty();
                     } else {
                         self.insert_live(key, slot, detail)?;
                     }
@@ -1882,7 +2049,9 @@ impl Residency {
             slot,
             last_drawn: self.frame,
             floor,
+            version: self.data_version(&key),
         };
+        self.stand_ins.due |= !self.stand_ins.history.is_empty();
         // Only a tile not resident arrives, so this counts each floor tile once.
         if self.entries.insert(key, entry).is_none() && floor {
             self.floor_resident += 1;
@@ -1928,6 +2097,18 @@ impl Residency {
         }
         self.tree.remove(Place::of(key));
         self.pools.release(entry.slot);
+        if let Some(row) = self.stand_ins.rows.release(Place::of(key)) {
+            self.stand_ins.row_frees.push(row);
+        }
+    }
+
+    /// The version ([`Entry::version`]) of `key`'s data as the source gives it now: every step
+    /// before the last refresh epoch naming it (every step, if none has).
+    fn data_version(&self, key: &TileKey) -> u64 {
+        self.stand_ins
+            .refreshed
+            .get(&Place::of(key))
+            .map_or(0, |&seq| seq + 1)
     }
 
     /// The bytes staging `key` takes: a finest tile's ring record and its job (exact for one
@@ -1955,6 +2136,20 @@ impl Residency {
             .sum();
         crate::normals::record_bytes(q, ring_points) + crate::normals::JOB_BYTES
     }
+}
+
+/// Every face's display tiles at `levels`: the floor.
+fn floor_keys(mesh: &BaseMesh, levels: &[Level]) -> BTreeSet<TileKey> {
+    mesh.faces()
+        .flat_map(|face| {
+            levels.iter().flat_map(move |&level| {
+                let per_side = u16::try_from(level.tiles_per_side()).unwrap_or(0);
+                (0..per_side).flat_map(move |ty| {
+                    (0..per_side).filter_map(move |tx| TileKey::display(face, level, tx, ty).ok())
+                })
+            })
+        })
+        .collect()
 }
 
 /// Which corner of its face face-grid vertex `(fi, fj)` is, `n` quads a side, if it is one:

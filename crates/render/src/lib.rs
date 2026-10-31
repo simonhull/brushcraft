@@ -54,6 +54,7 @@ pub mod shade;
 mod shader_check;
 #[cfg(feature = "spike")]
 pub mod spike;
+pub mod standin;
 pub mod surface;
 pub mod timing;
 pub(crate) mod tone;

@@ -28,6 +28,7 @@ use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode, Queu
 use crate::gpu::{Gpu, GpuError};
 use crate::normals::{NormalWork, RingRecord};
 use crate::residency::{Request, Requests};
+use crate::standin::StandInWork;
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -179,6 +180,17 @@ impl TileData {
             return Upload::Ring(&self.ring);
         }
         Upload::Vertices(bytemuck::cast_slice(self.vertices()))
+    }
+
+    /// Appends the tile's own positions as this read wrote them to `out`, as `f32` bits, three
+    /// words a vertex, row-major: a finest tile's without its ring, or the vertices'.
+    pub(crate) fn positions(&mut self, out: &mut Vec<u32>) {
+        if self.written == Written::Ring {
+            self.ring.tile_positions(out);
+        } else {
+            let vertices = self.vertices().iter();
+            out.extend(vertices.flat_map(|v| v.position.map(f32::to_bits)));
+        }
     }
 
     /// The ring's record, if the ring is what was written, for tests that change it.
@@ -614,12 +626,13 @@ impl Batch {
     }
 
     /// Ends the frame's staging: unmaps its buffers and hands them, with their copies, the
-    /// normal pass and the request readback, to the render thread as frame `frame`, whose
-    /// outcome goes to `outcomes`.
+    /// normal pass, the stand-in pass and the request readback, to the render thread as frame
+    /// `frame`, whose outcome goes to `outcomes`.
     pub(crate) fn finish(
         mut self,
         frame: u64,
         normals: Option<NormalWork>,
+        stand_ins: Option<StandInWork>,
         requests: Option<RequestCopy>,
         outcomes: Sender<FrameOutcome>,
     ) -> FrameUploads {
@@ -632,6 +645,7 @@ impl Batch {
             staging,
             copies: std::mem::take(&mut self.copies),
             normals,
+            stand_ins,
             bytes: self.bytes,
             requests,
             level_choice: true,
@@ -710,6 +724,9 @@ pub struct FrameUploads {
     /// The normal pass computing its finest tiles' vertices from their records, if it staged
     /// any.
     normals: Option<NormalWork>,
+    /// The stand-in pass ([`crate::standin`]): the frame's stand-ins, and the settle of every
+    /// stand-in's bound into the tree after the tree's copies; `None` while no tile stands in.
+    stand_ins: Option<StandInWork>,
     /// Bytes staged.
     bytes: u64,
     /// The request readback, if a readback buffer was free.
@@ -730,10 +747,10 @@ impl FrameUploads {
         self.bytes
     }
 
-    /// Whether nothing was staged: no copies and no normal pass.
+    /// Whether nothing was staged: no copies, no normal pass and no stand-in pass.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.copies.is_empty() && self.normals.is_none()
+        self.copies.is_empty() && self.normals.is_none() && self.stand_ins.is_none()
     }
 
     /// The same uploads, for a frame whose passes don't run the level choice (a frame with no
@@ -780,6 +797,9 @@ impl FrameUploads {
         self.encode(&mut encoder);
         if let Some(normals) = &self.normals {
             normals.encode(&mut encoder);
+        }
+        if let Some(stand_ins) = &self.stand_ins {
+            stand_ins.encode(&mut encoder);
         }
         passes(&mut encoder);
         if !self.level_choice

@@ -193,6 +193,18 @@ impl RingRecord {
         self.words.get(HEADER_QUADS).copied().unwrap_or(0)
     }
 
+    /// Appends the tile's own `(q + 1)²` positions, without the ring, to `out`: `f32` bits,
+    /// three words a vertex, row-major.
+    pub(crate) fn tile_positions(&self, out: &mut Vec<u32>) {
+        let q = usize::try_from(self.quads()).unwrap_or(0);
+        let padded = q + 3;
+        for j in 1..=q + 1 {
+            let start = HEADER_WORDS + 3 * (j * padded + 1);
+            let row = self.words.get(start..start + 3 * (q + 1));
+            out.extend(row.into_iter().flatten());
+        }
+    }
+
     /// The record's bytes, as staged.
     #[must_use]
     pub(crate) fn bytes(&self) -> &[u8] {

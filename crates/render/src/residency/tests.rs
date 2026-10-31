@@ -1720,3 +1720,5 @@ fn used_by(residency: &Residency) -> u64 {
         .map(|slot| slot.class().slot_bytes())
         .sum()
 }
+
+mod standins;

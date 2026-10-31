@@ -6,7 +6,8 @@
 // cut from frame to frame. A tile new to the cut is stamped now, so it morphs in over the
 // duration, only when it refines what was drawn last frame (an ancestor was in the cut) and the
 // camera is still: that is a level change made with the camera still (an arrival, a refresh),
-// which would otherwise pop. Any other tile new to the cut is stamped a whole duration ago, so
+// which would otherwise pop; so is a tile whose data replaced a stand-in (NODE_MORPH_IN). Any
+// other tile new to the cut is stamped a whole duration ago, so
 // it is drawn at its level at once: moving, the distance factor alone governs the morph; and a
 // tile replacing its finer descendants, or one with nothing drawn before it, has nothing to
 // morph from.
@@ -74,10 +75,13 @@ fn stamp(@builtin(global_invocation_id) id: vec3<u32>) {
     let s = morph[n];
     let staying = s.face == entry.face && s.place == entry.place
         && (s.frame == params.frame - 1u || s.frame == params.frame);
+    // Data that replaced a stand-in morphs in as an arrival does: the tile stayed in the cut,
+    // but what it draws changed (render::standin). Stamped once, in its frame's first phase.
+    let morph_in = (tree[n].flags & NODE_MORPH_IN) != 0u && s.frame != params.frame;
     var start = s.start;
-    if !staying {
+    if !staying || morph_in {
         start = params.now - params.duration;
-        if (params.flags & MOVING) == 0u && refines_last_frame(n) {
+        if (params.flags & MOVING) == 0u && (morph_in || refines_last_frame(n)) {
             start = params.now;
         }
     }
