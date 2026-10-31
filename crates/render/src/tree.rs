@@ -518,6 +518,32 @@ impl TileTree {
         Some(index)
     }
 
+    /// Raises the resident tile at `place`'s bound `e` to `error` and makes its cone the one
+    /// that covers everything, as a stroke it can't stand in for needs
+    /// ([`crate::standin`]); its node is written again only if that changes it. Its data is the
+    /// same, so it isn't stamped.
+    pub(crate) fn raise_bound(&mut self, place: Place, error: f32) {
+        let Some(&index) = self.by_place.get(&place) else {
+            return;
+        };
+        let node = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.nodes.get_mut(i))
+            .and_then(Option::as_mut);
+        let Some(node) = node else {
+            return;
+        };
+        let raised = TileDetail {
+            error,
+            cone: geom::FinestNormalCone::EVERYTHING,
+            stored: node.detail.stored,
+        };
+        if node.detail != raised {
+            node.detail = raised;
+            self.dirty.insert(index);
+        }
+    }
+
     /// Sets or clears [`NODE_MORPH_IN`] on the resident tile at `place`, marking its node to be
     /// written; whether it is resident.
     pub(crate) fn set_morph_in(&mut self, place: Place, on: bool) -> bool {

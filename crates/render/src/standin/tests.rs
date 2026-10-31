@@ -508,6 +508,13 @@ fn a_failed_step_before_an_upkeep_refresh_never_passes_for_a_refresh() {
             }
         }
         assert!(epochs.iter().any(|epoch| epoch.kind == EpochKind::Revert));
+        assert!(
+            epochs
+                .iter()
+                .filter(|epoch| epoch.kind == EpochKind::Refresh)
+                .all(|epoch| epoch.keys.iter().all(|k| k.channel() == Channel::DISPLAY)),
+            "a refresh's epoch holds refreshed tiles alone"
+        );
         frame(gpu, &mut residency, store, drained);
         run_jobs(store);
         let refreshed = store.drain_stale(&cursor);
@@ -515,7 +522,65 @@ fn a_failed_step_before_an_upkeep_refresh_never_passes_for_a_refresh() {
         frame(gpu, &mut residency, store, Drained::Epochs(Vec::new()));
         let grids = finest_grids(store, &mesh);
         check(gpu, &residency, &grids, &BTreeSet::new());
+        // The refresh unblocked the places the revert reached: a step there stands in again.
+        assert!(residency.blocked_places() == 0, "unblocked by the refresh");
+        let before = residency.stats().stand_ins;
+        let again = step(
+            store,
+            &mesh,
+            &cursor,
+            FaceId::new(2),
+            Vec3::new(0.0, 0.01, 0.0),
+        );
+        assert_step(&again);
+        let edited = finest_of(&again);
+        frame(gpu, &mut residency, store, again);
+        assert!(residency.stats().stand_ins > before, "stood in again");
+        let stepped = finest_grids(store, &mesh);
+        check(gpu, &residency, &stepped, &above(&edited));
         store.unsubscribe_stale(cursor);
         drop(project.close(false));
     });
+}
+
+#[test]
+fn an_epoch_of_several_dabs_sums_their_displacements() {
+    let dir = TempDir::new("summed");
+    let (mut project, _) = project(&dir, |config| config);
+    let store = project.store();
+    let cursor = store.subscribe_stale();
+    let finest = level(FINEST);
+    store.begin_op().expect("an op");
+    let face = FaceId::new(2);
+    let (key, li, lj) = TileKey::containing(
+        geom::LayerId::BASE,
+        Channel::DISPLACEMENT,
+        face,
+        finest,
+        40,
+        50,
+    )
+    .expect("a finest tile");
+    for lift in [0.002_f32, 0.003] {
+        let c = store
+            .correction(key)
+            .expect("reads")
+            .get(li, lj)
+            .expect("a vertex");
+        store
+            .set_correction(face, finest, 40, 50, c + Vec3::new(0.0, 0.0, lift))
+            .expect("written");
+        store.bump_display_error(&[key], lift).expect("bumped");
+    }
+    store.close_epoch().expect("closed");
+    let Drained::Epochs(epochs) = store.drain_stale(&cursor) else {
+        panic!("epochs");
+    };
+    let kinds: Vec<EpochKind> = epochs.iter().map(|epoch| epoch.kind).collect();
+    assert!(
+        matches!(kinds.as_slice(), [EpochKind::Step { displacement }] if *displacement >= 0.005),
+        "one step's epoch, its displacements summed: {kinds:?}"
+    );
+    store.unsubscribe_stale(cursor);
+    drop(project.close(false));
 }

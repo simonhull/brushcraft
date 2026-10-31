@@ -22,6 +22,13 @@
 //! step whose finest tiles show, which keeps its seams closed (the stand-in module's notes,
 //! "Seams").
 //!
+//! A tile that can't stand in when it is behind (blocked by a revert, behind steps its place
+//! forgot, past what a scratch binds, no row left, a finest tile missing) has its bound raised
+//! instead, by twice the steps it is behind ([`Residency::raise_bound`]): never drawn with a
+//! bound smaller than its error, though its seams may show the steps on one side only until it
+//! stands in or is refreshed. Rows are as many as tiles can be resident, and the scratch grows,
+//! so in practice only a revert or a forgotten step leaves a tile so.
+//!
 //! A place's entries are kept until a refresh epoch names it: whatever holds its tile later
 //! (an arrival, a reload after a lost frame) reads data as old as that refresh. A revert's
 //! epoch ([`store::EpochKind::Revert`]) moved finest vertices by an unknown amount: the places
@@ -29,7 +36,6 @@
 //! them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
 
 use geom::TileKey;
 
@@ -61,7 +67,7 @@ pub(super) struct Under {
 }
 
 /// What a resident display tile needs to stand in: the steps since its data's version.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct Behind {
     /// The steps' displacement bounds, summed: how far a finest vertex under it moved since.
     displacement: Displacement,
@@ -69,6 +75,9 @@ pub(super) struct Behind {
     newest: u64,
     /// The finest tiles the steps moved under it.
     under: BTreeSet<TileKey>,
+    /// Whether it may stand in: not blocked by a revert, set aside as too large, or behind a
+    /// step its place forgot.
+    can_stand: bool,
 }
 
 /// A tile a frame stood in, undone if the frame is lost.
@@ -102,6 +111,10 @@ pub(super) struct StandIns {
     /// Places a revert's epoch reached, with its epoch number: they don't stand in until a
     /// refresh epoch names them after it.
     pub(super) blocked: BTreeMap<Place, u64>,
+    /// Per place, the steps its index forgot past [`MAX_STEPS`]: the newest one's epoch number
+    /// and their displacements summed. A tile behind one doesn't stand in (its finest tiles are
+    /// forgotten): its bound is raised instead, until a refresh names it.
+    pub(super) dropped: BTreeMap<Place, (u64, Displacement)>,
     /// Places whose tiles may be behind a step: a step entered under them, or their data was
     /// loaded, since they were last looked at.
     pub(super) due: BTreeSet<Place>,
@@ -123,8 +136,11 @@ pub(super) struct StandIns {
     /// The finest tiles whose positions the stand-ins will read: those of steps not yet
     /// entered (their pending epochs') and those entered this frame.
     pub(super) keep_positions: BTreeSet<TileKey>,
-    /// Whether the frame's tree upload wrote a node that has a row: the settle runs.
+    /// Whether the frame's tree upload wrote a node that has a row, or a row's bound was
+    /// raised: the settle runs.
     pub(super) settle: bool,
+    /// The newest epoch residency has applied, if any: what a tile read now has seen.
+    pub(super) seen: Option<u64>,
     /// A finest tile as read for a stand-in.
     pub(super) data: TileData,
 }
@@ -145,6 +161,7 @@ impl StandIns {
             entered: 0,
             refreshed: BTreeMap::new(),
             blocked: BTreeMap::new(),
+            dropped: BTreeMap::new(),
             due: BTreeSet::new(),
             oversized: BTreeSet::new(),
             planned: Vec::new(),
@@ -154,6 +171,7 @@ impl StandIns {
             positions: BTreeMap::new(),
             keep_positions: BTreeSet::new(),
             settle: false,
+            seen: None,
             data: TileData::default(),
         })
     }
@@ -178,7 +196,11 @@ impl StandIns {
             });
             under.finest.extend(finest);
             while steps.len() > MAX_STEPS {
-                steps.pop_first();
+                if let Some((seq, forgotten)) = steps.pop_first() {
+                    let (through, sum) = self.dropped.entry(place).or_default();
+                    *through = (*through).max(seq);
+                    *sum = sum.plus(forgotten.displacement);
+                }
                 *dropped += 1;
             }
             self.due.insert(place);
@@ -202,6 +224,34 @@ impl StandIns {
         if self.blocked.get(&place).is_some_and(|&revert| revert < seq) {
             self.blocked.remove(&place);
         }
+        if self
+            .dropped
+            .get(&place)
+            .is_some_and(|&(through, _)| through < seq)
+        {
+            self.dropped.remove(&place);
+        }
+    }
+
+    /// The steps the tile at `place` is behind from epoch number `from` on, its index's and
+    /// those it forgot: their displacements summed, and the newest one's number; `None` if
+    /// none.
+    pub(super) fn since(&self, place: Place, from: u64) -> Option<(Displacement, u64)> {
+        let forgotten = self.dropped.get(&place);
+        let mut found = forgotten
+            .filter(|&&(through, _)| through >= from)
+            .map(|&(through, sum)| (sum, through));
+        let kept = self
+            .index
+            .get(&place)
+            .into_iter()
+            .flat_map(|steps| steps.range(from..));
+        for (&seq, under) in kept {
+            let (sum, newest) = found.get_or_insert((Displacement::ZERO, seq));
+            *sum = sum.plus(under.displacement);
+            *newest = (*newest).max(seq);
+        }
+        found
     }
 
     /// Notes the positions of finest tile `key`, read for an epoch's staging, if the stand-ins
@@ -214,17 +264,24 @@ impl StandIns {
         }
     }
 
-    /// Rebuilds the index from what a resync hands over: every display tile a stroke changed
-    /// since its last refresh, behind one step of their displacements summed. Everything else
-    /// is as its refresh left it.
-    pub(super) fn resync(&mut self, unrefreshed: Vec<store::Unrefreshed>) {
+    /// Forgets the index on a resync: the feed lost the epochs it was built from. What the
+    /// resync hands over enters when the tiles' re-read switches ([`StandIns::enter_unrefreshed`]).
+    pub(super) fn resync(&mut self) {
         self.index.clear();
         self.refreshed.clear();
         self.blocked.clear();
+        self.dropped.clear();
         self.oversized.clear();
         self.positions.clear();
+    }
+
+    /// Enters what a resync handed over: every display tile a stroke changed since its last
+    /// refresh, behind one step of its displacements summed, under its own place. A tile whose
+    /// displacement isn't one is blocked until a refresh, as after a revert.
+    pub(super) fn enter_unrefreshed(&mut self, unrefreshed: Vec<store::Unrefreshed>) {
         for tile in unrefreshed {
             let Ok(displacement) = Displacement::try_from(tile.displacement) else {
+                self.blocked.insert(Place::of(&tile.tile), 0);
                 continue;
             };
             let place = Place::of(&tile.tile);
@@ -244,11 +301,15 @@ impl Residency {
     /// rows' steps; the tiles standing in are touched in the tree, so the bounds pass
     /// recomputes them.
     ///
-    /// Tiles in the cut stand in first, whatever the time; the rest while the frame is before
-    /// `deadline`, the oldest data first. A frame reading more finest tiles than the kept
-    /// scratch holds uses a one-off one. A tile needing more than a scratch binds is set
-    /// aside until its inputs change; a tile with no row left waits; both are counted as
-    /// skipped.
+    /// Every resident display tile behind a step stands in, whatever the time: the cut is a
+    /// frame old, and the level choice may draw any of them. A frame reading more finest tiles
+    /// than the kept scratch holds uses a one-off one, grown as it needs. A tile that can't
+    /// stand in this frame (blocked by a revert, behind a step its place forgot, needing more
+    /// finest tiles than a scratch binds, no row left, a finest tile the source has nothing
+    /// for) keeps its data but has its bound raised by twice the steps it is behind
+    /// ([`Residency::raise_bound`]): never drawn with a bound smaller than its error, though a
+    /// seam beside it may show the steps on one side only until it stands in or is refreshed.
+    /// Those are counted as skipped.
     ///
     /// # Errors
     ///
@@ -258,7 +319,6 @@ impl Residency {
         gpu: &Gpu,
         batch: &mut Batch,
         source: &mut S,
-        deadline: Instant,
     ) -> Result<(), ResidencyError>
     where
         S::Error: Into<ResidencyError>,
@@ -273,23 +333,35 @@ impl Residency {
         }
         let behind = self.behind();
         if behind.is_empty() {
+            // A frame reading nothing: the one-off scratch counts it idle.
+            self.stand_ins.pass.idle();
             return Ok(());
         }
         let most = usize::try_from(self.stand_ins.pass.most_tiles()).unwrap_or(usize::MAX);
         let mut reads: BTreeSet<TileKey> = BTreeSet::new();
         let mut chosen: Vec<(TileKey, Behind)> = Vec::new();
+        let mut raised: Vec<TileKey> = Vec::new();
+        let mut rows_left = self.stand_ins.rows.left();
         for (key, tile) in behind {
             let place = Place::of(&key);
-            if tile.under.len() > most {
-                self.stand_ins.oversized.insert(place);
-                self.stats.stand_ins_skipped += 1;
+            let has_row = self.stand_ins.rows.get(place).is_some();
+            if !tile.can_stand {
+                raised.push(key);
                 continue;
             }
-            let in_cut = self.cut.contains(&key);
-            let more = tile.under.difference(&reads).count();
-            if reads.len() + more > most || (!in_cut && Instant::now() >= deadline) {
-                self.skip_stand_in(place);
+            if tile.under.len() > most {
+                self.stand_ins.oversized.insert(place);
+                raised.push(key);
                 continue;
+            }
+            let more = tile.under.difference(&reads).count();
+            if reads.len() + more > most || (!has_row && rows_left == 0) {
+                self.stand_ins.due.insert(place);
+                raised.push(key);
+                continue;
+            }
+            if !has_row {
+                rows_left -= 1;
             }
             reads.extend(tile.under.iter().copied());
             chosen.push((key, tile));
@@ -301,10 +373,16 @@ impl Residency {
                 .iter()
                 .map(|f| scratch.get(f).map(|&index| (index, Place::of(f))))
                 .collect();
-            match under {
-                Some(under) => self.stand_in(gpu, batch, key, &tile, under)?,
-                None => self.skip_stand_in(Place::of(&key)),
+            if let Some(under) = under {
+                self.stand_in(gpu, batch, key, &tile, under)?;
+            } else {
+                self.stand_ins.due.insert(Place::of(&key));
+                raised.push(key);
             }
+        }
+        for key in raised {
+            self.stats.stand_ins_skipped += 1;
+            self.raise_bound(gpu, batch, key)?;
         }
         Ok(())
     }
@@ -367,10 +445,60 @@ impl Residency {
         Ok(scratch)
     }
 
+    /// Raises the bound of `key`, a resident display tile behind steps it can't stand in for
+    /// this frame, by twice those steps' displacements: its vertices stay, so a finest vertex
+    /// that moved `D` from the surface it was within `e` of is within `e + D` (the second `D`
+    /// the store's in-stroke margin).
+    ///
+    /// A stand-in's bound (in its row) is raised on the GPU by the steps since it last counted
+    /// them, a row step replacing no vertex ([`Entry::bounded`](super::Entry)). Any other
+    /// tile's node gets, on the CPU, the bound it was loaded with plus twice the steps since
+    /// it was loaded (the store's bound counts every step it had made before), and the cone
+    /// that covers everything; a node already holding that isn't written again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Residency::stage`].
+    pub(super) fn raise_bound(
+        &mut self,
+        gpu: &Gpu,
+        batch: &mut Batch,
+        key: TileKey,
+    ) -> Result<(), ResidencyError> {
+        let place = Place::of(&key);
+        let Some(entry) = self.entries.get(&key).copied() else {
+            return Ok(());
+        };
+        if let Some(row) = self.stand_ins.rows.get(place) {
+            let Some((displacement, newest)) = self.stand_ins.since(place, entry.bounded) else {
+                return Ok(());
+            };
+            self.stand_ins.pass.write_row(
+                gpu,
+                batch,
+                &mut self.ring,
+                row,
+                RowWrite::Step { displacement },
+            )?;
+            self.stand_ins.settle = true;
+            if let Some(live) = self.entries.get_mut(&key) {
+                live.bounded = newest + 1;
+            }
+            return Ok(());
+        }
+        let after = entry.loaded_after.map_or(0, |seen| seen + 1);
+        let Some((displacement, _)) = self.stand_ins.since(place, after) else {
+            return Ok(());
+        };
+        let raise = displacement.plus(displacement).get();
+        let bound = (entry.loaded_error + raise).next_up().min(f32::MAX);
+        self.tree.raise_bound(place, bound);
+        Ok(())
+    }
+
     /// Stands `key` in, behind by `tile`, reading the finest tiles `under` (by their index in
     /// the scratch): its row's step staged (a new row's bound from the tile's stored bound),
-    /// its node touched, its data's version moved past the steps. Skipped (counted) if every
-    /// row is taken.
+    /// its node touched, its data's version and its bound moved past the steps.
     ///
     /// # Errors
     ///
@@ -390,12 +518,20 @@ impl Residency {
         };
         let displacement = tile.displacement;
         let row = if let Some(row) = self.stand_ins.rows.get(place) {
+            // The row's bound counts the steps before `bounded` (a raise may have counted more
+            // than the stand-in's vertices show): the steps since then are what moved.
+            let moved = self
+                .stand_ins
+                .since(place, entry.bounded)
+                .map_or(Displacement::ZERO, |(sum, _)| sum);
             self.stand_ins.pass.write_row(
                 gpu,
                 batch,
                 &mut self.ring,
                 row,
-                RowWrite::Step { displacement },
+                RowWrite::Step {
+                    displacement: moved,
+                },
             )?;
             row
         } else if let Some(row) = self.stand_ins.rows.take(place) {
@@ -410,12 +546,13 @@ impl Residency {
                 .write_row(gpu, batch, &mut self.ring, row, write)?;
             row
         } else {
-            self.skip_stand_in(place);
-            return Ok(());
+            // The rows were counted when the frame planned: never.
+            return Err(ResidencyError::Invariant("a stand-in found no row"));
         };
         self.tree.touch(place);
         if let Some(live) = self.entries.get_mut(&key) {
             live.version = tile.newest + 1;
+            live.bounded = tile.newest + 1;
         }
         self.stand_ins.stood.push(Stood {
             key,
@@ -431,23 +568,14 @@ impl Residency {
         Ok(())
     }
 
-    /// Whether the display tile at `place`, its data of `version`, is behind a step in the
-    /// index.
+    /// Whether the display tile at `place`, its data of `version`, is behind a step: one in
+    /// the index, or one it forgot.
     pub(super) fn is_behind(&self, place: Place, version: u64) -> bool {
-        self.stand_ins
-            .index
-            .get(&place)
-            .is_some_and(|steps| steps.range(version..).next().is_some())
+        self.stand_ins.since(place, version).is_some()
     }
 
-    /// Counts a stand-in that couldn't be made this frame; its place is looked at again next.
-    fn skip_stand_in(&mut self, place: Place) {
-        self.stats.stand_ins_skipped += 1;
-        self.stand_ins.due.insert(place);
-    }
-
-    /// Every due resident display tile behind a step in the index, with what it needs to catch
-    /// up: the cut's tiles first, then the oldest data first. The due places are taken.
+    /// Every due resident display tile behind a step, with what it needs to catch up, the
+    /// oldest data first. The due places are taken.
     fn behind(&mut self) -> Vec<(TileKey, Behind)> {
         let due = std::mem::take(&mut self.stand_ins.due);
         let mut behind: Vec<(TileKey, Behind)> = Vec::new();
@@ -455,31 +583,37 @@ impl Residency {
             let Some(key) = place.key(self.finest) else {
                 continue;
             };
-            let (Some(entry), Some(steps)) =
-                (self.entries.get(&key), self.stand_ins.index.get(&place))
-            else {
+            let Some(entry) = self.entries.get(&key) else {
                 continue;
             };
-            if self.stand_ins.blocked.contains_key(&place)
-                || self.stand_ins.oversized.contains(&place)
-            {
+            let Some((displacement, newest)) = self.stand_ins.since(place, entry.version) else {
                 continue;
-            }
-            let mut tile = Behind::default();
-            for (&seq, under) in steps.range(entry.version..) {
-                tile.displacement = tile.displacement.plus(under.displacement);
-                tile.newest = seq;
+            };
+            let forgot = self
+                .stand_ins
+                .dropped
+                .get(&place)
+                .is_some_and(|&(through, _)| through >= entry.version);
+            let can_stand = !forgot
+                && !self.stand_ins.blocked.contains_key(&place)
+                && !self.stand_ins.oversized.contains(&place);
+            let mut tile = Behind {
+                displacement,
+                newest,
+                under: BTreeSet::new(),
+                can_stand,
+            };
+            let kept = self.stand_ins.index.get(&place);
+            let steps = kept
+                .into_iter()
+                .flat_map(|steps| steps.range(entry.version..));
+            for (_, under) in steps {
                 tile.under.extend(under.finest.iter().copied());
             }
-            if !tile.under.is_empty() {
-                behind.push((key, tile));
-            }
+            behind.push((key, tile));
         }
-        let order = |key: &TileKey| {
-            let version = self.entries.get(key).map_or(0, |entry| entry.version);
-            (!self.cut.contains(key), version)
-        };
-        behind.sort_by_key(|(key, _)| order(key));
+        let version = |key: &TileKey| self.entries.get(key).map_or(0, |entry| entry.version);
+        behind.sort_by_key(|(key, _)| version(key));
         behind
     }
 

@@ -317,6 +317,12 @@ impl RowBook {
         self.high
     }
 
+    /// How many more rows can be taken.
+    pub(crate) fn left(&self) -> u32 {
+        let taken = u32::try_from(self.by_place.len()).unwrap_or(u32::MAX);
+        self.capacity.saturating_sub(taken)
+    }
+
     /// Whether no tile stands in.
     pub(crate) fn is_empty(&self) -> bool {
         self.by_place.is_empty()
@@ -520,14 +526,11 @@ impl StandInPass {
     ///
     /// As [`Gpu::scoped`], making the one-off scratch.
     pub(crate) fn begin(&mut self, gpu: &Gpu, tiles: u32) -> Result<(), GpuError> {
-        self.use_one_off = tiles > self.scratch_tiles;
-        if !self.use_one_off {
-            self.one_off_idle = self.one_off_idle.saturating_add(1);
-            if self.one_off_idle > ONE_OFF_FRAMES {
-                self.one_off = None;
-            }
+        if tiles <= self.scratch_tiles {
+            self.idle();
             return Ok(());
         }
+        self.use_one_off = true;
         self.one_off_idle = 0;
         let need = u64::from(tiles) * TILE_BYTES;
         if self
@@ -540,6 +543,16 @@ impl StandInPass {
             self.one_off = Some(storage_buffer(gpu, "one-off stand-in scratch", bytes)?);
         }
         Ok(())
+    }
+
+    /// Notes a frame whose stand-ins read no finest tile: the one-off scratch counts it idle,
+    /// and is dropped after [`ONE_OFF_FRAMES`] of them in a row.
+    pub(crate) fn idle(&mut self) {
+        self.use_one_off = false;
+        self.one_off_idle = self.one_off_idle.saturating_add(1);
+        if self.one_off_idle > ONE_OFF_FRAMES {
+            self.one_off = None;
+        }
     }
 
     /// Bytes of the one-off scratch, while it is kept.

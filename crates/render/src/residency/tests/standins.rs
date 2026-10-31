@@ -339,6 +339,23 @@ fn check(gpu: &Gpu, residency: &Residency, sphere: &Sphere) -> usize {
     raised
 }
 
+/// Checks that every resident display tile's bound holds every finest vertex under it, seams
+/// aside: a tile that couldn't stand in keeps its data, its bound raised.
+fn check_bounds(gpu: &Gpu, residency: &Residency, sphere: &Sphere) {
+    for (place, (vertices, node)) in display_tiles(gpu, residency) {
+        let (_, _, size) = sphere.block(place);
+        let scale = size / place.level().tile_quads();
+        let grid = &sphere.current[&place.face().index()];
+        let worst = measured_error(place, sphere.finest, &vertices, grid, scale);
+        let measured = (worst - 1e-6) / 1.01;
+        assert!(
+            measured <= node.error,
+            "{place:?}: a finest vertex {measured} from its triangles, past its bound {}",
+            node.error
+        );
+    }
+}
+
 /// The display tiles above the finest tiles `epoch` names.
 fn above(epoch: &Epoch) -> BTreeSet<Place> {
     let mut above = BTreeSet::new();
@@ -585,11 +602,20 @@ fn the_reads_a_step_takes_stay_flat_however_long_the_stroke() {
                 Drained::Epochs(vec![epoch]),
                 None,
             );
-            // A step reads its finest tiles once, for the stand-ins, and no display tile: the
-            // ones it names had only their bound raised.
+            // With nothing skipped, a step reads its finest tiles once, for the stand-ins, and
+            // no display tile: the ones it names had only their bound raised.
+            assert_eq!(
+                residency.stats().stand_ins_skipped,
+                0,
+                "step {step}: skipped"
+            );
             per_step.push((sphere.reads - before, finest));
+            if step % 10 == 9 {
+                check(gpu, &residency, &sphere);
+            }
         }
-        for (step, &(reads, finest)) in per_step.iter().enumerate() {
+        let steps = per_step.iter().enumerate();
+        for (step, &(reads, finest)) in steps {
             assert_eq!(
                 reads, finest,
                 "step {step}: {reads} reads for {finest} finest tiles"
@@ -904,6 +930,8 @@ fn with_every_row_taken_a_stand_in_waits_and_is_counted() {
         let stats = residency.stats();
         assert_eq!(stats.stand_ins, 2, "two rows");
         assert_eq!(stats.stand_ins_skipped, (wanted - 2) as u64);
+        // Those that wait keep their data with their bound raised: every bound still holds.
+        check_bounds(gpu, &residency, &sphere);
         // Each waits: looked at again next frame.
         quiet(gpu, &mut residency, &mut sphere);
         assert_eq!(
@@ -911,6 +939,7 @@ fn with_every_row_taken_a_stand_in_waits_and_is_counted() {
             2 * (wanted - 2) as u64,
             "tried again"
         );
+        check_bounds(gpu, &residency, &sphere);
     });
 }
 
@@ -933,6 +962,7 @@ fn a_tile_past_what_a_scratch_binds_is_set_aside_until_its_inputs_change() {
         let skipped = residency.stats().stand_ins_skipped;
         assert!(skipped > 0, "some tiles need more than one finest tile");
         assert!(!residency.stand_ins.oversized.is_empty());
+        check_bounds(gpu, &residency, &sphere);
         // Not walked again while nothing under them changes.
         quiet(gpu, &mut residency, &mut sphere);
         assert_eq!(residency.stats().stand_ins_skipped, skipped, "set aside");
@@ -949,5 +979,88 @@ fn a_tile_past_what_a_scratch_binds_is_set_aside_until_its_inputs_change() {
             residency.stats().stand_ins_skipped > skipped,
             "looked at again"
         );
+        check_bounds(gpu, &residency, &sphere);
+    });
+}
+
+#[test]
+fn every_tile_behind_a_step_stands_in_whatever_the_deadline() {
+    GpuTest::run(|gpu| {
+        let mut sphere = Sphere::new();
+        let mut residency = residency(gpu, &sphere, 6);
+        quiet(gpu, &mut residency, &mut sphere);
+        let epoch = sphere.step(0.02);
+        let stood = above(&epoch);
+        residency.begin_frame(gpu).expect("a frame begins");
+        residency.apply(Drained::Epochs(vec![epoch]));
+        // An empty cut, and the frame's deadline already past.
+        residency.use_frame(FrameUse::default());
+        let uploads = residency
+            .stage(gpu, &mut sphere, Instant::now())
+            .expect("staged");
+        submit(gpu, uploads, |_| {});
+        assert!(residency.cut().is_empty());
+        let stats = residency.stats();
+        assert_eq!(stats.stand_ins, stood.len() as u64, "all stood in");
+        assert_eq!(stats.stand_ins_skipped, 0);
+        check(gpu, &residency, &sphere);
+    });
+}
+
+#[test]
+fn a_tile_behind_steps_its_place_forgot_has_its_bound_raised_instead() {
+    GpuTest::run(|gpu| {
+        let mut sphere = Sphere::new();
+        let mut residency = residency(gpu, &sphere, 6);
+        quiet(gpu, &mut residency, &mut sphere);
+        let key = TileKey::displacement(FaceId::new(0), sphere.finest, 0, 0).expect("a key");
+        let steps = MAX_STEPS + 5;
+        let displacement = 1e-4_f32;
+        let seqs = 1..=steps as u64;
+        let epochs: Vec<Epoch> = seqs
+            .map(|seq| Epoch {
+                seq,
+                kind: EpochKind::Step { displacement },
+                keys: BTreeSet::from([key]),
+            })
+            .collect();
+        frame(
+            gpu,
+            &mut residency,
+            &mut sphere,
+            Drained::Epochs(epochs),
+            None,
+        );
+        assert!(residency.stats().stand_in_steps_dropped > 0);
+        let above: Vec<Place> = {
+            let mut above = Vec::new();
+            let mut at = Place::of(&key).parent();
+            while let Some(place) = at {
+                above.push(place);
+                at = place.parent();
+            }
+            above
+        };
+        let tiles = display_tiles(gpu, &residency);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a few thousand steps, exact in f32"
+        )]
+        let total = 2.0 * displacement * steps as f32;
+        for place in &above {
+            assert!(
+                residency.stand_ins.rows.get(*place).is_none(),
+                "{place:?} stood in"
+            );
+            let (vertices, node) = &tiles[place];
+            let grid = &sphere.current[&place.face().index()];
+            let scale = sphere.block(*place).2 / place.level().tile_quads();
+            let stored = measured_error(*place, sphere.finest, vertices, grid, scale);
+            assert!(
+                node.error >= stored + total * 0.999,
+                "{place:?}: bound {} not raised past {stored} by {total}",
+                node.error
+            );
+        }
     });
 }

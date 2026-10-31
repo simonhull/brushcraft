@@ -352,8 +352,9 @@ pub struct ResidencyConfig {
     /// The finest tiles the stand-ins' kept scratch holds ([`crate::standin`]): a frame whose
     /// stand-ins read more makes a one-off scratch.
     stand_in_tiles: u32,
-    /// The most display tiles standing in at once.
-    stand_in_rows: u32,
+    /// The most display tiles standing in at once: by default as many as can be resident
+    /// (the tile tree's capacity), so a stand-in never waits for a row.
+    stand_in_rows: Option<u32>,
 }
 
 /// A mebibyte.
@@ -372,10 +373,6 @@ pub const LONG_STALL: u32 = 8;
 /// The finest tiles the stand-ins' kept scratch holds by default: the largest brush step below
 /// the footprint limit F (about 150 tiles, spec "Big brushes") and some to spare.
 const STAND_IN_TILES: u32 = 160;
-
-/// The display tiles standing in at once by default: every resident ancestor of the tiles a
-/// long stroke edited before the refresh catches up.
-const STAND_IN_ROWS: u32 = 8192;
 
 /// The most brush steps a place keeps for its display tile to catch up with
 /// ([`crate::standin`]): a long stroke's worth while the refresh lags, bounding what a store
@@ -404,7 +401,7 @@ impl ResidencyConfig {
             request_capacity: 4096,
             floor_top: FLOOR_TOP,
             stand_in_tiles,
-            stand_in_rows: STAND_IN_ROWS,
+            stand_in_rows: None,
         }
     }
 
@@ -436,7 +433,7 @@ impl ResidencyConfig {
             request_capacity,
             floor_top,
             stand_in_tiles: STAND_IN_TILES,
-            stand_in_rows: STAND_IN_ROWS,
+            stand_in_rows: None,
         };
         config.check()?;
         Ok(config)
@@ -491,7 +488,7 @@ impl ResidencyConfig {
     pub fn with_stand_ins(self, tiles: u32, rows: u32) -> Self {
         Self {
             stand_in_tiles: tiles.max(1),
-            stand_in_rows: rows.max(1),
+            stand_in_rows: Some(rows.max(1)),
             ..self
         }
     }
@@ -674,13 +671,21 @@ struct Entry {
     last_drawn: u64,
     /// Whether it is part of the floor.
     floor: bool,
-    /// The brush steps its data includes, for a display tile: every step of epoch number below
-    /// this one ([`Residency::apply`] of a step's epoch). Its stored data includes the steps up to the last
-    /// refresh epoch naming it; a stand-in, every step it read.
+    /// The brush steps its data includes, for a display tile: every step of epoch number
+    /// below this one ([`Residency::apply`] of a step's epoch). Its stored data includes the
+    /// steps up to the last refresh epoch naming it; a stand-in, every step it read.
     version: u64,
     /// The bound its data was stored with, for a display tile: what a stand-in's bound grows
     /// from (the bound it is drawn with may be a stroke's raise past it).
     stored_error: f32,
+    /// The bound it was loaded with, the store's (a stroke's raise of the stored one counts
+    /// every step the store had made): what its bound is raised from while it can't stand in.
+    loaded_error: f32,
+    /// The newest epoch residency had applied when its data was read, if any: steps after it
+    /// raise its loaded bound.
+    loaded_after: Option<u64>,
+    /// The steps its stand-in's bound (its row's) counts: every one before this.
+    bounded: u64,
 }
 
 /// A tile requested.
@@ -703,6 +708,8 @@ enum Staged {
         slot: Slot,
         /// Its bound `e` and finest normals' cone.
         detail: TileDetail,
+        /// The newest epoch residency had applied when it was read ([`Entry::loaded_after`]).
+        seen: Option<u64>,
     },
     /// The source had nothing for it: it leaves when the epoch switches.
     Missing,
@@ -727,6 +734,9 @@ struct Group {
     /// The brush steps of its epochs, oldest first: they enter the stand-ins' index when it
     /// switches, as their finest tiles show.
     steps: Vec<Step>,
+    /// What a resync handed over (a resync's group): it enters the index when the re-read
+    /// switches.
+    unrefreshed: Vec<store::Unrefreshed>,
 }
 
 impl Group {
@@ -749,6 +759,7 @@ impl Group {
         self.stalled = self.stalled.max(other.stalled);
         self.urgent |= other.urgent;
         self.steps.extend(other.steps);
+        self.unrefreshed.extend(other.unrefreshed);
         self.steps.sort_by_key(|step| step.seq);
     }
 }
@@ -922,7 +933,8 @@ impl Residency {
         let (outcome_sender, outcomes) = mpsc::channel();
         // A record chunk holds what a staging buffer does; as many are kept as hold the ring.
         let normals = NormalPass::new(gpu, staging_bytes, staging_cap)?;
-        let stand_ins = StandIns::new(gpu, config.stand_in_tiles, config.stand_in_rows)?;
+        let rows = config.stand_in_rows.unwrap_or(capacity);
+        let stand_ins = StandIns::new(gpu, config.stand_in_tiles, rows)?;
         Ok(Self {
             ring: StagingRing::new(staging_bytes, staging_cap),
             config,
@@ -1171,6 +1183,12 @@ impl Residency {
         self.cut = cut;
     }
 
+    /// How many places a revert keeps from standing in, for the tests.
+    #[cfg(test)]
+    pub(crate) fn blocked_places(&self) -> usize {
+        self.stand_ins.blocked.len()
+    }
+
     /// Whether `key` is a finest tile of the project (evaluated positions, not a display tile).
     fn is_finest(&self, key: &TileKey) -> bool {
         key.level() == self.finest && key.channel() != Channel::DISPLAY
@@ -1195,8 +1213,12 @@ impl Residency {
                 }
             }
             Drained::Resync(unrefreshed) => {
-                self.stand_ins.resync(unrefreshed);
+                self.stand_ins.resync();
                 self.resync();
+                // What the stroke changed enters when the tiles' re-read switches.
+                if let Some(group) = self.groups.last_mut() {
+                    group.unrefreshed.extend(unrefreshed);
+                }
             }
         }
     }
@@ -1204,6 +1226,14 @@ impl Residency {
     /// Applies one epoch by its kind (see [`Residency::apply`]).
     fn apply_kind(&mut self, epoch: Epoch) {
         let Epoch { seq, kind, keys } = epoch;
+        self.stand_ins.seen = Some(self.stand_ins.seen.map_or(seq, |seen| seen.max(seq)));
+        // A step whose displacement isn't one bounds nothing: as a revert.
+        let kind = match kind {
+            EpochKind::Step { displacement } if Displacement::try_from(displacement).is_err() => {
+                EpochKind::Revert
+            }
+            other @ (EpochKind::Step { .. } | EpochKind::Refresh | EpochKind::Revert) => other,
+        };
         match kind {
             EpochKind::Step { displacement } => {
                 let finest: BTreeSet<TileKey> =
@@ -1233,7 +1263,8 @@ impl Residency {
             EpochKind::Revert => {
                 let mut keys = keys;
                 let mut above: BTreeSet<Place> = BTreeSet::new();
-                for key in keys.iter().filter(|key| self.is_finest(key)) {
+                let moved = keys.iter().filter(|key| self.is_finest(key));
+                for key in moved {
                     let mut at = Place::of(key).parent();
                     while let Some(place) = at {
                         above.insert(place);
@@ -1557,7 +1588,7 @@ impl Residency {
             return Err(error);
         }
         self.stage_wanted(gpu, batch, source, deadline)?;
-        self.stage_stand_ins(gpu, batch, source, deadline)?;
+        self.stage_stand_ins(gpu, batch, source)?;
         for (start, nodes) in self.tree.take_dirty() {
             self.note_tree_write(&nodes);
             let offset = u64::from(start) * NODE_BYTES;
@@ -1710,12 +1741,15 @@ impl Residency {
             return Ok(Read::NoSlot);
         };
         let read = self.read_fresh(gpu, batch, source, key, slot, forced)?;
+        let seen = self.stand_ins.seen;
         match read {
             Read::Staged(detail) => match self.joining(&key) {
                 Some(group) => {
-                    group.staged.insert(key, Staged::Data { slot, detail });
+                    group
+                        .staged
+                        .insert(key, Staged::Data { slot, detail, seen });
                 }
-                None => self.insert_live(key, slot, detail)?,
+                None => self.insert_live(key, slot, detail, seen)?,
             },
             Read::Missing => {
                 self.pools.release(slot);
@@ -1791,7 +1825,10 @@ impl Residency {
                 };
                 match self.read_fresh(gpu, batch, source, key, slot, false)? {
                     Read::Staged(detail) => {
-                        group.staged.insert(key, Staged::Data { slot, detail });
+                        let seen = self.stand_ins.seen;
+                        group
+                            .staged
+                            .insert(key, Staged::Data { slot, detail, seen });
                         self.stats.shadowed += 1;
                     }
                     Read::Missing => {
@@ -1863,6 +1900,7 @@ impl Residency {
                         Staged::Data {
                             slot: target,
                             detail,
+                            seen: self.stand_ins.seen,
                         },
                     );
                 }
@@ -1893,16 +1931,23 @@ impl Residency {
             self.stand_ins
                 .enter(step, &mut self.stats.stand_in_steps_dropped);
         }
+        let unrefreshed = std::mem::take(&mut group.unrefreshed);
+        if !unrefreshed.is_empty() {
+            self.stand_ins.enter_unrefreshed(unrefreshed);
+        }
         for (key, staged) in std::mem::take(&mut group.staged) {
             let place = Place::of(&key);
             match staged {
-                Staged::Data { slot, detail } => {
+                Staged::Data { slot, detail, seen } => {
                     let version = self.data_version(&key);
                     if let Some(entry) = self.entries.get_mut(&key) {
                         let old = entry.slot;
                         entry.slot = slot;
                         entry.version = version;
                         entry.stored_error = detail.stored.unwrap_or(detail.error);
+                        entry.loaded_error = detail.error;
+                        entry.loaded_after = seen;
+                        entry.bounded = version;
                         self.tree.move_to(place, slot, detail);
                         if old != slot {
                             self.pools.release(old);
@@ -1918,7 +1963,7 @@ impl Residency {
                         }
                         self.loaded(place);
                     } else {
-                        self.insert_live(key, slot, detail)?;
+                        self.insert_live(key, slot, detail, seen)?;
                     }
                 }
                 Staged::Missing => {
@@ -2068,7 +2113,8 @@ impl Residency {
         Ok(self.pools.acquire(gpu, class)?)
     }
 
-    /// Makes `key` resident in `slot` with its bound `e` and finest normals' cone (`detail`).
+    /// Makes `key` resident in `slot` with its bound `e` and finest normals' cone (`detail`),
+    /// read when residency had applied the epochs up to `seen`.
     ///
     /// # Errors
     ///
@@ -2078,6 +2124,7 @@ impl Residency {
         key: TileKey,
         slot: Slot,
         detail: TileDetail,
+        seen: Option<u64>,
     ) -> Result<(), ResidencyError> {
         let floor = self.floor.contains(&key);
         let mut flags = 0;
@@ -2094,6 +2141,9 @@ impl Residency {
             floor,
             version: self.data_version(&key),
             stored_error: detail.stored.unwrap_or(detail.error),
+            loaded_error: detail.error,
+            loaded_after: seen,
+            bounded: self.data_version(&key),
         };
         self.loaded(Place::of(&key));
         // Only a tile not resident arrives, so this counts each floor tile once.
