@@ -39,7 +39,7 @@ const NO_START: u32 = f32::NAN.to_bits();
 /// per vertex of the largest tile ([`store::StoreConfig::STROKE_TILE_BYTES`], 33,800 bytes), and
 /// nothing more while it is used over that store: the store has set that much aside from its
 /// budget ([`store::StoreConfig::stroke_tiles`]). A store reserves for one stroke state, so keep
-/// one `Stroke` per store for the session, and pass it to every [`super::draw_step`]. It starts
+/// one `Stroke` per store for the session, and pass it to every [`crate::apply_dabs`]. It starts
 /// afresh by itself when the store's op changes (a new stroke, or a save), and when it is used
 /// over another store ([`TileStore::id`]), whose reservation it then takes the size of.
 ///
@@ -58,7 +58,8 @@ const NO_START: u32 = f32::NAN.to_bits();
 /// tiles), a tile the current dab edits may find no state free and none to release. Tiles get
 /// state in key order; the rest are written per dab, as without a stroke state (the
 /// start-of-dab value plus the dab's delta), and counted in
-/// [`super::StepStats::tiles_unaccumulated`]. Nothing fails.
+/// [`crate::ApplyStats::tiles_unaccumulated`]. Nothing fails. Dabs count one by one, in order,
+/// however many one [`crate::apply_dabs`] call applies.
 #[derive(Debug)]
 pub struct Stroke {
     /// The store the state is kept over. A dab over another releases every tile first.
@@ -102,7 +103,7 @@ impl Stroke {
     /// reservation), counts the dab, and gives each edited tile state, in key order, while some
     /// is free or can be released (see [`Stroke`]). Returns how many edited tiles got none: those
     /// are written per dab.
-    pub(super) fn begin_dab(&mut self, store: &TileStore, edited: &[TileKey]) -> usize {
+    pub(crate) fn begin_dab(&mut self, store: &TileStore, edited: &[TileKey]) -> usize {
         let op = store.current_op();
         if store.id() != self.store {
             self.release_all();
@@ -141,13 +142,13 @@ impl Stroke {
     }
 
     /// The state of each tile of `edited`, aligned with it: `None` for a tile written per dab.
-    pub(super) fn states(&self, edited: &[TileKey]) -> Vec<Option<&TileStroke>> {
+    pub(crate) fn states(&self, edited: &[TileKey]) -> Vec<Option<&TileStroke>> {
         edited.iter().map(|key| self.tiles.get(key)).collect()
     }
 
     /// Records `store`'s op as of the end of a dab: the op its edits were made in, which the
     /// edit may have begun itself.
-    pub(super) const fn end_dab(&mut self, store: &TileStore) {
+    pub(crate) const fn end_dab(&mut self, store: &TileStore) {
         self.op = store.current_op();
     }
 
@@ -204,7 +205,7 @@ impl Stroke {
 /// (it is `Fn + Sync`): each vertex's entries are touched by one thread per dab, and one dab's
 /// edit ends before the next begins, so [`Ordering::Relaxed`] is enough and the result is the
 /// same at any worker count (see [`TileStroke::write`]).
-pub(super) struct TileStroke {
+pub(crate) struct TileStroke {
     /// The `f32` bits of each vertex's correction `z` as the stroke first found it, or
     /// [`NO_START`] until the stroke first writes it.
     start: Box<[AtomicU32]>,
@@ -261,7 +262,7 @@ impl TileStroke {
     /// on one thread, and the brush gives a vertex its delta in one tile alone (its owner): so
     /// this entry is read and written by one thread in a dab, and `current` is the value before
     /// this dab writes it, which, the first time, is the value the stroke found.
-    pub(super) fn write(&self, at: usize, current: f32, delta: f32) -> Option<f32> {
+    pub(crate) fn write(&self, at: usize, current: f32, delta: f32) -> Option<f32> {
         let start_bits = self.start.get(at)?;
         let acc_bits = self.acc.get(at)?;
         let mut start = f32::from_bits(start_bits.load(Ordering::Relaxed));

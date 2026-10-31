@@ -1,32 +1,9 @@
 //! The draw step: one dab of the draw brush, pushing the surface out along its normal.
 //!
-//! [`draw_step`] runs, in order:
-//!
-//! 1. **Query**: the tiles whose boxes the brush's sphere touches, from the spatial index.
-//! 2. **Pin**: those tiles are evaluated and pinned, so they stay resident for the step.
-//! 3. **Brush**: `brush::draw` over each tile's evaluated positions (the tiles on the store's
-//!    workers), giving each vertex within the radius its delta along the normal axis of its tangent
-//!    frame. Every delta is computed before any correction is written: an edit moves the positions
-//!    of every tile holding a copy of the vertex, and a later tile's brush must see the surface as
-//!    the step found it.
-//! 4. **Edit**: each delta is added to the sum of the stroke's deltas for its vertex, and the
-//!    vertex's correction `z` is set to the value the stroke first found there plus that sum (see
-//!    [`Stroke`]), through [`TileStore::update_tiles`], which keeps seam twins in step and, the
-//!    tiles being pinned, writes their interiors in parallel. The stored value is so rounded to its
-//!    tile's quantization once per stroke, not once per dab.
-//! 5. **Neighbours**: the tiles whose bounds may have changed are listed. That is every tile
-//!    holding a vertex within the radius, whose positions moved, and every tile whose normals read
-//!    one of those, whose normal cones may have turned: the tiles each reached tile's normals read,
-//!    as the store recorded them when it last computed those normals ([`TileStore::stale_after`]).
-//! 6. **Evaluate**: those tiles are evaluated again, positions and normals, together through
-//!    [`TileStore::evaluate_many_with_bounds`], which builds them in parallel. A neighbour whose
-//!    own positions didn't move keeps its normals, stale, and only the border vertices that read a
-//!    moved vertex (its apron, and the rings of base vertices at its corners) are recomputed; the
-//!    tiles that moved are recomputed in full. Each tile's bounds are computed on the worker that
-//!    computed its normals, right after.
-//! 7. **Refit**: the index's tree is refitted to those bounds (any tile without, read back from the
-//!    store's cache) and they are recorded in the store; the step closes its epoch of the store's
-//!    stale-tile feed ([`TileStore::close_epoch`]).
+//! [`draw_step`] is [`apply_dabs`](crate::apply_dabs) for one dab, with the plain smoothstep
+//! falloff: the step the M0 benchmark measured, kept so its history stays comparable. See the
+//! `apply` module notes for its phases (`query`, `pin`, `brush`, `edit`, `neighbours`,
+//! `evaluate`, `refit`, as [`PhaseTimes`] times them).
 //!
 //! Corrections live in each vertex's tangent frame `(t, b, n)` of the predicted surface, so a
 //! push along the frame normal `n` is a change of the correction's `z` alone, with no frames to
@@ -41,17 +18,13 @@
 //! edits it: the least of its copies (see [`geom::Topology::owns`]). The edit then writes the
 //! new value into every copy.
 
-use std::ops::AddAssign;
-use std::time::{Duration, Instant};
-
-use brush::Smoothstep;
-use geom::{TileKey, Vec3};
-use store::{CacheError, IndexError, SpatialIndex, TileStore};
-pub use stroke::Stroke;
-use stroke::TileStroke;
+use brush::Imprint;
+use geom::Vec3;
+use store::{SpatialIndex, TileStore};
 use thiserror::Error;
 
-mod stroke;
+use crate::apply::{ApplyStats, PhaseTimes, SculptError, apply_imprints};
+use crate::state::Stroke;
 
 /// Why [`DrawParams::new`] refused its arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -127,64 +100,20 @@ impl DrawParams {
     pub const fn strength(&self) -> f32 {
         self.strength
     }
-}
 
-/// Why a [`draw_step`] failed.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum SculptError {
-    /// The store couldn't pin, evaluate or edit a tile.
-    #[error("the tile store failed")]
-    Cache(#[from] CacheError),
-    /// The spatial index couldn't be brought up to date.
-    #[error("updating the spatial index failed")]
-    Index(#[from] IndexError),
-}
-
-/// How long each phase of a [`draw_step`] took (see the module notes for the phases).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PhaseTimes {
-    /// Querying the spatial index for the tiles the brush touches.
-    pub query: Duration,
-    /// Evaluating and pinning those tiles.
-    pub pin: Duration,
-    /// Running the brush over their evaluated positions.
-    pub brush: Duration,
-    /// Writing the deltas into the corrections.
-    pub edit: Duration,
-    /// Listing the tiles whose bounds the edits may change: those reached, and their
-    /// neighbours whose normals read them.
-    pub neighbours: Duration,
-    /// Evaluating the changed tiles again, positions and normals.
-    pub evaluate: Duration,
-    /// Recomputing their bounds and refitting the index.
-    pub refit: Duration,
-}
-
-impl PhaseTimes {
-    /// The whole step: every phase together.
-    #[must_use]
-    pub fn total(&self) -> Duration {
-        self.query
-            + self.pin
-            + self.brush
-            + self.edit
-            + self.neighbours
-            + self.evaluate
-            + self.refit
-    }
-}
-
-impl AddAssign for PhaseTimes {
-    /// Adds each phase's time, to total the phases of several steps.
-    fn add_assign(&mut self, rhs: Self) {
-        self.query += rhs.query;
-        self.pin += rhs.pin;
-        self.brush += rhs.brush;
-        self.edit += rhs.edit;
-        self.neighbours += rhs.neighbours;
-        self.evaluate += rhs.evaluate;
-        self.refit += rhs.refit;
+    /// The draw action's imprint of this dab: its centre, radius and strength, hardness `0`
+    /// (the plain smoothstep falloff). The normal and params are placeholders the draw action
+    /// doesn't read.
+    pub(crate) fn imprint(&self) -> Imprint {
+        let Vec3 { x, y, z } = self.center;
+        Imprint::new(
+            [x, y, z],
+            [0.0, 0.0, 1.0],
+            self.radius,
+            self.strength,
+            0.0,
+            [0.0; 4],
+        )
     }
 }
 
@@ -210,51 +139,11 @@ pub struct StepStats {
     pub times: PhaseTimes,
 }
 
-/// The deltas of one tile the step edits: one per vertex of the tile, row-major, zero for each
-/// vertex the tile doesn't move (outside the radius, or edited through another copy).
-#[derive(Debug)]
-struct TileDeltas {
-    /// The tile.
-    key: TileKey,
-    /// The `side²` deltas along the frame normal.
-    deltas: Vec<f32>,
-}
-
-/// What the brush phase found: the deltas to write, and the tiles whose positions they move.
-#[derive(Debug, Default)]
-struct BrushOutput {
-    /// The tiles owning a vertex to move, with their deltas, in key order.
-    edits: Vec<TileDeltas>,
-    /// Every tile holding a vertex within the radius, owned or a copy: the tiles whose positions
-    /// the edits move.
-    reached: Vec<TileKey>,
-    /// Vertices to move, each once.
-    vertices: usize,
-}
-
-/// Times the phases of a step, one lap after another.
-#[derive(Debug)]
-struct Laps(Instant);
-
-impl Laps {
-    /// Starts the first lap now.
-    fn start() -> Self {
-        Self(Instant::now())
-    }
-
-    /// Ends the current lap, returning its length, and starts the next.
-    fn lap(&mut self) -> Duration {
-        let now = Instant::now();
-        let lap = now.duration_since(self.0);
-        self.0 = now;
-        lap
-    }
-}
-
 /// One dab of the draw brush: pushes the surface out along its frame normal near `params`.
 ///
 /// Every vertex of the index's level within the radius moves by `strength · smoothstep(d /
-/// radius)`, and `index` is brought up to date (see the module notes for the phases).
+/// radius)`, and `index` is brought up to date: [`apply_dabs`](crate::apply_dabs) for this one
+/// dab, at hardness `0`, with the same bits.
 ///
 /// `store` is the project's ([`Project::store`](store::Project::store)). The step edits as part
 /// of the store's current op: call it between
@@ -268,264 +157,40 @@ impl Laps {
 ///
 /// # Errors
 ///
-/// [`SculptError::Cache`] if the store can't pin the tiles the brush touches (more than its
-/// budget holds, for one), evaluate them or edit them; [`SculptError::Index`] if the index
-/// can't be updated. An error in the edit phase
-/// leaves the tiles edited as [`TileStore::update_tiles`] says (the failing tile may have its
-/// whole interior pass applied, and is then marked dirty), and the index not updated for them:
-/// rebuild it. The deltas the edit summed into `stroke` but didn't write (the failing vertex's,
-/// and the interiors of later tiles of its parallel run) are written by the next step that
-/// writes those vertices, as part of their sums; sums no later step writes are lost. Tiles
-/// after the failing one get no sums for their border vertices, nor tiles after its run for
-/// any vertex. Don't retry a failed step: its deltas already summed would be counted twice.
+/// As [`apply_dabs`](crate::apply_dabs): [`SculptError::Cache`] if the store can't pin the tiles
+/// the brush touches (more than its budget holds, for one), evaluate them or edit them;
+/// [`SculptError::Index`] if the index can't be updated. An error in the edit phase leaves the
+/// tiles edited as [`TileStore::update_tiles`] says (the failing tile may have its whole
+/// interior pass applied, and is then marked dirty), and the index is still updated for the
+/// tiles the brush reached, unless that fails too (then rebuild it). The deltas the edit summed
+/// into `stroke` but didn't write (the failing vertex's, and the interiors of later tiles of its
+/// parallel run) are written by the next step that writes those vertices, as part of their
+/// sums; sums no later step writes are lost. Tiles after the failing one get no sums for their
+/// border vertices, nor tiles after its run for any vertex. Don't retry a failed step: its
+/// deltas already summed would be counted twice.
 pub fn draw_step(
     store: &mut TileStore,
     index: &mut SpatialIndex,
     stroke: &mut Stroke,
     params: DrawParams,
 ) -> Result<StepStats, SculptError> {
-    let mut laps = Laps::start();
-    let mut times = PhaseTimes::default();
-
-    let candidates: Vec<TileKey> = index.query_sphere(params.center, params.radius).collect();
-    times.query = laps.lap();
-
-    let pins = store.pin(&candidates)?;
-    times.pin = laps.lap();
-
-    let found = run_brush(store, pins.keys(), params)?;
-    times.brush = laps.lap();
-
-    let edited: Vec<TileKey> = found.edits.iter().map(|tile| tile.key).collect();
-    let tiles_unaccumulated = stroke.begin_dab(store, &edited);
-    let states = stroke.states(&edited);
-    let edit = store.update_tiles(&edited, |n, i, j, c| {
-        stroke_write(&found.edits, &states, n, i, j, c)
-    });
-    stroke.end_dab(store);
-    edit?;
-    raise_display_bounds(store, &found)?;
-    times.edit = laps.lap();
-
-    let changed = store.stale_after(&found.reached)?;
-    times.neighbours = laps.lap();
-
-    let wave = store.evaluate_many_with_bounds(&changed)?;
-    times.evaluate = laps.lap();
-
-    // The tiles were made current together just above, their bounds computed with their
-    // normals: the refit takes those, and reads any other tile from the cache.
-    index.refit_with(store, &changed, &wave)?;
-    // The step's edits and their re-evaluation are one epoch of the stale-tile feed.
-    store.close_epoch()?;
-    times.refit = laps.lap();
-    drop(pins);
-
-    Ok(StepStats {
-        candidates: candidates.len(),
-        tiles_edited: found.edits.len(),
-        vertices: found.vertices,
-        tiles_updated: changed.len(),
-        tiles_unaccumulated,
-        times,
-    })
+    Ok(apply_imprints(store, index, stroke, &[params.imprint()])?.into())
 }
 
-/// The brush phase: runs the draw brush over the evaluated positions of every tile of `keys`
-/// (pinned, so cached), and keeps the deltas of the vertices each tile owns (see
-/// [`geom::Topology::owns`]).
-///
-/// Each tile is made current first, in order, as [`TileStore::evaluate`] makes it (a lookup,
-/// as it is pinned); then the tiles are brushed on the store's workers
-/// ([`TileStore::par_map`]) from their cached positions, each on its own, and gathered in key
-/// order. A tile whose positions aren't cached is brushed on its own afterwards.
-///
-/// # Errors
-///
-/// As [`TileStore::evaluate`].
-fn run_brush(
-    store: &mut TileStore,
-    keys: &[TileKey],
-    params: DrawParams,
-) -> Result<BrushOutput, CacheError> {
-    for &key in keys {
-        store.evaluate(key)?;
-    }
-    let brushed: Vec<Option<TileBrush>> = {
-        let cache = &*store;
-        let topology = cache.mesh().topology();
-        let cached: Vec<(TileKey, Option<&[Vec3]>)> = keys
-            .iter()
-            .map(|key| (*key, cache.cached_positions(key)))
-            .collect();
-        cache.par_map(&cached, |&(key, positions)| {
-            positions.map(|positions| brush_tile(topology, key, positions, params))
-        })
-    };
-    let mut found = BrushOutput::default();
-    for (&key, tile) in keys.iter().zip(brushed) {
-        let tile = tile.map_or_else(|| brush_evicted(store, key, params), Ok)?;
-        if !tile.reached {
-            continue;
-        }
-        found.reached.push(key);
-        if tile.moved > 0 {
-            found.vertices += tile.moved;
-            found.edits.push(TileDeltas {
-                key,
-                deltas: tile.deltas,
-            });
+impl From<ApplyStats> for StepStats {
+    /// The counts and times of an [`apply_dabs`](crate::apply_dabs) call as a step's: for one
+    /// dab, what the step did; for more, the frame's (its vertices and unaccumulated tiles
+    /// summed over the dabs).
+    fn from(stats: ApplyStats) -> Self {
+        Self {
+            candidates: stats.candidates,
+            tiles_edited: stats.tiles_edited,
+            vertices: stats.vertices,
+            tiles_updated: stats.tiles_updated,
+            tiles_unaccumulated: stats.tiles_unaccumulated,
+            times: stats.times,
         }
     }
-    Ok(found)
-}
-
-/// What the brush does to `key`, a tile a later tile's evaluation pushed out of the cache
-/// before the workers could brush it: evaluated again, then brushed here.
-///
-/// The positions are read back shared ([`TileStore::cached_positions`]) beside the mesh, not
-/// copied out of the evaluation's mutable borrow. They are current right after the evaluation,
-/// so the copy below it is a fallback that keeps the result right should that ever change.
-///
-/// # Errors
-///
-/// As [`TileStore::evaluate`].
-fn brush_evicted(
-    store: &mut TileStore,
-    key: TileKey,
-    params: DrawParams,
-) -> Result<TileBrush, CacheError> {
-    store.evaluate(key)?;
-    if let Some(positions) = store.cached_positions(&key) {
-        return Ok(brush_tile(store.mesh().topology(), key, positions, params));
-    }
-    let positions = store.evaluate(key)?.to_vec();
-    Ok(brush_tile(store.mesh().topology(), key, &positions, params))
-}
-
-/// What the brush does to one tile: see [`brush_tile`].
-#[derive(Debug)]
-struct TileBrush {
-    /// Whether a vertex of the tile is within the radius: its positions move.
-    reached: bool,
-    /// The deltas of the vertices the tile owns, one per vertex, row-major; zero elsewhere.
-    deltas: Vec<f32>,
-    /// How many of them aren't zero.
-    moved: usize,
-}
-
-/// Runs the draw brush over `positions`, tile `key`'s evaluated positions, and keeps the deltas
-/// of the vertices the tile owns (see [`geom::Topology::owns`]).
-fn brush_tile(
-    topology: &geom::Topology,
-    key: TileKey,
-    positions: &[Vec3],
-    params: DrawParams,
-) -> TileBrush {
-    let center = [params.center.x, params.center.y, params.center.z];
-    let mut deltas = vec![0.0; positions.len()];
-    let inside = brush::draw(
-        &Smoothstep,
-        center,
-        params.radius,
-        params.strength,
-        bytemuck::cast_slice(positions),
-        &mut deltas,
-    );
-    if inside == 0 {
-        return TileBrush {
-            reached: false,
-            deltas,
-            moved: 0,
-        };
-    }
-    for ((i, j), delta) in vertices(key.side()).zip(&mut deltas) {
-        if *delta != 0.0 && !topology.owns(&key, i, j) {
-            *delta = 0.0;
-        }
-    }
-    let moved = deltas.iter().filter(|&&delta| delta != 0.0).count();
-    TileBrush {
-        reached: true,
-        deltas,
-        moved,
-    }
-}
-
-/// The edit for vertex `(i, j)` of tile `edits[n]`, whose correction is stored as `c`.
-///
-/// `None` (no write) where its delta is zero; else `c` with its `z` the stroke's start for the
-/// vertex plus the stroke's deltas for it so far, this one included ([`TileStroke::write`]), or,
-/// for a tile without state (`states[n]` is `None`, see "The thrash limit" on [`Stroke`]),
-/// `c.z` plus the delta.
-///
-/// Interior and border vertices so take the same formula: the stored value is rounded to the
-/// tile's quantization when it is written, never added to dab by dab, and the interior's error
-/// over the stroke is bounded per capture of the start (see "Error bound" on [`Stroke`]).
-///
-/// This keeps state per vertex, which is sound because [`TileStore::update_tiles`] calls its
-/// closure exactly once per vertex of each tile, and only the vertex's owner has a non-zero
-/// delta for it (copies are zeroed by [`brush_tile`]): the vertex's entries are read and written
-/// by one thread a dab, and `c` is its value before this dab writes it. The same bits at any
-/// worker count.
-fn stroke_write(
-    edits: &[TileDeltas],
-    states: &[Option<&TileStroke>],
-    n: usize,
-    i: u32,
-    j: u32,
-    c: Vec3,
-) -> Option<Vec3> {
-    let tile = edits.get(n)?;
-    let at = usize::try_from(j * tile.key.side() + i).ok()?;
-    let delta = tile.deltas.get(at).copied()?;
-    if delta == 0.0 {
-        return None;
-    }
-    let written = match states.get(n)? {
-        Some(state) => state.write(at, c.z, delta)?,
-        None => c.z + delta,
-    };
-    Some(Vec3::new(c.x, c.y, written))
-}
-
-/// Raises the bound of every display tile the step's writes can change.
-///
-/// By twice the farthest the step moved a vertex (see [`TileStore::bump_display_error`]), so
-/// the display tiles drawn until the store's refresh stay bounds.
-///
-/// The farthest is the largest delta plus the quantization step of the tiles it was written
-/// into: a stroke rounds each written value to its tile's step once, so a dab's change can
-/// exceed its delta by that much.
-///
-/// # Errors
-///
-/// As [`TileStore::bump_display_error`], and [`TileStore::correction`] for reading a tile's
-/// step.
-fn raise_display_bounds(store: &mut TileStore, found: &BrushOutput) -> Result<(), CacheError> {
-    // Without a display layer there is nothing to raise, and no reason to scan every delta.
-    if store.display_finest().is_none() {
-        return Ok(());
-    }
-    let delta = found
-        .edits
-        .iter()
-        .flat_map(|tile| tile.deltas.iter())
-        .fold(0.0_f32, |m, d| m.max(d.abs()));
-    if delta == 0.0 {
-        return Ok(());
-    }
-    let mut step = 0.0_f32;
-    for tile in &found.edits {
-        step = step.max(store.correction(tile.key)?.scale());
-    }
-    store.bump_display_error(&found.reached, delta + step)
-}
-
-/// The vertex coordinates `(i, j)` of a tile with `side` vertices per side, in row-major order
-/// (the order of its evaluated positions).
-fn vertices(side: u32) -> impl Iterator<Item = (u32, u32)> {
-    (0..side).flat_map(move |j| (0..side).map(move |i| (i, j)))
 }
 
 #[cfg(test)]

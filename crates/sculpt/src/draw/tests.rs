@@ -8,14 +8,17 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use brush::Smoothstep;
 use geom::{
     BaseMesh, Channel, CorrectionMap, DenseEvaluation, FaceId, LayerId, Level, PositionSource,
-    Region, cube_sphere, normals,
+    Region, TileKey, cube_sphere, normals,
 };
 use store::{Project, ProjectConfig, StoreConfig, Workers};
 
 use super::*;
+use crate::apply::{brush_evicted, brush_tile, vertices};
 
 /// Exactly `n` evaluation workers.
 ///
@@ -617,8 +620,9 @@ fn an_evicted_tile_is_brushed_as_from_its_positions() {
     let key = TileKey::displacement(FaceId::new(0), level, 0, 0).unwrap();
     let store = project.store();
     let copy = store.evaluate(key).unwrap().to_vec();
-    let want = brush_tile(store.mesh().topology(), key, &copy, params);
-    let got = brush_evicted(store, key, params).unwrap();
+    let imprint = params.imprint();
+    let want = brush_tile(store.mesh().topology(), key, &copy, &imprint);
+    let got = brush_evicted(store, key, &imprint).unwrap();
     assert!(want.reached, "the brush reaches the tile");
     assert_eq!(
         (got.reached, got.moved, got.deltas),

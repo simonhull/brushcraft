@@ -1657,6 +1657,7 @@ dependencies = [
  "divan",
  "geom",
  "store",
+ "stroke",
  "thiserror 2.0.21",
 ]
 
