@@ -32,6 +32,16 @@
 //!   in the same command encoder from what it last held (zero if never written). A frame here
 //!   resolves only queries it wrote.
 //!
+//! **A frame's start is no earlier than the frame before it ended.** The start pass touches no
+//! resource, so nothing orders it after the earlier frame's work: on Metal, with the GPU behind,
+//! an Apple M4 ran it beside the earlier frame's shading, accumulation and tone passes, and the
+//! gap from its stamp to the next pass (the uploads) read 15–22 ms: the rest of that frame. With
+//! the GPU keeping up, or waited for after each frame, the gap was 0.00–0.35 ms. So the start's
+//! stamps are taken as no earlier than the last tick of the frame timed before
+//! (`GpuTimes::from_ticks`'s `earlier_end`): the uploads are the gap from then to the next pass,
+//! and the total runs from then. On Vulkan the start's stamp is at the bottom of the pipe, after
+//! the earlier frame's work, so this changes nothing there.
+//!
 //! A tick of zero or all ones is no time: a pass with one is unwritten, and its phase (and any
 //! gap beside it) is absent rather than wrong.
 //!
@@ -219,16 +229,30 @@ impl GpuTimes {
 
     /// The times of frame `frame` from its `spans`, in the order encoded, and their `ticks`, a
     /// tick `period` nanoseconds. `None` if no pass of it has its timestamps.
+    ///
+    /// `earlier_end` is the last tick of the frame timed before it, if one was: the frame's start
+    /// is taken as no earlier (see the module notes: a start pass run beside the earlier
+    /// frame's last passes would put the rest of that frame into this one's uploads and total).
     pub(crate) fn from_ticks(
         frame: u64,
         spans: &[Span],
         ticks: Ticks<'_>,
         period: f32,
+        earlier_end: Option<u64>,
     ) -> Option<Self> {
-        // Per span, `None` for a gap, else its pass's stamps if written.
+        let floor = earlier_end.unwrap_or(0);
+        // Per span, `None` for a gap, else its pass's stamps if written; the start's no earlier
+        // than the frame before ended.
         let stamped: Vec<Option<Option<(u64, u64)>>> = spans
             .iter()
-            .map(|span| span.pair().map(|pair| ticks.of(pair)))
+            .map(|span| {
+                let written = span.pair().map(|pair| ticks.of(pair));
+                match span {
+                    Span::Start(_) => written
+                        .map(|pair| pair.map(|(begin, end)| (begin.max(floor), end.max(floor)))),
+                    Span::Pass(..) | Span::Between(_) => written,
+                }
+            })
             .collect();
         let mut times = Self {
             frame,
@@ -280,6 +304,30 @@ impl GpuTimes {
         times.total = ticks_to_duration(last - first, period);
         Some(times)
     }
+}
+
+/// The latest tick written of the passes in `spans`, read from `ticks`; `None` if none was.
+///
+/// That is where the frame they time ended, as far as its stamps say: a pass whose end wasn't
+/// written still says it began.
+pub(crate) fn last_tick(spans: &[Span], ticks: Ticks<'_>) -> Option<u64> {
+    let written = |tick: Option<&u64>| tick.copied().filter(|&t| t != 0 && t != u64::MAX);
+    spans
+        .iter()
+        .filter_map(|span| span.pair())
+        .flat_map(|pair| {
+            let (list, at) = match pair {
+                Pair::Own(at) => (ticks.own, at),
+                Pair::Lod(at) => (ticks.lod, at),
+            };
+            let at = usize::try_from(at).unwrap_or(usize::MAX);
+            [
+                written(list.get(at)),
+                written(list.get(at.saturating_add(1))),
+            ]
+        })
+        .flatten()
+        .max()
 }
 
 /// The first pass's stamps among `stamped` (per span, `None` for a gap), walked outward from a
@@ -373,6 +421,8 @@ pub(crate) struct GpuTimer {
     returned: Receiver<Returned>,
     /// Times read while taking buffers back, not yet collected.
     ready: Vec<GpuTimes>,
+    /// The last tick of the newest frame read, which the next frame's start is no earlier than.
+    last_tick: Option<u64>,
 }
 
 impl GpuTimer {
@@ -418,6 +468,7 @@ impl GpuTimer {
             done,
             returned,
             ready: Vec::new(),
+            last_tick: None,
         }))
     }
 
@@ -523,7 +574,9 @@ impl GpuTimer {
                         own: ticks.get(..lod_from).unwrap_or_default(),
                         lod: ticks.get(lod_from..).unwrap_or_default(),
                     };
-                    let read = GpuTimes::from_ticks(frame, &spans, ticks, self.period);
+                    let read =
+                        GpuTimes::from_ticks(frame, &spans, ticks, self.period, self.last_tick);
+                    self.last_tick = last_tick(&spans, ticks).max(self.last_tick);
                     self.ready.extend(read);
                 }
                 Returned::Unread(buffer) => self.free.push(buffer),
