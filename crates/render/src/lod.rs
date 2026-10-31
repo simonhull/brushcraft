@@ -272,8 +272,9 @@ const BUCKETS: usize = 256;
 /// Threads per workgroup of the per-node passes.
 const GROUP: u32 = 64;
 
-/// Readback buffers in flight at most.
-const READBACKS: usize = 3;
+/// Readback buffers made at most: one more than the frames the GPU may have at once
+/// ([`crate::FRAMES_IN_FLIGHT`]), so a frame submitted within that bound always has one.
+const READBACKS: usize = crate::FRAMES_IN_FLIGHT + 1;
 
 /// Step uniforms: levels for the sweep and passes for the relaxation, one per dynamic offset.
 const STEPS: u32 = 32;
@@ -1030,15 +1031,26 @@ pub struct CutReader {
 
 impl CutReader {
     /// The latest frame's results read back, if a readback completed since the last call (the
-    /// device must have been polled since; older completed readbacks are dropped): its cut and
-    /// drawn tiles as keys of a project whose finest level is `finest`, its counts, and the frame
-    /// it is of.
+    /// device must have been polled since; older completed readbacks are read and dropped): as
+    /// [`CutReader::collect_all`], the last of them.
     ///
     /// # Errors
     ///
     /// [`LodError::Gpu`] if a mapped buffer can't be viewed.
     pub fn collect(&self, finest: Level) -> Result<Option<LodOutput>, LodError> {
-        let mut latest = None;
+        Ok(self.collect_all(finest)?.pop())
+    }
+
+    /// Every frame's results read back since the last call, oldest first (the device must have
+    /// been polled since): each one's cut and drawn tiles as keys of a project whose finest level
+    /// is `finest`, its counts, and the frame it is of.
+    ///
+    /// # Errors
+    ///
+    /// [`LodError::Gpu`] if a mapped buffer can't be viewed; the buffers read before it are
+    /// still taken back.
+    pub fn collect_all(&self, finest: Level) -> Result<Vec<LodOutput>, LodError> {
+        let mut outputs = Vec::new();
         while let Ok(back) = self.mapped.try_recv() {
             let Readback::Mapped(buffer, frame, clock) = back else {
                 // A level choice that's gone has no count to correct.
@@ -1049,9 +1061,9 @@ impl CutReader {
             buffer.unmap();
             // A level choice that's gone has nothing to take back.
             drop(self.back.send(Returned::Free(buffer)));
-            latest = Some(read?);
+            outputs.push(read?);
         }
-        Ok(latest)
+        Ok(outputs)
     }
 }
 
@@ -1174,6 +1186,8 @@ pub struct Lod {
     free: Vec<Buffer>,
     /// Readback buffers made.
     made: usize,
+    /// Frames whose results weren't read back for want of a free buffer, ever.
+    dropped: u64,
     /// Given to each readback, to send its buffer to the reader once mapped.
     done: Sender<Readback>,
     /// Where mapped readbacks arrive, until [`Lod::take_reader`] moves it out.
@@ -1359,6 +1373,7 @@ impl Lod {
             group: None,
             free: Vec::new(),
             made: 0,
+            dropped: 0,
             done,
             reader: Some(reader),
             returns,
@@ -1710,7 +1725,10 @@ impl Lod {
                 self.made += 1;
                 buffer
             }
-            None => return Ok(None),
+            None => {
+                self.dropped += 1;
+                return Ok(None);
+            }
         };
         encoder.copy_buffer_to_buffer(&self.frame, 0, &buffer, 0, FRAME_BYTES);
         encoder.copy_buffer_to_buffer(&self.cut, 0, &buffer, FRAME_BYTES, self.cut.size());
@@ -1752,6 +1770,14 @@ impl Lod {
         };
         self.take_unused();
         Ok(latest)
+    }
+
+    /// Frames whose results weren't read back because every readback buffer was in flight,
+    /// ever ([`Lod::encode_readback`] gave `None`). Zero while the GPU is kept within
+    /// [`crate::FRAMES_IN_FLIGHT`] frames.
+    #[must_use]
+    pub const fn dropped_readbacks(&self) -> u64 {
+        self.dropped
     }
 
     /// Moves where the readbacks arrive out of the level choice, to read them on another thread

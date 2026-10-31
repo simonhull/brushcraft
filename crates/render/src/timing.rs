@@ -43,9 +43,10 @@
 //! Each timed frame resolves its queries into a readback buffer of a small ring, mapped once the
 //! frame is submitted; whichever thread polls the device next (the app's owner thread, at the
 //! start of its frame) completes the mapping, and [`crate::Renderer::take_timings`] reads every
-//! timed frame that has come back since, tagged with the frame it is of. A frame finds no free
-//! buffer only if readbacks fall behind; it is then not timed (its times are absent, never
-//! wrong).
+//! timed frame that has come back since, tagged with the frame it is of. The ring holds more
+//! buffers than the frames the GPU may have at once ([`crate::FRAMES_IN_FLIGHT`]), so a frame
+//! finds no free buffer only if its user lets the GPU fall further behind; it is then not timed
+//! (its times are absent, never wrong) and counted ([`crate::DroppedReadbacks::timing`]).
 //!
 //! Without timestamp queries there is no timer (`GpuTimer`): frames are drawn the same, and
 //! their times are absent.
@@ -318,8 +319,13 @@ const LOD_AT: BufferAddress = {
 /// Bytes of the resolved and readback buffers.
 const BYTES: BufferAddress = LOD_AT + LOD_CAPACITY as BufferAddress * QUERY_SIZE as BufferAddress;
 
-/// Readback buffers in the ring: one frame is drawn at a time, read back a frame or two later.
-const RING: usize = 4;
+/// Readback buffers in the ring.
+///
+/// More than the frames the GPU may have at once ([`crate::FRAMES_IN_FLIGHT`]), so a frame
+/// submitted within that bound always has one. A buffer comes back to the ring only when the
+/// render thread next takes it back, after a device poll mapped it: one more than the level
+/// choice's ring for that.
+const RING: usize = crate::FRAMES_IN_FLIGHT + 2;
 
 /// The start pass's shader: one thread that does nothing, so the pass has work and every
 /// backend writes its timestamps.
@@ -357,6 +363,8 @@ pub(crate) struct GpuTimer {
     free: Vec<Buffer>,
     /// Readback buffers made, at most [`RING`]; one whose mapping failed is no longer counted.
     made: usize,
+    /// Frames stamped but not timed for want of a free readback buffer, ever.
+    dropped: u64,
     /// Nanoseconds a tick.
     period: f32,
     /// Given to each frame's readback, to send it back once mapped.
@@ -405,6 +413,7 @@ impl GpuTimer {
             resolved,
             free: Vec::new(),
             made: 0,
+            dropped: 0,
             period,
             done,
             returned,
@@ -459,7 +468,10 @@ impl GpuTimer {
                 self.made += 1;
                 buffer
             }
-            None => return Ok(None),
+            None => {
+                self.dropped += 1;
+                return Ok(None);
+            }
         };
         encoder.resolve_query_set(&self.queries, 0..on.used, &self.resolved, 0);
         if let Some((lod, count)) = &on.lod {
@@ -472,6 +484,13 @@ impl GpuTimer {
             spans,
             done: self.done.clone(),
         }))
+    }
+
+    /// Frames stamped but not timed because every readback buffer was in flight, ever
+    /// ([`GpuTimer::finish`] gave `None` for that). Zero while the GPU is kept within
+    /// [`crate::FRAMES_IN_FLIGHT`] frames.
+    pub(crate) const fn dropped_readbacks(&self) -> u64 {
+        self.dropped
     }
 
     /// Every timed frame read back since the last call, in the order they came back: those whose

@@ -16,8 +16,11 @@ use crate::upload::{Readback, RequestCopy};
 /// words. Cleared every frame after the readback copy.
 pub const REQUEST_HEADER: u64 = 16;
 
-/// Readback buffers in flight at most: a readback is read a frame or two after its frame.
-const READBACKS: usize = 3;
+/// Readback buffers made at most.
+///
+/// A readback is read a frame or two after its frame, so one more than the frames the GPU may
+/// have at once ([`crate::FRAMES_IN_FLIGHT`]): a frame submitted within that bound always has one.
+const READBACKS: usize = crate::FRAMES_IN_FLIGHT + 1;
 
 /// The WGSL declarations of the request buffer, for the pass that writes it (the level choice).
 ///
@@ -147,6 +150,8 @@ pub(crate) struct RequestBuffer {
     free: Vec<Buffer>,
     /// Readback buffers made.
     made: usize,
+    /// Frames that made no readback for want of a free buffer, ever.
+    dropped: u64,
     /// Given to each frame's readback, to send its buffer back.
     sender: Sender<Readback>,
     /// Where readback buffers come back: mapped, unused, or lost.
@@ -178,6 +183,7 @@ impl RequestBuffer {
             buffer,
             free: Vec::new(),
             made: 0,
+            dropped: 0,
             sender,
             mapped,
             latest: None,
@@ -195,6 +201,12 @@ impl RequestBuffer {
     #[cfg(test)]
     pub(crate) const fn idle(&self) -> bool {
         self.free.len() == self.made
+    }
+
+    /// Frames that made no readback because every readback buffer was in flight, ever (their
+    /// requests waited in the buffer for a later frame's).
+    pub(crate) const fn dropped_readbacks(&self) -> u64 {
+        self.dropped
     }
 
     /// The buffer the GPU appends requests to ([`REQUESTS_WGSL`]'s `TileRequests`).
@@ -224,7 +236,10 @@ impl RequestBuffer {
                 self.made += 1;
                 buffer
             }
-            None => return Ok(None),
+            None => {
+                self.dropped += 1;
+                return Ok(None);
+            }
         };
         Ok(Some(RequestCopy {
             source: self.buffer.clone(),

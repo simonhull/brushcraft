@@ -604,6 +604,9 @@ pub struct ResidencyStats {
     pub staged_bytes: u64,
     /// Tiles the last frame staged.
     pub staged_tiles: u64,
+    /// Frames that made no request readback because every readback buffer was in flight, ever:
+    /// zero while the GPU is kept within [`crate::FRAMES_IN_FLIGHT`] frames.
+    pub request_readbacks_dropped: u64,
 }
 
 /// A resident tile.
@@ -972,6 +975,7 @@ impl Residency {
             wanted: self.wanted.len(),
             unavailable: self.unavailable.len(),
             pending_epochs: self.groups.len(),
+            request_readbacks_dropped: self.requests.dropped_readbacks(),
             ..self.stats
         }
     }

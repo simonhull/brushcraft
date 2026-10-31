@@ -62,5 +62,19 @@ pub mod upload;
 mod visibility_view;
 
 pub use draw::{
-    DrawError, DrawTimes, Drawn, FrameInputs, Look, Outcome, Renderer, Scene, SceneView,
+    DrawError, DrawTimes, Drawn, DroppedReadbacks, FrameInputs, Look, Outcome, Renderer, Scene,
+    SceneView,
 };
+
+/// The most frames the GPU should have at once: submitted by the CPU and not yet finished.
+///
+/// A frame's readbacks (its cut, its requests, its GPU times) are read a frame or two after it
+/// is submitted, once the GPU has finished it. A CPU that submits frames faster than the GPU
+/// finishes them builds a queue: input waits behind it, and each readback ring runs out of
+/// buffers, so readbacks are dropped. The app starts no frame while the GPU has this many
+/// (`app`'s scheduler), and each readback ring holds more buffers than this, so a submitted frame
+/// always finds one: a frame encoded while the GPU still runs the one before it, and a buffer to
+/// spare for a readback mapped but not yet read.
+///
+/// Two lets the CPU encode a frame while the GPU draws the last, and no more.
+pub const FRAMES_IN_FLIGHT: usize = 2;

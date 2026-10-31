@@ -122,6 +122,29 @@ pub struct DrawTimes {
     pub present: Duration,
 }
 
+/// Readbacks a renderer's frames made none of for want of a free readback buffer, ever.
+///
+/// Each ring holds more buffers than [`crate::FRAMES_IN_FLIGHT`], so these stay zero while the
+/// GPU is kept within that bound ([`Renderer::dropped_readbacks`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DroppedReadbacks {
+    /// Frames that drew their scene but read back no cut.
+    pub cut: u64,
+    /// Frames stamped for timing but not timed.
+    pub timing: u64,
+}
+
+impl DroppedReadbacks {
+    /// The drops since `earlier`, a count taken before these.
+    #[must_use]
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            cut: self.cut.saturating_sub(earlier.cut),
+            timing: self.timing.saturating_sub(earlier.timing),
+        }
+    }
+}
+
 /// What became of a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -266,6 +289,19 @@ impl Renderer {
             .as_mut()
             .map(GpuTimer::collect)
             .unwrap_or_default()
+    }
+
+    /// The readbacks its frames made none of for want of a free buffer, ever: the level choice's
+    /// cut readbacks and the GPU timer's.
+    #[must_use]
+    pub fn dropped_readbacks(&self) -> DroppedReadbacks {
+        DroppedReadbacks {
+            cut: self
+                .passes
+                .as_ref()
+                .map_or(0, |passes| passes.lod().dropped_readbacks()),
+            timing: self.timer.as_ref().map_or(0, GpuTimer::dropped_readbacks),
+        }
     }
 
     /// Draws each frame's scene with `passes` from now on. They are built where residency is,
