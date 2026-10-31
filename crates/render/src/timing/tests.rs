@@ -210,3 +210,79 @@ fn a_frame_s_last_tick_is_its_latest_written_one() {
         "nothing written"
     );
 }
+
+/// Where a slot of the timer's ring is in its life, in the model of the ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotLife {
+    /// Its frame's queries, written or being written, not resolved yet.
+    Pending(usize),
+    /// Resolved by the encoding of frame `0`; mapped once the GPU has finished that frame.
+    Resolving(usize),
+}
+
+#[test]
+fn a_timing_slot_is_resolved_by_the_first_frame_after_its_own_and_freed_once_that_one_finishes() {
+    // A model of the ring under the app's bound: a GPU taking 40 ms a frame, a 60 Hz display,
+    // each frame starting once the GPU has finished all but `FRAMES_IN_FLIGHT - 1` before it.
+    // The owner's poll at a frame's start runs the callbacks of every frame finished by then:
+    // the timer's (which sets a frame's done flag and maps the slots it resolved) before the
+    // app's, as the timer registers its own first.
+    let bound = crate::FRAMES_IN_FLIGHT;
+    let (interval, per_frame) = (16_667_u64, 40_000_u64);
+    let frames = 200;
+    let mut starts: Vec<u64> = Vec::new();
+    let mut done: Vec<u64> = Vec::new();
+    let mut slots: Vec<Option<SlotLife>> = vec![None; RING];
+    let mut resolved_by = vec![0; frames];
+    let mut peak = 0;
+    for frame in 0..frames {
+        let paced = starts.last().map_or(0, |&s| s + interval);
+        let start = frame
+            .checked_sub(bound)
+            .and_then(|k| done.get(k))
+            .map_or(paced, |&d| paced.max(d));
+        let finished = done.iter().take_while(|&&d| d <= start).count();
+        // `begin`: slots whose resolving frame has finished are mapped and taken back.
+        for slot in &mut slots {
+            if let Some(SlotLife::Resolving(by)) = *slot
+                && by < finished
+            {
+                *slot = None;
+            }
+        }
+        let free = slots.iter_mut().find(|slot| slot.is_none());
+        *free.expect("a free slot") = Some(SlotLife::Pending(frame));
+        peak = peak.max(slots.iter().flatten().count());
+        // `finish`: the earlier frames the GPU has finished are resolved by this one.
+        for slot in &mut slots {
+            if let Some(SlotLife::Pending(own)) = *slot
+                && own < finished
+            {
+                *slot = Some(SlotLife::Resolving(frame));
+                if let Some(by) = resolved_by.get_mut(own) {
+                    *by = frame;
+                }
+            }
+        }
+        starts.push(start);
+        let gpu_free = done.last().copied().unwrap_or(0);
+        done.push(start.max(gpu_free) + per_frame);
+    }
+    for (own, &by) in resolved_by.iter().enumerate().take(frames - bound - 1) {
+        let first_after = starts.iter().position(|&s| s >= done[own]);
+        assert_eq!(
+            Some(by),
+            first_after,
+            "frame {own}: resolved by the first frame encoded after it finished"
+        );
+    }
+    assert!(
+        peak < RING,
+        "at most RING − 1 slots busy, one to spare: {peak} of {RING}"
+    );
+    assert_eq!(
+        peak,
+        bound + 2,
+        "the bound's frames, one resolving, and the new one"
+    );
+}

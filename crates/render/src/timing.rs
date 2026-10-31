@@ -388,10 +388,19 @@ const BYTES: BufferAddress = LOD_AT + LOD_CAPACITY as BufferAddress * QUERY_SIZE
 /// Slots in the ring: a slot is a frame's own queries and the buffer they are read back through.
 ///
 /// A slot is busy from its frame's encoding until the render thread takes its readback back:
-/// while the GPU runs the frame (at most [`crate::FRAMES_IN_FLIGHT`] frames), until a later
-/// frame's encoding resolves its queries (or [`GpuTimer::flush`]), and until that submission is
-/// done and a poll maps the buffer. So a frame finds a free slot while the GPU is kept within the
-/// bound, with three to spare.
+/// while the GPU runs the frame, until the first frame encoded after the GPU finished it resolves
+/// its queries (or [`GpuTimer::flush`]), and until that frame is finished too and a poll maps the
+/// buffer. Under the app's bound ([`crate::FRAMES_IN_FLIGHT`] frames unfinished) a frame being
+/// encoded finds at most `FRAMES_IN_FLIGHT + 1` slots busy: the bound's frames, and one
+/// resolved by a frame the GPU hasn't finished. With its own, it needs `FRAMES_IN_FLIGHT + 2`;
+/// the ring has one to spare (the model in the tests,
+/// `a_timing_slot_is_resolved_by_the_first_frame_after_its_own_and_freed_once_that_one_finishes`).
+///
+/// That relies on the order of the queue's callbacks: the timer asks for its frame's
+/// (`TimedFrame::submitted`, setting the frame's done flag) as the frame is drawn, before the app
+/// asks for its own (the render thread's, after the draw), and the queue runs a submission's
+/// callbacks in the order asked. So by the time the app hears a frame finished and starts the
+/// next, that frame's flag is set, and the next frame's encoding resolves it.
 const RING: usize = crate::FRAMES_IN_FLIGHT + 3;
 
 /// Bytes between slots' regions of the resolve buffer: a slot's own ticks, then the level
