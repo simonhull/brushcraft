@@ -29,6 +29,7 @@ use crate::cli::Options;
 use crate::frame::schedule::Next;
 use crate::frame::{LookChange, Setup};
 use crate::navigate::{Button, Input, Modifiers};
+use crate::pace::{Pacer, Step, SystemTimer};
 use crate::render_thread::{Hooks, RenderThread};
 use crate::{AppOwner, ProjectToOpen, Summary, describe_adapter, start};
 
@@ -50,6 +51,11 @@ struct Running {
     window: Arc<dyn Window>,
     /// The GPU's description, for the summary.
     adapter: String,
+    /// Waits for the next frame precisely: the event loop's timer wakes the loop just before
+    /// it, and the rest is spun ([`crate::pace`]).
+    pacer: Pacer,
+    /// The event loop's timer last asked for, to learn how long it ran: from when, for how long.
+    asked: Option<(Instant, Duration)>,
 }
 
 /// winit's application: opens the window when it can, runs the frame loop, and reports how
@@ -136,6 +142,8 @@ impl WindowApp {
             render,
             window,
             adapter,
+            pacer: Pacer::default(),
+            asked: None,
         })
     }
 
@@ -144,6 +152,11 @@ impl WindowApp {
     /// The display's refresh rate is read again first: the window may have moved to another
     /// display, which winit doesn't report on Wayland (no `Moved` event there).
     ///
+    /// The wait for the next frame is precise ([`crate::pace`]): winit's timer is asked to wake
+    /// the loop as the pacer plans (short of the frame by the spin margin, and by how long its
+    /// waits have run), and the last of it is spun here. With FIFO presentation the render
+    /// thread's present paces the frames anyway; with mailbox, this wait does.
+    ///
     /// # Errors
     ///
     /// If a frame, the upkeep or the render thread fails.
@@ -151,6 +164,14 @@ impl WindowApp {
         running
             .owner
             .set_interval(refresh_interval(running.window.as_ref()));
+        if let Some((from, asked)) = running.asked.take() {
+            // Woken by the timer, or by an event after it would have fired: how long it ran.
+            // An event before it says nothing.
+            let took = Instant::now().saturating_duration_since(from);
+            if took >= asked {
+                running.pacer.slept(asked, took);
+            }
+        }
         loop {
             let now = Instant::now();
             match running.owner.next(now) {
@@ -160,10 +181,14 @@ impl WindowApp {
                         .owner
                         .frame(now, deadline, |frame| render.send(frame))?;
                 }
-                Next::Wait { until } => {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(until));
-                    return Ok(());
-                }
+                Next::Wait { until } => match running.pacer.plan(now, until) {
+                    Step::Sleep(asked) => {
+                        running.asked = Some((now, asked));
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(now + asked));
+                        return Ok(());
+                    }
+                    Step::Spin | Step::Done => running.pacer.spin_until(&mut SystemTimer, until),
+                },
                 Next::Render => {
                     event_loop.set_control_flow(ControlFlow::Wait);
                     return Ok(());
@@ -193,6 +218,7 @@ impl WindowApp {
                     render,
                     window,
                     adapter,
+                    ..
                 } = running;
                 let presentation = render.presentation();
                 let stopped = render.stop().map(drop);

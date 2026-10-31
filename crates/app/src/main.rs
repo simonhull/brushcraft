@@ -25,6 +25,7 @@ mod cli;
 mod frame;
 mod navigate;
 mod overlay;
+mod pace;
 mod paths;
 mod pick;
 mod record;
@@ -50,6 +51,7 @@ use winit::event_loop::EventLoop;
 use crate::cli::Options;
 use crate::frame::schedule::Next;
 use crate::frame::{NoBrush, Owner, Setup, Uploads as _};
+use crate::pace::{Pacer, SystemTimer};
 use crate::pick::Picker;
 use crate::render_thread::{Hooks, RenderThread};
 use crate::uploads::GpuResidency;
@@ -239,19 +241,22 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
     Ok(summary)
 }
 
-/// Runs the frame loop with no event loop until the scripted frames are done: sleeping where
-/// a window would wait for events, and waiting on the render thread directly.
+/// Runs the frame loop with no event loop until the scripted frames are done.
+///
+/// Where a window would wait for events it waits for the next frame precisely ([`pace`]), and
+/// for the upkeep by a plain sleep; it waits on the render thread directly.
 ///
 /// # Errors
 ///
 /// If a frame, the upkeep or the render thread fails.
 fn drive_offscreen(owner: &mut AppOwner, render: &mut RenderThread) -> Result<()> {
+    let mut pacer = Pacer::default();
     while !owner.done() {
         let now = Instant::now();
         match owner.next(now) {
             Next::Frame { deadline } => owner.frame(now, deadline, |frame| render.send(frame))?,
             Next::Render => owner.shown(render.wait()?),
-            Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
+            Next::Wait { until } => drop(pacer.wait_until(&mut SystemTimer, until)),
             Next::Idle { upkeep } => {
                 std::thread::sleep(upkeep.saturating_duration_since(now));
                 owner.upkeep(Instant::now())?;
