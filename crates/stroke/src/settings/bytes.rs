@@ -7,17 +7,18 @@ use crate::{
     MAX_CURVE_POINTS, MAX_ENTRIES, Param, PathSettings, Radius, SizeMode,
 };
 
-/// The byte form's current version.
-pub(super) const VERSION: u8 = 1;
+/// The byte form's current version. Version 1 held one kind of symmetry at a time; no stroke
+/// record was ever written with it, so this build reads version 2 only.
+pub(super) const VERSION: u8 = 2;
 
-/// Symmetry tags. `3` is reserved for topological symmetry.
-mod symmetry_tag {
-    /// [`Symmetry::None`](super::Symmetry::None).
-    pub(super) const NONE: u8 = 0;
-    /// [`Symmetry::Mirror`](super::Symmetry::Mirror).
+/// The bits of the symmetry byte: which kinds are on. The rest are refused.
+mod symmetry_bit {
+    /// Mirror planes follow: [`Symmetry::mirror`](super::Symmetry::mirror).
     pub(super) const MIRROR: u8 = 1;
-    /// [`Symmetry::Radial`](super::Symmetry::Radial).
-    pub(super) const RADIAL: u8 = 2;
+    /// Radial copies follow: [`Symmetry::radial`](super::Symmetry::radial).
+    pub(super) const RADIAL: u8 = 1 << 1;
+    /// Reserved for topological symmetry; refused until it exists.
+    pub(super) const TOPOLOGICAL: u8 = 1 << 2;
 }
 
 /// The tag of each [`Input`] in the byte form.
@@ -57,15 +58,15 @@ const fn axis_tag(axis: Axis) -> u8 {
 impl StrokeSettings {
     /// The settings' stable byte form, for a stroke's record.
     ///
-    /// The layout (version 1), all numbers little-endian:
-    /// - the version, `1`, as a `u8`;
+    /// The layout (version 2), all numbers little-endian:
+    /// - the version, `2`, as a `u8`;
     /// - the path: the minimum cutoff, the cutoff slope, the derivative cutoff and the lazy string,
     ///   each an `f64`;
     /// - the spacing as an `f32`; the size mode as a `u8` (`0` screen, `1` world); the radius as an
     ///   `f32`;
-    /// - the symmetry: a `u8` tag (`0` none, `1` mirror, `2` radial, `3` reserved for topological),
-    ///   then for mirror the plane bits as a `u8`, for radial the axis (`0` X, `1` Y, `2` Z) and
-    ///   the copy count as `u8`s;
+    /// - the symmetry: a `u8` of the kinds that are on (bit 0 mirror, bit 1 radial, bit 2 reserved
+    ///   for topological), then for mirror the plane bits as a `u8`, then for radial the axis (`0`
+    ///   X, `1` Y, `2` Z) and the copy count as `u8`s;
     /// - the action's parameters, four `f32`s;
     /// - the dynamics: the entry count as a `u8`, then each entry: the input's tag (`0` pressure,
     ///   `1` tilt amount, `2` tilt direction, `3` twist, `4` speed, `5` distance, `6` random)
@@ -94,17 +95,16 @@ impl StrokeSettings {
             SizeMode::World => 1,
         });
         out.f32(self.radius.get());
-        match self.symmetry {
-            Symmetry::None => out.u8(symmetry_tag::NONE),
-            Symmetry::Mirror(planes) => {
-                out.u8(symmetry_tag::MIRROR);
-                out.u8(planes.bits());
-            }
-            Symmetry::Radial(radial) => {
-                out.u8(symmetry_tag::RADIAL);
-                out.u8(axis_tag(radial.axis()));
-                out.u8(radial.copies());
-            }
+        let Symmetry { mirror, radial } = self.symmetry;
+        let kinds =
+            mirror.map_or(0, |_| symmetry_bit::MIRROR) | radial.map_or(0, |_| symmetry_bit::RADIAL);
+        out.u8(kinds);
+        if let Some(planes) = mirror {
+            out.u8(planes.bits());
+        }
+        if let Some(radial) = radial {
+            out.u8(axis_tag(radial.axis()));
+            out.u8(radial.copies());
         }
         for value in self.action_params {
             out.f32(value);
@@ -163,20 +163,7 @@ impl StrokeSettings {
             }
         };
         let radius = Radius::new(reader.f32()?)?;
-        let symmetry = match reader.u8()? {
-            symmetry_tag::NONE => Symmetry::None,
-            symmetry_tag::MIRROR => Symmetry::Mirror(MirrorPlanes::from_bits(reader.u8()?)?),
-            symmetry_tag::RADIAL => {
-                let axis = read_axis(&mut reader)?;
-                Symmetry::Radial(Radial::new(axis, reader.u8()?)?)
-            }
-            tag => {
-                return Err(DecodeError::Tag {
-                    what: "symmetry",
-                    tag,
-                });
-            }
-        };
+        let symmetry = read_symmetry(&mut reader)?;
         let mut action_params = [0.0; ACTION_SLOTS];
         for value in &mut action_params {
             *value = reader.f32()?;
@@ -217,6 +204,36 @@ fn read_axis(reader: &mut Reader<'_>) -> Result<Axis, DecodeError> {
         2 => Ok(Axis::Z),
         tag => Err(DecodeError::Tag { what: "axis", tag }),
     }
+}
+
+/// Reads the symmetry: its kinds byte, then each kind's values.
+///
+/// # Errors
+///
+/// [`DecodeError::Truncated`] at the end of the bytes; [`DecodeError::Tag`] for a kinds byte with
+/// the topological bit (which this build can't apply) or an unknown one, or an unknown axis;
+/// [`DecodeError::Invalid`] for planes or a copy count the constructors refuse.
+fn read_symmetry(reader: &mut Reader<'_>) -> Result<Symmetry, DecodeError> {
+    let kinds = reader.u8()?;
+    let known = symmetry_bit::MIRROR | symmetry_bit::RADIAL;
+    if kinds & !known != 0 || kinds & symmetry_bit::TOPOLOGICAL != 0 {
+        return Err(DecodeError::Tag {
+            what: "symmetry",
+            tag: kinds,
+        });
+    }
+    let mirror = if kinds & symmetry_bit::MIRROR == 0 {
+        None
+    } else {
+        Some(MirrorPlanes::from_bits(reader.u8()?)?)
+    };
+    let radial = if kinds & symmetry_bit::RADIAL == 0 {
+        None
+    } else {
+        let axis = read_axis(reader)?;
+        Some(Radial::new(axis, reader.u8()?)?)
+    };
+    Ok(Symmetry { mirror, radial })
 }
 
 /// Reads one dynamics entry.

@@ -261,20 +261,62 @@ impl Radial {
     }
 }
 
-/// How each placed dab is copied before any action runs. Placing the copies is the stroke
-/// engine's job (not built yet); these are the settings it reads.
+/// How each placed dab is copied before any action runs: through mirror planes, radial copies,
+/// or both.
+///
+/// With both, the copies are the product: every radial turn of every mirror image, so mirroring
+/// in X with six radial copies makes twelve. [`Symmetry::copies`] counts them. The default has
+/// neither: each dab is placed once.
 ///
 /// Topological symmetry (through a correspondence between base faces) will join these as a third
-/// kind; its byte tag is reserved.
+/// kind; its bit in the byte form is reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Symmetry {
-    /// No copies: the default.
-    #[default]
-    None,
-    /// Mirrored through world planes, in any combination.
-    Mirror(MirrorPlanes),
-    /// Turned about a world axis.
-    Radial(Radial),
+pub struct Symmetry {
+    /// The mirror planes, or `None` for no mirroring.
+    pub mirror: Option<MirrorPlanes>,
+    /// The radial copies, or `None` for none.
+    pub radial: Option<Radial>,
+}
+
+impl Symmetry {
+    /// No symmetry: each dab is placed once.
+    pub const NONE: Self = Self {
+        mirror: None,
+        radial: None,
+    };
+
+    /// Mirroring through `planes`, with no radial copies.
+    #[must_use]
+    pub const fn mirror(planes: MirrorPlanes) -> Self {
+        Self {
+            mirror: Some(planes),
+            radial: None,
+        }
+    }
+
+    /// Radial copies, with no mirroring.
+    #[must_use]
+    pub const fn radial(radial: Radial) -> Self {
+        Self {
+            mirror: None,
+            radial: Some(radial),
+        }
+    }
+
+    /// How many copies each dab makes, the original included: `2^planes` mirror images times
+    /// the radial count. `1` with no symmetry; at most `8 · Radial::MAX_COPIES`.
+    #[must_use]
+    pub fn copies(self) -> u32 {
+        let mirrors = match self.mirror {
+            Some(planes) => 1 << planes.bits().count_ones(),
+            None => 1,
+        };
+        let turns = match self.radial {
+            Some(radial) => u32::from(radial.copies()),
+            None => 1,
+        };
+        mirrors * turns
+    }
 }
 
 /// Everything that shapes a stroke: the path's smoothing, the spacing, the size and how it is
@@ -388,7 +430,7 @@ impl Default for StrokeSettings {
             size_mode: SizeMode::Screen,
             radius: Radius::DEFAULT,
             dynamics: Dynamics::default(),
-            symmetry: Symmetry::None,
+            symmetry: Symmetry::NONE,
             action_params: [0.0; ACTION_SLOTS],
         }
     }

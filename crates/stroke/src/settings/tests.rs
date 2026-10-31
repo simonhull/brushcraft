@@ -37,7 +37,10 @@ fn everything() -> StrokeSettings {
         SizeMode::World,
         Radius::new(0.02).unwrap(),
         Dynamics::new(entries).unwrap(),
-        Symmetry::Radial(Radial::new(Axis::Y, 6).unwrap()),
+        Symmetry {
+            mirror: Some(MirrorPlanes::X | MirrorPlanes::Y),
+            radial: Some(Radial::new(Axis::Y, 6).unwrap()),
+        },
         [1.0, -2.0, 0.5, 3.0],
     )
     .unwrap()
@@ -46,7 +49,7 @@ fn everything() -> StrokeSettings {
 #[test]
 fn round_trips_through_bytes() {
     let mirrored = StrokeSettings {
-        symmetry: Symmetry::Mirror(MirrorPlanes::X | MirrorPlanes::Z),
+        symmetry: Symmetry::mirror(MirrorPlanes::X | MirrorPlanes::Z),
         ..StrokeSettings::default()
     };
     for settings in [StrokeSettings::default(), everything(), mirrored] {
@@ -62,7 +65,7 @@ fn round_trips_through_bytes() {
 
 #[test]
 fn the_default_bytes_are_pinned() {
-    // Version 1's layout must not drift: a stroke record stored today decodes the same later.
+    // Version 2's layout must not drift: a stroke record stored today decodes the same later.
     let bytes = StrokeSettings::default().to_bytes();
     assert_eq!(
         bytes.len(),
@@ -107,11 +110,11 @@ fn bad_bytes_are_refused() {
         "empty"
     );
     let mut versioned = good.clone();
-    versioned[0] = 2;
+    versioned[0] = 1;
     assert_eq!(
         StrokeSettings::from_bytes(&versioned),
-        Err(DecodeError::Version(2)),
-        "unknown version"
+        Err(DecodeError::Version(1)),
+        "version 1, never written, is not read"
     );
     for cut in 1..good.len() {
         assert!(
@@ -169,12 +172,64 @@ fn settings_are_validated() {
         SizeMode::Screen,
         Radius::new(1.0).unwrap(),
         Dynamics::default(),
-        Symmetry::None,
+        Symmetry::NONE,
         [0.0, f32::INFINITY, 0.0, 0.0],
     );
     assert!(
         matches!(nan_param, Err(SettingsError::ActionParam { index: 1, .. })),
         "an infinite action parameter"
+    );
+}
+
+#[test]
+fn symmetry_combines_mirror_and_radial() {
+    assert_eq!(Symmetry::default(), Symmetry::NONE, "none by default");
+    assert_eq!(Symmetry::NONE.copies(), 1, "the dab alone");
+    let xz = Symmetry::mirror(MirrorPlanes::X | MirrorPlanes::Z);
+    assert_eq!(xz.copies(), 4, "two planes, four images");
+    let six = Symmetry::radial(Radial::new(Axis::Y, 6).unwrap());
+    assert_eq!(six.copies(), 6, "six turns");
+    let both = Symmetry {
+        mirror: Some(MirrorPlanes::X),
+        radial: Some(Radial::new(Axis::Y, 6).unwrap()),
+    };
+    assert_eq!(both.copies(), 12, "each turn of each image");
+    let most = Symmetry {
+        mirror: Some(MirrorPlanes::X | MirrorPlanes::Y | MirrorPlanes::Z),
+        radial: Some(Radial::new(Axis::Z, Radial::MAX_COPIES).unwrap()),
+    };
+    assert_eq!(most.copies(), 8 * 64, "the most");
+}
+
+#[test]
+fn unknown_symmetry_kinds_are_refused() {
+    let settings = StrokeSettings {
+        symmetry: Symmetry::mirror(MirrorPlanes::Y),
+        ..StrokeSettings::default()
+    };
+    let at = 1 + 32 + 4 + 1 + 4;
+    let good = settings.to_bytes();
+    assert_eq!(good.get(at..at + 2), Some([1, 2].as_slice()), "mirror, Y");
+    for kinds in [1 << 2, 1 << 3, 0x80] {
+        let mut bad = good.clone();
+        bad[at] = 1 | kinds;
+        assert_eq!(
+            StrokeSettings::from_bytes(&bad),
+            Err(DecodeError::Tag {
+                what: "symmetry",
+                tag: 1 | kinds
+            }),
+            "kind bit {kinds:#04x} (topological is reserved)"
+        );
+    }
+    let mut no_plane = good;
+    no_plane[at + 1] = 0;
+    assert!(
+        matches!(
+            StrokeSettings::from_bytes(&no_plane),
+            Err(DecodeError::Invalid(SettingsError::Symmetry(_)))
+        ),
+        "mirroring through no plane"
     );
 }
 
