@@ -11,10 +11,17 @@
 //!
 //! **When the GPU finishes a frame:** after drawing each frame the thread asks the queue to say
 //! when the work submitted so far is done (`Queue::on_submitted_work_done`), and the callback
-//! records the frame's number as finished. Callbacks run in whichever thread polls the device next:
-//! the owner, through [`RenderThread::gpu_finished`] while it waits for the GPU, or at the start
-//! of its next frame. Nothing waits on the GPU for it, so the owner can keep at most
-//! [`render::FRAMES_IN_FLIGHT`] frames unfinished on the GPU without ever blocking.
+//! records the frame's number as finished. Callbacks (these, and the readbacks' maps) run in
+//! whichever thread polls the device next. Two threads do:
+//!
+//! - the owner: through [`RenderThread::gpu_finished`] while it waits for the GPU, and at the start
+//!   of each frame (residency's `begin_frame`), both only while this thread holds no frame;
+//! - this thread: `Queue::submit` runs the device's upkeep (`maintain(Poll)`) as it submits a
+//!   frame, before that frame's maps are requested, so it can complete only earlier frames'.
+//!
+//! So no poll falls between two maps one frame requests. Nothing waits on the GPU for it, so the
+//! owner can keep at most [`render::FRAMES_IN_FLIGHT`] frames unfinished on the GPU without ever
+//! blocking.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -312,8 +319,10 @@ impl RenderThread {
     /// the device first without waiting, so the callbacks of frames finished since run now.
     ///
     /// Call it only while the thread holds no frame (between a frame's [`Presented`] and the
-    /// next [`RenderThread::send`]): every readback of the frames it has drawn is mapped by
-    /// then, so a poll never falls between two maps of one frame and hears of one alone.
+    /// next [`RenderThread::send`]): every readback map of the frames it has drawn is requested
+    /// by then, so a poll never falls between two map requests of one frame and hears of one
+    /// alone. The only other thread that polls is this one, as it submits (`Queue::submit` runs
+    /// `maintain(Poll)`), before the frame it submits requests its maps (the module notes).
     ///
     /// # Errors
     ///
@@ -636,6 +645,29 @@ mod tests {
         assert_eq!(thread.finished().expect("running"), Vec::new());
         let returned = thread.stop().expect("stopped cleanly");
         assert_eq!(returned.target.size(), size);
+    }
+
+    #[test]
+    fn a_frame_with_no_scene_is_heard_finished_by_polling() {
+        let size = Size::new(8, 8).expect("non-zero");
+        let (gpu, target) = offscreen(size);
+        let mut thread =
+            RenderThread::spawn(gpu, target, Hooks::none(), true).expect("render thread");
+        assert_eq!(thread.gpu_finished().expect("polled"), 0, "nothing drawn");
+        thread.send(request(size, &[])).expect("sent");
+        let presented = thread.wait().expect("drawn");
+        assert!(!presented.scene, "no scene");
+        // The owner's poll: never a wait on the GPU, so a few, a millisecond apart.
+        let heard = (0..10_000).find_map(|_| {
+            let finished = thread.gpu_finished().expect("polled");
+            if finished == presented.number {
+                return Some(finished);
+            }
+            thread::sleep(Duration::from_millis(1));
+            None
+        });
+        assert_eq!(heard, Some(1), "frame 1 heard finished within ten seconds");
+        thread.stop().expect("stopped cleanly");
     }
 
     #[test]

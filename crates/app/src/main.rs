@@ -50,7 +50,7 @@ use winit::event_loop::EventLoop;
 
 use crate::cli::Options;
 use crate::frame::schedule::Next;
-use crate::frame::{NoBrush, Owner, Setup, Uploads as _};
+use crate::frame::{GpuWait, NoBrush, Owner, Setup, Uploads as _};
 use crate::pace::{Pacer, SystemTimer};
 use crate::pick::Picker;
 use crate::render_thread::{Hooks, RenderThread};
@@ -260,13 +260,10 @@ fn drive_offscreen(owner: &mut AppOwner, render: &mut RenderThread) -> Result<()
         match owner.next(now) {
             Next::Frame { deadline } => owner.frame(now, deadline, |frame| render.send(frame))?,
             Next::Render => owner.shown(render.wait()?),
-            Next::Gpu => {
-                owner.gpu_finished(render.gpu_finished()?);
-                let still = matches!(owner.next(now), Next::Gpu);
-                if still && !owner.while_gpu_busy(now, now + frame::GPU_POLL)? {
-                    std::thread::sleep(frame::GPU_POLL);
-                }
-            }
+            Next::Gpu => match owner.wait_for_gpu(now, || render.gpu_finished())? {
+                GpuWait::Ready | GpuWait::Worked => {}
+                GpuWait::Idle => std::thread::sleep(frame::GPU_POLL),
+            },
             Next::Wait { until } => drop(pacer.wait_until(&mut SystemTimer, until)),
             Next::Idle { upkeep } => {
                 std::thread::sleep(upkeep.saturating_duration_since(now));

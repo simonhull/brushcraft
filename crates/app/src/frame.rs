@@ -33,9 +33,9 @@
 //! **Never outrunning the GPU:** a frame starts only while the GPU has fewer than
 //! [`render::FRAMES_IN_FLIGHT`] frames unfinished ([`schedule`]). The owner never waits on the
 //! GPU: when a frame is due and the GPU is that far behind ([`Next::Gpu`]), the loop polls the
-//! device for finished frames ([`Owner::gpu_finished`]) and meanwhile runs the store's jobs and
-//! the upkeep ([`Owner::while_gpu_busy`]), sleeping only when there are none. The time a frame
-//! waited so is its `gpu_wait` ([`OwnerPhases::gpu_wait`]).
+//! device for finished frames and meanwhile runs the store's jobs and the upkeep
+//! ([`Owner::wait_for_gpu`]), sleeping only when there are none ([`GPU_POLL`] says why it polls).
+//! The time a frame waited so is its `gpu_wait` ([`OwnerPhases::gpu_wait`]).
 //!
 //! Frames are made on demand: [`schedule::Scheduler`] decides when, from why they are wanted.
 //! A frame that leaves store jobs queued, uploads in flight, requests pending, or epochs in the
@@ -235,7 +235,28 @@ fn uploads_deadline(now: Instant, deadline: Instant) -> Instant {
 /// How long the loop waits between polls of the device while the GPU is busy and there are no
 /// jobs to run ([`Next::Gpu`]): a frame starts at most about this late after the GPU finishes
 /// the one it waited for.
+///
+/// **Why poll, not wait:** a waiter thread blocked in a device poll would wake the loop the
+/// moment the GPU finished, with no wake-ups meanwhile. But a poll runs the readback maps'
+/// callbacks, and the frame loop's account of them (`crate::uploads`) needs no poll to fall
+/// between two maps of one frame: the render thread asks for them one after the other as it
+/// submits, so only a poll from the owner while the render thread holds no frame (or the
+/// render thread's own submission) is safe. A third thread polling at any time would break that.
+/// The cost of polling instead is a wake-up of the loop each millisecond while the GPU is behind
+/// and there are no store jobs to run: none while the GPU keeps up, or while no frame is wanted.
 pub(crate) const GPU_POLL: Duration = Duration::from_millis(1);
+
+/// What the loop did while a frame waited for the GPU ([`Owner::wait_for_gpu`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuWait {
+    /// The GPU has finished enough: ask [`Owner::next`] again, which may say to start the frame.
+    Ready,
+    /// Still busy; a slice of the store's jobs ran meanwhile. Look at the window's events, then
+    /// wait again.
+    Worked,
+    /// Still busy, and nothing to do: wait [`GPU_POLL`], then poll again.
+    Idle,
+}
 
 /// How long one frame's phases took on the owner thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -622,12 +643,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// What to do at `now`: as the scheduler says, but no frame while there is no frame size
     /// (a minimised window) or once a scripted run has made its frames (or its script is over);
     /// upkeep stays due on its own clock meanwhile.
-    pub(crate) fn next(&self, now: Instant) -> Next {
+    ///
+    /// A wait for the GPU ends when the answer is neither [`Next::Gpu`] nor [`Next::Frame`]
+    /// (a minimised window, nothing wanted any more): the next frame's
+    /// [`OwnerPhases::gpu_wait`] counts only a wait that led to it.
+    pub(crate) fn next(&mut self, now: Instant) -> Next {
         let next = self.scheduler.next(now);
         let no_frames = self.size.is_none()
             || self.limit.is_some_and(|limit| self.started >= limit)
             || self.script_over;
-        match next {
+        let next = match next {
             Next::Frame { .. } | Next::Wait { .. } | Next::Gpu if no_frames => Next::Idle {
                 upkeep: self.scheduler.upkeep_due(),
             },
@@ -636,13 +661,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             | Next::Gpu
             | Next::Render
             | Next::Idle { .. } => next,
+        };
+        if !matches!(next, Next::Gpu | Next::Frame { .. }) {
+            self.gpu_wait_from = None;
         }
-    }
-
-    /// The GPU has finished frame `frame` and every one before it: as the render thread's
-    /// completion count says ([`crate::render_thread::RenderThread::gpu_finished`]).
-    pub(crate) fn gpu_finished(&mut self, frame: u64) {
-        self.scheduler.gpu_finished(frame);
+        next
     }
 
     /// How long the frame starting at `now` waited for the GPU ([`OwnerPhases::gpu_wait`]); the
@@ -653,34 +676,45 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .map_or(Duration::ZERO, |from| now.saturating_duration_since(from))
     }
 
-    /// What the loop does while a frame waits for the GPU ([`Next::Gpu`]), at `now`: the upkeep
-    /// if it is due, then the store's jobs until `until` (at least a slice), if there are any.
-    /// Returns whether it ran any jobs: if not, the loop has nothing to do but wait a little
-    /// ([`GPU_POLL`]) and poll again. The wait counts toward the next frame's
-    /// [`OwnerPhases::gpu_wait`].
+    /// One step of waiting for the GPU, at `now`, when [`Owner::next`] said [`Next::Gpu`]:
+    /// hears from `finished` the newest frame the GPU has finished
+    /// ([`crate::render_thread::RenderThread::gpu_finished`], which polls the device without
+    /// waiting); if it is still too far behind, runs the upkeep if it is due, then a slice of the
+    /// store's jobs, if there are any, until [`GPU_POLL`] from now. Both loops (offscreen and
+    /// the window's) call it, and map what it returns to a sleep or the event loop's control
+    /// flow.
+    ///
+    /// The wait counts toward the next frame's [`OwnerPhases::gpu_wait`], the jobs run meanwhile
+    /// included; they are not added to the overlay's jobs line, which reports the jobs after the
+    /// last hand-off.
     ///
     /// # Errors
     ///
-    /// As [`Project::tick`], [`Project::poll`] and the store's jobs.
-    pub(crate) fn while_gpu_busy(&mut self, now: Instant, until: Instant) -> Result<bool> {
+    /// As `finished`, [`Project::tick`], [`Project::poll`] and the store's jobs.
+    pub(crate) fn wait_for_gpu(
+        &mut self,
+        now: Instant,
+        finished: impl FnOnce() -> Result<u64>,
+    ) -> Result<GpuWait> {
         self.gpu_wait_from.get_or_insert(now);
+        if !self.scheduler.polled(finished()?) {
+            return Ok(GpuWait::Ready);
+        }
         if now >= self.scheduler.upkeep_due() {
             self.upkeep(now)?;
         }
         if !self.project.store().has_jobs() {
-            return Ok(false);
+            return Ok(GpuWait::Idle);
         }
-        let report = self
-            .project
+        self.project
             .store()
-            .run_jobs(until.max(Instant::now() + JobsReport::SLICE_TARGET))
+            .run_jobs((now + GPU_POLL).max(Instant::now() + JobsReport::SLICE_TARGET))
             .context("running the store's jobs")?;
-        self.after_hand_off.report = report;
         // What the jobs closed is the next frame's: it is wanted already, waiting for the GPU.
         if self.project.store().has_jobs() || self.has_stale() {
             self.scheduler.want(Reason::Converging);
         }
-        Ok(true)
+        Ok(GpuWait::Worked)
     }
 
     /// Whether a scripted run has made all its frames (or run its script through) and the

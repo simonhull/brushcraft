@@ -251,6 +251,14 @@ impl Scheduler {
         self.gpu_finished = self.gpu_finished.max(frame.min(self.started));
     }
 
+    /// The GPU has finished frame `frame` (as a poll found): whether it is still too far behind
+    /// for the next frame ([`Scheduler::gpu_busy`]). The one step of waiting for the GPU that the
+    /// owner's loop and the tests' models share (`Owner::wait_for_gpu`).
+    pub(crate) fn polled(&mut self, frame: u64) -> bool {
+        self.gpu_finished(frame);
+        self.gpu_busy()
+    }
+
     /// Frames started that the GPU hasn't finished: submitted, or still with the render thread.
     pub(crate) const fn gpu_in_flight(&self) -> u64 {
         self.started.saturating_sub(self.gpu_finished)
@@ -905,8 +913,9 @@ mod tests {
                 }
                 Next::Wait { until } => now = until,
                 Next::Gpu => {
-                    now += crate::frame::GPU_POLL;
-                    scheduler.gpu_finished(gpu.poll(now));
+                    if scheduler.polled(gpu.poll(now)) {
+                        now += crate::frame::GPU_POLL;
+                    }
                 }
                 Next::Render | Next::Idle { .. } => unreachable!("frames are wanted, and shown"),
             }
@@ -1091,8 +1100,9 @@ mod tests {
                 }
                 Next::Wait { until } => now = until,
                 Next::Gpu => {
-                    now += crate::frame::GPU_POLL;
-                    scheduler.gpu_finished(gpu.poll(now));
+                    if scheduler.polled(gpu.poll(now)) {
+                        now += crate::frame::GPU_POLL;
+                    }
                 }
                 Next::Idle { .. } => break,
                 Next::Render => unreachable!("shown at once"),

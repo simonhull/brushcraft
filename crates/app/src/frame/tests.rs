@@ -121,7 +121,7 @@ fn run<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, most: u64) -> u64 {
 }
 
 /// The first frame's deadline, which the owner wants at once.
-fn first_deadline<B: Brush, U: Uploads>(owner: &Owner<B, U>) -> Instant {
+fn first_deadline<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) -> Instant {
     let Next::Frame { deadline } = owner.next(Instant::now()) else {
         panic!("the first frame is wanted");
     };
@@ -207,7 +207,7 @@ fn a_frame_runs_input_brush_feed_uploads_then_hands_off_then_the_jobs() {
     owner.input(Input::Move {
         at: Pixel { x: 200.0, y: 100.0 },
     });
-    let deadline = first_deadline(&owner);
+    let deadline = first_deadline(&mut owner);
     let started = Instant::now();
     let mut handed = None;
     owner
@@ -601,7 +601,7 @@ fn the_first_frame_uploads_the_floor_and_then_nothing_spins() {
     let mut owner = resident_owner(&dir, &gpu);
     let floor = owner.uploads().floor_tiles();
     assert!(floor > 0, "a floor to upload");
-    let deadline = first_deadline(&owner);
+    let deadline = first_deadline(&mut owner);
     let mut first = None;
     frame_with(&mut owner, deadline, |request| {
         first = Some((request.overlay.join("\n"), submit(&gpu, request)));
@@ -638,7 +638,7 @@ fn a_frame_whose_uploads_are_dropped_is_recovered_by_the_next() {
     // The first frame's uploads are dropped unsubmitted (as by a render thread that gave up on
     // its frame), and nothing else asks for another: no retry, no input.
     let mut dropped = 0;
-    let deadline = first_deadline(&owner);
+    let deadline = first_deadline(&mut owner);
     frame_with(&mut owner, deadline, |request| {
         dropped = request.uploads.as_ref().map_or(0, FrameUploads::bytes);
         drop(request);

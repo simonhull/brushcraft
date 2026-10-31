@@ -29,7 +29,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::camera::Pixel;
 use crate::cli::Options;
 use crate::frame::schedule::Next;
-use crate::frame::{GPU_POLL, LookChange, Setup};
+use crate::frame::{GPU_POLL, GpuWait, LookChange, Setup};
 use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::render_thread::{Hooks, RenderThread};
@@ -196,17 +196,13 @@ impl WindowApp {
                     return Ok(());
                 }
                 Next::Gpu => {
-                    running.owner.gpu_finished(running.render.gpu_finished()?);
-                    if !matches!(running.owner.next(now), Next::Gpu) {
-                        continue;
-                    }
-                    // Still busy: a slice of jobs, then back to the event loop for its events;
-                    // with none, poll again shortly.
-                    let worked = running.owner.while_gpu_busy(now, now + GPU_POLL)?;
-                    let flow = if worked {
-                        ControlFlow::Poll
-                    } else {
-                        ControlFlow::WaitUntil(now + GPU_POLL)
+                    let render = &running.render;
+                    // Still busy after a slice of jobs: back to the event loop for its events;
+                    // with none, poll again shortly (`GPU_POLL` says why it polls).
+                    let flow = match running.owner.wait_for_gpu(now, || render.gpu_finished())? {
+                        GpuWait::Ready => continue,
+                        GpuWait::Worked => ControlFlow::Poll,
+                        GpuWait::Idle => ControlFlow::WaitUntil(now + GPU_POLL),
                     };
                     event_loop.set_control_flow(flow);
                     return Ok(());
