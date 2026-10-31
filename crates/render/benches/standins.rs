@@ -5,12 +5,14 @@
 //! (1,536 finest tiles), every display tile up to level 7 resident (the floor taken to level 7),
 //! no finest tile: the stroke is seen from a distance. Each step names about a dozen finest tiles
 //! along a path, three new ones a step, and the display tiles above them (the store's bump), so
-//! [`STEPS`] steps edit about 900 finest tiles. Each sample is one step's frame, after `done`
-//! steps of the same stroke: its epoch applied, staged, submitted and waited for, so the GPU's
-//! part is in it too, the same at every `done`. What should stay flat as `done` grows is the
-//! owner thread's part, which once grew with the stroke. The GPU is the default adapter, or the
-//! first whose name contains `BRUSHCRAFT_ADAPTER`.
+//! [`STEPS`] steps edit about 900 finest tiles. Each sample is the owner thread's part of one
+//! step's frame, after `done` steps of the same stroke: its epoch applied and the frame staged.
+//! The frame is submitted and waited for between samples, untimed. It should stay flat as `done`
+//! grows (it once grew with the stroke). The GPU is the default adapter, or the first whose
+//! name contains `BRUSHCRAFT_ADAPTER`; any failure panics, so a broken run never passes for a
+//! fast one.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::OnceLock;
@@ -20,7 +22,7 @@ use geom::{BaseMesh, Channel, FinestNormalCone, Level, TileKey, cube_sphere};
 use render::gpu::{AdapterRequest, Gpu};
 use render::residency::{FrameUse, Residency, ResidencyConfig};
 use render::tree::Place;
-use render::upload::{TileData, TileDetail, TileSource};
+use render::upload::{FrameUploads, TileData, TileDetail, TileSource};
 use store::{Drained, Epoch, EpochKind};
 use wgpu::{CommandEncoderDescriptor, PollType};
 
@@ -38,6 +40,42 @@ const ADVANCE: usize = 3;
 
 /// Steps done before the samples: early in the stroke and late.
 const DONE: [usize; 3] = [0, STEPS / 2, STEPS - 50];
+
+/// Ends the run on a failure, saying what failed: a broken run never passes for a fast one.
+trait OrDie<T> {
+    /// The value, or a panic naming `what`.
+    ///
+    /// # Panics
+    ///
+    /// If there is no value.
+    fn or_die(self, what: &str) -> T;
+}
+
+impl<T, E: std::fmt::Display> OrDie<T> for Result<T, E> {
+    #[expect(
+        clippy::panic,
+        reason = "a bench ends on a failure: a broken run never passes for a fast one"
+    )]
+    fn or_die(self, what: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(error) => panic!("{what}: {error}"),
+        }
+    }
+}
+
+impl<T> OrDie<T> for Option<T> {
+    #[expect(
+        clippy::panic,
+        reason = "a bench ends on a failure: a broken run never passes for a fast one"
+    )]
+    fn or_die(self, what: &str) -> T {
+        match self {
+            Some(value) => value,
+            None => panic!("{what}"),
+        }
+    }
+}
 
 /// The GPU every bench runs on, opened once by `main`.
 static GPU: OnceLock<Gpu> = OnceLock::new();
@@ -116,66 +154,84 @@ fn step(path: &[TileKey], n: usize) -> Epoch {
     }
 }
 
-/// One step's frame: `epoch` applied, staged, submitted and waited for.
+/// The owner thread's part of one step's frame: `epoch` applied, the frame staged.
 ///
-/// # Errors
+/// # Panics
 ///
-/// If residency or the GPU fails.
-fn frame(
-    gpu: &Gpu,
-    residency: &mut Residency,
-    epoch: Epoch,
-) -> Result<(), Box<dyn std::error::Error>> {
-    residency.begin_frame(gpu)?;
+/// If residency fails.
+fn stage(gpu: &Gpu, residency: &mut Residency, epoch: Epoch) -> FrameUploads {
+    residency.begin_frame(gpu).or_die("a frame begins");
     residency.apply(Drained::Epochs(vec![epoch]));
     residency.use_frame(FrameUse::default());
-    let uploads = residency.stage(gpu, &mut Zeros, Instant::now() + Duration::from_secs(60))?;
+    residency
+        .stage(gpu, &mut Zeros, Instant::now() + Duration::from_secs(60))
+        .or_die("staged")
+}
+
+/// Submits a frame's `uploads` and waits for the GPU.
+///
+/// # Panics
+///
+/// If the GPU fails.
+fn submit(gpu: &Gpu, uploads: FrameUploads) {
     let encoder = gpu
         .device()
         .create_command_encoder(&CommandEncoderDescriptor::default());
     uploads.submit(gpu.queue(), encoder, |_| {});
-    gpu.device().poll(PollType::wait_indefinitely())?;
-    Ok(())
+    gpu.device()
+        .poll(PollType::wait_indefinitely())
+        .or_die("the GPU finishes");
 }
 
 /// Residency seen from a distance, its floor (every display tile to level 7) up, and the
 /// stroke's path.
 ///
-/// # Errors
+/// # Panics
 ///
 /// If the mesh, the configuration, residency or the GPU fails.
-fn far() -> Result<(Residency, Vec<TileKey>), Box<dyn std::error::Error>> {
-    let Some(gpu) = GPU.get() else {
-        return Err("no GPU".into());
-    };
-    let mesh = cube_sphere(4)?;
-    let config = ResidencyConfig::new(1 << 30, 16 << 20, 64 << 20, 8 << 20, 64, level(7))?;
-    let mut residency = Residency::new(gpu, &mesh, level(FINEST), config)?;
-    residency.begin_frame(gpu)?;
-    let uploads = residency.stage(gpu, &mut Zeros, Instant::now() + Duration::from_secs(60))?;
-    let encoder = gpu
-        .device()
-        .create_command_encoder(&CommandEncoderDescriptor::default());
-    uploads.submit(gpu.queue(), encoder, |_| {});
-    gpu.device().poll(PollType::wait_indefinitely())?;
-    Ok((residency, finest_tiles(&mesh)))
+fn far(gpu: &Gpu) -> (Residency, Vec<TileKey>) {
+    let mesh = cube_sphere(4).or_die("a mesh");
+    let config = ResidencyConfig::new(1 << 30, 16 << 20, 64 << 20, 8 << 20, 64, level(7))
+        .or_die("a configuration");
+    let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).or_die("residency");
+    residency.begin_frame(gpu).or_die("a frame begins");
+    let uploads = residency
+        .stage(gpu, &mut Zeros, Instant::now() + Duration::from_secs(60))
+        .or_die("staged");
+    submit(gpu, uploads);
+    (residency, finest_tiles(&mesh))
 }
 
-/// One step's frame after `done` steps of the stroke.
+/// The owner thread's part of one step's frame after `done` steps of the stroke.
+///
+/// # Panics
+///
+/// If the GPU or residency fails.
 #[divan::bench(args = DONE, sample_count = 40, sample_size = 1)]
 fn step_frame(bencher: divan::Bencher<'_, '_>, done: usize) {
-    let Some(gpu) = GPU.get() else { return };
-    let Ok((mut residency, path)) = far() else {
-        return;
-    };
+    let gpu = GPU.get().or_die("the GPU, opened by main");
+    let (mut residency, path) = far(gpu);
     for n in 0..done {
-        if frame(gpu, &mut residency, step(&path, n)).is_err() {
-            return;
-        }
+        let uploads = stage(gpu, &mut residency, step(&path, n));
+        submit(gpu, uploads);
     }
-    let mut n = done;
-    bencher.bench_local(|| {
-        n += 1;
-        drop(frame(gpu, &mut residency, step(&path, n)));
-    });
+    let state = RefCell::new((residency, done, None::<FrameUploads>));
+    bencher
+        .with_inputs(|| {
+            // Untimed: the last sample's frame submitted, and the next step's epoch.
+            let mut state = state.borrow_mut();
+            if let Some(uploads) = state.2.take() {
+                submit(gpu, uploads);
+            }
+            state.1 += 1;
+            step(&path, state.1)
+        })
+        .bench_local_values(|epoch| {
+            let mut state = state.borrow_mut();
+            let uploads = stage(gpu, &mut state.0, epoch);
+            state.2 = Some(uploads);
+        });
+    if let Some(uploads) = state.borrow_mut().2.take() {
+        submit(gpu, uploads);
+    }
 }
