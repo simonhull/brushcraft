@@ -130,7 +130,8 @@ pub struct DrawTimes {
 pub struct DroppedReadbacks {
     /// Frames that drew their scene but read back no cut.
     pub cut: u64,
-    /// Frames stamped for timing but not timed.
+    /// Frames whose GPU times were lost: no slot of the timer's ring free, or one couldn't be
+    /// made, or its readback failed or was never submitted.
     pub timing: u64,
 }
 
@@ -386,11 +387,13 @@ impl Renderer {
             aa,
             timer,
         } = self;
-        let (mut stamps, mut tick_readback) = (Stamps::of(timer.as_mut(), gpu, inputs.frame), None);
         overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         if let Some(passes) = scene_passes.as_mut() {
             passes.set_shading(gpu, inputs.look, inputs.overlay_scale);
         }
+        // Taken after the last early return: the stamps hold a slot of the timer's ring, which
+        // only `finish_stamps` gives back.
+        let (mut stamps, mut tick_readback) = (Stamps::of(timer.as_mut(), gpu, inputs.frame), None);
         let to_draw = scene_passes.as_mut().map(|passes| (inputs.scene, passes));
         let drawing = matches!(to_draw, Some((Scene::Draw(_), _)));
         let uploads = uploads.map(|uploads| for_frame(uploads, drawing));

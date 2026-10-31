@@ -423,11 +423,15 @@ enum Returned {
         /// The spans it holds the ticks of, in order.
         spans: Vec<Span>,
     },
-    /// Never submitted, or never written: free again, nothing to read.
+    /// Never written (a frame that stamped no pass, or ran out of queries): free again, nothing
+    /// to read, nothing lost.
     Unread(usize),
-    /// Frame `0` was never submitted: its slot waits for nothing.
+    /// Resolved for a frame, but that submission never went: free again, the frame's times
+    /// lost.
+    Lost(usize),
+    /// Frame `0` was never submitted: its slot waits for nothing, and its times are lost.
     Abandoned(u64),
-    /// Its mapping failed: the slot is gone.
+    /// Its mapping failed: the slot is gone, and the frame's times with it.
     Failed,
 }
 
@@ -475,7 +479,8 @@ pub(crate) struct GpuTimer {
     /// Where queries are resolved: a region of [`STRIDE`] bytes a slot, its own ticks first,
     /// then the level choice's at [`LOD_AT`].
     resolved: Buffer,
-    /// Frames not timed for want of a free slot, ever.
+    /// Frames whose times were lost, ever: no slot free, a slot not made, a readback failed or
+    /// never submitted.
     dropped: u64,
     /// Nanoseconds a tick.
     period: f32,
@@ -553,13 +558,22 @@ impl GpuTimer {
         }
     }
 
-    /// A new slot, if the ring has room for one (else the frame is counted dropped) and the GPU
-    /// makes it.
+    /// A new slot, if the ring has room for one and the GPU makes it; else the frame is counted
+    /// dropped.
     fn make_slot(&mut self, gpu: &Gpu) -> Option<usize> {
         if self.slots.len() >= RING {
             self.dropped += 1;
             return None;
         }
+        let made = self.try_make_slot(gpu);
+        if made.is_none() {
+            self.dropped += 1;
+        }
+        made
+    }
+
+    /// A new slot, if the GPU makes it.
+    fn try_make_slot(&mut self, gpu: &Gpu) -> Option<usize> {
         let device = gpu.device();
         let slot = gpu
             .scoped("frame timer slot", || Slot {
@@ -634,7 +648,9 @@ impl GpuTimer {
             return timed;
         };
         if on.overflowed || on.used == 0 {
-            // Back unread: nothing worth resolving was written.
+            // Back unread: nothing worth resolving was written. Not counted as a drop: a frame
+            // that stamped no pass has no times to lose, and one that ran out of queries
+            // (`CAPACITY`) is a bug in the stamps, not a readback the ring couldn't make.
             drop(self.done.send(Returned::Unread(on.slot)));
             return timed;
         }
@@ -693,8 +709,9 @@ impl GpuTimer {
         Ok(())
     }
 
-    /// Frames not timed because no slot was free, ever ([`GpuTimer::begin`] gave stamps that are
-    /// off for that). Zero while the GPU is kept within [`crate::FRAMES_IN_FLIGHT`] frames.
+    /// Frames whose times were lost, ever: [`GpuTimer::begin`] found no slot free or couldn't
+    /// make one, or a readback failed or was never submitted. Zero while the GPU is kept within
+    /// [`crate::FRAMES_IN_FLIGHT`] frames and the device works.
     pub(crate) const fn dropped_readbacks(&self) -> u64 {
         self.dropped
     }
@@ -734,7 +751,12 @@ impl GpuTimer {
                     self.ready.extend(read);
                 }
                 Returned::Unread(slot) => self.free.push(slot),
+                Returned::Lost(slot) => {
+                    self.dropped += 1;
+                    self.free.push(slot);
+                }
                 Returned::Abandoned(frame) => {
+                    self.dropped += 1;
                     let (abandoned, kept): (VecDeque<Pending>, VecDeque<Pending>) =
                         std::mem::take(&mut self.pending)
                             .into_iter()
@@ -743,7 +765,7 @@ impl GpuTimer {
                     self.free
                         .extend(abandoned.iter().map(|pending| pending.slot));
                 }
-                Returned::Failed => {}
+                Returned::Failed => self.dropped += 1,
             }
         }
     }
@@ -929,10 +951,10 @@ impl TimedFrame {
 
 impl Drop for TimedFrame {
     fn drop(&mut self) {
-        // Unsubmitted: what it resolved goes back unread, and its own frame waits for nothing.
-        // A timer that's gone has nothing to take back.
+        // Unsubmitted: what it resolved goes back, those frames' times lost, and its own frame
+        // waits for nothing. A timer that's gone has nothing to take back.
         for resolving in self.resolving.drain(..) {
-            drop(self.done.send(Returned::Unread(resolving.slot)));
+            drop(self.done.send(Returned::Lost(resolving.slot)));
         }
         if let Some((frame, _)) = self.this.take() {
             drop(self.done.send(Returned::Abandoned(frame)));
