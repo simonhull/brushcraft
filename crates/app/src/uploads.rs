@@ -291,8 +291,8 @@ impl GpuResidency {
             changed |= requests.dropped() == 0 && requested != self.requested;
             self.requested = requested;
         }
-        // Requested finest tiles are evaluated in the jobs phase, after the hand-off, never
-        // while staging: queued here, staged once evaluated.
+        // Requested finest tiles are queued here for the jobs phase, after the hand-off; staging
+        // takes those it has the time for itself.
         self.evaluations
             .request(store, residency)
             .context("queueing requested finest tiles for evaluation")?;

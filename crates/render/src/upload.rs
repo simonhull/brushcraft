@@ -231,7 +231,9 @@ pub trait TileSource {
     /// Whether requested tile `key` is being made elsewhere and isn't ready yet, so reading it
     /// now would block on that work: a finest tile in the store's queued evaluation
     /// ([`FinestEvaluations`]). Such a tile is never read for its request; it stays wanted, and
-    /// is staged in a later frame, once this says no. Tiles a pending epoch names are read
+    /// is staged in a later frame, once this says no. It is asked again after
+    /// [`TileSource::prepare`], before each tile prepared is read: a tile the source couldn't
+    /// ready in the time it had is deferred then. Tiles a pending epoch names are read
     /// whatever this says, since the epoch switches whole. The default says no: nothing is made
     /// elsewhere.
     #[expect(
@@ -288,6 +290,14 @@ pub struct StoreSource<'a> {
     /// the last [`TileSource::prepare`]: what that prepare evaluates here, counted against the
     /// time left.
     reserved: BTreeSet<TileKey>,
+    /// Requested finest tiles evaluated here this frame: read from the cache.
+    done_here: BTreeSet<TileKey>,
+    /// Requested finest tiles let through but left unevaluated when the clock ran out: deferred
+    /// for the rest of the frame, never read here.
+    cut: BTreeSet<TileKey>,
+    /// The dearest a requested finest tile has cost here this frame, if one has been evaluated:
+    /// what the next group is sized at, if dearer than the estimate.
+    frame_cost: Option<std::time::Duration>,
     /// Finest tiles read through the store's own evaluation on this thread, not from a copy.
     evaluated_here: usize,
     /// A delay added to each requested finest tile evaluated here, for the tests of a slow
@@ -305,6 +315,9 @@ impl<'a> StoreSource<'a> {
             evaluations: None,
             until: None,
             reserved: BTreeSet::new(),
+            done_here: BTreeSet::new(),
+            cut: BTreeSet::new(),
+            frame_cost: None,
             evaluated_here: 0,
             #[cfg(test)]
             slow: std::time::Duration::ZERO,
@@ -324,6 +337,9 @@ impl<'a> StoreSource<'a> {
             evaluations: Some(evaluations),
             until: None,
             reserved: BTreeSet::new(),
+            done_here: BTreeSet::new(),
+            cut: BTreeSet::new(),
+            frame_cost: None,
             evaluated_here: 0,
             #[cfg(test)]
             slow: std::time::Duration::ZERO,
@@ -365,6 +381,82 @@ impl<'a> StoreSource<'a> {
             .and_then(|evaluations| evaluations.get(key))
     }
 
+    /// Evaluates the positions of every tile `finest`'s rings read: the tiles, their aprons and
+    /// the tiles round their corners' base vertices.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`].
+    fn evaluate_positions(&mut self, finest: &[TileKey]) -> Result<(), CacheError> {
+        let mut inputs = BTreeSet::new();
+        for key in finest {
+            inputs.extend(self.store.normal_inputs(key)?.iter().copied());
+        }
+        let inputs: Vec<TileKey> = inputs.into_iter().collect();
+        self.store.evaluate_many(&inputs, Evaluation::Positions)
+    }
+
+    /// Evaluates requested finest tiles `keys` here, in order, a group at a time, the clock
+    /// read before each: a group is as many tiles as [`GROUP_TIME`] holds at the dearer of the
+    /// estimate and the dearest this frame has measured (one, the frame's first), and fewer if
+    /// the time left before the deadline less [`STAGE_MARGIN`] holds fewer at a quarter more.
+    /// When it holds none, the rest are cut: deferred for the rest of the frame, and left
+    /// queued. So an estimate however wrong overruns by one group at most, and the frame's
+    /// first group is a single tile, measured. Each tile evaluated is withdrawn from the queue.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`].
+    fn evaluate_requested(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {
+        let Some(until) = self.until else {
+            return self.evaluate_positions(keys);
+        };
+        let mut at = 0;
+        while at < keys.len() {
+            let estimate = self
+                .evaluations
+                .as_deref()
+                .and_then(FinestEvaluations::cost)
+                .unwrap_or(PROBE_COST);
+            let (each, most) = match self.frame_cost {
+                Some(measured) => {
+                    let each = measured.max(estimate);
+                    let fits = GROUP_TIME.as_nanos() / each.as_nanos().max(1);
+                    (each, usize::try_from(fits).unwrap_or(usize::MAX).max(1))
+                }
+                None => (estimate, 1),
+            };
+            let room = until
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(STAGE_MARGIN);
+            let dear = each.saturating_add(each / 4).as_nanos().max(1);
+            let fit = usize::try_from(room.as_nanos() / dear).unwrap_or(usize::MAX);
+            let group = most.min(fit).min(keys.len() - at);
+            if group == 0 {
+                break;
+            }
+            let Some(batch) = keys.get(at..at + group) else {
+                break;
+            };
+            let began = Instant::now();
+            self.evaluate_positions(batch)?;
+            #[cfg(test)]
+            std::thread::sleep(self.slow * u32::try_from(group).unwrap_or(u32::MAX));
+            let took = began.elapsed() / u32::try_from(group).unwrap_or(u32::MAX).max(1);
+            self.frame_cost = Some(self.frame_cost.map_or(took, |cost| cost.max(took)));
+            if let Some(evaluations) = self.evaluations.as_deref_mut() {
+                evaluations.note_cost(took);
+            }
+            self.done_here.extend(batch.iter().copied());
+            // Evaluated here: the queue lets them go, so none is evaluated twice.
+            self.store.retain_evaluation(|key| !batch.contains(key));
+            at += group;
+        }
+        self.cut
+            .extend(keys.get(at..).unwrap_or_default().iter().copied());
+        Ok(())
+    }
+
     /// Whether requested finest tile `key`, without a copy, fits in the time left to be
     /// evaluated here: see [`StoreSource::evaluating_until`].
     fn fits_here(&self, key: &TileKey) -> bool {
@@ -387,6 +479,13 @@ impl<'a> StoreSource<'a> {
     }
 }
 
+/// About how long a group of requested finest tiles evaluated while staging takes.
+///
+/// At the cost estimated: the clock is read between groups, so this is about what an estimate too
+/// cheap can overrun by (with the tiles of one evaluation together, rather than one at a time,
+/// which pays a call's fixed cost, about 0.1 ms, a tile).
+pub const GROUP_TIME: std::time::Duration = std::time::Duration::from_micros(700);
+
 /// The time kept free before the staging deadline when requested finest tiles are evaluated
 /// while staging ([`StoreSource::evaluating_until`]).
 ///
@@ -407,40 +506,20 @@ impl TileSource for StoreSource<'_> {
         let (display, finest): (Vec<TileKey>, Vec<TileKey>) = keys
             .iter()
             .partition(|key| key.channel() == Channel::DISPLAY);
-        // A tile with a copy reads it: nothing to evaluate.
-        let finest: Vec<TileKey> = finest
-            .into_iter()
-            .filter(|key| self.evaluated(key).is_none())
-            .collect();
-        // The requested tiles let through to be evaluated here, timed for the next.
+        // A tile with a copy reads it: nothing to evaluate. The requested tiles let through
+        // are evaluated against the clock; the rest (a pending epoch's) together, whatever the
+        // time, since the epoch switches whole.
         let reserved = std::mem::take(&mut self.reserved);
-        let requested: Vec<TileKey> = finest
-            .iter()
-            .copied()
-            .filter(|key| reserved.contains(key))
-            .collect();
-        if !finest.is_empty() {
-            let began = Instant::now();
-            // Positions only, of every tile the rings read: the tiles, their aprons and the
-            // tiles round their corners' base vertices.
-            let mut inputs = BTreeSet::new();
-            for key in &finest {
-                inputs.extend(self.store.normal_inputs(key)?.iter().copied());
-            }
-            let inputs: Vec<TileKey> = inputs.into_iter().collect();
-            self.store.evaluate_many(&inputs, Evaluation::Positions)?;
-            #[cfg(test)]
-            std::thread::sleep(self.slow * u32::try_from(requested.len()).unwrap_or(0));
-            if let Some(evaluations) = self.evaluations.as_deref_mut()
-                && let Ok(count) = u32::try_from(requested.len())
-                && count > 0
-            {
-                evaluations.note_cost(began.elapsed() / count);
-            }
+        let unread = finest
+            .into_iter()
+            .filter(|key| self.evaluated(key).is_none());
+        let (requested, others): (Vec<TileKey>, Vec<TileKey>) =
+            unread.partition(|key| reserved.contains(key));
+        if !others.is_empty() {
+            self.evaluate_positions(&others)?;
         }
         if !requested.is_empty() {
-            // Evaluated here: the queue lets them go, so none is evaluated twice.
-            self.store.retain_evaluation(|key| !requested.contains(key));
+            self.evaluate_requested(&requested)?;
         }
         if !display.is_empty() {
             let tiles = self.store.display_for_draw(&display)?;
@@ -457,8 +536,12 @@ impl TileSource for StoreSource<'_> {
         if self.evaluations.is_none()
             || key.channel() == Channel::DISPLAY
             || self.evaluated(&key).is_some()
+            || self.done_here.contains(&key)
         {
             return false;
+        }
+        if self.cut.contains(&key) {
+            return true;
         }
         if self.fits_here(&key) {
             self.reserved.insert(key);

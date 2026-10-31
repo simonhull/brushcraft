@@ -1492,6 +1492,10 @@ impl Residency {
             }
             source.prepare(&ready).map_err(Into::into)?;
             for key in ready {
+                // A tile the source couldn't ready in the time it had waits, wanted.
+                if source.deferred(key) {
+                    continue;
+                }
                 match self.arrive(gpu, batch, source, key, false)? {
                     Read::NoRoom => return Ok(()),
                     Read::NoSlot => {}

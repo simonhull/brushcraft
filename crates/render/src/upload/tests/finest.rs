@@ -659,6 +659,46 @@ fn with_slack_and_many_wanted_staging_takes_about_slack_over_cost() {
     });
 }
 
+/// An estimate ten times too cheap still keeps staging near its deadline.
+///
+/// Within about a millisecond: the clock is read between groups, the frame's first group is one
+/// tile, and the tiles left when the time runs out are cut, deferred, never read.
+#[test]
+fn staging_keeps_its_deadline_with_an_estimate_ten_times_too_cheap() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("hybrid-cheap");
+        let (mut project, cursor, mut residency, mut evaluations, requests) =
+            due_and_queued(gpu, &dir);
+        let store = project.store();
+        let cheap = Duration::from_micros(300);
+        let mut staged = 0;
+        for frame in 0..3 {
+            // Told cheap before every frame, as if a warm frame had just measured it.
+            evaluations.note_cost(cheap);
+            evaluations.note_cost(cheap);
+            let staging = slack(Duration::from_millis(12), cheap * 10);
+            let until = staging.until.expect("a deadline");
+            let (here, ended) = hybrid_frame(
+                gpu,
+                &mut residency,
+                &mut evaluations,
+                store,
+                &cursor,
+                &requests,
+                staging,
+            );
+            let over = ended.saturating_duration_since(until);
+            assert!(
+                over <= Duration::from_millis(1),
+                "frame {frame}: {over:?} past the deadline, {here} tiles evaluated"
+            );
+            staged += here;
+        }
+        assert!(staged > 0, "some evaluated while staging");
+        drop(project.close(false));
+    });
+}
+
 /// One cold tile's dear cost doesn't keep staging from evaluating for good: frames that defer
 /// tiles for want of time and evaluate none halve it, until tiles fit again.
 #[test]
