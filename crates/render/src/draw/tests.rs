@@ -276,11 +276,22 @@ fn draw_scene(
     at: (Duration, u64),
     look: Look,
 ) -> SceneFrame {
-    draw_scene_timed(gpu, world, size, eye, at, look, false)
+    draw_scene_timed(gpu, world, size, eye, at, look, Timed::Off)
 }
 
-/// [`draw_scene`], with the frame's phases and the level choice's stages timed on the GPU if
-/// `timed` (and the device has timestamp queries).
+/// What a test frame times on the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Timed {
+    /// Nothing.
+    Off,
+    /// The frame's phases: every pass stamped with the frame's own queries.
+    Phases,
+    /// The phases and the level choice's stages: the level choice's passes stamped by its own
+    /// timer, the frame borrowing their stamps.
+    PhasesAndStages,
+}
+
+/// [`draw_scene`], timed on the GPU as `timed` says (if the device has timestamp queries).
 fn draw_scene_timed(
     gpu: &Gpu,
     world: &World,
@@ -288,11 +299,11 @@ fn draw_scene_timed(
     eye: Vec3,
     (time, frame): (Duration, u64),
     look: Look,
-    timed: bool,
+    timed: Timed,
 ) -> SceneFrame {
     let mut target = Target::Offscreen(Offscreen::new(gpu, size).expect("target"));
     let mut renderer = Renderer::new(gpu, target.format()).expect("renderer");
-    if timed {
+    if timed != Timed::Off {
         renderer.enable_timing(gpu).expect("the frame timer");
     }
     let mut passes = FramePasses::new(
@@ -304,7 +315,7 @@ fn draw_scene_timed(
         ShadePath::Compute,
     )
     .expect("the scene's passes");
-    if timed {
+    if timed == Timed::PhasesAndStages {
         passes
             .lod_mut()
             .enable_timing(gpu)
@@ -384,7 +395,7 @@ fn a_timed_frame_reports_its_phases_and_stages_on_the_gpu_when_the_device_can() 
         let eye = Vec3::new(0.4, 0.3, 2.6);
         let at = (Duration::from_secs(1), 5);
         let look = styled(MatCapStyle::Clay);
-        let frame = draw_scene_timed(gpu, &world, size, eye, at, look, true);
+        let frame = draw_scene_timed(gpu, &world, size, eye, at, look, Timed::PhasesAndStages);
         if gpu.timestamp_period().is_none() {
             assert!(frame.gpu_times.is_empty(), "no queries, no times");
             assert_eq!(frame.cut.timings, None, "nor stage times");
@@ -394,37 +405,68 @@ fn a_timed_frame_reports_its_phases_and_stages_on_the_gpu_when_the_device_can() 
             panic!("one frame timed: {:?}", frame.gpu_times);
         };
         assert_eq!(times.frame(), 5, "tagged with its frame");
-        let every = [
-            GpuPhase::Uploads,
-            GpuPhase::Bounds,
-            GpuPhase::LevelChoice,
-            GpuPhase::Raster,
-            GpuPhase::Readback,
-            GpuPhase::Shade,
-            GpuPhase::Accumulate,
-            GpuPhase::Tone,
-        ];
-        let phases: Vec<Duration> = every
-            .iter()
-            .map(|&phase| times.phase(phase).expect("every phase ran"))
-            .collect();
-        let sum: Duration = phases.iter().sum();
-        // Each phase rounds down to whole nanoseconds on its own.
-        let rounding = Duration::from_nanos(every.len() as u64);
-        assert!(
-            times
-                .total()
-                .checked_sub(sum)
-                .is_some_and(|left| left <= rounding),
-            "the phases tile the frame: {sum:?} of {:?}",
-            times.total()
+        every_phase_plausible(times);
+        let stages = frame.cut.timings.expect("the stages came with the cut");
+        let level_choice = stages.choose + stages.relax + stages.sweep + stages.emit;
+        assert_eq!(
+            times.phase(GpuPhase::LevelChoice),
+            Some(level_choice),
+            "the frame read the stage timer's stamps of the level choice's passes"
         );
-        assert!(times.total() > Duration::ZERO, "the frame took time");
-        assert!(frame.cut.timings.is_some(), "the stages came with the cut");
         let untimed = draw_scene(gpu, &world, size, eye, at, look);
         assert!(untimed.gpu_times.is_empty(), "off unless asked for");
         assert_eq!(untimed.cut.timings, None, "the stages too");
     });
+}
+
+#[test]
+fn a_frame_timed_without_the_stage_timer_stamps_the_level_choice_s_passes_itself() {
+    GpuTest::run(|gpu| {
+        if gpu.timestamp_period().is_none() {
+            return;
+        }
+        let world = World::with_finest(gpu, 4);
+        let size = Size::new(96, 64).expect("non-zero");
+        let eye = Vec3::new(0.4, 0.3, 2.6);
+        let at = (Duration::from_secs(1), 5);
+        let look = styled(MatCapStyle::Clay);
+        let frame = draw_scene_timed(gpu, &world, size, eye, at, look, Timed::Phases);
+        let [times] = frame.gpu_times.as_slice() else {
+            panic!("one frame timed: {:?}", frame.gpu_times);
+        };
+        every_phase_plausible(times);
+        assert_eq!(frame.cut.timings, None, "no stage timer, no stages");
+    });
+}
+
+/// Checks the times of a frame that drew its scene, still, on lavapipe.
+///
+/// Every phase ran and took time, none longer than the frame, and the phases (passes and the
+/// gaps of the copies between them) sum to most of the frame, never more: Vulkan's timestamps
+/// are at the bottom of the pipe, so passes don't overlap.
+fn every_phase_plausible(times: &GpuTimes) {
+    let total = times.total();
+    assert!(total > Duration::ZERO, "the frame took time");
+    assert!(
+        total < Duration::from_secs(10),
+        "a frame, not a run: {total:?}"
+    );
+    let phases: Vec<(GpuPhase, Duration)> = GpuPhase::ALL
+        .iter()
+        .map(|&phase| (phase, times.phase(phase).expect("every phase ran")))
+        .collect();
+    for &(phase, took) in &phases {
+        assert!(took > Duration::ZERO, "{phase:?} took time: {times:?}");
+        assert!(took <= total, "{phase:?} within the frame: {times:?}");
+    }
+    let sum: Duration = phases.iter().map(|&(_, took)| took).sum();
+    // Each phase rounds down to whole nanoseconds on its own.
+    let rounding = Duration::from_nanos(phases.len() as u64);
+    assert!(sum <= total + rounding, "{sum:?} of {total:?}: {times:?}");
+    // Left out: the start pass, and the gaps between passes that are no phase's work. On
+    // lavapipe each gap is the next pass's setup on the CPU, 0.05–0.4 ms with the machine
+    // quiet (about 8 % of this frame's 16 passes and 29 ms), more under load.
+    assert!(sum >= total / 2, "{sum:?} of {total:?}: {times:?}");
 }
 
 /// The pixels of `target`, an offscreen one.

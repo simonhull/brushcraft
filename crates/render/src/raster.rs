@@ -142,13 +142,14 @@ use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferUsages, Color,
     ColorTargetState, ColorWrites, CommandEncoder, CompareFunction, ComputePassDescriptor,
-    ComputePipeline, DepthBiasState, DepthStencilState, Extent3d, Face, FragmentState, FrontFace,
-    IndexFormat, LoadOp, MultisampleState, Operations, PipelineCompilationOptions,
-    PipelineLayoutDescriptor, PolygonMode, PrimitiveState, PrimitiveTopology,
-    RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
-    RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
-    StencilState, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages, TextureView, TextureViewDescriptor, VertexState,
+    ComputePassTimestampWrites, ComputePipeline, DepthBiasState, DepthStencilState, Extent3d, Face,
+    FragmentState, FrontFace, IndexFormat, LoadOp, MultisampleState, Operations,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode, PrimitiveState,
+    PrimitiveTopology, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
+    RenderPassDescriptor, RenderPassTimestampWrites, RenderPipeline, RenderPipelineDescriptor,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, StoreOp, Texture,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, VertexState,
 };
 
 use crate::camera::{GpuView, View};
@@ -826,7 +827,8 @@ impl Raster {
     }
 
     /// Encodes the stamp pass over `cut`, the frame's cut (after the level choice's first
-    /// phase, before either draw), reading `tree`.
+    /// phase, before either draw), reading `tree`; the pass writes `timestamps` if given
+    /// ([`crate::timing`]).
     ///
     /// # Errors
     ///
@@ -838,6 +840,7 @@ impl Raster {
         encoder: &mut CommandEncoder,
         tree: &Buffer,
         cut: CutList<'_>,
+        timestamps: Option<ComputePassTimestampWrites<'_>>,
     ) -> Result<(), RasterError> {
         if self.frame.is_none() {
             return Err(RasterError::NoFrame);
@@ -866,7 +869,7 @@ impl Raster {
         let entries = u32::try_from(cut.entries.size() / 16).unwrap_or(u32::MAX);
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("raster stamp"),
-            timestamp_writes: None,
+            timestamp_writes: timestamps,
         });
         pass.set_pipeline(&self.stamp);
         pass.set_bind_group(0, &group, &[]);
@@ -875,7 +878,8 @@ impl Raster {
     }
 
     /// Encodes one phase's draw: its clusters, one instance each, into the visibility and depth
-    /// buffers, cleared first for [`Phase::First`].
+    /// buffers, cleared first for [`Phase::First`]; the pass writes `timestamps` if given
+    /// ([`crate::timing`]).
     ///
     /// # Errors
     ///
@@ -888,6 +892,7 @@ impl Raster {
         encoder: &mut CommandEncoder,
         draw: &ClusterDraw<'_>,
         phase: Phase,
+        timestamps: Option<RenderPassTimestampWrites<'_>>,
     ) -> Result<(), RasterError> {
         if self.frame.is_none() {
             return Err(RasterError::NoFrame);
@@ -928,6 +933,7 @@ impl Raster {
                 }),
                 stencil_ops: None,
             }),
+            timestamp_writes: timestamps,
             ..RenderPassDescriptor::default()
         });
         pass.set_pipeline(&slot_pipeline.pipeline);

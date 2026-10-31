@@ -40,7 +40,7 @@ use crate::overlay::{OverlayPass, TextImage};
 use crate::raster::{FrameError, FramePasses, SceneInputs};
 use crate::shade::ShadeSettings;
 use crate::surface::{Acquired, Size, SurfaceError, Target};
-use crate::timing::{GpuPhase, GpuTimer, GpuTimes, Mark, Marks, TimedFrame};
+use crate::timing::{GpuPhase, GpuTimer, GpuTimes, Stamps, TimedFrame};
 use crate::tone::{ToneMap, ToneSource};
 use crate::upload::FrameUploads;
 use crate::visibility_view::VisibilityView;
@@ -338,7 +338,7 @@ impl Renderer {
             aa,
             timer,
         } = self;
-        let (mut marks, mut tick_readback) = (Marks::of(timer.as_ref(), inputs.frame), None);
+        let (mut stamps, mut tick_readback) = (Stamps::of(timer.as_ref(), inputs.frame), None);
         overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
         if let Some(passes) = scene_passes.as_mut() {
             passes.set_shading(gpu, inputs.look, inputs.overlay_scale);
@@ -359,13 +359,12 @@ impl Renderer {
                 .create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("frame"),
                 });
-            marks.mark(&mut commands, Mark::Start);
+            stamps.start(&mut commands);
             let mut encoded = None;
             let passes = |frame: &mut CommandEncoder| {
-                marks.end(frame, GpuPhase::Uploads);
                 encoded = to_draw.and_then(|(scene, passes)| {
                     let images = (&mut *view, &mut *tone, &mut *aa);
-                    encode_scene(gpu, frame, scene, passes, images, showing, &mut marks)
+                    encode_scene(gpu, frame, scene, passes, images, showing, &mut stamps)
                 });
                 let mut pass = frame.begin_render_pass(&RenderPassDescriptor {
                     label: Some("scene and overlay"),
@@ -378,6 +377,7 @@ impl Renderer {
                             store: StoreOp::Store,
                         },
                     })],
+                    timestamp_writes: stamps.render(GpuPhase::Tone),
                     ..RenderPassDescriptor::default()
                 });
                 if let Some(Ok(EncodedScene { shown: true, .. })) = &encoded {
@@ -389,8 +389,7 @@ impl Renderer {
                 // The last pass: the overlay over everything.
                 overlay.draw(&mut pass);
                 drop(pass);
-                marks.end(frame, GpuPhase::Tone);
-                tick_readback = finish_marks(timer.as_mut(), gpu, frame, &mut marks);
+                tick_readback = finish_stamps(timer.as_mut(), gpu, frame, &mut stamps);
             };
             submit(gpu, uploads, commands, passes);
             if let Some(readback) = tick_readback.take() {
@@ -425,18 +424,18 @@ fn for_frame(uploads: FrameUploads, drawing: bool) -> FrameUploads {
     }
 }
 
-/// Encodes reading a frame's `marks` back into `frame` with `timer`, after its last pass.
+/// Encodes reading a frame's `stamps` back into `frame` with `timer`, after its last pass.
 ///
-/// Leaves `marks` off; `None` if not timed (no timer). A frame whose readback can't be made is
+/// Leaves `stamps` off; `None` if not timed (no timer). A frame whose readback can't be made is
 /// not timed; it draws the same.
-fn finish_marks(
+fn finish_stamps(
     timer: Option<&mut GpuTimer>,
     gpu: &Gpu,
     frame: &mut CommandEncoder,
-    marks: &mut Marks,
+    stamps: &mut Stamps,
 ) -> Option<TimedFrame> {
-    let marked = std::mem::replace(marks, Marks::off());
-    timer?.finish(gpu, frame, marked).ok().flatten()
+    let stamped = std::mem::replace(stamps, Stamps::off());
+    timer?.finish(gpu, frame, stamped).ok().flatten()
 }
 
 /// How a frame shows its scene: its look, and its size (a scene shaded again must be of it).
@@ -468,8 +467,8 @@ impl Showing {
 /// Encodes `scene` with `passes` into `frame`, after the uploads; `None` for no scene.
 ///
 /// The scene is drawn or shaded again, with its accumulation as `aa` decides, and the image the
-/// frame shows ([`Showing::look`]) is bound for the tone map or the debug view. `marks` times the
-/// phases on the GPU: each phase encoded is marked at its end.
+/// frame shows ([`Showing::look`]) is bound for the tone map or the debug view. `stamps` times
+/// the phases' passes on the GPU.
 ///
 /// A scene drawn is always shaded, the debug view or not, so the shading pass's view and bind
 /// groups are the last scene's when a later frame shades it again.
@@ -486,7 +485,7 @@ fn encode_scene(
     passes: &mut FramePasses,
     (view, tone, aa): (&mut VisibilityView, &mut ToneMap, &mut AaState),
     showing: Showing,
-    marks: &mut Marks,
+    stamps: &mut Stamps,
 ) -> Option<Result<EncodedScene, FrameError>> {
     let shaded = showing.look.view == SceneView::Shaded;
     let encoded = match scene {
@@ -499,13 +498,11 @@ fn encode_scene(
                 AaFrame::Accumulate { jitter, .. } => jitter,
                 AaFrame::Plain | AaFrame::Filter | AaFrame::Show => Jitter::CENTRE,
             };
-            let readback = passes.encode_marked(gpu, frame, scene, jitter, marks)?;
-            passes.encode_shading(gpu, frame, scene)?;
-            marks.end(frame, GpuPhase::Shade);
+            let readback = passes.encode_stamped(gpu, frame, scene, jitter, stamps)?;
+            passes.encode_shading_stamped(gpu, frame, scene, stamps)?;
             let tree = Some(scene.tree);
-            let (step, mut report) =
-                accumulate(gpu, frame, passes, aa, step, (tree, Some(scene.bounds)));
-            marks.end(frame, GpuPhase::Accumulate);
+            let changes = (tree, Some(scene.bounds));
+            let (step, mut report) = accumulate(gpu, frame, passes, aa, step, changes, stamps);
             report.filtered_instead |= shaded && still && !accumulable;
             let encoded = EncodedScene {
                 readback,
@@ -532,14 +529,12 @@ fn encode_scene(
             let (visible, step, mut report) = match step {
                 AaFrame::Show => (passes.aa().mean().is_some(), step, AaReport::default()),
                 AaFrame::Accumulate { .. } | AaFrame::Filter => {
-                    let again = passes.encode_shading_again(gpu, frame)?;
-                    marks.end(frame, GpuPhase::Shade);
+                    let again = passes.encode_shading_again_stamped(gpu, frame, stamps)?;
                     let (step, report) = if again {
-                        accumulate(gpu, frame, passes, aa, step, (None, None))
+                        accumulate(gpu, frame, passes, aa, step, (None, None), stamps)
                     } else {
                         (step, AaReport::default())
                     };
-                    marks.end(frame, GpuPhase::Accumulate);
                     (again, step, report)
                 }
                 AaFrame::Plain => (true, step, AaReport::default()),
@@ -553,7 +548,7 @@ fn encode_scene(
             Ok((encoded, step))
         })(),
     };
-    Some(encoded.and_then(|(encoded, step)| {
+    let shown = encoded.and_then(|(encoded, step)| {
         if encoded.shown {
             if shaded {
                 bind_shaded(gpu, passes, tone, step, showing.clear)?;
@@ -562,7 +557,12 @@ fn encode_scene(
             }
         }
         Ok(encoded)
-    }))
+    });
+    if shown.is_err() {
+        // Encoded part way: a pass may have taken stamps it never wrote.
+        stamps.abandon();
+    }
+    Some(shown)
 }
 
 /// Encodes the accumulation of the frame just shaded, if `step` accumulates; returns the step
@@ -571,6 +571,7 @@ fn encode_scene(
 /// It reads `inputs`: the tile tree's buffer and the tiles whose data changed (`None` for the
 /// last tree, and none). A refusal never fails the frame: the histories are dropped (`aa`
 /// restarts next time) and the frame is filtered instead.
+/// `stamps` times its pass.
 fn accumulate(
     gpu: &Gpu,
     frame: &mut CommandEncoder,
@@ -578,11 +579,12 @@ fn accumulate(
     aa: &mut AaState,
     step: AaFrame,
     (tree, changes): (Option<&Buffer>, Option<&BoundsUpdate>),
+    stamps: &mut Stamps,
 ) -> (AaFrame, AaReport) {
     let AaFrame::Accumulate { restart, .. } = step else {
         return (step, AaReport::default());
     };
-    match passes.encode_accumulation(gpu, frame, tree, changes, restart) {
+    match passes.encode_accumulation(gpu, frame, (tree, changes), restart, stamps) {
         Ok(restarted) => (
             step,
             AaReport {

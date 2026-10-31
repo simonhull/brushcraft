@@ -25,9 +25,10 @@
 //!   uploads, then the render thread's encode and submit; and those phases, with the owner's upkeep
 //!   and jobs (after the hand-off) and the render thread's acquire and present, each `<phase>_ms`;
 //! - `gpu_ms`: the whole frame on the GPU, and each of its phases ([`GpuPhase`]) as
-//!   `gpu_<phase>_ms` (`null` for a phase the frame didn't run);
+//!   `gpu_<phase>_ms`, the sum of its passes (`null` for a phase the frame didn't run, or whose
+//!   timestamps the GPU didn't write);
 //! - `lod_<stage>_ms`: the level choice's own stages, timed by its queries (bounds, choose, relax,
-//!   sweep, emit, post);
+//!   sweep, emit, post; 0 for a stage that didn't run: the bounds, with no tile changed);
 //! - from the frame's cut: `drawn` (whether it came back), `triangles`, `cut`, `tiles_per_level`
 //!   (the cut's tiles at each level from 0), `over_budget` (tiles in view left over 1 px, the
 //!   spec's count), `waiting`, `budget_limited` and `held_by_neighbours` (why), `shortfall`,

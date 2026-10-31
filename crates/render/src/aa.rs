@@ -122,6 +122,7 @@ use crate::draw::{Look, SceneView};
 use crate::gpu::{Gpu, GpuError};
 use crate::raster::{MORPH_WGSL, Raster};
 use crate::surface::Size;
+use crate::timing::{GpuPhase, Stamps};
 use crate::tree::NODE_WGSL;
 
 #[cfg(test)]
@@ -591,11 +592,14 @@ impl Accumulation {
     ///
     /// [`AaError::TooLarge`] if the image's histories don't fit a binding; [`AaError::Gpu`] if
     /// a buffer or bind group is refused. With no tree given yet, nothing is encoded.
+    ///
+    /// `stamps` times the pass ([`crate::timing`]).
     pub(crate) fn encode(
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
         inputs: &AccumulateInputs<'_>,
+        stamps: &mut Stamps,
     ) -> Result<bool, AaError> {
         if let Some(tree) = inputs.tree {
             self.tree = Some(tree.clone());
@@ -632,7 +636,7 @@ impl Accumulation {
         let (node_group, pixel_group) = self.groups(gpu, &tree, inputs, history)?;
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("aa"),
-            timestamp_writes: None,
+            timestamp_writes: stamps.compute(GpuPhase::Accumulate),
         });
         pass.set_bind_group(0, &node_group, &[]);
         if marks > 0 {

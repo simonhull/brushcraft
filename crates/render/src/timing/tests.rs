@@ -1,54 +1,136 @@
-//! A frame's phases from its marks' ticks, with no GPU; the GPU run is in `draw`'s tests.
+//! A frame's phases from its passes' ticks, with no GPU; the GPU run is in `draw`'s tests.
 
 use super::*;
 
-/// The marks of a frame that drew a scene, in the order `Renderer::draw` writes them.
-fn scene_marks() -> Vec<Mark> {
-    let ends = GpuPhase::ALL.map(Mark::End);
-    std::iter::once(Mark::Start).chain(ends).collect()
+/// Nanoseconds.
+const fn ns(nanos: u64) -> Duration {
+    Duration::from_nanos(nanos)
+}
+
+/// The frame's own ticks `own`, and none of the level choice's.
+fn own(own: &[u64]) -> Ticks<'_> {
+    Ticks { own, lod: &[] }
 }
 
 #[test]
-fn each_phase_runs_from_the_mark_before_its_own() {
-    let marks = scene_marks();
-    let ticks = [100, 110, 130, 160, 200, 250, 310, 380, 460];
-    let times = GpuTimes::from_ticks(9, &marks, &ticks, 1.0).unwrap();
-    assert_eq!(times.frame(), 9);
-    let ns = Duration::from_nanos;
-    let wanted = [10, 20, 30, 40, 50, 60, 70, 80];
-    for (phase, took) in GpuPhase::ALL.into_iter().zip(wanted) {
-        assert_eq!(times.phase(phase), Some(ns(took)), "{phase:?}");
-    }
-    assert_eq!(times.total(), ns(360), "first to last");
-}
-
-#[test]
-fn ticks_scale_by_the_period_and_phases_not_run_are_absent() {
-    // A frame with no scene: its uploads, then the overlay.
-    let marks = [
-        Mark::Start,
-        Mark::End(GpuPhase::Uploads),
-        Mark::End(GpuPhase::Tone),
+fn a_phase_is_the_sum_of_its_passes_and_the_gaps_its_copies_sit_in() {
+    use GpuPhase::{Raster, Readback, Shade, Uploads};
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Between(Uploads),
+        Span::Pass(Raster, Pair::Own(2)),
+        Span::Pass(Raster, Pair::Own(4)),
+        Span::Between(Readback),
+        Span::Pass(Shade, Pair::Own(6)),
     ];
-    let times = GpuTimes::from_ticks(1, &marks, &[0, 4, 10], 2.5).unwrap();
+    // Start 100–110; raster 130–160 and 170–200; shade 230–300.
+    let ticks = [100, 110, 130, 160, 170, 200, 230, 300];
+    let times = GpuTimes::from_ticks(9, &spans, own(&ticks), 1.0).unwrap();
+    assert_eq!(times.frame(), 9);
     assert_eq!(
-        times.phase(GpuPhase::Uploads),
-        Some(Duration::from_nanos(10))
+        times.phase(Uploads),
+        Some(ns(20)),
+        "start's end to raster's beginning"
     );
-    assert_eq!(times.phase(GpuPhase::Tone), Some(Duration::from_nanos(15)));
-    assert_eq!(times.phase(GpuPhase::Raster), None, "not run");
-    assert_eq!(times.total(), Duration::from_nanos(25));
+    assert_eq!(
+        times.phase(Raster),
+        Some(ns(60)),
+        "both its passes, not the gap"
+    );
+    assert_eq!(
+        times.phase(Readback),
+        Some(ns(30)),
+        "raster's end to shade's beginning"
+    );
+    assert_eq!(times.phase(Shade), Some(ns(70)));
+    assert_eq!(times.phase(GpuPhase::Tone), None, "not run");
+    assert_eq!(times.total(), ns(200), "first stamp to last");
+    let sum: Duration = GpuPhase::ALL.iter().filter_map(|&p| times.phase(p)).sum();
+    let left = times.total().checked_sub(sum);
+    assert_eq!(
+        left,
+        Some(ns(20)),
+        "the start and the gap between the raster passes"
+    );
 }
 
 #[test]
-fn too_few_marks_or_mismatched_ticks_time_nothing() {
-    assert_eq!(GpuTimes::from_ticks(1, &[Mark::Start], &[5], 1.0), None);
-    let marks = scene_marks();
-    assert_eq!(GpuTimes::from_ticks(1, &marks, &[1, 2, 3], 1.0), None);
-    // A timestamp that goes backwards (a reset between them) reads as zero, never wraps.
-    let back = [Mark::Start, Mark::End(GpuPhase::Shade)];
-    let times = GpuTimes::from_ticks(1, &back, &[50, 40], 1.0).unwrap();
-    assert_eq!(times.phase(GpuPhase::Shade), Some(Duration::ZERO));
+fn ticks_scale_by_the_period_and_borrowed_stamps_read_the_level_choice_s_ticks() {
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Pass(GpuPhase::LevelChoice, Pair::Lod(2)),
+        Span::Pass(GpuPhase::LevelChoice, Pair::Lod(4)),
+        Span::Pass(GpuPhase::Tone, Pair::Own(2)),
+    ];
+    let ticks = Ticks {
+        own: &[10, 12, 40, 44],
+        lod: &[1, 1, 20, 25, 30, 38],
+    };
+    let times = GpuTimes::from_ticks(1, &spans, ticks, 2.5).unwrap();
+    assert_eq!(
+        times.phase(GpuPhase::LevelChoice),
+        Some(ns(32)),
+        "(5 + 8) × 2.5, rounded down"
+    );
+    assert_eq!(times.phase(GpuPhase::Tone), Some(ns(10)));
+    assert_eq!(times.total(), ns(85));
+}
+
+#[test]
+fn an_unwritten_stamp_leaves_its_phase_and_the_gaps_beside_it_absent() {
+    use GpuPhase::{Raster, Readback, Shade, Uploads};
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Between(Uploads),
+        Span::Pass(Raster, Pair::Own(2)),
+        Span::Pass(Raster, Pair::Own(4)),
+        Span::Between(Readback),
+        Span::Pass(Shade, Pair::Own(6)),
+    ];
+    // The second raster pass's end is Metal's error value: never written.
+    let ticks = [100, 110, 130, 160, 170, u64::MAX, 230, 300];
+    let times = GpuTimes::from_ticks(1, &spans, own(&ticks), 1.0).unwrap();
+    assert_eq!(times.phase(Uploads), Some(ns(20)));
+    assert_eq!(times.phase(Raster), None, "half its passes isn't its time");
+    assert_eq!(times.phase(Readback), None, "a gap needs both sides");
+    assert_eq!(times.phase(Shade), Some(ns(70)));
+    assert_eq!(times.total(), ns(200));
+    // Zero is no time either, and a frame with no stamp written isn't timed at all.
+    let zeros = [0; 8];
+    assert_eq!(GpuTimes::from_ticks(1, &spans, own(&zeros), 1.0), None);
+    assert_eq!(
+        GpuTimes::from_ticks(1, &spans, own(&[1, 2]), 1.0)
+            .unwrap()
+            .total(),
+        ns(1)
+    );
+    assert_eq!(GpuTimes::from_ticks(1, &[], own(&ticks), 1.0), None);
+}
+
+#[test]
+fn a_pass_that_ends_before_it_begins_is_unwritten_and_a_gap_never_goes_negative() {
+    let spans = [
+        Span::Pass(GpuPhase::Raster, Pair::Own(0)),
+        Span::Between(GpuPhase::Readback),
+        Span::Pass(GpuPhase::Shade, Pair::Own(2)),
+        Span::Pass(GpuPhase::Tone, Pair::Own(4)),
+    ];
+    // Shade begins before raster ends (passes overlap on a tile-based GPU); tone runs backwards.
+    let ticks = [100, 200, 150, 260, 300, 290];
+    let times = GpuTimes::from_ticks(1, &spans, own(&ticks), 1.0).unwrap();
+    assert_eq!(times.phase(GpuPhase::Readback), Some(Duration::ZERO));
+    assert_eq!(times.phase(GpuPhase::Shade), Some(ns(110)));
+    assert_eq!(times.phase(GpuPhase::Tone), None);
+    assert_eq!(times.total(), ns(160), "earliest stamp to latest written");
+}
+
+#[test]
+fn stamps_off_give_and_note_nothing() {
+    let mut stamps = Stamps::off();
+    assert!(stamps.compute(GpuPhase::Shade).is_none());
+    assert!(stamps.render(GpuPhase::Tone).is_none());
+    stamps.between(GpuPhase::Readback);
+    assert_eq!(stamps.spans, []);
 }
 
 #[test]
@@ -60,4 +142,11 @@ fn phase_names_are_distinct_record_words() {
             .iter()
             .all(|name| name.bytes().all(|b| b.is_ascii_lowercase()))
     );
+}
+
+#[test]
+fn the_level_choice_s_ticks_start_at_a_resolve_s_alignment_after_the_frame_s_own() {
+    assert_eq!(LOD_AT % wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT, 0);
+    assert!(LOD_AT >= u64::from(CAPACITY) * u64::from(QUERY_SIZE));
+    assert_eq!(BYTES % 8, 0);
 }

@@ -107,6 +107,7 @@ use crate::raster::{
     MORPH_WGSL, PLACE_WGSL, QUAD_WGSL, Raster, RasterError, slot_group, slot_source,
 };
 use crate::residency::{SlotLayout, Tier};
+use crate::timing::{GpuPhase, Stamps};
 use crate::tree::NODE_WGSL;
 use crate::upload::{VERTEX_BYTES, VERTEX_WGSL};
 
@@ -428,7 +429,7 @@ impl<M: Material> Shade<M> {
 
     /// Encodes the pass over `scene`'s visibility buffer, after the raster's draws in the same
     /// submission (the settings go through the queue: one pass a submission), and keeps its bind
-    /// groups for [`Shade::encode_again`].
+    /// groups for [`Shade::encode_again`]. `stamps` times the pass ([`crate::timing`]).
     ///
     /// # Errors
     ///
@@ -439,6 +440,7 @@ impl<M: Material> Shade<M> {
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
         scene: &ShadeScene<'_>,
+        stamps: &mut Stamps,
     ) -> Result<(), ShadeError> {
         let visibility = scene.raster.visibility();
         let size = (visibility.width(), visibility.height());
@@ -477,13 +479,14 @@ impl<M: Material> Shade<M> {
             size,
             basis,
         });
-        self.encode_again(gpu, encoder)?;
+        self.encode_again(gpu, encoder, stamps)?;
         Ok(())
     }
 
     /// Encodes the pass again over the visibility buffer last shaded, with the settings and
     /// material as they are now: the shading alone, no raster (a material or wireframe change
-    /// with the scene unchanged). Returns whether there was a scene to shade.
+    /// with the scene unchanged). Returns whether there was a scene to shade. `stamps` times the
+    /// pass.
     ///
     /// # Errors
     ///
@@ -492,6 +495,7 @@ impl<M: Material> Shade<M> {
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
+        stamps: &mut Stamps,
     ) -> Result<bool, ShadeError> {
         let Some(bound) = &self.bound else {
             return Ok(false);
@@ -524,7 +528,7 @@ impl<M: Material> Shade<M> {
             Pipeline::Compute(pipeline) => {
                 let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                     label: Some("shade"),
-                    timestamp_writes: None,
+                    timestamp_writes: stamps.compute(GpuPhase::Shade),
                 });
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &bound.frame, &[]);
@@ -549,6 +553,7 @@ impl<M: Material> Shade<M> {
                             store: StoreOp::Store,
                         },
                     })],
+                    timestamp_writes: stamps.render(GpuPhase::Shade),
                     ..RenderPassDescriptor::default()
                 });
                 pass.set_pipeline(pipeline);

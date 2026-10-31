@@ -103,7 +103,9 @@ pub(crate) fn shade_frame(
         raster,
         view,
     };
-    shade.encode(gpu, &mut encoder, &scene).expect("encoded");
+    shade
+        .encode(gpu, &mut encoder, &scene, &mut Stamps::off())
+        .expect("encoded");
     gpu.queue().submit([encoder.finish()]);
     finish(gpu);
 }
@@ -553,7 +555,8 @@ fn a_material_or_wireframe_change_is_a_shading_pass_alone() {
                 .device()
                 .create_command_encoder(&CommandEncoderDescriptor::default());
             assert!(
-                pass.encode_again(gpu, &mut encoder).expect("encoded"),
+                pass.encode_again(gpu, &mut encoder, &mut Stamps::off())
+                    .expect("encoded"),
                 "a scene"
             );
             gpu.queue().submit([encoder.finish()]);
@@ -619,7 +622,11 @@ fn shading_again_with_nothing_shaded_does_nothing() {
         let mut encoder = gpu
             .device()
             .create_command_encoder(&CommandEncoderDescriptor::default());
-        assert!(!shade.encode_again(gpu, &mut encoder).expect("encoded"));
+        assert!(
+            !shade
+                .encode_again(gpu, &mut encoder, &mut Stamps::off())
+                .expect("encoded")
+        );
         assert!(shade.target().is_none(), "no target yet");
     });
 }

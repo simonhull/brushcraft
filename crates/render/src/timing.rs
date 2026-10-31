@@ -1,14 +1,46 @@
 //! How long a frame's phases take on the GPU, by timestamp queries, read back without waiting.
 //!
-//! A frame is timed by **marks**: a timestamp written between two of its phases
-//! (`Marks::mark`), so a phase's time is the time between the mark before it and its own. A
-//! mark is an empty compute pass whose only work is its beginning-of-pass timestamp, which needs
-//! only [`wgpu::Features::TIMESTAMP_QUERY`] (timestamps at pass boundaries; Apple GPUs have no
-//! others), never `TIMESTAMP_QUERY_INSIDE_ENCODERS`, and leaves every pass's own code alone. On
-//! Vulkan the timestamp is written at the bottom of the pipe, once all the work before it is
-//! done, so the time between two marks is the work between them, gaps included.
+//! A frame is timed by its **passes**: each compute or render pass of a phase carries a pair of
+//! timestamps, written at its beginning and its end through the pass's own `timestamp_writes`
+//! (`Stamps::compute`, `Stamps::render`), and a phase's time is the sum of its passes'. Work
+//! that is no pass (the copies of the uploads and of the cut's readback) is timed by the gap it
+//! sits in: from the end of the pass before it to the beginning of the pass after
+//! (`Stamps::between`). A frame starts with a pass of its own (`Stamps::start`), a single
+//! one-thread dispatch, so the uploads' copies have a pass before them. A phase's time thus
+//! leaves out what lies between passes and is no phase's (barriers, the level choice's small
+//! copy), so the phases sum to a little less than the frame's total: on lavapipe, which sets
+//! each pass up on the CPU between them, about 8 % less.
 //!
-//! Each timed frame resolves its marks into a readback buffer of a small ring, mapped once the
+//! The pass-boundary timestamps need only [`wgpu::Features::TIMESTAMP_QUERY`], never
+//! `TIMESTAMP_QUERY_INSIDE_ENCODERS`, and they are the only kind every backend writes:
+//!
+//! - **Vulkan** (wgpu-hal 30, `vulkan/command.rs`) writes both with `vkCmdWriteTimestamp` at
+//!   `BOTTOM_OF_PIPE`: the beginning once all earlier work is done, the end once the pass's is.
+//!   Passes in one queue don't overlap, so the phases and gaps tile the frame.
+//! - **Metal** (`metal/command.rs`) turns them into the pass descriptor's sample buffer
+//!   attachments, sampled at stage boundaries (`MTLCounterSamplingPoint::AtStageBoundary`, the only
+//!   point Apple GPUs offer): a compute pass's start and end of encoder, a render pass's start of
+//!   vertex and end of fragment. An encoder with no work writes nothing: wgpu's own notes on blit
+//!   encoders say so, and on an Apple M4 the earlier design, an empty compute pass whose beginning
+//!   marked the boundary between phases, read zero or the same tick in every frame. So every
+//!   stamped pass here does work, the start pass included. An unwritten sample resolves to
+//!   `MTLCounterErrorValue` (all ones); wgpu takes a tick on Apple GPUs as 1 ns. Passes there may
+//!   overlap (the tile-based GPU runs one's vertices beside another's fragments), so a phase's sum
+//!   may exceed its wall time and a gap reads zero; the total is from the earliest stamp to the
+//!   latest.
+//! - **wgpu-core** resets a pass's two queries as the pass begins, and resolves a query not written
+//!   in the same command encoder from what it last held (zero if never written). A frame here
+//!   resolves only queries it wrote.
+//!
+//! A tick of zero or all ones is no time: a pass with one is unwritten, and its phase (and any
+//! gap beside it) is absent rather than wrong.
+//!
+//! The level choice's stage timer ([`crate::lod::Lod::enable_timing`]) stamps the level
+//! choice's passes with its own queries, and a pass takes one pair of timestamps: when it is on,
+//! the frame borrows those stamps (`Stamps::lod`) and resolves the level choice's queries
+//! alongside its own.
+//!
+//! Each timed frame resolves its queries into a readback buffer of a small ring, mapped once the
 //! frame is submitted; whichever thread polls the device next (the app's owner thread, at the
 //! start of its frame) completes the mapping, and [`crate::Renderer::take_timings`] reads every
 //! timed frame that has come back since, tagged with the frame it is of. A frame finds no free
@@ -16,15 +48,15 @@
 //! wrong).
 //!
 //! Without timestamp queries there is no timer (`GpuTimer`): frames are drawn the same, and
-//! their times are absent. The level choice times its own stages with its own queries
-//! ([`crate::lod::Lod::enable_timing`]), read back with its cut.
+//! their times are absent.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use wgpu::{
-    Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePassDescriptor,
-    ComputePassTimestampWrites, MapMode, QUERY_SIZE, QuerySet, QuerySetDescriptor, QueryType,
+    Buffer, BufferAddress, BufferDescriptor, BufferUsages, CommandEncoder, ComputePassDescriptor,
+    ComputePassTimestampWrites, ComputePipeline, MapMode, QUERY_SIZE, QuerySet, QuerySetDescriptor,
+    QueryType, RenderPassTimestampWrites, ShaderSource,
 };
 
 use crate::gpu::{Gpu, GpuError};
@@ -33,7 +65,7 @@ use crate::gpu::{Gpu, GpuError};
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
 
-/// A phase of a frame on the GPU, in the order a frame runs them. Each ends at its mark.
+/// A phase of a frame on the GPU, in the order a frame runs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GpuPhase {
     /// The uploads' copies into tile slots and the tile tree, and the normal pass over the finest
@@ -91,13 +123,66 @@ impl GpuPhase {
     }
 }
 
-/// A mark: the frame's start, or the end of a phase.
+/// Where a pass's pair of timestamps is written: its beginning at the index given, its end at
+/// the next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mark {
-    /// Before anything of the frame.
-    Start,
-    /// After the phase.
-    End(GpuPhase),
+pub(crate) enum Pair {
+    /// The frame's own queries.
+    Own(u32),
+    /// The level choice's stage timer's queries ([`Stamps::lod`]).
+    Lod(u32),
+}
+
+/// A stretch of a frame on the GPU, in the order encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Span {
+    /// The frame's start pass: no phase's, the beginning of the frame's total.
+    Start(Pair),
+    /// A pass of a phase, from its beginning to its end.
+    Pass(GpuPhase, Pair),
+    /// Work of a phase that is no pass: from the end of the pass before to the beginning of the
+    /// pass after.
+    Between(GpuPhase),
+}
+
+impl Span {
+    /// Its pass's timestamps; `None` for work between passes.
+    const fn pair(self) -> Option<Pair> {
+        match self {
+            Self::Start(pair) | Self::Pass(_, pair) => Some(pair),
+            Self::Between(_) => None,
+        }
+    }
+}
+
+/// A frame's resolved ticks: its own queries' and, when it borrowed the level choice's stamps,
+/// the level choice's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ticks<'a> {
+    /// The frame's own, by query index.
+    pub(crate) own: &'a [u64],
+    /// The level choice's, by query index.
+    pub(crate) lod: &'a [u64],
+}
+
+impl Ticks<'_> {
+    /// The beginning and end of the pass stamped at `pair`; `None` if either is no time (zero,
+    /// or Metal's all-ones error value: never written) or the end is before the beginning.
+    fn of(self, pair: Pair) -> Option<(u64, u64)> {
+        let (ticks, at) = match pair {
+            Pair::Own(at) => (self.own, at),
+            Pair::Lod(at) => (self.lod, at),
+        };
+        let at = usize::try_from(at).ok()?;
+        let tick = |index: usize| {
+            ticks
+                .get(index)
+                .copied()
+                .filter(|&tick| tick != 0 && tick != u64::MAX)
+        };
+        let (begin, end) = (tick(at)?, tick(at.checked_add(1)?)?);
+        (end >= begin).then_some((begin, end))
+    }
 }
 
 /// One frame's times on the GPU.
@@ -105,7 +190,7 @@ pub(crate) enum Mark {
 pub struct GpuTimes {
     /// The frame they are of.
     frame: u64,
-    /// From the frame's first mark to its last.
+    /// From the frame's first timestamp to its last.
     total: Duration,
     /// Each phase's time, by [`GpuPhase::ALL`]'s order; `None` for a phase the frame didn't run.
     phases: [Option<Duration>; GpuPhase::ALL.len()],
@@ -118,48 +203,90 @@ impl GpuTimes {
         self.frame
     }
 
-    /// From the frame's first mark to its last: the whole frame's GPU time.
+    /// From the frame's first timestamp to its last: the whole frame's GPU time.
     #[must_use]
     pub const fn total(&self) -> Duration {
         self.total
     }
 
-    /// How long `phase` took; `None` if the frame didn't run it.
+    /// How long `phase` took: the sum of its passes and the gaps its work between passes sits
+    /// in; `None` if the frame didn't run it, or a timestamp of it wasn't written.
     #[must_use]
     pub fn phase(&self, phase: GpuPhase) -> Option<Duration> {
         self.phases.get(phase.index()).copied().flatten()
     }
 
-    /// The times of frame `frame` from its `marks`, in the order written, and their `ticks`, one
-    /// each, a tick `period` nanoseconds: each phase runs from the mark before its own. `None`
-    /// with fewer than two marks (nothing between them), or with a tick count that isn't the
-    /// marks'.
+    /// The times of frame `frame` from its `spans`, in the order encoded, and their `ticks`, a
+    /// tick `period` nanoseconds. `None` if no pass of it has its timestamps.
     pub(crate) fn from_ticks(
         frame: u64,
-        marks: &[Mark],
-        ticks: &[u64],
+        spans: &[Span],
+        ticks: Ticks<'_>,
         period: f32,
     ) -> Option<Self> {
-        if marks.len() < 2 || ticks.len() != marks.len() {
-            return None;
-        }
+        // Per span, `None` for a gap, else its pass's stamps if written.
+        let stamped: Vec<Option<Option<(u64, u64)>>> = spans
+            .iter()
+            .map(|span| span.pair().map(|pair| ticks.of(pair)))
+            .collect();
         let mut times = Self {
             frame,
             ..Self::default()
         };
-        let steps = marks.iter().zip(ticks).skip(1).zip(ticks);
-        for ((mark, &end), &begin) in steps {
-            if let Mark::End(phase) = mark
-                && let Some(slot) = times.phases.get_mut(phase.index())
-            {
-                let took = ticks_to_duration(end.saturating_sub(begin), period);
-                *slot = Some(slot.unwrap_or_default() + took);
+        let mut unwritten = [false; GpuPhase::ALL.len()];
+        let mut add = |phase: GpuPhase, took: Option<u64>| {
+            let index = phase.index();
+            match took {
+                Some(took) => {
+                    if let Some(slot) = times.phases.get_mut(index) {
+                        *slot = Some(slot.unwrap_or_default() + ticks_to_duration(took, period));
+                    }
+                }
+                None => {
+                    if let Some(flag) = unwritten.get_mut(index) {
+                        *flag = true;
+                    }
+                }
+            }
+        };
+        for (index, span) in spans.iter().enumerate() {
+            match *span {
+                Span::Start(_) => {}
+                Span::Pass(phase, _) => {
+                    let took = stamped.get(index).copied().flatten().flatten();
+                    add(phase, took.map(|(begin, end)| end - begin));
+                }
+                Span::Between(phase) => {
+                    let (before, after) = stamped.split_at(index.min(stamped.len()));
+                    let before = nearest_pass(before.iter().rev());
+                    let after = nearest_pass(after.iter().skip(1));
+                    let gap = before
+                        .zip(after)
+                        .map(|((_, end), (begin, _))| begin.saturating_sub(end));
+                    add(phase, gap);
+                }
             }
         }
-        let (first, last) = (ticks.first()?, ticks.last()?);
-        times.total = ticks_to_duration(last.saturating_sub(*first), period);
+        let flags = unwritten.iter().zip(&mut times.phases);
+        for (&missing, slot) in flags {
+            if missing {
+                *slot = None;
+            }
+        }
+        let written = stamped.iter().flatten().flatten();
+        let first = written.clone().map(|&(begin, _)| begin).min()?;
+        let last = written.map(|&(_, end)| end).max()?;
+        times.total = ticks_to_duration(last - first, period);
         Some(times)
     }
+}
+
+/// The first pass's stamps among `stamped` (per span, `None` for a gap), walked outward from a
+/// gap; `None` if there is no pass, or its stamps weren't written.
+fn nearest_pass<'a>(
+    mut stamped: impl Iterator<Item = &'a Option<Option<(u64, u64)>>>,
+) -> Option<(u64, u64)> {
+    stamped.find_map(|span| *span).flatten()
 }
 
 /// `ticks` timestamp ticks of `period` nanoseconds each, as a duration.
@@ -174,23 +301,41 @@ pub(crate) fn ticks_to_duration(ticks: u64, period: f32) -> Duration {
     Duration::from_nanos(nanos)
 }
 
-/// The most marks a frame writes: the start and every phase's end, with room to spare.
-const CAPACITY: u32 = 16;
+/// The most of its own queries a frame writes: two a pass, with room to spare (a frame drawing
+/// its scene stamps 16 passes).
+const CAPACITY: u32 = 64;
+
+/// The most of the level choice's queries a frame resolves.
+const LOD_CAPACITY: u32 = 16;
+
+/// Where the level choice's ticks start in the resolved and readback buffers: after the
+/// frame's own, at a query resolve's alignment.
+const LOD_AT: BufferAddress = {
+    let own = CAPACITY as BufferAddress * QUERY_SIZE as BufferAddress;
+    own.next_multiple_of(wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT)
+};
+
+/// Bytes of the resolved and readback buffers.
+const BYTES: BufferAddress = LOD_AT + LOD_CAPACITY as BufferAddress * QUERY_SIZE as BufferAddress;
 
 /// Readback buffers in the ring: one frame is drawn at a time, read back a frame or two later.
 const RING: usize = 4;
 
+/// The start pass's shader: one thread that does nothing, so the pass has work and every
+/// backend writes its timestamps.
+const START_WGSL: &str = "@compute @workgroup_size(1) fn start() {}";
+
 /// A timed frame's readback buffer, on its way back to the timer.
 #[derive(Debug)]
 enum Returned {
-    /// Mapped: the ticks of frame `frame`'s `marks`, in order.
+    /// Mapped: the ticks of frame `frame`'s `spans`.
     Mapped {
         /// The buffer, mapped.
         buffer: Buffer,
         /// The frame it is of.
         frame: u64,
-        /// The marks it holds the ticks of, in order.
-        marks: Vec<Mark>,
+        /// The spans it holds the ticks of, in order.
+        spans: Vec<Span>,
     },
     /// Never submitted: free again, nothing to read.
     Unread(Buffer),
@@ -198,13 +343,15 @@ enum Returned {
     Failed,
 }
 
-/// Times frames on the GPU by timestamp queries: the queries every frame writes its marks into,
-/// and the ring of buffers they are read back through.
+/// Times frames on the GPU by timestamp queries: the queries every frame's passes write, the
+/// start pass, and the ring of buffers they are read back through.
 #[derive(Debug)]
 pub(crate) struct GpuTimer {
-    /// The marks' queries, reused by every frame.
+    /// The frame's own queries, reused by every frame.
     queries: QuerySet,
-    /// Where a frame's queries are resolved.
+    /// The start pass's pipeline.
+    start: ComputePipeline,
+    /// Where a frame's queries are resolved: its own, then the level choice's at [`LOD_AT`].
     resolved: Buffer,
     /// Readback buffers free.
     free: Vec<Buffer>,
@@ -225,7 +372,8 @@ impl GpuTimer {
     ///
     /// # Errors
     ///
-    /// As [`Gpu::scoped`], if the queries or their buffer can't be made.
+    /// As [`Gpu::scoped`], if the queries or their buffer can't be made; as
+    /// [`Gpu::compute_pipeline`] for the start pass.
     pub(crate) fn new(gpu: &Gpu) -> Result<Option<Self>, GpuError> {
         let Some(period) = gpu.timestamp_period() else {
             return Ok(None);
@@ -239,15 +387,21 @@ impl GpuTimer {
             });
             let resolved = device.create_buffer(&BufferDescriptor {
                 label: Some("frame timestamps resolved"),
-                size: u64::from(CAPACITY * QUERY_SIZE),
+                size: BYTES,
                 usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
             (queries, resolved)
         })?;
+        let start = gpu.compute_pipeline(
+            "frame timer start",
+            ShaderSource::Wgsl(START_WGSL.into()),
+            "start",
+        )?;
         let (done, returned) = mpsc::channel();
         Ok(Some(Self {
             queries,
+            start,
             resolved,
             free: Vec::new(),
             made: 0,
@@ -258,18 +412,24 @@ impl GpuTimer {
         }))
     }
 
-    /// The marks of frame `frame`, to write as it is encoded.
-    pub(crate) fn begin(&self, frame: u64) -> Marks {
-        Marks {
-            queries: Some(self.queries.clone()),
-            written: Vec::new(),
+    /// The stamps of frame `frame`, to give its passes as it is encoded.
+    pub(crate) fn begin(&self, frame: u64) -> Stamps {
+        Stamps {
+            on: Some(On {
+                queries: self.queries.clone(),
+                start: self.start.clone(),
+                used: 0,
+                lod: None,
+                overflowed: false,
+            }),
+            spans: Vec::new(),
             frame,
         }
     }
 
-    /// Encodes reading `marks` back, after the last of them: `None` if they are too few to time
-    /// anything, or every readback buffer is in flight. Call [`TimedFrame::submitted`] once the
-    /// frame is submitted.
+    /// Encodes reading `stamps` back, after the last of their passes: `None` if they time no
+    /// pass, ran out of queries, or every readback buffer is in flight. Call
+    /// [`TimedFrame::submitted`] once the frame is submitted.
     ///
     /// # Errors
     ///
@@ -278,20 +438,20 @@ impl GpuTimer {
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
-        marks: Marks,
+        stamps: Stamps,
     ) -> Result<Option<TimedFrame>, GpuError> {
         self.take_back();
-        let count = u32::try_from(marks.written.len()).unwrap_or(u32::MAX);
-        if count < 2 || marks.queries.is_none() {
+        let Stamps { on, spans, frame } = stamps;
+        let Some(on) = on.filter(|on| !on.overflowed && on.used > 0) else {
             return Ok(None);
-        }
+        };
         let buffer = match self.free.pop() {
             Some(buffer) => buffer,
             None if self.made < RING => {
                 let buffer = gpu.scoped("frame timestamps readback", || {
                     gpu.device().create_buffer(&BufferDescriptor {
                         label: Some("frame timestamps readback"),
-                        size: u64::from(CAPACITY * QUERY_SIZE),
+                        size: BYTES,
                         usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
                         mapped_at_creation: false,
                     })
@@ -301,13 +461,15 @@ impl GpuTimer {
             }
             None => return Ok(None),
         };
-        let bytes = u64::from(count * QUERY_SIZE);
-        encoder.resolve_query_set(&self.queries, 0..count, &self.resolved, 0);
-        encoder.copy_buffer_to_buffer(&self.resolved, 0, &buffer, 0, bytes);
+        encoder.resolve_query_set(&self.queries, 0..on.used, &self.resolved, 0);
+        if let Some((lod, count)) = &on.lod {
+            encoder.resolve_query_set(lod, 0..*count, &self.resolved, LOD_AT);
+        }
+        encoder.copy_buffer_to_buffer(&self.resolved, 0, &buffer, 0, BYTES);
         Ok(Some(TimedFrame {
             buffer: Some(buffer),
-            frame: marks.frame,
-            marks: marks.written,
+            frame,
+            spans,
             done: self.done.clone(),
         }))
     }
@@ -327,18 +489,22 @@ impl GpuTimer {
                 Returned::Mapped {
                     buffer,
                     frame,
-                    marks,
+                    spans,
                 } => {
-                    let ticks: Option<Vec<u64>> = buffer.get_mapped_range(..).ok().map(|view| {
-                        let bytes = marks.len() * size_of::<u64>();
-                        view.get(..bytes)
-                            .map(bytemuck::pod_collect_to_vec)
-                            .unwrap_or_default()
-                    });
+                    let ticks: Vec<u64> = buffer
+                        .get_mapped_range(..)
+                        .ok()
+                        .and_then(|view| view.get(..).map(bytemuck::pod_collect_to_vec))
+                        .unwrap_or_default();
                     buffer.unmap();
                     self.free.push(buffer);
-                    let read = ticks
-                        .and_then(|ticks| GpuTimes::from_ticks(frame, &marks, &ticks, self.period));
+                    let lod_from =
+                        usize::try_from(LOD_AT / u64::from(QUERY_SIZE)).unwrap_or(usize::MAX);
+                    let ticks = Ticks {
+                        own: ticks.get(..lod_from).unwrap_or_default(),
+                        lod: ticks.get(lod_from..).unwrap_or_default(),
+                    };
+                    let read = GpuTimes::from_ticks(frame, &spans, ticks, self.period);
                     self.ready.extend(read);
                 }
                 Returned::Unread(buffer) => self.free.push(buffer),
@@ -348,59 +514,134 @@ impl GpuTimer {
     }
 }
 
-/// A frame's marks as it is encoded: written into the timer's queries, in order. Marks with no
-/// timer ([`Marks::off`]) write nothing.
+/// A timed frame's queries and start pass, while it is encoded.
 #[derive(Debug)]
-pub(crate) struct Marks {
+struct On {
+    /// The timer's queries.
+    queries: QuerySet,
+    /// The start pass's pipeline.
+    start: ComputePipeline,
+    /// Queries given out, two a pass.
+    used: u32,
+    /// The level choice's queries and how many to resolve, once a pass borrowed its stamps.
+    lod: Option<(QuerySet, u32)>,
+    /// Whether a pass found no queries left: the frame is then not timed.
+    overflowed: bool,
+}
+
+/// A frame's timestamps as it is encoded: a pair for each pass that asks, in order. Stamps with
+/// no timer ([`Stamps::off`]) give none and note nothing.
+#[derive(Debug)]
+pub(crate) struct Stamps {
     /// The timer's queries; `None` when off.
-    queries: Option<QuerySet>,
-    /// The marks written, in order.
-    written: Vec<Mark>,
+    on: Option<On>,
+    /// The frame's spans, in the order encoded.
+    spans: Vec<Span>,
     /// The frame they are of.
     frame: u64,
 }
 
-impl Marks {
-    /// The marks of frame `frame` with `timer` ([`GpuTimer::begin`]), or off without one.
+impl Stamps {
+    /// The stamps of frame `frame` with `timer` ([`GpuTimer::begin`]), or off without one.
     pub(crate) fn of(timer: Option<&GpuTimer>, frame: u64) -> Self {
         timer.map_or_else(Self::off, |timer| timer.begin(frame))
     }
 
-    /// Marks that write nothing: a frame not timed.
+    /// Stamps that write nothing: a frame not timed.
     pub(crate) const fn off() -> Self {
         Self {
-            queries: None,
-            written: Vec::new(),
+            on: None,
+            spans: Vec::new(),
             frame: 0,
         }
     }
 
-    /// Writes `mark` into `encoder`, between passes: an empty compute pass whose beginning
-    /// writes the timestamp. Nothing once the queries are all written, or with no timer.
-    pub(crate) fn mark(&mut self, encoder: &mut CommandEncoder, mark: Mark) {
-        let Some(queries) = &self.queries else {
-            return;
-        };
-        let Ok(index) = u32::try_from(self.written.len()) else {
-            return;
-        };
-        if index >= CAPACITY {
-            return;
+    /// Takes a pair of the frame's own queries for a pass, noted as `span` of it; `None` (and
+    /// the frame not timed) once they run out, or with no timer.
+    fn claim(&mut self, span: impl FnOnce(Pair) -> Span) -> Option<(&QuerySet, u32)> {
+        let on = self.on.as_mut()?;
+        let at = on.used;
+        if on.overflowed || at + 2 > CAPACITY {
+            on.overflowed = true;
+            return None;
         }
-        drop(encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("timestamp mark"),
-            timestamp_writes: Some(ComputePassTimestampWrites {
-                query_set: queries,
-                beginning_of_pass_write_index: Some(index),
-                end_of_pass_write_index: None,
-            }),
-        }));
-        self.written.push(mark);
+        on.used += 2;
+        self.spans.push(span(Pair::Own(at)));
+        Some((&on.queries, at))
     }
 
-    /// The end of `phase`: [`Marks::mark`] with [`Mark::End`].
-    pub(crate) fn end(&mut self, encoder: &mut CommandEncoder, phase: GpuPhase) {
-        self.mark(encoder, Mark::End(phase));
+    /// Encodes the frame's start: a pass of one thread, stamped, before anything else of it.
+    /// The uploads' copies and normal pass come next, before the scene's passes: they are timed
+    /// by the gap after it ([`GpuPhase::Uploads`]).
+    pub(crate) fn start(&mut self, encoder: &mut CommandEncoder) {
+        let Some(pipeline) = self.on.as_ref().map(|on| on.start.clone()) else {
+            return;
+        };
+        let Some((queries, at)) = self.claim(Span::Start) else {
+            return;
+        };
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("frame timer start"),
+            timestamp_writes: Some(ComputePassTimestampWrites {
+                query_set: queries,
+                beginning_of_pass_write_index: Some(at),
+                end_of_pass_write_index: Some(at + 1),
+            }),
+        });
+        pass.set_pipeline(&pipeline);
+        pass.dispatch_workgroups(1, 1, 1);
+        drop(pass);
+        self.between(GpuPhase::Uploads);
+    }
+
+    /// The timestamp writes of a compute pass of `phase`, to encode at once; `None` when off.
+    pub(crate) fn compute(&mut self, phase: GpuPhase) -> Option<ComputePassTimestampWrites<'_>> {
+        let (query_set, at) = self.claim(|pair| Span::Pass(phase, pair))?;
+        Some(ComputePassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(at),
+            end_of_pass_write_index: Some(at + 1),
+        })
+    }
+
+    /// The timestamp writes of a render pass of `phase`, to encode at once; `None` when off.
+    pub(crate) fn render(&mut self, phase: GpuPhase) -> Option<RenderPassTimestampWrites<'_>> {
+        let (query_set, at) = self.claim(|pair| Span::Pass(phase, pair))?;
+        Some(RenderPassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(at),
+            end_of_pass_write_index: Some(at + 1),
+        })
+    }
+
+    /// Notes work of `phase` that is no pass (copies), encoded next: timed by the gap between
+    /// the passes around it.
+    pub(crate) fn between(&mut self, phase: GpuPhase) {
+        if self.on.is_some() {
+            self.spans.push(Span::Between(phase));
+        }
+    }
+
+    /// Notes a pass of `phase` that the level choice's stage timer stamps: its beginning at
+    /// query `at` of `queries`, its end at the next, of the `count` the frame resolves.
+    pub(crate) fn lod(&mut self, phase: GpuPhase, queries: &QuerySet, count: u32, at: u32) {
+        let Some(on) = self.on.as_mut() else {
+            return;
+        };
+        if count > LOD_CAPACITY || at + 2 > count {
+            on.overflowed = true;
+            return;
+        }
+        on.lod.get_or_insert_with(|| (queries.clone(), count));
+        self.spans.push(Span::Pass(phase, Pair::Lod(at)));
+    }
+
+    /// Gives up timing the frame: its encoding failed part way, so a pass may have claimed
+    /// queries it never wrote.
+    pub(crate) fn abandon(&mut self) {
+        if let Some(on) = self.on.as_mut() {
+            on.overflowed = true;
+        }
     }
 }
 
@@ -413,8 +654,8 @@ pub(crate) struct TimedFrame {
     buffer: Option<Buffer>,
     /// The frame.
     frame: u64,
-    /// Its marks, in order.
-    marks: Vec<Mark>,
+    /// Its spans, in order.
+    spans: Vec<Span>,
     /// Where it goes once mapped.
     done: Sender<Returned>,
 }
@@ -429,13 +670,13 @@ impl TimedFrame {
         let back = buffer.clone();
         let done = self.done.clone();
         let frame = self.frame;
-        let marks = std::mem::take(&mut self.marks);
+        let spans = std::mem::take(&mut self.spans);
         buffer.map_async(MapMode::Read, .., move |result| {
             let returned = if result.is_ok() {
                 Returned::Mapped {
                     buffer: back,
                     frame,
-                    marks,
+                    spans,
                 }
             } else {
                 Returned::Failed

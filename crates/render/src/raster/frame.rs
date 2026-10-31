@@ -32,7 +32,7 @@ use crate::lod::{CutReadback, Lod, LodConfig, LodError, MainInputs};
 use crate::material::MatCapStyle;
 use crate::residency::SlotLayout;
 use crate::shade::{Shade, ShadeError, ShadePath, ShadeScene};
-use crate::timing::{GpuPhase, Marks};
+use crate::timing::{GpuPhase, Stamps};
 
 /// Why a frame's passes couldn't be set up or encoded.
 #[derive(Debug, Error)]
@@ -177,7 +177,7 @@ impl FramePasses {
     /// Encodes the accumulation of the frame just shaded ([`crate::aa`]): `changes` names the
     /// tiles whose data changed this frame, `restart` starts every pixel's history again; `tree`
     /// is the tile tree's buffer, `None` for the last one given. Returns whether every pixel's
-    /// history started again.
+    /// history started again. `stamps` times its pass ([`crate::timing`]).
     ///
     /// # Errors
     ///
@@ -187,9 +187,9 @@ impl FramePasses {
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
-        tree: Option<&Buffer>,
-        changes: Option<&BoundsUpdate>,
+        (tree, changes): (Option<&Buffer>, Option<&BoundsUpdate>),
         restart: bool,
+        stamps: &mut Stamps,
     ) -> Result<bool, FrameError> {
         let Some(shaded) = self.shade.target() else {
             return Ok(false);
@@ -201,7 +201,7 @@ impl FramePasses {
             changes,
             restart,
         };
-        Ok(self.aa.encode(gpu, encoder, &inputs)?)
+        Ok(self.aa.encode(gpu, encoder, &inputs, stamps)?)
     }
 
     /// Sets how the shading shows the scene, `look`'s wireframe and MatCap style, the wireframe's
@@ -225,13 +225,29 @@ impl FramePasses {
         encoder: &mut CommandEncoder,
         inputs: &SceneInputs<'_>,
     ) -> Result<(), FrameError> {
+        self.encode_shading_stamped(gpu, encoder, inputs, &mut Stamps::off())
+    }
+
+    /// [`FramePasses::encode_shading`], its pass timed on the GPU by `stamps`
+    /// ([`crate::timing`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`FramePasses::encode_shading`].
+    pub(crate) fn encode_shading_stamped(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        inputs: &SceneInputs<'_>,
+        stamps: &mut Stamps,
+    ) -> Result<(), FrameError> {
         let scene = ShadeScene {
             tree: inputs.tree,
             slots: inputs.slots,
             raster: &self.raster,
             view: inputs.view,
         };
-        Ok(self.shade.encode(gpu, encoder, &scene)?)
+        Ok(self.shade.encode(gpu, encoder, &scene, stamps)?)
     }
 
     /// Encodes the shading pass again over the last visibility buffer shaded, with no raster:
@@ -245,7 +261,22 @@ impl FramePasses {
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
     ) -> Result<bool, FrameError> {
-        Ok(self.shade.encode_again(gpu, encoder)?)
+        self.encode_shading_again_stamped(gpu, encoder, &mut Stamps::off())
+    }
+
+    /// [`FramePasses::encode_shading_again`], its pass timed on the GPU by `stamps`
+    /// ([`crate::timing`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`FramePasses::encode_shading_again`].
+    pub(crate) fn encode_shading_again_stamped(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        stamps: &mut Stamps,
+    ) -> Result<bool, FrameError> {
+        Ok(self.shade.encode_again(gpu, encoder, stamps)?)
     }
 
     /// How long a level change made with the camera still morphs: frames should keep coming
@@ -286,22 +317,23 @@ impl FramePasses {
         inputs: &SceneInputs<'_>,
         jitter: Jitter,
     ) -> Result<Option<CutReadback>, FrameError> {
-        self.encode_marked(gpu, encoder, inputs, jitter, &mut Marks::off())
+        self.encode_stamped(gpu, encoder, inputs, jitter, &mut Stamps::off())
     }
 
-    /// [`FramePasses::encode_jittered`], timed on the GPU by `marks` ([`crate::timing`]): each
-    /// phase marked at its end, the bounds, the level choice, the raster and the readback.
+    /// [`FramePasses::encode_jittered`], timed on the GPU by `stamps` ([`crate::timing`]): the
+    /// passes of the bounds, the level choice and the raster, and the readback's copies between
+    /// the raster and the next pass.
     ///
     /// # Errors
     ///
     /// As [`FramePasses::encode`].
-    pub(crate) fn encode_marked(
+    pub(crate) fn encode_stamped(
         &mut self,
         gpu: &Gpu,
         encoder: &mut CommandEncoder,
         inputs: &SceneInputs<'_>,
         jitter: Jitter,
-        marks: &mut Marks,
+        stamps: &mut Stamps,
     ) -> Result<Option<CutReadback>, FrameError> {
         let size = inputs.view.size();
         let wanted = (size.width(), size.height());
@@ -316,9 +348,9 @@ impl FramePasses {
         {
             self.previous = None;
         }
+        let bounds = (inputs.tree, inputs.bounds, inputs.slots);
         self.lod
-            .encode_bounds(gpu, encoder, inputs.tree, inputs.bounds, inputs.slots)?;
-        marks.end(encoder, GpuPhase::Bounds);
+            .encode_bounds_stamped(gpu, encoder, bounds, stamps)?;
         let previous = self
             .previous
             .as_ref()
@@ -331,8 +363,7 @@ impl FramePasses {
             finest: inputs.finest,
             morph: Some(self.raster.morph_inputs()),
         };
-        self.lod.encode_main(gpu, encoder, &main)?;
-        marks.end(encoder, GpuPhase::LevelChoice);
+        self.lod.encode_main_stamped(gpu, encoder, &main, stamps)?;
         let jittered = inputs.view.jittered(jitter);
         let frame = RasterFrame {
             view: &jittered,
@@ -340,21 +371,23 @@ impl FramePasses {
             moving: inputs.moving,
         };
         self.raster.begin_frame(gpu, &frame)?;
+        let cut = self.lod.cut_list();
+        let writes = stamps.compute(GpuPhase::Raster);
         self.raster
-            .encode_stamp(gpu, encoder, inputs.tree, self.lod.cut_list())?;
-        let drawn = self.draw_both(gpu, encoder, inputs, &current);
+            .encode_stamp(gpu, encoder, inputs.tree, cut, writes)?;
+        let drawn = self.draw_both(gpu, encoder, inputs, &current, stamps);
         // The swap: this frame's pyramid is the next one's previous, and the old previous is
         // built over next.
         let older = self.previous.replace((*inputs.view, current));
         self.current = older.map(|(_, pyramid)| pyramid);
         drawn?;
-        marks.end(encoder, GpuPhase::Raster);
+        stamps.between(GpuPhase::Readback);
         let readback = self.lod.encode_readback(gpu, encoder, inputs.frame)?;
-        marks.end(encoder, GpuPhase::Readback);
         Ok(readback)
     }
 
-    /// The two draws around the second phase, building `current` after each.
+    /// The two draws around the second phase, building `current` after each, their passes
+    /// timed by `stamps`.
     ///
     /// # Errors
     ///
@@ -365,10 +398,12 @@ impl FramePasses {
         encoder: &mut CommandEncoder,
         inputs: &SceneInputs<'_>,
         current: &DepthPyramid,
+        stamps: &mut Stamps,
     ) -> Result<(), FrameError> {
         for (post, phase) in [(false, Phase::First), (true, Phase::Second)] {
             if post {
-                self.lod.encode_post(gpu, encoder, current)?;
+                self.lod
+                    .encode_post_stamped(gpu, encoder, current, stamps)?;
             }
             let draw = ClusterDraw {
                 tree: inputs.tree,
@@ -376,9 +411,13 @@ impl FramePasses {
                 clusters: self.lod.clusters(post),
                 args: self.lod.draw_args(post),
             };
-            self.raster.encode_draw(gpu, encoder, &draw, phase)?;
+            let draw_writes = stamps.render(GpuPhase::Raster);
+            self.raster
+                .encode_draw(gpu, encoder, &draw, phase, draw_writes)?;
             let depth = self.raster.depth_view();
-            self.pyramids.build(gpu, encoder, depth, current, None)?;
+            let pyramid_writes = stamps.compute(GpuPhase::Raster);
+            self.pyramids
+                .build(gpu, encoder, depth, current, pyramid_writes)?;
         }
         Ok(())
     }

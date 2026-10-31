@@ -190,7 +190,7 @@ use crate::cull::{
 use crate::gpu::{Gpu, GpuError};
 use crate::raster::{GpuMorphState, GpuRasterParams, MORPH_WGSL};
 use crate::residency::{FrameUse, REQUESTS_WGSL, Tier};
-use crate::timing::ticks_to_duration;
+use crate::timing::{GpuPhase, Stamps, ticks_to_duration};
 use crate::tree::{NODE_BYTES, NODE_WGSL, Place};
 
 #[cfg(test)]
@@ -303,6 +303,15 @@ impl Stage {
     /// `2 * index + 1` (end).
     const fn index(self) -> u32 {
         self as u32
+    }
+
+    /// The frame's phase its pass is part of ([`crate::timing`]).
+    const fn phase(self) -> GpuPhase {
+        match self {
+            Self::Bounds => GpuPhase::Bounds,
+            Self::Choose | Self::Relax | Self::Sweep | Self::Emit => GpuPhase::LevelChoice,
+            Self::Post => GpuPhase::Raster,
+        }
     }
 }
 
@@ -1420,12 +1429,29 @@ impl Lod {
         update: &BoundsUpdate,
         slots: &SlotBuffers,
     ) -> Result<(), LodError> {
-        // No tile changed, no pass: the stage didn't run.
-        let writes = self
-            .timer
-            .as_ref()
-            .filter(|_| !update.is_empty())
-            .map(|timer| timer.writes(Stage::Bounds));
+        let bounds = (tree, update, slots);
+        self.encode_bounds_stamped(gpu, encoder, bounds, &mut Stamps::off())
+    }
+
+    /// [`Lod::encode_bounds`] for the tile tree's buffer, the update and the slot buffers, its
+    /// pass timed in the frame's `stamps` too ([`crate::timing`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Lod::encode_bounds`].
+    pub(crate) fn encode_bounds_stamped(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        (tree, update, slots): (&Buffer, &BoundsUpdate, &SlotBuffers),
+        stamps: &mut Stamps,
+    ) -> Result<(), LodError> {
+        // No tile changed, no pass: the stage didn't run, and nothing is stamped.
+        let writes = if update.is_empty() {
+            None
+        } else {
+            stage_writes(self.timer.as_ref(), stamps, Stage::Bounds)
+        };
         self.bounds
             .encode(gpu, encoder, tree, update, slots, writes)?;
         Ok(())
@@ -1447,6 +1473,21 @@ impl Lod {
         encoder: &mut CommandEncoder,
         inputs: &MainInputs<'_>,
     ) -> Result<(), LodError> {
+        self.encode_main_stamped(gpu, encoder, inputs, &mut Stamps::off())
+    }
+
+    /// [`Lod::encode_main`], its passes timed in the frame's `stamps` too ([`crate::timing`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Lod::encode_main`].
+    pub(crate) fn encode_main_stamped(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        inputs: &MainInputs<'_>,
+        stamps: &mut Stamps,
+    ) -> Result<(), LodError> {
         self.check(inputs)?;
         self.write_settings(gpu, inputs);
         let passes = self.config.relax_passes;
@@ -1461,7 +1502,7 @@ impl Lod {
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod choose"),
-                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Choose)),
+                timestamp_writes: stage_writes(self.timer.as_ref(), stamps, Stage::Choose),
             });
             pass.set_bind_group(0, &group, &[0]);
             pass.set_bind_group(1, &phase, &[]);
@@ -1479,7 +1520,7 @@ impl Lod {
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod relax"),
-                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Relax)),
+                timestamp_writes: stage_writes(self.timer.as_ref(), stamps, Stage::Relax),
             });
             for index in 0..passes {
                 pass.set_pipeline(&p.relax);
@@ -1497,7 +1538,7 @@ impl Lod {
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod sweep"),
-                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Sweep)),
+                timestamp_writes: stage_writes(self.timer.as_ref(), stamps, Stage::Sweep),
             });
             pass.set_bind_group(1, &phase, &[]);
             pass.set_pipeline(&p.sweep);
@@ -1509,7 +1550,7 @@ impl Lod {
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod emit"),
-                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Emit)),
+                timestamp_writes: stage_writes(self.timer.as_ref(), stamps, Stage::Emit),
             });
             pass.set_bind_group(0, &group, &[0]);
             pass.set_bind_group(1, &phase, &[]);
@@ -1604,13 +1645,28 @@ impl Lod {
         encoder: &mut CommandEncoder,
         pyramid: &DepthPyramid,
     ) -> Result<(), LodError> {
+        self.encode_post_stamped(gpu, encoder, pyramid, &mut Stamps::off())
+    }
+
+    /// [`Lod::encode_post`], its pass timed in the frame's `stamps` too ([`crate::timing`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Lod::encode_post`].
+    pub(crate) fn encode_post_stamped(
+        &self,
+        gpu: &Gpu,
+        encoder: &mut CommandEncoder,
+        pyramid: &DepthPyramid,
+        stamps: &mut Stamps,
+    ) -> Result<(), LodError> {
         let Some(group) = self.group.as_ref() else {
             return Ok(());
         };
         let phase = self.phase_group(gpu, true, pyramid)?;
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("lod post"),
-            timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Post)),
+            timestamp_writes: stage_writes(self.timer.as_ref(), stamps, Stage::Post),
         });
         pass.set_bind_group(0, group, &[0]);
         pass.set_bind_group(1, &phase, &[]);
@@ -2011,6 +2067,25 @@ impl Pipelines {
             gate,
         })
     }
+}
+
+/// The timestamp writes of stage `stage`'s pass, encoded at once; `None` with no timer.
+///
+/// They are the stage timer's when it is on, noted in the frame's `stamps` as borrowed (a pass
+/// takes one pair of timestamps, so the frame reads the stage timer's back too); the frame's
+/// own otherwise.
+fn stage_writes<'a>(
+    timer: Option<&'a Timer>,
+    stamps: &'a mut Stamps,
+    stage: Stage,
+) -> Option<ComputePassTimestampWrites<'a>> {
+    let phase = stage.phase();
+    let Some(timer) = timer else {
+        return stamps.compute(phase);
+    };
+    let begin = 2 * stage.index();
+    stamps.lod(phase, &timer.queries, 2 * STAGES, begin);
+    Some(timer.writes(stage))
 }
 
 impl Timer {

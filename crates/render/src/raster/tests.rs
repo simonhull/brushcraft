@@ -565,7 +565,7 @@ pub(crate) fn draw_cut(
         count_word: 0,
     };
     raster
-        .encode_stamp(gpu, &mut encoder, world.tree.buffer(), cut_list)
+        .encode_stamp(gpu, &mut encoder, world.tree.buffer(), cut_list, None)
         .expect("encoded");
     let draw = ClusterDraw {
         tree: world.tree.buffer(),
@@ -574,7 +574,7 @@ pub(crate) fn draw_cut(
         args: (&args, 0),
     };
     raster
-        .encode_draw(gpu, &mut encoder, &draw, Phase::First)
+        .encode_draw(gpu, &mut encoder, &draw, Phase::First, None)
         .expect("encoded");
     gpu.queue().submit([encoder.finish()]);
     finish(gpu);
@@ -1156,7 +1156,7 @@ pub(crate) fn lod_frame_output(
     lod.encode_main(gpu, &mut encoder, &inputs)
         .expect("encoded");
     raster
-        .encode_stamp(gpu, &mut encoder, world.tree.buffer(), lod.cut_list())
+        .encode_stamp(gpu, &mut encoder, world.tree.buffer(), lod.cut_list(), None)
         .expect("encoded");
     let (args, offset) = lod.draw_args(false);
     let args = args.clone();
@@ -1167,7 +1167,7 @@ pub(crate) fn lod_frame_output(
         args: (&args, offset),
     };
     raster
-        .encode_draw(gpu, &mut encoder, &draw, Phase::First)
+        .encode_draw(gpu, &mut encoder, &draw, Phase::First, None)
         .expect("encoded");
     let readback = lod
         .encode_readback(gpu, &mut encoder, 0)
