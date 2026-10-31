@@ -256,6 +256,36 @@ fn brush_times_a_stroke_after_loading_the_index() {
 }
 
 #[test]
+fn brush_dabs_applies_the_stroke_a_frame_to_a_call() {
+    let dir = TempDir::new();
+    generate(&dir);
+    let printed = run_on(
+        &dir.project(),
+        "brush --level 6 --steps 6 --footprint 3000 --dabs 3",
+    )
+    .unwrap();
+    let stroke = line(&printed, "brush", "stroke");
+    assert!(
+        (number(stroke, "steps") - 2.0).abs() < 0.5,
+        "two calls of three dabs: {stroke}"
+    );
+    assert!(
+        (number(stroke, "dabs_per_call") - 3.0).abs() < 0.5,
+        "three dabs a call: {stroke}"
+    );
+    assert!(
+        stroke.contains("\"path\":\"apply_dabs\""),
+        "through apply_dabs: {stroke}"
+    );
+    assert!(number(stroke, "step_p99_ms") > 0.0, "a latency: {stroke}");
+    let vertices = number(stroke, "vertices_mean");
+    assert!(
+        (4500.0..18_000.0).contains(&vertices),
+        "about three footprints a call: {stroke}"
+    );
+}
+
+#[test]
 fn brush_per_step_reports_every_step() {
     let dir = TempDir::new();
     generate(&dir);

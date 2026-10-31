@@ -178,9 +178,12 @@ pub(crate) fn run<J: Write, H: Write>(
     }
     let mut state = Stroke::new(project.store());
     out.say(&format!(
-        "brush: {} draw steps, radius {:.5}",
+        "brush: {} draw steps, radius {:.5}{}",
         plan.centres.len(),
-        plan.radius
+        plan.radius,
+        options
+            .dabs
+            .map_or_else(String::new, |n| format!(", {n} to a call of apply_dabs"))
     ))?;
     // A dab where the stroke starts, before its tiles are evaluated: what the first dab of a
     // stroke over a region the view hasn't drawn costs. Then the warm-up, and the stroke.
@@ -191,6 +194,7 @@ pub(crate) fn run<J: Write, H: Write>(
         plan.centres.get(..1).unwrap_or_default(),
         plan.radius,
         options.strength,
+        options.dabs,
         Detail::Summary,
     )?;
     let cold_ms = cold.first().map_or(0.0, |dab| ms(dab.wall));
@@ -202,6 +206,7 @@ pub(crate) fn run<J: Write, H: Write>(
         &plan.centres,
         plan.radius,
         options.strength,
+        options.dabs,
         options.detail,
     )?;
     if options.detail == Detail::PerStep {
@@ -216,6 +221,15 @@ pub(crate) fn run<J: Write, H: Write>(
             .with("radius", f64::from(plan.radius))
             .with("footprint_target", options.footprint)
             .with("budget_mib", options.budget_mib)
+            .with("dabs_per_call", options.dabs.unwrap_or(1))
+            .with(
+                "path",
+                if options.dabs.is_some() {
+                    "apply_dabs"
+                } else {
+                    "draw_step"
+                },
+            )
             .with("cold_first_dab_ms", cold_ms),
         &dabs,
     ))?;
@@ -304,6 +318,7 @@ pub(crate) fn run_save<J: Write, H: Write>(
         &plan.centres,
         plan.radius,
         options.strength,
+        None,
         Detail::Summary,
     )?;
     let after = corrections(&mut project, &reached)?;

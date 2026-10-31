@@ -22,5 +22,6 @@ geom.workspace = true
 rustix = { workspace = true, features = ["process", "thread"] }
 sculpt.workspace = true
 store = { workspace = true, features = ["bench"] }
+stroke.workspace = true
 thiserror.workspace = true
 zstd = { workspace = true, optional = true }

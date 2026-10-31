@@ -245,6 +245,7 @@ dependencies = [
  "rustix",
  "sculpt",
  "store",
+ "stroke",
  "thiserror 2.0.21",
  "zstd",
 ]

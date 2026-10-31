@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, ensure};
 use geom::{Level, Vec3};
-use sculpt::{DrawParams, StepStats, Stroke, draw_step};
+use sculpt::{DrawParams, StepStats, Stroke, apply_dabs, draw_step};
 use store::{Activity, Project, ProjectConfig, SpatialIndex, StoreConfig};
 
 use crate::cli::{DisplayLayer, Options};
@@ -121,7 +121,7 @@ pub(crate) struct Dab {
     pub(crate) minor_faults: Option<u64>,
 }
 
-/// How closely [`stroke`] watches each step.
+/// How closely [`stroke()`] watches each step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Detail {
     /// The step's statistics, wall time and store activity: what costs nothing to take.
@@ -133,14 +133,20 @@ pub(crate) enum Detail {
 
 /// Runs one stroke of draw steps with `radius` and `strength`, one at each of `centres`.
 ///
-/// The steps run between [`Project::begin_stroke`] and [`Project::end_stroke`], each watched as
-/// `detail` says. `stroke_state` is the session's one stroke state ([`Stroke`]), which starts
-/// afresh with the stroke.
+/// With `per_call` `None`, each dab is a [`draw_step`], the path the history measures; with
+/// `Some(n)`, the dabs go `n` to a call of [`apply_dabs`] (hardness 0, so the same draw brush),
+/// a frame's path, and each record is a call's. The calls run between [`Project::begin_stroke`]
+/// and [`Project::end_stroke`], each watched as `detail` says. `stroke_state` is the session's
+/// one stroke state ([`Stroke`]), which starts afresh with the stroke.
 ///
 /// # Errors
 ///
 /// If a step fails, the stroke can't begin or end, or (with [`Detail::PerStep`]) the page
 /// faults can't be read.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stroke's parts as each subcommand plans them; a struct would only rename them"
+)]
 pub(crate) fn stroke(
     project: &mut Project,
     index: &mut SpatialIndex,
@@ -148,6 +154,7 @@ pub(crate) fn stroke(
     centres: &[Vec3],
     radius: f32,
     strength: f32,
+    per_call: Option<usize>,
     detail: Detail,
 ) -> Result<Vec<Dab>> {
     let faults = || match detail {
@@ -156,13 +163,39 @@ pub(crate) fn stroke(
     };
     project.begin_stroke().context("beginning a stroke")?;
     let mut dabs = Vec::with_capacity(centres.len());
-    for &center in centres {
-        let params = DrawParams::new(center, radius, strength)?;
+    let mut seq = 0_u32;
+    for group in centres.chunks(per_call.unwrap_or(1)) {
+        let params = group
+            .iter()
+            .map(|&center| DrawParams::new(center, radius, strength))
+            .collect::<Result<Vec<DrawParams>, _>>()?;
+        let frame: Vec<stroke::Dab> = params
+            .iter()
+            .map(|params| {
+                let Vec3 { x, y, z } = params.center();
+                seq = seq.wrapping_add(1);
+                stroke::Dab {
+                    position: [x, y, z],
+                    normal: [0.0, 0.0, 1.0],
+                    tangent: [1.0, 0.0, 0.0],
+                    radius,
+                    strength,
+                    seq,
+                    ..stroke::Dab::default()
+                }
+            })
+            .collect();
         let faults_before = faults()?;
         let activity_before = project.store().activity();
         let start = Instant::now();
-        let stats =
-            draw_step(project.store(), index, stroke_state, params).context("a draw step")?;
+        let stats = match (per_call, params.first()) {
+            (None, Some(&params)) => {
+                draw_step(project.store(), index, stroke_state, params).context("a draw step")?
+            }
+            _ => apply_dabs(project.store(), index, stroke_state, &frame)
+                .context("a frame of dabs")?
+                .into(),
+        };
         let wall = start.elapsed();
         let activity = project.store().activity().since(&activity_before);
         let minor_faults = faults()?

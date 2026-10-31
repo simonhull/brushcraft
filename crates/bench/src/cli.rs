@@ -55,6 +55,8 @@ options (each subcommand takes the ones it uses):
             (warm: as in a running app), or each in turn (both)
   brush:    --steps N (200)  --footprint VERTICES (50000)  --strength F (0.0001)
             --display (keep the display layer: each step raises its display tiles' bounds)
+            --dabs N (apply the stroke's dabs N to a call of sculpt::apply_dabs, a frame's
+            path, instead of a draw step each; the latency is then per frame)
   display:  --steps N (200)  --footprint VERTICES (50000)  --strength F (0.0001)
             --per-step (a JSON line per step besides the summary: its time and each phase's,
             its footprint, the tiles the store loaded, evaluated and evicted, page faults)
@@ -147,7 +149,7 @@ impl Subcommand {
     /// Whether the subcommand takes the option `flag`.
     fn takes(self, flag: Flag) -> bool {
         use Flag::{
-            Amplitude, Baseline, BudgetMib, Display, Footprint, Force, Full, History, Level,
+            Amplitude, Baseline, BudgetMib, Dabs, Display, Footprint, Force, Full, History, Level,
             Levels, Moves, NoStages, PerStep, Pool, Project, RegionQuads, Samples, Seed,
             SettleSecs, Splits, Steps, StepsPerMove, Strength, Tiny, ViewTiles, Workers,
         };
@@ -164,7 +166,7 @@ impl Subcommand {
             Samples => matches!(self, Self::PageIn | Self::DisplayStudy),
             RegionQuads | Pool => self == Self::PageIn,
             Steps => matches!(self, Self::Brush | Self::Save | Self::Display),
-            PerStep | Display => self == Self::Brush,
+            PerStep | Display | Dabs => self == Self::Brush,
             Strength => matches!(
                 self,
                 Self::Brush | Self::Save | Self::Budget | Self::Display
@@ -294,11 +296,13 @@ enum Flag {
     SettleSecs,
     /// `--display`, a switch.
     Display,
+    /// `--dabs`.
+    Dabs,
 }
 
 impl Flag {
     /// Every flag with its name, without the leading `--`.
-    const NAMES: [(Self, &'static str); 26] = [
+    const NAMES: [(Self, &'static str); 27] = [
         (Self::Project, "project"),
         (Self::BudgetMib, "budget-mib"),
         (Self::Seed, "seed"),
@@ -325,6 +329,7 @@ impl Flag {
         (Self::NoStages, "no-stages"),
         (Self::SettleSecs, "settle-secs"),
         (Self::Display, "display"),
+        (Self::Dabs, "dabs"),
     ];
 
     /// Whether the flag is a switch, taking no value.
@@ -382,6 +387,9 @@ pub(crate) struct Options {
     pub(crate) steps: usize,
     /// `brush`: how closely each step of the stroke is watched and reported.
     pub(crate) detail: Detail,
+    /// `brush`: apply the stroke's dabs this many to a call of `sculpt::apply_dabs` (`--dabs`),
+    /// or `None` for a `sculpt::draw_step` each, the path the history measures.
+    pub(crate) dabs: Option<usize>,
     /// How far the draw brush pushes at its centre, along the frame normal.
     pub(crate) strength: f32,
     /// `budget`: places the walk pans to.
@@ -442,6 +450,7 @@ impl Options {
                 200
             },
             detail: Detail::Summary,
+            dabs: None,
             strength: 1e-4,
             moves: 20,
             steps_per_move: 10,
@@ -517,6 +526,7 @@ impl Options {
                 })?;
             }
             Flag::Steps => self.steps = positive(flag, text()?)?,
+            Flag::Dabs => self.dabs = Some(positive(flag, text()?)?),
             Flag::Strength => self.strength = finite(flag, text()?)?,
             Flag::Moves => self.moves = positive(flag, text()?)?,
             Flag::StepsPerMove => self.steps_per_move = positive(flag, text()?)?,
@@ -675,6 +685,12 @@ mod tests {
             Detail::PerStep,
             "a record per step asked for"
         );
+        assert_eq!(brush.options.dabs, None, "a draw step a dab by default");
+        assert_eq!(
+            parse("brush --dabs 4").unwrap().options.dabs,
+            Some(4),
+            "four dabs to a call of apply_dabs"
+        );
         let save = parse("save --steps 7 --level=6 --project /tmp/x.bcrf").unwrap();
         assert_eq!(save.options.steps, 7, "a spaced value");
         assert_eq!(save.options.level, 6, "an inline value");
@@ -756,6 +772,12 @@ mod tests {
                 "per-step records for a subcommand without them",
             ),
             ("brush --per-step=yes", "a value for the per-step switch"),
+            ("brush --dabs 0", "no dabs to a call"),
+            ("brush --dabs", "dabs without a count"),
+            (
+                "save --dabs 2",
+                "dabs to a call for a subcommand without them",
+            ),
             ("perf --tiny --full", "a tiny and a full project"),
             ("perf --full --tiny", "a full and a tiny project"),
             ("perf --history", "a history without its directory"),

@@ -172,6 +172,7 @@ fn walk<J: Write, H: Write>(
             &plan.centres,
             plan.radius,
             options.strength,
+            None,
             Detail::Summary,
         )?
         .len();
