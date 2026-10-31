@@ -24,24 +24,38 @@
 //!   encoders say so, and on an Apple M4 the earlier design, an empty compute pass whose beginning
 //!   marked the boundary between phases, read zero or the same tick in every frame. So every
 //!   stamped pass here does work, the start pass included. An unwritten sample resolves to
-//!   `MTLCounterErrorValue` (all ones); wgpu takes a tick on Apple GPUs as 1 ns. Passes there may
-//!   overlap (the tile-based GPU runs one's vertices beside another's fragments), so a phase's sum
-//!   may exceed its wall time and a gap reads zero; the total is from the earliest stamp to the
-//!   latest.
+//!   `MTLCounterErrorValue` (all ones); wgpu takes a tick on Apple GPUs as 1 ns. Passes there
+//!   overlap: the tile-based GPU runs a render pass's vertex stage, where its beginning is sampled,
+//!   beside earlier passes' work, so its stamps alone would count that work twice (the rule below).
 //! - **wgpu-core** resets a pass's two queries as the pass begins, and resolves a query not written
 //!   in the same command encoder from what it last held (zero if never written). A frame here
 //!   resolves only queries it wrote, its own in a later encoding, where they hold what it wrote: no
 //!   other frame writes its slot's queries meanwhile.
 //!
-//! **A frame's start is no earlier than the frame before it ended.** The start pass touches no
-//! resource, so nothing orders it after the earlier frame's work: on Metal, with the GPU behind,
-//! an Apple M4 ran it beside the earlier frame's shading, accumulation and tone passes, and the
-//! gap from its stamp to the next pass (the uploads) read 15–22 ms: the rest of that frame. With
-//! the GPU keeping up, or waited for after each frame, the gap was 0.00–0.35 ms. So the start's
-//! stamps are taken as no earlier than the last tick of the frame timed before
-//! (`GpuTimes::from_ticks`'s `earlier_end`): the uploads are the gap from then to the next pass,
-//! and the total runs from then. On Vulkan the start's stamp is at the bottom of the pipe, after
-//! the earlier frame's work, so this changes nothing there.
+//! **A pass begins no earlier than the passes before it ended.** A frame's passes run in the
+//! order encoded, and on every backend a pass's end follows the work of the passes before it: so
+//! each pass's stamps are taken as no earlier than the latest end of the passes before it in the
+//! frame (`clamp_after`), a phase's time is the sum of its passes' clamped times, and a gap is
+//! from one clamped stamp to the next. Work that ran beside earlier passes counts as theirs,
+//! where it ran, not twice.
+//!
+//! - **Metal** samples a render pass's beginning as its vertex stage starts, which may be while
+//!   earlier passes still run. On an Apple M4 at 4K the tone pass's full-screen triangle had its
+//!   vertices run beside the shading and accumulation, and its stamps read 6–14 ms, shading
+//!   included, where the tone map itself took 1.6–2.2 ms (the total less the other phases); three
+//!   settling frames read the raster at 13.5 ms of a 16.4 ms frame. The phases summed to 1.4–1.7
+//!   times the total. Clamped, tone is from shade's (or accumulation's) end to its own, and the
+//!   phases tile the frame.
+//! - **Vulkan** writes both stamps at the bottom of the pipe, so they are already serial and the
+//!   clamp changes nothing (the test `serial_stamps_read_the_same_as_unclamped`).
+//!
+//! The first pass, the frame's start, is clamped the same way to where the frame timed before
+//! ended (`GpuTimes::from_ticks`'s `earlier_end`). The start pass touches no resource, so nothing
+//! orders it after the earlier frame's work: on Metal, with the GPU behind, an Apple M4 ran it
+//! beside the earlier frame's shading, accumulation and tone passes, and the gap from its stamp to
+//! the next pass (the uploads) read 15–22 ms: the rest of that frame. With the GPU keeping up, or
+//! waited for after each frame, the gap was 0.00–0.35 ms. Clamped, the uploads are the gap from
+//! that frame's end to the next pass, and the total runs from then.
 //!
 //! A tick of zero or all ones is no time: a pass with one is unwritten, and its phase (and any
 //! gap beside it) is absent rather than wrong.
@@ -248,9 +262,10 @@ impl GpuTimes {
     /// The times of frame `frame` from its `spans`, in the order encoded, and their `ticks`, a
     /// tick `period` nanoseconds. `None` if no pass of it has its timestamps.
     ///
-    /// `earlier_end` is the last tick of the frame timed before it, if one was: the frame's start
-    /// is taken as no earlier (see the module notes: a start pass run beside the earlier
-    /// frame's last passes would put the rest of that frame into this one's uploads and total).
+    /// Each pass is taken as beginning no earlier than the passes before it ended, and the first
+    /// as no earlier than `earlier_end`, the last tick of the frame timed before it, if one was
+    /// (see the module notes: on Metal a pass's beginning may be sampled while earlier passes
+    /// still run, which would count their work twice).
     pub(crate) fn from_ticks(
         frame: u64,
         spans: &[Span],
@@ -258,18 +273,19 @@ impl GpuTimes {
         period: f32,
         earlier_end: Option<u64>,
     ) -> Option<Self> {
-        let floor = earlier_end.unwrap_or(0);
-        // Per span, `None` for a gap, else its pass's stamps if written; the start's no earlier
-        // than the frame before ended.
+        // Per span, `None` for a gap, else its pass's stamps if written, each pass's no earlier
+        // than the passes before it ended (the first's, than the frame before ended).
         let stamped: Vec<Option<Option<(u64, u64)>>> = spans
             .iter()
-            .map(|span| {
-                let written = span.pair().map(|pair| ticks.of(pair));
-                match span {
-                    Span::Start(_) => written
-                        .map(|pair| pair.map(|(begin, end)| (begin.max(floor), end.max(floor)))),
-                    Span::Pass(..) | Span::Between(_) => written,
-                }
+            .scan(earlier_end.unwrap_or(0), |floor, span| {
+                let clamped = span.pair().map(|pair| {
+                    ticks.of(pair).map(|(begin, end)| {
+                        let (begin, end) = clamp_after(begin, end, *floor);
+                        *floor = end;
+                        (begin, end)
+                    })
+                });
+                Some(clamped)
             })
             .collect();
         let mut times = Self {
@@ -346,6 +362,14 @@ pub(crate) fn last_tick(spans: &[Span], ticks: Ticks<'_>) -> Option<u64> {
         })
         .flatten()
         .max()
+}
+
+/// A pass's stamps `begin` and `end` (`end` no earlier), taken as no earlier than `floor`, where
+/// the passes before it ended: so its time is what it ran after them, and what it ran beside them
+/// is theirs.
+fn clamp_after(begin: u64, end: u64, floor: u64) -> (u64, u64) {
+    let begin = begin.max(floor);
+    (begin, end.max(begin))
 }
 
 /// The first pass's stamps among `stamped` (per span, `None` for a gap), walked outward from a

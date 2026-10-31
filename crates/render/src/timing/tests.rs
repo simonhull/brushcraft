@@ -122,7 +122,11 @@ fn a_pass_that_ends_before_it_begins_is_unwritten_and_a_gap_never_goes_negative(
     let ticks = [100, 200, 150, 260, 300, 290];
     let times = GpuTimes::from_ticks(1, &spans, own(&ticks), 1.0, None).unwrap();
     assert_eq!(times.phase(GpuPhase::Readback), Some(Duration::ZERO));
-    assert_eq!(times.phase(GpuPhase::Shade), Some(ns(110)));
+    assert_eq!(
+        times.phase(GpuPhase::Shade),
+        Some(ns(60)),
+        "from raster's end: the overlap is raster's"
+    );
     assert_eq!(times.phase(GpuPhase::Tone), None);
     assert_eq!(times.total(), ns(160), "earliest stamp to latest written");
 }
@@ -285,4 +289,210 @@ fn a_timing_slot_is_resolved_by_the_first_frame_after_its_own_and_freed_once_tha
         bound + 2,
         "the bound's frames, one resolving, and the new one"
     );
+}
+
+/// The sum of the phases timed, and the frame's total.
+fn summed(times: &GpuTimes) -> (Duration, Duration) {
+    let sum: Duration = GpuPhase::ALL.iter().filter_map(|&p| times.phase(p)).sum();
+    (sum, times.total())
+}
+
+#[test]
+fn a_pass_begun_beside_the_one_before_counts_from_where_that_one_ended() {
+    use GpuPhase::{Raster, Readback, Shade, Tone, Uploads};
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Between(Uploads),
+        Span::Pass(Raster, Pair::Own(2)),
+        Span::Between(Readback),
+        Span::Pass(Shade, Pair::Own(4)),
+        Span::Pass(Tone, Pair::Own(6)),
+    ];
+    // As on Metal: the tone pass's beginning is sampled as its full-screen triangle's vertices
+    // run, at 320, while shade runs on to 500; its fragments end at 530.
+    let ticks = [100, 101, 110, 300, 300, 500, 320, 530];
+    let times = GpuTimes::from_ticks(1, &spans, own(&ticks), 1.0, None).unwrap();
+    assert_eq!(
+        times.phase(Tone),
+        Some(ns(30)),
+        "tone's end less shade's, not 210 with the shading in it"
+    );
+    assert_eq!(times.phase(Shade), Some(ns(200)), "the overlap is shade's");
+    assert_eq!(times.phase(Raster), Some(ns(190)));
+    assert_eq!(times.phase(Uploads), Some(ns(9)));
+    assert_eq!(times.phase(Readback), Some(Duration::ZERO));
+    let (sum, total) = summed(&times);
+    assert_eq!(total, ns(430));
+    assert_eq!(
+        total.checked_sub(sum),
+        Some(ns(1)),
+        "all but the start pass"
+    );
+}
+
+#[test]
+fn raster_passes_begun_beside_earlier_work_count_only_what_they_ran_after_it() {
+    use GpuPhase::{Bounds, LevelChoice, Raster, Shade, Tone, Uploads};
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Between(Uploads),
+        Span::Pass(Bounds, Pair::Own(2)),
+        Span::Pass(LevelChoice, Pair::Lod(0)),
+        Span::Pass(Raster, Pair::Own(4)),
+        Span::Pass(Raster, Pair::Lod(2)),
+        Span::Pass(Raster, Pair::Own(6)),
+        Span::Pass(Shade, Pair::Own(8)),
+        Span::Pass(Tone, Pair::Own(10)),
+    ];
+    // The first draw's vertices start under bounds (1015) and the second's under the first draw
+    // (1050), the level choice's second phase between them; tone's under shade.
+    let own_ticks = [
+        1000, 1001, 1010, 1020, 1015, 1100, 1050, 1200, 1200, 1300, 1210, 1320,
+    ];
+    let lod_ticks = [1020, 1040, 1100, 1110];
+    let ticks = Ticks {
+        own: &own_ticks,
+        lod: &lod_ticks,
+    };
+    let times = GpuTimes::from_ticks(1, &spans, ticks, 1.0, None).unwrap();
+    assert_eq!(
+        times.phase(Raster),
+        Some(ns(160)),
+        "1040–1100, 1100–1110 and 1110–1200, not 245 of a 320 frame"
+    );
+    assert_eq!(times.phase(Uploads), Some(ns(9)));
+    assert_eq!(times.phase(Bounds), Some(ns(10)));
+    assert_eq!(times.phase(LevelChoice), Some(ns(20)));
+    assert_eq!(times.phase(Shade), Some(ns(100)));
+    assert_eq!(times.phase(Tone), Some(ns(20)));
+    let (sum, total) = summed(&times);
+    assert_eq!(total, ns(320));
+    assert_eq!(
+        total.checked_sub(sum),
+        Some(ns(1)),
+        "all but the start pass"
+    );
+}
+
+#[test]
+fn an_overlapping_frame_s_unwritten_stamps_still_leave_their_phases_absent() {
+    use GpuPhase::{Raster, Readback, Shade, Tone};
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Pass(Raster, Pair::Own(2)),
+        Span::Between(Readback),
+        Span::Pass(Shade, Pair::Own(4)),
+        Span::Pass(Tone, Pair::Own(6)),
+    ];
+    // Tone begun under shade, its end never written.
+    let tone_unended = [100, 101, 110, 300, 300, 500, 320, u64::MAX];
+    let unended = GpuTimes::from_ticks(1, &spans, own(&tone_unended), 1.0, None).unwrap();
+    assert_eq!(unended.phase(Tone), None);
+    assert_eq!(unended.phase(Shade), Some(ns(200)));
+    assert_eq!(unended.total(), ns(400));
+    // Shade's beginning never written: it and the gap before it are absent, and tone is clamped
+    // by the passes that were.
+    let shade_unbegun = [100, 101, 110, 300, 0, 500, 320, 530];
+    let unbegun = GpuTimes::from_ticks(1, &spans, own(&shade_unbegun), 1.0, None).unwrap();
+    assert_eq!(unbegun.phase(Shade), None);
+    assert_eq!(unbegun.phase(Readback), None);
+    assert_eq!(
+        unbegun.phase(Tone),
+        Some(ns(210)),
+        "from raster's end, written"
+    );
+    assert_eq!(unbegun.phase(Raster), Some(ns(190)));
+}
+
+/// `spans`' phases from their raw stamps, unclamped, and the total: the rule before passes were
+/// clamped to the ones before them. Every stamp must be written.
+fn unclamped(spans: &[Span], ticks: Ticks<'_>) -> ([Option<Duration>; 8], Duration) {
+    let raw: Vec<Option<(u64, u64)>> = spans
+        .iter()
+        .map(|span| span.pair().map(|pair| ticks.of(pair).expect("written")))
+        .collect();
+    let mut phases = [None; GpuPhase::ALL.len()];
+    for (index, span) in spans.iter().enumerate() {
+        let (phase, took) = match *span {
+            Span::Start(_) => continue,
+            Span::Pass(phase, _) => {
+                let (begin, end) = raw[index].expect("a pass");
+                (phase, end - begin)
+            }
+            Span::Between(phase) => {
+                let before = raw[..index].iter().rev().find_map(|&pass| pass);
+                let after = raw[index + 1..].iter().find_map(|&pass| pass);
+                let ((_, end), (begin, _)) = before.zip(after).expect("passes around a gap");
+                (phase, begin - end)
+            }
+        };
+        let slot = &mut phases[phase.index()];
+        *slot = Some(slot.unwrap_or_default() + ns(took));
+    }
+    let stamps = raw.iter().flatten();
+    let first = stamps
+        .clone()
+        .map(|&(begin, _)| begin)
+        .min()
+        .expect("a pass");
+    let last = stamps.map(|&(_, end)| end).max().expect("a pass");
+    (phases, ns(last - first))
+}
+
+#[test]
+fn serial_stamps_read_the_same_as_unclamped() {
+    use GpuPhase::{Accumulate, Bounds, LevelChoice, Raster, Readback, Shade, Tone, Uploads};
+    // Every kind of span, as a frame drawing its scene encodes them.
+    let spans = [
+        Span::Start(Pair::Own(0)),
+        Span::Between(Uploads),
+        Span::Pass(Bounds, Pair::Own(2)),
+        Span::Pass(LevelChoice, Pair::Lod(0)),
+        Span::Pass(LevelChoice, Pair::Lod(2)),
+        Span::Pass(Raster, Pair::Own(4)),
+        Span::Pass(Raster, Pair::Lod(4)),
+        Span::Pass(Raster, Pair::Own(6)),
+        Span::Between(Readback),
+        Span::Pass(Shade, Pair::Own(8)),
+        Span::Pass(Accumulate, Pair::Own(10)),
+        Span::Pass(Tone, Pair::Own(12)),
+    ];
+    // Stamps written one after another, as Vulkan's at the bottom of the pipe: gaps and passes
+    // of 0–49 ticks (touching and empty ones included), from a fixed generator.
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % 50
+    };
+    for _ in 0..500 {
+        let (mut own_ticks, mut lod_ticks) = ([0_u64; 14], [0_u64; 6]);
+        let mut now = 1000;
+        for span in &spans {
+            let Some(pair) = span.pair() else {
+                continue;
+            };
+            let (list, at): (&mut [u64], u32) = match pair {
+                Pair::Own(at) => (&mut own_ticks, at),
+                Pair::Lod(at) => (&mut lod_ticks, at),
+            };
+            let at = usize::try_from(at).expect("small");
+            now += next();
+            list[at] = now;
+            now += next();
+            list[at + 1] = now;
+        }
+        let ticks = Ticks {
+            own: &own_ticks,
+            lod: &lod_ticks,
+        };
+        let (phases, total) = unclamped(&spans, ticks);
+        for earlier_end in [None, Some(own_ticks[0])] {
+            let times = GpuTimes::from_ticks(1, &spans, ticks, 1.0, earlier_end).expect("written");
+            let clamped = GpuPhase::ALL.map(|phase| times.phase(phase));
+            assert_eq!(clamped, phases, "{own_ticks:?} {lod_ticks:?}");
+            assert_eq!(times.total(), total);
+        }
+    }
 }
