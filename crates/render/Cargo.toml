@@ -33,6 +33,10 @@ name = "eviction"
 harness = false
 
 [[bench]]
+name = "standins"
+harness = false
+
+[[bench]]
 name = "brush_gpu"
 harness = false
 required-features = ["spike"]
