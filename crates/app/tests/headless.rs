@@ -258,7 +258,10 @@ mod tests {
         let frames = &lines[6..];
         let count: usize = field(run, "frames").parse().unwrap();
         assert_eq!(frames.len(), count, "a line a frame");
-        assert!(count >= 5, "frames through every segment: {count}");
+        // The run follows the wall clock, so how many frames it makes depends on the machine's
+        // load (3 under a load of 15): at least its first and one at its end. What follows
+        // depends on frames, not time.
+        assert!(count >= 2, "a first frame and a last: {count}");
         for (number, frame) in (1..).zip(frames) {
             assert!(frame.contains(r#""result":"frame""#), "{frame}");
             assert_eq!(field(frame, "frame"), number.to_string(), "in order");
@@ -269,12 +272,21 @@ mod tests {
             .iter()
             .filter(|f| field(f, "gpu_ms") != "null")
             .count();
+        // A frame starts only once the GPU has finished all but one before it
+        // (`render::FRAMES_IN_FLIGHT`, 2), and its start reads back what they drew: so by the
+        // third frame the first's cut (and its level choice's stages) came back, however slowly
+        // the frames came.
+        let cuts_due = count >= 3;
         if timing == "true" {
-            assert!(timed_frames > 0, "GPU times came back");
+            // Every frame's, the last ones' read as the render thread stopped.
+            assert_eq!(timed_frames, count, "GPU times came back");
             let stages = frames
                 .iter()
                 .filter(|f| field(f, "lod_choose_ms") != "null");
-            assert!(stages.count() > 0, "the level choice's stages too");
+            assert!(
+                !cuts_due || stages.count() > 0,
+                "the level choice's stages too"
+            );
         } else {
             assert_eq!(timed_frames, 0, "no GPU times without timing");
         }
@@ -282,7 +294,7 @@ mod tests {
             .iter()
             .filter(|f| field(f, "drawn") == "true")
             .count();
-        assert!(drawn > 0, "cuts came back");
+        assert!(!cuts_due || drawn > 0, "cuts came back");
         assert!(
             frames.iter().any(|f| field(f, "moving") == "true"),
             "the camera moved"
