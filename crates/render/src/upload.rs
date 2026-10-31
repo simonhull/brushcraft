@@ -287,11 +287,16 @@ pub struct StoreSource<'a> {
     /// may.
     until: Option<Instant>,
     /// Requested finest tiles without a copy that [`TileSource::deferred`] let through since
-    /// the last [`TileSource::prepare`]: what that prepare evaluates here, counted against the
-    /// time left.
-    reserved: BTreeSet<TileKey>,
+    /// the last [`TileSource::prepare`], each with its work (the tiles of its cone to evaluate,
+    /// [`TileStore::cone_work`]): what that prepare evaluates here, counted against the time
+    /// left.
+    reserved: BTreeMap<TileKey, usize>,
     /// Requested finest tiles evaluated here this frame: read from the cache.
     done_here: BTreeSet<TileKey>,
+    /// Requested finest tiles whose cones aren't in memory: left to the queue this frame.
+    cold: BTreeSet<TileKey>,
+    /// The work of the tiles reserved since the last prepare.
+    reserved_work: usize,
     /// Requested finest tiles let through but left unevaluated when the clock ran out: deferred
     /// for the rest of the frame, never read here.
     cut: BTreeSet<TileKey>,
@@ -314,8 +319,10 @@ impl<'a> StoreSource<'a> {
             display: BTreeMap::new(),
             evaluations: None,
             until: None,
-            reserved: BTreeSet::new(),
+            reserved: BTreeMap::new(),
             done_here: BTreeSet::new(),
+            cold: BTreeSet::new(),
+            reserved_work: 0,
             cut: BTreeSet::new(),
             frame_cost: None,
             evaluated_here: 0,
@@ -336,8 +343,10 @@ impl<'a> StoreSource<'a> {
             display: BTreeMap::new(),
             evaluations: Some(evaluations),
             until: None,
-            reserved: BTreeSet::new(),
+            reserved: BTreeMap::new(),
             done_here: BTreeSet::new(),
+            cold: BTreeSet::new(),
+            reserved_work: 0,
             cut: BTreeSet::new(),
             frame_cost: None,
             evaluated_here: 0,
@@ -349,13 +358,16 @@ impl<'a> StoreSource<'a> {
     /// Lets requested finest tiles without a copy be evaluated here while the frame has the
     /// time, as staging without the queue does.
     ///
-    /// Each is let through ([`TileSource::deferred`] says no) while the tiles let through since
-    /// the last [`TileSource::prepare`], at the cost per tile measured lately
-    /// ([`FinestEvaluations::cost`]) and a quarter more, fit before `deadline` less
-    /// [`STAGE_MARGIN`]; with no cost measured yet, one tile at a time, if [`PROBE_COST`] fits.
-    /// Call it once a frame, as staging starts: it ages the cost ([`FinestEvaluations::cost`]).
-    /// Each tile evaluated here is withdrawn from the queue, so none is evaluated twice.
-    /// Without evaluations ([`StoreSource::new`]), it changes nothing.
+    /// Only a tile whose cone has its corrections in memory is let through
+    /// ([`TileStore::cone_work`]): a cold one would wait on the file, a few milliseconds a tile,
+    /// which no estimate or clock bounds, so it is left to the queue, which reads ahead. One is
+    /// let through ([`TileSource::deferred`] says no) while the work of those let through since
+    /// the last [`TileSource::prepare`] (the tiles of their cones to evaluate), at the cost a
+    /// cone tile has taken lately ([`FinestEvaluations::cost`], else [`PROBE_COST`]) and a
+    /// quarter more, fits before `deadline` less [`STAGE_MARGIN`]; and they are evaluated in
+    /// groups against the clock (see [`TileSource::prepare`]). Call it once a frame, as staging
+    /// starts: it ages the cost. Each tile evaluated here is withdrawn from the queue, so none
+    /// is evaluated twice. Without evaluations ([`StoreSource::new`]), it changes nothing.
     #[must_use]
     pub fn evaluating_until(mut self, deadline: Instant) -> Self {
         if let Some(evaluations) = self.evaluations.as_deref_mut() {
@@ -396,20 +408,23 @@ impl<'a> StoreSource<'a> {
         self.store.evaluate_many(&inputs, Evaluation::Positions)
     }
 
-    /// Evaluates requested finest tiles `keys` here, in order, a group at a time, the clock
-    /// read before each: a group is as many tiles as [`GROUP_TIME`] holds at the dearer of the
-    /// estimate and the dearest this frame has measured (one, the frame's first), and fewer if
-    /// the time left before the deadline less [`STAGE_MARGIN`] holds fewer at a quarter more.
-    /// When it holds none, the rest are cut: deferred for the rest of the frame, and left
-    /// queued. So an estimate however wrong overruns by one group at most, and the frame's
-    /// first group is a single tile, measured. Each tile evaluated is withdrawn from the queue.
+    /// Evaluates requested finest tiles `keys` here, each with its work, in order, a group at a
+    /// time, the clock read before each.
+    ///
+    /// A group is as much work as [`GROUP_TIME`] holds at the dearer of the estimate and the
+    /// dearest this frame has measured (one tile, the frame's first), and less if the time left
+    /// before the deadline less [`STAGE_MARGIN`] holds less at a quarter more. When it holds
+    /// not even the next tile, the rest are cut: deferred for the rest of the frame, and left
+    /// queued. So an estimate however wrong overruns by one group at most. Each tile evaluated
+    /// is withdrawn from the queue.
     ///
     /// # Errors
     ///
     /// As [`TileStore::evaluate_many`].
-    fn evaluate_requested(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {
+    fn evaluate_requested(&mut self, keys: &[(TileKey, usize)]) -> Result<(), CacheError> {
         let Some(until) = self.until else {
-            return self.evaluate_positions(keys);
+            let keys: Vec<TileKey> = keys.iter().map(|&(key, _)| key).collect();
+            return self.evaluate_positions(&keys);
         };
         let mut at = 0;
         while at < keys.len() {
@@ -418,64 +433,72 @@ impl<'a> StoreSource<'a> {
                 .as_deref()
                 .and_then(FinestEvaluations::cost)
                 .unwrap_or(PROBE_COST);
-            let (each, most) = match self.frame_cost {
-                Some(measured) => {
-                    let each = measured.max(estimate);
-                    let fits = GROUP_TIME.as_nanos() / each.as_nanos().max(1);
-                    (each, usize::try_from(fits).unwrap_or(usize::MAX).max(1))
-                }
-                None => (estimate, 1),
-            };
+            let each = self.frame_cost.map_or(estimate, |cost| cost.max(estimate));
             let room = until
                 .saturating_duration_since(Instant::now())
                 .saturating_sub(STAGE_MARGIN);
-            let dear = each.saturating_add(each / 4).as_nanos().max(1);
-            let fit = usize::try_from(room.as_nanos() / dear).unwrap_or(usize::MAX);
-            let group = most.min(fit).min(keys.len() - at);
+            let dear = |work: usize| {
+                let work = u32::try_from(work.max(1)).unwrap_or(u32::MAX);
+                each.saturating_add(each / 4).saturating_mul(work)
+            };
+            let mut group = 0;
+            let mut work = 0;
+            for &(_, more) in keys.get(at..).unwrap_or_default() {
+                let next = work + more;
+                let first = group == 0;
+                if dear(next) > room
+                    || (!first && (self.frame_cost.is_none() || dear(next) > GROUP_TIME))
+                {
+                    break;
+                }
+                group += 1;
+                work = next;
+            }
             if group == 0 {
                 break;
             }
             let Some(batch) = keys.get(at..at + group) else {
                 break;
             };
+            let batch: Vec<TileKey> = batch.iter().map(|&(key, _)| key).collect();
             let began = Instant::now();
-            self.evaluate_positions(batch)?;
+            self.evaluate_positions(&batch)?;
             #[cfg(test)]
-            std::thread::sleep(self.slow * u32::try_from(group).unwrap_or(u32::MAX));
-            let took = began.elapsed() / u32::try_from(group).unwrap_or(u32::MAX).max(1);
+            std::thread::sleep(self.slow * u32::try_from(work.max(1)).unwrap_or(u32::MAX));
+            let took = began.elapsed() / u32::try_from(work.max(1)).unwrap_or(u32::MAX);
             self.frame_cost = Some(self.frame_cost.map_or(took, |cost| cost.max(took)));
             if let Some(evaluations) = self.evaluations.as_deref_mut() {
                 evaluations.note_cost(took);
             }
-            self.done_here.extend(batch.iter().copied());
             // Evaluated here: the queue lets them go, so none is evaluated twice.
             self.store.retain_evaluation(|key| !batch.contains(key));
+            self.done_here.extend(batch);
             at += group;
         }
-        self.cut
-            .extend(keys.get(at..).unwrap_or_default().iter().copied());
+        let rest = keys.get(at..).unwrap_or_default();
+        self.cut.extend(rest.iter().map(|&(key, _)| key));
         Ok(())
     }
 
-    /// Whether requested finest tile `key`, without a copy, fits in the time left to be
-    /// evaluated here: see [`StoreSource::evaluating_until`].
-    fn fits_here(&self, key: &TileKey) -> bool {
+    /// Notes that a tile was deferred for want of time at the cost estimated.
+    fn starved(&mut self) {
+        if let Some(evaluations) = self.evaluations.as_deref_mut() {
+            evaluations.note_starved();
+        }
+    }
+
+    /// Whether requested finest tile `key`, of `work`, fits in the time left to be evaluated
+    /// here beside the work let through already: see [`StoreSource::evaluating_until`].
+    fn fits_here(&self, work: usize) -> bool {
         let (Some(until), Some(evaluations)) = (self.until, self.evaluations.as_deref()) else {
             return false;
         };
-        if self.reserved.contains(key) {
-            return true;
-        }
         let room = until
             .saturating_duration_since(Instant::now())
             .saturating_sub(STAGE_MARGIN);
-        match evaluations.cost() {
-            None => self.reserved.is_empty() && room >= PROBE_COST,
-            Some(cost) => {
-                let tiles = u32::try_from(self.reserved.len() + 1).unwrap_or(u32::MAX);
-                cost.saturating_add(cost / 4).saturating_mul(tiles) <= room
-            }
-        }
+        let each = evaluations.cost().unwrap_or(PROBE_COST);
+        let work = u32::try_from((self.reserved_work + work).max(1)).unwrap_or(u32::MAX);
+        each.saturating_add(each / 4).saturating_mul(work) <= room
     }
 }
 
@@ -492,12 +515,11 @@ pub const GROUP_TIME: std::time::Duration = std::time::Duration::from_micros(700
 /// It is for the rest of staging after them: writing their records and the tile tree's nodes.
 pub const STAGE_MARGIN: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// What a requested finest tile is taken to cost when no cost has been measured.
+/// What a tile of a requested finest tile's cone is taken to cost when none has been measured.
 ///
-/// The time left must hold it before the first is evaluated while staging, alone, to measure
-/// one (a cold tile, its cone read from the file, measured about 0.8 ms on the benchmark
-/// project).
-pub const PROBE_COST: std::time::Duration = std::time::Duration::from_millis(1);
+/// Evaluated while staging: on the dear side of the 20–50 µs measured on the benchmark
+/// project, so the first tiles let through take less than the time they are given.
+pub const PROBE_COST: std::time::Duration = std::time::Duration::from_micros(100);
 
 impl TileSource for StoreSource<'_> {
     type Error = CacheError;
@@ -510,11 +532,16 @@ impl TileSource for StoreSource<'_> {
         // are evaluated against the clock; the rest (a pending epoch's) together, whatever the
         // time, since the epoch switches whole.
         let reserved = std::mem::take(&mut self.reserved);
+        self.reserved_work = 0;
         let unread = finest
             .into_iter()
             .filter(|key| self.evaluated(key).is_none());
         let (requested, others): (Vec<TileKey>, Vec<TileKey>) =
-            unread.partition(|key| reserved.contains(key));
+            unread.partition(|key| reserved.contains_key(key));
+        let requested: Vec<(TileKey, usize)> = requested
+            .into_iter()
+            .map(|key| (key, reserved.get(&key).copied().unwrap_or(1)))
+            .collect();
         if !others.is_empty() {
             self.evaluate_positions(&others)?;
         }
@@ -540,19 +567,33 @@ impl TileSource for StoreSource<'_> {
         {
             return false;
         }
-        if self.cut.contains(&key) {
-            return true;
-        }
-        if self.fits_here(&key) {
-            self.reserved.insert(key);
+        if self.reserved.contains_key(&key) {
             return false;
         }
-        if self.until.is_some()
-            && let Some(evaluations) = self.evaluations.as_deref_mut()
-        {
-            evaluations.note_starved();
+        if self.until.is_none() || self.cut.contains(&key) || self.cold.contains(&key) {
+            return true;
         }
-        true
+        // No time for even the least work: the cone isn't listed.
+        if !self.fits_here(1) {
+            self.starved();
+            return true;
+        }
+        // Only a tile whose cone is in memory: a cold one would wait on the file here, which no
+        // estimate or clock bounds; the queue reads it ahead instead.
+        let Ok(Some(work)) = self.store.cone_work(&key) else {
+            self.cold.insert(key);
+            return true;
+        };
+        // A tile whose cone is current still costs its gather: one tile's work at the least.
+        let work = work.max(1);
+        if !self.fits_here(work) {
+            self.cut.insert(key);
+            self.starved();
+            return true;
+        }
+        self.reserved.insert(key, work);
+        self.reserved_work += work;
+        false
     }
 
     fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, CacheError> {

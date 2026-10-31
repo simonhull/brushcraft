@@ -43,7 +43,8 @@ use crate::residency::Residency;
 pub struct FinestEvaluations {
     /// Copies taken from the store and not outdated since, until staged.
     held: BTreeMap<TileKey, EvaluatedTile>,
-    /// What a requested finest tile evaluated while staging has cost lately, if one has.
+    /// What a tile of a requested finest tile's cone, evaluated while staging, has cost lately,
+    /// if one has.
     cost: Option<Duration>,
     /// Whether a frame's staging since the last [`FinestEvaluations::begin_staging`] deferred a
     /// tile for want of time at that cost.
@@ -114,7 +115,8 @@ impl FinestEvaluations {
         self.held.get(key)
     }
 
-    /// What a requested finest tile evaluated while staging has cost lately, if one has been
+    /// What a tile of a requested finest tile's cone ([`TileStore::cone_work`]), evaluated while
+    /// staging, has cost lately, if one has been
     /// ([`StoreSource::evaluating_until`](super::StoreSource::evaluating_until)): what the time
     /// left is counted in. It follows a dearer tile at once and a cheaper one half way, so it
     /// stays on the dear side; and it halves after a frame whose staging evaluated nothing
@@ -125,7 +127,7 @@ impl FinestEvaluations {
         self.cost
     }
 
-    /// Notes that a requested finest tile evaluated while staging cost `each`.
+    /// Notes that a tile of a requested finest tile's cone, evaluated while staging, cost `each`.
     pub(crate) fn note_cost(&mut self, each: Duration) {
         self.cost = Some(match self.cost {
             Some(cost) if each < cost => (cost + each) / 2,

@@ -427,9 +427,9 @@ fn every_finest(store: &TileStore) -> Requests {
     )
 }
 
-/// A staging deadline that stages copies but leaves no time to evaluate a tile: less than
-/// [`STAGE_MARGIN`] and [`PROBE_COST`](crate::upload::PROBE_COST) together.
-const NO_SLACK: Duration = Duration::from_micros(1500);
+/// A staging deadline with time to stage copies: what the tests give a frame whose evaluation
+/// they make too dear to fit.
+const NO_SLACK: Duration = Duration::from_millis(50);
 
 /// Staging that may evaluate until `slack` from now, each tile `slow` slower.
 fn slack(slack: Duration, slow: Duration) -> Staging {
@@ -485,7 +485,8 @@ fn with_slack_a_due_tile_is_staged_in_its_frame_while_staging() {
     });
 }
 
-/// With no time left in the frame, a due tile waits for the queue, and is staged from its copy.
+/// With no time left in the frame for a tile at the cost estimated, a due tile waits for the
+/// queue, and is staged from its copy.
 #[test]
 fn without_slack_a_due_tile_is_staged_from_the_queue() {
     GpuTest::run(|gpu| {
@@ -496,6 +497,8 @@ fn without_slack_a_due_tile_is_staged_from_the_queue() {
         let mut residency = with_floor(gpu, &mesh, level(FINEST), store);
         let mut evaluations = FinestEvaluations::new();
         let (key, requests) = requested();
+        // A cost so dear no tile fits, for all the halving of the frames that defer one.
+        evaluations.note_cost(Duration::from_secs(3600));
         let tight = || slack(NO_SLACK, Duration::ZERO);
         for _ in 0..3 {
             let (here, _) = hybrid_frame(
@@ -655,6 +658,56 @@ fn with_slack_and_many_wanted_staging_takes_about_slack_over_cost() {
             queued - here,
             "each withdrawn from the queue"
         );
+        drop(project.close(false));
+    });
+}
+
+/// A due tile whose cone would be read from the file is never evaluated while staging, however
+/// much time the frame has: the queue reads it ahead, and it is staged from the queue's copy.
+#[test]
+fn a_tile_with_a_cold_cone_is_left_to_the_queue() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("hybrid-cold");
+        let mesh = cube_sphere(1).expect("a mesh");
+        let (path, config) = saved_edited(&dir, "cold.bcp", &mesh, level(FINEST));
+        let mut project = Project::open(&path, config).expect("opened");
+        let store = project.store();
+        let cursor = store.subscribe_stale();
+        let mut residency = with_floor(gpu, &mesh, level(FINEST), store);
+        let mut evaluations = FinestEvaluations::new();
+        let (key, requests) = requested();
+        assert_eq!(
+            store.cone_work(&key).expect("a tile"),
+            None,
+            "its cone is on the file"
+        );
+        let roomy = || slack(Duration::from_secs(1), Duration::ZERO);
+        for _ in 0..2 {
+            let (here, _) = hybrid_frame(
+                gpu,
+                &mut residency,
+                &mut evaluations,
+                store,
+                &cursor,
+                &requests,
+                roomy(),
+            );
+            assert_eq!(here, 0, "never evaluated while staging");
+        }
+        assert!(residency.slot(&key).is_none(), "left to the queue");
+        run_all_jobs(store);
+        let (here, _) = hybrid_frame(
+            gpu,
+            &mut residency,
+            &mut evaluations,
+            store,
+            &cursor,
+            &requests,
+            roomy(),
+        );
+        assert_eq!(here, 0, "staged from its copy");
+        assert!(residency.slot(&key).is_some(), "staged");
+        assert_eq!(shown(gpu, &residency, &key), evaluated(store, key));
         drop(project.close(false));
     });
 }
