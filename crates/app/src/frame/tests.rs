@@ -466,6 +466,99 @@ fn epochs_closed_between_frames_want_a_frame_to_take_them() {
 }
 
 #[test]
+fn a_frame_due_with_the_gpu_behind_waits_running_jobs_and_upkeep_then_starts() {
+    let dir = TestDir::new();
+    let mut owner = Owner::new(
+        project(&dir),
+        NoBrush,
+        NoUploads,
+        setup(Some(100)),
+        Instant::now(),
+    );
+    // Frames handed off and shown, the GPU finishing none: each runs a single slice of jobs.
+    let bound = u64::try_from(render::FRAMES_IN_FLIGHT).expect("small");
+    for number in 1..=bound {
+        let now = loop {
+            let now = Instant::now();
+            match owner.next(now) {
+                Next::Frame { .. } => break now,
+                Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
+                other @ (Next::Gpu | Next::Render | Next::Idle { .. }) => {
+                    panic!("frame {number} is due: {other:?}")
+                }
+            }
+        };
+        owner.frame(now, now, |_| Ok(())).expect("a frame");
+        owner.shown(Presented {
+            gpu_finished: 0,
+            ..presented(number)
+        });
+    }
+    assert!(
+        owner.project().store().has_jobs(),
+        "the display layer still building"
+    );
+    let due = loop {
+        let now = Instant::now();
+        match owner.next(now) {
+            Next::Gpu => break now,
+            Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
+            other @ (Next::Frame { .. } | Next::Render | Next::Idle { .. }) => {
+                panic!("the next frame waits for the GPU: {other:?}")
+            }
+        }
+    };
+    let busy = owner.wait_for_gpu(due, || Ok(0)).expect("waiting");
+    assert_eq!(busy, GpuWait::Worked, "the store's jobs ran meanwhile");
+    assert!(
+        owner.scheduler.wanted().contains(Reason::Converging),
+        "and want the frame for what they leave"
+    );
+    let later = owner.scheduler.upkeep_due() + Duration::from_millis(1);
+    owner.wait_for_gpu(later, || Ok(0)).expect("waiting");
+    assert_eq!(
+        owner.scheduler.upkeep_due(),
+        later + schedule::UPKEEP_INTERVAL,
+        "the upkeep ran, due meanwhile"
+    );
+    let ready = owner.wait_for_gpu(later, || Ok(bound)).expect("waiting");
+    assert_eq!(ready, GpuWait::Ready, "the GPU finished");
+    let Next::Frame { deadline } = owner.next(later) else {
+        panic!("the frame starts");
+    };
+    owner.frame(later, deadline, |_| Ok(())).expect("a frame");
+    let log = owner.phase_log().expect("a scripted run's log");
+    let waited = log.owner.last().expect("logged").gpu_wait;
+    assert_eq!(
+        waited,
+        later - due,
+        "from when it was due to when it started"
+    );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_wait_for_the_gpu_that_leads_to_no_frame_is_forgotten() {
+    let dir = TestDir::new();
+    let start = Instant::now();
+    let mut owner = Owner::new(project(&dir), NoBrush, NoUploads, setup(Some(2)), start);
+    let wait = owner.wait_for_gpu(start, || Ok(0)).expect("waiting");
+    assert_eq!(wait, GpuWait::Ready, "nothing in flight");
+    let later = start + Duration::from_secs(5);
+    assert!(matches!(owner.next(later), Next::Frame { .. }));
+    assert_eq!(
+        owner.gpu_wait_from,
+        Some(start),
+        "a frame is due: the wait leads to it"
+    );
+    // Minimised: no frame, so the wait is over, and the frame once shown again didn't wait.
+    owner.resize(None);
+    assert!(matches!(owner.next(later), Next::Idle { .. }));
+    assert_eq!(owner.gpu_wait_from, None, "no frame: no wait to count");
+    owner.close().expect("closed");
+}
+
+#[test]
 fn a_minimised_window_still_runs_its_upkeep() {
     let dir = TestDir::new();
     let mut owner = Owner::new(
