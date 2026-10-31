@@ -1829,6 +1829,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "stroke"
+version = "0.0.0"
+dependencies = [
+ "bolero",
+ "bytemuck",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"

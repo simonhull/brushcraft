@@ -12,6 +12,7 @@ publish = false
 geom = { path = "crates/geom" }
 store = { path = "crates/store" }
 input = { path = "crates/input" }
+stroke = { path = "crates/stroke" }
 brush = { path = "crates/brush" }
 sculpt = { path = "crates/sculpt" }
 render = { path = "crates/render" }
