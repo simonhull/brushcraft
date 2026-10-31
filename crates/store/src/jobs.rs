@@ -232,6 +232,10 @@ pub(crate) struct ConeSteps {
     cone_tile_cost: Option<Duration>,
     /// The time the steps through the cone held have taken so far.
     pub(crate) spent: Duration,
+    /// The dearest a tile of a cone has cost in this call of the jobs, if one has been
+    /// evaluated: the first group of a call is one tile, measured, and the next are sized at
+    /// the dearer of this and the estimate, so an estimate gone cheap overruns by one tile.
+    pub(crate) call_cost: Option<Duration>,
 }
 
 impl Default for ConeSteps {
@@ -251,6 +255,7 @@ impl ConeSteps {
             key_cost: KEY_COST,
             cone_tile_cost: None,
             spent: Duration::ZERO,
+            call_cost: None,
         }
     }
 
@@ -282,6 +287,12 @@ impl ConeSteps {
         usize::try_from(fits)
             .unwrap_or(usize::MAX)
             .clamp(1, ROUND_MAX_ALONE)
+    }
+
+    /// What a tile of a cone has cost lately in a step of the queued evaluation alone, on the
+    /// dear side, if one has been measured: what [`ConeSteps::tiles_alone`] counts in.
+    pub(crate) const fn cone_tile_cost(&self) -> Option<Duration> {
+        self.cone_tile_cost
     }
 
     /// How many tiles of a cone a step of the queued evaluation alone may evaluate with `left`

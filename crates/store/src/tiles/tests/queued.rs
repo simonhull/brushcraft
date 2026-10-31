@@ -363,22 +363,35 @@ fn run_jobs_ends_near_its_deadline_on_the_real_clock() {
     }
 }
 
-/// With the queue alone and every cone tile made slow, a call still ends near its deadline.
+/// With the queue alone, a call ends near its deadline even when its cone tiles turn ten
+/// times dearer than the cost it estimated.
 ///
-/// Within about a millisecond: each step is sized from the dear cost measured, the
-/// copies keep to the time left, and a step with too little time waits for the next call.
+/// Within about a millisecond: a call's first group is one tile, measured, and the next are
+/// sized at the dearer of that and the estimate, the clock read before each; a step with too
+/// little time waits for the next call.
 #[test]
-fn run_jobs_alone_keeps_its_deadline_under_a_slow_evaluation() {
+fn run_jobs_alone_keeps_its_deadline_when_its_estimate_is_ten_times_too_cheap() {
     let dir = TestDir::new();
     let mesh = mesh();
     let (mut store, _) = edited(&dir, &mesh, roomy());
     store
         .queue_evaluation_as(&prioritized(&mesh, 43), Evaluation::Positions)
         .unwrap();
-    store.hooks.slow_cone_tile = Duration::from_micros(100);
     let budget = Duration::from_millis(8);
+    // Calls at the tiles' own cost, until one is measured.
+    for _ in 0..3 {
+        store.run_jobs(Instant::now() + budget).unwrap();
+        drop(store.take_evaluated());
+    }
+    let estimate = store
+        .evaluation
+        .steps
+        .cone_tile_cost()
+        .expect("a cost measured");
+    // Every tile ten times that from now on (on top of its own cost).
+    store.hooks.slow_cone_tile = estimate * 10;
     let (mut worst, mut finished) = (Duration::ZERO, 0);
-    for _ in 0..20 {
+    for _ in 0..12 {
         let start = Instant::now();
         let report = store.run_jobs(start + budget).unwrap();
         worst = worst.max(start.elapsed().saturating_sub(budget));
@@ -389,7 +402,7 @@ fn run_jobs_alone_keeps_its_deadline_under_a_slow_evaluation() {
     // A millisecond, and as much again for a loaded machine's scheduler.
     assert!(
         worst <= Duration::from_millis(2),
-        "a call ran {worst:?} past its deadline"
+        "a call ran {worst:?} past its deadline (estimate {estimate:?})"
     );
 }
 

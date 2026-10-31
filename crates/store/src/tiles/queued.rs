@@ -27,6 +27,10 @@ const REFRESH_TIME: Duration = Duration::from_micros(300);
 /// whatever the time, so every call moves on.
 const MIN_STEP_TILES: usize = 8;
 
+/// About how long a group of a step's tiles takes, at the cost estimated: the clock is read
+/// between groups, so this is about what an estimate too cheap can overrun the deadline by.
+const GROUP_TIME_ALONE: Duration = Duration::from_micros(700);
+
 /// The time a slice of the queued evaluation may take when it has the jobs to itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Alone {
@@ -391,15 +395,55 @@ impl TileStore {
             steps.reset();
             return Ok(WholeStep::Step(ConeStep::Current(keys)));
         }
-        let evaluating = Instant::now();
-        self.evaluate_many(&targets, Evaluation::Positions)?;
-        #[cfg(test)]
-        std::thread::sleep(
-            self.hooks.slow_cone_tile * u32::try_from(targets.len()).unwrap_or(u32::MAX),
-        );
-        steps.took_tiles_alone(evaluating.elapsed(), targets.len());
+        // A group at a time, the clock read before each, so a cost estimated too cheap overruns
+        // by a group at most: a call's first group is one tile, measured, and the next are sized
+        // at the dearer of that and the estimate. The call's first slice goes whatever the time.
+        if alone.first {
+            steps.call_cost = None;
+        }
+        let mut done = 0;
+        while done < targets.len() {
+            let each = match (steps.call_cost, steps.cone_tile_cost()) {
+                (Some(call), Some(estimate)) => Some(call.max(estimate)),
+                (call, estimate) => call.or(estimate),
+            };
+            let group = match (steps.call_cost, each) {
+                (Some(_), Some(each)) => {
+                    let fits = GROUP_TIME_ALONE.as_nanos() / each.as_nanos().max(1);
+                    usize::try_from(fits).unwrap_or(usize::MAX).max(1)
+                }
+                _ => 1,
+            }
+            .min(targets.len() - done);
+            let need = each
+                .unwrap_or_default()
+                .saturating_mul(u32::try_from(group).unwrap_or(u32::MAX));
+            if (done > 0 || !alone.first) && began.elapsed().saturating_add(need) > alone.left {
+                break;
+            }
+            let Some(batch) = targets.get(done..done + group) else {
+                break;
+            };
+            let evaluating = Instant::now();
+            self.evaluate_many(batch, Evaluation::Positions)?;
+            #[cfg(test)]
+            std::thread::sleep(
+                self.hooks.slow_cone_tile * u32::try_from(group).unwrap_or(u32::MAX),
+            );
+            let took = evaluating.elapsed();
+            steps.took_tiles_alone(took, group);
+            let measured = took / u32::try_from(group).unwrap_or(u32::MAX).max(1);
+            steps.call_cost = Some(steps.call_cost.map_or(measured, |cost| cost.max(measured)));
+            done += group;
+        }
         steps.spent += began.elapsed();
-        steps.seen.extend(targets);
+        if done == 0 {
+            return Ok(WholeStep::Spent);
+        }
+        let whole = whole && done == targets.len();
+        steps
+            .seen
+            .extend(targets.get(..done).unwrap_or_default().iter().copied());
         if whole {
             steps.took_keys(steps.spent, keys.len());
             steps.reset();
