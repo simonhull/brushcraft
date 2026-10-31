@@ -337,10 +337,14 @@ impl<'a> StoreSource<'a> {
     /// the last [`TileSource::prepare`], at the cost per tile measured lately
     /// ([`FinestEvaluations::cost`]) and a quarter more, fit before `deadline` less
     /// [`STAGE_MARGIN`]; with no cost measured yet, one tile at a time, if [`PROBE_COST`] fits.
+    /// Call it once a frame, as staging starts: it ages the cost ([`FinestEvaluations::cost`]).
     /// Each tile evaluated here is withdrawn from the queue, so none is evaluated twice.
     /// Without evaluations ([`StoreSource::new`]), it changes nothing.
     #[must_use]
-    pub const fn evaluating_until(mut self, deadline: Instant) -> Self {
+    pub fn evaluating_until(mut self, deadline: Instant) -> Self {
+        if let Some(evaluations) = self.evaluations.as_deref_mut() {
+            evaluations.begin_staging();
+        }
         self.until = Some(deadline);
         self
     }
@@ -459,6 +463,11 @@ impl TileSource for StoreSource<'_> {
         if self.fits_here(&key) {
             self.reserved.insert(key);
             return false;
+        }
+        if self.until.is_some()
+            && let Some(evaluations) = self.evaluations.as_deref_mut()
+        {
+            evaluations.note_starved();
         }
         true
     }

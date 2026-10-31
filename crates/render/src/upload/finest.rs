@@ -45,6 +45,11 @@ pub struct FinestEvaluations {
     held: BTreeMap<TileKey, EvaluatedTile>,
     /// What a requested finest tile evaluated while staging has cost lately, if one has.
     cost: Option<Duration>,
+    /// Whether a frame's staging since the last [`FinestEvaluations::begin_staging`] deferred a
+    /// tile for want of time at that cost.
+    starved: bool,
+    /// Whether one measured the cost since then.
+    measured: bool,
 }
 
 impl FinestEvaluations {
@@ -111,8 +116,10 @@ impl FinestEvaluations {
 
     /// What a requested finest tile evaluated while staging has cost lately, if one has been
     /// ([`StoreSource::evaluating_until`](super::StoreSource::evaluating_until)): what the time
-    /// left is counted in. It follows a dearer tile at once and a cheaper one by a quarter, so
-    /// it stays on the dear side.
+    /// left is counted in. It follows a dearer tile at once and a cheaper one half way, so it
+    /// stays on the dear side; and it halves after a frame whose staging evaluated nothing
+    /// while it deferred tiles for want of time (as the next frame's staging begins), so one
+    /// cold tile can't keep staging from ever measuring again.
     #[must_use]
     pub const fn cost(&self) -> Option<Duration> {
         self.cost
@@ -121,9 +128,26 @@ impl FinestEvaluations {
     /// Notes that a requested finest tile evaluated while staging cost `each`.
     pub(crate) fn note_cost(&mut self, each: Duration) {
         self.cost = Some(match self.cost {
-            Some(cost) if each < cost => (cost * 3 + each) / 4,
+            Some(cost) if each < cost => (cost + each) / 2,
             _ => each,
         });
+        self.measured = true;
+    }
+
+    /// Notes that staging deferred a tile for want of time at the cost measured.
+    pub(crate) const fn note_starved(&mut self) {
+        self.starved = true;
+    }
+
+    /// Starts a frame's staging: if the last deferred tiles for want of time and measured
+    /// nothing, the cost halves, so a dear estimate from one cold tile lets tiles through again
+    /// within a few frames and is measured anew.
+    pub(crate) fn begin_staging(&mut self) {
+        if self.starved && !self.measured {
+            self.cost = self.cost.map(|cost| cost / 2);
+        }
+        self.starved = false;
+        self.measured = false;
     }
 
     /// How many copies are held, waiting to be staged.
