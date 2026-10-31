@@ -165,6 +165,7 @@
 //! desktop budget's ~60k. On a tablet (unified memory, but a slower copy) that is worth a
 //! readback only every few frames, or of the cut's changes; residency tolerates a stale cut.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -277,8 +278,60 @@ const READBACKS: usize = 3;
 /// Step uniforms: levels for the sweep and passes for the relaxation, one per dynamic offset.
 const STEPS: u32 = 32;
 
-/// Timed stages: bounds, choose, relax, sweep, emit, post.
+/// Timed stages: bounds, choose, relax, sweep, emit, post ([`Stage`]).
 const STAGES: u32 = 6;
+
+/// A stage timed by [`Lod::enable_timing`]: a pass of its own, with a pair of timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// The bounds pass.
+    Bounds,
+    /// Choose, close, threshold and mark.
+    Choose,
+    /// The relaxation passes.
+    Relax,
+    /// The sweep.
+    Sweep,
+    /// Emit and finish.
+    Emit,
+    /// The second phase.
+    Post,
+}
+
+impl Stage {
+    /// Its place among the timer's stages: its timestamps are queries `2 * index` (begin) and
+    /// `2 * index + 1` (end).
+    const fn index(self) -> u32 {
+        self as u32
+    }
+}
+
+/// The stages a frame encoded, one bit a stage: those whose timestamps are this frame's. A
+/// stage not encoded leaves its queries as an earlier frame wrote them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StagesRan(u8);
+
+impl StagesRan {
+    /// These and `stage`.
+    const fn with(self, stage: Stage) -> Self {
+        Self(self.0 | 1 << stage.index())
+    }
+
+    /// Whether the stage at `index` ran.
+    const fn has(self, index: u32) -> bool {
+        index < u8::BITS && self.0 & 1 << index != 0
+    }
+}
+
+/// How to read the stages' timestamps: a tick's length, and the stages that ran in the frame
+/// they are of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StageClock {
+    /// Nanoseconds a tick.
+    period: f32,
+    /// The stages whose timestamps are the frame's own.
+    ran: StagesRan,
+}
 
 /// One visible cluster as the raster reads it ([`CLUSTER_WGSL`]'s `Cluster`).
 #[repr(C)]
@@ -891,8 +944,8 @@ pub struct MorphInputs<'a> {
 #[derive(Debug)]
 enum Readback {
     /// Mapped, the results of frame `1` in it, and its stages' timestamps at its end if `2`
-    /// says how long a tick is.
-    Mapped(Buffer, u64, Option<f32>),
+    /// says how to read them.
+    Mapped(Buffer, u64, Option<StageClock>),
     /// Mapping failed; the buffer is gone.
     Failed,
 }
@@ -915,8 +968,8 @@ pub struct CutReadback {
     buffer: Option<Buffer>,
     /// The frame it is of.
     frame: u64,
-    /// Nanoseconds a timestamp tick, if the stages' timestamps were copied to the buffer's end.
-    period: Option<f32>,
+    /// How to read the stages' timestamps, if they were copied to the buffer's end.
+    clock: Option<StageClock>,
     /// Where it goes once mapped: to the reader.
     done: Sender<Readback>,
     /// Where an unread one goes back.
@@ -930,10 +983,10 @@ impl CutReadback {
         if let Some(buffer) = self.buffer.take() {
             let back = buffer.clone();
             let done = self.done.clone();
-            let (frame, period) = (self.frame, self.period);
+            let (frame, clock) = (self.frame, self.clock);
             buffer.map_async(MapMode::Read, .., move |result| {
                 let readback = if result.is_ok() {
-                    Readback::Mapped(back, frame, period)
+                    Readback::Mapped(back, frame, clock)
                 } else {
                     Readback::Failed
                 };
@@ -978,12 +1031,12 @@ impl CutReader {
     pub fn collect(&self, finest: Level) -> Result<Option<LodOutput>, LodError> {
         let mut latest = None;
         while let Ok(back) = self.mapped.try_recv() {
-            let Readback::Mapped(buffer, frame, period) = back else {
+            let Readback::Mapped(buffer, frame, clock) = back else {
                 // A level choice that's gone has no count to correct.
                 drop(self.back.send(Returned::Lost));
                 continue;
             };
-            let read = read_output(&buffer, finest, frame, period);
+            let read = read_output(&buffer, finest, frame, clock);
             buffer.unmap();
             // A level choice that's gone has nothing to take back.
             drop(self.back.send(Returned::Free(buffer)));
@@ -1011,13 +1064,19 @@ pub struct LodTimings {
 }
 
 impl LodTimings {
-    /// The stages' times from their timestamps, two a stage (begin, end) in stage order, a tick
-    /// `period` nanoseconds; a stage with no ticks reads as zero.
-    fn from_ticks(ticks: &[u64], period: f32) -> Self {
-        let stage = |index: usize| {
-            let begin = ticks.get(2 * index).copied().unwrap_or(0);
-            let end = ticks.get(2 * index + 1).copied().unwrap_or(0);
-            ticks_to_duration(end.saturating_sub(begin), period)
+    /// The stages' times from their timestamps, two a stage (begin, end) in stage order, read
+    /// by `clock`. A stage that didn't run reads as zero, whatever an earlier frame left in its
+    /// queries; so does one with no ticks.
+    fn from_ticks(ticks: &[u64], clock: StageClock) -> Self {
+        let stage = |index: u32| {
+            if !clock.ran.has(index) {
+                return Duration::ZERO;
+            }
+            let at = |offset: u32| {
+                let slot = usize::try_from(2 * index + offset).unwrap_or(usize::MAX);
+                ticks.get(slot).copied().unwrap_or(0)
+            };
+            ticks_to_duration(at(1).saturating_sub(at(0)), clock.period)
         };
         Self {
             bounds: stage(0),
@@ -1044,6 +1103,12 @@ struct Timer {
     staging: Buffer,
     /// Nanoseconds a tick.
     period: f32,
+    /// The stages encoded since the last readback. A cell: the second phase is encoded through
+    /// a shared borrow ([`Lod::encode_post`]).
+    ran: Cell<StagesRan>,
+    /// The stages whose ticks [`Timer::resolved`] holds as this frame's, as of the last
+    /// readback.
+    resolved_ran: StagesRan,
 }
 
 /// The level choice: its passes, the buffers it writes, and its readbacks.
@@ -1355,7 +1420,12 @@ impl Lod {
         update: &BoundsUpdate,
         slots: &SlotBuffers,
     ) -> Result<(), LodError> {
-        let writes = self.timer.as_ref().map(|timer| timer.writes(0));
+        // No tile changed, no pass: the stage didn't run.
+        let writes = self
+            .timer
+            .as_ref()
+            .filter(|_| !update.is_empty())
+            .map(|timer| timer.writes(Stage::Bounds));
         self.bounds
             .encode(gpu, encoder, tree, update, slots, writes)?;
         Ok(())
@@ -1391,7 +1461,7 @@ impl Lod {
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod choose"),
-                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(1)),
+                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Choose)),
             });
             pass.set_bind_group(0, &group, &[0]);
             pass.set_bind_group(1, &phase, &[]);
@@ -1409,7 +1479,7 @@ impl Lod {
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod relax"),
-                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(2)),
+                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Relax)),
             });
             for index in 0..passes {
                 pass.set_pipeline(&p.relax);
@@ -1427,7 +1497,7 @@ impl Lod {
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod sweep"),
-                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(3)),
+                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Sweep)),
             });
             pass.set_bind_group(1, &phase, &[]);
             pass.set_pipeline(&p.sweep);
@@ -1439,7 +1509,7 @@ impl Lod {
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod emit"),
-                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(4)),
+                timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Emit)),
             });
             pass.set_bind_group(0, &group, &[0]);
             pass.set_bind_group(1, &phase, &[]);
@@ -1540,7 +1610,7 @@ impl Lod {
         let phase = self.phase_group(gpu, true, pyramid)?;
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("lod post"),
-            timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(5)),
+            timestamp_writes: self.timer.as_ref().map(|timer| timer.writes(Stage::Post)),
         });
         pass.set_bind_group(0, group, &[0]);
         pass.set_bind_group(1, &phase, &[]);
@@ -1566,6 +1636,8 @@ impl Lod {
         frame: u64,
     ) -> Result<Option<CutReadback>, LodError> {
         self.take_unused();
+        // The stages encoded since the last readback are this frame's, read back or not.
+        let ran = self.timer.as_ref().map(|timer| timer.ran.take());
         let buffer = match self.free.pop() {
             Some(buffer) => buffer,
             None if self.made < READBACKS => {
@@ -1586,21 +1658,26 @@ impl Lod {
         };
         encoder.copy_buffer_to_buffer(&self.frame, 0, &buffer, 0, FRAME_BYTES);
         encoder.copy_buffer_to_buffer(&self.cut, 0, &buffer, FRAME_BYTES, self.cut.size());
-        let mut period = None;
-        if let Some(timer) = &self.timer {
+        let mut clock = None;
+        if let Some(timer) = &mut self.timer {
+            let ran = ran.unwrap_or_default();
             encoder.resolve_query_set(&timer.queries, 0..2 * STAGES, &timer.resolved, 0);
+            timer.resolved_ran = ran;
             // At the buffer's end, if it was made with room for them (made before timing was
             // turned on, it wasn't).
             if buffer.size() >= FRAME_BYTES + self.cut.size() + TIMER_BYTES {
                 let at = buffer.size() - TIMER_BYTES;
                 encoder.copy_buffer_to_buffer(&timer.resolved, 0, &buffer, at, TIMER_BYTES);
-                period = Some(timer.period);
+                clock = Some(StageClock {
+                    period: timer.period,
+                    ran,
+                });
             }
         }
         Ok(Some(CutReadback {
             buffer: Some(buffer),
             frame,
-            period,
+            clock,
             done: self.done.clone(),
             unused: self.returns.clone(),
         }))
@@ -1673,6 +1750,8 @@ impl Lod {
                     BufferUsages::COPY_DST | BufferUsages::MAP_READ,
                 ),
                 period,
+                ran: Cell::new(StagesRan::default()),
+                resolved_ran: StagesRan::default(),
             }
         })?;
         self.timer = Some(timer);
@@ -1681,7 +1760,7 @@ impl Lod {
 
     /// The stages' times of the last frame encoded with [`Lod::encode_readback`], waiting for
     /// the GPU (for tools and benchmarks); `None` without timing. A stage not encoded that
-    /// frame reads as zero.
+    /// frame (the bounds, with no tile changed) reads as zero, never as an earlier frame's.
     ///
     /// # Errors
     ///
@@ -1691,7 +1770,11 @@ impl Lod {
             return Ok(None);
         };
         let ticks: Vec<u64> = gpu.read_buffer_with(&timer.resolved, &timer.staging)?;
-        Ok(Some(LodTimings::from_ticks(&ticks, timer.period)))
+        let clock = StageClock {
+            period: timer.period,
+            ran: timer.resolved_ran,
+        };
+        Ok(Some(LodTimings::from_ticks(&ticks, clock)))
     }
 
     /// Group 0 for this frame: the tree, request and morph buffers are the caller's (the
@@ -1931,18 +2014,19 @@ impl Pipelines {
 }
 
 impl Timer {
-    /// Stage `stage`'s timestamp writes.
-    fn writes(&self, stage: u32) -> ComputePassTimestampWrites<'_> {
+    /// Stage `stage`'s timestamp writes, noting that it ran this frame.
+    fn writes(&self, stage: Stage) -> ComputePassTimestampWrites<'_> {
+        self.ran.set(self.ran.get().with(stage));
         ComputePassTimestampWrites {
             query_set: &self.queries,
-            beginning_of_pass_write_index: Some(2 * stage),
-            end_of_pass_write_index: Some(2 * stage + 1),
+            beginning_of_pass_write_index: Some(2 * stage.index()),
+            end_of_pass_write_index: Some(2 * stage.index() + 1),
         }
     }
 }
 
 /// The results in a mapped readback buffer, of frame `tag`, with the stages' timestamps at its
-/// end if `period` (nanoseconds a tick) is given.
+/// end if `clock` says how to read them.
 ///
 /// # Errors
 ///
@@ -1951,7 +2035,7 @@ fn read_output(
     buffer: &Buffer,
     finest: Level,
     tag: u64,
-    period: Option<f32>,
+    clock: Option<StageClock>,
 ) -> Result<LodOutput, LodError> {
     let view = buffer.get_mapped_range(..).map_err(GpuError::from)?;
     let frame_end = usize::try_from(FRAME_BYTES).unwrap_or(usize::MAX);
@@ -1959,18 +2043,18 @@ fn read_output(
         .get(..frame_end)
         .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
         .unwrap_or_else(GpuFrame::zeroed);
-    let timer_start = match period {
+    let timer_start = match clock {
         Some(_) => view
             .len()
             .saturating_sub(usize::try_from(TIMER_BYTES).unwrap_or(usize::MAX)),
         None => view.len(),
     };
-    let timings = period.map(|period| {
+    let timings = clock.map(|clock| {
         let ticks: Vec<u64> = view
             .get(timer_start..)
             .map(bytemuck::pod_collect_to_vec)
             .unwrap_or_default();
-        LodTimings::from_ticks(&ticks, period)
+        LodTimings::from_ticks(&ticks, clock)
     });
     // Only the entries written: the buffer holds the whole capacity's.
     let written_bytes = u64::from(frame.cut_count).saturating_mul(CUT_BYTES);

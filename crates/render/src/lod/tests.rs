@@ -1716,3 +1716,37 @@ fn the_cone_test_s_cosine_and_sine_are_within_a_millionth_up_to_a_quarter_turn()
     let worst = errors.fold(0.0, f64::max);
     assert!(worst < 1e-6, "worst {worst:e}");
 }
+
+#[test]
+fn a_stage_that_did_not_run_reads_zero_not_the_ticks_an_earlier_frame_left() {
+    // Every stage's queries hold ticks, the bounds' an earlier frame's: this frame changed no
+    // tile, so its bounds pass never ran.
+    let ticks = [100, 160, 200, 210, 300, 340, 400, 401, 500, 520, 600, 630];
+    let ran = [
+        Stage::Choose,
+        Stage::Relax,
+        Stage::Sweep,
+        Stage::Emit,
+        Stage::Post,
+    ]
+    .into_iter()
+    .fold(StagesRan::default(), StagesRan::with);
+    let read = LodTimings::from_ticks(&ticks, StageClock { period: 2.0, ran });
+    let ns = Duration::from_nanos;
+    let wanted = LodTimings {
+        bounds: Duration::ZERO,
+        choose: ns(20),
+        relax: ns(80),
+        sweep: ns(2),
+        emit: ns(40),
+        post: ns(60),
+    };
+    assert_eq!(read, wanted);
+    let only_bounds = StageClock {
+        period: 1.0,
+        ran: StagesRan::default().with(Stage::Bounds),
+    };
+    let bounds = LodTimings::from_ticks(&ticks, only_bounds);
+    assert_eq!(bounds.bounds, ns(60), "once it runs, its ticks count");
+    assert_eq!(bounds.choose, Duration::ZERO, "and only its");
+}
