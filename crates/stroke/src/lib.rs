@@ -12,22 +12,24 @@
 //! scene comes through two traits its callers implement: a [`Projector`] from the camera and a
 //! [`Surface`] to place dabs on.
 //!
-//! What is here so far:
+//! The parts:
 //! - **Input:** [`Sample`], one pen report in physical pixels and seconds on the pen's clock. The
 //!   app converts `input`'s de-jittered samples: `input` carries the platform's pen backends
 //!   (Wayland), and `stroke` depends on no windowing code.
 //! - **The path:** [`Path`], a speed-adaptive low-pass with an optional lazy string that never
 //!   loses a stroke's tail, configured by [`PathSettings`].
-//! - **Size:** [`Radius`] and [`SizeMode`].
+//! - **Size:** [`Radius`] and [`SizeMode`]; a screen radius is frozen into a world radius at the
+//!   stroke's first hit.
 //! - **Dynamics:** [`Dynamics`], a table of [`Entry`]s mapping an [`Input`] through a [`Curve`]
 //!   onto a [`Param`]; [`StrokeRandom`] for the random input.
 //! - **The scene:** [`Projector`] (screen to world [`Ray`]s, and pixel size at a depth) and
 //!   [`Surface`] (raycasts, continuity, and the closest point on the stroke's region), in `f64`
 //!   world space ([`DVec3`]), with [`Hit`]s on the base mesh.
+//! - **Placement and symmetry:** [`Stroke`] walks the path into dabs a set surface distance apart,
+//!   keeps them on the stroke's own region ([`REACH_RADII`]), gives each a frame, and copies each
+//!   through the [`Symmetry`].
 //! - **Settings:** [`StrokeSettings`], validated plain data with a versioned byte form.
 //! - **Output:** [`Dab`], plain data shared by the CPU and the GPU.
-//!
-//! Placing dabs on the surface (spacing, the size freeze, symmetry copies) comes next.
 //!
 //! Design: `specs/2026-10-31-brush-engine-design.md` §1 in the docs repo.
 
@@ -35,10 +37,16 @@ mod curve;
 mod dab;
 mod dynamics;
 mod path;
+mod place;
 mod sample;
 mod settings;
 mod size;
+mod stroke;
 mod surface;
+mod symmetry;
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+mod tests;
 mod unit;
 mod vector;
 
@@ -49,12 +57,14 @@ pub use dynamics::{
     MAX_ENTRIES, Param, StrokeRandom, Values,
 };
 pub use path::{Path, PathError, PathSettings};
+pub use place::{REACH_RADII, SPACING_TOLERANCE};
 pub use sample::{Buttons, Sample, SampleError, ScreenPoint, Tilt, Twist};
 pub use settings::{
     Axis, DecodeError, MirrorPlanes, Radial, SettingsError, Spacing, StrokeSettings, Symmetry,
     SymmetryError,
 };
 pub use size::{Radius, RadiusError, SizeMode};
+pub use stroke::{Stroke, StrokeId};
 pub use surface::{Hit, Projector, Ray, Surface};
 pub use unit::{NotUnit, Unit};
 pub use vector::DVec3;

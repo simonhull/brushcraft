@@ -268,6 +268,16 @@ impl Radial {
 /// in X with six radial copies makes twelve. [`Symmetry::copies`] counts them. The default has
 /// neither: each dab is placed once.
 ///
+/// **Copy indices** ([`Dab::copy`](crate::Dab::copy)): the mirror images are numbered `0` (the
+/// dab itself) then each non-empty subset of the planes in the order of their bits (X, Y, XY, Z,
+/// XZ, YZ, XYZ, those active), and the turns `0..n`; copy `image · n + turn` is mirror image
+/// `image` turned `turn` steps, so an index always names the same map. A copy that coincides with
+/// an earlier one of the same dab (within 1 % of its radius: a dab on a mirror plane or the
+/// radial axis) is dropped, leaving a gap in the indices.
+///
+/// Each copy's frame goes through its map (normal and tangent alike), and a copy mirrored through
+/// an odd number of planes has its alpha angle negated, since a reflection reverses rotation.
+///
 /// Topological symmetry (through a correspondence between base faces) will join these as a third
 /// kind; its bit in the byte form is reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

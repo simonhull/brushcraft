@@ -102,7 +102,7 @@ pub trait Projector {
 /// stroke differs.
 ///
 /// **Errors.** The methods can't fail: an implementation that hits an error (a store read) keeps
-/// it, answers `None` or `false`, and its owner checks after each `Stroke` call
+/// it, answers `None` or `false`, and its owner checks after each [`Stroke`](crate::Stroke) call
 /// and ends the stroke there. The engine places no dab where the surface gave no answer.
 pub trait Surface {
     /// Where `ray` first meets the surface, or `None` if it misses.

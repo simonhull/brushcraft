@@ -33,7 +33,8 @@ pub struct Dab {
     /// The dab's place in its stroke: `0` for the first dab, counting up. Symmetry copies of one
     /// dab share it.
     pub seq: u32,
-    /// Which symmetry copy this is: `0` for the dab under the pen.
+    /// Which symmetry copy this is: `0` for the dab under the pen; the others are numbered as
+    /// [`Symmetry`](crate::Symmetry) describes.
     pub copy: u32,
     /// When the dab was placed, in seconds since its stroke began on the pen's clock.
     pub time: f32,
