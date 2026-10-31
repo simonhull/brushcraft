@@ -51,22 +51,6 @@ const CLUSTER_MASK: u32 = 0x3fu;
 // Bits of its quad.
 const QUAD_MASK: u32 = 0x3fu;
 
-// A vertex's attributes besides its position: its unit normal (xyz) and roughness term (w).
-fn attributes(n: u32, placed: Placed) -> vec4<f32> {
-    let slot = tree[n].slot;
-    let side = node_side(n);
-    let v = tile_vertex(slot, side, placed.at.x, placed.at.y);
-    let own = vec4<f32>(v.normal, v.roughness);
-    if placed.t >= 1.0 {
-        return own;
-    }
-    // Morphing: carried from its parents' midpoint the same way as its position.
-    let a = tile_vertex(slot, side, placed.from_a.x, placed.from_a.y);
-    let b = tile_vertex(slot, side, placed.from_b.x, placed.from_b.y);
-    let mid = (vec4<f32>(a.normal, a.roughness) + vec4<f32>(b.normal, b.roughness)) * 0.5;
-    return mix(mid, own, placed.t);
-}
-
 // The pixel position (x right, y down, from the top-left corner) clip point `c` projects to;
 // only for a point in front of the eye (c.w > 0).
 fn screen(c: vec4<f32>) -> vec2<f32> {
@@ -272,9 +256,9 @@ fn rebuild(pixel: vec2<u32>) -> Rebuilt {
         corner1 = placed2;
         corner2 = placed3;
     }
-    let a0 = attributes(n, placed0);
-    let a1 = attributes(n, corner1);
-    let a2 = attributes(n, corner2);
+    let a0 = placed0.attributes;
+    let a1 = corner1.attributes;
+    let a2 = corner2.attributes;
     let mixed = a0 * b.x + a1 * b.y + a2 * b.z;
     let reach = sqrt(dot(mixed.xyz, mixed.xyz));
     if reach > 0.0 {

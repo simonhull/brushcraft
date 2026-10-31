@@ -40,11 +40,6 @@ fn tile_vertex(slot: u32, side: u32, i: u32, j: u32) -> TileVertex {
     return slot_vertex(size_class, slot_buffer, base + j * side + i);
 }
 
-// Vertex (i, j)'s position of the tile in `slot`, `side` vertices a row.
-fn tile_position(slot: u32, side: u32, i: u32, j: u32) -> vec3<f32> {
-    return tile_vertex(slot, side, i, j).position;
-}
-
 // The `e` a tile's level change trades: its parent's, the bound on how far the parent's
 // surface (where the morph starts) lies from the finest; negative without a resident parent
 // (a level-0 tile), which never morphs.
@@ -114,9 +109,10 @@ fn edge_of(i: u32, j: u32, quads: u32) -> u32 {
 }
 
 // A cluster vertex where it is drawn, the visibility id (without the quad) of its cluster, and
-// the morph that put it there, so the shading pass can carry a vertex's other attributes the
-// same way: the drawn point is mix((tile (from_a) + tile (from_b)) / 2, tile (at), t), and
-// exactly tile (at) where t is 1 (then from_a and from_b are `at`).
+// its other attributes carried by the same morph, so the shading pass reads each corner's
+// vertex once, here: the drawn point is mix((tile (a) + tile (b)) / 2, tile (at), t) for the
+// morph's two parents a and b, and exactly tile (at) where t is 1; the normal and roughness
+// term are mixed the same way.
 struct Placed {
     // World units.
     position: vec3<f32>,
@@ -124,12 +120,12 @@ struct Placed {
     id: u32,
     // The tile vertex (i, j) drawn here, after the edge variant's remap.
     at: vec2<u32>,
-    // The first of the two vertices whose midpoint the morph starts from.
-    from_a: vec2<u32>,
-    // The second.
-    from_b: vec2<u32>,
     // How far the morph has run: 1 for a vertex where it is.
     t: f32,
+    // The unit normal (xyz, as mixed: not renormalized) and the roughness term (w), carried
+    // as the position is. The raster's vertex shader doesn't read it, so its compiler drops
+    // the loads.
+    attributes: vec4<f32>,
 }
 
 // Grid vertex `index` (of the static index buffer) of the cluster `cell` (Cluster.cell) of node
@@ -155,11 +151,13 @@ fn place_vertex(n: u32, cell: u32, index: u32) -> Placed {
     let quads = side - 1u;
     let i = cx * CLUSTER_QUADS + local % CLUSTER_SIDE;
     let j = cy * CLUSTER_QUADS + local / CLUSTER_SIDE;
-    let at = vec2<u32>(i, j);
-    let p = tile_position(node.slot, side, i, j);
+    let v = tile_vertex(node.slot, side, i, j);
+    let p = v.position;
+    let attributes = vec4<f32>(v.normal, v.roughness);
     let per = clusters_per_side(side);
     let id = (n << NODE_SHIFT) | ((cy * per + cx) << CLUSTER_SHIFT);
-    let still = Placed(p, id, at, at, at, 1.0);
+    let at = vec2<u32>(i, j);
+    let still = Placed(p, id, at, 1.0, attributes);
     let odd_i = (i & 1u) == 1u;
     let odd_j = (j & 1u) == 1u;
     if !(odd_i || odd_j) {
@@ -200,6 +198,9 @@ fn place_vertex(n: u32, cell: u32, index: u32) -> Placed {
         a.y -= 1u;
         b.y += 1u;
     }
-    let mid = (tile_position(node.slot, side, a.x, a.y) + tile_position(node.slot, side, b.x, b.y)) * 0.5;
-    return Placed(mix(mid, p, t), id, at, a, b, t);
+    let va = tile_vertex(node.slot, side, a.x, a.y);
+    let vb = tile_vertex(node.slot, side, b.x, b.y);
+    let mid = (va.position + vb.position) * 0.5;
+    let mid_attributes = (vec4<f32>(va.normal, va.roughness) + vec4<f32>(vb.normal, vb.roughness)) * 0.5;
+    return Placed(mix(mid, p, t), id, at, t, mix(mid_attributes, attributes, t));
 }
