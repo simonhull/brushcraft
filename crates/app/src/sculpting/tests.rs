@@ -369,57 +369,101 @@ fn tiles(first: u16, n: u16) -> Vec<TileKey> {
 
 #[test]
 fn the_time_left_takes_dabs_from_the_front_and_at_least_one() {
-    // A unit a nanosecond, no overhead a dab: a dab of one tile takes 4,225 ns.
-    let cost = DabCost::new(0.0, 1.0, Grouping::PerDab);
+    // A nanosecond a dab's tile, nothing else: a dab of one tile takes 1 ns.
+    let cost = DabCost::new(0.0, 0.0, 1.0, 0.0);
     let one = tiles(0, 1);
-    let dab = Duration::from_nanos(4225);
+    let ns = Duration::from_nanos;
     let take = |dabs: &[&[TileKey]], room: Duration, at_least_one: bool| {
         cost.take(dabs.iter().copied(), room, at_least_one).0
     };
-    assert_eq!(take(&[&one, &one, &one], dab * 2, true), 2, "what fits");
-    assert_eq!(take(&[&one, &one], dab / 2, true), 1, "at least one");
-    assert_eq!(take(&[&one, &one], dab / 2, false), 0, "none once applied");
-    assert_eq!(take(&[], dab * 10, true), 0, "none to take");
+    assert_eq!(take(&[&one, &one, &one], ns(2), true), 2, "what fits");
+    assert_eq!(take(&[&one, &one], ns(0), true), 1, "at least one");
+    assert_eq!(take(&[&one, &one], ns(0), false), 0, "none once applied");
+    assert_eq!(take(&[], ns(10), true), 0, "none to take");
     let big = tiles(0, 30);
     assert_eq!(
-        take(&[&one, &big, &one], dab * 5, true),
+        take(&[&one, &big, &one], ns(5), true),
         1,
         "a run from the front, not a selection"
     );
-    let (_, units) = cost.take([one.as_slice(), &one], dab * 9, true);
-    assert_eq!(units, 2.0 * TILE_VERTICES, "each dab its own tiles");
-    let side = f64::from(geom::TILE_QUADS + 1);
-    assert_eq!(TILE_VERTICES, side * side, "65 × 65 vertices a tile");
 }
 
 #[test]
-fn grouped_by_tile_a_batch_pays_once_for_each_tile_its_dabs_share() {
-    let union = DabCost::new(10.0, 1.0, Grouping::TileUnion);
-    let per_dab = DabCost::new(10.0, 1.0, Grouping::PerDab);
+fn a_batch_pays_its_part_its_dabs_their_tiles_and_their_union_once() {
     let (a, b) = (tiles(0, 4), tiles(2, 4));
     let room = Duration::from_secs(1);
-    let (count, units) = union.take([a.as_slice(), &b, &a], room, true);
-    assert_eq!(count, 3);
+    let cost = |model: DabCost| model.take([a.as_slice(), &b, &a], room, true);
     assert_eq!(
-        units,
-        6.0 * TILE_VERTICES + 3.0 * 10.0,
-        "six tiles among them, and each dab's overhead"
+        cost(DabCost::new(7.0, 0.0, 0.0, 0.0)),
+        (3, 7.0),
+        "once a batch"
     );
-    let (_, apart) = per_dab.take([a.as_slice(), &b, &a], room, true);
-    assert_eq!(apart, 12.0 * TILE_VERTICES + 3.0 * 10.0);
+    assert_eq!(
+        cost(DabCost::new(0.0, 5.0, 0.0, 0.0)),
+        (3, 15.0),
+        "each dab"
+    );
+    assert_eq!(
+        cost(DabCost::new(0.0, 0.0, 1.0, 0.0)),
+        (3, 12.0),
+        "each dab's tiles"
+    );
+    assert_eq!(
+        cost(DabCost::new(0.0, 0.0, 0.0, 1.0)),
+        (3, 6.0),
+        "six tiles among them, once each"
+    );
+    assert_eq!(
+        DabCost::new(7.0, 0.0, 0.0, 0.0).take(std::iter::empty::<&[TileKey]>(), room, true),
+        (0, 0.0),
+        "no dab, no batch"
+    );
+}
+
+#[test]
+fn the_calibration_fits_the_bench_within_its_spread() {
+    // Part A's p99 per call, in ms, with the tiles a dab reaches and their union as the bench's
+    // stroke reaches them: (dabs, tiles a dab, union, ms).
+    let points: [(u16, u16, u16, f64); 6] = [
+        (1, 2, 2, 0.52),
+        (8, 2, 3, 1.10),
+        (32, 2, 4, 3.09),
+        (1, 21, 21, 2.55),
+        (8, 21, 27, 6.08),
+        (32, 21, 51, 22.0),
+    ];
+    for (dabs, each, union, ms) in points {
+        // Each dab's tiles a window sliding along the union, as the stroke moves.
+        let slide = union - each;
+        let windows = (0..dabs).map(|k| {
+            let offset = if dabs > 1 { k * slide / (dabs - 1) } else { 0 };
+            tiles(offset, each)
+        });
+        let batch: Vec<Vec<TileKey>> = windows.collect();
+        let (count, predicted) =
+            DabCost::CALIBRATED.take(batch.iter().map(Vec::as_slice), Duration::MAX, true);
+        assert_eq!(count, usize::from(dabs));
+        let fitted = predicted / 1e6;
+        assert!(
+            (fitted - ms).abs() < 0.6,
+            "{dabs} dabs of {each} tiles: {fitted:.2} ms against {ms} ms"
+        );
+    }
 }
 
 #[test]
 fn the_cost_learns_how_long_batches_take_here() {
-    let mut cost = DabCost::new(0.0, 1.0, Grouping::PerDab);
+    // A microsecond a dab's tile: a dab of one tile takes 1 us as calibrated.
+    let mut cost = DabCost::new(0.0, 0.0, 1000.0, 0.0);
     let one = tiles(0, 1);
+    let ns = |us: u64| Duration::from_nanos(us * 1000);
     // Four and a half dabs' time, as calibrated.
-    let room = Duration::from_nanos(4225 * 9 / 2);
+    let room = Duration::from_nanos(4500);
     assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 4);
-    // A batch of one tile took four times its prediction: the scale rises, but only doubles.
-    cost.observe(TILE_VERTICES, Duration::from_nanos(4225 * 4));
+    // A batch took four times its prediction: the scale rises, but only doubles.
+    cost.observe(1000.0, ns(4));
     assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 2, "doubled");
-    cost.observe(TILE_VERTICES, Duration::from_nanos(4225 * 4));
+    cost.observe(1000.0, ns(4));
     assert_eq!(
         cost.take([one.as_slice(); 8], room, true).0,
         1,
@@ -427,31 +471,12 @@ fn the_cost_learns_how_long_batches_take_here() {
     );
     // Faster batches lower it an eighth of the way each.
     for _ in 0..40 {
-        cost.observe(TILE_VERTICES, Duration::from_nanos(4225));
+        cost.observe(1000.0, ns(1));
     }
     assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 4, "back");
     // One far off is believed only to double, however far.
-    cost.observe(TILE_VERTICES, Duration::from_secs(3600));
+    cost.observe(1000.0, Duration::from_secs(3600));
     assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 2);
-}
-
-#[test]
-fn a_batch_pays_its_fixed_part_once() {
-    let one = tiles(0, 1);
-    let cost = DabCost::new(0.0, 1.0, Grouping::PerDab).with_per_batch(TILE_VERTICES);
-    let room = Duration::from_nanos(4225 * 4);
-    let (count, units) = cost.take([one.as_slice(); 8], room, true);
-    assert_eq!(count, 3, "the batch's own part takes one dab's room");
-    assert_eq!(units, 4.0 * TILE_VERTICES, "and is counted in its units");
-    assert_eq!(
-        cost.take(
-            std::iter::empty::<&[TileKey]>(),
-            Duration::from_secs(1),
-            true
-        ),
-        (0, 0.0),
-        "no dab, no batch"
-    );
 }
 
 #[test]
