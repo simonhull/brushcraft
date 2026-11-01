@@ -11,7 +11,7 @@
 //! preview is never written).
 //!
 //! A shown dab moves the finest tiles its sphere reaches as the store holds them, each gathered
-//! with its ring ([`TileStore::cached_positions_with_ring`]), by the draw action's own amount
+//! with its ring ([`TileStore::cached_positions_with_ring_many`]), by the draw action's own amount
 //! ([`brush::draw_imprint_vertex`], the code `apply_dabs` runs): every point within its radius
 //! moves `w(p)` along the dab's normal. That is the one difference from the finest work, which
 //! moves each vertex along its frame normal of the predicted surface: the frames need the
@@ -42,17 +42,17 @@
 //!
 //! # Landing
 //!
-//! When the oldest dabs shown land ([`Preview::land`]), the store's finest surface moves under
-//! the previews, and each tile whose points they moved is made again: the store's tile now, moved
-//! by the dabs still shown. A landed dab moved a point by at most its strength, plus the stored
-//! quantization of the tile the point is inside (its own corrections only, re-quantized by its own
-//! writes, which a dab makes only where it moves a vertex of the tile). So it moved a point of a
-//! previewed tile only if the tile's preview box, grown by how far the dabs shown moved its points
-//! (each dab at most its strength) and by the landed dabs' strengths, touches its sphere; those
-//! tiles are made again, and a tile no dab shown moves any more goes back to the store's. A tile
-//! that wasn't previewed and whose surface the landed dabs moved may now lie within a dab still
-//! shown: the index's boxes, refitted by the landing, find those. Untouched tiles the landing
-//! moved are forgotten, to be looked at again.
+//! When the oldest dabs shown land ([`Preview::land`]), the store's finest surface moves under the
+//! previews. A landed dab moved the vertices within its radius (each by at most its strength), and
+//! a tile's interior quantization only by that tile's own writes, so it changed the positions of
+//! the tiles its sphere reached in the index as it was, and the rings of their neighbours
+//! ([`TileStore::stale_after`]). After the landing the index's boxes have moved by at most the
+//! landed strengths, so its query with the spheres grown by them finds every tile reached; the
+//! landing's tiles are those and their neighbours. Each of them that is previewed is made again:
+//! the store's tile now, moved by the dabs still shown, or the store's tile alone if none moves
+//! it. One that isn't may now lie within a dab still shown, the store having moved it: its box (of
+//! its own positions, as the store holds them now) says, and it is previewed if so. Untouched
+//! tiles among them are forgotten, to be looked at again.
 //!
 //! Once no dab is shown, no tile is previewed.
 
@@ -78,29 +78,49 @@ pub struct PreviewStats {
     pub gathered: usize,
 }
 
-/// What the preview knows of a tile a dab shown has reached.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Reached {
-    /// The box of every point of its block as drawn: its preview's, or (untouched) the store's;
-    /// `None` for a block of no finite point (never, for a tile of the store), which no dab
-    /// reaches.
-    bounds: Option<Aabb>,
-    /// How far the dabs shown moved its points at most: the strengths of those that moved any,
-    /// summed. Zero for a tile untouched.
-    slack: f32,
-}
-
-/// A tile being moved in one call: its block and what is known of it.
+/// A tile being moved in one call: its block, its box, and whether a dab shown moved it.
 #[derive(Debug)]
 struct Moving {
     /// The tile.
     key: TileKey,
     /// Its block: its preview, or the store's tile gathered with its ring.
     block: GatheredBlock,
-    /// How far the dabs shown moved its points at most.
-    slack: f32,
+    /// The box of every point of `block`, as it is now ([`bounds_of`]).
+    bounds: Option<Aabb>,
+    /// Whether a dab shown moved a point of it: it is previewed.
+    moved: bool,
     /// Whether it had a preview as the call began.
     previewed: bool,
+}
+
+impl Moving {
+    /// The store's `block` of tile `key`, not moved yet.
+    fn of_store(key: TileKey, block: GatheredBlock) -> Self {
+        let bounds = bounds_of(&block);
+        Self {
+            key,
+            block,
+            bounds,
+            moved: false,
+            previewed: false,
+        }
+    }
+
+    /// Moves it by `dab` if its box touches the dab's sphere, its box made again if a point
+    /// moved.
+    fn move_by(&mut self, dab: &Imprint) {
+        if touches(self.bounds.as_ref(), dab, 0.0) && move_by(&mut self.block, dab) {
+            self.moved = true;
+            self.bounds = bounds_of(&self.block);
+        }
+    }
+
+    /// Moves it by every one of `dabs`, in order ([`Moving::move_by`]).
+    fn move_by_every(&mut self, dabs: &[Imprint]) {
+        for dab in dabs {
+            self.move_by(dab);
+        }
+    }
 }
 
 /// A brush's previews: the dabs shown and not yet landed, and the tiles they reach (see the
@@ -109,13 +129,16 @@ struct Moving {
 /// The caller shows the dabs a step can't apply ([`Preview::show`]) and, as it applies the
 /// oldest of them through [`apply_dabs`](crate::apply_dabs) in order, lands them
 /// ([`Preview::land`]) after each call. Dabs dropped unapplied (a stroke ended by an error) are
-/// landed too: nothing then moves under the previews, and they are made again without them.
+/// landed too: nothing then moves under the previews, and they are made again without them; a
+/// store changed otherwise under them (the failing dab's writes) has them made again
+/// ([`Preview::rebase`]).
 #[derive(Debug, Default)]
 pub struct Preview {
     /// The dabs shown and not landed, oldest first.
     shown: VecDeque<Imprint>,
-    /// The tiles they reach: previewed ones, and untouched ones the index found.
-    reached: BTreeMap<TileKey, Reached>,
+    /// The tiles they reach, previewed or untouched, by the box of their points as drawn (`None`
+    /// for a tile of no finite point, which no dab reaches), and whether previewed.
+    reached: BTreeMap<TileKey, (Option<Aabb>, bool)>,
 }
 
 impl Preview {
@@ -176,30 +199,28 @@ impl Preview {
     ) -> Result<(), SculptError> {
         self.shown.push_back(*imprint);
         stats.dabs += 1;
-        let [x, y, z] = imprint.center;
-        let center = Vec3::new(x, y, z);
-        let near: Vec<TileKey> = self
+        let near: Vec<(TileKey, bool)> = self
             .reached
             .iter()
-            .filter(|(_, reached)| touches(reached.bounds.as_ref(), imprint, 0.0))
-            .map(|(key, _)| *key)
+            .filter(|(_, (bounds, _))| touches(bounds.as_ref(), imprint, 0.0))
+            .map(|(key, &(_, previewed))| (*key, previewed))
             .collect();
         let queried = index
-            .query_sphere(center, reach(imprint, 0.0))
+            .query_sphere(centre(imprint), reach(imprint, 0.0))
             .filter(|key| !self.reached.contains_key(key));
-        let fresh: Vec<TileKey> = queried.collect();
-        // Tiles already reached take this dab alone; fresh ones, the store's tile moved by every
-        // dab shown (this one last), as are untouched ones (the dabs before moved nothing there).
-        let mut moving: Vec<Moving> = Vec::with_capacity(near.len() + fresh.len());
-        let mut from_store: Vec<TileKey> = fresh;
-        for key in near {
-            match store.take_preview(&key) {
+        let mut from_store: Vec<TileKey> = queried.collect();
+        // Previewed tiles take this dab alone; the others, the store's tile moved by every dab
+        // shown, this one last (for an untouched one, the dabs before moved nothing there).
+        let mut moving: Vec<Moving> = Vec::with_capacity(near.len() + from_store.len());
+        for (key, previewed) in near {
+            match store.take_preview(&key).filter(|_| previewed) {
                 Some(block) => {
-                    let slack = self.reached.get(&key).map_or(0.0, |r| r.slack);
+                    let bounds = self.reached.get(&key).and_then(|&(bounds, _)| bounds);
                     moving.push(Moving {
                         key,
                         block,
-                        slack,
+                        bounds,
+                        moved: true,
                         previewed: true,
                     });
                 }
@@ -212,27 +233,22 @@ impl Preview {
         let incremental = moving.len();
         moving.extend(gathered);
         let (old, new) = moving.split_at_mut(incremental);
-        store.par_map_mut(old, |tile| {
-            if move_by(&mut tile.block, imprint) {
-                tile.slack = add_up(tile.slack, imprint.strength.abs());
-            }
-        });
-        store.par_map_mut(new, |tile| move_by_every(tile, &all));
+        store.par_map_mut(old, |tile| tile.move_by(imprint));
+        store.par_map_mut(new, |tile| tile.move_by_every(&all));
         self.keep(store, moving, stats)
     }
 
     /// Lands the oldest `count` dabs shown (fewer if fewer are): they were applied through
     /// [`apply_dabs`](crate::apply_dabs), in order, since they were shown, or dropped. Every tile
-    /// whose points they may have moved is made again over the store's tile as it is now, by
-    /// the dabs still shown, or goes back to the store's; and so is every tile the landing
-    /// brought within a dab still shown. Closes the call's preview epoch.
+    /// whose positions or ring their landing can have changed is made again (see "Landing" in the
+    /// module notes). Closes the call's preview epoch.
     ///
     /// `index` is the spatial index as the landing left it (refitted).
     ///
     /// # Errors
     ///
-    /// [`SculptError::Cache`] if a tile can't be gathered: its preview is cleared (the store's
-    /// tile shows), and the epoch is closed all the same.
+    /// [`SculptError::Cache`] if a tile can't be gathered or listed: the previews of those being
+    /// made again are cleared (the store's tiles show), and the epoch is closed all the same.
     pub fn land(
         &mut self,
         store: &mut TileStore,
@@ -259,7 +275,7 @@ impl Preview {
     ///
     /// # Errors
     ///
-    /// [`SculptError::Cache`] if a tile can't be gathered.
+    /// [`SculptError::Cache`] if a tile can't be gathered or listed.
     fn land_tiles(
         &mut self,
         store: &mut TileStore,
@@ -269,55 +285,53 @@ impl Preview {
     ) -> Result<(), SculptError> {
         if self.shown.is_empty() {
             // Nothing shown any more: every preview goes back to the store's tile.
-            for key in std::mem::take(&mut self.reached).into_keys() {
-                if store.preview(&key).is_some() {
+            for (key, (_, previewed)) in std::mem::take(&mut self.reached) {
+                if previewed {
                     store.clear_preview(&key);
                     stats.tiles_cleared += 1;
                 }
             }
             return Ok(());
         }
-        let landed_strength = landed
+        let strength = landed
             .iter()
             .fold(0.0_f32, |sum, dab| add_up(sum, dab.strength.abs()));
-        // Previewed tiles whose points the landing may have moved, and untouched ones whose
-        // store tiles it may have moved (forgotten, to be looked at again).
-        let mut again: BTreeSet<TileKey> = BTreeSet::new();
-        let mut forget: Vec<TileKey> = Vec::new();
-        for (key, reached) in &self.reached {
-            let grown = add_up(reached.slack, landed_strength);
-            if landed
-                .iter()
-                .any(|dab| touches(reached.bounds.as_ref(), dab, grown))
-            {
-                if reached.slack > 0.0 {
-                    again.insert(*key);
-                } else {
-                    forget.push(*key);
-                }
-            }
-        }
-        for key in forget {
-            self.reached.remove(&key);
-        }
-        // Tiles the landing moved that no preview holds yet: within a dab still shown now?
-        let moved: BTreeSet<TileKey> = landed
+        let reached: BTreeSet<TileKey> = landed
             .iter()
-            .flat_map(|dab| {
-                let [x, y, z] = dab.center;
-                index.query_sphere(Vec3::new(x, y, z), reach(dab, landed_strength))
-            })
-            .filter(|key| !self.reached.contains_key(key))
+            .flat_map(|dab| index.query_sphere(centre(dab), reach(dab, strength)))
             .collect();
-        if !moved.is_empty() {
-            for dab in &self.shown {
-                let [x, y, z] = dab.center;
-                let within = index
-                    .query_sphere(Vec3::new(x, y, z), reach(dab, 0.0))
-                    .filter(|key| moved.contains(key));
-                again.extend(within);
+        let reached: Vec<TileKey> = reached.into_iter().collect();
+        let changed = match store.stale_after(&reached) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.clear(store, stats);
+                return Err(error.into());
+            }
+        };
+        let mut again: BTreeSet<TileKey> = BTreeSet::new();
+        let mut unpreviewed: Vec<TileKey> = Vec::new();
+        for key in changed {
+            match self.reached.get(&key) {
+                Some(&(_, true)) => {
+                    again.insert(key);
+                }
+                Some(&(_, false)) => {
+                    // Untouched, and the store moved it: looked at again below.
+                    self.reached.remove(&key);
+                    unpreviewed.push(key);
+                }
+                None => unpreviewed.push(key),
             }
         }
+        // The store moved these: within a dab still shown now, by their own positions' box?
+        let shown: Vec<Imprint> = self.shown.iter().copied().collect();
+        let within = unpreviewed.into_iter().filter(|key| {
+            let positions = store.cached_positions(key);
+            let bounds = positions.and_then(|points| Aabb::from_points(points.iter().copied()));
+            // A tile not cached is looked at whole: gathered, and kept only if moved.
+            bounds.is_none() || shown.iter().any(|dab| touches(bounds.as_ref(), dab, 0.0))
+        });
+        again.extend(within);
         self.remake(store, &again, stats)
     }
 
@@ -335,15 +349,11 @@ impl Preview {
         index: &SpatialIndex,
     ) -> Result<PreviewStats, SculptError> {
         let mut stats = PreviewStats::default();
-        let mut again: BTreeSet<TileKey> = BTreeSet::new();
         let reached = std::mem::take(&mut self.reached);
-        let previewed = reached
-            .into_iter()
-            .filter(|(_, reached)| reached.slack > 0.0);
-        again.extend(previewed.map(|(key, _)| key));
+        let previewed = reached.into_iter().filter(|&(_, (_, previewed))| previewed);
+        let mut again: BTreeSet<TileKey> = previewed.map(|(key, _)| key).collect();
         for dab in &self.shown {
-            let [x, y, z] = dab.center;
-            again.extend(index.query_sphere(Vec3::new(x, y, z), reach(dab, 0.0)));
+            again.extend(index.query_sphere(centre(dab), reach(dab, 0.0)));
         }
         let made = self.remake(store, &again, &mut stats);
         let closed = store.close_preview_epoch();
@@ -386,8 +396,19 @@ impl Preview {
             tile.previewed = previewed.contains(&tile.key);
         }
         let shown: Vec<Imprint> = self.shown.iter().copied().collect();
-        store.par_map_mut(&mut moving, |tile| move_by_every(tile, &shown));
+        store.par_map_mut(&mut moving, |tile| tile.move_by_every(&shown));
         self.keep(store, moving, stats)
+    }
+
+    /// Clears every preview and forgets every tile reached, the dabs shown kept: for a landing
+    /// that can't tell which tiles it changed. The next dab shown gathers afresh.
+    fn clear(&mut self, store: &mut TileStore, stats: &mut PreviewStats) {
+        for (key, (_, previewed)) in std::mem::take(&mut self.reached) {
+            if previewed {
+                store.clear_preview(&key);
+                stats.tiles_cleared += 1;
+            }
+        }
     }
 
     /// Hands the tiles of a call back to the store: a moved tile's preview set, an unmoved
@@ -404,15 +425,8 @@ impl Preview {
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
         for tile in moving {
-            let bounds = bounds_of(&tile.block);
-            self.reached.insert(
-                tile.key,
-                Reached {
-                    bounds,
-                    slack: tile.slack,
-                },
-            );
-            if tile.slack > 0.0 {
+            self.reached.insert(tile.key, (tile.bounds, tile.moved));
+            if tile.moved {
                 store.set_preview(tile.key, tile.block)?;
                 stats.tiles_set += 1;
             } else {
@@ -451,25 +465,10 @@ fn gather(store: &mut TileStore, keys: &[TileKey]) -> Result<Vec<Moving>, Sculpt
                 Some(block) => block,
                 None => store.positions_with_ring(key)?,
             };
-            Ok(Moving {
-                key,
-                block,
-                slack: 0.0,
-                previewed: false,
-            })
+            Ok(Moving::of_store(key, block))
         })
         .collect::<Result<Vec<Moving>, CacheError>>()
         .map_err(SculptError::from)
-}
-
-/// Moves `tile`, as the store holds it, by every dab of `shown` in order: those whose sphere
-/// its box touches as each comes. Its slack grows by the strength of each that moves a point.
-fn move_by_every(tile: &mut Moving, shown: &[Imprint]) {
-    for dab in shown {
-        if touches(bounds_of(&tile.block).as_ref(), dab, 0.0) && move_by(&mut tile.block, dab) {
-            tile.slack = add_up(tile.slack, dab.strength.abs());
-        }
-    }
 }
 
 /// Moves every point of `block` within `dab`'s radius by the draw action's amount along the
@@ -500,6 +499,12 @@ fn bounds_of(block: &GatheredBlock) -> Option<Aabb> {
     let points = block.padded().iter().chain(&ring_points).copied();
     let finite = points.filter(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
     Aabb::from_points(finite)
+}
+
+/// `dab`'s centre.
+const fn centre(dab: &Imprint) -> Vec3 {
+    let [x, y, z] = dab.center;
+    Vec3::new(x, y, z)
 }
 
 /// How far a test of `dab`'s sphere, grown by `grow`, reaches: its radius and `grow`, rounded
