@@ -2,9 +2,9 @@
 //!
 //! Each case is a short sequence of operations drawn from the bytes `bolero` generates, over a
 //! small project (the cube sphere to level 7, its display layer built): brush steps of one to
-//! four dabs at random places, refresh slices, reverts (writes no step covers), a step that
-//! failed after its first dab's bump (its epoch closed, as `draw_step` closes it), lost and
-//! failed frames, camera moves
+//! four dabs (`sculpt::apply_dabs` frames) at random places, refresh slices, reverts (writes no
+//! step covers), a frame of dabs that fails after its first (its epoch closed all the same),
+//! lost and failed frames, camera moves
 //! (near: a face's finest tiles wanted and in the cut; far: none), `mark_all_dirty`, under a
 //! budget small enough to evict, an epoch size small enough to shadow, and sometimes a stale cap
 //! small enough to resync. After every frame that reaches the GPU it checks the invariant
@@ -117,6 +117,10 @@ struct Case {
     near: Vec<TileKey>,
     /// Frames lost or failed, so far.
     lost: usize,
+    /// The store's spatial index, for the brush.
+    index: store::SpatialIndex,
+    /// The brush's stroke state.
+    stroke: sculpt::Stroke,
 }
 
 /// The vertex `(face, i, j)` of the finest grid a byte pair names.
@@ -147,6 +151,9 @@ impl Case {
             .and_then(|config| config.with_buffer_bytes(2 * big))
             .expect("a configuration");
         let residency = Residency::new(gpu, &mesh, finest, config).expect("residency");
+        let index =
+            store::SpatialIndex::build(project.store(), finest, |_, _| {}).expect("an index");
+        let stroke = sculpt::Stroke::new(project.store());
         let mut case = Self {
             project,
             mesh,
@@ -154,6 +161,8 @@ impl Case {
             residency,
             near: Vec::new(),
             lost: 0,
+            index,
+            stroke,
         };
         case.frame(gpu);
         case
@@ -204,61 +213,78 @@ impl Case {
         self.frame_with(gpu, None, false);
     }
 
-    /// A brush step of `dabs` dabs at the places the bytes name, as one epoch (a frame of
-    /// dabs), the first `bumped` of them bumping the display bounds by how far they moved
-    /// their vertex (the rest as a step that failed before its bump).
-    fn step(&mut self, dabs: &[(u8, u8)], bumped: usize) {
+    /// A write no step covers, at the vertex the bytes name: a revert's epoch, closed.
+    fn revert(&mut self, (first, second): (u8, u8)) {
         let store = self.project.store();
         let finest = level(FINEST);
         store.begin_op().expect("an op");
-        for (n, &(a, b)) in dabs.iter().enumerate() {
-            let before = finest_grids(store, &self.mesh);
-            let (face, i, j) = vertex(a, b);
-            let (key, li, lj) = TileKey::containing(
-                geom::LayerId::BASE,
-                Channel::DISPLACEMENT,
-                face,
-                finest,
-                i,
-                j,
-            )
-            .expect("a finest tile");
-            let c = store
-                .correction(key)
-                .expect("reads")
-                .get(li, lj)
-                .expect("a vertex");
-            let lift = (f32::from(b) - 127.5) / 127.5 * 0.02;
-            store
-                .set_correction(face, finest, i, j, c + Vec3::new(0.0, 0.0, lift))
-                .expect("written");
-            if n < bumped {
-                let after = finest_grids(store, &self.mesh);
-                let mut worst = 0.0_f64;
-                for (index, grid) in &after {
-                    for (p, q) in grid.iter().zip(&before[index]) {
-                        let d = [p.x - q.x, p.y - q.y, p.z - q.z].map(f64::from);
-                        worst = worst.max((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
-                    }
-                }
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "rounded to an f32, then up a step"
-                )]
-                let worst = (worst as f32).next_up();
-                let copies = self.mesh.topology().copies(face, finest, i, j);
-                let holders: Vec<TileKey> = copies
-                    .iter()
-                    .filter_map(|copy| {
-                        TileKey::displacement(copy.face, finest, copy.tx, copy.ty).ok()
-                    })
-                    .chain([key])
-                    .collect();
-                store.bump_display_error(&holders, worst).expect("bumped");
-            }
-        }
-        // Closed whatever happened, as `draw_step` closes its epoch on its error paths too.
+        let (face, i, j) = vertex(first, second);
+        let (key, li, lj) = TileKey::containing(
+            geom::LayerId::BASE,
+            Channel::DISPLACEMENT,
+            face,
+            finest,
+            i,
+            j,
+        )
+        .expect("a finest tile");
+        let c = store
+            .correction(key)
+            .expect("reads")
+            .get(li, lj)
+            .expect("a vertex");
+        let lift = (f32::from(second) - 127.5) / 127.5 * 0.02;
+        store
+            .set_correction(face, finest, i, j, c + Vec3::new(0.0, 0.0, lift))
+            .expect("written");
         store.close_epoch().expect("closed");
+    }
+
+    /// A frame of brush dabs, one at each place the byte pairs name (on a finest vertex, of a
+    /// radius and strength the bytes choose), applied with `sculpt::apply_dabs` as one call:
+    /// one epoch, its displacements summed. With `fail`, a last dab the store can't hold may
+    /// make the call fail after the others (its epoch closed all the same).
+    fn dabs(&mut self, places: &[(u8, u8)], fail: bool) {
+        let grids = finest_grids(self.project.store(), &self.mesh);
+        let quads = level(FINEST).face_quads();
+        let mut frame: Vec<stroke::Dab> = places
+            .iter()
+            .zip(0_u32..)
+            .map(|(&(a, b), seq)| {
+                let (face, i, j) = vertex(a, b);
+                let at = usize::try_from(j * (quads + 1) + i).expect("small");
+                let centre = grids[&face.index()][at];
+                stroke::Dab {
+                    position: [centre.x, centre.y, centre.z],
+                    normal: [0.0, 0.0, 1.0],
+                    tangent: [1.0, 0.0, 0.0],
+                    radius: 0.02 + f32::from(a % 8) * 0.01,
+                    strength: (f32::from(b) - 127.5) / 127.5 * 0.01,
+                    seq,
+                    ..stroke::Dab::default()
+                }
+            })
+            .collect();
+        if fail && let Some(last) = frame.last().copied() {
+            frame.push(stroke::Dab {
+                strength: 3e38,
+                seq: last.seq + 1,
+                ..last
+            });
+        }
+        self.project.begin_stroke().expect("a stroke");
+        let applied = sculpt::apply_dabs(
+            self.project.store(),
+            &mut self.index,
+            &mut self.stroke,
+            &frame,
+        );
+        // The dab the store can't hold fails the call where it lands on vertices of its own;
+        // either way the call's epoch is closed.
+        if !fail {
+            applied.expect("the frame applies");
+        }
+        self.project.end_stroke().expect("the stroke ends");
     }
 
     /// Runs one operation the bytes name, then a frame (one that may be lost or fail).
@@ -275,7 +301,7 @@ impl Case {
                         )
                     })
                     .collect();
-                self.step(&dabs, usize::MAX);
+                self.dabs(&dabs, false);
             }
             2 => {
                 // A refresh slice.
@@ -285,9 +311,9 @@ impl Case {
                     .expect("a slice");
             }
             // A write no step covers: a revert's epoch.
-            3 => self.step(&[(a, b)], 0),
-            // A step that failed after its first dab's bump: its epoch closes as a revert's.
-            4 => self.step(&[(a, b), (b, a)], 1),
+            3 => self.revert((a, b)),
+            // A frame of dabs that fails after its first: its epoch closed all the same.
+            4 => self.dabs(&[(a, b)], true),
             5 => {
                 self.frame_with(gpu, None, true);
                 return;
@@ -447,5 +473,31 @@ fn stand_ins_hold_their_bounds() {
                 let shared: &Gpu = *gpu;
                 run(shared, ops);
             });
+    });
+}
+
+/// The case the model found on 2026-10-31.
+///
+/// A frame of dabs that failed after its first wrote the failing dab's huge move into tiles the
+/// first dab's bump had named, and the store closed the epoch as a step's with the first dab's
+/// displacement. A write after the last bump now makes the epoch a revert's.
+#[test]
+fn regression_a_failed_dab_s_writes_after_an_earlier_bump_close_a_revert() {
+    GpuTest::run(|gpu| {
+        run(
+            gpu,
+            &[
+                (208, 246, 196),
+                (44, 76, 62),
+                (246, 6, 52),
+                (243, 241, 25),
+                (254, 189, 212),
+                (223, 122, 181),
+                (19, 161, 242),
+                (31, 2, 208),
+                (27, 83, 37),
+                (174, 106, 132),
+            ],
+        );
     });
 }

@@ -28,6 +28,8 @@ bolero.workspace = true
 divan.workspace = true
 geom = { workspace = true, features = ["test-fixtures"] }
 rayon.workspace = true
+sculpt.workspace = true
+stroke.workspace = true
 
 [[bench]]
 name = "eviction"

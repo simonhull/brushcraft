@@ -585,4 +585,6 @@ fn an_epoch_of_several_dabs_sums_their_displacements() {
     drop(project.close(false));
 }
 
+// Its world holds the sculpt crate's types, a dev-dependency rustdoc doesn't link.
+#[cfg(not(doc))]
 mod model;
