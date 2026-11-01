@@ -562,3 +562,126 @@ fn rays_along_the_seams_hit_as_brute_force_does() {
         );
     }
 }
+
+/// `hit` as bits, `−0` and `0` told apart, if there is one: what "bit for bit" compares.
+fn hit_bits(hit: Option<TriangleHit>) -> Option<(TileKey, [u32; 3], u32, u32, bool)> {
+    let hit = hit?;
+    let floats = [hit.t.to_bits(), hit.u.to_bits(), hit.v.to_bits()];
+    Some((hit.key, floats, hit.i, hit.j, hit.second))
+}
+
+/// Rays at the sphere of every kind: aimed, grazing its rim, along the seams, from inside, and
+/// missing it.
+fn sphere_rays(rng: &mut Rng, count: usize) -> Vec<Ray> {
+    let rays = (0..count).filter_map(|k| {
+        let toward = rng.point(-1.0, 1.0).normalized()?;
+        let side = toward.cross(Vec3::new(0.3, 0.5, 0.7)).normalized()?;
+        let (origin, direction) = match k % 5 {
+            0 => (toward * 3.0, -toward + rng.point(-0.2, 0.2)),
+            1 => (toward * 3.0 + side * rng.range(0.8, 0.9), -toward),
+            2 => {
+                let angle = rng.range(0.0, std::f32::consts::TAU);
+                let (sin, cos) = angle.sin_cos();
+                let aim = Vec3::new(0.0, -cos + rng.range(-0.2, 0.2), -sin);
+                (Vec3::new(0.0, 3.0 * cos, 3.0 * sin), aim)
+            }
+            3 => (rng.point(-0.3, 0.3), toward),
+            _ => (toward * 3.0 + side * rng.range(0.9, 1.5), -toward),
+        };
+        Ray::new(origin, direction)
+    });
+    rays.collect()
+}
+
+#[test]
+fn raycasts_through_blocks_hit_as_every_triangle_does() {
+    let mut fx = sphere();
+    let mut rng = Rng(14);
+    let rays = sphere_rays(&mut rng, 500);
+    let mut hits = 0;
+    // Twice: the blocks built by the first pass, then kept.
+    for pass in 0..2 {
+        for (k, ray) in rays.iter().enumerate() {
+            let fast = fx.index.raycast_triangle(&mut fx.store, ray).unwrap();
+            let exhaustive = fx.index.raycast_exhaustive(&mut fx.store, ray).unwrap();
+            assert_eq!(
+                hit_bits(fast),
+                hit_bits(exhaustive),
+                "pass {pass}, ray {k}: the same hit, bit for bit ({ray:?})"
+            );
+            hits += usize::from(fast.is_some());
+        }
+    }
+    assert!(hits > 500, "most rays hit: {hits}");
+}
+
+#[test]
+fn an_edit_is_raycast_as_it_is_now() {
+    let mut fx = sphere();
+    let key = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let side = key.side();
+    let (i, j) = (side / 2, side / 2);
+    let at = usize::try_from(j * side + i).unwrap();
+    let before = fx.store.evaluate(key).unwrap()[at];
+    // A ray at the vertex, raycast so the tile's blocks are kept.
+    let origin = before * 3.0;
+    let ray = Ray::new(origin, before - origin).unwrap();
+    let first = fx
+        .index
+        .raycast_triangle(&mut fx.store, &ray)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.key, key, "the ray hits the tile");
+    // Move the vertex well off where the ray hit it.
+    fx.store.begin_op().unwrap();
+    fx.store
+        .set_correction(FaceId::new(0), level(), i, j, Vec3::new(0.0, 0.0, 0.5))
+        .unwrap();
+    fx.index.update(&mut fx.store, &[key]).unwrap();
+    let moved = fx.store.evaluate(key).unwrap()[at];
+    assert!((moved - before).length() > 0.1, "the edit moves the vertex");
+    let after = fx.index.raycast_triangle(&mut fx.store, &ray).unwrap();
+    let exhaustive = fx.index.raycast_exhaustive(&mut fx.store, &ray).unwrap();
+    assert_eq!(
+        hit_bits(after),
+        hit_bits(exhaustive),
+        "the edited surface's hit"
+    );
+    // A ray across the spike the edit raised, clear of the surface as it was: the tile's
+    // blocks from before would skip every triangle it crosses.
+    let across = (moved - before)
+        .cross(Vec3::new(0.3, 0.5, 0.7))
+        .normalized()
+        .unwrap();
+    let point = before + (moved - before) * 0.8;
+    let along = Ray::new(point + across, -across).unwrap();
+    let spike = fx.index.raycast_triangle(&mut fx.store, &along).unwrap();
+    let every = fx.index.raycast_exhaustive(&mut fx.store, &along).unwrap();
+    assert_eq!(
+        spike.map(|hit| hit.key),
+        Some(key),
+        "the ray hits the spike"
+    );
+    assert_eq!(
+        hit_bits(spike),
+        hit_bits(every),
+        "the spike's hit, bit for bit"
+    );
+}
+
+#[test]
+fn a_clone_raycasts_alike() {
+    let mut fx = sphere();
+    let mut rng = Rng(15);
+    let rays = sphere_rays(&mut rng, 50);
+    let firsts: Vec<_> = rays
+        .iter()
+        .map(|ray| hit_bits(fx.index.raycast_triangle(&mut fx.store, ray).unwrap()))
+        .collect();
+    let copy = fx.index.clone();
+    let again: Vec<_> = rays
+        .iter()
+        .map(|ray| hit_bits(copy.raycast_triangle(&mut fx.store, ray).unwrap()))
+        .collect();
+    assert_eq!(firsts, again, "a clone, its cache empty, hits the same");
+}

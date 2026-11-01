@@ -17,8 +17,12 @@
 //! - [`SpatialIndex::raycast`]: the first point a ray hits, for picking
 //!   ([`SpatialIndex::raycast_triangle`] with the triangle and where on it). The tree hands out
 //!   candidate tiles nearest-first, and each is evaluated and intersected exactly, quad by quad
-//!   (two triangles each), until no remaining candidate can be nearer than the hit found.
+//!   (two triangles each), until no remaining candidate can be nearer than the hit found. Inside a
+//!   tile, its blocks of 8 × 8 quads ([`blocks`]) skip the triangles the ray can't hit, with the
+//!   same answer, bit for bit, as testing them all; the blocks of the tiles raycast last are kept
+//!   until the store's next write.
 
+mod blocks;
 mod bvh;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -27,6 +31,7 @@ pub use bvh::{Bvh, Hit, MAX_TILES, Ray, SphereQuery};
 use geom::{BaseMesh, Level, MAX_LEVEL, TILE_QUADS, TileKey, Vec3};
 use thiserror::Error;
 
+use self::blocks::{BlockCache, SharedBlocks, TileBlocks, WideRay, Written};
 pub use crate::tile_bounds::{Aabb, NormalCone, TileBounds};
 pub use crate::tiles::WaveBounds;
 use crate::tiles::{CacheError, Evaluation, TileStore};
@@ -85,6 +90,9 @@ pub struct SpatialIndex {
     level: Level,
     /// The tiles' bounds.
     bvh: Bvh,
+    /// The blocks of the tiles raycast last, which let a raycast skip most of a tile's
+    /// triangles (see [`blocks`]).
+    blocks: SharedBlocks,
 }
 
 impl SpatialIndex {
@@ -124,6 +132,7 @@ impl SpatialIndex {
         Ok(Self {
             level,
             bvh: Bvh::build(tiles)?,
+            blocks: SharedBlocks::default(),
         })
     }
 
@@ -181,6 +190,7 @@ impl SpatialIndex {
             Self {
                 level,
                 bvh: Bvh::build(tiles)?,
+                blocks: SharedBlocks::default(),
             },
             stats,
         ))
@@ -363,6 +373,11 @@ impl SpatialIndex {
     /// Of a tile's triangles at the same least parameter, the first in row-major order is
     /// taken, a quad's first triangle before its second.
     ///
+    /// A tile's triangles are tested through its blocks (see the module notes), built on its first
+    /// raycast since the store's last write: about 0.4 of testing every triangle, then about a
+    /// thirtieth while they are kept. The answer is the exhaustive test's, bit for bit.
+    /// Raycasts through one index take turns on its kept blocks.
+    ///
     /// # Errors
     ///
     /// [`IndexError::Cache`] if a candidate tile can't be evaluated.
@@ -371,16 +386,82 @@ impl SpatialIndex {
         store: &mut TileStore,
         ray: &Ray,
     ) -> Result<Option<TriangleHit>, IndexError> {
+        let wide = WideRay::new(ray);
+        let mut cache = self.blocks.lock();
+        self.raycast_with(store, ray, |store, key| {
+            tile_hit(store, &mut cache, ray, &wide, key)
+        })
+    }
+
+    /// [`SpatialIndex::raycast_triangle`] testing every triangle of each candidate tile: the
+    /// oracle the blocks' answers are checked against.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpatialIndex::raycast_triangle`].
+    #[cfg(test)]
+    pub(crate) fn raycast_exhaustive(
+        &self,
+        store: &mut TileStore,
+        ray: &Ray,
+    ) -> Result<Option<TriangleHit>, IndexError> {
+        self.raycast_with(store, ray, |store, key| {
+            Ok(intersect_grid(ray, store.evaluate(key)?, key.side(), key))
+        })
+    }
+
+    /// The tree's raycast ([`Bvh::raycast`]) with `hit(store, key)` as the test of a candidate
+    /// tile: the hit it gives on the tile the tree finds first.
+    ///
+    /// # Errors
+    ///
+    /// As `hit`.
+    fn raycast_with(
+        &self,
+        store: &mut TileStore,
+        ray: &Ray,
+        mut hit: impl FnMut(&mut TileStore, TileKey) -> Result<Option<TriangleHit>, CacheError>,
+    ) -> Result<Option<TriangleHit>, IndexError> {
         let mut found: Vec<TriangleHit> = Vec::new();
-        let hit = self.bvh.raycast(ray, |key| {
-            let hit = intersect_grid(ray, store.evaluate(key)?, key.side(), key);
+        let first = self.bvh.raycast(ray, |key| {
+            let hit = hit(store, key)?;
             if let Some(hit) = hit {
                 found.push(hit);
             }
             Ok::<_, CacheError>(hit.map(|hit| hit.t))
         })?;
-        Ok(hit.and_then(|hit| found.into_iter().find(|tri| tri.key == hit.key)))
+        Ok(first.and_then(|first| found.into_iter().find(|tri| tri.key == first.key)))
     }
+}
+
+/// The nearest triangle `ray` (`wide` in `f64`) crosses of tile `key`, as [`intersect_grid`]
+/// gives it.
+///
+/// The tile is evaluated through `store`, and intersected through its blocks: from `cache` if
+/// they were built from the tile as it evaluates now, else built and kept there.
+///
+/// # Errors
+///
+/// As [`TileStore::evaluate`].
+fn tile_hit(
+    store: &mut TileStore,
+    cache: &mut BlockCache,
+    ray: &Ray,
+    wide: &WideRay,
+    key: TileKey,
+) -> Result<Option<TriangleHit>, CacheError> {
+    let side = key.side();
+    store.evaluate(key)?;
+    // The state is read with the tile current, so the blocks kept for it are of these bits.
+    let written = Written::of(store);
+    if let Some(positions) = store.cached_positions(&key)
+        && let Some(blocks) = cache.blocks(written, key, positions, side)
+    {
+        return Ok(blocks.intersect(ray, wide, positions, key));
+    }
+    // Current a moment ago, so only a store that drops a tile at once lands here.
+    let positions = store.evaluate(key)?;
+    Ok(TileBlocks::new(positions, side).intersect(ray, wide, positions, key))
 }
 
 /// Where a ray first crosses a tile's surface: [`SpatialIndex::raycast_triangle`]'s answer.
@@ -442,6 +523,10 @@ fn intersect_tile(ray: &Ray, positions: &[Vec3], side: u32) -> Option<f32> {
 
 /// The nearest triangle `ray` crosses of a grid of `side` vertices a side with `positions`,
 /// row-major, the hit named for tile `key` (see [`TriangleHit`]); `None` if it misses every one.
+///
+/// Every triangle tested, in row-major order: the exhaustive test, which [`TileBlocks`] answers
+/// as, bit for bit, and the oracle its tests check it against.
+#[cfg(test)]
 fn intersect_grid(ray: &Ray, positions: &[Vec3], side: u32, key: TileKey) -> Option<TriangleHit> {
     let width = side as usize;
     let rows = positions.chunks_exact(width);
