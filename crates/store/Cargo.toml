@@ -14,7 +14,8 @@ workspace = true
 # the fuzz crate only, so release builds never compile it.
 fuzzing = []
 # What `brushcraft-bench` needs to time the display layer level by level
-# (`TileStore::queue_display_level`), turned on by the bench only.
+# (`TileStore::queue_display_level`) and what `benches/stroke_record.rs` times
+# (`StrokeRecord::framed_len`), turned on by the benches only.
 bench = []
 
 [dependencies]
@@ -45,3 +46,9 @@ harness = false
 [[bench]]
 name = "display_draw"
 harness = false
+
+# Needs `StrokeRecord::framed_len`, built with the `bench` feature only.
+[[bench]]
+name = "stroke_record"
+harness = false
+required-features = ["bench"]
