@@ -310,7 +310,7 @@ fn a_drag_with_no_pressure_reaches_nothing_and_the_stroke_goes_on() {
     let mut owner = owner(&dir);
     run(&mut owner, 10_000);
     let mut samples = stroke(ACROSS, 12);
-    // Every drag of the stroke's first half without pressure: dabs of radius 0.
+    // Every drag of the stroke's first half without pressure: the engine places no dab there.
     for sample in samples.iter_mut().skip(1).take(6) {
         sample.pressure = input::Unit::ZERO;
     }

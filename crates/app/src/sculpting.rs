@@ -12,8 +12,8 @@
 //!   nothing under (the route's hit lost to rounding) starts no stroke, and its samples are
 //!   dropped.
 //! - **Each sample:** [`Stroke::push`], through a fresh [`StoreSurface`] each call, ended with
-//!   [`StoreSurface::finish`]; the dabs it places join the stroke's queue, but those of radius 0 (a
-//!   sample with no pressure), which reach nothing.
+//!   [`StoreSurface::finish`]; the dabs it places join the stroke's queue. A sample with no
+//!   pressure places none: the engine places no dab below [`stroke::MIN_DAB_SIZE`].
 //! - **Each frame:** the queue's dabs are applied by [`apply_dabs`], as many as the frame's budget
 //!   allows ([`DabBudget`]), in order; the rest wait for the next frame. The edit closes the
 //!   store's epoch, which the frame loop drains after the brush phase and uploads in the same
@@ -443,8 +443,7 @@ impl Sculpting {
         keep_sample(&mut active.record, &engine, &mut self.error);
         match finished {
             Ok(()) => {
-                let reaching = placed.filter(reaches);
-                let queued = reaching.map(|dab| Queued { dab, sample: times });
+                let queued = placed.map(|dab| Queued { dab, sample: times });
                 self.queue.extend(queued);
             }
             Err(error) => {
@@ -478,8 +477,7 @@ impl Sculpting {
         let tail = stroke.end(&projector, &mut surface);
         match surface.finish() {
             Ok(()) => {
-                let reaching = tail.filter(reaches);
-                let queued = reaching.map(|dab| Queued { dab, sample: times });
+                let queued = tail.map(|dab| Queued { dab, sample: times });
                 self.queue.extend(queued);
             }
             Err(error) => self.fail("placing the stroke's last dabs", &error),
@@ -806,15 +804,6 @@ impl Brush for Sculpting {
         }
         lines
     }
-}
-
-/// Whether `dab` reaches any vertex: its radius is positive.
-///
-/// The engine scales a dab's radius by its dynamics' size factor, so a sample with no pressure
-/// places a dab of radius 0 (the default pressure-to-size curve starts at 0). It moves nothing, and
-/// [`apply_dabs`] refuses a frame holding one, so it is left out: leaving it out is applying it.
-fn reaches(dab: &Dab) -> bool {
-    dab.radius > 0.0
 }
 
 /// `sample` added to `record`; a full record leaves it out and keeps the error in `error`.

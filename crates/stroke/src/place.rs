@@ -43,6 +43,12 @@
 //! the last dab and the distance from the start, both in radii, and the stroke's random value
 //! for its sequence number.
 //!
+//! **Dabs too small to move anything.** A dab whose dynamics' size factor is below
+//! [`MIN_DAB_SIZE`] (a sample with no pressure, under the default pressure-to-size curve) is not
+//! placed: the walk goes on as if it were (the spacing to the next dab counts from its place),
+//! but nothing is emitted and it takes no sequence number, so the dabs that are placed keep their
+//! spacing and number on from each other. No dab of radius 0 ever leaves the engine.
+//!
 //! **The tail.** [`Stroke::end`](crate::Stroke::end) walks the last segment to the pen's last
 //! raw sample, then places a final dab there unless one already lies within 1 % of the spacing
 //! of it, so a fast stroke's dabs always reach where the pen lifted.
@@ -57,6 +63,13 @@ use crate::{
     ACTION_SLOTS, DVec3, Dynamics, Inputs, Sample, ScreenPoint, SizeMode, Spacing, StrengthMode,
     StrokeRandom, StrokeSettings, Unit,
 };
+
+/// The smallest size factor a placed dab has: a dab whose dynamics make it smaller than this
+/// share of the stroke's frozen radius, a thousandth, is not placed (see the module's notes).
+///
+/// It would move next to nothing (at most a thousandth of the brush's footprint's width) and,
+/// at 0, nothing at all, which an action refuses as a dab.
+pub const MIN_DAB_SIZE: f32 = 1e-3;
 
 /// How far a hit may be from the last accepted point and still continue the stroke, in radii of
 /// the stroke's frozen world radius: the reach given to [`Surface::continuous`] and
@@ -254,7 +267,7 @@ impl Placer {
             from: *first,
             to: *first,
         };
-        placer.pending = Some(placer.make(&anchor, 0.0, DVec3::ZERO));
+        placer.pending = placer.make(&anchor, 0.0, DVec3::ZERO);
         Some(placer)
     }
 
@@ -377,8 +390,7 @@ impl Placer {
             self.flush(out);
         }
         if self.travelled >= self.next_spacing * (1.0 - SPACING_TOLERANCE) {
-            let placed = self.make(segment, u, direction);
-            out.push(placed);
+            out.extend(self.make(segment, u, direction));
         }
     }
 
@@ -397,14 +409,15 @@ impl Placer {
     pub(crate) fn tail(&mut self, segment: &Segment, out: &mut Vec<Placed>) {
         self.flush(out);
         if self.travelled > self.next_spacing * SPACING_TOLERANCE {
-            let placed = self.make(segment, 1.0, self.heading.unwrap_or(DVec3::ZERO));
-            out.push(placed);
+            let heading = self.heading.unwrap_or(DVec3::ZERO);
+            out.extend(self.make(segment, 1.0, heading));
         }
     }
 
     /// The dab at the cursor, `u` of the way along `segment`, heading along `direction`; the
-    /// spacing, speed and distance bookkeeping move on to it.
-    fn make(&mut self, segment: &Segment, u: f64, direction: DVec3) -> Placed {
+    /// spacing, speed and distance bookkeeping move on to it. `None` if its size factor is below
+    /// [`MIN_DAB_SIZE`]: the bookkeeping moves on all the same, but it takes no sequence number.
+    fn make(&mut self, segment: &Segment, u: f64, direction: DVec3) -> Option<Placed> {
         let time = segment.time(u);
         let dt = time - self.last_time;
         if dt > 0.0 {
@@ -431,7 +444,9 @@ impl Placer {
             reason = "a dab's time is f32 seconds since its stroke began"
         )]
         let since_start = (time - self.start) as f32;
-        let placed = Placed {
+        // `>=` is false for NaN too, which finite dynamics can't give.
+        let sized = values.size >= MIN_DAB_SIZE;
+        let placed = sized.then(|| Placed {
             position: self.cursor.position,
             normal: self.cursor.normal,
             tangent,
@@ -442,10 +457,12 @@ impl Placer {
             params,
             seq: self.seq,
             time: since_start,
-        };
+        });
         let floor = f64::from(Spacing::MIN) * self.radius;
         self.next_spacing = (self.spacing * self.radius * f64::from(values.spacing)).max(floor);
-        self.seq = self.seq.wrapping_add(1);
+        if sized {
+            self.seq = self.seq.wrapping_add(1);
+        }
         self.travelled = 0.0;
         self.last_time = time;
         self.last_distance = self.distance;

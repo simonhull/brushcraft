@@ -11,9 +11,9 @@ use crate::tests::slab::{self, Slab};
 use crate::tests::sphere::Sphere;
 use crate::tests::{Camera, sample};
 use crate::{
-    Axis, Curve, DVec3, Dynamics, Entry, Hardness, Input, MirrorPlanes, Param, PathSettings,
-    Radial, Radius, SPACING_TOLERANCE, ScreenPoint, SizeMode, Spacing, Strength, StrengthMode,
-    Surface, Symmetry,
+    Axis, Curve, DVec3, Dynamics, Entry, Hardness, Input, MIN_DAB_SIZE, MirrorPlanes, Param,
+    PathSettings, Radial, Radius, SPACING_TOLERANCE, ScreenPoint, SizeMode, Spacing, Strength,
+    StrengthMode, Surface, Symmetry,
 };
 
 /// The spacing tests' tolerance: the plan's ±10 %.
@@ -594,6 +594,50 @@ fn a_strength_in_radii_follows_the_frozen_radius_at_any_zoom() {
             .iter()
             .all(|dab| dab.strength.to_bits() == 0.1_f32.to_bits()),
         "in model units, as given"
+    );
+}
+
+#[test]
+fn no_pressure_places_no_dab_and_the_spacing_holds_across_it() {
+    let camera = top_camera();
+    // Pressed, then lifted to no pressure (still touching) for the middle third, then pressed.
+    let samples: Vec<Sample> = (0..90)
+        .map(|i| {
+            let u = f64::from(i) / 89.0;
+            let pressure = if (30..60).contains(&i) { 0.0 } else { 1.0 };
+            sample(screen(200.0 + 400.0 * u, 300.0), u, pressure)
+        })
+        .collect();
+    let (dabs, radius) = run(&plain(), &camera, &mut Plane, &samples);
+    let smallest = dabs
+        .iter()
+        .map(|dab| dab.radius)
+        .fold(f32::INFINITY, f32::min);
+    println!(
+        "no pressure: {} dabs, smallest radius {smallest:.6} of {radius:.4}",
+        dabs.len()
+    );
+    assert!(
+        dabs.iter()
+            .all(|dab| f64::from(dab.radius) >= f64::from(MIN_DAB_SIZE) * radius * 0.999),
+        "no dab below the least size"
+    );
+    let numbers: Vec<u32> = dabs.iter().map(|dab| dab.seq).collect();
+    let expected: Vec<u32> = (0..u32::try_from(dabs.len()).unwrap()).collect();
+    assert_eq!(numbers, expected, "numbered on, with no gaps");
+    // Every gap is a whole number of spacings: the skipped dabs kept their places.
+    let target = f64::from(Spacing::DEFAULT.get()) * radius;
+    let spans = gaps(&dabs, DVec3::distance);
+    let multiples: Vec<f64> = spans.iter().map(|gap| gap / target).collect();
+    for multiple in &multiples {
+        assert!(
+            (multiple - multiple.round()).abs() < TOLERANCE * multiple.round().max(1.0),
+            "a whole number of spacings: {multiples:?}"
+        );
+    }
+    assert!(
+        multiples.iter().any(|&m| m > 10.0),
+        "the unpressed third left a gap: {multiples:?}"
     );
 }
 
