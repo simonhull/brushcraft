@@ -14,7 +14,8 @@
 //! Two queries:
 //!
 //! - [`SpatialIndex::query_sphere`]: the tiles a brush's sphere touches, from the bounds alone;
-//! - [`SpatialIndex::raycast`]: the first point a ray hits, for picking. The tree hands out
+//! - [`SpatialIndex::raycast`]: the first point a ray hits, for picking
+//!   ([`SpatialIndex::raycast_triangle`] with the triangle and where on it). The tree hands out
 //!   candidate tiles nearest-first, and each is evaluated and intersected exactly, quad by quad
 //!   (two triangles each), until no remaining candidate can be nearer than the hit found.
 
@@ -343,16 +344,68 @@ impl SpatialIndex {
 
     /// Where `ray` first hits the surface at the index's level, evaluating candidate tiles
     /// through `store` nearest-first and intersecting each one's quads as two triangles; `None`
-    /// if it hits nothing.
+    /// if it hits nothing. [`SpatialIndex::raycast_triangle`] without the triangle.
     ///
     /// # Errors
     ///
     /// [`IndexError::Cache`] if a candidate tile can't be evaluated.
     pub fn raycast(&self, store: &mut TileStore, ray: &Ray) -> Result<Option<Hit>, IndexError> {
-        Ok(self.bvh.raycast(ray, |key| {
-            Ok::<_, CacheError>(intersect_tile(ray, store.evaluate(key)?, key.side()))
-        })?)
+        let hit = self.raycast_triangle(store, ray)?;
+        Ok(hit.map(|hit| Hit {
+            key: hit.key,
+            t: hit.t,
+        }))
     }
+
+    /// [`SpatialIndex::raycast`], with the triangle hit and where on it: the one raycast, for
+    /// picking and for whatever needs the surface's point, normal or coordinates there.
+    ///
+    /// Of a tile's triangles at the same least parameter, the first in row-major order is
+    /// taken, a quad's first triangle before its second.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Cache`] if a candidate tile can't be evaluated.
+    pub fn raycast_triangle(
+        &self,
+        store: &mut TileStore,
+        ray: &Ray,
+    ) -> Result<Option<TriangleHit>, IndexError> {
+        let mut found: Vec<TriangleHit> = Vec::new();
+        let hit = self.bvh.raycast(ray, |key| {
+            let hit = intersect_grid(ray, store.evaluate(key)?, key.side(), key);
+            if let Some(hit) = hit {
+                found.push(hit);
+            }
+            Ok::<_, CacheError>(hit.map(|hit| hit.t))
+        })?;
+        Ok(hit.and_then(|hit| found.into_iter().find(|tri| tri.key == hit.key)))
+    }
+}
+
+/// Where a ray first crosses a tile's surface: [`SpatialIndex::raycast_triangle`]'s answer.
+///
+/// The tile's quad `(i, j)`–`(i + 1, j + 1)` is split along that diagonal into two triangles:
+/// the first `(i, j)`, `(i + 1, j)`, `(i + 1, j + 1)`, the second `(i, j)`, `(i + 1, j + 1)`,
+/// `(i, j + 1)`. The point is `corner + u (second − corner) + v (third − corner)` on the
+/// triangle hit, which lies on the ray at `t` up to rounding; `u` and `v` may stray outside the
+/// triangle by the test's slack (about `1e-6`) at an edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TriangleHit {
+    /// The tile hit.
+    pub key: TileKey,
+    /// The ray parameter of the hit, as [`Hit::t`].
+    pub t: f32,
+    /// The quad's least corner's column in the tile.
+    pub i: u32,
+    /// The quad's least corner's row in the tile.
+    pub j: u32,
+    /// Whether the quad's second triangle was hit, else its first.
+    pub second: bool,
+    /// The weight of the triangle's second corner.
+    pub u: f32,
+    /// The weight of its third corner.
+    pub v: f32,
 }
 
 /// The most tiles per side of a face, at the deepest level: 64, which a tile coordinate (a
@@ -380,34 +433,71 @@ fn tiles_of(mesh: &BaseMesh, level: Level) -> impl Iterator<Item = TileKey> {
 /// The ray parameter of `ray`'s nearest hit on a tile with `positions`, row-major `side × side`,
 /// each quad split into two triangles along its `(i, j)`–`(i + 1, j + 1)` diagonal; `None` if
 /// it misses every one.
+#[cfg(test)]
 fn intersect_tile(ray: &Ray, positions: &[Vec3], side: u32) -> Option<f32> {
-    let side = side as usize;
-    let rows = positions.chunks_exact(side);
-    rows.clone()
+    // Any tile names the hit: only its parameter is kept.
+    let key = TileKey::displacement(geom::FaceId::new(0), Level::new(6).ok()?, 0, 0).ok()?;
+    intersect_grid(ray, positions, side, key).map(|hit| hit.t)
+}
+
+/// The nearest triangle `ray` crosses of a grid of `side` vertices a side with `positions`,
+/// row-major, the hit named for tile `key` (see [`TriangleHit`]); `None` if it misses every one.
+fn intersect_grid(ray: &Ray, positions: &[Vec3], side: u32, key: TileKey) -> Option<TriangleHit> {
+    let width = side as usize;
+    let rows = positions.chunks_exact(width);
+    let quads = rows
+        .clone()
         .zip(rows.skip(1))
-        .flat_map(|(row, next)| row.windows(2).zip(next.windows(2)))
-        .filter_map(|quad| match quad {
-            (&[a, b], &[c, d]) => {
-                let first = intersect_triangle(ray, a, b, d);
-                let second = intersect_triangle(ray, a, d, c);
-                [first, second].into_iter().flatten().reduce(f32::min)
+        .zip(0_u32..)
+        .flat_map(|((row, next), j)| {
+            row.windows(2)
+                .zip(next.windows(2))
+                .zip(0_u32..)
+                .map(move |(quad, i)| (quad, i, j))
+        });
+    let mut best: Option<TriangleHit> = None;
+    for (quad, i, j) in quads {
+        let (&[low, right], &[up, far]) = quad else {
+            continue;
+        };
+        let triangles = [(false, low, right, far), (true, low, far, up)];
+        for (second, corner, p, q) in triangles {
+            let Some((t, u, v)) = intersect_triangle(ray, corner, p, q) else {
+                continue;
+            };
+            if best.is_none_or(|best| t < best.t) {
+                best = Some(TriangleHit {
+                    key,
+                    t,
+                    i,
+                    j,
+                    second,
+                    u,
+                    v,
+                });
             }
-            _ => None,
-        })
-        .reduce(f32::min)
+        }
+    }
+    best
 }
 
 /// How far outside a triangle's edges, in barycentric terms, a hit still counts: enough that a
 /// ray through an edge two triangles share hits one of them despite rounding.
 const EDGE_SLACK: f32 = 1e-6;
 
-/// The ray parameter where `ray` crosses the triangle `corner`, `second`, `third` (from either
-/// side), or `None` if it misses or runs parallel to it.
+/// Where `ray` crosses the triangle `corner`, `second`, `third` (from either side): the ray
+/// parameter, and the weights of the second and third corners; `None` if it misses or runs
+/// parallel to it.
 ///
 /// Möller and Trumbore's test: solve `origin + t·direction = corner + u (second − corner) +
 /// v (third − corner)` by Cramer's rule, and accept `u ≥ 0`, `v ≥ 0`, `u + v ≤ 1`, `t ≥ 0`
 /// (the barycentric bounds widened by [`EDGE_SLACK`]).
-fn intersect_triangle(ray: &Ray, corner: Vec3, second: Vec3, third: Vec3) -> Option<f32> {
+fn intersect_triangle(
+    ray: &Ray,
+    corner: Vec3,
+    second: Vec3,
+    third: Vec3,
+) -> Option<(f32, f32, f32)> {
     let (edge1, edge2) = (second - corner, third - corner);
     let across = ray.direction().cross(edge2);
     let det = edge1.dot(across);
@@ -421,5 +511,5 @@ fn intersect_triangle(ray: &Ray, corner: Vec3, second: Vec3, third: Vec3) -> Opt
     let v = ray.direction().dot(up) * inv;
     let inside = u >= -EDGE_SLACK && v >= -EDGE_SLACK && u + v <= 1.0 + EDGE_SLACK;
     let t = edge2.dot(up) * inv;
-    (inside && t >= 0.0).then_some(t)
+    (inside && t >= 0.0).then_some((t, u, v))
 }

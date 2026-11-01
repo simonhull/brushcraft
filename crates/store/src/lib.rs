@@ -49,7 +49,7 @@ pub use file::{
 };
 pub use index::{
     Aabb, Bvh, Hit, IndexError, LoadStats, MAX_TILES, NormalCone, Ray, SpatialIndex, SphereQuery,
-    TileBounds, WaveBounds,
+    TileBounds, TriangleHit, WaveBounds,
 };
 pub use jobs::JobsReport;
 pub use meta::{Meta, ProjectId, Role, SavePoint};
