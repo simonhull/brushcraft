@@ -20,6 +20,7 @@ thiserror.workspace = true
 [dev-dependencies]
 divan.workspace = true
 geom = { workspace = true, features = ["test-fixtures"] }
+store = { workspace = true, features = ["test-oracle"] }
 
 [[bench]]
 name = "draw_step"

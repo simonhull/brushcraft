@@ -17,6 +17,9 @@ fuzzing = []
 # (`TileStore::queue_display_level`) and what `benches/stroke_record.rs` times
 # (`StrokeRecord::framed_len`), turned on by the benches only.
 bench = []
+# `SpatialIndex::raycast_exhaustive`, the raycast testing every triangle of each candidate
+# tile: the oracle the fast raycast is checked against, for other crates' tests only.
+test-oracle = []
 
 [dependencies]
 bytemuck.workspace = true

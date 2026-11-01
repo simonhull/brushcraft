@@ -394,13 +394,14 @@ impl SpatialIndex {
     }
 
     /// [`SpatialIndex::raycast_triangle`] testing every triangle of each candidate tile: the
-    /// oracle the blocks' answers are checked against.
+    /// oracle the blocks' answers are checked against, here and (with the `test-oracle`
+    /// feature) in other crates' tests.
     ///
     /// # Errors
     ///
     /// As [`SpatialIndex::raycast_triangle`].
-    #[cfg(test)]
-    pub(crate) fn raycast_exhaustive(
+    #[cfg(any(test, feature = "test-oracle"))]
+    pub fn raycast_exhaustive(
         &self,
         store: &mut TileStore,
         ray: &Ray,
@@ -526,7 +527,7 @@ fn intersect_tile(ray: &Ray, positions: &[Vec3], side: u32) -> Option<f32> {
 ///
 /// Every triangle tested, in row-major order: the exhaustive test, which [`TileBlocks`] answers
 /// as, bit for bit, and the oracle its tests check it against.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-oracle"))]
 fn intersect_grid(ray: &Ray, positions: &[Vec3], side: u32, key: TileKey) -> Option<TriangleHit> {
     let width = side as usize;
     let rows = positions.chunks_exact(width);

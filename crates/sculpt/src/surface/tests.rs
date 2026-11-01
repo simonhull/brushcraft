@@ -592,3 +592,80 @@ fn surface_costs() {
         );
     }
 }
+
+#[test]
+fn placement_after_a_dab_raycasts_as_every_triangle_does() {
+    let dir = TestDir::new();
+    let (mut project, mut index) = cube(&dir, level(), fixed(2));
+    // The top of the sphere, where the draw dab's normal (+z) is the surface's.
+    let down = Ray::new(DVec3::new(0.01, 0.02, 3.0), DVec3::new(0.0, 0.0, -1.0)).unwrap();
+    let top = {
+        let mut surface = StoreSurface::new(project.store(), &index);
+        let hit = surface.raycast(&down).unwrap();
+        surface.finish().unwrap();
+        hit.position
+    };
+    // Rays from above around the top, placed before the dab so the index keeps the blocks of
+    // the surface as it was, and rays skimming across the top at the heights the dab raises it
+    // to: clear of the surface as it was.
+    let around = |k: u32| {
+        let angle = f64::from(k) * 0.7;
+        DVec3::new(angle.cos(), angle.sin(), 0.0) * (0.004 * f64::from(k % 25))
+    };
+    let from_above: Vec<Ray> = (0..50)
+        .map(|k| Ray::new(top + around(k) + DVec3::new(0.0, 0.0, 2.0), -DVec3::Z).unwrap())
+        .collect();
+    let skimming: Vec<Ray> = (0..50)
+        .map(|k| {
+            let height = 0.02 + 0.004 * f64::from(k % 25);
+            let across = DVec3::new(0.0, 0.002 * f64::from(k) - 0.05, height);
+            let origin = top + across - DVec3::new(1.0, 0.0, 0.0);
+            Ray::new(origin, DVec3::new(1.0, 0.0, 0.0)).unwrap()
+        })
+        .collect();
+    let mut warming = StoreSurface::new(project.store(), &index);
+    let before: Vec<Option<Hit>> = from_above.iter().map(|ray| warming.raycast(ray)).collect();
+    warming.finish().unwrap();
+    assert!(
+        before.iter().all(Option::is_some),
+        "the rays from above hit the top"
+    );
+    // One strong dab at the top, raising it by up to a tenth.
+    let mut state = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    let raise = dab(top.to_f32(), 0.2, 0.1, 0.5, 0);
+    apply_dabs(project.store(), &mut index, &mut state, &[raise]).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    let store = project.store();
+    let (mut raised, mut skimmed) = (0, 0);
+    let rays = from_above.iter().chain(&skimming);
+    for (k, ray) in rays.enumerate() {
+        let narrow = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32()).unwrap();
+        let every = index.raycast_exhaustive(store, &narrow).unwrap();
+        let fast = index.raycast_triangle(store, &narrow).unwrap();
+        assert_eq!(
+            fast.map(|hit| (hit.key, hit.i, hit.j, hit.second, hit.t.to_bits())),
+            every.map(|hit| (hit.key, hit.i, hit.j, hit.second, hit.t.to_bits())),
+            "ray {k}: the same triangle at the same parameter after the dab"
+        );
+        let mut surface = StoreSurface::new(store, &index);
+        let placed = surface.raycast(ray);
+        let expected = every.map(|hit| surface.hit_on_triangle(ray, hit).unwrap());
+        surface.finish().unwrap();
+        assert_eq!(placed, expected, "ray {k}: the placement after the dab");
+        let lifted = |hit: &Hit| hit.position.z > top.z + 0.01;
+        if k < 50 {
+            raised += usize::from(placed.as_ref().is_some_and(lifted));
+        } else {
+            skimmed += usize::from(placed.as_ref().is_some_and(lifted));
+        }
+    }
+    assert!(
+        raised >= 25,
+        "the dab raised where the rays from above land: {raised}"
+    );
+    assert!(
+        skimmed >= 10,
+        "rays skimming the old top hit the raised one: {skimmed}"
+    );
+}
