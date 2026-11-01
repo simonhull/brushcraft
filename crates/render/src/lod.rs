@@ -2168,26 +2168,51 @@ fn read_output(
         .map(bytemuck::pod_collect_to_vec)
         .unwrap_or_default();
     let written = entries.iter();
-    let mut output = LodOutput {
-        frame: tag,
-        stats: stats(&frame),
-        timings,
-        ..LodOutput::default()
-    };
+    let mut nodes: Vec<(u32, Place)> = Vec::with_capacity(entries.len());
+    let mut cut: Vec<TileKey> = Vec::with_capacity(entries.len());
+    let mut drawn: Vec<TileKey> = Vec::with_capacity(entries.len());
     for entry in written {
         let Some(place) = Place::from_packed(entry.face, entry.place) else {
             continue;
         };
-        output.nodes.push((entry.node, place));
+        nodes.push((entry.node, place));
         let Some(key) = place.key(finest) else {
             continue;
         };
-        output.cut.insert(key);
+        cut.push(key);
         if entry.flags & CUT_DRAWN != 0 {
-            output.drawn.insert(key);
+            drawn.push(key);
         }
     }
-    Ok(output)
+    // Built whole from the keys, sorted in a vector: inserting thousands one at a time is the
+    // most of the owner's time reading a cut.
+    Ok(LodOutput {
+        frame: tag,
+        cut: sorted_set(cut),
+        drawn: sorted_set(drawn),
+        nodes,
+        stats: stats(&frame),
+        timings,
+    })
+}
+
+/// The set of `keys`, built in one pass once they are sorted (duplicates count once).
+fn sorted_set(mut keys: Vec<TileKey>) -> BTreeSet<TileKey> {
+    keys.sort_unstable_by_key(key_order);
+    keys.dedup();
+    // Already sorted, so the set's own sort is a single check before it builds.
+    keys.into_iter().collect()
+}
+
+/// `key` as one number whose order is the key's: its fields packed in the order its `Ord`
+/// compares them, so a sort compares one word instead of six fields.
+fn key_order(key: &TileKey) -> u128 {
+    let whose = (u128::from(key.layer().get()) << 112)
+        | (u128::from(key.channel().raw()) << 104)
+        | (u128::from(key.face().index()) << 72);
+    let place =
+        (u128::from(key.level().get()) << 32) | (u128::from(key.tx()) << 16) | u128::from(key.ty());
+    whose | place
 }
 
 /// The counts of a frame's results.

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::FRAC_PI_2;
 
-use geom::{BaseMesh, FinestNormalCone, Level, cube_sphere};
+use geom::{BaseMesh, Channel, FinestNormalCone, LayerId, Level, TileKey, cube_sphere};
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, PollType, TextureViewDescriptor,
 };
@@ -1756,4 +1756,33 @@ fn a_stage_that_did_not_run_reads_zero_not_the_ticks_an_earlier_frame_left() {
     let bounds = LodTimings::from_ticks(&ticks, only_bounds);
     assert_eq!(bounds.bounds, ns(60), "once it runs, its ticks count");
     assert_eq!(bounds.choose, Duration::ZERO, "and only its");
+}
+
+/// A random key: any layer, channel and level of a few faces, some far apart, so every field's
+/// bits are crossed.
+fn random_key(rng: &mut Rng) -> TileKey {
+    let level = level(u8::try_from(rng.below(10)).expect("small"));
+    let per_side = usize::try_from(level.tiles_per_side()).expect("small");
+    let tx = u16::try_from(rng.below(per_side)).expect("small");
+    let ty = u16::try_from(rng.below(per_side)).expect("small");
+    let layer = LayerId::new(u16::try_from(rng.below(3)).expect("small"));
+    let channel = Channel::from_raw(u8::try_from(rng.below(3)).expect("small"));
+    let face = geom::FaceId::new([0, 1, 7, 95, 1 << 20][rng.below(5)]);
+    TileKey::new(layer, channel, face, level, tx, ty).expect("in range")
+}
+
+#[test]
+fn keys_sort_by_their_packed_order_as_by_their_own_and_a_cut_reads_back_as_the_same_set() {
+    let mut rng = Rng(41);
+    let keys: Vec<TileKey> = (0..4000).map(|_| random_key(&mut rng)).collect();
+    for pair in keys.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let packed = key_order(a).cmp(&key_order(b));
+        assert_eq!(packed, a.cmp(b), "{a:?} against {b:?}");
+    }
+    // Duplicates too: every third key twice.
+    let mut doubled = keys.clone();
+    doubled.extend(keys.iter().step_by(3).copied());
+    let from_scratch: BTreeSet<TileKey> = doubled.iter().copied().collect();
+    assert_eq!(sorted_set(doubled), from_scratch);
 }
