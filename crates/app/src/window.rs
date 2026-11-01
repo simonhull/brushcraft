@@ -15,6 +15,14 @@
 //! loop after each batch of events and again just before each frame. It holds the window and is
 //! stopped first on the way out ([`WindowApp::finish`]), so our backend never outlives the
 //! window's surface. The mouse's events stay winit's.
+//!
+//! **Order between the two:** within the pen stream, and within the mouse's input, everything
+//! keeps the order it happened in. Across them it doesn't: a frame's input phase applies all the
+//! mouse input queued since the last frame first, then routes the pen samples drained after each
+//! batch of events (and just before the frame), so a mouse event and a pen sample of the same
+//! batch reach navigation mouse first, whichever came first. With one hand on the pen that only
+//! matters if both drag at once, which navigation doesn't support anyway (a drag keeps the button
+//! that started it).
 
 use std::sync::Arc;
 use std::sync::mpsc::Sender;

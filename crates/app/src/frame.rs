@@ -6,8 +6,9 @@
 //!
 //! 1. **input**: the pointer input queued since the last frame moves the camera, then the surface
 //!    under the pointer is picked if the pointer or the view changed ([`crate::pick`]); the pen
-//!    samples queued since the last frame become the frame's [`PenFrame`] (the pen moved the camera
-//!    and the pick as they were queued, as navigation's input: [`crate::pen`]);
+//!    samples queued since the last frame are routed ([`crate::pen::PenRouter`]: a stroke to
+//!    navigation or the brush, the rest to both), navigation's moving the camera after the mouse's
+//!    input, and become the frame's [`PenFrame`];
 //! 2. **brush**: a seam for M1a4's brush step ([`Brush`]; [`NoBrush`] until then), which sees the
 //!    camera as the input left it and the frame's pen samples;
 //! 3. **feed**: the stale-tile feed is drained: the epochs closed since the last frame;
@@ -70,7 +71,7 @@ use self::schedule::{Next, Reason, Reasons, Scheduler};
 use crate::camera::{Arcball, Camera, Pixel};
 use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
-use crate::pen::{PenFrame, PenNavigation, PenSample, PenStatus};
+use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route};
 use crate::pick::Picker;
 use crate::record::{Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
@@ -87,6 +88,14 @@ pub(crate) trait Brush {
     ///
     /// If the store fails the edit.
     fn step(&mut self, project: &mut Project, camera: &Camera, pen: &PenFrame) -> Result<()>;
+
+    /// Whether the brush takes the stroke `down` starts, in the input phase, with `camera` as
+    /// the input so far left it: the one place the brush claims strokes. A stroke started with a
+    /// barrel button held navigates whatever this says ([`crate::pen::route`]). By default, and
+    /// until the brush is in, every stroke navigates.
+    fn route(&mut self, _project: &mut Project, _camera: &Camera, _down: &PenSample) -> Route {
+        Route::Navigate
+    }
 }
 
 /// No brush yet (M1a4): the step does nothing.
@@ -360,8 +369,10 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     navigator: Navigator,
     /// Pointer input since the last frame, applied in its input phase.
     input: Vec<Input>,
-    /// Pen samples since the last frame, taken into [`Owner::pen_frame`] in its input phase.
+    /// Pen samples since the last frame, routed into `pen_frame` in its input phase.
     pen_queue: Vec<PenSample>,
+    /// Which stroke is in progress, and where it goes.
+    pen_router: PenRouter,
     /// Follows the pen stream into navigation's input as samples are queued.
     pen_navigation: PenNavigation,
     /// The pen samples the last input phase took, for the brush step, and the pen's hover.
@@ -534,6 +545,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             navigator: Navigator::default(),
             input: Vec::new(),
             pen_queue: Vec::new(),
+            pen_router: PenRouter::default(),
             pen_navigation: PenNavigation::default(),
             pen_frame: PenFrame::default(),
             pen_status: PenStatus::default(),
@@ -599,17 +611,25 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.input.push(input);
     }
 
-    /// Queues a pen sample for the next frame's input phase. It acts on navigation at once, as
-    /// the input it makes ([`crate::pen::PenNavigation`]): the tip drags, the barrel buttons are
-    /// modifiers, motion in range moves the pick, and leaving takes the pointer away.
+    /// Queues a pen sample for the next frame's input phase, where it is routed.
+    ///
+    /// **The contract:** who a sample belongs to is decided in the input phase, not here: a
+    /// stroke (`Down` through `Up`) goes whole to navigation or to the brush, as decided at its
+    /// `Down` ([`Brush::route`], [`crate::pen::route`]), and a sample out of a stroke to both.
+    /// Here the sample only moves the pointer picking follows (away at a `Leave`), wants a frame
+    /// if it belongs to a stroke, and is queued; consecutive samples out of a stroke are
+    /// coalesced, the latest replacing the one before (only the pen's latest state out of a
+    /// stroke counts, for the pointer, the barrel buttons and the hover), so the queue stays
+    /// short while no frame comes.
     pub(crate) fn pen(&mut self, sample: PenSample) {
-        let mut navigation = self.pen_navigation;
-        navigation.inputs(&sample, |input| self.input(input));
-        self.pen_navigation = navigation;
-        if sample.phase == input::Phase::Leave {
-            self.pointer_left();
+        self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
+        if sample.phase.in_stroke() {
+            self.scheduler.want(Reason::Input);
         }
-        self.pen_queue.push(sample);
+        match self.pen_queue.last_mut() {
+            Some(last) if !last.phase.in_stroke() && !sample.phase.in_stroke() => *last = sample,
+            _ => self.pen_queue.push(sample),
+        }
     }
 
     /// The pen samples the last input phase took, and the pen's hover: what the brush step is
@@ -968,7 +988,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.navigator
                 .apply(event, &mut self.camera, &arcball, height);
         }
-        self.pen_frame.take(&mut self.pen_queue);
+        self.route_pen(&arcball, height);
         if let Some(picker) = &mut self.picker {
             let view = self.camera.view(size);
             picker
@@ -976,6 +996,31 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 .context("picking")?;
         }
         Ok(())
+    }
+
+    /// Routes the pen samples queued since the last frame into the frame's [`PenFrame`], in
+    /// order: navigation's (out of a stroke, or in a stroke routed to it) move the camera, whose
+    /// viewport `arcball` covers and is `height` pixels tall, as they come, so a later `Down` is
+    /// routed with the view the earlier samples left.
+    fn route_pen(&mut self, arcball: &Arcball, height: f64) {
+        self.pen_frame.clear();
+        let queued = std::mem::take(&mut self.pen_queue);
+        let samples = queued.into_iter();
+        for sample in samples {
+            let (brush, project, camera) = (&mut self.brush, &mut self.project, &self.camera);
+            let route = self
+                .pen_router
+                .route(&sample, |down| brush.route(project, camera, down));
+            if route != Some(Route::Brush) {
+                let mut navigation = self.pen_navigation;
+                navigation.inputs(&sample, |input| {
+                    self.navigator
+                        .apply(input, &mut self.camera, arcball, height);
+                });
+                self.pen_navigation = navigation;
+            }
+            self.pen_frame.push(sample, route);
+        }
     }
 
     /// Wants the frames the image needs to accumulate its samples after a frame wanted for

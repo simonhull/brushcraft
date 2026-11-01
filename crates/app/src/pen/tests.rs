@@ -522,21 +522,36 @@ fn on_the_fallback_barrel_one_is_the_tip_and_barrel_two_a_button() {
     );
 }
 
+/// Starts `frame` over with `samples`, routed by `router`, the brush asking for `claims`.
+fn take(frame: &mut PenFrame, router: &mut PenRouter, samples: &[PenSample], claims: Route) {
+    frame.clear();
+    for sample in samples {
+        let route = router.route(sample, |_| claims);
+        frame.push(*sample, route);
+    }
+}
+
 #[test]
 fn a_frame_takes_its_samples_in_order_and_keeps_the_hover() {
     let t0 = Instant::now();
     let mut frame = PenFrame::default();
-    let mut queued = vec![
-        sample(Phase::Enter, (1.0, 1.0), t0),
-        sample(Phase::Hover, (2.0, 1.0), t0),
-    ];
-    frame.take(&mut queued);
-    assert!(queued.is_empty(), "the queue is drained");
+    let mut router = PenRouter::default();
+    let brush = Route::Brush;
+    take(
+        &mut frame,
+        &mut router,
+        &[
+            sample(Phase::Enter, (1.0, 1.0), t0),
+            sample(Phase::Hover, (2.0, 1.0), t0),
+        ],
+        brush,
+    );
     assert_eq!(frame.samples().len(), 2);
+    assert!(frame.strokes().is_empty(), "out of a stroke: both");
     let hover = frame.hover().expect("hovering");
     assert_eq!(hover.at, Pixel { x: 2.0, y: 1.0 });
 
-    frame.take(&mut Vec::new());
+    take(&mut frame, &mut router, &[], brush);
     assert!(
         frame.samples().is_empty(),
         "a frame with no samples has none"
@@ -547,21 +562,99 @@ fn a_frame_takes_its_samples_in_order_and_keeps_the_hover() {
         "a pen hovering still still hovers"
     );
 
-    let mut stroke = vec![
-        sample(Phase::Down, (3.0, 1.0), t0),
-        sample(Phase::Drag, (4.0, 1.0), t0),
-    ];
-    frame.take(&mut stroke);
+    take(
+        &mut frame,
+        &mut router,
+        &[
+            sample(Phase::Hover, (3.0, 1.0), t0),
+            sample(Phase::Down, (3.0, 1.0), t0),
+            sample(Phase::Drag, (4.0, 1.0), t0),
+        ],
+        brush,
+    );
     assert_eq!(frame.hover(), None, "touching isn't hovering");
-    let phases: Vec<Phase> = frame.samples().iter().map(|s| s.phase).collect();
-    assert_eq!(phases, [Phase::Down, Phase::Drag]);
+    assert_eq!(frame.strokes(), [(1..3, Route::Brush)]);
 
-    let mut lift = vec![sample(Phase::Up, (5.0, 1.0), t0)];
-    frame.take(&mut lift);
+    take(
+        &mut frame,
+        &mut router,
+        &[
+            sample(Phase::Drag, (5.0, 1.0), t0),
+            sample(Phase::Up, (5.0, 1.0), t0),
+            sample(Phase::Hover, (6.0, 1.0), t0),
+        ],
+        Route::Navigate,
+    );
+    assert_eq!(
+        frame.strokes(),
+        [(0..2, Route::Brush)],
+        "a stroke keeps the route its Down chose, across frames"
+    );
     assert!(frame.hover().is_some(), "lifted: in range again");
-    let mut away = vec![sample(Phase::Leave, (5.0, 1.0), t0)];
-    frame.take(&mut away);
+    take(
+        &mut frame,
+        &mut router,
+        &[sample(Phase::Leave, (6.0, 1.0), t0)],
+        brush,
+    );
     assert_eq!(frame.hover(), None, "gone");
+}
+
+#[test]
+fn the_brush_reads_its_strokes_and_the_hover_never_a_navigation_stroke() {
+    let t0 = Instant::now();
+    let mut frame = PenFrame::default();
+    let mut router = PenRouter::default();
+    let samples = [
+        sample(Phase::Hover, (1.0, 1.0), t0),
+        sample(Phase::Down, (1.0, 1.0), t0),
+        sample(Phase::Drag, (2.0, 1.0), t0),
+        sample(Phase::Up, (3.0, 1.0), t0),
+        sample(Phase::Hover, (4.0, 1.0), t0),
+    ];
+    take(&mut frame, &mut router, &samples, Route::Navigate);
+    let read: Vec<Phase> = frame.for_brush().map(|sample| sample.phase).collect();
+    assert_eq!(read, [Phase::Hover, Phase::Hover]);
+    take(&mut frame, &mut router, &samples, Route::Brush);
+    assert_eq!(
+        frame.for_brush().count(),
+        5,
+        "the brush's stroke, and the hover"
+    );
+}
+
+#[test]
+fn a_barrel_held_at_the_down_navigates_whatever_the_brush_asks() {
+    let t0 = Instant::now();
+    let down = holding(sample(Phase::Down, (0.0, 0.0), t0), Buttons::SECONDARY);
+    assert_eq!(route(&down, |_| Route::Brush), Route::Navigate);
+    let bare = sample(Phase::Down, (0.0, 0.0), t0);
+    assert_eq!(route(&bare, |_| Route::Brush), Route::Brush);
+}
+
+#[test]
+fn a_lost_up_ends_the_routed_stroke() {
+    let t0 = Instant::now();
+    let mut router = PenRouter::default();
+    let decided: Vec<Option<Route>> = [
+        sample(Phase::Down, (0.0, 0.0), t0),
+        sample(Phase::Drag, (1.0, 0.0), t0),
+        sample(Phase::Hover, (2.0, 0.0), t0),
+        sample(Phase::Drag, (3.0, 0.0), t0),
+    ]
+    .iter()
+    .map(|sample| router.route(sample, |_| Route::Brush))
+    .collect();
+    assert_eq!(
+        decided,
+        [
+            Some(Route::Brush),
+            Some(Route::Brush),
+            None,
+            Some(Route::Navigate)
+        ],
+        "a drag with no down before it navigates, where it does nothing"
+    );
 }
 
 /// The navigation input `samples` make, in order.

@@ -396,20 +396,30 @@ fn a_drag_wants_a_frame_and_moves_the_camera_in_it_but_hovering_wants_none() {
     owner.close().expect("closed");
 }
 
-/// A brush that records what each frame's pen samples were (their phases) and where the pen
-/// hovered.
+/// A brush that claims the strokes it is set to, and records what each frame handed it: the
+/// phases of the samples it reads, and where the pen hovered.
 #[derive(Debug, Default)]
 struct PenLog {
+    /// Whether it claims the strokes not started with a barrel held.
+    claims: bool,
     /// Each step's samples' phases, and the hover it was handed.
     frames: Vec<(Vec<input::Phase>, Option<Pixel>)>,
 }
 
 impl Brush for PenLog {
     fn step(&mut self, _project: &mut Project, _camera: &Camera, pen: &PenFrame) -> Result<()> {
-        let phases: Vec<input::Phase> = pen.samples().iter().map(|sample| sample.phase).collect();
+        let phases: Vec<input::Phase> = pen.for_brush().map(|sample| sample.phase).collect();
         self.frames
             .push((phases, pen.hover().map(|hover| hover.at)));
         Ok(())
+    }
+
+    fn route(&mut self, _project: &mut Project, _camera: &Camera, _down: &PenSample) -> Route {
+        if self.claims {
+            Route::Brush
+        } else {
+            Route::Navigate
+        }
     }
 }
 
@@ -430,19 +440,23 @@ fn pen_sample(phase: input::Phase, (x, y): (f64, f64)) -> PenSample {
     }
 }
 
-#[test]
-fn pen_samples_navigate_as_queued_and_reach_the_brush_in_order() {
-    use input::Phase;
-    let dir = TestDir::new();
-    let mut owner = Owner::new(
-        project(&dir),
-        PenLog::default(),
-        NoUploads,
-        setup(None),
-        Instant::now(),
-    );
+/// A frame loop over a fresh project with a [`PenLog`] brush claiming strokes or not, settled.
+fn pen_owner(dir: &TestDir, claims: bool) -> Owner<PenLog, NoUploads> {
+    let brush = PenLog {
+        claims,
+        ..PenLog::default()
+    };
+    let mut owner = Owner::new(project(dir), brush, NoUploads, setup(None), Instant::now());
     run(&mut owner, 10_000);
     owner.brush.frames.clear();
+    owner
+}
+
+#[test]
+fn a_navigation_stroke_orbits_and_never_reaches_the_brush() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = pen_owner(&dir, false);
     owner.pen(pen_sample(Phase::Enter, (160.0, 100.0)));
     owner.pen(pen_sample(Phase::Hover, (161.0, 100.0)));
     assert!(
@@ -452,36 +466,99 @@ fn pen_samples_navigate_as_queued_and_reach_the_brush_in_order() {
     let before = *owner.camera();
     owner.pen(pen_sample(Phase::Down, (161.0, 100.0)));
     owner.pen(pen_sample(Phase::Drag, (200.0, 100.0)));
-    assert_eq!(run(&mut owner, 100), 1, "one frame for the drag");
+    assert_eq!(run(&mut owner, 100), 1, "one frame for the stroke");
     assert_ne!(*owner.camera(), before, "the tip's drag orbited");
+    let phases: Vec<Phase> = owner
+        .pen_frame()
+        .samples()
+        .iter()
+        .map(|sample| sample.phase)
+        .collect();
+    assert_eq!(
+        phases,
+        [Phase::Hover, Phase::Down, Phase::Drag],
+        "every sample in order, the enter coalesced into the hover after it"
+    );
     assert_eq!(
         owner.brush.frames,
-        [(
-            vec![Phase::Enter, Phase::Hover, Phase::Down, Phase::Drag],
-            None
-        )],
-        "the brush has every sample, in order; touching isn't hovering"
+        [(vec![Phase::Hover], None)],
+        "the brush reads the hover, not the navigation stroke; touching isn't hovering"
     );
-    assert_eq!(owner.pen_frame().samples().len(), 4);
 
     owner.pen(pen_sample(Phase::Up, (200.0, 100.0)));
+    owner.pen(pen_sample(Phase::Hover, (205.0, 90.0)));
     owner.pen(pen_sample(Phase::Hover, (210.0, 90.0)));
-    owner.expose();
     assert_eq!(run(&mut owner, 100), 1);
     let after = *owner.camera();
     let last = owner.brush.frames.last().cloned();
     assert_eq!(
         last,
-        Some((
-            vec![Phase::Up, Phase::Hover],
-            Some(Pixel { x: 210.0, y: 90.0 })
-        )),
-        "lifted and hovering"
+        Some((vec![Phase::Hover], Some(Pixel { x: 210.0, y: 90.0 }))),
+        "lifted and hovering: the latest hover"
     );
     owner.pen(pen_sample(Phase::Drag, (300.0, 10.0)));
-    owner.expose();
     run(&mut owner, 100);
     assert_eq!(*owner.camera(), after, "the drag ended at the lift");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_brush_stroke_never_orbits_and_a_barrel_stroke_still_navigates() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = pen_owner(&dir, true);
+    let before = *owner.camera();
+    owner.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    owner.pen(pen_sample(Phase::Drag, (200.0, 100.0)));
+    assert_eq!(run(&mut owner, 100), 1);
+    owner.pen(pen_sample(Phase::Drag, (240.0, 100.0)));
+    owner.pen(pen_sample(Phase::Up, (240.0, 100.0)));
+    assert_eq!(run(&mut owner, 100), 1);
+    assert_eq!(*owner.camera(), before, "the brush's stroke moved nothing");
+    let read: Vec<Vec<Phase>> = owner
+        .brush
+        .frames
+        .iter()
+        .map(|(phases, _)| phases.clone())
+        .collect();
+    assert_eq!(
+        read,
+        [vec![Phase::Down, Phase::Drag], vec![Phase::Drag, Phase::Up]],
+        "the brush has its stroke across both frames"
+    );
+
+    let barrel = |phase, at| PenSample {
+        buttons: input::Buttons::SECONDARY,
+        ..pen_sample(phase, at)
+    };
+    owner.pen(barrel(Phase::Down, (160.0, 100.0)));
+    owner.pen(barrel(Phase::Drag, (200.0, 100.0)));
+    run(&mut owner, 100);
+    assert_ne!(
+        owner.camera().target(),
+        before.target(),
+        "a barrel held at the down pans, though the brush claims strokes"
+    );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn hovering_while_no_frame_comes_keeps_one_sample() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = pen_owner(&dir, false);
+    let moves = (0..1000).map(f64::from);
+    for x in moves {
+        owner.pen(pen_sample(Phase::Hover, (x, 10.0)));
+    }
+    assert_eq!(owner.pen_queue.len(), 1, "coalesced");
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(
+        owner.pen_frame().hover().map(|hover| hover.at),
+        Some(Pixel { x: 999.0, y: 10.0 }),
+        "the latest hover"
+    );
     owner.close().expect("closed");
 }
 

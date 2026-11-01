@@ -12,12 +12,15 @@
 //! rest of the app sees one kind of sample, [`PenSample`], in physical pixels.
 //!
 //! **Into the frame loop.** The window drains the stream ([`PenStream::drain`]) on the owner
-//! thread: once after each batch of events, so a sample that may move the camera wants a frame,
-//! and again just before each frame, so the frame takes what arrived meanwhile. The owner queues
-//! the samples ([`crate::frame::Owner::pen`]), turns them into navigation's input at once
-//! ([`navigation`]: the tip drags, the barrel buttons are modifiers, hovering moves the pick), and
-//! hands them, in order, to the frame's [`PenFrame`] in the input phase, where the brush step
-//! reads them with the hover ([`Hover`]: where the pen is in range, and how far above).
+//! thread: once after each batch of events, so a stroke's samples want a frame, and again just
+//! before each frame, so the frame takes what arrived meanwhile. The owner queues the samples
+//! ([`crate::frame::Owner::pen`]), coalescing the pen's motion out of a stroke (only the latest
+//! counts), and routes them in the frame's input phase ([`PenRouter`]): each stroke, `Down`
+//! through `Up`, goes whole to navigation or to the brush ([`Route`], decided at its `Down` by
+//! [`route`]), while the samples out of a stroke go to both: navigation reads them for the
+//! pointer and the barrel buttons ([`navigation`]: the tip drags, the barrels are modifiers,
+//! hovering moves the pick), the brush for the hover ([`Hover`]: where the pen is in range, and
+//! how far above). The frame's [`PenFrame`] holds them, in order, with their routes.
 //!
 //! **Kept free of sculpting:** a sample is the pen's state and nothing more (no rays, no
 //! surfaces, no brush settings), so a painting app could take the same stream.
@@ -38,6 +41,7 @@ mod tests;
 mod wayland;
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -103,25 +107,118 @@ pub(crate) struct Hover {
     pub(crate) timestamp: Instant,
 }
 
-/// What a frame's input phase took from the pen stream: the samples queued since the last
-/// frame, in order, and the pen's hover as they leave it.
+/// Who a stroke belongs to: decided once, at its `Down`, for the whole stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// The stroke orbits, pans or zooms the view.
+    Navigate,
+    /// The stroke is the brush's.
+    Brush,
+}
+
+/// The route of the stroke `down` starts: navigation whenever a barrel button is held (the
+/// barrels are navigation's modifiers), what `brush` decides otherwise.
+///
+/// `brush` is the one place the brush claims strokes ([`crate::frame::Brush::route`]); with no
+/// brush, every stroke navigates.
+pub(crate) fn route(down: &PenSample, brush: impl FnOnce(&PenSample) -> Route) -> Route {
+    if down.buttons == Buttons::default() {
+        brush(down)
+    } else {
+        Route::Navigate
+    }
+}
+
+/// Follows the pen stream's strokes, routing each sample: a stroke's samples go where its `Down`
+/// sent them, the rest to both navigation and the brush.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PenRouter {
+    /// The route of the stroke in progress; `None` between strokes.
+    stroke: Option<Route>,
+}
+
+impl PenRouter {
+    /// Where `sample` goes: its stroke's route (at a `Down`, the one `brush` and [`route`]
+    /// decide), or `None` for a sample out of a stroke, which goes to both.
+    ///
+    /// A stroke ends at its `Up`, or at a sample out of a stroke if the `Up` was lost. A `Drag`
+    /// or `Up` with no `Down` before it (lost) navigates, where it does nothing without a drag.
+    pub(crate) fn route(
+        &mut self,
+        sample: &PenSample,
+        brush: impl FnOnce(&PenSample) -> Route,
+    ) -> Option<Route> {
+        match sample.phase {
+            Phase::Down => {
+                let stroke = route(sample, brush);
+                self.stroke = Some(stroke);
+                Some(stroke)
+            }
+            Phase::Drag => Some(*self.stroke.get_or_insert(Route::Navigate)),
+            Phase::Up => Some(self.stroke.take().unwrap_or(Route::Navigate)),
+            Phase::Enter | Phase::Hover | Phase::Leave => {
+                self.stroke = None;
+                None
+            }
+        }
+    }
+}
+
+/// What a frame's input phase took from the pen stream: the samples queued since the last frame,
+/// in order, which strokes (or parts of strokes) among them went where, and the pen's hover as
+/// they leave it.
+///
+/// **The contract:** navigation has already had the samples outside the brush's strokes; the
+/// brush reads [`for_brush`](Self::for_brush), its strokes' samples and those out of any stroke
+/// (the hover, for warming the surface under the pen), never a navigation stroke's. A stroke can
+/// span frames: its first frame's range starts at its `Down`, its last ends at its `Up` (or,
+/// with the `Up` lost, before the next sample out of a stroke).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PenFrame {
     /// The frame's samples, oldest first.
     samples: Vec<PenSample>,
+    /// The runs of `samples` that belong to a stroke, with the stroke's route, in order.
+    strokes: Vec<(Range<usize>, Route)>,
     /// The pen's hover after the last sample of this frame or an earlier one; `None` while it
     /// touches or is out of range.
     hover: Option<Hover>,
 }
 
 impl PenFrame {
-    /// The samples this frame took, oldest first: what the brush step turns into a stroke.
+    /// Every sample this frame took, oldest first, whatever its route.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "the brush step reads it from M1a4's edit loop on")
     )]
     pub(crate) fn samples(&self) -> &[PenSample] {
         &self.samples
+    }
+
+    /// The runs of [`samples`](Self::samples) in a stroke, each with its stroke's route.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the brush step reads it from M1a4's edit loop on")
+    )]
+    pub(crate) fn strokes(&self) -> &[(Range<usize>, Route)] {
+        &self.strokes
+    }
+
+    /// The samples the brush reads, oldest first: its strokes' and those out of any stroke.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the brush step reads it from M1a4's edit loop on")
+    )]
+    pub(crate) fn for_brush(&self) -> impl Iterator<Item = &PenSample> {
+        let navigated = |index: usize| {
+            self.strokes
+                .iter()
+                .any(|(range, route)| *route == Route::Navigate && range.contains(&index))
+        };
+        self.samples
+            .iter()
+            .enumerate()
+            .filter(move |&(index, _)| !navigated(index))
+            .map(|(_, sample)| sample)
     }
 
     /// Where the pen hovers, if it does: kept across frames while it hovers still, so a brush
@@ -134,14 +231,30 @@ impl PenFrame {
         self.hover
     }
 
-    /// Starts the next frame with the samples of `queued`, in order, emptying it: the last
-    /// frame's samples go, the hover carries over until a sample changes it.
-    pub(crate) fn take(&mut self, queued: &mut Vec<PenSample>) {
+    /// Starts the next frame: the last frame's samples go, the hover carries over until a
+    /// sample changes it.
+    pub(crate) fn clear(&mut self) {
         self.samples.clear();
-        if let Some(last) = queued.last() {
-            self.hover = last.hover();
+        self.strokes.clear();
+    }
+
+    /// Adds `sample`, routed `route` (`None`: out of a stroke).
+    pub(crate) fn push(&mut self, sample: PenSample, route: Option<Route>) {
+        let index = self.samples.len();
+        self.samples.push(sample);
+        self.hover = sample.hover();
+        let Some(route) = route else {
+            return;
+        };
+        match self.strokes.last_mut() {
+            // The same stroke goes on: a new stroke always starts at a `Down`.
+            Some((range, last))
+                if range.end == index && *last == route && sample.phase != Phase::Down =>
+            {
+                range.end = index + 1;
+            }
+            _ => self.strokes.push((index..index + 1, route)),
         }
-        self.samples.append(queued);
     }
 }
 
