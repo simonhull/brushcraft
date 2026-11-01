@@ -145,8 +145,8 @@ pub(crate) struct Frame {
     pub(crate) clock: Option<ClockSample>,
     /// When its present was submitted, on the frame loop's clock, in ms, if known.
     pub(crate) submitted_ms: Option<f64>,
-    /// The pen's latency: its oldest sample whose dabs it applied to its present submitted, in
-    /// ms; `None` for a frame that applied none.
+    /// The pen's latency: its oldest sample whose dabs it showed first (applied, or shown ahead)
+    /// to its present submitted, in ms; `None` for a frame that showed none.
     pub(crate) sample_to_present_ms: Option<f64>,
     /// Its brush phase, in ms.
     pub(crate) brush_ms: Option<f64>,
@@ -154,8 +154,16 @@ pub(crate) struct Frame {
     pub(crate) prepare_ms: Option<f64>,
     /// Dabs it applied.
     pub(crate) dabs_applied: Option<f64>,
-    /// Dabs it left queued for the next frames.
+    /// Dabs it showed ahead of their finest work.
+    pub(crate) dabs_shown: Option<f64>,
+    /// Dabs it left neither applied nor shown, for the next frames: the stroke's lag.
     pub(crate) dabs_carried: Option<f64>,
+    /// Dabs shown and not yet applied as its brush step ended: the catch-up left.
+    pub(crate) dabs_catching_up: Option<f64>,
+    /// Display tiles standing in for a stroke's edits as it was staged.
+    pub(crate) standing_in: Option<f64>,
+    /// Epochs residency had pending as it was staged.
+    pub(crate) pending_epochs: Option<f64>,
     /// Whether a dab of it was above the footprint limit F.
     pub(crate) above_f: Option<bool>,
     /// Whether a stroke was still open as its brush step ended.
@@ -281,7 +289,11 @@ impl Recorded {
                 brush_ms: number(object, "brush_ms"),
                 prepare_ms: number(object, "prepare_ms"),
                 dabs_applied: number(object, "dabs_applied"),
+                dabs_shown: number(object, "dabs_shown"),
                 dabs_carried: number(object, "dabs_carried"),
+                dabs_catching_up: number(object, "dabs_catching_up"),
+                standing_in: number(object, "standing_in"),
+                pending_epochs: number(object, "pending_epochs"),
                 above_f: object.get("above_f").and_then(Json::as_bool),
                 stroke_open: object.get("stroke_open").and_then(Json::as_bool),
             }),

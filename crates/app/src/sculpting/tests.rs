@@ -490,11 +490,11 @@ fn a_frames_brush_has_the_aim_less_the_frames_other_work_and_more_once_behind() 
         .expect("after boot");
     assert_eq!(
         budget.until(fresh),
-        start + crate::frame::LATENCY_AIM.saturating_sub(after),
+        start + LATENCY_AIM.saturating_sub(after),
         "the time left before the frame must be submitted"
     );
     let late = start
-        .checked_sub(crate::frame::LATENCY_AIM + Duration::from_millis(1))
+        .checked_sub(LATENCY_AIM + Duration::from_millis(1))
         .expect("after boot");
     assert_eq!(
         budget.until(late),
@@ -514,12 +514,14 @@ fn a_frames_brush_has_the_aim_less_the_frames_other_work_and_more_once_behind() 
 fn the_budget_carries_dabs_across_frames_in_order_and_loses_none() {
     let (capped_dir, whole_dir) = (TestDir::new(), TestDir::new());
     let epoch = Instant::now();
+    // F = ∞: nothing shown ahead, every dab carried until its finest work.
     let mut capped = owner_of(
         project(&capped_dir),
         |project| {
             Sculpting::new(project)
                 .with_cost(DabCost::one_at_a_time())
                 .with_epoch(epoch)
+                .with_previews(false)
         },
         setup(),
     );
@@ -846,4 +848,91 @@ fn queue_over(frames: &[&String], segment: &str) -> (usize, Option<usize>) {
     let after = ours.get(last_open + 1..).unwrap_or_default();
     let drained = after.iter().position(|line| carried(line) == 0);
     (most, drained.map(|at| at + 1))
+}
+
+#[test]
+fn a_step_within_its_time_is_finest_work_alone_and_one_past_it_shows_the_rest() {
+    let (within_dir, past_dir) = (TestDir::new(), TestDir::new());
+    let epoch = Instant::now();
+    let mut within = owner_of(
+        project(&within_dir),
+        |project| {
+            Sculpting::new(project)
+                .with_cost(DabCost::any_number())
+                .with_epoch(epoch)
+        },
+        setup(),
+    );
+    // Nothing fits a frame: every dab is shown, and catches up between frames and after the
+    // hand-off once the pen rests.
+    let mut past = owner_of(
+        project(&past_dir),
+        |project| {
+            Sculpting::new(project)
+                .with_cost(DabCost::one_at_a_time())
+                .with_epoch(epoch)
+        },
+        setup(),
+    );
+    run(&mut within, 10_000);
+    run(&mut past, 10_000);
+    let samples = stroke(ACROSS, 12);
+    queue(&mut within, samples.clone());
+    queue(&mut past, samples);
+
+    assert_eq!(run(&mut within, 1), 1);
+    let finest = within.brush().last();
+    assert!(finest.dabs_applied > 3, "{finest:?}");
+    assert_eq!(finest.dabs_shown, 0, "within its time: nothing shown ahead");
+    assert_eq!(finest.dabs_catching_up, 0);
+    assert!(!within.project().store().has_previews());
+
+    assert_eq!(run(&mut past, 1), 1);
+    let shown = past.brush().last();
+    assert_eq!(shown.dabs_applied, 0, "a frame waits on no finest work");
+    assert_eq!(
+        shown.dabs_shown, finest.dabs_applied,
+        "every dab placed is shown in the frame of its sample"
+    );
+    assert_eq!(shown.dabs_carried, 0, "none left behind the pen");
+    assert_eq!(shown.dabs_catching_up, shown.dabs_shown);
+    assert!(shown.oldest.is_some(), "the frame's latency runs from them");
+    assert!(past.project().store().has_previews(), "drawn from previews");
+
+    run(&mut within, 10_000);
+    let mut frames = 0;
+    while past.brush().stroking() {
+        run(&mut past, 1);
+        frames += 1;
+        assert!(frames < 10_000, "the catch-up ends");
+    }
+    assert!(
+        !past.project().store().has_previews(),
+        "no preview once every dab has landed"
+    );
+    assert_eq!(past.brush().error(), None);
+    assert_eq!(
+        positions(past.project()),
+        positions(within.project()),
+        "shown then caught up: the surface of finest work alone, bit for bit"
+    );
+    within.close().expect("closed");
+    assert_eq!(saved_strokes(past, &past_dir, "p.bcrf").len(), 1);
+}
+
+#[test]
+fn f_is_the_dab_one_frames_time_fits_by_the_cost_model() {
+    let cost = DabCost::CALIBRATED;
+    let level = Level::new(12).expect("a level");
+    let keys = |n: u16| -> Vec<TileKey> {
+        let keys = (0..n).map(|k| {
+            TileKey::display(geom::FaceId::new(0), level, k % 64, k / 64).expect("on the face")
+        });
+        keys.collect()
+    };
+    let fits = |n: u16| cost.take([keys(n).as_slice()], LATENCY_AIM, false).0 == 1;
+    let limit = u16::try_from(LIMIT_TILES).expect("a few tiles");
+    assert!(fits(limit), "F itself fits the aim");
+    assert!(!fits(limit + 1), "one tile more doesn't");
+    assert_eq!(LIMIT_TILES, 65, "the derivation in LIMIT_TILES' notes");
 }

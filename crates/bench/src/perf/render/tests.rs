@@ -680,3 +680,50 @@ fn the_run_line_places_the_clock_and_gives_the_refresh() {
     let older = Recorded::parse(RECORDED).unwrap();
     assert_eq!((older.clock_unix_ms, older.refresh_ms), (None, None));
 }
+
+/// [`stroke_frame`] whose brush left `catching_up` dabs shown to catch up, with `standing_in`
+/// display tiles standing in and no epoch pending.
+fn catch_up_frame(
+    time_ms: f64,
+    (applied, open): (f64, bool),
+    (catching_up, standing_in): (f64, f64),
+) -> Frame {
+    Frame {
+        dabs_shown: Some(0.0),
+        dabs_catching_up: Some(catching_up),
+        standing_in: Some(standing_in),
+        pending_epochs: Some(0.0),
+        ..stroke_frame(time_ms, (applied, 0.0, open), 5.0)
+    }
+}
+
+#[test]
+fn a_stroke_shown_ahead_gives_its_time_to_exact_and_its_frames_to_settle() {
+    let frames = vec![
+        catch_up_frame(0.0, (0.0, true), (6.0, 0.0)),
+        catch_up_frame(6.0, (0.0, true), (9.0, 4.0)),
+        catch_up_frame(16.0, (3.0, false), (6.0, 6.0)),
+        catch_up_frame(32.0, (6.0, false), (0.0, 6.0)),
+        catch_up_frame(48.0, (0.0, false), (0.0, 2.0)),
+        catch_up_frame(64.0, (0.0, false), (0.0, 0.0)),
+    ];
+    let [near, ..] = strokes::derive(&stroke_run(frames));
+    assert_eq!(near.most_catching_up, Some(9.0));
+    assert_eq!(
+        near.exact_after_up,
+        Some(strokes::Drain::Frames(16.0)),
+        "exact 16 ms after the first frame after pen-up"
+    );
+    assert_eq!(
+        near.settle,
+        Some(strokes::Drain::Frames(4.0)),
+        "settled in the fourth frame after pen-up, its stand-ins replaced"
+    );
+    let older = vec![
+        stroke_frame(0.0, (1.0, 0.0, true), 5.0),
+        stroke_frame(6.0, (1.0, 0.0, false), 5.0),
+    ];
+    let [old, ..] = strokes::derive(&stroke_run(older));
+    assert_eq!(old.exact_after_up, None, "an older app's record can't say");
+    assert_eq!(old.settle, None);
+}

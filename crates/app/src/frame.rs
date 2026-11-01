@@ -151,13 +151,21 @@ pub(crate) enum BrushChange {
 /// way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct BrushReport {
-    /// The oldest pen sample whose dabs this frame applied: the frame's latency runs from it to
-    /// its present being submitted. `None` if the frame applied nothing.
+    /// The oldest pen sample whose dabs this frame shows first (applied, or shown ahead of their
+    /// finest work): the frame's latency runs from it to its present being submitted. `None` if
+    /// the frame shows no dab for the first time.
     pub(crate) oldest: Option<SampleTimes>,
-    /// Dabs applied this frame.
+    /// Dabs applied this frame: finest work, the dabs' own or a catch-up of dabs shown before.
     pub(crate) dabs_applied: usize,
-    /// Dabs placed but left for the next frames, past the frame's budget.
+    /// Dabs shown this frame ahead of their finest work, which didn't fit its time: a preview
+    /// the catch-up makes exact later.
+    pub(crate) dabs_shown: usize,
+    /// Dabs placed but neither applied nor shown, left for the next frames: the stroke lags the
+    /// pen by them.
     pub(crate) dabs_carried: usize,
+    /// Dabs shown and not yet applied as the step ends: the catch-up still to do before the
+    /// surface is exact.
+    pub(crate) dabs_catching_up: usize,
     /// Tiles whose data the frame's dabs edited, summed over its brush steps (its own and those
     /// between the last frame and it): a tile two steps edited counts twice.
     pub(crate) tiles_edited: usize,
@@ -173,9 +181,9 @@ pub(crate) struct BrushReport {
 }
 
 impl BrushReport {
-    /// This report followed by `later`, a later step's: what both applied (the tiles edited
-    /// summed, not a union), the earlier sample of the two, and the later step's state (carried,
-    /// busy, open).
+    /// This report followed by `later`, a later step's: what both applied and showed (the tiles
+    /// edited summed, not a union), the earlier sample of the two, and the later step's state
+    /// (carried, catching up, busy, open).
     #[must_use]
     pub(crate) fn then(self, later: Self) -> Self {
         let oldest = match (self.oldest, later.oldest) {
@@ -185,7 +193,9 @@ impl BrushReport {
         Self {
             oldest,
             dabs_applied: self.dabs_applied + later.dabs_applied,
+            dabs_shown: self.dabs_shown + later.dabs_shown,
             dabs_carried: later.dabs_carried,
+            dabs_catching_up: later.dabs_catching_up,
             tiles_edited: self.tiles_edited + later.tiles_edited,
             above_limit: self.above_limit || later.above_limit,
             busy: later.busy,
@@ -206,7 +216,7 @@ pub(crate) const LATENCY_AIM: Duration = Duration::from_millis(6);
 /// The store's jobs wait while it does ([`Owner::stroke_under_way`]), and run again once the pen
 /// holds still, lifts, or its `Up` is lost. The pen reports at 173 Hz while it moves, so a few
 /// samples' gap.
-const STROKE_QUIET: Duration = Duration::from_millis(50);
+pub(crate) const STROKE_QUIET: Duration = Duration::from_millis(50);
 
 /// The least time a frame's brush step gets, whatever the estimate of the frame's other work.
 ///
@@ -251,6 +261,10 @@ const JOB_STEP: Duration = Duration::from_millis(1);
 /// take up to a refresh interval ([`BrushBudget::until`]), so the frames' fixed work is spread over
 /// more dabs while the screen still updates at about the display's rate. Between frames the budget
 /// is a plain slice ([`BrushBudget::slice`]).
+///
+/// **Progress:** a step between frames (or after a frame's hand-off) is there for finest work, so
+/// it applies at least one dab ([`BrushBudget::forces_progress`]); a frame's step needn't, where
+/// the brush can show what doesn't fit its time ahead of its finest work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BrushBudget {
     /// When the step began.
@@ -259,6 +273,8 @@ pub(crate) struct BrushBudget {
     until: Instant,
     /// When it must be done by once behind.
     behind: Instant,
+    /// Whether the step must apply at least one dab if any is queued.
+    progress: bool,
 }
 
 impl BrushBudget {
@@ -270,6 +286,7 @@ impl BrushBudget {
             start,
             until,
             behind: until.max(start + interval),
+            progress: false,
         }
     }
 
@@ -285,7 +302,20 @@ impl BrushBudget {
             start,
             until: start + length,
             behind: start + length,
+            progress: true,
         }
+    }
+
+    /// When the step must be done by keeping to the aim: what a step whose dabs are all shown
+    /// already (or caught up) has, however old they are.
+    pub(crate) const fn aim(&self) -> Instant {
+        self.until
+    }
+
+    /// Whether the step must apply at least one dab if any is queued: work between frames, not a
+    /// frame's (see "Progress" above).
+    pub(crate) const fn forces_progress(&self) -> bool {
+        self.progress
     }
 
     /// When the step must be done by, the oldest dab it holds placed from a sample taken at
@@ -324,8 +354,10 @@ impl SampleTimes {
 pub(crate) trait Brush {
     /// One step of brush work: the pen samples queued since the last step (`pen`, oldest first,
     /// with the pen's hover), placed, and as many of the queued dabs applied as `budget` leaves
-    /// time for (at least one, if any is queued), their epoch closed. The context's camera is the
-    /// view as the input left it, which the samples are projected through.
+    /// time for (at least one, if any is queued and the budget [forces
+    /// progress](BrushBudget::forces_progress) or the brush can't show dabs otherwise), the rest
+    /// shown ahead of their finest work where the brush can, their epochs closed. The context's
+    /// camera is the view as the input left it, which the samples are projected through.
     ///
     /// A frame's step ([`Owner::frame_fed`]), or one between frames ([`Owner::between_frames`]),
     /// whose edits the next frame shows.
@@ -350,8 +382,9 @@ pub(crate) trait Brush {
     }
 
     /// Work kept off the input's latency path, run after the frame has been handed off and
-    /// before the store's jobs, until `deadline`: warming the surface under a hovering pen.
-    /// Returns whether some is left, which wants the next frame.
+    /// before the store's jobs, until `deadline`: the finest work of dabs shown ahead of it (the
+    /// catch-up), and warming the surface under a hovering pen. Returns whether some is left,
+    /// which wants the next frame.
     ///
     /// # Errors
     ///

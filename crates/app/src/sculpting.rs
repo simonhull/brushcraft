@@ -15,9 +15,10 @@
 //!   [`StoreSurface::finish`]; the dabs it places join the stroke's queue. A sample with no
 //!   pressure places none: the engine places no dab below [`stroke::MIN_DAB_SIZE`].
 //! - **Each step:** the queued dabs are applied by [`apply_dabs`], oldest stroke first, as many as
-//!   the time the step has fits ([`BrushBudget`], [`DabCost`]); the rest wait for the next step.
-//!   The edit closes the store's epoch, which the frame loop drains after the brush phase and
-//!   uploads in the same frame (a step between frames: in the next).
+//!   the time the step has fits ([`BrushBudget`], [`DabCost`]); the rest are shown at once ahead of
+//!   their finest work ([`Preview`], "Big brushes" below) and wait for later steps. The edit closes
+//!   the store's epoch, which the frame loop drains after the brush phase and uploads in the same
+//!   frame (a step between frames: in the next).
 //! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) when it is the oldest stroke
 //!   left, so every edit of the store's current op is that stroke's: a stroke started while the
 //!   last still has dabs queued waits behind them, its dabs placed but not applied, and its op
@@ -41,22 +42,46 @@
 //! batch costs a fixed part, a part a dab, a part for each tile each dab reaches, and a part for
 //! each tile of their union (each dab's tiles queried in the index as it is queued), fitted to the
 //! bench and scaled by a factor learnt on the machine. A step applies at least one dab.
-//! The rest are carried to the next step, in order: no dab is dropped, and the stroke's tail waits
-//! behind them. A frame that carries dabs wants the next, on input.
+//! The rest wait for the next steps, in order: no dab is dropped, and the stroke's tail waits
+//! behind them. A frame that leaves dabs queued wants the next, on input.
 //!
 //! **Between frames** the frame loop steps the brush too, in short slices, while a stroke is under
 //! way and the loop would otherwise wait (for the render thread, the GPU, or the refresh slot): so
 //! a frame's own step has only the samples since, and a 60 Hz frame's idle time isn't lost to a
 //! fast stroke ([`crate::frame::Owner::between_frames`]).
 //!
-//! The footprint limit F (the M1 spec's "Big brushes": about 150 tiles a step, [`LIMIT_TILES`]) is
-//! reported per frame ([`BrushReport::above_limit`]): the latency target holds below it; above it
-//! is the big-brush path, still to come.
+//! # Big brushes: what doesn't fit is shown, then caught up
 //!
-//! A dab is placed on the surface as it is when the dab is placed: the dabs queued ahead of it
-//! haven't landed yet. Within a frame that was always so (a frame's dabs apply after all its
-//! samples are placed); carrying makes it so for longer, so a carried dab may be placed on a
-//! surface its predecessors have yet to raise.
+//! A frame never waits on finest work that doesn't fit its time (the M1 spec's "Big brushes",
+//! decided per frame, 2026-11-01). Whatever a frame's step can't apply in its time is **shown**
+//! at once on the finest tiles it reaches ([`Preview::show`]): the draw action's own amounts on
+//! the tiles as the store holds them, kept in memory beside the store, never saved, and drawn by
+//! the renderer from the store's preview epochs, the display levels through stand-ins. A frame
+//! within its time (nothing shown before still to catch up, and all its dabs fitting) is finest
+//! work alone, as ever.
+//!
+//! The dabs shown are the queue's front; they **catch up** as finest work, through
+//! [`apply_dabs`] in order, merged per tile in each batch, off the frame's latency path: between
+//! frames and after the hand-off ([`Brush::prepare`], until the frame's deadline), never in a
+//! frame's own step, which waits on no catch-up. While the pen draws ([`STROKE_QUIET`] since its
+//! last sample), the catch-up takes only batches the cost model fits before the pen's next sample
+//! is due (its smoothed interval, less a margin), so it doesn't hold a sample up; once the pen
+//! lifts or rests, each step takes at least one dab, in batches of up to [`CATCH_UP_BATCH`]. Each
+//! batch that lands makes the previews it moved again over what landed ([`Preview::land`]); once
+//! every dab has landed none is left and the surface is exact, which the record's
+//! `dabs_catching_up` counts down to. The saved result is that of applying the dabs at once, bit
+//! for bit; a save meanwhile holds what has landed (the previews are never saved), the stroke's
+//! later dabs landing in the working file after it.
+//!
+//! The footprint limit F ([`LIMIT_TILES`]) is the dab one frame's time can't fit at all, by the
+//! cost model: such a dab is always shown and caught up. It is reported per frame
+//! ([`BrushReport::above_limit`]).
+//!
+//! A dab is placed on the store's surface as it is when the dab is placed: the dabs queued ahead
+//! of it haven't landed yet. Within a frame that was always so (a frame's dabs apply after all its
+//! samples are placed); queueing makes it so for longer, so a dab may be placed on a surface its
+//! predecessors have yet to raise. Placement never reads a preview: what the stroke engine sees is
+//! the store's surface alone, the same whether its predecessors were shown ahead or not.
 //!
 //! # Warming under a hovering pen
 //!
@@ -94,7 +119,7 @@ use anyhow::Result;
 use geom::TileKey;
 use input::Phase;
 use render::camera::View;
-use sculpt::{StoreSurface, apply_dabs};
+use sculpt::{Preview, StoreSurface, apply_dabs};
 use store::{
     Evaluation, OpId, PenSample as RecordSample, PenTilt, Project, ProjectError, SpatialIndex,
     StrokeCamera, StrokeRecord, StrokeRecordError, TileStore,
@@ -105,7 +130,10 @@ use stroke::{
 };
 
 use crate::camera::{Camera, Pixel};
-use crate::frame::{Brush, BrushBudget, BrushChange, BrushContext, BrushReport, SampleTimes};
+use crate::frame::{
+    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, LATENCY_AIM, STROKE_QUIET,
+    SampleTimes,
+};
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 
 #[cfg(test)]
@@ -134,9 +162,53 @@ pub(crate) const SIZE_STEP: f32 = 1.25;
 /// The brush radius's range, in physical pixels.
 pub(crate) const RADIUS_PIXELS: (f32, f32) = (1.0, 2000.0);
 
-/// The footprint limit F, as the tiles a dab touches: the M1 spec's "Big brushes" (about 150
-/// tiles a step, about 180,000 vertices). The pen's latency target holds below it.
-pub(crate) const LIMIT_TILES: usize = 150;
+/// The footprint limit F, as the tiles a dab touches: the most a dab can touch and still fit a
+/// frame's time on its own, by the brush's cost model ([`DabCost::limit_tiles`]).
+///
+/// Derived from [`DabCost::CALIBRATED`] and the latency aim ([`LATENCY_AIM`], 6 ms): a frame
+/// with nothing else to do has at most the aim for its brush, and one dab of `t` tiles (its
+/// union is its own tiles) costs `per_batch + per_dab + (per_dab_tile + per_tile) · t`, so `t ≤
+/// (6 − 0.41 − 0.024) ms / (0.0264 + 0.0589) ms = 65.2`: **65 tiles** (about 270,000 vertices
+/// of 65² at the benchmark's level 9). The M1 spec's provisional "about 150 tiles" came from the
+/// M0 step model (0.25 ms + 24 µs a tile against 4 ms); the brush's own calibrated model is
+/// the one the budget uses, so F follows it. A dab above F never fits a frame: it is always shown
+/// ahead and caught up. Below it, the per-frame switch decides (see "Big brushes" in the module
+/// notes).
+pub(crate) const LIMIT_TILES: usize = DabCost::CALIBRATED.limit_tiles(LATENCY_AIM);
+
+/// The time a catch-up batch is given once the pen has lifted or rests (see "Big brushes" in the
+/// module notes): about a 60 Hz frame's.
+///
+/// [`apply_dabs`] merges a batch's dabs per tile, so a batch of many costs far less than as many
+/// batches of one (32 dabs of 50,000 vertices: 16 ms against 38 ms, Task 5b's A/B), and with no
+/// pen sample to wait behind it, the catch-up takes batches this long: a step between frames, or
+/// after a frame's hand-off, runs to it rather than to its own short slice. A pen that touches
+/// again waits at most one batch.
+pub(crate) const CATCH_UP_BATCH: Duration = Duration::from_millis(12);
+
+/// How often a stroke's samples are taken to arrive before its own say: the Kamvas's measured
+/// 173 Hz.
+const FIRST_INTERVAL: Duration = Duration::from_micros(5_780);
+
+/// The range a stroke's smoothed sample interval is held to: a gap past it (the pen resting) or
+/// below it (samples bunched by the compositor) says little about the next.
+const INTERVAL_RANGE: (Duration, Duration) = (Duration::from_millis(2), Duration::from_millis(20));
+
+/// How much earlier than the next sample is due the catch-up must be done while the pen draws:
+/// the cost model's misses and the sample's own jitter.
+const SAMPLE_MARGIN: Duration = Duration::from_micros(700);
+
+/// A stroke's sample interval `interval` after a sample that came `gap` after the last: an eighth
+/// of the way toward the gap, held to [`INTERVAL_RANGE`].
+fn smoothed_interval(interval: Duration, gap: Duration) -> Duration {
+    let (least, most) = INTERVAL_RANGE;
+    let gap = gap.clamp(least, most);
+    let toward = match gap.checked_sub(interval) {
+        Some(longer) => interval + longer / 8,
+        None => interval.saturating_sub(interval.saturating_sub(gap) / 8),
+    };
+    toward.clamp(least, most)
+}
 
 /// Tiles the warming evaluates together on the store's workers between checks of its deadline.
 pub(crate) const WARM_BATCH: usize = 16;
@@ -208,6 +280,28 @@ impl DabCost {
         per_tile: 58_900.0,
         scale: 1.0,
     };
+
+    /// The most tiles one dab can touch and fit `time` as a batch of its own, unscaled: what F
+    /// is ([`LIMIT_TILES`]). Zero if not even a dab of no tile fits.
+    pub(crate) const fn limit_tiles(self, time: Duration) -> usize {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a frame's time in nanoseconds: far below where f64 loses integers"
+        )]
+        let fits = time.as_nanos() as f64;
+        let left = fits - self.per_batch - self.per_dab;
+        let per_tile = self.per_dab_tile + self.per_tile;
+        if left <= 0.0 || per_tile <= 0.0 {
+            return 0;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a positive count of tiles, rounded down: what fits"
+        )]
+        let tiles = (left / per_tile) as usize;
+        tiles
+    }
 
     /// A model of the given terms, in nanoseconds (as [`DabCost`]'s fields), not yet scaled.
     #[cfg(test)]
@@ -368,6 +462,8 @@ struct Source {
     times: SampleTimes,
     /// The tiles its sphere touches in the index, as it was queued: its cost ([`DabCost`]).
     tiles: Vec<TileKey>,
+    /// Whether it is shown ahead of its finest work ([`Preview::show`]), waiting to catch up.
+    shown: bool,
 }
 
 /// A stroke, from its `Down` until its op ends: its engine stroke while the pen is down, what its
@@ -392,6 +488,9 @@ struct Pending {
     sources: VecDeque<Source>,
     /// Its last sample's times: a lost `Up`'s tail is timed from it.
     last: SampleTimes,
+    /// How often its samples arrive, smoothed: when the next is due, which the catch-up keeps
+    /// clear of ([`Sculpting::before_next_sample`]).
+    interval: Duration,
 }
 
 impl Pending {
@@ -419,7 +518,11 @@ fn enqueue(
         let touched = index.query_sphere(geom::Vec3::new(x, y, z), dab.radius);
         let keys: Vec<TileKey> = touched.collect();
         dabs.push_back(dab);
-        sources.push_back(Source { times, tiles: keys });
+        sources.push_back(Source {
+            times,
+            tiles: keys,
+            shown: false,
+        });
     }
 }
 
@@ -468,6 +571,15 @@ pub(crate) struct Sculpting {
     strokes: VecDeque<Pending>,
     /// What applying dabs costs: how a step's time becomes dabs.
     cost: DabCost,
+    /// The dabs shown ahead of their finest work, and the tiles they reach (see "Big brushes" in
+    /// the module notes); `None` for a brush that never shows dabs ahead (F = ∞: everything is
+    /// finest work, carried to later steps where it doesn't fit).
+    preview: Option<Preview>,
+    /// The catch-up done after the hand-off since the last step, which the next step reports.
+    caught_up: BrushReport,
+    /// Whether a step between frames has shown or applied dabs no frame has drawn yet: while the
+    /// pen draws, the catch-up then waits for that frame, which it would hold up.
+    unframed: bool,
     /// The next stroke's number.
     next_stroke: u32,
     /// The epoch sample times count from.
@@ -507,6 +619,9 @@ impl Sculpting {
             state,
             strokes: VecDeque::new(),
             cost: DabCost::CALIBRATED,
+            preview: Some(Preview::new()),
+            caught_up: BrushReport::default(),
+            unframed: false,
             next_stroke: 0,
             epoch: Instant::now(),
             routed: None,
@@ -527,6 +642,16 @@ impl Sculpting {
     #[must_use]
     pub(crate) const fn with_cost(mut self, cost: DabCost) -> Self {
         self.cost = cost;
+        self
+    }
+
+    /// This brush with its dabs shown ahead of their finest work where a step can't fit them
+    /// (`true`, the default: F = 0 for whatever doesn't fit), or never (`false`: F = ∞, every
+    /// dab finest work, carried to later steps where it doesn't fit).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_previews(mut self, previews: bool) -> Self {
+        self.preview = previews.then(Preview::new);
         self
     }
 
@@ -582,6 +707,44 @@ impl Sculpting {
     /// Dabs placed and not yet applied, over every stroke.
     fn queued(&self) -> usize {
         self.strokes.iter().map(|stroke| stroke.dabs.len()).sum()
+    }
+
+    /// Dabs placed and neither applied nor shown, over every stroke: the stroke's lag.
+    fn unshown(&self) -> usize {
+        let sources = self.strokes.iter().flat_map(|stroke| &stroke.sources);
+        sources.filter(|source| !source.shown).count()
+    }
+
+    /// Whether the pen is drawing: the last stroke's last sample arrived within
+    /// [`STROKE_QUIET`] (its `Up` included, a few milliseconds after it). The catch-up then takes
+    /// only dabs that fit their step's time: a dab forced past it would hold up the samples
+    /// arriving meanwhile, and the frame showing a lifted stroke's tail.
+    fn pen_moving(&self) -> bool {
+        let last = self.strokes.back();
+        last.is_some_and(|stroke| stroke.last.received.elapsed() < STROKE_QUIET)
+    }
+
+    /// When a catch-up batch must be done by while the pen draws, so as not to hold up its next
+    /// sample: [`SAMPLE_MARGIN`] before that is due, by its stroke's smoothed interval. `None`
+    /// with no stroke.
+    fn before_next_sample(&self) -> Option<Instant> {
+        let stroke = self.strokes.back()?;
+        let due = stroke.last.received + stroke.interval;
+        Some(due.checked_sub(SAMPLE_MARGIN).unwrap_or(due))
+    }
+
+    /// Dabs shown and not yet applied: the catch-up still to do.
+    fn catching_up(&self) -> usize {
+        self.preview.as_ref().map_or(0, Preview::shown)
+    }
+
+    /// The report's state as a step ends: what is carried and catching up, whether work is left,
+    /// whether a stroke is open.
+    fn finish_report(&self, report: &mut BrushReport) {
+        report.dabs_carried = self.unshown();
+        report.dabs_catching_up = self.catching_up();
+        report.busy = self.queued() > 0;
+        report.open = self.strokes.back().is_some_and(Pending::open);
     }
 
     /// A pen sample as the stroke engine reads it: physical pixels, seconds since the brush's
@@ -666,6 +829,7 @@ impl Sculpting {
             dabs: VecDeque::new(),
             sources: VecDeque::new(),
             last: times_of(down),
+            interval: FIRST_INTERVAL,
         });
     }
 
@@ -687,6 +851,10 @@ impl Sculpting {
         let finished = surface.finish();
         let times = times_of(sample);
         pending.samples.push(record_sample(&engine_sample));
+        let gap = times
+            .received
+            .saturating_duration_since(pending.last.received);
+        pending.interval = smoothed_interval(pending.interval, gap);
         pending.last = times;
         match finished {
             Ok(()) => {
@@ -726,18 +894,116 @@ impl Sculpting {
         }
     }
 
+    /// One step's dabs: applied as `budget` leaves time for (all of them with none), and, for a
+    /// brush that shows dabs ahead, the rest shown (see "Big brushes" in the module notes).
+    ///
+    /// A step within its time is finest work alone: nothing shown waits to catch up and the
+    /// cost model fits every queued dab. Any other shows its unshown dabs first (they are what
+    /// the frame is for) and then catches up with the time left.
+    fn work(
+        &mut self,
+        scene: &mut Scene<'_>,
+        report: &mut BrushReport,
+        budget: Option<&BrushBudget>,
+    ) {
+        let showing = self.preview.is_some() && budget.is_some();
+        if showing && !self.fits(budget) {
+            self.show(scene, report);
+        }
+        self.apply(scene, report, budget);
+        if showing {
+            // What the step's finest work didn't take after all.
+            self.show(scene, report);
+        }
+    }
+
+    /// Whether every queued dab fits `budget` as finest work, with nothing shown waiting: then a
+    /// step needs no preview.
+    fn fits(&self, budget: Option<&BrushBudget>) -> bool {
+        let Some(budget) = budget else {
+            return true;
+        };
+        if self.catching_up() > 0 || self.strokes.len() > 1 {
+            return false;
+        }
+        let Some(front) = self.strokes.front() else {
+            return true;
+        };
+        let Some(oldest) = front.sources.front() else {
+            return true;
+        };
+        let room = budget
+            .until(oldest.times.taken)
+            .saturating_duration_since(Instant::now());
+        let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
+        let (count, _) = self.cost.take(tiles, room, false);
+        count == front.dabs.len()
+    }
+
+    /// Shows every queued dab not yet shown, in order, ahead of its finest work, counting them in
+    /// `report` (their samples among those whose latency the frame carries). A preview that
+    /// fails leaves the dabs it didn't show to be shown (or applied) by a later step.
+    fn show(&mut self, scene: &mut Scene<'_>, report: &mut BrushReport) {
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        let unshown = self.strokes.iter().flat_map(|stroke| {
+            let pairs = stroke.dabs.iter().zip(&stroke.sources);
+            pairs.filter(|(_, source)| !source.shown)
+        });
+        let dabs: Vec<Dab> = unshown.map(|(dab, _)| *dab).collect();
+        if dabs.is_empty() {
+            return;
+        }
+        let before = preview.shown();
+        let shown = preview.show(scene.project.store(), scene.index, &dabs);
+        let count = preview.shown() - before;
+        let sources = self
+            .strokes
+            .iter_mut()
+            .flat_map(|stroke| &mut stroke.sources);
+        let newly = sources.filter(|source| !source.shown).take(count);
+        for source in newly {
+            source.shown = true;
+            report.dabs_shown += 1;
+            report.oldest = Some(
+                report
+                    .oldest
+                    .map_or(source.times, |oldest| oldest.earliest(source.times)),
+            );
+            report.above_limit |= source.tiles.len() > LIMIT_TILES;
+        }
+        if let Err(error) = shown {
+            self.fail("showing dabs ahead of their finest work", &error);
+        }
+    }
+
     /// Applies queued dabs while `budget` leaves time for them (all of them with none), oldest
     /// stroke first, beginning each stroke's op as it comes to the front and ending it once it is
-    /// over; at least one dab if any is queued.
+    /// over; at least one dab if any is queued and the step must make progress (always for a
+    /// brush that shows nothing ahead, else as the budget says).
     ///
     /// The time left is read from the clock before each stroke's batch, so a batch that ran long
-    /// leaves the next less.
+    /// leaves the next less. Dabs shown ahead keep the aim's time: a step catching up never
+    /// takes the "behind" time, which is for a brush whose stroke lags the pen.
     fn apply(
         &mut self,
         scene: &mut Scene<'_>,
         report: &mut BrushReport,
         budget: Option<&BrushBudget>,
     ) {
+        let moving = self.pen_moving();
+        let forced = match (&self.preview, budget) {
+            (None, _) | (_, None) => true,
+            (Some(_), Some(budget)) => budget.forces_progress() && !moving,
+        };
+        // Once the pen lifts or rests, a step that must make progress catches up in batches
+        // long enough to merge dabs per tile.
+        let batch = self.preview.is_some() && forced && budget.is_some() && !moving;
+        // While the pen draws, the catch-up waits for the frame of what this step (or one before
+        // it, between frames) showed, then has until the next sample is due.
+        let waits = self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0;
+        let before_next = self.before_next_sample().filter(|_| !waits);
         loop {
             let Some(front) = self.strokes.front_mut() else {
                 return;
@@ -754,15 +1020,35 @@ impl Sculpting {
                 }
             }
             let first = report.dabs_applied == 0;
-            let room = match (budget, front.sources.front()) {
-                (Some(budget), Some(oldest)) => budget
+            let unshown = front.sources.iter().find(|source| !source.shown);
+            let room = match (budget, front.sources.front(), unshown) {
+                (Some(budget), Some(_), Some(oldest)) => budget
                     .until(oldest.times.taken)
                     .saturating_duration_since(Instant::now()),
-                (Some(_), None) => Duration::ZERO,
-                (None, _) => Duration::MAX,
+                (Some(budget), Some(_), None) => {
+                    budget.aim().saturating_duration_since(Instant::now())
+                }
+                (Some(_), None, _) => Duration::ZERO,
+                (None, _, _) => Duration::MAX,
+            };
+            let catching_up = front.sources.front().is_some_and(|source| source.shown);
+            if catching_up && self.preview.is_some() && !forced {
+                // A frame's step (or one while the pen draws, with nothing left that fits) waits
+                // on no catch-up: what it shows is already shown.
+                if budget.is_some_and(|budget| !budget.forces_progress()) {
+                    return;
+                }
+            }
+            let room = match (catching_up, batch, forced) {
+                (true, true, _) => room.max(CATCH_UP_BATCH),
+                // The pen draws: the catch-up has until its next sample is due.
+                (true, false, false) => before_next.map_or(Duration::ZERO, |by| {
+                    by.saturating_duration_since(Instant::now())
+                }),
+                _ => room,
             };
             let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
-            let (count, predicted) = self.cost.take(tiles, room, first);
+            let (count, predicted) = self.cost.take(tiles, room, first && forced);
             if count > 0 {
                 let began = Instant::now();
                 self.apply_front(scene, report, count);
@@ -784,7 +1070,12 @@ impl Sculpting {
         let Some(front) = self.strokes.front_mut() else {
             return;
         };
-        let sources = front.sources.iter().take(count);
+        // Dabs shown already count for the frame that showed them.
+        let sources = front
+            .sources
+            .iter()
+            .take(count)
+            .filter(|source| !source.shown);
         for source in sources {
             report.oldest = Some(
                 report
@@ -793,6 +1084,7 @@ impl Sculpting {
             );
             report.above_limit |= source.tiles.len() > LIMIT_TILES;
         }
+        let landing = front.sources.iter().take(count).filter(|s| s.shown).count();
         let dabs: &[Dab] = front.dabs.make_contiguous();
         let batch = dabs.get(..count).unwrap_or(dabs);
         let applied = apply_dabs(scene.project.store(), scene.index, &mut self.state, batch);
@@ -802,15 +1094,39 @@ impl Sculpting {
                 front.sources.drain(..count);
                 report.dabs_applied += stats.dabs;
                 report.tiles_edited += stats.tiles_edited;
+                self.land(scene, landing, false);
             }
             Err(error) => {
+                // Every dab of the stroke left is dropped, those shown with them.
+                let dropped = front.sources.iter().filter(|s| s.shown).count();
                 front.dabs.clear();
                 front.sources.clear();
                 front.engine = None;
                 self.index_stale = true;
                 self.fail("applying dabs", &error);
                 self.rebuild_index(scene);
+                self.land(scene, dropped, true);
             }
+        }
+    }
+
+    /// Lands the oldest `count` dabs shown (applied, or dropped), making the previews they moved
+    /// again over what landed; with `rebase`, every preview, for a store a failed batch left
+    /// changed past what its dabs say.
+    fn land(&mut self, scene: &mut Scene<'_>, count: usize, rebase: bool) {
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        if count == 0 && !rebase {
+            return;
+        }
+        let store = scene.project.store();
+        let mut landed = preview.land(store, scene.index, count);
+        if rebase && landed.is_ok() {
+            landed = preview.rebase(store, scene.index);
+        }
+        if let Err(error) = landed {
+            self.fail("catching the shown dabs up", &error);
         }
     }
 
@@ -942,10 +1258,13 @@ impl Sculpting {
         )];
         let last = key.last;
         lines.push(format!(
-            "stroke     {}  last frame with dabs: {} applied, {} carried, {} tiles edited{}",
+            "stroke     {}  last frame with dabs: {} applied, {} shown, {} carried, {} catching \
+             up, {} tiles edited{}",
             if key.drawing { "drawing" } else { "none" },
             last.dabs_applied,
+            last.dabs_shown,
             last.dabs_carried,
+            last.dabs_catching_up,
             last.tiles_edited,
             if last.above_limit { ", above F" } else { "" }
         ));
@@ -1065,9 +1384,8 @@ impl Brush for Sculpting {
                     ForBrush::StrokeElsewhere => None,
                 });
                 self.held.extend(events);
-                report.dabs_carried = self.queued();
+                self.finish_report(&mut report);
                 report.busy = true;
-                report.open = self.strokes.back().is_some_and(Pending::open);
             }
             self.routed = None;
             self.note_hover(pen, None);
@@ -1090,12 +1408,14 @@ impl Brush for Sculpting {
             self.handle(&mut scene, sample);
         }
         self.routed = None;
-        self.apply(&mut scene, &mut report, Some(budget));
+        self.work(&mut scene, &mut report, Some(budget));
+        // A frame draws what the steps before it did; one between frames leaves it to the next.
+        self.unframed = budget.forces_progress()
+            && (self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0);
         self.note_hover(pen, view.as_ref());
-        report.dabs_carried = self.queued();
-        report.busy = report.dabs_carried > 0;
-        report.open = self.strokes.back().is_some_and(Pending::open);
-        if report.dabs_applied > 0 {
+        let mut report = std::mem::take(&mut self.caught_up).then(report);
+        self.finish_report(&mut report);
+        if report.dabs_applied > 0 || report.dabs_shown > 0 {
             self.last = report;
         }
         self.refresh_status();
@@ -1132,6 +1452,19 @@ impl Brush for Sculpting {
         let Some(mut scene) = Scene::of(context) else {
             return Ok(false);
         };
+        if self.catching_up() > 0 {
+            // The catch-up: finest work of the dabs shown, at least a dab a call, off the
+            // latency path. No warming meanwhile: the pen is down, or its stroke not landed.
+            let now = Instant::now();
+            let budget = BrushBudget::slice(now, deadline.saturating_duration_since(now));
+            let mut report = BrushReport::default();
+            self.apply(&mut scene, &mut report, Some(&budget));
+            let progress = report.dabs_applied > 0;
+            self.caught_up = std::mem::take(&mut self.caught_up).then(report);
+            // More of it wanted only while it moves on: a pen drawing takes only dabs that fit,
+            // and the next frame (wanted while dabs are queued) tries again.
+            return Ok(progress && self.queued() > 0);
+        }
         // At least one piece of work each call, so warming finishes even in frames that overrun.
         let mut worked = false;
         if self.warm.wanted != self.warm.target {
@@ -1155,7 +1488,7 @@ impl Brush for Sculpting {
                 self.handle(&mut scene, event.as_ref());
             }
             self.lift(&mut scene, None);
-            self.apply(&mut scene, &mut BrushReport::default(), None);
+            self.work(&mut scene, &mut BrushReport::default(), None);
         }
         Ok(())
     }

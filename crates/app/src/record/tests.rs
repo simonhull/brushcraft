@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 64] = [
+const FRAME_FIELDS: [&str; 68] = [
     "bench",
     "result",
     "frame",
@@ -59,6 +59,8 @@ const FRAME_FIELDS: [&str; 64] = [
     "evicted",
     "uploaded_bytes",
     "uploaded_tiles",
+    "standing_in",
+    "pending_epochs",
     "cut_readback_dropped",
     "request_readback_dropped",
     "timing_readback_dropped",
@@ -66,7 +68,9 @@ const FRAME_FIELDS: [&str; 64] = [
     "sample_to_present_ms",
     "received_to_present_ms",
     "dabs_applied",
+    "dabs_shown",
     "dabs_carried",
+    "dabs_catching_up",
     "tiles_edited",
     "above_f",
     "stroke_open",

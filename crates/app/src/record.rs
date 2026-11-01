@@ -42,19 +42,24 @@
 //!   `cone_culled` (tiles culled by their normal cone) and `cone_exempt` (tiles their cone would
 //!   cull, drawn because their morph isn't settled), `requested`, `relax_passes`;
 //! - residency as the frame was staged: `resident`, `wanted`, `evicted` (this frame),
-//!   `uploaded_bytes` and `uploaded_tiles`;
+//!   `uploaded_bytes` and `uploaded_tiles`, `standing_in` (display tiles standing in for a stroke's
+//!   edits, until the refresh replaces them) and `pending_epochs` (epochs staged over frames, not
+//!   switched in yet): with no dab left to apply, a stroke is settled, every tile it touched
+//!   showing its final data, once both are 0;
 //! - the brush ([`crate::frame::BrushReport`]): `submitted_ms` (when the render thread's present
 //!   call returned, on the frame loop's clock), `sample_to_present_ms` (the pen's latency: from the
-//!   oldest pen sample whose dabs the frame applied, by the pen's de-jittered clock, to the frame's
-//!   present submitted; `null` for a frame that applied none) and `received_to_present_ms` (the
-//!   same from when that sample reached the app), `dabs_applied`, `dabs_carried` (placed but left
-//!   for the next frames, past the frame's budget), `tiles_edited`, `above_f` (a dab of the frame
-//!   above the footprint limit F, where the latency target doesn't hold), and `stroke_open` (a
-//!   stroke still open as the brush step ended: the pen down; the frames after the last open one
-//!   until none carries dabs are the queue draining after pen-up). What the brush did between the
-//!   last frame and this one (whose edits this frame shows) counts as this frame's, its time
-//!   `between_ms`. The owner's `prepare_ms` is the brush's work after the hand-off (warming the
-//!   surface under a hovering pen), off the latency path.
+//!   oldest pen sample whose dabs the frame showed first, applied or ahead of their finest work, by
+//!   the pen's de-jittered clock, to the frame's present submitted; `null` for a frame that showed
+//!   none) and `received_to_present_ms` (the same from when that sample reached the app),
+//!   `dabs_applied` (finest work), `dabs_shown` (shown ahead of their finest work, which didn't fit
+//!   the frame), `dabs_carried` (placed but neither applied nor shown, left for the next frames:
+//!   the stroke's lag), `dabs_catching_up` (shown and not yet applied: the surface is exact once
+//!   none are), `tiles_edited`, `above_f` (a dab of the frame above the footprint limit F, which no
+//!   frame's time fits), and `stroke_open` (a stroke still open as the brush step ended: the pen
+//!   down; the frames after the last open one until none carries dabs are the queue draining after
+//!   pen-up). What the brush did between the last frame and this one (whose edits this frame shows)
+//!   counts as this frame's, its time `between_ms`. The owner's `prepare_ms` is the brush's work
+//!   after the hand-off (warming the surface under a hovering pen), off the latency path.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -201,7 +206,9 @@ impl Line {
             .with("sample_to_present_ms", latency.map(|l| l.taken))
             .with("received_to_present_ms", latency.map(|l| l.received))
             .with("dabs_applied", brush.map(|b| b.dabs_applied))
+            .with("dabs_shown", brush.map(|b| b.dabs_shown))
             .with("dabs_carried", brush.map(|b| b.dabs_carried))
+            .with("dabs_catching_up", brush.map(|b| b.dabs_catching_up))
             .with("tiles_edited", brush.map(|b| b.tiles_edited))
             .with("above_f", brush.map(|b| b.above_limit))
             .with("stroke_open", brush.map(|b| b.open))
@@ -214,6 +221,8 @@ impl Line {
             .with("evicted", counts.map(|c| c.evicted))
             .with("uploaded_bytes", counts.map(|c| c.uploaded_bytes))
             .with("uploaded_tiles", counts.map(|c| c.uploaded_tiles))
+            .with("standing_in", counts.map(|c| c.standing_in))
+            .with("pending_epochs", counts.map(|c| c.pending_epochs))
     }
 }
 
@@ -255,6 +264,10 @@ pub(crate) struct ResidencyCounts {
     pub(crate) uploaded_tiles: u64,
     /// Whether the frame made no request readback for want of a free buffer.
     pub(crate) request_readback_dropped: bool,
+    /// Display tiles standing in for a stroke's edits, until the refresh replaces them.
+    pub(crate) standing_in: usize,
+    /// Epochs residency has pending: staged over frames, not switched in yet.
+    pub(crate) pending_epochs: usize,
 }
 
 /// What a frame's cut readback said.
@@ -501,6 +514,8 @@ impl Recorder {
                 uploaded_bytes: stats.staged_bytes,
                 uploaded_tiles: stats.staged_tiles,
                 request_readback_dropped: requests_dropped,
+                standing_in: stats.standing_in,
+                pending_epochs: stats.pending_epochs,
             });
         }
     }

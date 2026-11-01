@@ -58,9 +58,14 @@ fn a_lost_up_ends_the_stroke_as_a_navigation_stroke_starts() {
 #[test]
 fn a_stroke_started_while_dabs_are_carried_waits_behind_them() {
     let dir = TestDir::new();
+    // F = ∞: nothing shown ahead, every dab carried until its finest work.
     let mut owner = owner_of(
         project(&dir),
-        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        |project| {
+            Sculpting::new(project)
+                .with_cost(DabCost::one_at_a_time())
+                .with_previews(false)
+        },
         setup(),
     );
     run(&mut owner, 10_000);
@@ -106,10 +111,9 @@ fn closing_mid_stroke_applies_it_and_records_it_once() {
     run(&mut owner, 10_000);
     queue(&mut owner, open(stroke(ACROSS, 12)));
     assert_eq!(run(&mut owner, 1), 1);
-    assert!(
-        owner.brush().last().dabs_carried > 0,
-        "dabs carried as it closes"
-    );
+    let last = owner.brush().last();
+    assert_eq!(last.dabs_carried, 0, "every dab shown");
+    assert!(last.dabs_catching_up > 0, "dabs to catch up as it closes");
     let recovery = owner
         .project()
         .recovery_path()
