@@ -138,6 +138,11 @@ pub(crate) struct PenRouter {
 }
 
 impl PenRouter {
+    /// The route of the stroke in progress; `None` between strokes.
+    pub(crate) const fn stroke(self) -> Option<Route> {
+        self.stroke
+    }
+
     /// Where `sample` goes: its stroke's route (at a `Down`, the one `brush` and [`route`]
     /// decide), or `None` for a sample out of a stroke, which goes to both.
     ///
@@ -198,13 +203,6 @@ impl PenFrame {
     }
 
     /// The runs of [`samples`](Self::samples) in a stroke, each with its stroke's route.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the brush reads for_brush and hover; the tests check the frame whole"
-        )
-    )]
     pub(crate) fn strokes(&self) -> &[(Range<usize>, Route)] {
         &self.strokes
     }

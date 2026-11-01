@@ -325,6 +325,32 @@ fn a_drag_with_no_pressure_reaches_nothing_and_the_stroke_goes_on() {
     assert_eq!(saved_strokes(owner, &dir, "light.bcrf").len(), 1);
 }
 
+/// The overlay's picks `owner` has made so far.
+fn picks(owner: &Owner<Sculpting, NoUploads>) -> u64 {
+    owner.picker().expect("a picker").picks()
+}
+
+#[test]
+fn the_overlays_pick_waits_for_the_stroke_to_end() {
+    let dir = TestDir::new();
+    let mut owner = owner(&dir);
+    run(&mut owner, 10_000);
+    let samples = stroke(ACROSS, 12);
+    let (first, rest) = samples.split_at(6);
+    let before = picks(&owner);
+    // The stroke's first half in one frame, its second (with the up) in the next.
+    queue(&mut owner, first.to_vec());
+    assert_eq!(run(&mut owner, 1), 1);
+    assert_eq!(picks(&owner), before, "no pick in a frame of the stroke");
+    queue(&mut owner, rest.to_vec());
+    assert_eq!(run(&mut owner, 1), 1);
+    assert_eq!(picks(&owner), before, "nor in its last frame");
+    assert!(!owner.brush().stroking(), "the stroke is over");
+    run(&mut owner, 10_000);
+    assert_eq!(picks(&owner), before + 1, "then the pick, once");
+    owner.close().expect("closed");
+}
+
 #[test]
 fn a_budget_takes_dabs_from_the_front_and_at_least_one() {
     let budget = DabBudget::new(25.0);

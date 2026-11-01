@@ -4,11 +4,13 @@
 //! [`Owner`] holds the project, so it lives on the one thread that may touch the store, and
 //! makes each frame in a fixed order:
 //!
-//! 1. **input**: the pointer input queued since the last frame moves the camera, then the surface
-//!    under the pointer is picked if the pointer or the view changed ([`crate::pick`]); the pen
-//!    samples queued since the last frame are routed ([`crate::pen::PenRouter`]: a stroke to
-//!    navigation or the brush, the rest to both), navigation's moving the camera after the mouse's
-//!    input, and become the frame's [`PenFrame`];
+//! 1. **input**: the pointer input queued since the last frame moves the camera; the pen samples
+//!    queued since the last frame are routed ([`crate::pen::PenRouter`]: a stroke to navigation or
+//!    the brush, the rest to both), navigation's moving the camera after the mouse's input, and
+//!    become the frame's [`PenFrame`]; then the surface under the pointer is picked for the overlay
+//!    if the pointer or the view changed ([`crate::pick`]), except while the brush is stroking (the
+//!    pick is on the pen's latency path, and the stroke moves the surface under it anyway): it is
+//!    made once the stroke is over, in a frame wanted for it;
 //! 2. **brush**: the brush's step ([`Brush`]; the app's is [`crate::sculpting::Sculpting`]), which
 //!    sees the camera as the input left it and the frame's pen samples, applies the frame's dabs
 //!    and closes their epoch, so they are drained just after and drawn in this frame; what it
@@ -557,6 +559,19 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     latency: Option<Duration>,
     /// How far into a scripted run its pen samples have been queued: those up to here are.
     script_pen: Duration,
+    /// Whether the brush is stroking, for the overlay's pick.
+    stroking: Stroking,
+}
+
+/// Whether the brush is stroking, as the overlay's pick needs to know.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Stroking {
+    /// Whether the last brush step left work for the next frame (dabs carried, a stroke
+    /// ending): the brush is still stroking.
+    busy: bool,
+    /// Whether a frame skipped the overlay's pick because the brush was stroking: the pick is
+    /// made in a frame wanted once the stroke is over.
+    pick_deferred: bool,
 }
 
 /// Every frame's phase times in a scripted run, for the summary printed at its end.
@@ -707,6 +722,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             latency_from: None,
             latency: None,
             script_pen: Duration::ZERO,
+            stroking: Stroking::default(),
         }
     }
 
@@ -974,6 +990,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         phases.input = lap.next();
 
         let brushed = self.brush_step(size)?;
+        self.stroking.busy = brushed.busy;
         phases.brush = lap.next();
 
         let drained = self.project.store().drain_stale(&self.cursor);
@@ -1042,6 +1059,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.want_next(&uploads);
         if brushed.busy {
             self.scheduler.want(Reason::Input);
+        }
+        if self.stroking.pick_deferred && !self.brushing() {
+            // The stroke is over: the next frame makes the pick this one skipped.
+            self.scheduler.want(Reason::Pick);
         }
         if preparing {
             self.scheduler.want(Reason::Converging);
@@ -1212,8 +1233,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// The input phase of a frame of `size`: the input queued since the last frame moves the
-    /// camera, then the surface under the pointer is picked if the pointer or the view changed;
-    /// the pen samples queued become the frame's [`PenFrame`].
+    /// camera, the pen samples queued become the frame's [`PenFrame`], then the surface under the
+    /// pointer is picked if the pointer or the view changed, unless the brush is stroking
+    /// ([`Owner::brushing`]; see the module notes).
     ///
     /// # Errors
     ///
@@ -1227,13 +1249,28 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 .apply(event, &mut self.camera, &arcball, height);
         }
         self.route_pen(&arcball, size);
-        if let Some(picker) = &mut self.picker {
+        self.stroking.pick_deferred = self.brushing();
+        if let Some(picker) = &mut self.picker
+            && !self.stroking.pick_deferred
+        {
             let view = self.camera.view(size);
             picker
                 .update(self.project.store(), view.as_ref())
                 .context("picking")?;
         }
         Ok(())
+    }
+
+    /// Whether the brush is stroking: this frame's pen samples hold a stroke of the brush's, a
+    /// stroke of its goes on past them, or the last brush step left work (dabs carried, a stroke
+    /// ending) for the next.
+    fn brushing(&self) -> bool {
+        let routed = self
+            .pen_frame
+            .strokes()
+            .iter()
+            .any(|(_, route)| *route == Route::Brush);
+        routed || self.pen_router.stroke() == Some(Route::Brush) || self.stroking.busy
     }
 
     /// Routes the pen samples queued since the last frame into the frame's [`PenFrame`], in
