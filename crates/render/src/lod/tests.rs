@@ -1772,6 +1772,38 @@ fn random_key(rng: &mut Rng) -> TileKey {
 }
 
 #[test]
+fn keys_at_every_field_s_ends_order_by_their_packed_order_as_by_their_own() {
+    let top = level(geom::MAX_LEVEL);
+    let below_top = level(geom::MAX_LEVEL - 1);
+    let last = |at: Level| u16::try_from(at.tiles_per_side() - 1).expect("small");
+    let layers = [LayerId::new(0), LayerId::new(u16::MAX)];
+    let channels = [Channel::from_raw(0), Channel::from_raw(u8::MAX)];
+    let faces = [geom::FaceId::new(0), geom::FaceId::new(u32::MAX)];
+    let mut keys: Vec<TileKey> = Vec::new();
+    for layer in layers {
+        for channel in channels {
+            for face in faces {
+                for at in [below_top, top] {
+                    for tx in [0, last(at)] {
+                        for ty in [0, last(at)] {
+                            let key = TileKey::new(layer, channel, face, at, tx, ty);
+                            keys.push(key.expect("in range"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Every pair, both ways round.
+    for a in &keys {
+        for b in &keys {
+            let packed = key_order(a).cmp(&key_order(b));
+            assert_eq!(packed, a.cmp(b), "{a:?} against {b:?}");
+        }
+    }
+}
+
+#[test]
 fn keys_sort_by_their_packed_order_as_by_their_own_and_a_cut_reads_back_as_the_same_sets() {
     let mut rng = Rng(41);
     let keys: Vec<TileKey> = (0..4000).map(|_| random_key(&mut rng)).collect();
