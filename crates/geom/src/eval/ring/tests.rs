@@ -571,3 +571,59 @@ fn blocks_displaced_by_one_function_of_position_still_meet_bit_for_bit() {
     assert!(shared > 0, "tiles share border vertices");
     assert!(moved > 0, "the bump moved vertices");
 }
+
+#[test]
+fn a_block_displaced_along_another_pairs_their_points_slot_by_slot() {
+    let mesh = cube_sphere(1).expect("a valid mesh");
+    let (positions, values) = (evaluated(&mesh, 7, 21), evaluated(&mesh, 7, 22));
+    let key = TileKey::displacement(FaceId::new(4), level(7), 1, 1).expect("a tile");
+    let region = Region::of_tile(&key);
+    let gathered = gather_block(&mesh, &positions, region).expect("gathers");
+    let along = gather_block(&mesh, &values, region).expect("gathers");
+    let mut moved = gathered.clone();
+    assert!(moved.displace_along(&along, |p, v| p + v * 0.5));
+    let slots = gathered
+        .padded()
+        .iter()
+        .zip(moved.padded())
+        .zip(along.padded());
+    for ((before, after), value) in slots {
+        if before.x.is_nan() {
+            assert!(after.x.is_nan(), "a gap stays a gap");
+        } else {
+            assert_eq!(after.to_bits(), (*before + *value * 0.5).to_bits());
+        }
+    }
+    let corners =
+        (0..4).filter_map(|c| Some((gathered.corner(c)?, moved.corner(c)?, along.corner(c)?)));
+    let mut rings = 0;
+    for (before, after, value) in corners {
+        rings += 1;
+        assert_eq!(
+            after.center().to_bits(),
+            (before.center() + value.center() * 0.5).to_bits()
+        );
+        let points = before.edges().iter().chain(before.diagonals());
+        let moved_points = after.edges().iter().chain(after.diagonals());
+        let paired = value.edges().iter().chain(value.diagonals());
+        for ((b, a), v) in points.zip(moved_points).zip(paired) {
+            assert_eq!(
+                a.to_bits(),
+                (*b + *v * 0.5).to_bits(),
+                "a ring point paired"
+            );
+        }
+    }
+    assert!(rings > 0, "a tile on a face corner");
+    let other = TileKey::displacement(FaceId::new(4), level(7), 0, 1).expect("a tile");
+    let elsewhere = gather_block(&mesh, &values, Region::of_tile(&other)).expect("gathers");
+    let mut kept = gathered.clone();
+    assert!(
+        !kept.displace_along(&elsewhere, |p, v| p + v),
+        "another region doesn't pair"
+    );
+    let bits = |block: &GatheredBlock| -> Vec<[u32; 3]> {
+        block.padded().iter().map(|p| p.to_bits()).collect()
+    };
+    assert_eq!(bits(&kept), bits(&gathered), "and nothing moved");
+}

@@ -126,6 +126,44 @@ impl GatheredBlock {
         }
     }
 
+    /// Moves every point the block holds through `f`, as [`GatheredBlock::displace`], each given
+    /// with `along`'s value at the same place: `along` is a block of the same region gathered
+    /// alike (from another source of per-vertex values, the vertices' frame normals say), so its
+    /// points pair with this one's slot by slot and ring point by ring point. Returns whether
+    /// they paired: blocks of different regions, or of base-vertex rings of different shapes,
+    /// are left as they are.
+    ///
+    /// Every block holding a vertex holds its bits and (gathered alike) the same `along` value,
+    /// so an `f` of the two alone moves the vertex to the same bits in every block, as
+    /// [`GatheredBlock::displace`] does.
+    pub fn displace_along(&mut self, along: &Self, mut f: impl FnMut(Vec3, Vec3) -> Vec3) -> bool {
+        let shapes = |block: &Self| {
+            block
+                .corners
+                .each_ref()
+                .map(|ring| ring.as_ref().map(GatheredRing::valence))
+        };
+        if self.region != along.region || shapes(self) != shapes(along) {
+            return false;
+        }
+        let finite = |v: &Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+        let slots = self
+            .padded
+            .as_mut_slice()
+            .iter_mut()
+            .zip(along.padded.as_slice());
+        let rings = self.corners.iter_mut().zip(&along.corners);
+        let ring_points = rings.flat_map(|(ring, paired)| {
+            let points = ring.iter_mut().flat_map(|ring| ring.ring.points_mut());
+            let values = paired.iter().flat_map(|paired| paired.ring.points());
+            points.zip(values)
+        });
+        for (point, value) in slots.chain(ring_points).filter(|(p, _)| finite(p)) {
+            *point = f(*point, *value);
+        }
+        true
+    }
+
     /// The ring of the base vertex at block corner `c` (`0..4`: `(0, 0)`, `(q, 0)`, `(q, q)`,
     /// `(0, q)`), or `None` if that corner isn't a base vertex.
     #[must_use]
