@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use geom::{Channel, FaceId, LayerId, Level, Region, TileKey, Vec3, cube_sphere};
 use store::{Project, SpatialIndex, TileStore};
 use stroke::{
-    DVec3, Dab, Hit, Projector, Ray, Sample, ScreenPoint, Stroke as PenStroke, StrokeId,
+    DVec3, Dab, Hit, Projector, Ray, Sample, ScreenPoint, Strength, Stroke as PenStroke, StrokeId,
     StrokeSettings, Surface, Unit,
 };
 
 use super::StoreSurface;
+use crate::SculptError;
 use crate::apply::apply_dabs;
 use crate::state::Stroke;
 use crate::testing::{TestDir, cube, dab, fixed, project_over, snapshot, tiles, two_cubes, vertex};
@@ -26,7 +27,8 @@ fn level() -> Level {
 fn bumps(project: &mut Project, index: &mut SpatialIndex) {
     let level = level();
     let mut frame = Vec::new();
-    for (n, face) in (0_u32..).zip([0, 1, 2, 0]) {
+    let faces = (0_u32..).zip([0, 1, 2, 0]);
+    for (n, face) in faces {
         let key = TileKey::displacement(FaceId::new(face), level, 1, 0).unwrap();
         let centre = vertex(project.store(), key, 20 + 9 * n, 30);
         frame.push(dab(centre, 0.2, 0.03, 0.2, n));
@@ -82,13 +84,13 @@ fn raycasts_hit_what_picking_hits() {
         let ray = inward(direction);
         let narrow = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32()).unwrap();
         let picked = index.raycast(store, &narrow).unwrap();
-        let mut surface = StoreSurface::new(store, &index);
-        let ours = surface.raycast_triangle(&narrow).unwrap();
+        let triangle = index.raycast_triangle(store, &narrow).unwrap();
         assert_eq!(
-            ours.map(|(key, hit)| (key, hit.t.to_bits())),
+            triangle.map(|hit| (hit.key, hit.t.to_bits())),
             picked.map(|hit| (hit.key, hit.t.to_bits())),
             "the same tile at the same parameter, toward {direction:?}"
         );
+        let mut surface = StoreSurface::new(store, &index);
         let (Some(hit), Some(picked)) = (surface.raycast(&ray), picked) else {
             continue;
         };
@@ -168,7 +170,8 @@ fn extreme(store: &mut TileStore, faces: std::ops::Range<u32>, key: impl Fn(Vec3
         }
         let side = tile.side();
         let positions = store.evaluate(tile).unwrap().to_vec();
-        for (k, p) in (0_u32..).zip(positions) {
+        let numbered = (0_u32..).zip(positions);
+        for (k, p) in numbered {
             if best.is_none_or(|(b, ..)| key(p) > b) {
                 best = Some((key(p), tile, k % side, k / side));
             }
@@ -287,6 +290,84 @@ fn an_error_is_kept_and_every_later_call_answers_none() {
     assert!(surface.take_error().is_some(), "taken");
     assert!(surface.error().is_none(), "and gone");
     assert!(surface.continuous(&a, &a, 1.0), "answering again");
+    assert!(surface.finish().is_ok(), "nothing kept");
+
+    let mut again = StoreSurface::new(project.store(), &index);
+    assert_eq!(again.raycast(&ray), None, "the same miss");
+    assert!(
+        matches!(again.finish(), Err(SculptError::Index(_))),
+        "finishing gives the kept error back"
+    );
+}
+
+/// The face-grid point `step` vertices inside face `face`'s grid from its border point
+/// `(gi, gj)`, along each axis the point is on the border of.
+fn inside(gi: u32, gj: u32, n: u32, step: u32) -> (u32, u32) {
+    let inward = |g: u32| match g {
+        0 => step,
+        g if g == n => n - step,
+        g => g,
+    };
+    (inward(gi), inward(gj))
+}
+
+/// Checks the faces around base vertex `(gi, gj)` of `face` are continuous there.
+///
+/// It hits a vertex two in from the corner on each face around the base vertex, and checks every
+/// pair of them is continuous within four times their distance, and not within half of it.
+/// Returns how many faces meet there.
+fn around_a_corner(
+    store: &mut TileStore,
+    index: &SpatialIndex,
+    face: FaceId,
+    gi: u32,
+    gj: u32,
+) -> usize {
+    let level = level();
+    let n = level.face_quads();
+    let copies = store.mesh().topology().copies(face, level, gi, gj);
+    let hits: Vec<Hit> = copies
+        .iter()
+        .map(|copy| {
+            let region = Region::of_tile(&copy.key(level));
+            let (x, y) = inside(region.x0() + copy.i, region.y0() + copy.j, n, 2);
+            vertex_hit(store, copy.face, x, y)
+        })
+        .collect();
+    let mut surface = StoreSurface::new(store, index);
+    for (k, a) in hits.iter().enumerate() {
+        for b in hits.iter().skip(k + 1) {
+            let apart = a.position.distance(b.position);
+            assert_ne!(a.face, b.face, "two faces");
+            assert!(surface.continuous(a, b, 4.0 * apart), "{a:?} to {b:?}");
+            assert!(surface.continuous(b, a, 4.0 * apart), "{b:?} to {a:?}");
+            assert!(
+                !surface.continuous(a, b, 0.5 * apart),
+                "short of the distance"
+            );
+        }
+    }
+    assert!(surface.finish().is_ok(), "no error");
+    hits.len()
+}
+
+#[test]
+fn hits_around_a_cube_corner_are_continuous() {
+    let dir = TestDir::new();
+    let (mut project, index) = cube(&dir, level(), fixed(2));
+    let faces = around_a_corner(project.store(), &index, FaceId::new(0), 0, 0);
+    assert_eq!(faces, 3, "three faces meet at a cube corner");
+}
+
+#[test]
+fn hits_around_a_valence_5_vertex_are_continuous() {
+    let dir = TestDir::new();
+    let prism = geom::fixtures::subdivided_pentagonal_prism().unwrap();
+    let (mut project, index) = project_over(&dir, prism, level(), 128, fixed(2));
+    let n = level().face_quads();
+    // Face 5's corner 2 is the top cap's centre, where five faces meet.
+    let faces = around_a_corner(project.store(), &index, FaceId::new(5), n, n);
+    assert_eq!(faces, 5, "five faces meet at the cap's centre");
 }
 
 /// A pinhole camera at `eye` looking down −z, `focal` pixels, its axis through screen point
@@ -324,17 +405,6 @@ fn to_surface(store: &mut TileStore, index: &SpatialIndex, p: Vec3) -> f32 {
         .fold(f32::INFINITY, f32::min)
 }
 
-/// The finished dabs: the stroke engine's strength (a factor, here the pen's pressure) scaled
-/// to a displacement, and its hardness factor on a brush of hardness 0.
-fn finish(dabs: impl Iterator<Item = Dab>) -> Vec<Dab> {
-    dabs.map(|d| Dab {
-        strength: d.strength * 0.004,
-        hardness: d.hardness * 0.0,
-        ..d
-    })
-    .collect()
-}
-
 #[test]
 fn a_stroke_over_the_store_edits_it_and_its_dabs_stay_on_the_surface() {
     let dir = TestDir::new();
@@ -351,7 +421,8 @@ fn a_stroke_over_the_store_edits_it_and_its_dabs_stay_on_the_surface() {
             Sample::new(at, 0.5 * u, Unit::new(0.8).unwrap()).unwrap()
         })
         .collect();
-    let settings = StrokeSettings::default();
+    // The stroke engine's dabs are final: the brush's own strength times the pressure.
+    let settings = StrokeSettings::default().with_strength(Strength::new(0.004).unwrap());
     let mut state = Stroke::new(project.store());
     project.begin_stroke().unwrap();
     let (first, rest) = samples.split_first().unwrap();
@@ -359,16 +430,21 @@ fn a_stroke_over_the_store_edits_it_and_its_dabs_stay_on_the_surface() {
         let mut surface = StoreSurface::new(project.store(), &index);
         let pen = PenStroke::begin(&settings, StrokeId::new(1), &camera, &mut surface, *first)
             .expect("the first sample is over the cube");
-        assert!(surface.error().is_none(), "no error");
+        surface.finish().unwrap();
         pen
     };
     let mut placed = 0;
     let mut moved = 0;
     for sample in rest {
         let mut surface = StoreSurface::new(project.store(), &index);
-        let dabs = finish(pen.push(&camera, &mut surface, *sample));
-        assert!(surface.error().is_none(), "no error");
+        let dabs: Vec<Dab> = pen.push(&camera, &mut surface, *sample).collect();
+        surface.finish().unwrap();
         for d in &dabs {
+            assert!(
+                (0.0032 - 1e-6..=0.0032 + 1e-6).contains(&d.strength),
+                "the brush's strength at the pen's pressure: {}",
+                d.strength
+            );
             let [x, y, z] = d.position;
             let off = to_surface(project.store(), &index, Vec3::new(x, y, z));
             assert!(off < 0.01, "dab {} is on the surface: {off}", d.seq);
@@ -380,8 +456,8 @@ fn a_stroke_over_the_store_edits_it_and_its_dabs_stay_on_the_surface() {
     }
     let tail = {
         let mut surface = StoreSurface::new(project.store(), &index);
-        let tail = finish(pen.end(&camera, &mut surface));
-        assert!(surface.error().is_none(), "no error");
+        let tail: Vec<Dab> = pen.end(&camera, &mut surface).collect();
+        surface.finish().unwrap();
         tail
     };
     placed += tail.len();
@@ -420,7 +496,8 @@ fn surface_costs() {
     let calls = 200_u32;
     let rays: Vec<Ray> = directions(calls).map(inward).collect();
     let mut frame = Vec::new();
-    for (n, ray) in (0_u32..).zip(rays.iter().step_by(20)) {
+    let every_twentieth = (0_u32..).zip(rays.iter().step_by(20));
+    for (n, ray) in every_twentieth {
         let mut surface = StoreSurface::new(project.store(), &index);
         let hit = surface.raycast(ray).unwrap();
         frame.push(dab(hit.position.to_f32(), 0.2, 0.02, 0.0, n));

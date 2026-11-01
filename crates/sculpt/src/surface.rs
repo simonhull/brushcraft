@@ -3,12 +3,12 @@
 //!
 //! # Raycasts
 //!
-//! [`Surface::raycast`] is picking's raycast ([`SpatialIndex::raycast`]): the index's tree is
-//! walked nearest box first ([`Bvh::raycast`](store::Bvh::raycast)), each candidate tile
-//! evaluated and its quads intersected as two triangles, split along their `(i, j)`–`(i + 1,
-//! j + 1)` diagonal, with the same test, so it hits the same tile at the same ray parameter, bit
-//! for bit. It also keeps which triangle was hit and where on it, for the [`Hit`]: the point is
-//! interpolated on the triangle, the normal from the evaluated normals at its corners
+//! [`Surface::raycast`] is picking's raycast, [`SpatialIndex::raycast_triangle`]: the index's
+//! tree walked nearest box first, each candidate tile evaluated and its quads intersected as two
+//! triangles. It hits the same tile at the same ray parameter as picking, and keeps which
+//! triangle and where on it, for the [`Hit`]: the point is interpolated on the triangle (so it
+//! agrees with picking's `origin + direction · t` to rounding, about `1e-5` of the scene's size,
+//! not bit for bit), the normal is interpolated from the evaluated normals at its corners
 //! ([`TileStore::normals`]), and the base face's coordinates from the vertices' grid places.
 //!
 //! # The stroke's region
@@ -37,35 +37,24 @@
 //!
 //! # Errors
 //!
-//! The [`Surface`] methods can't fail. A store or index error is kept
-//! ([`StoreSurface::error`]), the method answers `None` or `false`, and every later call
-//! answers so too without reading the store: the owner checks after each call into the stroke
-//! engine and ends the stroke there, taking the error with [`StoreSurface::take_error`].
+//! The [`Surface`] methods can't fail. A store or index error is kept, the method answers `None`
+//! or `false`, and every later call answers so too without reading the store. End each call into
+//! the stroke engine with [`StoreSurface::finish`], which gives the error back: the dabs that
+//! call gave are then to be discarded and the stroke ended.
 //!
 //! # Cost
 //!
 //! Every method reads tiles through the store, which evaluates a tile the first time and finds
-//! it cached after: the tiles near a stroke are the ones it brushes. The walk looks up each
+//! it cached after: the tiles near a stroke are the ones it brushes. A walk first evaluates,
+//! together on the store's workers, the tiles in its ball not cached yet. The walk looks up each
 //! tile's neighbours with at most eight copy lookups (one per corner, one per edge), whatever
-//! the tile's size. Measured in release on `cube_sphere(4)` at level 8 (`surface_costs` in the
-//! tests, 200 calls each, 2026-10-31), brushes of about 12,000 and 50,000 vertices (radius 62
-//! and 125 quads, the reach three radii, a region of 36 and 118 tiles):
-//!
-//! | method | warm, 12k | warm, 50k | cold, 12k | cold, 50k |
-//! |---|---|---|---|---|
-//! | `raycast` | 42 µs | 49 µs | 2.7 ms | 2.8 ms |
-//! | `continuous` | 6 µs | 19 µs | 2.3 ms | 4.4 ms |
-//! | `closest_on_region` | 108 µs | 224 µs | 7.6 ms | 21 ms |
-//!
-//! Means; the worst warm call was 292 µs. A raycast costs what picking's does (the triangle
-//! tests of the tiles it enters); the walk about 1.5 µs a tile; `closest_on_region` scans only
-//! the tiles whose boxes come nearer the ray than the best vertex so far. Cold, each evaluates
-//! the tiles it reads: for the walk, every tile of the region, nine times a dab's footprint.
+//! the tile's size. Measured costs are in the `surface` tests' release timing
+//! (`surface_costs`).
 
 use std::collections::{BTreeSet, VecDeque};
 
 use geom::{Channel, LayerId, Region, TileKey, Vec3};
-use store::{CacheError, SpatialIndex, TileStore};
+use store::{CacheError, Evaluation, SpatialIndex, TileStore, TriangleHit};
 use stroke::{DVec3, Hit, Ray, Surface};
 
 use crate::SculptError;
@@ -74,7 +63,8 @@ use crate::SculptError;
 /// level: see the module notes for what each method computes, and how errors are kept.
 ///
 /// Borrows the store and the index for its life: make one for each call into the stroke engine
-/// ([`stroke::Stroke::begin`], `push`, `end`), and drop it before applying the dabs.
+/// ([`stroke::Stroke::begin`], `push`, `end`), and end it with [`StoreSurface::finish`] before
+/// applying the dabs.
 #[derive(Debug)]
 pub struct StoreSurface<'a> {
     /// The store the tiles are read through.
@@ -108,6 +98,18 @@ impl<'a> StoreSurface<'a> {
         self.error.take()
     }
 
+    /// Ends the surface's use, giving back the error a method hit, if one did: the way to end
+    /// each call into the stroke engine, so a kept error can't be dropped unread.
+    ///
+    /// # Errors
+    ///
+    /// The error a method kept. The dabs the stroke engine gave from a call that ended in an
+    /// error were placed with the surface answering `None` or `false` after it: discard them,
+    /// and end the stroke there.
+    pub fn finish(self) -> Result<(), SculptError> {
+        self.error.map_or(Ok(()), Err)
+    }
+
     /// `result`'s value, or `None` with its error kept.
     fn keep<T>(&mut self, result: Result<T, SculptError>) -> Option<T> {
         match result {
@@ -120,6 +122,10 @@ impl<'a> StoreSurface<'a> {
     }
 
     /// The tile of the index's level holding `hit`, from its face and coordinates.
+    ///
+    /// The grid point is `⌊uv · n⌋`. A hit on a border between tiles (or rounded to just
+    /// across it) lies in both; the walk steps from either into the other across their shared
+    /// border vertices near it, so which one this picks doesn't change the region.
     fn tile_of(&self, hit: &Hit) -> Option<TileKey> {
         let level = self.index.level();
         let n = level.face_quads();
@@ -167,7 +173,8 @@ impl<'a> StoreSurface<'a> {
             let level = key.level();
             let region = Region::of_tile(&key);
             let topology = self.store.mesh().topology();
-            for (i, j) in probes.into_iter().flatten() {
+            let found = probes.into_iter().flatten();
+            for (i, j) in found {
                 let copies = topology.copies(key.face(), level, region.x0() + i, region.y0() + j);
                 for copy in &copies {
                     let tile = copy.key(level);
@@ -180,61 +187,58 @@ impl<'a> StoreSurface<'a> {
         Ok(reached)
     }
 
+    /// Evaluates, together on the store's workers, every tile whose box touches the ball of
+    /// `reach` around `center` and whose positions aren't cached: what a walk there reads, made
+    /// current in parallel instead of one tile at a time as the walk comes to it.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`].
+    fn prefetch(&mut self, center: DVec3, reach: f64) -> Result<(), CacheError> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the index's query is f32; a tile it misses by rounding is evaluated by the \
+                      walk when it reaches it"
+        )]
+        let radius = reach as f32;
+        let store = &*self.store;
+        let missing: Vec<TileKey> = self
+            .index
+            .query_sphere(center.to_f32(), radius)
+            .filter(|key| store.cached_positions(key).is_none())
+            .collect();
+        if !missing.is_empty() {
+            self.store.evaluate_many(&missing, Evaluation::Positions)?;
+        }
+        Ok(())
+    }
+
     /// [`Surface::raycast`], its errors returned.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::evaluate`] and [`TileStore::normals`].
+    /// As [`SpatialIndex::raycast_triangle`] and [`TileStore::normals`].
     fn try_raycast(&mut self, ray: &Ray) -> Result<Option<Hit>, SculptError> {
         let Some(narrow) = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32()) else {
             return Ok(None);
         };
-        let Some((key, triangle)) = self.raycast_triangle(&narrow)? else {
+        let Some(triangle) = self.index.raycast_triangle(self.store, &narrow)? else {
             return Ok(None);
         };
-        self.hit_on_triangle(ray, key, triangle).map(Some)
+        self.hit_on_triangle(ray, triangle).map(Some)
     }
 
-    /// The tile and the triangle `ray` hits first: [`SpatialIndex::raycast`]'s walk and test,
-    /// keeping the triangle.
-    ///
-    /// # Errors
-    ///
-    /// As [`TileStore::evaluate`].
-    fn raycast_triangle(
-        &mut self,
-        ray: &store::Ray,
-    ) -> Result<Option<(TileKey, TriangleHit)>, CacheError> {
-        let index = self.index;
-        let store = &mut *self.store;
-        let mut found: Vec<(TileKey, TriangleHit)> = Vec::new();
-        let hit = index.bvh().raycast(ray, |key| {
-            let side = key.side();
-            let hit = intersect_tile(ray, store.evaluate(key)?, side);
-            if let Some(hit) = hit {
-                found.push((key, hit));
-            }
-            Ok::<_, CacheError>(hit.map(|hit| hit.t))
-        })?;
-        Ok(hit.and_then(|hit| found.into_iter().find(|(key, _)| *key == hit.key)))
-    }
-
-    /// The [`Hit`] where `ray` crosses `triangle` of tile `key`: the point interpolated on the
-    /// triangle, the evaluated normals interpolated and normalised (the triangle's own normal,
-    /// facing the ray's origin, where they cancel), and the face's coordinates.
+    /// The [`Hit`] where `ray` crosses `triangle`: the point interpolated on the triangle, the
+    /// evaluated normals interpolated and normalised (the triangle's own normal, facing the
+    /// ray's origin, where they cancel), and the face's coordinates.
     ///
     /// # Errors
     ///
     /// As [`TileStore::normals`].
-    fn hit_on_triangle(
-        &mut self,
-        ray: &Ray,
-        key: TileKey,
-        triangle: TriangleHit,
-    ) -> Result<Hit, SculptError> {
-        let side = key.side();
-        let corners = triangle.corners(side);
-        let weights = triangle.weights();
+    fn hit_on_triangle(&mut self, ray: &Ray, triangle: TriangleHit) -> Result<Hit, SculptError> {
+        let key = triangle.key;
+        let corners = corners(&triangle);
+        let weights = weights(&triangle);
         let (positions, normals) = self.tile_values(key, corners)?;
         let position = interpolate(&positions, weights);
         let flat = (positions[1] - positions[0]).cross(positions[2] - positions[0]);
@@ -247,7 +251,7 @@ impl<'a> StoreSurface<'a> {
             .normalized()
             .or_else(|| facing.normalized())
             .unwrap_or(DVec3::Z);
-        let (gx, gy) = triangle.grid(weights);
+        let (gx, gy) = grid_point(&triangle, weights);
         Ok(Hit {
             position,
             normal,
@@ -284,11 +288,12 @@ impl<'a> StoreSurface<'a> {
     ///
     /// # Errors
     ///
-    /// As [`TileStore::evaluate`] and [`TileStore::normals`].
+    /// As [`TileStore::evaluate`], [`TileStore::evaluate_many`] and [`TileStore::normals`].
     fn try_closest(&mut self, ray: &Ray, near: &Hit, reach: f64) -> Result<Hit, SculptError> {
         let Some(start) = self.tile_of(near) else {
             return Ok(*near);
         };
+        self.prefetch(near.position, reach)?;
         let region = self.walk(start, near.position, reach, None)?;
         // Nearest box first, so the scan can stop at the first tile whose box is farther from
         // the ray than the best vertex so far: the answer doesn't depend on the order, as ties
@@ -305,10 +310,11 @@ impl<'a> StoreSurface<'a> {
                 break;
             }
             let positions = self.store.evaluate(key)?;
-            for (k, &p) in positions.iter().enumerate() {
-                if distance_squared(p, near.position) > reach_squared {
-                    continue;
-                }
+            let in_reach = positions
+                .iter()
+                .enumerate()
+                .filter(|&(_, &p)| distance_squared(p, near.position) <= reach_squared);
+            for (k, &p) in in_reach {
                 let p = DVec3::from_f32(p);
                 let off = p - ray.closest_to(p);
                 let candidate = (off.dot(off), key, k);
@@ -321,8 +327,8 @@ impl<'a> StoreSurface<'a> {
             return Ok(*near);
         };
         let ([position], [normal]) = self.tile_values(key, [k])?;
-        let side = key.side();
-        let (i, j) = (k % side as usize, k / side as usize);
+        let side = key.side() as usize;
+        let (i, j) = (k % side, k / side);
         Ok(Hit {
             position,
             normal: normal.normalized().unwrap_or(near.normal),
@@ -352,9 +358,10 @@ impl<'a> StoreSurface<'a> {
     ///
     /// # Errors
     ///
-    /// As [`TileStore::evaluate`].
+    /// As [`TileStore::evaluate`] and [`TileStore::evaluate_many`].
     fn try_continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> Result<bool, SculptError> {
-        if a.position.distance(b.position) > reach {
+        let apart = a.position.distance(b.position);
+        if apart > reach {
             return Ok(false);
         }
         let (Some(from), Some(to)) = (self.tile_of(a), self.tile_of(b)) else {
@@ -363,6 +370,7 @@ impl<'a> StoreSurface<'a> {
         if from == to {
             return Ok(true);
         }
+        self.prefetch(a.position, apart)?;
         let walked = self.walk(from, a.position, reach, Some(to))?;
         Ok(walked.last() == Some(&to))
     }
@@ -392,136 +400,6 @@ impl Surface for StoreSurface<'_> {
         let joined = self.try_continuous(a, b, reach);
         self.keep(joined).unwrap_or(false)
     }
-}
-
-/// Where a ray crosses one triangle of a tile: the ray parameter, the quad, which of its two
-/// triangles, and the barycentric coordinates on it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct TriangleHit {
-    /// The ray parameter.
-    t: f32,
-    /// The quad's corner `(i, j)` in the tile, its least.
-    i: u32,
-    /// See `i`.
-    j: u32,
-    /// Whether it is the quad's second triangle, `(i, j)`, `(i + 1, j + 1)`, `(i, j + 1)`;
-    /// else its first, `(i, j)`, `(i + 1, j)`, `(i + 1, j + 1)`.
-    second: bool,
-    /// The weight of the triangle's second corner, as the ray test found it (a little outside
-    /// `0..=1` at an edge, within the test's slack).
-    u: f32,
-    /// The weight of its third corner, likewise.
-    v: f32,
-}
-
-impl TriangleHit {
-    /// The row-major indices of the triangle's corners in a tile of `side` vertices a side, in
-    /// the test's order: the corner, the second, the third.
-    fn corners(&self, side: u32) -> [usize; 3] {
-        let at = |i: u32, j: u32| (j * side + i) as usize;
-        let (i, j) = (self.i, self.j);
-        if self.second {
-            [at(i, j), at(i + 1, j + 1), at(i, j + 1)]
-        } else {
-            [at(i, j), at(i + 1, j), at(i + 1, j + 1)]
-        }
-    }
-
-    /// The corners' weights, clamped onto the triangle: each at least 0, summing to 1.
-    fn weights(&self) -> [f64; 3] {
-        let (u, v) = (f64::from(self.u).max(0.0), f64::from(self.v).max(0.0));
-        let sum = u + v;
-        let (u, v) = if sum > 1.0 {
-            (u / sum, v / sum)
-        } else {
-            (u, v)
-        };
-        [1.0 - u - v, u, v]
-    }
-
-    /// The point with the corners' `weights`, in the tile's grid coordinates.
-    fn grid(&self, [_, u, v]: [f64; 3]) -> (f64, f64) {
-        let (i, j) = (f64::from(self.i), f64::from(self.j));
-        if self.second {
-            (i + u, j + u + v)
-        } else {
-            (i + u + v, j + v)
-        }
-    }
-}
-
-/// The nearest triangle `ray` crosses of a tile with `positions`, row-major `side × side`.
-///
-/// It is the index's own test (see `store`'s `intersect_tile`), keeping the triangle. The least
-/// parameter is the one the index finds, bit for bit; of equal ones, the first in row-major
-/// order, the first triangle before the second.
-fn intersect_tile(ray: &store::Ray, positions: &[Vec3], side: u32) -> Option<TriangleHit> {
-    let width = side as usize;
-    let rows = positions.chunks_exact(width);
-    let quads = rows
-        .clone()
-        .zip(rows.skip(1))
-        .zip(0_u32..)
-        .flat_map(|((row, next), j)| {
-            row.windows(2)
-                .zip(next.windows(2))
-                .zip(0_u32..)
-                .map(move |(quad, i)| (quad, i, j))
-        });
-    let mut best: Option<TriangleHit> = None;
-    for (quad, i, j) in quads {
-        let (&[low, right], &[up, far]) = quad else {
-            continue;
-        };
-        let triangles = [(false, low, right, far), (true, low, far, up)];
-        for (second, corner, p, q) in triangles {
-            let Some((t, u, v)) = intersect_triangle(ray, corner, p, q) else {
-                continue;
-            };
-            if best.is_none_or(|best| t < best.t) {
-                best = Some(TriangleHit {
-                    t,
-                    i,
-                    j,
-                    second,
-                    u,
-                    v,
-                });
-            }
-        }
-    }
-    best
-}
-
-/// How far outside a triangle's edges, in barycentric terms, a hit still counts: the index's.
-const EDGE_SLACK: f32 = 1e-6;
-
-/// Where `ray` crosses the triangle `corner`, `second`, `third` (from either side): its
-/// parameter and the weights of the second and third corners; `None` if it misses or runs
-/// parallel to it.
-///
-/// The index's test (Möller and Trumbore's, by Cramer's rule, the barycentric bounds widened by
-/// [`EDGE_SLACK`]), operation for operation, so the parameter is the index's bit for bit.
-fn intersect_triangle(
-    ray: &store::Ray,
-    corner: Vec3,
-    second: Vec3,
-    third: Vec3,
-) -> Option<(f32, f32, f32)> {
-    let (edge1, edge2) = (second - corner, third - corner);
-    let across = ray.direction().cross(edge2);
-    let det = edge1.dot(across);
-    if det == 0.0 || !det.is_finite() {
-        return None;
-    }
-    let inv = det.recip();
-    let from_corner = ray.origin() - corner;
-    let u = from_corner.dot(across) * inv;
-    let up = from_corner.cross(edge1);
-    let v = ray.direction().dot(up) * inv;
-    let inside = u >= -EDGE_SLACK && v >= -EDGE_SLACK && u + v <= 1.0 + EDGE_SLACK;
-    let t = edge2.dot(up) * inv;
-    (inside && t >= 0.0).then_some((t, u, v))
 }
 
 /// The border vertices to look up the neighbours of a tile with `side` vertices a side through.
@@ -554,6 +432,44 @@ fn at(positions: &[Vec3], side: u32, i: u32, j: u32) -> Option<Vec3> {
 fn distance_squared(p: Vec3, center: DVec3) -> f64 {
     let off = DVec3::from_f32(p) - center;
     off.dot(off)
+}
+
+/// The row-major indices of `triangle`'s corners in its tile, in the test's order: the corner,
+/// the second, the third (see [`TriangleHit`]).
+fn corners(triangle: &TriangleHit) -> [usize; 3] {
+    let side = triangle.key.side();
+    let at = |i: u32, j: u32| (j * side + i) as usize;
+    let (i, j) = (triangle.i, triangle.j);
+    if triangle.second {
+        [at(i, j), at(i + 1, j + 1), at(i, j + 1)]
+    } else {
+        [at(i, j), at(i + 1, j), at(i + 1, j + 1)]
+    }
+}
+
+/// `triangle`'s corners' weights, clamped onto the triangle: each at least 0, summing to 1.
+fn weights(triangle: &TriangleHit) -> [f64; 3] {
+    let (u, v) = (
+        f64::from(triangle.u).max(0.0),
+        f64::from(triangle.v).max(0.0),
+    );
+    let sum = u + v;
+    let (u, v) = if sum > 1.0 {
+        (u / sum, v / sum)
+    } else {
+        (u, v)
+    };
+    [1.0 - u - v, u, v]
+}
+
+/// The point of `triangle` with its corners' `weights`, in its tile's grid coordinates.
+fn grid_point(triangle: &TriangleHit, [_, u, v]: [f64; 3]) -> (f64, f64) {
+    let (i, j) = (f64::from(triangle.i), f64::from(triangle.j));
+    if triangle.second {
+        (i + u, j + u + v)
+    } else {
+        (i + u + v, j + v)
+    }
 }
 
 /// The values `at` of `values`, in `f64`; a missing one is zero (never, for a tile's own
