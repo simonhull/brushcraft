@@ -14,26 +14,27 @@
 //! # The stroke's region
 //!
 //! [`Surface::continuous`] and [`Surface::closest_on_region`] both walk the surface near a point
-//! `p`, within `reach` of it, tile by tile:
+//! `p`, within `reach` of it, vertex by vertex:
 //!
-//! - the walk starts at the tile holding `p` (from its face and coordinates);
-//! - from each tile it reaches, it steps into every tile that shares one of its border vertices
-//!   lying within `reach` of `p` (the copies of the vertex, [`geom::Topology::copies`]), across
-//!   faces too.
+//! - the walk starts at the vertex nearest `p` of the quad around it;
+//! - inside a tile, it spreads along the grid's edges (rows, columns and the diagonal each quad is
+//!   split along) through vertices within `reach` of `p`: the tile's vertices within reach fall
+//!   into pieces, and the walk enters only the pieces it reaches;
+//! - it crosses into a neighbouring tile at a border vertex of an entered piece, through the
+//!   vertex's copies ([`geom::Topology::copies`]), across faces too.
 //!
-//! So two tiles are connected when the surface itself joins them within the ball, at a seam
-//! vertex inside it: the two faces of a thin slab are close but join only at its rim, which a
-//! ball smaller than the slab doesn't reach; two parts with a gap between them share no vertex
-//! at all. A tile is one piece: two folds of the surface inside one tile count as connected,
-//! an approximation at the scale of a tile (64 quads a side at the finest levels).
+//! So two points are connected when the surface itself joins them within the ball: the two
+//! faces of a thin slab, or two sides of a fold, are close but join only at the rim, which a
+//! ball smaller than the slab doesn't reach, whether or not they share a tile; two parts with a
+//! gap between them share no vertex at all. The resolution is the mesh's: a fold thinner than a
+//! quad isn't seen.
 //!
-//! [`Surface::continuous`] asks whether the walk from `a` reaches the tile holding `b` (`b`
-//! within `reach` of `a` first, and true at once for two hits on one tile).
-//! [`Surface::closest_on_region`] walks the whole region and takes, of the vertices within
-//! `reach` of `near` on the tiles reached, the one closest to the ray (ties to the least tile
-//! key, then the first vertex in row-major order): the closest point up to the mesh's spacing,
-//! about one quad, which the stroke engine allows ("approximate, but deterministic"). If no vertex
-//! lies within `reach` (a reach under a quad), `near` itself is the answer.
+//! [`Surface::continuous`] asks whether the walk from `a` enters the piece holding `b`'s nearest
+//! quad corner (`b` within `reach` of `a` first). [`Surface::closest_on_region`] walks the whole
+//! region and takes, of its vertices, the one closest to the ray (ties to the least tile key,
+//! then the first vertex in row-major order): the closest point up to the mesh's spacing, about
+//! one quad, which the stroke engine allows ("approximate, but deterministic"). If `near`'s
+//! nearest corner lies out of reach (a reach under a quad), `near` itself is the answer.
 //!
 //! # Errors
 //!
@@ -46,18 +47,34 @@
 //!
 //! Every method reads tiles through the store, which evaluates a tile the first time and finds
 //! it cached after: the tiles near a stroke are the ones it brushes. A walk first evaluates,
-//! together on the store's workers, the tiles in its ball not cached yet. The walk looks up each
-//! tile's neighbours with at most eight copy lookups (one per corner, one per edge), whatever
-//! the tile's size. Measured costs are in the `surface` tests' release timing
-//! (`surface_costs`).
+//! together on the store's workers, the tiles in its ball not cached yet. Inside the walk, a
+//! tile whose box lies wholly within reach is one piece at no cost; another has its vertices'
+//! distances taken and grouped into pieces row by row; a tile's neighbours are looked up once
+//! per corner and per run of a piece along an edge.
+//!
+//! Measured in release on `cube_sphere(4)` at level 8 (`surface_costs` in the tests, 200 calls
+//! each, 2026-10-31), brushes of about 12,000 and 50,000 vertices (radius 62 and 125 quads, the
+//! reach three radii, a region of 36 and 118 tiles, of which about 20 and 36 cut by the ball's
+//! edge and labelled):
+//!
+//! | method | warm, 12k | warm, 50k | cold, 12k | cold, 50k |
+//! |---|---|---|---|---|
+//! | `raycast` | 42 µs | 45 µs | 2.3 ms | 2.4 ms |
+//! | `continuous` | 10 µs | 21 µs | 1.9 ms | 2.4 ms |
+//! | `closest_on_region` | 287 µs | 590 µs | 3.5 ms | 6.8 ms |
+//!
+//! Means; the worst warm call was 897 µs (`closest_on_region`, 50k). Most of a warm walk is
+//! labelling the tiles the ball's edge cuts, a few microseconds each; cold, it is evaluating the
+//! region's tiles, nine times a dab's footprint, which the prefetch spreads over the workers.
 
-use std::collections::{BTreeSet, VecDeque};
-
-use geom::{Channel, LayerId, Region, TileKey, Vec3};
+use geom::{Channel, LayerId, Region, TileKey, Topology, Vec3};
 use store::{CacheError, Evaluation, SpatialIndex, TileStore, TriangleHit};
 use stroke::{DVec3, Hit, Ray, Surface};
 
+use self::region::{Ball, Source, Vertex, Walked, distance_squared, walk};
 use crate::SculptError;
+
+mod region;
 
 /// The tile store and its spatial index as the stroke engine's [`Surface`], at the index's
 /// level: see the module notes for what each method computes, and how errors are kept.
@@ -124,8 +141,9 @@ impl<'a> StoreSurface<'a> {
     /// The tile of the index's level holding `hit`, from its face and coordinates.
     ///
     /// The grid point is `⌊uv · n⌋`. A hit on a border between tiles (or rounded to just
-    /// across it) lies in both; the walk steps from either into the other across their shared
-    /// border vertices near it, so which one this picks doesn't change the region.
+    /// across it) lies in both, and either holds the corners of the quad around it that
+    /// [`StoreSurface::anchor`] starts from, the border vertices being in both; so which one
+    /// this picks doesn't change the walk.
     fn tile_of(&self, hit: &Hit) -> Option<TileKey> {
         let level = self.index.level();
         let n = level.face_quads();
@@ -135,56 +153,46 @@ impl<'a> StoreSurface<'a> {
         Some(key)
     }
 
-    /// The walk of the module notes from `start` over the tiles joined within `reach` of
-    /// `center`: the tiles reached, in the order reached. Stops early, with `target` last, once
-    /// it reaches `target`.
-    ///
-    /// A tile's border vertices other than its corners have their copies in the same tiles
-    /// edge by edge (the tile across that edge, on this face or the next: tiles are aligned on
-    /// both), so each edge's copies are looked up once, through one of its vertices, if any of
-    /// them is within reach, and each corner's if it is.
+    /// The vertex the walk starts from (or looks for) for `hit`: of the corners of the quad
+    /// around it in its tile, the nearest to it (the first of equals, row-major); `None` if
+    /// that one isn't within `reach_squared` of `center`, or the hit isn't on a tile.
     ///
     /// # Errors
     ///
     /// As [`TileStore::evaluate`].
-    fn walk(
+    fn anchor(
         &mut self,
-        start: TileKey,
+        hit: &Hit,
         center: DVec3,
-        reach: f64,
-        target: Option<TileKey>,
-    ) -> Result<Vec<TileKey>, CacheError> {
-        let reach_squared = reach * reach;
-        let mut seen = BTreeSet::from([start]);
-        let mut queue = VecDeque::from([start]);
-        let mut reached = Vec::new();
-        while let Some(key) = queue.pop_front() {
-            reached.push(key);
-            if Some(key) == target {
-                break;
-            }
-            let side = key.side();
-            let positions = self.store.evaluate(key)?;
-            let within = |(i, j): (u32, u32)| {
-                at(positions, side, i, j)
-                    .is_some_and(|p| distance_squared(p, center) <= reach_squared)
-            };
-            let probes = border_probes(side, within);
-            let level = key.level();
-            let region = Region::of_tile(&key);
-            let topology = self.store.mesh().topology();
-            let found = probes.into_iter().flatten();
-            for (i, j) in found {
-                let copies = topology.copies(key.face(), level, region.x0() + i, region.y0() + j);
-                for copy in &copies {
-                    let tile = copy.key(level);
-                    if seen.insert(tile) {
-                        queue.push_back(tile);
-                    }
-                }
-            }
-        }
-        Ok(reached)
+        reach_squared: f64,
+    ) -> Result<Option<Vertex>, CacheError> {
+        let Some(key) = self.tile_of(hit) else {
+            return Ok(None);
+        };
+        let side = key.side();
+        let region = Region::of_tile(&key);
+        let n = f64::from(key.level().face_quads());
+        let last = f64::from(side - 1);
+        let local = |u: f64, origin: u32| (u * n - f64::from(origin)).clamp(0.0, last);
+        let (x, y) = (local(hit.uv[0], region.x0()), local(hit.uv[1], region.y0()));
+        let (x0, y0) = (floor_to(x, side - 1), floor_to(y, side - 1));
+        let (x1, y1) = ((x0 + 1).min(side - 1), (y0 + 1).min(side - 1));
+        let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+        let positions = self.store.evaluate(key)?;
+        let nearest = corners
+            .into_iter()
+            .filter_map(|(i, j)| {
+                let at = (j * side + i) as usize;
+                Some((distance_squared(*positions.get(at)?, hit.position), at))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let Some((_, at)) = nearest else {
+            return Ok(None);
+        };
+        let inside = positions
+            .get(at)
+            .is_some_and(|&p| Ball::new(center, reach_squared).holds(p));
+        Ok(inside.then_some((key, at)))
     }
 
     /// Evaluates, together on the store's workers, every tile whose box touches the ball of
@@ -284,37 +292,77 @@ impl<'a> StoreSurface<'a> {
         Ok((gather(positions, at), gather(normals, at)))
     }
 
+    /// The walk from `near` over the region within `reach` of it (see the module notes), its
+    /// tiles prefetched first; `None` if `near` has no vertex of its quad within reach.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate`] and [`TileStore::evaluate_many`].
+    fn region(
+        &mut self,
+        near: &Hit,
+        reach: f64,
+        target: Option<&Hit>,
+    ) -> Result<Option<Walked>, CacheError> {
+        let reach_squared = reach * reach;
+        let center = near.position;
+        let prefetched = target.map_or(reach, |b| b.position.distance(center).min(reach));
+        self.prefetch(center, prefetched)?;
+        let Some(start) = self.anchor(near, center, reach_squared)? else {
+            return Ok(None);
+        };
+        let goal = match target {
+            Some(b) => match self.anchor(b, center, reach_squared)? {
+                Some(goal) => Some(goal),
+                None => return Ok(Some(Walked::default())),
+            },
+            None => None,
+        };
+        walk(
+            &mut Reader {
+                store: self.store,
+                index: self.index,
+            },
+            start,
+            center,
+            reach_squared,
+            goal,
+        )
+        .map(Some)
+    }
+
     /// [`Surface::closest_on_region`], its errors returned.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::evaluate`], [`TileStore::evaluate_many`] and [`TileStore::normals`].
+    /// As [`TileStore::evaluate`] and [`TileStore::normals`].
     fn try_closest(&mut self, ray: &Ray, near: &Hit, reach: f64) -> Result<Hit, SculptError> {
-        let Some(start) = self.tile_of(near) else {
+        let Some(walked) = self.region(near, reach, None)? else {
             return Ok(*near);
         };
-        self.prefetch(near.position, reach)?;
-        let region = self.walk(start, near.position, reach, None)?;
         // Nearest box first, so the scan can stop at the first tile whose box is farther from
         // the ray than the best vertex so far: the answer doesn't depend on the order, as ties
         // go to the least key and vertex either way.
-        let mut tiles: Vec<(f64, TileKey)> = region
-            .into_iter()
-            .map(|key| (self.box_distance_squared(ray, &key), key))
+        let mut tiles: Vec<(f64, TileKey)> = walked
+            .tiles
+            .keys()
+            .map(|&key| (self.box_distance_squared(ray, &key), key))
             .collect();
         tiles.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let reach_squared = reach * reach;
         let mut best: Option<(f64, TileKey, usize)> = None;
         for (bound, key) in tiles {
             if best.is_some_and(|(least, _, _)| bound > least) {
                 break;
             }
+            let Some(reached) = walked.tiles.get(&key) else {
+                continue;
+            };
             let positions = self.store.evaluate(key)?;
-            let in_reach = positions
+            let on_region = positions
                 .iter()
                 .enumerate()
-                .filter(|&(_, &p)| distance_squared(p, near.position) <= reach_squared);
-            for (k, &p) in in_reach {
+                .filter(|&(k, _)| reached.holds(k));
+            for (k, &p) in on_region {
                 let p = DVec3::from_f32(p);
                 let off = p - ray.closest_to(p);
                 let candidate = (off.dot(off), key, k);
@@ -360,19 +408,11 @@ impl<'a> StoreSurface<'a> {
     ///
     /// As [`TileStore::evaluate`] and [`TileStore::evaluate_many`].
     fn try_continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> Result<bool, SculptError> {
-        let apart = a.position.distance(b.position);
-        if apart > reach {
+        if a.position.distance(b.position) > reach {
             return Ok(false);
         }
-        let (Some(from), Some(to)) = (self.tile_of(a), self.tile_of(b)) else {
-            return Ok(false);
-        };
-        if from == to {
-            return Ok(true);
-        }
-        self.prefetch(a.position, apart)?;
-        let walked = self.walk(from, a.position, reach, Some(to))?;
-        Ok(walked.last() == Some(&to))
+        let walked = self.region(a, reach, Some(b))?;
+        Ok(walked.is_some_and(|walked| walked.found))
     }
 }
 
@@ -402,36 +442,43 @@ impl Surface for StoreSurface<'_> {
     }
 }
 
-/// The border vertices to look up the neighbours of a tile with `side` vertices a side through.
-///
-/// Their copies name every tile sharing a border vertex `within` takes: each corner `within`
-/// takes, and for each edge with a vertex between its corners that `within` takes, that edge's
-/// first such vertex.
-fn border_probes(side: u32, within: impl Fn((u32, u32)) -> bool) -> [Option<(u32, u32)>; 8] {
-    let last = side.saturating_sub(1);
-    let edge = |at: &dyn Fn(u32) -> (u32, u32)| (1..last).map(at).find(|&v| within(v));
-    let corner = |v: (u32, u32)| within(v).then_some(v);
-    [
-        corner((0, 0)),
-        corner((last, 0)),
-        corner((0, last)),
-        corner((last, last)),
-        edge(&|t| (t, 0)),
-        edge(&|t| (t, last)),
-        edge(&|t| (0, t)),
-        edge(&|t| (last, t)),
-    ]
+/// The store and index as the region walk reads them.
+#[derive(Debug)]
+struct Reader<'s> {
+    /// The store, for positions and the topology.
+    store: &'s mut TileStore,
+    /// The index, for tiles' boxes.
+    index: &'s SpatialIndex,
 }
 
-/// Vertex `(i, j)`'s position in a tile's row-major `positions`.
-fn at(positions: &[Vec3], side: u32, i: u32, j: u32) -> Option<Vec3> {
-    positions.get(usize::try_from(j * side + i).ok()?).copied()
-}
+impl Source for Reader<'_> {
+    type Error = CacheError;
 
-/// The squared distance from `p` to `center`, in `f64`.
-fn distance_squared(p: Vec3, center: DVec3) -> f64 {
-    let off = DVec3::from_f32(p) - center;
-    off.dot(off)
+    fn topology(&self) -> &Topology {
+        self.store.mesh().topology()
+    }
+
+    fn positions(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
+        self.store.evaluate(key)
+    }
+
+    /// Whether the tile's box in the index lies inside the ball: every corner of it within
+    /// reach. The index is refitted after every edit, so its boxes bound the positions.
+    fn wholly_within(&self, key: &TileKey, center: DVec3, reach_squared: f64) -> bool {
+        let Some(bounds) = self.index.bvh().bounds(key) else {
+            return false;
+        };
+        let (low, high) = (bounds.aabb.min(), bounds.aabb.max());
+        let corners = (0..8_u8).map(|c| {
+            Vec3::new(
+                if c & 1 == 0 { low.x } else { high.x },
+                if c & 2 == 0 { low.y } else { high.y },
+                if c & 4 == 0 { low.z } else { high.z },
+            )
+        });
+        let mut corners = corners;
+        corners.all(|corner| distance_squared(corner, center) <= reach_squared)
+    }
 }
 
 /// The row-major indices of `triangle`'s corners in its tile, in the test's order: the corner,
@@ -497,11 +544,16 @@ fn face_uv(key: TileKey, gx: f64, gy: f64) -> [f64; 2] {
 /// The grid column (or row) of a face of `n` quads a side holding face coordinate `u`: `⌊u n⌋`,
 /// clamped to `0..=n`.
 fn grid_index(u: f64, n: u32) -> u32 {
-    let g = (u * f64::from(n)).floor().clamp(0.0, f64::from(n));
+    floor_to(u * f64::from(n), n)
+}
+
+/// `⌊x⌋`, clamped to `0..=most`; a NaN gives 0.
+fn floor_to(x: f64, most: u32) -> u32 {
+    let g = x.floor().clamp(0.0, f64::from(most));
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "clamped to 0..=n just above, which a u32 holds; a NaN casts to 0"
+        reason = "clamped to 0..=most just above, which a u32 holds; a NaN casts to 0"
     )]
     let g = g as u32;
     g

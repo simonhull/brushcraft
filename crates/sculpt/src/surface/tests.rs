@@ -548,10 +548,7 @@ fn surface_costs() {
         surface.closest_on_region(&hits[k].1, &hits[k].0, reach);
     };
     let walk = |surface: &mut StoreSurface<'_>, k: usize| {
-        let start = surface.tile_of(&hits[k].0).unwrap();
-        surface
-            .walk(start, hits[k].0.position, reach, None)
-            .unwrap();
+        surface.region(&hits[k].0, reach, None).unwrap();
     };
     let costs: [(&str, &Call<'_>); 4] = [
         ("raycast", &raycast),
@@ -564,13 +561,17 @@ fn surface_costs() {
         let sizes: Vec<usize> = hits
             .iter()
             .map(|(hit, _, _)| {
-                let start = surface.tile_of(hit).unwrap();
-                surface
-                    .walk(start, hit.position, reach, None)
-                    .unwrap()
-                    .len()
+                let walked = surface.region(hit, reach, None).unwrap();
+                walked.map_or(0, |walked| walked.tiles.len())
             })
             .collect();
+        let walked = surface.region(&hits[0].0, reach, None).unwrap().unwrap();
+        let labelled = walked
+            .tiles
+            .values()
+            .filter(|reached| reached.pieces != super::region::Pieces::Whole)
+            .count();
+        println!("labelled {labelled} of {} tiles", walked.tiles.len());
         println!(
             "region: mean {} tiles, most {}",
             sizes.iter().sum::<usize>() / sizes.len(),
