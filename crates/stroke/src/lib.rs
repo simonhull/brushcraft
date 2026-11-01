@@ -68,3 +68,11 @@ pub use stroke::{Stroke, StrokeId};
 pub use surface::{Hit, Projector, Ray, Surface};
 pub use unit::{NotUnit, Unit};
 pub use vector::DVec3;
+
+/// The version of the engine that places dabs, as a stroke's record keeps it.
+///
+/// Dabs placed by two builds with the same version, from the same samples, settings, camera and
+/// surface, are the same bit for bit. Bump it with any change to what the engine places (smoothing,
+/// spacing, size, dynamics, symmetry, a `Dab`'s values), so a record says which engine its samples
+/// were drawn through.
+pub const ENGINE_VERSION: u32 = 1;
