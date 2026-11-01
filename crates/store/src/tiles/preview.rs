@@ -9,9 +9,12 @@
 //! clears it once no dab it shows is left to land.
 //!
 //! The store keeps a tile's preview ([`TileStore::set_preview`]) and hands it to whoever draws
-//! ([`TileStore::preview`]); it reads none of it itself. Evaluation, the spatial index, raycasts,
-//! the display layer's refresh and every file the store writes see only the store's own tiles: a
-//! preview is never saved, and a save mid-stroke holds what has landed.
+//! ([`TileStore::preview`]), and to the stroke placing the next dabs, which reads the **stroke's
+//! surface**: the store's tiles with the previews in place of theirs
+//! ([`TileStore::surface_positions`], [`TileStore::surface_normals`], and the spatial index's
+//! [`SpatialIndex::raycast_surface`](crate::SpatialIndex::raycast_surface)). Evaluation, the
+//! brush's edits, the display layer's refresh and every file the store writes see only the
+//! store's own tiles: a preview is never saved, and a save mid-stroke holds what has landed.
 //!
 //! # Epochs
 //!
@@ -28,9 +31,10 @@
 //! replacing what a renderer draws from the preview. The refresh drops such tiles (and those
 //! waiting on one), and looks for them again once a preview is cleared.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{Channel, GatheredBlock, Level, Region, TileKey};
+use geom::{Channel, GatheredBlock, Level, Region, TileKey, Vec3};
 
 use super::TileStore;
 use super::error::CacheError;
@@ -40,14 +44,48 @@ use crate::stale::EpochKind;
 /// the last epoch.
 #[derive(Debug, Default)]
 pub(crate) struct Previews {
-    /// Each previewed finest tile's block: its positions with the ring as a renderer draws them;
-    /// `None` while its brush has taken it to move it ([`TileStore::take_preview`]).
-    blocks: BTreeMap<TileKey, Option<GatheredBlock>>,
+    /// Each previewed finest tile: its positions with the ring as a renderer draws them; `None`
+    /// while its brush has taken it to move it ([`TileStore::take_preview`]).
+    blocks: BTreeMap<TileKey, Option<Shown>>,
     /// Per display tile above a previewed finest tile, how many previewed finest tiles lie
     /// under it: the refresh leaves these alone.
     above: BTreeMap<TileKey, usize>,
     /// The finest tiles whose previews were set or cleared since the last preview epoch.
     changed: BTreeSet<TileKey>,
+}
+
+/// A previewed tile: its block, and its own positions and normals as the stroke's surface reads
+/// them.
+#[derive(Debug)]
+struct Shown {
+    /// Its positions with the ring and the base-vertex rings.
+    block: GatheredBlock,
+    /// Its own positions, row-major `side²`: the block without its ring.
+    own: Vec<Vec3>,
+    /// Its unit normals, row-major, from the block ([`GatheredBlock::normals`]), made when first
+    /// read.
+    normals: OnceCell<Vec<Vec3>>,
+    /// Its own positions' blocks, for raycasts, made when first raycast.
+    blocks: OnceCell<crate::index::TileBlocks>,
+}
+
+impl Shown {
+    /// `block`, its own positions taken out.
+    fn new(block: GatheredBlock) -> Self {
+        let quads = i64::from(block.quads());
+        let side = usize::try_from(block.quads()).unwrap_or(0) + 1;
+        let mut own: Vec<Vec3> = Vec::with_capacity(side * side);
+        for j in 0..=quads {
+            let row = block.row(j);
+            own.extend_from_slice(row.get(1..=side).unwrap_or_default());
+        }
+        Self {
+            block,
+            own,
+            normals: OnceCell::new(),
+            blocks: OnceCell::new(),
+        }
+    }
 }
 
 impl Previews {
@@ -90,7 +128,11 @@ impl TileStore {
             return Err(CacheError::NotItsBlock(key));
         }
         let previews = &mut self.previews;
-        if previews.blocks.insert(key, Some(block)).is_none() {
+        if previews
+            .blocks
+            .insert(key, Some(Shown::new(block)))
+            .is_none()
+        {
             for above in Previews::ancestors(&key) {
                 *previews.above.entry(above).or_insert(0) += 1;
             }
@@ -124,7 +166,67 @@ impl TileStore {
     /// to draw them.
     #[must_use]
     pub fn preview(&self, key: &TileKey) -> Option<&GatheredBlock> {
-        self.previews.blocks.get(key)?.as_ref()
+        Some(&self.previews.blocks.get(key)?.as_ref()?.block)
+    }
+
+    /// Finest tile `key`'s own positions as its preview shows them, row-major, if it has one.
+    #[must_use]
+    pub fn preview_positions(&self, key: &TileKey) -> Option<&[Vec3]> {
+        Some(&self.previews.blocks.get(key)?.as_ref()?.own)
+    }
+
+    /// Finest tile `key`'s preview's blocks for raycasts, made on first use and kept with the
+    /// preview, and its own positions, if it has one.
+    pub(crate) fn preview_blocks(
+        &self,
+        key: &TileKey,
+    ) -> Option<(&crate::index::TileBlocks, &[Vec3])> {
+        let shown = self.previews.blocks.get(key)?.as_ref()?;
+        let blocks = shown
+            .blocks
+            .get_or_init(|| crate::index::TileBlocks::new(&shown.own, key.side()));
+        Some((blocks, &shown.own))
+    }
+
+    /// Tile `key`'s positions on the stroke's surface, row-major: its preview's where it has one,
+    /// else as the store evaluates it ([`TileStore::evaluate`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate`].
+    pub fn surface_positions(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
+        if self.preview_positions(&key).is_some() {
+            return Ok(self.preview_positions(&key).unwrap_or_default());
+        }
+        self.evaluate(key)
+    }
+
+    /// Tile `key`'s positions on the stroke's surface if they are at hand without evaluating:
+    /// its preview's, else as cached ([`TileStore::cached_positions`]).
+    #[must_use]
+    pub fn cached_surface_positions(&self, key: &TileKey) -> Option<&[Vec3]> {
+        self.preview_positions(key)
+            .or_else(|| self.cached_positions(key))
+    }
+
+    /// Tile `key`'s unit normals on the stroke's surface, row-major: its preview's (from its
+    /// block with the ring, [`GatheredBlock::normals`], the bits the store's normals of those
+    /// positions would be), else the store's ([`TileStore::normals`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::normals`].
+    pub fn surface_normals(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
+        if !matches!(self.previews.blocks.get(&key), Some(Some(_))) {
+            return self.normals(key);
+        }
+        let mesh = &self.mesh;
+        let shown = self.previews.blocks.get(&key).and_then(Option::as_ref);
+        Ok(shown.map_or(&[][..], |shown| {
+            shown
+                .normals
+                .get_or_init(|| shown.block.normals(mesh).as_slice().to_vec())
+        }))
     }
 
     /// Takes finest tile `key`'s preview out to move it, if it has one: the brush sets it again
@@ -132,7 +234,7 @@ impl TileStore {
     /// preview epoch closes. Meanwhile it counts as previewed (the refresh still waits for it),
     /// and [`TileStore::preview`] has nothing for it.
     pub fn take_preview(&mut self, key: &TileKey) -> Option<GatheredBlock> {
-        self.previews.blocks.get_mut(key)?.take()
+        Some(self.previews.blocks.get_mut(key)?.take()?.block)
     }
 
     /// Every previewed finest tile, in key order.

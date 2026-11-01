@@ -628,7 +628,7 @@ impl WideRay {
 
 /// A tile's blocks: see the module notes.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct TileBlocks {
+pub(crate) struct TileBlocks {
     /// Vertices per side of the tile's grid.
     side: u32,
     /// Blocks per side: the tile's quads per side over [`BLOCK_QUADS`], rounded up.
@@ -647,7 +647,7 @@ impl TileBlocks {
     /// A tile always has them all. Were it short, the blocks would bound the whole rows there
     /// are, and [`TileBlocks::intersect`] test only those, as the exhaustive test does; a debug
     /// build asserts it isn't.
-    pub(super) fn new(positions: &[Vec3], side: u32) -> Self {
+    pub(crate) fn new(positions: &[Vec3], side: u32) -> Self {
         debug_assert!(
             positions.len() >= (side as usize).pow(2),
             "a tile's grid has all its positions"

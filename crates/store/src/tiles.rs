@@ -140,6 +140,7 @@ mod edit;
 mod epochs;
 mod error;
 mod evaluate;
+mod frames;
 #[cfg(test)]
 mod hooks;
 mod layers;

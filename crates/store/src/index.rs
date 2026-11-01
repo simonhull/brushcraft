@@ -31,7 +31,8 @@ pub use bvh::{Bvh, Hit, MAX_TILES, Ray, SphereQuery};
 use geom::{BaseMesh, Level, MAX_LEVEL, TILE_QUADS, TileKey, Vec3};
 use thiserror::Error;
 
-use self::blocks::{BlockCache, SharedBlocks, TileBlocks, WideRay, Written};
+pub(crate) use self::blocks::TileBlocks;
+use self::blocks::{BlockCache, SharedBlocks, WideRay, Written};
 pub use crate::tile_bounds::{Aabb, NormalCone, TileBounds};
 pub use crate::tiles::WaveBounds;
 use crate::tiles::{CacheError, Evaluation, TileStore};
@@ -391,6 +392,80 @@ impl SpatialIndex {
         self.raycast_with(store, ray, |store, key| {
             tile_hit(store, &mut cache, ray, &wide, key)
         })
+    }
+
+    /// [`SpatialIndex::raycast_triangle`] over the stroke's surface: a previewed tile
+    /// ([`TileStore::preview_positions`]) is hit as its preview shows it, every other as the
+    /// store evaluates it. What a stroke places its next dabs on, its dabs not landed yet shown.
+    ///
+    /// A previewed tile's blocks are built from its preview's positions and kept with the preview
+    /// (`TileStore::preview_blocks`), not in the index's cache: the cache's blocks are of the
+    /// store's bits, and a preview changes without the store's writes, its blocks with it. So the
+    /// skipping stays exact on previews too: the exhaustive test's answer, bit for bit. The tree
+    /// finds a previewed tile only where its box holds the preview: a brush showing
+    /// one grows the box to it ([`SpatialIndex::cover`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`SpatialIndex::raycast_triangle`].
+    pub fn raycast_surface(
+        &self,
+        store: &mut TileStore,
+        ray: &Ray,
+    ) -> Result<Option<TriangleHit>, IndexError> {
+        let wide = WideRay::new(ray);
+        let mut cache = self.blocks.lock();
+        self.raycast_with(store, ray, |store, key| {
+            if let Some((blocks, positions)) = store.preview_blocks(&key) {
+                return Ok(blocks.intersect(ray, &wide, positions, key));
+            }
+            tile_hit(store, &mut cache, ray, &wide, key)
+        })
+    }
+
+    /// [`SpatialIndex::raycast_surface`] testing every triangle of each candidate tile, previews
+    /// in place of their tiles: its oracle.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpatialIndex::raycast_triangle`].
+    #[cfg(any(test, feature = "test-oracle"))]
+    pub fn raycast_surface_exhaustive(
+        &self,
+        store: &mut TileStore,
+        ray: &Ray,
+    ) -> Result<Option<TriangleHit>, IndexError> {
+        self.raycast_with(store, ray, |store, key| {
+            Ok(intersect_grid(
+                ray,
+                store.surface_positions(key)?,
+                key.side(),
+                key,
+            ))
+        })
+    }
+
+    /// Grows tile `key`'s box in the tree to hold `aabb` too: a preview's box, so that queries
+    /// and raycasts find the tile where its preview lies. Only the tree's box: the bounds the
+    /// store records (and saves) stay the tile's own, and the next refit of the tile gives it
+    /// back its own box.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::UnknownTile`] for a tile not in the index; nothing is changed then.
+    pub fn cover(&mut self, key: &TileKey, aabb: Aabb) -> Result<(), IndexError> {
+        let bounds = *self.bvh.bounds(key).ok_or(IndexError::UnknownTile(*key))?;
+        let grown = bounds.aabb.union(aabb);
+        if grown == bounds.aabb {
+            return Ok(());
+        }
+        self.bvh.refit(&[(
+            *key,
+            TileBounds {
+                aabb: grown,
+                ..bounds
+            },
+        )])
     }
 
     /// [`SpatialIndex::raycast_triangle`] testing every triangle of each candidate tile: the
