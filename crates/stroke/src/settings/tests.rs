@@ -50,6 +50,18 @@ fn everything() -> StrokeSettings {
 }
 
 #[test]
+fn a_new_radius_keeps_everything_else() {
+    let settings = everything();
+    let resized = settings.clone().with_radius(Radius::new(0.5).unwrap());
+    assert_eq!(resized.radius(), Radius::new(0.5).unwrap());
+    assert_eq!(
+        resized.with_radius(settings.radius()),
+        settings,
+        "every other field as it was"
+    );
+}
+
+#[test]
 fn round_trips_through_bytes() {
     let mirrored = StrokeSettings {
         symmetry: Symmetry::mirror(MirrorPlanes::X | MirrorPlanes::Z),

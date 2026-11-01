@@ -463,6 +463,11 @@ fn keys_change_the_size_and_the_strength_within_bounds() {
     let strength = brush.settings().strength().get();
     assert!(brush.change(BrushChange::Larger));
     assert_eq!(brush.settings().radius().get(), 50.0);
+    assert_eq!(
+        brush.settings().strength_mode(),
+        StrengthMode::Radius,
+        "a new size keeps the strength in radii"
+    );
     assert!(brush.change(BrushChange::Smaller));
     assert!(brush.change(BrushChange::Smaller));
     assert_eq!(brush.settings().radius().get(), 32.0);
@@ -521,6 +526,17 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
     let mut owner = owner_of(project(&dir), Sculpting::new, setup);
     run(&mut owner, 100_000);
     assert!(owner.done(), "the script ran through");
+    let settings = owner.brush().settings();
+    assert_eq!(
+        settings.radius().get(),
+        6.0,
+        "the far stroke's size, set as it entered"
+    );
+    assert_eq!(
+        settings.strength_mode(),
+        StrengthMode::Radius,
+        "still in radii after the script set the size"
+    );
     assert!(owner.project().has_unsaved_edits(), "the strokes edited");
     let lines = owner.record_lines();
     let segments: Vec<&str> = lines

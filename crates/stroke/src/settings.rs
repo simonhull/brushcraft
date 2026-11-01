@@ -500,6 +500,12 @@ impl StrokeSettings {
         Self { strength, ..self }
     }
 
+    /// These settings with the brush's `radius`, in the size mode's unit, everything else kept.
+    #[must_use]
+    pub fn with_radius(self, radius: Radius) -> Self {
+        Self { radius, ..self }
+    }
+
     /// These settings with the brush's strength measured in `mode`.
     #[must_use]
     pub fn with_strength_mode(self, mode: StrengthMode) -> Self {

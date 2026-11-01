@@ -566,20 +566,7 @@ impl Sculpting {
         if radius == self.settings.radius() {
             return false;
         }
-        let Ok(settings) = StrokeSettings::new(
-            *self.settings.path(),
-            self.settings.spacing(),
-            self.settings.size_mode(),
-            radius,
-            self.settings.dynamics().clone(),
-            self.settings.symmetry(),
-            self.settings.action_params(),
-        ) else {
-            return false;
-        };
-        self.settings = settings
-            .with_strength(self.settings.strength())
-            .with_hardness(self.settings.hardness());
+        self.settings = self.settings.clone().with_radius(radius);
         true
     }
 
