@@ -685,3 +685,60 @@ fn a_clone_raycasts_alike() {
         .collect();
     assert_eq!(firsts, again, "a clone, its cache empty, hits the same");
 }
+
+#[test]
+fn blocks_kept_for_one_store_are_not_used_for_another() {
+    // Two stores over the same mesh, one write each, so their counts of writes agree: the
+    // second raises a spike on a tile, the first moves a vertex elsewhere. The index is the
+    // second store's, so its tree holds the spike.
+    let (mut first, mut second) = (sphere(), sphere());
+    let key = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let side = key.side();
+    let (i, j) = (side / 2, side / 2);
+    let at = usize::try_from(j * side + i).unwrap();
+    let before = second.store.evaluate(key).unwrap()[at];
+    first.store.begin_op().unwrap();
+    first
+        .store
+        .set_correction(FaceId::new(3), level(), i, j, Vec3::new(0.0, 0.0, 0.5))
+        .unwrap();
+    second.store.begin_op().unwrap();
+    second
+        .store
+        .set_correction(FaceId::new(0), level(), i, j, Vec3::new(0.0, 0.0, 0.5))
+        .unwrap();
+    second.index.update(&mut second.store, &[key]).unwrap();
+    assert_eq!(
+        first.store.edits(),
+        second.store.edits(),
+        "the stores have written as often"
+    );
+    let moved = second.store.evaluate(key).unwrap()[at];
+    let across = (moved - before)
+        .cross(Vec3::new(0.3, 0.5, 0.7))
+        .normalized()
+        .unwrap();
+    let point = before + (moved - before) * 0.8;
+    let ray = Ray::new(point + across, -across).unwrap();
+    // Over the first store, the tile's blocks are built from its surface, which the ray
+    // passes clear of.
+    let index = &second.index;
+    let missed = index.raycast_triangle(&mut first.store, &ray).unwrap();
+    assert_ne!(
+        missed.map(|hit| hit.key),
+        Some(key),
+        "the first store's tile has no spike"
+    );
+    let spike = index.raycast_triangle(&mut second.store, &ray).unwrap();
+    let every = index.raycast_exhaustive(&mut second.store, &ray).unwrap();
+    assert_eq!(
+        spike.map(|hit| hit.key),
+        Some(key),
+        "the second store's spike is hit"
+    );
+    assert_eq!(
+        hit_bits(spike),
+        hit_bits(every),
+        "the spike's hit, bit for bit"
+    );
+}

@@ -135,11 +135,7 @@ impl Block {
         let quads = side.saturating_sub(1);
         let (i0, j0) = (column * BLOCK_QUADS, row * BLOCK_QUADS);
         let (i1, j1) = ((i0 + BLOCK_QUADS).min(quads), (j0 + BLOCK_QUADS).min(quads));
-        let width = side as usize;
-        let span = |j: u32| {
-            let start = j as usize * width + i0 as usize;
-            positions.get(start..=start + (i1 - i0) as usize)
-        };
+        let span = |j: u32| row_span(positions, side, j, i0..=i1);
         for j in j0..j1 {
             let (Some(bottom), Some(top)) = (span(j), span(j + 1)) else {
                 continue;
@@ -533,6 +529,20 @@ impl Sweep {
     }
 }
 
+/// The vertices `columns` of row `j` of the grid of `side` vertices a side with `positions`;
+/// `None` unless the row is whole there, as the exhaustive test, which takes whole rows only,
+/// sees it.
+fn row_span(
+    positions: &[Vec3],
+    side: u32,
+    j: u32,
+    columns: std::ops::RangeInclusive<u32>,
+) -> Option<&[Vec3]> {
+    let width = side as usize;
+    let row = positions.chunks_exact(width.max(1)).nth(j as usize)?;
+    row.get(*columns.start() as usize..=*columns.end() as usize)
+}
+
 /// The componentwise least of `a` and `b`, passing over a NaN.
 fn least(a: Vec3, b: Vec3) -> Vec3 {
     Vec3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z))
@@ -632,9 +642,16 @@ pub(super) struct TileBlocks {
 }
 
 impl TileBlocks {
-    /// The blocks of the grid of `side` vertices a side with `positions`, row-major. Positions
-    /// past `side²` are ignored; a grid with fewer has blocks for the rows it has.
+    /// The blocks of a tile's grid of `side` vertices a side, its `side²` positions row-major.
+    ///
+    /// A tile always has them all. Were it short, the blocks would bound the whole rows there
+    /// are, and [`TileBlocks::intersect`] test only those, as the exhaustive test does; a debug
+    /// build asserts it isn't.
     pub(super) fn new(positions: &[Vec3], side: u32) -> Self {
+        debug_assert!(
+            positions.len() >= (side as usize).pow(2),
+            "a tile's grid has all its positions"
+        );
         let per_side = side.saturating_sub(1).div_ceil(BLOCK_QUADS);
         let blocks = Sweep::blocks(positions, side).unwrap_or_else(|| {
             let places =
@@ -711,11 +728,7 @@ impl TileBlocks {
         let quads = self.side.saturating_sub(1);
         let (i0, j0) = (column * BLOCK_QUADS, row * BLOCK_QUADS);
         let (i1, j1) = ((i0 + BLOCK_QUADS).min(quads), (j0 + BLOCK_QUADS).min(quads));
-        let width = self.side as usize;
-        let span = |j: u32| {
-            let start = j as usize * width + i0 as usize;
-            positions.get(start..=start + (i1 - i0) as usize)
-        };
+        let span = |j: u32| row_span(positions, self.side, j, i0..=i1);
         for j in j0..j1 {
             let (Some(bottom), Some(top)) = (span(j), span(j + 1)) else {
                 continue;

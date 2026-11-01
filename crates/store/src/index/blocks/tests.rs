@@ -244,32 +244,47 @@ fn blocks_hit_as_every_triangle_does_for_any_seed() {
 
 #[test]
 fn ties_go_to_the_first_triangle_in_row_major_order() {
-    // Two sheets at the same height over each other: every hit on one is at the same `t` on
-    // the other, and the first rows win.
-    let side = 17;
+    // Two sheets at the same height over each other, in different groups of blocks: every hit
+    // on one is at the same `t` on the other, and the first rows win. The first sheet runs
+    // over block rows 0 and 1; block row 2 folds back well below the sheets; the second sheet,
+    // block row 3, lies over the first's first block row. One vertex of the second sheet, away
+    // from where the rays hit, is lifted toward the rays' origins, so its block is entered
+    // first, and its group (the fold makes the group unbounded) is visited first: only the
+    // comparison of places then gives the first sheet's triangle.
+    let side = 33;
     let mut positions = Vec::new();
     for j in 0..side {
         for i in 0..side {
-            let (x, y) = (
-                f32::from(u8::try_from(i).unwrap()),
-                f32::from(u8::try_from(j % 8).unwrap()),
-            );
-            positions.push(Vec3::new(x, y, 0.0));
+            let x = f32::from(u8::try_from(i).unwrap());
+            let p = match j {
+                0..=16 => Vec3::new(x, f32::from(u8::try_from(j).unwrap()), 0.0),
+                17..=23 => Vec3::new(x, f32::from(u8::try_from(24 - j).unwrap()), -5.0),
+                _ => {
+                    let lift = if (i, j) == (6, 31) { 0.5 } else { 0.0 };
+                    Vec3::new(x, f32::from(u8::try_from(j - 24).unwrap()), lift)
+                }
+            };
+            positions.push(p);
         }
     }
     let blocks = TileBlocks::new(&positions, side);
     let mut rng = Rng(7);
     for k in 0..200 {
-        let target = Vec3::new(rng.range(0.0, 16.0), rng.range(0.0, 7.0), 0.0);
+        let target = Vec3::new(rng.range(1.0, 3.0), rng.range(1.0, 3.0), 0.0);
         let origin = target + Vec3::new(rng.range(-1.0, 1.0), rng.range(-1.0, 1.0), 3.0);
         let ray = Ray::new(origin, target - origin).unwrap();
+        let wide = WideRay::new(&ray);
+        let first = blocks.blocks.first().unwrap().reach(&wide).unwrap();
+        let second = blocks.blocks[12].reach(&wide).unwrap();
+        assert!(
+            f64::NEG_INFINITY < second && second < first,
+            "ray {k} enters the second sheet's block first: {second} before {first}"
+        );
         assert!(
             agrees(&positions, side, &blocks, &ray, &format!("tie {k}")),
             "ray {k} hits the sheets"
         );
-        let hit = blocks
-            .intersect(&ray, &WideRay::new(&ray), &positions, key())
-            .unwrap();
+        let hit = blocks.intersect(&ray, &wide, &positions, key()).unwrap();
         assert!(
             hit.j < 8,
             "ray {k}: the first sheet's triangle wins the tie"
@@ -478,5 +493,36 @@ fn a_sweep_bounds_a_block_as_its_quads_do() {
             .flat_map(|row| [0, 1].map(|column| Block::of_quads(short, 17, (column, row))))
             .collect::<Vec<_>>(),
         "a grid short of rows: the rows it has"
+    );
+}
+
+#[test]
+fn a_block_as_near_as_the_best_hit_is_still_tested() {
+    let hit = |t: f32| TriangleHit {
+        key: key(),
+        t,
+        i: 0,
+        j: 0,
+        second: false,
+        u: 0.0,
+        v: 0.0,
+    };
+    assert!(can_hold_better(5.0, None), "nothing found yet");
+    assert!(can_hold_better(1.0, Some(&hit(2.0))), "a nearer block");
+    assert!(
+        can_hold_better(2.0, Some(&hit(2.0))),
+        "a block at the hit's `t`: a tie it may win by place"
+    );
+    assert!(
+        can_hold_better(0.0, Some(&hit(-0.0))),
+        "`0` and `−0` are the same `t`"
+    );
+    assert!(
+        !can_hold_better(2.000_000_1, Some(&hit(2.0))),
+        "a block beyond the hit"
+    );
+    assert!(
+        !can_hold_better(f64::from(f32::INFINITY), Some(&hit(f32::MAX))),
+        "a block at infinity, beyond a finite hit"
     );
 }
