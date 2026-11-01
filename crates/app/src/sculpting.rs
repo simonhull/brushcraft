@@ -1049,10 +1049,10 @@ impl Sculpting {
             };
             let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
             let (count, predicted) = self.cost.take(tiles, room, first && forced);
-            if count > 0 {
-                let began = Instant::now();
-                self.apply_front(scene, report, count);
-                self.cost.observe(predicted, began.elapsed());
+            if count > 0
+                && let Some(took) = self.apply_front(scene, report, count)
+            {
+                self.cost.observe(predicted, took);
             }
             if !self.strokes.front().is_some_and(Pending::done) {
                 return;
@@ -1064,12 +1064,19 @@ impl Sculpting {
     }
 
     /// Applies the oldest stroke's first `count` queued dabs in one [`apply_dabs`], adding to
-    /// `report`. A store error drops the stroke's dabs left, ends its engine stroke, and has the
-    /// spatial index rebuilt.
-    fn apply_front(&mut self, scene: &mut Scene<'_>, report: &mut BrushReport, count: usize) {
-        let Some(front) = self.strokes.front_mut() else {
-            return;
-        };
+    /// `report`, and lands those of them shown. A store error drops the stroke's dabs left, ends
+    /// its engine stroke, and has the spatial index rebuilt.
+    ///
+    /// Returns how long [`apply_dabs`] took, what the cost model learns from ([`DabCost`] models
+    /// the finest work alone, not the landing's previews made again); `None` if there was no
+    /// stroke.
+    fn apply_front(
+        &mut self,
+        scene: &mut Scene<'_>,
+        report: &mut BrushReport,
+        count: usize,
+    ) -> Option<Duration> {
+        let front = self.strokes.front_mut()?;
         // Dabs shown already count for the frame that showed them.
         let sources = front
             .sources
@@ -1087,7 +1094,9 @@ impl Sculpting {
         let landing = front.sources.iter().take(count).filter(|s| s.shown).count();
         let dabs: &[Dab] = front.dabs.make_contiguous();
         let batch = dabs.get(..count).unwrap_or(dabs);
+        let began = Instant::now();
         let applied = apply_dabs(scene.project.store(), scene.index, &mut self.state, batch);
+        let took = began.elapsed();
         match applied {
             Ok(stats) => {
                 front.dabs.drain(..count);
@@ -1108,6 +1117,7 @@ impl Sculpting {
                 self.land(scene, dropped, true);
             }
         }
+        Some(took)
     }
 
     /// Lands the oldest `count` dabs shown (applied, or dropped), making the previews they moved
