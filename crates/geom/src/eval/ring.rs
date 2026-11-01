@@ -108,6 +108,24 @@ impl GatheredBlock {
         self.padded.row(j)
     }
 
+    /// Moves every point the block holds through `f`: its positions, ring included, and its
+    /// base-vertex rings' points. Slots without a vertex (NaN) stay as they are; `f` isn't called
+    /// for them.
+    ///
+    /// Every block holding a vertex holds its bits (its owner's), so an `f` that is a function of
+    /// a point's bits alone moves the vertex to the same new bits in every block, on every face:
+    /// blocks so moved still meet bit for bit. That is what a preview of a brush stroke does to
+    /// the finest tiles it shows ahead of their evaluation.
+    pub fn displace(&mut self, mut f: impl FnMut(Vec3) -> Vec3) {
+        let finite = |v: &Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+        let slots = self.padded.as_mut_slice().iter_mut();
+        let rings = self.corners.iter_mut().flatten();
+        let ring_points = rings.flat_map(|ring| ring.ring.points_mut());
+        for point in slots.chain(ring_points).filter(|p| finite(p)) {
+            *point = f(*point);
+        }
+    }
+
     /// The ring of the base vertex at block corner `c` (`0..4`: `(0, 0)`, `(q, 0)`, `(q, q)`,
     /// `(0, q)`), or `None` if that corner isn't a base vertex.
     #[must_use]

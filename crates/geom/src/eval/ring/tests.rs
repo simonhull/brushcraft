@@ -485,3 +485,89 @@ fn a_ring_point_that_isnt_finite_gives_nan_at_its_base_vertex() {
         "the reference agrees"
     );
 }
+
+#[test]
+fn a_displaced_block_moves_every_point_through_the_function_and_leaves_the_gaps() {
+    let mesh = cube_sphere(1).expect("a valid mesh");
+    let dense = evaluated(&mesh, 7, 3);
+    let key = TileKey::displacement(FaceId::new(2), level(7), 0, 1).expect("a tile");
+    let gathered = gather_block(&mesh, &dense, Region::of_tile(&key)).expect("gathers");
+    let shift = |p: Vec3| Vec3::new(p.x * 2.0, p.y - 1.0, p.z + 0.5);
+    let mut moved = gathered.clone();
+    moved.displace(shift);
+    let pairs = gathered.padded().iter().zip(moved.padded());
+    for (before, after) in pairs {
+        if before.x.is_nan() {
+            assert!(after.x.is_nan(), "a gap stays a gap");
+        } else {
+            assert_eq!(after.to_bits(), shift(*before).to_bits(), "moved as f says");
+        }
+    }
+    let corners = (0..4).filter_map(|c| Some((gathered.corner(c)?, moved.corner(c)?)));
+    let mut rings = 0;
+    for (before, after) in corners {
+        rings += 1;
+        assert_eq!(after.center().to_bits(), shift(before.center()).to_bits());
+        let points = before.edges().iter().chain(before.diagonals());
+        let moved_points = after.edges().iter().chain(after.diagonals());
+        for (b, a) in points.zip(moved_points) {
+            assert_eq!(a.to_bits(), shift(*b).to_bits(), "a ring point moved too");
+        }
+    }
+    assert!(
+        rings > 0,
+        "the tile on a face corner has a base-vertex ring"
+    );
+}
+
+#[test]
+fn blocks_displaced_by_one_function_of_position_still_meet_bit_for_bit() {
+    let mesh = cube_sphere(1).expect("a valid mesh");
+    let dense = evaluated(&mesh, 7, 13);
+    let top = level(7);
+    let mut displaced = blocks(&mesh, &dense, top);
+    // A bump about a face's corner vertex, so it reaches across tile and face seams.
+    let centre = dense
+        .position(FaceId::new(0), top, 0, 0)
+        .expect("a corner vertex");
+    let bump = |p: Vec3| {
+        let d = p - centre;
+        let w = (0.3 - (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()).max(0.0);
+        p + Vec3::new(w, -w * 0.5, w * 0.25)
+    };
+    for block in displaced.values_mut() {
+        block.displace(bump);
+    }
+    let n = top.face_quads();
+    let topology = mesh.topology();
+    let mut seen: BTreeMap<(FaceId, u32, u32), [u32; 3]> = BTreeMap::new();
+    let (mut shared, mut moved) = (0, 0);
+    for (key, block) in &displaced {
+        let region = block.region();
+        let q = region.quads();
+        for j in 0..=q {
+            for i in 0..=q {
+                let (fi, fj) = (region.x0() + i, region.y0() + j);
+                let owner = topology
+                    .owner_copy(key.face(), n, fi, fj)
+                    .expect("a vertex of the face");
+                let bits = block.get(i64::from(i), i64::from(j)).to_bits();
+                if let Some(&first) = seen.get(&owner) {
+                    shared += 1;
+                    assert_eq!(first, bits, "{owner:?}: every copy moved alike");
+                } else {
+                    seen.insert(owner, bits);
+                }
+                let before = dense
+                    .position(key.face(), top, fi, fj)
+                    .expect("evaluated")
+                    .to_bits();
+                if before != bits {
+                    moved += 1;
+                }
+            }
+        }
+    }
+    assert!(shared > 0, "tiles share border vertices");
+    assert!(moved > 0, "the bump moved vertices");
+}

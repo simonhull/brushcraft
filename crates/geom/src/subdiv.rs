@@ -41,6 +41,11 @@ impl Padded {
         &self.data
     }
 
+    /// Every slot, ring included, row-major from `(-1, -1)`, writable.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [Vec3] {
+        &mut self.data
+    }
+
     /// The bytes the block holds on the heap: its slots' allocation.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.data.capacity().saturating_mul(size_of::<Vec3>())
@@ -154,6 +159,17 @@ impl CornerRing {
     /// The diagonal neighbours, in ring order.
     pub(crate) fn diagonals(&self) -> &[Vec3] {
         self.diagonals.get(..self.valence).unwrap_or_default()
+    }
+
+    /// Every point of the ring, the centre first, then the edge and the diagonal neighbours,
+    /// writable.
+    pub(crate) fn points_mut(&mut self) -> impl Iterator<Item = &mut Vec3> {
+        let valence = self.valence;
+        let edges = self.edges.iter_mut().take(valence);
+        let diagonals = self.diagonals.iter_mut().take(valence);
+        std::iter::once(&mut self.center)
+            .chain(edges)
+            .chain(diagonals)
     }
 }
 
