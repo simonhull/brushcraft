@@ -31,8 +31,15 @@
 //!
 //! A reader refuses any other version, a reserved byte set, a reserved site's op, a start time
 //! that isn't finite, a length or count past its limit, a frame that doesn't decompress to the
-//! stated size, and a sample that isn't canonical (a twist or tilt direction with no tilt, see
-//! [`PenSample`]).
+//! stated size, and a sample that isn't canonical (a tilt direction with no tilt, see
+//! [`PenSample`]; a twist with no tilt is valid).
+//!
+//! # Where records live
+//!
+//! No Index names a stroke record: a save point holds every stroke record before it in the
+//! file, and a file holds at most one record of an op. Compaction (`crate::file::compact`) keeps
+//! the latest state only and drops every stroke record: which history to keep is decided with
+//! stroke history in M2.
 
 use std::f64::consts::{FRAC_PI_2, TAU};
 
@@ -57,6 +64,18 @@ const VERSION: u8 = 1;
 /// Payload bytes before the compressed frame: version and reserved bytes, op, engine, camera,
 /// start time, settings length and sample count.
 const FIXED: usize = 4 + 8 + 4 + CAMERA_BYTES + 8 + 4 + 4;
+
+/// Where the op is in a payload: after the version and reserved bytes. Fixed in every version,
+/// so a file can tell which strokes it holds records of without decoding them.
+pub(crate) const OP_AT: usize = 4;
+
+/// The longest payload a writer makes: the fixed fields, then a zstd frame of the longest
+/// settings and the most samples, which zstd never expands by more than 1/128 plus a small
+/// constant.
+pub(crate) const MAX_STROKE_PAYLOAD: usize = {
+    let raw = MAX_STROKE_SETTINGS + SAMPLE_BYTES * MAX_STROKE_SAMPLES;
+    FIXED + raw + raw / 128 + 1024
+};
 
 /// Bytes of the camera: nine `f64`s of eye, target and up, the field of view, two `u32`s of size.
 const CAMERA_BYTES: usize = 10 * 8 + 2 * 4;
@@ -382,7 +401,8 @@ fn put_row(out: &mut [u8; SAMPLE_BYTES], fields: [u32; 8]) {
         .iter()
         .zip(fields)
         .flat_map(|(&bits, value)| value.to_le_bytes().into_iter().take(field_bytes(bits)));
-    for (slot, byte) in out.iter_mut().zip(bytes) {
+    let slots = out.iter_mut().zip(bytes);
+    for (slot, byte) in slots {
         *slot = byte;
     }
 }
@@ -391,9 +411,11 @@ fn put_row(out: &mut [u8; SAMPLE_BYTES], fields: [u32; 8]) {
 fn read_row(row: &[u8; SAMPLE_BYTES]) -> [u32; 8] {
     let mut fields = [0; 8];
     let mut at = row.iter();
-    for (field, &bits) in fields.iter_mut().zip(&FIELD_BITS) {
+    let widths = fields.iter_mut().zip(&FIELD_BITS);
+    for (field, &bits) in widths {
         let mut le = [0; 4];
-        for (slot, &byte) in le.iter_mut().zip(at.by_ref().take(field_bytes(bits))) {
+        let bytes = le.iter_mut().zip(at.by_ref().take(field_bytes(bits)));
+        for (slot, &byte) in bytes {
             *slot = byte;
         }
         *field = u32::from_le_bytes(le);
@@ -405,7 +427,7 @@ fn read_row(row: &[u8; SAMPLE_BYTES]) -> [u32; 8] {
 /// opaque bytes, the camera and its samples, quantized (see the module notes).
 ///
 /// Built with [`StrokeRecord::new`] and [`StrokeRecord::push`], one sample at a time, then handed
-/// to [`crate::Project::end_stroke_with`]; read back by
+/// to [`crate::Project::end_stroke`]; read back by
 /// [`ProjectFile::strokes`](crate::ProjectFile::strokes), for tools and tests only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StrokeRecord {
@@ -514,6 +536,19 @@ impl StrokeRecord {
         self.samples.is_empty()
     }
 
+    /// Frames the record as a stroke end does, delta coding and compression included, and
+    /// returns the framed length: what `benches/stroke_record.rs` times. Built only with the
+    /// `bench` feature.
+    ///
+    /// # Errors
+    ///
+    /// As framing at a stroke end: the compressor's I/O error.
+    #[cfg(feature = "bench")]
+    #[doc(hidden)]
+    pub fn framed_len(&self) -> Result<usize, crate::FileError> {
+        crate::file::frame_stroke(self).map(|framed| framed.len())
+    }
+
     /// The samples, in order, as quantized (see [`PenSample`] for how far each field may be
     /// from what was pushed).
     pub fn samples(&self) -> impl ExactSizeIterator<Item = PenSample> + '_ {
@@ -609,22 +644,23 @@ fn planes(samples: &[Quantized]) -> Vec<u8> {
     let n = samples.len();
     let mut out = vec![0; n * SAMPLE_BYTES];
     let mut previous = [0; 8];
-    for (i, sample) in samples.iter().enumerate() {
+    let rows = samples.iter().enumerate();
+    for (i, sample) in rows {
         let fields = sample.fields();
         let mut coded = [0; 8];
-        for (((slot, &value), &before), &bits) in coded
+        let columns = coded
             .iter_mut()
             .zip(&fields)
             .zip(&previous)
-            .zip(&FIELD_BITS)
-        {
+            .zip(&FIELD_BITS);
+        for (((slot, &value), &before), &bits) in columns {
             *slot = delta(value, before, bits);
         }
         previous = fields;
         let mut row = [0; SAMPLE_BYTES];
         put_row(&mut row, coded);
-        let targets = out.iter_mut().skip(i).step_by(n.max(1));
-        for (slot, byte) in targets.zip(row) {
+        let targets = out.iter_mut().skip(i).step_by(n.max(1)).zip(row);
+        for (slot, byte) in targets {
             *slot = byte;
         }
     }
@@ -637,18 +673,18 @@ fn unplane(planes: &[u8], count: usize) -> Option<Vec<Quantized>> {
     let mut previous = [0; 8];
     for i in 0..count {
         let mut row = [0; SAMPLE_BYTES];
-        let sources = planes.iter().skip(i).step_by(count);
-        for (slot, &byte) in row.iter_mut().zip(sources) {
+        let sources = row.iter_mut().zip(planes.iter().skip(i).step_by(count));
+        for (slot, &byte) in sources {
             *slot = byte;
         }
         let coded = read_row(&row);
         let mut fields = [0; 8];
-        for (((slot, &zig), &before), &bits) in fields
+        let columns = fields
             .iter_mut()
             .zip(&coded)
             .zip(&previous)
-            .zip(&FIELD_BITS)
-        {
+            .zip(&FIELD_BITS);
+        for (((slot, &zig), &before), &bits) in columns {
             *slot = undelta(zig, before, bits);
         }
         previous = fields;
@@ -735,7 +771,8 @@ pub(crate) mod tests {
     fn every_field_comes_back_within_its_stated_error() {
         let record = wobbly(OpId::new(0, 1).unwrap(), 200, 3);
         let pushed = (0..200).map(|k| sample_at(k, 3));
-        for (k, (given, kept)) in pushed.zip(record.samples()).enumerate() {
+        let pairs = pushed.zip(record.samples()).enumerate();
+        for (k, (given, kept)) in pairs {
             let near = |a: f64, b: f64, error: f64, what: &str| {
                 assert!(
                     (a - b).abs() <= error,
@@ -833,7 +870,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let xs = [-262_144.0, 262_143.0, -0.5, 0.0, 17.25, -17.25];
-        for (k, &x) in (0_u32..).zip(&xs) {
+        let numbered = (0_u32..).zip(&xs);
+        for (k, &x) in numbered {
             record
                 .push(&PenSample {
                     x,

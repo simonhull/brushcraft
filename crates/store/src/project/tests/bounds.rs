@@ -30,7 +30,7 @@ pub(super) fn indexed_stroke(
             .update(project.store(), &tiles(&mesh, TOP, TOP))
             .unwrap();
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn derived_bounds_skip_the_recovery_file_and_reach_the_saved_one() {
     let (_, loaded) = project.load_index(top(), |_, _| {}).unwrap();
     assert_eq!(loaded.stored, 0, "nothing stored: every bound computed");
     project.begin_stroke().unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     poll_until_idle(&mut project);
     assert_eq!(
         project.store().working().bounds_locations().count(),
@@ -168,7 +168,7 @@ fn edit_interior(project: &mut Project, index: &mut SpatialIndex, key: TileKey, 
         )
         .unwrap();
     index.update(project.store(), refit).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 }
 
 /// A roll-over carries the bounds the failed recovery file held into the new one: those flushed
@@ -290,7 +290,7 @@ fn a_bound_recorded_over_a_pending_edit_is_flushed() {
         )
         .unwrap();
     index.update(project.store(), &all).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     poll_until_idle(&mut project);
     let flushed = project.store().working().bounds_locations().count();
     assert!(

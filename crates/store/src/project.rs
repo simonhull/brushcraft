@@ -216,9 +216,9 @@ pub enum ProjectError {
         #[source]
         source: io::Error,
     },
-    /// [`Project::end_stroke_with`] was given the record of another stroke than the one
-    /// ending: its op isn't the store's current one. Nothing was recorded, and the stroke didn't
-    /// end.
+    /// [`Project::end_stroke`] was given the record of another stroke than the one ending: its
+    /// op isn't the one [`Project::begin_stroke`] returned for it. Nothing was recorded, and the
+    /// stroke didn't end.
     #[error("a record of op {record:?} for the stroke of op {stroke:?}")]
     NotTheStroke {
         /// The record's op.
@@ -226,6 +226,10 @@ pub enum ProjectError {
         /// The op of the stroke ending, if one is.
         stroke: Option<OpId>,
     },
+    /// [`Project::end_stroke`] was given a record of an op it has kept a record of already: the
+    /// stroke ended then, and its record is kept once. Nothing was recorded again.
+    #[error("the stroke of op {0:?} has its record already")]
+    AlreadyRecorded(OpId),
 }
 
 /// An old recovery file a save couldn't delete: it holds nothing the project needs any more
@@ -419,6 +423,12 @@ pub struct Project {
     /// a new recovery file replaces it or a save makes it unneeded: it is released only through
     /// [`Project::let_go`].
     stranded: Option<ProjectFile>,
+    /// The op of the stroke open now: the one [`Project::begin_stroke`] returned, until the
+    /// stroke ends. Kept across a save, which ends the store's op (its later edits take a new
+    /// one), so the stroke's record still lands.
+    stroke: Option<OpId>,
+    /// The op of the last stroke record kept: a second record of it is refused.
+    recorded: Option<OpId>,
     /// Test hook: makes the next placement of a recovery file a save or a roll-over makes fail
     /// after its temporary file is written and synced, before the rename, with an I/O error of
     /// this kind (see [`Unplaced::crash`](place::Unplaced::crash)).
@@ -674,6 +684,8 @@ impl Project {
             retry_after: ROLL_OVER_RETRY,
             held: Vec::new(),
             stranded: None,
+            stroke: None,
+            recorded: None,
             #[cfg(test)]
             fail_next_recovery: None,
             #[cfg(test)]
@@ -922,21 +934,42 @@ impl Project {
     }
 
     /// A stroke begins: starts a new op in the store ([`TileStore::begin_op`]), which every
-    /// edit of the stroke is part of, however many dabs it takes, and returns it.
+    /// edit of the stroke is part of, however many dabs it takes, and returns it: the op the
+    /// stroke's record is made with ([`Project::end_stroke`]).
     ///
     /// # Errors
     ///
     /// [`ProjectError::Cache`] with [`CacheError::OpsExhausted`] if the site's ops are used up.
     pub fn begin_stroke(&mut self) -> Result<OpId, ProjectError> {
-        Ok(self.store.begin_op()?)
+        let op = self.store.begin_op()?;
+        self.stroke = Some(op);
+        Ok(op)
     }
 
-    /// A stroke ended: flushes its edits to the recovery file in the background (see
-    /// [`RecoveryWriter::end_stroke`]). No record of the stroke is kept: the app's strokes end
-    /// with [`Project::end_stroke_with`]; this suits edits that no pen made (tools, tests).
+    /// A stroke ended, leaving `record`: flushes its edits to the recovery file in the
+    /// background (see [`RecoveryWriter::end_stroke`]), with the record kept beside them.
+    ///
+    /// The flush the stroke end starts appends the record before its save point, so the
+    /// recovery file holds it from the save point that holds the stroke's last edits, and a save
+    /// copies it into the project file. Opening a file never reads it (see [`StrokeRecord`]);
+    /// [`ProjectFile::strokes`] reads them back, for tools and tests.
+    ///
+    /// `record`'s op must be the one [`Project::begin_stroke`] returned for this stroke. That
+    /// holds across a save in the middle of the stroke, which moves the store's later edits to a
+    /// new op: the record still lands, once.
+    ///
+    /// The record is compressed here, on the calling thread: a few kilobytes of samples.
     ///
     /// # Errors
     ///
+    /// Refused, with nothing recorded and the stroke still open:
+    /// [`ProjectError::NotTheStroke`] if `record`'s op isn't the open stroke's;
+    /// [`ProjectError::Cache`] if compressing it fails.
+    ///
+    /// [`ProjectError::AlreadyRecorded`] if a record of its op was kept already: the stroke has
+    /// ended, so a call made again after an error below never records it twice.
+    ///
+    /// Once the record is kept, the stroke has ended, whatever follows:
     /// [`ProjectError::Recovery`] if the recovery writer fails, unless the failure was a sync,
     /// or a stopped writer thread, which the project deals with by moving to a new recovery
     /// file holding every edit;
@@ -945,33 +978,32 @@ impl Project {
     /// failing); [`ProjectError::OldRecoveryKept`] if it moved, but couldn't delete the old
     /// file; [`ProjectError::Unprotected`] for tiles whose edits aren't in the recovery file,
     /// once nothing else is to be reported.
-    pub fn end_stroke(&mut self) -> Result<(), ProjectError> {
-        self.end_stroke_at(Instant::now())
-    }
-
-    /// A stroke ended, leaving `record`: as [`Project::end_stroke`], with the record kept beside
-    /// the stroke's edits. The flush the stroke end starts appends it before its save point, so
-    /// the recovery file holds it from the save point that holds the stroke's last edits, and a
-    /// save copies it into the project file. Opening a file never reads it (see
-    /// [`StrokeRecord`]); [`ProjectFile::strokes`] reads them back, for tools and tests.
-    ///
-    /// The record is compressed here, on the calling thread: a few kilobytes of samples.
-    ///
-    /// # Errors
-    ///
-    /// [`ProjectError::NotTheStroke`] if `record`'s op isn't the stroke's (the store's current
-    /// op), and [`ProjectError::Cache`] if compressing it fails: nothing is recorded then, and the
-    /// stroke hasn't ended (call again, or [`Project::end_stroke`]). Then as
-    /// [`Project::end_stroke`].
-    pub fn end_stroke_with(&mut self, record: &StrokeRecord) -> Result<(), ProjectError> {
-        let stroke = self.store.current_op();
-        if stroke != Some(record.op()) {
+    pub fn end_stroke(&mut self, record: &StrokeRecord) -> Result<(), ProjectError> {
+        let op = record.op();
+        if self.recorded == Some(op) {
+            return Err(ProjectError::AlreadyRecorded(op));
+        }
+        if self.stroke != Some(op) {
             return Err(ProjectError::NotTheStroke {
-                record: record.op(),
-                stroke,
+                record: op,
+                stroke: self.stroke,
             });
         }
         self.store.record_stroke(record)?;
+        self.recorded = Some(op);
+        self.stroke = None;
+        self.end_stroke_at(Instant::now())
+    }
+
+    /// A stroke ended with no record of it: as [`Project::end_stroke`] otherwise. For tools,
+    /// tests and benches only, whose edits no pen made; the app's strokes end with
+    /// [`Project::end_stroke`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::end_stroke`] once its record is kept.
+    pub fn end_unrecorded_stroke(&mut self) -> Result<(), ProjectError> {
+        self.stroke = None;
         self.end_stroke_at(Instant::now())
     }
 

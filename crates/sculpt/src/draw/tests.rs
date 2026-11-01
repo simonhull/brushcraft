@@ -284,7 +284,7 @@ fn one_step_moves_exactly_the_vertices_within_the_radius_by_the_falloff() {
     project.begin_stroke().unwrap();
     let mut stroke = Stroke::new(project.store());
     let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     assert_eq!(stats.tiles_unaccumulated, 0, "every tile keeps its state");
 
     let mut map = CorrectionMap::new();
@@ -352,7 +352,7 @@ fn twins_stay_bit_identical() {
         )
         .unwrap();
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     assert_twins(project.store(), level);
 }
 
@@ -365,7 +365,7 @@ fn bounds_after_a_step_equal_bounds_built_from_scratch() {
     project.begin_stroke().unwrap();
     let mut stroke = Stroke::new(project.store());
     let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     assert!(
         stats.tiles_updated > stats.tiles_edited,
         "neighbours' normals turn too: {stats:?}"
@@ -399,7 +399,7 @@ fn a_stroke_of_overlapping_steps_matches_dense_after_each_step() {
         assert!(moved > 0, "step {k} reaches the surface");
         assert_as_dense(project.store(), &map, level, &format!("after step {k}"));
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     assert_bounds_fresh(project.store(), &index);
 }
 
@@ -435,7 +435,7 @@ fn a_step_at_a_valence_5_vertex_matches_dense_and_keeps_its_five_copies_in_step(
         );
         assert_as_dense(project.store(), &map, level, &format!("after step {k}"));
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     assert_twins(project.store(), level);
     assert_bounds_fresh(project.store(), &index);
 }
@@ -519,7 +519,7 @@ fn normals_after_random_steps_equal_a_full_recompute_at_any_thread_count() {
                 &format!("{threads} threads, step {k} on face {face} near ({i}, {j})"),
             );
         }
-        project.end_stroke().unwrap();
+        project.end_unrecorded_stroke().unwrap();
         let store = project.store();
         let all: Vec<Vec<[u32; 3]>> = tiles(&mesh, level)
             .into_iter()
@@ -550,7 +550,7 @@ fn a_brush_away_from_the_surface_changes_nothing() {
     let mut stroke = Stroke::new(project.store());
     let params = DrawParams::new(Vec3::new(0.0, 0.0, 0.0), 0.1, 1.0).unwrap();
     let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     assert_eq!(
         (
             stats.candidates,
@@ -688,7 +688,7 @@ fn light_dabs_move_a_tiles_interior_as_far_as_its_border() {
     let mut first = Stroke::new(project.store());
     let strong = DrawParams::new(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
     draw_step(project.store(), &mut index, &mut first, strong).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let scale = project.store().correction(key).unwrap().scale();
     assert!(scale > 0.0, "the strong dab set a scale");
 
@@ -701,7 +701,7 @@ fn light_dabs_move_a_tiles_interior_as_far_as_its_border() {
     for _ in 0..10 {
         draw_step(project.store(), &mut index, &mut stroke, light).unwrap();
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let (inside, border) = assert_moved_by_dabs(project.store(), key, &before, light, 10.0, 0.5);
     assert!(border > 0, "the brush reaches the tile's border");
     assert!(inside > border, "and its interior");
@@ -742,7 +742,7 @@ fn strong_stroke(project: &mut Project, index: &mut SpatialIndex, level: Level) 
     let mut stroke = Stroke::new(project.store());
     let strong = DrawParams::new(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
     draw_step(project.store(), index, &mut stroke, strong).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let scale = project.store().correction(key).unwrap().scale();
     assert!(scale > 0.0, "the strong dab set a scale");
     (key, scale)
@@ -776,7 +776,7 @@ fn a_strokes_writes_are_the_same_at_any_worker_count() {
             };
             draw_step(project.store(), &mut index, &mut stroke, params.unwrap()).unwrap();
         }
-        project.end_stroke().unwrap();
+        project.end_unrecorded_stroke().unwrap();
         finals.push(snapshot(project.store(), level));
     }
     assert!(
@@ -812,7 +812,7 @@ fn a_released_tile_revisited_stays_within_one_step() {
             assert!(stroke.tiles_held() <= 3, "no more than the store set aside");
         }
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let (inside, _) = assert_moved_by_dabs(project.store(), key, &before, light, 10.0, 1.0);
     assert!(inside > 0, "the brush reaches the tile");
 }
@@ -839,7 +839,7 @@ fn tiles_edited_in_the_last_dabs_keep_their_state() {
             assert_eq!(stats.tiles_unaccumulated, want, "face {face}");
         }
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let (inside, _) = assert_moved_by_dabs(project.store(), key, &before, light, 10.0, 0.5);
     assert!(inside > 0, "the brush reaches the tile");
 }
@@ -854,7 +854,7 @@ fn a_dab_past_the_thrash_limit_writes_its_overflow_tiles_per_dab_and_does_not_fa
         project.begin_stroke().unwrap();
         let mut stroke = Stroke::new(project.store());
         let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
-        project.end_stroke().unwrap();
+        project.end_unrecorded_stroke().unwrap();
         assert_eq!(
             stroke.tiles_held(),
             stroke_tiles.min(stats.tiles_edited),
@@ -924,7 +924,7 @@ fn a_new_stroke_starts_afresh() {
                 stroke.holds(&key),
                 "the tile owning the border has the state"
             );
-            project.end_stroke().unwrap();
+            project.end_unrecorded_stroke().unwrap();
         }
         snapshot(project.store(), level)
     };
@@ -963,7 +963,7 @@ fn a_reused_buffer_starts_with_no_sums() {
         let stats = draw_step(project.store(), &mut index, &mut stroke, light).unwrap();
         unaccumulated.push(stats.tiles_unaccumulated);
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     assert_eq!(
         unaccumulated,
         [1, 1, 1, 0, 0],
@@ -995,7 +995,7 @@ fn a_scale_that_grows_mid_stroke_keeps_vertices_within_a_step() {
     for _ in 0..10 {
         draw_step(project.store(), &mut index, &mut stroke, light).unwrap();
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let grown = project.store().correction(key).unwrap().scale();
     assert!(grown >= 2.0 * scale, "the scale grew: {scale} to {grown}");
     let (inside, _) = assert_moved_by_dabs(project.store(), key, &before, light, 20.0, 1.0);
@@ -1016,7 +1016,7 @@ fn a_stroke_used_over_another_project_starts_afresh() {
             .unwrap_or_else(|| Stroke::new(project.store()));
         project.begin_stroke().unwrap();
         border_dabs(&mut project, &mut index, &mut stroke, level, 0, scale);
-        project.end_stroke().unwrap();
+        project.end_unrecorded_stroke().unwrap();
         assert_eq!(stroke.buffers(), 3, "the second store's reservation");
         snapshot(project.store(), level)
     };
@@ -1064,7 +1064,7 @@ fn a_project_reopened_after_discarding_a_stroke_starts_afresh() {
         let mut stroke = Stroke::new(project.store());
         project.begin_stroke().unwrap();
         border_dabs(&mut project, &mut index, &mut stroke, level, 0, scale);
-        project.end_stroke().unwrap();
+        project.end_unrecorded_stroke().unwrap();
         // Closed unsaved, its recovery file deleted: the reopened project hands out the
         // discarded strokes' op ids again.
         project.close(false).unwrap();
@@ -1083,7 +1083,7 @@ fn a_project_reopened_after_discarding_a_stroke_starts_afresh() {
             0,
             rescale,
         );
-        reopened.end_stroke().unwrap();
+        reopened.end_unrecorded_stroke().unwrap();
         snapshot(reopened.store(), level)
     };
     assert!(
@@ -1129,5 +1129,5 @@ fn a_stroke_saved_part_way_goes_on_from_the_save() {
             &format!("dab {k} after the save"),
         );
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 }

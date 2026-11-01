@@ -66,7 +66,7 @@ fn stroke(project: &mut Project, map: &mut CorrectionMap, count: u32, seed: u64)
     let edits = random_edits(&project.store().working().mesh(), TOP, count, seed);
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), map, &edits);
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 }
 
 /// Asserts that the index loaded from the project file at `path`, at its latest save point, is
@@ -1232,7 +1232,7 @@ fn stroke_failing_its_sync(project: &mut Project, map: &mut CorrectionMap, count
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), map, &edits);
     project.writer.as_ref().unwrap().fail_syncs(0, 1);
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 }
 
 /// A close whose last flush fails to sync rolls over first, so the recovery file it keeps
@@ -1310,7 +1310,7 @@ fn interior(project: &mut Project, maps: &mut [&mut CorrectionMap], key: TileKey
         )
         .unwrap();
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 }
 
 /// A saved project with an edit readable nowhere.
@@ -1450,7 +1450,7 @@ fn a_save_goes_through_and_then_reports_what_is_unprotected() {
         .unwrap()
         .unwrap();
     break_slot(project.store(), &broken);
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let outcome = project.save().unwrap();
     assert_eq!(
         outcome.unprotected,

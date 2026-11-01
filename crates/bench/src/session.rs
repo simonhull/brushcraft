@@ -136,8 +136,8 @@ pub(crate) enum Detail {
 /// With `per_call` `None`, each dab is a [`draw_step`], the path the history measures; with
 /// `Some(n)`, the dabs go `n` to a call of [`apply_dabs`] (hardness 0, so the same draw brush),
 /// a frame's path, and each record is a call's. The calls run between [`Project::begin_stroke`]
-/// and [`Project::end_stroke`], each watched as `detail` says. `stroke_state` is the session's
-/// one stroke state ([`Stroke`]), which starts afresh with the stroke.
+/// and [`Project::end_unrecorded_stroke`], each watched as `detail` says. `stroke_state` is the
+/// session's one stroke state ([`Stroke`]), which starts afresh with the stroke.
 ///
 /// # Errors
 ///
@@ -208,7 +208,9 @@ pub(crate) fn stroke(
             minor_faults,
         });
     }
-    project.end_stroke().context("ending the stroke")?;
+    project
+        .end_unrecorded_stroke()
+        .context("ending the stroke")?;
     Ok(dabs)
 }
 

@@ -32,7 +32,7 @@ use self::format::{
 };
 use self::lock::{Access, Lock, LockedFile, open_locked, open_readable, open_writable};
 use self::reader::read_displacement_at;
-use self::stroke_io::stroke_locs;
+use self::stroke_io::{read_stroke_at, stroke_locs};
 use crate::OpId;
 use crate::bounds::bounds_payload;
 use crate::codec::{CodecError, compress, decompress, encode_displacement};
@@ -66,6 +66,8 @@ pub use format::{MAX_MESH_RAW, MAX_RAW};
 pub(crate) use lock::open_regular;
 pub(crate) use reader::{FileReader, FileSyncer, FramedTile, ReadScratch, frame_displacement};
 pub(crate) use stroke_io::frame_stroke;
+#[cfg(test)]
+pub(crate) use stroke_io::take_stroke_reads;
 
 /// The mode a user's project file is created with: the umask decides who else may read it, as
 /// for any file the user saves.
@@ -286,6 +288,11 @@ pub struct ProjectFile {
     /// The stroke records appended since the last save point, in file order: the next one holds
     /// them, as it holds every record before it (see [`crate::stroke_record`]).
     strokes: Vec<Loc>,
+    /// The ops of the stroke records the file holds, as packed bits: a stroke record of an op
+    /// already here isn't appended again (a save retried after a failure, say). Read from the
+    /// records' op fields the first time a stroke record is appended, never on open; `None`
+    /// until then.
+    stroke_ops: Option<BTreeSet<u64>>,
     /// The latest save point, the parent of the next one; `None` until the first save (see the
     /// invariant on `live`).
     saved: Option<SavedState>,
@@ -301,6 +308,10 @@ pub struct ProjectFile {
     /// of the guard in [`ProjectFile::append_index`].
     #[cfg(test)]
     skew_derivation: bool,
+    /// Makes the next [`ProjectFile::save`] fail with an I/O error after its records' sync,
+    /// before its Index: for tests of a save made again.
+    #[cfg(test)]
+    fail_next_save: bool,
 }
 
 /// A save point in the making: the state of the file as of a write of the store (the cut),
@@ -472,6 +483,7 @@ impl ProjectFile {
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
             strokes: Vec::new(),
+            stroke_ops: None,
             saved: None,
             deltas: 0,
             head: None,
@@ -479,6 +491,8 @@ impl ProjectFile {
             cut: None,
             #[cfg(test)]
             skew_derivation: false,
+            #[cfg(test)]
+            fail_next_save: false,
         })
     }
 
@@ -583,6 +597,7 @@ impl ProjectFile {
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
             strokes: Vec::new(),
+            stroke_ops: None,
             saved: None,
             deltas: 0,
             head: None,
@@ -590,6 +605,8 @@ impl ProjectFile {
             cut: None,
             #[cfg(test)]
             skew_derivation: false,
+            #[cfg(test)]
+            fail_next_save: false,
         };
         let tail = this.load_base(&heads, len)?;
         if this.end < len {
@@ -636,6 +653,10 @@ impl ProjectFile {
     /// Opens the project at `path` read-only, with a shared lock, at the save point (an Index)
     /// at byte `index_offset`.
     ///
+    /// Besides the Index chain, it walks every record head before the Index (8 bytes each, as an
+    /// open at the latest save point walks every head of the file) to find the stroke records the
+    /// save point holds; it reads none of them.
+    ///
     /// # Errors
     ///
     /// [`FileError::NotASavePoint`] if no good Index starts there, [`FileError::Damaged`] if
@@ -666,6 +687,7 @@ impl ProjectFile {
             live: chain.live,
             pending: BTreeMap::new(),
             strokes: Vec::new(),
+            stroke_ops: None,
             saved: Some(saved),
             deltas: chain.deltas,
             head: chain.head,
@@ -673,6 +695,8 @@ impl ProjectFile {
             cut: None,
             #[cfg(test)]
             skew_derivation: false,
+            #[cfg(test)]
+            fail_next_save: false,
         })
     }
 
@@ -1209,7 +1233,7 @@ impl ProjectFile {
         // History, not state: a stroke record that doesn't read is left out, never a reason to
         // stop the save.
         for loc in base.stroke_locations() {
-            let Ok(raw) = base.reader.read_record(loc) else {
+            let Ok(raw) = read_stroke_at(&base.reader, loc) else {
                 continue;
             };
             match self.append_stroke_copy(&raw) {
@@ -1394,6 +1418,10 @@ impl ProjectFile {
         self.cut = None;
         // Tiles are durable before the Index that names them.
         self.file.sync_data()?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_save) {
+            return Err(io::Error::other("a save failing, for the test").into());
+        }
         let appended = self.append_index()?;
         self.file.sync_data()?;
         Ok(self.commit_index(appended))
@@ -1791,6 +1819,11 @@ impl ProjectFile {
             saved_len + only_pending,
             "live holds a name neither saved nor pending, or lacks one"
         );
+    }
+
+    /// Makes the next [`ProjectFile::save`] fail after syncing its records, before its Index.
+    pub(crate) const fn fail_next_save(&mut self) {
+        self.fail_next_save = true;
     }
 
     /// Payload bytes of the last Index.

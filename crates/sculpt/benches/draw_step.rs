@@ -246,6 +246,6 @@ fn draw_step_50k(bencher: divan::Bencher<'_, '_>) {
             .expect("draw step");
         all.push(stats);
     });
-    fresh.project.end_stroke().expect("stroke");
+    fresh.project.end_unrecorded_stroke().expect("stroke");
     report(&all);
 }

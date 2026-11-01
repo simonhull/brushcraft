@@ -36,7 +36,7 @@ fn bumps(project: &mut Project, index: &mut SpatialIndex) {
     let mut state = Stroke::new(project.store());
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), index, &mut state, &frame).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 }
 
 /// `count` directions spread evenly over the sphere (a Fibonacci lattice).
@@ -464,7 +464,7 @@ fn a_stroke_over_the_store_edits_it_and_its_dabs_stay_on_the_surface() {
     moved += apply_dabs(project.store(), &mut index, &mut state, &tail)
         .unwrap()
         .vertices;
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     assert!(placed >= 5, "the stroke placed dabs: {placed}");
     assert!(moved > 1000, "and they moved vertices: {moved}");
     assert!(
@@ -505,7 +505,7 @@ fn surface_costs() {
     let mut state = Stroke::new(project.store());
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), &mut index, &mut state, &frame).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 
     // Each call's inputs: a hit, a ray a radius aside from it (the next pen sample's), and
     // where that ray hits.

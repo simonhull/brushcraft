@@ -323,7 +323,7 @@ fn refresh_stroke<J: Write, H: Write>(
         slices += ran.slices;
         long_slices += ran.long_slices;
     }
-    project.end_stroke()?;
+    project.end_unrecorded_stroke()?;
     let tiles: usize = built.iter().sum();
     let total: Duration = refreshes.iter().sum();
     let mut record = Record::new("display", "refresh")
@@ -362,7 +362,7 @@ fn refresh_stroke<J: Write, H: Write>(
         let params = DrawParams::new(centre, plan.radius, options.strength)?;
         draw_step(project.store(), index, &mut state, params)?;
     }
-    project.end_stroke()?;
+    project.end_unrecorded_stroke()?;
     let Ran {
         built: once, time, ..
     } = run_to_end(project.store(), Duration::from_millis(50))?;
@@ -421,7 +421,7 @@ fn paced_stroke<J: Write, H: Write>(
         slices += report.slices;
         long_slices += report.long_slices;
     }
-    project.end_stroke()?;
+    project.end_unrecorded_stroke()?;
     let stroke = began.elapsed();
     let left = project.store().run_jobs(Instant::now()).map(|r| r.left)?;
     let ran = run_to_end(project.store(), Duration::from_millis(50))?;

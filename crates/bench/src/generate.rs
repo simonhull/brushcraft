@@ -151,7 +151,7 @@ pub(crate) fn run<J: Write, H: Write>(
             project.tick(Instant::now())?;
             out.progress(&format!("level {level}"), done, total, start)?;
         }
-        project.end_stroke()?;
+        project.end_unrecorded_stroke()?;
     }
     let sculpted = start.elapsed();
     let finest = levels.last().copied().context("no level to sculpt")?;

@@ -151,7 +151,7 @@ impl Brush for OneEdit {
             .store()
             .edit_tile(key, |edit| edit.set(1, 1, Vec3::new(0.0, 0.0, 0.01)))??;
         project.store().close_epoch()?;
-        project.end_stroke()?;
+        project.end_unrecorded_stroke()?;
         Ok(())
     }
 }

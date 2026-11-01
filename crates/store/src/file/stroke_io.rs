@@ -3,33 +3,59 @@
 //!
 //! No Index names a stroke record: a save point holds every stroke record before it in the file.
 //! Opening a file finds them by the record heads it scans anyway, and reads none of them.
+//!
+//! A file holds at most one stroke record of an op: an append of a record whose op the file
+//! holds already is skipped, so a save that failed and is made again, or one whose rebase was
+//! refused, never writes a stroke's record twice.
 
+use std::collections::BTreeSet;
+use std::io;
 use std::os::unix::fs::FileExt;
 
 use super::error::FileError;
 use super::lock::Access;
+use super::reader::FileReader;
 use super::{Loc, ProjectFile};
-use crate::record::{Head, KIND_STROKE, frame, verify};
-use crate::stroke_record::StrokeRecord;
+use crate::record::{HEAD, Head, KIND_STROKE, TAIL, frame, verify};
+use crate::stroke_record::{MAX_STROKE_PAYLOAD, OP_AT, StrokeRecord};
+
+/// The longest framed stroke record: framing around the longest payload a writer makes.
+///
+/// A head stating a longer one isn't taken for a stroke record, so a hostile file can't make a
+/// copy or a read allocate its whole length.
+const MAX_STROKE_RECORD: u64 = (HEAD + MAX_STROKE_PAYLOAD + TAIL) as u64;
+
+/// Where a framed stroke record's op is, from its first byte: past the head.
+const FRAMED_OP_AT: usize = HEAD + OP_AT;
 
 #[cfg(test)]
 thread_local! {
-    /// Test hook: stroke records read on this thread, by [`ProjectFile::read_stroke_record`].
+    /// Test hook: reads of stroke records (whole, or their op) on this thread, all counted by
+    /// [`count_stroke_read`].
     static STROKE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Test hook: the stroke records read on this thread since the last call, counting again from
+/// Test hook: the stroke record reads on this thread since the last call, counting again from
 /// zero.
 #[cfg(test)]
 pub(crate) fn take_stroke_reads() -> u64 {
     STROKE_READS.with(|reads| reads.replace(0))
 }
 
-/// Where each stroke record of `heads` is, in file order.
+/// Counts a read of a stroke record, whole or in part, for the tests that check opening a file
+/// reads none: every such read goes through here.
+fn count_stroke_read() {
+    #[cfg(test)]
+    STROKE_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+/// Where each stroke record of `heads` is, in file order. A head of the stroke kind stating a
+/// record longer than [`MAX_STROKE_RECORD`] is passed over, as data of a kind this build doesn't
+/// know would be.
 pub(super) fn stroke_locs(heads: &[(u64, Head)]) -> impl Iterator<Item = Loc> + '_ {
     heads
         .iter()
-        .filter(|(_, head)| head.kind == KIND_STROKE)
+        .filter(|(_, head)| head.kind == KIND_STROKE && head.total() <= MAX_STROKE_RECORD)
         .map(|&(offset, head)| Loc {
             offset,
             len: head.total(),
@@ -46,29 +72,69 @@ pub(crate) fn frame_stroke(record: &StrokeRecord) -> Result<Vec<u8>, FileError> 
     frame(KIND_STROKE, &record.to_payload()?).ok_or(FileError::TooLarge)
 }
 
+/// The stroke record at `loc` of the file `reader` reads, framing included, after checking that
+/// it verifies and is a stroke record. Every whole read of a stroke record goes through here.
+///
+/// # Errors
+///
+/// [`FileError::Damaged`] if it doesn't, or the file ends first; [`FileError::Closed`] if the
+/// file has been dropped; [`FileError::Io`].
+pub(super) fn read_stroke_at(reader: &FileReader, loc: Loc) -> Result<Vec<u8>, FileError> {
+    count_stroke_read();
+    let raw = reader.read_record(loc)?;
+    if is_stroke_record(&raw) {
+        Ok(raw)
+    } else {
+        Err(FileError::Damaged { offset: loc.offset })
+    }
+}
+
 /// Whether `raw` is a whole stroke record: its framing and checksum are good and its kind is a
 /// stroke's. The payload isn't parsed: a copy carries it as it is.
 fn is_stroke_record(raw: &[u8]) -> bool {
     matches!(verify(raw), Some((KIND_STROKE, _)))
 }
 
+/// The op bits of the framed stroke record `raw`, unchecked; `None` if it is too short to hold
+/// them.
+fn op_bits(raw: &[u8]) -> Option<u64> {
+    let bytes = raw.get(FRAMED_OP_AT..FRAMED_OP_AT + 8)?;
+    bytes.try_into().ok().map(u64::from_le_bytes)
+}
+
 impl ProjectFile {
-    /// Appends `framed`, stroke records [`frame_stroke`] made, in order, with one write. The next
-    /// save point holds them, so a sync before it must cover them: they move the open cut's
-    /// named end, if one is open.
+    /// Appends `framed`, stroke records [`frame_stroke`] made, in order, with one write, but for
+    /// those of an op the file holds already (or one earlier in `framed`). The next save point
+    /// holds them, so a sync before it must cover them: they move the open cut's named end, if
+    /// one is open.
     ///
     /// If the write fails, none of them is recorded (the bytes written past the end, if any, are
     /// overwritten by the next append).
     ///
     /// # Errors
     ///
-    /// [`FileError::ReadOnly`], [`FileError::TooLarge`], [`FileError::Io`].
+    /// [`FileError::ReadOnly`], [`FileError::TooLarge`], [`FileError::Io`] (reading the ops the
+    /// file holds, the first time, too).
     pub(crate) fn append_strokes(&mut self, framed: &[Vec<u8>]) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
             return Err(FileError::ReadOnly);
         }
+        if framed.is_empty() {
+            return Ok(());
+        }
         let size = |n: usize| u64::try_from(n).or(Err(FileError::TooLarge));
-        let buffer = framed.concat();
+        let held = self.stroke_ops()?;
+        let mut new_ops = BTreeSet::new();
+        let fresh: Vec<&Vec<u8>> = framed
+            .iter()
+            .filter(|record| {
+                op_bits(record).is_none_or(|op| !held.contains(&op) && new_ops.insert(op))
+            })
+            .collect();
+        let buffer: Vec<u8> = fresh
+            .iter()
+            .flat_map(|record| record.iter().copied())
+            .collect();
         if buffer.is_empty() {
             return Ok(());
         }
@@ -76,20 +142,21 @@ impl ProjectFile {
         self.file.write_all_at(&buffer, start)?;
         self.end += size(buffer.len())?;
         let mut offset = start;
-        for record in framed {
+        for record in fresh {
             let len = size(record.len())?;
-            self.note_stroke(Loc { offset, len });
+            self.note_stroke(Loc { offset, len }, op_bits(record));
             offset += len;
         }
         Ok(())
     }
 
-    /// Appends `raw`, a stroke record read from another file, as it is.
+    /// Appends `raw`, a stroke record read from another file, as it is, unless the file holds a
+    /// stroke record of its op already.
     ///
     /// # Errors
     ///
     /// [`FileError::ReadOnly`]; [`FileError::Damaged`] if `raw` isn't a whole stroke record;
-    /// [`FileError::Io`].
+    /// [`FileError::Io`] (reading the ops the file holds, the first time, too).
     pub(crate) fn append_stroke_copy(&mut self, raw: &[u8]) -> Result<(), FileError> {
         if self.access == Access::ReadOnly {
             return Err(FileError::ReadOnly);
@@ -97,18 +164,56 @@ impl ProjectFile {
         if !is_stroke_record(raw) {
             return Err(FileError::Damaged { offset: self.end });
         }
+        let op = op_bits(raw);
+        if let Some(op) = op
+            && self.stroke_ops()?.contains(&op)
+        {
+            return Ok(());
+        }
         let loc = self.append_record(raw)?;
-        self.note_stroke(loc);
+        self.note_stroke(loc, op);
         Ok(())
     }
 
-    /// Records that a stroke record was appended at `loc`: the next save point holds it, and a
-    /// sync before that save point must cover it.
-    fn note_stroke(&mut self, loc: Loc) {
+    /// The ops of the stroke records the file holds, read from each record's op field (8 bytes,
+    /// unchecked) the first time they are wanted. A record too short to hold one is passed over.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Io`].
+    fn stroke_ops(&mut self) -> Result<&BTreeSet<u64>, FileError> {
+        if self.stroke_ops.is_none() {
+            let mut ops = BTreeSet::new();
+            let locs: Vec<Loc> = self.stroke_locations().collect();
+            for loc in locs {
+                count_stroke_read();
+                let mut bits = [0; 8];
+                match self
+                    .file
+                    .read_exact_at(&mut bits, loc.offset + FRAMED_OP_AT as u64)
+                {
+                    Ok(()) => {
+                        ops.insert(u64::from_le_bytes(bits));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            self.stroke_ops = Some(ops);
+        }
+        Ok(self.stroke_ops.get_or_insert_with(BTreeSet::new))
+    }
+
+    /// Records that a stroke record of `op` was appended at `loc`: the next save point holds it,
+    /// and a sync before that save point must cover it.
+    fn note_stroke(&mut self, loc: Loc, op: Option<u64>) {
         if let Some(cut) = &mut self.cut {
             cut.named_end = cut.named_end.max(loc.offset + loc.len);
         }
         self.strokes.push(loc);
+        if let (Some(ops), Some(op)) = (&mut self.stroke_ops, op) {
+            ops.insert(op);
+        }
     }
 
     /// Where each stroke record of the file's state is, in file order: those the latest save
@@ -128,14 +233,7 @@ impl ProjectFile {
     ///
     /// [`FileError::Damaged`] if it doesn't; [`FileError::Io`].
     pub(crate) fn read_stroke_record(&self, loc: Loc) -> Result<Vec<u8>, FileError> {
-        #[cfg(test)]
-        STROKE_READS.with(|reads| reads.set(reads.get() + 1));
-        let raw = self.read_record(loc.offset, loc.len)?;
-        if is_stroke_record(&raw) {
-            Ok(raw)
-        } else {
-            Err(FileError::Damaged { offset: loc.offset })
-        }
+        read_stroke_at(&self.reader(), loc)
     }
 
     /// How many stroke records the file's state holds: the latest save point's and those

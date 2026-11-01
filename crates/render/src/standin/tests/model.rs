@@ -284,7 +284,9 @@ impl Case {
         if !fail {
             applied.expect("the frame applies");
         }
-        self.project.end_stroke().expect("the stroke ends");
+        self.project
+            .end_unrecorded_stroke()
+            .expect("the stroke ends");
     }
 
     /// Runs one operation the bytes name, then a frame (one that may be lost or fail).

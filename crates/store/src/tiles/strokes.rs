@@ -4,8 +4,10 @@
 //! the store for the flush that stroke end triggers: the recovery writer appends it as the flush
 //! opens its cut ([`TileStore::flush_strokes`]), before the save point, so the save point that
 //! holds the stroke's last edits holds its record too, and none before it does. A save copies the
-//! working file's records, and those still waiting, into the project file; a roll-over carries the
-//! working file's into the new one, and those waiting stay for its first flush.
+//! working file's records, and those still waiting, into the project file; a roll-over carries
+//! both into the new working file. Either forgets the waiting ones once the store has moved on.
+//! A file never takes a second record of one op (see `crate::file`), so a save made again after a
+//! failure, or after a refused rebase, copies none twice.
 
 use super::TileStore;
 use super::error::CacheError;
@@ -47,8 +49,9 @@ impl TileStore {
         Ok(())
     }
 
-    /// Appends to `to` a copy of every stroke record of the working file, in order, then, if
-    /// `waiting`, every one waiting (which stay waiting). Returns how many were waiting.
+    /// Appends to `to` a copy of every stroke record of the working file, in order, then every
+    /// one waiting (which stay waiting until the store moves onto `to`'s state). Returns how many
+    /// were waiting. Records of ops `to` holds already are skipped.
     ///
     /// A record of the working file that doesn't read is left out: history, which never stops a
     /// save or a roll-over.
@@ -59,23 +62,20 @@ impl TileStore {
     pub(super) fn copy_strokes(
         &self,
         to: &mut ProjectFile,
-        waiting: bool,
         wrap: fn(FileError) -> CacheError,
     ) -> Result<usize, CacheError> {
-        for loc in self.file.stroke_locations() {
+        let held = self.file.stroke_locations();
+        for loc in held {
             if let Ok(raw) = self.file.read_stroke_record(loc) {
                 to.append_stroke_copy(&raw).map_err(wrap)?;
             }
-        }
-        if !waiting {
-            return Ok(0);
         }
         to.append_strokes(&self.strokes_waiting).map_err(wrap)?;
         Ok(self.strokes_waiting.len())
     }
 
     /// Forgets the first `count` stroke records waiting: a save copied them into the project
-    /// file, which the store has moved onto.
+    /// file, or a roll-over into the new working file, which the store has moved onto.
     pub(super) fn forget_saved_strokes(&mut self, count: usize) {
         self.strokes_waiting
             .drain(..count.min(self.strokes_waiting.len()));

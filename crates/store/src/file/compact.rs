@@ -20,7 +20,8 @@ use crate::stamp::Stamp;
 /// `src` is recovered as by [`ProjectFile::open`], but never modified: whatever follows its last
 /// save point is left in place (and not copied). It is held with a shared lock, so it can't be open
 /// for writing. History before the latest state is dropped; which history to keep is decided with
-/// stroke history (M2). On error, `dst` may be left partly written.
+/// stroke history (M2). So is every stroke record (see [`crate::StrokeRecord`]): they are history
+/// too, and none is copied. On error, `dst` may be left partly written.
 ///
 /// # Errors
 ///

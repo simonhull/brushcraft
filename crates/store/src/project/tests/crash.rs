@@ -261,7 +261,7 @@ fn record_of(op: OpId, seed: u64) -> StrokeRecord {
 /// Ends the project's stroke, the one with `seed`, with its record.
 fn end_recorded(project: &mut Project, seed: u64) {
     let op = project.store().current_op().unwrap();
-    project.end_stroke_with(&record_of(op, seed)).unwrap();
+    project.end_stroke(&record_of(op, seed)).unwrap();
 }
 
 /// Asserts that `file` holds the records of the strokes with `seeds`, in order, each with its

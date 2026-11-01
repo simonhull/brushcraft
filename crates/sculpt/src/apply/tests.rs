@@ -56,7 +56,7 @@ fn apply_in_frames(
         stats += apply_dabs(project.store(), index, &mut brush_state, frame).unwrap();
         rest = after;
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     stats
 }
 
@@ -151,7 +151,7 @@ fn stepped(dabs: &[Dab]) -> std::collections::BTreeMap<TileKey, TileBits> {
         let params = DrawParams::new(Vec3::new(x, y, z), d.radius, d.strength).unwrap();
         draw_step(project.store(), &mut index, &mut state, params).unwrap();
     }
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     snapshot(project.store(), level())
 }
 
@@ -211,7 +211,7 @@ fn a_store_error_ends_the_call_and_keeps_the_dabs_before_it() {
         ),
         "the third dab can't be stored: {failed:?}"
     );
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let after = snapshot(project.store(), level);
     let near: Vec<&TileKey> = reference.keys().filter(|key| key.face() != far).collect();
     let kept = near
@@ -315,7 +315,7 @@ fn a_dab_reaches_a_tile_through_a_seam_vertex_the_dab_before_pushed_out() {
         let after = vertex(project.store(), left, 64, 32);
         let second = dab(after + (after - before) * 0.05, 0.03, 0.001, 0.0, 1);
         let alone = apply_dabs(project.store(), &mut index, &mut state, &[second]).unwrap();
-        project.end_stroke().unwrap();
+        project.end_unrecorded_stroke().unwrap();
         assert!(
             alone.vertices > 0,
             "the second dab reaches the lifted vertex"
@@ -363,7 +363,7 @@ fn a_failed_call_closes_its_epoch() {
         !project.store().has_stale(&cursor),
         "one epoch, drained: {drained:?}"
     );
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
 }
 
 /// A project over the cube at the test level under `budget` bytes, or `None` if that is too
@@ -422,7 +422,7 @@ fn a_frame_too_big_to_pin_is_applied_in_two_with_the_same_bits() {
         let mut brush_state = Stroke::new(project.store());
         project.begin_stroke().unwrap();
         let applied = apply_dabs(project.store(), &mut index, &mut brush_state, &dabs);
-        project.end_stroke().unwrap();
+        project.end_unrecorded_stroke().unwrap();
         let Ok(done) = applied else {
             continue;
         };
@@ -478,7 +478,7 @@ fn a_frame_of_dabs_closes_one_step_epoch_with_their_displacements_summed() {
     let mut state = Stroke::new(project.store());
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), &mut index, &mut state, &frame).unwrap();
-    project.end_stroke().unwrap();
+    project.end_unrecorded_stroke().unwrap();
     let store::Drained::Epochs(epochs) = project.store().drain_stale(&cursor) else {
         panic!("epochs");
     };

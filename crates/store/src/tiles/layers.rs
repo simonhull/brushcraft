@@ -146,6 +146,9 @@ pub(crate) struct Filled {
     /// The bounds changes the store had counted when it was filled: a roll-over refuses it
     /// after a later one, which the new file doesn't hold.
     pub(super) bounds: u64,
+    /// How many of the stroke records waiting in the store were copied into it: the roll-over
+    /// forgets them, as the new file holds them.
+    pub(super) strokes: usize,
 }
 
 /// The bounds book of a store over `working` and `base`.

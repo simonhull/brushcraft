@@ -318,7 +318,7 @@ impl TileStore {
             )
             .map_err(CacheError::Save)?;
         self.save_display(project, &lost)?;
-        let strokes = self.copy_strokes(project, true, CacheError::Save)?;
+        let strokes = self.copy_strokes(project, CacheError::Save)?;
         project
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::Save))?;
@@ -501,8 +501,9 @@ impl TileStore {
     /// neither way, or a broken slot, is lost: listed, and left out. Then `fresh` is saved
     /// (synced, a save point, synced again). Every bound of the old working file and every bound
     /// changed since the last rebase go across too, as they are now; those a lost tile's edit could
-    /// change, as unknown. So does every stroke record of the old working file that reads; those
-    /// waiting for a flush keep waiting, for the new file's first.
+    /// change, as unknown. So does every stroke record of the old working file that reads, and
+    /// every one waiting for a flush (which the roll-over forgets): a stroke whose edits the new
+    /// file holds has its record there too.
     ///
     /// # Errors
     ///
@@ -589,8 +590,9 @@ impl TileStore {
             )
             .map_err(CacheError::WriteBack)?;
         self.carry_display(&mut fresh, &lost)?;
-        // Those waiting stay for the new file's first flush.
-        self.copy_strokes(&mut fresh, false, CacheError::WriteBack)?;
+        // Those waiting too: their strokes' edits are all in the new file's save point, which
+        // must hold their records as well.
+        let strokes = self.copy_strokes(&mut fresh, CacheError::WriteBack)?;
         fresh
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::WriteBack))?;
@@ -600,6 +602,7 @@ impl TileStore {
             cleaned,
             stamp: self.last_write,
             bounds: self.derived_changes(),
+            strokes,
         })
     }
 
@@ -630,6 +633,7 @@ impl TileStore {
             cleaned,
             stamp,
             bounds,
+            strokes,
         } = filled;
         if stamp != self.last_write || bounds != self.derived_changes() {
             return Err(CacheError::StaleSave);
@@ -668,7 +672,8 @@ impl TileStore {
                 mark.clear();
             }
         }
-        // The new file holds every bound as it is now.
+        // The new file holds every bound as it is now, and every stroke record waiting.
+        self.forget_saved_strokes(strokes);
         self.bounds.all_flushed();
         self.display.all_flushed();
         self.generation += 1;
