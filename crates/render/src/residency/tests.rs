@@ -552,6 +552,49 @@ fn random_arrivals_under_a_tiny_budget_never_evict_the_floor_the_cut_or_a_drawn_
     });
 }
 
+/// A random set of at most `count` tiles, from the model's.
+fn random_tiles(rng: &mut Rng, model: &Model, count: usize) -> BTreeSet<TileKey> {
+    let picked = (0..count).map(|_| model.any(rng));
+    picked.collect()
+}
+
+#[test]
+fn the_shielded_places_made_when_asked_are_those_made_from_scratch_from_the_latest_use() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let model = Model::new(&mesh, level(FINEST));
+        let config = ResidencyConfig::default();
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        let mut rng = Rng(23);
+        let mut cut: BTreeSet<TileKey> = BTreeSet::new();
+        for step in 0..2000 {
+            // The same cut again often (the shielded places are then kept), else a new one.
+            if !rng.one_in(3) {
+                let count = rng.below(40);
+                cut = random_tiles(&mut rng, &model, count);
+            }
+            // Drawn: a subset of the cut mostly, sometimes with tiles outside it.
+            let culled = cut.iter().filter(|_| !rng.one_in(4)).copied();
+            let mut drawn: BTreeSet<TileKey> = culled.collect();
+            if rng.one_in(4) {
+                let count = 1 + rng.below(5);
+                drawn.extend(random_tiles(&mut rng, &model, count));
+            }
+            residency.use_frame(FrameUse::new(cut.clone(), drawn.clone()));
+            // Asked in some frames only, as only an eviction or a resync asks.
+            if rng.one_in(2) {
+                let scratch = Shield::of(&cut, &drawn).places;
+                assert_eq!(
+                    residency.shielded(),
+                    &scratch,
+                    "step {step}: the places kept are the latest use's"
+                );
+                assert_eq!(residency.cut(), &cut, "step {step}: the cut is the latest");
+            }
+        }
+    });
+}
+
 #[test]
 fn a_request_waits_while_every_slot_it_could_take_is_protected() {
     GpuTest::run(|gpu| {

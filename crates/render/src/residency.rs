@@ -64,6 +64,7 @@
 //! unsubmitted, drops the tiles it wrote (their data never reached the GPU) and the whole tile tree
 //! is written again with the next frame; the floor comes back whole.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::ops::Bound;
@@ -570,6 +571,38 @@ impl FrameUse {
     }
 }
 
+/// The places a frame's use keeps from eviction because a tile below them is in its cut or was
+/// drawn ([`Residency::use_frame`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Shield {
+    /// Every ancestor of a tile of the cut or drawn.
+    places: BTreeSet<Place>,
+    /// Whether every tile drawn was in the cut: the places are then the cut's alone, and stay
+    /// right for a later use with the same cut whose drawn tiles are in it too.
+    from_cut: bool,
+}
+
+impl Shield {
+    /// The places above the tiles of `cut` and `drawn`.
+    fn of(cut: &BTreeSet<TileKey>, drawn: &BTreeSet<TileKey>) -> Self {
+        let mut places = BTreeSet::new();
+        for key in cut.iter().chain(drawn) {
+            let mut above = Place::of(key).parent();
+            while let Some(place) = above {
+                // Already in: so are all its ancestors.
+                if !places.insert(place) {
+                    break;
+                }
+                above = place.parent();
+            }
+        }
+        Self {
+            places,
+            from_cut: drawn.is_subset(cut),
+        }
+    }
+}
+
 /// Why residency failed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -822,10 +855,13 @@ pub struct Residency {
     frame: u64,
     /// The current cut.
     cut: BTreeSet<TileKey>,
-    /// The places with a descendant in the cut or drawn: every ancestor of either.
-    shielded: BTreeSet<Place>,
-    /// Whether `shielded` came from the cut alone (every tile drawn was in it).
-    shielded_from_cut: bool,
+    /// The tiles the latest [`Residency::use_frame`] drew: with `cut`, what `shielded` is made
+    /// from.
+    drawn: BTreeSet<TileKey>,
+    /// The places with a descendant in the cut or drawn, made from `cut` and `drawn` the first
+    /// time a frame asks what is protected ([`Residency::shielded`]): only an eviction or a
+    /// resync does, so a frame that evicts nothing never makes it.
+    shielded: OnceCell<Shield>,
     /// The tiles the frame being staged wrote, with the slot each was written to.
     touched: Vec<(TileKey, Slot)>,
     /// The same tiles, as a set: never evicted by the frame that wrote them.
@@ -958,8 +994,8 @@ impl Residency {
             pending: BTreeSet::new(),
             frame: 0,
             cut: BTreeSet::new(),
-            shielded: BTreeSet::new(),
-            shielded_from_cut: true,
+            drawn: BTreeSet::new(),
+            shielded: OnceCell::new(),
             touched: Vec::new(),
             fresh: BTreeSet::new(),
             forced_now: 0,
@@ -1166,25 +1202,25 @@ impl Residency {
             }
         }
         // The drawn tiles are the cut's after culling: with the cut as it was, and the shielded
-        // set made from it alone, the set is the same, and isn't made again.
-        let cut_only = drawn.is_subset(&cut);
-        if cut_only && self.shielded_from_cut && cut == self.cut {
-            return;
+        // set made from it alone, the set is the same, and is kept. One not made yet is made
+        // from the new sets if a frame needs it.
+        let same = self.shielded.get().is_some_and(|shield| shield.from_cut)
+            && cut == self.cut
+            && drawn.is_subset(&cut);
+        if !same {
+            self.shielded = OnceCell::new();
+            self.cut = cut;
         }
-        self.shielded_from_cut = cut_only;
-        let mut shielded = BTreeSet::new();
-        for key in cut.iter().chain(&drawn) {
-            let mut above = Place::of(key).parent();
-            while let Some(place) = above {
-                // Already in: so are all its ancestors.
-                if !shielded.insert(place) {
-                    break;
-                }
-                above = place.parent();
-            }
-        }
-        self.shielded = shielded;
-        self.cut = cut;
+        self.drawn = drawn;
+    }
+
+    /// The places with a descendant in the cut or drawn: every ancestor of either, made the
+    /// first time a frame asks after [`Residency::use_frame`] changed them.
+    fn shielded(&self) -> &BTreeSet<Place> {
+        let shield = self
+            .shielded
+            .get_or_init(|| Shield::of(&self.cut, &self.drawn));
+        &shield.places
     }
 
     /// Whether the resident display tile at `place` is behind a step (it stood in for none
@@ -1450,7 +1486,7 @@ impl Residency {
     fn protected(&self, key: &TileKey) -> bool {
         self.floor.contains(key)
             || self.cut.contains(key)
-            || self.shielded.contains(&Place::of(key))
+            || self.shielded().contains(&Place::of(key))
     }
 
     /// After a frame failed to stage (`staged_now`) or was dropped unsubmitted: drops every
