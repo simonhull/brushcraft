@@ -26,8 +26,8 @@
 //!
 //! 1. **brush**: the draw steps due at a pen's rate (173 Hz, the Kamvas's measured rate) since the
 //!    last frame, at most 16 (the rest dropped), each a [`sculpt::draw_step`] on the next centre.
-//!    After a stroke's 200th dab the stroke ends ([`Project::end_stroke`], which hands its edits to
-//!    the recovery writer) and the next begins: the strokes cycle with no gap.
+//!    After a stroke's 200th dab the stroke ends ([`Project::end_unrecorded_stroke`], which hands
+//!    its edits to the recovery writer) and the next begins: the strokes cycle with no gap.
 //! 2. **feed**: the stale-tile feed is drained (the display layer's epochs).
 //! 3. **upkeep**: [`Project::tick`] and [`Project::poll`]: the recovery file's flushes, at least
 //!    once a second during a stroke.
@@ -557,7 +557,9 @@ impl Load {
         self.dab += 1;
         if self.dab >= plan.centres.len() {
             let ending = Instant::now();
-            self.project.end_stroke().context("ending a stroke")?;
+            self.project
+                .end_unrecorded_stroke()
+                .context("ending a stroke")?;
             self.plan = (self.plan + 1) % self.plans.len();
             self.dab = 0;
             self.project.begin_stroke().context("beginning a stroke")?;
@@ -577,7 +579,9 @@ impl Load {
             work,
             ..
         } = self;
-        let ended = project.end_stroke().context("ending the last stroke");
+        let ended = project
+            .end_unrecorded_stroke()
+            .context("ending the last stroke");
         project.store().unsubscribe_stale(cursor);
         let closed = project.close(false).context("closing the load's project");
         drop(work);
