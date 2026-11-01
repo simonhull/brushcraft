@@ -40,6 +40,11 @@ impl TestDir {
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }
+
+    /// The directory.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
 }
 
 impl Drop for TestDir {
@@ -153,7 +158,8 @@ pub(crate) fn snapshot(store: &mut TileStore, level: Level) -> BTreeMap<TileKey,
                 .map(|((&c, &p), &n)| {
                     let mut all = [0; 9];
                     let parts = [bits(c), bits(p), bits(n)];
-                    for (slot, value) in all.iter_mut().zip(parts.iter().flatten()) {
+                    let slots = all.iter_mut().zip(parts.iter().flatten());
+                    for (slot, value) in slots {
                         *slot = *value;
                     }
                     all

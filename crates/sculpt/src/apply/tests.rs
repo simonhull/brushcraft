@@ -8,7 +8,7 @@ use stroke::Dab;
 use super::{ApplyStats, SculptError, apply_dabs};
 use crate::draw::{DrawParams, DrawParamsError, draw_step};
 use crate::state::Stroke;
-use crate::testing::{TestDir, cube, dab, fixed, snapshot, vertex};
+use crate::testing::{TestDir, TileBits, cube, dab, fixed, snapshot, vertex};
 
 /// The level the tests edit: 128 quads a face, four tiles of 64.
 fn level() -> Level {
@@ -80,7 +80,7 @@ fn run(workers: Workers, frames: &[usize]) -> (Snapshot, ApplyStats) {
 #[derive(Debug, PartialEq)]
 struct Snapshot {
     /// Every tile's corrections, positions and normals.
-    tiles: std::collections::BTreeMap<TileKey, crate::testing::TileBits>,
+    tiles: std::collections::BTreeMap<TileKey, TileBits>,
     /// Every tile's bounds in the index, printed (bit-exact for finite floats).
     bounds: std::collections::BTreeMap<TileKey, String>,
 }
@@ -141,7 +141,7 @@ fn draw_steps_equal_a_frame_of_their_dabs() {
 
 /// The tiles of a fresh cube after a draw step at each of `dabs` (their hardness ignored), in
 /// one stroke.
-fn stepped(dabs: &[Dab]) -> std::collections::BTreeMap<TileKey, crate::testing::TileBits> {
+fn stepped(dabs: &[Dab]) -> std::collections::BTreeMap<TileKey, TileBits> {
     let dir = TestDir::new();
     let (mut project, mut index) = cube(&dir, level(), fixed(2));
     let mut state = Stroke::new(project.store());
@@ -292,21 +292,150 @@ fn an_empty_frame_does_nothing() {
     assert_eq!(applied, ApplyStats::default(), "no dabs, nothing done");
 }
 
+/// A dab lifting the seam vertex `(64, 32)` of face 0's tile `(0, 0)` by 0.2.
+fn lift(project: &mut Project) -> Dab {
+    let left = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    dab(vertex(project.store(), left, 64, 32), 0.15, 0.2, 0.0, 0)
+}
+
 #[test]
-fn the_frames_tiles_widen_with_the_strengths_before() {
-    let imprints = [
-        brush::Imprint::new([1.0, 0.0, 0.0], [0.0; 3], 0.5, 0.25, 0.0, [0.0; 4]),
-        brush::Imprint::new([1.0, 0.0, 0.0], [0.0; 3], 0.5, -0.5, 0.0, [0.0; 4]),
-        brush::Imprint::new([1.0, 0.0, 0.0], [0.0; 3], 0.5, 0.1, 0.0, [0.0; 4]),
-    ];
-    let reaches: Vec<f32> = super::widened(&imprints).map(|(_, r)| r).collect();
-    assert_eq!(reaches[0], 0.5, "the first dab's own radius, exactly");
-    assert!(
-        reaches[1] >= 0.75 && reaches[1] < 0.751,
-        "plus the first's strength: {reaches:?}"
+fn a_dab_reaches_a_tile_through_a_seam_vertex_the_dab_before_pushed_out() {
+    let level = level();
+    let left = TileKey::displacement(FaceId::new(0), level, 0, 0).unwrap();
+    // The reference, one call per dab: the first lifts the seam vertex, the second is a small one
+    // just past where it went, far above the surface as the frame finds it.
+    let (reference, second) = {
+        let dir = TestDir::new();
+        let (mut project, mut index) = cube(&dir, level, fixed(2));
+        let before = vertex(project.store(), left, 64, 32);
+        let first = lift(&mut project);
+        let mut state = Stroke::new(project.store());
+        project.begin_stroke().unwrap();
+        apply_dabs(project.store(), &mut index, &mut state, &[first]).unwrap();
+        let after = vertex(project.store(), left, 64, 32);
+        let second = dab(after + (after - before) * 0.05, 0.03, 0.001, 0.0, 1);
+        let alone = apply_dabs(project.store(), &mut index, &mut state, &[second]).unwrap();
+        project.end_stroke().unwrap();
+        assert!(
+            alone.vertices > 0,
+            "the second dab reaches the lifted vertex"
+        );
+        (snapshot(project.store(), level), second)
+    };
+
+    let dir = TestDir::new();
+    let (mut project, mut index) = cube(&dir, level, fixed(2));
+    let [x, y, z] = second.position;
+    assert_eq!(
+        index
+            .query_sphere(Vec3::new(x, y, z), second.radius)
+            .count(),
+        0,
+        "no tile's box as the frame finds it touches the second dab"
     );
+    let frame = [lift(&mut project), second];
+    let framed = apply_in_frames(&mut project, &mut index, &frame, &[2]);
+    assert_eq!(framed.frames, 1, "one frame");
     assert!(
-        reaches[2] >= 1.25 && reaches[2] < 1.252,
-        "plus both strengths, whatever their signs: {reaches:?}"
+        snapshot(project.store(), level) == reference,
+        "the frame reaches the vertex too, and gives the same bits"
     );
+}
+
+#[test]
+fn a_failed_call_closes_its_epoch() {
+    let dir = TestDir::new();
+    let (mut project, mut index) = cube(&dir, level(), fixed(2));
+    let cursor = project.store().subscribe_stale();
+    let mut frame = path(&mut project, 2);
+    let (_, centre) = far_from(&mut project, &frame);
+    frame.push(dab(centre, 0.15, 3e38, 0.0, 2));
+    let mut state = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    let failed = apply_dabs(project.store(), &mut index, &mut state, &frame);
+    assert!(failed.is_err(), "the third dab can't be stored");
+    assert!(
+        project.store().has_stale(&cursor),
+        "the call's epoch is closed, for a reader to drain"
+    );
+    let drained = project.store().drain_stale(&cursor);
+    assert!(
+        !project.store().has_stale(&cursor),
+        "one epoch, drained: {drained:?}"
+    );
+    project.end_stroke().unwrap();
+}
+
+/// A project over the cube at the test level under `budget` bytes, or `None` if that is too
+/// small for it or its index.
+///
+/// In 64 KiB chunks, with no kept predictions and a little stroke state, so the budget is mostly
+/// the pools.
+fn tight(dir: &TestDir, budget: usize) -> Option<(Project, SpatialIndex)> {
+    let config = store::ProjectConfig {
+        store: store::StoreConfig::new(budget, 1)
+            .with_chunk_bytes(64 << 10)
+            .with_kept_predictions(0)
+            .with_stroke_tiles(8)
+            .with_workers(fixed(2)),
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let mut project = Project::new(geom::cube_sphere(1).unwrap(), config).ok()?;
+    let index = SpatialIndex::build(project.store(), level(), |_, _| {}).ok()?;
+    Some((project, index))
+}
+
+/// Two dabs on `project`, far apart: in the middle of face 0's first tile, and on the face
+/// farthest from it.
+fn far_apart(project: &mut Project) -> [Dab; 2] {
+    let near = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let first = dab(vertex(project.store(), near, 32, 32), 0.05, 0.01, 0.0, 0);
+    let (_, centre) = far_from(project, &[first]);
+    [first, dab(centre, 0.05, 0.01, 0.0, 1)]
+}
+
+/// The tiles of a fresh [`tight`] project under `budget` after [`far_apart`]'s dabs, one call
+/// each.
+fn far_apart_one_call_each(budget: usize) -> std::collections::BTreeMap<TileKey, TileBits> {
+    let dir = TestDir::new();
+    let (mut project, mut index) = tight(&dir, budget).unwrap();
+    let dabs = far_apart(&mut project);
+    apply_in_frames(&mut project, &mut index, &dabs, &[1]);
+    snapshot(project.store(), level())
+}
+
+#[test]
+fn a_frame_too_big_to_pin_is_applied_in_two_with_the_same_bits() {
+    let mesh = geom::cube_sphere(1).unwrap();
+    let minimum = store::StoreConfig::new(0, 1)
+        .with_chunk_bytes(64 << 10)
+        .with_kept_predictions(0)
+        .with_stroke_tiles(8)
+        .minimum_budget(&mesh);
+    let budgets = (0..256).map(|k| minimum + k * (64 << 10));
+    for budget in budgets {
+        let dir = TestDir::new();
+        let Some((mut project, mut index)) = tight(&dir, budget) else {
+            continue;
+        };
+        let dabs = far_apart(&mut project);
+        let mut brush_state = Stroke::new(project.store());
+        project.begin_stroke().unwrap();
+        let applied = apply_dabs(project.store(), &mut index, &mut brush_state, &dabs);
+        project.end_stroke().unwrap();
+        let Ok(done) = applied else {
+            continue;
+        };
+        assert_eq!(
+            done.frames, 2,
+            "at the least budget that applies them, {budget} bytes, the two dabs don't fit together"
+        );
+        assert_eq!(done.dabs, 2, "both applied");
+        assert!(
+            snapshot(project.store(), level()) == far_apart_one_call_each(budget),
+            "the same bits as a call per dab"
+        );
+        return;
+    }
+    panic!("no budget from the minimum up applies the two dabs");
 }

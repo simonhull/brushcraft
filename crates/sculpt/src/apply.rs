@@ -3,11 +3,11 @@
 //!
 //! [`apply_dabs`] runs, in order:
 //!
-//! 1. **Query**: for each dab, the tiles whose boxes its sphere touches, from the spatial index,
-//!    the sphere widened by how far the frame's earlier dabs can have moved a vertex (see "The
-//!    frame's tiles" below).
+//! 1. **Query**: for each dab, the tiles whose boxes its sphere touches, from the spatial index as
+//!    the frame found it.
 //! 2. **Pin**: every tile of those queries is evaluated and pinned, together, so they stay resident
-//!    for the frame.
+//!    for the frame; and with them every tile step 5 can evaluate or read, so that wave needs no
+//!    room the pins haven't counted (see "Errors").
 //! 3. **Each dab, in order:**
 //!    - **Brush**: `brush`'s draw action ([`brush::draw_imprint`]) over the evaluated positions of
 //!      each of the dab's tiles, the tiles on the store's workers, giving each vertex within the
@@ -24,8 +24,8 @@
 //!      radius) get their positions again, in parallel ([`TileStore::evaluate_many`]). They are
 //!      pinned and only their corrections changed, so the store applies the new corrections to the
 //!      prediction it kept of each (see "Kept predictions" on [`TileStore`]): the prediction, most
-//!      of a tile's evaluation, is made once per frame. The last dab skips this: step 5 evaluates
-//!      its tiles.
+//!      of a tile's evaluation, is made once per frame. Their boxes are taken again, for the next
+//!      dabs' tiles (see "The frame's tiles"). The last dab skips this: step 5 evaluates its tiles.
 //! 4. **Neighbours**: the tiles whose bounds may have changed are listed, once for the frame: every
 //!    tile holding a vertex within a dab's radius, and every tile whose normals read one of those
 //!    ([`TileStore::stale_after`]).
@@ -33,7 +33,7 @@
 //!    [`TileStore::evaluate_many_with_bounds`], each tile's bounds on the worker that computed its
 //!    normals.
 //! 6. **Refit**: the index's tree is refitted to those bounds; the frame closes its epoch of the
-//!    store's stale-tile feed ([`TileStore::close_epoch`]).
+//!    store's stale-tile feed ([`TileStore::close_epoch`]), exactly one a call, whatever failed.
 //!
 //! # The same as one dab at a time
 //!
@@ -45,10 +45,9 @@
 //!   the next is brushed (step 3), and the store's evaluation of a tile is a function of its
 //!   corrections and the coarser levels', which the brush never edits. So each dab's deltas are the
 //!   ones it would compute alone.
-//! - **Its tiles are the ones it would have alone.** A tile left out of a dab's query could only
-//!   matter if it held a vertex within the dab's radius. A one-at-a-time call queries the index
-//!   refitted after the dab before it; this one queries it as the frame found it, so each dab's
-//!   sphere is widened to cover what can have moved since (see "The frame's tiles"). A tile queried
+//! - **Its tiles hold every vertex it reaches.** A one-at-a-time call queries the index refitted
+//!   after the dab before it; this one knows each tile's box as it is now (see "The frame's
+//!   tiles"), so every tile holding a vertex within the dab's radius is brushed. A tile brushed
 //!   that no vertex of falls within the radius gives nothing: the brush finds no vertex to move,
 //!   and the tile is neither reached nor edited.
 //! - **Its writes are the ones it would make alone.** The edit is the same call with the same
@@ -59,21 +58,34 @@
 //!
 //! # The frame's tiles
 //!
-//! Dab `k`'s query is its sphere widened by the most the dabs before it in the frame can have
-//! moved a vertex of a tile none of them edited: the sum of their strengths (the draw action
-//! moves a vertex by at most its strength), with slack for rounding. Such a vertex is on a seam,
-//! held by an edited tile and stored exactly, so it moves by its deltas alone. A tile the frame
-//! has edited already can move further (rounding to its quantization, which may grow), so dab
-//! `k` brushes every tile edited before it in the frame too. Everything the query adds is pinned
-//! for the frame and brushed at no cost to the result.
+//! A tile's positions move only if a dab reaches it: if it holds a vertex within the dab's
+//! radius (and so is brushed, and counted as reached), whether it owns the vertex and is edited,
+//! or holds a copy of one its neighbour edits. So dab `k` brushes:
+//!
+//! - every tile its sphere touches by its box in the index as the frame found it, but those the
+//!   frame has reached already: the others haven't moved since, so that box still bounds them;
+//! - every tile the frame has reached whose box now, taken after the dab that last moved it,
+//!   touches its sphere.
+//!
+//! By induction over the dabs, that is every tile holding a vertex within dab `k`'s radius,
+//! whatever its action does to the vertices it reaches, with no bound on how far they move. Only
+//! the first set is known before the frame runs; it is what the frame pins, and the second is
+//! within it, as a tile reached was brushed and so pinned.
 //!
 //! # Errors
 //!
 //! A store error ends the call. The dabs before it stay applied (the failing dab as
 //! [`TileStore::update_tiles`] leaves it), and the index is still brought up to date for every
 //! tile a dab of the frame reached (steps 4 to 6); should that fail too, the first error is
-//! returned and the index must be rebuilt. If the frame's tiles don't fit the budget's pins
-//! together, the frame is applied in two halves, each a frame of its own, down to one dab.
+//! returned and the index must be rebuilt. The stale-tile epoch is closed either way. If the
+//! frame's tiles don't fit the budget's pins together ([`CacheError::OverBudget`], or
+//! [`CacheError::Full`] for pins that fit the count but not the chunks), the frame is applied in
+//! two halves, each a frame of its own, down to one dab: nothing has been written when the pin
+//! fails. The pins also hold the tiles the neighbours' wave evaluates (the tiles whose normals
+//! read a queried tile) and those their normals read, so after the edits that wave finds every
+//! tile it touches pinned, and can't run out of room. Releasing the pins before the wave instead
+//! would lose the predictions the store keeps for pinned tiles edited in place, which the next
+//! frames reuse.
 
 use std::collections::BTreeSet;
 use std::ops::AddAssign;
@@ -81,11 +93,11 @@ use std::time::{Duration, Instant};
 
 use brush::{Imprint, Smoothstep, draw_imprint};
 use geom::{TileKey, Vec3};
-use store::{CacheError, Evaluation, IndexError, SpatialIndex, TileStore};
+use store::{Aabb, CacheError, Evaluation, IndexError, SpatialIndex, TileStore};
 use stroke::Dab;
 use thiserror::Error;
 
-use crate::draw::DrawParamsError;
+use crate::draw::{DrawParamsError, check_dab};
 use crate::state::{Stroke, TileStroke};
 
 /// Why [`apply_dabs`] or [`draw_step`](crate::draw_step) failed.
@@ -164,8 +176,11 @@ impl AddAssign for PhaseTimes {
 pub struct ApplyStats {
     /// Dabs applied.
     pub dabs: usize,
-    /// Tiles the dabs' widened spheres touch by their boxes: queried and pinned (summed over
-    /// the frames, should the frame be split to fit the budget).
+    /// The frames they were applied in: one, unless the frame's tiles didn't fit the budget's
+    /// pins together and it was split (see "Errors" in the module notes).
+    pub frames: usize,
+    /// Tiles the dabs' spheres touch by their boxes as the frame found them: queried and pinned
+    /// (summed over the frames, should the frame be split to fit the budget).
     pub candidates: usize,
     /// Tiles whose corrections a dab edited, each counted once: those owning a vertex a dab
     /// moved (each also writes the copies its neighbours hold of its border vertices).
@@ -187,6 +202,7 @@ impl AddAssign for ApplyStats {
     /// Adds two frames' counts and times: a frame applied in parts.
     fn add_assign(&mut self, rhs: Self) {
         self.dabs += rhs.dabs;
+        self.frames += rhs.frames;
         self.candidates += rhs.candidates;
         self.tiles_edited += rhs.tiles_edited;
         self.vertices += rhs.vertices;
@@ -231,12 +247,12 @@ pub fn apply_dabs(
     stroke: &mut Stroke,
     dabs: &[Dab],
 ) -> Result<ApplyStats, SculptError> {
-    let imprints = dabs
+    let imprints: Result<Vec<Imprint>, SculptError> = dabs
         .iter()
         .enumerate()
         .map(|(n, dab)| imprint_of(dab).map_err(|error| SculptError::Dab { dab: n, error }))
-        .collect::<Result<Vec<Imprint>, SculptError>>()?;
-    apply_imprints(store, index, stroke, &imprints)
+        .collect();
+    apply_imprints(store, index, stroke, &imprints?)
 }
 
 /// The draw action's imprint of `dab`, checked as [`DrawParams::new`](crate::DrawParams::new)
@@ -246,15 +262,8 @@ pub fn apply_dabs(
 ///
 /// As [`DrawParams::new`](crate::DrawParams::new).
 fn imprint_of(dab: &Dab) -> Result<Imprint, DrawParamsError> {
-    if !dab.position.iter().all(|c| c.is_finite()) {
-        return Err(DrawParamsError::Center);
-    }
-    if !(dab.radius > 0.0 && dab.radius.is_finite()) {
-        return Err(DrawParamsError::Radius);
-    }
-    if !dab.strength.is_finite() {
-        return Err(DrawParamsError::Strength);
-    }
+    let [x, y, z] = dab.position;
+    check_dab(Vec3::new(x, y, z), dab.radius, dab.strength)?;
     Ok(Imprint::new(
         dab.position,
         dab.normal,
@@ -283,16 +292,22 @@ pub(crate) fn apply_imprints(
     let mut laps = Laps::start();
     let mut times = PhaseTimes::default();
 
-    let queries: Vec<Vec<TileKey>> = widened(imprints)
-        .map(|(center, reach)| index.query_sphere(center, reach).collect())
+    let queries: Vec<Vec<TileKey>> = imprints
+        .iter()
+        .map(|imprint| {
+            index
+                .query_sphere(centre(imprint), imprint.radius)
+                .collect()
+        })
         .collect();
     let frame_tiles: BTreeSet<TileKey> = queries.iter().flatten().copied().collect();
     let frame_tiles: Vec<TileKey> = frame_tiles.into_iter().collect();
     times.query = laps.lap();
 
-    let pins = match store.pin(&frame_tiles) {
+    let held = headroom(store, &frame_tiles)?;
+    let pins = match store.pin(&held) {
         Ok(pins) => pins,
-        Err(CacheError::OverBudget { .. }) if imprints.len() > 1 => {
+        Err(CacheError::OverBudget { .. } | CacheError::Full) if imprints.len() > 1 => {
             let (first, second) = imprints.split_at(imprints.len() / 2);
             let mut stats = apply_imprints(store, index, stroke, first)?;
             stats += apply_imprints(store, index, stroke, second)?;
@@ -313,6 +328,7 @@ pub(crate) fn apply_imprints(
 
     Ok(ApplyStats {
         dabs: imprints.len(),
+        frames: 1,
         candidates: frame_tiles.len(),
         tiles_edited: frame.edited.len(),
         vertices: frame.vertices,
@@ -322,33 +338,24 @@ pub(crate) fn apply_imprints(
     })
 }
 
-/// How far, relative to the strengths summed, a seam vertex can move past them: rounding in the
-/// sums and in the positions evaluated from them, with a wide margin.
-const MOVE_SLACK: f32 = 1e-3;
-
-/// How far, relative to the size of the coordinates, a position evaluated again can differ from
-/// its value plus its move: a few units in the last place of an `f32`, with a wide margin.
-const POSITION_SLACK: f32 = 1e-5;
-
-/// Each imprint's centre and the radius of its query.
+/// The tiles a frame over `frame_tiles` pins, in key order.
 ///
-/// That is its own radius, widened by the most the imprints before it can have moved a vertex
-/// of a tile none of them edited (see "The frame's tiles" in the module notes). The first
-/// imprint's is its own radius exactly.
-fn widened(imprints: &[Imprint]) -> impl Iterator<Item = (Vec3, f32)> + '_ {
-    let mut moved = 0.0_f32;
-    imprints.iter().map(move |imprint| {
-        let [x, y, z] = imprint.center;
-        let center = Vec3::new(x, y, z);
-        let reach = if moved > 0.0 {
-            let size = x.abs().max(y.abs()).max(z.abs()) + imprint.radius + moved;
-            imprint.radius + moved * (1.0 + MOVE_SLACK) + size * POSITION_SLACK
-        } else {
-            imprint.radius
-        };
-        moved += imprint.strength.abs();
-        (center, reach)
-    })
+/// Those, every tile whose normals read one of them (what the neighbours' wave can evaluate
+/// again), and every tile those tiles' normals read (what the wave reads): two rings of
+/// neighbours.
+///
+/// # Errors
+///
+/// As [`TileStore::stale_after`].
+fn headroom(store: &TileStore, frame_tiles: &[TileKey]) -> Result<Vec<TileKey>, CacheError> {
+    let wave = store.stale_after(frame_tiles)?;
+    store.stale_after(&wave)
+}
+
+/// `imprint`'s centre as a vector.
+fn centre(imprint: &Imprint) -> Vec3 {
+    let [x, y, z] = imprint.center;
+    Vec3::new(x, y, z)
 }
 
 /// What a frame's dabs have done so far.
@@ -356,6 +363,9 @@ fn widened(imprints: &[Imprint]) -> impl Iterator<Item = (Vec3, f32)> + '_ {
 struct Frame {
     /// Every tile holding a vertex within a dab's radius: those whose positions moved.
     reached: BTreeSet<TileKey>,
+    /// The box of each tile of `reached` as it is now, taken after the dab that last moved it;
+    /// `None` for one with no finite position.
+    boxes: std::collections::BTreeMap<TileKey, Option<Aabb>>,
     /// Every tile whose corrections a dab edited.
     edited: BTreeSet<TileKey>,
     /// Vertex moves, summed over the dabs.
@@ -366,10 +376,10 @@ struct Frame {
 
 /// Step 3 of the module notes for each of `imprints` in turn.
 ///
-/// `queries[k]` holds the tiles imprint `k`'s widened sphere touches, every one pinned. Each
-/// dab is brushed and written, and the tiles it moved made current for the next. Stops at the
-/// first error, `frame` holding what the dabs before it (and the failing one's brush, if it
-/// ran) reached.
+/// `queries[k]` holds the tiles imprint `k`'s sphere touches by their boxes as the frame found
+/// them, every one pinned. Each dab is brushed and written, and the tiles it moved made current
+/// for the next, their boxes taken again. Stops at the first error, `frame` holding what the
+/// dabs before it (and the failing one's brush, if it ran) reached.
 ///
 /// # Errors
 ///
@@ -384,14 +394,9 @@ fn run_dabs(
     times: &mut PhaseTimes,
     laps: &mut Laps,
 ) -> Result<(), CacheError> {
-    let mut moved: Vec<TileKey> = Vec::new();
-    for (imprint, query) in imprints.iter().zip(queries) {
-        if !moved.is_empty() {
-            store.evaluate_many(&moved, Evaluation::Positions)?;
-            times.evaluate += laps.lap();
-        }
-        let keys: BTreeSet<TileKey> = query.iter().chain(&frame.edited).copied().collect();
-        let keys: Vec<TileKey> = keys.into_iter().collect();
+    let dabs = imprints.iter().zip(queries).enumerate();
+    for (k, (imprint, query)) in dabs {
+        let keys = frame.tiles_for(imprint, query);
         let found = run_brush(store, &keys, imprint)?;
         frame.reached.extend(&found.reached);
         times.brush += laps.lap();
@@ -408,20 +413,57 @@ fn run_dabs(
         frame.vertices += found.vertices;
         raise_display_bounds(store, &found)?;
         times.edit += laps.lap();
-        moved = found.reached;
+
+        if k + 1 < imprints.len() && !found.reached.is_empty() {
+            store.evaluate_many(&found.reached, Evaluation::Positions)?;
+            frame.rebox(store, &found.reached);
+            times.evaluate += laps.lap();
+        }
     }
     Ok(())
+}
+
+impl Frame {
+    /// The tiles `imprint` is brushed over, in key order (see "The frame's tiles" in the module
+    /// notes): those of `query`, its tiles by their boxes as the frame found them, that the frame
+    /// hasn't reached, and those it has reached whose boxes now touch its sphere.
+    fn tiles_for(&self, imprint: &Imprint, query: &[TileKey]) -> Vec<TileKey> {
+        let centre = centre(imprint);
+        let radius_squared = imprint.radius * imprint.radius;
+        let unmoved = query.iter().filter(|key| !self.reached.contains(key));
+        let moved = self.boxes.iter().filter_map(|(key, aabb)| {
+            aabb.filter(|aabb| aabb.distance_squared(centre) <= radius_squared)
+                .map(|_| key)
+        });
+        let keys: BTreeSet<TileKey> = unmoved.chain(moved).copied().collect();
+        keys.into_iter().collect()
+    }
+
+    /// Takes again the boxes of `moved`, tiles just made current, from their cached positions,
+    /// on the store's workers.
+    fn rebox(&mut self, store: &TileStore, moved: &[TileKey]) {
+        let cached: Vec<Option<&[Vec3]>> = moved
+            .iter()
+            .map(|key| store.cached_positions(key))
+            .collect();
+        let boxes: Vec<Option<Aabb>> = store.par_map(&cached, |positions| {
+            positions.and_then(|positions| Aabb::from_points(positions.iter().copied()))
+        });
+        let fresh = moved.iter().copied().zip(boxes);
+        self.boxes.extend(fresh);
+    }
 }
 
 /// Steps 4 to 6 of the module notes for the tiles `reached`.
 ///
 /// Lists the tiles whose bounds may have changed, evaluates them, refits `index` and closes the
-/// store's epoch. Returns how many tiles were evaluated and refitted.
+/// store's epoch, which it closes even if an earlier step failed. Returns how many tiles were
+/// evaluated and refitted.
 ///
 /// # Errors
 ///
 /// As [`TileStore::stale_after`], [`TileStore::evaluate_many_with_bounds`],
-/// [`SpatialIndex::refit_with`] and [`TileStore::close_epoch`].
+/// [`SpatialIndex::refit_with`] and [`TileStore::close_epoch`]: the first that failed.
 fn finish(
     store: &mut TileStore,
     index: &mut SpatialIndex,
@@ -430,7 +472,32 @@ fn finish(
     laps: &mut Laps,
 ) -> Result<usize, SculptError> {
     let reached: Vec<TileKey> = reached.iter().copied().collect();
-    let changed = store.stale_after(&reached)?;
+    let refitted = refit(store, index, &reached, times, laps);
+    // The frame's edits and their re-evaluation are one epoch of the stale-tile feed, closed
+    // whatever failed before: a reader relies on one closed epoch a call.
+    let closed = store.close_epoch();
+    times.refit += laps.lap();
+    let updated = refitted?;
+    closed?;
+    Ok(updated)
+}
+
+/// Steps 4 to 6 of the module notes but the epoch: lists the tiles whose bounds may have changed
+/// after `reached`, evaluates them and refits `index`. Returns how many tiles were evaluated and
+/// refitted.
+///
+/// # Errors
+///
+/// As [`TileStore::stale_after`], [`TileStore::evaluate_many_with_bounds`] and
+/// [`SpatialIndex::refit_with`].
+fn refit(
+    store: &mut TileStore,
+    index: &mut SpatialIndex,
+    reached: &[TileKey],
+    times: &mut PhaseTimes,
+    laps: &mut Laps,
+) -> Result<usize, SculptError> {
+    let changed = store.stale_after(reached)?;
     times.neighbours += laps.lap();
 
     let wave = store.evaluate_many_with_bounds(&changed)?;
@@ -439,9 +506,6 @@ fn finish(
     // The tiles were made current together just above, their bounds computed with their
     // normals: the refit takes those, and reads any other tile from the cache.
     index.refit_with(store, &changed, &wave)?;
-    // The frame's edits and their re-evaluation are one epoch of the stale-tile feed.
-    store.close_epoch()?;
-    times.refit += laps.lap();
     Ok(changed.len())
 }
 
@@ -520,7 +584,8 @@ fn run_brush(
         })
     };
     let mut found = BrushOutput::default();
-    for (&key, tile) in keys.iter().zip(brushed) {
+    let tiles = keys.iter().zip(brushed);
+    for (&key, tile) in tiles {
         let tile = tile.map_or_else(|| brush_evicted(store, key, imprint), Ok)?;
         if !tile.reached {
             continue;
@@ -598,7 +663,8 @@ pub(crate) fn brush_tile(
             moved: 0,
         };
     }
-    for ((i, j), delta) in vertices(key.side()).zip(&mut deltas) {
+    let grid = vertices(key.side()).zip(&mut deltas);
+    for ((i, j), delta) in grid {
         if *delta != 0.0 && !topology.owns(&key, i, j) {
             *delta = 0.0;
         }

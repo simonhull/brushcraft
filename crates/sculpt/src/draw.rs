@@ -67,15 +67,7 @@ impl DrawParams {
     /// `radius` isn't positive and finite, [`DrawParamsError::Strength`] if `strength` isn't
     /// finite.
     pub fn new(center: Vec3, radius: f32, strength: f32) -> Result<Self, DrawParamsError> {
-        if !center.is_finite() {
-            return Err(DrawParamsError::Center);
-        }
-        if !(radius > 0.0 && radius.is_finite()) {
-            return Err(DrawParamsError::Radius);
-        }
-        if !strength.is_finite() {
-            return Err(DrawParamsError::Strength);
-        }
+        check_dab(center, radius, strength)?;
         Ok(Self {
             center,
             radius,
@@ -115,6 +107,26 @@ impl DrawParams {
             [0.0; 4],
         )
     }
+}
+
+/// Checks a dab's values as [`DrawParams::new`] and [`apply_dabs`](crate::apply_dabs) take
+/// them: a finite centre, a positive and finite radius and a finite strength.
+///
+/// # Errors
+///
+/// [`DrawParamsError::Center`], [`DrawParamsError::Radius`] or [`DrawParamsError::Strength`],
+/// for the first value that isn't so.
+pub(crate) fn check_dab(center: Vec3, radius: f32, strength: f32) -> Result<(), DrawParamsError> {
+    if !center.is_finite() {
+        return Err(DrawParamsError::Center);
+    }
+    if !(radius > 0.0 && radius.is_finite()) {
+        return Err(DrawParamsError::Radius);
+    }
+    if !strength.is_finite() {
+        return Err(DrawParamsError::Strength);
+    }
+    Ok(())
 }
 
 /// What one [`draw_step`] did, and how long each phase took.
