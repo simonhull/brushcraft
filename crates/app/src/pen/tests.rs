@@ -70,19 +70,28 @@ impl Backend for Mock {
         *self.running.borrow()
     }
 
-    fn losses(&self) -> (u64, u64) {
-        (3, 0)
+    fn losses(&self) -> Losses {
+        Losses {
+            dropped: 3,
+            lost: 0,
+        }
     }
 
-    fn stop(mut self, scale: f64, out: &mut Vec<PenSample>) -> Result<()> {
+    fn stop(mut self, scale: f64, out: &mut Vec<PenSample>) -> (Losses, Result<()>) {
         self.log.borrow_mut().push("backend stopped");
         self.drain(scale, out);
         let late = self.late.drain(..).map(|sample| scaled(sample, scale));
         out.extend(late);
-        match self.error {
-            Some(error) => bail!("{error}"),
+        // More lost after the last look: the final count is the stop's.
+        let losses = Losses {
+            dropped: 5,
+            lost: 1,
+        };
+        let result = match self.error {
+            Some(error) => Err(anyhow::anyhow!("{error}")),
             None => Ok(()),
-        }
+        };
+        (losses, result)
     }
 }
 
@@ -215,7 +224,11 @@ fn a_backend_that_stops_on_its_own_hands_over_to_the_fallback() {
             why: "our backend stopped: the Wayland connection failed".into()
         }
     );
-    assert_eq!(status.dropped, 3, "its losses stay counted");
+    assert_eq!(
+        (status.dropped, status.lost),
+        (5, 1),
+        "its final losses, counted at the stop, stay counted"
+    );
     pen.winit(WinitEvent::Entered, Some(Pixel::default()), None, (t0, 2));
     pen.drain(&mut out);
     assert_eq!(out.len(), 2, "winit's events follow");
@@ -340,14 +353,16 @@ fn gap_sd(times: &[Instant], skip: usize) -> f64 {
         .skip(skip)
         .collect();
     let n = f64::from(u32::try_from(gaps.len()).expect("few"));
-    let mean = gaps.iter().sum::<f64>() / n;
-    (gaps.iter().map(|gap| (gap - mean).powi(2)).sum::<f64>() / n).sqrt()
+    let total: f64 = gaps.iter().sum();
+    let mean = total / n;
+    let squares: f64 = gaps.iter().map(|gap| (gap - mean).powi(2)).sum();
+    (squares / n).sqrt()
 }
 
 #[test]
 fn a_recorded_fallback_stroke_keeps_its_order_and_runs_on_the_pens_clock() {
     let log = Log::default();
-    let mut pen = stream(&log, |_| bail!("X11"));
+    let mut pen = stream(&log, |_| bail!("no Wayland tablet support"));
     let events = recorded(2, 300);
     let numbered = events.iter().zip(1_u64..);
     for (&(event, at, received, _), wakeup) in numbered {
@@ -674,4 +689,160 @@ fn a_lost_up_ends_the_old_drag_before_the_next() {
             button: Button::PenTip
         })
     ));
+}
+
+#[test]
+fn a_stroke_left_half_done_at_the_hand_over_ends_with_a_leave() {
+    let log = Log::default();
+    let t0 = Instant::now();
+    let running = Rc::new(RefCell::new(true));
+    let mut pen = stream(&log, |_| {
+        let mut mock = Mock::new(&log);
+        mock.running = Rc::clone(&running);
+        mock.late.push(sample(Phase::Down, (10.0, 10.0), t0));
+        mock.late.push(sample(Phase::Drag, (12.0, 10.0), t0));
+        Ok(mock)
+    });
+    *running.borrow_mut() = false;
+    let mut out = Vec::new();
+    pen.drain(&mut out);
+    let phases: Vec<Phase> = out.iter().map(|sample| sample.phase).collect();
+    assert_eq!(phases, [Phase::Down, Phase::Drag, Phase::Leave]);
+    let leave = out.last().expect("a leave");
+    assert_eq!(
+        leave.at,
+        Pixel { x: 24.0, y: 20.0 },
+        "where the stroke stopped"
+    );
+    assert_eq!(leave.pressure, Unit::ZERO);
+    let inputs = navigation(&out);
+    assert_eq!(
+        inputs.last(),
+        Some(&Input::Release {
+            button: Button::PenTip
+        }),
+        "navigation's drag ends: {inputs:?}"
+    );
+}
+
+#[test]
+fn a_backend_that_stops_between_strokes_adds_no_leave() {
+    let log = Log::default();
+    let t0 = Instant::now();
+    let running = Rc::new(RefCell::new(true));
+    let mut pen = stream(&log, |_| {
+        let mut mock = Mock::new(&log);
+        mock.running = Rc::clone(&running);
+        mock.queued.push(sample(Phase::Down, (1.0, 1.0), t0));
+        mock.late.push(sample(Phase::Up, (1.0, 1.0), t0));
+        Ok(mock)
+    });
+    let mut out = Vec::new();
+    pen.drain(&mut out);
+    *running.borrow_mut() = false;
+    pen.drain(&mut out);
+    let phases: Vec<Phase> = out.iter().map(|sample| sample.phase).collect();
+    assert_eq!(phases, [Phase::Down, Phase::Up], "the up ended it already");
+}
+
+#[test]
+fn a_lost_up_then_hover_releases_the_tip() {
+    let t0 = Instant::now();
+    let inputs = navigation(&[
+        sample(Phase::Down, (0.0, 0.0), t0),
+        sample(Phase::Drag, (5.0, 0.0), t0),
+        sample(Phase::Hover, (6.0, 0.0), t0),
+    ]);
+    assert_eq!(
+        inputs.get(3..),
+        Some(
+            &[
+                Input::Release {
+                    button: Button::PenTip
+                },
+                Input::Move {
+                    at: Pixel { x: 6.0, y: 0.0 }
+                },
+            ][..]
+        ),
+        "{inputs:?}"
+    );
+}
+
+#[test]
+fn winit_taking_the_pen_from_a_silent_backend_hands_over_to_the_fallback() {
+    let log = Log::default();
+    let t0 = Instant::now();
+    let mut pen = stream(&log, |_| Ok(Mock::new(&log)));
+    let mut out = Vec::new();
+    let held = STARVED - 1;
+    let events = (0..held).map(|i| {
+        (
+            i,
+            if i == 0 {
+                WinitEvent::Entered
+            } else {
+                WinitEvent::Moved
+            },
+        )
+    });
+    for (i, event) in events {
+        let x = f64::from(u32::try_from(i).expect("small"));
+        pen.winit(event, Some(Pixel { x, y: 0.0 }), None, (t0, 1));
+    }
+    pen.drain(&mut out);
+    assert!(out.is_empty(), "held back while ours may still deliver");
+    assert_eq!(pen.status().source, PenSource::Ours);
+    pen.winit(WinitEvent::Moved, Some(Pixel::default()), None, (t0, 2));
+    assert!(matches!(pen.status().source, PenSource::Fallback { .. }));
+    assert_eq!(*log.borrow(), ["backend stopped", "backend dropped"]);
+    pen.drain(&mut out);
+    assert_eq!(out.len(), STARVED, "every held sample is kept, in order");
+    assert_eq!(out.first().map(|sample| sample.phase), Some(Phase::Enter));
+}
+
+#[test]
+fn winits_duplicates_are_dropped_while_ours_delivers() {
+    let log = Log::default();
+    let t0 = Instant::now();
+    let mut pen = stream(&log, |_| {
+        let mut mock = Mock::new(&log);
+        mock.queued.push(sample(Phase::Enter, (1.0, 1.0), t0));
+        Ok(mock)
+    });
+    pen.winit(WinitEvent::Entered, Some(Pixel::default()), None, (t0, 1));
+    let mut out = Vec::new();
+    pen.drain(&mut out);
+    assert_eq!(out.len(), 1, "ours only");
+    assert_eq!(pen.status().source, PenSource::Ours);
+}
+
+#[test]
+fn a_barrel_pressed_and_released_mid_drag_leaves_the_orbit_alone() {
+    let t0 = Instant::now();
+    let ball = Arcball::new(render::surface::Size::new(200, 100).expect("non-zero"));
+    let samples = [
+        sample(Phase::Down, (100.0, 50.0), t0),
+        holding(sample(Phase::Drag, (110.0, 50.0), t0), Buttons::SECONDARY),
+        holding(sample(Phase::Drag, (120.0, 50.0), t0), Buttons::SECONDARY),
+        sample(Phase::Drag, (130.0, 50.0), t0),
+    ];
+    let mut navigator = Navigator::default();
+    let mut camera = Camera::default();
+    let inputs = navigation(&samples);
+    let mut before_last = camera;
+    let count = inputs.len();
+    let numbered = inputs.into_iter().enumerate();
+    for (i, input) in numbered {
+        if i + 1 == count {
+            before_last = camera;
+        }
+        navigator.apply(input, &mut camera, &ball, 100.0);
+    }
+    assert_eq!(navigator.gesture(), Some(Gesture::Orbit), "still orbiting");
+    assert_ne!(
+        camera, before_last,
+        "the drag lives: the last motion orbited"
+    );
+    assert_eq!(camera.target(), Camera::default().target(), "never panned");
 }

@@ -5,9 +5,10 @@
 //! ([`input::wayland::PenBackend`]), read on a thread of its own and stamped through `input`'s
 //! [`Dejitter`](input::Dejitter) there; the research note `pen-input-wayland.md` chose it over
 //! winit (both barrel buttons, no strokes broken by a barrel release, a lower p99 under load).
-//! Where it can't start (X11, a compositor without the tablet protocol, another platform), the
-//! stream falls back to winit's tablet events, stamped through a [`Dejitter`](input::Dejitter)
-//! of its own on arrival ([`fallback`]), and the overlay says so ([`PenStatus`]). Either way the
+//! Where it can't start (a compositor without Wayland tablet support, another platform; winit is
+//! built for Wayland alone, so there is no X11 session to fall back from), the stream falls back
+//! to winit's tablet events, stamped through a [`Dejitter`](input::Dejitter) of its own on
+//! arrival ([`fallback`]), and the overlay says so ([`PenStatus`]). Either way the
 //! rest of the app sees one kind of sample, [`PenSample`], in physical pixels.
 //!
 //! **Into the frame loop.** The window drains the stream ([`PenStream::drain`]) on the owner
@@ -40,7 +41,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use input::{Buttons, Phase, Tilt, Tool, Unit};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
@@ -184,6 +185,15 @@ impl fmt::Display for PenStatus {
     }
 }
 
+/// What a backend's queue lost: motion dropped, and phase changes lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Losses {
+    /// Samples dropped (motion only) because the app fell behind.
+    pub(crate) dropped: u64,
+    /// Phase changes lost because even the queue's reserve was full.
+    pub(crate) lost: u64,
+}
+
 /// A pen backend the stream can run: our Wayland one, or a test's stand-in.
 pub(crate) trait Backend {
     /// Appends the samples queued over the window since the last drain to `out`, in order, at
@@ -193,17 +203,26 @@ pub(crate) trait Backend {
     /// Whether the backend's thread is still reading.
     fn running(&self) -> bool;
 
-    /// Samples dropped and phase changes lost by the backend's queue so far.
-    fn losses(&self) -> (u64, u64);
+    /// What the backend's queue has lost so far.
+    fn losses(&self) -> Losses;
 
     /// Stops the backend, joining its thread, and appends what it queued since the last drain
-    /// to `out`.
+    /// to `out`; returns what its queue lost over the whole run, counted once the thread has
+    /// been joined.
     ///
     /// # Errors
     ///
-    /// The error that stopped the backend's thread early, if one did.
-    fn stop(self, scale: f64, out: &mut Vec<PenSample>) -> Result<()>;
+    /// The error that stopped the backend's thread early, if one did, beside the losses.
+    fn stop(self, scale: f64, out: &mut Vec<PenSample>) -> (Losses, Result<()>);
 }
+
+/// winit tablet events in a row, with nothing from our backend meanwhile, that hand the pen to
+/// winit.
+///
+/// After so many the compositor is taken to send the pen to winit rather than to us: about a
+/// third of a second of pen motion, far more than a compositor that sends to both would let pile
+/// up between drains.
+const STARVED: usize = 64;
 
 /// Where the stream's samples come from now.
 #[derive(Debug)]
@@ -212,38 +231,46 @@ enum Source<B> {
     Ours(B),
     /// winit's tablet events.
     Fallback {
-        /// winit's tool, followed and de-jittered; boxed, as it is large beside a backend.
-        winit: Box<WinitPen>,
         /// Why our backend isn't running.
         why: Arc<str>,
     },
-}
-
-impl<B> Source<B> {
-    /// The fallback, because of `why`.
-    fn fallback(why: &str) -> Self {
-        Self::Fallback {
-            winit: Box::default(),
-            why: Arc::from(why),
-        }
-    }
 }
 
 /// The app's one pen stream: our backend where it runs, winit's tablet events otherwise.
 ///
 /// It holds the window (`W`, an `Arc` of it in the app) so the window outlives the backend:
 /// `source` is declared before `window`, so dropping the stream drops the backend (joining its
-/// thread) before this hold on the window goes. The order is load-bearing.
+/// thread) before this hold on the window goes. The order is load-bearing (our backend also
+/// holds the window itself, after its thread).
+///
+/// **Which source wins.** While our backend runs, winit's tablet events are still followed (so
+/// the fallback can take over mid-session with the tool's state right) but held back: the
+/// compositors measured send the pen to one tablet binding per client, ours, so winit gets none
+/// (`pen-input-wayland.md`). If winit gets [`STARVED`] events with nothing from ours meanwhile,
+/// the compositor sends the pen to winit instead: ours is stopped and the held samples are the
+/// stream from then on.
+///
+/// **After our backend stops** on its own, the fallback takes over, but whether the compositor
+/// then sends the pen to winit's binding is unverified on Hyprland (one binding per client: it
+/// may keep none for winit once ours is gone); the overlay says the stream fell back either way.
+/// A stroke our backend left half done (its last sample a `Down` or `Drag`) is ended with a
+/// synthetic `Leave` at that sample's position, so neither navigation nor the brush is left
+/// waiting for an `Up`.
 #[derive(Debug)]
 pub(crate) struct PenStream<B, W> {
     /// Where samples come from. Declared before `window`: see the type's notes.
     source: Source<B>,
+    /// winit's tool, followed and de-jittered whatever the source; boxed, as it is large.
+    winit: Box<WinitPen>,
     /// Physical pixels per logical pixel: our backend reports logical ones.
     scale: f64,
-    /// Samples from winit's events not yet drained.
+    /// Samples not yet drained: winit's on the fallback, or held back while ours runs; first, a
+    /// hand-over's last samples from ours.
     pending: Vec<PenSample>,
-    /// Samples dropped and lost by a backend that has since stopped.
-    losses: (u64, u64),
+    /// What a backend that has since stopped lost.
+    losses: Losses,
+    /// The last sample drained, to end a stroke the backend leaves half done.
+    last: Option<PenSample>,
     /// The window. Declared after `source`: see the type's notes.
     window: W,
 }
@@ -254,13 +281,17 @@ impl<B: Backend, W> PenStream<B, W> {
     pub(crate) fn start(window: W, scale: f64, spawn: impl FnOnce(&W) -> Result<B>) -> Self {
         let source = match spawn(&window) {
             Ok(backend) => Source::Ours(backend),
-            Err(e) => Source::fallback(&format!("{e:#}")),
+            Err(e) => Source::Fallback {
+                why: Arc::from(format!("{e:#}")),
+            },
         };
         Self {
             source,
+            winit: Box::default(),
             scale,
             pending: Vec::new(),
-            losses: (0, 0),
+            losses: Losses::default(),
+            last: None,
             window,
         }
     }
@@ -277,12 +308,9 @@ impl<B: Backend, W> PenStream<B, W> {
 
     /// Where the samples come from, and what our backend's queue lost.
     pub(crate) fn status(&self) -> PenStatus {
-        let (source, (dropped, lost)) = match &self.source {
-            Source::Ours(backend) => {
-                let (dropped, lost) = backend.losses();
-                (PenSource::Ours, (dropped, lost))
-            }
-            Source::Fallback { why, .. } => (
+        let (source, losses) = match &self.source {
+            Source::Ours(backend) => (PenSource::Ours, backend.losses()),
+            Source::Fallback { why } => (
                 PenSource::Fallback {
                     why: Arc::clone(why),
                 },
@@ -291,8 +319,8 @@ impl<B: Backend, W> PenStream<B, W> {
         };
         PenStatus {
             source,
-            dropped,
-            lost,
+            dropped: losses.dropped,
+            lost: losses.lost,
         }
     }
 
@@ -301,30 +329,59 @@ impl<B: Backend, W> PenStream<B, W> {
     /// A backend found stopped is joined and replaced by the fallback (its error is the
     /// fallback's reason, shown in the overlay), keeping what it queued before it stopped.
     pub(crate) fn drain(&mut self, out: &mut Vec<PenSample>) {
+        let start = out.len();
         match &mut self.source {
-            Source::Ours(backend) if backend.running() => backend.drain(self.scale, out),
-            Source::Ours(_) => self.fall_back(out),
+            Source::Ours(backend) if backend.running() => {
+                backend.drain(self.scale, out);
+                if out.len() > start {
+                    // Ours delivers: what winit got meanwhile is a duplicate, not the stream.
+                    self.pending.clear();
+                }
+            }
+            Source::Ours(_) => {
+                self.fall_back(None);
+                out.append(&mut self.pending);
+            }
             Source::Fallback { .. } => out.append(&mut self.pending),
+        }
+        if let Some(last) = out.get(start..).and_then(<[PenSample]>::last) {
+            self.last = Some(*last);
         }
     }
 
-    /// Joins a backend that stopped on its own, appending what it queued to `out`, and falls
-    /// back to winit's events, with the backend's error as the reason.
-    fn fall_back(&mut self, out: &mut Vec<PenSample>) {
-        let placeholder = Source::fallback("");
-        if let Source::Ours(backend) = std::mem::replace(&mut self.source, placeholder) {
-            self.losses = backend.losses();
-            let why = match backend.stop(self.scale, out) {
-                Ok(()) => "our backend stopped".to_owned(),
-                Err(e) => format!("our backend stopped: {e:#}"),
-            };
-            self.source = Source::fallback(&why);
+    /// Stops our backend (it stopped on its own, or `starved` says why winit has the pen),
+    /// joining it, and falls back to winit's events. Its last samples go first into the
+    /// pending ones, then a `Leave` if it left a stroke half done, then winit's held samples.
+    fn fall_back(&mut self, starved: Option<&str>) {
+        let placeholder = Source::Fallback { why: Arc::from("") };
+        let Source::Ours(backend) = std::mem::replace(&mut self.source, placeholder) else {
+            return;
+        };
+        let mut handed = Vec::new();
+        let (losses, stopped) = backend.stop(self.scale, &mut handed);
+        self.losses = losses;
+        if let Some(last) = handed.last() {
+            self.last = Some(*last);
         }
+        if let Some(leave) = self.last.and_then(|last| ended(&last, Instant::now())) {
+            handed.push(leave);
+            self.last = Some(leave);
+        }
+        let why = match (starved, stopped) {
+            (Some(why), _) => why.to_owned(),
+            (None, Ok(())) => "our backend stopped".to_owned(),
+            (None, Err(e)) => format!("our backend stopped: {e:#}"),
+        };
+        self.source = Source::Fallback {
+            why: Arc::from(why),
+        };
+        handed.append(&mut self.pending);
+        self.pending = handed;
     }
 
     /// Takes one of winit's tablet events, `event` at `at` with the tool's `data` where it has
-    /// it, received at `received` in event-loop wakeup `wakeup`. Followed only on the fallback:
-    /// while our backend runs, its samples are the pen's (and the compositor sends winit none).
+    /// it, received at `received` in event-loop wakeup `wakeup`: the stream on the fallback,
+    /// held back while our backend runs (see the type's notes).
     pub(crate) fn winit(
         &mut self,
         event: WinitEvent,
@@ -332,9 +389,12 @@ impl<B: Backend, W> PenStream<B, W> {
         data: Option<ToolData>,
         (received, wakeup): (Instant, u64),
     ) {
-        if let Source::Fallback { winit, .. } = &mut self.source {
-            self.pending
-                .push(winit.apply(event, at, data, (received, wakeup)));
+        self.pending
+            .push(self.winit.apply(event, at, data, (received, wakeup)));
+        if matches!(self.source, Source::Ours(_)) && self.pending.len() >= STARVED {
+            self.fall_back(Some(
+                "the compositor sends the pen to winit, not to our backend",
+            ));
         }
     }
 
@@ -355,7 +415,7 @@ impl<B: Backend, W> PenStream<B, W> {
             ..
         } = self;
         let stopped = match source {
-            Source::Ours(backend) => backend.stop(scale, out),
+            Source::Ours(backend) => backend.stop(scale, out).1,
             Source::Fallback { .. } => {
                 out.append(&mut pending);
                 Ok(())
@@ -363,6 +423,18 @@ impl<B: Backend, W> PenStream<B, W> {
         };
         (window, stopped)
     }
+}
+
+/// The `Leave` that ends a stroke `last` left half done (a `Down` or `Drag` with no `Up`), at
+/// its position, received `now`; `None` if `last` ended one already.
+fn ended(last: &PenSample, now: Instant) -> Option<PenSample> {
+    matches!(last.phase, Phase::Down | Phase::Drag).then(|| PenSample {
+        phase: Phase::Leave,
+        pressure: Unit::ZERO,
+        timestamp: now,
+        received: now,
+        ..*last
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -383,11 +455,11 @@ impl Backend for Ours {
         match *self {}
     }
 
-    fn losses(&self) -> (u64, u64) {
+    fn losses(&self) -> Losses {
         match *self {}
     }
 
-    fn stop(self, _: f64, _: &mut Vec<PenSample>) -> Result<()> {
+    fn stop(self, _: f64, _: &mut Vec<PenSample>) -> (Losses, Result<()>) {
         match self {}
     }
 }
@@ -397,8 +469,8 @@ pub(crate) type AppPen = PenStream<Ours, Arc<dyn Window>>;
 
 impl AppPen {
     /// Creates the app's window from `attributes`, with decorations off whatever they say, and
-    /// its pen stream: our backend on Wayland, winit's tablet events elsewhere or if it fails to
-    /// start. [`window`](Self::window) is the window.
+    /// its pen stream: our backend on Wayland, winit's tablet events on another platform or if
+    /// it fails to start. [`window`](Self::window) is the window.
     ///
     /// The backend spawns once winit has returned the window, which it does only after the
     /// window's first configure.
@@ -410,32 +482,66 @@ impl AppPen {
         event_loop: &dyn ActiveEventLoop,
         attributes: WindowAttributes,
     ) -> Result<Self> {
-        let window: Arc<dyn Window> = Arc::from(
-            event_loop
-                .create_window(attributes.with_decorations(false))
-                .context("creating the window")?,
-        );
+        let (window, undecorated) = undecorated::create(event_loop, attributes)?;
         let scale = window.scale_factor();
         Ok(Self::start(window, scale, |window| {
-            spawn_ours(event_loop, window.as_ref())
+            spawn_ours(event_loop, Arc::clone(window), undecorated)
         }))
     }
 }
 
-/// Starts our backend for `window`: only for [`AppPen::create_window`], which made `window`
-/// undecorated and holds it for as long as the backend runs.
+/// The witness that a window has no decorations, which our backend's spawn asks for.
+///
+/// winit's `is_decorated` can't serve: on Hyprland it reports server-side decorations, which
+/// leave the client no surfaces, as decorated. So the only way to a witness is to create the
+/// window undecorated here.
+mod undecorated {
+    use std::sync::Arc;
+
+    use anyhow::{Context as _, Result};
+    use winit::event_loop::ActiveEventLoop;
+    use winit::window::{Window, WindowAttributes};
+
+    /// A window was created with decorations off; only [`create`] makes one.
+    #[derive(Debug)]
+    pub(crate) struct Undecorated(());
+
+    /// Creates a window from `attributes` with decorations off whatever they say, and the
+    /// witness that it has none.
+    ///
+    /// # Errors
+    ///
+    /// If winit can't create the window.
+    pub(super) fn create(
+        event_loop: &dyn ActiveEventLoop,
+        attributes: WindowAttributes,
+    ) -> Result<(Arc<dyn Window>, Undecorated)> {
+        let window = event_loop
+            .create_window(attributes.with_decorations(false))
+            .context("creating the window")?;
+        Ok((Arc::from(window), Undecorated(())))
+    }
+}
+
+/// Starts our backend for `window`, which `undecorated` proves has no decorations: only for
+/// [`AppPen::create_window`], which holds the window for as long as the backend runs (as the
+/// backend does itself).
 ///
 /// # Errors
 ///
-/// If our backend can't start: not Wayland, no tablet support, another platform.
-fn spawn_ours(event_loop: &dyn ActiveEventLoop, window: &dyn Window) -> Result<Ours> {
+/// If our backend can't start: no Wayland tablet support, another platform.
+fn spawn_ours(
+    event_loop: &dyn ActiveEventLoop,
+    window: Arc<dyn Window>,
+    undecorated: undecorated::Undecorated,
+) -> Result<Ours> {
     #[cfg(target_os = "linux")]
     {
-        Ours::spawn(event_loop, window)
+        Ours::spawn(event_loop, window, undecorated)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (event_loop, window);
+        let _ = (event_loop, window, undecorated);
         Err(anyhow::anyhow!(
             "there is no pen backend of ours on this platform"
         ))
