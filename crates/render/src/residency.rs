@@ -1556,9 +1556,6 @@ impl Residency {
         self.normals.begin();
         self.stand_ins.planned.clear();
         self.stand_ins.stood.clear();
-        for place in std::mem::take(&mut self.stand_ins.morph_in) {
-            self.tree.set_morph_in(place, false);
-        }
         self.pending = self
             .groups
             .iter()
@@ -2042,14 +2039,12 @@ impl Residency {
                         if old != slot {
                             self.pools.release(old);
                         }
-                        // New data from the store: a stand-in it replaces morphs out, if the
-                        // data is caught up (else it stands in again, in this frame).
+                        // New data from the store: it replaces a stand-in in place, at the
+                        // same level, with no morph (spec, "A stroke seen from a distance",
+                        // amended 2026-11-01); data still behind a step stands in again, in
+                        // this frame.
                         if let Some(row) = self.stand_ins.rows.release(place) {
                             self.stand_ins.row_frees.push(row);
-                            if !self.is_behind(place, version) {
-                                self.tree.set_morph_in(place, true);
-                                self.stand_ins.morph_in.push(place);
-                            }
                         }
                         self.loaded(place);
                     } else {

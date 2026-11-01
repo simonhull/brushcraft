@@ -3,7 +3,7 @@
 //! A sphere whose stored display tiles lag its finest level, seen from a distance (no finest tile
 //! resident). The edited finest tiles go up through the scratch, every resident display tile above
 //! them stands in in the frame of the step (and one arriving after it, in its first frame), and the
-//! refresh replaces them, morphing in.
+//! refresh replaces them in place.
 
 use std::convert::Infallible;
 
@@ -12,7 +12,6 @@ use geom::{FaceId, FinestNormalCone};
 use super::*;
 use crate::raster::tests::standins::bumped;
 use crate::raster::tests::{finest_point, measured_error};
-use crate::tree::NODE_MORPH_IN;
 
 /// The sphere's finest grids by face, row-major.
 type Grids = BTreeMap<u32, Vec<[f32; 3]>>;
@@ -449,7 +448,7 @@ fn two_steps(gpu: &Gpu, scratch: u32) {
 }
 
 #[test]
-fn the_refresh_replaces_the_stand_ins_and_they_morph_in() {
+fn the_refresh_replaces_the_stand_ins_in_place() {
     GpuTest::run(|gpu| {
         let mut sphere = Sphere::new();
         let mut residency = residency(gpu, &sphere, 6);
@@ -475,7 +474,6 @@ fn the_refresh_replaces_the_stand_ins_and_they_morph_in() {
         let tiles = display_tiles(gpu, &residency);
         for place in &stood {
             let (vertices, node) = &tiles[place];
-            assert_ne!(node.flags & NODE_MORPH_IN, 0, "{place:?} morphs in");
             let grid = &sphere.current[&place.face().index()];
             let scale = sphere.block(*place).2 / place.level().tile_quads();
             let refreshed = measured_error(*place, sphere.finest, vertices, grid, scale);
@@ -490,20 +488,6 @@ fn the_refresh_replaces_the_stand_ins_and_they_morph_in() {
             "the step is caught up with"
         );
         check(gpu, &residency, &sphere);
-        frame(
-            gpu,
-            &mut residency,
-            &mut sphere,
-            Drained::Epochs(Vec::new()),
-            None,
-        );
-        let after = display_tiles(gpu, &residency);
-        assert!(
-            after
-                .values()
-                .all(|(_, node)| node.flags & NODE_MORPH_IN == 0),
-            "the morph-in flag is the refresh frame's alone"
-        );
     });
 }
 

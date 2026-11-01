@@ -2,15 +2,16 @@
 // for the morph's time factor, and its drawn edges, for the shading pass. One thread per cut
 // entry.
 //
-// After tree::NODE_WGSL, lod::CLUSTER_WGSL and raster::MORPH_WGSL. A tile keeps its stamp while it stays in the
-// cut from frame to frame. A tile new to the cut is stamped now, so it morphs in over the
-// duration, only when it refines what was drawn last frame (an ancestor was in the cut) and the
-// camera is still: that is a level change made with the camera still (an arrival, a refresh),
-// which would otherwise pop; so is a tile whose data replaced a stand-in (NODE_MORPH_IN). Any
-// other tile new to the cut is stamped a whole duration ago, so
-// it is drawn at its level at once: moving, the distance factor alone governs the morph; and a
-// tile replacing its finer descendants, or one with nothing drawn before it, has nothing to
-// morph from.
+// After tree::NODE_WGSL, lod::CLUSTER_WGSL and raster::MORPH_WGSL. A tile keeps its stamp while it
+// stays in the cut from frame to frame, whatever data its slot holds: new data for a tile already
+// drawn (a refresh replacing a stand-in, at the same level) is swapped in place with no morph
+// (spec, "A stroke seen from a distance", amended 2026-11-01). A tile new to the cut is stamped
+// now, so it morphs in over the duration, only when it refines what was drawn last frame (an
+// ancestor was in the cut) and the camera is still: that is a level change made with the camera
+// still (an arrival, a refresh), which would otherwise pop. Any other tile new to the cut is
+// stamped a whole duration ago, so it is drawn at its level at once: moving, the distance factor
+// alone governs the morph; and a tile replacing its finer descendants (a cut that coarsens, as
+// after a stroke), or one with nothing drawn before it, has nothing to morph from.
 
 // The tile tree.
 @group(0) @binding(0) var<storage, read> tree: array<TileNode>;
@@ -75,14 +76,8 @@ fn stamp(@builtin(global_invocation_id) id: vec3<u32>) {
     let s = morph[n];
     let staying = s.face == entry.face && s.place == entry.place
         && (s.frame == params.frame - 1u || s.frame == params.frame);
-    // Data that replaced a stand-in morphs in as an arrival does: the tile stayed in the cut,
-    // but what it draws changed (render::standin). Stamped once, in its frame's first phase.
-    let morph_in = (tree[n].flags & NODE_MORPH_IN) != 0u && s.frame != params.frame;
     var start = s.start;
-    if morph_in {
-        // Moving or still: what it draws changed in place.
-        start = params.now;
-    } else if !staying {
+    if !staying {
         start = params.now - params.duration;
         if (params.flags & MOVING) == 0u && refines_last_frame(n) {
             start = params.now;

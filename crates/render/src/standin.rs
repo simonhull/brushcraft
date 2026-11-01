@@ -6,8 +6,11 @@
 //! later. A **stand-in** is such a resident display tile, rewritten on the GPU in the frame of
 //! the step: every vertex of it that lies inside an edited finest tile takes the exact bits of
 //! the finest vertex it subsamples; every other vertex keeps its stored position, and the
-//! stored normals stay. It is never saved, read back or reused: the refresh's epoch replaces it
-//! (and its arrival morphs in, [`crate::tree::NODE_MORPH_IN`]).
+//! stored normals stay. It is never saved, read back or reused: the refresh's epoch replaces it,
+//! swapped in place at the same level with no morph (spec, amended 2026-11-01: a morph from the
+//! refreshed tile's own coarse interpolation drew the stroke's crest as a sawtooth, and the
+//! stand-in is within a few hundredths of a quad edge of the refreshed tile). A cut that coarsens
+//! after the stroke swaps as any coarsening does ([`crate::raster`], "The geomorph").
 //!
 //! # Seams
 //!

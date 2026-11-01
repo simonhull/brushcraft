@@ -3,7 +3,7 @@
 //! A wavy bump edits
 //! the finest level across a face border, the finest tiles it changed take their new data, and
 //! the pass stands in for every display tile above them. Their seams, their bound, the pinhole
-//! test beside stored tiles, the refresh morphing in over them, and the pass's cost.
+//! test beside stored tiles, the refresh swapped in over them with no morph, and the pass's cost.
 
 use std::sync::mpsc;
 use std::time::Instant;
@@ -12,7 +12,6 @@ use wgpu::{ComputePassTimestampWrites, QuerySetDescriptor, QueryType};
 
 use super::*;
 use crate::standin::{Displacement, RowWrite, StandIn, StandInPass, StandInWork};
-use crate::tree::NODE_MORPH_IN;
 use crate::upload::{Batch, StagingRing};
 
 /// Where the bump is centred: on the border between the +x and +y faces (x = y), so it moves
@@ -647,7 +646,7 @@ fn refreshed(world: &World, edit: &Edit, place: Place) -> (Vec<GpuVertex>, TileD
 }
 
 #[test]
-fn the_refresh_morphs_in_over_the_stand_ins_with_no_crack_in_any_frame() {
+fn the_refresh_swaps_in_over_the_stand_ins_at_once_with_no_crack() {
     GpuTest::run(|gpu| {
         let (mut world, edit, stood) = bumped_world(gpu, FINEST, AMPLITUDE, &[]);
         let face = edit.edited.first().expect("an edit").face();
@@ -681,20 +680,18 @@ fn the_refresh_morphs_in_over_the_stand_ins_with_no_crack_in_any_frame() {
             0,
             "stand-ins: pinholes"
         );
-        // The refresh replaces every stand-in, its tiles morphing in from frame 2.
+        // The refresh replaces every stand-in in place: the tiles stay in the cut, at their
+        // level, and draw their new data at once.
         for &place in &stood {
             let (vertices, detail) = refreshed(&world, &edit, place);
             world.rewrite(gpu, place, vertices, detail);
-            assert!(world.tree.set_morph_in(place, true));
         }
         world.write_tree(gpu);
-        let morphing: BTreeSet<Place> = cut.intersection(&stood).copied().collect();
         let mask = inside(
             &reference(gpu, &world, &view),
-            margin(&world, &cut, &view, 2.5, &morphing),
+            margin(&world, &cut, &view, 2.5, &BTreeSet::new()),
         );
-        let mut moved = 0;
-        let mut last: Option<Vec<u32>> = None;
+        let mut first: Option<Vec<u32>> = None;
         for (frame, ms) in [1000, 1040, 1080, 1120, 1200].into_iter().enumerate() {
             let image = draw_cut(gpu, &mut raster, &world, &cut, &clusters, &at(ms));
             let holes = pinholes(&mask, &image);
@@ -702,22 +699,17 @@ fn the_refresh_morphs_in_over_the_stand_ins_with_no_crack_in_any_frame() {
                 holes, 0,
                 "refresh frame {frame} at {ms} ms: {holes} pinholes"
             );
-            if let Some(last) = &last {
-                moved += last.iter().zip(&image).filter(|(a, b)| a != b).count();
-            }
-            last = Some(image);
-            if frame == 0 {
-                // The flag is the frame's alone.
-                for &place in &stood {
-                    world.tree.set_morph_in(place, false);
-                }
-                world.write_tree(gpu);
+            // No morph: the swap's first frame is already its last.
+            if let Some(first) = &first {
+                let moved = first.iter().zip(&image).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    moved, 0,
+                    "refresh frame {frame} at {ms} ms: {moved} pixels moved"
+                );
+            } else {
+                first = Some(image);
             }
         }
-        // The morph shows: the drawn surface changed while it ran.
-        assert!(moved > 0, "nothing moved while the refresh morphed in");
-        let nodes: Vec<GpuNode> = gpu.read_buffer(world.tree.buffer()).expect("read back");
-        assert!(nodes.iter().all(|n| n.flags & NODE_MORPH_IN == 0));
     });
 }
 

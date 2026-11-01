@@ -132,9 +132,6 @@ pub(super) struct StandIns {
     pub(super) stood: Vec<Stood>,
     /// Per frame staged and not yet heard of as submitted, the tiles it stood in.
     pub(super) stood_in_flight: BTreeMap<u64, Vec<Stood>>,
-    /// Tiles whose data replaced a stand-in in the last frame staged: they morph in
-    /// ([`crate::tree::NODE_MORPH_IN`], for that frame).
-    pub(super) morph_in: Vec<Place>,
     /// Finest tiles' positions as an epoch's staging read them, for the stand-ins over them:
     /// so a tile is read once an epoch.
     pub(super) positions: BTreeMap<TileKey, Vec<u32>>,
@@ -172,7 +169,6 @@ impl StandIns {
             planned: Vec::new(),
             stood: Vec::new(),
             stood_in_flight: BTreeMap::new(),
-            morph_in: Vec::new(),
             positions: BTreeMap::new(),
             keep_positions: BTreeSet::new(),
             settle: false,
@@ -607,7 +603,8 @@ impl Residency {
     }
 
     /// Whether the display tile at `place`, its data of `version`, is behind a step: one in
-    /// the index, or one it forgot.
+    /// the index, or one it forgot. For the tests.
+    #[cfg(test)]
     pub(super) fn is_behind(&self, place: Place, version: u64) -> bool {
         self.stand_ins.since(place, version).is_some()
     }
