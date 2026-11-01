@@ -11,8 +11,8 @@ use crate::tests::slab::{self, Slab};
 use crate::tests::sphere::Sphere;
 use crate::tests::{Camera, sample};
 use crate::{
-    Axis, Curve, DVec3, Dynamics, Entry, Input, MirrorPlanes, Param, PathSettings, Radial, Radius,
-    SPACING_TOLERANCE, ScreenPoint, SizeMode, Spacing, Surface, Symmetry,
+    Axis, Curve, DVec3, Dynamics, Entry, Hardness, Input, MirrorPlanes, Param, PathSettings,
+    Radial, Radius, SPACING_TOLERANCE, ScreenPoint, SizeMode, Spacing, Strength, Surface, Symmetry,
 };
 
 /// The spacing tests' tolerance: the plan's ±10 %.
@@ -507,7 +507,11 @@ fn pressure_changes_size_and_strength_per_dab() {
             sample(screen(200.0 + 400.0 * u, 300.0), u, pressure)
         })
         .collect();
-    let (dabs, radius) = run(&plain(), &camera, &mut Plane, &samples);
+    // The brush's own strength 2 and hardness 0.5: each dab's are final, the factors times them.
+    let brush = plain()
+        .with_strength(Strength::new(2.0).unwrap())
+        .with_hardness(Hardness::new(0.5).unwrap());
+    let (dabs, radius) = run(&brush, &camera, &mut Plane, &samples);
     let first = dabs.first().unwrap();
     let last = dabs.last().unwrap();
     println!(
@@ -519,29 +523,34 @@ fn pressure_changes_size_and_strength_per_dab() {
         last.strength
     );
     assert!(
-        (first.strength - 0.2).abs() < 1e-6,
-        "starts at 0.2: {}",
+        (first.strength - 0.4).abs() < 1e-6,
+        "starts at 0.2 of 2: {}",
         first.strength
     );
     assert!(
-        (last.strength - 1.0).abs() < 1e-6,
-        "ends at 1: {}",
+        (last.strength - 2.0).abs() < 1e-6,
+        "ends at 2: {}",
         last.strength
+    );
+    assert!(
+        dabs.iter()
+            .all(|dab| dab.hardness.to_bits() == 0.5_f32.to_bits()),
+        "the brush's hardness, its factor 1"
     );
     // Rising dab by dab until full pressure: the tail (from where the smoothing held the brush
     // to the pen-up) is all at the last sample's pressure.
     for pair in dabs.windows(2) {
-        if pair[0].strength < 1.0 {
+        if pair[0].strength < 2.0 {
             assert!(pair[1].strength > pair[0].strength, "rising: {pair:?}");
             assert!(pair[1].radius > pair[0].radius, "growing: {pair:?}");
         } else {
-            assert_eq!(pair[1].strength, 1.0, "held at full pressure");
+            assert_eq!(pair[1].strength, 2.0, "held at full pressure");
         }
     }
     for dab in &dabs {
         let size = f64::from(dab.radius) / radius;
         assert!(
-            (size - f64::from(dab.strength)).abs() < 1e-5,
+            (size - f64::from(dab.strength) / 2.0).abs() < 1e-5,
             "size and strength both follow the pressure"
         );
         assert_eq!(

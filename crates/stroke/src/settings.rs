@@ -32,6 +32,12 @@ pub enum SettingsError {
     /// The symmetry.
     #[error(transparent)]
     Symmetry(#[from] SymmetryError),
+    /// The brush's strength is NaN or infinite (see [`Strength::new`]).
+    #[error("the strength must be finite, not {0}")]
+    Strength(f32),
+    /// The brush's hardness is outside `0..=1` or NaN (see [`Hardness::new`]).
+    #[error("the hardness must be in 0..=1, not {0}")]
+    Hardness(f32),
     /// An action parameter is NaN or infinite.
     #[error("action parameter {index} is not finite: {value}")]
     ActionParam {
@@ -139,6 +145,81 @@ impl Spacing {
 }
 
 impl Default for Spacing {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The brush's own strength, in model units.
+///
+/// It is the action's strength for a dab whose dynamics leave it at its full value (a factor of
+/// 1): for draw, how far a vertex at the centre moves. Finite; negative works the other way
+/// (draw pushes in).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Strength(f32);
+
+impl Strength {
+    /// The default, `0.001` model units: a placeholder until the built-in brushes set their
+    /// own.
+    pub const DEFAULT: Self = Self(0.001);
+
+    /// A strength of `value` model units.
+    ///
+    /// # Errors
+    ///
+    /// [`SettingsError::Strength`] if `value` is NaN or infinite.
+    pub fn new(value: f32) -> Result<Self, SettingsError> {
+        if value.is_finite() {
+            Ok(Self(value + 0.0))
+        } else {
+            Err(SettingsError::Strength(value))
+        }
+    }
+
+    /// The strength, in model units.
+    #[must_use]
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for Strength {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The brush's own falloff hardness, in `0..=1`: `0` the action's falloff as it is, `1` a disc
+/// of full strength (see `brush::Hardened`). A dab's hardness is this times its dynamics'
+/// factor, clamped to `0..=1`.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Hardness(f32);
+
+impl Hardness {
+    /// The default: `0`, the falloff as it is.
+    pub const DEFAULT: Self = Self(0.0);
+
+    /// A hardness of `value`.
+    ///
+    /// # Errors
+    ///
+    /// [`SettingsError::Hardness`] if `value` is outside `0..=1` or NaN.
+    pub fn new(value: f32) -> Result<Self, SettingsError> {
+        if (0.0..=1.0).contains(&value) {
+            Ok(Self(value + 0.0))
+        } else {
+            Err(SettingsError::Hardness(value))
+        }
+    }
+
+    /// The hardness, in `0..=1`.
+    #[must_use]
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for Hardness {
     fn default() -> Self {
         Self::DEFAULT
     }
@@ -330,7 +411,7 @@ impl Symmetry {
 }
 
 /// Everything that shapes a stroke: the path's smoothing, the spacing, the size and how it is
-/// measured, the dynamics, the symmetry and the action's parameters.
+/// measured, the dynamics, the symmetry, and the action's strength, hardness and parameters.
 ///
 /// Plain data, validated as it is built: every part's type holds only valid values, and
 /// [`StrokeSettings::new`] checks the action's parameters, so settings that exist are usable and a
@@ -350,12 +431,17 @@ pub struct StrokeSettings {
     dynamics: Dynamics,
     /// How each dab is copied.
     symmetry: Symmetry,
+    /// The brush's own strength, before dynamics scales it.
+    strength: Strength,
+    /// The brush's own hardness, before dynamics scales it.
+    hardness: Hardness,
     /// The action's own parameters, before dynamics scales them; all finite.
     action_params: [f32; ACTION_SLOTS],
 }
 
 impl StrokeSettings {
-    /// Settings from their parts.
+    /// Settings from their parts, with the default [`Strength`] and [`Hardness`]
+    /// ([`StrokeSettings::with_strength`] and [`StrokeSettings::with_hardness`] set them).
     ///
     /// # Errors
     ///
@@ -383,8 +469,34 @@ impl StrokeSettings {
             radius,
             dynamics,
             symmetry,
+            strength: Strength::DEFAULT,
+            hardness: Hardness::DEFAULT,
             action_params: action_params.map(|v| v + 0.0),
         })
+    }
+
+    /// These settings with the brush's own `strength`.
+    #[must_use]
+    pub fn with_strength(self, strength: Strength) -> Self {
+        Self { strength, ..self }
+    }
+
+    /// These settings with the brush's own `hardness`.
+    #[must_use]
+    pub fn with_hardness(self, hardness: Hardness) -> Self {
+        Self { hardness, ..self }
+    }
+
+    /// The brush's own strength, before dynamics scales it.
+    #[must_use]
+    pub const fn strength(&self) -> Strength {
+        self.strength
+    }
+
+    /// The brush's own hardness, before dynamics scales it.
+    #[must_use]
+    pub const fn hardness(&self) -> Hardness {
+        self.hardness
     }
 
     /// How the screen path is smoothed.
@@ -432,7 +544,7 @@ impl StrokeSettings {
 
 impl Default for StrokeSettings {
     /// The default path, spacing 0.15, a 40-pixel screen radius, pressure to size and strength,
-    /// no symmetry, and the action's parameters at zero.
+    /// no symmetry, the default strength and hardness, and the action's parameters at zero.
     fn default() -> Self {
         Self {
             path: PathSettings::default(),
@@ -441,6 +553,8 @@ impl Default for StrokeSettings {
             radius: Radius::DEFAULT,
             dynamics: Dynamics::default(),
             symmetry: Symmetry::NONE,
+            strength: Strength::DEFAULT,
+            hardness: Hardness::DEFAULT,
             action_params: [0.0; ACTION_SLOTS],
         }
     }

@@ -1,15 +1,23 @@
 //! The settings' stable byte form: [`StrokeSettings::to_bytes`] and
 //! [`StrokeSettings::from_bytes`].
 
-use super::{Axis, DecodeError, MirrorPlanes, Radial, Spacing, StrokeSettings, Symmetry};
+use super::{
+    Axis, DecodeError, Hardness, MirrorPlanes, Radial, Spacing, Strength, StrokeSettings, Symmetry,
+};
 use crate::{
     ACTION_SLOTS, ActionSlot, Curve, CurveError, Dynamics, DynamicsError, Entry, FullScale, Input,
     MAX_CURVE_POINTS, MAX_ENTRIES, Param, PathSettings, Radius, SizeMode,
 };
 
-/// The byte form's current version. Version 1 held one kind of symmetry at a time; no stroke
-/// record was ever written with it, so this build reads version 2 only.
-pub(super) const VERSION: u8 = 2;
+/// The byte form's current version.
+///
+/// Version 1 held one kind of symmetry at a time; no stroke record was ever written with it, so
+/// this build doesn't read it. Version 2 had no strength or hardness: it is read with the
+/// defaults ([`Strength::DEFAULT`], [`Hardness::DEFAULT`]).
+pub(super) const VERSION: u8 = 3;
+
+/// The version before the brush's strength and hardness, still read.
+const VERSION_2: u8 = 2;
 
 /// The bits of the symmetry byte: which kinds are on. The rest are refused.
 mod symmetry_bit {
@@ -58,8 +66,8 @@ const fn axis_tag(axis: Axis) -> u8 {
 impl StrokeSettings {
     /// The settings' stable byte form, for a stroke's record.
     ///
-    /// The layout (version 2), all numbers little-endian:
-    /// - the version, `2`, as a `u8`;
+    /// The layout (version 3), all numbers little-endian:
+    /// - the version, `3`, as a `u8`;
     /// - the path: the minimum cutoff, the cutoff slope, the derivative cutoff and the lazy string,
     ///   each an `f64`;
     /// - the spacing as an `f32`; the size mode as a `u8` (`0` screen, `1` world); the radius as an
@@ -68,6 +76,8 @@ impl StrokeSettings {
     ///   for topological), then for mirror the plane bits as a `u8`, then for radial the axis (`0`
     ///   X, `1` Y, `2` Z) and the copy count as `u8`s;
     /// - the action's parameters, four `f32`s;
+    /// - the brush's strength and hardness, each an `f32` (new in version 3; version 2 has neither,
+    ///   and is read with the defaults);
     /// - the dynamics: the entry count as a `u8`, then each entry: the input's tag (`0` pressure,
     ///   `1` tilt amount, `2` tilt direction, `3` twist, `4` speed, `5` distance, `6` random)
     ///   followed for speed and distance by the full scale as an `f32`; the parameter's tag (`0`
@@ -109,6 +119,8 @@ impl StrokeSettings {
         for value in self.action_params {
             out.f32(value);
         }
+        out.f32(self.strength.get());
+        out.f32(self.hardness.get());
         let entries = self.dynamics.entries();
         // `Dynamics::new` holds the count to MAX_ENTRIES, which fits a byte.
         out.u8(u8::try_from(entries.len()).unwrap_or(u8::MAX));
@@ -139,7 +151,7 @@ impl StrokeSettings {
     ///
     /// # Errors
     ///
-    /// - [`DecodeError::Version`] for a version this build doesn't read;
+    /// - [`DecodeError::Version`] for a version this build doesn't read (it reads 2 and 3);
     /// - [`DecodeError::Truncated`] or [`DecodeError::Trailing`] if the bytes are shorter or longer
     ///   than the settings;
     /// - [`DecodeError::Tag`] for an unknown tag;
@@ -147,7 +159,7 @@ impl StrokeSettings {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut reader = Reader(bytes);
         let version = reader.u8()?;
-        if version != VERSION {
+        if version != VERSION && version != VERSION_2 {
             return Err(DecodeError::Version(version));
         }
         let path = PathSettings::new(reader.f64()?, reader.f64()?, reader.f64()?, reader.f64()?)?;
@@ -168,6 +180,11 @@ impl StrokeSettings {
         for value in &mut action_params {
             *value = reader.f32()?;
         }
+        let (strength, hardness) = if version == VERSION_2 {
+            (Strength::DEFAULT, Hardness::DEFAULT)
+        } else {
+            (Strength::new(reader.f32()?)?, Hardness::new(reader.f32()?)?)
+        };
         let count = usize::from(reader.u8()?);
         if count > MAX_ENTRIES {
             return Err(DynamicsError::TooManyEntries(count).into());
@@ -188,7 +205,9 @@ impl StrokeSettings {
             dynamics,
             symmetry,
             action_params,
-        )?)
+        )?
+        .with_strength(strength)
+        .with_hardness(hardness))
     }
 }
 

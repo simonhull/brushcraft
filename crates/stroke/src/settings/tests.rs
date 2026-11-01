@@ -44,6 +44,8 @@ fn everything() -> StrokeSettings {
         [1.0, -2.0, 0.5, 3.0],
     )
     .unwrap()
+    .with_strength(Strength::new(-0.25).unwrap())
+    .with_hardness(Hardness::new(0.75).unwrap())
 }
 
 #[test]
@@ -65,11 +67,11 @@ fn round_trips_through_bytes() {
 
 #[test]
 fn the_default_bytes_are_pinned() {
-    // Version 2's layout must not drift: a stroke record stored today decodes the same later.
+    // Version 3's layout must not drift: a stroke record stored today decodes the same later.
     let bytes = StrokeSettings::default().to_bytes();
     assert_eq!(
         bytes.len(),
-        1 + 32 + 4 + 1 + 4 + 1 + 16 + 1 + 2 * 27,
+        1 + 32 + 4 + 1 + 4 + 1 + 16 + 8 + 1 + 2 * 27,
         "length"
     );
     let head: Vec<u8> = std::iter::once(VERSION)
@@ -92,12 +94,45 @@ fn the_default_bytes_are_pinned() {
         .chain(0.0_f32.to_le_bytes())
         .chain(1.0_f32.to_le_bytes())
         .collect();
-    let at = head.len() + 16;
+    let brush: Vec<u8> = Strength::DEFAULT
+        .get()
+        .to_le_bytes()
+        .into_iter()
+        .chain(Hardness::DEFAULT.get().to_le_bytes())
+        .collect();
+    let brush_at = head.len() + 16;
+    assert_eq!(
+        bytes.get(brush_at..brush_at + 8),
+        Some(brush.as_slice()),
+        "the strength and hardness, after the action's parameters"
+    );
+    let at = head.len() + 16 + 8;
     assert_eq!(bytes.get(at), Some(&2), "two entries");
     assert_eq!(
         bytes.get(at + 1..at + 1 + first_entry.len()),
         Some(first_entry.as_slice()),
         "pressure → size, linear, 0..=1"
+    );
+}
+
+#[test]
+fn version_2_is_read_with_the_default_strength_and_hardness() {
+    let settings = everything();
+    let bytes = settings.to_bytes();
+    assert_eq!(bytes.first(), Some(&3), "written as version 3");
+    // Version 2 is version 3 without the strength and hardness.
+    let brush_at = 1 + 32 + 4 + 1 + 4 + 1 + 1 + 1 + 1 + 16;
+    let mut old: Vec<u8> = bytes;
+    old.drain(brush_at..brush_at + 8);
+    old[0] = 2;
+    let read = StrokeSettings::from_bytes(&old).unwrap();
+    assert_eq!(read.strength(), Strength::DEFAULT, "the default strength");
+    assert_eq!(read.hardness(), Hardness::DEFAULT, "the default hardness");
+    assert_eq!(
+        read.with_strength(settings.strength())
+            .with_hardness(settings.hardness()),
+        settings,
+        "everything else as written"
     );
 }
 
@@ -139,6 +174,25 @@ fn bad_bytes_are_refused() {
         ),
         "a negative radius"
     );
+    let brush_at = 1 + 32 + 4 + 1 + 4 + 1 + 16;
+    let mut strength = StrokeSettings::default().to_bytes();
+    strength[brush_at..brush_at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    assert!(
+        matches!(
+            StrokeSettings::from_bytes(&strength),
+            Err(DecodeError::Invalid(SettingsError::Strength(_)))
+        ),
+        "a NaN strength"
+    );
+    let mut hardness = StrokeSettings::default().to_bytes();
+    hardness[brush_at + 4..brush_at + 8].copy_from_slice(&1.5_f32.to_le_bytes());
+    assert!(
+        matches!(
+            StrokeSettings::from_bytes(&hardness),
+            Err(DecodeError::Invalid(SettingsError::Hardness(_)))
+        ),
+        "a hardness past 1"
+    );
     let mut mode = StrokeSettings::default().to_bytes();
     mode[1 + 32 + 4] = 9;
     assert_eq!(
@@ -165,6 +219,22 @@ fn settings_are_validated() {
         "X and Z"
     );
     assert!(Radial::new(Axis::Z, 1).is_err(), "one copy is no symmetry");
+    assert!(
+        Strength::new(f32::INFINITY).is_err(),
+        "an infinite strength"
+    );
+    assert_eq!(
+        Strength::new(-0.5).map(Strength::get),
+        Ok(-0.5),
+        "a strength inwards"
+    );
+    assert!(Hardness::new(-0.1).is_err(), "a negative hardness");
+    assert!(Hardness::new(f32::NAN).is_err(), "a NaN hardness");
+    assert_eq!(
+        Hardness::new(1.0).map(Hardness::get),
+        Ok(1.0),
+        "the hardest"
+    );
     assert!(Radial::new(Axis::Z, 65).is_err(), "too many copies");
     let nan_param = StrokeSettings::new(
         PathSettings::default(),

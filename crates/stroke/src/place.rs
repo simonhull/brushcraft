@@ -163,6 +163,10 @@ pub(crate) struct Placer {
     spacing: f64,
     /// The action's parameters, before dynamics.
     action_params: [f32; ACTION_SLOTS],
+    /// The brush's own strength, before dynamics.
+    strength: f32,
+    /// The brush's own hardness, before dynamics.
+    hardness: f32,
     /// The frozen world radius: positive and finite.
     radius: f64,
     /// The stroke's random values.
@@ -218,6 +222,8 @@ impl Placer {
             dynamics: settings.dynamics().clone(),
             spacing: f64::from(settings.spacing().get()),
             action_params: settings.action_params(),
+            strength: settings.strength().get(),
+            hardness: settings.hardness().get(),
             radius,
             random,
             start: first.time(),
@@ -419,9 +425,9 @@ impl Placer {
             normal: self.cursor.normal,
             tangent,
             radius: self.radius * f64::from(values.size),
-            strength: values.strength,
+            strength: self.strength * values.strength,
             angle: values.angle,
-            hardness: values.hardness,
+            hardness: (self.hardness * values.hardness).clamp(0.0, 1.0),
             params,
             seq: self.seq,
             time: since_start,

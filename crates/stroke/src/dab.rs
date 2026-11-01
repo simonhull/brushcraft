@@ -20,11 +20,13 @@ pub struct Dab {
     pub tangent: [f32; 3],
     /// The radius, in world units.
     pub radius: f32,
-    /// The action's strength.
+    /// The action's strength, final: the brush's own ([`Strength`](crate::Strength)) times the
+    /// dynamics' factor, in model units (for draw, how far a vertex at the centre moves).
     pub strength: f32,
     /// The alpha's rotation about the normal, in radians from the tangent.
     pub angle: f32,
-    /// The falloff's hardness.
+    /// The falloff's hardness, final, in `0..=1`: the brush's own
+    /// ([`Hardness`](crate::Hardness)) times the dynamics' factor, clamped.
     pub hardness: f32,
     /// The action's own parameters, as it defines them.
     pub params: [f32; ACTION_SLOTS],
