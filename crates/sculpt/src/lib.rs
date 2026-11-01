@@ -14,6 +14,8 @@
 //!   [`store::TileStore::edit_tile`], and brings the index back up to date once for the frame. The
 //!   result is that of applying the dabs one at a time, bit for bit.
 //! - [`draw_step`] is one dab of the draw brush, as M0 measured it: [`apply_dabs`] for one dab.
+//! - [`Preview`] shows dabs at once on the finest tiles they reach, ahead of the finest work, for a
+//!   brush whose frame can't fit it all; the same dabs land later through [`apply_dabs`].
 //! - [`StoreSurface`] is the store as the stroke engine's [`stroke::Surface`]: raycasts through the
 //!   index, and the stroke's connected region near a point.
 //!
@@ -25,6 +27,7 @@
 
 mod apply;
 mod draw;
+mod preview;
 mod state;
 mod surface;
 #[cfg(test)]
@@ -33,5 +36,6 @@ mod testing;
 
 pub use apply::{ApplyStats, PhaseTimes, SculptError, apply_dabs};
 pub use draw::{DrawParams, DrawParamsError, StepStats, draw_step};
+pub use preview::{Preview, PreviewStats};
 pub use state::Stroke;
 pub use surface::StoreSurface;

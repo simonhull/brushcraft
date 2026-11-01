@@ -639,3 +639,102 @@ mod model;
 // A strong stroke's stand-ins against the refresh that replaces them; ignored variants print.
 #[cfg(not(doc))]
 mod strong_stroke;
+
+// Uses the sculpt crate's types, a dev-dependency rustdoc doesn't link.
+#[cfg(not(doc))]
+#[test]
+fn dabs_shown_from_a_distance_stand_in_at_once_and_catch_up_to_the_display_build() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("preview");
+        let (mut project, mesh) = project(&dir, |config| config);
+        let finest = level(FINEST);
+        let store = project.store();
+        let cursor = store.subscribe_stale();
+        let mut residency = far_residency(gpu, &mesh, store);
+        let mut index = store::SpatialIndex::build(store, finest, |_, _| {}).expect("an index");
+        // A stroke of dabs across face 2's corner and centre, shown ahead of their finest work.
+        let grids = finest_grids(store, &mesh);
+        let n = finest.face_quads();
+        let dabs: Vec<stroke::Dab> = (0..6_u32)
+            .map(|k| {
+                let (i, j) = (k * n / 6, k * n / 7);
+                let p = grids[&2][usize::try_from(j * (n + 1) + i).expect("small")];
+                let length = p.dot(p).sqrt();
+                stroke::Dab {
+                    position: [p.x, p.y, p.z],
+                    normal: [p.x / length, p.y / length, p.z / length],
+                    radius: 0.12,
+                    strength: 0.01,
+                    seq: k,
+                    ..stroke::Dab::default()
+                }
+            })
+            .collect();
+        let mut preview = sculpt::Preview::new();
+        preview.show(store, &index, &dabs).expect("shown");
+        let previewed = store.drain_stale(&cursor);
+        let Drained::Epochs(epochs) = &previewed else {
+            panic!("no resync");
+        };
+        assert!(
+            epochs.iter().all(|epoch| epoch.kind == EpochKind::Preview),
+            "the preview's epoch alone: nothing landed"
+        );
+        frame(gpu, &mut residency, store, previewed);
+        let truth = finest_grids(store, &mesh);
+        assert_eq!(truth, grids, "the store's surface hasn't moved");
+        let shown = model::drawn_grids(store, &truth);
+        assert_ne!(shown, truth, "the previews moved what is drawn");
+        check(gpu, &residency, &shown, &BTreeSet::new());
+        let stats = residency.stats();
+        assert!(
+            stats.stand_ins > 0 && stats.stand_ins_skipped == 0,
+            "seen from a distance, shown by stand-ins at once: {stats:?}"
+        );
+
+        // The catch-up lands them in two batches, then the refresh runs.
+        let mut stroke = sculpt::Stroke::new(store);
+        project.begin_stroke().expect("a stroke");
+        for batch in dabs.chunks(3) {
+            let landing = project.store();
+            sculpt::apply_dabs(landing, &mut index, &mut stroke, batch).expect("applied");
+            preview.land(landing, &index, batch.len()).expect("landed");
+            let landed = landing.drain_stale(&cursor);
+            frame(gpu, &mut residency, landing, landed);
+            let now = finest_grids(landing, &mesh);
+            let drawn = model::drawn_grids(landing, &now);
+            check(gpu, &residency, &drawn, &BTreeSet::new());
+        }
+        project.end_unrecorded_stroke().expect("ended");
+        let refreshing = project.store();
+        assert!(!refreshing.has_previews(), "caught up: no preview left");
+        run_jobs(refreshing);
+        let refreshed = refreshing.drain_stale(&cursor);
+        frame(gpu, &mut residency, refreshing, refreshed);
+        frame(gpu, &mut residency, refreshing, Drained::Epochs(Vec::new()));
+        let exact = finest_grids(refreshing, &mesh);
+        check(gpu, &residency, &exact, &BTreeSet::new());
+        let mut compared = 0;
+        for (place, (vertices, node)) in display_tiles(gpu, &residency) {
+            let key = place.key(finest).expect("a key");
+            let built = refreshing
+                .display_for_draw(&[key])
+                .expect("reads")
+                .pop()
+                .flatten()
+                .expect("rebuilt");
+            assert_eq!(node.error, built.error(), "{place:?} draws the built bound");
+            for (drawn, stored) in vertices.iter().zip(built.positions()) {
+                assert_eq!(
+                    drawn.position.map(f32::to_bits),
+                    [stored.x, stored.y, stored.z].map(f32::to_bits),
+                    "{place:?} draws the display build of the finest result"
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 1000, "{compared} vertices");
+        refreshing.unsubscribe_stale(cursor);
+        drop(project.close(false));
+    });
+}

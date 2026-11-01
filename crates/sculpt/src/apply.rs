@@ -320,7 +320,7 @@ pub fn apply_dabs(
 /// # Errors
 ///
 /// As [`DrawParams::new`](crate::DrawParams::new).
-fn imprint_of(dab: &Dab) -> Result<Imprint, DrawParamsError> {
+pub(crate) fn imprint_of(dab: &Dab) -> Result<Imprint, DrawParamsError> {
     let [x, y, z] = dab.position;
     check_dab(Vec3::new(x, y, z), dab.radius, dab.strength)?;
     Ok(Imprint::new(

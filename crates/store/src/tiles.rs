@@ -146,6 +146,7 @@ mod layers;
 mod page;
 mod persist;
 mod pins;
+mod preview;
 mod queued;
 mod read;
 mod read_ahead;
@@ -441,6 +442,9 @@ pub struct TileStore {
     /// The third: whether a write came after the last bump, which no bump bounds (a dab that
     /// failed after writing) and makes the epoch a revert's.
     epoch_step: Option<(f32, BTreeSet<TileKey>, bool)>,
+    /// The previews: finest tiles a renderer shows ahead of their evaluation, never saved (see
+    /// the `preview` module).
+    previews: preview::Previews,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,
     /// The queued evaluation (see [`crate::queued`]): finest tiles wanted by priority, run in

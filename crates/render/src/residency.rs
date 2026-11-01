@@ -653,6 +653,9 @@ pub struct ResidencyStats {
     pub stand_in_bytes: u64,
     /// Display tiles stood in, ever (a tile once per frame it stands in).
     pub stand_ins: u64,
+    /// Display tiles standing in now: holding a row, until the refresh replaces them (or a
+    /// resync or revert reads them again).
+    pub standing_in: usize,
     /// Display tiles that wanted to stand in and couldn't in their frame, ever: more finest
     /// tiles than a scratch binds, every row taken, or the source had nothing for a finest tile
     /// they read. They try again the next frame.
@@ -1093,6 +1096,7 @@ impl Residency {
             wanted: self.wanted.len(),
             unavailable: self.unavailable.len(),
             pending_epochs: self.groups.len(),
+            standing_in: self.stand_ins.rows.taken().count(),
             request_readbacks_dropped: self.requests.dropped_readbacks(),
             ..self.stats
         }
@@ -1252,6 +1256,10 @@ impl Residency {
     /// - a brush step's finest tiles stand in for their resident display ancestors
     ///   ([`crate::standin`]) once they show; the display tiles it names aren't read again (only
     ///   their bound changed, and a stand-in replaces it);
+    /// - a preview's finest tiles are read again and stand in for their ancestors as a step's do, a
+    ///   step that moved the store's finest surface by nothing: what is drawn moved, the surface
+    ///   the bounds are against didn't, so a stand-in's bound grows by what it measures it moved
+    ///   alone (`e + D + max(D, M)` with `D = 0`, the stand-in module's "The bound");
     /// - a refresh's display tiles are read again, a stand-in among them replaced;
     /// - a revert's finest tiles moved by an unknown amount: the display tiles above them stop
     ///   standing in and are read again from the store, until a refresh names them.
@@ -1297,6 +1305,8 @@ impl Residency {
             EpochKind::Step { displacement } if Displacement::try_from(displacement).is_err() => {
                 EpochKind::Revert
             }
+            // A preview moved what is drawn, not the store's surface: a step of no displacement.
+            EpochKind::Preview => EpochKind::Step { displacement: 0.0 },
             other @ (EpochKind::Step { .. } | EpochKind::Refresh | EpochKind::Revert) => other,
         };
         match kind {
@@ -1323,6 +1333,8 @@ impl Residency {
                     display.map(|key| (Place::of(key), seq)).collect();
                 self.apply_epoch(keys, None, refreshes);
             }
+            // Made a step of no displacement above.
+            EpochKind::Preview => {}
             EpochKind::Revert => {
                 let mut keys = keys;
                 let mut above: BTreeSet<Place> = BTreeSet::new();

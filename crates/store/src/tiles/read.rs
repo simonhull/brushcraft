@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use geom::{BaseMesh, TileKey, Vec3};
+use rayon::iter::{IntoParallelRefMutIterator as _, ParallelIterator as _};
 
 use super::config::Evaluation;
 use super::error::{CacheError, Invariant};
@@ -128,6 +129,24 @@ impl TileStore {
         f: impl Fn(&T) -> R + Sync + Send,
     ) -> Vec<R> {
         map_parallel(&self.workers, items, f)
+    }
+
+    /// `f` of every item of `items`, each changed in place, in order, computed on the store's
+    /// evaluation workers as [`TileStore::par_map`] computes; a single item on the calling
+    /// thread.
+    ///
+    /// For per-tile work over data the caller owns, each item on its own: a brush's previews,
+    /// moved tile by tile.
+    pub fn par_map_mut<T: Send, R: Send>(
+        &self,
+        items: &mut [T],
+        f: impl Fn(&mut T) -> R + Sync + Send,
+    ) -> Vec<R> {
+        if items.len() <= 1 {
+            return items.iter_mut().map(f).collect();
+        }
+        self.workers
+            .install(|| items.par_iter_mut().map(f).collect())
     }
 
     /// `key`'s evaluated positions, row-major `side²`: cached, else computed coarse to fine

@@ -987,6 +987,11 @@ impl TileStore {
                 // Built, being built, or failed.
                 continue;
             }
+            if self.preview_holds(&key) {
+                // A preview under it: dropped, and looked for again once a preview is cleared
+                // (the `preview` module's "The refresh waits").
+                continue;
+            }
             let Some(reads) = tent_reads(&self.mesh, &key) else {
                 continue;
             };
@@ -1047,6 +1052,11 @@ impl TileStore {
                     if let Some(why) = needs.iter().find_map(|dep| self.failure(dep)) {
                         self.fail_display(key, why);
                         report.failed += 1;
+                        continue;
+                    }
+                    if needs.iter().any(|need| self.preview_holds(need)) {
+                        // It waits for a tile a preview holds: dropped with it, until a preview
+                        // is cleared.
                         continue;
                     }
                     later.push(key);

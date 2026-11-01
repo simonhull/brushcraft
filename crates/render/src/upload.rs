@@ -285,11 +285,14 @@ pub trait TileSource {
 }
 
 /// [`TileSource`] over the store: display tiles from [`TileStore::display_for_draw`], finest
-/// tiles from [`TileStore::positions_with_ring`].
+/// tiles from their previews ([`TileStore::preview`]) where they have one, else from
+/// [`TileStore::positions_with_ring`].
 ///
 /// A finest tile uploads its positions with the one-vertex ring and its corners' base-vertex
 /// rings (plan decision 1), every vertex its owner's bits, and the GPU computes its normals; the
-/// store's CPU normals aren't computed.
+/// store's CPU normals aren't computed. A previewed tile is drawn as its preview: a brush's dabs
+/// shown ahead of their evaluation (the store's [`store::EpochKind::Preview`]), and so are the
+/// stand-ins over it, which read its positions here.
 #[derive(Debug)]
 pub struct StoreSource<'a> {
     /// The store read.
@@ -348,6 +351,14 @@ impl TileSource for StoreSource<'_> {
         _scratch: &mut TileData,
         out: &mut Vec<u32>,
     ) -> Result<bool, CacheError> {
+        if let Some(block) = self.store.preview(&key) {
+            // The preview's own positions, without its ring.
+            let quads = i64::from(block.quads());
+            let rows = (0..=quads).map(|j| block.row(j));
+            let own = rows.flat_map(|row| row.iter().skip(1).take(row.len().saturating_sub(2)));
+            out.extend(own.flat_map(|p| p.to_bits()));
+            return Ok(true);
+        }
         // The tile's positions alone, as evaluated: no ring gathered.
         let positions = self.store.evaluate(key)?;
         out.extend(positions.iter().flat_map(|p| p.to_bits()));
@@ -385,6 +396,10 @@ impl TileSource for StoreSource<'_> {
                 ..TileDetail::of_display(&tile)
             };
             return Ok(Some(detail));
+        }
+        if let Some(block) = self.store.preview(&key) {
+            out.ring(self.store.mesh(), block);
+            return Ok(Some(TileDetail::FINEST));
         }
         // Prepared tiles are cached and current: the gather reads them, evaluating nothing.
         let block = match self.store.cached_positions_with_ring(&key)? {

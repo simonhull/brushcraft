@@ -43,9 +43,14 @@ pub enum CacheError {
     /// or tile. Nothing was written.
     #[error("correction rejected")]
     Correction(#[source] CorrectionError),
-    /// The key isn't a base-layer displacement tile above level 0 of a face of this mesh.
+    /// The key isn't a base-layer displacement tile above level 0 of a face of this mesh (or,
+    /// for a preview, of the store's finest level).
     #[error("{0:?} is not a base-layer displacement tile of this mesh above level 0")]
     NotATile(TileKey),
+    /// A preview's block isn't gathered over its tile's region
+    /// ([`TileStore::set_preview`](super::TileStore::set_preview)).
+    #[error("the preview given for {0:?} is not that tile's block")]
+    NotItsBlock(TileKey),
     /// The configured site is [`RESERVED_SITE`].
     #[error("site {RESERVED_SITE} is reserved")]
     ReservedSite,

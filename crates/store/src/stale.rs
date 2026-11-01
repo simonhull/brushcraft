@@ -58,6 +58,11 @@ pub enum EpochKind {
     /// to its record, a write outside a step. Display tiles above its finest tiles are only
     /// what the store holds for them.
     Revert,
+    /// Previews set or cleared ([`TileStore::set_preview`](crate::TileStore::set_preview)): the
+    /// finest tiles it names are to be drawn from their previews now (or from the store again,
+    /// where cleared). Only what a renderer draws moved; the store's finest surface, which
+    /// display tiles' bounds are against, did not. It names finest tiles alone.
+    Preview,
 }
 
 /// A display tile a stroke changed since its last refresh, as a resync hands it over: what a

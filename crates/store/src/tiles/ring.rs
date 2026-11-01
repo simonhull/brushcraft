@@ -11,9 +11,12 @@ use geom::{GatheredBlock, Region, TileKey, gather_block};
 
 use super::TileStore;
 use super::error::CacheError;
-use super::round::{Resident, Tiles};
+use super::round::{Resident, Tiles, map_parallel};
 use crate::pool::SlotId;
 use crate::slot::EvaluatedSlot;
+
+/// The evaluated slots a gather reads, by their tiles, in key order.
+type Held = Vec<(TileKey, SlotId<EvaluatedSlot>)>;
 
 impl TileStore {
     /// `key`'s evaluated positions with its one-vertex ring and its base-vertex rings, as
@@ -91,5 +94,44 @@ impl TileStore {
         // In key order, as the source finds them.
         held.sort_unstable_by_key(|&(input, _)| input);
         self.gather_held(key, &held).map(Some)
+    }
+
+    /// [`TileStore::cached_positions_with_ring`] for each of `keys`, in order, gathered on the
+    /// store's workers: the same blocks, bit for bit.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::cached_positions_with_ring`], the first in `keys`' order.
+    pub fn cached_positions_with_ring_many(
+        &self,
+        keys: &[TileKey],
+    ) -> Result<Vec<Option<GatheredBlock>>, CacheError> {
+        let mut found: Vec<(TileKey, Option<Held>)> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let inputs = self.normal_inputs(key)?;
+            let held: Option<Held> = inputs
+                .iter()
+                .map(|input| Some((*input, self.fresh_slot(input)?)))
+                .collect();
+            found.push((
+                *key,
+                held.map(|mut held| {
+                    held.sort_unstable_by_key(|&(input, _)| input);
+                    held
+                }),
+            ));
+        }
+        let (mesh, pool) = (&*self.mesh, &self.evaluated);
+        let gathered = map_parallel(&self.workers, &found, |(key, held)| {
+            let Some(held) = held else {
+                return Ok(None);
+            };
+            let tiles = Tiles::Shared { pool, held };
+            let source = Resident::new(mesh, tiles);
+            gather_block(mesh, &source, Region::of_tile(key))
+                .map(Some)
+                .map_err(CacheError::from)
+        });
+        gathered.into_iter().collect()
     }
 }

@@ -2,9 +2,10 @@
 //!
 //! Each case is a short sequence of operations drawn from the bytes `bolero` generates, over a
 //! small project (the cube sphere to level 7, its display layer built): brush steps of one to
-//! four dabs (`sculpt::apply_dabs` frames) at random places, refresh slices, reverts (writes no
-//! step covers), a frame of dabs that fails after its first (its epoch closed all the same),
-//! lost and failed frames, camera moves
+//! four dabs (`sculpt::apply_dabs` frames) at random places, dabs shown ahead of their finest
+//! work (`sculpt::Preview`, preview epochs) and their catch-up landing a few at a time, refresh
+//! slices, reverts (writes no step covers), a frame of dabs that fails after its first (its epoch
+//! closed all the same), lost and failed frames, camera moves
 //! (near: a face's finest tiles wanted and in the cut; far: none), `mark_all_dirty`, under a
 //! budget small enough to evict, an epoch size small enough to shadow, and sometimes a stale cap
 //! small enough to resync. After every frame that reaches the GPU it checks the invariant
@@ -121,6 +122,11 @@ struct Case {
     index: store::SpatialIndex,
     /// The brush's stroke state.
     stroke: sculpt::Stroke,
+    /// The dabs shown ahead of their finest work.
+    preview: sculpt::Preview,
+    /// The dabs shown and not landed, oldest first: while any is, a brush step's dabs are shown
+    /// after them (as the app's brush queues them), and a revert makes the previews again.
+    shown: Vec<stroke::Dab>,
 }
 
 /// The vertex `(face, i, j)` of the finest grid a byte pair names.
@@ -163,6 +169,8 @@ impl Case {
             lost: 0,
             index,
             stroke,
+            preview: sculpt::Preview::new(),
+            shown: Vec::new(),
         };
         case.frame(gpu);
         case
@@ -205,7 +213,9 @@ impl Case {
             .poll(PollType::wait_indefinitely())
             .expect("the GPU finishes");
         gpu.check().expect("no GPU error");
-        invariant(gpu, &self.residency, &finest_grids(store, &self.mesh));
+        let truth = finest_grids(store, &self.mesh);
+        let drawn = drawn_grids(store, &truth);
+        invariant(gpu, &self.residency, &truth, &drawn);
     }
 
     /// A frame that reaches the GPU.
@@ -238,33 +248,90 @@ impl Case {
             .set_correction(face, finest, i, j, c + Vec3::new(0.0, 0.0, lift))
             .expect("written");
         store.close_epoch().expect("closed");
+        if !self.shown.is_empty() {
+            // The store moved under the previews: they are made again.
+            self.preview.rebase(store, &self.index).expect("rebased");
+        }
     }
 
-    /// A frame of brush dabs, one at each place the byte pairs name (on a finest vertex, of a
-    /// radius and strength the bytes choose), applied with `sculpt::apply_dabs` as one call:
-    /// one epoch, its displacements summed. With `fail`, a last dab the store can't hold may
-    /// make the call fail after the others (its epoch closed all the same).
-    fn dabs(&mut self, places: &[(u8, u8)], fail: bool) {
+    /// One brush dab at each place the byte pairs name: on a finest vertex as the store holds it,
+    /// of a radius and strength the bytes choose, its normal the sphere's outward one there.
+    fn placed(&mut self, places: &[(u8, u8)]) -> Vec<stroke::Dab> {
         let grids = finest_grids(self.project.store(), &self.mesh);
         let quads = level(FINEST).face_quads();
-        let mut frame: Vec<stroke::Dab> = places
-            .iter()
-            .zip(0_u32..)
-            .map(|(&(a, b), seq)| {
-                let (face, i, j) = vertex(a, b);
-                let at = usize::try_from(j * (quads + 1) + i).expect("small");
-                let centre = grids[&face.index()][at];
-                stroke::Dab {
-                    position: [centre.x, centre.y, centre.z],
-                    normal: [0.0, 0.0, 1.0],
-                    tangent: [1.0, 0.0, 0.0],
-                    radius: 0.02 + f32::from(a % 8) * 0.01,
-                    strength: (f32::from(b) - 127.5) / 127.5 * 0.01,
-                    seq,
-                    ..stroke::Dab::default()
-                }
-            })
-            .collect();
+        let dabs = places.iter().zip(0_u32..).map(|(&(a, b), seq)| {
+            let (face, i, j) = vertex(a, b);
+            let at = usize::try_from(j * (quads + 1) + i).expect("small");
+            let centre = grids[&face.index()][at];
+            let length = centre.dot(centre).sqrt();
+            stroke::Dab {
+                position: [centre.x, centre.y, centre.z],
+                normal: [centre.x / length, centre.y / length, centre.z / length],
+                tangent: [1.0, 0.0, 0.0],
+                radius: 0.02 + f32::from(a % 8) * 0.01,
+                strength: (f32::from(b) - 127.5) / 127.5 * 0.01,
+                seq,
+                ..stroke::Dab::default()
+            }
+        });
+        dabs.collect()
+    }
+
+    /// Shows a dab at each place the byte pairs name ahead of its finest work: a preview epoch.
+    fn show(&mut self, places: &[(u8, u8)]) {
+        let dabs = self.placed(places);
+        self.preview
+            .show(self.project.store(), &self.index, &dabs)
+            .expect("shown");
+        self.shown.extend(dabs);
+    }
+
+    /// Lands the oldest of the dabs shown, as many as `a` picks: their finest work in one call
+    /// (a step's epoch), then the previews made again over it (a preview epoch).
+    fn land(&mut self, a: u8) {
+        if self.shown.is_empty() {
+            return;
+        }
+        self.land_count(1 + usize::from(a) % self.shown.len());
+    }
+
+    /// Lands the oldest `count` dabs shown (see [`Case::land`]).
+    fn land_count(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let landing: Vec<stroke::Dab> = self.shown.drain(..count).collect();
+        self.project.begin_stroke().expect("a stroke");
+        sculpt::apply_dabs(
+            self.project.store(),
+            &mut self.index,
+            &mut self.stroke,
+            &landing,
+        )
+        .expect("the dabs land");
+        self.project
+            .end_unrecorded_stroke()
+            .expect("the stroke ends");
+        self.preview
+            .land(self.project.store(), &self.index, count)
+            .expect("landed");
+    }
+
+    /// A frame of brush dabs, one at each place the byte pairs name ([`Case::placed`]), applied
+    /// with `sculpt::apply_dabs` as one call: one epoch, its displacements summed. With `fail`, a
+    /// last dab the store can't hold may make the call fail after the others (its epoch closed
+    /// all the same). While dabs are shown, the frame's dabs are shown after them instead (and
+    /// one to fail lands those first), as the app's brush queues them.
+    fn dabs(&mut self, places: &[(u8, u8)], fail: bool) {
+        if !self.shown.is_empty() {
+            if fail {
+                self.land_count(self.shown.len());
+            } else {
+                self.show(places);
+                return;
+            }
+        }
+        let mut frame = self.placed(places);
         if fail && let Some(last) = frame.last().copied() {
             frame.push(stroke::Dab {
                 strength: 3e38,
@@ -291,7 +358,7 @@ impl Case {
 
     /// Runs one operation the bytes name, then a frame (one that may be lost or fail).
     fn op(&mut self, gpu: &Gpu, (kind, a, b): (u8, u8, u8)) {
-        match kind % 9 {
+        match kind % 11 {
             0 | 1 => {
                 let count = usize::from(a % 4) + 1;
                 let dabs: Vec<(u8, u8)> = (0..count)
@@ -336,7 +403,22 @@ impl Case {
                         .collect()
                 };
             }
-            _ => self.residency.mark_tree_dirty(),
+            8 => self.residency.mark_tree_dirty(),
+            // Dabs shown ahead of their finest work.
+            9 => {
+                let count = usize::from(a % 3) + 1;
+                let places: Vec<(u8, u8)> = (0..count)
+                    .map(|n| {
+                        let n = u8::try_from(n).expect("small");
+                        (
+                            a.wrapping_add(n.wrapping_mul(7)),
+                            b.wrapping_add(n.wrapping_mul(13)),
+                        )
+                    })
+                    .collect();
+                self.show(&places);
+            }
+            _ => self.land(a),
         }
         self.frame(gpu);
     }
@@ -345,6 +427,11 @@ impl Case {
     /// frames must go idle.
     fn quiet(&mut self, gpu: &Gpu) {
         self.near.clear();
+        self.land_count(self.shown.len());
+        assert!(
+            !self.project.store().has_previews(),
+            "no preview once every dab shown has landed"
+        );
         for _ in 0..40 {
             run_jobs(self.project.store());
             self.frame(gpu);
@@ -373,16 +460,54 @@ impl Case {
     }
 }
 
-/// The invariant, against the store's finest level `grids`.
+/// The finest level as a renderer draws it: `truth` (the store's, [`finest_grids`]) with every
+/// previewed tile's own vertices from its preview.
+pub(super) fn drawn_grids(
+    store: &TileStore,
+    truth: &BTreeMap<u32, Vec<Vec3>>,
+) -> BTreeMap<u32, Vec<Vec3>> {
+    let finest = level(FINEST);
+    let (face_quads, quads) = (finest.face_quads(), finest.tile_quads());
+    let mut drawn = truth.clone();
+    for key in store.previewed() {
+        let (Some(block), Some(grid)) = (store.preview(key), drawn.get_mut(&key.face().index()))
+        else {
+            continue;
+        };
+        for j in 0..=quads {
+            for i in 0..=quads {
+                let (x, y) = (
+                    u32::from(key.tx()) * quads + i,
+                    u32::from(key.ty()) * quads + j,
+                );
+                let at = usize::try_from(y * (face_quads + 1) + x).expect("small");
+                grid[at] = block.get(i64::from(i), i64::from(j));
+            }
+        }
+    }
+    drawn
+}
+
+/// The invariant, against the store's finest level `truth` and the finest level as drawn,
+/// `drawn` (previews in place of their tiles, [`drawn_grids`]).
 ///
-/// Every resident display tile's node bounds every finest vertex under it (in `f64`), and each of
-/// its border vertices holds the finest vertex's bits, unless the tile is behind a step it couldn't
-/// stand in for (its bound raised) or its bound says nothing is known.
-fn invariant(gpu: &Gpu, residency: &Residency, grids: &BTreeMap<u32, Vec<Vec3>>) {
+/// Every resident display tile's node bounds every finest vertex under it, of the store's (in
+/// `f64`), and each of its border vertices holds the drawn finest vertex's bits, unless the tile
+/// is behind a step it couldn't stand in for (its bound raised) or its bound says nothing is
+/// known.
+fn invariant(
+    gpu: &Gpu,
+    residency: &Residency,
+    truth: &BTreeMap<u32, Vec<Vec3>>,
+    shown: &BTreeMap<u32, Vec<Vec3>>,
+) {
     let finest = level(FINEST);
     let n = finest.face_quads();
     let at = |face: FaceId, x: u32, y: u32| {
-        grids[&face.index()][usize::try_from(y * (n + 1) + x).expect("small")]
+        truth[&face.index()][usize::try_from(y * (n + 1) + x).expect("small")]
+    };
+    let drawn_at = |face: FaceId, x: u32, y: u32| {
+        shown[&face.index()][usize::try_from(y * (n + 1) + x).expect("small")]
     };
     for (place, (vertices, node)) in display_tiles(gpu, residency) {
         let size = n / place.level().tiles_per_side();
@@ -398,7 +523,7 @@ fn invariant(gpu: &Gpu, residency: &Residency, grids: &BTreeMap<u32, Vec<Vec3>>)
                 .flat_map(|j| (0..=quads).map(move |i| (i, j)))
                 .filter(|&(i, j)| i == 0 || j == 0 || i == quads || j == quads);
             for (i, j) in border {
-                let finest_bits = at(place.face(), x0 + i * scale, y0 + j * scale).to_bits();
+                let finest_bits = drawn_at(place.face(), x0 + i * scale, y0 + j * scale).to_bits();
                 assert_eq!(
                     vertex(i, j).position.map(f32::to_bits),
                     finest_bits,

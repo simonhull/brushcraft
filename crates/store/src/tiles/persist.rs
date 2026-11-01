@@ -168,6 +168,7 @@ impl TileStore {
             epoch_writes: BTreeSet::new(),
             epoch_keys: BTreeSet::new(),
             epoch_step: None,
+            previews: super::preview::Previews::default(),
             strokes_waiting: Vec::new(),
             floor: std::collections::BTreeMap::new(),
             floor_read: std::collections::BTreeMap::new(),
