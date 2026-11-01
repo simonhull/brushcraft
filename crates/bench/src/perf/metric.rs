@@ -74,17 +74,20 @@ pub(crate) enum Unit {
     Tiles,
     /// Frames: a count of them.
     Frames,
+    /// Brush dabs: a count of them.
+    Dabs,
 }
 
 impl Unit {
     /// Every unit.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Ms,
         Self::Us,
         Self::Mib,
         Self::Bytes,
         Self::Tiles,
         Self::Frames,
+        Self::Dabs,
     ];
 
     /// The unit's name in history records and tables (ASCII, so `us` for microseconds).
@@ -96,6 +99,7 @@ impl Unit {
             Self::Bytes => "B",
             Self::Tiles => "tiles",
             Self::Frames => "frames",
+            Self::Dabs => "dabs",
         }
     }
 

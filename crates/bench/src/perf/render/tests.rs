@@ -150,8 +150,112 @@ fn frame(time_ms: f64, segment: &str, (over, requested, wanted): (f64, f64, f64)
         over_budget: Some(over),
         requested: Some(requested),
         wanted: Some(wanted),
-        clock: None,
+        ..Frame::default()
     }
+}
+
+/// A frame of a stroke segment at `time_ms`.
+///
+/// It applied `applied` dabs and left `carried`, its stroke `open` or not, its latency
+/// `latency_ms` (with dabs applied), submitted 3 ms after its start, its brush 1 ms, its
+/// preparation 0.1 ms.
+fn stroke_frame(
+    time_ms: f64,
+    (applied, carried, open): (f64, f64, bool),
+    latency_ms: f64,
+) -> Frame {
+    Frame {
+        time_ms,
+        segment: Some("stroke_near".to_owned()),
+        submitted_ms: Some(time_ms + 3.0),
+        sample_to_present_ms: (applied > 0.0).then_some(latency_ms),
+        brush_ms: Some(1.0),
+        prepare_ms: Some(0.1),
+        dabs_applied: Some(applied),
+        dabs_carried: Some(carried),
+        above_f: Some(false),
+        stroke_open: Some(open),
+        ..Frame::default()
+    }
+}
+
+/// A strokes run of `frames`, all in `stroke_near`.
+fn stroke_run(frames: Vec<Frame>) -> Recorded {
+    Recorded {
+        segments: vec![("stroke_near".to_owned(), 0.0, 1000.0)],
+        frames,
+        ..Recorded::default()
+    }
+}
+
+#[test]
+fn a_stroke_gives_its_latency_its_queue_and_its_drain() {
+    let frames = vec![
+        stroke_frame(0.0, (0.0, 0.0, false), 0.0),
+        stroke_frame(6.0, (2.0, 1.0, true), 5.0),
+        stroke_frame(12.0, (3.0, 0.0, true), 7.5),
+        stroke_frame(18.0, (2.0, 3.0, true), 6.0),
+        stroke_frame(24.0, (2.0, 1.0, false), 9.0),
+        stroke_frame(30.0, (1.0, 0.0, false), 4.0),
+        stroke_frame(36.0, (0.0, 0.0, false), 0.0),
+    ];
+    let [near, far, long] = strokes::derive(&stroke_run(frames));
+    assert_eq!(near.sample_to_present_p99, Some(9.0), "the nearest rank");
+    assert_eq!(near.start_to_submitted_p99, Some(3.0));
+    assert_eq!(near.brush_p99, Some(1.0));
+    assert_eq!(near.most_carried, Some(3.0));
+    assert_eq!(
+        near.drain,
+        Some(strokes::Drain::Frames(2.0)),
+        "the second frame after pen-up carries none"
+    );
+    assert_eq!(near.above_f, Some(0.0));
+    assert_eq!(near.prepare_p99, Some(0.1));
+    assert_eq!(far, strokes::StrokeMetrics::default(), "no such segment");
+    assert_eq!(long, strokes::StrokeMetrics::default());
+}
+
+#[test]
+fn a_queue_never_drained_within_its_segment_is_not_reached_and_a_miss_on_the_benchmark() {
+    let frames = vec![
+        stroke_frame(0.0, (1.0, 5.0, true), 5.0),
+        stroke_frame(6.0, (1.0, 9.0, false), 30.0),
+        stroke_frame(12.0, (1.0, 8.0, false), 40.0),
+    ];
+    let mut samples = Samples::default();
+    let gaps = sample_strokes(&stroke_run(frames), Scale::Full, &mut samples).unwrap();
+    assert!(
+        gaps.contains(&Gap::NotReached(
+            "render.stroke_near.drain_frames",
+            Unit::Frames
+        )),
+        "{gaps:?}"
+    );
+    let metrics = with_targets(samples.measure().unwrap(), Scale::Full);
+    let ceiling = |name: &str| {
+        metrics
+            .iter()
+            .find(|m| m.name.as_str() == name)
+            .and_then(|m| m.ceiling)
+    };
+    assert_eq!(
+        ceiling("full.render.stroke_near.sample_to_present_p99_ms"),
+        Some(8.0),
+        "the spec's pen latency"
+    );
+    assert_eq!(
+        ceiling("full.render.stroke_near.dabs_carried_max"),
+        Some(strokes::MOST_CARRIED)
+    );
+    assert_eq!(ceiling("full.render.stroke_near.brush_p99_ms"), None);
+    let carried = metrics
+        .iter()
+        .find(|m| m.name.as_str() == "full.render.stroke_near.dabs_carried_max")
+        .expect("measured");
+    assert_eq!(carried.unit, Unit::Dabs);
+    let name: MetricName = "full.render.stroke_far.drain_frames".parse().unwrap();
+    assert_eq!(ceiling_of(&name, Scale::Full), Some(2.0));
+    assert_eq!(ceiling_of(&name, Scale::Medium), None);
 }
 
 /// A run opening in `open_ms`, its segments as the benchmark's at 1×, with `frames`.

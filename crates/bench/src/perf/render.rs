@@ -32,6 +32,11 @@
 //! - **open to correct**: from the project beginning to open until the first frame of the open
 //!   segment shown with no tile over 1 px and nothing requested (spec: ≤ 1 s on desktop).
 //!
+//! Each run also runs the strokes script (`--script-path strokes`), whose record gives the pen's
+//! metrics for its three strokes ([`strokes`]: sample to present, frame start to present
+//! submitted, the brush, the most dabs carried and the frames to drain them after pen-up, frames
+//! above F, the brush's preparation).
+//!
 //! A run whose record lacks one (no timestamp queries, no flick) gives no sample of it, and the
 //! part says so. A run that never reaches a timed metric's end (no frame caught up after the
 //! flick, none correct within the open segment) gives no sample either, and the part says it
@@ -41,6 +46,7 @@
 //! ([`judge_unreached`]). With no GPU (the app exits 69 when no adapter matches), the part
 //! doesn't run: "not run: no adapter".
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
 
@@ -52,6 +58,7 @@ use crate::perf::project::{Scale, Source, WorkDir};
 use crate::perf::suite::{AppExit, Runner, Samples};
 
 mod clocks;
+mod strokes;
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
@@ -136,6 +143,23 @@ pub(crate) struct Frame {
     pub(crate) wanted: Option<f64>,
     /// The GPU's clocks nearest its start, if sampled ([`Recorded::join_clocks`]).
     pub(crate) clock: Option<ClockSample>,
+    /// When its present was submitted, on the frame loop's clock, in ms, if known.
+    pub(crate) submitted_ms: Option<f64>,
+    /// The pen's latency: its oldest sample whose dabs it applied to its present submitted, in
+    /// ms; `None` for a frame that applied none.
+    pub(crate) sample_to_present_ms: Option<f64>,
+    /// Its brush phase, in ms.
+    pub(crate) brush_ms: Option<f64>,
+    /// The brush's preparation after its hand-off, in ms.
+    pub(crate) prepare_ms: Option<f64>,
+    /// Dabs it applied.
+    pub(crate) dabs_applied: Option<f64>,
+    /// Dabs it left queued for the next frames.
+    pub(crate) dabs_carried: Option<f64>,
+    /// Whether a dab of it was above the footprint limit F.
+    pub(crate) above_f: Option<bool>,
+    /// Whether a stroke was still open as its brush step ended.
+    pub(crate) stroke_open: Option<bool>,
 }
 
 impl Frame {
@@ -252,6 +276,14 @@ impl Recorded {
                 requested: number(object, "requested"),
                 wanted: number(object, "wanted"),
                 clock: None,
+                submitted_ms: number(object, "submitted_ms"),
+                sample_to_present_ms: number(object, "sample_to_present_ms"),
+                brush_ms: number(object, "brush_ms"),
+                prepare_ms: number(object, "prepare_ms"),
+                dabs_applied: number(object, "dabs_applied"),
+                dabs_carried: number(object, "dabs_carried"),
+                above_f: object.get("above_f").and_then(Json::as_bool),
+                stroke_open: object.get("stroke_open").and_then(Json::as_bool),
             }),
             _ => {}
         }
@@ -538,18 +570,47 @@ impl RenderMetrics {
     ///
     /// If a name isn't a metric name, or a unit clashes.
     fn sample(&self, scale: Scale, samples: &mut Samples) -> Result<Vec<Gap>> {
-        let mut gaps = Vec::new();
-        for (name, unit, value) in self.named() {
-            match value {
-                Value::Of(value) => {
-                    samples.push(MetricName::join(scale.name(), name)?, unit, value)?;
-                }
-                Value::Lacking => gaps.push(Gap::Lacking(name)),
-                Value::NotReached => gaps.push(Gap::NotReached(name, unit)),
-            }
-        }
-        Ok(gaps)
+        sample_named(self.named(), scale, samples)
     }
+}
+
+/// Adds `named` metrics (name after the scale, unit, value) to `samples` under `scale`'s names;
+/// returns those it had none of, and why.
+///
+/// # Errors
+///
+/// If a name isn't a metric name, or a unit clashes.
+fn sample_named(
+    named: impl IntoIterator<Item = (&'static str, Unit, Value)>,
+    scale: Scale,
+    samples: &mut Samples,
+) -> Result<Vec<Gap>> {
+    let mut gaps = Vec::new();
+    for (name, unit, value) in named {
+        match value {
+            Value::Of(value) => {
+                samples.push(MetricName::join(scale.name(), name)?, unit, value)?;
+            }
+            Value::Lacking => gaps.push(Gap::Lacking(name)),
+            Value::NotReached => gaps.push(Gap::NotReached(name, unit)),
+        }
+    }
+    Ok(gaps)
+}
+
+/// The pen's metrics of one strokes run, `recorded` ([`strokes`]), added to `samples` under
+/// `scale`'s names; returns those it had none of, and why.
+///
+/// # Errors
+///
+/// If a name isn't a metric name, or a unit clashes.
+fn sample_strokes(recorded: &Recorded, scale: Scale, samples: &mut Samples) -> Result<Vec<Gap>> {
+    let derived = strokes::derive(recorded);
+    let named = derived
+        .iter()
+        .enumerate()
+        .flat_map(|(index, metrics)| metrics.named(index));
+    sample_named(named, scale, samples)
 }
 
 /// A metric a run gave no sample of, by its name after the scale.
@@ -697,23 +758,27 @@ fn measure(
     let mut unreached: Vec<Unreached> = Vec::new();
     for run in 0..setting.runs {
         let record = dir.join(format!("render-{run}.jsonl"));
-        let args = [
-            copy_arg.clone(),
-            "--offscreen".into(),
-            "--script".into(),
-            "--script-speed".into(),
-            setting.speed.into(),
-            "--record".into(),
-            record.as_os_str().to_owned(),
-            "--adapter".into(),
-            setting.adapter.into(),
-            "--level".into(),
-            level.clone().into(),
-            "--size".into(),
-            setting.size.into(),
-        ];
+        let args = |path: &str, into: &Path| -> Vec<OsString> {
+            vec![
+                copy_arg.clone(),
+                "--offscreen".into(),
+                "--script".into(),
+                "--script-path".into(),
+                path.into(),
+                "--script-speed".into(),
+                setting.speed.into(),
+                "--record".into(),
+                into.as_os_str().to_owned(),
+                "--adapter".into(),
+                setting.adapter.into(),
+                "--level".into(),
+                level.clone().into(),
+                "--size".into(),
+                setting.size.into(),
+            ]
+        };
         let sampling = ClockSampler::start();
-        let exit = runner.app(&args, &dir.join("state"));
+        let exit = runner.app(&args("benchmark", &record), &dir.join("state"));
         let clock_samples = sampling.map(ClockSampler::stop);
         match exit? {
             AppExit::NoAdapter => return Ok(RenderPart::NotRun("no adapter".to_owned())),
@@ -725,7 +790,14 @@ fn measure(
             Recorded::parse(&text).with_context(|| format!("{}", record.display()))?;
         recorded.join_clocks(clock_samples);
         let metrics = derive(&recorded);
-        let gaps = metrics.sample(scale, &mut samples)?;
+        let mut gaps = metrics.sample(scale, &mut samples)?;
+        let strokes_record = dir.join(format!("strokes-{run}.jsonl"));
+        runner.app(&args("strokes", &strokes_record), &dir.join("state"))?;
+        let strokes_text = std::fs::read_to_string(&strokes_record)
+            .with_context(|| format!("reading {}", strokes_record.display()))?;
+        let stroked = Recorded::parse(&strokes_text)
+            .with_context(|| format!("{}", strokes_record.display()))?;
+        gaps.extend(sample_strokes(&stroked, scale, &mut samples)?);
         let mut said: Vec<String> = gaps.iter().map(Gap::to_string).collect();
         said.push(metrics.clock_note());
         notes.push(format!("run {}: {}", run + 1, said.join(", ")));
@@ -754,6 +826,7 @@ fn measure(
 fn ceiling_of(name: &MetricName, scale: Scale) -> Option<f64> {
     let target = TARGETS
         .iter()
+        .chain(&strokes::TARGETS)
         .find(|(target, _)| name.as_str().ends_with(target));
     target
         .filter(|_| scale == Scale::Full)
