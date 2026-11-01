@@ -548,6 +548,37 @@ fn a_brush_stroke_never_orbits_and_a_barrel_stroke_still_navigates() {
 }
 
 #[test]
+fn the_mouse_moves_no_view_while_a_brush_stroke_is_open() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = pen_owner(&dir, true);
+    let before = *owner.camera();
+    owner.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    assert_eq!(run(&mut owner, 100), 1);
+    // A mouse drag while the pen's stroke is open: the view holds still.
+    owner.input(Input::Press {
+        button: Button::MouseLeft,
+        at: Pixel { x: 100.0, y: 100.0 },
+    });
+    owner.input(Input::Move {
+        at: Pixel { x: 140.0, y: 100.0 },
+    });
+    owner.pen(pen_sample(Phase::Drag, (200.0, 100.0)));
+    run(&mut owner, 100);
+    assert_eq!(*owner.camera(), before, "frozen while the brush draws");
+    // The stroke over, the same drag goes on from where the pointer is, with no jump.
+    owner.pen(pen_sample(Phase::Up, (200.0, 100.0)));
+    run(&mut owner, 100);
+    assert_eq!(*owner.camera(), before, "no catching up");
+    owner.input(Input::Move {
+        at: Pixel { x: 180.0, y: 100.0 },
+    });
+    run(&mut owner, 100);
+    assert_ne!(*owner.camera(), before, "then the drag orbits");
+    owner.close().expect("closed");
+}
+
+#[test]
 fn hovering_while_no_frame_comes_keeps_one_sample() {
     use input::Phase;
     let dir = TestDir::new();

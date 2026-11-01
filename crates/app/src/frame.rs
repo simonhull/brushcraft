@@ -4,13 +4,14 @@
 //! [`Owner`] holds the project, so it lives on the one thread that may touch the store, and
 //! makes each frame in a fixed order:
 //!
-//! 1. **input**: the pointer input queued since the last frame moves the camera; the pen samples
-//!    queued since the last frame are routed ([`crate::pen::PenRouter`]: a stroke to navigation or
-//!    the brush, the rest to both), navigation's moving the camera after the mouse's input, and
-//!    become the frame's [`PenFrame`]; then the surface under the pointer is picked for the overlay
-//!    if the pointer or the view changed ([`crate::pick`]), except while the brush is stroking (the
-//!    pick is on the pen's latency path, and the stroke moves the surface under it anyway): it is
-//!    made once the stroke is over, in a frame wanted for it;
+//! 1. **input**: the pointer input queued since the last frame moves the camera (not while a brush
+//!    stroke is open: a stroke is drawn through one camera, which its record keeps); the pen
+//!    samples queued since the last frame are routed ([`crate::pen::PenRouter`]: a stroke to
+//!    navigation or the brush, the rest to both), navigation's moving the camera after the mouse's
+//!    input, and become the frame's [`PenFrame`]; then the surface under the pointer is picked for
+//!    the overlay if the pointer or the view changed ([`crate::pick`]), except while the brush is
+//!    stroking (the pick is on the pen's latency path, and the stroke moves the surface under it
+//!    anyway): it is made once the stroke is over, in a frame wanted for it;
 //! 2. **brush**: the brush's step ([`Brush`]; the app's is [`crate::sculpting::Sculpting`]), which
 //!    sees the camera as the input left it and the frame's pen samples, applies the frame's dabs
 //!    and closes their epoch, so they are drained just after and drawn in this frame; what it
@@ -1233,8 +1234,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// The input phase of a frame of `size`: the input queued since the last frame moves the
-    /// camera, the pen samples queued become the frame's [`PenFrame`], then the surface under the
-    /// pointer is picked if the pointer or the view changed, unless the brush is stroking
+    /// camera (unless a brush stroke is open: the view holds still while the brush draws), the pen
+    /// samples queued become the frame's [`PenFrame`], then the surface under the pointer is
+    /// picked if the pointer or the view changed, unless the brush is stroking
     /// ([`Owner::brushing`]; see the module notes).
     ///
     /// # Errors
@@ -1244,9 +1246,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let arcball = Arcball::new(size);
         let height = f64::from(size.height());
         let input = std::mem::take(&mut self.input);
+        // While a brush stroke is open the view holds still: the stroke's record keeps one camera.
+        // Navigation still follows the input (buttons held, the pointer), so nothing jumps after.
+        let frozen = self.pen_router.stroke() == Some(Route::Brush);
         for event in input {
-            self.navigator
-                .apply(event, &mut self.camera, &arcball, height);
+            let mut held = self.camera;
+            let camera = if frozen { &mut held } else { &mut self.camera };
+            self.navigator.apply(event, camera, &arcball, height);
         }
         self.route_pen(&arcball, size);
         self.stroking.pick_deferred = self.brushing();
