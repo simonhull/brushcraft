@@ -67,7 +67,6 @@
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
-use std::ops::Bound;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
@@ -87,6 +86,7 @@ use crate::upload::{
 };
 
 mod pool;
+mod recency;
 mod requests;
 mod stand_ins;
 #[cfg(test)]
@@ -94,6 +94,7 @@ mod stand_ins;
 mod tests;
 
 use pool::Pools;
+use recency::Recency;
 use requests::RequestBuffer;
 pub use requests::{GpuRequest, REQUEST_HEADER, REQUESTS_WGSL, Request, Requests};
 use stand_ins::StandIns;
@@ -700,7 +701,9 @@ pub struct ResidencyStats {
 struct Entry {
     /// Its slot.
     slot: Slot,
-    /// The frame it was last drawn in (or arrived in).
+    /// The frame it was last drawn in (or arrived in), for a tile outside the floor (the
+    /// floor's is never read). While the latest use holds it as drawn ([`Recency`]), that use's
+    /// frame is its own instead, and it is set here when the tile stops being held.
     last_drawn: u64,
     /// Whether it is part of the floor.
     floor: bool,
@@ -835,7 +838,7 @@ pub struct Residency {
     /// Every resident tile.
     entries: BTreeMap<TileKey, Entry>,
     /// Per class, resident tiles outside the floor by the frame they were last drawn in.
-    recency: Vec<BTreeSet<(u64, TileKey)>>,
+    recency: Recency,
     /// The floor's tiles.
     floor: BTreeSet<TileKey>,
     /// How many of them are resident: so a frame with the whole floor up skips scanning it.
@@ -984,7 +987,7 @@ impl Residency {
             pools,
             tree,
             entries: BTreeMap::new(),
-            recency: vec![BTreeSet::new(); CLASSES],
+            recency: Recency::default(),
             floor,
             floor_resident: 0,
             floor_unavailable: 0,
@@ -1190,17 +1193,7 @@ impl Residency {
     /// unreachable and drawn by the next ancestor up, two or more levels coarser.
     pub fn use_frame(&mut self, frame: FrameUse) {
         let FrameUse { cut, drawn } = frame;
-        for key in &drawn {
-            if let Some(entry) = self.entries.get_mut(key) {
-                if !entry.floor
-                    && let Some(recency) = self.recency.get_mut(usize::from(entry.slot.class.0))
-                {
-                    recency.remove(&(entry.last_drawn, *key));
-                    recency.insert((self.frame, *key));
-                }
-                entry.last_drawn = self.frame;
-            }
-        }
+        self.recency.renew(&drawn, self.frame, &mut self.entries);
         // The drawn tiles are the cut's after culling: with the cut as it was, and the shielded
         // set made from it alone, the set is the same, and is kept. One not made yet is made
         // from the new sets if a frame needs it.
@@ -2183,18 +2176,12 @@ impl Residency {
         }
         let index = usize::from(class.0);
         let after = self.scanned.get(index).copied().flatten();
-        let from = after.map_or(Bound::Unbounded, Bound::Excluded);
-        let candidates = self
-            .recency
-            .get(index)
-            .into_iter()
-            .flat_map(|recency| recency.range((from, Bound::Unbounded)));
+        let candidates = self.recency.oldest(index, after);
         let victim = candidates
             .filter(|(_, key)| {
                 !self.protected(key) && !self.pending.contains(key) && !self.fresh.contains(key)
             })
-            .find(|(_, key)| !self.groups.iter().any(|group| group.holds(key)))
-            .copied();
+            .find(|(_, key)| !self.groups.iter().any(|group| group.holds(key)));
         let Some(victim) = victim else {
             return Ok(None);
         };
@@ -2246,9 +2233,7 @@ impl Residency {
         if self.entries.insert(key, entry).is_none() && floor {
             self.floor_resident += 1;
         }
-        if !floor && let Some(recency) = self.recency.get_mut(usize::from(slot.class.0)) {
-            recency.insert((self.frame, key));
-        }
+        self.recency.arrived(key, self.frame, floor);
         Ok(())
     }
 
@@ -2282,9 +2267,7 @@ impl Residency {
         if entry.floor {
             self.floor_resident -= 1;
         }
-        if let Some(recency) = self.recency.get_mut(usize::from(entry.slot.class.0)) {
-            recency.remove(&(entry.last_drawn, *key));
-        }
+        self.recency.left(key, entry.last_drawn);
         self.tree.remove(Place::of(key));
         self.pools.release(entry.slot);
         if let Some(row) = self.stand_ins.rows.release(Place::of(key)) {
