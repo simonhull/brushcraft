@@ -53,7 +53,8 @@ impl TileStore {
     /// positions, or ring, the writes since changed, and every display tile recorded since.
     ///
     /// Its kind ([`EpochKind`]): a step's if brush steps' bumps
-    /// ([`TileStore::bump_display_error`]) covered every write in it, with their displacements
+    /// ([`TileStore::bump_display_error`]) covered every write in it (each written tile one a
+    /// bump named, and no write after the last bump), with their displacements
     /// summed (rounded up: the steps moved a vertex one after another); a revert's if it has
     /// writes no bump covered; else a refresh's. A refresh slice closes any epoch holding writes
     /// before it records its tiles, so a refresh's epoch holds refreshed tiles alone.
@@ -90,7 +91,7 @@ impl TileStore {
             )?
         };
         let kind = match step {
-            Some((displacement, covered)) if self.epoch_writes.is_subset(&covered) => {
+            Some((displacement, covered, false)) if self.epoch_writes.is_subset(&covered) => {
                 EpochKind::Step { displacement }
             }
             _ if !self.epoch_writes.is_empty() => EpochKind::Revert,
@@ -109,7 +110,7 @@ impl TileStore {
     /// last. A sum that isn't finite saturates at `f32::MAX`.
     pub(super) fn note_step(&mut self, edited: &BTreeSet<TileKey>, displacement: f32) {
         if self.stale.is_listened() {
-            let (sum, covered) = self.epoch_step.get_or_insert_with(Default::default);
+            let (sum, covered, unbumped) = self.epoch_step.get_or_insert_with(Default::default);
             let total = if *sum == 0.0 {
                 displacement
             } else {
@@ -119,6 +120,8 @@ impl TileStore {
             // still a bound, and one a reader can take.
             *sum = if total.is_finite() { total } else { f32::MAX };
             covered.extend(edited.iter().copied());
+            // The writes so far are this bump's.
+            *unbumped = false;
         }
     }
 
@@ -140,6 +143,9 @@ impl TileStore {
     pub(super) fn note_epoch_write(&mut self, key: TileKey) {
         if self.stale.is_listened() {
             self.epoch_writes.insert(key);
+            if let Some((_, _, unbumped)) = &mut self.epoch_step {
+                *unbumped = true;
+            }
         }
     }
 

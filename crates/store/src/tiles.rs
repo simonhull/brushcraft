@@ -430,7 +430,9 @@ pub struct TileStore {
     /// The open epoch's brush steps, if it has any: the displacements their bumps raised
     /// display bounds by, summed (rounded up), and the correction tiles those bumps covered. The
     /// epoch is a step's if they cover every write in it ([`crate::EpochKind`]).
-    epoch_step: Option<(f32, BTreeSet<TileKey>)>,
+    /// The third: whether a write came after the last bump, which no bump bounds (a dab that
+    /// failed after writing) and makes the epoch a revert's.
+    epoch_step: Option<(f32, BTreeSet<TileKey>, bool)>,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,
     /// The queued evaluation (see [`crate::queued`]): finest tiles wanted by priority, run in

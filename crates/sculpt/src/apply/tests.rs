@@ -439,3 +439,53 @@ fn a_frame_too_big_to_pin_is_applied_in_two_with_the_same_bits() {
     }
     panic!("no budget from the minimum up applies the two dabs");
 }
+
+#[test]
+fn a_frame_of_dabs_closes_one_step_epoch_with_their_displacements_summed() {
+    let dir = TestDir::new();
+    let config = store::ProjectConfig {
+        store: store::StoreConfig::new(64 << 20, 1)
+            .with_chunk_bytes(1 << 20)
+            .with_workers(fixed(2))
+            .with_display(level()),
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let mut project = Project::new(geom::cube_sphere(1).unwrap(), config).unwrap();
+    let store = project.store();
+    store.queue_display_rebuild(level());
+    loop {
+        store
+            .run_jobs(std::time::Instant::now() + std::time::Duration::from_millis(50))
+            .unwrap();
+        if !store.has_jobs() {
+            break;
+        }
+    }
+    let mut index = SpatialIndex::build(project.store(), level(), |_, _| {}).unwrap();
+    let cursor = project.store().subscribe_stale();
+    // Four dabs each centred on a vertex, so each moves that vertex its whole strength.
+    let key = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let strengths = [0.004_f32, 0.002, 0.003, 0.001];
+    let places = [(20, 20), (30, 22), (24, 34), (40, 40)];
+    let frame: Vec<Dab> = strengths
+        .iter()
+        .zip(places)
+        .zip(0..)
+        .map(|((&strength, (i, j)), seq)| {
+            dab(vertex(project.store(), key, i, j), 0.03, strength, 0.0, seq)
+        })
+        .collect();
+    let mut state = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    apply_dabs(project.store(), &mut index, &mut state, &frame).unwrap();
+    project.end_stroke().unwrap();
+    let store::Drained::Epochs(epochs) = project.store().drain_stale(&cursor) else {
+        panic!("epochs");
+    };
+    let kinds: Vec<store::EpochKind> = epochs.iter().map(|epoch| epoch.kind).collect();
+    let sum: f32 = strengths.iter().sum();
+    assert!(
+        matches!(kinds.as_slice(), [store::EpochKind::Step { displacement }] if *displacement >= sum),
+        "one step's epoch, D at least the dabs' strengths summed ({sum}): {kinds:?}"
+    );
+}
