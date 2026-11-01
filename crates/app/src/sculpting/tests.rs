@@ -13,7 +13,7 @@ use store::{ProjectConfig, ProjectFile, StoreConfig};
 
 use super::*;
 use crate::frame::schedule::Next;
-use crate::frame::{NoUploads, Owner, RecordSetup, Setup};
+use crate::frame::{NoPen, NoUploads, Owner, RecordSetup, Setup};
 use crate::pick::Picker;
 use crate::render_thread::Presented;
 use crate::script::{Script, Speed};
@@ -416,21 +416,41 @@ fn the_cost_learns_how_long_batches_take_here() {
     // Four and a half dabs' time, as calibrated.
     let room = Duration::from_nanos(4225 * 9 / 2);
     assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 4);
-    // A batch of one tile took four times its prediction: the scale rises at once.
+    // A batch of one tile took four times its prediction: the scale rises, but only doubles.
     cost.observe(TILE_VERTICES, Duration::from_nanos(4225 * 4));
-    assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 1);
+    assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 2, "doubled");
+    cost.observe(TILE_VERTICES, Duration::from_nanos(4225 * 4));
+    assert_eq!(
+        cost.take([one.as_slice(); 8], room, true).0,
+        1,
+        "four times"
+    );
     // Faster batches lower it an eighth of the way each.
     for _ in 0..40 {
         cost.observe(TILE_VERTICES, Duration::from_nanos(4225));
     }
     assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 4, "back");
-    // One far off is believed only to 64 times.
+    // One far off is believed only to double, however far.
     cost.observe(TILE_VERTICES, Duration::from_secs(3600));
-    assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 1);
+    assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 2);
+}
+
+#[test]
+fn a_batch_pays_its_fixed_part_once() {
+    let one = tiles(0, 1);
+    let cost = DabCost::new(0.0, 1.0, Grouping::PerDab).with_per_batch(TILE_VERTICES);
+    let room = Duration::from_nanos(4225 * 4);
+    let (count, units) = cost.take([one.as_slice(); 8], room, true);
+    assert_eq!(count, 3, "the batch's own part takes one dab's room");
+    assert_eq!(units, 4.0 * TILE_VERTICES, "and is counted in its units");
     assert_eq!(
-        cost.take([one.as_slice(); 8], room * 64, true).0,
-        4,
-        "held to 64 times"
+        cost.take(
+            std::iter::empty::<&[TileKey]>(),
+            Duration::from_secs(1),
+            true
+        ),
+        (0, 0.0),
+        "no dab, no batch"
     );
 }
 
@@ -522,6 +542,90 @@ fn the_budget_carries_dabs_across_frames_in_order_and_loses_none() {
     );
     whole.close().expect("closed");
     assert_eq!(saved_strokes(capped, &capped_dir, "c.bcrf").len(), 1);
+}
+
+#[test]
+fn between_frames_a_strokes_dabs_are_applied_once_and_shown_by_the_next_frame() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::any_number()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    assert!(
+        !owner
+            .between_frames(Instant::now(), &mut NoPen)
+            .expect("a step"),
+        "no stroke: nothing to do between frames"
+    );
+    // A frame in flight: the render thread has it, and the loop would wait.
+    let now = Instant::now();
+    let mut number = 0;
+    owner
+        .frame(now, now + Duration::from_secs(1), |request| {
+            number = request.number;
+            Ok(())
+        })
+        .expect("a frame");
+    assert_eq!(owner.next(Instant::now()), Next::Render);
+    // A down and drags arrive meanwhile (the stroke stays open).
+    let mut samples = stroke(ACROSS, 12);
+    samples.pop();
+    let first = samples.first().expect("a down").timestamp;
+    let last = samples.last().expect("drags").timestamp;
+    queue(&mut owner, samples);
+    let mut steps = 0;
+    while owner
+        .between_frames(Instant::now(), &mut NoPen)
+        .expect("a step")
+    {
+        steps += 1;
+        assert!(steps < 1000, "the loop would spin");
+    }
+    let between = owner.between_report().expect("the brush stepped");
+    assert!(steps > 0 && between.dabs_applied > 0, "{between:?}");
+    assert_eq!(between.dabs_carried, 0, "all of them, with time for any");
+    let oldest = between.oldest.expect("a sample applied");
+    assert!(
+        (first..=last).contains(&oldest.taken),
+        "one of the stroke's samples"
+    );
+    assert!(
+        !owner
+            .between_frames(Instant::now(), &mut NoPen)
+            .expect("a step"),
+        "nothing queued or carried: no more work, no spin"
+    );
+    owner.shown(presented(number));
+    let epochs = owner.feed_stats().epochs;
+    let next = owner.next(Instant::now());
+    let Next::Frame { deadline } = next else {
+        panic!("the edits want their frame at once: {next:?}");
+    };
+    owner
+        .frame(Instant::now(), deadline, |request| {
+            number = request.number;
+            Ok(())
+        })
+        .expect("a frame");
+    assert!(
+        owner.feed_stats().epochs > epochs,
+        "the next frame drained the epochs the steps closed"
+    );
+    assert_eq!(
+        owner.latency_from_of(number),
+        Some(oldest),
+        "its latency runs from the sample applied between frames"
+    );
+    assert_eq!(owner.between_report(), None, "counted once, by that frame");
+    assert_eq!(
+        owner.brush().last().dabs_applied,
+        between.dabs_applied,
+        "the frame applied none again"
+    );
+    owner.shown(presented(number));
+    owner.close().expect("closed");
 }
 
 #[test]
@@ -636,7 +740,13 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
         }),
         ..setup()
     };
-    let mut owner = owner_of(project(&dir), Sculpting::new, setup);
+    // A cost model that fits every dab: the queue's mechanics, whatever this machine's speed (the
+    // numbers are the performance suite's, on the benchmark project).
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::any_number()),
+        setup,
+    );
     run(&mut owner, 100_000);
     assert!(owner.done(), "the script ran through");
     let settings = owner.brush().settings();
@@ -683,14 +793,11 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
     let quiet = quiet.expect("frames without dabs");
     assert_eq!(field(quiet, "sample_to_present_ms"), "null", "{quiet}");
     let (most, drained) = queue_over(&frames, "\"stroke_long\"");
-    assert!(
-        most <= 8,
-        "the queue never grows over the long stroke: at most {most} carried"
+    assert_eq!(
+        most, 0,
+        "with time for every dab, the long stroke's queue never holds one past its frame"
     );
-    assert!(
-        drained.is_some_and(|count| count <= 2),
-        "drained within two frames of pen-up: {drained:?}"
-    );
+    assert_eq!(drained, Some(1), "the frame after pen-up carries none");
     let records = saved_strokes(owner, &dir, "scripted.bcrf");
     assert_eq!(records.len(), 3, "three strokes, a record each");
 }

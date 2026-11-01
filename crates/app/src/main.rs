@@ -277,7 +277,8 @@ fn drive_offscreen<B: Brush>(
         match owner.next(now) {
             Next::Frame { deadline } => owner.frame(now, deadline, |frame| render.send(frame))?,
             Next::Render if owner.between_frames(now, &mut pen)? => {
-                for presented in render.finished()? {
+                let finished = render.finished()?;
+                for presented in finished {
                     owner.shown(presented);
                 }
             }

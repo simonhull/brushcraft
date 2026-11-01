@@ -168,18 +168,28 @@ pub(crate) enum Grouping {
 /// What applying dabs costs: the one cost model the brush's budget turns time into dabs with (see
 /// "The budget" in the module notes), in one place to retune.
 ///
-/// Costs are in tile vertices: a batch costs its tiles (each dab's, or their union, as
-/// [`Grouping`] says) times [`TILE_VERTICES`], plus a fixed overhead a dab, at a time per unit.
+/// Costs are in tile vertices: a batch (one [`apply_dabs`] call) costs a fixed amount, plus its
+/// tiles (each dab's, or their union, as [`Grouping`] says) times [`TILE_VERTICES`], plus a fixed
+/// overhead a dab, at a time per unit.
 ///
 /// **Learnt on the machine:** the time per unit is the calibrated one times a scale learnt from
 /// each batch applied ([`DabCost::observe`], the way [`crate::pace::Pacer`] learns its sleeps): a
-/// batch slower than predicted raises it at once, a faster one lowers it an eighth of the way. The
-/// scripted strokes on the benchmark project took two to ten times the calibration (its dabs pin
-/// and evaluate more neighbours than the medium project's), so a fixed constant would overrun
+/// batch slower than predicted raises it at once, but at most doubling it a batch (one cold or
+/// stalled batch says little about the next), and a faster one lowers it an eighth of the way.
+/// The scripted strokes on the benchmark project took two to ten times the calibration (its dabs
+/// pin and evaluate more neighbours than the medium project's), so a fixed constant would overrun
 /// every budget there; learnt, the budget holds on any project and machine.
+///
+/// **When `apply_dabs` groups a frame's dabs by tile**, the cost's shape changes, not one
+/// constant: [`Grouping::TileUnion`], and the per-batch, per-dab and per-unit terms calibrated
+/// again against it (a frame of `n` dabs then costs well under `n` times one), all in
+/// [`DabCost::CALIBRATED`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DabCost {
-    /// What every dab costs besides its tiles, in units: its query, a dispatch to the workers.
+    /// What every batch costs besides its dabs, in units: the call's set-up and the workers'
+    /// dispatch.
+    per_batch: f64,
+    /// What every dab costs besides its tiles, in units: its query, its share of the dispatch.
     per_dab: f64,
     /// How long a unit takes, in nanoseconds, at the tail, as calibrated.
     ns_per_unit: f64,
@@ -193,29 +203,47 @@ pub(crate) struct DabCost {
 /// (a cold start, the process stopped).
 const COST_SCALE: (f64, f64) = (0.25, 64.0);
 
+/// The most a [`DabCost`]'s scale rises for one batch: it doubles at most.
+const COST_RISE: f64 = 2.0;
+
 impl DabCost {
-    /// The model calibrated in Task 5 on the medium project: about 10.5 ns a unit at p99,
-    /// marginal, for 1,000- and 50,000-vertex dabs alike (32 small dabs 6.0 ms, 1 small 0.51 ms;
-    /// 4 large 6.8 ms, 1 large 2.2 ms), two tiles' worth (8,450 units) a dab besides, each dab
-    /// paying for its own tiles. Retune here when `apply_dabs` changes: `brushcraft-bench brush
-    /// --dabs 32 --footprint small` and `--dabs 4 --footprint 50000` calibrate it; with dabs
-    /// grouped by tile, [`Grouping::TileUnion`].
+    /// The model calibrated in Task 5 on the medium project.
+    ///
+    /// About 10.5 ns a unit at p99, marginal, for 1,000- and 50,000-vertex dabs alike (32 small
+    /// dabs 6.0 ms, 1 small 0.51 ms; 4 large 6.8 ms, 1 large 2.2 ms); a batch's fixed part about
+    /// 0.33 ms (one small dab's 0.51 ms against its 0.18 ms marginal: about 31,400 units); two
+    /// tiles' worth (8,450 units) a dab besides, each dab paying for its own tiles. Retune here
+    /// when `apply_dabs` changes: `brushcraft-bench brush --dabs 32 --footprint small` and
+    /// `--dabs 4 --footprint 50000` calibrate it.
     pub(crate) const CALIBRATED: Self = Self {
+        per_batch: 31_400.0,
         per_dab: 2.0 * TILE_VERTICES,
         ns_per_unit: 10.5,
         grouping: Grouping::PerDab,
         scale: 1.0,
     };
 
-    /// A model costing `per_dab` units a dab besides its tiles, `ns_per_unit` a unit, its tiles
-    /// counted as `grouping` says. A time per unit of zero fits any batch in any time.
+    /// A model costing `per_dab` units a dab besides its tiles and nothing a batch, `ns_per_unit`
+    /// a unit, its tiles counted as `grouping` says. A time per unit of zero fits any batch in
+    /// any time.
     #[cfg(test)]
     pub(crate) const fn new(per_dab: f64, ns_per_unit: f64, grouping: Grouping) -> Self {
         Self {
+            per_batch: 0.0,
             per_dab,
             ns_per_unit,
             grouping,
             scale: 1.0,
+        }
+    }
+
+    /// This model with `units` a batch besides its dabs.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_per_batch(self, units: f64) -> Self {
+        Self {
+            per_batch: units,
+            ..self
         }
     }
 
@@ -238,8 +266,9 @@ impl DabCost {
         self.ns_per_unit * self.scale
     }
 
-    /// Learns from a batch costed at `units` that took `took`: a slower one than predicted raises
-    /// the scale at once, a faster one lowers it an eighth of the way.
+    /// Learns from a batch costed at `units` (its fixed part included) that took `took`: a slower
+    /// one than predicted raises the scale at once, at most [`COST_RISE`] times; a faster one
+    /// lowers it an eighth of the way.
     pub(crate) fn observe(&mut self, units: f64, took: Duration) {
         let predicted = units * self.ns_per_unit;
         if predicted <= 0.0 {
@@ -248,15 +277,16 @@ impl DabCost {
         let (least, most) = COST_SCALE;
         let seen = (took.as_secs_f64() * 1e9 / predicted).clamp(least, most);
         self.scale = if seen > self.scale {
-            seen
+            seen.min(self.scale * COST_RISE)
         } else {
             self.scale + (seen - self.scale) / 8.0
         };
     }
 
-    /// How many of the queued dabs, each given by the tiles it touches, in order, fit `room`:
-    /// the longest run from the front whose batch cost fits, and at least one if `at_least_one`
-    /// and there are any. Returns the count and the batch's units.
+    /// How many of the queued dabs, each given by the tiles it touches, in order, fit `room` as
+    /// one batch: the longest run from the front whose batch cost fits, and at least one if
+    /// `at_least_one` and there are any. Returns the count and the batch's units, its fixed part
+    /// included (none if it takes no dab).
     pub(crate) fn take<'a>(
         self,
         dabs: impl IntoIterator<Item = &'a [TileKey]>,
@@ -269,7 +299,7 @@ impl DabCost {
             f64::INFINITY
         };
         let mut seen: BTreeSet<TileKey> = BTreeSet::new();
-        let mut used = 0.0;
+        let mut used = self.per_batch;
         let mut count = 0;
         for tiles in dabs {
             let new = match self.grouping {
@@ -283,7 +313,7 @@ impl DabCost {
             used += cost;
             count += 1;
         }
-        (count, used)
+        (count, if count == 0 { 0.0 } else { used })
     }
 }
 

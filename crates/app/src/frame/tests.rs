@@ -579,24 +579,116 @@ fn a_brush_strokes_samples_start_a_frame_at_once_and_with_fifo_wait_for_the_slot
     fallback.close().expect("closed");
 }
 
-/// A pen stream that delivers `sample` at its `at`th drain, and nothing at any other.
+/// A pen stream that delivers `sample` once, at its first pull at or after `from`.
 #[derive(Debug)]
 struct LateSample {
-    /// Drains so far.
-    drains: usize,
-    /// The drain that delivers it.
-    at: usize,
-    /// The sample.
-    sample: PenSample,
+    /// When it may deliver.
+    from: Instant,
+    /// The sample, until delivered.
+    sample: Option<PenSample>,
+}
+
+impl LateSample {
+    /// A stream delivering `sample` at its first pull at or after `from`.
+    const fn new(from: Instant, sample: PenSample) -> Self {
+        Self {
+            from,
+            sample: Some(sample),
+        }
+    }
 }
 
 impl PenFeed for LateSample {
     fn pull(&mut self, out: &mut Vec<PenSample>) {
-        self.drains += 1;
-        if self.drains == self.at {
-            out.push(self.sample);
+        if Instant::now() >= self.from {
+            out.extend(self.sample.take());
         }
     }
+}
+
+/// A pen stream that delivers a drag of an open stroke at every pull: a stroke whose samples
+/// always wait.
+#[derive(Debug, Default)]
+struct EveryPull {
+    /// Pulls so far.
+    pulls: u32,
+}
+
+impl PenFeed for EveryPull {
+    fn pull(&mut self, out: &mut Vec<PenSample>) {
+        self.pulls += 1;
+        let x = 160.0 + f64::from(self.pulls % 40);
+        out.push(pen_sample(input::Phase::Drag, (x, 100.0)));
+    }
+}
+
+#[test]
+fn a_moving_strokes_held_jobs_want_no_frame_and_run_once_it_holds_still() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let brush = PenLog {
+        claims: true,
+        ..PenLog::default()
+    };
+    let mut owner = Owner::new(
+        project_to(&dir, 6),
+        brush,
+        NoUploads,
+        setup(None),
+        Instant::now(),
+    );
+    assert!(owner.project().store().has_jobs(), "a rebuild to run");
+    owner.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    frame(&mut owner, Instant::now() + Duration::from_secs(1));
+    assert_eq!(owner.after_hand_off.report.slices, 0, "held by the stroke");
+    let now = Instant::now();
+    let Next::Idle { upkeep } = owner.next(now) else {
+        panic!("no frame for the held jobs while the stroke moves");
+    };
+    assert!(
+        upkeep <= now + STROKE_QUIET,
+        "but the loop wakes as the stroke falls quiet"
+    );
+    // The pen holds still (or its `Up` was lost): the jobs want their frame, and run.
+    std::thread::sleep(STROKE_QUIET + Duration::from_millis(5));
+    assert!(matches!(owner.next(Instant::now()), Next::Frame { .. }));
+    frame(&mut owner, Instant::now() + Duration::from_millis(20));
+    assert!(
+        owner.after_hand_off.report.slices > 0,
+        "a still stroke lets the jobs run"
+    );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn the_upkeep_runs_when_due_however_often_a_stroke_waits() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = pen_owner(&dir, true);
+    owner.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    frame(&mut owner, Instant::now());
+    let before = owner.upkept_at;
+    let mut pen = EveryPull::default();
+    let until = Instant::now() + UPKEEP_INTERVAL * 2;
+    let mut number = owner.started;
+    while Instant::now() < until {
+        let now = Instant::now();
+        owner
+            .frame_fed(now, now + Duration::from_millis(1), &mut pen, |_| Ok(()))
+            .expect("a frame");
+        number += 1;
+        owner.shown(presented(number));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        owner.upkept_at > before,
+        "a sample waited at every look, yet the due upkeep ran"
+    );
+    assert!(
+        Instant::now() < owner.upkept_at + UPKEEP_INTERVAL * 2,
+        "and keeps running"
+    );
+    owner.close().expect("closed");
 }
 
 #[test]
@@ -616,14 +708,13 @@ fn the_jobs_yield_to_a_strokes_sample_and_wait_while_the_stroke_is_open() {
         Instant::now(),
     );
     assert!(owner.project().store().has_jobs(), "a rebuild to run");
-    // The sample arrives as the jobs run: at the drain after their first step (the frame's
-    // start, its brush phase, before the upkeep, the preparation and the first step come first).
-    let mut pen = LateSample {
-        drains: 0,
-        at: 6,
-        sample: pen_sample(Phase::Down, (160.0, 100.0)),
-    };
+    // The sample arrives as the jobs run: a few milliseconds into the frame, past its brush
+    // phase, upkeep and preparation (all quick here).
     let started = Instant::now();
+    let mut pen = LateSample::new(
+        started + Duration::from_millis(3),
+        pen_sample(Phase::Down, (160.0, 100.0)),
+    );
     owner
         .frame_fed(started, started + Duration::from_secs(30), &mut pen, |_| {
             Ok(())
@@ -642,13 +733,14 @@ fn the_jobs_yield_to_a_strokes_sample_and_wait_while_the_stroke_is_open() {
         matches!(owner.next(Instant::now()), Next::Frame { .. }),
         "and the sample's frame starts at once"
     );
-    // That frame opens the brush's stroke: no jobs at all while it is open.
+    // That frame opens the brush's stroke: no jobs at all while it moves.
     frame(&mut owner, Instant::now() + Duration::from_secs(1));
     assert_eq!(
         owner.after_hand_off.report.slices, 0,
-        "none while the stroke is open"
+        "none while the stroke moves"
     );
     owner.pen(pen_sample(Phase::Up, (160.0, 100.0)));
+    std::thread::sleep(STROKE_QUIET);
     frame(&mut owner, Instant::now() + Duration::from_millis(50));
     assert!(
         owner.after_hand_off.report.slices > 0,
@@ -881,7 +973,7 @@ fn a_frame_due_with_the_gpu_behind_waits_running_jobs_and_upkeep_then_starts() {
         .expect("waiting");
     assert_eq!(
         owner.scheduler.upkeep_due(),
-        later + schedule::UPKEEP_INTERVAL,
+        later + UPKEEP_INTERVAL,
         "the upkeep ran, due meanwhile"
     );
     let ready = owner
@@ -947,7 +1039,7 @@ fn a_minimised_window_still_runs_its_upkeep() {
         .step(context, &PenFrame::default(), &BrushBudget::unlimited())
         .expect("an edit");
     owner.resize(None);
-    let later = Instant::now() + schedule::UPKEEP_INTERVAL;
+    let later = Instant::now() + UPKEEP_INTERVAL;
     let Next::Idle { upkeep } = owner.next(later) else {
         panic!("no frames while minimised");
     };
@@ -958,11 +1050,7 @@ fn a_minimised_window_still_runs_its_upkeep() {
     let Next::Idle { upkeep: after } = owner.next(later) else {
         panic!("still no frames");
     };
-    assert_eq!(
-        after,
-        later + schedule::UPKEEP_INTERVAL,
-        "and is due again later"
-    );
+    assert_eq!(after, later + UPKEEP_INTERVAL, "and is due again later");
     owner.close().expect("closed");
 }
 
