@@ -588,3 +588,7 @@ fn an_epoch_of_several_dabs_sums_their_displacements() {
 // Its world holds the sculpt crate's types, a dev-dependency rustdoc doesn't link.
 #[cfg(not(doc))]
 mod model;
+
+// A diagnosis probe (ignored): a strong stroke's stand-ins against the refresh.
+#[cfg(not(doc))]
+mod diag;
