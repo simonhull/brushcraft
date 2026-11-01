@@ -40,6 +40,10 @@ name = "standins"
 harness = false
 
 [[bench]]
+name = "frame_use"
+harness = false
+
+[[bench]]
 name = "brush_gpu"
 harness = false
 required-features = ["spike"]
