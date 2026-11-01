@@ -150,7 +150,7 @@ impl Default for Spacing {
     }
 }
 
-/// The brush's own strength, in model units.
+/// The brush's own strength, in the unit its [`StrengthMode`] says.
 ///
 /// It is the action's strength for a dab whose dynamics leave it at its full value (a factor of
 /// 1): for draw, how far a vertex at the centre moves. Finite; negative works the other way
@@ -163,7 +163,7 @@ impl Strength {
     /// own.
     pub const DEFAULT: Self = Self(0.001);
 
-    /// A strength of `value` model units.
+    /// A strength of `value`, in model units or radii as the [`StrengthMode`] says.
     ///
     /// # Errors
     ///
@@ -176,7 +176,7 @@ impl Strength {
         }
     }
 
-    /// The strength, in model units.
+    /// The strength, in model units or radii as the [`StrengthMode`] says.
     #[must_use]
     pub const fn get(self) -> f32 {
         self.0
@@ -187,6 +187,22 @@ impl Default for Strength {
     fn default() -> Self {
         Self::DEFAULT
     }
+}
+
+/// What a brush's [`Strength`] is measured in.
+///
+/// Either way a [`Dab`](crate::Dab)'s strength is final, in model units: a strength in radii is
+/// turned into model units once, where the stroke freezes its world radius, so it holds for the
+/// whole stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum StrengthMode {
+    /// Model units, whatever the brush's size: the default.
+    #[default]
+    Model,
+    /// A fraction of the stroke's frozen world radius ([`Stroke::radius`](crate::Stroke::radius)):
+    /// a stroke raises the surface by the same share of its width at any zoom, and a brush made
+    /// larger is as much stronger.
+    Radius,
 }
 
 /// The brush's own falloff hardness, in `0..=1`: `0` the action's falloff as it is, `1` a disc
@@ -433,6 +449,8 @@ pub struct StrokeSettings {
     symmetry: Symmetry,
     /// The brush's own strength, before dynamics scales it.
     strength: Strength,
+    /// What the strength is measured in.
+    strength_mode: StrengthMode,
     /// The brush's own hardness, before dynamics scales it.
     hardness: Hardness,
     /// The action's own parameters, before dynamics scales them; all finite.
@@ -470,6 +488,7 @@ impl StrokeSettings {
             dynamics,
             symmetry,
             strength: Strength::DEFAULT,
+            strength_mode: StrengthMode::Model,
             hardness: Hardness::DEFAULT,
             action_params: action_params.map(|v| v + 0.0),
         })
@@ -479,6 +498,15 @@ impl StrokeSettings {
     #[must_use]
     pub fn with_strength(self, strength: Strength) -> Self {
         Self { strength, ..self }
+    }
+
+    /// These settings with the brush's strength measured in `mode`.
+    #[must_use]
+    pub fn with_strength_mode(self, mode: StrengthMode) -> Self {
+        Self {
+            strength_mode: mode,
+            ..self
+        }
     }
 
     /// These settings with the brush's own `hardness`.
@@ -491,6 +519,12 @@ impl StrokeSettings {
     #[must_use]
     pub const fn strength(&self) -> Strength {
         self.strength
+    }
+
+    /// What the brush's strength is measured in.
+    #[must_use]
+    pub const fn strength_mode(&self) -> StrengthMode {
+        self.strength_mode
     }
 
     /// The brush's own hardness, before dynamics scales it.
@@ -544,7 +578,8 @@ impl StrokeSettings {
 
 impl Default for StrokeSettings {
     /// The default path, spacing 0.15, a 40-pixel screen radius, pressure to size and strength,
-    /// no symmetry, the default strength and hardness, and the action's parameters at zero.
+    /// no symmetry, the default strength (in model units) and hardness, and the action's
+    /// parameters at zero.
     fn default() -> Self {
         Self {
             path: PathSettings::default(),
@@ -554,6 +589,7 @@ impl Default for StrokeSettings {
             dynamics: Dynamics::default(),
             symmetry: Symmetry::NONE,
             strength: Strength::DEFAULT,
+            strength_mode: StrengthMode::Model,
             hardness: Hardness::DEFAULT,
             action_params: [0.0; ACTION_SLOTS],
         }

@@ -79,8 +79,8 @@ use store::{
     StrokeRecord, TileStore,
 };
 use stroke::{
-    DVec3, Dab, Hit, Projector, REACH_RADII, Radius, Ray, Sample, ScreenPoint, Strength, Stroke,
-    StrokeId, StrokeSettings, Surface, Tilt, Twist, Unit,
+    DVec3, Dab, Hit, Projector, REACH_RADII, Radius, Ray, Sample, ScreenPoint, Strength,
+    StrengthMode, Stroke, StrokeId, StrokeSettings, Surface, Tilt, Twist, Unit,
 };
 
 use crate::camera::{Camera, Pixel};
@@ -91,18 +91,20 @@ use crate::pen::{PenFrame, PenSample, Route};
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
 
-/// The default base strength, as a fraction of the project's size (its bounding radius).
+/// The default base strength, as a fraction of the stroke's frozen world radius
+/// ([`StrengthMode::Radius`]): a tenth.
 ///
-/// 0.002, so a draw stroke at full pressure on the benchmark sphere (radius 1) moves the
-/// surface by about 0.013 at its centre line (spacing 0.15 radii stacks about 6.7 dabs' worth), a
-/// low ridge under the default 40-pixel brush seen whole. The keys scale it
+/// A stroke then raises the surface by the same share of its width at any zoom. At spacing 0.15
+/// radii a stroke's centre line sums about `p / 0.15` dabs' worth (pressure `p` scales both a
+/// dab's size, so how many overlap, and its strength), so the ridge stands about `0.1 · p² /
+/// 0.15` radii: a sixth of the radius at half pressure, two thirds at full. The keys scale it
 /// ([`STRENGTH_STEP`]).
-pub(crate) const DEFAULT_STRENGTH_PER_SIZE: f64 = 0.002;
+pub(crate) const DEFAULT_STRENGTH_FRACTION: f32 = 0.1;
 
 /// How much one press of a strength key scales the strength.
 pub(crate) const STRENGTH_STEP: f32 = 1.25;
 
-/// The strength's range, as factors of the default: a 64th to 64 times.
+/// The strength's range, as factors of the default: a 64th to 64 times (0.0016 to 6.4 radii).
 pub(crate) const STRENGTH_FACTORS: (f32, f32) = (1.0 / 64.0, 64.0);
 
 /// How much one press of a size key scales the brush's radius.
@@ -240,9 +242,7 @@ pub(crate) struct Sculpting {
     /// The brush's settings: draw, the stroke engine's defaults, the radius and strength the keys
     /// set.
     settings: StrokeSettings,
-    /// The default base strength, in model units, for the project's size.
-    base_strength: f32,
-    /// The strength, as a factor of `base_strength`.
+    /// The strength, as a factor of [`DEFAULT_STRENGTH_FRACTION`].
     strength_factor: f32,
     /// The stroke state `apply_dabs` keeps across a stroke's dabs.
     state: sculpt::Stroke,
@@ -268,16 +268,15 @@ pub(crate) struct Sculpting {
 }
 
 impl Sculpting {
-    /// The brush for `project`: its default strength from the project's size
-    /// ([`DEFAULT_STRENGTH_PER_SIZE`]), its stroke state from the store's reservation.
+    /// The brush for `project`: its strength [`DEFAULT_STRENGTH_FRACTION`] of the stroke's
+    /// radius, its stroke state from the store's reservation.
     pub(crate) fn new(project: &mut Project) -> Self {
-        let store = project.store();
-        let base_strength = default_strength(store);
-        let state = sculpt::Stroke::new(store);
-        let settings = StrokeSettings::default().with_strength(strength(base_strength, 1.0));
+        let state = sculpt::Stroke::new(project.store());
+        let settings = StrokeSettings::default()
+            .with_strength_mode(StrengthMode::Radius)
+            .with_strength(strength(1.0));
         Self {
             settings,
-            base_strength,
             strength_factor: 1.0,
             state,
             active: None,
@@ -305,9 +304,7 @@ impl Sculpting {
     #[must_use]
     pub(crate) fn with_strength(mut self, factor: f32) -> Self {
         self.strength_factor = factor;
-        self.settings = self
-            .settings
-            .with_strength(strength(self.base_strength, factor));
+        self.settings = self.settings.with_strength(strength(factor));
         self
     }
 
@@ -597,10 +594,7 @@ impl Sculpting {
             return false;
         }
         self.strength_factor = scaled;
-        self.settings = self
-            .settings
-            .clone()
-            .with_strength(strength(self.base_strength, scaled));
+        self.settings = self.settings.clone().with_strength(strength(scaled));
         true
     }
 
@@ -788,8 +782,8 @@ impl Brush for Sculpting {
             .as_ref()
             .map_or(&self.settings, |active| &active.settings);
         let mut lines = vec![format!(
-            "brush      draw  radius {:.1} px  strength {:.5} (x{:.2})  keys: [ ] size, - = \
-             strength",
+            "brush      draw  radius {:.1} px  strength {:.4} of the radius (x{:.2})  keys: [ ] \
+             size, - = strength",
             settings.radius().get(),
             settings.strength().get(),
             self.strength_factor
@@ -888,44 +882,9 @@ fn stroke_camera(camera: &Camera, view: &View) -> StrokeCamera {
     }
 }
 
-/// The brush's base strength, `factor` times `base`; the default if that isn't finite.
-fn strength(base: f32, factor: f32) -> Strength {
-    Strength::new(base * factor).unwrap_or_default()
-}
-
-/// The default base strength for `store`'s project.
-///
-/// [`DEFAULT_STRENGTH_PER_SIZE`] of its base mesh's bounding radius (the farthest vertex from its
-/// box's centre: 1 for the unit sphere); the engine's default for an empty mesh.
-fn default_strength(store: &TileStore) -> f32 {
-    let mesh = store.mesh();
-    let points = || {
-        mesh.vertices()
-            .filter_map(|v| mesh.vertex_position(v))
-            .map(|p| DVec3::new(p.x.into(), p.y.into(), p.z.into()))
-    };
-    let bounds = points().fold(None, |bounds: Option<(DVec3, DVec3)>, p| {
-        Some(bounds.map_or((p, p), |(low, high)| {
-            let low = DVec3::new(low.x.min(p.x), low.y.min(p.y), low.z.min(p.z));
-            let high = DVec3::new(high.x.max(p.x), high.y.max(p.y), high.z.max(p.z));
-            (low, high)
-        }))
-    });
-    let Some((low, high)) = bounds else {
-        return Strength::DEFAULT.get();
-    };
-    let centre = (low + high) * 0.5;
-    let radius = points().map(|p| p.distance(centre)).fold(0.0, f64::max);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "a strength in model units: f32 holds it"
-    )]
-    let base = (DEFAULT_STRENGTH_PER_SIZE * radius) as f32;
-    if base.is_finite() && base > 0.0 {
-        base
-    } else {
-        Strength::DEFAULT.get()
-    }
+/// The brush's base strength, `factor` times [`DEFAULT_STRENGTH_FRACTION`] of the radius.
+fn strength(factor: f32) -> Strength {
+    Strength::new(DEFAULT_STRENGTH_FRACTION * factor).unwrap_or_default()
 }
 
 /// The mean spacing of `level`'s vertices over `store`'s base mesh.

@@ -1727,8 +1727,8 @@ fn a_dab_shows_in_the_visibility_buffer_of_its_own_frame() {
     let picker = Picker::load(&mut project)
         .expect("the index loads")
         .expect("a display layer");
-    // Strong, so the dab moves the surface by pixels in a 320 × 200 frame.
-    let brush = Sculpting::new(&mut project).with_strength(25.0);
+    // Strong (0.15 of the radius), so the dab moves the surface by pixels in a 320 × 200 frame.
+    let brush = Sculpting::new(&mut project).with_strength(1.5);
     let residency = GpuResidency::new(Arc::clone(&gpu), project.store()).expect("residency");
     let mut owner =
         Owner::new(project, brush, residency, setup(None), Instant::now()).with_picker(picker);

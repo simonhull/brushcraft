@@ -5,7 +5,8 @@
 //! radius once, at the hit's view depth through [`Projector::world_per_pixel`], and holds until
 //! pen-up; a [`SizeMode::World`] radius is used as given. Zooming mid-stroke can't make the
 //! stroke uneven. Dynamics' size factor scales each dab's radius from it; spacing, the reach and
-//! the speed and distance inputs are all measured against it.
+//! the speed and distance inputs are all measured against it. A strength in radii
+//! ([`StrengthMode::Radius`]) becomes model units here too, once, from the frozen radius.
 //!
 //! **The walk.** Each new brush point (from the [`Path`](crate::Path)) makes a screen segment
 //! from the one before. The walk steps along it in screen space: each candidate point is
@@ -53,8 +54,8 @@
 use crate::surface::{Hit, Projector, Ray, Surface};
 use crate::symmetry::Placed;
 use crate::{
-    ACTION_SLOTS, DVec3, Dynamics, Inputs, Sample, ScreenPoint, SizeMode, Spacing, StrokeRandom,
-    StrokeSettings, Unit,
+    ACTION_SLOTS, DVec3, Dynamics, Inputs, Sample, ScreenPoint, SizeMode, Spacing, StrengthMode,
+    StrokeRandom, StrokeSettings, Unit,
 };
 
 /// How far a hit may be from the last accepted point and still continue the stroke, in radii of
@@ -163,7 +164,8 @@ pub(crate) struct Placer {
     spacing: f64,
     /// The action's parameters, before dynamics.
     action_params: [f32; ACTION_SLOTS],
-    /// The brush's own strength, before dynamics.
+    /// The brush's own strength before dynamics, in model units: a strength in radii is turned
+    /// into model units with the frozen radius.
     strength: f32,
     /// The brush's own hardness, before dynamics.
     hardness: f32,
@@ -218,11 +220,20 @@ impl Placer {
         if !(radius.is_finite() && radius > 0.0) {
             return None;
         }
+        let given_strength = settings.strength().get();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a dab's strength is f32: rounded once, as the radius freezes"
+        )]
+        let strength = match settings.strength_mode() {
+            StrengthMode::Model => given_strength,
+            StrengthMode::Radius => (f64::from(given_strength) * radius) as f32,
+        };
         let mut placer = Self {
             dynamics: settings.dynamics().clone(),
             spacing: f64::from(settings.spacing().get()),
             action_params: settings.action_params(),
-            strength: settings.strength().get(),
+            strength,
             hardness: settings.hardness().get(),
             radius,
             random,

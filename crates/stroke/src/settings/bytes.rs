@@ -2,7 +2,8 @@
 //! [`StrokeSettings::from_bytes`].
 
 use super::{
-    Axis, DecodeError, Hardness, MirrorPlanes, Radial, Spacing, Strength, StrokeSettings, Symmetry,
+    Axis, DecodeError, Hardness, MirrorPlanes, Radial, Spacing, Strength, StrengthMode,
+    StrokeSettings, Symmetry,
 };
 use crate::{
     ACTION_SLOTS, ActionSlot, Curve, CurveError, Dynamics, DynamicsError, Entry, FullScale, Input,
@@ -13,11 +14,15 @@ use crate::{
 ///
 /// Version 1 held one kind of symmetry at a time; no stroke record was ever written with it, so
 /// this build doesn't read it. Version 2 had no strength or hardness: it is read with the
-/// defaults ([`Strength::DEFAULT`], [`Hardness::DEFAULT`]).
-pub(super) const VERSION: u8 = 3;
+/// defaults ([`Strength::DEFAULT`], [`Hardness::DEFAULT`]). Version 3 had no strength mode: it is
+/// read in model units ([`StrengthMode::Model`]).
+pub(super) const VERSION: u8 = 4;
 
 /// The version before the brush's strength and hardness, still read.
 const VERSION_2: u8 = 2;
+
+/// The version before the strength's mode, still read.
+const VERSION_3: u8 = 3;
 
 /// The bits of the symmetry byte: which kinds are on. The rest are refused.
 mod symmetry_bit {
@@ -66,8 +71,8 @@ const fn axis_tag(axis: Axis) -> u8 {
 impl StrokeSettings {
     /// The settings' stable byte form, for a stroke's record.
     ///
-    /// The layout (version 3), all numbers little-endian:
-    /// - the version, `3`, as a `u8`;
+    /// The layout (version 4), all numbers little-endian:
+    /// - the version, `4`, as a `u8`;
     /// - the path: the minimum cutoff, the cutoff slope, the derivative cutoff and the lazy string,
     ///   each an `f64`;
     /// - the spacing as an `f32`; the size mode as a `u8` (`0` screen, `1` world); the radius as an
@@ -78,6 +83,8 @@ impl StrokeSettings {
     /// - the action's parameters, four `f32`s;
     /// - the brush's strength and hardness, each an `f32` (new in version 3; version 2 has neither,
     ///   and is read with the defaults);
+    /// - the strength's mode as a `u8`, `0` model units, `1` radii (new in version 4; version 3 is
+    ///   read in model units);
     /// - the dynamics: the entry count as a `u8`, then each entry: the input's tag (`0` pressure,
     ///   `1` tilt amount, `2` tilt direction, `3` twist, `4` speed, `5` distance, `6` random)
     ///   followed for speed and distance by the full scale as an `f32`; the parameter's tag (`0`
@@ -121,6 +128,10 @@ impl StrokeSettings {
         }
         out.f32(self.strength.get());
         out.f32(self.hardness.get());
+        out.u8(match self.strength_mode {
+            StrengthMode::Model => 0,
+            StrengthMode::Radius => 1,
+        });
         let entries = self.dynamics.entries();
         // `Dynamics::new` holds the count to MAX_ENTRIES, which fits a byte.
         out.u8(u8::try_from(entries.len()).unwrap_or(u8::MAX));
@@ -151,7 +162,7 @@ impl StrokeSettings {
     ///
     /// # Errors
     ///
-    /// - [`DecodeError::Version`] for a version this build doesn't read (it reads 2 and 3);
+    /// - [`DecodeError::Version`] for a version this build doesn't read (it reads 2 to 4);
     /// - [`DecodeError::Truncated`] or [`DecodeError::Trailing`] if the bytes are shorter or longer
     ///   than the settings;
     /// - [`DecodeError::Tag`] for an unknown tag;
@@ -159,7 +170,7 @@ impl StrokeSettings {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut reader = Reader(bytes);
         let version = reader.u8()?;
-        if version != VERSION && version != VERSION_2 {
+        if ![VERSION_2, VERSION_3, VERSION].contains(&version) {
             return Err(DecodeError::Version(version));
         }
         let path = PathSettings::new(reader.f64()?, reader.f64()?, reader.f64()?, reader.f64()?)?;
@@ -185,6 +196,20 @@ impl StrokeSettings {
         } else {
             (Strength::new(reader.f32()?)?, Hardness::new(reader.f32()?)?)
         };
+        let strength_mode = if version == VERSION {
+            match reader.u8()? {
+                0 => StrengthMode::Model,
+                1 => StrengthMode::Radius,
+                tag => {
+                    return Err(DecodeError::Tag {
+                        what: "strength mode",
+                        tag,
+                    });
+                }
+            }
+        } else {
+            StrengthMode::Model
+        };
         let count = usize::from(reader.u8()?);
         if count > MAX_ENTRIES {
             return Err(DynamicsError::TooManyEntries(count).into());
@@ -207,6 +232,7 @@ impl StrokeSettings {
             action_params,
         )?
         .with_strength(strength)
+        .with_strength_mode(strength_mode)
         .with_hardness(hardness))
     }
 }

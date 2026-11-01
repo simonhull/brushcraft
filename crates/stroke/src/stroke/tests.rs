@@ -12,7 +12,8 @@ use crate::tests::sphere::Sphere;
 use crate::tests::{Camera, sample};
 use crate::{
     Axis, Curve, DVec3, Dynamics, Entry, Hardness, Input, MirrorPlanes, Param, PathSettings,
-    Radial, Radius, SPACING_TOLERANCE, ScreenPoint, SizeMode, Spacing, Strength, Surface, Symmetry,
+    Radial, Radius, SPACING_TOLERANCE, ScreenPoint, SizeMode, Spacing, Strength, StrengthMode,
+    Surface, Symmetry,
 };
 
 /// The spacing tests' tolerance: the plan's ±10 %.
@@ -559,6 +560,41 @@ fn pressure_changes_size_and_strength_per_dab() {
             "no dynamics on the action's parameters"
         );
     }
+}
+
+#[test]
+fn a_strength_in_radii_follows_the_frozen_radius_at_any_zoom() {
+    let samples = line(screen(300.0, 300.0), screen(500.0, 300.0), 30, 0.5, 1.0);
+    let brush = plain()
+        .with_strength(Strength::new(0.1).unwrap())
+        .with_strength_mode(StrengthMode::Radius);
+    // The same 20-pixel brush from twice as far: twice the world radius, twice the strength.
+    let near = Camera::looking_at(DVec3::new(0.0, 0.0, 5.0), DVec3::ZERO, DVec3::Y, 800.0);
+    let far = Camera::looking_at(DVec3::new(0.0, 0.0, 10.0), DVec3::ZERO, DVec3::Y, 800.0);
+    for camera in [near, far] {
+        let (dabs, radius) = run(&brush, &camera, &mut Plane, &samples);
+        assert!(!dabs.is_empty(), "dabs placed");
+        for dab in &dabs {
+            let expected = 0.1 * radius;
+            assert!(
+                (f64::from(dab.strength) - expected).abs() < 1e-6 * expected,
+                "a tenth of the radius {radius}, in model units: {}",
+                dab.strength
+            );
+        }
+    }
+    let (model, _) = run(
+        &plain().with_strength(Strength::new(0.1).unwrap()),
+        &near,
+        &mut Plane,
+        &samples,
+    );
+    assert!(
+        model
+            .iter()
+            .all(|dab| dab.strength.to_bits() == 0.1_f32.to_bits()),
+        "in model units, as given"
+    );
 }
 
 #[test]

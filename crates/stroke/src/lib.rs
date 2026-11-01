@@ -61,7 +61,7 @@ pub use place::{REACH_RADII, SPACING_TOLERANCE};
 pub use sample::{Buttons, Sample, SampleError, ScreenPoint, Tilt, Twist};
 pub use settings::{
     Axis, DecodeError, Hardness, MirrorPlanes, Radial, SettingsError, Spacing, Strength,
-    StrokeSettings, Symmetry, SymmetryError,
+    StrengthMode, StrokeSettings, Symmetry, SymmetryError,
 };
 pub use size::{Radius, RadiusError, SizeMode};
 pub use stroke::{Stroke, StrokeId};

@@ -455,15 +455,17 @@ fn keys_change_the_size_and_the_strength_within_bounds() {
 }
 
 #[test]
-fn the_default_strength_follows_the_projects_size() {
+fn the_default_strength_is_a_tenth_of_the_strokes_radius() {
     let dir = TestDir::new();
     let mut project = project(&dir);
-    let strength = Sculpting::new(&mut project).settings().strength().get();
-    // A cube sphere's vertices lie on the unit sphere: its bounding radius is 1.
-    let expected = DEFAULT_STRENGTH_PER_SIZE;
+    let brush = Sculpting::new(&mut project);
+    let settings = brush.settings();
+    assert_eq!(settings.strength_mode(), StrengthMode::Radius, "in radii");
+    assert_eq!(settings.strength().get(), DEFAULT_STRENGTH_FRACTION);
+    let text = brush.status().join("\n");
     assert!(
-        (f64::from(strength) - expected).abs() < 1e-3 * expected,
-        "{strength} for {expected}"
+        text.contains("strength 0.1000 of the radius (x1.00)"),
+        "{text}"
     );
     project.close(false).expect("closed");
 }

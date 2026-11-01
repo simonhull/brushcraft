@@ -45,6 +45,7 @@ fn everything() -> StrokeSettings {
     )
     .unwrap()
     .with_strength(Strength::new(-0.25).unwrap())
+    .with_strength_mode(StrengthMode::Radius)
     .with_hardness(Hardness::new(0.75).unwrap())
 }
 
@@ -67,11 +68,11 @@ fn round_trips_through_bytes() {
 
 #[test]
 fn the_default_bytes_are_pinned() {
-    // Version 3's layout must not drift: a stroke record stored today decodes the same later.
+    // Version 4's layout must not drift: a stroke record stored today decodes the same later.
     let bytes = StrokeSettings::default().to_bytes();
     assert_eq!(
         bytes.len(),
-        1 + 32 + 4 + 1 + 4 + 1 + 16 + 8 + 1 + 2 * 27,
+        1 + 32 + 4 + 1 + 4 + 1 + 16 + 8 + 1 + 1 + 2 * 27,
         "length"
     );
     let head: Vec<u8> = std::iter::once(VERSION)
@@ -106,7 +107,12 @@ fn the_default_bytes_are_pinned() {
         Some(brush.as_slice()),
         "the strength and hardness, after the action's parameters"
     );
-    let at = head.len() + 16 + 8;
+    assert_eq!(
+        bytes.get(brush_at + 8),
+        Some(&0),
+        "the strength in model units"
+    );
+    let at = head.len() + 16 + 8 + 1;
     assert_eq!(bytes.get(at), Some(&2), "two entries");
     assert_eq!(
         bytes.get(at + 1..at + 1 + first_entry.len()),
@@ -119,20 +125,52 @@ fn the_default_bytes_are_pinned() {
 fn version_2_is_read_with_the_default_strength_and_hardness() {
     let settings = everything();
     let bytes = settings.to_bytes();
-    assert_eq!(bytes.first(), Some(&3), "written as version 3");
-    // Version 2 is version 3 without the strength and hardness.
+    assert_eq!(bytes.first(), Some(&4), "written as version 4");
+    // Version 2 is version 4 without the strength, the hardness and the strength's mode.
     let brush_at = 1 + 32 + 4 + 1 + 4 + 1 + 1 + 1 + 1 + 16;
     let mut old: Vec<u8> = bytes;
-    old.drain(brush_at..brush_at + 8);
+    old.drain(brush_at..brush_at + 9);
     old[0] = 2;
     let read = StrokeSettings::from_bytes(&old).unwrap();
     assert_eq!(read.strength(), Strength::DEFAULT, "the default strength");
     assert_eq!(read.hardness(), Hardness::DEFAULT, "the default hardness");
+    assert_eq!(read.strength_mode(), StrengthMode::Model, "in model units");
     assert_eq!(
         read.with_strength(settings.strength())
+            .with_strength_mode(settings.strength_mode())
             .with_hardness(settings.hardness()),
         settings,
         "everything else as written"
+    );
+}
+
+#[test]
+fn version_3_is_read_in_model_units() {
+    let settings = everything();
+    // Version 3 is version 4 without the strength's mode, after the strength and hardness.
+    let mode_at = 1 + 32 + 4 + 1 + 4 + 1 + 1 + 1 + 1 + 16 + 8;
+    let mut old: Vec<u8> = settings.to_bytes();
+    assert_eq!(old.get(mode_at), Some(&1), "written in radii");
+    old.remove(mode_at);
+    old[0] = 3;
+    let read = StrokeSettings::from_bytes(&old).unwrap();
+    assert_eq!(read.strength_mode(), StrengthMode::Model, "in model units");
+    assert_eq!(
+        read.with_strength_mode(StrengthMode::Radius),
+        settings,
+        "everything else as written"
+    );
+    let mut unknown = settings.to_bytes();
+    unknown[mode_at] = 2;
+    assert!(
+        matches!(
+            StrokeSettings::from_bytes(&unknown),
+            Err(DecodeError::Tag {
+                what: "strength mode",
+                tag: 2
+            })
+        ),
+        "an unknown mode is refused"
     );
 }
 
