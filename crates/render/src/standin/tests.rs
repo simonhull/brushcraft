@@ -584,3 +584,5 @@ fn an_epoch_of_several_dabs_sums_their_displacements() {
     store.unsubscribe_stale(cursor);
     drop(project.close(false));
 }
+
+mod model;

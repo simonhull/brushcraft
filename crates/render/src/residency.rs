@@ -1187,6 +1187,22 @@ impl Residency {
         self.cut = cut;
     }
 
+    /// Whether the resident display tile at `place` is behind a step (it stood in for none
+    /// since, its bound raised instead), for the tests.
+    #[cfg(test)]
+    pub(crate) fn tile_is_behind(&self, place: Place) -> bool {
+        place
+            .key(self.finest)
+            .and_then(|key| self.entries.get(&key))
+            .is_some_and(|entry| self.is_behind(place, entry.version))
+    }
+
+    /// Marks the whole tile tree to be written again, as after a lost frame, for the tests.
+    #[cfg(test)]
+    pub(crate) fn mark_tree_dirty(&mut self) {
+        self.tree.mark_all_dirty();
+    }
+
     /// How many places a revert keeps from standing in, for the tests.
     #[cfg(test)]
     pub(crate) fn blocked_places(&self) -> usize {
@@ -1290,11 +1306,17 @@ impl Residency {
                 }
                 for place in above {
                     self.stand_ins.blocked.insert(place, seq);
-                    // A resident one is read again: what the store holds for it now.
+                    // A resident one is read again: what the store holds for it now. Until that
+                    // switches in, its finest vertices moved by an unknown amount: its bound is
+                    // the one that says so, and its stand-in's row goes.
                     if let Some(key) = place.key(self.finest)
                         && self.entries.contains_key(&key)
                     {
                         keys.insert(key);
+                        if let Some(row) = self.stand_ins.rows.release(place) {
+                            self.stand_ins.row_frees.push(row);
+                        }
+                        self.tree.raise_bound(place, f32::MAX);
                     }
                 }
                 self.apply_epoch(keys, None, Vec::new());
