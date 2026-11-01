@@ -52,3 +52,7 @@ harness = false
 name = "stroke_record"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "raycast"
+harness = false
