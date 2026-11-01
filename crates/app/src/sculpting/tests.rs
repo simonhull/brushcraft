@@ -19,6 +19,8 @@ use crate::render_thread::Presented;
 use crate::script::{Script, Speed};
 use crate::test_dir::TestDir;
 
+mod lifecycle;
+
 /// The level the test projects are sculpted at: a 24-face sphere's 24 tiles of 32 × 32 quads.
 const LEVEL: u8 = 5;
 
@@ -343,8 +345,14 @@ fn the_overlays_pick_waits_for_the_stroke_to_end() {
     assert_eq!(run(&mut owner, 1), 1);
     assert_eq!(picks(&owner), before, "no pick in a frame of the stroke");
     queue(&mut owner, rest.to_vec());
-    assert_eq!(run(&mut owner, 1), 1);
-    assert_eq!(picks(&owner), before, "nor in its last frame");
+    // Its last frame, and those that apply the dabs it carried.
+    for _ in 0..1000 {
+        assert_eq!(run(&mut owner, 1), 1, "frames while it is stroking");
+        assert_eq!(picks(&owner), before, "no pick while it is stroking");
+        if !owner.brush().stroking() {
+            break;
+        }
+    }
     assert!(!owner.brush().stroking(), "the stroke is over");
     run(&mut owner, 10_000);
     assert_eq!(picks(&owner), before + 1, "then the pick, once");
@@ -353,11 +361,36 @@ fn the_overlays_pick_waits_for_the_stroke_to_end() {
 
 #[test]
 fn a_budget_takes_dabs_from_the_front_and_at_least_one() {
-    let budget = DabBudget::new(25.0);
-    assert_eq!(budget.take([10.0, 10.0, 10.0]), 2, "the run that fits");
-    assert_eq!(budget.take([100.0, 1.0]), 1, "at least one");
-    assert_eq!(budget.take([]), 0, "none to take");
-    assert_eq!(budget.take([5.0, 30.0, 1.0]), 1, "a run, not a selection");
+    let take = |costs: &[f64], room: f64, at_least_one: bool| {
+        let mut left = room;
+        let count = DabBudget::take(costs.iter().copied(), &mut left, at_least_one);
+        (count, left)
+    };
+    assert_eq!(
+        take(&[10.0, 10.0, 10.0], 25.0, true),
+        (2, 5.0),
+        "the run that fits"
+    );
+    assert_eq!(take(&[100.0, 1.0], 25.0, true).0, 1, "at least one");
+    assert_eq!(
+        take(&[100.0, 1.0], 25.0, false).0,
+        0,
+        "none once one is applied"
+    );
+    assert_eq!(take(&[], 25.0, true).0, 0, "none to take");
+    assert_eq!(
+        take(&[5.0, 30.0, 1.0], 25.0, true).0,
+        1,
+        "a run, not a selection"
+    );
+    let budget = DabBudget::new(0.0, 100.0);
+    assert_eq!(
+        budget.cost(3),
+        3.0 * TILE_VERTICES + 100.0,
+        "its tiles and the overhead"
+    );
+    let side = f64::from(geom::TILE_QUADS + 1);
+    assert_eq!(TILE_VERTICES, side * side, "65 × 65 vertices a tile");
 }
 
 #[test]
@@ -368,14 +401,18 @@ fn the_budget_carries_dabs_across_frames_in_order_and_loses_none() {
         project(&capped_dir),
         |project| {
             Sculpting::new(project)
-                .with_budget(DabBudget::new(1.0))
+                .with_budget(DabBudget::new(0.0, 1.0))
                 .with_epoch(epoch)
         },
         setup(),
     );
     let mut whole = owner_of(
         project(&whole_dir),
-        |project| Sculpting::new(project).with_epoch(epoch),
+        |project| {
+            Sculpting::new(project)
+                .with_budget(DabBudget::new(f64::INFINITY, 0.0))
+                .with_epoch(epoch)
+        },
         setup(),
     );
     run(&mut capped, 10_000);

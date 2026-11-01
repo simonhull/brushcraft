@@ -210,9 +210,9 @@ pub(crate) trait Brush {
     fn set_radius(&mut self, _pixels: f32) {}
 
     /// The overlay's lines about the brush: its settings and keys, its last stroke, its last
-    /// error. None by default.
-    fn status(&self) -> Vec<String> {
-        Vec::new()
+    /// error. None by default. Read on the latency path, so made beforehand.
+    fn status(&self) -> &[String] {
+        &[]
     }
 }
 
@@ -1091,7 +1091,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             pick: self.picker.as_ref().map(Picker::report),
             pen: &self.pen_status,
             filter_only: !self.accumulates,
-            brush: &brush,
+            brush,
             latency: self.latency,
         };
         overlay::lines(&snapshot)

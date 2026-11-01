@@ -5,46 +5,51 @@
 //!
 //! - **Routing** ([`Brush::route`]): a pen `Down` whose ray hits the surface is the brush's stroke;
 //!   off the surface it navigates, so no stroke starts off the surface. The ray is the one the
-//!   stroke engine casts ([`ViewProjector`]), through the store's spatial index.
+//!   stroke engine casts ([`ViewProjector`]), through the store's spatial index, and its hit is
+//!   kept for [`Stroke::begin`], so a `Down` raycasts once.
 //! - **Pen down:** [`Stroke::begin`] with the camera's projector and a [`StoreSurface`], which
-//!   freezes the brush's world radius at the first hit (the size is in screen pixels); then
-//!   [`Project::begin_stroke`], so every dab of the stroke is one op. A `Down` the engine finds
-//!   nothing under (the route's hit lost to rounding) starts no stroke, and its samples are
-//!   dropped.
+//!   freezes the brush's world radius at the first hit (the size is in screen pixels), and with it
+//!   a strength in radii ([`StrengthMode::Radius`]). A `Down` the engine finds nothing under (the
+//!   route's hit lost to a moved camera) starts no stroke, and its samples are dropped.
 //! - **Each sample:** [`Stroke::push`], through a fresh [`StoreSurface`] each call, ended with
 //!   [`StoreSurface::finish`]; the dabs it places join the stroke's queue. A sample with no
 //!   pressure places none: the engine places no dab below [`stroke::MIN_DAB_SIZE`].
-//! - **Each frame:** the queue's dabs are applied by [`apply_dabs`], as many as the frame's budget
-//!   allows ([`DabBudget`]), in order; the rest wait for the next frame. The edit closes the
-//!   store's epoch, which the frame loop drains after the brush phase and uploads in the same
+//! - **Each frame:** the queued dabs are applied by [`apply_dabs`], oldest stroke first, as many as
+//!   the frame's budget allows ([`DabBudget`]); the rest wait for the next frame. The edit closes
+//!   the store's epoch, which the frame loop drains after the brush phase and uploads in the same
 //!   frame.
-//! - **Pen up:** [`Stroke::end`] gives the tail; once the queue is empty the stroke's record
-//!   ([`StrokeRecord`]: the samples the engine read, the settings' bytes, the camera at the
+//! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) when it is the oldest stroke
+//!   left, so every edit of the store's current op is that stroke's: a stroke started while the
+//!   last still has dabs queued waits behind them, its dabs placed but not applied, and its op
+//!   begins once the last one's has ended.
+//! - **Pen up:** [`Stroke::end`] gives the tail; once every dab of the stroke is applied, its
+//!   record ([`StrokeRecord`]: the samples the engine read, the settings' bytes, the camera at the
 //!   stroke's start, [`stroke::ENGINE_VERSION`]) ends the op ([`Project::end_stroke`]). A stroke
-//!   whose `Up` was lost ends at the next sample out of a stroke.
+//!   whose `Up` was lost ends at the next sample out of a stroke, or as another stroke starts (one
+//!   the brush doesn't take included, [`ForBrush::StrokeElsewhere`]); its tail's time is its last
+//!   sample's.
 //!
 //! A sample's time is seconds from a fixed epoch (the brush's creation) on the pen's
 //! de-jittered clock.
 //!
 //! # The budget: dabs per frame
 //!
-//! Applying a frame's dabs costs about linearly in dabs and in the vertices each covers (Task 3
-//! measured four dabs of 50,000 vertices at 5.4 ms a call, one at 1.73 ms), which would eat the
-//! pen's 8 ms budget from sample to present. So a frame applies dabs while their summed
-//! footprint, estimated as `π (r / h)²` vertices for a dab of radius `r` over the index level's
-//! mean quad spacing `h`, stays within [`DabBudget::DEFAULT`] (150,000 vertices: about 4 ms on the
-//! development desktop by those numbers), and always at least one. The rest are carried to the
+//! A frame's dabs cost [`apply_dabs`] about linearly in the tiles they touch: each dab re-evaluates
+//! every tile its sphere reaches, whole, and pays a query and a dispatch to the workers besides.
+//! So each dab is costed as the tiles its sphere touches in the index (queried as it is queued)
+//! times a tile's [`TILE_VERTICES`], plus a fixed overhead, and a frame applies dabs while their
+//! summed cost fits [`DabBudget::DEFAULT`], and always at least one. The rest are carried to the
 //! next frame, in order: no dab is dropped, and the stroke's tail waits behind them. A frame that
-//! carries dabs wants the next. A new stroke starting while the last still has dabs queued first
-//! applies all of them and ends it.
+//! carries dabs wants the next.
 //!
-//! The footprint limit F (the M1 spec's "Big brushes", about 180,000 vertices a dab,
-//! [`LIMIT_VERTICES`]) is reported per frame ([`BrushReport::above_limit`]): the latency target
-//! holds below it; above it is the big-brush path, still to come.
+//! The footprint limit F (the M1 spec's "Big brushes": about 150 tiles a step, [`LIMIT_TILES`]) is
+//! reported per frame ([`BrushReport::above_limit`]): the latency target holds below it; above it
+//! is the big-brush path, still to come.
 //!
-//! Carried dabs were placed on the surface as it was when they were placed, before the dabs
-//! ahead of them were applied; a stroke's later dabs always are (a frame's dabs apply after its
-//! samples are all placed), so carrying changes when a dab lands, not where.
+//! A dab is placed on the surface as it is when the dab is placed: the dabs queued ahead of it
+//! haven't landed yet. Within a frame that was always so (a frame's dabs apply after all its
+//! samples are placed); carrying makes it so for longer, so a carried dab may be placed on a
+//! surface its predecessors have yet to raise.
 //!
 //! # Warming under a hovering pen
 //!
@@ -54,29 +59,38 @@
 //! notes where it hovers ([`PenFrame::hover`]), and [`Brush::prepare`], after the frame's
 //! hand-off and so off the latency path, raycasts there and evaluates the tiles within the reach
 //! ([`stroke::REACH_RADII`] brush radii) of the hit, [`WARM_BATCH`] at a time on the store's
-//! workers, until the frame's deadline. What is left goes on in the next frame's `prepare`; a
-//! pen that moves on, touches or leaves cancels it. A still pen is warmed once.
+//! workers, until the frame's deadline. Each call does at least one piece of that (the raycast
+//! and the tiles' list, or a batch), so it finishes even in frames that overrun their deadline.
+//! What is left goes on in the next frame's `prepare`; a pen that moves on, touches or leaves
+//! cancels it. A still pen is warmed once.
 //!
 //! # Errors
 //!
-//! A store error ends the stroke cleanly (the brush-engine spec, §3 "Errors"): the dabs of a push
-//! that ended in an error are dropped, the edits so far stay, the dabs still queued are applied,
-//! and the op ends with the stroke's record; a failed [`apply_dabs`] drops the dabs left (its
-//! own are applied up to the failing one; applying them again would count some twice). Either
-//! way the error shows in the overlay ([`Brush::status`]) and the app goes on.
+//! A store error ends the stroke cleanly (the brush-engine spec, §3 "Errors"), and shows in the
+//! overlay ([`Brush::status`]) while the app goes on:
+//!
+//! - a push that ended in an error has its dabs dropped; the dabs queued before it are still
+//!   applied, and the op ends with the stroke's record;
+//! - a failed [`apply_dabs`] drops the stroke's dabs left (its own are applied up to the failing
+//!   one, and applying them again would count some twice), and the spatial index is rebuilt from
+//!   the bounds the project keeps (`apply_dabs` may have left it stale), retried each frame until
+//!   it loads;
+//! - a record [`Project::end_stroke`] refuses ([`ProjectError::Cache`],
+//!   [`ProjectError::NotTheStroke`], or one that can't be made) ends the stroke unrecorded
+//!   ([`Project::end_unrecorded_stroke`]), so its edits are still flushed.
 
 use std::collections::VecDeque;
-use std::f64::consts::{FRAC_PI_2, PI};
+use std::f64::consts::FRAC_PI_2;
 use std::time::Instant;
 
 use anyhow::Result;
-use geom::{Level, TileKey};
+use geom::TileKey;
 use input::Phase;
 use render::camera::View;
 use sculpt::{StoreSurface, apply_dabs};
 use store::{
-    Evaluation, PenSample as RecordSample, PenTilt, Project, SpatialIndex, StrokeCamera,
-    StrokeRecord, TileStore,
+    Evaluation, OpId, PenSample as RecordSample, PenTilt, Project, ProjectError, SpatialIndex,
+    StrokeCamera, StrokeRecord, StrokeRecordError, TileStore,
 };
 use stroke::{
     DVec3, Dab, Hit, Projector, REACH_RADII, Radius, Ray, Sample, ScreenPoint, Strength,
@@ -85,7 +99,7 @@ use stroke::{
 
 use crate::camera::{Camera, Pixel};
 use crate::frame::{Brush, BrushChange, BrushContext, BrushReport, SampleTimes};
-use crate::pen::{PenFrame, PenSample, Route};
+use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -113,45 +127,71 @@ pub(crate) const SIZE_STEP: f32 = 1.25;
 /// The brush radius's range, in physical pixels.
 pub(crate) const RADIUS_PIXELS: (f32, f32) = (1.0, 2000.0);
 
-/// The footprint limit F, as the vertices a dab covers: the M1 spec's "Big brushes" (about 150
-/// tiles updated, about 180,000 vertices). The pen's latency target holds below it.
-pub(crate) const LIMIT_VERTICES: f64 = 180_000.0;
+/// The footprint limit F, as the tiles a dab touches: the M1 spec's "Big brushes" (about 150
+/// tiles a step, about 180,000 vertices). The pen's latency target holds below it.
+pub(crate) const LIMIT_TILES: usize = 150;
+
+/// The vertices a tile holds, `65²` at any level ([`geom::TILE_QUADS`] + 1 a side): what a dab
+/// re-evaluates for each tile its sphere touches.
+pub(crate) const TILE_VERTICES: f64 = 4225.0;
 
 /// Tiles the warming evaluates together on the store's workers between checks of its deadline.
 pub(crate) const WARM_BATCH: usize = 16;
 
-/// How many dabs a frame applies: as many as fit a budget of vertices covered, summed over the
-/// dabs, and always at least one (see "The budget" in the module notes).
+/// How many dabs a frame applies: as many as fit a budget, each dab costed by the tiles it
+/// touches plus a fixed overhead, and always at least one (see "The budget" in the module notes).
+///
+/// Costs are in tile vertices: a dab touching `t` tiles costs `t ·` [`TILE_VERTICES`] plus the
+/// overhead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DabBudget {
-    /// The most vertices a frame's dabs cover together, by their estimated footprints.
-    vertices: f64,
+    /// The most a frame's dabs cost together.
+    units: f64,
+    /// What every dab costs besides its tiles: its query, a dispatch to the workers.
+    per_dab: f64,
 }
 
 impl DabBudget {
-    /// 150,000 vertices a frame: about 4 ms of [`apply_dabs`] on the development desktop by Task
-    /// 3's measurements (27 ns a vertex covered, four 50,000-vertex dabs in 5.4 ms), half the
-    /// pen's 8 ms from sample to present.
+    /// 160,000 tile vertices a frame, and two tiles' worth (8,450) a dab besides.
+    ///
+    /// Sized against Task 3's p99, not its median: four dabs of 50,000 vertices (each touching
+    /// about 24 tiles, about 100,000 tile vertices) took 7.5 ms a call at p99, about 18 ns a tile
+    /// vertex, so the budget is about 3 ms at p99, leaving the rest of the pen's 8 ms to the
+    /// frame's input, feed, uploads and encoding (3 to 4 ms of uploads and encoding at p99 in the
+    /// first scripted run). Both constants are provisional: the overhead is a guess until
+    /// `brushcraft-bench brush --dabs 32 --footprint small` (many small dabs) and `--dabs 4
+    /// --footprint 50000` calibrate them.
     pub(crate) const DEFAULT: Self = Self {
-        vertices: 150_000.0,
+        units: 160_000.0,
+        per_dab: 2.0 * TILE_VERTICES,
     };
 
-    /// A budget of `vertices` covered a frame.
+    /// A budget of `units` tile vertices a frame, and `per_dab` a dab besides its tiles.
     #[cfg(test)]
-    pub(crate) const fn new(vertices: f64) -> Self {
-        Self { vertices }
+    pub(crate) const fn new(units: f64, per_dab: f64) -> Self {
+        Self { units, per_dab }
     }
 
-    /// How many of `footprints` (the queued dabs' estimated vertices, in order) to apply this
-    /// frame: the longest run from the front whose sum fits, at least one if there are any.
-    pub(crate) fn take(self, footprints: impl IntoIterator<Item = f64>) -> usize {
-        let mut sum = 0.0;
+    /// What a dab touching `tiles` tiles costs.
+    pub(crate) fn cost(self, tiles: usize) -> f64 {
+        let count = u32::try_from(tiles).map_or_else(|_| f64::from(u32::MAX), f64::from);
+        count * TILE_VERTICES + self.per_dab
+    }
+
+    /// How many of `costs` (queued dabs' costs, in order) fit `room`, the budget the frame has
+    /// left, which they use up: the longest run from the front that fits, and at least one if
+    /// `at_least_one` and there are any.
+    pub(crate) fn take(
+        costs: impl IntoIterator<Item = f64>,
+        room: &mut f64,
+        at_least_one: bool,
+    ) -> usize {
         let mut count = 0;
-        for footprint in footprints {
-            sum += footprint;
-            if count > 0 && sum > self.vertices {
+        for cost in costs {
+            if cost > *room && !(at_least_one && count == 0) {
                 break;
             }
+            *room -= cost;
             count += 1;
         }
         count
@@ -201,25 +241,102 @@ const fn world(v: render::camera::Vec3) -> DVec3 {
     DVec3::new(v.x, v.y, v.z)
 }
 
-/// A dab waiting to be applied, with the pen sample it came from, for the frame's latency.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Queued {
-    /// The dab.
-    dab: Dab,
-    /// The sample whose push (or the pen-up's end) placed it.
-    sample: SampleTimes,
+/// A surface whose first raycast is answered already: the route's hit, so a `Down` raycasts once.
+///
+/// The kept hit answers only a ray equal to its own, bit for bit (the same pixel, the same view);
+/// any other, and every later call, goes to the surface.
+struct Primed<'s, S> {
+    /// The surface.
+    surface: &'s mut S,
+    /// The route's ray and its hit, until the first raycast.
+    first: Option<(Ray, Hit)>,
 }
 
-/// The stroke in progress: the engine's stroke until the pen lifts, and its record.
+impl<S: Surface> Surface for Primed<'_, S> {
+    fn raycast(&mut self, ray: &Ray) -> Option<Hit> {
+        match self.first.take() {
+            Some((routed, hit)) if routed == *ray => Some(hit),
+            _ => self.surface.raycast(ray),
+        }
+    }
+
+    fn closest_on_region(&mut self, ray: &Ray, near: &Hit, reach: f64) -> Option<Hit> {
+        self.surface.closest_on_region(ray, near, reach)
+    }
+
+    fn continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> bool {
+        self.surface.continuous(a, b, reach)
+    }
+}
+
+/// Where a queued dab came from, and what it costs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Source {
+    /// The sample whose push (or the pen-up's end) placed it: the frame's latency runs from it.
+    times: SampleTimes,
+    /// The tiles its sphere touches, as it was queued.
+    tiles: usize,
+    /// Its cost against the frame's budget.
+    cost: f64,
+}
+
+/// A stroke, from its `Down` until its op ends: its engine stroke while the pen is down, what its
+/// record keeps, and its dabs not yet applied.
 #[derive(Debug)]
-struct Active {
+struct Pending {
     /// The engine's stroke; `None` once it has ended (pen up, or an error), while its queued
     /// dabs are applied.
-    stroke: Option<Stroke>,
-    /// The record of its samples, settings and camera, written as it ends.
-    record: StrokeRecord,
-    /// The settings it began with: the brush's, its radius frozen at the first hit.
+    engine: Option<Stroke>,
+    /// The brush's settings as the stroke began, which its record keeps (the engine holds its own
+    /// copy, its radius frozen at the first hit).
     settings: StrokeSettings,
+    /// The camera at the stroke's start, which its record keeps.
+    camera: StrokeCamera,
+    /// The samples the engine read, which its record keeps.
+    samples: Vec<RecordSample>,
+    /// Its op, once begun: once it is the oldest stroke left.
+    op: Option<OpId>,
+    /// Its dabs not yet applied, oldest first.
+    dabs: VecDeque<Dab>,
+    /// Where each of `dabs` came from, and its cost.
+    sources: VecDeque<Source>,
+    /// Its last sample's times: a lost `Up`'s tail is timed from it.
+    last: SampleTimes,
+}
+
+impl Pending {
+    /// Whether the pen still draws it.
+    const fn open(&self) -> bool {
+        self.engine.is_some()
+    }
+
+    /// Whether it is over: the pen lifted (or an error ended it) and every dab is applied.
+    fn done(&self) -> bool {
+        self.engine.is_none() && self.dabs.is_empty()
+    }
+}
+
+/// Queues `placed` on a stroke's `queue`: dabs placed by the sample at `times`, each costed by
+/// `budget` from the tiles of `index` its sphere touches.
+fn enqueue(
+    (dabs, sources): (&mut VecDeque<Dab>, &mut VecDeque<Source>),
+    placed: impl Iterator<Item = Dab>,
+    times: SampleTimes,
+    index: &SpatialIndex,
+    budget: DabBudget,
+) {
+    for dab in placed {
+        let [x, y, z] = dab.position;
+        let touched = index
+            .query_sphere(geom::Vec3::new(x, y, z), dab.radius)
+            .count();
+        dabs.push_back(dab);
+        sources.push_back(Source {
+            times,
+            tiles: touched,
+            cost: budget.cost(touched),
+        });
+    }
 }
 
 /// What the warming under a hovering pen is doing.
@@ -233,38 +350,63 @@ struct Warm {
     todo: Vec<TileKey>,
 }
 
+/// What the overlay's lines say: they are made again only when it changes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StatusKey {
+    /// The radius, in pixels.
+    radius: f32,
+    /// The strength, in radii.
+    strength: f32,
+    /// The strength's factor of the default.
+    factor: f32,
+    /// Whether a stroke is pending.
+    drawing: bool,
+    /// The last frame that applied dabs.
+    last: BrushReport,
+    /// How many errors have been kept (or cleared).
+    errors: u64,
+}
+
 /// The app's brush: pen strokes through the stroke engine into the store (see the module notes).
 ///
 /// One brush for M1a4: the draw action with the spec's defaults, its size in screen pixels
-/// frozen per stroke, its size and strength set with keys.
+/// frozen per stroke, its strength a share of that size, both set with keys.
 #[derive(Debug)]
 pub(crate) struct Sculpting {
     /// The brush's settings: draw, the stroke engine's defaults, the radius and strength the keys
-    /// set.
+    /// set, the strength in radii.
     settings: StrokeSettings,
     /// The strength, as a factor of [`DEFAULT_STRENGTH_FRACTION`].
     strength_factor: f32,
     /// The stroke state `apply_dabs` keeps across a stroke's dabs.
     state: sculpt::Stroke,
-    /// The stroke in progress, if any.
-    active: Option<Active>,
-    /// Dabs placed and not yet applied, oldest first.
-    queue: VecDeque<Queued>,
+    /// The strokes not over yet, oldest first: only the last can be open.
+    strokes: VecDeque<Pending>,
     /// How many dabs a frame applies.
     budget: DabBudget,
-    /// The mean spacing of the index level's vertices, in world units, for footprints; zero
-    /// before the first frame with an index.
-    spacing: f64,
     /// The next stroke's number.
     next_stroke: u32,
     /// The epoch sample times count from.
     epoch: Instant,
+    /// The ray and hit of the last `Down` routed to the brush, for its stroke's first raycast;
+    /// cleared at the end of each step.
+    routed: Option<(Ray, Hit)>,
+    /// Pen samples held over from a step with no scene (a degenerate view) while strokes were
+    /// pending, in order; `None` for a stroke started elsewhere.
+    held: Vec<Option<PenSample>>,
+    /// Whether the spatial index must be rebuilt: an `apply_dabs` failed, and its rebuild hasn't
+    /// succeeded yet.
+    index_stale: bool,
     /// The warming under a hovering pen.
     warm: Warm,
-    /// The last error, for the overlay.
+    /// The last error, for the overlay; cleared as a stroke starts cleanly.
     error: Option<String>,
+    /// Errors kept or cleared so far, for the overlay to see a change.
+    errors: u64,
     /// The last frame that applied dabs, for the overlay.
     last: BrushReport,
+    /// The overlay's lines, and what they were made from.
+    status: (Vec<String>, Option<StatusKey>),
 }
 
 impl Sculpting {
@@ -275,20 +417,25 @@ impl Sculpting {
         let settings = StrokeSettings::default()
             .with_strength_mode(StrengthMode::Radius)
             .with_strength(strength(1.0));
-        Self {
+        let mut brush = Self {
             settings,
             strength_factor: 1.0,
             state,
-            active: None,
-            queue: VecDeque::new(),
+            strokes: VecDeque::new(),
             budget: DabBudget::DEFAULT,
-            spacing: 0.0,
             next_stroke: 0,
             epoch: Instant::now(),
+            routed: None,
+            held: Vec::new(),
+            index_stale: false,
             warm: Warm::default(),
             error: None,
+            errors: 0,
             last: BrushReport::default(),
-        }
+            status: (Vec::new(), None),
+        };
+        brush.refresh_status();
+        brush
     }
 
     /// This brush with `budget` dabs a frame.
@@ -305,6 +452,7 @@ impl Sculpting {
     pub(crate) fn with_strength(mut self, factor: f32) -> Self {
         self.strength_factor = factor;
         self.settings = self.settings.with_strength(strength(factor));
+        self.refresh_status();
         self
     }
 
@@ -314,7 +462,7 @@ impl Sculpting {
         &self.settings
     }
 
-    /// The last error, if one happened.
+    /// The last error, if one happened since a stroke last started cleanly.
     #[cfg(test)]
     pub(crate) fn error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -337,8 +485,19 @@ impl Sculpting {
 
     /// Whether a stroke is in progress or its dabs are still being applied.
     #[cfg(test)]
-    pub(crate) const fn stroking(&self) -> bool {
-        self.active.is_some()
+    pub(crate) fn stroking(&self) -> bool {
+        !self.strokes.is_empty()
+    }
+
+    /// The strokes not over yet.
+    #[cfg(test)]
+    pub(crate) fn strokes_pending(&self) -> usize {
+        self.strokes.len()
+    }
+
+    /// Dabs placed and not yet applied, over every stroke.
+    fn queued(&self) -> usize {
+        self.strokes.iter().map(|stroke| stroke.dabs.len()).sum()
     }
 
     /// A pen sample as the stroke engine reads it: physical pixels, seconds since the brush's
@@ -368,176 +527,259 @@ impl Sculpting {
         Some(engine.with_buttons(stroke::Buttons::from_bits(button_bits(sample.buttons))))
     }
 
-    /// Ends the stroke in progress, if any, at once: its engine stroke ended and its tail
-    /// queued, every dab queued applied whatever the budget, and its op ended with its record.
-    fn finish_now(&mut self, context: &mut Scene<'_>, report: &mut BrushReport) {
-        self.lift(context, None);
-        let count = self.queue.len();
-        self.apply(context, report, count);
-        self.end_if_done(context.project);
+    /// Takes one pen event: a sample for the brush, or (`None`) a stroke the brush doesn't take
+    /// starting, which ends an open stroke whose `Up` was lost.
+    fn handle(&mut self, scene: &mut Scene<'_>, event: Option<&PenSample>) {
+        let Some(sample) = event else {
+            self.lift(scene, None);
+            return;
+        };
+        match sample.phase {
+            Phase::Down => {
+                self.lift(scene, None);
+                self.begin(scene, sample);
+            }
+            Phase::Drag => self.push(scene, sample),
+            Phase::Up => self.lift(scene, Some(sample)),
+            // Out of a stroke: a stroke whose `Up` was lost ends here.
+            Phase::Enter | Phase::Hover | Phase::Leave => self.lift(scene, None),
+        }
     }
 
-    /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it.
-    fn begin(&mut self, context: &mut Scene<'_>, down: &PenSample) {
+    /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it;
+    /// its op begins once the strokes before it are over.
+    fn begin(&mut self, scene: &mut Scene<'_>, down: &PenSample) {
         self.warm = Warm::default();
+        let routed = self.routed.take();
         let Some(first) = self.engine_sample(down) else {
             return;
         };
-        let projector = context.projector;
+        let projector = scene.projector;
         let id = StrokeId::new(self.next_stroke);
         self.next_stroke = self.next_stroke.wrapping_add(1);
-        let mut surface = StoreSurface::new(context.project.store(), context.index);
-        let stroke = Stroke::begin(&self.settings, id, &projector, &mut surface, first);
+        let mut surface = StoreSurface::new(scene.project.store(), scene.index);
+        let mut primed = Primed {
+            surface: &mut surface,
+            first: routed,
+        };
+        let engine = Stroke::begin(&self.settings, id, &projector, &mut primed, first);
         if let Err(error) = surface.finish() {
             self.fail("starting a stroke", &error);
             return;
         }
-        let Some(stroke) = stroke else {
+        let Some(engine) = engine else {
             return;
         };
-        let op = match context.project.begin_stroke() {
-            Ok(op) => op,
-            Err(error) => {
-                self.fail("starting a stroke", &error);
-                return;
-            }
-        };
-        let camera = stroke_camera(context.camera, &projector.view);
-        let record =
-            StrokeRecord::new(op, stroke::ENGINE_VERSION, self.settings.to_bytes(), camera);
-        let mut record = match record {
-            Ok(record) => record,
-            Err(error) => {
-                self.fail("recording a stroke", &error);
-                return;
-            }
-        };
-        self.keep_sample(&mut record, &first);
-        self.active = Some(Active {
-            stroke: Some(stroke),
-            record,
+        if self.error.take().is_some() {
+            self.errors += 1;
+        }
+        self.strokes.push_back(Pending {
+            engine: Some(engine),
             settings: self.settings.clone(),
+            camera: stroke_camera(scene.camera, &projector.view),
+            samples: vec![record_sample(&first)],
+            op: None,
+            dabs: VecDeque::new(),
+            sources: VecDeque::new(),
+            last: times_of(down),
         });
     }
 
-    /// Feeds `sample` (a `Drag` of the stroke in progress) to the engine, queueing the dabs it
-    /// places; a store error ends the stroke there, its dabs dropped.
-    fn push(&mut self, context: &mut Scene<'_>, sample: &PenSample) {
-        let Some(engine) = self.engine_sample(sample) else {
+    /// Feeds `sample` (a `Drag` of the open stroke) to the engine, queueing the dabs it places;
+    /// a store error ends the stroke there, its dabs dropped.
+    fn push(&mut self, scene: &mut Scene<'_>, sample: &PenSample) {
+        let Some(engine_sample) = self.engine_sample(sample) else {
             return;
         };
-        let times = SampleTimes {
-            taken: sample.timestamp,
-            received: sample.received,
-        };
-        let Some(active) = &mut self.active else {
+        let budget = self.budget;
+        let Some(pending) = self.strokes.back_mut().filter(|stroke| stroke.open()) else {
             return;
         };
-        let Some(stroke) = &mut active.stroke else {
+        let Some(engine) = &mut pending.engine else {
             return;
         };
-        let projector = context.projector;
-        let mut surface = StoreSurface::new(context.project.store(), context.index);
-        let placed = stroke.push(&projector, &mut surface, engine);
+        let projector = scene.projector;
+        let mut surface = StoreSurface::new(scene.project.store(), scene.index);
+        let placed = engine.push(&projector, &mut surface, engine_sample);
         let finished = surface.finish();
-        keep_sample(&mut active.record, &engine, &mut self.error);
+        let times = times_of(sample);
+        pending.samples.push(record_sample(&engine_sample));
+        pending.last = times;
         match finished {
             Ok(()) => {
-                let queued = placed.map(|dab| Queued { dab, sample: times });
-                self.queue.extend(queued);
+                let queue = (&mut pending.dabs, &mut pending.sources);
+                enqueue(queue, placed, times, scene.index, budget);
             }
             Err(error) => {
                 drop(placed);
-                active.stroke = None;
+                pending.engine = None;
                 self.fail("placing dabs", &error);
             }
         }
     }
 
-    /// Ends the engine's stroke (the pen lifted, at `up` if its sample came), queueing its tail.
-    fn lift(&mut self, context: &mut Scene<'_>, up: Option<&PenSample>) {
-        let Some(stroke) = self.active.as_mut().and_then(|active| active.stroke.take()) else {
+    /// Ends the open stroke's engine stroke, if there is one, queueing its tail: the pen lifted
+    /// at `up`, or (`None`) its `Up` was lost, and the tail is timed from its last sample.
+    fn lift(&mut self, scene: &mut Scene<'_>, up: Option<&PenSample>) {
+        let budget = self.budget;
+        let Some(pending) = self.strokes.back_mut() else {
             return;
         };
-        let times = up.map_or_else(
-            || {
-                let now = Instant::now();
-                SampleTimes {
-                    taken: now,
-                    received: now,
-                }
-            },
-            |up| SampleTimes {
-                taken: up.timestamp,
-                received: up.received,
-            },
-        );
-        let projector = context.projector;
-        let mut surface = StoreSurface::new(context.project.store(), context.index);
-        let tail = stroke.end(&projector, &mut surface);
+        let Some(engine) = pending.engine.take() else {
+            return;
+        };
+        let times = up.map_or(pending.last, times_of);
+        let projector = scene.projector;
+        let mut surface = StoreSurface::new(scene.project.store(), scene.index);
+        let tail = engine.end(&projector, &mut surface);
         match surface.finish() {
             Ok(()) => {
-                let queued = tail.map(|dab| Queued { dab, sample: times });
-                self.queue.extend(queued);
+                let queue = (&mut pending.dabs, &mut pending.sources);
+                enqueue(queue, tail, times, scene.index, budget);
             }
-            Err(error) => self.fail("placing the stroke's last dabs", &error),
+            Err(error) => {
+                drop(tail);
+                self.fail("placing the stroke's last dabs", &error);
+            }
         }
     }
 
-    /// Applies the first `count` queued dabs in one [`apply_dabs`], adding to `report`. A store
-    /// error drops every queued dab and ends the engine's stroke.
-    fn apply(&mut self, context: &mut Scene<'_>, report: &mut BrushReport, count: usize) {
-        let count = count.min(self.queue.len());
-        if count == 0 {
-            return;
+    /// Applies queued dabs within `room` of the budget, oldest stroke first, beginning each
+    /// stroke's op as it comes to the front and ending it once it is over; at least one dab if
+    /// any is queued.
+    fn apply(&mut self, scene: &mut Scene<'_>, report: &mut BrushReport, mut room: f64) {
+        loop {
+            let Some(front) = self.strokes.front_mut() else {
+                return;
+            };
+            if front.op.is_none() {
+                match scene.project.begin_stroke() {
+                    Ok(op) => front.op = Some(op),
+                    Err(error) => {
+                        // No op, so nothing of it can be applied: it is dropped.
+                        self.strokes.pop_front();
+                        self.fail("starting a stroke's op", &error);
+                        continue;
+                    }
+                }
+            }
+            let first = report.dabs_applied == 0;
+            let costs = front.sources.iter().map(|source| source.cost);
+            let count = DabBudget::take(costs, &mut room, first);
+            if count > 0 {
+                self.apply_front(scene, report, count);
+            }
+            if !self.strokes.front().is_some_and(Pending::done) {
+                return;
+            }
+            if let Some(over) = self.strokes.pop_front() {
+                self.end(scene.project, &over);
+            }
         }
-        let batch: Vec<Dab> = self.queue.iter().take(count).map(|q| q.dab).collect();
-        let sources = self.queue.iter().take(count).map(|q| q.sample);
-        let oldest = sources.reduce(SampleTimes::earliest);
-        report.oldest = match (report.oldest, oldest) {
-            (Some(a), Some(b)) => Some(a.earliest(b)),
-            (a, b) => a.or(b),
+    }
+
+    /// Applies the oldest stroke's first `count` queued dabs in one [`apply_dabs`], adding to
+    /// `report`. A store error drops the stroke's dabs left, ends its engine stroke, and has the
+    /// spatial index rebuilt.
+    fn apply_front(&mut self, scene: &mut Scene<'_>, report: &mut BrushReport, count: usize) {
+        let Some(front) = self.strokes.front_mut() else {
+            return;
         };
-        let footprints = batch.iter().map(|dab| footprint(dab.radius, self.spacing));
-        report.above_limit |= footprints.fold(0.0, f64::max) > LIMIT_VERTICES;
-        let applied = apply_dabs(
-            context.project.store(),
-            context.index,
-            &mut self.state,
-            &batch,
-        );
+        let sources = front.sources.iter().take(count);
+        for source in sources {
+            report.oldest = Some(
+                report
+                    .oldest
+                    .map_or(source.times, |oldest| oldest.earliest(source.times)),
+            );
+            report.above_limit |= source.tiles > LIMIT_TILES;
+        }
+        let dabs: &[Dab] = front.dabs.make_contiguous();
+        let batch = dabs.get(..count).unwrap_or(dabs);
+        let applied = apply_dabs(scene.project.store(), scene.index, &mut self.state, batch);
         match applied {
             Ok(stats) => {
-                self.queue.drain(..count);
+                front.dabs.drain(..count);
+                front.sources.drain(..count);
                 report.dabs_applied += stats.dabs;
                 report.tiles_edited += stats.tiles_edited;
             }
             Err(error) => {
-                self.queue.clear();
-                if let Some(active) = &mut self.active {
-                    active.stroke = None;
-                }
+                front.dabs.clear();
+                front.sources.clear();
+                front.engine = None;
+                self.index_stale = true;
                 self.fail("applying dabs", &error);
+                self.rebuild_index(scene);
             }
         }
     }
 
-    /// Ends the stroke's op with its record once its engine stroke has ended and its dabs are
-    /// all applied.
-    fn end_if_done(&mut self, project: &mut Project) {
-        let done = self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.stroke.is_none() && self.queue.is_empty());
-        if !done {
-            return;
+    /// Rebuilds the spatial index from the bounds the project keeps, after a failed
+    /// [`apply_dabs`]; on failure it is tried again next frame.
+    fn rebuild_index(&mut self, scene: &mut Scene<'_>) {
+        let level = scene.index.level();
+        match scene.project.load_index(level, |_, _| {}) {
+            Ok((index, _)) => {
+                *scene.index = index;
+                self.index_stale = false;
+            }
+            Err(error) => self.fail("rebuilding the spatial index", &error),
         }
-        let Some(active) = self.active.take() else {
+    }
+
+    /// Ends `over`'s op with its record; unrecorded if the record can't be made or the project
+    /// refuses it, so its edits are flushed all the same.
+    fn end(&mut self, project: &mut Project, over: &Pending) {
+        let Some(op) = over.op else {
             return;
         };
-        if let Err(error) = project.end_stroke(&active.record) {
+        let record = match self.record_of(op, over) {
+            Ok(record) => record,
+            Err(error) => {
+                self.fail("recording the stroke", &error);
+                self.end_unrecorded(project);
+                return;
+            }
+        };
+        match project.end_stroke(&record) {
+            Ok(()) => {}
+            Err(error @ (ProjectError::Cache(_) | ProjectError::NotTheStroke { .. })) => {
+                self.fail("recording the stroke", &error);
+                self.end_unrecorded(project);
+            }
+            Err(error) => self.fail("ending the stroke", &error),
+        }
+    }
+
+    /// Ends the open op with no record.
+    fn end_unrecorded(&mut self, project: &mut Project) {
+        if let Err(error) = project.end_unrecorded_stroke() {
             self.fail("ending the stroke", &error);
         }
+    }
+
+    /// `over`'s record under its `op`: its samples (as many as a record holds), settings,
+    /// camera and the engine's version.
+    ///
+    /// # Errors
+    ///
+    /// As [`StrokeRecord::new`]: settings too long for a record.
+    fn record_of(&mut self, op: OpId, over: &Pending) -> Result<StrokeRecord, StrokeRecordError> {
+        let mut record = StrokeRecord::new(
+            op,
+            stroke::ENGINE_VERSION,
+            over.settings.to_bytes(),
+            over.camera,
+        )?;
+        let samples = over.samples.iter();
+        for sample in samples {
+            if let Err(full) = record.push(sample) {
+                self.fail("recording the stroke", &full);
+                break;
+            }
+        }
+        Ok(record)
     }
 
     /// Keeps `error`, from `doing`, for the overlay.
@@ -545,11 +787,7 @@ impl Sculpting {
         let causes = std::iter::successors(Some(error), |error| error.source());
         let chain: Vec<String> = causes.map(ToString::to_string).collect();
         self.error = Some(format!("{doing}: {}", chain.join(": ")));
-    }
-
-    /// Adds `sample` to `record`, keeping the error if the record is full.
-    fn keep_sample(&mut self, record: &mut StrokeRecord, sample: &Sample) {
-        keep_sample(record, sample, &mut self.error);
+        self.errors += 1;
     }
 
     /// The radius in screen pixels, scaled by `factor` within [`RADIUS_PIXELS`].
@@ -567,6 +805,7 @@ impl Sculpting {
             return false;
         }
         self.settings = self.settings.clone().with_radius(radius);
+        self.refresh_status();
         true
     }
 
@@ -580,13 +819,48 @@ impl Sculpting {
         }
         self.strength_factor = scaled;
         self.settings = self.settings.clone().with_strength(strength(scaled));
+        self.refresh_status();
         true
+    }
+
+    /// Makes the overlay's lines again if what they say changed.
+    fn refresh_status(&mut self) {
+        let key = StatusKey {
+            radius: self.settings.radius().get(),
+            strength: self.settings.strength().get(),
+            factor: self.strength_factor,
+            drawing: !self.strokes.is_empty(),
+            last: self.last,
+            errors: self.errors,
+        };
+        if self.status.1 == Some(key) {
+            return;
+        }
+        let mut lines = vec![format!(
+            "brush      draw  radius {:.1} px  strength {:.4} of the radius (x{:.2})  keys: [ ] \
+             size, - = strength",
+            key.radius, key.strength, key.factor
+        )];
+        let last = key.last;
+        lines.push(format!(
+            "stroke     {}  last frame with dabs: {} applied, {} carried, {} tiles edited{}",
+            if key.drawing { "drawing" } else { "none" },
+            last.dabs_applied,
+            last.dabs_carried,
+            last.tiles_edited,
+            if last.above_limit { ", above F" } else { "" }
+        ));
+        if let Some(error) = &self.error {
+            lines.push(format!("brush err  {error}"));
+        }
+        self.status = (lines, Some(key));
     }
 
     /// Notes where the pen hovers in this frame's view, for [`Brush::prepare`] to warm.
     fn note_hover(&mut self, pen: &PenFrame, view: Option<&View>) {
-        self.warm.wanted = match (pen.hover(), view, &self.active) {
-            (Some(hover), Some(view), None) => Some((hover.at, *view)),
+        let open = self.strokes.back().is_some_and(Pending::open);
+        self.warm.wanted = match (pen.hover(), view, open) {
+            (Some(hover), Some(view), false) => Some((hover.at, *view)),
             _ => None,
         };
         if self.warm.wanted != self.warm.target {
@@ -597,15 +871,15 @@ impl Sculpting {
 
     /// Starts warming the hover's `wanted` position: raycasts there and lists the tiles within
     /// reach of the hit that aren't evaluated yet.
-    fn start_warming(&mut self, context: &mut Scene<'_>, at: Pixel) {
-        let projector = context.projector;
+    fn start_warming(&mut self, scene: &mut Scene<'_>, at: Pixel) {
+        let projector = scene.projector;
         let Ok(screen) = ScreenPoint::new(at.x, at.y) else {
             return;
         };
         let Some(ray) = projector.ray(screen) else {
             return;
         };
-        let mut surface = StoreSurface::new(context.project.store(), context.index);
+        let mut surface = StoreSurface::new(scene.project.store(), scene.index);
         let hit = surface.raycast(&ray);
         if let Err(error) = surface.finish() {
             self.fail("warming the surface under the pen", &error);
@@ -617,7 +891,29 @@ impl Sculpting {
         let depth = ray.depth_of(hit.position);
         let radius = f64::from(self.settings.radius().get()) * projector.world_per_pixel(depth);
         let reach = REACH_RADII * radius;
-        self.warm.todo = cold_tiles(context.project.store(), context.index, &hit, reach);
+        self.warm.todo = cold_tiles(scene.project.store(), scene.index, &hit, reach);
+    }
+
+    /// Evaluates the last [`WARM_BATCH`] tiles still to warm.
+    fn warm_batch(&mut self, scene: &mut Scene<'_>) {
+        let split = self.warm.todo.len().saturating_sub(WARM_BATCH);
+        let batch = self.warm.todo.split_off(split);
+        let evaluated = scene
+            .project
+            .store()
+            .evaluate_many(&batch, Evaluation::Positions);
+        if let Err(error) = evaluated {
+            self.warm.todo.clear();
+            self.fail("warming the surface under the pen", &error);
+        }
+    }
+}
+
+/// When `sample` was taken and when it reached the app.
+const fn times_of(sample: &PenSample) -> SampleTimes {
+    SampleTimes {
+        taken: sample.timestamp,
+        received: sample.received,
     }
 }
 
@@ -658,42 +954,50 @@ impl Brush for Sculpting {
         let view = context.camera.view(context.size);
         let mut report = BrushReport::default();
         let Some(mut scene) = Scene::of(context) else {
+            if !self.strokes.is_empty() {
+                // Kept for a frame that can place them: the strokes they belong to go on.
+                let events = pen.brush_events().map(|event| match event {
+                    ForBrush::Sample(sample) => Some(*sample),
+                    ForBrush::StrokeElsewhere => None,
+                });
+                self.held.extend(events);
+                report.dabs_carried = self.queued();
+                report.busy = true;
+            }
+            self.routed = None;
             self.note_hover(pen, None);
+            self.refresh_status();
             return Ok(report);
         };
-        if self.spacing == 0.0 {
-            self.spacing = mean_spacing(scene.project.store(), scene.index.level());
+        if self.index_stale {
+            self.rebuild_index(&mut scene);
         }
-        let samples = pen.for_brush();
-        for sample in samples {
-            match sample.phase {
-                Phase::Down => {
-                    self.finish_now(&mut scene, &mut report);
-                    self.begin(&mut scene, sample);
-                }
-                Phase::Drag => self.push(&mut scene, sample),
-                Phase::Up => self.lift(&mut scene, Some(sample)),
-                // Out of a stroke: a stroke whose `Up` was lost ends here.
-                Phase::Enter | Phase::Hover | Phase::Leave => self.lift(&mut scene, None),
-            }
+        let held = std::mem::take(&mut self.held);
+        for event in &held {
+            self.handle(&mut scene, event.as_ref());
         }
-        let footprints = self
-            .queue
-            .iter()
-            .map(|queued| footprint(queued.dab.radius, self.spacing));
-        let count = self.budget.take(footprints);
-        self.apply(&mut scene, &mut report, count);
-        self.end_if_done(scene.project);
+        let events = pen.brush_events();
+        for event in events {
+            let sample = match event {
+                ForBrush::Sample(sample) => Some(sample),
+                ForBrush::StrokeElsewhere => None,
+            };
+            self.handle(&mut scene, sample);
+        }
+        self.routed = None;
+        self.apply(&mut scene, &mut report, self.budget.units);
         self.note_hover(pen, view.as_ref());
-        report.dabs_carried = self.queue.len();
-        report.busy = !self.queue.is_empty();
+        report.dabs_carried = self.queued();
+        report.busy = report.dabs_carried > 0;
         if report.dabs_applied > 0 {
             self.last = report;
         }
+        self.refresh_status();
         Ok(report)
     }
 
     fn route(&mut self, context: BrushContext<'_>, down: &PenSample) -> Route {
+        self.routed = None;
         let Some(scene) = Scene::of(context) else {
             return Route::Navigate;
         };
@@ -709,10 +1013,12 @@ impl Brush for Sculpting {
             self.fail("picking under the pen", &error);
             return Route::Navigate;
         }
-        if hit.is_some() {
-            Route::Brush
-        } else {
-            Route::Navigate
+        match hit {
+            Some(hit) => {
+                self.routed = Some((ray, hit));
+                Route::Brush
+            }
+            None => Route::Navigate,
         }
     }
 
@@ -720,30 +1026,30 @@ impl Brush for Sculpting {
         let Some(mut scene) = Scene::of(context) else {
             return Ok(false);
         };
+        // At least one piece of work each call, so warming finishes even in frames that overrun.
+        let mut worked = false;
         if self.warm.wanted != self.warm.target {
             self.warm.target = self.warm.wanted;
             if let Some((at, _)) = self.warm.wanted {
                 self.start_warming(&mut scene, at);
+                worked = true;
             }
         }
-        while !self.warm.todo.is_empty() && Instant::now() < deadline {
-            let split = self.warm.todo.len().saturating_sub(WARM_BATCH);
-            let batch = self.warm.todo.split_off(split);
-            let evaluated = scene
-                .project
-                .store()
-                .evaluate_many(&batch, Evaluation::Positions);
-            if let Err(error) = evaluated {
-                self.warm.todo.clear();
-                self.fail("warming the surface under the pen", &error);
-            }
+        while !self.warm.todo.is_empty() && (!worked || Instant::now() < deadline) {
+            self.warm_batch(&mut scene);
+            worked = true;
         }
         Ok(!self.warm.todo.is_empty())
     }
 
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {
         if let Some(mut scene) = Scene::of(context) {
-            self.finish_now(&mut scene, &mut BrushReport::default());
+            let held = std::mem::take(&mut self.held);
+            for event in &held {
+                self.handle(&mut scene, event.as_ref());
+            }
+            self.lift(&mut scene, None);
+            self.apply(&mut scene, &mut BrushReport::default(), f64::INFINITY);
         }
         Ok(())
     }
@@ -761,42 +1067,8 @@ impl Brush for Sculpting {
         self.set_radius_pixels(pixels);
     }
 
-    fn status(&self) -> Vec<String> {
-        let settings = self
-            .active
-            .as_ref()
-            .map_or(&self.settings, |active| &active.settings);
-        let mut lines = vec![format!(
-            "brush      draw  radius {:.1} px  strength {:.4} of the radius (x{:.2})  keys: [ ] \
-             size, - = strength",
-            settings.radius().get(),
-            settings.strength().get(),
-            self.strength_factor
-        )];
-        let last = self.last;
-        lines.push(format!(
-            "stroke     {}  last frame with dabs: {} applied, {} carried, {} tiles edited{}",
-            if self.active.is_some() {
-                "drawing"
-            } else {
-                "none"
-            },
-            last.dabs_applied,
-            last.dabs_carried,
-            last.tiles_edited,
-            if last.above_limit { ", above F" } else { "" }
-        ));
-        if let Some(error) = &self.error {
-            lines.push(format!("brush err  {error}"));
-        }
-        lines
-    }
-}
-
-/// `sample` added to `record`; a full record leaves it out and keeps the error in `error`.
-fn keep_sample(record: &mut StrokeRecord, sample: &Sample, error: &mut Option<String>) {
-    if let Err(full) = record.push(&record_sample(sample)) {
-        *error = Some(format!("recording the stroke: {full}"));
+    fn status(&self) -> &[String] {
+        &self.status.0
     }
 }
 
@@ -861,41 +1133,6 @@ fn stroke_camera(camera: &Camera, view: &View) -> StrokeCamera {
 /// The brush's base strength, `factor` times [`DEFAULT_STRENGTH_FRACTION`] of the radius.
 fn strength(factor: f32) -> Strength {
     Strength::new(DEFAULT_STRENGTH_FRACTION * factor).unwrap_or_default()
-}
-
-/// The mean spacing of `level`'s vertices over `store`'s base mesh.
-///
-/// The mean length of the base faces' edges over the quads a face's side holds at `level`: a
-/// footprint estimate, not exact on a curved or uneven mesh.
-fn mean_spacing(store: &TileStore, level: Level) -> f64 {
-    let mesh = store.mesh();
-    let corners = |face| {
-        let corner = |c| {
-            mesh.corner_vertex(face, c)
-                .and_then(|v| mesh.vertex_position(v))
-        };
-        [corner(0), corner(1), corner(2), corner(3)]
-    };
-    let edges = mesh.faces().flat_map(|face| {
-        let [a, b, c, d] = corners(face);
-        [(a, b), (b, c), (c, d), (d, a)]
-    });
-    let lengths = edges.filter_map(|(a, b)| Some(f64::from((a? - b?).length())));
-    let (sum, count) = lengths.fold((0.0, 0_u32), |(sum, count), l| (sum + l, count + 1));
-    if count == 0 {
-        return 0.0;
-    }
-    sum / f64::from(count) / f64::from(level.face_quads())
-}
-
-/// The vertices a dab of `radius` covers over vertices `spacing` apart: `π (r / h)²`, at least
-/// one. With no spacing known, one.
-fn footprint(radius: f32, spacing: f64) -> f64 {
-    if spacing > 0.0 {
-        (PI * (f64::from(radius) / spacing).powi(2)).max(1.0)
-    } else {
-        1.0
-    }
 }
 
 /// The tiles warming evaluates: those of `index`'s level not evaluated in `store` whose boxes

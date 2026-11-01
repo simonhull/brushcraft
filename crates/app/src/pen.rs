@@ -208,6 +208,13 @@ impl PenFrame {
     }
 
     /// The samples the brush reads, oldest first: its strokes' and those out of any stroke.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the brush reads brush_events, which marks strokes elsewhere too"
+        )
+    )]
     pub(crate) fn for_brush(&self) -> impl Iterator<Item = &PenSample> {
         let navigated = |index: usize| {
             self.strokes
@@ -219,6 +226,31 @@ impl PenFrame {
             .enumerate()
             .filter(move |&(index, _)| !navigated(index))
             .map(|(_, sample)| sample)
+    }
+
+    /// What the brush takes from this frame, in order: its strokes' samples and those out of
+    /// any stroke, as [`for_brush`](Self::for_brush) gives them, and where a stroke routed
+    /// elsewhere starts, a [`ForBrush::StrokeElsewhere`] in its place (its samples are
+    /// navigation's), so the brush can end a stroke whose `Up` was lost.
+    pub(crate) fn brush_events(&self) -> impl Iterator<Item = ForBrush<'_>> {
+        let elsewhere = |index: usize| {
+            self.strokes
+                .iter()
+                .find(|(range, _)| range.contains(&index))
+                .is_some_and(|(_, route)| *route != Route::Brush)
+        };
+        self.samples
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, sample)| {
+                if !elsewhere(index) {
+                    Some(ForBrush::Sample(sample))
+                } else if sample.phase == Phase::Down {
+                    Some(ForBrush::StrokeElsewhere)
+                } else {
+                    None
+                }
+            })
     }
 
     /// Where the pen hovers, if it does: kept across frames while it hovers still, so a brush
@@ -252,6 +284,16 @@ impl PenFrame {
             _ => self.strokes.push((index..index + 1, route)),
         }
     }
+}
+
+/// What the brush is given of a frame's pen samples ([`PenFrame::brush_events`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ForBrush<'a> {
+    /// A sample of one of its strokes, or out of any stroke.
+    Sample(&'a PenSample),
+    /// A stroke routed elsewhere (to navigation) starts here: a stroke of the brush's still open
+    /// lost its `Up`.
+    StrokeElsewhere,
 }
 
 /// Where the pen stream comes from, for the overlay.
