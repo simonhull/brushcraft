@@ -227,7 +227,8 @@ mod tests {
         let counted = draw_imprint(&Smoothstep, &imprint, &positions, &mut imprinted);
         assert_eq!(inside, counted, "the same vertices inside");
         assert!(inside > 100 && inside < positions.len(), "a mix: {inside}");
-        for (k, (a, b)) in plain.iter().zip(&imprinted).enumerate() {
+        let pairs = plain.iter().zip(&imprinted).enumerate();
+        for (k, (a, b)) in pairs {
             assert_eq!(a.to_bits(), b.to_bits(), "vertex {k}");
         }
     }
@@ -239,7 +240,8 @@ mod tests {
         let mut out = std::vec![f32::NAN; positions.len()];
         let inside = draw_imprint(&Smoothstep, &imprint, &positions, &mut out);
         assert_eq!(inside, 100, "every point but the rim");
-        for (k, (&p, &o)) in positions.iter().zip(&out).enumerate() {
+        let pairs = positions.iter().zip(&out).enumerate();
+        for (k, (&p, &o)) in pairs {
             let t = p[0];
             if t <= 0.4 {
                 assert_eq!(o, 2.0, "full strength at t = {t}");
