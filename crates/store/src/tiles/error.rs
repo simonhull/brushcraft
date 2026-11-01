@@ -133,6 +133,24 @@ pub enum CacheError {
         /// The budget.
         budget: usize,
     },
+    /// A batch of whole tiles named one tile twice
+    /// ([`TileStore::replace_corrections`](super::TileStore::replace_corrections)). Nothing was
+    /// written.
+    #[error("{0:?} is given twice")]
+    NamedTwice(TileKey),
+    /// A batch of whole tiles changed a border vertex without giving every copy of it the same
+    /// bits: a copy's tile is missing from the batch, or holds other bits there
+    /// ([`TileStore::replace_corrections`](super::TileStore::replace_corrections)). Nothing was
+    /// written.
+    #[error("border vertex ({i}, {j}) of {tile:?} changes without its twins")]
+    TwinsDisagree {
+        /// The tile changing the vertex.
+        tile: TileKey,
+        /// The vertex's column in the tile.
+        i: u32,
+        /// The vertex's row in the tile.
+        j: u32,
+    },
     /// The store found one of its own invariants broken: a bug in the store, never caused by
     /// its input or the file's contents.
     #[error("internal invariant broken")]

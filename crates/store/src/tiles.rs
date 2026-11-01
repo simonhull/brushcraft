@@ -310,7 +310,13 @@ struct Bumped {
 ///   ([`StoreConfig::workers`]) and per prefetch worker, of which only the pages touched are
 ///   committed;
 /// - the bookkeeping: the dependency graph, the pools' indices and the change feed, which grow with
-///   the tiles resident and edited, not with their size.
+///   the tiles resident and edited, not with their size;
+/// - a brush's tiles replayed away from the store (`sculpt`'s `apply_dabs`, through
+///   [`TileStore::kept_prediction`], [`TileStore::cached_correction`] and
+///   [`TileStore::replace_corrections`]): for each tile of a run, copies of its positions,
+///   corrections and stroke state and its deltas, about 130 KB, for at most
+///   [`StoreConfig::kept_predictions`] tiles at once (about 8.3 MB with the default 64), freed when
+///   the run is written.
 ///
 /// That is a few MB besides the budget, ten or so with dozens of workers, plus the stacks.
 pub struct TileStore {

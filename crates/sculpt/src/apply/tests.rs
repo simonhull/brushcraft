@@ -5,6 +5,7 @@ use geom::{CorrectionError, FaceId, Level, TileKey, Vec3};
 use store::{CacheError, Project, SpatialIndex, StoreConfig, Workers};
 use stroke::Dab;
 
+use super::replay::{self, Fault};
 use super::{ApplyStats, SculptError, apply_dabs};
 use crate::draw::{DrawParams, DrawParamsError, draw_step};
 use crate::state::Stroke;
@@ -83,16 +84,42 @@ fn run(workers: Workers, frames: &[usize]) -> (Snapshot, ApplyStats) {
 
 /// [`run`] for a stroke of `count` dabs over a store of `config` (in 1 MiB chunks).
 fn run_over(config: StoreConfig, count: u32, frames: &[usize]) -> (Snapshot, ApplyStats) {
+    let config = config.with_chunk_bytes(1 << 20);
+    run_project(config, count, frames, &[]).expect("a roomy store applies the stroke")
+}
+
+/// [`run_over`] with `config` as it is, `faults` injected; `None` if the project or its index
+/// can't be made, or a call fails (a budget too tight for the stroke).
+fn run_project(
+    config: StoreConfig,
+    count: u32,
+    frames: &[usize],
+    faults: &[Fault],
+) -> Option<(Snapshot, ApplyStats)> {
     let dir = TestDir::new();
     let config = store::ProjectConfig {
-        store: config.with_chunk_bytes(1 << 20),
+        store: config,
         recovery_dir: dir.path().join("recovery"),
     };
-    let mut project = Project::new(geom::cube_sphere(1).unwrap(), config).unwrap();
-    let mut index = SpatialIndex::build(project.store(), level(), |_, _| {}).unwrap();
+    let mut project = Project::new(geom::cube_sphere(1).unwrap(), config).ok()?;
+    let mut index = SpatialIndex::build(project.store(), level(), |_, _| {}).ok()?;
+    for &fault in faults {
+        replay::inject(project.store().id(), fault);
+    }
     let dabs = path(&mut project, count);
     let mut brush_state = Stroke::new(project.store());
-    let stats = apply_with(&mut project, &mut index, &mut brush_state, &dabs, frames);
+    project.begin_stroke().ok()?;
+    let mut stats = ApplyStats::default();
+    let mut rest = dabs.as_slice();
+    for &size in frames.iter().cycle() {
+        if rest.is_empty() {
+            break;
+        }
+        let (frame, after) = rest.split_at(size.min(rest.len()));
+        stats += apply_dabs(project.store(), &mut index, &mut brush_state, frame).ok()?;
+        rest = after;
+    }
+    project.end_unrecorded_stroke().ok()?;
     let tiles = snapshot(project.store(), level());
     let bounds = index
         .bvh()
@@ -105,7 +132,7 @@ fn run_over(config: StoreConfig, count: u32, frames: &[usize]) -> (Snapshot, App
         bounds,
         stroke,
     };
-    (snapshot, stats)
+    Some((snapshot, stats))
 }
 
 /// A store's tiles in bits, its index's bounds and the stroke's state.
@@ -197,9 +224,11 @@ fn a_frame_equals_its_dabs_one_call_each_when_the_stroke_state_runs_out() {
                 stats.tiles_unaccumulated, one_each.tiles_unaccumulated,
                 "{buffers} buffers, frames {frames:?}: the same tiles written per dab"
             );
-            assert!(
-                stats.tiled_dabs > 0,
-                "{buffers} buffers, frames {frames:?}: dabs applied tile by tile"
+            assert_eq!(
+                stats.tiled_dabs,
+                32 - alone_in_frames(32, frames),
+                "{buffers} buffers, frames {frames:?}: every dab of a frame of two or more \
+                 applied tile by tile"
             );
             assert!(
                 framed == alone,
@@ -207,6 +236,60 @@ fn a_frame_equals_its_dabs_one_call_each_when_the_stroke_state_runs_out() {
             );
         }
     }
+}
+
+#[test]
+fn a_run_whose_twins_disagree_is_applied_one_dab_at_a_time_with_the_same_bits() {
+    let config = StoreConfig::new(64 << 20, 1).with_workers(fixed(2));
+    let (alone, _) = run_over(config, 24, &[1]);
+    let broken = config.with_chunk_bytes(1 << 20);
+    let (framed, stats) = run_project(broken, 24, &[24], &[Fault::BreakTwins]).unwrap();
+    assert!(
+        stats.tiled_dabs < 24,
+        "the store refused runs, which were applied one dab at a time: {stats:?}"
+    );
+    assert!(
+        framed == alone,
+        "nothing of a refused run was written: the same bits as a call a dab"
+    );
+}
+
+#[test]
+fn a_frame_equals_its_dabs_one_call_each_under_a_tight_budget_with_predictions_kept() {
+    // From the least budget the stroke fits in up, with predictions kept: whatever room keeping
+    // a run's predictions finds, the frame gives the bits of its dabs one call each.
+    let mesh = geom::cube_sphere(1).unwrap();
+    let config = |budget: usize| {
+        StoreConfig::new(budget, 1)
+            .with_chunk_bytes(64 << 10)
+            .with_kept_predictions(16)
+            .with_stroke_tiles(8)
+            .with_workers(fixed(2))
+    };
+    let minimum = config(0).minimum_budget(&mesh);
+    let budgets = (0..24).map(|k| minimum + k * (256 << 10));
+    let mut applied = 0;
+    for budget in budgets {
+        let Some((alone, _)) = run_project(config(budget), 12, &[1], &[]) else {
+            continue;
+        };
+        let (framed, stats) = run_project(config(budget), 12, &[12], &[])
+            .expect("a frame fits where its dabs one call each do");
+        assert_eq!(stats.tiled_dabs, 12, "{budget} bytes: tile by tile");
+        assert!(framed == alone, "{budget} bytes: the same bits");
+        // No budget here leaves too little room to keep a run's predictions (the cube's
+        // parents stay cached), so the store is made to report it.
+        let (starved, starved_stats) =
+            run_project(config(budget), 12, &[12], &[Fault::StarvePredictions])
+                .expect("a run without room for its predictions doesn't fail the frame");
+        assert_eq!(
+            starved_stats.tiled_dabs, 0,
+            "{budget} bytes: every run one dab at a time"
+        );
+        assert!(starved == alone, "{budget} bytes: the same bits, starved");
+        applied += 1;
+    }
+    assert!(applied > 0, "some budget applies the stroke");
 }
 
 #[test]

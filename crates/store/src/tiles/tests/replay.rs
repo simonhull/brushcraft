@@ -161,3 +161,81 @@ fn a_tile_of_another_side_is_refused_before_anything_is_written() {
     );
     assert_eq!(slots(&store, &keys), before, "nothing written");
 }
+
+#[test]
+fn an_empty_batch_does_nothing_and_begins_no_op() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = new_store(&dir, "empty.bcrf", &mesh, roomy());
+    assert_eq!(store.current_op(), None, "no op yet");
+    store.replace_corrections(&[]).unwrap();
+    assert_eq!(store.current_op(), None, "still none");
+}
+
+#[test]
+fn a_tile_given_twice_is_refused_before_anything_is_written() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = edited(&dir, &mesh, roomy());
+    let keys = finest(&mesh);
+    let key = *keys.first().unwrap();
+    let before = slots(&store, &keys);
+    let mut tile = store.correction(key).unwrap().to_tile();
+    tile.set(5, 5, Vec3::new(0.0, 0.0, 1.0)).unwrap();
+    let refused = store.replace_corrections(&[(key, &tile), (key, &tile)]);
+    assert!(
+        matches!(refused, Err(CacheError::NamedTwice(twice)) if twice == key),
+        "{refused:?}"
+    );
+    assert_eq!(slots(&store, &keys), before, "nothing written");
+}
+
+#[test]
+fn a_border_vertex_changed_without_its_twins_is_refused_before_anything_is_written() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = edited(&dir, &mesh, roomy());
+    let key = *finest(&mesh).first().unwrap();
+    let (i, j) = (0, 9);
+    let region = Region::of_tile(&key);
+    let copies = mesh
+        .topology()
+        .copies(key.face(), key.level(), region.x0() + i, region.y0() + j);
+    let all: Vec<TileKey> = copies.iter().map(|copy| copy.key(key.level())).collect();
+    assert!(all.len() > 1, "the vertex has copies in other tiles");
+    let before = slots(&store, &all);
+    let value = Vec3::new(0.0, 0.0, 0.5);
+    let mut tiles: BTreeMap<TileKey, CorrectionTile> = BTreeMap::new();
+    for copy in &copies {
+        let at = copy.key(key.level());
+        let mut tile = store.correction(at).unwrap().to_tile();
+        tile.set(copy.i, copy.j, value).unwrap();
+        tiles.insert(at, tile);
+    }
+    // The first tile alone: its twins are missing.
+    let alone = [(key, &tiles[&key])];
+    let refused = store.replace_corrections(&alone);
+    assert!(
+        matches!(refused, Err(CacheError::TwinsDisagree { tile, .. }) if tile == key),
+        "a copy missing: {refused:?}"
+    );
+    // Every copy, one with other bits.
+    let other = *all.iter().find(|&&at| at != key).unwrap();
+    let copy = copies
+        .iter()
+        .find(|copy| copy.key(key.level()) == other)
+        .unwrap();
+    tiles
+        .get_mut(&other)
+        .unwrap()
+        .set(copy.i, copy.j, value * 2.0)
+        .unwrap();
+    let differing: Vec<(TileKey, &CorrectionTile)> =
+        tiles.iter().map(|(at, tile)| (*at, tile)).collect();
+    let refused_too = store.replace_corrections(&differing);
+    assert!(
+        matches!(refused_too, Err(CacheError::TwinsDisagree { .. })),
+        "a copy with other bits: {refused_too:?}"
+    );
+    assert_eq!(slots(&store, &all), before, "nothing written");
+}

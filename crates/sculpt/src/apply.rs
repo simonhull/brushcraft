@@ -67,8 +67,9 @@
 //!   Border values are stored exactly. The vertex's owner writes it from its stroke state; each
 //!   other tile writes its copy from a copy of that state, taken from the stroke as the run began
 //!   and carried along with the same arithmetic ([`crate::state::stroke_sum`]), so every copy gets
-//!   the bits the owner's write gives all of them one at a time. The run checks it before writing:
-//!   every copy of a border vertex written is among the run's tiles and holds the same bits.
+//!   the bits the owner's write gives all of them one at a time. The store checks it before writing
+//!   ([`TileStore::replace_corrections`]): every copy of a border vertex written is among the run's
+//!   tiles and holds the same bits, or nothing is written.
 //! - **The stroke's state is decided ahead.** Which tiles hold stroke state, and which are released
 //!   or written per dab, depends on the tiles every dab edits, and so on every tile. The run
 //!   assumes no tile it edits loses its state or goes without, replays its tiles, then makes the
@@ -81,17 +82,21 @@
 //!
 //! What stays once a frame: the neighbours, normals, bounds and refit, and the epoch's close.
 //! The display tiles' bounds are raised once a run, by the run's dabs' displacements summed
-//! ([`TileStore::bump_display_error`]): the same step for the frame's epoch, a bound for each
-//! display tile at least as high as a dab at a time gives.
+//! rounding up ([`TileStore::bump_display_error`], whose own sums round up too): each display
+//! tile's raise is at least the exact sum of the displacements that reach it, so a bound, as a
+//! dab at a time gives one. The two needn't be the same bits: a dab at a time rounds once a
+//! dab, a run once, and a run's sum also covers dabs that reach only some of its tiles.
 //!
 //! ## One dab at a time, still
 //!
 //! A run is applied one dab at a time instead, nothing written by its replay, when its replay
 //! can't stand for it: a tile refuses a value ([`geom::CorrectionError::TooLarge`] or
 //! [`geom::CorrectionError::NotFinite`]: one dab at a time, the dabs before it stay applied, as
-//! "Errors" says), a tile lacks the positions, corrections or prediction it needs, the stroke's
-//! decisions differ again after the second replay, or the twins disagree (none should). A frame
-//! of one dab is applied so too, as a run of one dab needs no prediction and gains nothing.
+//! "Errors" says), a tile lacks the positions, corrections or prediction it needs, the store
+//! has no room to keep the run's predictions, the stroke's decisions differ again after the
+//! second replay, or the store refuses its twins ([`CacheError::TwinsDisagree`], none should).
+//! A frame of one dab is applied so too, as a run of one dab needs no prediction and gains
+//! nothing.
 //!
 //! # The frame's tiles
 //!
@@ -134,7 +139,7 @@
 //! would lose the predictions the store keeps for pinned tiles edited in place, which the next
 //! frames reuse.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
@@ -420,7 +425,7 @@ struct Frame {
     reached: BTreeSet<TileKey>,
     /// The box of each tile of `reached` as it is now, taken after the dab that last moved it;
     /// `None` for one with no finite position.
-    boxes: std::collections::BTreeMap<TileKey, Option<Aabb>>,
+    boxes: BTreeMap<TileKey, Option<Aabb>>,
     /// Every tile whose corrections a dab edited.
     edited: BTreeSet<TileKey>,
     /// Vertex moves, summed over the dabs.
@@ -473,7 +478,8 @@ fn run_dabs(
             Some(_) => {}
             None => {
                 let run_queries = queries.get(first..end).unwrap_or_default();
-                for (k, (imprint, query)) in run.iter().zip(run_queries).enumerate() {
+                let dabs = run.iter().zip(run_queries).enumerate();
+                for (k, (imprint, query)) in dabs {
                     let last = !more && first + k + 1 == imprints.len();
                     run_dab(store, stroke, imprint, query, last, frame, times, laps)?;
                 }
@@ -563,7 +569,10 @@ fn run_dab(
 /// # Errors
 ///
 /// As [`TileStore::evaluate_many`] and [`TileStore::keep_predictions_of`] before anything is
-/// written; as [`TileStore::replace_corrections`] and [`TileStore::bump_display_error`] after.
+/// written (but [`CacheError::Full`] and [`CacheError::OverBudget`] from keeping the
+/// predictions, which leave the run to be applied one dab at a time); as
+/// [`TileStore::replace_corrections`] (nothing written, but the stroke's state readied for the
+/// frame) and [`TileStore::bump_display_error`] after.
 fn run_tiled(
     store: &mut TileStore,
     stroke: &mut Stroke,
@@ -575,8 +584,21 @@ fn run_tiled(
 ) -> Result<Option<Vec<TileKey>>, CacheError> {
     let predicted = imprints.len() > 1;
     store.evaluate_many(keys, Evaluation::Positions)?;
-    if predicted && !store.keep_predictions_of(keys)? {
-        return Ok(None);
+    if predicted {
+        // Too little room to keep the run's predictions isn't the frame's failure: one dab at
+        // a time needs no more room than its pins, which it has.
+        let kept = store.keep_predictions_of(keys);
+        #[cfg(test)]
+        let kept = if replay::injected(store.id(), replay::Fault::StarvePredictions) {
+            Err(CacheError::Full)
+        } else {
+            kept
+        };
+        match kept {
+            Ok(true) => {}
+            Ok(false) | Err(CacheError::Full | CacheError::OverBudget { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        }
     }
     times.evaluate += laps.lap();
     stroke.begin_frame(store);
@@ -596,10 +618,18 @@ fn run_tiled(
             plan = Plan::Granted(grants);
             continue;
         }
-        if !replay::twins_agree(store, &outcomes) {
-            return Ok(None);
-        }
         times.brush += laps.lap();
+        let written = replay::written(&outcomes);
+        if !written.is_empty() {
+            // The store checks the twins before it writes anything; none should disagree (see
+            // "Tile by tile" in the module notes), and a run that broke them is applied one dab
+            // at a time.
+            match store.replace_corrections(&written) {
+                Ok(()) => {}
+                Err(CacheError::TwinsDisagree { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
         let reached = commit_run(store, stroke, outcomes, after, without, frame)?;
         times.edit += laps.lap();
         return Ok(Some(reached));
@@ -624,18 +654,21 @@ fn replay_run(
         plan,
         stroke,
         topology: store.mesh().topology(),
+        #[cfg(test)]
+        break_twins: replay::injected(store.id(), replay::Fault::BreakTwins),
     };
     Some(store.par_map(&inputs, |&input| replay::replay_tile(run, input)))
 }
 
-/// Writes a run's `outcomes` (in key order) and returns the tiles it reached, in key order.
+/// Takes a run's `outcomes` (in key order), its tiles written, as done, and returns the tiles it
+/// reached, in key order.
 ///
-/// The tiles written, whole; the stroke's state, its book `after` the run's dabs; the display
-/// tiles' bounds; and what the frame has done.
+/// The stroke's state, its book `after` the run's dabs; the display tiles' bounds; and what the
+/// frame has done.
 ///
 /// # Errors
 ///
-/// As [`TileStore::replace_corrections`] and [`TileStore::bump_display_error`].
+/// As [`TileStore::bump_display_error`].
 fn commit_run(
     store: &mut TileStore,
     stroke: &mut Stroke,
@@ -644,7 +677,6 @@ fn commit_run(
     without: usize,
     frame: &mut Frame,
 ) -> Result<Vec<TileKey>, CacheError> {
-    let written = store.replace_corrections(&replay::written(&outcomes));
     let reached: Vec<TileKey> = outcomes
         .iter()
         .filter(|outcome| outcome.reached)
@@ -658,11 +690,11 @@ fn commit_run(
         if !outcome.edits.is_empty() {
             frame.edited.insert(outcome.key);
         }
-        frame.vertices += outcome.edits.iter().map(|edit| edit.moved).sum::<usize>();
+        let moved: usize = outcome.edits.iter().map(|edit| edit.moved).sum();
+        frame.vertices += moved;
         finals.extend(outcome.state);
     }
     stroke.end_frame(store, after, finals);
-    written?;
     if store.display_finest().is_some() && displacement > 0.0 {
         store.bump_display_error(&reached, displacement)?;
     }
@@ -675,7 +707,7 @@ fn commit_run(
 /// quantization step of the tiles it was written into (as [`raise_display_bounds`] takes a
 /// dab's), summed rounding up, as the store sums a frame's.
 fn run_displacement(outcomes: &[TileOutcome]) -> f32 {
-    let mut dabs: std::collections::BTreeMap<usize, (f32, f32)> = std::collections::BTreeMap::new();
+    let mut dabs: BTreeMap<usize, (f32, f32)> = BTreeMap::new();
     let edits = outcomes.iter().flat_map(|outcome| outcome.edits.iter());
     for edit in edits {
         let (delta, step) = dabs.entry(edit.dab).or_insert((0.0, 0.0));

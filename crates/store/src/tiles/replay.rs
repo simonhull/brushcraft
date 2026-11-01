@@ -10,9 +10,13 @@
 
 use std::collections::BTreeSet;
 
-use geom::{CorrectionError, CorrectionTile, CorrectionView, Prediction, TileKey, Vec3};
+use geom::{
+    CorrectionError, CorrectionTile, CorrectionView, Prediction, Region, TileKey, Vec3, VertexCopy,
+};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use super::TileStore;
+use super::edit::border_order;
 use super::error::{CacheError, Invariant};
 use super::round::{
     Held, Predict, RoundTask, Tiles, each_parallel, keep_first, list_parents, predict_tile,
@@ -121,13 +125,14 @@ impl TileStore {
         keys: &[TileKey],
         held: &Held,
     ) -> Result<Vec<Prediction>, CacheError> {
-        let tasks: Vec<RoundTask> = keys
+        let tasks: Result<Vec<RoundTask>, Invariant> = keys
             .iter()
             .map(|key| {
                 let id: Option<SlotId<CorrectionSlot>> = self.corrections.find(key);
                 id.map(|id| (*key, id)).ok_or(Invariant::NotHeld(*key))
             })
-            .collect::<Result<_, _>>()?;
+            .collect();
+        let tasks = tasks?;
         let mut scratch = self.take_scratch(tasks.len());
         let made = self.predict_tasks(&tasks, held, &mut scratch);
         self.scratch = scratch;
@@ -188,26 +193,36 @@ impl TileStore {
     /// side, scale, interior and border, the bits given. Each tile's corrections become those
     /// of its [`CorrectionTile`], and the tile is marked written as an edit marks it (dirty, on
     /// the change feed with the op, in the open epoch of the stale-tile feed) and its
-    /// evaluations dropped, as [`TileStore::update_tiles`] does; in the order given, no tile
-    /// twice.
+    /// evaluations dropped, as [`TileStore::update_tiles`] does. An empty slice does nothing,
+    /// and begins no op.
     ///
     /// For a caller that edited copies of the tiles away from the store
     /// ([`CorrectionView::to_tile`]) with [`geom::CorrectionViewMut`]'s own writes, which so
     /// hold what the store's edits would have written. Unlike [`TileEdit::set`](super::TileEdit),
-    /// it doesn't carry a border vertex's value to the copies other tiles hold: **the caller
-    /// keeps twins agreeing**, writing every tile holding a copy of a border vertex it changes,
-    /// with the same value, in the same call.
+    /// it doesn't carry a border vertex's value to the copies other tiles hold: the batch must
+    /// hold them. Every border vertex whose value changes must have each of its copies in
+    /// another tile of `tiles`, holding the same bits; the call checks it, on the workers, and
+    /// refuses a batch that breaks it, so twins never disagree.
+    ///
+    /// Every tile is loaded and pinned, and the batch checked, before anything is written: an
+    /// error leaves every tile as it was (an op may have been begun).
     ///
     /// # Errors
     ///
-    /// [`CacheError::NotATile`] or [`CacheError::OpsExhausted`], and
+    /// Before anything is written: [`CacheError::NotATile`] or [`CacheError::OpsExhausted`];
     /// [`CacheError::Correction`] with [`CorrectionError::BadSide`] for a tile whose side isn't
-    /// its key's, before anything is written; as [`TileStore::edit_tile`] for a tile that
-    /// can't be loaded, which stops the call there, the tiles before it written.
+    /// its key's; [`CacheError::NamedTwice`] for a tile given twice;
+    /// [`CacheError::TwinsDisagree`] for a changed border vertex whose copy is missing from
+    /// the batch or holds other bits; as [`TileStore::edit_tile`] for a tile that can't be
+    /// loaded. [`CacheError::Internal`] for a stale handle while writing (never: the tiles are
+    /// pinned).
     pub fn replace_corrections(
         &mut self,
         tiles: &[(TileKey, &CorrectionTile)],
     ) -> Result<(), CacheError> {
+        if tiles.is_empty() {
+            return Ok(());
+        }
         self.drop_uncovered_bumps()?;
         self.settle_display()?;
         self.sync_pins()?;
@@ -219,13 +234,69 @@ impl TileStore {
                 tile.side(),
             )));
         }
+        let mut sorted: Vec<(TileKey, usize)> = keys.iter().copied().zip(0..).collect();
+        sorted.sort_unstable();
+        let twice = sorted.windows(2).find_map(|pair| match pair {
+            [(first, _), (second, _)] if first == second => Some(*first),
+            _ => None,
+        });
+        if let Some(key) = twice {
+            return Err(CacheError::NamedTwice(key));
+        }
         let op = self.edit_op()?;
+        let mut ids: Vec<SlotId<CorrectionSlot>> = Vec::with_capacity(tiles.len());
+        let mut loaded = Ok(());
+        for &key in &keys {
+            match self.load_pinned(key) {
+                Ok(id) => ids.push(id),
+                Err(e) => {
+                    loaded = Err(e);
+                    break;
+                }
+            }
+        }
+        let checked = loaded.and_then(|()| self.check_twins(tiles, &sorted, &ids));
+        let mut outcome = checked.and_then(|()| self.write_all(tiles, &ids, op));
+        for &id in &ids {
+            keep_first(&mut outcome, self.corrections.unpin(id));
+        }
+        outcome
+    }
+
+    /// `key`'s correction slot, loaded and pinned, for the caller to unpin.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::load_correction`]; [`CacheError::Internal`] for a stale handle. Nothing
+    /// stays pinned then.
+    fn load_pinned(&mut self, key: TileKey) -> Result<SlotId<CorrectionSlot>, CacheError> {
+        let id = self.load_correction(key)?;
+        self.corrections.pin(id)?;
+        Ok(id)
+    }
+
+    /// Writes each of `tiles` into its slot of `ids` (loaded and pinned, the batch checked),
+    /// marks each written with `op`, and drops the evaluations that followed from them.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Internal`] for a stale handle (never: the slots are pinned); the tiles
+    /// written before it stay written, and their evaluations are dropped.
+    fn write_all(
+        &mut self,
+        tiles: &[(TileKey, &CorrectionTile)],
+        ids: &[SlotId<CorrectionSlot>],
+        op: crate::op::OpId,
+    ) -> Result<(), CacheError> {
         let mut written = Vec::with_capacity(tiles.len());
         let mut outcome = Ok(());
-        for &(key, tile) in tiles {
-            let replaced = self.replace_one(key, tile, op);
-            if replaced.is_err() {
-                outcome = replaced;
+        let slots = tiles.iter().zip(ids);
+        for (&(key, tile), &id) in slots {
+            let wrote = self
+                .write_whole(id, tile)
+                .and_then(|()| self.mark_written(key, id, op));
+            if wrote.is_err() {
+                outcome = wrote;
                 break;
             }
             written.push(key);
@@ -234,26 +305,67 @@ impl TileStore {
         outcome
     }
 
-    /// [`TileStore::replace_corrections`] for one tile: loaded and pinned, its slot written,
-    /// marked written, unpinned.
+    /// Checks that `tiles` keep twins agreeing (see [`TileStore::replace_corrections`]): every
+    /// border vertex whose bits differ from those stored in its slot of `ids` has each copy in
+    /// another tile of the batch, with the same bits. `sorted` is each tile's key with its place
+    /// in `tiles`, in key order. Each tile is checked on the workers.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::load_correction`]; [`CacheError::Internal`] for a stale handle.
-    fn replace_one(
-        &mut self,
-        key: TileKey,
-        tile: &CorrectionTile,
-        op: crate::op::OpId,
+    /// [`CacheError::TwinsDisagree`] for the first such vertex, in the batch's order;
+    /// [`CacheError::Internal`] for a stale handle.
+    fn check_twins(
+        &self,
+        tiles: &[(TileKey, &CorrectionTile)],
+        sorted: &[(TileKey, usize)],
+        ids: &[SlotId<CorrectionSlot>],
     ) -> Result<(), CacheError> {
-        let id = self.load_correction(key)?;
-        self.corrections.pin(id)?;
-        let written = self
-            .write_whole(id, tile)
-            .and_then(|()| self.mark_written(key, id, op));
-        let mut outcome = written;
-        keep_first(&mut outcome, self.corrections.unpin(id));
-        outcome
+        let topology = self.mesh.topology();
+        let pool = &self.corrections;
+        let value = |key: &TileKey, i: u32, j: u32| {
+            let at = sorted.binary_search_by_key(key, |&(k, _)| k).ok()?;
+            let &(_, n) = sorted.get(at)?;
+            tiles.get(n)?.1.get(i, j)
+        };
+        let check =
+            |(&(key, tile), &id): (&(TileKey, &CorrectionTile), &SlotId<CorrectionSlot>)| {
+                let stored = pool
+                    .get(id)
+                    .ok_or(Invariant::StaleHandle)?
+                    .view()
+                    .map_err(Invariant::CorrectionSlot)?;
+                let border = topology.tile_border(&key);
+                let region = Region::of_tile(&key);
+                let level = key.level();
+                let ring = border_order(key.side());
+                for (i, j) in ring {
+                    let (Some(new), Some(old)) = (tile.get(i, j), stored.get(i, j)) else {
+                        return Err(CacheError::TwinsDisagree { tile: key, i, j });
+                    };
+                    if new.to_bits() == old.to_bits() {
+                        continue;
+                    }
+                    let copies: Vec<VertexCopy> = match border.as_ref().and_then(|b| b.copies(i, j))
+                    {
+                        Some(copies) => copies.to_vec(),
+                        None => topology
+                            .copies(key.face(), level, region.x0() + i, region.y0() + j)
+                            .to_vec(),
+                    };
+                    let agree = copies.iter().all(|copy| {
+                        value(&copy.key(level), copy.i, copy.j)
+                            .is_some_and(|theirs| theirs.to_bits() == new.to_bits())
+                    });
+                    if !agree {
+                        return Err(CacheError::TwinsDisagree { tile: key, i, j });
+                    }
+                }
+                Ok(())
+            };
+        let checks: Vec<Result<(), CacheError>> = self
+            .workers
+            .install(|| tiles.par_iter().zip(ids.par_iter()).map(check).collect());
+        checks.into_iter().collect()
     }
 
     /// Copies `tile` into correction slot `id`, whose tile has the same side.

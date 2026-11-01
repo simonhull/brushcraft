@@ -343,7 +343,8 @@ impl TileStore {
         let mut to_read = Vec::new();
         for key in readers.difference(&stale) {
             if let Some(bumped) = self.bumped.get_mut(key) {
-                bumped.extra += raise;
+                // Rounded up, so the sum stays at least the bumps' exact sum.
+                bumped.extra = (bumped.extra + raise).next_up();
                 bumped
                     .finest
                     .extend(moved.iter().filter(|f| covers(key, f)));

@@ -54,7 +54,8 @@ impl Plan {
         let mut grants = Grants::new();
         let mut released = Vec::new();
         let mut without = 0;
-        for (dab, mut tiles) in edited.into_iter().enumerate() {
+        let per_dab = edited.into_iter().enumerate();
+        for (dab, mut tiles) in per_dab {
             tiles.sort_unstable();
             let given = book.begin_dab(&tiles, &mut released);
             let granted = tiles.into_iter().zip(given);
@@ -104,6 +105,52 @@ pub(super) struct Run<'a> {
     pub(super) stroke: &'a Stroke,
     /// The mesh's topology: the copies and owners of border vertices.
     pub(super) topology: &'a Topology,
+    /// Whether the tiles write their copies of a neighbour's border vertices off by one, as a
+    /// broken replay would: the tests' way to see the store refuse the run's twins, and the run
+    /// applied one dab at a time ([`Fault::BreakTwins`]).
+    #[cfg(test)]
+    pub(super) break_twins: bool,
+}
+
+/// A fault the tests inject into the runs over one store (see [`inject`]).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// The runs write their twins broken (see [`Run::break_twins`]).
+    BreakTwins,
+    /// Keeping a run's predictions fails for want of room ([`store::CacheError::Full`]).
+    StarvePredictions,
+}
+
+/// The faults injected, each with the store whose runs it affects: set by a test, for its own
+/// store alone, so tests running beside it are untouched.
+#[cfg(test)]
+static FAULTS: std::sync::Mutex<Vec<(store::StoreId, Fault)>> = std::sync::Mutex::new(Vec::new());
+
+/// Injects `fault` into the runs over store `id`.
+///
+/// # Panics
+///
+/// If another test panicked holding the list.
+#[cfg(test)]
+pub(crate) fn inject(id: store::StoreId, fault: Fault) {
+    FAULTS
+        .lock()
+        .expect("no test panics holding it")
+        .push((id, fault));
+}
+
+/// Whether `fault` is injected into the runs over store `id`.
+///
+/// # Panics
+///
+/// If another test panicked holding the list.
+#[cfg(test)]
+pub(super) fn injected(id: store::StoreId, fault: Fault) -> bool {
+    FAULTS
+        .lock()
+        .expect("no test panics holding it")
+        .contains(&(id, fault))
 }
 
 /// One tile's part of a run, as the store holds it when the run begins.
@@ -146,6 +193,10 @@ pub(super) enum Stopped {
     /// The mesh lists no border for the tile (a tile holding a vertex twice, which no mesh the
     /// store accepts has).
     NoBorder,
+    /// A vertex the replay reads isn't where it looks: its position, delta, correction or
+    /// prediction is missing (never, for a tile and prediction of the same side). Rather than
+    /// carry on from a made-up value, the run is applied one dab at a time.
+    Inconsistent,
 }
 
 /// What a run did to one tile.
@@ -164,8 +215,6 @@ pub(super) struct TileOutcome {
     pub(super) used: Vec<(usize, Grant)>,
     /// Its own stroke state after the run, if a dab wrote it with state.
     pub(super) state: Option<FinalState>,
-    /// The border vertices written, each once.
-    pub(super) border: Vec<(u32, u32)>,
     /// Why the replay stopped, if it did.
     pub(super) stopped: Option<Stopped>,
 }
@@ -332,10 +381,6 @@ struct Replay<'a> {
     edits: Vec<DabEdit>,
     /// The grants its own writes took.
     used: Vec<(usize, Grant)>,
-    /// The border vertices written, each once.
-    border: Vec<(u32, u32)>,
-    /// Whether each vertex is among `border`, row-major.
-    border_seen: Vec<bool>,
 }
 
 /// What a dab moves of a tile, from one scan of the rows it was brushed over.
@@ -411,8 +456,6 @@ impl<'a> Replay<'a> {
             reached: false,
             edits: Vec::new(),
             used: Vec::new(),
-            border: Vec::new(),
-            border_seen: Vec::new(),
         }
     }
 
@@ -429,7 +472,7 @@ impl<'a> Replay<'a> {
             if self.stale {
                 return Err(Stopped::NoPrediction);
             }
-            if self.brush(imprint) > 0 {
+            if self.brush(imprint)? > 0 {
                 self.reached = true;
                 self.apply(dab)?;
             }
@@ -443,7 +486,11 @@ impl<'a> Replay<'a> {
     /// A vertex within the radius lies in its row's box, which so touches the sphere: the rows
     /// left out hold none. The test is the one the frame's tiles are chosen by (see "The frame's
     /// tiles" in the module notes of [`super`]).
-    fn brush(&mut self, imprint: &Imprint) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// [`Stopped::Inconsistent`] for a row the tile's positions or deltas don't hold.
+    fn brush(&mut self, imprint: &Imprint) -> Result<usize, Stopped> {
         let side = self.input.key.side();
         for &j in &self.brushed {
             if let Some(row) = self.deltas.get_mut(row_range(side, j)) {
@@ -464,7 +511,7 @@ impl<'a> Replay<'a> {
                 self.positions.get(range.clone()),
                 self.deltas.get_mut(range),
             ) else {
-                continue;
+                return Err(Stopped::Inconsistent);
             };
             inside += draw_imprint(
                 &Smoothstep,
@@ -473,7 +520,7 @@ impl<'a> Replay<'a> {
                 deltas,
             );
         }
-        inside
+        Ok(inside)
     }
 
     /// Writes dab `dab`'s deltas, as the store's edit of the tile would (interior row by row,
@@ -523,12 +570,11 @@ impl<'a> Replay<'a> {
         }
         self.written = true;
         if self.tile.scale().to_bits() == scale.to_bits() {
-            self.update_positions(&changed);
+            self.update_positions(&changed)
         } else {
             let all: Vec<usize> = (0..self.positions.len()).collect();
-            self.update_positions(&all);
+            self.update_positions(&all)
         }
-        Ok(())
     }
 
     /// Each of `moved`, border vertices, with its owner.
@@ -541,10 +587,10 @@ impl<'a> Replay<'a> {
             return Ok(Vec::new());
         }
         let owners = self.owners()?;
-        let found = moved
+        let found: Option<Vec<Owned>> = moved
             .iter()
             .map(|&vertex| owners.get(&vertex).map(|&owner| (vertex, owner)))
-            .collect::<Option<Vec<_>>>();
+            .collect();
         found.ok_or(Stopped::NoBorder)
     }
 
@@ -555,7 +601,6 @@ impl<'a> Replay<'a> {
     /// [`Stopped::NoBorder`] if the mesh lists no border for the tile.
     fn owners(&mut self) -> Result<&BTreeMap<(u32, u32), Owner>, Stopped> {
         if self.owners.is_none() {
-            self.border_seen = vec![false; self.deltas.len()];
             let key = self.input.key;
             let border = self
                 .run
@@ -586,10 +631,14 @@ impl<'a> Replay<'a> {
         let deltas = &self.deltas;
         let own = &mut self.own;
         let mut view = self.tile.view_mut();
+        let mut missing = false;
         for j in first..=last {
             let row = view.update_interior_row(j, |i, j, c| {
                 let at = at(side, i, j);
-                let delta = deltas.get(at).copied().unwrap_or(0.0);
+                let Some(&delta) = deltas.get(at) else {
+                    missing = true;
+                    return None;
+                };
                 if delta == 0.0 {
                     return None;
                 }
@@ -603,6 +652,9 @@ impl<'a> Replay<'a> {
                 return Err(Stopped::Refused(error));
             }
         }
+        if missing {
+            return Err(Stopped::Inconsistent);
+        }
         Ok(())
     }
 
@@ -612,7 +664,8 @@ impl<'a> Replay<'a> {
     ///
     /// # Errors
     ///
-    /// [`Stopped::Refused`] for a value that isn't finite.
+    /// [`Stopped::Refused`] for a value that isn't finite; [`Stopped::Inconsistent`] for a vertex
+    /// the tile or its deltas don't hold.
     fn write_border(
         &mut self,
         dab: usize,
@@ -622,8 +675,9 @@ impl<'a> Replay<'a> {
     ) -> Result<(), Stopped> {
         let side = self.input.key.side();
         let at = at(side, i, j);
-        let delta = self.deltas.get(at).copied().unwrap_or(0.0);
-        let c = self.tile.get(i, j).unwrap_or(Vec3::ZERO);
+        let (Some(&delta), Some(c)) = (self.deltas.get(at), self.tile.get(i, j)) else {
+            return Err(Stopped::Inconsistent);
+        };
         let z = if owner.own {
             self.own
                 .as_mut()
@@ -634,51 +688,55 @@ impl<'a> Replay<'a> {
                 .copies
                 .entry((i, j))
                 .or_insert_with(|| Entry::found(stroke, &owner.key, owner.at));
-            entry.write(self.run.plan, &owner.key, dab, c.z, delta)
+            let z = entry.write(self.run.plan, &owner.key, dab, c.z, delta);
+            // A copy written with other bits than its owner's: what the store must refuse.
+            #[cfg(test)]
+            let z = if self.run.break_twins { z + 1.0 } else { z };
+            z
         };
         self.tile
             .set(i, j, Vec3::new(c.x, c.y, z))
             .map_err(Stopped::Refused)?;
-        if let Some(seen) = self.border_seen.get_mut(at)
-            && !*seen
-        {
-            *seen = true;
-            self.border.push((i, j));
-        }
         Ok(())
     }
 
     /// The positions of the vertices at `changed` (row-major places, perhaps repeated) from the
     /// tile's prediction and corrections, as the store's evaluation gives them, and the box
     /// grown to hold them; with no prediction, the positions are marked stale instead.
-    fn update_positions(&mut self, changed: &[usize]) {
+    ///
+    /// # Errors
+    ///
+    /// [`Stopped::Inconsistent`] for a vertex the tile, its positions or its prediction don't
+    /// hold.
+    fn update_positions(&mut self, changed: &[usize]) -> Result<(), Stopped> {
         let Some(prediction) = self.input.prediction else {
             self.stale = true;
-            return;
+            return Ok(());
         };
         let side = self.input.key.side();
         let width = usize::try_from(side).unwrap_or(usize::MAX);
         for &at in changed {
             let (Ok(i), Ok(j)) = (u32::try_from(at % width), u32::try_from(at / width)) else {
-                continue;
+                return Err(Stopped::Inconsistent);
             };
-            let (Some(p), Some(frame), Some(c)) = (
+            let (Some(p), Some(frame), Some(c), Some(slot), Some(row)) = (
                 prediction.predicted(i, j),
                 prediction.frame(i, j),
                 self.tile.get(i, j),
+                self.positions.get_mut(at),
+                self.rows.get_mut(at / width),
             ) else {
-                continue;
+                return Err(Stopped::Inconsistent);
             };
             let moved = frame.apply(p, c);
-            if let Some(slot) = self.positions.get_mut(at) {
-                *slot = moved;
-            }
-            if let (Some(point), Some(row)) =
-                (Aabb::from_points([moved]), self.rows.get_mut(at / width))
-            {
+            *slot = moved;
+            // A position that isn't finite is within no dab's radius: its row's box needn't
+            // hold it.
+            if let Some(point) = Aabb::from_points([moved]) {
                 *row = Some(row.map_or(point, |aabb| aabb.union(point)));
             }
         }
+        Ok(())
     }
 
     /// The tile's outcome, the replay stopped for `stopped` or done.
@@ -697,7 +755,6 @@ impl<'a> Replay<'a> {
             edits: self.edits,
             used: self.used,
             state,
-            border: self.border,
             stopped,
         }
     }
@@ -733,44 +790,6 @@ fn at(side: u32, i: u32, j: u32) -> usize {
     usize::try_from(j * side + i).unwrap_or(usize::MAX)
 }
 
-/// Whether the twins of every border vertex the run wrote agree, bit for bit.
-///
-/// Each tile holding a copy of one must be among `outcomes` (in key order) and hold the same
-/// value there, as checked on the store's workers. What
-/// [`TileStore::replace_corrections`] asks of its caller; a run that broke it (none should: see
-/// "Tile by tile" in the module notes of [`super`]) is applied one dab at a time instead.
-pub(super) fn twins_agree(store: &TileStore, outcomes: &[TileOutcome]) -> bool {
-    let topology = store.mesh().topology();
-    let value = |key: &TileKey, i: u32, j: u32| {
-        let at = outcomes
-            .binary_search_by_key(key, |outcome| outcome.key)
-            .ok()?;
-        let outcome = outcomes.get(at)?;
-        outcome.written.as_ref()?.get(i, j)
-    };
-    let agree = store.par_map(outcomes, |outcome| {
-        let key = outcome.key;
-        if outcome.border.is_empty() {
-            return true;
-        }
-        let Some(border) = topology.tile_border(&key) else {
-            return false;
-        };
-        outcome.border.iter().all(|&(i, j)| {
-            let Some(mine) = value(&key, i, j) else {
-                return false;
-            };
-            border.copies(i, j).is_some_and(|copies| {
-                copies.iter().all(|copy| {
-                    value(&copy.key(key.level()), copy.i, copy.j)
-                        .is_some_and(|theirs| theirs.to_bits() == mine.to_bits())
-                })
-            })
-        })
-    });
-    agree.into_iter().all(|agrees| agrees)
-}
-
 /// The tiles `outcomes` wrote, with their corrections, for [`TileStore::replace_corrections`].
 pub(super) fn written(outcomes: &[TileOutcome]) -> Vec<(TileKey, &CorrectionTile)> {
     outcomes
@@ -790,7 +809,8 @@ pub(super) fn all_done(outcomes: &[TileOutcome]) -> bool {
 /// edit (which [`StrokeState::found`] gave it, fresh, from the start).
 pub(super) fn used(plan: &Plan, book: &Book, outcomes: &[TileOutcome]) -> Grants {
     let mut grants = Grants::new();
-    for outcome in outcomes.iter().filter(|outcome| !outcome.used.is_empty()) {
+    let edited = outcomes.iter().filter(|outcome| !outcome.used.is_empty());
+    for outcome in edited {
         let mut used = outcome.used.clone();
         if *plan == Plan::Continuous
             && !book.holds(&outcome.key)
