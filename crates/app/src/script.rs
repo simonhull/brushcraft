@@ -22,15 +22,40 @@
 //!
 //! `--script-speed` runs the same path faster (or slower), every duration divided by it: the
 //! gate's test runs it on lavapipe in a few seconds.
+//!
+//! # The strokes path
+//!
+//! `--script-path strokes` ([`Script::strokes`]) draws two pen strokes on the sphere, for the
+//! pen's latency (sample to present submitted) and a stroke seen from a distance:
+//!
+//! 1. **open**, 3 s still, three units away, as the benchmark path starts;
+//! 2. **approach**, 1.5 s: in to 0.3 above the surface, easing in and out;
+//! 3. **`stroke_near`**, 2 s still: the pen comes into range, then draws a stroke 1.2 s long across
+//!    the point facing the camera, a 40-pixel brush;
+//! 4. **retreat**, 1.5 s: out to three units again, a quarter turn round, to a part of the surface
+//!    not yet drawn close, easing in and out;
+//! 5. **`stroke_far`**, 2 s still: the same stroke seen from a distance, its tiles drawn at display
+//!    levels (the stand-ins' case), a 6-pixel brush: about the near stroke's world size in a 1280 ×
+//!    800 view, below the footprint limit F on the benchmark project;
+//! 6. **settle**, 2 s still: the edits' refresh lands.
+//!
+//! The pen's samples come at the Kamvas's measured 173 Hz, in real time whatever the speed (a
+//! faster run has fewer of them): hovering over the stroke's start from 0.3 s before it touches
+//! (so the brush warms the surface under it), then down, along the path with the pressure rising
+//! and falling, up, and out of range 0.1 s later. Each sample's point lies on the unit sphere, as
+//! the benchmark project is; the frame loop projects it through the camera at the sample's time
+//! ([`Script::pen`]).
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+use input::{Phase, Unit};
+use render::camera::Vec3 as WorldPoint;
 use thiserror::Error;
 
-use crate::camera::Camera;
+use crate::camera::{Camera, Vec3};
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -96,8 +121,16 @@ pub(crate) enum Segment {
     Zoom,
     /// Half a turn, fast.
     Flick,
-    /// Still, after the flick.
+    /// Still, after the flick (or the far stroke).
     Settle,
+    /// In close, to draw a stroke near the camera.
+    Approach,
+    /// Still, close, while a stroke is drawn.
+    StrokeNear,
+    /// Out again, to draw a stroke from a distance.
+    Retreat,
+    /// Still, far, while a stroke is drawn.
+    StrokeFar,
 }
 
 impl Segment {
@@ -109,6 +142,10 @@ impl Segment {
             Self::Zoom => "zoom",
             Self::Flick => "flick",
             Self::Settle => "settle",
+            Self::Approach => "approach",
+            Self::StrokeNear => "stroke_near",
+            Self::Retreat => "retreat",
+            Self::StrokeFar => "stroke_far",
         }
     }
 }
@@ -192,6 +229,173 @@ const BENCHMARK: [Keyframe; 5] = [
     },
 ];
 
+/// The strokes path's close pose: 0.3 above a unit sphere's surface.
+const NEAR: Pose = Pose {
+    distance: 1.3,
+    ..START
+};
+
+/// The strokes path's far pose: three units away again, a quarter turn round.
+const FAR: Pose = Pose {
+    yaw: FRAC_PI_2,
+    ..START
+};
+
+/// The strokes path's camera ([`Script::strokes`]; the module notes say why each segment).
+const STROKES: [Keyframe; 6] = [
+    Keyframe {
+        segment: Segment::Open,
+        seconds: 3.0,
+        to: START,
+        ease: Ease::Linear,
+    },
+    Keyframe {
+        segment: Segment::Approach,
+        seconds: 1.5,
+        to: NEAR,
+        ease: Ease::Smooth,
+    },
+    Keyframe {
+        segment: Segment::StrokeNear,
+        seconds: 2.0,
+        to: NEAR,
+        ease: Ease::Linear,
+    },
+    Keyframe {
+        segment: Segment::Retreat,
+        seconds: 1.5,
+        to: FAR,
+        ease: Ease::Smooth,
+    },
+    Keyframe {
+        segment: Segment::StrokeFar,
+        seconds: 2.0,
+        to: FAR,
+        ease: Ease::Linear,
+    },
+    Keyframe {
+        segment: Segment::Settle,
+        seconds: 2.0,
+        to: FAR,
+        ease: Ease::Linear,
+    },
+];
+
+/// The strokes path's pen strokes, one in each still stroke segment (which start at 4.5 s and
+/// 8 s).
+const PEN_STROKES: [PenStroke; 2] = [
+    PenStroke {
+        hover: 4.7,
+        down: 5.0,
+        up: 6.2,
+        radius: 40.0,
+        span: 0.25,
+    },
+    PenStroke {
+        hover: 8.2,
+        down: 8.5,
+        up: 9.7,
+        radius: 6.0,
+        span: 0.6,
+    },
+];
+
+/// How often a scripted pen reports: the Kamvas's measured rate, in hertz.
+pub(crate) const PEN_RATE: f64 = 173.0;
+
+/// How long after lifting a scripted pen leaves the tablet's range, in seconds.
+const LEAVE_AFTER: f64 = 0.1;
+
+/// One scripted pen stroke: when the pen hovers, touches and lifts, the brush's size, and how
+/// far the stroke runs.
+///
+/// The stroke is drawn across the point of the unit sphere facing the camera (the camera
+/// looks at the sphere's centre), from left to right as the view sees it, bowing up by a
+/// fifth of its span at its middle ([`PenStroke::point`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PenStroke {
+    /// When the pen comes into range over the stroke's start: seconds into the run at speed 1.
+    hover: f64,
+    /// When the tip touches, as `hover`.
+    down: f64,
+    /// When it lifts, as `hover`; after `down`.
+    up: f64,
+    /// The brush's radius for the stroke, in physical pixels, set as the pen comes into range.
+    radius: f32,
+    /// How far the stroke runs across the view, in world units, at the facing point.
+    span: f64,
+}
+
+impl PenStroke {
+    /// The stroke's point a fraction `along` (0 to 1) of the way, seen by `camera`: on the unit
+    /// sphere, about the point facing the camera.
+    fn point(&self, camera: &Camera, along: f64) -> WorldPoint {
+        let eye = camera.eye();
+        let facing = eye * eye.dot(eye).sqrt().recip();
+        let right = camera.axis(Vec3::new(1.0, 0.0, 0.0));
+        let up = camera.axis(Vec3::new(0.0, 1.0, 0.0));
+        let bow = 0.2 * (PI * along).sin();
+        let p = facing + right * ((along - 0.5) * self.span) + up * (bow * self.span);
+        let length = p.dot(p).sqrt();
+        WorldPoint::new(p.x / length, p.y / length, p.z / length)
+    }
+
+    /// The tip's pressure a fraction `along` (0 to 1) of the way: rising from 0.35 to 0.8 at the
+    /// middle and falling back.
+    fn pressure(along: f64) -> Unit {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a pressure in 0.35..=0.8: f32 holds it"
+        )]
+        let pressure = (0.35 + 0.45 * (PI * along).sin()) as f32;
+        Unit::try_from(pressure).unwrap_or(Unit::ONE)
+    }
+}
+
+/// One sample of a scripted pen: when, in what phase, where on the sphere, and how hard.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScriptPen {
+    /// When the pen took it, since the run began.
+    pub(crate) time: Duration,
+    /// Where it is in the stroke's lifecycle.
+    pub(crate) phase: Phase,
+    /// The camera at its time, which `point` is seen through.
+    pub(crate) camera: Camera,
+    /// The point of the surface the pen is over.
+    pub(crate) point: WorldPoint,
+    /// Tip pressure; zero out of contact.
+    pub(crate) pressure: Unit,
+    /// The brush's radius for the stroke, in physical pixels: on the stroke's first sample only.
+    pub(crate) radius: Option<f32>,
+}
+
+/// Which camera path a script runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ScriptPath {
+    /// The renderer's measured run ([`Script::benchmark`]).
+    #[default]
+    Benchmark,
+    /// Two pen strokes, near and far ([`Script::strokes`]).
+    Strokes,
+}
+
+/// Why a text isn't a [`ScriptPath`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{0:?} isn't a script path: benchmark or strokes")]
+pub(crate) struct BadPath(String);
+
+impl FromStr for ScriptPath {
+    type Err = BadPath;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "benchmark" => Ok(Self::Benchmark),
+            "strokes" => Ok(Self::Strokes),
+            _ => Err(BadPath(text.to_owned())),
+        }
+    }
+}
+
 /// How fast a script runs: every duration is divided by it. A positive, finite number.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Speed(f64);
@@ -242,15 +446,104 @@ pub(crate) struct Script {
     keyframes: Vec<Keyframe>,
     /// How fast it runs.
     speed: Speed,
+    /// The pen's strokes, in order; none on the benchmark path.
+    strokes: Vec<PenStroke>,
 }
 
 impl Script {
+    /// The path `path` names, run at `speed`.
+    pub(crate) fn new(path: ScriptPath, speed: Speed) -> Self {
+        match path {
+            ScriptPath::Benchmark => Self::benchmark(speed),
+            ScriptPath::Strokes => Self::strokes(speed),
+        }
+    }
+
     /// The benchmark path (the module notes), run at `speed`.
     pub(crate) fn benchmark(speed: Speed) -> Self {
         Self {
             start: START,
             keyframes: BENCHMARK.to_vec(),
             speed,
+            strokes: Vec::new(),
+        }
+    }
+
+    /// The strokes path (the module notes), run at `speed`.
+    pub(crate) fn strokes(speed: Speed) -> Self {
+        Self {
+            start: START,
+            keyframes: STROKES.to_vec(),
+            speed,
+            strokes: PEN_STROKES.to_vec(),
+        }
+    }
+
+    /// The scripted pen's samples taken after `from` and up to `to` into the run, in order (see
+    /// the module notes).
+    ///
+    /// Samples come every 1/[`PEN_RATE`] s from each stroke's hover, in real time; the first
+    /// is the pen entering range (with the stroke's brush radius), those before the stroke's
+    /// touch hover, the first at or after it is the `Down`, then `Drag`s, then an `Up` at the
+    /// lift, and a `Leave` [`LEAVE_AFTER`] later.
+    pub(crate) fn pen(&self, from: Duration, to: Duration) -> Vec<ScriptPen> {
+        let wanted = |&(time, _): &(f64, Phase)| {
+            let time = Duration::from_secs_f64(time);
+            time > from && time <= to
+        };
+        let samples = self.strokes.iter().flat_map(|stroke| {
+            self.stroke_samples(stroke)
+                .into_iter()
+                .filter(wanted)
+                .map(move |(time, phase)| self.sample(stroke, time, phase))
+        });
+        samples.collect()
+    }
+
+    /// Every sample of `stroke` at this speed, from its hover to its leave: its time in seconds
+    /// into the run, and its phase.
+    fn stroke_samples(&self, stroke: &PenStroke) -> Vec<(f64, Phase)> {
+        let speed = self.speed.get();
+        let (hover, down, up) = (stroke.hover / speed, stroke.down / speed, stroke.up / speed);
+        let period = PEN_RATE.recip();
+        let mut touched = false;
+        let regular = (0_u32..)
+            .map(|k| (k, hover + f64::from(k) * period))
+            .take_while(|&(_, time)| time < up)
+            .map(|(k, time)| {
+                let phase = if time < down {
+                    if k == 0 { Phase::Enter } else { Phase::Hover }
+                } else if std::mem::replace(&mut touched, true) {
+                    Phase::Drag
+                } else {
+                    Phase::Down
+                };
+                (time, phase)
+            });
+        let ends = [(up, Phase::Up), (up + LEAVE_AFTER, Phase::Leave)];
+        let samples = regular.chain(ends);
+        samples.collect()
+    }
+
+    /// `stroke`'s sample at `time` seconds into the run, in `phase` (one of
+    /// [`Script::stroke_samples`]).
+    fn sample(&self, stroke: &PenStroke, time: f64, phase: Phase) -> ScriptPen {
+        let speed = self.speed.get();
+        let (down, up) = (stroke.down / speed, stroke.up / speed);
+        let along = ((time - down) / (up - down)).clamp(0.0, 1.0);
+        let at = Duration::from_secs_f64(time);
+        let camera = self.at(at).pose.camera();
+        ScriptPen {
+            time: at,
+            phase,
+            camera,
+            point: stroke.point(&camera, along),
+            pressure: if matches!(phase, Phase::Down | Phase::Drag) {
+                PenStroke::pressure(along)
+            } else {
+                Unit::ZERO
+            },
+            radius: (phase == Phase::Enter).then_some(stroke.radius),
         }
     }
 

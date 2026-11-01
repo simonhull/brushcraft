@@ -1,7 +1,8 @@
 //! `brushcraft`: the app. Opens a project and draws it, in a window or offscreen.
 //!
 //! The main thread owns the project's tile store (it is `!Send`) and runs the frame loop
-//! ([`frame`]): input, the brush (M1a4), the stale-tile feed, the uploads that keep the
+//! ([`frame`]): input, the brush ([`sculpting`]: the pen sculpts where it touches the surface),
+//! the stale-tile feed, the uploads that keep the
 //! project's tiles on the GPU ([`uploads`]), then the frame handed to the render thread
 //! ([`render_thread`]), which encodes the uploads and the passes, submits and presents them,
 //! while the main thread runs the store's jobs. Frames are made only when something asks for
@@ -11,7 +12,8 @@
 //! overlay ([`overlay`]); the camera orbits, pans and zooms with the mouse and the pen
 //! ([`navigate`], [`camera`]), and the overlay shows the point of the surface under the
 //! pointer, picked by the spatial index ([`pick`]). Keys change how the scene is shown (M the
-//! MatCap, W the wireframe, C the debug view of a colour per cluster), each a shading pass alone.
+//! MatCap, W the wireframe, C the debug view of a colour per cluster), each a shading pass alone,
+//! and the brush (`[` and `]` its size, `-` and `=` its strength).
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
@@ -32,6 +34,7 @@ mod pick;
 mod record;
 mod render_thread;
 mod script;
+mod sculpting;
 #[cfg(test)]
 mod test_dir;
 mod uploads;
@@ -51,18 +54,19 @@ use winit::event_loop::EventLoop;
 
 use crate::cli::Options;
 use crate::frame::schedule::Next;
-use crate::frame::{GpuWait, NoBrush, Owner, Setup, Uploads as _};
+use crate::frame::{Brush, GpuWait, Owner, Setup, Uploads as _};
 use crate::pace::{Pacer, SystemTimer};
 use crate::pick::Picker;
 use crate::render_thread::{Hooks, RenderThread};
+use crate::sculpting::Sculpting;
 use crate::uploads::GpuResidency;
 use crate::window::WindowApp;
 
 /// The site the app's op ids carry: one, until sessions on several machines edit one project.
 const SITE: u16 = 1;
 
-/// The app's frame loop: no brush yet (M1a4), the project's tiles kept on the GPU.
-pub(crate) type AppOwner = Owner<NoBrush, GpuResidency>;
+/// The app's frame loop: the pen sculpts, the project's tiles kept on the GPU.
+pub(crate) type AppOwner = Owner<Sculpting, GpuResidency>;
 
 /// The frame loop over `project` as `setup` says, its tiles kept on `gpu`, wanting its first
 /// frame now, picking the surface under the pointer by the project's spatial index.
@@ -84,7 +88,8 @@ pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, mut setup: Setup) -> Re
         .and_then(|residency| Ok((residency, Picker::load(&mut project)?)));
     match ready {
         Ok((residency, picker)) => {
-            let owner = Owner::new(project, NoBrush, residency, setup, Instant::now());
+            let brush = Sculpting::new(&mut project);
+            let owner = Owner::new(project, brush, residency, setup, Instant::now());
             Ok(match picker {
                 Some(picker) => owner.with_picker(picker),
                 None => owner,
@@ -257,7 +262,10 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
 /// # Errors
 ///
 /// If a frame, the upkeep, the store's jobs or the render thread fails, or the device is lost.
-fn drive_offscreen(owner: &mut AppOwner, render: &mut RenderThread) -> Result<()> {
+fn drive_offscreen<B: Brush>(
+    owner: &mut Owner<B, GpuResidency>,
+    render: &mut RenderThread,
+) -> Result<()> {
     let mut pacer = Pacer::default();
     while !owner.done() {
         let now = Instant::now();

@@ -60,6 +60,12 @@ pub(crate) struct Snapshot<'a> {
     /// Whether still frames are filtered instead of accumulated (the image is too large for the
     /// device to accumulate).
     pub(crate) filter_only: bool,
+    /// The brush's lines ([`crate::frame::Brush::status`]): its settings and keys, its last
+    /// stroke, its last error.
+    pub(crate) brush: &'a [String],
+    /// The pen's latency in the last frame shown that applied dabs, sample to present
+    /// submitted; `None` before any.
+    pub(crate) latency: Option<Duration>,
 }
 
 /// `duration` in milliseconds, to two places.
@@ -91,6 +97,8 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         pick,
         pen,
         filter_only,
+        brush,
+        latency,
     } = *snapshot;
     let view = match look.view {
         SceneView::Shaded => format!("matcap {}", look.material.name()),
@@ -108,19 +116,30 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
             )
         },
     );
-    vec![
+    let latency_line = format!(
+        "latency    {}",
+        latency.map_or_else(
+            || "- (no dabs applied yet)".to_owned(),
+            |latency| format!(
+                "{} ms pen sample to present, last frame with dabs",
+                ms(latency)
+            )
+        )
+    );
+    let mut lines = vec![
         format!(
             "BrushCraft  frame {frame}  {}x{}  {presentation} at {refresh_hz:.1} Hz  {adapter}",
             size.width(),
             size.height()
         ),
         format!(
-            "owner ms   input {}  brush {}  feed {}  uploads {}  upkeep {}  jobs {}",
+            "owner ms   input {}  brush {}  feed {}  uploads {}  upkeep {}  prepare {}  jobs {}",
             ms(owner.input),
             ms(owner.brush),
             ms(owner.feed),
             ms(owner.uploads),
             ms(owner.upkeep),
+            ms(owner.prepare),
             ms(owner.jobs)
         ),
         render_line,
@@ -156,7 +175,10 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         ),
         format!("pick       {}", crate::pick::summary(pick)),
         format!("pen        {pen}"),
-    ]
+    ];
+    lines.extend(brush.iter().cloned());
+    lines.push(latency_line);
+    lines
 }
 
 /// Pixels between glyphs on a line.
@@ -324,6 +346,8 @@ mod tests {
                 lost: 0,
             },
             filter_only: false,
+            brush: &["brush      draw".to_owned()],
+            latency: Some(Duration::from_micros(6250)),
         };
         let text = lines(&snapshot).join("\n");
         for expected in [
@@ -340,6 +364,8 @@ mod tests {
             "matcap glossy  wireframe on",
             "pick       off (no spatial index)",
             "pen        winit's tablet events (fallback: not a Wayland display or window)",
+            "brush      draw",
+            "latency    6.25 ms pen sample to present",
         ] {
             assert!(text.contains(expected), "{expected:?} in:\n{text}");
         }
@@ -352,5 +378,14 @@ mod tests {
         let rest = lines(&without_render).join("\n");
         assert!(rest.contains("render ms  -"), "{rest}");
         assert!(rest.contains("12 tiles at level 5"), "{rest}");
+        let no_latency = Snapshot {
+            latency: None,
+            ..snapshot
+        };
+        let none_yet = lines(&no_latency).join("\n");
+        assert!(
+            none_yet.contains("latency    - (no dabs applied yet)"),
+            "{none_yet}"
+        );
     }
 }

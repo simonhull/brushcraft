@@ -287,6 +287,7 @@ fn settle(owner: &mut Owner<NoBrush, NoUploads>) -> u32 {
                     gpu: Vec::new(),
                     dropped: render::DroppedReadbacks::default(),
                     gpu_finished: number,
+                    submitted: Instant::now(),
                 });
                 made += 1;
             }

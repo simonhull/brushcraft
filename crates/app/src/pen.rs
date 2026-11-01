@@ -188,7 +188,10 @@ impl PenFrame {
     /// Every sample this frame took, oldest first, whatever its route.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the brush step reads it from M1a4's edit loop on")
+        expect(
+            dead_code,
+            reason = "the brush reads for_brush and hover; the tests check the frame whole"
+        )
     )]
     pub(crate) fn samples(&self) -> &[PenSample] {
         &self.samples
@@ -197,17 +200,16 @@ impl PenFrame {
     /// The runs of [`samples`](Self::samples) in a stroke, each with its stroke's route.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the brush step reads it from M1a4's edit loop on")
+        expect(
+            dead_code,
+            reason = "the brush reads for_brush and hover; the tests check the frame whole"
+        )
     )]
     pub(crate) fn strokes(&self) -> &[(Range<usize>, Route)] {
         &self.strokes
     }
 
     /// The samples the brush reads, oldest first: its strokes' and those out of any stroke.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the brush step reads it from M1a4's edit loop on")
-    )]
     pub(crate) fn for_brush(&self) -> impl Iterator<Item = &PenSample> {
         let navigated = |index: usize| {
             self.strokes
@@ -223,10 +225,6 @@ impl PenFrame {
 
     /// Where the pen hovers, if it does: kept across frames while it hovers still, so a brush
     /// can prepare the surface under it before a stroke starts.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the brush step reads it from M1a4's edit loop on")
-    )]
     pub(crate) const fn hover(&self) -> Option<Hover> {
         self.hover
     }

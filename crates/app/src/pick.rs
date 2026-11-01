@@ -41,10 +41,10 @@
 //! frame's input phase. Hovering stays warm, since the tiles under the pointer stay cached.
 //! Not yet measured in a release build on the benchmark project (Task 7's scripted runs can).
 //!
-//! What M1a4's brush calls is [`Picker::pick`]: a pick for any view and point, uncached. Nothing
-//! edits the surface yet, so the index is never refitted here and a still pointer over a still
-//! view isn't picked again; once the brush edits, it refits the index
-//! ([`SpatialIndex::update`]) and the overlay's pick should be redone after an edit.
+//! The brush ([`crate::sculpting`]) shares the picker's index ([`Picker::index_mut`]): it raycasts
+//! through it and brings it up to date after its edits, and a frame whose brush edited the
+//! surface has the next pick made afresh ([`Picker::surface_changed`]), so the overlay's line
+//! follows the edit even under a still pointer.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -275,6 +275,18 @@ impl Picker {
             .load_index(level, |_, _| {})
             .with_context(|| format!("loading the spatial index at level {level}"))?;
         Ok(Some(Self::new(index)))
+    }
+
+    /// The spatial index picks walk, for the brush, which raycasts and edits through it too and
+    /// brings it up to date after its edits ([`crate::frame::BrushContext`]).
+    pub(crate) const fn index_mut(&mut self) -> &mut SpatialIndex {
+        &mut self.index
+    }
+
+    /// The surface moved (the brush edited it): the next [`Picker::update`] picks again, even
+    /// with the pointer and the view where they were.
+    pub(crate) const fn surface_changed(&mut self) {
+        self.since = Since { last: None };
     }
 
     /// The pointer moved to `at` (`None`: it left the window); returns whether that changed it,

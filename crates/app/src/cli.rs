@@ -15,15 +15,17 @@ use render::gpu::AdapterRequest;
 use render::surface::Size;
 
 use crate::frame::RecordSetup;
-use crate::script::{Script, Speed};
+use crate::script::{Script, ScriptPath, Speed};
 
 /// What the app prints when its arguments don't parse.
 pub(crate) const USAGE: &str = "\
 usage: brushcraft PROJECT [OPTIONS]
 
 Opens the project (a .bcrf file outside the source repository) in a window and draws it.
-Drag with the left button or the pen to orbit, with Shift or the right or middle button to
-pan, with Ctrl to zoom; the wheel zooms too.
+The pen sculpts where it touches the model ([ and ] its size, - and = its strength); off the
+model it orbits. Drag with the left button to orbit, with Shift or the right or middle button
+to pan, with Ctrl to zoom; the wheel zooms too. The pen's first barrel button zooms, its
+second pans.
 
 options:
   --level N        the finest level of the display layer the store keeps (default 9)
@@ -35,6 +37,9 @@ options:
   --frames N       draw N frames, every one, then close: a scripted run
   --script         move the camera along the benchmark path (still, an orbit, a zoom in, a
                    flick, still), drawing every frame, then close: the measured run
+  --script-path P  the path --script runs: benchmark (the default), or strokes (still, in
+                   close, a pen stroke, out, a stroke seen from a distance, still): the
+                   pen's latency and a stroke from afar
   --script-speed X run the path X times as fast (default 1)
   --record FILE    with --script, write a JSON line per frame to FILE: GPU phase times, the
                    owner thread's phases, what was drawn, residency and uploads
@@ -81,6 +86,8 @@ pub(crate) struct Options {
     pub(crate) record: Option<PathBuf>,
     /// Whether a scripted run times the GPU's phases, where the device can.
     pub(crate) gpu_timing: bool,
+    /// The path a `--script` run follows.
+    pub(crate) script_path: ScriptPath,
 }
 
 /// The default finest level: the benchmark project's.
@@ -97,7 +104,7 @@ impl Options {
     ///
     /// On an unknown option, an option without its value or with one that doesn't parse, no
     /// project or more than one, `--offscreen` without `--frames` or `--script`, both of those,
-    /// or `--record` or `--script-speed` without `--script`.
+    /// or `--record`, `--script-path` or `--script-speed` without `--script`.
     pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut project = None;
         let mut level = DEFAULT_LEVEL;
@@ -107,6 +114,7 @@ impl Options {
         let mut frames = None;
         let mut script = false;
         let mut speed = None;
+        let mut path = None;
         let mut record = None;
         let mut gpu_timing = true;
         let mut offscreen = false;
@@ -132,6 +140,9 @@ impl Options {
             } else if let Some(value) = flag_value(&arg, "--script-speed", &mut args)? {
                 let parsed: Speed = text(&value, "--script-speed")?.parse()?;
                 speed = Some(parsed);
+            } else if let Some(value) = flag_value(&arg, "--script-path", &mut args)? {
+                let parsed: ScriptPath = text(&value, "--script-path")?.parse()?;
+                path = Some(parsed);
             } else if let Some(value) = flag_value(&arg, "--record", &mut args)? {
                 record = Some(PathBuf::from(value));
             } else if arg == "--script" {
@@ -159,8 +170,8 @@ impl Options {
         );
         let scripted = matches!(run, Run::Script(_));
         ensure!(
-            scripted || (record.is_none() && speed.is_none()),
-            "--record and --script-speed go with --script"
+            scripted || (record.is_none() && speed.is_none() && path.is_none()),
+            "--record, --script-path and --script-speed go with --script"
         );
         let mode = Mode { run, offscreen };
         let default_size = Size::new(DEFAULT_SIZE.0, DEFAULT_SIZE.1)
@@ -176,6 +187,7 @@ impl Options {
             mode,
             record,
             gpu_timing,
+            script_path: path.unwrap_or_default(),
         })
     }
 
@@ -190,7 +202,7 @@ impl Options {
     /// A `--script` run's camera path.
     pub(crate) fn script(&self) -> Option<Script> {
         match self.mode.run {
-            Run::Script(speed) => Some(Script::benchmark(speed)),
+            Run::Script(speed) => Some(Script::new(self.script_path, speed)),
             Run::Open | Run::Frames(_) => None,
         }
     }
@@ -353,6 +365,8 @@ mod tests {
             &["p.bcrf", "--record", "r.jsonl"],
             &["p.bcrf", "--frames", "3", "--script-speed", "2"],
             &["p.bcrf", "--script", "--script-speed", "0"],
+            &["p.bcrf", "--script-path", "strokes"],
+            &["p.bcrf", "--script", "--script-path", "orbit"],
         ] {
             assert!(parse(args).is_err(), "{args:?} refused");
         }
@@ -384,6 +398,13 @@ mod tests {
             mode(Run::Script(Speed::ONE), false),
             "in a window, at real speed"
         );
+        assert_eq!(options.script_path, ScriptPath::Benchmark, "by default");
+        assert_eq!(
+            options.script(),
+            Some(Script::benchmark("2.5".parse().unwrap()))
+        );
+        let strokes = parse(&["p.bcrf", "--script", "--script-path=strokes"]).unwrap();
+        assert_eq!(strokes.script(), Some(Script::strokes(Speed::ONE)));
     }
 
     /// The mode `run`, offscreen or not.

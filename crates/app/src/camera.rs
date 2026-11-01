@@ -257,6 +257,11 @@ impl Camera {
         self.distance
     }
 
+    /// The vertical field of view, in radians.
+    pub(crate) const fn fov_y(&self) -> f64 {
+        self.fov_y
+    }
+
     /// Where the eye is.
     pub(crate) fn eye(&self) -> Vec3 {
         self.target + self.axis(Vec3::new(0.0, 0.0, 1.0)) * self.distance

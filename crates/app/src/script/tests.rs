@@ -152,6 +152,92 @@ fn a_pose_puts_the_eye_where_its_angles_say() {
     for (got, wanted) in [eye.x, eye.y, eye.z].into_iter().zip(want) {
         assert!((got - wanted).abs() < 1e-12, "{eye:?} {want:?}");
     }
-    let up = pose.camera().axis(crate::camera::Vec3::new(0.0, 1.0, 0.0));
+    let up = pose.camera().axis(Vec3::new(0.0, 1.0, 0.0));
     assert!(up.y > 0.0, "upright: {up:?}");
+}
+
+#[test]
+fn the_strokes_path_closes_in_draws_backs_off_and_draws_again() {
+    let script = Script::strokes(Speed::ONE);
+    let names: Vec<Segment> = script.segments().iter().map(|span| span.0).collect();
+    assert_eq!(
+        names,
+        [
+            Segment::Open,
+            Segment::Approach,
+            Segment::StrokeNear,
+            Segment::Retreat,
+            Segment::StrokeFar,
+            Segment::Settle
+        ]
+    );
+    assert!(
+        close(script.at(at(5.5)).pose, NEAR),
+        "close for the first stroke"
+    );
+    assert!(close(script.at(at(9.0)).pose, FAR), "far for the second");
+    assert_eq!(
+        Script::benchmark(Speed::ONE).pen(at(0.0), at(30.0)),
+        Vec::new(),
+        "no pen on the benchmark path"
+    );
+    for (text, path) in [
+        ("benchmark", ScriptPath::Benchmark),
+        ("strokes", ScriptPath::Strokes),
+    ] {
+        assert_eq!(text.parse::<ScriptPath>(), Ok(path));
+    }
+    "orbit".parse::<ScriptPath>().unwrap_err();
+}
+
+#[test]
+fn a_scripted_pen_hovers_touches_drags_lifts_and_leaves_at_its_rate() {
+    let script = Script::strokes(Speed::ONE);
+    let all = script.pen(at(0.0), at(20.0));
+    // Cut anywhere, the same samples.
+    let mut halves = script.pen(at(0.0), at(5.37));
+    halves.extend(script.pen(at(5.37), at(20.0)));
+    assert_eq!(all, halves, "the same samples however the run is cut");
+    let near: Vec<&ScriptPen> = all.iter().filter(|s| s.time < at(7.0)).collect();
+    let phases: Vec<Phase> = near.iter().map(|s| s.phase).collect();
+    assert_eq!(phases.first(), Some(&Phase::Enter));
+    assert_eq!(phases.last(), Some(&Phase::Leave));
+    let down = phases
+        .iter()
+        .position(|&p| p == Phase::Down)
+        .expect("a down");
+    let up = phases.iter().position(|&p| p == Phase::Up).expect("an up");
+    assert!(phases[1..down].iter().all(|&p| p == Phase::Hover));
+    assert!(phases[down + 1..up].iter().all(|&p| p == Phase::Drag));
+    assert_eq!(up + 2, phases.len(), "then the leave");
+    // 0.3 s of hover, 1.2 s of stroke, at 173 Hz.
+    assert!((51..=53).contains(&down), "{down}");
+    assert!((257..=261).contains(&up), "{up}");
+    let gaps = near[..up]
+        .windows(2)
+        .map(|w| w[1].time.checked_sub(w[0].time).unwrap().as_secs_f64());
+    for gap in gaps {
+        assert!((gap * PEN_RATE - 1.0).abs() < 1e-3, "{gap}");
+    }
+    assert_eq!(
+        near[0].radius,
+        Some(40.0),
+        "the stroke's size, as it enters"
+    );
+    assert!(near[1..].iter().all(|s| s.radius.is_none()));
+    let mut pressing = near[down..up].iter().map(|s| s.pressure.get());
+    assert!(pressing.all(|p| (0.34..=0.81).contains(&p)), "pressed");
+    assert!(near[up].pressure.get() == 0.0 && near[0].pressure.get() == 0.0);
+    // Each point lies on the unit sphere, on the side facing the camera.
+    for sample in &all {
+        let p = sample.point;
+        assert!((p.length() - 1.0).abs() < 1e-9, "{p:?}");
+        let eye = sample.camera.eye();
+        assert!(p.x * eye.x + p.y * eye.y + p.z * eye.z > 0.0, "facing");
+    }
+    let far = all
+        .iter()
+        .find(|s| s.time > at(7.0))
+        .expect("the far stroke");
+    assert_eq!(far.radius, Some(6.0));
 }

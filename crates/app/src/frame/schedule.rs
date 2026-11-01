@@ -69,6 +69,9 @@ pub(crate) enum Reason {
     /// The image is still accumulating samples with the camera still (`render::aa`): wanted for
     /// as many frames as [`Scheduler::accumulate`] last asked.
     Accumulating,
+    /// Only the overlay's text changed (a brush setting, from the keyboard): like
+    /// [`Reason::Look`], a frame wanted for this alone shades the last scene again.
+    Overlay,
 }
 
 impl Reason {
@@ -85,6 +88,7 @@ impl Reason {
             Self::Look => 1 << 7,
             Self::Pick => 1 << 8,
             Self::Accumulating => 1 << 9,
+            Self::Overlay => 1 << 10,
         }
     }
 }
@@ -130,6 +134,7 @@ impl fmt::Display for Reasons {
             (Reason::Look, "look"),
             (Reason::Pick, "pick"),
             (Reason::Accumulating, "accumulating"),
+            (Reason::Overlay, "overlay"),
         ];
         let names: Vec<&str> = all
             .into_iter()

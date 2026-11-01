@@ -24,6 +24,7 @@ use crate::camera::Pixel;
 use crate::navigate::Button;
 use crate::pen::PenFrame;
 use crate::render_thread::draw_frame;
+use crate::sculpting::Sculpting;
 use crate::test_dir::TestDir;
 use crate::uploads::GpuResidency;
 
@@ -65,8 +66,8 @@ fn setup(frames: Option<u64>) -> Setup {
 }
 
 /// The render thread's report of frame `number`, shown, with no scene drawn, and finished on the
-/// GPU at once.
-const fn presented(number: u64) -> Presented {
+/// GPU at once, its present submitted now.
+fn presented(number: u64) -> Presented {
     Presented {
         number,
         outcome: Outcome::Presented,
@@ -84,6 +85,7 @@ const fn presented(number: u64) -> Presented {
         gpu: Vec::new(),
         dropped: DroppedReadbacks { cut: 0, timing: 0 },
         gpu_finished: number,
+        submitted: Instant::now(),
     }
 }
 
@@ -140,10 +142,13 @@ struct OneEdit {
 }
 
 impl Brush for OneEdit {
-    fn step(&mut self, project: &mut Project, camera: &Camera, _pen: &PenFrame) -> Result<()> {
+    fn step(&mut self, context: BrushContext<'_>, _pen: &PenFrame) -> Result<BrushReport> {
+        let BrushContext {
+            project, camera, ..
+        } = context;
         self.cameras.push(*camera);
         if std::mem::replace(&mut self.done, true) {
-            return Ok(());
+            return Ok(BrushReport::default());
         }
         let key = TileKey::displacement(FaceId::new(0), Level::new(FINEST)?, 0, 0)?;
         project.begin_stroke()?;
@@ -152,7 +157,7 @@ impl Brush for OneEdit {
             .edit_tile(key, |edit| edit.set(1, 1, Vec3::new(0.0, 0.0, 0.01)))??;
         project.store().close_epoch()?;
         project.end_unrecorded_stroke()?;
-        Ok(())
+        Ok(BrushReport::default())
     }
 }
 
@@ -407,14 +412,14 @@ struct PenLog {
 }
 
 impl Brush for PenLog {
-    fn step(&mut self, _project: &mut Project, _camera: &Camera, pen: &PenFrame) -> Result<()> {
+    fn step(&mut self, _context: BrushContext<'_>, pen: &PenFrame) -> Result<BrushReport> {
         let phases: Vec<input::Phase> = pen.for_brush().map(|sample| sample.phase).collect();
         self.frames
             .push((phases, pen.hover().map(|hover| hover.at)));
-        Ok(())
+        Ok(BrushReport::default())
     }
 
-    fn route(&mut self, _project: &mut Project, _camera: &Camera, _down: &PenSample) -> Route {
+    fn route(&mut self, _context: BrushContext<'_>, _down: &PenSample) -> Route {
         if self.claims {
             Route::Brush
         } else {
@@ -615,8 +620,14 @@ fn epochs_closed_between_frames_want_a_frame_to_take_them() {
         "settled"
     );
     // Work between frames closes an epoch, as a poll installing prefetched tiles does.
+    let context = BrushContext {
+        project: owner.project(),
+        index: None,
+        camera: &Camera::default(),
+        size: Size::new(320, 200).expect("a size"),
+    };
     OneEdit::default()
-        .step(owner.project(), &Camera::default(), &PenFrame::default())
+        .step(context, &PenFrame::default())
         .expect("an edit");
     owner.upkeep(Instant::now()).expect("upkeep");
     assert!(
@@ -737,8 +748,14 @@ fn a_minimised_window_still_runs_its_upkeep() {
     );
     run(&mut owner, 10_000);
     // An edit the recovery writer has yet to flush, then the window is minimised.
+    let context = BrushContext {
+        project: owner.project(),
+        index: None,
+        camera: &Camera::default(),
+        size: Size::new(320, 200).expect("a size"),
+    };
     OneEdit::default()
-        .step(owner.project(), &Camera::default(), &PenFrame::default())
+        .step(context, &PenFrame::default())
         .expect("an edit");
     owner.resize(None);
     let later = Instant::now() + schedule::UPKEEP_INTERVAL;
@@ -1040,9 +1057,9 @@ impl Screen {
 
 /// Makes a frame started at `now`, its jobs and uploads given until `deadline`, draws it on
 /// `screen` and reports it shown; returns whether its scene was drawn.
-fn draw_one(
+fn draw_one<B: Brush>(
     gpu: &Gpu,
-    owner: &mut Owner<NoBrush, GpuResidency>,
+    owner: &mut Owner<B, GpuResidency>,
     screen: &mut Screen,
     now: Instant,
     deadline: Instant,
@@ -1210,7 +1227,7 @@ fn bounds_of(request: &FrameRequest) -> usize {
 
 /// Makes frames on `screen` until they stop by themselves: everything resident, every morph
 /// over.
-fn settle(gpu: &Gpu, owner: &mut Owner<NoBrush, GpuResidency>, screen: &mut Screen) {
+fn settle<B: Brush>(gpu: &Gpu, owner: &mut Owner<B, GpuResidency>, screen: &mut Screen) {
     let mut made = 0;
     loop {
         assert!(made < 300, "frames never stopped");
@@ -1678,4 +1695,80 @@ fn a_display_faster_than_the_gpu_gets_every_frame_read_back() {
             assert_eq!(record_field(frame, &name), "false", "{frame}");
         }
     }
+}
+
+/// Draws a frame of `owner` on `screen` as soon as one is wanted; returns its visibility buffer.
+fn draw_when_wanted<B: Brush>(
+    gpu: &Gpu,
+    owner: &mut Owner<B, GpuResidency>,
+    screen: &mut Screen,
+) -> Vec<u32> {
+    loop {
+        let now = Instant::now();
+        match owner.next(now) {
+            Next::Frame { deadline } => {
+                assert!(draw_one(gpu, owner, screen, now, deadline), "drawn");
+                return screen.ids(gpu);
+            }
+            Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
+            other @ (Next::Render | Next::Gpu | Next::Idle { .. }) => {
+                panic!("a frame is wanted: {other:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn a_dab_shows_in_the_visibility_buffer_of_its_own_frame() {
+    let dir = TestDir::new();
+    let gpu = software_gpu();
+    let mut project = project(&dir);
+    build_display(&mut project);
+    let picker = Picker::load(&mut project)
+        .expect("the index loads")
+        .expect("a display layer");
+    // Strong, so the dab moves the surface by pixels in a 320 × 200 frame.
+    let brush = Sculpting::new(&mut project).with_strength(25.0);
+    let residency = GpuResidency::new(Arc::clone(&gpu), project.store()).expect("residency");
+    let mut owner =
+        Owner::new(project, brush, residency, setup(None), Instant::now()).with_picker(picker);
+    let mut screen = Screen::new(&gpu);
+    settle(&gpu, &mut owner, &mut screen);
+    // A still frame is drawn at the next of the accumulation's jitters, so frames are compared
+    // drawn unjittered: each just after the camera came back from a nudge, so moving.
+    let home = owner.camera;
+    let mut nudged = home;
+    nudged.zoom(1.01);
+    let mut moving_frame = |sculpting: &mut Owner<Sculpting, GpuResidency>| {
+        sculpting.camera = nudged;
+        sculpting.expose();
+        draw_when_wanted(&gpu, sculpting, &mut screen);
+        sculpting.camera = home;
+        sculpting.expose();
+        draw_when_wanted(&gpu, sculpting, &mut screen)
+    };
+    let before = moving_frame(&mut owner);
+    let again = moving_frame(&mut owner);
+    assert!(before == again, "the same view draws the same ids");
+    // A stroke across the sphere's middle, all of it taken by the next frame at `home`.
+    let drags = (1..6).map(|k| (input::Phase::Drag, 150.0 + 4.0 * f64::from(k)));
+    let stroke = std::iter::once((input::Phase::Down, 150.0)).chain(drags);
+    owner.camera = nudged;
+    owner.expose();
+    draw_when_wanted(&gpu, &mut owner, &mut screen);
+    owner.camera = home;
+    for (phase, x) in stroke {
+        owner.pen(PenSample {
+            pressure: input::Unit::ONE,
+            ..pen_sample(phase, (x, 100.0))
+        });
+    }
+    let after = draw_when_wanted(&gpu, &mut owner, &mut screen);
+    assert!(
+        owner.brush.last().dabs_applied > 0,
+        "the frame applied dabs"
+    );
+    let changed = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+    assert!(changed > 0, "the dab's frame drew the moved surface");
+    owner.close().expect("closed");
 }

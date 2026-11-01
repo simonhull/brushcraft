@@ -42,7 +42,16 @@
 //!   `cone_culled` (tiles culled by their normal cone) and `cone_exempt` (tiles their cone would
 //!   cull, drawn because their morph isn't settled), `requested`, `relax_passes`;
 //! - residency as the frame was staged: `resident`, `wanted`, `evicted` (this frame),
-//!   `uploaded_bytes` and `uploaded_tiles`.
+//!   `uploaded_bytes` and `uploaded_tiles`;
+//! - the brush ([`crate::frame::BrushReport`]): `submitted_ms` (when the render thread's present
+//!   call returned, on the frame loop's clock), `sample_to_present_ms` (the pen's latency: from the
+//!   oldest pen sample whose dabs the frame applied, by the pen's de-jittered clock, to the frame's
+//!   present submitted; `null` for a frame that applied none) and `received_to_present_ms` (the
+//!   same from when that sample reached the app), `dabs_applied`, `dabs_carried` (placed but left
+//!   for the next frames, past the frame's budget), `tiles_edited`, and `above_f` (a dab of the
+//!   frame above the footprint limit F, where the latency target doesn't hold). The owner's
+//!   `prepare_ms` is the brush's work after the hand-off (warming the surface under a hovering
+//!   pen), off the latency path.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -52,7 +61,7 @@ use render::residency::ResidencyStats;
 use render::timing::{GpuPhase, GpuTimes};
 use render::{DrawTimes, DroppedReadbacks};
 
-use crate::frame::{CutHeard, OwnerPhases};
+use crate::frame::{BrushReport, CutHeard, OwnerPhases};
 use crate::script::{Script, Segment};
 
 #[cfg(test)]
@@ -177,6 +186,23 @@ impl Line {
         out
     }
 
+    /// The line with the brush's fields: when the present was `submitted`, the pen's
+    /// `latency`, and what the brush step did (`brush`).
+    fn brush_fields(
+        self,
+        submitted: Option<Duration>,
+        latency: Option<Latency>,
+        brush: Option<&BrushReport>,
+    ) -> Self {
+        self.with("submitted_ms", submitted)
+            .with("sample_to_present_ms", latency.map(|l| l.taken))
+            .with("received_to_present_ms", latency.map(|l| l.received))
+            .with("dabs_applied", brush.map(|b| b.dabs_applied))
+            .with("dabs_carried", brush.map(|b| b.dabs_carried))
+            .with("tiles_edited", brush.map(|b| b.tiles_edited))
+            .with("above_f", brush.map(|b| b.above_limit))
+    }
+
     /// The line with residency's fields from `counts`.
     fn residency_fields(self, counts: Option<ResidencyCounts>) -> Self {
         self.with("resident", counts.map(|c| c.resident))
@@ -263,6 +289,22 @@ pub(crate) struct FrameRecord {
     pub(crate) residency: Option<ResidencyCounts>,
     /// Its cut, once read back.
     pub(crate) scene: Option<SceneRecord>,
+    /// What its brush step did.
+    pub(crate) brush: Option<BrushReport>,
+    /// When its present was submitted, on the frame loop's clock, once shown.
+    pub(crate) submitted: Option<Duration>,
+    /// The pen's latency, once shown, if it applied dabs.
+    pub(crate) latency: Option<Latency>,
+}
+
+/// A frame's pen latency: from the oldest pen sample whose dabs it applied to its present
+/// submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Latency {
+    /// From when the pen took the sample, by its de-jittered clock: the M1 spec's measure.
+    pub(crate) taken: Duration,
+    /// From when the sample reached the app.
+    pub(crate) received: Duration,
 }
 
 impl FrameRecord {
@@ -293,6 +335,7 @@ impl FrameRecord {
             .with("feed_ms", owner_ms(owner.feed))
             .with("uploads_ms", owner_ms(owner.uploads))
             .with("upkeep_ms", owner_ms(owner.upkeep))
+            .with("prepare_ms", owner_ms(owner.prepare))
             .with("jobs_ms", owner_ms(owner.jobs))
             .with("acquire_ms", render.map(|r| r.acquire))
             .with("encode_ms", render.map(|r| r.encode))
@@ -320,6 +363,7 @@ impl FrameRecord {
                 self.residency.map(|c| c.request_readback_dropped),
             )
             .with("timing_readback_dropped", dropped.map(|d| d.timing > 0))
+            .brush_fields(self.submitted, self.latency, self.brush.as_ref())
     }
 
     /// How many readbacks the frame made none of: cut, request and timing.
@@ -468,6 +512,22 @@ impl Recorder {
         if let Some(record) = self.frames.get_mut(&frame) {
             record.render = Some(times);
             record.presented = Some(at);
+        }
+    }
+
+    /// Frame `frame`'s brush step did `report`.
+    pub(crate) fn brush(&mut self, frame: u64, report: &BrushReport) {
+        if let Some(record) = self.frames.get_mut(&frame) {
+            record.brush = Some(*report);
+        }
+    }
+
+    /// Frame `frame`'s present was submitted at `submitted` on the frame loop's clock, with the
+    /// pen's `latency` if it applied dabs.
+    pub(crate) fn latency(&mut self, frame: u64, submitted: Duration, latency: Option<Latency>) {
+        if let Some(record) = self.frames.get_mut(&frame) {
+            record.submitted = Some(submitted);
+            record.latency = latency;
         }
     }
 

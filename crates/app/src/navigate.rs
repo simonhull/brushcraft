@@ -15,8 +15,8 @@
 //! window loses focus (when the release may never come); modifiers changing meanwhile don't
 //! switch it. Only motion in a drag and the wheel ask for a frame. Input arrives as [`Input`], the
 //! window's events in our terms (the pen's through its stream, [`crate::pen`]), so the rules here
-//! are tested without a window. The brush takes the pen tip over the model in M1a4; until then the
-//! tip navigates everywhere.
+//! are tested without a window. The pen's tip navigates only off the model: a stroke started on it
+//! is the brush's ([`crate::sculpting`]), unless a barrel button is held.
 
 use crate::camera::{Arcball, Camera, Pixel};
 

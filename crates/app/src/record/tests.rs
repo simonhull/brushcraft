@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 54] = [
+const FRAME_FIELDS: [&str; 62] = [
     "bench",
     "result",
     "frame",
@@ -20,6 +20,7 @@ const FRAME_FIELDS: [&str; 54] = [
     "feed_ms",
     "uploads_ms",
     "upkeep_ms",
+    "prepare_ms",
     "jobs_ms",
     "acquire_ms",
     "encode_ms",
@@ -60,6 +61,13 @@ const FRAME_FIELDS: [&str; 54] = [
     "cut_readback_dropped",
     "request_readback_dropped",
     "timing_readback_dropped",
+    "submitted_ms",
+    "sample_to_present_ms",
+    "received_to_present_ms",
+    "dabs_applied",
+    "dabs_carried",
+    "tiles_edited",
+    "above_f",
 ];
 
 /// The names of `line`'s fields, in order.
@@ -111,6 +119,10 @@ fn a_frame_line_names_every_field_and_nulls_what_never_came() {
         "lod_post_ms",
         "over_budget",
         "wanted",
+        "submitted_ms",
+        "sample_to_present_ms",
+        "dabs_applied",
+        "above_f",
     ] {
         assert_eq!(value(&line, name), &Value::Null, "{name}");
     }
@@ -147,6 +159,20 @@ fn facts_arriving_late_land_on_their_own_frame() {
         ..DrawTimes::default()
     };
     recorder.shown(2, render, ms(40));
+    recorder.brush(
+        2,
+        &BrushReport {
+            dabs_applied: 3,
+            dabs_carried: 1,
+            tiles_edited: 7,
+            ..BrushReport::default()
+        },
+    );
+    let latency = Latency {
+        taken: ms(6),
+        received: ms(5),
+    };
+    recorder.latency(2, ms(39), Some(latency));
     // Frame 2's cut, as residency's frame 11, heard during frame 3.
     let cut = CutHeard {
         frame: 11,
@@ -181,6 +207,13 @@ fn facts_arriving_late_land_on_their_own_frame() {
         "this frame's: 10 − 5"
     );
     assert_eq!(value(&line, "uploaded_tiles"), &Value::Int(2));
+    assert_eq!(value(&line, "submitted_ms"), &Value::Float(39.0));
+    assert_eq!(value(&line, "sample_to_present_ms"), &Value::Float(6.0));
+    assert_eq!(value(&line, "received_to_present_ms"), &Value::Float(5.0));
+    assert_eq!(value(&line, "dabs_applied"), &Value::Int(3));
+    assert_eq!(value(&line, "dabs_carried"), &Value::Int(1));
+    assert_eq!(value(&line, "tiles_edited"), &Value::Int(7));
+    assert_eq!(value(&line, "above_f"), &Value::Bool(false));
     assert!(
         line.to_json().contains(r#""tiles_per_level":[0,6,12]"#),
         "{}",

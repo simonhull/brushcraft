@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use geom::Level;
@@ -162,6 +162,10 @@ pub(crate) struct Presented {
     /// The newest frame the GPU had finished as this one was reported (every one before it
     /// too); 0 for none.
     pub(crate) gpu_finished: u64,
+    /// When the render thread's present call for it returned: its present submitted, the end of
+    /// the pen's latency (the M1 spec's "input sample → present submitted"). For a frame that got
+    /// no image, when its uploads were submitted.
+    pub(crate) submitted: Instant,
 }
 
 /// A hook the render thread calls.
@@ -567,6 +571,7 @@ pub(crate) fn draw_frame(
     let drawn = renderer
         .draw(gpu, target, &inputs, uploads, pre_present)
         .with_context(|| format!("drawing frame {}", frame.number))?;
+    let submitted = Instant::now();
     Ok(Presented {
         number: frame.number,
         outcome: drawn.outcome,
@@ -577,6 +582,7 @@ pub(crate) fn draw_frame(
         gpu: renderer.take_timings(),
         dropped: renderer.dropped_readbacks().since(dropped_before),
         gpu_finished: 0,
+        submitted,
     })
 }
 

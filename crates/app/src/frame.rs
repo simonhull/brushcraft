@@ -9,8 +9,12 @@
 //!    samples queued since the last frame are routed ([`crate::pen::PenRouter`]: a stroke to
 //!    navigation or the brush, the rest to both), navigation's moving the camera after the mouse's
 //!    input, and become the frame's [`PenFrame`];
-//! 2. **brush**: a seam for M1a4's brush step ([`Brush`]; [`NoBrush`] until then), which sees the
-//!    camera as the input left it and the frame's pen samples;
+//! 2. **brush**: the brush's step ([`Brush`]; the app's is [`crate::sculpting::Sculpting`]), which
+//!    sees the camera as the input left it and the frame's pen samples, applies the frame's dabs
+//!    and closes their epoch, so they are drained just after and drawn in this frame; what it
+//!    reports ([`BrushReport`]) goes to a scripted run's record, and the oldest sample it applied
+//!    is kept until the frame is shown, for the pen's latency (sample to present submitted,
+//!    [`Presented::submitted`]);
 //! 3. **feed**: the stale-tile feed is drained: the epochs closed since the last frame;
 //! 4. **uploads**: GPU residency ([`Uploads`], [`crate::uploads::GpuResidency`]) takes the drained
 //!    epochs and stages the frame's tiles from the store, until half the way to the frame's
@@ -19,7 +23,9 @@
 //!    uploads and the scene (residency's buffers, the camera's view, the frame's time and whether
 //!    the camera moves), which it starts encoding at once (the uploads first, then the passes);
 //! 6. **upkeep**: meanwhile the project's recovery writer is ticked and polled;
-//! 7. **jobs**: and the store's resumable jobs (display-layer refresh and rebuild) run until the
+//! 7. **prepare**: the brush's work off the latency path ([`Brush::prepare`]: warming the surface
+//!    under a hovering pen), until the frame's deadline;
+//! 8. **jobs**: and the store's resumable jobs (display-layer refresh and rebuild) run until the
 //!    frame's deadline, at least one slice of them. This frame draws nothing they produce: the
 //!    epochs they close are drained by the next frame, which they want.
 //!
@@ -65,7 +71,7 @@ use render::residency::ResidencyStats;
 use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
 use render::{DrawTimes, Look, SceneView, aa};
-use store::{Drained, JobsReport, Project, StaleCursor, TileStore};
+use store::{Drained, JobsReport, Project, SpatialIndex, StaleCursor, TileStore};
 
 use self::schedule::{Next, Reason, Reasons, Scheduler};
 use crate::camera::{Arcball, Camera, Pixel};
@@ -73,38 +79,150 @@ use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
 use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route};
 use crate::pick::Picker;
-use crate::record::{Recorder, RunInfo, SceneRecord};
+use crate::record::{Latency, Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
-use crate::script::{Script, Segment};
+use crate::script::{Script, ScriptPen, Segment};
 
-/// The brush's place in the frame: M1a4's brush step, run on the owner thread after input and
-/// before the feed is drained, so the epochs its edits close reach the GPU in the same frame.
-pub(crate) trait Brush {
-    /// One frame's brush work on `project`: the pen samples queued since the last frame (`pen`,
-    /// oldest first, with the pen's hover), applied, and their epoch closed. `camera` is the view
-    /// as this frame's input left it, which the samples are projected through.
-    ///
-    /// # Errors
-    ///
-    /// If the store fails the edit.
-    fn step(&mut self, project: &mut Project, camera: &Camera, pen: &PenFrame) -> Result<()>;
+/// What the brush is handed each time the frame loop calls it.
+///
+/// The project, its spatial index over the finest level (picking's, [`crate::pick`]; `None` if
+/// the project keeps no display layer, and then nothing can be brushed), and the view as the
+/// input phase left it.
+#[derive(Debug)]
+pub(crate) struct BrushContext<'a> {
+    /// The open project.
+    pub(crate) project: &'a mut Project,
+    /// Its spatial index over the finest level, shared with picking; a brush that edits brings
+    /// it up to date.
+    pub(crate) index: Option<&'a mut SpatialIndex>,
+    /// The camera, as this frame's input left it.
+    pub(crate) camera: &'a Camera,
+    /// The frame's size.
+    pub(crate) size: Size,
+}
 
-    /// Whether the brush takes the stroke `down` starts, in the input phase, with `camera` as
-    /// the input so far left it: the one place the brush claims strokes. A stroke started with a
-    /// barrel button held navigates whatever this says ([`crate::pen::route`]). By default, and
-    /// until the brush is in, every stroke navigates.
-    fn route(&mut self, _project: &mut Project, _camera: &Camera, _down: &PenSample) -> Route {
-        Route::Navigate
+/// A change to the brush's settings, from the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrushChange {
+    /// A smaller brush.
+    Smaller,
+    /// A larger brush.
+    Larger,
+    /// A weaker brush.
+    Weaker,
+    /// A stronger brush.
+    Stronger,
+}
+
+/// What a frame's brush step did, for the frame loop and a scripted run's record.
+///
+/// Nothing here is particular to sculpting: a painting brush places and applies dabs the same
+/// way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct BrushReport {
+    /// The oldest pen sample whose dabs this frame applied: the frame's latency runs from it to
+    /// its present being submitted. `None` if the frame applied nothing.
+    pub(crate) oldest: Option<SampleTimes>,
+    /// Dabs applied this frame.
+    pub(crate) dabs_applied: usize,
+    /// Dabs placed but left for the next frames, past the frame's budget.
+    pub(crate) dabs_carried: usize,
+    /// Tiles whose data the frame's dabs edited.
+    pub(crate) tiles_edited: usize,
+    /// Whether one of the frame's dabs was above the footprint limit F (the M1 spec's "Big
+    /// brushes"): the pen's latency target holds below it.
+    pub(crate) above_limit: bool,
+    /// Whether the brush has work left for the next frame (dabs carried, a stroke ending): the
+    /// next frame is wanted.
+    pub(crate) busy: bool,
+}
+
+/// When a pen sample was taken and when it reached the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SampleTimes {
+    /// When the pen took it, on its de-jittered clock.
+    pub(crate) taken: Instant,
+    /// When it reached the app.
+    pub(crate) received: Instant,
+}
+
+impl SampleTimes {
+    /// The earlier of two samples' times, field by field.
+    #[must_use]
+    pub(crate) fn earliest(self, other: Self) -> Self {
+        Self {
+            taken: self.taken.min(other.taken),
+            received: self.received.min(other.received),
+        }
     }
 }
 
-/// No brush yet (M1a4): the step does nothing.
+/// The brush's place in the frame: run on the owner thread after input and before the feed is
+/// drained, so the epochs its edits close reach the GPU in the same frame.
+pub(crate) trait Brush {
+    /// One frame's brush work: the pen samples queued since the last frame (`pen`, oldest
+    /// first, with the pen's hover), applied, and their epoch closed. The context's camera is
+    /// the view as this frame's input left it, which the samples are projected through.
+    ///
+    /// # Errors
+    ///
+    /// Only for a failure the app can't go on from; a store error in a stroke ends the stroke
+    /// and shows in the overlay ([`Brush::status`]).
+    fn step(&mut self, context: BrushContext<'_>, pen: &PenFrame) -> Result<BrushReport>;
+
+    /// Whether the brush takes the stroke `down` starts, in the input phase, with the context's
+    /// camera as the input so far left it: the one place the brush claims strokes. A stroke
+    /// started with a barrel button held navigates whatever this says ([`crate::pen::route`]).
+    /// By default every stroke navigates.
+    fn route(&mut self, _context: BrushContext<'_>, _down: &PenSample) -> Route {
+        Route::Navigate
+    }
+
+    /// Work kept off the input's latency path, run after the frame has been handed off and
+    /// before the store's jobs, until `deadline`: warming the surface under a hovering pen.
+    /// Returns whether some is left, which wants the next frame.
+    ///
+    /// # Errors
+    ///
+    /// Only for a failure the app can't go on from.
+    fn prepare(&mut self, _context: BrushContext<'_>, _deadline: Instant) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Applies what the brush still holds and ends its stroke: the project is about to close.
+    ///
+    /// # Errors
+    ///
+    /// Only for a failure the app can't go on from.
+    fn flush(&mut self, _context: BrushContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Changes the brush's settings; returns whether that changed anything, so the overlay
+    /// wants a frame.
+    fn change(&mut self, _change: BrushChange) -> bool {
+        false
+    }
+
+    /// Sets the brush's radius to `pixels` on the screen: a scripted stroke's size.
+    fn set_radius(&mut self, _pixels: f32) {}
+
+    /// The overlay's lines about the brush: its settings and keys, its last stroke, its last
+    /// error. None by default.
+    fn status(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// No brush, for the frame loop's tests: the step does nothing, and every stroke navigates.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct NoBrush;
 
+#[cfg(test)]
 impl Brush for NoBrush {
-    fn step(&mut self, _project: &mut Project, _camera: &Camera, _pen: &PenFrame) -> Result<()> {
-        Ok(())
+    fn step(&mut self, _context: BrushContext<'_>, _pen: &PenFrame) -> Result<BrushReport> {
+        Ok(BrushReport::default())
     }
 }
 
@@ -287,6 +405,9 @@ pub(crate) struct OwnerPhases {
     pub(crate) uploads: Duration,
     /// Ticking and polling the project, after the last frame's hand-off.
     pub(crate) upkeep: Duration,
+    /// The brush's work off the latency path (warming the surface under a hovering pen), after
+    /// the last frame's hand-off.
+    pub(crate) prepare: Duration,
     /// The store's jobs, after the last frame's hand-off.
     pub(crate) jobs: Duration,
 }
@@ -428,6 +549,14 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     recorder: Option<Recorder>,
     /// The record's setting, if the run is recorded.
     run_info: Option<RunInfo>,
+    /// The frame with the render thread and the oldest pen sample whose dabs it applied, until
+    /// it is shown: its latency is measured then.
+    latency_from: Option<(u64, SampleTimes)>,
+    /// The last frame's pen latency, sample to present submitted, for the overlay; `None` until
+    /// a frame applies dabs.
+    latency: Option<Duration>,
+    /// How far into a scripted run its pen samples have been queued: those up to here are.
+    script_pen: Duration,
 }
 
 /// Every frame's phase times in a scripted run, for the summary printed at its end.
@@ -470,6 +599,7 @@ impl PhaseLog {
             owner_phase("feed", |p| p.feed),
             owner_phase("uploads", |p| p.uploads),
             owner_phase("upkeep", |p| p.upkeep),
+            owner_phase("prepare", |p| p.prepare),
             owner_phase("jobs", |p| p.jobs),
             render_phase("acquire", |r| r.acquire),
             render_phase("encode", |r| r.encode),
@@ -501,6 +631,8 @@ fn spread(name: &str, mut times: Vec<Duration>) -> String {
 struct AfterHandOff {
     /// How long the upkeep took.
     upkeep: Duration,
+    /// How long the brush's preparation took.
+    prepare: Duration,
     /// How long the jobs took.
     jobs: Duration,
     /// What the jobs did.
@@ -572,6 +704,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             script: setup.script,
             script_over: false,
             run_info,
+            latency_from: None,
+            latency: None,
+            script_pen: Duration::ZERO,
         }
     }
 
@@ -587,6 +722,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) fn change_look(&mut self, change: LookChange) {
         self.look = change.apply(self.look);
         self.scheduler.want(Reason::Look);
+    }
+
+    /// Changes the brush's settings, and wants a frame for the overlay if that changed them.
+    pub(crate) fn change_brush(&mut self, change: BrushChange) {
+        if self.brush.change(change) {
+            self.scheduler.want(Reason::Overlay);
+        }
     }
 
     /// How the scene is shown.
@@ -820,17 +962,18 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let mut phases = OwnerPhases {
             gpu_wait: self.gpu_waited(now),
             upkeep: self.after_hand_off.upkeep,
+            prepare: self.after_hand_off.prepare,
             jobs: self.after_hand_off.jobs,
             ..OwnerPhases::default()
         };
         let mut lap = Lap::new();
         let time = now.saturating_duration_since(self.clock);
 
-        let segment = self.follow_script(time);
+        let segment = self.follow_script(time, size);
         self.take_input(size)?;
         phases.input = lap.next();
 
-        self.brush_step()?;
+        let brushed = self.brush_step(size)?;
         phases.brush = lap.next();
 
         let drained = self.project.store().drain_stale(&self.cursor);
@@ -851,7 +994,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .context("uploading tiles")?;
         phases.uploads = lap.next();
         self.record_staged((time, segment, moved), &mut uploads);
-        let shading_only = Reasons::default().with(Reason::Look).with(Reason::Pick);
+        if let Some(recorder) = &mut self.recorder {
+            recorder.brush(self.started, &brushed);
+        }
+        let shading_only = Reasons::default()
+            .with(Reason::Look)
+            .with(Reason::Pick)
+            .with(Reason::Overlay);
         let reshade = self.scene_shown
             && !reasons.is_empty()
             && reasons.within(shading_only)
@@ -868,25 +1017,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         });
         self.want_accumulation(reasons, &uploads, (scene.is_some() || reshade, moved));
 
-        let snapshot = Snapshot {
-            frame: self.started,
-            refresh_hz: self.scheduler.interval().as_secs_f64().recip(),
-            presentation: self.presentation,
-            adapter: &self.adapter,
-            size,
-            owner: phases,
-            render: self.render,
-            feed: self.feed,
-            jobs: self.after_hand_off.report,
-            tiles: uploads.summary.as_deref(),
-            scene: self.uploads.scene(),
-            camera: self.camera,
-            look: self.look,
-            pick: self.picker.as_ref().map(Picker::report),
-            pen: &self.pen_status,
-            filter_only: !self.accumulates,
-        };
-        let overlay = overlay::lines(&snapshot);
+        let overlay = self.overlay(size, phases, uploads.summary.as_deref());
         hand_off(FrameRequest {
             number: self.started,
             size,
@@ -900,9 +1031,72 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         })?;
         lap.next();
 
+        let preparing = self.after_hand_off(now, (size, deadline), &mut lap)?;
+        self.log_phases(OwnerPhases {
+            upkeep: self.after_hand_off.upkeep,
+            prepare: self.after_hand_off.prepare,
+            jobs: self.after_hand_off.jobs,
+            ..phases
+        });
+
+        self.want_next(&uploads);
+        if brushed.busy {
+            self.scheduler.want(Reason::Input);
+        }
+        if preparing {
+            self.scheduler.want(Reason::Converging);
+        }
+        Ok(())
+    }
+
+    /// The overlay's lines for the frame being made, of `size`, its owner thread's `phases` so
+    /// far, with the uploads' `tiles` line.
+    fn overlay(&self, size: Size, phases: OwnerPhases, tiles: Option<&str>) -> Vec<String> {
+        let brush = self.brush.status();
+        let snapshot = Snapshot {
+            frame: self.started,
+            refresh_hz: self.scheduler.interval().as_secs_f64().recip(),
+            presentation: self.presentation,
+            adapter: &self.adapter,
+            size,
+            owner: phases,
+            render: self.render,
+            feed: self.feed,
+            jobs: self.after_hand_off.report,
+            tiles,
+            scene: self.uploads.scene(),
+            camera: self.camera,
+            look: self.look,
+            pick: self.picker.as_ref().map(Picker::report),
+            pen: &self.pen_status,
+            filter_only: !self.accumulates,
+            brush: &brush,
+            latency: self.latency,
+        };
+        overlay::lines(&snapshot)
+    }
+
+    /// A frame of `size` started at `now`, once handed off: the upkeep, the brush's preparation,
+    /// then the store's jobs until `deadline` (at least a slice of them), each timed by `lap`
+    /// into [`Owner::after_hand_off`]. Returns whether the brush has preparation left.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::tick`], [`Project::poll`], [`Brush::prepare`] and the store's jobs.
+    fn after_hand_off(
+        &mut self,
+        now: Instant,
+        (size, deadline): (Size, Instant),
+        lap: &mut Lap,
+    ) -> Result<bool> {
         self.project.tick(now).context("ticking the project")?;
         self.project.poll().context("polling the project")?;
         self.after_hand_off.upkeep = lap.next();
+
+        let preparing = self
+            .with_brush(size, |brush, context| brush.prepare(context, deadline))
+            .context("preparing the brush")?;
+        self.after_hand_off.prepare = lap.next();
 
         let deadline = deadline.max(Instant::now() + JobsReport::SLICE_TARGET);
         self.after_hand_off.report = self
@@ -911,26 +1105,41 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .run_jobs(deadline)
             .context("running the store's jobs")?;
         self.after_hand_off.jobs = lap.next();
-        self.log_phases(OwnerPhases {
-            upkeep: self.after_hand_off.upkeep,
-            jobs: self.after_hand_off.jobs,
-            ..phases
-        });
-
-        self.want_next(&uploads);
-        Ok(())
+        Ok(preparing)
     }
 
-    /// The brush phase: the brush steps over the project with the camera and the pen samples the
-    /// input phase left.
+    /// Calls the brush with its context for a frame of `size`: the project, picking's spatial
+    /// index and the camera.
+    fn with_brush<R>(&mut self, size: Size, call: impl FnOnce(&mut B, BrushContext<'_>) -> R) -> R {
+        let context = BrushContext {
+            project: &mut self.project,
+            index: self.picker.as_mut().map(Picker::index_mut),
+            camera: &self.camera,
+            size,
+        };
+        call(&mut self.brush, context)
+    }
+
+    /// The brush phase of a frame of `size`: the brush steps over the project with the camera
+    /// and the pen samples the input phase left. Its edits move the surface, so the next pick
+    /// is made afresh; the oldest sample it applied is kept until the frame is shown, for its
+    /// latency.
     ///
     /// # Errors
     ///
-    /// If the brush's edit fails.
-    fn brush_step(&mut self) -> Result<()> {
-        self.brush
-            .step(&mut self.project, &self.camera, &self.pen_frame)
-            .context("the brush step")
+    /// If the brush fails in a way the app can't go on from.
+    fn brush_step(&mut self, size: Size) -> Result<BrushReport> {
+        let pen = std::mem::take(&mut self.pen_frame);
+        let stepped = self.with_brush(size, |brush, context| brush.step(context, &pen));
+        self.pen_frame = pen;
+        let report = stepped.context("the brush step")?;
+        if report.dabs_applied > 0
+            && let Some(picker) = &mut self.picker
+        {
+            picker.surface_changed();
+        }
+        self.latency_from = report.oldest.map(|oldest| (self.started, oldest));
+        Ok(report)
     }
 
     /// In a recorded run, files the frame just started (at `time`, in `segment`, its view
@@ -963,13 +1172,42 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// In a scripted run, puts the camera where the script has it `time` into the run (the
-    /// queued pointer input is dropped: the script drives the view), and marks the script over
-    /// once `time` reaches its end; returns the segment running. `None` with no script.
-    fn follow_script(&mut self, time: Duration) -> Option<Segment> {
-        let moment = self.script.as_ref()?.at(time);
+    /// queued pointer input is dropped: the script drives the view), queues the script's pen
+    /// samples taken since the last frame, each where its point projects in a view of `size` at
+    /// its own time, and marks the script over once `time` reaches its end; returns the segment
+    /// running. `None` with no script.
+    fn follow_script(&mut self, time: Duration, size: Size) -> Option<Segment> {
+        let script = self.script.as_ref()?;
+        let moment = script.at(time);
+        let due = script.pen(self.script_pen, time);
+        self.script_pen = time;
         self.camera = moment.pose.camera();
         self.input.clear();
         self.script_over |= moment.over;
+        let projected = due.into_iter().filter_map(|sample| {
+            let view = sample.camera.view(size)?;
+            let (x, y, _) = view.pixel(sample.point)?;
+            Some((sample, Pixel { x, y }))
+        });
+        let samples: Vec<(ScriptPen, Pixel)> = projected.collect();
+        for (sample, at) in samples {
+            if let Some(radius) = sample.radius {
+                self.brush.set_radius(radius);
+            }
+            let taken = self.clock + sample.time;
+            self.pen(PenSample {
+                phase: sample.phase,
+                tool: input::Tool::Pen,
+                at,
+                pressure: sample.pressure,
+                distance: None,
+                tilt: None,
+                roll: None,
+                buttons: input::Buttons::default(),
+                timestamp: taken,
+                received: taken,
+            });
+        }
         Some(moment.segment)
     }
 
@@ -988,7 +1226,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.navigator
                 .apply(event, &mut self.camera, &arcball, height);
         }
-        self.route_pen(&arcball, height);
+        self.route_pen(&arcball, size);
         if let Some(picker) = &mut self.picker {
             let view = self.camera.view(size);
             picker
@@ -1000,17 +1238,24 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// Routes the pen samples queued since the last frame into the frame's [`PenFrame`], in
     /// order: navigation's (out of a stroke, or in a stroke routed to it) move the camera, whose
-    /// viewport `arcball` covers and is `height` pixels tall, as they come, so a later `Down` is
-    /// routed with the view the earlier samples left.
-    fn route_pen(&mut self, arcball: &Arcball, height: f64) {
+    /// viewport `arcball` covers and is `size`, as they come, so a later `Down` is routed with
+    /// the view the earlier samples left.
+    fn route_pen(&mut self, arcball: &Arcball, size: Size) {
+        let height = f64::from(size.height());
         self.pen_frame.clear();
         let queued = std::mem::take(&mut self.pen_queue);
         let samples = queued.into_iter();
         for sample in samples {
-            let (brush, project, camera) = (&mut self.brush, &mut self.project, &self.camera);
+            let brush = &mut self.brush;
+            let context = BrushContext {
+                project: &mut self.project,
+                index: self.picker.as_mut().map(Picker::index_mut),
+                camera: &self.camera,
+                size,
+            };
             let route = self
                 .pen_router
-                .route(&sample, |down| brush.route(project, camera, down));
+                .route(&sample, |down| brush.route(context, down));
             if route != Some(Route::Brush) {
                 let mut navigation = self.pen_navigation;
                 navigation.inputs(&sample, |input| {
@@ -1094,9 +1339,23 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// The render thread finished a frame.
     pub(crate) fn shown(&mut self, mut presented: Presented) {
         let gpu = std::mem::take(&mut presented.gpu);
+        let latency = self
+            .latency_from
+            .take_if(|(frame, _)| *frame == presented.number)
+            .map(|(_, oldest)| Latency {
+                taken: presented.submitted.saturating_duration_since(oldest.taken),
+                received: presented
+                    .submitted
+                    .saturating_duration_since(oldest.received),
+            });
+        if let Some(latency) = latency {
+            self.latency = Some(latency.taken);
+        }
         if let Some(recorder) = &mut self.recorder {
             let at = Instant::now().saturating_duration_since(self.clock);
+            let submitted = presented.submitted.saturating_duration_since(self.clock);
             recorder.shown(presented.number, presented.times, at);
+            recorder.latency(presented.number, submitted, latency);
             recorder.dropped(presented.number, presented.dropped);
             for times in gpu {
                 recorder.gpu(times);
@@ -1152,13 +1411,21 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         Ok(())
     }
 
-    /// Closes the project: leaves the feed, then closes it, keeping its recovery file only if
-    /// it has edits no save holds (the app can't ask yet).
+    /// Closes the project: lets the brush apply what it holds and end its stroke, leaves the
+    /// feed, then closes it, keeping its recovery file only if it has edits no save holds (the
+    /// app can't ask yet).
     ///
     /// # Errors
     ///
-    /// As [`Project::close`].
-    pub(crate) fn close(self) -> Result<()> {
+    /// As [`Brush::flush`] and [`Project::close`].
+    pub(crate) fn close(mut self) -> Result<()> {
+        let flushed = match self.size.or_else(|| self.last_view.map(|(_, size)| size)) {
+            Some(size) => {
+                let flushed = self.with_brush(size, B::flush);
+                flushed.context("ending the brush's stroke")
+            }
+            None => Ok(()),
+        };
         let Self {
             mut project,
             cursor,
@@ -1166,7 +1433,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         } = self;
         project.store().unsubscribe_stale(cursor);
         let keep = project.has_unsaved_edits();
-        project.close(keep).context("closing the project")
+        let closed = project.close(keep).context("closing the project");
+        flushed.and(closed)
     }
 
     /// Whether the stale-tile feed holds epochs this loop hasn't drained (or a resync): work
@@ -1179,6 +1447,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     #[cfg(test)]
     pub(crate) const fn camera(&self) -> &Camera {
         &self.camera
+    }
+
+    /// The brush.
+    #[cfg(test)]
+    pub(crate) const fn brush(&self) -> &B {
+        &self.brush
     }
 
     /// The uploads seam.

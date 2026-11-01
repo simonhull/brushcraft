@@ -43,7 +43,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::camera::Pixel;
 use crate::cli::Options;
 use crate::frame::schedule::Next;
-use crate::frame::{GPU_POLL, GpuWait, LookChange, Setup};
+use crate::frame::{BrushChange, GPU_POLL, GpuWait, LookChange, Setup};
 use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
@@ -367,8 +367,13 @@ impl WindowApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed
-                    && !event.repeat
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                if let Some(change) = brush_change(event.physical_key) {
+                    // Held, a brush key repeats: the size or strength keeps changing.
+                    owner.change_brush(change);
+                } else if !event.repeat
                     && let Some(change) = look_change(event.physical_key)
                 {
                     owner.change_look(change);
@@ -391,6 +396,24 @@ fn look_change(key: PhysicalKey) -> Option<LookChange> {
         PhysicalKey::Code(KeyCode::KeyM) => Some(LookChange::MatCap),
         PhysicalKey::Code(KeyCode::KeyW) => Some(LookChange::Wireframe),
         PhysicalKey::Code(KeyCode::KeyC) => Some(LookChange::Clusters),
+        _ => None,
+    }
+}
+
+/// The change to the brush a key makes, if it makes one.
+///
+/// By the key's place on the keyboard, as [`look_change`]. The bracket keys make the brush smaller
+/// (`[`) and larger (`]`); the two keys left of Backspace make it weaker (`-`) and stronger (`=`).
+fn brush_change(key: PhysicalKey) -> Option<BrushChange> {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "KeyCode is non-exhaustive, and only these keys change the brush"
+    )]
+    match key {
+        PhysicalKey::Code(KeyCode::BracketLeft) => Some(BrushChange::Smaller),
+        PhysicalKey::Code(KeyCode::BracketRight) => Some(BrushChange::Larger),
+        PhysicalKey::Code(KeyCode::Minus) => Some(BrushChange::Weaker),
+        PhysicalKey::Code(KeyCode::Equal) => Some(BrushChange::Stronger),
         _ => None,
     }
 }
