@@ -1583,7 +1583,7 @@ impl Residency {
                     gpu,
                     &mut batch,
                     &mut self.ring,
-                    self.tree.buffer(),
+                    &self.tree,
                     self.finest,
                     &planned,
                     |slot| pools.locate(slot).map(|(b, o)| (b.clone(), o)),

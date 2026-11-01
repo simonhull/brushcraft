@@ -393,6 +393,11 @@ impl TileTree {
         &self.buffer
     }
 
+    /// The mesh's topology, which the tiles' neighbours are found through.
+    pub(crate) const fn topology(&self) -> &Topology {
+        &self.topology
+    }
+
     /// The most nodes the tree holds.
     #[must_use]
     pub const fn capacity(&self) -> u32 {

@@ -280,7 +280,7 @@ fn stand_in(
             gpu,
             &mut batch,
             &mut ring,
-            world.tree.buffer(),
+            &world.tree,
             world.finest,
             &stand_ins,
             locate,
@@ -509,6 +509,92 @@ fn the_seam_test_bites_a_stand_in_that_keeps_its_old_border() {
         let (world, edit, _) = bumped_world(gpu, FINEST, AMPLITUDE, &keep_border);
         let failures = seam_failures(&world, &edit);
         assert!(failures.len() > 10, "{} failures", failures.len());
+    });
+}
+
+/// The stand-ins' normals at their seams.
+///
+/// Every border vertex the edit moved, as each stood-in tile holding it on its border draws it
+/// (at any level, on any face), grouped by the vertex (its position's bits, which every copy
+/// holds exactly). Returns the groups whose normals
+/// differ, as text, the vertices held by two tiles or more, and the largest angle, degrees,
+/// between two normals of one vertex.
+fn seam_normals(world: &World, edit: &Edit, stood: &BTreeSet<Place>) -> (Vec<String>, usize, f64) {
+    let n = world.finest.face_quads();
+    let mut by_vertex: BTreeMap<[u32; 3], Vec<(Place, [f32; 3])>> = BTreeMap::new();
+    for &place in stood {
+        let (x0, y0, size) = block(world, place);
+        let quads = place.level().tile_quads();
+        let scale = size / quads;
+        let face = place.face().index();
+        let border = (0..=quads)
+            .flat_map(|j| (0..=quads).map(move |i| (i, j)))
+            .filter(|&(i, j)| i == 0 || j == 0 || i == quads || j == quads);
+        for (i, j) in border {
+            let (x, y) = (x0 + i * scale, y0 + j * scale);
+            let (now, before) = (
+                at(&edit.grids[&face], n, x, y),
+                at(&edit.before[&face], n, x, y),
+            );
+            if now.map(f32::to_bits) == before.map(f32::to_bits) {
+                continue;
+            }
+            let v =
+                world.tiles[&place].vertices[usize::try_from(j * (quads + 1) + i).expect("small")];
+            by_vertex
+                .entry(v.position.map(f32::to_bits))
+                .or_default()
+                .push((place, v.normal));
+        }
+    }
+    let angle = |a: [f32; 3], b: [f32; 3]| {
+        let dot: f64 = (0..3).map(|k| f64::from(a[k]) * f64::from(b[k])).sum();
+        dot.clamp(-1.0, 1.0).acos().to_degrees()
+    };
+    let (mut failures, mut shared, mut worst) = (Vec::new(), 0, 0.0_f64);
+    for copies in by_vertex.values().filter(|copies| copies.len() > 1) {
+        shared += 1;
+        let (first, normal) = copies[0];
+        for &(other, theirs) in &copies[1..] {
+            worst = worst.max(angle(normal, theirs));
+            if theirs.map(f32::to_bits) != normal.map(f32::to_bits) {
+                failures.push(format!("{first:?} {normal:?} against {other:?} {theirs:?}"));
+            }
+        }
+    }
+    (failures, shared, worst)
+}
+
+#[test]
+fn a_stand_in_s_normals_agree_on_both_sides_of_every_seam_across_faces_and_levels_too() {
+    GpuTest::run(|gpu| {
+        let (world, edit, stood) = bumped_world(gpu, FINEST, AMPLITUDE, &[]);
+        let (failures, shared, worst) = seam_normals(&world, &edit, &stood);
+        println!(
+            "{shared} seam vertices, {} differing, worst {worst:.4} deg",
+            failures.len()
+        );
+        assert!(shared >= 30, "{shared} seam vertices");
+        assert!(
+            failures.is_empty(),
+            "{} failures: {:?}",
+            failures.len(),
+            &failures[..5.min(failures.len())]
+        );
+    });
+}
+
+#[test]
+fn the_seam_normal_test_bites_a_border_normal_that_reads_its_own_tile_alone() {
+    GpuTest::run(|gpu| {
+        let own_tile_alone = [("tile = jobs[g].links[edge];", "tile = NONE;")];
+        let (world, edit, stood) = bumped_world(gpu, FINEST, AMPLITUDE, &own_tile_alone);
+        let (failures, _, worst) = seam_normals(&world, &edit, &stood);
+        assert!(
+            failures.len() > 10,
+            "{} failures, worst {worst} deg",
+            failures.len()
+        );
     });
 }
 

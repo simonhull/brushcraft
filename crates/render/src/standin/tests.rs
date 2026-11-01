@@ -389,7 +389,11 @@ fn run_jobs_after_rebuild(store: &mut TileStore, finest: Level) {
 #[test]
 fn the_passes_index_no_local_array_at_run_time() {
     let prefix = shared_source();
-    for own in [REPLACE_WGSL, SETTLE_WGSL] {
+    for own in [
+        REPLACE_WGSL,
+        &format!("{REPLACE_WGSL}{NORMALS_WGSL}"),
+        SETTLE_WGSL,
+    ] {
         let indexed = crate::shader_check::run_time_indexed_locals(&format!("{prefix}{own}"));
         assert!(indexed.is_empty(), "{indexed:?}");
     }

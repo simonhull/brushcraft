@@ -1,19 +1,21 @@
 // Stand-ins (render::standin): a stroke seen from a distance, shown in the frame of its step.
 //
-// The two passes' shared declarations; each pass's own source follows them
-// (standin_replace.wgsl, standin_settle.wgsl), after upload::VERTEX_WGSL, tree::NODE_WGSL and the
+// The passes' shared declarations; each pass's own source follows them (standin_replace.wgsl,
+// then standin_normals.wgsl in the same module; standin_settle.wgsl), after upload::VERTEX_WGSL, tree::NODE_WGSL and the
 // constants render::standin prefixes: TILE_WORDS (a finest tile's words in the scratch), PENDING,
 // EVERYTHING (the cone that covers everything, as its bits) and SLACK.
 //
 // `replace` runs one workgroup per job: a drawn display tile and one edited finest tile under
 // it. Every vertex of the display tile that the finest tile holds takes the finest vertex's
 // exact bits, read from the scratch the frame staged; the job's row keeps the largest distance
-// a vertex moved. `settle` then runs one thread per row: a row that a step made pending sets
+// a vertex moved. `normals` then runs over the same jobs, once every replace is done: each
+// replaced vertex's normal recomputed from the positions (see render::standin, "Normals").
+// `settle` then runs one thread per row: a row that a step made pending sets
 // its tile's bound to the bound before plus the step's displacement plus the larger of the two
 // (see render::standin, "The bound"), and every live row writes its bound and the cone that
 // covers everything into its node, every frame, over whatever the frame's tree upload wrote.
 
-// One display tile and one finest tile under it (render::standin::GpuJob): 32 bytes.
+// One display tile and one finest tile under it (render::standin::GpuJob): 64 bytes.
 struct Job {
     // The display tile's first vertex in its slot buffer.
     base: u32,
@@ -33,6 +35,15 @@ struct Job {
     // Finest vertices between display vertices (bits 0..16), and the finest tile's vertices
     // per side (16..32).
     step: u32,
+    // The finest tiles across the finest tile's edges, on its face or another, by their place in
+    // the scratch, NONE where the scratch doesn't hold one: across j = 0, i = side - 1,
+    // j = side - 1 and i = 0, in that order (tree::NODE_WGSL's neighbours).
+    links: array<u32, 4>,
+    // Per link, where a point one step across the edge lies in the tile across (whose grid may
+    // turn): the point at s along the edge (i on edges 0 and 2, j on 1 and 3) is
+    // origin + s * along + inward there, origin's i in bits 0..8 and j in 8..16, along in
+    // 16..18 and inward in 18..20 as grid steps (+i, +j, -i, -j as 0 to 3).
+    maps: array<u32, 4>,
 }
 
 // One stand-in's row (render::standin::GpuRow): 32 bytes.

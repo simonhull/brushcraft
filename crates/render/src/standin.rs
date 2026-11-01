@@ -5,8 +5,9 @@
 //! tiles still hold what the store last built for them, and the CPU refresh rebuilds them only
 //! later. A **stand-in** is such a resident display tile, rewritten on the GPU in the frame of
 //! the step: every vertex of it that lies inside an edited finest tile takes the exact bits of
-//! the finest vertex it subsamples; every other vertex keeps its stored position, and the
-//! stored normals stay. It is never saved, read back or reused: the refresh's epoch replaces it,
+//! the finest vertex it subsamples, and a normal recomputed from the positions (below,
+//! "Normals"); every other vertex keeps its stored position and normal. It is never saved, read
+//! back or reused: the refresh's epoch replaces it,
 //! swapped in place at the same level with no morph (spec, amended 2026-11-01: a morph from the
 //! refreshed tile's own coarse interpolation drew the stroke's crest as a sawtooth, and the
 //! stand-in is within a few hundredths of a quad edge of the refreshed tile). A cut that coarsens
@@ -44,6 +45,34 @@
 //! it into the tile's node every frame after the frame's tree upload (which writes the node's
 //! stored `e` whenever the CPU's tree marks it), until the row is freed.
 //!
+//! # Normals
+//!
+//! The stored normals of a stand-in's replaced vertices are the surface's before the step: on a
+//! strong stroke 30–34° rms off the refreshed tile's, up to 59° (spec, amended 2026-11-01: they
+//! are recomputed). So once every replace of the frame is done, the normal pass
+//! (`standin_normals.wgsl`) recomputes them from positions, over the same jobs, as central
+//! differences crossed:
+//!
+//! - a vertex inside the display tile, over the tile's own grid (its slot, as drawn);
+//! - a vertex on its border, over the finest grid around it: its four finest neighbours, from the
+//!   scratch, in the job's finest tile or in the one across its edge (the job's links, on its face
+//!   or across the face's edge, whose grid may turn: the link's map says where a point lies there).
+//!   Every tile holding the vertex, at any level, reads the same four points, so both sides of a
+//!   seam compute the same normal: the same bits on one face; across a face's edge, the cross
+//!   product of the same differences in another order and sign, equal but for the rounding of fused
+//!   products, which the encoding below almost always absorbs.
+//!
+//! A finest neighbour the scratch doesn't hold (in a finest tile no stand-in of the frame reads:
+//! the step didn't edit it) is replaced by the vertex itself, a one-sided difference, which the
+//! tile across, not standing in for the step, doesn't share: the step moved no finest vertex
+//! there, so the two differ by about what recomputing from positions costs anyway.
+//!
+//! Each normal goes through the display layer's encoding (octahedral, two signed 12-bit
+//! fractions) and back, so it is one the layer could hold; the roughness term stays the stored
+//! one. Measured on a strong stroke (`standin::tests::diag`), they are within a few degrees of the
+//! refreshed tile's, as close as the refreshed tile's own positions give against its stored
+//! (averaged) normals: the floor for any normal made from positions.
+//!
 //! # A frame
 //!
 //! Residency plans the frame's stand-ins ([`crate::residency`]), stages the finest tiles they
@@ -55,7 +84,7 @@
 use std::collections::BTreeMap;
 
 use bytemuck::{Pod, Zeroable};
-use geom::{FinestNormalCone, Level, TILE_QUADS};
+use geom::{FinestNormalCone, Level, TILE_QUADS, Topology};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding, BufferBindingType,
@@ -65,7 +94,7 @@ use wgpu::{
 use crate::cull::{MAX_GROUPS, entry, pipeline, storage_buffer};
 use crate::gpu::{Gpu, GpuError};
 use crate::residency::{SizeClass, Slot};
-use crate::tree::{NODE_WGSL, NONE, Place};
+use crate::tree::{NODE_WGSL, NONE, Place, TileTree};
 use crate::upload::{Batch, GpuVertex, StagingRing, VERTEX_WGSL};
 
 #[cfg(test)]
@@ -77,6 +106,9 @@ const STANDIN_WGSL: &str = include_str!("standin.wgsl");
 
 /// The replace pass's own source.
 const REPLACE_WGSL: &str = include_str!("standin_replace.wgsl");
+
+/// The normal pass's own source, after [`REPLACE_WGSL`] in the same module.
+const NORMALS_WGSL: &str = include_str!("standin_normals.wgsl");
 
 /// The settle pass's own source.
 const SETTLE_WGSL: &str = include_str!("standin_settle.wgsl");
@@ -179,6 +211,17 @@ struct GpuJob {
     fine: u32,
     /// Finest vertices between display vertices, `| ` the finest tile's side `<< 16`.
     step: u32,
+    /// The finest tiles across the finest tile's edges, on its face or another, by their index
+    /// in the scratch, [`NONE`] where the scratch holds none: in the order of
+    /// [`crate::tree::GpuNode::neighbours`].
+    links: [u32; 4],
+    /// Per link, where a point one step across the edge lies in the tile across, whose grid
+    /// may turn (across a face's edge): the point at `s` along the edge (`i` on edges 0 and 2,
+    /// `j` on 1 and 3) is `origin + s · along + inward` there, with `origin` in bits 0..8 (`i`)
+    /// and 8..16 (`j`), and `along` (bits 16..18) and `inward` (18..20) grid steps, `+i`, `+j`,
+    /// `−i`, `−j` as 0 to 3. Also what keeps a job's bytes a power of two, so that dispatches'
+    /// job lists, padded to whole jobs, start on the device's storage offset alignment.
+    maps: [u32; 4],
 }
 
 /// The bytes of one [`GpuJob`].
@@ -346,7 +389,7 @@ pub(crate) struct StandIn {
 }
 
 /// The stand-in pass: the scratch the frame's edited finest tiles are staged into, the rows,
-/// and the two pipelines.
+/// and the three pipelines.
 ///
 /// Owned by residency, on the owner thread. The scratch and the rows are GPU memory outside the
 /// slot budget ([`StandInPass::kept_bytes`]).
@@ -354,8 +397,11 @@ pub(crate) struct StandIn {
 pub(crate) struct StandInPass {
     /// The replace pipeline.
     replace: ComputePipeline,
-    /// Its bind group layout.
+    /// Its bind group layout, the normal pipeline's too.
     replace_layout: BindGroupLayout,
+    /// The normal pipeline: the replaced vertices' normals from the positions, over the replace
+    /// pass's jobs and bind groups.
+    normals: ComputePipeline,
     /// The settle pipeline.
     settle: ComputePipeline,
     /// Its bind group layout.
@@ -393,8 +439,8 @@ impl StandInPass {
         Self::build(gpu, scratch_tiles, rows, &[])
     }
 
-    /// [`StandInPass::new`] with each `(from, to)` of `patches` replaced in both passes'
-    /// sources, for the tests' bites.
+    /// [`StandInPass::new`] with each `(from, to)` of `patches` replaced in every pass's
+    /// source, for the tests' bites.
     ///
     /// # Errors
     ///
@@ -468,6 +514,17 @@ impl StandInPass {
             &[&replace_layout],
             "replace",
         )?;
+        let mut normals_source = format!("{prefix}{REPLACE_WGSL}{NORMALS_WGSL}");
+        for (from, to) in patches {
+            normals_source = normals_source.replace(from, to);
+        }
+        let normals = pipeline(
+            gpu,
+            "stand-in normals",
+            &normals_source,
+            &[&replace_layout],
+            "normals",
+        )?;
         let mut settle_source = format!("{prefix}{SETTLE_WGSL}");
         for (from, to) in patches {
             settle_source = settle_source.replace(from, to);
@@ -494,6 +551,7 @@ impl StandInPass {
         Ok(Self {
             replace,
             replace_layout,
+            normals,
             settle,
             settle_layout,
             scratch,
@@ -656,9 +714,10 @@ impl StandInPass {
     }
 
     /// Ends the frame: stages the job list of `stand_ins` (each tile's slot found by `locate`,
-    /// in a project whose finest level is `finest`) into `batch` and returns the frame's work,
-    /// the replace pass's dispatches and the settle over the first `rows` rows; `None` if there
-    /// is neither.
+    /// in a project whose finest level is `finest`, its tile tree `tree`) into `batch` and
+    /// returns the frame's work,
+    /// the replace pass's dispatches (the normal pass's too) and the settle over the first
+    /// `rows` rows; `None` if there is neither.
     ///
     /// # Errors
     ///
@@ -672,7 +731,7 @@ impl StandInPass {
         gpu: &Gpu,
         batch: &mut Batch,
         ring: &mut StagingRing,
-        tree: &Buffer,
+        tree: &TileTree,
         finest: Level,
         stand_ins: &[StandIn],
         locate: impl Fn(Slot) -> Option<(Buffer, u64)>,
@@ -681,6 +740,7 @@ impl StandInPass {
         if stand_ins.is_empty() && rows == 0 {
             return Ok(None);
         }
+        let links = Links::of(stand_ins, tree.topology(), finest).table();
         // One dispatch per slot buffer, each at most MAX_GROUPS jobs.
         let mut runs: BTreeMap<(SizeClass, u16), (Buffer, Vec<GpuJob>)> = BTreeMap::new();
         for stand_in in stand_ins {
@@ -690,7 +750,12 @@ impl StandInPass {
             let base = offset / size_of::<GpuVertex>() as u64;
             let base = u32::try_from(base).unwrap_or(u32::MAX);
             let jobs = stand_in.under.iter().filter_map(|&(index, finest_place)| {
-                job(stand_in, base, index, finest_place, finest)
+                let job = job(stand_in, base, index, finest_place, finest)?;
+                let (links, maps) = links
+                    .get(&finest_place)
+                    .copied()
+                    .unwrap_or(([NONE; 4], [0; 4]));
+                Some(GpuJob { links, maps, ..job })
             });
             let run = runs
                 .entry((stand_in.slot.class(), stand_in.slot.buffer()))
@@ -750,11 +815,12 @@ impl StandInPass {
             gpu.device().create_bind_group(&BindGroupDescriptor {
                 label: Some("stand-in settle"),
                 layout: &self.settle_layout,
-                entries: &[entry(0, tree), entry(1, &self.rows)],
+                entries: &[entry(0, tree.buffer()), entry(1, &self.rows)],
             })
         })?;
         Ok(Some(StandInWork {
             replace: self.replace.clone(),
+            normals: self.normals.clone(),
             replaces: replaces?,
             settle: self.settle.clone(),
             settle_group: settle,
@@ -776,8 +842,114 @@ fn shared_source() -> String {
     )
 }
 
+/// A grid step in a link's map: `+i`, `+j`, `−i`, `−j` as 0 to 3.
+fn direction_code(d: (i64, i64)) -> Option<u32> {
+    match d {
+        (1, 0) => Some(0),
+        (0, 1) => Some(1),
+        (-1, 0) => Some(2),
+        (0, -1) => Some(3),
+        _ => None,
+    }
+}
+
+/// The finest tiles of a frame's scratch, by place, and the mesh's topology: what a job's links
+/// are found in.
+#[derive(Debug)]
+struct Links<'a> {
+    /// Each finest tile the frame's stand-ins read, at its index in the scratch.
+    scratch: BTreeMap<Place, u32>,
+    /// The mesh's topology, for the tiles across a face's edges.
+    topology: &'a Topology,
+    /// The finest level.
+    finest: Level,
+}
+
+impl<'a> Links<'a> {
+    /// The scratch of the frame's `stand_ins`, in a project whose finest level is `finest`
+    /// over `topology`.
+    fn of(stand_ins: &[StandIn], topology: &'a Topology, finest: Level) -> Self {
+        let tiles = stand_ins.iter().flat_map(|stand_in| &stand_in.under);
+        let scratch = tiles.map(|&(index, place)| (place, index)).collect();
+        Self {
+            scratch,
+            topology,
+            finest,
+        }
+    }
+
+    /// Every finest tile's links and maps ([`Links::around`]), found once a frame however
+    /// many jobs read the tile.
+    fn table(&self) -> BTreeMap<Place, ([u32; 4], [u32; 4])> {
+        let places = self.scratch.keys();
+        places.map(|&place| (place, self.around(place))).collect()
+    }
+
+    /// The links of the finest tile at `place` and their maps, in the order of
+    /// [`crate::tree::GpuNode::neighbours`]: per edge, the finest tile across it by its index in
+    /// the scratch ([`NONE`] where the scratch holds none, or there is none), and where a point
+    /// one step across lies in it ([`GpuJob::maps`]).
+    fn around(&self, place: Place) -> ([u32; 4], [u32; 4]) {
+        let mut links = [NONE; 4];
+        let mut maps = [0; 4];
+        let across = place.neighbours(self.topology);
+        let found = across.iter().zip(links.iter_mut().zip(&mut maps));
+        for (edge, (other, (link, map))) in found.enumerate() {
+            let Some(other) = *other else {
+                continue;
+            };
+            let Some(&index) = self.scratch.get(&other) else {
+                continue;
+            };
+            if let Some(code) = self.map(place, edge, other) {
+                *link = index;
+                *map = code;
+            }
+        }
+        (links, maps)
+    }
+
+    /// Where the points one step across edge `edge` of the finest tile at `place` lie in the
+    /// finest tile `other` across it, as [`GpuJob::maps`] packs it; `None` if the topology
+    /// doesn't put the edge's first two vertices on one edge of `other`.
+    fn map(&self, place: Place, edge: usize, other: Place) -> Option<u32> {
+        let quads = self.finest.tile_quads();
+        // The edge's vertices at s = 0 and s = 1, in the tile.
+        let ends = match edge {
+            0 => [(0, 0), (1, 0)],
+            1 => [(quads, 0), (quads, 1)],
+            2 => [(0, quads), (1, quads)],
+            _ => [(0, 0), (0, 1)],
+        };
+        let (x0, y0) = (u32::from(place.tx()) * quads, u32::from(place.ty()) * quads);
+        let copy = |(i, j): (u32, u32)| {
+            let copies = self
+                .topology
+                .copies(place.face(), self.finest, x0 + i, y0 + j);
+            copies
+                .iter()
+                .find(|c| c.face == other.face() && c.tx == other.tx() && c.ty == other.ty())
+                .map(|c| (i64::from(c.i), i64::from(c.j)))
+        };
+        let (first, second) = (copy(ends[0])?, copy(ends[1])?);
+        let along = direction_code((second.0 - first.0, second.1 - first.1))?;
+        let last = i64::from(quads);
+        // Into `other`, away from the edge both lie on.
+        let inward = match (first, second) {
+            ((0, _), (0, _)) => (1, 0),
+            ((from, _), (to, _)) if from == last && to == last => (-1, 0),
+            ((_, 0), (_, 0)) => (0, 1),
+            ((_, from), (_, to)) if from == last && to == last => (0, -1),
+            _ => return None,
+        };
+        let inward = direction_code(inward)?;
+        let (ox, oy) = (u32::try_from(first.0).ok()?, u32::try_from(first.1).ok()?);
+        Some(ox | (oy << 8) | (along << 16) | (inward << 18))
+    }
+}
+
 /// The job of `stand_in` and the finest tile at `finest_place`: the display vertices the finest
-/// tile holds.
+/// tile holds, with no links (the caller adds them).
 ///
 /// The display tile's first vertex is at `base` in its slot buffer, and the finest tile is at
 /// `index` of the scratch. `None` if the finest tile holds none of its vertices (it isn't under
@@ -815,6 +987,8 @@ fn job(
         count: nx | (ny << 16),
         fine: fi | (fj << 16),
         step: step | ((fine_quads + 1) << 16),
+        links: [NONE; 4],
+        maps: [0; 4],
     })
 }
 
@@ -824,6 +998,8 @@ fn job(
 pub(crate) struct StandInWork {
     /// The replace pipeline.
     replace: ComputePipeline,
+    /// The normal pipeline, run over the same dispatches once every replace is done.
+    normals: ComputePipeline,
     /// Its dispatches: a bind group and its jobs, one workgroup each.
     replaces: Vec<(BindGroup, u32)>,
     /// The settle pipeline.
@@ -849,6 +1025,13 @@ impl StandInWork {
         });
         if !self.replaces.is_empty() {
             pass.set_pipeline(&self.replace);
+            for (group, jobs) in &self.replaces {
+                pass.set_bind_group(0, group, &[]);
+                pass.dispatch_workgroups(*jobs, 1, 1);
+            }
+            // After every replace: a border vertex's normal reads finest tiles other jobs
+            // replace from, and an inside one the tile's positions other jobs wrote.
+            pass.set_pipeline(&self.normals);
             for (group, jobs) in &self.replaces {
                 pass.set_bind_group(0, group, &[]);
                 pass.dispatch_workgroups(*jobs, 1, 1);
