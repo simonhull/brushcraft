@@ -5,9 +5,11 @@
 //! makes each frame in a fixed order:
 //!
 //! 1. **input**: the pointer input queued since the last frame moves the camera, then the surface
-//!    under the pointer is picked if the pointer or the view changed ([`crate::pick`]);
+//!    under the pointer is picked if the pointer or the view changed ([`crate::pick`]); the pen
+//!    samples queued since the last frame become the frame's [`PenFrame`] (the pen moved the camera
+//!    and the pick as they were queued, as navigation's input: [`crate::pen`]);
 //! 2. **brush**: a seam for M1a4's brush step ([`Brush`]; [`NoBrush`] until then), which sees the
-//!    camera as the input left it;
+//!    camera as the input left it and the frame's pen samples;
 //! 3. **feed**: the stale-tile feed is drained: the epochs closed since the last frame;
 //! 4. **uploads**: GPU residency ([`Uploads`], [`crate::uploads::GpuResidency`]) takes the drained
 //!    epochs and stages the frame's tiles from the store, until half the way to the frame's
@@ -68,6 +70,7 @@ use self::schedule::{Next, Reason, Reasons, Scheduler};
 use crate::camera::{Arcball, Camera, Pixel};
 use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
+use crate::pen::{PenFrame, PenNavigation, PenSample, PenStatus};
 use crate::pick::Picker;
 use crate::record::{Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
@@ -76,14 +79,14 @@ use crate::script::{Script, Segment};
 /// The brush's place in the frame: M1a4's brush step, run on the owner thread after input and
 /// before the feed is drained, so the epochs its edits close reach the GPU in the same frame.
 pub(crate) trait Brush {
-    /// One frame's brush work on `project`: the stroke samples queued since the last frame,
-    /// applied, and their epoch closed. `camera` is the view as this frame's input left it,
-    /// which the samples are projected through.
+    /// One frame's brush work on `project`: the pen samples queued since the last frame (`pen`,
+    /// oldest first, with the pen's hover), applied, and their epoch closed. `camera` is the view
+    /// as this frame's input left it, which the samples are projected through.
     ///
     /// # Errors
     ///
     /// If the store fails the edit.
-    fn step(&mut self, project: &mut Project, camera: &Camera) -> Result<()>;
+    fn step(&mut self, project: &mut Project, camera: &Camera, pen: &PenFrame) -> Result<()>;
 }
 
 /// No brush yet (M1a4): the step does nothing.
@@ -91,7 +94,7 @@ pub(crate) trait Brush {
 pub(crate) struct NoBrush;
 
 impl Brush for NoBrush {
-    fn step(&mut self, _project: &mut Project, _camera: &Camera) -> Result<()> {
+    fn step(&mut self, _project: &mut Project, _camera: &Camera, _pen: &PenFrame) -> Result<()> {
         Ok(())
     }
 }
@@ -357,6 +360,14 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     navigator: Navigator,
     /// Pointer input since the last frame, applied in its input phase.
     input: Vec<Input>,
+    /// Pen samples since the last frame, taken into [`Owner::pen_frame`] in its input phase.
+    pen_queue: Vec<PenSample>,
+    /// Follows the pen stream into navigation's input as samples are queued.
+    pen_navigation: PenNavigation,
+    /// The pen samples the last input phase took, for the brush step, and the pen's hover.
+    pen_frame: PenFrame,
+    /// Where the pen stream comes from, for the overlay.
+    pen_status: PenStatus,
     /// Decides when frames are made.
     scheduler: Scheduler,
     /// The frame size; `None` while there is none.
@@ -522,6 +533,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             camera: Camera::default(),
             navigator: Navigator::default(),
             input: Vec::new(),
+            pen_queue: Vec::new(),
+            pen_navigation: PenNavigation::default(),
+            pen_frame: PenFrame::default(),
+            pen_status: PenStatus::default(),
             scheduler,
             size: setup.size,
             overlay_scale: 1,
@@ -571,6 +586,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// Queues pointer input for the next frame's input phase, and wants that frame if the
     /// input may move the camera.
     pub(crate) fn input(&mut self, input: Input) {
+        if input == Input::Cancel {
+            // Navigation forgets the pen's buttons too: the next sample presses them again.
+            self.pen_navigation = PenNavigation::default();
+        }
         if self.navigator.may_move(&self.input, &input) {
             self.scheduler.want(Reason::Input);
         }
@@ -578,6 +597,36 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.point(Some(at));
         }
         self.input.push(input);
+    }
+
+    /// Queues a pen sample for the next frame's input phase. It acts on navigation at once, as
+    /// the input it makes ([`crate::pen::PenNavigation`]): the tip drags, the barrel buttons are
+    /// modifiers, motion in range moves the pick, and leaving takes the pointer away.
+    pub(crate) fn pen(&mut self, sample: PenSample) {
+        let mut navigation = self.pen_navigation;
+        navigation.inputs(&sample, |input| self.input(input));
+        self.pen_navigation = navigation;
+        if sample.phase == input::Phase::Leave {
+            self.pointer_left();
+        }
+        self.pen_queue.push(sample);
+    }
+
+    /// The pen samples the last input phase took, and the pen's hover: what the brush step is
+    /// handed.
+    #[cfg(test)]
+    pub(crate) const fn pen_frame(&self) -> &PenFrame {
+        &self.pen_frame
+    }
+
+    /// Where the pen stream comes from, as the overlay shows it.
+    pub(crate) const fn pen_status(&self) -> &PenStatus {
+        &self.pen_status
+    }
+
+    /// Where the pen stream comes from now, for the overlay.
+    pub(crate) fn set_pen_status(&mut self, status: PenStatus) {
+        self.pen_status = status;
     }
 
     /// The pointer left the window: nothing is under it to pick.
@@ -761,9 +810,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.take_input(size)?;
         phases.input = lap.next();
 
-        self.brush
-            .step(&mut self.project, &self.camera)
-            .context("the brush step")?;
+        self.brush_step()?;
         phases.brush = lap.next();
 
         let drained = self.project.store().drain_stale(&self.cursor);
@@ -816,6 +863,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             camera: self.camera,
             look: self.look,
             pick: self.picker.as_ref().map(Picker::report),
+            pen: &self.pen_status,
             filter_only: !self.accumulates,
         };
         let overlay = overlay::lines(&snapshot);
@@ -851,6 +899,18 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
         self.want_next(&uploads);
         Ok(())
+    }
+
+    /// The brush phase: the brush steps over the project with the camera and the pen samples the
+    /// input phase left.
+    ///
+    /// # Errors
+    ///
+    /// If the brush's edit fails.
+    fn brush_step(&mut self) -> Result<()> {
+        self.brush
+            .step(&mut self.project, &self.camera, &self.pen_frame)
+            .context("the brush step")
     }
 
     /// In a recorded run, files the frame just started (at `time`, in `segment`, its view
@@ -894,7 +954,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// The input phase of a frame of `size`: the input queued since the last frame moves the
-    /// camera, then the surface under the pointer is picked if the pointer or the view changed.
+    /// camera, then the surface under the pointer is picked if the pointer or the view changed;
+    /// the pen samples queued become the frame's [`PenFrame`].
     ///
     /// # Errors
     ///
@@ -907,6 +968,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.navigator
                 .apply(event, &mut self.camera, &arcball, height);
         }
+        self.pen_frame.take(&mut self.pen_queue);
         if let Some(picker) = &mut self.picker {
             let view = self.camera.view(size);
             picker

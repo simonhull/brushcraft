@@ -22,6 +22,7 @@ use store::{Epoch, ProjectConfig, StoreConfig};
 use super::*;
 use crate::camera::Pixel;
 use crate::navigate::Button;
+use crate::pen::PenFrame;
 use crate::render_thread::draw_frame;
 use crate::test_dir::TestDir;
 use crate::uploads::GpuResidency;
@@ -139,7 +140,7 @@ struct OneEdit {
 }
 
 impl Brush for OneEdit {
-    fn step(&mut self, project: &mut Project, camera: &Camera) -> Result<()> {
+    fn step(&mut self, project: &mut Project, camera: &Camera, _pen: &PenFrame) -> Result<()> {
         self.cameras.push(*camera);
         if std::mem::replace(&mut self.done, true) {
             return Ok(());
@@ -395,6 +396,95 @@ fn a_drag_wants_a_frame_and_moves_the_camera_in_it_but_hovering_wants_none() {
     owner.close().expect("closed");
 }
 
+/// A brush that records what each frame's pen samples were (their phases) and where the pen
+/// hovered.
+#[derive(Debug, Default)]
+struct PenLog {
+    /// Each step's samples' phases, and the hover it was handed.
+    frames: Vec<(Vec<input::Phase>, Option<Pixel>)>,
+}
+
+impl Brush for PenLog {
+    fn step(&mut self, _project: &mut Project, _camera: &Camera, pen: &PenFrame) -> Result<()> {
+        let phases: Vec<input::Phase> = pen.samples().iter().map(|sample| sample.phase).collect();
+        self.frames
+            .push((phases, pen.hover().map(|hover| hover.at)));
+        Ok(())
+    }
+}
+
+/// A pen sample in `phase` at `(x, y)`, now.
+fn pen_sample(phase: input::Phase, (x, y): (f64, f64)) -> PenSample {
+    let now = Instant::now();
+    PenSample {
+        phase,
+        tool: input::Tool::Pen,
+        at: Pixel { x, y },
+        pressure: input::Unit::ZERO,
+        distance: None,
+        tilt: None,
+        roll: None,
+        buttons: input::Buttons::default(),
+        timestamp: now,
+        received: now,
+    }
+}
+
+#[test]
+fn pen_samples_navigate_as_queued_and_reach_the_brush_in_order() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = Owner::new(
+        project(&dir),
+        PenLog::default(),
+        NoUploads,
+        setup(None),
+        Instant::now(),
+    );
+    run(&mut owner, 10_000);
+    owner.brush.frames.clear();
+    owner.pen(pen_sample(Phase::Enter, (160.0, 100.0)));
+    owner.pen(pen_sample(Phase::Hover, (161.0, 100.0)));
+    assert!(
+        matches!(owner.next(Instant::now()), Next::Idle { .. }),
+        "hovering with no picker wants no frame"
+    );
+    let before = *owner.camera();
+    owner.pen(pen_sample(Phase::Down, (161.0, 100.0)));
+    owner.pen(pen_sample(Phase::Drag, (200.0, 100.0)));
+    assert_eq!(run(&mut owner, 100), 1, "one frame for the drag");
+    assert_ne!(*owner.camera(), before, "the tip's drag orbited");
+    assert_eq!(
+        owner.brush.frames,
+        [(
+            vec![Phase::Enter, Phase::Hover, Phase::Down, Phase::Drag],
+            None
+        )],
+        "the brush has every sample, in order; touching isn't hovering"
+    );
+    assert_eq!(owner.pen_frame().samples().len(), 4);
+
+    owner.pen(pen_sample(Phase::Up, (200.0, 100.0)));
+    owner.pen(pen_sample(Phase::Hover, (210.0, 90.0)));
+    owner.expose();
+    assert_eq!(run(&mut owner, 100), 1);
+    let after = *owner.camera();
+    let last = owner.brush.frames.last().cloned();
+    assert_eq!(
+        last,
+        Some((
+            vec![Phase::Up, Phase::Hover],
+            Some(Pixel { x: 210.0, y: 90.0 })
+        )),
+        "lifted and hovering"
+    );
+    owner.pen(pen_sample(Phase::Drag, (300.0, 10.0)));
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(*owner.camera(), after, "the drag ended at the lift");
+    owner.close().expect("closed");
+}
+
 #[test]
 fn a_scripted_run_makes_its_frames_then_is_done() {
     let dir = TestDir::new();
@@ -449,7 +539,7 @@ fn epochs_closed_between_frames_want_a_frame_to_take_them() {
     );
     // Work between frames closes an epoch, as a poll installing prefetched tiles does.
     OneEdit::default()
-        .step(owner.project(), &Camera::default())
+        .step(owner.project(), &Camera::default(), &PenFrame::default())
         .expect("an edit");
     owner.upkeep(Instant::now()).expect("upkeep");
     assert!(
@@ -571,7 +661,7 @@ fn a_minimised_window_still_runs_its_upkeep() {
     run(&mut owner, 10_000);
     // An edit the recovery writer has yet to flush, then the window is minimised.
     OneEdit::default()
-        .step(owner.project(), &Camera::default())
+        .step(owner.project(), &Camera::default(), &PenFrame::default())
         .expect("an edit");
     owner.resize(None);
     let later = Instant::now() + schedule::UPKEEP_INTERVAL;

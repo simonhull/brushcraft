@@ -25,8 +25,8 @@
 //! moved the camera ([`Picker::update`]), and only when the pointer or the view (camera or frame
 //! size) changed since the last pick. Pointer motion that changes nothing else wants a frame of
 //! its own ([`crate::frame::schedule::Reason::Pick`]), which only shades the last scene again
-//! under the new overlay line. The pen picks too: winit reports its hover as pointer motion
-//! (a `PointerSource::TabletTool`), which reaches the frame loop like the mouse's.
+//! under the new overlay line. The pen picks too: its stream ([`crate::pen`]) turns hover into
+//! pointer motion, which reaches the frame loop like the mouse's.
 //!
 //! **Cost:** a pick takes candidate tiles nearest-first until none left can be nearer than its
 //! hit, usually one or two (more at a silhouette), and intersects every quad of each: a tile is

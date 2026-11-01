@@ -8,8 +8,13 @@
 //! thread (which wakes the loop when it has presented), wait for the GPU to finish a frame
 //! (polling it every [`GPU_POLL`], running the store's jobs meanwhile), or sleep until an event or
 //! the next upkeep.
-//! The pen navigates through winit's tablet events; `input`'s own pen backend is the brush's, in
-//! M1a4.
+//!
+//! **The pen** comes through one stream ([`crate::pen`]): our Wayland backend, spawned once the
+//! window exists (undecorated, and configured: winit returns a window only after its first
+//! configure), or winit's tablet events where it can't run. The stream is drained into the frame
+//! loop after each batch of events and again just before each frame. It holds the window and is
+//! stopped first on the way out ([`WindowApp::finish`]), so our backend never outlives the
+//! window's surface. The mouse's events stay winit's.
 
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -18,9 +23,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow};
 use render::surface::{Size, Target, WindowSurface};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{
-    ButtonSource, ElementState, MouseButton, MouseScrollDelta, TabletToolButton, WindowEvent,
+    ButtonSource, ElementState, MouseButton, MouseScrollDelta, PointerKind, PointerSource,
+    StartCause, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -32,6 +38,7 @@ use crate::frame::schedule::Next;
 use crate::frame::{GPU_POLL, GpuWait, LookChange, Setup};
 use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
+use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
 use crate::render_thread::{Hooks, RenderThread};
 use crate::{AppOwner, ProjectToOpen, Summary, describe_adapter, start};
 
@@ -44,6 +51,10 @@ const PIXELS_PER_NOTCH: f64 = 40.0;
 /// The window, the render thread and the frame loop, once the window exists.
 #[derive(Debug)]
 struct Running {
+    /// The pen stream. Declared first, so on any path that drops `Running` whole the backend
+    /// stops before anything else goes; it also holds the window itself, and
+    /// [`WindowApp::finish`] stops it before anything else.
+    pen: AppPen,
     /// The frame loop, holding the project.
     owner: AppOwner,
     /// The render thread. Declared before `window`, so it stops (releasing the surface) before
@@ -75,6 +86,11 @@ pub(crate) struct WindowApp {
     /// Where the run's outcome goes when the loop exits; `None` once it has been sent, so a
     /// run finishes once, whatever events follow.
     done: Option<Sender<Result<Summary>>>,
+    /// Event-loop wakeups so far: winit's fallback pen events of one wakeup may be one pen frame.
+    wakeup: u64,
+    /// Pen samples drained from the stream, handed on to the frame loop at once; kept for its
+    /// allocation.
+    pen_samples: Vec<PenSample>,
 }
 
 impl WindowApp {
@@ -89,6 +105,8 @@ impl WindowApp {
             project: Some(project),
             running: None,
             done: Some(done),
+            wakeup: 0,
+            pen_samples: Vec::new(),
         }
     }
 
@@ -109,11 +127,10 @@ impl WindowApp {
         let attributes = WindowAttributes::default()
             .with_title("BrushCraft")
             .with_surface_size(requested);
-        let window: Arc<dyn Window> = Arc::from(
-            event_loop
-                .create_window(attributes)
-                .context("creating the window")?,
-        );
+        // The pen stream creates the window (undecorated) and starts our backend on it, so it
+        // can hold the window for as long as the backend runs ([`crate::pen`]).
+        let pen = AppPen::create_window(event_loop, attributes)?;
+        let window = Arc::clone(pen.window());
         let size = frame_size(window.surface_size()).unwrap_or(self.options.size);
         let (gpu, surface) = WindowSurface::open(Arc::clone(&window), size, &self.options.adapter)
             .context("opening the GPU for the window")?;
@@ -139,7 +156,9 @@ impl WindowApp {
         };
         let mut owner = start(project, gpu, setup)?;
         owner.set_scale(window.scale_factor());
+        owner.set_pen_status(pen.status());
         Ok(Running {
+            pen,
             owner,
             render,
             window,
@@ -162,10 +181,15 @@ impl WindowApp {
     /// # Errors
     ///
     /// If a frame, the upkeep or the render thread fails.
-    fn drive(running: &mut Running, event_loop: &dyn ActiveEventLoop) -> Result<()> {
+    fn drive(
+        running: &mut Running,
+        pen_samples: &mut Vec<PenSample>,
+        event_loop: &dyn ActiveEventLoop,
+    ) -> Result<()> {
         running
             .owner
             .set_interval(refresh_interval(running.window.as_ref()));
+        Self::feed_pen(running, pen_samples);
         if let Some((from, asked)) = running.asked.take() {
             // Woken by the timer, or by an event after it would have fired: how long it ran.
             // An event before it says nothing.
@@ -178,6 +202,8 @@ impl WindowApp {
             let now = Instant::now();
             match running.owner.next(now) {
                 Next::Frame { deadline } => {
+                    // What the pen sent since the last batch of events joins this frame.
+                    Self::feed_pen(running, pen_samples);
                     let render = &mut running.render;
                     running
                         .owner
@@ -216,9 +242,20 @@ impl WindowApp {
         }
     }
 
-    /// Exits the loop, stops the render thread and closes the project, and sends how the run
-    /// went; `result` is an error that ended the run early, if one did. Only the first call does
-    /// more than exit.
+    /// Drains the pen stream into the frame loop, through `samples` (left empty), and tells the
+    /// overlay where the stream comes from (it falls back if our backend stopped).
+    fn feed_pen(running: &mut Running, samples: &mut Vec<PenSample>) {
+        running.pen.drain(samples);
+        let drained = samples.drain(..);
+        for sample in drained {
+            running.owner.pen(sample);
+        }
+        running.owner.set_pen_status(running.pen.status());
+    }
+
+    /// Exits the loop, stops the pen stream (first: our backend must not outlive the window's
+    /// surface), then the render thread, closes the project, and sends how the run went; `result`
+    /// is an error that ended the run early, if one did. Only the first call does more than exit.
     fn finish(&mut self, event_loop: &dyn ActiveEventLoop, result: Result<()>) {
         event_loop.exit();
         let Some(done) = self.done.take() else {
@@ -228,12 +265,17 @@ impl WindowApp {
         let outcome = match self.running.take() {
             Some(running) => {
                 let Running {
+                    pen,
                     mut owner,
                     render,
                     window,
                     adapter,
                     ..
                 } = running;
+                // The pen first: our backend must stop before the window's surface can go. What
+                // it sent since the last frame is dropped with the run.
+                let (pen_window, pen_stopped) = pen.stop(&mut Vec::new());
+                drop(pen_window);
                 let presentation = render.presentation();
                 let stopped = render
                     .stop()
@@ -241,7 +283,11 @@ impl WindowApp {
                 let summary = Summary::of(&owner, adapter, presentation);
                 let closed = owner.close();
                 drop(window);
-                result.and(stopped).and(closed).map(|()| summary)
+                result
+                    .and(stopped)
+                    .and(closed)
+                    .and(pen_stopped)
+                    .map(|()| summary)
             }
             None => result.and_then(|()| Err(anyhow!("the window never opened"))),
         };
@@ -258,6 +304,12 @@ impl WindowApp {
         let Some(running) = &mut self.running else {
             return;
         };
+        if let Some((tablet, at, data)) = tablet_event(&event) {
+            // The pen's events go to its stream, which follows them on the fallback.
+            let stamp = (Instant::now(), self.wakeup);
+            running.pen.winit(tablet, at, data, stamp);
+            return;
+        }
         let owner = &mut running.owner;
         #[expect(
             clippy::wildcard_enum_match_arm,
@@ -265,7 +317,10 @@ impl WindowApp {
         )]
         match event {
             WindowEvent::SurfaceResized(size) => owner.resize(frame_size(size)),
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => owner.set_scale(scale_factor),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                owner.set_scale(scale_factor);
+                running.pen.set_scale(scale_factor);
+            }
             WindowEvent::RedrawRequested | WindowEvent::Occluded(false) => owner.expose(),
             // A button held as focus goes may never report its release.
             WindowEvent::Focused(false) => owner.input(Input::Cancel),
@@ -277,13 +332,10 @@ impl WindowApp {
                 }));
             }
             WindowEvent::PointerLeft { .. } => owner.pointer_left(),
-            // Physical pixels, as the frame size: the mouse's, and the pen's while it hovers.
+            // Physical pixels, as the frame size.
             WindowEvent::PointerMoved { position, .. }
             | WindowEvent::PointerEntered { position, .. } => owner.input(Input::Move {
-                at: Pixel {
-                    x: position.x,
-                    y: position.y,
-                },
+                at: pixel(position),
             }),
             WindowEvent::PointerButton {
                 state,
@@ -295,10 +347,7 @@ impl WindowApp {
                     owner.input(match state {
                         ElementState::Pressed => Input::Press {
                             button,
-                            at: Pixel {
-                                x: position.x,
-                                y: position.y,
-                            },
+                            at: pixel(position),
                         },
                         ElementState::Released => Input::Release { button },
                     });
@@ -338,7 +387,8 @@ fn look_change(key: PhysicalKey) -> Option<LookChange> {
     }
 }
 
-/// The button navigation reads for a winit button, if it reads that one.
+/// The button navigation reads for a winit button, if it reads that one: the mouse's (the
+/// pen's come through its stream, [`crate::pen`]).
 fn navigation_button(button: &ButtonSource) -> Option<Button> {
     #[expect(
         clippy::wildcard_enum_match_arm,
@@ -348,15 +398,62 @@ fn navigation_button(button: &ButtonSource) -> Option<Button> {
         ButtonSource::Mouse(MouseButton::Left) => Some(Button::MouseLeft),
         ButtonSource::Mouse(MouseButton::Middle) => Some(Button::MouseMiddle),
         ButtonSource::Mouse(MouseButton::Right) => Some(Button::MouseRight),
-        ButtonSource::TabletTool {
-            button: TabletToolButton::Contact,
-            ..
-        } => Some(Button::PenTip),
-        ButtonSource::TabletTool {
-            button: TabletToolButton::Barrel,
-            ..
-        } => Some(Button::PenBarrel),
         _ => None,
+    }
+}
+
+/// One of winit's tablet tool events, in the pen stream's terms: the event, where (if winit
+/// says), and the tool's data (if it comes with it).
+type TabletEvent = (WinitEvent, Option<Pixel>, Option<ToolData>);
+
+/// `event` as a tablet tool's event, if it is one.
+fn tablet_event(event: &WindowEvent) -> Option<TabletEvent> {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "WindowEvent is non-exhaustive, and only these are a tablet tool's"
+    )]
+    match event {
+        WindowEvent::PointerEntered {
+            position,
+            kind: PointerKind::TabletTool(_),
+            ..
+        } => Some((WinitEvent::Entered, Some(pixel(*position)), None)),
+        WindowEvent::PointerLeft {
+            position,
+            kind: PointerKind::TabletTool(_),
+            ..
+        } => Some((WinitEvent::Left, position.map(pixel), None)),
+        WindowEvent::PointerMoved {
+            position,
+            source: PointerSource::TabletTool { kind, data },
+            ..
+        } => Some((
+            WinitEvent::Moved,
+            Some(pixel(*position)),
+            Some(ToolData::from_winit(*kind, data)),
+        )),
+        WindowEvent::PointerButton {
+            state,
+            position,
+            button: ButtonSource::TabletTool { kind, button, data },
+            ..
+        } => Some((
+            WinitEvent::Button {
+                button: (*button).into(),
+                pressed: *state == ElementState::Pressed,
+            },
+            Some(pixel(*position)),
+            Some(ToolData::from_winit(*kind, data)),
+        )),
+        _ => None,
+    }
+}
+
+/// winit's pointer position as a viewport pixel: both physical.
+const fn pixel(position: PhysicalPosition<f64>) -> Pixel {
+    Pixel {
+        x: position.x,
+        y: position.y,
     }
 }
 
@@ -389,6 +486,10 @@ fn refresh_interval(window: &dyn Window) -> Duration {
 }
 
 impl ApplicationHandler for WindowApp {
+    fn new_events(&mut self, _: &dyn ActiveEventLoop, _: StartCause) {
+        self.wakeup += 1;
+    }
+
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         if self.running.is_some() || self.done.is_none() {
             return;
@@ -419,7 +520,7 @@ impl ApplicationHandler for WindowApp {
         let Some(running) = &mut self.running else {
             return;
         };
-        let driven = Self::drive(running, event_loop);
+        let driven = Self::drive(running, &mut self.pen_samples, event_loop);
         if driven.is_err() || running.owner.done() {
             self.finish(event_loop, driven);
         }

@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 checkout.workspace = true
 geom.workspace = true
+input.workspace = true
 render.workspace = true
 store.workspace = true
 thiserror.workspace = true

@@ -6,16 +6,17 @@
 //! | Input | Gesture |
 //! |---|---|
 //! | left button or pen tip, dragged | orbit (the arcball) |
-//! | the same with Shift, or the pen's barrel button held | pan |
-//! | the same with Ctrl | zoom (drag up to come closer) |
+//! | the same with Shift, or the pen's second barrel button held | pan |
+//! | the same with Ctrl, or the pen's first barrel button held | zoom (drag up to come closer) |
 //! | middle or right button, dragged | pan |
 //! | wheel | zoom, a notch at a time |
 //!
 //! A gesture is chosen when its button goes down and lasts until that button comes up, or the
 //! window loses focus (when the release may never come); modifiers changing meanwhile don't
 //! switch it. Only motion in a drag and the wheel ask for a frame. Input arrives as [`Input`], the
-//! window's events in our terms, so the rules here are tested without a window. The brush takes the
-//! pen tip over the model in M1a4; until then the tip navigates everywhere.
+//! window's events in our terms (the pen's through its stream, [`crate::pen`]), so the rules here
+//! are tested without a window. The brush takes the pen tip over the model in M1a4; until then the
+//! tip navigates everywhere.
 
 use crate::camera::{Arcball, Camera, Pixel};
 
@@ -28,11 +29,14 @@ pub(crate) enum Button {
     MouseMiddle,
     /// The mouse's right button.
     MouseRight,
-    /// The pen tip touching the tablet. winit reports the pen's first barrel button this way
-    /// too (it maps evdev's `BTN_STYLUS` to the tip, as SDL does), so pressing it while
-    /// hovering orbits as well.
+    /// The pen tip touching the tablet. On winit's fallback the pen's first barrel button
+    /// arrives this way too (winit maps evdev's `BTN_STYLUS` to the tip, as SDL does), so there
+    /// pressing it while hovering orbits as well.
     PenTip,
-    /// The pen's second barrel button: held, the tip pans.
+    /// The pen's first barrel button (`BTN_STYLUS`): held, the tip zooms. Only our pen backend
+    /// tells it from the tip.
+    PenFirstBarrel,
+    /// The pen's second barrel button (`BTN_STYLUS2`): held, the tip pans.
     PenBarrel,
 }
 
@@ -112,24 +116,29 @@ pub(crate) struct Navigator {
     drag: Option<Drag>,
     /// The modifier keys held.
     modifiers: Modifiers,
-    /// Whether the pen's barrel button is held.
+    /// Whether the pen's second barrel button is held: the tip pans.
     barrel: bool,
+    /// Whether the pen's first barrel button is held: the tip zooms.
+    first_barrel: bool,
 }
 
 impl Navigator {
-    /// The gesture a press of `button` starts, given the modifiers and the barrel button; `None`
-    /// for a button that starts none.
+    /// The gesture a press of `button` starts, given the modifiers and the barrel buttons;
+    /// `None` for a button that starts none. Zoom wins over pan when both are asked for.
     pub(crate) const fn gesture_for(&self, button: Button) -> Option<Gesture> {
+        let pen = matches!(button, Button::PenTip);
         match button {
-            Button::MouseLeft | Button::PenTip => Some(if self.modifiers.ctrl {
-                Gesture::Zoom
-            } else if self.modifiers.shift || (self.barrel && matches!(button, Button::PenTip)) {
-                Gesture::Pan
-            } else {
-                Gesture::Orbit
-            }),
+            Button::MouseLeft | Button::PenTip => {
+                Some(if self.modifiers.ctrl || (pen && self.first_barrel) {
+                    Gesture::Zoom
+                } else if self.modifiers.shift || (pen && self.barrel) {
+                    Gesture::Pan
+                } else {
+                    Gesture::Orbit
+                })
+            }
             Button::MouseMiddle | Button::MouseRight => Some(Gesture::Pan),
-            Button::PenBarrel => None,
+            Button::PenBarrel | Button::PenFirstBarrel => None,
         }
     }
 
@@ -164,9 +173,7 @@ impl Navigator {
     fn track(&mut self, input: Input) {
         match input {
             Input::Press { button, at } => {
-                if button == Button::PenBarrel {
-                    self.barrel = true;
-                }
+                self.hold(button, true);
                 if self.drag.is_none()
                     && let Some(gesture) = self.gesture_for(button)
                 {
@@ -178,9 +185,7 @@ impl Navigator {
                 }
             }
             Input::Release { button } => {
-                if button == Button::PenBarrel {
-                    self.barrel = false;
-                }
+                self.hold(button, false);
                 if self.drag.is_some_and(|drag| drag.button == button) {
                     self.drag = None;
                 }
@@ -194,8 +199,18 @@ impl Navigator {
             Input::Cancel => {
                 self.drag = None;
                 self.barrel = false;
+                self.first_barrel = false;
             }
             Input::Wheel { .. } => {}
+        }
+    }
+
+    /// Notes `button` held or released, if it is a pen barrel button (a modifier).
+    const fn hold(&mut self, button: Button, held: bool) {
+        match button {
+            Button::PenBarrel => self.barrel = held,
+            Button::PenFirstBarrel => self.first_barrel = held,
+            Button::MouseLeft | Button::MouseMiddle | Button::MouseRight | Button::PenTip => {}
         }
     }
 

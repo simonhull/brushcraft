@@ -27,6 +27,7 @@ mod navigate;
 mod overlay;
 mod pace;
 mod paths;
+mod pen;
 mod pick;
 mod record;
 mod render_thread;
@@ -114,6 +115,8 @@ pub(crate) struct Summary {
     pub(crate) tiles: String,
     /// What the last frame read back drew, as the overlay's scene line shows it.
     pub(crate) scene: String,
+    /// Where the pen stream came from, as the overlay's pen line shows it.
+    pub(crate) pen: String,
     /// A scripted run's phase times ([`frame::PhaseLog::lines`]); empty for an open-ended run.
     pub(crate) phases: Vec<String>,
     /// A recorded run's record lines ([`record`]); empty for any other run.
@@ -131,6 +134,7 @@ impl Summary {
             presentation,
             tiles: uploads::summary(&residency.stats(), residency.floor_tiles()),
             scene: uploads::scene_summary(residency.scene()),
+            pen: owner.pen_status().to_string(),
             phases: owner
                 .phase_log()
                 .map(frame::PhaseLog::lines)
@@ -330,6 +334,7 @@ fn run() -> Result<()> {
     )?;
     writeln!(out, "tiles: {}", summary.tiles)?;
     writeln!(out, "scene: {}", summary.scene)?;
+    writeln!(out, "pen: {}", summary.pen)?;
     for line in &summary.phases {
         writeln!(out, "{line}")?;
     }

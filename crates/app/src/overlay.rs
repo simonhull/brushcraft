@@ -19,6 +19,7 @@ use store::JobsReport;
 
 use crate::camera::{Camera, Vec3};
 use crate::frame::{FeedStats, OwnerPhases};
+use crate::pen::PenStatus;
 use crate::pick::Report as PickReport;
 
 /// Everything the overlay reports about one frame.
@@ -54,6 +55,8 @@ pub(crate) struct Snapshot<'a> {
     pub(crate) look: Look,
     /// The last pick under the pointer; `None` if the frame loop doesn't pick.
     pub(crate) pick: Option<&'a PickReport>,
+    /// Where the pen stream comes from: our backend, or winit's events as the fallback.
+    pub(crate) pen: &'a PenStatus,
     /// Whether still frames are filtered instead of accumulated (the image is too large for the
     /// device to accumulate).
     pub(crate) filter_only: bool,
@@ -86,6 +89,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         camera,
         look,
         pick,
+        pen,
         filter_only,
     } = *snapshot;
     let view = match look.view {
@@ -151,6 +155,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
             }
         ),
         format!("pick       {}", crate::pick::summary(pick)),
+        format!("pen        {pen}"),
     ]
 }
 
@@ -311,6 +316,13 @@ mod tests {
                 material: render::material::MatCapStyle::Glossy,
             },
             pick: None,
+            pen: &PenStatus {
+                source: crate::pen::PenSource::Fallback {
+                    why: "not a Wayland display or window".into(),
+                },
+                dropped: 0,
+                lost: 0,
+            },
             filter_only: false,
         };
         let text = lines(&snapshot).join("\n");
@@ -327,6 +339,7 @@ mod tests {
             "eye (0.00, 0.00, 3.00)",
             "matcap glossy  wireframe on",
             "pick       off (no spatial index)",
+            "pen        winit's tablet events (fallback: not a Wayland display or window)",
         ] {
             assert!(text.contains(expected), "{expected:?} in:\n{text}");
         }

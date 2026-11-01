@@ -61,6 +61,7 @@ dependencies = [
  "anyhow",
  "checkout",
  "geom",
+ "input",
  "render",
  "store",
  "thiserror 2.0.21",
