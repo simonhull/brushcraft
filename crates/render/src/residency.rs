@@ -1272,6 +1272,15 @@ impl Residency {
             }
             Drained::Resync(unrefreshed) => {
                 self.stand_ins.resync();
+                // The lost epochs may have named previews, which the resync hands over only as
+                // finest tiles under unrefreshed display tiles: every place above one is treated
+                // as above a preview until a refresh names it (no measured bound).
+                let finest: Vec<TileKey> = unrefreshed
+                    .iter()
+                    .flat_map(|tile| tile.finest.iter().copied())
+                    .collect();
+                let after = self.stand_ins.seen.unwrap_or(0);
+                self.stand_ins.previewed(&finest, after);
                 // Until the re-read switches, the tiles kept hold data of unknown age: their
                 // bound is the one that says so, and their stand-ins' rows go.
                 let kept: Vec<TileKey> = self
@@ -1300,6 +1309,15 @@ impl Residency {
     fn apply_kind(&mut self, epoch: Epoch) {
         let Epoch { seq, kind, keys } = epoch;
         self.stand_ins.seen = Some(self.stand_ins.seen.map_or(seq, |seen| seen.max(seq)));
+        if matches!(kind, EpochKind::Preview) {
+            // What is drawn above these tiles is no longer the store's surface: no measured bound.
+            let finest: Vec<TileKey> = keys
+                .iter()
+                .filter(|key| self.is_finest(key))
+                .copied()
+                .collect();
+            self.stand_ins.previewed(&finest, seq);
+        }
         // A step whose displacement isn't one bounds nothing: as a revert.
         let kind = match kind {
             EpochKind::Step { displacement } if Displacement::try_from(displacement).is_err() => {

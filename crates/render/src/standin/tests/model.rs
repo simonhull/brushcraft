@@ -657,3 +657,30 @@ fn regression_a_resync_carries_the_previews_with_it() {
         );
     });
 }
+
+/// The case the model found on 2026-11-01, measuring stand-in bounds.
+///
+/// A stand-in over a previewed finest tile measured its finest vertices against the preview's
+/// positions, which the scratch holds, while its bound is against the store's surface: below the
+/// error by the preview's lead. A display tile above a preview now takes the formula until a
+/// refresh names it.
+#[test]
+fn regression_a_stand_in_over_a_preview_isn_t_measured_against_it() {
+    GpuTest::run(|gpu| {
+        run(
+            gpu,
+            &[
+                (208, 249, 162),
+                (160, 150, 173),
+                (159, 172, 38),
+                (174, 190, 22),
+                (236, 84, 144),
+                (81, 48, 36),
+                (57, 134, 239),
+                (58, 194, 159),
+                (2, 241, 93),
+                (51, 14, 199),
+            ],
+        );
+    });
+}

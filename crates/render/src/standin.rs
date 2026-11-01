@@ -49,7 +49,8 @@
 //! the stand-ins drew, not a sum over the steps.
 //!
 //! **The formula**, at a coarser level (its quads span several finest tiles, some holding no
-//! display vertex for a job to start from), or for a step whose vertices weren't replaced:
+//! display vertex for a job to start from), over a preview (below), or for a step whose vertices
+//! weren't replaced:
 //!
 //! `|F'(u) − S'(u)| ≤ |F'(u) − F(u)| + |F(u) − S(u)| + max |m_v| ≤ D + e + M`,
 //!
@@ -60,6 +61,20 @@
 //! Either is computed in `f32` and raised as "Rounding" says. A tile that stands in again bounds
 //! against its stand-in. The cone becomes the one that covers everything: no displacement bounds
 //! how normals turned.
+//!
+//! # Previews
+//!
+//! A previewed finest tile ([`store::EpochKind::Preview`]) is drawn, and read into the scratch,
+//! as its preview: dabs shown ahead of their finest work. The bounds are against the store's
+//! surface `F`, which the preview didn't move, so a measurement against the preview's positions
+//! bounds nothing: the drawn surface may be a dab's height from `F`. A display tile above a
+//! preview takes the formula, its `D` zero for the preview's epoch (residency makes it a step of
+//! no displacement): `|F(u) − S'(u)| ≤ e + M`, the stand-in's own moves. It does so from the
+//! preview's epoch until a refresh epoch names it, which the store holds back while any preview
+//! under it lasts: until then a finest tile under it may still be drawn from one. A resync hands
+//! the previews over only as finest tiles under unrefreshed display tiles, so every place above
+//! one of those takes the formula too, until refreshed. Measuring the
+//! preview's lead over `F` on the GPU too would need `F` in the scratch beside it.
 //!
 //! # Rounding
 //!
@@ -456,6 +471,10 @@ pub(crate) struct StandIn {
     pub(crate) row: u32,
     /// The edited finest tiles under it, by their index in the scratch, with their places.
     pub(crate) under: Vec<(u32, Place)>,
+    /// Whether its bound may be measured: no finest tile under it is drawn from a preview, whose
+    /// positions the scratch holds in place of the store's surface its bound is against
+    /// ([module notes](self), "Previews").
+    pub(crate) measure: bool,
 }
 
 /// The stand-in pass: the scratch the frame's edited finest tiles are staged into, the rows,
@@ -1108,7 +1127,7 @@ fn job(
     let (lx, nx, fi) = axis(place.tx(), finest_place.tx())?;
     let (ly, ny, fj) = axis(place.ty(), finest_place.ty())?;
     let covers = |first: u32, count: u32| first == 0 && (count - 1) * step == fine_quads;
-    let measure = if step <= fine_quads && covers(fi, nx) && covers(fj, ny) {
+    let measure = if stand_in.measure && step <= fine_quads && covers(fi, nx) && covers(fj, ny) {
         MEASURE
     } else {
         0

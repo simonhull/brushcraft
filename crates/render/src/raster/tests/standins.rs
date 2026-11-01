@@ -265,6 +265,7 @@ fn stand_in(
             under: under
                 .map(|(i, &f)| (u32::try_from(i).expect("small"), f))
                 .collect(),
+            measure: true,
         });
     }
     let rows = u32::try_from(targets.len()).expect("small");

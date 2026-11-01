@@ -119,6 +119,12 @@ pub(super) struct StandIns {
     /// and their displacements summed. A tile behind one doesn't stand in (its finest tiles are
     /// forgotten): its bound is raised instead, until a refresh names it.
     pub(super) dropped: BTreeMap<Place, (u64, Displacement)>,
+    /// Places above a finest tile a preview epoch named, with the newest such epoch's number:
+    /// their stand-ins' bounds aren't measured (a finest tile under them may be drawn from a
+    /// preview: the stand-in module's notes, "Previews") until a refresh epoch names them after
+    /// it. Kept through a resync, which adds the places above every finest tile it hands over
+    /// (the previews among them, which it doesn't tell apart), at the newest epoch applied.
+    pub(super) previewed: BTreeMap<Place, u64>,
     /// Places whose tiles may be behind a step: a step entered under them, or their data was
     /// loaded, since they were last looked at.
     pub(super) due: BTreeSet<Place>,
@@ -164,6 +170,7 @@ impl StandIns {
             refreshed: BTreeMap::new(),
             blocked: BTreeMap::new(),
             dropped: BTreeMap::new(),
+            previewed: BTreeMap::new(),
             due: BTreeSet::new(),
             set_aside: BTreeSet::new(),
             planned: Vec::new(),
@@ -256,6 +263,22 @@ impl StandIns {
             .is_some_and(|&(through, _)| through < seq)
         {
             self.dropped.remove(&place);
+        }
+        if self.previewed.get(&place).is_some_and(|&shown| shown < seq) {
+            self.previewed.remove(&place);
+        }
+    }
+
+    /// Notes a preview epoch numbered `seq` naming the finest tiles `keys`: the places above
+    /// them stop measuring their stand-ins' bounds until a refresh names them after it.
+    pub(super) fn previewed<'k>(&mut self, keys: impl IntoIterator<Item = &'k TileKey>, seq: u64) {
+        for key in keys {
+            let mut above = Place::of(key).parent();
+            while let Some(place) = above {
+                let shown = self.previewed.entry(place).or_insert(seq);
+                *shown = (*shown).max(seq);
+                above = place.parent();
+            }
         }
     }
 
@@ -620,6 +643,7 @@ impl Residency {
             slot: entry.slot,
             row,
             under,
+            measure: !self.stand_ins.previewed.contains_key(&place),
         });
         self.stats.stand_ins += 1;
         Ok(())
