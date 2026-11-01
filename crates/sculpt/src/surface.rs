@@ -1,15 +1,27 @@
 //! The store as the stroke engine's surface: [`StoreSurface`] implements [`stroke::Surface`]
 //! over the spatial index and the tile store, at the index's level.
 //!
+//! # The stroke's own surface
+//!
+//! Every read goes to the **stroke's surface**: the store's tiles with the previews of the dabs
+//! placed and not landed yet in place of theirs ([`TileStore::surface_positions`],
+//! [`TileStore::surface_normals`], [`SpatialIndex::raycast_surface`], and the index's boxes, which
+//! a preview grows to hold it; see [`crate::Preview`]). A preview moves the store's tiles as the
+//! finest work will, so a stroke places each dab on the surface its dabs before it leave, up to
+//! the stored encoding, however far the finest work lags (the brush-engine spec, "The surface
+//! placement reads"). With no preview, it is the store's surface.
+//!
 //! # Raycasts
 //!
-//! [`Surface::raycast`] is picking's raycast, [`SpatialIndex::raycast_triangle`]: the index's
-//! tree walked nearest box first, each candidate tile evaluated and its quads intersected as two
-//! triangles. It hits the same tile at the same ray parameter as picking, and keeps which
-//! triangle and where on it, for the [`Hit`]: the point is interpolated on the triangle (so it
-//! agrees with picking's `origin + direction · t` to rounding, about `1e-5` of the scene's size,
-//! not bit for bit), the normal is interpolated from the evaluated normals at its corners
-//! ([`TileStore::normals`]), and the base face's coordinates from the vertices' grid places.
+//! [`Surface::raycast`] is picking's raycast over the stroke's surface,
+//! [`SpatialIndex::raycast_surface`]: the index's tree walked nearest box first, each candidate
+//! tile evaluated (or its preview read) and its quads intersected as two triangles. With no
+//! preview it hits the same tile at the same ray parameter as picking, and keeps which triangle and
+//! where on it, for the [`Hit`]: the point is interpolated on the triangle (so it agrees with
+//! picking's `origin + direction · t` to rounding, about `1e-5` of the scene's size, not bit for
+//! bit), the normal is interpolated from the surface's normals at its corners
+//! ([`TileStore::surface_normals`]), and the base face's coordinates from the vertices' grid
+//! places.
 //!
 //! # The stroke's region
 //!
@@ -178,7 +190,7 @@ impl<'a> StoreSurface<'a> {
         let (x0, y0) = (floor_to(x, side - 1), floor_to(y, side - 1));
         let (x1, y1) = ((x0 + 1).min(side - 1), (y0 + 1).min(side - 1));
         let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
-        let positions = self.store.evaluate(key)?;
+        let positions = self.store.surface_positions(key)?;
         let nearest = corners
             .into_iter()
             .filter_map(|(i, j)| {
@@ -213,7 +225,7 @@ impl<'a> StoreSurface<'a> {
         let missing: Vec<TileKey> = self
             .index
             .query_sphere(center.to_f32(), radius)
-            .filter(|key| store.cached_positions(key).is_none())
+            .filter(|key| store.cached_surface_positions(key).is_none())
             .collect();
         if !missing.is_empty() {
             self.store.evaluate_many(&missing, Evaluation::Positions)?;
@@ -230,7 +242,7 @@ impl<'a> StoreSurface<'a> {
         let Some(narrow) = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32()) else {
             return Ok(None);
         };
-        let Some(triangle) = self.index.raycast_triangle(self.store, &narrow)? else {
+        let Some(triangle) = self.index.raycast_surface(self.store, &narrow)? else {
             return Ok(None);
         };
         self.hit_on_triangle(ray, triangle).map(Some)
@@ -268,28 +280,20 @@ impl<'a> StoreSurface<'a> {
         })
     }
 
-    /// The evaluated positions and normals of tile `key`'s vertices `at` (row-major indices),
-    /// in `f64`, its normals made current first.
+    /// The positions and normals of tile `key`'s vertices `at` (row-major indices) on the
+    /// stroke's surface, in `f64`.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::normals`].
+    /// As [`TileStore::surface_normals`] and [`TileStore::surface_positions`].
     fn tile_values<const N: usize>(
         &mut self,
         key: TileKey,
         at: [usize; N],
     ) -> Result<([DVec3; N], [DVec3; N]), SculptError> {
-        self.store.normals(key)?;
-        let (Some(positions), Some(normals)) = (
-            self.store.cached_positions(&key),
-            self.store.cached_normals(&key),
-        ) else {
-            // Made current just above: only a store that dropped them at once could miss.
-            let normals = self.store.normals(key)?.to_vec();
-            let positions = self.store.evaluate(key)?.to_vec();
-            return Ok((gather(&positions, at), gather(&normals, at)));
-        };
-        Ok((gather(positions, at), gather(normals, at)))
+        let normals = gather(self.store.surface_normals(key)?, at);
+        let positions = gather(self.store.surface_positions(key)?, at);
+        Ok((positions, normals))
     }
 
     /// The walk from `near` over the region within `reach` of it (see the module notes), its
@@ -357,7 +361,7 @@ impl<'a> StoreSurface<'a> {
             let Some(reached) = walked.tiles.get(&key) else {
                 continue;
             };
-            let positions = self.store.evaluate(key)?;
+            let positions = self.store.surface_positions(key)?;
             let on_region = positions
                 .iter()
                 .enumerate()
@@ -459,11 +463,12 @@ impl Source for Reader<'_> {
     }
 
     fn positions(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
-        self.store.evaluate(key)
+        self.store.surface_positions(key)
     }
 
     /// Whether the tile's box in the index lies inside the ball: every corner of it within
-    /// reach. The index is refitted after every edit, so its boxes bound the positions.
+    /// reach. The index is refitted after every edit, and grown to every preview, so its boxes
+    /// bound the surface's positions.
     fn wholly_within(&self, key: &TileKey, center: DVec3, reach_squared: f64) -> bool {
         let Some(bounds) = self.index.bvh().bounds(key) else {
             return false;

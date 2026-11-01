@@ -250,7 +250,9 @@ impl Case {
         store.close_epoch().expect("closed");
         if !self.shown.is_empty() {
             // The store moved under the previews: they are made again.
-            self.preview.rebase(store, &self.index).expect("rebased");
+            self.preview
+                .rebase(store, &mut self.index)
+                .expect("rebased");
         }
     }
 
@@ -281,7 +283,7 @@ impl Case {
     fn show(&mut self, places: &[(u8, u8)]) {
         let dabs = self.placed(places);
         self.preview
-            .show(self.project.store(), &self.index, &dabs)
+            .show(self.project.store(), &mut self.index, &dabs)
             .expect("shown");
         self.shown.extend(dabs);
     }
@@ -313,7 +315,7 @@ impl Case {
             .end_unrecorded_stroke()
             .expect("the stroke ends");
         self.preview
-            .land(self.project.store(), &self.index, count)
+            .land(self.project.store(), &mut self.index, count)
             .expect("landed");
     }
 
