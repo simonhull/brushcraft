@@ -5,9 +5,17 @@
 //! the floor (every display tile to level 6) and every display tile of levels 7 and 8 resident,
 //! about 5,800 tiles. The cut is either every level-8 tile of the sphere (3,456) or, every other
 //! frame, half the faces a level coarser (2,160); about three in five of its tiles are drawn.
-//! Each sample is one call, its frame begun untimed before it. The GPU is the default adapter,
-//! or the first whose name contains `BRUSHCRAFT_ADAPTER`; any failure panics, so a broken run
-//! never passes for a fast one.
+//! Each sample is one call, its frame begun untimed before it.
+//!
+//! The use is cheap partly because what it once made every frame the cut changed (the places
+//! the cut shields from eviction) is made only when a frame evicts. `use_frame_evicting` times
+//! such a frame whole: on the same sphere under a budget of [`FULL_SLOTS`] side-65 slots past
+//! the floor, every slot taken, a changing cut of odd faces' tiles (about 1,100 tiles, then 700),
+//! then staging one tile of an even face, which evicts one. Its time counts the use, the shielded
+//! places made for the eviction, and the staging and the eviction themselves.
+//!
+//! The GPU is the default adapter, or the first whose name contains `BRUSHCRAFT_ADAPTER`; any
+//! failure panics, so a broken run never passes for a fast one.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -17,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use geom::{BaseMesh, FinestNormalCone, Level, TileKey, cube_sphere};
 use render::gpu::{AdapterRequest, Gpu};
-use render::residency::{FrameUse, Request, Requests, Residency, ResidencyConfig};
+use render::residency::{FrameUse, Request, Requests, Residency, ResidencyConfig, SizeClass};
 use render::upload::{FrameUploads, TileData, TileDetail, TileSource};
 use store::Drained;
 use wgpu::{CommandEncoderDescriptor, PollType};
@@ -30,6 +38,14 @@ const FLOOR_TOP: u8 = 6;
 
 /// The most frames the setup stages to bring every tile in.
 const SETUP_FRAMES: usize = 400;
+
+/// Side-65 slots the evicting bench's budget holds past the floor: fewer than the sphere's
+/// tiles of levels 6 to 8 (4,536), so the pools fill.
+const FULL_SLOTS: u64 = 3000;
+
+/// Frames in a row that bring nothing in before the evicting bench's setup calls the pools
+/// full.
+const IDLE_FRAMES: usize = 3;
 
 /// Ends the run on a failure, saying what failed: a broken run never passes for a fast one.
 trait OrDie<T> {
@@ -205,4 +221,152 @@ fn use_frame(bencher: divan::Bencher<'_, '_>, changing: bool) {
             uses.get(state.1 % 2).cloned().unwrap_or_default()
         })
         .bench_local_values(|used| state.borrow_mut().0.use_frame(used));
+}
+
+/// Wants `keys`, a screen error each.
+fn requests(keys: &[TileKey]) -> Requests {
+    let wanted = keys.iter().map(|&key| Request {
+        key,
+        screen_error: 1.0,
+    });
+    Requests::new(wanted, 0)
+}
+
+/// Whether `key` lies on an odd face: the evicting bench's cuts are there, its arrivals not.
+fn odd(key: &TileKey) -> bool {
+    !key.face().index().is_multiple_of(2)
+}
+
+/// Residency with full pools, its two cuts, and the tiles waiting to come in.
+///
+/// The budget holds [`FULL_SLOTS`] side-65 slots past the floor (to level 5), every one taken
+/// by tiles of levels 6 to 8. The cuts are of odd faces' resident tiles; the even faces' tiles
+/// not resident wait.
+///
+/// # Panics
+///
+/// If the mesh, the configuration, residency or the GPU fails, or the pools never fill.
+fn full(gpu: &Gpu) -> (Residency, [BTreeSet<TileKey>; 2], Vec<TileKey>) {
+    let mesh = cube_sphere(6).or_die("a mesh");
+    let big = SizeClass::of(level(FINEST)).slot_bytes();
+    // The floor's classes, twice over (their shadow headroom), reserved first.
+    let faces = u64::from(mesh.face_count());
+    let floor_classes = (0..6).filter_map(SizeClass::new);
+    let floor: u64 = floor_classes
+        .map(|class| 2 * class.slot_bytes() * faces)
+        .sum();
+    let config = ResidencyConfig::default()
+        .with_budget(floor + FULL_SLOTS * big)
+        .and_then(|config| config.with_buffer_bytes(64 * big))
+        .or_die("a configuration");
+    let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).or_die("residency");
+    let [middle, coarse, fine] = [6, 7, 8].map(|l| display_tiles(&mesh, l));
+    let all: Vec<TileKey> = [middle, coarse.clone(), fine.clone()].concat();
+    let wanted = requests(&all);
+    let (mut last, mut idle) = (0, 0);
+    for _ in 0..SETUP_FRAMES {
+        residency.begin_frame(gpu).or_die("a frame begins");
+        residency.apply(Drained::Epochs(Vec::new()));
+        residency.want(&wanted);
+        let uploads = residency
+            .stage(gpu, &mut Zeros, Instant::now() + Duration::from_secs(60))
+            .or_die("staged");
+        submit(gpu, uploads);
+        let now = residency.stats().resident;
+        idle = if now == last { idle + 1 } else { 0 };
+        last = now;
+        if idle >= IDLE_FRAMES {
+            break;
+        }
+    }
+    assert!(idle >= IDLE_FRAMES, "the pools fill");
+    let present: BTreeSet<TileKey> = residency.resident().copied().collect();
+    let odd_fine = fine.iter().filter(|key| odd(key) && present.contains(key));
+    let every: BTreeSet<TileKey> = odd_fine.copied().collect();
+    // A quarter of the faces a level coarser.
+    let quarter = |key: &TileKey, rest: u32| key.face().index() % 4 == rest;
+    let kept_fine = every.iter().filter(|key| quarter(key, 1));
+    let coarser = coarse
+        .iter()
+        .filter(|key| quarter(key, 3) && present.contains(key));
+    let mixed: BTreeSet<TileKey> = kept_fine.chain(coarser).copied().collect();
+    let even_absent = all.iter().filter(|key| !odd(key) && !present.contains(key));
+    let waiting: Vec<TileKey> = even_absent.copied().collect();
+    assert!(!waiting.is_empty(), "some tiles wait");
+    (residency, [every, mixed], waiting)
+}
+
+/// One frame under full pools: [`Residency::use_frame`] of a changing cut of thousands of tiles,
+/// then staging one tile, which evicts one (see the module notes).
+///
+/// # Panics
+///
+/// If the GPU or residency fails, or the frames evict nothing.
+#[divan::bench(sample_count = 200, sample_size = 1)]
+fn use_frame_evicting(bencher: divan::Bencher<'_, '_>) {
+    let gpu = GPU.get().or_die("the GPU, opened by main");
+    let (residency, cuts, waiting) = full(gpu);
+    let uses = cuts.each_ref().map(frame_use);
+    let present: BTreeSet<TileKey> = residency.resident().copied().collect();
+    let evictions = residency.stats().evictions;
+    let state = RefCell::new(Evicting {
+        residency,
+        frame: 0,
+        waiting,
+        present,
+        sent: None,
+    });
+    bencher
+        .with_inputs(|| {
+            // Untimed: the last frame submitted; the tile it brought in off the line, the one
+            // it evicted to the back; the next frame begun, its tile and the next wanted (a
+            // tile is staged from the frame after it is first wanted); and its use.
+            let mut state = state.borrow_mut();
+            if let Some(uploads) = state.sent.take() {
+                submit(gpu, uploads);
+            }
+            let now: BTreeSet<TileKey> = state.residency.resident().copied().collect();
+            let evicted = state.present.difference(&now).filter(|key| !odd(key));
+            let evicted: Vec<TileKey> = evicted.copied().collect();
+            state.waiting.retain(|key| !now.contains(key));
+            state.waiting.extend(evicted);
+            state.present = now;
+            state.residency.begin_frame(gpu).or_die("a frame begins");
+            state.residency.apply(Drained::Epochs(Vec::new()));
+            let next: Vec<TileKey> = state.waiting.iter().take(2).copied().collect();
+            state.residency.want(&requests(&next));
+            state.frame += 1;
+            uses.get(state.frame % 2).cloned().unwrap_or_default()
+        })
+        .bench_local_values(|used| {
+            let mut state = state.borrow_mut();
+            state.residency.use_frame(used);
+            let uploads = state
+                .residency
+                .stage(gpu, &mut Zeros, Instant::now() + Duration::from_secs(60))
+                .or_die("staged");
+            state.sent = Some(uploads);
+        });
+    let mut state = state.borrow_mut();
+    if let Some(uploads) = state.sent.take() {
+        submit(gpu, uploads);
+    }
+    assert!(
+        state.residency.stats().evictions > evictions,
+        "the frames evict"
+    );
+}
+
+/// The evicting bench's state between samples.
+struct Evicting {
+    /// The residency.
+    residency: Residency,
+    /// Frames run.
+    frame: usize,
+    /// The even faces' tiles not resident, next to bring in first.
+    waiting: Vec<TileKey>,
+    /// The tiles resident after the last frame: those gone since were evicted.
+    present: BTreeSet<TileKey>,
+    /// The last frame's uploads, submitted before the next.
+    sent: Option<FrameUploads>,
 }
