@@ -1772,7 +1772,7 @@ fn random_key(rng: &mut Rng) -> TileKey {
 }
 
 #[test]
-fn keys_sort_by_their_packed_order_as_by_their_own_and_a_cut_reads_back_as_the_same_set() {
+fn keys_sort_by_their_packed_order_as_by_their_own_and_a_cut_reads_back_as_the_same_sets() {
     let mut rng = Rng(41);
     let keys: Vec<TileKey> = (0..4000).map(|_| random_key(&mut rng)).collect();
     for pair in keys.windows(2) {
@@ -1780,9 +1780,26 @@ fn keys_sort_by_their_packed_order_as_by_their_own_and_a_cut_reads_back_as_the_s
         let packed = key_order(a).cmp(&key_order(b));
         assert_eq!(packed, a.cmp(b), "{a:?} against {b:?}");
     }
-    // Duplicates too: every third key twice.
-    let mut doubled = keys.clone();
-    doubled.extend(keys.iter().step_by(3).copied());
-    let from_scratch: BTreeSet<TileKey> = doubled.iter().copied().collect();
-    assert_eq!(sorted_set(doubled), from_scratch);
+    // Duplicates too: every third key twice, drawn in either, both or neither.
+    let twice = keys.iter().step_by(3);
+    let read: Vec<(TileKey, bool)> = keys
+        .iter()
+        .chain(twice)
+        .map(|&key| (key, rng.below(3) == 0))
+        .collect();
+    // One at a time, as the sets were once built.
+    let mut cut: BTreeSet<TileKey> = BTreeSet::new();
+    let mut drawn: BTreeSet<TileKey> = BTreeSet::new();
+    for &(key, was_drawn) in &read {
+        cut.insert(key);
+        if was_drawn {
+            drawn.insert(key);
+        }
+    }
+    let tiles = read.iter().map(|&(key, was_drawn)| CutTile {
+        order: key_order(&key),
+        key,
+        drawn: was_drawn,
+    });
+    assert_eq!(cut_sets(tiles.collect()), (cut, drawn));
 }

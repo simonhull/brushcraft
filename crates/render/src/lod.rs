@@ -2169,8 +2169,7 @@ fn read_output(
         .unwrap_or_default();
     let written = entries.iter();
     let mut nodes: Vec<(u32, Place)> = Vec::with_capacity(entries.len());
-    let mut cut: Vec<TileKey> = Vec::with_capacity(entries.len());
-    let mut drawn: Vec<TileKey> = Vec::with_capacity(entries.len());
+    let mut tiles: Vec<CutTile> = Vec::with_capacity(entries.len());
     for entry in written {
         let Some(place) = Place::from_packed(entry.face, entry.place) else {
             continue;
@@ -2179,29 +2178,51 @@ fn read_output(
         let Some(key) = place.key(finest) else {
             continue;
         };
-        cut.push(key);
-        if entry.flags & CUT_DRAWN != 0 {
-            drawn.push(key);
-        }
+        tiles.push(CutTile {
+            order: key_order(&key),
+            key,
+            drawn: entry.flags & CUT_DRAWN != 0,
+        });
     }
-    // Built whole from the keys, sorted in a vector: inserting thousands one at a time is the
-    // most of the owner's time reading a cut.
+    let (cut, drawn) = cut_sets(tiles);
     Ok(LodOutput {
         frame: tag,
-        cut: sorted_set(cut),
-        drawn: sorted_set(drawn),
+        cut,
+        drawn,
         nodes,
         stats: stats(&frame),
         timings,
     })
 }
 
-/// The set of `keys`, built in one pass once they are sorted (duplicates count once).
-fn sorted_set(mut keys: Vec<TileKey>) -> BTreeSet<TileKey> {
-    keys.sort_unstable_by_key(key_order);
-    keys.dedup();
-    // Already sorted, so the set's own sort is a single check before it builds.
-    keys.into_iter().collect()
+/// A tile of a cut readback, as [`cut_sets`] sorts it.
+#[derive(Debug, Clone, Copy)]
+struct CutTile {
+    /// Its key's order ([`key_order`]).
+    order: u128,
+    /// Its key.
+    key: TileKey,
+    /// Whether it was drawn.
+    drawn: bool,
+}
+
+/// The cut's set of `tiles`, and the set of those drawn.
+///
+/// A tile there twice is drawn if either was. The sets are built whole once the tiles are
+/// sorted: inserting thousands one at a time was most of the owner thread's time reading a cut.
+fn cut_sets(mut tiles: Vec<CutTile>) -> (BTreeSet<TileKey>, BTreeSet<TileKey>) {
+    tiles.sort_unstable_by_key(|tile| tile.order);
+    tiles.dedup_by(|later, kept| {
+        let same = later.order == kept.order;
+        kept.drawn |= same && later.drawn;
+        same
+    });
+    // Already sorted, so each set's own sort is a single check before it builds.
+    let keys = tiles.iter().map(|tile| tile.key);
+    let cut: BTreeSet<TileKey> = keys.collect();
+    let drawn = tiles.iter().filter(|tile| tile.drawn).map(|tile| tile.key);
+    let drawn: BTreeSet<TileKey> = drawn.collect();
+    (cut, drawn)
 }
 
 /// `key` as one number whose order is the key's: its fields packed in the order its `Ord`
