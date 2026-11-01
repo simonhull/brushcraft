@@ -708,7 +708,7 @@ impl TileStore {
     /// The scratch buffers, taken out of the store so the owner thread can install from them
     /// while it changes the store, with at least `n` (at most [`ROUND`]) of them. The caller
     /// puts them back.
-    fn take_scratch(&mut self, n: usize) -> Vec<Vec<Vec3>> {
+    pub(super) fn take_scratch(&mut self, n: usize) -> Vec<Vec<Vec3>> {
         let mut scratch = std::mem::take(&mut self.scratch);
         let n = n.min(ROUND);
         if scratch.len() < n {

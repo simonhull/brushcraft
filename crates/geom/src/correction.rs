@@ -269,6 +269,19 @@ impl<'a> CorrectionView<'a> {
         }
     }
 
+    /// A [`CorrectionTile`] holding a copy of this tile: the same side, scale, interior and
+    /// border, so the same bits for every vertex. For editing a tile away from its storage (a
+    /// brush replaying several dabs on one tile), then writing it back whole.
+    #[must_use]
+    pub fn to_tile(self) -> CorrectionTile {
+        CorrectionTile {
+            side: self.side,
+            scale: self.scale,
+            interior: self.interior.to_vec(),
+            border: self.border.to_vec(),
+        }
+    }
+
     /// The correction at `(i, j)`, or `None` outside the tile.
     #[must_use]
     pub fn get(&self, i: u32, j: u32) -> Option<Vec3> {
@@ -1077,6 +1090,22 @@ mod tests {
     /// Every interior vertex of a tile of `side`, row-major.
     fn interior_cells(side: u32) -> impl Iterator<Item = (u32, u32)> {
         (1..side - 1).flat_map(move |j| (1..side - 1).map(move |i| (i, j)))
+    }
+
+    #[test]
+    fn a_view_copied_to_a_tile_is_the_same_tile() {
+        let side = 9;
+        let mut tile = CorrectionTile::zero(side).unwrap();
+        let mut rng = Rng::new(5);
+        let cells = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
+        for (i, j) in cells {
+            tile.set(i, j, rng.vec3(0.02)).unwrap();
+        }
+        let copy = tile.view().to_tile();
+        assert_eq!(copy, tile, "side, scale, interior and border");
+        let mut edited = copy;
+        edited.set(4, 4, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+        assert_ne!(edited, tile, "the copy is its own");
     }
 
     #[test]

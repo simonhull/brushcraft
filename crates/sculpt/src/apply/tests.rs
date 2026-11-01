@@ -2,7 +2,7 @@
 //! and its errors.
 
 use geom::{CorrectionError, FaceId, Level, TileKey, Vec3};
-use store::{CacheError, Project, SpatialIndex, Workers};
+use store::{CacheError, Project, SpatialIndex, StoreConfig, Workers};
 use stroke::Dab;
 
 use super::{ApplyStats, SculptError, apply_dabs};
@@ -45,6 +45,17 @@ fn apply_in_frames(
     frames: &[usize],
 ) -> ApplyStats {
     let mut brush_state = Stroke::new(project.store());
+    apply_with(project, index, &mut brush_state, dabs, frames)
+}
+
+/// [`apply_in_frames`] with `brush_state`, the stroke's state.
+fn apply_with(
+    project: &mut Project,
+    index: &mut SpatialIndex,
+    brush_state: &mut Stroke,
+    dabs: &[Dab],
+    frames: &[usize],
+) -> ApplyStats {
     project.begin_stroke().unwrap();
     let mut stats = ApplyStats::default();
     let mut rest = dabs;
@@ -53,7 +64,7 @@ fn apply_in_frames(
             break;
         }
         let (frame, after) = rest.split_at(size.min(rest.len()));
-        stats += apply_dabs(project.store(), index, &mut brush_state, frame).unwrap();
+        stats += apply_dabs(project.store(), index, brush_state, frame).unwrap();
         rest = after;
     }
     project.end_unrecorded_stroke().unwrap();
@@ -63,32 +74,59 @@ fn apply_in_frames(
 /// A fresh cube with `workers`, the stroke's dabs planned on it, and those dabs applied in
 /// frames of `frames`: the store's every tile afterwards, in bits, with its index's bounds.
 fn run(workers: Workers, frames: &[usize]) -> (Snapshot, ApplyStats) {
+    run_over(
+        StoreConfig::new(64 << 20, 1).with_workers(workers),
+        24,
+        frames,
+    )
+}
+
+/// [`run`] for a stroke of `count` dabs over a store of `config` (in 1 MiB chunks).
+fn run_over(config: StoreConfig, count: u32, frames: &[usize]) -> (Snapshot, ApplyStats) {
     let dir = TestDir::new();
-    let (mut project, mut index) = cube(&dir, level(), workers);
-    let dabs = path(&mut project, 24);
-    let stats = apply_in_frames(&mut project, &mut index, &dabs, frames);
+    let config = store::ProjectConfig {
+        store: config.with_chunk_bytes(1 << 20),
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let mut project = Project::new(geom::cube_sphere(1).unwrap(), config).unwrap();
+    let mut index = SpatialIndex::build(project.store(), level(), |_, _| {}).unwrap();
+    let dabs = path(&mut project, count);
+    let mut brush_state = Stroke::new(project.store());
+    let stats = apply_with(&mut project, &mut index, &mut brush_state, &dabs, frames);
     let tiles = snapshot(project.store(), level());
     let bounds = index
         .bvh()
         .iter()
         .map(|(key, bounds)| (*key, format!("{bounds:?}")))
         .collect();
-    (Snapshot { tiles, bounds }, stats)
+    let stroke = brush_state.bits();
+    let snapshot = Snapshot {
+        tiles,
+        bounds,
+        stroke,
+    };
+    (snapshot, stats)
 }
 
-/// A store's tiles in bits, and its index's bounds.
+/// A store's tiles in bits, its index's bounds and the stroke's state.
 #[derive(Debug, PartialEq)]
 struct Snapshot {
     /// Every tile's corrections, positions and normals.
     tiles: std::collections::BTreeMap<TileKey, TileBits>,
     /// Every tile's bounds in the index, printed (bit-exact for finite floats).
     bounds: std::collections::BTreeMap<TileKey, String>,
+    /// The stroke's state after the dabs, in bits ([`Stroke::bits`]).
+    stroke: StrokeBits,
 }
+
+/// What [`Stroke::bits`] gives.
+type StrokeBits = (crate::state::Book, Vec<crate::state::TileBits>);
 
 #[test]
 fn a_frame_of_dabs_equals_its_dabs_one_call_each_bit_for_bit() {
     let (alone, one_each) = run(fixed(2), &[1]);
     assert_eq!(one_each.dabs, 24, "every dab applied");
+    assert_eq!(one_each.tiled_dabs, 0, "a dab alone is applied as it was");
     assert!(
         one_each.vertices > 10_000,
         "the dabs move vertices: {one_each:?}"
@@ -101,6 +139,11 @@ fn a_frame_of_dabs_equals_its_dabs_one_call_each_bit_for_bit() {
         let (framed, stats) = run(fixed(2), frames);
         assert_eq!(stats.dabs, 24, "frames {frames:?}: every dab applied");
         assert_eq!(
+            stats.tiled_dabs,
+            24 - alone_in_frames(24, frames),
+            "frames {frames:?}: every dab of a frame of two or more applied tile by tile"
+        );
+        assert_eq!(
             stats.vertices, one_each.vertices,
             "frames {frames:?}: the same vertex moves"
         );
@@ -110,8 +153,72 @@ fn a_frame_of_dabs_equals_its_dabs_one_call_each_bit_for_bit() {
             .filter(|(key, tile)| alone.tiles.get(key) != Some(tile))
             .count();
         assert_eq!(differ, 0, "frames {frames:?}: tiles that differ");
-        assert!(framed == alone, "frames {frames:?}: the index's bounds too");
+        assert!(
+            framed.bounds == alone.bounds,
+            "frames {frames:?}: the index's bounds too"
+        );
+        assert!(framed == alone, "frames {frames:?}: and the stroke's state");
     }
+}
+
+/// How many of `count` dabs applied in frames of the sizes `frames` cycles through are alone
+/// in their frame: a frame of one dab is applied as it was before frames were tiled.
+fn alone_in_frames(count: usize, frames: &[usize]) -> usize {
+    let mut rest = count;
+    let mut alone = 0;
+    for &size in frames.iter().cycle() {
+        if rest == 0 {
+            break;
+        }
+        let taken = size.min(rest);
+        alone += usize::from(taken == 1);
+        rest -= taken;
+    }
+    alone
+}
+
+#[test]
+fn a_frame_equals_its_dabs_one_call_each_when_the_stroke_state_runs_out() {
+    // With a few buffers, the stroke releases tiles and writes others per dab mid-frame: a
+    // run's first replay assumes neither, and the second takes the grants the first one's
+    // dabs give.
+    for buffers in [0, 1, 2, 3, 5] {
+        let config = StoreConfig::new(64 << 20, 1)
+            .with_workers(fixed(2))
+            .with_stroke_tiles(buffers);
+        let (alone, one_each) = run_over(config, 32, &[1]);
+        assert!(
+            buffers > 2 || one_each.tiles_unaccumulated > 0,
+            "{buffers} buffers: some tiles written per dab: {one_each:?}"
+        );
+        for frames in [&[32][..], &[5, 3], &[9]] {
+            let (framed, stats) = run_over(config, 32, frames);
+            assert_eq!(
+                stats.tiles_unaccumulated, one_each.tiles_unaccumulated,
+                "{buffers} buffers, frames {frames:?}: the same tiles written per dab"
+            );
+            assert!(
+                stats.tiled_dabs > 0,
+                "{buffers} buffers, frames {frames:?}: dabs applied tile by tile"
+            );
+            assert!(
+                framed == alone,
+                "{buffers} buffers, frames {frames:?}: the same bits"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_frame_equals_its_dabs_one_call_each_with_no_predictions_kept() {
+    // No tile can have its prediction: every run is one dab.
+    let config = StoreConfig::new(64 << 20, 1)
+        .with_workers(fixed(2))
+        .with_kept_predictions(0);
+    let (alone, _) = run_over(config, 24, &[1]);
+    let (framed, stats) = run_over(config, 24, &[24]);
+    assert_eq!(stats.tiled_dabs, 24, "every dab tile by tile, one a run");
+    assert!(framed == alone, "the same bits");
 }
 
 #[test]
@@ -373,7 +480,7 @@ fn a_failed_call_closes_its_epoch() {
 /// the pools.
 fn tight(dir: &TestDir, budget: usize) -> Option<(Project, SpatialIndex)> {
     let config = store::ProjectConfig {
-        store: store::StoreConfig::new(budget, 1)
+        store: StoreConfig::new(budget, 1)
             .with_chunk_bytes(64 << 10)
             .with_kept_predictions(0)
             .with_stroke_tiles(8)
@@ -407,7 +514,7 @@ fn far_apart_one_call_each(budget: usize) -> std::collections::BTreeMap<TileKey,
 #[test]
 fn a_frame_too_big_to_pin_is_applied_in_two_with_the_same_bits() {
     let mesh = geom::cube_sphere(1).unwrap();
-    let minimum = store::StoreConfig::new(0, 1)
+    let minimum = StoreConfig::new(0, 1)
         .with_chunk_bytes(64 << 10)
         .with_kept_predictions(0)
         .with_stroke_tiles(8)
@@ -444,7 +551,7 @@ fn a_frame_too_big_to_pin_is_applied_in_two_with_the_same_bits() {
 fn a_frame_of_dabs_closes_one_step_epoch_with_their_displacements_summed() {
     let dir = TestDir::new();
     let config = store::ProjectConfig {
-        store: store::StoreConfig::new(64 << 20, 1)
+        store: StoreConfig::new(64 << 20, 1)
             .with_chunk_bytes(1 << 20)
             .with_workers(fixed(2))
             .with_display(level()),

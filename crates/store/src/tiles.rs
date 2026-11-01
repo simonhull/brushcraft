@@ -149,6 +149,7 @@ mod pins;
 mod queued;
 mod read;
 mod read_ahead;
+mod replay;
 mod ring;
 mod round;
 mod stream;

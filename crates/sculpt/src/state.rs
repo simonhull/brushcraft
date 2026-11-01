@@ -67,13 +67,124 @@ pub struct Stroke {
     /// The op of the stroke the state belongs to: the store's op when the last dab ended.
     /// A dab that finds the store at another op releases every tile first.
     op: Option<OpId>,
-    /// The dabs counted so far, the current one included: each tile's last dab is one of them.
-    dab: u64,
-    /// The tiles whose state the stroke keeps, each with its buffers.
+    /// Which tiles hold state, the dab that last edited each and the dabs counted: the
+    /// decisions of "Releasing tiles", kept apart from the buffers so a frame can make them
+    /// ahead of its writes (see [`Book`]).
+    book: Book,
+    /// The tiles whose state the stroke keeps, each with its buffers: those `book` holds.
     tiles: BTreeMap<TileKey, TileStroke>,
     /// The buffers no tile holds, ready for the next tile that needs state: with `tiles`, the
-    /// store's [`TileStore::stroke_tiles`] of them.
+    /// store's [`TileStore::stroke_tiles`] of them, as many as `book` counts free.
     free: Vec<TileStroke>,
+}
+
+/// What a dab's edit of a tile finds of the tile's stroke state, as [`Book::begin_dab`] grants
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Grant {
+    /// The tile held state before the dab: its starts and sums go on.
+    Held,
+    /// The tile was given a buffer at the dab: every start uncaptured, every sum zero.
+    Taken,
+    /// No buffer was free or could be released: the tile is written per dab (see "The thrash
+    /// limit" on [`Stroke`]).
+    Without,
+}
+
+/// The bookkeeping of a [`Stroke`]: which tiles hold state, the dab that last edited each, the
+/// dabs counted and the buffers free.
+///
+/// Its decisions are those of "Releasing tiles" on [`Stroke`], made from the tiles each dab
+/// edits and nothing else, so a copy can make a frame's decisions after the frame's dabs are
+/// worked out and before anything is written ([`crate::apply_dabs`]), and they are the
+/// stroke's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Book {
+    /// The dabs counted so far, the current one included: each tile's last dab is one of them.
+    dab: u64,
+    /// The tiles holding state, each with the dab that last edited it.
+    held: BTreeMap<TileKey, u64>,
+    /// How many buffers no tile holds.
+    free: usize,
+}
+
+impl Book {
+    /// A book of `buffers` free buffers and no dab counted.
+    const fn new(buffers: usize) -> Self {
+        Self {
+            dab: 0,
+            held: BTreeMap::new(),
+            free: buffers,
+        }
+    }
+
+    /// Counts a dab that edits `edited` (in key order) and gives each edited tile state, in key
+    /// order, while some is free or can be released (see [`Stroke`]). Returns the grants,
+    /// aligned with `edited`, after adding the tiles released for them to `released`, in the
+    /// order they were released.
+    pub(crate) fn begin_dab(
+        &mut self,
+        edited: &[TileKey],
+        released: &mut Vec<TileKey>,
+    ) -> Vec<Grant> {
+        self.dab += 1;
+        // Tiles already held are marked first, so none of this dab's is released for another.
+        for key in edited {
+            if let Some(last) = self.held.get_mut(key) {
+                *last = self.dab;
+            }
+        }
+        let mut grants = Vec::with_capacity(edited.len());
+        for key in edited {
+            if self.held.contains_key(key) {
+                grants.push(Grant::Held);
+                continue;
+            }
+            if self.free == 0
+                && let Some(oldest) = self.release_oldest()
+            {
+                released.push(oldest);
+            }
+            if self.free > 0 {
+                self.free -= 1;
+                self.held.insert(*key, self.dab);
+                grants.push(Grant::Taken);
+            } else {
+                grants.push(Grant::Without);
+            }
+        }
+        grants
+    }
+
+    /// Whether `key` holds state now.
+    pub(crate) fn holds(&self, key: &TileKey) -> bool {
+        self.held.contains_key(key)
+    }
+
+    /// Releases every tile: a new stroke begins.
+    fn release_all(&mut self) {
+        self.free += self.held.len();
+        self.held.clear();
+    }
+
+    /// Releases the tile with the oldest last dab, the least key among equals, of those not
+    /// edited in the last [`Stroke::PROTECTED_DABS`] dabs, and returns it; `None` if every
+    /// tile held is protected.
+    ///
+    /// A scan of the tiles held: it runs only when every buffer is taken, which a stroke over the
+    /// default reservation reaches only when it has edited 512 tiles.
+    fn release_oldest(&mut self) -> Option<TileKey> {
+        let dab = self.dab;
+        let oldest = self
+            .held
+            .iter()
+            .filter(|&(_, &last)| dab.saturating_sub(last) >= Stroke::PROTECTED_DABS)
+            .min_by_key(|&(key, &last)| (last, *key))
+            .map(|(key, _)| *key)?;
+        self.held.remove(&oldest);
+        self.free += 1;
+        Some(oldest)
+    }
 }
 
 impl Stroke {
@@ -90,7 +201,7 @@ impl Stroke {
         Self {
             store: store.id(),
             op: None,
-            dab: 0,
+            book: Book::new(store.stroke_tiles()),
             tiles: BTreeMap::new(),
             free: (0..store.stroke_tiles())
                 .map(|_| TileStroke::new())
@@ -98,12 +209,13 @@ impl Stroke {
         }
     }
 
-    /// Readies the state for a dab over `store` that edits `edited` (in key order): releases
-    /// every tile if the store or its op isn't the stroke's (taking the size of a new store's
-    /// reservation), counts the dab, and gives each edited tile state, in key order, while some
-    /// is free or can be released (see [`Stroke`]). Returns how many edited tiles got none: those
-    /// are written per dab.
-    pub(crate) fn begin_dab(&mut self, store: &TileStore, edited: &[TileKey]) -> usize {
+    /// Readies the state for dabs over `store`: releases every tile if the store or its op isn't
+    /// the stroke's (taking the size of a new store's reservation), and takes the store's op.
+    ///
+    /// Every dab does this before it counts. Within one frame, only the first dab can find
+    /// anything to do: an op changes only when an edit begins one, which the first dab that
+    /// writes does, and the op it begins is the one the next dab finds.
+    pub(crate) fn begin_frame(&mut self, store: &TileStore) {
         let op = store.current_op();
         if store.id() != self.store {
             self.release_all();
@@ -111,31 +223,38 @@ impl Stroke {
             self.free.truncate(store.stroke_tiles());
             let missing = store.stroke_tiles().saturating_sub(self.free.len());
             self.free.extend((0..missing).map(|_| TileStroke::new()));
+            self.book = Book::new(self.free.len());
         } else if op != self.op {
             self.release_all();
         }
         self.op = op;
-        self.dab += 1;
-        // Tiles already held are marked first, so none of this dab's is released for another.
-        for key in edited {
-            if let Some(tile) = self.tiles.get_mut(key) {
-                tile.last_dab = self.dab;
+    }
+
+    /// Readies the state for a dab over `store` that edits `edited` (in key order): as
+    /// [`Stroke::begin_frame`], then counts the dab and gives each edited tile state, in key
+    /// order, while some is free or can be released (see [`Stroke`]). Returns how many edited
+    /// tiles got none: those are written per dab.
+    pub(crate) fn begin_dab(&mut self, store: &TileStore, edited: &[TileKey]) -> usize {
+        self.begin_frame(store);
+        let mut released = Vec::new();
+        let grants = self.book.begin_dab(edited, &mut released);
+        for key in &released {
+            if let Some(tile) = self.tiles.remove(key) {
+                self.free.push(tile);
             }
         }
         let mut overflow = 0;
-        for key in edited {
-            if self.tiles.contains_key(key) {
-                continue;
-            }
-            if self.free.is_empty() {
-                self.release_oldest();
-            }
-            match self.free.pop() {
-                Some(mut tile) => {
-                    tile.take(self.dab);
-                    self.tiles.insert(*key, tile);
+        let granted = edited.iter().zip(grants);
+        for (key, grant) in granted {
+            match grant {
+                Grant::Held => {}
+                Grant::Taken => {
+                    if let Some(mut tile) = self.free.pop() {
+                        tile.take();
+                        self.tiles.insert(*key, tile);
+                    }
                 }
-                None => overflow += 1,
+                Grant::Without => overflow += 1,
             }
         }
         overflow
@@ -146,10 +265,66 @@ impl Stroke {
         edited.iter().map(|key| self.tiles.get(key)).collect()
     }
 
+    /// The state `key` holds now, if it holds any.
+    pub(crate) fn held(&self, key: &TileKey) -> Option<&TileStroke> {
+        self.tiles.get(key)
+    }
+
+    /// The stroke's bookkeeping as it is now: a frame makes its dabs' decisions on a copy (see
+    /// [`Book`]).
+    pub(crate) const fn book(&self) -> &Book {
+        &self.book
+    }
+
     /// Records `store`'s op as of the end of a dab: the op its edits were made in, which the
     /// edit may have begun itself.
     pub(crate) const fn end_dab(&mut self, store: &TileStore) {
         self.op = store.current_op();
+    }
+
+    /// Ends dabs written together over `store`: `book` is this stroke's book after them (made
+    /// on a copy of [`Stroke::book`] with [`Book::begin_dab`] for each, in order), and `finals`
+    /// the state each tile they edited with state ends with.
+    ///
+    /// Each tile `book` no longer holds gives its buffer back. Each of `finals` that `book`
+    /// holds gets its values: in the buffer it held throughout if it was
+    /// [`FinalState::continuous`], else in a buffer taken afresh, cleared first as a dab's take
+    /// clears it. A tile `book` holds that isn't among `finals` keeps its buffer as it is: the
+    /// dabs didn't write it. Then the store's op is the stroke's ([`Stroke::end_dab`]).
+    pub(crate) fn end_frame(&mut self, store: &TileStore, book: Book, finals: Vec<FinalState>) {
+        let gone: Vec<TileKey> = self
+            .tiles
+            .keys()
+            .filter(|key| !book.holds(key))
+            .copied()
+            .collect();
+        for key in gone {
+            if let Some(tile) = self.tiles.remove(&key) {
+                self.free.push(tile);
+            }
+        }
+        for state in finals {
+            if !book.holds(&state.key) {
+                continue;
+            }
+            let buffer = match self.tiles.remove(&state.key) {
+                Some(tile) if state.continuous => Some(tile),
+                Some(mut tile) => {
+                    tile.take();
+                    Some(tile)
+                }
+                None => self.free.pop().map(|mut tile| {
+                    tile.take();
+                    tile
+                }),
+            };
+            if let Some(mut tile) = buffer {
+                tile.fill(&state.start, &state.acc);
+                self.tiles.insert(state.key, tile);
+            }
+        }
+        self.book = book;
+        self.end_dab(store);
     }
 
     /// How many tiles' state the stroke holds now.
@@ -170,32 +345,46 @@ impl Stroke {
         self.tiles.len() + self.free.len()
     }
 
+    /// Everything the stroke holds, in bits: its book, and each held tile's starts and sums.
+    /// Two strokes that would write the same from now on have the same.
+    #[cfg(test)]
+    pub(crate) fn bits(&self) -> (Book, Vec<TileBits>) {
+        let tiles = self.tiles.iter().map(|(key, tile)| {
+            let entries = (0..ENTRIES)
+                .filter_map(|at| tile.entry(at))
+                .map(|(start, acc)| (start.to_bits(), acc.to_bits()))
+                .collect();
+            (*key, entries)
+        });
+        (self.book.clone(), tiles.collect())
+    }
+
     /// Releases every tile: a new stroke begins.
     fn release_all(&mut self) {
+        self.book.release_all();
         while let Some((_, tile)) = self.tiles.pop_first() {
             self.free.push(tile);
         }
     }
+}
 
-    /// Releases the tile with the oldest last dab, the least key among equals, of those not
-    /// edited in the last [`Stroke::PROTECTED_DABS`] dabs. Returns whether one was.
-    ///
-    /// A scan of the tiles held: it runs only when every buffer is taken, which a stroke over the
-    /// default reservation reaches only when it has edited 512 tiles.
-    fn release_oldest(&mut self) -> bool {
-        let dab = self.dab;
-        let oldest = self
-            .tiles
-            .iter()
-            .filter(|(_, tile)| dab.saturating_sub(tile.last_dab) >= Self::PROTECTED_DABS)
-            .min_by_key(|&(key, tile)| (tile.last_dab, *key))
-            .map(|(key, _)| *key);
-        let Some(tile) = oldest.and_then(|key| self.tiles.remove(&key)) else {
-            return false;
-        };
-        self.free.push(tile);
-        true
-    }
+/// A held tile's stroke state in bits, for the tests: each entry's start and sum.
+#[cfg(test)]
+pub(crate) type TileBits = (TileKey, Vec<(u32, u32)>);
+
+/// The stroke state a tile ends a frame's dabs with, for [`Stroke::end_frame`]: per vertex of
+/// the tile, row-major, the start and the sum as [`TileStroke`] holds them.
+#[derive(Debug)]
+pub(crate) struct FinalState {
+    /// The tile.
+    pub(crate) key: TileKey,
+    /// Whether the tile held state from before the dabs and kept it throughout, so these values
+    /// continue the buffer it holds.
+    pub(crate) continuous: bool,
+    /// Each vertex's start, `NaN` where the stroke hasn't captured one.
+    pub(crate) start: Vec<f32>,
+    /// Each vertex's sum of the stroke's deltas.
+    pub(crate) acc: Vec<f32>,
 }
 
 /// One tile's stroke state: per vertex, row-major in the tile's own side (a coarser tile uses
@@ -211,15 +400,12 @@ pub(crate) struct TileStroke {
     start: Box<[AtomicU32]>,
     /// The `f32` bits of the sum of the stroke's deltas for each vertex, from zero.
     acc: Box<[AtomicU32]>,
-    /// The dab that last edited the tile.
-    last_dab: u64,
 }
 
 impl std::fmt::Debug for TileStroke {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TileStroke")
             .field("entries", &self.start.len())
-            .field("last_dab", &self.last_dab)
             .finish_non_exhaustive()
     }
 }
@@ -232,25 +418,44 @@ impl TileStroke {
             acc: (0..ENTRIES)
                 .map(|_| AtomicU32::new(0.0_f32.to_bits()))
                 .collect(),
-            last_dab: 0,
         }
     }
 
-    /// Readies the buffer for a tile first edited at dab `dab`: no start captured and every sum
-    /// zero, clearing what an earlier tile left.
+    /// Readies the buffer for a tile first edited now: no start captured and every sum zero,
+    /// clearing what an earlier tile left.
     ///
     /// Every entry is cleared: at the levels a brush edits, every tile is the largest, so
     /// clearing only a tile's own `side²` entries would save nothing; and skipping buffers still
     /// clean from [`TileStroke::new`] measured no faster (the cold first dab of the medium
     /// project's `brush`, interleaved runs).
-    fn take(&mut self, dab: u64) {
+    fn take(&mut self) {
         for start in &mut self.start {
             *start.get_mut() = NO_START;
         }
         for acc in &mut self.acc {
             *acc.get_mut() = 0.0_f32.to_bits();
         }
-        self.last_dab = dab;
+    }
+
+    /// Sets the first entries' starts to `start` and their sums to `acc`: a tile's state as
+    /// dabs written together left it ([`Stroke::end_frame`]).
+    fn fill(&mut self, start: &[f32], acc: &[f32]) {
+        let starts = self.start.iter_mut().zip(start);
+        for (to, value) in starts {
+            *to.get_mut() = value.to_bits();
+        }
+        let sums = self.acc.iter_mut().zip(acc);
+        for (to, value) in sums {
+            *to.get_mut() = value.to_bits();
+        }
+    }
+
+    /// Entry `at`'s start (`NaN` if the stroke hasn't captured it) and sum, as they are now;
+    /// `None` if `at` is past the entries.
+    pub(crate) fn entry(&self, at: usize) -> Option<(f32, f32)> {
+        let start = f32::from_bits(self.start.get(at)?.load(Ordering::Relaxed));
+        let acc = f32::from_bits(self.acc.get(at)?.load(Ordering::Relaxed));
+        Some((start, acc))
     }
 
     /// The `z` to write for entry `at`, whose correction's `z` is stored as `current`, after
@@ -265,13 +470,27 @@ impl TileStroke {
     pub(crate) fn write(&self, at: usize, current: f32, delta: f32) -> Option<f32> {
         let start_bits = self.start.get(at)?;
         let acc_bits = self.acc.get(at)?;
-        let mut start = f32::from_bits(start_bits.load(Ordering::Relaxed));
-        if start.is_nan() {
-            start = current;
-            start_bits.store(current.to_bits(), Ordering::Relaxed);
-        }
-        let acc = f32::from_bits(acc_bits.load(Ordering::Relaxed)) + delta;
+        let (start, acc) = stroke_sum(
+            f32::from_bits(start_bits.load(Ordering::Relaxed)),
+            f32::from_bits(acc_bits.load(Ordering::Relaxed)),
+            current,
+            delta,
+        );
+        start_bits.store(start.to_bits(), Ordering::Relaxed);
         acc_bits.store(acc.to_bits(), Ordering::Relaxed);
         Some(start + acc)
     }
+}
+
+/// A vertex's start and sum after a write of `delta`; the value written is their sum.
+///
+/// From its start `start` (`NaN` if not captured yet) and sum `acc`, its correction's `z`
+/// stored as `current`: the start is `current` if it wasn't captured, and the sum gains
+/// `delta`.
+///
+/// The one arithmetic of a stroke's write, shared by [`TileStroke::write`] and a frame's
+/// replay of its dabs, so both give the same bits.
+pub(crate) fn stroke_sum(start: f32, acc: f32, current: f32, delta: f32) -> (f32, f32) {
+    let start = if start.is_nan() { current } else { start };
+    (start, acc + delta)
 }

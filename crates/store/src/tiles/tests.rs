@@ -49,6 +49,7 @@ mod layered;
 mod prefetch;
 mod queued;
 mod recovery;
+mod replay;
 mod ring;
 mod rounds_kept;
 mod stale;

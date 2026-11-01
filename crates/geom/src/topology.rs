@@ -396,11 +396,39 @@ impl Topology {
         }
         let region = Region::of_tile(key);
         let copies = self.copies(key.face(), key.level(), region.x0() + i, region.y0() + j);
-        let least = copies
+        Self::owner(&copies).is_none_or(|owner| {
+            (owner.face, owner.tx, owner.ty, owner.i, owner.j)
+                == (key.face(), key.tx(), key.ty(), i, j)
+        })
+    }
+
+    /// The copy of a vertex that owns it, of `copies`, all the copies of one vertex (as
+    /// [`Topology::copies`] or [`TileBorder::copies`] lists them): the least by face, then tile
+    /// row and column, then row and column within the tile. `None` for no copies.
+    ///
+    /// [`Topology::owns`] is whether a tile's vertex is this copy; a caller holding a vertex's
+    /// copies already finds its owner here without listing them again.
+    ///
+    /// ```
+    /// use geom::{FaceId, Level, Topology, cube_sphere};
+    ///
+    /// let mesh = cube_sphere(1)?;
+    /// let topology = mesh.topology();
+    /// let level = Level::new(7)?;
+    /// let corner = topology.copies(FaceId::new(0), level, 0, 0);
+    /// let owner = Topology::owner(&corner).expect("a cube corner has copies");
+    /// assert!(
+    ///     topology.owns(&owner.key(level), owner.i, owner.j),
+    ///     "the owner owns it"
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn owner(copies: &[VertexCopy]) -> Option<VertexCopy> {
+        copies
             .iter()
-            .map(|copy| (copy.face.index(), copy.ty, copy.tx, copy.j, copy.i))
-            .min();
-        least.is_none_or(|least| least == (key.face().index(), key.ty(), key.tx(), j, i))
+            .min_by_key(|copy| (copy.face.index(), copy.ty, copy.tx, copy.j, copy.i))
+            .copied()
     }
 
     /// The owner's copy of face-grid vertex `(i, j)` of `face` (`n` quads per side): the lowest
