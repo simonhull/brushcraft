@@ -14,6 +14,13 @@ use store::Workers;
 
 use crate::session::Detail;
 
+/// The small brush `--footprint small` names, in vertices.
+///
+/// A radius of about 18 quads, so a dab touches a few tiles and its cost is mostly what every dab
+/// pays (its query, its tiles' evaluation, a dispatch to the workers), not its vertices: what the
+/// app's dab budget (`app::sculpting::DabBudget`) is calibrated from.
+pub(crate) const SMALL_FOOTPRINT: usize = 1000;
+
 /// What the harness prints when its arguments don't parse.
 pub(crate) const USAGE: &str = "\
 usage: brushcraft-bench SUBCOMMAND [OPTIONS]
@@ -57,6 +64,8 @@ options (each subcommand takes the ones it uses):
             --display (keep the display layer: each step raises its display tiles' bounds)
             --dabs N (apply the stroke's dabs N to a call of sculpt::apply_dabs, a frame's
             path, instead of a draw step each; the latency is then per frame)
+  --footprint small     a small brush, 1000 vertices (a radius of about 18 quads, a few tiles):
+                        with --dabs, what a dab costs beyond its vertices, for the app's budget
   display:  --steps N (200)  --footprint VERTICES (50000)  --strength F (0.0001)
             --per-step (a JSON line per step besides the summary: its time and each phase's,
             its footprint, the tiles the store loaded, evaluated and evicted, page faults)
@@ -517,7 +526,14 @@ impl Options {
             Flag::Amplitude => self.amplitude = finite(flag, text()?)?,
             Flag::Level => self.level = positive(flag, text()?)?,
             Flag::Samples => self.samples = positive(flag, text()?)?,
-            Flag::Footprint => self.footprint = positive(flag, text()?)?,
+            Flag::Footprint => {
+                let text = text()?;
+                self.footprint = if text == "small" {
+                    SMALL_FOOTPRINT
+                } else {
+                    positive(flag, text)?
+                };
+            }
             Flag::RegionQuads => self.region_quads = positive(flag, text()?)?,
             Flag::Pool => {
                 let text = text()?;
@@ -686,6 +702,14 @@ mod tests {
             "a record per step asked for"
         );
         assert_eq!(brush.options.dabs, None, "a draw step a dab by default");
+        assert_eq!(
+            parse("brush --dabs 32 --footprint small")
+                .unwrap()
+                .options
+                .footprint,
+            SMALL_FOOTPRINT,
+            "the small brush"
+        );
         assert_eq!(
             parse("brush --dabs 4").unwrap().options.dabs,
             Some(4),
