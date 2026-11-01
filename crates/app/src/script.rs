@@ -25,9 +25,9 @@
 //!
 //! # The strokes path
 //!
-//! `--script-path strokes` ([`Script::strokes`]) draws three pen strokes on the sphere, for the
+//! `--script-path strokes` ([`Script::strokes`]) draws four pen strokes on the sphere, for the
 //! pen's latency (sample to present submitted), a stroke seen from a distance, and a brush that
-//! keeps up with a fast pen:
+//! keeps up with a fast pen, lightly and pressed hard:
 //!
 //! 1. **open**, 3 s still, three units away, as the benchmark path starts;
 //! 2. **approach**, 1.5 s: in to 0.3 above the surface, easing in and out;
@@ -46,14 +46,18 @@
 //!    queue of dabs never growing over the stroke and drained within two frames of pen-up. At the
 //!    performance suite's 4K a dab touches about 60 finest tiles of the benchmark project, below F
 //!    (in a 1280 × 800 view, about F);
-//! 8. **settle**, 2 s still: the edits' refresh lands.
+//! 8. **turn**, 1 s: a quarter turn more, to surface not yet drawn;
+//! 9. **`stroke_heavy`**, 2 s still: the long stroke again, pressed at full pressure all the way
+//!    (the others rise from 0.35 to 0.8 and fall back): bigger, stronger dabs, a quarter wider than
+//!    the long stroke's widest, so more tiles a dab; the case a user pressing hard draws;
+//! 10. **settle**, 2 s still: the edits' refresh lands.
 //!
 //! The pen's samples come at the Kamvas's measured 173 Hz, in real time whatever the speed (a
 //! faster run has fewer of them): hovering over the stroke's start from 0.3 s before it touches
 //! (so the brush warms the surface under it), then down, along the path with the pressure rising
-//! and falling, up, and out of range 0.1 s later. Each sample's point lies on the unit sphere, as
-//! the benchmark project is; the frame loop projects it through the camera at the sample's time
-//! ([`Script::pen`]).
+//! and falling (or held at full, [`Pressure`]), up, and out of range 0.1 s later. Each sample's
+//! point lies on the unit sphere, as the benchmark project is; the frame loop projects it through
+//! the camera at the sample's time ([`Script::pen`]).
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt;
@@ -144,6 +148,8 @@ pub(crate) enum Segment {
     Turn,
     /// Still, while a fast, long stroke is drawn across the whole object.
     StrokeLong,
+    /// Still, while the fast, long stroke is drawn again at full pressure.
+    StrokeHeavy,
 }
 
 impl Segment {
@@ -161,6 +167,7 @@ impl Segment {
             Self::StrokeFar => "stroke_far",
             Self::Turn => "turn",
             Self::StrokeLong => "stroke_long",
+            Self::StrokeHeavy => "stroke_heavy",
         }
     }
 }
@@ -256,12 +263,19 @@ const FAR: Pose = Pose {
     ..START
 };
 
-/// The strokes path's last pose: three units away, half a turn round from the start, for the
-/// long stroke.
+/// The strokes path's pose for the long stroke: three units away, half a turn round from the
+/// start.
 const ROUND: Pose = Pose { yaw: PI, ..START };
 
+/// The strokes path's last pose, for the heavy stroke: three quarters of a turn round from the
+/// start.
+const LAST: Pose = Pose {
+    yaw: PI + FRAC_PI_2,
+    ..START
+};
+
 /// The strokes path's camera ([`Script::strokes`]; the module notes say why each segment).
-const STROKES: [Keyframe; 8] = [
+const STROKES: [Keyframe; 10] = [
     Keyframe {
         segment: Segment::Open,
         seconds: 3.0,
@@ -305,22 +319,35 @@ const STROKES: [Keyframe; 8] = [
         ease: Ease::Linear,
     },
     Keyframe {
+        segment: Segment::Turn,
+        seconds: 1.0,
+        to: LAST,
+        ease: Ease::Smooth,
+    },
+    Keyframe {
+        segment: Segment::StrokeHeavy,
+        seconds: 2.0,
+        to: LAST,
+        ease: Ease::Linear,
+    },
+    Keyframe {
         segment: Segment::Settle,
         seconds: 2.0,
-        to: ROUND,
+        to: LAST,
         ease: Ease::Linear,
     },
 ];
 
-/// The strokes path's pen strokes, one in each still stroke segment (which start at 4.5 s, 8 s
-/// and 11 s).
-const PEN_STROKES: [PenStroke; 3] = [
+/// The strokes path's pen strokes, one in each still stroke segment (which start at 4.5 s, 8 s,
+/// 11 s and 14 s).
+const PEN_STROKES: [PenStroke; 4] = [
     PenStroke {
         hover: 4.7,
         down: 5.0,
         up: 6.2,
         radius: 40.0,
         span: 0.25,
+        pressure: Pressure::Swelling,
     },
     PenStroke {
         hover: 8.2,
@@ -328,6 +355,7 @@ const PEN_STROKES: [PenStroke; 3] = [
         up: 9.7,
         radius: 6.0,
         span: 0.6,
+        pressure: Pressure::Swelling,
     },
     PenStroke {
         hover: 11.2,
@@ -335,8 +363,26 @@ const PEN_STROKES: [PenStroke; 3] = [
         up: 12.3,
         radius: 40.0,
         span: 1.6,
+        pressure: Pressure::Swelling,
+    },
+    PenStroke {
+        hover: 14.2,
+        down: 14.5,
+        up: 15.3,
+        radius: 40.0,
+        span: 1.6,
+        pressure: Pressure::Full,
     },
 ];
+
+/// How hard a scripted pen presses along its stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pressure {
+    /// Rising from 0.35 to 0.8 at the middle and falling back: a stroke drawn lightly.
+    Swelling,
+    /// Full pressure all the way: a stroke pressed hard.
+    Full,
+}
 
 /// How often a scripted pen reports: the Kamvas's measured rate, in hertz.
 pub(crate) const PEN_RATE: f64 = 173.0;
@@ -362,6 +408,8 @@ pub(crate) struct PenStroke {
     radius: f32,
     /// How far the stroke runs across the view, in world units, at the facing point.
     span: f64,
+    /// How hard the pen presses along it.
+    pressure: Pressure,
 }
 
 impl PenStroke {
@@ -378,15 +426,20 @@ impl PenStroke {
         WorldPoint::new(p.x / length, p.y / length, p.z / length)
     }
 
-    /// The tip's pressure a fraction `along` (0 to 1) of the way: rising from 0.35 to 0.8 at the
-    /// middle and falling back.
-    fn pressure(along: f64) -> Unit {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a pressure in 0.35..=0.8: f32 holds it"
-        )]
-        let pressure = (0.35 + 0.45 * (PI * along).sin()) as f32;
-        Unit::try_from(pressure).unwrap_or(Unit::ONE)
+    /// The tip's pressure a fraction `along` (0 to 1) of the way, as its [`Pressure`] says:
+    /// rising from 0.35 to 0.8 at the middle and falling back, or full.
+    fn pressure(&self, along: f64) -> Unit {
+        match self.pressure {
+            Pressure::Swelling => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a pressure in 0.35..=0.8: f32 holds it"
+                )]
+                let pressure = (0.35 + 0.45 * (PI * along).sin()) as f32;
+                Unit::try_from(pressure).unwrap_or(Unit::ONE)
+            }
+            Pressure::Full => Unit::ONE,
+        }
     }
 }
 
@@ -413,7 +466,8 @@ pub(crate) enum ScriptPath {
     /// The renderer's measured run ([`Script::benchmark`]).
     #[default]
     Benchmark,
-    /// Three pen strokes: near, far, and fast and long ([`Script::strokes`]).
+    /// Four pen strokes: near, far, fast and long, and that again pressed hard
+    /// ([`Script::strokes`]).
     Strokes,
 }
 
@@ -594,7 +648,7 @@ impl Script {
             camera,
             point: stroke.point(&camera, along),
             pressure: if matches!(phase, Phase::Down | Phase::Drag) {
-                PenStroke::pressure(along)
+                stroke.pressure(along)
             } else {
                 Unit::ZERO
             },

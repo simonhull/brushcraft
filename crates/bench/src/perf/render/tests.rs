@@ -199,7 +199,7 @@ fn a_stroke_gives_its_latency_its_queue_and_its_drain() {
         stroke_frame(30.0, (1.0, 0.0, false), 4.0),
         stroke_frame(36.0, (0.0, 0.0, false), 0.0),
     ];
-    let [near, far, long] = strokes::derive(&stroke_run(frames));
+    let [near, far, long, heavy] = strokes::derive(&stroke_run(frames));
     assert_eq!(near.sample_to_present_p99, Some(9.0), "the nearest rank");
     assert_eq!(near.start_to_submitted_p99, Some(3.0));
     assert_eq!(near.brush_p99, Some(1.0));
@@ -213,6 +213,7 @@ fn a_stroke_gives_its_latency_its_queue_and_its_drain() {
     assert_eq!(near.prepare_p99, Some(0.1));
     assert_eq!(far, strokes::StrokeMetrics::default(), "no such segment");
     assert_eq!(long, strokes::StrokeMetrics::default());
+    assert_eq!(heavy, strokes::StrokeMetrics::default());
 }
 
 #[test]

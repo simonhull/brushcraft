@@ -1,7 +1,8 @@
 //! The pen's metrics, from the app's strokes script read back.
 //!
 //! The script (`brushcraft --script --script-path strokes`, its record written with `--record`)
-//! draws three strokes (`stroke_near`, `stroke_far`, `stroke_long`, the record's segments); each
+//! draws four strokes (`stroke_near`, `stroke_far`, `stroke_long`, `stroke_heavy`, the record's
+//! segments); each
 //! gives, over its segment's frames:
 //!
 //! - **sample to present**, p99: from the oldest pen sample whose dabs a frame applied to its
@@ -27,7 +28,7 @@ use crate::perf::metric::Unit;
 use crate::perf::render::{Frame, Recorded, Value, percentile};
 
 /// The strokes script's stroke segments, in order.
-pub(crate) const SEGMENTS: [&str; 3] = ["stroke_near", "stroke_far", "stroke_long"];
+pub(crate) const SEGMENTS: [&str; 4] = ["stroke_near", "stroke_far", "stroke_long", "stroke_heavy"];
 
 /// The ceiling on the most dabs carried, on the benchmark project: a few samples' worth.
 ///
@@ -38,7 +39,7 @@ pub(crate) const MOST_CARRIED: f64 = 8.0;
 
 /// Each metric's name after the scale, by segment (as [`SEGMENTS`]) and then in
 /// [`StrokeMetrics::named`]'s order.
-const NAMES: [[&str; 7]; 3] = [
+const NAMES: [[&str; 7]; 4] = [
     [
         "render.stroke_near.sample_to_present_p99_ms",
         "render.stroke_near.start_to_submitted_p99_ms",
@@ -65,6 +66,15 @@ const NAMES: [[&str; 7]; 3] = [
         "render.stroke_long.drain_frames",
         "render.stroke_long.frames_above_f",
         "render.stroke_long.prepare_p99_ms",
+    ],
+    [
+        "render.stroke_heavy.sample_to_present_p99_ms",
+        "render.stroke_heavy.start_to_submitted_p99_ms",
+        "render.stroke_heavy.brush_p99_ms",
+        "render.stroke_heavy.dabs_carried_max",
+        "render.stroke_heavy.drain_frames",
+        "render.stroke_heavy.frames_above_f",
+        "render.stroke_heavy.prepare_p99_ms",
     ],
 ];
 
@@ -105,7 +115,7 @@ pub(crate) struct StrokeMetrics {
 }
 
 /// Each stroke's metrics from `recorded`, in [`SEGMENTS`]' order.
-pub(crate) fn derive(recorded: &Recorded) -> [StrokeMetrics; 3] {
+pub(crate) fn derive(recorded: &Recorded) -> [StrokeMetrics; 4] {
     SEGMENTS.map(|segment| {
         let frames: Vec<&Frame> = recorded.in_segment(segment).collect();
         stroke(&frames)

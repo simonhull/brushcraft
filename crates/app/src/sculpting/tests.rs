@@ -824,7 +824,7 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
     );
     assert_eq!(drained, Some(1), "the frame after pen-up carries none");
     let records = saved_strokes(owner, &dir, "scripted.bcrf");
-    assert_eq!(records.len(), 3, "three strokes, a record each");
+    assert_eq!(records.len(), 4, "four strokes, a record each");
 }
 
 /// Over the record's `frames` in `segment`: the most dabs any carried, and how many frames it took
