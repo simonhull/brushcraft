@@ -34,6 +34,9 @@ struct Sphere {
     seq: u64,
     /// Tiles read, display and finest.
     reads: usize,
+    /// Per display tile, what the store's bump has added to its bound since its refresh:
+    /// twice the steps' displacements, summed.
+    raised: BTreeMap<Place, f32>,
 }
 
 /// `p` pushed out along itself by a smooth bump of `amplitude` and `radius` round `centre`:
@@ -70,6 +73,7 @@ impl Sphere {
             refreshed: BTreeSet::new(),
             seq: 0,
             reads: 0,
+            raised: BTreeMap::new(),
         }
     }
 
@@ -148,13 +152,18 @@ impl Sphere {
                 above
             })
             .collect();
-        keys.extend(raised);
-        self.seq += 1;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "rounded to an f32, then up a step"
         )]
         let displacement = (worst as f32).next_up();
+        // As the store's bump: each display tile above raised by twice the step.
+        for key in &raised {
+            let extra = self.raised.entry(Place::of(key)).or_insert(0.0);
+            *extra = (*extra + 2.0 * displacement).next_up();
+        }
+        keys.extend(raised);
+        self.seq += 1;
         Epoch {
             seq: self.seq,
             kind: EpochKind::Step { displacement },
@@ -165,6 +174,9 @@ impl Sphere {
     /// Refreshes the display tiles at `places`, and returns the refresh's epoch.
     fn refresh(&mut self, places: &BTreeSet<Place>) -> Epoch {
         self.refreshed.extend(places.iter().copied());
+        for place in places {
+            self.raised.remove(place);
+        }
         self.seq += 1;
         let keys = places.iter().filter_map(|p| p.key(self.finest)).collect();
         Epoch {
@@ -215,9 +227,16 @@ impl TileSource for Sphere {
             return Ok(Some(TileDetail::FINEST));
         }
         let grid = &grids[&place.face().index()];
+        // As the store draws a tile a stroke changed: its stored bound, raised by the bump.
+        let stored = measured_error(place, self.finest, &vertices, grid, scale);
+        let extra = self.raised.get(&place).copied().unwrap_or(0.0);
         Ok(Some(TileDetail {
-            stored: None,
-            error: measured_error(place, self.finest, &vertices, grid, scale),
+            stored: (extra > 0.0).then_some(stored),
+            error: if extra > 0.0 {
+                (stored + extra).next_up()
+            } else {
+                stored
+            },
             cone: FinestNormalCone::EVERYTHING,
         }))
     }
@@ -961,7 +980,7 @@ fn a_tile_past_what_a_scratch_binds_is_set_aside_until_its_inputs_change() {
         );
         let skipped = residency.stats().stand_ins_skipped;
         assert!(skipped > 0, "some tiles need more than one finest tile");
-        assert!(!residency.stand_ins.oversized.is_empty());
+        assert!(!residency.stand_ins.set_aside.is_empty());
         check_bounds(gpu, &residency, &sphere);
         // Not walked again while nothing under them changes.
         quiet(gpu, &mut residency, &mut sphere);
@@ -1014,7 +1033,7 @@ fn a_tile_behind_steps_its_place_forgot_has_its_bound_raised_instead() {
         let mut residency = residency(gpu, &sphere, 6);
         quiet(gpu, &mut residency, &mut sphere);
         let key = TileKey::displacement(FaceId::new(0), sphere.finest, 0, 0).expect("a key");
-        let steps = MAX_STEPS + 5;
+        let steps = MAX_STEPS + 50;
         let displacement = 1e-4_f32;
         let seqs = 1..=steps as u64;
         let epochs: Vec<Epoch> = seqs
@@ -1062,5 +1081,151 @@ fn a_tile_behind_steps_its_place_forgot_has_its_bound_raised_instead() {
                 node.error
             );
         }
+    });
+}
+
+#[test]
+fn a_row_raised_in_a_lost_frame_comes_back_with_the_store_s_bound() {
+    GpuTest::run(|gpu| {
+        let mut sphere = Sphere::new();
+        let mut residency = residency(gpu, &sphere, 6);
+        quiet(gpu, &mut residency, &mut sphere);
+        let first = sphere.step(0.02);
+        frame(
+            gpu,
+            &mut residency,
+            &mut sphere,
+            Drained::Epochs(vec![first]),
+            None,
+        );
+        assert!(!residency.stand_ins.rows.is_empty(), "stood in");
+        // No tile can stand in now: the next step raises the rows' bounds instead, in a frame
+        // that is lost.
+        residency.stand_ins.pass.set_most_tiles(0);
+        let second = sphere.step(-0.015);
+        residency.begin_frame(gpu).expect("a frame begins");
+        residency.apply(Drained::Epochs(vec![second]));
+        residency.use_frame(FrameUse::default());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let lost = residency.stage(gpu, &mut sphere, deadline).expect("staged");
+        drop(lost);
+        for _ in 0..3 {
+            quiet(gpu, &mut residency, &mut sphere);
+        }
+        assert!(residency.stats().lost_frames > 0);
+        check_bounds(gpu, &residency, &sphere);
+    });
+}
+
+#[test]
+fn a_tile_read_after_some_steps_raises_its_loaded_bound_by_the_steps_since() {
+    GpuTest::run(|gpu| {
+        let mut sphere = Sphere::new();
+        let mut residency = residency(gpu, &sphere, 5);
+        quiet(gpu, &mut residency, &mut sphere);
+        let mut late = BTreeSet::new();
+        for amplitude in [0.02, -0.01, 0.015] {
+            let epoch = sphere.step(amplitude);
+            late.extend(
+                above(&epoch)
+                    .into_iter()
+                    .filter(|p| p.level().get() == 6)
+                    .filter_map(|p| p.key(sphere.finest)),
+            );
+            frame(
+                gpu,
+                &mut residency,
+                &mut sphere,
+                Drained::Epochs(vec![epoch]),
+                None,
+            );
+        }
+        // Read now, the level-6 tiles carry the store's raised bound; they can't stand in, and
+        // a later step raises them from there.
+        residency.stand_ins.pass.set_most_tiles(0);
+        let requests = Requests::new(
+            late.iter().map(|&key| Request {
+                key,
+                screen_error: 10.0,
+            }),
+            0,
+        );
+        frame(
+            gpu,
+            &mut residency,
+            &mut sphere,
+            Drained::Epochs(Vec::new()),
+            Some(&requests),
+        );
+        assert!(
+            late.iter().all(|key| residency.slot(key).is_some()),
+            "arrived"
+        );
+        check_bounds(gpu, &residency, &sphere);
+        let later = sphere.step(0.01);
+        frame(
+            gpu,
+            &mut residency,
+            &mut sphere,
+            Drained::Epochs(vec![later]),
+            None,
+        );
+        check_bounds(gpu, &residency, &sphere);
+    });
+}
+
+#[test]
+fn a_stand_in_whose_place_forgot_steps_has_its_row_raised() {
+    GpuTest::run(|gpu| {
+        let mut sphere = Sphere::new();
+        let mut residency = residency(gpu, &sphere, 6);
+        quiet(gpu, &mut residency, &mut sphere);
+        let first = sphere.step(0.02);
+        let key = *finest_of(&first, sphere.finest)
+            .first()
+            .expect("a finest tile");
+        frame(
+            gpu,
+            &mut residency,
+            &mut sphere,
+            Drained::Epochs(vec![first]),
+            None,
+        );
+        let parent = Place::of(&key).parent().expect("a display tile");
+        assert!(residency.stand_ins.rows.get(parent).is_some(), "stood in");
+        let before = display_tiles(gpu, &residency)[&parent].1.error;
+        let steps = MAX_STEPS + 50;
+        let displacement = 1e-4_f32;
+        let seqs = sphere.seq + 1..=sphere.seq + steps as u64;
+        let epochs: Vec<Epoch> = seqs
+            .map(|seq| Epoch {
+                seq,
+                kind: EpochKind::Step { displacement },
+                keys: BTreeSet::from([key]),
+            })
+            .collect();
+        frame(
+            gpu,
+            &mut residency,
+            &mut sphere,
+            Drained::Epochs(epochs),
+            None,
+        );
+        assert!(residency.stats().stand_in_steps_dropped > 0);
+        assert!(
+            residency.stand_ins.rows.get(parent).is_some(),
+            "still its row"
+        );
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a few thousand steps, exact enough in f32"
+        )]
+        let total = 2.0 * displacement * steps as f32;
+        let after = display_tiles(gpu, &residency)[&parent].1.error;
+        assert!(
+            after >= before + total * 0.999,
+            "the row's bound {after} not raised past {before} by {total}"
+        );
+        check_bounds(gpu, &residency, &sphere);
     });
 }

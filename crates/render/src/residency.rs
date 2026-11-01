@@ -737,6 +737,9 @@ struct Group {
     /// What a resync handed over (a resync's group): it enters the index when the re-read
     /// switches.
     unrefreshed: Vec<store::Unrefreshed>,
+    /// The display tiles its refresh epochs name, with each epoch's number: they take effect
+    /// in the stand-ins' index when it switches, as their data shows.
+    refreshes: Vec<(Place, u64)>,
 }
 
 impl Group {
@@ -760,6 +763,7 @@ impl Group {
         self.urgent |= other.urgent;
         self.steps.extend(other.steps);
         self.unrefreshed.extend(other.unrefreshed);
+        self.refreshes.extend(other.refreshes);
         self.steps.sort_by_key(|step| step.seq);
     }
 }
@@ -1214,6 +1218,21 @@ impl Residency {
             }
             Drained::Resync(unrefreshed) => {
                 self.stand_ins.resync();
+                // Until the re-read switches, the tiles kept hold data of unknown age: their
+                // bound is the one that says so, and their stand-ins' rows go.
+                let kept: Vec<TileKey> = self
+                    .entries
+                    .keys()
+                    .filter(|key| key.channel() == Channel::DISPLAY)
+                    .copied()
+                    .collect();
+                for key in kept {
+                    let place = Place::of(&key);
+                    if let Some(row) = self.stand_ins.rows.release(place) {
+                        self.stand_ins.row_frees.push(row);
+                    }
+                    self.tree.raise_bound(place, f32::MAX);
+                }
                 self.resync();
                 // What the stroke changed enters when the tiles' re-read switches.
                 if let Some(group) = self.groups.last_mut() {
@@ -1250,15 +1269,13 @@ impl Residency {
                         .keep_positions
                         .extend(step.keys.iter().copied());
                 }
-                self.apply_epoch(finest, step);
+                self.apply_epoch(finest, step, Vec::new());
             }
             EpochKind::Refresh => {
-                for key in &keys {
-                    if key.channel() == Channel::DISPLAY {
-                        self.stand_ins.refreshed(Place::of(key), seq);
-                    }
-                }
-                self.apply_epoch(keys, None);
+                let display = keys.iter().filter(|key| key.channel() == Channel::DISPLAY);
+                let refreshes: Vec<(Place, u64)> =
+                    display.map(|key| (Place::of(key), seq)).collect();
+                self.apply_epoch(keys, None, refreshes);
             }
             EpochKind::Revert => {
                 let mut keys = keys;
@@ -1280,7 +1297,7 @@ impl Residency {
                         keys.insert(key);
                     }
                 }
-                self.apply_epoch(keys, None);
+                self.apply_epoch(keys, None, Vec::new());
             }
         }
     }
@@ -1288,9 +1305,19 @@ impl Residency {
     /// Makes an epoch of `keys` pending: its resident tiles, merged with the pending epochs
     /// that share a member with it. A member already staged for an earlier epoch is staged
     /// again. A small epoch merged into a pending one makes it urgent: it goes whole in the
-    /// next frame. A brush `step` enters the stand-ins' index when the pending epoch switches,
-    /// or now if nothing of it is pending.
-    fn apply_epoch(&mut self, keys: BTreeSet<TileKey>, step: Option<Step>) {
+    /// next frame.
+    ///
+    /// A brush `step` enters the stand-ins' index now: tiles above it are behind it, their
+    /// bound raised; it shows (they may stand in for it) when the pending epoch switches, or now
+    /// if nothing of it is pending. A refresh's `refreshes` (the display tiles it names, with
+    /// its epoch number) take effect when its data does: when the pending epoch switches, or
+    /// now if nothing of it is pending.
+    fn apply_epoch(
+        &mut self,
+        keys: BTreeSet<TileKey>,
+        step: Option<Step>,
+        refreshes: Vec<(Place, u64)>,
+    ) {
         for key in &keys {
             if self.forget_unavailable(key) && self.floor.contains(key) {
                 self.wanted.insert(
@@ -1314,9 +1341,16 @@ impl Residency {
         if live.is_empty() && touching.is_empty() {
             if let Some(step) = step {
                 self.stand_ins
-                    .enter(step, &mut self.stats.stand_in_steps_dropped);
+                    .enter(step, true, &mut self.stats.stand_in_steps_dropped);
+            }
+            for (place, seq) in refreshes {
+                self.stand_ins.refreshed(place, seq);
             }
             return;
+        }
+        if let Some(step) = &step {
+            self.stand_ins
+                .enter(step.clone(), false, &mut self.stats.stand_in_steps_dropped);
         }
         let bytes: u64 = live.iter().map(|key| self.upload_bytes(key)).sum();
         let mut merged = Group {
@@ -1335,6 +1369,7 @@ impl Residency {
         }
         merged.keys.extend(keys);
         merged.steps.extend(step);
+        merged.refreshes.extend(refreshes);
         self.groups.push(merged);
     }
 
@@ -1926,10 +1961,13 @@ impl Residency {
     /// [`ResidencyError::Tree`] if an arriving tile finds the tree full (it is sized for every
     /// tile the budget allows, so it doesn't).
     fn switch(&mut self, group: &mut Group) -> Result<(), ResidencyError> {
+        // Its refreshes take effect with their data, before the data's version is read.
+        for (place, seq) in std::mem::take(&mut group.refreshes) {
+            self.stand_ins.refreshed(place, seq);
+        }
         // The group's steps show now: the display tiles above them stand in with them.
         for step in std::mem::take(&mut group.steps) {
-            self.stand_ins
-                .enter(step, &mut self.stats.stand_in_steps_dropped);
+            self.stand_ins.show(&step);
         }
         let unrefreshed = std::mem::take(&mut group.unrefreshed);
         if !unrefreshed.is_empty() {
@@ -2201,7 +2239,7 @@ impl Residency {
     fn loaded(&mut self, place: Place) {
         if self.stand_ins.index.contains_key(&place) {
             self.stand_ins.due.insert(place);
-            self.stand_ins.oversized.remove(&place);
+            self.stand_ins.set_aside.remove(&place);
         }
     }
 

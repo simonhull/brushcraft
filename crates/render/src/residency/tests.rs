@@ -295,10 +295,13 @@ fn gpu_view(gpu: &Gpu, residency: &Residency) -> BTreeMap<TileKey, u32> {
         let version = data[0].reserved;
         assert_eq!(data[0], tag(&key, version), "{key:?}'s slot holds its data");
         let detail = detail_tag(version);
-        assert_eq!(
-            (node.error, node.finest_cone),
-            (detail.error, detail.cone.to_bits()),
-            "{key:?}'s node holds the e and cone of the data its slot holds"
+        // While a resync's re-read is pending, a kept display tile's bound is the one that
+        // says nothing is known (its data's age isn't).
+        let unknown = (f32::MAX, geom::FinestNormalCone::EVERYTHING.to_bits());
+        let held = (node.error, node.finest_cone);
+        assert!(
+            held == (detail.error, detail.cone.to_bits()) || held == unknown,
+            "{key:?}'s node holds the e and cone of the data its slot holds: {held:?}"
         );
         assert!(
             data.iter().all(|v| *v == data[0]),

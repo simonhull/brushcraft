@@ -64,6 +64,10 @@ pub(super) struct Under {
     displacement: Displacement,
     /// The finest tiles under the place it moved.
     finest: Vec<TileKey>,
+    /// Whether its finest tiles show: its epoch's pending group switched (or it had none). A
+    /// tile behind a step that doesn't show yet can't stand in (it would run ahead of a drawn
+    /// finest tile), and has its bound raised meanwhile.
+    shown: bool,
 }
 
 /// What a resident display tile needs to stand in: the steps since its data's version.
@@ -118,9 +122,10 @@ pub(super) struct StandIns {
     /// Places whose tiles may be behind a step: a step entered under them, or their data was
     /// loaded, since they were last looked at.
     pub(super) due: BTreeSet<Place>,
-    /// Places whose tiles need more finest tiles than a scratch binds: not looked at again
-    /// until a step enters under them or their data is loaded.
-    pub(super) oversized: BTreeSet<Place>,
+    /// Places whose tiles can't stand in until their inputs change: they need more finest tiles
+    /// than a scratch binds, or one the source had nothing for. Not looked at again until a
+    /// step enters under them or their data is loaded; their bound is raised meanwhile.
+    pub(super) set_aside: BTreeSet<Place>,
     /// The frame's stand-ins, planned while staging.
     pub(super) planned: Vec<StandIn>,
     /// The tiles the frame being staged stood in.
@@ -163,7 +168,7 @@ impl StandIns {
             blocked: BTreeMap::new(),
             dropped: BTreeMap::new(),
             due: BTreeSet::new(),
-            oversized: BTreeSet::new(),
+            set_aside: BTreeSet::new(),
             planned: Vec::new(),
             stood: Vec::new(),
             stood_in_flight: BTreeMap::new(),
@@ -179,7 +184,7 @@ impl StandIns {
     /// Enters `step` into the index: under every place above its finest tiles, those finest
     /// tiles, each place made due. A place over [`MAX_STEPS`] steps forgets its oldest, counted
     /// in `dropped`.
-    pub(super) fn enter(&mut self, step: Step, dropped: &mut u64) {
+    pub(super) fn enter(&mut self, step: Step, shown: bool, dropped: &mut u64) {
         let mut by_place: BTreeMap<Place, Vec<TileKey>> = BTreeMap::new();
         for key in &step.keys {
             let mut above = Place::of(key).parent();
@@ -193,6 +198,7 @@ impl StandIns {
             let under = steps.entry(step.seq).or_insert(Under {
                 displacement: step.displacement,
                 finest: Vec::new(),
+                shown,
             });
             under.finest.extend(finest);
             while steps.len() > MAX_STEPS {
@@ -204,10 +210,34 @@ impl StandIns {
                 *dropped += 1;
             }
             self.due.insert(place);
-            self.oversized.remove(&place);
+            self.set_aside.remove(&place);
         }
         self.keep_positions.extend(step.keys);
         self.entered += 1;
+    }
+
+    /// Notes that `step`'s finest tiles show now (its pending group switched): the places above
+    /// them may stand in for it.
+    pub(super) fn show(&mut self, step: &Step) {
+        let mut places = BTreeSet::new();
+        for key in &step.keys {
+            let mut above = Place::of(key).parent();
+            while let Some(place) = above {
+                places.insert(place);
+                above = place.parent();
+            }
+        }
+        for place in places {
+            if let Some(under) = self
+                .index
+                .get_mut(&place)
+                .and_then(|steps| steps.get_mut(&step.seq))
+            {
+                under.shown = true;
+            }
+            self.due.insert(place);
+            self.set_aside.remove(&place);
+        }
     }
 
     /// Notes a refresh epoch numbered `seq` naming the display tile at `place`: its stored
@@ -271,7 +301,7 @@ impl StandIns {
         self.refreshed.clear();
         self.blocked.clear();
         self.dropped.clear();
-        self.oversized.clear();
+        self.set_aside.clear();
         self.positions.clear();
     }
 
@@ -288,6 +318,7 @@ impl StandIns {
             let under = Under {
                 displacement,
                 finest: tile.finest.into_iter().collect(),
+                shown: true,
             };
             self.index.entry(place).or_default().insert(0, under);
             self.due.insert(place);
@@ -350,7 +381,7 @@ impl Residency {
                 continue;
             }
             if tile.under.len() > most {
-                self.stand_ins.oversized.insert(place);
+                self.stand_ins.set_aside.insert(place);
                 raised.push(key);
                 continue;
             }
@@ -376,7 +407,8 @@ impl Residency {
             if let Some(under) = under {
                 self.stand_in(gpu, batch, key, &tile, under)?;
             } else {
-                self.stand_ins.due.insert(Place::of(&key));
+                // A finest tile the source had nothing for: set aside until its inputs change.
+                self.stand_ins.set_aside.insert(Place::of(&key));
                 raised.push(key);
             }
         }
@@ -484,6 +516,12 @@ impl Residency {
             if let Some(live) = self.entries.get_mut(&key) {
                 live.bounded = newest + 1;
             }
+            // Lost with its frame, the raise would leave `bounded` counting steps the row's
+            // bound doesn't: the tile then leaves, and comes back with the store's bound.
+            self.stand_ins.stood.push(Stood {
+                key,
+                slot: entry.slot,
+            });
             return Ok(());
         }
         let after = entry.loaded_after.map_or(0, |seen| seen + 1);
@@ -594,21 +632,25 @@ impl Residency {
                 .dropped
                 .get(&place)
                 .is_some_and(|&(through, _)| through >= entry.version);
+            let kept = self.stand_ins.index.get(&place);
+            let mut steps = kept
+                .into_iter()
+                .flat_map(|steps| steps.range(entry.version..));
             let can_stand = !forgot
                 && !self.stand_ins.blocked.contains_key(&place)
-                && !self.stand_ins.oversized.contains(&place);
+                && !self.stand_ins.set_aside.contains(&place)
+                && steps.clone().all(|(_, under)| under.shown);
             let mut tile = Behind {
                 displacement,
                 newest,
                 under: BTreeSet::new(),
                 can_stand,
             };
-            let kept = self.stand_ins.index.get(&place);
-            let steps = kept
-                .into_iter()
-                .flat_map(|steps| steps.range(entry.version..));
-            for (_, under) in steps {
-                tile.under.extend(under.finest.iter().copied());
+            // What it would read, for a tile that may stand in alone.
+            if can_stand {
+                for (_, under) in &mut steps {
+                    tile.under.extend(under.finest.iter().copied());
+                }
             }
             behind.push((key, tile));
         }

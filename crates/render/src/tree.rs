@@ -518,10 +518,10 @@ impl TileTree {
         Some(index)
     }
 
-    /// Raises the resident tile at `place`'s bound `e` to `error` and makes its cone the one
-    /// that covers everything, as a stroke it can't stand in for needs
-    /// ([`crate::standin`]); its node is written again only if that changes it. Its data is the
-    /// same, so it isn't stamped.
+    /// Raises the resident tile at `place`'s bound `e` to `error`, if that is larger (it never
+    /// lowers one), and makes its cone the one that covers everything, as a stroke it can't
+    /// stand in for needs ([`crate::standin`]); its node is written again only if that changes
+    /// it. Its data is the same, so it isn't stamped.
     pub(crate) fn raise_bound(&mut self, place: Place, error: f32) {
         let Some(&index) = self.by_place.get(&place) else {
             return;
@@ -534,7 +534,7 @@ impl TileTree {
             return;
         };
         let raised = TileDetail {
-            error,
+            error: error.max(node.detail.error),
             cone: geom::FinestNormalCone::EVERYTHING,
             stored: node.detail.stored,
         };
