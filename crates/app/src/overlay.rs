@@ -18,6 +18,7 @@ use render::{DrawTimes, Look, SceneView};
 use store::JobsReport;
 
 use crate::camera::{Camera, Vec3};
+use crate::frame::schedule::StrokePacing;
 use crate::frame::{FeedStats, OwnerPhases};
 use crate::pen::PenStatus;
 use crate::pick::Report as PickReport;
@@ -66,6 +67,9 @@ pub(crate) struct Snapshot<'a> {
     /// The pen's latency in the last frame shown that applied dabs, sample to present
     /// submitted; `None` before any.
     pub(crate) latency: Option<Duration>,
+    /// How a brush stroke's frames are paced: on input, or to the refresh where presentation is
+    /// FIFO (mailbox not offered).
+    pub(crate) pacing: StrokePacing,
 }
 
 /// `duration` in milliseconds, to two places.
@@ -99,6 +103,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         filter_only,
         brush,
         latency,
+        pacing,
     } = *snapshot;
     let view = match look.view {
         SceneView::Shaded => format!("matcap {}", look.material.name()),
@@ -117,7 +122,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         },
     );
     let latency_line = format!(
-        "latency    {}",
+        "latency    {}  ({pacing})",
         latency.map_or_else(
             || "- (no dabs applied yet)".to_owned(),
             |latency| format!(
@@ -348,6 +353,7 @@ mod tests {
             filter_only: false,
             brush: &["brush      draw".to_owned()],
             latency: Some(Duration::from_micros(6250)),
+            pacing: StrokePacing::OnInput,
         };
         let text = lines(&snapshot).join("\n");
         for expected in [
@@ -366,6 +372,7 @@ mod tests {
             "pen        winit's tablet events (fallback: not a Wayland display or window)",
             "brush      draw",
             "latency    6.25 ms pen sample to present",
+            "(strokes start frames on input)",
         ] {
             assert!(text.contains(expected), "{expected:?} in:\n{text}");
         }
@@ -380,12 +387,17 @@ mod tests {
         assert!(rest.contains("12 tiles at level 5"), "{rest}");
         let no_latency = Snapshot {
             latency: None,
+            pacing: StrokePacing::Refresh,
             ..snapshot
         };
         let none_yet = lines(&no_latency).join("\n");
         assert!(
             none_yet.contains("latency    - (no dabs applied yet)"),
             "{none_yet}"
+        );
+        assert!(
+            none_yet.contains("strokes paced to the refresh (no mailbox: fifo)"),
+            "the fallback said: {none_yet}"
         );
     }
 }

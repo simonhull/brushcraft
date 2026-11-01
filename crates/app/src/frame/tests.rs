@@ -142,7 +142,12 @@ struct OneEdit {
 }
 
 impl Brush for OneEdit {
-    fn step(&mut self, context: BrushContext<'_>, _pen: &PenFrame) -> Result<BrushReport> {
+    fn step(
+        &mut self,
+        context: BrushContext<'_>,
+        _pen: &PenFrame,
+        _budget: &BrushBudget,
+    ) -> Result<BrushReport> {
         let BrushContext {
             project, camera, ..
         } = context;
@@ -412,7 +417,12 @@ struct PenLog {
 }
 
 impl Brush for PenLog {
-    fn step(&mut self, _context: BrushContext<'_>, pen: &PenFrame) -> Result<BrushReport> {
+    fn step(
+        &mut self,
+        _context: BrushContext<'_>,
+        pen: &PenFrame,
+        _budget: &BrushBudget,
+    ) -> Result<BrushReport> {
         let phases: Vec<input::Phase> = pen.for_brush().map(|sample| sample.phase).collect();
         self.frames
             .push((phases, pen.hover().map(|hover| hover.at)));
@@ -504,6 +514,146 @@ fn a_navigation_stroke_orbits_and_never_reaches_the_brush() {
     owner.pen(pen_sample(Phase::Drag, (300.0, 10.0)));
     run(&mut owner, 100);
     assert_eq!(*owner.camera(), after, "the drag ended at the lift");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_brush_strokes_samples_start_a_frame_at_once_and_with_fifo_wait_for_the_slot() {
+    use input::Phase;
+    let on_input = TestDir::new();
+    let mut owner = pen_owner(&on_input, true);
+    // The last frame started a moment ago: the refresh slot is most of an interval away.
+    owner.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    assert!(
+        matches!(owner.next(Instant::now()), Next::Frame { .. }),
+        "the down starts a frame at once"
+    );
+    frame(&mut owner, Instant::now());
+    owner.pen(pen_sample(Phase::Drag, (170.0, 100.0)));
+    assert!(
+        matches!(owner.next(Instant::now()), Next::Frame { .. }),
+        "and each sample of the brush's stroke"
+    );
+    frame(&mut owner, Instant::now());
+    owner.pen(pen_sample(Phase::Up, (170.0, 100.0)));
+    frame(&mut owner, Instant::now());
+    owner.close().expect("closed");
+
+    // A navigation stroke's samples after its down are paced to the refresh, as ever.
+    let navigating = TestDir::new();
+    let mut orbit = pen_owner(&navigating, false);
+    orbit.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    frame(&mut orbit, Instant::now());
+    orbit.pen(pen_sample(Phase::Drag, (200.0, 100.0)));
+    assert!(
+        matches!(orbit.next(Instant::now()), Next::Wait { .. }),
+        "an orbit by the pen keeps its pacing"
+    );
+    orbit.close().expect("closed");
+
+    // Where mailbox isn't offered (FIFO), a stroke's frames wait for their slot.
+    let paced = TestDir::new();
+    let fifo = Setup {
+        presentation: Presentation::Fifo,
+        ..setup(None)
+    };
+    let brush = PenLog {
+        claims: true,
+        ..PenLog::default()
+    };
+    let mut fallback = Owner::new(project(&paced), brush, NoUploads, fifo, Instant::now());
+    run(&mut fallback, 10_000);
+    fallback.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    frame(&mut fallback, Instant::now());
+    fallback.pen(pen_sample(Phase::Drag, (170.0, 100.0)));
+    assert!(
+        matches!(fallback.next(Instant::now()), Next::Wait { .. }),
+        "paced to the refresh"
+    );
+    let size = Size::new(320, 200).expect("non-zero");
+    let overlay = fallback.overlay(size, OwnerPhases::default(), None);
+    assert!(
+        overlay.join("\n").contains("no mailbox"),
+        "and the overlay says why"
+    );
+    fallback.close().expect("closed");
+}
+
+/// A pen stream that delivers `sample` at its `at`th drain, and nothing at any other.
+#[derive(Debug)]
+struct LateSample {
+    /// Drains so far.
+    drains: usize,
+    /// The drain that delivers it.
+    at: usize,
+    /// The sample.
+    sample: PenSample,
+}
+
+impl PenFeed for LateSample {
+    fn pull(&mut self, out: &mut Vec<PenSample>) {
+        self.drains += 1;
+        if self.drains == self.at {
+            out.push(self.sample);
+        }
+    }
+}
+
+#[test]
+fn the_jobs_yield_to_a_strokes_sample_and_wait_while_the_stroke_is_open() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let brush = PenLog {
+        claims: true,
+        ..PenLog::default()
+    };
+    // A larger display layer to build: its jobs take many steps.
+    let mut owner = Owner::new(
+        project_to(&dir, 6),
+        brush,
+        NoUploads,
+        setup(None),
+        Instant::now(),
+    );
+    assert!(owner.project().store().has_jobs(), "a rebuild to run");
+    // The sample arrives as the jobs run: at the drain after their first step (the frame's
+    // start, its brush phase, before the upkeep, the preparation and the first step come first).
+    let mut pen = LateSample {
+        drains: 0,
+        at: 6,
+        sample: pen_sample(Phase::Down, (160.0, 100.0)),
+    };
+    let started = Instant::now();
+    owner
+        .frame_fed(started, started + Duration::from_secs(30), &mut pen, |_| {
+            Ok(())
+        })
+        .expect("a frame");
+    owner.shown(presented(1));
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "the jobs stopped at the sample, long before their deadline: {took:?}"
+    );
+    assert!(owner.project().store().has_jobs(), "left for later");
+    let ran = owner.after_hand_off.report.slices;
+    assert!(ran >= 1, "a step ran before the sample came");
+    assert!(
+        matches!(owner.next(Instant::now()), Next::Frame { .. }),
+        "and the sample's frame starts at once"
+    );
+    // That frame opens the brush's stroke: no jobs at all while it is open.
+    frame(&mut owner, Instant::now() + Duration::from_secs(1));
+    assert_eq!(
+        owner.after_hand_off.report.slices, 0,
+        "none while the stroke is open"
+    );
+    owner.pen(pen_sample(Phase::Up, (160.0, 100.0)));
+    frame(&mut owner, Instant::now() + Duration::from_millis(50));
+    assert!(
+        owner.after_hand_off.report.slices > 0,
+        "the pen lifted: they go on"
+    );
     owner.close().expect("closed");
 }
 
@@ -658,7 +808,7 @@ fn epochs_closed_between_frames_want_a_frame_to_take_them() {
         size: Size::new(320, 200).expect("a size"),
     };
     OneEdit::default()
-        .step(context, &PenFrame::default())
+        .step(context, &PenFrame::default(), &BrushBudget::unlimited())
         .expect("an edit");
     owner.upkeep(Instant::now()).expect("upkeep");
     assert!(
@@ -717,20 +867,26 @@ fn a_frame_due_with_the_gpu_behind_waits_running_jobs_and_upkeep_then_starts() {
             }
         }
     };
-    let busy = owner.wait_for_gpu(due, || Ok(0)).expect("waiting");
+    let busy = owner
+        .wait_for_gpu(due, &mut NoPen, || Ok(0))
+        .expect("waiting");
     assert_eq!(busy, GpuWait::Worked, "the store's jobs ran meanwhile");
     assert!(
         owner.scheduler.wanted().contains(Reason::Converging),
         "and want the frame for what they leave"
     );
     let later = owner.scheduler.upkeep_due() + Duration::from_millis(1);
-    owner.wait_for_gpu(later, || Ok(0)).expect("waiting");
+    owner
+        .wait_for_gpu(later, &mut NoPen, || Ok(0))
+        .expect("waiting");
     assert_eq!(
         owner.scheduler.upkeep_due(),
         later + schedule::UPKEEP_INTERVAL,
         "the upkeep ran, due meanwhile"
     );
-    let ready = owner.wait_for_gpu(later, || Ok(bound)).expect("waiting");
+    let ready = owner
+        .wait_for_gpu(later, &mut NoPen, || Ok(bound))
+        .expect("waiting");
     assert_eq!(ready, GpuWait::Ready, "the GPU finished");
     let Next::Frame { deadline } = owner.next(later) else {
         panic!("the frame starts");
@@ -751,7 +907,9 @@ fn a_wait_for_the_gpu_that_leads_to_no_frame_is_forgotten() {
     let dir = TestDir::new();
     let start = Instant::now();
     let mut owner = Owner::new(project(&dir), NoBrush, NoUploads, setup(Some(2)), start);
-    let wait = owner.wait_for_gpu(start, || Ok(0)).expect("waiting");
+    let wait = owner
+        .wait_for_gpu(start, &mut NoPen, || Ok(0))
+        .expect("waiting");
     assert_eq!(wait, GpuWait::Ready, "nothing in flight");
     let later = start + Duration::from_secs(5);
     assert!(matches!(owner.next(later), Next::Frame { .. }));
@@ -786,7 +944,7 @@ fn a_minimised_window_still_runs_its_upkeep() {
         size: Size::new(320, 200).expect("a size"),
     };
     OneEdit::default()
-        .step(context, &PenFrame::default())
+        .step(context, &PenFrame::default(), &BrushBudget::unlimited())
         .expect("an edit");
     owner.resize(None);
     let later = Instant::now() + schedule::UPKEEP_INTERVAL;

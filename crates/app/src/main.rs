@@ -54,7 +54,7 @@ use winit::event_loop::EventLoop;
 
 use crate::cli::Options;
 use crate::frame::schedule::Next;
-use crate::frame::{Brush, GpuWait, Owner, Setup, Uploads as _};
+use crate::frame::{Brush, GpuWait, NoPen, Owner, Setup, Uploads as _};
 use crate::pace::{Pacer, SystemTimer};
 use crate::pick::Picker;
 use crate::render_thread::{Hooks, RenderThread};
@@ -256,26 +256,45 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
 ///
 /// Where a window would wait for events it waits for the next frame precisely ([`pace`]), and
 /// for the upkeep by a plain sleep; it waits on the render thread directly (which only encodes
-/// and submits). It never waits on the GPU: while the GPU is too far behind for the next frame
-/// it polls the device every [`frame::GPU_POLL`], running the store's jobs meanwhile.
+/// and submits), but no later than a scripted pen's next sample ([`Owner::pen_due`]), as a
+/// window's loop wakes for the pen. It never waits on the GPU: while the GPU is too far behind
+/// for the next frame it polls the device every [`frame::GPU_POLL`], running the brush's work
+/// between frames or the store's jobs meanwhile. Wherever it would wait, a brush stroke's work
+/// between frames comes first ([`Owner::between_frames`]).
 ///
 /// # Errors
 ///
-/// If a frame, the upkeep, the store's jobs or the render thread fails, or the device is lost.
+/// If a frame, the upkeep, the brush, the store's jobs or the render thread fails, or the device
+/// is lost.
 fn drive_offscreen<B: Brush>(
     owner: &mut Owner<B, GpuResidency>,
     render: &mut RenderThread,
 ) -> Result<()> {
     let mut pacer = Pacer::default();
+    let mut pen = NoPen;
     while !owner.done() {
         let now = Instant::now();
         match owner.next(now) {
             Next::Frame { deadline } => owner.frame(now, deadline, |frame| render.send(frame))?,
-            Next::Render => owner.shown(render.wait()?),
-            Next::Gpu => match owner.wait_for_gpu(now, || render.gpu_finished())? {
+            Next::Render if owner.between_frames(now, &mut pen)? => {
+                for presented in render.finished()? {
+                    owner.shown(presented);
+                }
+            }
+            Next::Render => {
+                let presented = match owner.pen_due() {
+                    Some(due) => render.wait_until(due)?,
+                    None => Some(render.wait()?),
+                };
+                if let Some(presented) = presented {
+                    owner.shown(presented);
+                }
+            }
+            Next::Gpu => match owner.wait_for_gpu(now, &mut pen, || render.gpu_finished())? {
                 GpuWait::Ready | GpuWait::Worked => {}
                 GpuWait::Idle => std::thread::sleep(frame::GPU_POLL),
             },
+            Next::Wait { .. } if owner.between_frames(now, &mut pen)? => {}
             Next::Wait { until } => drop(pacer.wait_until(&mut SystemTimer, until)),
             Next::Idle { upkeep } => {
                 std::thread::sleep(upkeep.saturating_duration_since(now));

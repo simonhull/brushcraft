@@ -25,8 +25,9 @@
 //!
 //! # The strokes path
 //!
-//! `--script-path strokes` ([`Script::strokes`]) draws two pen strokes on the sphere, for the
-//! pen's latency (sample to present submitted) and a stroke seen from a distance:
+//! `--script-path strokes` ([`Script::strokes`]) draws three pen strokes on the sphere, for the
+//! pen's latency (sample to present submitted), a stroke seen from a distance, and a brush that
+//! keeps up with a fast pen:
 //!
 //! 1. **open**, 3 s still, three units away, as the benchmark path starts;
 //! 2. **approach**, 1.5 s: in to 0.3 above the surface, easing in and out;
@@ -37,7 +38,15 @@
 //! 5. **`stroke_far`**, 2 s still: the same stroke seen from a distance, its tiles drawn at display
 //!    levels (the stand-ins' case), a 6-pixel brush: about the near stroke's world size in a 1280 ×
 //!    800 view, below the footprint limit F on the benchmark project;
-//! 6. **settle**, 2 s still: the edits' refresh lands.
+//! 6. **turn**, 1 s: a quarter turn more at that distance, to surface not yet drawn, easing in and
+//!    out;
+//! 7. **`stroke_long`**, 2 s still: a fast, long stroke at the default 40-pixel brush across the
+//!    whole sphere as the view sees it (from about 39° left of the point facing the camera to 39°
+//!    right, two thirds of the sphere's width on the screen), in 0.8 s: the brush must keep up, its
+//!    queue of dabs never growing over the stroke and drained within two frames of pen-up. At the
+//!    performance suite's 4K a dab touches about 60 finest tiles of the benchmark project, below F
+//!    (in a 1280 × 800 view, about F);
+//! 8. **settle**, 2 s still: the edits' refresh lands.
 //!
 //! The pen's samples come at the Kamvas's measured 173 Hz, in real time whatever the speed (a
 //! faster run has fewer of them): hovering over the stroke's start from 0.3 s before it touches
@@ -131,6 +140,10 @@ pub(crate) enum Segment {
     Retreat,
     /// Still, far, while a stroke is drawn.
     StrokeFar,
+    /// Round the object at the same distance, to surface not yet drawn.
+    Turn,
+    /// Still, while a fast, long stroke is drawn across the whole object.
+    StrokeLong,
 }
 
 impl Segment {
@@ -146,6 +159,8 @@ impl Segment {
             Self::StrokeNear => "stroke_near",
             Self::Retreat => "retreat",
             Self::StrokeFar => "stroke_far",
+            Self::Turn => "turn",
+            Self::StrokeLong => "stroke_long",
         }
     }
 }
@@ -241,8 +256,12 @@ const FAR: Pose = Pose {
     ..START
 };
 
+/// The strokes path's last pose: three units away, half a turn round from the start, for the
+/// long stroke.
+const ROUND: Pose = Pose { yaw: PI, ..START };
+
 /// The strokes path's camera ([`Script::strokes`]; the module notes say why each segment).
-const STROKES: [Keyframe; 6] = [
+const STROKES: [Keyframe; 8] = [
     Keyframe {
         segment: Segment::Open,
         seconds: 3.0,
@@ -274,16 +293,28 @@ const STROKES: [Keyframe; 6] = [
         ease: Ease::Linear,
     },
     Keyframe {
+        segment: Segment::Turn,
+        seconds: 1.0,
+        to: ROUND,
+        ease: Ease::Smooth,
+    },
+    Keyframe {
+        segment: Segment::StrokeLong,
+        seconds: 2.0,
+        to: ROUND,
+        ease: Ease::Linear,
+    },
+    Keyframe {
         segment: Segment::Settle,
         seconds: 2.0,
-        to: FAR,
+        to: ROUND,
         ease: Ease::Linear,
     },
 ];
 
-/// The strokes path's pen strokes, one in each still stroke segment (which start at 4.5 s and
-/// 8 s).
-const PEN_STROKES: [PenStroke; 2] = [
+/// The strokes path's pen strokes, one in each still stroke segment (which start at 4.5 s, 8 s
+/// and 11 s).
+const PEN_STROKES: [PenStroke; 3] = [
     PenStroke {
         hover: 4.7,
         down: 5.0,
@@ -297,6 +328,13 @@ const PEN_STROKES: [PenStroke; 2] = [
         up: 9.7,
         radius: 6.0,
         span: 0.6,
+    },
+    PenStroke {
+        hover: 11.2,
+        down: 11.5,
+        up: 12.3,
+        radius: 40.0,
+        span: 1.6,
     },
 ];
 
@@ -375,7 +413,7 @@ pub(crate) enum ScriptPath {
     /// The renderer's measured run ([`Script::benchmark`]).
     #[default]
     Benchmark,
-    /// Two pen strokes, near and far ([`Script::strokes`]).
+    /// Three pen strokes: near, far, and fast and long ([`Script::strokes`]).
     Strokes,
 }
 
@@ -498,6 +536,12 @@ impl Script {
         let start = self.pen.partition_point(|sample| sample.time <= from);
         let end = self.pen.partition_point(|sample| sample.time <= to);
         self.pen.get(start..end.max(start)).unwrap_or_default()
+    }
+
+    /// When the scripted pen's first sample after `from` into the run is taken, if there is one.
+    pub(crate) fn next_pen_after(&self, from: Duration) -> Option<Duration> {
+        let next = self.pen.partition_point(|sample| sample.time <= from);
+        self.pen.get(next).map(|sample| sample.time)
     }
 
     /// Every sample of the pen's strokes, in order of time (the strokes are in order, and don't

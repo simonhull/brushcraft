@@ -14,10 +14,10 @@
 //! - **Each sample:** [`Stroke::push`], through a fresh [`StoreSurface`] each call, ended with
 //!   [`StoreSurface::finish`]; the dabs it places join the stroke's queue. A sample with no
 //!   pressure places none: the engine places no dab below [`stroke::MIN_DAB_SIZE`].
-//! - **Each frame:** the queued dabs are applied by [`apply_dabs`], oldest stroke first, as many as
-//!   the frame's budget allows ([`DabBudget`]); the rest wait for the next frame. The edit closes
-//!   the store's epoch, which the frame loop drains after the brush phase and uploads in the same
-//!   frame.
+//! - **Each step:** the queued dabs are applied by [`apply_dabs`], oldest stroke first, as many as
+//!   the time the step has fits ([`BrushBudget`], [`DabCost`]); the rest wait for the next step.
+//!   The edit closes the store's epoch, which the frame loop drains after the brush phase and
+//!   uploads in the same frame (a step between frames: in the next).
 //! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) when it is the oldest stroke
 //!   left, so every edit of the store's current op is that stroke's: a stroke started while the
 //!   last still has dabs queued waits behind them, its dabs placed but not applied, and its op
@@ -32,15 +32,24 @@
 //! A sample's time is seconds from a fixed epoch (the brush's creation) on the pen's
 //! de-jittered clock.
 //!
-//! # The budget: dabs per frame
+//! # The budget: dabs per step, by the time left
 //!
-//! A frame's dabs cost [`apply_dabs`] about linearly in the tiles they touch: each dab re-evaluates
-//! every tile its sphere reaches, whole, and pays a query and a dispatch to the workers besides.
-//! So each dab is costed as the tiles its sphere touches in the index (queried as it is queued)
-//! times a tile's [`TILE_VERTICES`], plus a fixed overhead, and a frame applies dabs while their
-//! summed cost fits [`DabBudget::DEFAULT`], and always at least one. The rest are carried to the
-//! next frame, in order: no dab is dropped, and the stroke's tail waits behind them. A frame that
-//! carries dabs wants the next.
+//! A step applies dabs for as long as its frame has left ([`BrushBudget`]: the pen's latency aim
+//! from the frame's start, less the frame's own work after the brush; up to a refresh interval
+//! once the oldest queued dab is past the aim, so a brush behind catches up). The time is turned
+//! into dabs by one cost model, [`DabCost`]: a dab is costed by the tiles its
+//! sphere touches in the index (queried as it is queued), each a tile's [`TILE_VERTICES`], plus a
+//! fixed overhead, at a calibrated time per unit. Today's [`apply_dabs`] re-evaluates every tile of
+//! every dab, so a batch costs the sum over its dabs ([`Grouping::PerDab`]); once it applies a
+//! frame's dabs grouped by tile, a batch costs the union of its dabs' tiles
+//! ([`Grouping::TileUnion`]), which is one constant to change. A step applies at least one dab.
+//! The rest are carried to the next step, in order: no dab is dropped, and the stroke's tail waits
+//! behind them. A frame that carries dabs wants the next, on input.
+//!
+//! **Between frames** the frame loop steps the brush too, in short slices, while a stroke is under
+//! way and the loop would otherwise wait (for the render thread, the GPU, or the refresh slot): so
+//! a frame's own step has only the samples since, and a 60 Hz frame's idle time isn't lost to a
+//! fast stroke ([`crate::frame::Owner::between_frames`]).
 //!
 //! The footprint limit F (the M1 spec's "Big brushes": about 150 tiles a step, [`LIMIT_TILES`]) is
 //! reported per frame ([`BrushReport::above_limit`]): the latency target holds below it; above it
@@ -79,9 +88,9 @@
 //!   [`ProjectError::NotTheStroke`], or one that can't be made) ends the stroke unrecorded
 //!   ([`Project::end_unrecorded_stroke`]), so its edits are still flushed.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::f64::consts::FRAC_PI_2;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use geom::TileKey;
@@ -98,7 +107,7 @@ use stroke::{
 };
 
 use crate::camera::{Camera, Pixel};
-use crate::frame::{Brush, BrushChange, BrushContext, BrushReport, SampleTimes};
+use crate::frame::{Brush, BrushBudget, BrushChange, BrushContext, BrushReport, SampleTimes};
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 
 #[cfg(test)]
@@ -138,70 +147,155 @@ pub(crate) const TILE_VERTICES: f64 = 4225.0;
 /// Tiles the warming evaluates together on the store's workers between checks of its deadline.
 pub(crate) const WARM_BATCH: usize = 16;
 
-/// How many dabs a frame applies: as many as fit a budget, each dab costed by the tiles it
-/// touches plus a fixed overhead, and always at least one (see "The budget" in the module notes).
-///
-/// Costs are in tile vertices: a dab touching `t` tiles costs `t ·` [`TILE_VERTICES`] plus the
-/// overhead.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DabBudget {
-    /// The most a frame's dabs cost together.
-    units: f64,
-    /// What every dab costs besides its tiles: its query, a dispatch to the workers.
-    per_dab: f64,
+/// How a batch of dabs' tiles are counted against its cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Grouping {
+    /// Each dab pays for every tile it touches: [`apply_dabs`] as it is, re-evaluating each dab's
+    /// tiles whole (Task 3: about linear in dabs, a tile predicted once a call).
+    PerDab,
+    /// A batch pays once for each tile any of its dabs touches: [`apply_dabs`] grouping a frame's
+    /// dabs by tile, tiles in parallel.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the model once apply_dabs groups a frame's dabs by tile, being built now"
+        )
+    )]
+    TileUnion,
 }
 
-impl DabBudget {
-    /// 160,000 tile vertices a frame, and two tiles' worth (8,450) a dab besides.
-    ///
-    /// Sized against Task 3's p99, not its median: four dabs of 50,000 vertices (each touching
-    /// about 24 tiles, about 100,000 tile vertices) took 7.5 ms a call at p99, about 18 ns a tile
-    /// vertex, so the budget is about 3 ms at p99, leaving the rest of the pen's 8 ms to the
-    /// frame's input, feed, uploads and encoding (3 to 4 ms of uploads and encoding at p99 in the
-    /// first scripted run). Both constants are provisional: the overhead is a guess until
-    /// `brushcraft-bench brush --dabs 32 --footprint small` (many small dabs) and `--dabs 4
-    /// --footprint 50000` calibrate them.
-    pub(crate) const DEFAULT: Self = Self {
-        units: 160_000.0,
+/// What applying dabs costs: the one cost model the brush's budget turns time into dabs with (see
+/// "The budget" in the module notes), in one place to retune.
+///
+/// Costs are in tile vertices: a batch costs its tiles (each dab's, or their union, as
+/// [`Grouping`] says) times [`TILE_VERTICES`], plus a fixed overhead a dab, at a time per unit.
+///
+/// **Learnt on the machine:** the time per unit is the calibrated one times a scale learnt from
+/// each batch applied ([`DabCost::observe`], the way [`crate::pace::Pacer`] learns its sleeps): a
+/// batch slower than predicted raises it at once, a faster one lowers it an eighth of the way. The
+/// scripted strokes on the benchmark project took two to ten times the calibration (its dabs pin
+/// and evaluate more neighbours than the medium project's), so a fixed constant would overrun
+/// every budget there; learnt, the budget holds on any project and machine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DabCost {
+    /// What every dab costs besides its tiles, in units: its query, a dispatch to the workers.
+    per_dab: f64,
+    /// How long a unit takes, in nanoseconds, at the tail, as calibrated.
+    ns_per_unit: f64,
+    /// How a batch's tiles are counted.
+    grouping: Grouping,
+    /// How much longer than calibrated batches have taken on this machine and project, learnt.
+    scale: f64,
+}
+
+/// The range a [`DabCost`]'s learnt scale is held to: a batch far off says little about the next
+/// (a cold start, the process stopped).
+const COST_SCALE: (f64, f64) = (0.25, 64.0);
+
+impl DabCost {
+    /// The model calibrated in Task 5 on the medium project: about 10.5 ns a unit at p99,
+    /// marginal, for 1,000- and 50,000-vertex dabs alike (32 small dabs 6.0 ms, 1 small 0.51 ms;
+    /// 4 large 6.8 ms, 1 large 2.2 ms), two tiles' worth (8,450 units) a dab besides, each dab
+    /// paying for its own tiles. Retune here when `apply_dabs` changes: `brushcraft-bench brush
+    /// --dabs 32 --footprint small` and `--dabs 4 --footprint 50000` calibrate it; with dabs
+    /// grouped by tile, [`Grouping::TileUnion`].
+    pub(crate) const CALIBRATED: Self = Self {
         per_dab: 2.0 * TILE_VERTICES,
+        ns_per_unit: 10.5,
+        grouping: Grouping::PerDab,
+        scale: 1.0,
     };
 
-    /// A budget of `units` tile vertices a frame, and `per_dab` a dab besides its tiles.
+    /// A model costing `per_dab` units a dab besides its tiles, `ns_per_unit` a unit, its tiles
+    /// counted as `grouping` says. A time per unit of zero fits any batch in any time.
     #[cfg(test)]
-    pub(crate) const fn new(units: f64, per_dab: f64) -> Self {
-        Self { units, per_dab }
+    pub(crate) const fn new(per_dab: f64, ns_per_unit: f64, grouping: Grouping) -> Self {
+        Self {
+            per_dab,
+            ns_per_unit,
+            grouping,
+            scale: 1.0,
+        }
     }
 
-    /// What a dab touching `tiles` tiles costs.
-    pub(crate) fn cost(self, tiles: usize) -> f64 {
-        let count = u32::try_from(tiles).map_or_else(|_| f64::from(u32::MAX), f64::from);
-        count * TILE_VERTICES + self.per_dab
+    /// A model under which a step applies one dab at a time (each takes far longer than any
+    /// budget), for tests of carrying.
+    #[cfg(test)]
+    pub(crate) const fn one_at_a_time() -> Self {
+        Self::new(0.0, 1e12, Grouping::PerDab)
     }
 
-    /// How many of `costs` (queued dabs' costs, in order) fit `room`, the budget the frame has
-    /// left, which they use up: the longest run from the front that fits, and at least one if
-    /// `at_least_one` and there are any.
-    pub(crate) fn take(
-        costs: impl IntoIterator<Item = f64>,
-        room: &mut f64,
+    /// A model under which any number of dabs fit any time, for tests that apply every dab
+    /// placed.
+    #[cfg(test)]
+    pub(crate) const fn any_number() -> Self {
+        Self::new(0.0, 0.0, Grouping::PerDab)
+    }
+
+    /// How long a unit takes now, in nanoseconds: the calibrated time, scaled as learnt.
+    fn unit_ns(self) -> f64 {
+        self.ns_per_unit * self.scale
+    }
+
+    /// Learns from a batch costed at `units` that took `took`: a slower one than predicted raises
+    /// the scale at once, a faster one lowers it an eighth of the way.
+    pub(crate) fn observe(&mut self, units: f64, took: Duration) {
+        let predicted = units * self.ns_per_unit;
+        if predicted <= 0.0 {
+            return;
+        }
+        let (least, most) = COST_SCALE;
+        let seen = (took.as_secs_f64() * 1e9 / predicted).clamp(least, most);
+        self.scale = if seen > self.scale {
+            seen
+        } else {
+            self.scale + (seen - self.scale) / 8.0
+        };
+    }
+
+    /// How many of the queued dabs, each given by the tiles it touches, in order, fit `room`:
+    /// the longest run from the front whose batch cost fits, and at least one if `at_least_one`
+    /// and there are any. Returns the count and the batch's units.
+    pub(crate) fn take<'a>(
+        self,
+        dabs: impl IntoIterator<Item = &'a [TileKey]>,
+        room: Duration,
         at_least_one: bool,
-    ) -> usize {
+    ) -> (usize, f64) {
+        let fits = if self.unit_ns() > 0.0 {
+            room.as_secs_f64() * 1e9 / self.unit_ns()
+        } else {
+            f64::INFINITY
+        };
+        let mut seen: BTreeSet<TileKey> = BTreeSet::new();
+        let mut used = 0.0;
         let mut count = 0;
-        for cost in costs {
-            if cost > *room && !(at_least_one && count == 0) {
+        for tiles in dabs {
+            let new = match self.grouping {
+                Grouping::PerDab => tiles.len(),
+                Grouping::TileUnion => tiles.iter().filter(|&&key| seen.insert(key)).count(),
+            };
+            let cost = units(new) * TILE_VERTICES + self.per_dab;
+            if used + cost > fits && !(at_least_one && count == 0) {
                 break;
             }
-            *room -= cost;
+            used += cost;
             count += 1;
         }
-        count
+        (count, used)
     }
 }
 
-impl Default for DabBudget {
+impl Default for DabCost {
     fn default() -> Self {
-        Self::DEFAULT
+        Self::CALIBRATED
     }
+}
+
+/// `count` as a number of units.
+fn units(count: usize) -> f64 {
+    u32::try_from(count).map_or_else(|_| f64::from(u32::MAX), f64::from)
 }
 
 /// The camera as the stroke engine's [`Projector`]: rays from the eye through a viewport's
@@ -269,15 +363,13 @@ impl<S: Surface> Surface for Primed<'_, S> {
     }
 }
 
-/// Where a queued dab came from, and what it costs.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Where a queued dab came from, and what it touches.
+#[derive(Debug, Clone, PartialEq)]
 struct Source {
     /// The sample whose push (or the pen-up's end) placed it: the frame's latency runs from it.
     times: SampleTimes,
-    /// The tiles its sphere touches, as it was queued.
-    tiles: usize,
-    /// Its cost against the frame's budget.
-    cost: f64,
+    /// The tiles its sphere touches in the index, as it was queued: its cost ([`DabCost`]).
+    tiles: Vec<TileKey>,
 }
 
 /// A stroke, from its `Down` until its op ends: its engine stroke while the pen is down, what its
@@ -316,26 +408,20 @@ impl Pending {
     }
 }
 
-/// Queues `placed` on a stroke's `queue`: dabs placed by the sample at `times`, each costed by
-/// `budget` from the tiles of `index` its sphere touches.
+/// Queues `placed` on a stroke's `queue`: dabs placed by the sample at `times`, each with the
+/// tiles of `index` its sphere touches.
 fn enqueue(
     (dabs, sources): (&mut VecDeque<Dab>, &mut VecDeque<Source>),
     placed: impl Iterator<Item = Dab>,
     times: SampleTimes,
     index: &SpatialIndex,
-    budget: DabBudget,
 ) {
     for dab in placed {
         let [x, y, z] = dab.position;
-        let touched = index
-            .query_sphere(geom::Vec3::new(x, y, z), dab.radius)
-            .count();
+        let touched = index.query_sphere(geom::Vec3::new(x, y, z), dab.radius);
+        let keys: Vec<TileKey> = touched.collect();
         dabs.push_back(dab);
-        sources.push_back(Source {
-            times,
-            tiles: touched,
-            cost: budget.cost(touched),
-        });
+        sources.push_back(Source { times, tiles: keys });
     }
 }
 
@@ -382,8 +468,8 @@ pub(crate) struct Sculpting {
     state: sculpt::Stroke,
     /// The strokes not over yet, oldest first: only the last can be open.
     strokes: VecDeque<Pending>,
-    /// How many dabs a frame applies.
-    budget: DabBudget,
+    /// What applying dabs costs: how a step's time becomes dabs.
+    cost: DabCost,
     /// The next stroke's number.
     next_stroke: u32,
     /// The epoch sample times count from.
@@ -422,7 +508,7 @@ impl Sculpting {
             strength_factor: 1.0,
             state,
             strokes: VecDeque::new(),
-            budget: DabBudget::DEFAULT,
+            cost: DabCost::CALIBRATED,
             next_stroke: 0,
             epoch: Instant::now(),
             routed: None,
@@ -438,11 +524,11 @@ impl Sculpting {
         brush
     }
 
-    /// This brush with `budget` dabs a frame.
+    /// This brush costing its dabs by `cost`.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn with_budget(mut self, budget: DabBudget) -> Self {
-        self.budget = budget;
+    pub(crate) const fn with_cost(mut self, cost: DabCost) -> Self {
+        self.cost = cost;
         self
     }
 
@@ -591,7 +677,6 @@ impl Sculpting {
         let Some(engine_sample) = self.engine_sample(sample) else {
             return;
         };
-        let budget = self.budget;
         let Some(pending) = self.strokes.back_mut().filter(|stroke| stroke.open()) else {
             return;
         };
@@ -608,7 +693,7 @@ impl Sculpting {
         match finished {
             Ok(()) => {
                 let queue = (&mut pending.dabs, &mut pending.sources);
-                enqueue(queue, placed, times, scene.index, budget);
+                enqueue(queue, placed, times, scene.index);
             }
             Err(error) => {
                 drop(placed);
@@ -621,7 +706,6 @@ impl Sculpting {
     /// Ends the open stroke's engine stroke, if there is one, queueing its tail: the pen lifted
     /// at `up`, or (`None`) its `Up` was lost, and the tail is timed from its last sample.
     fn lift(&mut self, scene: &mut Scene<'_>, up: Option<&PenSample>) {
-        let budget = self.budget;
         let Some(pending) = self.strokes.back_mut() else {
             return;
         };
@@ -635,7 +719,7 @@ impl Sculpting {
         match surface.finish() {
             Ok(()) => {
                 let queue = (&mut pending.dabs, &mut pending.sources);
-                enqueue(queue, tail, times, scene.index, budget);
+                enqueue(queue, tail, times, scene.index);
             }
             Err(error) => {
                 drop(tail);
@@ -644,10 +728,18 @@ impl Sculpting {
         }
     }
 
-    /// Applies queued dabs within `room` of the budget, oldest stroke first, beginning each
-    /// stroke's op as it comes to the front and ending it once it is over; at least one dab if
-    /// any is queued.
-    fn apply(&mut self, scene: &mut Scene<'_>, report: &mut BrushReport, mut room: f64) {
+    /// Applies queued dabs while `budget` leaves time for them (all of them with none), oldest
+    /// stroke first, beginning each stroke's op as it comes to the front and ending it once it is
+    /// over; at least one dab if any is queued.
+    ///
+    /// The time left is read from the clock before each stroke's batch, so a batch that ran long
+    /// leaves the next less.
+    fn apply(
+        &mut self,
+        scene: &mut Scene<'_>,
+        report: &mut BrushReport,
+        budget: Option<&BrushBudget>,
+    ) {
         loop {
             let Some(front) = self.strokes.front_mut() else {
                 return;
@@ -664,10 +756,19 @@ impl Sculpting {
                 }
             }
             let first = report.dabs_applied == 0;
-            let costs = front.sources.iter().map(|source| source.cost);
-            let count = DabBudget::take(costs, &mut room, first);
+            let room = match (budget, front.sources.front()) {
+                (Some(budget), Some(oldest)) => budget
+                    .until(oldest.times.taken)
+                    .saturating_duration_since(Instant::now()),
+                (Some(_), None) => Duration::ZERO,
+                (None, _) => Duration::MAX,
+            };
+            let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
+            let (count, units) = self.cost.take(tiles, room, first);
             if count > 0 {
+                let began = Instant::now();
                 self.apply_front(scene, report, count);
+                self.cost.observe(units, began.elapsed());
             }
             if !self.strokes.front().is_some_and(Pending::done) {
                 return;
@@ -692,7 +793,7 @@ impl Sculpting {
                     .oldest
                     .map_or(source.times, |oldest| oldest.earliest(source.times)),
             );
-            report.above_limit |= source.tiles > LIMIT_TILES;
+            report.above_limit |= source.tiles.len() > LIMIT_TILES;
         }
         let dabs: &[Dab] = front.dabs.make_contiguous();
         let batch = dabs.get(..count).unwrap_or(dabs);
@@ -950,7 +1051,12 @@ impl<'a> Scene<'a> {
 }
 
 impl Brush for Sculpting {
-    fn step(&mut self, context: BrushContext<'_>, pen: &PenFrame) -> Result<BrushReport> {
+    fn step(
+        &mut self,
+        context: BrushContext<'_>,
+        pen: &PenFrame,
+        budget: &BrushBudget,
+    ) -> Result<BrushReport> {
         let view = context.camera.view(context.size);
         let mut report = BrushReport::default();
         let Some(mut scene) = Scene::of(context) else {
@@ -963,6 +1069,7 @@ impl Brush for Sculpting {
                 self.held.extend(events);
                 report.dabs_carried = self.queued();
                 report.busy = true;
+                report.open = self.strokes.back().is_some_and(Pending::open);
             }
             self.routed = None;
             self.note_hover(pen, None);
@@ -985,10 +1092,11 @@ impl Brush for Sculpting {
             self.handle(&mut scene, sample);
         }
         self.routed = None;
-        self.apply(&mut scene, &mut report, self.budget.units);
+        self.apply(&mut scene, &mut report, Some(budget));
         self.note_hover(pen, view.as_ref());
         report.dabs_carried = self.queued();
         report.busy = report.dabs_carried > 0;
+        report.open = self.strokes.back().is_some_and(Pending::open);
         if report.dabs_applied > 0 {
             self.last = report;
         }
@@ -1049,7 +1157,7 @@ impl Brush for Sculpting {
                 self.handle(&mut scene, event.as_ref());
             }
             self.lift(&mut scene, None);
-            self.apply(&mut scene, &mut BrushReport::default(), f64::INFINITY);
+            self.apply(&mut scene, &mut BrushReport::default(), None);
         }
         Ok(())
     }

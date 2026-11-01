@@ -13,10 +13,12 @@
 //!    stroking (the pick is on the pen's latency path, and the stroke moves the surface under it
 //!    anyway): it is made once the stroke is over, in a frame wanted for it;
 //! 2. **brush**: the brush's step ([`Brush`]; the app's is [`crate::sculpting::Sculpting`]), which
-//!    sees the camera as the input left it and the frame's pen samples, applies the frame's dabs
-//!    and closes their epoch, so they are drained just after and drawn in this frame; what it
-//!    reports ([`BrushReport`]) goes to a scripted run's record, and the oldest sample it applied
-//!    is kept until the frame is shown, for the pen's latency (sample to present submitted,
+//!    sees the camera as the input left it and the frame's pen samples (those that arrived during
+//!    the input phase too), applies as many of its queued dabs as the frame's time left allows
+//!    ([`BrushBudget`]) and closes their epoch, so they are drained just after and drawn in this
+//!    frame; what it reports ([`BrushReport`], with what it did between the last frame and this
+//!    one) goes to a scripted run's record, and the oldest sample it applied is kept until the
+//!    frame is shown, for the pen's latency (sample to present submitted,
 //!    [`Presented::submitted`]);
 //! 3. **feed**: the stale-tile feed is drained: the epochs closed since the last frame;
 //! 4. **uploads**: GPU residency ([`Uploads`], [`crate::uploads::GpuResidency`]) takes the drained
@@ -29,11 +31,36 @@
 //! 7. **prepare**: the brush's work off the latency path ([`Brush::prepare`]: warming the surface
 //!    under a hovering pen), until the frame's deadline;
 //! 8. **jobs**: and the store's resumable jobs (display-layer refresh and rebuild) run until the
-//!    frame's deadline, at least one slice of them. This frame draws nothing they produce: the
-//!    epochs they close are drained by the next frame, which they want.
+//!    frame's deadline, at least one slice of them (but none while a brush stroke is under way, and
+//!    no more once a stroke's samples wait). This frame draws nothing they produce: the epochs they
+//!    close are drained by the next frame, which they want.
 //!
 //! Handing off before the jobs keeps them out of the input's latency (the plan's order,
 //! amended by the Task 1 review).
+//!
+//! **The pen's latency** (the M1 spec's target: sample to present submitted ≤ 8 ms at p99 below
+//! F, "with mailbox presentation and late input"):
+//!
+//! - **frames on input:** a brush stroke's samples want their frame at once, unpaced, where
+//!   presentation allows it (mailbox, or offscreen; [`schedule::StrokePacing`]), as soon as the
+//!   render thread and the GPU have room; with FIFO (mailbox not offered) they keep the refresh's
+//!   pace, and the overlay says so;
+//! - **input read late:** the pen stream ([`PenFeed`]) is drained as a frame starts and again just
+//!   before its brush phase, and the brush takes every sample up to then;
+//! - **the brush's budget is the time left** ([`BrushBudget`]): the latency aim from the frame's
+//!   start less its own work after the brush (estimated from the last frames), turned into dabs by
+//!   the brush's cost model; more once the brush is behind, so it catches up;
+//! - **the brush works between frames** ([`Owner::between_frames`]): while a stroke is under way,
+//!   wherever the loop would wait (for the render thread, the GPU, or the refresh slot), it steps
+//!   the brush over the samples that arrived, in short slices, and the next frame shows the edits,
+//!   its latency measured from the oldest of them;
+//! - **the work after the hand-off yields:** the upkeep, the brush's preparation and each step of
+//!   the store's jobs stop once a stroke's samples wait (the next frame is wanted on input), and
+//!   the jobs don't run at all while a brush stroke is under way (a slice can run far past its
+//!   step, and their workers are the brush's): the display layer's refresh waits for the stroke to
+//!   land, the stand-ins showing it meanwhile.
+//!
+//! None of this is particular to sculpting: a painting brush's strokes would go the same way.
 //!
 //! **How the scene is shown** ([`Look`]: the MatCap's style, the wireframe, or the debug view of
 //! clusters) changes from the keyboard ([`LookChange`]). A frame wanted for that alone, with the
@@ -65,7 +92,7 @@
 
 pub(crate) mod schedule;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -77,7 +104,7 @@ use render::upload::FrameUploads;
 use render::{DrawTimes, Look, SceneView, aa};
 use store::{Drained, JobsReport, Project, SpatialIndex, StaleCursor, TileStore};
 
-use self::schedule::{Next, Reason, Reasons, Scheduler};
+use self::schedule::{Next, Reason, Reasons, Scheduler, StrokePacing};
 use crate::camera::{Arcball, Camera, Pixel};
 use crate::navigate::{Input, Navigator};
 use crate::overlay::{self, Snapshot};
@@ -139,6 +166,126 @@ pub(crate) struct BrushReport {
     /// Whether the brush has work left for the next frame (dabs carried, a stroke ending): the
     /// next frame is wanted.
     pub(crate) busy: bool,
+    /// Whether a stroke is open as the step ends: the pen is still down. A scripted run's record
+    /// keeps it, so the frames from pen-up until the queue drains can be counted.
+    pub(crate) open: bool,
+}
+
+impl BrushReport {
+    /// This report followed by `later`, a later step's: what both applied, the earlier sample of
+    /// the two, and the later step's state (carried, busy, open).
+    #[must_use]
+    pub(crate) fn then(self, later: Self) -> Self {
+        let oldest = match (self.oldest, later.oldest) {
+            (Some(a), Some(b)) => Some(a.earliest(b)),
+            (a, b) => a.or(b),
+        };
+        Self {
+            oldest,
+            dabs_applied: self.dabs_applied + later.dabs_applied,
+            dabs_carried: later.dabs_carried,
+            tiles_edited: self.tiles_edited + later.tiles_edited,
+            above_limit: self.above_limit || later.above_limit,
+            busy: later.busy,
+            open: later.open,
+        }
+    }
+}
+
+/// The pen's latency aim: from a pen sample being taken to the present of the frame that shows
+/// its dabs being submitted.
+///
+/// Below the M1 spec's target (8 ms at p99, brushes below F) by a margin for what the frame's
+/// estimate of its own remaining work ([`BrushBudget`]) misses at the tail.
+pub(crate) const LATENCY_AIM: Duration = Duration::from_millis(6);
+
+/// The least time a frame's brush step gets, whatever the estimate of the frame's other work.
+///
+/// A frame whose other work fills the aim still applies a useful amount, so a brush behind catches
+/// up rather than carrying all but one dab a frame.
+const LEAST_BRUSH: Duration = Duration::from_millis(1);
+
+/// What the frame's work after the brush is taken to cost before any frame has measured it:
+/// the feed, the uploads, the hand-off, the render thread's encode and submit.
+const FIRST_AFTER_BRUSH: Duration = Duration::from_millis(3);
+
+/// How many frames' work after the brush the estimate looks back over: the longest of them is
+/// the estimate, so a slow frame among the last few is planned for.
+const AFTER_BRUSH_KEPT: usize = 24;
+
+/// How long one step of brush work between frames may run ([`Owner::between_frames`]): short, so
+/// the loop hears soon of the render thread finishing and of new samples.
+pub(crate) const BETWEEN_SLICE: Duration = Duration::from_micros(1500);
+
+/// How long the store's jobs run between looks at the pen: they yield to a stroke's samples
+/// within about this (and a slice's overrun).
+const JOB_STEP: Duration = Duration::from_millis(1);
+
+/// When a brush step must have applied its dabs by: the time its frame has left.
+///
+/// A stroke's frame starts as its sample arrives (where strokes go on input), so to meet the
+/// latency aim it must submit its present by its start plus [`LATENCY_AIM`]. The frame loop
+/// knows how long its own work after the brush takes (the feed, the uploads, the hand-off and the
+/// render thread's encode and submit: [`Owner`] keeps an estimate, the longest of the last
+/// frames'), so the brush has until the aim less that work ([`BrushBudget::frame`]), at least
+/// [`LEAST_BRUSH`]. The brush turns the time into dabs with its own cost model; the dabs that
+/// don't fit are carried to the next step.
+///
+/// The time isn't cut further for a sample that waited before its frame started: the dabs cut
+/// would only move to the next frame, a whole frame later, and the frame's latency is its oldest
+/// sample's either way.
+///
+/// **A brush behind catches up:** once the oldest dab it holds is older than the aim, the aim is
+/// lost for it whatever the frame does, and what matters is draining the queue. Then the step may
+/// take up to a refresh interval ([`BrushBudget::until`]), so the frames' fixed work is spread over
+/// more dabs while the screen still updates at about the display's rate. Between frames the budget
+/// is a plain slice ([`BrushBudget::slice`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BrushBudget {
+    /// When the step began.
+    start: Instant,
+    /// When the step must be done by, keeping to the aim.
+    until: Instant,
+    /// When it must be done by once behind.
+    behind: Instant,
+}
+
+impl BrushBudget {
+    /// A frame's brush budget for a step starting at `start`, the frame's work after the brush
+    /// estimated at `after`, frames paced to `interval` (the most a step behind takes).
+    pub(crate) fn frame(start: Instant, after: Duration, interval: Duration) -> Self {
+        let until = start + LATENCY_AIM.saturating_sub(after).max(LEAST_BRUSH);
+        Self {
+            start,
+            until,
+            behind: until.max(start + interval),
+        }
+    }
+
+    /// An hour from now: every queued dab, for tests that step a brush directly.
+    #[cfg(test)]
+    pub(crate) fn unlimited() -> Self {
+        Self::slice(Instant::now(), Duration::from_secs(3600))
+    }
+
+    /// A budget of `length` from `start`: work between frames, behind or not.
+    pub(crate) fn slice(start: Instant, length: Duration) -> Self {
+        Self {
+            start,
+            until: start + length,
+            behind: start + length,
+        }
+    }
+
+    /// When the step must be done by, the oldest dab it holds placed from a sample taken at
+    /// `oldest`: the aim's deadline, or the catch-up's if that sample is older than the aim.
+    pub(crate) fn until(&self, oldest: Instant) -> Instant {
+        if self.start.saturating_duration_since(oldest) > LATENCY_AIM {
+            self.behind
+        } else {
+            self.until
+        }
+    }
 }
 
 /// When a pen sample was taken and when it reached the app.
@@ -164,15 +311,24 @@ impl SampleTimes {
 /// The brush's place in the frame: run on the owner thread after input and before the feed is
 /// drained, so the epochs its edits close reach the GPU in the same frame.
 pub(crate) trait Brush {
-    /// One frame's brush work: the pen samples queued since the last frame (`pen`, oldest
-    /// first, with the pen's hover), applied, and their epoch closed. The context's camera is
-    /// the view as this frame's input left it, which the samples are projected through.
+    /// One step of brush work: the pen samples queued since the last step (`pen`, oldest first,
+    /// with the pen's hover), placed, and as many of the queued dabs applied as `budget` leaves
+    /// time for (at least one, if any is queued), their epoch closed. The context's camera is the
+    /// view as the input left it, which the samples are projected through.
+    ///
+    /// A frame's step ([`Owner::frame_fed`]), or one between frames ([`Owner::between_frames`]),
+    /// whose edits the next frame shows.
     ///
     /// # Errors
     ///
     /// Only for a failure the app can't go on from; a store error in a stroke ends the stroke
     /// and shows in the overlay ([`Brush::status`]).
-    fn step(&mut self, context: BrushContext<'_>, pen: &PenFrame) -> Result<BrushReport>;
+    fn step(
+        &mut self,
+        context: BrushContext<'_>,
+        pen: &PenFrame,
+        budget: &BrushBudget,
+    ) -> Result<BrushReport>;
 
     /// Whether the brush takes the stroke `down` starts, in the input phase, with the context's
     /// camera as the input so far left it: the one place the brush claims strokes. A stroke
@@ -225,9 +381,32 @@ pub(crate) struct NoBrush;
 
 #[cfg(test)]
 impl Brush for NoBrush {
-    fn step(&mut self, _context: BrushContext<'_>, _pen: &PenFrame) -> Result<BrushReport> {
+    fn step(
+        &mut self,
+        _context: BrushContext<'_>,
+        _pen: &PenFrame,
+        _budget: &BrushBudget,
+    ) -> Result<BrushReport> {
         Ok(BrushReport::default())
     }
+}
+
+/// Where pen samples come from, read as late as the frame loop can.
+///
+/// The window's pen stream ([`crate::pen::AppPen`]) is pulled at a frame's start, just before its
+/// brush phase, and between the work after its hand-off, so a stroke's samples are never left
+/// waiting behind the store's jobs.
+pub(crate) trait PenFeed {
+    /// Appends every sample that arrived since the last call to `out`, in order.
+    fn pull(&mut self, out: &mut Vec<PenSample>);
+}
+
+/// No pen stream: offscreen, or a test; a scripted run's samples come from its script.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NoPen;
+
+impl PenFeed for NoPen {
+    fn pull(&mut self, _out: &mut Vec<PenSample>) {}
 }
 
 /// A change to how the scene is shown, from the keyboard.
@@ -403,6 +582,9 @@ pub(crate) struct OwnerPhases {
     pub(crate) input: Duration,
     /// The brush step.
     pub(crate) brush: Duration,
+    /// The brush's work between the last frame and this one ([`Owner::between_frames`]), whose
+    /// edits this frame shows: off this frame's own path, but on its samples' latency.
+    pub(crate) between: Duration,
     /// Draining the stale-tile feed.
     pub(crate) feed: Duration,
     /// The uploads.
@@ -564,11 +746,25 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     script_pen: Duration,
     /// Whether the brush is stroking, for the overlay's pick.
     stroking: Stroking,
+    /// What the brush did between the last frame and the next ([`Owner::between_frames`]), which
+    /// the next frame reports as its own, its latency measured from the oldest sample.
+    between: Option<BrushReport>,
+    /// How long the brush worked between the last frame and the next.
+    between_time: Duration,
+    /// When each frame not shown yet that applied dabs ended its brush phase, by number: its work
+    /// after the brush is measured as it is shown.
+    brushed_at: BTreeMap<u64, Instant>,
+    /// The last frames' work after the brush (feed, uploads, hand-off, encode and submit), newest
+    /// last, at most [`AFTER_BRUSH_KEPT`]: the longest is the brush budget's estimate.
+    after_brush: VecDeque<Duration>,
 }
 
-/// Whether the brush is stroking, as the overlay's pick needs to know.
+/// Whether the brush is stroking, as the overlay's pick and the latency's rules need to know.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Stroking {
+    /// Whether a sample queued since the last routing belongs to a brush stroke, or may (a `Down`
+    /// not yet routed): it wants a frame on input, and the work after a hand-off yields to it.
+    queued: bool,
     /// Whether the last brush step left work for the next frame (dabs carried, a stroke
     /// ending): the brush is still stroking.
     busy: bool,
@@ -668,7 +864,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         now: Instant,
     ) -> Self {
         let cursor = project.store().subscribe_stale();
-        let mut scheduler = Scheduler::new(setup.interval, now).with_morph(uploads.morph());
+        let mut scheduler = Scheduler::new(setup.interval, now)
+            .with_morph(uploads.morph())
+            .with_stroke_pacing(StrokePacing::of(setup.presentation));
         scheduler.want(Reason::Exposed);
         let scripted = setup.frames.is_some() || setup.script.is_some();
         if scripted {
@@ -726,6 +924,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             latency: None,
             script_pen: Duration::ZERO,
             stroking: Stroking::default(),
+            between: None,
+            between_time: Duration::ZERO,
+            brushed_at: BTreeMap::new(),
+            after_brush: VecDeque::new(),
         }
     }
 
@@ -782,10 +984,30 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// coalesced, the latest replacing the one before (only the pen's latest state out of a
     /// stroke counts, for the pointer, the barrel buttons and the hover), so the queue stays
     /// short while no frame comes.
+    ///
+    /// A sample of a brush stroke (or a `Down`, or a sample behind a `Down` not routed yet: either
+    /// may be the brush's) wants a frame for the stroke ([`Reason::Stroke`], started on input where
+    /// presentation allows); any other in a stroke wants one paced as ever ([`Reason::Input`]).
     pub(crate) fn pen(&mut self, sample: PenSample) {
+        self.queue_pen(sample, true);
+    }
+
+    /// [`Owner::pen`]; wanting a frame for it only if `want` (a sample the frame being made takes
+    /// itself wants none).
+    fn queue_pen(&mut self, sample: PenSample, want: bool) {
         self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
         if sample.phase.in_stroke() {
-            self.scheduler.want(Reason::Input);
+            let brush = sample.phase == input::Phase::Down
+                || self.stroke_open()
+                || self
+                    .pen_queue
+                    .iter()
+                    .any(|queued| queued.phase == input::Phase::Down);
+            self.stroking.queued |= brush;
+            if want {
+                self.scheduler
+                    .want(if brush { Reason::Stroke } else { Reason::Input });
+            }
         }
         match self.pen_queue.last_mut() {
             Some(last) if !last.phase.in_stroke() && !sample.phase.in_stroke() => *last = sample,
@@ -877,8 +1099,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// A wait for the GPU ends when the answer is neither [`Next::Gpu`] nor [`Next::Frame`]
     /// (a minimised window, nothing wanted any more): the next frame's
     /// [`OwnerPhases::gpu_wait`] counts only a wait that led to it.
+    ///
+    /// In a scripted run the script's pen samples taken by `now` are queued first, as a pen's
+    /// arrive between frames, and a wait ends early for its next sample ([`Owner::pen_due`]).
     pub(crate) fn next(&mut self, now: Instant) -> Next {
-        let next = self.scheduler.next(now);
+        self.queue_script_pen(now.saturating_duration_since(self.clock), true);
+        let next = match self.scheduler.next(now) {
+            Next::Wait { until } => Next::Wait {
+                until: self.pen_due().map_or(until, |due| due.min(until)),
+            },
+            next @ (Next::Frame { .. } | Next::Render | Next::Gpu | Next::Idle { .. }) => next,
+        };
         let no_frames = self.size.is_none()
             || self.limit.is_some_and(|limit| self.started >= limit)
             || self.script_over;
@@ -909,10 +1140,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// One step of waiting for the GPU, at `now`, when [`Owner::next`] said [`Next::Gpu`]:
     /// hears from `finished` the newest frame the GPU has finished
     /// ([`crate::render_thread::RenderThread::gpu_finished`], which polls the device without
-    /// waiting); if it is still too far behind, runs the upkeep if it is due, then a slice of the
-    /// store's jobs, if there are any, until [`GPU_POLL`] from now. Both loops (offscreen and
-    /// the window's) call it, and map what it returns to a sleep or the event loop's control
-    /// flow.
+    /// waiting); if it is still too far behind, runs the upkeep if it is due, then the brush's
+    /// work between frames if a stroke has some (the pen's samples from `pen`,
+    /// [`Owner::between_frames`]), else a slice of the store's jobs, if there are any, until
+    /// [`GPU_POLL`] from now. Both loops (offscreen and the window's) call it, and map what it
+    /// returns to a sleep or the event loop's control flow.
     ///
     /// The wait counts toward the next frame's [`OwnerPhases::gpu_wait`], the jobs run meanwhile
     /// included; they are not added to the overlay's jobs line, which reports the jobs after the
@@ -924,6 +1156,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) fn wait_for_gpu(
         &mut self,
         now: Instant,
+        pen: &mut impl PenFeed,
         finished: impl FnOnce() -> Result<u64>,
     ) -> Result<GpuWait> {
         self.gpu_wait_from.get_or_insert(now);
@@ -933,7 +1166,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if now >= self.scheduler.upkeep_due() {
             self.upkeep(now)?;
         }
-        if !self.project.store().has_jobs() {
+        if self.between_frames(now, pen)? {
+            return Ok(GpuWait::Worked);
+        }
+        if self.stroking.queued || self.stroke_under_way() || !self.project.store().has_jobs() {
             return Ok(GpuWait::Idle);
         }
         self.project
@@ -959,27 +1195,50 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.finished
     }
 
-    /// Makes a frame started at `now`, hands what the render thread is to draw to `hand_off`,
-    /// then runs the upkeep and the store's jobs until `deadline` (at least one slice of jobs,
-    /// however late it is). Call it when [`Owner::next`] says [`Next::Frame`], and report back
-    /// with [`Owner::shown`] when the render thread has drawn it.
+    /// [`Owner::frame_fed`] with no pen stream: offscreen, and the tests.
     ///
     /// # Errors
     ///
-    /// If the brush, the uploads, the hand-off, the project's upkeep or the store's jobs fail.
+    /// As [`Owner::frame_fed`].
     pub(crate) fn frame(
         &mut self,
         now: Instant,
         deadline: Instant,
         hand_off: impl FnOnce(FrameRequest) -> Result<()>,
     ) -> Result<()> {
+        self.frame_fed(now, deadline, &mut NoPen, hand_off)
+    }
+
+    /// Makes a frame started at `now`, hands what the render thread is to draw to `hand_off`,
+    /// then runs the upkeep and the store's jobs until `deadline` (at least one slice of jobs,
+    /// however late it is, unless a stroke's samples are waiting). Call it when [`Owner::next`]
+    /// says [`Next::Frame`], and report back with [`Owner::shown`] when the render thread has
+    /// drawn it.
+    ///
+    /// **Input read late:** `pen` is drained as the frame starts and again just before its brush
+    /// phase, so the brush takes every sample up to the moment it starts; and between the upkeep,
+    /// the brush's preparation and each step of the store's jobs, which stop as soon as a stroke's
+    /// samples wait (the next frame is then wanted on input).
+    ///
+    /// # Errors
+    ///
+    /// If the brush, the uploads, the hand-off, the project's upkeep or the store's jobs fail.
+    pub(crate) fn frame_fed(
+        &mut self,
+        now: Instant,
+        deadline: Instant,
+        pen: &mut impl PenFeed,
+        hand_off: impl FnOnce(FrameRequest) -> Result<()>,
+    ) -> Result<()> {
         let size = self
             .size
             .context("a frame was started with no frame size")?;
+        self.pull_pen(pen, now, false);
         let reasons = self.scheduler.started(now);
         self.started += 1;
         let mut phases = OwnerPhases {
             gpu_wait: self.gpu_waited(now),
+            between: std::mem::take(&mut self.between_time),
             upkeep: self.after_hand_off.upkeep,
             prepare: self.after_hand_off.prepare,
             jobs: self.after_hand_off.jobs,
@@ -992,8 +1251,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.take_input(size)?;
         phases.input = lap.next();
 
-        let brushed = self.brush_step(size)?;
-        self.stroking.busy = brushed.busy;
+        let brushed = self.brush_phase(size, pen)?;
         phases.brush = lap.next();
 
         let drained = self.project.store().drain_stale(&self.cursor);
@@ -1051,7 +1309,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         })?;
         lap.next();
 
-        let preparing = self.after_hand_off(now, (size, deadline), &mut lap)?;
+        let preparing = self.after_hand_off(now, (size, deadline), &mut lap, pen)?;
         self.log_phases(OwnerPhases {
             upkeep: self.after_hand_off.upkeep,
             prepare: self.after_hand_off.prepare,
@@ -1061,7 +1319,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
         self.want_next(&uploads);
         if brushed.busy {
-            self.scheduler.want(Reason::Input);
+            // Dabs carried: the next frame applies them, on input where strokes go on input.
+            self.scheduler.want(Reason::Stroke);
         }
         if self.stroking.pick_deferred && !self.brushing() {
             // The stroke is over: the next frame makes the pick this one skipped.
@@ -1096,6 +1355,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             filter_only: !self.accumulates,
             brush,
             latency: self.latency,
+            pacing: self.scheduler.stroke_pacing(),
         };
         overlay::lines(&snapshot)
     }
@@ -1103,6 +1363,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// A frame of `size` started at `now`, once handed off: the upkeep, the brush's preparation,
     /// then the store's jobs until `deadline` (at least a slice of them), each timed by `lap`
     /// into [`Owner::after_hand_off`]. Returns whether the brush has preparation left.
+    ///
+    /// **Each yields to the pen:** `pen` is drained before each, and between steps of the
+    /// preparation and of the jobs ([`JOB_STEP`]); once a stroke's samples wait, the rest is left
+    /// for later (the next frame, wanted on input, runs it again), so a sample never waits behind
+    /// them. The jobs' first slice, however late the frame, is skipped then too.
     ///
     /// # Errors
     ///
@@ -1112,24 +1377,67 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         now: Instant,
         (size, deadline): (Size, Instant),
         lap: &mut Lap,
+        pen: &mut impl PenFeed,
     ) -> Result<bool> {
-        self.project.tick(now).context("ticking the project")?;
-        self.project.poll().context("polling the project")?;
+        if !self.pull_pen(pen, Instant::now(), true) {
+            self.project.tick(now).context("ticking the project")?;
+            self.project.poll().context("polling the project")?;
+        }
         self.after_hand_off.upkeep = lap.next();
 
-        let preparing = self
-            .with_brush(size, |brush, context| brush.prepare(context, deadline))
-            .context("preparing the brush")?;
+        let mut preparing = false;
+        while !self.pull_pen(pen, Instant::now(), true) {
+            let step = (Instant::now() + JOB_STEP).min(deadline);
+            preparing = self
+                .with_brush(size, |brush, context| brush.prepare(context, step))
+                .context("preparing the brush")?;
+            if !preparing || Instant::now() >= deadline {
+                break;
+            }
+        }
         self.after_hand_off.prepare = lap.next();
 
-        let deadline = deadline.max(Instant::now() + JobsReport::SLICE_TARGET);
-        self.after_hand_off.report = self
-            .project
-            .store()
-            .run_jobs(deadline)
-            .context("running the store's jobs")?;
+        self.after_hand_off.report = self.run_jobs(deadline, pen)?;
         self.after_hand_off.jobs = lap.next();
         Ok(preparing)
+    }
+
+    /// The store's jobs until `deadline`, at least a slice of them, in steps of [`JOB_STEP`],
+    /// stopping as soon as a stroke's samples wait in `pen` (before the first slice too).
+    ///
+    /// **None at all while a brush stroke is under way** (the pen down on one, or its dabs still
+    /// queued, [`Owner::stroke_under_way`]): its samples come every few milliseconds, and a slice
+    /// of the jobs can run far past its step (a display tile's refresh slice took 11 ms in the
+    /// scripted strokes), which no yield can cut short; and the jobs' workers are the brush's.
+    /// The display layer's refresh waits for the stroke to land; meanwhile the stand-ins show the
+    /// stroke at display levels, and the frames upload only the brush's own tiles.
+    ///
+    /// # Errors
+    ///
+    /// As the store's jobs.
+    fn run_jobs(&mut self, deadline: Instant, pen: &mut impl PenFeed) -> Result<JobsReport> {
+        let mut report = JobsReport::default();
+        let mut first = true;
+        while !self.stroke_under_way() && !self.pull_pen(pen, Instant::now(), true) {
+            let at = Instant::now();
+            if !first && (at >= deadline || !self.project.store().has_jobs()) {
+                break;
+            }
+            let least = if first {
+                at + JobsReport::SLICE_TARGET
+            } else {
+                at
+            };
+            let step = (at + JOB_STEP).min(deadline).max(least);
+            let ran = self
+                .project
+                .store()
+                .run_jobs(step)
+                .context("running the store's jobs")?;
+            add_jobs(&mut report, &ran);
+            first = false;
+        }
+        Ok(report)
     }
 
     /// Calls the brush with its context for a frame of `size`: the project, picking's spatial
@@ -1144,17 +1452,47 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         call(&mut self.brush, context)
     }
 
-    /// The brush phase of a frame of `size`: the brush steps over the project with the camera
-    /// and the pen samples the input phase left. Its edits move the surface, so the next pick
-    /// is made afresh; the oldest sample it applied is kept until the frame is shown, for its
-    /// latency.
+    /// The brush phase of a frame of `size`: the samples that arrived from `pen` during the input
+    /// phase are routed too (input read late), then the brush steps within the time the frame has
+    /// left ([`BrushBudget::frame`]). What it did between the last frame and this one counts as
+    /// this frame's; the oldest sample applied is kept until the frame is shown, for its latency.
     ///
     /// # Errors
     ///
     /// If the brush fails in a way the app can't go on from.
-    fn brush_step(&mut self, size: Size) -> Result<BrushReport> {
+    fn brush_phase(&mut self, size: Size, pen: &mut impl PenFeed) -> Result<BrushReport> {
+        self.pull_pen(pen, Instant::now(), false);
+        if !self.pen_queue.is_empty() {
+            self.route_pen(&Arcball::new(size), size, false);
+        }
+        let budget = BrushBudget::frame(
+            Instant::now(),
+            self.after_brush_estimate(),
+            self.scheduler.interval(),
+        );
+        let stepped = self.brush_step(size, &budget)?;
+        let brushed = match self.between.take() {
+            Some(between) => between.then(stepped),
+            None => stepped,
+        };
+        self.stroking.busy = brushed.busy;
+        if let Some(oldest) = brushed.oldest {
+            self.latency_from.insert(self.started, oldest);
+            self.brushed_at.insert(self.started, Instant::now());
+        }
+        Ok(brushed)
+    }
+
+    /// A brush step for a frame of `size` (a frame's brush phase, or work between frames): the
+    /// brush steps over the project with the camera and the pen samples the last routing left,
+    /// within `budget`. Its edits move the surface, so the next pick is made afresh.
+    ///
+    /// # Errors
+    ///
+    /// If the brush fails in a way the app can't go on from.
+    fn brush_step(&mut self, size: Size, budget: &BrushBudget) -> Result<BrushReport> {
         let pen = std::mem::take(&mut self.pen_frame);
-        let stepped = self.with_brush(size, |brush, context| brush.step(context, &pen));
+        let stepped = self.with_brush(size, |brush, context| brush.step(context, &pen, budget));
         self.pen_frame = pen;
         let report = stepped.context("the brush step")?;
         if report.dabs_applied > 0
@@ -1162,10 +1500,91 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         {
             picker.surface_changed();
         }
-        if let Some(oldest) = report.oldest {
-            self.latency_from.insert(self.started, oldest);
-        }
         Ok(report)
+    }
+
+    /// Brush work between frames, at `now`: while a brush stroke is open (or its dabs are still
+    /// queued), the pen's samples from `pen` (and a script's taken by now) are routed and the
+    /// brush steps over them for [`BETWEEN_SLICE`], so the time a frame waits for the render
+    /// thread or the GPU (or, paced to the refresh, for its slot) isn't lost to the stroke. The
+    /// next frame shows the edits, and counts the step as its own: its latency runs from the
+    /// oldest sample applied. Returns whether it did any work; the loops call it while they
+    /// would otherwise wait, again until it says none is left.
+    ///
+    /// Nothing while no brush stroke is under way, and no camera input is applied: the mouse
+    /// moves no view during a brush stroke anyway.
+    ///
+    /// # Errors
+    ///
+    /// If the brush fails in a way the app can't go on from.
+    pub(crate) fn between_frames(&mut self, now: Instant, pen: &mut impl PenFeed) -> Result<bool> {
+        self.pull_pen(pen, now, true);
+        let Some(size) = self.size else {
+            return Ok(false);
+        };
+        let stroke = self.stroke_open() || self.stroking.queued;
+        let work = (stroke && !self.pen_queue.is_empty()) || self.stroking.busy;
+        if !work {
+            return Ok(false);
+        }
+        let began = Instant::now();
+        self.route_pen(&Arcball::new(size), size, true);
+        let report = self.brush_step(size, &BrushBudget::slice(began, BETWEEN_SLICE))?;
+        self.stroking.busy = report.busy;
+        if report.dabs_applied > 0 || report.busy {
+            self.scheduler.want(Reason::Stroke);
+        }
+        self.between = Some(match self.between.take() {
+            Some(before) => before.then(report),
+            None => report,
+        });
+        self.between_time += began.elapsed();
+        Ok(true)
+    }
+
+    /// Drains `pen` into the pen queue, and queues a scripted run's pen samples taken by `now`,
+    /// each wanting a frame if `want` (see [`Owner::pen`]); returns whether a brush stroke's
+    /// samples wait to be routed.
+    fn pull_pen(&mut self, pen: &mut impl PenFeed, now: Instant, want: bool) -> bool {
+        let mut pulled = Vec::new();
+        pen.pull(&mut pulled);
+        for sample in pulled {
+            self.queue_pen(sample, want);
+        }
+        self.queue_script_pen(now.saturating_duration_since(self.clock), want);
+        self.stroking.queued
+    }
+
+    /// Whether a brush stroke is open: the pen is down on a stroke routed to the brush.
+    fn stroke_open(&self) -> bool {
+        self.pen_router.stroke() == Some(Route::Brush)
+    }
+
+    /// Whether a brush stroke is under way: open, or its dabs still being applied after the pen
+    /// lifted. The store's jobs wait meanwhile.
+    fn stroke_under_way(&self) -> bool {
+        self.stroke_open() || self.stroking.busy
+    }
+
+    /// When a scripted run's next pen sample is taken, if it has one to come and a stroke's
+    /// frames start on input (paced to the refresh, the frames come at their slots anyway): a
+    /// loop waiting for a frame wakes for it, as a pen's arrival wakes a window's.
+    pub(crate) fn pen_due(&self) -> Option<Instant> {
+        if self.scheduler.stroke_pacing() != StrokePacing::OnInput || self.script_over {
+            return None;
+        }
+        let next = self.script.as_ref()?.next_pen_after(self.script_pen)?;
+        Some(self.clock + next)
+    }
+
+    /// The frame's work after the brush, estimated: the longest of the last frames' that applied
+    /// dabs ([`AFTER_BRUSH_KEPT`]), or [`FIRST_AFTER_BRUSH`] before any.
+    fn after_brush_estimate(&self) -> Duration {
+        self.after_brush
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(FIRST_AFTER_BRUSH)
     }
 
     /// In a recorded run, files the frame just started (at `time`, in `segment`, its view
@@ -1203,13 +1622,35 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// its own time, and marks the script over once `time` reaches its end; returns the segment
     /// running. `None` with no script.
     fn follow_script(&mut self, time: Duration, size: Size) -> Option<Segment> {
-        let script = self.script.as_ref()?;
-        let moment = script.at(time);
-        let due = script.pen(self.script_pen, time);
-        self.script_pen = time;
+        let moment = self.script.as_ref()?.at(time);
         self.camera = moment.pose.camera();
         self.input.clear();
         self.script_over |= moment.over;
+        self.queue_script_pen_at(time, size, false);
+        Some(moment.segment)
+    }
+
+    /// In a scripted run, queues the script's pen samples taken since the last queued and up to
+    /// `time` into the run, as [`Owner::follow_script`] does, each wanting a frame if `want`:
+    /// between frames, the script's pen arrives as a pen's would. Nothing with no frame size.
+    fn queue_script_pen(&mut self, time: Duration, want: bool) {
+        if let Some(size) = self.size {
+            self.queue_script_pen_at(time, size, want);
+        }
+    }
+
+    /// [`Owner::queue_script_pen`] in a view of `size`: each sample where its point projects at
+    /// its own time, taken (and received) at its time on the frame loop's clock; a sample's
+    /// brush radius, on the first of a stroke, is set as it is queued.
+    fn queue_script_pen_at(&mut self, time: Duration, size: Size, want: bool) {
+        let Some(script) = &self.script else {
+            return;
+        };
+        if time <= self.script_pen {
+            return;
+        }
+        let due = script.pen(self.script_pen, time);
+        self.script_pen = time;
         let projected = due.iter().copied().filter_map(|sample| {
             let view = sample.camera.view(size)?;
             let (x, y, _) = view.pixel(sample.point)?;
@@ -1221,7 +1662,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 self.brush.set_radius(radius);
             }
             let taken = self.clock + sample.time;
-            self.pen(PenSample {
+            let pen = PenSample {
                 phase: sample.phase,
                 tool: input::Tool::Pen,
                 at,
@@ -1232,9 +1673,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 buttons: input::Buttons::default(),
                 timestamp: taken,
                 received: taken,
-            });
+            };
+            self.queue_pen(pen, want);
         }
-        Some(moment.segment)
     }
 
     /// The input phase of a frame of `size`: the input queued since the last frame moves the
@@ -1252,13 +1693,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let input = std::mem::take(&mut self.input);
         // While a brush stroke is open the view holds still: the stroke's record keeps one camera.
         // Navigation still follows the input (buttons held, the pointer), so nothing jumps after.
-        let frozen = self.pen_router.stroke() == Some(Route::Brush);
+        let frozen = self.stroke_open();
         for event in input {
             let mut held = self.camera;
             let camera = if frozen { &mut held } else { &mut self.camera };
             self.navigator.apply(event, camera, &arcball, height);
         }
-        self.route_pen(&arcball, size);
+        self.route_pen(&arcball, size, true);
         self.stroking.pick_deferred = self.brushing();
         if let Some(picker) = &mut self.picker
             && !self.stroking.pick_deferred
@@ -1280,16 +1721,20 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .strokes()
             .iter()
             .any(|(_, route)| *route == Route::Brush);
-        routed || self.pen_router.stroke() == Some(Route::Brush) || self.stroking.busy
+        routed || self.stroke_open() || self.stroking.busy
     }
 
-    /// Routes the pen samples queued since the last frame into the frame's [`PenFrame`], in
-    /// order: navigation's (out of a stroke, or in a stroke routed to it) move the camera, whose
-    /// viewport `arcball` covers and is `size`, as they come, so a later `Down` is routed with
-    /// the view the earlier samples left.
-    fn route_pen(&mut self, arcball: &Arcball, size: Size) {
+    /// Routes the pen samples queued since the last routing into the [`PenFrame`] the next brush
+    /// step takes (a fresh one if `fresh`, else after what it holds: the samples that arrived
+    /// during a frame's input phase), in order: navigation's (out of a stroke, or in a stroke
+    /// routed to it) move the camera, whose viewport `arcball` covers and is `size`, as they come,
+    /// so a later `Down` is routed with the view the earlier samples left.
+    fn route_pen(&mut self, arcball: &Arcball, size: Size, fresh: bool) {
         let height = f64::from(size.height());
-        self.pen_frame.clear();
+        if fresh {
+            self.pen_frame.clear();
+        }
+        self.stroking.queued = false;
         let queued = std::mem::take(&mut self.pen_queue);
         let samples = queued.into_iter();
         for sample in samples {
@@ -1388,6 +1833,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let gpu = std::mem::take(&mut presented.gpu);
         // Frames are reported in order: any before this one still kept were lost.
         self.latency_from = self.latency_from.split_off(&presented.number);
+        self.brushed_at = self.brushed_at.split_off(&presented.number);
+        if let Some(brushed) = self.brushed_at.remove(&presented.number) {
+            if self.after_brush.len() >= AFTER_BRUSH_KEPT {
+                self.after_brush.pop_front();
+            }
+            self.after_brush
+                .push_back(presented.submitted.saturating_duration_since(brushed));
+        }
         let latency = self
             .latency_from
             .remove(&presented.number)
@@ -1514,6 +1967,21 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) const fn project(&mut self) -> &mut Project {
         &mut self.project
     }
+}
+
+/// Adds `ran`, a later run of the store's jobs, to `report`: the counts summed, the longest
+/// slice the longer, what is left as `ran` left it.
+fn add_jobs(report: &mut JobsReport, ran: &JobsReport) {
+    report.slices += ran.slices;
+    report.built += ran.built;
+    report.evaluated += ran.evaluated;
+    report.finished += ran.finished;
+    report.left = ran.left;
+    report.longest_slice = report.longest_slice.max(ran.longest_slice);
+    report.long_slices += ran.long_slices;
+    report.failed += ran.failed;
+    report.queue_finished += ran.queue_finished;
+    report.queue_left = ran.queue_left;
 }
 
 /// Whether the uploads left a frame nothing new to draw.

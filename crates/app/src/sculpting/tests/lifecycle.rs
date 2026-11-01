@@ -60,7 +60,7 @@ fn a_stroke_started_while_dabs_are_carried_waits_behind_them() {
     let dir = TestDir::new();
     let mut owner = owner_of(
         project(&dir),
-        |project| Sculpting::new(project).with_budget(DabBudget::new(0.0, 1.0)),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
         setup(),
     );
     run(&mut owner, 10_000);
@@ -100,7 +100,7 @@ fn closing_mid_stroke_applies_it_and_records_it_once() {
     let dir = TestDir::new();
     let mut owner = owner_of(
         project(&dir),
-        |project| Sculpting::new(project).with_budget(DabBudget::new(0.0, 1.0)),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
         setup(),
     );
     run(&mut owner, 10_000);
@@ -238,7 +238,11 @@ fn hover_frame(
     );
     pen.push(hover, None);
     brush
-        .step(context(project, index, &camera), &pen)
+        .step(
+            context(project, index, &camera),
+            &pen,
+            &BrushBudget::unlimited(),
+        )
         .expect("a step");
     brush
         .prepare(context(project, index, &camera), deadline)

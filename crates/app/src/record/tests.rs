@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 62] = [
+const FRAME_FIELDS: [&str; 64] = [
     "bench",
     "result",
     "frame",
@@ -17,6 +17,7 @@ const FRAME_FIELDS: [&str; 62] = [
     "gpu_wait_ms",
     "input_ms",
     "brush_ms",
+    "between_ms",
     "feed_ms",
     "uploads_ms",
     "upkeep_ms",
@@ -68,6 +69,7 @@ const FRAME_FIELDS: [&str; 62] = [
     "dabs_carried",
     "tiles_edited",
     "above_f",
+    "stroke_open",
 ];
 
 /// The names of `line`'s fields, in order.
@@ -123,6 +125,8 @@ fn a_frame_line_names_every_field_and_nulls_what_never_came() {
         "sample_to_present_ms",
         "dabs_applied",
         "above_f",
+        "stroke_open",
+        "between_ms",
     ] {
         assert_eq!(value(&line, name), &Value::Null, "{name}");
     }

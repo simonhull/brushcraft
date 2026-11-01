@@ -184,11 +184,19 @@ impl WindowApp {
     /// The wait for the next frame is precise ([`crate::pace`]): winit's timer is asked to wake
     /// the loop as the pacer plans (short of the frame by the spin margin, and by how long its
     /// waits have run), and the last of it is spun here. With FIFO presentation the render
-    /// thread's present paces the frames anyway; with mailbox, this wait does.
+    /// thread's present paces the frames anyway; with mailbox, this wait does, but for a brush
+    /// stroke's frames, which start on the pen's input (`frame::schedule::StrokePacing`).
+    ///
+    /// **The pen** is read late: the frame drains the stream itself as it starts, before its
+    /// brush phase, and between its work after the hand-off ([`crate::frame::Owner::frame_fed`]).
+    /// Wherever the loop would wait for the render thread, the GPU or the refresh slot, a brush
+    /// stroke's work between frames comes first ([`crate::frame::Owner::between_frames`]): one
+    /// slice, then back to the event loop (so the render thread's wake-up is heard), or, waiting
+    /// for the slot, until the slot.
     ///
     /// # Errors
     ///
-    /// If a frame, the upkeep or the render thread fails.
+    /// If a frame, the brush, the upkeep or the render thread fails.
     fn drive(
         running: &mut Running,
         pen_samples: &mut Vec<PenSample>,
@@ -210,13 +218,14 @@ impl WindowApp {
             let now = Instant::now();
             match running.owner.next(now) {
                 Next::Frame { deadline } => {
-                    // What the pen sent since the last batch of events joins this frame.
-                    Self::feed_pen(running, pen_samples);
-                    let render = &mut running.render;
-                    running
-                        .owner
-                        .frame(now, deadline, |frame| render.send(frame))?;
+                    // The frame drains what the pen sent since the last batch of events itself.
+                    let Running {
+                        pen, owner, render, ..
+                    } = &mut *running;
+                    owner.frame_fed(now, deadline, pen, |frame| render.send(frame))?;
+                    owner.set_pen_status(pen.status());
                 }
+                Next::Wait { .. } if running.owner.between_frames(now, &mut running.pen)? => {}
                 Next::Wait { until } => match running.pacer.plan(now, until) {
                     Step::Sleep(asked) => {
                         running.asked = Some((now, asked));
@@ -226,14 +235,24 @@ impl WindowApp {
                     Step::Spin | Step::Done => running.pacer.spin_until(&mut SystemTimer, until),
                 },
                 Next::Render => {
-                    event_loop.set_control_flow(ControlFlow::Wait);
+                    // A slice of the stroke's work, then the event loop's events (the render
+                    // thread's wake-up among them) before the next; with none, wait for them.
+                    let worked = running.owner.between_frames(now, &mut running.pen)?;
+                    event_loop.set_control_flow(if worked {
+                        ControlFlow::Poll
+                    } else {
+                        ControlFlow::Wait
+                    });
                     return Ok(());
                 }
                 Next::Gpu => {
-                    let render = &running.render;
-                    // Still busy after a slice of jobs: back to the event loop for its events;
-                    // with none, poll again shortly (`GPU_POLL` says why it polls).
-                    let flow = match running.owner.wait_for_gpu(now, || render.gpu_finished())? {
+                    let Running {
+                        pen, owner, render, ..
+                    } = &mut *running;
+                    // Still busy after a slice of the stroke's work or the jobs: back to the
+                    // event loop for its events; with none, poll again shortly (`GPU_POLL` says
+                    // why it polls).
+                    let flow = match owner.wait_for_gpu(now, pen, || render.gpu_finished())? {
                         GpuWait::Ready => continue,
                         GpuWait::Worked => ControlFlow::Poll,
                         GpuWait::Idle => ControlFlow::WaitUntil(now + GPU_POLL),

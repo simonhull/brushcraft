@@ -19,6 +19,14 @@
 //!   frame's readbacks find a buffer.
 //! - Paced to the display: a frame starts no sooner than one refresh interval after the last. The
 //!   pace is waited for first, precisely, so a GPU keeping up costs no wait of its own.
+//! - **But a pen stroke's frames start on input** where presentation allows it
+//!   ([`StrokePacing::OnInput`]: mailbox, or offscreen): a frame wanted for a brush stroke's
+//!   samples ([`Reason::Stroke`]) starts as soon as the last frame is off the render thread and the
+//!   GPU has room for it, not at the next refresh slot, so the pen's oldest sample waits for no
+//!   slot (the M1 spec's pen latency, "with mailbox presentation and late input"). The compositor
+//!   shows the newest frame at each refresh. With FIFO presentation ([`StrokePacing::Refresh`]: no
+//!   mailbox offered) a frame faster than the display would only wait in its acquire, so stroke
+//!   frames are paced like any other.
 //! - A frame's store jobs run until three quarters of an interval after it starts, leaving the rest
 //!   for handling the window's events.
 //! - A frame that couldn't be shown (the surface changed) is wanted again at once.
@@ -41,6 +49,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use render::Outcome;
+use render::surface::Presentation;
 
 /// Why a frame is wanted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +81,9 @@ pub(crate) enum Reason {
     /// Only the overlay's text changed (a brush setting, from the keyboard): like
     /// [`Reason::Look`], a frame wanted for this alone shades the last scene again.
     Overlay,
+    /// A brush stroke's pen samples (or the dabs applied from them between frames) wait for a
+    /// frame: with [`StrokePacing::OnInput`] it starts at once, unpaced.
+    Stroke,
 }
 
 impl Reason {
@@ -89,6 +101,7 @@ impl Reason {
             Self::Pick => 1 << 8,
             Self::Accumulating => 1 << 9,
             Self::Overlay => 1 << 10,
+            Self::Stroke => 1 << 11,
         }
     }
 }
@@ -135,6 +148,7 @@ impl fmt::Display for Reasons {
             (Reason::Pick, "pick"),
             (Reason::Accumulating, "accumulating"),
             (Reason::Overlay, "overlay"),
+            (Reason::Stroke, "stroke"),
         ];
         let names: Vec<&str> = all
             .into_iter()
@@ -176,6 +190,38 @@ pub(crate) enum Next {
     },
 }
 
+/// How a brush stroke's frames are paced: on input, or to the refresh like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StrokePacing {
+    /// A frame for a stroke's samples starts as they arrive ([`Reason::Stroke`]), as soon as the
+    /// render thread and the GPU have room: mailbox presentation (a newer frame replaces a queued
+    /// one, so drawing never waits for the display), or offscreen (no display at all).
+    OnInput,
+    /// Stroke frames are paced to the refresh: FIFO presentation, the fallback where mailbox
+    /// isn't offered, where a frame faster than the display would only wait in its acquire.
+    Refresh,
+}
+
+impl StrokePacing {
+    /// The pacing `presentation` allows: on input but for FIFO.
+    pub(crate) const fn of(presentation: Presentation) -> Self {
+        match presentation {
+            Presentation::Mailbox | Presentation::Offscreen => Self::OnInput,
+            Presentation::Fifo => Self::Refresh,
+        }
+    }
+}
+
+impl fmt::Display for StrokePacing {
+    /// As the overlay says it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::OnInput => "strokes start frames on input",
+            Self::Refresh => "strokes paced to the refresh (no mailbox: fifo)",
+        })
+    }
+}
+
 /// How often the loop wakes for upkeep while no frames are made.
 pub(crate) const UPKEEP_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -211,6 +257,8 @@ pub(crate) struct Scheduler {
     morph_end: Option<Instant>,
     /// Frames still wanted for accumulation.
     accumulating: u32,
+    /// How a brush stroke's frames are paced.
+    strokes: StrokePacing,
 }
 
 impl Scheduler {
@@ -229,7 +277,20 @@ impl Scheduler {
             morph: Duration::ZERO,
             morph_end: None,
             accumulating: 0,
+            strokes: StrokePacing::Refresh,
         }
+    }
+
+    /// The same scheduler, pacing a brush stroke's frames as `strokes` says (paced to the
+    /// refresh by default).
+    #[must_use]
+    pub(crate) const fn with_stroke_pacing(self, strokes: StrokePacing) -> Self {
+        Self { strokes, ..self }
+    }
+
+    /// How a brush stroke's frames are paced.
+    pub(crate) const fn stroke_pacing(&self) -> StrokePacing {
+        self.strokes
     }
 
     /// The same scheduler, keeping at most `bound` frames unfinished on the GPU instead of
@@ -341,7 +402,11 @@ impl Scheduler {
         } else {
             self.interval
         };
-        if let Some(last) = self.last_start
+        let on_input = self.strokes == StrokePacing::OnInput
+            && self.wanted.contains(Reason::Stroke)
+            && !self.hidden;
+        if !on_input
+            && let Some(last) = self.last_start
             && now < last + pace
         {
             return Next::Wait { until: last + pace };
@@ -708,6 +773,88 @@ mod tests {
                 "settled, and the morph long over: none"
             );
         }
+    }
+
+    #[test]
+    fn a_strokes_samples_start_a_frame_at_once_where_strokes_go_on_input() {
+        let (scheduler, start) = scheduler();
+        let mut scheduler = scheduler.with_stroke_pacing(StrokePacing::OnInput);
+        scheduler.want(Reason::Stroke);
+        scheduler.started(start);
+        scheduler.shown_on_gpu(Outcome::Presented);
+        let soon = start + Duration::from_millis(3);
+        scheduler.want(Reason::Stroke);
+        assert_eq!(
+            scheduler.next(soon),
+            Next::Frame {
+                deadline: soon + INTERVAL * 3 / 4
+            },
+            "no wait for the refresh slot"
+        );
+        scheduler.started(soon);
+        scheduler.want(Reason::Stroke);
+        assert_eq!(
+            scheduler.next(soon),
+            Next::Render,
+            "but one frame at a time"
+        );
+        scheduler.shown(Outcome::Presented);
+        let later = soon + Duration::from_millis(1);
+        scheduler.started(later);
+        scheduler.shown(Outcome::Presented);
+        scheduler.want(Reason::Stroke);
+        assert_eq!(
+            scheduler.next(later),
+            Next::Gpu,
+            "and never past the frames the GPU may have in flight"
+        );
+        scheduler.gpu_finished(3);
+        scheduler.want(Reason::Input);
+        let next = scheduler.next(later);
+        assert!(matches!(next, Next::Frame { .. }), "{next:?}");
+        scheduler.started(later);
+        scheduler.shown_on_gpu(Outcome::Presented);
+        scheduler.want(Reason::Input);
+        assert_eq!(
+            scheduler.next(later),
+            Next::Wait {
+                until: later + INTERVAL
+            },
+            "anything else is paced as ever: an orbit's input included"
+        );
+    }
+
+    #[test]
+    fn with_fifo_a_strokes_frames_are_paced_to_the_refresh() {
+        assert_eq!(
+            StrokePacing::of(Presentation::Fifo),
+            StrokePacing::Refresh,
+            "the fallback where mailbox isn't offered"
+        );
+        assert_eq!(
+            StrokePacing::of(Presentation::Mailbox),
+            StrokePacing::OnInput
+        );
+        assert_eq!(
+            StrokePacing::of(Presentation::Offscreen),
+            StrokePacing::OnInput
+        );
+        let (scheduler, start) = scheduler();
+        let mut scheduler = scheduler.with_stroke_pacing(StrokePacing::Refresh);
+        scheduler.want(Reason::Stroke);
+        scheduler.started(start);
+        scheduler.shown_on_gpu(Outcome::Presented);
+        scheduler.want(Reason::Stroke);
+        assert_eq!(
+            scheduler.next(start + Duration::from_millis(3)),
+            Next::Wait {
+                until: start + INTERVAL
+            }
+        );
+        assert!(
+            StrokePacing::Refresh.to_string().contains("no mailbox"),
+            "the overlay says why"
+        );
     }
 
     #[test]

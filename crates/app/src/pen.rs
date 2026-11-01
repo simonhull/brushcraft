@@ -53,6 +53,7 @@ use winit::window::{Window, WindowAttributes};
 pub(crate) use self::fallback::{ToolData, WinitEvent, WinitPen};
 pub(crate) use self::navigation::PenNavigation;
 use crate::camera::Pixel;
+use crate::frame::PenFeed;
 
 /// One pen sample, as the app takes it: the pen's state at one moment, in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -573,6 +574,13 @@ impl<B: Backend, W> PenStream<B, W> {
             }
         };
         (window, stopped)
+    }
+}
+
+impl<B: Backend, W> PenFeed for PenStream<B, W> {
+    /// [`PenStream::drain`]: the frame loop reads the stream as late as it can.
+    fn pull(&mut self, out: &mut Vec<PenSample>) {
+        self.drain(out);
     }
 }
 

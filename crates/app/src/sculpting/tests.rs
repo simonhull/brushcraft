@@ -359,38 +359,110 @@ fn the_overlays_pick_waits_for_the_stroke_to_end() {
     owner.close().expect("closed");
 }
 
+/// `n` distinct display tiles in a row along one face's first row, from `first` on.
+fn tiles(first: u16, n: u16) -> Vec<TileKey> {
+    let level = Level::new(12).expect("a level");
+    let keys = (first..first + n)
+        .map(|tx| TileKey::display(geom::FaceId::new(0), level, tx, 0).expect("on the face"));
+    keys.collect()
+}
+
 #[test]
-fn a_budget_takes_dabs_from_the_front_and_at_least_one() {
-    let take = |costs: &[f64], room: f64, at_least_one: bool| {
-        let mut left = room;
-        let count = DabBudget::take(costs.iter().copied(), &mut left, at_least_one);
-        (count, left)
+fn the_time_left_takes_dabs_from_the_front_and_at_least_one() {
+    // A unit a nanosecond, no overhead a dab: a dab of one tile takes 4,225 ns.
+    let cost = DabCost::new(0.0, 1.0, Grouping::PerDab);
+    let one = tiles(0, 1);
+    let dab = Duration::from_nanos(4225);
+    let take = |dabs: &[&[TileKey]], room: Duration, at_least_one: bool| {
+        cost.take(dabs.iter().copied(), room, at_least_one).0
     };
+    assert_eq!(take(&[&one, &one, &one], dab * 2, true), 2, "what fits");
+    assert_eq!(take(&[&one, &one], dab / 2, true), 1, "at least one");
+    assert_eq!(take(&[&one, &one], dab / 2, false), 0, "none once applied");
+    assert_eq!(take(&[], dab * 10, true), 0, "none to take");
+    let big = tiles(0, 30);
     assert_eq!(
-        take(&[10.0, 10.0, 10.0], 25.0, true),
-        (2, 5.0),
-        "the run that fits"
-    );
-    assert_eq!(take(&[100.0, 1.0], 25.0, true).0, 1, "at least one");
-    assert_eq!(
-        take(&[100.0, 1.0], 25.0, false).0,
-        0,
-        "none once one is applied"
-    );
-    assert_eq!(take(&[], 25.0, true).0, 0, "none to take");
-    assert_eq!(
-        take(&[5.0, 30.0, 1.0], 25.0, true).0,
+        take(&[&one, &big, &one], dab * 5, true),
         1,
-        "a run, not a selection"
+        "a run from the front, not a selection"
     );
-    let budget = DabBudget::new(0.0, 100.0);
-    assert_eq!(
-        budget.cost(3),
-        3.0 * TILE_VERTICES + 100.0,
-        "its tiles and the overhead"
-    );
+    let (_, units) = cost.take([one.as_slice(), &one], dab * 9, true);
+    assert_eq!(units, 2.0 * TILE_VERTICES, "each dab its own tiles");
     let side = f64::from(geom::TILE_QUADS + 1);
     assert_eq!(TILE_VERTICES, side * side, "65 × 65 vertices a tile");
+}
+
+#[test]
+fn grouped_by_tile_a_batch_pays_once_for_each_tile_its_dabs_share() {
+    let union = DabCost::new(10.0, 1.0, Grouping::TileUnion);
+    let per_dab = DabCost::new(10.0, 1.0, Grouping::PerDab);
+    let (a, b) = (tiles(0, 4), tiles(2, 4));
+    let room = Duration::from_secs(1);
+    let (count, units) = union.take([a.as_slice(), &b, &a], room, true);
+    assert_eq!(count, 3);
+    assert_eq!(
+        units,
+        6.0 * TILE_VERTICES + 3.0 * 10.0,
+        "six tiles among them, and each dab's overhead"
+    );
+    let (_, apart) = per_dab.take([a.as_slice(), &b, &a], room, true);
+    assert_eq!(apart, 12.0 * TILE_VERTICES + 3.0 * 10.0);
+}
+
+#[test]
+fn the_cost_learns_how_long_batches_take_here() {
+    let mut cost = DabCost::new(0.0, 1.0, Grouping::PerDab);
+    let one = tiles(0, 1);
+    // Four and a half dabs' time, as calibrated.
+    let room = Duration::from_nanos(4225 * 9 / 2);
+    assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 4);
+    // A batch of one tile took four times its prediction: the scale rises at once.
+    cost.observe(TILE_VERTICES, Duration::from_nanos(4225 * 4));
+    assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 1);
+    // Faster batches lower it an eighth of the way each.
+    for _ in 0..40 {
+        cost.observe(TILE_VERTICES, Duration::from_nanos(4225));
+    }
+    assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 4, "back");
+    // One far off is believed only to 64 times.
+    cost.observe(TILE_VERTICES, Duration::from_secs(3600));
+    assert_eq!(cost.take([one.as_slice(); 8], room, true).0, 1);
+    assert_eq!(
+        cost.take([one.as_slice(); 8], room * 64, true).0,
+        4,
+        "held to 64 times"
+    );
+}
+
+#[test]
+fn a_frames_brush_has_the_aim_less_the_frames_other_work_and_more_once_behind() {
+    let start = Instant::now();
+    let interval = Duration::from_micros(16_667);
+    let after = Duration::from_millis(2);
+    let budget = BrushBudget::frame(start, after, interval);
+    let fresh = start
+        .checked_sub(Duration::from_millis(1))
+        .expect("after boot");
+    assert_eq!(
+        budget.until(fresh),
+        start + crate::frame::LATENCY_AIM.saturating_sub(after),
+        "the time left before the frame must be submitted"
+    );
+    let late = start
+        .checked_sub(crate::frame::LATENCY_AIM + Duration::from_millis(1))
+        .expect("after boot");
+    assert_eq!(
+        budget.until(late),
+        start + interval,
+        "behind: up to a refresh interval, to catch up"
+    );
+    let full = BrushBudget::frame(start, Duration::from_secs(1), interval);
+    assert!(
+        full.until(fresh) > start,
+        "a frame whose other work fills the aim still brushes a little"
+    );
+    let between = BrushBudget::slice(start, Duration::from_millis(1));
+    assert_eq!(between.until(late), start + Duration::from_millis(1));
 }
 
 #[test]
@@ -401,7 +473,7 @@ fn the_budget_carries_dabs_across_frames_in_order_and_loses_none() {
         project(&capped_dir),
         |project| {
             Sculpting::new(project)
-                .with_budget(DabBudget::new(0.0, 1.0))
+                .with_cost(DabCost::one_at_a_time())
                 .with_epoch(epoch)
         },
         setup(),
@@ -410,7 +482,7 @@ fn the_budget_carries_dabs_across_frames_in_order_and_loses_none() {
         project(&whole_dir),
         |project| {
             Sculpting::new(project)
-                .with_budget(DabBudget::new(f64::INFINITY, 0.0))
+                .with_cost(DabCost::any_number())
                 .with_epoch(epoch)
         },
         setup(),
@@ -474,7 +546,11 @@ fn hovering_warms_the_surface_under_the_pen_once() {
     pen.push(sample(Phase::Hover, (160.0, 100.0), 0.0), None);
     let call = |warming: &mut Sculpting, open: &mut Project, index: &mut SpatialIndex| {
         warming
-            .step(context(open, index, &camera), &pen)
+            .step(
+                context(open, index, &camera),
+                &pen,
+                &BrushBudget::unlimited(),
+            )
             .expect("a step");
         let deadline = Instant::now() + Duration::from_secs(10);
         warming
@@ -566,8 +642,8 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
     let settings = owner.brush().settings();
     assert_eq!(
         settings.radius().get(),
-        6.0,
-        "the far stroke's size, set as it entered"
+        40.0,
+        "the long stroke's size, set as it entered"
     );
     assert_eq!(
         settings.strength_mode(),
@@ -606,6 +682,36 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
         .find(|line| field(line, "dabs_applied") == "0");
     let quiet = quiet.expect("frames without dabs");
     assert_eq!(field(quiet, "sample_to_present_ms"), "null", "{quiet}");
+    let (most, drained) = queue_over(&frames, "\"stroke_long\"");
+    assert!(
+        most <= 8,
+        "the queue never grows over the long stroke: at most {most} carried"
+    );
+    assert!(
+        drained.is_some_and(|count| count <= 2),
+        "drained within two frames of pen-up: {drained:?}"
+    );
     let records = saved_strokes(owner, &dir, "scripted.bcrf");
-    assert_eq!(records.len(), 2, "two strokes, a record each");
+    assert_eq!(records.len(), 3, "three strokes, a record each");
+}
+
+/// Over the record's `frames` in `segment`: the most dabs any carried, and how many frames it took
+/// to drain.
+///
+/// The drain is counted from pen-up (the first frame after the last with its stroke open) to the
+/// first carrying none, inclusively; `None` if it never drained there.
+fn queue_over(frames: &[&String], segment: &str) -> (usize, Option<usize>) {
+    let ours: Vec<&&String> = frames
+        .iter()
+        .filter(|line| field(line, "segment") == segment)
+        .collect();
+    let carried = |line: &str| -> usize { field(line, "dabs_carried").parse().expect("a count") };
+    let most = ours.iter().map(|line| carried(line)).max().unwrap_or(0);
+    let last_open = ours
+        .iter()
+        .rposition(|line| field(line, "stroke_open") == "true")
+        .expect("the pen touched in the segment");
+    let after = ours.get(last_open + 1..).unwrap_or_default();
+    let drained = after.iter().position(|line| carried(line) == 0);
+    (most, drained.map(|at| at + 1))
 }

@@ -38,8 +38,9 @@ options:
   --script         move the camera along the benchmark path (still, an orbit, a zoom in, a
                    flick, still), drawing every frame, then close: the measured run
   --script-path P  the path --script runs: benchmark (the default), or strokes (still, in
-                   close, a pen stroke, out, a stroke seen from a distance, still): the
-                   pen's latency and a stroke from afar
+                   close, a pen stroke, out, a stroke seen from a distance, round, a fast
+                   long stroke across the whole model, still): the pen's latency, a stroke
+                   from afar, and a brush keeping up
   --script-speed X run the path X times as fast (default 1)
   --record FILE    with --script, write a JSON line per frame to FILE: GPU phase times, the
                    owner thread's phases, what was drawn, residency and uploads

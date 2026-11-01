@@ -168,6 +168,8 @@ fn the_strokes_path_closes_in_draws_backs_off_and_draws_again() {
             Segment::StrokeNear,
             Segment::Retreat,
             Segment::StrokeFar,
+            Segment::Turn,
+            Segment::StrokeLong,
             Segment::Settle
         ]
     );
@@ -176,6 +178,12 @@ fn the_strokes_path_closes_in_draws_backs_off_and_draws_again() {
         "close for the first stroke"
     );
     assert!(close(script.at(at(9.0)).pose, FAR), "far for the second");
+    assert!(
+        close(script.at(at(12.0)).pose, ROUND),
+        "half a turn round for the long one"
+    );
+    assert_eq!(Segment::StrokeLong.name(), "stroke_long");
+    assert_eq!(Segment::Turn.name(), "turn");
     assert_eq!(
         Script::benchmark(Speed::ONE).pen(at(0.0), at(30.0)),
         &[],
@@ -240,4 +248,53 @@ fn a_scripted_pen_hovers_touches_drags_lifts_and_leaves_at_its_rate() {
         .find(|s| s.time > at(7.0))
         .expect("the far stroke");
     assert_eq!(far.radius, Some(6.0));
+}
+
+#[test]
+fn the_long_stroke_runs_fast_across_the_whole_sphere_at_forty_pixels() {
+    let script = Script::strokes(Speed::ONE);
+    let long: Vec<&ScriptPen> = script
+        .pen(at(11.0), at(13.0))
+        .iter()
+        .filter(|s| s.phase.in_stroke())
+        .collect();
+    let (first, last) = (long.first().expect("a down"), long.last().expect("an up"));
+    assert_eq!(first.phase, Phase::Down);
+    assert_eq!(last.phase, Phase::Up);
+    let lasted = last.time.checked_sub(first.time).expect("in order");
+    assert!(
+        (lasted.as_secs_f64() - 0.8).abs() < 0.01,
+        "fast: {lasted:?}"
+    );
+    let entered = script
+        .pen(at(11.0), at(13.0))
+        .first()
+        .expect("the pen enters");
+    assert_eq!(entered.radius, Some(40.0), "the default brush");
+    // From about 39° one side of the point facing the camera to 39° the other.
+    let facing = |sample: &ScriptPen| {
+        let eye = sample.camera.eye();
+        let p = sample.point;
+        (p.x * eye.x + p.y * eye.y + p.z * eye.z) / eye.dot(eye).sqrt()
+    };
+    for end in [first, last] {
+        let angle = facing(end).acos().to_degrees();
+        assert!((38.0..40.0).contains(&angle), "{angle}");
+    }
+}
+
+#[test]
+fn the_next_scripted_sample_is_found_after_any_time() {
+    let script = Script::strokes(Speed::ONE);
+    let all = script.pen(at(0.0), at(30.0));
+    let first = all.first().expect("samples").time;
+    assert_eq!(script.next_pen_after(Duration::ZERO), Some(first));
+    assert_eq!(
+        script.next_pen_after(first),
+        Some(all[1].time),
+        "strictly after"
+    );
+    let end = all.last().expect("samples").time;
+    assert_eq!(script.next_pen_after(end), None, "none after the last");
+    assert_eq!(Script::benchmark(Speed::ONE).next_pen_after(at(1.0)), None);
 }

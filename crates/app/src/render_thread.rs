@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -394,6 +394,21 @@ impl RenderThread {
         match self.presented.recv() {
             Ok(presented) => Ok(presented),
             Err(_) => Err(self.failure()),
+        }
+    }
+
+    /// Waits for the thread to finish the frame it has, but no later than `deadline`: `None` if
+    /// it hasn't by then (a scripted pen's next sample is due, say).
+    ///
+    /// # Errors
+    ///
+    /// The error that stopped the thread, if it stops instead.
+    pub(crate) fn wait_until(&mut self, deadline: Instant) -> Result<Option<Presented>> {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        match self.presented.recv_timeout(timeout) {
+            Ok(presented) => Ok(Some(presented)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(self.failure()),
         }
     }
 
