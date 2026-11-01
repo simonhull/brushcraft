@@ -1,5 +1,6 @@
 //! A long stroke seen from a distance: the owner thread's cost of one brush step's frame (the
-//! step's epoch applied, the frame staged with its stand-ins), early in the stroke and late.
+//! step's epoch applied, the frame staged with its stand-ins), early in the stroke and late, and
+//! the GPU's (the frame submitted and waited for).
 //!
 //! `cargo bench -p render --bench standins`. The project is the 96-face cube sphere to level 8
 //! (1,536 finest tiles), every display tile up to level 7 resident (the floor taken to level 7),
@@ -8,7 +9,10 @@
 //! [`STEPS`] steps edit about 900 finest tiles. Each sample is the owner thread's part of one
 //! step's frame, after `done` steps of the same stroke: its epoch applied and the frame staged.
 //! The frame is submitted and waited for between samples, untimed. It should stay flat as `done`
-//! grows (it once grew with the stroke). The GPU is the default adapter, or the first whose
+//! grows (it once grew with the stroke). `step_gpu` times the other half: each sample is the
+//! frame's uploads submitted and waited for (copies, the stand-in pass's replace, normals and
+//! settle, and the wait's own round trip), the frame staged untimed. The GPU is the default
+//! adapter, or the first whose
 //! name contains `BRUSHCRAFT_ADAPTER`; any failure panics, so a broken run never passes for a
 //! fast one.
 
@@ -234,4 +238,31 @@ fn step_frame(bencher: divan::Bencher<'_, '_>, done: usize) {
     if let Some(uploads) = state.borrow_mut().2.take() {
         submit(gpu, uploads);
     }
+}
+
+/// The GPU's part of one step's frame after `done` steps of the stroke: the frame's uploads
+/// submitted and waited for (their copies, the stand-in pass's replace, normals and settle),
+/// staged untimed.
+///
+/// # Panics
+///
+/// If the GPU or residency fails.
+#[divan::bench(args = DONE, sample_count = 40, sample_size = 1)]
+fn step_gpu(bencher: divan::Bencher<'_, '_>, done: usize) {
+    let gpu = GPU.get().or_die("the GPU, opened by main");
+    let (mut residency, path) = far(gpu);
+    for n in 0..done {
+        let uploads = stage(gpu, &mut residency, step(&path, n));
+        submit(gpu, uploads);
+    }
+    let state = RefCell::new((residency, done));
+    bencher
+        .with_inputs(|| {
+            // Untimed: the next step's frame staged.
+            let mut state = state.borrow_mut();
+            state.1 += 1;
+            let epoch = step(&path, state.1);
+            stage(gpu, &mut state.0, epoch)
+        })
+        .bench_local_values(|uploads| submit(gpu, uploads));
 }
