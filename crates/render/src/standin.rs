@@ -69,9 +69,9 @@
 //!
 //! Each normal goes through the display layer's encoding (octahedral, two signed 12-bit
 //! fractions) and back, so it is one the layer could hold; the roughness term stays the stored
-//! one. Measured on a strong stroke (`standin::tests::diag`), they are within a few degrees of the
-//! refreshed tile's, as close as the refreshed tile's own positions give against its stored
-//! (averaged) normals: the floor for any normal made from positions.
+//! one. Measured on a strong stroke (`standin::tests::strong_stroke`), they are within a few
+//! degrees of the refreshed tile's, as close as the refreshed tile's own positions give against its
+//! stored (averaged) normals: the floor for any normal made from positions.
 //!
 //! # A frame
 //!

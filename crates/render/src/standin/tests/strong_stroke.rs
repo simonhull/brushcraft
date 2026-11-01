@@ -1,5 +1,7 @@
-//! A diagnosis probe, not a check: a strong stroke's stand-ins against the display tiles the
-//! refresh builds for the same edit.
+//! A strong stroke's stand-ins against the display tiles the refresh builds for the same edit.
+//!
+//! The regression test of the spiky stroke (spec, "A stroke seen from a distance", amended
+//! 2026-11-01), and the probe that diagnosed it.
 //!
 //! A project over the cube sphere to [`FINEST`], its display layer built (optionally over a
 //! detailed surface: noise on one face's finest corrections), seen from a distance (every display
@@ -7,15 +9,18 @@
 //! spaces them (0.15 of the radius), strength 0.1 of the radius (the app's `StrengthMode::Radius`
 //! default at full pressure), applied a few dabs a frame as the app's steps are, each frame
 //! standing in. Then the snapshot of every display tile above the stroke (the stand-ins), the
-//! refresh, and the snapshot again. Per level: how far the stand-ins' positions and normals are
-//! from the refreshed tiles', where the worst sit, their bounds, and how far the refreshed tile's
-//! morph-in starts from its own shape.
+//! refresh, and the snapshot again. Per level: how far the refresh's swap moves a drawn vertex,
+//! how far the stand-ins' normals are from the refreshed tiles', their bounds, and where a morph
+//! from the refreshed tile's coarse interpolation would have started (what the swap replaced).
 //!
-//! Run: `cargo nextest run -p render --run-ignored only standin::tests::diag --no-capture`.
-//! `BRUSHCRAFT_DIAG_RADIUS` (finest quads), `BRUSHCRAFT_DIAG_NOISE` (finest quads, the detail's
-//! amplitude), `BRUSHCRAFT_DIAG_BATCH` (dabs a frame) and `BRUSHCRAFT_DIAG_DIAGONAL` (0: along
-//! the face's middle row; 1: along its diagonal, the quads' split; 2: along the other diagonal,
-//! across the split) vary the case.
+//! The test checks the swap and the normals along a row and across the quads' split
+//! ([`check`]); the swap itself drawing at once, with no morph, is the raster's
+//! `the_refresh_swaps_in_over_the_stand_ins_at_once_with_no_crack`. The ignored probe prints the
+//! figures for the case the environment sets: `cargo nextest run -p render --run-ignored only
+//! standin::tests::strong_stroke --no-capture`, with `BRUSHCRAFT_DIAG_RADIUS` (finest quads),
+//! `BRUSHCRAFT_DIAG_NOISE` (finest quads, the detail's amplitude), `BRUSHCRAFT_DIAG_BATCH` (dabs
+//! a frame) and `BRUSHCRAFT_DIAG_DIAGONAL` (0: along the face's middle row; 1: along its
+//! diagonal, the quads' split; 2: along the other diagonal, across the split).
 
 use std::f64::consts::PI;
 
@@ -134,24 +139,41 @@ struct Case {
     quad: f64,
 }
 
+impl Default for Case {
+    /// The checked case: a brush of 8 finest quads along the face's middle row, 4 dabs a
+    /// frame, no detail.
+    fn default() -> Self {
+        Self {
+            radius_quads: 8.0,
+            noise_quads: 0.0,
+            batch: 4,
+            direction: 0,
+            quad: PI / 2.0 / f64::from(level(FINEST).face_quads()),
+        }
+    }
+}
+
 impl Case {
-    /// The case from the environment, with the defaults the report quotes.
+    /// The case from the environment, the default's settings where it sets none.
     fn from_env() -> Self {
+        let default = Self::default();
+        #[expect(clippy::cast_precision_loss, reason = "a probe's small settings")]
+        let batch = default.batch as f64;
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             reason = "a probe's small settings"
         )]
         let (batch, direction) = (
-            env_or("BRUSHCRAFT_DIAG_BATCH", 4.0).max(1.0) as usize,
-            env_or("BRUSHCRAFT_DIAG_DIAGONAL", 0.0).clamp(0.0, 2.0) as u8,
+            env_or("BRUSHCRAFT_DIAG_BATCH", batch).max(1.0) as usize,
+            env_or("BRUSHCRAFT_DIAG_DIAGONAL", f64::from(default.direction)).clamp(0.0, 2.0) as u8,
         );
         Self {
-            radius_quads: env_or("BRUSHCRAFT_DIAG_RADIUS", 8.0),
-            noise_quads: env_or("BRUSHCRAFT_DIAG_NOISE", 0.0),
+            radius_quads: env_or("BRUSHCRAFT_DIAG_RADIUS", default.radius_quads),
+            noise_quads: env_or("BRUSHCRAFT_DIAG_NOISE", default.noise_quads),
             batch,
             direction,
-            quad: PI / 2.0 / f64::from(level(FINEST).face_quads()),
+            ..default
         }
     }
 
@@ -263,25 +285,24 @@ struct Figures {
     lift_max: f64,
     /// The quad edges summed over the tiles (one edge a tile), world units.
     edges: f64,
-    /// Position distance, stand-in vs refreshed.
+    /// Position distance, stand-in vs refreshed: how far the swap moves a drawn vertex.
     position: Spread,
     /// Where the largest is.
     position_at: String,
-    /// Normal angle, the stand-in's stored normal vs the refreshed one, degrees.
-    stale: Spread,
+    /// Normal angle, the stand-in's (as the pass computed it) vs the refreshed one, degrees.
+    normal: Spread,
     /// Where the largest is.
-    stale_at: String,
-    /// Normal angle, the stand-in's positions' own normal vs the refreshed one, degrees.
+    normal_at: String,
+    /// Normal angle, the stand-in's positions' own normal (central differences on the CPU,
+    /// one-sided at the tile's borders) vs the refreshed one, degrees: what the pass should get.
     recomputed: Spread,
     /// Normal angle, the refreshed tile's positions' own normal vs its stored one: the floor a
-    /// recomputation from positions can reach against the mip.
+    /// recomputation from positions can reach against the stored (averaged) normals.
     floor: Spread,
-    /// How far the refreshed tile's morph-in starts from it: an odd vertex's distance from the
-    /// midpoint of its two parents (where `NODE_MORPH_IN` starts it).
-    morph: Spread,
-    /// How far that start sinks an odd vertex towards the centre below the refreshed one (the
-    /// dips between the even vertices, which stay), largest, world units.
-    dip: f64,
+    /// How far a morph from the refreshed tile's own coarse interpolation would start from it:
+    /// an odd vertex's distance from the midpoint of its two parents. What the refresh drew
+    /// before it swapped in place (spec, amended 2026-11-01); kept to show what the swap avoids.
+    coarse: Spread,
     /// The largest stand-in bound.
     bound_standin: f64,
     /// The largest refreshed bound.
@@ -330,8 +351,8 @@ impl Figures {
                 self.position_at = format!("{at}{}", if odd { " odd" } else { " even" });
             }
             let normal = wide(tile.refreshed[k].normal);
-            if self.stale.add(angle(wide(tile.stood[k].normal), normal)) {
-                self.stale_at = at;
+            if self.normal.add(angle(wide(tile.stood[k].normal), normal)) {
+                self.normal_at = at;
             }
             self.recomputed
                 .add(angle(geometric_normal(&stood, side, i, j), normal));
@@ -342,17 +363,22 @@ impl Figures {
                 let (aj, bj) = if j % 2 == 1 { (j - 1, j + 1) } else { (j, j) };
                 let (pa, pb) = (fresh[index(ai, aj)], fresh[index(bi, bj)]);
                 let mid = [0, 1, 2].map(|c| f64::midpoint(pa[c], pb[c]));
-                self.morph.add(norm(sub(fresh[k], mid)));
-                self.dip = self.dip.max(norm(fresh[k]) - norm(mid));
+                self.coarse.add(norm(sub(fresh[k], mid)));
             }
         }
     }
 
+    /// The average quad edge of the level's tiles, world units.
+    fn edge(&self) -> f64 {
+        #[expect(clippy::cast_precision_loss, reason = "counts")]
+        let tiles = self.tiles.max(1) as f64;
+        self.edges / tiles
+    }
+
     /// Prints the figures of level `l`, in radii `radius` and quad edges too.
     fn print(&self, l: u8, radius: f64) {
-        #[expect(clippy::cast_precision_loss, reason = "counts")]
-        let edge = self.edges / self.tiles.max(1) as f64;
-        let (position, stale, morph) = (self.position, self.stale, self.morph);
+        let edge = self.edge();
+        let (position, normal, coarse) = (self.position, self.normal, self.coarse);
         println!(
             "level {l}: {} tiles, {} moved vertices (lift max {:.2} R); edge {edge:.5} = {:.3} R",
             self.tiles,
@@ -361,8 +387,8 @@ impl Figures {
             edge / radius,
         );
         println!(
-            "  position stand-in vs refreshed: max {:.2e} ({:.4} R, {:.4} edge), rms {:.4} R, \
-             {:.4} edge; worst at {}",
+            "  position stand-in vs refreshed (the swap): max {:.2e} ({:.4} R, {:.4} edge), rms \
+             {:.4} R, {:.4} edge; worst at {}",
             position.max,
             position.max / radius,
             position.max / edge,
@@ -371,26 +397,25 @@ impl Figures {
             self.position_at,
         );
         println!(
-            "  normal, stored (stale) vs refreshed: max {:.1} deg, rms {:.1} deg; worst at {}",
-            stale.max,
-            stale.rms(),
-            self.stale_at,
+            "  normal, the stand-in's vs refreshed: max {:.1} deg, rms {:.1} deg; worst at {}",
+            normal.max,
+            normal.rms(),
+            self.normal_at,
         );
         println!(
-            "  normal, recomputed from the stand-in vs refreshed: max {:.1} deg, rms {:.1} deg \
-             (floor, from the refreshed positions: max {:.1}, rms {:.1})",
+            "  normal, recomputed on the CPU from the stand-in vs refreshed: max {:.1} deg, rms \
+             {:.1} deg (floor, from the refreshed positions: max {:.1}, rms {:.1})",
             self.recomputed.max,
             self.recomputed.rms(),
             self.floor.max,
             self.floor.rms(),
         );
         println!(
-            "  refresh morph-in start vs refreshed (odd vertices): max {:.3} R ({:.3} edge), \
-             rms {:.3} R, deepest dip {:.3} R",
-            morph.max / radius,
-            morph.max / edge,
-            morph.rms() / radius,
-            self.dip / radius,
+            "  a morph from the coarse interpolation would start (odd vertices; none now): max \
+             {:.3} R ({:.3} edge), rms {:.3} R",
+            coarse.max / radius,
+            coarse.max / edge,
+            coarse.rms() / radius,
         );
         println!(
             "  bound: stand-in max {:.2} R, refreshed max {:.3} R, ratio max {:.0}",
@@ -432,72 +457,176 @@ fn compare(
     by_level
 }
 
+/// Runs `case` on `gpu`: the stroke stood in a step a frame, then refreshed. Returns the
+/// figures by level.
+fn run(gpu: &Gpu, case: Case) -> BTreeMap<u8, Figures> {
+    run_with(gpu, case, &[])
+}
+
+/// [`run`] with the stand-in pass's sources patched by `patches`, for the bites.
+fn run_with(gpu: &Gpu, case: Case, patches: &[(&str, &str)]) -> BTreeMap<u8, Figures> {
+    let finest = level(FINEST);
+    let dir = TempDir::new("strong-stroke");
+    let (mut project, mesh) = project(&dir, |config| config);
+    let face = FaceId::new(2);
+    if case.noise_quads > 0.0 {
+        #[expect(clippy::cast_possible_truncation, reason = "a probe's small settings")]
+        let amplitude = (case.noise_quads * case.quad) as f32;
+        detail(project.store(), face, amplitude);
+    }
+    let cursor = project.store().subscribe_stale();
+    let mut residency = far_residency(gpu, &mesh, project.store());
+    residency
+        .patch_stand_in_pass(gpu, patches)
+        .expect("the stand-in pass");
+    let before = display_tiles(gpu, &residency);
+    let grids = finest_grids(project.store(), &mesh);
+    let dabs = case.dabs(&grids[&face.index()], finest.face_quads());
+
+    // The stroke, a step a frame.
+    let mut index =
+        store::SpatialIndex::build(project.store(), finest, |_, _| {}).expect("an index");
+    let mut stroke_state = sculpt::Stroke::new(project.store());
+    project.begin_stroke().expect("a stroke");
+    let mut edited = BTreeSet::new();
+    for step in dabs.chunks(case.batch) {
+        sculpt::apply_dabs(project.store(), &mut index, &mut stroke_state, step)
+            .expect("the dabs apply");
+        let drained = project.store().drain_stale(&cursor);
+        edited.extend(finest_of(&drained));
+        frame(gpu, &mut residency, project.store(), drained);
+    }
+    project.end_unrecorded_stroke().expect("the stroke ends");
+    let store = project.store();
+    let last = store.drain_stale(&cursor);
+    frame(gpu, &mut residency, store, last);
+    let stats = residency.stats();
+    println!(
+        "case: {case:?}; radius {:.5} world, {} dabs; stand-ins {} skipped {}",
+        case.radius(),
+        dabs.len(),
+        stats.stand_ins,
+        stats.stand_ins_skipped
+    );
+    assert!(stats.stand_ins > 0, "nothing stood in");
+    let stood = display_tiles(gpu, &residency);
+    let stepped = finest_grids(store, &mesh);
+
+    // The refresh.
+    run_jobs(store);
+    let refresh = store.drain_stale(&cursor);
+    frame(gpu, &mut residency, store, refresh);
+    frame(gpu, &mut residency, store, Drained::Epochs(Vec::new()));
+    let refreshed = display_tiles(gpu, &residency);
+    assert_eq!(
+        stepped,
+        finest_grids(store, &mesh),
+        "the refresh moves no finest vertex"
+    );
+
+    let by_level = compare(
+        &edited,
+        &before,
+        &stood,
+        &refreshed,
+        f64::from(case.radius()),
+    );
+    store.unsubscribe_stale(cursor);
+    drop(project.close(false));
+    by_level
+}
+
+/// Checks `case`'s figures, printing them.
+///
+/// At every level the refresh swaps in within [`SWAP_EDGES`] of a quad
+/// edge of what the stand-in drew, and the stand-in's normals are within [`NORMAL_SLACK`] of the
+/// floor (what the refreshed tile's own positions give against its stored normals) and
+/// [`NORMAL_RMS`] rms of the refreshed tile's.
+fn check(case: Case, by_level: &BTreeMap<u8, Figures>) {
+    let radius = f64::from(case.radius());
+    let mut compared = 0;
+    for (l, figures) in by_level {
+        figures.print(*l, radius);
+        if figures.position.count == 0 {
+            continue;
+        }
+        compared += figures.position.count;
+        let swap = figures.position.max / figures.edge();
+        assert!(
+            swap <= SWAP_EDGES,
+            "level {l}: the swap moves a vertex {swap:.4} of an edge, at {}",
+            figures.position_at
+        );
+        let (normal, floor) = (figures.normal, figures.floor);
+        assert!(
+            normal.max <= floor.max + NORMAL_SLACK && normal.rms() <= floor.rms() + NORMAL_SLACK,
+            "level {l}: the stand-in's normals are max {:.1} deg, rms {:.1} deg from the \
+             refreshed tile's, the floor max {:.1}, rms {:.1}; worst at {}",
+            normal.max,
+            normal.rms(),
+            floor.max,
+            floor.rms(),
+            figures.normal_at
+        );
+        assert!(
+            normal.rms() <= NORMAL_RMS,
+            "level {l}: the stand-in's normals are {:.1} deg rms from the refreshed tile's",
+            normal.rms()
+        );
+    }
+    assert!(compared > 500, "{compared} moved vertices compared");
+}
+
+/// The most a vertex moves when the refresh swaps in for its stand-in, in quad edges of its
+/// level: the stand-in is the finest bits, the refresh their quantized encoding, within about
+/// 0.03 of an edge.
+const SWAP_EDGES: f64 = 0.05;
+
+/// How far, degrees, the stand-in's normals may be from the refreshed ones beyond the floor
+/// (max and rms): the encoding's step and the one-sided differences' change at a seam.
+const NORMAL_SLACK: f64 = 1.0;
+
+/// The most the stand-in's normals may be from the refreshed ones, rms, degrees: the strong
+/// stroke's floor is about 4 at its worst level; its stored normals were 30–34 off.
+const NORMAL_RMS: f64 = 5.0;
+
 #[test]
-#[ignore = "a diagnosis probe: prints figures, checks nothing"]
+fn a_strong_stroke_s_refresh_swaps_in_close_to_its_stand_ins_along_a_row_and_a_diagonal() {
+    GpuTest::run(|gpu| {
+        for direction in [0, 2] {
+            let case = Case {
+                direction,
+                ..Case::default()
+            };
+            check(case, &run(gpu, case));
+        }
+    });
+}
+
+#[test]
+fn the_strong_stroke_test_bites_stand_ins_that_keep_their_stored_normals() {
+    GpuTest::run(|gpu| {
+        let case = Case::default();
+        let by_level = run_with(gpu, case, &[("slots[at].normal = ", "let unused = ")]);
+        let stale = by_level
+            .values()
+            .map(|f| f.normal.rms())
+            .fold(0.0, f64::max);
+        assert!(
+            stale > 2.0 * NORMAL_RMS,
+            "stored normals {stale:.1} deg rms off"
+        );
+    });
+}
+
+#[test]
+#[ignore = "a diagnosis probe: prints figures for the case the environment sets, checks nothing"]
 fn stand_ins_against_the_refresh_after_a_strong_stroke() {
     GpuTest::run(|gpu| {
         let case = Case::from_env();
-        let finest = level(FINEST);
-        let dir = TempDir::new("diag");
-        let (mut project, mesh) = project(&dir, |config| config);
-        let face = FaceId::new(2);
-        if case.noise_quads > 0.0 {
-            #[expect(clippy::cast_possible_truncation, reason = "a probe's small settings")]
-            let amplitude = (case.noise_quads * case.quad) as f32;
-            detail(project.store(), face, amplitude);
-        }
-        let cursor = project.store().subscribe_stale();
-        let mut residency = far_residency(gpu, &mesh, project.store());
-        let before = display_tiles(gpu, &residency);
-        let grids = finest_grids(project.store(), &mesh);
-        let dabs = case.dabs(&grids[&face.index()], finest.face_quads());
-
-        // The stroke, a step a frame.
-        let mut index =
-            store::SpatialIndex::build(project.store(), finest, |_, _| {}).expect("an index");
-        let mut stroke_state = sculpt::Stroke::new(project.store());
-        project.begin_stroke().expect("a stroke");
-        let mut edited = BTreeSet::new();
-        for step in dabs.chunks(case.batch) {
-            sculpt::apply_dabs(project.store(), &mut index, &mut stroke_state, step)
-                .expect("the dabs apply");
-            let drained = project.store().drain_stale(&cursor);
-            edited.extend(finest_of(&drained));
-            frame(gpu, &mut residency, project.store(), drained);
-        }
-        project.end_unrecorded_stroke().expect("the stroke ends");
-        let store = project.store();
-        let last = store.drain_stale(&cursor);
-        frame(gpu, &mut residency, store, last);
-        let stats = residency.stats();
-        println!(
-            "case: {case:?}; radius {:.5} world, {} dabs; stand-ins {} skipped {}",
-            case.radius(),
-            dabs.len(),
-            stats.stand_ins,
-            stats.stand_ins_skipped
-        );
-        let stood = display_tiles(gpu, &residency);
-        let stepped = finest_grids(store, &mesh);
-
-        // The refresh.
-        run_jobs(store);
-        let refresh = store.drain_stale(&cursor);
-        frame(gpu, &mut residency, store, refresh);
-        frame(gpu, &mut residency, store, Drained::Epochs(Vec::new()));
-        let refreshed = display_tiles(gpu, &residency);
-        assert_eq!(
-            stepped,
-            finest_grids(store, &mesh),
-            "the refresh moves no finest vertex"
-        );
-
         let radius = f64::from(case.radius());
-        let by_level = compare(&edited, &before, &stood, &refreshed, radius);
-        for (l, figures) in &by_level {
+        for (l, figures) in &run(gpu, case) {
             figures.print(*l, radius);
         }
-        store.unsubscribe_stale(cursor);
-        drop(project.close(false));
     });
 }

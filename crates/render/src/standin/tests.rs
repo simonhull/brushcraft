@@ -593,6 +593,6 @@ fn an_epoch_of_several_dabs_sums_their_displacements() {
 #[cfg(not(doc))]
 mod model;
 
-// A diagnosis probe (ignored): a strong stroke's stand-ins against the refresh.
+// A strong stroke's stand-ins against the refresh that replaces them; ignored variants print.
 #[cfg(not(doc))]
-mod diag;
+mod strong_stroke;

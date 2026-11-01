@@ -322,6 +322,29 @@ impl StandIns {
     }
 }
 
+#[cfg(test)]
+impl Residency {
+    /// Makes the stand-in pass again, its sources with each `(from, to)` of `patches` replaced,
+    /// for the tests' bites; before any tile stands in (the new pass's rows are all free).
+    ///
+    /// # Errors
+    ///
+    /// As [`StandInPass::with_patches`].
+    pub(crate) fn patch_stand_in_pass(
+        &mut self,
+        gpu: &Gpu,
+        patches: &[(&str, &str)],
+    ) -> Result<(), GpuError> {
+        let rows = self
+            .config
+            .stand_in_rows
+            .unwrap_or_else(|| self.tree.capacity());
+        let tiles = self.config.stand_in_tiles;
+        self.stand_ins.pass = StandInPass::with_patches(gpu, tiles, rows, patches)?;
+        Ok(())
+    }
+}
+
 impl Residency {
     /// Plans the frame's stand-ins and stages what they read into `batch`: the rows freed
     /// since the last frame, every row again after a lost frame, the finest tiles read and the
