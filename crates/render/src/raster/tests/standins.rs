@@ -503,7 +503,7 @@ fn the_seam_test_bites_a_stand_in_that_keeps_its_old_border() {
         let keep_border = [(
             "slots[at].position = fresh;",
             "let i = lx + a;\n        let j = ly + b;\n        \
-             if i > 0u && j > 0u && i + 1u < job.side && j + 1u < job.side {\n            \
+             if i > 0u && j > 0u && i + 1u < side && j + 1u < side {\n            \
              slots[at].position = fresh;\n        }",
         )];
         let (world, edit, _) = bumped_world(gpu, FINEST, AMPLITUDE, &keep_border);
@@ -665,8 +665,8 @@ fn a_stand_in_s_bound_holds_every_finest_vertex_under_it_and_its_cone_covers_eve
 fn the_bound_test_bites_a_stand_in_whose_bound_isnt_raised() {
     GpuTest::run(|gpu| {
         let no_raise = [(
-            "error = min((error + d + max(d, moved)) * SLACK, F32_MAX);",
-            "error = error;",
+            "error = bitcast<f32>(min(bitcast<u32>(raised), F32_MAX_BITS));",
+            "let unraised = raised;",
         )];
         let (world, edit, stood) = bumped_world(gpu, FINEST, AMPLITUDE, &no_raise);
         let broken = stood.iter().filter(|&&place| {

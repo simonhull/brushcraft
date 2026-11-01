@@ -13,8 +13,10 @@
 //! how far the stand-ins' normals are from the refreshed tiles', their bounds, and where a morph
 //! from the refreshed tile's coarse interpolation would have started (what the swap replaced).
 //!
-//! The test checks the swap and the normals along a row and across the quads' split
-//! ([`check`]); the swap itself drawing at once, with no morph, is the raster's
+//! The test checks the swap, the normals and the bounds along a row and across the quads' split
+//! ([`check`]): every stand-in's bound at least its real error (in `f64`, against the finest
+//! level it showed), and the measured ones within a small factor of the refreshed tile's. The swap
+//! itself drawing at once, with no morph, is the raster's
 //! `the_refresh_swaps_in_over_the_stand_ins_at_once_with_no_crack`. The ignored probe prints the
 //! figures for the case the environment sets: `cargo nextest run -p render --run-ignored only
 //! standin::tests::strong_stroke --no-capture`, with `BRUSHCRAFT_DIAG_RADIUS` (finest quads),
@@ -309,6 +311,13 @@ struct Figures {
     bound_refreshed: f64,
     /// The largest ratio of the two, tile by tile.
     bound_ratio: f64,
+    /// The largest real error of a stand-in: a finest vertex's distance from its triangles, in
+    /// `f64`, against the finest level the stand-ins showed.
+    error_standin: f64,
+    /// The stand-ins whose bound is below their real error.
+    dishonest: usize,
+    /// Where the first one is.
+    dishonest_at: String,
 }
 
 /// What a snapshot holds: each resident display tile's vertices and node.
@@ -418,20 +427,58 @@ impl Figures {
             coarse.rms() / radius,
         );
         println!(
-            "  bound: stand-in max {:.2} R, refreshed max {:.3} R, ratio max {:.0}",
+            "  bound: stand-in max {:.3} R, refreshed max {:.3} R, ratio max {:.2}; stand-in real \
+             error max {:.3} R, {} bounds below it",
             self.bound_standin / radius,
             self.bound_refreshed / radius,
             self.bound_ratio,
+            self.error_standin / radius,
+            self.dishonest,
         );
     }
 }
 
-/// The figures by level of every display tile above `edited` in all three snapshots.
+/// The real error of the display tile at `place`, its `vertices`, against the finest level `grids`.
+///
+/// The largest distance, in `f64`, of a finest vertex under the tile (`grids` row-major, a face
+/// each) from its triangles, at its place on the quad holding it: the bound's pointwise measure
+/// (the stand-in module's notes, "The bound").
+fn real_error(place: Place, vertices: &[GpuVertex], grids: &BTreeMap<u32, Vec<Vec3>>) -> f64 {
+    let n = level(FINEST).face_quads();
+    let grid = &grids[&place.face().index()];
+    let size = n / place.level().tiles_per_side();
+    let (x0, y0) = (u32::from(place.tx()) * size, u32::from(place.ty()) * size);
+    let quads = place.level().tile_quads();
+    let scale = size / quads;
+    let p = |i: u32, j: u32| {
+        wide(vertices[usize::try_from(j * (quads + 1) + i).expect("small")].position)
+    };
+    let places = (0..=size).flat_map(|y| (0..=size).map(move |x| (x, y)));
+    places.fold(0.0, |worst: f64, (x, y)| {
+        let fine = grid[usize::try_from((y0 + y) * (n + 1) + x0 + x).expect("small")];
+        let (qx, qy) = ((x / scale).min(quads - 1), (y / scale).min(quads - 1));
+        let fx = f64::from(x - qx * scale) / f64::from(scale);
+        let fy = f64::from(y - qy * scale) / f64::from(scale);
+        let (p00, p10, p11, p01) = (p(qx, qy), p(qx + 1, qy), p(qx + 1, qy + 1), p(qx, qy + 1));
+        let drawn: [f64; 3] = [0, 1, 2].map(|a| {
+            if fx >= fy {
+                p00[a] + fx * (p10[a] - p00[a]) + fy * (p11[a] - p10[a])
+            } else {
+                p00[a] + fy * (p01[a] - p00[a]) + fx * (p11[a] - p01[a])
+            }
+        });
+        worst.max(norm(sub(wide([fine.x, fine.y, fine.z]), drawn)))
+    })
+}
+
+/// The figures by level of every display tile above `edited` in all three snapshots, the
+/// stand-ins' real error against `stepped`, the finest level they showed.
 fn compare(
     edited: &BTreeSet<TileKey>,
     before: &Snapshot,
     stood: &Snapshot,
     refreshed: &Snapshot,
+    stepped: &BTreeMap<u32, Vec<Vec3>>,
     radius: f64,
 ) -> BTreeMap<u8, Figures> {
     let mut by_level: BTreeMap<u8, Figures> = BTreeMap::new();
@@ -446,6 +493,14 @@ fn compare(
         figures.bound_standin = figures.bound_standin.max(bound);
         figures.bound_refreshed = figures.bound_refreshed.max(fresh_bound);
         figures.bound_ratio = figures.bound_ratio.max(bound / fresh_bound.max(1e-12));
+        let real = real_error(place, stand_in, stepped);
+        figures.error_standin = figures.error_standin.max(real);
+        if real > bound {
+            if figures.dishonest == 0 {
+                figures.dishonest_at = format!("{place:?}: real {real:e}, bound {bound:e}");
+            }
+            figures.dishonest += 1;
+        }
         let tile = Tile {
             place,
             before: old,
@@ -529,6 +584,7 @@ fn run_with(gpu: &Gpu, case: Case, patches: &[(&str, &str)]) -> BTreeMap<u8, Fig
         &before,
         &stood,
         &refreshed,
+        &stepped,
         f64::from(case.radius()),
     );
     store.unsubscribe_stale(cursor);
@@ -541,12 +597,25 @@ fn run_with(gpu: &Gpu, case: Case, patches: &[(&str, &str)]) -> BTreeMap<u8, Fig
 /// At every level the refresh swaps in within [`SWAP_EDGES`] of a quad
 /// edge of what the stand-in drew, and the stand-in's normals are within [`NORMAL_SLACK`] of the
 /// floor (what the refreshed tile's own positions give against its stored normals) and
-/// [`NORMAL_RMS`] rms of the refreshed tile's.
+/// [`NORMAL_RMS`] rms of the refreshed tile's. Every stand-in's bound is at least its real error,
+/// and, at the levels whose bound is measured, at most [`BOUND_RATIO`] times the refreshed tile's.
 fn check(case: Case, by_level: &BTreeMap<u8, Figures>) {
     let radius = f64::from(case.radius());
     let mut compared = 0;
     for (l, figures) in by_level {
         figures.print(*l, radius);
+        assert_eq!(
+            figures.dishonest, 0,
+            "level {l}: stand-in bounds below their real error, the first {}",
+            figures.dishonest_at
+        );
+        if *l >= MEASURED_FROM {
+            assert!(
+                figures.bound_ratio <= BOUND_RATIO,
+                "level {l}: a stand-in's bound {:.2} times the refreshed tile's",
+                figures.bound_ratio
+            );
+        }
         if figures.position.count == 0 {
             continue;
         }
@@ -576,6 +645,14 @@ fn check(case: Case, by_level: &BTreeMap<u8, Figures>) {
     }
     assert!(compared > 500, "{compared} moved vertices compared");
 }
+
+/// The coarsest level whose stand-ins' bounds are measured: six above the finest, where a quad
+/// spans a finest tile (the module's notes, "The bound"). Coarser ones take the formula.
+const MEASURED_FROM: u8 = FINEST - 6;
+
+/// The most a measured stand-in bound may be over the refreshed tile's: it measures the stand-in's
+/// own error, about the refreshed tile's, which adds its quantization and chains its levels.
+const BOUND_RATIO: f64 = 4.0;
 
 /// The most a vertex moves when the refresh swaps in for its stand-in, in quad edges of its
 /// level: the stand-in is the finest bits, the refresh their quantized encoding, within about
@@ -616,6 +693,20 @@ fn the_strong_stroke_test_bites_stand_ins_that_keep_their_stored_normals() {
             stale > 2.0 * NORMAL_RMS,
             "stored normals {stale:.1} deg rms off"
         );
+    });
+}
+
+#[test]
+fn the_strong_stroke_test_bites_a_measured_bound_that_halves() {
+    GpuTest::run(|gpu| {
+        let case = Case::default();
+        let halved = [(
+            "worst = max(worst, bound_bits(fine - drawn, magnitude));",
+            "worst = max(worst, bound_bits(0.5 * (fine - drawn), 0.0));",
+        )];
+        let by_level = run_with(gpu, case, &halved);
+        let dishonest: usize = by_level.values().map(|f| f.dishonest).sum();
+        assert!(dishonest > 0, "no bound below its real error");
     });
 }
 

@@ -125,20 +125,21 @@ fn normals(
     let fi = job.fine & 0xffffu;
     let fj = job.fine >> 16u;
     let step = job.step & 0xffffu;
-    let quads = job.side - 1u;
+    let side = job_side(job);
+    let quads = side - 1u;
     for (var t = lane; t < nx * ny; t += GROUP) {
         let a = t % nx;
         let b = t / nx;
         let i = lx + a;
         let j = ly + b;
-        let at = job.base + j * job.side + i;
+        let at = job.base + j * side + i;
         var du: vec3<f32>;
         var dv: vec3<f32>;
         if i > 0u && i < quads && j > 0u && j < quads {
-            du = slot_position(job.base, job.side, i + 1u, j)
-                - slot_position(job.base, job.side, i - 1u, j);
-            dv = slot_position(job.base, job.side, i, j + 1u)
-                - slot_position(job.base, job.side, i, j - 1u);
+            du = slot_position(job.base, side, i + 1u, j)
+                - slot_position(job.base, side, i - 1u, j);
+            dv = slot_position(job.base, side, i, j + 1u)
+                - slot_position(job.base, side, i, j - 1u);
         } else {
             let x = i32(fi + a * step);
             let y = i32(fj + b * step);

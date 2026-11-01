@@ -27,19 +27,67 @@
 //! Write `F` for the finest surface the tile's bound `e` was a bound against, `S` for the
 //! tile's surface (its triangles over its vertices), `F'` and `S'` after the step, `u` for a
 //! place on the face grid. The bound is pointwise: `|F(u) − S(u)| ≤ e` at every finest vertex
-//! `u` under the tile (each level's error is measured at the same grid place, and the finer
-//! triangles nest in the coarser). A stand-in moves each replaced vertex `v` by
-//! `m_v = F'(v) − S(v)` and no other vertex, and `S'(u) − S(u)` is the triangles' blend of the
-//! `m_v` (weights at least 0, summing to at most 1), so
+//! `u` under the tile, `S(u)` the point the tile's triangles draw at `u`'s place on its quad
+//! (each level's error is measured at the same grid place, and the finer triangles nest in the
+//! coarser). A stand-in moves each replaced vertex `v` by `m_v = F'(v) − S(v)` and no other
+//! vertex, and `S'(u) − S(u)` is the triangles' blend of the `m_v` (weights at least 0, summing
+//! to 1).
+//!
+//! **Measured**, at a display level at most six above the finest: a quad spans at most a finest
+//! tile, so each quad lies in one finest tile, its corners among that tile's vertices. Every
+//! finest tile a step moved a vertex of is one the stand-in reads (the store's epoch names every
+//! tile holding a moved vertex: the module's notes, "Seams"), and every finest vertex of those is
+//! measured: a job per finest tile, a thread per finest vertex, `|F'(u) − S'(u)|` at its place on
+//! the quad holding it, the corners the finest bits the replace writes. A finest vertex `u` in a
+//! tile the stand-in doesn't read didn't move, `F'(u) = F(u)`, and its quad's corners are that
+//! tile's vertices, so `|F'(u) − S'(u)| ≤ e + M_b`, with `M_b` the largest `|m_v|` of the
+//! replaced vertices beside such a quad (on the edge of a finest tile the stand-in reads). Those
+//! didn't move either (they are vertices of the unread tile): `m_v` is the stored quantization
+//! of an inside display vertex replaced for the first time, else zero, and a vertex whose bits
+//! didn't change counts nothing. The new bound is the larger of the largest measurement and
+//! `e + M_b`; the step's displacement doesn't enter it. Over a stroke it is the largest error
+//! the stand-ins drew, not a sum over the steps.
+//!
+//! **The formula**, at a coarser level (its quads span several finest tiles, some holding no
+//! display vertex for a job to start from), or for a step whose vertices weren't replaced:
 //!
 //! `|F'(u) − S'(u)| ≤ |F'(u) − F(u)| + |F(u) − S(u)| + max |m_v| ≤ D + e + M`,
 //!
 //! with `D` the step's displacement bound (how far any finest vertex moved) and `M` the largest
 //! `|m_v|`, which the pass measures. The new bound is `e + D + max(D, M)`: at least the spec's
-//! `e + 2D`, and a bound whatever the replaced vertices' quantization was (where `M > D`). It is
-//! summed in `f32` and raised by `SLACK`, more than the rounding of the sum and of `M` can
-//! have taken off. A tile that stands in again bounds against its stand-in, `D` the next step's.
-//! The cone becomes the one that covers everything: no displacement bounds how normals turned.
+//! `e + 2D`, and a bound whatever the replaced vertices' quantization was (where `M > D`).
+//!
+//! Either is computed in `f32` and raised as "Rounding" says. A tile that stands in again bounds
+//! against its stand-in. The cone becomes the one that covers everything: no displacement bounds
+//! how normals turned.
+//!
+//! # Rounding
+//!
+//! The GPU's `f32` arithmetic is what WGSL and Vulkan promise: a sum, difference or product within
+//! 1 ULP of the exact one (`ε = 2⁻²³` of its magnitude), a product fused into a sum or not (fusing
+//! drops a rounding), subnormals flushed to zero or not (`2⁻¹²⁶` an operation), `inverseSqrt`
+//! within 2 ULPs and a division within 2.5, so `length` (`1 / inverseSqrt` of a dot product) within
+//! `6ε` relative. With `A` the largest coordinate of the points a distance reads:
+//!
+//! - **A measured distance.** Each partial sum of `p00 + fx (p10 − p00) + fy (p11 − p10)` (the
+//!   fractions exact: a small integer times a power of two) is a blend of the corners, at most `A`
+//!   in size, and each difference at most `2A`. Summing each operation's rounding, a component of
+//!   `F'(u) − S'(u)` is within `12Aε` (`13Aε` with the second-order terms), so the vector within
+//!   `√3 · 13Aε < 23Aε`; its computed length `L` is within `6ε` of the computed vector's, whose
+//!   length is so at most `L (1 + 7ε)`. Underflow in the dot product loses less than `2⁻⁶¹`. So the
+//!   distance is at most `L (1 + 7ε) + 23Aε + 2⁻⁶¹`.
+//! - **A move** `m_v`: one difference a component, within `2Aε` of it: inside the same bound.
+//! - **What the shader writes**, `max((L + A · MAGNITUDE_SLACK) · SLACK, FLOOR)` with
+//!   `MAGNITUDE_SLACK = 2⁻¹⁷ = 64ε` (exact: a power of two) and `SLACK = 1 + 2⁻¹⁹ = 1 + 16ε`, is,
+//!   through its own two roundings, at least `(L + 64Aε)(1 + 13ε) ≥ L (1 + 7ε) + 23Aε + 41Aε`, and
+//!   `41Aε > 2⁻⁶¹` once `A ≥ 2⁻⁴³`. Below that every point is within `√3 A` of the origin and the
+//!   distance under `4A < 2⁻⁴¹`, which `FLOOR` (`2⁻⁴⁰`) covers. So it is a bound.
+//! - **A sum of bounds**, `e + M_b` or `e + D + max(D, M)` (non-negative): at most two roundings
+//!   and the product by `SLACK`, so at least `(1 − ε)³ (1 + 16ε) > 1` times the exact sum.
+//! - The comparisons and the largest of bounds are exact. A bound past the largest finite `f32` (or
+//!   not finite) becomes the largest, the store's unknown one.
+//!
+//! The model test (`standin::tests::model`) checks every bound in `f64` after every frame.
 //!
 //! The bound lives on the GPU, in the stand-in's **row**: the pass sets it there, and settles
 //! it into the tile's node every frame after the frame's tree upload (which writes the node's
@@ -81,7 +129,7 @@
 //! `StandInWork`, which [`crate::upload::FrameUploads`] encodes after the copies and the
 //! normal pass, before any pass reads a slot or the tree.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytemuck::{Pod, Zeroable};
 use geom::{FinestNormalCone, Level, TILE_QUADS, TileKey, Topology};
@@ -122,9 +170,28 @@ const PENDING: u32 = 1;
 /// Frames the one-off scratch is kept without a frame using it: a few seconds.
 const ONE_OFF_FRAMES: u32 = 240;
 
-/// What the settled bound is multiplied by: `1 + 2⁻¹⁶`, more than the rounding of its sum and
-/// of the distances measured (a few `f32` steps, `2⁻²⁴` each, of each) can have taken off.
-const SLACK: f32 = 1.0 + 1.0 / 65_536.0;
+/// What a measured distance and a sum of bounds are multiplied by: `1 + 2⁻¹⁹`, sixteen ULPs,
+/// more than their rounding can have taken off ([module notes](self), "Rounding").
+const SLACK: f32 = 1.0 + 1.0 / 524_288.0;
+
+/// What a measured distance is raised by, per unit of the largest coordinate it read: `2⁻¹⁷`,
+/// 64 ULPs, more than the rounding of its components can have cost ([module notes](self),
+/// "Rounding").
+const MAGNITUDE_SLACK: f32 = 1.0 / 131_072.0;
+
+/// The least bound a measured distance gets: `2⁻⁴⁰` world units.
+///
+/// More than any distance between points whose coordinates are too small for
+/// [`MAGNITUDE_SLACK`] to cover the underflow of their squares ([module notes](self),
+/// "Rounding"). Its bits: a biased exponent of `127 − 40`, no fraction.
+const FLOOR: f32 = f32::from_bits((127 - 40) << 23);
+
+/// The largest finite `f32`'s bits: a bound at or past it is the store's unknown one.
+const F32_MAX_BITS: u32 = f32::MAX.to_bits();
+
+/// A job's flag, in [`GpuJob::side`]: it measures its finest tile against the stand-in's
+/// triangles ([module notes](self), "The bound").
+const MEASURE: u32 = 1 << 31;
 
 /// The vertices a side of the largest finest tile.
 const FINEST_SIDE: u32 = TILE_QUADS + 1;
@@ -137,7 +204,7 @@ pub(crate) const TILE_WORDS: u32 = FINEST_SIDE * FINEST_SIDE * 3 + 1;
 const TILE_BYTES: u64 = TILE_WORDS as u64 * 4;
 
 /// A bound on how far a brush step moved any finest vertex, in world units: what a stand-in's
-/// bound grows by ([module notes](self), "The bound").
+/// bound grows by where it isn't measured ([module notes](self), "The bound").
 ///
 /// The store's step epoch carries it ([`store::EpochKind::Step`]): the edit path computes it
 /// for the store's in-stroke bound.
@@ -197,7 +264,8 @@ impl Displacement {
 struct GpuJob {
     /// The display tile's first vertex in its slot buffer.
     base: u32,
-    /// The display tile's vertices per side.
+    /// The display tile's vertices per side (bits 0..16); which finest tiles around the job's,
+    /// on its face, the stand-in reads (bits 16..25, [`read_around`]); and [`MEASURE`].
     side: u32,
     /// Its row.
     row: u32,
@@ -237,15 +305,17 @@ pub(crate) struct GpuRow {
     pub(crate) face: u32,
     /// Its tile's place, as the node holds it ([`Place::packed`]).
     pub(crate) place: u32,
-    /// Zero.
-    pub(crate) reserved: u32,
+    /// The largest bound on a measured finest vertex's distance from the stand-in's triangles
+    /// this frame, `f32` bits; 0 if no job of the row measured.
+    pub(crate) measured: u32,
     /// [`PENDING`].
     pub(crate) flags: u32,
     /// The step's displacement bound, `f32` bits.
     pub(crate) displacement: u32,
     /// The tile's settled bound, `f32` bits.
     pub(crate) error: u32,
-    /// The largest distance a replaced vertex moved this frame, `f32` bits.
+    /// The largest bound on the distance a replaced vertex moved this frame, `f32` bits: in a
+    /// measured job, of those beside a quad no job measures.
     pub(crate) moved: u32,
 }
 
@@ -255,7 +325,7 @@ impl GpuRow {
         node: NONE,
         face: 0,
         place: 0,
-        reserved: 0,
+        measured: 0,
         flags: 0,
         displacement: 0,
         error: 0,
@@ -700,7 +770,8 @@ impl StandInPass {
                 batch.write(gpu, ring, data, &self.rows, target, true)?;
             }
             RowWrite::Kept { node, place } => {
-                // Its node, face, place and step fields: not the bound the GPU settled.
+                // Its node, face, place, measurement and step fields: not the bound the GPU
+                // settled.
                 let fields = [node, place.face().index(), place.packed(), 0, 0, 0];
                 let data = bytemuck::cast_slice(&fields);
                 batch.write(gpu, ring, data, &self.rows, at, true)?;
@@ -749,8 +820,14 @@ impl StandInPass {
             };
             let base = offset / size_of::<GpuVertex>() as u64;
             let base = u32::try_from(base).unwrap_or(u32::MAX);
+            let read: BTreeSet<(u16, u16)> = stand_in
+                .under
+                .iter()
+                .map(|(_, place)| (place.tx(), place.ty()))
+                .collect();
             let jobs = stand_in.under.iter().filter_map(|&(index, finest_place)| {
-                let job = job(stand_in, base, index, finest_place, finest)?;
+                let around = read_around(&read, finest_place);
+                let job = job(stand_in, base, index, finest_place, finest, around)?;
                 let (links, maps) = links
                     .get(&finest_place)
                     .copied()
@@ -838,6 +915,10 @@ fn shared_source() -> String {
          const PENDING: u32 = {PENDING}u;\n\
          const EVERYTHING: u32 = {everything}u;\n\
          const SLACK: f32 = {SLACK:?};\n\
+         const MAGNITUDE_SLACK: f32 = {MAGNITUDE_SLACK:?};\n\
+         const FLOOR: f32 = {FLOOR:?};\n\
+         const F32_MAX_BITS: u32 = {F32_MAX_BITS}u;\n\
+         const MEASURE: u32 = {MEASURE}u;\n\
          {STANDIN_WGSL}"
     )
 }
@@ -973,18 +1054,41 @@ impl<'a> Links<'a> {
     }
 }
 
+/// Which finest tiles around the one at `place`, on its face, are among `read`.
+///
+/// `read` holds the `(tx, ty)` of the finest tiles a stand-in reads; the result packs them as
+/// [`GpuJob::side`] does: the tile at offset `(ox, oy)`, each −1 to 1, at bit
+/// `16 + (oy + 1) · 3 + ox + 1`.
+fn read_around(read: &BTreeSet<(u16, u16)>, place: Place) -> u32 {
+    let offsets = (0..3_u16).flat_map(|oy| (0..3_u16).map(move |ox| (ox, oy)));
+    offsets.fold(0, |mask, (ox, oy)| {
+        let x = place.tx().checked_add(ox).and_then(|x| x.checked_sub(1));
+        let y = place.ty().checked_add(oy).and_then(|y| y.checked_sub(1));
+        let is_read = x.zip(y).is_some_and(|tile| read.contains(&tile));
+        if is_read {
+            mask | (1 << (16 + u32::from(oy * 3 + ox)))
+        } else {
+            mask
+        }
+    })
+}
+
 /// The job of `stand_in` and the finest tile at `finest_place`: the display vertices the finest
 /// tile holds, with no links (the caller adds them).
 ///
 /// The display tile's first vertex is at `base` in its slot buffer, and the finest tile is at
-/// `index` of the scratch. `None` if the finest tile holds none of its vertices (it isn't under
-/// the tile).
+/// `index` of the scratch; `around` says which finest tiles beside it the stand-in reads
+/// ([`read_around`]). It measures ([`MEASURE`]) where its display quads cover its finest tile
+/// whole, from its first vertex: a display level at most six above the finest
+/// ([module notes](self), "The bound"). `None` if the finest tile holds none of its vertices (it
+/// isn't under the tile).
 fn job(
     stand_in: &StandIn,
     base: u32,
     index: u32,
     finest_place: Place,
     finest: Level,
+    around: u32,
 ) -> Option<GpuJob> {
     let place = stand_in.place;
     let level = place.level();
@@ -1003,9 +1107,15 @@ fn job(
     };
     let (lx, nx, fi) = axis(place.tx(), finest_place.tx())?;
     let (ly, ny, fj) = axis(place.ty(), finest_place.ty())?;
+    let covers = |first: u32, count: u32| first == 0 && (count - 1) * step == fine_quads;
+    let measure = if step <= fine_quads && covers(fi, nx) && covers(fj, ny) {
+        MEASURE
+    } else {
+        0
+    };
     Some(GpuJob {
         base,
-        side: quads + 1,
+        side: (quads + 1) | around | measure,
         row: stand_in.row,
         scratch: index,
         lo: lx | (ly << 16),
