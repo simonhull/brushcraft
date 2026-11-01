@@ -84,7 +84,7 @@
 use std::collections::BTreeMap;
 
 use bytemuck::{Pod, Zeroable};
-use geom::{FinestNormalCone, Level, TILE_QUADS, Topology};
+use geom::{FinestNormalCone, Level, TILE_QUADS, TileKey, Topology};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding, BufferBindingType,
@@ -889,24 +889,49 @@ impl<'a> Links<'a> {
     /// [`crate::tree::GpuNode::neighbours`]: per edge, the finest tile across it by its index in
     /// the scratch ([`NONE`] where the scratch holds none, or there is none), and where a point
     /// one step across lies in it ([`GpuJob::maps`]).
+    ///
+    /// An edge inside the face is found by arithmetic; only a face's edge asks the topology.
     fn around(&self, place: Place) -> ([u32; 4], [u32; 4]) {
         let mut links = [NONE; 4];
         let mut maps = [0; 4];
-        let across = place.neighbours(self.topology);
-        let found = across.iter().zip(links.iter_mut().zip(&mut maps));
-        for (edge, (other, (link, map))) in found.enumerate() {
-            let Some(other) = *other else {
+        let mut across: Option<[Option<Place>; 4]> = None;
+        let slots = links.iter_mut().zip(&mut maps);
+        for (edge, (link, map)) in slots.enumerate() {
+            let found = if let Some((other, code)) = self.on_face(place, edge) {
+                Some((other, code))
+            } else {
+                let neighbours = *across.get_or_insert_with(|| place.neighbours(self.topology));
+                let other = neighbours.get(edge).copied().flatten();
+                other.and_then(|other| Some((other, self.map(place, edge, other)?)))
+            };
+            let Some((other, code)) = found else {
                 continue;
             };
-            let Some(&index) = self.scratch.get(&other) else {
-                continue;
-            };
-            if let Some(code) = self.map(place, edge, other) {
+            if let Some(&index) = self.scratch.get(&other) {
                 *link = index;
                 *map = code;
             }
         }
         (links, maps)
+    }
+
+    /// The finest tile across edge `edge` of the finest tile at `place` and its map
+    /// ([`GpuJob::maps`]), if it lies on the same face: its grid is the tile's, shifted a tile.
+    fn on_face(&self, place: Place, edge: usize) -> Option<(Place, u32)> {
+        /// A map's packing: origin `(i, j)`, then the along and inward grid steps.
+        const fn pack(i: u32, j: u32, along: u32, inward: u32) -> u32 {
+            i | (j << 8) | (along << 16) | (inward << 18)
+        }
+        let quads = self.finest.tile_quads();
+        let (tx, ty) = (place.tx(), place.ty());
+        let ((x, y), map) = match edge {
+            0 => ((Some(tx), ty.checked_sub(1)), pack(0, quads, 0, 3)),
+            1 => ((tx.checked_add(1), Some(ty)), pack(0, 0, 1, 0)),
+            2 => ((Some(tx), ty.checked_add(1)), pack(0, 0, 0, 1)),
+            _ => ((tx.checked_sub(1), Some(ty)), pack(quads, 0, 1, 2)),
+        };
+        let key = TileKey::displacement(place.face(), self.finest, x?, y?).ok()?;
+        Some((Place::of(&key), map))
     }
 
     /// Where the points one step across edge `edge` of the finest tile at `place` lie in the

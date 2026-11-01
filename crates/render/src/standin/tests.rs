@@ -399,6 +399,49 @@ fn the_passes_index_no_local_array_at_run_time() {
     }
 }
 
+#[test]
+fn a_link_s_map_finds_the_tile_across_every_edge_on_a_face_and_across_its_edges() {
+    let mesh = cube_sphere(1).expect("a mesh");
+    let finest = level(8);
+    let per_side = u16::try_from(finest.tiles_per_side()).expect("small");
+    let places: Vec<Place> = mesh
+        .faces()
+        .flat_map(|face| {
+            (0..per_side).flat_map(move |ty| {
+                (0..per_side).map(move |tx| {
+                    Place::of(&TileKey::displacement(face, finest, tx, ty).expect("a tile"))
+                })
+            })
+        })
+        .collect();
+    let links = Links {
+        scratch: places.iter().zip(0..).map(|(&p, i)| (p, i)).collect(),
+        topology: mesh.topology(),
+        finest,
+    };
+    let (mut inside, mut across) = (0, 0);
+    for &place in &places {
+        let neighbours = place.neighbours(mesh.topology());
+        for (edge, other) in neighbours.iter().enumerate() {
+            let other = other.expect("a closed mesh");
+            // Whichever way a map is found, the topology's agrees with it.
+            let by_topology = links.map(place, edge, other).expect("a map");
+            if let Some((on_face, code)) = links.on_face(place, edge) {
+                assert_eq!(on_face, other, "{place:?} edge {edge}");
+                assert_eq!(code, by_topology, "{place:?} edge {edge}");
+                inside += 1;
+            } else {
+                assert_ne!(other.face(), place.face(), "{place:?} edge {edge}");
+                across += 1;
+            }
+            let (found, maps) = links.around(place);
+            assert_eq!(found[edge], links.scratch[&other], "{place:?} edge {edge}");
+            assert_eq!(maps[edge], by_topology, "{place:?} edge {edge}");
+        }
+    }
+    assert!(inside > 0 && across > 0, "{inside} inside, {across} across");
+}
+
 /// A project over the cube sphere to [`FINEST`], its display layer built, with `store`'s
 /// configuration changed by `configure`.
 fn project(
