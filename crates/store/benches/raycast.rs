@@ -3,24 +3,34 @@
 //! quads, 12.6 million triangles), every tile evaluated and cached first, so a raycast costs
 //! the tree's walk and the candidate tiles' triangle tests.
 //!
-//! - [`raycast_spread`]: rays from all around aimed at the sphere, each at another tile: what a
-//!   tile costs the first time it is raycast.
-//! - [`raycast_local`]: rays aimed within a small patch, a few tiles, again and again: a stroke's
-//!   raycasts, between edits.
-//! - [`raycast_grazing`]: rays aimed at the sphere's rim, nearly along the surface, each crossing a
-//!   long row of quads.
-//! - [`raycast_miss`]: rays that pass beside the sphere, close to it.
+//! The index keeps the blocks it raycasts a tile through until the store's next write, for the
+//! last 64 tiles raycast. The benches whose rays go all round the sphere meet each tile on first
+//! sight, its blocks built; the local ones meet the same few tiles again, their blocks kept
+//! unless a write comes between.
+//!
+//! - [`raycast_spread`]: rays from all around aimed at the sphere, each at other tiles, on first
+//!   sight.
+//! - [`raycast_local`]: rays aimed within a small patch, a few tiles, again and again with no write
+//!   between: the blocks kept.
+//! - [`raycast_local_edited`]: [`raycast_local`]'s rays with a write to the tile each hits before
+//!   each raycast, the tile evaluated again untimed: a stroke, each raycast after a dab.
+//! - [`raycast_grazing`]: rays from all around aimed at the sphere's rim, nearly along the surface,
+//!   each crossing a long row of quads, on first sight: the most a silhouette costs.
+//! - [`raycast_grazing_edited`]: grazing rays at one place on the rim with a write before each, as
+//!   [`raycast_local_edited`]: a stroke along the silhouette.
+//! - [`raycast_miss`]: rays from all around passing beside the sphere, close to it, on first sight.
 
 #![expect(
     clippy::expect_used,
     reason = "benchmark setup; a failure here should abort the run"
 )]
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use geom::{Level, Vec3, cube_sphere};
+use geom::{Level, TILE_QUADS, TileKey, Vec3, cube_sphere};
 use store::{Meta, ProjectFile, ProjectId, Ray, Role, SpatialIndex, StoreConfig, TileStore};
 
 fn main() {
@@ -88,6 +98,55 @@ impl Fresh {
                 .raycast_triangle(&mut self.store, ray)
                 .expect("raycast")
         });
+    }
+
+    /// Raycasts each of `rays` in turn, cycling, once per iteration, each after a write to a
+    /// vertex in the middle of the tile it hits and that tile's evaluation (both untimed), the
+    /// index refitted to it: every raycast meets the store just written, as a stroke's do after
+    /// each dab. The write moves the vertex by a millionth and back, in turn.
+    ///
+    /// # Panics
+    ///
+    /// If a ray misses, or a write, an evaluation or a raycast fails, which would be a bug.
+    fn bench_edited(mut self, bencher: divan::Bencher<'_, '_>, rays: &[Ray]) {
+        let targets: Vec<(Ray, TileKey)> = rays
+            .iter()
+            .map(|ray| {
+                let hit = self
+                    .index
+                    .raycast(&mut self.store, ray)
+                    .expect("raycast")
+                    .expect("the ray hits");
+                (*ray, hit.key)
+            })
+            .collect();
+        self.store.begin_op().expect("op");
+        let fresh = RefCell::new(self);
+        let mut next = targets.iter().cycle();
+        let mut lift = 0.0;
+        bencher
+            .with_inputs(|| {
+                let &(ray, key) = next.next().expect("a cycle of rays");
+                let mut fresh = fresh.borrow_mut();
+                let Self { store, index, .. } = &mut *fresh;
+                let middle = TILE_QUADS / 2;
+                let (i, j) = (
+                    u32::from(key.tx()) * TILE_QUADS + middle,
+                    u32::from(key.ty()) * TILE_QUADS + middle,
+                );
+                lift = if lift == 0.0 { 1e-6 } else { 0.0 };
+                store
+                    .set_correction(key.face(), key.level(), i, j, Vec3::new(0.0, 0.0, lift))
+                    .expect("write");
+                store.evaluate(key).expect("evaluate");
+                index.update(store, &[key]).expect("refit");
+                ray
+            })
+            .bench_local_values(|ray| {
+                let mut fresh = fresh.borrow_mut();
+                let Self { store, index, .. } = &mut *fresh;
+                index.raycast_triangle(store, &ray).expect("raycast")
+            });
     }
 }
 
@@ -188,7 +247,8 @@ fn radius(fresh: &mut Fresh, toward: Vec3) -> f32 {
     ray.at(hit.t).length()
 }
 
-/// Rays from all around, each aimed near the centre: every one hits, at another tile.
+/// Rays from all around, each aimed near the centre: every one hits, at other tiles, on first
+/// sight.
 #[divan::bench(sample_count = 50, sample_size = 512)]
 fn raycast_spread(bencher: divan::Bencher<'_, '_>) {
     let rays = rays(1, |rng, toward| {
@@ -198,29 +258,67 @@ fn raycast_spread(bencher: divan::Bencher<'_, '_>) {
     Fresh::new().bench(bencher, &rays);
 }
 
-/// Rays from one side, aimed within a patch a hundredth of the radius across: a few tiles,
-/// raycast again and again.
+/// Rays from one side, aimed within a patch a hundredth of the radius across, at `fresh`'s
+/// sphere: a few tiles.
 ///
 /// # Panics
 ///
 /// Never: the direction is a fixed nonzero vector.
-#[divan::bench(sample_count = 50, sample_size = 512)]
-fn raycast_local(bencher: divan::Bencher<'_, '_>) {
-    let mut fresh = Fresh::new();
+fn local_rays(fresh: &mut Fresh) -> Vec<Ray> {
     let toward = Vec3::new(0.3, 0.5, 0.8).normalized().expect("nonzero");
-    let r = radius(&mut fresh, toward);
+    let r = radius(fresh, toward);
     let side = across(toward);
     let up = toward.cross(side);
-    let rays = rays(2, |rng, _| {
+    rays(2, |rng, _| {
         let target = toward * r + side * rng.range(-0.01, 0.01) + up * rng.range(-0.01, 0.01);
         let origin = toward * 3.0;
         (origin, target - origin)
-    });
+    })
+}
+
+/// [`local_rays`], raycast again and again with nothing written between: each raycast after
+/// the first few finds its tiles' blocks kept.
+#[divan::bench(sample_count = 50, sample_size = 512)]
+fn raycast_local(bencher: divan::Bencher<'_, '_>) {
+    let mut fresh = Fresh::new();
+    let rays = local_rays(&mut fresh);
     fresh.bench(bencher, &rays);
 }
 
-/// Rays from all around passing within 2 % of the radius inside the rim, nearly along the
-/// surface where they hit it: the worst case, a long run of quads close to the ray.
+/// [`local_rays`], each after a write to the tile it hits ([`Fresh::bench_edited`]): a
+/// stroke's raycasts, each after a dab, its tiles' blocks built again.
+#[divan::bench(sample_count = 2000, sample_size = 1)]
+fn raycast_local_edited(bencher: divan::Bencher<'_, '_>) {
+    let mut fresh = Fresh::new();
+    let rays = local_rays(&mut fresh);
+    fresh.bench_edited(bencher, &rays);
+}
+
+/// Rays from one side grazing the sphere at one place on its rim, within 2 % of the radius
+/// inside it, each after a write to the tile it hits ([`Fresh::bench_edited`]): a stroke along
+/// the silhouette.
+///
+/// # Panics
+///
+/// Never: the directions are fixed nonzero vectors.
+#[divan::bench(sample_count = 2000, sample_size = 1)]
+fn raycast_grazing_edited(bencher: divan::Bencher<'_, '_>) {
+    let mut fresh = Fresh::new();
+    let toward = Vec3::new(0.3, 0.5, 0.8).normalized().expect("nonzero");
+    let side = across(toward);
+    let up = toward.cross(side);
+    let r = radius(&mut fresh, side);
+    let rays = rays(5, |rng, _| {
+        let origin = toward * 3.0 + side * r * rng.range(0.98, 1.0) + up * rng.range(-0.01, 0.01);
+        (origin, -toward)
+    });
+    fresh.bench_edited(bencher, &rays);
+}
+
+/// Rays from all around grazing the sphere, on first sight: the worst case.
+///
+/// They pass within 2 % of the radius inside the rim, nearly along the surface where they hit
+/// it, each at other tiles: a long run of quads close to the ray.
 #[divan::bench(sample_count = 50, sample_size = 512)]
 fn raycast_grazing(bencher: divan::Bencher<'_, '_>) {
     let mut fresh = Fresh::new();
@@ -232,8 +330,8 @@ fn raycast_grazing(bencher: divan::Bencher<'_, '_>) {
     fresh.bench(bencher, &rays);
 }
 
-/// Rays from all around passing just outside the rim, within 2 % of the radius: they walk
-/// candidate tiles and hit none.
+/// Rays from all around passing just outside the rim, within 2 % of the radius, on first
+/// sight: they walk candidate tiles and hit none.
 #[divan::bench(sample_count = 50, sample_size = 512)]
 fn raycast_miss(bencher: divan::Bencher<'_, '_>) {
     let mut fresh = Fresh::new();
