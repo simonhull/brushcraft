@@ -39,7 +39,7 @@ fn open_and_read(path: &std::path::Path) -> Result<(), store::FileError> {
 }
 
 /// Reads every tile of `file`, raw and decoded (correction tiles as displacement, display
-/// records as display tiles).
+/// records as display tiles), and every stroke record it holds.
 ///
 /// # Errors
 ///
@@ -52,7 +52,10 @@ fn read_all(file: &ProjectFile) -> Result<(), store::FileError> {
             file.read_displacement(key)?;
         }
     }
-    store::fuzzing::read_displays(file)
+    store::fuzzing::read_displays(file)?;
+    // A stroke record that doesn't read is an error in its place; the rest still read.
+    file.strokes().for_each(drop);
+    Ok(())
 }
 
 /// Opens a tile store over the file at `path` keeping a display layer under level 2 (the seeds'

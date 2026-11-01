@@ -35,7 +35,8 @@
 //!
 //! The parent checks that the child died of `SIGKILL`, lists the recovery files, restores the
 //! one it finds, and checks the evaluation against the dense evaluation of exactly the edits
-//! that should have survived: every completed stroke, none of the interrupted one. The index
+//! that should have survived: every completed stroke, none of the interrupted one, each
+//! completed stroke's record with its edits (every stroke ends with one). The index
 //! loaded from the restored files must be the one built from the restored tiles, bit for bit,
 //! without evaluating a tile. Then it saves the restored project and checks the project file
 //! holds them too.
@@ -51,6 +52,8 @@ use super::*;
 use crate::fixture::{display_layer, record, tight};
 use crate::index::SpatialIndex;
 use crate::index::tests::assert_loads_as_built;
+use crate::stroke_record::tests::wobbly;
+use crate::{OpId, StrokeRecord};
 
 /// The level the child indexes: the tests' finest.
 fn top() -> Level {
@@ -204,6 +207,17 @@ impl Scenario {
         self.crash == Crash::MidFlush("syncing save point")
     }
 
+    /// The seeds of the strokes whose records the recovery file must hold: every completed
+    /// stroke since the save, and the interrupted one only if its save point was written (its
+    /// record is appended with the flush its end starts, before that save point).
+    fn recorded_since_save(self) -> Vec<u64> {
+        let mut seeds: Vec<u64> = (0..self.strokes).map(seed).collect();
+        if self.keeps_the_last_stroke() {
+            seeds.push(INTERRUPTED_SEED);
+        }
+        seeds
+    }
+
     /// The edits a restore must hold: the saved stroke, every completed stroke, and the
     /// interrupted one only if its save point was written.
     fn survivors(self, mesh: &BaseMesh) -> CorrectionMap {
@@ -237,6 +251,34 @@ pub(super) fn poll_until_idle(project: &mut Project) {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// The record a child leaves for the stroke with `seed`, made as `op`.
+fn record_of(op: OpId, seed: u64) -> StrokeRecord {
+    wobbly(op, 40, seed)
+}
+
+/// Ends the project's stroke, the one with `seed`, with its record.
+fn end_recorded(project: &mut Project, seed: u64) {
+    let op = project.store().current_op().unwrap();
+    project.end_stroke_with(&record_of(op, seed)).unwrap();
+}
+
+/// Asserts that `file` holds the records of the strokes with `seeds`, in order, each with its
+/// own op, the ops in the order the strokes were made.
+fn assert_records(file: &ProjectFile, seeds: &[u64], what: &str) {
+    let read: Vec<StrokeRecord> = file.strokes().map(Result::unwrap).collect();
+    let expected: Vec<StrokeRecord> = read
+        .iter()
+        .zip(seeds)
+        .map(|(got, &seed)| record_of(got.op(), seed))
+        .collect();
+    assert_eq!(read.len(), seeds.len(), "{what}: one record a stroke");
+    assert_eq!(read, expected, "{what}: the records");
+    assert!(
+        read.is_sorted_by(|a, b| a.op() < b.op()),
+        "{what}: in the order of their ops"
+    );
 }
 
 /// Begins the stroke with `seed`, applies its `count` edits to the project's store, as dabs of
@@ -309,12 +351,12 @@ fn crash_child() {
     let (mut index, _) = project.load_index(top(), |_, _| {}).unwrap();
     if scenario.saved {
         edit(&mut project, &mut index, EDITS, SAVED_SEED);
-        project.end_stroke().unwrap();
+        end_recorded(&mut project, SAVED_SEED);
         assert_saved(project.save_as(&dir.join("p.bcrf")));
     }
     for k in 0..scenario.strokes {
         edit(&mut project, &mut index, EDITS, seed(k));
-        project.end_stroke().unwrap();
+        end_recorded(&mut project, seed(k));
         poll_until_idle(&mut project);
     }
     edit(
@@ -348,7 +390,7 @@ fn crash_child() {
             }
         }
         Crash::MidFlush(phase) => {
-            project.end_stroke().unwrap();
+            end_recorded(&mut project, INTERRUPTED_SEED);
             // More edits and a refit while the flush is in flight, straight on the store (a
             // project call would advance the flush).
             project.store.begin_op().unwrap();
@@ -470,6 +512,11 @@ fn crash(scenario: Scenario) {
         "{scenario:?}: the recovered edits, and only they, are unsaved"
     );
     let loaded = assert_restored_derived(project.store(), &what);
+    assert_records(
+        project.store().working(),
+        &scenario.recorded_since_save(),
+        &what,
+    );
     // A project never saved, whose first flush never finished, has no save point to hold any.
     let durable = scenario.saved || scenario.strokes > 0 || scenario.keeps_the_last_stroke();
     assert_eq!(
@@ -479,7 +526,20 @@ fn crash(scenario: Scenario) {
          ({loaded:?})"
     );
 
-    // What was restored saves: into the project file, or a first one.
+    save_restored(project, scenario, &dir, &survivors);
+}
+
+/// Saves `project`, restored after `scenario`'s crash in `dir`, and closes it.
+///
+/// It saves into its project file, or a first one. The project file must hold `survivors`, the
+/// edits restored, with every stroke's record, and the recovery file go with the close.
+fn save_restored(
+    mut project: Project,
+    scenario: Scenario,
+    dir: &TestDir,
+    survivors: &CorrectionMap,
+) {
+    let path = dir.path("p.bcrf");
     if scenario.saved {
         assert_saved(project.save());
     } else {
@@ -487,9 +547,14 @@ fn crash(scenario: Scenario) {
     }
     project.close(false).unwrap();
     let saved = format!("{scenario:?}: saved after the restore");
-    assert_project_file(&path, &survivors, &saved);
+    assert_project_file(&path, survivors, &saved);
+    let mut seeds = scenario.recorded_since_save();
+    if scenario.saved {
+        seeds.insert(0, SAVED_SEED);
+    }
+    assert_records(&ProjectFile::open(&path).unwrap(), &seeds, &saved);
     assert_eq!(
-        recovery_files(&dir),
+        recovery_files(dir),
         Vec::<String>::new(),
         "{scenario:?}: the recovery file goes with the close"
     );

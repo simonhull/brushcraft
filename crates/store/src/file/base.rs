@@ -30,6 +30,8 @@ pub(crate) struct BaseFile {
     pub(super) locations: SharedMap<TileKey, Loc>,
     /// Each saved bound's record as of the save point.
     pub(super) bounds: SharedMap<TileKey, Loc>,
+    /// Each stroke record the save point holds (every one before its Index), by offset.
+    pub(super) strokes: SharedMap<u64, Loc>,
     /// The project file's meta: its project, its role and its mesh.
     pub(super) meta: Meta,
     /// The save point: the project, the Index's offset and the head op it recorded.
@@ -131,6 +133,11 @@ impl BaseFile {
     /// Where each saved bound's record is, in key order.
     pub(crate) fn bounds_locations(&self) -> impl Iterator<Item = (&TileKey, Loc)> {
         self.bounds.iter().map(|(key, &loc)| (key, loc))
+    }
+
+    /// Where each stroke record the save point holds is, in file order.
+    pub(crate) fn stroke_locations(&self) -> impl Iterator<Item = Loc> + '_ {
+        self.strokes.iter().map(|(_, &loc)| loc)
     }
 
     /// The bounds the records at `entries` hold (see [`read_bounds_at`]).

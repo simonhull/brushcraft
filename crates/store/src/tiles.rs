@@ -152,6 +152,7 @@ mod read_ahead;
 mod ring;
 mod round;
 mod stream;
+mod strokes;
 mod upkeep;
 
 pub use config::{Evaluation, StoreConfig};
@@ -500,6 +501,9 @@ pub struct TileStore {
     own_edits: BTreeSet<TileKey>,
     /// What the store has done since it opened, for [`TileStore::activity`].
     activity: Activity,
+    /// Stroke records framed at their strokes' ends, waiting for the next flush (or save) to
+    /// append them (see [`TileStore::record_stroke`]).
+    strokes_waiting: Vec<Vec<u8>>,
     /// What the tests read and set: the log of what was computed, and the faults they inject.
     #[cfg(test)]
     hooks: TestHooks,

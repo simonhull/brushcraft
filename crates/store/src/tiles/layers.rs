@@ -113,6 +113,9 @@ pub(crate) struct Saved {
     /// The bounds changes the store had counted when the save was made: a rebase refuses it
     /// after a later one, which the save point doesn't hold.
     pub(super) bounds: u64,
+    /// How many of the stroke records waiting in the store the save copied: the rebase forgets
+    /// them, as the project file holds them.
+    pub(super) strokes: usize,
 }
 
 impl Saved {

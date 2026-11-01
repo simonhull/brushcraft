@@ -97,6 +97,7 @@ use crate::file::{FileError, PRIVATE_MODE, ProjectFile, SHARED_MODE, sync_parent
 use crate::index::{IndexError, LoadStats, SpatialIndex};
 use crate::meta::{Meta, ProjectId, Role, SavePoint};
 use crate::recovery::{RecoveryError, RecoveryWriter};
+use crate::stroke_record::StrokeRecord;
 use crate::tiles::{CacheError, Saved, StoreConfig, TileStore};
 
 mod discover;
@@ -214,6 +215,16 @@ pub enum ProjectError {
         /// Why it couldn't be deleted.
         #[source]
         source: io::Error,
+    },
+    /// [`Project::end_stroke_with`] was given the record of another stroke than the one
+    /// ending: its op isn't the store's current one. Nothing was recorded, and the stroke didn't
+    /// end.
+    #[error("a record of op {record:?} for the stroke of op {stroke:?}")]
+    NotTheStroke {
+        /// The record's op.
+        record: OpId,
+        /// The op of the stroke ending, if one is.
+        stroke: Option<OpId>,
     },
 }
 
@@ -921,7 +932,8 @@ impl Project {
     }
 
     /// A stroke ended: flushes its edits to the recovery file in the background (see
-    /// [`RecoveryWriter::end_stroke`]).
+    /// [`RecoveryWriter::end_stroke`]). No record of the stroke is kept: the app's strokes end
+    /// with [`Project::end_stroke_with`]; this suits edits that no pen made (tools, tests).
     ///
     /// # Errors
     ///
@@ -934,7 +946,41 @@ impl Project {
     /// file; [`ProjectError::Unprotected`] for tiles whose edits aren't in the recovery file,
     /// once nothing else is to be reported.
     pub fn end_stroke(&mut self) -> Result<(), ProjectError> {
-        let now = Instant::now();
+        self.end_stroke_at(Instant::now())
+    }
+
+    /// A stroke ended, leaving `record`: as [`Project::end_stroke`], with the record kept beside
+    /// the stroke's edits. The flush the stroke end starts appends it before its save point, so
+    /// the recovery file holds it from the save point that holds the stroke's last edits, and a
+    /// save copies it into the project file. Opening a file never reads it (see
+    /// [`StrokeRecord`]); [`ProjectFile::strokes`] reads them back, for tools and tests.
+    ///
+    /// The record is compressed here, on the calling thread: a few kilobytes of samples.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::NotTheStroke`] if `record`'s op isn't the stroke's (the store's current
+    /// op), and [`ProjectError::Cache`] if compressing it fails: nothing is recorded then, and the
+    /// stroke hasn't ended (call again, or [`Project::end_stroke`]). Then as
+    /// [`Project::end_stroke`].
+    pub fn end_stroke_with(&mut self, record: &StrokeRecord) -> Result<(), ProjectError> {
+        let stroke = self.store.current_op();
+        if stroke != Some(record.op()) {
+            return Err(ProjectError::NotTheStroke {
+                record: record.op(),
+                stroke,
+            });
+        }
+        self.store.record_stroke(record)?;
+        self.end_stroke_at(Instant::now())
+    }
+
+    /// [`Project::end_stroke`] at `now`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::end_stroke`].
+    fn end_stroke_at(&mut self, now: Instant) -> Result<(), ProjectError> {
         self.with_writer(
             |writer, store| writer.end_stroke(store, now),
             Retry::Due(now),

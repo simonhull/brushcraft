@@ -12,7 +12,9 @@
 //!    goes to the writer thread. At the same moment [`TileStore::flush_bounds`] appends, with one
 //!    write, the spatial index's bounds that edits changed since the last flush (65 bytes a tile;
 //!    the bounds an index computes with no edit pending stay out, see [`crate::bounds`]), so the
-//!    save point names the bounds of the state the snapshot copies. This is all a stroke end costs
+//!    save point names the bounds of the state the snapshot copies. The records of the strokes
+//!    ended by then go in with the same write's neighbour ([`TileStore::flush_strokes`]), so the
+//!    save point that holds a stroke's last edits holds its record. This is all a stroke end costs
 //!    the drawing thread, and it grows with the edits since the last flush.
 //! 2. **Encoding** (writer): each copy is encoded, compressed and framed as a tile record, and the
 //!    records come back. A copy that doesn't encode is left out, and the bounds its edit could have
@@ -528,8 +530,10 @@ impl RecoveryWriter {
         let snapshot = store
             .snapshot_dirty(self.consumer, &mut self.skipped)
             .and_then(|snapshots| {
-                // The bounds of the snapshot's state, at the same cut.
+                // The bounds of the snapshot's state, at the same cut, and the records of the
+                // strokes it ends.
                 store.flush_bounds(self.skipped.get(before..).unwrap_or_default())?;
+                store.flush_strokes()?;
                 Ok(snapshots)
             });
         let started = match snapshot {

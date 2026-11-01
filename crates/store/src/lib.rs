@@ -35,6 +35,7 @@ mod shared_map;
 mod slot;
 mod stale;
 mod stamp;
+mod stroke_record;
 #[cfg(test)]
 mod test_dir;
 mod tile_bounds;
@@ -61,6 +62,10 @@ pub use project::{
 pub use queued::EvaluatedTile;
 pub use recovery::{FLUSH_INTERVAL, RecoveryError, RecoveryWriter};
 pub use stale::{DEFAULT_STALE_CAP, Drained, Epoch, EpochKind, StaleCursor, Unrefreshed};
+pub use stroke_record::{
+    MAX_STROKE_SAMPLES, MAX_STROKE_SETTINGS, PenSample, PenTilt, SAMPLE_BYTES, StrokeCamera,
+    StrokeRecord, StrokeRecordError,
+};
 pub use tiles::{
     CacheError, Evaluation, Invariant, PinGuard, StoreConfig, StoreId, TileEdit, TileStore,
 };

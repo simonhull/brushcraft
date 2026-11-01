@@ -32,6 +32,7 @@ use self::format::{
 };
 use self::lock::{Access, Lock, LockedFile, open_locked, open_readable, open_writable};
 use self::reader::read_displacement_at;
+use self::stroke_io::stroke_locs;
 use crate::OpId;
 use crate::bounds::bounds_payload;
 use crate::codec::{CodecError, compress, decompress, encode_displacement};
@@ -50,6 +51,7 @@ mod error;
 mod format;
 mod lock;
 mod reader;
+mod stroke_io;
 
 pub(crate) use base::BaseFile;
 pub(crate) use compact::sync_parent;
@@ -63,6 +65,7 @@ pub(crate) use format::HEADER_LEN;
 pub use format::{MAX_MESH_RAW, MAX_RAW};
 pub(crate) use lock::open_regular;
 pub(crate) use reader::{FileReader, FileSyncer, FramedTile, ReadScratch, frame_displacement};
+pub(crate) use stroke_io::frame_stroke;
 
 /// The mode a user's project file is created with: the umask decides who else may read it, as
 /// for any file the user saves.
@@ -206,6 +209,9 @@ struct SavedState {
     tiles: SharedMap<TileKey, Loc>,
     /// Each bounds record it names, by key.
     bounds: SharedMap<TileKey, Loc>,
+    /// Each stroke record it holds, by offset: every one before its Index in the file (no Index
+    /// names them, see [`crate::stroke_record`]).
+    strokes: SharedMap<u64, Loc>,
     /// The save point it was derived from by putting entries in, never taking one out; `None`
     /// for one loaded from the file, or the file's first. With the file it was derived in, this
     /// proves the save point holds every record its parent does (see [`BaseFile::extends`]).
@@ -213,15 +219,21 @@ struct SavedState {
 }
 
 impl SavedState {
-    /// The save point at `offset`, with head op `head`, whose live records are `live`: loaded
-    /// from the file, with no parent.
-    fn loaded(offset: u64, head: Option<OpId>, live: &BTreeMap<Name, Loc>) -> Self {
+    /// The save point at `offset`, with head op `head`, whose live records are `live` and
+    /// whose stroke records are `strokes`, in file order: loaded from the file, with no parent.
+    fn loaded(
+        offset: u64,
+        head: Option<OpId>,
+        live: &BTreeMap<Name, Loc>,
+        strokes: impl IntoIterator<Item = Loc>,
+    ) -> Self {
         let (tiles, bounds) = split_names(live);
         Self {
             offset,
             head,
             tiles: SharedMap::from_sorted(tiles),
             bounds: SharedMap::from_sorted(bounds),
+            strokes: SharedMap::from_sorted(strokes.into_iter().map(|loc| (loc.offset, loc))),
             parent: None,
         }
     }
@@ -271,6 +283,9 @@ pub struct ProjectFile {
     live: BTreeMap<Name, Loc>,
     /// Entries written since the last Index (see the invariant on `live`).
     pending: BTreeMap<Name, Loc>,
+    /// The stroke records appended since the last save point, in file order: the next one holds
+    /// them, as it holds every record before it (see [`crate::stroke_record`]).
+    strokes: Vec<Loc>,
     /// The latest save point, the parent of the next one; `None` until the first save (see the
     /// invariant on `live`).
     saved: Option<SavedState>,
@@ -456,6 +471,7 @@ impl ProjectFile {
             end: leading.len() as u64,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
+            strokes: Vec::new(),
             saved: None,
             deltas: 0,
             head: None,
@@ -566,6 +582,7 @@ impl ProjectFile {
             end: leading.end,
             live: BTreeMap::new(),
             pending: BTreeMap::new(),
+            strokes: Vec::new(),
             saved: None,
             deltas: 0,
             head: None,
@@ -636,7 +653,10 @@ impl ProjectFile {
         let chain = load_chain(&file, index_offset, len)?.ok_or(FileError::Damaged {
             offset: index_offset,
         })?;
-        let saved = SavedState::loaded(index_offset, chain.head, &chain.live);
+        // The stroke records the save point holds: every one before its Index. Only their heads
+        // are read, as on any open.
+        let before = scan_heads(&file, leading.end, index_offset)?;
+        let saved = SavedState::loaded(index_offset, chain.head, &chain.live, stroke_locs(&before));
         Ok(Self {
             meta: leading.meta,
             mesh: leading.mesh,
@@ -645,6 +665,7 @@ impl ProjectFile {
             end: len,
             live: chain.live,
             pending: BTreeMap::new(),
+            strokes: Vec::new(),
             saved: Some(saved),
             deltas: chain.deltas,
             head: chain.head,
@@ -690,7 +711,13 @@ impl ProjectFile {
                 continue;
             }
             if let Some(chain) = chain_from(offset, &mut index_at)? {
-                self.saved = Some(SavedState::loaded(offset, chain.head, &chain.live));
+                let before = heads.get(..at).unwrap_or_default();
+                self.saved = Some(SavedState::loaded(
+                    offset,
+                    chain.head,
+                    &chain.live,
+                    stroke_locs(before),
+                ));
                 self.live = chain.live;
                 self.deltas = chain.deltas;
                 self.head = chain.head;
@@ -1059,6 +1086,7 @@ impl ProjectFile {
             reader: self.reader(),
             locations: saved.tiles.clone(),
             bounds: saved.bounds.clone(),
+            strokes: saved.strokes.clone(),
             meta: self.meta.clone(),
             save_point: SavePoint {
                 project: self.meta.project(),
@@ -1093,11 +1121,21 @@ impl ProjectFile {
         if chain.head != point.head {
             return Ok(None);
         }
-        let saved = SavedState::loaded(point.offset, chain.head, &chain.live);
+        // Every save point of the chain is at or before the latest, which holds every stroke
+        // record before it: this one's are those before its Index.
+        let strokes = self.saved.iter().flat_map(|latest| {
+            latest
+                .strokes
+                .iter()
+                .map(|(_, &loc)| loc)
+                .take_while(|loc| loc.offset < point.offset)
+        });
+        let saved = SavedState::loaded(point.offset, chain.head, &chain.live, strokes);
         Ok(Some(BaseFile {
             reader: self.reader(),
             locations: saved.tiles,
             bounds: saved.bounds,
+            strokes: saved.strokes,
             meta: self.meta.clone(),
             save_point: point,
             head: self.head,
@@ -1130,7 +1168,8 @@ impl ProjectFile {
     ///
     /// A bounds record that doesn't read is written as unknown instead: a bound is derived
     /// data, which loading the index computes again, and must never stop a save. So is a display
-    /// record (see [`crate::display`]).
+    /// record (see [`crate::display`]). Then every stroke record `base` holds is copied, in
+    /// order; one that doesn't read is left out (history, which never stops a save either).
     ///
     /// # Errors
     ///
@@ -1164,6 +1203,17 @@ impl ProjectFile {
                 Ok(_) | Err(FileError::Damaged { .. }) => {
                     self.write_bounds(*key, None, Stamp::ZERO)?;
                 }
+                Err(e) => return Err(e),
+            }
+        }
+        // History, not state: a stroke record that doesn't read is left out, never a reason to
+        // stop the save.
+        for loc in base.stroke_locations() {
+            let Ok(raw) = base.reader.read_record(loc) else {
+                continue;
+            };
+            match self.append_stroke_copy(&raw) {
+                Ok(()) | Err(FileError::Damaged { .. }) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -1494,11 +1544,20 @@ impl ProjectFile {
             offset: saved.offset,
             head: saved.head,
         });
+        // Every stroke record appended so far is before the Index, so the save point holds it.
+        let new_strokes = self.strokes.drain(..).map(|stroke| (stroke.offset, stroke));
+        let strokes = self
+            .saved
+            .as_ref()
+            .map(|saved| saved.strokes.clone())
+            .unwrap_or_default()
+            .with(new_strokes);
         self.saved = Some(SavedState {
             offset: loc.offset,
             head,
             tiles,
             bounds,
+            strokes,
             parent,
         });
         self.deltas = match coverage {
@@ -1523,10 +1582,10 @@ impl ProjectFile {
         self.saved.as_ref().map(|saved| saved.offset)
     }
 
-    /// Whether records (tiles or bounds) have been written since the last save point (or,
-    /// before the first, at all): what the next save point would name.
+    /// Whether records (tiles, bounds or strokes) have been written since the last save point
+    /// (or, before the first, at all): what the next save point would hold.
     pub(crate) fn has_unsaved_records(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.strokes.is_empty()
     }
 
     /// A handle that syncs this file from another thread while it stays open (see
@@ -1675,7 +1734,10 @@ impl ProjectFile {
         let chain = load_chain(&self.file, saved.offset, len)
             .unwrap()
             .expect("a save point just written loads");
-        let rebuilt = SavedState::loaded(saved.offset, chain.head, &chain.live);
+        let leading = read_leading(&self.file, len, None).unwrap();
+        let before = scan_heads(&self.file, leading.end, saved.offset).unwrap();
+        let rebuilt =
+            SavedState::loaded(saved.offset, chain.head, &chain.live, stroke_locs(&before));
         assert!(
             saved.tiles.same_entries(&rebuilt.tiles),
             "the derived save point's tiles differ from its chain's"
@@ -1683,6 +1745,10 @@ impl ProjectFile {
         assert!(
             saved.bounds.same_entries(&rebuilt.bounds),
             "the derived save point's bounds differ from its chain's"
+        );
+        assert!(
+            saved.strokes.same_entries(&rebuilt.strokes),
+            "the derived save point's stroke records differ from the file's"
         );
         assert_eq!(saved.head, rebuilt.head, "the derived save point's head");
     }

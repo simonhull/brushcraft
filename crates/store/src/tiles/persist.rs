@@ -168,6 +168,7 @@ impl TileStore {
             epoch_writes: BTreeSet::new(),
             epoch_keys: BTreeSet::new(),
             epoch_step: None,
+            strokes_waiting: Vec::new(),
             floor: std::collections::BTreeMap::new(),
             floor_read: std::collections::BTreeMap::new(),
             floor_top: config.floor_top,
@@ -226,6 +227,9 @@ impl TileStore {
     /// rebase, so a save that fails, or one followed by more edits, is simply made again.
     /// Nothing in the store changes: dirty slots stay dirty until the rebase, which is what
     /// makes the save's copies the saved state.
+    ///
+    /// The working file's stroke records are copied in too, in order, then those waiting for
+    /// it (which the rebase forgets); a record that doesn't read is left out.
     ///
     /// A project being saved under a new name has its old save point copied in first (see
     /// [`ProjectFile::copy_base`]); this adds the edits.
@@ -314,6 +318,7 @@ impl TileStore {
             )
             .map_err(CacheError::Save)?;
         self.save_display(project, &lost)?;
+        let strokes = self.copy_strokes(project, true, CacheError::Save)?;
         project
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::Save))?;
@@ -323,6 +328,7 @@ impl TileStore {
             stamp: self.last_write,
             lost,
             bounds: self.derived_changes(),
+            strokes,
         })
     }
 
@@ -364,6 +370,7 @@ impl TileStore {
             stamp,
             lost,
             bounds,
+            strokes,
         } = saved;
         if stamp != self.last_write || bounds != self.derived_changes() {
             return Err(CacheError::StaleSave);
@@ -411,6 +418,7 @@ impl TileStore {
         #[cfg(test)]
         self.assert_known_ops_resident();
         self.since_rebase.clear();
+        self.forget_saved_strokes(strokes);
         self.bounds.rebased();
         self.display.rebased();
         self.generation += 1;
@@ -493,7 +501,8 @@ impl TileStore {
     /// neither way, or a broken slot, is lost: listed, and left out. Then `fresh` is saved
     /// (synced, a save point, synced again). Every bound of the old working file and every bound
     /// changed since the last rebase go across too, as they are now; those a lost tile's edit could
-    /// change, as unknown.
+    /// change, as unknown. So does every stroke record of the old working file that reads; those
+    /// waiting for a flush keep waiting, for the new file's first.
     ///
     /// # Errors
     ///
@@ -580,6 +589,8 @@ impl TileStore {
             )
             .map_err(CacheError::WriteBack)?;
         self.carry_display(&mut fresh, &lost)?;
+        // Those waiting stay for the new file's first flush.
+        self.copy_strokes(&mut fresh, false, CacheError::WriteBack)?;
         fresh
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::WriteBack))?;
@@ -715,8 +726,8 @@ impl TileStore {
         self.base.as_ref()
     }
 
-    /// Writes every dirty correction tile, and every spatial-index bound the working file lacks,
-    /// to the working file and records a save point there. Returns its
+    /// Writes every dirty correction tile, every spatial-index bound the working file lacks and
+    /// every stroke record waiting to the working file and records a save point there. Returns its
     /// offset.
     ///
     /// This makes the working file hold every edit, as of a save point of its own; it doesn't
@@ -759,6 +770,7 @@ impl TileStore {
         }
         self.write_unsaved_bounds()?;
         self.write_unsaved_display()?;
+        self.flush_strokes()?;
         self.file
             .save()
             .map_err(|e| CacheError::from_save_point(e, CacheError::Store))

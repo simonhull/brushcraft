@@ -23,6 +23,7 @@ use crate::display::{DisplayRecord, StoredDisplay, display_body, display_header,
 use crate::meta::{MAX_BASE_PATH, ProjectId, Role};
 use crate::op::{MAX_SEQ, RESERVED_SITE};
 use crate::record::{HEAD, TAIL};
+use crate::stroke_record::{MAX_STROKE_SETTINGS, PenSample, PenTilt, StrokeCamera, StrokeRecord};
 use crate::test_dir::TestDir;
 use crate::{bounds, fixture};
 
@@ -364,9 +365,94 @@ fn decompression_never_panics() {
         });
 }
 
-/// A small project file at `path` with `meta`: three save points (one full Index, two deltas)
-/// of a tile each at levels 1 to 3, a known and an unknown bound, and an unsaved tile after the
-/// last save point.
+/// What generates a stroke record.
+///
+/// The op's site and sequence, the engine version, the settings, the camera's ten `f64`s and its
+/// size, then each sample's position, time, pressure, tilt amount and direction, twist and
+/// buttons.
+type StrokeParts = (
+    (u16, u64),
+    u32,
+    Vec<u8>,
+    [f64; 10],
+    [u32; 2],
+    Vec<(f64, f64, f64, f32, Option<(f32, f32)>, Option<f32>, u8)>,
+);
+
+/// The longest stroke a generator makes: enough samples for every delta and plane to matter.
+const FUZZ_SAMPLES: usize = 600;
+
+/// The stroke record `parts` describe, its samples cut at [`FUZZ_SAMPLES`].
+fn stroke_of((op, engine, settings, floats, size, samples): &StrokeParts) -> StrokeRecord {
+    let [ex, ey, ez, tx, ty, tz, ux, uy, uz, fov_y] = *floats;
+    let camera = StrokeCamera {
+        eye: [ex, ey, ez],
+        target: [tx, ty, tz],
+        up: [ux, uy, uz],
+        fov_y,
+        size: *size,
+    };
+    let settings: Vec<u8> = settings.iter().copied().take(MAX_STROKE_SETTINGS).collect();
+    let mut record = StrokeRecord::new(op_of(op.0, op.1), *engine, settings, camera).unwrap();
+    let pushed = samples.iter().take(FUZZ_SAMPLES);
+    for &(x, y, time, pressure, tilt, twist, buttons) in pushed {
+        let sample = PenSample {
+            x,
+            y,
+            time,
+            pressure,
+            tilt: tilt.map(|(amount, direction)| PenTilt { amount, direction }),
+            twist,
+            buttons,
+        };
+        record.push(&sample).unwrap();
+    }
+    record
+}
+
+/// Whether two stroke records write the same payload: equal, NaNs of the camera included, which
+/// `PartialEq` on `f64` can't say.
+fn same_record(a: &StrokeRecord, b: &StrokeRecord) -> bool {
+    a.to_payload().unwrap() == b.to_payload().unwrap()
+}
+
+/// The stroke record parser takes any bytes without panicking, and reads back what was written.
+///
+/// It is given a writer's payload with any one byte changed, and random bytes. Whatever it
+/// accepts writes a payload it reads back as the same record.
+#[test]
+fn stroke_payloads_never_panic_and_round_trip() {
+    bolero::check!()
+        .with_type::<(StrokeParts, Flip)>()
+        .for_each(|(parts, flip)| {
+            let record = stroke_of(parts);
+            let payload = record.to_payload().unwrap();
+            let back = StrokeRecord::from_payload(&payload).expect("a writer's payload reads");
+            assert!(same_record(&back, &record), "the record written");
+            assert_eq!(back.samples().len(), record.len(), "every sample");
+            if let Some(changed) = StrokeRecord::from_payload(&flipped(payload, *flip)) {
+                let again = StrokeRecord::from_payload(&changed.to_payload().unwrap())
+                    .expect("its own payload reads");
+                assert!(
+                    same_record(&again, &changed),
+                    "an accepted record's rewrite"
+                );
+            }
+        });
+    bolero::check!().for_each(|bytes: &[u8]| {
+        if let Some(record) = StrokeRecord::from_payload(bytes) {
+            let again = StrokeRecord::from_payload(&record.to_payload().unwrap())
+                .expect("its own payload reads");
+            assert!(same_record(&again, &record), "an accepted record's rewrite");
+        }
+    });
+}
+
+/// A small project file at `path` with `meta`, of every kind of record.
+///
+/// Three save points (one full Index, two deltas) of a tile each at levels 1 to 3, a known and an
+/// unknown bound, and an unsaved tile after the last save point. The first and third tiles'
+/// strokes leave records, and so does the unsaved tile's.
 fn seed_file(path: &Path, meta: Meta) {
     let mut file = ProjectFile::create(path, meta, fixture::mesh()).unwrap();
     for (seq, level) in (1..).zip(1..=3_u8) {
@@ -385,6 +471,9 @@ fn seed_file(path: &Path, meta: Meta) {
         let known = seq == 2;
         file.write_bounds(key, bound.as_ref().filter(|_| known), Stamp::ZERO)
             .unwrap();
+        if seq != 2 {
+            seed_stroke(&mut file, op_of(0, seq));
+        }
         file.save().unwrap();
     }
     // Display records, named by a save point: two known, one unknown.
@@ -408,6 +497,14 @@ fn seed_file(path: &Path, meta: Meta) {
     let key = TileKey::displacement(FaceId::new(4), Level::new(1).unwrap(), 0, 0).unwrap();
     let tile = CorrectionTile::from_values(3, &[Vec3::ZERO; 9]).unwrap();
     file.write_displacement(key, op_of(0, 4), &tile).unwrap();
+    seed_stroke(&mut file, op_of(0, 4));
+}
+
+/// Appends a short stroke record of `op` to `file`: a few samples, every field moving.
+fn seed_stroke(file: &mut ProjectFile, op: OpId) {
+    let record = crate::stroke_record::tests::wobbly(op, 12, op.seq());
+    file.append_strokes(&[frame_stroke(&record).unwrap()])
+        .unwrap();
 }
 
 /// The finest level [`small_display_tiles`] are built from.

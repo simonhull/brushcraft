@@ -10,8 +10,9 @@
 //!   [`TileStore::has_unsaved_records`] whether a flush has anything to do.
 //! - A flush starts with [`TileStore::open_cut`] and notes [`TileStore::generation`], which every
 //!   rebase moves on: a flush that sees it change is abandoned. [`TileStore::snapshot_dirty`] then
-//!   copies the dirty slots, with no encoding or I/O, and [`TileStore::flush_bounds`] appends the
-//!   bounds of the same state at the same cut.
+//!   copies the dirty slots, with no encoding or I/O, [`TileStore::flush_bounds`] appends the
+//!   bounds of the same state at the same cut, and [`TileStore::flush_strokes`] the records of the
+//!   strokes ended by then.
 //! - With the copies encoded, the tiles left out are dealt with (see [`super::bounds`]; a lost one
 //!   leaves the flush mark through [`TileStore::drop_from_stream`]), and
 //!   [`TileStore::append_streamed`] appends the rest.
@@ -50,12 +51,14 @@ impl TileStore {
     }
 
     /// Whether streaming consumer `id` has edits to flush: keys pushed to the feed since its last
-    /// snapshot, or keys of its flush mark still unconfirmed; or bounds the working file lacks.
+    /// snapshot, or keys of its flush mark still unconfirmed; or bounds the working file lacks;
+    /// or stroke records waiting for it.
     pub(crate) fn has_unflushed(&self, id: ConsumerId) -> bool {
         self.feed.has_pending(id)
             || self.streams.get(&id).is_some_and(|mark| !mark.is_empty())
             || self.bounds.has_unflushed()
             || self.display.has_unflushed()
+            || self.has_waiting_strokes()
     }
 
     /// Copies, for streaming consumer `id`, every correction slot whose latest edit isn't in the

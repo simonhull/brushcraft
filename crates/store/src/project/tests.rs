@@ -8,6 +8,7 @@ mod bounds;
 mod crash;
 mod hostile;
 mod restore;
+mod strokes;
 
 use geom::{CorrectionMap, Level, Region, TileKey, Vec3};
 

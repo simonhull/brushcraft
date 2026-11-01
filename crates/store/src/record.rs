@@ -20,6 +20,11 @@ pub(crate) const KIND_MESH: u8 = 4;
 /// A bounds record: one tile's bounds for the spatial index, or that they are unknown (see
 /// `bounds`).
 pub(crate) const KIND_BOUNDS: u8 = 5;
+/// A stroke record: a stroke's samples, settings and camera, kept beside its edits.
+///
+/// Never read on open (see `stroke_record`). No Index names one: a save point holds every stroke
+/// record before it in the file.
+pub(crate) const KIND_STROKE: u8 = 6;
 
 /// A record's head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
