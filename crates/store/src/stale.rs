@@ -48,7 +48,8 @@ pub enum EpochKind {
     /// tiles it names had only their bound raised
     /// ([`TileStore::bump_display_error`](crate::TileStore::bump_display_error)).
     Step {
-        /// A bound on how far the steps moved any finest vertex.
+        /// A bound on how far the steps moved any finest vertex: finite, saturated at
+        /// `f32::MAX` where the steps' displacements summed past it.
         displacement: f32,
     },
     /// A refresh: the display tiles it names were rebuilt from the finest level as it is.

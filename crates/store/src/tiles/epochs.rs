@@ -106,15 +106,18 @@ impl TileStore {
     /// Notes a brush step's bump for the open epoch, while a consumer listens: it moved no finest
     /// vertex farther than `displacement`, with writes to the `edited` tiles. An epoch of
     /// several steps (a frame of dabs) sums them, rounded up: each moved a vertex after the
-    /// last.
+    /// last. A sum that isn't finite saturates at `f32::MAX`.
     pub(super) fn note_step(&mut self, edited: &BTreeSet<TileKey>, displacement: f32) {
         if self.stale.is_listened() {
             let (sum, covered) = self.epoch_step.get_or_insert_with(Default::default);
-            *sum = if *sum == 0.0 {
+            let total = if *sum == 0.0 {
                 displacement
             } else {
                 (*sum + displacement).next_up()
             };
+            // A sum past the largest finite value (or of one that isn't finite) saturates there:
+            // still a bound, and one a reader can take.
+            *sum = if total.is_finite() { total } else { f32::MAX };
             covered.extend(edited.iter().copied());
         }
     }
