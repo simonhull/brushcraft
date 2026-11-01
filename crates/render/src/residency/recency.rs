@@ -103,24 +103,20 @@ impl Recency {
         for key in &walk.forgotten {
             self.unheld.remove(key);
         }
+        // A tile taken keeps its entry's frame: held, it is never used, and it is set when the
+        // tile is released.
         for key in walk.taken {
             let class = class_of(&key);
-            let Some(entry) = entries.get_mut(&key) else {
+            let Some(entry) = entries.get(&key).filter(|entry| !entry.floor) else {
                 self.unheld.insert(key);
                 continue;
             };
-            if entry.floor {
-                entry.last_drawn = frame;
-                self.unheld.insert(key);
-                continue;
-            }
             if let Some(stamped) = self.stamped.get_mut(class) {
                 stamped.remove(&(entry.last_drawn, key));
             }
             if let Some(held) = self.held.get_mut(class) {
                 held.insert(key);
             }
-            entry.last_drawn = frame;
         }
         self.held_at = frame;
     }
@@ -202,26 +198,8 @@ mod tests {
     use geom::{FaceId, Level};
 
     use super::*;
+    use crate::cull::tests::Rng;
     use crate::residency::Slot;
-
-    /// A small deterministic generator (splitmix64).
-    struct Rng(u64);
-
-    impl Rng {
-        /// The next 64 random bits.
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        /// A random index below `n` (`n > 0`).
-        fn below(&mut self, n: usize) -> usize {
-            usize::try_from(self.next() % n as u64).expect("below n")
-        }
-    }
 
     /// The tiles of the tests: two faces, levels 3 to 8 (four classes), a few of each; the floor
     /// is levels 3 and 4.
@@ -279,6 +257,8 @@ mod tests {
         let mut reference: BTreeMap<TileKey, u64> = BTreeMap::new();
         let mut drawn: BTreeSet<TileKey> = BTreeSet::new();
         let mut frame = 0;
+        // The last tile outside the floor to leave, with its frame.
+        let mut gone: Option<(u64, TileKey)> = None;
         for step in 0..20_000 {
             match rng.below(10) {
                 // A new frame.
@@ -299,7 +279,8 @@ mod tests {
                     let key = keys[rng.below(keys.len())];
                     if let Some(entry) = entries.remove(&key) {
                         recency.left(&key, entry.last_drawn);
-                        reference.remove(&key);
+                        // As an evicted victim: where a scan resumes from, no longer there.
+                        gone = reference.remove(&key).map(|last| (last, key)).or(gone);
                     }
                 }
                 // A frame's use: mostly the last one's drawn tiles, some gone, some new, resident
@@ -324,8 +305,14 @@ mod tests {
                 let kept: Vec<(u64, TileKey)> = recency.oldest(class, None).collect();
                 let scratch = from_scratch(&reference, class);
                 assert_eq!(kept, scratch, "step {step}: class {class}'s order");
-                // From any tile on, as an eviction's scan resumes.
-                if let Some(&after) = scratch.get(rng.below(scratch.len().max(1))) {
+                // As an eviction's scan resumes: from a tile still in the order, from the last
+                // to leave, and from any tile of the universe at a recent frame (the latest
+                // use's often), there or not.
+                let present = scratch.get(rng.below(scratch.len().max(1))).copied();
+                let stamp = frame.saturating_sub(rng.next() % 3);
+                let any = (stamp, keys[rng.below(keys.len())]);
+                let resumes = [present, gone, Some(any)];
+                for after in resumes.into_iter().flatten() {
                     let rest: Vec<(u64, TileKey)> = recency.oldest(class, Some(after)).collect();
                     let past = scratch.iter().filter(|&&tile| tile > after);
                     let past: Vec<(u64, TileKey)> = past.copied().collect();

@@ -587,7 +587,8 @@ impl Shield {
     /// The places above the tiles of `cut` and `drawn`.
     fn of(cut: &BTreeSet<TileKey>, drawn: &BTreeSet<TileKey>) -> Self {
         let mut places = BTreeSet::new();
-        for key in cut.iter().chain(drawn) {
+        let below = cut.iter().chain(drawn);
+        for key in below {
             let mut above = Place::of(key).parent();
             while let Some(place) = above {
                 // Already in: so are all its ancestors.
@@ -702,7 +703,7 @@ struct Entry {
     /// Its slot.
     slot: Slot,
     /// The frame it was last drawn in (or arrived in), for a tile outside the floor (the
-    /// floor's is never read). While the latest use holds it as drawn ([`Recency`]), that use's
+    /// floor's is never used). While the latest use holds it as drawn ([`Recency`]), that use's
     /// frame is its own instead, and it is set here when the tile stops being held.
     last_drawn: u64,
     /// Whether it is part of the floor.
