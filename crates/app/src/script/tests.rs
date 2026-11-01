@@ -178,7 +178,7 @@ fn the_strokes_path_closes_in_draws_backs_off_and_draws_again() {
     assert!(close(script.at(at(9.0)).pose, FAR), "far for the second");
     assert_eq!(
         Script::benchmark(Speed::ONE).pen(at(0.0), at(30.0)),
-        Vec::new(),
+        &[],
         "no pen on the benchmark path"
     );
     for (text, path) in [
@@ -195,8 +195,8 @@ fn a_scripted_pen_hovers_touches_drags_lifts_and_leaves_at_its_rate() {
     let script = Script::strokes(Speed::ONE);
     let all = script.pen(at(0.0), at(20.0));
     // Cut anywhere, the same samples.
-    let mut halves = script.pen(at(0.0), at(5.37));
-    halves.extend(script.pen(at(5.37), at(20.0)));
+    let mut halves = script.pen(at(0.0), at(5.37)).to_vec();
+    halves.extend_from_slice(script.pen(at(5.37), at(20.0)));
     assert_eq!(all, halves, "the same samples however the run is cut");
     let near: Vec<&ScriptPen> = all.iter().filter(|s| s.time < at(7.0)).collect();
     let phases: Vec<Phase> = near.iter().map(|s| s.phase).collect();
@@ -229,7 +229,7 @@ fn a_scripted_pen_hovers_touches_drags_lifts_and_leaves_at_its_rate() {
     assert!(pressing.all(|p| (0.34..=0.81).contains(&p)), "pressed");
     assert!(near[up].pressure.get() == 0.0 && near[0].pressure.get() == 0.0);
     // Each point lies on the unit sphere, on the side facing the camera.
-    for sample in &all {
+    for sample in all {
         let p = sample.point;
         assert!((p.length() - 1.0).abs() < 1e-9, "{p:?}");
         let eye = sample.camera.eye();

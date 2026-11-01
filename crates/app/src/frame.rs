@@ -65,6 +65,7 @@
 
 pub(crate) mod schedule;
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -552,9 +553,10 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     recorder: Option<Recorder>,
     /// The record's setting, if the run is recorded.
     run_info: Option<RunInfo>,
-    /// The frame with the render thread and the oldest pen sample whose dabs it applied, until
-    /// it is shown: its latency is measured then.
-    latency_from: Option<(u64, SampleTimes)>,
+    /// The frames not shown yet that applied dabs, by number, each with the oldest pen sample
+    /// whose dabs it applied: a frame's latency is measured as it is shown. Frames shown (or
+    /// lost) leave it, so it holds the few in flight.
+    latency_from: BTreeMap<u64, SampleTimes>,
     /// The last frame's pen latency, sample to present submitted, for the overlay; `None` until
     /// a frame applies dabs.
     latency: Option<Duration>,
@@ -720,7 +722,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             script: setup.script,
             script_over: false,
             run_info,
-            latency_from: None,
+            latency_from: BTreeMap::new(),
             latency: None,
             script_pen: Duration::ZERO,
             stroking: Stroking::default(),
@@ -1160,7 +1162,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         {
             picker.surface_changed();
         }
-        self.latency_from = report.oldest.map(|oldest| (self.started, oldest));
+        if let Some(oldest) = report.oldest {
+            self.latency_from.insert(self.started, oldest);
+        }
         Ok(report)
     }
 
@@ -1206,7 +1210,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.camera = moment.pose.camera();
         self.input.clear();
         self.script_over |= moment.over;
-        let projected = due.into_iter().filter_map(|sample| {
+        let projected = due.iter().copied().filter_map(|sample| {
             let view = sample.camera.view(size)?;
             let (x, y, _) = view.pixel(sample.point)?;
             Some((sample, Pixel { x, y }))
@@ -1382,10 +1386,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// The render thread finished a frame.
     pub(crate) fn shown(&mut self, mut presented: Presented) {
         let gpu = std::mem::take(&mut presented.gpu);
+        // Frames are reported in order: any before this one still kept were lost.
+        self.latency_from = self.latency_from.split_off(&presented.number);
         let latency = self
             .latency_from
-            .take_if(|(frame, _)| *frame == presented.number)
-            .map(|(_, oldest)| Latency {
+            .remove(&presented.number)
+            .map(|oldest| Latency {
                 taken: presented.submitted.saturating_duration_since(oldest.taken),
                 received: presented
                     .submitted

@@ -448,6 +448,8 @@ pub(crate) struct Script {
     speed: Speed,
     /// The pen's strokes, in order; none on the benchmark path.
     strokes: Vec<PenStroke>,
+    /// Every sample of the pen's strokes, in order of time: made once, as the script is.
+    pen: Vec<ScriptPen>,
 }
 
 impl Script {
@@ -466,17 +468,21 @@ impl Script {
             keyframes: BENCHMARK.to_vec(),
             speed,
             strokes: Vec::new(),
+            pen: Vec::new(),
         }
     }
 
     /// The strokes path (the module notes), run at `speed`.
     pub(crate) fn strokes(speed: Speed) -> Self {
-        Self {
+        let mut script = Self {
             start: START,
             keyframes: STROKES.to_vec(),
             speed,
             strokes: PEN_STROKES.to_vec(),
-        }
+            pen: Vec::new(),
+        };
+        script.pen = script.every_pen_sample();
+        script
     }
 
     /// The scripted pen's samples taken after `from` and up to `to` into the run, in order (see
@@ -486,15 +492,20 @@ impl Script {
     /// is the pen entering range (with the stroke's brush radius), those before the stroke's
     /// touch hover, the first at or after it is the `Down`, then `Drag`s, then an `Up` at the
     /// lift, and a `Leave` [`LEAVE_AFTER`] later.
-    pub(crate) fn pen(&self, from: Duration, to: Duration) -> Vec<ScriptPen> {
-        let wanted = |&(time, _): &(f64, Phase)| {
-            let time = Duration::from_secs_f64(time);
-            time > from && time <= to
-        };
+    ///
+    /// The samples are made once, as the script is; this only finds them.
+    pub(crate) fn pen(&self, from: Duration, to: Duration) -> &[ScriptPen] {
+        let start = self.pen.partition_point(|sample| sample.time <= from);
+        let end = self.pen.partition_point(|sample| sample.time <= to);
+        self.pen.get(start..end.max(start)).unwrap_or_default()
+    }
+
+    /// Every sample of the pen's strokes, in order of time (the strokes are in order, and don't
+    /// overlap).
+    fn every_pen_sample(&self) -> Vec<ScriptPen> {
         let samples = self.strokes.iter().flat_map(|stroke| {
             self.stroke_samples(stroke)
                 .into_iter()
-                .filter(wanted)
                 .map(move |(time, phase)| self.sample(stroke, time, phase))
         });
         samples.collect()
