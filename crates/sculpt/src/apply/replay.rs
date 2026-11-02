@@ -174,10 +174,11 @@ impl TileInput<'_> {
     /// Vertex `(i, j)`'s tangent frame: the prediction's, else the frames listed; `None` for a
     /// vertex neither holds (never, for a tile and prediction of the same side).
     fn frame(&self, i: u32, j: u32) -> Option<Frame> {
-        if let Some(prediction) = self.prediction {
-            return prediction.frame(i, j);
-        }
-        self.frames?.get(at(self.key.side(), i, j)).copied()
+        let frames = match self.prediction {
+            Some(prediction) => prediction.frames(),
+            None => self.frames?,
+        };
+        frames.get(at(self.key.side(), i, j)).copied()
     }
 }
 
