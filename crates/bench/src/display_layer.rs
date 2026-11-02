@@ -312,7 +312,7 @@ fn refresh_stroke<J: Write, H: Write>(
     let (mut steps, mut refreshes, mut built) = (Vec::new(), Vec::new(), Vec::new());
     let (mut longest, mut slices, mut long_slices) = (Duration::ZERO, 0, 0);
     for &centre in &plan.centres {
-        let params = DrawParams::new(centre, plan.radius, options.strength)?;
+        let params = DrawParams::new(centre, centre, plan.radius, options.strength)?;
         let start = Instant::now();
         draw_step(project.store(), index, &mut state, params)?;
         steps.push(start.elapsed());
@@ -359,7 +359,7 @@ fn refresh_stroke<J: Write, H: Write>(
     // costs, the tiles the steps share built once.
     project.begin_stroke()?;
     for &centre in &plan.centres {
-        let params = DrawParams::new(centre, plan.radius, options.strength)?;
+        let params = DrawParams::new(centre, centre, plan.radius, options.strength)?;
         draw_step(project.store(), index, &mut state, params)?;
     }
     project.end_unrecorded_stroke()?;
@@ -410,7 +410,7 @@ fn paced_stroke<J: Write, H: Write>(
     project.begin_stroke()?;
     for &centre in &plan.centres {
         let due = Instant::now() + period;
-        let params = DrawParams::new(centre, plan.radius, options.strength)?;
+        let params = DrawParams::new(centre, centre, plan.radius, options.strength)?;
         draw_step(project.store(), index, state, params)?;
         if Instant::now() > due {
             late += 1;

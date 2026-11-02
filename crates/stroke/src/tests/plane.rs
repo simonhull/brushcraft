@@ -39,4 +39,9 @@ impl Surface for Plane {
     fn continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> bool {
         a.position.distance(b.position) <= reach
     }
+
+    fn area_normal(&mut self, _center: DVec3, radius: f64, _hardness: f32) -> Option<DVec3> {
+        // Every normal is +Z; the sum's length (the falloff's integral) doesn't matter here.
+        Some(DVec3::Z * radius)
+    }
 }

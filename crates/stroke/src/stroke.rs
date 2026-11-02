@@ -143,7 +143,7 @@ impl Stroke {
         };
         self.placer
             .walk(projector, surface, &segment, &mut self.placed);
-        self.placer.tail(&segment, &mut self.placed);
+        self.placer.tail(surface, &segment, &mut self.placed);
         self.expand();
         self.dabs.into_iter()
     }

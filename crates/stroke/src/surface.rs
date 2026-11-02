@@ -124,6 +124,16 @@ pub trait Surface {
     /// (world units): connected through the surface itself, not just close in space. Two faces of
     /// a thin slab are close, but not connected nearby.
     fn continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> bool;
+
+    /// The sum of the surface's normals inside the sphere of `radius` around `center` (a dab's),
+    /// each weighted by the dab's falloff at its distance, made as hard as `hardness`: the
+    /// dab's area normal before it is normalised. `None` if the implementation has none to give
+    /// (an error, kept as for the other methods); a sum of zero, or one that isn't finite, is
+    /// degenerate too. Placement normalises it, and takes the hit's normal where it can't.
+    ///
+    /// The falloff is the action's (the implementation applies it); each vertex of the surface
+    /// counts once, however many of its pieces hold it. Deterministic, as every method is.
+    fn area_normal(&mut self, center: DVec3, radius: f64, hardness: f32) -> Option<DVec3>;
 }
 
 #[cfg(test)]

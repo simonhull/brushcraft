@@ -13,7 +13,9 @@ use crate::ACTION_SLOTS;
 pub struct Dab {
     /// The centre, in world space.
     pub position: [f32; 3],
-    /// The surface normal at the centre: unit length, pointing out of the surface.
+    /// The dab's area normal: the surface's normals inside its sphere, weighted by its falloff,
+    /// summed and normalised as it was placed (the surface normal at the centre where that sum is
+    /// degenerate). Unit length, pointing out of the surface; draw moves every vertex along it.
     pub normal: [f32; 3],
     /// The stroke's direction along the surface at the centre: unit length, perpendicular to the
     /// normal. With the normal and their cross product, the dab's local frame.

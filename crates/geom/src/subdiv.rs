@@ -161,14 +161,6 @@ impl CornerRing {
         self.diagonals.get(..self.valence).unwrap_or_default()
     }
 
-    /// Every point of the ring, the centre first, then the edge and the diagonal neighbours.
-    pub(crate) fn points(&self) -> impl Iterator<Item = &Vec3> {
-        let valence = self.valence;
-        let edges = self.edges.iter().take(valence);
-        let diagonals = self.diagonals.iter().take(valence);
-        std::iter::once(&self.center).chain(edges).chain(diagonals)
-    }
-
     /// Every point of the ring, the centre first, then the edge and the diagonal neighbours,
     /// writable.
     pub(crate) fn points_mut(&mut self) -> impl Iterator<Item = &mut Vec3> {

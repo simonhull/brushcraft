@@ -216,13 +216,15 @@ fn previews_meet_at_their_seams_and_move_points_by_the_draw_action_along_the_dab
         .collect();
     let mut preview = Preview::new();
     // Points by hand: the first dab's centre is face 0's first vertex; every vertex near it moves
-    // by the draw action's amount along its own frame normal, as the finest work moves it, not
-    // along the dab's normal.
+    // by the draw action's amount along the dab's normal, one direction for every vertex, as the
+    // finest work moves it, and not along the vertex's own frame normal.
     let first = dabs[0];
     preview.show(store, &mut index, &[first]).unwrap();
     let corner = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
-    let frames = store.frame_normals_many(&[corner]).unwrap().remove(0);
+    let frames = store.frames_many(&[corner]).unwrap().remove(0);
     let imprint = crate::apply::imprint_of(&first).unwrap();
+    let [nx, ny, nz] = imprint.normal;
+    let normal = Vec3::new(nx, ny, nz);
     let side = corner.side();
     let mut off_the_dab = 0;
     for (i, j) in [(0, 0), (5, 3), (2, 9), (11, 1)] {
@@ -234,7 +236,7 @@ fn previews_meet_at_their_seams_and_move_points_by_the_draw_action_along_the_dab
             [stored.x, stored.y, stored.z],
         )
         .unwrap();
-        let want = stored + frames[at] * w;
+        let want = stored + normal * w;
         let got = store
             .preview(&corner)
             .expect("previewed")
@@ -244,8 +246,7 @@ fn previews_meet_at_their_seams_and_move_points_by_the_draw_action_along_the_dab
             want.to_bits(),
             "({i}, {j}) moved as finest work"
         );
-        let [nx, ny, nz] = first.normal;
-        if frames[at].to_bits() != Vec3::new(nx, ny, nz).to_bits() {
+        if frames[at].n().to_bits() != normal.to_bits() {
             off_the_dab += 1;
         }
     }
@@ -502,5 +503,44 @@ fn a_preview_no_new_dab_moves_goes_back_as_it_was_and_is_not_sent_again() {
         }
     }
     store.unsubscribe_stale(cursor);
+    drop(project.close(false));
+}
+
+#[test]
+fn normals_made_together_are_the_surfaces_normals_previewed_or_not() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "normals");
+    let dabs = path(project.store(), 4);
+    let store = project.store();
+    let mut preview = Preview::new();
+    preview.show(store, &mut index, &dabs).unwrap();
+    let keys = finest_tiles(store);
+    let previewed = keys
+        .iter()
+        .filter(|key| store.preview(key).is_some())
+        .count();
+    assert!(
+        previewed > 0 && previewed < keys.len(),
+        "a mix: {previewed} previewed"
+    );
+    store.prepare_surface_normals(&keys).unwrap();
+    let together: Vec<Vec<[u32; 3]>> = keys
+        .iter()
+        .map(|key| {
+            let normals = store.cached_surface_normals(key).expect("made together");
+            normals.iter().map(|n| n.to_bits()).collect()
+        })
+        .collect();
+    let pairs = keys.iter().zip(&together);
+    for (&key, made) in pairs {
+        let one: Vec<[u32; 3]> = store
+            .surface_normals(key)
+            .unwrap()
+            .iter()
+            .map(|n| n.to_bits())
+            .collect();
+        assert_eq!(&one, made, "{key:?}: the bits read one at a time");
+    }
     drop(project.close(false));
 }

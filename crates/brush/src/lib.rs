@@ -11,7 +11,9 @@
 //! M0 has one brush, [`draw`](fn@draw), with a [`Smoothstep`] falloff: enough to measure edit
 //! latency. [`draw_vertex`] is its step for one vertex. A placed dab reaches an action as an
 //! [`Imprint`]: [`draw_imprint`] and [`draw_imprint_vertex`] are the draw brush for one, its
-//! falloff [`Hardened`] by the dab's hardness.
+//! falloff [`Hardened`] by the dab's hardness, and [`draw_move`] ([`draw_imprint_move`]) turns a
+//! vertex's displacement into its move, along the imprint's normal (the dab's area normal), one
+//! direction for every vertex.
 
 #![no_std]
 
@@ -22,4 +24,6 @@ mod math;
 
 pub use draw::{draw, draw_vertex};
 pub use falloff::{Falloff, Smoothstep};
-pub use imprint::{Hardened, Imprint, draw_imprint, draw_imprint_vertex};
+pub use imprint::{
+    Hardened, Imprint, draw_imprint, draw_imprint_move, draw_imprint_vertex, draw_move,
+};

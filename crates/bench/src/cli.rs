@@ -399,7 +399,8 @@ pub(crate) struct Options {
     /// `brush`: apply the stroke's dabs this many to a call of `sculpt::apply_dabs` (`--dabs`),
     /// or `None` for a `sculpt::draw_step` each, the path the history measures.
     pub(crate) dabs: Option<usize>,
-    /// How far the draw brush pushes at its centre, along the frame normal.
+    /// How far the draw brush pushes at its centre, along the dab's normal (outward from the
+    /// sphere's centre here, a stand-in for the area normal).
     pub(crate) strength: f32,
     /// `budget`: places the walk pans to.
     pub(crate) moves: usize,

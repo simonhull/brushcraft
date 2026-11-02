@@ -48,6 +48,20 @@
 //! one quad, which the stroke engine allows ("approximate, but deterministic"). If `near`'s
 //! nearest corner lies out of reach (a reach under a quad), `near` itself is the answer.
 //!
+//! # Area normals
+//!
+//! [`Surface::area_normal`] sums the stroke's surface's normals ([`TileStore::surface_normals`],
+//! a preview's own where one is shown) at every vertex inside the dab's sphere, each weighted by
+//! the draw action's falloff at its distance, made as hard as the dab
+//! ([`brush::draw_imprint_vertex`] at unit strength: the weight the action gives the vertex). The
+//! tiles are those whose boxes in the index touch the sphere; each vertex counts once, in the tile
+//! that owns it ([`geom::Topology::owns`]). The normals are made together first
+//! ([`TileStore::prepare_surface_normals`]: a preview's change with every dab shown, so most are
+//! made afresh, on the store's workers); then each tile's part is summed row by row, a tile each
+//! on the workers, and the parts are added in key order, all in `f64`. So the same surface and dab
+//! give the same bits at any worker count. Placement normalises the sum, and takes the hit's
+//! normal where it is zero or not finite.
+//!
 //! # Errors
 //!
 //! The [`Surface`] methods can't fail. A store or index error is kept, the method answers `None`
@@ -79,12 +93,16 @@
 //! labelling the tiles the ball's edge cuts, a few microseconds each; cold, it is evaluating the
 //! region's tiles, nine times a dab's footprint, which the prefetch spreads over the workers.
 
+use std::collections::BTreeSet;
+
+use brush::{Imprint, Smoothstep, draw_imprint_vertex};
 use geom::{Channel, LayerId, Region, TileKey, Topology, Vec3};
 use store::{CacheError, Evaluation, SpatialIndex, TileStore, TriangleHit};
 use stroke::{DVec3, Hit, Ray, Surface};
 
 use self::region::{Ball, Source, Vertex, Walked, distance_squared, walk};
 use crate::SculptError;
+use crate::apply::vertices;
 
 mod region;
 
@@ -406,6 +424,65 @@ impl<'a> StoreSurface<'a> {
         gap * gap
     }
 
+    /// [`Surface::area_normal`], its errors returned: the stroke's surface's normals inside the
+    /// dab's sphere, each weighted by the draw action's falloff there, summed in `f64` (see
+    /// "Area normals" in the module notes).
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::surface_normals`] and [`TileStore::surface_positions`].
+    fn try_area_normal(
+        &mut self,
+        center: DVec3,
+        radius: f64,
+        hardness: f32,
+    ) -> Result<Option<DVec3>, SculptError> {
+        let Some(imprint) = weighing(center, radius, hardness) else {
+            return Ok(None);
+        };
+        let keys: BTreeSet<TileKey> = self
+            .index
+            .query_sphere(centre_of(&imprint), area_reach(&imprint))
+            .collect();
+        let keys: Vec<TileKey> = keys.into_iter().collect();
+        self.store.prepare_surface_normals(&keys)?;
+        // Each tile's positions first, on this thread: a preview's are made from its block on
+        // first read.
+        for &key in &keys {
+            self.store.surface_positions(key)?;
+        }
+        let store = &*self.store;
+        let at_hand: Vec<Option<SurfaceTile<'_>>> = keys
+            .iter()
+            .map(|key| {
+                let positions = store.cached_surface_positions(key)?;
+                let normals = store.cached_surface_normals(key)?;
+                Some((*key, positions, normals))
+            })
+            .collect();
+        let topology = store.mesh().topology();
+        let sums: Vec<Option<DVec3>> = store.par_map(&at_hand, |tile| {
+            tile.map(|(key, positions, normals)| {
+                tile_area_sum(topology, key, positions, normals, &imprint)
+            })
+        });
+        let mut sum = DVec3::ZERO;
+        let tiles = keys.iter().zip(sums);
+        for (&key, tile) in tiles {
+            let part = if let Some(part) = tile {
+                part
+            } else {
+                // Pushed out of the cache before it was read: on its own.
+                let normals = self.store.surface_normals(key)?.to_vec();
+                let positions = self.store.surface_positions(key)?.to_vec();
+                let mesh = self.store.mesh();
+                tile_area_sum(mesh.topology(), key, &positions, &normals, &imprint)
+            };
+            sum = sum + part;
+        }
+        Ok(Some(sum))
+    }
+
     /// [`Surface::continuous`], its errors returned.
     ///
     /// # Errors
@@ -444,6 +521,74 @@ impl Surface for StoreSurface<'_> {
         let joined = self.try_continuous(a, b, reach);
         self.keep(joined).unwrap_or(false)
     }
+
+    fn area_normal(&mut self, center: DVec3, radius: f64, hardness: f32) -> Option<DVec3> {
+        if self.error.is_some() {
+            return None;
+        }
+        let sum = self.try_area_normal(center, radius, hardness);
+        self.keep(sum).flatten()
+    }
+}
+
+/// A tile of the stroke's surface as an area normal reads it: its key, positions and normals.
+type SurfaceTile<'a> = (TileKey, &'a [Vec3], &'a [Vec3]);
+
+/// Tile `key`'s part of an area normal's sum for `imprint` (see "Area normals" in the module
+/// notes).
+///
+/// Its own vertices' `normals` (those it owns, [`Topology::owns`]), each weighted by `imprint`'s
+/// displacement at its position in `positions`, summed row by row in `f64`.
+fn tile_area_sum(
+    topology: &Topology,
+    key: TileKey,
+    positions: &[Vec3],
+    normals: &[Vec3],
+    imprint: &Imprint,
+) -> DVec3 {
+    let owned = vertices(key.side())
+        .zip(positions.iter().zip(normals))
+        .filter(|&((i, j), _)| topology.owns(&key, i, j));
+    owned.fold(DVec3::ZERO, |sum, (_, (p, n))| {
+        match draw_imprint_vertex(&Smoothstep, imprint, [p.x, p.y, p.z]) {
+            Some(w) => sum + DVec3::from_f32(*n) * f64::from(w),
+            None => sum,
+        }
+    })
+}
+
+/// The imprint whose draw weights the normals of a dab at `center` of `radius` and `hardness`.
+///
+/// Of unit strength, so its displacement at a vertex is the falloff's weight there. `None` for a
+/// dab that covers nothing (a radius that isn't positive and finite in `f32`, a centre that isn't
+/// finite).
+fn weighing(center: DVec3, radius: f64, hardness: f32) -> Option<Imprint> {
+    let centre = center.to_f32();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a dab's radius is f32: the same rounding as the dab's own"
+    )]
+    let radius = radius as f32;
+    (centre.is_finite() && radius > 0.0 && radius.is_finite()).then(|| {
+        Imprint::new(
+            [centre.x, centre.y, centre.z],
+            [0.0, 0.0, 1.0],
+            radius,
+            1.0,
+            hardness,
+            [0.0; 4],
+        )
+    })
+}
+
+/// How far the index is queried around `imprint`'s centre for its area normal.
+///
+/// Its radius, rounded well up, so a vertex the falloff finds inside (on its squared distance in
+/// `f32`) is never in a tile whose box the query misses.
+fn area_reach(imprint: &Imprint) -> f32 {
+    let [x, y, z] = imprint.center;
+    let size = 1.0 + x.abs().max(y.abs()).max(z.abs());
+    imprint.radius * 1.001 + 1e-6 * size
 }
 
 /// The store and index as the region walk reads them.
@@ -484,6 +629,12 @@ impl Source for Reader<'_> {
         let mut corners = corners;
         corners.all(|corner| distance_squared(corner, center) <= reach_squared)
     }
+}
+
+/// `imprint`'s centre as a vector.
+const fn centre_of(imprint: &Imprint) -> Vec3 {
+    let [x, y, z] = imprint.center;
+    Vec3::new(x, y, z)
 }
 
 /// The row-major indices of `triangle`'s corners in its tile, in the test's order: the corner,

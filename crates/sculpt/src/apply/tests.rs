@@ -11,6 +11,8 @@ use crate::draw::{DrawParams, DrawParamsError, draw_step};
 use crate::state::Stroke;
 use crate::testing::{TestDir, TileBits, cube, dab, fixed, snapshot, vertex};
 
+mod folds;
+
 /// The level the tests edit: 128 quads a face, four tiles of 64.
 fn level() -> Level {
     Level::new(7).unwrap()
@@ -337,8 +339,9 @@ fn stepped(dabs: &[Dab]) -> std::collections::BTreeMap<TileKey, TileBits> {
     let mut state = Stroke::new(project.store());
     project.begin_stroke().unwrap();
     for d in dabs {
-        let [x, y, z] = d.position;
-        let params = DrawParams::new(Vec3::new(x, y, z), d.radius, d.strength).unwrap();
+        let ([x, y, z], [nx, ny, nz]) = (d.position, d.normal);
+        let (centre, normal) = (Vec3::new(x, y, z), Vec3::new(nx, ny, nz));
+        let params = DrawParams::new(centre, normal, d.radius, d.strength).unwrap();
         draw_step(project.store(), &mut index, &mut state, params).unwrap();
     }
     project.end_unrecorded_stroke().unwrap();

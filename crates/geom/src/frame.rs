@@ -28,8 +28,10 @@ impl Frame {
         n: Vec3::new(0.0, 0.0, 1.0),
     };
     /// A frame whose every component is NaN: what non-finite inputs give, so a bug upstream shows
-    /// up in the output instead of being hidden behind [`Frame::FALLBACK`].
-    const NAN: Self = Self {
+    /// up in the output instead of being hidden behind the fallback frame used where the surface
+    /// is degenerate; and what a caller listing frames can stand in for one it lacks, for the same
+    /// reason.
+    pub const NAN: Self = Self {
         t: Vec3::NAN,
         b: Vec3::NAN,
         n: Vec3::NAN,

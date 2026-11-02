@@ -1,9 +1,11 @@
 //! The draw step against `geom`'s dense evaluation of the same edits, bit for bit.
 //!
 //! The oracle doesn't go through tiles at all: it evaluates every face of the mesh in full,
-//! finds the deltas face by face, and writes them through a [`CorrectionMap`], which keeps twins
-//! in step on its own. Its deltas come from the same brush function (so they match bit for bit),
-//! and are checked against the smoothstep formula evaluated directly, in `f64`.
+//! predicts each face whole for its frames, finds the deltas face by face, and writes them through
+//! a [`CorrectionMap`], which keeps twins in step on its own. Its displacements come from the same
+//! brush function and its deltas from the same projection into each vertex's frame (so they match
+//! bit for bit), and the displacements are checked against the smoothstep formula evaluated
+//! directly, in `f64`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -13,12 +15,12 @@ use std::time::Duration;
 use brush::Smoothstep;
 use geom::{
     BaseMesh, Channel, CorrectionMap, DenseEvaluation, FaceId, LayerId, Level, PositionSource,
-    Region, TileKey, cube_sphere, normals,
+    Region, TileKey, cube_sphere, normals, predict_region,
 };
 use store::{Project, ProjectConfig, StoreConfig, Workers};
 
 use super::*;
-use crate::apply::{brush_evicted, brush_tile, vertices};
+use crate::apply::{brush_evicted, brush_tile, frame_delta, vertices};
 
 /// Exactly `n` evaluation workers.
 ///
@@ -104,18 +106,19 @@ fn formula(p: Vec3, params: DrawParams) -> Option<f64> {
 /// The oracle's stroke state, as [`Stroke`] keeps it.
 ///
 /// For each vertex the stroke has written, keyed by its least copy `(face, tx, ty, i, j)`: the
-/// correction `z` it first found and the sum of its deltas. The oracle tests stay within the
-/// default capacity, so no tile is ever released and the oracle doesn't model releases.
-type OracleStroke = BTreeMap<(FaceId, u16, u16, u32, u32), (f32, f32)>;
+/// value its correction is being built to, the correction it first found plus every delta since.
+/// The oracle tests stay within the default capacity, so no tile is ever released and the oracle
+/// doesn't model releases.
+type OracleStroke = BTreeMap<(FaceId, u16, u16, u32, u32), Vec3>;
 
 /// One step of the oracle, written into `map`, as part of the stroke `stroke` holds the state
 /// of; returns the vertices moved.
 ///
-/// Evaluates `map` densely at `level`, finds each vertex's delta, checks it against [`formula`],
-/// and writes the vertex's correction in `map` once per vertex (a vertex on a face edge is in the
-/// grids of every face sharing it), as the store's stroke does: its `z` becomes the value the
-/// stroke first found there plus the stroke's deltas for it so far, summed in `f32` in the same
-/// order.
+/// Evaluates `map` densely at `level`, finds each vertex's displacement, checks it against
+/// [`formula`], writes the dab's move in the vertex's frame (each face predicted whole), and writes
+/// the vertex's correction in `map` once per vertex (a vertex on a face edge is in the grids of
+/// every face sharing it), as the store's stroke does: it becomes the correction the stroke first
+/// found there plus the stroke's deltas for it so far, summed in `f32` in the same order.
 ///
 /// Faces are visited in order and each grid row-major, as the store visits the vertices of each
 /// of its tiles: an interior correction is quantized to a scale its tile's earlier writes set, so
@@ -129,10 +132,12 @@ fn oracle_step(
 ) -> usize {
     let dense = DenseEvaluation::new(mesh, level, map).unwrap();
     let topology = mesh.topology();
+    let imprint = params.imprint();
     let mut done = HashSet::new();
     let mut moved = 0;
     for face in mesh.faces() {
         let grid = dense.grid(face, level).unwrap();
+        let frames = predict_region(mesh, &dense, Region::whole_face(face, level)).unwrap();
         let mut deltas = vec![0.0; grid.as_slice().len()];
         let c = params.center();
         brush::draw(
@@ -162,11 +167,10 @@ fn oracle_step(
                 continue;
             }
             let old = map.get(face, level, i, j);
-            let (start, acc) = stroke.entry(first).or_insert((old.z, 0.0));
-            *acc += delta;
-            let z = *start + *acc;
-            map.set(topology, face, level, i, j, Vec3::new(old.x, old.y, z))
-                .unwrap();
+            let frame = frames.frame(i, j).unwrap();
+            let value = stroke.entry(first).or_insert(old);
+            *value = *value + frame_delta(&frame, &imprint, delta);
+            map.set(topology, face, level, i, j, *value).unwrap();
             moved += 1;
         }
     }
@@ -262,6 +266,16 @@ fn vertex(level: Level, face: u32, i: u32, j: u32) -> Vec3 {
     vertex_of(&cube_sphere(1).unwrap(), level, face, i, j)
 }
 
+/// The draw step's params for a dab at `center` of `radius` and `strength`, pushing outward
+/// from the cube's centre (the direction its sphere's normals sum to over a dab).
+///
+/// # Errors
+///
+/// As [`DrawParams::new`].
+fn params(center: Vec3, radius: f32, strength: f32) -> Result<DrawParams, DrawParamsError> {
+    DrawParams::new(center, center, radius, strength)
+}
+
 /// `mesh`'s face-grid vertex `(i, j)` of `face` at `level`, as evaluated before any edit.
 fn vertex_of(mesh: &BaseMesh, level: Level, face: u32, i: u32, j: u32) -> Vec3 {
     let dense = DenseEvaluation::new(mesh, level, &CorrectionMap::new()).unwrap();
@@ -278,7 +292,7 @@ fn one_step_moves_exactly_the_vertices_within_the_radius_by_the_falloff() {
     let level = Level::new(6).unwrap();
     let (mut project, mut index) = project(&dir, level);
     // Near an edge of face 0, so the brush reaches across it into the next face.
-    let params = DrawParams::new(vertex(level, 0, 60, 30), 0.3, 0.05).unwrap();
+    let params = params(vertex(level, 0, 60, 30), 0.3, 0.05).unwrap();
     let before = snapshot(project.store(), level);
 
     project.begin_stroke().unwrap();
@@ -306,9 +320,11 @@ fn one_step_moves_exactly_the_vertices_within_the_radius_by_the_falloff() {
     );
     assert_as_dense(project.store(), &map, level, "after the step");
 
-    // Moved means within the radius, and pushed along the frame normal alone.
+    // Moved means within the radius, and pushed along the dab's normal, every vertex alike.
     let after = snapshot(project.store(), level);
+    let normal = params.normal();
     let mut changed = 0;
+    let mut tangential = 0;
     for (place, &(p, c)) in &after {
         let (old, old_c) = before[place];
         if p.to_bits() == old.to_bits() {
@@ -316,20 +332,28 @@ fn one_step_moves_exactly_the_vertices_within_the_radius_by_the_falloff() {
         }
         changed += 1;
         let delta = formula(old, params).unwrap_or_else(|| panic!("{old:?} moved from outside"));
-        assert_eq!(
-            (c.x, c.y),
-            (old_c.x, old_c.y),
-            "only the normal axis changes"
-        );
-        let step = f64::from(c.z - old_c.z);
+        let shift = p - old;
+        let off = shift - normal * (shift.dot(normal));
         // Interior corrections are quantized: within a step of the tile's final scale, at most
-        // twice `strength / 32767`.
+        // twice `strength / 32767`, in each of the frame's three axes.
         assert!(
-            (step - delta).abs() <= 4e-6,
-            "{old:?} moved by {step}, the formula gives {delta}"
+            (f64::from(shift.dot(normal)) - delta).abs() <= 7e-6,
+            "{old:?} moved by {} along the dab's normal, the formula gives {delta}",
+            shift.dot(normal)
         );
+        assert!(
+            off.length() <= 7e-6,
+            "{old:?} moved {} off the dab's normal",
+            off.length()
+        );
+        let (bits, old_bits) = (c.to_bits(), old_c.to_bits());
+        tangential += usize::from(bits[0] != old_bits[0] || bits[1] != old_bits[1]);
     }
     assert!(changed > 0, "the step moved the surface");
+    assert!(
+        tangential > 0,
+        "the dab's normal isn't the frames': their tangential components change too"
+    );
 }
 
 #[test]
@@ -348,7 +372,7 @@ fn twins_stay_bit_identical() {
             project.store(),
             &mut index,
             &mut stroke,
-            DrawParams::new(center, 0.25, strength).unwrap(),
+            params(center, 0.25, strength).unwrap(),
         )
         .unwrap();
     }
@@ -361,7 +385,7 @@ fn bounds_after_a_step_equal_bounds_built_from_scratch() {
     let dir = TestDir::new();
     let level = Level::new(7).unwrap();
     let (mut project, mut index) = project(&dir, level);
-    let params = DrawParams::new(vertex(level, 2, 100, 128), 0.2, 0.1).unwrap();
+    let params = params(vertex(level, 2, 100, 128), 0.2, 0.1).unwrap();
     project.begin_stroke().unwrap();
     let mut stroke = Stroke::new(project.store());
     let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
@@ -388,7 +412,7 @@ fn a_stroke_of_overlapping_steps_matches_dense_after_each_step() {
     let mut stroke = Stroke::new(project.store());
     for (k, strength) in (0_u32..).zip(steps) {
         let center = vertex(level, 4, 40 + 15 * k, 90 - 12 * k);
-        let params = DrawParams::new(center, 0.1, strength).unwrap();
+        let params = params(center, 0.1, strength).unwrap();
         let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
         let moved = oracle_step(&mesh, level, &mut map, &mut oracle, params);
         assert_eq!(stats.vertices, moved, "step {k}: vertices moved");
@@ -421,7 +445,7 @@ fn a_step_at_a_valence_5_vertex_matches_dense_and_keeps_its_five_copies_in_step(
     // On the pole, then off it so the falloff crosses it unevenly, pushing out and then in.
     for (k, (shift, strength)) in [(0.0, 0.05), (0.08, -0.03)].into_iter().enumerate() {
         let center = Vec3::new(pole.x + shift, pole.y, pole.z);
-        let params = DrawParams::new(center, 0.3, strength).unwrap();
+        let params = params(center, 0.3, strength).unwrap();
         let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
         let moved = oracle_step(&mesh, level, &mut map, &mut oracle, params);
         assert_eq!(stats.vertices, moved, "step {k}: vertices moved");
@@ -511,7 +535,7 @@ fn normals_after_random_steps_equal_a_full_recompute_at_any_thread_count() {
             let center = vertex_of(&mesh, level, face, i, j);
             let radius = 0.004 + 0.002 * f32::from(u8::try_from(next(4)).unwrap());
             let strength = if next(2) == 0 { 0.003 } else { -0.002 };
-            let params = DrawParams::new(center, radius, strength).unwrap();
+            let params = params(center, radius, strength).unwrap();
             draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
             assert_normals_recomputed(
                 project.store(),
@@ -548,7 +572,8 @@ fn a_brush_away_from_the_surface_changes_nothing() {
     let before = snapshot(project.store(), level);
     project.begin_stroke().unwrap();
     let mut stroke = Stroke::new(project.store());
-    let params = DrawParams::new(Vec3::new(0.0, 0.0, 0.0), 0.1, 1.0).unwrap();
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let params = DrawParams::new(Vec3::new(0.0, 0.0, 0.0), up, 0.1, 1.0).unwrap();
     let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
     project.end_unrecorded_stroke().unwrap();
     assert_eq!(
@@ -568,23 +593,42 @@ fn a_brush_away_from_the_surface_changes_nothing() {
 fn draw_params_refuse_what_reaches_nowhere() {
     let center = Vec3::new(1.0, 0.0, 0.0);
     assert!(
-        DrawParams::new(center, 0.1, -0.5).is_ok(),
+        params(center, 0.1, -0.5).is_ok(),
         "a negative strength pushes in"
     );
+    let normals = [
+        Vec3::ZERO,
+        Vec3::new(f32::NAN, 0.0, 1.0),
+        Vec3::new(0.0, f32::INFINITY, 0.0),
+        Vec3::new(1e-30, 0.0, 0.0),
+    ];
+    for normal in normals {
+        assert_eq!(
+            DrawParams::new(center, normal, 0.1, 1.0),
+            Err(DrawParamsError::Normal),
+            "a normal of no direction: {normal:?}"
+        );
+    }
+    let long = DrawParams::new(center, Vec3::new(0.0, 3.0, 4.0), 0.1, 1.0).unwrap();
     assert_eq!(
-        DrawParams::new(Vec3::new(f32::NAN, 0.0, 0.0), 0.1, 1.0),
+        long.normal(),
+        Vec3::new(0.0, 0.6, 0.8),
+        "a normal is taken at unit length"
+    );
+    assert_eq!(
+        params(Vec3::new(f32::NAN, 0.0, 0.0), 0.1, 1.0),
         Err(DrawParamsError::Center),
         "a NaN centre"
     );
     for radius in [0.0, -1.0, f32::NAN, f32::INFINITY] {
         assert_eq!(
-            DrawParams::new(center, radius, 1.0),
+            params(center, radius, 1.0),
             Err(DrawParamsError::Radius),
             "radius {radius}"
         );
     }
     assert_eq!(
-        DrawParams::new(center, 0.1, f32::INFINITY),
+        params(center, 0.1, f32::INFINITY),
         Err(DrawParamsError::Strength),
         "an infinite strength"
     );
@@ -616,7 +660,7 @@ fn an_evicted_tile_is_brushed_as_from_its_positions() {
     let dir = TestDir::new();
     let level = Level::new(6).unwrap();
     let (mut project, _) = project(&dir, level);
-    let params = DrawParams::new(vertex(level, 0, 60, 30), 0.3, 0.05).unwrap();
+    let params = params(vertex(level, 0, 60, 30), 0.3, 0.05).unwrap();
     let key = TileKey::displacement(FaceId::new(0), level, 0, 0).unwrap();
     let store = project.store();
     let copy = store.evaluate(key).unwrap().to_vec();
@@ -631,45 +675,53 @@ fn an_evicted_tile_is_brushed_as_from_its_positions() {
     );
 }
 
-/// Each vertex `(i, j)` of `key`: its correction's `z` and its evaluated position, row-major.
-fn tile_state(store: &mut TileStore, key: TileKey) -> Vec<(u32, u32, f32, Vec3)> {
+/// Each vertex `(i, j)` of `key`: its correction and its evaluated position, row-major.
+fn tile_state(store: &mut TileStore, key: TileKey) -> Vec<(u32, u32, Vec3, Vec3)> {
     let positions = store.evaluate(key).unwrap().to_vec();
     let corrections = store.correction(key).unwrap();
     vertices(key.side())
         .zip(positions)
-        .map(|((i, j), p)| (i, j, corrections.get(i, j).unwrap().z, p))
+        .map(|((i, j), p)| (i, j, corrections.get(i, j).unwrap(), p))
         .collect()
 }
 
-/// Asserts that every vertex of `key` inside `light` moved from `before` by `dabs` times its delta.
+/// Asserts that every vertex of `key` inside `light` moved from `before` by `dabs` times its delta:
+/// its correction by `dabs` times its displacement along the dab's normal, written in its frame.
 ///
-/// Each within `steps` of the tile's final scale (and 1% of the expected move). Returns how many
-/// vertices it checked, and how many of them are on the tile's border.
+/// Each component within `steps` of the tile's final scale (and 1% of the expected move). Returns
+/// how many vertices it checked, and how many of them are on the tile's border.
 fn assert_moved_by_dabs(
     store: &mut TileStore,
     key: TileKey,
-    before: &[(u32, u32, f32, Vec3)],
+    before: &[(u32, u32, Vec3, Vec3)],
     light: DrawParams,
     dabs: f64,
     steps: f64,
 ) -> (usize, usize) {
     let side = key.side();
+    let frames = store.frames_many(&[key]).unwrap().remove(0);
     let after = store.correction(key).unwrap();
     let final_scale = f64::from(after.scale());
+    let imprint = light.imprint();
     let (mut inside, mut border) = (0, 0);
-    for &(i, j, z, p) in before {
+    for &(i, j, c, p) in before {
         let Some(d) = formula(p, light) else {
             continue;
         };
-        let moved = f64::from(after.get(i, j).unwrap().z) - f64::from(z);
-        let expected = dabs * d;
+        let at = usize::try_from(j * side + i).unwrap();
+        let along = frame_delta(&frames[at], &imprint, 1.0);
+        let moved = after.get(i, j).unwrap() - c;
         let on_border = i == 0 || j == 0 || i == side - 1 || j == side - 1;
         let place = if on_border { "border" } else { "interior" };
-        assert!(
-            (moved - expected).abs() <= steps * final_scale + 0.01 * expected.abs(),
-            "{place} vertex ({i}, {j}) moved by {moved}, expected {expected} \
-             (scale {final_scale})"
-        );
+        let axes = [(moved.x, along.x), (moved.y, along.y), (moved.z, along.z)];
+        for (got, unit) in axes {
+            let expected = dabs * d * f64::from(unit);
+            assert!(
+                (f64::from(got) - expected).abs() <= steps * final_scale + 0.01 * (dabs * d).abs(),
+                "{place} vertex ({i}, {j}) moved by {got}, expected {expected} \
+                 (scale {final_scale})"
+            );
+        }
         inside += 1;
         border += usize::from(on_border);
     }
@@ -686,14 +738,14 @@ fn light_dabs_move_a_tiles_interior_as_far_as_its_border() {
     // A strong dab alone makes the tile's scale large.
     project.begin_stroke().unwrap();
     let mut first = Stroke::new(project.store());
-    let strong = DrawParams::new(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
+    let strong = params(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
     draw_step(project.store(), &mut index, &mut first, strong).unwrap();
     project.end_unrecorded_stroke().unwrap();
     let scale = project.store().correction(key).unwrap().scale();
     assert!(scale > 0.0, "the strong dab set a scale");
 
     // Light dabs near the tile's right border, each under half a step at most vertices.
-    let light = DrawParams::new(vertex(level, 4, 60, 32), 0.06, 0.4 * scale).unwrap();
+    let light = params(vertex(level, 4, 60, 32), 0.06, 0.4 * scale).unwrap();
     let before = tile_state(project.store(), key);
     project.begin_stroke().unwrap();
     // A fresh stroke state, as a new stroke's.
@@ -740,7 +792,7 @@ fn strong_stroke(project: &mut Project, index: &mut SpatialIndex, level: Level) 
     let key = TileKey::displacement(FaceId::new(4), level, 0, 0).unwrap();
     project.begin_stroke().unwrap();
     let mut stroke = Stroke::new(project.store());
-    let strong = DrawParams::new(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
+    let strong = params(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
     draw_step(project.store(), index, &mut stroke, strong).unwrap();
     project.end_unrecorded_stroke().unwrap();
     let scale = project.store().correction(key).unwrap().scale();
@@ -755,7 +807,7 @@ fn strong_stroke(project: &mut Project, index: &mut SpatialIndex, level: Level) 
 /// reaches that one tile alone.
 fn light_dab(level: Level, face: u32, scale: f32) -> DrawParams {
     let i = if face == 4 { 50 } else { 32 };
-    DrawParams::new(vertex(level, face, i, 32), 0.06, 0.4 * scale).unwrap()
+    params(vertex(level, face, i, 32), 0.06, 0.4 * scale).unwrap()
 }
 
 #[test]
@@ -770,9 +822,9 @@ fn a_strokes_writes_are_the_same_at_any_worker_count() {
         for k in 0..20 {
             let center = vertex(level, 4, 20 + 4 * k, 32);
             let params = if k % 2 == 0 {
-                DrawParams::new(center, 0.1, 0.05)
+                params(center, 0.1, 0.05)
             } else {
-                DrawParams::new(center, 0.06, LIGHT)
+                params(center, 0.06, LIGHT)
             };
             draw_step(project.store(), &mut index, &mut stroke, params.unwrap()).unwrap();
         }
@@ -847,7 +899,7 @@ fn tiles_edited_in_the_last_dabs_keep_their_state() {
 #[test]
 fn a_dab_past_the_thrash_limit_writes_its_overflow_tiles_per_dab_and_does_not_fail() {
     let level = Level::new(7).unwrap();
-    let params = DrawParams::new(vertex(level, 4, 64, 64), 0.3, 0.05).unwrap();
+    let params = params(vertex(level, 4, 64, 64), 0.3, 0.05).unwrap();
     let run = |threads: usize, stroke_tiles: usize| {
         let dir = TestDir::new();
         let (mut project, mut index) = project_with(&dir, level, threads, stroke_tiles);
@@ -899,7 +951,7 @@ fn border_dabs(
 ) {
     for n in 0..3 {
         let center = vertex(level, 4, 61 + n + k, 30 + k);
-        let params = DrawParams::new(center, 0.06, 0.4 * scale).unwrap();
+        let params = params(center, 0.06, 0.4 * scale).unwrap();
         draw_step(project.store(), index, stroke, params).unwrap();
     }
 }
@@ -943,7 +995,7 @@ fn a_reused_buffer_starts_with_no_sums() {
     let (mut project, mut index) = project_with(&dir, level, 2, 1);
     let (_, scale) = strong_stroke(&mut project, &mut index, level);
     let other = TileKey::displacement(FaceId::new(1), level, 0, 0).unwrap();
-    let light = DrawParams::new(vertex(level, 1, 50, 32), 0.06, 0.4 * scale).unwrap();
+    let light = params(vertex(level, 1, 50, 32), 0.06, 0.4 * scale).unwrap();
     let before = tile_state(project.store(), other);
 
     project.begin_stroke().unwrap();
@@ -970,7 +1022,9 @@ fn a_reused_buffer_starts_with_no_sums() {
         "written per dab while the buffer's tile is protected, then given its buffer"
     );
     assert!(stroke.holds(&other), "the tile has the buffer");
-    let (inside, _) = assert_moved_by_dabs(project.store(), other, &before, light, 5.0, 1.0);
+    // Three dabs written per dab, each rounded to the tile's step, then one capture: within half a
+    // step for each, two steps in all, in every component.
+    let (inside, _) = assert_moved_by_dabs(project.store(), other, &before, light, 5.0, 2.0);
     assert!(inside > 0, "the brush reaches the tile");
 }
 
@@ -990,7 +1044,7 @@ fn a_scale_that_grows_mid_stroke_keeps_vertices_within_a_step() {
     }
     // A stronger dab in another corner of the tile, out of the light dabs' reach, grows the
     // tile's scale.
-    let stronger = DrawParams::new(vertex(level, 4, 10, 55), 0.1, 0.2).unwrap();
+    let stronger = params(vertex(level, 4, 10, 55), 0.1, 0.2).unwrap();
     draw_step(project.store(), &mut index, &mut stroke, stronger).unwrap();
     for _ in 0..10 {
         draw_step(project.store(), &mut index, &mut stroke, light).unwrap();
@@ -1106,7 +1160,7 @@ fn a_stroke_saved_part_way_goes_on_from_the_save() {
     let mut index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
     let mut map = CorrectionMap::new();
     let (key, scale) = strong_stroke(&mut project, &mut index, level);
-    let strong = DrawParams::new(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
+    let strong = params(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
     oracle_step(&mesh, level, &mut map, &mut OracleStroke::new(), strong);
     let light = light_dab(level, 4, scale);
     let mut stroke = Stroke::new(project.store());

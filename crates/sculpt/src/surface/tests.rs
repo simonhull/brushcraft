@@ -669,3 +669,108 @@ fn placement_after_a_dab_raycasts_as_every_triangle_does() {
         "rays skimming the old top hit the raised one: {skimmed}"
     );
 }
+
+/// The area normal's sum at `centre` for a dab of `radius` and `hardness`, computed directly.
+///
+/// Every tile of the level, each vertex in the tile that owns it, weighted by the draw action's
+/// falloff: each tile's part summed row by row, the parts added in key order, in `f64`.
+fn area_sum(store: &mut TileStore, centre: Vec3, radius: f32, hardness: f32) -> DVec3 {
+    let imprint = brush::Imprint::new(
+        [centre.x, centre.y, centre.z],
+        [0.0, 0.0, 1.0],
+        radius,
+        1.0,
+        hardness,
+        [0.0; 4],
+    );
+    let mut keys = tiles(store.mesh(), level());
+    keys.sort_unstable();
+    let mut sum = DVec3::ZERO;
+    for key in keys {
+        let normals = store.surface_normals(key).unwrap().to_vec();
+        let positions = store.surface_positions(key).unwrap().to_vec();
+        let side = key.side();
+        let mut part = DVec3::ZERO;
+        for (k, (p, n)) in positions.iter().zip(&normals).enumerate() {
+            let (i, j) = (
+                u32::try_from(k).unwrap() % side,
+                u32::try_from(k).unwrap() / side,
+            );
+            if !store.mesh().topology().owns(&key, i, j) {
+                continue;
+            }
+            if let Some(w) =
+                brush::draw_imprint_vertex(&brush::Smoothstep, &imprint, [p.x, p.y, p.z])
+            {
+                part = part + DVec3::from_f32(*n) * f64::from(w);
+            }
+        }
+        sum = sum + part;
+    }
+    sum
+}
+
+#[test]
+fn the_area_normal_sums_the_surfaces_normals_under_the_dab_by_its_falloff() {
+    let dir = TestDir::new();
+    let (mut project, mut index) = cube(&dir, level(), fixed(2));
+    bumps(&mut project, &mut index);
+    // On a bump over a face edge, and on a smooth part of the cube, at two hardnesses.
+    let store = project.store();
+    let on_edge = vertex(
+        store,
+        TileKey::displacement(FaceId::new(0), level(), 1, 0).unwrap(),
+        64,
+        30,
+    );
+    let smooth = vertex(
+        store,
+        TileKey::displacement(FaceId::new(5), level(), 0, 0).unwrap(),
+        32,
+        32,
+    );
+    for (centre, hardness) in [(on_edge, 0.0), (on_edge, 0.6), (smooth, 0.3)] {
+        let want = area_sum(project.store(), centre, 0.15, hardness);
+        let mut surface = StoreSurface::new(project.store(), &index);
+        let got = surface
+            .area_normal(DVec3::from_f32(centre), 0.15, hardness)
+            .unwrap();
+        surface.finish().unwrap();
+        assert_eq!(
+            got.to_f32_array().map(f32::to_bits),
+            want.to_f32_array().map(f32::to_bits),
+            "{centre:?}, hardness {hardness}: each vertex once, by the falloff"
+        );
+        assert_eq!(got, want, "the same sum, in f64");
+        let outward = DVec3::from_f32(centre).normalized().unwrap();
+        let normal = got.normalized().unwrap();
+        assert!(
+            normal.dot(outward) > 0.9,
+            "{centre:?}: about the outward direction, {normal:?}"
+        );
+    }
+    // Away from the bumps, the cube's limit surface is nearly a sphere: about the outward
+    // direction.
+    let tilt = area_sum(project.store(), smooth, 0.15, 0.0)
+        .normalized()
+        .unwrap()
+        .dot(DVec3::from_f32(smooth).normalized().unwrap());
+    assert!(tilt > 0.999, "a smooth part: {tilt}");
+    // Far from the surface, the dab covers nothing: a sum of zero, for placement to take the
+    // hit's normal instead.
+    let mut inside = StoreSurface::new(project.store(), &index);
+    let nothing = inside.area_normal(DVec3::ZERO, 0.1, 0.0);
+    inside.finish().unwrap();
+    assert_eq!(
+        nothing,
+        Some(DVec3::ZERO),
+        "inside the cube, no vertex in reach"
+    );
+    let mut empty = StoreSurface::new(project.store(), &index);
+    assert_eq!(
+        empty.area_normal(DVec3::from_f32(smooth), 0.0, 0.0),
+        None,
+        "a radius of zero covers nothing at all"
+    );
+    empty.finish().unwrap();
+}

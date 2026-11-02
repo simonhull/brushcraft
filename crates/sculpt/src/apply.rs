@@ -13,12 +13,14 @@
 //!    run is applied tile by tile (see "Tile by tile"):
 //!    - **Brush and edit**: each of the run's tiles, on the store's workers, takes every dab of the
 //!      run that reaches it, in order, on a copy of its own corrections: `brush`'s draw action
-//!      ([`brush::draw_imprint`]) gives each vertex within the radius its delta along the normal
-//!      axis of its tangent frame; the delta is added to the sum of the stroke's deltas for the
-//!      vertex, and the vertex's correction `z` set to the value the stroke first found there plus
-//!      that sum (see [`Stroke`]), so the stored value is rounded to the tile's quantization once
-//!      per stroke, not once per dab; and the tile's positions are made again from the prediction
-//!      the store keeps of it ([`TileStore::kept_prediction`]), for the next dab.
+//!      ([`brush::draw_imprint`], [`brush::draw_move`]) gives each vertex within the radius its
+//!      move, its displacement along the dab's normal (its area normal: one direction for every
+//!      vertex), and the move is written in the vertex's tangent frame ([`frame_delta`]) as its
+//!      delta; the vertex's correction is set to the value the stroke builds for it, the correction
+//!      it first found there plus every delta since (see [`Stroke`]), so the stored value is
+//!      rounded to the tile's quantization once per stroke, not once per dab; and the tile's
+//!      positions are made again from the prediction the store keeps of it
+//!      ([`TileStore::kept_prediction`]), for the next dab, whose frames the deltas take too.
 //!    - **Write**: the tiles are written back whole, together ([`TileStore::replace_corrections`]);
 //!      the stroke's state takes what the run did ([`Stroke::end_frame`]).
 //!    - **Positions**: unless it is the frame's last, the tiles the run reached get their positions
@@ -55,7 +57,8 @@
 //!   edited level. So a tile's copy of its corrections and its kept prediction give its positions
 //!   after any of the run's writes, the bits the store's evaluation gives.
 //! - **A vertex's delta is its own.** The draw action's delta for a vertex is a function of the
-//!   vertex's position and the dab alone.
+//!   vertex's position, its tangent frame (from the level below, which the brush never edits) and
+//!   the dab alone.
 //! - **A tile's quantization is its own.** The interior's scale covers its interior alone, and
 //!   grows (re-quantizing the interior) only for its own writes, in the order the store's edit
 //!   makes them: the replay writes through [`geom::CorrectionViewMut::update_interior_row`], the
@@ -63,13 +66,14 @@
 //!   the same values re-quantized, as one dab at a time.
 //! - **Shared vertices agree.** A border vertex is held by every tile it lies on, each copy's
 //!   prediction and frame the same bits (geom's seam guarantee) and its correction the same, so
-//!   each copy's position is the same, and every tile holding one finds the same delta for it.
-//!   Border values are stored exactly. The vertex's owner writes it from its stroke state; each
-//!   other tile writes its copy from a copy of that state, taken from the stroke as the run began
-//!   and carried along with the same arithmetic ([`crate::state::stroke_sum`]), so every copy gets
-//!   the bits the owner's write gives all of them one at a time. The store checks it before writing
-//!   ([`TileStore::replace_corrections`]): every copy of a border vertex written is among the run's
-//!   tiles and holds the same bits, or nothing is written.
+//!   each copy's position is the same, and every tile holding one finds the same delta for it,
+//!   written in the same frame. Border values are stored exactly. The vertex's owner writes it from
+//!   its stroke state; each other tile writes its copy from a copy of that state, taken from the
+//!   stroke as the run began and carried along with the same arithmetic
+//!   ([`crate::state::stroke_sum`]), so every copy gets the bits the owner's write gives all of
+//!   them one at a time. The store checks it before writing ([`TileStore::replace_corrections`]):
+//!   every copy of a border vertex written is among the run's tiles and holds the same bits, or
+//!   nothing is written.
 //! - **The stroke's state is decided ahead.** Which tiles hold stroke state, and which are released
 //!   or written per dab, depends on the tiles every dab edits, and so on every tile. The run
 //!   assumes no tile it edits loses its state or goes without, replays its tiles, then makes the
@@ -143,8 +147,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
-use brush::{Imprint, Smoothstep, draw_imprint};
-use geom::{TileKey, Vec3};
+use brush::{Imprint, Smoothstep, draw_imprint, draw_move};
+use geom::{Prediction, TileKey, Vec3};
 use store::{Aabb, CacheError, Evaluation, IndexError, SpatialIndex, TileStore};
 use stroke::Dab;
 use thiserror::Error;
@@ -273,33 +277,37 @@ impl AddAssign for ApplyStats {
 
 /// Applies `dabs`, a frame's dabs in sequence order, with the draw action.
 ///
-/// Each dab moves every vertex of the index's level within its radius along the vertex's frame
-/// normal by `strength · falloff(d / radius)`, the falloff [`Smoothstep`] made as hard as the
-/// dab's hardness ([`brush::Hardened`]), and `index` is brought up to date once for the frame
-/// (see the module notes for the phases).
+/// Each dab moves every vertex of the index's level within its radius along the dab's normal by
+/// `strength · falloff(d / radius)`, the falloff [`Smoothstep`] made as hard as the dab's hardness
+/// ([`brush::Hardened`]), and `index` is brought up to date once for the frame (see the module
+/// notes for the phases). The normal is the dab's area normal, as placement takes it: one
+/// direction for every vertex the dab moves ([`brush::draw_move`]).
 ///
 /// Each dab's values are taken as final: `strength` is the displacement at its centre in model
-/// units, `hardness` in `0..=1` (`0`, the plain falloff); the dab's normal, tangent, angle and
-/// params aren't read by the draw action. The result is that of applying the dabs one at a time,
-/// a call each, bit for bit (see "The same as one dab at a time" in the module notes).
+/// units, `hardness` in `0..=1` (`0`, the plain falloff), the normal any finite, non-zero vector
+/// (used at unit length); the dab's tangent, angle and params aren't read by the draw action. The
+/// result is that of applying the dabs one at a time, a call each, bit for bit (see "The same as
+/// one dab at a time" in the module notes).
 ///
 /// `store` is the project's ([`Project::store`](store::Project::store)). The dabs edit as part
 /// of the store's current op: call it between
 /// [`Project::begin_stroke`](store::Project::begin_stroke) and
 /// [`Project::end_stroke`](store::Project::end_stroke), so the stroke is one op. `stroke` keeps
-/// each edited vertex's start and summed deltas across the stroke's dabs (see [`Stroke`]); keep
+/// the value each edited vertex's correction is being built to across the stroke's dabs (see
+/// [`Stroke`]); keep
 /// one for the session and pass it to every call.
 ///
 /// # Errors
 ///
-/// [`SculptError::Dab`] for a dab whose centre or strength isn't finite or whose radius isn't
-/// positive and finite, before anything is written. [`SculptError::Cache`] if the store can't
-/// pin the tiles a dab touches (more than its budget holds, for one dab), evaluate them or edit
-/// them; [`SculptError::Index`] if the index can't be updated. A store error ends the call: the
-/// dabs before the failing one stay applied, and the index is updated for them (see "Errors" in
-/// the module notes). The failing dab's edit is left as [`TileStore::update_tiles`] leaves it,
-/// and the deltas it summed into `stroke` but didn't write are written by the next dab that
-/// writes those vertices; don't apply it again, or its deltas already summed count twice.
+/// [`SculptError::Dab`] for a dab whose centre or strength isn't finite, whose radius isn't
+/// positive and finite, or whose normal has no direction, before anything is written.
+/// [`SculptError::Cache`] if the store can't pin the tiles a dab touches (more than its budget
+/// holds, for one dab), evaluate them or edit them; [`SculptError::Index`] if the index can't be
+/// updated. A store error ends the call: the dabs before the failing one stay applied, and the
+/// index is updated for them (see "Errors" in the module notes). The failing dab's edit is left as
+/// [`TileStore::update_tiles`] leaves it, and the deltas it added to `stroke`'s values but didn't
+/// write are written by the next dab that writes those vertices; don't apply it again, or its
+/// deltas already added count twice.
 pub fn apply_dabs(
     store: &mut TileStore,
     index: &mut SpatialIndex,
@@ -322,10 +330,16 @@ pub fn apply_dabs(
 /// As [`DrawParams::new`](crate::DrawParams::new).
 pub(crate) fn imprint_of(dab: &Dab) -> Result<Imprint, DrawParamsError> {
     let [x, y, z] = dab.position;
-    check_dab(Vec3::new(x, y, z), dab.radius, dab.strength)?;
+    let [nx, ny, nz] = dab.normal;
+    let normal = check_dab(
+        Vec3::new(x, y, z),
+        Vec3::new(nx, ny, nz),
+        dab.radius,
+        dab.strength,
+    )?;
     Ok(Imprint::new(
         dab.position,
-        dab.normal,
+        [normal.x, normal.y, normal.z],
         dab.radius,
         dab.strength,
         dab.hardness,
@@ -446,8 +460,9 @@ struct Frame {
 ///
 /// # Errors
 ///
-/// As [`TileStore::evaluate`], [`TileStore::update_tiles`],
-/// [`TileStore::replace_corrections`] and [`TileStore::bump_display_error`].
+/// As [`TileStore::evaluate`], [`TileStore::keep_predictions_of`], [`TileStore::frames_many`],
+/// [`TileStore::update_tiles`], [`TileStore::replace_corrections`] and
+/// [`TileStore::bump_display_error`].
 fn run_dabs(
     store: &mut TileStore,
     stroke: &mut Stroke,
@@ -536,15 +551,16 @@ fn run_dab(
     laps: &mut Laps,
 ) -> Result<(), CacheError> {
     let keys = frame.tiles_for(imprint, query);
-    let found = run_brush(store, &keys, imprint)?;
+    let mut found = run_brush(store, &keys, imprint)?;
     frame.reached.extend(&found.reached);
     times.brush += laps.lap();
 
     let edited: Vec<TileKey> = found.edits.iter().map(|tile| tile.key).collect();
+    let deltas = frame_deltas(store, imprint, &mut found.edits)?;
     frame.unaccumulated += stroke.begin_dab(store, &edited);
     let states = stroke.states(&edited);
     let edit = store.update_tiles(&edited, |n, i, j, c| {
-        stroke_write(&found.edits, &states, n, i, j, c)
+        stroke_write(&found.edits, &deltas, &states, n, i, j, c)
     });
     stroke.end_dab(store);
     edit?;
@@ -568,11 +584,11 @@ fn run_dab(
 ///
 /// # Errors
 ///
-/// As [`TileStore::evaluate_many`] and [`TileStore::keep_predictions_of`] before anything is
-/// written (but [`CacheError::Full`] and [`CacheError::OverBudget`] from keeping the
-/// predictions, which leave the run to be applied one dab at a time); as
-/// [`TileStore::replace_corrections`] (nothing written, but the stroke's state readied for the
-/// frame) and [`TileStore::bump_display_error`] after.
+/// As [`TileStore::evaluate_many`], [`TileStore::frames_many`] and
+/// [`TileStore::keep_predictions_of`] before anything is written (but [`CacheError::Full`] and
+/// [`CacheError::OverBudget`] from keeping the predictions, which leave the run to be applied one
+/// dab at a time); as [`TileStore::replace_corrections`] (nothing written, but the stroke's state
+/// readied for the frame) and [`TileStore::bump_display_error`] after.
 fn run_tiled(
     store: &mut TileStore,
     stroke: &mut Stroke,
@@ -600,6 +616,12 @@ fn run_tiled(
             Err(e) => return Err(e),
         }
     }
+    // A run of one dab has no kept predictions to take its frames from: they are listed.
+    let frames = if predicted {
+        Vec::new()
+    } else {
+        store.frames_many(keys)?
+    };
     times.evaluate += laps.lap();
     stroke.begin_frame(store);
     let book = stroke.book().clone();
@@ -607,7 +629,8 @@ fn run_tiled(
     // A second replay at most: under the grants the first one's dabs give, which hold unless
     // the second's dabs edit other tiles.
     for _ in 0..2 {
-        let Some(outcomes) = replay_run(store, stroke, imprints, keys, &plan, predicted) else {
+        let replayed = replay_run(store, stroke, imprints, keys, &frames, &plan, predicted);
+        let Some(outcomes) = replayed else {
             return Ok(None);
         };
         if !replay::all_done(&outcomes) {
@@ -638,17 +661,20 @@ fn run_tiled(
 }
 
 /// Each tile of `keys` replayed over the run's dabs `imprints` under `plan`, on the store's
-/// workers, in key order; `None` if a tile's positions, corrections or (when `predicted`)
-/// prediction aren't cached.
+/// workers, in key order.
+///
+/// `None` if a tile's positions, corrections or (when `predicted`) prediction aren't cached. A
+/// tile without a kept prediction takes its frames from `frames`, aligned with `keys`.
 fn replay_run(
     store: &TileStore,
     stroke: &Stroke,
     imprints: &[Imprint],
     keys: &[TileKey],
+    frames: &[Vec<geom::Frame>],
     plan: &Plan,
     predicted: bool,
 ) -> Option<Vec<TileOutcome>> {
-    let inputs = replay::inputs(store, keys, predicted)?;
+    let inputs = replay::inputs(store, keys, predicted, frames)?;
     let run = Run {
         imprints,
         plan,
@@ -842,14 +868,18 @@ fn refit(
     Ok(changed.len())
 }
 
-/// The deltas of one tile a dab edits: one per vertex of the tile, row-major, zero for each
-/// vertex the tile doesn't move (outside the radius, or edited through another copy).
+/// The displacements of one tile a dab edits: one per vertex of the tile, row-major, zero for
+/// each vertex the tile doesn't move (outside the radius, or edited through another copy).
 #[derive(Debug)]
 struct TileDeltas {
     /// The tile.
     key: TileKey,
-    /// The `side²` deltas along the frame normal.
+    /// The `side²` displacements along the dab's normal ([`brush::draw_imprint`]).
     deltas: Vec<f32>,
+    /// The `side²` deltas, the dab's moves written in each vertex's frame ([`frame_delta`]),
+    /// where the brush had the tile's frames at hand (a kept prediction); else made by
+    /// [`frame_deltas`].
+    moves: Option<Vec<Vec3>>,
 }
 
 /// What a dab's brush phase found: the deltas to write, and the tiles whose positions they move.
@@ -905,21 +935,40 @@ fn run_brush(
     for &key in keys {
         store.evaluate(key)?;
     }
-    let brushed: Vec<Option<TileBrush>> = {
+    // The frames the deltas are written along: kept predictions, so the brush writes each tile's
+    // deltas as it finds its displacements (see `frame_deltas` for the rest).
+    match store.keep_predictions_of(keys) {
+        Ok(_) | Err(CacheError::Full | CacheError::OverBudget { .. }) => {}
+        Err(e) => return Err(e),
+    }
+    let brushed: Vec<Option<(TileBrush, Option<Vec<Vec3>>)>> = {
         let cache = &*store;
         let topology = cache.mesh().topology();
-        let cached: Vec<(TileKey, Option<&[Vec3]>)> = keys
+        let cached: Vec<CachedTile<'_>> = keys
             .iter()
-            .map(|key| (*key, cache.cached_positions(key)))
+            .map(|key| {
+                (
+                    *key,
+                    cache.cached_positions(key),
+                    cache.kept_prediction(key),
+                )
+            })
             .collect();
-        cache.par_map(&cached, |&(key, positions)| {
-            positions.map(|positions| brush_tile(topology, key, positions, imprint))
+        cache.par_map(&cached, |&(key, positions, prediction)| {
+            let tile = brush_tile(topology, key, positions?, imprint);
+            let moves = prediction.filter(|_| tile.moved > 0).map(|prediction| {
+                tile_frame_deltas(key, &tile.deltas, imprint, |i, j| prediction.frame(i, j))
+            });
+            Some((tile, moves))
         })
     };
     let mut found = BrushOutput::default();
     let tiles = keys.iter().zip(brushed);
-    for (&key, tile) in tiles {
-        let tile = tile.map_or_else(|| brush_evicted(store, key, imprint), Ok)?;
+    for (&key, outcome) in tiles {
+        let (tile, moves) = match outcome {
+            Some(done) => done,
+            None => (brush_evicted(store, key, imprint)?, None),
+        };
         if !tile.reached {
             continue;
         }
@@ -929,11 +978,16 @@ fn run_brush(
             found.edits.push(TileDeltas {
                 key,
                 deltas: tile.deltas,
+                moves,
             });
         }
     }
     Ok(found)
 }
+
+/// A tile as [`run_brush`] reads it from the cache: its key, its positions and its kept
+/// prediction, each if cached.
+type CachedTile<'a> = (TileKey, Option<&'a [Vec3]>, Option<&'a Prediction>);
 
 /// What the brush does to `key`, a tile a later tile's evaluation pushed out of the cache
 /// before the workers could brush it: evaluated again, then brushed here.
@@ -968,7 +1022,8 @@ pub(crate) fn brush_evicted(
 pub(crate) struct TileBrush {
     /// Whether a vertex of the tile is within the radius: its positions move.
     pub(crate) reached: bool,
-    /// The deltas of the vertices the tile owns, one per vertex, row-major; zero elsewhere.
+    /// The displacements of the vertices the tile owns, along the dab's normal, one per vertex,
+    /// row-major; zero elsewhere.
     pub(crate) deltas: Vec<f32>,
     /// How many of them aren't zero.
     pub(crate) moved: usize,
@@ -1010,12 +1065,102 @@ pub(crate) fn brush_tile(
     }
 }
 
-/// The edit for vertex `(i, j)` of tile `edits[n]`, whose correction is stored as `c`.
+/// `imprint`'s move of a vertex whose displacement is `w` ([`brush::draw_move`]: `w` along the
+/// dab's normal), written in the vertex's tangent `frame`: the delta its correction takes.
 ///
-/// `None` (no write) where its delta is zero; else `c` with its `z` the stroke's start for the
-/// vertex plus the stroke's deltas for it so far, this one included ([`TileStroke::write`]), or,
-/// for a tile without state (`states[n]` is `None`, see "The thrash limit" on [`Stroke`]),
-/// `c.z` plus the delta.
+/// The frame is orthonormal, so the components are the move's along its axes, and the corrected
+/// position ([`geom::Frame::apply`]) moves by the move itself, up to rounding. The one projection
+/// every path that writes draw's deltas makes (a dab at a time, a run tile by tile), so they give
+/// the same bits; and a vertex shared by several tiles has the same frame in each, so every copy
+/// gets the same delta.
+pub(crate) fn frame_delta(frame: &geom::Frame, imprint: &Imprint, w: f32) -> Vec3 {
+    let [x, y, z] = draw_move(imprint, w);
+    let moved = Vec3::new(x, y, z);
+    Vec3::new(
+        frame.t().dot(moved),
+        frame.b().dot(moved),
+        frame.n().dot(moved),
+    )
+}
+
+/// The deltas of a dab's edits: `imprint`'s move of each vertex it moves, written in the vertex's
+/// tangent frame ([`frame_delta`]).
+///
+/// For each of `edits`, in order, one per vertex of its tile, row-major, zero where its
+/// displacement is zero. The brush made them already for the tiles whose predictions the store
+/// keeps ([`run_brush`] has it keep them, [`TileStore::keep_predictions_of`], which the frame's
+/// evaluation of the tiles after the edit reuses, so it costs no prediction the dab didn't make
+/// already). The rest, for edits of more tiles than the store keeps predictions for, take copies of
+/// their frames ([`TileStore::frames_many`]), on the store's workers. Either way the frames are the
+/// bits the tiles' evaluation uses.
+///
+/// # Errors
+///
+/// As [`TileStore::frames_many`].
+fn frame_deltas(
+    store: &mut TileStore,
+    imprint: &Imprint,
+    edits: &mut [TileDeltas],
+) -> Result<Vec<Vec<Vec3>>, CacheError> {
+    let missing: Vec<TileKey> = edits
+        .iter()
+        .filter(|tile| tile.moves.is_none())
+        .map(|tile| tile.key)
+        .collect();
+    if !missing.is_empty() {
+        let copies = store.frames_many(&missing)?;
+        let lacking = edits.iter_mut().filter(|tile| tile.moves.is_none());
+        let listed: Vec<(&mut TileDeltas, &[geom::Frame])> = lacking
+            .zip(&copies)
+            .map(|(tile, frames)| (tile, frames.as_slice()))
+            .collect();
+        let made: Vec<Vec<Vec3>> = store.par_map(&listed, |(tile, frames)| {
+            let side = tile.key.side();
+            tile_frame_deltas(tile.key, &tile.deltas, imprint, |i, j| {
+                frames.get(usize::try_from(j * side + i).ok()?).copied()
+            })
+        });
+        for ((tile, _), moves) in listed.into_iter().zip(made) {
+            tile.moves = Some(moves);
+        }
+    }
+    Ok(edits
+        .iter_mut()
+        .map(|tile| tile.moves.take().unwrap_or_default())
+        .collect())
+}
+
+/// The deltas of tile `key` for its displacements `deltas` by `imprint`, `frame(i, j)` giving
+/// vertex `(i, j)`'s frame (see [`frame_deltas`]).
+///
+/// A vertex it gives none (never, for a tile and frames of the same side) takes a delta that isn't
+/// finite, which the store refuses to write.
+fn tile_frame_deltas(
+    key: TileKey,
+    deltas: &[f32],
+    imprint: &Imprint,
+    frame: impl Fn(u32, u32) -> Option<geom::Frame>,
+) -> Vec<Vec3> {
+    let moves = vertices(key.side()).zip(deltas);
+    moves
+        .map(|((i, j), &w)| {
+            if w == 0.0 {
+                return Vec3::ZERO;
+            }
+            frame(i, j).map_or(Vec3::new(f32::NAN, f32::NAN, f32::NAN), |frame| {
+                frame_delta(&frame, imprint, w)
+            })
+        })
+        .collect()
+}
+
+/// The edit for vertex `(i, j)` of tile `edits[n]`, whose correction is stored as `c`, its delta
+/// `deltas[n]`'s (the dab's move in its frame, [`frame_deltas`]).
+///
+/// `None` (no write) where its displacement is zero; else the value the stroke builds for the
+/// vertex, the correction it first found there plus every delta since, this one included
+/// ([`TileStroke::write`]), or, for a tile without state (`states[n]` is `None`, see "The thrash
+/// limit" on [`Stroke`]), `c` plus the delta.
 ///
 /// Interior and border vertices so take the same formula: the stored value is rounded to the
 /// tile's quantization when it is written, never added to dab by dab, and the interior's error
@@ -1023,11 +1168,16 @@ pub(crate) fn brush_tile(
 ///
 /// This keeps state per vertex, which is sound because [`TileStore::update_tiles`] calls its
 /// closure exactly once per vertex of each tile, and only the vertex's owner has a non-zero
-/// delta for it (copies are zeroed by [`brush_tile`]): the vertex's entries are read and written
-/// by one thread a dab, and `c` is its value before this dab writes it. The same bits at any
-/// worker count.
+/// displacement for it (copies are zeroed by [`brush_tile`]): the vertex's entries are read and
+/// written by one thread a dab, and `c` is its value before this dab writes it. The same bits at
+/// any worker count.
+#[expect(
+    clippy::many_single_char_names,
+    reason = "the store's edit closure's names: tile n, vertex (i, j), correction c, and w"
+)]
 fn stroke_write(
     edits: &[TileDeltas],
+    deltas: &[Vec<Vec3>],
     states: &[Option<&TileStroke>],
     n: usize,
     i: u32,
@@ -1036,15 +1186,15 @@ fn stroke_write(
 ) -> Option<Vec3> {
     let tile = edits.get(n)?;
     let at = usize::try_from(j * tile.key.side() + i).ok()?;
-    let delta = tile.deltas.get(at).copied()?;
-    if delta == 0.0 {
+    let w = tile.deltas.get(at).copied()?;
+    if w == 0.0 {
         return None;
     }
-    let written = match states.get(n)? {
-        Some(state) => state.write(at, c.z, delta)?,
-        None => c.z + delta,
-    };
-    Some(Vec3::new(c.x, c.y, written))
+    let delta = deltas.get(n)?.get(at).copied()?;
+    match states.get(n)? {
+        Some(state) => state.write(at, c, delta),
+        None => Some(c + delta),
+    }
 }
 
 /// Raises the bound of every display tile a dab's writes can change.

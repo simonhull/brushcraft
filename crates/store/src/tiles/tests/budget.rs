@@ -752,8 +752,8 @@ fn a_stroke_share_that_does_not_fit_is_refused() {
     }
     assert_eq!(
         StoreConfig::STROKE_TILE_BYTES,
-        33_800,
-        "two f32 a vertex of the largest tile"
+        50_700,
+        "three f32 a vertex of the largest tile, one for each correction component"
     );
 }
 
@@ -770,6 +770,10 @@ fn the_stroke_share_comes_out_of_the_pools() {
         share,
         StoreConfig::DEFAULT_STROKE_TILES * StoreConfig::STROKE_TILE_BYTES,
         "the default share"
+    );
+    assert_eq!(
+        share, 25_958_400,
+        "512 tiles of 50,700 bytes: about 24.75 MiB"
     );
     assert_eq!(without.stroke_state_bytes(), Some(0), "none set aside");
     let stroked = new_store(&dir, "with.bcp", &mesh, with);

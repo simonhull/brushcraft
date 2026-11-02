@@ -11,8 +11,8 @@ use crate::tests::slab::{self, Slab};
 use crate::tests::sphere::Sphere;
 use crate::tests::{Camera, sample};
 use crate::{
-    Axis, Curve, DVec3, Dynamics, Entry, Hardness, Input, MIN_DAB_SIZE, MirrorPlanes, Param,
-    PathSettings, Radial, Radius, SPACING_TOLERANCE, ScreenPoint, SizeMode, Spacing, Strength,
+    Axis, Curve, DVec3, Dynamics, Entry, Hardness, Hit, Input, MIN_DAB_SIZE, MirrorPlanes, Param,
+    PathSettings, Radial, Radius, Ray, SPACING_TOLERANCE, ScreenPoint, SizeMode, Spacing, Strength,
     StrengthMode, Surface, Symmetry,
 };
 
@@ -700,6 +700,105 @@ fn each_dab_is_framed_along_the_stroke() {
         dabs.windows(2).all(|w| w[1].time >= w[0].time),
         "in time order"
     );
+}
+
+/// The plane, its area normals whatever `normal` gives for the dab's centre, radius and
+/// hardness, each call recorded.
+struct Tilted<F> {
+    /// The area normal's sum for a dab's centre, radius and hardness.
+    normal: F,
+    /// The dabs asked about: centre, radius, hardness.
+    asked: Vec<(DVec3, f64, f32)>,
+}
+
+impl<F: FnMut(DVec3) -> Option<DVec3>> Surface for Tilted<F> {
+    fn raycast(&mut self, ray: &Ray) -> Option<Hit> {
+        Plane.raycast(ray)
+    }
+
+    fn closest_on_region(&mut self, ray: &Ray, near: &Hit, reach: f64) -> Option<Hit> {
+        Plane.closest_on_region(ray, near, reach)
+    }
+
+    fn continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> bool {
+        Plane.continuous(a, b, reach)
+    }
+
+    fn area_normal(&mut self, center: DVec3, radius: f64, hardness: f32) -> Option<DVec3> {
+        self.asked.push((center, radius, hardness));
+        (self.normal)(center)
+    }
+}
+
+#[test]
+fn each_dab_takes_its_area_normal_with_a_tangent_along_the_stroke() {
+    let camera = top_camera();
+    let samples = line(screen(200.0, 400.0), screen(600.0, 200.0), 50, 0.5, 1.0);
+    // A sum that turns with x, never unit length: the dab takes it normalised.
+    let mut surface = Tilted {
+        normal: |c: DVec3| Some(DVec3::new(0.3 * c.x, -0.2, 2.0)),
+        asked: Vec::new(),
+    };
+    let (dabs, _) = run(&plain(), &camera, &mut surface, &samples);
+    assert!(dabs.len() > 3, "a stroke: {}", dabs.len());
+    assert_eq!(surface.asked.len(), dabs.len(), "asked once a dab placed");
+    let along = DVec3::new(2.0, 1.0, 0.0).normalized().unwrap();
+    let asked = dabs.iter().zip(&surface.asked);
+    for (dab, &(centre, radius, hardness)) in asked {
+        let want = DVec3::new(0.3 * centre.x, -0.2, 2.0).normalized().unwrap();
+        assert_eq!(
+            dab.normal,
+            want.to_f32_array(),
+            "its area normal, normalised"
+        );
+        assert!(
+            (centre - position(dab)).length() < 1e-6,
+            "asked at the dab's centre"
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the dab's radius is the f32 of it"
+        )]
+        let narrow = radius as f32;
+        assert_eq!(narrow.to_bits(), dab.radius.to_bits(), "its radius");
+        assert_eq!(hardness.to_bits(), dab.hardness.to_bits(), "its hardness");
+        let tangent = vector(dab.tangent);
+        assert!(
+            tangent.dot(vector(dab.normal)).abs() < 1e-6,
+            "the tangent is orthogonal to the area normal"
+        );
+        assert!(
+            tangent.dot(along) > 0.95,
+            "and along the stroke: {tangent:?}"
+        );
+    }
+}
+
+#[test]
+fn a_degenerate_area_normal_falls_back_to_the_hits_normal() {
+    let camera = top_camera();
+    let samples = line(screen(200.0, 400.0), screen(600.0, 200.0), 50, 0.5, 1.0);
+    let sums = [
+        None,
+        Some(DVec3::ZERO),
+        Some(DVec3::new(f64::NAN, 0.0, 1.0)),
+        Some(DVec3::new(f64::INFINITY, 0.0, 1.0)),
+    ];
+    for sum in sums {
+        let mut surface = Tilted {
+            normal: |_| sum,
+            asked: Vec::new(),
+        };
+        let (dabs, _) = run(&plain(), &camera, &mut surface, &samples);
+        assert!(dabs.len() > 3, "{sum:?}: a stroke");
+        for dab in &dabs {
+            assert_eq!(
+                dab.normal,
+                [0.0, 0.0, 1.0],
+                "{sum:?}: the plane's own normal"
+            );
+        }
+    }
 }
 
 /// A straight stroke for the properties: `length` pixels long, at a speed that changes.

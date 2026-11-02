@@ -29,7 +29,7 @@ pub(crate) const COINCIDENT: f64 = 0.01;
 pub(crate) struct Placed {
     /// The centre.
     pub(crate) position: DVec3,
-    /// The unit surface normal.
+    /// The unit area normal (see [`Dab::normal`](crate::Dab::normal)).
     pub(crate) normal: DVec3,
     /// The unit tangent along the stroke, perpendicular to the normal.
     pub(crate) tangent: DVec3,

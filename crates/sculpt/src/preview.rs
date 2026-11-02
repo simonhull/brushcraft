@@ -12,24 +12,19 @@
 //!
 //! A shown dab moves the finest tiles its sphere reaches as the store holds them, each gathered
 //! with its ring ([`TileStore::cached_positions_with_ring_many`]), as the finest work moves them:
-//! every point within its radius moves by the draw action's own amount
-//! ([`brush::draw_imprint_vertex`], the code `apply_dabs` runs) along its vertex's tangent-frame
-//! normal ([`TileStore::frame_normals_many`]), the axis the finest work changes the vertex's
-//! correction along. So a preview differs from what lands only by the stored encoding (the
-//! correction rounded to its tile's quantization once a stroke, and the frame's arithmetic): the
-//! surface a stroke places its next dabs on ([`StoreSurface`](crate::StoreSurface), which reads the
-//! previews) is the one its dabs will leave.
-//!
-//! A tile's frame normals come from the level below, which the brush never edits: they are
-//! computed once for each tile a dab shown reaches, and kept while any dab is shown. The normals
-//! of a block's ring and base-vertex rings are its neighbours' own, gathered as the positions are
-//! ([`geom::GatheredBlock::displace_along`]); a neighbour no dab shown reaches has none kept, and
-//! its points (which no dab moves) are given no direction.
+//! every point within its radius moves by the draw action's own move
+//! ([`brush::draw_imprint_vertex`] and [`brush::draw_move`], the code `apply_dabs` runs): its
+//! displacement along the dab's normal, the dab's area normal, one direction for every point. The
+//! finest work writes that move into the vertex's correction, in its tangent frame. So a preview
+//! differs from what lands only by the stored encoding (the correction rounded to its tile's
+//! quantization once a stroke, and the frame's arithmetic): the surface a stroke places its next
+//! dabs on ([`StoreSurface`](crate::StoreSurface), which reads the previews) is the one its dabs
+//! will leave.
 //!
 //! A tile's preview is its points as the store holds them, moved by every dab shown and not yet
-//! landed, in order. Each move is a function of a point's bits and its frame normal alone, which
-//! every tile holding the vertex (on every face) has alike, so every tile moves it to the same
-//! bits: previews meet at their seams bit for bit, as the store's tiles do.
+//! landed, in order ([`geom::GatheredBlock::displace`]). Each move is a function of a point's bits
+//! and the dab alone, so every tile holding the vertex (on every face) moves it to the same bits:
+//! previews meet at their seams bit for bit, as the store's tiles do.
 //!
 //! Each previewed tile's box in the spatial index is grown to hold its preview
 //! ([`SpatialIndex::cover`]), so the stroke's raycasts and queries find it where it is shown.
@@ -68,14 +63,10 @@
 //!
 //! Once no dab is shown, no tile is previewed.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use brush::{Imprint, Smoothstep, draw_imprint_vertex};
-use geom::{
-    BaseMesh, Channel, FaceId, GatheredBlock, LayerId, Level, PositionSource, Region, TileKey,
-    Vec3, gather_block,
-};
+use brush::{Imprint, Smoothstep, draw_imprint_vertex, draw_move};
+use geom::{GatheredBlock, TileKey, Vec3};
 use store::{Aabb, CacheError, Evaluation, SpatialIndex, TileStore};
 use stroke::Dab;
 
@@ -128,70 +119,18 @@ impl Moving {
     }
 
     /// Moves it by every one of `dabs`, in order: by each whose sphere its box touches as it
-    /// comes, along its points' frame normals (gathered from `frames` over `mesh`), its box made
-    /// again after each that moved a point.
-    fn move_by_every(&mut self, mesh: &BaseMesh, frames: &Frames, dabs: &[Imprint]) {
-        let mut along: Option<GatheredBlock> = None;
+    /// comes, its box made again after each that moved a point.
+    fn move_by_every(&mut self, dabs: &[Imprint]) {
         for dab in dabs {
             if !touches(self.bounds.as_ref(), dab, 0.0) {
                 continue;
             }
-            if along.is_none() {
-                along = frames.block(mesh, self.key);
-            }
-            let Some(along) = &along else {
-                return;
-            };
-            if move_by(&mut self.block, along, dab) {
+            if move_by(&mut self.block, dab) {
                 self.moved = true;
                 self.unmoved = false;
                 self.bounds = bounds_of(&self.block);
             }
         }
-    }
-}
-
-/// The frame normals of the tiles the dabs shown reach, each row-major `side²` (see "What a
-/// preview is" in the module notes).
-#[derive(Debug, Default)]
-struct Frames(BTreeMap<TileKey, Vec<Vec3>>);
-
-impl Frames {
-    /// The frame normals of tile `key`'s block, gathered as its positions are: its own, its
-    /// ring's and its base-vertex rings', each its tile's (a tile without kept normals gives
-    /// none). `None` if the gather fails (never, for a tile of the mesh).
-    fn block(&self, mesh: &BaseMesh, key: TileKey) -> Option<GatheredBlock> {
-        let source = FrameSource {
-            frames: self,
-            last: Cell::new(None),
-        };
-        gather_block(mesh, &source, Region::of_tile(&key)).ok()
-    }
-}
-
-/// [`Frames`] as a [`PositionSource`]: each vertex's frame normal from the tile holding it, the
-/// last tile read remembered (a gather reads row by row).
-struct FrameSource<'a> {
-    /// The frame normals.
-    frames: &'a Frames,
-    /// The last tile read and its normals.
-    last: Cell<Option<(TileKey, &'a [Vec3])>>,
-}
-
-impl PositionSource for FrameSource<'_> {
-    fn position(&self, face: FaceId, level: Level, i: u32, j: u32) -> Option<Vec3> {
-        let (key, li, lj) =
-            TileKey::containing(LayerId::BASE, Channel::DISPLACEMENT, face, level, i, j)?;
-        let normals = match self.last.get() {
-            Some((last, normals)) if last == key => normals,
-            _ => {
-                let normals = self.frames.0.get(&key).map_or(&[][..], Vec::as_slice);
-                self.last.set(Some((key, normals)));
-                normals
-            }
-        };
-        let at = usize::try_from(lj * key.side() + li).ok()?;
-        Some(normals.get(at).copied().unwrap_or(Vec3::ZERO))
     }
 }
 
@@ -211,8 +150,6 @@ pub struct Preview {
     /// The tiles they reach, previewed or untouched, by the box of their points as drawn (`None`
     /// for a tile of no finite point, which no dab reaches), and whether previewed.
     reached: BTreeMap<TileKey, (Option<Aabb>, bool)>,
-    /// The frame normals of the tiles reached (and of those being reached).
-    frames: Frames,
 }
 
 impl Preview {
@@ -322,20 +259,12 @@ impl Preview {
         }
         let incremental = moving.len();
         moving.extend(gathered);
-        if let Err(error) = self.know_frames(store, &moving) {
-            // Nothing shown: the previews taken go back as they were.
-            for tile in moving.into_iter().take(incremental) {
-                store.put_back_preview(tile.key, tile.block)?;
-            }
-            return Err(error);
-        }
         self.shown.extend(new.iter().copied());
         stats.dabs += new.len();
         let all: Vec<Imprint> = self.shown.iter().copied().collect();
         let (old, fresh) = moving.split_at_mut(incremental);
-        let (mesh, frames) = (store.mesh(), &self.frames);
-        store.par_map_mut(old, |tile| tile.move_by_every(mesh, frames, new));
-        store.par_map_mut(fresh, |tile| tile.move_by_every(mesh, frames, &all));
+        store.par_map_mut(old, |tile| tile.move_by_every(new));
+        store.par_map_mut(fresh, |tile| tile.move_by_every(&all));
         self.keep(store, index, moving, stats)
     }
 
@@ -386,7 +315,6 @@ impl Preview {
     ) -> Result<(), SculptError> {
         if self.shown.is_empty() {
             // Nothing shown any more: every preview goes back to the store's tile.
-            self.frames = Frames::default();
             for (key, (_, previewed)) in std::mem::take(&mut self.reached) {
                 if previewed {
                     store.clear_preview(&key);
@@ -498,37 +426,9 @@ impl Preview {
         for tile in &mut moving {
             tile.previewed = previewed.contains(&tile.key);
         }
-        if let Err(error) = self.know_frames(store, &moving) {
-            for key in &keys {
-                self.reached.remove(key);
-                store.clear_preview(key);
-            }
-            return Err(error);
-        }
         let shown: Vec<Imprint> = self.shown.iter().copied().collect();
-        let (mesh, frames) = (store.mesh(), &self.frames);
-        store.par_map_mut(&mut moving, |tile| tile.move_by_every(mesh, frames, &shown));
+        store.par_map_mut(&mut moving, |tile| tile.move_by_every(&shown));
         self.keep(store, index, moving, stats)
-    }
-
-    /// Computes the frame normals of every tile of `moving` not known yet, together on the
-    /// store's workers.
-    ///
-    /// # Errors
-    ///
-    /// As [`TileStore::frame_normals_many`].
-    fn know_frames(&mut self, store: &mut TileStore, moving: &[Moving]) -> Result<(), SculptError> {
-        let missing: Vec<TileKey> = moving
-            .iter()
-            .map(|tile| tile.key)
-            .filter(|key| !self.frames.0.contains_key(key))
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let normals = store.frame_normals_many(&missing)?;
-        self.frames.0.extend(missing.into_iter().zip(normals));
-        Ok(())
     }
 
     /// Clears every preview and forgets every tile reached, the dabs shown kept: for a landing
@@ -610,19 +510,23 @@ fn gather(store: &mut TileStore, keys: &[TileKey]) -> Result<Vec<Moving>, Sculpt
         .map_err(SculptError::from)
 }
 
-/// Moves every point of `block` within `dab`'s radius by the draw action's amount along its
-/// frame normal in `along` (the block's frame normals, gathered alike); whether it moved any.
-fn move_by(block: &mut GatheredBlock, along: &GatheredBlock, dab: &Imprint) -> bool {
+/// Moves every point of `block` within `dab`'s radius by the draw action's move, its
+/// displacement along the dab's normal ([`brush::draw_move`]); whether it moved any.
+///
+/// A point with no displacement (on the rim, or of none at the falloff's edge) keeps its bits:
+/// adding a zero move would turn a `-0.0` into `0.0`.
+fn move_by(block: &mut GatheredBlock, dab: &Imprint) -> bool {
     let mut moved = false;
-    block.displace_along(along, |p, normal| {
-        match draw_imprint_vertex(&Smoothstep, dab, [p.x, p.y, p.z]) {
+    block.displace(
+        |p| match draw_imprint_vertex(&Smoothstep, dab, [p.x, p.y, p.z]) {
             Some(w) if w != 0.0 => {
                 moved = true;
-                p + normal * w
+                let [x, y, z] = draw_move(dab, w);
+                p + Vec3::new(x, y, z)
             }
             _ => p,
-        }
-    });
+        },
+    );
     moved
 }
 

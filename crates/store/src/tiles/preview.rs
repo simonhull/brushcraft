@@ -38,7 +38,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use geom::{Channel, GatheredBlock, Level, Region, TileKey, Vec3};
 
 use super::TileStore;
+use super::config::Evaluation;
 use super::error::CacheError;
+use super::round::map_parallel;
 use crate::Aabb;
 use crate::stale::EpochKind;
 
@@ -288,6 +290,67 @@ impl TileStore {
                 .normals
                 .get_or_init(|| block.normals(mesh).as_slice().to_vec())
         }))
+    }
+
+    /// Makes the normals of each of `keys` on the stroke's surface at hand, for
+    /// [`TileStore::cached_surface_normals`]: a previewed tile's made from its block, those not
+    /// made yet together on the store's workers; every other tile's evaluated, together, as
+    /// [`TileStore::evaluate_many`] does with [`Evaluation::Normals`]. The bits
+    /// [`TileStore::surface_normals`] gives, many tiles at once.
+    ///
+    /// The store's normals are cached, not pinned: read them right after, before anything else
+    /// is evaluated. A tile whose normals are pushed out of the cache before they are read is
+    /// read through [`TileStore::surface_normals`] instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate_many`].
+    pub fn prepare_surface_normals(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {
+        let unmade: Vec<(TileKey, &GatheredBlock)> = keys
+            .iter()
+            .filter_map(|key| {
+                let shown = self.previews.blocks.get(key)?;
+                let block = shown.block.as_ref()?;
+                shown.normals.get().is_none().then_some((*key, block))
+            })
+            .collect();
+        let mesh = &*self.mesh;
+        let made = map_parallel(&self.workers, &unmade, |&(_, block)| {
+            block.normals(mesh).as_slice().to_vec()
+        });
+        let keyed: Vec<TileKey> = unmade.into_iter().map(|(key, _)| key).collect();
+        for (key, normals) in keyed.into_iter().zip(made) {
+            if let Some(shown) = self.previews.blocks.get(&key) {
+                // Unmade just above: the cell takes them (a duplicate key's second set is dropped).
+                drop(shown.normals.set(normals));
+            }
+        }
+        let stored: Vec<TileKey> = keys
+            .iter()
+            .filter(|key| {
+                self.previews
+                    .blocks
+                    .get(key)
+                    .is_none_or(|shown| shown.block.is_none())
+            })
+            .copied()
+            .collect();
+        if !stored.is_empty() {
+            self.evaluate_many(&stored, Evaluation::Normals)?;
+        }
+        Ok(())
+    }
+
+    /// Tile `key`'s normals on the stroke's surface if they are at hand without computing: its
+    /// preview's if they were made ([`TileStore::prepare_surface_normals`],
+    /// [`TileStore::surface_normals`]), else the store's as cached
+    /// ([`TileStore::cached_normals`]). A previewed tile whose normals weren't made has none.
+    #[must_use]
+    pub fn cached_surface_normals(&self, key: &TileKey) -> Option<&[Vec3]> {
+        match self.previews.blocks.get(key) {
+            Some(shown) if shown.block.is_some() => shown.normals.get().map(Vec::as_slice),
+            _ => self.cached_normals(key),
+        }
     }
 
     /// Takes finest tile `key`'s preview out to move it, if it has one: the brush sets it again

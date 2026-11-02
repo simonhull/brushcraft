@@ -1,16 +1,16 @@
-//! A stroke's state: each touched vertex's start and summed deltas, kept in `f32` so a dab's
-//! small delta isn't rounded away by the tile's quantization (see [`Stroke`]).
+//! A stroke's state: the value each touched vertex's correction is being built to, kept in `f32`
+//! so a dab's small delta isn't rounded away by the tile's quantization (see [`Stroke`]).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use geom::{TILE_QUADS, TileKey};
+use geom::{TILE_QUADS, TileKey, Vec3};
 use store::{OpId, StoreId, TileStore};
 
 /// Vertices of the largest tile, the entries of each [`TileStroke`]: `(TILE_QUADS + 1)²`.
 const ENTRIES: usize = (TILE_QUADS as usize + 1) * (TILE_QUADS as usize + 1);
 
-/// The bits of a start not captured yet: a NaN, which a stored correction never is.
+/// The bits of a value not captured yet: a NaN, which a stored correction never is.
 const NO_START: u32 = f32::NAN.to_bits();
 
 /// The state one brush stroke keeps across its dabs, so that its small dabs move a tile's
@@ -19,10 +19,12 @@ const NO_START: u32 = f32::NAN.to_bits();
 /// A tile stores its interior corrections quantized to a step of its scale, and its border
 /// vertices exactly. Were each dab to add its delta to the stored value, a delta under half a
 /// step would vanish on the interior and be kept on the border, building ridges along tile
-/// seams. Instead, for every vertex a stroke writes, it keeps the correction's `z` as it first
-/// found it (the start) and the sum of its deltas, both in `f32`, and writes `start + sum`: the
-/// stored value is rounded when it is written, not added to dab by dab, and interior and border
-/// move alike.
+/// seams. Instead, for every vertex a stroke writes, it keeps the value it is building for each of
+/// the correction's three components in `f32`: the correction as it first found it (the start),
+/// plus every dab's delta since, and writes that. The stored value is rounded when it is written,
+/// not added to dab by dab, and interior and border move alike. All three components: draw moves
+/// a vertex along the dab's area normal, which is no vertex's own frame normal, so its deltas have
+/// tangential parts too, and they need the same once-a-stroke rounding as the normal part.
 ///
 /// # Error bound
 ///
@@ -35,8 +37,8 @@ const NO_START: u32 = f32::NAN.to_bits();
 ///
 /// # Memory
 ///
-/// [`Stroke::new`] allocates the state of [`TileStore::stroke_tiles`] tiles up front, two `f32`
-/// per vertex of the largest tile ([`store::StoreConfig::STROKE_TILE_BYTES`], 33,800 bytes), and
+/// [`Stroke::new`] allocates the state of [`TileStore::stroke_tiles`] tiles up front, three `f32`
+/// per vertex of the largest tile ([`store::StoreConfig::STROKE_TILE_BYTES`], 50,700 bytes), and
 /// nothing more while it is used over that store: the store has set that much aside from its
 /// budget ([`store::StoreConfig::stroke_tiles`]). A store reserves for one stroke state, so keep
 /// one `Stroke` per store for the session, and pass it to every [`crate::apply_dabs`]. It starts
@@ -82,9 +84,9 @@ pub struct Stroke {
 /// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Grant {
-    /// The tile held state before the dab: its starts and sums go on.
+    /// The tile held state before the dab: its values go on.
     Held,
-    /// The tile was given a buffer at the dab: every start uncaptured, every sum zero.
+    /// The tile was given a buffer at the dab: every value uncaptured.
     Taken,
     /// No buffer was free or could be released: the tile is written per dab (see "The thrash
     /// limit" on [`Stroke`]).
@@ -319,7 +321,7 @@ impl Stroke {
                 }),
             };
             if let Some(mut tile) = buffer {
-                tile.fill(&state.start, &state.acc);
+                tile.fill(&state.value);
                 self.tiles.insert(state.key, tile);
             }
         }
@@ -345,14 +347,14 @@ impl Stroke {
         self.tiles.len() + self.free.len()
     }
 
-    /// Everything the stroke holds, in bits: its book, and each held tile's starts and sums.
-    /// Two strokes that would write the same from now on have the same.
+    /// Everything the stroke holds, in bits: its book, and each held tile's values. Two strokes
+    /// that would write the same from now on have the same.
     #[cfg(test)]
     pub(crate) fn bits(&self) -> (Book, Vec<TileBits>) {
         let tiles = self.tiles.iter().map(|(key, tile)| {
             let entries = (0..ENTRIES)
                 .filter_map(|at| tile.entry(at))
-                .map(|(start, acc)| (start.to_bits(), acc.to_bits()))
+                .map(Vec3::to_bits)
                 .collect();
             (*key, entries)
         });
@@ -368,12 +370,12 @@ impl Stroke {
     }
 }
 
-/// A held tile's stroke state in bits, for the tests: each entry's start and sum.
+/// A held tile's stroke state in bits, for the tests: each entry's value.
 #[cfg(test)]
-pub(crate) type TileBits = (TileKey, Vec<(u32, u32)>);
+pub(crate) type TileBits = (TileKey, Vec<[u32; 3]>);
 
 /// The stroke state a tile ends a frame's dabs with, for [`Stroke::end_frame`]: per vertex of
-/// the tile, row-major, the start and the sum as [`TileStroke`] holds them.
+/// the tile, row-major, the value as [`TileStroke`] holds it.
 #[derive(Debug)]
 pub(crate) struct FinalState {
     /// The tile.
@@ -381,116 +383,111 @@ pub(crate) struct FinalState {
     /// Whether the tile held state from before the dabs and kept it throughout, so these values
     /// continue the buffer it holds.
     pub(crate) continuous: bool,
-    /// Each vertex's start, `NaN` where the stroke hasn't captured one.
-    pub(crate) start: Vec<f32>,
-    /// Each vertex's sum of the stroke's deltas.
-    pub(crate) acc: Vec<f32>,
+    /// Each vertex's value, every component `NaN` where the stroke hasn't captured one.
+    pub(crate) value: Vec<Vec3>,
 }
 
 /// One tile's stroke state: per vertex, row-major in the tile's own side (a coarser tile uses
-/// the first `side²` entries), the start and the sum of the stroke's deltas.
+/// the first `side²` entries), the value the stroke is building for each of the correction's
+/// three components.
 ///
 /// The entries are atomics only because the store's edit calls its closure on several threads
 /// (it is `Fn + Sync`): each vertex's entries are touched by one thread per dab, and one dab's
 /// edit ends before the next begins, so [`Ordering::Relaxed`] is enough and the result is the
 /// same at any worker count (see [`TileStroke::write`]).
 pub(crate) struct TileStroke {
-    /// The `f32` bits of each vertex's correction `z` as the stroke first found it, or
-    /// [`NO_START`] until the stroke first writes it.
-    start: Box<[AtomicU32]>,
-    /// The `f32` bits of the sum of the stroke's deltas for each vertex, from zero.
-    acc: Box<[AtomicU32]>,
+    /// The `f32` bits of each vertex's value, its three components in turn: the correction as the
+    /// stroke first found it plus every delta since, or [`NO_START`] in every component until the
+    /// stroke first writes it.
+    value: Box<[AtomicU32]>,
 }
 
 impl std::fmt::Debug for TileStroke {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TileStroke")
-            .field("entries", &self.start.len())
+            .field("entries", &(self.value.len() / 3))
             .finish_non_exhaustive()
     }
 }
 
 impl TileStroke {
-    /// A tile's state for the largest tile, every start not captured and every sum zero.
+    /// A tile's state for the largest tile, every value not captured.
     fn new() -> Self {
         Self {
-            start: (0..ENTRIES).map(|_| AtomicU32::new(NO_START)).collect(),
-            acc: (0..ENTRIES)
-                .map(|_| AtomicU32::new(0.0_f32.to_bits()))
-                .collect(),
+            value: (0..3 * ENTRIES).map(|_| AtomicU32::new(NO_START)).collect(),
         }
     }
 
-    /// Readies the buffer for a tile first edited now: no start captured and every sum zero,
-    /// clearing what an earlier tile left.
+    /// Readies the buffer for a tile first edited now: no value captured, clearing what an
+    /// earlier tile left.
     ///
     /// Every entry is cleared: at the levels a brush edits, every tile is the largest, so
     /// clearing only a tile's own `side²` entries would save nothing; and skipping buffers still
     /// clean from [`TileStroke::new`] measured no faster (the cold first dab of the medium
     /// project's `brush`, interleaved runs).
     fn take(&mut self) {
-        for start in &mut self.start {
-            *start.get_mut() = NO_START;
-        }
-        for acc in &mut self.acc {
-            *acc.get_mut() = 0.0_f32.to_bits();
+        for value in &mut self.value {
+            *value.get_mut() = NO_START;
         }
     }
 
-    /// Sets the first entries' starts to `start` and their sums to `acc`: a tile's state as
-    /// dabs written together left it ([`Stroke::end_frame`]).
-    fn fill(&mut self, start: &[f32], acc: &[f32]) {
-        let starts = self.start.iter_mut().zip(start);
-        for (to, value) in starts {
-            *to.get_mut() = value.to_bits();
-        }
-        let sums = self.acc.iter_mut().zip(acc);
-        for (to, value) in sums {
-            *to.get_mut() = value.to_bits();
+    /// Sets the first entries' values to `value`: a tile's state as dabs written together left it
+    /// ([`Stroke::end_frame`]).
+    fn fill(&mut self, value: &[Vec3]) {
+        let entries = self.value.as_chunks_mut::<3>().0.iter_mut().zip(value);
+        for (to, built) in entries {
+            let components = to.iter_mut().zip([built.x, built.y, built.z]);
+            for (component, v) in components {
+                *component.get_mut() = v.to_bits();
+            }
         }
     }
 
-    /// Entry `at`'s start (`NaN` if the stroke hasn't captured it) and sum, as they are now;
-    /// `None` if `at` is past the entries.
-    pub(crate) fn entry(&self, at: usize) -> Option<(f32, f32)> {
-        let start = f32::from_bits(self.start.get(at)?.load(Ordering::Relaxed));
-        let acc = f32::from_bits(self.acc.get(at)?.load(Ordering::Relaxed));
-        Some((start, acc))
+    /// Entry `at`'s value as the stroke holds it now, every component `NaN` where it hasn't
+    /// captured the vertex; `None` if `at` is past the entries.
+    pub(crate) fn entry(&self, at: usize) -> Option<Vec3> {
+        let [x, y, z] = self.components(at)?;
+        let load = |c: &AtomicU32| f32::from_bits(c.load(Ordering::Relaxed));
+        Some(Vec3::new(load(x), load(y), load(z)))
     }
 
-    /// The `z` to write for entry `at`, whose correction's `z` is stored as `current`, after
-    /// adding `delta` to its sum: `start + sum`, capturing `current` as the start if this is the
-    /// stroke's first write of it. `None` if `at` is past the entries (never, for a tile's own
-    /// vertex).
+    /// The atomics of entry `at`'s three components; `None` if `at` is past the entries.
+    fn components(&self, at: usize) -> Option<&[AtomicU32; 3]> {
+        let first = at.checked_mul(3)?;
+        self.value
+            .get(first..first.checked_add(3)?)?
+            .try_into()
+            .ok()
+    }
+
+    /// The correction to write for entry `at`, whose correction is stored as `current`, after
+    /// adding `delta`: the value the stroke builds ([`stroke_sum`]), capturing `current` as its
+    /// start if this is the stroke's first write of it. `None` if `at` is past the entries
+    /// (never, for a tile's own vertex).
     ///
     /// The store's edit calls its closure exactly once per vertex of each tile, a tile's interior
     /// on one thread, and the brush gives a vertex its delta in one tile alone (its owner): so
     /// this entry is read and written by one thread in a dab, and `current` is the value before
     /// this dab writes it, which, the first time, is the value the stroke found.
-    pub(crate) fn write(&self, at: usize, current: f32, delta: f32) -> Option<f32> {
-        let start_bits = self.start.get(at)?;
-        let acc_bits = self.acc.get(at)?;
-        let (start, acc) = stroke_sum(
-            f32::from_bits(start_bits.load(Ordering::Relaxed)),
-            f32::from_bits(acc_bits.load(Ordering::Relaxed)),
-            current,
-            delta,
-        );
-        start_bits.store(start.to_bits(), Ordering::Relaxed);
-        acc_bits.store(acc.to_bits(), Ordering::Relaxed);
-        Some(start + acc)
+    pub(crate) fn write(&self, at: usize, current: Vec3, delta: Vec3) -> Option<Vec3> {
+        let built = stroke_sum(self.entry(at)?, current, delta);
+        let components = self.components(at)?.iter().zip([built.x, built.y, built.z]);
+        for (to, v) in components {
+            to.store(v.to_bits(), Ordering::Relaxed);
+        }
+        Some(built)
     }
 }
 
-/// A vertex's start and sum after a write of `delta`; the value written is their sum.
+/// A vertex's value after a write of `delta`, which is also the correction written.
 ///
-/// From its start `start` (`NaN` if not captured yet) and sum `acc`, its correction's `z`
-/// stored as `current`: the start is `current` if it wasn't captured, and the sum gains
-/// `delta`.
+/// From its value `built` (every component `NaN` if not captured yet) and its correction stored
+/// as `current`: the start is `current` if the value wasn't captured, and the value gains `delta`,
+/// component by component.
 ///
 /// The one arithmetic of a stroke's write, shared by [`TileStroke::write`] and a frame's
 /// replay of its dabs, so both give the same bits.
-pub(crate) fn stroke_sum(start: f32, acc: f32, current: f32, delta: f32) -> (f32, f32) {
-    let start = if start.is_nan() { current } else { start };
-    (start, acc + delta)
+pub(crate) fn stroke_sum(built: Vec3, current: Vec3, delta: Vec3) -> Vec3 {
+    let start = if built.x.is_nan() { current } else { built };
+    start + delta
 }

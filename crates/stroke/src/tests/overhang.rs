@@ -191,4 +191,9 @@ impl Surface for Overhang {
     fn continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> bool {
         Self::path(a, b) <= reach
     }
+
+    fn area_normal(&mut self, _center: DVec3, _radius: f64, _hardness: f32) -> Option<DVec3> {
+        // Not modelled: placement takes the hit's normal, as for a degenerate sum.
+        None
+    }
 }

@@ -115,10 +115,16 @@ pub(crate) fn tiles(mesh: &BaseMesh, level: Level) -> Vec<TileKey> {
 }
 
 /// A draw dab at `position` of `radius`, `strength` and `hardness`, number `seq`.
+///
+/// It pushes outward from the origin (the test meshes' centre: about the area normal of a dab on
+/// them), or along `+z` at the origin itself.
 pub(crate) fn dab(position: Vec3, radius: f32, strength: f32, hardness: f32, seq: u32) -> Dab {
+    let normal = position
+        .normalized()
+        .unwrap_or_else(|| Vec3::new(0.0, 0.0, 1.0));
     Dab {
         position: [position.x, position.y, position.z],
-        normal: [0.0, 0.0, 1.0],
+        normal: [normal.x, normal.y, normal.z],
         tangent: [1.0, 0.0, 0.0],
         radius,
         strength,

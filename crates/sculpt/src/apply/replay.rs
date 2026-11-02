@@ -8,12 +8,12 @@ use std::collections::BTreeMap;
 
 use brush::{Imprint, Smoothstep, draw_imprint};
 use geom::{
-    CorrectionError, CorrectionTile, CorrectionView, Prediction, TileBorder, TileKey, Topology,
-    Vec3,
+    CorrectionError, CorrectionTile, CorrectionView, Frame, Prediction, TileBorder, TileKey,
+    Topology, Vec3,
 };
 use store::{Aabb, TileStore};
 
-use super::vertices;
+use super::{frame_delta, vertices};
 use crate::state::{Book, FinalState, Grant, Stroke, stroke_sum};
 
 /// Which stroke state each tile's writes take, at each dab of a run.
@@ -81,7 +81,7 @@ impl Plan {
     }
 
     /// Whether `key`'s state is taken afresh at a dab of the run after `after` (all of them, for
-    /// `None`) up to `dab`, included: its starts and sums restart from nothing then.
+    /// `None`) up to `dab`, included: its values restart from nothing then.
     fn taken_between(&self, key: &TileKey, after: Option<usize>, dab: usize) -> bool {
         let Self::Granted(grants) = self else {
             return false;
@@ -165,6 +165,20 @@ pub(super) struct TileInput<'a> {
     /// Its prediction, for its positions after each edit: needed when more than one dab can
     /// reach it, so for every tile of a run of two dabs or more.
     pub(super) prediction: Option<&'a Prediction>,
+    /// Its frames, row-major, for a tile without a prediction: the axes its deltas are written
+    /// along ([`frame_delta`]). With a prediction, its frames are the prediction's.
+    pub(super) frames: Option<&'a [Frame]>,
+}
+
+impl TileInput<'_> {
+    /// Vertex `(i, j)`'s tangent frame: the prediction's, else the frames listed; `None` for a
+    /// vertex neither holds (never, for a tile and prediction of the same side).
+    fn frame(&self, i: u32, j: u32) -> Option<Frame> {
+        if let Some(prediction) = self.prediction {
+            return prediction.frame(i, j);
+        }
+        self.frames?.get(at(self.key.side(), i, j)).copied()
+    }
 }
 
 /// What one dab did to a tile it edited (one owning a vertex it moved).
@@ -174,7 +188,7 @@ pub(super) struct DabEdit {
     pub(super) dab: usize,
     /// The vertices it moved that the tile owns.
     pub(super) moved: usize,
-    /// The largest of their deltas, in magnitude.
+    /// The largest of their displacements, in magnitude: the farthest it moved one.
     pub(super) delta: f32,
     /// The tile's quantization step after the dab's writes.
     pub(super) scale: f32,
@@ -193,9 +207,9 @@ pub(super) enum Stopped {
     /// The mesh lists no border for the tile (a tile holding a vertex twice, which no mesh the
     /// store accepts has).
     NoBorder,
-    /// A vertex the replay reads isn't where it looks: its position, delta, correction or
-    /// prediction is missing (never, for a tile and prediction of the same side). Rather than
-    /// carry on from a made-up value, the run is applied one dab at a time.
+    /// A vertex the replay reads isn't where it looks: its position, displacement, correction,
+    /// frame or prediction is missing (never, for a tile and prediction of the same side). Rather
+    /// than carry on from a made-up value, the run is applied one dab at a time.
     Inconsistent,
 }
 
@@ -219,14 +233,15 @@ pub(super) struct TileOutcome {
     pub(super) stopped: Option<Stopped>,
 }
 
-/// A vertex's stroke state as a replay carries it: the start and sum, and the dab of the run
-/// it was last brought up to (`None`: as the run found it).
+/// A value not captured yet, as the stroke holds one: every component `NaN`.
+const UNCAPTURED: Vec3 = Vec3::new(f32::NAN, f32::NAN, f32::NAN);
+
+/// A vertex's stroke state as a replay carries it: the value its correction is being built to,
+/// and the dab of the run it was last brought up to (`None`: as the run found it).
 #[derive(Debug, Clone, Copy)]
 struct Entry {
-    /// The start, `NaN` if not captured.
-    start: f32,
-    /// The sum of the stroke's deltas.
-    acc: f32,
+    /// The value, every component `NaN` if not captured.
+    value: Vec3,
     /// The last dab of the run that wrote it.
     as_of: Option<usize>,
 }
@@ -235,33 +250,34 @@ impl Entry {
     /// `owner`'s entry `at` as the stroke holds it when the run begins: fresh if it holds no
     /// state for `owner`.
     fn found(stroke: &Stroke, owner: &TileKey, at: usize) -> Self {
-        let (start, acc) = stroke
+        let value = stroke
             .held(owner)
             .and_then(|state| state.entry(at))
-            .unwrap_or((f32::NAN, 0.0));
-        Self {
-            start,
-            acc,
-            as_of: None,
-        }
+            .unwrap_or(UNCAPTURED);
+        Self { value, as_of: None }
     }
 
-    /// The `z` this entry's vertex, owned by `owner`, is written with at `dab`, whose stored
-    /// `z` is `current` before the write, for a delta of `delta`: as the store's edit writes it
-    /// (see `stroke_write` in [`super`]), the plan saying which state the owner has.
-    fn write(&mut self, plan: &Plan, owner: &TileKey, dab: usize, current: f32, delta: f32) -> f32 {
+    /// The correction this entry's vertex, owned by `owner`, is written with at `dab`, whose
+    /// stored correction is `current` before the write, for a delta of `delta`: as the store's
+    /// edit writes it (see `stroke_write` in [`super`]), the plan saying which state the owner
+    /// has.
+    fn write(
+        &mut self,
+        plan: &Plan,
+        owner: &TileKey,
+        dab: usize,
+        current: Vec3,
+        delta: Vec3,
+    ) -> Vec3 {
         if plan.taken_between(owner, self.as_of, dab) {
-            self.start = f32::NAN;
-            self.acc = 0.0;
+            self.value = UNCAPTURED;
         }
         self.as_of = Some(dab);
         if plan.grant(owner, dab) == Grant::Without {
             return current + delta;
         }
-        let (start, acc) = stroke_sum(self.start, self.acc, current, delta);
-        self.start = start;
-        self.acc = acc;
-        start + acc
+        self.value = stroke_sum(self.value, current, delta);
+        self.value
     }
 }
 
@@ -269,10 +285,8 @@ impl Entry {
 /// for it or fresh, and the dab it was last brought up to.
 #[derive(Debug)]
 struct StrokeState {
-    /// Each vertex's start.
-    start: Vec<f32>,
-    /// Each vertex's sum.
-    acc: Vec<f32>,
+    /// Each vertex's value.
+    value: Vec<Vec3>,
     /// The last dab of the run that wrote it.
     as_of: Option<usize>,
     /// Whether it still continues the buffer the stroke held for the tile.
@@ -283,17 +297,11 @@ impl StrokeState {
     /// `key`'s state as the stroke holds it when the run begins (`entries` of them), or fresh.
     fn found(stroke: &Stroke, key: &TileKey, entries: usize) -> Self {
         let held = stroke.held(key);
-        let mut start = vec![f32::NAN; entries];
-        let mut acc = vec![0.0; entries];
-        if let Some(state) = held {
-            let slots = start.iter_mut().zip(acc.iter_mut()).enumerate();
-            for (at, (to_start, to_acc)) in slots {
-                (*to_start, *to_acc) = state.entry(at).unwrap_or((f32::NAN, 0.0));
-            }
-        }
+        let value = (0..entries)
+            .map(|at| held.and_then(|state| state.entry(at)).unwrap_or(UNCAPTURED))
+            .collect();
         Self {
-            start,
-            acc,
+            value,
             as_of: None,
             continuous: held.is_some(),
         }
@@ -303,26 +311,23 @@ impl StrokeState {
     /// afresh since it was last brought up.
     fn reach(&mut self, plan: &Plan, key: &TileKey, dab: usize) {
         if plan.taken_between(key, self.as_of, dab) {
-            self.start.fill(f32::NAN);
-            self.acc.fill(0.0);
+            self.value.fill(UNCAPTURED);
             self.continuous = false;
         }
         self.as_of = Some(dab);
     }
 
-    /// The `z` entry `at` is written with, as [`Entry::write`] for the tile's own vertex, the
-    /// state brought to the dab already, which `grant` the dab's.
-    fn write(&mut self, grant: Grant, at: usize, current: f32, delta: f32) -> f32 {
-        let (Some(start), Some(acc)) = (self.start.get_mut(at), self.acc.get_mut(at)) else {
+    /// The correction entry `at` is written with, as [`Entry::write`] for the tile's own vertex,
+    /// the state brought to the dab already, which `grant` the dab's.
+    fn write(&mut self, grant: Grant, at: usize, current: Vec3, delta: Vec3) -> Vec3 {
+        let Some(value) = self.value.get_mut(at) else {
             return current + delta;
         };
         if grant == Grant::Without {
             return current + delta;
         }
-        let (new_start, new_acc) = stroke_sum(*start, *acc, current, delta);
-        *start = new_start;
-        *acc = new_acc;
-        new_start + new_acc
+        *value = stroke_sum(*value, current, delta);
+        *value
     }
 }
 
@@ -365,7 +370,7 @@ struct Replay<'a> {
     brushed: Vec<u32>,
     /// Whether a write moved positions the tile has no prediction to give.
     stale: bool,
-    /// Each vertex's delta of the dab being applied.
+    /// Each vertex's displacement by the dab being applied, along the dab's normal.
     deltas: Vec<f32>,
     /// The owner of each border vertex, found when first needed.
     owners: Option<BTreeMap<(u32, u32), Owner>>,
@@ -390,7 +395,7 @@ struct Moves {
     inside: usize,
     /// The first and last row holding one of them.
     rows: Option<(u32, u32)>,
-    /// The largest of their deltas, in magnitude.
+    /// The largest of their displacements, in magnitude.
     largest: f32,
     /// The border vertices it moves, in row-major order.
     border: Vec<(u32, u32)>,
@@ -474,7 +479,7 @@ impl<'a> Replay<'a> {
             }
             if self.brush(imprint)? > 0 {
                 self.reached = true;
-                self.apply(dab)?;
+                self.apply(dab, imprint)?;
             }
         }
         Ok(())
@@ -523,13 +528,15 @@ impl<'a> Replay<'a> {
         Ok(inside)
     }
 
-    /// Writes dab `dab`'s deltas, as the store's edit of the tile would (interior row by row,
-    /// then the border), and brings the positions up to date.
+    /// Writes dab `dab`'s deltas, `imprint`'s moves in each vertex's frame, as the store's edit of
+    /// the tile would (interior row by row, then the border), and brings the positions up to
+    /// date.
     ///
     /// # Errors
     ///
-    /// [`Stopped::Refused`] for a value the tile can't hold; [`Stopped::NoBorder`].
-    fn apply(&mut self, dab: usize) -> Result<(), Stopped> {
+    /// [`Stopped::Refused`] for a value the tile can't hold; [`Stopped::NoBorder`];
+    /// [`Stopped::Inconsistent`] for a vertex without a frame.
+    fn apply(&mut self, dab: usize, imprint: &Imprint) -> Result<(), Stopped> {
         let key = self.input.key;
         let side = key.side();
         let scan = Moves::scan(side, &self.deltas, &self.brushed);
@@ -548,10 +555,10 @@ impl<'a> Replay<'a> {
         let scale = self.tile.scale();
         let mut changed: Vec<usize> = Vec::new();
         if let Some(rows) = scan.rows {
-            self.write_interior(grant.unwrap_or(Grant::Held), rows, &mut changed)?;
+            self.write_interior(imprint, grant.unwrap_or(Grant::Held), rows, &mut changed)?;
         }
         for &((i, j), owner) in &border {
-            self.write_border(dab, (i, j), owner, grant.unwrap_or(Grant::Held))?;
+            self.write_border(dab, imprint, (i, j), owner, grant.unwrap_or(Grant::Held))?;
             changed.push(at(side, i, j));
         }
         if moved > 0 {
@@ -614,20 +621,24 @@ impl<'a> Replay<'a> {
 
     /// Writes the interior's deltas row by row through the tile's own view
     /// ([`geom::CorrectionViewMut::update_interior_row`], the store's own edit of an interior),
-    /// each vertex's `z` from the tile's stroke state under `grant`, noting each vertex written
-    /// in `changed`. Only `rows`, the first and last row with a delta, are visited: the rows
-    /// outside them would write nothing.
+    /// each vertex's correction from the tile's stroke state under `grant`, its delta `imprint`'s
+    /// move in its frame ([`frame_delta`]), noting each vertex written in `changed`. Only `rows`,
+    /// the first and last row with a displacement, are visited: the rows outside them would write
+    /// nothing.
     ///
     /// # Errors
     ///
-    /// [`Stopped::Refused`] for a value the tile can't hold.
+    /// [`Stopped::Refused`] for a value the tile can't hold; [`Stopped::Inconsistent`] for a
+    /// vertex without a displacement or frame.
     fn write_interior(
         &mut self,
+        imprint: &Imprint,
         grant: Grant,
         (first, last): (u32, u32),
         changed: &mut Vec<usize>,
     ) -> Result<(), Stopped> {
         let side = self.input.key.side();
+        let input = self.input;
         let deltas = &self.deltas;
         let own = &mut self.own;
         let mut view = self.tile.view_mut();
@@ -635,18 +646,23 @@ impl<'a> Replay<'a> {
         for j in first..=last {
             let row = view.update_interior_row(j, |i, j, c| {
                 let at = at(side, i, j);
-                let Some(&delta) = deltas.get(at) else {
+                let Some(&w) = deltas.get(at) else {
                     missing = true;
                     return None;
                 };
-                if delta == 0.0 {
+                if w == 0.0 {
                     return None;
                 }
-                let z = own
+                let Some(frame) = input.frame(i, j) else {
+                    missing = true;
+                    return None;
+                };
+                let delta = frame_delta(&frame, imprint, w);
+                let written = own
                     .as_mut()
-                    .map_or(c.z + delta, |own| own.write(grant, at, c.z, delta));
+                    .map_or(c + delta, |own| own.write(grant, at, c, delta));
                 changed.push(at);
-                Some(Vec3::new(c.x, c.y, z))
+                Some(written)
             });
             if let Some(error) = row.error {
                 return Err(Stopped::Refused(error));
@@ -658,45 +674,54 @@ impl<'a> Replay<'a> {
         Ok(())
     }
 
-    /// Writes border vertex `(i, j)`'s delta of dab `dab`, its `z` from its owner's stroke
-    /// state: the tile's own under `grant` if it owns the vertex, else the copy of the owner's
-    /// state this tile carries.
+    /// Writes border vertex `(i, j)`'s delta of dab `dab` (`imprint`'s move in the vertex's
+    /// frame, which every copy of it holds alike), its correction from its owner's stroke state:
+    /// the tile's own under `grant` if it owns the vertex, else the copy of the owner's state this
+    /// tile carries.
     ///
     /// # Errors
     ///
     /// [`Stopped::Refused`] for a value that isn't finite; [`Stopped::Inconsistent`] for a vertex
-    /// the tile or its deltas don't hold.
+    /// the tile, its displacements or its frames don't hold.
     fn write_border(
         &mut self,
         dab: usize,
+        imprint: &Imprint,
         (i, j): (u32, u32),
         owner: Owner,
         grant: Grant,
     ) -> Result<(), Stopped> {
         let side = self.input.key.side();
         let at = at(side, i, j);
-        let (Some(&delta), Some(c)) = (self.deltas.get(at), self.tile.get(i, j)) else {
+        let (Some(&w), Some(c), Some(frame)) = (
+            self.deltas.get(at),
+            self.tile.get(i, j),
+            self.input.frame(i, j),
+        ) else {
             return Err(Stopped::Inconsistent);
         };
-        let z = if owner.own {
+        let delta = frame_delta(&frame, imprint, w);
+        let written = if owner.own {
             self.own
                 .as_mut()
-                .map_or(c.z + delta, |own| own.write(grant, at, c.z, delta))
+                .map_or(c + delta, |own| own.write(grant, at, c, delta))
         } else {
             let stroke = self.run.stroke;
             let entry = self
                 .copies
                 .entry((i, j))
                 .or_insert_with(|| Entry::found(stroke, &owner.key, owner.at));
-            let z = entry.write(self.run.plan, &owner.key, dab, c.z, delta);
+            let written = entry.write(self.run.plan, &owner.key, dab, c, delta);
             // A copy written with other bits than its owner's: what the store must refuse.
             #[cfg(test)]
-            let z = if self.run.break_twins { z + 1.0 } else { z };
-            z
+            let written = if self.run.break_twins {
+                written + Vec3::new(0.0, 0.0, 1.0)
+            } else {
+                written
+            };
+            written
         };
-        self.tile
-            .set(i, j, Vec3::new(c.x, c.y, z))
-            .map_err(Stopped::Refused)?;
+        self.tile.set(i, j, written).map_err(Stopped::Refused)?;
         Ok(())
     }
 
@@ -745,8 +770,7 @@ impl<'a> Replay<'a> {
         let state = self.own.map(|own| FinalState {
             key,
             continuous: own.continuous,
-            start: own.start,
-            acc: own.acc,
+            value: own.value,
         });
         TileOutcome {
             key,
@@ -823,19 +847,26 @@ pub(super) fn used(plan: &Plan, book: &Book, outcomes: &[TileOutcome]) -> Grants
     grants
 }
 
-/// What each tile of `keys` is, for a run: positions, corrections and prediction.
+/// What each tile of `keys` is, for a run: positions, corrections, and prediction or frames.
 ///
-/// Read from `store`; `None` for a tile whose positions or corrections aren't cached, or that
-/// lacks the prediction `predicted` asks for.
+/// Read from `store`, the frames of a tile without a kept prediction from `frames` (aligned with
+/// `keys`); `None` for a tile whose positions or corrections aren't cached, that lacks the
+/// prediction `predicted` asks for, or that has neither a prediction nor frames.
 pub(super) fn inputs<'a>(
     store: &'a TileStore,
     keys: &[TileKey],
     predicted: bool,
+    frames: &'a [Vec<Frame>],
 ) -> Option<Vec<TileInput<'a>>> {
     keys.iter()
-        .map(|key| {
+        .enumerate()
+        .map(|(n, key)| {
             let prediction = store.kept_prediction(key);
             if predicted && prediction.is_none() {
+                return None;
+            }
+            let frames = frames.get(n).map(Vec::as_slice);
+            if prediction.is_none() && frames.is_none() {
                 return None;
             }
             Some(TileInput {
@@ -843,6 +874,7 @@ pub(super) fn inputs<'a>(
                 positions: store.cached_positions(key)?,
                 corrections: store.cached_correction(key)?,
                 prediction,
+                frames,
             })
         })
         .collect()

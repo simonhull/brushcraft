@@ -64,10 +64,11 @@ pub struct StoreConfig {
     /// [`TileStore::open`](super::TileStore::open) refuses a count whose share leaves the
     /// pools less than their minimum.
     pub kept_predictions: usize,
-    /// How many tiles' stroke state the budget sets aside: the `f32` start and summed deltas a
-    /// brush stroke keeps per vertex of the tiles it is editing, so that deltas smaller than a
-    /// quantization step aren't rounded away dab by dab (the `sculpt` crate holds the state;
-    /// the store only reserves for it and reports the count,
+    /// How many tiles' stroke state the budget sets aside: the `f32` value a brush stroke
+    /// builds for each of the three correction components of each vertex of the tiles it is
+    /// editing (the correction as it first found it plus every dab's delta since), so that
+    /// deltas smaller than a quantization step aren't rounded away dab by dab (the `sculpt` crate
+    /// holds the state; the store only reserves for it and reports the count,
     /// [`TileStore::stroke_tiles`](super::TileStore::stroke_tiles)).
     /// [`StoreConfig::DEFAULT_STROKE_TILES`] unless set. Each is charged to the budget at the
     /// largest tile's size, [`StoreConfig::STROKE_TILE_BYTES`]; zero keeps none, and a stroke
@@ -117,9 +118,9 @@ impl StoreConfig {
     /// The most [`StoreConfig::evaluation_bytes`] gives the queued evaluation.
     pub const MAX_EVALUATION_BYTES: usize = 64 << 20;
     /// The bytes of the budget one tile's stroke state is charged:
-    /// two `f32` (the start and the summed deltas) per vertex of the largest tile,
-    /// `(TILE_QUADS + 1)²` of them, so 33,800 bytes.
-    pub const STROKE_TILE_BYTES: usize = SIDE * SIDE * 2 * size_of::<f32>();
+    /// three `f32` (the value the stroke builds for each correction component) per vertex of the
+    /// largest tile, `(TILE_QUADS + 1)²` of them, so 50,700 bytes.
+    pub const STROKE_TILE_BYTES: usize = SIDE * SIDE * 3 * size_of::<f32>();
 
     /// A store of `budget_bytes` whose op ids carry `site`, with
     /// [`StoreConfig::DEFAULT_CHUNK_BYTES`] chunks and one evaluation worker per physical core

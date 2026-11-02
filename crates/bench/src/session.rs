@@ -167,16 +167,19 @@ pub(crate) fn stroke(
     for group in centres.chunks(per_call.unwrap_or(1)) {
         let params = group
             .iter()
-            .map(|&center| DrawParams::new(center, radius, strength))
+            // Pushed outward from the sphere's centre, the direction of its surface's normals
+            // smoothed over a dab: a stand-in for the area normal placement takes.
+            .map(|&center| DrawParams::new(center, center, radius, strength))
             .collect::<Result<Vec<DrawParams>, _>>()?;
         let frame: Vec<stroke::Dab> = params
             .iter()
             .map(|params| {
                 let Vec3 { x, y, z } = params.center();
+                let n = params.normal();
                 seq = seq.wrapping_add(1);
                 stroke::Dab {
                     position: [x, y, z],
-                    normal: [0.0, 0.0, 1.0],
+                    normal: [n.x, n.y, n.z],
                     tangent: [1.0, 0.0, 0.0],
                     radius,
                     strength,

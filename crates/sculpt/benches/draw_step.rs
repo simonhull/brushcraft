@@ -241,7 +241,8 @@ fn draw_step_50k(bencher: divan::Bencher<'_, '_>) {
             .get(all.len() % path.len())
             .copied()
             .expect("a path of PATH_STEPS centres");
-        let params = DrawParams::new(center, radius, STRENGTH).expect("params");
+        // Outward from the sphere's centre: a stand-in for the area normal placement takes.
+        let params = DrawParams::new(center, center, radius, STRENGTH).expect("params");
         let stats = draw_step(fresh.project.store(), &mut fresh.index, &mut stroke, params)
             .expect("draw step");
         all.push(stats);

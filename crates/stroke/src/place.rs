@@ -31,8 +31,12 @@
 //! never jumps to a separate part. Checking against the last accepted point (a chord at most a
 //! radius back) rather than the last dab keeps every link short.
 //!
-//! **The frame.** Each dab carries the surface normal at its hit and a tangent along the
-//! stroke's direction there: the last step's direction, projected into the tangent plane. The
+//! **The frame.** Each dab carries its area normal and a tangent along the stroke's direction
+//! there: the last step's direction, projected into the plane the normal is normal to. The area
+//! normal is the surface's normals inside the dab's sphere, weighted by its falloff, summed and
+//! normalised ([`Surface::area_normal`]), taken as the dab is placed, its final radius and
+//! hardness known; where that sum is degenerate (zero or not finite), the surface normal at the
+//! hit. The
 //! first dab waits for the pen's first movement to learn its direction (it is emitted by the
 //! first [`Stroke::push`](crate::Stroke::push) either way); where there is no direction (a still
 //! pen, a step along the normal), the previous dab's tangent is used, and failing that a world
@@ -160,6 +164,16 @@ fn tangent_along(normal: DVec3, direction: DVec3, previous: Option<DVec3>) -> DV
         })
 }
 
+/// The area normal of a dab at `hit` of `radius` and `hardness` on `surface`
+/// ([`Surface::area_normal`]), at unit length; the hit's normal where the surface gives no sum,
+/// or one that is zero or not finite.
+fn area_normal<S: Surface>(surface: &mut S, hit: &Hit, radius: f64, hardness: f32) -> DVec3 {
+    surface
+        .area_normal(hit.position, radius, hardness)
+        .and_then(DVec3::normalized)
+        .unwrap_or(hit.normal)
+}
+
 /// `hit` with its normal at unit length, or `None` if its position isn't finite or its normal
 /// has no direction: what the walk accepts from a [`Surface`].
 fn checked(hit: Hit) -> Option<Hit> {
@@ -267,7 +281,7 @@ impl Placer {
             from: *first,
             to: *first,
         };
-        placer.pending = placer.make(&anchor, 0.0, DVec3::ZERO);
+        placer.pending = placer.make(surface, &anchor, 0.0, DVec3::ZERO);
         Some(placer)
     }
 
@@ -363,7 +377,7 @@ impl Placer {
             // With nothing to stand on (a failing projector or surface), the walk moves on along
             // the screen with the same step.
             if let Some((hit, chord)) = found {
-                self.advance(segment, at, hit, chord, out);
+                self.advance(surface, segment, at, hit, chord, out);
                 // The next step: scaled toward the next target from this one's chord.
                 let grow = if chord > 0.0 {
                     (self.target() / chord).clamp(0.25, 4.0)
@@ -379,8 +393,17 @@ impl Placer {
     }
 
     /// Moves the cursor to `hit`, a `chord` away and `u` of the way along `segment`, emitting
-    /// the waiting first dab once the pen has moved and a dab where the spacing is reached.
-    fn advance(&mut self, segment: &Segment, u: f64, hit: Hit, chord: f64, out: &mut Vec<Placed>) {
+    /// the waiting first dab once the pen has moved and a dab where the spacing is reached, its
+    /// area normal taken from `surface`.
+    fn advance<S: Surface>(
+        &mut self,
+        surface: &mut S,
+        segment: &Segment,
+        u: f64,
+        hit: Hit,
+        chord: f64,
+        out: &mut Vec<Placed>,
+    ) {
         let direction = hit.position - self.cursor.position;
         self.cursor = hit;
         self.travelled += chord;
@@ -390,7 +413,7 @@ impl Placer {
             self.flush(out);
         }
         if self.travelled >= self.next_spacing * (1.0 - SPACING_TOLERANCE) {
-            out.extend(self.make(segment, u, direction));
+            out.extend(self.make(surface, segment, u, direction));
         }
     }
 
@@ -405,19 +428,33 @@ impl Placer {
     }
 
     /// Places the tail: a dab at the cursor (where the last segment ended) unless one already
-    /// lies there, to within the spacing tolerance. `segment` is the last segment walked.
-    pub(crate) fn tail(&mut self, segment: &Segment, out: &mut Vec<Placed>) {
+    /// lies there, to within the spacing tolerance, its area normal taken from `surface`.
+    /// `segment` is the last segment walked.
+    pub(crate) fn tail<S: Surface>(
+        &mut self,
+        surface: &mut S,
+        segment: &Segment,
+        out: &mut Vec<Placed>,
+    ) {
         self.flush(out);
         if self.travelled > self.next_spacing * SPACING_TOLERANCE {
             let heading = self.heading.unwrap_or(DVec3::ZERO);
-            out.extend(self.make(segment, 1.0, heading));
+            out.extend(self.make(surface, segment, 1.0, heading));
         }
     }
 
-    /// The dab at the cursor, `u` of the way along `segment`, heading along `direction`; the
-    /// spacing, speed and distance bookkeeping move on to it. `None` if its size factor is below
-    /// [`MIN_DAB_SIZE`]: the bookkeeping moves on all the same, but it takes no sequence number.
-    fn make(&mut self, segment: &Segment, u: f64, direction: DVec3) -> Option<Placed> {
+    /// The dab at the cursor, `u` of the way along `segment`, heading along `direction`, its
+    /// normal its area normal on `surface` ([`area_normal`]); the spacing, speed and distance
+    /// bookkeeping move on to it. `None` if its size factor is below [`MIN_DAB_SIZE`]: the
+    /// bookkeeping moves on all the same, but it takes no sequence number (nor is its area normal
+    /// taken).
+    fn make<S: Surface>(
+        &mut self,
+        surface: &mut S,
+        segment: &Segment,
+        u: f64,
+        direction: DVec3,
+    ) -> Option<Placed> {
         let time = segment.time(u);
         let dt = time - self.last_time;
         if dt > 0.0 {
@@ -434,7 +471,16 @@ impl Placer {
             ..segment.inputs(u)
         };
         let values = self.dynamics.evaluate(&inputs);
-        let tangent = tangent_along(self.cursor.normal, direction, self.tangent);
+        // `>=` is false for NaN too, which finite dynamics can't give.
+        let sized = values.size >= MIN_DAB_SIZE;
+        let radius = self.radius * f64::from(values.size);
+        let hardness = (self.hardness * values.hardness).clamp(0.0, 1.0);
+        let normal = if sized {
+            area_normal(surface, &self.cursor, radius, hardness)
+        } else {
+            self.cursor.normal
+        };
+        let tangent = tangent_along(normal, direction, self.tangent);
         let mut params = self.action_params;
         for (param, factor) in params.iter_mut().zip(values.action) {
             *param *= factor;
@@ -444,16 +490,14 @@ impl Placer {
             reason = "a dab's time is f32 seconds since its stroke began"
         )]
         let since_start = (time - self.start) as f32;
-        // `>=` is false for NaN too, which finite dynamics can't give.
-        let sized = values.size >= MIN_DAB_SIZE;
-        let placed = sized.then(|| Placed {
+        let placed = sized.then_some(Placed {
             position: self.cursor.position,
-            normal: self.cursor.normal,
+            normal,
             tangent,
-            radius: self.radius * f64::from(values.size),
+            radius,
             strength: self.strength * values.strength,
             angle: values.angle,
-            hardness: (self.hardness * values.hardness).clamp(0.0, 1.0),
+            hardness,
             params,
             seq: self.seq,
             time: since_start,

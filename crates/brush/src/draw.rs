@@ -1,16 +1,17 @@
-//! The draw brush: push the surface out along its normal, strongest at the brush centre.
+//! The draw brush: push the surface out, strongest at the brush centre.
 
 use crate::falloff::Falloff;
 use crate::math::{distance_squared, sqrt};
 
-/// The draw brush's per-vertex step: how far each vertex moves along its frame normal.
+/// The draw brush's per-vertex step: how far each vertex moves.
 ///
 /// For each `positions[k]` strictly within `radius` of `center` (distance `d < radius`), writes
 /// `strength · falloff(d / radius)` into `out[k]`; every other `out[k]` gets `0`, so `out` is fully
 /// written either way. Returns how many positions were within the radius.
 ///
-/// The value is the delta along the normal axis of the vertex's tangent frame: the caller adds it
-/// to the `z` of the vertex's correction. A point exactly on the rim gets `0` and doesn't count.
+/// The value is the vertex's displacement: how far it moves along the direction the caller
+/// moves it (for a placed dab, its area normal, [`draw_move`](crate::draw_move)). A point exactly
+/// on the rim gets `0` and doesn't count.
 /// A `radius` that isn't positive and finite covers nothing: `out` is zeroed and the count is 0.
 ///
 /// The weight's argument is `t = sqrt(d²) / radius`, a quotient, not `d²` scaled by a

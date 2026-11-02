@@ -4,7 +4,7 @@
 use crate::draw::draw_vertex;
 use crate::falloff::Falloff;
 
-/// One dab as an action reads it: where it is, its frame's normal, how far it reaches, how
+/// One dab as an action reads it: where it is, its normal, how far it reaches, how
 /// strongly it acts, how hard its falloff is, and the action's own parameters.
 ///
 /// Plain `f32` data (`#[repr(C)]`), the same on the CPU and the GPU. It is the `brush` side of
@@ -15,8 +15,9 @@ use crate::falloff::Falloff;
 pub struct Imprint {
     /// The centre, in model space.
     pub center: [f32; 3],
-    /// The surface normal at the centre, unit length, for actions that move along it (draw
-    /// moves each vertex along its own frame normal and doesn't read it).
+    /// The dab's normal, unit length: its area normal, the stroke's surface normals inside its
+    /// sphere weighted by its falloff, summed and normalised as it was placed (the hit's normal
+    /// where that sum is degenerate). Draw moves every vertex it reaches along it.
     pub normal: [f32; 3],
     /// How far the dab reaches from its centre: positive and finite for the dab to cover
     /// anything.
@@ -140,6 +141,54 @@ pub fn draw_imprint_vertex<F: Falloff>(falloff: &F, imprint: &Imprint, p: [f32; 
         imprint.strength,
         p,
     )
+}
+
+/// The draw action's move of a vertex whose displacement ([`draw_imprint_vertex`]) is `w`: `w`
+/// along the imprint's normal, `[w · nx, w · ny, w · nz]`.
+///
+/// Draw moves every vertex it reaches along the one direction, the dab's area normal, rather than
+/// each along its own normal: where per-vertex normals converge (under a tall stroke, over a
+/// rough surface), moving each along its own folds the surface over. Every path that applies
+/// draw (finest work, a preview shown ahead of it) moves a vertex by this, so they agree bit for
+/// bit before the move is stored.
+///
+/// ```
+/// use brush::{Imprint, draw_move};
+///
+/// let imprint = Imprint::new([0.0; 3], [0.6, 0.0, 0.8], 1.0, 0.1, 0.0, [0.0; 4]);
+/// assert_eq!(draw_move(&imprint, 0.5), [0.3, 0.0, 0.4]);
+/// ```
+#[inline]
+#[must_use]
+pub fn draw_move(imprint: &Imprint, w: f32) -> [f32; 3] {
+    let [x, y, z] = imprint.normal;
+    [w * x, w * y, w * z]
+}
+
+/// The move `imprint`'s draw gives the vertex at `p`, or `None` outside its sphere: its
+/// displacement ([`draw_imprint_vertex`]) along the imprint's normal ([`draw_move`]).
+///
+/// ```
+/// use brush::{Imprint, Smoothstep, draw_imprint_move};
+///
+/// let imprint = Imprint::new([0.0; 3], [0.0, 1.0, 0.0], 1.0, 0.1, 0.0, [0.0; 4]);
+/// let moved = draw_imprint_move(&Smoothstep, &imprint, [0.0; 3]).unwrap();
+/// assert!(
+///     (moved[1] - 0.1).abs() < 1e-7,
+///     "full strength along the normal at the centre"
+/// );
+/// assert_eq!(
+///     draw_imprint_move(&Smoothstep, &imprint, [2.0, 0.0, 0.0]),
+///     None
+/// );
+/// ```
+#[inline]
+pub fn draw_imprint_move<F: Falloff>(
+    falloff: &F,
+    imprint: &Imprint,
+    p: [f32; 3],
+) -> Option<[f32; 3]> {
+    draw_imprint_vertex(falloff, imprint, p).map(|w| draw_move(imprint, w))
 }
 
 /// [`draw`](crate::draw()) for an [`Imprint`]: writes [`draw_imprint_vertex`]'s displacement
@@ -278,6 +327,27 @@ mod tests {
         assert_eq!(run(f32::NAN), run(0.0), "a NaN hardness is 0");
         assert_eq!(run(7.0), run(1.0), "past 1 is 1");
         assert_eq!(run(1.0), [1.0; 10], "hardness 1 is a disc of full strength");
+    }
+
+    #[test]
+    fn every_vertex_moves_along_the_imprints_normal() {
+        let normal = [0.48, -0.6, 0.64];
+        let imprint = Imprint::new([0.1, 0.0, -0.2], normal, 0.8, 0.25, 0.3, [0.0; 4]);
+        let positions = line(120, 0.01);
+        let mut weights = std::vec![f32::NAN; positions.len()];
+        let inside = draw_imprint(&Smoothstep, &imprint, &positions, &mut weights);
+        assert!(inside > 10 && inside < positions.len(), "a mix: {inside}");
+        let pairs = positions.iter().zip(&weights);
+        for (&p, &w) in pairs {
+            match draw_imprint_move(&Smoothstep, &imprint, p) {
+                Some(moved) => {
+                    assert_eq!(moved, draw_move(&imprint, w), "w along the normal at {p:?}");
+                    let along = normal.map(|n| n * w);
+                    assert_eq!(moved, along, "the one direction at {p:?}");
+                }
+                None => assert!(w == 0.0, "outside at {p:?}"),
+            }
+        }
     }
 
     #[test]

@@ -545,7 +545,8 @@ impl Load {
             .get(self.dab)
             .copied()
             .context("a stroke ran past its dabs")?;
-        let params = DrawParams::new(center, plan.radius, STRENGTH)?;
+        // Outward from the sphere's centre: a stand-in for the area normal placement takes.
+        let params = DrawParams::new(center, center, plan.radius, STRENGTH)?;
         draw_step(
             self.project.store(),
             &mut self.index,

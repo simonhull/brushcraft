@@ -453,6 +453,10 @@ impl<S: Surface> Surface for Primed<'_, S> {
     fn continuous(&mut self, a: &Hit, b: &Hit, reach: f64) -> bool {
         self.surface.continuous(a, b, reach)
     }
+
+    fn area_normal(&mut self, center: DVec3, radius: f64, hardness: f32) -> Option<DVec3> {
+        self.surface.area_normal(center, radius, hardness)
+    }
 }
 
 /// Where a queued dab came from, and what it touches.
