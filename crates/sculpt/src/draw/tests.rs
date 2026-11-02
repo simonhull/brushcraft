@@ -334,15 +334,17 @@ fn one_step_moves_exactly_the_vertices_within_the_radius_by_the_falloff() {
         let delta = formula(old, params).unwrap_or_else(|| panic!("{old:?} moved from outside"));
         let shift = p - old;
         let off = shift - normal * (shift.dot(normal));
-        // Interior corrections are quantized: within a step of the tile's final scale, at most
-        // twice `strength / 32767`, in each of the frame's three axes.
+        // Interior corrections are quantized: within a step of their plane's final scale, at
+        // most twice `strength / 32767` along the frame's normal and, the tangential planes being
+        // at least 8 times coarser, 8 times that along each tangent: `√129 × 3.05e-6`.
+        let quantized = 3.5e-5;
         assert!(
-            (f64::from(shift.dot(normal)) - delta).abs() <= 7e-6,
+            (f64::from(shift.dot(normal)) - delta).abs() <= quantized,
             "{old:?} moved by {} along the dab's normal, the formula gives {delta}",
             shift.dot(normal)
         );
         assert!(
-            off.length() <= 7e-6,
+            f64::from(off.length()) <= quantized,
             "{old:?} moved {} off the dab's normal",
             off.length()
         );

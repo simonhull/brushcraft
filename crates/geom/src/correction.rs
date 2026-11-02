@@ -6,27 +6,37 @@ use crate::{FaceId, TILE_QUADS, Vec3};
 
 /// Largest quantized magnitude.
 const Q_MAX: f32 = 32767.0;
-/// Interior magnitudes below this would need a subnormal scale; such interiors are stored as zero.
+/// Interior magnitudes below this would need a subnormal scale; such planes are stored as zero.
 const TINY: f32 = Q_MAX * f32::MIN_POSITIVE;
-/// The largest scale a tile can have: every one of its `±32767` steps decodes finite, as
+/// The largest scale a plane can have: every one of its `±32767` steps decodes finite, as
 /// `Q_MAX × MAX_SCALE < f32::MAX`. A power-of-two divisor keeps it exact.
 const MAX_SCALE: f32 = f32::MAX / 65536.0;
+/// The tangential floor: how many times the normal plane's step a tangential plane's is at least.
+///
+/// A correction is `(t, b, n)` in its vertex's tangent frame, so the planes of `x` and `y` are
+/// tangential and that of `z` is the normal one. Every interior write applies the floor.
+const TANGENTIAL_FLOOR: f32 = 8.0;
 
 /// One tile's corrections, `(t, b, n)` per vertex (`x`, `y`, `z`) in the tangent frame of the
 /// predicted surface.
 ///
-/// Interior vertices are stored as `[i16; 3]` with one scale per tile, so each component is off by
-/// at most [`CorrectionTile::max_error`]. Border vertices are shared with neighbouring tiles that
-/// have their own scales, so they are stored exactly: every copy decodes to the same bits, which
-/// keeps seams closed.
+/// Interior vertices are stored as `[i16; 3]` with one scale per plane (component) of the tile,
+/// so each component is off by at most half its plane's step ([`CorrectionTile::max_error`]).
+/// The normal plane's scale comes from its own values; each tangential plane's is at least 8
+/// times the normal plane's (the tangential floor), so a tangential part, which varies with each
+/// vertex's frame and compresses poorly, is stored coarser than the normal part. Border vertices
+/// are shared with neighbouring tiles that have their own scales, so they are stored exactly:
+/// every copy decodes to the same bits, which keeps seams closed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorrectionTile {
     /// Vertices per side, at least 2.
     side: u32,
-    /// What one quantization step of the interior is worth: a component decodes as `q × scale`.
-    /// `+0.0` while the interior is all zero, else finite, positive and normal.
-    scale: f32,
-    /// The `(side − 2)²` interior vertices, row-major, quantized with `scale`.
+    /// What one quantization step of each interior plane is worth, `(t, b, n)`: a component
+    /// decodes as `q × scales[plane]`. Each is `+0.0` while its plane is all zero, else finite,
+    /// positive and normal.
+    scales: [f32; 3],
+    /// The `(side − 2)²` interior vertices, row-major, each component quantized with its plane's
+    /// scale.
     interior: Vec<[i16; 3]>,
     /// The `4 × (side − 1)` border vertices, exact: once round the tile counter-clockwise from
     /// `(0, 0)`, along the bottom row, up the right column, back along the top row and down the
@@ -66,7 +76,7 @@ pub enum CorrectionError {
         /// Vertices per side.
         side: u32,
     },
-    /// An interior value would need a scale above the largest a tile can have, past which its
+    /// An interior value would need a scale above the largest a plane can have, past which its
     /// steps decode to infinity.
     #[error("correction is too large to store")]
     TooLarge,
@@ -81,11 +91,12 @@ pub struct RowUpdate {
     pub error: Option<CorrectionError>,
 }
 
-/// A correction tile stored elsewhere (a pool slot): `side` vertices per side, interior quantized
-/// with `scale`, border exact. Same layout and rules as [`CorrectionTile`], whose
-/// [`CorrectionTile::view`] is one.
+/// A correction tile stored elsewhere (a pool slot), as [`CorrectionTile::view`] gives one.
 ///
-/// The constructor checks the shape and the scale; the values themselves are trusted to have
+/// `side` vertices per side, interior quantized with one scale per plane, border exact: the
+/// same layout and rules as [`CorrectionTile`].
+///
+/// The constructor checks the shape and the scales; the values themselves are trusted to have
 /// been written through [`CorrectionViewMut::set`] or checked by [`CorrectionView::validate`]
 /// (which [`CorrectionTile::from_parts`] and a decode through
 /// [`CorrectionViewMut::normalize_and_validate`] run).
@@ -93,8 +104,8 @@ pub struct RowUpdate {
 pub struct CorrectionView<'a> {
     /// Vertices per side, at least 2.
     side: u32,
-    /// The interior's quantization step, as [`CorrectionTile`]'s.
-    scale: f32,
+    /// Each interior plane's quantization step, as [`CorrectionTile`]'s.
+    scales: [f32; 3],
     /// The interior, row-major, at least `(side − 2)²` values (any more are ignored).
     interior: &'a [[i16; 3]],
     /// The border ring, in [`CorrectionTile`]'s order, at least `4 × (side − 1)` values.
@@ -110,9 +121,9 @@ pub struct CorrectionView<'a> {
 pub struct CorrectionViewMut<'a> {
     /// Vertices per side, at least 2.
     side: u32,
-    /// The interior's quantization step, grown in place when a write needs more range.
-    scale: &'a mut f32,
-    /// The interior, row-major, re-quantized in place when the scale grows.
+    /// Each interior plane's quantization step, grown in place when a write needs more range.
+    scales: &'a mut [f32; 3],
+    /// The interior, row-major, its planes re-quantized in place when their scales grow.
     interior: &'a mut [[i16; 3]],
     /// The border ring, in [`CorrectionTile`]'s order.
     border: &'a mut [Vec3],
@@ -168,13 +179,33 @@ fn counts(side: u32) -> Result<(usize, usize), CorrectionError> {
     Ok((to((side - 2) * (side - 2))?, to(4 * (side - 1))?))
 }
 
-/// Whether `scale` can be a tile's scale: `+0.0`, or finite, positive, normal and at most
+/// Whether `scale` can be a plane's scale: `+0.0`, or finite, positive, normal and at most
 /// [`MAX_SCALE`], so every interior value decodes finite.
 ///
-/// `-0.0` is not one: it would decode every interior value to a signed zero, so equal tiles
+/// `-0.0` is not one: it would decode every value of its plane to a signed zero, so equal tiles
 /// could differ in their bits. Callers that accept it normalise it to `+0.0` first.
 fn valid_scale(scale: f32) -> bool {
     scale.to_bits() == 0 || (f32::MIN_POSITIVE..=MAX_SCALE).contains(&scale)
+}
+
+/// Whether every plane's scale is valid ([`valid_scale`]).
+fn valid_scales(scales: [f32; 3]) -> bool {
+    scales.iter().all(|&scale| valid_scale(scale))
+}
+
+/// Whether every plane with a zero scale holds only zeros: anything else would decode to zero.
+fn zero_planes_hold_zeros(scales: [f32; 3], interior: &[[i16; 3]]) -> bool {
+    let zero_planes = scales.map(|scale| scale == 0.0);
+    interior.iter().all(|q| {
+        q.iter()
+            .zip(zero_planes)
+            .all(|(&value, zero)| !zero || value == 0)
+    })
+}
+
+/// The largest of `scales`: the coarsest plane's step.
+fn coarsest(scales: [f32; 3]) -> f32 {
+    scales.into_iter().fold(0.0, f32::max)
 }
 
 /// Whether `v` has a `-0.0` component.
@@ -185,29 +216,29 @@ fn has_negative_zero(v: Vec3) -> bool {
 }
 
 impl<'a> CorrectionView<'a> {
-    /// A view of a tile with `side` vertices per side over `interior` and `border`, which may be
-    /// longer than the tile needs (a slot sized for the largest tile): the view uses the first
-    /// `(side − 2)²` and `4(side − 1)` entries.
+    /// A view of a tile with `side` vertices per side over `interior` and `border`, quantized
+    /// with `scales` (`(t, b, n)`), which may be longer than the tile needs (a slot sized for the
+    /// largest tile): the view uses the first `(side − 2)²` and `4(side − 1)` entries.
     ///
     /// # Errors
     ///
     /// [`CorrectionError::BadSide`] for a side outside `2..=65`, or
-    /// [`CorrectionError::BadParts`] if either slice is too short or the scale is negative
+    /// [`CorrectionError::BadParts`] if either slice is too short or a scale is negative
     /// (`-0.0` included), subnormal, not finite or so large its steps decode to infinity.
     pub fn new(
         side: u32,
-        scale: f32,
+        scales: [f32; 3],
         interior: &'a [[i16; 3]],
         border: &'a [Vec3],
     ) -> Result<Self, CorrectionError> {
         let (ni, nb) = counts(side)?;
         let bad = CorrectionError::BadParts { side };
-        if !valid_scale(scale) {
+        if !valid_scales(scales) {
             return Err(bad);
         }
         Ok(Self {
             side,
-            scale,
+            scales,
             interior: interior.get(..ni).ok_or(bad)?,
             border: border.get(..nb).ok_or(bad)?,
         })
@@ -219,17 +250,24 @@ impl<'a> CorrectionView<'a> {
         self.side
     }
 
-    /// The interior quantization step.
+    /// Each interior plane's quantization step, `(t, b, n)`.
     #[must_use]
-    pub const fn scale(&self) -> f32 {
-        self.scale
+    pub const fn scales(&self) -> [f32; 3] {
+        self.scales
     }
 
-    /// The largest error per interior component after one quantization: half a step. As
-    /// [`CorrectionTile::max_error`].
+    /// The coarsest interior plane's quantization step, the largest of
+    /// [`CorrectionView::scales`]: one bound on every component's step.
     #[must_use]
-    pub const fn max_error(&self) -> f32 {
-        self.scale * 0.5
+    pub fn scale(&self) -> f32 {
+        coarsest(self.scales)
+    }
+
+    /// The largest error of each interior plane's components after one quantization: half its
+    /// step. As [`CorrectionTile::max_error`].
+    #[must_use]
+    pub fn max_error(&self) -> [f32; 3] {
+        self.scales.map(|scale| scale * 0.5)
     }
 
     /// Whether every correction is zero.
@@ -241,12 +279,15 @@ impl<'a> CorrectionView<'a> {
     /// Checks the values against the rules every tile keeps, the ones a tile written only through
     /// [`CorrectionViewMut::set`] keeps by construction:
     ///
-    /// - the scale is `+0.0`, or finite, positive and normal, and small enough that every interior
-    ///   value decodes finite;
-    /// - a zero scale has a zero interior (anything else would decode to zero);
+    /// - each plane's scale is `+0.0`, or finite, positive and normal, and small enough that every
+    ///   value of the plane decodes finite;
+    /// - a plane with a zero scale holds only zeros (anything else would decode to zero);
     /// - no interior value is `i16::MIN`, which quantization never produces (its range is
     ///   symmetric, `±32767`);
     /// - every border value is finite and none is `-0.0`, so equal corrections have equal bits.
+    ///
+    /// The tangential floor is not one of them: a tile written with one scale for all three
+    /// planes (an older file's) is valid, and gets the floor with its first interior write.
     ///
     /// [`CorrectionTile::from_parts`] and every decode run these; views otherwise trust their
     /// storage.
@@ -255,8 +296,8 @@ impl<'a> CorrectionView<'a> {
     ///
     /// [`CorrectionError::BadParts`] if any rule is broken.
     pub fn validate(&self) -> Result<(), CorrectionError> {
-        let ok = valid_scale(self.scale)
-            && (self.scale != 0.0 || self.interior.iter().all(|q| *q == [0; 3]))
+        let ok = valid_scales(self.scales)
+            && zero_planes_hold_zeros(self.scales, self.interior)
             && self.interior.iter().flatten().all(|q| *q != i16::MIN)
             && self
                 .border
@@ -269,14 +310,14 @@ impl<'a> CorrectionView<'a> {
         }
     }
 
-    /// A [`CorrectionTile`] holding a copy of this tile: the same side, scale, interior and
+    /// A [`CorrectionTile`] holding a copy of this tile: the same side, scales, interior and
     /// border, so the same bits for every vertex. For editing a tile away from its storage (a
     /// brush replaying several dabs on one tile), then writing it back whole.
     #[must_use]
     pub fn to_tile(self) -> CorrectionTile {
         CorrectionTile {
             side: self.side,
-            scale: self.scale,
+            scales: self.scales,
             interior: self.interior.to_vec(),
             border: self.border.to_vec(),
         }
@@ -286,7 +327,7 @@ impl<'a> CorrectionView<'a> {
     #[must_use]
     pub fn get(&self, i: u32, j: u32) -> Option<Vec3> {
         match slot(self.side, i, j)? {
-            Slot::Interior(k) => self.interior.get(k).map(|q| decode(*q, self.scale)),
+            Slot::Interior(k) => self.interior.get(k).map(|q| decode(*q, self.scales)),
             Slot::Border(k) => self.border.get(k).copied(),
         }
     }
@@ -301,19 +342,21 @@ impl<'a> CorrectionViewMut<'a> {
     /// As [`CorrectionView::new`].
     pub fn new(
         side: u32,
-        scale: &'a mut f32,
+        scales: &'a mut [f32; 3],
         interior: &'a mut [[i16; 3]],
         border: &'a mut [Vec3],
     ) -> Result<Self, CorrectionError> {
         let (ni, nb) = counts(side)?;
         let bad = CorrectionError::BadParts { side };
-        *scale += 0.0;
-        if !valid_scale(*scale) {
+        for scale in scales.iter_mut() {
+            *scale += 0.0;
+        }
+        if !valid_scales(*scales) {
             return Err(bad);
         }
         Ok(Self {
             side,
-            scale,
+            scales,
             interior: interior.get_mut(..ni).ok_or(bad)?,
             border: border.get_mut(..nb).ok_or(bad)?,
         })
@@ -324,7 +367,7 @@ impl<'a> CorrectionViewMut<'a> {
     pub fn as_view(&self) -> CorrectionView<'_> {
         CorrectionView {
             side: self.side,
-            scale: *self.scale,
+            scales: *self.scales,
             interior: self.interior,
             border: self.border,
         }
@@ -337,7 +380,7 @@ impl<'a> CorrectionViewMut<'a> {
     }
 
     /// The gate for values written straight into the storage (a decode): turns `-0.0` border
-    /// components into `+0.0` (the scale was normalised by [`CorrectionViewMut::new`]), then
+    /// components into `+0.0` (the scales were normalised by [`CorrectionViewMut::new`]), then
     /// checks [`CorrectionView::validate`]'s rules.
     ///
     /// # Errors
@@ -353,13 +396,15 @@ impl<'a> CorrectionViewMut<'a> {
 
     /// Sets the correction at `(i, j)`.
     ///
-    /// If an interior value doesn't fit the current scale, the scale grows geometrically (doubling
-    /// until it fits; from zero it becomes exactly what the value needs) and the existing
-    /// interior is re-quantized. Each growth adds at most half the new step of error to earlier
-    /// values, so after any number of growths they are within one
-    /// final [`CorrectionView::scale`] of what was stored, not within
-    /// [`CorrectionView::max_error`]. Interior values below a tiny threshold on a zero-scale
-    /// tile are stored as zero.
+    /// An interior write fits each plane's scale to the value first: a plane whose component
+    /// doesn't fit grows geometrically (doubling until it fits; from zero it becomes exactly what
+    /// the value needs), and a tangential plane below the tangential floor, 8 times the normal
+    /// plane's scale, doubles until it isn't (from zero, it becomes the floor). Each plane whose
+    /// scale changed is re-quantized. Each doubling adds at most half the plane's new step of
+    /// error to its earlier values, so after any number of growths they are within one final
+    /// step of their plane ([`CorrectionView::scales`]) of what was stored, not within
+    /// [`CorrectionView::max_error`]. Interior components below a tiny threshold on a
+    /// zero-scale plane are stored as zero.
     ///
     /// # Errors
     ///
@@ -371,7 +416,7 @@ impl<'a> CorrectionViewMut<'a> {
             return Err(CorrectionError::NotFinite);
         }
         if let Some(Slot::Interior(_)) = slot(self.side, i, j) {
-            self.fit_scale(c)?;
+            self.fit_scales(c)?;
         }
         self.store(i, j, c)
     }
@@ -383,7 +428,7 @@ impl<'a> CorrectionViewMut<'a> {
     /// the next vertex.
     ///
     /// The same bits as [`CorrectionViewMut::get`] then [`CorrectionViewMut::set`] for each
-    /// vertex in that order (a value that outgrows the scale re-quantizes the interior, which
+    /// vertex in that order (a value that outgrows a plane's scale re-quantizes that plane, which
     /// the vertices after it then read), without finding each vertex's place in the tile again
     /// for the read and the write: what an edit of a whole interior, row by row, costs per
     /// vertex.
@@ -416,56 +461,43 @@ impl<'a> CorrectionViewMut<'a> {
                 outcome.error = Some(CorrectionError::OutOfTile { i, j, side });
                 return outcome;
             };
-            let Some(c) = f(i, j, decode(q, *self.scale)) else {
+            let Some(c) = f(i, j, decode(q, *self.scales)) else {
                 continue;
             };
             if !c.is_finite() {
                 outcome.error = Some(CorrectionError::NotFinite);
                 return outcome;
             }
-            if let Err(e) = self.fit_scale(c) {
+            if let Err(e) = self.fit_scales(c) {
                 outcome.error = Some(e);
                 return outcome;
             }
-            let scale = *self.scale;
+            let scales = *self.scales;
             if let Some(stored) = self.interior.get_mut(k) {
-                *stored = [
-                    quantize(c.x, scale),
-                    quantize(c.y, scale),
-                    quantize(c.z, scale),
-                ];
+                *stored = quantize(c, scales);
             }
             outcome.wrote = true;
         }
         outcome
     }
 
-    /// Grows the scale, re-quantizing the interior, if interior value `c` (finite) doesn't fit
-    /// it: as [`CorrectionViewMut::set`] describes.
+    /// Grows the planes' scales, re-quantizing the planes that changed, if interior value `c`
+    /// (finite) doesn't fit them or a tangential plane is below its floor: as
+    /// [`CorrectionViewMut::set`] describes.
     ///
     /// # Errors
     ///
     /// [`CorrectionError::TooLarge`] if `c` needs a scale above [`MAX_SCALE`]; the tile is
     /// unchanged then.
-    fn fit_scale(&mut self, c: Vec3) -> Result<(), CorrectionError> {
-        let needed = max_abs(c);
-        let scale = *self.scale;
-        if needed > Q_MAX * scale {
-            if needed > Q_MAX * MAX_SCALE {
-                return Err(CorrectionError::TooLarge);
-            }
-            if scale == 0.0 {
-                if needed >= TINY {
-                    self.requantize(needed / Q_MAX);
-                }
-            } else {
-                self.requantize(grown_scale(scale, needed));
-            }
+    fn fit_scales(&mut self, c: Vec3) -> Result<(), CorrectionError> {
+        let fitted = fitted_scales(*self.scales, c)?;
+        if fitted.map(f32::to_bits) != self.scales.map(f32::to_bits) {
+            self.requantize(fitted);
         }
         Ok(())
     }
 
-    /// Writes `value` with the current scale.
+    /// Writes `value` with the current scales.
     ///
     /// # Errors
     ///
@@ -476,12 +508,8 @@ impl<'a> CorrectionViewMut<'a> {
         let outside = CorrectionError::OutOfTile { i, j, side };
         match slot(side, i, j).ok_or(outside)? {
             Slot::Interior(index) => {
-                let scale = *self.scale;
-                *self.interior.get_mut(index).ok_or(outside)? = [
-                    quantize(value.x, scale),
-                    quantize(value.y, scale),
-                    quantize(value.z, scale),
-                ];
+                let scales = *self.scales;
+                *self.interior.get_mut(index).ok_or(outside)? = quantize(value, scales);
             }
             Slot::Border(index) => {
                 *self.border.get_mut(index).ok_or(outside)? = without_negative_zero(value);
@@ -490,17 +518,19 @@ impl<'a> CorrectionViewMut<'a> {
         Ok(())
     }
 
-    /// Makes `scale` the tile's scale and re-quantizes every interior value to it.
-    fn requantize(&mut self, scale: f32) {
-        let old = *self.scale;
-        *self.scale = scale;
-        for q in self.interior.iter_mut() {
-            let v = decode(*q, old);
-            *q = [
-                quantize(v.x, scale),
-                quantize(v.y, scale),
-                quantize(v.z, scale),
-            ];
+    /// Makes `scales` the tile's and re-quantizes every interior value of each plane whose scale
+    /// changed; a plane whose scale is unchanged keeps its values as they are.
+    fn requantize(&mut self, scales: [f32; 3]) {
+        let old = *self.scales;
+        *self.scales = scales;
+        let planes = old.into_iter().zip(scales).enumerate();
+        let changed = planes.filter(|(_, (from, to))| from.to_bits() != to.to_bits());
+        for (plane, (from, to)) in changed {
+            for q in self.interior.iter_mut() {
+                if let Some(value) = q.get_mut(plane) {
+                    *value = quantize_one(f32::from(*value) * from, to);
+                }
+            }
         }
     }
 }
@@ -515,20 +545,22 @@ impl CorrectionTile {
         let (interior, border) = counts(side)?;
         Ok(Self {
             side,
-            scale: 0.0,
+            scales: [0.0; 3],
             interior: vec![[0; 3]; interior],
             border: vec![Vec3::ZERO; border],
         })
     }
 
-    /// A tile from `side²` row-major values. The scale comes from the interior values alone
-    /// (borders are stored exactly), then every value is stored once.
+    /// A tile from `side²` row-major values. The scales come from the interior values alone
+    /// (borders are stored exactly): the normal plane's is its largest magnitude over `32767`,
+    /// each tangential plane's the same of its own values but at least 8 times the normal
+    /// plane's (the tangential floor). Then every value is stored once.
     ///
     /// # Errors
     ///
     /// [`CorrectionError::BadSide`], [`CorrectionError::BadParts`] if `values` has the wrong
     /// length, [`CorrectionError::NotFinite`], or [`CorrectionError::TooLarge`] if an interior
-    /// value needs a scale above the largest a tile can have.
+    /// value needs a scale above the largest a plane can have.
     pub fn from_values(side: u32, values: &[Vec3]) -> Result<Self, CorrectionError> {
         let mut tile = Self::zero(side)?;
         if values.len() != tile.interior.len() + tile.border.len() {
@@ -540,15 +572,15 @@ impl CorrectionTile {
         let cells = (0..side)
             .flat_map(|j| (0..side).map(move |i| (i, j)))
             .zip(values);
-        let peak = cells
+        let peaks = cells
             .clone()
             .filter(|((i, j), _)| matches!(slot(side, *i, *j), Some(Slot::Interior(_))))
-            .map(|(_, v)| max_abs(*v))
-            .fold(0.0, f32::max);
-        if peak > Q_MAX * MAX_SCALE {
-            return Err(CorrectionError::TooLarge);
-        }
-        tile.scale = if peak < TINY { 0.0 } else { peak / Q_MAX };
+            .map(|(_, v)| components(*v).map(f32::abs))
+            .fold([0.0; 3], |peaks: [f32; 3], v| {
+                [peaks[0].max(v[0]), peaks[1].max(v[1]), peaks[2].max(v[2])]
+            });
+        let [t, b, n] = peaks;
+        tile.scales = fitted_scales([0.0; 3], Vec3::new(t, b, n))?;
         let mut view = tile.view_mut();
         cells
             .into_iter()
@@ -556,7 +588,7 @@ impl CorrectionTile {
         Ok(tile)
     }
 
-    /// A tile from stored parts (the file format's decode path). `-0.0` in the scale or the
+    /// A tile from stored parts (the file format's decode path). `-0.0` in a scale or the
     /// border becomes `+0.0`; everything else must pass [`CorrectionView::validate`].
     ///
     /// # Errors
@@ -565,7 +597,7 @@ impl CorrectionTile {
     /// `side` or a rule of [`CorrectionView::validate`] is broken.
     pub fn from_parts(
         side: u32,
-        scale: f32,
+        scales: [f32; 3],
         interior: Vec<[i16; 3]>,
         border: Vec<Vec3>,
     ) -> Result<Self, CorrectionError> {
@@ -575,11 +607,11 @@ impl CorrectionTile {
         }
         let mut tile = Self {
             side,
-            scale,
+            scales,
             interior,
             border,
         };
-        CorrectionViewMut::new(side, &mut tile.scale, &mut tile.interior, &mut tile.border)?
+        CorrectionViewMut::new(side, &mut tile.scales, &mut tile.interior, &mut tile.border)?
             .normalize_and_validate()?;
         Ok(tile)
     }
@@ -589,7 +621,7 @@ impl CorrectionTile {
     pub fn view(&self) -> CorrectionView<'_> {
         CorrectionView {
             side: self.side,
-            scale: self.scale,
+            scales: self.scales,
             interior: &self.interior,
             border: &self.border,
         }
@@ -600,7 +632,7 @@ impl CorrectionTile {
     pub fn view_mut(&mut self) -> CorrectionViewMut<'_> {
         CorrectionViewMut {
             side: self.side,
-            scale: &mut self.scale,
+            scales: &mut self.scales,
             interior: &mut self.interior,
             border: &mut self.border,
         }
@@ -612,20 +644,28 @@ impl CorrectionTile {
         self.side
     }
 
-    /// The interior quantization step.
+    /// Each interior plane's quantization step, `(t, b, n)`.
     #[must_use]
-    pub const fn scale(&self) -> f32 {
-        self.scale
+    pub const fn scales(&self) -> [f32; 3] {
+        self.scales
     }
 
-    /// The largest error per interior component after one quantization: half a step.
+    /// The coarsest interior plane's quantization step, the largest of
+    /// [`CorrectionTile::scales`]: one bound on every component's step.
+    #[must_use]
+    pub fn scale(&self) -> f32 {
+        coarsest(self.scales)
+    }
+
+    /// The largest error of each interior plane's components after one quantization: half its
+    /// step.
     ///
     /// This holds for tiles built by [`CorrectionTile::from_values`] or
-    /// [`CorrectionTile::from_parts`]. After [`CorrectionTile::set`] has grown the scale,
-    /// values are only guaranteed within one [`CorrectionTile::scale`].
+    /// [`CorrectionTile::from_parts`]. After [`CorrectionTile::set`] has grown a plane's scale,
+    /// that plane's values are only guaranteed within one of its steps.
     #[must_use]
-    pub const fn max_error(&self) -> f32 {
-        self.scale * 0.5
+    pub fn max_error(&self) -> [f32; 3] {
+        self.view().max_error()
     }
 
     /// Quantized interior values, row-major.
@@ -652,9 +692,9 @@ impl CorrectionTile {
         self.view().get(i, j)
     }
 
-    /// Sets the correction at `(i, j)`, growing the scale as [`CorrectionViewMut::set`] does:
-    /// after a growth, earlier interior values are within one final [`CorrectionTile::scale`] of
-    /// what was stored, not within [`CorrectionTile::max_error`].
+    /// Sets the correction at `(i, j)`, fitting the planes' scales as [`CorrectionViewMut::set`]
+    /// does: after a plane's growth, its earlier interior values are within one of its final
+    /// steps of what was stored, not within [`CorrectionTile::max_error`].
     ///
     /// # Errors
     ///
@@ -664,15 +704,67 @@ impl CorrectionTile {
     }
 }
 
-/// Grows `scale` by the smallest power of two that makes `needed` fit, staying at most
+/// The scales a tile quantized with `scales` (`(t, b, n)`) needs to hold interior value `c`
+/// (finite), each plane's grown only as far as it must:
+///
+/// - the normal plane holds `|n|` ([`fitted_scale`] with no floor);
+/// - each tangential plane holds its component and is at least the floor, [`TANGENTIAL_FLOOR`]
+///   times the normal plane's fitted scale (at most [`MAX_SCALE`]).
+///
+/// The floor is applied whenever a write fits the scales, so it holds after every interior
+/// write: when the normal plane grows, the tangential planes below the new floor double with
+/// it, and a tile that never had the floor (an older file's, with one scale for all three
+/// planes) gets it with its first interior write. A pure function of `scales` and `c`, so every
+/// replay of the same writes gives the same scales, bit for bit.
+///
+/// # Errors
+///
+/// [`CorrectionError::TooLarge`] if a component needs a scale above [`MAX_SCALE`].
+fn fitted_scales(scales: [f32; 3], c: Vec3) -> Result<[f32; 3], CorrectionError> {
+    let needed = components(c).map(f32::abs);
+    if needed.iter().any(|&n| n > Q_MAX * MAX_SCALE) {
+        return Err(CorrectionError::TooLarge);
+    }
+    let [t, b, n] = scales;
+    let [need_t, need_b, need_n] = needed;
+    let normal = fitted_scale(n, need_n, 0.0);
+    let floor = (TANGENTIAL_FLOOR * normal).min(MAX_SCALE);
+    Ok([
+        fitted_scale(t, need_t, floor),
+        fitted_scale(b, need_b, floor),
+        normal,
+    ])
+}
+
+/// One plane's scale fitted to hold magnitude `needed` (at most `Q_MAX × MAX_SCALE`) and to be at
+/// least `floor` (at most [`MAX_SCALE`]):
+///
+/// - a plane at zero holds only zeros, which any step stores exactly: it takes exactly what
+///   `needed` asks (zero below the tiny threshold), or the floor if that is more;
+/// - a plane that holds it and is at or above the floor keeps its scale;
+/// - otherwise it doubles until it does both, so its earlier values each gain at most half the new
+///   step of error, and stay within one final step after any number of growths.
+fn fitted_scale(scale: f32, needed: f32, floor: f32) -> f32 {
+    let fits = |s: f32| needed <= Q_MAX * s && s >= floor;
+    if scale == 0.0 {
+        let fresh = if needed >= TINY { needed / Q_MAX } else { 0.0 };
+        fresh.max(floor)
+    } else if fits(scale) {
+        scale
+    } else {
+        doubled_until(scale, fits)
+    }
+}
+
+/// `scale` grown by the smallest power of two for which `fits` holds, staying at most
 /// [`MAX_SCALE`].
 ///
-/// [`MAX_SCALE`] itself if no power of two below it does, which fits any `needed` up to
-/// `Q_MAX × MAX_SCALE` (the caller refuses more).
-fn grown_scale(scale: f32, needed: f32) -> f32 {
+/// [`MAX_SCALE`] itself if no power of two below it does, which holds any value up to
+/// `Q_MAX × MAX_SCALE` (the caller refuses more) and any floor (capped at [`MAX_SCALE`]).
+fn doubled_until(scale: f32, fits: impl Fn(f32) -> bool) -> f32 {
     (1..=128)
         .map(|k| scale * 2.0_f32.powi(k))
-        .find(|grown| *grown <= MAX_SCALE && grown * Q_MAX >= needed)
+        .find(|grown| *grown <= MAX_SCALE && fits(*grown))
         .unwrap_or(MAX_SCALE)
 }
 
@@ -681,9 +773,19 @@ fn without_negative_zero(v: Vec3) -> Vec3 {
     Vec3::new(v.x + 0.0, v.y + 0.0, v.z + 0.0)
 }
 
-/// The largest component magnitude: what a value needs of the interior's `±32767` steps.
-fn max_abs(v: Vec3) -> f32 {
-    v.x.abs().max(v.y.abs()).max(v.z.abs())
+/// `v`'s components, `(t, b, n)`, in plane order.
+const fn components(v: Vec3) -> [f32; 3] {
+    [v.x, v.y, v.z]
+}
+
+/// `v` with each component quantized with its plane's scale ([`quantize_one`]).
+fn quantize(v: Vec3, scales: [f32; 3]) -> [i16; 3] {
+    let [t, b, n] = scales;
+    [
+        quantize_one(v.x, t),
+        quantize_one(v.y, b),
+        quantize_one(v.z, n),
+    ]
 }
 
 /// `x` in steps of `scale`, rounded half away from zero and clamped to `±32767`; zero for a
@@ -699,7 +801,7 @@ fn max_abs(v: Vec3) -> f32 {
     clippy::cast_possible_truncation,
     reason = "clamped to ±32767 first; the cast truncates toward zero, as intended"
 )]
-fn quantize(x: f32, scale: f32) -> i16 {
+fn quantize_one(x: f32, scale: f32) -> i16 {
     if scale <= 0.0 {
         return 0;
     }
@@ -709,12 +811,14 @@ fn quantize(x: f32, scale: f32) -> i16 {
     toward_zero + i16::from(fraction >= 0.5) - i16::from(fraction <= -0.5)
 }
 
-/// A quantized interior value back in tangent-frame units.
-fn decode(q: [i16; 3], scale: f32) -> Vec3 {
+/// A quantized interior value back in tangent-frame units, each component at its plane's
+/// scale.
+fn decode(q: [i16; 3], scales: [f32; 3]) -> Vec3 {
+    let [t, b, n] = scales;
     Vec3::new(
-        f32::from(q[0]) * scale,
-        f32::from(q[1]) * scale,
-        f32::from(q[2]) * scale,
+        f32::from(q[0]) * t,
+        f32::from(q[1]) * b,
+        f32::from(q[2]) * n,
     )
 }
 
@@ -760,13 +864,13 @@ mod tests {
             for &v in &values {
                 let x = v * scale;
                 assert_eq!(
-                    quantize(x, scale),
+                    quantize_one(x, scale),
                     quantize_by_rounding(x, scale),
                     "{x:e} at scale {scale:e}"
                 );
             }
         }
-        assert_eq!(quantize(1.0, 0.0), 0, "zero scale");
+        assert_eq!(quantize_one(1.0, 0.0), 0, "zero scale");
     }
 
     #[test]
@@ -823,7 +927,17 @@ mod tests {
             }
         }
         let tile = CorrectionTile::from_values(side, &values).unwrap();
-        assert_eq!(tile.scale(), 1.0 / 32767.0, "borders don't set the scale");
+        let normal = 0.5 / 32767.0;
+        assert!(
+            1.0 / 32767.0 < 8.0 * normal,
+            "t's own values need less than the floor"
+        );
+        assert_eq!(
+            tile.scales(),
+            [8.0 * normal, 8.0 * normal, normal],
+            "borders don't set the scales; the tangential ones are at least 8 normal steps"
+        );
+
         assert_eq!(tile.get(0, 0).unwrap().x, 1e3, "border exact");
     }
 
@@ -845,9 +959,14 @@ mod tests {
             "border −0 becomes +0"
         );
         assert!(tile.is_zero(), "still zero");
-        let parts = CorrectionTile::from_parts(2, -0.0, vec![], vec![Vec3::new(-0.0, 0.0, 0.0); 4])
-            .unwrap();
-        assert_eq!(parts.scale().to_bits(), 0, "scale normalised");
+        let parts =
+            CorrectionTile::from_parts(2, [-0.0; 3], vec![], vec![Vec3::new(-0.0, 0.0, 0.0); 4])
+                .unwrap();
+        assert_eq!(
+            parts.scales().map(f32::to_bits),
+            [0; 3],
+            "scales normalised"
+        );
         assert_eq!(parts.border()[0].to_bits(), [0; 3], "border normalised");
     }
 
@@ -855,7 +974,7 @@ mod tests {
     fn from_parts_rejects_i16_min_and_oversized_sides() {
         let bad = vec![[i16::MIN, 0, 0]];
         assert_eq!(
-            CorrectionTile::from_parts(3, 1.0, bad, vec![Vec3::ZERO; 8]),
+            CorrectionTile::from_parts(3, [1.0; 3], bad, vec![Vec3::ZERO; 8]),
             Err(CorrectionError::BadParts { side: 3 }),
             "−32768 is not a valid quantized value"
         );
@@ -871,21 +990,31 @@ mod tests {
     fn from_parts_rejects_scales_that_lose_the_interior() {
         let border = || vec![Vec3::ZERO; 8];
         assert_eq!(
-            CorrectionTile::from_parts(3, 0.0, vec![[1, 0, 0]], border()),
+            CorrectionTile::from_parts(3, [0.0; 3], vec![[1, 0, 0]], border()),
             Err(CorrectionError::BadParts { side: 3 }),
             "zero scale with a nonzero interior would decode to zero"
         );
         assert_eq!(
-            CorrectionTile::from_parts(3, 1e-40, vec![[0; 3]], border()),
+            CorrectionTile::from_parts(3, [1.0, 0.0, 1.0], vec![[1, 1, 1]], border()),
+            Err(CorrectionError::BadParts { side: 3 }),
+            "one plane's zero scale with a nonzero value"
+        );
+        assert!(
+            CorrectionTile::from_parts(3, [1.0, 0.0, 1.0], vec![[1, 0, 1]], border()).is_ok(),
+            "a zero plane beside nonzero ones"
+        );
+        assert_eq!(
+            CorrectionTile::from_parts(3, [1.0, 1.0, 1e-40], vec![[0; 3]], border()),
             Err(CorrectionError::BadParts { side: 3 }),
             "subnormal scale"
         );
         assert!(
-            CorrectionTile::from_parts(3, 0.0, vec![[0; 3]], border()).is_ok(),
+            CorrectionTile::from_parts(3, [0.0; 3], vec![[0; 3]], border()).is_ok(),
             "zero scale, zero interior"
         );
         assert!(
-            CorrectionTile::from_parts(3, f32::MIN_POSITIVE, vec![[1, 0, 0]], border()).is_ok(),
+            CorrectionTile::from_parts(3, [f32::MIN_POSITIVE; 3], vec![[1, 0, 0]], border())
+                .is_ok(),
             "smallest normal scale"
         );
     }
@@ -917,13 +1046,22 @@ mod tests {
             let side = 2 + rng.below(64);
             let amplitude = 10f32.powf(rng.signed() * 4.0);
             let values: Vec<Vec3> = (0..side * side).map(|_| rng.vec3(amplitude)).collect();
+            // Tangential parts larger or smaller than the normal one, as the area normal gives.
+            let tangential = 10f32.powf(rng.signed() * 2.0);
+            let values: Vec<Vec3> = values
+                .iter()
+                .map(|v| Vec3::new(v.x * tangential, v.y * tangential, v.z))
+                .collect();
             let tile = CorrectionTile::from_values(side, &values).unwrap();
-            let bound = tile.max_error();
+            let [t, b, n] = tile.scales();
+            assert!(t >= 8.0 * n && b >= 8.0 * n, "the tangential floor");
+            let bounds = tile.max_error();
             for j in 0..side {
                 for i in 0..side {
                     let want = values[(j * side + i) as usize];
                     let got = tile.get(i, j).unwrap();
-                    for (w, g) in [(want.x, got.x), (want.y, got.y), (want.z, got.z)] {
+                    let planes = [(want.x, got.x), (want.y, got.y), (want.z, got.z)];
+                    for ((w, g), bound) in planes.into_iter().zip(bounds) {
                         let slack = w.abs() * 4.0 * f32::EPSILON;
                         assert!((w - g).abs() <= bound + slack, "|{w} − {g}| > {bound}");
                     }
@@ -977,9 +1115,9 @@ mod tests {
             }
             assert_eq!(got, want, "case {case}: the same outcome");
             assert_eq!(
-                fast.view().scale().to_bits(),
-                slow.view().scale().to_bits(),
-                "case {case}: the same scale"
+                fast.view().scales().map(f32::to_bits),
+                slow.view().scales().map(f32::to_bits),
+                "case {case}: the same scales"
             );
             assert_eq!(fast, slow, "case {case}: the same values");
         }
@@ -1021,7 +1159,10 @@ mod tests {
         tile.set(4, 4, Vec3::new(0.001, 0.0, 0.0)).unwrap();
         tile.set(3, 3, Vec3::new(5.0, 0.0, 0.0)).unwrap();
         let big = tile.get(3, 3).unwrap();
-        assert!((big.x - 5.0).abs() <= tile.max_error(), "large value kept");
+        assert!(
+            (big.x - 5.0).abs() <= tile.max_error()[0],
+            "large value kept"
+        );
         // The small value was re-quantized once more: within one (new) step.
         assert!(
             (tile.get(4, 4).unwrap().x - 0.001).abs() <= tile.scale(),
@@ -1081,10 +1222,121 @@ mod tests {
     #[test]
     fn a_value_that_fits_exactly_does_not_grow_the_scale() {
         let mut tile = CorrectionTile::zero(9).unwrap();
-        tile.set(2, 2, Vec3::new(32767.0, 0.0, 0.0)).unwrap();
-        assert_eq!(tile.scale(), 1.0, "from zero: 32767 needs a step of 1");
+        tile.set(2, 2, Vec3::new(0.0, 0.0, 32767.0)).unwrap();
+        assert_eq!(
+            tile.scales(),
+            [8.0, 8.0, 1.0],
+            "from zero: 32767 needs a normal step of 1, the tangential planes take the floor"
+        );
         tile.set(4, 4, Vec3::new(0.0, 0.0, -32767.0)).unwrap();
-        assert_eq!(tile.scale(), 1.0, "32767 steps of 1 fit: no growth");
+        tile.set(5, 5, Vec3::new(8.0 * 32767.0, 0.0, 0.0)).unwrap();
+        assert_eq!(tile.scales(), [8.0, 8.0, 1.0], "32767 steps fit: no growth");
+    }
+
+    /// When the normal plane grows, a tangential plane below the new floor doubles with it, so
+    /// its values stay within one of its final steps; one above it is left as it was.
+    #[test]
+    fn normal_growth_raises_the_tangential_floor_by_doubling() {
+        let side = 9;
+        let mut tile = CorrectionTile::zero(side).unwrap();
+        let mut rng = Rng::new(41);
+        let written: Vec<((u32, u32), Vec3)> = interior_cells(side)
+            .map(|cell| {
+                let v = rng.vec3(1e-2);
+                (cell, Vec3::new(v.x, v.y * 1e4, v.z))
+            })
+            .collect();
+        for &((i, j), c) in &written {
+            tile.set(i, j, c).unwrap();
+        }
+        let before = tile.scales();
+        let last = (side - 2, side - 2);
+        tile.set(last.0, last.1, Vec3::new(0.0, 0.0, 1.0)).unwrap();
+        let after = tile.scales();
+        let [t, b, n] = after;
+        assert!(n > before[2], "the normal plane grew");
+        assert!(t >= 8.0 * n && b >= 8.0 * n, "the floor holds");
+        let factor = t / before[0];
+        assert!(
+            factor > 1.0 && factor.log2().fract() == 0.0,
+            "t doubled to the floor: {before:?} → {after:?}"
+        );
+        assert_eq!(b, before[1], "b, far above the floor, is left as it was");
+        for &((i, j), c) in written.iter().filter(|(cell, _)| *cell != last) {
+            let got = tile.get(i, j).unwrap();
+            let planes = [(c.x, got.x), (c.y, got.y), (c.z, got.z)];
+            for ((w, g), step) in planes.into_iter().zip(after) {
+                assert!((w - g).abs() <= step, "({i}, {j}): |{w} − {g}| > {step}");
+            }
+        }
+    }
+
+    /// A tile with one scale for all three planes, as an older file holds it, reads as written.
+    ///
+    /// It gets the tangential floor with its first interior write: its tangential planes double
+    /// to it, their values within one final step. A border write leaves the scales as they are.
+    #[test]
+    fn one_scale_tiles_get_the_floor_with_their_first_interior_write() {
+        let side = 5;
+        let scale = 1e-3_f32;
+        let interior: Vec<[i16; 3]> = (0..9_i16).map(|k| [k * 100, -k * 50, k * 30]).collect();
+        let mut tile =
+            CorrectionTile::from_parts(side, [scale; 3], interior.clone(), vec![Vec3::ZERO; 16])
+                .unwrap();
+        let read: Vec<Vec3> = interior_cells(side)
+            .map(|(i, j)| tile.get(i, j).unwrap())
+            .collect();
+        for (q, v) in interior.iter().zip(&read) {
+            let want = q.map(|c| f32::from(c) * scale);
+            assert_eq!(v.to_bits(), Vec3::new(want[0], want[1], want[2]).to_bits());
+        }
+        tile.set(0, 2, Vec3::new(1.0, 2.0, 3.0)).unwrap();
+        assert_eq!(tile.scales(), [scale; 3], "a border write");
+        tile.set(1, 1, read[0]).unwrap();
+        assert_eq!(
+            tile.scales(),
+            [8.0 * scale, 8.0 * scale, scale],
+            "the floor"
+        );
+        let cells = interior_cells(side).zip(&read).skip(1);
+        for ((i, j), want) in cells {
+            let got = tile.get(i, j).unwrap();
+            assert_eq!(got.z.to_bits(), want.z.to_bits(), "the normal plane kept");
+            assert!((got.x - want.x).abs() <= 8.0 * scale, "t within a step");
+            assert!((got.y - want.y).abs() <= 8.0 * scale, "b within a step");
+        }
+    }
+
+    /// The tangential floor holds after every interior write, however the planes grow, and the
+    /// scales only ever grow.
+    #[test]
+    fn the_tangential_floor_holds_after_every_write() {
+        let mut rng = Rng::new(59);
+        for case in 0..50 {
+            let side = 3 + rng.below(30);
+            let mut tile = CorrectionTile::zero(side).unwrap();
+            let mut before = tile.scales();
+            for _ in 0..200 {
+                let (i, j) = (1 + rng.below(side - 2), 1 + rng.below(side - 2));
+                let amplitude = 10f32.powf(rng.signed() * 3.0);
+                let random = rng.vec3(amplitude);
+                let value = match rng.below(3) {
+                    0 => Vec3::new(0.0, 0.0, random.z),
+                    1 => Vec3::new(random.x, random.y, 0.0),
+                    _ => random,
+                };
+                tile.set(i, j, value).unwrap();
+                let [tangent, bitangent, normal] = tile.scales();
+                assert!(
+                    tangent >= 8.0 * normal && bitangent >= 8.0 * normal,
+                    "case {case}: the floor"
+                );
+                for (now, was) in tile.scales().into_iter().zip(before) {
+                    assert!(now >= was, "case {case}: scales only grow");
+                }
+                before = tile.scales();
+            }
+        }
     }
 
     /// Every interior vertex of a tile of `side`, row-major.
@@ -1119,21 +1371,22 @@ mod tests {
         for &((i, j), c) in &written {
             tile.set(i, j, c).unwrap();
         }
-        let before = tile.scale();
+        let before = tile.scales();
         // A value far outside the scale, at the last interior vertex, so the first (index 0) is
         // only touched by the re-quantization.
         tile.set(side - 2, side - 2, Vec3::new(50.0, 0.0, 0.0))
             .unwrap();
-        assert!(tile.scale() > before, "the scale grew");
+        assert!(tile.scales()[0] > before[0], "the t plane's scale grew");
         for &((i, j), c) in written
             .iter()
             .filter(|(cell, _)| *cell != (side - 2, side - 2))
         {
             let got = tile.get(i, j).unwrap();
-            for (w, g) in [(c.x, got.x), (c.y, got.y), (c.z, got.z)] {
+            let planes = [(c.x, got.x), (c.y, got.y), (c.z, got.z)];
+            for ((w, g), step) in planes.into_iter().zip(tile.scales()) {
                 assert!(
-                    (w - g).abs() <= tile.scale(),
-                    "({i}, {j}): {g} is not within one scale of {w}"
+                    (w - g).abs() <= step,
+                    "({i}, {j}): {g} is not within one step ({step}) of {w}"
                 );
             }
         }
@@ -1159,13 +1412,14 @@ mod tests {
             tile.set(i, j, c).unwrap();
             written.insert((i, j), c);
         }
-        let scale = tile.scale();
+        let scales = tile.scales();
         for ((i, j), c) in written {
             let got = tile.get(i, j).unwrap();
-            for (w, g) in [(c.x, got.x), (c.y, got.y), (c.z, got.z)] {
+            let planes = [(c.x, got.x), (c.y, got.y), (c.z, got.z)];
+            for ((w, g), step) in planes.into_iter().zip(scales) {
                 assert!(
-                    (w - g).abs() <= scale,
-                    "({i}, {j}): |{w} − {g}| > final scale {scale}"
+                    (w - g).abs() <= step,
+                    "({i}, {j}): |{w} − {g}| > final step {step}"
                 );
             }
         }
@@ -1177,7 +1431,7 @@ mod tests {
         let check = |scale: f32, q: [i16; 3], b: Vec3| {
             let mut border = vec![Vec3::ZERO; 8];
             border[3] = b;
-            CorrectionView::new(3, scale, &[q], &border)?.validate()
+            CorrectionView::new(3, [scale; 3], &[q], &border)?.validate()
         };
         assert_eq!(
             check(1.0, [1, 2, 3], Vec3::new(0.5, 0.0, 0.0)),
@@ -1212,27 +1466,31 @@ mod tests {
     fn a_negative_zero_scale_is_normalised_or_rejected() {
         let (_, mut interior, mut border) = full_slot();
         assert_eq!(
-            CorrectionView::new(3, -0.0, &interior, &border).unwrap_err(),
+            CorrectionView::new(3, [0.0, -0.0, 0.0], &interior, &border).unwrap_err(),
             CorrectionError::BadParts { side: 3 },
             "a read-only view can't normalise it, so it rejects it"
         );
-        let mut scale = -0.0_f32;
-        let mut view = CorrectionViewMut::new(3, &mut scale, &mut interior, &mut border).unwrap();
+        let mut scales = [1.0, -0.0, -0.0_f32];
+        let mut view = CorrectionViewMut::new(3, &mut scales, &mut interior, &mut border).unwrap();
         assert_eq!(
-            view.as_view().scale().to_bits(),
-            0,
+            view.as_view().scales().map(f32::to_bits),
+            [1.0_f32.to_bits(), 0, 0],
             "a mutable view normalises it"
         );
         view.normalize_and_validate().unwrap();
-        assert_eq!(scale.to_bits(), 0, "in the storage");
+        assert_eq!(
+            scales.map(f32::to_bits),
+            [1.0_f32.to_bits(), 0, 0],
+            "in the storage"
+        );
     }
 
     #[test]
     fn normalize_and_validate_clears_negative_zero_borders_only() {
-        let (mut scale, mut interior, mut border) = full_slot();
+        let (mut scales, mut interior, mut border) = full_slot();
         border[2] = Vec3::new(-0.0, 1.0, -0.0);
         border[5] = Vec3::new(-3.0, 0.0, 0.0);
-        let mut view = CorrectionViewMut::new(3, &mut scale, &mut interior, &mut border).unwrap();
+        let mut view = CorrectionViewMut::new(3, &mut scales, &mut interior, &mut border).unwrap();
         view.normalize_and_validate().unwrap();
         assert_eq!(
             border[2].to_bits(),
@@ -1242,7 +1500,7 @@ mod tests {
         assert_eq!(border[5].x, -3.0, "other values kept");
         border[1].y = f32::INFINITY;
         let mut infinite =
-            CorrectionViewMut::new(3, &mut scale, &mut interior, &mut border).unwrap();
+            CorrectionViewMut::new(3, &mut scales, &mut interior, &mut border).unwrap();
         assert_eq!(
             infinite.normalize_and_validate(),
             Err(CorrectionError::BadParts { side: 3 }),
@@ -1251,18 +1509,18 @@ mod tests {
     }
 
     /// The largest tile's storage, as a pool slot holds it.
-    fn full_slot() -> (f32, Vec<[i16; 3]>, Vec<Vec3>) {
+    fn full_slot() -> ([f32; 3], Vec<[i16; 3]>, Vec<Vec3>) {
         let (ni, nb) = counts(TILE_QUADS + 1).unwrap();
-        (0.0, vec![[0; 3]; ni], vec![Vec3::ZERO; nb])
+        ([0.0; 3], vec![[0; 3]; ni], vec![Vec3::ZERO; nb])
     }
 
     #[test]
     fn a_view_over_a_full_slot_behaves_like_a_small_tile() {
         let bits = |v: Option<Vec3>| v.unwrap().to_bits();
         for side in [2, 3, 9, 33, 65] {
-            let (mut scale, mut interior, mut border) = full_slot();
+            let (mut scales, mut interior, mut border) = full_slot();
             let mut view =
-                CorrectionViewMut::new(side, &mut scale, &mut interior, &mut border).unwrap();
+                CorrectionViewMut::new(side, &mut scales, &mut interior, &mut border).unwrap();
             let mut tile = CorrectionTile::zero(side).unwrap();
             let mut rng = Rng::new(u64::from(side));
             for step in 0..400 {
@@ -1273,9 +1531,9 @@ mod tests {
                 tile.set(i, j, c).unwrap();
                 view.set(i, j, c).unwrap();
                 assert_eq!(
-                    view.as_view().scale().to_bits(),
-                    tile.scale().to_bits(),
-                    "side {side} step {step}: scale"
+                    view.as_view().scales().map(f32::to_bits),
+                    tile.scales().map(f32::to_bits),
+                    "side {side} step {step}: scales"
                 );
             }
             for j in 0..side {
@@ -1291,8 +1549,8 @@ mod tests {
             assert_eq!(read.side(), side, "side");
             assert_eq!(read.is_zero(), tile.is_zero(), "is_zero");
             assert_eq!(
-                read.max_error().to_bits(),
-                tile.max_error().to_bits(),
+                read.max_error().map(f32::to_bits),
+                tile.max_error().map(f32::to_bits),
                 "max_error"
             );
             assert_eq!(read.get(side, 0), None, "outside");
@@ -1310,7 +1568,7 @@ mod tests {
             assert!(interior[ni..].iter().all(|q| *q == [0; 3]), "interior tail");
             assert!(border[nb..].iter().all(|v| *v == Vec3::ZERO), "border tail");
             // And a read-only view of the same storage decodes the same.
-            let again = CorrectionView::new(side, scale, &interior, &border).unwrap();
+            let again = CorrectionView::new(side, scales, &interior, &border).unwrap();
             assert_eq!(
                 bits(again.get(1, 1)),
                 bits(tile.get(1, 1)),
@@ -1328,36 +1586,36 @@ mod tests {
     fn views_check_shape_and_scale() {
         let (_, interior, border) = full_slot();
         assert_eq!(
-            CorrectionView::new(66, 0.0, &interior, &border).unwrap_err(),
+            CorrectionView::new(66, [0.0; 3], &interior, &border).unwrap_err(),
             CorrectionError::BadSide(66),
             "side above a full tile"
         );
         assert_eq!(
-            CorrectionView::new(1, 0.0, &interior, &border).unwrap_err(),
+            CorrectionView::new(1, [0.0; 3], &interior, &border).unwrap_err(),
             CorrectionError::BadSide(1),
             "side below 2"
         );
         assert_eq!(
-            CorrectionView::new(9, 0.0, &interior[..48], &border).unwrap_err(),
+            CorrectionView::new(9, [0.0; 3], &interior[..48], &border).unwrap_err(),
             CorrectionError::BadParts { side: 9 },
             "interior one short of 7²"
         );
         assert_eq!(
-            CorrectionView::new(9, 0.0, &interior, &border[..31]).unwrap_err(),
+            CorrectionView::new(9, [0.0; 3], &interior, &border[..31]).unwrap_err(),
             CorrectionError::BadParts { side: 9 },
             "border one short of 4·8"
         );
         assert!(
-            CorrectionView::new(9, 0.0, &interior[..49], &border[..32]).is_ok(),
+            CorrectionView::new(9, [0.0; 3], &interior[..49], &border[..32]).is_ok(),
             "exact lengths"
         );
         for scale in [-1.0, 1e-40, f32::NAN, f32::INFINITY] {
             assert_eq!(
-                CorrectionView::new(9, scale, &interior, &border).unwrap_err(),
+                CorrectionView::new(9, [1.0, 1.0, scale], &interior, &border).unwrap_err(),
                 CorrectionError::BadParts { side: 9 },
                 "scale {scale}"
             );
-            let (mut s, mut i, mut b) = (scale, interior.clone(), border.clone());
+            let (mut s, mut i, mut b) = ([scale, 1.0, 1.0], interior.clone(), border.clone());
             assert_eq!(
                 CorrectionViewMut::new(9, &mut s, &mut i, &mut b).unwrap_err(),
                 CorrectionError::BadParts { side: 9 },
@@ -1381,15 +1639,15 @@ mod tests {
         assert_eq!(
             CorrectionTile::from_parts(
                 3,
-                MAX_SCALE * 2.0,
-                vec![[32767, 0, 0]],
+                [1.0, MAX_SCALE * 2.0, 1.0],
+                vec![[0, 32767, 0]],
                 vec![Vec3::ZERO; 8]
             )
             .unwrap_err(),
             CorrectionError::BadParts { side: 3 },
         );
         let tile =
-            CorrectionTile::from_parts(3, MAX_SCALE, vec![[32767, 0, 0]], vec![Vec3::ZERO; 8])
+            CorrectionTile::from_parts(3, [MAX_SCALE; 3], vec![[32767; 3]], vec![Vec3::ZERO; 8])
                 .unwrap();
         assert!(tile.get(1, 1).unwrap().is_finite());
     }

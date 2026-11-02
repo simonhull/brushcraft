@@ -25,8 +25,25 @@ use crate::{OpId, bounds};
 
 /// The file's first bytes.
 const MAGIC: [u8; 4] = *b"BCRF";
-/// The format version this build reads and writes.
-const VERSION: u16 = 1;
+/// The format version this build writes: 2, where a displacement tile's channel header holds a
+/// scale per plane.
+const VERSION: u16 = 2;
+/// The format version before per-plane scales, which this build still reads: its displacement
+/// tiles hold one scale, read as three equal ones.
+const ONE_SCALE_VERSION: u16 = 1;
+/// Offset of the header's version field, after the magic.
+const VERSION_AT: u64 = MAGIC.len() as u64;
+
+/// The format version a file's header states, of those this build reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Version {
+    /// Version 1: every displacement tile in it holds one scale for its three planes. A file
+    /// this build appends a record to is upgraded to [`Version::Current`] first
+    /// ([`upgrade_header`]), as the records it writes hold three.
+    OneScale,
+    /// Version 2, the one this build writes.
+    Current,
+}
 /// File header bytes: magic, version `u16`, flags `u16`, reserved `u64`.
 pub(crate) const HEADER_LEN: usize = 16;
 /// Offset of the first record: the `Meta` record.
@@ -152,29 +169,47 @@ pub(super) fn tile_record<'a>(raw: &'a [u8], key: &TileKey) -> Option<TileRecord
     .filter(|tile| tile.key == *key)
 }
 
-/// Checks the file header.
+/// Checks the file header, and says which of the versions this build reads it states.
 ///
 /// # Errors
 ///
-/// [`FileError::BadHeader`] if it is short or has the wrong magic or version, or flags or
-/// reserved bits this version doesn't know (a later version may set them to mean something),
-/// [`FileError::Io`].
-pub(super) fn check_header(file: &File, len: u64) -> Result<(), FileError> {
+/// [`FileError::BadHeader`] if it is short or has the wrong magic or a version this build
+/// doesn't read, or flags or reserved bits this version doesn't know (a later version may set
+/// them to mean something), [`FileError::Io`].
+pub(super) fn check_header(file: &File, len: u64) -> Result<Version, FileError> {
     if len < FIRST_RECORD {
         return Err(FileError::BadHeader);
     }
     let mut header = [0; HEADER_LEN];
     file.read_exact_at(&mut header, 0)?;
     let mut r = Reader::new(&header);
-    if r.take(MAGIC.len()) == Some(&MAGIC[..])
-        && r.u16() == Some(VERSION)
-        && r.u16() == Some(0)
-        && r.u64() == Some(0)
-    {
-        Ok(())
-    } else {
-        Err(FileError::BadHeader)
+    let magic = r.take(MAGIC.len()) == Some(&MAGIC[..]);
+    let version = match r.u16() {
+        Some(VERSION) => Some(Version::Current),
+        Some(ONE_SCALE_VERSION) => Some(Version::OneScale),
+        _ => None,
+    };
+    match version {
+        Some(version) if magic && r.u16() == Some(0) && r.u64() == Some(0) => Ok(version),
+        _ => Err(FileError::BadHeader),
     }
+}
+
+/// Rewrites the header of a [`Version::OneScale`] file to say [`VERSION`].
+///
+/// Done before the first record this build appends to it: a reader that knows only version 1
+/// then refuses the file as a whole ([`FileError::BadHeader`]) rather than finding tiles it
+/// can't decode in it.
+///
+/// Not synced here: the version is two bytes of the file's first block, synced with the
+/// records after it, before any save point that names them.
+///
+/// # Errors
+///
+/// [`FileError::Io`].
+pub(super) fn upgrade_header(file: &File) -> Result<(), FileError> {
+    file.write_all_at(&VERSION.to_le_bytes(), VERSION_AT)?;
+    Ok(())
 }
 
 /// The framed `Mesh` record of `mesh`: its canonical bytes' length, then the bytes compressed.

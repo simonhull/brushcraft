@@ -395,7 +395,7 @@ impl TileStore {
             .ok_or_else(short)?;
         border.copy_from_slice(tile.border());
         slot.side = tile.side();
-        slot.scale = tile.scale();
+        slot.scales = tile.scales();
         Ok(())
     }
 }

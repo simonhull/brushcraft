@@ -1156,3 +1156,96 @@ fn locations_stay_valid_after_more_appends() {
     );
     assert_eq!(slot.to_tile().unwrap(), tile(0.5), "the newest tile");
 }
+
+/// The format version in a file's header.
+fn header_version(path: &Path) -> u16 {
+    let bytes = std::fs::read(path).unwrap();
+    u16::from_le_bytes([bytes[4], bytes[5]])
+}
+
+/// A file written before per-plane scales opens, and its tiles decode as they were written.
+///
+/// Format version 1, its displacement tiles with one scale in their channel header, opens at its
+/// latest save point and at a given one, and its tiles decode as three equal scales, the same
+/// values bit for bit. The first record this build appends to it upgrades its header to the
+/// current version, so an older reader refuses it whole; until then it is left as it was.
+#[test]
+fn a_one_scale_file_opens_and_decodes_as_it_was_written() {
+    let dir = TestDir::new();
+    let path = dir.path("old.bcrf");
+    let scale = 0.002_f32;
+    let interior: Vec<[i16; 3]> = (0..63 * 63)
+        .map(|k: i32| {
+            let k = i16::try_from(k % 4000).unwrap();
+            [k, -k / 2, k / 3]
+        })
+        .collect();
+    let border: Vec<Vec3> = (0..256_u16)
+        .map(|k| Vec3::new(f32::from(k) * 1e-3, 0.5, -0.25))
+        .collect();
+    let old = CorrectionTile::from_parts(65, [scale; 3], interior, border).unwrap();
+    let (header, body) = encode_displacement(&old).unwrap();
+    let mut one_scale = header[..2].to_vec();
+    one_scale.extend_from_slice(&scale.to_le_bytes());
+    let mut writer = ProjectFile::create(&path, meta(), mesh()).unwrap();
+    writer
+        .write_tile(key(1, 0), op(1), &one_scale, &body)
+        .unwrap();
+    let point = writer.save().unwrap();
+    drop(writer);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let bits = |tile: &CorrectionTile| -> Vec<[u32; 3]> {
+        (0..65)
+            .flat_map(|j| (0..65).map(move |i| (i, j)))
+            .map(|(i, j)| tile.get(i, j).unwrap().to_bits())
+            .collect()
+    };
+    let at = ProjectFile::open_at(&path, point).unwrap();
+    let (_, at_point) = at.read_displacement(&key(1, 0)).unwrap().unwrap();
+    assert_eq!(at_point.scales(), [scale; 3], "three equal scales");
+    assert_eq!(bits(&at_point), bits(&old), "decoded as written");
+    drop(at);
+    let mut opened = ProjectFile::open(&path).unwrap();
+    assert_eq!(header_version(&path), 1, "opening writes nothing");
+    let (op_read, latest) = opened.read_displacement(&key(1, 0)).unwrap().unwrap();
+    assert_eq!(op_read, op(1));
+    assert_eq!(latest, old, "the same tile");
+
+    opened
+        .write_displacement(key(2, 0), op(2), &tile(0.5))
+        .unwrap();
+    assert_eq!(
+        header_version(&path),
+        2,
+        "upgraded before its first new record"
+    );
+    opened.save().unwrap();
+    drop(opened);
+    let again = ProjectFile::open(&path).unwrap();
+    let (_, kept) = again.read_displacement(&key(1, 0)).unwrap().unwrap();
+    assert_eq!(bits(&kept), bits(&old), "the old tile, unchanged");
+    let (_, new) = again.read_displacement(&key(2, 0)).unwrap().unwrap();
+    assert_eq!(new, tile(0.5), "the new tile, with its three scales");
+}
+
+/// Files this build creates state the current version; a version this build doesn't read is
+/// refused.
+#[test]
+fn new_files_state_version_2_and_unknown_versions_are_refused() {
+    let dir = TestDir::new();
+    let path = dir.path("new.bcrf");
+    drop(ProjectFile::create(&path, meta(), mesh()).unwrap());
+    assert_eq!(header_version(&path), 2);
+    let mut bytes = std::fs::read(&path).unwrap();
+    for version in [0_u16, 3, u16::MAX] {
+        bytes[4..6].copy_from_slice(&version.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            matches!(ProjectFile::open(&path), Err(FileError::BadHeader)),
+            "version {version}"
+        );
+    }
+}

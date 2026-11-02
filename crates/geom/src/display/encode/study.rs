@@ -195,15 +195,18 @@ impl DisplayCodec for BaseOffsets<'_> {
             | crate::CorrectionError::BadSide(_)
             | crate::CorrectionError::BadParts { .. } => DisplayError::Shape,
         })?;
-        // As the store writes a correction tile: side, scale, the interior's three planes
-        // delta-coded, then the border's three planes of exact `f32`s.
+        // As the store writes a correction tile: side, the three planes' scales, the interior's
+        // three planes delta-coded, then the border's three planes of exact `f32`s.
+
         let mut out = Vec::new();
         out.extend_from_slice(
             &u16::try_from(side)
                 .map_err(|_too_wide| DisplayError::Shape)?
                 .to_le_bytes(),
         );
-        out.extend_from_slice(&tile.scale().to_le_bytes());
+        for scale in tile.scales() {
+            out.extend_from_slice(&scale.to_le_bytes());
+        }
         for k in 0..3 {
             let mut prev = 0_i16;
             for q in tile.interior() {
@@ -229,7 +232,7 @@ impl DisplayCodec for BaseOffsets<'_> {
         if u32::from(stored_side) != side {
             return Err(DisplayError::Malformed);
         }
-        let scale = reader.f32()?;
+        let scales = [reader.f32()?, reader.f32()?, reader.f32()?];
         let inner =
             usize::try_from(side.saturating_sub(2)).map_err(|_too_wide| DisplayError::Shape)?;
         let (count, ring) = (inner * inner, 4 * (inner + 1));
@@ -255,7 +258,7 @@ impl DisplayCodec for BaseOffsets<'_> {
         reader.finish()?;
         let tile = CorrectionTile::from_parts(
             side,
-            scale,
+            scales,
             interior,
             border.into_iter().map(join).collect(),
         )

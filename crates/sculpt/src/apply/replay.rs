@@ -553,7 +553,7 @@ impl<'a> Replay<'a> {
                 .get_or_insert_with(|| StrokeState::found(self.run.stroke, &key, entries));
             own.reach(self.run.plan, &key, dab);
         }
-        let scale = self.tile.scale();
+        let scales = self.tile.scales();
         let mut changed: Vec<usize> = Vec::new();
         if let Some(rows) = scan.rows {
             self.write_interior(imprint, grant.unwrap_or(Grant::Held), rows, &mut changed)?;
@@ -577,7 +577,7 @@ impl<'a> Replay<'a> {
             return Ok(());
         }
         self.written = true;
-        if self.tile.scale().to_bits() == scale.to_bits() {
+        if self.tile.scales().map(f32::to_bits) == scales.map(f32::to_bits) {
             self.update_positions(&changed)
         } else {
             let all: Vec<usize> = (0..self.positions.len()).collect();

@@ -16,9 +16,10 @@ const NO_START: u32 = f32::NAN.to_bits();
 /// The state one brush stroke keeps across its dabs, so that its small dabs move a tile's
 /// interior as far as its border.
 ///
-/// A tile stores its interior corrections quantized to a step of its scale, and its border
-/// vertices exactly. Were each dab to add its delta to the stored value, a delta under half a
-/// step would vanish on the interior and be kept on the border, building ridges along tile
+/// A tile stores its interior corrections quantized, each component to a step of its plane's
+/// scale (the tangential planes' at least 8 times coarser than the normal plane's), and its
+/// border vertices exactly. Were each dab to add its delta to the stored value, a delta under half
+/// a step would vanish on the interior and be kept on the border, building ridges along tile
 /// seams. Instead, for every vertex a stroke writes, it keeps the value it is building for each of
 /// the correction's three components in `f32`: the correction as it first found it (the start),
 /// plus every dab's delta since, and writes that. The stored value is rounded when it is written,
@@ -28,14 +29,15 @@ const NO_START: u32 = f32::NAN.to_bits();
 ///
 /// # Error bound
 ///
-/// An interior vertex's stored value differs from its value before the stroke plus the stroke's
-/// deltas by at most half a step of its tile's scale for each time its start is captured: once,
-/// unless its tile's state is released and the vertex edited again (see "Releasing tiles"),
-/// when the start is captured again from the rounded stored value. Should the tile's scale grow
-/// during the stroke, the re-quantization rounds the values written before it again, and the
-/// bound is one step of the final scale for each capture instead. The value accumulates as a
-/// running `f32`, so a delta under half an ulp of the value it is added to is lost: far below a
-/// quantization step, as the values are corrections, not positions.
+/// Each component of an interior vertex's stored value differs from its value before the stroke
+/// plus the stroke's deltas by at most half a step of its plane's scale for each time its start
+/// is captured: once, unless its tile's state is released and the vertex edited again (see
+/// "Releasing tiles"), when the start is captured again from the rounded stored value. Should a
+/// plane's scale grow during the stroke (its own values outgrowing it, or a tangential plane
+/// raised with the normal plane's), the re-quantization rounds that plane's values written before
+/// it again, and its bound is one step of its final scale for each capture instead. The value
+/// accumulates as a running `f32`, so a delta under half an ulp of the value it is added to is
+/// lost: far below a quantization step, as the values are corrections, not positions.
 ///
 /// # Memory
 ///

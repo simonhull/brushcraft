@@ -26,9 +26,9 @@ use self::format::read_head;
 #[cfg(test)]
 use self::format::take_work;
 use self::format::{
-    Coverage, FULL_EVERY, Index, Search, TileRecord, chain_from, check_header, find_index,
+    Coverage, FULL_EVERY, Index, Search, TileRecord, Version, chain_from, check_header, find_index,
     index_payload, leading_bytes, load_chain, mesh_record, read_exact, read_index, read_leading,
-    read_save_point, scan_heads, tile_payload, tile_record,
+    read_save_point, scan_heads, tile_payload, tile_record, upgrade_header,
 };
 use self::lock::{Access, Lock, LockedFile, open_locked, open_readable, open_writable};
 use self::reader::read_displacement_at;
@@ -302,6 +302,9 @@ pub struct ProjectFile {
     head: Option<OpId>,
     /// Whether writes are accepted.
     access: Access,
+    /// The format version the file's header states: an older file's is rewritten to the
+    /// current one before the first record appended to it (see [`upgrade_header`]).
+    version: Version,
     /// The cut the next save point is written for, while one is open (see [`Cut`]).
     cut: Option<Cut>,
     /// Makes the next save point's derivation leave out its first new tile record: for tests
@@ -488,6 +491,7 @@ impl ProjectFile {
             deltas: 0,
             head: None,
             access: Access::ReadWrite,
+            version: Version::Current,
             cut: None,
             #[cfg(test)]
             skew_derivation: false,
@@ -585,7 +589,7 @@ impl ProjectFile {
     ) -> Result<Self, FileError> {
         let access = repair.access();
         let len = file.metadata()?.len();
-        check_header(&file, len)?;
+        let version = check_header(&file, len)?;
         let leading = read_leading(&file, len, like)?;
         let heads = scan_heads(&file, leading.end, len)?;
         let mut this = Self {
@@ -602,6 +606,7 @@ impl ProjectFile {
             deltas: 0,
             head: None,
             access,
+            version,
             cut: None,
             #[cfg(test)]
             skew_derivation: false,
@@ -666,7 +671,7 @@ impl ProjectFile {
     pub fn open_at(path: &Path, index_offset: u64) -> Result<Self, FileError> {
         let file = open_locked(path, open_readable, Lock::Shared)?;
         let len = file.metadata()?.len();
-        check_header(&file, len)?;
+        let version = check_header(&file, len)?;
         let leading = read_leading(&file, len, None)?;
         if index_offset < leading.end || read_index(&file, index_offset, len)?.is_none() {
             return Err(FileError::NotASavePoint(index_offset));
@@ -692,6 +697,7 @@ impl ProjectFile {
             deltas: chain.deltas,
             head: chain.head,
             access: Access::ReadOnly,
+            version,
             cut: None,
             #[cfg(test)]
             skew_derivation: false,
@@ -956,13 +962,20 @@ impl ProjectFile {
         self.append_record(&record)
     }
 
-    /// Writes an already framed record at the end.
+    /// Writes an already framed record at the end, first upgrading an older file's header to
+    /// the version this build writes (see [`upgrade_header`]): every tile record goes through
+    /// here.
     ///
     /// # Errors
     ///
     /// [`FileError::Io`].
     fn append_record(&mut self, record: &[u8]) -> Result<Loc, FileError> {
+        if self.version != Version::Current {
+            upgrade_header(&self.file)?;
+            self.version = Version::Current;
+        }
         self.file.write_all_at(record, self.end)?;
+
         let loc = Loc {
             offset: self.end,
             len: record.len() as u64,

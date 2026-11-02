@@ -337,40 +337,43 @@ mod tests {
     /// [`golden_hash`] for valences 3 to 32, recorded from the evaluation as it stood when these
     /// were pinned.
     ///
+    /// Recorded again when corrections took a scale per plane, which changed the quantized
+    /// corrections the evaluation reads, not its arithmetic.
+    ///
     /// To regenerate after a deliberate change to the arithmetic, run
     /// `BRUSHCRAFT_PRINT_GOLDEN=1 cargo nextest run -p geom golden --no-capture`, check the
     /// change was meant to move the bits, and paste the printed table here.
     const GOLDEN: [u64; MAX_VALENCE - 2] = [
-        0x3B41_A5C9_D0F6_7E7D, // valence 3
-        0x1B49_B23D_CE92_CE00, // valence 4
-        0x4465_118A_B420_4844, // valence 5
-        0x2156_D801_BA78_EDF8, // valence 6
-        0x7160_A5A8_51D1_B46D, // valence 7
-        0x09DD_0649_C7D6_F284, // valence 8
-        0xE9F2_E185_744D_FEEC, // valence 9
-        0xD7AF_1F99_1FA2_BE93, // valence 10
-        0x543D_7A4F_9EE6_7695, // valence 11
-        0x2642_703D_1110_98CC, // valence 12
-        0x9938_7E0C_29F0_F906, // valence 13
-        0x9E20_FF64_C392_5683, // valence 14
-        0x6C19_4D25_B30F_36BD, // valence 15
-        0xCD0B_3FF1_3BBF_8C08, // valence 16
-        0x2732_B66C_30BC_4E7E, // valence 17
-        0x0A72_6CE0_F1F1_AD06, // valence 18
-        0x8F76_1DDA_91FA_56CE, // valence 19
-        0x2466_3B08_DCBD_E713, // valence 20
-        0x5F42_CA3B_35A9_4982, // valence 21
-        0x1898_1BC2_73A2_E60C, // valence 22
-        0xCB9A_EBF0_3F1B_25D4, // valence 23
-        0xB881_2109_5221_2331, // valence 24
-        0x4B40_B027_557A_ED9D, // valence 25
-        0x58D4_39B1_FF4E_C664, // valence 26
-        0x82CF_FAEE_77D3_2615, // valence 27
-        0xC3D2_48C9_A471_7772, // valence 28
-        0x0D7B_3977_3157_76D3, // valence 29
-        0x6F40_149E_1D76_4339, // valence 30
-        0x4843_2153_7435_F0DB, // valence 31
-        0x50D3_9623_FA69_568E, // valence 32
+        0x7AD6_3749_17E5_BF3E, // valence 3
+        0x0660_404E_FDED_9A5B, // valence 4
+        0x7BAF_05B5_AAC3_52B9, // valence 5
+        0x93C9_DCE3_76CE_B210, // valence 6
+        0xACDF_76D2_3278_5180, // valence 7
+        0x9FC7_49E8_12F5_EC8B, // valence 8
+        0xE6F7_AE33_EEE8_BADE, // valence 9
+        0x16A0_9457_CA1A_7E62, // valence 10
+        0x39A9_BE0E_D358_67EE, // valence 11
+        0x3F5E_FF30_5E91_10DB, // valence 12
+        0xB84C_E6CB_50BA_8F88, // valence 13
+        0x6135_9D7E_DEB0_EAEA, // valence 14
+        0x5F83_D507_91E0_1D19, // valence 15
+        0x08E1_795B_71A2_5100, // valence 16
+        0x239A_5DFE_8D0A_4A12, // valence 17
+        0x5CB4_61C0_8164_B345, // valence 18
+        0x8D41_081F_2952_F789, // valence 19
+        0x3B1C_F1F6_596A_C955, // valence 20
+        0x5723_1492_70E4_7326, // valence 21
+        0x9FCD_8225_BD8E_564F, // valence 22
+        0x68EE_FBC3_1F27_6AB3, // valence 23
+        0x4454_F3FF_64F2_6F91, // valence 24
+        0xC436_0F6D_E0EA_ED27, // valence 25
+        0xF3B5_0B0E_E52A_E931, // valence 26
+        0x5444_8D39_A72E_C606, // valence 27
+        0x8D47_AA7B_FA5C_00FA, // valence 28
+        0x54D2_16E3_4EFB_309A, // valence 29
+        0x2298_8648_A058_803B, // valence 30
+        0xD323_E851_7305_C9D8, // valence 31
+        0x8579_D771_BB11_D3E7, // valence 32
     ];
 
     /// Pins every summation order by the exact bits it produces at every valence the mesh accepts.

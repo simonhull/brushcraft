@@ -1059,17 +1059,19 @@ fn stage_hash(n: usize) -> u64 {
     crate::test_rng::fnv1a(points)
 }
 
-/// [`stage_hash`] for `prism(3)`, `prism(5)` and `prism(8)`, recorded from the stages as they
-/// stood when these were pinned (before the row and lane rewrites, so those are held to the
-/// per-vertex code's bits).
+/// [`stage_hash`] for `prism(3)`, `prism(5)` and `prism(8)`.
+///
+/// First recorded from the stages as they stood before the row and lane rewrites, so those were
+/// held to the per-vertex code's bits. Recorded again when corrections took a scale per plane,
+/// which changed the quantized corrections the stages read, not their arithmetic.
 ///
 /// To regenerate after a deliberate change to the arithmetic, run
 /// `BRUSHCRAFT_PRINT_GOLDEN=1 cargo nextest run -p geom stage_bits --no-capture`, check the
 /// change was meant to move the bits, and paste the printed values here.
 const STAGE_GOLDEN: [(usize, u64); 3] = [
-    (3, 0x7BE8_3E3F_9151_C7E5),
-    (5, 0x279C_99FF_705C_FE78),
-    (8, 0x9955_E72D_6E3F_B2C9),
+    (3, 0x56D9_FA86_0D13_3D18),
+    (5, 0x54C9_1B2B_8D22_7850),
+    (8, 0xCFB1_64C9_F291_C536),
 ];
 
 /// Pins the stages' bits on blocks wide enough that whole rows run through them: the

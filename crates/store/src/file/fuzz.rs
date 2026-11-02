@@ -302,12 +302,22 @@ fn bounds_payloads_never_panic_and_round_trip() {
     });
 }
 
-/// A displacement tile's header and a body of the length its side needs, from any side, scale
-/// and body bytes (repeated to length).
-fn displacement_of(side: u8, scale: f32, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+/// A displacement tile's header and a body of the length its side needs.
+///
+/// From any side, scales and body bytes (repeated to length). With `one_scale`, the header is
+/// an older file's, with the first scale alone.
+fn displacement_of(
+    side: u8,
+    scales: [f32; 3],
+    one_scale: bool,
+    bytes: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
     let side = u16::from(side % 70);
     let mut header = side.to_le_bytes().to_vec();
-    header.extend_from_slice(&scale.to_le_bytes());
+    let written = if one_scale { &scales[..1] } else { &scales[..] };
+    for scale in written {
+        header.extend_from_slice(&scale.to_le_bytes());
+    }
     let n = usize::from(side.saturating_sub(2));
     let ring = 4 * usize::from(side.saturating_sub(1));
     let len = n * n * 6 + ring * 12;
@@ -315,14 +325,15 @@ fn displacement_of(side: u8, scale: f32, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (header, body)
 }
 
-/// The displacement decoder takes any header and body, and a tile it accepts encodes and decodes
-/// again to the same slot, bit for bit.
+/// The displacement decoder takes any header and body, an older file's one-scale header
+/// included, and a tile it accepts encodes and decodes again to the same slot, bit for bit.
 #[test]
 fn displacement_decoding_never_panics_and_round_trips() {
     bolero::check!()
-        .with_type::<(u8, f32, Vec<u8>, Flip)>()
-        .for_each(|(side, scale, bytes, flip)| {
-            let (header, body) = displacement_of(*side, *scale, bytes);
+        .with_type::<(u8, [f32; 3], bool, Vec<u8>, Flip)>()
+        .for_each(|(side, scales, one_scale, bytes, flip)| {
+            let (header, body) = displacement_of(*side, *scales, *one_scale, bytes);
+
             let body = flipped(body, *flip);
             let mut slot: Box<CorrectionSlot> = bytemuck::zeroed_box();
             if decode_displacement_into(&header, &body, &mut slot).is_ok() {

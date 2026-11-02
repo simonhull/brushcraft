@@ -331,10 +331,10 @@ impl TileEdit<'_> {
     /// value, that is set as [`TileEdit::set`] sets it, before `f` sees the next vertex.
     ///
     /// The same as [`TileEdit::get`] then [`TileEdit::set`] for each vertex in that order, and
-    /// so the same bits: order matters, as a value that outgrows the tile's scale re-quantizes
-    /// its interior. It is cheaper, as each run of interior vertices of a row (which have no
-    /// copies in other tiles) is read and written through one borrowed view instead of a
-    /// lookup per call; border vertices go through [`TileEdit::set`], copies and all.
+    /// so the same bits: order matters, as a value that outgrows a plane's scale re-quantizes
+    /// that plane of the interior. It is cheaper, as each run of interior vertices of a row (which
+    /// have no copies in other tiles) is read and written through one borrowed view instead of
+    /// a lookup per call; border vertices go through [`TileEdit::set`], copies and all.
     ///
     /// # Errors
     ///
@@ -873,8 +873,8 @@ impl TileStore {
     /// quantization scale covers its interior alone: what an interior write reads and changes
     /// is the tile's own, whichever tile is edited first. So each run of consecutive pinned
     /// tiles (no tile twice) has its interiors written in parallel, each tile's in row-major
-    /// order (a value that outgrows the scale re-quantizes the interior, so the order within a
-    /// tile matters); then, tile by tile in order, its border vertices are set with their
+    /// order (a value that outgrows a plane's scale re-quantizes that plane, so the order within
+    /// a tile matters); then, tile by tile in order, its border vertices are set with their
     /// copies and the tile is marked written where its first write falls in row-major order,
     /// as one tile at a time would. Other tiles are edited one at a time.
     ///

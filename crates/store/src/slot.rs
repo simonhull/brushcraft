@@ -31,8 +31,8 @@ const BORDER: usize = 4 * (SIDE - 1);
 pub(crate) struct CorrectionSlot {
     /// Vertices per side.
     pub(crate) side: u32,
-    /// The interior quantization step.
-    pub(crate) scale: f32,
+    /// Each interior plane's quantization step, `(t, b, n)`.
+    pub(crate) scales: [f32; 3],
     /// Quantized interior values, row-major over `(side − 2)²`.
     pub(crate) interior: [[i16; 3]; INTERIOR],
     /// Keeps `border` 4-byte aligned without implicit padding (required by `Pod`).
@@ -65,8 +65,8 @@ impl CorrectionSlot {
     /// (side 0).
     pub(crate) fn reset(&mut self, side: u32) -> Result<(), CorrectionError> {
         self.clear();
-        // Zero scale and values: only the side can be wrong.
-        CorrectionView::new(side, 0.0, &self.interior, &self.border)?;
+        // Zero scales and values: only the side can be wrong.
+        CorrectionView::new(side, [0.0; 3], &self.interior, &self.border)?;
         // `new` accepted the side, so it is in `2..=65` and both prefixes fit their arrays.
         let n = usize::try_from(side).or(Err(CorrectionError::BadSide(side)))?;
         let interior = self
@@ -90,7 +90,7 @@ impl CorrectionSlot {
     /// [`CorrectionError::BadSide`] or [`CorrectionError::BadParts`] if the slot doesn't hold a
     /// tile (a zeroed slot has side 0).
     pub(crate) fn view(&self) -> Result<CorrectionView<'_>, CorrectionError> {
-        CorrectionView::new(self.side, self.scale, &self.interior, &self.border)
+        CorrectionView::new(self.side, self.scales, &self.interior, &self.border)
     }
 
     /// The tile in the slot, for editing.
@@ -101,7 +101,7 @@ impl CorrectionSlot {
     pub(crate) fn view_mut(&mut self) -> Result<CorrectionViewMut<'_>, CorrectionError> {
         CorrectionViewMut::new(
             self.side,
-            &mut self.scale,
+            &mut self.scales,
             &mut self.interior,
             &mut self.border,
         )
@@ -114,7 +114,7 @@ impl CorrectionSlot {
     pub(crate) fn from_tile(tile: &CorrectionTile) -> Self {
         let mut slot = Self::zeroed();
         slot.side = tile.side();
-        slot.scale = tile.scale();
+        slot.scales = tile.scales();
         // A tile's arrays are never longer than the largest tile's, so `zip` copies all of them.
         for (to, from) in slot.interior.iter_mut().zip(tile.interior()) {
             *to = *from;
@@ -125,14 +125,17 @@ impl CorrectionSlot {
         slot
     }
 
-    /// The bytes of the tile the slot holds: side, scale and the prefixes of the interior and
+    /// The bytes of the tile the slot holds: side, scales and the prefixes of the interior and
     /// border its side uses, as the tests compare slots (past the prefixes is whatever an
     /// earlier tile left, see [`CorrectionSlot::reset`]). A slot holding no tile gives its side
-    /// and scale alone.
+    /// and scales alone.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn tile_bytes(&self) -> Vec<u8> {
-        let mut bytes = [self.side.to_le_bytes(), self.scale.to_bits().to_le_bytes()].concat();
+        let mut bytes = self.side.to_le_bytes().to_vec();
+        for scale in self.scales {
+            bytes.extend_from_slice(&scale.to_bits().to_le_bytes());
+        }
         if let Ok((interior, border)) = self.parts() {
             bytes.extend_from_slice(bytemuck::cast_slice(interior));
             bytes.extend_from_slice(bytemuck::cast_slice(border));
@@ -152,7 +155,7 @@ impl CorrectionSlot {
     )]
     pub(crate) fn to_tile(&self) -> Result<CorrectionTile, CorrectionError> {
         let (interior, border) = self.parts()?;
-        CorrectionTile::from_parts(self.side, self.scale, interior.to_vec(), border.to_vec())
+        CorrectionTile::from_parts(self.side, self.scales, interior.to_vec(), border.to_vec())
     }
 
     /// The interior and border prefixes the slot's side uses.
@@ -194,7 +197,7 @@ impl fmt::Debug for CorrectionSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CorrectionSlot")
             .field("side", &self.side)
-            .field("scale", &self.scale)
+            .field("scales", &self.scales)
             .finish_non_exhaustive()
     }
 }
@@ -205,13 +208,13 @@ impl fmt::Debug for EvaluatedSlot {
     }
 }
 
-/// A correction slot is cleared to hold no tile: side 0, which no view accepts, and a zero
-/// scale. Its values are left as they were; [`CorrectionSlot::reset`] or a decode writes every
+/// A correction slot is cleared to hold no tile: side 0, which no view accepts, and zero
+/// scales. Its values are left as they were; [`CorrectionSlot::reset`] or a decode writes every
 /// value the new tile uses before anything reads it.
 impl SlotData for CorrectionSlot {
     fn clear(&mut self) {
         self.side = 0;
-        self.scale = 0.0;
+        self.scales = [0.0; 3];
     }
 }
 
@@ -246,7 +249,8 @@ mod tests {
 
     #[test]
     fn slots_have_the_gpu_sizes() {
-        assert_eq!(size_of::<CorrectionSlot>(), 26_896, "correction slot");
+        assert_eq!(size_of::<CorrectionSlot>(), 26_904, "correction slot");
+
         assert_eq!(size_of::<EvaluatedSlot>(), 101_400, "evaluated slot");
         let slot = EvaluatedSlot::zeroed();
         assert_eq!(
