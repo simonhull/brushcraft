@@ -50,19 +50,26 @@
 //!
 //! # Area normals
 //!
-//! [`Surface::area_normal`] sums the stroke's surface's normals ([`TileStore::surface_normals`],
-//! a preview's own where one is shown) at every vertex inside the dab's sphere, each weighted by
-//! the draw action's falloff at its distance, made as hard as the dab
-//! ([`brush::draw_imprint_vertex`] at unit strength: the weight the action gives the vertex). Only
-//! the near side counts: a vertex whose normal has a non-positive dot product with the normal at
-//! the dab's hit is left out, so the far wall of a feature thinner than the dab doesn't cancel
-//! the side being sculpted. The tiles are those whose boxes in the index touch the sphere; each
-//! vertex counts once, in the tile that owns it ([`geom::Topology::owns`]). The normals are made
-//! together first ([`TileStore::prepare_surface_normals`]: a preview's change with every dab shown,
-//! so most are made afresh, on the store's workers); then each tile's part is summed row by row, a
-//! tile each on the workers, and the parts are added in key order, all in `f64`. So the same
-//! surface and dab give the same bits at any worker count. Placement normalises the sum, and takes
-//! the hit's normal where it is zero or not finite.
+//! [`Surface::area_normal`] sums the stroke's surface's normals inside the dab's sphere, each
+//! weighted by the draw action's falloff at its distance, made as hard as the dab
+//! ([`brush::draw_imprint_vertex`] at unit strength: the weight the action gives there). The
+//! normals are the surface's quads': each quad (of the tiles whose boxes in the index touch the
+//! sphere, read from the stroke's surface, [`TileStore::surface_positions`]) whose centre lies
+//! inside the sphere adds the cross product of its diagonals, its normal times twice its area, so
+//! the sum is the falloff-weighted vector area of the surface under the dab, whatever its quads'
+//! sizes. Each quad belongs to one tile, so each counts once. Only the near side counts: a quad
+//! whose normal has a non-positive dot product with the normal at the dab's hit is left out, so the
+//! far wall of a feature thinner than the dab doesn't cancel the side being sculpted. Each tile's
+//! part is summed row by row and the parts added in key order, in `f64` (on the calling thread for
+//! a dab of a few tiles, on the store's workers for a larger one): so the same surface and dab give
+//! the same bits. Placement normalises the sum, and takes the hit's
+//! normal where it is zero or not finite.
+//!
+//! Quads' normals rather than the vertices' evaluated ones: they need the positions alone, which a
+//! dab's placement and finest work read anyway, where vertex normals need each tile's neighbours
+//! evaluated too, and a preview's normals made afresh after every dab shown (0.5 ms a dab over the
+//! `preview` bench's ridge, on the workers; under a loaded machine, waiting on them took
+//! milliseconds, enough for a frame to show a dab it would have applied).
 //!
 //! # Errors
 //!
@@ -104,7 +111,6 @@ use stroke::{DVec3, Hit, Ray, Surface};
 
 use self::region::{Ball, Source, Vertex, Walked, distance_squared, walk};
 use crate::SculptError;
-use crate::apply::vertices;
 
 mod region;
 
@@ -448,38 +454,35 @@ impl<'a> StoreSurface<'a> {
             .query_sphere(centre_of(&imprint), area_reach(&imprint))
             .collect();
         let keys: Vec<TileKey> = keys.into_iter().collect();
-        self.store.prepare_surface_normals(&keys)?;
+        if keys.len() < AREA_WORKERS_FROM {
+            let mut sum = DVec3::ZERO;
+            for key in keys {
+                let positions = self.store.surface_positions(key)?;
+                sum = sum + tile_area_sum(key, positions, &imprint, facing);
+            }
+            return Ok(Some(sum));
+        }
         // Each tile's positions first, on this thread: a preview's are made from its block on
         // first read.
         for &key in &keys {
             self.store.surface_positions(key)?;
         }
         let store = &*self.store;
-        let at_hand: Vec<Option<SurfaceTile<'_>>> = keys
+        let at_hand: Vec<(TileKey, Option<&[Vec3]>)> = keys
             .iter()
-            .map(|key| {
-                let positions = store.cached_surface_positions(key)?;
-                let normals = store.cached_surface_normals(key)?;
-                Some((*key, positions, normals))
-            })
+            .map(|key| (*key, store.cached_surface_positions(key)))
             .collect();
-        let topology = store.mesh().topology();
-        let sums: Vec<Option<DVec3>> = store.par_map(&at_hand, |tile| {
-            tile.map(|(key, positions, normals)| {
-                tile_area_sum(topology, key, positions, normals, &imprint, facing)
-            })
+        let parts: Vec<Option<DVec3>> = store.par_map(&at_hand, |&(key, positions)| {
+            positions.map(|positions| tile_area_sum(key, positions, &imprint, facing))
         });
         let mut sum = DVec3::ZERO;
-        let tiles = keys.iter().zip(sums);
-        for (&key, tile) in tiles {
-            let part = if let Some(part) = tile {
+        for (&key, part) in keys.iter().zip(parts) {
+            let part = if let Some(part) = part {
                 part
             } else {
                 // Pushed out of the cache before it was read: on its own.
-                let normals = self.store.surface_normals(key)?.to_vec();
-                let positions = self.store.surface_positions(key)?.to_vec();
-                let mesh = self.store.mesh();
-                tile_area_sum(mesh.topology(), key, &positions, &normals, &imprint, facing)
+                let positions = self.store.surface_positions(key)?;
+                tile_area_sum(key, positions, &imprint, facing)
             };
             sum = sum + part;
         }
@@ -540,36 +543,42 @@ impl Surface for StoreSurface<'_> {
     }
 }
 
-/// A tile of the stroke's surface as an area normal reads it: its key, positions and normals.
-type SurfaceTile<'a> = (TileKey, &'a [Vec3], &'a [Vec3]);
+/// The fewest tiles an area normal sums on the store's workers, a tile each: fewer are summed on
+/// the calling thread (about 50 µs a tile), which no busy worker can hold up. The same bits either
+/// way.
+const AREA_WORKERS_FROM: usize = 8;
 
 /// Tile `key`'s part of an area normal's sum for `imprint` (see "Area normals" in the module
-/// notes).
+/// notes), from its `positions` on the stroke's surface.
 ///
-/// Its own vertices' `normals` (those it owns, [`Topology::owns`]) on the near side (a positive
-/// dot product with `facing`, the normal at the dab's hit), each weighted by `imprint`'s
-/// displacement at its position in `positions`, summed row by row in `f64`.
-fn tile_area_sum(
-    topology: &Topology,
-    key: TileKey,
-    positions: &[Vec3],
-    normals: &[Vec3],
-    imprint: &Imprint,
-    facing: DVec3,
-) -> DVec3 {
-    let owned = vertices(key.side())
-        .zip(positions.iter().zip(normals))
-        .filter(|&((i, j), _)| topology.owns(&key, i, j));
-    owned.fold(DVec3::ZERO, |sum, (_, (p, n))| {
-        let normal = DVec3::from_f32(*n);
-        if normal.dot(facing) <= 0.0 {
-            return sum;
+/// Each of its quads whose centre (its corners' mean) is inside `imprint`'s sphere and whose
+/// normal faces `facing` (a positive dot product: the near side) adds that normal, the cross
+/// product of its diagonals (twice its area, for a flat quad), weighted by `imprint`'s
+/// displacement at its centre: summed row by row, in `f64`.
+fn tile_area_sum(key: TileKey, positions: &[Vec3], imprint: &Imprint, facing: DVec3) -> DVec3 {
+    let side = usize::try_from(key.side()).unwrap_or(0);
+    let mut sum = DVec3::ZERO;
+    let rows = positions
+        .chunks_exact(side)
+        .zip(positions.chunks_exact(side).skip(1));
+    for (low, high) in rows {
+        let quads = low.windows(2).zip(high.windows(2));
+        for (bottom, top) in quads {
+            let ([p00, p10], [p01, p11]) = (bottom, top) else {
+                continue;
+            };
+            let centre = (*p00 + *p10 + *p11 + *p01) * 0.25;
+            let Some(w) = draw_imprint_vertex(&Smoothstep, imprint, [centre.x, centre.y, centre.z])
+            else {
+                continue;
+            };
+            let normal = DVec3::from_f32(*p11 - *p00).cross(DVec3::from_f32(*p01 - *p10));
+            if normal.dot(facing) > 0.0 {
+                sum = sum + normal * f64::from(w);
+            }
         }
-        match draw_imprint_vertex(&Smoothstep, imprint, [p.x, p.y, p.z]) {
-            Some(w) => sum + normal * f64::from(w),
-            None => sum,
-        }
-    })
+    }
+    sum
 }
 
 /// The imprint whose draw weights the normals of a dab at `center` of `radius` and `hardness`.

@@ -25,8 +25,8 @@
 //!   the raycasts placement makes, about a dozen a dab.
 //! - [`show_ridge`]: [`Preview::show`] of the stroke's next dab, the ridge growing a dab a sample.
 //! - [`area_normal_ridge`]: [`Surface::area_normal`] of the ridge's next dab, just after its last
-//!   was shown: the per-dab work the area normal adds to placement, most of it making the moved
-//!   previews' normals afresh.
+//!   was shown: the per-dab work the area normal adds to placement, over the moved previews' own
+//!   positions.
 //! - [`dab_ridge`]: a whole dab as the app makes it, placed, shown and raycast around: the previews
 //!   change every dab, so their raycast blocks are built afresh each time (about ten tiles a dab,
 //!   20 µs each, 2026-11-02), which [`raycast_ridge`] leaves out. A raycast's saving that needs

@@ -674,15 +674,16 @@ fn placement_after_a_dab_raycasts_as_every_triangle_does() {
 
 /// The area normal's sum at `centre` for a dab of `radius` and `hardness`, computed directly.
 ///
-/// Every tile of the level, each vertex in the tile that owns it, weighted by the draw action's
-/// falloff: each tile's part summed row by row, the parts added in key order, in `f64`.
+/// Every quad of the level whose centre is within the dab, its diagonals' cross product weighted
+/// by the draw action's falloff at its centre: each tile's part summed row by row, the parts added
+/// in key order, in `f64`.
 fn area_sum(store: &mut TileStore, centre: Vec3, radius: f32, hardness: f32) -> DVec3 {
     let outward = DVec3::from_f32(centre).normalized().unwrap();
     area_sum_facing(store, centre, outward, radius, hardness)
 }
 
-/// [`area_sum`] counting the vertices whose normals have a positive dot product with `facing`;
-/// every vertex for a `facing` of `None`.
+/// [`area_sum`] counting the quads whose normals have a positive dot product with `facing`; every
+/// quad for a `facing` of `None`.
 fn area_sum_facing(
     store: &mut TileStore,
     centre: Vec3,
@@ -703,25 +704,24 @@ fn area_sum_facing(
     keys.sort_unstable();
     let mut sum = DVec3::ZERO;
     for key in keys {
-        let normals = store.surface_normals(key).unwrap().to_vec();
         let positions = store.surface_positions(key).unwrap().to_vec();
         let side = key.side();
+        let at = |i: u32, j: u32| positions[usize::try_from(j * side + i).unwrap()];
         let mut part = DVec3::ZERO;
-        for (k, (p, n)) in positions.iter().zip(&normals).enumerate() {
-            let (i, j) = (
-                u32::try_from(k).unwrap() % side,
-                u32::try_from(k).unwrap() / side,
-            );
-            if !store.mesh().topology().owns(&key, i, j) {
-                continue;
-            }
-            if facing.is_some_and(|facing| DVec3::from_f32(*n).dot(facing) <= 0.0) {
-                continue;
-            }
-            if let Some(w) =
-                brush::draw_imprint_vertex(&brush::Smoothstep, &imprint, [p.x, p.y, p.z])
-            {
-                part = part + DVec3::from_f32(*n) * f64::from(w);
+        for j in 0..side - 1 {
+            for i in 0..side - 1 {
+                let (p00, p10, p01, p11) = (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1));
+                let c = (p00 + p10 + p11 + p01) * 0.25;
+                let Some(w) =
+                    brush::draw_imprint_vertex(&brush::Smoothstep, &imprint, [c.x, c.y, c.z])
+                else {
+                    continue;
+                };
+                let n = DVec3::from_f32(p11 - p00).cross(DVec3::from_f32(p01 - p10));
+                if facing.is_some_and(|facing| n.dot(facing) <= 0.0) {
+                    continue;
+                }
+                part = part + n * f64::from(w);
             }
         }
         sum = sum + part;
@@ -748,18 +748,27 @@ fn the_area_normal_sums_the_surfaces_normals_under_the_dab_by_its_falloff() {
         32,
         32,
     );
-    for (centre, hardness) in [(on_edge, 0.0), (on_edge, 0.6), (smooth, 0.3)] {
-        let want = area_sum(project.store(), centre, 0.15, hardness);
+    // A large dab too (0.6, a dozen tiles or more), its tiles summed on the workers.
+    let cases = [
+        (on_edge, 0.15, 0.0),
+        (on_edge, 0.15, 0.6),
+        (smooth, 0.15, 0.3),
+        (on_edge, 0.6, 0.0),
+    ];
+    for (centre, radius, hardness) in cases {
+        let reached = index.query_sphere(centre, radius).count();
+        assert!(radius < 0.5 || reached >= 8, "a large dab: {reached} tiles");
+        let want = area_sum(project.store(), centre, radius, hardness);
         let mut surface = StoreSurface::new(project.store(), &index);
         let facing = DVec3::from_f32(centre).normalized().unwrap();
         let got = surface
-            .area_normal(DVec3::from_f32(centre), facing, 0.15, hardness)
+            .area_normal(DVec3::from_f32(centre), facing, f64::from(radius), hardness)
             .unwrap();
         surface.finish().unwrap();
         assert_eq!(
             got.to_f32_array().map(f32::to_bits),
             want.to_f32_array().map(f32::to_bits),
-            "{centre:?}, hardness {hardness}: each vertex once, by the falloff"
+            "{centre:?}, radius {radius}, hardness {hardness}: each quad once, by the falloff"
         );
         assert_eq!(got, want, "the same sum, in f64");
         let outward = DVec3::from_f32(centre).normalized().unwrap();
