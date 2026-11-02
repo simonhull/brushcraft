@@ -24,6 +24,10 @@
 //!   its far flank is seen edge on, aimed around the ridge's end, where a pen places the next dabs:
 //!   the raycasts placement makes, about a dozen a dab.
 //! - [`show_ridge`]: [`Preview::show`] of the stroke's next dab, the ridge growing a dab a sample.
+//! - [`dab_ridge`]: a whole dab as the app makes it, placed, shown and raycast around: the previews
+//!   change every dab, so their raycast blocks are built afresh each time (about ten tiles a dab,
+//!   20 µs each, 2026-11-02), which [`raycast_ridge`] leaves out. A raycast's saving that needs
+//!   bounds built on top of a preview's blocks has to pay for itself within a dab.
 
 #![expect(
     clippy::expect_used,
@@ -308,4 +312,40 @@ fn show_ridge(bencher: divan::Bencher<'_, '_>) {
                 .show(ridge.project.store(), &mut ridge.index, &[dab])
                 .expect("show")
         });
+}
+
+/// Raycasts a dab makes in [`dab_ridge`]: about as many as placement makes a dab in the app.
+const RAYS_A_DAB: usize = 14;
+
+/// A dab of the ridge as the app's strong stroke makes it.
+///
+/// Placed by a raycast, shown ([`Preview::show`]), then [`RAYS_A_DAB`] raycasts more around the
+/// ridge's new end, from its side, as placement makes for the next. Each raycast after a show
+/// builds the blocks of the previews it meets afresh, which [`raycast_ridge`], over previews that
+/// stay, leaves out.
+///
+/// # Panics
+///
+/// If placing, showing or a raycast fails, which would be a bug.
+#[divan::bench(sample_count = 100, sample_size = 1)]
+fn dab_ridge(bencher: divan::Bencher<'_, '_>) {
+    let mut ridge = Ridge::new();
+    bencher.bench_local(|| {
+        let dab = ridge.next_dab();
+        ridge
+            .preview
+            .show(ridge.project.store(), &mut ridge.index, &[dab])
+            .expect("show");
+        let rays = ridge.rays();
+        let every = rays
+            .iter()
+            .step_by(rays.len() / RAYS_A_DAB)
+            .take(RAYS_A_DAB);
+        for ray in every {
+            ridge
+                .index
+                .raycast_surface(ridge.project.store(), ray)
+                .expect("raycast");
+        }
+    });
 }
