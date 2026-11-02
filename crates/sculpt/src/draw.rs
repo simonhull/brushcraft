@@ -9,7 +9,9 @@
 //! dab, its area normal). Corrections live in each vertex's tangent frame `(t, b, n)` of the
 //! predicted surface, which isn't the dab's, so the move is written in the vertex's frame, all
 //! three components of its correction (see `frame_delta` in the `apply` module), with the frames
-//! from the level below ([`TileStore::frames_many`]).
+//! from the level below: usually those of the predictions the store keeps for the tiles a stroke
+//! edits ([`TileStore::kept_prediction`]), which the frame's evaluation after the edit reuses, and
+//! listed afresh ([`TileStore::frames_many`]) for a dab of more tiles than it keeps.
 //!
 //! # Seam twins
 //!

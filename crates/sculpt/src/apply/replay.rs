@@ -849,23 +849,22 @@ pub(super) fn used(plan: &Plan, book: &Book, outcomes: &[TileOutcome]) -> Grants
 
 /// What each tile of `keys` is, for a run: positions, corrections, and prediction or frames.
 ///
-/// Read from `store`, the frames of a tile without a kept prediction from `frames` (aligned with
-/// `keys`); `None` for a tile whose positions or corrections aren't cached, that lacks the
-/// prediction `predicted` asks for, or that has neither a prediction nor frames.
+/// Read from `store`, the frames of a tile without a kept prediction from `frames`; `None` for a
+/// tile whose positions or corrections aren't cached, that lacks the prediction `predicted` asks
+/// for, or that has neither a prediction nor frames.
 pub(super) fn inputs<'a>(
     store: &'a TileStore,
     keys: &[TileKey],
     predicted: bool,
-    frames: &'a [Vec<Frame>],
+    frames: &'a BTreeMap<TileKey, Vec<Frame>>,
 ) -> Option<Vec<TileInput<'a>>> {
     keys.iter()
-        .enumerate()
-        .map(|(n, key)| {
+        .map(|key| {
             let prediction = store.kept_prediction(key);
             if predicted && prediction.is_none() {
                 return None;
             }
-            let frames = frames.get(n).map(Vec::as_slice);
+            let frames = frames.get(key).map(Vec::as_slice);
             if prediction.is_none() && frames.is_none() {
                 return None;
             }

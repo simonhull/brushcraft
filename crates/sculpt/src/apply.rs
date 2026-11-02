@@ -616,11 +616,13 @@ fn run_tiled(
             Err(e) => return Err(e),
         }
     }
-    // A run of one dab has no kept predictions to take its frames from: they are listed.
+    // A run of one dab (more tiles than the store keeps predictions for) takes its frames from
+    // the predictions the store keeps, and those it can keep now, which the frame's evaluation
+    // after it reuses; the rest's are listed.
     let frames = if predicted {
-        Vec::new()
+        BTreeMap::new()
     } else {
-        store.frames_many(keys)?
+        unkept_frames(store, keys)?
     };
     times.evaluate += laps.lap();
     stroke.begin_frame(store);
@@ -660,17 +662,48 @@ fn run_tiled(
     Ok(None)
 }
 
+/// The frames of the tiles of `keys` whose predictions the store doesn't keep, for a run of one
+/// dab.
+///
+/// None if the store can keep their predictions now ([`TileStore::keep_predictions_of`]), else a
+/// copy of each ([`TileStore::frames_many`]).
+///
+/// # Errors
+///
+/// As [`TileStore::keep_predictions_of`] (but [`CacheError::Full`] and [`CacheError::OverBudget`],
+/// which take the copies) and [`TileStore::frames_many`].
+fn unkept_frames(
+    store: &mut TileStore,
+    keys: &[TileKey],
+) -> Result<BTreeMap<TileKey, Vec<geom::Frame>>, CacheError> {
+    let missing: Vec<TileKey> = keys
+        .iter()
+        .filter(|key| store.kept_prediction(key).is_none())
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    match store.keep_predictions_of(&missing) {
+        Ok(true) => return Ok(BTreeMap::new()),
+        Ok(false) | Err(CacheError::Full | CacheError::OverBudget { .. }) => {}
+        Err(e) => return Err(e),
+    }
+    let copies = store.frames_many(&missing)?;
+    Ok(missing.into_iter().zip(copies).collect())
+}
+
 /// Each tile of `keys` replayed over the run's dabs `imprints` under `plan`, on the store's
 /// workers, in key order.
 ///
 /// `None` if a tile's positions, corrections or (when `predicted`) prediction aren't cached. A
-/// tile without a kept prediction takes its frames from `frames`, aligned with `keys`.
+/// tile without a kept prediction takes its frames from `frames`.
 fn replay_run(
     store: &TileStore,
     stroke: &Stroke,
     imprints: &[Imprint],
     keys: &[TileKey],
-    frames: &[Vec<geom::Frame>],
+    frames: &BTreeMap<TileKey, Vec<geom::Frame>>,
     plan: &Plan,
     predicted: bool,
 ) -> Option<Vec<TileOutcome>> {
@@ -935,12 +968,8 @@ fn run_brush(
     for &key in keys {
         store.evaluate(key)?;
     }
-    // The frames the deltas are written along: kept predictions, so the brush writes each tile's
-    // deltas as it finds its displacements (see `frame_deltas` for the rest).
-    match store.keep_predictions_of(keys) {
-        Ok(_) | Err(CacheError::Full | CacheError::OverBudget { .. }) => {}
-        Err(e) => return Err(e),
-    }
+    // A tile whose prediction the store keeps has its deltas written as the brush finds its
+    // displacements; `frame_deltas` makes the rest's.
     let brushed: Vec<Option<(TileBrush, Option<Vec<Vec3>>)>> = {
         let cache = &*store;
         let topology = cache.mesh().topology();
@@ -1088,15 +1117,18 @@ pub(crate) fn frame_delta(frame: &geom::Frame, imprint: &Imprint, w: f32) -> Vec
 ///
 /// For each of `edits`, in order, one per vertex of its tile, row-major, zero where its
 /// displacement is zero. The brush made them already for the tiles whose predictions the store
-/// keeps ([`run_brush`] has it keep them, [`TileStore::keep_predictions_of`], which the frame's
-/// evaluation of the tiles after the edit reuses, so it costs no prediction the dab didn't make
-/// already). The rest, for edits of more tiles than the store keeps predictions for, take copies of
-/// their frames ([`TileStore::frames_many`]), on the store's workers. Either way the frames are the
-/// bits the tiles' evaluation uses.
+/// kept ([`run_brush`]): nearly every tile, as the frame's evaluation keeps the predictions of the
+/// tiles it edited, which the next dab edits again. The others' predictions are made and kept now
+/// ([`TileStore::keep_predictions_of`]), which the frame's evaluation of them after the edit
+/// reuses, so they cost no prediction the dab didn't make already; should they be more than the
+/// store keeps, they take copies of their frames instead ([`TileStore::frames_many`]). Either way
+/// the frames are the bits the tiles' evaluation uses, and the deltas are made on the store's
+/// workers, a tile each.
 ///
 /// # Errors
 ///
-/// As [`TileStore::frames_many`].
+/// As [`TileStore::keep_predictions_of`] (but [`CacheError::Full`] and [`CacheError::OverBudget`],
+/// which take the copies) and [`TileStore::frames_many`].
 fn frame_deltas(
     store: &mut TileStore,
     imprint: &Imprint,
@@ -1108,16 +1140,31 @@ fn frame_deltas(
         .map(|tile| tile.key)
         .collect();
     if !missing.is_empty() {
-        let copies = store.frames_many(&missing)?;
+        let kept = match store.keep_predictions_of(&missing) {
+            Ok(kept) => kept,
+            Err(CacheError::Full | CacheError::OverBudget { .. }) => false,
+            Err(e) => return Err(e),
+        };
+        let copies = if kept {
+            Vec::new()
+        } else {
+            store.frames_many(&missing)?
+        };
+        let cache = &*store;
         let lacking = edits.iter_mut().filter(|tile| tile.moves.is_none());
-        let listed: Vec<(&mut TileDeltas, &[geom::Frame])> = lacking
-            .zip(&copies)
-            .map(|(tile, frames)| (tile, frames.as_slice()))
+        let listed: Vec<(&mut TileDeltas, Frames<'_>)> = lacking
+            .enumerate()
+            .map(|(n, tile)| {
+                let frames = match cache.kept_prediction(&tile.key) {
+                    Some(prediction) if kept => Frames::Predicted(prediction),
+                    _ => Frames::Listed(copies.get(n).map_or(&[][..], Vec::as_slice)),
+                };
+                (tile, frames)
+            })
             .collect();
-        let made: Vec<Vec<Vec3>> = store.par_map(&listed, |(tile, frames)| {
-            let side = tile.key.side();
+        let made: Vec<Vec<Vec3>> = cache.par_map(&listed, |(tile, frames)| {
             tile_frame_deltas(tile.key, &tile.deltas, imprint, |i, j| {
-                frames.get(usize::try_from(j * side + i).ok()?).copied()
+                frames.frame(tile.key.side(), i, j)
             })
         });
         for ((tile, _), moves) in listed.into_iter().zip(made) {
@@ -1128,6 +1175,26 @@ fn frame_deltas(
         .iter_mut()
         .map(|tile| tile.moves.take().unwrap_or_default())
         .collect())
+}
+
+/// Where a tile's frames come from, for [`frame_deltas`]: the prediction the store keeps for it,
+/// or a copy of them.
+#[derive(Debug, Clone, Copy)]
+enum Frames<'a> {
+    /// The kept prediction's.
+    Predicted(&'a Prediction),
+    /// A copy, row-major ([`TileStore::frames_many`]).
+    Listed(&'a [geom::Frame]),
+}
+
+impl Frames<'_> {
+    /// Vertex `(i, j)`'s frame, of a tile of `side` vertices a side; `None` past the tile.
+    fn frame(self, side: u32, i: u32, j: u32) -> Option<geom::Frame> {
+        match self {
+            Self::Predicted(prediction) => prediction.frame(i, j),
+            Self::Listed(frames) => frames.get(usize::try_from(j * side + i).ok()?).copied(),
+        }
+    }
 }
 
 /// The deltas of tile `key` for its displacements `deltas` by `imprint`, `frame(i, j)` giving
