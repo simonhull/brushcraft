@@ -17,7 +17,8 @@
 //! strong stroke on the medium project folded 1.1 %, up to a fifth of a tile), and a raycast cost
 //! 26.6 µs, five times what it did over the smooth sphere (5.1 µs, 2026-11-02): a folded triangle
 //! faces every ray both ways at once. Draw now moves every vertex of a dab along its area normal,
-//! one direction, which folds nothing (`folds` in `apply`'s tests).
+//! one direction, and the ridge folds nowhere (measured: `folds` in `apply`'s tests; a wall steep
+//! against that direction inside a dab could still flip).
 //!
 //! - [`raycast_ridge`]: [`SpatialIndex::raycast_surface`] from a camera off to the ridge's side, so
 //!   its far flank is seen edge on, aimed around the ridge's end, where a pen places the next dabs:

@@ -6,8 +6,10 @@
 //! quads, as the performance suite's projects' do. Moving each vertex along its own frame normal
 //! there folds the surface over under a ridge taller than those normals' radius of curvature
 //! (about 1.5 % of the bench's previews' triangles, up to a fifth of a tile; 1.1 % for the app's
-//! strong stroke on the medium project). Moving all of a dab's vertices along one direction can't
-//! cross two of them over.
+//! strong stroke on the medium project). Moving all of a dab's vertices along one direction removes
+//! that convergence, and here it folds nothing; it isn't a guarantee: a wall inside the dab's
+//! sphere steep against that direction is sheared by its vertices' differing displacements and
+//! can still flip.
 //!
 //! The setup is the bench's: `cube_sphere(4)` to level 8 (1,536 tiles of 64 × 64 quads, a quad
 //! about 0.0015 across the unit sphere), and a ridge of 60 dabs of radius 0.2 (about 130 quads),
