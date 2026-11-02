@@ -7,23 +7,25 @@
 //! circle, every dab shown ([`Preview::show`], two at a time, as a brush whose finest work lags)
 //! and none landed: radius [`RADIUS`] (about 130 quads, some 20 tiles a dab, as a large brush on
 //! the medium project), strength a tenth of it, spacing 0.15 of it, each dab's centre placed on
-//! the stroke's own surface by a raycast, as placement places it. The previews stand as a ridge
-//! about nine tenths of a radius tall, its flanks steep.
+//! the stroke's own surface by a raycast and its normal its area normal there
+//! ([`Surface::area_normal`] over [`StoreSurface`]), as placement places them. The previews stand
+//! as a ridge some six tenths of a radius tall, its flanks steep.
 //!
-//! The noise is what makes the ridge as hard to raycast as the app's strong stroke. The draw
-//! action moves each vertex along its tangent frame's normal, which the level below gives, and
-//! the noise turns those normals by a few degrees over a few quads: where they converge, a
-//! height past their radius of curvature (about half the dab's radius here) folds the surface
-//! over, about 1.5 % of the previews' triangles (2026-11-02; the app's strong stroke on the
-//! medium project folds 1.1 %, up to a fifth of a tile). A folded triangle faces every ray both
-//! ways at once, and a flank seen edge on faces the rays along it so, and the raycast tests their
-//! blocks whole. Over the smooth sphere the ridge folds nowhere, and a raycast costs a fifth of
-//! what it does over the noise (5.1 against 26.6 µs, 2026-11-02; the app's, 50–70 µs).
+//! The noise makes the surface as rough as the performance suite's projects. When the draw action
+//! moved each vertex along its own tangent frame's normal, the noise's turning normals converged
+//! under the ridge and folded the surface over, about 1.5 % of the previews' triangles (the app's
+//! strong stroke on the medium project folded 1.1 %, up to a fifth of a tile), and a raycast cost
+//! 26.6 µs, five times what it did over the smooth sphere (5.1 µs, 2026-11-02): a folded triangle
+//! faces every ray both ways at once. Draw now moves every vertex of a dab along its area normal,
+//! one direction, which folds nothing (`folds` in `apply`'s tests).
 //!
 //! - [`raycast_ridge`]: [`SpatialIndex::raycast_surface`] from a camera off to the ridge's side, so
 //!   its far flank is seen edge on, aimed around the ridge's end, where a pen places the next dabs:
 //!   the raycasts placement makes, about a dozen a dab.
 //! - [`show_ridge`]: [`Preview::show`] of the stroke's next dab, the ridge growing a dab a sample.
+//! - [`area_normal_ridge`]: [`Surface::area_normal`] of the ridge's next dab, just after its last
+//!   was shown: the per-dab work the area normal adds to placement, most of it making the moved
+//!   previews' normals afresh.
 //! - [`dab_ridge`]: a whole dab as the app makes it, placed, shown and raycast around: the previews
 //!   change every dab, so their raycast blocks are built afresh each time (about ten tiles a dab,
 //!   20 µs each, 2026-11-02), which [`raycast_ridge`] leaves out. A raycast's saving that needs
@@ -39,9 +41,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
-use sculpt::Preview;
+use sculpt::{Preview, StoreSurface};
 use store::{Evaluation, Project, ProjectConfig, Ray, SpatialIndex, StoreConfig};
-use stroke::Dab;
+use stroke::{DVec3, Dab, Surface};
 
 fn main() {
     divan::main();
@@ -131,11 +133,12 @@ impl Ridge {
     }
 
     /// The next dab: its centre on the stroke's surface (previews in place) in its direction,
-    /// the outward normal, full strength.
+    /// its normal its area normal there, full strength.
     ///
     /// # Panics
     ///
-    /// If the raycast fails or misses the closed surface, which would be a bug.
+    /// If the raycast fails or misses the closed surface, or the area normal can't be taken,
+    /// which would be a bug.
     fn next_dab(&mut self) -> Dab {
         let direction = Self::direction(self.placed);
         let ray = Ray::new(direction * 3.0, direction * -1.0).expect("ray");
@@ -145,9 +148,15 @@ impl Ridge {
             .expect("raycast")
             .expect("the ray meets the closed surface");
         let centre = ray.at(hit.t);
+        let mut surface = StoreSurface::new(self.project.store(), &self.index);
+        let sum = surface.area_normal(DVec3::from_f32(centre), f64::from(RADIUS), 0.0);
+        surface.finish().expect("the area normal");
+        let normal = sum
+            .and_then(DVec3::normalized)
+            .map_or(direction, DVec3::to_f32);
         let dab = Dab {
             position: [centre.x, centre.y, centre.z],
-            normal: [direction.x, direction.y, direction.z],
+            normal: [normal.x, normal.y, normal.z],
             tangent: [0.0, 0.0, 1.0],
             radius: RADIUS,
             strength: 0.1 * RADIUS,
@@ -294,8 +303,8 @@ fn raycast_ridge(bencher: divan::Bencher<'_, '_>) {
     });
 }
 
-/// [`Preview::show`] of the ridge's next dab: see the module notes. Placing the dab (a raycast)
-/// is left out of the time.
+/// [`Preview::show`] of the ridge's next dab: see the module notes. Placing the dab (a raycast
+/// and its area normal) is left out of the time.
 ///
 /// # Panics
 ///
@@ -319,7 +328,8 @@ const RAYS_A_DAB: usize = 14;
 
 /// A dab of the ridge as the app's strong stroke makes it.
 ///
-/// Placed by a raycast, shown ([`Preview::show`]), then [`RAYS_A_DAB`] raycasts more around the
+/// Placed by a raycast and its area normal, shown ([`Preview::show`]), then [`RAYS_A_DAB`]
+/// raycasts more around the
 /// ridge's new end, from its side, as placement makes for the next. Each raycast after a show
 /// builds the blocks of the previews it meets afresh, which [`raycast_ridge`], over previews that
 /// stay, leaves out.
@@ -348,4 +358,33 @@ fn dab_ridge(bencher: divan::Bencher<'_, '_>) {
                 .expect("raycast");
         }
     });
+}
+
+/// [`Surface::area_normal`] of the ridge's next dab over [`StoreSurface`], just after its last dab
+/// was shown (untimed), so the previews it reads have moved: see the module notes.
+///
+/// # Panics
+///
+/// If showing or the area normal fails, which would be a bug.
+#[divan::bench(sample_count = 100, sample_size = 1)]
+fn area_normal_ridge(bencher: divan::Bencher<'_, '_>) {
+    let ridge = RefCell::new(Ridge::new());
+    bencher
+        .with_inputs(|| {
+            let ridge = &mut *ridge.borrow_mut();
+            let dab = ridge.next_dab();
+            ridge
+                .preview
+                .show(ridge.project.store(), &mut ridge.index, &[dab])
+                .expect("show");
+            let [x, y, z] = dab.position;
+            DVec3::from_f32(Vec3::new(x, y, z))
+        })
+        .bench_local_values(|centre| {
+            let ridge = &mut *ridge.borrow_mut();
+            let mut surface = StoreSurface::new(ridge.project.store(), &ridge.index);
+            let sum = surface.area_normal(centre, f64::from(RADIUS), 0.0);
+            surface.finish().expect("the area normal");
+            sum
+        });
 }
