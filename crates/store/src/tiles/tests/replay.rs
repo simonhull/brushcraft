@@ -280,3 +280,143 @@ fn a_border_vertex_changed_without_its_twins_is_refused_before_anything_is_writt
     );
     assert_eq!(slots(&store, &all), before, "nothing written");
 }
+
+/// Each of `keys`' corrections, in bits, row-major.
+fn corrections_bits(store: &mut TileStore, keys: &[TileKey]) -> Vec<Vec<[u32; 3]>> {
+    keys.iter()
+        .map(|key| {
+            let tile = store.correction(*key).unwrap();
+            let side = key.side();
+            (0..side)
+                .flat_map(|j| (0..side).map(move |i| (i, j)))
+                .map(|(i, j)| tile.get(i, j).unwrap().to_bits())
+                .collect()
+        })
+        .collect()
+}
+
+/// A brush-like move of vertex `(i, j)` of tile `n` written in its `frame`: a world move that
+/// differs from vertex to vertex, its components along the frame's axes added to `c`.
+fn framed_move(n: usize, i: u32, j: u32, c: Vec3, frame: &geom::Frame) -> Option<Vec3> {
+    if (i + 2 * j + u32::try_from(n).unwrap()).is_multiple_of(3) {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "small grid places")]
+    let world = Vec3::new(1e-3, -2e-3 + 1e-5 * i as f32, 5e-4 * j as f32 * 1e-2);
+    Some(
+        c + Vec3::new(
+            frame.t().dot(world),
+            frame.b().dot(world),
+            frame.n().dot(world),
+        ),
+    )
+}
+
+#[test]
+fn framed_updates_write_what_update_tiles_writes_given_the_frames() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let keys = finest(&mesh);
+    // Along the kept predictions' frames, as the store reads them.
+    let mut along_store = edited(&dir, &mesh, roomy());
+    let guard = along_store.pin(&keys).unwrap();
+    assert!(along_store.keep_predictions_of(&keys).unwrap(), "kept");
+    along_store.begin_op().unwrap();
+    assert!(
+        along_store.update_tiles_framed(&keys, framed_move).unwrap(),
+        "every tile pinned and kept"
+    );
+    let along = corrections_bits(&mut along_store, &keys);
+    drop(guard);
+    // With the frames listed and handed to the plain update.
+    let other = TestDir::new();
+    let mut plain = edited(&other, &mesh, roomy().with_kept_predictions(0));
+    let listed_frames = plain.frames_many(&keys).unwrap();
+    let plain_guard = plain.pin(&keys).unwrap();
+    assert!(
+        !plain.update_tiles_framed(&keys, framed_move).unwrap(),
+        "no kept predictions: nothing done"
+    );
+    plain.begin_op().unwrap();
+    plain
+        .update_tiles(&keys, |n, i, j, c| {
+            let side = keys[n].side();
+            let frame = listed_frames[n][usize::try_from(j * side + i).unwrap()];
+            framed_move(n, i, j, c, &frame)
+        })
+        .unwrap();
+    let listed = corrections_bits(&mut plain, &keys);
+    drop(plain_guard);
+    assert!(along == listed, "the same bits, tile by tile");
+}
+
+#[test]
+fn a_worker_predicts_the_bits_the_store_keeps() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let keys = finest(&mesh);
+    let mut store = edited(&dir, &mesh, roomy());
+    store.evaluate_many(&keys, Evaluation::Positions).unwrap();
+    let made: Vec<(TileKey, Prediction)> = {
+        let predictor = store.predictor();
+        keys.iter()
+            .filter_map(|key| Some((*key, predictor.predict(key, &store.parent_slots(key)?)?)))
+            .collect()
+    };
+    assert_eq!(made.len(), keys.len(), "every tile's parents current");
+    let guard = store.pin(&keys).unwrap();
+    assert!(store.keep_predictions_of(&keys).unwrap(), "kept");
+    // In bits: a prediction's ring holds NaN slots, which no comparison of values equals.
+    let bits = |p: &Prediction, side: u32| {
+        let frames: Vec<[[u32; 3]; 3]> = p
+            .frames()
+            .iter()
+            .map(|f| [f.t().to_bits(), f.b().to_bits(), f.n().to_bits()])
+            .collect();
+        let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
+        let predicted: Vec<[u32; 3]> = grid
+            .map(|(i, j)| p.predicted(i, j).unwrap().to_bits())
+            .collect();
+        (frames, predicted)
+    };
+    for (key, prediction) in &made {
+        let kept = store.kept_prediction(key).unwrap();
+        assert!(
+            bits(kept, key.side()) == bits(prediction, key.side()),
+            "{key:?}: the kept prediction's bits"
+        );
+    }
+    drop(guard);
+    // Kept through `keep_prediction` instead, by a store that kept none.
+    let other = TestDir::new();
+    let mut fresh = edited(&other, &mesh, roomy());
+    fresh.evaluate_many(&keys, Evaluation::Positions).unwrap();
+    let fresh_guard = fresh.pin(&keys).unwrap();
+    let unpinned = tiles(&mesh, TOP, TOP)
+        .into_iter()
+        .find(|key| !keys.contains(key))
+        .unwrap();
+    for (key, prediction) in made {
+        if fresh.kept_prediction(&key).is_none() {
+            assert!(fresh.keep_prediction(key, prediction), "{key:?} kept");
+        }
+    }
+    assert!(keys.iter().all(|key| fresh.kept_prediction(key).is_some()));
+    {
+        fresh
+            .evaluate_many(&[unpinned], Evaluation::Positions)
+            .unwrap();
+        let predicted = {
+            let predictor = fresh.predictor();
+            fresh
+                .parent_slots(&unpinned)
+                .and_then(|parents| predictor.predict(&unpinned, &parents))
+        };
+        let prediction = predicted.expect("its parents current");
+        assert!(
+            !fresh.keep_prediction(unpinned, prediction),
+            "a tile not pinned keeps none"
+        );
+    }
+    drop(fresh_guard);
+}

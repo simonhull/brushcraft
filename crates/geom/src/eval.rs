@@ -320,6 +320,13 @@ impl Prediction {
         (i < side && j < side).then(|| self.predicted.get(i64::from(i), i64::from(j)))
     }
 
+    /// Every vertex's tangent frame, row-major `(quads + 1)²`: [`Prediction::frame`] of each,
+    /// for a caller walking the whole block.
+    #[must_use]
+    pub fn frames(&self) -> &[Frame] {
+        &self.frames
+    }
+
     /// The tangent frame at block vertex `(i, j)`, or `None` outside the block.
     #[must_use]
     pub fn frame(&self, i: u32, j: u32) -> Option<Frame> {

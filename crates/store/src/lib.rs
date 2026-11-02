@@ -67,6 +67,7 @@ pub use stroke_record::{
     StrokeRecord, StrokeRecordError,
 };
 pub use tiles::{
-    CacheError, Evaluation, Invariant, PinGuard, StoreConfig, StoreId, TileEdit, TileStore,
+    CacheError, Evaluation, Invariant, ParentSlots, PinGuard, Predictor, StoreConfig, StoreId,
+    TileEdit, TileStore,
 };
 pub use workers::{ParseWorkersError, StartWorkersError, Workers};

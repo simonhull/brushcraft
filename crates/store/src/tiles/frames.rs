@@ -7,13 +7,13 @@
 
 use std::collections::BTreeSet;
 
-use geom::{Frame, Region, TileKey, predict_region};
+use geom::{BaseMesh, Frame, Prediction, Region, TileKey, predict_region};
 
 use super::TileStore;
 use super::config::Evaluation;
 use super::error::CacheError;
 use super::round::{Resident, Tiles, list_parents, map_parallel};
-use crate::pool::SlotId;
+use crate::pool::{Pool, SlotId};
 use crate::slot::EvaluatedSlot;
 
 /// The evaluated slots a prediction reads, by their tiles, in key order; `None` if one isn't
@@ -89,6 +89,55 @@ impl TileStore {
         Ok(out)
     }
 
+    /// A predictor of the tiles whose parents are current now, for a brush's workers to predict
+    /// tiles with while they brush others ([`Predictor`]): it reads the evaluated pool shared.
+    ///
+    /// Hold it only while nothing is evaluated or edited: it borrows the store.
+    #[must_use]
+    pub fn predictor(&self) -> Predictor<'_> {
+        Predictor {
+            mesh: &self.mesh,
+            pool: &self.evaluated,
+        }
+    }
+
+    /// The evaluated slots tile `key`'s prediction reads, its parents, as they are now
+    /// ([`Predictor::predict`]); `None` if one isn't current, or `key` isn't a tile of the store
+    /// above level 0.
+    #[must_use]
+    pub fn parent_slots(&self, key: &TileKey) -> Option<ParentSlots> {
+        self.check_key(key).ok()?;
+        let held: Option<Vec<(TileKey, SlotId<EvaluatedSlot>)>> = list_parents(&self.mesh, key)
+            .ok()?
+            .into_iter()
+            .map(|parent| Some((parent, self.fresh_slot(&parent)?)))
+            .collect();
+        let mut held = held?;
+        held.sort_unstable_by_key(|&(parent, _)| parent);
+        Some(ParentSlots(held))
+    }
+
+    /// Keeps `prediction`, made by [`Predictor::predict`] from tile `key`'s parents as they are
+    /// still (nothing evaluated or edited since), as [`TileStore::keep_predictions_of`] keeps
+    /// one: for [`TileStore::kept_prediction`], and for the tile's evaluation to reuse. Returns
+    /// whether it is kept now: not for a tile that isn't pinned and current, nor past the bound
+    /// (a tile of the bound's least recently used gives up its room first).
+    ///
+    /// A tile that has a kept prediction already keeps that one (the same bits).
+    pub fn keep_prediction(&mut self, key: TileKey, prediction: Prediction) -> bool {
+        if self.kept.get(&key).is_some() {
+            self.kept.used(&key);
+            return true;
+        }
+        let held = self.evaluated.is_pinned(&key) && self.corrections.is_pinned(&key);
+        if !held || !self.is_current(&key) || self.kept.capacity() == 0 {
+            return false;
+        }
+        self.kept.make_room(1);
+        self.kept.insert(key, prediction);
+        true
+    }
+
     /// [`TileStore::frames_many`] for one tile, its level below made current and pinned while it
     /// is predicted.
     ///
@@ -110,6 +159,47 @@ impl TileStore {
         let prediction = predicted?;
         unpinned?;
         Ok(frames_of(key.side(), |i, j| prediction.frame(i, j)))
+    }
+}
+
+/// A tile's parents' evaluated slots as current when [`TileStore::parent_slots`] found them, for
+/// [`Predictor::predict`].
+#[derive(Debug, Clone)]
+pub struct ParentSlots(Vec<(TileKey, SlotId<EvaluatedSlot>)>);
+
+/// Predicts tiles from their current parents, reading the store's evaluated pool shared.
+///
+/// From [`TileStore::predictor`]: a brush's workers predict the tiles it enters with it, each on
+/// its own, while they brush the others.
+#[derive(Clone, Copy)]
+pub struct Predictor<'a> {
+    /// The base mesh.
+    mesh: &'a BaseMesh,
+    /// The evaluated pool the parents are read from.
+    pool: &'a Pool<EvaluatedSlot>,
+}
+
+impl std::fmt::Debug for Predictor<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Predictor").finish_non_exhaustive()
+    }
+}
+
+impl Predictor<'_> {
+    /// Tile `key`'s prediction from its parents `parents` ([`TileStore::parent_slots`]): the bits
+    /// the store's evaluation predicts, frames and all. `None` if a parent's slot no longer holds
+    /// its positions (never, while the predictor is held), or the prediction fails (never, for a
+    /// tile of the store's mesh).
+    #[must_use]
+    pub fn predict(&self, key: &TileKey, parents: &ParentSlots) -> Option<Prediction> {
+        let source = Resident::new(
+            self.mesh,
+            Tiles::Shared {
+                pool: self.pool,
+                held: &parents.0,
+            },
+        );
+        predict_region(self.mesh, &source, Region::of_tile(key)).ok()
     }
 }
 

@@ -1,9 +1,11 @@
 //! Editing correction tiles: [`TileEdit`], the border and interior passes that carry an edit to
 //! every copy of a vertex, and the tiles an edit touched.
 
+use std::collections::BTreeSet;
+
 use geom::{
-    CorrectionError, CorrectionView, CorrectionViewMut, FaceId, Level, MAX_COPIES, Region,
-    RowUpdate, TileBorder, TileKey, Vec3, VertexCopy,
+    CorrectionError, CorrectionView, CorrectionViewMut, FaceId, Frame, Level, MAX_COPIES,
+    Prediction, Region, RowUpdate, TileBorder, TileKey, Vec3, VertexCopy,
 };
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -992,5 +994,151 @@ impl TileStore {
                 .and_then(std::convert::identity);
         }
         outcome
+    }
+
+    /// [`TileStore::update_tiles`] along each vertex's tangent frame: `f(n, i, j, c, frame)` for
+    /// vertex `(i, j)` of `keys[n]`, `frame` its frame (the store's kept prediction's,
+    /// [`TileStore::kept_prediction`]: the bits its evaluation uses), with the same calls and the
+    /// same bits as [`TileStore::update_tiles`] given each vertex's frame.
+    ///
+    /// For a brush writing a world move in each vertex's frame: the frames are read where the
+    /// write is made, on the workers for the interiors, with no copy of them. Returns `false`,
+    /// having done nothing, unless every tile of `keys` is pinned ([`TileStore::pin`]), has its
+    /// prediction kept, and comes once.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::update_tiles`].
+    pub fn update_tiles_framed(
+        &mut self,
+        keys: &[TileKey],
+        f: impl Fn(usize, u32, u32, Vec3, &Frame) -> Option<Vec3> + Sync,
+    ) -> Result<bool, CacheError> {
+        let distinct: BTreeSet<&TileKey> = keys.iter().collect();
+        let ready = distinct.len() == keys.len()
+            && keys
+                .iter()
+                .all(|key| self.corrections.is_pinned(key) && self.kept.get(key).is_some());
+        if !ready {
+            return Ok(false);
+        }
+        // Every write before this one is settled, as `update_tiles` settles it.
+        self.drop_uncovered_bumps()?;
+        self.settle_display()?;
+        self.sync_pins()?;
+        let still = keys
+            .iter()
+            .all(|key| self.corrections.is_pinned(key) && self.kept.get(key).is_some());
+        if !still {
+            return Ok(false);
+        }
+        self.check_keys_and_op(keys)?;
+        let ids = keys
+            .iter()
+            .map(|key| {
+                self.corrections
+                    .lookup(key)
+                    .map(|(id, _)| id)
+                    .ok_or(Invariant::StaleHandle)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let kept = &self.kept;
+        let mut slots = self
+            .corrections
+            .get_many_mut(&ids)
+            .ok_or(Invariant::StaleHandle)?;
+        // Each tile's interior, and a copy of its border vertices' frames for the border writes
+        // after: those go through the store, which may drop predictions as it settles.
+        let (interiors, borders): (Vec<InteriorPass>, Vec<BorderFrames>) =
+            self.workers.install(|| {
+                keys.par_iter()
+                    .zip(slots.par_iter_mut())
+                    .enumerate()
+                    .map(|(k, (key, slot))| {
+                        let frames = kept.get(key).map_or(&[][..], Prediction::frames);
+                        let side = key.side();
+                        let pass = update_interior(slot, side, |i, j, c| {
+                            let at = usize::try_from(j * side + i).unwrap_or(usize::MAX);
+                            let frame = frames.get(at).copied().unwrap_or(Frame::NAN);
+                            f(k, i, j, c, &frame)
+                        });
+                        (pass, BorderFrames::of(side, frames))
+                    })
+                    .unzip()
+            });
+        let mut outcome = Ok(());
+        let passes = keys.iter().zip(interiors).zip(&borders).enumerate();
+        for (k, ((&key, pass), border)) in passes {
+            if outcome.is_err() {
+                if pass.first_row.is_some() {
+                    #[expect(
+                        clippy::redundant_closure_for_method_calls,
+                        reason = "the method path names one edit lifetime; edit_tile's closure \
+                                  must take any"
+                    )]
+                    let marked = self
+                        .edit_tile(key, |edit| edit.mark_own_written())
+                        .and_then(std::convert::identity);
+                    keep_first(&mut outcome, marked);
+                }
+                continue;
+            }
+            outcome = self
+                .edit_tile(key, |edit| {
+                    edit.update_border(pass, |i, j, c| f(k, i, j, c, &border.frame(i, j)))
+                })
+                .and_then(std::convert::identity);
+        }
+        outcome.map(|()| true)
+    }
+}
+
+/// A tile's border vertices' frames, copied from its kept prediction's for
+/// [`TileStore::update_tiles_framed`]'s border writes: rows `0` and `side − 1`, then columns `0`
+/// and `side − 1`, each in order.
+#[derive(Debug)]
+struct BorderFrames {
+    /// Vertices per side.
+    side: u32,
+    /// The frames, `4 · side`; a vertex without one has [`Frame::NAN`].
+    frames: Vec<Frame>,
+}
+
+impl BorderFrames {
+    /// The border frames of a tile of `side` vertices a side from its `frames`, row-major.
+    fn of(side: u32, frames: &[Frame]) -> Self {
+        let width = usize::try_from(side).unwrap_or(0);
+        let last = width.saturating_sub(1);
+        let frame = |at: usize| frames.get(at).copied().unwrap_or(Frame::NAN);
+        let rows = [0, last]
+            .into_iter()
+            .flat_map(|j| (0..width).map(move |i| j * width + i));
+        let columns = [0, last]
+            .into_iter()
+            .flat_map(|i| (0..width).map(move |j| j * width + i));
+        let border = rows.chain(columns).map(frame).collect();
+        Self {
+            side,
+            frames: border,
+        }
+    }
+
+    /// Border vertex `(i, j)`'s frame; [`Frame::NAN`] for a vertex not on the border.
+    fn frame(&self, i: u32, j: u32) -> Frame {
+        let (side, last) = (self.side, self.side.saturating_sub(1));
+        let at = if j == 0 {
+            Some(i)
+        } else if j == last {
+            Some(side + i)
+        } else if i == 0 {
+            Some(2 * side + j)
+        } else if i == last {
+            Some(3 * side + j)
+        } else {
+            None
+        };
+        at.and_then(|at| self.frames.get(usize::try_from(at).ok()?))
+            .copied()
+            .unwrap_or(Frame::NAN)
     }
 }

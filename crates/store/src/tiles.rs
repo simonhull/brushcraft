@@ -161,6 +161,7 @@ mod upkeep;
 pub use config::{Evaluation, StoreConfig};
 pub use edit::TileEdit;
 pub use error::{CacheError, Invariant};
+pub use frames::{ParentSlots, Predictor};
 pub(crate) use layers::{Saved, Snapshot};
 pub use pins::PinGuard;
 pub use read::WaveBounds;
