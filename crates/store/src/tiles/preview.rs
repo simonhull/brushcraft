@@ -21,8 +21,8 @@
 //! The tiles whose previews were set or cleared since the last close are noted, and
 //! [`TileStore::close_preview_epoch`] closes them as one epoch of the stale-tile feed, of kind
 //! [`EpochKind::Preview`]: the positions a renderer reads for them changed, the store's did not.
-//! A consumer that resyncs is handed every preview again, as an epoch closed right after its
-//! resync.
+//! A consumer that resyncs is handed every preview again with the resync, as unrefreshed display
+//! tiles over the previewed finest tiles ([`Drained::Resync`](crate::Drained::Resync)).
 //!
 //! # The refresh waits
 //!
@@ -268,12 +268,29 @@ impl TileStore {
         Ok(())
     }
 
-    /// Hands every previewed tile to the feed again, as one preview epoch: after a consumer's
-    /// resync, which lost the epochs that named them.
-    pub(super) fn reannounce_previews(&mut self) {
-        let every: BTreeSet<TileKey> = self.previews.blocks.keys().copied().collect();
-        if !every.is_empty() {
-            self.stale.close(every, EpochKind::Preview);
+    /// Adds every previewed finest tile to `unrefreshed`, under each display tile above it (with
+    /// no displacement where the display tile has none yet): what a consumer's resync, which lost
+    /// the epochs naming the previews, needs to stand in for them again.
+    pub(super) fn previews_unrefreshed(&self, unrefreshed: &mut Vec<crate::Unrefreshed>) {
+        let mut at: BTreeMap<TileKey, usize> = unrefreshed
+            .iter()
+            .enumerate()
+            .map(|(n, entry)| (entry.tile, n))
+            .collect();
+        for key in self.previews.blocks.keys() {
+            for above in Previews::ancestors(key) {
+                let n = *at.entry(above).or_insert_with(|| {
+                    unrefreshed.push(crate::Unrefreshed {
+                        tile: above,
+                        displacement: 0.0,
+                        finest: BTreeSet::new(),
+                    });
+                    unrefreshed.len() - 1
+                });
+                if let Some(entry) = unrefreshed.get_mut(n) {
+                    entry.finest.insert(*key);
+                }
+            }
         }
     }
 

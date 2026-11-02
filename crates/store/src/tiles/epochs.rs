@@ -33,14 +33,16 @@ impl TileStore {
 
     /// The epochs closed for `cursor` since its last drain, in order, each whole; or
     /// [`Drained::Resync`] if it fell more than [`StoreConfig::stale_cap`](super::StoreConfig)
-    /// keys behind. After a resync every preview is handed out again, as a preview epoch for the
-    /// next drain.
+    /// keys behind. A resync hands every preview out again too, as unrefreshed display tiles
+    /// over the previewed finest tiles (displacement 0: a preview moves what is drawn, not the
+    /// store's surface).
     pub fn drain_stale(&mut self, cursor: &StaleCursor) -> Drained {
         match self.stale.drain(cursor) {
             Drained::Resync(_) => {
-                let unrefreshed = self.unrefreshed_display();
-                // The lost epochs named the previews too: the consumer's next drain has them.
-                self.reannounce_previews();
+                // The lost epochs named the previews too: they go with the resync, so the
+                // tiles it reads again stand in for them as they switch in.
+                let mut unrefreshed = self.unrefreshed_display();
+                self.previews_unrefreshed(&mut unrefreshed);
                 Drained::Resync(unrefreshed)
             }
             epochs @ Drained::Epochs(_) => epochs,

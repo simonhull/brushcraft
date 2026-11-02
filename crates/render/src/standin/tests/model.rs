@@ -630,3 +630,30 @@ fn regression_a_failed_dab_s_writes_after_an_earlier_bump_close_a_revert() {
         );
     });
 }
+
+/// The case the model found on 2026-11-01, soaking Task 8's previews.
+///
+/// A landing's epochs overflowed a small stale cap and the renderer resynced. The store handed
+/// the previews out again only as an epoch after the resync, so for a frame the tiles read again
+/// showed the store's surface beside stand-ins reading previews: a seam open. A resync now
+/// carries the previews with it, as unrefreshed display tiles over the previewed finest tiles.
+#[test]
+fn regression_a_resync_carries_the_previews_with_it() {
+    GpuTest::run(|gpu| {
+        run(
+            gpu,
+            &[
+                (254, 172, 86),
+                (119, 254, 158),
+                (2, 197, 124),
+                (13, 174, 84),
+                (214, 209, 109),
+                (182, 10, 222),
+                (13, 171, 90),
+                (240, 84, 20),
+                (252, 184, 167),
+                (201, 41, 90),
+            ],
+        );
+    });
+}
