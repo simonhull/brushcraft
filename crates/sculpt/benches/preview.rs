@@ -2,18 +2,27 @@
 //! and showing its next dab.
 //!
 //! The mesh is `cube_sphere(4)` at level 8 (1,536 tiles of 64 × 64 quads, a quad about 0.0015
-//! across the unit sphere). A stroke of [`RIDGE_DABS`] dabs runs along a great circle, every dab
-//! shown ([`Preview::show`], two at a time, as a brush whose finest work lags) and none landed:
-//! radius [`RADIUS`] (about 130 quads, some 20 tiles a dab, as a large brush on the medium
-//! project), strength a tenth of it, spacing 0.15 of it, each dab's centre placed on the stroke's
-//! own surface by a raycast, as placement places it. The previews stand as a ridge about two thirds
-//! of a radius tall, its flanks steep.
+//! across the unit sphere), every level sculpted with an octave of noise as the performance
+//! suite's projects are ([`sculpt_octave`]). A stroke of [`RIDGE_DABS`] dabs runs along a great
+//! circle, every dab shown ([`Preview::show`], two at a time, as a brush whose finest work lags)
+//! and none landed: radius [`RADIUS`] (about 130 quads, some 20 tiles a dab, as a large brush on
+//! the medium project), strength a tenth of it, spacing 0.15 of it, each dab's centre placed on
+//! the stroke's own surface by a raycast, as placement places it. The previews stand as a ridge
+//! about nine tenths of a radius tall, its flanks steep.
+//!
+//! The noise is what makes the ridge as hard to raycast as the app's strong stroke. The draw
+//! action moves each vertex along its tangent frame's normal, which the level below gives, and
+//! the noise turns those normals by a few degrees over a few quads: where they converge, a
+//! height past their radius of curvature (about half the dab's radius here) folds the surface
+//! over, about 1.5 % of the previews' triangles (2026-11-02; the app's strong stroke on the
+//! medium project folds 1.1 %, up to a fifth of a tile). A folded triangle faces every ray both
+//! ways at once, and a flank seen edge on faces the rays along it so, and the raycast tests their
+//! blocks whole. Over the smooth sphere the ridge folds nowhere, and a raycast costs a fifth of
+//! what it does over the noise (5.1 against 26.6 µs, 2026-11-02; the app's, 50–70 µs).
 //!
 //! - [`raycast_ridge`]: [`SpatialIndex::raycast_surface`] from a camera off to the ridge's side, so
 //!   its far flank is seen edge on, aimed around the ridge's end, where a pen places the next dabs:
-//!   the raycasts placement makes, about a dozen a dab. The app's strong stroke on the medium
-//!   project costs several times as much a raycast (50–70 µs, 2026-11-01): its previews' flanks run
-//!   along its rays over far more blocks than this smooth ridge's, each tested whole.
+//!   the raycasts placement makes, about a dozen a dab.
 //! - [`show_ridge`]: [`Preview::show`] of the stroke's next dab, the ridge growing a dab a sample.
 
 #![expect(
@@ -25,9 +34,9 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use geom::{Level, Vec3, cube_sphere};
+use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
 use sculpt::Preview;
-use store::{Project, ProjectConfig, Ray, SpatialIndex, StoreConfig};
+use store::{Evaluation, Project, ProjectConfig, Ray, SpatialIndex, StoreConfig};
 use stroke::Dab;
 
 fn main() {
@@ -82,6 +91,9 @@ impl Ridge {
         };
         let mut project = Project::new(cube_sphere(4).expect("sphere"), config).expect("project");
         let level = Level::new(LEVEL).expect("level");
+        for octave in 1..=LEVEL {
+            sculpt_octave(&mut project, Level::new(octave).expect("level"));
+        }
         let index = SpatialIndex::build(project.store(), level, |_, _| {}).expect("index");
         let mut ridge = Self {
             project,
@@ -165,6 +177,91 @@ impl Ridge {
             })
             .collect()
     }
+}
+
+/// The noise's amplitude at level 1, each level's octave half the one below's.
+const AMPLITUDE: f32 = 0.02;
+
+/// Sculpts `level`'s octave of the noise into every tile of it, as `brushcraft-bench generate`
+/// sculpts the performance suite's projects.
+///
+/// Each vertex the tile owns is pushed along its frame's normal by
+/// `AMPLITUDE · 2^−(L−1) · noise(p · f_L)`, `p` its position with the levels below sculpted and
+/// `f_L = 4 · 2^L / 2π` (features about four quads of the level across).
+///
+/// # Panics
+///
+/// If the store refuses a tile of its own mesh.
+fn sculpt_octave(project: &mut Project, level: Level) {
+    let l = i32::from(level.get());
+    let amplitude = AMPLITUDE * 0.5_f32.powi(l - 1);
+    let frequency = 4.0 * 2.0_f32.powi(l) / std::f32::consts::TAU;
+    let per_side = u16::try_from(level.tiles_per_side()).expect("tiles a side");
+    let faces = project.store().mesh().face_count();
+    let keys: Vec<TileKey> = (0..faces)
+        .flat_map(|face| {
+            (0..per_side).flat_map(move |ty| {
+                (0..per_side).map(move |tx| {
+                    TileKey::displacement(FaceId::new(face), level, tx, ty).expect("tile")
+                })
+            })
+        })
+        .collect();
+    project.begin_stroke().expect("stroke");
+    let store = project.store();
+    store
+        .evaluate_many(&keys, Evaluation::Positions)
+        .expect("evaluate");
+    for key in keys {
+        let positions = store.evaluate(key).expect("evaluate").to_vec();
+        let side = key.side();
+        let topology = store.mesh().topology();
+        let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
+        let writes: Vec<(u32, u32, f32)> = grid
+            .zip(&positions)
+            .filter(|&((i, j), _)| topology.owns(&key, i, j))
+            .map(|((i, j), &p)| (i, j, amplitude * value_noise(p * frequency, l)))
+            .collect();
+        store
+            .edit_tile(key, |edit| {
+                writes
+                    .iter()
+                    .try_for_each(|&(i, j, z)| edit.set(i, j, Vec3::new(0.0, 0.0, z)))
+            })
+            .expect("edit")
+            .expect("set");
+    }
+    project.end_unrecorded_stroke().expect("stroke");
+}
+
+/// Value noise in 3D, in `[-1, 1]`: a random value at every point of the integer lattice (of
+/// octave `octave`), blended between the eight around `p` with smoothstep weights.
+fn value_noise(p: Vec3, octave: i32) -> f32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "unit-sphere points times at most a few hundred"
+    )]
+    let split = |x: f32| (x.floor() as i32, x - x.floor());
+    let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+    let ((x0, fx), (y0, fy), (z0, fz)) = (split(p.x), split(p.y), split(p.z));
+    let lattice = |dx: i32, dy: i32, dz: i32| {
+        let key = [x0 + dx, y0 + dy, z0 + dz, octave].into_iter().fold(
+            0x9E37_79B9_7F4A_7C15_u64,
+            |h, k| {
+                let mut z = h ^ u64::from(k.cast_unsigned());
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            },
+        );
+        #[expect(clippy::cast_precision_loss, reason = "24 bits are exact in an f32")]
+        let bits = (key >> 40) as f32;
+        bits / 8_388_608.0 - 1.0
+    };
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let along_x = |dy, dz| lerp(lattice(0, dy, dz), lattice(1, dy, dz), smooth(fx));
+    let along_y = |dz| lerp(along_x(0, dz), along_x(1, dz), smooth(fy));
+    lerp(along_y(0), along_y(1), smooth(fz))
 }
 
 impl Drop for Ridge {
