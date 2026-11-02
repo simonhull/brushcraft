@@ -139,7 +139,8 @@ pub(super) struct StandIns {
     /// Per frame staged and not yet heard of as submitted, the tiles it stood in.
     pub(super) stood_in_flight: BTreeMap<u64, Vec<Stood>>,
     /// Finest tiles' positions as an epoch's staging read them, for the stand-ins over them:
-    /// so a tile is read once an epoch.
+    /// so a tile is read once an epoch. Each is padded as the scratch stages it
+    /// ([`pad_positions`]), so it is staged as kept, never copied again.
     pub(super) positions: BTreeMap<TileKey, Vec<u32>>,
     /// The finest tiles whose positions the stand-ins will read: those of steps not yet
     /// entered (their pending epochs') and those entered this frame.
@@ -307,8 +308,11 @@ impl StandIns {
     /// will read them: `words` appends them.
     pub(super) fn note_positions(&mut self, key: TileKey, words: impl FnOnce(&mut Vec<u32>)) {
         if self.keep_positions.contains(&key) {
-            let mut kept = Vec::new();
+            // A tile read again (each frame of a stroke over it) refills its own buffer.
+            let mut kept = self.positions.remove(&key).unwrap_or_default();
+            kept.clear();
             words(&mut kept);
+            pad_positions(&mut kept);
             self.positions.insert(key, kept);
         }
     }
@@ -492,11 +496,11 @@ impl Residency {
         let mut scratch: BTreeMap<TileKey, u32> = BTreeMap::new();
         let mut words = Vec::with_capacity(3 * vertices + 1);
         for &key in reads {
-            words.clear();
-            if let Some(kept) = self.stand_ins.positions.get(&key) {
-                words.extend_from_slice(kept);
+            let staged: &[u32] = if let Some(kept) = self.stand_ins.positions.get(&key) {
+                kept
             } else {
                 self.stats.stand_in_reads += 1;
+                words.clear();
                 let data = &mut self.stand_ins.data;
                 if !source
                     .read_positions(key, data, &mut words)
@@ -504,16 +508,16 @@ impl Residency {
                 {
                     continue;
                 }
-            }
-            if words.len() != 3 * vertices {
+                pad_positions(&mut words);
+                &words
+            };
+            if staged.len() != 3 * vertices + 1 {
                 continue;
             }
-            // A whole number of 8-byte words, as staging copies need.
-            words.push(0);
             let index = u32::try_from(scratch.len()).unwrap_or(u32::MAX);
             self.stand_ins
                 .pass
-                .stage_tile(gpu, batch, &mut self.ring, index, &words)?;
+                .stage_tile(gpu, batch, &mut self.ring, index, staged)?;
             scratch.insert(key, index);
         }
         Ok(scratch)
@@ -776,4 +780,12 @@ impl Residency {
         let keep = &self.stand_ins.keep_positions;
         self.stand_ins.positions.retain(|key, _| keep.contains(key));
     }
+}
+
+/// Pads a finest tile's `positions` as the stand-ins' scratch stages them.
+///
+/// They are `f32` bits, three words a vertex: one word more makes the odd count of words of its
+/// `65²` vertices a whole number of 8-byte words, as staging copies need.
+fn pad_positions(positions: &mut Vec<u32>) {
+    positions.push(0);
 }

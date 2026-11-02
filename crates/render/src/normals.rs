@@ -167,14 +167,15 @@ impl RingRecord {
         for (slot, stencil) in header {
             *slot = *stencil;
         }
-        words.extend(padded.iter().flat_map(|p| p.to_bits()));
+        // `Vec3` is three `f32`s, `repr(C)`: its words are its components' bits.
+        words.extend_from_slice(bytemuck::cast_slice(padded));
         for (c, ring) in rings.into_iter().enumerate() {
             let Some(edges) = ring else {
                 continue;
             };
             let start = u32::try_from(words.len()).unwrap_or(u32::MAX);
             let valence = u32::try_from(edges.len()).unwrap_or(0);
-            words.extend(edges.iter().flat_map(|e| e.to_bits()));
+            words.extend_from_slice(bytemuck::cast_slice(edges));
             if let Some(slot) = words.get_mut(HEADER_RINGS + c) {
                 *slot = start;
             }
@@ -198,10 +199,12 @@ impl RingRecord {
     pub(crate) fn tile_positions(&self, out: &mut Vec<u32>) {
         let q = usize::try_from(self.quads()).unwrap_or(0);
         let padded = q + 3;
+        out.reserve(3 * (q + 1) * (q + 1));
         for j in 1..=q + 1 {
             let start = HEADER_WORDS + 3 * (j * padded + 1);
-            let row = self.words.get(start..start + 3 * (q + 1));
-            out.extend(row.into_iter().flatten());
+            if let Some(row) = self.words.get(start..start + 3 * (q + 1)) {
+                out.extend_from_slice(row);
+            }
         }
     }
 

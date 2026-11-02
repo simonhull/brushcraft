@@ -354,14 +354,16 @@ impl TileSource for StoreSource<'_> {
         if let Some(block) = self.store.preview(&key) {
             // The preview's own positions, without its ring.
             let quads = i64::from(block.quads());
-            let rows = (0..=quads).map(|j| block.row(j));
-            let own = rows.flat_map(|row| row.iter().skip(1).take(row.len().saturating_sub(2)));
-            out.extend(own.flat_map(|p| p.to_bits()));
+            for j in 0..=quads {
+                let row = block.row(j);
+                let own = row.get(1..row.len().saturating_sub(1)).unwrap_or_default();
+                out.extend_from_slice(bytemuck::cast_slice(own));
+            }
             return Ok(true);
         }
         // The tile's positions alone, as evaluated: no ring gathered.
         let positions = self.store.evaluate(key)?;
-        out.extend(positions.iter().flat_map(|p| p.to_bits()));
+        out.extend_from_slice(bytemuck::cast_slice(positions));
         Ok(true)
     }
 

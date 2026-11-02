@@ -44,6 +44,10 @@ name = "frame_use"
 harness = false
 
 [[bench]]
+name = "near_stroke"
+harness = false
+
+[[bench]]
 name = "brush_gpu"
 harness = false
 required-features = ["spike"]
