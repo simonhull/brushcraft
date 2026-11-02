@@ -33,7 +33,9 @@ const NO_START: u32 = f32::NAN.to_bits();
 /// unless its tile's state is released and the vertex edited again (see "Releasing tiles"),
 /// when the start is captured again from the rounded stored value. Should the tile's scale grow
 /// during the stroke, the re-quantization rounds the values written before it again, and the
-/// bound is one step of the final scale for each capture instead.
+/// bound is one step of the final scale for each capture instead. The value accumulates as a
+/// running `f32`, so a delta under half an ulp of the value it is added to is lost: far below a
+/// quantization step, as the values are corrections, not positions.
 ///
 /// # Memory
 ///

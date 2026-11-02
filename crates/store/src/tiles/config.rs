@@ -106,7 +106,8 @@ impl StoreConfig {
     /// re-predicts the 20 to 30 tiles its sphere reaches, and a stroke moves on by a tenth of a
     /// radius a step, so a stroke's tiles are reused for several steps before it leaves them.
     pub const DEFAULT_KEPT_PREDICTIONS: usize = 64;
-    /// The default [`StoreConfig::stroke_tiles`]: 512, about 17.3 MB of the budget. A dab edits
+    /// The default [`StoreConfig::stroke_tiles`]: 512, 25,958,400 bytes of the budget (about
+    /// 24.75 MiB, [`StoreConfig::STROKE_TILE_BYTES`] each). A dab edits
     /// the 20 to 30 tiles its sphere reaches, so a stroke keeps the state of every tile its last
     /// several dabs edited with room to spare.
     pub const DEFAULT_STROKE_TILES: usize = 512;

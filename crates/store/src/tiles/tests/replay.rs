@@ -43,6 +43,47 @@ fn a_kept_prediction_gives_the_evaluated_bits() {
 }
 
 #[test]
+fn listed_frames_are_the_kept_predictions_frames_bit_for_bit() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let keys = finest(&mesh);
+    // Listed by a store that keeps no prediction: every one predicted afresh.
+    let mut listing = edited(&dir, &mesh, roomy().with_kept_predictions(0));
+    let listed = listing.frames_many(&keys).unwrap();
+    // The same edits, and the predictions kept.
+    let other = TestDir::new();
+    let mut keeping = edited(&other, &mesh, roomy());
+    let guard = keeping.pin(&keys).unwrap();
+    assert!(keeping.keep_predictions_of(&keys).unwrap(), "kept");
+    let bits = |f: &geom::Frame| [f.t().to_bits(), f.b().to_bits(), f.n().to_bits()];
+    for (key, frames) in keys.iter().zip(&listed) {
+        let prediction = keeping.kept_prediction(key).unwrap();
+        let side = key.side();
+        assert_eq!(
+            frames.len(),
+            usize::try_from(side * side).unwrap(),
+            "{key:?}: every vertex"
+        );
+        let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
+        for ((i, j), frame) in grid.zip(frames) {
+            let kept = prediction.frame(i, j).unwrap();
+            assert_eq!(bits(frame), bits(&kept), "{key:?} ({i}, {j})");
+        }
+    }
+    // And a store reading its own kept predictions lists the same.
+    let again = keeping.frames_many(&keys).unwrap();
+    assert!(
+        again
+            .iter()
+            .flatten()
+            .zip(listed.iter().flatten())
+            .all(|(a, b)| bits(a) == bits(b)),
+        "the kept predictions' frames, listed"
+    );
+    drop(guard);
+}
+
+#[test]
 fn predictions_are_kept_only_for_pinned_current_tiles_within_the_bound() {
     let dir = TestDir::new();
     let mesh = mesh();

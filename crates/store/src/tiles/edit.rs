@@ -644,7 +644,9 @@ impl TileStore {
 
     /// How many tiles' stroke state the budget set aside for a brush stroke
     /// ([`StoreConfig::stroke_tiles`](super::config::StoreConfig::stroke_tiles)): the most tiles
-    /// one stroke over this store may keep a start and summed deltas for. Its bytes are already
+    /// one stroke over this store may keep the value it builds for each vertex's three correction
+    /// components for (the correction as it first found it plus every delta since). Its bytes are
+    /// already
     /// out of the pools' share, so a stroke that allocates this much, and no more, stays within
     /// the budget.
     #[must_use]
@@ -880,8 +882,9 @@ impl TileStore {
     ///   fails part way), with the vertex's correction as stored just before its write;
     /// - calls run on several threads, one tile's interior all on one thread.
     ///
-    /// So `f` may keep state per vertex that only that vertex's call touches (a brush stroke's
-    /// summed deltas, say), but must give the same result whatever the thread schedule. A
+    /// So `f` may keep state per vertex that only that vertex's call touches (the value a brush
+    /// stroke builds for each of the vertex's three components, say), but must give the same result
+    /// whatever the thread schedule. A
     /// change here that called `f` twice for a vertex would break such callers.
     ///
     /// The change joins the open epoch of the stale-tile feed ([`TileStore::subscribe_stale`]): the
