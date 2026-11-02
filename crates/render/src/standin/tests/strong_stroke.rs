@@ -235,6 +235,8 @@ impl Case {
                 };
                 #[expect(clippy::cast_possible_truncation, reason = "f32 positions")]
                 let position = point(x, y).map(|v| v as f32);
+                // Placeholder until the dab is applied: it takes its area normal then
+                // ([`area_normals`]), as placement gives it.
                 stroke::Dab {
                     position,
                     normal: [0.0, 0.0, 1.0],
@@ -247,6 +249,39 @@ impl Case {
             })
             .collect()
     }
+}
+
+/// `dabs`, each with its area normal on `store`'s surface as it is now (the stroke's dabs before
+/// them applied), as placement gives a dab its normal; the surface normal's stand-in, outward from
+/// the sphere's centre, where the sum is degenerate.
+fn area_normals(
+    store: &mut TileStore,
+    index: &store::SpatialIndex,
+    dabs: &[stroke::Dab],
+) -> Vec<stroke::Dab> {
+    let mut surface = sculpt::StoreSurface::new(store, index);
+    let placed = dabs
+        .iter()
+        .map(|dab| {
+            let [x, y, z] = dab.position;
+            let centre = stroke::DVec3::from_f32(Vec3::new(x, y, z));
+            let normal = stroke::Surface::area_normal(
+                &mut surface,
+                centre,
+                f64::from(dab.radius),
+                dab.hardness,
+            )
+            .and_then(stroke::DVec3::normalized)
+            .or_else(|| centre.normalized())
+            .expect("a dab off the sphere's centre");
+            stroke::Dab {
+                normal: normal.to_f32_array(),
+                ..*dab
+            }
+        })
+        .collect();
+    surface.finish().expect("the area normals");
+    placed
 }
 
 /// A distribution's largest value and sum of squares.
@@ -545,7 +580,8 @@ fn run_with(gpu: &Gpu, case: Case, patches: &[(&str, &str)]) -> BTreeMap<u8, Fig
     project.begin_stroke().expect("a stroke");
     let mut edited = BTreeSet::new();
     for step in dabs.chunks(case.batch) {
-        sculpt::apply_dabs(project.store(), &mut index, &mut stroke_state, step)
+        let step = area_normals(project.store(), &index, step);
+        sculpt::apply_dabs(project.store(), &mut index, &mut stroke_state, &step)
             .expect("the dabs apply");
         let drained = project.store().drain_stale(&cursor);
         edited.extend(finest_of(&drained));
@@ -664,8 +700,11 @@ const SWAP_EDGES: f64 = 0.05;
 const NORMAL_SLACK: f64 = 1.0;
 
 /// The most the stand-in's normals may be from the refreshed ones, rms, degrees: the strong
-/// stroke's floor is about 4 at its worst level; its stored normals were 30–34 off.
-const NORMAL_RMS: f64 = 5.0;
+/// stroke's floor (the refreshed tile's own positions against its stored normals) is about 5 at its
+/// worst level, 5.1 at level 3 across the quads' split since draw moves a dab's vertices along its
+/// area normal (2026-11-02; about 4 before, when each moved along its own frame normal, which this
+/// was set against); its stored normals were 30–34 off.
+const NORMAL_RMS: f64 = 6.0;
 
 #[test]
 fn a_strong_stroke_s_refresh_swaps_in_close_to_its_stand_ins_along_a_row_and_a_diagonal() {
