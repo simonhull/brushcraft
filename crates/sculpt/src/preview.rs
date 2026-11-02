@@ -107,6 +107,10 @@ struct Moving {
     moved: bool,
     /// Whether it had a preview as the call began.
     previewed: bool,
+    /// Whether `block` is its preview as the call began, taken from the store and not moved
+    /// since: it goes back as it was ([`TileStore::put_back_preview`]), which a renderer has
+    /// already, and keeps what the stroke's surface made of it.
+    unmoved: bool,
 }
 
 impl Moving {
@@ -119,6 +123,7 @@ impl Moving {
             bounds,
             moved: false,
             previewed: false,
+            unmoved: false,
         }
     }
 
@@ -139,6 +144,7 @@ impl Moving {
             };
             if move_by(&mut self.block, along, dab) {
                 self.moved = true;
+                self.unmoved = false;
                 self.bounds = bounds_of(&self.block);
             }
         }
@@ -310,6 +316,7 @@ impl Preview {
                     bounds,
                     moved: true,
                     previewed: true,
+                    unmoved: true,
                 });
             }
         }
@@ -318,7 +325,7 @@ impl Preview {
         if let Err(error) = self.know_frames(store, &moving) {
             // Nothing shown: the previews taken go back as they were.
             for tile in moving.into_iter().take(incremental) {
-                store.set_preview(tile.key, tile.block)?;
+                store.put_back_preview(tile.key, tile.block)?;
             }
             return Err(error);
         }
@@ -535,8 +542,9 @@ impl Preview {
         }
     }
 
-    /// Hands the tiles of a call back to the store: a moved tile's preview set, an unmoved
-    /// one's cleared (if it had one) and kept as untouched.
+    /// Hands the tiles of a call back to the store: a previewed tile no dab of the call moved put
+    /// back as it was, any other moved tile's preview set, an unmoved one's cleared (if it had
+    /// one) and kept as untouched.
     ///
     /// # Errors
     ///
@@ -551,7 +559,10 @@ impl Preview {
     ) -> Result<(), SculptError> {
         for tile in moving {
             self.reached.insert(tile.key, (tile.bounds, tile.moved));
-            if tile.moved {
+            if tile.unmoved {
+                // Its preview as it was: its box too.
+                store.put_back_preview(tile.key, tile.block)?;
+            } else if tile.moved {
                 if let Some(bounds) = tile.bounds {
                     index.cover(&tile.key, bounds)?;
                 }

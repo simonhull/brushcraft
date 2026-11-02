@@ -51,6 +51,10 @@ pub enum CacheError {
     /// ([`TileStore::set_preview`](super::TileStore::set_preview)).
     #[error("the preview given for {0:?} is not that tile's block")]
     NotItsBlock(TileKey),
+    /// A preview was put back for a tile whose preview wasn't taken
+    /// ([`TileStore::put_back_preview`](super::TileStore::put_back_preview)).
+    #[error("{0:?} has no preview taken to put back")]
+    NoPreviewTaken(TileKey),
     /// The configured site is [`RESERVED_SITE`].
     #[error("site {RESERVED_SITE} is reserved")]
     ReservedSite,

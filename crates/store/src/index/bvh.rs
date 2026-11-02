@@ -86,7 +86,7 @@ impl Aabb {
     /// empty otherwise, so the ray misses. Every other axis divides by a nonzero, finite
     /// component, which never gives a NaN (at worst an infinity, for a component so small
     /// the quotient overflows, and that still orders correctly).
-    fn entry(&self, ray: &Ray) -> Option<f32> {
+    pub(crate) fn entry(&self, ray: &Ray) -> Option<f32> {
         let (mut near, mut far) = (0.0_f32, f32::INFINITY);
         for a in Axis::ALL {
             let (low, high) = (a.of(self.min), a.of(self.max));

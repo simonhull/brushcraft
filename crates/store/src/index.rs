@@ -405,6 +405,12 @@ impl SpatialIndex {
     /// finds a previewed tile only where its box holds the preview: a brush showing
     /// one grows the box to it ([`SpatialIndex::cover`]).
     ///
+    /// That box holds the store's tile and every preview it had too, so a previewed tile is a
+    /// candidate only where the ray also enters the box of its preview's own positions: as tight
+    /// as the box the tree keeps for any other tile, the box of its positions. A ray along a tall
+    /// preview passes many grown boxes it has no business with (a quarter of a strong stroke's
+    /// candidate tiles), each a tile whose blocks the ray runs along tested whole.
+    ///
     /// # Errors
     ///
     /// As [`SpatialIndex::raycast_triangle`].
@@ -416,15 +422,19 @@ impl SpatialIndex {
         let wide = WideRay::new(ray);
         let mut cache = self.blocks.lock();
         self.raycast_with(store, ray, |store, key| {
-            if let Some((blocks, positions)) = store.preview_blocks(&key) {
-                return Ok(blocks.intersect(ray, &wide, positions, key));
+            if let Some(preview) = store.preview_blocks(&key) {
+                if !preview.entered_by(ray) {
+                    return Ok(None);
+                }
+                return Ok(preview.blocks.intersect(ray, &wide, preview.positions, key));
             }
             tile_hit(store, &mut cache, ray, &wide, key)
         })
     }
 
     /// [`SpatialIndex::raycast_surface`] testing every triangle of each candidate tile, previews
-    /// in place of their tiles: its oracle.
+    /// in place of their tiles: its oracle. The candidates are the same: a previewed tile only
+    /// where the ray enters the box of its preview's own positions, made here afresh.
     ///
     /// # Errors
     ///
@@ -436,6 +446,12 @@ impl SpatialIndex {
         ray: &Ray,
     ) -> Result<Option<TriangleHit>, IndexError> {
         self.raycast_with(store, ray, |store, key| {
+            if let Some(own) = store.preview_positions(&key) {
+                let bounds = Aabb::from_points(own.iter().copied());
+                if bounds.is_none_or(|bounds| bounds.entry(ray).is_none()) {
+                    return Ok(None);
+                }
+            }
             Ok(intersect_grid(
                 ray,
                 store.surface_positions(key)?,

@@ -452,3 +452,55 @@ fn the_strokes_surface_is_hit_where_its_previews_show_it() {
     );
     drop(project.close(false));
 }
+
+#[test]
+fn a_preview_no_new_dab_moves_goes_back_as_it_was_and_is_not_sent_again() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "kept");
+    let dabs = path(project.store(), 8);
+    let store = project.store();
+    let cursor = store.subscribe_stale();
+    let mut preview = Preview::new();
+    preview.show(store, &mut index, &dabs).unwrap();
+    let before: BTreeMap<TileKey, Vec<Vec3>> = store
+        .previewed()
+        .copied()
+        .collect::<Vec<TileKey>>()
+        .into_iter()
+        .map(|key| (key, store.preview_positions(&key).unwrap().to_vec()))
+        .collect();
+    drop(store.drain_stale(&cursor));
+    // One more dab, weak and small, where the first dab was: it moves a few tiles of many.
+    let again = Dab {
+        radius: 0.02,
+        strength: 0.001,
+        seq: 8,
+        ..dabs[0]
+    };
+    let stats = preview.show(store, &mut index, &[again]).unwrap();
+    let Drained::Epochs(epochs) = store.drain_stale(&cursor) else {
+        panic!("no resync");
+    };
+    let sent: Vec<TileKey> = epochs
+        .iter()
+        .filter(|epoch| epoch.kind == EpochKind::Preview)
+        .flat_map(|epoch| epoch.keys.iter().copied())
+        .collect();
+    assert!(!sent.is_empty(), "the dab moved a preview");
+    assert_eq!(sent.len(), stats.tiles_set, "only the tiles set are sent");
+    assert!(
+        sent.len() < before.len(),
+        "{} of {} previews sent again",
+        sent.len(),
+        before.len()
+    );
+    for (key, positions) in &before {
+        let now = store.preview_positions(key).expect("still previewed");
+        if !sent.contains(key) {
+            assert_eq!(now, positions.as_slice(), "{key:?} is as it was");
+        }
+    }
+    store.unsubscribe_stale(cursor);
+    drop(project.close(false));
+}
