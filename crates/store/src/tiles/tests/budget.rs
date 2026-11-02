@@ -652,9 +652,9 @@ fn a_budget_below_the_minimum_is_refused() {
         matches!(
             short_kept,
             Err(CacheError::TooManyKeptPredictions {
-                asked: 64,
-                most: 63
-            })
+                asked: StoreConfig::DEFAULT_KEPT_PREDICTIONS,
+                most
+            }) if most == StoreConfig::DEFAULT_KEPT_PREDICTIONS - 1
         ),
         "a byte short of the kept predictions' share: {short_kept:?}"
     );
@@ -673,6 +673,32 @@ fn a_budget_below_the_minimum_is_refused() {
     assert!(
         open("exact.bcp", tight().with_budget_bytes(minimum)).is_ok(),
         "the minimum is enough"
+    );
+}
+
+/// The default kept predictions are 256 of the largest tile's, about 50.3 MiB of the budget.
+#[test]
+fn the_default_kept_predictions_share_is_256_tiles() {
+    let config = roomy();
+    assert_eq!(
+        config.kept_predictions,
+        StoreConfig::DEFAULT_KEPT_PREDICTIONS,
+        "the default"
+    );
+    assert_eq!(
+        StoreConfig::DEFAULT_KEPT_PREDICTIONS,
+        256,
+        "256 predictions"
+    );
+    assert_eq!(
+        config.kept_prediction_bytes(),
+        Some(256 * Prediction::TILE_BYTES),
+        "each the largest tile's"
+    );
+    assert_eq!(
+        config.kept_prediction_bytes(),
+        Some(52_727_808),
+        "about 50.3 MiB"
     );
 }
 

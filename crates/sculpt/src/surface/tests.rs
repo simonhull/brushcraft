@@ -809,7 +809,7 @@ fn a_dab_on_a_slab_thinner_than_it_takes_the_normal_of_its_own_face() {
     let dir = TestDir::new();
     // About 0.07 thick at its middle, against a dab of radius 0.2: the far face is inside the
     // dab's sphere.
-    let (mut project, index) = project_over(&dir, slab(0.08), level(), 64, fixed(2));
+    let (mut project, index) = project_over(&dir, slab(0.08), level(), 128, fixed(2));
     for (from, up) in [(DVec3::Z, 1.0), (-DVec3::Z, -1.0)] {
         let ray = Ray::new(from * 3.0, -from).unwrap();
         let mut surface = StoreSurface::new(project.store(), &index);

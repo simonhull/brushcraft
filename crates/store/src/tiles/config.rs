@@ -102,10 +102,13 @@ impl StoreConfig {
         Ok(level) => level,
         Err(_) => unreachable!(),
     };
-    /// The default [`StoreConfig::kept_predictions`]: 64, about 13 MB of the budget. A brush step
-    /// re-predicts the 20 to 30 tiles its sphere reaches, and a stroke moves on by a tenth of a
-    /// radius a step, so a stroke's tiles are reused for several steps before it leaves them.
-    pub const DEFAULT_KEPT_PREDICTIONS: usize = 64;
+    /// The default [`StoreConfig::kept_predictions`]: 256, 52,727,808 bytes of the budget at
+    /// worst (about 50.3 MiB, [`geom::Prediction::TILE_BYTES`] each). A brush step re-predicts the
+    /// 20 to 30 tiles its sphere reaches, and a stroke moves on by a tenth of a radius a step, so a
+    /// stroke's tiles are reused for several steps before it leaves them; a big brush reaches a
+    /// hundred tiles or more, whose frames its deltas are written along, and whose predictions its
+    /// evaluation reuses only if they are kept (64 made each such dab predict its tiles twice).
+    pub const DEFAULT_KEPT_PREDICTIONS: usize = 256;
     /// The default [`StoreConfig::stroke_tiles`]: 512, 25,958,400 bytes of the budget (about
     /// 24.75 MiB, [`StoreConfig::STROKE_TILE_BYTES`] each). A dab edits
     /// the 20 to 30 tiles its sphere reaches, so a stroke keeps the state of every tile its last

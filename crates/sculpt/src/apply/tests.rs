@@ -78,7 +78,7 @@ fn apply_with(
 /// frames of `frames`: the store's every tile afterwards, in bits, with its index's bounds.
 fn run(workers: Workers, frames: &[usize]) -> (Snapshot, ApplyStats) {
     run_over(
-        StoreConfig::new(64 << 20, 1).with_workers(workers),
+        StoreConfig::new(128 << 20, 1).with_workers(workers),
         24,
         frames,
     )
@@ -212,7 +212,7 @@ fn a_frame_equals_its_dabs_one_call_each_when_the_stroke_state_runs_out() {
     // run's first replay assumes neither, and the second takes the grants the first one's
     // dabs give.
     for buffers in [0, 1, 2, 3, 5] {
-        let config = StoreConfig::new(64 << 20, 1)
+        let config = StoreConfig::new(128 << 20, 1)
             .with_workers(fixed(2))
             .with_stroke_tiles(buffers);
         let (alone, one_each) = run_over(config, 32, &[1]);
@@ -242,7 +242,7 @@ fn a_frame_equals_its_dabs_one_call_each_when_the_stroke_state_runs_out() {
 
 #[test]
 fn a_run_whose_twins_disagree_is_applied_one_dab_at_a_time_with_the_same_bits() {
-    let config = StoreConfig::new(64 << 20, 1).with_workers(fixed(2));
+    let config = StoreConfig::new(128 << 20, 1).with_workers(fixed(2));
     let (alone, _) = run_over(config, 24, &[1]);
     let broken = config.with_chunk_bytes(1 << 20);
     let (framed, stats) = run_project(broken, 24, &[24], &[Fault::BreakTwins]).unwrap();
@@ -297,7 +297,7 @@ fn a_frame_equals_its_dabs_one_call_each_under_a_tight_budget_with_predictions_k
 #[test]
 fn a_frame_equals_its_dabs_one_call_each_with_no_predictions_kept() {
     // No tile can have its prediction: every run is one dab.
-    let config = StoreConfig::new(64 << 20, 1)
+    let config = StoreConfig::new(128 << 20, 1)
         .with_workers(fixed(2))
         .with_kept_predictions(0);
     let (alone, _) = run_over(config, 24, &[1]);
@@ -637,7 +637,7 @@ fn a_frame_too_big_to_pin_is_applied_in_two_with_the_same_bits() {
 fn a_frame_of_dabs_closes_one_step_epoch_with_their_displacements_summed() {
     let dir = TestDir::new();
     let config = store::ProjectConfig {
-        store: StoreConfig::new(64 << 20, 1)
+        store: StoreConfig::new(128 << 20, 1)
             .with_chunk_bytes(1 << 20)
             .with_workers(fixed(2))
             .with_display(level()),

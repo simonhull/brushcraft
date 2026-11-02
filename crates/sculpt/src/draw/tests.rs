@@ -65,7 +65,7 @@ fn project(dir: &TestDir, level: Level) -> (Project, SpatialIndex) {
 /// `dir`, and its spatial index at `level`.
 fn project_over(dir: &TestDir, mesh: BaseMesh, level: Level) -> (Project, SpatialIndex) {
     let config = ProjectConfig {
-        store: StoreConfig::new(64 << 20, 1)
+        store: StoreConfig::new(128 << 20, 1)
             .with_chunk_bytes(1 << 20)
             .with_workers(fixed(2)),
         recovery_dir: dir.0.join("recovery"),
@@ -509,7 +509,7 @@ fn normals_after_random_steps_equal_a_full_recompute_at_any_thread_count() {
     for threads in [1, hardware] {
         let dir = TestDir::new();
         let config = ProjectConfig {
-            store: StoreConfig::new(64 << 20, 1)
+            store: StoreConfig::new(128 << 20, 1)
                 .with_chunk_bytes(1 << 20)
                 .with_workers(fixed(threads)),
             recovery_dir: dir.0.join("recovery"),
@@ -772,7 +772,7 @@ fn project_with(
     stroke_tiles: usize,
 ) -> (Project, SpatialIndex) {
     let config = ProjectConfig {
-        store: StoreConfig::new(64 << 20, 1)
+        store: StoreConfig::new(128 << 20, 1)
             .with_chunk_bytes(1 << 20)
             .with_workers(fixed(threads))
             .with_stroke_tiles(stroke_tiles),
@@ -1098,7 +1098,7 @@ fn assert_saved(saved: Result<store::SaveOutcome, store::ProjectError>) {
 /// recovery files in `dir`.
 fn reopen_config(dir: &TestDir) -> ProjectConfig {
     ProjectConfig {
-        store: StoreConfig::new(64 << 20, 1)
+        store: StoreConfig::new(128 << 20, 1)
             .with_chunk_bytes(1 << 20)
             .with_workers(fixed(2)),
         recovery_dir: dir.0.join("recovery"),

@@ -77,9 +77,9 @@ pub(crate) fn project_over(
     (project, index)
 }
 
-/// The cube (`cube_sphere(1)`, 6 faces) at `level` under a 64 MiB budget, with `workers`.
+/// The cube (`cube_sphere(1)`, 6 faces) at `level` under a 128 MiB budget, with `workers`.
 pub(crate) fn cube(dir: &TestDir, level: Level, workers: Workers) -> (Project, SpatialIndex) {
-    project_over(dir, cube_sphere(1).unwrap(), level, 64, workers)
+    project_over(dir, cube_sphere(1).unwrap(), level, 128, workers)
 }
 
 /// Two copies of the cube (`cube_sphere(1)`), the second moved `offset` along x: a mesh of two
