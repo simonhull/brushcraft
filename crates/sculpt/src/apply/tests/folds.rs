@@ -21,8 +21,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
-use store::{Evaluation, Project, Ray, SpatialIndex, TileStore};
-use stroke::{DVec3, Dab, Surface};
+use store::{Evaluation, Project, SpatialIndex, TileStore};
+use stroke::{DVec3, Dab, Ray, Surface};
 
 use super::super::apply_dabs;
 use crate::StoreSurface;
@@ -116,14 +116,15 @@ fn direction(n: u32) -> Vec3 {
 /// outside along the ridge's great circle, its normal its area normal there, full strength.
 fn next_dab(store: &mut TileStore, index: &SpatialIndex, n: u32) -> Dab {
     let direction = direction(n);
-    let ray = Ray::new(direction * 3.0, direction * -1.0).unwrap();
-    let hit = index.raycast_surface(store, &ray).unwrap().unwrap();
-    let centre = ray.at(hit.t);
+    let from = DVec3::from_f32(direction);
+    let ray = Ray::new(from * 3.0, -from).unwrap();
     let mut surface = StoreSurface::new(store, index);
+    let hit = surface.raycast(&ray).unwrap();
     let sum = surface
-        .area_normal(DVec3::from_f32(centre), f64::from(RADIUS), 0.0)
+        .area_normal(hit.position, hit.normal, f64::from(RADIUS), 0.0)
         .unwrap();
     surface.finish().unwrap();
+    let centre = hit.position.to_f32();
     let normal = sum.normalized().unwrap().to_f32();
     Dab {
         position: [centre.x, centre.y, centre.z],

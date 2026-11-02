@@ -169,7 +169,7 @@ fn tangent_along(normal: DVec3, direction: DVec3, previous: Option<DVec3>) -> DV
 /// or one that is zero or not finite.
 fn area_normal<S: Surface>(surface: &mut S, hit: &Hit, radius: f64, hardness: f32) -> DVec3 {
     surface
-        .area_normal(hit.position, radius, hardness)
+        .area_normal(hit.position, hit.normal, radius, hardness)
         .and_then(DVec3::normalized)
         .unwrap_or(hit.normal)
 }

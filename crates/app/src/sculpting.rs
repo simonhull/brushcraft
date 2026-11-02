@@ -454,8 +454,14 @@ impl<S: Surface> Surface for Primed<'_, S> {
         self.surface.continuous(a, b, reach)
     }
 
-    fn area_normal(&mut self, center: DVec3, radius: f64, hardness: f32) -> Option<DVec3> {
-        self.surface.area_normal(center, radius, hardness)
+    fn area_normal(
+        &mut self,
+        center: DVec3,
+        facing: DVec3,
+        radius: f64,
+        hardness: f32,
+    ) -> Option<DVec3> {
+        self.surface.area_normal(center, facing, radius, hardness)
     }
 }
 

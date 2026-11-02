@@ -53,14 +53,16 @@
 //! [`Surface::area_normal`] sums the stroke's surface's normals ([`TileStore::surface_normals`],
 //! a preview's own where one is shown) at every vertex inside the dab's sphere, each weighted by
 //! the draw action's falloff at its distance, made as hard as the dab
-//! ([`brush::draw_imprint_vertex`] at unit strength: the weight the action gives the vertex). The
-//! tiles are those whose boxes in the index touch the sphere; each vertex counts once, in the tile
-//! that owns it ([`geom::Topology::owns`]). The normals are made together first
-//! ([`TileStore::prepare_surface_normals`]: a preview's change with every dab shown, so most are
-//! made afresh, on the store's workers); then each tile's part is summed row by row, a tile each
-//! on the workers, and the parts are added in key order, all in `f64`. So the same surface and dab
-//! give the same bits at any worker count. Placement normalises the sum, and takes the hit's
-//! normal where it is zero or not finite.
+//! ([`brush::draw_imprint_vertex`] at unit strength: the weight the action gives the vertex). Only
+//! the near side counts: a vertex whose normal has a non-positive dot product with the normal at
+//! the dab's hit is left out, so the far wall of a feature thinner than the dab doesn't cancel
+//! the side being sculpted. The tiles are those whose boxes in the index touch the sphere; each
+//! vertex counts once, in the tile that owns it ([`geom::Topology::owns`]). The normals are made
+//! together first ([`TileStore::prepare_surface_normals`]: a preview's change with every dab shown,
+//! so most are made afresh, on the store's workers); then each tile's part is summed row by row, a
+//! tile each on the workers, and the parts are added in key order, all in `f64`. So the same
+//! surface and dab give the same bits at any worker count. Placement normalises the sum, and takes
+//! the hit's normal where it is zero or not finite.
 //!
 //! # Errors
 //!
@@ -434,6 +436,7 @@ impl<'a> StoreSurface<'a> {
     fn try_area_normal(
         &mut self,
         center: DVec3,
+        facing: DVec3,
         radius: f64,
         hardness: f32,
     ) -> Result<Option<DVec3>, SculptError> {
@@ -463,7 +466,7 @@ impl<'a> StoreSurface<'a> {
         let topology = store.mesh().topology();
         let sums: Vec<Option<DVec3>> = store.par_map(&at_hand, |tile| {
             tile.map(|(key, positions, normals)| {
-                tile_area_sum(topology, key, positions, normals, &imprint)
+                tile_area_sum(topology, key, positions, normals, &imprint, facing)
             })
         });
         let mut sum = DVec3::ZERO;
@@ -476,7 +479,7 @@ impl<'a> StoreSurface<'a> {
                 let normals = self.store.surface_normals(key)?.to_vec();
                 let positions = self.store.surface_positions(key)?.to_vec();
                 let mesh = self.store.mesh();
-                tile_area_sum(mesh.topology(), key, &positions, &normals, &imprint)
+                tile_area_sum(mesh.topology(), key, &positions, &normals, &imprint, facing)
             };
             sum = sum + part;
         }
@@ -522,11 +525,17 @@ impl Surface for StoreSurface<'_> {
         self.keep(joined).unwrap_or(false)
     }
 
-    fn area_normal(&mut self, center: DVec3, radius: f64, hardness: f32) -> Option<DVec3> {
+    fn area_normal(
+        &mut self,
+        center: DVec3,
+        facing: DVec3,
+        radius: f64,
+        hardness: f32,
+    ) -> Option<DVec3> {
         if self.error.is_some() {
             return None;
         }
-        let sum = self.try_area_normal(center, radius, hardness);
+        let sum = self.try_area_normal(center, facing, radius, hardness);
         self.keep(sum).flatten()
     }
 }
@@ -537,7 +546,8 @@ type SurfaceTile<'a> = (TileKey, &'a [Vec3], &'a [Vec3]);
 /// Tile `key`'s part of an area normal's sum for `imprint` (see "Area normals" in the module
 /// notes).
 ///
-/// Its own vertices' `normals` (those it owns, [`Topology::owns`]), each weighted by `imprint`'s
+/// Its own vertices' `normals` (those it owns, [`Topology::owns`]) on the near side (a positive
+/// dot product with `facing`, the normal at the dab's hit), each weighted by `imprint`'s
 /// displacement at its position in `positions`, summed row by row in `f64`.
 fn tile_area_sum(
     topology: &Topology,
@@ -545,13 +555,18 @@ fn tile_area_sum(
     positions: &[Vec3],
     normals: &[Vec3],
     imprint: &Imprint,
+    facing: DVec3,
 ) -> DVec3 {
     let owned = vertices(key.side())
         .zip(positions.iter().zip(normals))
         .filter(|&((i, j), _)| topology.owns(&key, i, j));
     owned.fold(DVec3::ZERO, |sum, (_, (p, n))| {
+        let normal = DVec3::from_f32(*n);
+        if normal.dot(facing) <= 0.0 {
+            return sum;
+        }
         match draw_imprint_vertex(&Smoothstep, imprint, [p.x, p.y, p.z]) {
-            Some(w) => sum + DVec3::from_f32(*n) * f64::from(w),
+            Some(w) => sum + normal * f64::from(w),
             None => sum,
         }
     })

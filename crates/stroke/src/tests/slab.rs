@@ -87,7 +87,13 @@ impl Surface for Slab {
         through <= reach
     }
 
-    fn area_normal(&mut self, _center: DVec3, _radius: f64, _hardness: f32) -> Option<DVec3> {
+    fn area_normal(
+        &mut self,
+        _center: DVec3,
+        _facing: DVec3,
+        _radius: f64,
+        _hardness: f32,
+    ) -> Option<DVec3> {
         // Not modelled: placement takes the hit's normal, as for a degenerate sum.
         None
     }

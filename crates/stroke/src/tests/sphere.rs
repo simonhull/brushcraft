@@ -69,7 +69,13 @@ impl Surface for Sphere {
         self.arc(a.position, b.position) <= reach
     }
 
-    fn area_normal(&mut self, center: DVec3, _radius: f64, _hardness: f32) -> Option<DVec3> {
+    fn area_normal(
+        &mut self,
+        center: DVec3,
+        _facing: DVec3,
+        _radius: f64,
+        _hardness: f32,
+    ) -> Option<DVec3> {
         // A cap of a sphere around a point on it: by symmetry, its normals sum to the radial
         // direction through the point.
         Some(center - self.centre)

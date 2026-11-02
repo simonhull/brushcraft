@@ -724,7 +724,13 @@ impl<F: FnMut(DVec3) -> Option<DVec3>> Surface for Tilted<F> {
         Plane.continuous(a, b, reach)
     }
 
-    fn area_normal(&mut self, center: DVec3, radius: f64, hardness: f32) -> Option<DVec3> {
+    fn area_normal(
+        &mut self,
+        center: DVec3,
+        _facing: DVec3,
+        radius: f64,
+        hardness: f32,
+    ) -> Option<DVec3> {
         self.asked.push((center, radius, hardness));
         (self.normal)(center)
     }

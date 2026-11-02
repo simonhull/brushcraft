@@ -16,7 +16,9 @@ use super::StoreSurface;
 use crate::SculptError;
 use crate::apply::apply_dabs;
 use crate::state::Stroke;
-use crate::testing::{TestDir, cube, dab, fixed, project_over, snapshot, tiles, two_cubes, vertex};
+use crate::testing::{
+    TestDir, cube, dab, fixed, project_over, slab, snapshot, tiles, two_cubes, vertex,
+};
 
 /// The level the tests read: 128 quads a face, four tiles of 64.
 fn level() -> Level {
@@ -675,6 +677,20 @@ fn placement_after_a_dab_raycasts_as_every_triangle_does() {
 /// Every tile of the level, each vertex in the tile that owns it, weighted by the draw action's
 /// falloff: each tile's part summed row by row, the parts added in key order, in `f64`.
 fn area_sum(store: &mut TileStore, centre: Vec3, radius: f32, hardness: f32) -> DVec3 {
+    let outward = DVec3::from_f32(centre).normalized().unwrap();
+    area_sum_facing(store, centre, outward, radius, hardness)
+}
+
+/// [`area_sum`] counting the vertices whose normals have a positive dot product with `facing`;
+/// every vertex for a `facing` of `None`.
+fn area_sum_facing(
+    store: &mut TileStore,
+    centre: Vec3,
+    facing: impl Into<Option<DVec3>>,
+    radius: f32,
+    hardness: f32,
+) -> DVec3 {
+    let facing: Option<DVec3> = facing.into();
     let imprint = brush::Imprint::new(
         [centre.x, centre.y, centre.z],
         [0.0, 0.0, 1.0],
@@ -697,6 +713,9 @@ fn area_sum(store: &mut TileStore, centre: Vec3, radius: f32, hardness: f32) -> 
                 u32::try_from(k).unwrap() / side,
             );
             if !store.mesh().topology().owns(&key, i, j) {
+                continue;
+            }
+            if facing.is_some_and(|facing| DVec3::from_f32(*n).dot(facing) <= 0.0) {
                 continue;
             }
             if let Some(w) =
@@ -732,8 +751,9 @@ fn the_area_normal_sums_the_surfaces_normals_under_the_dab_by_its_falloff() {
     for (centre, hardness) in [(on_edge, 0.0), (on_edge, 0.6), (smooth, 0.3)] {
         let want = area_sum(project.store(), centre, 0.15, hardness);
         let mut surface = StoreSurface::new(project.store(), &index);
+        let facing = DVec3::from_f32(centre).normalized().unwrap();
         let got = surface
-            .area_normal(DVec3::from_f32(centre), 0.15, hardness)
+            .area_normal(DVec3::from_f32(centre), facing, 0.15, hardness)
             .unwrap();
         surface.finish().unwrap();
         assert_eq!(
@@ -759,7 +779,7 @@ fn the_area_normal_sums_the_surfaces_normals_under_the_dab_by_its_falloff() {
     // Far from the surface, the dab covers nothing: a sum of zero, for placement to take the
     // hit's normal instead.
     let mut inside = StoreSurface::new(project.store(), &index);
-    let nothing = inside.area_normal(DVec3::ZERO, 0.1, 0.0);
+    let nothing = inside.area_normal(DVec3::ZERO, DVec3::Z, 0.1, 0.0);
     inside.finish().unwrap();
     assert_eq!(
         nothing,
@@ -768,9 +788,38 @@ fn the_area_normal_sums_the_surfaces_normals_under_the_dab_by_its_falloff() {
     );
     let mut empty = StoreSurface::new(project.store(), &index);
     assert_eq!(
-        empty.area_normal(DVec3::from_f32(smooth), 0.0, 0.0),
+        empty.area_normal(DVec3::from_f32(smooth), DVec3::Z, 0.0, 0.0),
         None,
         "a radius of zero covers nothing at all"
     );
     empty.finish().unwrap();
+}
+
+#[test]
+fn a_dab_on_a_slab_thinner_than_it_takes_the_normal_of_its_own_face() {
+    let dir = TestDir::new();
+    // About 0.07 thick at its middle, against a dab of radius 0.2: the far face is inside the
+    // dab's sphere.
+    let (mut project, index) = project_over(&dir, slab(0.08), level(), 64, fixed(2));
+    for (from, up) in [(DVec3::Z, 1.0), (-DVec3::Z, -1.0)] {
+        let ray = Ray::new(from * 3.0, -from).unwrap();
+        let mut surface = StoreSurface::new(project.store(), &index);
+        let hit = surface.raycast(&ray).unwrap();
+        let sum = surface
+            .area_normal(hit.position, hit.normal, 0.2, 0.0)
+            .unwrap();
+        surface.finish().unwrap();
+        let normal = sum.normalized().unwrap();
+        assert!(
+            normal.z * up > 0.999,
+            "the dab on the {up:+} face takes that face's normal: {normal:?}"
+        );
+        // Both faces counted, the far one cancels most of the near one.
+        let centre = hit.position.to_f32();
+        let both = area_sum_facing(project.store(), centre, None, 0.2, 0.0);
+        assert!(
+            both.length() < 0.5 * sum.length(),
+            "the far face would cancel it: {both:?} against {sum:?}"
+        );
+    }
 }

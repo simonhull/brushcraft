@@ -102,6 +102,22 @@ pub(crate) fn two_cubes(offset: f32) -> BaseMesh {
     BaseMesh::from_polygons(positions, &polygons).unwrap()
 }
 
+/// The cube (`cube_sphere(1)`) flattened along z by `factor`: a slab `factor` as thick as it is
+/// wide, its two broad faces facing `+z` and `-z`.
+pub(crate) fn slab(factor: f32) -> BaseMesh {
+    let one = cube_sphere(1).unwrap();
+    let positions: Vec<Vec3> = one
+        .vertices()
+        .map(|v| one.vertex_position(v).unwrap())
+        .map(|p| Vec3::new(p.x, p.y, p.z * factor))
+        .collect();
+    let quads: Vec<[u32; 4]> = one
+        .faces()
+        .map(|f| [0, 1, 2, 3].map(|c| one.corner_vertex(f, c).unwrap().index()))
+        .collect();
+    BaseMesh::from_polygons(positions, &quads).unwrap()
+}
+
 /// Every tile of `level` of `mesh`, face by face.
 pub(crate) fn tiles(mesh: &BaseMesh, level: Level) -> Vec<TileKey> {
     let per_side = u16::try_from(level.tiles_per_side()).unwrap();

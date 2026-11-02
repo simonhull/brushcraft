@@ -74,6 +74,8 @@ struct Ridge {
     dir: PathBuf,
     /// The dabs placed so far.
     placed: u32,
+    /// The surface normal at the last dab's hit: the side its area normal counts.
+    facing: DVec3,
 }
 
 impl Ridge {
@@ -107,6 +109,7 @@ impl Ridge {
             preview: Preview::new(),
             dir,
             placed: 0,
+            facing: DVec3::Z,
         };
         while ridge.placed < RIDGE_DABS {
             let pair = [ridge.next_dab(), ridge.next_dab()];
@@ -142,18 +145,22 @@ impl Ridge {
     fn next_dab(&mut self) -> Dab {
         let direction = Self::direction(self.placed);
         let ray = Ray::new(direction * 3.0, direction * -1.0).expect("ray");
-        let hit = self
-            .index
-            .raycast_surface(self.project.store(), &ray)
-            .expect("raycast")
-            .expect("the ray meets the closed surface");
-        let centre = ray.at(hit.t);
+        let ray = stroke::Ray::new(
+            DVec3::from_f32(ray.origin()),
+            DVec3::from_f32(ray.direction()),
+        )
+        .expect("ray");
         let mut surface = StoreSurface::new(self.project.store(), &self.index);
-        let sum = surface.area_normal(DVec3::from_f32(centre), f64::from(RADIUS), 0.0);
-        surface.finish().expect("the area normal");
+        let hit = surface
+            .raycast(&ray)
+            .expect("the ray meets the closed surface");
+        let sum = surface.area_normal(hit.position, hit.normal, f64::from(RADIUS), 0.0);
+        surface.finish().expect("the raycast and the area normal");
+        let centre = hit.position.to_f32();
         let normal = sum
             .and_then(DVec3::normalized)
             .map_or(direction, DVec3::to_f32);
+        self.facing = hit.normal;
         let dab = Dab {
             position: [centre.x, centre.y, centre.z],
             normal: [normal.x, normal.y, normal.z],
@@ -378,12 +385,12 @@ fn area_normal_ridge(bencher: divan::Bencher<'_, '_>) {
                 .show(ridge.project.store(), &mut ridge.index, &[dab])
                 .expect("show");
             let [x, y, z] = dab.position;
-            DVec3::from_f32(Vec3::new(x, y, z))
+            (DVec3::from_f32(Vec3::new(x, y, z)), ridge.facing)
         })
-        .bench_local_values(|centre| {
+        .bench_local_values(|(centre, facing)| {
             let ridge = &mut *ridge.borrow_mut();
             let mut surface = StoreSurface::new(ridge.project.store(), &ridge.index);
-            let sum = surface.area_normal(centre, f64::from(RADIUS), 0.0);
+            let sum = surface.area_normal(centre, facing, f64::from(RADIUS), 0.0);
             surface.finish().expect("the area normal");
             sum
         });

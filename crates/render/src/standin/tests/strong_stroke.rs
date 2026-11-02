@@ -251,9 +251,10 @@ impl Case {
     }
 }
 
-/// `dabs`, each with its area normal on `store`'s surface as it is now (the stroke's dabs before
-/// them applied), as placement gives a dab its normal; the surface normal's stand-in, outward from
-/// the sphere's centre, where the sum is degenerate.
+/// `dabs`, each with its area normal on `store`'s surface as it is now, as placement gives it.
+///
+/// The surface is the stroke's dabs before them applied. Where the sum is degenerate, the normal
+/// is the surface normal's stand-in, outward from the sphere's centre.
 fn area_normals(
     store: &mut TileStore,
     index: &store::SpatialIndex,
@@ -265,15 +266,17 @@ fn area_normals(
         .map(|dab| {
             let [x, y, z] = dab.position;
             let centre = stroke::DVec3::from_f32(Vec3::new(x, y, z));
+            // The near side: facing outward from the sphere's centre, about the hit's normal.
+            let outward = centre.normalized().expect("a dab off the sphere's centre");
             let normal = stroke::Surface::area_normal(
                 &mut surface,
                 centre,
+                outward,
                 f64::from(dab.radius),
                 dab.hardness,
             )
             .and_then(stroke::DVec3::normalized)
-            .or_else(|| centre.normalized())
-            .expect("a dab off the sphere's centre");
+            .unwrap_or(outward);
             stroke::Dab {
                 normal: normal.to_f32_array(),
                 ..*dab
@@ -699,8 +702,10 @@ const SWAP_EDGES: f64 = 0.05;
 /// (max and rms): the encoding's step and the one-sided differences' change at a seam.
 const NORMAL_SLACK: f64 = 1.0;
 
-/// The most the stand-in's normals may be from the refreshed ones, rms, degrees: the strong
-/// stroke's floor (the refreshed tile's own positions against its stored normals) is about 5 at its
+/// The most the stand-in's normals may be from the refreshed ones, rms, degrees.
+///
+/// The strong stroke's floor (the refreshed tile's own positions against its stored normals) is
+/// about 5 at its
 /// worst level, 5.1 at level 3 across the quads' split since draw moves a dab's vertices along its
 /// area normal (2026-11-02; about 4 before, when each moved along its own frame normal, which this
 /// was set against); its stored normals were 30–34 off.
