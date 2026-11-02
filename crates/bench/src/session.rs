@@ -131,6 +131,32 @@ pub(crate) enum Detail {
     PerStep,
 }
 
+/// The area normal of a dab at `center` of `radius` on `project`'s surface (hardness 0).
+///
+/// As placement takes it ([`stroke::Surface::area_normal`]), its near side the one facing outward
+/// from the sphere's centre, as a dab placed by a raycast from the camera faces; that direction
+/// itself where the sum is degenerate.
+///
+/// # Errors
+///
+/// If the surface can't be read, or `center` is the sphere's centre.
+fn area_normal(
+    project: &mut Project,
+    index: &SpatialIndex,
+    center: Vec3,
+    radius: f32,
+) -> Result<Vec3> {
+    use stroke::{DVec3, Surface as _};
+    let centre = DVec3::from_f32(center);
+    let outward = centre
+        .normalized()
+        .context("a dab at the sphere's centre")?;
+    let mut surface = sculpt::StoreSurface::new(project.store(), index);
+    let sum = surface.area_normal(centre, outward, f64::from(radius), 0.0);
+    surface.finish().context("the area normal")?;
+    Ok(sum.and_then(DVec3::normalized).unwrap_or(outward).to_f32())
+}
+
 /// Runs one stroke of draw steps with `radius` and `strength`, one at each of `centres`.
 ///
 /// With `per_call` `None`, each dab is a [`draw_step`], the path the history measures; with
@@ -165,11 +191,16 @@ pub(crate) fn stroke(
     let mut dabs = Vec::with_capacity(centres.len());
     let mut seq = 0_u32;
     for group in centres.chunks(per_call.unwrap_or(1)) {
+        // Each dab's area normal, as placement gives it, on the surface the dabs before it left:
+        // taken before the step's clock starts.
+        let normals = group
+            .iter()
+            .map(|&center| area_normal(project, index, center, radius))
+            .collect::<Result<Vec<Vec3>>>()?;
         let params = group
             .iter()
-            // Pushed outward from the sphere's centre, the direction of its surface's normals
-            // smoothed over a dab: a stand-in for the area normal placement takes.
-            .map(|&center| DrawParams::new(center, center, radius, strength))
+            .zip(normals)
+            .map(|(&center, normal)| DrawParams::new(center, normal, radius, strength))
             .collect::<Result<Vec<DrawParams>, _>>()?;
         let frame: Vec<stroke::Dab> = params
             .iter()
