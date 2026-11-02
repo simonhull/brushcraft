@@ -25,3 +25,7 @@ store = { workspace = true, features = ["test-oracle"] }
 [[bench]]
 name = "draw_step"
 harness = false
+
+[[bench]]
+name = "preview"
+harness = false
