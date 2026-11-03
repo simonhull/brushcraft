@@ -174,9 +174,13 @@ fn stale_normals_brought_up_to_date_equal_a_full_recompute() {
     let dir = TestDir::new();
     let dab_count = dabs.len();
     let mut runs = Vec::new();
+    // At least two workers last, so the counts differ on a machine of one thread too (each
+    // names its store's file).
     for threads in [
         1,
-        thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .max(2),
     ] {
         let config = config(80, 16).with_workers(fixed(threads));
         let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);

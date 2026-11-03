@@ -81,10 +81,14 @@ fn evaluating_many_equals_the_dense_evaluation_at_any_thread_count() {
     let mesh = mesh();
     let all = tiles(&mesh, 1, TOP);
     let finest = tiles(&mesh, TOP, TOP);
+    // At least three workers last, so the three counts differ on a machine of one or two
+    // threads too (each names its store's file).
     let threads = [
         1,
         2,
-        thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .max(3),
     ];
     for (base, n) in [roomy(), tight()]
         .into_iter()

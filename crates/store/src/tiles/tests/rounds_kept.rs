@@ -64,10 +64,14 @@ fn slots_written_on_the_workers_are_the_same_at_any_thread_count() {
     let (keys, around) = brushed_tiles(&mesh);
     let all = tiles(&mesh, 1, TOP);
     let mut runs = Vec::new();
+    // At least three workers last, so the three counts differ on a machine of one or two
+    // threads too (each names its store's file).
     for threads in [
         1,
         2,
-        thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .max(3),
     ] {
         let config = roomy().with_workers(fixed(threads));
         let mut store = new_store(&dir, &format!("{threads}.bcp"), &mesh, config);
