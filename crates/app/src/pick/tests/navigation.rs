@@ -342,3 +342,68 @@ fn the_wheel_closes_on_the_surface_magnifies_at_the_boundary_and_backs_out_the_s
     assert!((back.magnification() - 1.0).abs() < 1e-12);
     owner.close().expect("closed");
 }
+
+/// Makes frames of `owner` until it wants none, as [`settle`] does; returns the overlay lines of
+/// the last frame made, if any.
+fn settle_shown(owner: &mut Owner<NoBrush, NoUploads>) -> Option<Vec<String>> {
+    let mut last = None;
+    for _ in 0..50 {
+        let now = Instant::now();
+        match owner.next(now) {
+            Next::Frame { deadline } => {
+                let mut number = 0;
+                owner
+                    .frame(now, deadline, |request| {
+                        number = request.number;
+                        last = Some(request.overlay);
+                        Ok(())
+                    })
+                    .expect("a frame");
+                owner.shown(Presented {
+                    number,
+                    outcome: Shown::Presented,
+                    times: DrawTimes::default(),
+                    scene: false,
+                    shown: false,
+                    aa: render::aa::AaReport::default(),
+                    gpu: Vec::new(),
+                    dropped: render::DroppedReadbacks::default(),
+                    gpu_finished: number,
+                    submitted: Instant::now(),
+                });
+            }
+            Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
+            Next::Render | Next::Gpu | Next::Idle { .. } => break,
+        }
+    }
+    last
+}
+
+#[test]
+fn a_press_that_moves_the_pivot_shows_it_in_the_overlay_without_moving_the_view() {
+    let dir = TestDir::new();
+    let mut owner = owner(&dir);
+    owner.input(Input::Move {
+        at: at(205.0, 70.0),
+    });
+    settle(&mut owner);
+    let view = owner.camera().view(size());
+    owner.input(Input::Press {
+        button: Button::MouseRight,
+        at: at(205.0, 70.0),
+    });
+    let lines = settle_shown(&mut owner).expect("a frame for the overlay");
+    let pivot = owner.camera().pivot();
+    assert_ne!(
+        pivot,
+        camera::Vec3::default(),
+        "the press grabbed the surface"
+    );
+    let said = format!("pivot ({:.2}, {:.2}, {:.2})", pivot.x, pivot.y, pivot.z);
+    assert!(
+        lines.iter().any(|line| line.contains(&said)),
+        "{said} in {lines:?}"
+    );
+    assert_eq!(owner.camera().view(size()), view, "no pixel moved");
+    owner.close().expect("closed");
+}

@@ -561,3 +561,41 @@ fn picking_through_a_view_magnified_off_centre_hits_what_its_pixels_show() {
         );
     }
 }
+
+#[test]
+fn at_the_magnification_limit_the_pick_ray_agrees_with_the_image_to_half_a_pixel() {
+    // The unit sphere's boundary, the pivot off the centre, zoomed to the limit.
+    let mut camera = magnified_about(camera::Vec3::new(0.3, -0.2, 0.932_737_905_308_881_5), 2.0);
+    camera.zoom(1e-12);
+    let view = camera.view(size()).expect("a view");
+    let eye = view.eye();
+    // The GPU draws a point `p` relative to its f32 eye, as the exact view draws `p` moved by the
+    // eye's rounding.
+    let [gx, gy, gz, _] = view.gpu().eye;
+    let rounding = eye - Vec3::new(f64::from(gx), f64::from(gy), f64::from(gz));
+    let depth = (Vec3::new(0.3, -0.2, 0.932_737_905_308_881_5) - eye).dot(view.forward());
+    for pixel in [
+        at(160.0, 100.0),
+        at(37.5, 12.25),
+        at(300.25, 190.75),
+        at(220.0, 60.0),
+    ] {
+        let ray = PickRay::through(&view, pixel)
+            .expect("a ray")
+            .store_ray()
+            .expect("an f32 ray");
+        let (origin, direction) = (
+            Vec3::from_f32(ray.origin()),
+            Vec3::from_f32(ray.direction()),
+        );
+        // A point of the surface the ray reaches at the pivot's depth, as the mesh holds it (f32).
+        let t = (depth - (origin - eye).dot(view.forward())) / direction.dot(view.forward());
+        let reached = Vec3::from_f32(to_f32(origin + direction * t));
+        let (x, y, _) = view.pixel(reached + rounding).expect("in front");
+        assert!(
+            (x - pixel.x).abs() < 0.5 && (y - pixel.y).abs() < 0.5,
+            "{pixel:?} at {}x: the image shows the ray's point at ({x}, {y})",
+            camera.magnification()
+        );
+    }
+}
