@@ -1,5 +1,10 @@
-//! A scripted run's per-frame record (`--record`): what each frame cost and what it drew, as JSON
+//! A recorded run's per-frame record (`--record`): what each frame cost and what it drew, as JSON
 //! lines in the style of `brushcraft-bench`'s records, which `brushcraft-bench perf` reads.
+//!
+//! A scripted run is recorded, and so is a live session in a window (the pen's latency of strokes
+//! drawn by hand, read by `brushcraft-bench strokes-summary`): its record has no segments and its
+//! frames none, and it keeps every frame's record in memory (about a kilobyte each, some 400 MB
+//! an hour at 120 frames a second) until the window closes and the lines are written.
 //!
 //! A frame's facts arrive at different times: its owner thread phases as it is made (its upkeep
 //! and jobs once they have run), its render thread phases when it is shown, its GPU times two or
@@ -589,8 +594,9 @@ impl Recorder {
         }
     }
 
-    /// The record's lines: the run's (`info`), each of `script`'s segments', then each frame's.
-    pub(crate) fn lines(&self, info: &RunInfo, script: &Script) -> Vec<String> {
+    /// The record's lines: the run's (`info`), each of `script`'s segments' (none for a live
+    /// session, which has no script: its speed is 1), then each frame's.
+    pub(crate) fn lines(&self, info: &RunInfo, script: Option<&Script>) -> Vec<String> {
         let dropped: u64 = self
             .frames
             .values()
@@ -601,7 +607,7 @@ impl Recorder {
             .with("adapter", info.adapter.as_str())
             .with("width", info.size.0)
             .with("height", info.size.1)
-            .with("speed", script.speed().get())
+            .with("speed", script.map_or(1.0, |script| script.speed().get()))
             .with("gpu_timing", info.gpu_timing)
             .with("lod_timing", info.lod_timing)
             .with("open_ms", info.open)
@@ -609,7 +615,8 @@ impl Recorder {
             .with("refresh_ms", info.refresh)
             .with("frames", self.frames.len())
             .with("readbacks_dropped", dropped);
-        let segments = script.segments().into_iter().map(|(segment, start, end)| {
+        let spans = script.map(Script::segments).unwrap_or_default();
+        let segments = spans.into_iter().map(|(segment, start, end)| {
             Line::new("segment")
                 .with("segment", segment.name())
                 .with("start_ms", start)

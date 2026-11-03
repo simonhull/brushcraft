@@ -1041,7 +1041,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             scene_shown: false,
             picker: None,
             accumulates: true,
-            recorder: setup.script.as_ref().map(|_| Recorder::default()),
+            recorder: (setup.script.is_some() || run_info.is_some()).then(Recorder::default),
             script: setup.script,
             script_over: false,
             run_info,
@@ -1062,10 +1062,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
     }
 
-    /// A recorded scripted run's record lines ([`crate::record`]); empty for any other run.
+    /// A recorded run's record lines ([`crate::record`]), scripted or live; empty for a run not
+    /// recorded.
     pub(crate) fn record_lines(&self) -> Vec<String> {
-        match (&self.recorder, &self.run_info, &self.script) {
-            (Some(recorder), Some(info), Some(script)) => recorder.lines(info, script),
+        match (&self.recorder, &self.run_info) {
+            (Some(recorder), Some(info)) => recorder.lines(info, self.script.as_ref()),
             _ => Vec::new(),
         }
     }

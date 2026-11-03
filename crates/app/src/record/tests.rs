@@ -262,7 +262,7 @@ fn a_run_writes_its_setting_its_segments_then_its_frames() {
         refresh: Duration::from_micros(6944),
     };
     let script = Script::benchmark(Speed::ONE);
-    let lines = recorder.lines(&info, &script);
+    let lines = recorder.lines(&info, Some(&script));
     assert_eq!(lines.len(), 1 + 5 + 2);
     assert!(
         lines[0]
@@ -341,7 +341,7 @@ fn dropped_readbacks_are_marked_on_their_frame_and_totalled_on_the_run_line() {
         clock_unix: None,
         refresh: ms(16),
     };
-    let lines = recorder.lines(&info, &Script::benchmark(Speed::ONE));
+    let lines = recorder.lines(&info, Some(&Script::benchmark(Speed::ONE)));
     assert!(
         lines[0].contains(r#""readbacks_dropped":4"#),
         "{}",

@@ -45,7 +45,9 @@ options:
                    how a stroke looks, with --screenshot
   --script-speed X run the path X times as fast (default 1)
   --record FILE    with --script, write a JSON line per frame to FILE: GPU phase times, the
-                   owner thread's phases, what was drawn, residency and uploads
+                   owner thread's phases, what was drawn, residency and uploads; in a window
+                   with neither --script nor --frames, the same for a live session (the pen's
+                   latency of strokes drawn by hand), written as the window closes
   --no-gpu-timing  don't time the GPU, even where it can be (with --script)
   --offscreen      no window: draw into a texture (needs --frames or --script)
   --screenshot FILE
@@ -183,8 +185,12 @@ impl Options {
         );
         let scripted = matches!(run, Run::Script(_));
         ensure!(
-            scripted || (record.is_none() && speed.is_none() && path.is_none()),
-            "--record, --script-path and --script-speed go with --script"
+            scripted || (speed.is_none() && path.is_none()),
+            "--script-path and --script-speed go with --script"
+        );
+        ensure!(
+            record.is_none() || matches!(run, Run::Script(_) | Run::Open),
+            "--record goes with --script, or with a window's open run (a live session)"
         );
         ensure!(
             offscreen || screenshot.is_none(),
@@ -381,7 +387,7 @@ mod tests {
             &["p.bcrf", "--frames", "0"],
             &["p.bcrf", "--offscreen"],
             &["p.bcrf", "--script", "--frames", "3"],
-            &["p.bcrf", "--record", "r.jsonl"],
+            &["p.bcrf", "--frames", "3", "--record", "r.jsonl"],
             &["p.bcrf", "--frames", "3", "--script-speed", "2"],
             &["p.bcrf", "--script", "--script-speed", "0"],
             &["p.bcrf", "--script-path", "strokes"],
@@ -437,6 +443,14 @@ mod tests {
         );
         let strokes = parse(&["p.bcrf", "--script", "--script-path=strokes"]).unwrap();
         assert_eq!(strokes.script(), Some(Script::strokes(Speed::ONE)));
+        let live = parse(&["p.bcrf", "--record", "/tmp/live.jsonl"]).unwrap();
+        assert_eq!(
+            live.mode,
+            mode(Run::Open, false),
+            "a live session, recorded"
+        );
+        assert_eq!(live.record, Some(PathBuf::from("/tmp/live.jsonl")));
+        assert_eq!(live.script(), None);
     }
 
     #[test]
