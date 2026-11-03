@@ -42,13 +42,16 @@
 //!
 //! # The budget
 //!
-//! The shapes are counted in the store's memory budget, the positions kept made with them: the
-//! pools' limit is lowered by their bytes ([`TileStore::pen_down_bytes`]), never below the pools'
-//! minimum, and raised back when the shapes go. There is no cap: a stroke keeps every tile's shape
-//! whatever it costs, and the bytes the pools' minimum leaves no room for are reported as held
-//! beyond the budget ([`TileStore::pen_down_beyond_budget`]). Lowering the limit unmaps nothing at
-//! once: the pools take no chunk while they hold more than it, and give chunks back as they next
-//! make room.
+//! The shapes are counted in the store's memory budget, with the positions and normals made of
+//! them and the previews' pen-down blocks ([`TileStore::pen_down_bytes`]): the pools' limit is
+//! lowered by their bytes, never below the pools' minimum, and raised back when they go. The
+//! lowering is settled as a frame pins its tiles ([`TileStore::pin`]), before it counts its room,
+//! and never below what those pins need: so the data a stroke keeps never makes a frame's pins
+//! fail, and a frame that has pinned its tiles is never short of the room it counted. There is
+//! no cap: a stroke keeps every tile's shape whatever it costs, and the bytes the floor leaves no
+//! room for are reported as held beyond the budget ([`TileStore::pen_down_beyond_budget`]).
+//! Lowering the limit unmaps nothing at once: the pools take no chunk while they hold more than
+//! it, and give chunks back as they next make room.
 //!
 //! # Reads
 //!
@@ -62,17 +65,16 @@
 //! surface, and its refits keep a changed tile's box over its pen-down shape
 //! too (see [`SpatialIndex::refit`](crate::SpatialIndex::refit)).
 
-use std::borrow::Cow;
 use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{
-    BaseMesh, Channel, CorrectionTile, CorrectionView, FaceId, GatheredBlock, LayerId, Level,
-    PositionSource, Prediction, Region, TileKey, Vec3, gather_block,
+    BaseMesh, Channel, CorrectionTile, FaceId, GatheredBlock, LayerId, Level, PositionSource,
+    Prediction, Region, TileKey, Vec3, gather_block,
 };
 
 use super::TileStore;
-use super::error::CacheError;
+use super::error::{CacheError, Invariant};
 use crate::Aabb;
 use crate::index::TileBlocks;
 use crate::tiles::config::Evaluation;
@@ -89,20 +91,15 @@ pub struct PenDownShape {
 
 impl PenDownShape {
     /// The shape of a tile whose corrections are `corrections` and whose positions, made from
-    /// them, are `positions`.
+    /// them, are `positions`: for the tests (the store makes its own from a tile it holds).
+    #[cfg(test)]
     #[must_use]
-    pub fn new(corrections: CorrectionTile, positions: &[Vec3]) -> Self {
+    pub(crate) fn new(corrections: CorrectionTile, positions: &[Vec3]) -> Self {
         let finite = positions.iter().copied().filter(|p| p.is_finite());
         Self {
             corrections,
             bounds: Aabb::from_points(finite),
         }
-    }
-
-    /// The tile's corrections at pen-down.
-    #[must_use]
-    pub fn corrections(&self) -> CorrectionView<'_> {
-        self.corrections.view()
     }
 
     /// The tile's pen-down positions, row-major: `prediction` (the tile's) with the pen-down
@@ -161,6 +158,18 @@ pub(crate) struct PenDown {
     made: BTreeMap<TileKey, Made>,
     /// Reads of `made` so far: each entry's last read is one of them.
     reads: u64,
+    /// The positions made of the changed tiles a brush is working on: the tiles of its last dab
+    /// or run, whatever their number (see "Positions made, kept for the next reads" in the module
+    /// notes).
+    brush: BTreeMap<TileKey, Vec<Vec3>>,
+    /// The pen-down normals of the tiles whose normals read a changed tile, made once each: they
+    /// can't change while the stroke lasts.
+    normals: BTreeMap<TileKey, Vec<Vec3>>,
+    /// The pen-down blocks a brush's previews weigh their points at, one a previewed tile (see
+    /// [`TileStore::keep_preview_pen_down`]).
+    previews: BTreeMap<TileKey, GatheredBlock>,
+    /// The bytes `previews` holds.
+    preview_bytes: usize,
 }
 
 /// A changed tile's pen-down positions, made, and its raycast blocks once built.
@@ -178,9 +187,13 @@ struct Made {
 /// around the pen, several dabs' worth. With [`MADE_BYTES`] each, about 3.5 MiB.
 pub(crate) const MADE_TILES: usize = 64;
 
-/// The bytes a tile's positions kept made are counted at: a tile of 65² positions, its raycast
-/// blocks (at most about 4.3 KB) and its map entry.
-const MADE_BYTES: usize = 65 * 65 * size_of::<Vec3>() + 4_352 + ENTRY_BYTES;
+/// The bytes a tile's positions or normals made are counted at: a tile of 65² of them and its map
+/// entry.
+const GRID_BYTES: usize = 65 * 65 * size_of::<Vec3>() + ENTRY_BYTES;
+
+/// The bytes a tile's positions kept made for placement are counted at: [`GRID_BYTES`] and its
+/// raycast blocks (at most about 4.3 KB).
+const MADE_BYTES: usize = GRID_BYTES + 4_352;
 
 /// The bytes a map entry adds to a shape's own: its key, and the map's node share.
 const ENTRY_BYTES: usize = size_of::<TileKey>() + 2 * size_of::<usize>();
@@ -231,7 +244,6 @@ impl TileStore {
                 }
             }
         }
-        self.withhold_pen_down();
         outcome
     }
 
@@ -285,10 +297,12 @@ impl TileStore {
     /// one whose positions aren't kept made now.
     #[must_use]
     pub fn made_pen_down(&self, key: &TileKey) -> Option<&[Vec3]> {
-        self.pen_down
+        let pen_down = &self.pen_down;
+        pen_down
             .made
             .get(key)
             .map(|made| made.positions.as_slice())
+            .or_else(|| pen_down.brush.get(key).map(Vec::as_slice))
     }
 
     /// Changed tile `key`'s pen-down positions and raycast blocks, made and kept for the next
@@ -321,33 +335,46 @@ impl TileStore {
         self.pen_down.reads += 1;
         let read = self.pen_down.reads;
         if !self.pen_down.made.contains_key(&key) {
-            let positions = self.made_afresh(key)?;
+            // A brush's, if it made them; else made now.
+            let positions = match self.pen_down.brush.get(&key) {
+                Some(brush) => brush.clone(),
+                None => self.made_afresh(key)?,
+            };
             self.keep_made(key, positions, read);
-            self.withhold_pen_down();
         }
         let made = self
             .pen_down
             .made
             .get_mut(&key)
-            .ok_or(super::error::Invariant::NotHeld(key))?;
+            .ok_or(Invariant::NoPenDownShape(key))?;
         made.read = read;
         Ok(made)
     }
 
-    /// Makes the pen-down positions of the changed tiles of `keys` whose predictions the store
-    /// keeps and whose positions aren't kept made, together on the store's workers, and keeps
-    /// them (the first 64 of `keys` at most): for a brush about to read them through
-    /// `&self` on its workers ([`TileStore::made_pen_down`]), which then find them for this dab and
-    /// the next. Counted as read now.
+    /// Makes the pen-down positions of the changed tiles of `keys` a brush is about to read
+    /// through `&self` on its workers ([`TileStore::made_pen_down`]): its dab's or run's tiles.
+    ///
+    /// They are kept apart from placement's, as the brush's working set: those of `keys` it holds
+    /// already stay, the others' go, and the changed tiles of `keys` with a kept prediction and no
+    /// positions made yet have them made, together on the store's workers. However many they are
+    /// (a big brush's dab reaches over a thousand tiles), the next dab over the same tiles finds
+    /// them made. Their bytes are counted with the pen-down data.
     pub fn make_pen_down_many(&mut self, keys: &[TileKey]) {
-        let todo: Vec<(TileKey, &PenDownShape, &Prediction)> = keys
+        let wanted: BTreeSet<TileKey> = keys
             .iter()
-            .filter(|key| !self.pen_down.made.contains_key(key))
+            .filter(|key| self.pen_down.shapes.contains_key(key))
+            .copied()
+            .collect();
+        self.pen_down.brush.retain(|key, _| wanted.contains(key));
+        let todo: Vec<(TileKey, &PenDownShape, &Prediction)> = wanted
+            .iter()
+            .filter(|key| {
+                !self.pen_down.brush.contains_key(key) && !self.pen_down.made.contains_key(key)
+            })
             .filter_map(|key| {
                 let shape = self.pen_down.shapes.get(key)?;
                 Some((*key, shape, self.kept.get(key)?))
             })
-            .take(MADE_TILES)
             .collect();
         if todo.is_empty() {
             return;
@@ -355,12 +382,7 @@ impl TileStore {
         let made: Vec<(TileKey, Vec<Vec3>)> = self.par_map(&todo, |&(key, shape, prediction)| {
             (key, shape.positions(prediction))
         });
-        for (key, positions) in made {
-            self.pen_down.reads += 1;
-            let read = self.pen_down.reads;
-            self.keep_made(key, positions, read);
-        }
-        self.withhold_pen_down();
+        self.pen_down.brush.extend(made);
     }
 
     /// Keeps `positions`, changed tile `key`'s pen-down positions made, as read at `read`, the
@@ -398,10 +420,10 @@ impl TileStore {
         };
         let prediction = made.as_ref().or_else(|| self.kept.get(&key));
         let shape = self.pen_down.shapes.get(&key);
-        Ok(match (shape, prediction) {
-            (Some(shape), Some(prediction)) => shape.positions(prediction),
-            _ => Vec::new(),
-        })
+        match (shape, prediction) {
+            (Some(shape), Some(prediction)) => Ok(shape.positions(prediction)),
+            _ => Err(Invariant::NoPenDownShape(key).into()),
+        }
     }
 
     /// Tile `key`'s pen-down positions with its one-vertex ring and its base-vertex rings, as
@@ -529,21 +551,57 @@ impl TileStore {
 
     /// Tile `key`'s pen-down unit normals, row-major: the normals of its pen-down block
     /// ([`TileStore::pen_down_block`]), which are [`TileStore::normals`]' bits where nothing they
-    /// read was changed by the stroke (then read from the cache).
+    /// read was changed by the stroke (then read from the cache). Where something was, they are
+    /// made once and kept until the stroke's pen-down data goes: the tiles they read keep their
+    /// pen-down positions while the stroke lasts.
     ///
     /// # Errors
     ///
     /// As [`TileStore::normals`] and [`TileStore::pen_down_block`].
-    pub fn pen_down_normals(&mut self, key: TileKey) -> Result<Cow<'_, [Vec3]>, CacheError> {
-        let changed = self
-            .normal_inputs(&key)?
-            .iter()
-            .any(|input| self.pen_down.shapes.contains_key(input));
-        if !changed {
-            return self.normals(key).map(Cow::Borrowed);
+    pub fn pen_down_normals(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
+        if !self.pen_down.normals.contains_key(&key) {
+            let changed = self
+                .normal_inputs(&key)?
+                .iter()
+                .any(|input| self.pen_down.shapes.contains_key(input));
+            if !changed {
+                return self.normals(key);
+            }
+            let block = self.pen_down_block(key)?;
+            let normals = block.normals(&self.mesh).as_slice().to_vec();
+            self.pen_down.normals.insert(key, normals);
         }
-        let block = self.pen_down_block(key)?;
-        Ok(Cow::Owned(block.normals(&self.mesh).as_slice().to_vec()))
+        Ok(self
+            .pen_down
+            .normals
+            .get(&key)
+            .map_or(&[][..], Vec::as_slice))
+    }
+
+    /// Keeps `block`, previewed tile `key`'s pen-down block, for the preview that weighs its
+    /// points at it ([`TileStore::take_preview_pen_down`] gives it back), its bytes counted with
+    /// the pen-down data: a big brush's previews hold one for each of over a thousand tiles. It
+    /// goes when the stroke's pen-down data does, or when the preview drops it
+    /// ([`TileStore::drop_preview_pen_down`]).
+    pub fn keep_preview_pen_down(&mut self, key: TileKey, block: GatheredBlock) {
+        self.pen_down.preview_bytes += block_bytes(&block);
+        if let Some(old) = self.pen_down.previews.insert(key, block) {
+            self.pen_down.preview_bytes -= block_bytes(&old);
+        }
+    }
+
+    /// Takes previewed tile `key`'s pen-down block out, kept with
+    /// [`TileStore::keep_preview_pen_down`], to weigh more dabs at; `None` if none is kept (the
+    /// stroke's pen-down data went since).
+    pub fn take_preview_pen_down(&mut self, key: &TileKey) -> Option<GatheredBlock> {
+        let block = self.pen_down.previews.remove(key)?;
+        self.pen_down.preview_bytes -= block_bytes(&block);
+        Some(block)
+    }
+
+    /// Drops previewed tile `key`'s pen-down block, if one is kept: its preview is cleared.
+    pub fn drop_preview_pen_down(&mut self, key: &TileKey) {
+        drop(self.take_preview_pen_down(key));
     }
 
     /// How many tiles' pen-down shapes the current stroke keeps.
@@ -552,11 +610,16 @@ impl TileStore {
         self.pen_down.shapes.len()
     }
 
-    /// The bytes the current stroke's pen-down shapes hold, and the positions kept made of them:
-    /// withheld from the pools' share of the budget (see the module notes).
+    /// The bytes the current stroke's pen-down data holds: its shapes, the positions and normals
+    /// made of them, and its previews' pen-down blocks; withheld from the pools' share of the
+    /// budget (see the module notes).
     #[must_use]
     pub fn pen_down_bytes(&self) -> usize {
-        self.pen_down.bytes + self.pen_down.made.len() * MADE_BYTES
+        let pen_down = &self.pen_down;
+        pen_down.bytes
+            + pen_down.made.len() * MADE_BYTES
+            + (pen_down.brush.len() + pen_down.normals.len()) * GRID_BYTES
+            + pen_down.preview_bytes
     }
 
     /// The bytes of the pen-down shapes the pools' minimum leaves no room for in the budget: held
@@ -569,20 +632,30 @@ impl TileStore {
     /// Lets go of the current stroke's pen-down shapes, their bytes given back to the pools: the
     /// stroke has ended. [`TileStore::begin_op`] does it too, as the next stroke begins.
     pub fn release_pen_down(&mut self) {
-        if self.pen_down.shapes.is_empty() {
+        if self.pen_down_bytes() == 0 {
             return;
         }
         self.pen_down = PenDown::default();
-        self.withhold_pen_down();
+        self.withhold_pen_down(0);
     }
 
-    /// Sets the pools' limit to the budget's less the pen-down shapes' and positions made's
-    /// bytes, never below the pools' minimum, and notes what that leaves beyond the budget.
-    fn withhold_pen_down(&mut self) {
-        let floor = self.headroom.minimum_budget(self.corrections.chunk_bytes());
+    /// Sets the pools' limit to the budget's less the pen-down data's bytes, never below the
+    /// pools' minimum nor `beside` (the bytes the pins about to be taken need), and notes what
+    /// that leaves beyond the budget: called by [`TileStore::pin`] before it counts its room, so
+    /// the data a stroke keeps never starves its next frame's pins.
+    pub(super) fn withhold_pen_down(&mut self, beside: usize) {
+        let floor = self
+            .headroom
+            .minimum_budget(self.corrections.chunk_bytes())
+            .max(beside);
         let bytes = self.pen_down_bytes();
         self.pen_down.beyond = self.budget.withhold(bytes, floor);
     }
+}
+
+/// The bytes `block` holds: itself and its positions with the ring.
+fn block_bytes(block: &GatheredBlock) -> usize {
+    size_of::<GatheredBlock>() + size_of_val(block.padded())
 }
 
 /// The pen-down positions of the tiles a gather reads, and the base mesh at level 0: what

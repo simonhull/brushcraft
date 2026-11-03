@@ -190,6 +190,10 @@ pub enum Invariant {
     /// A tile an evaluation didn't pin was looked for among those it did.
     #[error("{0:?} is not among the tiles the evaluation pinned")]
     NotHeld(TileKey),
+    /// A tile read at pen-down as one the stroke changed had no pen-down shape, or no prediction
+    /// to make its positions from, where the store had just made sure of both.
+    #[error("{0:?} has no pen-down shape to read")]
+    NoPenDownShape(TileKey),
     /// A tile was named twice among the tasks of one round, which write one tile each.
     #[error("{0:?} is named twice in one round")]
     NamedTwice(TileKey),

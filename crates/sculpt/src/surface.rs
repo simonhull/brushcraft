@@ -323,7 +323,7 @@ impl<'a> StoreSurface<'a> {
         key: TileKey,
         at: [usize; N],
     ) -> Result<([DVec3; N], [DVec3; N]), SculptError> {
-        let normals = gather(&self.store.pen_down_normals(key)?, at);
+        let normals = gather(self.store.pen_down_normals(key)?, at);
         let positions = gather(self.store.pen_down_positions(key)?, at);
         Ok((positions, normals))
     }

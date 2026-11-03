@@ -366,6 +366,21 @@ impl TileStore {
     ///
     /// [`CacheError::OverBudget`].
     pub(super) fn check_pin_budget(&self, keys: &BTreeSet<TileKey>) -> Result<(), CacheError> {
+        let needed = self.pin_bytes(keys);
+        if needed > self.budget.limit() {
+            return Err(CacheError::OverBudget {
+                tiles: keys.len(),
+                needed,
+                budget: self.budget.limit(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The bytes pinning `keys` needs (see [`TileStore::check_pin_budget`]): the chunks each pool
+    /// needs for its pinned slots besides these tiles, one slot per tile, and the store's own
+    /// headroom.
+    pub(super) fn pin_bytes(&self, keys: &BTreeSet<TileKey>) -> usize {
         /// Bytes of chunks `pool` needs for its pinned slots outside `keys`, one per key, and
         /// `headroom` more.
         fn chunks_needed<T: SlotData>(
@@ -377,16 +392,8 @@ impl TileStore {
             let slots = pool.pinned_slots().saturating_sub(pinned_here) + keys.len() + headroom;
             slots.div_ceil(pool.per_chunk() as usize) * pool.chunk_bytes()
         }
-        let needed = chunks_needed(&self.evaluated, keys, self.headroom.evaluated)
-            + chunks_needed(&self.corrections, keys, 1);
-        if needed > self.budget.limit() {
-            return Err(CacheError::OverBudget {
-                tiles: keys.len(),
-                needed,
-                budget: self.budget.limit(),
-            });
-        }
-        Ok(())
+        chunks_needed(&self.evaluated, keys, self.headroom.evaluated)
+            + chunks_needed(&self.corrections, keys, 1)
     }
 
     /// Checks each of `keys` as [`TileStore::check_key`] does, and that an op is current or can

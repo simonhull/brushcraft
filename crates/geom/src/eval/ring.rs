@@ -108,29 +108,11 @@ impl GatheredBlock {
         self.padded.row(j)
     }
 
-    /// Moves every point the block holds through `f`: its positions, ring included, and its
-    /// base-vertex rings' points. Slots without a vertex (NaN) stay as they are; `f` isn't called
-    /// for them.
-    ///
-    /// Every block holding a vertex holds its bits (its owner's), so an `f` that is a function of
-    /// a point's bits alone moves the vertex to the same new bits in every block, on every face:
-    /// blocks so moved still meet bit for bit. That is what a preview of a brush stroke does to
-    /// the finest tiles it shows ahead of their evaluation.
-    pub fn displace(&mut self, mut f: impl FnMut(Vec3) -> Vec3) {
-        let finite = |v: &Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
-        let slots = self.padded.as_mut_slice().iter_mut();
-        let rings = self.corners.iter_mut().flatten();
-        let ring_points = rings.flat_map(|ring| ring.ring.points_mut());
-        for point in slots.chain(ring_points).filter(|p| finite(p)) {
-            *point = f(*point);
-        }
-    }
-
-    /// Moves every point the block holds through `f` of it and `reference`'s point in the same
-    /// slot: as [`GatheredBlock::displace`], each point with its counterpart in a block gathered
-    /// over the same region (the same surface at another time: a brush stroke's previews weigh
-    /// each point's move at its position as the stroke began). Slots without a vertex in either
-    /// block (NaN) stay as they are; `f` isn't called for them.
+    /// Moves every point the block holds (its positions, ring included, and its base-vertex
+    /// rings' points) through `f` of it and `reference`'s point in the same slot: its counterpart
+    /// in a block gathered over the same region (the same surface at another time: a brush
+    /// stroke's previews weigh each point's move at its position as the stroke began). Slots
+    /// without a vertex in either block (NaN) stay as they are; `f` isn't called for them.
     ///
     /// Every block holds a vertex's owner bits, this one and `reference` alike, so an `f` that is
     /// a function of the two points' bits alone moves the vertex to the same new bits in every
@@ -138,6 +120,7 @@ impl GatheredBlock {
     ///
     /// Returns whether the blocks match: `false`, and nothing moved, if `reference` isn't
     /// gathered over this block's region, or its base-vertex rings aren't this block's.
+    #[must_use = "a block not gathered over the same region is left unmoved"]
     pub fn displace_along(
         &mut self,
         reference: &Self,

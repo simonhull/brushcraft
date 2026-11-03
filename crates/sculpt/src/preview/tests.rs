@@ -537,3 +537,62 @@ fn a_preview_no_new_dab_moves_goes_back_as_it_was_and_is_not_sent_again() {
     store.unsubscribe_stale(cursor);
     drop(project.close(false));
 }
+
+#[test]
+fn a_preview_over_dabs_its_stroke_landed_differs_from_what_lands_only_by_the_encoding() {
+    // The first dabs land, then the next are shown over them in the same stroke: each point is
+    // weighed at its pen-down position, as their finest work weighs it, from tiles the stroke
+    // has changed (their pen-down shapes) and tiles it hasn't.
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "over-landed");
+    let dabs = path(project.store(), 10);
+    let (first, rest) = dabs.split_at(5);
+    let mut stroke = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
+    let landed_first: BTreeMap<TileKey, Vec<Vec3>> = {
+        let store = project.store();
+        finest_tiles(store)
+            .into_iter()
+            .map(|key| (key, store.evaluate(key).unwrap().to_vec()))
+            .collect()
+    };
+    assert!(
+        project.store().pen_down_tiles() > 0,
+        "the stroke changed tiles"
+    );
+    let mut preview = Preview::new();
+    preview.show(project.store(), &index, rest).unwrap();
+    let store = project.store();
+    let shown_now: BTreeMap<TileKey, Vec<Vec3>> = store
+        .previewed()
+        .copied()
+        .collect::<Vec<TileKey>>()
+        .into_iter()
+        .map(|key| (key, shown_positions(store, &key)))
+        .collect();
+    let changed_shown = shown_now
+        .keys()
+        .filter(|key| store.pen_down_shape(key).is_some())
+        .count();
+    assert!(changed_shown > 0, "previews over tiles the stroke changed");
+    apply_dabs(project.store(), &mut index, &mut stroke, rest).unwrap();
+    preview.land(project.store(), &index, rest.len()).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    let after = project.store();
+    let (mut moved, mut off) = (0.0_f32, 0.0_f32);
+    for (key, drawn) in &shown_now {
+        let landed = after.evaluate(*key).unwrap();
+        for ((p, l), b) in drawn.iter().zip(landed).zip(&landed_first[key]) {
+            moved = moved.max((*l - *b).length());
+            off = off.max((*p - *l).length());
+        }
+    }
+    assert!(moved > 0.01, "the shown dabs moved the surface: {moved}");
+    assert!(
+        off < moved * 1e-3,
+        "shown {off} from what landed, of {moved} moved: the encoding's rounding alone"
+    );
+    drop(project.close(false));
+}

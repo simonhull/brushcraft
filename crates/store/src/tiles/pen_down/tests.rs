@@ -186,6 +186,12 @@ fn the_shapes_are_withheld_from_the_pools_and_given_back_when_the_stroke_ends() 
     store.begin_op().expect("an op");
     let reached = tiles_pushed((100, 100), 6);
     store.keep_pen_down(&reached).expect("kept");
+    assert_eq!(
+        store.budget.limit(),
+        opened,
+        "withheld as a frame pins, not before"
+    );
+    drop(store.pin(&reached).expect("pinned"));
     let bytes = store.pen_down_bytes();
     assert!(
         bytes >= reached.len() * 26_886,
@@ -327,13 +333,14 @@ fn the_positions_read_last_are_kept_made_counted_and_the_same_bits_afresh() {
         store.made_pen_down(first).is_none(),
         "the least recently read let go"
     );
-    assert!(store.made_pen_down(last).is_some(), "the last read kept");
+    assert!(store.pen_down.made.contains_key(last), "the last read kept");
     assert_eq!(store.pen_down.made.len(), MADE_TILES);
     assert_eq!(
         store.pen_down_bytes(),
         shapes + MADE_TILES * MADE_BYTES,
         "counted with the shapes"
     );
+    drop(store.pin(&keys[..1]).expect("pinned"));
     assert_eq!(store.budget.limit(), opened - store.pen_down_bytes());
     let again = bits(store.pen_down_positions(*first).expect("reads"));
     assert_eq!(
@@ -352,4 +359,163 @@ fn the_positions_read_last_are_kept_made_counted_and_the_same_bits_afresh() {
     );
     store.release_pen_down();
     assert_eq!(store.budget.limit(), opened, "given back with the shapes");
+}
+
+/// Every tile of `TOP`, face by face.
+fn all_tiles() -> Vec<TileKey> {
+    let top = Level::new(TOP).expect("a level");
+    let per_side = u16::try_from(top.tiles_per_side()).expect("a few");
+    (0..6)
+        .flat_map(|face| {
+            (0..per_side).flat_map(move |ty| {
+                (0..per_side).map(move |tx| {
+                    TileKey::displacement(FaceId::new(face), top, tx, ty).expect("a tile")
+                })
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn pen_down_normals_are_made_once_and_kept_with_the_stroke() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = store_over(&dir, &mesh);
+    store.begin_op().expect("an op");
+    let centre = (124, 100);
+    let reached = tiles_pushed(centre, 3);
+    store.keep_pen_down(&reached).expect("kept");
+    push_out(&mut store, centre, 3, 0.05);
+    let (key, _, _) = tile_at(centre.0, centre.1);
+    let (before, made) = (store.pen_down_bytes(), store.pen_down.made.len());
+    let first = bits(store.pen_down_normals(key).expect("normals"));
+    assert!(store.pen_down.normals.contains_key(&key), "kept");
+    let made = store.pen_down.made.len() - made;
+    assert_eq!(
+        store.pen_down_bytes(),
+        before + GRID_BYTES + made * MADE_BYTES,
+        "and counted, with the positions its block made"
+    );
+    let block = store.pen_down_block(key).expect("gathered");
+    assert_eq!(
+        first,
+        bits(block.normals(&mesh).as_slice()),
+        "the pen-down block's"
+    );
+    assert_eq!(bits(store.pen_down_normals(key).expect("normals")), first);
+    // A tile whose normals read no changed tile is the store's own, not kept.
+    let far = tile_at(10, 200).0;
+    store.pen_down_normals(far).expect("normals");
+    assert!(!store.pen_down.normals.contains_key(&far));
+    store.release_pen_down();
+    assert!(store.pen_down.normals.is_empty());
+}
+
+#[test]
+fn a_brush_keeps_its_tiles_positions_made_apart_from_placements_however_many() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = store_over(&dir, &mesh);
+    let keys = all_tiles();
+    assert!(keys.len() > MADE_TILES);
+    store.begin_op().expect("an op");
+    store.keep_pen_down(&keys).expect("kept");
+    store.keep_predictions_of(&[]).expect("nothing to keep");
+    // Placement reads a few around the pen.
+    let near: Vec<TileKey> = keys.iter().take(4).copied().collect();
+    for key in &near {
+        store.pen_down_positions(*key).expect("reads");
+    }
+    let predicted: Vec<TileKey> = keys
+        .iter()
+        .filter(|key| store.kept_prediction(key).is_some())
+        .copied()
+        .collect();
+    store.make_pen_down_many(&keys);
+    for key in &predicted {
+        let made = store.made_pen_down(key).expect("made for the brush");
+        assert_eq!(bits(made), bits(store.evaluate(*key).expect("evaluates")));
+    }
+    for key in &near {
+        assert!(
+            store.pen_down.made.contains_key(key),
+            "placement's stay made"
+        );
+    }
+    let brush = store.pen_down.brush.len();
+    assert!(
+        brush + near.len() >= predicted.len(),
+        "every predicted tile made"
+    );
+    // The next dab's tiles: those it doesn't reach go.
+    let half: Vec<TileKey> = keys.iter().take(keys.len() / 2).copied().collect();
+    store.make_pen_down_many(&half);
+    assert!(store.pen_down.brush.keys().all(|key| half.contains(key)));
+    assert_eq!(
+        store.pen_down_bytes(),
+        store.pen_down.bytes
+            + store.pen_down.made.len() * MADE_BYTES
+            + store.pen_down.brush.len() * GRID_BYTES,
+        "counted"
+    );
+}
+
+#[test]
+fn a_previews_pen_down_blocks_are_counted_and_go_with_the_stroke() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = store_over(&dir, &mesh);
+    store.begin_op().expect("an op");
+    let (key, _, _) = tile_at(100, 100);
+    let block = store.positions_with_ring(key).expect("gathered");
+    let before = store.pen_down_bytes();
+    store.keep_preview_pen_down(key, block.clone());
+    let held = store.pen_down_bytes() - before;
+    assert!(held >= 67 * 67 * 12, "{held} bytes for a 67² block");
+    assert_eq!(store.take_preview_pen_down(&key), Some(block.clone()));
+    assert_eq!(store.pen_down_bytes(), before, "taken out, uncounted");
+    store.keep_preview_pen_down(key, block);
+    store.release_pen_down();
+    assert_eq!(
+        store.take_preview_pen_down(&key),
+        None,
+        "gone with the stroke"
+    );
+}
+
+#[test]
+fn a_stroke_s_pen_down_data_never_makes_a_frame_s_pins_fail() {
+    // A budget whose pools just hold a frame's pins: the pen-down data is withheld beside them,
+    // the rest reported beyond the budget, and the pins taken.
+    let keys = all_tiles();
+    let probe_dir = TestDir::new();
+    let mesh = mesh();
+    let probe = store_over(&probe_dir, &mesh);
+    let needed = probe.pin_bytes(&keys.iter().copied().collect());
+    drop(probe);
+    let dir = TestDir::new();
+    let config = crate::fixture::with_reserved_shares(
+        crate::StoreConfig::new(needed, crate::fixture::SITE)
+            .with_chunk_bytes(roomy().chunk_bytes)
+            .with_workers(crate::fixture::TEST_THREADS),
+    );
+    let file = ProjectFile::create(&dir.path("tight.bcp"), meta_for(&mesh), Arc::clone(&mesh))
+        .expect("a file");
+    let mut store = TileStore::open(file, config).expect("a store");
+    drop(store.pin(&keys).expect("the pins fit"));
+    store.begin_op().expect("an op");
+    store.keep_pen_down(&keys).expect("kept");
+    for key in keys.iter().take(MADE_TILES) {
+        store.pen_down_positions(*key).expect("reads");
+    }
+    let pins = store
+        .pin(&keys)
+        .expect("the pins fit beside the pen-down data");
+    assert!(
+        store.pen_down_beyond_budget() > 0,
+        "the rest held beyond the budget"
+    );
+    drop(pins);
+    store.release_pen_down();
+    assert_eq!(store.pen_down_beyond_budget(), 0);
 }
