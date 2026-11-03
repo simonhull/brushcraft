@@ -279,9 +279,20 @@ fn a_stroke_edits_the_project_and_is_recorded_once() {
         "the project was edited"
     );
     assert_eq!(
-        *owner.camera(),
-        Camera::default(),
-        "the stroke didn't orbit"
+        owner.camera().view(size()),
+        Camera::default().view(size()),
+        "the stroke didn't move the view"
+    );
+    // It made where it began the pivot: its first dab's centre, on the surface under the Down.
+    let pivot = owner.camera().pivot();
+    let view = owner.camera().view(size()).expect("a view");
+    let (x, y, _) = view
+        .pixel(render::camera::Vec3::new(pivot.x, pivot.y, pivot.z))
+        .expect("in front");
+    let (down_x, down_y) = ACROSS.0;
+    assert!(
+        (x - down_x).abs() < 1.0 && (y - down_y).abs() < 1.0,
+        "the pivot shows under the Down: ({x}, {y})"
     );
     assert_eq!(owner.brush().error(), None);
     queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));

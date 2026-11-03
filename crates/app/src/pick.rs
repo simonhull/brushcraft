@@ -5,11 +5,11 @@
 //!
 //! **The ray** ([`PickRay::through`]) goes from the view's near plane through a point of the
 //! viewport, given in physical pixels from its top-left corner, as winit reports the pointer
-//! (`WindowEvent::PointerMoved`'s `PhysicalPosition`) and as the frame's [`Size`] counts the
-//! surface. Both are physical, so a high-DPI display's scale factor needs no conversion: it only
-//! sizes the overlay's text ([`crate::frame::Owner::set_scale`]), never the scene. The position
-//! is continuous: `(0, 0)` is the viewport's top-left corner and pixel `(i, j)`'s centre is
-//! `(i + 0.5, j + 0.5)`, the same convention [`View::pixel`] projects to. The ray starts on the
+//! (`WindowEvent::PointerMoved`'s `PhysicalPosition`) and as the frame's [`render::surface::Size`]
+//! counts the surface. Both are physical, so a high-DPI display's scale factor needs no conversion:
+//! it only sizes the overlay's text ([`crate::frame::Owner::set_scale`]), never the scene. The
+//! position is continuous: `(0, 0)` is the viewport's top-left corner and pixel `(i, j)`'s centre
+//! is `(i + 0.5, j + 0.5)`, the same convention [`View::pixel`] projects to. The ray starts on the
 //! near plane, not at the eye, because nothing nearer is drawn.
 //!
 //! **The hit** ([`Picker::pick`], [`Hit`]) is where [`SpatialIndex::raycast`] says the ray first
@@ -52,10 +52,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use geom::TileKey;
 use render::camera::{Vec3, View};
-use render::surface::Size;
 use store::{Project, Ray, SpatialIndex, TileStore};
 
-use crate::camera::Pixel;
+use crate::camera::{self, Pixel};
 
 /// A ray from the view through a point of the viewport: unit length, starting on the near plane.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,19 +71,16 @@ impl PickRay {
     /// The ray from `view`'s near plane through `at`, a point of its viewport in physical pixels
     /// from the top-left corner (see the module notes); `None` if `at` isn't finite.
     ///
-    /// A point `p` pixels right of the centre is `p / pixels_per_unit` units right per unit of
-    /// depth, which is how [`View::pixel`] projects it, so a point on the ray projects back to
-    /// `at`.
+    /// A point `p` pixels right of the principal point (the centre, unless the view is magnified
+    /// off it) is `p / pixels_per_unit` units right per unit of depth, which is how
+    /// [`View::pixel`] projects it ([`View::through`]), so a point on the ray projects back to
+    /// `at`, magnified or not.
     pub(crate) fn through(view: &View, at: Pixel) -> Option<Self> {
         if !(at.x.is_finite() && at.y.is_finite()) {
             return None;
         }
-        let (width, height) = dimensions(view.size());
-        let per_unit = view.pixels_per_unit();
-        let across = (at.x - width / 2.0) / per_unit;
-        let down = (height / 2.0 - at.y) / per_unit;
         let forward = view.forward();
-        let direction = (forward + view.right() * across + view.up() * down).normalized()?;
+        let direction = view.through(at.x, at.y).normalized()?;
         // The near plane is `near` along `forward`; the ray reaches it after `near / cos θ`.
         let start = view.near() / direction.dot(forward);
         Some(Self {
@@ -111,11 +107,6 @@ impl PickRay {
     fn store_ray(&self) -> Option<Ray> {
         Ray::new(to_f32(self.origin), to_f32(self.direction))
     }
-}
-
-/// `size`'s width and height, as `f64`.
-fn dimensions(size: Size) -> (f64, f64) {
-    (f64::from(size.width()), f64::from(size.height()))
 }
 
 /// `v` rounded to `f32`, as the store's rays and the mesh are.
@@ -281,6 +272,36 @@ impl Picker {
     /// brings it up to date after its edits ([`crate::frame::BrushContext`]).
     pub(crate) const fn index_mut(&mut self) -> &mut SpatialIndex {
         &mut self.index
+    }
+
+    /// The sphere holding the model, as the index's tiles' boxes bound it: about the centre of
+    /// their box, out to the farthest corner of any (in the camera's `f64`); `None` for an empty
+    /// index. What the camera's boundary is fitted around ([`crate::camera::Boundary`]).
+    ///
+    /// A pass over every tile's box: 153,600 on the benchmark project, a fraction of a
+    /// millisecond. The frame loop takes it at open, on F, and once after the brush's edits,
+    /// between strokes.
+    pub(crate) fn model_sphere(&self) -> Option<(camera::Vec3, f64)> {
+        let bvh = self.index.bvh();
+        let wide =
+            |v: geom::Vec3| camera::Vec3::new(f64::from(v.x), f64::from(v.y), f64::from(v.z));
+        let whole = bvh.aabb()?;
+        let centre = wide(whole.centroid());
+        let farthest = |(_, bounds): &(TileKey, store::TileBounds)| {
+            let (low, high) = (
+                wide(bounds.aabb.min()) - centre,
+                wide(bounds.aabb.max()) - centre,
+            );
+            let reach = |a: f64, b: f64| a.abs().max(b.abs());
+            let corner = camera::Vec3::new(
+                reach(low.x, high.x),
+                reach(low.y, high.y),
+                reach(low.z, high.z),
+            );
+            corner.length()
+        };
+        let radius = bvh.iter().map(farthest).fold(0.0, f64::max);
+        Some((centre, radius))
     }
 
     /// The surface moved (the brush edited it): the next [`Picker::update`] picks again, even

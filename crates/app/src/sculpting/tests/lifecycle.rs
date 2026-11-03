@@ -304,6 +304,7 @@ fn landing_stroke(camera: &Camera, brush: &Sculpting) -> Pending {
         sources: VecDeque::new(),
         last: times_of(&down),
         interval: FIRST_INTERVAL,
+        start_noted: true,
     }
 }
 

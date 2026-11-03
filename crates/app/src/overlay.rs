@@ -82,6 +82,26 @@ fn vec3(v: Vec3) -> String {
     format!("({:.2}, {:.2}, {:.2})", v.x, v.y, v.z)
 }
 
+/// The overlay's camera line: the eye, the pivot and the eye's distance to it, and the
+/// magnification.
+///
+/// The magnification shows its factor while the eye is held at the model's boundary and the
+/// image magnified instead ([`crate::camera`]), or that it isn't.
+fn camera_line(camera: &Camera) -> String {
+    let factor = camera.magnification();
+    let magnified = if factor > 1.0 {
+        format!("magnified {factor:.2}x (eye at the boundary)")
+    } else {
+        "not magnified".to_owned()
+    };
+    format!(
+        "camera     eye {}  pivot {} at {:.3}  {magnified}",
+        vec3(camera.eye()),
+        vec3(camera.pivot()),
+        (camera.eye() - camera.pivot()).length(),
+    )
+}
+
 /// The overlay's lines for `snapshot`: plain ASCII, one fact per field.
 pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
     let Snapshot {
@@ -161,12 +181,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         ),
         format!("tiles      {}", tiles.unwrap_or("none on the GPU yet")),
         format!("scene      {}", crate::uploads::scene_summary(scene)),
-        format!(
-            "camera     eye {}  target {}  distance {:.3}",
-            vec3(camera.eye()),
-            vec3(camera.target()),
-            camera.distance()
-        ),
+        camera_line(&camera),
         format!(
             "look       {view}  wireframe {wireframe}  (keys: M matcap, W wireframe, C clusters)"
         ),
@@ -366,7 +381,7 @@ mod tests {
             "1234 display tiles left",
             "none on the GPU yet",
             "no cut read back yet",
-            "eye (0.00, 0.00, 3.00)",
+            "eye (0.00, 0.00, 3.00)  pivot (0.00, 0.00, 0.00) at 3.000  not magnified",
             "matcap glossy  wireframe on",
             "pick       off (no spatial index)",
             "pen        winit's tablet events (fallback: not a Wayland display or window)",
@@ -385,6 +400,17 @@ mod tests {
         let rest = lines(&without_render).join("\n");
         assert!(rest.contains("render ms  -"), "{rest}");
         assert!(rest.contains("12 tiles at level 5"), "{rest}");
+        let mut close_up = Camera::default();
+        close_up.zoom(1e-5);
+        let magnified = Snapshot {
+            camera: close_up,
+            ..snapshot
+        };
+        let shown = lines(&magnified).join("\n");
+        assert!(
+            shown.contains("magnified 3.33x (eye at the boundary)"),
+            "{shown}"
+        );
         let no_latency = Snapshot {
             latency: None,
             pacing: StrokePacing::Refresh,

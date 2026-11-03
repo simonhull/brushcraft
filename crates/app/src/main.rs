@@ -13,7 +13,8 @@
 //! ([`navigate`], [`camera`]), and the overlay shows the point of the surface under the
 //! pointer, picked by the spatial index ([`pick`]). Keys change how the scene is shown (M the
 //! MatCap, W the wireframe, C the debug view of a colour per cluster), each a shading pass alone,
-//! and the brush (`[` and `]` its size, `-` and `=` its strength).
+//! and the brush (`[` and `]` its size, `-` and `=` its strength); F frames the model, as opening
+//! the project does.
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
@@ -92,8 +93,9 @@ pub(crate) fn start(mut project: Project, gpu: Arc<Gpu>, mut setup: Setup) -> Re
         Ok((residency, picker)) => {
             let brush = Sculpting::new(&mut project);
             let owner = Owner::new(project, brush, residency, setup, Instant::now());
+            // Opening a project starts framed (a scripted run's path sets its view instead).
             Ok(match picker {
-                Some(picker) => owner.with_picker(picker),
+                Some(picker) => owner.with_picker(picker).framed(),
                 None => owner,
             })
         }

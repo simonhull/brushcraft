@@ -392,10 +392,14 @@ impl WindowApp {
                 if let Some(change) = brush_change(event.physical_key) {
                     // Held, a brush key repeats: the size or strength keeps changing.
                     owner.change_brush(change);
-                } else if !event.repeat
-                    && let Some(change) = look_change(event.physical_key)
-                {
-                    owner.change_look(change);
+                } else if !event.repeat {
+                    if let Some(change) = look_change(event.physical_key) {
+                        owner.change_look(change);
+                    } else if event.physical_key == PhysicalKey::Code(KeyCode::KeyF) {
+                        // F frames the model, its centre the pivot (by the key's place, as the
+                        // look's keys are).
+                        owner.frame_model();
+                    }
                 }
             }
             _ => {}

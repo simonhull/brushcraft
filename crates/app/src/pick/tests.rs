@@ -2,12 +2,13 @@
 //!
 //! The ray through a pixel (the centre, the corners, a high-DPI window), picks on a small
 //! generated sphere (on the surface, the near side, a miss), the frame loop picking only when the
-//! pointer or the view changed, the overlay's line, and a pick's time.
+//! pointer or the view changed, the overlay's line, and a pick's time; navigation about the pivot
+//! the frame loop picks under, in [`navigation`].
 
 use std::time::{Duration, Instant};
 
 use geom::{Level, cube_sphere};
-use render::surface::Presentation;
+use render::surface::{Presentation, Size};
 use render::{DrawTimes, Outcome as Shown};
 use store::{ProjectConfig, StoreConfig};
 
@@ -18,6 +19,8 @@ use crate::frame::{NoBrush, NoUploads, Owner, Setup};
 use crate::navigate::Input;
 use crate::render_thread::Presented;
 use crate::test_dir::TestDir;
+
+mod navigation;
 
 /// The level the test projects are picked at: a 24-face sphere's 96 tiles.
 const LEVEL: u8 = 7;

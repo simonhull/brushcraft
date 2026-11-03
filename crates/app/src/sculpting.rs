@@ -396,7 +396,8 @@ fn count_of(count: usize) -> f64 {
 }
 
 /// The camera as the stroke engine's [`Projector`]: rays from the eye through a viewport's
-/// pixels, scaled so their parameter is the view depth, as [`crate::pick::PickRay`] aims them.
+/// pixels, scaled so their parameter is the view depth, as [`crate::pick::PickRay`] aims them,
+/// magnified or not.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ViewProjector {
     /// The view.
@@ -411,17 +412,17 @@ impl ViewProjector {
 }
 
 impl Projector for ViewProjector {
+    /// The ray from the eye through `screen`, through the view's principal point
+    /// ([`View::through`]), so a magnified view's rays go where its pixels show.
     fn ray(&self, screen: ScreenPoint) -> Option<Ray> {
         let view = &self.view;
-        let size = view.size();
-        let (width, height) = (f64::from(size.width()), f64::from(size.height()));
-        let per_unit = view.pixels_per_unit();
-        let across = (screen.x() - width / 2.0) / per_unit;
-        let down = (height / 2.0 - screen.y()) / per_unit;
-        let direction = view.forward() + view.right() * across + view.up() * down;
+        let direction = view.through(screen.x(), screen.y());
         Ray::new(world(view.eye()), world(direction))
     }
 
+    /// A pixel's world size at `depth`: the view's own scale, which a magnified view's
+    /// magnification is in ([`View::pixels_per_unit`]), so the brush's screen radius and the
+    /// world radius it freezes at are the magnified image's pixels.
     fn world_per_pixel(&self, depth: f64) -> f64 {
         depth / self.view.pixels_per_unit()
     }
@@ -506,9 +507,22 @@ struct Pending {
     /// How often its samples arrive, smoothed: when the next is due, which the catch-up keeps
     /// clear of ([`Sculpting::before_next_sample`]).
     interval: Duration,
+    /// Whether its start (its first dab's centre) has been noted for the camera's pivot.
+    start_noted: bool,
 }
 
 impl Pending {
+    /// Notes the stroke's start in `start` once its first dab is queued: the first queued is
+    /// the first placed, since none is applied before it.
+    fn note_start(&mut self, start: &mut Option<[f32; 3]>) {
+        if !self.start_noted
+            && let Some(first) = self.dabs.front()
+        {
+            self.start_noted = true;
+            *start = Some(first.position);
+        }
+    }
+
     /// Whether the pen still draws it.
     const fn open(&self) -> bool {
         self.engine.is_some()
@@ -627,6 +641,9 @@ pub(crate) struct Sculpting {
     last: BrushReport,
     /// The overlay's lines, and what they were made from.
     status: (Vec<String>, Option<StatusKey>),
+    /// The start of the last stroke begun (its first dab's centre), until the frame loop takes it
+    /// for the camera's pivot ([`Brush::take_stroke_start`]).
+    stroke_start: Option<[f32; 3]>,
 }
 
 impl Sculpting {
@@ -658,6 +675,7 @@ impl Sculpting {
             errors: 0,
             last: BrushReport::default(),
             status: (Vec::new(), None),
+            stroke_start: None,
         };
         brush.refresh_status();
         brush
@@ -902,6 +920,7 @@ impl Sculpting {
             sources: VecDeque::new(),
             last: times_of(down),
             interval: FIRST_INTERVAL,
+            start_noted: false,
         });
     }
 
@@ -932,6 +951,7 @@ impl Sculpting {
             Ok(()) => {
                 let queue = (&mut pending.dabs, &mut pending.sources);
                 enqueue(queue, placed, times, scene.index);
+                pending.note_start(&mut self.stroke_start);
             }
             Err(error) => {
                 drop(placed);
@@ -958,6 +978,7 @@ impl Sculpting {
             Ok(()) => {
                 let queue = (&mut pending.dabs, &mut pending.sources);
                 enqueue(queue, tail, times, scene.index);
+                pending.note_start(&mut self.stroke_start);
             }
             Err(error) => {
                 drop(tail);
@@ -1621,6 +1642,15 @@ impl Brush for Sculpting {
         }
     }
 
+    fn take_stroke_start(&mut self) -> Option<crate::camera::Vec3> {
+        let [x, y, z] = self.stroke_start.take()?;
+        Some(crate::camera::Vec3::new(
+            f64::from(x),
+            f64::from(y),
+            f64::from(z),
+        ))
+    }
+
     fn set_radius(&mut self, pixels: f32) {
         self.set_radius_pixels(pixels);
     }
@@ -1685,7 +1715,12 @@ fn button_bits(buttons: input::Buttons) -> u8 {
 }
 
 /// The camera a stroke was drawn through, as its record keeps it: `camera`'s eye, target, up and
-/// field of view, and `view`'s size.
+/// field of view (narrowed by its magnification), and `view`'s size.
+///
+/// The record holds no principal point: a stroke drawn through a view magnified off its centre
+/// (the magnified image shifted, `crate::camera`'s lens) is recorded as the view magnified about
+/// its centre, its rays a shift away from the ones it was drawn through. Its edits stay
+/// authoritative; the record's camera needs the lens's shift (a store change) to replay it.
 fn stroke_camera(camera: &Camera, view: &View) -> StrokeCamera {
     let triple = |v: crate::camera::Vec3| [v.x, v.y, v.z];
     let size = view.size();
@@ -1693,7 +1728,7 @@ fn stroke_camera(camera: &Camera, view: &View) -> StrokeCamera {
         eye: triple(camera.eye()),
         target: triple(camera.target()),
         up: triple(camera.axis(crate::camera::Vec3::new(0.0, 1.0, 0.0))),
-        fov_y: camera.fov_y(),
+        fov_y: camera.magnified_fov_y(),
         size: [size.width(), size.height()],
     }
 }

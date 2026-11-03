@@ -13,7 +13,12 @@
 //!
 //! A gesture is chosen when its button goes down and lasts until that button comes up, or the
 //! window loses focus (when the release may never come); modifiers changing meanwhile don't
-//! switch it. Only motion in a drag and the wheel ask for a frame. Input arrives as [`Input`], the
+//! switch it. Every gesture works about the camera's pivot ([`crate::camera`]): a drag started
+//! over the model makes the surface under the pointer the pivot as it starts
+//! ([`Navigator::drag_start`], which the frame loop picks under), one started over empty space
+//! keeps it; the wheel keeps it too. Orbit turns about the pivot, pan keeps the pivot's depth
+//! with the pointer, zoom scales the pivot's apparent distance, magnifying at the model's
+//! boundary. Only motion in a drag and the wheel ask for a frame. Input arrives as [`Input`], the
 //! window's events in our terms (the pen's through its stream, [`crate::pen`]), so the rules here
 //! are tested without a window. The pen's tip navigates only off the model: a stroke started on it
 //! is the brush's ([`crate::sculpting`]), unless a barrel button is held.
@@ -88,7 +93,8 @@ pub(crate) enum Gesture {
     Orbit,
     /// Moves the view in its plane.
     Pan,
-    /// Moves the eye towards the target or away.
+    /// Brings the pivot closer or sends it away: the eye moves along its line to it, and the
+    /// image magnifies once the eye is at the model's boundary.
     Zoom,
 }
 
@@ -103,10 +109,10 @@ struct Drag {
     last: Pixel,
 }
 
-/// How much one wheel notch scales the distance: 10 % closer per notch in.
+/// How much one wheel notch scales the pivot's apparent distance: 10 % closer per notch in.
 const NOTCH_ZOOM: f64 = 1.1;
-/// How much dragging one pixel scales the distance when zooming by drag: 100 pixels up is
-/// about 2.7× closer (`e`).
+/// How much dragging one pixel scales the pivot's apparent distance when zooming by drag: 100
+/// pixels up is about 2.7× closer (`e`).
 const DRAG_ZOOM_PER_PIXEL: f64 = 0.01;
 
 /// Turns pointer input into camera motion.
@@ -165,6 +171,25 @@ impl Navigator {
             Input::Press { .. } | Input::Release { .. } | Input::Modifiers(_) | Input::Cancel => {
                 false
             }
+        }
+    }
+
+    /// Where the drag `input` starts, if it starts one: a press of a button that makes a gesture,
+    /// with no drag in progress. The frame loop makes the surface under it the camera's pivot
+    /// before applying it ([`crate::frame`]); the press itself moves nothing.
+    pub(crate) const fn drag_start(&self, input: &Input) -> Option<Pixel> {
+        match *input {
+            Input::Press { button, at }
+                if self.drag.is_none() && self.gesture_for(button).is_some() =>
+            {
+                Some(at)
+            }
+            Input::Press { .. }
+            | Input::Release { .. }
+            | Input::Move { .. }
+            | Input::Wheel { .. }
+            | Input::Modifiers(_)
+            | Input::Cancel => None,
         }
     }
 
