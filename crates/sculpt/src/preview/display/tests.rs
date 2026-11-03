@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use geom::{Channel, FaceId, Level, TileKey, Vec3};
-use store::{DisplayPreview, TileStore};
+use store::{DisplayPreview, Project, SpatialIndex, TileStore};
 use stroke::Dab;
 
 use super::finest_place;
@@ -395,4 +395,120 @@ fn the_vertices_in_a_finest_tile_are_those_placed_in_it() {
             );
         }
     }
+}
+
+/// The finest vertex of `key`'s face farthest from what the display tile's record draws at its
+/// place, as `store` holds it: where a coarse tile's bound is tightest.
+fn worst_place(store: &mut TileStore, key: &TileKey) -> Vec3 {
+    let finest = store.display_finest().unwrap();
+    let record = store
+        .display_for_draw(&[*key])
+        .unwrap()
+        .pop()
+        .flatten()
+        .unwrap();
+    let quads = key.side() - 1;
+    let step = 1_u32 << (finest.get() - key.level().get());
+    let span = quads * step / 64;
+    let mut worst = (0.0_f64, Vec3::ZERO);
+    for fy in 0..span {
+        for fx in 0..span {
+            let (tx, ty) = (
+                u32::from(key.tx()) * span + fx,
+                u32::from(key.ty()) * span + fy,
+            );
+            let tile = TileKey::displacement(
+                key.face(),
+                finest,
+                u16::try_from(tx).unwrap(),
+                u16::try_from(ty).unwrap(),
+            )
+            .unwrap();
+            let positions = store.evaluate(tile).unwrap().to_vec();
+            for b in 0..=64 {
+                for a in 0..=64 {
+                    let f = positions[usize::try_from(b * 65 + a).unwrap()];
+                    let d = drawn_at(key, record.positions(), finest, tx * 64 + a, ty * 64 + b);
+                    let gap = (f64::from(f.x) - d[0])
+                        .hypot(f64::from(f.y) - d[1])
+                        .hypot(f64::from(f.z) - d[2]);
+                    if gap > worst.0 {
+                        worst = (gap, f);
+                    }
+                }
+            }
+        }
+    }
+    worst.1
+}
+
+/// Shows `dabs` on display tiles, applies and lands them, and asserts that every preview made
+/// (as shown) bounds the finest result.
+fn shown_then_landed(project: &mut Project, index: &mut SpatialIndex, dabs: &[Dab], what: &str) {
+    let mut stroke = Stroke::new(project.store());
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    preview
+        .show(project.store(), index, dabs, &display_only)
+        .unwrap();
+    let shown = previews(project.store());
+    apply_dabs(project.store(), index, &mut stroke, dabs).unwrap();
+    preview
+        .land(project.store(), index, dabs.len(), &display_only)
+        .unwrap();
+    let ratio = assert_bounds(project.store(), &shown, what);
+    eprintln!("{what}: largest error / bound {ratio:.3}");
+    preview.end_stroke(project.store()).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+}
+
+#[test]
+fn a_coarse_tile_counts_the_dabs_at_finest_vertices_bulging_past_its_own_box() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "bulge");
+    let coarse = TileKey::display(FaceId::new(0), Level::ZERO, 0, 0).unwrap();
+    let at = worst_place(project.store(), &coarse);
+    let dabs: Vec<Dab> = (0..8).map(|n| dab(at, 0.05, 0.02, 0.0, n)).collect();
+    shown_then_landed(&mut project, &mut index, &dabs, "bulging past level 0");
+    drop(project.close(false));
+}
+
+#[test]
+fn a_record_refreshed_mid_stroke_still_gives_its_preview_the_pen_down_surface() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "refreshed");
+    // Six strong dabs over one place, then the same six again: what the second six move was
+    // moved, and refreshed, already.
+    let key = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let at = crate::testing::vertex(project.store(), key, 50, 50);
+    let first: Vec<Dab> = (0..6).map(|n| dab(at, 0.15, 0.04, 0.0, n)).collect();
+    let rest: Vec<Dab> = first
+        .iter()
+        .map(|d| Dab {
+            seq: d.seq + 6,
+            ..*d
+        })
+        .collect();
+    let (first, rest) = (first.as_slice(), rest.as_slice());
+    let mut stroke = Stroke::new(project.store());
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    // Six dabs applied at once, then the refresh rebuilds the records over them.
+    apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
+    preview.note_applied(&index, first);
+    run_jobs(project.store());
+    // Six more shown, then landed: the previews are made over the rebuilt records.
+    preview
+        .show(project.store(), &index, rest, &display_only)
+        .unwrap();
+    let shown = previews(project.store());
+    apply_dabs(project.store(), &mut index, &mut stroke, rest).unwrap();
+    preview
+        .land(project.store(), &index, rest.len(), &display_only)
+        .unwrap();
+    let ratio = assert_bounds(project.store(), &shown, "over records rebuilt mid-stroke");
+    eprintln!("over records rebuilt mid-stroke: largest error / bound {ratio:.3}");
+    drop(project.close(false));
 }

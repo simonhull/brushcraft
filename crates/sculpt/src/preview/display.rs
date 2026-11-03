@@ -64,14 +64,19 @@
 //!   and that against the triangle's blend of the corners' moves (linear interpolation's error);
 //!   both moves lie in `[0, s]` along the dab's normal, so never more than `s`. A dab counts only
 //!   in the quads whose pen-down box, grown by `e₀` (where the finest vertices under the quad lie),
-//!   its sphere touches; the tile's bound takes the largest quad's sum. So the bound follows the
-//!   dabs over each place, not the stroke's length: a long stroke over a coarse tile adds only the
-//!   few dabs overlapping any one quad.
+//!   its sphere touches (cut into cells of a few finest quads for a coarse quad); the tile's bound
+//!   takes the largest cell's sum. Where `e₀` is far larger than the dabs (the coarsest levels),
+//!   every cell's grown box takes every dab near it, so the sum is capped by another bound of the
+//!   same part: `|M(F₀(u)) − Σλ M(P0(v))| ≤ |M(F₀(u))| + max |M(P0(v))| ≤ 2 max_p |M(p)|`, and
+//!   `|M(p)|` is at most the strengths of the dabs overlapping any one dab (every dab holding `p`
+//!   overlaps the one nearest it): local to the stroke, not its length.
 //! - `max |D(v) − G(v)|` is measured, in `f64`, over every vertex: the rebased vertices' store bits
 //!   against the sum, and every vertex's rounding.
-//! - `ε` is taken as `2⁻¹⁰` of the dabs' strengths: a correction is stored to within one step of
-//!   its tile's plane scale, at most `8 · |c| / 32767` (the tangential floor), `|c|` the stroke's
-//!   moves there.
+//! - `ε`, the finest work's rounding into its stored corrections, lands on every vertex of a finest
+//!   tile the stroke writes (a plane's scale that grows re-rounds every interior value), quads no
+//!   dab touches included: it is bounded per finest tile the stroke's dabs reach by its planes'
+//!   final steps, from their scales now and the dabs' strengths over it ([`rounding_bound`]), the
+//!   largest of them under the tile counting everywhere on it.
 //!
 //! The sum is raised for its own rounding as the stand-ins' is (`render`'s stand-in notes,
 //! "Rounding"): times `1 + 2⁻¹⁹`, plus `2⁻¹⁷` of the largest coordinate. The cone is unknown (a
@@ -97,9 +102,25 @@ const SLACK: f64 = 1.0 + 1.0 / 524_288.0;
 /// What a bound is raised by per unit of the largest coordinate it read: `2⁻¹⁷`.
 const MAGNITUDE_SLACK: f64 = 1.0 / 131_072.0;
 
-/// The finest work's own rounding, per unit of a dab's strength: `2⁻¹⁰` (module notes, "The
-/// bound").
-const STORED_ROUNDING: f64 = 1.0 / 1024.0;
+/// A quad of a display tile's pen-down tile, as its bound reads it (module notes, "The bound").
+///
+/// Its finest vertices lie within `e₀` of its two triangles, so a dab counts at one only if its
+/// sphere touches the triangles' part over the vertex, grown by `e₀`, or holds a corner (the
+/// interpolation blends the corners' moves). A coarse quad spans many finest tiles: it is cut
+/// into cells of [`CELL_FINEST_QUADS`] finest quads a side, and a dab counts in the cells it
+/// touches, so a long stroke across a coarse quad adds, at any place, only the dabs over that
+/// place (and those holding a corner of the quad).
+#[derive(Debug)]
+struct Quad {
+    /// Its pen-down corners: `(i, j)`, `(i+1, j)`, `(i, j+1)`, `(i+1, j+1)`.
+    corners: [Vec3; 4],
+    /// Half the square of the longest edge of its two triangles, `h² / 2`.
+    half_edge_squared: f64,
+    /// Its cells' boxes, each grown by `e₀`; the cells' terms are `terms[first..first + len]`.
+    cells: Vec<Option<Aabb>>,
+    /// Where its cells' terms start in [`DisplayState::terms`].
+    first: usize,
+}
 
 /// One display tile's preview as the brush keeps it while its stroke lasts (see the module
 /// notes).
@@ -125,14 +146,13 @@ pub(super) struct DisplayState {
     ideal: Vec<[f64; 3]>,
     /// The record's roughness.
     roughness: Vec<u8>,
-    /// The box of the pen-down positions.
+    /// The box of every cell's ([`Quad::cells`]) and corner: where a dab can count at all.
     bounds: Option<Aabb>,
     /// `e₀`, the pen-down tile's bound.
     pen_down_bound: f64,
-    /// Per quad, row-major, the box of its pen-down corners grown by `e₀` and half the square of
-    /// its longest pen-down edge (`h² / 2`): where a dab counts in its bound, and how much.
-    quads: Vec<(Option<Aabb>, f64)>,
-    /// Per quad, the dabs' terms of the bound, summed.
+    /// Its quads, row-major: where a dab counts in its bound, and how much.
+    quads: Vec<Quad>,
+    /// Per cell of every quad, in their order, the dabs' terms of the bound, summed.
     terms: Vec<f64>,
     /// Whether it was last handed to the store held.
     pub(super) published_held: Option<bool>,
@@ -202,9 +222,8 @@ fn vertices_in(key: &TileKey, finest: Level, tile: &TileKey) -> Vec<(usize, u32,
     out
 }
 
-/// The finest tiles under display tile `key`, at `finest`: what the tests walk.
-#[cfg(test)]
-fn finest_under(key: &TileKey, finest: Level) -> Vec<TileKey> {
+/// The finest tiles under display tile `key`, at `finest`.
+pub(super) fn finest_under(key: &TileKey, finest: Level) -> Vec<TileKey> {
     let quads = key.side() - 1;
     let step = 1_u32 << (finest.get() - key.level().get());
     let span = (quads * step / finest.tile_quads().max(1)).max(1);
@@ -240,7 +259,29 @@ fn term(dab: &Imprint, e0: f64, half_h2: f64) -> f64 {
     let share = (steep * e0 + curve * half_h2).min(1.0);
     // A NaN share (an infinite slope times a zero bound) is the whole move.
     let share = if share.is_nan() { 1.0 } else { share };
-    s * share + s * STORED_ROUNDING
+    s * share
+}
+
+/// How far the finest work's rounding can move a vertex of a finest tile whose correction scales
+/// are `scales` (`(t, b, n)`) now, once dabs of strengths summing to `strength` land on it.
+///
+/// A plane holds every interior value within one final step of its exact value, however often
+/// it grew (geom's `fitted_scale`). The dabs move a vertex's correction by at most `strength`
+/// along any axis of its (orthonormal) frame, so each plane ends at most `2 (s · 32767 +
+/// strength) / 32767` (grown by doubling to hold its largest value), the tangential planes at
+/// least 8 times the normal one's; a vertex is within the three final steps' length.
+pub(super) fn rounding_bound(scales: [f32; 3], strength: f64) -> f64 {
+    const STEPS: f64 = 32_767.0;
+    let grown = |scale: f32| {
+        let scale = f64::from(scale);
+        scale.max(2.0 * scale.mul_add(STEPS, strength) / STEPS)
+    };
+    let [t, b, n] = scales;
+    let normal = grown(n);
+    let (tangent, bitangent) = (grown(t).max(8.0 * normal), grown(b).max(8.0 * normal));
+    tangent
+        .mul_add(tangent, bitangent.mul_add(bitangent, normal * normal))
+        .sqrt()
 }
 
 /// `v` as `f64` components.
@@ -359,15 +400,18 @@ impl DisplayState {
             });
             inputs.push((tile, recorded_bound, displacement));
         }
-        // A finest tile whose block reads one the stroke changed changed since pen-down, so since
-        // every record above it: it is among the tiles changed, the only ones looked at.
-        for tile_key in &changed {
-            let read = store.normal_inputs(tile_key)?;
-            if read
-                .iter()
-                .any(|input| store.pen_down_shape(input).is_some())
-            {
-                at_pen_down.insert(*tile_key);
+        // The finest tiles whose blocks read one the stroke changed: their pen-down bits are its
+        // pen-down blocks', whatever their records hold now (one rebuilt mid-stroke holds bits the
+        // stroke moved). The readers of a changed tile are among its normal inputs, as
+        // neighbourhood goes both ways.
+        let wanted: BTreeSet<TileKey> = keys.iter().copied().collect();
+        let changed_by_stroke: Vec<TileKey> = store.pen_down_keys().copied().collect();
+        for tile_key in changed_by_stroke {
+            for reader in store.normal_inputs(&tile_key)?.iter() {
+                let mut above = super::display_ancestors(reader);
+                if above.any(|ancestor| wanted.contains(&ancestor)) {
+                    at_pen_down.insert(*reader);
+                }
             }
         }
         let mut blocks = Blocks::default();
@@ -426,11 +470,18 @@ impl DisplayState {
         };
         let Replaced { base, p0, .. } = made;
         let frames: Vec<[Vec3; 2]> = n0.iter().copied().map(frame_of).collect();
-        let quads = quads_of(&p0, side, pen_down_bound);
+        let per_side = cells_per_side(&key, finest_level);
+        let quads = quads_of(&p0, side, pen_down_bound, per_side);
+        let cells = quads.iter().map(|quad| quad.cells.len()).sum();
         let ideal: Vec<[f64; 3]> = p0.iter().copied().map(wide).collect();
+        let reach = quads.iter().flat_map(|quad| {
+            let corners = quad.corners.iter().map(|&corner| point_box(corner));
+            quad.cells.iter().copied().chain(corners)
+        });
+        let bounds = reach.flatten().reduce(Aabb::union);
         let mut state = Self {
             key,
-            bounds: bounds_of_points(&p0),
+            bounds,
             turn: vec![[Vec3::ZERO; 2]; p0.len()],
             normals: n0.clone(),
             turned: vec![false; p0.len()],
@@ -441,7 +492,7 @@ impl DisplayState {
             ideal,
             roughness: tile.roughness().to_vec(),
             pen_down_bound,
-            terms: vec![0.0; quads.len()],
+            terms: vec![0.0; cells],
             quads,
             published_held: None,
         };
@@ -465,9 +516,20 @@ impl DisplayState {
             return false;
         }
         let e0 = self.pen_down_bound;
-        for ((bounds, half_h2), sum) in self.quads.iter().zip(&mut self.terms) {
-            if touches(bounds.as_ref(), dab) {
-                *sum += term(dab, e0, *half_h2);
+        for quad in &self.quads {
+            let at_corner = quad
+                .corners
+                .iter()
+                .any(|&corner| touches(point_box(corner).as_ref(), dab));
+            let share = term(dab, e0, quad.half_edge_squared);
+            let terms = self
+                .terms
+                .get_mut(quad.first..quad.first + quad.cells.len())
+                .unwrap_or_default();
+            for (cell, sum) in quad.cells.iter().zip(terms) {
+                if at_corner || touches(cell.as_ref(), dab) {
+                    *sum += share;
+                }
             }
         }
         let mut moved = false;
@@ -548,7 +610,7 @@ impl DisplayState {
 
     /// The preview to hand the store: what is drawn, its normals and bound (module notes),
     /// `held` as given.
-    pub(super) fn publish(&mut self, held: bool) -> DisplayPreview {
+    pub(super) fn publish(&mut self, held: bool, rounding: f64, moves_cap: f64) -> DisplayPreview {
         // The normals of the vertices a dab turned since the last, made again.
         let vertices = self
             .normals
@@ -569,8 +631,15 @@ impl DisplayState {
             largest = largest.max(d[0].abs().max(d[1].abs()).max(d[2].abs()));
         }
         let deviation = deviation_squared.sqrt();
-        let terms = self.terms.iter().copied().fold(0.0, f64::max);
-        let sum = (self.pen_down_bound + terms + deviation) * SLACK + largest * MAGNITUDE_SLACK;
+        // The moves' part: the per-cell sums, or twice the most any place moves, the smaller.
+        let terms = self
+            .terms
+            .iter()
+            .copied()
+            .fold(0.0, f64::max)
+            .min(moves_cap);
+        let sum = (self.pen_down_bound + terms + rounding + deviation) * SLACK
+            + largest * MAGNITUDE_SLACK;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "rounded up to the next f32 below, so still a bound; past f32's range it \
@@ -798,11 +867,40 @@ fn grown(bounds: &Aabb, by: f32) -> Option<Aabb> {
     Aabb::new(low, high)
 }
 
-/// Per quad of a tile over `positions` (`side²`, row-major), row-major: its box and half edge.
+/// The box of `point` alone; `None` for a point not finite.
+fn point_box(point: Vec3) -> Option<Aabb> {
+    Aabb::from_points([point])
+}
+
+/// The finest quads a side of a cell of a coarse quad's bound ([`Quad`]): eight, smaller than a
+/// big brush's dab on the screen, so a cell counts about the dabs overlapping one place.
+const CELL_FINEST_QUADS: u32 = 8;
+
+/// How many cells a side each quad of display tile `key` is cut into for its bound: of
+/// [`CELL_FINEST_QUADS`] finest quads each ([`Quad`]), at least one, at most 64.
+fn cells_per_side(key: &TileKey, finest: Level) -> usize {
+    let step = 1_u32 << (finest.get() - key.level().get());
+    let cells = (step / CELL_FINEST_QUADS).clamp(1, 64);
+    usize::try_from(cells).unwrap_or(1)
+}
+
+/// The point at fractions `(fx, fy)` of a quad with corners `[c00, c10, c01, c11]`, on its two
+/// triangles (split along `(i, j)`–`(i+1, j+1)`, as every level is drawn).
+fn on_quad([c00, c10, c01, c11]: [Vec3; 4], fx: f32, fy: f32) -> Vec3 {
+    if fx >= fy {
+        c00 + (c10 - c00) * fx + (c11 - c10) * fy
+    } else {
+        c00 + (c01 - c00) * fy + (c11 - c01) * fx
+    }
+}
+
+/// The quads of a tile over `positions` (`side²`, row-major), row-major, each cut into `per_side`²
+/// cells whose boxes are grown by `grow` ([`Quad`]).
 ///
-/// The box of its corners grown by `grow`, and half the square of the longest edge of its two
-/// triangles (its four edges and its `(i, j)`–`(i+1, j+1)` diagonal).
-fn quads_of(positions: &[Vec3], side: usize, grow: f64) -> Vec<(Option<Aabb>, f64)> {
+/// A cell's box holds its part of the quad's triangles: the images of its corners, and of where
+/// the diagonal crosses it, every map from fractions to the triangles being linear on each side
+/// of the diagonal; then grown, its rounding outward.
+fn quads_of(positions: &[Vec3], side: usize, grow: f64, per_side: usize) -> Vec<Quad> {
     let at = |i: usize, j: usize| positions.get(j * side + i).copied();
     let quads = side.saturating_sub(1);
     #[expect(
@@ -810,14 +908,23 @@ fn quads_of(positions: &[Vec3], side: usize, grow: f64) -> Vec<(Option<Aabb>, f6
         reason = "a bound in world units, rounded up past f32's rounding by next_up"
     )]
     let grow = (grow as f32).next_up();
-    let cells = (0..quads).flat_map(|j| (0..quads).map(move |i| (i, j)));
-    cells
+    #[expect(clippy::cast_precision_loss, reason = "at most 64 cells a side")]
+    let fraction = |k: usize| k as f32 / per_side as f32;
+    let mut first = 0;
+    let places = (0..quads).flat_map(|j| (0..quads).map(move |i| (i, j)));
+    places
         .map(|(i, j)| {
             let (Some(c00), Some(c10), Some(c01), Some(c11)) =
                 (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1))
             else {
-                return (None, 0.0);
+                return Quad {
+                    corners: [Vec3::ZERO; 4],
+                    half_edge_squared: 0.0,
+                    cells: Vec::new(),
+                    first,
+                };
             };
+            let corners = [c00, c10, c01, c11];
             let edges = [(c00, c10), (c00, c01), (c00, c11), (c10, c11), (c01, c11)];
             let longest = edges
                 .iter()
@@ -826,9 +933,34 @@ fn quads_of(positions: &[Vec3], side: usize, grow: f64) -> Vec<(Option<Aabb>, f6
                     f64::from(edge.dot(edge))
                 })
                 .fold(0.0, f64::max);
-            let corners = [c00, c10, c01, c11];
-            let bounds = bounds_of_points(&corners).and_then(|corners| grown(&corners, grow));
-            (bounds, 0.5 * longest)
+            let grid = (0..per_side).flat_map(|b| (0..per_side).map(move |a| (a, b)));
+            let cells: Vec<Option<Aabb>> = grid
+                .map(|(a, b)| {
+                    let (x0, x1, y0, y1) =
+                        (fraction(a), fraction(a + 1), fraction(b), fraction(b + 1));
+                    let mut points = vec![
+                        on_quad(corners, x0, y0),
+                        on_quad(corners, x1, y0),
+                        on_quad(corners, x0, y1),
+                        on_quad(corners, x1, y1),
+                    ];
+                    // Where the diagonal fx = fy crosses the cell.
+                    let (low, high) = (x0.max(y0), x1.min(y1));
+                    if low <= high {
+                        points.push(on_quad(corners, low, low));
+                        points.push(on_quad(corners, high, high));
+                    }
+                    bounds_of_points(&points).and_then(|cell| grown(&cell, grow))
+                })
+                .collect();
+            let quad = Quad {
+                corners,
+                half_edge_squared: 0.5 * longest,
+                first,
+                cells,
+            };
+            first += quad.cells.len();
+            quad
         })
         .collect()
 }

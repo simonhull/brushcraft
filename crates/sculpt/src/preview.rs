@@ -215,6 +215,12 @@ pub struct Preview {
     held: BTreeMap<TileKey, usize>,
     /// The display tiles previewed in this stroke.
     displays: BTreeMap<TileKey, DisplayState>,
+    /// Per finest tile a dab of the stroke reaches, the dabs' strengths summed: how far the
+    /// stroke can grow the tile's quantization scales, for the display previews' bounds.
+    strengths: BTreeMap<TileKey, f64>,
+    /// Per dab of `stroke`, in order, the strengths of the stroke's dabs overlapping it (itself
+    /// included): no place moves farther than the largest.
+    overlaps: Vec<f64>,
 }
 
 /// Which tiles a renderer holds or wants: those a [`Preview`] makes previews of.
@@ -303,9 +309,10 @@ impl Preview {
     /// by the index are held in the store.
     fn note_shown(&mut self, store: &mut TileStore, index: &SpatialIndex, dabs: &[Imprint]) {
         for dab in dabs {
-            self.stroke.push(*dab);
+            self.push_stroke(*dab);
             let reached: Vec<TileKey> = index.query_sphere(centre(dab), reach(dab)).collect();
             for key in &reached {
+                *self.strengths.entry(*key).or_insert(0.0) += f64::from(dab.strength.abs());
                 let count = self.held.entry(*key).or_insert(0);
                 if *count == 0 {
                     store.hold_preview(*key);
@@ -320,10 +327,61 @@ impl Preview {
     /// they join the stroke's dabs, which every display preview made later takes for its normals
     /// and bound. The display previews of the stroke so far are let go (none is held, nothing
     /// being shown): one made again reads the store as the dabs left it.
-    pub fn note_applied(&mut self, dabs: &[Dab]) {
-        let imprints = dabs.iter().filter_map(|dab| imprint_of(dab).ok());
-        self.stroke.extend(imprints);
+    pub fn note_applied(&mut self, index: &SpatialIndex, dabs: &[Dab]) {
+        let imprints: Vec<Imprint> = dabs.iter().filter_map(|dab| imprint_of(dab).ok()).collect();
+        for dab in &imprints {
+            for key in index.query_sphere(centre(dab), reach(dab)) {
+                *self.strengths.entry(key).or_insert(0.0) += f64::from(dab.strength.abs());
+            }
+        }
+        for dab in imprints {
+            self.push_stroke(dab);
+        }
         self.displays.clear();
+    }
+
+    /// Adds `dab` to the stroke's dabs, and its strength to the overlaps of those it overlaps.
+    fn push_stroke(&mut self, dab: Imprint) {
+        let strength = f64::from(dab.strength.abs());
+        let mut own = strength;
+        for (other, overlap) in self.stroke.iter().zip(&mut self.overlaps) {
+            let apart = centre(other) - centre(&dab);
+            let reach = f64::from(reach(other)) + f64::from(reach(&dab));
+            if f64::from(apart.dot(apart)) < reach * reach {
+                *overlap += strength;
+                own += f64::from(other.strength.abs());
+            }
+        }
+        self.stroke.push(dab);
+        self.overlaps.push(own);
+    }
+
+    /// Twice the farthest the stroke's dabs move any place: what the moves' part of a display
+    /// preview's bound is capped by (the `display` module's "The bound").
+    fn moves_cap(&self) -> f64 {
+        2.0 * self.overlaps.iter().copied().fold(0.0, f64::max)
+    }
+
+    /// How far the finest work's rounding can move a finest vertex under display tile `key`,
+    /// once every dab of the stroke has landed: the largest of its finest tiles' bounds
+    /// ([`display::rounding_bound`]), over the tiles a dab of the stroke reaches (the others keep
+    /// their stored bits).
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a correction tile can't be read.
+    fn rounding(&self, store: &mut TileStore, key: &TileKey) -> Result<f64, SculptError> {
+        let Some(finest) = store.display_finest() else {
+            return Ok(0.0);
+        };
+        let mut most = 0.0_f64;
+        for tile in display::finest_under(key, finest) {
+            if let Some(&strength) = self.strengths.get(&tile) {
+                let scales = store.correction(tile)?.scales();
+                most = most.max(display::rounding_bound(scales, strength));
+            }
+        }
+        Ok(most)
     }
 
     /// Ends the stroke: every dab of it has landed (or was dropped). The display previews are
@@ -350,11 +408,16 @@ impl Preview {
         for mut state in std::mem::take(&mut self.displays).into_values() {
             if state.published_held == Some(true) {
                 let key = *state.key();
-                let set = store.set_display_preview(key, state.publish(false));
+                let cap = self.moves_cap();
+                let set = self.rounding(store, &key).and_then(|rounding| {
+                    Ok(store.set_display_preview(key, state.publish(false, rounding, cap))?)
+                });
                 published = published.and(set);
             }
         }
         self.stroke.clear();
+        self.overlaps.clear();
+        self.strengths.clear();
         let closed = store.close_preview_epoch();
         published?;
         closed?;
@@ -483,18 +546,26 @@ impl Preview {
         keys: &[TileKey],
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
-        let wanted: BTreeSet<&TileKey> = keys.iter().collect();
-        let mut publishing: Vec<(bool, &mut DisplayState)> = self
+        let mut rounding: BTreeMap<TileKey, f64> = BTreeMap::new();
+        for key in keys {
+            if self.displays.contains_key(key) {
+                rounding.insert(*key, self.rounding(store, key)?);
+            }
+        }
+        let cap = self.moves_cap();
+        let mut publishing: Vec<(bool, f64, &mut DisplayState)> = self
             .displays
             .iter_mut()
-            .filter(|(key, _)| wanted.contains(key))
-            .map(|(key, state)| (store.preview_held(key), state))
+            .filter_map(|(key, state)| {
+                let rounds = rounding.get(key)?;
+                Some((store.preview_held(key), *rounds, state))
+            })
             .collect();
         // Made on the workers, handed over in order.
         let made: Vec<(TileKey, bool, DisplayPreview)> =
-            store.par_map_mut(&mut publishing, |(held, state)| {
+            store.par_map_mut(&mut publishing, |(held, rounds, state)| {
                 state.published_held = Some(*held);
-                (*state.key(), *held, state.publish(*held))
+                (*state.key(), *held, state.publish(*held, *rounds, cap))
             });
         for (key, _, preview) in made {
             store.set_display_preview(key, preview)?;

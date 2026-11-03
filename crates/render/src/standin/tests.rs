@@ -867,16 +867,17 @@ fn a_long_previewed_stroke_keeps_every_drawn_bound_true_and_flat_frame_by_frame_
         let mut index = store::SpatialIndex::build(store, finest, |_, _| {}).expect("an index");
         let grids = finest_grids(store, &mesh);
         let n = finest.face_quads();
-        // A long stroke across face 2, a dab a frame, landing three frames behind.
-        let dabs: Vec<stroke::Dab> = (0..18_u32)
+        // A long stroke across face 2, a dab a frame, landing three frames behind: long enough
+        // that the coarsest tiles' bounds reach the stroke's local cap and stay there.
+        let dabs: Vec<stroke::Dab> = (0..48_u32)
             .map(|k| {
-                let (i, j) = (n / 8 + k * n / 24, n / 2);
+                let (i, j) = (n / 8 + k * n / 64, n / 2);
                 let p = grids[&2][usize::try_from(j * (n + 1) + i).expect("small")];
                 let length = p.dot(p).sqrt();
                 stroke::Dab {
                     position: [p.x, p.y, p.z],
                     normal: [p.x / length, p.y / length, p.z / length],
-                    radius: 0.1,
+                    radius: 0.05,
                     strength: 0.01,
                     seq: k,
                     ..stroke::Dab::default()
@@ -934,20 +935,17 @@ fn a_long_previewed_stroke_keeps_every_drawn_bound_true_and_flat_frame_by_frame_
         // Released tiles stand in for the steps after their release, as any data would.
         eprintln!("the previewed tiles' largest bound, frame by frame: {largest:?}");
         eprintln!("every tile's largest bound, with its level: {every:?}");
-        let (first, last) = (
-            every.first().expect("frames").1,
-            every.last().expect("frames").1,
-        );
-        assert!(
-            last <= 1.5 * first,
-            "no level compounds, level 0 included: {every:?}"
-        );
-        let early = largest.get(5).copied().expect("frames");
-        let late = largest.last().copied().expect("frames");
-        assert!(
-            late <= 1.5 * early,
-            "the bounds follow the dabs over each place, not the frames: {largest:?}"
-        );
+        // Once the stroke is longer than the dabs reach, the bound follows the dabs over each
+        // place (and, at the coarsest levels, the stroke's local cap), not the stroke's length.
+        let at = |frames: &[(Level, f32)], k: usize| frames.get(k).map_or(0.0, |&(_, bound)| bound);
+        let previewed: Vec<(Level, f32)> = largest.iter().map(|&b| (Level::ZERO, b)).collect();
+        for (what, frames) in [("previewed", &previewed), ("every", &every)] {
+            let (two_thirds, last) = (at(frames, 32), at(frames, frames.len() - 1));
+            assert!(
+                last <= two_thirds * 1.02,
+                "{what}: the bound flat over the stroke's last third: {two_thirds} → {last}"
+            );
+        }
         project.store().unsubscribe_stale(cursor);
         drop(project.close(false));
     });

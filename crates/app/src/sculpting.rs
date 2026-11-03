@@ -1260,7 +1260,7 @@ impl Sculpting {
                     && !direct.is_empty()
                 {
                     // Applied at once: the stroke's later previews count them.
-                    preview.note_applied(&direct);
+                    preview.note_applied(scene.index, &direct);
                 }
             }
             Err(error) => {
