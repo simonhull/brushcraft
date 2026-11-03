@@ -278,30 +278,13 @@ impl Picker {
     /// their box, out to the farthest corner of any (in the camera's `f64`); `None` for an empty
     /// index. What the camera's boundary is fitted around ([`crate::camera::Boundary`]).
     ///
-    /// A pass over every tile's box: 153,600 on the benchmark project, a fraction of a
-    /// millisecond. The frame loop takes it at open, on F, and once after the brush's edits,
-    /// between strokes.
+    /// A pass over every tile's box ([`store::Bvh::bounding_sphere`]): 0.4 ms on the benchmark
+    /// project's 153,600, 25 µs on 9,600 (`store`'s `index` bench). The frame loop takes it at
+    /// open, on F, and after the brush's edits, off the pen's path
+    /// ([`crate::frame::Owner::fit_boundary`]).
     pub(crate) fn model_sphere(&self) -> Option<(camera::Vec3, f64)> {
-        let bvh = self.index.bvh();
-        let wide =
-            |v: geom::Vec3| camera::Vec3::new(f64::from(v.x), f64::from(v.y), f64::from(v.z));
-        let whole = bvh.aabb()?;
-        let centre = wide(whole.centroid());
-        let farthest = |(_, bounds): &(TileKey, store::TileBounds)| {
-            let (low, high) = (
-                wide(bounds.aabb.min()) - centre,
-                wide(bounds.aabb.max()) - centre,
-            );
-            let reach = |a: f64, b: f64| a.abs().max(b.abs());
-            let corner = camera::Vec3::new(
-                reach(low.x, high.x),
-                reach(low.y, high.y),
-                reach(low.z, high.z),
-            );
-            corner.length()
-        };
-        let radius = bvh.iter().map(farthest).fold(0.0, f64::max);
-        Some((centre, radius))
+        let ([x, y, z], radius) = self.index.bvh().bounding_sphere()?;
+        Some((camera::Vec3::new(x, y, z), radius))
     }
 
     /// The surface moved (the brush edited it): the next [`Picker::update`] picks again, even

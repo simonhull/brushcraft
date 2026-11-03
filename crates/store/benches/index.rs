@@ -2,6 +2,9 @@
 //!
 //! - [`bvh_build_153600`]: the tree alone over the benchmark sphere's 153,600 level-9 tiles, from
 //!   bounds already known (worked out analytically, see [`sphere_tiles`]).
+//! - [`bounding_sphere_153600`] and [`bounding_sphere_9600`]: the sphere holding every tile's box
+//!   over the same tiles (and a medium project's share of them), what the app's camera fits its
+//!   boundary around after a stroke (`Bvh::bounding_sphere`).
 //! - [`spatial_index_build`]: the whole build through a store, evaluating every tile of a level
 //!   from a cold cache (positions and normals) and building the tree over them: a 96-face sphere at
 //!   level 8, 1,536 tiles.
@@ -106,6 +109,31 @@ fn bvh_build_153600(bencher: divan::Bencher<'_, '_>) {
     bencher
         .with_inputs(|| tiles.clone())
         .bench_local_values(|tiles| Bvh::build(tiles).expect("build"));
+}
+
+/// [`Bvh::bounding_sphere`] over the benchmark sphere's 153,600 level-9 tiles: the pass the app
+/// makes after a stroke has landed, to grow its camera's boundary.
+///
+/// # Panics
+///
+/// Never: the tiles are distinct.
+#[divan::bench(sample_count = 50)]
+fn bounding_sphere_153600(bencher: divan::Bencher<'_, '_>) {
+    let bvh = Bvh::build(sphere_tiles()).expect("build");
+    bencher.bench_local(|| divan::black_box(&bvh).bounding_sphere());
+}
+
+/// [`Bvh::bounding_sphere`] over a medium project's 9,600 tiles: the benchmark sphere's first
+/// sixteenth, about a 2,400-face model's level-7 tiles.
+///
+/// # Panics
+///
+/// Never: the tiles are distinct.
+#[divan::bench(sample_count = 50)]
+fn bounding_sphere_9600(bencher: divan::Bencher<'_, '_>) {
+    let tiles: Vec<(TileKey, TileBounds)> = sphere_tiles().into_iter().take(9_600).collect();
+    let bvh = Bvh::build(tiles).expect("build");
+    bencher.bench_local(|| divan::black_box(&bvh).bounding_sphere());
 }
 
 /// A store over a fresh, empty working file in its own temporary directory, removed on drop.

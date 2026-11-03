@@ -507,6 +507,30 @@ impl Bvh {
         self.nodes.first().map(|root| root.aabb)
     }
 
+    /// The sphere holding every tile's box, in `f64`: about the centre of the box of them all
+    /// ([`Bvh::aabb`]), out to the farthest corner of any tile's box. `None` for an empty tree.
+    ///
+    /// A pass over every tile: the app's camera keeps its eye out of a boundary fitted around it
+    /// (`app::camera`). On the benchmark sphere's 153,600 tiles, see `benches/index.rs`.
+    #[must_use]
+    pub fn bounding_sphere(&self) -> Option<([f64; 3], f64)> {
+        let wide = |v: Vec3| [f64::from(v.x), f64::from(v.y), f64::from(v.z)];
+        let centre = wide(self.aabb()?.centroid());
+        let farthest = |(_, bounds): &(TileKey, TileBounds)| {
+            let (low, high) = (wide(bounds.aabb.min()), wide(bounds.aabb.max()));
+            let axes = low.iter().zip(&high).zip(&centre);
+            let squared: f64 = axes
+                .map(|((from, to), middle)| {
+                    let reach = (from - middle).abs().max((to - middle).abs());
+                    reach * reach
+                })
+                .sum();
+            squared.sqrt()
+        };
+        let radius = self.items.iter().map(farthest).fold(0.0, f64::max);
+        Some((centre, radius))
+    }
+
     /// `key`'s bounds, as last built or refitted; `None` if the tree doesn't hold it.
     #[must_use]
     pub fn bounds(&self, key: &TileKey) -> Option<&TileBounds> {
