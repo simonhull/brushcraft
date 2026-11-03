@@ -1734,7 +1734,7 @@ fn button_bits(buttons: input::Buttons) -> u8 {
 /// The camera a stroke was drawn through, as its record keeps it.
 ///
 /// `camera`'s eye, target, up, unmagnified field of view and lens (its magnification and the
-/// image's shift), and `view`'s size. [`recorded_view`] rebuilds the view from it.
+/// image's shift), and `view`'s size. `recorded_view` (in tests) rebuilds the view from it.
 fn stroke_camera(camera: &Camera, view: &View) -> StrokeCamera {
     let triple = |v: crate::camera::Vec3| [v.x, v.y, v.z];
     let size = view.size();
