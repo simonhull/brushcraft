@@ -68,6 +68,10 @@ pub(crate) struct Previews {
     above: BTreeMap<TileKey, usize>,
     /// The tiles whose previews were set or cleared since the last preview epoch.
     changed: BTreeSet<TileKey>,
+    /// The bytes the display previews hold.
+    display_bytes: usize,
+    /// The bytes a brush keeps to make its previews ([`TileStore::note_preview_state_bytes`]).
+    state_bytes: usize,
 }
 
 /// A display tile's preview: the vertices a renderer draws for it while a brush's dabs are shown
@@ -90,6 +94,16 @@ pub struct DisplayPreview {
     /// brush (no stand-in of its own over it), which makes it again as they land. Once released,
     /// its positions are the store's surface, and a renderer treats it as any data it read.
     pub held: bool,
+}
+
+impl DisplayPreview {
+    /// The bytes it holds.
+    fn bytes(&self) -> usize {
+        size_of::<Self>()
+            + size_of_val(self.positions.as_slice())
+            + size_of_val(self.normals.as_slice())
+            + size_of_val(self.roughness.as_slice())
+    }
 }
 
 /// A previewed tile: its block, taken out while its brush moves it.
@@ -250,9 +264,25 @@ impl TileStore {
         {
             return Err(CacheError::NotItsBlock(key));
         }
-        self.previews.display.insert(key, preview);
-        self.previews.changed.insert(key);
+        let previews = &mut self.previews;
+        previews.display_bytes += preview.bytes();
+        if let Some(old) = previews.display.insert(key, preview) {
+            previews.display_bytes -= old.bytes();
+        }
+        previews.changed.insert(key);
         Ok(())
+    }
+
+    /// The bytes the previews hold, counted with the stroke's pen-down data
+    /// ([`TileStore::pen_down_bytes`]): the display previews, and what a brush keeps to make them.
+    pub(super) const fn display_preview_bytes(&self) -> usize {
+        self.previews.display_bytes + self.previews.state_bytes
+    }
+
+    /// Notes `bytes`, what a brush keeps to make its previews (each display tile's pen-down tile,
+    /// moves and terms), to be counted in the store's budget with the pen-down data.
+    pub fn note_preview_state_bytes(&mut self, bytes: usize) {
+        self.previews.state_bytes = bytes;
     }
 
     /// Display tile `key`'s preview, if it has one: what a renderer is to draw for it.
@@ -264,7 +294,8 @@ impl TileStore {
     /// Clears display tile `key`'s preview, if it has one: a renderer draws its record again.
     /// Noted for the next preview epoch.
     pub fn clear_display_preview(&mut self, key: &TileKey) {
-        if self.previews.display.remove(key).is_some() {
+        if let Some(old) = self.previews.display.remove(key) {
+            self.previews.display_bytes -= old.bytes();
             self.previews.changed.insert(*key);
         }
     }
@@ -276,7 +307,9 @@ impl TileStore {
 
     /// Drops display tile `key`'s preview as the refresh records the tile: its own epoch names it.
     pub(super) fn refreshed_preview(&mut self, key: &TileKey) {
-        self.previews.display.remove(key);
+        if let Some(old) = self.previews.display.remove(key) {
+            self.previews.display_bytes -= old.bytes();
+        }
     }
 
     /// Finest tile `key`'s preview, if it has one: its positions with the ring as a renderer is

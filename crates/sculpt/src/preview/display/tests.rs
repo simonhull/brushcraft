@@ -494,7 +494,7 @@ fn a_record_refreshed_mid_stroke_still_gives_its_preview_the_pen_down_surface() 
     project.begin_stroke().unwrap();
     // Six dabs applied at once, then the refresh rebuilds the records over them.
     apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
-    preview.note_applied(&index, first);
+    preview.note_applied(project.store(), &index, first);
     run_jobs(project.store());
     // Six more shown, then landed: the previews are made over the rebuilt records.
     preview
@@ -587,5 +587,40 @@ fn a_preview_that_moved_nothing_over_an_unchanged_tile_is_gone_with_its_stroke()
             "{key:?}: a preview outliving its stroke is over a tile the refresh will rebuild"
         );
     }
+    drop(project.close(false));
+}
+
+#[test]
+fn display_previews_are_counted_with_the_pen_down_data_and_go_with_it() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "bytes");
+    let dabs = path(project.store(), 6);
+    let before = project.store().pen_down_bytes();
+    let mut stroke = Stroke::new(project.store());
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    preview
+        .show(project.store(), &index, &dabs, &display_only)
+        .unwrap();
+    let shown = previews(project.store());
+    let vertices: usize = shown.values().map(|p| p.positions.len()).sum();
+    let counted = project.store().pen_down_bytes() - before;
+    assert!(
+        counted > vertices * 25,
+        "{counted} bytes counted for {vertices} vertices: the previews and what makes them"
+    );
+    apply_dabs(project.store(), &mut index, &mut stroke, &dabs).unwrap();
+    preview
+        .land(project.store(), &index, dabs.len(), &display_only)
+        .unwrap();
+    preview.end_stroke(project.store()).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    run_jobs(project.store());
+    assert_eq!(
+        project.store().pen_down_bytes(),
+        0,
+        "refreshed: nothing kept"
+    );
     drop(project.close(false));
 }

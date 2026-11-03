@@ -299,6 +299,7 @@ impl Preview {
             let displays = self.show_displays(store, &imprints, drawn, &mut stats);
             shown = shown.and(displays);
         }
+        self.note_bytes(store);
         let closed = store.close_preview_epoch();
         shown?;
         closed?;
@@ -327,7 +328,7 @@ impl Preview {
     /// they join the stroke's dabs, which every display preview made later takes for its normals
     /// and bound. The display previews of the stroke so far are let go (none is held, nothing
     /// being shown): one made again reads the store as the dabs left it.
-    pub fn note_applied(&mut self, index: &SpatialIndex, dabs: &[Dab]) {
+    pub fn note_applied(&mut self, store: &mut TileStore, index: &SpatialIndex, dabs: &[Dab]) {
         let imprints: Vec<Imprint> = dabs.iter().filter_map(|dab| imprint_of(dab).ok()).collect();
         for dab in &imprints {
             for key in index.query_sphere(centre(dab), reach(dab)) {
@@ -338,6 +339,13 @@ impl Preview {
             self.push_stroke(dab);
         }
         self.displays.clear();
+        self.note_bytes(store);
+    }
+
+    /// Tells the store what the display previews' states hold, for its budget.
+    fn note_bytes(&self, store: &mut TileStore) {
+        let states = self.displays.values().map(DisplayState::bytes).sum();
+        store.note_preview_state_bytes(states);
     }
 
     /// Adds `dab` to the stroke's dabs, and its strength to the overlaps of those it overlaps.
@@ -420,6 +428,7 @@ impl Preview {
         self.stroke.clear();
         self.overlaps.clear();
         self.strengths.clear();
+        self.note_bytes(store);
         let closed = store.close_preview_epoch();
         published?;
         closed?;
@@ -453,6 +462,7 @@ impl Preview {
             let remade = self.remake(store, &again, &mut stats);
             made = made.and(remade);
         }
+        self.note_bytes(store);
         let closed = store.close_preview_epoch();
         made?;
         closed?;
@@ -767,6 +777,7 @@ impl Preview {
                 Err(error.into())
             }
         };
+        self.note_bytes(store);
         let closed = store.close_preview_epoch();
         made?;
         closed?;
@@ -844,6 +855,7 @@ impl Preview {
         let displays: Vec<TileKey> = std::mem::take(&mut self.displays).into_keys().collect();
         let displays_made = self.make_displays(store, &displays, &mut stats);
         made = made.and(displays_made);
+        self.note_bytes(store);
         let closed = store.close_preview_epoch();
         made?;
         closed?;

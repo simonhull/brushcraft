@@ -54,7 +54,8 @@
 //! # The budget
 //!
 //! The shapes are counted in the store's memory budget, with the positions and normals made of
-//! them and the previews' pen-down blocks ([`TileStore::pen_down_bytes`]): the pools' limit is
+//! them, the previews' pen-down blocks and the display previews, what their brush keeps to make
+//! them included ([`TileStore::pen_down_bytes`]): the pools' limit is
 //! lowered by their bytes, never below the pools' minimum, and raised back when they go. The
 //! lowering is settled as a frame pins its tiles ([`TileStore::pin`]), before it counts its room,
 //! and never below what those pins need: so the data a stroke keeps never makes a frame's pins
@@ -817,7 +818,8 @@ impl TileStore {
     }
 
     /// The bytes the current stroke's pen-down data holds: its shapes, the positions and normals
-    /// made of them, and its previews' pen-down blocks; withheld from the pools' share of the
+    /// made of them, its previews' pen-down blocks, and the display previews with what their
+    /// brush keeps to make them; withheld from the pools' share of the
     /// budget (see the module notes).
     #[must_use]
     pub fn pen_down_bytes(&self) -> usize {
@@ -826,6 +828,7 @@ impl TileStore {
             + pen_down.made.len() * MADE_BYTES
             + (pen_down.brush.len() + pen_down.normals.len()) * GRID_BYTES
             + pen_down.preview_bytes
+            + self.display_preview_bytes()
     }
 
     /// The bytes of the pen-down shapes the pools' minimum leaves no room for in the budget: held

@@ -507,6 +507,28 @@ impl DisplayState {
         state
     }
 
+    /// The bytes it holds.
+    pub(super) fn bytes(&self) -> usize {
+        let cells: usize = self
+            .quads
+            .iter()
+            .map(|quad| size_of_val(quad.cells.as_slice()))
+            .sum();
+        size_of::<Self>()
+            + size_of_val(self.p0.as_slice())
+            + size_of_val(self.n0.as_slice())
+            + size_of_val(self.frames.as_slice())
+            + size_of_val(self.turn.as_slice())
+            + size_of_val(self.normals.as_slice())
+            + size_of_val(self.turned.as_slice())
+            + size_of_val(self.drawn.as_slice())
+            + size_of_val(self.ideal.as_slice())
+            + size_of_val(self.roughness.as_slice())
+            + size_of_val(self.quads.as_slice())
+            + cells
+            + size_of_val(self.terms.as_slice())
+    }
+
     /// The tile.
     pub(super) const fn key(&self) -> &TileKey {
         &self.key
