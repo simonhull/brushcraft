@@ -77,34 +77,11 @@ pub(crate) fn on_surface(
     Ok(ray.at(hit.t))
 }
 
-/// Evaluated positions within `radius` of `center`, over the tiles the index finds there.
+/// The radius that covers about `footprint` vertices around `center`.
 ///
-/// A vertex on a tile border counts once per tile holding it, a few percent more than the
-/// vertices themselves; the draw step's own count, which the harness reports, is exact.
-///
-/// # Errors
-///
-/// If a tile can't be evaluated.
-fn positions_within(
-    index: &SpatialIndex,
-    store: &mut TileStore,
-    center: Vec3,
-    radius: f32,
-) -> Result<usize> {
-    let keys: Vec<TileKey> = index.query_sphere(center, radius).collect();
-    let mut count = 0;
-    for key in keys {
-        count += store
-            .evaluate(key)?
-            .iter()
-            .filter(|&&p| (p - center).length() < radius)
-            .count();
-    }
-    Ok(count)
-}
-
-/// The radius that covers about `footprint` vertices around `center`, by bisection on the
-/// count of evaluated positions within it (see [`positions_within`]).
+/// The brushes' own search ([`sculpt::radius_covering`]), which counts a vertex on a tile border
+/// once per tile holding it, a few percent more than the vertices themselves; the draw step's own
+/// count, which the harness reports, is exact.
 ///
 /// # Errors
 ///
@@ -115,16 +92,7 @@ pub(crate) fn calibrated_radius(
     center: Vec3,
     footprint: usize,
 ) -> Result<f32> {
-    let (mut low, mut high) = (0.0_f32, 2.0_f32);
-    for _ in 0..30 {
-        let mid = f32::midpoint(low, high);
-        if positions_within(index, store, center, mid)? < footprint {
-            low = mid;
-        } else {
-            high = mid;
-        }
-    }
-    Ok(high)
+    Ok(sculpt::radius_covering(index, store, center, footprint)?)
 }
 
 /// The unit directions of a stroke's `steps` dabs from the origin: along the great circle

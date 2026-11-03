@@ -22,6 +22,8 @@
 //! - [`draw_step`] is one dab of the draw brush, as M0 measured it: [`apply_dabs`] for one dab.
 //! - [`Preview`] shows dabs at once on the finest tiles they reach, ahead of the finest work, for a
 //!   brush whose frame can't fit it all; the same dabs land later through [`apply_dabs`].
+//! - [`radius_covering`] sizes a brush by the vertices it covers about a point: the radius whose
+//!   ball holds that many, as the M1 spec's "brush of 1M vertices" is named.
 //! - [`StoreSurface`] is the store's pen-down surface as the stroke engine's [`stroke::Surface`]:
 //!   raycasts through the index, the stroke's connected region near a point, and area normals.
 //!
@@ -34,6 +36,7 @@
 
 mod apply;
 mod draw;
+mod footprint;
 mod preview;
 mod state;
 mod surface;
@@ -43,6 +46,7 @@ mod testing;
 
 pub use apply::{ApplyStats, PhaseTimes, SculptError, apply_dabs};
 pub use draw::{DrawParams, DrawParamsError, StepStats, draw_step};
+pub use footprint::radius_covering;
 pub use preview::{Preview, PreviewStats};
 pub use state::Stroke;
 pub use surface::StoreSurface;
