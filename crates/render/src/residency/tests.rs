@@ -77,6 +77,10 @@ struct Model {
     closed: Vec<Epoch>,
     /// Tiles whose data the model says it has at hand ([`TileSource::at_hand`]).
     at_hand: BTreeSet<TileKey>,
+    /// The tiles a brush holds with no preview ([`TileSource::waits_for_preview`]).
+    held: BTreeSet<TileKey>,
+    /// Its count of changes to `held` ([`TileSource::holds_changed`]).
+    holds_changed: u64,
     /// Whether it says so of half the display tiles besides (those of an even face and
     /// column), for the randomized tests to stage some display tiles in the frame they are
     /// first requested in.
@@ -112,6 +116,8 @@ impl Model {
             unprepared: 0,
             closed: Vec::new(),
             at_hand: BTreeSet::new(),
+            held: BTreeSet::new(),
+            holds_changed: 0,
             half_at_hand: false,
         }
     }
@@ -193,6 +199,18 @@ impl TileSource for Model {
             self.prepared.insert(*key, self.version(key));
         }
         Ok(())
+    }
+
+    fn waits_for_preview(&mut self, key: TileKey) -> bool {
+        self.held.contains(&key)
+    }
+
+    fn held(&mut self) -> Vec<TileKey> {
+        self.held.iter().copied().collect()
+    }
+
+    fn holds_changed(&mut self) -> u64 {
+        self.holds_changed
     }
 
     fn at_hand(&mut self, key: TileKey) -> bool {
@@ -595,6 +613,88 @@ fn the_shielded_places_made_when_asked_are_those_made_from_scratch_from_the_late
                 assert_eq!(residency.cut(), &cut, "step {step}: the cut is the latest");
             }
         }
+    });
+}
+
+#[test]
+fn a_held_tile_with_no_preview_leaves_outside_the_cut_stays_in_it_and_waits_to_arrive() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let config = tiny(&mesh, 1);
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        let finest: Vec<TileKey> = model
+            .all
+            .iter()
+            .filter(|key| key.level() == level(FINEST))
+            .copied()
+            .collect();
+        let ask = |keys: &[TileKey]| {
+            let requests = keys.iter().map(|&key| Request {
+                key,
+                screen_error: 1.0,
+            });
+            Requests::new(requests, 0)
+        };
+        let two = ask(&finest[..2]);
+        let quiet = || Drained::Epochs(Vec::new());
+        for _ in 0..4 {
+            frame(
+                gpu,
+                &mut residency,
+                &mut model,
+                quiet(),
+                FrameUse::default(),
+                Some(&two),
+            );
+        }
+        assert!(residency.slot(&finest[0]).is_some() && residency.slot(&finest[1]).is_some());
+        // A brush holds both; only the second is in the cut.
+        model.held.extend(finest[..2].iter().copied());
+        model.holds_changed += 1;
+        let cut: BTreeSet<TileKey> = finest[1..2].iter().copied().collect();
+        let used = || FrameUse::new(cut.clone(), cut.clone());
+        frame(gpu, &mut residency, &mut model, quiet(), used(), None);
+        assert!(
+            residency.slot(&finest[0]).is_none(),
+            "outside the cut: it goes"
+        );
+        assert!(residency.slot(&finest[1]).is_some(), "in the cut: it stays");
+        // Asked for again, it waits for its preview, and is named.
+        let again = ask(&finest[..1]);
+        for _ in 0..3 {
+            frame(
+                gpu,
+                &mut residency,
+                &mut model,
+                quiet(),
+                used(),
+                Some(&again),
+            );
+        }
+        assert!(
+            residency.slot(&finest[0]).is_none(),
+            "drawn only from a preview"
+        );
+        assert!(
+            residency
+                .waiting_for_previews()
+                .any(|key| *key == finest[0])
+        );
+        // Its preview made, it arrives.
+        model.held.clear();
+        model.holds_changed += 1;
+        for _ in 0..3 {
+            frame(
+                gpu,
+                &mut residency,
+                &mut model,
+                quiet(),
+                used(),
+                Some(&again),
+            );
+        }
+        assert!(residency.slot(&finest[0]).is_some(), "it arrives");
     });
 }
 

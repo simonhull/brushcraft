@@ -14,7 +14,7 @@ use stroke::Dab;
 use super::finest_place;
 use crate::apply::apply_dabs;
 use crate::preview::tests::{at_once, base, level, open_copy, path, previewed_drawing, run_jobs};
-use crate::preview::{DrawsAll, Preview};
+use crate::preview::{DrawsAll, Preview, WAITING_A_CALL};
 use crate::state::Stroke;
 use crate::testing::{TestDir, dab};
 
@@ -622,5 +622,39 @@ fn display_previews_are_counted_with_the_pen_down_data_and_go_with_it() {
         0,
         "refreshed: nothing kept"
     );
+    drop(project.close(false));
+}
+
+#[test]
+fn the_previews_a_renderer_waits_for_are_made_a_few_a_call() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, index, _) = open_copy(&dir, &base, "waiting");
+    let dabs = path(project.store(), 6);
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    // A renderer drawing nothing yet: every held display tile waits.
+    preview
+        .show(project.store(), &index, &dabs, &|_: &TileKey| false)
+        .unwrap();
+    let store = project.store();
+    let waiting: Vec<TileKey> = store
+        .held_previews()
+        .filter(|key| key.channel() == Channel::DISPLAY)
+        .copied()
+        .collect();
+    assert!(
+        waiting.len() > WAITING_A_CALL,
+        "{} tiles wait",
+        waiting.len()
+    );
+    preview.make_waiting(store, &waiting).unwrap();
+    assert_eq!(previews(store).len(), WAITING_A_CALL, "a few a call");
+    let mut calls = 1;
+    while waiting.iter().any(|key| store.preview_wanted(key)) {
+        preview.make_waiting(store, &waiting).unwrap();
+        calls += 1;
+        assert!(calls <= waiting.len(), "each call makes some");
+    }
     drop(project.close(false));
 }
