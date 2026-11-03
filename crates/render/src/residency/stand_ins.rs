@@ -269,7 +269,13 @@ impl StandIns {
         {
             self.dropped.remove(&place);
         }
-        if self.previewed.get(&place).is_some_and(|&shown| shown < seq) {
+        // A display preview's epoch (read as a refresh's) carries the finest previews under it:
+        // its data counts them, so the place measures its stand-ins again from it on.
+        if self
+            .previewed
+            .get(&place)
+            .is_some_and(|&shown| shown <= seq)
+        {
             self.previewed.remove(&place);
         }
     }

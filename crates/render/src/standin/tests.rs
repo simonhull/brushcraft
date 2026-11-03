@@ -853,6 +853,84 @@ fn dabs_shown_on_display_tiles_are_drawn_from_them_with_closed_seams_until_the_r
     });
 }
 
+// Uses the sculpt crate's types, a dev-dependency rustdoc doesn't link.
+#[cfg(not(doc))]
+#[test]
+fn a_long_previewed_stroke_keeps_its_drawn_bounds_true_and_flat_frame_by_frame() {
+    GpuTest::run(|gpu| {
+        let dir = TempDir::new("long-preview");
+        let (mut project, mesh) = project(&dir, |config| config);
+        let finest = level(FINEST);
+        let store = project.store();
+        let cursor = store.subscribe_stale();
+        let mut residency = far_residency(gpu, &mesh, store);
+        let mut index = store::SpatialIndex::build(store, finest, |_, _| {}).expect("an index");
+        let grids = finest_grids(store, &mesh);
+        let n = finest.face_quads();
+        // A long stroke across face 2, a dab a frame, landing three frames behind.
+        let dabs: Vec<stroke::Dab> = (0..18_u32)
+            .map(|k| {
+                let (i, j) = (n / 8 + k * n / 24, n / 2);
+                let p = grids[&2][usize::try_from(j * (n + 1) + i).expect("small")];
+                let length = p.dot(p).sqrt();
+                stroke::Dab {
+                    position: [p.x, p.y, p.z],
+                    normal: [p.x / length, p.y / length, p.z / length],
+                    radius: 0.1,
+                    strength: 0.01,
+                    seq: k,
+                    ..stroke::Dab::default()
+                }
+            })
+            .collect();
+        let resident: BTreeSet<Place> = display_tiles(gpu, &residency).keys().copied().collect();
+        let mut preview = sculpt::Preview::new();
+        let mut stroke = sculpt::Stroke::new(store);
+        project.begin_stroke().expect("a stroke");
+        let mut largest = Vec::new();
+        for (k, dab) in dabs.iter().enumerate() {
+            let store = project.store();
+            preview
+                .show(store, &index, std::slice::from_ref(dab), &sculpt::DrawsAll)
+                .expect("shown");
+            if k >= 3 {
+                let landing = dabs.get(k - 3..=k - 3).expect("a dab");
+                sculpt::apply_dabs(store, &mut index, &mut stroke, landing).expect("applied");
+                preview
+                    .land(store, &index, 1, &sculpt::DrawsAll)
+                    .expect("landed");
+            }
+            let drained = store.drain_stale(&cursor);
+            frame(gpu, &mut residency, store, drained);
+            let now = finest_grids(store, &mesh);
+            let drawn = model::drawn_grids(store, &now);
+            check(gpu, &residency, &drawn, &resident);
+            // The previewed tiles' bounds (a tile no dab reaches, standing in only as a reader of
+            // a moved ring, keeps the formula of a level far above the finest).
+            let tiles = display_tiles(gpu, &residency);
+            let previewed = tiles.iter().filter(|(place, _)| {
+                place
+                    .key(finest)
+                    .is_some_and(|key| store.display_preview(&key).is_some())
+            });
+            let bound = previewed
+                .map(|(_, (_, node))| node.error)
+                .fold(0.0_f32, f32::max);
+            largest.push(bound);
+        }
+        // Released tiles stand in for the steps after their release, as any data would.
+        eprintln!("the previewed tiles' largest bound, frame by frame: {largest:?}");
+        let early = largest.get(5).copied().expect("frames");
+        let late = largest.last().copied().expect("frames");
+        assert!(
+            late <= 1.5 * early,
+            "the bounds follow the dabs over each place, not the frames: {largest:?}"
+        );
+        project.store().unsubscribe_stale(cursor);
+        drop(project.close(false));
+    });
+}
+
 /// A renderer drawing only finest tiles, as these tests' stand-ins over previews assume: the
 /// previews are of finest tiles alone, and display tiles above them stand in.
 pub(crate) fn finest_only(key: &TileKey) -> bool {
