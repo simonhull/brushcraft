@@ -796,3 +796,35 @@ fn a_tile_the_stroke_state_released_is_weighed_at_its_first_pen_down_shape_when_
         "the shapes go with the stroke"
     );
 }
+
+#[test]
+fn a_dab_of_more_tiles_than_the_store_keeps_predictions_for_writes_finite_deltas() {
+    // Each dab reaches more tiles than the store keeps predictions for: keeping those it lacks
+    // must not push out the predictions of its other tiles, whose deltas are written along them.
+    let config = StoreConfig::new(128 << 20, 1)
+        .with_chunk_bytes(1 << 20)
+        .with_workers(fixed(2))
+        .with_kept_predictions(12);
+    let dir = TestDir::new();
+    let project_config = store::ProjectConfig {
+        store: config,
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let mut project = Project::new(geom::cube_sphere(1).unwrap(), project_config).unwrap();
+    let mut index = SpatialIndex::build(project.store(), level(), |_, _| {}).unwrap();
+    let mut state = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    for n in 0..6_u16 {
+        let key = TileKey::displacement(FaceId::new(u32::from(n % 3)), level(), n % 2, 0).unwrap();
+        let centre = vertex(project.store(), key, 64, 32);
+        let big = dab(centre, 0.6, 0.01, 0.0, u32::from(n));
+        let applied = apply_dabs(project.store(), &mut index, &mut state, &[big]);
+        let done = applied.unwrap_or_else(|error| panic!("dab {n}: {error:?}"));
+        assert!(
+            done.candidates > 12,
+            "dab {n} reaches {} tiles",
+            done.candidates
+        );
+    }
+    project.end_unrecorded_stroke().unwrap();
+}

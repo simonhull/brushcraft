@@ -665,7 +665,8 @@ fn unkept_frames(
     if missing.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let kept = store.keep_predictions_of(&missing);
+    // All the run's tiles: the room the missing ones need is made from other tiles' predictions.
+    let kept = store.keep_predictions_of(keys);
     #[cfg(test)]
     let kept = if replay::injected(store.id(), replay::Fault::StarvePredictions) {
         Err(CacheError::Full)
@@ -1168,10 +1169,11 @@ pub(crate) fn frame_delta(frame: &geom::Frame, imprint: &Imprint, w: f32) -> Vec
 /// ([`TileStore::update_tiles_framed`]): `imprint`'s move of each vertex it moves, written in the
 /// vertex's tangent frame ([`frame_delta`]). For each of `edits`, in order, one per vertex of its
 /// tile, row-major, zero where its displacement is zero. The tiles without a kept prediction have
-/// theirs made and kept now ([`TileStore::keep_predictions_of`]); should they be more than the
-/// store keeps, they take copies of their frames instead ([`TileStore::frames_many`]). Either way
-/// the frames are the bits the tiles' evaluation uses, and the deltas are made on the store's
-/// workers, a tile each.
+/// theirs made and kept now ([`TileStore::keep_predictions_of`], asked for every tile of the dab,
+/// so the room is made from other tiles' predictions); should the dab's tiles be more than the
+/// store keeps, those without one take copies of their frames instead ([`TileStore::frames_many`]).
+/// Either way the frames are the bits the tiles' evaluation uses, and the deltas are made on the
+/// store's workers, a tile each.
 ///
 /// # Errors
 ///
@@ -1187,8 +1189,12 @@ fn frame_deltas(
         .map(|tile| tile.key)
         .filter(|key| store.kept_prediction(key).is_none())
         .collect();
+    // All the dab's tiles, not only those missing: the room the missing ones need is then made
+    // from other tiles' predictions, never from those of the dab's tiles the deltas are written
+    // along.
+    let tiles: Vec<TileKey> = edits.iter().map(|tile| tile.key).collect();
     let kept = missing.is_empty()
-        || match store.keep_predictions_of(&missing) {
+        || match store.keep_predictions_of(&tiles) {
             Ok(kept) => kept,
             Err(CacheError::Full | CacheError::OverBudget { .. }) => false,
             Err(e) => return Err(e),
