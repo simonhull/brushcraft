@@ -336,7 +336,7 @@ impl TileStore {
 
     /// Makes the pen-down positions of the changed tiles of `keys` whose predictions the store
     /// keeps and whose positions aren't kept made, together on the store's workers, and keeps
-    /// them (at most [`MADE_TILES`], the first of `keys`): for a brush about to read them through
+    /// them (the first 64 of `keys` at most): for a brush about to read them through
     /// `&self` on its workers ([`TileStore::made_pen_down`]), which then find them for this dab and
     /// the next. Counted as read now.
     pub fn make_pen_down_many(&mut self, keys: &[TileKey]) {
@@ -477,7 +477,7 @@ impl TileStore {
     /// workers: the same blocks, bit for bit.
     ///
     /// The tiles they read are made current first: the changed ones' positions made and kept
-    /// (more than [`MADE_TILES`] of them, or one pushed out meanwhile, and the blocks are gathered
+    /// (more than the 64 kept made, or one pushed out meanwhile, and the blocks are gathered
     /// one by one), the others evaluated together.
     ///
     /// # Errors
