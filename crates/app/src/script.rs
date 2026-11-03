@@ -404,8 +404,8 @@ const STROKES: [Keyframe; 12] = [
 /// The finest vertices the huge stroke's brush covers about its start: the M1 spec's "brush of
 /// 1M vertices".
 ///
-/// About 1,165 tiles of edits a dab on the benchmark project, by the GPU spikes' projection. Sized
-/// by its vertices, the brush does that work on any project, whatever its density there.
+/// Sized by its vertices, the brush does the same work on any project, whatever its density
+/// there: about 250 finest level-9 tiles edited a dab (256 on the medium project).
 pub(crate) const HUGE_VERTICES: u32 = 1_000_000;
 
 /// The strokes path's pen strokes, one in each still stroke segment (which start at 4.5 s, 8 s,

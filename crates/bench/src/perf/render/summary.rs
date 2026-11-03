@@ -9,8 +9,7 @@
 //!   segment's frames after its last open one (the coarsening as its refresh lands), which the
 //!   suite's metric, during the stroke, leaves out;
 //! - **tiles a dab**: the tiles the segment's dabs edited over the dabs applied, for checking a
-//!   brush's size (the huge stroke's million vertices are about 1,165 tiles a dab on the benchmark
-//!   project);
+//!   brush's size (the huge stroke's million vertices are about 250 level-9 tiles a dab);
 //! - **the pen's frames**, and the dabs applied and shown ahead.
 //!
 //! A scripted record gives a row for each stroke segment it has ([`strokes::SEGMENTS`]); a live
