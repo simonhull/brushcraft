@@ -199,7 +199,7 @@ fn a_stroke_gives_its_latency_its_queue_and_its_drain() {
         stroke_frame(30.0, (1.0, 0.0, false), 4.0),
         stroke_frame(36.0, (0.0, 0.0, false), 0.0),
     ];
-    let [near, far, long, heavy] = strokes::derive(&stroke_run(frames));
+    let [near, far, long, heavy, huge] = strokes::derive(&stroke_run(frames));
     assert_eq!(near.sample_to_present_p99, Some(9.0), "the nearest rank");
     assert_eq!(near.start_to_submitted_p99, Some(3.0));
     assert_eq!(near.brush_p99, Some(1.0));
@@ -210,10 +210,11 @@ fn a_stroke_gives_its_latency_its_queue_and_its_drain() {
         "the second frame after pen-up carries none"
     );
     assert_eq!(near.above_f, Some(0.0));
-    assert_eq!(near.prepare_p99, Some(0.1));
+    assert_eq!(near.catch_up_p99, Some(0.1));
     assert_eq!(far, strokes::StrokeMetrics::default(), "no such segment");
     assert_eq!(long, strokes::StrokeMetrics::default());
     assert_eq!(heavy, strokes::StrokeMetrics::default());
+    assert_eq!(huge, strokes::StrokeMetrics::default());
 }
 
 #[test]
@@ -256,7 +257,72 @@ fn a_queue_never_drained_within_its_segment_is_not_reached_and_a_miss_on_the_ben
     assert_eq!(carried.unit, Unit::Dabs);
     let name: MetricName = "full.render.stroke_far.drain_frames".parse().unwrap();
     assert_eq!(ceiling_of(&name, Scale::Full), Some(2.0));
-    assert_eq!(ceiling_of(&name, Scale::Medium), None);
+}
+
+/// The pen's targets hold on the medium project as on the benchmark one, the tiny check aside;
+/// the far stroke's level jumps and the big brush's time to exact have their own.
+#[test]
+fn the_pens_targets_hold_on_the_medium_and_benchmark_projects() {
+    let ceiling = |name: &str, scale| ceiling_of(&name.parse().unwrap(), scale);
+    for (scale, word) in [(Scale::Medium, "medium"), (Scale::Full, "full")] {
+        let of = |rest: &str| ceiling(&format!("{word}.render.{rest}"), scale);
+        for segment in strokes::SEGMENTS {
+            assert_eq!(
+                of(&format!("{segment}.sample_to_present_p99_ms")),
+                Some(8.0),
+                "{word} {segment}: the pen's latency, the big brush's through its preview"
+            );
+            assert_eq!(of(&format!("{segment}.drain_frames")), Some(2.0));
+            assert_eq!(of(&format!("{segment}.catch_up_p99_ms")), None);
+        }
+        assert_eq!(of("stroke_far.level_jump_max"), Some(1.0), "{word}");
+        assert_eq!(of("stroke_near.level_jump_max"), None, "the far stroke's");
+        assert_eq!(
+            of("stroke_huge.exact_after_up_ms"),
+            Some(strokes::HUGE_EXACT_MS),
+            "{word}"
+        );
+        assert_eq!(of("stroke_long.exact_after_up_ms"), None);
+    }
+    assert_eq!(
+        ceiling("medium.render.spin_catch_up_ms", Scale::Medium),
+        None
+    );
+    assert_eq!(
+        ceiling(
+            "tiny.render.stroke_near.sample_to_present_p99_ms",
+            Scale::Tiny
+        ),
+        None,
+        "the tiny check measures nothing"
+    );
+}
+
+/// The largest level jump is taken over the frames whose stroke was open, in levels.
+#[test]
+fn a_stroke_gives_its_largest_level_jump_while_open() {
+    let jumped = |time_ms, open, level_jump| Frame {
+        level_jump,
+        ..stroke_frame(time_ms, (1.0, 0.0, open), 5.0)
+    };
+    let frames = vec![
+        jumped(0.0, true, Some(1.0)),
+        jumped(6.0, true, None),
+        jumped(12.0, true, Some(0.0)),
+        jumped(18.0, false, Some(4.0)),
+    ];
+    let [near, ..] = strokes::derive(&stroke_run(frames));
+    assert_eq!(
+        near.most_level_jump,
+        Some(1.0),
+        "after pen-up doesn't count"
+    );
+    let named = near.named(0);
+    let jump = named
+        .iter()
+        .find(|(name, ..)| *name == "render.stroke_near.level_jump_max")
+        .expect("named");
+    assert_eq!(jump.1, Unit::Levels);
 }
 
 /// A run opening in `open_ms`, its segments as the benchmark's at 1×, with `frames`.

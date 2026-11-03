@@ -33,9 +33,11 @@
 //!   segment shown with no tile over 1 px and nothing requested (spec: ≤ 1 s on desktop).
 //!
 //! Each run also runs the strokes script (`--script-path strokes`), whose record gives the pen's
-//! metrics for its three strokes ([`strokes`]: sample to present, frame start to present
+//! metrics for its five strokes ([`strokes`]: sample to present, frame start to present
 //! submitted, the brush, the most dabs carried and the frames to drain them after pen-up, frames
-//! above F, the brush's preparation).
+//! above F, the catch-up, the time until exact and the frames until settled after pen-up, and
+//! the largest level jump of the stroke's tiles), held to the pen's targets on the medium
+//! project as on the benchmark one.
 //!
 //! A run whose record lacks one (no timestamp queries, no flick) gives no sample of it, and the
 //! part says so. A run that never reaches a timed metric's end (no frame caught up after the
@@ -168,6 +170,9 @@ pub(crate) struct Frame {
     pub(crate) above_f: Option<bool>,
     /// Whether a stroke was still open as its brush step ended.
     pub(crate) stroke_open: Option<bool>,
+    /// The largest level change of a tile the stroke edited since the cut before, if its cut
+    /// came back and drew one.
+    pub(crate) level_jump: Option<f64>,
 }
 
 impl Frame {
@@ -296,6 +301,7 @@ impl Recorded {
                 pending_epochs: number(object, "pending_epochs"),
                 above_f: object.get("above_f").and_then(Json::as_bool),
                 stroke_open: object.get("stroke_open").and_then(Json::as_bool),
+                level_jump: number(object, "level_jump"),
             }),
             _ => {}
         }
@@ -833,20 +839,23 @@ fn measure(
     Ok(RenderPart::Measured { metrics, notes })
 }
 
-/// The ceiling on metric `name` at `scale`: the spec's target ([`TARGETS`]) on the benchmark
-/// project, none on the other scales.
+/// The ceiling on metric `name` at `scale`: the spec's target on it, if it has one there.
+///
+/// The renderer's ([`TARGETS`]) hold on the benchmark project, the pen's ([`strokes::TARGETS`])
+/// on the medium project too; none on the tiny check, whose software GPU and fast script measure
+/// nothing.
 fn ceiling_of(name: &MetricName, scale: Scale) -> Option<f64> {
-    let target = TARGETS
+    let ends = |&&(target, _): &&(&str, f64)| name.as_str().ends_with(target);
+    let renderer = TARGETS.iter().find(ends).filter(|_| scale == Scale::Full);
+    let pen = strokes::TARGETS
         .iter()
-        .chain(&strokes::TARGETS)
-        .find(|(target, _)| name.as_str().ends_with(target));
-    target
-        .filter(|_| scale == Scale::Full)
-        .map(|&(_, ceiling)| ceiling)
+        .find(ends)
+        .filter(|_| matches!(scale, Scale::Medium | Scale::Full));
+    renderer.or(pen).map(|&(_, ceiling)| ceiling)
 }
 
-/// `metrics` of `scale`, those the spec sets a target for given it as their ceiling on the
-/// benchmark project ([`TARGETS`]); the other scales' are only compared with their history.
+/// `metrics` of `scale`, those the spec sets a target for given it as their ceiling
+/// ([`ceiling_of`]); the rest are only compared with their history.
 fn with_targets(metrics: Vec<Metric>, scale: Scale) -> Vec<Metric> {
     metrics
         .into_iter()

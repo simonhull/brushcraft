@@ -263,7 +263,7 @@ impl Entry {
                 max: load("load_max")?,
             },
             metric: Metric {
-                name: text("metric")?.parse()?,
+                name: current_name(&text("metric")?).parse()?,
                 unit: Unit::named(&unit).ok_or_else(|| anyhow!("unknown unit {unit:?}"))?,
                 value,
                 ceiling: match object.get("ceiling") {
@@ -273,6 +273,26 @@ impl Entry {
             },
         })
     }
+}
+
+/// Metrics renamed since lines were written, read under their new names.
+///
+/// Each is a part of the old name after its scale, the old name's end and the new end. A line of
+/// an old name reads as the new one, so its series (and its baseline) goes on across the rename
+/// rather than starting again as "new".
+///
+/// - The strokes' `prepare_p99_ms` measured the brush's catch-up after the hand-off, not a
+///   preparation of anything: `catch_up_p99_ms` since 2026-11-03.
+const RENAMED: [(&str, &str, &str); 1] =
+    [(".render.stroke_", ".prepare_p99_ms", ".catch_up_p99_ms")];
+
+/// `name`, renamed as [`RENAMED`] says if it is an old name, else as it is.
+fn current_name(name: &str) -> String {
+    let renamed = RENAMED.iter().find_map(|&(within, old, new)| {
+        let kept = name.strip_suffix(old)?;
+        kept.contains(within).then(|| format!("{kept}{new}"))
+    });
+    renamed.unwrap_or_else(|| name.to_owned())
 }
 
 /// A history file as read: its entries, and the torn last line left out, if there was one.
@@ -496,6 +516,49 @@ pub(crate) mod tests {
             Entry::parse(&added).unwrap(),
             e,
             "unknown fields are ignored"
+        );
+    }
+
+    /// A line of a renamed metric's old name reads as its new name, so the series goes on; a
+    /// name merely ending the same way elsewhere stays as it is.
+    #[test]
+    fn a_renamed_metric_reads_back_under_its_new_name() {
+        let old = entry(
+            "full.render.stroke_far.prepare_p99_ms",
+            0.5,
+            "2026-11-03T17:49:21Z",
+            true,
+            "cpu",
+        );
+        let read = Entry::parse(&old.to_record().to_json()).unwrap();
+        assert_eq!(
+            read.metric.name.as_str(),
+            "full.render.stroke_far.catch_up_p99_ms",
+            "the catch-up, as it is named now"
+        );
+        assert_eq!(read.metric.value, old.metric.value, "the same value");
+        let elsewhere = entry(
+            "medium.other.prepare_p99_ms",
+            1.0,
+            "2026-11-03T17:49:21Z",
+            true,
+            "cpu",
+        );
+        let kept = Entry::parse(&elsewhere.to_record().to_json()).unwrap();
+        assert_eq!(kept.metric.name.as_str(), "medium.other.prepare_p99_ms");
+        let same = entry(
+            "full.render.stroke_far.catch_up_p99_ms",
+            0.6,
+            "2026-11-04T09:00:00Z",
+            false,
+            "cpu",
+        );
+        let past = [Entry::parse(&old.to_record().to_json()).unwrap()];
+        let base = baselines(&past, &same.info);
+        assert_eq!(
+            base.get(&same.metric.name).map(|e| e.metric.name.as_str()),
+            Some("full.render.stroke_far.catch_up_p99_ms"),
+            "the old line is the new name's baseline"
         );
     }
 

@@ -59,7 +59,7 @@ impl fmt::Display for MetricName {
 }
 
 /// The unit a metric is in. Every metric is better lower: times, memory, bytes, tiles over
-/// budget, frames over the refresh.
+/// budget, frames over the refresh, levels jumped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unit {
     /// Milliseconds.
@@ -76,11 +76,13 @@ pub(crate) enum Unit {
     Frames,
     /// Brush dabs: a count of them.
     Dabs,
+    /// Subdivision levels: how many a tile's drawn level changed by.
+    Levels,
 }
 
 impl Unit {
     /// Every unit.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Ms,
         Self::Us,
         Self::Mib,
@@ -88,6 +90,7 @@ impl Unit {
         Self::Tiles,
         Self::Frames,
         Self::Dabs,
+        Self::Levels,
     ];
 
     /// The unit's name in history records and tables (ASCII, so `us` for microseconds).
@@ -100,6 +103,7 @@ impl Unit {
             Self::Tiles => "tiles",
             Self::Frames => "frames",
             Self::Dabs => "dabs",
+            Self::Levels => "levels",
         }
     }
 
