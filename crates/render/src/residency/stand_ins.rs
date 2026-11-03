@@ -29,6 +29,10 @@
 //! stands in or is refreshed. Rows are as many as tiles can be resident, and the scratch grows,
 //! so in practice only a revert or a forgotten step leaves a tile so.
 //!
+//! A held display preview ([`crate::upload::TileDetail::held`]) is passed over: the brush that
+//! made it makes it again as the steps under it land, and its release (read again, no longer
+//! held) makes it due, to stand in for any step after it.
+//!
 //! A place's entries are kept until a refresh epoch names it: whatever holds its tile later
 //! (an arrival, a reload after a lost frame) reads data as old as that refresh. A revert's
 //! epoch ([`store::EpochKind::Revert`]) moved finest vertices by an unknown amount: the places
@@ -672,6 +676,10 @@ impl Residency {
             let Some(entry) = self.entries.get(&key) else {
                 continue;
             };
+            if entry.held {
+                // A brush's preview: it makes the tile again as its dabs land.
+                continue;
+            }
             let Some((displacement, newest)) = self.stand_ins.since(place, entry.version) else {
                 continue;
             };

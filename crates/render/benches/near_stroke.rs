@@ -137,6 +137,7 @@ impl TileSource for Rings<'_> {
             error: 1e-3,
             cone: FinestNormalCone::EVERYTHING,
             stored: None,
+            held: false,
         }))
     }
 }

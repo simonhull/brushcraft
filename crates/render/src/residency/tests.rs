@@ -224,6 +224,7 @@ fn detail_tag(version: u32) -> TileDetail {
         stored: None,
         error: f32::from(u16::try_from(version).expect("small values")),
         cone: geom::FinestNormalCone::from_bits(version.wrapping_mul(0x9E37_79B9)),
+        held: false,
     }
 }
 

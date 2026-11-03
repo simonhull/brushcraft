@@ -17,8 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::finest_only;
-use super::*;
+use super::{finest_only, *};
 use crate::residency::{Request, Requests, ResidencyError, SizeClass};
 use crate::upload::{TileData, TileDetail, TileSource};
 

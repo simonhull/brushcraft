@@ -34,6 +34,7 @@ fn detail(error: f32, tag: usize) -> TileDetail {
         stored: None,
         error,
         cone: geom::FinestNormalCone::from_bits(bits),
+        held: false,
     }
 }
 

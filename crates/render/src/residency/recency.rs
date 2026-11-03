@@ -234,6 +234,7 @@ mod tests {
             loaded_error: 0.0,
             loaded_after: None,
             bounded: 0,
+            held: false,
         }
     }
 

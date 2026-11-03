@@ -110,6 +110,7 @@ impl TileSource for Zeros {
             error: 1e-3,
             cone: FinestNormalCone::EVERYTHING,
             stored: None,
+            held: false,
         }))
     }
 }

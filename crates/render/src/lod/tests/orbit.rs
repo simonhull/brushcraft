@@ -149,6 +149,7 @@ fn benchmark_scene(gpu: &Gpu, shape: Shape, rough: bool) -> Scene {
                 stored: None,
                 error: 0.25 * factor * b.quad_edge,
                 cone,
+                held: false,
             }
         };
         let flags = if finest_tile { NODE_FINEST } else { 0 };

@@ -536,6 +536,7 @@ impl TileTree {
             error: error.max(node.detail.error),
             cone: geom::FinestNormalCone::EVERYTHING,
             stored: node.detail.stored,
+            held: node.detail.held,
         };
         if node.detail != raised {
             node.detail = raised;

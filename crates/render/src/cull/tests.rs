@@ -213,6 +213,7 @@ fn a_bounds_pass_that_fails_leaves_its_tiles_unknown_not_stale() {
             stored: None,
             error: 0.0,
             cone: geom::FinestNormalCone::EVERYTHING,
+            held: false,
         };
         let node = tree
             .insert(place, Slot::for_tests(class, 0), unused, 0)

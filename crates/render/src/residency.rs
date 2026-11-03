@@ -726,6 +726,10 @@ struct Entry {
     loaded_after: Option<u64>,
     /// The steps its stand-in's bound (its row's) counts: every one before this.
     bounded: u64,
+    /// Whether its data is a brush's preview of a held tile ([`TileDetail::held`]): the brush
+    /// makes it again as its dabs land, so it neither stands in nor has its bound raised for the
+    /// steps meanwhile.
+    held: bool,
 }
 
 /// A tile requested.
@@ -852,6 +856,9 @@ pub struct Residency {
     floor_unavailable: usize,
     /// Tiles requested.
     wanted: BTreeMap<TileKey, Want>,
+    /// Tiles requested that the last staging left waiting for a brush's preview
+    /// ([`TileSource::waits_for_preview`]).
+    waiting_previews: BTreeSet<TileKey>,
     /// Tiles the source had nothing for, until an epoch names them.
     unavailable: BTreeSet<TileKey>,
     /// Pending epochs, oldest first.
@@ -996,6 +1003,7 @@ impl Residency {
             floor_resident: 0,
             floor_unavailable: 0,
             wanted: BTreeMap::new(),
+            waiting_previews: BTreeSet::new(),
             unavailable: BTreeSet::new(),
             groups: Vec::new(),
             pending: BTreeSet::new(),
@@ -1260,6 +1268,12 @@ impl Residency {
     ///   step that moved the store's finest surface by nothing: what is drawn moved, the surface
     ///   the bounds are against didn't, so a stand-in's bound grows by what it measures it moved
     ///   alone (`e + D + max(D, M)` with `D = 0`, the stand-in module's "The bound");
+    /// - a preview's display tiles (a brush's display previews, [`store::DisplayPreview`]) are read
+    ///   again as a refresh's are, their data holding every step before the epoch, its bound the
+    ///   brush's against the finest result; with them in the epoch no finest tile under them
+    ///   stands in for its ancestors (they are previewed themselves). While held, a display
+    ///   preview neither stands in nor has its bound raised for the steps landing under it: the
+    ///   brush makes it again as they land ([`TileDetail::held`]);
     /// - a refresh's display tiles are read again, a stand-in among them replaced;
     /// - a revert's finest tiles moved by an unknown amount: the display tiles above them stop
     ///   standing in and are read again from the store, until a refresh names them.
@@ -1317,6 +1331,19 @@ impl Residency {
                 .copied()
                 .collect();
             self.stand_ins.previewed(&finest, seq);
+            // Display previews are read again, data that holds every step before them, as a
+            // refresh's: switched with the finest previews of the same epoch.
+            let display: Vec<(Place, u64)> = keys
+                .iter()
+                .filter(|key| key.channel() == Channel::DISPLAY)
+                .map(|key| (Place::of(key), seq))
+                .collect();
+            if !display.is_empty() {
+                // The display tiles above the finest previews are previewed themselves: no
+                // stand-in over them, so no step to stand in for.
+                self.apply_epoch(keys, None, display);
+                return;
+            }
         }
         // A step whose displacement isn't one bounds nothing: as a revert.
         let kind = match kind {
@@ -1579,6 +1606,7 @@ impl Residency {
     where
         S::Error: Into<ResidencyError>,
     {
+        self.waiting_previews.clear();
         self.touched.clear();
         self.fresh.clear();
         self.forced_now = 0;
@@ -1801,6 +1829,9 @@ impl Residency {
             for &(key, due) in chunk {
                 if self.entries.contains_key(&key) || self.unavailable.contains(&key) {
                     self.wanted.remove(&key);
+                } else if source.waits_for_preview(key) {
+                    // Dabs still to land reach it: drawn only once the brush makes its preview.
+                    self.waiting_previews.insert(key);
                 } else if due || source.at_hand(key) {
                     ready.push(key);
                 }
@@ -1823,6 +1854,19 @@ impl Residency {
             }
         }
         Ok(())
+    }
+
+    /// The tiles requested that the last staging left waiting for a brush's preview: held, with
+    /// none made yet ([`TileSource::waits_for_preview`]). The brush makes them, and they arrive
+    /// from the next staging on.
+    pub fn waiting_for_previews(&self) -> impl Iterator<Item = &TileKey> {
+        self.waiting_previews.iter()
+    }
+
+    /// Whether `key` is resident or requested: a tile a brush's preview is made for.
+    #[must_use]
+    pub fn holds_or_wants(&self, key: &TileKey) -> bool {
+        self.entries.contains_key(key) || self.wanted.contains_key(key)
     }
 
     /// Whether `key` is arriving as a member of a pending epoch, staged already.
@@ -2065,6 +2109,7 @@ impl Residency {
                         entry.loaded_error = detail.error;
                         entry.loaded_after = seen;
                         entry.bounded = version;
+                        entry.held = detail.held;
                         self.tree.move_to(place, slot, detail);
                         if old != slot {
                             self.pools.release(old);
@@ -2253,6 +2298,7 @@ impl Residency {
             loaded_error: detail.error,
             loaded_after: seen,
             bounded: self.data_version(&key),
+            held: detail.held,
         };
         self.loaded(Place::of(&key));
         // Only a tile not resident arrives, so this counts each floor tile once.

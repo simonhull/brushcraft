@@ -297,6 +297,7 @@ fn stand_in(
             stored: None,
             error: node.error,
             cone: FinestNormalCone::from_bits(node.finest_cone),
+            held: false,
         };
         let tile = world.tiles.get_mut(&place).expect("resident");
         tile.vertices = vertices;
@@ -728,6 +729,7 @@ fn refreshed(world: &World, edit: &Edit, place: Place) -> (Vec<GpuVertex>, TileD
             stored: None,
             error,
             cone: FinestNormalCone::EVERYTHING,
+            held: false,
         },
     )
 }

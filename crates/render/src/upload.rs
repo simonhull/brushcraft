@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use bytemuck::{Pod, Zeroable};
 use geom::{Channel, DisplayTile, FinestNormalCone, TileKey, Vec3};
-use store::{CacheError, Evaluation, TileStore};
+use store::{CacheError, DisplayPreview, Evaluation, TileStore};
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, MapMode, Queue};
 
 use crate::gpu::{Gpu, GpuError};
@@ -92,6 +92,10 @@ pub struct TileDetail {
     /// ([`TileStore::bump_display_error`]): what a stand-in's bound grows from
     /// ([`crate::standin`]), so the stroke's steps count once. `None` where `error` is it.
     pub stored: Option<f32>,
+    /// Whether it is a brush's preview of a held display tile ([`TileStore::display_preview`],
+    /// dabs still to land reaching it): the brush makes it again as they land, so residency
+    /// stands nothing in over it meanwhile.
+    pub held: bool,
 }
 
 impl TileDetail {
@@ -100,6 +104,7 @@ impl TileDetail {
         error: 0.0,
         cone: FinestNormalCone::EVERYTHING,
         stored: None,
+        held: false,
     };
 
     /// A display tile's: its `e` and its finest normals' cone.
@@ -109,6 +114,19 @@ impl TileDetail {
             error: tile.error(),
             cone: tile.cone(),
             stored: None,
+            held: false,
+        }
+    }
+
+    /// A display preview's: its bound, the cone that covers everything (the brush doesn't know
+    /// its finest normals'), held as the preview says.
+    #[must_use]
+    pub const fn of_preview(preview: &DisplayPreview) -> Self {
+        Self {
+            error: preview.bound,
+            cone: FinestNormalCone::EVERYTHING,
+            stored: None,
+            held: preview.held,
         }
     }
 }
@@ -239,6 +257,18 @@ pub trait TileSource {
         false
     }
 
+    /// Whether `key` must wait for a brush to make its preview before it is drawn: dabs still to
+    /// land reach it, and it has none yet ([`TileStore::preview_wanted`]). Residency leaves such
+    /// a tile wanted and names it ([`crate::residency::Residency::waiting_for_previews`]). The
+    /// default says no.
+    #[expect(
+        unused_variables,
+        reason = "the default knows of no brush; a source that does overrides it"
+    )]
+    fn waits_for_preview(&mut self, key: TileKey) -> bool {
+        false
+    }
+
     /// Writes `key` into `out`, its vertices or (a finest tile) its positions with the ring, and
     /// returns its bound `e` and its finest normals' cone, or `None` if the source has nothing
     /// to draw for it yet (a display tile not built, or made unknown by edits): it is then drawn
@@ -337,7 +367,13 @@ impl TileSource for StoreSource<'_> {
     }
 
     fn at_hand(&mut self, key: TileKey) -> bool {
-        self.display.contains_key(&key) || !self.store.display_needs_read(&key)
+        self.display.contains_key(&key)
+            || self.store.display_preview(&key).is_some()
+            || !self.store.display_needs_read(&key)
+    }
+
+    fn waits_for_preview(&mut self, key: TileKey) -> bool {
+        self.store.preview_wanted(&key)
     }
 
     fn prepare_positions(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {
@@ -368,6 +404,26 @@ impl TileSource for StoreSource<'_> {
     }
 
     fn read(&mut self, key: TileKey, out: &mut TileData) -> Result<Option<TileDetail>, CacheError> {
+        if key.channel() == Channel::DISPLAY
+            && let Some(preview) = self.store.display_preview(&key)
+        {
+            // A brush's preview, ahead of the finest work under it.
+            let vertices = out
+                .vertices()
+                .iter_mut()
+                .zip(&preview.positions)
+                .zip(&preview.normals)
+                .zip(&preview.roughness);
+            for (((vertex, position), normal), roughness) in vertices {
+                *vertex = GpuVertex {
+                    position: components(*position),
+                    roughness: f32::from(*roughness) / f32::from(u8::MAX),
+                    normal: components(*normal),
+                    reserved: 0,
+                };
+            }
+            return Ok(Some(TileDetail::of_preview(preview)));
+        }
         if key.channel() == Channel::DISPLAY {
             let tile = match self.display.remove(&key) {
                 Some(tile) => tile,

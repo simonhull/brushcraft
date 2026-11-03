@@ -173,6 +173,7 @@ impl Scene {
                     stored: None,
                     error: error(place) * b.quad_edge,
                     cone: sphere_cone(&data),
+                    held: false,
                 }
             };
             bounds.insert(place, b);
@@ -1334,6 +1335,7 @@ fn a_silhouette_tile_whose_finest_detail_faces_the_camera_is_refined_though_it_f
                 stored: None,
                 error: e,
                 cone: past,
+                held: false,
             },
         );
         assert!(
@@ -1349,6 +1351,7 @@ fn a_silhouette_tile_whose_finest_detail_faces_the_camera_is_refined_though_it_f
                 stored: None,
                 error: e,
                 cone: drawn,
+                held: false,
             },
         );
         assert!(
@@ -1378,6 +1381,7 @@ fn a_tile_whose_finest_normals_all_face_away_too_is_not_refined() {
                 stored: None,
                 error: e,
                 cone: all_away,
+                held: false,
             },
         );
         assert_eq!(
@@ -1415,6 +1419,7 @@ fn a_tile_whose_finest_normals_face_away_but_whose_own_triangles_face_the_eye_is
                 stored: None,
                 error: e,
                 cone: all_away,
+                held: false,
             },
         );
         assert!(
@@ -1441,6 +1446,7 @@ fn a_tile_whose_finest_cone_covers_everything_is_refined_whenever_its_error_asks
             stored: None,
             error: e,
             cone: FinestNormalCone::EVERYTHING,
+            held: false,
         };
         for eye in eyes {
             let view = look(eye, center).gpu();
@@ -1507,6 +1513,7 @@ fn refining_by_the_finest_normal_cone_agrees_with_the_cpu_reference() {
                     stored: None,
                     error: rng.range(0.02, 0.3),
                     cone: random_cone(&mut rng),
+                    held: false,
                 };
                 scene.set_detail(place, detail);
             }

@@ -237,6 +237,7 @@ impl TileSource for Sphere {
                 stored
             },
             cone: FinestNormalCone::EVERYTHING,
+            held: false,
         }))
     }
 }

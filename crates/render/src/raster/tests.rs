@@ -197,6 +197,7 @@ impl World {
                     stored: None,
                     error: measured_error(place, finest, &vertices, grid, scale),
                     cone: FinestNormalCone::covering(&normals).expect("normals"),
+                    held: false,
                 }
             };
             let class = SizeClass::of(place.level());
