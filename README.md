@@ -2,8 +2,6 @@
 
 A digital sculpting application in Rust, built to hold and sculpt billions of polygons.
 
-Design docs and research live in a separate repo, `~/Code/brushcraft-docs`.
-
 ## Layout
 
 | Crate | Responsibility |
