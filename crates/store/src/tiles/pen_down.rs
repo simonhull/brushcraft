@@ -472,12 +472,13 @@ impl TileStore {
     /// one whose positions aren't kept made now.
     #[must_use]
     pub fn made_pen_down(&self, key: &TileKey) -> Option<&[Vec3]> {
+        // The brush's first: its tiles are read every dab. Where both hold a tile, the same bits.
         let pen_down = &self.pen_down;
         pen_down
-            .made
+            .brush
             .get(key)
-            .map(|made| made.positions.as_slice())
-            .or_else(|| pen_down.brush.get(key).map(Vec::as_slice))
+            .map(Vec::as_slice)
+            .or_else(|| pen_down.made.get(key).map(|made| made.positions.as_slice()))
     }
 
     /// Changed tile `key`'s pen-down positions and raycast blocks, made and kept for the next
@@ -538,6 +539,7 @@ impl TileStore {
         self.keep_brush_pen_down(keys, []);
         let todo: Vec<PenDownMaker<'_>> = keys
             .iter()
+            .filter(|key| self.made_pen_down(key).is_none())
             .filter_map(|key| self.pen_down_maker(key))
             .collect();
         if todo.is_empty() {
@@ -549,13 +551,10 @@ impl TileStore {
 
     /// What a worker needs to make changed tile `key`'s pen-down positions
     /// ([`PenDownMaker::make`]), for the store to keep after ([`TileStore::keep_brush_pen_down`]):
-    /// `None` for a tile the stroke hasn't changed, one whose positions are kept made already
-    /// ([`TileStore::made_pen_down`]), or one whose prediction isn't kept.
+    /// `None` for a tile the stroke hasn't changed, or one whose prediction isn't kept. Whether
+    /// they are kept made already is the caller's to ask first ([`TileStore::made_pen_down`]).
     #[must_use]
     pub fn pen_down_maker(&self, key: &TileKey) -> Option<PenDownMaker<'_>> {
-        if self.made_pen_down(key).is_some() {
-            return None;
-        }
         Some(PenDownMaker {
             key: *key,
             shape: self.pen_down.shapes.get(key)?,
@@ -573,15 +572,15 @@ impl TileStore {
         keys: &[TileKey],
         made: impl IntoIterator<Item = MadePenDown>,
     ) {
-        let wanted: BTreeSet<TileKey> = keys
-            .iter()
-            .filter(|key| self.pen_down.shapes.contains_key(key))
-            .copied()
-            .collect();
+        // Every tile the brush holds and every one made is a changed tile, so being among `keys`
+        // is enough. A dab's tiles come in key order, so sorting them is a check.
+        let mut wanted: Vec<TileKey> = keys.to_vec();
+        wanted.sort_unstable();
+        let among = |key: &TileKey| wanted.binary_search(key).is_ok();
         let pen_down = &mut self.pen_down;
-        pen_down.brush.retain(|key, _| wanted.contains(key));
+        pen_down.brush.retain(|key, _| among(key));
         for MadePenDown { key, positions } in made {
-            if wanted.contains(&key) && !pen_down.made.contains_key(&key) {
+            if among(&key) && !pen_down.made.contains_key(&key) {
                 pen_down.brush.entry(key).or_insert(positions);
             }
         }

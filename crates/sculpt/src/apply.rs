@@ -1058,13 +1058,22 @@ enum BrushSource<'a> {
 
 impl<'a> BrushSource<'a> {
     /// Tile `key`'s source in `store` as it is now.
+    ///
+    /// Most of a dab's tiles are changed tiles whose positions the brush made at an earlier dab,
+    /// so those are looked for first.
     fn of(store: &'a TileStore, key: &TileKey) -> Self {
-        if let Some(taker) = store.pen_down_taker(key) {
-            return Self::Unchanged(taker);
+        if let Some(made) = store.made_pen_down(key) {
+            return Self::Read(PenDownTile::Positions(Some(made)));
         }
-        store
-            .pen_down_maker(key)
-            .map_or_else(|| Self::Read(PenDownTile::of(store, key)), Self::Make)
+        if let Some(shape) = store.pen_down_shape(key) {
+            return store
+                .pen_down_maker(key)
+                .map_or(Self::Read(PenDownTile::Kept(shape, None)), Self::Make);
+        }
+        store.pen_down_taker(key).map_or_else(
+            || Self::Read(PenDownTile::Positions(store.cached_positions(key))),
+            Self::Unchanged,
+        )
     }
 
     /// The draw action for `imprint` over tile `key` (see [`brush_tile`]), with what the worker

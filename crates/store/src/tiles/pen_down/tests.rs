@@ -630,7 +630,6 @@ fn positions_made_on_workers_are_kept_as_the_brush_s_and_go_with_its_tiles() {
     store.keep_brush_pen_down(&reached, made);
     for (key, before) in reached.iter().zip(&at_pen_down) {
         assert_eq!(bits(store.made_pen_down(key).expect("kept")), bits(before));
-        assert!(store.pen_down_maker(key).is_none(), "{key:?}: made already");
     }
     assert_eq!(
         store.pen_down_bytes(),
@@ -639,11 +638,9 @@ fn positions_made_on_workers_are_kept_as_the_brush_s_and_go_with_its_tiles() {
     );
     // The next dab's tiles: the others' go, and what is made of a tile not among them isn't kept.
     let (first, rest) = reached.split_first().expect("tiles");
-    let again = store.pen_down_maker(first).map(|maker| maker.make());
-    assert!(again.is_none(), "made already");
     store.keep_brush_pen_down(rest, []);
     assert!(store.made_pen_down(first).is_none(), "gone with its dab");
-    let outside = store.pen_down_maker(first).expect("not made now").make();
+    let outside = store.pen_down_maker(first).expect("a changed tile").make();
     store.keep_brush_pen_down(rest, [outside]);
     assert!(
         store.made_pen_down(first).is_none(),
