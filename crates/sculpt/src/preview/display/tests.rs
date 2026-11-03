@@ -224,11 +224,8 @@ fn border_vertices_are_the_finest_previews_bits_and_the_landed_work_replaces_the
                             "{stage}: {key:?} ({i}, {j}) is the finest bits"
                         );
                         checked += 1;
-                    } else if landing.is_some()
-                        && store
-                            .display_changes(key)
-                            .is_some_and(|(_, f)| f.contains(&under))
-                    {
+                    } else if landing.is_some() && store.pen_down_shape(&under).is_some() {
+                        // Inside a finest tile the stroke wrote: the store's bits.
                         assert_eq!(
                             at(got),
                             at(want),
@@ -510,5 +507,85 @@ fn a_record_refreshed_mid_stroke_still_gives_its_preview_the_pen_down_surface() 
         .unwrap();
     let ratio = assert_bounds(project.store(), &shown, "over records rebuilt mid-stroke");
     eprintln!("over records rebuilt mid-stroke: largest error / bound {ratio:.3}");
+    drop(project.close(false));
+}
+
+#[test]
+fn a_display_preview_left_undrawn_for_a_call_still_takes_its_dabs() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let dabs = path_dabs(&dir, &base);
+    // Every call drawing display tiles, against one call that draws none of them.
+    let made = |name: &str, middle: &dyn Fn(&TileKey) -> bool| {
+        let (mut project, index, _) = open_copy(&dir, &base, name);
+        let mut preview = Preview::new();
+        project.begin_stroke().unwrap();
+        for (n, dab) in dabs.iter().enumerate() {
+            let drawn = |key: &TileKey| if n == 1 { middle(key) } else { true };
+            preview
+                .show(project.store(), &index, std::slice::from_ref(dab), &drawn)
+                .unwrap();
+        }
+        let shown = previews(project.store());
+        drop(project.close(false));
+        shown
+    };
+    let always = made("always", &|_: &TileKey| true);
+    let skipped = made("skipped", &|key: &TileKey| {
+        key.channel() != Channel::DISPLAY
+    });
+    assert!(!always.is_empty());
+    for (key, want) in &always {
+        let got = skipped.get(key).expect("previewed in both");
+        assert_eq!(
+            got.positions, want.positions,
+            "{key:?} took the dab it wasn't drawn for"
+        );
+        assert_eq!(
+            got.bound.to_bits(),
+            want.bound.to_bits(),
+            "{key:?}'s bound too"
+        );
+    }
+}
+
+/// Three dabs over face 0, on `base`'s surface.
+fn path_dabs(dir: &TestDir, base: &std::path::Path) -> Vec<Dab> {
+    let (mut project, _, _) = open_copy(dir, base, "dabs");
+    let dabs = path(project.store(), 3);
+    drop(project.close(false));
+    dabs
+}
+
+#[test]
+fn a_preview_that_moved_nothing_over_an_unchanged_tile_is_gone_with_its_stroke() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "unmoved");
+    // A tiny dab hovering off the surface: inside display tiles' grown boxes, moving nothing.
+    let finest_key = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let on = crate::testing::vertex(project.store(), finest_key, 31, 31);
+    let off = on * 1.01;
+    let dabs = vec![dab(off, 0.002, 0.01, 0.0, 0)];
+    let mut stroke = Stroke::new(project.store());
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    preview
+        .show(project.store(), &index, &dabs, &display_only)
+        .unwrap();
+    apply_dabs(project.store(), &mut index, &mut stroke, &dabs).unwrap();
+    preview
+        .land(project.store(), &index, 1, &display_only)
+        .unwrap();
+    preview.end_stroke(project.store()).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    let store = project.store();
+    let left: Vec<TileKey> = store.display_previewed().copied().collect();
+    for key in &left {
+        assert!(
+            store.display_changes(key).is_some(),
+            "{key:?}: a preview outliving its stroke is over a tile the refresh will rebuild"
+        );
+    }
     drop(project.close(false));
 }

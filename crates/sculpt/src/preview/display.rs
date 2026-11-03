@@ -156,6 +156,9 @@ pub(super) struct DisplayState {
     terms: Vec<f64>,
     /// Whether it was last handed to the store held.
     pub(super) published_held: Option<bool>,
+    /// Whether a dab moved a vertex of it, or a landing rebased one: else what it draws is its
+    /// record's, and once released and unchanged under it, the record is drawn again.
+    pub(super) moved: bool,
 }
 
 /// Where display vertex `(i, j)` of `key` lies on the finest level `finest`: the finest tile
@@ -495,6 +498,7 @@ impl DisplayState {
             terms: vec![0.0; cells],
             quads,
             published_held: None,
+            moved: false,
         };
         let landed = stroke.len().saturating_sub(pending.len());
         for (n, dab) in stroke.iter().enumerate() {
@@ -510,11 +514,13 @@ impl DisplayState {
 
     /// Adds `dab` to the preview, after every dab it holds: its move to what is drawn if
     /// `drawn` (a dab still to land), and to the normals, `G` and the bound in any case. Returns
-    /// whether it moved a vertex.
+    /// whether it touched the preview (counted in its bound, if nothing else): it is to be
+    /// handed to the store again.
     pub(super) fn take(&mut self, dab: &Imprint, drawn: bool) -> bool {
         if !touches(self.bounds.as_ref(), dab) {
             return false;
         }
+        let mut touched = false;
         let e0 = self.pen_down_bound;
         for quad in &self.quads {
             let at_corner = quad
@@ -529,6 +535,7 @@ impl DisplayState {
             for (cell, sum) in quad.cells.iter().zip(terms) {
                 if at_corner || touches(cell.as_ref(), dab) {
                     *sum += share;
+                    touched = true;
                 }
             }
         }
@@ -569,12 +576,13 @@ impl DisplayState {
                 }
             }
         }
-        moved
+        self.moved |= moved;
+        touched || moved
     }
 
     /// Rebases the vertices inside finest tiles `changed` (gathered in `blocks.now`) on the
     /// store's bits, moved by `pending`, the dabs still to land: after a landing changed them.
-    /// Returns whether any vertex was rebased.
+    /// Returns whether any vertex's bits changed.
     pub(super) fn rebase(
         &mut self,
         finest: Level,
@@ -601,10 +609,13 @@ impl DisplayState {
                         at = at + Vec3::new(x, y, z);
                     }
                 }
-                *out = at;
-                any = true;
+                if out.to_bits() != at.to_bits() {
+                    *out = at;
+                    any = true;
+                }
             }
         }
+        self.moved |= any;
         any
     }
 

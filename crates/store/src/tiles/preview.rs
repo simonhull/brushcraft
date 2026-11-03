@@ -261,14 +261,12 @@ impl TileStore {
         self.previews.display.get(key)
     }
 
-    /// Takes display tile `key`'s preview out, if it has one, for the brush to make it again;
-    /// noted for the next preview epoch whether it is set again or not.
-    pub fn take_display_preview(&mut self, key: &TileKey) -> Option<DisplayPreview> {
-        let taken = self.previews.display.remove(key);
-        if taken.is_some() {
+    /// Clears display tile `key`'s preview, if it has one: a renderer draws its record again.
+    /// Noted for the next preview epoch.
+    pub fn clear_display_preview(&mut self, key: &TileKey) {
+        if self.previews.display.remove(key).is_some() {
             self.previews.changed.insert(*key);
         }
-        taken
     }
 
     /// Every display tile with a preview, in key order.

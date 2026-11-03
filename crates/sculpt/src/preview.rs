@@ -405,6 +405,8 @@ impl Preview {
         }
         self.reach.clear();
         let mut published = Ok(());
+        let all: Vec<TileKey> = self.displays.keys().copied().collect();
+        self.forget_unchanged(store, all);
         for mut state in std::mem::take(&mut self.displays).into_values() {
             if state.published_held == Some(true) {
                 let key = *state.key();
@@ -483,10 +485,21 @@ impl Preview {
         drawn: &impl Drawn,
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
-        let tiles = self.display_tiles(new.len(), drawn);
-        let (known, fresh): (Vec<TileKey>, Vec<TileKey>) = tiles
-            .into_iter()
-            .partition(|key| self.displays.contains_key(key));
+        // Every display preview the stroke has that the dabs reach takes them, drawn now or not
+        // (one drawn later must hold them); of the others, those drawn are made.
+        let reached = self.display_tiles(new.len(), &DrawsAll);
+        let (known, fresh): (BTreeSet<TileKey>, Vec<TileKey>) = (
+            reached
+                .iter()
+                .filter(|key| self.displays.contains_key(key))
+                .copied()
+                .collect(),
+            reached
+                .iter()
+                .filter(|key| !self.displays.contains_key(key) && drawn.draws(key))
+                .copied()
+                .collect(),
+        );
         let mut moving: Vec<&mut DisplayState> = self
             .displays
             .iter_mut()
@@ -600,8 +613,11 @@ impl Preview {
         let Some(finest) = store.display_finest() else {
             return Ok(());
         };
+        // The tiles the stroke wrote among those the landing can have changed (a tile it reached
+        // and moved nothing of keeps its bits, which the records above it hold already).
         let under: BTreeSet<TileKey> = changed
             .iter()
+            .filter(|key| store.pen_down_shape(key).is_some())
             .filter(|key| display_ancestors(key).any(|above| self.displays.contains_key(&above)))
             .copied()
             .collect();
@@ -621,7 +637,26 @@ impl Preview {
             })
             .map(|((key, _), _)| *key)
             .collect();
+        let again = self.forget_unchanged(store, again);
         self.publish(store, &again, stats)
+    }
+
+    /// Of `keys`, the display previews to hand the store again: a released one that never moved
+    /// a vertex, over a tile no landed dab changed (no bump on its record), is dropped and its
+    /// store preview cleared instead, its record drawn again (nothing would refresh it).
+    fn forget_unchanged(&mut self, store: &mut TileStore, keys: Vec<TileKey>) -> Vec<TileKey> {
+        keys.into_iter()
+            .filter(|key| {
+                let unchanged = !store.preview_held(key)
+                    && store.display_changes(key).is_none()
+                    && self.displays.get(key).is_some_and(|state| !state.moved);
+                if unchanged {
+                    self.displays.remove(key);
+                    store.clear_display_preview(key);
+                }
+                !unchanged
+            })
+            .collect()
     }
 
     /// Shows `new` (see [`Preview::show`]).
