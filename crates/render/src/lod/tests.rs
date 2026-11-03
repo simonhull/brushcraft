@@ -26,6 +26,7 @@ use crate::surface::Size;
 use crate::tree::{GpuNode, NODE_BYTES, NODE_FINEST, TileTree};
 use crate::upload::{GpuVertex, TileDetail};
 
+mod budget;
 mod orbit;
 
 /// Level `l`.
@@ -1015,7 +1016,7 @@ fn a_spike_of_detail_is_relaxed_into_neighbours_a_level_apart_or_drawn_coarser()
 }
 
 #[test]
-fn the_triangle_budget_caps_the_cut_and_refines_the_largest_errors_first() {
+fn the_triangle_budget_caps_what_is_drawn_and_refines_the_largest_errors_first() {
     GpuTest::run(|gpu| {
         let mesh = cube_sphere(1).expect("a mesh");
         let mut scene = Scene::new(gpu, mesh, level(8), |_| true, |_| 0.3);
@@ -1035,19 +1036,27 @@ fn the_triangle_budget_caps_the_cut_and_refines_the_largest_errors_first() {
         let capped = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
         check_partition(&scene, &capped);
         check_neighbours(&scene, &capped, Some(&view));
-        // Recounted from the cut on the CPU, not taken from the GPU's own count.
-        let recount: u32 = places(&capped)
-            .iter()
-            .map(|place| 2 * place.level().tile_quads().pow(2))
-            .sum();
+        // The budget caps what is drawn (tiles out of view or facing away spend nothing),
+        // recounted from the tiles drawn on the CPU, not taken from the GPU's own count.
+        let recount = |keys: &BTreeSet<TileKey>| -> u32 {
+            keys.iter()
+                .map(|key| 2 * key.level().tile_quads().pow(2))
+                .sum()
+        };
+        let drawn = recount(&capped.drawn);
         assert!(
-            recount <= budget,
-            "{recount} triangles in the cut: {:?}",
+            drawn <= budget,
+            "{drawn} triangles drawn: {:?}",
             capped.stats
         );
-        assert_eq!(recount, capped.stats.cut_triangles, "the GPU's count");
+        assert_eq!(drawn, capped.stats.drawn_triangles, "the GPU's count");
+        assert_eq!(
+            recount(&capped.cut),
+            capped.stats.cut_triangles,
+            "the GPU's count"
+        );
         assert!(
-            capped.stats.refined_triangles <= budget,
+            drawn <= capped.stats.refined_triangles && capped.stats.refined_triangles <= budget,
             "{:?}",
             capped.stats
         );

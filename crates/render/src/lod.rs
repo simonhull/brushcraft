@@ -24,11 +24,28 @@
 //! - **Completeness.** A tile is refined only when all its children are resident, so the cut covers
 //!   every face exactly once; tiles under a missing one are unreachable and ignored. The pinned
 //!   floor means level 0 is always there.
-//! - **Budget.** The tier's triangle budget caps the refinements: every possible refinement's added
-//!   triangles go into a histogram by its screen error (capped by its ancestors', so the refined
-//!   set stays a tree), and refinement stops at the error where the budget runs out. Tiles left
-//!   over 1 px are counted and reported ([`LodStats::over_pixel`]); higher errors are refined
-//!   first.
+//! - **Budget.** The tier's triangle budget caps what the cut draws (spec, "Triangle budget"):
+//!   every possible refinement's charge goes into a histogram by its rank, and the worst are
+//!   refined first, until the budget is spent. Tiles left over 1 px are counted and reported
+//!   ([`LodStats::over_pixel`]). When it binds (spec, "When it binds"):
+//!   - *Charged by what is drawn.* A refinement is charged what its children draw beyond what it
+//!     draws, each drawn when in the frustum by its own sphere and not facing away by its own
+//!     triangles, as drawing culls: a tile out of view or facing away, with all under it, spends
+//!     nothing, however loose its `e`. Its rank is its `e` projected over its own sphere, capped by
+//!     its ancestors' (so the refined set stays a tree): the sphere grown by `e`, which the wanting
+//!     test keeps, reaches the near plane for a loose `e` and projects it without limit.
+//!   - *No cut-off at a bucket.* The histogram's buckets are taken whole, worst first, down to the
+//!     one that doesn't fit; that partial bucket's tiles are then taken by finer bins (a 128th of
+//!     the bucket, and the level, coarse first), worst first, until the budget is spent to within a
+//!     bin, typically a tile's charge. Bins, not a race for what is left, so the choice is the same
+//!     every frame.
+//!   - *What the sweep takes back is given back.* The neighbour rule's sweep takes back a
+//!     refinement whose neighbour wasn't raised (the relaxation found no budget left); its charge
+//!     is recounted and spent again, a level at a time, coarse to fine, on the tiles of the cut
+//!     whose seams hold and that need refining: wanting it, or needed by the neighbour rule for a
+//!     tile that does, spread as the relaxation does, at that tile's error, worst first.
+//!   - These passes run only when the budget binds (gated on the GPU, `gate.wgsl`'s `binds`): with
+//!     room for everything wanted, the choice is the one without them.
 //! - **Neighbours at most one level apart.** A fixed number of relaxation passes
 //!   ([`LodConfig::with_relax_passes`]) raises any tile in the cut that touches an area two levels
 //!   finer. Then a sweep, coarse to fine, keeps a refinement only where every edge neighbour is
@@ -167,6 +184,7 @@
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -177,7 +195,7 @@ use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding, BufferBindingType,
-    BufferDescriptor, BufferSize, BufferUsages, CommandEncoder, ComputePassDescriptor,
+    BufferDescriptor, BufferSize, BufferUsages, CommandEncoder, ComputePass, ComputePassDescriptor,
     ComputePassTimestampWrites, ComputePipeline, MapMode, QUERY_SIZE, QuerySet, QuerySetDescriptor,
     QueryType, ShaderStages, TextureSampleType, TextureViewDimension,
 };
@@ -499,14 +517,14 @@ struct NodeWork {
     memory: u32,
     /// This frame's state.
     flags: u32,
-    /// The projected `e`, pixels.
+    /// The projected `e`, pixels, over the tile's sphere grown by `e`.
     priority: f32,
-    /// The priority capped by the ancestors'.
+    /// The rank capped by the ancestors'.
     effective: f32,
     /// Its entry in the cut.
     cut_index: u32,
-    /// Zero.
-    reserved: u32,
+    /// The projected `e`, pixels, over the tile's own sphere: what the budget ranks it by.
+    rank: f32,
 }
 
 /// Indexed indirect draw arguments, WGSL's `DrawArgs`.
@@ -589,9 +607,19 @@ struct GpuFrame {
     raises: [u32; MAX_RELAX_PASSES as usize],
     /// The budget's histogram.
     histogram: [u32; BUCKETS],
+    /// The bucket the budget couldn't take whole; [`BUCKETS`] when it took every one.
+    partial: u32,
+    /// Budget units charged after the sweep, the give-back included (where the budget binds).
+    charged: u32,
+    /// Refinements the fill admitted from the partial bucket.
+    filled: u32,
+    /// Refinements given back after the sweep.
+    given_back: u32,
+    /// 1 if the budget's passes ran (encoded, and the budget binds).
+    budget_ran: u32,
 }
 
-/// The bytes of [`GpuFrame`].
+/// The bytes of [`GpuFrame`]: what the readback copies of the frame buffer.
 const FRAME_BYTES: u64 = size_of::<GpuFrame>() as u64;
 
 /// Byte offset of [`GpuFrame::post`] in the frame buffer: the second draw's arguments.
@@ -603,6 +631,20 @@ const POST_GROUPS: u64 = 2 * POST_ARGS;
 /// The dispatch-arguments entry the second phase's dispatch is copied to, past the relaxation
 /// passes'.
 const POST_SLOT: u32 = MAX_RELAX_PASSES + 1;
+
+/// The dispatch-arguments entry of the passes over every node that run only when the budget
+/// binds (the fill's, the recount and the give-back's), set by the budget's gate after the
+/// threshold.
+const REFILL_SLOT: u32 = POST_SLOT + 1;
+
+/// [`REFILL_SLOT`]'s companion for the budget's one-workgroup passes (clearing its scratch and
+/// its thresholds).
+const ONCE_SLOT: u32 = REFILL_SLOT + 1;
+
+/// Bytes of the frame buffer past [`GpuFrame`], which the readback leaves out: the fine bins and
+/// the per-level buckets the budget's passes work in (`lod.wgsl`'s `LodFrame` from
+/// `fine_threshold`).
+const SCRATCH_BYTES: u64 = 4 * (2 + 2048 + BUCKETS as u64);
 
 /// The frame's settings, WGSL's `LodParams`.
 #[repr(C)]
@@ -657,6 +699,18 @@ const GATE_WGSL: &str = include_str!("gate.wgsl");
 
 /// Word offset of [`GpuFrame::raises`] in the frame buffer.
 const RAISES_WORD: usize = std::mem::offset_of!(GpuFrame, raises) / 4;
+
+/// The byte offsets in the dispatch arguments of the budget's passes' dispatches: over every node
+/// ([`REFILL_SLOT`]) and of one workgroup ([`ONCE_SLOT`]).
+const fn budget_slots() -> (u64, u64) {
+    (
+        REFILL_SLOT as u64 * DISPATCH_BYTES,
+        ONCE_SLOT as u64 * DISPATCH_BYTES,
+    )
+}
+
+/// Word offset of [`GpuFrame::partial`] in the frame buffer, which the budget's gate reads.
+const PARTIAL_WORD: usize = std::mem::offset_of!(GpuFrame, partial) / 4;
 
 /// Bytes of one dispatch's indirect arguments: three `u32` workgroup counts.
 const DISPATCH_BYTES: u64 = 12;
@@ -838,8 +892,11 @@ pub struct LodStats {
     pub cut: u32,
     /// Triangles of the cut.
     pub cut_triangles: u32,
-    /// Triangles the refinements were charged, within the budget: in [`BUDGET_UNIT`]s, so an
-    /// upper bound on [`LodStats::cut_triangles`].
+    /// Triangles the refinements were charged, within the budget, in [`BUDGET_UNIT`]s: by what
+    /// each draws (a tile out of view or facing away spends nothing), so an upper bound on
+    /// [`LodStats::drawn_triangles`] but for tiles drawn because their morph isn't settled
+    /// ([`LodStats::cone_exempt`]). Where the budget binds, the charge of the final choice,
+    /// recounted after the sweep, the give-back included.
     pub refined_triangles: u32,
     /// Triangles drawn, both phases.
     pub drawn_triangles: u32,
@@ -873,12 +930,30 @@ pub struct LodStats {
     pub cone_exempt: u32,
     /// Tiles each relaxation pass raised, for the passes run.
     pub raises: Vec<u32>,
+    /// Where the budget binds, the histogram bucket it couldn't take whole (an eighth of an
+    /// octave each, from 2⁻⁸ px), whose tiles were admitted until the budget was spent; `None`
+    /// when the budget refined everything wanted. [`LodStats::budget_error`] in pixels.
+    pub partial_bucket: Option<u32>,
+    /// Refinements admitted from the partial bucket before the relaxation.
+    pub filled: u32,
+    /// Refinements admitted after the sweep with the charge it took back.
+    pub given_back: u32,
     /// Clusters, retries and cut entries past their lists' ends: zero unless a list is too
     /// small.
     pub overflow: (u32, u32, u32),
 }
 
 impl LodStats {
+    /// The least screen error, in pixels, of the bucket the budget couldn't take whole
+    /// ([`LodStats::partial_bucket`]): about where the budget stopped refining, worst first.
+    /// `None` when the budget didn't bind.
+    #[must_use]
+    pub fn budget_error(&self) -> Option<f32> {
+        self.partial_bucket
+            .and_then(|bucket| u16::try_from(bucket).ok())
+            .map(|bucket| (f32::from(bucket) / 8.0 - 8.0).exp2())
+    }
+
     /// The relaxation passes that raised anything: how many the frame needed, if it settled
     /// within those run (the last pass run raising something means it may not have).
     #[must_use]
@@ -963,10 +1038,22 @@ enum Readback {
 /// A readback buffer going back to the level choice that made it.
 #[derive(Debug)]
 enum Returned {
-    /// Free for another frame: read, or never submitted.
+    /// Free for another frame: never submitted, or dropped unread.
     Free(Buffer),
+    /// Free for another frame, read: with what its frame's budget said.
+    Read(Buffer, BudgetSeen),
     /// Gone: its mapping failed.
     Lost,
+}
+
+/// What a frame read back said of the triangle budget, for deciding whether the next frames
+/// encode the passes that run when it binds ([`Lod::encode_main`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BudgetSeen {
+    /// Triangles the choice was charged ([`LodStats::refined_triangles`]).
+    charged: u32,
+    /// Whether the budget bound ([`LodStats::partial_bucket`]).
+    binds: bool,
 }
 
 /// A frame's readback, encoded: call [`CutReadback::submitted`] once its command buffer is
@@ -1059,8 +1146,18 @@ impl CutReader {
             };
             let read = read_output(&buffer, finest, frame, clock);
             buffer.unmap();
+            let returned = match &read {
+                Ok(output) => Returned::Read(
+                    buffer,
+                    BudgetSeen {
+                        charged: output.stats.refined_triangles,
+                        binds: output.stats.partial_bucket.is_some(),
+                    },
+                ),
+                Err(_) => Returned::Free(buffer),
+            };
             // A level choice that's gone has nothing to take back.
-            drop(self.back.send(Returned::Free(buffer)));
+            drop(self.back.send(returned));
             outputs.push(read?);
         }
         Ok(outputs)
@@ -1164,7 +1261,8 @@ pub struct Lod {
     /// [`GpuStep`]s, one per [`UNIFORM_STRIDE`].
     steps: Buffer,
     /// Indirect dispatch arguments: entry 0 every node, entry `k` relaxation pass `k`'s (set
-    /// by the gate after pass `k - 1`), entry [`POST_SLOT`] the second phase's.
+    /// by the gate after pass `k - 1`), entry [`POST_SLOT`] the second phase's, entry
+    /// [`REFILL_SLOT`] the budget's passes (set by the budget's gate).
     dispatches: Buffer,
     /// The gate's bind group: the frame buffer, the dispatch arguments, the steps.
     gate_group: BindGroup,
@@ -1198,6 +1296,10 @@ pub struct Lod {
     returned: Receiver<Returned>,
     /// Timestamp queries, once [`Lod::enable_timing`] is called on a device that has them.
     timer: Option<Timer>,
+    /// Whether the last frame read back had the budget binding or at least half spent (`true`
+    /// until one is read): the frame then encodes the passes that run when it binds, which cost
+    /// their dispatches even when the GPU finds it doesn't and runs them on no workgroup.
+    budget_near: bool,
 }
 
 /// The level choice's compute pipelines.
@@ -1225,8 +1327,30 @@ struct Pipelines {
     post: ComputePipeline,
     /// `post_finish`.
     post_finish: ComputePipeline,
+    /// `scratch_clear`.
+    scratch_clear: ComputePipeline,
+    /// `fill_count`.
+    fill_count: ComputePipeline,
+    /// `fill_threshold`.
+    fill_threshold: ComputePipeline,
+    /// `fill`.
+    fill: ComputePipeline,
+    /// `recount`.
+    recount: ComputePipeline,
+    /// `need_init`.
+    need_init: ComputePipeline,
+    /// `need_spread`.
+    need_spread: ComputePipeline,
+    /// `back_count`.
+    back_count: ComputePipeline,
+    /// `back_threshold`.
+    back_threshold: ComputePipeline,
+    /// `give_back`.
+    give_back: ComputePipeline,
     /// `gate`, with its own layout.
     gate: ComputePipeline,
+    /// `binds`, the budget's gate, on the gate's layout.
+    binds: ComputePipeline,
 }
 
 /// A layout entry for a buffer binding.
@@ -1299,7 +1423,7 @@ impl Lod {
         let frame = gpu.scoped("lod frame", || {
             device.create_buffer(&BufferDescriptor {
                 label: Some("lod frame"),
-                size: FRAME_BYTES,
+                size: FRAME_BYTES + SCRATCH_BYTES,
                 usage: BufferUsages::STORAGE
                     | BufferUsages::INDIRECT
                     | BufferUsages::COPY_SRC
@@ -1325,7 +1449,7 @@ impl Lod {
         let dispatches = gpu.scoped("lod dispatches", || {
             device.create_buffer(&BufferDescriptor {
                 label: Some("lod dispatches"),
-                size: (u64::from(POST_SLOT) + 1) * DISPATCH_BYTES,
+                size: (u64::from(ONCE_SLOT) + 1) * DISPATCH_BYTES,
                 usage: BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
@@ -1379,6 +1503,7 @@ impl Lod {
             returns,
             returned,
             timer: None,
+            budget_near: true,
         })
     }
 
@@ -1505,6 +1630,9 @@ impl Lod {
     ) -> Result<(), LodError> {
         self.check(inputs)?;
         self.write_settings(gpu, inputs);
+        // What the readbacks said since the last frame: whether to encode the budget's passes.
+        self.take_unused();
+        let budget = self.budget_near;
         let passes = self.config.relax_passes;
         let group = self.group(gpu, inputs)?;
         let pyramid = inputs
@@ -1531,12 +1659,23 @@ impl Lod {
             pass.dispatch_workgroups(1, 1, 1);
             pass.set_pipeline(&p.mark);
             pass.dispatch_workgroups(nodes, 1, 1);
+            if budget {
+                pass.set_pipeline(&p.binds);
+                pass.set_bind_group(0, &self.gate_group, &[0]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
         }
+        let levels = 0..u32::from(inputs.finest.get());
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("lod relax"),
                 timestamp_writes: stage_writes(self.timer.as_ref(), stamps, Stage::Relax),
             });
+            pass.set_bind_group(0, &group, &[0]);
+            pass.set_bind_group(1, &phase, &[]);
+            if budget {
+                self.encode_fill(&mut pass);
+            }
             for index in 0..passes {
                 pass.set_pipeline(&p.relax);
                 pass.set_bind_group(0, &group, &[step(index)]);
@@ -1557,9 +1696,12 @@ impl Lod {
             });
             pass.set_bind_group(1, &phase, &[]);
             pass.set_pipeline(&p.sweep);
-            for level in 0..u32::from(inputs.finest.get()) {
+            for level in levels.clone() {
                 pass.set_bind_group(0, &group, &[step(level)]);
                 pass.dispatch_workgroups(nodes, 1, 1);
+            }
+            if budget {
+                self.encode_give_back(&mut pass, &group, levels);
             }
         }
         {
@@ -1584,6 +1726,53 @@ impl Lod {
         );
         self.group = Some(group);
         Ok(())
+    }
+
+    /// Encodes the budget's fill into `pass` (group 0 bound at the first step): where the budget
+    /// binds, the partial bucket's tiles by fine bin, before the relaxation, so its passes raise
+    /// around what the fill admits as around what mark refined. Gated: with the budget not
+    /// binding, its dispatches are of no workgroup.
+    fn encode_fill(&self, pass: &mut ComputePass<'_>) {
+        let p = &self.pipelines;
+        let (every, once) = budget_slots();
+        for (pipeline, slot) in [
+            (&p.scratch_clear, once),
+            (&p.fill_count, every),
+            (&p.fill_threshold, once),
+            (&p.fill, every),
+        ] {
+            pass.set_pipeline(pipeline);
+            pass.dispatch_workgroups_indirect(&self.dispatches, slot);
+        }
+    }
+
+    /// Encodes giving back into `pass` after the sweep, over `levels` coarse to fine, `group`
+    /// group 0: where the budget binds, what the sweep took back is recounted and spent again on
+    /// the tiles that need refining. Gated as [`Lod::encode_fill`].
+    fn encode_give_back(&self, pass: &mut ComputePass<'_>, group: &BindGroup, levels: Range<u32>) {
+        let p = &self.pipelines;
+        let (every, once) = budget_slots();
+        let step = |index: u32| index * u32::try_from(UNIFORM_STRIDE).unwrap_or(256);
+        pass.set_bind_group(0, group, &[0]);
+        for pipeline in [&p.recount, &p.need_init] {
+            pass.set_pipeline(pipeline);
+            pass.dispatch_workgroups_indirect(&self.dispatches, every);
+        }
+        pass.set_pipeline(&p.need_spread);
+        for _ in 0..self.config.relax_passes {
+            pass.dispatch_workgroups_indirect(&self.dispatches, every);
+        }
+        for level in levels {
+            pass.set_bind_group(0, group, &[step(level)]);
+            for (pipeline, slot) in [
+                (&p.back_count, every),
+                (&p.back_threshold, once),
+                (&p.give_back, every),
+            ] {
+                pass.set_pipeline(pipeline);
+                pass.dispatch_workgroups_indirect(&self.dispatches, slot);
+            }
+        }
     }
 
     /// Checks a frame's inputs against what the level choice was made for.
@@ -1791,6 +1980,11 @@ impl Lod {
         while let Ok(returned) = self.returned.try_recv() {
             match returned {
                 Returned::Free(buffer) => self.free.push(buffer),
+                Returned::Read(buffer, seen) => {
+                    self.free.push(buffer);
+                    self.budget_near =
+                        seen.binds || seen.charged >= self.config.triangle_budget / 2;
+                }
                 Returned::Lost => self.made = self.made.saturating_sub(1),
             }
         }
@@ -2061,8 +2255,12 @@ impl Pipelines {
         gate_layout: &BindGroupLayout,
         patches: &[(&str, &str)],
     ) -> Result<Self, GpuError> {
-        let gate_source = format!("const RAISES: u32 = {RAISES_WORD}u;\n{GATE_WGSL}");
+        let gate_source = format!(
+            "const RAISES: u32 = {RAISES_WORD}u;\nconst PARTIAL: u32 = {PARTIAL_WORD}u;\n\
+             const REFILL: u32 = {REFILL_SLOT}u;\nconst ONCE: u32 = {ONCE_SLOT}u;\n{GATE_WGSL}"
+        );
         let gate = pipeline(gpu, "lod gate", &gate_source, &[gate_layout], "gate")?;
+        let binds = pipeline(gpu, "lod binds", &gate_source, &[gate_layout], "binds")?;
         let mut source =
             format!("{NODE_WGSL}{REQUESTS_WGSL}{CULL_WGSL}{CLUSTER_WGSL}{MORPH_WGSL}{LOD_WGSL}");
         for (from, to) in patches {
@@ -2090,7 +2288,18 @@ impl Pipelines {
             finish: make("finish")?,
             post: make("post")?,
             post_finish: make("post_finish")?,
+            scratch_clear: make("scratch_clear")?,
+            fill_count: make("fill_count")?,
+            fill_threshold: make("fill_threshold")?,
+            fill: make("fill")?,
+            recount: make("recount")?,
+            need_init: make("need_init")?,
+            need_spread: make("need_spread")?,
+            back_count: make("back_count")?,
+            back_threshold: make("back_threshold")?,
+            give_back: make("give_back")?,
             gate,
+            binds,
         })
     }
 }
@@ -2238,10 +2447,17 @@ fn key_order(key: &TileKey) -> u128 {
 
 /// The counts of a frame's results.
 fn stats(frame: &GpuFrame) -> LodStats {
+    let binds = usize::try_from(frame.partial).is_ok_and(|bucket| bucket < BUCKETS);
+    let recounted = binds && frame.budget_ran != 0;
     LodStats {
         cut: frame.cut_count,
         cut_triangles: frame.cut_triangles,
-        refined_triangles: frame.triangles.saturating_mul(BUDGET_UNIT),
+        refined_triangles: if recounted {
+            frame.charged
+        } else {
+            frame.triangles
+        }
+        .saturating_mul(BUDGET_UNIT),
         drawn_triangles: frame.drawn_triangles,
         drawn: (frame.drawn_main, frame.drawn_post),
         clusters: (frame.main.instance_count, frame.post.instance_count),
@@ -2261,6 +2477,9 @@ fn stats(frame: &GpuFrame) -> LodStats {
         stuck: frame.stuck,
         cone_exempt: frame.cone_exempt,
         raises: frame.raises.to_vec(),
+        partial_bucket: binds.then_some(frame.partial),
+        filled: frame.filled,
+        given_back: frame.given_back,
         overflow: (
             frame.cluster_overflow,
             frame.retry_overflow,
