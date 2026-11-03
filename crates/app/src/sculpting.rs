@@ -221,6 +221,10 @@ fn smoothed_interval(interval: Duration, gap: Duration) -> Duration {
 /// Tiles the warming evaluates together on the store's workers between checks of its deadline.
 pub(crate) const WARM_BATCH: usize = 16;
 
+/// How many dab spacings ahead of an open stroke's last dab the warming ahead of it looks
+/// ([`Sculpting::warm_ahead`]): as many as a fast stroke places in a frame or two.
+pub(crate) const AHEAD_DABS: usize = 6;
+
 /// What applying dabs costs: the one cost model the brush's budget turns time into dabs with (see
 /// "The budget" in the module notes), in one place to retune.
 ///
@@ -514,6 +518,8 @@ struct Pending {
     start_noted: bool,
     /// When its `Down` was received: what its start is dated by, for the pivot.
     down_at: Instant,
+    /// Its last two dabs placed, the latest last: where it heads, for the warming ahead of it.
+    heading: [Option<Dab>; 2],
 }
 
 impl Pending {
@@ -542,12 +548,17 @@ impl Pending {
 /// Queues `placed` on a stroke's `queue`: dabs placed by the sample at `times`, each with the
 /// tiles of `index` its sphere touches.
 fn enqueue(
-    (dabs, sources): (&mut VecDeque<Dab>, &mut VecDeque<Source>),
+    (dabs, sources, heading): (
+        &mut VecDeque<Dab>,
+        &mut VecDeque<Source>,
+        &mut [Option<Dab>; 2],
+    ),
     placed: impl Iterator<Item = Dab>,
     times: SampleTimes,
     index: &SpatialIndex,
 ) {
     for dab in placed {
+        *heading = [heading[1], Some(dab)];
         let [x, y, z] = dab.position;
         let touched = index.query_sphere(geom::Vec3::new(x, y, z), dab.radius);
         let keys: Vec<TileKey> = touched.collect();
@@ -638,6 +649,10 @@ pub(crate) struct Sculpting {
     index_stale: bool,
     /// The warming under a hovering pen.
     warm: Warm,
+    /// Where the warming ahead of the open stroke last listed its tiles.
+    ahead_warmed: Option<geom::Vec3>,
+    /// The tiles ahead of the open stroke still to evaluate.
+    ahead_todo: Vec<TileKey>,
     /// The last error, for the overlay; cleared as a stroke starts cleanly.
     error: Option<String>,
     /// Errors kept or cleared so far, for the overlay to see a change.
@@ -680,6 +695,8 @@ impl Sculpting {
             deferred: Vec::new(),
             index_stale: false,
             warm: Warm::default(),
+            ahead_warmed: None,
+            ahead_todo: Vec::new(),
             error: None,
             errors: 0,
             last: BrushReport::default(),
@@ -932,6 +949,7 @@ impl Sculpting {
             interval: FIRST_INTERVAL,
             start_noted: false,
             down_at: down.received,
+            heading: [None, None],
         });
     }
 
@@ -960,7 +978,11 @@ impl Sculpting {
         pending.last = times;
         match finished {
             Ok(()) => {
-                let queue = (&mut pending.dabs, &mut pending.sources);
+                let queue = (
+                    &mut pending.dabs,
+                    &mut pending.sources,
+                    &mut pending.heading,
+                );
                 enqueue(queue, placed, times, scene.index);
                 pending.note_start(&mut self.stroke_start);
             }
@@ -987,7 +1009,11 @@ impl Sculpting {
         let tail = engine.end(&projector, &mut surface);
         match surface.finish() {
             Ok(()) => {
-                let queue = (&mut pending.dabs, &mut pending.sources);
+                let queue = (
+                    &mut pending.dabs,
+                    &mut pending.sources,
+                    &mut pending.heading,
+                );
                 enqueue(queue, tail, times, scene.index);
                 pending.note_start(&mut self.stroke_start);
             }
@@ -1472,6 +1498,53 @@ impl Sculpting {
         self.warm.todo = cold_tiles(scene.project.store(), scene.index, &hit, reach);
     }
 
+    /// Warms a batch of the ground ahead of the open stroke: the tiles within the reach
+    /// ([`stroke::REACH_RADII`] radii) of where its dabs head, [`AHEAD_DABS`] spacings past its
+    /// last, not evaluated yet. A heading met before (within a radius of the last one warmed) is
+    /// not listed again.
+    fn warm_ahead(&mut self, scene: &mut Scene<'_>) {
+        let Some([Some(previous), Some(last)]) = self.stroke.as_ref().map(|stroke| stroke.heading)
+        else {
+            return;
+        };
+        let at = |dab: &Dab| geom::Vec3::new(dab.position[0], dab.position[1], dab.position[2]);
+        let step = at(&last) - at(&previous);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a few spacings ahead, a small count"
+        )]
+        let ahead = at(&last) + step * (AHEAD_DABS as f32);
+        let near_last = self
+            .ahead_warmed
+            .is_some_and(|warmed| (warmed - ahead).length() < last.radius);
+        if !near_last {
+            self.ahead_warmed = Some(ahead);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the index's query is f32, as the dab's radius"
+            )]
+            let reach = (REACH_RADII * f64::from(last.radius)) as f32;
+            let store = &*scene.project.store();
+            let found = scene.index.query_sphere(ahead, reach);
+            self.ahead_todo = found
+                .filter(|key| store.cached_positions(key).is_none())
+                .collect();
+        }
+        let split = self.ahead_todo.len().saturating_sub(WARM_BATCH);
+        let batch = self.ahead_todo.split_off(split);
+        if batch.is_empty() {
+            return;
+        }
+        if let Err(error) = scene
+            .project
+            .store()
+            .evaluate_many(&batch, Evaluation::Positions)
+        {
+            self.ahead_todo.clear();
+            self.fail("warming the ground ahead of the stroke", &error);
+        }
+    }
+
     /// Evaluates the last [`WARM_BATCH`] tiles still to warm.
     fn warm_batch(&mut self, scene: &mut Scene<'_>) {
         let split = self.warm.todo.len().saturating_sub(WARM_BATCH);
@@ -1650,9 +1723,15 @@ impl Brush for Sculpting {
         let Some(mut scene) = Scene::of(context) else {
             return Ok(false);
         };
+        // Ahead of a drawing pen, the ground its next dabs will reach is warmed first, a batch a
+        // call: placement's reads there (the area normal, the raycasts) find it evaluated.
+        if self.stroke.as_ref().is_some_and(Pending::open) {
+            self.warm_ahead(&mut scene);
+        }
         if self.catching_up() > 0 {
             // The catch-up: finest work of the dabs shown, at least a dab a call, off the
-            // latency path. No warming meanwhile: the pen is down, or its stroke not landed.
+            // latency path. No warming under a hover meanwhile: the pen is down, or its stroke
+            // not landed.
             let now = Instant::now();
             let budget = BrushBudget::slice(now, deadline.saturating_duration_since(now));
             let mut report = BrushReport::default();
