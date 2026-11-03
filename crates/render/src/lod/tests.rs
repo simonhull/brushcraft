@@ -705,6 +705,126 @@ fn with_everything_resident_no_tile_in_view_is_left_over_a_pixel() {
     });
 }
 
+/// The view from `eye` towards `target` as [`look`] makes it, its field narrowed `factor` times:
+/// an unmagnified view of the image `look(eye, target).magnified(factor, [0.0, 0.0])` shows.
+fn narrowed(eye: Vec3, target: Vec3, factor: f64) -> View {
+    let wide = look(eye, target);
+    let fov_y = 2.0 * ((45_f64.to_radians() / 2.0).tan() / factor).atan();
+    View::look_at(eye, target, wide.up(), fov_y, size(), 0.01).expect("a view")
+}
+
+#[test]
+fn a_magnified_view_chooses_the_cut_of_the_narrowed_view_of_the_same_image() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut scene = Scene::new(gpu, mesh, level(8), |_| true, |_| 0.3);
+        let config = LodConfig::default()
+            .with_relax_passes(MAX_RELAX_PASSES)
+            .expect("valid");
+        let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+        let requests = request_buffer(gpu, 1024);
+        // Eyes just off the sphere, as the app's boundary holds them, looking at its surface
+        // (drawn finest, magnified or not); and two far out, whose unmagnified views draw the
+        // sphere coarser than their magnified ones must.
+        let poses = [
+            (Vec3::new(0.0, 0.0, 1.1), Vec3::new(0.0, 0.0, 1.0), 6.0),
+            (Vec3::new(0.7, 0.5, 0.6), Vec3::new(0.55, 0.45, 0.5), 20.0),
+            (Vec3::new(-1.0, 0.3, 0.4), Vec3::new(-0.9, 0.2, 0.3), 3.0),
+            (Vec3::new(0.0, 12.0, 1.5), Vec3::new(0.0, 1.0, 0.1), 4.0),
+            (Vec3::new(9.0, 9.0, 9.0), Vec3::new(0.5, 0.6, 0.6), 12.0),
+        ];
+        let mut finer = 0;
+        for (eye, target, factor) in poses {
+            let magnified = look(eye, target)
+                .magnified(factor, [0.0, 0.0])
+                .expect("magnified");
+            let narrowed = narrowed(eye, target, factor);
+            let ours = run(gpu, &mut lod, &mut scene, &requests, &magnified, None, None);
+            let theirs = run(gpu, &mut lod, &mut scene, &requests, &narrowed, None, None);
+            assert_eq!(ours.cut, theirs.cut, "{factor}x from {eye:?}: the cut");
+            assert_eq!(
+                ours.drawn, theirs.drawn,
+                "{factor}x from {eye:?}: what is drawn"
+            );
+            assert_eq!(ours.stats.over_pixel, 0, "{:?}", ours.stats);
+            let wide = look(eye, target);
+            let unmagnified = run(gpu, &mut lod, &mut scene, &requests, &wide, None, None);
+            let deepest = |output: &LodOutput| {
+                output
+                    .drawn
+                    .iter()
+                    .map(|key| key.level().get())
+                    .max()
+                    .unwrap_or(0)
+            };
+            finer += usize::from(deepest(&ours) > deepest(&unmagnified));
+        }
+        assert_eq!(
+            finer, 2,
+            "magnified from far out, the surface in view is drawn finer"
+        );
+    });
+}
+
+#[test]
+fn a_view_magnified_off_its_centre_leaves_no_tile_in_view_over_a_pixel() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut scene = Scene::new(gpu, mesh, level(8), |_| true, |_| 0.3);
+        let config = LodConfig::default()
+            .with_relax_passes(MAX_RELAX_PASSES)
+            .expect("valid");
+        let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+        let requests = request_buffer(gpu, 1024);
+        let mut rng = Rng(23);
+        let mut seen = 0;
+        for _ in 0..10 {
+            let direction = Vec3::new(
+                f64::from(rng.range(-1.0, 1.0)),
+                f64::from(rng.range(-1.0, 1.0)),
+                f64::from(rng.range(-1.0, 1.0)),
+            )
+            .normalized()
+            .expect("a direction");
+            let eye = direction * f64::from(rng.range(2.0, 12.0));
+            let factor = f64::from(rng.range(1.5, 30.0));
+            // Magnified about a pixel of the sphere's image, off the centre: the image's shift
+            // is what keeps that pixel where it was.
+            let about = [
+                f64::from(rng.range(220.0, 420.0)),
+                f64::from(rng.range(160.0, 320.0)),
+            ];
+            let shift = [
+                (1.0 - factor) * (about[0] - 320.0),
+                (1.0 - factor) * (about[1] - 240.0),
+            ];
+            let view = look(eye, Vec3::default())
+                .magnified(factor, shift)
+                .expect("magnified");
+            let output = run(gpu, &mut lod, &mut scene, &requests, &view, None, None);
+            check_partition(&scene, &output);
+            check_neighbours(&scene, &output, Some(&view));
+            assert_eq!(
+                output.stats.over_pixel, 0,
+                "{factor}x {shift:?}: {:?}",
+                output.stats
+            );
+            assert_eq!(output.stats.shortfall, 0, "settled: {:?}", output.stats);
+            assert!(
+                output.drawn.is_subset(&output.cut),
+                "drawn tiles are in the cut"
+            );
+            seen += usize::from(!output.drawn.is_empty());
+            for place in output.nodes.iter().map(|(_, place)| *place) {
+                if let Some(error) = cpu_error(&scene, &view, place) {
+                    assert!(error <= 1.0 + 1e-3, "{place:?}: {error} pixels on the CPU");
+                }
+            }
+        }
+        assert!(seen > 5, "the sphere is in most views: {seen}");
+    });
+}
+
 #[test]
 fn hysteresis_keeps_the_cut_still_for_a_camera_moving_back_and_forth_across_a_threshold() {
     GpuTest::run(|gpu| {
