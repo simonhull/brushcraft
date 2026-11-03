@@ -161,9 +161,12 @@ pub(crate) enum Outcome {
 pub(crate) struct Upkeep {
     /// The finest level, which the display tiles are built from.
     pub(crate) finest: Level,
-    /// The tiles still to build, finest level first, then in key order: a tile is built after
-    /// every tile one level finer that it reads.
-    pending: BTreeSet<(Reverse<Level>, TileKey)>,
+    /// The tiles still to build: those under a tile to build first ([`Upkeep::prioritise`])
+    /// before the others, and of each, the finest level first, then in key order: a tile is
+    /// built after every tile one level finer that it reads.
+    pending: BTreeSet<(Rank, Reverse<Level>, TileKey)>,
+    /// The tiles whose subtrees are built first: a renderer's coarse stand-ins that it draws.
+    first: BTreeSet<TileKey>,
     /// The tiles the workers are building, with the count of correction changes their inputs
     /// were taken at.
     pub(crate) in_flight: BTreeMap<TileKey, u64>,
@@ -454,6 +457,15 @@ impl CacheCaps {
     }
 }
 
+/// Where a tile to build goes among an [`Upkeep`]'s: under a tile to build first, or after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    /// Under (or one of) the tiles whose subtrees are built first.
+    First,
+    /// Any other.
+    Later,
+}
+
 impl Upkeep {
     /// Work building `keys` (display tiles of levels below `finest`), keeping at most `copies`
     /// finest copies ([`CacheCaps::copies`]).
@@ -468,8 +480,9 @@ impl Upkeep {
             pending: keys
                 .into_iter()
                 .filter(|key| key.level() < finest)
-                .map(|key| (Reverse(key.level()), key))
+                .map(|key| (Rank::Later, Reverse(key.level()), key))
                 .collect(),
+            first: BTreeSet::new(),
             in_flight: BTreeMap::new(),
             decoding: BTreeSet::new(),
             sender,
@@ -481,15 +494,51 @@ impl Upkeep {
         }
     }
 
-    /// The next tile to build: the finest level's first.
+    /// The next tile to build: the finest level's first, of those under a tile to build first
+    /// if any is left.
     pub(crate) fn next(&mut self) -> Option<TileKey> {
-        self.pending.pop_first().map(|(_, key)| key)
+        self.pending.pop_first().map(|(_, _, key)| key)
     }
 
     /// Puts `key` (back) among the tiles to build.
     pub(crate) fn push(&mut self, key: TileKey) {
         if key.level() < self.finest {
-            self.pending.insert((Reverse(key.level()), key));
+            let rank = self.rank(&key);
+            self.pending.insert((rank, Reverse(key.level()), key));
+        }
+    }
+
+    /// Builds the subtrees of `roots` first: every tile still to build under one of them (or one
+    /// of them) goes before the others, finest level first as ever. The same roots again change
+    /// nothing.
+    pub(crate) fn prioritise(&mut self, roots: &BTreeSet<TileKey>) {
+        if *roots == self.first {
+            return;
+        }
+        self.first.clone_from(roots);
+        let pending = std::mem::take(&mut self.pending);
+        self.pending = pending
+            .into_iter()
+            .map(|(_, level, key)| (self.rank(&key), level, key))
+            .collect();
+    }
+
+    /// Where `key` goes among the tiles to build: first if it is under (or is) a tile to build
+    /// first.
+    fn rank(&self, key: &TileKey) -> Rank {
+        let under = |root: &TileKey| {
+            if root.face() != key.face() || root.level() > key.level() {
+                return false;
+            }
+            let scale = key.level().tiles_per_side() / root.level().tiles_per_side().max(1);
+            let scale = scale.max(1);
+            (u32::from(key.tx()) / scale, u32::from(key.ty()) / scale)
+                == (u32::from(root.tx()), u32::from(root.ty()))
+        };
+        if self.first.iter().any(under) {
+            Rank::First
+        } else {
+            Rank::Later
         }
     }
 
@@ -587,6 +636,54 @@ mod tests {
         assert_eq!(upkeep.next(), Some(key(5, 0)), "then level 5");
         assert_eq!(upkeep.next(), Some(key(3, 0)), "then level 3");
         assert!(upkeep.is_empty(), "nothing left");
+    }
+
+    /// The subtrees of the tiles to build first come before every other tile, each still finest
+    /// level first; the others follow in their order, and a tile pushed back keeps its rank.
+    #[test]
+    fn the_subtrees_to_build_first_come_first_finest_level_first() {
+        let key = |face: u32, l: u8, tx: u16| {
+            TileKey::display(FaceId::new(face), Level::new(l).unwrap(), tx, 0).unwrap()
+        };
+        let mut upkeep = Upkeep::new(
+            Level::new(9).unwrap(),
+            [
+                key(0, 6, 0),
+                key(0, 7, 0),
+                key(0, 7, 1),
+                key(0, 8, 0),
+                key(0, 8, 2),
+                key(1, 8, 2),
+            ],
+            CacheCaps::MIN_COPIES,
+        );
+        // Level 7 has two tiles a side, level 8 four: level 7's tile 1 holds level 8's tile 2.
+        upkeep.prioritise(&BTreeSet::from([key(0, 7, 1)]));
+        assert_eq!(
+            upkeep.next(),
+            Some(key(0, 8, 2)),
+            "under the root, finest first"
+        );
+        upkeep.push(key(0, 8, 2));
+        assert_eq!(
+            upkeep.next(),
+            Some(key(0, 8, 2)),
+            "pushed back, still first"
+        );
+        assert_eq!(upkeep.next(), Some(key(0, 7, 1)), "then the root itself");
+        assert_eq!(
+            upkeep.next(),
+            Some(key(0, 8, 0)),
+            "then the rest, finest first"
+        );
+        assert_eq!(upkeep.next(), Some(key(1, 8, 2)));
+        assert_eq!(upkeep.next(), Some(key(0, 7, 0)));
+        assert_eq!(
+            upkeep.next(),
+            Some(key(0, 6, 0)),
+            "a coarser tile isn't under the root"
+        );
+        assert!(upkeep.is_empty());
     }
 
     /// The copies hold as of one count of correction changes: a change since empties them (and
