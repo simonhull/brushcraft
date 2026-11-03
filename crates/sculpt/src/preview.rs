@@ -84,7 +84,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use brush::{Imprint, Smoothstep, draw_imprint_vertex, draw_move};
 use geom::{GatheredBlock, Level, TileKey, Vec3};
-use store::{Aabb, CacheError, Evaluation, SpatialIndex, TileStore};
+use store::{Aabb, CacheError, DisplayPreview, Evaluation, SpatialIndex, TileStore};
 use stroke::Dab;
 
 use crate::apply::{SculptError, imprint_of};
@@ -347,9 +347,10 @@ impl Preview {
         }
         self.reach.clear();
         let mut published = Ok(());
-        for state in std::mem::take(&mut self.displays).into_values() {
+        for mut state in std::mem::take(&mut self.displays).into_values() {
             if state.published_held == Some(true) {
-                let set = store.set_display_preview(*state.key(), state.publish(false));
+                let key = *state.key();
+                let set = store.set_display_preview(key, state.publish(false));
                 published = published.and(set);
             }
         }
@@ -482,13 +483,22 @@ impl Preview {
         keys: &[TileKey],
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
-        for key in keys {
-            let held = store.preview_held(key);
-            if let Some(state) = self.displays.get_mut(key) {
-                store.set_display_preview(*key, state.publish(held))?;
-                state.published_held = Some(held);
-                stats.tiles_set += 1;
-            }
+        let wanted: BTreeSet<&TileKey> = keys.iter().collect();
+        let mut publishing: Vec<(bool, &mut DisplayState)> = self
+            .displays
+            .iter_mut()
+            .filter(|(key, _)| wanted.contains(key))
+            .map(|(key, state)| (store.preview_held(key), state))
+            .collect();
+        // Made on the workers, handed over in order.
+        let made: Vec<(TileKey, bool, DisplayPreview)> =
+            store.par_map_mut(&mut publishing, |(held, state)| {
+                state.published_held = Some(*held);
+                (*state.key(), *held, state.publish(*held))
+            });
+        for (key, _, preview) in made {
+            store.set_display_preview(key, preview)?;
+            stats.tiles_set += 1;
         }
         Ok(())
     }

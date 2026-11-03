@@ -115,6 +115,10 @@ pub(super) struct DisplayState {
     frames: Vec<[Vec3; 2]>,
     /// How far the dabs have turned each tangent of the frame.
     turn: Vec<[Vec3; 2]>,
+    /// The drawn normals as last made ([`DisplayState::publish`]).
+    normals: Vec<Vec3>,
+    /// The vertices whose tangents a dab turned since the normals were made.
+    turned: Vec<bool>,
     /// What is drawn, `D`.
     drawn: Vec<Vec3>,
     /// `G`: the pen-down positions moved by every dab of the stroke, summed in `f64`.
@@ -428,6 +432,8 @@ impl DisplayState {
             key,
             bounds: bounds_of_points(&p0),
             turn: vec![[Vec3::ZERO; 2]; p0.len()],
+            normals: n0.clone(),
+            turned: vec![false; p0.len()],
             drawn: base,
             p0,
             n0,
@@ -470,8 +476,9 @@ impl DisplayState {
             .iter()
             .zip(&mut self.drawn)
             .zip(&mut self.ideal)
-            .zip(self.frames.iter().zip(&mut self.turn));
-        for (((p, out), ideal), (frame, turn)) in vertices {
+            .zip(self.frames.iter().zip(&mut self.turn))
+            .zip(&mut self.turned);
+        for ((((p, out), ideal), (frame, turn)), turned) in vertices {
             let at = [p.x, p.y, p.z];
             match draw_imprint_vertex(&Smoothstep, dab, at) {
                 Some(w) if w != 0.0 => {
@@ -496,6 +503,7 @@ impl DisplayState {
                     let [t1, t2] = frame;
                     turn[0] = turn[0] + along * gradient.dot(*t1);
                     turn[1] = turn[1] + along * gradient.dot(*t2);
+                    *turned = true;
                 }
             }
         }
@@ -540,29 +548,27 @@ impl DisplayState {
 
     /// The preview to hand the store: what is drawn, its normals and bound (module notes),
     /// `held` as given.
-    pub(super) fn publish(&self, held: bool) -> DisplayPreview {
-        let normals = self
-            .n0
-            .iter()
-            .zip(&self.frames)
-            .zip(&self.turn)
-            .map(|((&n0, [t1, t2]), [a1, a2])| {
-                if *a1 == Vec3::ZERO && *a2 == Vec3::ZERO {
-                    return n0;
-                }
-                (*t1 + *a1).cross(*t2 + *a2).normalized().unwrap_or(n0)
-            })
-            .collect();
-        let mut deviation = 0.0_f64;
+    pub(super) fn publish(&mut self, held: bool) -> DisplayPreview {
+        // The normals of the vertices a dab turned since the last, made again.
+        let vertices = self
+            .normals
+            .iter_mut()
+            .zip(&mut self.turned)
+            .zip(self.n0.iter().zip(&self.frames).zip(&self.turn));
+        for ((normal, turned), ((&n0, [t1, t2]), [a1, a2])) in vertices {
+            if std::mem::take(turned) {
+                *normal = (*t1 + *a1).cross(*t2 + *a2).normalized().unwrap_or(n0);
+            }
+        }
+        let mut deviation_squared = 0.0_f64;
         let mut largest = 0.0_f64;
         for (drawn, ideal) in self.drawn.iter().zip(&self.ideal) {
             let d = wide(*drawn);
-            let gap = (d[0] - ideal[0])
-                .hypot(d[1] - ideal[1])
-                .hypot(d[2] - ideal[2]);
-            deviation = deviation.max(gap);
+            let (dx, dy, dz) = (d[0] - ideal[0], d[1] - ideal[1], d[2] - ideal[2]);
+            deviation_squared = deviation_squared.max(dz.mul_add(dz, dx.mul_add(dx, dy * dy)));
             largest = largest.max(d[0].abs().max(d[1].abs()).max(d[2].abs()));
         }
+        let deviation = deviation_squared.sqrt();
         let terms = self.terms.iter().copied().fold(0.0, f64::max);
         let sum = (self.pen_down_bound + terms + deviation) * SLACK + largest * MAGNITUDE_SLACK;
         #[expect(
@@ -582,7 +588,7 @@ impl DisplayState {
         };
         DisplayPreview {
             positions: self.drawn.clone(),
-            normals,
+            normals: self.normals.clone(),
             roughness: self.roughness.clone(),
             bound,
             held,
