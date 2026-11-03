@@ -52,8 +52,12 @@
 //! ε`.
 //!
 //! - The first term is at most `e₀`, the pen-down tile's bound: the record's own where nothing was
-//!   replaced, else the stand-in formula `e + D + max(D, M)` from it (`D` the steps since the
-//!   record, `M` how far a replaced vertex moved).
+//!   replaced; else measured, as a stand-in measures its bound: the farthest finest vertex of every
+//!   finest tile changed since the record (all at hand, gathered for the replacing) from the
+//!   pen-down tile's triangles, and for the others, unchanged, the record's bound plus `M`, the
+//!   largest move of a replaced vertex (the triangles' blend of the corners' moves). The stand-in
+//!   formula `e + D + max(D, M)` (`D` the steps since the record) is kept for a place that couldn't
+//!   be measured.
 //! - Each dab's term is at most `s · min(1, L e₀ + K h² / 2)`, `s` its strength, `L = steepest / r`
 //!   and `K = curvature / r²` its falloff's bounds ([`brush::Falloff`]), `h` the quad's longest
 //!   pen-down edge: the move at `F₀(u)` against the move at the point of the triangle (Lipschitz),
@@ -403,8 +407,16 @@ impl DisplayState {
             }
         }
         let pen_down_bound = if made.flags.iter().any(|&r| r) {
-            let d = f64::from(displacement);
-            f64::from(recorded_bound) + d + d.max(made.moved_most)
+            // Measured where the finest tiles are at hand (every one changed since the record),
+            // the record's own bound and the replaced vertices' largest move elsewhere.
+            let elsewhere = f64::from(recorded_bound) + made.moved_most;
+            farthest_under(&key, finest_level, &made.p0, blocks).map_or_else(
+                || {
+                    let d = f64::from(displacement);
+                    f64::from(recorded_bound) + d + d.max(made.moved_most)
+                },
+                |measured| measured.max(elsewhere),
+            )
         } else {
             f64::from(tile.error())
         };
@@ -681,6 +693,87 @@ impl Replaced {
             })
             .collect()
     }
+}
+
+/// The farthest a gathered finest vertex under display tile `key` lies from `p0`'s triangles.
+///
+/// Each vertex as the stroke began, from the pen-down tile `p0`'s triangles at its place, in
+/// `f64`; `None` if a place falls off the tile (never, for tiles under it).
+///
+/// The point a tile draws at finest grid place `u` is its quad's triangle blend there, the quad
+/// split along its `(i, j)`–`(i+1, j+1)` diagonal, as every level is drawn.
+fn farthest_under(key: &TileKey, finest: Level, p0: &[Vec3], blocks: &Blocks) -> Option<f64> {
+    let quads = key.side() - 1;
+    let step = 1_u32 << (finest.get() - key.level().get());
+    let finest_quads = finest.tile_quads().max(1);
+    let span = (quads * step / finest_quads).max(1);
+    let side = usize::try_from(key.side()).ok()?;
+    let corner = |i: u32, j: u32| -> Option<[f64; 3]> {
+        let v = p0.get(usize::try_from(j).ok()? * side + usize::try_from(i).ok()?)?;
+        Some(wide(*v))
+    };
+    let under = |tile: &TileKey| {
+        let inside = |t: u16, f: u16| {
+            let (t, f) = (u32::from(t), u32::from(f));
+            f >= t * span && f < (t + 1) * span
+        };
+        tile.face() == key.face() && inside(key.tx(), tile.tx()) && inside(key.ty(), tile.ty())
+    };
+    let tiles = blocks
+        .now
+        .keys()
+        .chain(blocks.pen_down.keys())
+        .filter(|tile| under(tile));
+    let mut farthest = 0.0_f64;
+    for tile in tiles {
+        let Some(block) = blocks.pen_down.get(tile).or_else(|| blocks.now.get(tile)) else {
+            continue;
+        };
+        let origin = |t: u16| f64::from(u32::from(t) * quads);
+        for row in 0..=finest_quads {
+            for col in 0..=finest_quads {
+                let gx = f64::from(u32::from(tile.tx()) * finest_quads + col);
+                let gy = f64::from(u32::from(tile.ty()) * finest_quads + row);
+                let across = gx / f64::from(step) - origin(key.tx());
+                let down = gy / f64::from(step) - origin(key.ty());
+                let last = f64::from(quads - 1);
+                let (qx, qy) = (
+                    across.floor().clamp(0.0, last),
+                    down.floor().clamp(0.0, last),
+                );
+                let (fx, fy) = (across - qx, down - qy);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a quad index within the tile, clamped to it"
+                )]
+                let (i, j) = (qx as u32, qy as u32);
+                let (c00, c10, c01, c11) = (
+                    corner(i, j)?,
+                    corner(i + 1, j)?,
+                    corner(i, j + 1)?,
+                    corner(i + 1, j + 1)?,
+                );
+                let fine = wide(block.get(i64::from(col), i64::from(row)));
+                let parts = fine
+                    .iter()
+                    .zip(c00.iter().zip(&c10))
+                    .zip(c01.iter().zip(&c11));
+                let gap: f64 = parts
+                    .map(|((f, (p00, p10)), (p01, p11))| {
+                        let drawn = if fx >= fy {
+                            fy.mul_add(p11 - p10, fx.mul_add(p10 - p00, *p00))
+                        } else {
+                            fx.mul_add(p11 - p01, fy.mul_add(p01 - p00, *p00))
+                        };
+                        (f - drawn).powi(2)
+                    })
+                    .sum();
+                farthest = farthest.max(gap.sqrt());
+            }
+        }
+    }
+    Some(farthest)
 }
 
 /// `bounds` grown by `by` on every side, rounded outward; `None` past `f32`'s range.
