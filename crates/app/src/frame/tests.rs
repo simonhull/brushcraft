@@ -2041,9 +2041,12 @@ fn a_dab_shows_in_the_visibility_buffer_of_its_own_frame() {
         });
     }
     let after = draw_when_wanted(&gpu, &mut owner, &mut screen);
+    // Applied as finest work or, where the frame's time ran short (a loaded machine), shown
+    // ahead of it: either way the frame draws them.
+    let report = owner.brush.last();
     assert!(
-        owner.brush.last().dabs_applied > 0,
-        "the frame applied dabs"
+        report.dabs_applied + report.dabs_shown > 0,
+        "the frame applied or showed dabs: {report:?}"
     );
     let changed = before.iter().zip(&after).filter(|(a, b)| a != b).count();
     assert!(changed > 0, "the dab's frame drew the moved surface");
