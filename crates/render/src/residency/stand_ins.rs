@@ -59,6 +59,9 @@ pub(super) struct Step {
     pub(super) displacement: Displacement,
     /// The finest tiles its epoch named.
     pub(super) keys: Vec<TileKey>,
+    /// Of them, those its writes moved ([`store::Epoch::written`]); the others only read a moved
+    /// one for their ring.
+    pub(super) written: BTreeSet<TileKey>,
 }
 
 /// One step's part under one place: what a display tile there needs of it.
@@ -202,9 +205,18 @@ impl StandIns {
             }
         }
         for (place, finest) in by_place {
+            // No finest vertex under a place whose finest tiles only read a moved one moved: its
+            // tile stands in for the step with no displacement, so no level compounds the step's
+            // bound for a ring alone.
+            let moved = finest.iter().any(|key| step.written.contains(key));
+            let displacement = if moved {
+                step.displacement
+            } else {
+                Displacement::ZERO
+            };
             let steps = self.index.entry(place).or_default();
             let under = steps.entry(step.seq).or_insert(Under {
-                displacement: step.displacement,
+                displacement,
                 finest: Vec::new(),
                 shown,
             });

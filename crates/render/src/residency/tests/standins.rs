@@ -166,6 +166,7 @@ impl Sphere {
         Epoch {
             seq: self.seq,
             kind: EpochKind::Step { displacement },
+            written: keys.clone(),
             keys,
         }
     }
@@ -182,6 +183,7 @@ impl Sphere {
             seq: self.seq,
             kind: EpochKind::Refresh,
             keys,
+            written: BTreeSet::new(),
         }
     }
 
@@ -732,6 +734,7 @@ fn a_revert_in_the_drain_of_a_step_drops_its_stand_ins_and_reads_the_store_again
             seq: sphere.seq,
             kind: EpochKind::Revert,
             keys: finest_of(&step, sphere.finest),
+            written: finest_of(&step, sphere.finest),
         };
         frame(
             gpu,
@@ -894,6 +897,7 @@ fn a_place_keeps_at_most_max_steps_and_counts_the_ones_it_forgets() {
             seq: seq as u64,
             kind: EpochKind::Step { displacement: 1e-4 },
             keys: BTreeSet::from([key]),
+            written: BTreeSet::from([key]),
         });
         residency.apply(Drained::Epochs(epochs.collect()));
         let above = sphere.finest.get();
@@ -1026,6 +1030,7 @@ fn a_tile_behind_steps_its_place_forgot_has_its_bound_raised_instead() {
                 seq,
                 kind: EpochKind::Step { displacement },
                 keys: BTreeSet::from([key]),
+                written: BTreeSet::from([key]),
             })
             .collect();
         frame(
@@ -1187,6 +1192,7 @@ fn a_stand_in_whose_place_forgot_steps_has_its_row_raised() {
                 seq,
                 kind: EpochKind::Step { displacement },
                 keys: BTreeSet::from([key]),
+                written: BTreeSet::from([key]),
             })
             .collect();
         frame(

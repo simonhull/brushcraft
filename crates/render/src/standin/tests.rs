@@ -856,7 +856,7 @@ fn dabs_shown_on_display_tiles_are_drawn_from_them_with_closed_seams_until_the_r
 // Uses the sculpt crate's types, a dev-dependency rustdoc doesn't link.
 #[cfg(not(doc))]
 #[test]
-fn a_long_previewed_stroke_keeps_its_drawn_bounds_true_and_flat_frame_by_frame() {
+fn a_long_previewed_stroke_keeps_every_drawn_bound_true_and_flat_frame_by_frame_level_0_included() {
     GpuTest::run(|gpu| {
         let dir = TempDir::new("long-preview");
         let (mut project, mesh) = project(&dir, |config| config);
@@ -888,6 +888,7 @@ fn a_long_previewed_stroke_keeps_its_drawn_bounds_true_and_flat_frame_by_frame()
         let mut stroke = sculpt::Stroke::new(store);
         project.begin_stroke().expect("a stroke");
         let mut largest = Vec::new();
+        let mut every = Vec::new();
         for (k, dab) in dabs.iter().enumerate() {
             let stepping = project.store();
             preview
@@ -910,9 +911,16 @@ fn a_long_previewed_stroke_keeps_its_drawn_bounds_true_and_flat_frame_by_frame()
             let now = finest_grids(stepping, &mesh);
             let drawn = model::drawn_grids(stepping, &now);
             check(gpu, &residency, &drawn, &resident);
-            // The previewed tiles' bounds (a tile no dab reaches, standing in only as a reader of
-            // a moved ring, keeps the formula of a level far above the finest).
+            // The previewed tiles' bounds, and every tile's: a tile no dab reaches stands in only
+            // as a reader of a moved ring, with no displacement, at any level.
             let tiles = display_tiles(gpu, &residency);
+            let everyone = tiles
+                .iter()
+                .map(|(place, (_, node))| (place.level(), node.error))
+                .fold((Level::ZERO, 0.0_f32), |most, (level, error)| {
+                    if error > most.1 { (level, error) } else { most }
+                });
+            every.push(everyone);
             let previewed = tiles.iter().filter(|(place, _)| {
                 place
                     .key(finest)
@@ -925,6 +933,15 @@ fn a_long_previewed_stroke_keeps_its_drawn_bounds_true_and_flat_frame_by_frame()
         }
         // Released tiles stand in for the steps after their release, as any data would.
         eprintln!("the previewed tiles' largest bound, frame by frame: {largest:?}");
+        eprintln!("every tile's largest bound, with its level: {every:?}");
+        let (first, last) = (
+            every.first().expect("frames").1,
+            every.last().expect("frames").1,
+        );
+        assert!(
+            last <= 1.5 * first,
+            "no level compounds, level 0 included: {every:?}"
+        );
         let early = largest.get(5).copied().expect("frames");
         let late = largest.last().copied().expect("frames");
         assert!(

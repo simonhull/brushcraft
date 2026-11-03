@@ -140,6 +140,7 @@ mod tests {
             seq: 0,
             kind: EpochKind::Step { displacement: 0.1 },
             keys: keys.iter().copied().collect(),
+            written: keys.iter().copied().collect(),
         }])
     }
 

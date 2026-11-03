@@ -181,6 +181,11 @@ fn step(path: &[TileKey], n: usize) -> Epoch {
     Epoch {
         seq: u64::try_from(n).unwrap_or(u64::MAX),
         kind: EpochKind::Step { displacement: 1e-4 },
+        written: keys
+            .iter()
+            .filter(|key| key.channel() != Channel::DISPLAY)
+            .copied()
+            .collect(),
         keys,
     }
 }

@@ -1321,7 +1321,12 @@ impl Residency {
 
     /// Applies one epoch by its kind (see [`Residency::apply`]).
     fn apply_kind(&mut self, epoch: Epoch) {
-        let Epoch { seq, kind, keys } = epoch;
+        let Epoch {
+            seq,
+            kind,
+            keys,
+            written,
+        } = epoch;
         self.stand_ins.seen = Some(self.stand_ins.seen.map_or(seq, |seen| seen.max(seq)));
         if matches!(kind, EpochKind::Preview) {
             // What is drawn above these tiles is no longer the store's surface: no measured bound.
@@ -1364,6 +1369,7 @@ impl Residency {
                         seq,
                         displacement,
                         keys: finest.iter().copied().collect(),
+                        written,
                     });
                 if let Some(step) = &step {
                     self.stand_ins

@@ -149,11 +149,13 @@ impl Model {
             kind: EpochKind::Refresh,
             seq,
             keys: keys.clone(),
+            written: BTreeSet::new(),
         });
         self.undrained.push(Epoch {
             seq,
             kind: EpochKind::Refresh,
             keys,
+            written: BTreeSet::new(),
         });
     }
 
