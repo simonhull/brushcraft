@@ -194,7 +194,8 @@ fn vertices_in(key: &TileKey, finest: Level, tile: &TileKey) -> Vec<(usize, u32,
     out
 }
 
-/// The finest tiles under display tile `key`, at `finest`.
+/// The finest tiles under display tile `key`, at `finest`: what the tests walk.
+#[cfg(test)]
 fn finest_under(key: &TileKey, finest: Level) -> Vec<TileKey> {
     let quads = key.side() - 1;
     let step = 1_u32 << (finest.get() - key.level().get());
@@ -335,7 +336,7 @@ impl DisplayState {
         }
         let tiles = store.display_for_draw(keys)?;
         let mut inputs = Vec::new();
-        let mut changed = BTreeSet::new();
+        let mut changed: BTreeSet<TileKey> = BTreeSet::new();
         let mut at_pen_down = BTreeSet::new();
         for (key, tile) in keys.iter().zip(tiles) {
             let Some(tile) = tile else {
@@ -348,16 +349,18 @@ impl DisplayState {
                 changed.extend(under.iter().copied());
                 d
             });
-            for tile_key in finest_under(key, finest_level) {
-                let read = store.normal_inputs(&tile_key)?;
-                if read
-                    .iter()
-                    .any(|input| store.pen_down_shape(input).is_some())
-                {
-                    at_pen_down.insert(tile_key);
-                }
-            }
             inputs.push((tile, recorded_bound, displacement));
+        }
+        // A finest tile whose block reads one the stroke changed changed since pen-down, so since
+        // every record above it: it is among the tiles changed, the only ones looked at.
+        for tile_key in &changed {
+            let read = store.normal_inputs(tile_key)?;
+            if read
+                .iter()
+                .any(|input| store.pen_down_shape(input).is_some())
+            {
+                at_pen_down.insert(*tile_key);
+            }
         }
         let mut blocks = Blocks::default();
         blocks.add_now(store, &changed)?;
