@@ -18,16 +18,20 @@
 //!
 //! A stroke record (kind 6) holds, all numbers little-endian:
 //!
-//! - the record's version, `1`, as a `u8`, then three reserved zero bytes;
+//! - the record's version, `2`, as a `u8`, then three reserved zero bytes;
 //! - the op, as `OpId::to_bits` packs it, a `u64`;
 //! - the engine version, a `u32`;
 //! - the camera: eye, target and up, each three `f64`s, the vertical field of view in radians as an
-//!   `f64`, the view's width and height in physical pixels as `u32`s;
+//!   `f64`, the view's width and height in physical pixels as `u32`s, then its magnification and
+//!   the image's shift, right and up, three `f64`s (see [`StrokeCamera`]);
 //! - the start time (the first sample's, in seconds on the pen's clock), an `f64`;
 //! - the settings' length, a `u32`, at most [`MAX_STROKE_SETTINGS`];
 //! - the samples' count, a `u32`, at most [`MAX_STROKE_SAMPLES`];
 //! - a zstd frame of the settings, then the sample planes: `settings + 16 × count` bytes once
 //!   decompressed, exactly.
+//!
+//! **Version 1**, written before views could be magnified, is the same without the last three
+//! `f64`s of the camera: it reads as magnification 1 and no shift, the view it was drawn through.
 //!
 //! A reader refuses any other version, a reserved byte set, a reserved site's op, a start time
 //! that isn't finite, a length or count past its limit, a frame that doesn't decompress to the
@@ -58,12 +62,21 @@ pub const MAX_STROKE_SAMPLES: usize = 1 << 20;
 /// The longest settings a record holds, in bytes. A stroke's settings take a few hundred.
 pub const MAX_STROKE_SETTINGS: usize = 1 << 16;
 
-/// The record's version this build writes and reads.
-const VERSION: u8 = 1;
+/// The record's version this build writes: 2, whose camera holds the view's magnification and
+/// shift.
+const VERSION: u8 = 2;
 
-/// Payload bytes before the compressed frame: version and reserved bytes, op, engine, camera,
-/// start time, settings length and sample count.
+/// The version before magnified views, which this build still reads: its camera holds no
+/// magnification or shift, and reads as magnification 1, shift 0.
+const UNMAGNIFIED_VERSION: u8 = 1;
+
+/// Payload bytes before the compressed frame, as this build writes it: version and reserved
+/// bytes, op, engine, camera, start time, settings length and sample count.
 const FIXED: usize = 4 + 8 + 4 + CAMERA_BYTES + 8 + 4 + 4;
+
+/// [`FIXED`] in a version 1 payload, whose camera has no lens.
+#[cfg(test)]
+const UNMAGNIFIED_FIXED: usize = FIXED - LENS_BYTES;
 
 /// Where the op is in a payload: after the version and reserved bytes. Fixed in every version,
 /// so a file can tell which strokes it holds records of without decoding them.
@@ -77,8 +90,12 @@ pub(crate) const MAX_STROKE_PAYLOAD: usize = {
     FIXED + raw + raw / 128 + 1024
 };
 
-/// Bytes of the camera: nine `f64`s of eye, target and up, the field of view, two `u32`s of size.
-const CAMERA_BYTES: usize = 10 * 8 + 2 * 4;
+/// Bytes of the camera: nine `f64`s of eye, target and up, the field of view, two `u32`s of size,
+/// and the lens.
+const CAMERA_BYTES: usize = 10 * 8 + 2 * 4 + LENS_BYTES;
+
+/// Bytes of the camera's lens, since version 2: the magnification and the shift's two `f64`s.
+const LENS_BYTES: usize = 3 * 8;
 
 /// Steps per physical pixel of a quantized screen coordinate.
 const POSITION_STEPS: f64 = 32.0;
@@ -110,8 +127,14 @@ const FIELD_BITS: [u32; 8] = [24, 24, 32, 16, 8, 8, 8, 8];
 
 /// The camera a stroke was drawn through: enough to turn its screen samples back into rays.
 ///
+/// The view looks from `eye` towards `target` with `up` as its up and a vertical field of
+/// `fov_y`, into a viewport of `size`; then its image is magnified `magnification` times about
+/// the viewport's centre and moved by `shift`: a point the plain view shows at `t` on its image
+/// plane (right and up, over its depth) shows at `magnification · t + shift`. A stroke drawn with
+/// the view unmagnified has magnification 1 and no shift.
+///
 /// Stored bit for bit.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StrokeCamera {
     /// Where the eye is, in model units.
     pub eye: [f64; 3],
@@ -123,6 +146,26 @@ pub struct StrokeCamera {
     pub fov_y: f64,
     /// The view's width and height, in physical pixels.
     pub size: [u32; 2],
+    /// How many times the view's image is magnified: 1 for a plain view.
+    pub magnification: f64,
+    /// The magnified image's shift, right and up, in units of the plain view's image plane at
+    /// unit depth: 0 for a plain view.
+    pub shift: [f64; 2],
+}
+
+impl Default for StrokeCamera {
+    /// Every number zero but the magnification, 1: an unmagnified view of nothing.
+    fn default() -> Self {
+        Self {
+            eye: [0.0; 3],
+            target: [0.0; 3],
+            up: [0.0; 3],
+            fov_y: 0.0,
+            size: [0; 2],
+            magnification: 1.0,
+            shift: [0.0; 2],
+        }
+    }
 }
 
 /// Which way the pen leans and how far, as a [`PenSample`] carries it.
@@ -584,6 +627,10 @@ impl StrokeRecord {
         for side in camera.size {
             out.extend_from_slice(&side.to_le_bytes());
         }
+        let lens = std::iter::once(&camera.magnification).chain(&camera.shift);
+        for value in lens {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
         out.extend_from_slice(&self.start.to_le_bytes());
         // Both fit: `new` and `push` hold them to their limits, far below u32::MAX.
         let settings_len = u32::try_from(self.settings.len()).unwrap_or(u32::MAX);
@@ -599,7 +646,12 @@ impl StrokeRecord {
     pub(crate) fn from_payload(payload: &[u8]) -> Option<Self> {
         let mut reader = Reader::new(payload);
         let [version, r0, r1, r2] = <[u8; 4]>::try_from(reader.take(4)?).ok()?;
-        if version != VERSION || (r0, r1, r2) != (0, 0, 0) {
+        let magnified = match version {
+            VERSION => true,
+            UNMAGNIFIED_VERSION => false,
+            _ => return None,
+        };
+        if (r0, r1, r2) != (0, 0, 0) {
             return None;
         }
         let op = OpId::from_bits(reader.u64()?)?;
@@ -610,6 +662,15 @@ impl StrokeRecord {
         }
         let [ex, ey, ez, tx, ty, tz, ux, uy, uz, fov_y] = f64s;
         let size = [reader.u32()?, reader.u32()?];
+        let [magnification, sx, sy] = if magnified {
+            let mut lens = [0.0; 3];
+            for value in &mut lens {
+                *value = f64::from_bits(reader.u64()?);
+            }
+            lens
+        } else {
+            [1.0, 0.0, 0.0]
+        };
         let start = f64::from_bits(reader.u64()?);
         if !start.is_finite() {
             return None;
@@ -631,6 +692,8 @@ impl StrokeRecord {
                 up: [ux, uy, uz],
                 fov_y,
                 size,
+                magnification,
+                shift: [sx, sy],
             },
             start,
             samples: unplane(planes, count)?,
@@ -708,6 +771,8 @@ pub(crate) mod tests {
             up: [0.0, 1.0, 0.0],
             fov_y: 0.785,
             size: [2560, 1440],
+            magnification: 6.5,
+            shift: [0.125, -0.0703],
         };
         let settings: Vec<u8> = seed
             .to_le_bytes()
@@ -764,6 +829,53 @@ pub(crate) mod tests {
             payload.len() < 500 * SAMPLE_BYTES / 2,
             "{} bytes for 500 samples",
             payload.len()
+        );
+    }
+
+    /// `record`'s payload as version 1 wrote it: no lens in its camera.
+    fn unmagnified_payload(record: &StrokeRecord) -> Vec<u8> {
+        let mut payload = record.to_payload().unwrap();
+        payload[0] = UNMAGNIFIED_VERSION;
+        // The lens follows the camera's size: after the version, op, engine, ten f64s and two
+        // u32s.
+        let lens = 4 + 8 + 4 + 10 * 8 + 2 * 4;
+        payload.drain(lens..lens + LENS_BYTES);
+        payload
+    }
+
+    #[test]
+    fn a_version_1_record_reads_as_drawn_through_an_unmagnified_view() {
+        let record = wobbly(OpId::new(2, 17).unwrap(), 40, 3);
+        let old = unmagnified_payload(&record);
+        assert_eq!(old.len(), record.to_payload().unwrap().len() - LENS_BYTES);
+        let back = StrokeRecord::from_payload(&old).expect("version 1 reads");
+        let camera = *back.camera();
+        assert_eq!(camera.magnification, 1.0, "magnification 1");
+        assert_eq!(camera.shift, [0.0, 0.0], "no shift");
+        assert_eq!(
+            StrokeCamera {
+                magnification: record.camera().magnification,
+                shift: record.camera().shift,
+                ..camera
+            },
+            *record.camera(),
+            "the rest as written"
+        );
+        assert!(back.samples().eq(record.samples()), "the same samples");
+        assert_eq!(back.settings(), record.settings());
+        let mut cut = old.clone();
+        cut.truncate(UNMAGNIFIED_FIXED - 1);
+        assert_eq!(
+            StrokeRecord::from_payload(&cut),
+            None,
+            "a short version 1 payload"
+        );
+        let mut reserved = old;
+        reserved[3] = 1;
+        assert_eq!(
+            StrokeRecord::from_payload(&reserved),
+            None,
+            "a reserved byte set"
         );
     }
 
@@ -915,7 +1027,8 @@ pub(crate) mod tests {
             change(&mut bad);
             assert_eq!(StrokeRecord::from_payload(&bad), None, "{what}");
         };
-        refused(&|p| p[0] = 2, "another version");
+        refused(&|p| p[0] = 3, "another version");
+        refused(&|p| p[0] = 0, "version 0");
         refused(&|p| p[2] = 1, "a reserved byte set");
         refused(
             &|p| p[4..12].copy_from_slice(&u64::MAX.to_le_bytes()),

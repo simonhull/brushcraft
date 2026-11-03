@@ -20,6 +20,7 @@ use crate::script::{Script, Speed};
 use crate::test_dir::TestDir;
 
 mod lifecycle;
+mod navigation;
 
 /// The level the test projects are sculpted at: a 24-face sphere's 24 tiles of 32 × 32 quads.
 const LEVEL: u8 = 5;

@@ -378,14 +378,14 @@ fn decompression_never_panics() {
 
 /// What generates a stroke record.
 ///
-/// The op's site and sequence, the engine version, the settings, the camera's ten `f64`s and its
-/// size, then each sample's position, time, pressure, tilt amount and direction, twist and
-/// buttons.
+/// The op's site and sequence, the engine version, the settings, the camera's thirteen `f64`s
+/// (eye, target, up, field of view, magnification and shift) and its size, then each sample's
+/// position, time, pressure, tilt amount and direction, twist and buttons.
 type StrokeParts = (
     (u16, u64),
     u32,
     Vec<u8>,
-    [f64; 10],
+    [f64; 13],
     [u32; 2],
     Vec<(f64, f64, f64, f32, Option<(f32, f32)>, Option<f32>, u8)>,
 );
@@ -395,13 +395,29 @@ const FUZZ_SAMPLES: usize = 600;
 
 /// The stroke record `parts` describe, its samples cut at [`FUZZ_SAMPLES`].
 fn stroke_of((op, engine, settings, floats, size, samples): &StrokeParts) -> StrokeRecord {
-    let [ex, ey, ez, tx, ty, tz, ux, uy, uz, fov_y] = *floats;
+    let [
+        ex,
+        ey,
+        ez,
+        tx,
+        ty,
+        tz,
+        ux,
+        uy,
+        uz,
+        fov_y,
+        magnification,
+        sx,
+        sy,
+    ] = *floats;
     let camera = StrokeCamera {
         eye: [ex, ey, ez],
         target: [tx, ty, tz],
         up: [ux, uy, uz],
         fov_y,
         size: *size,
+        magnification,
+        shift: [sx, sy],
     };
     let settings: Vec<u8> = settings.iter().copied().take(MAX_STROKE_SETTINGS).collect();
     let mut record = StrokeRecord::new(op_of(op.0, op.1), *engine, settings, camera).unwrap();

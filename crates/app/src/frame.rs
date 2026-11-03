@@ -112,7 +112,7 @@ use store::{Drained, JobsReport, Project, SpatialIndex, StaleCursor, TileStore};
 
 use self::schedule::{Next, Reason, Reasons, Scheduler, StrokePacing, UPKEEP_INTERVAL};
 use crate::camera::{Arcball, Boundary, Camera, Pixel};
-use crate::navigate::{Input, Navigator};
+use crate::navigate::{Button, Input, Navigator};
 use crate::overlay::{self, Snapshot};
 use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route};
 use crate::pick::Picker;
@@ -431,11 +431,20 @@ pub(crate) trait Brush {
         false
     }
 
-    /// Where the last stroke the brush began starts (its first dab's centre), once: the next
-    /// call gives `None` until another begins. The frame loop makes it the camera's pivot after
-    /// each step (the navigation spec: orbit and zoom about the last edit). None by default.
-    fn take_stroke_start(&mut self) -> Option<crate::camera::Vec3> {
+    /// Where the last stroke the brush began starts (its first dab's centre), with when its
+    /// `Down` was received, once: the next call gives `None` until another begins. The frame
+    /// loop makes it the camera's pivot after each step (the navigation spec: orbit and zoom
+    /// about the last edit), unless an event since set another ([`Owner::pivot_to`]). None by
+    /// default.
+    fn take_stroke_start(&mut self) -> Option<(crate::camera::Vec3, Instant)> {
         None
+    }
+
+    /// Whether the last [`Brush::route`] navigated because it found no surface under its `Down`
+    /// (it looked, and missed): the frame loop then doesn't pick under it again for the pivot.
+    /// False by default, as the default route looks at nothing.
+    fn routed_off_surface(&self) -> bool {
+        false
     }
 
     /// Sets the brush's radius to `pixels` on the screen: a scripted stroke's size.
@@ -750,6 +759,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     navigator: Navigator,
     /// Pointer input since the last frame, applied in its input phase.
     input: Vec<Input>,
+    /// When each of `input` was queued, in order: a drag's press dates the pivot it sets.
+    input_at: Vec<Instant>,
     /// Pen samples since the last frame, routed into `pen_frame` in its input phase.
     pen_queue: Vec<PenSample>,
     /// Which stroke is in progress, and where it goes.
@@ -845,6 +856,10 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     upkept_at: Instant,
     /// What the camera is to be fitted to the model by, at the next input phase.
     fitting: Fitting,
+    /// When the event that set the camera's pivot last happened (a drag's press, a stroke's
+    /// `Down`, F); `None` before any. A source later than another wins, whichever is heard first
+    /// ([`Owner::pivot_to`]).
+    pivot_at: Option<Instant>,
 }
 
 /// What the camera is still to be fitted to the model by: framing it, and growing its boundary
@@ -992,6 +1007,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             camera: Camera::default(),
             navigator: Navigator::default(),
             input: Vec::new(),
+            input_at: Vec::new(),
             pen_queue: Vec::new(),
             pen_router: PenRouter::default(),
             pen_navigation: PenNavigation::default(),
@@ -1032,6 +1048,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             jobs_held: None,
             upkept_at: now,
             fitting: Fitting::default(),
+            pivot_at: None,
         }
     }
 
@@ -1063,7 +1080,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// Queues pointer input for the next frame's input phase, and wants that frame if the
-    /// input may move the camera.
+    /// input may move the camera, or starts a drag (whose press may move the pivot, which the
+    /// overlay shows).
     pub(crate) fn input(&mut self, input: Input) {
         if input == Input::Cancel {
             // Navigation forgets the pen's buttons too: the next sample presses them again.
@@ -1071,11 +1089,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
         if self.navigator.may_move(&self.input, &input) {
             self.scheduler.want(Reason::Input);
+        } else if self.picker.is_some() && self.navigator.drag_start(&input).is_some() {
+            self.scheduler.want(Reason::Overlay);
         }
         if let Input::Move { at } | Input::Press { at, .. } = input {
             self.point(Some(at));
         }
         self.input.push(input);
+        self.input_at.push(Instant::now());
     }
 
     /// Queues a pen sample for the next frame's input phase, where it is routed.
@@ -1165,7 +1186,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) fn with_picker(mut self, picker: Picker) -> Self {
         self.picker = Some(picker);
         self.fitting.bounds = true;
-        self.fit_boundary();
+        if let Some(size) = self.size {
+            self.fit_boundary(size);
+        }
         self
     }
 
@@ -1188,17 +1211,42 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// Grows the camera's boundary around the model as the spatial index now bounds it, if the
-    /// brush edited the surface since it was fitted; the camera keeps the eye out of it. A pass
-    /// over the index's tiles ([`Picker::model_sphere`]), so made once the brush is idle. Never
-    /// in a scripted run: its path sets its poses directly, boundary or not.
-    fn fit_boundary(&mut self) {
+    /// brush edited the surface since it was fitted; the camera keeps the eye out of it, and a
+    /// frame is wanted if that moved the view in a viewport of `size`. Never in a scripted run:
+    /// its path sets its poses directly, boundary or not.
+    ///
+    /// A pass over the index's tiles ([`Picker::model_sphere`]: 0.4 ms on the benchmark
+    /// project's 153,600, 25 µs on 9,600, `store`'s `index` bench), so it runs off the pen's
+    /// path: after a frame's hand-off once the brush is idle and no sample waits
+    /// ([`Owner::after_hand_off`]), and before a navigation drag's pick ([`Owner::grab`]).
+    fn fit_boundary(&mut self, size: Size) {
         if !std::mem::take(&mut self.fitting.bounds) || self.script.is_some() {
             return;
         }
         let sphere = self.picker.as_ref().and_then(Picker::model_sphere);
         if let Some(boundary) = sphere.and_then(|(centre, radius)| Boundary::around(centre, radius))
         {
+            let before = self.camera.view(size);
             self.camera.grow_boundary(boundary);
+            if self.camera.view(size) != before {
+                self.scheduler.want(Reason::Input);
+            }
+        }
+    }
+
+    /// Makes `pivot` the camera's, set by an event at `at`, unless a later event set it
+    /// already: a stroke's start noted at its tail, after a drag that began later, loses to the
+    /// drag's grab. Wants a frame for the overlay's camera line if it moved the pivot; the view
+    /// doesn't move ([`Camera::set_pivot`]), so the frame shades the scene again and the image
+    /// keeps accumulating.
+    fn pivot_to(&mut self, pivot: crate::camera::Vec3, at: Instant) {
+        if self.pivot_at.is_some_and(|set| at < set) {
+            return;
+        }
+        self.pivot_at = Some(at);
+        if pivot != self.camera.pivot() {
+            self.camera.set_pivot(pivot);
+            self.scheduler.want(Reason::Overlay);
         }
     }
 
@@ -1211,17 +1259,22 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if let Some((centre, radius)) = self.picker.as_ref().and_then(Picker::model_sphere) {
             self.camera.frame(centre, radius, size);
             self.fitting.bounds = false;
+            self.pivot_at = Some(Instant::now());
         }
     }
 
-    /// A navigation drag starts at `at`, in a viewport of `size`: if the surface is under it,
-    /// that point becomes the camera's pivot (the navigation spec), before the drag moves the
-    /// camera. A drag started over empty space keeps the pivot. Moves no pixel.
+    /// A navigation drag starts at `at`, in a viewport of `size`, by an event at `when`: if the
+    /// surface is under it, that point becomes the camera's pivot (the navigation spec), before
+    /// the drag moves the camera. A drag started over empty space keeps the pivot. Moves no
+    /// pixel, the boundary holding the pivot ([`Camera::set_pivot`]): a boundary the brush's
+    /// edits left stale is fitted first ([`Owner::fit_boundary`]), so a pick on surface a stroke
+    /// raised past its margin grows it around the model, not the pivot alone.
     ///
     /// # Errors
     ///
     /// If the pick can't evaluate a tile.
-    fn grab(&mut self, at: Pixel, size: Size) -> Result<()> {
+    fn grab(&mut self, at: Pixel, size: Size, when: Instant) -> Result<()> {
+        self.fit_boundary(size);
         let (Some(picker), Some(view)) = (&self.picker, self.camera.view(size)) else {
             return Ok(());
         };
@@ -1230,8 +1283,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .context("picking under a navigation drag")?;
         if let Some(hit) = hit {
             let p = hit.position;
-            self.camera
-                .set_pivot(crate::camera::Vec3::new(p.x, p.y, p.z));
+            self.pivot_to(crate::camera::Vec3::new(p.x, p.y, p.z), when);
         }
         Ok(())
     }
@@ -1598,6 +1650,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 break;
             }
         }
+        if !self.brushing() && !self.pull_pen(pen, Instant::now(), true) {
+            // Off the pen's path: the frame is handed off and no sample waits.
+            self.fit_boundary(size);
+        }
         self.after_hand_off.prepare = lap.next();
 
         self.after_hand_off.report = self.run_jobs(deadline, pen)?;
@@ -1706,9 +1762,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if report.dabs_applied > 0 || report.dabs_shown > 0 {
             self.fitting.bounds = true;
         }
-        if let Some(start) = self.brush.take_stroke_start() {
+        if let Some((start, at)) = self.brush.take_stroke_start() {
             // Orbit and zoom about where the stroke began; no pixel moves.
-            self.camera.set_pivot(start);
+            self.pivot_to(start, at);
         }
         Ok(report)
     }
@@ -1876,6 +1932,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let moment = self.script.as_ref()?.at(time);
         self.camera = moment.pose.camera();
         self.input.clear();
+        self.input_at.clear();
         self.script_over |= moment.over;
         self.queue_script_pen_at(time, size, false);
         Some(moment.segment)
@@ -1944,18 +2001,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let arcball = Arcball::new(size);
         let height = f64::from(size.height());
         let input = std::mem::take(&mut self.input);
+        let input_at = std::mem::take(&mut self.input_at);
         // While a brush stroke is open the view holds still: the stroke's record keeps one camera.
         // Navigation still follows the input (buttons held, the pointer), so nothing jumps after.
         let frozen = self.stroke_open();
         if !frozen {
             self.frame_if_wanted(size);
-            if !self.brushing() {
-                self.fit_boundary();
-            }
         }
-        for event in input {
+        let timed = input.into_iter().zip(input_at);
+        for (event, when) in timed {
             if !frozen && let Some(at) = self.navigator.drag_start(&event) {
-                self.grab(at, size)?;
+                self.grab(at, size, when)?;
             }
             let mut held = self.camera;
             let camera = if frozen { &mut held } else { &mut self.camera };
@@ -2012,9 +2068,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 camera: &self.camera,
                 size,
             };
-            let route = self
-                .pen_router
-                .route(&sample, |down| brush.route(context, down));
+            let mut asked = false;
+            let route = self.pen_router.route(&sample, |down| {
+                asked = true;
+                brush.route(context, down)
+            });
+            // A `Down` the brush raycast and found nothing under navigates: the surface isn't
+            // under it, so its drag keeps the pivot without picking the same ray again.
+            let missed = asked && route == Some(Route::Navigate) && self.brush.routed_off_surface();
             if route != Some(Route::Brush) {
                 let mut navigation = self.pen_navigation;
                 let mut failed = None;
@@ -2022,8 +2083,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                     if failed.is_some() {
                         return;
                     }
+                    let tip = matches!(
+                        input,
+                        Input::Press {
+                            button: Button::PenTip,
+                            ..
+                        }
+                    );
                     if let Some(at) = self.navigator.drag_start(&input)
-                        && let Err(error) = self.grab(at, size)
+                        && !(missed && tip)
+                        && let Err(error) = self.grab(at, size, sample.received)
                     {
                         failed = Some(error);
                         return;

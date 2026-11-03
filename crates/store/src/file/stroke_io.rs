@@ -401,7 +401,7 @@ mod tests {
         let path = dir.path("p.bcrf");
         let mut file = ProjectFile::create(&path, meta(), mesh()).unwrap();
         let mut payload = record(0).to_payload().unwrap();
-        payload[0] = 2;
+        payload[0] = 3;
         let newer = frame(KIND_STROKE, &payload).unwrap();
         file.append_strokes(&[newer]).unwrap();
         file.save().unwrap();

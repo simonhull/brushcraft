@@ -305,6 +305,7 @@ fn landing_stroke(camera: &Camera, brush: &Sculpting) -> Pending {
         last: times_of(&down),
         interval: FIRST_INTERVAL,
         start_noted: true,
+        down_at: down.received,
     }
 }
 

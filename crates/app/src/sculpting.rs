@@ -509,17 +509,19 @@ struct Pending {
     interval: Duration,
     /// Whether its start (its first dab's centre) has been noted for the camera's pivot.
     start_noted: bool,
+    /// When its `Down` was received: what its start is dated by, for the pivot.
+    down_at: Instant,
 }
 
 impl Pending {
-    /// Notes the stroke's start in `start` once its first dab is queued: the first queued is
-    /// the first placed, since none is applied before it.
-    fn note_start(&mut self, start: &mut Option<[f32; 3]>) {
+    /// Notes the stroke's start in `start` once its first dab is queued, dated by its `Down`:
+    /// the first queued is the first placed, since none is applied before it.
+    fn note_start(&mut self, start: &mut Option<([f32; 3], Instant)>) {
         if !self.start_noted
             && let Some(first) = self.dabs.front()
         {
             self.start_noted = true;
-            *start = Some(first.position);
+            *start = Some((first.position, self.down_at));
         }
     }
 
@@ -641,9 +643,13 @@ pub(crate) struct Sculpting {
     last: BrushReport,
     /// The overlay's lines, and what they were made from.
     status: (Vec<String>, Option<StatusKey>),
-    /// The start of the last stroke begun (its first dab's centre), until the frame loop takes it
-    /// for the camera's pivot ([`Brush::take_stroke_start`]).
-    stroke_start: Option<[f32; 3]>,
+    /// The start of the last stroke begun (its first dab's centre) and when its `Down` was
+    /// received, until the frame loop takes it for the camera's pivot
+    /// ([`Brush::take_stroke_start`]).
+    stroke_start: Option<([f32; 3], Instant)>,
+    /// Whether the last route raycast its `Down` and found no surface
+    /// ([`Brush::routed_off_surface`]).
+    route_missed: bool,
 }
 
 impl Sculpting {
@@ -676,6 +682,7 @@ impl Sculpting {
             last: BrushReport::default(),
             status: (Vec::new(), None),
             stroke_start: None,
+            route_missed: false,
         };
         brush.refresh_status();
         brush
@@ -921,6 +928,7 @@ impl Sculpting {
             last: times_of(down),
             interval: FIRST_INTERVAL,
             start_noted: false,
+            down_at: down.received,
         });
     }
 
@@ -1542,6 +1550,7 @@ impl Brush for Sculpting {
 
     fn route(&mut self, context: BrushContext<'_>, down: &PenSample) -> Route {
         self.routed = None;
+        self.route_missed = false;
         let Some(scene) = Scene::of(context) else {
             return Route::Navigate;
         };
@@ -1574,10 +1583,17 @@ impl Brush for Sculpting {
                         self.fail("picking under the pen", &error);
                         Route::Navigate
                     }
-                    Some(Ok(None)) | None => Route::Navigate,
+                    Some(Ok(None)) => {
+                        self.route_missed = true;
+                        Route::Navigate
+                    }
+                    None => Route::Navigate,
                 }
             }
-            None => Route::Navigate,
+            None => {
+                self.route_missed = true;
+                Route::Navigate
+            }
         }
     }
 
@@ -1642,13 +1658,14 @@ impl Brush for Sculpting {
         }
     }
 
-    fn take_stroke_start(&mut self) -> Option<crate::camera::Vec3> {
-        let [x, y, z] = self.stroke_start.take()?;
-        Some(crate::camera::Vec3::new(
-            f64::from(x),
-            f64::from(y),
-            f64::from(z),
-        ))
+    fn take_stroke_start(&mut self) -> Option<(crate::camera::Vec3, Instant)> {
+        let ([x, y, z], at) = self.stroke_start.take()?;
+        let start = crate::camera::Vec3::new(f64::from(x), f64::from(y), f64::from(z));
+        Some((start, at))
+    }
+
+    fn routed_off_surface(&self) -> bool {
+        self.route_missed
     }
 
     fn set_radius(&mut self, pixels: f32) {
@@ -1714,13 +1731,10 @@ fn button_bits(buttons: input::Buttons) -> u8 {
     held.fold(0, |bits, bit| bits | bit)
 }
 
-/// The camera a stroke was drawn through, as its record keeps it: `camera`'s eye, target, up and
-/// field of view (narrowed by its magnification), and `view`'s size.
+/// The camera a stroke was drawn through, as its record keeps it.
 ///
-/// The record holds no principal point: a stroke drawn through a view magnified off its centre
-/// (the magnified image shifted, `crate::camera`'s lens) is recorded as the view magnified about
-/// its centre, its rays a shift away from the ones it was drawn through. Its edits stay
-/// authoritative; the record's camera needs the lens's shift (a store change) to replay it.
+/// `camera`'s eye, target, up, unmagnified field of view and lens (its magnification and the
+/// image's shift), and `view`'s size. [`recorded_view`] rebuilds the view from it.
 fn stroke_camera(camera: &Camera, view: &View) -> StrokeCamera {
     let triple = |v: crate::camera::Vec3| [v.x, v.y, v.z];
     let size = view.size();
@@ -1728,9 +1742,35 @@ fn stroke_camera(camera: &Camera, view: &View) -> StrokeCamera {
         eye: triple(camera.eye()),
         target: triple(camera.target()),
         up: triple(camera.axis(crate::camera::Vec3::new(0.0, 1.0, 0.0))),
-        fov_y: camera.magnified_fov_y(),
+        fov_y: camera.fov_y(),
         size: [size.width(), size.height()],
+        magnification: camera.magnification(),
+        shift: camera.shift(),
     }
+}
+
+/// The view a stroke record's `camera` was drawn through.
+///
+/// The plain view from its eye towards its target, its near plane at
+/// [`render::camera::NEAR_FRACTION`] of their distance as [`Camera::view`] puts it, magnified by
+/// its lens ([`crate::camera::lensed`]). A version 1 record reads as unmagnified. `None` for a
+/// camera no view can be made of. For tests and replay tools: nothing in the app replays a stroke
+/// yet.
+#[cfg(test)]
+pub(crate) fn recorded_view(camera: &StrokeCamera) -> Option<View> {
+    let point = |[x, y, z]: [f64; 3]| render::camera::Vec3::new(x, y, z);
+    let (eye, target) = (point(camera.eye), point(camera.target));
+    let size = render::surface::Size::new(camera.size[0], camera.size[1])?;
+    let near = (eye - target).length() * render::camera::NEAR_FRACTION;
+    let plain = View::look_at(eye, target, point(camera.up), camera.fov_y, size, near)?;
+    #[expect(
+        clippy::float_cmp,
+        reason = "an unmagnified record rebuilds the plain view bit for bit, as Camera::view gives it"
+    )]
+    if camera.magnification == 1.0 && camera.shift == [0.0, 0.0] {
+        return Some(plain);
+    }
+    crate::camera::lensed(&plain, camera.magnification, camera.shift)
 }
 
 /// The brush's base strength, `factor` times [`DEFAULT_STRENGTH_FRACTION`] of the radius.

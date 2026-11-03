@@ -36,6 +36,8 @@ fn stroke() -> StrokeRecord {
         up: [0.0, 1.0, 0.0],
         fov_y: 0.785,
         size: [2560, 1440],
+        magnification: 1.0,
+        shift: [0.0; 2],
     };
     let settings: Vec<u8> = (0..400_u32)
         .map(|k| u8::try_from(k * 37 % 251).expect("below 251"))

@@ -7,7 +7,8 @@
 //!
 //! - **The pivot** ([`Camera::pivot`]) is the point orbit and zoom turn and scale about: where the
 //!   last stroke began, the surface under the pointer as a navigation drag starts over the model,
-//!   or the model's centre once framed ([`crate::frame`] sets it). Setting it moves no pixel.
+//!   or the model's centre once framed ([`crate::frame`] sets it, the latest event winning).
+//!   Setting it moves no pixel, unless the boundary must grow to hold it (below).
 //! - **Orbit** turns the eye and the view's orientation together about the pivot, so the pivot
 //!   stays on its pixel. **Pan** slides the view in its plane so the pivot's depth keeps pace with
 //!   the pointer. **Zoom** scales the pivot's apparent distance (the eye's distance to it over the
@@ -24,6 +25,10 @@
 //!   boundary** (with no boundary known, at [`Camera::MIN_DISTANCE`] from the pivot), and no orbit,
 //!   pan or zoom leaves the eye inside it. The perspective freezes there: while magnified it is the
 //!   boundary's, flatter than a true close-up.
+//! - **The boundary holds every pivot**, as it holds the model's points, a margin inside: one set
+//!   outside it (a surface raised past the margin, picked before the boundary is fitted again)
+//!   grows it ([`Boundary::holding`]), so the eye's line to the pivot leaves the boundary at one
+//!   point. It grows, never shrinks, until the model is framed again.
 //!
 //! **Magnification is the lens's, not the eye's:** a magnification factor `m` and a shift `s`
 //! carry the unmagnified view's image plane (right and up over depth) `t` to `m · t + s`, which
@@ -32,9 +37,25 @@
 //! puts them; [`View::pixels_per_unit`] grows by `m`, so everything that measures the view in
 //! pixels (the level choice, the brush's screen radius, picking's rays through
 //! [`View::through`]) measures the magnified image's. A zoom keeps the pivot's pixel by changing
-//! `s` with `m`; a magnification that the pivot's moving on the screen (a pan, a new pivot)
-//! leaves when it falls back to 1 keeps its shift, a view whose line of sight is off the
-//! screen's centre. Framing clears it.
+//! `s` with `m`. **An unmagnified image is never shifted:** if the pivot moved on the screen
+//! while magnified (a pan, a new pivot), the shift left as the magnification falls back to 1 is
+//! folded into the orientation, the view turned about the eye so the pivot keeps its pixel and
+//! the line of sight meets the screen's centre again. The pivot's pixel is kept exactly; the rest
+//! of the image steps by the difference between a shift and a turn, small for a small shift.
+//!
+//! **The limits scale with the model and the `f32` the GPU draws in:** the eye goes out to
+//! [`Camera::MAX_DISTANCE`] model radii (for a model larger than 1), so any model frames
+//! unmagnified; and the magnification stops where a pixel at the pivot, in a 4K-tall view,
+//! still spans [`Camera::PIXEL_ULPS`] `f32` steps of the eye's and the pivot's coordinates
+//! (about 70 times for a unit model with the eye on its boundary), beyond which the image would
+//! move in steps and the pick ray's own rounding would disagree with it.
+//!
+//! **Known limit: the surface can pass the eye during a stroke.** The view holds still while a
+//! stroke is drawn (its record keeps one camera), and the boundary is fitted again only once the
+//! brush is idle. A strong stroke on a magnified close-up can raise the surface by more than the
+//! margin, up to and past the eye: the part past it isn't drawn and the brush may work on a
+//! surface the eye is inside, until the stroke has landed and the grown boundary pushes the eye
+//! back out along its line to the pivot.
 //!
 //! A scripted camera's pose ([`Camera::orbiting`], [`Camera::slide`]) is set directly: no pivot
 //! of its own (the target), no boundary, never magnified, its view exactly the plain one.
@@ -285,6 +306,24 @@ impl Boundary {
         }
     }
 
+    /// This boundary grown, if it must be, to hold `point` as it holds the model's points: the
+    /// sphere of the model's points it was made around ([`Boundary::around`], its radius over 1
+    /// plus [`Boundary::MARGIN`]) grown to the smallest holding `point` too, then the margin
+    /// added again. Itself if that sphere holds `point` already.
+    pub(crate) fn holding(self, point: Vec3) -> Self {
+        let model = self.radius / (1.0 + Self::MARGIN);
+        let apart = point - self.centre;
+        let gap = apart.length();
+        if gap <= model || !gap.is_finite() {
+            return self;
+        }
+        let grown = f64::midpoint(model, gap);
+        Self {
+            centre: self.centre + apart * ((grown - model) / gap),
+            radius: grown * (1.0 + Self::MARGIN),
+        }
+    }
+
     /// How far from `origin` along the unit vector `direction` a ray last leaves the sphere;
     /// `None` if it doesn't meet it at a positive distance.
     fn exit(self, origin: Vec3, direction: Vec3) -> Option<f64> {
@@ -355,13 +394,18 @@ impl Default for Camera {
 }
 
 impl Camera {
-    /// The farthest the eye goes from the target, or from the pivot.
+    /// The farthest the eye goes from the target, or from the pivot, for a model of radius 1 or
+    /// less (or none known): a larger model's limit is this many of its boundary's radii
+    /// ([`Camera::far`]), so framing any model leaves it unmagnified.
     pub(crate) const MAX_DISTANCE: f64 = 1e4;
-    /// The most the image is magnified: about the scale at which a pixel shrinks to the `f32`
-    /// rounding of the positions the GPU draws.
-    pub(crate) const MAX_MAGNIFICATION: f64 = 1e4;
     /// The closest the eye comes to the target, or to the pivot with no boundary known.
     pub(crate) const MIN_DISTANCE: f64 = 1e-4;
+    /// How many `f32` rounding steps (ulps) of the drawn positions' magnitude a magnified pixel
+    /// spans at least, at the pivot's depth ([`Camera::most_magnification`]).
+    pub(crate) const PIXEL_ULPS: f64 = 4.0;
+    /// The tallest viewport the magnification limit is made for, in pixels: a 4K display's
+    /// ([`Camera::most_magnification`]). A shorter one gets the same limit, its pixels coarser.
+    pub(crate) const TALLEST_VIEWPORT: f64 = 2160.0;
 
     /// The default camera ([`Camera::default`]: looking at the origin, y up) turned to look from
     /// `yaw` radians about the world's y axis (counter-clockwise from above, from +z towards +x)
@@ -392,13 +436,13 @@ impl Camera {
     }
 
     /// The vertical field of view, unmagnified, in radians.
-    #[cfg(test)]
     pub(crate) const fn fov_y(&self) -> f64 {
         self.fov_y
     }
 
     /// The vertical field of view as magnified: the unmagnified one narrowed by
     /// [`Camera::magnification`].
+    #[cfg(test)]
     pub(crate) fn magnified_fov_y(&self) -> f64 {
         2.0 * ((self.fov_y / 2.0).tan() / self.lens.factor).atan()
     }
@@ -411,6 +455,12 @@ impl Camera {
     /// How many times the image is magnified: 1 unless the eye is at the boundary.
     pub(crate) const fn magnification(&self) -> f64 {
         self.lens.factor
+    }
+
+    /// The magnified image's shift, right and up, in units of the unmagnified image plane at
+    /// unit depth (see the module notes): 0 whenever the image isn't magnified.
+    pub(crate) const fn shift(&self) -> [f64; 2] {
+        self.lens.shift
     }
 
     /// The model's boundary, once known.
@@ -429,23 +479,37 @@ impl Camera {
         self.orientation.apply(axis)
     }
 
-    /// Makes `pivot` the point orbit and zoom turn and scale about. Moves no pixel: only the next
-    /// orbit or zoom turns or scales about it.
-    pub(crate) const fn set_pivot(&mut self, pivot: Vec3) {
+    /// Makes `pivot`, a point of the model, the point orbit and zoom turn and scale about. Moves
+    /// no pixel: only the next orbit or zoom turns or scales about it.
+    ///
+    /// The boundary is grown to hold it as it holds the model's points, a [`Boundary::MARGIN`]
+    /// inside ([`Boundary::holding`]), so every pivot is inside the boundary; a surface raised
+    /// past the boundary since it was fitted (a pick there before the frame loop fits it again)
+    /// grows it. Only then can a pixel move: if the grown boundary takes in the eye, the eye is
+    /// held out of it as [`Camera::orbit`] does.
+    pub(crate) fn set_pivot(&mut self, pivot: Vec3) {
         self.pivot = pivot;
+        if let Some(boundary) = self.boundary {
+            let holding = boundary.holding(pivot);
+            if holding != boundary {
+                self.boundary = Some(holding);
+                self.settle(self.apparent());
+            }
+        }
     }
 
-    /// Takes `boundary` as the model's, grown to hold the one known before (if any), and keeps
-    /// the eye out of it as [`Camera::orbit`] does.
+    /// Takes `boundary` as the model's, grown to hold the one known before (if any) and the
+    /// pivot, and keeps the eye out of it as [`Camera::orbit`] does.
     ///
-    /// The boundary only grows until the next [`Camera::frame`]: every pivot set since was a
-    /// point of the model inside the one known then, and the eye keeps to its line to a pivot
-    /// inside the boundary. A model sculpted smaller leaves the eye a little farther out.
+    /// The boundary only grows until the next [`Camera::frame`], and always holds the pivot
+    /// ([`Camera::set_pivot`]): the eye keeps to its line to a pivot inside it, which leaves the
+    /// boundary at exactly one point. A model sculpted smaller leaves the eye a little farther
+    /// out.
     pub(crate) fn grow_boundary(&mut self, boundary: Boundary) {
-        self.boundary = Some(
-            self.boundary
-                .map_or(boundary, |known| known.union(boundary)),
-        );
+        let grown = self
+            .boundary
+            .map_or(boundary, |known| known.union(boundary));
+        self.boundary = Some(grown.holding(self.pivot));
         self.settle(self.apparent());
     }
 
@@ -463,9 +527,9 @@ impl Camera {
         let fit = half.min((half.tan() * aspect).atan());
         self.target = centre;
         self.pivot = centre;
-        self.distance = (radius / fit.sin()).clamp(Self::MIN_DISTANCE, Self::MAX_DISTANCE);
         self.lens = Lens::NONE;
         self.boundary = Some(boundary);
+        self.distance = (radius / fit.sin()).clamp(Self::MIN_DISTANCE, self.far());
         self.settle(self.apparent());
     }
 
@@ -529,12 +593,59 @@ impl Camera {
         (self.eye() - self.pivot).length() / self.lens.factor
     }
 
+    /// The farthest the eye goes from the target or the pivot: [`Camera::MAX_DISTANCE`], or that
+    /// many of the boundary's radii for a model larger than 1. Distances scale with the model,
+    /// so a model of any size frames unmagnified and zooms out as far, in its own radii, as the
+    /// benchmark's unit sphere does.
+    fn far(&self) -> f64 {
+        self.boundary.map_or(Self::MAX_DISTANCE, |boundary| {
+            Self::MAX_DISTANCE * boundary.radius.max(1.0)
+        })
+    }
+
+    /// The most the image may be magnified with the eye `reach` from the pivot along `line`: as
+    /// far as a pixel at the pivot's depth, in a [`Camera::TALLEST_VIEWPORT`] tall view, still
+    /// spans [`Camera::PIXEL_ULPS`] of the `f32` rounding of what is drawn there; at least 1.
+    ///
+    /// The GPU takes the eye and the surface as `f32` (the view eye-relative,
+    /// `render::camera::GpuView`), each rounded to an ulp of its magnitude: so a pixel smaller
+    /// than an ulp of the larger of the two, the eye's or the pivot's largest coordinate, shows
+    /// the rounding as the eye moves (the image steps rather than slides), and the pick ray's
+    /// own rounding (`crate::pick`) disagrees with the image by that much. Four ulps keeps both
+    /// to about a quarter of a pixel. For a unit model with the eye on its boundary, 0.05 above
+    /// the surface, that is about 40 times.
+    fn most_magnification(&self, line: Vec3, reach: f64) -> f64 {
+        let eye = self.pivot + line * reach;
+        let forward = -self.axis(Vec3::new(0.0, 0.0, 1.0));
+        let depth = (self.pivot - eye).dot(forward);
+        let largest = [eye, self.pivot]
+            .iter()
+            .flat_map(|v| [v.x.abs(), v.y.abs(), v.z.abs()])
+            .fold(0.0, f64::max);
+        let per_unit = Self::TALLEST_VIEWPORT / 2.0 / (self.fov_y / 2.0).tan();
+        let pixel = Self::PIXEL_ULPS * f32_ulp(largest);
+        (depth / (pixel * per_unit)).max(1.0)
+    }
+
     /// Puts the eye on its line to the pivot, and magnifies the image, so the pivot's apparent
     /// distance is `apparent` (clamped to the limits): the eye as close as that asks, but no
     /// closer than the boundary (or [`Camera::MIN_DISTANCE`]) along the line, the image
-    /// magnified by what is left. The pivot keeps its pixel: the eye moves along the line
-    /// through it, and the image scales about it. Whatever moved the view last, it leaves the
-    /// eye out of the boundary, and on it while the image is magnified.
+    /// magnified by what is left, up to [`Camera::most_magnification`]. The pivot keeps its
+    /// pixel: the eye moves along the line through it, and the image scales about it. Whatever
+    /// moved the view last, it leaves the eye out of the boundary, and on it while the image is
+    /// magnified.
+    ///
+    /// **Back to 1, the shift is folded into the orientation:** a magnification that falls to 1
+    /// with the image still shifted (the pivot moved on the screen while magnified) turns the
+    /// view about the eye instead, so the pivot shows where the shifted image showed it and the
+    /// view looks along its axis again: an unmagnified image is never shifted. The pivot keeps
+    /// its pixel exactly; the rest of the image differs from the shifted one by the turn's
+    /// perspective, which grows with the shift (a few pixels at the edge for a shift of a tenth
+    /// of the field).
+    ///
+    /// **A pivot not ahead of the eye** (which navigation never makes) has no pixel to keep: the
+    /// image keeps its centre's instead, and isn't magnified (its depth leaves
+    /// [`Camera::most_magnification`] at 1), a magnified one falling back to 1 about its centre.
     fn settle(&mut self, apparent: f64) {
         let to_eye = self.eye() - self.pivot;
         let reach = to_eye.length();
@@ -542,14 +653,15 @@ impl Camera {
             return;
         }
         let line = to_eye * reach.recip();
+        let far = self.far();
         let floor = self
             .boundary
             .and_then(|boundary| boundary.exit(self.pivot, line))
             .unwrap_or(0.0)
-            .max(Self::MIN_DISTANCE);
+            .clamp(Self::MIN_DISTANCE, far);
         let apparent = apparent
-            .min(Self::MAX_DISTANCE)
-            .max(floor / Self::MAX_MAGNIFICATION);
+            .min(far)
+            .max(floor / self.most_magnification(line, floor));
         let settled = apparent.max(floor);
         let factor = settled / apparent;
         #[expect(
@@ -560,18 +672,57 @@ impl Camera {
         if settled == reach && factor == self.lens.factor {
             return;
         }
-        // The pivot's place on the image plane: unchanged by the eye moving along its line.
-        if let Some([x, y]) = self.pivot_on_image() {
-            let [sx, sy] = self.lens.shift;
-            let by = self.lens.factor - factor;
-            self.lens.shift = [sx + by * x, sy + by * y];
+        // What keeps its pixel: the pivot, its place on the unmagnified image plane unchanged by
+        // the eye moving along its line; or, with the pivot not ahead, the image's centre.
+        let [sx, sy] = self.lens.shift;
+        let [x, y] = self
+            .pivot_on_image()
+            .unwrap_or([-sx / self.lens.factor, -sy / self.lens.factor]);
+        let shown = [self.lens.factor * x + sx, self.lens.factor * y + sy];
+        #[expect(
+            clippy::float_cmp,
+            reason = "factor is exactly 1 when the eye is at the apparent distance, and an \
+                      unmagnified image must have no shift at all"
+        )]
+        let unmagnified = factor == 1.0;
+        if unmagnified {
+            self.turn_to_show([x, y], shown);
+            self.lens.shift = [0.0, 0.0];
+        } else {
+            self.lens.shift = [shown[0] - factor * x, shown[1] - factor * y];
         }
         self.lens.factor = factor;
         let eye = self.pivot + line * settled;
         let back = self.axis(Vec3::new(0.0, 0.0, 1.0));
-        self.distance =
-            (self.distance * settled / reach).clamp(Self::MIN_DISTANCE, Self::MAX_DISTANCE);
+        self.distance = (self.distance * settled / reach).clamp(Self::MIN_DISTANCE, far);
         self.target = eye - back * self.distance;
+    }
+
+    /// Turns the view about the eye so the unmagnified view shows what it shows at `from` on its
+    /// image plane (right and up, over depth) at `shown` instead: the shortest turn carrying the
+    /// one direction in the view to the other. Nothing if they are the same. The eye stays; the
+    /// target turns with the view.
+    fn turn_to_show(&mut self, [x, y]: [f64; 2], shown: [f64; 2]) {
+        #[expect(
+            clippy::float_cmp,
+            reason = "only a turn that changes nothing is skipped, so an unshifted view stays bit \
+                      for bit as it was"
+        )]
+        if [x, y] == shown {
+            return;
+        }
+        let unit = |v: Vec3| v * v.length().recip();
+        let (now, wanted) = (
+            unit(Vec3::new(x, y, -1.0)),
+            unit(Vec3::new(shown[0], shown[1], -1.0)),
+        );
+        // In the view, the direction is to turn from `now` to `wanted`: the view turns the other
+        // way, as an orbit's drag turns it ([`Camera::orbit`]), about the eye.
+        let eye = self.eye();
+        self.orientation = Rotation::between(now, wanted)
+            .inverse()
+            .then(self.orientation);
+        self.target = eye - self.axis(Vec3::new(0.0, 0.0, 1.0)) * self.distance;
     }
 
     /// Where the unmagnified view shows the pivot on its image plane: right and up, over its
@@ -605,12 +756,35 @@ impl Camera {
         if self.lens == Lens::NONE {
             return Some(plain);
         }
-        // The shift is in image-plane units; the plain view's scale turns it into its pixels
-        // (y down).
-        let [sx, sy] = self.lens.shift;
-        let per_unit = plain.pixels_per_unit();
-        plain.magnified(self.lens.factor, [sx * per_unit, -sy * per_unit])
+        lensed(&plain, self.lens.factor, self.lens.shift)
     }
+}
+
+/// `plain` with its image magnified `factor` times about the viewport's centre and moved by
+/// `shift`, a lens's view.
+///
+/// The shift is right and up, in units of `plain`'s image plane at unit depth: a point `plain`
+/// shows at `t` on its image plane shows at `factor · t + shift`. What [`Camera::view`] gives for
+/// its lens, and what a stroke record's camera rebuilds ([`crate::sculpting`]). `None` as
+/// [`View::magnified`] is.
+pub(crate) fn lensed(plain: &View, factor: f64, shift: [f64; 2]) -> Option<View> {
+    // The shift is in image-plane units; the plain view's scale turns it into its pixels (y
+    // down).
+    let [sx, sy] = shift;
+    let per_unit = plain.pixels_per_unit();
+    plain.magnified(factor, [sx * per_unit, -sy * per_unit])
+}
+
+/// The step between `f32`s at the magnitude `x` (an `f32`'s rounding of a coordinate that
+/// large is up to half of it); the smallest normal `f32` for 0.
+fn f32_ulp(x: f64) -> f64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the magnitude as the GPU rounds it, to find its f32 step"
+    )]
+    let rounded = (x.abs() as f32).max(f32::MIN_POSITIVE);
+    let next = f32::from_bits(rounded.to_bits().saturating_add(1));
+    f64::from(next - rounded)
 }
 
 /// Shoemake's arcball over a viewport: a unit sphere centred on it, filling its shorter side.
@@ -807,9 +981,14 @@ mod tests {
             camera.magnification()
         );
         camera.zoom(1e-12);
+        // The eye 1e-4 from the pivot at the origin: a pixel of four f32 steps at 1e-4, at the
+        // tallest viewport's scale.
+        let per_unit = Camera::TALLEST_VIEWPORT / 2.0 / (camera.fov_y() / 2.0).tan();
+        let most = Camera::MIN_DISTANCE / (Camera::PIXEL_ULPS * f32_ulp(1e-4) * per_unit);
         assert!(
-            (camera.magnification() - Camera::MAX_MAGNIFICATION).abs() < CLOSE,
-            "magnified at most to its limit"
+            (camera.magnification() / most - 1.0).abs() < 1e-9,
+            "magnified at most to its limit: {} {most}",
+            camera.magnification()
         );
         camera.zoom(1e30);
         assert!(
@@ -1092,6 +1271,190 @@ mod tests {
         assert_eq!(camera.boundary(), None);
     }
 
+    /// The pixel the view's line of sight meets: the centre, unless the image is shifted.
+    fn principal(camera: &Camera) -> [f64; 2] {
+        camera.view(size()).expect("a view").principal()
+    }
+
+    /// The unit sphere's near side where `camera` shows `pixel` of [`size`], if it shows it.
+    fn sphere_under(camera: &Camera, pixel: (f64, f64)) -> Option<Vec3> {
+        let view = camera.view(size())?;
+        let ray = view.through(pixel.0, pixel.1);
+        let (eye, ray) = (
+            Vec3::new(view.eye().x, view.eye().y, view.eye().z),
+            Vec3::new(ray.x, ray.y, ray.z),
+        );
+        // |eye + t ray| = 1, the nearer root.
+        let (square, linear, constant) = (ray.dot(ray), 2.0 * eye.dot(ray), eye.dot(eye) - 1.0);
+        let root = linear * linear - 4.0 * square * constant;
+        (root >= 0.0).then(|| eye + ray * ((-linear - root.sqrt()) / (2.0 * square)))
+    }
+
+    /// `camera` zoomed out a notch at a time until unmagnified, each step keeping the pivot on
+    /// its pixel; returns how many steps it took.
+    fn zoom_out_to_one(camera: &mut Camera) -> usize {
+        for step in 0..1000 {
+            if camera.magnification() <= 1.0 {
+                return step;
+            }
+            let before = shown(camera, camera.pivot());
+            camera.zoom(1.1);
+            let after = shown(camera, camera.pivot());
+            assert!(
+                same_pixel(before, after, 1e-6),
+                "step {step}: {before:?} → {after:?}"
+            );
+        }
+        panic!("never unmagnified: {camera:?}");
+    }
+
+    #[test]
+    fn back_to_one_the_shift_is_folded_into_the_orientation_and_the_pivot_keeps_its_pixel() {
+        let mut camera = magnified(sculpting(), 6.0);
+        camera.pan(70.0, -40.0, 200.0);
+        // A new pivot elsewhere on the surface, seen off where the magnification was centred.
+        let other = {
+            let (x, y) = (-0.2, 0.25);
+            Vec3::new(x, y, (1.0 - x * x - y * y).sqrt())
+        };
+        camera.set_pivot(other);
+        assert_ne!(camera.shift(), [0.0, 0.0], "shifted while magnified");
+        zoom_out_to_one(&mut camera);
+        assert_eq!(camera.magnification(), 1.0);
+        assert_eq!(camera.shift(), [0.0, 0.0], "no shift unmagnified");
+        assert_eq!(principal(&camera), [160.0, 100.0], "on the axis");
+        // The view is still a true one: its axes orthonormal.
+        let [right, up, back] = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ]
+        .map(|axis| camera.axis(axis));
+        for (a, b) in [(right, up), (up, back), (back, right)] {
+            assert!(a.dot(b).abs() < 1e-12 && (a.length() - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn cycles_of_magnifying_panning_and_new_pivots_never_leave_an_unmagnified_view_off_axis() {
+        let mut camera = sculpting();
+        let ball = Arcball::new(size());
+        let pixels = [(200.0, 80.0), (120.0, 130.0), (175.0, 60.0), (140.0, 110.0)];
+        for cycle in 0_u32..24 {
+            camera = magnified(camera, 3.0 + f64::from(cycle % 5));
+            camera.pan(25.0, 15.0 - f64::from(cycle), 200.0);
+            camera.orbit(ball.drag(Pixel { x: 160.0, y: 100.0 }, Pixel { x: 163.0, y: 98.0 }));
+            let pixel = pixels[usize::try_from(cycle).expect("small") % pixels.len()];
+            camera.set_pivot(sphere_under(&camera, pixel).expect("the sphere is there"));
+            zoom_out_to_one(&mut camera);
+            assert_eq!(camera.shift(), [0.0, 0.0], "cycle {cycle}");
+            assert_eq!(principal(&camera), [160.0, 100.0], "cycle {cycle}");
+            assert!(out(&camera) >= 1.0 - 1e-12, "cycle {cycle}: outside");
+            // Back to the start's distance, to magnify again next cycle.
+            for _ in 0..20 {
+                camera.zoom(1.1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_pivot_behind_the_eye_unmagnifies_about_the_images_centre() {
+        let mut camera = magnified(sculpting(), 5.0);
+        let behind = camera.eye() + camera.axis(Vec3::new(0.0, 0.0, 1.0)) * 0.5;
+        // Not a point of the model, but the camera must stay sound if handed one.
+        camera.set_pivot(behind);
+        let centre_ray = camera.view(size()).expect("a view").through(160.0, 100.0);
+        camera.zoom(0.5);
+        assert_eq!(camera.magnification(), 1.0, "nothing to magnify about");
+        assert_eq!(camera.shift(), [0.0, 0.0]);
+        let now = camera.view(size()).expect("a view").through(160.0, 100.0);
+        let unit = |v: RenderVec3| v * v.length().recip();
+        assert!(
+            (unit(now) - unit(centre_ray)).length() < 1e-9,
+            "the centre shows what it showed"
+        );
+        assert!(out(&camera) >= 1.0 - 1e-12, "outside: {}", out(&camera));
+    }
+
+    #[test]
+    fn a_pivot_outside_the_boundary_grows_it_to_hold_the_pivot() {
+        let mut camera = magnified(sculpting(), 2.0);
+        // A surface raised past the margin since the boundary was fitted.
+        let raised = on_surface() * 1.3;
+        camera.set_pivot(raised);
+        let boundary = camera.boundary().expect("a boundary");
+        let model = boundary.radius() / (1.0 + Boundary::MARGIN);
+        assert!(
+            (raised - boundary.centre()).length() <= model + 1e-9,
+            "the pivot is a point of the grown model sphere"
+        );
+        assert!(
+            (Vec3::default() - boundary.centre()).length() + 1.0 <= model + 1e-9,
+            "which still holds the old one"
+        );
+        assert!(
+            out(&camera) >= 1.0 - 1e-12,
+            "the eye held out: {}",
+            out(&camera)
+        );
+        let before = boundary;
+        camera.set_pivot(on_surface());
+        assert_eq!(
+            camera.boundary(),
+            Some(before),
+            "a pivot inside grows nothing"
+        );
+    }
+
+    #[test]
+    fn a_huge_model_frames_unmagnified() {
+        let mut camera = Camera::default();
+        for radius in [1.0, 4.5e3, 1e5, 3e6] {
+            let centre = Vec3::new(radius * 0.1, -radius, 2.0 * radius);
+            camera.frame(centre, radius, size());
+            assert_eq!(camera.magnification(), 1.0, "radius {radius}");
+            let distance = (camera.eye() - centre).length();
+            let half = (camera.fov_y() / 2.0).sin();
+            assert!(
+                (radius / distance / half - 1.0).abs() < 1e-9,
+                "radius {radius}: fitted at {distance}"
+            );
+            camera.zoom(1e9);
+            assert!(
+                (camera.eye() - centre).length() <= Camera::MAX_DISTANCE * radius * 1.06,
+                "radius {radius}: out as far as a unit model's limit in its radii"
+            );
+        }
+    }
+
+    #[test]
+    fn the_magnification_stops_where_a_pixel_spans_four_f32_steps() {
+        // A model of radius 0.8: every coordinate of the eye and the pivot well inside 0.5..1,
+        // one f32 step.
+        let mut camera = Camera::default();
+        camera.grow_boundary(Boundary::around(Vec3::default(), 0.8).expect("a boundary"));
+        camera.set_pivot(on_surface() * 0.8);
+        camera.zoom(1e-9);
+        let factor = camera.magnification();
+        let eye = camera.eye();
+        let forward = -camera.axis(Vec3::new(0.0, 0.0, 1.0));
+        let depth = (camera.pivot() - eye).dot(forward);
+        let pivot = camera.pivot();
+        let coordinates = [eye.x, eye.y, eye.z, pivot.x, pivot.y, pivot.z];
+        let largest = coordinates.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let per_unit = Camera::TALLEST_VIEWPORT / 2.0 / (camera.fov_y() / 2.0).tan();
+        let pixel = depth / (per_unit * factor);
+        let steps = pixel / f32_ulp(largest);
+        assert!(
+            (steps / Camera::PIXEL_ULPS - 1.0).abs() < 1e-6,
+            "{steps} steps a pixel at {factor}x"
+        );
+        assert!(
+            (20.0..100.0).contains(&factor),
+            "a unit model's limit: {factor}"
+        );
+    }
+
     #[test]
     fn no_orbit_pan_or_zoom_leaves_the_eye_inside_the_boundary() {
         let ball = Arcball::new(size());
@@ -1104,7 +1467,7 @@ mod tests {
                         continue;
                     }
                     let (a, b) = (a.clamp(-1e3, 1e3), b.clamp(-1e3, 1e3));
-                    match kind % 5 {
+                    match kind % 7 {
                         0 => camera.orbit(ball.drag(
                             Pixel { x: 160.0, y: 100.0 },
                             Pixel {
@@ -1119,19 +1482,46 @@ mod tests {
                             let p = Vec3::new(a.sin(), b.cos(), (a * b).sin()) * 0.5;
                             camera.set_pivot(p);
                         }
-                        _ => camera.grow_boundary(
-                            Boundary::around(Vec3::default(), 1.0 + a.abs() / 1e3)
-                                .expect("a boundary"),
-                        ),
+                        4 => {
+                            // A point the view shows, anywhere along the ray out to three
+                            // times the eye's distance to the boundary's centre: inside the
+                            // boundary or out past it (a surface raised past its margin).
+                            let view = camera.view(size()).expect("a view");
+                            let ray = view.through(160.0 + a % 160.0, 100.0 + b % 100.0);
+                            let reach = (camera.eye() - camera.boundary().expect("known").centre())
+                                .length();
+                            let along = (0.01 + (a * b).abs() % 3.0) * reach;
+                            let p = view.eye() + ray * (along / ray.length());
+                            camera.set_pivot(Vec3::new(p.x, p.y, p.z));
+                        }
+                        5 => {
+                            // A boundary off the centre, grown into the known one.
+                            let centre = Vec3::new(a.sin(), b.sin(), (a + b).cos()) * 0.8;
+                            let radius = 0.2 + (a * b).abs() % 1.5;
+                            camera.grow_boundary(
+                                Boundary::around(centre, radius).expect("a boundary"),
+                            );
+                        }
+                        // Zooms at the clamps: far past either limit.
+                        _ => camera.zoom(if a > 0.0 { 1e300 } else { 1e-300 }),
                     }
                     let out = out(&camera);
                     assert!(out >= 1.0 - 1e-9, "step {n}: the eye is inside, at {out}");
-                    if camera.magnification() > 1.0 + 1e-9 {
+                    let boundary = camera.boundary().expect("a boundary");
+                    let model = boundary.radius() / (1.0 + Boundary::MARGIN);
+                    assert!(
+                        (camera.pivot() - boundary.centre()).length() <= model * (1.0 + 1e-12),
+                        "step {n}: the pivot is outside the boundary"
+                    );
+                    if camera.magnification() > 1.0 {
                         assert!(
                             (out - 1.0).abs() < 1e-6,
                             "step {n}: magnified off it, at {out}"
                         );
+                    } else {
+                        assert_eq!(camera.shift(), [0.0, 0.0], "step {n}: shifted at 1x");
                     }
+                    assert!(camera.magnification() >= 1.0, "step {n}");
                     assert!(camera.view(size()).is_some(), "step {n}: a view");
                 }
             });
