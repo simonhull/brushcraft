@@ -72,8 +72,11 @@
 //! frames and after the hand-off ([`Brush::prepare`], until the frame's deadline), never in a
 //! frame's own step, which waits on no catch-up. While the pen draws ([`STROKE_QUIET`] since its
 //! last sample), the catch-up takes only batches the cost model fits before the pen's next sample
-//! is due (its smoothed interval, less a margin), so it doesn't hold a sample up; once the pen
-//! lifts or rests, each step takes at least one dab, in batches of up to [`CATCH_UP_BATCH`]. Each
+//! is due (its smoothed interval, less a margin), so it doesn't hold a sample up; while it rests
+//! on the surface, batches of a sample's interval; once the pen lifts, each step takes at least
+//! one dab, in batches of up to [`CATCH_UP_BATCH`]. So a pen frame never waits behind more than
+//! a sample's worth of catch-up (the live session's catch-up p99 of 17 ms in pen frames came from
+//! 12 ms batches run while the pen rested down). Each
 //! batch that lands makes the previews it moved again over what landed ([`Preview::land`]); once
 //! every dab has landed none is left and the surface is exact, which the record's
 //! `dabs_catching_up` counts down to. The saved result is that of applying the dabs at once, bit
@@ -1107,13 +1110,23 @@ impl Sculpting {
         budget: Option<&BrushBudget>,
     ) {
         let moving = self.pen_moving();
+        // While the pen is down, resting or not, the catch-up never holds up its next sample:
+        // a dab is forced, and long batches taken, only once it has lifted.
+        let down = self.stroke.as_ref().is_some_and(Pending::open);
         let forced = match (&self.preview, budget) {
             (None, _) | (_, None) => true,
-            (Some(_), Some(budget)) => budget.forces_progress() && !moving,
+            (Some(_), Some(budget)) => budget.forces_progress() && !moving && !down,
         };
-        // Once the pen lifts or rests, a step that must make progress catches up in batches
-        // long enough to merge dabs per tile.
+        // Once the pen lifts, a step that must make progress catches up in batches long enough
+        // to merge dabs per tile.
         let batch = self.preview.is_some() && forced && budget.is_some() && !moving;
+        // A pen resting on the surface sends no samples to wait for: the catch-up takes a
+        // sample's interval at a time, so one arriving waits at most that.
+        let resting = down && !moving;
+        let interval = self
+            .stroke
+            .as_ref()
+            .map_or(FIRST_INTERVAL, |stroke| stroke.interval);
         // While the pen draws, the catch-up waits for the frame of what this step (or one before
         // it, between frames) showed, then has until the next sample is due.
         let waits = self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0;
@@ -1152,6 +1165,8 @@ impl Sculpting {
         }
         let room = match (catching_up, batch, forced) {
             (true, true, _) => room.max(CATCH_UP_BATCH),
+            // The pen rests: a sample's interval, less the margin.
+            (true, false, false) if resting => interval.saturating_sub(SAMPLE_MARGIN),
             // The pen draws: the catch-up has until its next sample is due.
             (true, false, false) => before_next.map_or(Duration::ZERO, |by| {
                 by.saturating_duration_since(Instant::now())

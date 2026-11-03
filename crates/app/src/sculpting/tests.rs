@@ -1036,3 +1036,39 @@ fn the_brushs_pixel_size_off_centre_in_a_magnified_view_is_its_images_pixel() {
         "the magnification's share of it"
     );
 }
+
+#[test]
+fn a_pen_resting_down_takes_no_forced_catch_up_and_it_lands_once_lifted() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    // The stroke without its `Up`: the pen stays down.
+    let mut samples = stroke(ACROSS, 12);
+    let up = samples.pop().expect("an up");
+    queue(&mut owner, samples);
+    run(&mut owner, 1);
+    let shown = owner.brush().last().dabs_catching_up;
+    assert!(shown > 0, "nothing fits: every dab shown ahead");
+    // It rests, past the quiet: before, each step then forced a dab; now none while it is down.
+    std::thread::sleep(STROKE_QUIET + Duration::from_millis(10));
+    run(&mut owner, 3);
+    assert_eq!(
+        owner.brush().last().dabs_catching_up,
+        shown,
+        "no dab forced while the pen rests down"
+    );
+    let mut up = up;
+    up.timestamp = Instant::now();
+    up.received = up.timestamp;
+    owner.pen(up);
+    let mut frames = 0;
+    while owner.brush().stroking() {
+        run(&mut owner, 1);
+        frames += 1;
+        assert!(frames < 10_000, "the catch-up ends once lifted");
+    }
+}
