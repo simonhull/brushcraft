@@ -926,12 +926,12 @@ fn bounds_of(block: &GatheredBlock) -> Option<Aabb> {
     Aabb::from_points(finite)
 }
 
-/// The display tiles above finest tile `key`: one at each level from 1 up to the one below its
+/// The display tiles above finest tile `key`: one at each level from 0 up to the one below its
 /// own.
 fn display_ancestors(key: &TileKey) -> impl Iterator<Item = TileKey> + use<> {
     let (face, finest, tx, ty) = (key.face(), key.level(), key.tx(), key.ty());
     let per_side = finest.tiles_per_side();
-    (1..finest.get()).filter_map(move |l| {
+    (0..finest.get()).filter_map(move |l| {
         let level = Level::new(l).ok()?;
         let scale = (per_side / level.tiles_per_side().max(1)).max(1);
         let (x, y) = (u32::from(tx) / scale, u32::from(ty) / scale);

@@ -105,11 +105,12 @@ struct Shown {
 }
 
 impl Previews {
-    /// The display tiles above finest tile `key`: one at each level from 1 below its own.
+    /// The display tiles above finest tile `key`: one at each level from 0 up to the one below its
+    /// own.
     fn ancestors(key: &TileKey) -> impl Iterator<Item = TileKey> + use<> {
         let (face, finest, tx, ty) = (key.face(), key.level(), key.tx(), key.ty());
         let per_side = finest.tiles_per_side();
-        (1..finest.get()).filter_map(move |l| {
+        (0..finest.get()).filter_map(move |l| {
             let level = Level::new(l).ok()?;
             let scale = per_side / level.tiles_per_side().max(1);
             let (x, y) = (u32::from(tx) / scale.max(1), u32::from(ty) / scale.max(1));
@@ -235,9 +236,8 @@ impl TileStore {
         let below_finest = self
             .display_finest
             .is_some_and(|finest| key.level() < finest);
-        let of_the_mesh = key.layer() == geom::LayerId::BASE
-            && key.level() != Level::ZERO
-            && self.mesh.topology().contains(key.face());
+        let of_the_mesh =
+            key.layer() == geom::LayerId::BASE && self.mesh.topology().contains(key.face());
         if key.channel() != Channel::DISPLAY || !below_finest || !of_the_mesh {
             return Err(CacheError::NotATile(key));
         }
@@ -406,8 +406,8 @@ mod tests {
         let finest = Level::new(9).expect("a level");
         let key = TileKey::displacement(FaceId::new(3), finest, 5, 2).expect("a tile");
         let above: Vec<TileKey> = Previews::ancestors(&key).collect();
-        assert_eq!(above.len(), 8, "levels 1 to 8");
-        for (ancestor, l) in above.iter().zip(1..) {
+        assert_eq!(above.len(), 9, "levels 0 to 8");
+        for (ancestor, l) in above.iter().zip(0..) {
             assert_eq!(ancestor.level().get(), l);
             assert_eq!(ancestor.channel(), Channel::DISPLAY);
             assert_eq!(ancestor.face(), FaceId::new(3));
@@ -418,10 +418,10 @@ mod tests {
             (2, 1),
             "half the tile's place"
         );
-        let level_7 = above.get(6).expect("level 7");
+        let level_7 = above.get(7).expect("level 7");
         assert_eq!((level_7.tx(), level_7.ty()), (1, 0));
         assert!(
-            above.iter().take(6).all(|a| (a.tx(), a.ty()) == (0, 0)),
+            above.iter().take(7).all(|a| (a.tx(), a.ty()) == (0, 0)),
             "a tile is a whole face up to level 6"
         );
     }

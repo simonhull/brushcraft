@@ -78,7 +78,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use brush::{
     Falloff, Hardened, Imprint, Smoothstep, draw_imprint_gradient, draw_imprint_vertex, draw_move,
 };
-use geom::{GatheredBlock, Level, TILE_QUADS, TileKey, Vec3};
+use geom::{GatheredBlock, Level, TileKey, Vec3};
 use store::{Aabb, CacheError, DisplayPreview, Evaluation, TileStore};
 
 use super::{bounds_of_points, touches};
@@ -138,12 +138,13 @@ pub(super) struct DisplayState {
 fn finest_place(key: &TileKey, finest: Level, i: u32, j: u32) -> Option<(TileKey, u32, u32)> {
     let quads = key.side() - 1;
     let step = 1_u32 << (finest.get() - key.level().get());
-    let span = quads * step / TILE_QUADS;
+    let finest_quads = finest.tile_quads().max(1);
+    let span = (quads * step / finest_quads).max(1);
     let place = |t: u16, v: u32| {
         let g = (u32::from(t) * quads + v) * step;
         let first = u32::from(t) * span;
-        let tile = (g / TILE_QUADS).clamp(first, first + span - 1);
-        (tile, g - tile * TILE_QUADS)
+        let tile = (g / finest_quads).clamp(first, first + span - 1);
+        (tile, g - tile * finest_quads)
     };
     let (fx, a) = place(key.tx(), i);
     let (fy, b) = place(key.ty(), j);
@@ -161,7 +162,7 @@ fn finest_place(key: &TileKey, finest: Level, i: u32, j: u32) -> Option<(TileKey
 fn finest_under(key: &TileKey, finest: Level) -> Vec<TileKey> {
     let quads = key.side() - 1;
     let step = 1_u32 << (finest.get() - key.level().get());
-    let span = quads * step / TILE_QUADS;
+    let span = (quads * step / finest.tile_quads().max(1)).max(1);
     let (x0, y0) = (u32::from(key.tx()) * span, u32::from(key.ty()) * span);
     let grid = (y0..y0 + span).flat_map(|y| (x0..x0 + span).map(move |x| (x, y)));
     grid.filter_map(|(x, y)| {
