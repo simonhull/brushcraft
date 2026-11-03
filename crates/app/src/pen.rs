@@ -605,6 +605,11 @@ pub(crate) use self::wayland::Ours;
 pub(crate) enum Ours {}
 
 #[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::uninhabited_references,
+    reason = "Ours has no value here, so no reference to one can exist and no method be called: \
+              the empty matches say so to the compiler"
+)]
 impl Backend for Ours {
     fn drain(&mut self, _: f64, _: &mut Vec<PenSample>) {
         match *self {}
