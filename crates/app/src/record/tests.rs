@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 71] = [
+const FRAME_FIELDS: [&str; 72] = [
     "bench",
     "result",
     "frame",
@@ -54,6 +54,7 @@ const FRAME_FIELDS: [&str; 71] = [
     "cone_exempt",
     "requested",
     "relax_passes",
+    "level_jump",
     "resident",
     "wanted",
     "evicted",
@@ -198,6 +199,7 @@ fn facts_arriving_late_land_on_their_own_frame() {
             },
             levels: vec![0, 6, 12],
             stages: None,
+            level_jump: Some(2),
         },
     };
     recorder.cut(cut);
@@ -209,6 +211,11 @@ fn facts_arriving_late_land_on_their_own_frame() {
     assert_eq!(value(&line, "over_budget"), &Value::Int(2));
     assert_eq!(value(&line, "requested"), &Value::Int(5));
     assert_eq!(value(&line, "relax_passes"), &Value::Int(2));
+    assert_eq!(
+        value(&line, "level_jump"),
+        &Value::Int(2),
+        "the stroke's jump"
+    );
     assert_eq!(
         value(&line, "tiles_per_level"),
         &Value::Ints(vec![0, 6, 12])

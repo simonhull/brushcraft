@@ -40,7 +40,10 @@
 //!   (the cut's tiles at each level from 0), `over_budget` (tiles in view left over 1 px, the
 //!   spec's count), `waiting`, `budget_limited` and `held_by_neighbours` (why), `shortfall`,
 //!   `cone_culled` (tiles culled by their normal cone) and `cone_exempt` (tiles their cone would
-//!   cull, drawn because their morph isn't settled), `requested`, `relax_passes`;
+//!   cull, drawn because their morph isn't settled), `requested`, `relax_passes`, and `level_jump`:
+//!   the largest change of the level drawing a finest tile the current stroke edited (the last
+//!   one's, until the next begins) since the cut heard before (the M1 spec's "stroke seen from a
+//!   distance": no jump bigger than one), `null` with no stroked tile drawn in both;
 //! - residency as the frame was staged: `resident`, `wanted`, `evicted` (this frame),
 //!   `uploaded_bytes` and `uploaded_tiles`, `standing_in` (display tiles standing in for a stroke's
 //!   edits, until the refresh replaces them) and `pending_epochs` (epochs staged over frames, not
@@ -61,7 +64,8 @@
 //!   surface as it began, counted in the store's budget, and the bytes the budget had no room for).
 //!   What the brush did between the last frame and this one (whose edits this frame shows) counts
 //!   as this frame's, its time `between_ms`. The owner's `prepare_ms` is the brush's work after the
-//!   hand-off (warming the surface under a hovering pen), off the latency path.
+//!   hand-off, off the latency path: a big brush's catch-up (the finest work of dabs shown ahead of
+//!   it) while there is one, else warming the surface under a hovering pen.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -284,6 +288,9 @@ pub(crate) struct SceneRecord {
     pub(crate) levels: Vec<u64>,
     /// The level choice's stages on the GPU, if timed.
     pub(crate) stages: Option<LodTimings>,
+    /// The largest level change of a tile the current (or last) stroke edited, from the cut
+    /// heard before this one: `None` with no stroke drawn in both.
+    pub(crate) level_jump: Option<u8>,
 }
 
 /// Everything recorded of one frame.
@@ -417,6 +424,10 @@ impl FrameRecord {
             .with("cone_exempt", stat(|s| s.cone_exempt))
             .with("requested", stat(|s| s.requested))
             .with("relax_passes", scene.map(|s| s.stats.passes_used()))
+            .with(
+                "level_jump",
+                scene.and_then(|s| s.level_jump).map(u32::from),
+            )
     }
 }
 

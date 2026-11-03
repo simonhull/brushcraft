@@ -32,8 +32,9 @@
 //!    uploads and the scene (residency's buffers, the camera's view, the frame's time and whether
 //!    the camera moves), which it starts encoding at once (the uploads first, then the passes);
 //! 6. **upkeep**: meanwhile the project's recovery writer is ticked and polled;
-//! 7. **prepare**: the brush's work off the latency path ([`Brush::prepare`]: warming the surface
-//!    under a hovering pen), until the frame's deadline;
+//! 7. **prepare**: the brush's work off the latency path ([`Brush::prepare`]: a big brush's
+//!    catch-up, the finest work of the dabs shown ahead of it, while there is one, else warming the
+//!    surface under a hovering pen), until the frame's deadline;
 //! 8. **jobs**: and the store's resumable jobs (display-layer refresh and rebuild) run until the
 //!    frame's deadline, at least one slice of them (but none while a brush stroke is under way, and
 //!    no more once a stroke's samples wait). This frame draws nothing they produce: the epochs they
@@ -605,6 +606,9 @@ pub(crate) struct FrameUpdate {
     pub(crate) moved: bool,
     /// The frame's time: its start, since the frame loop's clock began.
     pub(crate) time: Duration,
+    /// Whether a brush stroke is open as the frame's brush step ended: a stroke beginning
+    /// restarts the record's level jumps of the stroke's tiles ([`crate::uploads`]).
+    pub(crate) stroke_open: bool,
 }
 
 /// No GPU residency, for the frame loop's tests without a GPU: nothing is uploaded, and the
@@ -1509,6 +1513,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             deadline: uploads_deadline(now, deadline),
             moved,
             time,
+            stroke_open: brushed.open,
         };
         let mut uploads = self
             .uploads

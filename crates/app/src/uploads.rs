@@ -75,9 +75,12 @@ use render::shade::ShadePath;
 use render::upload::{FrameUploads, StoreSource, prefetch_requests};
 use store::TileStore;
 
+use self::jumps::LevelJumps;
 use crate::frame::{CutHeard, FrameUpdate, UploadStatus, Uploads};
 use crate::record::SceneRecord;
 use crate::render_thread::ResidentScene;
+
+mod jumps;
 
 /// A mebibyte, for the overlay's sizes.
 const MIB: f64 = 1024.0 * 1024.0;
@@ -145,6 +148,8 @@ pub(crate) struct GpuResidency {
     scene: Option<LodStats>,
     /// How many cut readbacks have been heard.
     cuts_heard: u64,
+    /// The current stroke's tiles, for the level jumps of the cuts drawing them.
+    jumps: LevelJumps,
 }
 
 impl GpuResidency {
@@ -215,6 +220,7 @@ impl GpuResidency {
             bounds_sent: None,
             scene: None,
             cuts_heard: 0,
+            jumps: LevelJumps::default(),
         })
     }
 
@@ -253,6 +259,7 @@ impl GpuResidency {
             deadline,
             moved,
             time,
+            stroke_open,
         } = update;
         let gpu = &*self.gpu;
         let residency = &mut self.residency;
@@ -271,6 +278,8 @@ impl GpuResidency {
             self.times.pop_first();
         }
         let mut changed = moved;
+        self.jumps
+            .drained(stroke_open, &drained, residency.finest());
         residency.apply(drained);
         if let Some(requests) = residency.take_requests() {
             prefetch_requests(store, &requests).context("paging in requested tiles")?;
@@ -286,8 +295,12 @@ impl GpuResidency {
             .reader
             .collect_all(residency.finest())
             .context("reading the level choice's cut back")?;
-        let heard_cuts: Vec<CutHeard> = cuts.iter().map(heard_of).collect();
+        let mut heard_cuts: Vec<CutHeard> = Vec::with_capacity(cuts.len());
         for output in cuts {
+            let jump = self
+                .jumps
+                .jump(residency.cut(), &output.cut, residency.finest());
+            heard_cuts.push(heard_of(&output, jump));
             if residency.cut() != &output.cut {
                 let still = self.times.get(&output.frame).filter(|stamp| !stamp.moving);
                 cut_changed = still.map(|stamp| stamp.time).or(cut_changed);
@@ -345,8 +358,9 @@ impl GpuResidency {
     }
 }
 
-/// What a scripted run's record keeps of the cut `output`.
-fn heard_of(output: &LodOutput) -> CutHeard {
+/// What a scripted run's record keeps of the cut `output`, whose stroked tiles' largest level
+/// change since the cut heard before it was `level_jump` ([`LevelJumps::jump`]).
+fn heard_of(output: &LodOutput, level_jump: Option<u8>) -> CutHeard {
     let mut levels: Vec<u64> = Vec::new();
     for key in &output.cut {
         let level = usize::from(key.level().get());
@@ -363,6 +377,7 @@ fn heard_of(output: &LodOutput) -> CutHeard {
             stats: output.stats.clone(),
             levels,
             stages: output.timings,
+            level_jump,
         },
     }
 }

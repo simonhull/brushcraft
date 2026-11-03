@@ -1754,6 +1754,7 @@ fn residency_frame(
         deadline: Instant::now() + Duration::from_secs(600),
         moved: moving,
         time,
+        stroke_open: false,
     };
     let mut status = residency
         .apply(update, project.store())
