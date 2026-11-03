@@ -889,21 +889,26 @@ fn a_long_previewed_stroke_keeps_its_drawn_bounds_true_and_flat_frame_by_frame()
         project.begin_stroke().expect("a stroke");
         let mut largest = Vec::new();
         for (k, dab) in dabs.iter().enumerate() {
-            let store = project.store();
+            let stepping = project.store();
             preview
-                .show(store, &index, std::slice::from_ref(dab), &sculpt::DrawsAll)
+                .show(
+                    stepping,
+                    &index,
+                    std::slice::from_ref(dab),
+                    &sculpt::DrawsAll,
+                )
                 .expect("shown");
             if k >= 3 {
                 let landing = dabs.get(k - 3..=k - 3).expect("a dab");
-                sculpt::apply_dabs(store, &mut index, &mut stroke, landing).expect("applied");
+                sculpt::apply_dabs(stepping, &mut index, &mut stroke, landing).expect("applied");
                 preview
-                    .land(store, &index, 1, &sculpt::DrawsAll)
+                    .land(stepping, &index, 1, &sculpt::DrawsAll)
                     .expect("landed");
             }
-            let drained = store.drain_stale(&cursor);
-            frame(gpu, &mut residency, store, drained);
-            let now = finest_grids(store, &mesh);
-            let drawn = model::drawn_grids(store, &now);
+            let drained = stepping.drain_stale(&cursor);
+            frame(gpu, &mut residency, stepping, drained);
+            let now = finest_grids(stepping, &mesh);
+            let drawn = model::drawn_grids(stepping, &now);
             check(gpu, &residency, &drawn, &resident);
             // The previewed tiles' bounds (a tile no dab reaches, standing in only as a reader of
             // a moved ring, keeps the formula of a level far above the finest).
@@ -911,7 +916,7 @@ fn a_long_previewed_stroke_keeps_its_drawn_bounds_true_and_flat_frame_by_frame()
             let previewed = tiles.iter().filter(|(place, _)| {
                 place
                     .key(finest)
-                    .is_some_and(|key| store.display_preview(&key).is_some())
+                    .is_some_and(|key| stepping.display_preview(&key).is_some())
             });
             let bound = previewed
                 .map(|(_, (_, node))| node.error)
