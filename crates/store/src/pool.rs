@@ -38,16 +38,37 @@ use crate::hash::TileMap;
 /// can't tell two budgets apart.
 #[derive(Debug)]
 pub(crate) struct Budget {
-    /// Bytes the pools may hold together.
+    /// Bytes the pools may hold together: `opened`, less what is withheld.
     limit: usize,
-    /// Bytes the pools' mapped chunks hold now: never more than `limit`.
+    /// The limit the budget was made with, before anything was withheld
+    /// ([`Budget::withhold`]).
+    opened: usize,
+    /// Bytes the pools' mapped chunks hold now: no more than `limit`, but for a while after the
+    /// limit is lowered ([`Budget::withhold`]), until the pools give chunks back.
     used: usize,
 }
 
 impl Budget {
     /// A budget of `limit` bytes, none used.
     pub(crate) const fn new(limit: usize) -> Self {
-        Self { limit, used: 0 }
+        Self {
+            limit,
+            opened: limit,
+            used: 0,
+        }
+    }
+
+    /// Withholds `bytes` from the pools, the last call's withholding replaced: the limit becomes
+    /// the budget's limit as made less `bytes`, never below `floor` (the pools' minimum). Returns
+    /// how many of `bytes` didn't fit above the floor: what is held beyond the budget.
+    ///
+    /// Lowering the limit unmaps nothing: the pools take no chunk while they hold more than it,
+    /// and give chunks back as they next make room.
+    pub(crate) fn withhold(&mut self, bytes: usize, floor: usize) -> usize {
+        let floor = floor.min(self.opened);
+        let spare = self.opened - floor;
+        self.limit = self.opened - bytes.min(spare);
+        bytes.saturating_sub(spare)
     }
 
     /// The limit.

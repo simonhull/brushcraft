@@ -960,6 +960,9 @@ impl Project {
     ///
     /// The record is compressed here, on the calling thread: a few kilobytes of samples.
     ///
+    /// The stroke's pen-down shapes go once its record is kept
+    /// ([`TileStore::release_pen_down`]): the next stroke reads the surface the stroke left.
+    ///
     /// # Errors
     ///
     /// Refused, with nothing recorded and the stroke still open:
@@ -992,6 +995,7 @@ impl Project {
         self.store.record_stroke(record)?;
         self.recorded = Some(op);
         self.stroke = None;
+        self.store.release_pen_down();
         self.end_stroke_at(Instant::now())
     }
 
@@ -1004,6 +1008,7 @@ impl Project {
     /// As [`Project::end_stroke`] once its record is kept.
     pub fn end_unrecorded_stroke(&mut self) -> Result<(), ProjectError> {
         self.stroke = None;
+        self.store.release_pen_down();
         self.end_stroke_at(Instant::now())
     }
 

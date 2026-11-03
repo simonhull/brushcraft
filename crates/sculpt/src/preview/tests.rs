@@ -57,6 +57,15 @@ fn base(dir: &TestDir) -> PathBuf {
     path
 }
 
+/// Finest tile `key`'s own positions as its preview shows them, row-major: its block without
+/// the ring.
+fn shown_positions(store: &TileStore, key: &TileKey) -> Vec<Vec3> {
+    let block = store.preview(key).expect("previewed");
+    let q = i64::from(block.quads());
+    let rows = (0..=q).flat_map(|j| (0..=q).map(move |i| (i, j)));
+    rows.map(|(i, j)| block.get(i, j)).collect()
+}
+
 /// A copy of `base` named `name`, opened, with its spatial index at the finest level.
 fn open_copy(dir: &TestDir, base: &Path, name: &str) -> (Project, SpatialIndex, PathBuf) {
     let path = dir.path().join(format!("{name}.bcrf"));
@@ -181,11 +190,11 @@ fn a_save_while_dabs_are_shown_holds_what_landed_and_nothing_of_the_previews() {
     let mut preview = Preview::new();
     shown.begin_stroke().unwrap();
     preview
-        .show(shown.store(), &mut shown_index, &dabs)
+        .show(shown.store(), &shown_index, &dabs)
         .expect("shown");
     apply_dabs(shown.store(), &mut shown_index, &mut stroke, first).unwrap();
     preview
-        .land(shown.store(), &mut shown_index, first.len())
+        .land(shown.store(), &shown_index, first.len())
         .expect("landed");
     assert_eq!(preview.shown(), 7, "seven dabs still shown");
     assert!(shown.store().has_previews(), "previews pending");
@@ -207,7 +216,7 @@ fn a_save_while_dabs_are_shown_holds_what_landed_and_nothing_of_the_previews() {
 fn previews_meet_at_their_seams_and_move_points_by_the_draw_action_along_the_dab() {
     let dir = TestDir::new();
     let base = base(&dir);
-    let (mut project, mut index, _) = open_copy(&dir, &base, "seams");
+    let (mut project, index, _) = open_copy(&dir, &base, "seams");
     let dabs = path(project.store(), 6);
     let store = project.store();
     let before: BTreeMap<TileKey, Vec<Vec3>> = finest_tiles(store)
@@ -219,7 +228,7 @@ fn previews_meet_at_their_seams_and_move_points_by_the_draw_action_along_the_dab
     // by the draw action's amount along the dab's normal, one direction for every vertex, as the
     // finest work moves it, and not along the vertex's own frame normal.
     let first = dabs[0];
-    preview.show(store, &mut index, &[first]).unwrap();
+    preview.show(store, &index, &[first]).unwrap();
     let corner = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
     let frames = store.frames_many(&[corner]).unwrap().remove(0);
     let imprint = crate::apply::imprint_of(&first).unwrap();
@@ -251,10 +260,10 @@ fn previews_meet_at_their_seams_and_move_points_by_the_draw_action_along_the_dab
         }
     }
     assert!(off_the_dab > 0, "frame normals that aren't the dab's");
-    let gone = preview.land(store, &mut index, 1).unwrap();
+    let gone = preview.land(store, &index, 1).unwrap();
     assert!(gone.tiles_cleared > 0, "dropped unapplied: its previews go");
     assert!(!store.has_previews());
-    preview.show(store, &mut index, &dabs).unwrap();
+    preview.show(store, &index, &dabs).unwrap();
     let previewed: Vec<TileKey> = store.previewed().copied().collect();
     assert!(previewed.len() > 1, "{previewed:?}");
     // Every copy of a vertex, from every previewed tile and face, holds the same bits; and a
@@ -305,11 +314,9 @@ fn the_refresh_waits_for_previews_and_runs_once_every_dab_has_landed() {
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
     project.begin_stroke().unwrap();
-    preview.show(project.store(), &mut index, &dabs).unwrap();
+    preview.show(project.store(), &index, &dabs).unwrap();
     apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
-    preview
-        .land(project.store(), &mut index, first.len())
-        .unwrap();
+    preview.land(project.store(), &index, first.len()).unwrap();
     let store = project.store();
     let held: Vec<TileKey> = store.previewed().copied().collect();
     assert!(!held.is_empty(), "previews left");
@@ -324,7 +331,7 @@ fn the_refresh_waits_for_previews_and_runs_once_every_dab_has_landed() {
         "a display tile over a preview waits for the dabs to land"
     );
     apply_dabs(store, &mut index, &mut stroke, rest).unwrap();
-    preview.land(store, &mut index, rest.len()).unwrap();
+    preview.land(store, &index, rest.len()).unwrap();
     assert!(!store.has_previews());
     run_jobs(store);
     assert!(
@@ -363,20 +370,18 @@ fn a_preview_differs_from_what_lands_only_by_the_stored_encoding() {
         .map(|key| (key, store.evaluate(key).unwrap().to_vec()))
         .collect();
     let mut preview = Preview::new();
-    preview.show(store, &mut index, &dabs).unwrap();
+    preview.show(store, &index, &dabs).unwrap();
     let shown_now: BTreeMap<TileKey, Vec<Vec3>> = store
         .previewed()
         .copied()
         .collect::<Vec<TileKey>>()
         .into_iter()
-        .map(|key| (key, store.preview_positions(&key).unwrap().to_vec()))
+        .map(|key| (key, shown_positions(store, &key)))
         .collect();
     let mut stroke = Stroke::new(store);
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), &mut index, &mut stroke, &dabs).unwrap();
-    preview
-        .land(project.store(), &mut index, dabs.len())
-        .unwrap();
+    preview.land(project.store(), &index, dabs.len()).unwrap();
     project.end_unrecorded_stroke().unwrap();
     let landed_store = project.store();
     let (mut moved, mut off) = (0.0_f32, 0.0_f32);
@@ -396,11 +401,12 @@ fn a_preview_differs_from_what_lands_only_by_the_stored_encoding() {
 }
 
 #[test]
-fn the_strokes_surface_is_hit_where_its_previews_show_it() {
+fn the_pen_down_surface_is_hit_where_it_was_whatever_is_shown_or_landed() {
     let dir = TestDir::new();
     let base = base(&dir);
     let (mut project, mut index, _) = open_copy(&dir, &base, "surface");
-    // Strong dabs, every one pushing out, so the preview stands well off the store's surface.
+    // Strong dabs, every one pushing out, so what is shown and what lands stand well off the
+    // surface the stroke began on.
     let dabs: Vec<Dab> = path(project.store(), 8)
         .into_iter()
         .map(|dab| Dab {
@@ -408,37 +414,62 @@ fn the_strokes_surface_is_hit_where_its_previews_show_it() {
             ..dab
         })
         .collect();
-    let store = project.store();
+    let rays: Vec<store::Ray> = dabs
+        .iter()
+        .flat_map(|dab| {
+            let [x, y, z] = dab.position;
+            let centre = Vec3::new(x, y, z);
+            // From outside the sphere, straight down at the dab's centre and a little beside it.
+            [Vec3::ZERO, Vec3::new(0.03, -0.02, 0.01)].map(|offset| {
+                let target = centre + offset;
+                let origin = target * 3.0;
+                store::Ray::new(origin, target - origin).unwrap()
+            })
+        })
+        .collect();
+    let at_pen_down: Vec<Option<store::TriangleHit>> = rays
+        .iter()
+        .map(|ray| index.raycast_exhaustive(project.store(), ray).unwrap())
+        .collect();
+    let mut stroke = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
     let mut preview = Preview::new();
-    preview.show(store, &mut index, &dabs).unwrap();
-    assert!(store.has_previews());
-    let mut rays = 0;
-    let mut raised = 0;
-    for dab in &dabs {
-        let [x, y, z] = dab.position;
-        let centre = Vec3::new(x, y, z);
-        // From outside the sphere, straight down at the dab's centre and a little beside it.
-        for offset in [Vec3::ZERO, Vec3::new(0.03, -0.02, 0.01)] {
-            let target = centre + offset;
-            let origin = target * 3.0;
-            let ray = store::Ray::new(origin, target - origin).unwrap();
-            let fast = index.raycast_surface(store, &ray).unwrap();
-            let every = index.raycast_surface_exhaustive(store, &ray).unwrap();
-            assert_eq!(fast, every, "the blocks skip exactly on previews too");
-            let truth = index.raycast_exhaustive(store, &ray).unwrap();
-            if let (Some(fast), Some(truth)) = (fast, truth) {
-                rays += 1;
-                if fast.t < truth.t {
-                    raised += 1;
-                }
-            }
+    preview.show(project.store(), &index, &dabs).unwrap();
+    let (first, _) = dabs.split_at(4);
+    apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
+    preview.land(project.store(), &index, first.len()).unwrap();
+    let store = project.store();
+    assert!(store.has_previews() && store.pen_down_tiles() > 0);
+    let (mut hits, mut raised) = (0, 0);
+    for (ray, was) in rays.iter().zip(&at_pen_down) {
+        let fast = index.raycast_pen_down(store, ray).unwrap();
+        let every = index.raycast_pen_down_exhaustive(store, ray).unwrap();
+        assert_eq!(
+            fast, every,
+            "the blocks skip exactly on pen-down shapes too"
+        );
+        let (Some(fast), Some(was)) = (fast, was) else {
+            panic!("every ray hits the sphere");
+        };
+        hits += 1;
+        assert_eq!(fast.key, was.key);
+        assert!(
+            (fast.t - was.t).abs() <= was.t * 1e-4,
+            "{} where it was, {}",
+            fast.t,
+            was.t
+        );
+        let now = index.raycast_exhaustive(store, ray).unwrap().unwrap();
+        if now.t < was.t * 0.99 {
+            raised += 1;
         }
     }
     assert!(
-        rays > 0 && raised > 0,
-        "{raised} of {rays} rays hit the raised preview first"
+        hits > 0 && raised > 0,
+        "{raised} of {hits} rays meet the landed dabs first"
     );
-    // The stroke engine's surface reads it too: a raycast at the first dab hits the preview.
+    // The stroke engine's surface reads it too: a raycast at the first dab hits where the
+    // surface was, not the dabs landed or shown there.
     let [x, y, z] = dabs[0].position;
     let target = stroke::DVec3::new(f64::from(x), f64::from(y), f64::from(z));
     let ray = stroke::Ray::new(target * 3.0, target * -2.0).unwrap();
@@ -446,11 +477,12 @@ fn the_strokes_surface_is_hit_where_its_previews_show_it() {
     let hit = stroke::Surface::raycast(&mut surface, &ray).expect("a hit");
     surface.finish().unwrap();
     assert!(
-        hit.position.length() > target.length() + 0.02,
-        "placed on the preview, {} out, not on the store's surface at {}",
+        (hit.position.length() - target.length()).abs() < 1e-3,
+        "placed at pen-down, {} out, where the dab was placed at {}",
         hit.position.length(),
         target.length()
     );
+    project.end_unrecorded_stroke().unwrap();
     drop(project.close(false));
 }
 
@@ -458,18 +490,18 @@ fn the_strokes_surface_is_hit_where_its_previews_show_it() {
 fn a_preview_no_new_dab_moves_goes_back_as_it_was_and_is_not_sent_again() {
     let dir = TestDir::new();
     let base = base(&dir);
-    let (mut project, mut index, _) = open_copy(&dir, &base, "kept");
+    let (mut project, index, _) = open_copy(&dir, &base, "kept");
     let dabs = path(project.store(), 8);
     let store = project.store();
     let cursor = store.subscribe_stale();
     let mut preview = Preview::new();
-    preview.show(store, &mut index, &dabs).unwrap();
+    preview.show(store, &index, &dabs).unwrap();
     let before: BTreeMap<TileKey, Vec<Vec3>> = store
         .previewed()
         .copied()
         .collect::<Vec<TileKey>>()
         .into_iter()
-        .map(|key| (key, store.preview_positions(&key).unwrap().to_vec()))
+        .map(|key| (key, shown_positions(store, &key)))
         .collect();
     drop(store.drain_stale(&cursor));
     // One more dab, weak and small, where the first dab was: it moves a few tiles of many.
@@ -479,7 +511,7 @@ fn a_preview_no_new_dab_moves_goes_back_as_it_was_and_is_not_sent_again() {
         seq: 8,
         ..dabs[0]
     };
-    let stats = preview.show(store, &mut index, &[again]).unwrap();
+    let stats = preview.show(store, &index, &[again]).unwrap();
     let Drained::Epochs(epochs) = store.drain_stale(&cursor) else {
         panic!("no resync");
     };
@@ -497,9 +529,9 @@ fn a_preview_no_new_dab_moves_goes_back_as_it_was_and_is_not_sent_again() {
         before.len()
     );
     for (key, positions) in &before {
-        let now = store.preview_positions(key).expect("still previewed");
+        let now = shown_positions(store, key);
         if !sent.contains(key) {
-            assert_eq!(now, positions.as_slice(), "{key:?} is as it was");
+            assert_eq!(&now, positions, "{key:?} is as it was");
         }
     }
     store.unsubscribe_stale(cursor);

@@ -1,26 +1,29 @@
 //! The store as the stroke engine's surface: [`StoreSurface`] implements [`stroke::Surface`]
 //! over the spatial index and the tile store, at the index's level.
 //!
-//! # The stroke's own surface
+//! # The pen-down surface
 //!
-//! Every read goes to the **stroke's surface**: the store's tiles with the previews of the dabs
-//! placed and not landed yet in place of theirs ([`TileStore::surface_positions`],
-//! [`TileStore::surface_normals`], [`SpatialIndex::raycast_surface`], and the index's boxes, which
-//! a preview grows to hold it; see [`crate::Preview`]). A preview moves the store's tiles as the
-//! finest work will, so a stroke places each dab on the surface its dabs before it leave, up to
-//! the stored encoding, however far the finest work lags (the brush-engine spec, "The surface
-//! placement reads"). With no preview, it is the store's surface.
+//! Every read goes to the **pen-down surface**: the store's tiles as they were when the current
+//! stroke began (the brush-engine spec, "The surface a stroke reads is its pen-down surface"). A
+//! tile the stroke has changed is read at the pen-down shape the store keeps of it
+//! ([`TileStore::pen_down_shape`], made into positions and kept by the store), every other as the
+//! store evaluates it, which is its pen-down shape; normals at a hit are the pen-down
+//! block's ([`TileStore::pen_down_normals`]), and raycasts go through
+//! [`SpatialIndex::raycast_pen_down`], whose boxes hold every changed tile's pen-down shape. A
+//! stroke never reads its own dabs, whether they have landed or are only shown ahead
+//! ([`crate::Preview`]): what it places is the same however fast the finest work goes. With no
+//! stroke under way, it is the store's surface.
 //!
 //! # Raycasts
 //!
-//! [`Surface::raycast`] is picking's raycast over the stroke's surface,
-//! [`SpatialIndex::raycast_surface`]: the index's tree walked nearest box first, each candidate
-//! tile evaluated (or its preview read) and its quads intersected as two triangles. With no
-//! preview it hits the same tile at the same ray parameter as picking, and keeps which triangle and
-//! where on it, for the [`Hit`]: the point is interpolated on the triangle (so it agrees with
-//! picking's `origin + direction · t` to rounding, about `1e-5` of the scene's size, not bit for
-//! bit), the normal is interpolated from the surface's normals at its corners
-//! ([`TileStore::surface_normals`]), and the base face's coordinates from the vertices' grid
+//! [`Surface::raycast`] is picking's raycast over the pen-down surface,
+//! [`SpatialIndex::raycast_pen_down`]: the index's tree walked nearest box first, each candidate
+//! tile evaluated (or its pen-down positions made) and its quads intersected as two triangles.
+//! With no stroke under way it hits the same tile at the same ray parameter as picking, and keeps
+//! which triangle and where on it, for the [`Hit`]: the point is interpolated on the triangle (so
+//! it agrees with picking's `origin + direction · t` to rounding, about `1e-5` of the scene's size,
+//! not bit for bit), the normal is interpolated from the pen-down normals at its corners
+//! ([`TileStore::pen_down_normals`]), and the base face's coordinates from the vertices' grid
 //! places.
 //!
 //! # The stroke's region
@@ -50,11 +53,11 @@
 //!
 //! # Area normals
 //!
-//! [`Surface::area_normal`] sums the stroke's surface's normals inside the dab's sphere, each
+//! [`Surface::area_normal`] sums the pen-down surface's normals inside the dab's sphere, each
 //! weighted by the draw action's falloff at its distance, made as hard as the dab
 //! ([`brush::draw_imprint_vertex`] at unit strength: the weight the action gives there). The
 //! normals are the surface's quads': each quad (of the tiles whose boxes in the index touch the
-//! sphere, read from the stroke's surface, [`TileStore::surface_positions`]) whose centre lies
+//! sphere, read at pen-down) whose centre lies
 //! inside the sphere adds the cross product of its diagonals, its normal times twice its area, so
 //! the sum is the falloff-weighted vector area of the surface under the dab, whatever its quads'
 //! sizes. Each quad belongs to one tile, so each counts once. Only the near side counts: a quad
@@ -67,9 +70,7 @@
 //!
 //! Quads' normals rather than the vertices' evaluated ones: they need the positions alone, which a
 //! dab's placement and finest work read anyway, where vertex normals need each tile's neighbours
-//! evaluated too, and a preview's normals made afresh after every dab shown (0.5 ms a dab over the
-//! `preview` bench's ridge, on the workers; under a loaded machine, waiting on them took
-//! milliseconds, enough for a frame to show a dab it would have applied).
+//! read too, and a changed tile's normals made afresh from its pen-down block.
 //!
 //! # Errors
 //!
@@ -81,7 +82,9 @@
 //! # Cost
 //!
 //! Every method reads tiles through the store, which evaluates a tile the first time and finds
-//! it cached after: the tiles near a stroke are the ones it brushes. A walk first evaluates,
+//! it cached after: the tiles near a stroke are the ones it brushes. A changed tile's pen-down
+//! positions are made from its shape the first time they are read, and the store keeps the last
+//! few dozen made ([`TileStore::pen_down_positions`]). A walk first evaluates,
 //! together on the store's workers, the tiles in its ball not cached yet. Inside the walk, a
 //! tile whose box lies wholly within reach is one piece at no cost; another has its vertices'
 //! distances taken and grouped into pieces row by row; a tile's neighbours are looked up once
@@ -111,6 +114,7 @@ use stroke::{DVec3, Hit, Ray, Surface};
 
 use self::region::{Ball, Source, Vertex, Walked, distance_squared, walk};
 use crate::SculptError;
+use crate::apply::PenDownTile;
 
 mod region;
 
@@ -216,7 +220,7 @@ impl<'a> StoreSurface<'a> {
         let (x0, y0) = (floor_to(x, side - 1), floor_to(y, side - 1));
         let (x1, y1) = ((x0 + 1).min(side - 1), (y0 + 1).min(side - 1));
         let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
-        let positions = self.store.surface_positions(key)?;
+        let positions = self.store.pen_down_positions(key)?;
         let nearest = corners
             .into_iter()
             .filter_map(|(i, j)| {
@@ -234,8 +238,9 @@ impl<'a> StoreSurface<'a> {
     }
 
     /// Evaluates, together on the store's workers, every tile whose box touches the ball of
-    /// `reach` around `center` and whose positions aren't cached: what a walk there reads, made
-    /// current in parallel instead of one tile at a time as the walk comes to it.
+    /// `reach` around `center` that the stroke hasn't changed and whose positions aren't cached:
+    /// what a walk there reads, made current in parallel instead of one tile at a time as the
+    /// walk comes to it.
     ///
     /// # Errors
     ///
@@ -251,7 +256,8 @@ impl<'a> StoreSurface<'a> {
         let missing: Vec<TileKey> = self
             .index
             .query_sphere(center.to_f32(), radius)
-            .filter(|key| store.cached_surface_positions(key).is_none())
+            .filter(|key| store.pen_down_shape(key).is_none())
+            .filter(|key| store.cached_positions(key).is_none())
             .collect();
         if !missing.is_empty() {
             self.store.evaluate_many(&missing, Evaluation::Positions)?;
@@ -263,24 +269,24 @@ impl<'a> StoreSurface<'a> {
     ///
     /// # Errors
     ///
-    /// As [`SpatialIndex::raycast_triangle`] and [`TileStore::normals`].
+    /// As [`SpatialIndex::raycast_pen_down`] and [`TileStore::pen_down_normals`].
     fn try_raycast(&mut self, ray: &Ray) -> Result<Option<Hit>, SculptError> {
         let Some(narrow) = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32()) else {
             return Ok(None);
         };
-        let Some(triangle) = self.index.raycast_surface(self.store, &narrow)? else {
+        let Some(triangle) = self.index.raycast_pen_down(self.store, &narrow)? else {
             return Ok(None);
         };
         self.hit_on_triangle(ray, triangle).map(Some)
     }
 
     /// The [`Hit`] where `ray` crosses `triangle`: the point interpolated on the triangle, the
-    /// evaluated normals interpolated and normalised (the triangle's own normal, facing the
+    /// pen-down normals interpolated and normalised (the triangle's own normal, facing the
     /// ray's origin, where they cancel), and the face's coordinates.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::normals`].
+    /// As [`TileStore::pen_down_normals`].
     fn hit_on_triangle(&mut self, ray: &Ray, triangle: TriangleHit) -> Result<Hit, SculptError> {
         let key = triangle.key;
         let corners = corners(&triangle);
@@ -306,19 +312,19 @@ impl<'a> StoreSurface<'a> {
         })
     }
 
-    /// The positions and normals of tile `key`'s vertices `at` (row-major indices) on the
-    /// stroke's surface, in `f64`.
+    /// The pen-down positions and normals of tile `key`'s vertices `at` (row-major indices), in
+    /// `f64`.
     ///
     /// # Errors
     ///
-    /// As [`TileStore::surface_normals`] and [`TileStore::surface_positions`].
+    /// As [`TileStore::pen_down_normals`] and [`TileStore::evaluate`].
     fn tile_values<const N: usize>(
         &mut self,
         key: TileKey,
         at: [usize; N],
     ) -> Result<([DVec3; N], [DVec3; N]), SculptError> {
-        let normals = gather(self.store.surface_normals(key)?, at);
-        let positions = gather(self.store.surface_positions(key)?, at);
+        let normals = gather(&self.store.pen_down_normals(key)?, at);
+        let positions = gather(self.store.pen_down_positions(key)?, at);
         Ok((positions, normals))
     }
 
@@ -387,7 +393,7 @@ impl<'a> StoreSurface<'a> {
             let Some(reached) = walked.tiles.get(&key) else {
                 continue;
             };
-            let positions = self.store.surface_positions(key)?;
+            let positions = self.store.pen_down_positions(key)?;
             let on_region = positions
                 .iter()
                 .enumerate()
@@ -432,13 +438,13 @@ impl<'a> StoreSurface<'a> {
         gap * gap
     }
 
-    /// [`Surface::area_normal`], its errors returned: the stroke's surface's normals inside the
+    /// [`Surface::area_normal`], its errors returned: the pen-down surface's normals inside the
     /// dab's sphere, each weighted by the draw action's falloff there, summed in `f64` (see
     /// "Area normals" in the module notes).
     ///
     /// # Errors
     ///
-    /// As [`TileStore::surface_normals`] and [`TileStore::surface_positions`].
+    /// As [`TileStore::evaluate`].
     fn try_area_normal(
         &mut self,
         center: DVec3,
@@ -457,23 +463,26 @@ impl<'a> StoreSurface<'a> {
         if keys.len() < AREA_WORKERS_FROM {
             let mut sum = DVec3::ZERO;
             for key in keys {
-                let positions = self.store.surface_positions(key)?;
+                let positions = self.store.pen_down_positions(key)?;
                 sum = sum + tile_area_sum(key, positions, &imprint, facing);
             }
             return Ok(Some(sum));
         }
-        // Each tile's positions first, on this thread: a preview's are made from its block on
-        // first read.
+        // The unchanged tiles' positions first, on this thread; a changed tile's positions are
+        // made on its worker.
         for &key in &keys {
-            self.store.surface_positions(key)?;
+            if self.store.pen_down_shape(&key).is_none() {
+                self.store.evaluate(key)?;
+            }
         }
         let store = &*self.store;
-        let at_hand: Vec<(TileKey, Option<&[Vec3]>)> = keys
+        let at_hand: Vec<(TileKey, PenDownTile<'_>)> = keys
             .iter()
-            .map(|key| (*key, store.cached_surface_positions(key)))
+            .map(|key| (*key, PenDownTile::of(store, key)))
             .collect();
-        let parts: Vec<Option<DVec3>> = store.par_map(&at_hand, |&(key, positions)| {
-            positions.map(|positions| tile_area_sum(key, positions, &imprint, facing))
+        let parts: Vec<Option<DVec3>> = store.par_map(&at_hand, |&(key, pen_down)| {
+            let positions = pen_down.positions()?;
+            Some(tile_area_sum(key, &positions, &imprint, facing))
         });
         let mut sum = DVec3::ZERO;
         for (&key, part) in keys.iter().zip(parts) {
@@ -481,7 +490,7 @@ impl<'a> StoreSurface<'a> {
                 part
             } else {
                 // Pushed out of the cache before it was read: on its own.
-                let positions = self.store.surface_positions(key)?;
+                let positions = self.store.pen_down_positions(key)?;
                 tile_area_sum(key, positions, &imprint, facing)
             };
             sum = sum + part;
@@ -549,7 +558,7 @@ impl Surface for StoreSurface<'_> {
 const AREA_WORKERS_FROM: usize = 8;
 
 /// Tile `key`'s part of an area normal's sum for `imprint` (see "Area normals" in the module
-/// notes), from its `positions` on the stroke's surface.
+/// notes), from its pen-down `positions`.
 ///
 /// Each of its quads whose centre (its corners' mean) is inside `imprint`'s sphere and whose
 /// normal faces `facing` (a positive dot product: the near side) adds that normal, the cross
@@ -615,7 +624,7 @@ fn area_reach(imprint: &Imprint) -> f32 {
     imprint.radius * 1.001 + 1e-6 * size
 }
 
-/// The store and index as the region walk reads them.
+/// The store and index as the region walk reads them: at pen-down.
 #[derive(Debug)]
 struct Reader<'s> {
     /// The store, for positions and the topology.
@@ -632,12 +641,12 @@ impl Source for Reader<'_> {
     }
 
     fn positions(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
-        self.store.surface_positions(key)
+        self.store.pen_down_positions(key)
     }
 
     /// Whether the tile's box in the index lies inside the ball: every corner of it within
-    /// reach. The index is refitted after every edit, and grown to every preview, so its boxes
-    /// bound the surface's positions.
+    /// reach. The index is refitted after every edit, each changed tile's box holding its
+    /// pen-down shape too, so its boxes bound the pen-down positions.
     fn wholly_within(&self, key: &TileKey, center: DVec3, reach_squared: f64) -> bool {
         let Some(bounds) = self.index.bvh().bounds(key) else {
             return false;

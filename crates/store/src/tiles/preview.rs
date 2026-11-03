@@ -9,12 +9,10 @@
 //! clears it once no dab it shows is left to land.
 //!
 //! The store keeps a tile's preview ([`TileStore::set_preview`]) and hands it to whoever draws
-//! ([`TileStore::preview`]), and to the stroke placing the next dabs, which reads the **stroke's
-//! surface**: the store's tiles with the previews in place of theirs
-//! ([`TileStore::surface_positions`], [`TileStore::surface_normals`], and the spatial index's
-//! [`SpatialIndex::raycast_surface`](crate::SpatialIndex::raycast_surface)). Evaluation, the
-//! brush's edits, the display layer's refresh and every file the store writes see only the
-//! store's own tiles: a preview is never saved, and a save mid-stroke holds what has landed.
+//! ([`TileStore::preview`]). Nothing else reads it: a stroke places its dabs on its pen-down
+//! surface (see the `pen_down` module), and evaluation, the brush's edits, the display layer's
+//! refresh and every file the store writes see only the store's own tiles: a preview is never
+//! saved, and a save mid-stroke holds what has landed.
 //!
 //! # Epochs
 //!
@@ -32,14 +30,12 @@
 //! replacing what a renderer draws from the preview. The refresh drops such tiles (and those
 //! waiting on one), and looks for them again once a preview is cleared.
 
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{Channel, GatheredBlock, Level, Region, TileKey, Vec3};
+use geom::{Channel, GatheredBlock, Level, Region, TileKey};
 
 use super::TileStore;
 use super::error::CacheError;
-use crate::Aabb;
 use crate::stale::EpochKind;
 
 /// The store's previews: each finest tile's, the display tiles above them, and what changed since
@@ -56,88 +52,16 @@ pub(crate) struct Previews {
     changed: BTreeSet<TileKey>,
 }
 
-/// A previewed tile: its block, and its own positions, normals and raycast blocks as the
-/// stroke's surface reads them, each made from the block when first read.
+/// A previewed tile: its block, taken out while its brush moves it.
 ///
 /// A brush moving the tile takes its block out ([`TileStore::take_preview`]) and either sets a
-/// new one ([`TileStore::set_preview`]), which starts the rest afresh, or puts the same one back
-/// unmoved ([`TileStore::put_back_preview`]), which keeps what was made of it.
+/// new one ([`TileStore::set_preview`]) or puts the same one back unmoved
+/// ([`TileStore::put_back_preview`]), which a renderer has already.
 #[derive(Debug)]
 struct Shown {
     /// Its positions with the ring and the base-vertex rings; `None` while its brush has taken
     /// it to move it.
     block: Option<GatheredBlock>,
-    /// Its own positions, row-major `side²`: the block without its ring.
-    own: OnceCell<Vec<Vec3>>,
-    /// Its unit normals, row-major, from the block ([`GatheredBlock::normals`]).
-    normals: OnceCell<Vec<Vec3>>,
-    /// Its own positions' blocks, for raycasts.
-    blocks: OnceCell<crate::index::TileBlocks>,
-    /// The box of its own positions' finite points, for raycasts; `None` inside for none.
-    bounds: OnceCell<Option<Aabb>>,
-}
-
-/// A previewed tile as a raycast reads it ([`TileStore::preview_blocks`]).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PreviewSurface<'a> {
-    /// Its own positions' blocks.
-    pub(crate) blocks: &'a crate::index::TileBlocks,
-    /// Its own positions, row-major `side²`.
-    pub(crate) positions: &'a [Vec3],
-    /// The box of those positions' finite points; `None` for none.
-    pub(crate) bounds: Option<Aabb>,
-}
-
-impl PreviewSurface<'_> {
-    /// Whether `ray` enters the box of the preview's own positions: the box the spatial index's
-    /// tree keeps for a tile that isn't previewed (see
-    /// [`SpatialIndex::raycast_surface`](crate::SpatialIndex::raycast_surface)). A preview of no
-    /// finite point is entered by none.
-    pub(crate) fn entered_by(&self, ray: &crate::Ray) -> bool {
-        self.bounds
-            .is_some_and(|bounds| bounds.entry(ray).is_some())
-    }
-}
-
-impl Shown {
-    /// `block`, nothing made of it yet.
-    fn new(block: GatheredBlock) -> Self {
-        Self {
-            block: Some(block),
-            own: OnceCell::new(),
-            normals: OnceCell::new(),
-            blocks: OnceCell::new(),
-            bounds: OnceCell::new(),
-        }
-    }
-
-    /// Its own positions, made from its block on first use; `None` while the block is taken
-    /// and they weren't made.
-    fn own(&self) -> Option<&[Vec3]> {
-        if let Some(own) = self.own.get() {
-            return Some(own);
-        }
-        let block = self.block.as_ref()?;
-        Some(self.own.get_or_init(|| own_of(block)))
-    }
-}
-
-/// Whether `a` and `b` are the same points, bit for bit.
-fn same_bits(a: &[Vec3], b: &[Vec3]) -> bool {
-    let bits = |p: &Vec3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
-    a.len() == b.len() && a.iter().zip(b).all(|(p, q)| bits(p) == bits(q))
-}
-
-/// `block`'s own positions, row-major `side²`: the block without its ring.
-fn own_of(block: &GatheredBlock) -> Vec<Vec3> {
-    let quads = i64::from(block.quads());
-    let side = usize::try_from(block.quads()).unwrap_or(0) + 1;
-    let mut own: Vec<Vec3> = Vec::with_capacity(side * side);
-    for j in 0..=quads {
-        let row = block.row(j);
-        own.extend_from_slice(row.get(1..=side).unwrap_or_default());
-    }
-    own
 }
 
 impl Previews {
@@ -180,7 +104,11 @@ impl TileStore {
             return Err(CacheError::NotItsBlock(key));
         }
         let previews = &mut self.previews;
-        if previews.blocks.insert(key, Shown::new(block)).is_none() {
+        if previews
+            .blocks
+            .insert(key, Shown { block: Some(block) })
+            .is_none()
+        {
             for above in Previews::ancestors(&key) {
                 *previews.above.entry(above).or_insert(0) += 1;
             }
@@ -217,95 +145,21 @@ impl TileStore {
         self.previews.blocks.get(key)?.block.as_ref()
     }
 
-    /// Finest tile `key`'s own positions as its preview shows them, row-major, if it has one.
-    #[must_use]
-    pub fn preview_positions(&self, key: &TileKey) -> Option<&[Vec3]> {
-        let shown = self.previews.blocks.get(key)?;
-        shown.block.as_ref()?;
-        shown.own()
-    }
-
-    /// Finest tile `key`'s preview as a raycast reads it, if it has one: its own positions'
-    /// blocks and box, made on first use and kept with the preview, and the positions.
-    pub(crate) fn preview_blocks(&self, key: &TileKey) -> Option<PreviewSurface<'_>> {
-        let shown = self.previews.blocks.get(key)?;
-        shown.block.as_ref()?;
-        let own = shown.own()?;
-        let blocks = shown
-            .blocks
-            .get_or_init(|| crate::index::TileBlocks::new(own, key.side()));
-        let bounds = *shown
-            .bounds
-            .get_or_init(|| Aabb::from_points(own.iter().copied()));
-        Some(PreviewSurface {
-            blocks,
-            positions: own,
-            bounds,
-        })
-    }
-
-    /// Tile `key`'s positions on the stroke's surface, row-major: its preview's where it has one,
-    /// else as the store evaluates it ([`TileStore::evaluate`]).
-    ///
-    /// # Errors
-    ///
-    /// As [`TileStore::evaluate`].
-    pub fn surface_positions(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
-        if self.preview_positions(&key).is_some() {
-            return Ok(self.preview_positions(&key).unwrap_or_default());
-        }
-        self.evaluate(key)
-    }
-
-    /// Tile `key`'s positions on the stroke's surface if they are at hand without evaluating:
-    /// its preview's, else as cached ([`TileStore::cached_positions`]).
-    #[must_use]
-    pub fn cached_surface_positions(&self, key: &TileKey) -> Option<&[Vec3]> {
-        self.preview_positions(key)
-            .or_else(|| self.cached_positions(key))
-    }
-
-    /// Tile `key`'s unit normals on the stroke's surface, row-major: its preview's (from its
-    /// block with the ring, [`GatheredBlock::normals`], the bits the store's normals of those
-    /// positions would be), else the store's ([`TileStore::normals`]).
-    ///
-    /// # Errors
-    ///
-    /// As [`TileStore::normals`].
-    pub fn surface_normals(&mut self, key: TileKey) -> Result<&[Vec3], CacheError> {
-        let previewed = self.previews.blocks.get(&key);
-        if previewed.is_none_or(|shown| shown.block.is_none()) {
-            return self.normals(key);
-        }
-        let mesh = &self.mesh;
-        let with_block = self
-            .previews
-            .blocks
-            .get(&key)
-            .and_then(|shown| Some((shown, shown.block.as_ref()?)));
-        Ok(with_block.map_or(&[][..], |(shown, block)| {
-            shown
-                .normals
-                .get_or_init(|| block.normals(mesh).as_slice().to_vec())
-        }))
-    }
-
     /// Takes finest tile `key`'s preview out to move it, if it has one: the brush sets it again
     /// ([`TileStore::set_preview`]), puts it back unmoved ([`TileStore::put_back_preview`]) or
     /// clears it ([`TileStore::clear_preview`]) before the next preview epoch closes. Meanwhile
-    /// it counts as previewed (the refresh still waits for it), and [`TileStore::preview`] and
-    /// the stroke's surface have nothing of it.
+    /// it counts as previewed (the refresh still waits for it), and [`TileStore::preview`] has
+    /// nothing of it.
     pub fn take_preview(&mut self, key: &TileKey) -> Option<GatheredBlock> {
         self.previews.blocks.get_mut(key)?.block.take()
     }
 
     /// Puts back finest tile `key`'s preview `block`, taken with [`TileStore::take_preview`] and
     /// not moved since: the same bits, so nothing is noted for the next preview epoch (a renderer
-    /// has it already), and what the stroke's surface made of it (its own positions, normals and
-    /// raycast blocks) is kept.
+    /// has it already).
     ///
     /// The caller vouches that `block` is the one taken, unchanged: a block that differs is to be
-    /// set ([`TileStore::set_preview`]), which a debug build checks it isn't.
+    /// set ([`TileStore::set_preview`]).
     ///
     /// # Errors
     ///
@@ -327,13 +181,6 @@ impl TileStore {
         else {
             return Err(CacheError::NoPreviewTaken(key));
         };
-        debug_assert!(
-            shown
-                .own
-                .get()
-                .is_none_or(|own| same_bits(own, &own_of(&block))),
-            "a preview put back is the one taken, unmoved"
-        );
         shown.block = Some(block);
         Ok(())
     }

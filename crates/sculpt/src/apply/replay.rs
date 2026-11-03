@@ -1,9 +1,10 @@
 //! A run of a frame's dabs replayed tile by tile, tiles in parallel.
 //!
-//! Each tile takes every dab of the run that reaches it, in order, on a copy of its own
-//! corrections, and the tiles are written back whole once the run is done (see "Tile by tile"
-//! in the module notes of [`super`]).
+//! Each tile takes every dab of the run that reaches it at pen-down, in order, on a copy of its
+//! own corrections, and the tiles are written back whole once the run is done (see "Tile by
+//! tile" in the module notes of [`super`]).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use brush::{Imprint, Smoothstep, draw_imprint};
@@ -13,7 +14,7 @@ use geom::{
 };
 use store::{Aabb, TileStore};
 
-use super::{frame_delta, vertices};
+use super::{Given, PenDownTile, frame_delta, vertices};
 use crate::state::{Book, FinalState, Grant, Stroke, stroke_sum};
 
 /// Which stroke state each tile's writes take, at each dab of a run.
@@ -158,12 +159,11 @@ pub(super) fn injected(id: store::StoreId, fault: Fault) -> bool {
 pub(super) struct TileInput<'a> {
     /// The tile.
     pub(super) key: TileKey,
-    /// Its positions, current.
-    pub(super) positions: &'a [Vec3],
+    /// Its pen-down positions, which every dab of the run is weighed at.
+    pub(super) pen_down: PenDownTile<'a>,
     /// Its corrections, as stored.
     pub(super) corrections: CorrectionView<'a>,
-    /// Its prediction, for its positions after each edit: needed when more than one dab can
-    /// reach it, so for every tile of a run of two dabs or more.
+    /// The prediction the store keeps of it, if it keeps one: its frames.
     pub(super) prediction: Option<&'a Prediction>,
     /// Its frames, row-major, for a tile without a prediction: the axes its deltas are written
     /// along ([`frame_delta`]). With a prediction, its frames are the prediction's.
@@ -202,9 +202,6 @@ pub(super) enum Stopped {
     /// A value the tile can't hold ([`CorrectionError::TooLarge`] or
     /// [`CorrectionError::NotFinite`]).
     Refused(CorrectionError),
-    /// A second dab reached the tile, which has no prediction to give its positions after the
-    /// first's writes.
-    NoPrediction,
     /// The mesh lists no border for the tile (a tile holding a vertex twice, which no mesh the
     /// store accepts has).
     NoBorder,
@@ -361,16 +358,13 @@ struct Replay<'a> {
     input: TileInput<'a>,
     /// Its corrections, as the dabs so far left them.
     tile: CorrectionTile,
-    /// Its positions, as the dabs so far left them (current while `stale` is false).
+    /// Its pen-down positions.
     positions: Vec<Vec3>,
-    /// For each row of the tile, a box holding every position the row has had since the run
-    /// began (`None` while none is finite): it bounds the row's positions now.
+    /// For each row of the tile, the box of its pen-down positions (`None` for none finite).
     rows: Vec<Option<Aabb>>,
     /// The rows the dab being applied was brushed over: the only rows whose deltas may not be
     /// zero.
     brushed: Vec<u32>,
-    /// Whether a write moved positions the tile has no prediction to give.
-    stale: bool,
     /// Each vertex's displacement by the dab being applied, along the dab's normal.
     deltas: Vec<f32>,
     /// The owner of each border vertex, found when first needed.
@@ -438,7 +432,11 @@ fn row_range(side: u32, j: u32) -> std::ops::Range<usize> {
 impl<'a> Replay<'a> {
     /// The replay of `input` before any dab.
     fn new(run: Run<'a>, input: TileInput<'a>) -> Self {
-        let positions = input.positions.to_vec();
+        let positions = input
+            .pen_down
+            .positions()
+            .map(Cow::into_owned)
+            .unwrap_or_default();
         let side = input.key.side();
         let rows = (0..side)
             .map(|j| {
@@ -454,7 +452,6 @@ impl<'a> Replay<'a> {
             positions,
             rows,
             brushed: Vec::new(),
-            stale: false,
             owners: None,
             own: None,
             copies: BTreeMap::new(),
@@ -473,11 +470,6 @@ impl<'a> Replay<'a> {
     fn dabs(&mut self) -> Result<(), Stopped> {
         let imprints = self.run.imprints.iter().enumerate();
         for (dab, imprint) in imprints {
-            // Without a prediction, the box no longer bounds positions a write moved: any dab
-            // after one could reach them.
-            if self.stale {
-                return Err(Stopped::NoPrediction);
-            }
             if self.brush(imprint)? > 0 {
                 self.reached = true;
                 self.apply(dab, imprint)?;
@@ -486,12 +478,11 @@ impl<'a> Replay<'a> {
         Ok(())
     }
 
-    /// Brushes `imprint` over the rows its sphere touches by their boxes, the deltas of every
-    /// other row zero, and returns how many vertices are within its radius.
+    /// Brushes `imprint` over the rows its sphere touches by their pen-down boxes, the deltas of
+    /// every other row zero, and returns how many vertices are within its radius at pen-down.
     ///
     /// A vertex within the radius lies in its row's box, which so touches the sphere: the rows
-    /// left out hold none. The test is the one the frame's tiles are chosen by (see "The frame's
-    /// tiles" in the module notes of [`super`]).
+    /// left out hold none.
     ///
     /// # Errors
     ///
@@ -530,8 +521,7 @@ impl<'a> Replay<'a> {
     }
 
     /// Writes dab `dab`'s deltas, `imprint`'s moves in each vertex's frame, as the store's edit of
-    /// the tile would (interior row by row, then the border), and brings the positions up to
-    /// date.
+    /// the tile would (interior row by row, then the border).
     ///
     /// # Errors
     ///
@@ -553,14 +543,13 @@ impl<'a> Replay<'a> {
                 .get_or_insert_with(|| StrokeState::found(self.run.stroke, &key, entries));
             own.reach(self.run.plan, &key, dab);
         }
-        let scales = self.tile.scales();
-        let mut changed: Vec<usize> = Vec::new();
+        let mut changed = false;
         if let Some(rows) = scan.rows {
-            self.write_interior(imprint, grant.unwrap_or(Grant::Held), rows, &mut changed)?;
+            changed |= self.write_interior(imprint, grant.unwrap_or(Grant::Held), rows)?;
         }
         for &((i, j), owner) in &border {
             self.write_border(dab, imprint, (i, j), owner, grant.unwrap_or(Grant::Held))?;
-            changed.push(at(side, i, j));
+            changed = true;
         }
         if moved > 0 {
             let border_deltas =
@@ -573,16 +562,8 @@ impl<'a> Replay<'a> {
                 scale: self.tile.scale(),
             });
         }
-        if changed.is_empty() {
-            return Ok(());
-        }
-        self.written = true;
-        if self.tile.scales().map(f32::to_bits) == scales.map(f32::to_bits) {
-            self.update_positions(&changed)
-        } else {
-            let all: Vec<usize> = (0..self.positions.len()).collect();
-            self.update_positions(&all)
-        }
+        self.written |= changed;
+        Ok(())
     }
 
     /// Each of `moved`, border vertices, with its owner.
@@ -623,9 +604,8 @@ impl<'a> Replay<'a> {
     /// Writes the interior's deltas row by row through the tile's own view
     /// ([`geom::CorrectionViewMut::update_interior_row`], the store's own edit of an interior),
     /// each vertex's correction from the tile's stroke state under `grant`, its delta `imprint`'s
-    /// move in its frame ([`frame_delta`]), noting each vertex written in `changed`. Only `rows`,
-    /// the first and last row with a displacement, are visited: the rows outside them would write
-    /// nothing.
+    /// move in its frame ([`frame_delta`]); whether it wrote any. Only `rows`, the first and last
+    /// row with a displacement, are visited: the rows outside them would write nothing.
     ///
     /// # Errors
     ///
@@ -636,14 +616,14 @@ impl<'a> Replay<'a> {
         imprint: &Imprint,
         grant: Grant,
         (first, last): (u32, u32),
-        changed: &mut Vec<usize>,
-    ) -> Result<(), Stopped> {
+    ) -> Result<bool, Stopped> {
         let side = self.input.key.side();
         let input = self.input;
         let deltas = &self.deltas;
         let own = &mut self.own;
         let mut view = self.tile.view_mut();
         let mut missing = false;
+        let mut changed = false;
         for j in first..=last {
             let row = view.update_interior_row(j, |i, j, c| {
                 let at = at(side, i, j);
@@ -662,7 +642,7 @@ impl<'a> Replay<'a> {
                 let written = own
                     .as_mut()
                     .map_or(c + delta, |own| own.write(grant, at, c, delta));
-                changed.push(at);
+                changed = true;
                 Some(written)
             });
             if let Some(error) = row.error {
@@ -672,7 +652,7 @@ impl<'a> Replay<'a> {
         if missing {
             return Err(Stopped::Inconsistent);
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Writes border vertex `(i, j)`'s delta of dab `dab` (`imprint`'s move in the vertex's
@@ -723,45 +703,6 @@ impl<'a> Replay<'a> {
             written
         };
         self.tile.set(i, j, written).map_err(Stopped::Refused)?;
-        Ok(())
-    }
-
-    /// The positions of the vertices at `changed` (row-major places, perhaps repeated) from the
-    /// tile's prediction and corrections, as the store's evaluation gives them, and the box
-    /// grown to hold them; with no prediction, the positions are marked stale instead.
-    ///
-    /// # Errors
-    ///
-    /// [`Stopped::Inconsistent`] for a vertex the tile, its positions or its prediction don't
-    /// hold.
-    fn update_positions(&mut self, changed: &[usize]) -> Result<(), Stopped> {
-        let Some(prediction) = self.input.prediction else {
-            self.stale = true;
-            return Ok(());
-        };
-        let side = self.input.key.side();
-        let width = usize::try_from(side).unwrap_or(usize::MAX);
-        for &at in changed {
-            let (Ok(i), Ok(j)) = (u32::try_from(at % width), u32::try_from(at / width)) else {
-                return Err(Stopped::Inconsistent);
-            };
-            let (Some(p), Some(frame), Some(c), Some(slot), Some(row)) = (
-                prediction.predicted(i, j),
-                prediction.frame(i, j),
-                self.tile.get(i, j),
-                self.positions.get_mut(at),
-                self.rows.get_mut(at / width),
-            ) else {
-                return Err(Stopped::Inconsistent);
-            };
-            let moved = frame.apply(p, c);
-            *slot = moved;
-            // A position that isn't finite is within no dab's radius: its row's box needn't
-            // hold it.
-            if let Some(point) = Aabb::from_points([moved]) {
-                *row = Some(row.map_or(point, |aabb| aabb.union(point)));
-            }
-        }
         Ok(())
     }
 
@@ -848,30 +789,35 @@ pub(super) fn used(plan: &Plan, book: &Book, outcomes: &[TileOutcome]) -> Grants
     grants
 }
 
-/// What each tile of `keys` is, for a run: positions, corrections, and prediction or frames.
+/// What each tile of `keys` is, for a run: pen-down positions, corrections, and prediction or
+/// frames.
 ///
-/// Read from `store`, the frames of a tile without a kept prediction from `frames`; `None` for a
-/// tile whose positions or corrections aren't cached, that lacks the prediction `predicted` asks
-/// for, or that has neither a prediction nor frames.
+/// Read from `store`, the frames and pen-down positions of a tile without a kept prediction from
+/// those `given`; `None` for a tile whose pen-down positions aren't at hand
+/// ([`PenDownTile::at_hand`]), one whose corrections aren't cached, or one that has neither a
+/// prediction nor frames.
 pub(super) fn inputs<'a>(
     store: &'a TileStore,
     keys: &[TileKey],
-    predicted: bool,
-    frames: &'a BTreeMap<TileKey, Vec<Frame>>,
+    given: Given<'a>,
 ) -> Option<Vec<TileInput<'a>>> {
     keys.iter()
         .map(|key| {
             let prediction = store.kept_prediction(key);
-            if predicted && prediction.is_none() {
+            let frames = given.frames.get(key).map(Vec::as_slice);
+            if prediction.is_none() && frames.is_none() {
                 return None;
             }
-            let frames = frames.get(key).map(Vec::as_slice);
-            if prediction.is_none() && frames.is_none() {
+            let pen_down = match given.positions.get(key) {
+                Some(made) => PenDownTile::Positions(Some(made)),
+                None => PenDownTile::of(store, key),
+            };
+            if !pen_down.at_hand() {
                 return None;
             }
             Some(TileInput {
                 key: *key,
-                positions: store.cached_positions(key)?,
+                pen_down,
                 corrections: store.cached_correction(key)?,
                 prediction,
                 frames,

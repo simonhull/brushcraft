@@ -35,7 +35,7 @@ pub(crate) use self::blocks::TileBlocks;
 use self::blocks::{BlockCache, SharedBlocks, WideRay, Written};
 pub use crate::tile_bounds::{Aabb, NormalCone, TileBounds};
 pub use crate::tiles::WaveBounds;
-use crate::tiles::{CacheError, Evaluation, TileStore};
+use crate::tiles::{CacheError, Evaluation, PenDownShape, TileStore};
 
 /// Tiles [`SpatialIndex::build`] evaluates together before it reads their bounds.
 ///
@@ -231,6 +231,11 @@ impl SpatialIndex {
     /// evaluated on its own, one at a time; [`SpatialIndex::update`] makes them all current
     /// together first.
     ///
+    /// While a stroke keeps a tile's pen-down shape ([`TileStore::pen_down_shape`]), the tree's
+    /// box of the tile holds the shape too, so the stroke's raycasts and queries of its pen-down
+    /// surface find the tile there however far its dabs moved it; the store records the tile's
+    /// own bounds. The box shrinks back at the tile's first refit after the stroke.
+    ///
     /// # Errors
     ///
     /// As [`SpatialIndex::bounds_of`]; [`IndexError::UnknownTile`] for a tile not in the index.
@@ -258,7 +263,11 @@ impl SpatialIndex {
         // The store first: the tree's refit changes nothing when it fails, and can't fail here
         // (every key is known), so a failure leaves the index as it was.
         store.record_bounds(&changed)?;
-        self.bvh.refit(&changed)
+        let boxes: Vec<(TileKey, TileBounds)> = changed
+            .into_iter()
+            .map(|(key, bounds)| (key, over_pen_down(store, &key, bounds)))
+            .collect();
+        self.bvh.refit(&boxes)
     }
 
     /// The bounds of each of `keys`, in order, as [`SpatialIndex::bounds_of`] gives them.
@@ -394,27 +403,24 @@ impl SpatialIndex {
         })
     }
 
-    /// [`SpatialIndex::raycast_triangle`] over the stroke's surface: a previewed tile
-    /// ([`TileStore::preview_positions`]) is hit as its preview shows it, every other as the
-    /// store evaluates it. What a stroke places its next dabs on, its dabs not landed yet shown.
+    /// [`SpatialIndex::raycast_triangle`] over the current stroke's pen-down surface: a tile the
+    /// stroke changed is hit at its pen-down shape ([`TileStore::pen_down_shape`]), every other as
+    /// the store evaluates it. What a stroke places its dabs on (see the store's `pen_down`
+    /// notes); with no stroke, picking's raycast.
     ///
-    /// A previewed tile's blocks are built from its preview's positions and kept with the preview
-    /// (`TileStore::preview_blocks`), not in the index's cache: the cache's blocks are of the
-    /// store's bits, and a preview changes without the store's writes, its blocks with it. So the
-    /// skipping stays exact on previews too: the exhaustive test's answer, bit for bit. The tree
-    /// finds a previewed tile only where its box holds the preview: a brush showing
-    /// one grows the box to it ([`SpatialIndex::cover`]).
-    ///
-    /// That box holds the store's tile and every preview it had too, so a previewed tile is a
-    /// candidate only where the ray also enters the box of its preview's own positions: as tight
-    /// as the box the tree keeps for any other tile, the box of its positions. A ray along a tall
-    /// preview passes many grown boxes it has no business with (a quarter of a strong stroke's
-    /// candidate tiles), each a tile whose blocks the ray runs along tested whole.
+    /// A changed tile's blocks are built from its pen-down positions and kept with them by the
+    /// store (`TileStore::pen_down_blocks`), not in the index's cache, whose blocks are of the
+    /// store's bits: so the skipping stays exact on
+    /// pen-down shapes too, the exhaustive test's answer, bit for bit. The tree finds a changed
+    /// tile where its box holds the shape: every refit while the stroke lasts keeps it so
+    /// ([`SpatialIndex::refit`]). That box holds the tile's current positions too, so a changed
+    /// tile is a candidate only where the ray also enters the box of its shape: as tight as the
+    /// box the tree keeps for any other tile.
     ///
     /// # Errors
     ///
     /// As [`SpatialIndex::raycast_triangle`].
-    pub fn raycast_surface(
+    pub fn raycast_pen_down(
         &self,
         store: &mut TileStore,
         ray: &Ray,
@@ -422,66 +428,49 @@ impl SpatialIndex {
         let wide = WideRay::new(ray);
         let mut cache = self.blocks.lock();
         self.raycast_with(store, ray, |store, key| {
-            if let Some(preview) = store.preview_blocks(&key) {
-                if !preview.entered_by(ray) {
+            if let Some(shape) = store.pen_down_shape(&key) {
+                if shape
+                    .bounds()
+                    .is_none_or(|bounds| bounds.entry(ray).is_none())
+                {
                     return Ok(None);
                 }
-                return Ok(preview.blocks.intersect(ray, &wide, preview.positions, key));
+                if let Some((positions, blocks)) = store.pen_down_blocks(key)? {
+                    return Ok(blocks.intersect(ray, &wide, positions, key));
+                }
             }
             tile_hit(store, &mut cache, ray, &wide, key)
         })
     }
 
-    /// [`SpatialIndex::raycast_surface`] testing every triangle of each candidate tile, previews
-    /// in place of their tiles: its oracle. The candidates are the same: a previewed tile only
-    /// where the ray enters the box of its preview's own positions, made here afresh.
+    /// [`SpatialIndex::raycast_pen_down`] testing every triangle of each candidate tile, pen-down
+    /// shapes in place of their tiles: its oracle. The candidates are the same: a changed tile
+    /// only where the ray enters the box of its shape.
     ///
     /// # Errors
     ///
     /// As [`SpatialIndex::raycast_triangle`].
     #[cfg(any(test, feature = "test-oracle"))]
-    pub fn raycast_surface_exhaustive(
+    pub fn raycast_pen_down_exhaustive(
         &self,
         store: &mut TileStore,
         ray: &Ray,
     ) -> Result<Option<TriangleHit>, IndexError> {
         self.raycast_with(store, ray, |store, key| {
-            if let Some(own) = store.preview_positions(&key) {
-                let bounds = Aabb::from_points(own.iter().copied());
-                if bounds.is_none_or(|bounds| bounds.entry(ray).is_none()) {
-                    return Ok(None);
-                }
+            if let Some(shape) = store.pen_down_shape(&key)
+                && shape
+                    .bounds()
+                    .is_none_or(|bounds| bounds.entry(ray).is_none())
+            {
+                return Ok(None);
             }
             Ok(intersect_grid(
                 ray,
-                store.surface_positions(key)?,
+                store.pen_down_positions(key)?,
                 key.side(),
                 key,
             ))
         })
-    }
-
-    /// Grows tile `key`'s box in the tree to hold `aabb` too: a preview's box, so that queries
-    /// and raycasts find the tile where its preview lies. Only the tree's box: the bounds the
-    /// store records (and saves) stay the tile's own, and the next refit of the tile gives it
-    /// back its own box.
-    ///
-    /// # Errors
-    ///
-    /// [`IndexError::UnknownTile`] for a tile not in the index; nothing is changed then.
-    pub fn cover(&mut self, key: &TileKey, aabb: Aabb) -> Result<(), IndexError> {
-        let bounds = *self.bvh.bounds(key).ok_or(IndexError::UnknownTile(*key))?;
-        let grown = bounds.aabb.union(aabb);
-        if grown == bounds.aabb {
-            return Ok(());
-        }
-        self.bvh.refit(&[(
-            *key,
-            TileBounds {
-                aabb: grown,
-                ..bounds
-            },
-        )])
     }
 
     /// [`SpatialIndex::raycast_triangle`] testing every triangle of each candidate tile: the
@@ -616,6 +605,20 @@ fn intersect_tile(ray: &Ray, positions: &[Vec3], side: u32) -> Option<f32> {
 /// The nearest triangle `ray` crosses of a grid of `side` vertices a side with `positions`,
 /// row-major, the hit named for tile `key` (see [`TriangleHit`]); `None` if it misses every one.
 ///
+/// Tile `key`'s `bounds` as the tree keeps them: grown to hold its pen-down shape too while the
+/// current stroke keeps one ([`TileStore::pen_down_shape`]), so a raycast or query of the pen-down
+/// surface finds the tile there. The store records `bounds` as they are.
+fn over_pen_down(store: &TileStore, key: &TileKey, bounds: TileBounds) -> TileBounds {
+    let shape = store.pen_down_shape(key).and_then(PenDownShape::bounds);
+    match shape {
+        Some(shape) => TileBounds {
+            aabb: bounds.aabb.union(shape),
+            ..bounds
+        },
+        None => bounds,
+    }
+}
+
 /// Every triangle tested, in row-major order: the exhaustive test, which [`TileBlocks`] answers
 /// as, bit for bit, and the oracle its tests check it against.
 #[cfg(any(test, feature = "test-oracle"))]

@@ -7,21 +7,28 @@
 //! interior is rounded once per stroke, not once per dab, so small dabs move it as far as its
 //! exactly stored border.
 //!
+//! A stroke reads the surface as it was when it began, its **pen-down surface** (the brush-engine
+//! spec): placement's every read, and the distances each dab's falloff is measured over. The store
+//! keeps the pen-down shape of each tile a stroke changes ([`store::TileStore::keep_pen_down`]), so
+//! a stroke never reads its own dabs: a ridge is the sum of its dabs over the surface the stroke
+//! began on, and what a stroke places doesn't depend on how far its dabs have landed.
+//!
 //! The per-vertex math lives in `brush`, shared with the GPU; this crate does the rest:
 //! - [`apply_dabs`] applies a frame's dabs (the stroke engine's [`stroke::Dab`]s): it finds the
 //!   tiles they reach through the [`store::SpatialIndex`], pins and evaluates them, runs each dab's
-//!   brush over its tiles on the store's workers, writes the deltas into the corrections through
-//!   [`store::TileStore::edit_tile`], and brings the index back up to date once for the frame. The
-//!   result is that of applying the dabs one at a time, bit for bit.
+//!   brush over its tiles' pen-down positions on the store's workers, writes the deltas into the
+//!   corrections through [`store::TileStore::edit_tile`], and brings the index back up to date once
+//!   for the frame. The result is that of applying the dabs one at a time, bit for bit.
 //! - [`draw_step`] is one dab of the draw brush, as M0 measured it: [`apply_dabs`] for one dab.
 //! - [`Preview`] shows dabs at once on the finest tiles they reach, ahead of the finest work, for a
 //!   brush whose frame can't fit it all; the same dabs land later through [`apply_dabs`].
-//! - [`StoreSurface`] is the store as the stroke engine's [`stroke::Surface`]: raycasts through the
-//!   index, and the stroke's connected region near a point.
+//! - [`StoreSurface`] is the store's pen-down surface as the stroke engine's [`stroke::Surface`]:
+//!   raycasts through the index, the stroke's connected region near a point, and area normals.
 //!
 //! Dabs are part of the stroke their caller has begun: [`store::Project::begin_stroke`] before
 //! the first, [`store::Project::end_stroke`] after the last, so every dab of the stroke is one
-//! op. Every call takes the session's one [`Stroke`], which starts afresh when the op changes.
+//! op, and the store keeps the stroke's pen-down shapes from the first until the last. Every call
+//! takes the session's one [`Stroke`], which starts afresh when the op changes.
 //!
 //! No GPU or windowing code: everything here runs headless.
 

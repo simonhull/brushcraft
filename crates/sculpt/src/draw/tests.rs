@@ -112,13 +112,14 @@ fn formula(p: Vec3, params: DrawParams) -> Option<f64> {
 type OracleStroke = BTreeMap<(FaceId, u16, u16, u32, u32), Vec3>;
 
 /// One step of the oracle, written into `map`, as part of the stroke `stroke` holds the state
-/// of; returns the vertices moved.
+/// of, the stroke having begun on `pen_down`; returns the vertices moved.
 ///
-/// Evaluates `map` densely at `level`, finds each vertex's displacement, checks it against
-/// [`formula`], writes the dab's move in the vertex's frame (each face predicted whole), and writes
-/// the vertex's correction in `map` once per vertex (a vertex on a face edge is in the grids of
-/// every face sharing it), as the store's stroke does: it becomes the correction the stroke first
-/// found there plus the stroke's deltas for it so far, summed in `f32` in the same order.
+/// Evaluates `pen_down` densely at `level`, finds each vertex's displacement there (the draw
+/// action weighs a vertex at its pen-down position), checks it against [`formula`], writes the
+/// dab's move in the vertex's frame (each face predicted whole), and writes the vertex's correction
+/// in `map` once per vertex (a vertex on a face edge is in the grids of every face sharing it), as
+/// the store's stroke does: it becomes the correction the stroke first found there plus the
+/// stroke's deltas for it so far, summed in `f32` in the same order.
 ///
 /// Faces are visited in order and each grid row-major, as the store visits the vertices of each
 /// of its tiles: an interior correction is quantized to a scale its tile's earlier writes set, so
@@ -126,11 +127,12 @@ type OracleStroke = BTreeMap<(FaceId, u16, u16, u32, u32), Vec3>;
 fn oracle_step(
     mesh: &BaseMesh,
     level: Level,
+    pen_down: &CorrectionMap,
     map: &mut CorrectionMap,
     stroke: &mut OracleStroke,
     params: DrawParams,
 ) -> usize {
-    let dense = DenseEvaluation::new(mesh, level, map).unwrap();
+    let dense = DenseEvaluation::new(mesh, level, pen_down).unwrap();
     let topology = mesh.topology();
     let imprint = params.imprint();
     let mut done = HashSet::new();
@@ -243,22 +245,29 @@ fn assert_twins(store: &mut TileStore, level: Level) {
     assert!(shared > 0, "the level has twins to compare");
 }
 
-/// Asserts that `index` holds, for every tile, the bounds an index built from scratch finds.
-fn assert_bounds_fresh(store: &mut TileStore, index: &SpatialIndex) {
-    let fresh = SpatialIndex::build(store, index.level(), |_, _| {}).unwrap();
+/// Asserts that the project records, for every tile, the bounds an index built from scratch finds.
+///
+/// And that `index` holds them: their cones exactly, and boxes that hold theirs (the box of a tile
+/// a stroke changed holds its pen-down shape too, until its next refit).
+fn assert_bounds_fresh(project: &mut Project, index: &SpatialIndex) {
+    let level = index.level();
+    let fresh = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
+    let (recorded, _) = project.load_index(level, |_, _| {}).unwrap();
     assert_eq!(fresh.bvh().len(), index.bvh().len(), "the same tiles");
     for (key, bounds) in fresh.bvh().iter() {
         assert_eq!(
-            index.bvh().bounds(key),
+            recorded.bvh().bounds(key),
             Some(bounds),
-            "the bounds of {key:?}"
+            "the bounds of {key:?} recorded"
+        );
+        let held = index.bvh().bounds(key).expect("every tile");
+        assert_eq!(held.cone, bounds.cone, "the cone of {key:?}");
+        assert_eq!(
+            held.aabb.union(bounds.aabb),
+            held.aabb,
+            "the box of {key:?} holds its bounds"
         );
     }
-    assert_eq!(
-        index.bvh().aabb(),
-        fresh.bvh().aabb(),
-        "the box of everything"
-    );
 }
 
 /// The cube's face-grid vertex `(i, j)` of `face` at `level`, as evaluated before any edit.
@@ -305,6 +314,7 @@ fn one_step_moves_exactly_the_vertices_within_the_radius_by_the_falloff() {
     let moved = oracle_step(
         project.store().mesh(),
         level,
+        &CorrectionMap::new(),
         &mut map,
         &mut OracleStroke::new(),
         params,
@@ -396,7 +406,7 @@ fn bounds_after_a_step_equal_bounds_built_from_scratch() {
         stats.tiles_updated > stats.tiles_edited,
         "neighbours' normals turn too: {stats:?}"
     );
-    assert_bounds_fresh(project.store(), &index);
+    assert_bounds_fresh(&mut project, &index);
 }
 
 #[test]
@@ -406,8 +416,10 @@ fn a_stroke_of_overlapping_steps_matches_dense_after_each_step() {
     let (mut project, mut index) = project(&dir, level);
     let mesh = project.store().mesh().clone();
     let mut map = CorrectionMap::new();
+    let pen_down = map.clone();
     // Across face 4 and its tiles' borders (at 64 on each axis), each step under a radius on from
-    // the last, some pushing in: every step reads the corrections the steps before it wrote.
+    // the last, some pushing in: every step adds to the corrections the steps before it wrote,
+    // weighed on the surface the stroke began on.
     let steps = [0.05, 0.03, -0.04, 0.06, 0.02];
     let mut oracle = OracleStroke::new();
     project.begin_stroke().unwrap();
@@ -416,7 +428,7 @@ fn a_stroke_of_overlapping_steps_matches_dense_after_each_step() {
         let center = vertex(level, 4, 40 + 15 * k, 90 - 12 * k);
         let params = params(center, 0.1, strength).unwrap();
         let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
-        let moved = oracle_step(&mesh, level, &mut map, &mut oracle, params);
+        let moved = oracle_step(&mesh, level, &pen_down, &mut map, &mut oracle, params);
         assert_eq!(stats.vertices, moved, "step {k}: vertices moved");
         assert_eq!(
             stats.tiles_unaccumulated, 0,
@@ -426,7 +438,7 @@ fn a_stroke_of_overlapping_steps_matches_dense_after_each_step() {
         assert_as_dense(project.store(), &map, level, &format!("after step {k}"));
     }
     project.end_unrecorded_stroke().unwrap();
-    assert_bounds_fresh(project.store(), &index);
+    assert_bounds_fresh(&mut project, &index);
 }
 
 #[test]
@@ -441,6 +453,7 @@ fn a_step_at_a_valence_5_vertex_matches_dense_and_keeps_its_five_copies_in_step(
     let copies = mesh.topology().copies(FaceId::new(5), level, n, n);
     assert_eq!(copies.len(), 5, "a copy in each of the five faces");
     let mut map = CorrectionMap::new();
+    let pen_down = map.clone();
     let mut oracle = OracleStroke::new();
     project.begin_stroke().unwrap();
     let mut stroke = Stroke::new(project.store());
@@ -449,7 +462,7 @@ fn a_step_at_a_valence_5_vertex_matches_dense_and_keeps_its_five_copies_in_step(
         let center = Vec3::new(pole.x + shift, pole.y, pole.z);
         let params = params(center, 0.3, strength).unwrap();
         let stats = draw_step(project.store(), &mut index, &mut stroke, params).unwrap();
-        let moved = oracle_step(&mesh, level, &mut map, &mut oracle, params);
+        let moved = oracle_step(&mesh, level, &pen_down, &mut map, &mut oracle, params);
         assert_eq!(stats.vertices, moved, "step {k}: vertices moved");
         assert_eq!(
             stats.tiles_unaccumulated, 0,
@@ -463,7 +476,7 @@ fn a_step_at_a_valence_5_vertex_matches_dense_and_keeps_its_five_copies_in_step(
     }
     project.end_unrecorded_stroke().unwrap();
     assert_twins(project.store(), level);
-    assert_bounds_fresh(project.store(), &index);
+    assert_bounds_fresh(&mut project, &index);
 }
 
 /// Evaluated positions of whole tiles, each vertex answered from its containing tile: the
@@ -1163,20 +1176,30 @@ fn a_stroke_saved_part_way_goes_on_from_the_save() {
     let mut map = CorrectionMap::new();
     let (key, scale) = strong_stroke(&mut project, &mut index, level);
     let strong = params(vertex(level, 4, 32, 32), 0.1, 0.05).unwrap();
-    oracle_step(&mesh, level, &mut map, &mut OracleStroke::new(), strong);
+    oracle_step(
+        &mesh,
+        level,
+        &CorrectionMap::new(),
+        &mut map,
+        &mut OracleStroke::new(),
+        strong,
+    );
+    // The light stroke begins on what the strong one left, and reads it at pen-down across the
+    // save too.
+    let pen_down = map.clone();
     let light = light_dab(level, 4, scale);
     let mut stroke = Stroke::new(project.store());
     let mut oracle = OracleStroke::new();
     project.begin_stroke().unwrap();
     for _ in 0..3 {
         draw_step(project.store(), &mut index, &mut stroke, light).unwrap();
-        oracle_step(&mesh, level, &mut map, &mut oracle, light);
+        oracle_step(&mesh, level, &pen_down, &mut map, &mut oracle, light);
     }
     assert_saved(project.save());
     oracle = OracleStroke::new();
     for k in 0..5 {
         draw_step(project.store(), &mut index, &mut stroke, light).unwrap();
-        oracle_step(&mesh, level, &mut map, &mut oracle, light);
+        oracle_step(&mesh, level, &pen_down, &mut map, &mut oracle, light);
         assert!(stroke.holds(&key), "the tile keeps its state");
         assert_as_dense(
             project.store(),

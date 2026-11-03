@@ -593,7 +593,9 @@ impl TileEdit<'_> {
 impl TileStore {
     /// Starts a new op, the site's next sequence number, and returns it: every edit from now
     /// on, [`TileStore::set_correction`] and [`TileStore::edit_tile`] alike, is part of it,
-    /// until the next call. A stroke begins one and keeps it across all of its dabs.
+    /// until the next call. A stroke begins one and keeps it across all of its dabs, so the
+    /// last stroke's pen-down shapes go ([`TileStore::release_pen_down`]): the new stroke's
+    /// surface at pen-down is the store's as it is now.
     ///
     /// Ops are issued here only, never passed in by a caller, so they only grow. An edit with
     /// no op begun (the first after the store opens, or after a rebase) begins one itself.
@@ -611,6 +613,19 @@ impl TileStore {
     /// [`CacheError::OpsExhausted`] past the site's last sequence number; the current op is
     /// kept then.
     pub fn begin_op(&mut self) -> Result<OpId, CacheError> {
+        let op = self.start_op()?;
+        self.release_pen_down();
+        Ok(op)
+    }
+
+    /// Starts the site's next op, as [`TileStore::begin_op`] does, the pen-down shapes kept: for
+    /// an edit that finds no op (after a rebase moved the store's later edits to a new op, in
+    /// the middle of a stroke).
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::begin_op`].
+    fn start_op(&mut self) -> Result<OpId, CacheError> {
         let op = self.next_op.ok_or(CacheError::OpsExhausted)?;
         self.next_op = op.next();
         self.op = Some(op);
@@ -684,7 +699,7 @@ impl TileStore {
     pub(super) fn edit_op(&mut self) -> Result<OpId, CacheError> {
         match self.op {
             Some(op) => Ok(op),
-            None => self.begin_op(),
+            None => self.start_op(),
         }
     }
 

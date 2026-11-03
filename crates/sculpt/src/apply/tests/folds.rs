@@ -13,9 +13,9 @@
 //!
 //! The setup is the bench's: `cube_sphere(4)` to level 8 (1,536 tiles of 64 × 64 quads, a quad
 //! about 0.0015 across the unit sphere), and a ridge of 60 dabs of radius 0.2 (about 130 quads),
-//! strength a tenth of it, spacing 0.15 of it, each placed on the stroke's surface by a raycast
-//! and given its area normal there, then applied as finest work (one dab a call). Moving each
-//! vertex along its own frame normal instead, the same ridge flips 17,444 of the 667,625
+//! strength a tenth of it, spacing 0.15 of it, each placed on the stroke's pen-down surface by a
+//! raycast and given its area normal there, then applied as finest work (one dab a call). Moving
+//! each vertex along its own frame normal instead, the same ridge flips 17,444 of the 667,625
 //! triangles it moves, 1,206 in the worst tile (2026-11-02, before draw took the area normal); at
 //! level 7 it flips 7, at level 6 none: the folds need the finest octaves' turning normals under
 //! a ridge many quads tall.
@@ -61,13 +61,13 @@ fn a_tall_stroke_on_a_rough_surface_folds_no_triangle() {
 
     let mut stroke = Stroke::new(project.store());
     project.begin_stroke().unwrap();
-    let mut normals_off = 0_u32;
+    let mut least = 1.0_f32;
     for n in 0..RIDGE_DABS {
         let dab = next_dab(project.store(), &index, n);
         let [x, y, z] = dab.position;
         let outward = Vec3::new(x, y, z).normalized().unwrap();
         let [nx, ny, nz] = dab.normal;
-        normals_off += u32::from(outward.dot(Vec3::new(nx, ny, nz)) < 0.999);
+        least = least.min(outward.dot(Vec3::new(nx, ny, nz)));
         apply_dabs(project.store(), &mut index, &mut stroke, &[dab]).unwrap();
     }
     project.end_unrecorded_stroke().unwrap();
@@ -90,14 +90,15 @@ fn a_tall_stroke_on_a_rough_surface_folds_no_triangle() {
             .count();
     }
     let total: usize = before.values().map(Vec::len).sum();
+    let tilt = least.clamp(-1.0, 1.0).acos().to_degrees();
     println!(
         "{flipped} of {total} triangles flipped ({worst} in the worst tile), {moved} moved; \
-         {normals_off} of {RIDGE_DABS} area normals off the radial"
+         area normals at most {tilt:.1}° off the radial"
     );
     assert!(moved > 10_000, "the ridge moved the surface: {moved}");
     assert!(
-        normals_off > RIDGE_DABS / 2,
-        "the area normals follow the ridge, not the sphere: {normals_off}"
+        tilt < 10.0,
+        "the area normals are the rough sphere's at pen-down, not the ridge's: {tilt}°"
     );
     assert_eq!(
         flipped, 0,
@@ -114,8 +115,9 @@ fn direction(n: u32) -> Vec3 {
     Vec3::new(0.6 * cos, 0.6 * sin, 0.8).normalized().unwrap()
 }
 
-/// The next dab of the ridge, number `n`: its centre on the store's surface by a raycast from
-/// outside along the ridge's great circle, its normal its area normal there, full strength.
+/// The next dab of the ridge, number `n`: its centre on the stroke's pen-down surface by a
+/// raycast from outside along the ridge's great circle, its normal its area normal there, full
+/// strength.
 fn next_dab(store: &mut TileStore, index: &SpatialIndex, n: u32) -> Dab {
     let direction = direction(n);
     let from = DVec3::from_f32(direction);

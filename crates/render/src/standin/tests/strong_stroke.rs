@@ -251,10 +251,11 @@ impl Case {
     }
 }
 
-/// `dabs`, each with its area normal on `store`'s surface as it is now, as placement gives it.
+/// `dabs`, each with its area normal on the stroke's pen-down surface, as placement gives it.
 ///
-/// The surface is the stroke's dabs before them applied. Where the sum is degenerate, the normal
-/// is the surface normal's stand-in, outward from the sphere's centre.
+/// The surface is `store`'s as the stroke began, whatever of its dabs were applied since. Where the
+/// sum is degenerate, the normal is the surface normal's stand-in, outward from the sphere's
+/// centre.
 fn area_normals(
     store: &mut TileStore,
     index: &store::SpatialIndex,
@@ -705,11 +706,11 @@ const NORMAL_SLACK: f64 = 1.0;
 /// The most the stand-in's normals may be from the refreshed ones, rms, degrees.
 ///
 /// The strong stroke's floor (the refreshed tile's own positions against its stored normals) is
-/// about 5 at its
-/// worst level, 5.1 at level 3 across the quads' split since draw moves a dab's vertices along its
-/// area normal (2026-11-02; about 4 before, when each moved along its own frame normal, which this
-/// was set against); its stored normals were 30–34 off.
-const NORMAL_RMS: f64 = 6.0;
+/// 8.6 at its worst level, level 3 across the quads' split, since a stroke weighs its dabs at
+/// pen-down and its ridge is their sum, 1.37 radii tall (2026-11-02; 5.2 there before, on a ridge
+/// of 0.81 radii, and about 4 when each dab moved its vertices along their own frame normals);
+/// the stand-in meets the floor at every level. Its stored normals were 30–34 off.
+const NORMAL_RMS: f64 = 10.0;
 
 #[test]
 fn a_strong_stroke_s_refresh_swaps_in_close_to_its_stand_ins_along_a_row_and_a_diagonal() {

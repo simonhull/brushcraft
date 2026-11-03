@@ -145,6 +145,18 @@ impl TileStore {
     ///
     /// As [`TileStore::frames_many`].
     fn frames_of_one(&mut self, key: TileKey) -> Result<Vec<Frame>, CacheError> {
+        let prediction = self.prediction_of_one(key)?;
+        Ok(frames_of(key.side(), |i, j| prediction.frame(i, j)))
+    }
+
+    /// Tile `key`'s prediction, made afresh from its parents, made current and pinned while it
+    /// is predicted, and not kept: the bits a kept prediction of it would have.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::evaluate`] for making the parents current; [`CacheError::Eval`] (not for a
+    /// valid key).
+    pub(super) fn prediction_of_one(&mut self, key: TileKey) -> Result<Prediction, CacheError> {
         let parents: BTreeSet<TileKey> = list_parents(&self.mesh, &key)?.into_iter().collect();
         let held = self.pin_current(parents)?;
         let source = Resident::new(
@@ -158,7 +170,7 @@ impl TileStore {
         let unpinned = self.unpin_held(&held);
         let prediction = predicted?;
         unpinned?;
-        Ok(frames_of(key.side(), |i, j| prediction.frame(i, j)))
+        Ok(prediction)
     }
 }
 

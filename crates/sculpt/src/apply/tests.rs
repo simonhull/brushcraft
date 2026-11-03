@@ -280,13 +280,14 @@ fn a_frame_equals_its_dabs_one_call_each_under_a_tight_budget_with_predictions_k
         assert_eq!(stats.tiled_dabs, 12, "{budget} bytes: tile by tile");
         assert!(framed == alone, "{budget} bytes: the same bits");
         // No budget here leaves too little room to keep a run's predictions (the cube's
-        // parents stay cached), so the store is made to report it.
+        // parents stay cached), so the store is made to report it: the runs copy their frames,
+        // and make their changed tiles' pen-down positions on the calling thread.
         let (starved, starved_stats) =
             run_project(config(budget), 12, &[12], &[Fault::StarvePredictions])
                 .expect("a run without room for its predictions doesn't fail the frame");
         assert_eq!(
-            starved_stats.tiled_dabs, 0,
-            "{budget} bytes: every run one dab at a time"
+            starved_stats.tiled_dabs, 12,
+            "{budget} bytes: tile by tile all the same"
         );
         assert!(starved == alone, "{budget} bytes: the same bits, starved");
         applied += 1;
@@ -424,10 +425,15 @@ fn a_store_error_ends_the_call_and_keeps_the_dabs_before_it() {
     );
     for key in near {
         let fresh = SpatialIndex::bounds_of(project.store(), *key).unwrap();
+        let held = index.bvh().bounds(key).expect("every tile");
         assert_eq!(
-            index.bvh().bounds(key),
-            Some(&fresh),
-            "{key:?}'s bounds in the index are current"
+            held.cone, fresh.cone,
+            "{key:?}'s cone in the index is current"
+        );
+        assert_eq!(
+            held.aabb.union(fresh.aabb),
+            held.aabb,
+            "{key:?}'s box in the index holds its current bounds"
         );
     }
 }
@@ -492,46 +498,48 @@ fn lift(project: &mut Project) -> Dab {
 }
 
 #[test]
-fn a_dab_reaches_a_tile_through_a_seam_vertex_the_dab_before_pushed_out() {
+fn a_dab_weighs_a_vertex_the_dab_before_lifted_where_it_was_at_pen_down() {
     let level = level();
     let left = TileKey::displacement(FaceId::new(0), level, 0, 0).unwrap();
-    // The reference, one call per dab: the first lifts the seam vertex, the second is a small one
-    // just past where it went, far above the surface as the frame finds it.
-    let (reference, second) = {
-        let dir = TestDir::new();
-        let (mut project, mut index) = cube(&dir, level, fixed(2));
-        let before = vertex(project.store(), left, 64, 32);
-        let first = lift(&mut project);
-        let mut state = Stroke::new(project.store());
-        project.begin_stroke().unwrap();
-        apply_dabs(project.store(), &mut index, &mut state, &[first]).unwrap();
-        let after = vertex(project.store(), left, 64, 32);
-        let second = dab(after + (after - before) * 0.05, 0.03, 0.001, 0.0, 1);
-        let alone = apply_dabs(project.store(), &mut index, &mut state, &[second]).unwrap();
-        project.end_unrecorded_stroke().unwrap();
-        assert!(
-            alone.vertices > 0,
-            "the second dab reaches the lifted vertex"
-        );
-        (snapshot(project.store(), level), second)
-    };
-
+    // One call per dab: the first lifts the seam vertex, the second is a small one just past
+    // where it went, far above the surface the stroke began on, and the third a small one where
+    // it was.
     let dir = TestDir::new();
     let (mut project, mut index) = cube(&dir, level, fixed(2));
-    let [x, y, z] = second.position;
+    let before = vertex(project.store(), left, 64, 32);
+    let first = lift(&mut project);
+    let mut state = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    apply_dabs(project.store(), &mut index, &mut state, &[first]).unwrap();
+    let after = vertex(project.store(), left, 64, 32);
+    assert!((after - before).length() > 0.1, "the first dab lifted it");
+    let above = dab(after + (after - before) * 0.05, 0.03, 0.001, 0.0, 1);
+    let alone = apply_dabs(project.store(), &mut index, &mut state, &[above]).unwrap();
     assert_eq!(
-        index
-            .query_sphere(Vec3::new(x, y, z), second.radius)
-            .count(),
-        0,
-        "no tile's box as the frame finds it touches the second dab"
+        alone.vertices, 0,
+        "a dab where the vertex went reaches nothing"
     );
-    let frame = [lift(&mut project), second];
-    let framed = apply_in_frames(&mut project, &mut index, &frame, &[2]);
+    let at = dab(before, 0.03, 0.001, 0.0, 2);
+    let lifted = vertex(project.store(), left, 64, 32);
+    let reached = apply_dabs(project.store(), &mut index, &mut state, &[at]).unwrap();
+    assert!(reached.vertices > 0, "a dab where it was reaches it");
+    let moved = vertex(project.store(), left, 64, 32) - lifted;
+    assert!(
+        (moved.length() - 0.001).abs() < 1e-4,
+        "by the dab's full strength, though it is far from the dab's centre now: {moved:?}"
+    );
+    project.end_unrecorded_stroke().unwrap();
+    let reference = snapshot(project.store(), level);
+
+    // The same dabs as one frame: the same bits.
+    let frame_dir = TestDir::new();
+    let (mut framed_project, mut framed_index) = cube(&frame_dir, level, fixed(2));
+    let frame = [lift(&mut framed_project), above, at];
+    let framed = apply_in_frames(&mut framed_project, &mut framed_index, &frame, &[3]);
     assert_eq!(framed.frames, 1, "one frame");
     assert!(
-        snapshot(project.store(), level) == reference,
-        "the frame reaches the vertex too, and gives the same bits"
+        snapshot(framed_project.store(), level) == reference,
+        "the frame weighs it where it was too, and gives the same bits"
     );
 }
 
@@ -680,5 +688,111 @@ fn a_frame_of_dabs_closes_one_step_epoch_with_their_displacements_summed() {
     assert!(
         matches!(kinds.as_slice(), [store::EpochKind::Step { displacement }] if *displacement >= sum),
         "one step's epoch, D at least the dabs' strengths summed ({sum}): {kinds:?}"
+    );
+}
+
+/// The height of `p` above `base` along `base`'s outward direction.
+fn height(p: Vec3, base: Vec3) -> f32 {
+    (p - base).dot(base.normalized().unwrap())
+}
+
+#[test]
+fn dabs_on_one_spot_add_up_past_their_radius() {
+    // Each dab weighs a vertex at its pen-down position: the vertex at the centre takes every
+    // dab's full strength, however far the dabs before it lifted it, so eight dabs of 0.4 radii
+    // raise it 3.2 radii. Weighed where it stands, it would leave the dabs' reach after a few.
+    let key = TileKey::displacement(FaceId::new(0), level(), 1, 0).unwrap();
+    let (radius, strength, count) = (0.05_f32, 0.02_f32, 8_u32);
+    for frames in [&[1][..], &[8], &[3]] {
+        let dir = TestDir::new();
+        let (mut project, mut index) = cube(&dir, level(), fixed(2));
+        let base = vertex(project.store(), key, 32, 32);
+        let dabs: Vec<Dab> = (0..count)
+            .map(|n| dab(base, radius, strength, 0.0, n))
+            .collect();
+        apply_in_frames(&mut project, &mut index, &dabs, frames);
+        let raised = height(vertex(project.store(), key, 32, 32), base);
+        #[expect(clippy::cast_precision_loss, reason = "eight dabs")]
+        let sum = strength * count as f32;
+        assert!(
+            (raised - sum).abs() < 1e-3 * sum,
+            "frames {frames:?}: raised {raised}, the dabs' strengths sum to {sum}, {} radii",
+            sum / radius
+        );
+    }
+}
+
+#[test]
+fn a_tile_the_stroke_state_released_is_weighed_at_its_first_pen_down_shape_when_revisited() {
+    // A stroke state of one tile: a stroke that leaves a tile and comes back finds its state
+    // released, but the tile keeps the pen-down shape it had before the stroke first wrote it,
+    // and the stroke's dab there weighs its vertices where they were then.
+    let level = level();
+    let config = StoreConfig::new(128 << 20, 1)
+        .with_chunk_bytes(1 << 20)
+        .with_workers(fixed(2))
+        .with_stroke_tiles(1);
+    let dir = TestDir::new();
+    let project_config = store::ProjectConfig {
+        store: config,
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let mut project = Project::new(geom::cube_sphere(1).unwrap(), project_config).unwrap();
+    let mut index = SpatialIndex::build(project.store(), level, |_, _| {}).unwrap();
+    let home = TileKey::displacement(FaceId::new(0), level, 1, 1).unwrap();
+    let base = vertex(project.store(), home, 32, 32);
+    let pen_down = project.store().evaluate(home).unwrap().to_vec();
+    // Stronger than its radius: once lifted, the centre is out of a second dab's reach where it
+    // stands.
+    let (radius, strength) = (0.04_f32, 0.06_f32);
+    let away: Vec<Dab> = (0..=u16::try_from(Stroke::PROTECTED_DABS).unwrap())
+        .map(|n| {
+            let far = TileKey::displacement(FaceId::new(3), level, n % 2, n / 2 % 2).unwrap();
+            dab(
+                vertex(project.store(), far, 32, 32),
+                radius,
+                0.001,
+                0.0,
+                1 + u32::from(n),
+            )
+        })
+        .collect();
+    let mut state = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    let first = dab(base, radius, strength, 0.0, 0);
+    apply_dabs(project.store(), &mut index, &mut state, &[first]).unwrap();
+    for dab in &away {
+        apply_dabs(project.store(), &mut index, &mut state, &[*dab]).unwrap();
+    }
+    assert!(!state.holds(&home), "the stroke released the tile's state");
+    let shape = project.store().pen_down_positions(home).unwrap().to_vec();
+    let bits = |points: &[Vec3]| points.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&shape),
+        bits(&pen_down),
+        "its pen-down shape is the stroke's first"
+    );
+    let again = Dab { seq: 9, ..first };
+    let alone = apply_dabs(project.store(), &mut index, &mut state, &[again]).unwrap();
+    assert!(
+        alone.vertices > 0,
+        "the dab back home reaches the tile at pen-down"
+    );
+    let raised = height(vertex(project.store(), home, 32, 32), base);
+    assert!(
+        (raised - 2.0 * strength).abs() < 1e-3,
+        "raised {raised}: both dabs' full strength, {}",
+        2.0 * strength
+    );
+    assert_eq!(
+        bits(project.store().pen_down_positions(home).unwrap()),
+        bits(&pen_down),
+        "and it keeps that shape"
+    );
+    project.end_unrecorded_stroke().unwrap();
+    assert_eq!(
+        project.store().pen_down_tiles(),
+        0,
+        "the shapes go with the stroke"
     );
 }

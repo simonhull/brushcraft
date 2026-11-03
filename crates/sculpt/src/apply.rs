@@ -1,10 +1,24 @@
 //! Applying a frame's dabs: [`apply_dabs`], the draw brush for every dab a frame placed, the
 //! dabs applied tile by tile, tiles in parallel on the store's workers.
 //!
+//! # Weighed at pen-down
+//!
+//! A dab moves each vertex within its radius by `strength · falloff(d / radius)` along its area
+//! normal, `d` the distance from the dab's centre to the vertex **at pen-down**: where the vertex
+//! was when the stroke began (the brush-engine spec, "The surface a stroke reads is its pen-down
+//! surface"), read from the pen-down shape the store keeps of a tile the stroke has changed
+//! ([`TileStore::pen_down_shape`]), or from the store's evaluation of any other. So a stroke's
+//! dabs add up over the pen-down surface: a ridge is the sum of its dabs, never a dab weighed on
+//! the ridge its predecessors raised. Before a tile is first written, the store keeps its shape
+//! ([`TileStore::keep_pen_down`]).
+//!
 //! [`apply_dabs`] runs, in order:
 //!
 //! 1. **Query**: for each dab, the tiles whose boxes its sphere touches, from the spatial index as
-//!    the frame found it.
+//!    the frame found it. The index's boxes hold every tile's pen-down positions (a changed tile's
+//!    box holds its pen-down shape, see [`SpatialIndex::refit`]), and a dab's reach is measured
+//!    there, so these are all the tiles each dab can reach, however the frame's dabs before it
+//!    moved them.
 //! 2. **Pin**: every tile of those queries is evaluated and pinned, together, so they stay resident
 //!    for the frame; and with them every tile step 5 can evaluate or read, so that wave needs no
 //!    room the pins haven't counted (see "Errors").
@@ -13,19 +27,16 @@
 //!    run is applied tile by tile (see "Tile by tile"):
 //!    - **Brush and edit**: each of the run's tiles, on the store's workers, takes every dab of the
 //!      run that reaches it, in order, on a copy of its own corrections: `brush`'s draw action
-//!      ([`brush::draw_imprint`], [`brush::draw_move`]) gives each vertex within the radius its
-//!      move, its displacement along the dab's normal (its area normal: one direction for every
-//!      vertex), and the move is written in the vertex's tangent frame ([`frame_delta`]) as its
+//!      ([`brush::draw_imprint`], [`brush::draw_move`]) gives each vertex within the radius at
+//!      pen-down its move, its displacement along the dab's normal (its area normal: one direction
+//!      for every vertex), and the move is written in the vertex's tangent frame ([`frame_delta`],
+//!      the frames of the prediction the store keeps of it, [`TileStore::kept_prediction`]) as its
 //!      delta; the vertex's correction is set to the value the stroke builds for it, the correction
 //!      it first found there plus every delta since (see [`Stroke`]), so the stored value is
-//!      rounded to the tile's quantization once per stroke, not once per dab; and the tile's
-//!      positions are made again from the prediction the store keeps of it
-//!      ([`TileStore::kept_prediction`]), for the next dab, whose frames the deltas take too.
-//!    - **Write**: the tiles are written back whole, together ([`TileStore::replace_corrections`]);
-//!      the stroke's state takes what the run did ([`Stroke::end_frame`]).
-//!    - **Positions**: unless it is the frame's last, the tiles the run reached get their positions
-//!      again ([`TileStore::evaluate_many`], from the same kept predictions), and their boxes are
-//!      taken again, for the next run's tiles (see "The frame's tiles").
+//!      rounded to the tile's quantization once per stroke, not once per dab.
+//!    - **Write**: the pen-down shapes of the tiles written for the first time are kept; the tiles
+//!      are written back whole, together ([`TileStore::replace_corrections`]); the stroke's state
+//!      takes what the run did ([`Stroke::end_frame`]).
 //!
 //!    A frame of one dab is applied as it always was, the dab's tiles brushed on the workers and
 //!    written through [`TileStore::update_tiles`]; so is a run whose replay can't be exact (see
@@ -36,8 +47,11 @@
 //! 5. **Evaluate**: those tiles are evaluated again, positions and normals, together through
 //!    [`TileStore::evaluate_many_with_bounds`], each tile's bounds on the worker that computed its
 //!    normals.
-//! 6. **Refit**: the index's tree is refitted to those bounds; the frame closes its epoch of the
-//!    store's stale-tile feed ([`TileStore::close_epoch`]), exactly one a call, whatever failed.
+//! 6. **Refit**: the index's tree is refitted to those bounds (a changed tile's box holding its
+//!    pen-down shape too); the frame closes its epoch of the store's stale-tile feed
+//!    ([`TileStore::close_epoch`]), exactly one a call, whatever failed.
+//!
+//! Nothing is evaluated between a frame's dabs: a dab reads no position a dab before it moved.
 //!
 //! # The same as one dab at a time
 //!
@@ -51,29 +65,23 @@
 //! Applying a run's dabs tile by tile, each tile on its own, is exact because nothing a dab
 //! does to a tile depends on another tile, given the run's dabs:
 //!
-//! - **A tile's positions are its own.** A finest tile's positions are its prediction, from the
-//!   level below, which the brush never edits, with its own corrections applied vertex by vertex in
-//!   each vertex's tangent frame ([`geom::Frame::apply`]). No stencil reaches across tiles at the
-//!   edited level. So a tile's copy of its corrections and its kept prediction give its positions
-//!   after any of the run's writes, the bits the store's evaluation gives.
 //! - **A vertex's delta is its own.** The draw action's delta for a vertex is a function of the
-//!   vertex's position, its tangent frame (from the level below, which the brush never edits) and
-//!   the dab alone.
+//!   vertex's pen-down position (its tile's, which no dab of the stroke changes), its tangent frame
+//!   (from the level below, which the brush never edits) and the dab alone.
 //! - **A tile's quantization is its own.** The interior's scale covers its interior alone, and
 //!   grows (re-quantizing the interior) only for its own writes, in the order the store's edit
 //!   makes them: the replay writes through [`geom::CorrectionViewMut::update_interior_row`], the
 //!   store's own edit of an interior, row by row, so a scale grows mid-run at the same vertex, with
 //!   the same values re-quantized, as one dab at a time.
 //! - **Shared vertices agree.** A border vertex is held by every tile it lies on, each copy's
-//!   prediction and frame the same bits (geom's seam guarantee) and its correction the same, so
-//!   each copy's position is the same, and every tile holding one finds the same delta for it,
-//!   written in the same frame. Border values are stored exactly. The vertex's owner writes it from
-//!   its stroke state; each other tile writes its copy from a copy of that state, taken from the
-//!   stroke as the run began and carried along with the same arithmetic
-//!   ([`crate::state::stroke_sum`]), so every copy gets the bits the owner's write gives all of
-//!   them one at a time. The store checks it before writing ([`TileStore::replace_corrections`]):
-//!   every copy of a border vertex written is among the run's tiles and holds the same bits, or
-//!   nothing is written.
+//!   pen-down position (a pen-down shape keeps its border exactly), frame and correction the same
+//!   bits (geom's seam guarantee), so every tile holding one finds the same delta for it, written
+//!   in the same frame. Border values are stored exactly. The vertex's owner writes it from its
+//!   stroke state; each other tile writes its copy from a copy of that state, taken from the stroke
+//!   as the run began and carried along with the same arithmetic ([`crate::state::stroke_sum`]), so
+//!   every copy gets the bits the owner's write gives all of them one at a time. The store checks
+//!   it before writing ([`TileStore::replace_corrections`]): every copy of a border vertex written
+//!   is among the run's tiles and holds the same bits, or nothing is written.
 //! - **The stroke's state is decided ahead.** Which tiles hold stroke state, and which are released
 //!   or written per dab, depends on the tiles every dab edits, and so on every tile. The run
 //!   assumes no tile it edits loses its state or goes without, replays its tiles, then makes the
@@ -96,34 +104,18 @@
 //! A run is applied one dab at a time instead, nothing written by its replay, when its replay
 //! can't stand for it: a tile refuses a value ([`geom::CorrectionError::TooLarge`] or
 //! [`geom::CorrectionError::NotFinite`]: one dab at a time, the dabs before it stay applied, as
-//! "Errors" says), a tile lacks the positions, corrections or prediction it needs, the store
-//! has no room to keep the run's predictions, the stroke's decisions differ again after the
-//! second replay, or the store refuses its twins ([`CacheError::TwinsDisagree`], none should).
-//! A frame of one dab is applied so too, as a run of one dab needs no prediction and gains
-//! nothing.
+//! "Errors" says), a tile lacks the positions, corrections or frames it needs, the stroke's
+//! decisions differ again after the second replay, or the store refuses its twins
+//! ([`CacheError::TwinsDisagree`], none should). A frame of one dab is applied so too, as a run of
+//! one dab gains nothing.
 //!
 //! # The frame's tiles
 //!
-//! A tile's positions move only if a dab reaches it: if it holds a vertex within the dab's
-//! radius (and so is brushed, and counted as reached), whether it owns the vertex and is edited,
-//! or holds a copy of one its neighbour edits. So dab `k` brushes:
-//!
-//! - every tile its sphere touches by its box in the index as the frame found it, but those the
-//!   frame has reached already: the others haven't moved since, so that box still bounds them;
-//! - every tile the frame has reached whose box now, taken after the run that last moved it,
-//!   touches its sphere.
-//!
-//! By induction over the dabs, that is every tile holding a vertex within dab `k`'s radius,
-//! whatever its action does to the vertices it reaches, with no bound on how far they move. Only
-//! the first set is known before the frame runs; it is what the frame pins, and the second is
-//! within it, as a tile reached was brushed and so pinned.
-//!
-//! A run's tiles are its dabs' tiles so chosen at its start. Within the run, each tile keeps a
-//! box for each of its rows, grown with every position the run gives it, and takes a dab only
-//! over the rows whose box touches the dab's sphere: the same induction, row by row, inside the
-//! tile. A tile that isn't among the run's tiles doesn't move during it: its first vertex to
-//! come within a dab's radius would lie in its box as the frame found it, which so touches that
-//! dab's sphere, and it would be among them.
+//! A dab reaches a vertex whose pen-down position is within its radius, and a tile holding one
+//! has its pen-down positions in its box in the index, which so touches the dab's sphere: so each
+//! dab's tiles are its query's, those the frame pins, and nothing the frame's dabs do changes
+//! them. Within a run, each tile keeps a box for each of its rows' pen-down positions, and takes
+//! a dab only over the rows whose box touches the dab's sphere.
 //!
 //! # Errors
 //!
@@ -143,13 +135,16 @@
 //! would lose the predictions the store keeps for pinned tiles edited in place, which the next
 //! frames reuse.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::AddAssign;
 use std::time::{Duration, Instant};
 
 use brush::{Imprint, Smoothstep, draw_imprint, draw_move};
 use geom::{Prediction, TileKey, Vec3};
-use store::{Aabb, CacheError, Evaluation, IndexError, ParentSlots, SpatialIndex, TileStore};
+use store::{
+    CacheError, Evaluation, IndexError, ParentSlots, PenDownShape, SpatialIndex, TileStore,
+};
 use stroke::Dab;
 use thiserror::Error;
 
@@ -189,15 +184,16 @@ pub struct PhaseTimes {
     pub query: Duration,
     /// Evaluating and pinning those tiles.
     pub pin: Duration,
-    /// Running the brush over their evaluated positions.
+    /// Running the brush over their pen-down positions.
     pub brush: Duration,
-    /// Writing the deltas into the corrections.
+    /// Keeping the pen-down shapes of the tiles written for the first time, and writing the
+    /// deltas into the corrections.
     pub edit: Duration,
     /// Listing the tiles whose bounds the edits may change: those reached, and their
     /// neighbours whose normals read them.
     pub neighbours: Duration,
-    /// Evaluating the changed tiles again: their positions between dabs, then positions and
-    /// normals once for the frame.
+    /// Making the run's tiles' positions and frames current before they are brushed, and
+    /// evaluating the changed tiles' positions and normals again once for the frame.
     pub evaluate: Duration,
     /// Recomputing their bounds and refitting the index.
     pub refit: Duration,
@@ -278,7 +274,8 @@ impl AddAssign for ApplyStats {
 /// Applies `dabs`, a frame's dabs in sequence order, with the draw action.
 ///
 /// Each dab moves every vertex of the index's level within its radius along the dab's normal by
-/// `strength · falloff(d / radius)`, the falloff [`Smoothstep`] made as hard as the dab's hardness
+/// `strength · falloff(d / radius)`, `d` measured at pen-down (see "Weighed at pen-down" in the
+/// module notes), the falloff [`Smoothstep`] made as hard as the dab's hardness
 /// ([`brush::Hardened`]), and `index` is brought up to date once for the frame (see the module
 /// notes for the phases). The normal is the dab's area normal, as placement takes it: one
 /// direction for every vertex the dab moves ([`brush::draw_move`]).
@@ -365,12 +362,14 @@ pub(crate) fn apply_imprints(
     let mut laps = Laps::start();
     let mut times = PhaseTimes::default();
 
+    // Each dab's tiles in key order: the order the stroke's state gives tiles their buffers in.
     let queries: Vec<Vec<TileKey>> = imprints
         .iter()
         .map(|imprint| {
-            index
+            let keys: BTreeSet<TileKey> = index
                 .query_sphere(centre(imprint), imprint.radius)
-                .collect()
+                .collect();
+            keys.into_iter().collect()
         })
         .collect();
     let frame_tiles: BTreeSet<TileKey> = queries.iter().flatten().copied().collect();
@@ -435,11 +434,9 @@ fn centre(imprint: &Imprint) -> Vec3 {
 /// What a frame's dabs have done so far.
 #[derive(Debug, Default)]
 struct Frame {
-    /// Every tile holding a vertex within a dab's radius: those whose positions moved.
+    /// Every tile holding a vertex within a dab's radius at pen-down: those whose positions
+    /// moved.
     reached: BTreeSet<TileKey>,
-    /// The box of each tile of `reached` as it is now, taken after the dab that last moved it;
-    /// `None` for one with no finite position.
-    boxes: BTreeMap<TileKey, Option<Aabb>>,
     /// Every tile whose corrections a dab edited.
     edited: BTreeSet<TileKey>,
     /// Vertex moves, summed over the dabs.
@@ -453,16 +450,16 @@ struct Frame {
 /// Step 3 of the module notes for `imprints`, in runs.
 ///
 /// `queries[k]` holds the tiles imprint `k`'s sphere touches by their boxes as the frame found
-/// them, every one pinned. Each run is applied tile by tile ([`run_tiled`]), or one dab at a
-/// time where it can't be ([`run_dab`]), and the tiles it moved made current for the next, their
-/// boxes taken again; a frame of one dab is applied one dab at a time. Stops at the first error,
-/// `frame` holding what the dabs before it (and the failing one's brush, if it ran) reached.
+/// them, in key order, every one pinned: every tile it can reach (see "The frame's tiles" in the
+/// module notes). Each run is applied tile by tile ([`run_tiled`]), or one dab at a time where it
+/// can't be ([`run_dab`]); a frame of one dab is applied one dab at a time. Stops at the first
+/// error, `frame` holding what the dabs before it (and the failing one's brush, if it ran) reached.
 ///
 /// # Errors
 ///
 /// As [`TileStore::evaluate`], [`TileStore::keep_predictions_of`], [`TileStore::frames_many`],
-/// [`TileStore::update_tiles`], [`TileStore::replace_corrections`] and
-/// [`TileStore::bump_display_error`].
+/// [`TileStore::keep_pen_down`], [`TileStore::update_tiles`],
+/// [`TileStore::replace_corrections`] and [`TileStore::bump_display_error`].
 fn run_dabs(
     store: &mut TileStore,
     stroke: &mut Stroke,
@@ -477,28 +474,13 @@ fn run_dabs(
     }
     let mut first = 0;
     while first < imprints.len() {
-        let (end, keys) = frame.next_run(store.kept_predictions(), imprints, queries, first);
+        let (end, keys) = next_run(store.kept_predictions(), queries, first);
         let run = imprints.get(first..end).unwrap_or_default();
-        let tiled = run_tiled(store, stroke, run, &keys, frame, times, laps)?;
-        let more = end < imprints.len();
-        if tiled.is_some() {
+        if run_tiled(store, stroke, run, &keys, frame, times, laps)? {
             frame.tiled += run.len();
-        }
-        match tiled {
-            Some(reached) if more && !reached.is_empty() => {
-                store.evaluate_many(&reached, Evaluation::Positions)?;
-                frame.rebox(store, &reached);
-                times.evaluate += laps.lap();
-            }
-            Some(_) => {}
-            None => {
-                let run_queries = queries.get(first..end).unwrap_or_default();
-                let dabs = run.iter().zip(run_queries).enumerate();
-                for (k, (imprint, query)) in dabs {
-                    let last = !more && first + k + 1 == imprints.len();
-                    run_dab(store, stroke, imprint, query, last, frame, times, laps)?;
-                }
-            }
+        } else {
+            let run_queries = queries.get(first..end).unwrap_or_default();
+            run_dabs_one_by_one(store, stroke, run, run_queries, frame, times, laps)?;
         }
         first = end;
     }
@@ -519,42 +501,38 @@ fn run_dabs_one_by_one(
     times: &mut PhaseTimes,
     laps: &mut Laps,
 ) -> Result<(), CacheError> {
-    let dabs = imprints.iter().zip(queries).enumerate();
-    for (k, (imprint, query)) in dabs {
-        let last = k + 1 == imprints.len();
-        run_dab(store, stroke, imprint, query, last, frame, times, laps)?;
+    let dabs = imprints.iter().zip(queries);
+    for (imprint, query) in dabs {
+        run_dab(store, stroke, imprint, query, frame, times, laps)?;
     }
     Ok(())
 }
 
 /// One dab of step 3 of the module notes, on its own.
 ///
-/// Brushed over its tiles on the workers, written through [`TileStore::update_tiles`], and,
-/// unless it is the frame's `last`, the tiles it moved made current for the next, their boxes
-/// taken again.
+/// Brushed over its tiles `query` (in key order) on the workers, the pen-down shapes of the tiles
+/// it moves kept, and written through [`TileStore::update_tiles_framed`] (or
+/// [`TileStore::update_tiles`]).
 ///
 /// # Errors
 ///
 /// As [`run_dabs`].
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one dab of the frame's loop: the frame's state, the dab and the phase timers"
-)]
 fn run_dab(
     store: &mut TileStore,
     stroke: &mut Stroke,
     imprint: &Imprint,
     query: &[TileKey],
-    last: bool,
     frame: &mut Frame,
     times: &mut PhaseTimes,
     laps: &mut Laps,
 ) -> Result<(), CacheError> {
-    let keys = frame.tiles_for(imprint, query);
-    let found = run_brush(store, &keys, imprint)?;
+    let found = run_brush(store, query, imprint)?;
     frame.reached.extend(&found.reached);
     times.brush += laps.lap();
 
+    // Every tile holding a vertex the dab moves is written: the vertex's owner, and the tiles
+    // holding its copies.
+    store.keep_pen_down(&found.reached)?;
     let edited: Vec<TileKey> = found.edits.iter().map(|tile| tile.key).collect();
     frame.unaccumulated += stroke.begin_dab(store, &edited);
     let states = stroke.states(&edited);
@@ -586,27 +564,21 @@ fn run_dab(
     frame.vertices += found.vertices;
     raise_display_bounds(store, &found)?;
     times.edit += laps.lap();
-
-    if !last && !found.reached.is_empty() {
-        store.evaluate_many(&found.reached, Evaluation::Positions)?;
-        frame.rebox(store, &found.reached);
-        times.evaluate += laps.lap();
-    }
     Ok(())
 }
 
 /// A run of the frame's dabs, `imprints`, applied tile by tile over `keys`, the run's tiles.
 ///
-/// See "Tile by tile" in the module notes. Returns the tiles the run reached, in key order, or
-/// `None` if the run must be applied one dab at a time instead, nothing having been written.
+/// See "Tile by tile" in the module notes. Returns whether it was: `false` if the run must be
+/// applied one dab at a time instead, nothing having been written.
 ///
 /// # Errors
 ///
 /// As [`TileStore::evaluate_many`], [`TileStore::frames_many`] and
 /// [`TileStore::keep_predictions_of`] before anything is written (but [`CacheError::Full`] and
-/// [`CacheError::OverBudget`] from keeping the predictions, which leave the run to be applied one
-/// dab at a time); as [`TileStore::replace_corrections`] (nothing written, but the stroke's state
-/// readied for the frame) and [`TileStore::bump_display_error`] after.
+/// [`CacheError::OverBudget`] from keeping the predictions, which take copies of the frames); as
+/// [`TileStore::keep_pen_down`] and [`TileStore::replace_corrections`] (nothing written, but the
+/// stroke's state readied for the frame) and [`TileStore::bump_display_error`] after.
 fn run_tiled(
     store: &mut TileStore,
     stroke: &mut Stroke,
@@ -615,33 +587,19 @@ fn run_tiled(
     frame: &mut Frame,
     times: &mut PhaseTimes,
     laps: &mut Laps,
-) -> Result<Option<Vec<TileKey>>, CacheError> {
-    let predicted = imprints.len() > 1;
-    store.evaluate_many(keys, Evaluation::Positions)?;
-    if predicted {
-        // Too little room to keep the run's predictions isn't the frame's failure: one dab at
-        // a time needs no more room than its pins, which it has.
-        let kept = store.keep_predictions_of(keys);
-        #[cfg(test)]
-        let kept = if replay::injected(store.id(), replay::Fault::StarvePredictions) {
-            Err(CacheError::Full)
-        } else {
-            kept
-        };
-        match kept {
-            Ok(true) => {}
-            Ok(false) | Err(CacheError::Full | CacheError::OverBudget { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        }
-    }
-    // A run of one dab (more tiles than the store keeps predictions for) takes its frames from
-    // the predictions the store keeps, and those it can keep now, which the frame's evaluation
-    // after it reuses; the rest's are listed.
-    let frames = if predicted {
-        BTreeMap::new()
-    } else {
-        unkept_frames(store, keys)?
-    };
+) -> Result<bool, CacheError> {
+    // A changed tile is brushed at its pen-down shape; the others at their positions now.
+    let unchanged: Vec<TileKey> = keys
+        .iter()
+        .filter(|key| store.pen_down_shape(key).is_none())
+        .copied()
+        .collect();
+    store.evaluate_many(&unchanged, Evaluation::Positions)?;
+    // The run's frames from the predictions the store keeps, and those it can keep now, which the
+    // frame's evaluation after it reuses; the rest's are listed.
+    let frames = unkept_frames(store, keys)?;
+    store.make_pen_down_many(keys);
+    let made = unkept_pen_down(store, keys)?;
     times.evaluate += laps.lap();
     stroke.begin_frame(store);
     let book = stroke.book().clone();
@@ -649,12 +607,16 @@ fn run_tiled(
     // A second replay at most: under the grants the first one's dabs give, which hold unless
     // the second's dabs edit other tiles.
     for _ in 0..2 {
-        let replayed = replay_run(store, stroke, imprints, keys, &frames, &plan, predicted);
+        let given = Given {
+            frames: &frames,
+            positions: &made,
+        };
+        let replayed = replay_run(store, stroke, imprints, keys, given, &plan);
         let Some(outcomes) = replayed else {
-            return Ok(None);
+            return Ok(false);
         };
         if !replay::all_done(&outcomes) {
-            return Ok(None);
+            return Ok(false);
         }
         let (grants, after, without) = Plan::of(&book, &outcomes, imprints.len());
         if replay::used(&plan, &book, &outcomes) != grants {
@@ -664,24 +626,25 @@ fn run_tiled(
         times.brush += laps.lap();
         let written = replay::written(&outcomes);
         if !written.is_empty() {
+            let first_written: Vec<TileKey> = written.iter().map(|&(key, _)| key).collect();
+            store.keep_pen_down(&first_written)?;
             // The store checks the twins before it writes anything; none should disagree (see
             // "Tile by tile" in the module notes), and a run that broke them is applied one dab
             // at a time.
             match store.replace_corrections(&written) {
                 Ok(()) => {}
-                Err(CacheError::TwinsDisagree { .. }) => return Ok(None),
+                Err(CacheError::TwinsDisagree { .. }) => return Ok(false),
                 Err(e) => return Err(e),
             }
         }
-        let reached = commit_run(store, stroke, outcomes, after, without, frame)?;
+        commit_run(store, stroke, outcomes, after, without, frame)?;
         times.edit += laps.lap();
-        return Ok(Some(reached));
+        return Ok(true);
     }
-    Ok(None)
+    Ok(false)
 }
 
-/// The frames of the tiles of `keys` whose predictions the store doesn't keep, for a run of one
-/// dab.
+/// The frames of the tiles of `keys` whose predictions the store doesn't keep, for a run.
 ///
 /// None if the store can keep their predictions now ([`TileStore::keep_predictions_of`]), else a
 /// copy of each ([`TileStore::frames_many`]).
@@ -702,7 +665,14 @@ fn unkept_frames(
     if missing.is_empty() {
         return Ok(BTreeMap::new());
     }
-    match store.keep_predictions_of(&missing) {
+    let kept = store.keep_predictions_of(&missing);
+    #[cfg(test)]
+    let kept = if replay::injected(store.id(), replay::Fault::StarvePredictions) {
+        Err(CacheError::Full)
+    } else {
+        kept
+    };
+    match kept {
         Ok(true) => return Ok(BTreeMap::new()),
         Ok(false) | Err(CacheError::Full | CacheError::OverBudget { .. }) => {}
         Err(e) => return Err(e),
@@ -711,21 +681,45 @@ fn unkept_frames(
     Ok(missing.into_iter().zip(copies).collect())
 }
 
+/// The pen-down positions of the changed tiles of `keys` the store has neither a prediction nor
+/// positions made of.
+///
+/// Made on this thread ([`TileStore::pen_down_positions`]): a run's workers make the others' from
+/// the kept predictions.
+///
+/// # Errors
+///
+/// As [`TileStore::pen_down_positions`].
+fn unkept_pen_down(
+    store: &mut TileStore,
+    keys: &[TileKey],
+) -> Result<BTreeMap<TileKey, Vec<Vec3>>, CacheError> {
+    let unkept: Vec<TileKey> = keys
+        .iter()
+        .filter(|key| store.pen_down_shape(key).is_some())
+        .filter(|key| store.kept_prediction(key).is_none() && store.made_pen_down(key).is_none())
+        .copied()
+        .collect();
+    unkept
+        .into_iter()
+        .map(|key| Ok((key, store.pen_down_positions(key)?.to_vec())))
+        .collect()
+}
+
 /// Each tile of `keys` replayed over the run's dabs `imprints` under `plan`, on the store's
 /// workers, in key order.
 ///
-/// `None` if a tile's positions, corrections or (when `predicted`) prediction aren't cached. A
-/// tile without a kept prediction takes its frames from `frames`.
+/// `None` if a tile's pen-down positions or corrections aren't at hand, or it has neither a kept
+/// prediction nor frames `given`.
 fn replay_run(
     store: &TileStore,
     stroke: &Stroke,
     imprints: &[Imprint],
     keys: &[TileKey],
-    frames: &BTreeMap<TileKey, Vec<geom::Frame>>,
+    given: Given<'_>,
     plan: &Plan,
-    predicted: bool,
 ) -> Option<Vec<TileOutcome>> {
-    let inputs = replay::inputs(store, keys, predicted, frames)?;
+    let inputs = replay::inputs(store, keys, given)?;
     let run = Run {
         imprints,
         plan,
@@ -737,8 +731,7 @@ fn replay_run(
     Some(store.par_map(&inputs, |&input| replay::replay_tile(run, input)))
 }
 
-/// Takes a run's `outcomes` (in key order), its tiles written, as done, and returns the tiles it
-/// reached, in key order.
+/// Takes a run's `outcomes` (in key order), its tiles written, as done.
 ///
 /// The stroke's state, its book `after` the run's dabs; the display tiles' bounds; and what the
 /// frame has done.
@@ -753,7 +746,7 @@ fn commit_run(
     after: Book,
     without: usize,
     frame: &mut Frame,
-) -> Result<Vec<TileKey>, CacheError> {
+) -> Result<(), CacheError> {
     let reached: Vec<TileKey> = outcomes
         .iter()
         .filter(|outcome| outcome.reached)
@@ -775,7 +768,7 @@ fn commit_run(
     if store.display_finest().is_some() && displacement > 0.0 {
         store.bump_display_error(&reached, displacement)?;
     }
-    Ok(reached)
+    Ok(())
 }
 
 /// The farthest a run's dabs moved a finest vertex, summed over its dabs.
@@ -802,66 +795,27 @@ fn run_displacement(outcomes: &[TileOutcome]) -> f32 {
         )
 }
 
-impl Frame {
-    /// The tiles `imprint` is brushed over, in key order (see "The frame's tiles" in the module
-    /// notes): those of `query`, its tiles by their boxes as the frame found them, that the frame
-    /// hasn't reached, and those it has reached whose boxes now touch its sphere.
-    fn tiles_for(&self, imprint: &Imprint, query: &[TileKey]) -> Vec<TileKey> {
-        let centre = centre(imprint);
-        let radius_squared = imprint.radius * imprint.radius;
-        let unmoved = query.iter().filter(|key| !self.reached.contains(key));
-        let moved = self.boxes.iter().filter_map(|(key, aabb)| {
-            aabb.filter(|aabb| aabb.distance_squared(centre) <= radius_squared)
-                .map(|_| key)
-        });
-        let keys: BTreeSet<TileKey> = unmoved.chain(moved).copied().collect();
-        keys.into_iter().collect()
-    }
-
-    /// The next run of the frame's dabs from dab `first`, and its tiles, in key order (see
-    /// "Tile by tile" in the module notes): `first` and the dabs after it while the run's tiles
-    /// number at most `kept`, the predictions the store keeps, so each of them can have its
-    /// own. Each dab's tiles are [`Frame::tiles_for`]'s. Returns the end of the run (the dab
-    /// after its last) and its tiles; a run of one dab may have more tiles than that, as its
-    /// tiles need no prediction.
-    fn next_run(
-        &self,
-        kept: usize,
-        imprints: &[Imprint],
-        queries: &[Vec<TileKey>],
-        first: usize,
-    ) -> (usize, Vec<TileKey>) {
-        let tiles_of = |k: usize| {
-            let imprint = imprints.get(k)?;
-            let query = queries.get(k)?;
-            Some(self.tiles_for(imprint, query))
-        };
-        let mut keys: BTreeSet<TileKey> = tiles_of(first).unwrap_or_default().into_iter().collect();
-        let mut end = first + 1;
-        while let Some(more) = tiles_of(end) {
-            let grown: BTreeSet<TileKey> = keys.iter().chain(&more).copied().collect();
-            if grown.len() > kept {
-                break;
-            }
-            keys = grown;
-            end += 1;
+/// The next run of the frame's dabs from dab `first`, and its tiles, in key order.
+///
+/// See "Tile by tile" in the module notes: `first` and the dabs after it while the run's tiles
+/// number at most `kept`, the predictions the store keeps, so each of them can have its own. Each
+/// dab's tiles are its query's, `queries[k]`. Returns the end of the run (the dab after its last)
+/// and its tiles; a run of one dab may have more tiles than that.
+fn next_run(kept: usize, queries: &[Vec<TileKey>], first: usize) -> (usize, Vec<TileKey>) {
+    let tiles_of = |k: usize| queries.get(k);
+    let mut keys: BTreeSet<TileKey> = tiles_of(first)
+        .map(|query| query.iter().copied().collect())
+        .unwrap_or_default();
+    let mut end = first + 1;
+    while let Some(more) = tiles_of(end) {
+        let grown: BTreeSet<TileKey> = keys.iter().chain(more).copied().collect();
+        if grown.len() > kept {
+            break;
         }
-        (end, keys.into_iter().collect())
+        keys = grown;
+        end += 1;
     }
-
-    /// Takes again the boxes of `moved`, tiles just made current, from their cached positions,
-    /// on the store's workers.
-    fn rebox(&mut self, store: &TileStore, moved: &[TileKey]) {
-        let cached: Vec<Option<&[Vec3]>> = moved
-            .iter()
-            .map(|key| store.cached_positions(key))
-            .collect();
-        let boxes: Vec<Option<Aabb>> = store.par_map(&cached, |positions| {
-            positions.and_then(|positions| Aabb::from_points(positions.iter().copied()))
-        });
-        let fresh = moved.iter().copied().zip(boxes);
-        self.boxes.extend(fresh);
-    }
+    (end, keys.into_iter().collect())
 }
 
 /// Steps 4 to 6 of the module notes for the tiles `reached`.
@@ -962,14 +916,13 @@ impl Laps {
 
 /// A dab's brush phase, the draw action for `imprint` over every tile of `keys`.
 ///
-/// It runs over the tiles' evaluated positions (pinned, so cached; in key order), and keeps
-/// the deltas of the vertices each tile owns (see [`geom::Topology::owns`]).
+/// It runs over the tiles' pen-down positions (in key order), and keeps the deltas of the
+/// vertices each tile owns (see [`geom::Topology::owns`]).
 ///
-/// Each tile is made current first, in order, as [`TileStore::evaluate`] makes it (a lookup,
-/// as it is pinned and the tiles the previous dab moved were evaluated again together); then the
-/// tiles are brushed on the store's workers ([`TileStore::par_map`]) from their cached
-/// positions, each on its own, and gathered in key order. A tile whose positions aren't cached
-/// is brushed on its own afterwards.
+/// Each tile the stroke hasn't changed is made current first, in order, as [`TileStore::evaluate`]
+/// makes it (a lookup, as it is pinned); then the tiles are brushed on the store's workers
+/// ([`TileStore::par_map`]), each on its own, a changed tile's positions made there, and gathered
+/// in key order. A tile whose positions aren't cached is brushed on its own afterwards.
 ///
 /// # Errors
 ///
@@ -980,8 +933,12 @@ fn run_brush(
     imprint: &Imprint,
 ) -> Result<BrushOutput, CacheError> {
     for &key in keys {
-        store.evaluate(key)?;
+        if store.pen_down_shape(&key).is_none() {
+            store.evaluate(key)?;
+        }
     }
+    // The changed tiles' pen-down positions, made on the workers and kept for the next dabs.
+    store.make_pen_down_many(keys);
     // A tile the store keeps no prediction for, whose parents are current (a tile the stroke
     // enters, or is about to: its box touches the sphere), is predicted on the workers in the
     // same pass as the brushing, a task of its own, and kept: the edit writes each vertex's delta
@@ -998,13 +955,15 @@ fn run_brush(
             unkept.filter_map(|key| Some(Task::Predict(*key, cache.parent_slots(key)?)));
         let brushing = keys
             .iter()
-            .map(|key| Task::Brush(*key, cache.cached_positions(key)));
+            .map(|key| Task::Brush(*key, PenDownTile::of(cache, key)));
         // The predictions first: each is a few brushes' work, so the workers start on them.
         let tasks: Vec<Task<'_>> = predicting.chain(brushing).collect();
         let done = cache.par_map(&tasks, |task| match task {
             Task::Predict(key, parents) => Done::Predicted(*key, predictor.predict(key, parents)),
-            Task::Brush(key, positions) => Done::Brushed(
-                positions.map(|positions| brush_tile(topology, *key, positions, imprint)),
+            Task::Brush(key, pen_down) => Done::Brushed(
+                pen_down
+                    .positions()
+                    .map(|positions| brush_tile(topology, *key, &positions, imprint)),
             ),
         });
         let mut brushed = Vec::with_capacity(keys.len());
@@ -1048,8 +1007,62 @@ fn run_brush(
 enum Task<'a> {
     /// Predict a tile the store keeps no prediction for, from its parents' slots.
     Predict(TileKey, ParentSlots),
-    /// Brush a tile: its key and its positions, if cached.
-    Brush(TileKey, Option<&'a [Vec3]>),
+    /// Brush a tile at its pen-down positions.
+    Brush(TileKey, PenDownTile<'a>),
+}
+
+/// What a run is given beside the store for the tiles whose predictions it doesn't keep.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Given<'a> {
+    /// Their frames.
+    pub(crate) frames: &'a BTreeMap<TileKey, Vec<geom::Frame>>,
+    /// The pen-down positions of those the stroke changed.
+    pub(crate) positions: &'a BTreeMap<TileKey, Vec<Vec3>>,
+}
+
+/// A tile's pen-down positions as work on the store's workers reads them: a changed tile's shape
+/// with its kept prediction, made into positions there, or another tile's cached positions.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PenDownTile<'a> {
+    /// A tile the stroke changed: the pen-down shape the store keeps of it, and the prediction
+    /// the store keeps of it, if it keeps one.
+    Kept(&'a PenDownShape, Option<&'a Prediction>),
+    /// Its positions, if at hand: as the store evaluates a tile the stroke hasn't changed (if
+    /// cached), or made already for a changed one.
+    Positions(Option<&'a [Vec3]>),
+}
+
+impl<'a> PenDownTile<'a> {
+    /// Tile `key` at pen-down, as `store` has it now: a changed tile's positions if the store
+    /// keeps them made ([`TileStore::made_pen_down`]), else its shape.
+    pub(crate) fn of(store: &'a TileStore, key: &TileKey) -> Self {
+        match store.pen_down_shape(key) {
+            Some(shape) => store.made_pen_down(key).map_or_else(
+                || Self::Kept(shape, store.kept_prediction(key)),
+                |made| Self::Positions(Some(made)),
+            ),
+            None => Self::Positions(store.cached_positions(key)),
+        }
+    }
+
+    /// Whether [`PenDownTile::positions`] gives the positions: the prediction of a changed tile,
+    /// or the positions of another, at hand.
+    pub(crate) const fn at_hand(self) -> bool {
+        matches!(self, Self::Kept(_, Some(_)) | Self::Positions(Some(_)))
+    }
+
+    /// The tile's pen-down positions, row-major: made from its shape and prediction
+    /// ([`PenDownShape::positions`]), or borrowed from the cache; `None` for a changed tile whose
+    /// prediction isn't kept, or another not cached: the caller reads those on its own
+    /// ([`TileStore::pen_down_positions`]).
+    pub(crate) fn positions(self) -> Option<Cow<'a, [Vec3]>> {
+        match self {
+            Self::Kept(shape, prediction) => {
+                prediction.map(|prediction| Cow::Owned(shape.positions(prediction)))
+            }
+            Self::Positions(positions) => positions.map(Cow::Borrowed),
+        }
+    }
 }
 
 /// What a [`Task`] gave.
@@ -1060,12 +1073,11 @@ enum Done {
     Brushed(Option<TileBrush>),
 }
 
-/// What the brush does to `key`, a tile a later tile's evaluation pushed out of the cache
-/// before the workers could brush it: evaluated again, then brushed here.
+/// What the brush does to `key`, a tile the workers couldn't brush.
 ///
-/// The positions are read back shared ([`TileStore::cached_positions`]) beside the mesh, not
-/// copied out of the evaluation's mutable borrow. They are current right after the evaluation,
-/// so the copy below it is a fallback that keeps the result right should that ever change.
+/// A later tile's evaluation pushed its positions out of the cache, or (a changed tile) the store
+/// keeps no prediction to make its pen-down positions from: they are read again
+/// ([`TileStore::pen_down_positions`]), then brushed here.
 ///
 /// # Errors
 ///
@@ -1075,11 +1087,7 @@ pub(crate) fn brush_evicted(
     key: TileKey,
     imprint: &Imprint,
 ) -> Result<TileBrush, CacheError> {
-    store.evaluate(key)?;
-    if let Some(positions) = store.cached_positions(&key) {
-        return Ok(brush_tile(store.mesh().topology(), key, positions, imprint));
-    }
-    let positions = store.evaluate(key)?.to_vec();
+    let positions = store.pen_down_positions(key)?.to_vec();
     Ok(brush_tile(
         store.mesh().topology(),
         key,
@@ -1100,7 +1108,7 @@ pub(crate) struct TileBrush {
     pub(crate) moved: usize,
 }
 
-/// Runs the draw action for `imprint` over `positions`, tile `key`'s evaluated positions, and
+/// Runs the draw action for `imprint` over `positions`, tile `key`'s pen-down positions, and
 /// keeps the deltas of the vertices the tile owns (see [`geom::Topology::owns`]).
 pub(crate) fn brush_tile(
     topology: &geom::Topology,

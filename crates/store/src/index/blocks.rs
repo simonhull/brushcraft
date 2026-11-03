@@ -680,7 +680,7 @@ impl TileBlocks {
 
     /// The bytes the blocks and their groups take, the vectors' spare capacity included.
     #[cfg(test)]
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         size_of::<Self>() + (self.blocks.capacity() + self.groups.capacity()) * size_of::<Block>()
     }
 

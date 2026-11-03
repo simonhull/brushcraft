@@ -704,7 +704,7 @@ fn area_sum_facing(
     keys.sort_unstable();
     let mut sum = DVec3::ZERO;
     for key in keys {
-        let positions = store.surface_positions(key).unwrap().to_vec();
+        let positions = store.pen_down_positions(key).unwrap().to_vec();
         let side = key.side();
         let at = |i: u32, j: u32| positions[usize::try_from(j * side + i).unwrap()];
         let mut part = DVec3::ZERO;
@@ -832,3 +832,5 @@ fn a_dab_on_a_slab_thinner_than_it_takes_the_normal_of_its_own_face() {
         );
     }
 }
+
+mod hard_stroke;

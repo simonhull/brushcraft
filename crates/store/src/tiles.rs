@@ -145,6 +145,7 @@ mod frames;
 mod hooks;
 mod layers;
 mod page;
+mod pen_down;
 mod persist;
 mod pins;
 mod preview;
@@ -163,6 +164,7 @@ pub use edit::TileEdit;
 pub use error::{CacheError, Invariant};
 pub use frames::{ParentSlots, Predictor};
 pub(crate) use layers::{Saved, Snapshot};
+pub use pen_down::PenDownShape;
 pub use pins::PinGuard;
 pub use read::WaveBounds;
 
@@ -447,6 +449,8 @@ pub struct TileStore {
     /// The previews: finest tiles a renderer shows ahead of their evaluation, never saved (see
     /// the `preview` module).
     previews: preview::Previews,
+    /// The pen-down shapes of the tiles the current stroke changed (see the `pen_down` module).
+    pen_down: pen_down::PenDown,
     /// The jobs queued (see [`crate::jobs`]), run in slices by [`TileStore::run_jobs`].
     jobs: std::collections::VecDeque<crate::jobs::Job>,
     /// The queued evaluation (see [`crate::queued`]): finest tiles wanted by priority, run in
