@@ -38,7 +38,18 @@
 //! [`MADE_TILES`] changed tiles read last are kept made, each with its raycast blocks once built,
 //! the least recently read going first. Reads through `&self` (the brush's workers,
 //! [`TileStore::made_pen_down`]) find them there but don't count as reads; a brush has the store
-//! make its tiles' first ([`TileStore::make_pen_down_many`]).
+//! make its tiles' first ([`TileStore::make_pen_down_many`]), or makes them on the workers that
+//! read them ([`TileStore::pen_down_maker`]) and has the store keep them after
+//! ([`TileStore::keep_brush_pen_down`]).
+//!
+//! # Shapes taken on the workers
+//!
+//! A brush's workers read a tile the stroke hasn't changed from the store's cache, and can take
+//! its pen-down shape there ([`TileStore::pen_down_taker`]), for the store to keep before the
+//! stroke's first write ([`TileStore::keep_pen_down_taken`]): the shapes of a dab's new tiles made
+//! beside their brushing, not one by one after it. A taken shape names the store and its count of
+//! writes when it was taken, and is kept only while they are the same, so it is the shape
+//! [`TileStore::keep_pen_down`] makes.
 //!
 //! # The budget
 //!
@@ -69,12 +80,12 @@ use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{
-    BaseMesh, Channel, CorrectionTile, FaceId, GatheredBlock, LayerId, Level, PositionSource,
-    Prediction, Region, TileKey, Vec3, gather_block,
+    BaseMesh, Channel, CorrectionTile, CorrectionView, FaceId, GatheredBlock, LayerId, Level,
+    PositionSource, Prediction, Region, TileKey, Vec3, gather_block,
 };
 
-use super::TileStore;
 use super::error::{CacheError, Invariant};
+use super::{StoreId, TileStore};
 use crate::Aabb;
 use crate::index::TileBlocks;
 use crate::tiles::config::Evaluation;
@@ -109,8 +120,7 @@ impl PenDownShape {
         let view = self.corrections.view();
         prediction
             .apply(|i, j| view.get(i, j).unwrap_or(Vec3::ZERO))
-            .as_slice()
-            .to_vec()
+            .into_vec()
     }
 
     /// The box of the tile's finite positions at pen-down; `None` for a tile of none.
@@ -128,6 +138,126 @@ impl PenDownShape {
         size_of::<Self>()
             + inner * inner * size_of::<[i16; 3]>()
             + 4 * side.saturating_sub(1) * size_of::<Vec3>()
+    }
+}
+
+/// What a worker needs to make a changed tile's pen-down positions ([`TileStore::pen_down_maker`]).
+///
+/// Its pen-down shape and the prediction the store keeps of it, neither of which changes while the
+/// stroke lasts.
+#[derive(Debug, Clone, Copy)]
+pub struct PenDownMaker<'a> {
+    /// The tile.
+    key: TileKey,
+    /// Its pen-down shape.
+    shape: &'a PenDownShape,
+    /// The prediction the store keeps of it.
+    prediction: &'a Prediction,
+}
+
+impl PenDownMaker<'_> {
+    /// The tile's pen-down positions, made ([`PenDownShape::positions`]): for the worker to read,
+    /// and the store to keep after ([`TileStore::keep_brush_pen_down`]).
+    #[must_use]
+    pub fn make(&self) -> MadePenDown {
+        MadePenDown {
+            key: self.key,
+            positions: self.shape.positions(self.prediction),
+        }
+    }
+}
+
+/// A changed tile's pen-down positions made on a worker ([`PenDownMaker::make`]).
+///
+/// Only the store's [`PenDownMaker`] makes one, from the tile's pen-down shape and its kept
+/// prediction: so the positions are the tile's pen-down positions for as long as the stroke keeps
+/// its shape.
+#[derive(Debug)]
+pub struct MadePenDown {
+    /// The tile.
+    key: TileKey,
+    /// Its pen-down positions, row-major.
+    positions: Vec<Vec3>,
+}
+
+impl MadePenDown {
+    /// The tile whose positions these are.
+    #[must_use]
+    pub const fn key(&self) -> TileKey {
+        self.key
+    }
+
+    /// The tile's pen-down positions, row-major.
+    #[must_use]
+    pub fn positions(&self) -> &[Vec3] {
+        &self.positions
+    }
+}
+
+/// What a worker needs to read a tile the stroke hasn't changed and take its pen-down shape: its
+/// positions and corrections as the store has them cached ([`TileStore::pen_down_taker`]).
+#[derive(Debug, Clone, Copy)]
+pub struct PenDownTaker<'a> {
+    /// The tile.
+    key: TileKey,
+    /// Its positions as the store evaluates them: its pen-down positions.
+    positions: &'a [Vec3],
+    /// Its corrections.
+    corrections: CorrectionView<'a>,
+    /// The store they were read from.
+    store: StoreId,
+    /// That store's count of writes ([`TileStore::edits`]) when they were read.
+    edits: u64,
+}
+
+impl<'a> PenDownTaker<'a> {
+    /// The tile's positions as the store evaluates them, row-major: its pen-down positions, as the
+    /// stroke hasn't changed it.
+    #[must_use]
+    pub const fn positions(&self) -> &'a [Vec3] {
+        self.positions
+    }
+
+    /// The tile's pen-down shape, from its positions and corrections, for
+    /// [`TileStore::keep_pen_down_taken`] to keep.
+    #[must_use]
+    pub fn take(&self) -> TakenShape {
+        let PositionsBox(bounds) = PositionsBox::of(self.positions);
+        TakenShape {
+            key: self.key,
+            shape: PenDownShape {
+                corrections: self.corrections.to_tile(),
+                bounds,
+            },
+            store: self.store,
+            edits: self.edits,
+        }
+    }
+}
+
+/// A tile's pen-down shape taken on a worker ([`PenDownTaker::take`]), for
+/// [`TileStore::keep_pen_down_taken`] to keep.
+///
+/// It names the store it was taken from and that store's count of writes then, and is kept only
+/// while they are the same: so it is the shape [`TileStore::keep_pen_down`] would make, bit for
+/// bit.
+#[derive(Debug)]
+pub struct TakenShape {
+    /// The tile.
+    key: TileKey,
+    /// Its shape as the store had it.
+    shape: PenDownShape,
+    /// The store it was taken from.
+    store: StoreId,
+    /// That store's count of writes ([`TileStore::edits`]) when it was taken.
+    edits: u64,
+}
+
+impl TakenShape {
+    /// The tile whose shape this is.
+    #[must_use]
+    pub const fn key(&self) -> TileKey {
+        self.key
     }
 }
 
@@ -247,6 +377,51 @@ impl TileStore {
         outcome
     }
 
+    /// Keeps the pen-down shape of each of `keys` the current stroke hasn't kept yet, as
+    /// [`TileStore::keep_pen_down`] does, taking those of `taken` that are still the store's as it
+    /// is (no write since they were taken) instead of making them again: the same shapes, made on
+    /// the workers that read the tiles before. A shape of `taken` for a tile not of `keys`, or one
+    /// kept already, is dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`TileStore::keep_pen_down`].
+    pub fn keep_pen_down_taken(
+        &mut self,
+        keys: &[TileKey],
+        taken: impl IntoIterator<Item = TakenShape>,
+    ) -> Result<(), CacheError> {
+        let (store, edits) = (self.id(), self.edits());
+        let fresh = taken
+            .into_iter()
+            .filter(|taken| taken.store == store && taken.edits == edits);
+        for TakenShape { key, shape, .. } in fresh {
+            if keys.contains(&key) && !self.pen_down.shapes.contains_key(&key) {
+                self.pen_down.bytes += shape.bytes() + ENTRY_BYTES;
+                self.pen_down.shapes.insert(key, shape);
+            }
+        }
+        self.keep_pen_down(keys)
+    }
+
+    /// What a worker needs to read tile `key` and take its pen-down shape
+    /// ([`PenDownTaker::take`]), if the current stroke hasn't kept one for it and its positions and
+    /// corrections are cached: for [`TileStore::keep_pen_down_taken`] to keep before the stroke's
+    /// first write to it.
+    #[must_use]
+    pub fn pen_down_taker(&self, key: &TileKey) -> Option<PenDownTaker<'_>> {
+        if self.pen_down.shapes.contains_key(key) {
+            return None;
+        }
+        Some(PenDownTaker {
+            key: *key,
+            positions: self.cached_positions(key)?,
+            corrections: self.cached_correction(key)?,
+            store: self.id(),
+            edits: self.edits(),
+        })
+    }
+
     /// Tile `key`'s shape as it is now, `bounds` its positions' box if at hand (else taken from
     /// its evaluation).
     ///
@@ -360,29 +535,56 @@ impl TileStore {
     /// (a big brush's dab reaches over a thousand tiles), the next dab over the same tiles finds
     /// them made. Their bytes are counted with the pen-down data.
     pub fn make_pen_down_many(&mut self, keys: &[TileKey]) {
+        self.keep_brush_pen_down(keys, []);
+        let todo: Vec<PenDownMaker<'_>> = keys
+            .iter()
+            .filter_map(|key| self.pen_down_maker(key))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        let made: Vec<MadePenDown> = self.par_map(&todo, PenDownMaker::make);
+        self.keep_brush_pen_down(keys, made);
+    }
+
+    /// What a worker needs to make changed tile `key`'s pen-down positions
+    /// ([`PenDownMaker::make`]), for the store to keep after ([`TileStore::keep_brush_pen_down`]):
+    /// `None` for a tile the stroke hasn't changed, one whose positions are kept made already
+    /// ([`TileStore::made_pen_down`]), or one whose prediction isn't kept.
+    #[must_use]
+    pub fn pen_down_maker(&self, key: &TileKey) -> Option<PenDownMaker<'_>> {
+        if self.made_pen_down(key).is_some() {
+            return None;
+        }
+        Some(PenDownMaker {
+            key: *key,
+            shape: self.pen_down.shapes.get(key)?,
+            prediction: self.kept.get(key)?,
+        })
+    }
+
+    /// Sets the brush's working set to the changed tiles of `keys`, its dab's or run's tiles, as
+    /// [`TileStore::make_pen_down_many`] does, keeping `made` (made on the workers that brushed
+    /// them, [`PenDownMaker::make`]): those of `keys` held already stay, the others go, and
+    /// each of `made` of a tile of `keys` without positions kept made is kept. Their bytes are
+    /// counted with the pen-down data.
+    pub fn keep_brush_pen_down(
+        &mut self,
+        keys: &[TileKey],
+        made: impl IntoIterator<Item = MadePenDown>,
+    ) {
         let wanted: BTreeSet<TileKey> = keys
             .iter()
             .filter(|key| self.pen_down.shapes.contains_key(key))
             .copied()
             .collect();
-        self.pen_down.brush.retain(|key, _| wanted.contains(key));
-        let todo: Vec<(TileKey, &PenDownShape, &Prediction)> = wanted
-            .iter()
-            .filter(|key| {
-                !self.pen_down.brush.contains_key(key) && !self.pen_down.made.contains_key(key)
-            })
-            .filter_map(|key| {
-                let shape = self.pen_down.shapes.get(key)?;
-                Some((*key, shape, self.kept.get(key)?))
-            })
-            .collect();
-        if todo.is_empty() {
-            return;
+        let pen_down = &mut self.pen_down;
+        pen_down.brush.retain(|key, _| wanted.contains(key));
+        for MadePenDown { key, positions } in made {
+            if wanted.contains(&key) && !pen_down.made.contains_key(&key) {
+                pen_down.brush.entry(key).or_insert(positions);
+            }
         }
-        let made: Vec<(TileKey, Vec<Vec3>)> = self.par_map(&todo, |&(key, shape, prediction)| {
-            (key, shape.positions(prediction))
-        });
-        self.pen_down.brush.extend(made);
     }
 
     /// Keeps `positions`, changed tile `key`'s pen-down positions made, as read at `read`, the

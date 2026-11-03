@@ -519,3 +519,136 @@ fn a_stroke_s_pen_down_data_never_makes_a_frame_s_pins_fail() {
     store.release_pen_down();
     assert_eq!(store.pen_down_beyond_budget(), 0);
 }
+
+#[test]
+fn shapes_taken_on_workers_are_those_kept_from_the_store_while_nothing_was_written_since() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let centre = (124, 100);
+    let reached = tiles_pushed(centre, 3);
+    // Two stores over the same mesh: one keeps its shapes itself, the other takes them.
+    let mut kept = store_over(&dir, &mesh);
+    let other = TestDir::new();
+    let mut taking = store_over(&other, &mesh);
+    for store in [&mut kept, &mut taking] {
+        store.begin_op().expect("an op");
+        push_out(store, centre, 2, 0.02);
+        store
+            .evaluate_many(&reached, Evaluation::Positions)
+            .expect("evaluates");
+    }
+    kept.keep_pen_down(&reached).expect("kept");
+    let takers: Vec<PenDownTaker<'_>> = reached
+        .iter()
+        .map(|key| taking.pen_down_taker(key).expect("cached, not kept yet"))
+        .collect();
+    for (key, taker) in reached.iter().zip(&takers) {
+        assert_eq!(
+            bits(taker.positions()),
+            bits(kept.pen_down_positions(*key).expect("reads")),
+            "{key:?}: a taker reads the tile's positions at pen-down"
+        );
+    }
+    let taken: Vec<TakenShape> = taking.par_map(&takers, PenDownTaker::take);
+    // One tile's shape only, as a dab would have taken: the others are made by the store.
+    let (first, rest) = reached.split_first().expect("tiles");
+    let one: Vec<TakenShape> = taken.into_iter().filter(|t| t.key() == *first).collect();
+    taking.keep_pen_down_taken(&reached, one).expect("kept");
+    for key in &reached {
+        assert_eq!(
+            taking.pen_down_shape(key),
+            kept.pen_down_shape(key),
+            "{key:?}: the shape keep_pen_down makes"
+        );
+    }
+    assert_eq!(taking.pen_down.bytes, kept.pen_down.bytes, "counted alike");
+    assert!(
+        taking.pen_down_taker(first).is_none(),
+        "kept now: none to take"
+    );
+    assert!(
+        rest.iter().all(|key| taking.pen_down_shape(key).is_some()),
+        "the others made by the store"
+    );
+
+    // A shape taken before a write is stale: the store makes the tile's shape as it is now.
+    let late = tile_at(10, 200).0;
+    taking.evaluate(late).expect("evaluates");
+    let stale = taking.pen_down_taker(&late).expect("cached").take();
+    push_out(&mut taking, (10, 200), 2, 0.05);
+    taking.evaluate(late).expect("evaluates");
+    let now = taking.pen_down_taker(&late).expect("cached").take();
+    taking.keep_pen_down_taken(&[late], [stale]).expect("kept");
+    assert_eq!(
+        taking.pen_down_shape(&late),
+        Some(&now.shape),
+        "the shape after the write, not the stale one"
+    );
+    // A taken shape of a tile not asked for isn't kept.
+    let elsewhere = tile_at(200, 10).0;
+    taking.evaluate(elsewhere).expect("evaluates");
+    let unasked = taking.pen_down_taker(&elsewhere).expect("cached").take();
+    taking.keep_pen_down_taken(&[], [unasked]).expect("kept");
+    assert!(
+        taking.pen_down_shape(&elsewhere).is_none(),
+        "not of the keys"
+    );
+}
+
+#[test]
+fn positions_made_on_workers_are_kept_as_the_brush_s_and_go_with_its_tiles() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = store_over(&dir, &mesh);
+    let centre = (124, 100);
+    let reached = tiles_pushed(centre, 3);
+    store.begin_op().expect("an op");
+    let pins = store.pin(&reached).expect("pinned");
+    let at_pen_down: Vec<Vec<Vec3>> = reached
+        .iter()
+        .map(|key| store.evaluate(*key).expect("evaluates").to_vec())
+        .collect();
+    store.keep_pen_down(&reached).expect("kept");
+    assert!(
+        store.keep_predictions_of(&reached).expect("kept"),
+        "all kept"
+    );
+    push_out(&mut store, centre, 3, 0.05);
+    let makers: Vec<PenDownMaker<'_>> = reached
+        .iter()
+        .map(|key| {
+            store
+                .pen_down_maker(key)
+                .expect("a changed tile, its prediction kept")
+        })
+        .collect();
+    let made: Vec<MadePenDown> = store.par_map(&makers, PenDownMaker::make);
+    for ((key, one), before) in reached.iter().zip(&made).zip(&at_pen_down) {
+        assert_eq!(one.key(), *key);
+        assert_eq!(bits(one.positions()), bits(before), "{key:?}: at pen-down");
+    }
+    store.keep_brush_pen_down(&reached, made);
+    for (key, before) in reached.iter().zip(&at_pen_down) {
+        assert_eq!(bits(store.made_pen_down(key).expect("kept")), bits(before));
+        assert!(store.pen_down_maker(key).is_none(), "{key:?}: made already");
+    }
+    assert_eq!(
+        store.pen_down_bytes(),
+        store.pen_down.bytes + reached.len() * GRID_BYTES,
+        "counted"
+    );
+    // The next dab's tiles: the others' go, and what is made of a tile not among them isn't kept.
+    let (first, rest) = reached.split_first().expect("tiles");
+    let again = store.pen_down_maker(first).map(|maker| maker.make());
+    assert!(again.is_none(), "made already");
+    store.keep_brush_pen_down(rest, []);
+    assert!(store.made_pen_down(first).is_none(), "gone with its dab");
+    let outside = store.pen_down_maker(first).expect("not made now").make();
+    store.keep_brush_pen_down(rest, [outside]);
+    assert!(
+        store.made_pen_down(first).is_none(),
+        "not of the dab's tiles"
+    );
+    assert_eq!(store.pen_down.brush.len(), rest.len());
+    drop(pins);
+}
