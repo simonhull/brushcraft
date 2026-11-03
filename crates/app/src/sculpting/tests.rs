@@ -947,3 +947,80 @@ fn f_is_the_dab_one_frames_time_fits_by_the_cost_model() {
     assert!(!fits(limit + 1), "one tile more doesn't");
     assert_eq!(LIMIT_TILES, 65, "the derivation in LIMIT_TILES' notes");
 }
+
+/// A camera on a unit sphere's boundary, its image magnified about `pivot`'s pixel at least
+/// `factor` times.
+fn magnified_about(pivot: crate::camera::Vec3, factor: f64) -> Camera {
+    let mut camera = Camera::default();
+    let boundary = crate::camera::Boundary::around(crate::camera::Vec3::default(), 1.0);
+    camera.grow_boundary(boundary.expect("a boundary"));
+    camera.set_pivot(pivot);
+    for _ in 0..200 {
+        if camera.magnification() >= factor {
+            return camera;
+        }
+        camera.zoom(1.0 / 1.1);
+    }
+    panic!("never magnified {factor} times");
+}
+
+#[test]
+fn the_brushs_rays_and_pixel_size_in_a_magnified_view_are_the_narrowed_views_of_the_same_image() {
+    let camera = magnified_about(crate::camera::Vec3::default(), 5.0);
+    let magnified = ViewProjector::new(&camera.view(size()).expect("a view"));
+    let eye = camera.eye();
+    let point = |v: crate::camera::Vec3| render::camera::Vec3::new(v.x, v.y, v.z);
+    let narrowed = View::look_at(
+        point(eye),
+        point(camera.target()),
+        point(camera.axis(crate::camera::Vec3::new(0.0, 1.0, 0.0))),
+        camera.magnified_fov_y(),
+        size(),
+        camera.distance() * render::camera::NEAR_FRACTION,
+    )
+    .expect("a view");
+    let narrowed = ViewProjector::new(&narrowed);
+    for (x, y) in [(160.0, 100.0), (12.5, 190.25), (301.0, 7.0)] {
+        let screen = ScreenPoint::new(x, y).expect("finite");
+        let (a, b) = (
+            magnified.ray(screen).expect("a ray"),
+            narrowed.ray(screen).expect("a ray"),
+        );
+        let gap = (a.direction() - b.direction()).length();
+        assert!(gap < 1e-12, "({x}, {y}): {gap}");
+        assert_eq!(a.origin(), b.origin());
+    }
+    for depth in [0.05, 0.4, 2.0] {
+        let (a, b) = (
+            magnified.world_per_pixel(depth),
+            narrowed.world_per_pixel(depth),
+        );
+        assert!((a / b - 1.0).abs() < 1e-12, "at {depth}: {a} {b}");
+    }
+}
+
+#[test]
+fn the_brushs_pixel_size_off_centre_in_a_magnified_view_is_its_images_pixel() {
+    let pivot = crate::camera::Vec3::new(0.45, 0.3, (1.0 - 0.45 * 0.45 - 0.3 * 0.3_f64).sqrt());
+    let camera = magnified_about(pivot, 12.0);
+    let view = camera.view(size()).expect("a view");
+    assert_ne!(view.principal(), [160.0, 100.0], "magnified off the centre");
+    let projector = ViewProjector::new(&view);
+    // A brush of 40 pixels on the screen at the pivot: the world radius the engine freezes.
+    let at = render::camera::Vec3::new(pivot.x, pivot.y, pivot.z);
+    let depth = (at - view.eye()).dot(view.forward());
+    let radius = 40.0 * projector.world_per_pixel(depth);
+    // That radius, facing the eye at the pivot, spans 40 of the magnified view's pixels.
+    let (x, y, _) = view.pixel(at).expect("in front");
+    let (ux, uy, _) = view.pixel(at + view.up() * radius).expect("in front");
+    let (rx, ry, _) = view.pixel(at + view.right() * radius).expect("in front");
+    let spans = [(ux - x).hypot(uy - y), (rx - x).hypot(ry - y)];
+    for span in spans {
+        assert!((span / 40.0 - 1.0).abs() < 0.02, "{span} pixels, not 40");
+    }
+    let unmagnified = 40.0 * depth / (view.pixels_per_unit() / camera.magnification());
+    assert!(
+        (unmagnified / radius - camera.magnification()).abs() < 1e-9,
+        "the magnification's share of it"
+    );
+}

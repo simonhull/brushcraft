@@ -2,8 +2,8 @@
 //!
 //! The ray through a pixel (the centre, the corners, a high-DPI window), picks on a small
 //! generated sphere (on the surface, the near side, a miss), the frame loop picking only when the
-//! pointer or the view changed, the overlay's line, and a pick's time; navigation about the pivot
-//! the frame loop picks under, in [`navigation`].
+//! pointer or the view changed, the overlay's line, a pick's time, and picking through a
+//! magnified view; navigation about the pivot the frame loop picks under, in [`navigation`].
 
 use std::time::{Duration, Instant};
 
@@ -438,4 +438,126 @@ fn picks_are_timed_on_a_reopened_project() {
         warm.join(" ")
     );
     project.close(false).expect("closed");
+}
+
+/// A camera on the test sphere's boundary, its image magnified about `pivot`'s pixel at least
+/// `factor` times; with the pivot on the line of sight (the origin), magnified about the centre.
+fn magnified_about(pivot: camera::Vec3, factor: f64) -> Camera {
+    let mut camera = Camera::default();
+    let boundary = camera::Boundary::around(camera::Vec3::default(), 1.0);
+    camera.grow_boundary(boundary.expect("a boundary"));
+    camera.set_pivot(pivot);
+    for _ in 0..200 {
+        if camera.magnification() >= factor {
+            return camera;
+        }
+        camera.zoom(1.0 / 1.1);
+    }
+    panic!("never magnified {factor} times");
+}
+
+/// `camera`'s view of [`size`] unmagnified: the same eye and axes, the plain field.
+fn plain(camera: &Camera) -> View {
+    let point = |v: camera::Vec3| Vec3::new(v.x, v.y, v.z);
+    View::look_at(
+        point(camera.eye()),
+        point(camera.target()),
+        point(camera.axis(camera::Vec3::new(0.0, 1.0, 0.0))),
+        camera.fov_y(),
+        size(),
+        camera.distance() * render::camera::NEAR_FRACTION,
+    )
+    .expect("a view")
+}
+
+#[test]
+fn picking_through_a_magnified_view_matches_the_narrowed_view_of_the_same_image() {
+    let dir = TestDir::new();
+    let mut project = project(&dir, false);
+    let picker = picker(&mut project);
+    let camera = magnified_about(camera::Vec3::default(), 6.0);
+    let magnified = camera.view(size()).expect("a view");
+    assert_eq!(magnified.principal(), [160.0, 100.0], "about the centre");
+    // The view of the same image: the same eye, its field narrowed by the magnification.
+    let plain = plain(&camera);
+    let narrowed = View::look_at(
+        plain.eye(),
+        plain.eye() + plain.forward(),
+        plain.up(),
+        camera.magnified_fov_y(),
+        size(),
+        plain.near(),
+    )
+    .expect("a view");
+    assert!(
+        (magnified.pixels_per_unit() / narrowed.pixels_per_unit() - 1.0).abs() < 1e-12,
+        "the same pixels"
+    );
+    for pixel in [
+        at(160.0, 100.0),
+        at(31.5, 12.25),
+        at(300.0, 180.0),
+        at(90.0, 150.0),
+    ] {
+        let (a, b) = (
+            PickRay::through(&magnified, pixel).expect("a ray"),
+            PickRay::through(&narrowed, pixel).expect("a ray"),
+        );
+        assert!(close(a.origin(), b.origin(), 1e-12), "{pixel:?}");
+        assert!(close(a.direction(), b.direction(), 1e-12), "{pixel:?}");
+        let hits = [
+            picker
+                .pick(project.store(), &magnified, pixel)
+                .expect("a pick"),
+            picker
+                .pick(project.store(), &narrowed, pixel)
+                .expect("a pick"),
+        ];
+        let [Some(seen), Some(also)] = hits else {
+            panic!("{pixel:?}: the sphere fills a magnified view: {hits:?}");
+        };
+        assert!(close(seen.position, also.position, 1e-9), "{pixel:?}");
+    }
+}
+
+#[test]
+fn picking_through_a_view_magnified_off_centre_hits_what_its_pixels_show() {
+    let dir = TestDir::new();
+    let mut project = project(&dir, false);
+    let picker = picker(&mut project);
+    let pivot = picker
+        .pick(project.store(), &view_of(size()), at(215.0, 60.0))
+        .expect("a pick")
+        .expect("the sphere is there")
+        .position;
+    let camera = magnified_about(camera::Vec3::new(pivot.x, pivot.y, pivot.z), 8.0);
+    let magnified = camera.view(size()).expect("a view");
+    let [px, py] = magnified.principal();
+    assert!((px - 160.0).abs() > 100.0, "off the centre: ({px}, {py})");
+    let unmagnified = plain(&camera);
+    let factor = camera.magnification();
+    for pixel in [at(215.0, 60.0), at(180.0, 40.0), at(250.0, 90.0)] {
+        let hit = picker
+            .pick(project.store(), &magnified, pixel)
+            .expect("a pick")
+            .expect("the sphere is under it");
+        let (x, y, _) = magnified.pixel(hit.position).expect("in front");
+        assert!(
+            (x - pixel.x).abs() < 0.01 && (y - pixel.y).abs() < 0.01,
+            "{pixel:?}: the hit shows at ({x}, {y})"
+        );
+        // The unmagnified view shows it where the magnification carries back from.
+        let back = at(
+            160.0 + (pixel.x - px) / factor,
+            100.0 + (pixel.y - py) / factor,
+        );
+        let plain_hit = picker
+            .pick(project.store(), &unmagnified, back)
+            .expect("a pick")
+            .expect("the sphere is under it");
+        assert!(
+            close(hit.position, plain_hit.position, 1e-5),
+            "{pixel:?}: {hit:?} {plain_hit:?}"
+        );
+    }
 }
