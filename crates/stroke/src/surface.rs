@@ -101,6 +101,9 @@ pub trait Projector {
 /// implementation can evaluate and cache what it reads; each must be deterministic, or a replayed
 /// stroke differs.
 ///
+/// For a stroke, it is the surface as the stroke began: its pen-down surface, whatever of the
+/// stroke's own dabs the caller has applied since (see [`Stroke`](crate::Stroke)).
+///
 /// **Errors.** The methods can't fail: an implementation that hits an error (a store read) keeps
 /// it, answers `None` or `false`, and its owner checks after each [`Stroke`](crate::Stroke) call
 /// and ends the stroke there. The engine places no dab where the surface gave no answer.

@@ -34,9 +34,15 @@ impl StrokeId {
 /// Each sample goes through the [`Path`]'s smoothing, then placement (spacing along the surface,
 /// the stroke's region, the frame and dynamics; see the `place` module's notes in the source),
 /// then the [`Symmetry`](crate::Symmetry) copies. The camera and the surface are passed to each
-/// call rather than held, so the caller can edit the surface between calls (the dabs it applies)
-/// and move the camera mid-stroke: the brush's size is frozen at the first hit, so a zoom
-/// doesn't change it.
+/// call rather than held, so the caller can apply the stroke's dabs between calls and move the
+/// camera mid-stroke: the brush's size is frozen at the first hit, so a zoom doesn't change it.
+///
+/// **The surface is the stroke's pen-down surface** (the brush-engine spec): a caller applying
+/// the stroke's dabs between calls answers every call from the surface as it was when the stroke
+/// began, never from the dabs applied since (`sculpt`'s surface does). Placing a dab on the
+/// ridge its predecessors raised made a hard stroke climb its own ridge and break into spikes;
+/// on its pen-down surface it rises as one ridge, and its dabs don't depend on how far the
+/// caller's applying has got.
 ///
 /// **Deterministic:** the same settings, id, samples, camera and surface give bit-identical
 /// dabs. That's what makes a stroke's recorded input meaningful.

@@ -26,7 +26,8 @@
 //! [`Surface::continuous`] with the last accepted point within [`REACH_RADII`] radii; a ray that
 //! misses, or hits a part that isn't continuous (across a gap, a separate part behind a
 //! silhouette, the far face of a thin slab), goes to [`Surface::closest_on_region`] instead: the
-//! point of the stroke's own surface closest to the pen's ray, near the last accepted point. Past
+//! point of the stroke's own region of the surface closest to the pen's ray, near the last
+//! accepted point. Past
 //! a silhouette the resolved points stop advancing, so no dabs pile up there, and the stroke
 //! never jumps to a separate part. Checking against the last accepted point (a chord at most a
 //! radius back) rather than the last dab keeps every link short.
