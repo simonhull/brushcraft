@@ -25,17 +25,17 @@ const LARGEST: f32 = 1024.0;
 const NARROWING: u32 = 24;
 
 /// The smallest radius about `center` whose ball holds at least `vertices` of the finest level's
-/// evaluated positions, to about an `f32` step; [`LARGEST`] if the whole model holds fewer.
+/// evaluated positions, to about an `f32` step; 1024 (`LARGEST`) if the whole model holds fewer.
 ///
 /// The count is of evaluated positions tile by tile, so a vertex on a border between tiles is
 /// counted once for each tile holding it: a few percent more than the distinct vertices, which
 /// a footprint of hundreds of thousands hardly notices. A position counts when its distance
 /// from `center` is below the radius.
 ///
-/// The search doubles the radius from [`START`] until the ball holds enough, then halves the
-/// bracket between the last radius short of it and the first enough [`NARROWING`] times, each step
-/// evaluating the tiles whose boxes touch the ball through `store` (its pool keeps them for the
-/// next). Its cost follows the footprint: the largest ball it evaluates is at most twice the
+/// The search doubles the radius from 1/1024 (`START`) until the ball holds enough, then halves the
+/// bracket between the last radius short of it and the first enough 24 times (`NARROWING`), each
+/// step evaluating the tiles whose boxes touch the ball through `store` (its pool keeps them for
+/// the next). Its cost follows the footprint: the largest ball it evaluates is at most twice the
 /// answer's radius, four times its vertices. A million-vertex footprint on the benchmark project is
 /// tens of milliseconds once its tiles are in the pool; a tool's or a scripted run's call, never a
 /// stroke's.
