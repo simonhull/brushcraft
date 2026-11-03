@@ -20,9 +20,12 @@
 //!   the store's epoch, which the frame loop drains after the brush phase and uploads in the same
 //!   frame (a step between frames: in the next).
 //! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) when it is the oldest stroke
-//!   left, so every edit of the store's current op is that stroke's: a stroke started while the
-//!   last still has dabs queued waits behind them, its dabs placed but not applied, and its op
-//!   begins once the last one's has ended.
+//!   left, so every edit of the store's current op is that stroke's.
+//! - **A stroke begins on what the last one left:** it reads its pen-down surface (the brush-engine
+//!   spec), which is the surface once every stroke before it has landed. So a pen `Down` while an
+//!   earlier stroke still has dabs to apply (its pen lifted) waits, with every event after it, and
+//!   is taken once that stroke's op has ended ([`Sculpting::admit`]): its first dab is shown no
+//!   sooner, but every dab it places is the same however fast the finest work went.
 //! - **Pen up:** [`Stroke::end`] gives the tail; once every dab of the stroke is applied, its
 //!   record ([`StrokeRecord`]: the samples the engine read, the settings' bytes, the camera at the
 //!   stroke's start, [`stroke::ENGINE_VERSION`]) ends the op ([`Project::end_stroke`]). A stroke
@@ -77,11 +80,9 @@
 //! cost model: such a dab is always shown and caught up. It is reported per frame
 //! ([`BrushReport::above_limit`]).
 //!
-//! A dab is placed on the store's surface as it is when the dab is placed: the dabs queued ahead
-//! of it haven't landed yet. Within a frame that was always so (a frame's dabs apply after all its
-//! samples are placed); queueing makes it so for longer, so a dab may be placed on a surface its
-//! predecessors have yet to raise. Placement never reads a preview: what the stroke engine sees is
-//! the store's surface alone, the same whether its predecessors were shown ahead or not.
+//! A dab is placed on the stroke's pen-down surface ([`StoreSurface`]): the surface as the stroke
+//! began, never its own dabs, whether they have landed, wait in the queue or are shown ahead. So
+//! what a stroke places doesn't depend on how far its finest work has got.
 //!
 //! # Warming under a hovering pen
 //!
@@ -600,6 +601,10 @@ pub(crate) struct Sculpting {
     /// Pen samples held over from a step with no scene (a degenerate view) while strokes were
     /// pending, in order; `None` for a stroke started elsewhere.
     held: Vec<Option<PenSample>>,
+    /// Pen events waiting for the strokes before them to end, in order, from a `Down` that came
+    /// while an earlier stroke still had dabs to apply (see "A stroke begins on what the last one
+    /// left" in the module notes); `None` for a stroke started elsewhere.
+    deferred: Vec<Option<PenSample>>,
     /// Whether the spatial index must be rebuilt: an `apply_dabs` failed, and its rebuild hasn't
     /// succeeded yet.
     index_stale: bool,
@@ -636,6 +641,7 @@ impl Sculpting {
             epoch: Instant::now(),
             routed: None,
             held: Vec::new(),
+            deferred: Vec::new(),
             index_stale: false,
             warm: Warm::default(),
             error: None,
@@ -702,10 +708,11 @@ impl Sculpting {
         self.last
     }
 
-    /// Whether a stroke is in progress or its dabs are still being applied.
+    /// Whether a stroke is in progress or its dabs are still being applied, or a stroke waits to
+    /// begin.
     #[cfg(test)]
     pub(crate) fn stroking(&self) -> bool {
-        !self.strokes.is_empty()
+        !self.strokes.is_empty() || !self.deferred.is_empty()
     }
 
     /// The strokes not over yet.
@@ -753,8 +760,8 @@ impl Sculpting {
     fn finish_report(&self, report: &mut BrushReport) {
         report.dabs_carried = self.unshown();
         report.dabs_catching_up = self.catching_up();
-        report.busy = self.queued() > 0;
-        report.open = self.strokes.back().is_some_and(Pending::open);
+        report.busy = self.queued() > 0 || !self.deferred.is_empty();
+        report.open = self.strokes.back().is_some_and(Pending::open) || !self.deferred.is_empty();
     }
 
     /// A pen sample as the stroke engine reads it: physical pixels, seconds since the brush's
@@ -782,6 +789,40 @@ impl Sculpting {
             engine = engine.with_twist(twist);
         }
         Some(engine.with_buttons(stroke::Buttons::from_bits(button_bits(sample.buttons))))
+    }
+
+    /// Takes one pen event as [`Sculpting::handle`] does, unless it must wait: a `Down` (ending
+    /// an open stroke whose `Up` was lost) while an earlier stroke still has dabs to apply, and
+    /// every event after one that waits, are deferred until the strokes before them have ended
+    /// ([`Sculpting::release_deferred`]).
+    fn admit(&mut self, scene: &mut Scene<'_>, event: Option<&PenSample>) {
+        let down = event.is_some_and(|sample| sample.phase == Phase::Down);
+        if down && self.deferred.is_empty() {
+            self.lift(scene, None);
+        }
+        let waits = !self.deferred.is_empty() || (down && !self.strokes.is_empty());
+        if !waits {
+            self.handle(scene, event);
+            return;
+        }
+        if down {
+            // Cast on the surface an earlier stroke had at its pen-down: the stroke raycasts
+            // again once it begins.
+            self.routed = None;
+        }
+        self.deferred.push(event.copied());
+    }
+
+    /// Takes the events deferred, once every stroke before them has ended: through
+    /// [`Sculpting::admit`] again, so a later stroke among them waits for the first in turn.
+    fn release_deferred(&mut self, scene: &mut Scene<'_>) {
+        if !self.strokes.is_empty() {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.deferred);
+        for event in &deferred {
+            self.admit(scene, event.as_ref());
+        }
     }
 
     /// Takes one pen event: a sample for the brush, or (`None`) a stroke the brush doesn't take
@@ -1417,7 +1458,7 @@ impl Brush for Sculpting {
         }
         let held = std::mem::take(&mut self.held);
         for event in &held {
-            self.handle(&mut scene, event.as_ref());
+            self.admit(&mut scene, event.as_ref());
         }
         let events = pen.brush_events();
         for event in events {
@@ -1425,10 +1466,15 @@ impl Brush for Sculpting {
                 ForBrush::Sample(sample) => Some(sample),
                 ForBrush::StrokeElsewhere => None,
             };
-            self.handle(&mut scene, sample);
+            self.admit(&mut scene, sample);
+        }
+        self.work(&mut scene, &mut report, Some(budget));
+        if !self.deferred.is_empty() && self.strokes.is_empty() {
+            // The strokes before them have ended: the deferred stroke begins on what they left.
+            self.release_deferred(&mut scene);
+            self.work(&mut scene, &mut report, Some(budget));
         }
         self.routed = None;
-        self.work(&mut scene, &mut report, Some(budget));
         // A frame draws what the steps before it did; one between frames leaves it to the next.
         self.unframed = budget.forces_progress()
             && (self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0);
@@ -1505,10 +1551,16 @@ impl Brush for Sculpting {
         if let Some(mut scene) = Scene::of(context) {
             let held = std::mem::take(&mut self.held);
             for event in &held {
-                self.handle(&mut scene, event.as_ref());
+                self.admit(&mut scene, event.as_ref());
             }
-            self.lift(&mut scene, None);
-            self.work(&mut scene, &mut BrushReport::default(), None);
+            loop {
+                self.lift(&mut scene, None);
+                self.work(&mut scene, &mut BrushReport::default(), None);
+                if self.deferred.is_empty() || !self.strokes.is_empty() {
+                    break;
+                }
+                self.release_deferred(&mut scene);
+            }
         }
         Ok(())
     }

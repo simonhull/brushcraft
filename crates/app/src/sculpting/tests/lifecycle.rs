@@ -1,5 +1,7 @@
-//! A stroke's lifecycle at its edges: a lost `Up`, a stroke started while dabs are carried, the
-//! project closing mid-stroke, a store error mid-stroke; and warming's deadline and cancellation.
+//! A stroke's lifecycle at its edges, and warming's deadline and cancellation.
+//!
+//! The edges: a lost `Up`, a stroke started while dabs are carried (it waits for them, its
+//! pen-down surface what they leave), the project closing mid-stroke, a store error mid-stroke.
 
 use super::*;
 
@@ -56,7 +58,7 @@ fn a_lost_up_ends_the_stroke_as_a_navigation_stroke_starts() {
 }
 
 #[test]
-fn a_stroke_started_while_dabs_are_carried_waits_behind_them() {
+fn a_stroke_started_while_dabs_are_carried_begins_once_they_have_landed() {
     let dir = TestDir::new();
     // F = ∞: nothing shown ahead, every dab carried until its finest work.
     let mut owner = owner_of(
@@ -77,9 +79,10 @@ fn a_stroke_started_while_dabs_are_carried_waits_behind_them() {
     assert_eq!(run(&mut owner, 1), 1);
     assert_eq!(
         owner.brush().strokes_pending(),
-        2,
-        "the second waits behind the first"
+        1,
+        "the second waits, unplaced, for the first to land: it begins on what the first left"
     );
+    assert!(owner.brush().stroking(), "a stroke waits");
     assert_eq!(
         owner.brush().last().dabs_applied,
         1,
