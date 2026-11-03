@@ -46,12 +46,14 @@
 //!   spec's count), `waiting`, `budget_limited` and `held_by_neighbours` (why), `shortfall`,
 //!   `cone_culled` (tiles culled by their normal cone) and `cone_exempt` (tiles their cone would
 //!   cull, drawn because their morph isn't settled), `requested`, `relax_passes`, the budget's
-//!   `charged_triangles` (what the choice was charged, by what it draws: at least `triangles` but
-//!   for `cone_exempt` tiles, at most the budget), `budget_error_px` (where the budget binds, about
-//!   the screen error it stopped refining at, worst first; `null` when it took everything wanted),
-//!   `filled` and `given_back` (refinements the budget admitted past its whole buckets, and after
-//!   the neighbour rule's sweep with the charge it took back), and `level_jump`: the largest change
-//!   of the level drawing a finest tile the current stroke edited (the last one's, until the next
+//!   `budget_binds` (the budget bound, and its choice made the cut: by need, worst first over the
+//!   whole view), `charged_triangles` (what the choice was charged, by what it may draw: at least
+//!   `triangles`, at most the budget), `budget_error_px` (where the budget bound and stopped short,
+//!   about the screen error it stopped at; `null` otherwise), `budget_slack` (triangles the budget
+//!   may have left unspent: the fine bin it stopped at and the held tiles), `relax_refused` (raises
+//!   the relaxation couldn't fit, which make it bind), `admitted` and `held` (refinements the
+//!   budget's choice made, and those its seams refused), and `level_jump`: the largest change of
+//!   the level drawing a finest tile the current stroke edited (the last one's, until the next
 //!   begins) since the cut heard before (the M1 spec's "stroke seen from a distance": no jump
 //!   bigger than one), `null` with no stroked tile drawn in both;
 //! - residency as the frame was staged: `resident`, `wanted`, `evicted` (this frame),
@@ -434,13 +436,16 @@ impl FrameRecord {
             .with("cone_exempt", stat(|s| s.cone_exempt))
             .with("requested", stat(|s| s.requested))
             .with("relax_passes", scene.map(|s| s.stats.passes_used()))
+            .with("budget_binds", scene.map(|s| s.stats.budget_binds))
             .with("charged_triangles", stat(|s| s.refined_triangles))
             .with(
                 "budget_error_px",
                 scene.and_then(|s| s.stats.budget_error()).map(f64::from),
             )
-            .with("filled", stat(|s| s.filled))
-            .with("given_back", stat(|s| s.given_back))
+            .with("budget_slack", stat(|s| s.budget_slack))
+            .with("relax_refused", stat(|s| s.relax_refused))
+            .with("admitted", stat(|s| s.admitted))
+            .with("held", stat(|s| s.held))
             .with(
                 "level_jump",
                 scene.and_then(|s| s.level_jump).map(u32::from),

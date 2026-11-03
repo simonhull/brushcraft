@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 76] = [
+const FRAME_FIELDS: [&str; 79] = [
     "bench",
     "result",
     "frame",
@@ -54,10 +54,13 @@ const FRAME_FIELDS: [&str; 76] = [
     "cone_exempt",
     "requested",
     "relax_passes",
+    "budget_binds",
     "charged_triangles",
     "budget_error_px",
-    "filled",
-    "given_back",
+    "budget_slack",
+    "relax_refused",
+    "admitted",
+    "held",
     "level_jump",
     "resident",
     "wanted",
@@ -171,9 +174,12 @@ fn a_cut_s_budget_fields_say_what_it_was_charged_and_where_the_budget_stopped() 
         10,
         LodStats {
             refined_triangles: 1280,
-            partial_bucket: Some(72),
-            filled: 3,
-            given_back: 4,
+            budget_binds: true,
+            budget_bucket: Some(72),
+            budget_slack: 256,
+            relax_refused: 2,
+            admitted: 3,
+            held: 4,
             ..LodStats::default()
         },
     ));
@@ -184,9 +190,12 @@ fn a_cut_s_budget_fields_say_what_it_was_charged_and_where_the_budget_stopped() 
         &Value::Float(2.0),
         "bucket 72: 2^(72 / 8 - 8) px"
     );
-    assert_eq!(value(&line, "filled"), &Value::Int(3));
-    assert_eq!(value(&line, "given_back"), &Value::Int(4));
-    // A budget that took everything wanted stopped nowhere.
+    assert_eq!(value(&line, "budget_binds"), &Value::Bool(true));
+    assert_eq!(value(&line, "budget_slack"), &Value::Int(256));
+    assert_eq!(value(&line, "relax_refused"), &Value::Int(2));
+    assert_eq!(value(&line, "admitted"), &Value::Int(3));
+    assert_eq!(value(&line, "held"), &Value::Int(4));
+    // A budget that didn't bind stopped nowhere.
     recorder.cut(cut(10, LodStats::default()));
     let unbound = recorder.frames[&1].line();
     assert_eq!(value(&unbound, "budget_error_px"), &Value::Null);
