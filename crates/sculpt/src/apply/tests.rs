@@ -90,6 +90,23 @@ fn run_over(config: StoreConfig, count: u32, frames: &[usize]) -> (Snapshot, App
     run_project(config, count, frames, &[]).expect("a roomy store applies the stroke")
 }
 
+/// [`run_project`] (which must apply the stroke), with how many changed tiles' pen-down
+/// positions its runs made on the calling thread.
+fn run_counting(
+    config: StoreConfig,
+    count: u32,
+    frames: &[usize],
+    faults: &[Fault],
+) -> (Snapshot, ApplyStats, usize) {
+    let id = std::cell::Cell::new(None);
+    let (snapshot, stats) = run_project_with(config, count, frames, faults, &|store| {
+        id.set(Some(store));
+    })
+    .expect("the stroke applies");
+    let made = id.get().map_or(0, replay::made_alone_over);
+    (snapshot, stats, made)
+}
+
 /// [`run_over`] with `config` as it is, `faults` injected; `None` if the project or its index
 /// can't be made, or a call fails (a budget too tight for the stroke).
 fn run_project(
@@ -97,6 +114,17 @@ fn run_project(
     count: u32,
     frames: &[usize],
     faults: &[Fault],
+) -> Option<(Snapshot, ApplyStats)> {
+    run_project_with(config, count, frames, faults, &|_| {})
+}
+
+/// [`run_project`], telling `opened` the store's id once it is open.
+fn run_project_with(
+    config: StoreConfig,
+    count: u32,
+    frames: &[usize],
+    faults: &[Fault],
+    opened: &dyn Fn(store::StoreId),
 ) -> Option<(Snapshot, ApplyStats)> {
     let dir = TestDir::new();
     let config = store::ProjectConfig {
@@ -108,6 +136,7 @@ fn run_project(
     for &fault in faults {
         replay::inject(project.store().id(), fault);
     }
+    opened(project.store().id());
     let dabs = path(&mut project, count);
     let mut brush_state = Stroke::new(project.store());
     project.begin_stroke().ok()?;
@@ -280,16 +309,32 @@ fn a_frame_equals_its_dabs_one_call_each_under_a_tight_budget_with_predictions_k
         assert_eq!(stats.tiled_dabs, 12, "{budget} bytes: tile by tile");
         assert!(framed == alone, "{budget} bytes: the same bits");
         // No budget here leaves too little room to keep a run's predictions (the cube's
-        // parents stay cached), so the store is made to report it: the runs copy their frames,
-        // and make their changed tiles' pen-down positions on the calling thread.
-        let (starved, starved_stats) =
-            run_project(config(budget), 12, &[12], &[Fault::StarvePredictions])
-                .expect("a run without room for its predictions doesn't fail the frame");
+        // parents stay cached), so the store is made to report it: the runs copy their frames.
+        // In frames of three, so the later runs begin on tiles the stroke has changed.
+        let (starved, starved_stats, _) =
+            run_counting(config(budget), 12, &[3], &[Fault::StarvePredictions]);
         assert_eq!(
             starved_stats.tiled_dabs, 12,
             "{budget} bytes: tile by tile all the same"
         );
         assert!(starved == alone, "{budget} bytes: the same bits, starved");
+        // Starved, and given none of the predictions or positions the store keeps: the runs
+        // make their changed tiles' pen-down positions on the calling thread.
+        let (hidden, hidden_stats, made) = run_counting(
+            config(budget),
+            12,
+            &[3],
+            &[Fault::StarvePredictions, Fault::HideKept],
+        );
+        assert_eq!(
+            hidden_stats.tiled_dabs, 12,
+            "{budget} bytes: tile by tile, hidden"
+        );
+        assert!(
+            made > 0,
+            "{budget} bytes: the runs made their positions alone"
+        );
+        assert!(hidden == alone, "{budget} bytes: the same bits, hidden");
         applied += 1;
     }
     assert!(applied > 0, "some budget applies the stroke");
@@ -826,5 +871,70 @@ fn a_dab_of_more_tiles_than_the_store_keeps_predictions_for_writes_finite_deltas
             done.candidates
         );
     }
+    project.end_unrecorded_stroke().unwrap();
+}
+
+/// A cube at level 9 under `budget` (in 1 MiB chunks), the stroke state small: its index, and
+/// a dab of radius 0.7 on face 0, about two hundred tiles. `None` if the store won't open.
+fn tight_cube(dir: &TestDir, budget: usize) -> Option<(Project, SpatialIndex, Dab)> {
+    let level = Level::new(9).unwrap();
+    let config = store::ProjectConfig {
+        store: StoreConfig::new(budget, 1)
+            .with_chunk_bytes(1 << 20)
+            .with_workers(fixed(2))
+            .with_kept_predictions(16)
+            .with_stroke_tiles(16),
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let mut project = Project::new(geom::cube_sphere(1).unwrap(), config).ok()?;
+    let index = SpatialIndex::build(project.store(), level, |_, _| {}).ok()?;
+    let key = TileKey::displacement(FaceId::new(0), level, 4, 4).unwrap();
+    let centre = vertex(project.store(), key, 0, 0);
+    Some((project, index, dab(centre, 0.7, 0.002, 0.0, 0)))
+}
+
+#[test]
+fn under_a_budget_its_first_dab_just_fits_a_stroke_goes_on_beside_its_pen_down_data() {
+    // The least budget (in steps of a chunk) a dab of some two hundred tiles applies under in a
+    // fresh store: the same dab again and again in one stroke must apply too, the stroke's
+    // pen-down data withheld beside each frame's pins, what doesn't fit reported.
+    let minimum = StoreConfig::new(0, 1)
+        .with_chunk_bytes(1 << 20)
+        .with_kept_predictions(16)
+        .with_stroke_tiles(16)
+        .minimum_budget(&geom::cube_sphere(1).unwrap());
+    let fits = |budget: usize| {
+        let dir = TestDir::new();
+        let Some((mut project, mut index, first)) = tight_cube(&dir, budget) else {
+            return false;
+        };
+        let mut state = Stroke::new(project.store());
+        project.begin_stroke().unwrap();
+        apply_dabs(project.store(), &mut index, &mut state, &[first]).is_ok()
+    };
+    // Bisected, in chunks above the minimum: the least that fits.
+    let (mut low, mut high) = (0_usize, 64_usize);
+    assert!(fits(minimum + (high << 20)), "some budget fits the dab");
+    while low < high {
+        let middle = usize::midpoint(low, high);
+        if fits(minimum + (middle << 20)) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    let budget = minimum + (high << 20);
+    let dir = TestDir::new();
+    let (mut project, mut index, first) = tight_cube(&dir, budget).unwrap();
+    let mut state = Stroke::new(project.store());
+    project.begin_stroke().unwrap();
+    let opening = apply_dabs(project.store(), &mut index, &mut state, &[first]).unwrap();
+    assert!(opening.candidates > 100, "{} tiles", opening.candidates);
+    for n in 1..4 {
+        let again = Dab { seq: n, ..first };
+        let applied = apply_dabs(project.store(), &mut index, &mut state, &[again]);
+        assert!(applied.is_ok(), "{budget} bytes, dab {n}: {applied:?}");
+    }
+    assert!(project.store().pen_down_bytes() > 0);
     project.end_unrecorded_stroke().unwrap();
 }

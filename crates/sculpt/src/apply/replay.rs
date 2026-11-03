@@ -121,6 +121,44 @@ pub(crate) enum Fault {
     BreakTwins,
     /// Keeping a run's predictions fails for want of room ([`store::CacheError::Full`]).
     StarvePredictions,
+    /// A run takes none of the predictions or positions the store keeps made for its changed
+    /// tiles: it makes their pen-down positions itself (`unkept_pen_down` in [`super`]).
+    HideKept,
+}
+
+/// How many changed tiles' pen-down positions runs over each store made on the calling thread,
+/// for the tests to see that path taken.
+#[cfg(test)]
+static MADE_ALONE: std::sync::Mutex<Vec<(store::StoreId, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Counts `count` more changed tiles' pen-down positions made on the calling thread over store
+/// `id`.
+///
+/// # Panics
+///
+/// If another test panicked holding the counts.
+#[cfg(test)]
+pub(super) fn made_alone(id: store::StoreId, count: usize) {
+    let mut counts = MADE_ALONE.lock().expect("no test panics holding it");
+    match counts.iter_mut().find(|(store, _)| *store == id) {
+        Some((_, made)) => *made += count,
+        None => counts.push((id, count)),
+    }
+}
+
+/// How many changed tiles' pen-down positions runs over store `id` made on the calling thread.
+///
+/// # Panics
+///
+/// If another test panicked holding the counts.
+#[cfg(test)]
+pub(crate) fn made_alone_over(id: store::StoreId) -> usize {
+    let counts = MADE_ALONE.lock().expect("no test panics holding it");
+    counts
+        .iter()
+        .find(|(store, _)| *store == id)
+        .map_or(0, |&(_, made)| made)
 }
 
 /// The faults injected, each with the store whose runs it affects: set by a test, for its own

@@ -9,8 +9,9 @@
 //! surface"), read from the pen-down shape the store keeps of a tile the stroke has changed
 //! ([`TileStore::pen_down_shape`]), or from the store's evaluation of any other. So a stroke's
 //! dabs add up over the pen-down surface: a ridge is the sum of its dabs, never a dab weighed on
-//! the ridge its predecessors raised. Before a tile is first written, the store keeps its shape
-//! ([`TileStore::keep_pen_down`]).
+//! the ridge its predecessors raised. Before a dab or a run writes, the store keeps the shape of
+//! every tile it reached ([`TileStore::keep_pen_down`]): those it writes, and the few beside them
+//! it reaches without writing, the same on either path.
 //!
 //! [`apply_dabs`] runs, in order:
 //!
@@ -34,7 +35,7 @@
 //!      delta; the vertex's correction is set to the value the stroke builds for it, the correction
 //!      it first found there plus every delta since (see [`Stroke`]), so the stored value is
 //!      rounded to the tile's quantization once per stroke, not once per dab.
-//!    - **Write**: the pen-down shapes of the tiles written for the first time are kept; the tiles
+//!    - **Write**: the pen-down shapes of the tiles reached for the first time are kept; the tiles
 //!      are written back whole, together ([`TileStore::replace_corrections`]); the stroke's state
 //!      takes what the run did ([`Stroke::end_frame`]).
 //!
@@ -186,7 +187,7 @@ pub struct PhaseTimes {
     pub pin: Duration,
     /// Running the brush over their pen-down positions.
     pub brush: Duration,
-    /// Keeping the pen-down shapes of the tiles written for the first time, and writing the
+    /// Keeping the pen-down shapes of the tiles reached for the first time, and writing the
     /// deltas into the corrections.
     pub edit: Duration,
     /// Listing the tiles whose bounds the edits may change: those reached, and their
@@ -530,8 +531,8 @@ fn run_dab(
     frame.reached.extend(&found.reached);
     times.brush += laps.lap();
 
-    // Every tile holding a vertex the dab moves is written: the vertex's owner, and the tiles
-    // holding its copies.
+    // Every tile the dab reaches keeps its pen-down shape, as a run's do: each tile holding a
+    // vertex the dab moves is written (the vertex's owner, and the tiles holding its copies).
     store.keep_pen_down(&found.reached)?;
     let edited: Vec<TileKey> = found.edits.iter().map(|tile| tile.key).collect();
     frame.unaccumulated += stroke.begin_dab(store, &edited);
@@ -624,10 +625,16 @@ fn run_tiled(
             continue;
         }
         times.brush += laps.lap();
+        // Every tile the run reached keeps its pen-down shape, as a dab on its own keeps every
+        // tile it reaches: those it writes, and those holding a vertex within reach it doesn't.
+        let reached: Vec<TileKey> = outcomes
+            .iter()
+            .filter(|outcome| outcome.reached)
+            .map(|outcome| outcome.key)
+            .collect();
+        store.keep_pen_down(&reached)?;
         let written = replay::written(&outcomes);
         if !written.is_empty() {
-            let first_written: Vec<TileKey> = written.iter().map(|&(key, _)| key).collect();
-            store.keep_pen_down(&first_written)?;
             // The store checks the twins before it writes anything; none should disagree (see
             // "Tile by tile" in the module notes), and a run that broke them is applied one dab
             // at a time.
@@ -695,12 +702,19 @@ fn unkept_pen_down(
     store: &mut TileStore,
     keys: &[TileKey],
 ) -> Result<BTreeMap<TileKey, Vec<Vec3>>, CacheError> {
+    let hidden = false;
+    #[cfg(test)]
+    let hidden = hidden || replay::injected(store.id(), replay::Fault::HideKept);
     let unkept: Vec<TileKey> = keys
         .iter()
         .filter(|key| store.pen_down_shape(key).is_some())
-        .filter(|key| store.kept_prediction(key).is_none() && store.made_pen_down(key).is_none())
+        .filter(|key| {
+            hidden || (store.kept_prediction(key).is_none() && store.made_pen_down(key).is_none())
+        })
         .copied()
         .collect();
+    #[cfg(test)]
+    replay::made_alone(store.id(), unkept.len());
     unkept
         .into_iter()
         .map(|key| Ok((key, store.pen_down_positions(key)?.to_vec())))
