@@ -1072,3 +1072,50 @@ fn a_pen_resting_down_takes_no_forced_catch_up_and_it_lands_once_lifted() {
         assert!(frames < 10_000, "the catch-up ends once lifted");
     }
 }
+
+#[test]
+fn a_frame_that_fits_none_of_its_dabs_shows_them_on_display_tiles_in_that_frame() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    let samples = stroke(ACROSS, 12);
+    queue(&mut owner, samples);
+    assert_eq!(run(&mut owner, 1), 1);
+    let shown = owner.brush().last();
+    assert!(shown.dabs_shown > 0, "{shown:?}");
+    assert_eq!(
+        shown.dabs_applied, 0,
+        "nothing fits: no finest work in the frame"
+    );
+    assert!(
+        shown.oldest.is_some(),
+        "the frame carries their samples' latency"
+    );
+    // In that frame, the display tiles above them are drawn from previews that move.
+    let store = owner.project().store();
+    let previewed: Vec<TileKey> = store.display_previewed().copied().collect();
+    assert!(!previewed.is_empty(), "display previews made in the frame");
+    let mut moved = 0;
+    for key in &previewed {
+        let preview = store.display_preview(key).expect("a preview").clone();
+        assert!(preview.held, "held while its dabs are to land");
+        let record = store
+            .display_for_draw(&[*key])
+            .expect("reads")
+            .pop()
+            .flatten()
+            .expect("recorded");
+        let differ = record
+            .positions()
+            .iter()
+            .zip(&preview.positions)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        moved += differ;
+    }
+    assert!(moved > 0, "the dabs moved the display tiles drawn");
+}
