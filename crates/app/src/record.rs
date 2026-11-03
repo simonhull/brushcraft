@@ -45,10 +45,15 @@
 //!   (the cut's tiles at each level from 0), `over_budget` (tiles in view left over 1 px, the
 //!   spec's count), `waiting`, `budget_limited` and `held_by_neighbours` (why), `shortfall`,
 //!   `cone_culled` (tiles culled by their normal cone) and `cone_exempt` (tiles their cone would
-//!   cull, drawn because their morph isn't settled), `requested`, `relax_passes`, and `level_jump`:
-//!   the largest change of the level drawing a finest tile the current stroke edited (the last
-//!   one's, until the next begins) since the cut heard before (the M1 spec's "stroke seen from a
-//!   distance": no jump bigger than one), `null` with no stroked tile drawn in both;
+//!   cull, drawn because their morph isn't settled), `requested`, `relax_passes`, the budget's
+//!   `charged_triangles` (what the choice was charged, by what it draws: at least `triangles` but
+//!   for `cone_exempt` tiles, at most the budget), `budget_error_px` (where the budget binds, about
+//!   the screen error it stopped refining at, worst first; `null` when it took everything wanted),
+//!   `filled` and `given_back` (refinements the budget admitted past its whole buckets, and after
+//!   the neighbour rule's sweep with the charge it took back), and `level_jump`: the largest change
+//!   of the level drawing a finest tile the current stroke edited (the last one's, until the next
+//!   begins) since the cut heard before (the M1 spec's "stroke seen from a distance": no jump
+//!   bigger than one), `null` with no stroked tile drawn in both;
 //! - residency as the frame was staged: `resident`, `wanted`, `evicted` (this frame),
 //!   `uploaded_bytes` and `uploaded_tiles`, `standing_in` (display tiles standing in for a stroke's
 //!   edits, until the refresh replaces them) and `pending_epochs` (epochs staged over frames, not
@@ -429,6 +434,13 @@ impl FrameRecord {
             .with("cone_exempt", stat(|s| s.cone_exempt))
             .with("requested", stat(|s| s.requested))
             .with("relax_passes", scene.map(|s| s.stats.passes_used()))
+            .with("charged_triangles", stat(|s| s.refined_triangles))
+            .with(
+                "budget_error_px",
+                scene.and_then(|s| s.stats.budget_error()).map(f64::from),
+            )
+            .with("filled", stat(|s| s.filled))
+            .with("given_back", stat(|s| s.given_back))
             .with(
                 "level_jump",
                 scene.and_then(|s| s.level_jump).map(u32::from),

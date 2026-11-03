@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 72] = [
+const FRAME_FIELDS: [&str; 76] = [
     "bench",
     "result",
     "frame",
@@ -54,6 +54,10 @@ const FRAME_FIELDS: [&str; 72] = [
     "cone_exempt",
     "requested",
     "relax_passes",
+    "charged_triangles",
+    "budget_error_px",
+    "filled",
+    "given_back",
     "level_jump",
     "resident",
     "wanted",
@@ -147,6 +151,45 @@ fn a_frame_line_names_every_field_and_nulls_what_never_came() {
         "{json}"
     );
     assert!(json.contains(r#""gpu_ms":null"#), "{json}");
+}
+
+#[test]
+fn a_cut_s_budget_fields_say_what_it_was_charged_and_where_the_budget_stopped() {
+    let mut recorder = Recorder::default();
+    recorder.started(1, ms(0), Some(Segment::Open), true);
+    recorder.staged(1, Some(10), Some(&stats(0)));
+    let cut = |frame, stats| CutHeard {
+        frame,
+        scene: SceneRecord {
+            stats,
+            levels: vec![2400],
+            stages: None,
+            level_jump: None,
+        },
+    };
+    recorder.cut(cut(
+        10,
+        LodStats {
+            refined_triangles: 1280,
+            partial_bucket: Some(72),
+            filled: 3,
+            given_back: 4,
+            ..LodStats::default()
+        },
+    ));
+    let line = recorder.frames[&1].line();
+    assert_eq!(value(&line, "charged_triangles"), &Value::Int(1280));
+    assert_eq!(
+        value(&line, "budget_error_px"),
+        &Value::Float(2.0),
+        "bucket 72: 2^(72 / 8 - 8) px"
+    );
+    assert_eq!(value(&line, "filled"), &Value::Int(3));
+    assert_eq!(value(&line, "given_back"), &Value::Int(4));
+    // A budget that took everything wanted stopped nowhere.
+    recorder.cut(cut(10, LodStats::default()));
+    let unbound = recorder.frames[&1].line();
+    assert_eq!(value(&unbound, "budget_error_px"), &Value::Null);
 }
 
 #[test]
