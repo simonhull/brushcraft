@@ -57,9 +57,11 @@
 //!   none are), `tiles_edited`, `above_f` (a dab of the frame above the footprint limit F, which no
 //!   frame's time fits), and `stroke_open` (a stroke still open as the brush step ended: the pen
 //!   down; the frames after the last open one until none carries dabs are the queue draining after
-//!   pen-up). What the brush did between the last frame and this one (whose edits this frame shows)
-//!   counts as this frame's, its time `between_ms`. The owner's `prepare_ms` is the brush's work
-//!   after the hand-off (warming the surface under a hovering pen), off the latency path.
+//!   pen-up), and `kept_tiles`, `kept_bytes` and `kept_beyond_budget` (what the stroke keeps of the
+//!   surface as it began, counted in the store's budget, and the bytes the budget had no room for).
+//!   What the brush did between the last frame and this one (whose edits this frame shows) counts
+//!   as this frame's, its time `between_ms`. The owner's `prepare_ms` is the brush's work after the
+//!   hand-off (warming the surface under a hovering pen), off the latency path.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -212,6 +214,9 @@ impl Line {
             .with("tiles_edited", brush.map(|b| b.tiles_edited))
             .with("above_f", brush.map(|b| b.above_limit))
             .with("stroke_open", brush.map(|b| b.open))
+            .with("kept_tiles", brush.map(|b| b.kept.tiles))
+            .with("kept_bytes", brush.map(|b| b.kept.bytes))
+            .with("kept_beyond_budget", brush.map(|b| b.kept.beyond_budget))
     }
 
     /// The line with residency's fields from `counts`.

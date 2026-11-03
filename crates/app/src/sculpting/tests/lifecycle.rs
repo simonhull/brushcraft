@@ -1,7 +1,8 @@
 //! A stroke's lifecycle at its edges, and warming's deadline and cancellation.
 //!
 //! The edges: a lost `Up`, a stroke started while dabs are carried (it waits for them, its
-//! pen-down surface what they leave), the project closing mid-stroke, a store error mid-stroke.
+//! pen-down surface what they leave, its samples held over a step with no scene, and a `Down` on
+//! their fresh ridge brushing), the project closing mid-stroke, a store error mid-stroke.
 
 use super::*;
 
@@ -77,12 +78,10 @@ fn a_stroke_started_while_dabs_are_carried_begins_once_they_have_landed() {
     assert!(carried > 2, "the first stroke carries dabs: {carried}");
     queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
     assert_eq!(run(&mut owner, 1), 1);
-    assert_eq!(
-        owner.brush().strokes_pending(),
-        1,
+    assert!(
+        owner.brush().under_way() && !owner.brush().deferred.is_empty(),
         "the second waits, unplaced, for the first to land: it begins on what the first left"
     );
-    assert!(owner.brush().stroking(), "a stroke waits");
     assert_eq!(
         owner.brush().last().dabs_applied,
         1,
@@ -287,5 +286,137 @@ fn warming_progresses_past_its_deadline_and_a_moved_pen_cancels_it() {
     let left = hover_frame(&mut brush, (&mut project, picker.index_mut()), None, past);
     assert!(!left && brush.warm.todo.is_empty(), "cancelled");
     assert_eq!(brush.warm.wanted, None);
+    project.close(false).expect("closed");
+}
+
+/// A stroke under way with no dabs left to place, standing for one whose dabs still land: what a
+/// `Down` waits behind.
+fn landing_stroke(camera: &Camera, brush: &Sculpting) -> Pending {
+    let view = camera.view(size()).expect("a view");
+    let down = sample(Phase::Down, (160.0, 100.0), 0.5);
+    Pending {
+        engine: None,
+        settings: brush.settings.clone(),
+        camera: stroke_camera(camera, &view),
+        samples: Vec::new(),
+        op: None,
+        dabs: VecDeque::from([Dab::default()]),
+        sources: VecDeque::new(),
+        last: times_of(&down),
+        interval: FIRST_INTERVAL,
+    }
+}
+
+#[test]
+fn a_waiting_strokes_samples_are_held_over_a_step_with_no_scene() {
+    let dir = TestDir::new();
+    let mut project = project(&dir);
+    let mut picker = Picker::load(&mut project)
+        .expect("the index loads")
+        .expect("a display layer");
+    let mut brush = Sculpting::new(&mut project);
+    let camera = Camera::default();
+    // The earlier stroke ended between frames; the next one's `Down` still waits.
+    brush
+        .deferred
+        .push(Some(sample(Phase::Down, (150.0, 100.0), 0.5)));
+    let mut pen = PenFrame::default();
+    let drags = stroke(((150.0, 100.0), (180.0, 104.0)), 6);
+    let count = drags.len();
+    for drag in drags.into_iter().skip(1) {
+        pen.push(drag, Some(Route::Brush));
+    }
+    let blind = BrushContext {
+        project: &mut project,
+        index: None,
+        camera: &camera,
+        size: size(),
+    };
+    let report = brush
+        .step(blind, &pen, &BrushBudget::unlimited())
+        .expect("a step");
+    assert!(report.busy, "a stroke waits: the next frame is wanted");
+    assert_eq!(
+        brush.held.len(),
+        count - 1,
+        "its samples held, none dropped"
+    );
+    brush
+        .step(
+            context(&mut project, picker.index_mut(), &camera),
+            &PenFrame::default(),
+            &BrushBudget::unlimited(),
+        )
+        .expect("a step");
+    assert!(!brush.stroking(), "it began, took every sample and ended");
+    project.close(false).expect("closed");
+}
+
+#[test]
+fn a_down_on_a_landing_strokes_fresh_ridge_brushes() {
+    let dir = TestDir::new();
+    let mut project = project(&dir);
+    let mut picker = Picker::load(&mut project)
+        .expect("the index loads")
+        .expect("a display layer");
+    let mut brush = Sculpting::new(&mut project);
+    let camera = Camera::default();
+    let projector = ViewProjector::new(&camera.view(size()).expect("a view"));
+    let ray_at = |x: f64| {
+        projector
+            .ray(ScreenPoint::new(x, 100.0).expect("a point"))
+            .expect("a ray")
+    };
+    let pen_down_hit = |of: &mut Project, index: &SpatialIndex, x: f64| {
+        let mut surface = StoreSurface::new(of.store(), index);
+        let hit = surface.raycast(&ray_at(x));
+        surface.finish().expect("no store error");
+        hit
+    };
+    // The sphere's silhouette along the middle row.
+    let edge = (160..320)
+        .map(f64::from)
+        .take_while(|&x| pen_down_hit(&mut project, picker.index_mut(), x).is_some())
+        .last()
+        .expect("the sphere is under the middle");
+    let near = pen_down_hit(&mut project, picker.index_mut(), edge - 4.0).expect("a hit");
+    // The earlier stroke raises a bump at the silhouette, its pen-down shapes kept.
+    project.begin_stroke().expect("a stroke");
+    let mut state = sculpt::Stroke::new(project.store());
+    let centre = near.position.to_f32();
+    let outward = near.normal.to_f32();
+    let bump = Dab {
+        position: [centre.x, centre.y, centre.z],
+        normal: [outward.x, outward.y, outward.z],
+        radius: 0.3,
+        strength: 0.25,
+        ..Dab::default()
+    };
+    apply_dabs(project.store(), picker.index_mut(), &mut state, &[bump]).expect("applied");
+    brush.stroke = Some(landing_stroke(&camera, &brush));
+    // A pixel past the silhouette the stroke began on, on the bump.
+    let on_bump = (1..40).map(|d| edge + f64::from(d)).find(|&x| {
+        let missed = pen_down_hit(&mut project, picker.index_mut(), x).is_none();
+        let ray = ray_at(x);
+        let narrow =
+            store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32()).expect("a ray");
+        let landed = picker
+            .index_mut()
+            .raycast_triangle(project.store(), &narrow)
+            .expect("casts");
+        missed && landed.is_some()
+    });
+    let x = on_bump.expect("the bump stands past the silhouette");
+    let down = sample(Phase::Down, (x, 100.0), 0.5);
+    let waiting = brush.route(context(&mut project, picker.index_mut(), &camera), &down);
+    assert_eq!(waiting, Route::Brush, "a Down on the fresh ridge brushes");
+    brush.stroke = None;
+    let alone = brush.route(context(&mut project, picker.index_mut(), &camera), &down);
+    assert_eq!(
+        alone,
+        Route::Navigate,
+        "with no stroke landing, the pen-down surface decides"
+    );
+    project.end_unrecorded_stroke().expect("ended");
     project.close(false).expect("closed");
 }

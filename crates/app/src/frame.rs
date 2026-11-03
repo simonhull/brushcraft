@@ -178,12 +178,28 @@ pub(crate) struct BrushReport {
     /// Whether a stroke is open as the step ends: the pen is still down. A scripted run's record
     /// keeps it, so the frames from pen-up until the queue drains can be counted.
     pub(crate) open: bool,
+    /// What the brush's stroke keeps of the surface as it began, as the step ends: its tiles and
+    /// bytes, and the bytes of them the budget had no room for.
+    pub(crate) kept: Kept,
+}
+
+/// What a brush's stroke keeps of the surface as it began (a sculpting stroke's pen-down data),
+/// as [`BrushReport::kept`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Kept {
+    /// Tiles kept.
+    pub(crate) tiles: usize,
+    /// Bytes kept, counted in the store's budget.
+    pub(crate) bytes: usize,
+    /// Bytes of them held beyond the budget: the room the pools' minimum and the frame's pins
+    /// left had none for them.
+    pub(crate) beyond_budget: usize,
 }
 
 impl BrushReport {
     /// This report followed by `later`, a later step's: what both applied and showed (the tiles
     /// edited summed, not a union), the earlier sample of the two, and the later step's state
-    /// (carried, catching up, busy, open).
+    /// (carried, catching up, busy, open, kept).
     #[must_use]
     pub(crate) fn then(self, later: Self) -> Self {
         let oldest = match (self.oldest, later.oldest) {
@@ -200,6 +216,7 @@ impl BrushReport {
             above_limit: self.above_limit || later.above_limit,
             busy: later.busy,
             open: later.open,
+            kept: later.kept,
         }
     }
 }

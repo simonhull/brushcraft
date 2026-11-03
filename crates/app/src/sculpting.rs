@@ -14,18 +14,22 @@
 //! - **Each sample:** [`Stroke::push`], through a fresh [`StoreSurface`] each call, ended with
 //!   [`StoreSurface::finish`]; the dabs it places join the stroke's queue. A sample with no
 //!   pressure places none: the engine places no dab below [`stroke::MIN_DAB_SIZE`].
-//! - **Each step:** the queued dabs are applied by [`apply_dabs`], oldest stroke first, as many as
-//!   the time the step has fits ([`BrushBudget`], [`DabCost`]); the rest are shown at once ahead of
+//! - **Each step:** the queued dabs are applied by [`apply_dabs`], oldest first, as many as the
+//!   time the step has fits ([`BrushBudget`], [`DabCost`]); the rest are shown at once ahead of
 //!   their finest work ([`Preview`], "Big brushes" below) and wait for later steps. The edit closes
 //!   the store's epoch, which the frame loop drains after the brush phase and uploads in the same
 //!   frame (a step between frames: in the next).
-//! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) when it is the oldest stroke
-//!   left, so every edit of the store's current op is that stroke's.
+//! - **The op:** a stroke's op begins ([`Project::begin_stroke`]) as its first dabs are applied, so
+//!   every edit of the store's current op is that stroke's.
 //! - **A stroke begins on what the last one left:** it reads its pen-down surface (the brush-engine
 //!   spec), which is the surface once every stroke before it has landed. So a pen `Down` while an
 //!   earlier stroke still has dabs to apply (its pen lifted) waits, with every event after it, and
 //!   is taken once that stroke's op has ended ([`Sculpting::admit`]): its first dab is shown no
-//!   sooner, but every dab it places is the same however fast the finest work went.
+//!   sooner, but every dab it places is the same however fast the finest work went. So one stroke
+//!   at most is under way. Whether such a `Down` brushes or navigates is decided as it comes, from
+//!   the surface as it is then too (the earlier stroke's dabs landed so far), as a `Down` on that
+//!   stroke's fresh ridge means to brush ([`Brush::route`]); the stroke begins, or finds nothing
+//!   under it and doesn't, on the surface the earlier one left.
 //! - **Pen up:** [`Stroke::end`] gives the tail; once every dab of the stroke is applied, its
 //!   record ([`StrokeRecord`]: the samples the engine read, the settings' bytes, the camera at the
 //!   stroke's start, [`stroke::ENGINE_VERSION`]) ends the op ([`Project::end_stroke`]). A stroke
@@ -132,7 +136,7 @@ use stroke::{
 
 use crate::camera::{Camera, Pixel};
 use crate::frame::{
-    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, LATENCY_AIM, STROKE_QUIET,
+    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Kept, LATENCY_AIM, STROKE_QUIET,
     SampleTimes,
 };
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
@@ -491,7 +495,7 @@ struct Pending {
     camera: StrokeCamera,
     /// The samples the engine read, which its record keeps.
     samples: Vec<RecordSample>,
-    /// Its op, once begun: once it is the oldest stroke left.
+    /// Its op, once begun: as its first dabs are applied.
     op: Option<OpId>,
     /// Its dabs not yet applied, oldest first.
     dabs: VecDeque<Dab>,
@@ -561,6 +565,8 @@ struct StatusKey {
     drawing: bool,
     /// The last frame that applied dabs.
     last: BrushReport,
+    /// What the stroke keeps of the surface it began on.
+    kept: Kept,
     /// How many errors have been kept (or cleared).
     errors: u64,
 }
@@ -578,8 +584,11 @@ pub(crate) struct Sculpting {
     strength_factor: f32,
     /// The stroke state `apply_dabs` keeps across a stroke's dabs.
     state: sculpt::Stroke,
-    /// The strokes not over yet, oldest first: only the last can be open.
-    strokes: VecDeque<Pending>,
+    /// The stroke not over yet, if one is: its pen down, or its dabs still to apply. A stroke
+    /// started meanwhile waits in `deferred`.
+    stroke: Option<Pending>,
+    /// What the stroke keeps of the surface it began on, as the last step left it.
+    kept: Kept,
     /// What applying dabs costs: how a step's time becomes dabs.
     cost: DabCost,
     /// The dabs shown ahead of their finest work, and the tiles they reach (see "Big brushes" in
@@ -598,10 +607,10 @@ pub(crate) struct Sculpting {
     /// The ray and hit of the last `Down` routed to the brush, for its stroke's first raycast;
     /// cleared at the end of each step.
     routed: Option<(Ray, Hit)>,
-    /// Pen samples held over from a step with no scene (a degenerate view) while strokes were
-    /// pending, in order; `None` for a stroke started elsewhere.
+    /// Pen samples held over from a step with no scene (a degenerate view) while a stroke was
+    /// under way or waited to begin, in order; `None` for a stroke started elsewhere.
     held: Vec<Option<PenSample>>,
-    /// Pen events waiting for the strokes before them to end, in order, from a `Down` that came
+    /// Pen events waiting for the stroke before them to end, in order, from a `Down` that came
     /// while an earlier stroke still had dabs to apply (see "A stroke begins on what the last one
     /// left" in the module notes); `None` for a stroke started elsewhere.
     deferred: Vec<Option<PenSample>>,
@@ -632,7 +641,8 @@ impl Sculpting {
             settings,
             strength_factor: 1.0,
             state,
-            strokes: VecDeque::new(),
+            stroke: None,
+            kept: Kept::default(),
             cost: DabCost::CALIBRATED,
             preview: Some(Preview::new()),
             caught_up: BrushReport::default(),
@@ -712,23 +722,23 @@ impl Sculpting {
     /// begin.
     #[cfg(test)]
     pub(crate) fn stroking(&self) -> bool {
-        !self.strokes.is_empty() || !self.deferred.is_empty()
+        self.stroke.is_some() || !self.deferred.is_empty()
     }
 
-    /// The strokes not over yet.
+    /// Whether a stroke is under way (not one that waits to begin).
     #[cfg(test)]
-    pub(crate) fn strokes_pending(&self) -> usize {
-        self.strokes.len()
+    pub(crate) const fn under_way(&self) -> bool {
+        self.stroke.is_some()
     }
 
-    /// Dabs placed and not yet applied, over every stroke.
+    /// Dabs placed and not yet applied.
     fn queued(&self) -> usize {
-        self.strokes.iter().map(|stroke| stroke.dabs.len()).sum()
+        self.stroke.as_ref().map_or(0, |stroke| stroke.dabs.len())
     }
 
-    /// Dabs placed and neither applied nor shown, over every stroke: the stroke's lag.
+    /// Dabs placed and neither applied nor shown: the stroke's lag.
     fn unshown(&self) -> usize {
-        let sources = self.strokes.iter().flat_map(|stroke| &stroke.sources);
+        let sources = self.stroke.iter().flat_map(|stroke| &stroke.sources);
         sources.filter(|source| !source.shown).count()
     }
 
@@ -737,7 +747,7 @@ impl Sculpting {
     /// only dabs that fit their step's time: a dab forced past it would hold up the samples
     /// arriving meanwhile, and the frame showing a lifted stroke's tail.
     fn pen_moving(&self) -> bool {
-        let last = self.strokes.back();
+        let last = self.stroke.as_ref();
         last.is_some_and(|stroke| stroke.last.received.elapsed() < STROKE_QUIET)
     }
 
@@ -745,7 +755,7 @@ impl Sculpting {
     /// sample: [`SAMPLE_MARGIN`] before that is due, by its stroke's smoothed interval. `None`
     /// with no stroke.
     fn before_next_sample(&self) -> Option<Instant> {
-        let stroke = self.strokes.back()?;
+        let stroke = self.stroke.as_ref()?;
         let due = stroke.last.received + stroke.interval;
         Some(due.checked_sub(SAMPLE_MARGIN).unwrap_or(due))
     }
@@ -756,12 +766,23 @@ impl Sculpting {
     }
 
     /// The report's state as a step ends: what is carried and catching up, whether work is left,
-    /// whether a stroke is open.
+    /// whether a stroke is open, what it keeps.
     fn finish_report(&self, report: &mut BrushReport) {
         report.dabs_carried = self.unshown();
         report.dabs_catching_up = self.catching_up();
         report.busy = self.queued() > 0 || !self.deferred.is_empty();
-        report.open = self.strokes.back().is_some_and(Pending::open) || !self.deferred.is_empty();
+        report.open = self.stroke.as_ref().is_some_and(Pending::open) || !self.deferred.is_empty();
+        report.kept = self.kept;
+    }
+
+    /// Notes what the stroke keeps of the surface it began on, from `store` (see
+    /// [`BrushReport::kept`]).
+    fn note_kept(&mut self, store: &TileStore) {
+        self.kept = Kept {
+            tiles: store.pen_down_tiles(),
+            bytes: store.pen_down_bytes(),
+            beyond_budget: store.pen_down_beyond_budget(),
+        };
     }
 
     /// A pen sample as the stroke engine reads it: physical pixels, seconds since the brush's
@@ -793,14 +814,14 @@ impl Sculpting {
 
     /// Takes one pen event as [`Sculpting::handle`] does, unless it must wait: a `Down` (ending
     /// an open stroke whose `Up` was lost) while an earlier stroke still has dabs to apply, and
-    /// every event after one that waits, are deferred until the strokes before them have ended
+    /// every event after one that waits, are deferred until the stroke before them has ended
     /// ([`Sculpting::release_deferred`]).
     fn admit(&mut self, scene: &mut Scene<'_>, event: Option<&PenSample>) {
         let down = event.is_some_and(|sample| sample.phase == Phase::Down);
         if down && self.deferred.is_empty() {
             self.lift(scene, None);
         }
-        let waits = !self.deferred.is_empty() || (down && !self.strokes.is_empty());
+        let waits = !self.deferred.is_empty() || (down && self.stroke.is_some());
         if !waits {
             self.handle(scene, event);
             return;
@@ -813,10 +834,10 @@ impl Sculpting {
         self.deferred.push(event.copied());
     }
 
-    /// Takes the events deferred, once every stroke before them has ended: through
+    /// Takes the events deferred, once the stroke before them has ended: through
     /// [`Sculpting::admit`] again, so a later stroke among them waits for the first in turn.
     fn release_deferred(&mut self, scene: &mut Scene<'_>) {
-        if !self.strokes.is_empty() {
+        if self.stroke.is_some() {
             return;
         }
         let deferred = std::mem::take(&mut self.deferred);
@@ -844,8 +865,8 @@ impl Sculpting {
         }
     }
 
-    /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it;
-    /// its op begins once the strokes before it are over.
+    /// Starts a stroke at `down` (routed to the brush), if the engine finds the surface under it:
+    /// with none under way ([`Sculpting::admit`] holds a `Down` back until then).
     fn begin(&mut self, scene: &mut Scene<'_>, down: &PenSample) {
         self.warm = Warm::default();
         let routed = self.routed.take();
@@ -871,7 +892,7 @@ impl Sculpting {
         if self.error.take().is_some() {
             self.errors += 1;
         }
-        self.strokes.push_back(Pending {
+        self.stroke = Some(Pending {
             engine: Some(engine),
             settings: self.settings.clone(),
             camera: stroke_camera(scene.camera, &projector.view),
@@ -890,7 +911,7 @@ impl Sculpting {
         let Some(engine_sample) = self.engine_sample(sample) else {
             return;
         };
-        let Some(pending) = self.strokes.back_mut().filter(|stroke| stroke.open()) else {
+        let Some(pending) = self.stroke.as_mut().filter(|stroke| stroke.open()) else {
             return;
         };
         let Some(engine) = &mut pending.engine else {
@@ -923,7 +944,7 @@ impl Sculpting {
     /// Ends the open stroke's engine stroke, if there is one, queueing its tail: the pen lifted
     /// at `up`, or (`None`) its `Up` was lost, and the tail is timed from its last sample.
     fn lift(&mut self, scene: &mut Scene<'_>, up: Option<&PenSample>) {
-        let Some(pending) = self.strokes.back_mut() else {
+        let Some(pending) = self.stroke.as_mut() else {
             return;
         };
         let Some(engine) = pending.engine.take() else {
@@ -974,10 +995,10 @@ impl Sculpting {
         let Some(budget) = budget else {
             return true;
         };
-        if self.catching_up() > 0 || self.strokes.len() > 1 {
+        if self.catching_up() > 0 {
             return false;
         }
-        let Some(front) = self.strokes.front() else {
+        let Some(front) = self.stroke.as_ref() else {
             return true;
         };
         let Some(oldest) = front.sources.front() else {
@@ -998,7 +1019,7 @@ impl Sculpting {
         let Some(preview) = &mut self.preview else {
             return;
         };
-        let unshown = self.strokes.iter().flat_map(|stroke| {
+        let unshown = self.stroke.iter().flat_map(|stroke| {
             let pairs = stroke.dabs.iter().zip(&stroke.sources);
             pairs.filter(|(_, source)| !source.shown)
         });
@@ -1010,7 +1031,7 @@ impl Sculpting {
         let shown = preview.show(scene.project.store(), scene.index, &dabs);
         let count = preview.shown() - before;
         let sources = self
-            .strokes
+            .stroke
             .iter_mut()
             .flat_map(|stroke| &mut stroke.sources);
         let newly = sources.filter(|source| !source.shown).take(count);
@@ -1030,13 +1051,13 @@ impl Sculpting {
     }
 
     /// Applies queued dabs while `budget` leaves time for them (all of them with none), oldest
-    /// stroke first, beginning each stroke's op as it comes to the front and ending it once it is
-    /// over; at least one dab if any is queued and the step must make progress (always for a
-    /// brush that shows nothing ahead, else as the budget says).
+    /// first, beginning the stroke's op with its first and ending it once the stroke is over; at
+    /// least one dab if any is queued and the step must make progress (always for a brush that
+    /// shows nothing ahead, else as the budget says).
     ///
-    /// The time left is read from the clock before each stroke's batch, so a batch that ran long
-    /// leaves the next less. Dabs shown ahead keep the aim's time: a step catching up never
-    /// takes the "behind" time, which is for a brush whose stroke lags the pen.
+    /// The time left is read from the clock before the batch. Dabs shown ahead keep the aim's time:
+    /// a step catching up never takes the "behind" time, which is for a brush whose stroke lags
+    /// the pen.
     fn apply(
         &mut self,
         scene: &mut Scene<'_>,
@@ -1055,66 +1076,62 @@ impl Sculpting {
         // it, between frames) showed, then has until the next sample is due.
         let waits = self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0;
         let before_next = self.before_next_sample().filter(|_| !waits);
-        loop {
-            let Some(front) = self.strokes.front_mut() else {
-                return;
-            };
-            if front.op.is_none() {
-                match scene.project.begin_stroke() {
-                    Ok(op) => front.op = Some(op),
-                    Err(error) => {
-                        // No op, so nothing of it can be applied: it is dropped.
-                        self.strokes.pop_front();
-                        self.fail("starting a stroke's op", &error);
-                        continue;
-                    }
-                }
-            }
-            let first = report.dabs_applied == 0;
-            let unshown = front.sources.iter().find(|source| !source.shown);
-            let room = match (budget, front.sources.front(), unshown) {
-                (Some(budget), Some(_), Some(oldest)) => budget
-                    .until(oldest.times.taken)
-                    .saturating_duration_since(Instant::now()),
-                (Some(budget), Some(_), None) => {
-                    budget.aim().saturating_duration_since(Instant::now())
-                }
-                (Some(_), None, _) => Duration::ZERO,
-                (None, _, _) => Duration::MAX,
-            };
-            let catching_up = front.sources.front().is_some_and(|source| source.shown);
-            if catching_up && self.preview.is_some() && !forced {
-                // A frame's step (or one while the pen draws, with nothing left that fits) waits
-                // on no catch-up: what it shows is already shown.
-                if budget.is_some_and(|budget| !budget.forces_progress()) {
+        let Some(front) = self.stroke.as_mut() else {
+            return;
+        };
+        if front.op.is_none() {
+            match scene.project.begin_stroke() {
+                Ok(op) => front.op = Some(op),
+                Err(error) => {
+                    // No op, so nothing of it can be applied: it is dropped.
+                    self.stroke = None;
+                    self.fail("starting a stroke's op", &error);
                     return;
                 }
             }
-            let room = match (catching_up, batch, forced) {
-                (true, true, _) => room.max(CATCH_UP_BATCH),
-                // The pen draws: the catch-up has until its next sample is due.
-                (true, false, false) => before_next.map_or(Duration::ZERO, |by| {
-                    by.saturating_duration_since(Instant::now())
-                }),
-                _ => room,
-            };
-            let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
-            let (count, predicted) = self.cost.take(tiles, room, first && forced);
-            if count > 0
-                && let Some(took) = self.apply_front(scene, report, count)
-            {
-                self.cost.observe(predicted, took);
-            }
-            if !self.strokes.front().is_some_and(Pending::done) {
+        }
+        let first = report.dabs_applied == 0;
+        let unshown = front.sources.iter().find(|source| !source.shown);
+        let room = match (budget, front.sources.front(), unshown) {
+            (Some(budget), Some(_), Some(oldest)) => budget
+                .until(oldest.times.taken)
+                .saturating_duration_since(Instant::now()),
+            (Some(budget), Some(_), None) => budget.aim().saturating_duration_since(Instant::now()),
+            (Some(_), None, _) => Duration::ZERO,
+            (None, _, _) => Duration::MAX,
+        };
+        let catching_up = front.sources.front().is_some_and(|source| source.shown);
+        if catching_up && self.preview.is_some() && !forced {
+            // A frame's step (or one while the pen draws, with nothing left that fits) waits
+            // on no catch-up: what it shows is already shown.
+            if budget.is_some_and(|budget| !budget.forces_progress()) {
                 return;
             }
-            if let Some(over) = self.strokes.pop_front() {
-                self.end(scene.project, &over);
-            }
+        }
+        let room = match (catching_up, batch, forced) {
+            (true, true, _) => room.max(CATCH_UP_BATCH),
+            // The pen draws: the catch-up has until its next sample is due.
+            (true, false, false) => before_next.map_or(Duration::ZERO, |by| {
+                by.saturating_duration_since(Instant::now())
+            }),
+            _ => room,
+        };
+        let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
+        let (count, predicted) = self.cost.take(tiles, room, first && forced);
+        if count > 0
+            && let Some(took) = self.apply_front(scene, report, count)
+        {
+            self.cost.observe(predicted, took);
+        }
+        if !self.stroke.as_ref().is_some_and(Pending::done) {
+            return;
+        }
+        if let Some(over) = self.stroke.take() {
+            self.end(scene.project, &over);
         }
     }
 
-    /// Applies the oldest stroke's first `count` queued dabs in one [`apply_dabs`], adding to
+    /// Applies the stroke's first `count` queued dabs in one [`apply_dabs`], adding to
     /// `report`, and lands those of them shown. A store error drops the stroke's dabs left, ends
     /// its engine stroke, and has the spatial index rebuilt.
     ///
@@ -1127,7 +1144,7 @@ impl Sculpting {
         report: &mut BrushReport,
         count: usize,
     ) -> Option<Duration> {
-        let front = self.strokes.front_mut()?;
+        let front = self.stroke.as_mut()?;
         // Dabs shown already count for the frame that showed them.
         let sources = front
             .sources
@@ -1305,8 +1322,9 @@ impl Sculpting {
             radius: self.settings.radius().get(),
             strength: self.settings.strength().get(),
             factor: self.strength_factor,
-            drawing: !self.strokes.is_empty(),
+            drawing: self.stroke.is_some(),
             last: self.last,
+            kept: self.kept,
             errors: self.errors,
         };
         if self.status.1 == Some(key) {
@@ -1329,6 +1347,17 @@ impl Sculpting {
             last.tiles_edited,
             if last.above_limit { ", above F" } else { "" }
         ));
+        let kept = key.kept;
+        lines.push(format!(
+            "pen-down   {} tiles kept  {:.1} MiB in the budget{}",
+            kept.tiles,
+            mib(kept.bytes),
+            if kept.beyond_budget > 0 {
+                format!(", {:.1} MiB beyond it", mib(kept.beyond_budget))
+            } else {
+                String::new()
+            }
+        ));
         if let Some(error) = &self.error {
             lines.push(format!("brush err  {error}"));
         }
@@ -1337,7 +1366,7 @@ impl Sculpting {
 
     /// Notes where the pen hovers in this frame's view, for [`Brush::prepare`] to warm.
     fn note_hover(&mut self, pen: &PenFrame, view: Option<&View>) {
-        let open = self.strokes.back().is_some_and(Pending::open);
+        let open = self.stroke.as_ref().is_some_and(Pending::open);
         self.warm.wanted = match (pen.hover(), view, open) {
             (Some(hover), Some(view), false) => Some((hover.at, *view)),
             _ => None,
@@ -1438,8 +1467,9 @@ impl Brush for Sculpting {
         let view = context.camera.view(context.size);
         let mut report = BrushReport::default();
         let Some(mut scene) = Scene::of(context) else {
-            if !self.strokes.is_empty() {
-                // Kept for a frame that can place them: the strokes they belong to go on.
+            if self.stroke.is_some() || !self.deferred.is_empty() {
+                // Kept for a frame that can place them: the strokes they belong to go on, and so
+                // does a stroke that waits to begin.
                 let events = pen.brush_events().map(|event| match event {
                     ForBrush::Sample(sample) => Some(*sample),
                     ForBrush::StrokeElsewhere => None,
@@ -1469,11 +1499,12 @@ impl Brush for Sculpting {
             self.admit(&mut scene, sample);
         }
         self.work(&mut scene, &mut report, Some(budget));
-        if !self.deferred.is_empty() && self.strokes.is_empty() {
-            // The strokes before them have ended: the deferred stroke begins on what they left.
+        if !self.deferred.is_empty() && self.stroke.is_none() {
+            // The stroke before them has ended: the deferred stroke begins on what it left.
             self.release_deferred(&mut scene);
             self.work(&mut scene, &mut report, Some(budget));
         }
+        self.note_kept(scene.project.store());
         self.routed = None;
         // A frame draws what the steps before it did; one between frames leaves it to the next.
         self.unframed = budget.forces_progress()
@@ -1510,6 +1541,21 @@ impl Brush for Sculpting {
                 self.routed = Some((ray, hit));
                 Route::Brush
             }
+            // A `Down` that waits for a stroke still landing begins on what that stroke leaves:
+            // one on its fresh ridge, off the surface it began on, brushes too.
+            None if self.stroke.is_some() || !self.deferred.is_empty() => {
+                let narrow = store::Ray::new(ray.origin().to_f32(), ray.direction().to_f32());
+                let landed = narrow
+                    .map(|narrow| scene.index.raycast_triangle(scene.project.store(), &narrow));
+                match landed {
+                    Some(Ok(Some(_))) => Route::Brush,
+                    Some(Err(error)) => {
+                        self.fail("picking under the pen", &error);
+                        Route::Navigate
+                    }
+                    Some(Ok(None)) | None => Route::Navigate,
+                }
+            }
             None => Route::Navigate,
         }
     }
@@ -1525,6 +1571,7 @@ impl Brush for Sculpting {
             let budget = BrushBudget::slice(now, deadline.saturating_duration_since(now));
             let mut report = BrushReport::default();
             self.apply(&mut scene, &mut report, Some(&budget));
+            self.note_kept(scene.project.store());
             let progress = report.dabs_applied > 0;
             self.caught_up = std::mem::take(&mut self.caught_up).then(report);
             // More of it wanted only while it moves on: a pen drawing takes only dabs that fit,
@@ -1556,7 +1603,7 @@ impl Brush for Sculpting {
             loop {
                 self.lift(&mut scene, None);
                 self.work(&mut scene, &mut BrushReport::default(), None);
-                if self.deferred.is_empty() || !self.strokes.is_empty() {
+                if self.deferred.is_empty() || self.stroke.is_some() {
                     break;
                 }
                 self.release_deferred(&mut scene);
@@ -1597,6 +1644,16 @@ fn record_sample(sample: &Sample) -> RecordSample {
         twist: sample.twist().map(Twist::get),
         buttons: sample.buttons().bits(),
     }
+}
+
+/// `bytes` in MiB, for the overlay.
+fn mib(bytes: usize) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an overlay's figure: a few decimals of MiB"
+    )]
+    let bytes = bytes as f64;
+    bytes / f64::from(1_u32 << 20)
 }
 
 /// The pen's tilt as the engine takes it: the angle from upright, and the way it leans.
