@@ -173,6 +173,8 @@ fn the_strokes_path_closes_in_draws_backs_off_and_draws_again() {
             Segment::StrokeLong,
             Segment::Turn,
             Segment::StrokeHeavy,
+            Segment::Turn,
+            Segment::StrokeHuge,
             Segment::Settle
         ]
     );
@@ -191,6 +193,11 @@ fn the_strokes_path_closes_in_draws_backs_off_and_draws_again() {
     );
     assert_eq!(Segment::StrokeLong.name(), "stroke_long");
     assert_eq!(Segment::StrokeHeavy.name(), "stroke_heavy");
+    assert_eq!(Segment::StrokeHuge.name(), "stroke_huge");
+    assert!(
+        close(script.at(at(20.0)).pose, BELOW),
+        "back round, below the equator, for the huge one"
+    );
     assert_eq!(Segment::Turn.name(), "turn");
     assert_eq!(
         Script::benchmark(Speed::ONE).pen(at(0.0), at(30.0)),
@@ -237,11 +244,11 @@ fn a_scripted_pen_hovers_touches_drags_lifts_and_leaves_at_its_rate() {
         assert!((gap * PEN_RATE - 1.0).abs() < 1e-3, "{gap}");
     }
     assert_eq!(
-        near[0].radius,
-        Some(40.0),
+        near[0].size,
+        Some(BrushSize::Pixels(40.0)),
         "the stroke's size, as it enters"
     );
-    assert!(near[1..].iter().all(|s| s.radius.is_none()));
+    assert!(near[1..].iter().all(|s| s.size.is_none()));
     let mut pressing = near[down..up].iter().map(|s| s.pressure.get());
     assert!(pressing.all(|p| (0.34..=0.81).contains(&p)), "pressed");
     assert!(near[up].pressure.get() == 0.0 && near[0].pressure.get() == 0.0);
@@ -256,7 +263,7 @@ fn a_scripted_pen_hovers_touches_drags_lifts_and_leaves_at_its_rate() {
         .iter()
         .find(|s| s.time > at(7.0))
         .expect("the far stroke");
-    assert_eq!(far.radius, Some(6.0));
+    assert_eq!(far.size, Some(BrushSize::Pixels(6.0)));
 }
 
 #[test]
@@ -279,7 +286,11 @@ fn the_long_stroke_runs_fast_across_the_whole_sphere_at_forty_pixels() {
         .pen(at(11.0), at(13.0))
         .first()
         .expect("the pen enters");
-    assert_eq!(entered.radius, Some(40.0), "the default brush");
+    assert_eq!(
+        entered.size,
+        Some(BrushSize::Pixels(40.0)),
+        "the default brush"
+    );
     // From about 39° one side of the point facing the camera to 39° the other.
     let facing = |sample: &ScriptPen| {
         let eye = sample.camera.eye();
@@ -329,6 +340,55 @@ fn the_heavy_stroke_is_the_long_stroke_pressed_at_full_pressure() {
         pressing.map(|s| s.pressure).all(|p| p == Unit::ONE),
         "full pressure all the way"
     );
+}
+
+#[test]
+fn the_huge_stroke_draws_a_million_vertex_brush_for_two_seconds_then_waits_for_the_catch_up() {
+    let script = Script::strokes(Speed::ONE);
+    let span = script
+        .segments()
+        .into_iter()
+        .find(|span| span.0 == Segment::StrokeHuge)
+        .expect("the huge stroke's segment");
+    let samples = script.pen(span.1, span.2);
+    let entered = samples.first().expect("the pen enters");
+    assert_eq!(entered.phase, Phase::Enter);
+    assert_eq!(
+        entered.size,
+        Some(BrushSize::Vertices(HUGE_VERTICES)),
+        "sized by its vertices"
+    );
+    assert_eq!(HUGE_VERTICES, 1_000_000, "the spec's big brush");
+    let stroke: Vec<&ScriptPen> = samples.iter().filter(|s| s.phase.in_stroke()).collect();
+    let (first, last) = (
+        stroke.first().expect("a down"),
+        stroke.last().expect("an up"),
+    );
+    let lasted = last.time.checked_sub(first.time).expect("in order");
+    assert!(
+        (lasted.as_secs_f64() - 2.0).abs() < 0.01,
+        "a 2 s stroke: {lasted:?}"
+    );
+    let after = span
+        .2
+        .checked_sub(last.time)
+        .expect("up within the segment");
+    assert!(
+        after.as_secs_f64() >= 5.0,
+        "room for the catch-up: {after:?}"
+    );
+    let pressing = stroke.iter().filter(|s| s.phase != Phase::Up);
+    assert!(
+        pressing.map(|s| s.pressure).all(|p| p == Unit::ONE),
+        "full pressure, so the brush is the size given"
+    );
+    // Below the equator, where no other stroke of the path reaches.
+    assert!(stroke.iter().all(|s| s.point.y < 0.0), "below the equator");
+    let mut others = script
+        .pen(Duration::ZERO, span.1)
+        .iter()
+        .filter(|s| s.phase.in_stroke());
+    assert!(others.all(|s| s.point.y > 0.0), "the others above");
 }
 
 #[test]
@@ -394,7 +454,11 @@ fn the_sweep_presses_from_none_to_full_evenly_at_the_pens_rate() {
     let phases: Vec<Phase> = all.iter().map(|s| s.phase).collect();
     assert_eq!(phases.first(), Some(&Phase::Enter));
     assert_eq!(phases.last(), Some(&Phase::Leave));
-    assert_eq!(all[0].radius, Some(40.0), "the default brush");
+    assert_eq!(
+        all[0].size,
+        Some(BrushSize::Pixels(40.0)),
+        "the default brush"
+    );
     let down = phases
         .iter()
         .position(|&p| p == Phase::Down)

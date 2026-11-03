@@ -119,7 +119,7 @@ use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route
 use crate::pick::Picker;
 use crate::record::{Latency, Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
-use crate::script::{Script, ScriptPen, Segment};
+use crate::script::{BrushSize, Script, ScriptPen, Segment};
 
 /// What the brush is handed each time the frame loop calls it.
 ///
@@ -835,6 +835,11 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     latency: Option<Duration>,
     /// How far into a scripted run its pen samples have been queued: those up to here are.
     script_pen: Duration,
+    /// Why a scripted pen's brush couldn't be sized as its stroke asked
+    /// ([`Owner::script_radius`]), found as its samples were queued (between frames, where
+    /// nothing returns an error): the next frame fails with it, so a measured run never draws a
+    /// stroke at a size it didn't ask for.
+    script_failure: Option<anyhow::Error>,
     /// Whether the brush is stroking, for the overlay's pick.
     stroking: Stroking,
     /// What the brush did between the last frame and the next ([`Owner::between_frames`]), which
@@ -1043,6 +1048,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             latency_from: BTreeMap::new(),
             latency: None,
             script_pen: Duration::ZERO,
+            script_failure: None,
             stroking: Stroking::default(),
             between: None,
             between_time: Duration::ZERO,
@@ -1470,7 +1476,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// # Errors
     ///
-    /// If the brush, the uploads, the hand-off, the project's upkeep or the store's jobs fail.
+    /// If the brush, the uploads, the hand-off, the project's upkeep or the store's jobs fail,
+    /// or a scripted pen's brush couldn't be sized ([`Owner::script_failure`]).
     pub(crate) fn frame_fed(
         &mut self,
         now: Instant,
@@ -1482,6 +1489,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             .size
             .context("a frame was started with no frame size")?;
         self.pull_pen(pen, now, false);
+        if let Some(failure) = self.script_failure.take() {
+            return Err(failure);
+        }
         let reasons = self.scheduler.started(now);
         self.started += 1;
         let mut phases = OwnerPhases {
@@ -1971,8 +1981,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         });
         let samples: Vec<(ScriptPen, Pixel)> = projected.collect();
         for (sample, at) in samples {
-            if let Some(radius) = sample.radius {
-                self.brush.set_radius(radius);
+            if let Some(given) = sample.size {
+                match self.script_radius(given, &sample, size) {
+                    Ok(pixels) => self.brush.set_radius(pixels),
+                    Err(failure) => {
+                        self.script_failure.get_or_insert(failure);
+                    }
+                }
             }
             let taken = self.clock + sample.time;
             let pen = PenSample {
@@ -1989,6 +2004,58 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             };
             self.queue_pen(pen, want);
         }
+    }
+
+    /// The brush radius, in physical pixels, that a scripted pen's `sample` (entering range) sets
+    /// as `given` says, in a view of `size`: a radius in pixels as it is, or the radius whose ball
+    /// about the sample's point holds that many finest vertices ([`sculpt::radius_covering`]) as
+    /// the pixels it spans there, by the brush's own measure (a pixel's world size at the point's
+    /// view depth, [`View::pixels_per_unit`]), so the stroke freezes it back to that world radius
+    /// at the touch, from the same view.
+    ///
+    /// Sizing by vertices evaluates the tiles about the point (tens of milliseconds for a million
+    /// vertices once they are in the pool, their first evaluation more): in a hover frame, 0.3 s
+    /// before the touch, never in a stroke's.
+    ///
+    /// # Errors
+    ///
+    /// If sizing by vertices finds no picker's index (no display layer), the point isn't in view,
+    /// or a tile can't be evaluated.
+    fn script_radius(&mut self, given: BrushSize, sample: &ScriptPen, size: Size) -> Result<f32> {
+        let vertices = match given {
+            BrushSize::Pixels(pixels) => return Ok(pixels),
+            BrushSize::Vertices(vertices) => vertices,
+        };
+        let picker = self
+            .picker
+            .as_mut()
+            .context("sizing a scripted brush by its vertices needs the spatial index")?;
+        let point = sample.point;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a point on the unit sphere: f32 holds it to the index's precision"
+        )]
+        let center = geom::Vec3::new(point.x as f32, point.y as f32, point.z as f32);
+        let count = usize::try_from(vertices).unwrap_or(usize::MAX);
+        let world =
+            sculpt::radius_covering(picker.index_mut(), self.project.store(), center, count)
+                .with_context(|| format!("finding the radius that covers {vertices} vertices"))?;
+        let view = sample
+            .camera
+            .view(size)
+            .context("a scripted brush sized with no view")?;
+        let (x, y, _) = view
+            .pixel(point)
+            .context("a scripted brush sized at a point behind the eye")?;
+        let through = view.through(x, y);
+        let depth = (point - view.eye()).length() / through.length();
+        let pixels = f64::from(world) * view.pixels_per_unit() / depth;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a brush radius in pixels: f32 holds it"
+        )]
+        let pixels = pixels as f32;
+        Ok(pixels)
     }
 
     /// The input phase of a frame of `size`: the camera frames the model if that was asked for,

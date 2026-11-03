@@ -25,9 +25,10 @@
 //!
 //! # The strokes path
 //!
-//! `--script-path strokes` ([`Script::strokes`]) draws four pen strokes on the sphere, for the
-//! pen's latency (sample to present submitted), a stroke seen from a distance, and a brush that
-//! keeps up with a fast pen, lightly and pressed hard:
+//! `--script-path strokes` ([`Script::strokes`]) draws five pen strokes on the sphere, for the
+//! pen's latency (sample to present submitted), a stroke seen from a distance, a brush that
+//! keeps up with a fast pen, lightly and pressed hard, and the M1 spec's big brush of a million
+//! vertices with its catch-up:
 //!
 //! 1. **open**, 3 s still, three units away, as the benchmark path starts;
 //! 2. **approach**, 1.5 s: in to 0.3 above the surface, easing in and out;
@@ -50,7 +51,15 @@
 //! 9. **`stroke_heavy`**, 2 s still: the long stroke again, pressed at full pressure all the way
 //!    (the others rise from 0.35 to 0.8 and fall back): bigger, stronger dabs, a quarter wider than
 //!    the long stroke's widest, so more tiles a dab; the case a user pressing hard draws;
-//! 10. **settle**, 2 s still: the edits' refresh lands.
+//! 10. **turn**, 1 s: a quarter turn more, back round to the start's side, and down to 20° below
+//!     the equator, to surface not yet drawn;
+//! 11. **`stroke_huge`**, 8 s still: a stroke 2 s long at full pressure with a brush covering
+//!     [`HUGE_VERTICES`] (a million) finest vertices about its start ([`BrushSize::Vertices`],
+//!     sized on the project as the pen comes into range), over 0.6 of the view at the point facing
+//!     the camera: far above the footprint limit F, so every dab previews and catches up. The 5.5 s
+//!     after pen-up leave room to time the catch-up until the finest level is exact (the spec's
+//!     provisional target is 2 s after a 2 s stroke);
+//! 12. **settle**, 2 s still: the edits' refresh lands.
 //!
 //! The pen's samples come at the Kamvas's measured 173 Hz, in real time whatever the speed (a
 //! faster run has fewer of them): hovering over the stroke's start from 0.3 s before it touches
@@ -177,6 +186,8 @@ pub(crate) enum Segment {
     StrokeLong,
     /// Still, while the fast, long stroke is drawn again at full pressure.
     StrokeHeavy,
+    /// Still, while a stroke of a million-vertex brush is drawn and caught up.
+    StrokeHuge,
     /// Still, while one long stroke is drawn at a slant, its pressure rising from none to full.
     Sweep,
 }
@@ -197,6 +208,7 @@ impl Segment {
             Self::Turn => "turn",
             Self::StrokeLong => "stroke_long",
             Self::StrokeHeavy => "stroke_heavy",
+            Self::StrokeHuge => "stroke_huge",
             Self::Sweep => "sweep",
         }
     }
@@ -305,8 +317,16 @@ const LAST: Pose = Pose {
     ..START
 };
 
+/// The strokes path's pose for the huge stroke: three units away, back round at the start's
+/// yaw (a whole turn on), 20° below the equator, where none of the other strokes reach.
+const BELOW: Pose = Pose {
+    yaw: TAU,
+    pitch: -PITCH,
+    ..START
+};
+
 /// The strokes path's camera ([`Script::strokes`]; the module notes say why each segment).
-const STROKES: [Keyframe; 10] = [
+const STROKES: [Keyframe; 12] = [
     Keyframe {
         segment: Segment::Open,
         seconds: 3.0,
@@ -362,21 +382,40 @@ const STROKES: [Keyframe; 10] = [
         ease: Ease::Linear,
     },
     Keyframe {
+        segment: Segment::Turn,
+        seconds: 1.0,
+        to: BELOW,
+        ease: Ease::Smooth,
+    },
+    Keyframe {
+        segment: Segment::StrokeHuge,
+        seconds: 8.0,
+        to: BELOW,
+        ease: Ease::Linear,
+    },
+    Keyframe {
         segment: Segment::Settle,
         seconds: 2.0,
-        to: LAST,
+        to: BELOW,
         ease: Ease::Linear,
     },
 ];
 
+/// The finest vertices the huge stroke's brush covers about its start: the M1 spec's "brush of
+/// 1M vertices".
+///
+/// About 1,165 tiles of edits a dab on the benchmark project, by the GPU spikes' projection. Sized
+/// by its vertices, the brush does that work on any project, whatever its density there.
+pub(crate) const HUGE_VERTICES: u32 = 1_000_000;
+
 /// The strokes path's pen strokes, one in each still stroke segment (which start at 4.5 s, 8 s,
-/// 11 s and 14 s).
-const PEN_STROKES: [PenStroke; 4] = [
+/// 11 s, 14 s and 17 s).
+const PEN_STROKES: [PenStroke; 5] = [
     PenStroke {
         hover: 4.7,
         down: 5.0,
         up: 6.2,
-        radius: 40.0,
+        size: BrushSize::Pixels(40.0),
         shape: Shape::Across { span: 0.25 },
         pressure: Pressure::Swelling,
     },
@@ -384,7 +423,7 @@ const PEN_STROKES: [PenStroke; 4] = [
         hover: 8.2,
         down: 8.5,
         up: 9.7,
-        radius: 6.0,
+        size: BrushSize::Pixels(6.0),
         shape: Shape::Across { span: 0.6 },
         pressure: Pressure::Swelling,
     },
@@ -392,7 +431,7 @@ const PEN_STROKES: [PenStroke; 4] = [
         hover: 11.2,
         down: 11.5,
         up: 12.3,
-        radius: 40.0,
+        size: BrushSize::Pixels(40.0),
         shape: Shape::Across { span: 1.6 },
         pressure: Pressure::Swelling,
     },
@@ -400,8 +439,16 @@ const PEN_STROKES: [PenStroke; 4] = [
         hover: 14.2,
         down: 14.5,
         up: 15.3,
-        radius: 40.0,
+        size: BrushSize::Pixels(40.0),
         shape: Shape::Across { span: 1.6 },
+        pressure: Pressure::Full,
+    },
+    PenStroke {
+        hover: 17.2,
+        down: 17.5,
+        up: 19.5,
+        size: BrushSize::Vertices(HUGE_VERTICES),
+        shape: Shape::Across { span: 0.6 },
         pressure: Pressure::Full,
     },
 ];
@@ -449,7 +496,7 @@ const SWEEP_STROKE: PenStroke = PenStroke {
     hover: 4.7,
     down: 5.0,
     up: 6.6,
-    radius: 40.0,
+    size: BrushSize::Pixels(40.0),
     shape: Shape::Arc {
         angle: 12.0 * PI / 180.0,
         sweep: 60.0 * PI / 180.0,
@@ -495,6 +542,17 @@ pub(crate) const PEN_RATE: f64 = 173.0;
 /// How long after lifting a scripted pen leaves the tablet's range, in seconds.
 const LEAVE_AFTER: f64 = 0.1;
 
+/// A scripted stroke's brush size, set as the pen comes into range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BrushSize {
+    /// A radius in physical pixels, as the brush's keys set it.
+    Pixels(f32),
+    /// The radius that covers about this many finest vertices about the stroke's start, found
+    /// on the project (`sculpt::radius_covering`) and set as the pixels it spans there, so the
+    /// brush does the same work on any project and at any view size.
+    Vertices(u32),
+}
+
 /// One scripted pen stroke: when the pen hovers, touches and lifts, the brush's size, where the
 /// stroke runs, and how hard it presses.
 ///
@@ -508,8 +566,8 @@ pub(crate) struct PenStroke {
     down: f64,
     /// When it lifts, as `hover`; after `down`.
     up: f64,
-    /// The brush's radius for the stroke, in physical pixels, set as the pen comes into range.
-    radius: f32,
+    /// The brush's size for the stroke, set as the pen comes into range.
+    size: BrushSize,
     /// Where it runs.
     shape: Shape,
     /// How hard the pen presses along it.
@@ -585,8 +643,8 @@ pub(crate) struct ScriptPen {
     pub(crate) point: WorldPoint,
     /// Tip pressure; zero out of contact.
     pub(crate) pressure: Unit,
-    /// The brush's radius for the stroke, in physical pixels: on the stroke's first sample only.
-    pub(crate) radius: Option<f32>,
+    /// The brush's size for the stroke: on the stroke's first sample only.
+    pub(crate) size: Option<BrushSize>,
 }
 
 /// Which camera path a script runs.
@@ -595,8 +653,8 @@ pub(crate) enum ScriptPath {
     /// The renderer's measured run ([`Script::benchmark`]).
     #[default]
     Benchmark,
-    /// Four pen strokes: near, far, fast and long, and that again pressed hard
-    /// ([`Script::strokes`]).
+    /// Five pen strokes: near, far, fast and long, that again pressed hard, and a million-vertex
+    /// brush ([`Script::strokes`]).
     Strokes,
     /// One long stroke seen at a slant, pressed from none to full ([`Script::sweep`]).
     Sweep,
@@ -727,7 +785,7 @@ impl Script {
     /// the module notes).
     ///
     /// Samples come every 1/[`PEN_RATE`] s from each stroke's hover, in real time; the first
-    /// is the pen entering range (with the stroke's brush radius), those before the stroke's
+    /// is the pen entering range (with the stroke's brush size), those before the stroke's
     /// touch hover, the first at or after it is the `Down`, then `Drag`s, then an `Up` at the
     /// lift, and a `Leave` [`LEAVE_AFTER`] later.
     ///
@@ -798,7 +856,7 @@ impl Script {
             } else {
                 Unit::ZERO
             },
-            radius: (phase == Phase::Enter).then_some(stroke.radius),
+            size: (phase == Phase::Enter).then_some(stroke.size),
         }
     }
 

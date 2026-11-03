@@ -789,11 +789,10 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
     run(&mut owner, 100_000);
     assert!(owner.done(), "the script ran through");
     let settings = owner.brush().settings();
-    assert_eq!(
-        settings.radius().get(),
-        40.0,
-        "the long stroke's size, set as it entered"
-    );
+    // The huge stroke's, sized by its million vertices as it entered: on this small project,
+    // the whole model.
+    let radius = settings.radius().get();
+    assert!(radius > 40.0, "past the long stroke's 40 px: {radius}");
     assert_eq!(
         settings.strength_mode(),
         StrengthMode::Radius,
@@ -838,7 +837,7 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
     );
     assert_eq!(drained, Some(1), "the frame after pen-up carries none");
     let records = saved_strokes(owner, &dir, "scripted.bcrf");
-    assert_eq!(records.len(), 4, "four strokes, a record each");
+    assert_eq!(records.len(), 5, "five strokes, a record each");
 }
 
 /// Over the record's `frames` in `segment`: the most dabs any carried, and how many frames it took
