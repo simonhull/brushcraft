@@ -926,3 +926,91 @@ fn the_waiting_records_share_follows_the_budget() {
         "a roomy budget gives the whole share"
     );
 }
+
+/// A display preview of `key`: its record's vertices, bound `bound`, `held` as given.
+fn preview_of(store: &mut TileStore, key: TileKey, bound: f32, held: bool) -> DisplayPreview {
+    let tile = store
+        .display_for_draw(&[key])
+        .unwrap()
+        .pop()
+        .flatten()
+        .expect("a recorded tile");
+    DisplayPreview {
+        positions: tile.positions().to_vec(),
+        normals: tile.normals().to_vec(),
+        roughness: tile.roughness().to_vec(),
+        bound,
+        held,
+    }
+}
+
+#[test]
+fn a_held_tile_is_wanted_until_its_preview_is_made_and_the_refresh_waits_for_its_release() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let finest = tile_at(FaceId::new(0), 1, 1);
+    let parent = TileKey::display(FaceId::new(0), level(TOP - 1), 0, 0).unwrap();
+    assert!(!store.preview_held(&finest) && !store.preview_wanted(&parent));
+    store.hold_preview(finest);
+    store.hold_preview(finest);
+    assert!(store.preview_held(&finest), "a held finest tile");
+    assert!(store.preview_wanted(&finest), "held without a preview");
+    assert!(
+        store.preview_held(&parent),
+        "the display tiles above are held"
+    );
+    assert!(store.preview_wanted(&parent));
+    let elsewhere = TileKey::display(FaceId::new(1), level(TOP - 1), 0, 0).unwrap();
+    assert!(!store.preview_held(&elsewhere), "another face's tile isn't");
+    let made = preview_of(&mut store, parent, 1.0, true);
+    store.set_display_preview(parent, made.clone()).unwrap();
+    assert!(!store.preview_wanted(&parent), "its preview is made");
+    assert_eq!(store.display_preview(&parent), Some(&made));
+    // Edits under it bring the refresh, which waits while the tile is held.
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 20, 3));
+    // The jobs don't finish while it is held: a few slices of them.
+    for _ in 0..20 {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(20))
+            .unwrap();
+    }
+    assert_eq!(
+        store.display_preview(&parent),
+        Some(&made),
+        "the refresh left the held tile alone"
+    );
+    // Holding is a set: one release releases it.
+    store.release_preview(&finest);
+    assert!(!store.preview_held(&parent), "released");
+    run_all(&mut store);
+    assert_eq!(
+        store.display_preview(&parent),
+        None,
+        "the refresh replaced the released preview"
+    );
+    assert_layer_current(&mut store, "refreshed after the release");
+}
+
+#[test]
+fn a_display_preview_must_be_of_a_display_tile_and_its_side() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let parent = TileKey::display(FaceId::new(0), level(TOP - 1), 0, 0).unwrap();
+    let mut made = preview_of(&mut store, parent, 1.0, false);
+    let finest = tile_at(FaceId::new(0), 1, 1);
+    assert!(matches!(
+        store.set_display_preview(finest, made.clone()),
+        Err(CacheError::NotATile(_))
+    ));
+    made.normals.pop();
+    assert!(matches!(
+        store.set_display_preview(parent, made),
+        Err(CacheError::NotItsBlock(_))
+    ));
+    assert_eq!(store.display_preview(&parent), None, "nothing kept");
+}

@@ -136,6 +136,8 @@ impl TileStore {
             self.display_generations
                 .insert(*tile.key(), self.display_builds);
             self.bumped.remove(tile.key());
+            // The refresh's epoch names it: what is drawn of it is its record again.
+            self.refreshed_preview(tile.key());
             if tile.key().level() <= self.floor_top {
                 self.floor
                     .insert(*tile.key(), DisplayRecord::of(tile, finest));
@@ -431,6 +433,20 @@ impl TileStore {
     #[must_use]
     pub fn display_stored_error(&self, key: &TileKey) -> Option<f32> {
         self.bumped.get(key).map(|bumped| bumped.record.error)
+    }
+
+    /// What changed under display tile `key` since its record was built, if anything did (its
+    /// bound raised by a stroke): how far the steps since moved any finest vertex under it, at most
+    /// (their displacements summed, rounded up), and the finest tiles under it they moved.
+    ///
+    /// What a brush making the tile's preview from its record ([`TileStore::display_for_draw`])
+    /// needs: the vertices inside those finest tiles are behind the store's surface, the others
+    /// are as recorded.
+    #[must_use]
+    pub fn display_changes(&self, key: &TileKey) -> Option<(f32, &BTreeSet<TileKey>)> {
+        self.bumped
+            .get(key)
+            .map(|bumped| ((bumped.extra * 0.5).next_up(), &bumped.finest))
     }
 
     /// Every display tile a stroke changed since its last refresh: its bump's displacements,

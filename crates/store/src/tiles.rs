@@ -166,6 +166,7 @@ pub use frames::{ParentSlots, Predictor};
 pub(crate) use layers::{Saved, Snapshot};
 pub use pen_down::{MadePenDown, PenDownMaker, PenDownShape, PenDownTaker, TakenShape};
 pub use pins::PinGuard;
+pub use preview::DisplayPreview;
 pub use read::WaveBounds;
 
 /// A [`TileStore`]'s identity among the stores the process opens ([`TileStore::id`]).
