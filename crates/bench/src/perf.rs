@@ -521,6 +521,23 @@ fn report<J: Write, H: Write>(
     Ok((flagged, noisy))
 }
 
+/// Runs `strokes-summary`: the pen's numbers from the app's records in `options.records`
+/// ([`render::summary`]).
+///
+/// # Errors
+///
+/// If no directory was given, it holds no record, a record doesn't read, or writing fails.
+pub(crate) fn strokes_summary<J: Write, H: Write>(
+    options: &Options,
+    out: &mut Output<J, H>,
+) -> Result<()> {
+    let dir = options
+        .records
+        .as_deref()
+        .context("strokes-summary needs --records DIR")?;
+    render::summary::run(dir, out)
+}
+
 /// Runs `perf` (see the module notes); `paths.project` is the full project for `--full`.
 ///
 /// # Errors

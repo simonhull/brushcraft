@@ -5,11 +5,14 @@
 //! `stroke_huge`, the record's segments; the last a brush of a million vertices, far above F, the
 //! M1 spec's big brush); each gives, over its segment's frames:
 //!
-//! - **sample to present**, p99: from the oldest pen sample whose dabs a frame applied to its
-//!   present being submitted, over the frames that applied dabs (the M1 spec's pen latency: ≤ 8 ms
-//!   at p99 below the footprint limit F, and the same through the preview for the big brush);
-//! - **frame start to present submitted**, p99, over the same frames: the frame's own share;
-//! - **brush**, p99, over the same frames: the frame's brush phase (the work between frames, whose
+//! - **sample to present**, p50 and p99: from the oldest pen sample whose dabs a frame showed first
+//!   (applied, or previewed ahead of their finest work) to its present being submitted, over the
+//!   frames that showed a pen sample's dabs first, the **pen's frames** (the M1 spec's pen latency:
+//!   ≤ 8 ms at p99 below the footprint limit F, and the same through the preview for the big
+//!   brush). A frame applying only a catch-up of dabs shown before shows no sample first: it isn't
+//!   one of them;
+//! - **frame start to present submitted**, p99, over the pen's frames: the frame's own share;
+//! - **brush**, p99, over the pen's frames: the frame's brush phase (the work between frames, whose
 //!   edits it shows, is the record's `between_ms`, not counted here);
 //! - **most dabs carried**: the most any frame left neither applied nor shown for the next: the
 //!   stroke's lag behind the pen. A brush that keeps up carries at most a few samples' worth for a
@@ -69,6 +72,7 @@ pub(crate) const MOST_CARRIED: f64 = 8.0;
 macro_rules! names {
     ($segment:literal) => {
         [
+            concat!("render.", $segment, ".sample_to_present_p50_ms"),
             concat!("render.", $segment, ".sample_to_present_p99_ms"),
             concat!("render.", $segment, ".start_to_submitted_p99_ms"),
             concat!("render.", $segment, ".brush_p99_ms"),
@@ -86,7 +90,7 @@ macro_rules! names {
 
 /// Each metric's name after the scale, by segment (as [`SEGMENTS`]) and then in
 /// [`StrokeMetrics::named`]'s order.
-const NAMES: [[&str; 11]; 5] = [
+const NAMES: [[&str; 12]; 5] = [
     names!("stroke_near"),
     names!("stroke_far"),
     names!("stroke_long"),
@@ -121,6 +125,8 @@ pub(crate) enum Drain {
 /// One stroke's metrics from one run; `None` for one the record can't give.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct StrokeMetrics {
+    /// Sample to present submitted, p50, in ms.
+    pub(crate) sample_to_present_p50: Option<f64>,
     /// Sample to present submitted, p99, in ms.
     pub(crate) sample_to_present_p99: Option<f64>,
     /// Frame start to present submitted, p99, in ms.
@@ -155,15 +161,16 @@ pub(crate) fn derive(recorded: &Recorded) -> [StrokeMetrics; 5] {
     })
 }
 
-/// One stroke's metrics from its segment's `frames`, in order.
-fn stroke(frames: &[&Frame]) -> StrokeMetrics {
+/// One stroke's metrics from its segment's `frames`, in order (the settle frames, which look
+/// past the segment, aside).
+pub(crate) fn stroke(frames: &[&Frame]) -> StrokeMetrics {
     if frames.is_empty() {
         return StrokeMetrics::default();
     }
-    let brushed = frames
+    let pens = frames
         .iter()
-        .filter(|frame| frame.dabs_applied.is_some_and(|dabs| dabs > 0.0));
-    let brushed: Vec<&&Frame> = brushed.collect();
+        .filter(|frame| frame.sample_to_present_ms.is_some());
+    let brushed: Vec<&&Frame> = pens.collect();
     let latency: Vec<f64> = brushed
         .iter()
         .filter_map(|f| f.sample_to_present_ms)
@@ -181,6 +188,7 @@ fn stroke(frames: &[&Frame]) -> StrokeMetrics {
     let open = frames.iter().filter(|f| f.stroke_open == Some(true));
     let jumps = open.filter_map(|f| f.level_jump);
     StrokeMetrics {
+        sample_to_present_p50: percentile(&latency, 50),
         sample_to_present_p99: percentile(&latency, 99),
         start_to_submitted_p99: percentile(&start_to_submitted, 99),
         brush_p99: percentile(&brush, 99),
@@ -271,6 +279,7 @@ impl StrokeMetrics {
             None => Value::Lacking,
         };
         let [
+            median,
             latency,
             start,
             brush,
@@ -284,6 +293,7 @@ impl StrokeMetrics {
             jump,
         ] = *names;
         vec![
+            (median, Unit::Ms, self.sample_to_present_p50.into()),
             (latency, Unit::Ms, self.sample_to_present_p99.into()),
             (start, Unit::Ms, self.start_to_submitted_p99.into()),
             (brush, Unit::Ms, self.brush_p99.into()),

@@ -1,6 +1,6 @@
 //! `brushcraft-bench`: the M0 benchmark harness.
 //!
-//! Eight subcommands, headless, over the benchmark project (see [`cli::USAGE`]):
+//! Subcommands, headless, over the benchmark project (see [`cli::USAGE`]):
 //!
 //! - `generate` builds the benchmark sphere (`cube_sphere(20)`, levels 1 to 9: 1.26 billion
 //!   triangles) with fBm-noise corrections at every level, and saves it ([`generate`]);
@@ -16,7 +16,10 @@
 //!   file's growth, and the refresh after each brush step ([`display_layer`]);
 //! - `display-study` measures every candidate display-tile encoding on the project's faces: file
 //!   growth, the error bound, decode cost and seam exactness (`display_study`, built with the
-//!   `display-study` feature only).
+//!   `display-study` feature only);
+//! - `strokes-summary` reads the app's records of measured strokes (`brushcraft --record`) and
+//!   gives the pen's numbers, a row a stroke (`perf::render::summary`), for the measured runs
+//!   `scripts/measure-strokes.sh` makes.
 //!
 //! Each result is a JSON line on stdout (`{"bench": …, "result": …, …}`); progress and a human
 //! summary go to stderr. The project lives outside the repository, under
@@ -62,18 +65,20 @@ use crate::report::Output;
 /// Whatever the subcommand fails with.
 fn run<J: Write, H: Write>(command: &Command, out: &mut Output<J, H>) -> Result<Status> {
     let options = &command.options;
-    let paths = Paths::resolve(options.project.as_deref())?;
+    // Every subcommand but `strokes-summary`, which reads records alone, works on a project.
+    let paths = || Paths::resolve(options.project.as_deref());
     match command.subcommand {
-        Subcommand::Generate => generate::run(options, &paths, out),
-        Subcommand::PageIn => page_in::run(options, &paths, out),
-        Subcommand::Brush => brush::run(options, &paths, out),
-        Subcommand::Save => brush::run_save(options, &paths, out),
-        Subcommand::Budget => budget::run(options, &paths, out),
-        Subcommand::Perf => return perf::run(options, &paths, out),
-        Subcommand::Display => display_layer::run(options, &paths, out),
-        Subcommand::DisplaySave => display_layer::run_save(options, &paths, out),
+        Subcommand::Generate => generate::run(options, &paths()?, out),
+        Subcommand::PageIn => page_in::run(options, &paths()?, out),
+        Subcommand::Brush => brush::run(options, &paths()?, out),
+        Subcommand::Save => brush::run_save(options, &paths()?, out),
+        Subcommand::Budget => budget::run(options, &paths()?, out),
+        Subcommand::Perf => return perf::run(options, &paths()?, out),
+        Subcommand::Display => display_layer::run(options, &paths()?, out),
+        Subcommand::DisplaySave => display_layer::run_save(options, &paths()?, out),
+        Subcommand::StrokesSummary => perf::strokes_summary(options, out),
         #[cfg(feature = "display-study")]
-        Subcommand::DisplayStudy => display_study::run(options, &paths, out),
+        Subcommand::DisplayStudy => display_study::run(options, &paths()?, out),
         #[cfg(not(feature = "display-study"))]
         Subcommand::DisplayStudy => Err(anyhow::anyhow!(
             "built without the display-study feature: \

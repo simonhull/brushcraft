@@ -43,6 +43,10 @@ subcommands:
   display-study  every display-tile encoding measured on sampled faces: file growth, the
              error bound, decode cost and seam exactness (reads the project, saves nothing;
              needs the display-study feature)
+  strokes-summary  the pen's numbers, a row a stroke, from the app's records (brushcraft
+             --record) in --records DIR: sample to present p50 and p99, the brush, the queue,
+             the catch-up and time to exact, level jumps, tiles a dab, each target marked
+             (scripts/measure-strokes.sh makes the records and runs it)
 
 options (each subcommand takes the ones it uses):
   --project PATH          the project file (default $XDG_CACHE_HOME/brushcraft/bench/sphere.bcrf);
@@ -81,6 +85,7 @@ options (each subcommand takes the ones it uses):
             reaching 2 during a part labels the run loaded)
             Exit status 3 when a metric got worse beyond its noise; else 4 when one was too
             noisy to compare (its noise band over 25 %).
+  strokes-summary: --records DIR (every *.jsonl in it, in name order)
 
 Results go to stdout as JSON lines; progress and a human summary go to stderr.";
 
@@ -105,11 +110,13 @@ pub(crate) enum Subcommand {
     Display,
     /// Rebuild the display layer and save it.
     DisplaySave,
+    /// Summarise the pen's numbers from the app's records.
+    StrokesSummary,
 }
 
 impl Subcommand {
     /// Every subcommand.
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Generate,
         Self::PageIn,
         Self::Brush,
@@ -119,6 +126,7 @@ impl Subcommand {
         Self::DisplayStudy,
         Self::Display,
         Self::DisplaySave,
+        Self::StrokesSummary,
     ];
 
     /// The subcommand's name on the command line and in the JSON records.
@@ -133,6 +141,7 @@ impl Subcommand {
             Self::DisplayStudy => "display-study",
             Self::Display => "display",
             Self::DisplaySave => "display-save",
+            Self::StrokesSummary => "strokes-summary",
         }
     }
 
@@ -149,7 +158,8 @@ impl Subcommand {
             | Self::Perf
             | Self::DisplayStudy
             | Self::Display
-            | Self::DisplaySave => 2048,
+            | Self::DisplaySave
+            | Self::StrokesSummary => 2048,
             Self::PageIn => 4096,
             Self::Budget => 1024,
         }
@@ -159,10 +169,15 @@ impl Subcommand {
     fn takes(self, flag: Flag) -> bool {
         use Flag::{
             Amplitude, Baseline, BudgetMib, Dabs, Display, Footprint, Force, Full, History, Level,
-            Levels, Moves, NoStages, PerStep, Pool, Project, RegionQuads, Samples, Seed,
+            Levels, Moves, NoStages, PerStep, Pool, Project, Records, RegionQuads, Samples, Seed,
             SettleSecs, Splits, Steps, StepsPerMove, Strength, Tiny, ViewTiles, Workers,
         };
+        if self == Self::StrokesSummary {
+            // It reads records, nothing else: no project, store or workers.
+            return flag == Records;
+        }
         match flag {
+            Records => false,
             Project | Workers => true,
             BudgetMib | Seed => self != Self::Perf,
             Splits | Levels | Amplitude | Force => self == Self::Generate,
@@ -307,11 +322,13 @@ enum Flag {
     Display,
     /// `--dabs`.
     Dabs,
+    /// `--records`.
+    Records,
 }
 
 impl Flag {
     /// Every flag with its name, without the leading `--`.
-    const NAMES: [(Self, &'static str); 27] = [
+    const NAMES: [(Self, &'static str); 28] = [
         (Self::Project, "project"),
         (Self::BudgetMib, "budget-mib"),
         (Self::Seed, "seed"),
@@ -339,6 +356,7 @@ impl Flag {
         (Self::SettleSecs, "settle-secs"),
         (Self::Display, "display"),
         (Self::Dabs, "dabs"),
+        (Self::Records, "records"),
     ];
 
     /// Whether the flag is a switch, taking no value.
@@ -413,6 +431,8 @@ pub(crate) struct Options {
     pub(crate) workers: Workers,
     /// `perf`: the history directory to append to and compare with.
     pub(crate) history: Option<PathBuf>,
+    /// `strokes-summary`: the directory of the app's records to summarise.
+    pub(crate) records: Option<PathBuf>,
     /// `perf`: mark the run as the new baseline.
     pub(crate) baseline: bool,
     /// `perf`: the projects measured.
@@ -468,6 +488,7 @@ impl Options {
             view_tiles: 2000,
             workers: Workers::PhysicalCores,
             history: None,
+            records: None,
             baseline: false,
             projects: Projects::Medium,
             stages: true,
@@ -521,6 +542,7 @@ impl Options {
             Flag::Display => self.display = DisplayLayer::Kept,
             Flag::Project => self.project = Some(path()?),
             Flag::History => self.history = Some(path()?),
+            Flag::Records => self.records = Some(path()?),
             Flag::BudgetMib => self.budget_mib = parse(flag, text()?)?,
             Flag::Seed => self.seed = parse(flag, text()?)?,
             Flag::Splits => self.splits = positive(flag, text()?)?,
@@ -622,8 +644,8 @@ impl Command {
     /// # Errors
     ///
     /// On a missing or unknown subcommand, an unknown flag or one the subcommand doesn't take,
-    /// a flag without its value, a value that doesn't parse, a stray argument, or
-    /// `display-save` without `--project`.
+    /// a flag without its value, a value that doesn't parse, a stray argument,
+    /// `display-save` without `--project`, or `strokes-summary` without `--records`.
     pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut args = args.into_iter();
         let first = args.next().ok_or_else(|| anyhow!("no subcommand"))?;
@@ -665,6 +687,10 @@ impl Command {
             subcommand != Subcommand::DisplaySave || options.project.is_some(),
             "display-save writes into the project: name it with --project (a reflinked copy of \
              the benchmark project, never the one perf measures)"
+        );
+        ensure!(
+            subcommand != Subcommand::StrokesSummary || options.records.is_some(),
+            "strokes-summary reads the app's records: name their directory with --records"
         );
         Ok(Self {
             subcommand,
@@ -813,8 +839,20 @@ mod tests {
                 "display-save --project /tmp/x.bcrf --steps 3",
                 "steps for display-save, which doesn't brush",
             ),
+            ("strokes-summary", "a summary of no records"),
+            (
+                "strokes-summary --records /d --project /p.bcrf",
+                "a project for a summary of records",
+            ),
+            (
+                "brush --records /d",
+                "records for a subcommand that makes none",
+            ),
         ] {
             assert!(parse(args).is_err(), "{what}: {args:?}");
         }
+        let summary = parse("strokes-summary --records /tmp/task9").unwrap();
+        assert_eq!(summary.subcommand, Subcommand::StrokesSummary);
+        assert_eq!(summary.options.records, Some(PathBuf::from("/tmp/task9")));
     }
 }

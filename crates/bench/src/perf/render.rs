@@ -61,6 +61,7 @@ use crate::perf::suite::{AppExit, Runner, Samples};
 
 mod clocks;
 mod strokes;
+pub(crate) mod summary;
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
@@ -173,6 +174,8 @@ pub(crate) struct Frame {
     /// The largest level change of a tile the stroke edited since the cut before, if its cut
     /// came back and drew one.
     pub(crate) level_jump: Option<f64>,
+    /// Tiles its dabs edited, summed over its brush steps.
+    pub(crate) tiles_edited: Option<f64>,
 }
 
 impl Frame {
@@ -202,6 +205,10 @@ impl Frame {
 pub(crate) struct Recorded {
     /// The GPU's name and backend, as the app gave it.
     pub(crate) adapter: String,
+    /// The project the run opened, as the app gave it.
+    pub(crate) project: String,
+    /// The frame's width and height, in pixels, if the record gives them.
+    pub(crate) size: Option<(f64, f64)>,
     /// From the project beginning to open to the frame loop's clock starting, in ms.
     pub(crate) open_ms: f64,
     /// The frame loop's clock's start, in ms since the Unix epoch by the system clock, if the
@@ -263,6 +270,9 @@ impl Recorded {
             Some("run") => {
                 let adapter = object.get("adapter").and_then(Json::as_str);
                 adapter.unwrap_or_default().clone_into(&mut self.adapter);
+                let project = object.get("project").and_then(Json::as_str);
+                project.unwrap_or_default().clone_into(&mut self.project);
+                self.size = number(object, "width").zip(number(object, "height"));
                 self.open_ms = required(object, "open_ms")?;
                 self.clock_unix_ms = number(object, "clock_unix_us").map(|us| us / 1e3);
                 self.refresh_ms = number(object, "refresh_ms");
@@ -302,6 +312,7 @@ impl Recorded {
                 above_f: object.get("above_f").and_then(Json::as_bool),
                 stroke_open: object.get("stroke_open").and_then(Json::as_bool),
                 level_jump: number(object, "level_jump"),
+                tiles_edited: number(object, "tiles_edited"),
             }),
             _ => {}
         }
