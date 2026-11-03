@@ -27,6 +27,9 @@
 //! - [`big_dab_ridge`]: a whole dab of a big brush (radius [`BIG_RADIUS`], about 300 tiles), placed
 //!   and applied, on a ridge of its dabs: more changed tiles a dab than the store keeps placement's
 //!   pen-down positions made for.
+//! - [`area_normal_cold`]: [`Surface::area_normal`] of a big dab (about 70 tiles, [`FAR_RADIUS`])
+//!   where nothing has been evaluated yet: what placement pays as a big stroke moves onto fresh
+//!   ground.
 //! - [`show_far`]: [`Preview::show`] of the next dab of a stroke whose earlier dabs are all still
 //!   shown (none landed: the catch-up far behind), at about 70 tiles a dab ([`FAR_RADIUS`]) and for
 //!   the big brush (about 300 tiles, past a million vertices), drawn as a renderer far off draws
@@ -70,6 +73,9 @@ const FAR_RADIUS: f32 = 0.35;
 
 /// The radius of [`show_far`]'s big brush: about a million vertices, some 240 tiles a dab.
 const MILLION_RADIUS: f32 = 0.73;
+
+/// How many fresh places [`area_normal_cold`] spreads over the sphere: as many as its samples.
+const COLD_PLACES: u32 = 12;
 
 /// How many levels below the finest [`show_far`]'s cut on display tiles is: a big brush seen from
 /// far enough that its 70 tiles fit a 40-pixel radius.
@@ -570,4 +576,43 @@ fn show_far(bencher: divan::Bencher<'_, '_>, (what, radius, drawing): (&str, f32
         .count();
     let displays = ridge.project.store().display_previewed().count();
     eprintln!("show_far {what}: {tiles} tiles a dab, {displays} display previews");
+}
+
+/// [`Surface::area_normal`] of a dab of [`FAR_RADIUS`] over cold ground: see the module notes.
+///
+/// Every sample starts with the store's pools emptied ([`store::TileStore::evict_all`]), at a fresh
+/// place: [`COLD_PLACES`] spread over the sphere by a golden spiral.
+///
+/// # Panics
+///
+/// If the area normal fails, which would be a bug.
+#[divan::bench(sample_count = 12, sample_size = 1)]
+fn area_normal_cold(bencher: divan::Bencher<'_, '_>) {
+    let ridge = RefCell::new(Ridge::made(FAR_RADIUS, 0, false));
+    let mut k = 0_u32;
+    bencher
+        .with_inputs(|| {
+            k += 1;
+            // The golden spiral's place `k` of `COLD_PLACES`.
+            #[expect(clippy::cast_precision_loss, reason = "a dozen places")]
+            let (n, total) = ((k % COLD_PLACES) as f32 + 0.5, COLD_PLACES as f32);
+            let z = 1.0 - 2.0 * n / total;
+            let around = n * std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+            let flat = (1.0 - z * z).max(0.0).sqrt();
+            ridge
+                .borrow_mut()
+                .project
+                .store()
+                .evict_all()
+                .expect("emptied");
+            Vec3::new(flat * around.cos(), flat * around.sin(), z)
+        })
+        .bench_local_values(|direction| {
+            let ridge = &mut *ridge.borrow_mut();
+            let centre = DVec3::from_f32(direction);
+            let mut surface = StoreSurface::new(ridge.project.store(), &ridge.index);
+            let sum = surface.area_normal(centre, centre, f64::from(FAR_RADIUS), 0.0);
+            surface.finish().expect("the area normal");
+            sum
+        });
 }

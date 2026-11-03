@@ -468,13 +468,15 @@ impl<'a> StoreSurface<'a> {
             }
             return Ok(Some(sum));
         }
-        // The unchanged tiles' positions first, on this thread; a changed tile's positions are
-        // made on its worker.
-        for &key in &keys {
-            if self.store.pen_down_shape(&key).is_none() {
-                self.store.evaluate(key)?;
-            }
-        }
+        // The unchanged tiles' positions first, evaluated together on the store's workers (one
+        // after another here, a big dab's fresh ground was most of a pen frame); a changed tile's
+        // positions are made on its worker.
+        let unchanged: Vec<TileKey> = keys
+            .iter()
+            .filter(|key| self.store.pen_down_shape(key).is_none())
+            .copied()
+            .collect();
+        self.store.evaluate_many(&unchanged, Evaluation::Positions)?;
         let store = &*self.store;
         let at_hand: Vec<(TileKey, PenDownTile<'_>)> = keys
             .iter()
