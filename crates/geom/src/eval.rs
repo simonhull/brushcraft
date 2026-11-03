@@ -111,6 +111,12 @@ impl Grid {
         &self.data
     }
 
+    /// All positions, row-major, taken out of the grid without a copy.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<Vec3> {
+        self.data
+    }
+
     /// All positions, row-major, to write in place.
     pub(crate) fn data_mut(&mut self) -> &mut [Vec3] {
         &mut self.data

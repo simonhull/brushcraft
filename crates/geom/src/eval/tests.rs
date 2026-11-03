@@ -737,6 +737,7 @@ fn apply_into_matches_apply() {
             prediction.apply_into(&c, &mut out).unwrap();
             let bits = |v: &[Vec3]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&out), bits(grid.as_slice()), "{region:?}");
+            assert_eq!(bits(&grid.into_vec()), bits(&out), "{region:?}: taken out");
         }
     }
 }
