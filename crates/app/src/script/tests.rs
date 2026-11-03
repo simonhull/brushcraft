@@ -142,6 +142,7 @@ fn a_pose_puts_the_eye_where_its_angles_say() {
         yaw: 0.7,
         pitch: 0.3,
         distance: 2.0,
+        lowered: 0.0,
     };
     let eye = pose.camera().eye();
     let want = [
@@ -199,6 +200,7 @@ fn the_strokes_path_closes_in_draws_backs_off_and_draws_again() {
     for (text, path) in [
         ("benchmark", ScriptPath::Benchmark),
         ("strokes", ScriptPath::Strokes),
+        ("sweep", ScriptPath::Sweep),
     ] {
         assert_eq!(text.parse::<ScriptPath>(), Ok(path));
     }
@@ -327,4 +329,140 @@ fn the_heavy_stroke_is_the_long_stroke_pressed_at_full_pressure() {
         pressing.map(|s| s.pressure).all(|p| p == Unit::ONE),
         "full pressure all the way"
     );
+}
+
+#[test]
+fn a_lowered_pose_slides_the_camera_down_without_turning_it() {
+    let level = SLANTED.camera();
+    let centred = Pose {
+        lowered: 0.0,
+        ..SLANTED
+    }
+    .camera();
+    let down = centred.eye() - level.eye();
+    let up = centred.axis(Vec3::new(0.0, 1.0, 0.0));
+    assert!((down.dot(up) - 0.6).abs() < 1e-12, "0.6 down: {down:?}");
+    assert!(
+        (down.dot(down) - 0.36).abs() < 1e-12,
+        "and only down: {down:?}"
+    );
+    let forward = Vec3::new(0.0, 0.0, 1.0);
+    let turned = level.axis(forward) - centred.axis(forward);
+    assert!(turned.dot(turned) < 1e-24, "not turned: {turned:?}");
+    let halfway = START.toward(SLANTED, 0.5);
+    assert!((halfway.lowered - 0.3).abs() < 1e-12, "{halfway:?}");
+}
+
+#[test]
+fn the_sweep_path_closes_in_on_a_slant_draws_once_and_settles() {
+    let script = Script::sweep(Speed::ONE);
+    let names: Vec<Segment> = script.segments().iter().map(|span| span.0).collect();
+    assert_eq!(
+        names,
+        [
+            Segment::Open,
+            Segment::Approach,
+            Segment::Sweep,
+            Segment::Settle
+        ]
+    );
+    assert!(close(script.at(at(1.0)).pose, START), "opens far");
+    assert!(
+        close(script.at(at(6.0)).pose, SLANTED),
+        "close for the sweep"
+    );
+    let end = script.at(script.duration());
+    assert!(end.over && close(end.pose, SLANTED), "{end:?}");
+    assert_eq!(script.duration(), at(9.5));
+    assert_eq!(Segment::Sweep.name(), "sweep");
+    assert_eq!(Script::new(ScriptPath::Sweep, Speed::ONE), script);
+}
+
+/// The sweep path's samples from its `Down` to its `Up`.
+fn sweep_stroke(script: &Script) -> Vec<&ScriptPen> {
+    let stroke = script
+        .pen(at(0.0), at(30.0))
+        .iter()
+        .filter(|s| s.phase.in_stroke());
+    stroke.collect()
+}
+
+#[test]
+fn the_sweep_presses_from_none_to_full_evenly_at_the_pens_rate() {
+    let script = Script::sweep(Speed::ONE);
+    let all = script.pen(at(0.0), at(30.0));
+    let phases: Vec<Phase> = all.iter().map(|s| s.phase).collect();
+    assert_eq!(phases.first(), Some(&Phase::Enter));
+    assert_eq!(phases.last(), Some(&Phase::Leave));
+    assert_eq!(all[0].radius, Some(40.0), "the default brush");
+    let down = phases
+        .iter()
+        .position(|&p| p == Phase::Down)
+        .expect("a down");
+    let up = phases.iter().position(|&p| p == Phase::Up).expect("an up");
+    // 0.3 s of hover, 1.6 s of stroke, at 173 Hz.
+    assert!((51..=53).contains(&down), "{down}");
+    assert!((327..=331).contains(&up), "{up}");
+    assert!(phases[down + 1..up].iter().all(|&p| p == Phase::Drag));
+    let gaps = all[..up]
+        .windows(2)
+        .map(|w| w[1].time.checked_sub(w[0].time).unwrap().as_secs_f64());
+    for gap in gaps {
+        assert!((gap * PEN_RATE - 1.0).abs() < 1e-3, "{gap}");
+    }
+    let stroke = sweep_stroke(&script);
+    let (first, last) = (stroke[0], stroke[stroke.len() - 1]);
+    let lasted = last.time.checked_sub(first.time).unwrap().as_secs_f64();
+    assert!((lasted - 1.6).abs() < PEN_RATE.recip(), "{lasted}");
+    // Linear in time from the touch (the first sample at or after it is the `Down`): none
+    // there, full at the lift.
+    let pressing = &stroke[..stroke.len() - 1];
+    let touch = pressing[0].pressure.get();
+    assert!(touch < 0.004, "next to none at the touch: {touch}");
+    for sample in pressing {
+        let into = sample.time.as_secs_f64() - SWEEP_STROKE.down;
+        let want = into / 1.6;
+        let got = f64::from(sample.pressure.get());
+        assert!((got - want).abs() < 1e-6, "{into} s in: {got}, not {want}");
+    }
+    let pressures = pressing.iter().map(|s| s.pressure.get());
+    let rising: Vec<f32> = pressures.collect();
+    assert!(rising.windows(2).all(|w| w[0] < w[1]), "rising all the way");
+    let full = rising[rising.len() - 1];
+    assert!(full > 0.995, "full by the lift: {full}");
+    assert_eq!(last.pressure, Unit::ZERO, "none once lifted");
+}
+
+#[test]
+fn the_sweep_runs_across_the_view_on_the_sphere_seen_at_a_slant() {
+    let script = Script::sweep(Speed::ONE);
+    let size = render::surface::Size::new(1280, 800).unwrap();
+    let stroke = sweep_stroke(&script);
+    let mut xs = Vec::new();
+    for sample in &stroke {
+        let p = sample.point;
+        assert!((p.length() - 1.0).abs() < 1e-9, "on the sphere: {p:?}");
+        let eye = sample.camera.eye();
+        let ray = WorldPoint::new(eye.x - p.x, eye.y - p.y, eye.z - p.z);
+        let slant = (ray.dot(p) / ray.length()).acos().to_degrees();
+        assert!((36.0..38.0).contains(&slant), "seen at about 37°: {slant}");
+        let view = sample.camera.view(size).unwrap();
+        let (x, y, _) = view.pixel(p).expect("in front of the eye");
+        assert!((0.0..800.0).contains(&y), "in the view: {y}");
+        xs.push(x);
+    }
+    assert!(xs.windows(2).all(|w| w[0] < w[1]), "left to right");
+    let (left, right) = (xs[0], xs[xs.len() - 1]);
+    assert!(
+        left < 320.0 && right > 960.0,
+        "across the view: {left} to {right}"
+    );
+    assert!(
+        (left + right - 1280.0).abs() < 1.0,
+        "centred: {left} to {right}"
+    );
+    let eye = stroke[0].camera.eye();
+    let middle = stroke[stroke.len() / 2].point;
+    let near = WorldPoint::new(eye.x - middle.x, eye.y - middle.y, eye.z - middle.z).length();
+    assert!((0.4..0.6).contains(&near), "close: {near}");
 }

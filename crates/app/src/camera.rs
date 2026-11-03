@@ -284,9 +284,15 @@ impl Camera {
     /// depth, the scene keeps pace with the pointer.
     pub(crate) fn pan(&mut self, dx: f64, dy: f64, height: f64) {
         let per_pixel = 2.0 * self.distance * (self.fov_y / 2.0).tan() / height.max(1.0);
-        let right = self.axis(Vec3::new(1.0, 0.0, 0.0));
-        let up = self.axis(Vec3::new(0.0, 1.0, 0.0));
-        self.target = self.target - right * (dx * per_pixel) + up * (dy * per_pixel);
+        self.slide(-dx * per_pixel, dy * per_pixel);
+    }
+
+    /// Moves the target, and the eye with it, `right` and `up` world units along the view's own
+    /// axes: the view slides across the scene without turning.
+    pub(crate) fn slide(&mut self, right: f64, up: f64) {
+        let right_axis = self.axis(Vec3::new(1.0, 0.0, 0.0));
+        let up_axis = self.axis(Vec3::new(0.0, 1.0, 0.0));
+        self.target = self.target + right_axis * right + up_axis * up;
     }
 
     /// Moves the eye towards the target (`factor` below 1) or away (above 1), scaling the

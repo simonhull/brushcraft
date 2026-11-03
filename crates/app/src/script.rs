@@ -55,9 +55,25 @@
 //! The pen's samples come at the Kamvas's measured 173 Hz, in real time whatever the speed (a
 //! faster run has fewer of them): hovering over the stroke's start from 0.3 s before it touches
 //! (so the brush warms the surface under it), then down, along the path with the pressure rising
-//! and falling (or held at full, [`Pressure`]), up, and out of range 0.1 s later. Each sample's
-//! point lies on the unit sphere, as the benchmark project is; the frame loop projects it through
-//! the camera at the sample's time ([`Script::pen`]).
+//! and falling (or held at full, or rising all the way, [`Pressure`]), up, and out of range 0.1 s
+//! later. Each sample's point lies on the unit sphere, as the benchmark project is; the frame
+//! loop projects it through the camera at the sample's time ([`Script::pen`]).
+//!
+//! # The sweep path
+//!
+//! `--script-path sweep` ([`Script::sweep`]) draws one long, sweeping stroke for looking at, its
+//! pressure rising evenly from none to full: how a stroke looks as the pen presses harder, seen at
+//! a slant, where a ridge that breaks into separate leaning spikes shows clearest.
+//!
+//! 1. **open**, 3 s still, three units away, as the benchmark path starts;
+//! 2. **approach**, 1.5 s: in to 1.3 from the centre, the camera slid 0.6 down its own up axis, so
+//!    it looks past the point facing it at surface below, easing in and out;
+//! 3. **sweep**, 3 s still: the pen comes into range, then draws a stroke 1.6 s long at the default
+//!    40-pixel brush, left to right along a circle 12° of the sphere about the point facing the
+//!    camera, 60° each side of the circle's lowest point as the view sees it: a smile across the
+//!    middle three fifths of the view's width, about 0.5 from the eye, every point of it seen at
+//!    about 37° between the view's ray and the surface's normal;
+//! 4. **settle**, 2 s still: the edits' refresh lands, and the run ends.
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt;
@@ -74,8 +90,10 @@ use crate::camera::{Camera, Vec3};
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
 
-/// Where a scripted camera is: turned `yaw` radians about the vertical axis (from +z towards
-/// +x), `pitch` radians above the horizon, `distance` from the origin it looks at.
+/// Where a scripted camera is: turned about the origin, at a distance, perhaps slid down.
+///
+/// It is turned `yaw` radians about the vertical axis (from +z towards +x), `pitch` radians above
+/// the horizon, `distance` from the origin it looks at, then slid `lowered` down its own up axis.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Pose {
     /// Radians about the vertical axis, not wrapped: a whole turn ends at τ.
@@ -84,22 +102,30 @@ pub(crate) struct Pose {
     pub(crate) pitch: f64,
     /// From the origin.
     pub(crate) distance: f64,
+    /// How far the camera then slides down its own up axis, without turning, in world units
+    /// ([`Camera::slide`]): 0 looks at the origin; more puts surface below the point facing the
+    /// camera at the view's centre, seen at a slant.
+    pub(crate) lowered: f64,
 }
 
 impl Pose {
     /// The camera at this pose.
     pub(crate) fn camera(self) -> Camera {
-        Camera::orbiting(self.yaw, self.pitch, self.distance)
+        let mut camera = Camera::orbiting(self.yaw, self.pitch, self.distance);
+        camera.slide(0.0, -self.lowered);
+        camera
     }
 
-    /// The pose a fraction `s` (0 to 1) of the way from this one to `to`: yaw and pitch linear,
-    /// distance geometric (a steady rate in log-distance, so a zoom looks as fast near as far).
+    /// The pose a fraction `s` (0 to 1) of the way from this one to `to`: yaw, pitch and the
+    /// lowering linear, distance geometric (a steady rate in log-distance, so a zoom looks as fast
+    /// near as far).
     fn toward(self, to: Self, s: f64) -> Self {
         let lerp = |a: f64, b: f64| a + (b - a) * s;
         Self {
             yaw: lerp(self.yaw, to.yaw),
             pitch: lerp(self.pitch, to.pitch),
             distance: self.distance * (to.distance / self.distance).powf(s),
+            lowered: lerp(self.lowered, to.lowered),
         }
     }
 }
@@ -150,6 +176,8 @@ pub(crate) enum Segment {
     StrokeLong,
     /// Still, while the fast, long stroke is drawn again at full pressure.
     StrokeHeavy,
+    /// Still, while one long stroke is drawn at a slant, its pressure rising from none to full.
+    Sweep,
 }
 
 impl Segment {
@@ -168,6 +196,7 @@ impl Segment {
             Self::Turn => "turn",
             Self::StrokeLong => "stroke_long",
             Self::StrokeHeavy => "stroke_heavy",
+            Self::Sweep => "sweep",
         }
     }
 }
@@ -200,6 +229,7 @@ const START: Pose = Pose {
     yaw: 0.0,
     pitch: PITCH,
     distance: 3.0,
+    lowered: 0.0,
 };
 
 /// After the orbit: a whole turn on.
@@ -346,7 +376,7 @@ const PEN_STROKES: [PenStroke; 4] = [
         down: 5.0,
         up: 6.2,
         radius: 40.0,
-        span: 0.25,
+        shape: Shape::Across { span: 0.25 },
         pressure: Pressure::Swelling,
     },
     PenStroke {
@@ -354,7 +384,7 @@ const PEN_STROKES: [PenStroke; 4] = [
         down: 8.5,
         up: 9.7,
         radius: 6.0,
-        span: 0.6,
+        shape: Shape::Across { span: 0.6 },
         pressure: Pressure::Swelling,
     },
     PenStroke {
@@ -362,7 +392,7 @@ const PEN_STROKES: [PenStroke; 4] = [
         down: 11.5,
         up: 12.3,
         radius: 40.0,
-        span: 1.6,
+        shape: Shape::Across { span: 1.6 },
         pressure: Pressure::Swelling,
     },
     PenStroke {
@@ -370,10 +400,61 @@ const PEN_STROKES: [PenStroke; 4] = [
         down: 14.5,
         up: 15.3,
         radius: 40.0,
-        span: 1.6,
+        shape: Shape::Across { span: 1.6 },
         pressure: Pressure::Full,
     },
 ];
+
+/// The sweep path's pose: 1.3 from the centre, slid 0.6 down, so the view's centre falls on
+/// surface below the point facing the camera, seen at a slant.
+const SLANTED: Pose = Pose {
+    distance: 1.3,
+    lowered: 0.6,
+    ..START
+};
+
+/// The sweep path's camera ([`Script::sweep`]; the module notes say why each segment).
+const SWEEP: [Keyframe; 4] = [
+    Keyframe {
+        segment: Segment::Open,
+        seconds: 3.0,
+        to: START,
+        ease: Ease::Linear,
+    },
+    Keyframe {
+        segment: Segment::Approach,
+        seconds: 1.5,
+        to: SLANTED,
+        ease: Ease::Smooth,
+    },
+    Keyframe {
+        segment: Segment::Sweep,
+        seconds: 3.0,
+        to: SLANTED,
+        ease: Ease::Linear,
+    },
+    Keyframe {
+        segment: Segment::Settle,
+        seconds: 2.0,
+        to: SLANTED,
+        ease: Ease::Linear,
+    },
+];
+
+/// The sweep path's one stroke, in its still segment (which starts at 4.5 s): 12° of the sphere
+/// about the point facing the camera, seen there at about 37°, 60° each side of the circle's
+/// lowest point.
+const SWEEP_STROKE: PenStroke = PenStroke {
+    hover: 4.7,
+    down: 5.0,
+    up: 6.6,
+    radius: 40.0,
+    shape: Shape::Arc {
+        angle: 12.0 * PI / 180.0,
+        sweep: 60.0 * PI / 180.0,
+    },
+    pressure: Pressure::Rising,
+};
 
 /// How hard a scripted pen presses along its stroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +463,29 @@ pub(crate) enum Pressure {
     Swelling,
     /// Full pressure all the way: a stroke pressed hard.
     Full,
+    /// Rising evenly from none at the touch to full at the lift: every pressure along one stroke.
+    Rising,
+}
+
+/// Where a scripted stroke runs on the unit sphere, about the point facing the camera (the
+/// sphere's point nearest the eye), left to right as the view sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Shape {
+    /// Across the facing point, bowing up by a fifth of its span at its middle: seen square on
+    /// at its middle, more and more at a slant towards its ends.
+    Across {
+        /// How far the stroke runs across the view, in world units, at the facing point.
+        span: f64,
+    },
+    /// Along a circle about the facing point, round from one side of the circle's lowest point
+    /// (as the view sees it) to the other: a smile, every point of it seen at the same slant.
+    Arc {
+        /// The circle's radius as an angle at the sphere's centre, from the facing point, in
+        /// radians: the further, the steeper the slant.
+        angle: f64,
+        /// How far round the circle the stroke runs each side of its lowest point, in radians.
+        sweep: f64,
+    },
 }
 
 /// How often a scripted pen reports: the Kamvas's measured rate, in hertz.
@@ -390,12 +494,11 @@ pub(crate) const PEN_RATE: f64 = 173.0;
 /// How long after lifting a scripted pen leaves the tablet's range, in seconds.
 const LEAVE_AFTER: f64 = 0.1;
 
-/// One scripted pen stroke: when the pen hovers, touches and lifts, the brush's size, and how
-/// far the stroke runs.
+/// One scripted pen stroke: when the pen hovers, touches and lifts, the brush's size, where the
+/// stroke runs, and how hard it presses.
 ///
-/// The stroke is drawn across the point of the unit sphere facing the camera (the camera
-/// looks at the sphere's centre), from left to right as the view sees it, bowing up by a
-/// fifth of its span at its middle ([`PenStroke::point`]).
+/// The stroke is drawn about the point of the unit sphere facing the camera, from left to right
+/// as the view sees it, as its [`Shape`] says ([`PenStroke::point`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PenStroke {
     /// When the pen comes into range over the stroke's start: seconds into the run at speed 1.
@@ -406,28 +509,39 @@ pub(crate) struct PenStroke {
     up: f64,
     /// The brush's radius for the stroke, in physical pixels, set as the pen comes into range.
     radius: f32,
-    /// How far the stroke runs across the view, in world units, at the facing point.
-    span: f64,
+    /// Where it runs.
+    shape: Shape,
     /// How hard the pen presses along it.
     pressure: Pressure,
 }
 
 impl PenStroke {
     /// The stroke's point a fraction `along` (0 to 1) of the way, seen by `camera`: on the unit
-    /// sphere, about the point facing the camera.
+    /// sphere, about the point facing the camera, as its [`Shape`] says.
     fn point(&self, camera: &Camera, along: f64) -> WorldPoint {
-        let eye = camera.eye();
-        let facing = eye * eye.dot(eye).sqrt().recip();
+        let facing = unit(camera.eye());
         let right = camera.axis(Vec3::new(1.0, 0.0, 0.0));
         let up = camera.axis(Vec3::new(0.0, 1.0, 0.0));
-        let bow = 0.2 * (PI * along).sin();
-        let p = facing + right * ((along - 0.5) * self.span) + up * (bow * self.span);
-        let length = p.dot(p).sqrt();
-        WorldPoint::new(p.x / length, p.y / length, p.z / length)
+        let p = match self.shape {
+            Shape::Across { span } => {
+                let bow = 0.2 * (PI * along).sin();
+                unit(facing + right * ((along - 0.5) * span) + up * (bow * span))
+            }
+            Shape::Arc { angle, sweep } => {
+                // The view's right and down, square to the facing point's normal: the circle's
+                // plane's axes.
+                let across = unit(right - facing * right.dot(facing));
+                let down = unit(-up - facing * (-up).dot(facing) - across * (-up).dot(across));
+                let round = (2.0 * along - 1.0) * sweep;
+                let outward = down * round.cos() + across * round.sin();
+                facing * angle.cos() + outward * angle.sin()
+            }
+        };
+        WorldPoint::new(p.x, p.y, p.z)
     }
 
     /// The tip's pressure a fraction `along` (0 to 1) of the way, as its [`Pressure`] says:
-    /// rising from 0.35 to 0.8 at the middle and falling back, or full.
+    /// rising from 0.35 to 0.8 at the middle and falling back, full, or rising from none to full.
     fn pressure(&self, along: f64) -> Unit {
         match self.pressure {
             Pressure::Swelling => {
@@ -439,8 +553,22 @@ impl PenStroke {
                 Unit::try_from(pressure).unwrap_or(Unit::ONE)
             }
             Pressure::Full => Unit::ONE,
+            Pressure::Rising => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a pressure in 0.0..=1.0: f32 holds it"
+                )]
+                let pressure = along.clamp(0.0, 1.0) as f32;
+                Unit::try_from(pressure).unwrap_or(Unit::ONE)
+            }
         }
     }
+}
+
+/// `v` scaled to unit length; `v` is never zero here (a camera's eye, outside the sphere, or an
+/// axis with a component square to another).
+fn unit(v: Vec3) -> Vec3 {
+    v * v.dot(v).sqrt().recip()
 }
 
 /// One sample of a scripted pen: when, in what phase, where on the sphere, and how hard.
@@ -469,11 +597,13 @@ pub(crate) enum ScriptPath {
     /// Four pen strokes: near, far, fast and long, and that again pressed hard
     /// ([`Script::strokes`]).
     Strokes,
+    /// One long stroke seen at a slant, pressed from none to full ([`Script::sweep`]).
+    Sweep,
 }
 
 /// Why a text isn't a [`ScriptPath`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0:?} isn't a script path: benchmark or strokes")]
+#[error("{0:?} isn't a script path: benchmark, strokes or sweep")]
 pub(crate) struct BadPath(String);
 
 impl FromStr for ScriptPath {
@@ -483,6 +613,7 @@ impl FromStr for ScriptPath {
         match text {
             "benchmark" => Ok(Self::Benchmark),
             "strokes" => Ok(Self::Strokes),
+            "sweep" => Ok(Self::Sweep),
             _ => Err(BadPath(text.to_owned())),
         }
     }
@@ -550,6 +681,7 @@ impl Script {
         match path {
             ScriptPath::Benchmark => Self::benchmark(speed),
             ScriptPath::Strokes => Self::strokes(speed),
+            ScriptPath::Sweep => Self::sweep(speed),
         }
     }
 
@@ -571,6 +703,19 @@ impl Script {
             keyframes: STROKES.to_vec(),
             speed,
             strokes: PEN_STROKES.to_vec(),
+            pen: Vec::new(),
+        };
+        script.pen = script.every_pen_sample();
+        script
+    }
+
+    /// The sweep path (the module notes), run at `speed`.
+    pub(crate) fn sweep(speed: Speed) -> Self {
+        let mut script = Self {
+            start: START,
+            keyframes: SWEEP.to_vec(),
+            speed,
+            strokes: vec![SWEEP_STROKE],
             pen: Vec::new(),
         };
         script.pen = script.every_pen_sample();
