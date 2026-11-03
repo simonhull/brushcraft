@@ -50,12 +50,14 @@
 //!   whole view), `charged_triangles` (what the choice was charged, by what it may draw: at least
 //!   `triangles`, at most the budget), `budget_error_px` (where the budget bound and stopped short,
 //!   about the screen error it stopped at; `null` otherwise), `budget_slack` (triangles the budget
-//!   may have left unspent: the fine bin it stopped at and the held tiles), `relax_refused` (raises
-//!   the relaxation couldn't fit, which make it bind), `admitted` and `held` (refinements the
-//!   budget's choice made, and those its seams refused), and `level_jump`: the largest change of
-//!   the level drawing a finest tile the current stroke edited (the last one's, until the next
-//!   begins) since the cut heard before (the M1 spec's "stroke seen from a distance": no jump
-//!   bigger than one), `null` with no stroked tile drawn in both;
+//!   may have left unspent: the fine bin it stopped at and the held tiles' charge), `relax_refused`
+//!   (raises the relaxation couldn't fit, which make it bind), `need_passes` and `need_unsettled`
+//!   (the spreading passes that raised a need, and whether the last still did: then the cut may
+//!   depend on thread order), `admitted` and `held` (refinements the budget's choice made, and
+//!   those its seams refused), and `level_jump`: the largest change of the level drawing a finest
+//!   tile the current stroke edited (the last one's, until the next begins) since the cut heard
+//!   before (the M1 spec's "stroke seen from a distance": no jump bigger than one), `null` with no
+//!   stroked tile drawn in both;
 //! - residency as the frame was staged: `resident`, `wanted`, `evicted` (this frame),
 //!   `uploaded_bytes` and `uploaded_tiles`, `standing_in` (display tiles standing in for a stroke's
 //!   edits, until the refresh replaces them) and `pending_epochs` (epochs staged over frames, not
@@ -444,6 +446,8 @@ impl FrameRecord {
             )
             .with("budget_slack", stat(|s| s.budget_slack))
             .with("relax_refused", stat(|s| s.relax_refused))
+            .with("need_passes", stat(|s| s.need_passes))
+            .with("need_unsettled", scene.map(|s| s.stats.need_unsettled))
             .with("admitted", stat(|s| s.admitted))
             .with("held", stat(|s| s.held))
             .with(

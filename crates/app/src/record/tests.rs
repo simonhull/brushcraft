@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 79] = [
+const FRAME_FIELDS: [&str; 81] = [
     "bench",
     "result",
     "frame",
@@ -59,6 +59,8 @@ const FRAME_FIELDS: [&str; 79] = [
     "budget_error_px",
     "budget_slack",
     "relax_refused",
+    "need_passes",
+    "need_unsettled",
     "admitted",
     "held",
     "level_jump",
@@ -178,6 +180,7 @@ fn a_cut_s_budget_fields_say_what_it_was_charged_and_where_the_budget_stopped() 
             budget_bucket: Some(72),
             budget_slack: 256,
             relax_refused: 2,
+            need_passes: 5,
             admitted: 3,
             held: 4,
             ..LodStats::default()
@@ -193,6 +196,8 @@ fn a_cut_s_budget_fields_say_what_it_was_charged_and_where_the_budget_stopped() 
     assert_eq!(value(&line, "budget_binds"), &Value::Bool(true));
     assert_eq!(value(&line, "budget_slack"), &Value::Int(256));
     assert_eq!(value(&line, "relax_refused"), &Value::Int(2));
+    assert_eq!(value(&line, "need_passes"), &Value::Int(5));
+    assert_eq!(value(&line, "need_unsettled"), &Value::Bool(false));
     assert_eq!(value(&line, "admitted"), &Value::Int(3));
     assert_eq!(value(&line, "held"), &Value::Int(4));
     // A budget that didn't bind stopped nowhere.
