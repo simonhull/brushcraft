@@ -269,6 +269,12 @@ pub trait TileSource {
         false
     }
 
+    /// Every tile a brush holds ([`TileStore::held_previews`]): those
+    /// [`TileSource::waits_for_preview`] may say wait. The default holds none.
+    fn held(&mut self) -> Vec<TileKey> {
+        Vec::new()
+    }
+
     /// Writes `key` into `out`, its vertices or (a finest tile) its positions with the ring, and
     /// returns its bound `e` and its finest normals' cone, or `None` if the source has nothing
     /// to draw for it yet (a display tile not built, or made unknown by edits): it is then drawn
@@ -374,6 +380,10 @@ impl TileSource for StoreSource<'_> {
 
     fn waits_for_preview(&mut self, key: TileKey) -> bool {
         self.store.preview_wanted(&key)
+    }
+
+    fn held(&mut self) -> Vec<TileKey> {
+        self.store.held_previews().copied().collect()
     }
 
     fn prepare_positions(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {

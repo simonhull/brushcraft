@@ -446,7 +446,7 @@ impl Uploads for GpuResidency {
     }
 
     fn draws(&self, key: &TileKey) -> bool {
-        self.residency.holds_or_wants(key)
+        self.residency.draws_or_wants(key)
     }
 
     fn waiting_for_previews(&self) -> Vec<TileKey> {

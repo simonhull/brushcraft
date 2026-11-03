@@ -1613,6 +1613,7 @@ impl Residency {
         S::Error: Into<ResidencyError>,
     {
         self.waiting_previews.clear();
+        self.evict_waiting(source);
         self.touched.clear();
         self.fresh.clear();
         self.forced_now = 0;
@@ -1874,10 +1875,31 @@ impl Residency {
         self.drawn.iter()
     }
 
-    /// Whether `key` is resident or requested: a tile a brush's preview is made for.
+    /// Whether `key` is in the cut, above it (an ancestor of a tile of it, or the floor) or
+    /// requested: a tile a brush's preview is made for. A tile resident outside these (a tile
+    /// left from an earlier cut) gets none: it goes once a brush holds it
+    /// ([`TileSource::waits_for_preview`]), and comes back with one if the cut wants it again.
     #[must_use]
-    pub fn holds_or_wants(&self, key: &TileKey) -> bool {
-        self.entries.contains_key(key) || self.wanted.contains_key(key)
+    pub fn draws_or_wants(&self, key: &TileKey) -> bool {
+        self.protected(key) || self.wanted.contains_key(key)
+    }
+
+    /// Evicts every resident tile a brush holds that has no preview (outside the cut and above
+    /// it, so none is made: [`Residency::draws_or_wants`]), so the cut never comes down to it,
+    /// drawing the surface without the dabs still to land. A tile an epoch's change waits on
+    /// stays until it switches.
+    fn evict_waiting<S: TileSource>(&mut self, source: &mut S) {
+        for key in source.held() {
+            let evictable = self.entries.contains_key(&key)
+                && !self.protected(&key)
+                && !self.pending.contains(&key)
+                && !self.fresh.contains(&key)
+                && !self.groups.iter().any(|group| group.holds(&key));
+            if evictable && source.waits_for_preview(key) {
+                self.remove_live(&key);
+                self.stats.evictions += 1;
+            }
+        }
     }
 
     /// Whether `key` is arriving as a member of a pending epoch, staged already.
