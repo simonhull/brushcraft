@@ -140,7 +140,7 @@ fn brute_ray(scene: &[(TileKey, TileBounds)], ray: &Ray) -> Option<Hit> {
     scene
         .iter()
         .filter_map(|&(key, b)| hit_ball(ray, &b.aabb).map(|t| Hit { key, t }))
-        .min_by(|a, b| a.t.total_cmp(&b.t))
+        .min_by(|a, b| a.t.total_cmp(&b.t).then(a.key.cmp(&b.key)))
 }
 
 /// The tree's raycast against the same balls, as they are in `scene`; also counts the precise
@@ -801,4 +801,32 @@ fn rays_along_a_face_an_edge_or_a_seam_enter_the_box() {
         Some(2.0),
         "a subnormal component along the low y face"
     );
+}
+
+#[test]
+fn hits_at_the_same_parameter_go_to_the_least_key_whichever_box_the_ray_enters_first() {
+    // Two tiles meeting at a seam the ray crosses: the same hit parameter from both. The box of
+    // the greater key reaches out towards the ray's origin (grown, as a stroke's tiles' are), so
+    // the ray enters it first.
+    let ray = Ray::new(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
+    let seam = 5.0;
+    for grown in [0, 1] {
+        let near = bounds(Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.5, 0.5, 2.0));
+        let tight = bounds(Vec3::ZERO, Vec3::new(0.5, 0.5, 0.5));
+        let scene = vec![
+            (key(0), if grown == 0 { tight } else { near }),
+            (key(1), if grown == 0 { near } else { tight }),
+        ];
+        let bvh = Bvh::build(scene).unwrap();
+        let hit = bvh
+            .raycast(&ray, |_| Ok::<_, Infallible>(Some(seam)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hit.key,
+            key(0),
+            "the least key, the grown box {grown}'s or not"
+        );
+        assert!((hit.t - seam).abs() < f32::EPSILON);
+    }
 }

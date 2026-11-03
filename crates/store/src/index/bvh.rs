@@ -593,7 +593,10 @@ impl Bvh {
     /// its nearest intersection, `None` if there is none. It is called only for tiles whose box
     /// the ray enters, nearest box first, and no more once the next box starts past the
     /// nearest hit so far. Its hits must lie in the tile's box, as the tile's surface does;
-    /// a negative or NaN parameter counts as a miss.
+    /// a negative or NaN parameter counts as a miss. Of hits at the same parameter (a seam both
+    /// tiles meet), the least key's is the nearest: the answer doesn't depend on which box the
+    /// ray enters first, so boxes grown differently (a stroke's, as its dabs land) give the same
+    /// hit.
     ///
     /// # Errors
     ///
@@ -619,7 +622,8 @@ impl Bvh {
             what,
         }) = heap.pop()
         {
-            if best.is_some_and(|b| nearest >= b.t) {
+            // A box entered at the nearest hit so far may hold a hit there of a lesser key.
+            if best.is_some_and(|b| nearest > b.t) {
                 break;
             }
             match what {
@@ -629,7 +633,7 @@ impl Bvh {
                     };
                     if let Some(t) = hit(key)?
                         && t >= 0.0
-                        && best.is_none_or(|b| t < b.t)
+                        && best.is_none_or(|b| t.total_cmp(&b.t).then(key.cmp(&b.key)).is_lt())
                     {
                         best = Some(Hit { key, t });
                     }
