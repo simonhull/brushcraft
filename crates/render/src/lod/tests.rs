@@ -1062,52 +1062,10 @@ fn the_triangle_budget_caps_what_is_drawn_and_refines_the_largest_errors_first()
         );
         assert!(capped.stats.over_pixel > 0, "the cap bites");
         assert!(capped.stats.budget_limited > 0, "and is counted");
-        // Largest errors first: no tile of the cut, its children resident, is much further over
-        // than the least of the refined tiles (one histogram bucket, an eighth of an octave),
-        // but for those the sweep or the budget took back.
-        let cut = places(&capped);
-        let mut refined = Vec::new();
-        for place in scene.bounds.keys() {
-            let inside = cut.iter().any(|c| {
-                c.level() > place.level() && {
-                    let mut above = c.parent();
-                    while let Some(p) = above {
-                        if p == *place {
-                            break;
-                        }
-                        above = p.parent();
-                    }
-                    above == Some(*place)
-                }
-            });
-            if inside && let Some(error) = cpu_error(&scene, &view, *place) {
-                refined.push(error);
-            }
-        }
-        let least = refined
-            .iter()
-            .copied()
-            .filter(|e| *e > 1.0)
-            .fold(f32::MAX, f32::min);
-        let exceptions = capped.stats.shortfall + capped.stats.refused;
-        let worse: Vec<f32> = cut
-            .iter()
-            .filter(|place| {
-                place
-                    .children()
-                    .into_iter()
-                    .flatten()
-                    .all(|c| c.level() <= scene.finest)
-            })
-            .filter_map(|place| cpu_error(&scene, &view, *place))
-            .filter(|error| *error > least * 1.2)
-            .collect();
-        assert!(
-            worse.len() <= usize::try_from(exceptions).expect("small"),
-            "{} tiles of the cut over {least}: {worse:?}, {:?}",
-            worse.len(),
-            capped.stats
-        );
+        assert!(capped.stats.budget_binds, "binds: {:?}", capped.stats);
+        // Largest errors first: what the budget left in the cut ranks no higher than where it
+        // stopped.
+        budget::assert_worst_first(&scene, &view, &capped);
     });
 }
 

@@ -27,25 +27,36 @@
 //! - **Budget.** The tier's triangle budget caps what the cut draws (spec, "Triangle budget"):
 //!   every possible refinement's charge goes into a histogram by its rank, and the worst are
 //!   refined first, until the budget is spent. Tiles left over 1 px are counted and reported
-//!   ([`LodStats::over_pixel`]). When it binds (spec, "When it binds"):
-//!   - *Charged by what is drawn.* A refinement is charged what its children draw beyond what it
-//!     draws, each drawn when in the frustum by its own sphere and not facing away by its own
-//!     triangles, as drawing culls: a tile out of view or facing away, with all under it, spends
-//!     nothing, however loose its `e`. Its rank is its `e` projected over its own sphere, capped by
-//!     its ancestors' (so the refined set stays a tree): the sphere grown by `e`, which the wanting
+//!   ([`LodStats::over_pixel`]).
+//!   - *Charged by what may be drawn.* A refinement is charged what its children may draw beyond
+//!     what it may draw. A tile may be drawn unless emit certainly culls it: out of the frustum by
+//!     its own sphere, or facing away by its own triangles with its morph settled at its end
+//!     whatever its edges (emit cone-culls a tile facing away only once settled; with the distance
+//!     ramp on, that is rarely known ahead, so such tiles are charged). Out of view, a tile and all
+//!     under it spend nothing, however loose its `e`. Over a refined tree the charges sum to at
+//!     least what its cut draws, so the triangles drawn never exceed the budget, and neither do the
+//!     clusters (a tile of 8 quads a side or more is a whole number of 128-triangle clusters; a
+//!     smaller one is one cluster, at most one a node: the cluster lists hold the budget's clusters
+//!     plus one a node).
+//!   - *Ranked by its own sphere.* Its rank is its `e` projected over its own sphere, capped by its
+//!     ancestors' (so the refined set stays a tree): the sphere grown by `e`, which the wanting
 //!     test keeps, reaches the near plane for a loose `e` and projects it without limit.
-//!   - *No cut-off at a bucket.* The histogram's buckets are taken whole, worst first, down to the
-//!     one that doesn't fit; that partial bucket's tiles are then taken by finer bins (a 128th of
-//!     the bucket, and the level, coarse first), worst first, until the budget is spent to within a
-//!     bin, typically a tile's charge. Bins, not a race for what is left, so the choice is the same
-//!     every frame.
-//!   - *What the sweep takes back is given back.* The neighbour rule's sweep takes back a
-//!     refinement whose neighbour wasn't raised (the relaxation found no budget left); its charge
-//!     is recounted and spent again, a level at a time, coarse to fine, on the tiles of the cut
-//!     whose seams hold and that need refining: wanting it, or needed by the neighbour rule for a
-//!     tile that does, spread as the relaxation does, at that tile's error, worst first.
-//!   - These passes run only when the budget binds (gated on the GPU, `gate.wgsl`'s `binds`): with
-//!     room for everything wanted, the choice is the one without them.
+//!   - *When it binds* (spec, "When it binds"): mark couldn't take every bucket, or the level-0
+//!     tiles alone are over the budget, or the relaxation couldn't fit a raise (its claims are
+//!     compare-and-swaps, never an add taken back, so it can't be refused for another raise's
+//!     moment of overshoot: refusals happen exactly when the raises together don't fit). The cut is
+//!     then chosen again, from the level-0 tiles: every tile wanting refining needs it at its
+//!     capped rank; the need spreads (to a parent from its children, and to a tile the neighbour
+//!     rule needs for a needing neighbour's child) until a pass raises none; one threshold over the
+//!     whole view takes the needs worst first, whole buckets then finer bins (a 128th of a bucket,
+//!     and the level, coarse first), to within a bin of the budget; and a level at a time, coarse
+//!     to fine, every tile needing refining at or above it whose seams hold is refined. Bins
+//!     summed, never a race for what is left: the same cut every frame, whatever order the threads
+//!     ran in. A refinement charged nothing is refined whatever its rank.
+//!   - These passes are always encoded and run only when the budget binds: the GPU decides
+//!     (`gate.wgsl`'s `binds` sets their dispatches to no workgroup otherwise), so the first frame
+//!     the budget binds in is chosen by them too. Without the budget binding, the choice is mark's,
+//!     the relaxation's and the sweep's.
 //! - **Neighbours at most one level apart.** A fixed number of relaxation passes
 //!   ([`LodConfig::with_relax_passes`]) raises any tile in the cut that touches an area two levels
 //!   finer. Then a sweep, coarse to fine, keeps a refinement only where every edge neighbour is
@@ -607,17 +618,50 @@ struct GpuFrame {
     raises: [u32; MAX_RELAX_PASSES as usize],
     /// The budget's histogram.
     histogram: [u32; BUCKETS],
-    /// The bucket the budget couldn't take whole; [`BUCKETS`] when it took every one.
+    /// The bucket mark couldn't take whole; [`BUCKETS`] when it took every one, or when the
+    /// level-0 tiles alone are over the budget.
     partial: u32,
-    /// Budget units charged after the sweep, the give-back included (where the budget binds).
+    /// 1 if the budget binds: the budget's choice then makes the cut.
+    budget_wanted: u32,
+    /// Raises the relaxation couldn't fit in the budget.
+    relax_refused: u32,
+    /// 1 if the budget's choice made the cut.
+    binds: u32,
+    /// Budget units the budget's choice is charged.
     charged: u32,
-    /// Refinements the fill admitted from the partial bucket.
-    filled: u32,
-    /// Refinements given back after the sweep.
-    given_back: u32,
-    /// 1 if the budget's passes ran (encoded, and the budget binds).
-    budget_ran: u32,
+    /// Refinements the budget's choice admitted.
+    admitted: u32,
+    /// Tiles at or above its threshold whose seams didn't hold.
+    held: u32,
+    /// The bucket of need the budget's choice couldn't take whole (0: took every one;
+    /// [`BUCKETS`]: could take none).
+    need_bucket: u32,
+    /// The lowest fine bin of [`GpuFrame::need_bucket`] taken ([`FINE_BINS`] for none).
+    need_bin: u32,
+    /// Budget units of the first fine bin it couldn't take.
+    slack: u32,
 }
+
+/// The frame buffer past [`GpuFrame`], which the readback leaves out: the buckets and fine bins
+/// the budget's choice works in, and its spreading's counts (`lod.wgsl`'s `LodFrame` from
+/// `need_histogram`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct GpuScratch {
+    /// Budget units of every needed refinement, by bucket of its need.
+    need_histogram: [u32; BUCKETS],
+    /// Budget units of the refinements of the bucket the choice couldn't take whole, by fine bin.
+    fine: [u32; FINE_BINS],
+    /// Needs each spreading pass raised.
+    spread_changes: [u32; NEED_PASSES as usize],
+}
+
+/// Fine bins of a bucket of need: 128 slices of its range, each split by 16 levels.
+const FINE_BINS: usize = 2048;
+
+/// Spreading passes the budget's choice runs; those after one that raised no need return at
+/// once.
+pub const NEED_PASSES: u32 = MAX_RELAX_PASSES;
 
 /// The bytes of [`GpuFrame`]: what the readback copies of the frame buffer.
 const FRAME_BYTES: u64 = size_of::<GpuFrame>() as u64;
@@ -632,19 +676,18 @@ const POST_GROUPS: u64 = 2 * POST_ARGS;
 /// passes'.
 const POST_SLOT: u32 = MAX_RELAX_PASSES + 1;
 
-/// The dispatch-arguments entry of the passes over every node that run only when the budget
-/// binds (the fill's, the recount and the give-back's), set by the budget's gate after the
-/// threshold.
+/// The dispatch-arguments entry of the budget's choice's passes over every node, set by the
+/// budget's gate after the relaxation (no workgroup unless the budget binds).
 const REFILL_SLOT: u32 = POST_SLOT + 1;
 
-/// [`REFILL_SLOT`]'s companion for the budget's one-workgroup passes (clearing its scratch and
-/// its thresholds).
+/// [`REFILL_SLOT`]'s companion for the budget's choice's one-workgroup passes.
 const ONCE_SLOT: u32 = REFILL_SLOT + 1;
 
-/// Bytes of the frame buffer past [`GpuFrame`], which the readback leaves out: the fine bins and
-/// the per-level buckets the budget's passes work in (`lod.wgsl`'s `LodFrame` from
-/// `fine_threshold`).
-const SCRATCH_BYTES: u64 = 4 * (2 + 2048 + BUCKETS as u64);
+/// Dispatch-arguments entries in all.
+const DISPATCH_SLOTS: u32 = ONCE_SLOT + 1;
+
+/// Bytes of [`GpuScratch`].
+const SCRATCH_BYTES: u64 = size_of::<GpuScratch>() as u64;
 
 /// The frame's settings, WGSL's `LodParams`.
 #[repr(C)]
@@ -700,17 +743,8 @@ const GATE_WGSL: &str = include_str!("gate.wgsl");
 /// Word offset of [`GpuFrame::raises`] in the frame buffer.
 const RAISES_WORD: usize = std::mem::offset_of!(GpuFrame, raises) / 4;
 
-/// The byte offsets in the dispatch arguments of the budget's passes' dispatches: over every node
-/// ([`REFILL_SLOT`]) and of one workgroup ([`ONCE_SLOT`]).
-const fn budget_slots() -> (u64, u64) {
-    (
-        REFILL_SLOT as u64 * DISPATCH_BYTES,
-        ONCE_SLOT as u64 * DISPATCH_BYTES,
-    )
-}
-
-/// Word offset of [`GpuFrame::partial`] in the frame buffer, which the budget's gate reads.
-const PARTIAL_WORD: usize = std::mem::offset_of!(GpuFrame, partial) / 4;
+/// Word offset of [`GpuFrame::budget_wanted`] in the frame buffer, which the budget's gate reads.
+const BUDGET_WANTED_WORD: usize = std::mem::offset_of!(GpuFrame, budget_wanted) / 4;
 
 /// Bytes of one dispatch's indirect arguments: three `u32` workgroup counts.
 const DISPATCH_BYTES: u64 = 12;
@@ -893,10 +927,8 @@ pub struct LodStats {
     /// Triangles of the cut.
     pub cut_triangles: u32,
     /// Triangles the refinements were charged, within the budget, in [`BUDGET_UNIT`]s: by what
-    /// each draws (a tile out of view or facing away spends nothing), so an upper bound on
-    /// [`LodStats::drawn_triangles`] but for tiles drawn because their morph isn't settled
-    /// ([`LodStats::cone_exempt`]). Where the budget binds, the charge of the final choice,
-    /// recounted after the sweep, the give-back included.
+    /// each may draw (a tile out of view spends nothing), so an upper bound on
+    /// [`LodStats::drawn_triangles`]. Where the budget binds, the budget's choice's.
     pub refined_triangles: u32,
     /// Triangles drawn, both phases.
     pub drawn_triangles: u32,
@@ -930,14 +962,29 @@ pub struct LodStats {
     pub cone_exempt: u32,
     /// Tiles each relaxation pass raised, for the passes run.
     pub raises: Vec<u32>,
-    /// Where the budget binds, the histogram bucket it couldn't take whole (an eighth of an
-    /// octave each, from 2⁻⁸ px), whose tiles were admitted until the budget was spent; `None`
-    /// when the budget refined everything wanted. [`LodStats::budget_error`] in pixels.
-    pub partial_bucket: Option<u32>,
-    /// Refinements admitted from the partial bucket before the relaxation.
-    pub filled: u32,
-    /// Refinements admitted after the sweep with the charge it took back.
-    pub given_back: u32,
+    /// Whether the budget bound: mark couldn't take every bucket, the level-0 tiles alone were
+    /// over it, or the relaxation couldn't fit a raise ([`LodStats::relax_refused`]). The cut
+    /// is then the budget's choice: by need, worst first over the whole view, to within a fine
+    /// bin.
+    pub budget_binds: bool,
+    /// Where the budget bound and stopped short of everything needed, the histogram bucket of
+    /// need it couldn't take whole (an eighth of an octave each, from 2⁻⁸ px), its tiles taken
+    /// by finer bins; `None` otherwise (the budget didn't bind, took everything needed, or
+    /// could take nothing past the level-0 tiles). [`LodStats::budget_error`] in pixels.
+    pub budget_bucket: Option<u32>,
+    /// Where the budget bound, triangles it may have left unspent: the first fine bin it
+    /// couldn't take, and the charge of the tiles [`LodStats::held`].
+    pub budget_slack: u32,
+    /// The histogram bucket mark couldn't take whole, if any (the budget then binds); `None`
+    /// when it took every bucket, or when the level-0 tiles alone were over the budget.
+    pub mark_bucket: Option<u32>,
+    /// Raises the relaxation couldn't fit in the budget (which makes it bind).
+    pub relax_refused: u32,
+    /// Refinements the budget's choice admitted.
+    pub admitted: u32,
+    /// Tiles the budget's choice took whose seams didn't hold (none once the need has
+    /// settled): counted in [`LodStats::shortfall`] too.
+    pub held: u32,
     /// Clusters, retries and cut entries past their lists' ends: zero unless a list is too
     /// small.
     pub overflow: (u32, u32, u32),
@@ -945,11 +992,11 @@ pub struct LodStats {
 
 impl LodStats {
     /// The least screen error, in pixels, of the bucket the budget couldn't take whole
-    /// ([`LodStats::partial_bucket`]): about where the budget stopped refining, worst first.
+    /// ([`LodStats::budget_bucket`]): about where the budget stopped refining, worst first.
     /// `None` when the budget didn't bind.
     #[must_use]
     pub fn budget_error(&self) -> Option<f32> {
-        self.partial_bucket
+        self.budget_bucket
             .and_then(|bucket| u16::try_from(bucket).ok())
             .map(|bucket| (f32::from(bucket) / 8.0 - 8.0).exp2())
     }
@@ -1038,22 +1085,10 @@ enum Readback {
 /// A readback buffer going back to the level choice that made it.
 #[derive(Debug)]
 enum Returned {
-    /// Free for another frame: never submitted, or dropped unread.
+    /// Free for another frame: read, or never submitted.
     Free(Buffer),
-    /// Free for another frame, read: with what its frame's budget said.
-    Read(Buffer, BudgetSeen),
     /// Gone: its mapping failed.
     Lost,
-}
-
-/// What a frame read back said of the triangle budget, for deciding whether the next frames
-/// encode the passes that run when it binds ([`Lod::encode_main`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BudgetSeen {
-    /// Triangles the choice was charged ([`LodStats::refined_triangles`]).
-    charged: u32,
-    /// Whether the budget bound ([`LodStats::partial_bucket`]).
-    binds: bool,
 }
 
 /// A frame's readback, encoded: call [`CutReadback::submitted`] once its command buffer is
@@ -1146,18 +1181,8 @@ impl CutReader {
             };
             let read = read_output(&buffer, finest, frame, clock);
             buffer.unmap();
-            let returned = match &read {
-                Ok(output) => Returned::Read(
-                    buffer,
-                    BudgetSeen {
-                        charged: output.stats.refined_triangles,
-                        binds: output.stats.partial_bucket.is_some(),
-                    },
-                ),
-                Err(_) => Returned::Free(buffer),
-            };
             // A level choice that's gone has nothing to take back.
-            drop(self.back.send(returned));
+            drop(self.back.send(Returned::Free(buffer)));
             outputs.push(read?);
         }
         Ok(outputs)
@@ -1296,10 +1321,6 @@ pub struct Lod {
     returned: Receiver<Returned>,
     /// Timestamp queries, once [`Lod::enable_timing`] is called on a device that has them.
     timer: Option<Timer>,
-    /// Whether the last frame read back had the budget binding or at least half spent (`true`
-    /// until one is read): the frame then encodes the passes that run when it binds, which cost
-    /// their dispatches even when the GPU finds it doesn't and runs them on no workgroup.
-    budget_near: bool,
 }
 
 /// The level choice's compute pipelines.
@@ -1327,26 +1348,22 @@ struct Pipelines {
     post: ComputePipeline,
     /// `post_finish`.
     post_finish: ComputePipeline,
-    /// `scratch_clear`.
-    scratch_clear: ComputePipeline,
-    /// `fill_count`.
-    fill_count: ComputePipeline,
-    /// `fill_threshold`.
-    fill_threshold: ComputePipeline,
-    /// `fill`.
-    fill: ComputePipeline,
-    /// `recount`.
-    recount: ComputePipeline,
+    /// `budget_begin`.
+    budget_begin: ComputePipeline,
     /// `need_init`.
     need_init: ComputePipeline,
     /// `need_spread`.
     need_spread: ComputePipeline,
-    /// `back_count`.
-    back_count: ComputePipeline,
-    /// `back_threshold`.
-    back_threshold: ComputePipeline,
-    /// `give_back`.
-    give_back: ComputePipeline,
+    /// `need_count`.
+    need_count: ComputePipeline,
+    /// `need_threshold`.
+    need_threshold: ComputePipeline,
+    /// `need_fine_count`.
+    need_fine_count: ComputePipeline,
+    /// `need_fine_threshold`.
+    need_fine_threshold: ComputePipeline,
+    /// `admit`.
+    admit: ComputePipeline,
     /// `gate`, with its own layout.
     gate: ComputePipeline,
     /// `binds`, the budget's gate, on the gate's layout.
@@ -1415,7 +1432,9 @@ impl Lod {
         }
         let nodes = u64::from(capacity.max(1));
         // Clusters of tiles with at least 8 quads a side carry 128 triangles each; smaller tiles
-        // one cluster each, at most one per node.
+        // one cluster each, at most one per node. The tiles drawn are within what the choice is
+        // charged, and the charge within the budget (the module notes, "Budget"), so the lists
+        // never overflow.
         let cluster_capacity = (config.triangle_budget / 128).saturating_add(capacity.max(1));
         let device = gpu.device();
         let bounds = BoundsPass::new(gpu, capacity)?;
@@ -1449,7 +1468,7 @@ impl Lod {
         let dispatches = gpu.scoped("lod dispatches", || {
             device.create_buffer(&BufferDescriptor {
                 label: Some("lod dispatches"),
-                size: (u64::from(ONCE_SLOT) + 1) * DISPATCH_BYTES,
+                size: u64::from(DISPATCH_SLOTS) * DISPATCH_BYTES,
                 usage: BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
@@ -1503,7 +1522,6 @@ impl Lod {
             returns,
             returned,
             timer: None,
-            budget_near: true,
         })
     }
 
@@ -1630,9 +1648,6 @@ impl Lod {
     ) -> Result<(), LodError> {
         self.check(inputs)?;
         self.write_settings(gpu, inputs);
-        // What the readbacks said since the last frame: whether to encode the budget's passes.
-        self.take_unused();
-        let budget = self.budget_near;
         let passes = self.config.relax_passes;
         let group = self.group(gpu, inputs)?;
         let pyramid = inputs
@@ -1659,11 +1674,6 @@ impl Lod {
             pass.dispatch_workgroups(1, 1, 1);
             pass.set_pipeline(&p.mark);
             pass.dispatch_workgroups(nodes, 1, 1);
-            if budget {
-                pass.set_pipeline(&p.binds);
-                pass.set_bind_group(0, &self.gate_group, &[0]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
         }
         let levels = 0..u32::from(inputs.finest.get());
         {
@@ -1671,11 +1681,6 @@ impl Lod {
                 label: Some("lod relax"),
                 timestamp_writes: stage_writes(self.timer.as_ref(), stamps, Stage::Relax),
             });
-            pass.set_bind_group(0, &group, &[0]);
-            pass.set_bind_group(1, &phase, &[]);
-            if budget {
-                self.encode_fill(&mut pass);
-            }
             for index in 0..passes {
                 pass.set_pipeline(&p.relax);
                 pass.set_bind_group(0, &group, &[step(index)]);
@@ -1688,6 +1693,10 @@ impl Lod {
                 pass.set_bind_group(0, &self.gate_group, &[step(index)]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
+            // Whether the budget binds, decided on the GPU: the budget's choice's dispatches.
+            pass.set_pipeline(&p.binds);
+            pass.set_bind_group(0, &self.gate_group, &[0]);
+            pass.dispatch_workgroups(1, 1, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -1700,9 +1709,7 @@ impl Lod {
                 pass.set_bind_group(0, &group, &[step(level)]);
                 pass.dispatch_workgroups(nodes, 1, 1);
             }
-            if budget {
-                self.encode_give_back(&mut pass, &group, levels);
-            }
+            self.encode_budget(&mut pass, &group, levels);
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -1728,50 +1735,39 @@ impl Lod {
         Ok(())
     }
 
-    /// Encodes the budget's fill into `pass` (group 0 bound at the first step): where the budget
-    /// binds, the partial bucket's tiles by fine bin, before the relaxation, so its passes raise
-    /// around what the fill admits as around what mark refined. Gated: with the budget not
-    /// binding, its dispatches are of no workgroup.
-    fn encode_fill(&self, pass: &mut ComputePass<'_>) {
+    /// Encodes the budget's choice into `pass` after the sweep, over `levels` coarse to fine,
+    /// `group` group 0 (`lod.wgsl`, "The budget's choice"): always encoded, its dispatches set by
+    /// the budget's gate to no workgroup unless the budget binds, so the frame it starts binding
+    /// in is chosen by it too.
+    fn encode_budget(&self, pass: &mut ComputePass<'_>, group: &BindGroup, levels: Range<u32>) {
         let p = &self.pipelines;
-        let (every, once) = budget_slots();
+        let every = u64::from(REFILL_SLOT) * DISPATCH_BYTES;
+        let once = u64::from(ONCE_SLOT) * DISPATCH_BYTES;
+        let step = |index: u32| index * u32::try_from(UNIFORM_STRIDE).unwrap_or(256);
+        pass.set_bind_group(0, group, &[0]);
+        for (pipeline, slot) in [(&p.budget_begin, once), (&p.need_init, every)] {
+            pass.set_pipeline(pipeline);
+            pass.dispatch_workgroups_indirect(&self.dispatches, slot);
+        }
+        pass.set_pipeline(&p.need_spread);
+        for index in 0..NEED_PASSES {
+            pass.set_bind_group(0, group, &[step(index)]);
+            pass.dispatch_workgroups_indirect(&self.dispatches, every);
+        }
+        pass.set_bind_group(0, group, &[0]);
         for (pipeline, slot) in [
-            (&p.scratch_clear, once),
-            (&p.fill_count, every),
-            (&p.fill_threshold, once),
-            (&p.fill, every),
+            (&p.need_count, every),
+            (&p.need_threshold, once),
+            (&p.need_fine_count, every),
+            (&p.need_fine_threshold, once),
         ] {
             pass.set_pipeline(pipeline);
             pass.dispatch_workgroups_indirect(&self.dispatches, slot);
         }
-    }
-
-    /// Encodes giving back into `pass` after the sweep, over `levels` coarse to fine, `group`
-    /// group 0: where the budget binds, what the sweep took back is recounted and spent again on
-    /// the tiles that need refining. Gated as [`Lod::encode_fill`].
-    fn encode_give_back(&self, pass: &mut ComputePass<'_>, group: &BindGroup, levels: Range<u32>) {
-        let p = &self.pipelines;
-        let (every, once) = budget_slots();
-        let step = |index: u32| index * u32::try_from(UNIFORM_STRIDE).unwrap_or(256);
-        pass.set_bind_group(0, group, &[0]);
-        for pipeline in [&p.recount, &p.need_init] {
-            pass.set_pipeline(pipeline);
-            pass.dispatch_workgroups_indirect(&self.dispatches, every);
-        }
-        pass.set_pipeline(&p.need_spread);
-        for _ in 0..self.config.relax_passes {
-            pass.dispatch_workgroups_indirect(&self.dispatches, every);
-        }
+        pass.set_pipeline(&p.admit);
         for level in levels {
             pass.set_bind_group(0, group, &[step(level)]);
-            for (pipeline, slot) in [
-                (&p.back_count, every),
-                (&p.back_threshold, once),
-                (&p.give_back, every),
-            ] {
-                pass.set_pipeline(pipeline);
-                pass.dispatch_workgroups_indirect(&self.dispatches, slot);
-            }
+            pass.dispatch_workgroups_indirect(&self.dispatches, every);
         }
     }
 
@@ -1980,11 +1976,6 @@ impl Lod {
         while let Ok(returned) = self.returned.try_recv() {
             match returned {
                 Returned::Free(buffer) => self.free.push(buffer),
-                Returned::Read(buffer, seen) => {
-                    self.free.push(buffer);
-                    self.budget_near =
-                        seen.binds || seen.charged >= self.config.triangle_budget / 2;
-                }
                 Returned::Lost => self.made = self.made.saturating_sub(1),
             }
         }
@@ -2256,13 +2247,16 @@ impl Pipelines {
         patches: &[(&str, &str)],
     ) -> Result<Self, GpuError> {
         let gate_source = format!(
-            "const RAISES: u32 = {RAISES_WORD}u;\nconst PARTIAL: u32 = {PARTIAL_WORD}u;\n\
+            "const RAISES: u32 = {RAISES_WORD}u;\nconst BUDGET_WANTED: u32 = {BUDGET_WANTED_WORD}u;\n\
              const REFILL: u32 = {REFILL_SLOT}u;\nconst ONCE: u32 = {ONCE_SLOT}u;\n{GATE_WGSL}"
         );
         let gate = pipeline(gpu, "lod gate", &gate_source, &[gate_layout], "gate")?;
         let binds = pipeline(gpu, "lod binds", &gate_source, &[gate_layout], "binds")?;
-        let mut source =
-            format!("{NODE_WGSL}{REQUESTS_WGSL}{CULL_WGSL}{CLUSTER_WGSL}{MORPH_WGSL}{LOD_WGSL}");
+        let mut source = format!(
+            "const BUCKETS: u32 = {BUCKETS}u;\nconst FINE_BINS: u32 = {FINE_BINS}u;\n\
+             const NEED_PASSES: u32 = {NEED_PASSES}u;\n\
+             {NODE_WGSL}{REQUESTS_WGSL}{CULL_WGSL}{CLUSTER_WGSL}{MORPH_WGSL}{LOD_WGSL}"
+        );
         for (from, to) in patches {
             source = source.replace(from, to);
         }
@@ -2288,16 +2282,14 @@ impl Pipelines {
             finish: make("finish")?,
             post: make("post")?,
             post_finish: make("post_finish")?,
-            scratch_clear: make("scratch_clear")?,
-            fill_count: make("fill_count")?,
-            fill_threshold: make("fill_threshold")?,
-            fill: make("fill")?,
-            recount: make("recount")?,
+            budget_begin: make("budget_begin")?,
             need_init: make("need_init")?,
             need_spread: make("need_spread")?,
-            back_count: make("back_count")?,
-            back_threshold: make("back_threshold")?,
-            give_back: make("give_back")?,
+            need_count: make("need_count")?,
+            need_threshold: make("need_threshold")?,
+            need_fine_count: make("need_fine_count")?,
+            need_fine_threshold: make("need_fine_threshold")?,
+            admit: make("admit")?,
             gate,
             binds,
         })
@@ -2447,12 +2439,12 @@ fn key_order(key: &TileKey) -> u128 {
 
 /// The counts of a frame's results.
 fn stats(frame: &GpuFrame) -> LodStats {
-    let binds = usize::try_from(frame.partial).is_ok_and(|bucket| bucket < BUCKETS);
-    let recounted = binds && frame.budget_ran != 0;
+    let binds = frame.binds != 0;
+    let stopped = usize::try_from(frame.need_bucket).is_ok_and(|bucket| bucket < BUCKETS);
     LodStats {
         cut: frame.cut_count,
         cut_triangles: frame.cut_triangles,
-        refined_triangles: if recounted {
+        refined_triangles: if binds {
             frame.charged
         } else {
             frame.triangles
@@ -2477,9 +2469,19 @@ fn stats(frame: &GpuFrame) -> LodStats {
         stuck: frame.stuck,
         cone_exempt: frame.cone_exempt,
         raises: frame.raises.to_vec(),
-        partial_bucket: binds.then_some(frame.partial),
-        filled: frame.filled,
-        given_back: frame.given_back,
+        budget_binds: binds,
+        budget_bucket: (binds && stopped && frame.need_bin != 0).then_some(frame.need_bucket),
+        budget_slack: if binds {
+            frame.slack.saturating_mul(BUDGET_UNIT)
+        } else {
+            0
+        },
+        mark_bucket: usize::try_from(frame.partial)
+            .is_ok_and(|bucket| bucket < BUCKETS)
+            .then_some(frame.partial),
+        relax_refused: frame.relax_refused,
+        admitted: frame.admitted,
+        held: frame.held,
         overflow: (
             frame.cluster_overflow,
             frame.retry_overflow,

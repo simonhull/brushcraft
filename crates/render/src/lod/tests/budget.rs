@@ -1,13 +1,9 @@
 //! The triangle budget when it binds (spec, "Triangle budget", "When it binds").
 //!
-//! The worst errors first, tiles admitted up to the budget with no cut-off at a bucket, charged
-//! by what they draw, and the charge the sweep takes back returned.
+//! The worst needs first over the whole view, tiles admitted up to the budget to within a fine
+//! bin with no cut-off at a bucket, charged by what they draw, the same cut every frame.
 
 use super::*;
-
-/// The most one refinement is charged: four finest-sized children drawn where their parent
-/// wasn't, in triangles.
-const ONE_TILE: u32 = 4 * 2 * 64 * 64;
 
 /// The test sphere (`cube_sphere(4)` to level 8, every tile resident, `e` its quad edge), seen
 /// from 2.7 away: about 440 tiles drawn, 3.6M triangles with no budget.
@@ -72,18 +68,22 @@ fn near_the_facing_point(scene: &Scene, view: &View, place: Place, radius: f32) 
     d.sqrt() < radius
 }
 
-/// Asserts the choice `output` charged at most `budget` and filled it to within one tile's
-/// charge, and drew no more than it charged.
+/// Asserts the choice `output` bound and filled `budget` to within the slack it reports.
+///
+/// It charged at most `budget`, left unspent no more than its slack (the first fine bin it
+/// couldn't take and its held tiles, plus the rounding of the budget to units), and drew no more
+/// than it charged.
 fn assert_filled(output: &LodOutput, budget: u32) {
     let stats = &output.stats;
+    assert!(stats.budget_binds, "binds: {stats:?}");
     assert!(
         stats.refined_triangles <= budget,
         "over the budget: {stats:?}"
     );
+    let unspent = budget - stats.refined_triangles;
     assert!(
-        stats.refined_triangles + ONE_TILE > budget,
-        "{} of {budget} triangles charged: {stats:?}",
-        stats.refined_triangles,
+        unspent <= stats.budget_slack + BUDGET_UNIT,
+        "{unspent} of {budget} triangles unspent: {stats:?}"
     );
     assert!(
         stats.drawn_triangles <= stats.refined_triangles,
@@ -91,12 +91,65 @@ fn assert_filled(output: &LodOutput, budget: u32) {
     );
 }
 
+/// `place`'s rank as the GPU orders it: its `e` projected over its own sphere, capped by its
+/// ancestors', 0 out of view; `None` where in view is too close to call.
+pub(super) fn cpu_rank(scene: &Scene, view: &View, place: Place) -> Option<f32> {
+    let gpu = view.gpu();
+    let eye = [gpu.eye[0], gpu.eye[1], gpu.eye[2]];
+    let mut rank = f32::MAX;
+    let mut at = Some(place);
+    while let Some(p) = at {
+        let b = scene.bounds[&p];
+        let e = scene.details[&p].error;
+        let wide = in_frustum(&gpu, b.center, (b.radius + e) * 1.001)
+            && !scene.refine_facing_away(p, eye, e * 1.001 + b.radius * 0.001, b.radius * 0.001);
+        let narrow = in_frustum(&gpu, b.center, (b.radius + e) * 0.999)
+            && !scene.refine_facing_away(p, eye, e * 0.999 - b.radius * 0.001, -b.radius * 0.001);
+        if wide != narrow {
+            return None;
+        }
+        rank = rank.min(if wide {
+            projected(&gpu, &b, 0.0, e)
+        } else {
+            0.0
+        });
+        at = p.parent();
+    }
+    Some(rank)
+}
+
+/// Asserts the budget's choice `output` went worst first.
+///
+/// No tile it left in the cut ranks above the bucket it stopped in ([`LodStats::budget_error`],
+/// an eighth of an octave, with 5 % for the CPU's arithmetic against the GPU's), but those it
+/// held for their seams.
+pub(super) fn assert_worst_first(scene: &Scene, view: &View, output: &LodOutput) {
+    let Some(error) = output.stats.budget_error() else {
+        return;
+    };
+    let above = error * 2_f32.powf(1.0 / 8.0) * 1.05;
+    let left_over: Vec<(Place, f32)> = places(output)
+        .into_iter()
+        .filter(|p| p.level() < scene.finest)
+        .filter_map(|p| cpu_rank(scene, view, p).map(|rank| (p, rank)))
+        .filter(|(_, rank)| *rank > above)
+        .collect();
+    let held = usize::try_from(output.stats.held).expect("small");
+    assert!(
+        left_over.len() <= held,
+        "{} tiles of the cut ranked over {above} px: {left_over:?}, {:?}",
+        left_over.len(),
+        output.stats
+    );
+}
+
 #[test]
-fn a_binding_budget_is_filled_to_within_one_tile_s_charge() {
+fn a_binding_budget_is_filled_to_within_its_slack() {
     GpuTest::run(|gpu| {
         let (mut scene, view) = sphere(gpu);
         let unlimited = choose(gpu, &mut scene, &view, None);
         assert_eq!(unlimited.stats.over_pixel, 0, "{:?}", unlimited.stats);
+        assert!(!unlimited.stats.budget_binds, "{:?}", unlimited.stats);
         for divisor in [2, 3, 5, 9] {
             let budget = unlimited.stats.drawn_triangles / divisor;
             let capped = choose(gpu, &mut scene, &view, Some(budget));
@@ -108,6 +161,12 @@ fn a_binding_budget_is_filled_to_within_one_tile_s_charge() {
                 capped.stats
             );
             assert_filled(&capped, budget);
+            // A fine bin is a 128th of an eighth of an octave, at one level: a tile or two.
+            assert!(
+                capped.stats.budget_slack <= 4 * 2 * 64 * 64 * 2,
+                "{:?}",
+                capped.stats
+            );
         }
     });
 }
@@ -186,6 +245,8 @@ fn an_inflated_region_over_the_whole_budget_never_drops_the_view_to_its_base_fac
         });
         let capped = choose(gpu, &mut scene, &view, Some(budget));
         check_partition(&scene, &capped);
+        // The budget's choice keeps the neighbour rule.
+        assert!(capped.stats.admitted > 0, "{:?}", capped.stats);
         check_neighbours(&scene, &capped, Some(&view));
         assert!(
             capped.cut.iter().any(|key| key.level() > level(2)),
@@ -193,6 +254,41 @@ fn an_inflated_region_over_the_whole_budget_never_drops_the_view_to_its_base_fac
             capped.stats
         );
         assert_filled(&capped, budget);
+        // The sweep's takebacks of the first choice don't count: only what the budget's choice
+        // held for its seams.
+        assert_eq!(
+            capped.stats.shortfall, capped.stats.held,
+            "{:?}",
+            capped.stats
+        );
+    });
+}
+
+#[test]
+fn the_charge_goes_to_the_worst_needs_not_to_lower_errors_elsewhere() {
+    GpuTest::run(|gpu| {
+        // Errors a tenth of the quad edge: the tiles want refining by the quad edge's 4 px, at
+        // low ranks; the inflated region's ranks are far above, and the neighbour rule needs
+        // tiles of lower rank around it.
+        let mesh = cube_sphere(4).expect("a mesh");
+        let mut scene = Scene::new(gpu, mesh, level(8), |_| true, |_| 0.1);
+        let view = look(Vec3::new(0.4, 0.6, 2.6), Vec3::default());
+        let unlimited = choose(gpu, &mut scene, &view, None);
+        let budget = unlimited.stats.drawn_triangles / 3;
+        inflate(&mut scene, |s, place| {
+            near_the_facing_point(s, &view, place, 0.15)
+        });
+        let capped = choose(gpu, &mut scene, &view, Some(budget));
+        check_partition(&scene, &capped);
+        check_neighbours(&scene, &capped, Some(&view));
+        assert_filled(&capped, budget);
+        let region_finest = capped
+            .cut
+            .iter()
+            .filter(|key| near_the_facing_point(&scene, &view, Place::of(key), 0.1))
+            .all(|key| key.level() == scene.finest);
+        assert!(region_finest, "the worst first: {:?}", capped.stats);
+        assert_worst_first(&scene, &view, &capped);
     });
 }
 
@@ -206,11 +302,7 @@ fn a_binding_budget_chooses_the_same_cut_whatever_order_the_threads_ran_in() {
             near_the_facing_point(s, &view, place, 0.6)
         });
         let first = choose(gpu, &mut scene, &view, Some(budget));
-        assert!(
-            first.stats.filled + first.stats.given_back > 0,
-            "{:?}",
-            first.stats
-        );
+        assert!(first.stats.admitted > 0, "{:?}", first.stats);
         for _ in 0..4 {
             let again = choose(gpu, &mut scene, &view, Some(budget));
             assert_eq!(
@@ -223,7 +315,7 @@ fn a_binding_budget_chooses_the_same_cut_whatever_order_the_threads_ran_in() {
 }
 
 #[test]
-fn a_budget_far_from_binding_skips_its_passes_and_takes_them_up_a_frame_after_it_binds() {
+fn the_frame_a_budget_starts_binding_in_is_chosen_by_it_with_no_cut_off() {
     GpuTest::run(|gpu| {
         let (mut scene, near) = sphere(gpu);
         let unlimited = choose(gpu, &mut scene, &near, None);
@@ -238,26 +330,196 @@ fn a_budget_far_from_binding_skips_its_passes_and_takes_them_up_a_frame_after_it
         let mut frame = |view: &View| run(gpu, &mut lod, &mut scene, &requests, view, None, None);
         let distant = frame(&far);
         assert!(
-            distant.stats.refined_triangles < budget / 2,
+            !distant.stats.budget_binds,
             "far from its budget: {:?}",
             distant.stats
         );
-        // The frame after one far from its budget encodes no budget pass: binding now, it
-        // stops at a bucket, with no fill and nothing given back.
-        let first = frame(&near);
+        // The first frame that binds, with nothing read back saying so yet.
+        let onset = frame(&near);
+        assert_filled(&onset, budget);
+    });
+}
+
+#[test]
+fn a_budget_under_the_level_0_tiles_binds_and_stops_nowhere() {
+    GpuTest::run(|gpu| {
+        let (mut scene, view) = sphere(gpu);
+        let tiny = choose(gpu, &mut scene, &view, Some(16));
+        check_partition(&scene, &tiny);
+        assert!(tiny.stats.budget_binds, "{:?}", tiny.stats);
+        assert_eq!(tiny.stats.mark_bucket, None, "{:?}", tiny.stats);
+        assert_eq!(tiny.stats.budget_bucket, None, "{:?}", tiny.stats);
         assert!(
-            first.stats.partial_bucket.is_some(),
-            "binds: {:?}",
-            first.stats
-        );
-        assert_eq!(
-            (first.stats.filled, first.stats.given_back),
-            (0, 0),
+            tiny.cut.iter().all(|key| key.level() == level(0) || {
+                // Only refinements charged nothing: tiles out of view.
+                !tiny.drawn.contains(key)
+            }),
             "{:?}",
-            first.stats
+            tiny.stats
         );
-        // The next has heard it bind, and fills the budget.
-        let second = frame(&near);
-        assert_filled(&second, budget);
+    });
+}
+
+/// A scene and a budget where mark takes every bucket but the relaxation can't fit its raises.
+///
+/// An inflated region is refined to the finest level, and the relaxation must raise its
+/// neighbours, which want less. The budget is the least mark takes whole, found by bisection
+/// (mark takes every bucket exactly when the budget holds them all).
+fn relax_refusing(gpu: &Gpu) -> (Scene, View, u32) {
+    // Errors a twentieth of the quad edge: outside the region the quad edge's 4 px decides,
+    // levels short of the region's, so the relaxation raises tiles in view around it.
+    let mesh = cube_sphere(4).expect("a mesh");
+    let mut scene = Scene::new(gpu, mesh, level(8), |_| true, |_| 0.05);
+    let view = look(Vec3::new(0.4, 0.6, 2.6), Vec3::default());
+    inflate(&mut scene, |s, place| {
+        near_the_facing_point(s, &view, place, 0.15)
+    });
+    let unlimited = choose(gpu, &mut scene, &view, None);
+    let (mut low, mut high) = (0, unlimited.stats.refined_triangles);
+    while high - low > BUDGET_UNIT {
+        let mid = low + (high - low) / 2;
+        let output = choose(gpu, &mut scene, &view, Some(mid));
+        if output.stats.mark_bucket.is_some() {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    let output = choose(gpu, &mut scene, &view, Some(high));
+    assert!(
+        output.stats.mark_bucket.is_none() && output.stats.relax_refused > 0,
+        "mark takes every bucket and the relaxation can't fit: {:?}",
+        output.stats
+    );
+    (scene, view, high)
+}
+
+#[test]
+fn a_relaxation_the_budget_refuses_makes_the_budget_bind_though_mark_took_every_bucket() {
+    GpuTest::run(|gpu| {
+        let (mut scene, view, budget) = relax_refusing(gpu);
+        let output = choose(gpu, &mut scene, &view, Some(budget));
+        check_partition(&scene, &output);
+        check_neighbours(&scene, &output, Some(&view));
+        assert!(output.stats.budget_binds, "{:?}", output.stats);
+        assert!(
+            output.stats.refined_triangles <= budget,
+            "{:?}",
+            output.stats
+        );
+        assert!(
+            output.stats.drawn_triangles <= output.stats.refined_triangles,
+            "{:?}",
+            output.stats
+        );
+    });
+}
+
+#[test]
+fn a_still_camera_over_a_refusing_relaxation_keeps_the_same_cut_every_frame() {
+    GpuTest::run(|gpu| {
+        let (mut scene, view, budget) = relax_refusing(gpu);
+        let config = LodConfig::default()
+            .with_triangle_budget(budget)
+            .with_relax_passes(MAX_RELAX_PASSES)
+            .expect("valid");
+        let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+        let requests = request_buffer(gpu, 4096);
+        let outputs: Vec<LodOutput> = (0..6)
+            .map(|_| run(gpu, &mut lod, &mut scene, &requests, &view, None, None))
+            .collect();
+        let settled = outputs.get(1).expect("frames");
+        for (frame, output) in outputs.iter().enumerate().skip(2) {
+            assert_eq!(
+                output.cut, settled.cut,
+                "frame {frame}: {:?} against {:?}",
+                output.stats, settled.stats
+            );
+        }
+    });
+}
+
+/// A frame's choice with the raster's morph on, the distance ramp at `ramp` pixels.
+///
+/// With a duration and every stamp zero (every tile new to the cut, the camera still), no tile
+/// with a parent is settled at its end, and emit draws every tile facing away that isn't settled
+/// at its start.
+fn run_morphing(gpu: &Gpu, lod: &mut Lod, scene: &mut Scene, view: &View, ramp: f32) -> LodOutput {
+    let requests = request_buffer(gpu, 4096);
+    let stamps = gpu.device().create_buffer(&BufferDescriptor {
+        label: Some("test stamps"),
+        size: u64::from(scene.tree.capacity().max(1)) * 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let params = gpu.device().create_buffer(&BufferDescriptor {
+        label: Some("test raster params"),
+        size: 32,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    // GpuRasterParams: frame, now, duration, flags, ramp, count word, reserved.
+    let words: [u32; 8] = [5, 1000, 150, 0, ramp.to_bits(), 0, 0, 0];
+    gpu.queue()
+        .write_buffer(&params, 0, bytemuck::cast_slice(&words));
+    scene.upload(gpu, lod);
+    gpu.queue().write_buffer(&requests, 0, &[0; 16]);
+    let mut encoder = gpu
+        .device()
+        .create_command_encoder(&CommandEncoderDescriptor::default());
+    let inputs = MainInputs {
+        tree: scene.tree.buffer(),
+        requests: &requests,
+        view,
+        previous: None,
+        finest: scene.finest,
+        morph: Some(MorphInputs {
+            stamps: &stamps,
+            params: &params,
+        }),
+    };
+    lod.encode_main(gpu, &mut encoder, &inputs)
+        .expect("encoded");
+    let readback = lod
+        .encode_readback(gpu, &mut encoder, 0)
+        .expect("encoded")
+        .expect("a readback buffer is free");
+    gpu.queue().submit([encoder.finish()]);
+    readback.submitted();
+    gpu.device()
+        .poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .expect("the GPU finishes");
+    gpu.check().expect("no GPU error");
+    lod.collect(scene.finest)
+        .expect("read back")
+        .expect("the frame's results arrived")
+}
+
+#[test]
+fn with_the_morph_on_the_tiles_drawn_facing_away_are_charged_and_the_budget_bounds_the_drawn() {
+    GpuTest::run(|gpu| {
+        let (mut scene, view) = sphere(gpu);
+        let unlimited = choose(gpu, &mut scene, &view, None);
+        for budget in [None, Some(unlimited.stats.drawn_triangles / 3)] {
+            let config = LodConfig::default()
+                .with_relax_passes(MAX_RELAX_PASSES)
+                .expect("valid");
+            let config = budget.map_or(config, |b| config.with_triangle_budget(b));
+            let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+            let output = run_morphing(gpu, &mut lod, &mut scene, &view, 1.0);
+            let stats = &output.stats;
+            assert!(stats.cone_exempt > 0, "tiles facing away drawn: {stats:?}");
+            assert!(
+                stats.drawn_triangles <= stats.refined_triangles,
+                "drew more than it charged: {stats:?}"
+            );
+            if let Some(budget) = budget {
+                assert_filled(&output, budget);
+            }
+            assert_eq!(stats.overflow, (0, 0, 0), "{stats:?}");
+        }
     });
 }

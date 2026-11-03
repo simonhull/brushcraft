@@ -4,7 +4,7 @@
 // Appended to tree::NODE_WGSL, residency::REQUESTS_WGSL, cull::CULL_WGSL, lod::CLUSTER_WGSL and
 // raster::MORPH_WGSL.
 // One thread per node of the tile tree in every pass but the thresholds (threshold,
-// fill_threshold, back_threshold), scratch_clear, finish and post. The passes, in order (lod.rs
+// need_threshold, need_fine_threshold), budget_begin, finish and post. The passes, in order (lod.rs
 // dispatches them):
 //
 // 1. begin: clears the frame's counts and draw arguments.
@@ -13,27 +13,24 @@
 // 3. close: per tile, its rank (its e projected over its own sphere) capped by its ancestors'
 //    (so the refined set stays a tree under any threshold), and whether every ancestor wants
 //    refining and can be; for those, a histogram of the budget units each possible refinement
-//    is charged (what its children draw beyond what it draws: nothing out of view or facing
-//    away), by that capped rank.
-// 4. threshold: the error the triangle budget allows refining down to, from the histogram: the
-//    buckets taken whole, worst first, and the bucket that doesn't fit (the partial bucket);
-//    then binds (gate.wgsl) dispatches the budget's passes below only if there is one.
-// 5. mark: refines every such tile that wants it, can be, and is above the threshold; where the
-//    budget binds, fill_count, fill_threshold and fill take the partial bucket's tiles by fine
-//    bin, worst first, until the budget is spent, so there is no cut-off at a bucket.
+//    is charged (what its children may draw beyond what it may draw: nothing out of view), by
+//    that capped rank.
+// 4. threshold: the error the triangle budget allows refining down to, from the histogram; if
+//    it can't take every bucket, or the level-0 tiles alone are over it, the budget binds.
+// 5. mark: refines every such tile that wants it, can be, and is above the threshold (or is
+//    charged nothing).
 // 6. relax, up to a fixed number of passes: a reached tile in the cut is refined if it
 //    touches an area two levels finer, or wants refining above the threshold (a tile reached
 //    only through an earlier raise). In place and monotone (bits are only set), so passes
 //    converge to the same choice in any order; each pass's dispatch is gated on the last one
-//    having raised something (gate.wgsl), so passes past the settling cost nothing.
+//    having raised something (gate.wgsl), so passes past the settling cost nothing. A raise the
+//    budget can't fit makes the budget bind. Then binds (gate.wgsl) dispatches the budget's
+//    choice below only where the budget binds.
 // 7. sweep, one pass per level, coarse to fine: a tile keeps its refinement only if each
 //    neighbour across its edges is reached at its level, so neighbours in the cut are at most
 //    one level apart by construction; refinements taken back are the shortfall. Where the
-//    budget binds, the charge the sweep took back is given back: recount sums what it kept,
-//    need_init and need_spread find what needs refining (the tiles wanting it and those the
-//    neighbour rule needs for them), and a level at a time, coarse to fine, back_count,
-//    back_threshold and give_back refine the tiles of the cut that need it and whose seams hold,
-//    worst first, until the budget is spent.
+//    budget binds, the budget's choice ("The budget's choice", below) then chooses the cut
+//    again, by need, worst first over the whole view.
 // 8. emit: the cut (tiles reached and not refined), read back for residency; requests;
 //    frustum, cone (only for tiles whose morph is settled) and first-phase occlusion culling (the previous frame's pyramid, seen from
 //    the previous frame's view); the visible clusters and their draw arguments, and the tiles
@@ -93,7 +90,7 @@ struct NodeWork {
     cut_index: u32,
     // The projected e over the tile's own sphere (0 out of view): what the budget ranks its
     // refinement by, until close has capped it into `effective`; where the budget binds, after
-    // the sweep, how badly it needs refining (need_init, need_spread).
+    // the sweep, how badly it needs refining (need_init, need_spread), -1 not at all.
     rank: f32,
 }
 
@@ -177,27 +174,40 @@ struct LodFrame {
     // Tiles raised by each relaxation pass.
     raises: array<atomic<u32>, 16>,
     // Budget units each possible refinement adds, by bucket of its capped screen error.
-    histogram: array<atomic<u32>, 256>,
-    // The bucket the budget couldn't take whole, whose tiles fill and give_back admit until
-    // the budget is spent; BUCKETS when the budget took every bucket (it doesn't bind).
+    histogram: array<atomic<u32>, BUCKETS>,
+    // The histogram's bucket mark couldn't take whole; BUCKETS when it took every bucket, or
+    // when the level-0 tiles alone are over the budget.
     partial: u32,
-    // Budget units the choice is charged after the sweep: recount's sum, then give_back's.
+    // 1 if the budget binds: threshold couldn't take every bucket, or the level-0 tiles alone are
+    // over it, or the relaxation couldn't fit a raise. The budget's choice then runs.
+    budget_wanted: atomic<u32>,
+    // Raises the relaxation couldn't fit in the budget.
+    relax_refused: atomic<u32>,
+    // 1 once budget_begin ran: the budget's choice made the cut.
+    binds: u32,
+    // Budget units the budget's choice is charged: the level-0 tiles', then what it admits.
     charged: atomic<u32>,
-    // Refinements fill admitted from the partial bucket.
-    filled: atomic<u32>,
-    // Refinements give_back admitted after the sweep.
-    given_back: atomic<u32>,
-    // 1 once scratch_clear ran: the budget's passes were encoded and it binds.
-    budget_ran: u32,
+    // Refinements the budget's choice admitted.
+    admitted: atomic<u32>,
+    // Tiles needing refining at or above its threshold whose seams didn't hold (none once the
+    // need has settled).
+    held: atomic<u32>,
+    // The budget's choice's threshold: the bucket of need it couldn't take whole (0 when it took
+    // every one, BUCKETS when it could take none), and the lowest fine bin of it taken
+    // (FINE_BINS for none).
+    need_bucket: u32,
+    // See need_bucket.
+    need_bin: u32,
+    // Budget units of the first fine bin the budget's choice couldn't take: with the held tiles'
+    // charge, what can be left unspent.
+    slack: u32,
     // Past here, scratch the readback leaves out (render::lod::GpuFrame stops before it).
-    // The lowest fine bin fill took.
-    fine_threshold: u32,
-    // The lowest bucket the level being given back took.
-    level_threshold: u32,
-    // Budget units of the partial bucket's tiles, by fine bin.
-    fine: array<atomic<u32>, 2048>,
-    // Budget units of the level being given back, by bucket.
-    level_histogram: array<atomic<u32>, 256>,
+    // Budget units of every tile needing refining, by bucket of its need.
+    need_histogram: array<atomic<u32>, BUCKETS>,
+    // Budget units of the tiles of need_bucket, by fine bin.
+    fine: array<atomic<u32>, FINE_BINS>,
+    // Needs each spreading pass raised: a pass after one that raised none has nothing to do.
+    spread_changes: array<atomic<u32>, NEED_PASSES>,
 }
 
 // One tile of the cut (render::lod::GpuCutEntry): 16 bytes.
@@ -284,8 +294,8 @@ const W_SHORT: u32 = 1024u;
 const W_HELD: u32 = 2048u;
 // Outside the frustum, by the sphere of what it draws: its seams are off-screen.
 const W_OUTSIDE: u32 = 4096u;
-// Drawn if in the cut: in the frustum by its own sphere and not facing away by its own
-// triangles (or of unknown bounds, which drawing doesn't cull). What the budget charges.
+// May be drawn if in the cut: emit doesn't certainly cull it (see choose). What the budget
+// charges.
 const W_DRAWS: u32 = 8192u;
 // LodParams.options: seams of tiles outside the frustum are exempt from the neighbour rule.
 const OPTION_OFFSCREEN_SEAMS: u32 = 1u;
@@ -295,8 +305,7 @@ const MEM_REFINED: u32 = 1u;
 const CUT_DRAWN: u32 = 1u;
 // Tiles at this level and finer have four children; coarser ones one (a whole face).
 const SPLIT_FROM: u32 = 6u;
-// Histogram buckets: an eighth of an octave each, from 2^-8 px.
-const BUCKETS: u32 = 256u;
+// Histogram buckets (BUCKETS, from lod.rs): an eighth of an octave each, from 2^-8 px.
 // Indices per cluster: 8 × 8 quads, two triangles each.
 const CLUSTER_INDICES: u32 = 384u;
 
@@ -321,7 +330,7 @@ fn triangles_of(level: u32) -> u32 {
 // isn't, against 2^32 / 256 = 16M nodes, past MAX_NODES).
 const UNIT: u32 = 128u;
 
-// Triangles node `n` draws if in the cut: none if drawing would cull it (W_DRAWS).
+// Triangles node `n` may draw if in the cut: none if drawing certainly culls it (W_DRAWS).
 fn drawn_triangles(n: u32) -> u32 {
     if (flags_of(n) & W_DRAWS) == 0u {
         return 0u;
@@ -329,11 +338,11 @@ fn drawn_triangles(n: u32) -> u32 {
     return triangles_of(level_of(tree[n].place));
 }
 
-// Budget units refining node `n` is charged (a complete tile): the triangles its children draw
-// beyond what it draws itself, rounded up to a unit (exact from level 3 on, where a tile is a
-// multiple of a cluster), none where they draw no more. Charged by what is drawn, a tile out
-// of view or facing away, its children too, spends nothing (spec, "When it binds"), and the
-// charges of a refined tree sum to at least the triangles its cut draws.
+// Budget units refining node `n` is charged (a complete tile): the triangles its children may
+// draw beyond what it may draw itself, rounded up to a unit (exact from level 3 on, where a tile is a
+// multiple of a cluster), none where they may draw no more. Charged by what may be drawn, a tile
+// out of view, its children too, spends nothing (spec, "When it binds"), and the charges of a
+// refined tree sum to at least the triangles its cut draws.
 fn charge_units(n: u32) -> u32 {
     var children = 0u;
     var count = 4u;
@@ -522,10 +531,9 @@ fn begin(@builtin(local_invocation_index) t: u32) {
     atomicStore(&frame.stuck, 0u);
     atomicStore(&frame.cone_exempt, 0u);
     frame.partial = BUCKETS;
-    atomicStore(&frame.charged, 0u);
-    atomicStore(&frame.filled, 0u);
-    atomicStore(&frame.given_back, 0u);
-    frame.budget_ran = 0u;
+    atomicStore(&frame.budget_wanted, 0u);
+    atomicStore(&frame.relax_refused, 0u);
+    frame.binds = 0u;
 }
 
 // One step of a finest-normal cone's half-angle (geom::FinestNormalCone): pi / 4095, as the
@@ -668,10 +676,14 @@ fn choose(@builtin(global_invocation_id) id: vec3<u32>) {
     if b.radius >= 0.0 && !in_frustum(view, b.center, b.radius) {
         out |= W_OUTSIDE;
     }
-    // As emit culls a tile of the cut, but for the cone's morph exemption: what the budget
-    // charges.
+    // Whatever emit may draw of it if it is in the cut: what the budget charges. Emit culls a
+    // tile out of the frustum, and one facing away only once its morph is settled, which
+    // depends on edges the cut hasn't chosen yet: settled at its end with no edge drawn finer
+    // (the most seams to check) is settled whatever its edges, so only such a tile facing away
+    // is certainly culled. Any other facing away may be drawn (cone-exempt) and is charged.
+    let facing_away = b.radius >= 0.0 && backfacing(b, view.eye.xyz, 0.0);
     if b.radius < 0.0
-        || ((out & W_OUTSIDE) == 0u && !backfacing(b, view.eye.xyz, 0.0)) {
+        || ((out & W_OUTSIDE) == 0u && !(facing_away && settled_at_end(n, 0u))) {
         out |= W_DRAWS;
     }
     if b.radius >= 0.0
@@ -759,107 +771,28 @@ fn threshold() {
     let budget = params.budget / UNIT;
     var total = (atomicLoad(&frame.base) + UNIT - 1u) / UNIT;
     var chosen = BUCKETS;
-    for (var i = BUCKETS; i > 0u; i--) {
-        let add = atomicLoad(&frame.histogram[i - 1u]);
-        if total > budget || add > budget - total {
-            // The bucket that doesn't fit whole: fill takes its tiles until the budget is spent.
-            frame.partial = i - 1u;
-            break;
+    if total > budget {
+        // The level-0 tiles alone are over: no bucket is partly taken, nothing can be refined.
+        atomicStore(&frame.budget_wanted, 1u);
+        chosen = BUCKETS;
+    } else {
+        for (var i = BUCKETS; i > 0u; i--) {
+            let add = atomicLoad(&frame.histogram[i - 1u]);
+            if add > budget - total {
+                frame.partial = i - 1u;
+                atomicStore(&frame.budget_wanted, 1u);
+                break;
+            }
+            total += add;
+            chosen = i - 1u;
         }
-        total += add;
-        chosen = i - 1u;
     }
     frame.threshold = chosen;
     atomicStore(&frame.triangles, total);
-    atomicStore(&frame.charged, (atomicLoad(&frame.base) + UNIT - 1u) / UNIT);
 }
 
-// Fine bins within the partial bucket: FINE_SUBS slices of its error range, each split by
-// level, coarse first, so a parent whose capped error equals its child's ranks ahead of it.
-const FINE_SUBS: u32 = 128u;
-// Levels a fine bin is split by: past MAX_LEVEL.
-const FINE_LEVELS: u32 = 16u;
-// FINE_SUBS times FINE_LEVELS.
-const FINE_BINS: u32 = 2048u;
-
-// Whether node `n` (state `f`) is a tile of the partial bucket fill may admit: closed, wanting
-// refining and complete, held back by mark.
-fn fill_candidate(n: u32, f: u32) -> bool {
-    let needed = W_LIVE | W_CLOSED | W_WANTS | W_COMPLETE;
-    return (f & needed) == needed
-        && (f & W_REFINED) == 0u
-        && bucket(work[n].effective) == frame.partial;
-}
-
-// Node `n`'s fine bin in the partial bucket: higher is worse, a tile's never above its parent's
-// (its capped error is at most its parent's, and a tie goes to the coarser).
-fn fine_bin(n: u32) -> u32 {
-    let at = (log2(work[n].effective) + 8.0) * 8.0 - f32(frame.partial);
-    let sub = u32(clamp(floor(at * f32(FINE_SUBS)), 0.0, f32(FINE_SUBS - 1u)));
-    let level = min(level_of(tree[n].place), FINE_LEVELS - 1u);
-    return sub * FINE_LEVELS + (FINE_LEVELS - 1u - level);
-}
-
-// Where the budget binds (dispatched only then): clears the fine bins and the level buckets.
-@compute @workgroup_size(256)
-fn scratch_clear(@builtin(local_invocation_index) t: u32) {
-    if t == 0u {
-        frame.budget_ran = 1u;
-    }
-    for (var i = t; i < FINE_BINS; i += 256u) {
-        atomicStore(&frame.fine[i], 0u);
-    }
-    atomicStore(&frame.level_histogram[t], 0u);
-}
-
-// The fill, first pass: the charge of every tile of the partial bucket, by fine bin.
-@compute @workgroup_size(64)
-fn fill_count(@builtin(global_invocation_id) id: vec3<u32>) {
-    let n = id.x;
-    if n >= params.capacity {
-        return;
-    }
-    if fill_candidate(n, flags_of(n)) {
-        atomicAdd(&frame.fine[fine_bin(n)], charge_units(n));
-    }
-}
-
-// The fill, second pass: the lowest fine bin the budget left by mark takes, from the worst down,
-// each whole, so the choice is the same every frame whatever order the threads ran in.
-@compute @workgroup_size(1)
-fn fill_threshold() {
-    let budget = params.budget / UNIT;
-    var total = atomicLoad(&frame.triangles);
-    var chosen = FINE_BINS;
-    for (var i = FINE_BINS; i > 0u; i--) {
-        let add = atomicLoad(&frame.fine[i - 1u]);
-        if total > budget || add > budget - total {
-            break;
-        }
-        total += add;
-        chosen = i - 1u;
-    }
-    frame.fine_threshold = chosen;
-    atomicStore(&frame.triangles, total);
-}
-
-// The fill, third pass: refines the tiles of the partial bucket in the fine bins taken, so the
-// budget is spent to within a fine bin instead of stopping at the bucket (spec, "When it
-// binds"). A tile's parent is in a bin as bad or worse, so the refined set stays a tree.
-@compute @workgroup_size(64)
-fn fill(@builtin(global_invocation_id) id: vec3<u32>) {
-    let n = id.x;
-    if n >= params.capacity {
-        return;
-    }
-    if fill_candidate(n, flags_of(n)) && fine_bin(n) >= frame.fine_threshold {
-        atomicAnd(&work[n].flags, ~W_HELD);
-        atomicOr(&work[n].flags, W_REFINED);
-        atomicAdd(&frame.filled, 1u);
-    }
-}
-
-// Refines every reachable tile that wants it and can be, down to the threshold.
+// Refines every reachable tile that wants it and can be, down to the threshold, and any whose
+// refinement is charged nothing.
 @compute @workgroup_size(64)
 fn mark(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = id.x;
@@ -871,7 +804,8 @@ fn mark(@builtin(global_invocation_id) id: vec3<u32>) {
     if (f & needed) != needed {
         return;
     }
-    if bucket(work[n].effective) >= frame.threshold {
+    // A refinement that draws no more is charged nothing: refined whatever its bucket.
+    if bucket(work[n].effective) >= frame.threshold || charge_units(n) == 0u {
         atomicOr(&work[n].flags, W_REFINED);
     } else {
         atomicOr(&work[n].flags, W_HELD);
@@ -905,16 +839,38 @@ fn relax(@builtin(global_invocation_id) id: vec3<u32>) {
         atomicOr(&work[n].flags, W_STUCK);
         return;
     }
-    let delta = charge_units(n);
-    let budget = params.budget / UNIT;
-    let before = atomicAdd(&frame.triangles, delta);
-    if before <= budget && delta <= budget - before {
+    if claim_triangles(charge_units(n)) {
         atomicOr(&work[n].flags, W_REFINED);
         atomicAdd(&frame.raises[cursor.index], 1u);
     } else {
-        atomicSub(&frame.triangles, delta);
         atomicOr(&work[n].flags, W_REFUSED);
+        atomicAdd(&frame.relax_refused, 1u);
+        atomicStore(&frame.budget_wanted, 1u);
     }
+}
+
+// Claims `units` of the budget from the choice's charge (frame.triangles) for a raise: whether
+// they fit. A raise charged nothing always fits. A compare and swap, never an add taken back,
+// so no claim is refused for a moment's overshoot of others: the claims are refused, in any
+// order, exactly when the raises together don't fit, and the budget's choice then makes the
+// cut, so the cut never depends on the order the threads ran in.
+fn claim_triangles(units: u32) -> bool {
+    if units == 0u {
+        return true;
+    }
+    let budget = params.budget / UNIT;
+    var current = atomicLoad(&frame.triangles);
+    for (var guard = 0u; guard < 65536u; guard++) {
+        if current > budget || units > budget - current {
+            return false;
+        }
+        let swapped = atomicCompareExchangeWeak(&frame.triangles, current, current + units);
+        if swapped.exchanged {
+            return true;
+        }
+        current = swapped.old_value;
+    }
+    return false;
 }
 
 // Whether node `n` is reached in the end: level 0, or its parent finally refined.
@@ -955,20 +911,6 @@ fn sweep(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
-// After the sweep, where the budget binds (dispatched only then): the charge of the refinements
-// the sweep kept, into frame.charged (threshold put the level-0 tiles' there), so what the
-// sweep took back is spent again by giving back.
-@compute @workgroup_size(64)
-fn recount(@builtin(global_invocation_id) id: vec3<u32>) {
-    let n = id.x;
-    if n >= params.capacity {
-        return;
-    }
-    if (flags_of(n) & W_FINAL) != 0u {
-        atomicAdd(&frame.charged, charge_units(n));
-    }
-}
-
 // Whether every seam of node `n`, at its level, has a tile reached in the end on the other side
 // (or lies off the screen): the sweep's rule, so a tile refined now breaks no seam.
 fn seams_hold(n: u32) -> bool {
@@ -984,23 +926,44 @@ fn seams_hold(n: u32) -> bool {
     return true;
 }
 
-// Giving back first finds which tiles need refining, with how bad an error, held in each node's
-// `rank` (free once close has capped the ranks into `effective`): a tile refined in the end, or
-// one wanting refining that can be, needs it at its capped error; any other, if neither, not at
-// all (-1). need_spread then raises the tiles the neighbour rule needs for those.
-@compute @workgroup_size(64)
-fn need_init(@builtin(global_invocation_id) id: vec3<u32>) {
-    let n = id.x;
-    if n >= params.capacity {
+// The budget's choice (spec, "When it binds"), after the sweep, dispatched only where the budget
+// binds (gate.wgsl's binds): the cut is chosen again from the level-0 tiles, by need, worst first
+// over the whole view, to within a fine bin of the budget.
+//
+// 1. budget_begin: clears its counts and buckets; the charge starts at the level-0 tiles'.
+// 2. need_init: forgets mark's, the relaxation's and the sweep's choice; a tile that wants
+//    refining and could be (closed, complete) needs it at its capped rank, any other not at all.
+// 3. need_spread, NEED_PASSES passes, those after one that raised nothing returning at once:
+//    the tiles the neighbour rule and the tree need for those, at the need of the tile they let
+//    through.
+// 4. need_count and need_threshold, then need_fine_count and need_fine_threshold: the need the
+//    budget takes down to, by bucket then fine bin, each whole.
+// 5. admit, a level at a time, coarse to fine: every tile needing refining at or above that,
+//    reached, its seams holding.
+@compute @workgroup_size(256)
+fn budget_begin(@builtin(local_invocation_index) t: u32) {
+    for (var i = t; i < FINE_BINS; i += 256u) {
+        atomicStore(&frame.fine[i], 0u);
+    }
+    for (var i = t; i < BUCKETS; i += 256u) {
+        atomicStore(&frame.need_histogram[i], 0u);
+    }
+    if t < NEED_PASSES {
+        atomicStore(&frame.spread_changes[t], 0u);
+    }
+    if t != 0u {
         return;
     }
-    let f = flags_of(n);
-    let wants = (f & (W_LIVE | W_WANTS | W_COMPLETE)) == (W_LIVE | W_WANTS | W_COMPLETE);
-    if wants || (f & W_FINAL) != 0u {
-        work[n].rank = work[n].effective;
-    } else {
-        work[n].rank = -1.0;
-    }
+    frame.binds = 1u;
+    // Wanting tiles the cut leaves count as held back by the budget (emit).
+    frame.threshold = BUCKETS;
+    atomicStore(&frame.charged, (atomicLoad(&frame.base) + UNIT - 1u) / UNIT);
+    atomicStore(&frame.admitted, 0u);
+    atomicStore(&frame.held, 0u);
+    atomicStore(&frame.shortfall, 0u);
+    frame.need_bucket = BUCKETS;
+    frame.need_bin = FINE_BINS;
+    frame.slack = 0u;
 }
 
 // How badly node `n` needs refining (its `rank` after need_init), -1 if not at all or absent.
@@ -1011,21 +974,49 @@ fn need_of(n: u32) -> f32 {
     return work[n].rank;
 }
 
-// One pass of spreading the need, as the relaxation raises a tile for an area two levels finer:
-// a complete tile across an edge from a tile of its level that needs refining, whose child along
-// the shared edge does too, needs refining at the lesser of the two (that child's seam holds at
-// its level only if this tile is refined). Each thread writes only its own node and needs only
-// grow, so the passes converge on the same needs in any order.
+// The budget's choice, step 2: per node, mark's, the relaxation's and the sweep's choice
+// forgotten, and its first need, in its `rank` (free once close has capped the ranks into
+// `effective`): its capped rank if it wants refining and could be, else -1.
+@compute @workgroup_size(64)
+fn need_init(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if n >= params.capacity {
+        return;
+    }
+    let f = atomicAnd(&work[n].flags, ~(W_REFINED | W_FINAL | W_SHORT | W_HELD | W_REFUSED));
+    let needed = W_LIVE | W_CLOSED | W_WANTS | W_COMPLETE;
+    work[n].rank = select(-1.0, work[n].effective, (f & needed) == needed);
+}
+
+// The budget's choice, step 3, one pass: a complete tile needs refining at least as badly as
+// any of its children (a child is reached only through it) and as the lesser of a tile of its
+// level across an edge and that tile's child along the shared edge (that child's seam holds at
+// its level only if this tile is refined, as the relaxation raises a tile for an area two levels
+// finer). Each thread writes only its own node and needs only grow, so the passes settle on the
+// same needs in any order; the pass counts what it raised, so the next knows if it settled.
 @compute @workgroup_size(64)
 fn need_spread(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = id.x;
     if n >= params.capacity {
         return;
     }
+    // Settled: the last pass raised nothing (frame.spread_changes, per pass), so this one
+    // wouldn't either.
+    if cursor.index > 0u && atomicLoad(&frame.spread_changes[cursor.index - 1u]) == 0u {
+        return;
+    }
     if (flags_of(n) & (W_LIVE | W_COMPLETE)) != (W_LIVE | W_COMPLETE) {
         return;
     }
-    var need = work[n].rank;
+    let before = work[n].rank;
+    var need = before;
+    var count = 4u;
+    if level_of(tree[n].place) < SPLIT_FROM {
+        count = 1u;
+    }
+    for (var i = 0u; i < count; i++) {
+        need = max(need, need_of(tree[n].children[i]));
+    }
     for (var k = 0u; k < 4u; k++) {
         if ((tree[n].edges >> k) & 1u) == 0u {
             continue;
@@ -1049,77 +1040,150 @@ fn need_spread(@builtin(global_invocation_id) id: vec3<u32>) {
             need = max(need, min(across, max(need_of(a), need_of(b))));
         }
     }
-    work[n].rank = need;
+    if need > before {
+        work[n].rank = need;
+        atomicAdd(&frame.spread_changes[cursor.index], 1u);
+    }
 }
 
-// Whether node `n` is a tile giving back may refine at the level being given back: in the cut
-// after the sweep, complete, needing refining (need_spread), its seams holding. Refining tiles of
-// one level changes neither whether another tile of that level is in the cut nor whether its
-// seams hold (both read the levels above), so the passes of a level agree on it.
-fn back_candidate(n: u32) -> bool {
-    let f = flags_of(n);
-    return (f & (W_LIVE | W_COMPLETE)) == (W_LIVE | W_COMPLETE)
-        && (f & W_FINAL) == 0u
-        && level_of(tree[n].place) == cursor.index
+// Whether node `n` is a refinement the budget's choice can count: live, complete, needing
+// refining, charged something (one charged nothing is admitted whatever its need).
+fn need_candidate(n: u32) -> bool {
+    return (flags_of(n) & (W_LIVE | W_COMPLETE)) == (W_LIVE | W_COMPLETE)
         && work[n].rank >= 0.0
-        && reached_final(n)
-        && seams_hold(n);
+        && charge_units(n) > 0u;
 }
 
-// The bucket giving back ranks node `n` in: how badly it needs refining.
-fn back_bucket(n: u32) -> u32 {
-    return bucket(work[n].rank);
+// Fine bins of a bucket of need: FINE_SUBS slices of its range, each split by level, coarse
+// first, so FINE_BINS = FINE_SUBS × FINE_LEVELS.
+const FINE_SUBS: u32 = 128u;
+// Levels a fine bin is split by: past MAX_LEVEL.
+const FINE_LEVELS: u32 = 16u;
+
+// Node `n`'s fine bin in bucket `b` of its need: higher is worse. A tile's bin is never above
+// its parent's: its need is at most its parent's (need_spread), and where the two are equal they
+// share a slice, and the coarser level ranks ahead; so the bins taken keep the refined set a
+// tree.
+fn fine_bin(n: u32, b: u32) -> u32 {
+    let at = (log2(work[n].rank) + 8.0) * 8.0 - f32(b);
+    let sub = u32(clamp(floor(at * f32(FINE_SUBS)), 0.0, f32(FINE_SUBS - 1u)));
+    let level = min(level_of(tree[n].place), FINE_LEVELS - 1u);
+    return sub * FINE_LEVELS + (FINE_LEVELS - 1u - level);
 }
 
-// Giving back, first pass of a level (coarse to fine, after recount): the charge of
-// the level's candidates, by bucket. What the sweep took back for want of neighbours comes back
-// in the order the budget would have spent it, a level at a time: the coarser tiles first, which
-// lets their finer neighbours' seams hold at the next level.
+// The budget's choice, step 4: the charge of every refinement needed, by bucket of its need.
 @compute @workgroup_size(64)
-fn back_count(@builtin(global_invocation_id) id: vec3<u32>) {
+fn need_count(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = id.x;
     if n >= params.capacity {
         return;
     }
-    if back_candidate(n) {
-        atomicAdd(&frame.level_histogram[back_bucket(n)], charge_units(n));
+    if need_candidate(n) {
+        atomicAdd(&frame.need_histogram[bucket(work[n].rank)], charge_units(n));
     }
 }
 
-// Giving back, second pass of a level: the lowest bucket what the budget has left takes, from
-// the worst down, each whole, so the choice is the same every frame whatever order the threads
-// ran in; then clears the level's buckets for the next level.
+// The budget's choice, step 4: the buckets of need the budget takes whole, worst first, and the
+// one it can't (need_bucket); 0 if it takes every one, BUCKETS if the level-0 tiles leave none.
 @compute @workgroup_size(1)
-fn back_threshold() {
+fn need_threshold() {
     let budget = params.budget / UNIT;
     var total = atomicLoad(&frame.charged);
-    var chosen = BUCKETS;
+    if total > budget {
+        return;
+    }
     for (var i = BUCKETS; i > 0u; i--) {
-        let add = atomicLoad(&frame.level_histogram[i - 1u]);
-        if total > budget || add > budget - total {
+        let add = atomicLoad(&frame.need_histogram[i - 1u]);
+        if add > budget - total {
+            frame.need_bucket = i - 1u;
+            atomicStore(&frame.charged, total);
+            return;
+        }
+        total += add;
+    }
+    // Every bucket fits: every fine bin of the lowest is taken too.
+    frame.need_bucket = 0u;
+    frame.need_bin = 0u;
+    atomicStore(&frame.charged, total);
+}
+
+// The budget's choice, step 4: the charge of the refinements of need_bucket, by fine bin.
+@compute @workgroup_size(64)
+fn need_fine_count(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if n >= params.capacity || frame.need_bin == 0u || frame.need_bucket >= BUCKETS {
+        return;
+    }
+    if need_candidate(n) {
+        let b = bucket(work[n].rank);
+        if b == frame.need_bucket {
+            atomicAdd(&frame.fine[fine_bin(n, b)], charge_units(n));
+        }
+    }
+}
+
+// The budget's choice, step 4: the fine bins of need_bucket the budget takes whole, worst
+// first (need_bin the lowest taken), and the charge of the first it can't (slack): the choice
+// is the same every frame whatever order the threads ran in.
+@compute @workgroup_size(1)
+fn need_fine_threshold() {
+    if frame.need_bin == 0u || frame.need_bucket >= BUCKETS {
+        return;
+    }
+    let budget = params.budget / UNIT;
+    var total = atomicLoad(&frame.charged);
+    var chosen = FINE_BINS;
+    for (var i = FINE_BINS; i > 0u; i--) {
+        let add = atomicLoad(&frame.fine[i - 1u]);
+        if add > budget - total {
+            frame.slack = add;
             break;
         }
         total += add;
         chosen = i - 1u;
     }
-    frame.level_threshold = chosen;
+    frame.need_bin = chosen;
     atomicStore(&frame.charged, total);
-    for (var i = 0u; i < BUCKETS; i++) {
-        atomicStore(&frame.level_histogram[i], 0u);
-    }
 }
 
-// Giving back, third pass of a level: refines in the end the level's candidates in the buckets
-// taken.
+// Whether node `n`, needing refining, is at or above the budget's threshold: a bucket of need
+// above need_bucket, or a fine bin of it at or above need_bin.
+fn above_threshold(n: u32) -> bool {
+    let b = bucket(work[n].rank);
+    if b != frame.need_bucket {
+        return b > frame.need_bucket;
+    }
+    return frame.need_bin == 0u || fine_bin(n, b) >= frame.need_bin;
+}
+
+// The budget's choice, step 5, one level, coarse to fine: a tile of the cut so far needing
+// refining at or above the threshold, or charged nothing, is refined if its seams hold; one
+// whose seams don't is held (counted as the shortfall). The threshold's charge already counts
+// it: admitted or not, the charge stays within the budget.
 @compute @workgroup_size(64)
-fn give_back(@builtin(global_invocation_id) id: vec3<u32>) {
+fn admit(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = id.x;
     if n >= params.capacity {
         return;
     }
-    if back_candidate(n) && back_bucket(n) >= frame.level_threshold {
+    let f = flags_of(n);
+    if (f & (W_LIVE | W_COMPLETE)) != (W_LIVE | W_COMPLETE)
+        || level_of(tree[n].place) != cursor.index
+        || work[n].rank < 0.0
+        || !reached_final(n) {
+        return;
+    }
+    if charge_units(n) > 0u && !above_threshold(n) {
+        atomicOr(&work[n].flags, W_HELD);
+        return;
+    }
+    if seams_hold(n) {
         atomicOr(&work[n].flags, W_REFINED | W_FINAL);
-        atomicAdd(&frame.given_back, 1u);
+        atomicAdd(&frame.admitted, 1u);
+    } else {
+        atomicOr(&work[n].flags, W_SHORT);
+        atomicAdd(&frame.held, 1u);
+        atomicAdd(&frame.shortfall, 1u);
     }
 }
 
@@ -1436,11 +1500,11 @@ fn emit(@builtin(global_invocation_id) id: vec3<u32>) {
         atomicAdd(&frame.over_pixel, 1u);
         if has_children(n) && (f & W_COMPLETE) == 0u {
             atomicAdd(&frame.waiting, 1u);
+        } else if (f & W_SHORT) != 0u {
+            atomicAdd(&frame.held_by_neighbours, 1u);
         } else if (f & (W_HELD | W_REFUSED)) != 0u
             || ((f & W_WANTS) != 0u && bucket(work[n].effective) < frame.threshold) {
             atomicAdd(&frame.budget_limited, 1u);
-        } else if (f & W_SHORT) != 0u {
-            atomicAdd(&frame.held_by_neighbours, 1u);
         }
     }
     let wanted = (f & (W_VISIBLE | W_WANTS)) == (W_VISIBLE | W_WANTS) && (f & W_COMPLETE) == 0u;

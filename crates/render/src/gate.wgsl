@@ -33,16 +33,17 @@ fn gate() {
     args[next + 2u] = 1u;
 }
 
-// The budget's gate (render::lod), after threshold: sets the dispatches of the passes that run
-// only when the budget binds (threshold left a bucket it couldn't take whole, at word PARTIAL of
-// the frame buffer), entry REFILL to every node and entry ONCE to one workgroup, else both to no
-// workgroup at all, so a frame the budget doesn't bind runs none of them.
+// The budget's gate (render::lod), after the relaxation: where the budget binds (word
+// BUDGET_WANTED of the frame buffer: threshold couldn't take every bucket, or the level-0 tiles
+// are over it, or the relaxation couldn't fit a raise), sets entry REFILL, the budget's passes
+// over every node, to every node and entry ONCE, its one-workgroup passes, to one workgroup;
+// else both to no workgroup, so a frame the budget doesn't
+// bind runs none of them on any workgroup, with no readback deciding.
 //
-// Preceded by `const PARTIAL: u32 = ...;`, `const REFILL: u32 = ...;` and `const ONCE: u32 =
-// ...;` from lod.rs too.
+// Preceded by `const BUDGET_WANTED`, `REFILL` and `ONCE` from lod.rs too.
 @compute @workgroup_size(1)
 fn binds() {
-    let binding = frame_words[PARTIAL] < 256u;
+    let binding = frame_words[BUDGET_WANTED] != 0u;
     let every = 3u * REFILL;
     args[every] = select(0u, args[0], binding);
     args[every + 1u] = 1u;
