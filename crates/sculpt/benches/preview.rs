@@ -24,6 +24,9 @@
 //! - [`area_normal_ridge`]: [`Surface::area_normal`] of the ridge's next dab: the per-dab work the
 //!   area normal adds to placement, over the changed tiles' pen-down shapes.
 //! - [`dab_ridge`]: a whole dab as the app makes it, placed, shown and raycast around.
+//! - [`big_dab_ridge`]: a whole dab of a big brush (radius [`BIG_RADIUS`], about 300 tiles), placed
+//!   and applied, on a ridge of its dabs: more changed tiles a dab than the store keeps placement's
+//!   pen-down positions made for.
 
 #![expect(
     clippy::expect_used,
@@ -52,6 +55,13 @@ const RADIUS: f32 = 0.2;
 /// The dabs of the ridge shown before the benches.
 const RIDGE_DABS: u32 = 60;
 
+/// The big brush's radius, on the unit sphere: each dab reaches about 300 tiles, past the tiles
+/// the store keeps pen-down positions made for placement.
+const BIG_RADIUS: f32 = 0.9;
+
+/// The big brush's dabs applied before [`big_dab_ridge`].
+const BIG_DABS: u32 = 8;
+
 /// Rays in [`raycast_ridge`]'s cycle.
 const RAYS: usize = 256;
 
@@ -70,15 +80,29 @@ struct Ridge {
     placed: u32,
     /// The surface normal at the last dab's hit: the side its area normal counts.
     facing: DVec3,
+    /// The dabs' radius.
+    radius: f32,
+    /// The stroke's state, the stroke open.
+    stroke: Stroke,
 }
 
 impl Ridge {
-    /// The project, its index, and [`RIDGE_DABS`] dabs applied in an open stroke.
+    /// The project, its index, and [`RIDGE_DABS`] dabs of [`RADIUS`] applied in an open stroke.
     ///
     /// # Panics
     ///
     /// If the fixed setup is rejected, or the temporary directory can't be made.
     fn new() -> Self {
+        Self::of(RADIUS, RIDGE_DABS)
+    }
+
+    /// The project, its index, and `dabs` dabs of `radius` applied in an open stroke, two at a
+    /// time.
+    ///
+    /// # Panics
+    ///
+    /// As [`Ridge::new`].
+    fn of(radius: f32, dabs: u32) -> Self {
         /// Distinguishes this process's directories.
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -97,6 +121,7 @@ impl Ridge {
             sculpt_octave(&mut project, Level::new(octave).expect("level"));
         }
         let index = SpatialIndex::build(project.store(), level, |_, _| {}).expect("index");
+        let stroke = Stroke::new(project.store());
         let mut ridge = Self {
             project,
             index,
@@ -104,14 +129,30 @@ impl Ridge {
             dir,
             placed: 0,
             facing: DVec3::Z,
+            radius,
+            stroke,
         };
-        let mut stroke = Stroke::new(ridge.project.store());
         ridge.project.begin_stroke().expect("stroke");
-        while ridge.placed < RIDGE_DABS {
+        while ridge.placed < dabs {
             let pair = [ridge.next_dab(), ridge.next_dab()];
-            apply_dabs(ridge.project.store(), &mut ridge.index, &mut stroke, &pair).expect("apply");
+            ridge.apply(&pair);
         }
         ridge
+    }
+
+    /// Applies `dabs` in the ridge's stroke.
+    ///
+    /// # Panics
+    ///
+    /// If applying fails, which would be a bug.
+    fn apply(&mut self, dabs: &[Dab]) {
+        apply_dabs(
+            self.project.store(),
+            &mut self.index,
+            &mut self.stroke,
+            dabs,
+        )
+        .expect("apply");
     }
 
     /// The direction of dab `n` from the sphere's centre: along a great circle, 0.15 radii a dab.
@@ -119,9 +160,9 @@ impl Ridge {
     /// # Panics
     ///
     /// Never: the direction is never zero.
-    fn direction(n: u32) -> Vec3 {
+    fn direction(&self, n: u32) -> Vec3 {
         #[expect(clippy::cast_precision_loss, reason = "a few hundred dabs")]
-        let angle = 0.15 * RADIUS * n as f32;
+        let angle = 0.15 * self.radius * n as f32;
         let (sin, cos) = angle.sin_cos();
         Vec3::new(0.6 * cos, 0.6 * sin, 0.8)
             .normalized()
@@ -136,7 +177,7 @@ impl Ridge {
     /// If the raycast fails or misses the closed surface, or the area normal can't be taken,
     /// which would be a bug.
     fn next_dab(&mut self) -> Dab {
-        let direction = Self::direction(self.placed);
+        let direction = self.direction(self.placed);
         let ray = Ray::new(direction * 3.0, direction * -1.0).expect("ray");
         let ray = stroke::Ray::new(
             DVec3::from_f32(ray.origin()),
@@ -147,7 +188,7 @@ impl Ridge {
         let hit = surface
             .raycast(&ray)
             .expect("the ray meets the closed surface");
-        let sum = surface.area_normal(hit.position, hit.normal, f64::from(RADIUS), 0.0);
+        let sum = surface.area_normal(hit.position, hit.normal, f64::from(self.radius), 0.0);
         surface.finish().expect("the raycast and the area normal");
         let centre = hit.position.to_f32();
         let normal = sum
@@ -158,8 +199,8 @@ impl Ridge {
             position: [centre.x, centre.y, centre.z],
             normal: [normal.x, normal.y, normal.z],
             tangent: [0.0, 0.0, 1.0],
-            radius: RADIUS,
-            strength: 0.1 * RADIUS,
+            radius: self.radius,
+            strength: 0.1 * self.radius,
             hardness: 0.0,
             seq: self.placed,
             ..Dab::default()
@@ -175,8 +216,8 @@ impl Ridge {
     ///
     /// Never: the path moves, and the camera is off the surface.
     fn rays(&self) -> Vec<Ray> {
-        let end = Self::direction(self.placed);
-        let along = (Self::direction(self.placed + 1) - end)
+        let end = self.direction(self.placed);
+        let along = (self.direction(self.placed + 1) - end)
             .normalized()
             .expect("the path moves");
         let side = end.cross(along).normalized().expect("across the path");
@@ -185,7 +226,7 @@ impl Ridge {
             .map(|k| {
                 #[expect(clippy::cast_precision_loss, reason = "a few hundred rays")]
                 let (a, b) = ((k % 16) as f32 / 15.0, (k / 16) as f32 / 15.0 - 0.5);
-                let target = end - along * (RADIUS * a) + side * (2.0 * RADIUS * b);
+                let target = end - along * (self.radius * a) + side * (2.0 * self.radius * b);
                 Ray::new(camera, target - camera).expect("ray")
             })
             .collect()
@@ -384,4 +425,33 @@ fn area_normal_ridge(bencher: divan::Bencher<'_, '_>) {
             surface.finish().expect("the area normal");
             sum
         });
+}
+
+/// A whole dab of a big brush, about 300 tiles, on a ridge of [`BIG_DABS`] of them: placed (a
+/// raycast and its area normal over the stroke's changed tiles) and applied.
+///
+/// # Panics
+///
+/// If placing or applying fails, which would be a bug.
+#[divan::bench(sample_count = 20, sample_size = 1)]
+#[expect(
+    clippy::print_stderr,
+    reason = "a bench reports the footprint it measured beside divan's timings"
+)]
+fn big_dab_ridge(bencher: divan::Bencher<'_, '_>) {
+    let mut ridge = Ridge::of(BIG_RADIUS, BIG_DABS);
+    bencher.bench_local(|| {
+        let dab = ridge.next_dab();
+        ridge.apply(&[dab]);
+    });
+    let tiles = ridge
+        .index
+        .query_sphere(ridge.direction(ridge.placed), BIG_RADIUS)
+        .count();
+    eprintln!(
+        "big_dab_ridge: {tiles} tiles a dab, {} changed, {:.1} MiB of pen-down data",
+        ridge.project.store().pen_down_tiles(),
+        f64::from(u32::try_from(ridge.project.store().pen_down_bytes()).unwrap_or(u32::MAX))
+            / f64::from(1_u32 << 20)
+    );
 }
