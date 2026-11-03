@@ -623,7 +623,7 @@ impl PenFeed for EveryPull {
 }
 
 #[test]
-fn a_moving_strokes_held_jobs_want_no_frame_and_run_once_it_holds_still() {
+fn a_moving_strokes_frames_run_the_jobs_time_boxed_and_want_frames_for_them() {
     use input::Phase;
     let dir = TestDir::new();
     let brush = PenLog {
@@ -639,23 +639,24 @@ fn a_moving_strokes_held_jobs_want_no_frame_and_run_once_it_holds_still() {
     );
     assert!(owner.project().store().has_jobs(), "a rebuild to run");
     owner.pen(pen_sample(Phase::Down, (160.0, 100.0)));
-    frame(&mut owner, Instant::now() + Duration::from_secs(1));
-    assert_eq!(owner.after_hand_off.report.slices, 0, "held by the stroke");
-    let now = Instant::now();
-    let Next::Idle { upkeep } = owner.next(now) else {
-        panic!("no frame for the held jobs while the stroke moves");
-    };
+    let began = Instant::now();
+    frame(&mut owner, began + Duration::from_secs(1));
+    let report = owner.after_hand_off.report;
     assert!(
-        upkeep <= now + STROKE_QUIET,
-        "but the loop wakes as the stroke falls quiet"
+        report.slices > 0,
+        "the refresh runs in a stroke's frame too"
     );
-    // The pen holds still (or its `Up` was lost): the jobs want their frame, and run.
-    std::thread::sleep(STROKE_QUIET + Duration::from_millis(5));
-    assert!(matches!(owner.next(Instant::now()), Next::Frame { .. }));
-    frame(&mut owner, Instant::now() + Duration::from_millis(20));
     assert!(
-        owner.after_hand_off.report.slices > 0,
-        "a still stroke lets the jobs run"
+        owner.after_hand_off.jobs < Duration::from_millis(200),
+        "time-boxed to its share, not the frame's deadline: {:?}",
+        owner.after_hand_off.jobs
+    );
+    assert!(
+        matches!(
+            owner.next(Instant::now()),
+            Next::Frame { .. } | Next::Wait { .. } | Next::Gpu
+        ),
+        "the jobs left want the next frame while the stroke moves"
     );
     owner.close().expect("closed");
 }
@@ -692,7 +693,7 @@ fn the_upkeep_runs_when_due_however_often_a_stroke_waits() {
 }
 
 #[test]
-fn the_jobs_yield_to_a_strokes_sample_and_wait_while_the_stroke_is_open() {
+fn the_jobs_yield_to_a_strokes_sample_and_keep_a_share_while_the_stroke_is_open() {
     use input::Phase;
     let dir = TestDir::new();
     let brush = PenLog {
@@ -733,11 +734,12 @@ fn the_jobs_yield_to_a_strokes_sample_and_wait_while_the_stroke_is_open() {
         matches!(owner.next(Instant::now()), Next::Frame { .. }),
         "and the sample's frame starts at once"
     );
-    // That frame opens the brush's stroke: no jobs at all while it moves.
+    // That frame opens the brush's stroke: the jobs keep a share of it, no more.
     frame(&mut owner, Instant::now() + Duration::from_secs(1));
-    assert_eq!(
-        owner.after_hand_off.report.slices, 0,
-        "none while the stroke moves"
+    assert!(
+        owner.after_hand_off.jobs < Duration::from_millis(200),
+        "time-boxed while the stroke moves: {:?}",
+        owner.after_hand_off.jobs
     );
     owner.pen(pen_sample(Phase::Up, (160.0, 100.0)));
     std::thread::sleep(STROKE_QUIET);

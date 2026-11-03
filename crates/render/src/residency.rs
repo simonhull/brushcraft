@@ -1270,10 +1270,10 @@ impl Residency {
     ///   alone (`e + D + max(D, M)` with `D = 0`, the stand-in module's "The bound");
     /// - a preview's display tiles (a brush's display previews, [`store::DisplayPreview`]) are read
     ///   again as a refresh's are, their data holding every step before the epoch, its bound the
-    ///   brush's against the finest result; with them in the epoch no finest tile under them
-    ///   stands in for its ancestors (they are previewed themselves). While held, a display
-    ///   preview neither stands in nor has its bound raised for the steps landing under it: the
-    ///   brush makes it again as they land ([`TileDetail::held`]);
+    ///   brush's against the finest result; with them in the epoch no finest tile under them stands
+    ///   in for its ancestors (they are previewed themselves). While held, a display preview
+    ///   neither stands in nor has its bound raised for the steps landing under it: the brush makes
+    ///   it again as they land ([`TileDetail::held`]);
     /// - a refresh's display tiles are read again, a stand-in among them replaced;
     /// - a revert's finest tiles moved by an unknown amount: the display tiles above them stop
     ///   standing in and are read again from the store, until a refresh names them.
@@ -1861,6 +1861,11 @@ impl Residency {
     /// from the next staging on.
     pub fn waiting_for_previews(&self) -> impl Iterator<Item = &TileKey> {
         self.waiting_previews.iter()
+    }
+
+    /// The tiles the latest [`Residency::use_frame`] drew.
+    pub fn drawn(&self) -> impl Iterator<Item = &TileKey> {
+        self.drawn.iter()
     }
 
     /// Whether `key` is resident or requested: a tile a brush's preview is made for.

@@ -452,6 +452,17 @@ impl Uploads for GpuResidency {
     fn waiting_for_previews(&self) -> Vec<TileKey> {
         self.residency.waiting_for_previews().copied().collect()
     }
+
+    fn drawn_stale(&self, store: &TileStore) -> Vec<TileKey> {
+        let drawn = self.residency.drawn();
+        let display = drawn.filter(|key| key.channel() == geom::Channel::DISPLAY);
+        display
+            .filter(|key| {
+                store.display_changes(key).is_some() || store.display_preview(key).is_some()
+            })
+            .copied()
+            .collect()
+    }
 }
 
 /// What residency's counts don't say about the work left, for [`pending`].

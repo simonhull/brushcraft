@@ -381,6 +381,8 @@ impl FrameRecord {
             .with("upkeep_ms", owner_ms(owner.upkeep))
             .with("prepare_ms", owner_ms(owner.prepare))
             .with("jobs_ms", owner_ms(owner.jobs))
+            .with("jobs_built", known.then_some(owner.jobs_built))
+            .with("jobs_left", known.then_some(owner.jobs_left))
             .with("acquire_ms", render.map(|r| r.acquire))
             .with("encode_ms", render.map(|r| r.encode))
             .with("present_ms", render.map(|r| r.present))
