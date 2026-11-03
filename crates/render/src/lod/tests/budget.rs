@@ -43,6 +43,7 @@ fn inflate(scene: &mut Scene, mut pick: impl FnMut(&Scene, Place) -> bool) {
                 stored: before.stored,
                 error: before.error * 1000.0,
                 cone: FinestNormalCone::EVERYTHING,
+                held: false,
             },
         );
     }
