@@ -11,7 +11,10 @@
 //! dabs add up over the pen-down surface: a ridge is the sum of its dabs, never a dab weighed on
 //! the ridge its predecessors raised. Before a dab or a run writes, the store keeps the shape of
 //! every tile it reached ([`TileStore::keep_pen_down`]): those it writes, and the few beside them
-//! it reaches without writing, the same on either path.
+//! it reaches without writing, the same on either path. A dab on its own has its workers take the
+//! shapes of the tiles it reaches for the first time as they brush them
+//! ([`TileStore::keep_pen_down_taken`]), and make the pen-down positions of the changed tiles it
+//! brushes that the store hasn't made yet, which the store keeps for the next dabs.
 //!
 //! [`apply_dabs`] runs, in order:
 //!
@@ -144,7 +147,8 @@ use std::time::{Duration, Instant};
 use brush::{Imprint, Smoothstep, draw_imprint, draw_move};
 use geom::{Prediction, TileKey, Vec3};
 use store::{
-    CacheError, Evaluation, IndexError, ParentSlots, PenDownShape, SpatialIndex, TileStore,
+    CacheError, Evaluation, IndexError, MadePenDown, ParentSlots, PenDownMaker, PenDownShape,
+    PenDownTaker, SpatialIndex, TakenShape, TileStore,
 };
 use stroke::Dab;
 use thiserror::Error;
@@ -527,13 +531,14 @@ fn run_dab(
     times: &mut PhaseTimes,
     laps: &mut Laps,
 ) -> Result<(), CacheError> {
-    let found = run_brush(store, query, imprint)?;
+    let mut found = run_brush(store, query, imprint)?;
     frame.reached.extend(&found.reached);
     times.brush += laps.lap();
 
     // Every tile the dab reaches keeps its pen-down shape, as a run's do: each tile holding a
-    // vertex the dab moves is written (the vertex's owner, and the tiles holding its copies).
-    store.keep_pen_down(&found.reached)?;
+    // vertex the dab moves is written (the vertex's owner, and the tiles holding its copies). The
+    // workers that brushed them took the shapes of those the stroke reaches for the first time.
+    store.keep_pen_down_taken(&found.reached, std::mem::take(&mut found.taken))?;
     let edited: Vec<TileKey> = found.edits.iter().map(|tile| tile.key).collect();
     frame.unaccumulated += stroke.begin_dab(store, &edited);
     let states = stroke.states(&edited);
@@ -908,6 +913,9 @@ struct BrushOutput {
     reached: Vec<TileKey>,
     /// Vertices to move, each once.
     vertices: usize,
+    /// The pen-down shapes of the tiles of `reached` the stroke hadn't reached before, taken by
+    /// the workers that brushed them ([`TileStore::keep_pen_down_taken`] keeps them).
+    taken: Vec<TakenShape>,
 }
 
 /// Times the phases of a call, one lap after another.
@@ -936,8 +944,12 @@ impl Laps {
 ///
 /// Each tile the stroke hasn't changed is made current first, in order, as [`TileStore::evaluate`]
 /// makes it (a lookup, as it is pinned); then the tiles are brushed on the store's workers
-/// ([`TileStore::par_map`]), each on its own, a changed tile's positions made there, and gathered
-/// in key order. A tile whose positions aren't cached is brushed on its own afterwards.
+/// ([`TileStore::par_map`]), each on its own, and gathered in key order. A worker brushing a
+/// changed tile whose pen-down positions aren't made yet makes them ([`PenDownMaker`]), and the
+/// store keeps them for the next dabs as the brush's working set
+/// ([`TileStore::keep_brush_pen_down`]); one brushing a tile the stroke hasn't changed that the
+/// dab reaches takes its pen-down shape ([`PenDownTaker`]), kept before the dab writes. A tile
+/// whose positions aren't cached is brushed on its own afterwards.
 ///
 /// # Errors
 ///
@@ -952,14 +964,12 @@ fn run_brush(
             store.evaluate(key)?;
         }
     }
-    // The changed tiles' pen-down positions, made on the workers and kept for the next dabs.
-    store.make_pen_down_many(keys);
     // A tile the store keeps no prediction for, whose parents are current (a tile the stroke
     // enters, or is about to: its box touches the sphere), is predicted on the workers in the
     // same pass as the brushing, a task of its own, and kept: the edit writes each vertex's delta
     // along its frame from the kept predictions ([`TileStore::update_tiles_framed`]), and the
     // frame's evaluation of the tiles after it reuses them.
-    let (brushed, made): (Vec<Option<TileBrush>>, Vec<(TileKey, Prediction)>) = {
+    let (brushed, predicted, made) = {
         let cache = &*store;
         let topology = cache.mesh().topology();
         let predictor = cache.predictor();
@@ -970,35 +980,42 @@ fn run_brush(
             unkept.filter_map(|key| Some(Task::Predict(*key, cache.parent_slots(key)?)));
         let brushing = keys
             .iter()
-            .map(|key| Task::Brush(*key, PenDownTile::of(cache, key)));
+            .map(|key| Task::Brush(*key, BrushSource::of(cache, key)));
         // The predictions first: each is a few brushes' work, so the workers start on them.
         let tasks: Vec<Task<'_>> = predicting.chain(brushing).collect();
         let done = cache.par_map(&tasks, |task| match task {
             Task::Predict(key, parents) => Done::Predicted(*key, predictor.predict(key, parents)),
-            Task::Brush(key, pen_down) => Done::Brushed(
-                pen_down
-                    .positions()
-                    .map(|positions| brush_tile(topology, *key, &positions, imprint)),
-            ),
+            Task::Brush(key, source) => source.brush(topology, *key, imprint),
         });
-        let mut brushed = Vec::with_capacity(keys.len());
-        let mut made = Vec::new();
+        let mut brushed: Vec<(Option<TileBrush>, Option<TakenShape>)> =
+            Vec::with_capacity(keys.len());
+        let mut predicted: Vec<(TileKey, Prediction)> = Vec::new();
+        let mut made: Vec<MadePenDown> = Vec::new();
         for each in done {
             match each {
-                Done::Predicted(key, Some(prediction)) => made.push((key, prediction)),
+                Done::Predicted(key, Some(prediction)) => predicted.push((key, prediction)),
                 Done::Predicted(_, None) => {}
-                Done::Brushed(tile) => brushed.push(tile),
+                Done::Brushed {
+                    tile,
+                    made: one,
+                    taken,
+                } => {
+                    made.extend(one);
+                    brushed.push((tile, taken));
+                }
             }
         }
-        (brushed, made)
+        (brushed, predicted, made)
     };
+    // The changed tiles' pen-down positions made on the workers, kept for the next dabs.
+    store.keep_brush_pen_down(keys, made);
     // A tile the store can't keep it for is predicted again by its evaluation, the same bits.
-    for (key, prediction) in made {
+    for (key, prediction) in predicted {
         store.keep_prediction(key, prediction);
     }
     let mut found = BrushOutput::default();
     let tiles = keys.iter().zip(brushed);
-    for (&key, outcome) in tiles {
+    for (&key, (outcome, taken)) in tiles {
         let tile = match outcome {
             Some(done) => done,
             None => brush_evicted(store, key, imprint)?,
@@ -1007,6 +1024,7 @@ fn run_brush(
             continue;
         }
         found.reached.push(key);
+        found.taken.extend(taken);
         if tile.moved > 0 {
             found.vertices += tile.moved;
             found.edits.push(TileDeltas {
@@ -1023,7 +1041,63 @@ enum Task<'a> {
     /// Predict a tile the store keeps no prediction for, from its parents' slots.
     Predict(TileKey, ParentSlots),
     /// Brush a tile at its pen-down positions.
-    Brush(TileKey, PenDownTile<'a>),
+    Brush(TileKey, BrushSource<'a>),
+}
+
+/// Where a worker of [`run_brush`]'s pass reads a tile's pen-down positions from.
+#[derive(Debug, Clone, Copy)]
+enum BrushSource<'a> {
+    /// A tile the stroke hasn't changed, its positions and corrections cached: its pen-down shape
+    /// is taken there if the dab reaches it.
+    Unchanged(PenDownTaker<'a>),
+    /// A changed tile whose pen-down positions aren't made yet: made there, for the store to keep.
+    Make(PenDownMaker<'a>),
+    /// Any other tile, as [`PenDownTile::of`] gives it.
+    Read(PenDownTile<'a>),
+}
+
+impl<'a> BrushSource<'a> {
+    /// Tile `key`'s source in `store` as it is now.
+    fn of(store: &'a TileStore, key: &TileKey) -> Self {
+        if let Some(taker) = store.pen_down_taker(key) {
+            return Self::Unchanged(taker);
+        }
+        store
+            .pen_down_maker(key)
+            .map_or_else(|| Self::Read(PenDownTile::of(store, key)), Self::Make)
+    }
+
+    /// The draw action for `imprint` over tile `key` (see [`brush_tile`]), with what the worker
+    /// made or took of the tile for the store to keep.
+    fn brush(self, topology: &geom::Topology, key: TileKey, imprint: &Imprint) -> Done {
+        match self {
+            Self::Unchanged(unchanged) => {
+                let tile = brush_tile(topology, key, unchanged.positions(), imprint);
+                let taken = tile.reached.then(|| unchanged.take());
+                Done::Brushed {
+                    tile: Some(tile),
+                    made: None,
+                    taken,
+                }
+            }
+            Self::Make(maker) => {
+                let made = maker.make();
+                let tile = brush_tile(topology, key, made.positions(), imprint);
+                Done::Brushed {
+                    tile: Some(tile),
+                    made: Some(made),
+                    taken: None,
+                }
+            }
+            Self::Read(pen_down) => Done::Brushed {
+                tile: pen_down
+                    .positions()
+                    .map(|positions| brush_tile(topology, key, &positions, imprint)),
+                made: None,
+                taken: None,
+            },
+        }
+    }
 }
 
 /// What a run is given beside the store for the tiles whose predictions it doesn't keep.
@@ -1084,8 +1158,16 @@ impl<'a> PenDownTile<'a> {
 enum Done {
     /// A tile's prediction, if made.
     Predicted(TileKey, Option<Prediction>),
-    /// A tile brushed, if its positions were cached.
-    Brushed(Option<TileBrush>),
+    /// A tile brushed.
+    Brushed {
+        /// What the brush does to it, if its positions were at hand.
+        tile: Option<TileBrush>,
+        /// Its pen-down positions, if the worker made them.
+        made: Option<MadePenDown>,
+        /// Its pen-down shape, if the worker took it: a tile the stroke reaches for the first
+        /// time.
+        taken: Option<TakenShape>,
+    },
 }
 
 /// What the brush does to `key`, a tile the workers couldn't brush.
