@@ -1038,7 +1038,7 @@ fn the_brushs_pixel_size_off_centre_in_a_magnified_view_is_its_images_pixel() {
 }
 
 #[test]
-fn a_pen_resting_down_takes_no_forced_catch_up_and_it_lands_once_lifted() {
+fn a_pen_resting_down_catches_up_a_dab_at_a_time_once_starved_and_lands_all_once_lifted() {
     let dir = TestDir::new();
     let mut owner = owner_of(
         project(&dir),
@@ -1052,14 +1052,20 @@ fn a_pen_resting_down_takes_no_forced_catch_up_and_it_lands_once_lifted() {
     queue(&mut owner, samples);
     run(&mut owner, 1);
     let shown = owner.brush().last().dabs_catching_up;
-    assert!(shown > 0, "nothing fits: every dab shown ahead");
-    // It rests, past the quiet: before, each step then forced a dab; now none while it is down.
-    std::thread::sleep(STROKE_QUIET + Duration::from_millis(10));
-    run(&mut owner, 3);
-    assert_eq!(
-        owner.brush().last().dabs_catching_up,
-        shown,
-        "no dab forced while the pen rests down"
+    assert!(shown > 1, "nothing fits: every dab shown ahead");
+    // It rests past the quiet and the starvation time: the catch-up takes a dab a step, no
+    // more (a long batch waits for the pen to lift).
+    std::thread::sleep(CATCH_UP_STARVED.max(STROKE_QUIET) + Duration::from_millis(10));
+    // What a frame's hand-off catches up shows in the next frame's report.
+    run(&mut owner, 2);
+    let left = owner.brush().last().dabs_catching_up;
+    assert!(
+        left < shown,
+        "a starved catch-up lands a dab while the pen is down"
+    );
+    assert!(
+        left > 0,
+        "a dab at a time, not the whole backlog: {left} of {shown}"
     );
     let mut up = up;
     up.timestamp = Instant::now();

@@ -74,9 +74,11 @@
 //! last sample), the catch-up takes only batches the cost model fits before the pen's next sample
 //! is due (its smoothed interval, less a margin), so it doesn't hold a sample up; while it rests
 //! on the surface, batches of a sample's interval; once the pen lifts, each step takes at least
-//! one dab, in batches of up to [`CATCH_UP_BATCH`]. So a pen frame never waits behind more than
-//! a sample's worth of catch-up (the live session's catch-up p99 of 17 ms in pen frames came from
-//! 12 ms batches run while the pen rested down). Each
+//! one dab, in batches of up to [`CATCH_UP_BATCH`]. A frame's own step takes what fits the slack
+//! its time leaves, if it showed nothing. While the pen is down progress is guaranteed all the
+//! same: a catch-up that has landed nothing for [`CATCH_UP_STARVED`] (a quarter of that past
+//! [`CATCH_UP_BACKLOG`] dabs) takes one dab off a frame's step, whatever it costs; so the backlog
+//! stays bounded, at the price of that one dab's time before a sample. Each
 //! batch that lands makes the previews it moved again over what landed ([`Preview::land`]); once
 //! every dab has landed none is left and the surface is exact, which the record's
 //! `dabs_catching_up` counts down to. The saved result is that of applying the dabs at once, bit
@@ -220,6 +222,14 @@ fn smoothed_interval(interval: Duration, gap: Duration) -> Duration {
 
 /// Tiles the warming evaluates together on the store's workers between checks of its deadline.
 pub(crate) const WARM_BATCH: usize = 16;
+
+/// How long a catch-up may land nothing while the pen is down before it takes a dab all the same
+/// (off a frame's step): about three 60 Hz frames.
+pub(crate) const CATCH_UP_STARVED: Duration = Duration::from_millis(50);
+
+/// How many dabs a catch-up may hold while the pen is down before it takes one all the same four
+/// times as often ([`CATCH_UP_STARVED`] / 4).
+pub(crate) const CATCH_UP_BACKLOG: usize = 96;
 
 /// How many dab spacings ahead of an open stroke's last dab the warming ahead of it looks
 /// ([`Sculpting::warm_ahead`]): as many as a fast stroke places in a frame or two.
@@ -649,6 +659,9 @@ pub(crate) struct Sculpting {
     index_stale: bool,
     /// The warming under a hovering pen.
     warm: Warm,
+    /// When the catch-up last landed a dab (or had none to land): what [`CATCH_UP_STARVED`]
+    /// counts from.
+    landed_at: Instant,
     /// Where the warming ahead of the open stroke last listed its tiles.
     ahead_warmed: Option<geom::Vec3>,
     /// The tiles ahead of the open stroke still to evaluate.
@@ -695,6 +708,7 @@ impl Sculpting {
             deferred: Vec::new(),
             index_stale: false,
             warm: Warm::default(),
+            landed_at: Instant::now(),
             ahead_warmed: None,
             ahead_todo: Vec::new(),
             error: None,
@@ -1157,6 +1171,9 @@ impl Sculpting {
         // it, between frames) showed, then has until the next sample is due.
         let waits = self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0;
         let before_next = self.before_next_sample().filter(|_| !waits);
+        let waited = self.landed_at.elapsed();
+        let behind = waited >= CATCH_UP_STARVED
+            || (self.catching_up() >= CATCH_UP_BACKLOG && waited >= CATCH_UP_STARVED / 4);
         let Some(front) = self.stroke.as_mut() else {
             return;
         };
@@ -1182,29 +1199,35 @@ impl Sculpting {
             (None, _, _) => Duration::MAX,
         };
         let catching_up = front.sources.front().is_some_and(|source| source.shown);
-        if catching_up && self.preview.is_some() && !forced {
-            // A frame's step (or one while the pen draws, with nothing left that fits) waits
-            // on no catch-up: what it shows is already shown.
-            if budget.is_some_and(|budget| !budget.forces_progress()) {
-                return;
-            }
-        }
+        // A frame's own step catches up only with the slack its time leaves, up to the pen's
+        // next sample; what it shows is shown already.
+        let frame_step = budget.is_some_and(|budget| !budget.forces_progress());
+        // While the pen is down, a catch-up that has landed nothing for a while (or holds many
+        // dabs) takes one dab all the same, off a frame's step: the backlog never grows
+        // unbounded, and the tiles it holds are let go.
+        let starved = catching_up && down && !frame_step && behind;
+        let until_sample = before_next.map_or(Duration::ZERO, |by| {
+            by.saturating_duration_since(Instant::now())
+        });
         let room = match (catching_up, batch, forced) {
             (true, true, _) => room.max(CATCH_UP_BATCH),
+            (true, false, false) if frame_step => room.min(until_sample),
             // The pen rests: a sample's interval, less the margin.
             (true, false, false) if resting => interval.saturating_sub(SAMPLE_MARGIN),
             // The pen draws: the catch-up has until its next sample is due.
-            (true, false, false) => before_next.map_or(Duration::ZERO, |by| {
-                by.saturating_duration_since(Instant::now())
-            }),
+            (true, false, false) => until_sample,
             _ => room,
         };
         let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
-        let (count, predicted) = self.cost.take(tiles, room, first && forced);
+        let at_least_one = first && (forced || starved);
+        let (count, predicted) = self.cost.take(tiles, room, at_least_one);
         if count > 0
             && let Some(took) = self.apply_front(scene, report, count)
         {
             self.cost.observe(predicted, took);
+        }
+        if count > 0 || !catching_up {
+            self.landed_at = Instant::now();
         }
         if !self.stroke.as_ref().is_some_and(Pending::done) {
             return;
