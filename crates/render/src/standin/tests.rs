@@ -671,7 +671,7 @@ fn dabs_shown_from_a_distance_stand_in_at_once_and_catch_up_to_the_display_build
             })
             .collect();
         let mut preview = sculpt::Preview::new();
-        preview.show(store, &index, &dabs).expect("shown");
+        preview.show(store, &index, &dabs, &finest_only).expect("shown");
         let previewed = store.drain_stale(&cursor);
         let Drained::Epochs(epochs) = &previewed else {
             panic!("no resync");
@@ -698,7 +698,7 @@ fn dabs_shown_from_a_distance_stand_in_at_once_and_catch_up_to_the_display_build
         for batch in dabs.chunks(3) {
             let landing = project.store();
             sculpt::apply_dabs(landing, &mut index, &mut stroke, batch).expect("applied");
-            preview.land(landing, &index, batch.len()).expect("landed");
+            preview.land(landing, &index, batch.len(), &finest_only).expect("landed");
             let landed = landing.drain_stale(&cursor);
             frame(gpu, &mut residency, landing, landed);
             let now = finest_grids(landing, &mesh);
@@ -737,4 +737,10 @@ fn dabs_shown_from_a_distance_stand_in_at_once_and_catch_up_to_the_display_build
         refreshing.unsubscribe_stale(cursor);
         drop(project.close(false));
     });
+}
+
+/// A renderer drawing only finest tiles, as these tests' stand-ins over previews assume: the
+/// previews are of finest tiles alone, and display tiles above them stand in.
+pub(crate) fn finest_only(key: &TileKey) -> bool {
+    key.channel() != Channel::DISPLAY
 }

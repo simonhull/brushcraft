@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geom::{FaceId, Level, TileKey, Vec3, cube_sphere};
-use sculpt::{Preview, StoreSurface, Stroke, apply_dabs};
+use sculpt::{DrawsAll, Preview, StoreSurface, Stroke, apply_dabs};
 use store::{Evaluation, Project, ProjectConfig, Ray, SpatialIndex, StoreConfig};
 use stroke::{DVec3, Dab, Surface};
 
@@ -359,7 +359,7 @@ fn show_ridge(bencher: divan::Bencher<'_, '_>) {
             let ridge = &mut *ridge.borrow_mut();
             ridge
                 .preview
-                .show(ridge.project.store(), &ridge.index, &[dab])
+                .show(ridge.project.store(), &ridge.index, &[dab], &DrawsAll)
                 .expect("show")
         });
 }
@@ -382,7 +382,7 @@ fn dab_ridge(bencher: divan::Bencher<'_, '_>) {
         let dab = ridge.next_dab();
         ridge
             .preview
-            .show(ridge.project.store(), &ridge.index, &[dab])
+            .show(ridge.project.store(), &ridge.index, &[dab], &DrawsAll)
             .expect("show");
         let rays = ridge.rays();
         let every = rays
@@ -413,7 +413,7 @@ fn area_normal_ridge(bencher: divan::Bencher<'_, '_>) {
             let dab = ridge.next_dab();
             ridge
                 .preview
-                .show(ridge.project.store(), &ridge.index, &[dab])
+                .show(ridge.project.store(), &ridge.index, &[dab], &DrawsAll)
                 .expect("show");
             let [x, y, z] = dab.position;
             (DVec3::from_f32(Vec3::new(x, y, z)), ridge.facing)

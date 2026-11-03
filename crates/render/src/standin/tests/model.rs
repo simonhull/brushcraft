@@ -17,6 +17,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::finest_only;
 use super::*;
 use crate::residency::{Request, Requests, ResidencyError, SizeClass};
 use crate::upload::{TileData, TileDetail, TileSource};
@@ -281,7 +282,7 @@ impl Case {
     fn show(&mut self, places: &[(u8, u8)]) {
         let dabs = self.placed(places);
         self.preview
-            .show(self.project.store(), &self.index, &dabs)
+            .show(self.project.store(), &self.index, &dabs, &finest_only)
             .expect("shown");
         self.shown.extend(dabs);
     }
@@ -313,7 +314,7 @@ impl Case {
             .end_unrecorded_stroke()
             .expect("the stroke ends");
         self.preview
-            .land(self.project.store(), &self.index, count)
+            .land(self.project.store(), &self.index, count, &finest_only)
             .expect("landed");
     }
 

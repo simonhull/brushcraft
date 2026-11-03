@@ -17,13 +17,19 @@ use crate::apply::apply_dabs;
 use crate::state::Stroke;
 use crate::testing::{TestDir, dab, fixed, vertex};
 
+/// A renderer drawing finest tiles alone: the finest previews these tests are about, and no
+/// display preview (the `display` tests have those).
+pub(super) fn finest_only(key: &TileKey) -> bool {
+    key.channel() != geom::Channel::DISPLAY
+}
+
 /// The finest level: 128 quads a face, four tiles of 64.
-fn level() -> Level {
+pub(super) fn level() -> Level {
     Level::new(7).unwrap()
 }
 
 /// The store's configuration: a display layer to the finest level, two workers.
-fn config(dir: &TestDir, name: &str) -> ProjectConfig {
+pub(super) fn config(dir: &TestDir, name: &str) -> ProjectConfig {
     ProjectConfig {
         store: StoreConfig::new(256 << 20, 1)
             .with_display(level())
@@ -33,7 +39,7 @@ fn config(dir: &TestDir, name: &str) -> ProjectConfig {
 }
 
 /// Runs the store's jobs until none is left.
-fn run_jobs(store: &mut TileStore) {
+pub(super) fn run_jobs(store: &mut TileStore) {
     for _ in 0..10_000 {
         store
             .run_jobs(Instant::now() + Duration::from_millis(50))
@@ -47,7 +53,7 @@ fn run_jobs(store: &mut TileStore) {
 
 /// A project over the cube sphere with its display layer built, saved as `base.bcrf` in `dir`
 /// and closed: every test opens copies of it, so their files start the same.
-fn base(dir: &TestDir) -> PathBuf {
+pub(super) fn base(dir: &TestDir) -> PathBuf {
     let mut project = Project::new(cube_sphere(1).unwrap(), config(dir, "base")).unwrap();
     project.store().queue_display_rebuild(level());
     run_jobs(project.store());
@@ -67,7 +73,11 @@ fn shown_positions(store: &TileStore, key: &TileKey) -> Vec<Vec3> {
 }
 
 /// A copy of `base` named `name`, opened, with its spatial index at the finest level.
-fn open_copy(dir: &TestDir, base: &Path, name: &str) -> (Project, SpatialIndex, PathBuf) {
+pub(super) fn open_copy(
+    dir: &TestDir,
+    base: &Path,
+    name: &str,
+) -> (Project, SpatialIndex, PathBuf) {
     let path = dir.path().join(format!("{name}.bcrf"));
     std::fs::copy(base, &path).unwrap();
     let mut project = Project::open(&path, config(dir, name)).unwrap();
@@ -80,7 +90,7 @@ fn open_copy(dir: &TestDir, base: &Path, name: &str) -> (Project, SpatialIndex, 
 ///
 /// Radius 0.15 (about 16 quads), strengths of both signs, every fifth forty times stronger
 /// (tiles' scales grow), varied hardness, each dab's normal the sphere's outward one.
-fn path(store: &mut TileStore, count: u32) -> Vec<Dab> {
+pub(super) fn path(store: &mut TileStore, count: u32) -> Vec<Dab> {
     (0..count)
         .map(|n| {
             let (tx, ty) = (u16::from(n % 2 == 1), u16::from(n % 4 >= 2));
@@ -100,12 +110,12 @@ fn path(store: &mut TileStore, count: u32) -> Vec<Dab> {
 }
 
 /// The finest level's tiles of every face.
-fn finest_tiles(store: &TileStore) -> Vec<TileKey> {
+pub(super) fn finest_tiles(store: &TileStore) -> Vec<TileKey> {
     crate::testing::tiles(store.mesh(), level())
 }
 
 /// Applies `dabs` at once, as finest work.
-fn at_once(project: &mut Project, index: &mut SpatialIndex, dabs: &[Dab]) {
+pub(super) fn at_once(project: &mut Project, index: &mut SpatialIndex, dabs: &[Dab]) {
     let mut stroke = Stroke::new(project.store());
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), index, &mut stroke, dabs).unwrap();
@@ -114,24 +124,40 @@ fn at_once(project: &mut Project, index: &mut SpatialIndex, dabs: &[Dab]) {
 
 /// Shows every one of `dabs`, then applies them `run` at a time, landing each run: what a brush
 /// whose frames fit none of its finest work does. Returns what each landing did.
-fn previewed(
+pub(super) fn previewed(
     project: &mut Project,
     index: &mut SpatialIndex,
     dabs: &[Dab],
     run: usize,
 ) -> Vec<PreviewStats> {
+    previewed_drawing(project, index, dabs, run, &finest_only)
+}
+
+/// [`previewed`] for a renderer drawing what `drawn` says.
+pub(super) fn previewed_drawing(
+    project: &mut Project,
+    index: &mut SpatialIndex,
+    dabs: &[Dab],
+    run: usize,
+    drawn: &impl super::Drawn,
+) -> Vec<PreviewStats> {
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
     project.begin_stroke().unwrap();
-    let shown = preview.show(project.store(), index, dabs).unwrap();
+    let shown = preview.show(project.store(), index, dabs, drawn).unwrap();
     assert_eq!(shown.dabs, dabs.len());
     assert!(shown.tiles_set > 0, "the dabs moved previews");
     let mut landings = Vec::new();
     for chunk in dabs.chunks(run) {
         apply_dabs(project.store(), index, &mut stroke, chunk).unwrap();
-        landings.push(preview.land(project.store(), index, chunk.len()).unwrap());
+        landings.push(
+            preview
+                .land(project.store(), index, chunk.len(), drawn)
+                .unwrap(),
+        );
     }
     assert_eq!(preview.shown(), 0, "every dab landed");
+    preview.end_stroke(project.store()).unwrap();
     project.end_unrecorded_stroke().unwrap();
     landings
 }
@@ -190,11 +216,11 @@ fn a_save_while_dabs_are_shown_holds_what_landed_and_nothing_of_the_previews() {
     let mut preview = Preview::new();
     shown.begin_stroke().unwrap();
     preview
-        .show(shown.store(), &shown_index, &dabs)
+        .show(shown.store(), &shown_index, &dabs, &finest_only)
         .expect("shown");
     apply_dabs(shown.store(), &mut shown_index, &mut stroke, first).unwrap();
     preview
-        .land(shown.store(), &shown_index, first.len())
+        .land(shown.store(), &shown_index, first.len(), &finest_only)
         .expect("landed");
     assert_eq!(preview.shown(), 7, "seven dabs still shown");
     assert!(shown.store().has_previews(), "previews pending");
@@ -228,7 +254,7 @@ fn previews_meet_at_their_seams_and_move_points_by_the_draw_action_along_the_dab
     // by the draw action's amount along the dab's normal, one direction for every vertex, as the
     // finest work moves it, and not along the vertex's own frame normal.
     let first = dabs[0];
-    preview.show(store, &index, &[first]).unwrap();
+    preview.show(store, &index, &[first], &finest_only).unwrap();
     let corner = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
     let frames = store.frames_many(&[corner]).unwrap().remove(0);
     let imprint = crate::apply::imprint_of(&first).unwrap();
@@ -260,10 +286,10 @@ fn previews_meet_at_their_seams_and_move_points_by_the_draw_action_along_the_dab
         }
     }
     assert!(off_the_dab > 0, "frame normals that aren't the dab's");
-    let gone = preview.land(store, &index, 1).unwrap();
+    let gone = preview.land(store, &index, 1, &finest_only).unwrap();
     assert!(gone.tiles_cleared > 0, "dropped unapplied: its previews go");
     assert!(!store.has_previews());
-    preview.show(store, &index, &dabs).unwrap();
+    preview.show(store, &index, &dabs, &finest_only).unwrap();
     let previewed: Vec<TileKey> = store.previewed().copied().collect();
     assert!(previewed.len() > 1, "{previewed:?}");
     // Every copy of a vertex, from every previewed tile and face, holds the same bits; and a
@@ -314,9 +340,13 @@ fn the_refresh_waits_for_previews_and_runs_once_every_dab_has_landed() {
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
     project.begin_stroke().unwrap();
-    preview.show(project.store(), &index, &dabs).unwrap();
+    preview
+        .show(project.store(), &index, &dabs, &finest_only)
+        .unwrap();
     apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
-    preview.land(project.store(), &index, first.len()).unwrap();
+    preview
+        .land(project.store(), &index, first.len(), &finest_only)
+        .unwrap();
     let store = project.store();
     let held: Vec<TileKey> = store.previewed().copied().collect();
     assert!(!held.is_empty(), "previews left");
@@ -331,7 +361,9 @@ fn the_refresh_waits_for_previews_and_runs_once_every_dab_has_landed() {
         "a display tile over a preview waits for the dabs to land"
     );
     apply_dabs(store, &mut index, &mut stroke, rest).unwrap();
-    preview.land(store, &index, rest.len()).unwrap();
+    preview
+        .land(store, &index, rest.len(), &finest_only)
+        .unwrap();
     assert!(!store.has_previews());
     run_jobs(store);
     assert!(
@@ -370,7 +402,7 @@ fn a_preview_differs_from_what_lands_only_by_the_stored_encoding() {
         .map(|key| (key, store.evaluate(key).unwrap().to_vec()))
         .collect();
     let mut preview = Preview::new();
-    preview.show(store, &index, &dabs).unwrap();
+    preview.show(store, &index, &dabs, &finest_only).unwrap();
     let shown_now: BTreeMap<TileKey, Vec<Vec3>> = store
         .previewed()
         .copied()
@@ -381,7 +413,9 @@ fn a_preview_differs_from_what_lands_only_by_the_stored_encoding() {
     let mut stroke = Stroke::new(store);
     project.begin_stroke().unwrap();
     apply_dabs(project.store(), &mut index, &mut stroke, &dabs).unwrap();
-    preview.land(project.store(), &index, dabs.len()).unwrap();
+    preview
+        .land(project.store(), &index, dabs.len(), &finest_only)
+        .unwrap();
     project.end_unrecorded_stroke().unwrap();
     let landed_store = project.store();
     let (mut moved, mut off) = (0.0_f32, 0.0_f32);
@@ -434,10 +468,14 @@ fn the_pen_down_surface_is_hit_where_it_was_whatever_is_shown_or_landed() {
     let mut stroke = Stroke::new(project.store());
     project.begin_stroke().unwrap();
     let mut preview = Preview::new();
-    preview.show(project.store(), &index, &dabs).unwrap();
+    preview
+        .show(project.store(), &index, &dabs, &finest_only)
+        .unwrap();
     let (first, _) = dabs.split_at(4);
     apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
-    preview.land(project.store(), &index, first.len()).unwrap();
+    preview
+        .land(project.store(), &index, first.len(), &finest_only)
+        .unwrap();
     let store = project.store();
     assert!(store.has_previews() && store.pen_down_tiles() > 0);
     let (mut hits, mut raised) = (0, 0);
@@ -495,7 +533,7 @@ fn a_preview_no_new_dab_moves_goes_back_as_it_was_and_is_not_sent_again() {
     let store = project.store();
     let cursor = store.subscribe_stale();
     let mut preview = Preview::new();
-    preview.show(store, &index, &dabs).unwrap();
+    preview.show(store, &index, &dabs, &finest_only).unwrap();
     let before: BTreeMap<TileKey, Vec<Vec3>> = store
         .previewed()
         .copied()
@@ -511,7 +549,7 @@ fn a_preview_no_new_dab_moves_goes_back_as_it_was_and_is_not_sent_again() {
         seq: 8,
         ..dabs[0]
     };
-    let stats = preview.show(store, &index, &[again]).unwrap();
+    let stats = preview.show(store, &index, &[again], &finest_only).unwrap();
     let Drained::Epochs(epochs) = store.drain_stale(&cursor) else {
         panic!("no resync");
     };
@@ -563,7 +601,9 @@ fn a_preview_over_dabs_its_stroke_landed_differs_from_what_lands_only_by_the_enc
         "the stroke changed tiles"
     );
     let mut preview = Preview::new();
-    preview.show(project.store(), &index, rest).unwrap();
+    preview
+        .show(project.store(), &index, rest, &finest_only)
+        .unwrap();
     let store = project.store();
     let shown_now: BTreeMap<TileKey, Vec<Vec3>> = store
         .previewed()
@@ -578,7 +618,9 @@ fn a_preview_over_dabs_its_stroke_landed_differs_from_what_lands_only_by_the_enc
         .count();
     assert!(changed_shown > 0, "previews over tiles the stroke changed");
     apply_dabs(project.store(), &mut index, &mut stroke, rest).unwrap();
-    preview.land(project.store(), &index, rest.len()).unwrap();
+    preview
+        .land(project.store(), &index, rest.len(), &finest_only)
+        .unwrap();
     project.end_unrecorded_stroke().unwrap();
     let after = project.store();
     let (mut moved, mut off) = (0.0_f32, 0.0_f32);

@@ -47,6 +47,6 @@ mod testing;
 pub use apply::{ApplyStats, PhaseTimes, SculptError, apply_dabs};
 pub use draw::{DrawParams, DrawParamsError, StepStats, draw_step};
 pub use footprint::radius_covering;
-pub use preview::{Preview, PreviewStats};
+pub use preview::{Drawn, DrawsAll, Preview, PreviewStats};
 pub use state::Stroke;
 pub use surface::StoreSurface;

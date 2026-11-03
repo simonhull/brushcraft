@@ -1,5 +1,5 @@
-//! Previews: a brush's dabs shown at once on the finest tiles they reach, ahead of the finest
-//! work that makes them exact ([`Preview`]).
+//! Previews: a brush's dabs shown at once on the tiles a renderer draws, ahead of the finest work
+//! that makes them exact ([`Preview`]).
 //!
 //! # What a preview is
 //!
@@ -34,10 +34,28 @@
 //! store beside it ([`TileStore::keep_preview_pen_down`]), counted with the stroke's pen-down
 //! data, until no dab shown moves it.
 //!
+//! # Display tiles
+//!
+//! Most of what a big brush reaches is drawn at display levels, far coarser than the finest:
+//! moving the finest tiles there costs as much as the finest work itself. So a dab shown also
+//! moves the **display tiles** a renderer draws above the finest tiles it reaches
+//! ([`Drawn`]; every level for [`DrawsAll`]), each a display preview of its own (the `display`
+//! module: its pen-down tile, moves, normals of the moved surface, and a bound against the finest
+//! result), handed to the store ([`TileStore::set_display_preview`]). The finest previews are made
+//! only of the finest tiles a renderer draws, which a big brush seen at its size has few of.
+//!
+//! Every finest tile a dab shown reaches by the index is **held** in the store until the dab
+//! lands ([`TileStore::hold_preview`]): a renderer draws a held tile only from a preview, and
+//! asks for those it wants that have none ([`Preview::make_waiting`]); the refresh leaves the
+//! display tiles above alone. A display preview's tile released, its vertices are the store's
+//! surface; it is drawn until the refresh replaces it. The stroke's dabs are kept, applied at once
+//! ([`Preview::note_applied`]) or shown, for the display previews' normals and bounds, until the
+//! stroke ends ([`Preview::end_stroke`]).
+//!
 //! # Which tiles
 //!
-//! A dab moves the points within its radius at pen-down. A tile holds such a point only if the
-//! box of its pen-down block (of every point of the block, ring included) touches the dab's
+//! A dab moves the points within its radius at pen-down. A finest tile holds such a point only if
+//! the box of its pen-down block (of every point of the block, ring included) touches the dab's
 //! sphere; a tile not reached yet is found by its box in the spatial index, which holds its
 //! pen-down positions (see [`SpatialIndex::refit`]). So a dab shown moves the reached tiles whose
 //! pen-down box touches it, and gathers those of the index's query it reaches that aren't reached
@@ -65,11 +83,15 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use brush::{Imprint, Smoothstep, draw_imprint_vertex, draw_move};
-use geom::{GatheredBlock, TileKey, Vec3};
+use geom::{GatheredBlock, Level, TileKey, Vec3};
 use store::{Aabb, CacheError, Evaluation, SpatialIndex, TileStore};
 use stroke::Dab;
 
 use crate::apply::{SculptError, imprint_of};
+
+mod display;
+
+use display::DisplayState;
 
 /// What a [`Preview::show`] or [`Preview::land`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -181,8 +203,45 @@ struct Reached {
 pub struct Preview {
     /// The dabs shown and not landed, oldest first.
     shown: VecDeque<Imprint>,
-    /// The tiles they reach, previewed or untouched.
+    /// The finest tiles each dab shown reaches by the spatial index (its pen-down boxes), in
+    /// the order of `shown`: what it holds in the store.
+    reach: VecDeque<Vec<TileKey>>,
+    /// The finest tiles reached, previewed or untouched.
     reached: BTreeMap<TileKey, Reached>,
+    /// Every dab of the stroke, applied at once or shown, in order: what a display preview's
+    /// normals and bound take.
+    stroke: Vec<Imprint>,
+    /// Per finest tile held, how many dabs shown reach it.
+    held: BTreeMap<TileKey, usize>,
+    /// The display tiles previewed in this stroke.
+    displays: BTreeMap<TileKey, DisplayState>,
+}
+
+/// Which tiles a renderer holds or wants: those a [`Preview`] makes previews of.
+///
+/// A tile it doesn't draw needs no preview: if a renderer wants one later while dabs still to
+/// land reach it, it asks for it ([`Preview::make_waiting`]); the store says which those are
+/// ([`TileStore::preview_wanted`]).
+pub trait Drawn {
+    /// Whether a renderer holds or wants tile `key`.
+    fn draws(&self, key: &TileKey) -> bool;
+}
+
+/// Every tile is drawn: previews of every finest and display tile the dabs reach, at every
+/// level (headless use, and the tests).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrawsAll;
+
+impl Drawn for DrawsAll {
+    fn draws(&self, _key: &TileKey) -> bool {
+        true
+    }
+}
+
+impl<F: Fn(&TileKey) -> bool> Drawn for F {
+    fn draws(&self, key: &TileKey) -> bool {
+        self(key)
+    }
 }
 
 impl Preview {
@@ -218,6 +277,7 @@ impl Preview {
         store: &mut TileStore,
         index: &SpatialIndex,
         dabs: &[Dab],
+        drawn: &impl Drawn,
     ) -> Result<PreviewStats, SculptError> {
         let imprints: Result<Vec<Imprint>, SculptError> = dabs
             .iter()
@@ -226,11 +286,260 @@ impl Preview {
             .collect();
         let imprints = imprints?;
         let mut stats = PreviewStats::default();
-        let shown = self.show_all(store, index, &imprints, &mut stats);
+        let before = self.shown.len();
+        let mut shown = self.show_all(store, index, &imprints, drawn, &mut stats);
+        if self.shown.len() > before {
+            self.note_shown(store, index, &imprints);
+            let displays = self.show_displays(store, &imprints, drawn, &mut stats);
+            shown = shown.and(displays);
+        }
         let closed = store.close_preview_epoch();
         shown?;
         closed?;
         Ok(stats)
+    }
+
+    /// Notes `dabs`, just shown: they join the stroke's dabs, and the finest tiles each reaches
+    /// by the index are held in the store.
+    fn note_shown(&mut self, store: &mut TileStore, index: &SpatialIndex, dabs: &[Imprint]) {
+        for dab in dabs {
+            self.stroke.push(*dab);
+            let reached: Vec<TileKey> = index.query_sphere(centre(dab), reach(dab)).collect();
+            for key in &reached {
+                let count = self.held.entry(*key).or_insert(0);
+                if *count == 0 {
+                    store.hold_preview(*key);
+                }
+                *count += 1;
+            }
+            self.reach.push_back(reached);
+        }
+    }
+
+    /// Notes `dabs`, applied at once by [`apply_dabs`](crate::apply_dabs) with nothing shown:
+    /// they join the stroke's dabs, which every display preview made later takes for its normals
+    /// and bound. The display previews of the stroke so far are let go (none is held, nothing
+    /// being shown): one made again reads the store as the dabs left it.
+    pub fn note_applied(&mut self, dabs: &[Dab]) {
+        let imprints = dabs.iter().filter_map(|dab| imprint_of(dab).ok());
+        self.stroke.extend(imprints);
+        self.displays.clear();
+    }
+
+    /// Ends the stroke: every dab of it has landed (or was dropped). The display previews are
+    /// handed to the store released, to be drawn until the refresh replaces them; every hold is
+    /// released; the stroke's dabs are forgotten. Closes the call's preview epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if the store refuses a preview (never, for tiles it made) or the
+    /// epoch can't close.
+    pub fn end_stroke(&mut self, store: &mut TileStore) -> Result<(), SculptError> {
+        let mut stats = PreviewStats::default();
+        let landed = self.shown.len();
+        if landed > 0 {
+            // Dropped dabs: nothing moves under the previews any more.
+            self.shown.clear();
+            self.clear(store, &mut stats);
+        }
+        for (key, _) in std::mem::take(&mut self.held) {
+            store.release_preview(&key);
+        }
+        self.reach.clear();
+        let mut published = Ok(());
+        for state in std::mem::take(&mut self.displays).into_values() {
+            if state.published_held == Some(true) {
+                let set = store.set_display_preview(*state.key(), state.publish(false));
+                published = published.and(set);
+            }
+        }
+        self.stroke.clear();
+        let closed = store.close_preview_epoch();
+        published?;
+        closed?;
+        Ok(())
+    }
+
+    /// Makes the previews of `keys`, tiles a renderer waits for: held with no preview made
+    /// ([`TileStore::preview_wanted`]); the others are left alone. Closes the call's preview
+    /// epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a tile can't be read or gathered.
+    pub fn make_waiting(
+        &mut self,
+        store: &mut TileStore,
+        keys: &[TileKey],
+    ) -> Result<PreviewStats, SculptError> {
+        let mut stats = PreviewStats::default();
+        let waiting: Vec<TileKey> = keys
+            .iter()
+            .filter(|key| store.preview_wanted(key))
+            .copied()
+            .collect();
+        let (display, finest): (Vec<TileKey>, Vec<TileKey>) = waiting
+            .into_iter()
+            .partition(|key| key.channel() == geom::Channel::DISPLAY);
+        let mut made = self.make_displays(store, &display, &mut stats);
+        if !finest.is_empty() {
+            let again: BTreeSet<TileKey> = finest.into_iter().collect();
+            let remade = self.remake(store, &again, &mut stats);
+            made = made.and(remade);
+        }
+        let closed = store.close_preview_epoch();
+        made?;
+        closed?;
+        Ok(stats)
+    }
+
+    /// The display tiles above the finest tiles `dabs` reach that `drawn` draws: those a
+    /// display preview moves for them.
+    fn display_tiles(&self, dabs: usize, drawn: &impl Drawn) -> BTreeSet<TileKey> {
+        let first = self.reach.len().saturating_sub(dabs);
+        let reached = self.reach.iter().skip(first).flatten();
+        let mut tiles = BTreeSet::new();
+        for key in reached {
+            tiles.extend(display_ancestors(key).filter(|above| drawn.draws(above)));
+        }
+        tiles
+    }
+
+    /// Moves the display previews by `new`, just shown and noted: those the stroke has take
+    /// them, those `drawn` draws that it hasn't are made. Hands every one that changed to the
+    /// store.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a tile can't be read or gathered.
+    fn show_displays(
+        &mut self,
+        store: &mut TileStore,
+        new: &[Imprint],
+        drawn: &impl Drawn,
+        stats: &mut PreviewStats,
+    ) -> Result<(), SculptError> {
+        let tiles = self.display_tiles(new.len(), drawn);
+        let (known, fresh): (Vec<TileKey>, Vec<TileKey>) = tiles
+            .into_iter()
+            .partition(|key| self.displays.contains_key(key));
+        let mut moving: Vec<&mut DisplayState> = self
+            .displays
+            .iter_mut()
+            .filter(|(key, _)| known.contains(key))
+            .map(|(_, state)| state)
+            .collect();
+        let moved: Vec<bool> = store.par_map_mut(&mut moving, |state| {
+            new.iter()
+                .fold(false, |any, dab| state.take(dab, true) | any)
+        });
+        let changed: Vec<TileKey> = known
+            .iter()
+            .zip(moved)
+            .filter(|&(_, moved)| moved)
+            .map(|(key, _)| *key)
+            .collect();
+        self.publish(store, &changed, stats)?;
+        self.make_displays(store, &fresh, stats)
+    }
+
+    /// Makes display previews of `keys` that the stroke has none of, over the store as it is,
+    /// and hands them to the store.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a tile can't be read or gathered.
+    fn make_displays(
+        &mut self,
+        store: &mut TileStore,
+        keys: &[TileKey],
+        stats: &mut PreviewStats,
+    ) -> Result<(), SculptError> {
+        let pending: Vec<Imprint> = self.shown.iter().copied().collect();
+        let mut made = Vec::new();
+        for key in keys {
+            if self.displays.contains_key(key) {
+                continue;
+            }
+            if let Some(state) = DisplayState::make(store, *key, &self.stroke, &pending)? {
+                self.displays.insert(*key, state);
+                made.push(*key);
+                stats.gathered += 1;
+            }
+        }
+        self.publish(store, &made, stats)
+    }
+
+    /// Hands the display previews of `keys` to the store, each held as the store says now.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if the store refuses one (never, for tiles it made).
+    fn publish(
+        &mut self,
+        store: &mut TileStore,
+        keys: &[TileKey],
+        stats: &mut PreviewStats,
+    ) -> Result<(), SculptError> {
+        for key in keys {
+            let held = store.preview_held(key);
+            if let Some(state) = self.displays.get_mut(key) {
+                store.set_display_preview(*key, state.publish(held))?;
+                state.published_held = Some(held);
+                stats.tiles_set += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// After a landing of the dabs whose reach was `landed`: releases the finest tiles no dab
+    /// shown reaches any more, rebases the display previews over the finest tiles `changed` (the
+    /// store moved them), and hands the store those that changed or were released.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a finest tile can't be gathered.
+    fn land_displays(
+        &mut self,
+        store: &mut TileStore,
+        landed: Vec<Vec<TileKey>>,
+        changed: &BTreeSet<TileKey>,
+        stats: &mut PreviewStats,
+    ) -> Result<(), SculptError> {
+        for key in landed.into_iter().flatten() {
+            if let Some(count) = self.held.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.held.remove(&key);
+                    store.release_preview(&key);
+                }
+            }
+        }
+        let Some(finest) = store.display_finest() else {
+            return Ok(());
+        };
+        let under: BTreeSet<TileKey> = changed
+            .iter()
+            .filter(|key| display_ancestors(key).any(|above| self.displays.contains_key(&above)))
+            .copied()
+            .collect();
+        let mut blocks = display::Blocks::default();
+        blocks.add_now(store, &under)?;
+        let pending: Vec<Imprint> = self.shown.iter().copied().collect();
+        let mut every: Vec<&mut DisplayState> = self.displays.values_mut().collect();
+        let rebased: Vec<bool> = store.par_map_mut(&mut every, |state| {
+            state.rebase(finest, &blocks, &under, &pending)
+        });
+        let again: Vec<TileKey> = self
+            .displays
+            .iter()
+            .zip(rebased)
+            .filter(|((key, state), rebased)| {
+                *rebased || state.published_held != Some(store.preview_held(key))
+            })
+            .map(|((key, _), _)| *key)
+            .collect();
+        self.publish(store, &again, stats)
     }
 
     /// Shows `new` (see [`Preview::show`]).
@@ -243,6 +552,7 @@ impl Preview {
         store: &mut TileStore,
         index: &SpatialIndex,
         new: &[Imprint],
+        drawn: &impl Drawn,
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
         if new.is_empty() {
@@ -257,7 +567,7 @@ impl Preview {
         let queried: BTreeSet<TileKey> = new
             .iter()
             .flat_map(|dab| index.query_sphere(centre(dab), reach(dab)))
-            .filter(|key| !self.reached.contains_key(key))
+            .filter(|key| !self.reached.contains_key(key) && drawn.draws(key))
             .collect();
         // Previewed tiles take the new dabs alone; the others, the store's tile moved by every
         // dab shown (for an untouched one, the dabs before moved nothing there). A previewed tile
@@ -311,9 +621,11 @@ impl Preview {
         store: &mut TileStore,
         index: &SpatialIndex,
         count: usize,
+        drawn: &impl Drawn,
     ) -> Result<PreviewStats, SculptError> {
         let count = count.min(self.shown.len());
         let landed: Vec<Imprint> = self.shown.drain(..count).collect();
+        let reach: Vec<Vec<TileKey>> = self.reach.drain(..count.min(self.reach.len())).collect();
         let mut stats = PreviewStats {
             dabs: landed.len(),
             ..PreviewStats::default()
@@ -321,7 +633,23 @@ impl Preview {
         if landed.is_empty() {
             return Ok(stats);
         }
-        let made = self.land_tiles(store, index, &landed, &mut stats);
+        // The landing changed the positions, or rings, of the tiles the dabs reach in the index
+        // (their pen-down boxes, which the landing didn't move) and of their neighbours.
+        let queried: BTreeSet<TileKey> = reach.iter().flatten().copied().collect();
+        let queried: Vec<TileKey> = queried.into_iter().collect();
+        let made = match store.stale_after(&queried) {
+            Ok(changed) => {
+                let set: BTreeSet<TileKey> = changed.iter().copied().collect();
+                let finest = self.land_tiles(store, index, changed, drawn, &mut stats);
+                let displays = self.land_displays(store, reach, &set, &mut stats);
+                finest.and(displays)
+            }
+            Err(error) => {
+                self.clear(store, &mut stats);
+                let _released = self.land_displays(store, reach, &BTreeSet::new(), &mut stats);
+                Err(error.into())
+            }
+        };
         let closed = store.close_preview_epoch();
         made?;
         closed?;
@@ -337,7 +665,8 @@ impl Preview {
         &mut self,
         store: &mut TileStore,
         index: &SpatialIndex,
-        landed: &[Imprint],
+        changed: Vec<TileKey>,
+        drawn: &impl Drawn,
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
         if self.shown.is_empty() {
@@ -345,18 +674,6 @@ impl Preview {
             self.clear(store, stats);
             return Ok(());
         }
-        let queried: BTreeSet<TileKey> = landed
-            .iter()
-            .flat_map(|dab| index.query_sphere(centre(dab), reach(dab)))
-            .collect();
-        let queried: Vec<TileKey> = queried.into_iter().collect();
-        let changed = match store.stale_after(&queried) {
-            Ok(changed) => changed,
-            Err(error) => {
-                self.clear(store, stats);
-                return Err(error.into());
-            }
-        };
         let mut again: BTreeSet<TileKey> = BTreeSet::new();
         let mut unpreviewed: Vec<TileKey> = Vec::new();
         for key in changed {
@@ -373,11 +690,14 @@ impl Preview {
             }
         }
         // The store moved these: within a dab still shown, by their boxes in the index?
-        let within = unpreviewed.into_iter().filter(|key| {
-            let bounds = index.bvh().bounds(key).map(|bounds| bounds.aabb);
-            // A tile without bounds is looked at whole: gathered, and kept only if moved.
-            bounds.is_none() || self.shown.iter().any(|dab| touches(bounds.as_ref(), dab))
-        });
+        let within = unpreviewed
+            .into_iter()
+            .filter(|key| drawn.draws(key))
+            .filter(|key| {
+                let bounds = index.bvh().bounds(key).map(|bounds| bounds.aabb);
+                // A tile without bounds is looked at whole: gathered, and kept only if moved.
+                bounds.is_none() || self.shown.iter().any(|dab| touches(bounds.as_ref(), dab))
+            });
         again.extend(within);
         self.remake(store, &again, stats)
     }
@@ -402,7 +722,11 @@ impl Preview {
         for dab in &self.shown {
             again.extend(index.query_sphere(centre(dab), reach(dab)));
         }
-        let made = self.remake(store, &again, &mut stats);
+        let mut made = self.remake(store, &again, &mut stats);
+        // The display previews, made again over the store as the failure left it.
+        let displays: Vec<TileKey> = std::mem::take(&mut self.displays).into_keys().collect();
+        let displays_made = self.make_displays(store, &displays, &mut stats);
+        made = made.and(displays_made);
         let closed = store.close_preview_epoch();
         made?;
         closed?;
@@ -600,6 +924,28 @@ fn bounds_of(block: &GatheredBlock) -> Option<Aabb> {
     let points = block.padded().iter().chain(&ring_points).copied();
     let finite = points.filter(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
     Aabb::from_points(finite)
+}
+
+/// The display tiles above finest tile `key`: one at each level from 1 up to the one below its
+/// own.
+fn display_ancestors(key: &TileKey) -> impl Iterator<Item = TileKey> + use<> {
+    let (face, finest, tx, ty) = (key.face(), key.level(), key.tx(), key.ty());
+    let per_side = finest.tiles_per_side();
+    (1..finest.get()).filter_map(move |l| {
+        let level = Level::new(l).ok()?;
+        let scale = (per_side / level.tiles_per_side().max(1)).max(1);
+        let (x, y) = (u32::from(tx) / scale, u32::from(ty) / scale);
+        let (x, y) = (u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+        TileKey::display(face, level, x, y).ok()
+    })
+}
+
+/// The box of the finite points of `points`; `None` if there is none.
+fn bounds_of_points(points: &[Vec3]) -> Option<Aabb> {
+    let finite = points
+        .iter()
+        .filter(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+    Aabb::from_points(finite.copied())
 }
 
 /// `dab`'s centre.

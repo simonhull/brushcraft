@@ -145,6 +145,12 @@ use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
 
+/// The tiles the preview makes previews of: the finest tiles, the display levels reached through
+/// stand-ins.
+fn finest_tiles(key: &TileKey) -> bool {
+    key.channel() != geom::Channel::DISPLAY
+}
+
 /// The default base strength, as a fraction of the stroke's frozen world radius
 /// ([`StrengthMode::Radius`]): a tenth.
 ///
@@ -1057,7 +1063,7 @@ impl Sculpting {
             return;
         }
         let before = preview.shown();
-        let shown = preview.show(scene.project.store(), scene.index, &dabs);
+        let shown = preview.show(scene.project.store(), scene.index, &dabs, &finest_tiles);
         let count = preview.shown() - before;
         let sources = self
             .stroke
@@ -1228,7 +1234,7 @@ impl Sculpting {
             return;
         }
         let store = scene.project.store();
-        let mut landed = preview.land(store, scene.index, count);
+        let mut landed = preview.land(store, scene.index, count, &finest_tiles);
         if rebase && landed.is_ok() {
             landed = preview.rebase(store, scene.index);
         }
