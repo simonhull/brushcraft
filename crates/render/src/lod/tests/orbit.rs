@@ -9,6 +9,9 @@
 //! sample of each, their `e` a quarter of their quad edge (where the error and quad rules meet)
 //! times a per-tile factor (1 for the smooth case, 0.25 to 2 at random for the rough one).
 //!
+//! With every tile resident it also runs with a budget that binds (4M triangles,
+//! [`BINDING_BUDGET`]), for what the passes that run then cost.
+//!
 //! Ignored by default: run on the machine's GPU, in release, with
 //! `cargo nextest run --release -p render --run-ignored only orbit --no-capture`
 //! (`BRUSHCRAFT_ADAPTER=<name>` picks an adapter by name).
@@ -22,6 +25,10 @@ use super::*;
 use crate::cull::{BoundsUpdate, SlotBuffers};
 use crate::gpu::AdapterRequest;
 use crate::residency::CLASSES;
+
+/// The binding budget measured beside the default one: 4M triangles, under what the benchmark
+/// orbit draws close.
+const BINDING_BUDGET: u32 = 4 << 20;
 
 /// Samples a side of a tile's bounds are taken from.
 const SAMPLES: u32 = 9;
@@ -316,8 +323,14 @@ fn orbit_relaxation_passes_and_timings_at_the_benchmark_tree_shape() {
             for (width, height) in sizes {
                 let size = Size::new(width, height).expect("non-zero");
                 for distance in [3.0, 1.5, 1.1, 1.02] {
-                    for exempt in [false, true] {
+                    // Every tile resident, also with a budget that binds: the cost of the
+                    // passes that run then (spec, "When it binds").
+                    let binding = shape.top == shape.finest && shape.splits == 20;
+                    let cases = [(false, None), (true, None), (true, Some(BINDING_BUDGET))];
+                    let cases = cases.into_iter().filter(|(_, b)| binding || b.is_none());
+                    for (exempt, budget) in cases {
                         let config = LodConfig::default().with_offscreen_seams(exempt);
+                        let config = budget.map_or(config, |b| config.with_triangle_budget(b));
                         let mut lod = Lod::new(&gpu, scene.tree.capacity(), config)
                             .expect("the level choice");
                         lod.enable_timing(&gpu).expect("timing");
@@ -330,10 +343,11 @@ fn orbit_relaxation_passes_and_timings_at_the_benchmark_tree_shape() {
                         let steady = measured.passes.iter().skip(1).copied().max().unwrap_or(0);
                         measured.timings.remove(0);
                         println!(
-                            "{}, {}, {width}×{height}, distance {distance}, off-screen seams {}: passes p50 {median} max {max} (after frame 0: {steady}), shortfall max {}, over 1 px max {}, cut max {} tiles {} triangles, charged max {} triangles; {}",
+                            "{}, {}, {width}×{height}, distance {distance}, off-screen seams {}{}: passes p50 {median} max {max} (after frame 0: {steady}), shortfall max {}, over 1 px max {}, cut max {} tiles {} triangles, charged max {} triangles; {}",
                             shape.label,
                             if rough { "rough" } else { "smooth" },
                             if exempt { "exempt" } else { "held" },
+                            if budget.is_some() { ", budget 4M" } else { "" },
                             measured.shortfall,
                             measured.over_pixel,
                             measured.cut.0,
