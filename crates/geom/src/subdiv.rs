@@ -161,6 +161,19 @@ impl CornerRing {
         self.diagonals.get(..self.valence).unwrap_or_default()
     }
 
+    /// Every point of the ring, the centre first, then the edge and the diagonal neighbours: the
+    /// order of [`CornerRing::points_mut`].
+    pub(crate) fn points(&self) -> impl Iterator<Item = &Vec3> {
+        std::iter::once(&self.center)
+            .chain(self.edges())
+            .chain(self.diagonals())
+    }
+
+    /// How many neighbours of each kind the ring has: the vertex's valence.
+    pub(crate) const fn valence(&self) -> usize {
+        self.valence
+    }
+
     /// Every point of the ring, the centre first, then the edge and the diagonal neighbours,
     /// writable.
     pub(crate) fn points_mut(&mut self) -> impl Iterator<Item = &mut Vec3> {

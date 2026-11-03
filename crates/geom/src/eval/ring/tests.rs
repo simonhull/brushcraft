@@ -571,3 +571,65 @@ fn blocks_displaced_by_one_function_of_position_still_meet_bit_for_bit() {
     assert!(shared > 0, "tiles share border vertices");
     assert!(moved > 0, "the bump moved vertices");
 }
+
+#[test]
+fn a_block_displaced_along_another_moves_each_point_by_its_counterpart() {
+    let mesh = cube_sphere(1).expect("a valid mesh");
+    let (now, then) = (evaluated(&mesh, 7, 3), evaluated(&mesh, 7, 13));
+    let key = TileKey::displacement(FaceId::new(2), level(7), 0, 1).expect("a tile");
+    let region = Region::of_tile(&key);
+    let current = gather_block(&mesh, &now, region).expect("gathers");
+    let reference = gather_block(&mesh, &then, region).expect("gathers");
+    let shift = |p: Vec3, at: Vec3| p + Vec3::new(at.x * 0.5, -at.y, at.z * 0.25);
+    let mut moved = current.clone();
+    assert!(moved.displace_along(&reference, shift), "the blocks match");
+    let triples = current
+        .padded()
+        .iter()
+        .zip(reference.padded())
+        .zip(moved.padded());
+    for ((before, at), after) in triples {
+        if before.x.is_nan() {
+            assert!(after.x.is_nan(), "a gap stays a gap");
+        } else {
+            assert_eq!(after.to_bits(), shift(*before, *at).to_bits());
+        }
+    }
+    let corners =
+        (0..4).filter_map(|c| Some((current.corner(c)?, reference.corner(c)?, moved.corner(c)?)));
+    let mut rings = 0;
+    for (before, at, after) in corners {
+        rings += 1;
+        assert_eq!(
+            after.center().to_bits(),
+            shift(before.center(), at.center()).to_bits()
+        );
+        let points = before.edges().iter().chain(before.diagonals());
+        let reference_points = at.edges().iter().chain(at.diagonals());
+        let moved_points = after.edges().iter().chain(after.diagonals());
+        for ((b, r), a) in points.zip(reference_points).zip(moved_points) {
+            assert_eq!(a.to_bits(), shift(*b, *r).to_bits(), "a ring point moved");
+        }
+    }
+    assert!(
+        rings > 0,
+        "the tile on a face corner has a base-vertex ring"
+    );
+}
+
+#[test]
+fn a_block_isnt_displaced_along_one_of_another_region() {
+    let mesh = cube_sphere(1).expect("a valid mesh");
+    let dense = evaluated(&mesh, 7, 3);
+    let one = TileKey::displacement(FaceId::new(2), level(7), 0, 1).expect("a tile");
+    let other = TileKey::displacement(FaceId::new(2), level(7), 1, 1).expect("a tile");
+    let mut block = gather_block(&mesh, &dense, Region::of_tile(&one)).expect("gathers");
+    let elsewhere = gather_block(&mesh, &dense, Region::of_tile(&other)).expect("gathers");
+    let before = block.clone();
+    assert!(!block.displace_along(&elsewhere, |p, _| p + Vec3::new(1.0, 0.0, 0.0)));
+    let bits = |of: &GatheredBlock| {
+        let bits: Vec<[u32; 3]> = of.padded().iter().map(|p| p.to_bits()).collect();
+        bits
+    };
+    assert_eq!(bits(&block), bits(&before), "nothing moved");
+}

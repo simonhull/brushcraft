@@ -126,6 +126,55 @@ impl GatheredBlock {
         }
     }
 
+    /// Moves every point the block holds through `f` of it and `reference`'s point in the same
+    /// slot: as [`GatheredBlock::displace`], each point with its counterpart in a block gathered
+    /// over the same region (the same surface at another time: a brush stroke's previews weigh
+    /// each point's move at its position as the stroke began). Slots without a vertex in either
+    /// block (NaN) stay as they are; `f` isn't called for them.
+    ///
+    /// Every block holds a vertex's owner bits, this one and `reference` alike, so an `f` that is
+    /// a function of the two points' bits alone moves the vertex to the same new bits in every
+    /// block: blocks so moved still meet bit for bit.
+    ///
+    /// Returns whether the blocks match: `false`, and nothing moved, if `reference` isn't
+    /// gathered over this block's region, or its base-vertex rings aren't this block's.
+    pub fn displace_along(
+        &mut self,
+        reference: &Self,
+        mut f: impl FnMut(Vec3, Vec3) -> Vec3,
+    ) -> bool {
+        let same_rings = self
+            .corners
+            .iter()
+            .zip(&reference.corners)
+            .all(|(own, other)| match (own, other) {
+                (Some(own), Some(other)) => own.ring.valence() == other.ring.valence(),
+                (None, None) => true,
+                _ => false,
+            });
+        if self.region != reference.region || !same_rings {
+            return false;
+        }
+        let finite = |v: &Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+        let slots = self
+            .padded
+            .as_mut_slice()
+            .iter_mut()
+            .zip(reference.padded.as_slice());
+        let rings = self.corners.iter_mut().zip(&reference.corners);
+        let ring_points = rings.flat_map(|(own, other)| {
+            own.iter_mut()
+                .zip(other)
+                .flat_map(|(own, other)| own.ring.points_mut().zip(other.ring.points()))
+        });
+        for (point, at) in slots.chain(ring_points) {
+            if finite(point) && finite(at) {
+                *point = f(*point, *at);
+            }
+        }
+        true
+    }
+
     /// The ring of the base vertex at block corner `c` (`0..4`: `(0, 0)`, `(q, 0)`, `(q, q)`,
     /// `(0, q)`), or `None` if that corner isn't a base vertex.
     #[must_use]
