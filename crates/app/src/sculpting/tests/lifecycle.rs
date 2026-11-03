@@ -333,6 +333,8 @@ fn a_waiting_strokes_samples_are_held_over_a_step_with_no_scene() {
         index: None,
         camera: &camera,
         size: size(),
+        drawn: Drawing::ALL,
+        waiting: &[],
     };
     let report = brush
         .step(blind, &pen, &BrushBudget::unlimited())

@@ -136,20 +136,14 @@ use stroke::{
 
 use crate::camera::{Camera, Pixel};
 use crate::frame::{
-    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Kept, LATENCY_AIM, STROKE_QUIET,
-    SampleTimes,
+    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Drawing, Kept, LATENCY_AIM,
+    STROKE_QUIET, SampleTimes,
 };
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests;
-
-/// The tiles the preview makes previews of: the finest tiles, the display levels reached through
-/// stand-ins.
-fn finest_tiles(key: &TileKey) -> bool {
-    key.channel() != geom::Channel::DISPLAY
-}
 
 /// The default base strength, as a fraction of the stroke's frozen world radius
 /// ([`StrengthMode::Radius`]): a tenth.
@@ -1014,6 +1008,13 @@ impl Sculpting {
         budget: Option<&BrushBudget>,
     ) {
         let showing = self.preview.is_some() && budget.is_some();
+        if let Some(preview) = &mut self.preview
+            && !scene.waiting.is_empty()
+            && let Err(error) = preview.make_waiting(scene.project.store(), scene.waiting)
+        {
+            // The renderer keeps waiting: it draws their ancestors meanwhile.
+            self.fail("making the previews the renderer waits for", &error);
+        }
         if showing && !self.fits(budget) {
             self.show(scene, report);
         }
@@ -1063,7 +1064,13 @@ impl Sculpting {
             return;
         }
         let before = preview.shown();
-        let shown = preview.show(scene.project.store(), scene.index, &dabs, &finest_tiles);
+        let drawn = scene.drawn;
+        let shown = preview.show(
+            scene.project.store(),
+            scene.index,
+            &dabs,
+            &|key: &TileKey| drawn.draws(key),
+        );
         let count = preview.shown() - before;
         let sources = self
             .stroke
@@ -1202,11 +1209,18 @@ impl Sculpting {
         let took = began.elapsed();
         match applied {
             Ok(stats) => {
+                let direct: Vec<Dab> = batch.get(landing..).unwrap_or_default().to_vec();
                 front.dabs.drain(..count);
                 front.sources.drain(..count);
                 report.dabs_applied += stats.dabs;
                 report.tiles_edited += stats.tiles_edited;
                 self.land(scene, landing, false);
+                if let Some(preview) = &mut self.preview
+                    && !direct.is_empty()
+                {
+                    // Applied at once: the stroke's later previews count them.
+                    preview.note_applied(&direct);
+                }
             }
             Err(error) => {
                 // Every dab of the stroke left is dropped, those shown with them.
@@ -1234,7 +1248,8 @@ impl Sculpting {
             return;
         }
         let store = scene.project.store();
-        let mut landed = preview.land(store, scene.index, count, &finest_tiles);
+        let drawn = scene.drawn;
+        let mut landed = preview.land(store, scene.index, count, &|key: &TileKey| drawn.draws(key));
         if rebase && landed.is_ok() {
             landed = preview.rebase(store, scene.index);
         }
@@ -1259,6 +1274,11 @@ impl Sculpting {
     /// Ends `over`'s op with its record; unrecorded if the record can't be made or the project
     /// refuses it, so its edits are flushed all the same.
     fn end(&mut self, project: &mut Project, over: &Pending) {
+        if let Some(preview) = &mut self.preview
+            && let Err(error) = preview.end_stroke(project.store())
+        {
+            self.fail("ending the stroke's previews", &error);
+        }
         let Some(op) = over.op else {
             return;
         };
@@ -1471,6 +1491,10 @@ struct Scene<'a> {
     camera: &'a Camera,
     /// The camera's projector, for the frame's size.
     projector: ViewProjector,
+    /// Whether the renderer holds or wants a tile: what the previews are made of.
+    drawn: Drawing<'a>,
+    /// The tiles the renderer waits for previews of.
+    waiting: &'a [TileKey],
 }
 
 impl<'a> Scene<'a> {
@@ -1482,12 +1506,16 @@ impl<'a> Scene<'a> {
             index,
             camera,
             size,
+            drawn,
+            waiting,
         } = context;
         Some(Self {
             project,
             index: index?,
             projector: ViewProjector::new(&camera.view(size)?),
             camera,
+            drawn,
+            waiting,
         })
     }
 }

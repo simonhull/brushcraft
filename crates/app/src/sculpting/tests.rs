@@ -203,6 +203,8 @@ fn context<'a>(
         index: Some(index),
         camera,
         size: size(),
+        drawn: Drawing::ALL,
+        waiting: &[],
     }
 }
 
@@ -237,6 +239,8 @@ fn a_down_on_the_surface_brushes_and_off_it_navigates() {
             index,
             camera: &camera,
             size: size(),
+            drawn: Drawing::ALL,
+            waiting: &[],
         };
         brush.route(context, &sample(Phase::Down, at, 0.5))
     };
@@ -917,9 +921,17 @@ fn a_step_within_its_time_is_finest_work_alone_and_one_past_it_shows_the_rest() 
         frames += 1;
         assert!(frames < 10_000, "the catch-up ends");
     }
+    let store = past.project().store();
     assert!(
-        !past.project().store().has_previews(),
-        "no preview once every dab has landed"
+        store.previewed().next().is_none() && store.held_previews().next().is_none(),
+        "no finest preview and nothing held once every dab has landed"
+    );
+    let released = store.display_previewed().copied().collect::<Vec<TileKey>>();
+    assert!(
+        released.iter().all(|key| store
+            .display_preview(key)
+            .is_some_and(|preview| !preview.held)),
+        "the display previews left are released, drawn until the refresh"
     );
     assert_eq!(past.brush().error(), None);
     assert_eq!(

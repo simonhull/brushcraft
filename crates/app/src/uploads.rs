@@ -444,6 +444,14 @@ impl Uploads for GpuResidency {
     fn scene(&self) -> Option<&LodStats> {
         self.scene.as_ref()
     }
+
+    fn draws(&self, key: &TileKey) -> bool {
+        self.residency.holds_or_wants(key)
+    }
+
+    fn waiting_for_previews(&self) -> Vec<TileKey> {
+        self.residency.waiting_for_previews().copied().collect()
+    }
 }
 
 /// What residency's counts don't say about the work left, for [`pending`].

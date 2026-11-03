@@ -898,6 +898,8 @@ fn epochs_closed_between_frames_want_a_frame_to_take_them() {
         index: None,
         camera: &Camera::default(),
         size: Size::new(320, 200).expect("a size"),
+        drawn: Drawing::ALL,
+        waiting: &[],
     };
     OneEdit::default()
         .step(context, &PenFrame::default(), &BrushBudget::unlimited())
@@ -1034,6 +1036,8 @@ fn a_minimised_window_still_runs_its_upkeep() {
         index: None,
         camera: &Camera::default(),
         size: Size::new(320, 200).expect("a size"),
+        drawn: Drawing::ALL,
+        waiting: &[],
     };
     OneEdit::default()
         .step(context, &PenFrame::default(), &BrushBudget::unlimited())

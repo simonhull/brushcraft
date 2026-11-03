@@ -182,6 +182,8 @@ fn a_down_the_brush_finds_off_the_surface_says_so_and_one_on_it_doesnt() {
             index: Some(picker.index_mut()),
             camera: &camera,
             size: size(),
+            drawn: Drawing::ALL,
+            waiting: &[],
         };
         let route = brush.route(context, &sample(Phase::Down, at, 0.5));
         assert_eq!(route == Route::Navigate, off, "{at:?}");
@@ -192,6 +194,8 @@ fn a_down_the_brush_finds_off_the_surface_says_so_and_one_on_it_doesnt() {
         index: None,
         camera: &camera,
         size: size(),
+        drawn: Drawing::ALL,
+        waiting: &[],
     };
     assert_eq!(
         brush.route(context, &sample(Phase::Down, (3.0, 3.0), 0.5)),

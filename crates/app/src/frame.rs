@@ -102,6 +102,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use geom::TileKey;
 use render::camera::View;
 use render::lod::LodStats;
 use render::raster::FramePasses;
@@ -137,6 +138,32 @@ pub(crate) struct BrushContext<'a> {
     pub(crate) camera: &'a Camera,
     /// The frame's size.
     pub(crate) size: Size,
+    /// Whether the renderer holds or wants a tile: what a brush's previews are made of.
+    pub(crate) drawn: Drawing<'a>,
+    /// The tiles the renderer waits for a brush's previews of (held, none made yet).
+    pub(crate) waiting: &'a [TileKey],
+}
+
+/// Whether the renderer holds or wants a tile ([`Uploads::draws`]): what a brush's previews are
+/// made of.
+#[derive(Clone, Copy)]
+pub(crate) struct Drawing<'a>(pub(crate) &'a dyn Fn(&TileKey) -> bool);
+
+impl Drawing<'_> {
+    /// Every tile drawn: for a brush with no renderer to ask (the tests', and routing, which
+    /// makes no preview).
+    pub(crate) const ALL: Drawing<'static> = Drawing(&|_| true);
+
+    /// Whether the renderer holds or wants `key`.
+    pub(crate) fn draws(&self, key: &TileKey) -> bool {
+        (self.0)(key)
+    }
+}
+
+impl std::fmt::Debug for Drawing<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Drawing")
+    }
 }
 
 /// A change to the brush's settings, from the keyboard.
@@ -591,6 +618,17 @@ pub(crate) trait Uploads {
     /// first.
     fn scene(&self) -> Option<&LodStats> {
         None
+    }
+
+    /// Whether the renderer holds or wants tile `key`, which a brush's previews are made of.
+    /// Every tile with no renderer.
+    fn draws(&self, _key: &TileKey) -> bool {
+        true
+    }
+
+    /// The tiles the last staging left waiting for a brush's previews.
+    fn waiting_for_previews(&self) -> Vec<TileKey> {
+        Vec::new()
     }
 }
 
@@ -1718,11 +1756,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// Calls the brush with its context for a frame of `size`: the project, picking's spatial
     /// index and the camera.
     fn with_brush<R>(&mut self, size: Size, call: impl FnOnce(&mut B, BrushContext<'_>) -> R) -> R {
+        let waiting = self.uploads.waiting_for_previews();
+        let uploads = &self.uploads;
+        let drawn = |key: &TileKey| uploads.draws(key);
         let context = BrushContext {
             project: &mut self.project,
             index: self.picker.as_mut().map(Picker::index_mut),
             camera: &self.camera,
             size,
+            drawn: Drawing(&drawn),
+            waiting: &waiting,
         };
         call(&mut self.brush, context)
     }
@@ -2140,6 +2183,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 index: self.picker.as_mut().map(Picker::index_mut),
                 camera: &self.camera,
                 size,
+                drawn: Drawing::ALL,
+                waiting: &[],
             };
             let mut asked = false;
             let route = self.pen_router.route(&sample, |down| {
