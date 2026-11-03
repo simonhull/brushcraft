@@ -1014,3 +1014,68 @@ fn a_display_preview_must_be_of_a_display_tile_and_its_side() {
     ));
     assert_eq!(store.display_preview(&parent), None, "nothing kept");
 }
+
+#[test]
+fn a_refresh_in_flight_as_its_tile_becomes_held_leaves_the_held_preview_drawn() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    // Edits bring a refresh, whose builds the workers finish but the store hasn't collected.
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 20, 5));
+    store.hooks.hold_finished = true;
+    for _ in 0..20 {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(20))
+            .unwrap();
+    }
+    assert!(
+        !store.hooks.held_finished.is_empty(),
+        "builds finished, not collected"
+    );
+    // A stroke holds every tile those builds are of, with previews of its own.
+    let built: Vec<TileKey> = store
+        .hooks
+        .held_finished
+        .iter()
+        .map(|done| done.key)
+        .filter(|key| key.channel() == Channel::DISPLAY)
+        .collect();
+    for key in tiles(&mesh, TOP, TOP) {
+        store.hold_preview(key);
+    }
+    let held: Vec<TileKey> = built
+        .iter()
+        .filter(|key| store.preview_held(key))
+        .copied()
+        .collect();
+    assert!(!held.is_empty(), "held tiles in flight");
+    for key in &held {
+        // Its record may be unknown (the edits): a preview of its side, whatever its values.
+        let vertices = usize::try_from(key.side() * key.side()).unwrap();
+        let made = DisplayPreview {
+            positions: vec![Vec3::ZERO; vertices],
+            normals: vec![Vec3::new(0.0, 0.0, 1.0); vertices],
+            roughness: vec![255; vertices],
+            bound: 1.0,
+            held: true,
+        };
+        store.set_display_preview(*key, made).unwrap();
+    }
+    // The builds land: the held tiles keep their previews.
+    store.hooks.hold_finished = false;
+    for _ in 0..20 {
+        store
+            .run_jobs(Instant::now() + Duration::from_millis(20))
+            .unwrap();
+    }
+    for key in &held {
+        assert!(
+            store
+                .display_preview(key)
+                .is_some_and(|preview| preview.held),
+            "{key:?}: drawn from its preview while held"
+        );
+    }
+}

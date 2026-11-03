@@ -805,6 +805,11 @@ impl TileStore {
         drop(self.take_preview_pen_down(key));
     }
 
+    /// Every tile the current stroke changed, with a pen-down shape kept, in key order.
+    pub fn pen_down_keys(&self) -> impl Iterator<Item = &TileKey> {
+        self.pen_down.shapes.keys()
+    }
+
     /// How many tiles' pen-down shapes the current stroke keeps.
     #[must_use]
     pub fn pen_down_tiles(&self) -> usize {

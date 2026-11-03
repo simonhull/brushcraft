@@ -136,8 +136,12 @@ impl TileStore {
             self.display_generations
                 .insert(*tile.key(), self.display_builds);
             self.bumped.remove(tile.key());
-            // The refresh's epoch names it: what is drawn of it is its record again.
-            self.refreshed_preview(tile.key());
+            // The refresh's epoch names it: what is drawn of it is its record again, unless a
+            // brush holds it (a build in flight as its tile became held): then its preview stays
+            // what is drawn, the dabs still to land on it.
+            if !self.preview_holds(tile.key()) {
+                self.refreshed_preview(tile.key());
+            }
             if tile.key().level() <= self.floor_top {
                 self.floor
                     .insert(*tile.key(), DisplayRecord::of(tile, finest));
