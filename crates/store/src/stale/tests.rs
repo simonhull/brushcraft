@@ -33,12 +33,17 @@ fn epochs_arrive_once_whole_and_in_order_or_as_a_resync() {
             let mut next = [0_u64; 3];
             for &(op, size) in ops {
                 let count = u32::from(size % 8);
-                feed.close(keys(u32::from(op), count), EpochKind::Refresh);
+                feed.close(
+                    keys(u32::from(op), count),
+                    BTreeSet::new(),
+                    EpochKind::Refresh,
+                );
                 if count > 0 {
                     closed.push(Epoch {
                         kind: EpochKind::Refresh,
                         seq: u64::try_from(closed.len()).unwrap(),
                         keys: keys(u32::from(op), count),
+                        written: BTreeSet::new(),
                     });
                 }
                 assert!(feed.most_pending() <= cap, "memory stays within the cap");
@@ -87,7 +92,7 @@ fn an_unsubscribed_cursor_is_told_to_resync() {
     let kept = cursor.clone();
     feed.unsubscribe(cursor);
     assert!(!feed.is_listened(), "no one listens");
-    feed.close(keys(0, 3), EpochKind::Refresh);
+    feed.close(keys(0, 3), BTreeSet::new(), EpochKind::Refresh);
     assert_eq!(feed.drain(&kept), Drained::Resync(Vec::new()), "gone");
 }
 
@@ -100,7 +105,7 @@ fn a_cursor_of_another_feed_is_told_to_resync() {
     let (mut a, mut b) = (StaleFeed::new(10), StaleFeed::new(10));
     let from_a = a.subscribe();
     let from_b = b.subscribe();
-    b.close(keys(0, 2), EpochKind::Refresh);
+    b.close(keys(0, 2), BTreeSet::new(), EpochKind::Refresh);
     assert_eq!(b.drain(&from_a), Drained::Resync(Vec::new()), "not b's");
     b.unsubscribe(from_a);
     assert!(b.is_listened(), "b's consumer stays");
@@ -110,6 +115,7 @@ fn a_cursor_of_another_feed_is_told_to_resync() {
             kind: EpochKind::Refresh,
             seq: 0,
             keys: keys(0, 2),
+            written: BTreeSet::new(),
         }]),
         "b's own cursor"
     );
@@ -121,11 +127,11 @@ fn has_pending_says_whether_a_drain_would_give_anything() {
     let mut feed = StaleFeed::new(4);
     let cursor = feed.subscribe();
     assert!(!feed.has_pending(&cursor), "nothing closed yet");
-    feed.close(keys(0, 2), EpochKind::Refresh);
+    feed.close(keys(0, 2), BTreeSet::new(), EpochKind::Refresh);
     assert!(feed.has_pending(&cursor), "an epoch waits");
     assert_ne!(feed.drain(&cursor), Drained::Epochs(Vec::new()));
     assert!(!feed.has_pending(&cursor), "drained");
-    feed.close(keys(0, 5), EpochKind::Refresh);
+    feed.close(keys(0, 5), BTreeSet::new(), EpochKind::Refresh);
     assert!(feed.has_pending(&cursor), "past the cap: a resync waits");
     assert_eq!(feed.drain(&cursor), Drained::Resync(Vec::new()));
     assert!(!feed.has_pending(&cursor), "resynced");

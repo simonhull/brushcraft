@@ -356,7 +356,8 @@ impl TileStore {
         self.close_writes()?;
         let changed = std::mem::take(&mut self.previews.changed);
         if self.stale.is_listened() {
-            self.stale.close(changed, EpochKind::Preview);
+            self.stale
+                .close(changed, BTreeSet::new(), EpochKind::Preview);
         }
         Ok(())
     }

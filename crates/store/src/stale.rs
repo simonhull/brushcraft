@@ -87,6 +87,11 @@ pub struct Epoch {
     /// The finest tiles and display tiles whose decoded positions (or, for a finest tile, the
     /// ring of neighbouring positions uploaded with it) changed, in key order.
     pub keys: BTreeSet<TileKey>,
+    /// Of `keys`, the finest tiles whose own positions the epoch's writes moved: those written
+    /// (a border vertex is written in every tile holding it). The other finest tiles of a step's
+    /// epoch only read a moved one for their ring: none of their vertices moved. Empty for an
+    /// epoch with no writes (a refresh's, a preview's).
+    pub written: BTreeSet<TileKey>,
 }
 
 /// What a drain gives a consumer.
@@ -171,7 +176,12 @@ impl StaleFeed {
 
     /// Closes an epoch of `keys`, of `kind`, handing it to every consumer; a consumer it would
     /// take past the cap loses its epochs instead. Nothing is closed for no keys.
-    pub(crate) fn close(&mut self, keys: BTreeSet<TileKey>, kind: EpochKind) {
+    pub(crate) fn close(
+        &mut self,
+        keys: BTreeSet<TileKey>,
+        written: BTreeSet<TileKey>,
+        kind: EpochKind,
+    ) {
         if keys.is_empty() || self.consumers.is_empty() {
             return;
         }
@@ -179,6 +189,7 @@ impl StaleFeed {
             seq: self.next_seq,
             kind,
             keys,
+            written,
         };
         self.next_seq += 1;
         let size = epoch.keys.len();

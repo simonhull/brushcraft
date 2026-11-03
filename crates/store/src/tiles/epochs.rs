@@ -105,10 +105,14 @@ impl TileStore {
             _ if !self.epoch_writes.is_empty() => EpochKind::Revert,
             _ => EpochKind::Refresh,
         };
-        self.epoch_writes.clear();
+        // The finest tiles written moved their own vertices; the other readers only their ring.
+        let written: BTreeSet<TileKey> = std::mem::take(&mut self.epoch_writes)
+            .into_iter()
+            .filter(|key| moved.contains(key))
+            .collect();
         let mut keys = std::mem::take(&mut self.epoch_keys);
         keys.extend(moved);
-        self.stale.close(keys, kind);
+        self.stale.close(keys, written, kind);
         Ok(())
     }
 
