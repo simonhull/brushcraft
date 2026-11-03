@@ -435,8 +435,12 @@ impl Camera {
         self.pivot = pivot;
     }
 
-    /// Takes `boundary` as the model's (grown to hold the one known before, if any: the model's
-    /// bounds only grow between frames), and keeps the eye out of it as [`Camera::orbit`] does.
+    /// Takes `boundary` as the model's, grown to hold the one known before (if any), and keeps
+    /// the eye out of it as [`Camera::orbit`] does.
+    ///
+    /// The boundary only grows until the next [`Camera::frame`]: every pivot set since was a
+    /// point of the model inside the one known then, and the eye keeps to its line to a pivot
+    /// inside the boundary. A model sculpted smaller leaves the eye a little farther out.
     pub(crate) fn grow_boundary(&mut self, boundary: Boundary) {
         self.boundary = Some(
             self.boundary
