@@ -11,6 +11,14 @@
 //! the near plane sits at [`NEAR_FRACTION`] of the distance to the target, so it follows the
 //! camera in for close work.
 //!
+//! **Magnification** ([`View::magnified`]) enlarges a view's image about a point instead of
+//! moving the eye: the projection's field narrows and its principal point (where the line of
+//! sight meets the viewport) moves, so the eye, every depth and the near plane stay as they were
+//! while [`View::pixels_per_unit`] grows by the factor. Everything that measures the view
+//! through that scale (the level choice's screen error, the brush's pixel size) or through the
+//! view-projection (culling, the raster, shading) measures the magnified image's own pixels; rays
+//! through a pixel go through [`View::through`], which knows the principal point.
+//!
 //! Math is `f64`, the camera and its matrices both: a handful of numbers, kept exact for long
 //! drags and for views close to the surface. A [`View`] goes to the GPU as `f32`
 //! ([`View::gpu`], the WGSL `View` of [`crate::cull::CULL_WGSL`]).
@@ -459,6 +467,10 @@ pub struct View {
     size: Size,
     /// Pixels a world length of 1 covers, facing the eye at a distance of 1.
     pixels_per_unit: f64,
+    /// The principal point: where the line of sight meets the viewport, in pixels from its
+    /// top-left corner (x right, y down). The viewport's centre, unless the view is magnified
+    /// off it ([`View::magnified`]) or jittered ([`View::jittered`]).
+    principal: [f64; 2],
     /// The near plane's distance from the eye.
     near: f64,
 }
@@ -517,8 +529,53 @@ impl View {
             planes: frustum_planes(&clip_from_world),
             size,
             pixels_per_unit: focal * height / 2.0,
+            principal: [width / 2.0, height / 2.0],
             near,
         }
+    }
+
+    /// The same view with its image enlarged `factor` times about the viewport's centre, then
+    /// moved by `shift` pixels (x right, y down): a point this view shows at pixel `p` shows at
+    /// `centre + factor · (p − centre) + shift`. A lens with a narrower field, its principal
+    /// point moved: what the app's camera does when the eye can come no closer
+    /// (`app::camera`).
+    ///
+    /// Only the projection's first two rows change (each scaled, and gaining a multiple of the
+    /// last), so the eye, the view's axes, the depth of every point and the near plane are bit
+    /// for bit the same; [`View::pixels_per_unit`] is `factor` times this view's, so a length in
+    /// pixels measured through it is one of the magnified image. The frustum's side planes close
+    /// in with the image, and [`View::principal`] moves with it.
+    ///
+    /// `None` unless `factor` is positive and finite and `shift` finite.
+    #[must_use]
+    pub fn magnified(&self, factor: f64, shift: [f64; 2]) -> Option<Self> {
+        let [sx, sy] = shift;
+        let valid = factor > 0.0 && factor.is_finite() && sx.is_finite() && sy.is_finite();
+        if !valid {
+            return None;
+        }
+        let (width, height) = (f64::from(self.size.width()), f64::from(self.size.height()));
+        // ndc x' = factor · ndc x + 2 sx / width; ndc y points up while pixels count down, so
+        // y' = factor · y − 2 sy / height. Each is a row scaled plus a multiple of the last (w).
+        let moves = [2.0 * sx / width, -2.0 * sy / height];
+        let mut clip_from_world = self.clip_from_world;
+        let [r0, r1, _, r3] = &mut clip_from_world.rows;
+        let moved_rows = [r0, r1].into_iter().zip(moves);
+        for (row, by) in moved_rows {
+            let entries = row.iter_mut().zip(*r3);
+            for (value, last) in entries {
+                *value = factor * *value + by * last;
+            }
+        }
+        let [px, py] = self.principal;
+        let (cx, cy) = (width / 2.0, height / 2.0);
+        Some(Self {
+            clip_from_world,
+            planes: frustum_planes(&clip_from_world),
+            pixels_per_unit: self.pixels_per_unit * factor,
+            principal: [cx + factor * (px - cx) + sx, cy + factor * (py - cy) + sy],
+            ..*self
+        })
     }
 
     /// The same view with its image moved by `jitter`, a fraction of a pixel: pixel `(x, y)`'s
@@ -529,7 +586,8 @@ impl View {
     /// Only the projection's first two rows change (each gains a multiple of the last), so the
     /// eye, the depth of every point, the near plane, [`View::pixels_per_unit`] and every pixel
     /// length are bit for bit the same: what the level choice and the geomorph compute from them
-    /// doesn't move with the jitter. The frustum's side planes move with the image.
+    /// doesn't move with the jitter. The frustum's side planes and [`View::principal`] move with
+    /// the image.
     #[must_use]
     pub fn jittered(&self, jitter: Jitter) -> Self {
         let (width, height) = (f64::from(self.size.width()), f64::from(self.size.height()));
@@ -545,9 +603,11 @@ impl View {
                 *value += by * last;
             }
         }
+        let [px, py] = self.principal;
         Self {
             clip_from_world,
             planes: frustum_planes(&clip_from_world),
+            principal: [px - jitter.x, py - jitter.y],
             ..*self
         }
     }
@@ -593,6 +653,26 @@ impl View {
     #[must_use]
     pub const fn near(&self) -> f64 {
         self.near
+    }
+
+    /// The principal point: where the line of sight meets the viewport, in pixels from its
+    /// top-left corner (x right, y down). The viewport's centre unless the view is magnified off
+    /// it ([`View::magnified`]) or jittered.
+    #[must_use]
+    pub const fn principal(&self) -> [f64; 2] {
+        self.principal
+    }
+
+    /// The direction from the eye through the point `(x, y)` of the viewport, in pixels from its
+    /// top-left corner (x right, y down; pixel `(i, j)`'s centre is `(i + 0.5, j + 0.5)`, as
+    /// [`View::pixel`] gives it): not unit length, but one unit along [`View::forward`] per unit
+    /// of it, so a point `t` along it is at depth `t`. Every point along it projects to `(x, y)`.
+    #[must_use]
+    pub fn through(&self, x: f64, y: f64) -> Vec3 {
+        let [px, py] = self.principal;
+        let across = (x - px) / self.pixels_per_unit;
+        let down = (py - y) / self.pixels_per_unit;
+        self.forward() + self.right() * across + self.up() * down
     }
 
     /// The frustum's planes, `[nx, ny, nz, d]` with `n · p + d ≥ 0` inside and `|n| = 1`: left,
@@ -781,6 +861,136 @@ mod tests {
             "the centre changes nothing"
         );
         assert!(Jitter::new(0.5, 0.0).is_none() && Jitter::new(0.0, -0.6).is_none());
+    }
+
+    /// A view off the axes, for the magnification tests: 60°, near 0.01, into [`size`].
+    fn slanted() -> View {
+        View::look_at(
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(0.1, -0.2, 0.3),
+            Vec3::new(0.0, 1.0, 0.0),
+            60_f64.to_radians(),
+            size(),
+            0.01,
+        )
+        .expect("a view")
+    }
+
+    #[test]
+    fn a_magnified_view_enlarges_the_image_about_the_centre_and_moves_it_by_the_shift() {
+        let view = slanted();
+        let magnified = view.magnified(3.0, [12.5, -7.0]).expect("a magnified view");
+        let centre = (100.0, 50.0);
+        for p in [
+            Vec3::new(0.1, -0.2, 0.3),
+            Vec3::new(0.4, 0.1, -0.2),
+            Vec3::new(0.15, -0.1, 0.25),
+        ] {
+            let (x, y, depth) = view.pixel(p).expect("in front");
+            let (mx, my, moved_depth) = magnified.pixel(p).expect("in front");
+            let want = (
+                centre.0 + 3.0 * (x - centre.0) + 12.5,
+                centre.1 + 3.0 * (y - centre.1) - 7.0,
+            );
+            assert!((mx - want.0).abs() < 1e-9, "x: {mx} {want:?}");
+            assert!((my - want.1).abs() < 1e-9, "y: {my} {want:?}");
+            assert!((moved_depth - depth).abs() < 1e-15, "the same depth");
+        }
+        assert!((magnified.pixels_per_unit() - 3.0 * view.pixels_per_unit()).abs() < 1e-12);
+        assert_eq!(magnified.eye(), view.eye());
+        assert_eq!(magnified.near(), view.near());
+        assert_eq!(
+            magnified.gpu().planes[4],
+            view.gpu().planes[4],
+            "the near plane, bit for bit"
+        );
+        let [px, py] = magnified.principal();
+        assert!((px - 112.5).abs() < 1e-12 && (py - 43.0).abs() < 1e-12);
+        assert_eq!(view.magnified(1.0, [0.0, 0.0]), Some(view), "no change");
+        assert!(view.magnified(0.0, [0.0, 0.0]).is_none());
+        assert!(view.magnified(2.0, [f64::NAN, 0.0]).is_none());
+    }
+
+    #[test]
+    fn a_magnified_views_lengths_in_pixels_are_its_images_own() {
+        let view = slanted();
+        let magnified = view
+            .magnified(40.0, [-300.0, 220.0])
+            .expect("a magnified view");
+        // A short segment facing the eye, wherever it lies on the magnified screen, covers
+        // `length · pixels_per_unit / depth` of its pixels (to first order off the axis: at the
+        // principal point exactly).
+        let ahead = view.forward() * 2.5;
+        let point = view.eye() + ahead;
+        let (x, y, _) = magnified.pixel(point).expect("in front");
+        let [px, py] = magnified.principal();
+        assert!((x - px).abs() < 1e-9 && (y - py).abs() < 1e-9, "the axis");
+        let length = 1e-4;
+        let (ux, uy, _) = magnified
+            .pixel(point + view.up() * length)
+            .expect("in front");
+        let measured = (ux - x).hypot(uy - y);
+        let predicted = length * magnified.pixels_per_unit() / 2.5;
+        assert!(
+            (measured - predicted).abs() < 1e-6 * predicted,
+            "{measured} {predicted}"
+        );
+    }
+
+    #[test]
+    fn the_direction_through_a_pixel_projects_back_to_it_magnified_or_not() {
+        let view = slanted();
+        let jitter = Jitter::new(0.25, -0.125).expect("inside the pixel");
+        let views = [
+            view,
+            view.magnified(5.0, [31.0, -12.0]).expect("magnified"),
+            view.magnified(2.0, [-8.0, 3.0])
+                .expect("magnified")
+                .jittered(jitter),
+        ];
+        for v in views {
+            for (x, y) in [(0.5, 0.5), (199.5, 99.5), (37.25, 61.75), (100.0, 50.0)] {
+                let direction = v.through(x, y);
+                assert!(
+                    (direction.dot(v.forward()) - 1.0).abs() < 1e-12,
+                    "unit depth"
+                );
+                for t in [0.05, 1.0, 7.0] {
+                    let (px, py, _) = v.pixel(v.eye() + direction * t).expect("in front");
+                    assert!(
+                        (px - x).abs() < 1e-7 && (py - y).abs() < 1e-7,
+                        "({x}, {y}) at {t}: ({px}, {py})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_magnified_views_frustum_planes_hold_exactly_what_projects_inside_it() {
+        let magnified = slanted().magnified(6.0, [250.0, -90.0]).expect("magnified");
+        let mut state = 9_u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            #[expect(clippy::cast_precision_loss, reason = "53 random bits")]
+            let unit = (state >> 11) as f64 / (1_u64 << 53) as f64;
+            unit * 4.0 - 2.0
+        };
+        let mut inside = 0;
+        for _ in 0..20_000 {
+            let point = Vec3::new(random(), random(), random());
+            let inside_planes = magnified
+                .planes()
+                .iter()
+                .all(|[a, b, c, d]| a * point.x + b * point.y + c * point.z + d >= 0.0);
+            let [x, y, z, w] = magnified.clip(point);
+            let inside_clip = w > 0.0 && x.abs() <= w && y.abs() <= w && z <= w;
+            assert_eq!(inside_planes, inside_clip, "{point:?}");
+            inside += usize::from(inside_clip);
+        }
+        assert!(inside > 0, "some points are in view");
     }
 
     #[test]
