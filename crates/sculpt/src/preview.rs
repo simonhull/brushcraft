@@ -456,16 +456,17 @@ impl Preview {
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
         let pending: Vec<Imprint> = self.shown.iter().copied().collect();
-        let mut made = Vec::new();
-        for key in keys {
-            if self.displays.contains_key(key) {
-                continue;
-            }
-            if let Some(state) = DisplayState::make(store, *key, &self.stroke, &pending)? {
-                self.displays.insert(*key, state);
-                made.push(*key);
-                stats.gathered += 1;
-            }
+        let fresh: Vec<TileKey> = keys
+            .iter()
+            .filter(|key| !self.displays.contains_key(key))
+            .copied()
+            .collect();
+        let built = DisplayState::make_many(store, &fresh, &self.stroke, &pending)?;
+        let mut made = Vec::with_capacity(built.len());
+        for state in built {
+            made.push(*state.key());
+            self.displays.insert(*state.key(), state);
+            stats.gathered += 1;
         }
         self.publish(store, &made, stats)
     }

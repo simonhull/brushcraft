@@ -78,7 +78,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use brush::{
     Falloff, Hardened, Imprint, Smoothstep, draw_imprint_gradient, draw_imprint_vertex, draw_move,
 };
-use geom::{GatheredBlock, Level, TileKey, Vec3};
+use geom::{DisplayTile, GatheredBlock, Level, TileKey, Vec3};
 use store::{Aabb, CacheError, DisplayPreview, Evaluation, TileStore};
 
 use super::{bounds_of_points, touches};
@@ -103,8 +103,6 @@ const STORED_ROUNDING: f64 = 1.0 / 1024.0;
 pub(super) struct DisplayState {
     /// The tile.
     key: TileKey,
-    /// Vertices per side.
-    side: usize,
     /// The pen-down tile's positions, `P0`.
     p0: Vec<Vec3>,
     /// The pen-down normals, `n0`.
@@ -156,6 +154,44 @@ fn finest_place(key: &TileKey, finest: Level, i: u32, j: u32) -> Option<(TileKey
     )
     .ok()?;
     Some((tile, a, b))
+}
+
+/// The vertices of display tile `key` inside finest tile `tile` (at level `finest`), its border
+/// included: each one's index in the tile and its place in the finest tile. None for a finest
+/// tile not under `key`.
+fn vertices_in(key: &TileKey, finest: Level, tile: &TileKey) -> Vec<(usize, u32, u32)> {
+    let quads = key.side() - 1;
+    let step = 1_u32 << (finest.get() - key.level().get());
+    let finest_quads = finest.tile_quads().max(1);
+    let span = (quads * step / finest_quads).max(1);
+    // Along one axis: the display vertices whose finest coordinate lies in the finest tile, and
+    // where.
+    let along = |t: u16, f: u16| -> Vec<(u32, u32)> {
+        let (t, f) = (u32::from(t), u32::from(f));
+        if f < t * span || f >= (t + 1) * span {
+            return Vec::new();
+        }
+        let origin = t * quads * step;
+        let (low, high) = (f * finest_quads - origin, (f + 1) * finest_quads - origin);
+        let first = low.div_ceil(step);
+        let last = (high / step).min(quads);
+        (first..=last)
+            .map(|i| (i, origin + i * step - f * finest_quads))
+            .collect()
+    };
+    if tile.face() != key.face() || tile.level() != finest {
+        return Vec::new();
+    }
+    let (columns, rows) = (along(key.tx(), tile.tx()), along(key.ty(), tile.ty()));
+    let side = usize::try_from(key.side()).unwrap_or(0);
+    let mut out = Vec::with_capacity(columns.len() * rows.len());
+    for &(j, row) in &rows {
+        for &(i, col) in &columns {
+            let v = usize::try_from(j).unwrap_or(0) * side + usize::try_from(i).unwrap_or(0);
+            out.push((v, col, row));
+        }
+    }
+    out
 }
 
 /// The finest tiles under display tile `key`, at `finest`.
@@ -274,34 +310,90 @@ impl Blocks {
 }
 
 impl DisplayState {
-    /// Makes display tile `key`'s preview over the store as it holds it now: its pen-down tile
-    /// and base (module notes), moved by `pending` (the dabs shown and not landed, a suffix of
-    /// `stroke`), its normals and bound over every dab of `stroke`. `None` if the store has no
-    /// record of the tile to draw (nor does a renderer).
+    /// Makes the previews of display tiles `keys` over the store as it holds it now: each its
+    /// pen-down tile and base (module notes), moved by `pending` (the dabs shown and not landed,
+    /// a suffix of `stroke`), its normals and bound over every dab of `stroke`. A tile the store
+    /// has no record of to draw (nor does a renderer) is left out.
+    ///
+    /// The records are decoded together and the finest blocks gathered once for all of them;
+    /// the previews are made on the store's workers.
     ///
     /// # Errors
     ///
     /// [`CacheError`] if a record or a finest tile can't be read.
-    pub(super) fn make(
+    pub(super) fn make_many(
         store: &mut TileStore,
-        key: TileKey,
+        keys: &[TileKey],
         stroke: &[Imprint],
         pending: &[Imprint],
-    ) -> Result<Option<Self>, CacheError> {
+    ) -> Result<Vec<Self>, CacheError> {
         let Some(finest_level) = store.display_finest() else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let Some(tile) = store.display_for_draw(&[key])?.pop().flatten() else {
-            return Ok(None);
-        };
-        let recorded_bound = store
-            .display_stored_error(&key)
-            .unwrap_or_else(|| tile.error());
-        let (displacement, blocks) = gather(store, &key, finest_level)?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tiles = store.display_for_draw(keys)?;
+        let mut inputs = Vec::new();
+        let mut changed = BTreeSet::new();
+        let mut at_pen_down = BTreeSet::new();
+        for (key, tile) in keys.iter().zip(tiles) {
+            let Some(tile) = tile else {
+                continue;
+            };
+            let recorded_bound = store
+                .display_stored_error(key)
+                .unwrap_or_else(|| tile.error());
+            let displacement = store.display_changes(key).map_or(0.0, |(d, under)| {
+                changed.extend(under.iter().copied());
+                d
+            });
+            for tile_key in finest_under(key, finest_level) {
+                let read = store.normal_inputs(&tile_key)?;
+                if read
+                    .iter()
+                    .any(|input| store.pen_down_shape(input).is_some())
+                {
+                    at_pen_down.insert(tile_key);
+                }
+            }
+            inputs.push((tile, recorded_bound, displacement));
+        }
+        let mut blocks = Blocks::default();
+        blocks.add_now(store, &changed)?;
+        blocks.add_pen_down(store, &at_pen_down)?;
+        let blocks = &blocks;
+        Ok(
+            store.par_map_mut(&mut inputs, |(tile, recorded_bound, displacement)| {
+                Self::build(
+                    tile,
+                    *recorded_bound,
+                    *displacement,
+                    finest_level,
+                    blocks,
+                    stroke,
+                    pending,
+                )
+            }),
+        )
+    }
+
+    /// Display tile `tile`'s preview (see [`DisplayState::make_many`]), its record's own bound
+    /// `recorded_bound`, the steps since moving a finest vertex under it `displacement` at most.
+    fn build(
+        tile: &DisplayTile,
+        recorded_bound: f32,
+        displacement: f32,
+        finest_level: Level,
+        blocks: &Blocks,
+        stroke: &[Imprint],
+        pending: &[Imprint],
+    ) -> Self {
+        let key = *tile.key();
         let side = usize::try_from(key.side()).unwrap_or(0);
-        let made = Replaced::of(&key, finest_level, tile.positions(), &blocks);
+        let made = Replaced::of(&key, finest_level, tile.positions(), blocks);
         let mut n0 = tile.normals().to_vec();
-        let normals = made.normals(&key, finest_level, tile.normals(), &blocks);
+        let normals = made.normals(&key, finest_level, tile.normals(), blocks);
         for (v, n) in normals {
             if let Some(slot) = n0.get_mut(v) {
                 *slot = n;
@@ -319,7 +411,6 @@ impl DisplayState {
         let ideal: Vec<[f64; 3]> = p0.iter().copied().map(wide).collect();
         let mut state = Self {
             key,
-            side,
             bounds: bounds_of_points(&p0),
             turn: vec![[Vec3::ZERO; 2]; p0.len()],
             drawn: base,
@@ -337,7 +428,7 @@ impl DisplayState {
         for (n, dab) in stroke.iter().enumerate() {
             state.take(dab, n >= landed);
         }
-        Ok(Some(state))
+        state
     }
 
     /// The tile.
@@ -407,32 +498,27 @@ impl DisplayState {
         pending: &[Imprint],
     ) -> bool {
         let mut any = false;
-        let side = u32::try_from(self.side).unwrap_or(0);
-        let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
-        for (v, (i, j)) in grid.enumerate() {
-            let Some((under, col, row)) = finest_place(&self.key, finest, i, j) else {
+        for under in changed {
+            let Some(block) = blocks.now.get(under) else {
                 continue;
             };
-            if !changed.contains(&under) {
-                continue;
-            }
-            let Some(block) = blocks.now.get(&under) else {
-                continue;
-            };
-            let (Some(out), Some(start)) = (self.drawn.get_mut(v), self.p0.get(v)) else {
-                continue;
-            };
-            let mut at = block.get(i64::from(col), i64::from(row));
-            for dab in pending {
-                if let Some(w) = draw_imprint_vertex(&Smoothstep, dab, [start.x, start.y, start.z])
-                    && w != 0.0
-                {
-                    let [x, y, z] = draw_move(dab, w);
-                    at = at + Vec3::new(x, y, z);
+            for (v, col, row) in vertices_in(&self.key, finest, under) {
+                let (Some(out), Some(start)) = (self.drawn.get_mut(v), self.p0.get(v)) else {
+                    continue;
+                };
+                let mut at = block.get(i64::from(col), i64::from(row));
+                for dab in pending {
+                    if let Some(w) =
+                        draw_imprint_vertex(&Smoothstep, dab, [start.x, start.y, start.z])
+                        && w != 0.0
+                    {
+                        let [x, y, z] = draw_move(dab, w);
+                        at = at + Vec3::new(x, y, z);
+                    }
                 }
+                *out = at;
+                any = true;
             }
-            *out = at;
-            any = true;
         }
         any
     }
@@ -487,40 +573,6 @@ impl DisplayState {
             held,
         }
     }
-}
-
-/// The finest blocks display tile `key` is made from, and how far the steps since its record
-/// moved a finest vertex under it.
-///
-/// The store's blocks of the finest tiles changed since the record, and the pen-down blocks of
-/// those whose blocks read a tile the stroke changed (module notes, "The pen-down tile"), at the
-/// finest level `finest_level`.
-///
-/// # Errors
-///
-/// [`CacheError`] if a finest tile can't be listed, evaluated or gathered.
-fn gather(
-    store: &mut TileStore,
-    key: &TileKey,
-    finest_level: Level,
-) -> Result<(f32, Blocks), CacheError> {
-    let (displacement, changed) = store
-        .display_changes(key)
-        .map_or((0.0, BTreeSet::new()), |(d, under)| (d, under.clone()));
-    let mut at_pen_down = BTreeSet::new();
-    for tile_key in finest_under(key, finest_level) {
-        let read = store.normal_inputs(&tile_key)?;
-        if read
-            .iter()
-            .any(|input| store.pen_down_shape(input).is_some())
-        {
-            at_pen_down.insert(tile_key);
-        }
-    }
-    let mut blocks = Blocks::default();
-    blocks.add_now(store, &changed)?;
-    blocks.add_pen_down(store, &at_pen_down)?;
-    Ok((displacement, blocks))
 }
 
 /// A display tile's record with the vertices inside the finest tiles gathered replaced: its base

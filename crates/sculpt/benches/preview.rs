@@ -27,6 +27,12 @@
 //! - [`big_dab_ridge`]: a whole dab of a big brush (radius [`BIG_RADIUS`], about 300 tiles), placed
 //!   and applied, on a ridge of its dabs: more changed tiles a dab than the store keeps placement's
 //!   pen-down positions made for.
+//! - [`show_far`]: [`Preview::show`] of the next dab of a stroke whose earlier dabs are all still
+//!   shown (none landed: the catch-up far behind), at about 70 tiles a dab ([`FAR_RADIUS`]) and for
+//!   the big brush (about 300 tiles, past a million vertices), drawn as a renderer far off draws
+//!   it: on the finest tiles alone (the preview before display tiles, every tile the dab reaches
+//!   moved and its display levels left to stand-ins), or on the display tiles of a coarse cut
+//!   ([`CUT`] levels below the finest) and every level above it, no finest tile drawn.
 
 #![expect(
     clippy::expect_used,
@@ -58,6 +64,16 @@ const RIDGE_DABS: u32 = 60;
 /// The big brush's radius, on the unit sphere: each dab reaches about 300 tiles, past the tiles
 /// the store keeps pen-down positions made for placement.
 const BIG_RADIUS: f32 = 0.9;
+
+/// The radius of [`show_far`]'s smaller brush: about 70 tiles a dab.
+const FAR_RADIUS: f32 = 0.35;
+
+/// The radius of [`show_far`]'s big brush: about a million vertices, some 240 tiles a dab.
+const MILLION_RADIUS: f32 = 0.73;
+
+/// How many levels below the finest [`show_far`]'s cut on display tiles is: a big brush seen from
+/// far enough that its 70 tiles fit a 40-pixel radius.
+const CUT: u8 = 4;
 
 /// The big brush's dabs applied before [`big_dab_ridge`].
 const BIG_DABS: u32 = 8;
@@ -103,6 +119,15 @@ impl Ridge {
     ///
     /// As [`Ridge::new`].
     fn of(radius: f32, dabs: u32) -> Self {
+        Self::made(radius, dabs, false)
+    }
+
+    /// [`Ridge::of`], with its display layer built first if `display`.
+    ///
+    /// # Panics
+    ///
+    /// As [`Ridge::new`].
+    fn made(radius: f32, dabs: u32, display: bool) -> Self {
         /// Distinguishes this process's directories.
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -111,14 +136,28 @@ impl Ridge {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("temporary directory");
+        let level = Level::new(LEVEL).expect("level");
+        let store = StoreConfig::new(1 << 30, 1);
         let config = ProjectConfig {
-            store: StoreConfig::new(1 << 30, 1),
+            store: if display {
+                store.with_display(level)
+            } else {
+                store
+            },
             recovery_dir: dir.join("recovery"),
         };
         let mut project = Project::new(cube_sphere(4).expect("sphere"), config).expect("project");
-        let level = Level::new(LEVEL).expect("level");
         for octave in 1..=LEVEL {
             sculpt_octave(&mut project, Level::new(octave).expect("level"));
+        }
+        if display {
+            project.store().queue_display_rebuild(level);
+            while project.store().has_jobs() {
+                project
+                    .store()
+                    .run_jobs(std::time::Instant::now() + std::time::Duration::from_millis(100))
+                    .expect("the display layer builds");
+            }
         }
         let index = SpatialIndex::build(project.store(), level, |_, _| {}).expect("index");
         let stroke = Stroke::new(project.store());
@@ -454,4 +493,81 @@ fn big_dab_ridge(bencher: divan::Bencher<'_, '_>) {
         f64::from(u32::try_from(ridge.project.store().pen_down_bytes()).unwrap_or(u32::MAX))
             / f64::from(1_u32 << 20)
     );
+}
+
+/// How [`show_far`] draws: the tiles a renderer holds.
+#[derive(Debug, Clone, Copy)]
+enum Drawing {
+    /// The finest tiles alone.
+    Finest,
+    /// The display tiles [`CUT`] levels below the finest and above.
+    Display,
+}
+
+impl Drawing {
+    /// Whether it draws `key`.
+    fn draws(self, key: &TileKey) -> bool {
+        match self {
+            Self::Finest => key.channel() != geom::Channel::DISPLAY,
+            Self::Display => {
+                key.channel() == geom::Channel::DISPLAY && key.level().get() + CUT <= LEVEL
+            }
+        }
+    }
+}
+
+/// [`Preview::show`] of a stroke's next dab, the earlier ones all shown: see the module notes.
+/// Its first eight dabs are shown before the timing, and each sample shows one more.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+#[divan::bench(
+    sample_count = 30,
+    sample_size = 1,
+    args = [("70 tiles, finest", FAR_RADIUS, Drawing::Finest),
+            ("70 tiles, display", FAR_RADIUS, Drawing::Display),
+            ("1M vertices, finest", MILLION_RADIUS, Drawing::Finest),
+            ("1M vertices, display", MILLION_RADIUS, Drawing::Display)]
+)]
+#[expect(
+    clippy::print_stderr,
+    reason = "a bench reports the footprint it measured beside divan's timings"
+)]
+fn show_far(bencher: divan::Bencher<'_, '_>, (what, radius, drawing): (&str, f32, Drawing)) {
+    let ridge = RefCell::new(Ridge::made(radius, 0, true));
+    {
+        let ridge = &mut *ridge.borrow_mut();
+        let first: Vec<Dab> = (0..8).map(|_| ridge.next_dab()).collect();
+        ridge
+            .preview
+            .show(
+                ridge.project.store(),
+                &ridge.index,
+                &first,
+                &|key: &TileKey| drawing.draws(key),
+            )
+            .expect("show");
+    }
+    bencher
+        .with_inputs(|| ridge.borrow_mut().next_dab())
+        .bench_local_values(|dab| {
+            let ridge = &mut *ridge.borrow_mut();
+            ridge
+                .preview
+                .show(
+                    ridge.project.store(),
+                    &ridge.index,
+                    &[dab],
+                    &|key: &TileKey| drawing.draws(key),
+                )
+                .expect("show")
+        });
+    let ridge = &mut *ridge.borrow_mut();
+    let tiles = ridge
+        .index
+        .query_sphere(ridge.direction(ridge.placed), radius)
+        .count();
+    let displays = ridge.project.store().display_previewed().count();
+    eprintln!("show_far {what}: {tiles} tiles a dab, {displays} display previews");
 }

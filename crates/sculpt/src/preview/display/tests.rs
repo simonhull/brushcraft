@@ -360,3 +360,39 @@ fn a_previews_normals_follow_the_moved_surface_as_the_refresh_makes_them() {
         assert!(rms < 10.0, "{key:?}: {rms}° rms (stale {stale})");
     }
 }
+
+#[test]
+fn the_vertices_in_a_finest_tile_are_those_placed_in_it() {
+    let finest = Level::new(9).unwrap();
+    for level in [0_u8, 1, 3, 6, 7, 8] {
+        let level = Level::new(level).unwrap();
+        let per_side = u16::try_from(level.tiles_per_side()).unwrap();
+        let key = TileKey::display(FaceId::new(2), level, per_side - 1, 0).unwrap();
+        let side = key.side();
+        for tile in super::finest_under(&key, finest) {
+            let found = super::vertices_in(&key, finest, &tile);
+            for (v, col, row) in &found {
+                let (i, j) = (
+                    u32::try_from(*v).unwrap() % side,
+                    u32::try_from(*v).unwrap() / side,
+                );
+                let (placed, a, b) = finest_place(&key, finest, i, j).unwrap();
+                // A vertex on a finest tile's border is in both tiles; placed in one of them.
+                if placed == tile {
+                    assert_eq!((a, b), (*col, *row), "{level:?}: ({i}, {j})");
+                }
+                assert!(*col <= 64 && *row <= 64);
+            }
+            let placed_here = (0..side * side)
+                .filter(|v| {
+                    let (i, j) = (v % side, v / side);
+                    finest_place(&key, finest, i, j).unwrap().0 == tile
+                })
+                .count();
+            assert!(
+                found.len() >= placed_here,
+                "{level:?}: every vertex placed in it is found"
+            );
+        }
+    }
+}
