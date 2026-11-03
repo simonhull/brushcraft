@@ -25,5 +25,6 @@ mod math;
 pub use draw::{draw, draw_vertex};
 pub use falloff::{Falloff, Smoothstep};
 pub use imprint::{
-    Hardened, Imprint, draw_imprint, draw_imprint_move, draw_imprint_vertex, draw_move,
+    Hardened, Imprint, draw_imprint, draw_imprint_gradient, draw_imprint_move, draw_imprint_vertex,
+    draw_move,
 };

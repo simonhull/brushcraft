@@ -8,6 +8,23 @@
 pub trait Falloff {
     /// The weight at normalised distance `t`: `1` at `t = 0`, `0` for `t ≥ 1`.
     fn weight(&self, t: f32) -> f32;
+
+    /// The weight's slope `d weight / dt` at normalised distance `t`: `0` outside `(0, 1)` (and for
+    /// a NaN `t`), where the weight is constant.
+    ///
+    /// What a caller moving a surface by the brush needs for the moved surface's normals (the
+    /// draw move's gradient, [`draw_imprint_gradient`](crate::draw_imprint_gradient)).
+    fn slope(&self, t: f32) -> f32;
+
+    /// The largest `|slope|` over `[0, 1]`: how fast the weight can change with `t`, what a bound
+    /// on the error of evaluating the falloff at a point off by some distance takes.
+    fn steepest(&self) -> f32;
+
+    /// The largest second derivative's magnitude over `[0, 1]` and the largest `|slope(t) / t|`,
+    /// the larger of the two: what bounds every second directional derivative of
+    /// `weight(|p − c| / r)` in space, times `1 / r²` (the radial one is the falloff's own second
+    /// derivative, the tangential ones its slope over the distance).
+    fn curvature(&self) -> f32;
 }
 
 /// The smoothstep falloff, `1 − (3t² − 2t³)`.
@@ -29,6 +46,29 @@ impl Falloff for Smoothstep {
             // `t ≥ 1`, or NaN.
             0.0
         }
+    }
+
+    /// `6t(t − 1)` inside `(0, 1)`, `0` elsewhere.
+    #[inline]
+    fn slope(&self, t: f32) -> f32 {
+        if t > 0.0 && t < 1.0 {
+            6.0 * t * (t - 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// `1.5`, at `t = 0.5`.
+    #[inline]
+    fn steepest(&self) -> f32 {
+        1.5
+    }
+
+    /// `6`: the second derivative `12t − 6` is at most 6 in magnitude, and so is
+    /// `slope(t) / t = 6(t − 1)`.
+    #[inline]
+    fn curvature(&self) -> f32 {
+        6.0
     }
 }
 
@@ -76,6 +116,34 @@ mod tests {
                 at(k + 1)
             );
         }
+    }
+
+    #[test]
+    fn smoothstep_slope_is_the_weights_derivative_and_within_its_bounds() {
+        let f = Smoothstep;
+        let h = 1e-3_f32;
+        for k in 1..STEPS - 1 {
+            let t = at(k);
+            let numeric = (f.weight(t + h) - f.weight(t - h)) / (2.0 * h);
+            assert!(
+                (numeric - f.slope(t)).abs() < 1e-2,
+                "slope at t = {t}: {numeric} vs {}",
+                f.slope(t)
+            );
+            assert!(
+                f.slope(t).abs() <= f.steepest(),
+                "steepest bounds the slope at {t}"
+            );
+            let second = (f.slope(t + h) - f.slope(t - h)) / (2.0 * h);
+            assert!(second.abs() <= f.curvature() + 1e-2, "curvature at {t}");
+            assert!(
+                (f.slope(t) / t).abs() <= f.curvature() + 1e-4,
+                "slope over t at {t}"
+            );
+        }
+        assert_eq!(f.slope(0.0), 0.0, "flat at the centre");
+        assert_eq!(f.slope(1.0), 0.0, "flat at the rim");
+        assert_eq!(f.slope(f32::NAN), 0.0, "no slope for a NaN distance");
     }
 
     #[test]
