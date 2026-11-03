@@ -198,9 +198,16 @@ struct LodFrame {
     need_bucket: u32,
     // See need_bucket.
     need_bin: u32,
-    // Budget units of the first fine bin the budget's choice couldn't take: with the held tiles'
-    // charge, what can be left unspent.
+    // Budget units of the first fine bin the budget's choice couldn't take: with held_charge,
+    // what can be left unspent.
     slack: u32,
+    // Budget units of the held tiles.
+    held_charge: atomic<u32>,
+    // Budget units of what the budget's choice made: the level-0 tiles' and what it admitted
+    // (charged is what its thresholds took, admitted or not).
+    made_charge: atomic<u32>,
+    // Spreading passes that raised a need: NEED_PASSES if the last did (not settled).
+    need_passes: u32,
     // Past here, scratch the readback leaves out (render::lod::GpuFrame stops before it).
     // Budget units of every tile needing refining, by bucket of its need.
     need_histogram: array<atomic<u32>, BUCKETS>,
@@ -297,6 +304,11 @@ const W_OUTSIDE: u32 = 4096u;
 // May be drawn if in the cut: emit doesn't certainly cull it (see choose). What the budget
 // charges.
 const W_DRAWS: u32 = 8192u;
+// Every ancestor complete (close): the tile can be reached, so its refinement can be made.
+const W_REACHABLE: u32 = 16384u;
+// The budget's choice: needing refining, but a neighbour its seams need reached can't be (absent,
+// or under an incomplete tile), so it can never be refined, nor anything under it (need_block).
+const W_BLOCKED: u32 = 32768u;
 // LodParams.options: seams of tiles outside the frustum are exempt from the neighbour rule.
 const OPTION_OFFSCREEN_SEAMS: u32 = 1u;
 // NodeWork.memory: the tile was refined last frame.
@@ -735,6 +747,7 @@ fn close(@builtin(global_invocation_id) id: vec3<u32>) {
     var ancestor = tree[n].parent;
     var effective = work[n].rank;
     var closed = true;
+    var reachable = true;
     // At most one step per level: the walk ends at level 0, or at a missing ancestor (the
     // tile is then unreachable).
     for (var guard = 0u; guard < 16u && level > 0u; guard++) {
@@ -745,6 +758,9 @@ fn close(@builtin(global_invocation_id) id: vec3<u32>) {
         if (fa & (W_WANTS | W_COMPLETE)) != (W_WANTS | W_COMPLETE) {
             closed = false;
         }
+        if (fa & W_COMPLETE) == 0u {
+            reachable = false;
+        }
         effective = min(effective, work[ancestor].rank);
         level = level_of(tree[ancestor].place);
         ancestor = tree[ancestor].parent;
@@ -753,6 +769,9 @@ fn close(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     work[n].effective = effective;
+    if reachable {
+        atomicOr(&work[n].flags, W_REACHABLE);
+    }
     if !closed {
         return;
     }
@@ -933,9 +952,13 @@ fn seams_hold(n: u32) -> bool {
 // 1. budget_begin: clears its counts and buckets; the charge starts at the level-0 tiles'.
 // 2. need_init: forgets mark's, the relaxation's and the sweep's choice; a tile that wants
 //    refining and could be (closed, complete) needs it at its capped rank, any other not at all.
-// 3. need_spread, NEED_PASSES passes, those after one that raised nothing returning at once:
+// 3. need_spread, NEED_PASSES passes (twice the levels and two: a cascade through tiles that
+//    don't want refining climbs a level each lateral hop and each child-to-parent hop), those
+//    after one that raised nothing returning at once:
 //    the tiles the neighbour rule and the tree need for those, at the need of the tile they let
 //    through.
+// 3b. need_block: tiles whose seams need a neighbour that can't be reached are blocked, they and
+//    what is under them never counted.
 // 4. need_count and need_threshold, then need_fine_count and need_fine_threshold: the need the
 //    budget takes down to, by bucket then fine bin, each whole.
 // 5. admit, a level at a time, coarse to fine: every tile needing refining at or above that,
@@ -960,7 +983,10 @@ fn budget_begin(@builtin(local_invocation_index) t: u32) {
     atomicStore(&frame.charged, (atomicLoad(&frame.base) + UNIT - 1u) / UNIT);
     atomicStore(&frame.admitted, 0u);
     atomicStore(&frame.held, 0u);
+    atomicStore(&frame.held_charge, 0u);
+    atomicStore(&frame.made_charge, (atomicLoad(&frame.base) + UNIT - 1u) / UNIT);
     atomicStore(&frame.shortfall, 0u);
+    frame.need_passes = 0u;
     frame.need_bucket = BUCKETS;
     frame.need_bin = FINE_BINS;
     frame.slack = 0u;
@@ -983,7 +1009,10 @@ fn need_init(@builtin(global_invocation_id) id: vec3<u32>) {
     if n >= params.capacity {
         return;
     }
-    let f = atomicAnd(&work[n].flags, ~(W_REFINED | W_FINAL | W_SHORT | W_HELD | W_REFUSED));
+    let f = atomicAnd(
+        &work[n].flags,
+        ~(W_REFINED | W_FINAL | W_SHORT | W_HELD | W_REFUSED | W_BLOCKED),
+    );
     let needed = W_LIVE | W_CLOSED | W_WANTS | W_COMPLETE;
     work[n].rank = select(-1.0, work[n].effective, (f & needed) == needed);
 }
@@ -1023,7 +1052,7 @@ fn need_spread(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let m = tree[n].neighbours[k];
         let across = need_of(m);
-        if across <= need {
+        if across <= need || offscreen_pair(n, m) {
             continue;
         }
         for (var back = 0u; back < 4u; back++) {
@@ -1046,12 +1075,68 @@ fn need_spread(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
-// Whether node `n` is a refinement the budget's choice can count: live, complete, needing
-// refining, charged something (one charged nothing is admitted whatever its need).
+// Whether the seams between node `n`'s children and its neighbour `m`'s along their shared edge
+// are off the screen, as seams_hold judges them once `n` is in the cut: `n` or `m` (the finer
+// side's ancestor at `n`'s level) outside the frustum, with the option on. The need doesn't
+// spread across such a seam, as the neighbour rule doesn't hold there.
+fn offscreen_pair(n: u32, m: u32) -> bool {
+    if (params.options & OPTION_OFFSCREEN_SEAMS) == 0u {
+        return false;
+    }
+    return ((flags_of(n) | flags_of(m)) & W_OUTSIDE) != 0u;
+}
+
+// Whether node `n` is a refinement the budget's choice can count: live, complete, reachable
+// (every ancestor complete: one that isn't, admit never reaches, so its charge would be spent on
+// nothing), needing refining, charged something (one charged nothing is admitted whatever its
+// need).
 fn need_candidate(n: u32) -> bool {
-    return (flags_of(n) & (W_LIVE | W_COMPLETE)) == (W_LIVE | W_COMPLETE)
+    let all = W_LIVE | W_COMPLETE | W_REACHABLE;
+    return (flags_of(n) & all) == all
         && work[n].rank >= 0.0
+        && !blocked(n)
         && charge_units(n) > 0u;
+}
+
+// Whether node `n` or an ancestor is blocked (need_block): it can never be refined.
+fn blocked(n: u32) -> bool {
+    var at = n;
+    // At most one step per level.
+    for (var guard = 0u; guard < 16u && at != NONE; guard++) {
+        if (flags_of(at) & W_BLOCKED) != 0u {
+            return true;
+        }
+        at = tree[at].parent;
+    }
+    return false;
+}
+
+// The budget's choice, after spreading: a tile needing refining one of whose seams needs a
+// neighbour of its level reached that can't be (absent, or under an incomplete tile), the seam
+// not off the screen, is blocked: admit would hold it whatever the budget, so neither it nor
+// anything under it is counted, and the budget goes to tiles it can refine.
+@compute @workgroup_size(64)
+fn need_block(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if n >= params.capacity || work[n].rank < 0.0 {
+        return;
+    }
+    let f = flags_of(n);
+    if (f & (W_LIVE | W_COMPLETE)) != (W_LIVE | W_COMPLETE) {
+        return;
+    }
+    for (var k = 0u; k < 4u; k++) {
+        if ((tree[n].edges >> k) & 1u) == 0u {
+            continue;
+        }
+        let m = tree[n].neighbours[k];
+        let outside = (params.options & OPTION_OFFSCREEN_SEAMS) != 0u
+            && ((f | select(0u, flags_of(m), m != NONE)) & W_OUTSIDE) != 0u;
+        if !outside && (m == NONE || (flags_of(m) & W_REACHABLE) == 0u) {
+            atomicOr(&work[n].flags, W_BLOCKED);
+            return;
+        }
+    }
 }
 
 // Fine bins of a bucket of need: FINE_SUBS slices of its range, each split by level, coarse
@@ -1087,6 +1172,11 @@ fn need_count(@builtin(global_invocation_id) id: vec3<u32>) {
 // one it can't (need_bucket); 0 if it takes every one, BUCKETS if the level-0 tiles leave none.
 @compute @workgroup_size(1)
 fn need_threshold() {
+    for (var k = 0u; k < NEED_PASSES; k++) {
+        if atomicLoad(&frame.spread_changes[k]) != 0u {
+            frame.need_passes = k + 1u;
+        }
+    }
     let budget = params.budget / UNIT;
     var total = atomicLoad(&frame.charged);
     if total > budget {
@@ -1173,6 +1263,13 @@ fn admit(@builtin(global_invocation_id) id: vec3<u32>) {
         || !reached_final(n) {
         return;
     }
+    if blocked(n) {
+        // Never counted: its seams can't hold.
+        atomicOr(&work[n].flags, W_SHORT);
+        atomicAdd(&frame.held, 1u);
+        atomicAdd(&frame.shortfall, 1u);
+        return;
+    }
     if charge_units(n) > 0u && !above_threshold(n) {
         atomicOr(&work[n].flags, W_HELD);
         return;
@@ -1180,9 +1277,11 @@ fn admit(@builtin(global_invocation_id) id: vec3<u32>) {
     if seams_hold(n) {
         atomicOr(&work[n].flags, W_REFINED | W_FINAL);
         atomicAdd(&frame.admitted, 1u);
+        atomicAdd(&frame.made_charge, charge_units(n));
     } else {
         atomicOr(&work[n].flags, W_SHORT);
         atomicAdd(&frame.held, 1u);
+        atomicAdd(&frame.held_charge, charge_units(n));
         atomicAdd(&frame.shortfall, 1u);
     }
 }

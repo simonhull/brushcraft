@@ -52,7 +52,10 @@
 //!     and the level, coarse first), to within a bin of the budget; and a level at a time, coarse
 //!     to fine, every tile needing refining at or above it whose seams hold is refined. Bins
 //!     summed, never a race for what is left: the same cut every frame, whatever order the threads
-//!     ran in. A refinement charged nothing is refined whatever its rank.
+//!     ran in. A refinement charged nothing is refined whatever its rank. A tile that can't be
+//!     reached (an ancestor incomplete), or whose seams need a neighbour that can't be, is never
+//!     counted, nor anything under it: its charge would be spent on nothing. The charge reported is
+//!     what the choice made, the level-0 tiles' and the refinements admitted.
 //!   - These passes are always encoded and run only when the budget binds: the GPU decides
 //!     (`gate.wgsl`'s `binds` sets their dispatches to no workgroup otherwise), so the first frame
 //!     the budget binds in is chosen by them too. Without the budget binding, the choice is mark's,
@@ -640,6 +643,12 @@ struct GpuFrame {
     need_bin: u32,
     /// Budget units of the first fine bin it couldn't take.
     slack: u32,
+    /// Budget units of the held tiles.
+    held_charge: u32,
+    /// Budget units of what the budget's choice made: the level-0 tiles' and what it admitted.
+    made_charge: u32,
+    /// Spreading passes that raised a need ([`NEED_PASSES`] if the last did).
+    need_passes: u32,
 }
 
 /// The frame buffer past [`GpuFrame`], which the readback leaves out: the buckets and fine bins
@@ -659,9 +668,12 @@ struct GpuScratch {
 /// Fine bins of a bucket of need: 128 slices of its range, each split by 16 levels.
 const FINE_BINS: usize = 2048;
 
-/// Spreading passes the budget's choice runs; those after one that raised no need return at
-/// once.
-pub const NEED_PASSES: u32 = MAX_RELAX_PASSES;
+/// Spreading passes the budget's choice runs: twice the levels and two.
+///
+/// Those after one that raised no need return at once. A cascade through tiles that don't want
+/// refining (to the back faces at level 0, past a silhouette) climbs a level with each lateral hop
+/// (a neighbour's child needs it) and each child-to-parent one, about two passes a level.
+pub const NEED_PASSES: u32 = 2 * geom::MAX_LEVEL as u32 + 2;
 
 /// The bytes of [`GpuFrame`]: what the readback copies of the frame buffer.
 const FRAME_BYTES: u64 = size_of::<GpuFrame>() as u64;
@@ -973,17 +985,24 @@ pub struct LodStats {
     /// could take nothing past the level-0 tiles). [`LodStats::budget_error`] in pixels.
     pub budget_bucket: Option<u32>,
     /// Where the budget bound, triangles it may have left unspent: the first fine bin it
-    /// couldn't take, and the charge of the tiles [`LodStats::held`].
+    /// couldn't take, and the charge of the tiles it took but [`LodStats::held`].
     pub budget_slack: u32,
     /// The histogram bucket mark couldn't take whole, if any (the budget then binds); `None`
     /// when it took every bucket, or when the level-0 tiles alone were over the budget.
     pub mark_bucket: Option<u32>,
     /// Raises the relaxation couldn't fit in the budget (which makes it bind).
     pub relax_refused: u32,
+    /// Where the budget bound, the spreading passes that raised a need.
+    pub need_passes: u32,
+    /// Where the budget bound, whether the need was still spreading after the last pass
+    /// ([`NEED_PASSES`]): then the cut may depend on the order the threads ran in.
+    pub need_unsettled: bool,
     /// Refinements the budget's choice admitted.
     pub admitted: u32,
-    /// Tiles the budget's choice took whose seams didn't hold (none once the need has
-    /// settled): counted in [`LodStats::shortfall`] too.
+    /// Tiles needing refining the budget's choice didn't refine for their seams: those whose
+    /// seams need a neighbour that can't be reached (absent, or under an incomplete tile), never
+    /// charged, and those it took whose seams didn't hold (none once the need has settled),
+    /// whose charge is in [`LodStats::budget_slack`]. Counted in [`LodStats::shortfall`] too.
     pub held: u32,
     /// Clusters, retries and cut entries past their lists' ends: zero unless a list is too
     /// small.
@@ -1354,6 +1373,8 @@ struct Pipelines {
     need_init: ComputePipeline,
     /// `need_spread`.
     need_spread: ComputePipeline,
+    /// `need_block`.
+    need_block: ComputePipeline,
     /// `need_count`.
     need_count: ComputePipeline,
     /// `need_threshold`.
@@ -1756,6 +1777,7 @@ impl Lod {
         }
         pass.set_bind_group(0, group, &[0]);
         for (pipeline, slot) in [
+            (&p.need_block, every),
             (&p.need_count, every),
             (&p.need_threshold, once),
             (&p.need_fine_count, every),
@@ -2285,6 +2307,7 @@ impl Pipelines {
             budget_begin: make("budget_begin")?,
             need_init: make("need_init")?,
             need_spread: make("need_spread")?,
+            need_block: make("need_block")?,
             need_count: make("need_count")?,
             need_threshold: make("need_threshold")?,
             need_fine_count: make("need_fine_count")?,
@@ -2445,7 +2468,7 @@ fn stats(frame: &GpuFrame) -> LodStats {
         cut: frame.cut_count,
         cut_triangles: frame.cut_triangles,
         refined_triangles: if binds {
-            frame.charged
+            frame.made_charge
         } else {
             frame.triangles
         }
@@ -2472,10 +2495,15 @@ fn stats(frame: &GpuFrame) -> LodStats {
         budget_binds: binds,
         budget_bucket: (binds && stopped && frame.need_bin != 0).then_some(frame.need_bucket),
         budget_slack: if binds {
-            frame.slack.saturating_mul(BUDGET_UNIT)
+            frame
+                .slack
+                .saturating_add(frame.held_charge)
+                .saturating_mul(BUDGET_UNIT)
         } else {
             0
         },
+        need_passes: if binds { frame.need_passes } else { 0 },
+        need_unsettled: binds && frame.need_passes >= NEED_PASSES,
         mark_bucket: usize::try_from(frame.partial)
             .is_ok_and(|bucket| bucket < BUCKETS)
             .then_some(frame.partial),

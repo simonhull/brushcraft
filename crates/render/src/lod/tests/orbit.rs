@@ -198,6 +198,8 @@ struct Measured {
     cut: (u32, u32),
     /// The most triangles the refinements were charged.
     charged: u32,
+    /// The most spreading passes the budget's choice needed, and whether one didn't settle.
+    need_passes: (u32, bool),
     /// Per frame, the stages' GPU times.
     timings: Vec<LodTimings>,
 }
@@ -249,6 +251,10 @@ fn orbit(
         measured.shortfall = measured.shortfall.max(stats.shortfall);
         measured.over_pixel = measured.over_pixel.max(stats.over_pixel);
         measured.charged = measured.charged.max(stats.refined_triangles);
+        measured.need_passes = (
+            measured.need_passes.0.max(stats.need_passes),
+            measured.need_passes.1 || stats.need_unsettled,
+        );
         measured.cut = (
             measured.cut.0.max(stats.cut),
             measured.cut.1.max(stats.cut_triangles),
@@ -343,7 +349,7 @@ fn orbit_relaxation_passes_and_timings_at_the_benchmark_tree_shape() {
                         let steady = measured.passes.iter().skip(1).copied().max().unwrap_or(0);
                         measured.timings.remove(0);
                         println!(
-                            "{}, {}, {width}×{height}, distance {distance}, off-screen seams {}{}: passes p50 {median} max {max} (after frame 0: {steady}), shortfall max {}, over 1 px max {}, cut max {} tiles {} triangles, charged max {} triangles; {}",
+                            "{}, {}, {width}×{height}, distance {distance}, off-screen seams {}{}: passes p50 {median} max {max} (after frame 0: {steady}), shortfall max {}, over 1 px max {}, cut max {} tiles {} triangles, charged max {} triangles, spreading passes max {} (unsettled {}); {}",
                             shape.label,
                             if rough { "rough" } else { "smooth" },
                             if exempt { "exempt" } else { "held" },
@@ -353,6 +359,8 @@ fn orbit_relaxation_passes_and_timings_at_the_benchmark_tree_shape() {
                             measured.cut.0,
                             measured.cut.1,
                             measured.charged,
+                            measured.need_passes.0,
+                            measured.need_passes.1,
                             stages(&measured.timings),
                         );
                     }

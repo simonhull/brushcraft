@@ -172,7 +172,7 @@ fn a_binding_budget_is_filled_to_within_its_slack() {
 }
 
 #[test]
-fn tiles_out_of_view_or_facing_away_spend_nothing() {
+fn tiles_certainly_culled_out_of_view_or_facing_away_spend_nothing() {
     GpuTest::run(|gpu| {
         let (mut plain, view) = sphere(gpu);
         let unlimited = choose(gpu, &mut plain, &view, None);
@@ -180,6 +180,7 @@ fn tiles_out_of_view_or_facing_away_spend_nothing() {
         let expected = choose(gpu, &mut plain, &view, Some(budget));
         let (mut scene, _) = sphere(gpu);
         inflate(&mut scene, |s, place| far_side(s, &view, place));
+        // No morph: every tile facing away is settled, so certainly culled.
         let inflated = choose(gpu, &mut scene, &view, Some(budget));
         check_partition(&scene, &inflated);
         assert_eq!(
@@ -520,6 +521,184 @@ fn with_the_morph_on_the_tiles_drawn_facing_away_are_charged_and_the_budget_boun
                 assert_filled(&output, budget);
             }
             assert_eq!(stats.overflow, (0, 0, 0), "{stats:?}");
+        }
+    });
+}
+
+/// Whether `place`'s tile lies wholly outside `view`'s frustum, by its own sphere with a margin.
+fn out_of_view(scene: &Scene, view: &View, place: Place) -> bool {
+    let b = scene.bounds[&place];
+    !in_frustum(&view.gpu(), b.center, b.radius * 1.01)
+}
+
+#[test]
+fn with_the_morph_on_tiles_out_of_view_spend_nothing() {
+    GpuTest::run(|gpu| {
+        // Close enough that part of the sphere lies out of the frustum.
+        let close = look(Vec3::new(0.2, 0.3, 1.3), Vec3::default());
+        let (mut plain, _) = sphere(gpu);
+        let config = LodConfig::default()
+            .with_relax_passes(MAX_RELAX_PASSES)
+            .expect("valid");
+        let unlimited = {
+            let mut lod = Lod::new(gpu, plain.tree.capacity(), config).expect("the level choice");
+            run_morphing(gpu, &mut lod, &mut plain, &close, 1.0)
+        };
+        let config = config.with_triangle_budget(unlimited.stats.drawn_triangles / 3);
+        let mut capped = Lod::new(gpu, plain.tree.capacity(), config).expect("the level choice");
+        let expected = run_morphing(gpu, &mut capped, &mut plain, &close, 1.0);
+        let (mut scene, _) = sphere(gpu);
+        let mut picked = 0;
+        inflate(&mut scene, |s, place| {
+            let out = out_of_view(s, &close, place);
+            picked += usize::from(out);
+            out
+        });
+        assert!(picked > 0, "tiles out of view");
+        let mut again = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+        let inflated = run_morphing(gpu, &mut again, &mut scene, &close, 1.0);
+        check_partition(&scene, &inflated);
+        assert!(inflated.stats.budget_binds, "{:?}", inflated.stats);
+        assert_eq!(
+            inflated.drawn, expected.drawn,
+            "the tiles drawn: {:?} against {:?}",
+            inflated.stats, expected.stats
+        );
+        assert_eq!(
+            inflated.stats.refined_triangles, expected.stats.refined_triangles,
+            "the charge"
+        );
+    });
+}
+
+#[test]
+fn a_cascade_past_the_silhouette_to_the_back_faces_settles_and_keeps_the_cut() {
+    GpuTest::run(|gpu| {
+        // Deep detail just in front of the silhouette (levels 8 and 9 inflated, cube_sphere(1)
+        // to level 10): its neighbours across the silhouette face away and want nothing, so the
+        // neighbour rule needs them and their ancestors, back faces down to level 0, raised level
+        // by level.
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut scene = Scene::new(gpu, mesh, level(10), |_| true, |_| 1.0);
+        let view = look(Vec3::new(0.4, 0.6, 2.6), Vec3::default());
+        let eye = view.gpu().eye;
+        let length = (eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2]).sqrt();
+        inflate(&mut scene, |s, place| {
+            let c = s.bounds[&place].center;
+            let along = (c[0] * eye[0] + c[1] * eye[1] + c[2] * eye[2]) / length;
+            place.level() >= level(8) && (0.0..0.15).contains(&along)
+        });
+        let unlimited = choose(gpu, &mut scene, &view, None);
+        let config = LodConfig::default()
+            .with_triangle_budget(unlimited.stats.drawn_triangles / 2)
+            .with_relax_passes(MAX_RELAX_PASSES)
+            .expect("valid");
+        let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+        let requests = request_buffer(gpu, 4096);
+        let outputs: Vec<LodOutput> = (0..4)
+            .map(|_| run(gpu, &mut lod, &mut scene, &requests, &view, None, None))
+            .collect();
+        let first = outputs.first().expect("frames");
+        assert!(first.stats.budget_binds, "{:?}", first.stats);
+        println!("spreading passes needed: {}", first.stats.need_passes);
+        for (frame, output) in outputs.iter().enumerate() {
+            assert!(
+                !output.stats.need_unsettled,
+                "frame {frame}: {:?}",
+                output.stats
+            );
+            check_partition(&scene, output);
+            check_neighbours(&scene, output, Some(&view));
+        }
+        let settled = outputs.get(1).expect("frames");
+        for (frame, output) in outputs.iter().enumerate().skip(2) {
+            assert_eq!(output.cut, settled.cut, "frame {frame}: {:?}", output.stats);
+        }
+    });
+}
+
+#[test]
+fn needs_under_an_absent_tile_are_not_charged_and_the_budget_is_still_filled() {
+    GpuTest::run(|gpu| {
+        // A few level-7 tiles in view absent while all their descendants stay: their parents
+        // are incomplete, so nothing under them can be reached, whatever it needs.
+        let (probe, view) = sphere(gpu);
+        let absent: BTreeSet<Place> = probe
+            .bounds
+            .keys()
+            .copied()
+            .filter(|p| p.level() == level(7))
+            .filter(|p| near_the_facing_point(&probe, &view, *p, 0.4))
+            .step_by(3)
+            .collect();
+        assert!(!absent.is_empty(), "tiles to leave out");
+        drop(probe);
+        let mesh = cube_sphere(4).expect("a mesh");
+        let mut scene = Scene::new(gpu, mesh, level(8), |p| !absent.contains(&p), |_| 1.0);
+        inflate(&mut scene, |s, place| {
+            near_the_facing_point(s, &view, place, 0.5)
+        });
+        let unlimited = choose(gpu, &mut scene, &view, None);
+        let budget = unlimited.stats.drawn_triangles / 3;
+        let capped = choose(gpu, &mut scene, &view, Some(budget));
+        check_partition(&scene, &capped);
+        check_neighbours(&scene, &capped, Some(&view));
+        assert_filled(&capped, budget);
+        // Nothing counted that can't be refined: what is left is the stopping bin, a tile or two.
+        let unspent = budget - capped.stats.refined_triangles;
+        assert!(
+            unspent <= 2 * 4 * 2 * 64 * 64,
+            "{unspent} unspent: {:?}",
+            capped.stats
+        );
+    });
+}
+
+#[test]
+fn a_camera_moving_slowly_at_the_budget_s_edge_never_swaps_back_and_forth() {
+    GpuTest::run(|gpu| {
+        let (mut scene, view) = sphere(gpu);
+        inflate(&mut scene, |s, place| {
+            near_the_facing_point(s, &view, place, 0.15)
+        });
+        let unlimited = choose(gpu, &mut scene, &view, None);
+        let config = LodConfig::default()
+            .with_triangle_budget(unlimited.stats.drawn_triangles * 9 / 10)
+            .with_relax_passes(MAX_RELAX_PASSES)
+            .expect("valid");
+        let mut lod = Lod::new(gpu, scene.tree.capacity(), config).expect("the level choice");
+        let requests = request_buffer(gpu, 4096);
+        let mut cuts: Vec<BTreeSet<TileKey>> = Vec::new();
+        let mut binding = 0;
+        for frame in 0..24_u32 {
+            // A slow orbit: a tenth of a degree a frame, each view seen twice.
+            let angle = f64::from(frame / 2) * 0.1_f64.to_radians();
+            let eye = Vec3::new(2.7 * angle.sin(), 0.6, 2.7 * angle.cos());
+            let output = run(
+                gpu,
+                &mut lod,
+                &mut scene,
+                &requests,
+                &look(eye, Vec3::default()),
+                None,
+                None,
+            );
+            binding += usize::from(output.stats.budget_binds);
+            cuts.push(output.cut);
+        }
+        assert!(binding > 0, "the budget binds");
+        for at in 2..cuts.len() {
+            let (a, b, c) = (&cuts[at - 2], &cuts[at - 1], &cuts[at]);
+            assert!(
+                !(a != b && a == c),
+                "frames {} to {at} swap back and forth",
+                at - 2
+            );
+        }
+        // Each view seen twice: the second frame of a still view keeps the first's cut, after
+        // the first frame's hysteresis has settled.
+        for pair in cuts.chunks(2).skip(1) {
+            assert_eq!(pair[0], pair[1], "a still view's cut changed");
         }
     });
 }
