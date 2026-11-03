@@ -263,10 +263,10 @@ impl SpatialIndex {
         // The store first: the tree's refit changes nothing when it fails, and can't fail here
         // (every key is known), so a failure leaves the index as it was.
         store.record_bounds(&changed)?;
-        let boxes: Vec<(TileKey, TileBounds)> = changed
-            .into_iter()
-            .map(|(key, bounds)| (key, over_pen_down(store, &key, bounds)))
-            .collect();
+        let mut boxes = changed;
+        for (key, bounds) in &mut boxes {
+            *bounds = over_pen_down(store, key, *bounds);
+        }
         self.bvh.refit(&boxes)
     }
 

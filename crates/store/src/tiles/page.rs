@@ -356,17 +356,20 @@ impl TileStore {
         outcome
     }
 
-    /// Whether pinning `keys` fits the budget: the chunks each pool needs to hold its pinned
-    /// slots besides these tiles, one slot per tile, and the store's own headroom (an
-    /// evaluation's pins, and the correction slot it loads), against the budget. Slots are
-    /// counted as if packed into chunks; pins spread over chunks can still run a pool out of
-    /// room later.
+    /// Whether pinning `keys` fits the budget: `needed`, the bytes pinning them needs
+    /// ([`TileStore::pin_bytes`]: the chunks each pool needs to hold its pinned slots besides
+    /// these tiles, one slot per tile, and the store's own headroom, an evaluation's pins and the
+    /// correction slot it loads), against the budget. Slots are counted as if packed into chunks;
+    /// pins spread over chunks can still run a pool out of room later.
     ///
     /// # Errors
     ///
     /// [`CacheError::OverBudget`].
-    pub(super) fn check_pin_budget(&self, keys: &BTreeSet<TileKey>) -> Result<(), CacheError> {
-        let needed = self.pin_bytes(keys);
+    pub(super) fn check_pin_budget(
+        &self,
+        keys: &BTreeSet<TileKey>,
+        needed: usize,
+    ) -> Result<(), CacheError> {
         if needed > self.budget.limit() {
             return Err(CacheError::OverBudget {
                 tiles: keys.len(),
@@ -377,9 +380,9 @@ impl TileStore {
         Ok(())
     }
 
-    /// The bytes pinning `keys` needs (see [`TileStore::check_pin_budget`]): the chunks each pool
-    /// needs for its pinned slots besides these tiles, one slot per tile, and the store's own
-    /// headroom.
+    /// The bytes pinning `keys` needs: the chunks each pool needs for its pinned slots besides
+    /// these tiles, one slot per tile, and the store's own headroom (see
+    /// [`TileStore::check_pin_budget`]).
     pub(super) fn pin_bytes(&self, keys: &BTreeSet<TileKey>) -> usize {
         /// Bytes of chunks `pool` needs for its pinned slots outside `keys`, one per key, and
         /// `headroom` more.

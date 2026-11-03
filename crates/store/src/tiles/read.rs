@@ -287,10 +287,11 @@ impl TileStore {
         for key in &keys {
             self.check_key(key)?;
         }
-        // The pen-down data a stroke keeps is withheld from the pools now, beside these pins.
+        // The pen-down data a stroke keeps is withheld from the pools now, beside these pins:
+        // withholding pins nothing, so the bytes they need are the same after it.
         let needed = self.pin_bytes(&keys);
         self.withhold_pen_down(needed);
-        self.check_pin_budget(&keys)?;
+        self.check_pin_budget(&keys, needed)?;
         let mut set = Vec::with_capacity(keys.len());
         let pinned = self.in_batches(&keys, Targets::Pinned, |store, batch| {
             store.pin_batch(batch, &mut set)
