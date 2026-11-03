@@ -700,7 +700,8 @@ fn spawn_ours(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (event_loop, window, undecorated);
+        // Nothing starts: what it was given goes back unused.
+        drop((event_loop, window, undecorated));
         Err(anyhow::anyhow!(
             "there is no pen backend of ours on this platform"
         ))
