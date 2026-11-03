@@ -457,6 +457,9 @@ impl CacheCaps {
     }
 }
 
+/// The most tiles to build [`Upkeep::prioritise`] ranks again: a frame's worth of lookups.
+const RANKED_AT_MOST: usize = 2048;
+
 /// Where a tile to build goes among an [`Upkeep`]'s: under a tile to build first, or after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Rank {
@@ -509,13 +512,19 @@ impl Upkeep {
     }
 
     /// Builds the subtrees of `roots` first: every tile still to build under one of them (or one
-    /// of them) goes before the others, finest level first as ever. The same roots again change
-    /// nothing.
+    /// of them) goes before the others, finest level first as ever.
+    ///
+    /// Roots add up over the job, and only a new one costs anything: the tiles to build are
+    /// ranked again, each by its few ancestors, unless they are more than [`RANKED_AT_MOST`] (a
+    /// whole layer's rebuild), when only tiles pushed from now on are ranked.
     pub(crate) fn prioritise(&mut self, roots: &BTreeSet<TileKey>) {
-        if *roots == self.first {
+        if roots.is_subset(&self.first) {
             return;
         }
-        self.first.clone_from(roots);
+        self.first.extend(roots.iter().copied());
+        if self.pending.len() > RANKED_AT_MOST {
+            return;
+        }
         let pending = std::mem::take(&mut self.pending);
         self.pending = pending
             .into_iter()
@@ -526,16 +535,16 @@ impl Upkeep {
     /// Where `key` goes among the tiles to build: first if it is under (or is) a tile to build
     /// first.
     fn rank(&self, key: &TileKey) -> Rank {
-        let under = |root: &TileKey| {
-            if root.face() != key.face() || root.level() > key.level() {
-                return false;
-            }
-            let scale = key.level().tiles_per_side() / root.level().tiles_per_side().max(1);
-            let scale = scale.max(1);
-            (u32::from(key.tx()) / scale, u32::from(key.ty()) / scale)
-                == (u32::from(root.tx()), u32::from(root.ty()))
+        let per_side = key.level().tiles_per_side();
+        let ancestor = |l: u8| {
+            let level = Level::new(l).ok()?;
+            let scale = (per_side / level.tiles_per_side().max(1)).max(1);
+            let (x, y) = (u32::from(key.tx()) / scale, u32::from(key.ty()) / scale);
+            let (x, y) = (u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+            TileKey::display(key.face(), level, x, y).ok()
         };
-        if self.first.iter().any(under) {
+        let mut above = (0..=key.level().get()).filter_map(ancestor);
+        if above.any(|root| self.first.contains(&root)) {
             Rank::First
         } else {
             Rank::Later

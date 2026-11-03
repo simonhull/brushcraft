@@ -1051,13 +1051,6 @@ impl Sculpting {
         budget: Option<&BrushBudget>,
     ) {
         let showing = self.preview.is_some() && budget.is_some();
-        if let Some(preview) = &mut self.preview
-            && !scene.waiting.is_empty()
-            && let Err(error) = preview.make_waiting(scene.project.store(), scene.waiting)
-        {
-            // The renderer keeps waiting: it draws their ancestors meanwhile.
-            self.fail("making the previews the renderer waits for", &error);
-        }
         if showing && !self.fits(budget) {
             self.show(scene, report);
         }
@@ -1746,6 +1739,14 @@ impl Brush for Sculpting {
         let Some(mut scene) = Scene::of(context) else {
             return Ok(false);
         };
+        // The previews the renderer waits for, a few a call, off the pen's path: it draws their
+        // ancestors meanwhile.
+        if let Some(preview) = &mut self.preview
+            && !scene.waiting.is_empty()
+            && let Err(error) = preview.make_waiting(scene.project.store(), scene.waiting)
+        {
+            self.fail("making the previews the renderer waits for", &error);
+        }
         // Ahead of a drawing pen, the ground its next dabs will reach is warmed first, a batch a
         // call: placement's reads there (the area normal, the raycasts) find it evaluated.
         if self.stroke.as_ref().is_some_and(Pending::open) {

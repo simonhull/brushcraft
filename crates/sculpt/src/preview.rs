@@ -93,6 +93,10 @@ mod display;
 
 use display::DisplayState;
 
+/// The most previews [`Preview::make_waiting`] makes a call: what a renderer asks for at once can
+/// be a whole refined region, and a preview takes some tens of microseconds to a millisecond.
+pub const WAITING_A_CALL: usize = 8;
+
 /// What a [`Preview::show`] or [`Preview::land`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PreviewStats {
@@ -436,8 +440,8 @@ impl Preview {
     }
 
     /// Makes the previews of `keys`, tiles a renderer waits for: held with no preview made
-    /// ([`TileStore::preview_wanted`]); the others are left alone. Closes the call's preview
-    /// epoch.
+    /// ([`TileStore::preview_wanted`]), at most [`WAITING_A_CALL`] a call (the rest wait for the
+    /// next); the others are left alone. Closes the call's preview epoch.
     ///
     /// # Errors
     ///
@@ -451,6 +455,7 @@ impl Preview {
         let waiting: Vec<TileKey> = keys
             .iter()
             .filter(|key| store.preview_wanted(key))
+            .take(WAITING_A_CALL)
             .copied()
             .collect();
         let (display, finest): (Vec<TileKey>, Vec<TileKey>) = waiting

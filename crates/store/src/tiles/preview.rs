@@ -68,6 +68,8 @@ pub(crate) struct Previews {
     above: BTreeMap<TileKey, usize>,
     /// The tiles whose previews were set or cleared since the last preview epoch.
     changed: BTreeSet<TileKey>,
+    /// How many holds and releases there have been.
+    holds_changed: u64,
     /// The bytes the display previews hold.
     display_bytes: usize,
     /// The bytes a brush keeps to make its previews ([`TileStore::note_preview_state_bytes`]).
@@ -178,6 +180,7 @@ impl TileStore {
     pub fn hold_preview(&mut self, key: TileKey) {
         let previews = &mut self.previews;
         if previews.held.insert(key) {
+            previews.holds_changed += 1;
             for above in Previews::ancestors(&key) {
                 *previews.above.entry(above).or_insert(0) += 1;
             }
@@ -192,6 +195,7 @@ impl TileStore {
         if !previews.held.remove(key) {
             return;
         }
+        previews.holds_changed += 1;
         for above in Previews::ancestors(key) {
             if let Some(count) = previews.above.get_mut(&above) {
                 *count = count.saturating_sub(1);
@@ -202,6 +206,13 @@ impl TileStore {
         }
         // The refresh dropped the tiles above it: it looks for unknown tiles again.
         self.refresh_seen = u64::MAX;
+    }
+
+    /// How many times a tile was held or released so far: unchanged, no tile started to wait for
+    /// a preview ([`TileStore::preview_wanted`]) since it was last read.
+    #[must_use]
+    pub const fn preview_holds_changed(&self) -> u64 {
+        self.previews.holds_changed
     }
 
     /// Whether tile `key` is held: a finest tile a dab still to land reaches, or a display tile

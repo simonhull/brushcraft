@@ -275,6 +275,12 @@ pub trait TileSource {
         Vec::new()
     }
 
+    /// A count of changes to what a brush holds and has previews of: the same as last time, no
+    /// tile started waiting. The default never changes.
+    fn holds_changed(&mut self) -> u64 {
+        0
+    }
+
     /// Writes `key` into `out`, its vertices or (a finest tile) its positions with the ring, and
     /// returns its bound `e` and its finest normals' cone, or `None` if the source has nothing
     /// to draw for it yet (a display tile not built, or made unknown by edits): it is then drawn
@@ -389,6 +395,10 @@ impl TileSource for StoreSource<'_> {
 
     fn held(&mut self) -> Vec<TileKey> {
         self.store.held_previews().copied().collect()
+    }
+
+    fn holds_changed(&mut self) -> u64 {
+        self.store.preview_holds_changed()
     }
 
     fn prepare_positions(&mut self, keys: &[TileKey]) -> Result<(), CacheError> {

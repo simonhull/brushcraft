@@ -800,8 +800,8 @@ impl TileStore {
     /// Builds the subtrees of `roots` (display tiles) first in the display layer's refresh and
     /// rebuild: every tile to build under one of them goes before the others, each level from the
     /// one below as ever. What a renderer asks for its coarse stand-ins that it draws, so the
-    /// view sharpens where it is looked at first. The same roots again change nothing; empty
-    /// roots, the order is finest level first, then key order.
+    /// view sharpens where it is looked at first. Roots add up over a job: the same roots again
+    /// change nothing, and only new ones cost the tiles' ranking.
     pub fn refresh_first(&mut self, roots: &[TileKey]) {
         let roots: BTreeSet<TileKey> = roots.iter().copied().collect();
         for job in &mut self.jobs {

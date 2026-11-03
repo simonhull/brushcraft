@@ -859,6 +859,11 @@ pub struct Residency {
     /// Tiles requested that the last staging left waiting for a brush's preview
     /// ([`TileSource::waits_for_preview`]).
     waiting_previews: BTreeSet<TileKey>,
+    /// The source's count of changes to what a brush holds, as [`Residency::evict_waiting`] last
+    /// looked ([`TileSource::holds_changed`]).
+    holds_seen: u64,
+    /// Whether the cut changed since [`Residency::evict_waiting`] last looked.
+    cut_moved: bool,
     /// Tiles the source had nothing for, until an epoch names them.
     unavailable: BTreeSet<TileKey>,
     /// Pending epochs, oldest first.
@@ -1004,6 +1009,8 @@ impl Residency {
             floor_unavailable: 0,
             wanted: BTreeMap::new(),
             waiting_previews: BTreeSet::new(),
+            holds_seen: 0,
+            cut_moved: false,
             unavailable: BTreeSet::new(),
             groups: Vec::new(),
             pending: BTreeSet::new(),
@@ -1216,6 +1223,7 @@ impl Residency {
         if !same {
             self.shielded = OnceCell::new();
             self.cut = cut;
+            self.cut_moved = true;
         }
         self.drawn = drawn;
     }
@@ -1887,15 +1895,23 @@ impl Residency {
     /// Evicts every resident tile a brush holds that has no preview (outside the cut and above
     /// it, so none is made: [`Residency::draws_or_wants`]), so the cut never comes down to it,
     /// drawing the surface without the dabs still to land. A tile an epoch's change waits on
-    /// stays until it switches.
+    /// stays until it switches. Looked at only when the brush's holds or the cut changed since
+    /// the last time, the groups asked only of the few tiles that would go.
     fn evict_waiting<S: TileSource>(&mut self, source: &mut S) {
+        let holds = source.holds_changed();
+        if holds == self.holds_seen && !self.cut_moved {
+            return;
+        }
+        self.holds_seen = holds;
+        self.cut_moved = false;
         for key in source.held() {
             let evictable = self.entries.contains_key(&key)
                 && !self.protected(&key)
                 && !self.pending.contains(&key)
                 && !self.fresh.contains(&key)
+                && source.waits_for_preview(key)
                 && !self.groups.iter().any(|group| group.holds(&key));
-            if evictable && source.waits_for_preview(key) {
+            if evictable {
                 self.remove_live(&key);
                 self.stats.evictions += 1;
             }

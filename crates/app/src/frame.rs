@@ -1738,8 +1738,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         } else {
             deadline
         };
-        let roots = self.uploads.drawn_stale(self.project.store());
-        self.project.store().refresh_first(&roots);
+        if self.project.store().has_jobs() {
+            let roots = self.uploads.drawn_stale(self.project.store());
+            self.project.store().refresh_first(&roots);
+        }
         self.after_hand_off.report = self.run_jobs(jobs_by, pen)?;
         self.after_hand_off.jobs = lap.next();
         Ok(preparing)
