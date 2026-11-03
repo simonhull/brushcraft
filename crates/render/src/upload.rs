@@ -365,6 +365,11 @@ impl TileSource for StoreSource<'_> {
             let inputs: Vec<TileKey> = inputs.into_iter().collect();
             self.store.evaluate_many(&inputs, Evaluation::Positions)?;
         }
+        // A previewed tile is read from its preview: its record isn't decoded.
+        let display: Vec<TileKey> = display
+            .into_iter()
+            .filter(|key| self.store.display_preview(key).is_none())
+            .collect();
         if !display.is_empty() {
             let tiles = self.store.display_for_draw(&display)?;
             self.display.extend(display.into_iter().zip(tiles));
