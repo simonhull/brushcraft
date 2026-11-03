@@ -21,8 +21,9 @@
 //!   apparent size: pushed out of the boundary if the move carried it in, the image magnified to
 //!   make up; drawn in to the boundary, the magnification lowered, if the image was magnified and
 //!   the move carried the eye off it. So **the image is magnified only while the eye is on the
-//!   boundary**, and no orbit, pan or zoom leaves the eye inside it. The perspective freezes there:
-//!   while magnified it is the boundary's, flatter than a true close-up.
+//!   boundary** (with no boundary known, at [`Camera::MIN_DISTANCE`] from the pivot), and no orbit,
+//!   pan or zoom leaves the eye inside it. The perspective freezes there: while magnified it is the
+//!   boundary's, flatter than a true close-up.
 //!
 //! **Magnification is the lens's, not the eye's:** a magnification factor `m` and a shift `s`
 //! carry the unmagnified view's image plane (right and up over depth) `t` to `m · t + s`, which

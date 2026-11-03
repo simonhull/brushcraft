@@ -92,7 +92,8 @@
 //!
 //! **A scripted run** (`--script`, [`crate::script`]) puts the camera where its path has it at
 //! each frame's stamp, before the input phase (pointer input is dropped), wants every frame until
-//! the path is over, and records every frame ([`crate::record`]).
+//! the path is over, and records every frame ([`crate::record`]). Its poses are set directly: it
+//! isn't framed at open, and no boundary is fitted around the model for it.
 
 pub(crate) mod schedule;
 
