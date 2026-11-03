@@ -476,7 +476,8 @@ impl<'a> StoreSurface<'a> {
             .filter(|key| self.store.pen_down_shape(key).is_none())
             .copied()
             .collect();
-        self.store.evaluate_many(&unchanged, Evaluation::Positions)?;
+        self.store
+            .evaluate_many(&unchanged, Evaluation::Positions)?;
         let store = &*self.store;
         let at_hand: Vec<(TileKey, PenDownTile<'_>)> = keys
             .iter()
