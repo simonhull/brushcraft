@@ -223,14 +223,7 @@ impl Drop for WakeOnExit {
 /// What a render thread hands back as it stops.
 #[derive(Debug)]
 pub(crate) struct Stopped {
-    /// Its target.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the app drops the target as the thread stops; tests read its pixels"
-        )
-    )]
+    /// Its target: an offscreen run's screenshot reads its pixels.
     pub(crate) target: Target,
     /// The GPU times of its last frames, which no later frame resolved
     /// ([`Renderer::flush_timings`]): read back once the GPU has finished every frame. Empty

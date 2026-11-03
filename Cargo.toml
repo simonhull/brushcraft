@@ -24,6 +24,8 @@ anyhow = "1.0.100"
 bolero = "0.13.4"
 bytemuck = { version = "1.25.2", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 divan = "0.1.21"
+# Screenshots (`--screenshot`): encoding only needs the defaults-free core.
+png = { version = "0.18.1", default-features = false }
 pollster = "1.0.1"
 raw-window-handle = "0.6.2"
 rayon = "1.12.0"

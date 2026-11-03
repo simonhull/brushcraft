@@ -42,12 +42,15 @@ options:
                    long stroke across the whole model, still): the pen's latency, a stroke
                    from afar, and a brush keeping up; or sweep (still, in close looking at
                    the surface at a slant, one long stroke pressed from none to full, still):
-                   how a stroke looks
+                   how a stroke looks, with --screenshot
   --script-speed X run the path X times as fast (default 1)
   --record FILE    with --script, write a JSON line per frame to FILE: GPU phase times, the
                    owner thread's phases, what was drawn, residency and uploads
   --no-gpu-timing  don't time the GPU, even where it can be (with --script)
-  --offscreen      no window: draw into a texture (needs --frames or --script)";
+  --offscreen      no window: draw into a texture (needs --frames or --script)
+  --screenshot FILE
+                   with --offscreen, write the last frame drawn to FILE as a PNG when the
+                   run ends";
 
 /// What ends a run.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,6 +94,9 @@ pub(crate) struct Options {
     pub(crate) gpu_timing: bool,
     /// The path a `--script` run follows.
     pub(crate) script_path: ScriptPath,
+    /// Where an offscreen run writes its last frame as a PNG ([`crate::screenshot`]), if
+    /// anywhere.
+    pub(crate) screenshot: Option<PathBuf>,
 }
 
 /// The default finest level: the benchmark project's.
@@ -107,7 +113,8 @@ impl Options {
     ///
     /// On an unknown option, an option without its value or with one that doesn't parse, no
     /// project or more than one, `--offscreen` without `--frames` or `--script`, both of those,
-    /// or `--record`, `--script-path` or `--script-speed` without `--script`.
+    /// `--record`, `--script-path` or `--script-speed` without `--script`, or `--screenshot`
+    /// without `--offscreen`.
     pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut project = None;
         let mut level = DEFAULT_LEVEL;
@@ -119,6 +126,7 @@ impl Options {
         let mut speed = None;
         let mut path = None;
         let mut record = None;
+        let mut screenshot = None;
         let mut gpu_timing = true;
         let mut offscreen = false;
         let mut args = args.into_iter();
@@ -148,6 +156,8 @@ impl Options {
                 path = Some(parsed);
             } else if let Some(value) = flag_value(&arg, "--record", &mut args)? {
                 record = Some(PathBuf::from(value));
+            } else if let Some(value) = flag_value(&arg, "--screenshot", &mut args)? {
+                screenshot = Some(PathBuf::from(value));
             } else if arg == "--script" {
                 script = true;
             } else if arg == "--no-gpu-timing" {
@@ -176,6 +186,10 @@ impl Options {
             scripted || (record.is_none() && speed.is_none() && path.is_none()),
             "--record, --script-path and --script-speed go with --script"
         );
+        ensure!(
+            offscreen || screenshot.is_none(),
+            "--screenshot goes with --offscreen: a window's frames are the compositor's to capture"
+        );
         let mode = Mode { run, offscreen };
         let default_size = Size::new(DEFAULT_SIZE.0, DEFAULT_SIZE.1)
             .ok_or_else(|| anyhow!("the default size is not empty"))?;
@@ -191,6 +205,7 @@ impl Options {
             record,
             gpu_timing,
             script_path: path.unwrap_or_default(),
+            screenshot,
         })
     }
 
@@ -319,6 +334,7 @@ mod tests {
         assert_eq!(options.size, Size::new(1280, 800).unwrap());
         assert_eq!(options.mode, mode(Run::Open, false));
         assert_eq!((options.record, options.gpu_timing), (None, true));
+        assert_eq!(options.screenshot, None);
     }
 
     #[test]
@@ -370,6 +386,19 @@ mod tests {
             &["p.bcrf", "--script", "--script-speed", "0"],
             &["p.bcrf", "--script-path", "strokes"],
             &["p.bcrf", "--script", "--script-path", "orbit"],
+            &["p.bcrf", "--screenshot", "s.png"],
+            &["p.bcrf", "--frames", "3", "--screenshot", "s.png"],
+            &["p.bcrf", "--script", "--screenshot=s.png"],
+            &["p.bcrf", "--offscreen", "--screenshot", "s.png"],
+            &["p.bcrf", "--offscreen", "--frames", "3", "--screenshot"],
+            &[
+                "p.bcrf",
+                "--script-path",
+                "sweep",
+                "--offscreen",
+                "--frames",
+                "3",
+            ],
         ] {
             assert!(parse(args).is_err(), "{args:?} refused");
         }
@@ -408,6 +437,28 @@ mod tests {
         );
         let strokes = parse(&["p.bcrf", "--script", "--script-path=strokes"]).unwrap();
         assert_eq!(strokes.script(), Some(Script::strokes(Speed::ONE)));
+    }
+
+    #[test]
+    fn an_offscreen_run_may_end_with_a_screenshot() {
+        let sweep = parse(&[
+            "--offscreen",
+            "--script",
+            "--script-path",
+            "sweep",
+            "--screenshot",
+            "out.png",
+            "--size=640x400",
+            "p.bcrf",
+        ])
+        .unwrap();
+        assert_eq!(sweep.mode, mode(Run::Script(Speed::ONE), true));
+        assert_eq!(sweep.script(), Some(Script::sweep(Speed::ONE)));
+        assert_eq!(sweep.screenshot, Some(PathBuf::from("out.png")));
+        assert_eq!(sweep.size, Size::new(640, 400).unwrap());
+        let frames = parse(&["p.bcrf", "--offscreen", "--frames=2", "--screenshot=f.png"]).unwrap();
+        assert_eq!(frames.mode, mode(Run::Frames(2), true));
+        assert_eq!(frames.screenshot, Some(PathBuf::from("f.png")));
     }
 
     /// The mode `run`, offscreen or not.

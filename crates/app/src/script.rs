@@ -63,7 +63,8 @@
 //!
 //! `--script-path sweep` ([`Script::sweep`]) draws one long, sweeping stroke for looking at, its
 //! pressure rising evenly from none to full: how a stroke looks as the pen presses harder, seen at
-//! a slant, where a ridge that breaks into separate leaning spikes shows clearest.
+//! a slant, where a ridge that breaks into separate leaning spikes shows clearest. With
+//! `--screenshot` it leaves the result in a PNG.
 //!
 //! 1. **open**, 3 s still, three units away, as the benchmark path starts;
 //! 2. **approach**, 1.5 s: in to 1.3 from the centre, the camera slid 0.6 down its own up axis, so

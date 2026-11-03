@@ -20,7 +20,8 @@
 //! closes a project on lavapipe with no display. With `--script` the camera follows the
 //! benchmark path ([`script`]) and every frame is recorded, written with `--record` as JSON lines
 //! ([`record`]): the renderer's measured run, which `brushcraft-bench perf` makes its render
-//! metrics from. Usage: [`cli::USAGE`].
+//! metrics from. An offscreen run with `--screenshot` writes its last frame as a PNG as it ends
+//! ([`screenshot`]). Usage: [`cli::USAGE`].
 
 mod camera;
 mod cli;
@@ -33,6 +34,7 @@ mod pen;
 mod pick;
 mod record;
 mod render_thread;
+mod screenshot;
 mod script;
 mod sculpting;
 #[cfg(test)]
@@ -216,13 +218,16 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
     Ok(summary)
 }
 
-/// Runs the app offscreen for `frames` frames, then closes the project. The GPU, the target
-/// and the render thread come first, the project last.
+/// Runs the app offscreen for `frames` frames, then closes the project.
+///
+/// The GPU, the target and the render thread come first, the project last. With
+/// `--screenshot`, a run that went well writes the last frame it drew once the render thread has
+/// stopped.
 ///
 /// # Errors
 ///
-/// If the GPU or the target can't be opened, the project doesn't open, a frame fails, or the
-/// project doesn't close.
+/// If the GPU or the target can't be opened, the project doesn't open, a frame fails, the
+/// screenshot can't be written, or the project doesn't close.
 fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
     let gpu = Arc::new(Gpu::open(&options.adapter).context("opening the GPU")?);
     let adapter = describe_adapter(gpu.adapter_info());
@@ -241,11 +246,18 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
         script: options.script(),
         record: options.record_setup(render.timing(), opening),
     };
-    let mut owner = start(project, gpu, setup)?;
+    let mut owner = start(project, Arc::clone(&gpu), setup)?;
     let ran = drive_offscreen(&mut owner, &mut render);
-    let stopped = render
-        .stop()
-        .map(|stopped| owner.last_gpu_times(stopped.gpu));
+    let stopped = render.stop().and_then(|stopped| {
+        if ran.is_ok()
+            && let Some(path) = &options.screenshot
+            && let Target::Offscreen(offscreen) = &stopped.target
+        {
+            screenshot::save(offscreen, &gpu, path)?;
+        }
+        owner.last_gpu_times(stopped.gpu);
+        Ok(())
+    });
     let summary = Summary::of(&owner, adapter, presentation);
     let closed = owner.close();
     ran.and(stopped).and(closed)?;
