@@ -659,6 +659,12 @@ fn a_held_tile_with_no_preview_leaves_outside_the_cut_stays_in_it_and_waits_to_a
             residency.slot(&finest[0]).is_none(),
             "outside the cut: it goes"
         );
+        assert!(
+            residency
+                .waiting_for_previews()
+                .any(|key| *key == finest[1]),
+            "in the cut, nothing requests it: it is asked for all the same"
+        );
         assert!(residency.slot(&finest[1]).is_some(), "in the cut: it stays");
         // Asked for again, it waits for its preview, and is named.
         let again = ask(&finest[..1]);

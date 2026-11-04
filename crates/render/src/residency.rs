@@ -859,6 +859,10 @@ pub struct Residency {
     /// Tiles requested that the last staging left waiting for a brush's preview
     /// ([`TileSource::waits_for_preview`]).
     waiting_previews: BTreeSet<TileKey>,
+    /// The resident tiles in the cut or above it that a brush holds with no preview: nothing
+    /// requests them, so they are asked for here, or the cut would go on drawing them without
+    /// the dabs still to land.
+    held_unmade: BTreeSet<TileKey>,
     /// The source's count of changes to what a brush holds, as [`Residency::evict_waiting`] last
     /// looked ([`TileSource::holds_changed`]).
     holds_seen: u64,
@@ -1009,6 +1013,7 @@ impl Residency {
             floor_unavailable: 0,
             wanted: BTreeMap::new(),
             waiting_previews: BTreeSet::new(),
+            held_unmade: BTreeSet::new(),
             holds_seen: 0,
             cut_moved: false,
             unavailable: BTreeSet::new(),
@@ -1622,6 +1627,9 @@ impl Residency {
     {
         self.waiting_previews.clear();
         self.evict_waiting(source);
+        self.held_unmade
+            .retain(|key| source.waits_for_preview(*key));
+        self.waiting_previews.extend(&self.held_unmade);
         self.touched.clear();
         self.fresh.clear();
         self.forced_now = 0;
@@ -1871,9 +1879,9 @@ impl Residency {
         Ok(())
     }
 
-    /// The tiles requested that the last staging left waiting for a brush's preview: held, with
-    /// none made yet ([`TileSource::waits_for_preview`]). The brush makes them, and they arrive
-    /// from the next staging on.
+    /// The tiles the last staging left waiting for a brush's preview: held, with none made yet
+    /// ([`TileSource::waits_for_preview`]), requested or resident in the cut or above it. The
+    /// brush makes them, and they arrive from the next staging on.
     pub fn waiting_for_previews(&self) -> impl Iterator<Item = &TileKey> {
         self.waiting_previews.iter()
     }
@@ -1895,8 +1903,10 @@ impl Residency {
     /// Evicts every resident tile a brush holds that has no preview (outside the cut and above
     /// it, so none is made: [`Residency::draws_or_wants`]), so the cut never comes down to it,
     /// drawing the surface without the dabs still to land. A tile an epoch's change waits on
-    /// stays until it switches. Looked at only when the brush's holds or the cut changed since
-    /// the last time, the groups asked only of the few tiles that would go.
+    /// stays until it switches. One in the cut or above it stays and is noted for
+    /// [`Residency::waiting_for_previews`]: no request asks for a resident tile. Looked at only
+    /// when the brush's holds or the cut changed since the last time, the groups asked only of
+    /// the few tiles that would go.
     fn evict_waiting<S: TileSource>(&mut self, source: &mut S) {
         let holds = source.holds_changed();
         if holds == self.holds_seen && !self.cut_moved {
@@ -1904,12 +1914,17 @@ impl Residency {
         }
         self.holds_seen = holds;
         self.cut_moved = false;
+        self.held_unmade.clear();
         for key in source.held() {
-            let evictable = self.entries.contains_key(&key)
-                && !self.protected(&key)
-                && !self.pending.contains(&key)
+            if !self.entries.contains_key(&key) || !source.waits_for_preview(key) {
+                continue;
+            }
+            if self.protected(&key) {
+                self.held_unmade.insert(key);
+                continue;
+            }
+            let evictable = !self.pending.contains(&key)
                 && !self.fresh.contains(&key)
-                && source.waits_for_preview(key)
                 && !self.groups.iter().any(|group| group.holds(&key));
             if evictable {
                 self.remove_live(&key);
