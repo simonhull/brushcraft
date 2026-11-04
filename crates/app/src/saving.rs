@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn the_overlay_says_what_the_last_save_came_to() {
         let mut saving = saving();
-        assert!(saving.line(true, 0, false).contains("unsaved edits"));
+        assert!(!saving.line(true, 0, false).contains("no unsaved edits"));
         assert!(saving.line(false, 0, false).contains("no unsaved edits"));
         saving.nothing_to_save();
         assert!(saving.line(false, 0, false).contains("nothing to save"));

@@ -279,6 +279,35 @@ fn a_stroke_begun_during_a_save_waits_for_it_and_is_not_in_it() {
     assert_eq!(records_on_disk(&dir), 2, "the next save holds it");
 }
 
+/// With nothing left to land, a stroke begun as the save writes waits all the same: the store
+/// mustn't change under it.
+#[test]
+fn a_stroke_begun_as_a_save_writes_waits_for_it() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(saved_project(&dir), Sculpting::new, setup());
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 10_000);
+    let drawn = positions(owner.project());
+    owner.request_save(Instant::now());
+    owner.save_step();
+    owner.save_step();
+    assert_eq!(owner.save_stage(), Some(Stage::Writing));
+    queue(
+        &mut owner,
+        stroke_after_ctrl_s(((150.0, 80.0), (170.0, 120.0)), 6),
+    );
+    run(&mut owner, 1);
+    assert!(!owner.brush().under_way(), "it hasn't begun");
+    assert!(!owner.brush().deferred.is_empty(), "it waits, kept");
+    finish_save(&mut owner);
+    assert_eq!(tiles_on_disk(&dir), drawn, "nothing of it");
+    run(&mut owner, 10_000);
+    assert!(!owner.brush().stroking(), "it began and landed");
+    assert_ne!(positions(owner.project()), drawn, "it drew");
+    owner.close().expect("closed");
+}
+
 /// A stroke waiting for the one before it when Ctrl+S comes was drawn before it: it's in the save.
 #[test]
 fn a_stroke_waiting_behind_another_at_ctrl_s_is_in_the_save() {
@@ -337,7 +366,7 @@ fn a_failed_save_keeps_the_edits_the_marker_and_the_recovery_file() {
     assert!(title.starts_with('*'), "still unsaved: {title}");
     assert!(title.contains("save failed"), "{title}");
     let line = owner.save_line();
-    assert!(line.contains("unsaved edits"), "{line}");
+    assert!(!line.contains("no unsaved edits"), "{line}");
     assert!(line.contains("save failed"), "{line}");
     assert!(owner.project().has_unsaved_edits());
     assert_eq!(positions(owner.project()), drawn, "nothing lost");
@@ -429,6 +458,9 @@ fn the_unsaved_marker_goes_with_a_save_and_comes_back_with_a_stroke() {
     queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
     run(&mut owner, 1);
     assert_eq!(owner.title_change().as_deref(), Some("*p - BrushCraft"));
+    run(&mut owner, 10_000);
+    assert_eq!(owner.landing(), 0, "it landed");
+    assert_eq!(owner.title_change(), None, "landed edits are unsaved too");
     owner.close().expect("closed");
 }
 
