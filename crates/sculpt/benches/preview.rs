@@ -39,6 +39,9 @@
 //! - [`show_first_of_many`]: [`Preview::show`] of the first dab shown of a stroke that has changed
 //!   more than a thousand tiles, every dab before it applied at once: every display preview it
 //!   reaches made there and then, replaying the stroke and gathering what it changed.
+//! - [`show_late_in_stroke`] and [`land_late_in_stroke`]: [`Preview::show`] of a dab, and
+//!   [`Preview::land`] of the oldest, with [`LATE_STROKE`]'s dabs shown before them: what a dab
+//!   pays for the backlog, on the finest tiles and on display tiles.
 //! - [`note_late_in_stroke`]: [`Preview::note_applied`] of one dab with [`LONG_STROKE`]'s dabs
 //!   before it: what a dab pays for the stroke's length in `push_stroke`.
 
@@ -62,6 +65,12 @@ fn main() {
 
 /// The level edited.
 const LEVEL: u8 = 8;
+
+/// The dabs shown before the one timed in [`show_late_in_stroke`], [`land_late_in_stroke`].
+const LATE_STROKE: [usize; 2] = [1_370, 5_000];
+
+/// The radius of those dabs: the benchmark's small brush, a few tiles a dab.
+const LATE_RADIUS: f32 = 0.05;
 
 /// The dabs before the one noted in [`note_late_in_stroke`].
 const LONG_STROKE: [usize; 3] = [100, 1_000, 10_000];
@@ -578,6 +587,81 @@ fn show_first_of_many(bencher: divan::Bencher<'_, '_>) {
     let changed = ridge.project.store().pen_down_tiles();
     let displays = ridge.project.store().display_previewed().count();
     eprintln!("show_first_of_many: {changed} tiles changed, {displays} display previews");
+}
+
+/// A ridge of `shown` dabs shown as `drawing` draws them, none landed.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+fn shown_ridge(shown: usize, drawing: Drawing) -> (Ridge, Vec<Dab>) {
+    let mut ridge = Ridge::made(LATE_RADIUS, 0, true);
+    let mut dabs = Vec::with_capacity(shown);
+    for _ in 0..shown {
+        let dab = ridge.next_dab();
+        ridge
+            .preview
+            .show(
+                ridge.project.store(),
+                &ridge.index,
+                &[dab],
+                &|key: &TileKey| drawing.draws(key),
+            )
+            .expect("show");
+        dabs.push(dab);
+    }
+    (ridge, dabs)
+}
+
+/// [`Preview::show`] of a dab with many shown before it: see the module notes.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+#[divan::bench(args = LATE_STROKE, sample_count = 30, sample_size = 1)]
+fn show_late_in_stroke(bencher: divan::Bencher<'_, '_>, shown: usize) {
+    let ridge = RefCell::new(shown_ridge(shown, Drawing::Finest).0);
+    bencher
+        .with_inputs(|| ridge.borrow_mut().next_dab())
+        .bench_local_values(|dab| {
+            let ridge = &mut *ridge.borrow_mut();
+            ridge
+                .preview
+                .show(
+                    ridge.project.store(),
+                    &ridge.index,
+                    &[dab],
+                    &|key: &TileKey| Drawing::Finest.draws(key),
+                )
+                .expect("show")
+        });
+}
+
+/// [`Preview::land`] of a dab with many still shown behind it: see the module notes.
+///
+/// # Panics
+///
+/// If applying or landing fails, which would be a bug.
+#[divan::bench(args = LATE_STROKE, sample_count = 30, sample_size = 1)]
+fn land_late_in_stroke(bencher: divan::Bencher<'_, '_>, shown: usize) {
+    let (ridge, dabs) = shown_ridge(shown, Drawing::Display);
+    let ridge = RefCell::new(ridge);
+    let next = std::cell::Cell::new(0);
+    bencher
+        .with_inputs(|| {
+            let ridge = &mut *ridge.borrow_mut();
+            let dab = dabs.get(next.replace(next.get() + 1)).expect("a dab");
+            ridge.apply(std::slice::from_ref(dab));
+        })
+        .bench_local_values(|()| {
+            let ridge = &mut *ridge.borrow_mut();
+            ridge
+                .preview
+                .land(ridge.project.store(), &ridge.index, 1, &|key: &TileKey| {
+                    Drawing::Display.draws(key)
+                })
+                .expect("land")
+        });
 }
 
 /// [`Preview::note_applied`] of a dab late in a long stroke: see the module notes.
