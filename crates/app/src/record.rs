@@ -704,7 +704,8 @@ pub(crate) struct RecordStream {
 }
 
 impl RecordStream {
-    /// A stream into a file at `path`, made empty.
+    /// A stream into a file at `path`, made empty: a record left there by an earlier run goes as
+    /// this one starts, not as it ends, as a killed run has only the stream to leave.
     pub(crate) fn to(path: PathBuf) -> Self {
         let (lines, batches) = mpsc::channel::<Vec<String>>();
         let writer = std::thread::spawn(move || {

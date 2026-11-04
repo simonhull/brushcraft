@@ -1110,23 +1110,89 @@ fn a_close_request_is_answered_at_once_and_the_landing_goes_on_in_frames() {
         "nothing landed in the call: {left} of {backlog}"
     );
     assert!(!owner.ready_to_close(), "{left} dabs still to land");
-    let mut frames = 0;
+    let mut steps = 0;
     let mut longest = Duration::ZERO;
     while !owner.ready_to_close() {
         let before = owner.landing();
         let began = Instant::now();
+        owner.close_step().expect("a step");
         run(&mut owner, 1);
         longest = longest.max(began.elapsed());
-        frames += 1;
+        steps += 1;
         assert!(
             before.saturating_sub(owner.landing()) <= 2,
-            "a batch a frame: {before} to {}",
+            "a batch a step: {before} to {}",
             owner.landing()
         );
-        assert!(frames < 10_000, "the landing ends");
+        assert!(steps < 10_000, "the landing ends");
     }
-    assert!(frames >= backlog / 2, "{backlog} dabs in {frames} frames");
+    assert!(steps >= backlog / 2, "{backlog} dabs in {steps} steps");
     assert!(longest < Duration::from_secs(1), "a frame took {longest:?}");
+}
+
+/// A close lands whether or not a frame can be drawn: a hidden window has no size, and the steps
+/// go on without one, the dabs landed and the stroke ended.
+#[test]
+fn a_close_lands_with_no_frame_to_draw() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    queue(&mut owner, to_and_fro(2));
+    run(&mut owner, 1);
+    assert!(owner.brush().last().dabs_catching_up > 2, "dabs to land");
+    owner.resize(None);
+    owner.request_close().expect("a close");
+    let mut steps = 0;
+    while !owner.ready_to_close() {
+        owner.close_step().expect("a step");
+        steps += 1;
+        assert!(steps < 10_000, "the landing ends, no frame drawn");
+    }
+    assert!(steps > 2, "batch by batch");
+    assert!(!owner.brush().stroking(), "the stroke ended");
+}
+
+/// A close with nothing held is ready at once; with the pen lifted, or a stroke waiting behind
+/// the one landing, it lands them too; a second request changes nothing.
+#[test]
+fn a_close_waits_for_what_is_held_however_it_stands() {
+    let closed_after = |samples: Vec<Vec<PenSample>>| {
+        let dir = TestDir::new();
+        let mut owner = owner_of(
+            project(&dir),
+            |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+            setup(),
+        );
+        run(&mut owner, 10_000);
+        for stroke in samples {
+            queue(&mut owner, stroke);
+            run(&mut owner, 1);
+        }
+        owner.request_close().expect("a close");
+        let landing = owner.landing();
+        owner.request_close().expect("a second close");
+        assert_eq!(
+            owner.landing(),
+            landing,
+            "a second request does nothing here"
+        );
+        let mut steps = 0;
+        while !owner.ready_to_close() {
+            owner.close_step().expect("a step");
+            steps += 1;
+            assert!(steps < 10_000, "the landing ends");
+        }
+        assert!(!owner.brush().stroking(), "nothing left");
+        landing
+    };
+    assert_eq!(closed_after(Vec::new()), 0, "nothing held: ready at once");
+    assert!(closed_after(vec![stroke(ACROSS, 12)]) > 0, "the pen lifted");
+    let two = closed_after(vec![stroke(ACROSS, 12), stroke(ACROSS, 12)]);
+    assert!(two > 0, "a stroke waiting behind");
 }
 
 /// A drawing pen, however long the catch-up has landed nothing, makes no sample wait behind a dab

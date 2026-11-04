@@ -472,9 +472,9 @@ impl Blocks {
 
 impl DisplayState {
     /// Makes the previews of display tiles `keys` over the store as it holds it now: each its
-    /// pen-down tile and base (module notes), moved by `pending` (the dabs shown and not landed,
-    /// a suffix of `stroke`), its normals and bound over every dab of `stroke`. A tile the store
-    /// has no record of to draw (nor does a renderer) is left out.
+    /// pen-down tile and base (module notes), moved by those of `dabs` still to land, its normals
+    /// and bound over every dab of the stroke that can reach it. A tile the store has no record
+    /// of to draw (nor does a renderer) is left out.
     ///
     /// The records are decoded together and the finest blocks gathered once for all of them;
     /// the previews are made on the store's workers.
@@ -781,7 +781,7 @@ impl DisplayState {
     }
 
     /// Rebases the vertices inside finest tiles `changed` (gathered in `blocks.now`) on the
-    /// store's bits, moved by `pending`, the dabs still to land: after a landing changed them.
+    /// store's bits, moved by those of `dabs` still to land: after a landing changed them.
     /// Returns whether any vertex's bits changed.
     pub(super) fn rebase(
         &mut self,

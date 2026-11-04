@@ -79,11 +79,10 @@
 //! A frame's own step takes what fits the slack its time leaves, if it showed nothing. While the
 //! pen is down progress is guaranteed all the same, off a frame's step and whatever the dab costs:
 //! under a resting pen a catch-up that has landed nothing for [`CATCH_UP_STARVED`] takes one dab,
-//! and under a drawing pen one holding [`CATCH_UP_BACKLOG`] dabs, or previews past the store's
-//! budget, takes a batch every quarter of that. Only then does a batch's time come before a
-//! sample. The backlog isn't bounded: a pen placing dabs faster than they land outruns even these,
-//! but the batches grow with the backlog ([`backlog_batch`]) and write each tile once, so the
-//! landing gains on it as it grows.
+//! and under a drawing pen one holding [`CATCH_UP_BACKLOG`] dabs takes a batch every quarter of
+//! that. Only then does a batch's time come before a sample. The backlog isn't bounded: a pen
+//! placing dabs faster than they land outruns even these, but the batches grow with the backlog
+//! ([`backlog_batch`]) and write each tile once, so the landing gains on it as it grows.
 //! Each batch that lands makes the previews it moved again over what landed ([`Preview::land`]);
 //! once every dab has landed none is left and the surface is exact, which the record's
 //! `dabs_catching_up` counts down to. The saved result is that of applying the dabs at once, bit
@@ -253,10 +252,10 @@ pub(crate) const CATCH_UP_STARVED: Duration = Duration::from_millis(50);
 /// How many dabs a catch-up may hold under a drawing pen before it takes them all the same, four
 /// times as often as [`CATCH_UP_STARVED`].
 ///
-/// A dab shown costs next to nothing to keep; what a long stroke holds is the previews, which the
-/// store's budget watches: past it the catch-up is forced too, whatever the backlog
-/// ([`Kept::beyond_budget`]). This only says when a stroke has gone on for minutes. Forced at 512,
-/// a fast stroke fell from 170 frames a second to five after eight seconds, for good.
+/// A dab shown costs next to nothing to keep, so this only says when a stroke has gone on for
+/// minutes. Forced at 512, a fast stroke fell from 170 frames a second to five after eight
+/// seconds, for good. The store's budget plays no part: forcing dabs to land only adds pen-down
+/// shapes, which go at the stroke's end, so past the budget it would never let go.
 pub(crate) const CATCH_UP_BACKLOG: usize = 16_384;
 
 /// How many dab spacings ahead of an open stroke's last dab the warming ahead of it looks
@@ -692,6 +691,8 @@ pub(crate) struct Sculpting {
     landed_at: Instant,
     /// Whether the window was asked to close: no pen is down any more, and what is held lands.
     closing: Closing,
+    /// The last projector a step had: what a close lands with if the camera has gone degenerate.
+    last_projector: Option<ViewProjector>,
     /// The backlog past which a drawing pen waits for the catch-up ([`CATCH_UP_BACKLOG`]).
     backlog_limit: usize,
     /// Where the warming ahead of the open stroke last listed its tiles.
@@ -742,6 +743,7 @@ impl Sculpting {
             warm: Warm::default(),
             landed_at: Instant::now(),
             closing: Closing::No,
+            last_projector: None,
             backlog_limit: CATCH_UP_BACKLOG,
             ahead_warmed: None,
             ahead_todo: Vec::new(),
@@ -1176,7 +1178,11 @@ impl Sculpting {
         report: &mut BrushReport,
         budget: Option<&BrushBudget>,
     ) {
-        let moving = self.pen_moving();
+        // A close lands through its own steps, whatever frames do.
+        if self.closing == Closing::Landing {
+            return;
+        }
+        let moving = self.closing == Closing::No && self.pen_moving();
         // While the pen is down, resting or not, the catch-up never holds up its next sample:
         // a dab is forced, and long batches taken, only once it has lifted.
         let down = self.stroke.as_ref().is_some_and(Pending::open);
@@ -1202,8 +1208,7 @@ impl Sculpting {
         let backlog = self.catching_up();
         let limit = self.backlog_limit;
         let behind = if moving {
-            let over = backlog >= self.backlog_limit || self.kept.beyond_budget > 0;
-            over && waited >= CATCH_UP_STARVED / 4
+            backlog >= self.backlog_limit && waited >= CATCH_UP_STARVED / 4
         } else {
             waited >= CATCH_UP_STARVED
         };
@@ -1222,7 +1227,7 @@ impl Sculpting {
             }
         }
         let first = report.dabs_applied == 0;
-        let waiting_stroke = self.closing == Closing::Landing || !self.deferred.is_empty();
+        let waiting_stroke = self.closing != Closing::No || !self.deferred.is_empty();
         // A frame shows each batch before the next starts, so the frames keep coming.
         if batch && self.unframed {
             return;
@@ -1658,6 +1663,29 @@ struct Scene<'a> {
 }
 
 impl<'a> Scene<'a> {
+    /// `context`'s scene for a close: a degenerate camera gives `fallback`, the last good
+    /// projector, as what is left to land hardly needs a view. `None` if there is no index, or
+    /// nothing ever gave a view: no stroke began then.
+    fn closing(context: BrushContext<'a>, fallback: Option<&ViewProjector>) -> Option<Self> {
+        let BrushContext {
+            project,
+            index,
+            camera,
+            size,
+            drawn,
+            waiting,
+        } = context;
+        let projector = camera.view(size).as_ref().map(ViewProjector::new);
+        Some(Self {
+            project,
+            index: index?,
+            projector: projector.or_else(|| fallback.copied())?,
+            camera,
+            drawn,
+            waiting,
+        })
+    }
+
     /// `context`'s scene; `None` with no index (nothing to brush) or no view (a degenerate
     /// camera).
     fn of(context: BrushContext<'a>) -> Option<Self> {
@@ -1706,6 +1734,7 @@ impl Brush for Sculpting {
             self.refresh_status();
             return Ok(report);
         };
+        self.last_projector = Some(scene.projector);
         if self.index_stale {
             self.rebuild_index(&mut scene);
         }
@@ -1721,16 +1750,10 @@ impl Brush for Sculpting {
             };
             self.admit(&mut scene, sample);
         }
-        if self.closing == Closing::Landing {
-            self.lift(&mut scene, None);
-        }
         self.work(&mut scene, &mut report, Some(budget));
         if !self.deferred.is_empty() && self.stroke.is_none() {
             // The stroke before them has ended: the deferred stroke begins on what it left.
             self.release_deferred(&mut scene);
-            if self.closing == Closing::Landing {
-                self.lift(&mut scene, None);
-            }
             self.work(&mut scene, &mut report, Some(budget));
         }
         self.note_kept(scene.project.store());
@@ -1852,7 +1875,7 @@ impl Brush for Sculpting {
 
     fn begin_closing(&mut self, context: BrushContext<'_>) -> Result<()> {
         self.closing = Closing::Landing;
-        if let Some(mut scene) = Scene::of(context) {
+        if let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) {
             let held = std::mem::take(&mut self.held);
             for event in &held {
                 self.admit(&mut scene, event.as_ref());
@@ -1862,13 +1885,43 @@ impl Brush for Sculpting {
         Ok(())
     }
 
+    fn close_step(&mut self, context: BrushContext<'_>) -> Result<bool> {
+        let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) else {
+            // No scene ever: no stroke began, and what waits to begin can't.
+            self.held.clear();
+            self.deferred.clear();
+            return Ok(false);
+        };
+        let held = std::mem::take(&mut self.held);
+        for event in &held {
+            self.admit(&mut scene, event.as_ref());
+        }
+        self.closing = Closing::Stepping;
+        self.unframed = false;
+        let budget = BrushBudget::slice(Instant::now(), WAITED_BATCH);
+        let mut report = BrushReport::default();
+        self.lift(&mut scene, None);
+        self.work(&mut scene, &mut report, Some(&budget));
+        if !self.deferred.is_empty() && self.stroke.is_none() {
+            self.release_deferred(&mut scene);
+            self.lift(&mut scene, None);
+            self.work(&mut scene, &mut report, Some(&budget));
+        }
+        self.closing = Closing::Landing;
+        self.note_kept(scene.project.store());
+        let landed = report.dabs_applied > 0;
+        self.caught_up = std::mem::take(&mut self.caught_up).then(report);
+        Ok(landed)
+    }
+
     fn landing(&self) -> usize {
         let under_way = usize::from(self.stroke.is_some());
         self.queued().max(under_way) + self.deferred.len() + self.held.len()
     }
 
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {
-        if let Some(mut scene) = Scene::of(context) {
+        self.closing = Closing::No;
+        if let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) {
             let held = std::mem::take(&mut self.held);
             for event in &held {
                 self.admit(&mut scene, event.as_ref());

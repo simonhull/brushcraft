@@ -68,11 +68,15 @@
 //! later. Each sample's point lies on the unit sphere, as the benchmark project is; the frame
 //! loop projects it through the camera at the sample's time ([`Script::pen`]).
 //!
-//! # The sweep path
+//! # The spiral paths
 //!
 //! `--script-path spiral` ([`Script::spiral`]) draws one stroke 25 s long at the default brush,
 //! pressed hard, spiralling out across the sphere onto fresh ground: what a stroke's length costs,
-//! read against the dabs placed so far.
+//! read against the dabs placed so far. `--script-path spiral-light` ([`Script::spiral_light`])
+//! touches down lightly and presses hard over its first 2 s, as a pen does, so its dabs start a
+//! fraction of the size of the rest.
+//!
+//! # The sweep path
 //!
 //! `--script-path sweep` ([`Script::sweep`]) draws one long, sweeping stroke for looking at, its
 //! pressure rising evenly from none to full: how a stroke looks as the pen presses harder, seen at
@@ -549,6 +553,12 @@ const SPIRAL_STROKE: PenStroke = PenStroke {
     pressure: Pressure::Full,
 };
 
+/// The light spiral's stroke: [`SPIRAL_STROKE`], touching down lightly.
+const SPIRAL_LIGHT_STROKE: PenStroke = PenStroke {
+    pressure: Pressure::Touchdown,
+    ..SPIRAL_STROKE
+};
+
 /// How hard a scripted pen presses along its stroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pressure {
@@ -558,6 +568,8 @@ pub(crate) enum Pressure {
     Full,
     /// Rising evenly from none at the touch to full at the lift: every pressure along one stroke.
     Rising,
+    /// From a touch of 0.02 to full in the first twelfth of the stroke, then full.
+    Touchdown,
 }
 
 /// Where a scripted stroke runs on the unit sphere, about the point facing the camera (the
@@ -684,6 +696,14 @@ impl PenStroke {
                 let pressure = along.clamp(0.0, 1.0) as f32;
                 Unit::try_from(pressure).unwrap_or(Unit::ONE)
             }
+            Pressure::Touchdown => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a pressure in 0.02..=1.0: f32 holds it"
+                )]
+                let pressure = (0.02 + 12.0 * along).min(1.0) as f32;
+                Unit::try_from(pressure).unwrap_or(Unit::ONE)
+            }
         }
     }
 }
@@ -724,11 +744,13 @@ pub(crate) enum ScriptPath {
     Sweep,
     /// One stroke 25 s long, out across the sphere ([`Script::spiral`]).
     Spiral,
+    /// That stroke touching down lightly ([`Script::spiral_light`]).
+    SpiralLight,
 }
 
 /// Why a text isn't a [`ScriptPath`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0:?} isn't a script path: benchmark, strokes, sweep or spiral")]
+#[error("{0:?} isn't a script path: benchmark, strokes, sweep, spiral or spiral-light")]
 pub(crate) struct BadPath(String);
 
 impl FromStr for ScriptPath {
@@ -740,6 +762,7 @@ impl FromStr for ScriptPath {
             "strokes" => Ok(Self::Strokes),
             "sweep" => Ok(Self::Sweep),
             "spiral" => Ok(Self::Spiral),
+            "spiral-light" => Ok(Self::SpiralLight),
             _ => Err(BadPath(text.to_owned())),
         }
     }
@@ -809,6 +832,7 @@ impl Script {
             ScriptPath::Strokes => Self::strokes(speed),
             ScriptPath::Sweep => Self::sweep(speed),
             ScriptPath::Spiral => Self::spiral(speed),
+            ScriptPath::SpiralLight => Self::spiral_light(speed),
         }
     }
 
@@ -856,6 +880,19 @@ impl Script {
             keyframes: SPIRAL.to_vec(),
             speed,
             strokes: vec![SPIRAL_STROKE],
+            pen: Vec::new(),
+        };
+        script.pen = script.every_pen_sample();
+        script
+    }
+
+    /// The light spiral path (the module notes), run at `speed`.
+    pub(crate) fn spiral_light(speed: Speed) -> Self {
+        let mut script = Self {
+            start: START,
+            keyframes: SPIRAL.to_vec(),
+            speed,
+            strokes: vec![SPIRAL_LIGHT_STROKE],
             pen: Vec::new(),
         };
         script.pen = script.every_pen_sample();

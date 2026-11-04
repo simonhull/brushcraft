@@ -100,7 +100,7 @@ pub(crate) struct WindowApp {
     /// Where the run's outcome goes when the loop exits.
     /// Where the run's outcome goes when the loop exits; `None` once it has been sent, so a
     /// run finishes once, whatever events follow.
-    done: Option<Sender<Result<Ended>>>,
+    done: Option<Sender<Ended>>,
     /// Event-loop wakeups so far: winit's fallback pen events of one wakeup may be one pen frame.
     wakeup: u64,
     /// Pen samples drained from the stream, handed on to the frame loop at once; kept for its
@@ -110,11 +110,7 @@ pub(crate) struct WindowApp {
 
 impl WindowApp {
     /// An app that opens `project` in a window as `options` say, reporting to `done`.
-    pub(crate) const fn new(
-        options: Options,
-        project: ProjectToOpen,
-        done: Sender<Result<Ended>>,
-    ) -> Self {
+    pub(crate) const fn new(options: Options, project: ProjectToOpen, done: Sender<Ended>) -> Self {
         Self {
             options,
             project: Some(project),
@@ -295,6 +291,13 @@ impl WindowApp {
     /// one did. Only the first call does more than exit.
     fn finish(&mut self, event_loop: &dyn ActiveEventLoop, result: Result<()>) {
         event_loop.exit();
+        self.wind_up(result);
+    }
+
+    /// [`WindowApp::finish`] but for ending the loop: for a loop already over too
+    /// ([`WindowApp`]'s `drop`), so a run that ended in an error still hands its frame loop back,
+    /// to land what it holds and close the project.
+    fn wind_up(&mut self, result: Result<()>) {
         let Some(done) = self.done.take() else {
             // Finished already (an error, then the close the exit brings): nothing more to say.
             return;
@@ -321,12 +324,15 @@ impl WindowApp {
                 // The window goes first: the project closes once the event loop has ended
                 // (`run_window`), however long that takes, with no window left unanswered.
                 drop(window);
-                result
-                    .and(stopped)
-                    .and(pen_stopped)
-                    .map(|()| Ended { summary, owner })
+                Ended {
+                    run: result.and(stopped).and(pen_stopped).map(|()| summary),
+                    owner: Some(owner),
+                }
             }
-            None => result.and_then(|()| Err(anyhow!("the window never opened"))),
+            None => Ended {
+                run: result.and_then(|()| Err(anyhow!("the window never opened"))),
+                owner: None,
+            },
         };
         // `main` holds the receiver until the loop returns, so the send can't fail.
         drop(done.send(outcome));
@@ -604,8 +610,15 @@ impl ApplicationHandler for WindowApp {
         let Some(running) = &mut self.running else {
             return;
         };
-        let driven = Self::drive(running, &mut self.pen_samples, event_loop);
+        let stepped = if running.closing {
+            running.owner.close_step().map(|_| ())
+        } else {
+            Ok(())
+        };
+        let driven = stepped.and_then(|()| Self::drive(running, &mut self.pen_samples, event_loop));
         if running.closing {
+            // Back at once, frames or none, the window's events heard between batches.
+            event_loop.set_control_flow(ControlFlow::Poll);
             // Said in tens, so the compositor isn't told every dab.
             let left = running.owner.landing().div_ceil(TITLE_STEP) * TITLE_STEP;
             if left != running.title_says {
@@ -618,5 +631,12 @@ impl ApplicationHandler for WindowApp {
         if driven.is_err() || running.owner.done() || running.owner.ready_to_close() {
             self.finish(event_loop, driven);
         }
+    }
+}
+
+impl Drop for WindowApp {
+    /// A loop that ended on its own failure never finished: its frame loop still goes back.
+    fn drop(&mut self) {
+        self.wind_up(Ok(()));
     }
 }

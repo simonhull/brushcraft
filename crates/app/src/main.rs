@@ -153,14 +153,14 @@ impl Summary {
     }
 }
 
-/// A window's run that ended well: how it went, and its frame loop, to close once the window and
-/// the event loop are gone.
+/// A window's run as it ended: how it went, and its frame loop if it got that far, to close once
+/// the window and the event loop are gone, however the run went.
 #[derive(Debug)]
 pub(crate) struct Ended {
     /// How the run went.
-    pub(crate) summary: Summary,
+    pub(crate) run: Result<Summary>,
     /// The frame loop, holding the project.
-    pub(crate) owner: AppOwner,
+    pub(crate) owner: Option<AppOwner>,
 }
 
 /// A GPU's name and backend, as the overlay and the summary show it.
@@ -221,14 +221,38 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
         .context("starting the event loop")?
         .run_app(WindowApp::new(options, project, done))
         .context("running the event loop");
-    let Ok(outcome) = outcome.try_recv() else {
+    let Ok(ended) = outcome.try_recv() else {
         ran?;
         bail!("the event loop ended without closing the project");
     };
-    let ended: Ended = outcome?;
-    ran?;
-    ended.owner.close()?;
-    Ok(ended.summary)
+    settled(ended.run, ran, ended.owner, AppOwner::close)
+}
+
+/// How a window's run ended, once `owner` has closed through `close`, whatever `run` and the
+/// event loop's `ran` say.
+///
+/// So what it holds lands and the project closes after any failure. The first error is the one
+/// returned, with those after it as its context.
+///
+/// # Errors
+///
+/// Any of the three.
+fn settled<O>(
+    run: Result<Summary>,
+    ran: Result<()>,
+    owner: Option<O>,
+    close: impl FnOnce(O) -> Result<()>,
+) -> Result<Summary> {
+    let closed = owner.map_or(Ok(()), close);
+    let also = |error: anyhow::Error, later: Result<()>| match later {
+        Ok(()) => error,
+        Err(cause) => error.context(format!("and then: {cause:#}")),
+    };
+    match (run, ran) {
+        (Ok(summary), Ok(())) => closed.map(|()| summary),
+        (Ok(_), Err(error)) => Err(also(error, closed)),
+        (Err(error), ran) => Err(also(also(error, ran), closed)),
+    }
 }
 
 /// Runs the app offscreen for `frames` frames, then closes the project.
@@ -392,4 +416,60 @@ fn run() -> Result<()> {
         writeln!(out, "{line}")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+mod tests {
+    use anyhow::{Result, anyhow};
+    use render::surface::Presentation;
+
+    use super::{Summary, settled};
+
+    /// A run's summary, its details aside.
+    fn summary() -> Summary {
+        Summary {
+            frames: 7,
+            adapter: String::new(),
+            presentation: Presentation::Offscreen,
+            tiles: String::new(),
+            scene: String::new(),
+            pen: String::new(),
+            phases: Vec::new(),
+            records: Vec::new(),
+        }
+    }
+
+    /// However the run or its event loop failed, the frame loop closes: what it holds lands, and
+    /// the op ends. An early return on the error would lose them.
+    #[test]
+    fn a_run_that_failed_still_closes_its_frame_loop_and_says_every_error() {
+        let failed = || Err(anyhow!("the device was lost"));
+        let cases: [(Result<Summary>, Result<()>); 4] = [
+            (Ok(summary()), Ok(())),
+            (failed(), Ok(())),
+            (Ok(summary()), Err(anyhow!("the loop failed"))),
+            (failed(), Err(anyhow!("the loop failed"))),
+        ];
+        for (run, ran) in cases {
+            let failing = run.is_err() || ran.is_err();
+            let mut closed = false;
+            let outcome = settled(run, ran, Some(()), |()| {
+                closed = true;
+                Ok(())
+            });
+            assert!(closed, "closed all the same");
+            assert_eq!(outcome.is_err(), failing);
+        }
+        let both = settled(failed(), Ok(()), Some(()), |()| Err(anyhow!("no room")));
+        let said = format!("{:#}", both.expect_err("failed"));
+        assert!(
+            said.contains("the device was lost") && said.contains("no room"),
+            "{said}"
+        );
+        let closing = settled(Ok(summary()), Ok(()), Some(()), |()| {
+            Err(anyhow!("no room"))
+        });
+        assert!(closing.is_err(), "a close that failed fails the run");
+    }
 }

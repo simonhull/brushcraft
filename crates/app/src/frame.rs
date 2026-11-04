@@ -478,6 +478,16 @@ pub(crate) trait Brush {
         0
     }
 
+    /// Lands a batch of what the brush holds, whether or not a frame can be drawn. Returns whether
+    /// any landed.
+    ///
+    /// # Errors
+    ///
+    /// Only for a failure the app can't go on from.
+    fn close_step(&mut self, _context: BrushContext<'_>) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Applies what the brush still holds and ends its stroke: the project is about to close.
     ///
     /// # Errors
@@ -823,8 +833,11 @@ pub(crate) enum Closing {
     /// It wasn't.
     #[default]
     No,
-    /// It was: no pen is taken any more, and what the brush holds lands.
+    /// It was: no pen is taken any more, and what the brush holds lands, only through
+    /// [`Owner::close_step`], so the window's events come between batches however things stand.
     Landing,
+    /// A brush's step of that landing is running ([`Brush::close_step`]).
+    Stepping,
 }
 
 /// What a scripted run's record says of its setting, beside what the [`Setup`] says.
@@ -1254,7 +1267,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// [`Owner::pen`]; wanting a frame for it only if `want` (a sample the frame being made takes
     /// itself wants none).
     fn queue_pen(&mut self, sample: PenSample, want: bool) {
-        if self.closing == Closing::Landing {
+        if self.closing != Closing::No {
             return;
         }
         self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
@@ -2507,7 +2520,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// As [`Brush::begin_closing`].
     pub(crate) fn request_close(&mut self) -> Result<()> {
-        if self.closing == Closing::Landing {
+        if self.closing != Closing::No {
             return Ok(());
         }
         self.closing = Closing::Landing;
@@ -2525,9 +2538,29 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.brush.landing()
     }
 
-    /// Whether a close was asked for and nothing is left to land.
+    /// A step of a close's landing, with or without frames: a window hidden, or never sized,
+    /// lands all the same. Returns whether any landed; the caller's events come between steps.
+    ///
+    /// # Errors
+    ///
+    /// As [`Brush::close_step`].
+    pub(crate) fn close_step(&mut self) -> Result<bool> {
+        let size = self.size.or_else(|| self.last_view.map(|(_, size)| size));
+        let Some(size) = size.filter(|_| self.closing != Closing::No) else {
+            return Ok(false);
+        };
+        let landed = self.with_brush(size, B::close_step)?;
+        if landed {
+            self.scheduler.want(Reason::Stroke);
+        }
+        Ok(landed)
+    }
+
+    /// Whether a close was asked for and nothing is left to land: nothing was ever drawn, or the
+    /// brush has landed what it held.
     pub(crate) fn ready_to_close(&self) -> bool {
-        self.closing == Closing::Landing && self.landing() == 0
+        let drawn = self.size.is_some() || self.last_view.is_some();
+        self.closing != Closing::No && (self.landing() == 0 || !drawn)
     }
 
     /// Closes the project: lets the brush apply what it holds and end its stroke, leaves the
