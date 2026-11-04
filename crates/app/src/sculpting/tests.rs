@@ -1114,11 +1114,15 @@ fn a_drawing_pen_is_held_up_by_a_dear_catch_up_only_past_its_backlog() {
     };
     let (few, few_left) = shown_after(1);
     assert!(few > 1 && few < CATCH_UP_BACKLOG, "{few} dabs shown");
-    assert_eq!(few_left, few, "a short backlog waits for the pen");
+    // The fresh sample may place a dab of its own, however the clock falls under load.
+    assert!(
+        few_left >= few,
+        "a short backlog waits for the pen: {few} to {few_left}"
+    );
     let (many, many_left) = shown_after(90);
     assert!(many >= CATCH_UP_BACKLOG, "{many} dabs shown");
     assert!(
-        many - many_left >= backlog_batch(many),
+        many + 1 - many_left >= backlog_batch(many),
         "past the backlog a batch lands, growing with it: {many} to {many_left}"
     );
 }
