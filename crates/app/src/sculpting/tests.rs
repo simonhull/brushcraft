@@ -142,7 +142,23 @@ fn stroke((from, to): ((f64, f64), (f64, f64)), steps: u32) -> Vec<PenSample> {
     let samples = std::iter::once(sample(Phase::Down, from, 0.8))
         .chain(drags)
         .chain(std::iter::once(sample(Phase::Up, to, 0.0)));
-    let mut samples: Vec<PenSample> = samples.collect();
+    taken_up_to_now(samples.collect())
+}
+
+/// A stroke to and fro along [`ACROSS`], `passes` times, its pen left down: as [`stroke()`].
+fn to_and_fro(passes: u32) -> Vec<PenSample> {
+    let (from, to) = ACROSS;
+    let at = |k: u32| {
+        let t = f64::from(k % 16).min(f64::from(16 - k % 16)) / 8.0;
+        (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
+    };
+    let drags = (1..=passes * 8).map(|k| sample(Phase::Drag, at(k), 0.8));
+    let samples = std::iter::once(sample(Phase::Down, from, 0.8)).chain(drags);
+    taken_up_to_now(samples.collect())
+}
+
+/// `samples`, oldest first, taken at the scripted pen's rate up to now.
+fn taken_up_to_now(mut samples: Vec<PenSample>) -> Vec<PenSample> {
     let now = Instant::now();
     let period = Duration::from_secs_f64(crate::script::PEN_RATE.recip());
     let count = u32::try_from(samples.len()).expect("a few");
@@ -1034,6 +1050,40 @@ fn the_brushs_pixel_size_off_centre_in_a_magnified_view_is_its_images_pixel() {
     assert!(
         (unmagnified / radius - camera.magnification()).abs() < 1e-9,
         "the magnification's share of it"
+    );
+}
+
+/// A drawing pen, however long the catch-up has landed nothing, makes no sample wait behind a dab
+/// that doesn't fit: only the backlog's size does.
+#[test]
+fn a_drawing_pen_is_held_up_by_a_dear_catch_up_only_past_its_backlog() {
+    let long_ago = Instant::now()
+        .checked_sub(CATCH_UP_STARVED * 4)
+        .expect("after the epoch");
+    let shown_after = |passes: u32| {
+        let dir = TestDir::new();
+        let mut owner = owner_of(
+            project(&dir),
+            |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+            setup(),
+        );
+        run(&mut owner, 10_000);
+        queue(&mut owner, to_and_fro(passes));
+        run(&mut owner, 1);
+        let shown = owner.brush().last().dabs_catching_up;
+        owner.brush_mut().landed_at = long_ago;
+        // Fresh from its samples, the pen still draws.
+        run(&mut owner, 2);
+        (shown, owner.brush().last().dabs_catching_up)
+    };
+    let (few, few_left) = shown_after(1);
+    assert!(few > 1 && few < CATCH_UP_BACKLOG, "{few} dabs shown");
+    assert_eq!(few_left, few, "a short backlog waits for the pen");
+    let (many, many_left) = shown_after(12);
+    assert!(many >= CATCH_UP_BACKLOG, "{many} dabs shown");
+    assert!(
+        many_left < many,
+        "past the backlog a dab lands all the same"
     );
 }
 

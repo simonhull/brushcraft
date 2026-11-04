@@ -76,9 +76,10 @@
 //! on the surface, batches of a sample's interval; once the pen lifts, each step takes at least
 //! one dab, in batches of up to [`CATCH_UP_BATCH`]. A frame's own step takes what fits the slack
 //! its time leaves, if it showed nothing. While the pen is down progress is guaranteed all the
-//! same: a catch-up that has landed nothing for [`CATCH_UP_STARVED`] (a quarter of that past
-//! [`CATCH_UP_BACKLOG`] dabs) takes one dab off a frame's step, whatever it costs; so the backlog
-//! stays bounded, at the price of that one dab's time before a sample. Each
+//! same, off a frame's step and whatever the dab costs: under a resting pen a catch-up that has
+//! landed nothing for [`CATCH_UP_STARVED`] takes one dab, and under a drawing pen one holding
+//! [`CATCH_UP_BACKLOG`] dabs takes one every quarter of that; so the backlog stays bounded, and
+//! only past that size does a dab's time come before a sample. Each
 //! batch that lands makes the previews it moved again over what landed ([`Preview::land`]); once
 //! every dab has landed none is left and the surface is exact, which the record's
 //! `dabs_catching_up` counts down to. The saved result is that of applying the dabs at once, bit
@@ -223,12 +224,16 @@ fn smoothed_interval(interval: Duration, gap: Duration) -> Duration {
 /// Tiles the warming evaluates together on the store's workers between checks of its deadline.
 pub(crate) const WARM_BATCH: usize = 16;
 
-/// How long a catch-up may land nothing while the pen is down before it takes a dab all the same
-/// (off a frame's step): about three 60 Hz frames.
+/// How long a catch-up may land nothing under a pen resting on the surface before it takes a dab
+/// all the same (off a frame's step), whatever it costs: no sample waits behind it. About three
+/// 60 Hz frames.
 pub(crate) const CATCH_UP_STARVED: Duration = Duration::from_millis(50);
 
-/// How many dabs a catch-up may hold while the pen is down before it takes one all the same four
-/// times as often ([`CATCH_UP_STARVED`] / 4).
+/// How many dabs a catch-up may hold under a drawing pen before it takes one all the same.
+///
+/// It then takes them four times as often as [`CATCH_UP_STARVED`]. Only here does a dab's whole
+/// cost hold a sample up, so the rule is the backlog's size, not how long it has waited: dear
+/// dabs taken by time cost a scribble half its frames.
 pub(crate) const CATCH_UP_BACKLOG: usize = 96;
 
 /// How many dab spacings ahead of an open stroke's last dab the warming ahead of it looks
@@ -1165,8 +1170,11 @@ impl Sculpting {
         let waits = self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0;
         let before_next = self.before_next_sample().filter(|_| !waits);
         let waited = self.landed_at.elapsed();
-        let behind = waited >= CATCH_UP_STARVED
-            || (self.catching_up() >= CATCH_UP_BACKLOG && waited >= CATCH_UP_STARVED / 4);
+        let behind = if moving {
+            self.catching_up() >= CATCH_UP_BACKLOG && waited >= CATCH_UP_STARVED / 4
+        } else {
+            waited >= CATCH_UP_STARVED
+        };
         let Some(front) = self.stroke.as_mut() else {
             return;
         };

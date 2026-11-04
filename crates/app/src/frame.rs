@@ -2494,6 +2494,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         &self.brush
     }
 
+    /// The brush, to change: a test's stand-in for time gone by.
+    #[cfg(test)]
+    pub(crate) const fn brush_mut(&mut self) -> &mut B {
+        &mut self.brush
+    }
+
     /// What the brush did between the last frame and the next, not yet counted by a frame.
     #[cfg(test)]
     pub(crate) const fn between_report(&self) -> Option<BrushReport> {
