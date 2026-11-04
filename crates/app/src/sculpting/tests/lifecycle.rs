@@ -183,6 +183,43 @@ fn light_then_heavy(
     Some((owner, samples))
 }
 
+/// A store failing as a close lands reaches the process: the dabs it drops aren't lost in silence.
+#[test]
+fn a_store_error_while_closing_is_an_error_of_the_close() {
+    let minimum = tight(0).minimum_budget(&cube_sphere(2).expect("a cube sphere"));
+    let budget = |step: usize| minimum + step * (64 << 10);
+    let fits = |step: usize| {
+        let dir = TestDir::new();
+        light_then_heavy(&dir, budget(step))
+            .map(|(owner, _)| owner.close().expect("closed"))
+            .is_some()
+    };
+    let (mut low, mut high) = (0, 512);
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if fits(middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    let dir = TestDir::new();
+    let (mut owner, heavy) = light_then_heavy(&dir, budget(high)).expect("it fits, as found");
+    // Held for a frame that never came: the close takes them in, and they don't fit.
+    owner.brush_mut().held.extend(heavy.into_iter().map(Some));
+    owner.request_close().expect("a close");
+    let mut steps = 0;
+    let failed = loop {
+        match owner.close_step() {
+            Err(error) => break error,
+            Ok(_) => assert!(!owner.ready_to_close(), "landed with no failure"),
+        }
+        steps += 1;
+        assert!(steps < 10_000, "the landing ends");
+    };
+    assert!(failed.to_string().contains("applying dabs"), "{failed:#}");
+}
+
 #[test]
 fn a_store_error_mid_stroke_ends_it_with_one_record_and_nothing_after() {
     // The least budget the light dabs fit under, found by halving: there the heavy dabs, over
@@ -303,6 +340,7 @@ fn landing_stroke(camera: &Camera, brush: &Sculpting) -> Pending {
         dabs: VecDeque::from([Dab::default()]),
         sources: VecDeque::new(),
         last: times_of(&down),
+        placed_at: Instant::now(),
         interval: FIRST_INTERVAL,
         start_noted: true,
         down_at: down.received,

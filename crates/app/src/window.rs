@@ -48,7 +48,7 @@ use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
 use crate::render_thread::{Hooks, RenderThread};
-use crate::{AppOwner, Ended, ProjectToOpen, Summary, describe_adapter, start};
+use crate::{AppOwner, Ended, ProjectToOpen, Summary, describe_adapter, said_too, start};
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -325,7 +325,7 @@ impl WindowApp {
                 // (`run_window`), however long that takes, with no window left unanswered.
                 drop(window);
                 Ended {
-                    run: result.and(stopped).and(pen_stopped).map(|()| summary),
+                    run: said_too(said_too(result, stopped), pen_stopped).map(|()| summary),
                     owner: Some(owner),
                 }
             }
@@ -637,6 +637,9 @@ impl ApplicationHandler for WindowApp {
 impl Drop for WindowApp {
     /// A loop that ended on its own failure never finished: its frame loop still goes back.
     fn drop(&mut self) {
-        self.wind_up(Ok(()));
+        // Unwinding, a second panic here would abort, and `Project`'s drop flushes recovery.
+        if !std::thread::panicking() {
+            self.wind_up(Ok(()));
+        }
     }
 }

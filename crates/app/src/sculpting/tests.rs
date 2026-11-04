@@ -1157,6 +1157,38 @@ fn a_frame_held_up_forces_no_dab_on_a_pen_still_drawing() {
     );
 }
 
+/// A pen held still may go on reporting, slowly: what makes it resting is that it places no dab,
+/// and a starved catch-up lands one all the same.
+#[test]
+fn a_held_pen_still_reporting_lands_a_starved_dab() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    let mut samples = stroke(ACROSS, 12);
+    samples.pop();
+    queue(&mut owner, samples);
+    run(&mut owner, 1);
+    // Its first report may place the dab the stroke's lag left.
+    owner.pen(sample(Phase::Drag, ACROSS.1, 0.8));
+    run(&mut owner, 2);
+    let shown = owner.brush().last().dabs_catching_up;
+    assert!(shown > 1, "dabs shown");
+    for _ in 0..4 {
+        std::thread::sleep(RESTING_QUIET / 3);
+        owner.pen(sample(Phase::Drag, ACROSS.1, 0.8));
+        run(&mut owner, 2);
+    }
+    let left = owner.brush().last().dabs_catching_up;
+    assert!(
+        left < shown,
+        "still reporting, a dab lands: {shown} to {left}"
+    );
+}
+
 /// A close lands whether or not a frame can be drawn: a hidden window has no size, and the steps
 /// go on without one, the dabs landed and the stroke ended.
 #[test]

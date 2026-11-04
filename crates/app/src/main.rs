@@ -244,14 +244,20 @@ fn settled<O>(
     close: impl FnOnce(O) -> Result<()>,
 ) -> Result<Summary> {
     let closed = owner.map_or(Ok(()), close);
-    let also = |error: anyhow::Error, later: Result<()>| match later {
-        Ok(()) => error,
-        Err(cause) => error.context(format!("and then: {cause:#}")),
-    };
-    match (run, ran) {
-        (Ok(summary), Ok(())) => closed.map(|()| summary),
-        (Ok(_), Err(error)) => Err(also(error, closed)),
-        (Err(error), ran) => Err(also(also(error, ran), closed)),
+    said_too(said_too(run, ran), closed)
+}
+
+/// `first`, or `later`'s error if it was fine; if both failed, the first error with the later as
+/// its context, so neither goes unsaid.
+///
+/// # Errors
+///
+/// Either's.
+pub(crate) fn said_too<T>(first: Result<T>, later: Result<()>) -> Result<T> {
+    match (first, later) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cause)) => Err(error.context(format!("and then: {cause:#}"))),
     }
 }
 

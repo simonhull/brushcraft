@@ -130,7 +130,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::f64::consts::FRAC_PI_2;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use geom::TileKey;
 use input::Phase;
 use render::camera::View;
@@ -250,11 +250,12 @@ pub(crate) const WARM_BATCH: usize = 16;
 /// 60 Hz frames.
 pub(crate) const CATCH_UP_STARVED: Duration = Duration::from_millis(50);
 
-/// How long a pen must have sent nothing before it counts as resting, for a starved catch-up.
+/// How long a pen must have placed no dab before it counts as resting, for a starved catch-up.
 ///
-/// Much longer than [`STROKE_QUIET`]: a frame held up past that, the samples waiting unread, isn't
-/// a resting pen, and a dab forced then held the samples up further. Every 50 ms of stall on a
-/// busy machine took a dab of up to 450 ms, and a fast stroke came out seconds behind.
+/// It may go on reporting: what counts is the dabs, not the samples. Much longer than
+/// [`STROKE_QUIET`]: a frame held up past that, the samples waiting unread, isn't a resting pen,
+/// and a dab forced then held the samples up further. Every 50 ms of stall on a busy machine took
+/// a dab of up to 450 ms, and a fast stroke came out seconds behind.
 pub(crate) const RESTING_QUIET: Duration = Duration::from_millis(250);
 
 /// How many dabs a catch-up may hold under a drawing pen before it takes them all the same, four
@@ -556,6 +557,8 @@ struct Pending {
     sources: VecDeque<Source>,
     /// Its last sample's times: a lost `Up`'s tail is timed from it.
     last: SampleTimes,
+    /// When a sample last placed a dab: a held pen goes on reporting, but isn't drawing.
+    placed_at: Instant,
     /// How often its samples arrive, smoothed: when the next is due, which the catch-up keeps
     /// clear of ([`Sculpting::before_next_sample`]).
     interval: Duration,
@@ -1004,6 +1007,7 @@ impl Sculpting {
             dabs: VecDeque::new(),
             sources: VecDeque::new(),
             last: times_of(down),
+            placed_at: Instant::now(),
             interval: FIRST_INTERVAL,
             start_noted: false,
             down_at: down.received,
@@ -1041,7 +1045,11 @@ impl Sculpting {
                     &mut pending.sources,
                     &mut pending.heading,
                 );
+                let before = queue.0.len();
                 enqueue(queue, placed, times, scene.index);
+                if pending.dabs.len() > before {
+                    pending.placed_at = Instant::now();
+                }
                 pending.note_start(&mut self.stroke_start);
             }
             Err(error) => {
@@ -1215,14 +1223,14 @@ impl Sculpting {
         let waited = self.landed_at.elapsed();
         let backlog = self.catching_up();
         let limit = self.backlog_limit;
-        let behind = if moving {
+        let drawing = self
+            .stroke
+            .as_ref()
+            .is_some_and(|stroke| stroke.placed_at.elapsed() < RESTING_QUIET);
+        let behind = if drawing {
             backlog >= self.backlog_limit && waited >= CATCH_UP_STARVED / 4
         } else {
-            let quiet = self
-                .stroke
-                .as_ref()
-                .map_or(Duration::MAX, |stroke| stroke.last.received.elapsed());
-            waited >= CATCH_UP_STARVED && quiet >= RESTING_QUIET
+            waited >= CATCH_UP_STARVED
         };
         let Some(front) = self.stroke.as_mut() else {
             return;
@@ -1276,7 +1284,7 @@ impl Sculpting {
         };
         let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
         let at_least_one = first && (forced || starved);
-        let (count, predicted) = if starved && moving {
+        let (count, predicted) = if starved && drawing {
             self.cost.take(
                 tiles.take(backlog_batch(backlog, limit)),
                 Duration::MAX,
@@ -1458,6 +1466,24 @@ impl Sculpting {
             }
         }
         Ok(record)
+    }
+
+    /// How many errors have been kept: for [`Sculpting::failed_since`].
+    const fn errors_kept(&self) -> u64 {
+        self.errors
+    }
+
+    /// An error if one was kept since there were `before`: landing for a close has no overlay left
+    /// to say it on, and dabs dropped must reach the process's exit.
+    ///
+    /// # Errors
+    ///
+    /// The error kept.
+    fn failed_since(&self, before: u64) -> Result<()> {
+        match &self.error {
+            Some(error) if self.errors != before => Err(anyhow!("{error}")),
+            _ => Ok(()),
+        }
     }
 
     /// Keeps `error`, from `doing`, for the overlay.
@@ -1898,6 +1924,7 @@ impl Brush for Sculpting {
     }
 
     fn close_step(&mut self, context: BrushContext<'_>) -> Result<bool> {
+        let errors = self.errors_kept();
         let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) else {
             // No scene ever: no stroke began, and what waits to begin can't.
             self.held.clear();
@@ -1923,6 +1950,7 @@ impl Brush for Sculpting {
         self.note_kept(scene.project.store());
         let landed = report.dabs_applied > 0;
         self.caught_up = std::mem::take(&mut self.caught_up).then(report);
+        self.failed_since(errors)?;
         Ok(landed)
     }
 
@@ -1932,6 +1960,7 @@ impl Brush for Sculpting {
     }
 
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {
+        let errors = self.errors_kept();
         self.closing = Closing::No;
         if let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) {
             let held = std::mem::take(&mut self.held);
@@ -1947,7 +1976,7 @@ impl Brush for Sculpting {
                 self.release_deferred(&mut scene);
             }
         }
-        Ok(())
+        self.failed_since(errors)
     }
 
     fn change(&mut self, change: BrushChange) -> bool {
