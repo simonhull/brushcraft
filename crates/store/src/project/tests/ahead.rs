@@ -155,6 +155,46 @@ fn a_tile_lost_after_it_was_copied_stays_at_its_last_saved_state() {
     );
 }
 
+/// So too a tile no edit touched since its copy, its record found unreadable by a roll-over: the
+/// store reads its last saved state from then on, and the copy would differ from that.
+#[test]
+fn a_tile_whose_record_went_bad_after_it_was_copied_stays_at_its_last_saved_state() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let top = tiles(&mesh(), TOP, TOP);
+    let (lost, other) = (top[5], top[30]);
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    assert_saved(project.save_as(&path));
+    let mut want = CorrectionMap::new();
+    let mut scratch = CorrectionMap::new();
+    let c = Vec3::new(0.0, 0.0, 0.25);
+    interior(&mut project, &mut [&mut scratch], lost, c);
+    project.finish_flushes().unwrap();
+    project.store().evict_all().unwrap();
+    copy_all(&mut project);
+    let old = project.recovery_path().unwrap().to_path_buf();
+    let loc = project.store().working().locate(&lost).unwrap();
+    damage(&old, loc);
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    interior(
+        &mut project,
+        &mut [&mut want],
+        other,
+        Vec3::new(0.25, 0.0, 0.0),
+    );
+    while project.recovery_path().unwrap() == old {
+        drop(project.poll());
+        std::thread::yield_now();
+    }
+    drop(project.save().unwrap());
+    project.close(false).unwrap();
+    assert_project_file(
+        &path,
+        &want,
+        "the other tile, and the lost one as last saved",
+    );
+}
+
 #[test]
 fn a_tile_evicted_after_it_was_copied_is_still_saved() {
     let dir = TestDir::new();
