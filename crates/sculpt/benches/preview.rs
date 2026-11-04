@@ -36,6 +36,11 @@
 //!   it: on the finest tiles alone (the preview before display tiles, every tile the dab reaches
 //!   moved and its display levels left to stand-ins), or on the display tiles of a coarse cut
 //!   ([`CUT`] levels below the finest) and every level above it, no finest tile drawn.
+//! - [`show_first_of_many`]: [`Preview::show`] of the first dab shown of a stroke that has changed
+//!   more than a thousand tiles, every dab before it applied at once: every display preview it
+//!   reaches made there and then, replaying the stroke and gathering what it changed.
+//! - [`note_late_in_stroke`]: [`Preview::note_applied`] of one dab with [`LONG_STROKE`]'s dabs
+//!   before it: what a dab pays for the stroke's length in `push_stroke`.
 
 #![expect(
     clippy::expect_used,
@@ -57,6 +62,9 @@ fn main() {
 
 /// The level edited.
 const LEVEL: u8 = 8;
+
+/// The dabs before the one noted in [`note_late_in_stroke`].
+const LONG_STROKE: [usize; 3] = [100, 1_000, 10_000];
 
 /// The dabs' radius, on the unit sphere.
 const RADIUS: f32 = 0.2;
@@ -520,6 +528,83 @@ impl Drawing {
             }
         }
     }
+}
+
+/// [`Preview::show`] of the first dab shown of a long big stroke: see the module notes.
+///
+/// # Panics
+///
+/// If showing fails, which would be a bug.
+#[divan::bench(sample_count = 10, sample_size = 1)]
+#[expect(
+    clippy::print_stderr,
+    reason = "a bench reports the footprint it measured beside divan's timings"
+)]
+fn show_first_of_many(bencher: divan::Bencher<'_, '_>) {
+    let ridge = RefCell::new(Ridge::made(BIG_RADIUS, 60, true));
+    let earlier: Vec<Dab> = {
+        let ridge = &mut *ridge.borrow_mut();
+        let dabs: Vec<Dab> = (0..40).map(|_| ridge.next_dab()).collect();
+        ridge.apply(&dabs);
+        dabs
+    };
+    bencher
+        .with_inputs(|| {
+            let ridge = &mut *ridge.borrow_mut();
+            ridge
+                .preview
+                .end_stroke(ridge.project.store())
+                .expect("end");
+            ridge.preview = Preview::new();
+            ridge
+                .preview
+                .note_applied(ridge.project.store(), &ridge.index, &earlier)
+                .expect("note");
+            ridge.next_dab()
+        })
+        .bench_local_values(|dab| {
+            let ridge = &mut *ridge.borrow_mut();
+            ridge
+                .preview
+                .show(
+                    ridge.project.store(),
+                    &ridge.index,
+                    &[dab],
+                    &|key: &TileKey| Drawing::Display.draws(key),
+                )
+                .expect("show")
+        });
+    let ridge = &mut *ridge.borrow_mut();
+    let changed = ridge.project.store().pen_down_tiles();
+    let displays = ridge.project.store().display_previewed().count();
+    eprintln!("show_first_of_many: {changed} tiles changed, {displays} display previews");
+}
+
+/// [`Preview::note_applied`] of a dab late in a long stroke: see the module notes.
+///
+/// # Panics
+///
+/// If noting fails, which would be a bug.
+#[divan::bench(args = LONG_STROKE, sample_count = 50, sample_size = 1)]
+fn note_late_in_stroke(bencher: divan::Bencher<'_, '_>, dabs: usize) {
+    let ridge = RefCell::new(Ridge::of(RADIUS, 2));
+    let one = {
+        let ridge = &mut *ridge.borrow_mut();
+        let one = ridge.next_dab();
+        let many = vec![one; dabs];
+        ridge
+            .preview
+            .note_applied(ridge.project.store(), &ridge.index, &many)
+            .expect("note");
+        one
+    };
+    bencher.bench_local(|| {
+        let ridge = &mut *ridge.borrow_mut();
+        ridge
+            .preview
+            .note_applied(ridge.project.store(), &ridge.index, &[one])
+            .expect("note");
+    });
 }
 
 /// [`Preview::show`] of a stroke's next dab, the earlier ones all shown: see the module notes.

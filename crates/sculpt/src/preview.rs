@@ -228,6 +228,8 @@ pub struct Preview {
     /// Per dab of `stroke`, in order, the strengths of the stroke's dabs overlapping it (itself
     /// included): no place moves farther than the largest.
     overlaps: Vec<f64>,
+    /// The largest of `overlaps`.
+    overlap_most: f64,
     /// The tiles [`Preview::make_waiting`] tried and got no preview of (nothing moves them, or
     /// they have no record), left out until a landing changes the store under them; a new dab
     /// that moves one makes its preview itself.
@@ -419,17 +421,19 @@ impl Preview {
             let reach = f64::from(reach(other)) + f64::from(reach(&dab));
             if f64::from(apart.dot(apart)) < reach * reach {
                 *overlap += strength;
+                self.overlap_most = self.overlap_most.max(*overlap);
                 own += f64::from(other.strength.abs());
             }
         }
         self.stroke.push(dab);
         self.overlaps.push(own);
+        self.overlap_most = self.overlap_most.max(own);
     }
 
     /// Twice the farthest the stroke's dabs move any place: what the moves' part of a display
     /// preview's bound is capped by (the `display` module's "The bound").
     fn moves_cap(&self) -> f64 {
-        2.0 * self.overlaps.iter().copied().fold(0.0, f64::max)
+        2.0 * self.overlap_most
     }
 
     /// How far the finest work's rounding can move a finest vertex under display tile `key`,
@@ -492,6 +496,7 @@ impl Preview {
         published = published.and(forgotten);
         self.stroke.clear();
         self.overlaps.clear();
+        self.overlap_most = 0.0;
         self.strengths.clear();
         self.note_bytes(store);
         let closed = store.close_preview_epoch();
