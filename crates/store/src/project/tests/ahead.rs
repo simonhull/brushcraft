@@ -99,7 +99,7 @@ fn a_dirty_tile_is_left_for_the_save() {
     assert!(paused_by_io(&paused), "{paused:?}");
     stroke(&mut project, &mut map, 60, 8);
     copy_all(&mut project);
-    project.save().unwrap();
+    drop(project.save().unwrap());
     project.close(false).unwrap();
     assert_project_file(&path, &map, "the stroke no flush took");
 }
