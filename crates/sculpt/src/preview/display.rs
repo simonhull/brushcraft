@@ -64,12 +64,13 @@
 //!   and that against the triangle's blend of the corners' moves (linear interpolation's error);
 //!   both moves lie in `[0, s]` along the dab's normal, so never more than `s`. A dab counts only
 //!   in the quads whose pen-down box, grown by `e₀` (where the finest vertices under the quad lie),
-//!   its sphere touches (cut into cells of a few finest quads for a coarse quad); the tile's bound
-//!   takes the largest cell's sum. Where `e₀` is far larger than the dabs (the coarsest levels),
-//!   every cell's grown box takes every dab near it, so the sum is capped by another bound of the
-//!   same part: `|M(F₀(u)) − Σλ M(P0(v))| ≤ |M(F₀(u))| + max |M(P0(v))| ≤ 2 max_p |M(p)|`, and
-//!   `|M(p)|` is at most the strengths of the dabs overlapping any one dab (every dab holding `p`
-//!   overlaps the one nearest it): local to the stroke, not its length.
+//!   its sphere touches (cut into cells of a few finest quads for a coarse quad, no smaller than
+//!   `e₀`, found by halves so a small dab costs a few boxes); the tile's bound takes the largest
+//!   cell's sum. Where `e₀` is far larger than the dabs (the coarsest levels), every cell's grown
+//!   box takes every dab near it, so the sum is capped by another bound of the same part:
+//!   `|M(F₀(u)) − Σλ M(P0(v))| ≤ |M(F₀(u))| + max |M(P0(v))| ≤ 2 max_p |M(p)|`, and `|M(p)|` is at
+//!   most the strengths of the dabs overlapping any one dab (every dab holding `p` overlaps the one
+//!   nearest it): local to the stroke, not its length.
 //! - `max |D(v) − G(v)|` is measured, in `f64`, over every vertex: the rebased vertices' store bits
 //!   against the sum, and every vertex's rounding.
 //! - `ε`, the finest work's rounding into its stored corrections, lands on every vertex of a finest
@@ -521,9 +522,14 @@ impl DisplayState {
         };
         let Replaced { base, p0, .. } = made;
         let frames: Vec<[Vec3; 2]> = n0.iter().copied().map(frame_of).collect();
-        let per_side = cells_per_side(&key, finest_level);
         let cell_growth = growth_of(pen_down_bound);
         let quads = quads_of(&p0, side, cell_growth);
+        let longest = quads
+            .iter()
+            .map(|quad| quad.half_edge_squared)
+            .fold(0.0, f64::max);
+        let longest = (2.0 * longest).sqrt();
+        let per_side = cells_per_side(&key, finest_level, longest, pen_down_bound);
         let ideal: Vec<[f64; 3]> = p0.iter().copied().map(wide).collect();
         let quad_rows: Vec<Option<Aabb>> = quads
             .chunks(side.saturating_sub(1).max(1))
@@ -616,27 +622,29 @@ impl DisplayState {
                     *span = Some((first.min(column), last.max(column + 1)));
                 }
                 let share = term.at(e0, quad.half_edge_squared);
-                // A quad of one cell: the quad's box is the cell's, rounded up.
-                let at_corner = per_side == 1
+                // A quad of one cell: the quad's box is the cell's, rounded up. A dab holding a
+                // corner counts in every cell (the interpolation blends the corners' moves).
+                let everywhere = per_side == 1
                     || quad
                         .corners
                         .iter()
                         .any(|&corner| touches(point_box(corner).as_ref(), dab));
                 let corners = quad.corners;
-                let growth = self.cell_growth;
-                let counts = |a: usize, b: usize| {
-                    at_corner || touches(cell_box(corners, a, b, per_side, growth).as_ref(), dab)
-                };
-                let cells = (0..per_side).flat_map(|b| (0..per_side).map(move |a| (a, b)));
-                for (n, (a, b)) in cells.enumerate() {
-                    if !counts(a, b) {
-                        continue;
-                    }
-                    if quad.terms.is_empty() {
-                        quad.terms = vec![0.0; per_side * per_side];
-                        self.cells_held += per_side * per_side;
-                    }
-                    if let Some(sum) = quad.terms.get_mut(n) {
+                let mut cells = Vec::new();
+                if everywhere {
+                    cells.extend(0..per_side * per_side);
+                } else {
+                    cells_touched(corners, per_side, self.cell_growth, dab, &mut cells);
+                }
+                if cells.is_empty() {
+                    continue;
+                }
+                if quad.terms.is_empty() {
+                    quad.terms = vec![0.0; per_side * per_side];
+                    self.cells_held += per_side * per_side;
+                }
+                for cell in cells {
+                    if let Some(sum) = quad.terms.get_mut(cell) {
                         *sum += share;
                         self.deepest = self.deepest.max(*sum);
                         touched = true;
@@ -1002,10 +1010,16 @@ fn point_box(point: Vec3) -> Option<Aabb> {
 const CELL_FINEST_QUADS: u32 = 8;
 
 /// How many cells a side each quad of display tile `key` is cut into for its bound: of
-/// [`CELL_FINEST_QUADS`] finest quads each ([`Quad`]), at least one, at most 64.
-fn cells_per_side(key: &TileKey, finest: Level) -> usize {
+/// [`CELL_FINEST_QUADS`] finest quads each ([`Quad`]), at least one, at most 64; a power of two.
+///
+/// No smaller than `e0`, which every cell's box is grown by, over a longest quad edge of
+/// `longest`: smaller cells tell no more dabs apart, and a dab would count in many more of them.
+fn cells_per_side(key: &TileKey, finest: Level, longest: f64, e0: f64) -> usize {
     let step = 1_u32 << (finest.get() - key.level().get());
-    let cells = (step / CELL_FINEST_QUADS).clamp(1, 64);
+    let mut cells = (step / CELL_FINEST_QUADS).clamp(1, 64);
+    while cells > 1 && longest < e0 * f64::from(cells) {
+        cells /= 2;
+    }
     usize::try_from(cells).unwrap_or(1)
 }
 
@@ -1029,40 +1043,98 @@ fn growth_of(e0: f64) -> f32 {
     narrow.next_up()
 }
 
-/// The box of cell `(a, b)` of a quad with corners `corners`, cut into `per_side`² cells.
+/// The box of the part of a quad with corners `corners` from fractions `x` across and `y` down.
 ///
-/// Over the cell's part of the two triangles, whose extremes are at its corners and the ends of
-/// the diagonal; then grown by `growth`, its rounding outward.
-fn cell_box(corners: [Vec3; 4], a: usize, b: usize, per_side: usize, growth: f32) -> Option<Aabb> {
-    #[expect(clippy::cast_precision_loss, reason = "at most 64 cells a side")]
-    let fraction = |k: usize| k as f32 / per_side as f32;
-    let (x0, x1, y0, y1) = (fraction(a), fraction(a + 1), fraction(b), fraction(b + 1));
-    let square = [
-        on_quad(corners, x0, y0),
-        on_quad(corners, x1, y0),
-        on_quad(corners, x0, y1),
-        on_quad(corners, x1, y1),
-    ];
-    // Where the diagonal fx = fy crosses the cell.
+/// Over that part of the two triangles, whose extremes are at its corners and the ends of the
+/// diagonal; then grown by `growth`, its rounding outward.
+fn part_box(corners: [Vec3; 4], x: (f32, f32), y: (f32, f32), growth: f32) -> Option<Aabb> {
+    let ((x0, x1), (y0, y1)) = (x, y);
+    let s0 = on_quad(corners, x0, y0);
+    let s1 = on_quad(corners, x1, y0);
+    let s2 = on_quad(corners, x0, y1);
+    let s3 = on_quad(corners, x1, y1);
+    // Where the diagonal fx = fy crosses the part.
     let (low, high) = (x0.max(y0), x1.min(y1));
-    let [s0, s1, s2, s3] = square;
     let (d0, d1) = if low <= high {
         (on_quad(corners, low, low), on_quad(corners, high, high))
     } else {
         (s0, s0)
     };
-    bounds_of_points(&[s0, s1, s2, s3, d0, d1]).and_then(|cell| grown(&cell, growth))
+    bounds_of_points(&[s0, s1, s2, s3, d0, d1]).and_then(|part| grown(&part, growth))
+}
+
+/// The box of cell `(a, b)` of a quad with corners `corners`, cut into `per_side`² cells, grown
+/// by `growth` ([`part_box`]).
+fn cell_box(corners: [Vec3; 4], a: usize, b: usize, per_side: usize, growth: f32) -> Option<Aabb> {
+    block_box(corners, (a, b, 1), per_side, growth)
+}
+
+/// The box of the `size`² cells from `(a, b)` of a quad cut into `per_side`² cells.
+fn block_box(
+    corners: [Vec3; 4],
+    (a, b, size): (usize, usize, usize),
+    per_side: usize,
+    growth: f32,
+) -> Option<Aabb> {
+    #[expect(clippy::cast_precision_loss, reason = "at most 64 cells a side")]
+    let fraction = |k: usize| k as f32 / per_side as f32;
+    let x = (fraction(a), fraction(a + size));
+    let y = (fraction(b), fraction(b + size));
+    part_box(corners, x, y, growth)
+}
+
+/// How much a box of a part of a quad with corners `corners` may lie past another's that holds
+/// the part: a few roundings of [`on_quad`]'s.
+fn rounding_of(corners: [Vec3; 4]) -> f32 {
+    let size = corners
+        .iter()
+        .map(|c| c.x.abs().max(c.y.abs()).max(c.z.abs()))
+        .fold(0.0, f32::max);
+    8.0 * f32::EPSILON * size
+}
+
+/// Adds to `out` the cells `dab` touches of a quad with corners `corners` cut into `per_side`²
+/// cells (a power of two), their boxes grown by `growth`, by index, row-major.
+///
+/// By halves: a block of cells is looked into only if `dab` touches its box, so a small dab on a
+/// coarse quad costs a few boxes, not one a cell. A block's box is grown past its cells' by their
+/// rounding, so it holds them all.
+fn cells_touched(
+    corners: [Vec3; 4],
+    per_side: usize,
+    growth: f32,
+    dab: &Imprint,
+    out: &mut Vec<usize>,
+) {
+    let margin = growth + rounding_of(corners);
+    let mut blocks = vec![(0, 0, per_side)];
+    while let Some((a, b, size)) = blocks.pop() {
+        if size == 1 {
+            if touches(cell_box(corners, a, b, per_side, growth).as_ref(), dab) {
+                out.push(b * per_side + a);
+            }
+            continue;
+        }
+        if !touches(
+            block_box(corners, (a, b, size), per_side, margin).as_ref(),
+            dab,
+        ) {
+            continue;
+        }
+        let half = size / 2;
+        blocks.extend([
+            (a, b, half),
+            (a + half, b, half),
+            (a, b + half, half),
+            (a + half, b + half, half),
+        ]);
+    }
 }
 
 /// The box of a whole quad with corners `corners` (its cells' boxes grown by `growth`): the
 /// corners' grown by that and a few roundings of [`on_quad`]'s, so it holds every cell's box.
 fn quad_box(corners: [Vec3; 4], growth: f32) -> Option<Aabb> {
-    let size = corners
-        .iter()
-        .map(|c| c.x.abs().max(c.y.abs()).max(c.z.abs()))
-        .fold(0.0, f32::max);
-    let rounding = 8.0 * f32::EPSILON * size;
-    bounds_of_points(&corners).and_then(|quad| grown(&quad, growth + rounding))
+    bounds_of_points(&corners).and_then(|quad| grown(&quad, growth + rounding_of(corners)))
 }
 
 /// The quads of a tile over `positions` (`side²`, row-major), row-major, their cells' boxes grown

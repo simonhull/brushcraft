@@ -7,11 +7,12 @@
 
 use std::collections::BTreeMap;
 
+use brush::Imprint;
 use geom::{Channel, FaceId, Level, TileKey, Vec3};
 use store::{DisplayPreview, Project, SpatialIndex, TileStore};
 use stroke::Dab;
 
-use super::{cell_box, finest_place, quad_box};
+use super::{cell_box, cells_touched, finest_place, quad_box};
 use crate::apply::apply_dabs;
 use crate::preview::tests::{at_once, base, level, open_copy, path, previewed_drawing, run_jobs};
 use crate::preview::{DrawsAll, Preview, WAITING_A_CALL};
@@ -514,7 +515,9 @@ fn a_record_refreshed_mid_stroke_still_gives_its_preview_the_pen_down_surface() 
     project.begin_stroke().unwrap();
     // Six dabs applied at once, then the refresh rebuilds the records over them.
     apply_dabs(project.store(), &mut index, &mut stroke, first).unwrap();
-    preview.note_applied(project.store(), &index, first);
+    preview
+        .note_applied(project.store(), &index, first)
+        .unwrap();
     run_jobs(project.store());
     // Six more shown, then landed: the previews are made over the rebuilt records.
     preview
@@ -718,4 +721,77 @@ fn a_quads_box_holds_every_cell_of_it() {
             }
         }
     }
+}
+
+/// Looking into a quad by halves finds the cells a dab touches, no more and no fewer, however it
+/// lies on the quad.
+#[test]
+fn the_cells_a_dab_touches_are_found_by_halves_as_one_by_one() {
+    let corners = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.1, 0.0),
+        Vec3::new(0.1, 1.0, 0.2),
+        Vec3::new(1.2, 1.1, 0.7),
+    ];
+    let places = [
+        ([0.5, 0.5, 0.3], 0.02),
+        ([0.13, 0.81, 0.2], 0.1),
+        ([0.9, 0.2, 0.1], 0.31),
+        ([3.0, 3.0, 3.0], 0.1),
+    ];
+    for (center, radius) in places {
+        let dab = Imprint::new(center, [0.0, 0.0, 1.0], radius, 0.01, 0.0, [0.0; 4]);
+        for per_side in [2_usize, 8, 64] {
+            for growth in [0.0_f32, 0.01] {
+                let one_by_one: Vec<usize> = (0..per_side * per_side)
+                    .filter(|n| {
+                        let cell = cell_box(corners, n % per_side, n / per_side, per_side, growth);
+                        crate::preview::touches(cell.as_ref(), &dab)
+                    })
+                    .collect();
+                let mut by_halves = Vec::new();
+                cells_touched(corners, per_side, growth, &dab, &mut by_halves);
+                by_halves.sort_unstable();
+                assert_eq!(by_halves, one_by_one, "{center:?}, {per_side} a side");
+            }
+        }
+    }
+}
+
+/// Dabs applied at once, after dabs shown have landed, move the previews the stroke has: they
+/// still bound the finest result, and the next dab shown finds them made.
+#[test]
+fn dabs_applied_at_once_move_the_previews_the_stroke_has() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let dabs = path_dabs(&dir, &base);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "applied");
+    let (shown_first, then_applied) = dabs.split_at(dabs.len() / 2);
+    let mut stroke = Stroke::new(project.store());
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    preview
+        .show(project.store(), &index, shown_first, &display_only)
+        .unwrap();
+    apply_dabs(project.store(), &mut index, &mut stroke, shown_first).unwrap();
+    preview
+        .land(project.store(), &index, shown_first.len(), &display_only)
+        .unwrap();
+    apply_dabs(project.store(), &mut index, &mut stroke, then_applied).unwrap();
+    preview
+        .note_applied(project.store(), &index, then_applied)
+        .unwrap();
+    let shown = previews(project.store());
+    assert_bounds(project.store(), &shown, "after dabs applied at once");
+    let last = shown_first.last().expect("a dab");
+    let again = preview
+        .show(
+            project.store(),
+            &index,
+            std::slice::from_ref(last),
+            &display_only,
+        )
+        .unwrap();
+    assert_eq!(again.gathered, 0, "the previews are still at hand");
+    drop(project.close(false));
 }

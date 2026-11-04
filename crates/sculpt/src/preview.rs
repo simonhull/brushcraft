@@ -330,20 +330,71 @@ impl Preview {
 
     /// Notes `dabs`, applied at once by [`apply_dabs`](crate::apply_dabs) with nothing shown:
     /// they join the stroke's dabs, which every display preview made later takes for its normals
-    /// and bound. The display previews of the stroke so far are let go (none is held, nothing
-    /// being shown): one made again reads the store as the dabs left it.
-    pub fn note_applied(&mut self, store: &mut TileStore, index: &SpatialIndex, dabs: &[Dab]) {
+    /// and bound. Those the stroke has take them as a landing would have: over the finest tiles
+    /// they wrote, with their turn and bound; made again instead, each would replay the whole
+    /// stroke and gather what it wrote, milliseconds in a frame the dabs were found to fit.
+    /// Closes the call's preview epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a tile can't be read or gathered, or the store refuses a preview.
+    pub fn note_applied(
+        &mut self,
+        store: &mut TileStore,
+        index: &SpatialIndex,
+        dabs: &[Dab],
+    ) -> Result<(), SculptError> {
         let imprints: Vec<Imprint> = dabs.iter().filter_map(|dab| imprint_of(dab).ok()).collect();
+        let mut reached: BTreeSet<TileKey> = BTreeSet::new();
         for dab in &imprints {
             for key in index.query_sphere(centre(dab), reach(dab)) {
                 *self.strengths.entry(key).or_insert(0.0) += f64::from(dab.strength.abs());
+                reached.insert(key);
             }
         }
-        for dab in imprints {
-            self.push_stroke(dab);
+        for dab in &imprints {
+            self.push_stroke(*dab);
         }
-        self.displays.clear();
+        if self.displays.is_empty() {
+            return Ok(());
+        }
+        let mut stats = PreviewStats::default();
+        let landed = self.land_applied(store, &imprints, &reached, &mut stats);
         self.note_bytes(store);
+        let closed = store.close_preview_epoch();
+        landed?;
+        closed?;
+        Ok(())
+    }
+
+    /// The display previews the stroke has take `dabs`, already in the store, which changed
+    /// around the finest tiles `reached`; those they touched are handed to the store.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a tile can't be read or gathered, or the store refuses a preview.
+    fn land_applied(
+        &mut self,
+        store: &mut TileStore,
+        dabs: &[Imprint],
+        reached: &BTreeSet<TileKey>,
+        stats: &mut PreviewStats,
+    ) -> Result<(), SculptError> {
+        let queried: Vec<TileKey> = reached.iter().copied().collect();
+        let changed: BTreeSet<TileKey> = store.stale_after(&queried)?.into_iter().collect();
+        let mut every: Vec<&mut DisplayState> = self.displays.values_mut().collect();
+        let touched: Vec<bool> = store.par_map_mut(&mut every, |state| {
+            dabs.iter()
+                .fold(false, |any, dab| state.take(dab, false) | any)
+        });
+        let keys: Vec<TileKey> = self
+            .displays
+            .keys()
+            .zip(touched)
+            .filter(|&(_, touched)| touched)
+            .map(|(key, _)| *key)
+            .collect();
+        self.land_displays(store, Vec::new(), &changed, &keys, stats)
     }
 
     /// Tells the store what the display previews' states hold, for its budget.
@@ -604,7 +655,8 @@ impl Preview {
 
     /// After a landing of the dabs whose reach was `landed`: releases the finest tiles no dab
     /// shown reaches any more, rebases the display previews over the finest tiles `changed` (the
-    /// store moved them), and hands the store those that changed or were released.
+    /// store moved them), and hands the store those that changed or were released, with
+    /// `touched`.
     ///
     /// # Errors
     ///
@@ -614,6 +666,7 @@ impl Preview {
         store: &mut TileStore,
         landed: Vec<Vec<TileKey>>,
         changed: &BTreeSet<TileKey>,
+        touched: &[TileKey],
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
         for key in landed.into_iter().flatten() {
@@ -653,7 +706,9 @@ impl Preview {
             .map(|((key, _), _)| *key)
             .collect();
         let again = self.forget_unchanged(store, again);
-        self.publish(store, &again, stats)
+        let wanted: BTreeSet<TileKey> = again.into_iter().chain(touched.iter().copied()).collect();
+        let wanted: Vec<TileKey> = wanted.into_iter().collect();
+        self.publish(store, &wanted, stats)
     }
 
     /// Of `keys`, the display previews to hand the store again: a released one that never moved
@@ -773,12 +828,12 @@ impl Preview {
             Ok(changed) => {
                 let set: BTreeSet<TileKey> = changed.iter().copied().collect();
                 let finest = self.land_tiles(store, index, changed, drawn, &mut stats);
-                let displays = self.land_displays(store, reach, &set, &mut stats);
+                let displays = self.land_displays(store, reach, &set, &[], &mut stats);
                 finest.and(displays)
             }
             Err(error) => {
                 self.clear(store, &mut stats);
-                let _released = self.land_displays(store, reach, &BTreeSet::new(), &mut stats);
+                let _released = self.land_displays(store, reach, &BTreeSet::new(), &[], &mut stats);
                 Err(error.into())
             }
         };

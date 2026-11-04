@@ -74,14 +74,14 @@
 //! last sample), the catch-up takes only batches the cost model fits before the pen's next sample
 //! is due (its smoothed interval, less a margin), so it doesn't hold a sample up; while it rests
 //! on the surface, batches of a sample's interval; once the pen lifts, each step takes at least
-//! one dab, in batches of up to [`CATCH_UP_BATCH`]. A frame's own step takes what fits the slack
-//! its time leaves, if it showed nothing. While the pen is down progress is guaranteed all the
-//! same, off a frame's step and whatever the dab costs: under a resting pen a catch-up that has
-//! landed nothing for [`CATCH_UP_STARVED`] takes one dab, and under a drawing pen one holding
-//! [`CATCH_UP_BACKLOG`] dabs takes one every quarter of that; so the backlog stays bounded, and
-//! only past that size does a dab's time come before a sample. Each
-//! batch that lands makes the previews it moved again over what landed ([`Preview::land`]); once
-//! every dab has landed none is left and the surface is exact, which the record's
+//! one dab, in batches of up to [`CATCH_UP_BATCH`].
+//! A frame's own step takes what fits the slack its time leaves, if it showed nothing. While the
+//! pen is down progress is guaranteed all the same, off a frame's step and whatever the dab costs:
+//! under a resting pen a catch-up that has landed nothing for [`CATCH_UP_STARVED`] takes one dab,
+//! and under a drawing pen one holding [`CATCH_UP_BACKLOG`] dabs takes one every quarter of that;
+//! so the backlog stays bounded, and only past that size does a dab's time come before a sample.
+//! Each batch that lands makes the previews it moved again over what landed ([`Preview::land`]);
+//! once every dab has landed none is left and the surface is exact, which the record's
 //! `dabs_catching_up` counts down to. The saved result is that of applying the dabs at once, bit
 //! for bit; a save meanwhile holds what has landed (the previews are never saved), the stroke's
 //! later dabs landing in the working file after it.
@@ -1282,9 +1282,11 @@ impl Sculpting {
                 self.land(scene, landing, false);
                 if let Some(preview) = &mut self.preview
                     && !direct.is_empty()
+                    // Applied at once: the stroke's previews count them.
+                    && let Err(error) =
+                        preview.note_applied(scene.project.store(), scene.index, &direct)
                 {
-                    // Applied at once: the stroke's later previews count them.
-                    preview.note_applied(scene.project.store(), scene.index, &direct);
+                    self.fail("moving the previews by dabs applied at once", &error);
                 }
             }
             Err(error) => {
