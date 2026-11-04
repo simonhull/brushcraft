@@ -87,23 +87,21 @@ fn the_next_save_copies_ahead_from_the_start_again() {
     project.close(false).unwrap();
 }
 
-/// A tile dirty as the slices pass it has an out-of-date record: copying that would hide the edit
-/// from the save.
+/// With crash protection paused nothing flushes: a tile edited again is dirty over its old record,
+/// and copying that would hide the edit from the save.
 #[test]
 fn a_dirty_tile_is_left_for_the_save() {
     let dir = TestDir::new();
     let path = dir.path("p.bcrf");
     let mut map = CorrectionMap::new();
     let mut project = edited(&dir, &mut map);
-    project.finish_flushes().unwrap();
-    let edits = random_edits(&project.store().working().mesh(), TOP, 60, 7);
-    project.begin_stroke().unwrap();
-    apply_dabs(project.store(), &mut map, &edits);
+    let paused = fail_and_pause(&mut project, &mut map, 8, io::ErrorKind::Other);
+    assert!(paused_by_io(&paused), "{paused:?}");
+    stroke(&mut project, &mut map, 60, 8);
     copy_all(&mut project);
-    project.end_unrecorded_stroke().unwrap();
-    assert_saved(project.save());
+    project.save().unwrap();
     project.close(false).unwrap();
-    assert_project_file(&path, &map, "the stroke the slices passed");
+    assert_project_file(&path, &map, "the stroke no flush took");
 }
 
 #[test]
