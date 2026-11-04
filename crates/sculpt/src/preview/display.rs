@@ -486,6 +486,7 @@ impl DisplayState {
         store: &mut TileStore,
         keys: &[TileKey],
         dabs: StrokeDabs<'_>,
+        readers: &BTreeMap<TileKey, BTreeSet<TileKey>>,
     ) -> Result<Vec<Self>, CacheError> {
         let Some(finest_level) = store.display_finest() else {
             return Ok(Vec::new());
@@ -514,16 +515,8 @@ impl DisplayState {
         // pen-down blocks', whatever their records hold now (one rebuilt mid-stroke holds bits the
         // stroke moved). The readers of a changed tile are among its normal inputs, as
         // neighbourhood goes both ways.
-        let wanted: BTreeSet<TileKey> = keys.iter().copied().collect();
-        let changed_by_stroke: Vec<TileKey> = store.pen_down_keys().copied().collect();
-        for tile_key in changed_by_stroke {
-            for reader in store.normal_inputs(&tile_key)?.iter() {
-                let mut above = super::display_ancestors(reader);
-                if above.any(|ancestor| wanted.contains(&ancestor)) {
-                    at_pen_down.insert(*reader);
-                }
-            }
-        }
+        let under = keys.iter().filter_map(|key| readers.get(key)).flatten();
+        at_pen_down.extend(under);
         let mut blocks = Blocks::default();
         blocks.add_now(store, &changed)?;
         blocks.add_pen_down(store, &at_pen_down)?;

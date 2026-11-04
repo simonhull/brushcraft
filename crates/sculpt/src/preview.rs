@@ -237,6 +237,9 @@ pub struct Preview {
     overlaps: Vec<f64>,
     /// The largest of `overlaps`.
     overlap_most: f64,
+    /// Per display tile, the finest tiles under it whose blocks read a tile the stroke changed:
+    /// those a preview made there takes at pen-down, kept up as the stroke changes tiles.
+    readers: BTreeMap<TileKey, BTreeSet<TileKey>>,
     /// The tiles [`Preview::make_waiting`] tried and got no preview of (nothing moves them, or
     /// they have no record), left out until a landing changes the store under them; a new dab
     /// that moves one makes its preview itself.
@@ -495,6 +498,8 @@ impl Preview {
         published = published.and(forgotten);
         self.stroke.clear();
         self.dab_index.clear();
+        self.readers.clear();
+        store.take_pen_down_added();
         self.overlaps.clear();
         self.overlap_most = 0.0;
         self.strengths.clear();
@@ -684,8 +689,15 @@ impl Preview {
             .filter(|key| !self.displays.contains_key(key))
             .copied()
             .collect();
+        for changed in store.take_pen_down_added() {
+            for reader in store.normal_inputs(&changed)?.iter() {
+                for above in display_ancestors(reader) {
+                    self.readers.entry(above).or_default().insert(*reader);
+                }
+            }
+        }
         let dabs = StrokeDabs::of(&self.stroke, &self.dab_index, self.shown.len());
-        let built = DisplayState::make_many(store, &fresh, dabs)?;
+        let built = DisplayState::make_many(store, &fresh, dabs, &self.readers)?;
         let mut made = Vec::with_capacity(built.len());
         for state in built {
             made.push(*state.key());

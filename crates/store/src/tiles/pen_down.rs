@@ -280,6 +280,8 @@ impl PositionsBox {
 pub(crate) struct PenDown {
     /// Each changed tile's shape.
     shapes: BTreeMap<TileKey, PenDownShape>,
+    /// The tiles given a shape since [`TileStore::take_pen_down_added`].
+    added: Vec<TileKey>,
     /// The bytes the shapes hold, each counted as [`PenDownShape::bytes`] and its map entry.
     bytes: usize,
     /// The bytes the pools' minimum leaves no room for: held beyond the budget.
@@ -367,7 +369,9 @@ impl TileStore {
             match made {
                 Ok(shape) => {
                     self.pen_down.bytes += shape.bytes() + ENTRY_BYTES;
-                    self.pen_down.shapes.insert(key, shape);
+                    if self.pen_down.shapes.insert(key, shape).is_none() {
+                        self.pen_down.added.push(key);
+                    }
                 }
                 Err(error) => {
                     outcome = Err(error);
@@ -399,7 +403,9 @@ impl TileStore {
         for TakenShape { key, shape, .. } in fresh {
             if keys.contains(&key) && !self.pen_down.shapes.contains_key(&key) {
                 self.pen_down.bytes += shape.bytes() + ENTRY_BYTES;
-                self.pen_down.shapes.insert(key, shape);
+                if self.pen_down.shapes.insert(key, shape).is_none() {
+                    self.pen_down.added.push(key);
+                }
             }
         }
         self.keep_pen_down(keys)
@@ -809,6 +815,12 @@ impl TileStore {
     /// Every tile the current stroke changed, with a pen-down shape kept, in key order.
     pub fn pen_down_keys(&self) -> impl Iterator<Item = &TileKey> {
         self.pen_down.shapes.keys()
+    }
+
+    /// The tiles the current stroke changed since the last call: a long stroke's brush keeps up
+    /// with them, not walking every tile the stroke has changed.
+    pub fn take_pen_down_added(&mut self) -> Vec<TileKey> {
+        std::mem::take(&mut self.pen_down.added)
     }
 
     /// How many tiles' pen-down shapes the current stroke keeps.
