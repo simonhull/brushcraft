@@ -27,6 +27,14 @@ struct Grid {
     dabs: Vec<usize>,
 }
 
+impl Grid {
+    /// About the bytes its cells and its list hold, the dabs filed in them aside.
+    fn bytes(&self) -> usize {
+        let cell = size_of::<[i64; 3]>() + size_of::<Vec<usize>>();
+        self.cells.len() * cell + self.dabs.len() * size_of::<usize>()
+    }
+}
+
 /// A stroke's dabs by the cells they touch, in stroke order, one grid per size of dab.
 ///
 /// Pressure sizes a stroke's dabs, so its first may be a tenth of the rest, and on any one grid
@@ -42,6 +50,8 @@ pub(super) struct DabIndex {
     strange: Vec<usize>,
     /// Every dab's box, in order.
     boxes: Vec<DabBox>,
+    /// How many times a dab is filed in a cell.
+    filed: usize,
 }
 
 impl DabIndex {
@@ -63,6 +73,7 @@ impl DabIndex {
         grid.dabs.push(number);
         for cell in cells(range) {
             grid.cells.entry(cell).or_default().push(number);
+            self.filed += 1;
         }
     }
 
@@ -113,6 +124,13 @@ impl DabIndex {
             let axes = first.iter().zip(last).zip(low.iter().zip(&high));
             !axes.into_iter().any(|((a, b), (c, d))| b < c || a > d)
         })
+    }
+
+    /// About the bytes it holds.
+    pub(super) fn bytes(&self) -> usize {
+        let boxes = self.boxes.len() * size_of::<DabBox>();
+        let filed = self.filed * size_of::<usize>();
+        boxes + filed + self.grids.values().map(Grid::bytes).sum::<usize>()
     }
 
     /// Forgets every dab.

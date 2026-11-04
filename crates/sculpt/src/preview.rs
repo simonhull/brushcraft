@@ -99,6 +99,9 @@ use display::{DisplayState, StrokeDabs};
 /// be a whole refined region, and a preview takes some tens of microseconds to a millisecond.
 pub const WAITING_A_CALL: usize = 8;
 
+/// What a set's node keeps for each key in [`Preview::readers`], beside the key: an estimate.
+const READER_BYTES: usize = 16;
+
 /// The most tiles [`Preview::make_waiting`] tries a call, counting those that get no preview.
 const WAITING_TRIES: usize = 4 * WAITING_A_CALL;
 
@@ -240,6 +243,8 @@ pub struct Preview {
     /// Per display tile, the finest tiles under it whose blocks read a tile the stroke changed:
     /// those a preview made there takes at pen-down, kept up as the stroke changes tiles.
     readers: BTreeMap<TileKey, BTreeSet<TileKey>>,
+    /// Tiles the stroke changed that `readers` hasn't taken in yet.
+    unread: Vec<TileKey>,
     /// The tiles [`Preview::make_waiting`] tried and got no preview of (nothing moves them, or
     /// they have no record), left out until a landing changes the store under them; a new dab
     /// that moves one makes its preview itself.
@@ -409,8 +414,11 @@ impl Preview {
 
     /// Tells the store what the display previews' states hold, for its budget.
     fn note_bytes(&self, store: &mut TileStore) {
-        let states = self.displays.values().map(DisplayState::bytes).sum();
-        store.note_preview_state_bytes(states);
+        let states: usize = self.displays.values().map(DisplayState::bytes).sum();
+        let lists = self.readers.values().map(BTreeSet::len);
+        let readers = lists.sum::<usize>() * (size_of::<TileKey>() + READER_BYTES);
+        let stroke = self.stroke.len() * size_of::<Imprint>();
+        store.note_preview_state_bytes(states + readers + stroke + self.dab_index.bytes());
     }
 
     /// Adds `dab` to the stroke's dabs, and its strength to the overlaps of those it overlaps.
@@ -499,6 +507,7 @@ impl Preview {
         self.stroke.clear();
         self.dab_index.clear();
         self.readers.clear();
+        self.unread.clear();
         store.take_pen_down_added();
         self.overlaps.clear();
         self.overlap_most = 0.0;
@@ -689,12 +698,15 @@ impl Preview {
             .filter(|key| !self.displays.contains_key(key))
             .copied()
             .collect();
-        for changed in store.take_pen_down_added() {
+        self.unread.extend(store.take_pen_down_added());
+        while let Some(&changed) = self.unread.last() {
+            // Popped once read: a failure leaves it for the next call.
             for reader in store.normal_inputs(&changed)?.iter() {
                 for above in display_ancestors(reader) {
                     self.readers.entry(above).or_default().insert(*reader);
                 }
             }
+            self.unread.pop();
         }
         let dabs = StrokeDabs::of(&self.stroke, &self.dab_index, self.shown.len());
         let built = DisplayState::make_many(store, &fresh, dabs, &self.readers)?;
