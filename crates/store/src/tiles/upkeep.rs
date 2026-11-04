@@ -1000,8 +1000,8 @@ impl TileStore {
                 continue;
             }
             if self.preview_holds(&key) {
-                // A preview under it: dropped, and looked for again once a preview is cleared
-                // (the `preview` module's "The refresh waits").
+                // Held by a brush: dropped, and looked for again once a tile is released (the
+                // `preview` module's "Held tiles").
                 continue;
             }
             let Some(reads) = tent_reads(&self.mesh, &key) else {
@@ -1067,8 +1067,7 @@ impl TileStore {
                         continue;
                     }
                     if needs.iter().any(|need| self.preview_holds(need)) {
-                        // It waits for a tile a preview holds: dropped with it, until a preview
-                        // is cleared.
+                        // It waits for a held tile: dropped with it, until a tile is released.
                         continue;
                     }
                     later.push(key);

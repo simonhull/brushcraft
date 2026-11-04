@@ -132,7 +132,14 @@ fn a_display_preview_bounds_the_finest_result_shown_and_part_landed() {
     let dir = TestDir::new();
     let base = base(&dir);
     let (mut project, mut index, _) = open_copy(&dir, &base, "bound");
-    let dabs = path(project.store(), 14);
+    let mut dabs = path(project.store(), 14);
+    // And dabs where each coarse level's bound is tightest: a level's finest vertex farthest
+    // from what it draws.
+    for level in 0..4 {
+        let coarse = TileKey::display(FaceId::new(0), Level::new(level).unwrap(), 0, 0).unwrap();
+        let at = worst_place(project.store(), &coarse);
+        dabs.extend((0..2).map(|n| dab(at, 0.08, 0.02, 0.0, 14 + 2 * u32::from(level) + n)));
+    }
     let (first, rest) = dabs.split_at(7);
     let mut stroke = Stroke::new(project.store());
     let mut preview = Preview::new();
@@ -163,7 +170,20 @@ fn a_display_preview_bounds_the_finest_result_shown_and_part_landed() {
         "largest error / bound: shown {shown_ratio:.3}, part landed {part_ratio:.3}, landed \
          {landed_ratio:.3}"
     );
-    assert!(shown_ratio > 0.01, "a bound near the error: {shown_ratio}");
+    // The bound is near the error at every level, not only at the tile that is worst.
+    let mut per_level: BTreeMap<u8, f64> = BTreeMap::new();
+    for (key, made) in &shown {
+        let ratio = farthest(store, key, made) / f64::from(made.bound);
+        let most = per_level.entry(key.level().get()).or_insert(0.0);
+        *most = most.max(ratio);
+    }
+    eprintln!("largest error / bound by level: {per_level:?}");
+    for (level, ratio) in &per_level {
+        assert!(
+            *ratio > 0.2,
+            "level {level}: a bound near the error: {ratio}"
+        );
+    }
     assert!(
         landed.values().all(|p| !p.held),
         "released once every dab landed"
