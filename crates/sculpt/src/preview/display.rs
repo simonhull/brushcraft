@@ -94,6 +94,7 @@ use brush::{
 use geom::{DisplayTile, GatheredBlock, Level, TileKey, Vec3};
 use store::{Aabb, CacheError, DisplayPreview, Evaluation, TileStore};
 
+use super::dabs::DabIndex;
 use super::{bounds_of_points, touches};
 
 #[cfg(test)]
@@ -126,6 +127,28 @@ struct Quad {
     /// quad, as most of a coarse tile's never do. The cells' boxes are worked out as a dab comes
     /// near ([`cell_box`]), not kept.
     terms: Vec<f64>,
+}
+
+/// A stroke's dabs as a display preview takes them.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StrokeDabs<'a> {
+    /// Every dab of the stroke, in order.
+    stroke: &'a [Imprint],
+    /// Which of them can reach a place.
+    index: &'a DabIndex,
+    /// The number of the first still to land.
+    first_pending: usize,
+}
+
+impl<'a> StrokeDabs<'a> {
+    /// The dabs of `stroke`, its last `pending` still to land.
+    pub(super) const fn of(stroke: &'a [Imprint], index: &'a DabIndex, pending: usize) -> Self {
+        Self {
+            stroke,
+            index,
+            first_pending: stroke.len().saturating_sub(pending),
+        }
+    }
 }
 
 /// One display tile's preview as the brush keeps it while its stroke lasts (see the module
@@ -168,6 +191,8 @@ pub(super) struct DisplayState {
     deepest: f64,
     /// How many cells' sums are held ([`Quad::terms`]).
     cells_held: usize,
+    /// How many of the stroke's dabs it took as it was made.
+    replayed: usize,
     /// Whether it was last handed to the store held.
     pub(super) published_held: Option<bool>,
 }
@@ -460,8 +485,7 @@ impl DisplayState {
     pub(super) fn make_many(
         store: &mut TileStore,
         keys: &[TileKey],
-        stroke: &[Imprint],
-        pending: &[Imprint],
+        dabs: StrokeDabs<'_>,
     ) -> Result<Vec<Self>, CacheError> {
         let Some(finest_level) = store.display_finest() else {
             return Ok(Vec::new());
@@ -512,8 +536,7 @@ impl DisplayState {
                     *displacement,
                     finest_level,
                     blocks,
-                    stroke,
-                    pending,
+                    dabs,
                 )
             }),
         )
@@ -527,8 +550,7 @@ impl DisplayState {
         displacement: f32,
         finest_level: Level,
         blocks: &Blocks,
-        stroke: &[Imprint],
-        pending: &[Imprint],
+        dabs: StrokeDabs<'_>,
     ) -> Self {
         let key = *tile.key();
         let side = usize::try_from(key.side()).unwrap_or(0);
@@ -595,11 +617,18 @@ impl DisplayState {
             cell_growth,
             deepest: 0.0,
             cells_held: 0,
+            replayed: 0,
             published_held: None,
         };
-        let landed = stroke.len().saturating_sub(pending.len());
-        for (n, dab) in stroke.iter().enumerate() {
-            state.take(dab, n >= landed);
+        // A dab that misses the tile's box takes nothing: only those near it are walked.
+        if let Some(whole) = state.bounds {
+            let near = dabs.index.near(&whole, 0);
+            state.replayed = near.len();
+            for n in near {
+                if let Some(dab) = dabs.stroke.get(n) {
+                    state.take(dab, n >= dabs.first_pending);
+                }
+            }
         }
         state
     }
@@ -619,6 +648,11 @@ impl DisplayState {
             + size_of_val(self.quads.as_slice())
             + size_of_val(self.quad_rows.as_slice())
             + self.cells_held * size_of::<f64>()
+    }
+
+    /// How many of the stroke's dabs it took as it was made.
+    pub(super) const fn replayed(&self) -> usize {
+        self.replayed
     }
 
     /// The tile.
@@ -754,19 +788,30 @@ impl DisplayState {
         finest: Level,
         blocks: &Blocks,
         changed: &BTreeSet<TileKey>,
-        pending: &[Imprint],
+        dabs: StrokeDabs<'_>,
     ) -> bool {
         let mut any = false;
         for under in changed {
             let Some(block) = blocks.now.get(under) else {
                 continue;
             };
-            for (v, col, row) in vertices_in(&self.key, finest, under) {
+            let vertices = vertices_in(&self.key, finest, under);
+            // The dabs still to land near these vertices: the others move none of them.
+            let starts = vertices
+                .iter()
+                .filter_map(|&(v, ..)| self.p0.get(v).copied());
+            let starts: Vec<Vec3> = starts.collect();
+            let near = bounds_of_points(&starts).map_or_else(Vec::new, |bounds| {
+                dabs.index.near(&bounds, dabs.first_pending)
+            });
+            let near = near.iter().filter_map(|&n| dabs.stroke.get(n));
+            let pending: Vec<&Imprint> = near.collect();
+            for (v, col, row) in vertices {
                 let (Some(out), Some(start)) = (self.drawn.get_mut(v), self.p0.get(v)) else {
                     continue;
                 };
                 let mut at = block.get(i64::from(col), i64::from(row));
-                for dab in pending {
+                for dab in &pending {
                     if let Some(w) =
                         draw_imprint_vertex(&Smoothstep, dab, [start.x, start.y, start.z])
                         && w != 0.0

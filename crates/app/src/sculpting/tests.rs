@@ -1143,6 +1143,7 @@ fn a_drawing_pen_is_held_up_by_a_dear_catch_up_only_past_its_backlog() {
             |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
             setup(),
         );
+        owner.brush_mut().backlog_limit = 512;
         run(&mut owner, 10_000);
         queue(&mut owner, to_and_fro(passes));
         run(&mut owner, 1);
@@ -1159,16 +1160,16 @@ fn a_drawing_pen_is_held_up_by_a_dear_catch_up_only_past_its_backlog() {
         (shown, owner.brush().last().dabs_catching_up)
     };
     let (few, few_left) = shown_after(1);
-    assert!(few > 1 && few < CATCH_UP_BACKLOG, "{few} dabs shown");
+    assert!(few > 1 && few < 512, "{few} dabs shown");
     // The fresh sample may place a dab of its own, however the clock falls under load.
     assert!(
         few_left >= few,
         "a short backlog waits for the pen: {few} to {few_left}"
     );
     let (many, many_left) = shown_after(90);
-    assert!(many >= CATCH_UP_BACKLOG, "{many} dabs shown");
+    assert!(many >= 512, "{many} dabs shown");
     assert!(
-        many + 1 - many_left >= backlog_batch(many),
+        many + 1 - many_left >= backlog_batch(many, 512),
         "past the backlog a batch lands, growing with it: {many} to {many_left}"
     );
 }

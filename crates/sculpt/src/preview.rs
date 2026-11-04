@@ -89,9 +89,11 @@ use stroke::Dab;
 
 use crate::apply::{SculptError, imprint_of};
 
+mod dabs;
 mod display;
 
-use display::DisplayState;
+use dabs::DabIndex;
+use display::{DisplayState, StrokeDabs};
 
 /// The most previews [`Preview::make_waiting`] makes a call: what a renderer asks for at once can
 /// be a whole refined region, and a preview takes some tens of microseconds to a millisecond.
@@ -111,6 +113,9 @@ pub struct PreviewStats {
     pub tiles_cleared: usize,
     /// Tiles gathered from the store to preview (or look at) afresh.
     pub gathered: usize,
+    /// Dabs taken again by display previews made ([`DabIndex::near`]): what a fresh tile costs,
+    /// which follows the dabs near it, not the stroke's length.
+    pub replayed: usize,
 }
 
 /// A tile being moved in one call: its block, its pen-down block and box, and whether a dab
@@ -218,6 +223,8 @@ pub struct Preview {
     /// Every dab of the stroke, applied at once or shown, in order: what a display preview's
     /// normals and bound take.
     stroke: Vec<Imprint>,
+    /// Which of `stroke`'s dabs can reach a place.
+    dab_index: DabIndex,
     /// Per finest tile held, how many dabs shown reach it.
     held: BTreeMap<TileKey, usize>,
     /// The display tiles previewed in this stroke.
@@ -391,18 +398,9 @@ impl Preview {
     ) -> Result<(), SculptError> {
         let queried: Vec<TileKey> = reached.iter().copied().collect();
         let changed: BTreeSet<TileKey> = store.stale_after(&queried)?.into_iter().collect();
-        let mut every: Vec<&mut DisplayState> = self.displays.values_mut().collect();
-        let touched: Vec<bool> = store.par_map_mut(&mut every, |state| {
-            dabs.iter()
-                .fold(false, |any, dab| state.take(dab, false) | any)
-        });
-        let keys: Vec<TileKey> = self
-            .displays
-            .keys()
-            .zip(touched)
-            .filter(|&(_, touched)| touched)
-            .map(|(key, _)| *key)
-            .collect();
+        let above = reached.iter().flat_map(display_ancestors);
+        let above: BTreeSet<TileKey> = above.collect();
+        let keys = self.moved_by(store, &above, dabs, false);
         self.land_displays(store, Vec::new(), &changed, &keys, stats)
     }
 
@@ -425,6 +423,7 @@ impl Preview {
                 own += f64::from(other.strength.abs());
             }
         }
+        self.dab_index.push(&dab);
         self.stroke.push(dab);
         self.overlaps.push(own);
         self.overlap_most = self.overlap_most.max(own);
@@ -495,6 +494,7 @@ impl Preview {
         let forgotten = forgotten.map(|_| ());
         published = published.and(forgotten);
         self.stroke.clear();
+        self.dab_index.clear();
         self.overlaps.clear();
         self.overlap_most = 0.0;
         self.strengths.clear();
@@ -617,24 +617,46 @@ impl Preview {
                 .copied()
                 .collect(),
         );
-        let mut moving: Vec<&mut DisplayState> = self
-            .displays
-            .iter_mut()
-            .filter(|(key, _)| known.contains(key))
-            .map(|(_, state)| state)
-            .collect();
-        let moved: Vec<bool> = store.par_map_mut(&mut moving, |state| {
-            new.iter()
-                .fold(false, |any, dab| state.take(dab, true) | any)
-        });
-        let changed: Vec<TileKey> = known
-            .iter()
-            .zip(moved)
-            .filter(|&(_, moved)| moved)
-            .map(|(key, _)| *key)
-            .collect();
+        let changed = self.moved_by(store, &known, new, true);
         self.publish(store, &changed, stats)?;
         self.make_displays(store, &fresh, stats)
+    }
+
+    /// The display previews of `keys` the stroke has take `dabs`, as still to land if `drawn`;
+    /// returns those they touched. Taken out to work on: the stroke may have thousands, a dab
+    /// reaches a few.
+    fn moved_by(
+        &mut self,
+        store: &TileStore,
+        keys: &BTreeSet<TileKey>,
+        dabs: &[Imprint],
+        drawn: bool,
+    ) -> Vec<TileKey> {
+        let mut moving = self.take_states(keys);
+        let moved: Vec<bool> = store.par_map_mut(&mut moving, |state| {
+            dabs.iter()
+                .fold(false, |any, dab| state.take(dab, drawn) | any)
+        });
+        let touched = moving.iter().zip(moved).filter(|&(_, moved)| moved);
+        let touched: Vec<TileKey> = touched.map(|(state, _)| *state.key()).collect();
+        self.put_states(moving);
+        touched
+    }
+
+    /// The states of `keys` the stroke has, out of `displays` ([`Preview::put_states`] them back).
+    fn take_states<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'a TileKey>,
+    ) -> Vec<DisplayState> {
+        let taken = keys.into_iter().filter_map(|key| self.displays.remove(key));
+        taken.collect()
+    }
+
+    /// Puts `states` back.
+    fn put_states(&mut self, states: Vec<DisplayState>) {
+        for state in states {
+            self.displays.insert(*state.key(), state);
+        }
     }
 
     /// Makes display previews of `keys` that the stroke has none of, over the store as it is,
@@ -649,16 +671,17 @@ impl Preview {
         keys: &[TileKey],
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
-        let pending: Vec<Imprint> = self.shown.iter().copied().collect();
         let fresh: Vec<TileKey> = keys
             .iter()
             .filter(|key| !self.displays.contains_key(key))
             .copied()
             .collect();
-        let built = DisplayState::make_many(store, &fresh, &self.stroke, &pending)?;
+        let dabs = StrokeDabs::of(&self.stroke, &self.dab_index, self.shown.len());
+        let built = DisplayState::make_many(store, &fresh, dabs)?;
         let mut made = Vec::with_capacity(built.len());
         for state in built {
             made.push(*state.key());
+            stats.replayed += state.replayed();
             self.displays.insert(*state.key(), state);
             stats.gathered += 1;
         }
@@ -683,12 +706,12 @@ impl Preview {
             }
         }
         let cap = self.moves_cap();
-        let mut publishing: Vec<(bool, f64, &mut DisplayState)> = self
-            .displays
+        let mut taken = self.take_states(rounding.keys());
+        let mut publishing: Vec<(bool, f64, &mut DisplayState)> = taken
             .iter_mut()
-            .filter_map(|(key, state)| {
-                let rounds = rounding.get(key)?;
-                Some((store.preview_held(key), *rounds, state))
+            .filter_map(|state| {
+                let rounds = rounding.get(state.key())?;
+                Some((store.preview_held(state.key()), *rounds, state))
             })
             .collect();
         // Made on the workers, handed over in order.
@@ -697,6 +720,7 @@ impl Preview {
                 state.published_held = Some(*held);
                 (*state.key(), *held, state.publish(*held, *rounds, cap))
             });
+        self.put_states(taken);
         for (key, _, preview) in made {
             store.set_display_preview(key, preview)?;
             stats.tiles_set += 1;
@@ -720,12 +744,15 @@ impl Preview {
         touched: &[TileKey],
         stats: &mut PreviewStats,
     ) -> Result<(), SculptError> {
+        // The display tiles above a tile released: what may no longer be held.
+        let mut released: BTreeSet<TileKey> = BTreeSet::new();
         for key in landed.into_iter().flatten() {
             if let Some(count) = self.held.get_mut(&key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     self.held.remove(&key);
                     store.release_preview(&key);
+                    released.extend(display_ancestors(&key));
                 }
             }
         }
@@ -733,29 +760,37 @@ impl Preview {
             return Ok(());
         };
         // The tiles the stroke wrote among those the landing can have changed (a tile it reached
-        // and moved nothing of keeps its bits, which the records above it hold already).
-        let under: BTreeSet<TileKey> = changed
+        // and moved nothing of keeps its bits, which the records above it hold already), and the
+        // previews over them: a landing costs what it changed, however many the stroke has.
+        let written = changed
             .iter()
-            .filter(|key| store.pen_down_shape(key).is_some())
-            .filter(|key| display_ancestors(key).any(|above| self.displays.contains_key(&above)))
-            .copied()
-            .collect();
+            .filter(|key| store.pen_down_shape(key).is_some());
+        let mut under: BTreeSet<TileKey> = BTreeSet::new();
+        let mut above: BTreeSet<TileKey> = BTreeSet::new();
+        for key in written {
+            let mut over = display_ancestors(key).filter(|up| self.displays.contains_key(up));
+            if let Some(first) = over.next() {
+                under.insert(*key);
+                above.insert(first);
+                above.extend(over);
+            }
+        }
         let mut blocks = display::Blocks::default();
         blocks.add_now(store, &under)?;
-        let pending: Vec<Imprint> = self.shown.iter().copied().collect();
-        let mut every: Vec<&mut DisplayState> = self.displays.values_mut().collect();
-        let rebased: Vec<bool> = store.par_map_mut(&mut every, |state| {
-            state.rebase(finest, &blocks, &under, &pending)
+        let mut taken = self.take_states(&above);
+        let dabs = StrokeDabs::of(&self.stroke, &self.dab_index, self.shown.len());
+        let rebased: Vec<bool> = store.par_map_mut(&mut taken, |state| {
+            state.rebase(finest, &blocks, &under, dabs)
         });
-        let again: Vec<TileKey> = self
-            .displays
-            .iter()
-            .zip(rebased)
-            .filter(|((key, state), rebased)| {
-                *rebased || state.published_held != Some(store.preview_held(key))
-            })
-            .map(|((key, _), _)| *key)
-            .collect();
+        let moved = taken.iter().zip(rebased).filter(|&(_, rebased)| rebased);
+        let moved: Vec<TileKey> = moved.map(|(state, _)| *state.key()).collect();
+        self.put_states(taken);
+        let unheld = released.iter().filter(|key| {
+            self.displays
+                .get(key)
+                .is_some_and(|state| state.published_held != Some(store.preview_held(key)))
+        });
+        let again: Vec<TileKey> = moved.iter().chain(unheld).copied().collect();
         let again = self.forget_unchanged(store, again)?;
         let wanted: BTreeSet<TileKey> = again.into_iter().chain(touched.iter().copied()).collect();
         let wanted: Vec<TileKey> = wanted.into_iter().collect();

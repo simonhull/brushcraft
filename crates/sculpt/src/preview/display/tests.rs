@@ -919,3 +919,55 @@ fn tiles_that_get_no_preview_starve_none_behind_them() {
     }
     drop(project.close(false));
 }
+
+/// A preview made late in a long stroke takes the dabs near it, not all of them: the same work as
+/// one made early, by count.
+#[test]
+fn a_fresh_preview_late_in_a_long_stroke_takes_the_dabs_near_it() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, index, _) = open_copy(&dir, &base, "long");
+    let store = project.store();
+    let key = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let here = crate::testing::vertex(store, key, 32, 32);
+    // The other side of the sphere: on the tile whose middle lies farthest.
+    let faces: Vec<FaceId> = store.mesh().faces().collect();
+    let middles: Vec<Vec3> = faces
+        .iter()
+        .map(|&face| {
+            let tile = TileKey::displacement(face, level(), 0, 0).unwrap();
+            crate::testing::vertex(store, tile, 32, 32)
+        })
+        .collect();
+    let apart = |a: Vec3| (a - here).length();
+    let far_off = middles
+        .into_iter()
+        .max_by(|&a, &b| apart(a).total_cmp(&apart(b)))
+        .unwrap();
+    let made_after = |dabs_before: u32, opened: &mut Project| {
+        let mut preview = Preview::new();
+        opened.begin_stroke().unwrap();
+        let earlier: Vec<Dab> = (0..dabs_before)
+            .map(|n| dab(far_off, 0.02, 0.0001, 0.0, n))
+            .collect();
+        preview
+            .note_applied(opened.store(), &index, &earlier)
+            .unwrap();
+        let last = dab(here, 0.02, 0.0001, 0.0, dabs_before);
+        let shown = preview
+            .show(opened.store(), &index, &[last], &display_only)
+            .unwrap();
+        preview.end_stroke(opened.store()).unwrap();
+        opened.end_unrecorded_stroke().unwrap();
+        (shown.gathered, shown.replayed)
+    };
+    let (gathered, early) = made_after(1, &mut project);
+    let (gathered_late, late) = made_after(2_000, &mut project);
+    assert!(gathered > 0 && gathered_late > 0, "previews made");
+    let per_tile = |replayed: usize, tiles: usize| replayed.div_ceil(tiles);
+    assert!(
+        per_tile(late, gathered_late) <= 2 * per_tile(early, gathered) + 1,
+        "{early} dabs over {gathered} tiles early, {late} over {gathered_late} late"
+    );
+    drop(project.close(false));
+}
