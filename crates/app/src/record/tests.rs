@@ -5,7 +5,7 @@ use super::*;
 use crate::script::Speed;
 
 /// Every field of a frame line, in order: what `brushcraft-bench perf` reads.
-const FRAME_FIELDS: [&str; 83] = [
+const FRAME_FIELDS: [&str; 85] = [
     "bench",
     "result",
     "frame",
@@ -25,6 +25,7 @@ const FRAME_FIELDS: [&str; 83] = [
     "jobs_ms",
     "jobs_built",
     "jobs_left",
+    "jobs_longest_ms",
     "acquire_ms",
     "encode_ms",
     "present_ms",
@@ -79,6 +80,7 @@ const FRAME_FIELDS: [&str; 83] = [
     "submitted_ms",
     "sample_to_present_ms",
     "received_to_present_ms",
+    "sample_wait_ms",
     "dabs_applied",
     "dabs_shown",
     "dabs_carried",
@@ -243,6 +245,7 @@ fn facts_arriving_late_land_on_their_own_frame() {
     let latency = Latency {
         taken: ms(6),
         received: ms(5),
+        waited: ms(2),
     };
     recorder.latency(2, ms(39), Some(latency));
     // Frame 2's cut, as residency's frame 11, heard during frame 3.
@@ -288,6 +291,7 @@ fn facts_arriving_late_land_on_their_own_frame() {
     assert_eq!(value(&line, "submitted_ms"), &Value::Float(39.0));
     assert_eq!(value(&line, "sample_to_present_ms"), &Value::Float(6.0));
     assert_eq!(value(&line, "received_to_present_ms"), &Value::Float(5.0));
+    assert_eq!(value(&line, "sample_wait_ms"), &Value::Float(2.0));
     assert_eq!(value(&line, "dabs_applied"), &Value::Int(3));
     assert_eq!(value(&line, "dabs_carried"), &Value::Int(1));
     assert_eq!(value(&line, "tiles_edited"), &Value::Int(7));

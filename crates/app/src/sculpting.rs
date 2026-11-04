@@ -1783,6 +1783,10 @@ impl Brush for Sculpting {
         Ok(!self.warm.todo.is_empty())
     }
 
+    fn next_sample_due(&self) -> Option<Instant> {
+        self.before_next_sample().filter(|_| self.pen_moving())
+    }
+
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {
         if let Some(mut scene) = Scene::of(context) {
             let held = std::mem::take(&mut self.held);

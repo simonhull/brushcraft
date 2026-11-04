@@ -67,17 +67,18 @@
 //!   call returned, on the frame loop's clock), `sample_to_present_ms` (the pen's latency: from the
 //!   oldest pen sample whose dabs the frame showed first, applied or ahead of their finest work, by
 //!   the pen's de-jittered clock, to the frame's present submitted; `null` for a frame that showed
-//!   none) and `received_to_present_ms` (the same from when that sample reached the app),
-//!   `dabs_applied` (finest work), `dabs_shown` (shown ahead of their finest work, which didn't fit
-//!   the frame), `dabs_carried` (placed but neither applied nor shown, left for the next frames:
-//!   the stroke's lag), `dabs_catching_up` (shown and not yet applied: the surface is exact once
-//!   none are), `tiles_edited`, `above_f` (a dab of the frame above the footprint limit F, which no
-//!   frame's time fits), and `stroke_open` (a stroke still open as the brush step ended: the pen
-//!   down; the frames after the last open one until none carries dabs are the queue draining after
-//!   pen-up), and `kept_tiles`, `kept_bytes` and `kept_beyond_budget` (what the stroke keeps of the
-//!   surface as it began, counted in the store's budget, and the bytes the budget had no room for).
-//!   What the brush did between the last frame and this one (whose edits this frame shows) counts
-//!   as this frame's, its time `between_ms`. The owner's `prepare_ms` is the brush's work after the
+//!   none), `received_to_present_ms` (the same from when that sample reached the app),
+//!   `sample_wait_ms` (from then to the frame's start: what it waited for a frame), `dabs_applied`
+//!   (finest work), `dabs_shown` (shown ahead of their finest work, which didn't fit the frame),
+//!   `dabs_carried` (placed but neither applied nor shown, left for the next frames: the stroke's
+//!   lag), `dabs_catching_up` (shown and not yet applied: the surface is exact once none are),
+//!   `tiles_edited`, `above_f` (a dab of the frame above the footprint limit F, which no frame's
+//!   time fits), and `stroke_open` (a stroke still open as the brush step ended: the pen down; the
+//!   frames after the last open one until none carries dabs are the queue draining after pen-up),
+//!   and `kept_tiles`, `kept_bytes` and `kept_beyond_budget` (what the stroke keeps of the surface
+//!   as it began, counted in the store's budget, and the bytes the budget had no room for). What
+//!   the brush did between the last frame and this one (whose edits this frame shows) counts as
+//!   this frame's, its time `between_ms`. The owner's `prepare_ms` is the brush's work after the
 //!   hand-off, off the latency path: a big brush's catch-up (the finest work of dabs shown ahead of
 //!   it) while there is one, else warming the surface under a hovering pen.
 
@@ -225,6 +226,7 @@ impl Line {
         self.with("submitted_ms", submitted)
             .with("sample_to_present_ms", latency.map(|l| l.taken))
             .with("received_to_present_ms", latency.map(|l| l.received))
+            .with("sample_wait_ms", latency.map(|l| l.waited))
             .with("dabs_applied", brush.map(|b| b.dabs_applied))
             .with("dabs_shown", brush.map(|b| b.dabs_shown))
             .with("dabs_carried", brush.map(|b| b.dabs_carried))
@@ -348,6 +350,9 @@ pub(crate) struct Latency {
     pub(crate) taken: Duration,
     /// From when the sample reached the app.
     pub(crate) received: Duration,
+    /// From when the sample reached the app to the frame's start: what it waited for a frame, on
+    /// the work after the last hand-off (the record's `jobs_ms`, `prepare_ms`) among others.
+    pub(crate) waited: Duration,
 }
 
 impl FrameRecord {
@@ -383,6 +388,7 @@ impl FrameRecord {
             .with("jobs_ms", owner_ms(owner.jobs))
             .with("jobs_built", known.then_some(owner.jobs_built))
             .with("jobs_left", known.then_some(owner.jobs_left))
+            .with("jobs_longest_ms", owner_ms(owner.jobs_longest))
             .with("acquire_ms", render.map(|r| r.acquire))
             .with("encode_ms", render.map(|r| r.encode))
             .with("present_ms", render.map(|r| r.present))

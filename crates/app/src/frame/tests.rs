@@ -693,6 +693,38 @@ fn the_upkeep_runs_when_due_however_often_a_stroke_waits() {
 }
 
 #[test]
+fn a_late_strokes_frame_starts_no_slice_of_the_jobs() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let brush = PenLog {
+        claims: true,
+        ..PenLog::default()
+    };
+    let mut owner = Owner::new(
+        project_to(&dir, 6),
+        brush,
+        NoUploads,
+        setup(None),
+        Instant::now(),
+    );
+    assert!(owner.project().store().has_jobs(), "a rebuild to run");
+    owner.pen(pen_sample(Phase::Down, (160.0, 100.0)));
+    // A frame already past the latency aim when it started: no slice, however long it has.
+    let began = Instant::now().checked_sub(LATENCY_AIM * 2).expect("a past");
+    owner
+        .frame_fed(
+            began,
+            began + Duration::from_secs(1),
+            &mut NoPen,
+            |_| Ok(()),
+        )
+        .expect("a frame");
+    owner.shown(presented(1));
+    assert_eq!(owner.after_hand_off.report.slices, 0, "the pen comes first");
+    owner.close().expect("closed");
+}
+
+#[test]
 fn the_jobs_yield_to_a_strokes_sample_and_keep_a_share_while_the_stroke_is_open() {
     use input::Phase;
     let dir = TestDir::new();

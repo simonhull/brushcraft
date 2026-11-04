@@ -261,6 +261,10 @@ impl BrushReport {
 /// [`Owner::run_jobs`]): a few refresh slices.
 pub(crate) const STROKE_REFRESH: Duration = Duration::from_micros(1_500);
 
+/// How near the pen's next sample no slice of the store's jobs starts during a stroke: 2 ms, about
+/// what a slice takes when it overruns its millisecond.
+const SAMPLE_CLEAR: Duration = Duration::from_millis(2);
+
 /// The latency aim for a stroke's input: from a sample being taken to the present of the frame
 /// that shows its effect being submitted.
 ///
@@ -448,6 +452,12 @@ pub(crate) trait Brush {
     /// Only for a failure the app can't go on from.
     fn prepare(&mut self, _context: BrushContext<'_>, _deadline: Instant) -> Result<bool> {
         Ok(false)
+    }
+
+    /// When the pen's next sample is due, while it draws: the store's jobs start no slice just
+    /// before it. `None` with no pen drawing.
+    fn next_sample_due(&self) -> Option<Instant> {
+        None
     }
 
     /// Applies what the brush still holds and ends its stroke: the project is about to close.
@@ -738,6 +748,8 @@ pub(crate) struct OwnerPhases {
     pub(crate) jobs_built: usize,
     /// The display tiles they had left to build then ([`JobsReport::left`]).
     pub(crate) jobs_left: usize,
+    /// Their longest slice then ([`JobsReport::longest_slice`]): what no yield cuts short.
+    pub(crate) jobs_longest: Duration,
 }
 
 /// What the stale-tile feed has delivered since the project opened.
@@ -885,6 +897,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// whose dabs it applied: a frame's latency is measured as it is shown. Frames shown (or
     /// lost) leave it, so it holds the few in flight.
     latency_from: BTreeMap<u64, SampleTimes>,
+    /// When the frames of `latency_from` started: how long their oldest samples waited for one.
+    began_at: BTreeMap<u64, Instant>,
     /// The last frame's pen latency, sample to present submitted, for the overlay; `None` until
     /// a frame applies dabs.
     latency: Option<Duration>,
@@ -1038,6 +1052,7 @@ impl AfterHandOff {
             jobs: self.jobs,
             jobs_built: self.report.built,
             jobs_left: self.report.left,
+            jobs_longest: self.report.longest_slice,
             ..phases
         }
     }
@@ -1112,6 +1127,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             script_over: false,
             run_info,
             latency_from: BTreeMap::new(),
+            began_at: BTreeMap::new(),
             latency: None,
             script_pen: Duration::ZERO,
             script_failure: None,
@@ -1562,7 +1578,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.take_input(size)?;
         phases.input = lap.next();
 
-        let brushed = self.brush_phase(size, pen)?;
+        let brushed = self.brush_phase(size, now, pen)?;
         phases.brush = lap.next();
 
         let drained = self.project.store().drain_stale(&self.cursor);
@@ -1706,8 +1722,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         // While a stroke is under way, the jobs keep a share of the frame ahead of the catch-up,
         // none once the frame runs late (their first slice runs all the same).
         let stroking = self.stroke_under_way();
-        let late = Instant::now() >= now + LATENCY_AIM;
-        let share = if stroking && !late {
+        let on_time_until = now + LATENCY_AIM;
+        let share = if stroking && Instant::now() < on_time_until {
             STROKE_REFRESH
         } else {
             Duration::ZERO
@@ -1742,7 +1758,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             let roots = self.uploads.drawn_stale(self.project.store());
             self.project.store().refresh_first(&roots);
         }
-        self.after_hand_off.report = self.run_jobs(jobs_by, pen)?;
+        let boxed = stroking.then_some(on_time_until);
+        self.after_hand_off.report = self.run_jobs(jobs_by, boxed, pen)?;
         self.after_hand_off.jobs = lap.next();
         Ok(preparing)
     }
@@ -1752,21 +1769,39 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// **They run during a stroke too** (user decision 2026-11-03: before, the refresh waited for
     /// a stroke and its catch-up, so stand-ins piled up and the view sharpened seconds after the
-    /// pen lifted), time-boxed by the caller ([`STROKE_REFRESH`] while the frame is on time, one
-    /// slice once it runs late), the subtrees of the display tiles the renderer draws stale first
-    /// ([`TileStore::refresh_first`]). The pen keeps priority: a slice never starts while a
-    /// sample waits.
+    /// pen lifted), time-boxed by the caller ([`STROKE_REFRESH`] while the frame is on time), the
+    /// subtrees of the display tiles the renderer draws stale first
+    /// ([`TileStore::refresh_first`]). The pen keeps priority. With `on_time_until` (a stroke
+    /// under way, the end of the frame's latency aim) no slice is forced, and none starts once
+    /// that is past, without [`JobsReport::SLICE_TARGET`] left of `deadline`, within
+    /// [`SAMPLE_CLEAR`] of the pen's next sample, or while a sample waits: a slice started can't
+    /// be cut short. The record's `jobs_ms`, `jobs_longest_ms` and `sample_wait_ms` show what
+    /// they cost a sample.
     ///
     /// # Errors
     ///
     /// As the store's jobs.
-    fn run_jobs(&mut self, deadline: Instant, pen: &mut impl PenFeed) -> Result<JobsReport> {
+    fn run_jobs(
+        &mut self,
+        deadline: Instant,
+        on_time_until: Option<Instant>,
+        pen: &mut impl PenFeed,
+    ) -> Result<JobsReport> {
         let mut report = JobsReport::default();
-        let mut first = true;
+        // A slice however late, unless a stroke is under way.
+        let mut first = on_time_until.is_none();
         while !self.pull_pen(pen, Instant::now(), true) {
             let at = Instant::now();
             if !first && (at >= deadline || !self.project.store().has_jobs()) {
                 break;
+            }
+            if let Some(until) = on_time_until {
+                let due = self.brush.next_sample_due();
+                let too_near = due.is_some_and(|due| at + SAMPLE_CLEAR >= due);
+                let no_room = at + JobsReport::SLICE_TARGET > deadline;
+                if at >= until || no_room || too_near {
+                    break;
+                }
             }
             let least = if first {
                 at + JobsReport::SLICE_TARGET
@@ -1810,7 +1845,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// # Errors
     ///
     /// If the brush fails in a way the app can't go on from.
-    fn brush_phase(&mut self, size: Size, pen: &mut impl PenFeed) -> Result<BrushReport> {
+    fn brush_phase(
+        &mut self,
+        size: Size,
+        began: Instant,
+        pen: &mut impl PenFeed,
+    ) -> Result<BrushReport> {
         self.pull_pen(pen, Instant::now(), false);
         if !self.pen_queue.is_empty() {
             self.route_pen(&Arcball::new(size), size, false)?;
@@ -1828,6 +1868,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.stroking.busy = brushed.busy;
         if let Some(oldest) = brushed.oldest {
             self.latency_from.insert(self.started, oldest);
+            self.began_at.insert(self.started, began);
             self.brushed_at.insert(self.started, Instant::now());
         }
         Ok(brushed)
@@ -2325,6 +2366,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let gpu = std::mem::take(&mut presented.gpu);
         // Frames are reported in order: any before this one still kept were lost.
         self.latency_from = self.latency_from.split_off(&presented.number);
+        self.began_at = self.began_at.split_off(&presented.number);
+        let began = self.began_at.remove(&presented.number);
         self.brushed_at = self.brushed_at.split_off(&presented.number);
         if let Some(brushed) = self.brushed_at.remove(&presented.number)
             && presented.outcome == Outcome::Presented
@@ -2339,6 +2382,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 received: presented
                     .submitted
                     .saturating_duration_since(oldest.received),
+                waited: began.map_or(Duration::ZERO, |began| {
+                    began.saturating_duration_since(oldest.received)
+                }),
             });
         if let Some(latency) = latency {
             self.latency = Some(latency.taken);
