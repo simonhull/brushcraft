@@ -78,7 +78,8 @@
 //! a frame between batches.
 //! A frame's own step takes what fits the slack its time leaves, if it showed nothing. While the
 //! pen is down progress is guaranteed all the same, off a frame's step and whatever the dab costs:
-//! under a resting pen a catch-up that has landed nothing for [`CATCH_UP_STARVED`] takes one dab,
+//! under a pen resting [`RESTING_QUIET`] a catch-up that has landed nothing for
+//! [`CATCH_UP_STARVED`] takes one dab,
 //! and under a drawing pen one holding [`CATCH_UP_BACKLOG`] dabs takes a batch every quarter of
 //! that. Only then does a batch's time come before a sample. The backlog isn't bounded: a pen
 //! placing dabs faster than they land outruns even these, but the batches grow with the backlog
@@ -248,6 +249,13 @@ pub(crate) const WARM_BATCH: usize = 16;
 /// all the same (off a frame's step), whatever it costs: no sample waits behind it. About three
 /// 60 Hz frames.
 pub(crate) const CATCH_UP_STARVED: Duration = Duration::from_millis(50);
+
+/// How long a pen must have sent nothing before it counts as resting, for a starved catch-up.
+///
+/// Much longer than [`STROKE_QUIET`]: a frame held up past that, the samples waiting unread, isn't
+/// a resting pen, and a dab forced then held the samples up further. Every 50 ms of stall on a
+/// busy machine took a dab of up to 450 ms, and a fast stroke came out seconds behind.
+pub(crate) const RESTING_QUIET: Duration = Duration::from_millis(250);
 
 /// How many dabs a catch-up may hold under a drawing pen before it takes them all the same, four
 /// times as often as [`CATCH_UP_STARVED`].
@@ -1210,7 +1218,11 @@ impl Sculpting {
         let behind = if moving {
             backlog >= self.backlog_limit && waited >= CATCH_UP_STARVED / 4
         } else {
-            waited >= CATCH_UP_STARVED
+            let quiet = self
+                .stroke
+                .as_ref()
+                .map_or(Duration::MAX, |stroke| stroke.last.received.elapsed());
+            waited >= CATCH_UP_STARVED && quiet >= RESTING_QUIET
         };
         let Some(front) = self.stroke.as_mut() else {
             return;

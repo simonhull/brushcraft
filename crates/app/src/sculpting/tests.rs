@@ -1130,6 +1130,33 @@ fn a_close_request_is_answered_at_once_and_the_landing_goes_on_in_frames() {
     assert!(longest < Duration::from_secs(1), "a frame took {longest:?}");
 }
 
+/// A pen quiet for a moment isn't resting: a frame held up past [`STROKE_QUIET`] forces no dab,
+/// however long the catch-up has landed nothing.
+#[test]
+fn a_frame_held_up_forces_no_dab_on_a_pen_still_drawing() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    queue(&mut owner, to_and_fro(1));
+    run(&mut owner, 1);
+    let shown = owner.brush().last().dabs_catching_up;
+    assert!(shown > 1, "dabs shown");
+    owner.brush_mut().landed_at = Instant::now()
+        .checked_sub(CATCH_UP_STARVED * 4)
+        .expect("after the epoch");
+    std::thread::sleep(STROKE_QUIET + Duration::from_millis(10));
+    run(&mut owner, 2);
+    assert_eq!(
+        owner.brush().last().dabs_catching_up,
+        shown,
+        "no dab forced"
+    );
+}
+
 /// A close lands whether or not a frame can be drawn: a hidden window has no size, and the steps
 /// go on without one, the dabs landed and the stroke ended.
 #[test]
@@ -1258,7 +1285,7 @@ fn a_pen_resting_down_catches_up_a_dab_at_a_time_once_starved_and_lands_all_once
     assert!(shown > 1, "nothing fits: every dab shown ahead");
     // It rests past the quiet and the starvation time: the catch-up takes a dab a step, no
     // more (a long batch waits for the pen to lift).
-    std::thread::sleep(CATCH_UP_STARVED.max(STROKE_QUIET) + Duration::from_millis(10));
+    std::thread::sleep(CATCH_UP_STARVED.max(RESTING_QUIET) + Duration::from_millis(10));
     // What a frame's hand-off catches up shows in the next frame's report.
     run(&mut owner, 2);
     let left = owner.brush().last().dabs_catching_up;
