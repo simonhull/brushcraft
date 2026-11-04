@@ -792,6 +792,7 @@ fn a_scripted_run_strokes_the_project_and_records_its_latency() {
     let setup = Setup {
         script: Some(Script::strokes("8".parse::<Speed>().expect("a speed"))),
         record: Some(RecordSetup {
+            path: None,
             project: "test".to_owned(),
             gpu_timing: false,
             lod_timing: false,
@@ -1083,10 +1084,11 @@ fn a_frame_comes_between_the_catch_ups_batches() {
     assert!(frames >= shown, "{shown} dabs landed in {frames} frames");
 }
 
-/// A big backlog at pen-up doesn't hold a close up: the request lands nothing itself and returns
-/// at once, a frame comes for every batch, so the window's events are heard between them, and
-/// the close is ready once it has all landed. (`Owner::close` used to land it all in one call,
-/// the window unanswered: 31 s for 726 dabs.)
+/// A big backlog at pen-up doesn't hold a close up.
+///
+/// The request lands nothing itself and returns at once, a frame comes for every batch, so the
+/// window's events are heard between them, and the close is ready once it has all landed.
+/// (`Owner::close` used to land it all in one call, the window unanswered: 31 s for 726 dabs.)
 #[test]
 fn a_close_request_is_answered_at_once_and_the_landing_goes_on_in_frames() {
     let dir = TestDir::new();

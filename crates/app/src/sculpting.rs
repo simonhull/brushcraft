@@ -145,8 +145,8 @@ use stroke::{
 
 use crate::camera::{Camera, Pixel};
 use crate::frame::{
-    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Drawing, Kept, LATENCY_AIM,
-    STROKE_QUIET, SampleTimes,
+    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Closing, Drawing, Kept,
+    LATENCY_AIM, STROKE_QUIET, SampleTimes,
 };
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 
@@ -687,7 +687,7 @@ pub(crate) struct Sculpting {
     /// counts from.
     landed_at: Instant,
     /// Whether the window was asked to close: no pen is down any more, and what is held lands.
-    closing: bool,
+    closing: Closing,
     /// Where the warming ahead of the open stroke last listed its tiles.
     ahead_warmed: Option<geom::Vec3>,
     /// The tiles ahead of the open stroke still to evaluate.
@@ -735,7 +735,7 @@ impl Sculpting {
             index_stale: false,
             warm: Warm::default(),
             landed_at: Instant::now(),
-            closing: false,
+            closing: Closing::No,
             ahead_warmed: None,
             ahead_todo: Vec::new(),
             error: None,
@@ -1213,7 +1213,7 @@ impl Sculpting {
             }
         }
         let first = report.dabs_applied == 0;
-        let waiting_stroke = self.closing || !self.deferred.is_empty();
+        let waiting_stroke = self.closing == Closing::Landing || !self.deferred.is_empty();
         // A frame shows each batch before the next starts, so the frames keep coming.
         if batch && self.unframed {
             return;
@@ -1709,14 +1709,14 @@ impl Brush for Sculpting {
             };
             self.admit(&mut scene, sample);
         }
-        if self.closing {
+        if self.closing == Closing::Landing {
             self.lift(&mut scene, None);
         }
         self.work(&mut scene, &mut report, Some(budget));
         if !self.deferred.is_empty() && self.stroke.is_none() {
             // The stroke before them has ended: the deferred stroke begins on what it left.
             self.release_deferred(&mut scene);
-            if self.closing {
+            if self.closing == Closing::Landing {
                 self.lift(&mut scene, None);
             }
             self.work(&mut scene, &mut report, Some(budget));
@@ -1839,7 +1839,7 @@ impl Brush for Sculpting {
     }
 
     fn begin_closing(&mut self, context: BrushContext<'_>) -> Result<()> {
-        self.closing = true;
+        self.closing = Closing::Landing;
         if let Some(mut scene) = Scene::of(context) {
             let held = std::mem::take(&mut self.held);
             for event in &held {

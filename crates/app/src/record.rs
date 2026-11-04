@@ -12,8 +12,9 @@
 //! render thread stops), and its cut (what the level
 //! choice drew, with the level choice's own stage times) when residency reads that back. The
 //! [`Recorder`] keeps each frame's [`FrameRecord`] by number and fills it in as they come; the
-//! lines are written once the run is over ([`Recorder::lines`]). A fact that never came (the last
-//! frames' readbacks, GPU times on a device without timestamp queries) is `null`.
+//! lines reach the file every second as the run goes on ([`RecordStream`]), so a run killed keeps
+//! its record, and are written whole once it is over ([`Recorder::lines`]). A fact that never came
+//! (the last frames' readbacks, GPU times on a device without timestamp queries) is `null`.
 //!
 //! Every line is a flat JSON object of named numbers, strings, booleans and number arrays, with
 //! `"bench":"render"` and its `"result"`: one `run` line (the setting), one `segment` line per
@@ -83,6 +84,11 @@
 //!   it) while there is one, else warming the surface under a hovering pen.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufWriter, Write as _};
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use render::lod::{LodStats, LodTimings};
@@ -626,6 +632,13 @@ impl Recorder {
     /// The record's lines: the run's (`info`), each of `script`'s segments' (none for a live
     /// session, which has no script: its speed is 1), then each frame's.
     pub(crate) fn lines(&self, info: &RunInfo, script: Option<&Script>) -> Vec<String> {
+        let frames = self.frames.values().map(FrameRecord::line);
+        let frames = frames.map(|line| line.to_json());
+        self.head(info, script).into_iter().chain(frames).collect()
+    }
+
+    /// The record's first lines: the run's and each of `script`'s segments', as they stand.
+    fn head(&self, info: &RunInfo, script: Option<&Script>) -> Vec<String> {
         let dropped: u64 = self
             .frames
             .values()
@@ -651,11 +664,106 @@ impl Recorder {
                 .with("start_ms", start)
                 .with("end_ms", end)
         });
-        let frames = self.frames.values().map(FrameRecord::line);
         std::iter::once(run)
             .chain(segments)
-            .chain(frames)
             .map(|line| line.to_json())
             .collect()
+    }
+
+    /// The lines of the frames from number `from` up to `to`.
+    fn frame_lines(&self, from: u64, to: u64) -> Vec<String> {
+        let frames = self.frames.range(from..to);
+        frames.map(|(_, frame)| frame.line().to_json()).collect()
+    }
+}
+
+/// How often the record reaches its file as a run goes on ([`RecordStream`]).
+const STREAM_EVERY: Duration = Duration::from_secs(1);
+
+/// How many frames behind the newest the stream writes: their late facts (GPU times, the cut)
+/// have come by then.
+const STREAM_LAG: u64 = 16;
+
+/// The record on its way to its file as a run goes on, so a session killed or crashed keeps what
+/// it had up to a second or two before.
+///
+/// Written on a thread of its own, the frame loop only making the lines; the run's own end writes
+/// the whole record over it ([`Recorder::lines`]), with the facts that came late and the run
+/// line's totals, which say nothing yet here. A failure to write ends the stream quietly: the
+/// end's write says so, if it fails too.
+#[derive(Debug)]
+pub(crate) struct RecordStream {
+    /// Hands lines to the writer; dropped to end it.
+    lines: Option<Sender<Vec<String>>>,
+    /// The writer.
+    writer: Option<JoinHandle<()>>,
+    /// The next frame to write.
+    next: u64,
+    /// When lines last went; `None` before the first.
+    last: Option<Instant>,
+}
+
+impl RecordStream {
+    /// A stream into a file at `path`, made empty.
+    pub(crate) fn to(path: PathBuf) -> Self {
+        let (lines, batches) = mpsc::channel::<Vec<String>>();
+        let writer = std::thread::spawn(move || {
+            let Ok(file) = File::create(path) else {
+                return;
+            };
+            let mut out = BufWriter::new(file);
+            for batch in batches {
+                let written = batch.iter().try_for_each(|line| writeln!(out, "{line}"));
+                if written.and_then(|()| out.flush()).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            lines: Some(lines),
+            writer: Some(writer),
+            next: 0,
+            last: None,
+        }
+    }
+
+    /// Sends what `recorder` holds of the frames before the newest, `newest`, at `now`, if
+    /// [`STREAM_EVERY`] has gone by.
+    pub(crate) fn keep(
+        &mut self,
+        recorder: &Recorder,
+        info: &RunInfo,
+        script: Option<&Script>,
+        newest: u64,
+        now: Instant,
+    ) {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < STREAM_EVERY)
+        {
+            return;
+        }
+        let mut batch = if self.last.is_none() {
+            recorder.head(info, script)
+        } else {
+            Vec::new()
+        };
+        self.last = Some(now);
+        let upto = newest.saturating_sub(STREAM_LAG);
+        batch.extend(recorder.frame_lines(self.next, upto));
+        self.next = self.next.max(upto);
+        if let Some(lines) = &self.lines {
+            // A writer gone has said nothing: see the type's notes.
+            drop(lines.send(batch));
+        }
+    }
+}
+
+impl Drop for RecordStream {
+    fn drop(&mut self) {
+        drop(self.lines.take());
+        if let Some(writer) = self.writer.take() {
+            drop(writer.join());
+        }
     }
 }

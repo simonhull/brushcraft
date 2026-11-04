@@ -243,7 +243,8 @@ impl Options {
     /// `--record`. Whether the level choice's stages are timed is found as the frame loop starts
     /// ([`crate::start`]).
     pub(crate) fn record_setup(&self, gpu_timing: bool, opening: Instant) -> Option<RecordSetup> {
-        self.record.as_ref().map(|_| RecordSetup {
+        self.record.as_ref().map(|path| RecordSetup {
+            path: Some(path.clone()),
             project: self.project.display().to_string(),
             gpu_timing,
             lod_timing: false,

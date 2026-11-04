@@ -1969,6 +1969,7 @@ fn a_display_faster_than_the_gpu_gets_every_frame_read_back() {
         frames: Some(made),
         script: Some(Script::benchmark(crate::script::Speed::ONE)),
         record: Some(RecordSetup {
+            path: None,
             project: "test".to_owned(),
             gpu_timing: render.timing(),
             lod_timing,

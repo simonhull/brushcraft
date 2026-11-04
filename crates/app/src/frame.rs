@@ -99,6 +99,7 @@
 pub(crate) mod schedule;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -118,7 +119,7 @@ use crate::navigate::{Button, Input, Navigator};
 use crate::overlay::{self, Snapshot};
 use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route};
 use crate::pick::Picker;
-use crate::record::{Latency, Recorder, RunInfo, SceneRecord};
+use crate::record::{Latency, RecordStream, Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
 use crate::script::{BrushSize, Script, ScriptPen, Segment};
 
@@ -816,9 +817,22 @@ pub(crate) struct Setup {
     pub(crate) record: Option<RecordSetup>,
 }
 
+/// Whether the window was asked to close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Closing {
+    /// It wasn't.
+    #[default]
+    No,
+    /// It was: no pen is taken any more, and what the brush holds lands.
+    Landing,
+}
+
 /// What a scripted run's record says of its setting, beside what the [`Setup`] says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecordSetup {
+    /// Where the record goes as the run goes on ([`RecordStream`]); `None` to keep it till the
+    /// end.
+    pub(crate) path: Option<PathBuf>,
     /// The project file, as given.
     pub(crate) project: String,
     /// Whether the render thread times the GPU's phases.
@@ -908,6 +922,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     script_over: bool,
     /// Every frame's record, in a scripted run.
     recorder: Option<Recorder>,
+    /// The record on its way to its file, in a run recorded to one.
+    record_stream: Option<RecordStream>,
     /// The record's setting, if the run is recorded.
     run_info: Option<RunInfo>,
     /// The frames not shown yet that applied dabs, by number, each with the oldest pen sample
@@ -953,7 +969,7 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// ([`Owner::pivot_to`]).
     pivot_at: Option<Instant>,
     /// Whether the window was asked to close ([`Owner::request_close`]).
-    closing: bool,
+    closing: Closing,
 }
 
 /// What the camera is still to be fitted to the model by: framing it, and growing its boundary
@@ -1096,6 +1112,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         if scripted {
             scheduler.want(Reason::Scripted);
         }
+        let record_stream = setup
+            .record
+            .as_ref()
+            .and_then(|record| record.path.clone())
+            .map(RecordStream::to);
         let run_info = setup.record.map(|record| RunInfo {
             project: record.project,
             adapter: setup.adapter.clone(),
@@ -1142,6 +1163,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             picker: None,
             accumulates: true,
             recorder: (setup.script.is_some() || run_info.is_some()).then(Recorder::default),
+            record_stream,
             script: setup.script,
             script_over: false,
             run_info,
@@ -1159,7 +1181,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             upkept_at: now,
             fitting: Fitting::default(),
             pivot_at: None,
-            closing: false,
+            closing: Closing::No,
         }
     }
 
@@ -1232,7 +1254,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// [`Owner::pen`]; wanting a frame for it only if `want` (a sample the frame being made takes
     /// itself wants none).
     fn queue_pen(&mut self, sample: PenSample, want: bool) {
-        if self.closing {
+        if self.closing == Closing::Landing {
             return;
         }
         self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
@@ -2065,6 +2087,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
         if let Some(recorder) = &mut self.recorder {
             recorder.owner(self.started, phases);
+            if let (Some(stream), Some(info)) = (&mut self.record_stream, &self.run_info) {
+                let script = self.script.as_ref();
+                stream.keep(recorder, info, script, self.started, Instant::now());
+            }
         }
     }
 
@@ -2481,10 +2507,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// As [`Brush::begin_closing`].
     pub(crate) fn request_close(&mut self) -> Result<()> {
-        if self.closing {
+        if self.closing == Closing::Landing {
             return Ok(());
         }
-        self.closing = true;
+        self.closing = Closing::Landing;
         self.pen_queue.clear();
         if let Some(size) = self.size.or_else(|| self.last_view.map(|(_, size)| size)) {
             self.with_brush(size, B::begin_closing)
@@ -2501,7 +2527,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// Whether a close was asked for and nothing is left to land.
     pub(crate) fn ready_to_close(&self) -> bool {
-        self.closing && self.landing() == 0
+        self.closing == Closing::Landing && self.landing() == 0
     }
 
     /// Closes the project: lets the brush apply what it holds and end its stroke, leaves the

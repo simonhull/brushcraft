@@ -426,3 +426,53 @@ fn a_moment_by_the_frame_loop_clock_is_placed_on_the_system_clock() {
         "{off:?} from the clock read beside it"
     );
 }
+
+/// A run killed keeps its record: the file holds the head and the frames before the lag while the
+/// run still goes on, nothing having closed.
+#[test]
+fn the_record_reaches_its_file_as_the_run_goes_on() {
+    let dir = std::env::temp_dir().join(format!("brushcraft-record-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run.jsonl");
+    let mut recorder = Recorder::default();
+    for frame in 0..100 {
+        recorder.started(frame, ms(frame), None, false);
+    }
+    let info = RunInfo {
+        project: "p".to_owned(),
+        adapter: "a".to_owned(),
+        size: (8, 8),
+        gpu_timing: true,
+        lod_timing: true,
+        open: ms(0),
+        clock_unix: None,
+        refresh: ms(16),
+    };
+    let mut stream = RecordStream::to(path.clone());
+    let now = Instant::now();
+    stream.keep(&recorder, &info, None, 100, now);
+    let frames = || {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.lines()
+            .filter(|line| line.contains(r#""result":"frame""#))
+            .count()
+    };
+    let waited_from = Instant::now();
+    while frames() < 84 {
+        assert!(
+            waited_from.elapsed() < Duration::from_secs(5),
+            "{} frames",
+            frames()
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(frames(), 84, "all but the lag's, the stream still open");
+    stream.keep(&recorder, &info, None, 100, now);
+    drop(stream);
+    assert_eq!(
+        frames(),
+        84,
+        "each frame once, and nothing sooner than a second on"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
