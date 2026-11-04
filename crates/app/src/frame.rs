@@ -1720,7 +1720,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.after_hand_off.upkeep = lap.next();
 
         // While a stroke is under way, the jobs keep a share of the frame ahead of the catch-up,
-        // none once the frame runs late (their first slice runs all the same).
+        // none once the frame runs late, when they start no slice ([`Owner::run_jobs`]).
         let stroking = self.stroke_under_way();
         let on_time_until = now + LATENCY_AIM;
         let share = if stroking && Instant::now() < on_time_until {

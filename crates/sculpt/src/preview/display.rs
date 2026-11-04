@@ -8,10 +8,12 @@
 //!
 //! Every display vertex `v` subsamples one finest vertex `u`. A display tile's **pen-down tile**
 //! `P0` is its record ([`TileStore::display_for_draw`], as stored before any stroke since its
-//! last refresh) with every vertex inside a finest tile that changed since replaced by the
-//! finest vertex's exact bits as the stroke began: from the tile's pen-down block where a tile the
-//! stroke changed is among those its block reads ([`TileStore::pen_down_blocks_many`]), else as
-//! the store holds it now (unchanged since the stroke began). Its **base** is the same with the
+//! last refresh, which may be mid-stroke) with every vertex inside a finest tile that changed
+//! since, or whose block reads a tile this stroke changed, replaced by the finest vertex's exact
+//! bits as the stroke began: from the tile's pen-down block where a tile the stroke changed is
+//! among those its block reads ([`TileStore::pen_down_blocks_many`]), else as the store holds it
+//! now (unchanged since the stroke began). So a record the refresh rebuilt over this stroke's own
+//! dabs still gives the surface at pen-down. Its **base** is the same with the
 //! store's current bits: what a renderer's stand-in draws of it. A border vertex of either is the
 //! finest vertex's exact bits (stored losslessly, or replaced), so every tile holding it, at any
 //! level and on any face, holds the same bits.
@@ -55,9 +57,9 @@
 //!   replaced; else measured, as a stand-in measures its bound: the farthest finest vertex of every
 //!   finest tile changed since the record (all at hand, gathered for the replacing) from the
 //!   pen-down tile's triangles, and for the others, unchanged, the record's bound plus `M`, the
-//!   largest move of a replaced vertex (the triangles' blend of the corners' moves). The stand-in
-//!   formula `e + D + max(D, M)` (`D` the steps since the record) is kept for a place that couldn't
-//!   be measured.
+//!   largest move of a replaced vertex at a corner of a quad over one of them (the triangles' blend
+//!   of the corners' moves; a quad wholly over changed tiles is measured). A place that couldn't be
+//!   measured keeps the stand-in formula `e + D + max(D, M)`, `D` the steps since the record.
 //! - Each dab's term is at most `s · min(1, L e₀ + K h² / 2)`, `s` its strength, `L = steepest / r`
 //!   and `K = curvature / r²` its falloff's bounds ([`brush::Falloff`]), `h` the quad's longest
 //!   pen-down edge: the move at `F₀(u)` against the move at the point of the triangle (Lipschitz),
@@ -168,9 +170,6 @@ pub(super) struct DisplayState {
     cells_held: usize,
     /// Whether it was last handed to the store held.
     pub(super) published_held: Option<bool>,
-    /// Whether a dab moved a vertex of it, or a landing rebased one: else what it draws is its
-    /// record's, and once released and unchanged under it, the record is drawn again.
-    pub(super) moved: bool,
 }
 
 /// Where display vertex `(i, j)` of `key` lies on the finest level `finest`: the finest tile
@@ -301,8 +300,9 @@ impl Term {
 /// A plane holds every interior value within one final step of its exact value, however often
 /// it grew (geom's `fitted_scale`). The dabs move a vertex's correction by at most `strength`
 /// along any axis of its (orthonormal) frame, so each plane ends at most `2 (s · 32767 +
-/// strength) / 32767` (grown by doubling to hold its largest value), the tangential planes at
-/// least 8 times the normal one's; a vertex is within the three final steps' length.
+/// strength) / 32767` (grown by doubling to hold its largest value), the tangential planes,
+/// at least 8 times the normal one's and doubled up to it, less than 16 times; a vertex is within
+/// the three final steps' length.
 pub(super) fn rounding_bound(scales: [f32; 3], strength: f64) -> f64 {
     const STEPS: f64 = 32_767.0;
     let grown = |scale: f32| {
@@ -311,7 +311,7 @@ pub(super) fn rounding_bound(scales: [f32; 3], strength: f64) -> f64 {
     };
     let [t, b, n] = scales;
     let normal = grown(n);
-    let (tangent, bitangent) = (grown(t).max(8.0 * normal), grown(b).max(8.0 * normal));
+    let (tangent, bitangent) = (grown(t).max(16.0 * normal), grown(b).max(16.0 * normal));
     tangent
         .mul_add(tangent, bitangent.mul_add(bitangent, normal * normal))
         .sqrt()
@@ -332,7 +332,41 @@ pub(super) struct Blocks {
     pub(super) pen_down: BTreeMap<TileKey, GatheredBlock>,
 }
 
+/// The quads of display tile `key` at a corner of which vertex `(i, j)` lies.
+fn quads_at(key: &TileKey, i: u32, j: u32) -> impl Iterator<Item = (u32, u32)> {
+    let last = key.side().saturating_sub(2);
+    let columns = [i.checked_sub(1), Some(i).filter(|&i| i <= last)];
+    let rows = [j.checked_sub(1), Some(j).filter(|&j| j <= last)];
+    rows.into_iter().flatten().flat_map(move |qj| {
+        let across = columns.into_iter().flatten();
+        across.map(move |qi| (qi, qj))
+    })
+}
+
 impl Blocks {
+    /// Whether every finest tile under quad `(i, j)` of display tile `key` is gathered here.
+    fn hold_quad(&self, key: &TileKey, finest: Level, i: u32, j: u32) -> bool {
+        let quads = key.side() - 1;
+        let step = 1_u32 << (finest.get() - key.level().get());
+        let finest_quads = finest.tile_quads().max(1);
+        // The finest tiles a quad at `v` of tile `t` spans along an axis.
+        let spanned = |t: u16, v: u32| {
+            let from = (u32::from(t) * quads + v) * step;
+            from / finest_quads..=(from + step - 1) / finest_quads
+        };
+        let (columns, rows) = (spanned(key.tx(), i), spanned(key.ty(), j));
+        rows.into_iter().all(|y| {
+            columns.clone().all(|x| {
+                let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
+                    return false;
+                };
+                TileKey::displacement(key.face(), finest, x, y).is_ok_and(|tile| {
+                    self.now.contains_key(&tile) || self.pen_down.contains_key(&tile)
+                })
+            })
+        })
+    }
+
     /// The finest tiles gathered here under display tile `key`, each once.
     fn under(&self, key: &TileKey, finest: Level) -> impl Iterator<Item = &TileKey> {
         let quads = key.side() - 1;
@@ -507,9 +541,11 @@ impl DisplayState {
             }
         }
         let pen_down_bound = if made.flags.iter().any(|&r| r) {
-            // Measured where the finest tiles are at hand (every one changed since the record),
-            // the record's own bound and the replaced vertices' largest move elsewhere.
-            let elsewhere = f64::from(recorded_bound) + made.moved_most;
+            // Measured where the finest tiles are at hand (every one changed since the record);
+            // elsewhere the record's own bound, and the largest move of a replaced vertex at a
+            // corner of a quad reaching there.
+            let beside = made.moved_beside_unchanged(&key, finest_level, tile.positions(), blocks);
+            let elsewhere = f64::from(recorded_bound) + beside;
             farthest_under(&key, finest_level, &made.p0, blocks).map_or_else(
                 || {
                     let d = f64::from(displacement);
@@ -560,7 +596,6 @@ impl DisplayState {
             deepest: 0.0,
             cells_held: 0,
             published_held: None,
-            moved: false,
         };
         let landed = stroke.len().saturating_sub(pending.len());
         for (n, dab) in stroke.iter().enumerate() {
@@ -660,7 +695,6 @@ impl DisplayState {
             };
             moved |= self.move_vertices(dab, drawn, row * side + first..row * side + last + 1);
         }
-        self.moved |= moved;
         touched || moved
     }
 
@@ -747,7 +781,6 @@ impl DisplayState {
                 }
             }
         }
-        self.moved |= any;
         any
     }
 
@@ -860,6 +893,36 @@ impl Replaced {
             }
         }
         made
+    }
+
+    /// The largest move from `record` of a replaced vertex at a corner of a quad over a finest
+    /// tile not in `blocks`: unchanged since the record, it lies within the record's bound of the
+    /// record's triangles, and the pen-down tile's differ by their corners' moves at most. A
+    /// quad wholly over the finest tiles gathered is measured instead, however far its corners
+    /// moved; a stroke's height doesn't count here but at the edge of what it changed.
+    fn moved_beside_unchanged(
+        &self,
+        key: &TileKey,
+        finest: Level,
+        record: &[Vec3],
+        blocks: &Blocks,
+    ) -> f64 {
+        let width = usize::try_from(key.side()).unwrap_or(0).max(1);
+        let corners = self.flags.iter().zip(self.p0.iter().zip(record));
+        let mut most = 0.0_f64;
+        for (v, (&replaced, (&start, &was))) in corners.enumerate() {
+            let moved = f64::from((start - was).length());
+            if !replaced || moved <= most {
+                continue;
+            }
+            let (Ok(i), Ok(j)) = (u32::try_from(v % width), u32::try_from(v / width)) else {
+                continue;
+            };
+            if quads_at(key, i, j).any(|(qi, qj)| !blocks.hold_quad(key, finest, qi, qj)) {
+                most = moved;
+            }
+        }
+        most
     }
 
     /// The pen-down normals of the replaced vertices, made from the pen-down positions (module

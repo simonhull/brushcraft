@@ -453,6 +453,24 @@ impl TileStore {
             .map(|bumped| ((bumped.extra * 0.5).next_up(), &bumped.finest))
     }
 
+    /// Whether display tile `key`'s record is the surface as it stands: a record there is, no
+    /// stroke's bump over it, and no write since made it unknown. What a brush's preview of it
+    /// can give way to, with no refresh to wait for; none would come for such a tile.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Eval`] if listing what writes made unknown fails; [`CacheError::Store`] if a
+    /// read fails.
+    pub fn display_record_stands(&mut self, key: &TileKey) -> Result<bool, CacheError> {
+        self.drop_uncovered_bumps()?;
+        self.display.settle(&self.mesh, &self.deps)?;
+        self.take_read_ahead();
+        if self.bumped.contains_key(key) {
+            return Ok(false);
+        }
+        Ok(self.display_source(key)?.is_some())
+    }
+
     /// Every display tile a stroke changed since its last refresh: its bump's displacements,
     /// summed (rounded up), and the finest tiles under it they moved. What a resync hands a
     /// renderer, so it can stand in for them again ([`crate::Drained::Resync`]).

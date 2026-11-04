@@ -97,6 +97,9 @@ use display::DisplayState;
 /// be a whole refined region, and a preview takes some tens of microseconds to a millisecond.
 pub const WAITING_A_CALL: usize = 8;
 
+/// The most tiles [`Preview::make_waiting`] tries a call, counting those that get no preview.
+const WAITING_TRIES: usize = 4 * WAITING_A_CALL;
+
 /// What a [`Preview::show`] or [`Preview::land`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PreviewStats {
@@ -225,6 +228,10 @@ pub struct Preview {
     /// Per dab of `stroke`, in order, the strengths of the stroke's dabs overlapping it (itself
     /// included): no place moves farther than the largest.
     overlaps: Vec<f64>,
+    /// The tiles [`Preview::make_waiting`] tried and got no preview of (nothing moves them, or
+    /// they have no record), left out until a landing changes the store under them; a new dab
+    /// that moves one makes its preview itself.
+    fruitless: BTreeSet<TileKey>,
 }
 
 /// Which tiles a renderer holds or wants: those a [`Preview`] makes previews of.
@@ -467,9 +474,10 @@ impl Preview {
             store.release_preview(&key);
         }
         self.reach.clear();
+        self.fruitless.clear();
         let mut published = Ok(());
         let all: Vec<TileKey> = self.displays.keys().copied().collect();
-        self.forget_unchanged(store, all);
+        let forgotten = self.forget_unchanged(store, all);
         for mut state in std::mem::take(&mut self.displays).into_values() {
             if state.published_held == Some(true) {
                 let key = *state.key();
@@ -480,6 +488,8 @@ impl Preview {
                 published = published.and(set);
             }
         }
+        let forgotten = forgotten.map(|_| ());
+        published = published.and(forgotten);
         self.stroke.clear();
         self.overlaps.clear();
         self.strengths.clear();
@@ -503,26 +513,62 @@ impl Preview {
         keys: &[TileKey],
     ) -> Result<PreviewStats, SculptError> {
         let mut stats = PreviewStats::default();
-        let waiting: Vec<TileKey> = keys
+        let mut made = Ok(());
+        let mut left = WAITING_A_CALL;
+        let mut attempts = WAITING_TRIES;
+        let mut wanted = keys
             .iter()
-            .filter(|key| store.preview_wanted(key))
-            .take(WAITING_A_CALL)
+            .filter(|key| store.preview_wanted(key) && !self.fruitless.contains(key))
             .copied()
-            .collect();
-        let (display, finest): (Vec<TileKey>, Vec<TileKey>) = waiting
-            .into_iter()
-            .partition(|key| key.channel() == geom::Channel::DISPLAY);
-        let mut made = self.make_displays(store, &display, &mut stats);
-        if !finest.is_empty() {
-            let again: BTreeSet<TileKey> = finest.into_iter().collect();
-            let remade = self.remake(store, &again, &mut stats);
-            made = made.and(remade);
+            .collect::<Vec<TileKey>>()
+            .into_iter();
+        // Batch after batch until the call's previews are made: a tile that gets none (nothing
+        // moves it, it has no record) costs its one try and is left out for a while.
+        while left > 0 && attempts > 0 {
+            let batch: Vec<TileKey> = wanted.by_ref().take(left.min(attempts)).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let tried = self.make_batch(store, &batch, &mut stats);
+            made = made.and(tried);
+            let (done, none): (Vec<TileKey>, Vec<TileKey>) = batch
+                .into_iter()
+                .partition(|key| !store.preview_wanted(key));
+            attempts -= done.len() + none.len();
+            left -= done.len();
+            self.fruitless.extend(none);
         }
         self.note_bytes(store);
         let closed = store.close_preview_epoch();
         made?;
         closed?;
         Ok(stats)
+    }
+
+    /// Tries to make the previews of `keys`: a display tile with a state has it handed to the
+    /// store again (the refresh dropped it while it wasn't held), one without is made, and a
+    /// finest tile is gathered.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a tile can't be read or gathered.
+    fn make_batch(
+        &mut self,
+        store: &mut TileStore,
+        keys: &[TileKey],
+        stats: &mut PreviewStats,
+    ) -> Result<(), SculptError> {
+        let (display, finest): (Vec<TileKey>, Vec<TileKey>) = keys
+            .iter()
+            .partition(|key| key.channel() == geom::Channel::DISPLAY);
+        let (known, fresh): (Vec<TileKey>, Vec<TileKey>) = display
+            .into_iter()
+            .partition(|key| self.displays.contains_key(key));
+        let handed = self.publish(store, &known, stats);
+        let displays = self.make_displays(store, &fresh, stats);
+        let again: BTreeSet<TileKey> = finest.into_iter().collect();
+        let remade = self.remake(store, &again, stats);
+        handed.and(displays).and(remade)
     }
 
     /// The display tiles above the finest tiles `dabs` reach that `drawn` draws: those a
@@ -705,28 +751,36 @@ impl Preview {
             })
             .map(|((key, _), _)| *key)
             .collect();
-        let again = self.forget_unchanged(store, again);
+        let again = self.forget_unchanged(store, again)?;
         let wanted: BTreeSet<TileKey> = again.into_iter().chain(touched.iter().copied()).collect();
         let wanted: Vec<TileKey> = wanted.into_iter().collect();
         self.publish(store, &wanted, stats)
     }
 
-    /// Of `keys`, the display previews to hand the store again: a released one that never moved
-    /// a vertex, over a tile no landed dab changed (no bump on its record), is dropped and its
-    /// store preview cleared instead, its record drawn again (nothing would refresh it).
-    fn forget_unchanged(&mut self, store: &mut TileStore, keys: Vec<TileKey>) -> Vec<TileKey> {
-        keys.into_iter()
-            .filter(|key| {
-                let unchanged = !store.preview_held(key)
-                    && store.display_changes(key).is_none()
-                    && self.displays.get(key).is_some_and(|state| !state.moved);
-                if unchanged {
-                    self.displays.remove(key);
-                    store.clear_display_preview(key);
-                }
-                !unchanged
-            })
-            .collect()
+    /// Of `keys`, the display previews to hand the store again: a released one over a tile whose
+    /// record stands ([`TileStore::display_record_stands`]: rebuilt since the stroke's last write
+    /// there, or never moved) is dropped, its state with it, and the record is drawn. No refresh
+    /// would replace it; one whose record doesn't stand is what is drawn until the refresh's.
+    ///
+    /// # Errors
+    ///
+    /// [`SculptError::Cache`] if a record can't be read.
+    fn forget_unchanged(
+        &mut self,
+        store: &mut TileStore,
+        keys: Vec<TileKey>,
+    ) -> Result<Vec<TileKey>, SculptError> {
+        let mut kept = Vec::with_capacity(keys.len());
+        for key in keys {
+            let released = !store.preview_held(&key) && store.display_changes(&key).is_none();
+            if released && store.display_record_stands(&key)? {
+                self.displays.remove(&key);
+                store.clear_display_preview(&key);
+            } else {
+                kept.push(key);
+            }
+        }
+        Ok(kept)
     }
 
     /// Shows `new` (see [`Preview::show`]).
@@ -811,6 +865,7 @@ impl Preview {
         drawn: &impl Drawn,
     ) -> Result<PreviewStats, SculptError> {
         let count = count.min(self.shown.len());
+        self.fruitless.clear();
         let landed: Vec<Imprint> = self.shown.drain(..count).collect();
         let reach: Vec<Vec<TileKey>> = self.reach.drain(..count.min(self.reach.len())).collect();
         let mut stats = PreviewStats {

@@ -530,6 +530,21 @@ fn a_record_refreshed_mid_stroke_still_gives_its_preview_the_pen_down_surface() 
         .unwrap();
     let ratio = assert_bounds(project.store(), &shown, "over records rebuilt mid-stroke");
     eprintln!("over records rebuilt mid-stroke: largest error / bound {ratio:.3}");
+    // A record rebuilt over the first dabs moves its replaced vertices by their whole height: a
+    // bound counting that shows here, however small the error.
+    let mut levels: BTreeMap<u8, f64> = BTreeMap::new();
+    for (tile, drawn) in &shown {
+        let error = farthest(project.store(), tile, drawn) / f64::from(drawn.bound);
+        let tightest = levels.entry(tile.level().get()).or_insert(0.0);
+        *tightest = tightest.max(error);
+    }
+    eprintln!("error / bound by level: {levels:?}");
+    for (level, tightest) in levels {
+        assert!(
+            tightest > 0.05,
+            "level {level}: the error is {tightest} of the bound, a stroke's height too much"
+        );
+    }
     drop(project.close(false));
 }
 
@@ -793,5 +808,114 @@ fn dabs_applied_at_once_move_the_previews_the_stroke_has() {
         )
         .unwrap();
     assert_eq!(again.gathered, 0, "the previews are still at hand");
+    drop(project.close(false));
+}
+
+/// A stroke and its jobs leave nothing of the previews: each is dropped as its tile goes back to
+/// its record, whether the refresh rebuilt it mid-stroke or after.
+#[test]
+fn nothing_of_the_previews_stays_after_a_stroke_and_its_jobs() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "gone");
+    // A dab that moves the surface, then one hovering off it over the same place: within the
+    // tiles' grown boxes, so it touches their previews, it writes nothing the refresh would see.
+    let finest_key = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let on = crate::testing::vertex(project.store(), finest_key, 31, 31);
+    let dabs = vec![
+        dab(on, 0.05, 0.01, 0.0, 0),
+        dab(on * 1.01, 0.002, 0.01, 0.0, 1),
+    ];
+    let mut stroke = Stroke::new(project.store());
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    // Each dab shown, landed and its tiles refreshed before the next: what it left behind is
+    // rebuilt while the stroke goes on, and the next dabs come near it again.
+    for dab in &dabs {
+        let dab = std::slice::from_ref(dab);
+        preview
+            .show(project.store(), &index, dab, &display_only)
+            .unwrap();
+        apply_dabs(project.store(), &mut index, &mut stroke, dab).unwrap();
+        preview
+            .land(project.store(), &index, 1, &display_only)
+            .unwrap();
+        run_jobs(project.store());
+    }
+    preview.end_stroke(project.store()).unwrap();
+    project.end_unrecorded_stroke().unwrap();
+    run_jobs(project.store());
+    let store = project.store();
+    let left: Vec<TileKey> = store.display_previewed().copied().collect();
+    assert_eq!(left, Vec::new(), "no preview outlives its refresh");
+    assert_eq!(store.pen_down_bytes(), 0, "nothing kept");
+    drop(project.close(false));
+}
+
+/// A held tile whose preview the refresh dropped while it wasn't held comes back with the state
+/// the stroke has, which a dab that doesn't touch it would never hand over.
+#[test]
+fn a_held_tile_with_a_state_and_no_preview_gets_it_handed_over_again() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, index, _) = open_copy(&dir, &base, "state");
+    let dabs = path(project.store(), 6);
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    preview
+        .show(project.store(), &index, &dabs, &display_only)
+        .unwrap();
+    let store = project.store();
+    let shown = previews(store);
+    let (key, want) = shown.iter().next().expect("a preview");
+    store.clear_display_preview(key);
+    assert!(store.preview_wanted(key), "held, with none");
+    let made = preview.make_waiting(store, &[*key]).unwrap();
+    assert_eq!(made.gathered, 0, "nothing made again");
+    let got = store.display_preview(key).expect("handed over");
+    assert_eq!(got.positions, want.positions);
+    drop(project.close(false));
+}
+
+/// Tiles a call can make nothing of don't use up what it may make: the tile behind them is made
+/// in the same call, and they aren't tried again until the dabs change.
+#[test]
+fn tiles_that_get_no_preview_starve_none_behind_them() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, index, _) = open_copy(&dir, &base, "starved");
+    let dabs = path(project.store(), 6);
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    preview
+        .show(project.store(), &index, &dabs, &|_: &TileKey| false)
+        .unwrap();
+    let store = project.store();
+    // Finest tiles no dab moves, held all the same, ahead of the display tile that waits.
+    let per_side = u16::try_from(level().tiles_per_side()).unwrap();
+    let faces: Vec<FaceId> = store.mesh().faces().collect();
+    let tiles = faces.iter().rev().flat_map(|&face| {
+        (0..per_side * per_side).map(move |n| (face, n % per_side, n / per_side))
+    });
+    let stuck: Vec<TileKey> = tiles
+        .take(2 * WAITING_A_CALL)
+        .map(|(face, tx, ty)| TileKey::displacement(face, level(), tx, ty).unwrap())
+        .collect();
+    for key in &stuck {
+        store.hold_preview(*key);
+    }
+    let waits = *store
+        .held_previews()
+        .find(|key| key.channel() == Channel::DISPLAY && store.preview_wanted(key))
+        .expect("a display tile waiting");
+    let mut keys = stuck.clone();
+    keys.push(waits);
+    preview.make_waiting(store, &keys).unwrap();
+    assert!(!store.preview_wanted(&waits), "made behind the stuck tiles");
+    let again = preview.make_waiting(store, &keys).unwrap();
+    assert_eq!(again.gathered, 0, "the stuck tiles aren't tried again");
+    for key in &stuck {
+        store.release_preview(key);
+    }
     drop(project.close(false));
 }

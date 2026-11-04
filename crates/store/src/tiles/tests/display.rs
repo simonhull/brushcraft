@@ -46,6 +46,35 @@ fn display_tiles_round_trip_through_save_and_open() {
     }
 }
 
+/// A record stands until a write makes it unknown: a preview over it can give way to it only
+/// then, with no refresh to come.
+#[test]
+fn a_record_stands_until_a_write_makes_it_unknown() {
+    let mesh = mesh();
+    let keys = display_keys(&mesh);
+    let dir = TestDir::new();
+    let mut store = new_store(&dir, "work.bcp", &mesh, roomy().with_display(level(TOP)));
+    let layer = display_layer(&mut store);
+    store.record_display(&layer).unwrap();
+    for key in &keys {
+        assert!(
+            store.display_record_stands(key).unwrap(),
+            "{key:?} recorded"
+        );
+    }
+    let mut map = CorrectionMap::new();
+    apply(&mut store, &mut map, &random_edits(&mesh, TOP, 2, 50));
+    let stored = store.stored_display(&keys).unwrap();
+    assert!(stored.iter().any(Option::is_none), "something is unknown");
+    for (key, kept) in keys.iter().zip(&stored) {
+        assert_eq!(
+            store.display_record_stands(key).unwrap(),
+            kept.is_some(),
+            "{key:?}"
+        );
+    }
+}
+
 #[test]
 fn an_edit_makes_unknown_every_display_tile_it_changes_across_faces() {
     let mesh = mesh();
