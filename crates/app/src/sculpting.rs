@@ -1967,6 +1967,20 @@ impl Brush for Sculpting {
             for event in &held {
                 self.admit(&mut scene, event.as_ref());
             }
+            // In batches as a close's: one of everything held pins every tile it reaches, which
+            // a tight budget may refuse though dab by dab it fits.
+            self.lift(&mut scene, None);
+            self.closing = Closing::Stepping;
+            loop {
+                self.unframed = false;
+                let budget = BrushBudget::slice(Instant::now(), WAITED_BATCH);
+                let mut report = BrushReport::default();
+                self.work(&mut scene, &mut report, Some(&budget));
+                if report.dabs_applied == 0 {
+                    break;
+                }
+            }
+            self.closing = Closing::No;
             loop {
                 self.lift(&mut scene, None);
                 self.work(&mut scene, &mut BrushReport::default(), None);

@@ -177,24 +177,29 @@ fn light_then_heavy(
     queue(&mut owner, light);
     run(&mut owner, 10_000);
     if owner.brush().last().dabs_applied == 0 || owner.brush().error().is_some() {
-        owner.close().expect("closed");
+        drop(owner.close());
         return None;
     }
     Some((owner, samples))
 }
 
-/// A store failing as a close lands reaches the process: the dabs it drops aren't lost in silence.
-#[test]
-fn a_store_error_while_closing_is_an_error_of_the_close() {
+/// A frame loop on about the least budget the light dabs of [`light_then_heavy`] fit, with its
+/// directory, and the heavy dabs, which don't.
+///
+/// Found by halving, then going up from there: how a run's dabs fall into batches is up to the
+/// clock, a batch pins the tiles of all its dabs, and at the very edge one run fits where the next
+/// doesn't. Nothing is asked of the close of a run that's only looked at.
+fn at_the_budgets_edge() -> (TestDir, Owner<Sculpting, NoUploads>, Vec<PenSample>) {
     let minimum = tight(0).minimum_budget(&cube_sphere(2).expect("a cube sphere"));
     let budget = |step: usize| minimum + step * (64 << 10);
     let fits = |step: usize| {
         let dir = TestDir::new();
         light_then_heavy(&dir, budget(step))
-            .map(|(owner, _)| owner.close().expect("closed"))
+            .map(|(owner, _)| drop(owner.close()))
             .is_some()
     };
     let (mut low, mut high) = (0, 512);
+    assert!(fits(high), "the light dabs fit a generous budget");
     while high - low > 1 {
         let middle = low + (high - low) / 2;
         if fits(middle) {
@@ -203,8 +208,19 @@ fn a_store_error_while_closing_is_an_error_of_the_close() {
             low = middle;
         }
     }
-    let dir = TestDir::new();
-    let (mut owner, heavy) = light_then_heavy(&dir, budget(high)).expect("it fits, as found");
+    (high..=512)
+        .find_map(|step| {
+            let dir = TestDir::new();
+            let made = light_then_heavy(&dir, budget(step));
+            made.map(|(owner, heavy)| (dir, owner, heavy))
+        })
+        .expect("it fits a generous budget")
+}
+
+/// A store failing as a close lands reaches the process: the dabs it drops aren't lost in silence.
+#[test]
+fn a_store_error_while_closing_is_an_error_of_the_close() {
+    let (_dir, mut owner, heavy) = at_the_budgets_edge();
     // Held for a frame that never came: the close takes them in, and they don't fit.
     owner.brush_mut().held.extend(heavy.into_iter().map(Some));
     owner.request_close().expect("a close");
@@ -222,28 +238,7 @@ fn a_store_error_while_closing_is_an_error_of_the_close() {
 
 #[test]
 fn a_store_error_mid_stroke_ends_it_with_one_record_and_nothing_after() {
-    // The least budget the light dabs fit under, found by halving: there the heavy dabs, over
-    // the whole sphere, can't pin their tiles.
-    let minimum = tight(0).minimum_budget(&cube_sphere(2).expect("a cube sphere"));
-    let budget = |step: usize| minimum + step * (64 << 10);
-    let fits = |step: usize| {
-        let dir = TestDir::new();
-        light_then_heavy(&dir, budget(step))
-            .map(|(owner, _)| owner.close().expect("closed"))
-            .is_some()
-    };
-    let (mut low, mut high) = (0, 512);
-    assert!(fits(high), "the light dabs fit a generous budget");
-    while high - low > 1 {
-        let middle = low + (high - low) / 2;
-        if fits(middle) {
-            high = middle;
-        } else {
-            low = middle;
-        }
-    }
-    let dir = TestDir::new();
-    let (mut owner, heavy) = light_then_heavy(&dir, budget(high)).expect("it fits, as found");
+    let (dir, mut owner, heavy) = at_the_budgets_edge();
     queue(&mut owner, heavy);
     run(&mut owner, 10_000);
     let error = owner.brush().error().map(str::to_owned);
