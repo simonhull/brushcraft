@@ -74,12 +74,15 @@
 //! last sample), the catch-up takes only batches the cost model fits before the pen's next sample
 //! is due (its smoothed interval, less a margin), so it doesn't hold a sample up; while it rests
 //! on the surface, batches of a sample's interval; once the pen lifts, each step takes at least
-//! one dab, in batches of up to [`CATCH_UP_BATCH`] ([`WAITED_BATCH`] while the next stroke waits).
+//! one dab, in batches of up to [`CATCH_UP_BATCH`] ([`WAITED_BATCH`] while the next stroke waits),
+//! a frame between batches.
 //! A frame's own step takes what fits the slack its time leaves, if it showed nothing. While the
 //! pen is down progress is guaranteed all the same, off a frame's step and whatever the dab costs:
 //! under a resting pen a catch-up that has landed nothing for [`CATCH_UP_STARVED`] takes one dab,
-//! and under a drawing pen one holding [`CATCH_UP_BACKLOG`] dabs takes one every quarter of that;
-//! so the backlog stays bounded, and only past that size does a dab's time come before a sample.
+//! and under a drawing pen one holding [`CATCH_UP_BACKLOG`] dabs takes a batch every quarter of
+//! that. Only past that size does a batch's time come before a sample. The backlog isn't bounded:
+//! a pen placing dabs faster than they land outruns even these, but the batches grow with the
+//! backlog ([`backlog_batch`]) and write each tile once, so the landing gains on it as it grows.
 //! Each batch that lands makes the previews it moved again over what landed ([`Preview::land`]);
 //! once every dab has landed none is left and the surface is exact, which the record's
 //! `dabs_catching_up` counts down to. The saved result is that of applying the dabs at once, bit
@@ -197,8 +200,20 @@ pub(crate) const LIMIT_TILES: usize = DabCost::CALIBRATED.limit_tiles(LATENCY_AI
 /// again waits at most one batch.
 pub(crate) const CATCH_UP_BATCH: Duration = Duration::from_millis(12);
 
-/// How long the catch-up's batches are while the pen's next stroke waits for it: dabs overlap, a
-/// batch writes each tile once, and landing is the whole wait, so longer batches cut it.
+/// How many dabs a catch-up holding `backlog` takes at once under a drawing pen.
+///
+/// Past [`CATCH_UP_BACKLOG`]: more as the backlog grows, four at the limit. A batch writes each
+/// tile once, so it lands many dabs for little more of a sample's wait than one.
+const fn backlog_batch(backlog: usize) -> usize {
+    backlog / (CATCH_UP_BACKLOG / 4)
+}
+
+/// How long the catch-up's batches are while the pen's next stroke waits for it.
+///
+/// Dabs overlap, a batch writes each tile once, and landing is the whole wait, so longer batches
+/// cut it. A frame comes between batches, however long; measured on the heavy stroke's landing, a
+/// batch of one big dab (33 or 66 ms) gives 15 frames a second where this gives 11, for a wait
+/// 15% longer and a scribble's slowest tenth of dabs four times later.
 pub(crate) const WAITED_BATCH: Duration = Duration::from_millis(100);
 
 /// How often a stroke's samples are taken to arrive before its own say: the Kamvas's measured
@@ -1174,8 +1189,9 @@ impl Sculpting {
         let waits = self.unframed || report.dabs_shown > 0 || report.dabs_applied > 0;
         let before_next = self.before_next_sample().filter(|_| !waits);
         let waited = self.landed_at.elapsed();
+        let backlog = self.catching_up();
         let behind = if moving {
-            self.catching_up() >= CATCH_UP_BACKLOG && waited >= CATCH_UP_STARVED / 4
+            backlog >= CATCH_UP_BACKLOG && waited >= CATCH_UP_STARVED / 4
         } else {
             waited >= CATCH_UP_STARVED
         };
@@ -1195,6 +1211,10 @@ impl Sculpting {
         }
         let first = report.dabs_applied == 0;
         let waiting_stroke = !self.deferred.is_empty();
+        // A frame shows each batch before the next starts, so the frames keep coming.
+        if batch && self.unframed {
+            return;
+        }
         let unshown = front.sources.iter().find(|source| !source.shown);
         let room = match (budget, front.sources.front(), unshown) {
             (Some(budget), Some(_), Some(oldest)) => budget
@@ -1227,7 +1247,12 @@ impl Sculpting {
         };
         let tiles = front.sources.iter().map(|source| source.tiles.as_slice());
         let at_least_one = first && (forced || starved);
-        let (count, predicted) = self.cost.take(tiles, room, at_least_one);
+        let (count, predicted) = if starved && moving {
+            self.cost
+                .take(tiles.take(backlog_batch(backlog)), Duration::MAX, true)
+        } else {
+            self.cost.take(tiles, room, at_least_one)
+        };
         if count > 0
             && let Some(took) = self.apply_front(scene, report, count)
         {
@@ -1778,6 +1803,7 @@ impl Brush for Sculpting {
             self.apply(&mut scene, &mut report, Some(&budget));
             self.note_kept(scene.project.store());
             let progress = report.dabs_applied > 0;
+            self.unframed |= progress;
             self.caught_up = std::mem::take(&mut self.caught_up).then(report);
             // More of it wanted only while it moves on: a pen drawing takes only dabs that fit,
             // and the next frame (wanted while dabs are queued) tries again.

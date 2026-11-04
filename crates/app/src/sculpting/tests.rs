@@ -1053,6 +1053,36 @@ fn the_brushs_pixel_size_off_centre_in_a_magnified_view_is_its_images_pixel() {
     );
 }
 
+/// Once the pen lifts, a frame comes between the catch-up's batches, however dear: a dab at a
+/// time, it takes a frame a dab.
+#[test]
+fn a_frame_comes_between_the_catch_ups_batches() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    let mut samples = stroke(ACROSS, 12);
+    let up = samples.pop().expect("an up");
+    queue(&mut owner, samples);
+    run(&mut owner, 1);
+    let shown = owner.brush().last().dabs_catching_up;
+    assert!(shown > 2, "{shown} dabs to land");
+    let mut up = up;
+    up.timestamp = Instant::now();
+    up.received = up.timestamp;
+    owner.pen(up);
+    let mut frames = 0;
+    while owner.brush().stroking() {
+        run(&mut owner, 1);
+        frames += 1;
+        assert!(frames < 10_000, "the catch-up ends");
+    }
+    assert!(frames >= shown, "{shown} dabs landed in {frames} frames");
+}
+
 /// A drawing pen, however long the catch-up has landed nothing, makes no sample wait behind a dab
 /// that doesn't fit: only the backlog's size does.
 #[test]
@@ -1072,7 +1102,13 @@ fn a_drawing_pen_is_held_up_by_a_dear_catch_up_only_past_its_backlog() {
         run(&mut owner, 1);
         let shown = owner.brush().last().dabs_catching_up;
         owner.brush_mut().landed_at = long_ago;
-        // Fresh from its samples, the pen still draws.
+        // A fresh sample: the pen still draws.
+        let last = if passes.is_multiple_of(2) {
+            ACROSS.0
+        } else {
+            ACROSS.1
+        };
+        owner.pen(sample(Phase::Drag, last, 0.8));
         run(&mut owner, 2);
         (shown, owner.brush().last().dabs_catching_up)
     };
@@ -1082,8 +1118,8 @@ fn a_drawing_pen_is_held_up_by_a_dear_catch_up_only_past_its_backlog() {
     let (many, many_left) = shown_after(90);
     assert!(many >= CATCH_UP_BACKLOG, "{many} dabs shown");
     assert!(
-        many_left < many,
-        "past the backlog a dab lands all the same"
+        many - many_left >= backlog_batch(many),
+        "past the backlog a batch lands, growing with it: {many} to {many_left}"
     );
 }
 
