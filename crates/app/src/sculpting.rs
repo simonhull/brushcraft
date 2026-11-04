@@ -74,7 +74,7 @@
 //! last sample), the catch-up takes only batches the cost model fits before the pen's next sample
 //! is due (its smoothed interval, less a margin), so it doesn't hold a sample up; while it rests
 //! on the surface, batches of a sample's interval; once the pen lifts, each step takes at least
-//! one dab, in batches of up to [`CATCH_UP_BATCH`].
+//! one dab, in batches of up to [`CATCH_UP_BATCH`] ([`WAITED_BATCH`] while the next stroke waits).
 //! A frame's own step takes what fits the slack its time leaves, if it showed nothing. While the
 //! pen is down progress is guaranteed all the same, off a frame's step and whatever the dab costs:
 //! under a resting pen a catch-up that has landed nothing for [`CATCH_UP_STARVED`] takes one dab,
@@ -197,6 +197,10 @@ pub(crate) const LIMIT_TILES: usize = DabCost::CALIBRATED.limit_tiles(LATENCY_AI
 /// again waits at most one batch.
 pub(crate) const CATCH_UP_BATCH: Duration = Duration::from_millis(12);
 
+/// How long the catch-up's batches are while the pen's next stroke waits for it: dabs overlap, a
+/// batch writes each tile once, and landing is the whole wait, so longer batches cut it.
+pub(crate) const WAITED_BATCH: Duration = Duration::from_millis(100);
+
 /// How often a stroke's samples are taken to arrive before its own say: the Kamvas's measured
 /// 173 Hz.
 const FIRST_INTERVAL: Duration = Duration::from_micros(5_780);
@@ -234,7 +238,7 @@ pub(crate) const CATCH_UP_STARVED: Duration = Duration::from_millis(50);
 /// It then takes them four times as often as [`CATCH_UP_STARVED`]. Only here does a dab's whole
 /// cost hold a sample up, so the rule is the backlog's size, not how long it has waited: dear
 /// dabs taken by time cost a scribble half its frames.
-pub(crate) const CATCH_UP_BACKLOG: usize = 96;
+pub(crate) const CATCH_UP_BACKLOG: usize = 512;
 
 /// How many dab spacings ahead of an open stroke's last dab the warming ahead of it looks
 /// ([`Sculpting::warm_ahead`]): as many as a fast stroke places in a frame or two.
@@ -1190,6 +1194,7 @@ impl Sculpting {
             }
         }
         let first = report.dabs_applied == 0;
+        let waiting_stroke = !self.deferred.is_empty();
         let unshown = front.sources.iter().find(|source| !source.shown);
         let room = match (budget, front.sources.front(), unshown) {
             (Some(budget), Some(_), Some(oldest)) => budget
@@ -1211,6 +1216,7 @@ impl Sculpting {
             by.saturating_duration_since(Instant::now())
         });
         let room = match (catching_up, batch, forced) {
+            (true, true, _) if waiting_stroke => room.max(WAITED_BATCH),
             (true, true, _) => room.max(CATCH_UP_BATCH),
             (true, false, false) if frame_step => room.min(until_sample),
             // The pen rests: a sample's interval, less the margin.

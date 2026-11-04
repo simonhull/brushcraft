@@ -1079,7 +1079,7 @@ fn a_drawing_pen_is_held_up_by_a_dear_catch_up_only_past_its_backlog() {
     let (few, few_left) = shown_after(1);
     assert!(few > 1 && few < CATCH_UP_BACKLOG, "{few} dabs shown");
     assert_eq!(few_left, few, "a short backlog waits for the pen");
-    let (many, many_left) = shown_after(12);
+    let (many, many_left) = shown_after(90);
     assert!(many >= CATCH_UP_BACKLOG, "{many} dabs shown");
     assert!(
         many_left < many,
