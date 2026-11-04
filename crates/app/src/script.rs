@@ -70,6 +70,10 @@
 //!
 //! # The sweep path
 //!
+//! `--script-path spiral` ([`Script::spiral`]) draws one stroke 25 s long at the default brush,
+//! pressed hard, spiralling out across the sphere onto fresh ground: what a stroke's length costs,
+//! read against the dabs placed so far.
+//!
 //! `--script-path sweep` ([`Script::sweep`]) draws one long, sweeping stroke for looking at, its
 //! pressure rising evenly from none to full: how a stroke looks as the pen presses harder, seen at
 //! a slant, where a ridge that breaks into separate leaning spikes shows clearest. With
@@ -184,6 +188,8 @@ pub(crate) enum Segment {
     Turn,
     /// Still, while a fast, long stroke is drawn across the whole object.
     StrokeLong,
+    /// The spiral path's one long stroke ([`Script::spiral`]).
+    StrokeSpiral,
     /// Still, while the fast, long stroke is drawn again at full pressure.
     StrokeHeavy,
     /// Still, while a stroke of a million-vertex brush is drawn and caught up.
@@ -210,6 +216,7 @@ impl Segment {
             Self::StrokeHeavy => "stroke_heavy",
             Self::StrokeHuge => "stroke_huge",
             Self::Sweep => "sweep",
+            Self::StrokeSpiral => "stroke_spiral",
         }
     }
 }
@@ -504,6 +511,44 @@ const SWEEP_STROKE: PenStroke = PenStroke {
     pressure: Pressure::Rising,
 };
 
+/// The spiral path's camera ([`Script::spiral`]): the sphere whole in view, the stroke held still
+/// under it long enough to feel what its length costs.
+const SPIRAL: [Keyframe; 3] = [
+    Keyframe {
+        segment: Segment::Open,
+        seconds: 3.0,
+        to: START,
+        ease: Ease::Linear,
+    },
+    Keyframe {
+        segment: Segment::StrokeSpiral,
+        seconds: 27.0,
+        to: START,
+        ease: Ease::Linear,
+    },
+    Keyframe {
+        segment: Segment::Settle,
+        seconds: 20.0,
+        to: START,
+        ease: Ease::Linear,
+    },
+];
+
+/// The spiral path's one stroke: 25 s at the default brush, pressed hard, out from near the
+/// facing point in five turns, onto fresh ground all the way.
+const SPIRAL_STROKE: PenStroke = PenStroke {
+    hover: 3.2,
+    down: 3.5,
+    up: 28.5,
+    size: BrushSize::Pixels(40.0),
+    shape: Shape::Spiral {
+        from: 6.0 * PI / 180.0,
+        to: 60.0 * PI / 180.0,
+        turns: 5.0,
+    },
+    pressure: Pressure::Full,
+};
+
 /// How hard a scripted pen presses along its stroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pressure {
@@ -533,6 +578,16 @@ pub(crate) enum Shape {
         angle: f64,
         /// How far round the circle the stroke runs each side of its lowest point, in radians.
         sweep: f64,
+    },
+    /// Round the facing point, the angle at the sphere's centre growing evenly: a stroke that
+    /// never stops reaching fresh ground.
+    Spiral {
+        /// The angle it starts at, in radians.
+        from: f64,
+        /// The angle it ends at, in radians.
+        to: f64,
+        /// How many times it goes round.
+        turns: f64,
     },
 }
 
@@ -593,6 +648,15 @@ impl PenStroke {
                 let down = unit(-up - facing * (-up).dot(facing) - across * (-up).dot(across));
                 let round = (2.0 * along - 1.0) * sweep;
                 let outward = down * round.cos() + across * round.sin();
+                facing * angle.cos() + outward * angle.sin()
+            }
+            Shape::Spiral { from, to, turns } => {
+                let across = unit(right - facing * right.dot(facing));
+                let above = unit(up - facing * up.dot(facing) - across * up.dot(across));
+                // Both by the root of how far along: the pen's speed stays about even.
+                let angle = from + (to - from) * along.sqrt();
+                let round = 2.0 * PI * turns * along.sqrt();
+                let outward = across * round.cos() + above * round.sin();
                 facing * angle.cos() + outward * angle.sin()
             }
         };
@@ -658,11 +722,13 @@ pub(crate) enum ScriptPath {
     Strokes,
     /// One long stroke seen at a slant, pressed from none to full ([`Script::sweep`]).
     Sweep,
+    /// One stroke 25 s long, out across the sphere ([`Script::spiral`]).
+    Spiral,
 }
 
 /// Why a text isn't a [`ScriptPath`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0:?} isn't a script path: benchmark, strokes or sweep")]
+#[error("{0:?} isn't a script path: benchmark, strokes, sweep or spiral")]
 pub(crate) struct BadPath(String);
 
 impl FromStr for ScriptPath {
@@ -673,6 +739,7 @@ impl FromStr for ScriptPath {
             "benchmark" => Ok(Self::Benchmark),
             "strokes" => Ok(Self::Strokes),
             "sweep" => Ok(Self::Sweep),
+            "spiral" => Ok(Self::Spiral),
             _ => Err(BadPath(text.to_owned())),
         }
     }
@@ -741,6 +808,7 @@ impl Script {
             ScriptPath::Benchmark => Self::benchmark(speed),
             ScriptPath::Strokes => Self::strokes(speed),
             ScriptPath::Sweep => Self::sweep(speed),
+            ScriptPath::Spiral => Self::spiral(speed),
         }
     }
 
@@ -775,6 +843,19 @@ impl Script {
             keyframes: SWEEP.to_vec(),
             speed,
             strokes: vec![SWEEP_STROKE],
+            pen: Vec::new(),
+        };
+        script.pen = script.every_pen_sample();
+        script
+    }
+
+    /// The spiral path (the module notes), run at `speed`.
+    pub(crate) fn spiral(speed: Speed) -> Self {
+        let mut script = Self {
+            start: START,
+            keyframes: SPIRAL.to_vec(),
+            speed,
+            strokes: vec![SPIRAL_STROKE],
             pen: Vec::new(),
         };
         script.pen = script.every_pen_sample();

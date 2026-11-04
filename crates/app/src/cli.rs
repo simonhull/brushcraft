@@ -43,7 +43,8 @@ options:
                    stroke of a million-vertex brush, still): the pen's latency, a stroke from
                    afar, a brush keeping up, and a big brush's preview and catch-up; or sweep (still, in close looking at
                    the surface at a slant, one long stroke pressed from none to full, still):
-                   how a stroke looks, with --screenshot
+                   how a stroke looks, with --screenshot; or spiral (one stroke 25 s long
+                   across the whole sphere): what a stroke's length costs
   --script-speed X run the path X times as fast (default 1)
   --record FILE    with --script, write a JSON line per frame to FILE: GPU phase times, the
                    owner thread's phases, what was drawn, residency and uploads; in a window
