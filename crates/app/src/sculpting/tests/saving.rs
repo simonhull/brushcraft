@@ -326,6 +326,25 @@ fn a_stroke_waiting_behind_another_at_ctrl_s_is_in_the_save() {
     assert_eq!(records_on_disk(&dir), 2, "both strokes");
 }
 
+/// Nor does a stroke let go of by the last one's end and not yet begun go missing.
+#[test]
+fn a_stroke_about_to_begin_at_ctrl_s_is_in_the_save() {
+    let dir = TestDir::new();
+    let mut owner = slow_owner(&dir);
+    run(&mut owner, 10_000);
+    let waiting = stroke(ACROSS, 12).into_iter().map(Some);
+    owner.brush_mut().deferred.extend(waiting);
+    owner.request_save(Instant::now());
+    let mut steps = 0;
+    while owner.save_stage().is_some() {
+        owner.save_step();
+        steps += 1;
+        assert!(steps < 100_000, "it ends");
+    }
+    owner.close().expect("closed");
+    assert_eq!(records_on_disk(&dir), 1);
+}
+
 /// One waiting behind the stroke the pen is drawing, its `Up` lost, doesn't hold the save for ever:
 /// the `Down` after Ctrl+S ends it, as it would any other time.
 #[test]

@@ -222,6 +222,13 @@ fn a_project_saved_since_restores_onto_the_earlier_save_point_and_saves_as_new()
     );
     assert!(restored.has_unsaved_edits(), "the recovered edits");
     assert!(
+        matches!(
+            restored.save_ahead(Instant::now()),
+            Err(ProjectError::NoPath)
+        ),
+        "no copies ahead into the file it mustn't save to either"
+    );
+    assert!(
         matches!(restored.save(), Err(ProjectError::NoPath)),
         "not into the project file, which has moved on"
     );

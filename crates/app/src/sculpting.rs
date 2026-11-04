@@ -1496,8 +1496,8 @@ impl Sculpting {
     }
 
     /// A batch of a close's or a save's landing, whether or not a frame can be drawn: `lifting`
-    /// the pen of any open stroke for a close, which doesn't wait for it, and for a save only of
-    /// one whose `Up` was lost, as the stroke after it shows. Returns whether any landed.
+    /// the pen of any open stroke for a close, which doesn't wait for it. Returns whether any
+    /// landed.
     ///
     /// # Errors
     ///
@@ -1518,7 +1518,7 @@ impl Sculpting {
         self.unframed = false;
         let budget = BrushBudget::slice(Instant::now(), WAITED_BATCH);
         let mut report = BrushReport::default();
-        if lifting || self.deferred_for_save() {
+        if lifting {
             self.lift(&mut scene, None);
         }
         self.work(&mut scene, &mut report, Some(&budget));
