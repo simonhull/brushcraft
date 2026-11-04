@@ -113,8 +113,8 @@ pub struct PreviewStats {
     pub tiles_cleared: usize,
     /// Tiles gathered from the store to preview (or look at) afresh.
     pub gathered: usize,
-    /// Dabs taken again by display previews made (the dabs near it): what a fresh tile costs,
-    /// which follows the dabs near it, not the stroke's length.
+    /// Dabs taken again by the display previews made: what a fresh tile costs, which follows the
+    /// dabs near it, not the stroke's length.
     pub replayed: usize,
 }
 
@@ -618,6 +618,14 @@ impl Preview {
                 .collect(),
         );
         let changed = self.moved_by(store, &known, new, true);
+        // One a dab reached but didn't touch is held again all the same: said so.
+        let held_again = known.iter().filter(|key| {
+            self.displays
+                .get(key)
+                .is_some_and(|state| state.published_held != Some(store.preview_held(key)))
+        });
+        let changed: BTreeSet<TileKey> = changed.iter().chain(held_again).copied().collect();
+        let changed: Vec<TileKey> = changed.into_iter().collect();
         self.publish(store, &changed, stats)?;
         self.make_displays(store, &fresh, stats)
     }

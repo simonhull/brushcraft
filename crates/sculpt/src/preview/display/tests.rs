@@ -971,3 +971,65 @@ fn a_fresh_preview_late_in_a_long_stroke_takes_the_dabs_near_it() {
     );
     drop(project.close(false));
 }
+
+/// A preview released, then held again by a dab that reaches its finest tile's box but no quad of
+/// it, says it's held: the dab is still to land there.
+#[test]
+fn a_preview_held_again_by_a_dab_that_touches_none_of_it_says_so() {
+    let dir = TestDir::new();
+    let base = base(&dir);
+    let (mut project, mut index, _) = open_copy(&dir, &base, "held");
+    let key = TileKey::displacement(FaceId::new(0), level(), 0, 0).unwrap();
+    let on = crate::testing::vertex(project.store(), key, 32, 32);
+    let first = [dab(on, 0.02, 0.01, 0.0, 0)];
+    let mut stroke = Stroke::new(project.store());
+    let mut preview = Preview::new();
+    project.begin_stroke().unwrap();
+    preview
+        .show(project.store(), &index, &first, &display_only)
+        .unwrap();
+    apply_dabs(project.store(), &mut index, &mut stroke, &first).unwrap();
+    preview
+        .land(project.store(), &index, 1, &display_only)
+        .unwrap();
+    let released = previews(project.store());
+    assert!(released.values().any(|shown| !shown.held), "released, kept");
+    // Off the surface at the box's corner: in the index's box, in no quad's.
+    let bounds = index.bvh().bounds(&key).unwrap().aabb;
+    let (low, high) = (bounds.min(), bounds.max());
+    let tile_store = project.store();
+    let places: Vec<Vec3> = (0..=8)
+        .flat_map(|j| (0..=8).map(move |i| (i * 8, j * 8)))
+        .map(|(i, j)| crate::testing::vertex(tile_store, key, i, j))
+        .collect();
+    let clear_of = |at: Vec3| {
+        let gaps = places.iter().map(|&p| f64::from((p - at).length()));
+        gaps.fold(f64::MAX, f64::min)
+    };
+    let corners = (0..8).map(|n: u8| {
+        Vec3::new(
+            if n & 1 == 0 { low.x } else { high.x },
+            if n & 2 == 0 { low.y } else { high.y },
+            if n & 4 == 0 { low.z } else { high.z },
+        )
+    });
+    let corner = corners
+        .max_by(|&a, &b| clear_of(a).total_cmp(&clear_of(b)))
+        .unwrap();
+    let hovering = [dab(corner, 0.0001, 0.0001, 0.0, 1)];
+    preview
+        .show(project.store(), &index, &hovering, &display_only)
+        .unwrap();
+    let store = project.store();
+    let held: Vec<TileKey> = store
+        .display_previewed()
+        .filter(|tile| store.preview_held(tile))
+        .copied()
+        .collect();
+    assert!(!held.is_empty(), "the dab holds them");
+    for tile in held {
+        let shown = store.display_preview(&tile).unwrap();
+        assert!(shown.held, "{tile:?} is held and says so");
+    }
+    drop(project.close(false));
+}
