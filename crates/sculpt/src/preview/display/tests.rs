@@ -11,7 +11,7 @@ use geom::{Channel, FaceId, Level, TileKey, Vec3};
 use store::{DisplayPreview, Project, SpatialIndex, TileStore};
 use stroke::Dab;
 
-use super::finest_place;
+use super::{cell_box, finest_place, quad_box};
 use crate::apply::apply_dabs;
 use crate::preview::tests::{at_once, base, level, open_copy, path, previewed_drawing, run_jobs};
 use crate::preview::{DrawsAll, Preview, WAITING_A_CALL};
@@ -677,4 +677,45 @@ fn the_previews_a_renderer_waits_for_are_made_a_few_a_call() {
         assert!(calls <= waiting.len(), "each call makes some");
     }
     drop(project.close(false));
+}
+
+/// A dab that misses a quad's box counts in none of its cells: the box holds them all, rounding
+/// included, however finely the quad is cut.
+#[test]
+fn a_quads_box_holds_every_cell_of_it() {
+    let quads = [
+        [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.5),
+        ],
+        [
+            Vec3::new(1000.1, -700.3, 12.7),
+            Vec3::new(1000.4, -700.2, 12.9),
+            Vec3::new(1000.2, -699.9, 12.1),
+            Vec3::new(1000.7, -699.8, 13.3),
+        ],
+    ];
+    for corners in quads {
+        for growth in [0.0_f32, 1e-3, 0.25] {
+            let whole = quad_box(corners, growth).expect("a box");
+            for per_side in [1_usize, 2, 7, 64] {
+                let cells = (0..per_side).flat_map(|b| (0..per_side).map(move |a| (a, b)));
+                for (a, b) in cells {
+                    let cell = cell_box(corners, a, b, per_side, growth).expect("a box");
+                    let (low, high) = (cell.min(), cell.max());
+                    let (lowest, highest) = (whole.min(), whole.max());
+                    assert!(
+                        low.x >= lowest.x && low.y >= lowest.y && low.z >= lowest.z,
+                        "cell ({a}, {b}) of {per_side} below its quad's box"
+                    );
+                    assert!(
+                        high.x <= highest.x && high.y <= highest.y && high.z <= highest.z,
+                        "cell ({a}, {b}) of {per_side} above its quad's box"
+                    );
+                }
+            }
+        }
+    }
 }
