@@ -717,6 +717,8 @@ pub(crate) struct Sculpting {
     error: Option<String>,
     /// Errors kept or cleared so far, for the overlay to see a change.
     errors: u64,
+    /// How many errors have dropped dabs, and the latest of them: a save since can't hold them.
+    drops: (u64, Option<String>),
     /// The last frame that applied dabs, for the overlay.
     last: BrushReport,
     /// The overlay's lines, and what they were made from.
@@ -764,6 +766,7 @@ impl Sculpting {
             ahead_todo: Vec::new(),
             error: None,
             errors: 0,
+            drops: (0, None),
             last: BrushReport::default(),
             status: (Vec::new(), None),
             stroke_start: None,
@@ -1016,7 +1019,7 @@ impl Sculpting {
         };
         let engine = Stroke::begin(&self.settings, id, &projector, &mut primed, first);
         if let Err(error) = surface.finish() {
-            self.fail("starting a stroke", &error);
+            self.dropped("starting a stroke", &error);
             return;
         }
         let Some(engine) = engine else {
@@ -1082,7 +1085,7 @@ impl Sculpting {
             Err(error) => {
                 drop(placed);
                 pending.engine = None;
-                self.fail("placing dabs", &error);
+                self.dropped("placing dabs", &error);
             }
         }
     }
@@ -1112,7 +1115,7 @@ impl Sculpting {
             }
             Err(error) => {
                 drop(tail);
-                self.fail("placing the stroke's last dabs", &error);
+                self.dropped("placing the stroke's last dabs", &error);
             }
         }
     }
@@ -1268,7 +1271,7 @@ impl Sculpting {
                 Err(error) => {
                     // No op, so nothing of it can be applied: it is dropped.
                     self.stroke = None;
-                    self.fail("starting a stroke's op", &error);
+                    self.dropped("starting a stroke's op", &error);
                     return;
                 }
             }
@@ -1394,7 +1397,7 @@ impl Sculpting {
                 front.sources.clear();
                 front.engine = None;
                 self.index_stale = true;
-                self.fail("applying dabs", &error);
+                self.dropped("applying dabs", &error);
                 self.rebuild_index(scene);
                 self.land(scene, dropped, true);
             }
@@ -1562,6 +1565,12 @@ impl Sculpting {
         let chain: Vec<String> = causes.map(ToString::to_string).collect();
         self.error = Some(format!("{doing}: {}", chain.join(": ")));
         self.errors += 1;
+    }
+
+    /// Keeps `error`, from `doing`, as [`Sculpting::fail`] does: one that dropped dabs.
+    fn dropped(&mut self, doing: &str, error: &dyn std::error::Error) {
+        self.fail(doing, error);
+        self.drops = (self.drops.0 + 1, self.error.clone());
     }
 
     /// The radius in screen pixels, scaled by `factor` within [`RADIUS_PIXELS`].
@@ -2037,6 +2046,17 @@ impl Brush for Sculpting {
     fn end_saving(&mut self) {
         self.landing = Landing::InFrames;
         self.save_asked = None;
+    }
+
+    fn drops(&self) -> u64 {
+        self.drops.0
+    }
+
+    fn dropped_since(&self, before: u64) -> Result<()> {
+        match &self.drops {
+            (count, Some(error)) if *count != before => Err(anyhow!("{error}")),
+            _ => Ok(()),
+        }
     }
 
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {

@@ -104,6 +104,111 @@ fn a_dirty_tile_is_left_for_the_save() {
     assert_project_file(&path, &map, "the stroke no flush took");
 }
 
+/// A tile copied, then edited with its slot broken and lost by a roll-over, goes back to its last
+/// saved state in the store, so the next save point mustn't name the copy.
+#[test]
+fn a_tile_lost_after_it_was_copied_stays_at_its_last_saved_state() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let [lost, other]: [TileKey; 2] = tiles(&mesh(), TOP, TOP)[..2].try_into().unwrap();
+    let mut project = Project::new((*mesh()).clone(), config(&dir)).unwrap();
+    assert_saved(project.save_as(&path));
+    let mut want = CorrectionMap::new();
+    let mut scratch = CorrectionMap::new();
+    interior(
+        &mut project,
+        &mut [&mut scratch],
+        lost,
+        Vec3::new(0.0, 0.0, 0.25),
+    );
+    project.finish_flushes().unwrap();
+    copy_all(&mut project);
+    let old = project.recovery_path().unwrap().to_path_buf();
+    // The sync of the next flush fails while the broken slot is dirty: the roll-over loses it.
+    project.writer.as_ref().unwrap().pause(true);
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    interior(
+        &mut project,
+        &mut [&mut want],
+        other,
+        Vec3::new(0.25, 0.0, 0.0),
+    );
+    project.begin_stroke().unwrap();
+    project
+        .store()
+        .edit_tile(lost, |edit| edit.set(5, 7, Vec3::new(0.0, 0.0, 0.5)))
+        .unwrap()
+        .unwrap();
+    break_slot(project.store(), &lost);
+    project.end_unrecorded_stroke().unwrap();
+    project.writer.as_ref().unwrap().pause(false);
+    while project.recovery_path().unwrap() == old {
+        drop(project.poll());
+        std::thread::yield_now();
+    }
+    drop(project.save().unwrap());
+    project.close(false).unwrap();
+    assert_project_file(
+        &path,
+        &want,
+        "the other tile, and the lost one as last saved",
+    );
+}
+
+#[test]
+fn a_tile_evicted_after_it_was_copied_is_still_saved() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = edited(&dir, &mut map);
+    copy_all(&mut project);
+    project.store().evict_all().unwrap();
+    assert_saved(project.save());
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "evicted after the copies");
+}
+
+#[test]
+fn a_roll_over_between_slices_loses_nothing() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = edited(&dir, &mut map);
+    while !matches!(
+        project.save_ahead(Instant::now()).unwrap(),
+        SaveAhead::Copying(_)
+    ) {}
+    fail_and_roll_over(&mut project, &mut map, 8);
+    copy_all(&mut project);
+    assert_saved(project.save());
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "rolled over between the slices");
+}
+
+#[test]
+fn a_ticks_flush_between_slices_loses_nothing() {
+    let dir = TestDir::new();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = edited(&dir, &mut map);
+    while !matches!(
+        project.save_ahead(Instant::now()).unwrap(),
+        SaveAhead::Copying(_)
+    ) {}
+    let edits = random_edits(&project.store().working().mesh(), TOP, 60, 8);
+    project.begin_stroke().unwrap();
+    apply_dabs(project.store(), &mut map, &edits);
+    project
+        .tick(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    copy_all(&mut project);
+    project.end_unrecorded_stroke().unwrap();
+    copy_all(&mut project);
+    assert_saved(project.save());
+    project.close(false).unwrap();
+    assert_project_file(&path, &map, "a flush between the slices");
+}
+
 #[test]
 fn an_edit_after_copying_ahead_reaches_the_save() {
     let dir = TestDir::new();

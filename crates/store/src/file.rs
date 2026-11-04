@@ -258,6 +258,15 @@ struct Appended {
     bounds: SharedMap<TileKey, Loc>,
 }
 
+/// A tile record in the file that nothing names yet ([`ProjectFile::append_unnamed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnnamedCopy {
+    /// The op of the record.
+    op: OpId,
+    /// Where it is.
+    loc: Loc,
+}
+
 /// An open project file.
 pub struct ProjectFile {
     /// The file's identity, from its `Meta` record.
@@ -1394,6 +1403,23 @@ impl ProjectFile {
     /// [`FileError::ReadOnly`]; [`FileError::Damaged`] if `raw` isn't a whole tile record of
     /// `key` after all; [`FileError::Io`].
     pub(crate) fn append_copy(&mut self, key: &TileKey, raw: &[u8]) -> Result<(), FileError> {
+        let copy = self.append_unnamed(key, raw)?;
+        self.name_copy(key, copy);
+        Ok(())
+    }
+
+    /// Appends `raw` as [`ProjectFile::append_copy`] does, but as nothing yet: no save point names
+    /// it until [`ProjectFile::name_copy`] does. So a copy made ahead of a save that turns out
+    /// not to be wanted is only bytes past the end, whatever the next save point holds.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectFile::append_copy`].
+    pub(crate) fn append_unnamed(
+        &mut self,
+        key: &TileKey,
+        raw: &[u8],
+    ) -> Result<UnnamedCopy, FileError> {
         if self.access == Access::ReadOnly {
             return Err(FileError::ReadOnly);
         }
@@ -1401,8 +1427,12 @@ impl ProjectFile {
             .ok_or(FileError::Damaged { offset: self.end })?
             .op;
         let loc = self.append_record(raw)?;
-        self.note(Name::Tile(*key), Some(op), Stamp::ZERO, loc);
-        Ok(())
+        Ok(UnnamedCopy { op, loc })
+    }
+
+    /// Makes `copy`, appended by [`ProjectFile::append_unnamed`], `key`'s latest record.
+    pub(crate) fn name_copy(&mut self, key: &TileKey, copy: UnnamedCopy) {
+        self.note(Name::Tile(*key), Some(copy.op), Stamp::ZERO, copy.loc);
     }
 
     /// A reader for other threads. It reads this open file while it stays open, and doesn't keep

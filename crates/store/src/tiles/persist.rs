@@ -146,7 +146,7 @@ impl TileStore {
             deps: DepGraph::with_reach_memo(cache_caps.reach),
             unsaved: TileMap::default(),
             since_rebase,
-            copied_ahead: BTreeSet::new(),
+            copied_ahead: std::collections::BTreeMap::new(),
             ahead_cursor: None,
             last_write: Stamp::ZERO,
             known_ops: TileMap::default(),
@@ -264,8 +264,9 @@ impl TileStore {
         }
         self.drain_saves();
         let mut lost = BTreeSet::new();
-        let to_copy = self.since_rebase.difference(&self.copied_ahead);
-        for key in to_copy {
+        let copied = &self.copied_ahead;
+        let to_copy = self.since_rebase.iter();
+        for key in to_copy.filter(|key| !copied.contains_key(key)) {
             let resident = self.corrections.find(key);
             let tile = |id| {
                 self.corrections
@@ -309,6 +310,12 @@ impl TileStore {
                 }
             }
         }
+        // A copy of a tile no longer to save (lost since, its last saved state what the store
+        // reads) stays unnamed.
+        let named = self.copied_ahead.iter();
+        for (key, copy) in named.filter(|(key, _)| self.since_rebase.contains(key)) {
+            project.name_copy(key, *copy);
+        }
         // Every tile of a recovery file is an edit since the last save point, so it must have
         // been copied: a save point without one would lose it once the store is rebased.
         let recovery = matches!(self.file.meta().role(), Role::Recovery { .. });
@@ -350,8 +357,9 @@ impl TileStore {
     /// Returns how many of those tiles aren't in `project` yet, `None` once this has come to the
     /// last of them.
     ///
-    /// Nothing is named by a save point until the save, and what the file holds past its last one
-    /// is discarded when it opens, so a save that never comes costs only the bytes. Slices need
+    /// The copies are named by nothing until the save names them, and what the file holds past
+    /// its last save point is discarded when it opens, so a copy no save wants costs only the
+    /// bytes. Slices need
     /// no quiet between them: an edit takes its tile out of the copies ([`TileStore::drain_saves`])
     /// and the save copies it as it then is.
     ///
@@ -385,11 +393,13 @@ impl TileStore {
                 continue;
             }
             if let Ok(Some(raw)) = self.file.read_tile_record(key) {
-                if let Err(error) = project.append_copy(key, &raw) {
-                    self.forget_copied_ahead();
-                    return Err(CacheError::Save(error));
+                match project.append_unnamed(key, &raw) {
+                    Ok(copy) => drop(self.copied_ahead.insert(*key, copy)),
+                    Err(error) => {
+                        self.forget_copied_ahead();
+                        return Err(CacheError::Save(error));
+                    }
                 }
-                self.copied_ahead.insert(*key);
             }
         };
         let left = self

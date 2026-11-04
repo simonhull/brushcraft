@@ -33,16 +33,20 @@
 //!
 //! # Failing
 //!
-//! A failed save, or a landing that failed and dropped dabs, loses nothing it hadn't lost: the
-//! edits stay, unsaved, in the recovery file. The title and the overlay say so until the next
-//! Ctrl+S, the log (stderr) says why, and Ctrl+S tries again.
+//! A failed save loses nothing: the edits stay, unsaved, in the recovery file. The title and the
+//! overlay say so until the next Ctrl+S, the log (stderr) says why, and Ctrl+S tries again. Dabs
+//! dropped by a store error since Ctrl+S, in any stage, fail the save too, as it can't hold
+//! everything drawn.
 //!
 //! # Closing meanwhile
 //!
 //! A close asked for during a save lets the save finish: the close lands everything held, a
-//! stroke that waited included (the pen isn't taken any more), the save holds all of that, and
-//! only then does the window go. A second request takes the window at once, and the save is
-//! finished as the project closes ([`crate::frame::Owner::close`]).
+//! stroke that waited included (the pen isn't taken any more), the save holds all of that, whole,
+//! and only then does the window go. A second request takes the window at once, and the save is
+//! finished as the project closes ([`crate::frame::Owner::close`]), unless dabs were dropped.
+//!
+//! If that save fails the window stays, saying so: the user asked for it. Ctrl+S tries again, and
+//! a further close takes the window, the recovery file kept, the failure an error of the run.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -110,6 +114,8 @@ enum Doing {
     Nothing,
     /// The last save failed.
     Failed,
+    /// The last save failed as the window closed, which waits for a further close.
+    FailedClosing,
     /// A save waits for the pen.
     PenDown,
     /// A save is landing this many dabs.
@@ -129,6 +135,10 @@ pub(crate) struct Saving {
     stage: Option<Stage>,
     /// When the save under way was asked for.
     asked: Instant,
+    /// How many times the brush had dropped dabs when it was.
+    drops_at: u64,
+    /// Why a save failed with the window closing: it stays until a further close.
+    failed_closing: Option<String>,
     /// The tiles still to copy, once the copying has begun.
     tiles_left: Option<usize>,
     /// How the last save ended, until the next is asked for.
@@ -148,6 +158,8 @@ impl Saving {
             ),
             stage: None,
             asked: now,
+            drops_at: 0,
+            failed_closing: None,
             tiles_left: None,
             outcome: None,
             title_says: None,
@@ -159,10 +171,27 @@ impl Saving {
         self.stage
     }
 
-    /// A save was asked for at `now`.
-    pub(crate) fn start(&mut self, now: Instant) {
+    /// When the save under way was asked for.
+    pub(crate) const fn asked(&self) -> Instant {
+        self.asked
+    }
+
+    /// How many times the brush had dropped dabs when the save under way was asked for.
+    pub(crate) const fn drops_at(&self) -> u64 {
+        self.drops_at
+    }
+
+    /// Why a save failed with the window closing, if one did and hasn't been tried again.
+    pub(crate) fn failed_closing(&self) -> Option<&str> {
+        self.failed_closing.as_deref()
+    }
+
+    /// A save was asked for at `now`, the brush having dropped dabs `drops` times.
+    pub(crate) fn start(&mut self, now: Instant, drops: u64) {
         self.stage = Some(Stage::PenDown);
         self.asked = now;
+        self.drops_at = drops;
+        self.failed_closing = None;
         self.tiles_left = None;
         self.outcome = None;
     }
@@ -177,8 +206,11 @@ impl Saving {
         self.tiles_left = Some(left);
     }
 
-    /// Ctrl+S found nothing to save: the file doesn't gain an empty save point.
+    /// Ctrl+S found nothing to save, at once or once a stroke of no dabs had ended: the file
+    /// doesn't gain an empty save point.
     pub(crate) fn nothing_to_save(&mut self) {
+        self.stage = None;
+        self.failed_closing = None;
         self.outcome = Some(Outcome::Done("nothing to save".to_owned()));
     }
 
@@ -191,11 +223,13 @@ impl Saving {
         self.outcome = Some(Outcome::Done(said));
     }
 
-    /// The save under way failed because of `error`: says so in the log.
-    pub(crate) fn failed(&mut self, error: &Error) {
+    /// The save under way failed because of `error`, with the window `closing` or not: says so
+    /// in the log.
+    pub(crate) fn failed(&mut self, error: &Error, closing: bool) {
         let why = format!("{error:#}");
         log(&format!("brushcraft: {}: save failed: {why}", self.name));
         self.stage = None;
+        self.failed_closing = closing.then(|| why.clone());
         self.outcome = Some(Outcome::Failed(why));
     }
 
@@ -251,6 +285,7 @@ impl Saving {
             (Some(Stage::Writing), _) => {
                 Doing::Writing(self.tiles_left.map(|left| rounded(left, TILES_STEP)))
             }
+            (None, _) if self.failed_closing.is_some() => Doing::FailedClosing,
             (None, _) if closing => Doing::Closing(rounded(landing, DABS_STEP)),
             (None, Some(Outcome::Failed(_))) => Doing::Failed,
             (None, _) => Doing::Nothing,
@@ -265,6 +300,10 @@ impl Saving {
                 Some(Outcome::Failed(why)) => format!("save failed: {why}"),
                 Some(Outcome::Done(_)) | None => "save failed".to_owned(),
             },
+            Doing::FailedClosing => format!(
+                "save failed: {}; Ctrl+S to try again, or close again to leave it unsaved",
+                self.failed_closing.as_deref().unwrap_or_default()
+            ),
             Doing::PenDown => "saving when the stroke ends".to_owned(),
             Doing::Landing(left) => format!("saving, {left} dabs to land"),
             Doing::Writing(Some(left)) => format!("saving, {left} tiles to write"),
@@ -337,7 +376,7 @@ mod tests {
     #[test]
     fn the_title_is_said_once_and_again_only_when_it_changes() {
         let mut saving = saving();
-        saving.start(Instant::now());
+        saving.start(Instant::now(), 0);
         saving.reach(Stage::Landing);
         assert!(saving.title_change(true, 95, false).is_some());
         assert_eq!(saving.title_change(true, 91, false), None, "same ten");
@@ -350,7 +389,7 @@ mod tests {
     #[test]
     fn the_title_follows_a_save_through_its_stages() {
         let mut saving = saving();
-        saving.start(Instant::now());
+        saving.start(Instant::now(), 0);
         assert_eq!(
             saving.title_change(true, 1, false).as_deref(),
             Some("*sphere - BrushCraft: saving when the stroke ends")
@@ -370,16 +409,29 @@ mod tests {
     #[test]
     fn a_failure_is_said_until_the_next_save_is_asked_for() {
         let mut saving = saving();
-        saving.start(Instant::now());
-        saving.failed(&anyhow!("the disk is full"));
+        saving.start(Instant::now(), 0);
+        saving.failed(&anyhow!("the disk is full"), false);
         assert_eq!(saving.stage(), None);
         assert_eq!(
             saving.title_change(true, 0, false).as_deref(),
             Some("*sphere - BrushCraft: save failed: the disk is full")
         );
         assert!(saving.line(true, 0, false).contains("the disk is full"));
-        saving.start(Instant::now());
+        saving.start(Instant::now(), 0);
         assert!(!saving.line(true, 0, false).contains("the disk is full"));
+    }
+
+    #[test]
+    fn a_failure_with_the_window_closing_waits_and_says_what_to_do() {
+        let mut saving = saving();
+        saving.start(Instant::now(), 0);
+        saving.failed(&anyhow!("the disk is full"), true);
+        assert_eq!(saving.failed_closing(), Some("the disk is full"));
+        let title = saving.title_change(true, 0, true).expect("a title");
+        assert!(title.contains("the disk is full"), "{title}");
+        assert!(title.contains("close again"), "{title}");
+        saving.start(Instant::now(), 0);
+        assert_eq!(saving.failed_closing(), None, "tried again");
     }
 
     #[test]
@@ -389,7 +441,7 @@ mod tests {
             saving.title_change(true, 41, true).as_deref(),
             Some("*sphere - BrushCraft: closing, 50 dabs to land")
         );
-        saving.start(Instant::now());
+        saving.start(Instant::now(), 0);
         saving.reach(Stage::Landing);
         assert_eq!(
             saving.title_change(true, 41, true).as_deref(),

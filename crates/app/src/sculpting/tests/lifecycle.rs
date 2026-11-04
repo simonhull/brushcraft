@@ -142,7 +142,8 @@ fn tight(budget: usize) -> StoreConfig {
         .with_display(Level::new(7).expect("a level"))
 }
 
-/// A stroke on a fresh project under `tight(budget)`, light first, then heavy.
+/// A stroke on a fresh project, saved as `edge.bcrf`, under `tight(budget)`, light first, then
+/// heavy.
 ///
 /// Its brush 400 pixels, its pressure light (0.01: small dabs) for its first half and full (dabs
 /// over the whole sphere) after. Returns the frame loop with its light half drawn, and the heavy
@@ -157,6 +158,7 @@ fn light_then_heavy(
         recovery_dir: dir.path().join("recovery"),
     };
     let mut project = Project::new(cube_sphere(2).ok()?, config).ok()?;
+    drop(project.save_as(&dir.path().join("edge.bcrf")).ok()?);
     let Ok(Some(picker)) = Picker::load(&mut project) else {
         project.close(false).expect("closed");
         return None;

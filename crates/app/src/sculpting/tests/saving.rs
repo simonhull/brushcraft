@@ -542,6 +542,145 @@ fn a_close_during_a_save_waits_for_it_and_it_holds_every_stroke() {
     assert_eq!(recovery_files(&dir), 0, "nothing unsaved");
 }
 
+/// A close during the writing lets the stroke that waited go: the save waits for all of it, however
+/// many batches it lands in, so the file never holds half a stroke.
+#[test]
+fn a_close_as_a_save_writes_saves_a_waiting_stroke_whole() {
+    for steps in [2, 40] {
+        let dir = TestDir::new();
+        let mut owner = slow_owner(&dir);
+        run(&mut owner, 10_000);
+        queue(&mut owner, stroke(ACROSS, 12));
+        run(&mut owner, 10_000);
+        owner.request_save(Instant::now());
+        owner.save_step();
+        owner.save_step();
+        assert_eq!(owner.save_stage(), Some(Stage::Writing));
+        queue(
+            &mut owner,
+            stroke_after_ctrl_s(((150.0, 80.0), (170.0, 120.0)), steps),
+        );
+        run(&mut owner, 1);
+        assert!(!owner.brush().deferred.is_empty(), "it waits");
+        owner.request_close().expect("a close");
+        let mut passes = 0;
+        while !owner.ready_to_close() {
+            owner.close_step().expect("a step");
+            owner.save_step();
+            passes += 1;
+            assert!(passes < 100_000, "it ends");
+        }
+        owner.close().expect("closed");
+        assert_eq!(records_on_disk(&dir), 2, "{steps}: both strokes, whole");
+        assert_eq!(recovery_files(&dir), 0, "{steps}: nothing unsaved");
+    }
+}
+
+/// A save that fails as the window closes is the user's to see: the window stays, saying so, and
+/// a further close takes it, the failure an error of the run and the recovery file kept.
+#[test]
+fn a_save_failing_during_a_close_holds_the_window_and_fails_the_run() {
+    let dir = TestDir::new();
+    let mut owner = owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 10_000);
+    owner.request_save(Instant::now());
+    owner.request_close().expect("a close");
+    finish_save(&mut owner);
+    assert!(!owner.ready_to_close(), "the window stays");
+    let title = owner.title_change().expect("it says so");
+    assert!(title.contains("save failed"), "{title}");
+    let closed = owner.close().expect_err("the run failed");
+    assert!(closed.to_string().contains("saving"), "{closed:#}");
+    assert_eq!(recovery_files(&dir), 1, "its edits are there");
+}
+
+#[test]
+fn a_held_close_goes_once_nothing_is_left_to_save() {
+    let dir = TestDir::new();
+    let mut owner = owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 10_000);
+    owner.request_save(Instant::now());
+    owner.request_close().expect("a close");
+    finish_save(&mut owner);
+    assert!(owner.close_held());
+    drop(owner.project().save_as(&path_in(&dir)).expect("saved"));
+    owner.request_save(Instant::now());
+    assert!(owner.ready_to_close(), "nothing is left unsaved");
+    owner.close().expect("closed");
+    assert_eq!(recovery_files(&dir), 0);
+}
+
+/// Dabs dropped while the save waited for the pen: it can't say it holds them.
+#[test]
+fn dabs_dropped_with_the_pen_down_fail_the_save() {
+    let (_dir, mut owner, heavy) = lifecycle::at_the_budgets_edge();
+    owner.request_save(Instant::now());
+    assert_eq!(owner.save_stage(), Some(Stage::PenDown));
+    queue(&mut owner, heavy);
+    run(&mut owner, 10_000);
+    assert!(owner.brush().error().is_some(), "the heavy dabs don't fit");
+    finish_save(&mut owner);
+    assert!(owner.save_line().contains("save failed"));
+    let title = owner.title_change().expect("it says so");
+    assert!(title.starts_with('*'), "not saved: {title}");
+    assert!(owner.project().has_unsaved_edits());
+    owner.close().expect("closed");
+}
+
+/// A landing that fails as the project closes leaves the save unmade and the recovery file there.
+#[test]
+fn a_failed_flush_skips_the_save_and_keeps_the_recovery_file() {
+    let (_dir, mut owner, heavy) = lifecycle::at_the_budgets_edge();
+    let recovery = owner.project().recovery_path().expect("a file").to_owned();
+    owner.brush_mut().held.extend(heavy.into_iter().map(Some));
+    owner.request_save(Instant::now());
+    let closed = owner.close().expect_err("the dabs don't fit");
+    assert!(
+        format!("{closed:#}").contains("applying dabs"),
+        "{closed:#}"
+    );
+    assert!(recovery.exists(), "the edits since the last save");
+}
+
+/// The samples of a stroke from before Ctrl+S, not yet routed: it's in the save.
+#[test]
+fn a_stroke_queued_at_ctrl_s_is_in_the_save() {
+    let dir = TestDir::new();
+    let mut owner = slow_owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    owner.request_save(Instant::now());
+    assert_eq!(owner.save_step(), SaveStep::Idle, "its samples wait");
+    finish_save(&mut owner);
+    assert!(!owner.project().has_unsaved_edits());
+    owner.close().expect("closed");
+    assert_eq!(records_on_disk(&dir), 1);
+}
+
+/// A stroke that placed no dab has no edits: no empty save point for it.
+#[test]
+fn a_stroke_of_no_dabs_saves_nothing() {
+    let dir = TestDir::new();
+    let mut owner = slow_owner(&dir);
+    run(&mut owner, 10_000);
+    let (from, to) = ACROSS;
+    let light = [sample(Phase::Down, from, 0.0), sample(Phase::Drag, to, 0.0)];
+    queue(&mut owner, light.to_vec());
+    run(&mut owner, 1);
+    assert!(owner.brush().under_way(), "the pen is down");
+    owner.request_save(Instant::now());
+    owner.pen(sample(Phase::Up, to, 0.0));
+    finish_save(&mut owner);
+    assert!(owner.save_line().contains("nothing to save"));
+    assert_eq!(owner.brush().save_asked, None, "strokes aren't held");
+    owner.close().expect("closed");
+    assert_eq!(save_points(&dir), 1, "only the first");
+}
+
 /// The window gone at a second close, the save asked for is still made.
 #[test]
 fn a_save_cut_off_by_the_window_going_is_finished_as_the_project_closes() {

@@ -102,7 +102,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use geom::TileKey;
 use render::camera::View;
 use render::lod::LodStats;
@@ -513,6 +513,20 @@ pub(crate) trait Brush {
 
     /// The save is over, however it went: strokes go on, those that waited for it first.
     fn end_saving(&mut self) {}
+
+    /// How many times the brush has dropped dabs, a store error ending a stroke early.
+    fn drops(&self) -> u64 {
+        0
+    }
+
+    /// The latest error that dropped dabs, if any did since there were `before` drops.
+    ///
+    /// # Errors
+    ///
+    /// That error: a save since then can't hold everything drawn.
+    fn dropped_since(&self, _before: u64) -> Result<()> {
+        Ok(())
+    }
 
     /// Lands a batch of what the brush holds, whether or not a frame can be drawn. Returns whether
     /// any landed.
@@ -2618,7 +2632,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// brush has landed what it held), and no save is under way.
     pub(crate) fn ready_to_close(&self) -> bool {
         let drawn = self.size.is_some() || self.last_view.is_some();
-        self.closing() && self.saving.stage().is_none() && (self.landing() == 0 || !drawn)
+        let saved = self.saving.stage().is_none() && !self.close_held();
+        self.closing() && saved && (self.landing() == 0 || !drawn)
+    }
+
+    /// Whether the window stays, a close waiting for a further close: its save failed.
+    pub(crate) fn close_held(&self) -> bool {
+        self.saving.failed_closing().is_some()
     }
 
     /// Ctrl+S, at `now`: a save of everything drawn so far starts, answered at once, and goes on
@@ -2629,11 +2649,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             return;
         }
         self.scheduler.want(Reason::Input);
-        if !self.unsaved() {
+        if !self.unsaved() && !self.pen_queued(now) {
             self.saving.nothing_to_save();
             return;
         }
-        self.saving.start(now);
+        self.saving.start(now, self.brush.drops());
         // A close takes every stroke there is, so none has to wait.
         if !self.closing() {
             self.brush.begin_saving(now);
@@ -2646,7 +2666,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) fn save_step(&mut self) -> SaveStep {
         match self.saving.stage() {
             None => SaveStep::Idle,
-            Some(Stage::PenDown) if self.brush.pen_down() && !self.closing() => SaveStep::Idle,
+            Some(Stage::PenDown) if self.pen_held() && !self.closing() => SaveStep::Idle,
             Some(Stage::PenDown) => {
                 self.brush.begin_landing();
                 self.saving.reach(Stage::Landing);
@@ -2655,6 +2675,20 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             Some(Stage::Landing) => self.land_for_save(),
             Some(Stage::Writing) => self.write_save(),
         }
+    }
+
+    /// Whether a save asked for can't begin landing: the pen is down on a stroke it holds, or a
+    /// stroke's samples from before it wait to be routed.
+    fn pen_held(&self) -> bool {
+        self.brush.pen_down() || self.pen_queued(self.saving.asked())
+    }
+
+    /// Whether a stroke's samples from before `asked` wait to be routed, as they will be with
+    /// frames to route them.
+    fn pen_queued(&self, asked: Instant) -> bool {
+        let mut queued = self.pen_queue.iter();
+        let before = |sample: &PenSample| sample.phase.in_stroke() && sample.received <= asked;
+        self.size.is_some() && queued.any(before)
     }
 
     /// A step of a save's landing: on to the writing once it holds nothing more. A close lands
@@ -2695,8 +2729,23 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// A step of a save's writing: a slice of its work done ahead, then, with only the fixed part
-    /// left, the save.
+    /// left, the save. A close may have let strokes go that waited for the save: it waits for them
+    /// to land, as a stroke's op must end before a save holds it. With dabs dropped the save
+    /// fails, and with no edits, after a stroke of no dabs, there is nothing to save.
     fn write_save(&mut self) -> SaveStep {
+        let drawn = self.size.is_some() || self.last_view.is_some();
+        if self.closing() && drawn && self.landing() > 0 {
+            return SaveStep::Worked;
+        }
+        if let Err(error) = self.brush.dropped_since(self.saving.drops_at()) {
+            self.end_save(Err(error.context("dabs were dropped")));
+            return SaveStep::Worked;
+        }
+        if !self.project.has_unsaved_edits() {
+            self.saving.nothing_to_save();
+            self.save_over();
+            return SaveStep::Worked;
+        }
         match self.project.save_ahead(Instant::now() + SAVE_SLICE) {
             Ok(SaveAhead::Flushing) => SaveStep::Waiting,
             Ok(SaveAhead::Copying(left)) => {
@@ -2719,8 +2768,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     fn end_save(&mut self, saved: Result<SaveOutcome>) {
         match saved {
             Ok(outcome) => self.saving.saved(&outcome, Instant::now()),
-            Err(error) => self.saving.failed(&error),
+            Err(error) => self.saving.failed(&error, self.closing()),
         }
+        self.save_over();
+    }
+
+    /// The save under way is over: strokes go on.
+    fn save_over(&mut self) {
         if !self.closing() {
             self.brush.end_saving();
         }
@@ -2762,13 +2816,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// Closes the project: lets the brush apply what it holds and end its stroke, finishes a save
-    /// under way (the window has gone, and the user asked for it), leaves the feed, then closes
-    /// the project, keeping its recovery file only if it has edits no save holds (the app can't
-    /// ask yet).
+    /// under way (the window has gone, and the user asked for it) unless that went wrong, leaves
+    /// the feed, then closes the project, keeping its recovery file only if it has edits no save
+    /// holds (the app can't ask yet).
     ///
     /// # Errors
     ///
-    /// As [`Brush::flush`], [`Project::save`] and [`Project::close`].
+    /// As [`Brush::flush`], [`Project::save`] and [`Project::close`]; a save that failed with the
+    /// window closing, or can't be made as dabs were dropped.
     pub(crate) fn close(mut self) -> Result<()> {
         let flushed = match self.size.or_else(|| self.last_view.map(|(_, size)| size)) {
             Some(size) => {
@@ -2777,12 +2832,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             }
             None => Ok(()),
         };
-        let saved = if self.saving.stage().is_some() {
-            let saved = self.project.save().context("saving the project");
-            saved.map(|outcome| self.saving.saved(&outcome, Instant::now()))
-        } else {
-            Ok(())
-        };
+        let saved = self.last_save(flushed.is_ok());
         let Self {
             mut project,
             cursor,
@@ -2792,6 +2842,27 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let keep = project.has_unsaved_edits();
         let closed = project.close(keep).context("closing the project");
         said_too(said_too(flushed, saved), closed)
+    }
+
+    /// What a closing project does about its save: says that one failed, finishes one under way
+    /// if everything `landed` and no dabs were dropped since it was asked for.
+    ///
+    /// # Errors
+    ///
+    /// The failure, or why the save wasn't made: its edits stay unsaved, in the recovery file.
+    fn last_save(&mut self, landed: bool) -> Result<()> {
+        if let Some(why) = self.saving.failed_closing() {
+            return Err(anyhow!("saving the project: {why}"));
+        }
+        if self.saving.stage().is_none() {
+            return Ok(());
+        }
+        let dropped = self.brush.dropped_since(self.saving.drops_at());
+        dropped.context("not saved: dabs were dropped")?;
+        ensure!(landed, "not saved: what the brush held didn't all land");
+        let outcome = self.project.save().context("saving the project")?;
+        self.saving.saved(&outcome, Instant::now());
+        Ok(())
     }
 
     /// Whether the stale-tile feed holds epochs this loop hasn't drained (or a resync): work

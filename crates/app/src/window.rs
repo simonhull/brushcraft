@@ -424,7 +424,7 @@ impl WindowApp {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                if !event.repeat && saves(event.physical_key, running.modifiers) {
+                if saves(event.physical_key, running.modifiers, event.repeat) {
                     owner.request_save(Instant::now());
                 } else if let Some(change) = brush_change(event.physical_key) {
                     // Held, a brush key repeats: the size or strength keeps changing.
@@ -445,9 +445,9 @@ impl WindowApp {
 }
 
 /// Whether `key` with `modifiers` held is Ctrl+S: Ctrl alone, S by its place on the keyboard, as
-/// the other keys are. With Shift it stays free for Save As.
-fn saves(key: PhysicalKey, modifiers: ModifiersState) -> bool {
-    key == PhysicalKey::Code(KeyCode::KeyS) && modifiers == ModifiersState::CONTROL
+/// the other keys are, and not a held key's `repeat`. With Shift it stays free for Save As.
+fn saves(key: PhysicalKey, modifiers: ModifiersState, repeat: bool) -> bool {
+    !repeat && key == PhysicalKey::Code(KeyCode::KeyS) && modifiers == ModifiersState::CONTROL
 }
 
 /// The change of look a key makes, if it makes one: by the key's place on the keyboard, so
@@ -622,14 +622,18 @@ impl ApplicationHandler for WindowApp {
         } else {
             Ok(())
         };
+        // Samples the pen sent before Ctrl+S are in the save: they are looked at first.
+        Self::feed_pen(running, &mut self.pen_samples);
         let saving = running.owner.save_step();
         let driven = stepped.and_then(|()| Self::drive(running, &mut self.pen_samples, event_loop));
+        // A close held by a failed save has nothing to do but wait for the user.
+        let closing = running.closing && !running.owner.close_held();
         match saving {
             // Nothing to do but look again shortly: the recovery writer wakes nothing.
-            SaveStep::Waiting if !running.closing => {
+            SaveStep::Waiting if !closing => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + GPU_POLL));
             }
-            SaveStep::Idle if !running.closing => {}
+            SaveStep::Idle if !closing => {}
             // Back at once, frames or none, the window's events heard between batches.
             SaveStep::Waiting | SaveStep::Idle | SaveStep::Worked => {
                 event_loop.set_control_flow(ControlFlow::Poll);
@@ -664,11 +668,12 @@ mod tests {
 
     #[test]
     fn ctrl_s_saves_and_nothing_else_does() {
-        assert!(saves(S, ModifiersState::CONTROL));
-        assert!(!saves(S, ModifiersState::default()), "S alone");
+        assert!(saves(S, ModifiersState::CONTROL, false));
+        assert!(!saves(S, ModifiersState::CONTROL, true), "held down");
+        assert!(!saves(S, ModifiersState::default(), false), "S alone");
         let other = PhysicalKey::Code(KeyCode::KeyA);
-        assert!(!saves(other, ModifiersState::CONTROL), "Ctrl+A");
+        assert!(!saves(other, ModifiersState::CONTROL, false), "Ctrl+A");
         let held = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert!(!saves(S, held), "Ctrl+Shift+S stays free");
+        assert!(!saves(S, held, false), "Ctrl+Shift+S stays free");
     }
 }
