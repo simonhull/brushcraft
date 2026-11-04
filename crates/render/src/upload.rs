@@ -275,6 +275,13 @@ pub trait TileSource {
         Vec::new()
     }
 
+    /// The tiles that may have started to wait ([`TileSource::waits_for_preview`]) since the last
+    /// call: all held, by default. A source that knows says fewer, as a long stroke holds
+    /// thousands.
+    fn newly_held(&mut self) -> Vec<TileKey> {
+        self.held()
+    }
+
     /// A count of changes to what a brush holds and has previews of: the same as last time, no
     /// tile started waiting. The default never changes.
     fn holds_changed(&mut self) -> u64 {
@@ -395,6 +402,10 @@ impl TileSource for StoreSource<'_> {
 
     fn held(&mut self) -> Vec<TileKey> {
         self.store.held_previews().copied().collect()
+    }
+
+    fn newly_held(&mut self) -> Vec<TileKey> {
+        self.store.take_newly_held()
     }
 
     fn holds_changed(&mut self) -> u64 {

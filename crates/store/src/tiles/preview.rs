@@ -70,6 +70,9 @@ pub(crate) struct Previews {
     changed: BTreeSet<TileKey>,
     /// How many holds and releases there have been.
     holds_changed: u64,
+    /// The tiles that may have started waiting for a preview since a renderer last asked: held,
+    /// or a held tile's preview gone ([`TileStore::take_newly_held`]).
+    newly_held: Vec<TileKey>,
     /// The bytes the display previews hold.
     display_bytes: usize,
     /// The bytes a brush keeps to make its previews ([`TileStore::note_preview_state_bytes`]).
@@ -172,6 +175,9 @@ impl TileStore {
         let previews = &mut self.previews;
         if previews.blocks.remove(key).is_some() {
             previews.changed.insert(*key);
+            if previews.held.contains(key) {
+                previews.newly_held.push(*key);
+            }
         }
     }
 
@@ -181,8 +187,13 @@ impl TileStore {
         let previews = &mut self.previews;
         if previews.held.insert(key) {
             previews.holds_changed += 1;
+            previews.newly_held.push(key);
             for above in Previews::ancestors(&key) {
-                *previews.above.entry(above).or_insert(0) += 1;
+                let count = previews.above.entry(above).or_insert(0);
+                if *count == 0 {
+                    previews.newly_held.push(above);
+                }
+                *count += 1;
             }
         }
     }
@@ -196,6 +207,9 @@ impl TileStore {
             return;
         }
         previews.holds_changed += 1;
+        if previews.held.is_empty() {
+            previews.newly_held.clear();
+        }
         for above in Previews::ancestors(key) {
             if let Some(count) = previews.above.get_mut(&above) {
                 *count = count.saturating_sub(1);
@@ -236,6 +250,13 @@ impl TileStore {
             } else {
                 !self.previews.blocks.contains_key(key)
             }
+    }
+
+    /// The tiles that may have started waiting for a preview since the last call: held, or a held
+    /// tile's preview gone. What a renderer looks at, not every tile held: a long stroke holds
+    /// thousands, and adds a few a dab.
+    pub fn take_newly_held(&mut self) -> Vec<TileKey> {
+        std::mem::take(&mut self.previews.newly_held)
     }
 
     /// Every tile held, finest and display, in key order.
@@ -308,6 +329,9 @@ impl TileStore {
         if let Some(old) = self.previews.display.remove(key) {
             self.previews.display_bytes -= old.bytes();
             self.previews.changed.insert(*key);
+            if self.previews.above.contains_key(key) {
+                self.previews.newly_held.push(*key);
+            }
         }
     }
 
@@ -320,6 +344,9 @@ impl TileStore {
     pub(super) fn refreshed_preview(&mut self, key: &TileKey) {
         if let Some(old) = self.previews.display.remove(key) {
             self.previews.display_bytes -= old.bytes();
+            if self.previews.above.contains_key(key) {
+                self.previews.newly_held.push(*key);
+            }
         }
     }
 

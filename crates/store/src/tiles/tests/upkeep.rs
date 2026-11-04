@@ -944,6 +944,30 @@ fn preview_of(store: &mut TileStore, key: TileKey, bound: f32, held: bool) -> Di
     }
 }
 
+/// A renderer hears of a tile held once, with the display tiles above it held for it, not of
+/// every tile the stroke has held so far.
+#[test]
+fn the_tiles_newly_held_are_said_once() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = display_store(&dir, &mesh);
+    run_all(&mut store);
+    let first = tile_at(FaceId::new(0), 1, 1);
+    let parent = TileKey::display(FaceId::new(0), level(TOP - 1), 0, 0).unwrap();
+    store.hold_preview(first);
+    let told = store.take_newly_held();
+    assert!(told.contains(&first) && told.contains(&parent), "{told:?}");
+    assert_eq!(store.take_newly_held(), Vec::new(), "said once");
+    let second = tile_at(FaceId::new(1), 1, 1);
+    store.hold_preview(second);
+    let later = store.take_newly_held();
+    assert!(later.contains(&second), "{later:?}");
+    assert!(
+        !later.contains(&first),
+        "not the tiles held before: {later:?}"
+    );
+}
+
 #[test]
 fn a_held_tile_is_wanted_until_its_preview_is_made_and_the_refresh_waits_for_its_release() {
     let dir = TestDir::new();

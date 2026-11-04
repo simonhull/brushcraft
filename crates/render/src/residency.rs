@@ -385,6 +385,10 @@ pub const MAX_STEPS: usize = 4096;
 /// batches, so a frame overruns it by at most one batch of tiles.
 const PREPARE_BATCH: usize = 16;
 
+/// How often [`Residency::evict_waiting`] looks at every tile a brush holds, not only those newly
+/// held: for a tile that came to be resident some other way.
+const EVICT_FULL_EVERY: u64 = 64;
+
 impl ResidencyConfig {
     /// The configuration of `tier`.
     #[must_use]
@@ -859,10 +863,12 @@ pub struct Residency {
     /// Tiles requested that the last staging left waiting for a brush's preview
     /// ([`TileSource::waits_for_preview`]).
     waiting_previews: BTreeSet<TileKey>,
-    /// The resident tiles in the cut or above it that a brush holds with no preview: nothing
-    /// requests them, so they are asked for here, or the cut would go on drawing them without
-    /// the dabs still to land.
+    /// The resident tiles a brush holds with no preview that stay for now: in the cut or above
+    /// it (nothing requests them, so they are asked for here, or the cut would go on drawing them
+    /// without the dabs still to land), or kept by an epoch's change.
     held_unmade: BTreeSet<TileKey>,
+    /// How many times [`Residency::evict_waiting`] has looked.
+    evict_checks: u64,
     /// The source's count of changes to what a brush holds, as [`Residency::evict_waiting`] last
     /// looked ([`TileSource::holds_changed`]).
     holds_seen: u64,
@@ -1014,6 +1020,7 @@ impl Residency {
             wanted: BTreeMap::new(),
             waiting_previews: BTreeSet::new(),
             held_unmade: BTreeSet::new(),
+            evict_checks: 0,
             holds_seen: 0,
             cut_moved: false,
             unavailable: BTreeSet::new(),
@@ -1629,7 +1636,13 @@ impl Residency {
         self.evict_waiting(source);
         self.held_unmade
             .retain(|key| source.waits_for_preview(*key));
-        self.waiting_previews.extend(&self.held_unmade);
+        let asked: Vec<TileKey> = self
+            .held_unmade
+            .iter()
+            .filter(|key| self.protected(key))
+            .copied()
+            .collect();
+        self.waiting_previews.extend(asked);
         self.touched.clear();
         self.fresh.clear();
         self.forced_now = 0;
@@ -1906,7 +1919,8 @@ impl Residency {
     /// stays until it switches. One in the cut or above it stays and is noted for
     /// [`Residency::waiting_for_previews`]: no request asks for a resident tile. Looked at only
     /// when the brush's holds or the cut changed since the last time, the groups asked only of
-    /// the few tiles that would go.
+    /// the few tiles that would go, and at the tiles newly held and those it kept, every tile
+    /// held only every [`EVICT_FULL_EVERY`]th time: a long stroke holds thousands.
     fn evict_waiting<S: TileSource>(&mut self, source: &mut S) {
         let holds = source.holds_changed();
         if holds == self.holds_seen && !self.cut_moved {
@@ -1914,19 +1928,28 @@ impl Residency {
         }
         self.holds_seen = holds;
         self.cut_moved = false;
-        self.held_unmade.clear();
-        for key in source.held() {
+        // What can have changed: tiles newly held, those kept last time, and now and then all.
+        self.evict_checks += 1;
+        let fresh = if self.evict_checks.is_multiple_of(EVICT_FULL_EVERY) {
+            source.held()
+        } else {
+            source.newly_held()
+        };
+        let looked_at: BTreeSet<TileKey> = fresh
+            .into_iter()
+            .chain(std::mem::take(&mut self.held_unmade))
+            .collect();
+        for key in looked_at {
             if !self.entries.contains_key(&key) || !source.waits_for_preview(key) {
                 continue;
             }
-            if self.protected(&key) {
+            let kept = self.protected(&key)
+                || self.pending.contains(&key)
+                || self.fresh.contains(&key)
+                || self.groups.iter().any(|group| group.holds(&key));
+            if kept {
                 self.held_unmade.insert(key);
-                continue;
-            }
-            let evictable = !self.pending.contains(&key)
-                && !self.fresh.contains(&key)
-                && !self.groups.iter().any(|group| group.holds(&key));
-            if evictable {
+            } else {
                 self.remove_live(&key);
                 self.stats.evictions += 1;
             }
