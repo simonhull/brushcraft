@@ -81,6 +81,8 @@ struct Model {
     held: BTreeSet<TileKey>,
     /// Its count of changes to `held` ([`TileSource::holds_changed`]).
     holds_changed: u64,
+    /// What [`TileSource::newly_held`] says, emptied as it does, if the test says; else all held.
+    newly: Option<Vec<TileKey>>,
     /// Whether it says so of half the display tiles besides (those of an even face and
     /// column), for the randomized tests to stage some display tiles in the frame they are
     /// first requested in.
@@ -118,6 +120,7 @@ impl Model {
             at_hand: BTreeSet::new(),
             held: BTreeSet::new(),
             holds_changed: 0,
+            newly: None,
             half_at_hand: false,
         }
     }
@@ -207,6 +210,13 @@ impl TileSource for Model {
 
     fn held(&mut self) -> Vec<TileKey> {
         self.held.iter().copied().collect()
+    }
+
+    fn newly_held(&mut self) -> Vec<TileKey> {
+        match &mut self.newly {
+            Some(newly) => std::mem::take(newly),
+            None => self.held(),
+        }
     }
 
     fn holds_changed(&mut self) -> u64 {
@@ -613,6 +623,63 @@ fn the_shielded_places_made_when_asked_are_those_made_from_scratch_from_the_late
                 assert_eq!(residency.cut(), &cut, "step {step}: the cut is the latest");
             }
         }
+    });
+}
+
+/// Held tiles are looked at as they are newly held, and all of them now and then.
+///
+/// A tile said to be newly held goes at once; one the source fails to say goes at the full scan,
+/// [`EVICT_FULL_EVERY`] looks later; and one kept in the cut stays looked at, with no source to
+/// say it again, as the cut moves off it.
+#[test]
+fn held_tiles_are_looked_at_as_they_are_newly_held_and_at_every_full_scan() {
+    GpuTest::run(|gpu| {
+        let mesh = cube_sphere(1).expect("a mesh");
+        let mut model = Model::new(&mesh, level(FINEST));
+        let config = tiny(&mesh, 2);
+        let mut residency = Residency::new(gpu, &mesh, level(FINEST), config).expect("residency");
+        let finest: Vec<TileKey> = model
+            .all
+            .iter()
+            .filter(|key| key.level() == level(FINEST))
+            .copied()
+            .collect();
+        let requests = finest[..3].iter().map(|&key| Request {
+            key,
+            screen_error: 1.0,
+        });
+        let three = Requests::new(requests, 0);
+        let quiet = || Drained::Epochs(Vec::new());
+        for _ in 0..4 {
+            let none = FrameUse::default();
+            frame(gpu, &mut residency, &mut model, quiet(), none, Some(&three));
+        }
+        assert!(finest[..3].iter().all(|key| residency.slot(key).is_some()));
+        let cut: BTreeSet<TileKey> = finest[2..3].iter().copied().collect();
+        let used = |drawn: &BTreeSet<TileKey>| FrameUse::new(drawn.clone(), drawn.clone());
+        // Said: gone at once. Not said: there until the scan.
+        model.newly = Some(vec![finest[0], finest[2]]);
+        model.held.extend(finest[..3].iter().copied());
+        model.holds_changed += 1;
+        frame(gpu, &mut residency, &mut model, quiet(), used(&cut), None);
+        assert!(residency.slot(&finest[0]).is_none(), "said: it goes");
+        assert!(residency.slot(&finest[1]).is_some(), "not said: not yet");
+        assert!(residency.slot(&finest[2]).is_some(), "in the cut: it stays");
+        // Kept, it is looked at as the cut moves, nothing saying it again.
+        let moved: BTreeSet<TileKey> = finest[3..4].iter().copied().collect();
+        model.holds_changed += 1;
+        frame(gpu, &mut residency, &mut model, quiet(), used(&moved), None);
+        frame(gpu, &mut residency, &mut model, quiet(), used(&moved), None);
+        assert!(
+            residency.slot(&finest[2]).is_none(),
+            "out of the cut: it goes"
+        );
+        let scan = usize::try_from(EVICT_FULL_EVERY).expect("small");
+        for _ in 0..scan {
+            model.holds_changed += 1;
+            frame(gpu, &mut residency, &mut model, quiet(), used(&moved), None);
+        }
+        assert!(residency.slot(&finest[1]).is_none(), "the scan finds it");
     });
 }
 
