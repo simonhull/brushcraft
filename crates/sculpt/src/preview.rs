@@ -113,7 +113,7 @@ pub struct PreviewStats {
     pub tiles_cleared: usize,
     /// Tiles gathered from the store to preview (or look at) afresh.
     pub gathered: usize,
-    /// Dabs taken again by display previews made ([`DabIndex::near`]): what a fresh tile costs,
+    /// Dabs taken again by display previews made (the dabs near it): what a fresh tile costs,
     /// which follows the dabs near it, not the stroke's length.
     pub replayed: usize,
 }
