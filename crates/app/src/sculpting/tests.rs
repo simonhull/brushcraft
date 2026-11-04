@@ -21,6 +21,7 @@ use crate::test_dir::TestDir;
 
 mod lifecycle;
 mod navigation;
+mod saving;
 
 /// The level the test projects are sculpted at: a 24-face sphere's 24 tiles of 32 × 32 quads.
 const LEVEL: u8 = 5;
@@ -46,11 +47,15 @@ fn setup() -> Setup {
 /// A never-saved project over a 24-face cube sphere (radius about 1), keeping a display layer
 /// under [`LEVEL`], its recovery file in `dir`.
 fn project(dir: &TestDir) -> Project {
-    let config = ProjectConfig {
+    Project::new(cube_sphere(2).expect("a cube sphere"), config(dir)).expect("a new project")
+}
+
+/// What the test projects open with, their recovery files in `dir`.
+fn config(dir: &TestDir) -> ProjectConfig {
+    ProjectConfig {
         store: StoreConfig::new(256 << 20, 1).with_display(Level::new(LEVEL).expect("a level")),
         recovery_dir: dir.path().join("recovery"),
-    };
-    Project::new(cube_sphere(2).expect("a cube sphere"), config).expect("a new project")
+    }
 }
 
 /// The frame loop over `project`, its brush made by `brush`, picking by its index, set up by

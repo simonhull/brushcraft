@@ -14,7 +14,7 @@
 //! pointer, picked by the spatial index ([`pick`]). Keys change how the scene is shown (M the
 //! MatCap, W the wireframe, C the debug view of a colour per cluster), each a shading pass alone,
 //! and the brush (`[` and `]` its size, `-` and `=` its strength); F frames the model, as opening
-//! the project does.
+//! the project does; Ctrl+S saves ([`saving`]).
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
@@ -35,6 +35,7 @@ mod pen;
 mod pick;
 mod record;
 mod render_thread;
+mod saving;
 mod screenshot;
 mod script;
 mod sculpting;

@@ -29,7 +29,8 @@
 //!   at most is under way. Whether such a `Down` brushes or navigates is decided as it comes, from
 //!   the surface as it is then too (the earlier stroke's dabs landed so far), as a `Down` on that
 //!   stroke's fresh ridge means to brush ([`Brush::route`]); the stroke begins, or finds nothing
-//!   under it and doesn't, on the surface the earlier one left.
+//!   under it and doesn't, on the surface the earlier one left. A `Down` after Ctrl+S waits the
+//!   same way, for the save ([`crate::saving`]).
 //! - **Pen up:** [`Stroke::end`] gives the tail; once every dab of the stroke is applied, its
 //!   record ([`StrokeRecord`]: the samples the engine read, the settings' bytes, the camera at the
 //!   stroke's start, [`stroke::ENGINE_VERSION`]) ends the op ([`Project::end_stroke`]). A stroke
@@ -87,8 +88,8 @@
 //! Each batch that lands makes the previews it moved again over what landed ([`Preview::land`]);
 //! once every dab has landed none is left and the surface is exact, which the record's
 //! `dabs_catching_up` counts down to. The saved result is that of applying the dabs at once, bit
-//! for bit; a save meanwhile holds what has landed (the previews are never saved), the stroke's
-//! later dabs landing in the working file after it.
+//! for bit. The previews are never saved, so a save lands what the brush holds first
+//! ([`crate::saving`]).
 //!
 //! The footprint limit F ([`LIMIT_TILES`]) is the dab one frame's time can't fit at all, by the
 //! cost model: such a dab is always shown and caught up. It is reported per frame
@@ -146,8 +147,8 @@ use stroke::{
 
 use crate::camera::{Camera, Pixel};
 use crate::frame::{
-    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Closing, Drawing, Kept,
-    LATENCY_AIM, STROKE_QUIET, SampleTimes,
+    Brush, BrushBudget, BrushChange, BrushContext, BrushReport, Drawing, Kept, LATENCY_AIM,
+    Landing, STROKE_QUIET, SampleTimes,
 };
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
 
@@ -700,8 +701,10 @@ pub(crate) struct Sculpting {
     /// When the catch-up last landed a dab (or had none to land): what [`CATCH_UP_STARVED`]
     /// counts from.
     landed_at: Instant,
-    /// Whether the window was asked to close: no pen is down any more, and what is held lands.
-    closing: Closing,
+    /// How dabs land: a close and a save land them in steps of their own.
+    landing: Landing,
+    /// When the save under way was asked for: strokes down after it wait for the save.
+    save_asked: Option<Instant>,
     /// The last projector a step had: what a close lands with if the camera has gone degenerate.
     last_projector: Option<ViewProjector>,
     /// The backlog past which a drawing pen waits for the catch-up ([`CATCH_UP_BACKLOG`]).
@@ -753,7 +756,8 @@ impl Sculpting {
             index_stale: false,
             warm: Warm::default(),
             landed_at: Instant::now(),
-            closing: Closing::No,
+            landing: Landing::InFrames,
+            save_asked: None,
             last_projector: None,
             backlog_limit: CATCH_UP_BACKLOG,
             ahead_warmed: None,
@@ -927,7 +931,9 @@ impl Sculpting {
         if down && self.deferred.is_empty() {
             self.lift(scene, None);
         }
-        let waits = !self.deferred.is_empty() || (down && self.stroke.is_some());
+        let waits = !self.deferred.is_empty()
+            || (down && self.stroke.is_some())
+            || self.waits_for_save(event);
         if !waits {
             self.handle(scene, event);
             return;
@@ -940,10 +946,31 @@ impl Sculpting {
         self.deferred.push(event.copied());
     }
 
+    /// Whether `event` is the `Down` of a stroke begun after the save under way was asked for: it
+    /// waits for the save, and isn't in it.
+    fn waits_for_save(&self, event: Option<&PenSample>) -> bool {
+        let down = event.filter(|sample| sample.phase == Phase::Down);
+        let after = |asked| down.is_some_and(|sample| sample.received > asked);
+        self.save_asked.is_some_and(after)
+    }
+
+    /// Whether the next events deferred are a stroke waiting for the save under way.
+    fn deferred_for_save(&self) -> bool {
+        let next = self.deferred.first().copied().flatten();
+        self.waits_for_save(next.as_ref())
+    }
+
+    /// The events deferred that a save holds: those before a stroke that waits for it.
+    fn deferred_in_save(&self) -> impl Iterator<Item = &Option<PenSample>> {
+        let events = self.deferred.iter();
+        events.take_while(|event| !self.waits_for_save(event.as_ref()))
+    }
+
     /// Takes the events deferred, once the stroke before them has ended: through
-    /// [`Sculpting::admit`] again, so a later stroke among them waits for the first in turn.
+    /// [`Sculpting::admit`] again, so a later stroke among them waits for the first in turn, and
+    /// one begun after a save was asked for waits for it.
     fn release_deferred(&mut self, scene: &mut Scene<'_>) {
-        if self.stroke.is_some() {
+        if self.stroke.is_some() || self.deferred_for_save() {
             return;
         }
         let deferred = std::mem::take(&mut self.deferred);
@@ -1194,11 +1221,11 @@ impl Sculpting {
         report: &mut BrushReport,
         budget: Option<&BrushBudget>,
     ) {
-        // A close lands through its own steps, whatever frames do.
-        if self.closing == Closing::Landing {
+        // A close or a save lands through its own steps, whatever frames do.
+        if self.landing == Landing::InSteps {
             return;
         }
-        let moving = self.closing == Closing::No && self.pen_moving();
+        let moving = self.landing == Landing::InFrames && self.pen_moving();
         // While the pen is down, resting or not, the catch-up never holds up its next sample:
         // a dab is forced, and long batches taken, only once it has lifted.
         let down = self.stroke.as_ref().is_some_and(Pending::open);
@@ -1247,7 +1274,7 @@ impl Sculpting {
             }
         }
         let first = report.dabs_applied == 0;
-        let waiting_stroke = self.closing != Closing::No || !self.deferred.is_empty();
+        let waiting_stroke = self.landing != Landing::InFrames || !self.deferred.is_empty();
         // A frame shows each batch before the next starts, so the frames keep coming.
         if batch && self.unframed {
             return;
@@ -1468,13 +1495,56 @@ impl Sculpting {
         Ok(record)
     }
 
+    /// A batch of a close's or a save's landing, whether or not a frame can be drawn: `lifting`
+    /// the pen of any open stroke for a close, which doesn't wait for it, and for a save only of
+    /// one whose `Up` was lost, as the stroke after it shows. Returns whether any landed.
+    ///
+    /// # Errors
+    ///
+    /// The error kept, if dabs were dropped.
+    fn landing_step(&mut self, context: BrushContext<'_>, lifting: bool) -> Result<bool> {
+        let errors = self.errors_kept();
+        let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) else {
+            // No scene ever: no stroke began, and what waits to begin can't.
+            self.held.clear();
+            self.deferred.clear();
+            return Ok(false);
+        };
+        let held = std::mem::take(&mut self.held);
+        for event in &held {
+            self.admit(&mut scene, event.as_ref());
+        }
+        self.landing = Landing::Stepping;
+        self.unframed = false;
+        let budget = BrushBudget::slice(Instant::now(), WAITED_BATCH);
+        let mut report = BrushReport::default();
+        if lifting || self.deferred_for_save() {
+            self.lift(&mut scene, None);
+        }
+        self.work(&mut scene, &mut report, Some(&budget));
+        if !self.deferred.is_empty() && self.stroke.is_none() {
+            self.release_deferred(&mut scene);
+            if lifting {
+                self.lift(&mut scene, None);
+            }
+            self.work(&mut scene, &mut report, Some(&budget));
+        }
+        self.landing = Landing::InSteps;
+        self.note_kept(scene.project.store());
+        let landed = report.dabs_applied > 0;
+        self.caught_up = std::mem::take(&mut self.caught_up).then(report);
+        self.failed_since(errors)?;
+        Ok(landed)
+    }
+
     /// How many errors have been kept: for [`Sculpting::failed_since`].
     const fn errors_kept(&self) -> u64 {
         self.errors
     }
 
     /// An error if one was kept since there were `before`: landing for a close has no overlay left
-    /// to say it on, and dabs dropped must reach the process's exit.
+    /// to say it on, and dabs dropped must reach the process's exit; a save can't say it holds
+    /// them.
     ///
     /// # Errors
     ///
@@ -1912,7 +1982,10 @@ impl Brush for Sculpting {
     }
 
     fn begin_closing(&mut self, context: BrushContext<'_>) -> Result<()> {
-        self.closing = Closing::Landing;
+        self.landing = Landing::InSteps;
+        // Nothing waits for a save any more: a close lands every stroke there is, and the save
+        // holds them all.
+        self.save_asked = None;
         if let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) {
             let held = std::mem::take(&mut self.held);
             for event in &held {
@@ -1924,34 +1997,7 @@ impl Brush for Sculpting {
     }
 
     fn close_step(&mut self, context: BrushContext<'_>) -> Result<bool> {
-        let errors = self.errors_kept();
-        let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) else {
-            // No scene ever: no stroke began, and what waits to begin can't.
-            self.held.clear();
-            self.deferred.clear();
-            return Ok(false);
-        };
-        let held = std::mem::take(&mut self.held);
-        for event in &held {
-            self.admit(&mut scene, event.as_ref());
-        }
-        self.closing = Closing::Stepping;
-        self.unframed = false;
-        let budget = BrushBudget::slice(Instant::now(), WAITED_BATCH);
-        let mut report = BrushReport::default();
-        self.lift(&mut scene, None);
-        self.work(&mut scene, &mut report, Some(&budget));
-        if !self.deferred.is_empty() && self.stroke.is_none() {
-            self.release_deferred(&mut scene);
-            self.lift(&mut scene, None);
-            self.work(&mut scene, &mut report, Some(&budget));
-        }
-        self.closing = Closing::Landing;
-        self.note_kept(scene.project.store());
-        let landed = report.dabs_applied > 0;
-        self.caught_up = std::mem::take(&mut self.caught_up).then(report);
-        self.failed_since(errors)?;
-        Ok(landed)
+        self.landing_step(context, true)
     }
 
     fn landing(&self) -> usize {
@@ -1959,9 +2005,44 @@ impl Brush for Sculpting {
         self.queued().max(under_way) + self.deferred.len() + self.held.len()
     }
 
+    fn begin_saving(&mut self, asked: Instant) {
+        self.save_asked = Some(asked);
+    }
+
+    fn pen_down(&self) -> bool {
+        let events = self.deferred.iter().chain(&self.held).flatten();
+        // A stroke after the save began: the pen lifted from any before it, `Up` lost or not.
+        if events.clone().any(|event| self.waits_for_save(Some(event))) {
+            return false;
+        }
+        match events.last() {
+            Some(event) => matches!(event.phase, Phase::Down | Phase::Drag),
+            None => self.stroke.as_ref().is_some_and(Pending::open),
+        }
+    }
+
+    fn begin_landing(&mut self) {
+        self.landing = Landing::InSteps;
+    }
+
+    fn landing_for_save(&self) -> usize {
+        let under_way = usize::from(self.stroke.is_some());
+        self.queued().max(under_way) + self.deferred_in_save().count() + self.held.len()
+    }
+
+    fn save_step(&mut self, context: BrushContext<'_>) -> Result<bool> {
+        self.landing_step(context, false)
+    }
+
+    fn end_saving(&mut self) {
+        self.landing = Landing::InFrames;
+        self.save_asked = None;
+    }
+
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {
         let errors = self.errors_kept();
-        self.closing = Closing::No;
+        self.landing = Landing::InFrames;
+        self.save_asked = None;
         if let Some(mut scene) = Scene::closing(context, self.last_projector.as_ref()) {
             let held = std::mem::take(&mut self.held);
             for event in &held {
@@ -1970,7 +2051,7 @@ impl Brush for Sculpting {
             // In batches as a close's: one of everything held pins every tile it reaches, which
             // a tight budget may refuse though dab by dab it fits.
             self.lift(&mut scene, None);
-            self.closing = Closing::Stepping;
+            self.landing = Landing::Stepping;
             loop {
                 self.unframed = false;
                 let budget = BrushBudget::slice(Instant::now(), WAITED_BATCH);
@@ -1980,7 +2061,7 @@ impl Brush for Sculpting {
                     break;
                 }
             }
-            self.closing = Closing::No;
+            self.landing = Landing::InFrames;
             loop {
                 self.lift(&mut scene, None);
                 self.work(&mut scene, &mut BrushReport::default(), None);

@@ -64,6 +64,8 @@ pub(crate) struct Snapshot<'a> {
     /// The brush's lines ([`crate::frame::Brush::status`]): its settings and keys, its last
     /// stroke, its last error.
     pub(crate) brush: &'a [String],
+    /// The line about the project: its name, whether it has unsaved edits, how its save goes.
+    pub(crate) save: &'a str,
     /// The pen's latency in the last frame shown that applied dabs, sample to present
     /// submitted; `None` before any.
     pub(crate) latency: Option<Duration>,
@@ -122,6 +124,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         pen,
         filter_only,
         brush,
+        save,
         latency,
         pacing,
     } = *snapshot;
@@ -196,6 +199,7 @@ pub(crate) fn lines(snapshot: &Snapshot<'_>) -> Vec<String> {
         format!("pick       {}", crate::pick::summary(pick)),
         format!("pen        {pen}"),
     ];
+    lines.push(save.to_owned());
     lines.extend(brush.iter().cloned());
     lines.push(latency_line);
     lines
@@ -367,6 +371,7 @@ mod tests {
             },
             filter_only: false,
             brush: &["brush      draw".to_owned()],
+            save: "project    sphere",
             latency: Some(Duration::from_micros(6250)),
             pacing: StrokePacing::OnInput,
         };

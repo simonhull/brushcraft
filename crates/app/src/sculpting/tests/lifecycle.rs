@@ -189,7 +189,7 @@ fn light_then_heavy(
 /// Found by halving, then going up from there: how a run's dabs fall into batches is up to the
 /// clock, a batch pins the tiles of all its dabs, and at the very edge one run fits where the next
 /// doesn't. Nothing is asked of the close of a run that's only looked at.
-fn at_the_budgets_edge() -> (TestDir, Owner<Sculpting, NoUploads>, Vec<PenSample>) {
+pub(super) fn at_the_budgets_edge() -> (TestDir, Owner<Sculpting, NoUploads>, Vec<PenSample>) {
     let minimum = tight(0).minimum_budget(&cube_sphere(2).expect("a cube sphere"));
     let budget = |step: usize| minimum + step * (64 << 10);
     let fits = |step: usize| {

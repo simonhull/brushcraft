@@ -37,7 +37,7 @@ use winit::event::{
     StartCause, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::camera::Pixel;
@@ -48,13 +48,11 @@ use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
 use crate::render_thread::{Hooks, RenderThread};
+use crate::saving::SaveStep;
 use crate::{AppOwner, Ended, ProjectToOpen, Summary, describe_adapter, said_too, start};
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_micros(16_667);
-
-/// How finely the title counts the dabs left to land as the window closes.
-const TITLE_STEP: usize = 10;
 
 /// Pixels of touchpad scrolling taken as one wheel notch.
 const PIXELS_PER_NOTCH: f64 = 40.0;
@@ -82,8 +80,8 @@ struct Running {
     asked: Option<(Instant, Duration)>,
     /// Whether the window was asked to close, the brush landing what it holds.
     closing: bool,
-    /// The dabs the title last said were left to land.
-    title_says: usize,
+    /// The keyboard's modifiers as winit last reported them: what Ctrl+S reads.
+    modifiers: ModifiersState,
 }
 
 /// winit's application: opens the window when it can, runs the frame loop, and reports how
@@ -177,7 +175,7 @@ impl WindowApp {
             pacer: Pacer::default(),
             asked: None,
             closing: false,
-            title_says: 0,
+            modifiers: ModifiersState::default(),
         })
     }
 
@@ -389,6 +387,7 @@ impl WindowApp {
             WindowEvent::Focused(false) => owner.input(Input::Cancel),
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
+                running.modifiers = state;
                 owner.input(Input::Modifiers(Modifiers {
                     shift: state.shift_key(),
                     ctrl: state.control_key(),
@@ -425,7 +424,9 @@ impl WindowApp {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                if let Some(change) = brush_change(event.physical_key) {
+                if !event.repeat && saves(event.physical_key, running.modifiers) {
+                    owner.request_save(Instant::now());
+                } else if let Some(change) = brush_change(event.physical_key) {
                     // Held, a brush key repeats: the size or strength keeps changing.
                     owner.change_brush(change);
                 } else if !event.repeat {
@@ -441,6 +442,12 @@ impl WindowApp {
             _ => {}
         }
     }
+}
+
+/// Whether `key` with `modifiers` held is Ctrl+S: Ctrl alone, S by its place on the keyboard, as
+/// the other keys are. With Shift it stays free for Save As.
+fn saves(key: PhysicalKey, modifiers: ModifiersState) -> bool {
+    key == PhysicalKey::Code(KeyCode::KeyS) && modifiers == ModifiersState::CONTROL
 }
 
 /// The change of look a key makes, if it makes one: by the key's place on the keyboard, so
@@ -615,18 +622,21 @@ impl ApplicationHandler for WindowApp {
         } else {
             Ok(())
         };
+        let saving = running.owner.save_step();
         let driven = stepped.and_then(|()| Self::drive(running, &mut self.pen_samples, event_loop));
-        if running.closing {
-            // Back at once, frames or none, the window's events heard between batches.
-            event_loop.set_control_flow(ControlFlow::Poll);
-            // Said in tens, so the compositor isn't told every dab.
-            let left = running.owner.landing().div_ceil(TITLE_STEP) * TITLE_STEP;
-            if left != running.title_says {
-                running.title_says = left;
-                running
-                    .window
-                    .set_title(&format!("BrushCraft: closing, {left} dabs to land"));
+        match saving {
+            // Nothing to do but look again shortly: the recovery writer wakes nothing.
+            SaveStep::Waiting if !running.closing => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + GPU_POLL));
             }
+            SaveStep::Idle if !running.closing => {}
+            // Back at once, frames or none, the window's events heard between batches.
+            SaveStep::Waiting | SaveStep::Idle | SaveStep::Worked => {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+        }
+        if let Some(title) = running.owner.title_change() {
+            running.window.set_title(&title);
         }
         if driven.is_err() || running.owner.done() || running.owner.ready_to_close() {
             self.finish(event_loop, driven);
@@ -641,5 +651,24 @@ impl Drop for WindowApp {
         if !std::thread::panicking() {
             self.wind_up(Ok(()));
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+mod tests {
+    use super::*;
+
+    /// The S key.
+    const S: PhysicalKey = PhysicalKey::Code(KeyCode::KeyS);
+
+    #[test]
+    fn ctrl_s_saves_and_nothing_else_does() {
+        assert!(saves(S, ModifiersState::CONTROL));
+        assert!(!saves(S, ModifiersState::default()), "S alone");
+        let other = PhysicalKey::Code(KeyCode::KeyA);
+        assert!(!saves(other, ModifiersState::CONTROL), "Ctrl+A");
+        let held = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(!saves(S, held), "Ctrl+Shift+S stays free");
     }
 }

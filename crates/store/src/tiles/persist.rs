@@ -20,7 +20,9 @@
 //!   have advanced one, so the change feed's backlog stays bounded between saves.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Bound;
 use std::rc::Rc;
+use std::time::Instant;
 
 use geom::TileKey;
 
@@ -46,6 +48,15 @@ use crate::pool::{Budget, Pool};
 use crate::prefetch::Prefetcher;
 use crate::stamp::Stamp;
 use crate::workers::StartWorkersError;
+
+/// The tiles of `working` still to save: a recovery file holds only edits no save has, so a
+/// restored one's all are. Its display records aren't edits: the display book carries them.
+fn unsaved_in(working: &ProjectFile) -> BTreeSet<TileKey> {
+    match working.meta().role() {
+        Role::Recovery { .. } => working.keys().copied().filter(is_correction).collect(),
+        Role::Project => BTreeSet::new(),
+    }
+}
 
 impl TileStore {
     /// A store over `working`, the file it writes, with no base under it: a project file read
@@ -110,12 +121,7 @@ impl TileStore {
             config.site,
             [working.head(), base.as_ref().and_then(BaseFile::head)],
         )?;
-        // A recovery file holds only edits no save has: a restored one's are still to save.
-        let since_rebase = match working.meta().role() {
-            // Display records aren't edits: the display book carries them.
-            Role::Recovery { .. } => working.keys().copied().filter(is_correction).collect(),
-            Role::Project => BTreeSet::new(),
-        };
+        let since_rebase = unsaved_in(&working);
         let bounds = book_of(&working, base.as_ref())?;
         let display = display_book_of(&working, base.as_ref(), config.display, mesh.face_count());
         let workers = rayon::ThreadPoolBuilder::new()
@@ -140,6 +146,8 @@ impl TileStore {
             deps: DepGraph::with_reach_memo(cache_caps.reach),
             unsaved: TileMap::default(),
             since_rebase,
+            copied_ahead: BTreeSet::new(),
+            ahead_cursor: None,
             last_write: Stamp::ZERO,
             known_ops: TileMap::default(),
             generation: 0,
@@ -212,7 +220,8 @@ impl TileStore {
 
     /// Copies every tile edited since the last rebase (or since the store opened) into
     /// `project`, with every bound changed since, saves it, and returns the proof a rebase needs:
-    /// the new save point as a base, and the store's latest write and bounds change.
+    /// the new save point as a base, and the store's latest write and bounds change. Tiles
+    /// [`TileStore::copy_ahead`] put in `project` already, and no edit touched since, are there.
     ///
     /// The bounds written describe the state the save point names: a tile whose latest edit is
     /// lost (below) has every bound its edit could change written as unknown.
@@ -255,7 +264,8 @@ impl TileStore {
         }
         self.drain_saves();
         let mut lost = BTreeSet::new();
-        for key in &self.since_rebase {
+        let to_copy = self.since_rebase.difference(&self.copied_ahead);
+        for key in to_copy {
             let resident = self.corrections.find(key);
             let tile = |id| {
                 self.corrections
@@ -332,6 +342,69 @@ impl TileStore {
             bounds: self.derived_changes(),
             strokes,
         })
+    }
+
+    /// A slice of a save's copying, ahead of [`TileStore::save_into`], until `deadline` (at least
+    /// one tile, if any is left): the records of tiles edited since the last rebase go from the
+    /// working file into `project`, as they stand, so the save itself has only the rest to do.
+    /// Returns how many of those tiles aren't in `project` yet, `None` once this has come to the
+    /// last of them.
+    ///
+    /// Nothing is named by a save point until the save, and what the file holds past its last one
+    /// is discarded when it opens, so a save that never comes costs only the bytes. Slices need
+    /// no quiet between them: an edit takes its tile out of the copies ([`TileStore::drain_saves`])
+    /// and the save copies it as it then is.
+    ///
+    /// Only what a save would copy as a record is copied. A dirty tile, or one whose record doesn't
+    /// read, is left for the save, which knows what to do with each.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Save`] if a write to `project` fails: the copies are forgotten then, as what
+    /// a failed write leaves in the file can't be counted on.
+    pub(crate) fn copy_ahead(
+        &mut self,
+        project: &mut ProjectFile,
+        deadline: Instant,
+    ) -> Result<Option<usize>, CacheError> {
+        self.drain_saves();
+        let from = self.ahead_cursor.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut keys = self.since_rebase.range((from, Bound::Unbounded));
+        let mut first = true;
+        let finished = loop {
+            if !first && Instant::now() >= deadline {
+                break false;
+            }
+            let Some(key) = keys.next() else {
+                break true;
+            };
+            first = false;
+            self.ahead_cursor = Some(*key);
+            let resident = self.corrections.find(key);
+            if resident.is_some_and(|id| self.corrections.is_dirty(id) == Some(true)) {
+                continue;
+            }
+            if let Ok(Some(raw)) = self.file.read_tile_record(key) {
+                if let Err(error) = project.append_copy(key, &raw) {
+                    self.forget_copied_ahead();
+                    return Err(CacheError::Save(error));
+                }
+                self.copied_ahead.insert(*key);
+            }
+        };
+        let left = self
+            .since_rebase
+            .len()
+            .saturating_sub(self.copied_ahead.len());
+        Ok((!finished).then_some(left))
+    }
+
+    /// Forgets what [`TileStore::copy_ahead`] copied, so the next save copies every tile: its
+    /// copies went to a project file that isn't the next save's, or a failure leaves them in
+    /// doubt.
+    pub(crate) fn forget_copied_ahead(&mut self) {
+        self.copied_ahead.clear();
+        self.ahead_cursor = None;
     }
 
     /// Swaps in the save point `saved` proves, as the base, and `working`, a fresh working file
@@ -420,6 +493,7 @@ impl TileStore {
         #[cfg(test)]
         self.assert_known_ops_resident();
         self.since_rebase.clear();
+        self.forget_copied_ahead();
         self.forget_saved_strokes(strokes);
         self.bounds.rebased();
         self.display.rebased();
@@ -698,7 +772,8 @@ impl TileStore {
     }
 
     /// Moves every key save's consumer hasn't drained from the change feed into
-    /// [`TileStore::since_rebase`].
+    /// [`TileStore::since_rebase`], each out of [`TileStore::copied_ahead`]: edited since, its copy
+    /// is out of date.
     ///
     /// Draining early changes nothing a save sees, as `since_rebase` is a set. A save drains it
     /// ([`TileStore::save_into`], [`TileStore::save`]), as do a roll-over and a lost tile, and so
@@ -707,8 +782,10 @@ impl TileStore {
     /// ([`crate::Project::with_writer`]). So the feed's backlog stays bounded between saves.
     pub(crate) fn drain_saves(&mut self) {
         let drained = self.feed.drain(self.save_consumer);
-        self.since_rebase
-            .extend(drained.into_iter().map(|(key, _)| key));
+        for (key, _) in drained {
+            self.copied_ahead.remove(&key);
+            self.since_rebase.insert(key);
+        }
     }
 
     /// The change feed's backlog: entries some consumer hasn't drained yet.

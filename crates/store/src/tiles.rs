@@ -355,6 +355,12 @@ pub struct TileStore {
     /// Every tile edited since the last rebase (or since the store opened), drained from the
     /// feed by save's consumer: what the next save copies into the project file.
     since_rebase: BTreeSet<TileKey>,
+    /// The tiles of [`TileStore::since_rebase`] a save under way has copied into the project file
+    /// already ([`TileStore::copy_ahead`]), as they stand: the save leaves them out. An edit
+    /// takes a tile out again ([`TileStore::drain_saves`]).
+    copied_ahead: BTreeSet<TileKey>,
+    /// The last tile [`TileStore::copy_ahead`] came to: its next slice goes on after it.
+    ahead_cursor: Option<TileKey>,
     /// The stamp of the latest write a correction slot took (see [`crate::stamp`]): where a
     /// recovery flush cuts ([`TileStore::open_cut`]); a save records it, and a rebase refuses a
     /// save made before a later write.

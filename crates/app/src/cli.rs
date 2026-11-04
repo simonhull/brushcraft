@@ -25,7 +25,7 @@ Opens the project (a .bcrf file outside the source repository) in a window and d
 The pen sculpts where it touches the model ([ and ] its size, - and = its strength); off the
 model it orbits. Drag with the left button to orbit, with Shift or the right or middle button
 to pan, with Ctrl to zoom; the wheel zooms too. The pen's first barrel button zooms, its
-second pans.
+second pans. Ctrl+S saves the project.
 
 options:
   --level N        the finest level of the display layer the store keeps (default 9)

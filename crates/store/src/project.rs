@@ -22,6 +22,12 @@
 //! rebased, the save has happened, whatever follows: deleting the old file is best effort, and a
 //! failure to is reported ([`SaveOutcome::kept`]), never fatal.
 //!
+//! A save blocks its thread for as long as all that takes: seconds after a long stroke, nearly
+//! all of it waiting for the flush and copying records. An app that must go on answering calls
+//! [`Project::save_ahead`] first, slice by slice, until it says [`SaveAhead::Ready`], and the
+//! save has only its fixed part left. The records it copies are part of the save: no save point
+//! names them until the save does, and if none ever does, the file discards them as it opens.
+//!
 //! # Saving comes first
 //!
 //! **A save always succeeds if the project file can be written.** The recovery directory never
@@ -291,6 +297,17 @@ pub struct SaveOutcome {
     /// Old recovery files that couldn't be deleted. The project holds them until it closes, so
     /// no listing offers them meanwhile.
     pub kept: Vec<KeptRecovery>,
+}
+
+/// How far [`Project::save_ahead`] has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveAhead {
+    /// A flush is under way: nothing to do until the recovery writer's thread is done with it.
+    Flushing,
+    /// Copying tile records into the project file, this many tiles left.
+    Copying(usize),
+    /// [`Project::save`] has only its fixed part left.
+    Ready,
 }
 
 /// A recovery file found by [`find_recoveries`]: what the app shows to offer a restore.
@@ -726,8 +743,45 @@ impl Project {
                 self.switch(saved, &project, &path)
             });
         self.file = Some(project);
+        if switched.is_err() {
+            // What the file holds past its last save point is in doubt, so it is all written again.
+            self.store.forget_copied_ahead();
+        }
         kept.extend(switched?);
         Ok(self.outcome(kept))
+    }
+
+    /// A slice of the work of the next [`Project::save`], done ahead of it, for a caller that
+    /// can't be blocked for all of it: never waits, and copies tile records into the project file
+    /// until `deadline`, so a call takes about that long at most. Called until it says
+    /// [`SaveAhead::Ready`], it leaves the save its fixed part only.
+    ///
+    /// While a flush is under way this only moves it on: the records to copy are the ones it
+    /// writes. The project file changes in nothing a reader sees: its new records are named by no
+    /// save point until the save. Edits may go on between slices, and the save takes them,
+    /// however far this got. A save never needs this.
+    ///
+    /// Crash protection never stops a save: a flush that fails here is the writer's to deal with,
+    /// and the save says what came of it.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::NoPath`] for a project never saved, or restored onto an earlier save
+    /// point, as [`Project::save`] gives; [`ProjectError::Cache`] if a write to the project file
+    /// fails. The project goes on as before, and saving again works.
+    pub fn save_ahead(&mut self, deadline: Instant) -> Result<SaveAhead, ProjectError> {
+        if self.path.is_none() {
+            return Err(ProjectError::NoPath);
+        }
+        drop(self.advance());
+        if self.writer.as_ref().is_some_and(|writer| !writer.is_idle()) {
+            return Ok(SaveAhead::Flushing);
+        }
+        let project = self.file.as_mut().ok_or(ProjectError::NoPath)?;
+        Ok(match self.store.copy_ahead(project, deadline)? {
+            Some(left) => SaveAhead::Copying(left),
+            None => SaveAhead::Ready,
+        })
     }
 
     /// Saves the project as a new project file at `path`, with a new project id, and goes on
@@ -757,6 +811,8 @@ impl Project {
             return Err(ProjectError::Exists(path));
         }
         let mut kept = self.prepare_save()?;
+        // Copies ahead went to the old project file: the new one needs every tile.
+        self.store.forget_copied_ahead();
         let meta = self
             .store
             .working()

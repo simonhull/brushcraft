@@ -111,7 +111,9 @@ use render::residency::ResidencyStats;
 use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
 use render::{DrawTimes, Look, Outcome, SceneView, aa};
-use store::{Drained, JobsReport, Project, SpatialIndex, StaleCursor, TileStore};
+use store::{
+    Drained, JobsReport, Project, SaveAhead, SaveOutcome, SpatialIndex, StaleCursor, TileStore,
+};
 
 use self::schedule::{Next, Reason, Reasons, Scheduler, StrokePacing, UPKEEP_INTERVAL};
 use crate::camera::{Arcball, Boundary, Camera, Pixel};
@@ -121,6 +123,8 @@ use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route
 use crate::pick::Picker;
 use crate::record::{Latency, RecordStream, Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
+use crate::said_too;
+use crate::saving::{SAVE_SLICE, SaveStep, Saving, Stage};
 use crate::script::{BrushSize, Script, ScriptPen, Segment};
 
 /// What the brush is handed each time the frame loop calls it.
@@ -478,6 +482,38 @@ pub(crate) trait Brush {
         0
     }
 
+    /// A save was asked for at `asked`: from now on a stroke whose `Down` came later waits, its
+    /// samples kept, until [`Brush::end_saving`], and isn't in the save.
+    fn begin_saving(&mut self, _asked: Instant) {}
+
+    /// Whether the pen is down on a stroke a save holds: it can't begin landing yet.
+    fn pen_down(&self) -> bool {
+        false
+    }
+
+    /// The pen has lifted: what a save holds lands from now on only through
+    /// [`Brush::save_step`], so the window's events come between batches however things stand.
+    fn begin_landing(&mut self) {}
+
+    /// How many dabs a save still waits for: [`Brush::landing`] without the strokes begun after it
+    /// was asked for.
+    fn landing_for_save(&self) -> usize {
+        0
+    }
+
+    /// Lands a batch of what a save holds, as [`Brush::close_step`] does for a close. Returns
+    /// whether any landed.
+    ///
+    /// # Errors
+    ///
+    /// If dabs were dropped: the save can't hold everything drawn.
+    fn save_step(&mut self, _context: BrushContext<'_>) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The save is over, however it went: strokes go on, those that waited for it first.
+    fn end_saving(&mut self) {}
+
     /// Lands a batch of what the brush holds, whether or not a frame can be drawn. Returns whether
     /// any landed.
     ///
@@ -828,15 +864,24 @@ pub(crate) struct Setup {
 }
 
 /// Whether the window was asked to close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Closing {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Close {
     /// It wasn't.
+    NotAsked,
+    /// It was: no pen is taken any more, and what the brush holds lands.
+    Asked,
+}
+
+/// How the brush's dabs land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Landing {
+    /// In its frames and between them, as they fit.
     #[default]
-    No,
-    /// It was: no pen is taken any more, and what the brush holds lands, only through
-    /// [`Owner::close_step`], so the window's events come between batches however things stand.
-    Landing,
-    /// A brush's step of that landing is running ([`Brush::close_step`]).
+    InFrames,
+    /// For a close or a save: only through steps of their own ([`Owner::close_step`],
+    /// [`Owner::save_step`]), so the window's events come between batches however things stand.
+    InSteps,
+    /// One of those steps is running ([`Brush::close_step`], [`Brush::save_step`]).
     Stepping,
 }
 
@@ -982,7 +1027,9 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// ([`Owner::pivot_to`]).
     pivot_at: Option<Instant>,
     /// Whether the window was asked to close ([`Owner::request_close`]).
-    closing: Closing,
+    close: Close,
+    /// The project's saves ([`Owner::request_save`]).
+    saving: Saving,
 }
 
 /// What the camera is still to be fitted to the model by: framing it, and growing its boundary
@@ -1117,6 +1164,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         now: Instant,
     ) -> Self {
         let cursor = project.store().subscribe_stale();
+        let saving = Saving::new(project.path(), now);
         let mut scheduler = Scheduler::new(setup.interval, now)
             .with_morph(uploads.morph())
             .with_stroke_pacing(StrokePacing::of(setup.presentation));
@@ -1194,7 +1242,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             upkept_at: now,
             fitting: Fitting::default(),
             pivot_at: None,
-            closing: Closing::No,
+            close: Close::NotAsked,
+            saving,
         }
     }
 
@@ -1267,7 +1316,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// [`Owner::pen`]; wanting a frame for it only if `want` (a sample the frame being made takes
     /// itself wants none).
     fn queue_pen(&mut self, sample: PenSample, want: bool) {
-        if self.closing != Closing::No {
+        if self.closing() {
             return;
         }
         self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
@@ -1724,6 +1773,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// far, with the uploads' `tiles` line.
     fn overlay(&self, size: Size, phases: OwnerPhases, tiles: Option<&str>) -> Vec<String> {
         let brush = self.brush.status();
+        let save = self
+            .saving
+            .line(self.unsaved(), self.save_counts(), self.closing());
         let snapshot = Snapshot {
             frame: self.started,
             refresh_hz: self.scheduler.interval().as_secs_f64().recip(),
@@ -1742,6 +1794,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             pen: &self.pen_status,
             filter_only: !self.accumulates,
             brush,
+            save: &save,
             latency: self.latency,
             pacing: self.scheduler.stroke_pacing(),
         };
@@ -2520,10 +2573,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// As [`Brush::begin_closing`].
     pub(crate) fn request_close(&mut self) -> Result<()> {
-        if self.closing != Closing::No {
+        if self.closing() {
             return Ok(());
         }
-        self.closing = Closing::Landing;
+        self.close = Close::Asked;
         self.pen_queue.clear();
         if let Some(size) = self.size.or_else(|| self.last_view.map(|(_, size)| size)) {
             self.with_brush(size, B::begin_closing)
@@ -2546,7 +2599,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// As [`Brush::close_step`].
     pub(crate) fn close_step(&mut self) -> Result<bool> {
         let size = self.size.or_else(|| self.last_view.map(|(_, size)| size));
-        let Some(size) = size.filter(|_| self.closing != Closing::No) else {
+        let Some(size) = size.filter(|_| self.closing()) else {
             return Ok(false);
         };
         let landed = self.with_brush(size, B::close_step)?;
@@ -2556,20 +2609,166 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         Ok(landed)
     }
 
-    /// Whether a close was asked for and nothing is left to land: nothing was ever drawn, or the
-    /// brush has landed what it held.
-    pub(crate) fn ready_to_close(&self) -> bool {
-        let drawn = self.size.is_some() || self.last_view.is_some();
-        self.closing != Closing::No && (self.landing() == 0 || !drawn)
+    /// Whether the window was asked to close.
+    fn closing(&self) -> bool {
+        self.close == Close::Asked
     }
 
-    /// Closes the project: lets the brush apply what it holds and end its stroke, leaves the
-    /// feed, then closes it, keeping its recovery file only if it has edits no save holds (the
-    /// app can't ask yet).
+    /// Whether a close was asked for, nothing is left to land (nothing was ever drawn, or the
+    /// brush has landed what it held), and no save is under way.
+    pub(crate) fn ready_to_close(&self) -> bool {
+        let drawn = self.size.is_some() || self.last_view.is_some();
+        self.closing() && self.saving.stage().is_none() && (self.landing() == 0 || !drawn)
+    }
+
+    /// Ctrl+S, at `now`: a save of everything drawn so far starts, answered at once, and goes on
+    /// through [`Owner::save_step`] (see [`crate::saving`]). With a save under way this is the
+    /// same save; with no edits there is nothing to do, and the overlay says so.
+    pub(crate) fn request_save(&mut self, now: Instant) {
+        if self.saving.stage().is_some() {
+            return;
+        }
+        self.scheduler.want(Reason::Input);
+        if !self.unsaved() {
+            self.saving.nothing_to_save();
+            return;
+        }
+        self.saving.start(now);
+        // A close takes every stroke there is, so none has to wait.
+        if !self.closing() {
+            self.brush.begin_saving(now);
+        }
+    }
+
+    /// A step of the save under way, if one is, whether or not a frame can be drawn; the caller's
+    /// events come between steps. A failure doesn't reach the caller: the app goes on, and the
+    /// title and overlay say it ([`crate::saving`]).
+    pub(crate) fn save_step(&mut self) -> SaveStep {
+        match self.saving.stage() {
+            None => SaveStep::Idle,
+            Some(Stage::PenDown) if self.brush.pen_down() && !self.closing() => SaveStep::Idle,
+            Some(Stage::PenDown) => {
+                self.brush.begin_landing();
+                self.saving.reach(Stage::Landing);
+                SaveStep::Worked
+            }
+            Some(Stage::Landing) => self.land_for_save(),
+            Some(Stage::Writing) => self.write_save(),
+        }
+    }
+
+    /// A step of a save's landing: on to the writing once it holds nothing more. A close lands
+    /// the same dabs through its own steps, which leave this only to wait for them.
+    fn land_for_save(&mut self) -> SaveStep {
+        let size = self.size.or_else(|| self.last_view.map(|(_, size)| size));
+        let left = if self.closing() {
+            self.landing()
+        } else {
+            self.brush.landing_for_save()
+        };
+        let Some(size) = size.filter(|_| left > 0) else {
+            self.saving.reach(Stage::Writing);
+            return SaveStep::Worked;
+        };
+        if self.closing() {
+            return SaveStep::Worked;
+        }
+        match self.with_brush(size, B::save_step) {
+            Ok(landed) => {
+                if landed {
+                    self.surface_landed();
+                }
+            }
+            Err(error) => self.end_save(Err(error.context("landing the dabs to save"))),
+        }
+        SaveStep::Worked
+    }
+
+    /// Dabs landed outside the frames' brush steps: the next frame shows them, the next pick is
+    /// made afresh, and the camera's boundary grows around them.
+    fn surface_landed(&mut self) {
+        self.scheduler.want(Reason::Stroke);
+        self.fitting.bounds = true;
+        if let Some(picker) = &mut self.picker {
+            picker.surface_changed();
+        }
+    }
+
+    /// A step of a save's writing: a slice of its work done ahead, then, with only the fixed part
+    /// left, the save.
+    fn write_save(&mut self) -> SaveStep {
+        match self.project.save_ahead(Instant::now() + SAVE_SLICE) {
+            Ok(SaveAhead::Flushing) => SaveStep::Waiting,
+            Ok(SaveAhead::Copying(left)) => {
+                self.saving.copying(left);
+                SaveStep::Worked
+            }
+            Ok(SaveAhead::Ready) => {
+                let saved = self.project.save().context("saving the project");
+                self.end_save(saved);
+                SaveStep::Worked
+            }
+            Err(error) => {
+                self.end_save(Err(anyhow::Error::new(error).context("saving the project")));
+                SaveStep::Worked
+            }
+        }
+    }
+
+    /// The save under way ended in `saved`: said, and strokes go on.
+    fn end_save(&mut self, saved: Result<SaveOutcome>) {
+        match saved {
+            Ok(outcome) => self.saving.saved(&outcome, Instant::now()),
+            Err(error) => self.saving.failed(&error),
+        }
+        if !self.closing() {
+            self.brush.end_saving();
+        }
+        // The overlay's line, and what the rebase closed.
+        self.scheduler.want(Reason::Converging);
+    }
+
+    /// Whether anything drawn isn't in a save: edits of the project, or dabs the brush holds.
+    fn unsaved(&self) -> bool {
+        self.project.has_unsaved_edits() || self.landing() > 0
+    }
+
+    /// The dabs the title and the overlay count down: a save's, or a close's.
+    fn save_counts(&self) -> usize {
+        if self.closing() {
+            self.landing()
+        } else {
+            self.brush.landing_for_save()
+        }
+    }
+
+    /// The window's title, if it no longer says what it should ([`crate::saving`]).
+    pub(crate) fn title_change(&mut self) -> Option<String> {
+        let (unsaved, left) = (self.unsaved(), self.save_counts());
+        self.saving.title_change(unsaved, left, self.closing())
+    }
+
+    /// The stage of the save under way, if one is.
+    #[cfg(test)]
+    pub(crate) const fn save_stage(&self) -> Option<Stage> {
+        self.saving.stage()
+    }
+
+    /// The overlay's line about the project.
+    #[cfg(test)]
+    pub(crate) fn save_line(&self) -> String {
+        self.saving
+            .line(self.unsaved(), self.save_counts(), self.closing())
+    }
+
+    /// Closes the project: lets the brush apply what it holds and end its stroke, finishes a save
+    /// under way (the window has gone, and the user asked for it), leaves the feed, then closes
+    /// the project, keeping its recovery file only if it has edits no save holds (the app can't
+    /// ask yet).
     ///
     /// # Errors
     ///
-    /// As [`Brush::flush`] and [`Project::close`].
+    /// As [`Brush::flush`], [`Project::save`] and [`Project::close`].
     pub(crate) fn close(mut self) -> Result<()> {
         let flushed = match self.size.or_else(|| self.last_view.map(|(_, size)| size)) {
             Some(size) => {
@@ -2577,6 +2776,12 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 flushed.context("ending the brush's stroke")
             }
             None => Ok(()),
+        };
+        let saved = if self.saving.stage().is_some() {
+            let saved = self.project.save().context("saving the project");
+            saved.map(|outcome| self.saving.saved(&outcome, Instant::now()))
+        } else {
+            Ok(())
         };
         let Self {
             mut project,
@@ -2586,7 +2791,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         project.store().unsubscribe_stale(cursor);
         let keep = project.has_unsaved_edits();
         let closed = project.close(keep).context("closing the project");
-        flushed.and(closed)
+        said_too(said_too(flushed, saved), closed)
     }
 
     /// Whether the stale-tile feed holds epochs this loop hasn't drained (or a resync): work
