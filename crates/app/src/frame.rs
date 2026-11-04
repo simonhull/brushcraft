@@ -460,6 +460,23 @@ pub(crate) trait Brush {
         None
     }
 
+    /// The window was asked to close: lifts the pen of any open stroke, and has the brush land
+    /// what it holds through its steps, frame by frame, with the next strokes that wait
+    /// ([`Brush::landing`] counts down). The window answers meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Only for a failure the app can't go on from.
+    fn begin_closing(&mut self, _context: BrushContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// How many dabs the brush still holds to land, those of strokes that wait among them: what
+    /// a close waits for.
+    fn landing(&self) -> usize {
+        0
+    }
+
     /// Applies what the brush still holds and ends its stroke: the project is about to close.
     ///
     /// # Errors
@@ -935,6 +952,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// `Down`, F); `None` before any. A source later than another wins, whichever is heard first
     /// ([`Owner::pivot_to`]).
     pivot_at: Option<Instant>,
+    /// Whether the window was asked to close ([`Owner::request_close`]).
+    closing: bool,
 }
 
 /// What the camera is still to be fitted to the model by: framing it, and growing its boundary
@@ -1140,6 +1159,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             upkept_at: now,
             fitting: Fitting::default(),
             pivot_at: None,
+            closing: false,
         }
     }
 
@@ -1212,6 +1232,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// [`Owner::pen`]; wanting a frame for it only if `want` (a sample the frame being made takes
     /// itself wants none).
     fn queue_pen(&mut self, sample: PenSample, want: bool) {
+        if self.closing {
+            return;
+        }
         self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
         if sample.phase.in_stroke() {
             // A `Down` with a barrel button held navigates whatever the brush says (`pen::route`).
@@ -2448,6 +2471,37 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.scheduler.want(Reason::Converging);
         }
         Ok(())
+    }
+
+    /// The window was asked to close: the pen's samples are no longer taken, and the brush lands
+    /// what it holds over the frames that follow, however long that takes, with nothing here
+    /// waiting for it. [`Owner::ready_to_close`] says when it has.
+    ///
+    /// # Errors
+    ///
+    /// As [`Brush::begin_closing`].
+    pub(crate) fn request_close(&mut self) -> Result<()> {
+        if self.closing {
+            return Ok(());
+        }
+        self.closing = true;
+        self.pen_queue.clear();
+        if let Some(size) = self.size.or_else(|| self.last_view.map(|(_, size)| size)) {
+            self.with_brush(size, B::begin_closing)
+                .context("lifting the pen to close")?;
+        }
+        self.scheduler.want(Reason::Stroke);
+        Ok(())
+    }
+
+    /// How many dabs a close waits for ([`Brush::landing`]).
+    pub(crate) fn landing(&self) -> usize {
+        self.brush.landing()
+    }
+
+    /// Whether a close was asked for and nothing is left to land.
+    pub(crate) fn ready_to_close(&self) -> bool {
+        self.closing && self.landing() == 0
     }
 
     /// Closes the project: lets the brush apply what it holds and end its stroke, leaves the

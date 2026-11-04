@@ -1083,6 +1083,50 @@ fn a_frame_comes_between_the_catch_ups_batches() {
     assert!(frames >= shown, "{shown} dabs landed in {frames} frames");
 }
 
+/// A big backlog at pen-up doesn't hold a close up: the request lands nothing itself and returns
+/// at once, a frame comes for every batch, so the window's events are heard between them, and
+/// the close is ready once it has all landed. (`Owner::close` used to land it all in one call,
+/// the window unanswered: 31 s for 726 dabs.)
+#[test]
+fn a_close_request_is_answered_at_once_and_the_landing_goes_on_in_frames() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(
+        project(&dir),
+        |project| Sculpting::new(project).with_cost(DabCost::one_at_a_time()),
+        setup(),
+    );
+    run(&mut owner, 10_000);
+    queue(&mut owner, to_and_fro(4));
+    run(&mut owner, 1);
+    let backlog = owner.brush().last().dabs_catching_up;
+    assert!(backlog > 8, "{backlog} dabs to land");
+    assert!(!owner.ready_to_close(), "nothing asked");
+    owner.request_close().expect("a close");
+    let left = owner.landing();
+    assert!(
+        left >= backlog,
+        "nothing landed in the call: {left} of {backlog}"
+    );
+    assert!(!owner.ready_to_close(), "{left} dabs still to land");
+    let mut frames = 0;
+    let mut longest = Duration::ZERO;
+    while !owner.ready_to_close() {
+        let before = owner.landing();
+        let began = Instant::now();
+        run(&mut owner, 1);
+        longest = longest.max(began.elapsed());
+        frames += 1;
+        assert!(
+            before.saturating_sub(owner.landing()) <= 2,
+            "a batch a frame: {before} to {}",
+            owner.landing()
+        );
+        assert!(frames < 10_000, "the landing ends");
+    }
+    assert!(frames >= backlog / 2, "{backlog} dabs in {frames} frames");
+    assert!(longest < Duration::from_secs(1), "a frame took {longest:?}");
+}
+
 /// A drawing pen, however long the catch-up has landed nothing, makes no sample wait behind a dab
 /// that doesn't fit: only the backlog's size does.
 #[test]

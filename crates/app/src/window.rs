@@ -48,10 +48,13 @@ use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
 use crate::render_thread::{Hooks, RenderThread};
-use crate::{AppOwner, ProjectToOpen, Summary, describe_adapter, start};
+use crate::{AppOwner, Ended, ProjectToOpen, Summary, describe_adapter, start};
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_micros(16_667);
+
+/// How finely the title counts the dabs left to land as the window closes.
+const TITLE_STEP: usize = 10;
 
 /// Pixels of touchpad scrolling taken as one wheel notch.
 const PIXELS_PER_NOTCH: f64 = 40.0;
@@ -77,6 +80,10 @@ struct Running {
     pacer: Pacer,
     /// The event loop's timer last asked for, to learn how long it ran: from when, for how long.
     asked: Option<(Instant, Duration)>,
+    /// Whether the window was asked to close, the brush landing what it holds.
+    closing: bool,
+    /// The dabs the title last said were left to land.
+    title_says: usize,
 }
 
 /// winit's application: opens the window when it can, runs the frame loop, and reports how
@@ -93,7 +100,7 @@ pub(crate) struct WindowApp {
     /// Where the run's outcome goes when the loop exits.
     /// Where the run's outcome goes when the loop exits; `None` once it has been sent, so a
     /// run finishes once, whatever events follow.
-    done: Option<Sender<Result<Summary>>>,
+    done: Option<Sender<Result<Ended>>>,
     /// Event-loop wakeups so far: winit's fallback pen events of one wakeup may be one pen frame.
     wakeup: u64,
     /// Pen samples drained from the stream, handed on to the frame loop at once; kept for its
@@ -106,7 +113,7 @@ impl WindowApp {
     pub(crate) const fn new(
         options: Options,
         project: ProjectToOpen,
-        done: Sender<Result<Summary>>,
+        done: Sender<Result<Ended>>,
     ) -> Self {
         Self {
             options,
@@ -173,6 +180,8 @@ impl WindowApp {
             adapter,
             pacer: Pacer::default(),
             asked: None,
+            closing: false,
+            title_says: 0,
         })
     }
 
@@ -281,8 +290,9 @@ impl WindowApp {
     }
 
     /// Exits the loop, stops the pen stream (first: our backend must not outlive the window's
-    /// surface), then the render thread, closes the project, and sends how the run went; `result`
-    /// is an error that ended the run early, if one did. Only the first call does more than exit.
+    /// surface), then the render thread, drops the window, and sends how the run went, with the
+    /// frame loop for `run_window` to close; `result` is an error that ended the run early, if
+    /// one did. Only the first call does more than exit.
     fn finish(&mut self, event_loop: &dyn ActiveEventLoop, result: Result<()>) {
         event_loop.exit();
         let Some(done) = self.done.take() else {
@@ -308,13 +318,13 @@ impl WindowApp {
                     .stop()
                     .map(|stopped| owner.last_gpu_times(stopped.gpu));
                 let summary = Summary::of(&owner, adapter, presentation);
-                let closed = owner.close();
+                // The window goes first: the project closes once the event loop has ended
+                // (`run_window`), however long that takes, with no window left unanswered.
                 drop(window);
                 result
                     .and(stopped)
-                    .and(closed)
                     .and(pen_stopped)
-                    .map(|()| summary)
+                    .map(|()| Ended { summary, owner })
             }
             None => result.and_then(|()| Err(anyhow!("the window never opened"))),
         };
@@ -322,10 +332,30 @@ impl WindowApp {
         drop(done.send(outcome));
     }
 
+    /// The window was asked to close. The first time, the brush starts landing what it holds:
+    /// the loop runs on, frames and events, the title counting the dabs down, and ends as they
+    /// run out. Asked again, the window goes at once and the landing ends after it, unseen.
+    fn close_requested(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(running) = &mut self.running else {
+            self.finish(event_loop, Ok(()));
+            return;
+        };
+        if running.closing {
+            self.finish(event_loop, Ok(()));
+            return;
+        }
+        running.closing = true;
+        match running.owner.request_close() {
+            Ok(()) if running.owner.ready_to_close() => self.finish(event_loop, Ok(())),
+            Ok(()) => {}
+            Err(error) => self.finish(event_loop, Err(error)),
+        }
+    }
+
     /// Turns a window event into frame-loop input or window state.
     fn handle(&mut self, event_loop: &dyn ActiveEventLoop, event: WindowEvent) {
         if matches!(event, WindowEvent::CloseRequested) {
-            self.finish(event_loop, Ok(()));
+            self.close_requested(event_loop);
             return;
         }
         let Some(running) = &mut self.running else {
@@ -575,7 +605,17 @@ impl ApplicationHandler for WindowApp {
             return;
         };
         let driven = Self::drive(running, &mut self.pen_samples, event_loop);
-        if driven.is_err() || running.owner.done() {
+        if running.closing {
+            // Said in tens, so the compositor isn't told every dab.
+            let left = running.owner.landing().div_ceil(TITLE_STEP) * TITLE_STEP;
+            if left != running.title_says {
+                running.title_says = left;
+                running
+                    .window
+                    .set_title(&format!("BrushCraft: closing, {left} dabs to land"));
+            }
+        }
+        if driven.is_err() || running.owner.done() || running.owner.ready_to_close() {
             self.finish(event_loop, driven);
         }
     }

@@ -686,6 +686,8 @@ pub(crate) struct Sculpting {
     /// When the catch-up last landed a dab (or had none to land): what [`CATCH_UP_STARVED`]
     /// counts from.
     landed_at: Instant,
+    /// Whether the window was asked to close: no pen is down any more, and what is held lands.
+    closing: bool,
     /// Where the warming ahead of the open stroke last listed its tiles.
     ahead_warmed: Option<geom::Vec3>,
     /// The tiles ahead of the open stroke still to evaluate.
@@ -733,6 +735,7 @@ impl Sculpting {
             index_stale: false,
             warm: Warm::default(),
             landed_at: Instant::now(),
+            closing: false,
             ahead_warmed: None,
             ahead_todo: Vec::new(),
             error: None,
@@ -1210,7 +1213,7 @@ impl Sculpting {
             }
         }
         let first = report.dabs_applied == 0;
-        let waiting_stroke = !self.deferred.is_empty();
+        let waiting_stroke = self.closing || !self.deferred.is_empty();
         // A frame shows each batch before the next starts, so the frames keep coming.
         if batch && self.unframed {
             return;
@@ -1706,10 +1709,16 @@ impl Brush for Sculpting {
             };
             self.admit(&mut scene, sample);
         }
+        if self.closing {
+            self.lift(&mut scene, None);
+        }
         self.work(&mut scene, &mut report, Some(budget));
         if !self.deferred.is_empty() && self.stroke.is_none() {
             // The stroke before them has ended: the deferred stroke begins on what it left.
             self.release_deferred(&mut scene);
+            if self.closing {
+                self.lift(&mut scene, None);
+            }
             self.work(&mut scene, &mut report, Some(budget));
         }
         self.note_kept(scene.project.store());
@@ -1827,6 +1836,23 @@ impl Brush for Sculpting {
 
     fn next_sample_due(&self) -> Option<Instant> {
         self.before_next_sample().filter(|_| self.pen_moving())
+    }
+
+    fn begin_closing(&mut self, context: BrushContext<'_>) -> Result<()> {
+        self.closing = true;
+        if let Some(mut scene) = Scene::of(context) {
+            let held = std::mem::take(&mut self.held);
+            for event in &held {
+                self.admit(&mut scene, event.as_ref());
+            }
+            self.lift(&mut scene, None);
+        }
+        Ok(())
+    }
+
+    fn landing(&self) -> usize {
+        let under_way = usize::from(self.stroke.is_some());
+        self.queued().max(under_way) + self.deferred.len() + self.held.len()
     }
 
     fn flush(&mut self, context: BrushContext<'_>) -> Result<()> {

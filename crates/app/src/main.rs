@@ -153,6 +153,16 @@ impl Summary {
     }
 }
 
+/// A window's run that ended well: how it went, and its frame loop, to close once the window and
+/// the event loop are gone.
+#[derive(Debug)]
+pub(crate) struct Ended {
+    /// How the run went.
+    pub(crate) summary: Summary,
+    /// The frame loop, holding the project.
+    pub(crate) owner: AppOwner,
+}
+
 /// A GPU's name and backend, as the overlay and the summary show it.
 pub(crate) fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
     format!("{} ({:?})", info.name, info.backend)
@@ -215,9 +225,10 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
         ran?;
         bail!("the event loop ended without closing the project");
     };
-    let summary = outcome?;
+    let ended: Ended = outcome?;
     ran?;
-    Ok(summary)
+    ended.owner.close()?;
+    Ok(ended.summary)
 }
 
 /// Runs the app offscreen for `frames` frames, then closes the project.
