@@ -2697,6 +2697,8 @@ struct Lands {
     saving: Option<Instant>,
     /// The strokes it took: a `Down` each.
     strokes: usize,
+    /// How many times it has dropped dabs.
+    drops: u64,
 }
 
 impl Brush for Lands {
@@ -2757,6 +2759,18 @@ impl Brush for Lands {
 
     fn end_saving(&mut self) {
         self.saving = None;
+    }
+
+    fn drops(&self) -> u64 {
+        self.drops
+    }
+
+    fn dropped_since(&self, before: u64) -> Result<()> {
+        if self.drops == before {
+            Ok(())
+        } else {
+            bail!("no room for the dabs");
+        }
     }
 }
 
@@ -3243,4 +3257,61 @@ fn discard_tells_the_brush_to_forget_and_never_to_land() {
     let owner = ui_owner(&dir, brush);
     owner.discard().expect("discarded");
     assert!(abandoned.get(), "it was told");
+}
+
+/// The save can't say what it doesn't hold: `saving.start` counts drops from the Save, so dabs
+/// dropped under the bar before it pass as nothing.
+#[test]
+fn dabs_dropped_under_the_bar_keep_the_window_and_the_title_says_so() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    owner.brush.drops = 1;
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    drop(owner.title_change());
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), None, "the window stays");
+    assert!(!owner.dialogs.bar_showing(), "the bar goes");
+    let title = owner.title_change().expect("it says so");
+    assert!(title.contains("no room for the dabs"), "{title}");
+
+    assert_eq!(
+        owner.ask_close(Instant::now()),
+        CloseAnswer::Now,
+        "told, and with nothing unsaved a further close leaves"
+    );
+}
+
+#[test]
+fn a_further_save_leaves_once_the_drop_was_said() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    owner.brush.drops = 1;
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), None, "the first time, it stays");
+
+    owner.brush.held = 2;
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), Some(WindowRequest::Exit), "told once");
+}
+
+#[test]
+fn dabs_dropped_while_a_failed_save_keeps_the_window_count_as_told() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    owner.brush.drops = 1;
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), None, "that save failed");
+
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    finish_saving(&mut owner);
+    assert_eq!(
+        owner.take_request(),
+        Some(WindowRequest::Exit),
+        "said already"
+    );
 }

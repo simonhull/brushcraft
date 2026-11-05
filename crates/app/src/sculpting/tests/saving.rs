@@ -1007,3 +1007,32 @@ fn discard_keeps_a_live_runs_record() {
         "the stream reached the file: {written}"
     );
 }
+
+/// The real thing: dabs dropped in the frames under the bar, before Save.
+#[test]
+fn dabs_dropped_under_the_bar_stop_the_exit() {
+    let (_dir, mut owner, heavy) = lifecycle::at_the_budgets_edge();
+    let drops = owner.brush().drops();
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    queue(&mut owner, heavy);
+    run(&mut owner, 10_000);
+    assert!(owner.brush().drops() > drops, "the frames dropped dabs");
+    owner.request_save(Instant::now());
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    let mut steps = 0;
+    while owner.save_stage().is_some() {
+        owner.save_step();
+        run(&mut owner, 1);
+        steps += 1;
+        assert!(steps < 100_000, "the save ends");
+    }
+    owner.save_step();
+    assert_eq!(
+        owner.take_request(),
+        None,
+        "dropped dabs, and the window stays"
+    );
+    let title = owner.title_change().expect("it says so");
+    assert!(title.contains("save failed"), "{title}");
+    owner.close().expect("closed");
+}

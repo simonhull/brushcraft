@@ -1096,6 +1096,9 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     saving: Saving,
     /// What the window does once the save under way has succeeded.
     after_save: AfterSave,
+    /// How many of the brush's drops of dabs the user has been told of: a save counts only those
+    /// since it began, so dabs dropped before it, under the close bar say, would go unsaid.
+    told_drops: u64,
     /// What the window must do next ([`Owner::take_request`]).
     request: Option<WindowRequest>,
     /// What the UI shows.
@@ -1316,6 +1319,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             close: Close::NotAsked,
             saving,
             after_save: AfterSave::Stay,
+            told_drops: 0,
             request: None,
             dialogs,
         }
@@ -2985,7 +2989,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// With the window to exit after the save, at `now`: the bar's progress while it goes on, with
     /// or without frames, and the outcome once it ends. Only a save that succeeded lets the window
-    /// go; one that failed leaves it and the user's work, and the title says so.
+    /// go, and only if it holds all that was drawn: one that failed, or that dabs were dropped
+    /// from before it began, leaves the window and the user's work. The title says so, and then
+    /// the user has been told, so a further close can leave.
     ///
     /// The save fixed what it holds as it began, so a stroke that waited for it isn't in it. Save
     /// on the bar means all of it: another save follows, under the same bar.
@@ -2997,7 +3003,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             }
             return;
         }
-        if self.saving.last_succeeded() == Some(true) {
+        let saved = self.saving.last_succeeded() == Some(true);
+        let lost = self.brush.dropped_since(self.told_drops);
+        if saved && lost.is_ok() {
             if self.unsaved() || self.pen_queued(now) {
                 self.request_save(now);
                 self.dialogs.finish(self.save_counts(), now);
@@ -3005,11 +3013,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 self.after_save = AfterSave::Stay;
                 self.request = Some(WindowRequest::Exit);
             }
-        } else {
-            self.after_save = AfterSave::Stay;
-            self.dialogs.clear_prompt(now);
-            self.scheduler.want(Reason::Overlay);
+            return;
         }
+        if let (true, Err(error)) = (saved, lost) {
+            self.saving
+                .failed(&error.context("dabs were dropped"), self.closing());
+        }
+        self.told_drops = self.brush.drops();
+        self.after_save = AfterSave::Stay;
+        self.dialogs.clear_prompt(now);
+        self.scheduler.want(Reason::Overlay);
     }
 
     /// Whether a save asked for can't begin landing: the pen is down on a stroke it holds, or a
