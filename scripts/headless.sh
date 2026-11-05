@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks that the headless crates (geom, store, brush, sculpt, stroke) depend on no GPU or windowing
+# Checks that the headless crates (geom, store, brush, sculpt, stroke, ui) depend on no GPU or windowing
 # crate, as the architecture requires, on every target and with every feature; fails naming the
 # crate and what it pulls in, and fails if cargo itself fails.
 # Usage: scripts/headless.sh [crate...] (default: the headless crates; run by check.sh and CI)
@@ -11,7 +11,7 @@ forbidden='^(wgpu|wgpu-[a-z-]+|naga|naga-[a-z-]+|winit|raw-window-handle|ash|met
 
 crates=("$@")
 if [[ ${#crates[@]} -eq 0 ]]; then
-  crates=(geom store brush sculpt stroke)
+  crates=(geom store brush sculpt stroke ui)
 fi
 
 status=0

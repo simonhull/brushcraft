@@ -17,6 +17,7 @@ brush = { path = "crates/brush" }
 sculpt = { path = "crates/sculpt" }
 render = { path = "crates/render" }
 checkout = { path = "crates/checkout" }
+ui = { path = "crates/ui" }
 anyhow = "1.0.100"
 # 0.13.4, not 0.13.7: bolero-generator-derive 0.13.5 (pulled in by bolero 0.13.5 and later) pins
 # indexmap to exactly 2.11.2, and wgpu 30 needs 2.11.4 or later. Return to the latest once the
@@ -32,6 +33,8 @@ rayon = "1.12.0"
 rustix = { version = "1.1.5", default-features = false, features = ["event", "fs", "param", "std"] }
 softbuffer = { version = "0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
 thiserror = "2.0.21"
+# Font tables only: outlines, advances and metrics. Rasterising and layout are ours (crate `ui`).
+ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
 wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client"] }

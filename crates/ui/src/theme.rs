@@ -1,0 +1,210 @@
+//! The look: every colour, size and duration of the UI, and the contrast arithmetic that checks
+//! them.
+//!
+//! Colours are display (sRGB-encoded) values, and the UI blends in them, as the mockups do.
+
+use std::time::Duration;
+
+/// A colour in display (sRGB-encoded) values, straight alpha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Colour {
+    /// Red.
+    pub r: u8,
+    /// Green.
+    pub g: u8,
+    /// Blue.
+    pub b: u8,
+    /// Opacity: 0 is none, 255 full.
+    pub a: u8,
+}
+
+impl Colour {
+    /// Opaque.
+    #[must_use]
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b, a: 255 }
+    }
+
+    /// With alpha.
+    #[must_use]
+    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+
+    /// This over an opaque `ground`, blended in display values, as the UI pass does. The result is
+    /// opaque.
+    #[must_use]
+    pub fn over(self, ground: Self) -> Self {
+        let alpha = f64::from(self.a) / 255.0;
+        let blend = |top: u8, under: u8| {
+            to_channel(alpha * f64::from(top) + (1.0 - alpha) * f64::from(under))
+        };
+        Self::rgb(
+            blend(self.r, ground.r),
+            blend(self.g, ground.g),
+            blend(self.b, ground.b),
+        )
+    }
+
+    /// WCAG relative luminance, 0 to 1. Alpha plays no part: blend with [`Colour::over`] first.
+    #[must_use]
+    pub fn luminance(self) -> f64 {
+        0.2126 * decoded(self.r) + 0.7152 * decoded(self.g) + 0.0722 * decoded(self.b)
+    }
+
+    /// WCAG contrast ratio against `other`, 1 to 21.
+    #[must_use]
+    pub fn contrast(self, other: Self) -> f64 {
+        let (one, two) = (self.luminance(), other.luminance());
+        (one.max(two) + 0.05) / (one.min(two) + 0.05)
+    }
+}
+
+/// A value of 0 to 255 as the nearest channel value.
+fn to_channel(value: f64) -> u8 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rounded and clamped to 0 to 255 first"
+    )]
+    let channel = value.round().clamp(0.0, 255.0) as u8;
+    channel
+}
+
+/// A channel in linear light, 0 to 1: the sRGB decoding WCAG's luminance is defined on.
+fn decoded(channel: u8) -> f64 {
+    let value = f64::from(channel) / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Every colour, size and duration of the UI. Nothing else in the workspace hard-codes one, so a
+/// new direction is a new constant. Sizes are logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Theme {
+    /// The one surface: bars and chips.
+    pub glass: Colour,
+    /// The line around glass.
+    pub hairline: Colour,
+    /// The fill behind a quiet control under the pointer.
+    pub hover: Colour,
+    /// The one action on a bar, and work under way.
+    pub accent: Colour,
+    /// Text on the accent.
+    pub accent_text: Colour,
+    /// This needs the user.
+    pub needs_you: Colour,
+    /// Text on glass.
+    pub text: Colour,
+    /// Secondary text on glass.
+    pub quiet_text: Colour,
+    /// The corners of a bar.
+    pub radius: f32,
+    /// The corners of a control.
+    pub control_radius: f32,
+    /// The height of a control: a pen's target.
+    pub control_height: f32,
+    /// Between neighbouring controls.
+    pub gap: f32,
+    /// A bar's padding around its controls.
+    pub bar_inset: f32,
+    /// A bar's text in from its left edge.
+    pub bar_text_inset: f32,
+    /// A bar up from the window's bottom edge.
+    pub bar_bottom: f32,
+    /// The height of a chip, whose corners are fully round.
+    pub chip_height: f32,
+    /// A chip in from the window's top and right edges.
+    pub chip_inset: f32,
+    /// Body text: size and line height.
+    pub body: (f32, f32),
+    /// Status text: size and line height.
+    pub status: (f32, f32),
+    /// How long anything takes to appear or leave.
+    pub fade: Duration,
+    /// A chip's opacity while the pen is down.
+    pub chip_pen_down: f32,
+    /// The opacity of a chip with nothing left to do ("Saved").
+    pub saved_alpha: f32,
+    /// Glass alpha where the pass can only blend in linear light, which lightens glass.
+    pub glass_alpha_linear: f32,
+}
+
+impl Theme {
+    /// Glass: smoked, one small accent, the model never dimmed. For now, not final.
+    pub const GLASS: Self = Self {
+        glass: Colour::rgba(22, 23, 26, 168),
+        hairline: Colour::rgba(255, 255, 255, 36),
+        hover: Colour::rgba(255, 255, 255, 31),
+        accent: Colour::rgb(0xF0, 0x8A, 0x3C),
+        accent_text: Colour::rgb(0x1C, 0x12, 0x08),
+        needs_you: Colour::rgb(0xFF, 0x6F, 0x61),
+        text: Colour::rgb(0xF4, 0xF5, 0xF6),
+        quiet_text: Colour::rgb(0xDC, 0xDE, 0xE1),
+        radius: 14.0,
+        control_radius: 10.0,
+        control_height: 44.0,
+        gap: 8.0,
+        bar_inset: 12.0,
+        bar_text_inset: 22.0,
+        bar_bottom: 28.0,
+        chip_height: 32.0,
+        chip_inset: 20.0,
+        body: (15.0, 22.0),
+        status: (13.0, 18.0),
+        fade: Duration::from_millis(120),
+        chip_pen_down: 0.25,
+        saved_alpha: 0.6,
+        glass_alpha_linear: 0.9,
+    };
+}
+
+#[cfg(test)]
+#[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
+mod tests {
+    use super::*;
+
+    /// The brightest clay the MatCaps show, in display colour.
+    const BRIGHTEST_CLAY: Colour = Colour::rgb(0xD6, 0xD6, 0xD2);
+
+    #[test]
+    fn text_on_glass_meets_contrast_over_the_brightest_clay() {
+        let theme = Theme::GLASS;
+        let ground = theme.glass.over(BRIGHTEST_CLAY);
+        for text in [theme.text, theme.quiet_text] {
+            assert!(text.contrast(ground) >= 4.5, "{text:?} on {ground:?}");
+        }
+        assert!(
+            theme.accent_text.contrast(theme.accent) >= 4.5,
+            "text on the accent"
+        );
+    }
+
+    #[test]
+    fn controls_are_big_enough_for_the_pen() {
+        let theme = Theme::GLASS;
+        assert!(theme.control_height >= 44.0, "a pen needs a 44 px target");
+    }
+
+    #[test]
+    fn glass_over_the_brightest_clay_is_the_grey_of_the_mockups() {
+        assert_eq!(
+            Theme::GLASS.glass.over(BRIGHTEST_CLAY),
+            Colour::rgb(88, 88, 89),
+            "blended in display values"
+        );
+    }
+
+    #[test]
+    fn contrast_runs_from_one_to_twenty_one() {
+        let (black, white) = (Colour::rgb(0, 0, 0), Colour::rgb(255, 255, 255));
+        assert!(
+            (black.contrast(white) - 21.0).abs() < 1e-9,
+            "black on white"
+        );
+        assert!((white.contrast(white) - 1.0).abs() < 1e-9, "white on white");
+    }
+}
