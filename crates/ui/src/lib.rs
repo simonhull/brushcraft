@@ -4,6 +4,9 @@
 //! use it unchanged. It opens no window and touches no GPU: a renderer draws what it hands over,
 //! and its tests run anywhere. Design: `specs/2026-11-04-ui-foundation-design.md` in the docs repo.
 
+mod raster;
+mod text;
 mod theme;
 
+pub use text::{AtlasImage, Line, PlacedGlyph, Text, Weight};
 pub use theme::{Colour, Theme};

@@ -8,3 +8,6 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+ttf-parser.workspace = true
