@@ -3701,6 +3701,79 @@ fn try_again_saves_and_the_bar_goes() {
     assert!(!owner.dialogs.bar_showing());
 }
 
+/// The user asked to save and close: a retry that works finishes what they asked.
+#[test]
+fn try_again_after_the_close_bars_save_closes_once_it_works() {
+    let dir = TestDir::new();
+    let mut owner = close_failed_owner(&dir);
+    let again = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, again);
+    assert!(
+        owner.dialogs.finishing(),
+        "the retry shows as the close it is"
+    );
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), Some(WindowRequest::Exit));
+}
+
+/// However many tries it takes.
+#[test]
+fn a_second_try_after_the_close_bars_save_still_closes() {
+    let dir = TestDir::new();
+    let mut owner = close_failed_owner(&dir);
+    let again = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, again);
+    owner.end_save(Err(disk_full()));
+    owner.save_step();
+    assert_eq!(owner.take_request(), None, "the window stays");
+    see_the_bar(&mut owner);
+    let second = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, second);
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), Some(WindowRequest::Exit));
+}
+
+/// Nobody asked this window to close.
+#[test]
+fn try_again_after_ctrl_s_leaves_the_window() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    let again = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, again);
+    assert!(!owner.dialogs.finishing());
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), None);
+}
+
+/// A later failure of a plain Ctrl+S doesn't inherit a close given up on.
+#[test]
+fn a_close_given_up_on_is_not_finished_by_a_later_try() {
+    let dir = TestDir::new();
+    let mut owner = close_failed_owner(&dir);
+    let dismiss = owner.dialogs.control(Action::Dismiss);
+    tap(&mut owner, dismiss);
+    owner.request_save(Instant::now());
+    owner.end_save(Err(disk_full()));
+    owner.save_step();
+    see_the_bar(&mut owner);
+    let again = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, again);
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), None);
+}
+
+/// Cancel takes the close back on a retry as on the first try.
+#[test]
+fn cancelling_a_retry_keeps_the_window() {
+    let dir = TestDir::new();
+    let mut owner = close_failed_owner(&dir);
+    let again = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, again);
+    owner.act(Action::Cancel, Instant::now());
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), None);
+}
+
 #[test]
 fn a_try_that_fails_again_says_so_again() {
     let dir = TestDir::new();

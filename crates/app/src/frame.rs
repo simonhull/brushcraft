@@ -1237,6 +1237,9 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     saving: Saving,
     /// What the window does once the save under way has succeeded.
     after_save: AfterSave,
+    /// What the last failed save meant to do after it: Try again carries on with that, so a retry
+    /// of the close bar's Save that works closes the window, as the user asked.
+    after_retry: AfterSave,
     /// How many of the brush's drops of dabs the user has been told of: a save counts only those
     /// since it began, so dabs dropped before it, under the close bar say, would go unsaid.
     told_drops: u64,
@@ -1480,6 +1483,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             close: Close::NotAsked,
             saving,
             after_save: AfterSave::Stay,
+            after_retry: AfterSave::Stay,
             told_drops: 0,
             exposed: None,
             lost: BTreeSet::new(),
@@ -1832,6 +1836,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                     self.act(Action::OpenCopy, now);
                 } else {
                     self.request_save(now);
+                    self.after_save = self.after_retry;
+                    if self.after_save == AfterSave::Exit {
+                        self.dialogs.finish(self.save_counts(), now);
+                    }
                 }
             }
             Action::UseLastSave if self.dialogs.says_restored() && self.may_reopen() => {
@@ -3534,6 +3542,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// told.
     fn save_failed(&mut self, error: &anyhow::Error, now: Instant) {
         self.saving.failed(error, self.closing());
+        self.after_retry = self.after_save;
         let work = match self.brush.dropped_since(self.told_drops) {
             Ok(()) => Work::Whole,
             Err(_) => Work::LessAStroke,
