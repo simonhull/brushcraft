@@ -895,6 +895,43 @@ enum Close {
     Asked,
 }
 
+/// What the window does once the save under way has succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterSave {
+    /// It stays.
+    Stay,
+    /// It exits: Save on the close bar, or a close during a save. Cancelling takes that back, and
+    /// the save carries on, harmless.
+    Exit,
+}
+
+/// What a request to close the window does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseAnswer {
+    /// The window can go: nothing is unsaved, or nobody can be asked.
+    Now,
+    /// A bar is showing: it stays until that is answered.
+    Asked,
+}
+
+/// What the window must do for the owner, which can't reach it ([`Owner::take_request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowRequest {
+    /// Close: everything is saved.
+    Exit,
+    /// Close, dropping what isn't saved: the user said so on the close bar.
+    ExitDiscarding,
+}
+
+/// A key the UI may want, before anything else hears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiKey {
+    /// Enter, alone.
+    Enter,
+    /// Escape, alone.
+    Escape,
+}
+
 /// How the brush's dabs land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Landing {
@@ -1053,6 +1090,10 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     close: Close,
     /// The project's saves ([`Owner::request_save`]).
     saving: Saving,
+    /// What the window does once the save under way has succeeded.
+    after_save: AfterSave,
+    /// What the window must do next ([`Owner::take_request`]).
+    request: Option<WindowRequest>,
     /// What the UI shows.
     dialogs: Dialogs,
 }
@@ -1270,6 +1311,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             pivot_at: None,
             close: Close::NotAsked,
             saving,
+            after_save: AfterSave::Stay,
+            request: None,
             dialogs,
         }
     }
@@ -1332,7 +1375,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let took = match input {
             Input::Press { button, at } => {
                 let claim = self.dialogs.claim_mouse(button, at, now);
-                claim == Claim::Ui
+                self.claim(claim, now)
             }
             Input::Release { button } if self.dialogs.mouse_holds(button) => {
                 let action = self.dialogs.release_mouse(now);
@@ -1378,7 +1421,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             }
         }
         match sample.phase {
-            Phase::Down => self.dialogs.claim(sample.at, now) == Claim::Ui,
+            Phase::Down => {
+                let claim = self.dialogs.claim(sample.at, now);
+                self.claim(claim, now)
+            }
             Phase::Enter | Phase::Hover => {
                 self.ui_hover(Some(sample.at));
                 false
@@ -1389,6 +1435,20 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             }
             Phase::Drag | Phase::Up => false,
         }
+    }
+
+    /// Whether `claim` leaves its stroke to the UI. Going back to work off the bar answers it: on
+    /// the close bar that's Keep sculpting, and while finishing, Cancel, the stroke waiting for the
+    /// save as any does.
+    fn claim(&mut self, claim: Claim, now: Instant) -> bool {
+        if claim == Claim::Elsewhere {
+            if self.dialogs.asking_close() {
+                self.act(Action::KeepSculpting, now);
+            } else if self.dialogs.finishing() {
+                self.act(Action::Cancel, now);
+            }
+        }
+        claim == Claim::Ui
     }
 
     /// The pointer is at `at` as far as the UI goes, and a frame is wanted if that changes what
@@ -1406,14 +1466,75 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
     }
 
+    /// The window was asked to close at `now`. It goes at once with nothing unsaved. With a save
+    /// under way that save decides, and otherwise the close bar asks, a close while it shows
+    /// changing nothing; either way nothing lands or lifts for it. A scripted run never asks, so
+    /// `close_held` and the save's failure hold it instead, and nor does a window with no size,
+    /// where no bar could show: what isn't saved stays in the recovery file.
+    pub(crate) fn ask_close(&mut self, now: Instant) -> CloseAnswer {
+        if self.log.is_some() || self.size.is_none() {
+            return CloseAnswer::Now;
+        }
+        let asked = if self.saving.stage().is_some() {
+            self.after_save = AfterSave::Exit;
+            if !self.dialogs.finishing() {
+                self.dialogs.finish(self.save_counts(), now);
+            }
+            true
+        } else if self.dialogs.asking_close() || self.dialogs.finishing() {
+            true
+        } else if self.unsaved() || self.pen_queued(now) {
+            self.dialogs.ask_close(self.saving.name(), now);
+            true
+        } else {
+            false
+        };
+        if !asked {
+            return CloseAnswer::Now;
+        }
+        self.scheduler.want(Reason::Overlay);
+        CloseAnswer::Asked
+    }
+
+    /// What the window must do next, if anything.
+    pub(crate) const fn take_request(&mut self) -> Option<WindowRequest> {
+        self.request.take()
+    }
+
+    /// `key` was pressed at `now`: whether the UI took it, or it goes on as before. A bar the pen
+    /// holds back can't be seen, so a key can't answer it.
+    pub(crate) fn key(&mut self, key: UiKey, now: Instant) -> bool {
+        if self.dialogs.pen_is_down() {
+            return false;
+        }
+        let action = match key {
+            UiKey::Enter if self.dialogs.asking_close() => Action::Save,
+            UiKey::Escape if self.dialogs.asking_close() => Action::KeepSculpting,
+            UiKey::Escape if self.dialogs.finishing() => Action::Cancel,
+            UiKey::Enter | UiKey::Escape => return false,
+        };
+        self.act(action, now);
+        true
+    }
+
     /// Does what a control on a bar says, and wants the frame that shows it.
     fn act(&mut self, action: Action, now: Instant) {
         match action {
-            Action::Dismiss => self.dialogs.clear_bar(now),
-            Action::Save
-            | Action::DontSave
-            | Action::KeepSculpting
-            | Action::Cancel
+            Action::Save => {
+                self.request_save(now);
+                self.after_save = AfterSave::Exit;
+                self.dialogs.finish(self.save_counts(), now);
+            }
+            // The one way to losing work on purpose: only the close bar leads here.
+            Action::DontSave if self.dialogs.asking_close() => {
+                self.request = Some(WindowRequest::ExitDiscarding);
+            }
+            Action::Cancel => {
+                self.after_save = AfterSave::Stay;
+                self.dialogs.clear_prompt(now);
+            }
+            Action::KeepSculpting | Action::Dismiss => self.dialogs.clear_prompt(now),
+            Action::DontSave
             | Action::TryAgain
             | Action::UseLastSave
             | Action::OpenCopy
@@ -1935,9 +2056,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// What the UI shows in the frame started at `now`, with the project `unsaved` or not.
     fn ui_frame(&mut self, unsaved: bool, now: Instant) -> Option<UiFrame> {
-        let saving = self.saving.stage().is_some();
-        self.dialogs.update(Facts { unsaved, saving }, now);
+        self.dialogs.update(self.facts(unsaved), now);
         self.dialogs.frame(now)
+    }
+
+    /// What decides what the UI shows, with the project `unsaved` or not.
+    fn facts(&self, unsaved: bool) -> Facts {
+        Facts {
+            unsaved,
+            saving: self.saving.stage().is_some(),
+            landing: self.save_counts(),
+        }
     }
 
     /// The overlay's lines for the frame being made, of `size`, its owner thread's `phases` so
@@ -2829,8 +2958,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// A step of the save under way, if one is, whether or not a frame can be drawn; the caller's
     /// events come between steps. A failure doesn't reach the caller: the app goes on, and the
     /// title and overlay say it ([`crate::saving`]).
+    ///
+    /// A save the window exits after ends in the window's going, if it succeeded
+    /// ([`Owner::exit_step`]).
     pub(crate) fn save_step(&mut self) -> SaveStep {
-        match self.saving.stage() {
+        let step = match self.saving.stage() {
             None => SaveStep::Idle,
             Some(Stage::PenDown) if self.pen_held() && !self.closing() => SaveStep::Idle,
             Some(Stage::PenDown) => {
@@ -2840,6 +2972,39 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             }
             Some(Stage::Landing) => self.land_for_save(),
             Some(Stage::Writing) => self.write_save(),
+        };
+        if self.after_save == AfterSave::Exit {
+            self.exit_step(Instant::now());
+        }
+        step
+    }
+
+    /// With the window to exit after the save, at `now`: the bar's progress while it goes on, with
+    /// or without frames, and the outcome once it ends. Only a save that succeeded lets the window
+    /// go; one that failed leaves it and the user's work, and the title says so.
+    ///
+    /// The save fixed what it holds as it began, so a stroke that waited for it isn't in it. Save
+    /// on the bar means all of it: another save follows, under the same bar.
+    fn exit_step(&mut self, now: Instant) {
+        if self.saving.stage().is_some() {
+            self.dialogs.update(self.facts(self.unsaved()), now);
+            if self.dialogs.needs_frame(now) {
+                self.scheduler.want(Reason::Overlay);
+            }
+            return;
+        }
+        if self.saving.last_succeeded() == Some(true) {
+            if self.unsaved() || self.pen_queued(now) {
+                self.request_save(now);
+                self.dialogs.finish(self.save_counts(), now);
+            } else {
+                self.after_save = AfterSave::Stay;
+                self.request = Some(WindowRequest::Exit);
+            }
+        } else {
+            self.after_save = AfterSave::Stay;
+            self.dialogs.clear_prompt(now);
+            self.scheduler.want(Reason::Overlay);
         }
     }
 
@@ -2988,7 +3153,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// Closes the project: lets the brush apply what it holds and end its stroke, finishes a save
     /// under way (the window has gone, and the user asked for it) unless that went wrong, leaves
     /// the feed, then closes the project, keeping its recovery file only if it has edits no save
-    /// holds (the app can't ask yet).
+    /// holds.
     ///
     /// # Errors
     ///

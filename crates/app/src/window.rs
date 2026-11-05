@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use render::surface::{Size, Target, WindowSurface};
+use ui::Theme;
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{
     ButtonSource, ElementState, MouseButton, MouseScrollDelta, PointerKind, PointerSource,
     StartCause, WindowEvent,
@@ -43,7 +44,9 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::camera::Pixel;
 use crate::cli::Options;
 use crate::frame::schedule::Next;
-use crate::frame::{BrushChange, GPU_POLL, GpuWait, LookChange, Setup};
+use crate::frame::{
+    BrushChange, CloseAnswer, GPU_POLL, GpuWait, LookChange, Setup, UiKey, WindowRequest,
+};
 use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
@@ -133,9 +136,11 @@ impl WindowApp {
             .take()
             .ok_or_else(|| anyhow!("the project was already taken"))?;
         let requested = PhysicalSize::new(self.options.size.width(), self.options.size.height());
+        let (least_width, least_height) = Theme::GLASS.window_min;
         let attributes = WindowAttributes::default()
             .with_title("BrushCraft")
-            .with_surface_size(requested);
+            .with_surface_size(requested)
+            .with_min_surface_size(LogicalSize::new(least_width, least_height));
         // The pen stream creates the window (undecorated) and starts our backend on it, so it
         // can hold the window for as long as the backend runs ([`crate::pen`]).
         let pen = AppPen::create_window(event_loop, attributes)?;
@@ -337,9 +342,10 @@ impl WindowApp {
         drop(done.send(outcome));
     }
 
-    /// The window was asked to close. The first time, the brush starts landing what it holds:
-    /// the loop runs on, frames and events, the title counting the dabs down, and ends as they
-    /// run out. Asked again, the window goes at once and the landing ends after it, unseen.
+    /// The window was asked to close. The owner decides whether that can happen yet
+    /// ([`crate::frame::Owner::ask_close`]): a bar may have to ask first, which answers here later
+    /// through [`crate::frame::Owner::take_request`]. A scripted run's second close takes the
+    /// window at once.
     fn close_requested(&mut self, event_loop: &dyn ActiveEventLoop) {
         let Some(running) = &mut self.running else {
             self.finish(event_loop, Ok(()));
@@ -349,6 +355,19 @@ impl WindowApp {
             self.finish(event_loop, Ok(()));
             return;
         }
+        if running.owner.ask_close(Instant::now()) == CloseAnswer::Now {
+            self.close_now(event_loop);
+        }
+    }
+
+    /// The window goes: the brush starts landing whatever it holds, the loop running on, frames
+    /// and events, the title counting the dabs down, and it ends as they run out. Asked again, the
+    /// window goes at once and the landing ends after it, unseen.
+    fn close_now(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(running) = &mut self.running else {
+            self.finish(event_loop, Ok(()));
+            return;
+        };
         running.closing = true;
         match running.owner.request_close() {
             Ok(()) if running.owner.ready_to_close() => self.finish(event_loop, Ok(())),
@@ -425,6 +444,10 @@ impl WindowApp {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                let ui_wants = ui_key(event.physical_key, running.modifiers, event.repeat);
+                if ui_wants.is_some_and(|key| owner.key(key, Instant::now())) {
+                    return;
+                }
                 if saves(event.physical_key, running.modifiers, event.repeat) {
                     owner.request_save(Instant::now());
                 } else if let Some(change) = brush_change(event.physical_key) {
@@ -445,10 +468,30 @@ impl WindowApp {
     }
 }
 
-/// Whether `key` with `modifiers` held is Ctrl+S: Ctrl alone, S by its place on the keyboard, as
-/// the other keys are, and not a held key's `repeat`. With Shift it stays free for Save As.
+/// Whether `key` with `modifiers` held is Ctrl+S: Ctrl alone (or Cmd alone on macOS), S by its
+/// place on the keyboard, as the other keys are, and not a held key's `repeat`. With Shift it stays
+/// free for Save As.
 fn saves(key: PhysicalKey, modifiers: ModifiersState, repeat: bool) -> bool {
-    !repeat && key == PhysicalKey::Code(KeyCode::KeyS) && modifiers == ModifiersState::CONTROL
+    let command = modifiers == ModifiersState::CONTROL
+        || (cfg!(target_os = "macos") && modifiers == ModifiersState::META);
+    !repeat && key == PhysicalKey::Code(KeyCode::KeyS) && command
+}
+
+/// The key the UI may want, if `key` with `modifiers` held is one: alone, and not a held key's
+/// `repeat`.
+fn ui_key(key: PhysicalKey, modifiers: ModifiersState, repeat: bool) -> Option<UiKey> {
+    if repeat || modifiers != ModifiersState::default() {
+        return None;
+    }
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "KeyCode is non-exhaustive, and the UI reads only these"
+    )]
+    match key {
+        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => Some(UiKey::Enter),
+        PhysicalKey::Code(KeyCode::Escape) => Some(UiKey::Escape),
+        _ => None,
+    }
 }
 
 /// The change of look a key makes, if it makes one: by the key's place on the keyboard, so
@@ -643,8 +686,14 @@ impl ApplicationHandler for WindowApp {
         if let Some(title) = running.owner.title_change() {
             running.window.set_title(&title);
         }
+        let request = running.owner.take_request();
         if driven.is_err() || running.owner.done() || running.owner.ready_to_close() {
             self.finish(event_loop, driven);
+            return;
+        }
+        match request {
+            Some(WindowRequest::Exit) => self.close_now(event_loop),
+            Some(WindowRequest::ExitDiscarding) | None => {}
         }
     }
 }
@@ -676,5 +725,33 @@ mod tests {
         assert!(!saves(other, ModifiersState::CONTROL, false), "Ctrl+A");
         let held = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert!(!saves(S, held, false), "Ctrl+Shift+S stays free");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_s_saves_on_macos() {
+        assert!(saves(S, ModifiersState::META, false));
+        assert!(saves(S, ModifiersState::CONTROL, false), "as Ctrl does");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn meta_s_is_the_desktops_elsewhere() {
+        assert!(!saves(S, ModifiersState::META, false));
+    }
+
+    #[test]
+    fn enter_and_escape_reach_the_ui_only_without_modifiers() {
+        let none = ModifiersState::default();
+        let enter = PhysicalKey::Code(KeyCode::Enter);
+        let escape = PhysicalKey::Code(KeyCode::Escape);
+        assert_eq!(ui_key(enter, none, false), Some(UiKey::Enter));
+        assert_eq!(ui_key(escape, none, false), Some(UiKey::Escape));
+        let numpad = PhysicalKey::Code(KeyCode::NumpadEnter);
+        assert_eq!(ui_key(numpad, none, false), Some(UiKey::Enter));
+        assert_eq!(ui_key(enter, none, true), None, "held down");
+        assert_eq!(ui_key(enter, ModifiersState::CONTROL, false), None);
+        assert_eq!(ui_key(escape, ModifiersState::SHIFT, false), None);
+        assert_eq!(ui_key(S, none, false), None, "another key");
     }
 }

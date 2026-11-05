@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::frame::{CloseAnswer, UiKey, WindowRequest};
 use crate::saving::{SaveStep, Stage};
 
 /// Where the tests' projects are saved in `dir`.
@@ -720,4 +721,146 @@ fn a_save_needs_no_frames() {
     assert!(!owner.project().has_unsaved_edits());
     owner.close().expect("closed");
     assert_eq!(records_on_disk(&dir), 1);
+}
+
+/// Runs passes of the window's loop until a close bar's save is over, the window's request left
+/// for the test to take.
+fn finish_closing_save(owner: &mut Owner<Sculpting, NoUploads>) {
+    finish_save(owner);
+    owner.save_step();
+}
+
+/// A failed save is the window's to survive: with `exit_after_save` set it stays, the edits and the
+/// recovery file with it, and the title says so.
+#[test]
+fn a_failed_save_after_asking_keeps_the_window() {
+    let dir = TestDir::new();
+    // Never saved: no path to save to.
+    let mut owner = owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 10_000);
+    let drawn = positions(owner.project());
+    let now = Instant::now();
+    assert_eq!(owner.ask_close(now), CloseAnswer::Asked);
+    assert!(owner.key(UiKey::Enter, now), "Save");
+    drop(owner.title_change());
+    finish_closing_save(&mut owner);
+    assert_eq!(owner.take_request(), None, "the window stays");
+    assert!(!owner.ready_to_close(), "nothing is on its way out");
+    assert!(
+        !owner.close_held(),
+        "and no close waits: that was a scripted run's"
+    );
+    let title = owner.title_change().expect("it says so");
+    assert!(title.contains("save failed"), "{title}");
+    assert!(title.starts_with('*'), "still unsaved: {title}");
+    assert_eq!(positions(owner.project()), drawn, "nothing lost");
+
+    // The bar went, and the user can go on: a close asks again.
+    assert!(!owner.key(UiKey::Escape, Instant::now()), "no bar left");
+    queue(&mut owner, stroke(((150.0, 80.0), (170.0, 120.0)), 6));
+    run(&mut owner, 10_000);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    owner.close().expect("closed");
+    assert_eq!(recovery_files(&dir), 1, "its edits are there");
+}
+
+/// Dabs dropped while the bar's save lands fail it as any: the window stays.
+#[test]
+fn a_save_after_asking_with_dabs_dropped_keeps_the_window() {
+    let (_dir, mut owner, heavy) = lifecycle::at_the_budgets_edge();
+    owner.brush_mut().held.extend(heavy.into_iter().map(Some));
+    let now = Instant::now();
+    owner.request_save(now);
+    assert_eq!(owner.ask_close(now), CloseAnswer::Asked);
+    // No frames between the steps, as a close's test: they would let the pins go.
+    let mut steps = 0;
+    while owner.save_stage().is_some() {
+        owner.save_step();
+        steps += 1;
+        assert!(steps < 10_000, "the save ends");
+    }
+    owner.save_step();
+    assert_eq!(owner.take_request(), None, "not saved: the window stays");
+    let title = owner.title_change().expect("it says so");
+    assert!(title.contains("save failed"), "{title}");
+    owner.close().expect("closed");
+}
+
+/// Everything drawn is in the file before the window goes, the stroke that waited for an earlier
+/// save too: the close bar's Save is a promise to keep all of it.
+#[test]
+fn a_stroke_that_waited_for_the_save_is_saved_before_the_window_goes() {
+    let dir = TestDir::new();
+    let mut owner = slow_owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 1);
+    owner.request_save(Instant::now());
+    owner.save_step();
+    queue(
+        &mut owner,
+        stroke_after_ctrl_s(((150.0, 80.0), (170.0, 120.0)), 6),
+    );
+    run(&mut owner, 1);
+    assert!(!owner.brush().deferred.is_empty(), "the second waits");
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    let mut request = None;
+    let mut passes = 0;
+    while request.is_none() {
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        run(&mut owner, 1);
+        request = owner.take_request();
+        passes += 1;
+        assert!(passes < 100_000, "it ends");
+    }
+    assert_eq!(request, Some(WindowRequest::Exit));
+    assert!(!owner.project().has_unsaved_edits(), "all of it saved");
+    owner.close().expect("closed");
+    assert_eq!(records_on_disk(&dir), 2, "both strokes");
+    assert_eq!(recovery_files(&dir), 0, "nothing unsaved");
+}
+
+/// A stroke that drew nothing has nothing to save: Save goes all the same.
+#[test]
+fn saving_nothing_after_asking_exits() {
+    let dir = TestDir::new();
+    let mut owner = owner_of(saved_project(&dir), Sculpting::new, setup());
+    run(&mut owner, 10_000);
+    owner.pen(sample(Phase::Down, (1.0, 1.0), 0.5));
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    owner.pen(sample(Phase::Up, (1.0, 1.0), 0.0));
+    run(&mut owner, 100);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    owner.save_step();
+    assert_eq!(owner.take_request(), Some(WindowRequest::Exit));
+    owner.close().expect("closed");
+}
+
+/// A stroke on the model during the bar's save cancels the exit, and waits for the save.
+#[test]
+fn a_stroke_while_finishing_stays_out_of_the_save_and_the_window_stays() {
+    let dir = TestDir::new();
+    let mut owner = slow_owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 1);
+    let now = Instant::now();
+    assert_eq!(owner.ask_close(now), CloseAnswer::Asked);
+    assert!(owner.key(UiKey::Enter, now), "Save");
+    queue(
+        &mut owner,
+        stroke_after_ctrl_s(((150.0, 80.0), (170.0, 120.0)), 6),
+    );
+    run(&mut owner, 1);
+    assert!(!owner.brush().deferred.is_empty(), "it waits");
+    finish_closing_save(&mut owner);
+    assert_eq!(owner.take_request(), None, "cancelled");
+    assert_eq!(records_on_disk(&dir), 1, "the first stroke alone");
+    run(&mut owner, 10_000);
+    assert!(owner.project().has_unsaved_edits(), "the second is unsaved");
+    owner.close().expect("closed");
 }

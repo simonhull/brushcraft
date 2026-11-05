@@ -47,6 +47,11 @@
 //!
 //! If that save fails the window stays, saying so: the user asked for it. Ctrl+S tries again, and
 //! a further close takes the window, the recovery file kept, the failure an error of the run.
+//!
+//! That close is a scripted run's. With a person at the window a close never lands anything: it
+//! asks, on a bar ([`crate::dialogs`]), and Save on the bar is an ordinary save that can still be
+//! cancelled, the window exiting once it has succeeded ([`crate::frame::Owner::ask_close`]). If it
+//! fails the window stays, the bar goes, and the title says so.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -184,6 +189,20 @@ impl Saving {
     /// Why a save failed with the window closing, if one did and hasn't been tried again.
     pub(crate) fn failed_closing(&self) -> Option<&str> {
         self.failed_closing.as_deref()
+    }
+
+    /// The name the project goes by.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Whether the last save went through, or had nothing to do; `None` until one ends.
+    pub(crate) const fn last_succeeded(&self) -> Option<bool> {
+        match &self.outcome {
+            Some(Outcome::Done(_)) => Some(true),
+            Some(Outcome::Failed(_)) => Some(false),
+            None => None,
+        }
     }
 
     /// A save was asked for at `now`, the brush having dropped dabs `drops` times.
@@ -349,6 +368,20 @@ mod tests {
     /// A project called `sphere`.
     fn saving() -> Saving {
         Saving::new(Some(Path::new("/some/where/sphere.bcrf")), Instant::now())
+    }
+
+    #[test]
+    fn the_last_outcome_is_known_until_the_next_save_starts() {
+        let mut saving = saving();
+        assert_eq!(saving.last_succeeded(), None, "no save yet");
+        saving.nothing_to_save();
+        assert_eq!(saving.last_succeeded(), Some(true), "nothing lost");
+        saving.start(Instant::now(), 0);
+        assert_eq!(saving.last_succeeded(), None, "a save under way");
+        saving.failed(&anyhow!("no room"), false);
+        assert_eq!(saving.last_succeeded(), Some(false));
+        saving.start(Instant::now(), 0);
+        assert_eq!(saving.last_succeeded(), None, "forgotten");
     }
 
     #[test]

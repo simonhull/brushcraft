@@ -215,8 +215,12 @@ pub struct Theme {
     pub chip_pen_down: f32,
     /// How long "Saved" stays before it fades.
     pub saved_hold: Duration,
+    /// The least time between steps of a progress line, so its list isn't rebuilt every frame.
+    pub progress_step: Duration,
     /// Glass alpha where the pass can only blend in linear light, which lightens glass.
     pub glass_alpha_linear: f32,
+    /// The smallest a window may be, logical pixels: a bar's controls always fit.
+    pub window_min: (u32, u32),
 }
 
 impl Theme {
@@ -261,7 +265,9 @@ impl Theme {
         fade: Duration::from_millis(120),
         chip_pen_down: 0.25,
         saved_hold: Duration::from_secs(2),
+        progress_step: Duration::from_millis(100),
         glass_alpha_linear: 0.9,
+        window_min: (640, 400),
     };
 
     /// This theme for a renderer that blends as `blend` says: as it is in display values, and with

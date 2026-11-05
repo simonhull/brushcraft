@@ -1,11 +1,11 @@
 //! What the UI shows and when: the app's whole UI state, on top of the `ui` crate.
 //!
 //! `ui` knows widgets and nothing of projects; this says which ones the project's state calls for,
-//! in the user's words. For now that is the save chip. The owner thread brings it up to date once
-//! a frame, after the pen's work ([`Dialogs::update`]), and what it shows goes to the render thread
-//! with the frame. The pen touches only the fades ([`Dialogs::pen_down`], [`Dialogs::pen_up`]), and
-//! a chip where there was none waits for it to lift, so nothing appears, and no atlas uploads,
-//! during a stroke.
+//! in the user's words: the save chip, and the bar's [`Prompt`]. The owner thread brings it up to
+//! date once a frame, after the pen's work ([`Dialogs::update`]), and what it shows goes to the
+//! render thread with the frame. The pen touches only the fades ([`Dialogs::pen_down`],
+//! [`Dialogs::pen_up`]), and a chip where there was none, or a bar that changed, waits for it to
+//! lift, so nothing appears, and no atlas uploads, during a stroke.
 //!
 //! **Routing:** with a bar up, a `Down` or a press goes here first ([`Dialogs::claim`],
 //! [`Dialogs::claim_mouse`]). One on the bar is the UI's, whole: the stroke's other samples stop
@@ -16,17 +16,13 @@
 use std::time::Instant;
 
 use render::surface::Size;
-use ui::{Blend, Chip, Mark, Theme, Ui, UiFrame};
+use ui::{Bar, Blend, Chip, Control, Emphasis, Mark, Theme, Ui, UiFrame};
 
 use crate::camera::Pixel;
 use crate::navigate::Button;
 
 /// What a control on a bar does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "the UI's actions: nothing makes them until the bars that offer them"
-)]
 pub(crate) enum Action {
     /// Save, then go on with what was asked.
     Save,
@@ -37,14 +33,22 @@ pub(crate) enum Action {
     /// Stop what's under way.
     Cancel,
     /// Try a failed save again.
+    #[expect(dead_code, reason = "the failure bar will offer it")]
     TryAgain,
     /// Put the bar away.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the failure bar will offer it"))]
     Dismiss,
     /// Open the project from its last save.
+    #[expect(dead_code, reason = "the restore note will offer it")]
     UseLastSave,
     /// Open found work as a copy.
+    #[expect(dead_code, reason = "the earlier-version note will offer it")]
     OpenCopy,
     /// Leave found work where it is.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the earlier-version note will offer it")
+    )]
     Ignore,
 }
 
@@ -83,6 +87,8 @@ pub(crate) struct Facts {
     pub(crate) unsaved: bool,
     /// Whether a save is under way.
     pub(crate) saving: bool,
+    /// How many dabs the save under way still waits for.
+    pub(crate) landing: usize,
 }
 
 /// What the chip has to say.
@@ -114,6 +120,75 @@ impl Status {
             Self::Saved => chip("Saved", Mark::None),
         }
     }
+}
+
+/// What the bottom bar is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prompt {
+    /// Nothing.
+    None,
+    /// "Save changes to `name`?"
+    AskClose {
+        /// The project's name.
+        name: String,
+    },
+    /// A save the window exits after, with a progress line. It says "Finishing your stroke" while
+    /// dabs land, and "Saving" once the save is writing.
+    Finishing {
+        /// The dabs left to land when it began.
+        from: usize,
+        /// The dabs left to land as the bar last said.
+        left: usize,
+        /// When the bar last said so: it says so again [`Theme::progress_step`] later at the
+        /// soonest.
+        said_at: Instant,
+    },
+}
+
+impl Prompt {
+    /// The bar that says it.
+    fn bar(&self) -> Option<Bar<Action>> {
+        let quiet = |label: &str, action| Control {
+            label: label.to_owned(),
+            action,
+            emphasis: Emphasis::Quiet,
+        };
+        match self {
+            Self::None => None,
+            Self::AskClose { name } => {
+                let save = Control {
+                    label: "Save".to_owned(),
+                    action: Action::Save,
+                    emphasis: Emphasis::Filled,
+                };
+                let controls = vec![
+                    quiet("Don't save", Action::DontSave),
+                    quiet("Keep sculpting", Action::KeepSculpting),
+                    save,
+                ];
+                Some(Bar::new(format!("Save changes to {name}?"), controls))
+            }
+            Self::Finishing { from, left, .. } => {
+                let title = if *left > 0 {
+                    "Finishing your stroke"
+                } else {
+                    "Saving"
+                };
+                let cancel = quiet("Cancel", Action::Cancel);
+                Some(Bar::new(title, vec![cancel]).with_progress(progress(*left, *from)))
+            }
+        }
+    }
+}
+
+/// How far along a wait is with `left` of `from` still to go, 0 to 1.
+fn progress(left: usize, from: usize) -> f32 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a progress line is a few hundred pixels: f32 is far finer"
+    )]
+    let share = left as f32 / from.max(1) as f32;
+    (1.0 - share).max(0.0)
 }
 
 /// Who has the pointer's input: the bar, and what it has been pressed with.
@@ -155,6 +230,10 @@ pub(crate) struct Dialogs {
     pen_is_down: bool,
     /// Whether a chip is waiting for the pen to lift.
     waiting: bool,
+    /// What the bar is about.
+    prompt: Prompt,
+    /// The bar isn't saying what `prompt` does, for the pen is down.
+    prompt_waiting: bool,
     /// Input on its way to the bar.
     routing: Routing,
     /// How many hit tests were made.
@@ -199,6 +278,8 @@ impl Dialogs {
             saved_at: None,
             pen_is_down: false,
             waiting: false,
+            prompt: Prompt::None,
+            prompt_waiting: false,
             routing: Routing::default(),
             #[cfg(test)]
             hit_tests: std::cell::Cell::new(0),
@@ -222,8 +303,9 @@ impl Dialogs {
         changed
     }
 
-    /// Brings the chip up to date; cheap when nothing changed, as nearly always. A chip where there
-    /// was none waits for the pen to lift; one already showing changes at once.
+    /// Brings the chip and the bar's progress up to date; cheap when nothing changed, as nearly
+    /// always. A chip where there was none waits for the pen to lift; one already showing changes
+    /// at once.
     pub(crate) fn update(&mut self, facts: Facts, now: Instant) {
         let status = self.next_status(facts, now);
         let arriving = self.status == Status::Quiet && status != Status::Quiet;
@@ -232,6 +314,68 @@ impl Dialogs {
             self.status = status;
             self.ui.set_chip(status.chip(), now);
         }
+        self.update_progress(facts.landing, now);
+    }
+
+    /// Moves the progress line to `landing` dabs left, if it is due to move: every
+    /// [`Theme::progress_step`], so the list isn't rebuilt each frame, and at once as the title
+    /// changes.
+    fn update_progress(&mut self, landing: usize, now: Instant) {
+        let Prompt::Finishing { left, said_at, .. } = &mut self.prompt else {
+            return;
+        };
+        let due = now.saturating_duration_since(*said_at) >= Theme::GLASS.progress_step;
+        let new_title = (landing == 0) != (*left == 0);
+        if landing != *left && (due || new_title) {
+            *left = landing;
+            *said_at = now;
+            self.show_prompt(now);
+        }
+    }
+
+    /// Puts the prompt on the bar, or leaves it for the `Up` with the pen down: nothing is laid out
+    /// under a stroke, and no bar can appear there.
+    fn show_prompt(&mut self, now: Instant) {
+        self.routing.bar_up = self.prompt != Prompt::None;
+        self.routing.update();
+        self.prompt_waiting = self.pen_is_down;
+        if !self.prompt_waiting {
+            self.ui.set_bar(self.prompt.bar(), now);
+        }
+    }
+
+    /// Asks whether to save `name`, the project, before the window closes.
+    pub(crate) fn ask_close(&mut self, name: &str, now: Instant) {
+        self.prompt = Prompt::AskClose {
+            name: name.to_owned(),
+        };
+        self.show_prompt(now);
+    }
+
+    /// Says a save the window exits after is under way, `from` dabs left to land.
+    pub(crate) fn finish(&mut self, from: usize, now: Instant) {
+        self.prompt = Prompt::Finishing {
+            from,
+            left: from,
+            said_at: now,
+        };
+        self.show_prompt(now);
+    }
+
+    /// Takes the bar away.
+    pub(crate) fn clear_prompt(&mut self, now: Instant) {
+        self.prompt = Prompt::None;
+        self.show_prompt(now);
+    }
+
+    /// Whether the bar asks about closing.
+    pub(crate) const fn asking_close(&self) -> bool {
+        matches!(self.prompt, Prompt::AskClose { .. })
+    }
+
+    /// Whether the bar says a save the window exits after is under way.
+    pub(crate) const fn finishing(&self) -> bool {
+        matches!(self.prompt, Prompt::Finishing { .. })
     }
 
     /// A save finished at `now`: "Saved" shows for its while, whether or not a frame saw the save.
@@ -276,9 +420,12 @@ impl Dialogs {
         self.ui.pen_down(now);
     }
 
-    /// The pen lifted: everything comes back.
+    /// The pen lifted: everything comes back, and a bar that waited for it arrives.
     pub(crate) fn pen_up(&mut self, now: Instant) {
         self.pen_is_down = false;
+        if self.prompt_waiting {
+            self.show_prompt(now);
+        }
         self.ui.pen_up(now);
     }
 
@@ -380,13 +527,6 @@ impl Dialogs {
         self.routing.pointer = at;
         self.ui.hover(at.map(ui_point))
     }
-
-    /// Takes the bar away.
-    pub(crate) fn clear_bar(&mut self, now: Instant) {
-        self.routing.bar_up = false;
-        self.routing.update();
-        self.ui.set_bar(None, now);
-    }
 }
 
 /// What the frame loop's tests need of a bar: one to show, and where its parts are.
@@ -394,7 +534,7 @@ impl Dialogs {
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 impl Dialogs {
     /// Shows `bar`, as seen: its fade began long enough ago to be over.
-    pub(crate) fn show_bar(&mut self, bar: ui::Bar<Action>) {
+    pub(crate) fn show_bar(&mut self, bar: Bar<Action>) {
         let seen = Instant::now().checked_sub(Theme::GLASS.fade * 2);
         self.ui
             .set_bar(Some(bar), seen.expect("the clock is past a fade"));
@@ -405,6 +545,11 @@ impl Dialogs {
     /// Whether a bar is meant to show.
     pub(crate) const fn bar_showing(&self) -> bool {
         self.routing.bar_up
+    }
+
+    /// The bar as it should be.
+    pub(crate) fn bar(&self) -> Option<Bar<Action>> {
+        self.prompt.bar()
     }
 
     /// How many hit tests were made.
@@ -458,18 +603,21 @@ mod tests {
     const CLEAN: Facts = Facts {
         unsaved: false,
         saving: false,
+        landing: 0,
     };
 
     /// Edits, no save.
     const EDITED: Facts = Facts {
         unsaved: true,
         saving: false,
+        landing: 0,
     };
 
     /// A save of edits under way.
     const SAVING: Facts = Facts {
         unsaved: true,
         saving: true,
+        landing: 0,
     };
 
     /// Dialogs in a window of 800 × 600, showing nothing.
@@ -656,5 +804,163 @@ mod tests {
         assert_eq!(dialogs.size, (800, 600), "minimised");
         dialogs.resize(Size::new(640, 480));
         assert_eq!(dialogs.size, (640, 480), "resized");
+    }
+
+    /// A save under way, with `landing` dabs left.
+    const fn landing(landing: usize) -> Facts {
+        Facts { landing, ..SAVING }
+    }
+
+    /// Whether a bar's fade heads up at `now`.
+    fn bar_rising(dialogs: &mut Dialogs, now: Instant) -> bool {
+        dialogs
+            .frame(now)
+            .is_some_and(|frame| frame.fades[0].to > 0.5)
+    }
+
+    #[test]
+    fn the_close_bar_says_it_in_the_users_words() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.ask_close("first-sculpt", now);
+        let quiet = |label: &str, action| Control {
+            label: label.to_owned(),
+            action,
+            emphasis: Emphasis::Quiet,
+        };
+        let save = Control {
+            label: "Save".to_owned(),
+            action: Action::Save,
+            emphasis: Emphasis::Filled,
+        };
+        let controls = vec![
+            quiet("Don't save", Action::DontSave),
+            quiet("Keep sculpting", Action::KeepSculpting),
+            save,
+        ];
+        let bar = Bar::new("Save changes to first-sculpt?", controls);
+        assert_eq!(dialogs.bar(), Some(bar));
+    }
+
+    #[test]
+    fn finishing_says_saving_once_nothing_is_left_to_land() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        let cancel = || Control {
+            label: "Cancel".to_owned(),
+            action: Action::Cancel,
+            emphasis: Emphasis::Quiet,
+        };
+        dialogs.finish(10, now);
+        let finishing = Bar::new("Finishing your stroke", vec![cancel()]).with_progress(0.0);
+        assert_eq!(dialogs.bar(), Some(finishing), "no counts");
+        dialogs.update(landing(0), now);
+        let saving = Bar::new("Saving", vec![cancel()]).with_progress(1.0);
+        assert_eq!(dialogs.bar(), Some(saving), "at once, whatever the time");
+    }
+
+    #[test]
+    fn nothing_to_land_goes_straight_to_saving() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.finish(0, now);
+        let cancel = Control {
+            label: "Cancel".to_owned(),
+            action: Action::Cancel,
+            emphasis: Emphasis::Quiet,
+        };
+        let saving = Bar::new("Saving", vec![cancel]).with_progress(1.0);
+        assert_eq!(dialogs.bar(), Some(saving));
+    }
+
+    #[test]
+    fn progress_moves_at_most_every_100_ms_and_the_list_rebuilds_no_oftener() {
+        let now = Instant::now();
+        let step = Theme::GLASS.progress_step;
+        let mut dialogs = dialogs(now);
+        dialogs.update(landing(10), now);
+        dialogs.finish(10, now);
+        let first = dialogs.frame(now).expect("the bar");
+
+        let early = now + step / 2;
+        dialogs.update(landing(5), early);
+        let same = dialogs.frame(early).expect("the bar");
+        assert!(Arc::ptr_eq(&first.list, &same.list), "too soon");
+
+        let due = now + step;
+        dialogs.update(landing(5), due);
+        let moved = dialogs.frame(due).expect("the bar");
+        assert!(!Arc::ptr_eq(&first.list, &moved.list), "due");
+        assert!(dialogs.needs_frame(due), "and it wants the frame");
+    }
+
+    #[test]
+    fn progress_never_runs_backwards_past_nothing() {
+        assert!(progress(20, 10).abs() < 1e-6, "more than it began with");
+        assert!((progress(5, 10) - 0.5).abs() < 1e-6, "half");
+        assert!((progress(0, 0) - 1.0).abs() < 1e-6, "nothing to wait for");
+    }
+
+    #[test]
+    fn a_prompt_under_the_pen_waits_for_the_up_and_builds_nothing() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.update(EDITED, now);
+        let before = dialogs.frame(now).expect("the chip");
+        dialogs.pen_down(now);
+        dialogs.ask_close("first-sculpt", now);
+        assert!(dialogs.routes(), "input goes through here");
+        let during = dialogs.frame(now).expect("the chip");
+        assert!(Arc::ptr_eq(&before.list, &during.list), "nothing laid out");
+        assert!(!bar_rising(&mut dialogs, now), "and nothing shows");
+
+        let later = now + Theme::GLASS.fade * 3;
+        dialogs.update(EDITED, later);
+        assert!(!bar_rising(&mut dialogs, later), "however long it takes");
+
+        dialogs.pen_up(later);
+        assert!(bar_rising(&mut dialogs, later), "here it comes");
+        assert!(dialogs.needs_frame(later), "in frames of its own");
+    }
+
+    #[test]
+    fn a_prompt_taken_away_under_the_pen_never_comes_back() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.ask_close("first-sculpt", now);
+        let seen = now + Theme::GLASS.fade;
+        dialogs.pen_down(seen);
+        dialogs.clear_prompt(seen);
+        assert!(!dialogs.routes(), "the bar's over");
+        dialogs.pen_up(seen);
+        assert!(!bar_rising(&mut dialogs, seen), "it stays gone");
+    }
+
+    #[test]
+    fn every_bar_fits_the_smallest_window_at_any_scale() {
+        let now = Instant::now();
+        let (width, height) = Theme::GLASS.window_min;
+        for scale in [1.0, 1.25, 2.0] {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a small whole window size"
+            )]
+            let size = Size::new(
+                (f64::from(width) * scale) as u32,
+                (f64::from(height) * scale) as u32,
+            );
+            let mut dialogs = Dialogs::new(size, scale, Blend::Display, now);
+            let seen = now + Theme::GLASS.fade;
+            dialogs.ask_close("a project with a name as long as anyone will give it", now);
+            for action in [Action::DontSave, Action::KeepSculpting, Action::Save] {
+                let mut points = dialogs.grid();
+                let found = points.find(|&at| {
+                    let (x, y) = ui_point(at);
+                    dialogs.ui.hit(x, y, seen) == Some(action)
+                });
+                assert!(found.is_some(), "{action:?} at {scale}");
+            }
+        }
     }
 }
