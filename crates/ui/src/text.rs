@@ -49,6 +49,15 @@ pub struct AtlasImage {
 }
 
 impl AtlasImage {
+    /// An atlas of the first size with nothing in it.
+    fn empty(version: u64) -> Self {
+        Self {
+            size: ATLAS_SIZE,
+            texels: vec![0; (ATLAS_SIZE * ATLAS_SIZE) as usize],
+            version,
+        }
+    }
+
     /// `coverage`, `width` wide, copied in at `at`, which the caller has reserved inside the image.
     fn put(&mut self, at: (u32, u32), width: usize, coverage: &[u8]) {
         let side = self.size as usize;
@@ -172,14 +181,22 @@ impl Text {
             medium: face(MEDIUM),
             semi_bold: face(SEMI_BOLD),
             glyphs: HashMap::new(),
-            atlas: Arc::new(AtlasImage {
-                size: ATLAS_SIZE,
-                texels: vec![0; (ATLAS_SIZE * ATLAS_SIZE) as usize],
-                version: 0,
-            }),
+            atlas: Arc::new(AtlasImage::empty(0)),
             shelves: Vec::new(),
             shelves_end: 0,
         }
+    }
+
+    /// Forgets every glyph: a new, empty atlas, with a higher version so a renderer uploads it.
+    ///
+    /// Lines laid out before this point into the old atlas. Frames in flight keep that one, and
+    /// anything still to be drawn must be laid out again.
+    pub fn reset(&mut self) {
+        let version = self.atlas.version + 1;
+        self.atlas = Arc::new(AtlasImage::empty(version));
+        self.glyphs.clear();
+        self.shelves.clear();
+        self.shelves_end = 0;
     }
 
     /// Rasterises printable ASCII for `sizes`, physical px.
@@ -225,6 +242,12 @@ impl Text {
     #[must_use]
     pub const fn atlas(&self) -> &Arc<AtlasImage> {
         &self.atlas
+    }
+
+    /// How many glyphs it has been asked for.
+    #[cfg(test)]
+    pub(crate) fn held_glyphs(&self) -> usize {
+        self.glyphs.len()
     }
 
     /// The face of a weight.
@@ -522,6 +545,33 @@ mod tests {
         );
         let again = text.line("E", Weight::Regular, 40.0).glyphs[0];
         assert_eq!(again.atlas, first.atlas, "and the cache still points at it");
+    }
+
+    #[test]
+    fn a_reset_empties_the_atlas_and_leaves_frames_in_flight_theirs() {
+        let mut text = Text::new();
+        text.warm(&[(Weight::Regular, 200.0)]);
+        let in_flight = Arc::clone(text.atlas());
+        assert_eq!(in_flight.size, 2048, "grown");
+
+        text.reset();
+        assert!(
+            text.atlas().version > in_flight.version,
+            "a renderer uploads it"
+        );
+        assert_eq!(text.atlas().size, 1024, "the first size again");
+        assert!(text.atlas().texels.iter().all(|&texel| texel == 0), "empty");
+        assert!(
+            in_flight.texels.iter().any(|&texel| texel > 0),
+            "theirs stays"
+        );
+
+        let line = text.line("E", Weight::Regular, 40.0);
+        assert_eq!(line.glyphs[0].atlas, (0, 0), "packing starts again");
+        assert!(
+            text.atlas().texels.iter().any(|&texel| texel > 0),
+            "and fills"
+        );
     }
 
     #[test]

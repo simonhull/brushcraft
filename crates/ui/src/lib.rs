@@ -86,7 +86,8 @@ impl<A: Copy + PartialEq> Ui<A> {
         ui
     }
 
-    /// Moves to a window of `size` at `scale`. A new scale rasterises printable ASCII for it.
+    /// Moves to a window of `size` at `scale`. A new scale starts the atlas afresh with printable
+    /// ASCII at its sizes, so scales passed through never fill it.
     pub fn set_view(&mut self, size: (u32, u32), scale: f32) {
         let next = view(size, scale);
         if next == self.view {
@@ -95,6 +96,7 @@ impl<A: Copy + PartialEq> Ui<A> {
         let rescaled = (next.scale - self.view.scale).abs() > f32::EPSILON;
         self.view = next;
         if rescaled {
+            self.text.reset();
             self.warm();
         }
         if let Some(shown) = &mut self.bar {
@@ -166,7 +168,11 @@ impl<A: Copy + PartialEq> Ui<A> {
     pub fn hit(&self, x: f32, y: f32) -> Option<A> {
         let shown = self.live_bar()?;
         let at = shown.layout.control_at(x, y)?;
-        shown.widget.controls.get(at).map(|control| control.action)
+        shown
+            .widget
+            .controls()
+            .get(at)
+            .map(|control| control.action)
     }
 
     /// Whether the point is on the bar's glass at all.
@@ -334,14 +340,19 @@ mod tests {
         }
     }
 
-    /// The close bar: actions 1, 2 and 3.
-    fn close_bar() -> Bar<u8> {
+    /// The close bar's controls, under another title: actions 1, 2 and 3.
+    fn bar_titled(title: impl Into<String>) -> Bar<u8> {
         let controls = vec![
             quiet("Don't save", 1),
             quiet("Keep sculpting", 2),
             filled("Save", 3),
         ];
-        Bar::new("Save changes to first-sculpt?", controls)
+        Bar::new(title, controls)
+    }
+
+    /// The close bar.
+    fn close_bar() -> Bar<u8> {
+        bar_titled("Save changes to first-sculpt?")
     }
 
     /// A chip with a dot.
@@ -414,9 +425,7 @@ mod tests {
         let second = ui.frame(after_a_fade(now)).expect("still");
         assert!(Arc::ptr_eq(&first.list, &second.list), "nothing changed");
 
-        let mut other = close_bar();
-        other.title = "Something else".to_owned();
-        ui.set_bar(Some(other), now);
+        ui.set_bar(Some(bar_titled("Something else")), now);
         let third = ui.frame(now).expect("still");
         assert!(!Arc::ptr_eq(&first.list, &third.list), "the title changed");
     }
@@ -448,9 +457,7 @@ mod tests {
         assert!(!ui.animating(later), "in");
         assert!(near(frame.fades[0].at(later), 1.0), "to full");
 
-        let mut other = close_bar();
-        other.title = "Something else".to_owned();
-        ui.set_bar(Some(other), later);
+        ui.set_bar(Some(bar_titled("Something else")), later);
         assert!(!ui.animating(later), "a swap doesn't fade");
     }
 
@@ -536,9 +543,7 @@ mod tests {
         ui.pen_down(now);
         for step in 0..5 {
             let then = now + Duration::from_millis(step * 40);
-            let mut bar = close_bar();
-            bar.title = format!("Bar {step}");
-            ui.set_bar(Some(bar), then);
+            ui.set_bar(Some(bar_titled(format!("Bar {step}"))), then);
             let frame = ui.frame(then).expect("the chip shows");
             assert!(near(frame.fades[0].at(then), 0.0), "step {step}");
         }
@@ -717,9 +722,8 @@ mod tests {
         let now = Instant::now();
         let theme = Theme::GLASS;
         let mut ui = new_ui(now);
-        let with_progress = |progress| Bar {
-            progress: Some(progress),
-            ..Bar::new("Finishing your stroke", vec![quiet("Cancel", 1)])
+        let with_progress = |progress| {
+            Bar::new("Finishing your stroke", vec![quiet("Cancel", 1)]).with_progress(progress)
         };
         ui.set_bar(Some(with_progress(0.25)), now);
         let before = ui.frame(now).expect("a bar shows");
@@ -856,11 +860,7 @@ mod tests {
         );
         let title_x = plain.list.glyphs[0].rect.x;
 
-        let failure = Bar {
-            needs_you: true,
-            ..close_bar()
-        };
-        ui.set_bar(Some(failure), now);
+        ui.set_bar(Some(close_bar().needing_you()), now);
         let frame = ui.frame(now).expect("a bar shows");
         assert_eq!(
             frame.list.rects[0].stroke, theme.needs_you_hairline,
@@ -879,10 +879,8 @@ mod tests {
         let now = Instant::now();
         let theme = Theme::GLASS;
         let mut ui = new_ui(now);
-        let bar = Bar {
-            detail: Some("From yesterday at 16:42".to_owned()),
-            ..Bar::new("Your unsaved work is back", vec![quiet("Use last save", 1)])
-        };
+        let bar = Bar::new("Your unsaved work is back", vec![quiet("Use last save", 1)])
+            .with_detail("From yesterday at 16:42");
         ui.set_bar(Some(bar), now);
         let frame = ui.frame(now).expect("a bar shows");
         let top = |glyphs: Vec<GlyphQuad>| {
@@ -897,8 +895,8 @@ mod tests {
     #[test]
     fn only_the_first_filled_control_stays_filled() {
         let bar = Bar::new("Two", vec![filled("One", 1), filled("Two", 2)]);
-        assert_eq!(bar.controls[0].emphasis, Emphasis::Filled, "the first");
-        assert_eq!(bar.controls[1].emphasis, Emphasis::Quiet, "the second");
+        assert_eq!(bar.controls()[0].emphasis, Emphasis::Filled, "the first");
+        assert_eq!(bar.controls()[1].emphasis, Emphasis::Quiet, "the second");
     }
 
     #[test]
@@ -918,6 +916,54 @@ mod tests {
 
         ui.set_bar(Some(Bar::new("Fresh words", vec![quiet("Fine", 1)])), now);
         assert_eq!(ui.text.atlas().version, version, "the atlas was ready");
+    }
+
+    #[test]
+    fn scales_passed_through_leave_nothing_in_the_atlas() {
+        let now = Instant::now();
+        let mut ui = new_ui(now);
+        ui.set_bar(Some(close_bar()), now);
+        ui.set_chip(Some(unsaved()), now);
+        ui.set_view(WINDOW, 3.0);
+        let held = ui.text.held_glyphs();
+        let old = ui.frame(now).expect("both show");
+
+        for step in 1..200_u16 {
+            ui.set_view(WINDOW, 1.0 + f32::from(step) / 100.0);
+        }
+        ui.set_view(WINDOW, 3.0);
+        assert_eq!(ui.text.held_glyphs(), held, "this scale's glyphs, no more");
+        let new = ui.frame(now).expect("both show");
+        assert!(
+            new.atlas.version > old.atlas.version,
+            "a renderer uploads it"
+        );
+        let side = new.atlas.size as usize;
+        for glyph in &new.list.glyphs {
+            let (x, y) = (glyph.atlas.0 as usize, glyph.atlas.1 as usize);
+            let top_left = y * side + x;
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a glyph's size is a small whole number"
+            )]
+            let (w, h) = (glyph.rect.w as usize, glyph.rect.h as usize);
+            let rows = new.atlas.texels[top_left..].chunks(side).take(h);
+            let mut inked = rows.flat_map(|row| &row[..w]);
+            assert!(
+                inked.any(|&texel| texel > 0),
+                "{glyph:?} is in the new atlas"
+            );
+        }
+    }
+
+    #[test]
+    fn a_move_with_no_new_scale_keeps_the_atlas() {
+        let now = Instant::now();
+        let mut ui = new_ui(now);
+        let version = ui.text.atlas().version;
+        ui.set_view((640, 480), 1.0);
+        assert_eq!(ui.text.atlas().version, version, "the same glyphs serve");
     }
 
     #[test]

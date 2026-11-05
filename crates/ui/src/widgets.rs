@@ -28,19 +28,19 @@ pub struct Control<A> {
     pub emphasis: Emphasis,
 }
 
-/// A prompt along the bottom edge.
+/// A prompt along the bottom edge. Made by [`Bar::new`], which holds it to one filled control.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bar<A> {
     /// What it says.
-    pub title: String,
+    title: String,
     /// More, in quieter text under the title.
-    pub detail: Option<String>,
+    detail: Option<String>,
     /// 0 to 1: draws the progress line.
-    pub progress: Option<f32>,
+    progress: Option<f32>,
     /// A coral hairline: this needs the user.
-    pub needs_you: bool,
-    /// Its controls, left to right.
-    pub controls: Vec<Control<A>>,
+    needs_you: bool,
+    /// Its controls, left to right, at most one of them filled.
+    controls: Vec<Control<A>>,
 }
 
 impl<A> Bar<A> {
@@ -59,6 +59,39 @@ impl<A> Bar<A> {
             needs_you: false,
             controls,
         }
+    }
+
+    /// This bar with more to say, in quieter text under the title.
+    #[must_use]
+    pub fn with_detail(self, detail: impl Into<String>) -> Self {
+        Self {
+            detail: Some(detail.into()),
+            ..self
+        }
+    }
+
+    /// This bar with a progress line, `progress` of the way along, 0 to 1.
+    #[must_use]
+    pub fn with_progress(self, progress: f32) -> Self {
+        Self {
+            progress: Some(progress),
+            ..self
+        }
+    }
+
+    /// This bar with a coral hairline and mark: it needs the user.
+    #[must_use]
+    pub fn needing_you(self) -> Self {
+        Self {
+            needs_you: true,
+            ..self
+        }
+    }
+
+    /// Its controls, left to right, at most one of them filled.
+    #[must_use]
+    pub fn controls(&self) -> &[Control<A>] {
+        &self.controls
     }
 }
 
