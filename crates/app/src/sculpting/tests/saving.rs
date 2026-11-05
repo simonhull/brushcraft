@@ -864,3 +864,129 @@ fn a_stroke_while_finishing_stays_out_of_the_save_and_the_window_stays() {
     assert!(owner.project().has_unsaved_edits(), "the second is unsaved");
     owner.close().expect("closed");
 }
+
+/// The frame loop over a saved project in `dir`, with a stroke half landed, the pen still on it, a
+/// second waiting and a sample held over: all that a brush can hold at once.
+fn holding_everything(dir: &TestDir) -> Owner<Sculpting, NoUploads> {
+    let mut owner = slow_owner(dir);
+    run(&mut owner, 10_000);
+    let mut open = stroke(ACROSS, 12);
+    open.pop();
+    queue(&mut owner, open);
+    run(&mut owner, 1);
+    let second = stroke(((150.0, 80.0), (170.0, 120.0)), 6);
+    queue(&mut owner, second.clone());
+    run(&mut owner, 1);
+    assert!(!owner.brush().deferred.is_empty(), "the second waits");
+    let held = second.first().copied();
+    owner.brush_mut().held.push(held);
+    assert!(owner.brush().under_way(), "the first is under way");
+    assert!(owner.landing() > 1, "and there's plenty held");
+    owner
+}
+
+#[test]
+fn abandoning_forgets_what_is_held_and_lands_nothing() {
+    let dir = TestDir::new();
+    let mut owner = holding_everything(&dir);
+    owner.request_save(Instant::now());
+    let before = positions(owner.project());
+    owner.brush_mut().abandon();
+    assert_eq!(owner.landing(), 0, "nothing is held");
+    assert_eq!(owner.brush().landing_for_save(), 0, "nor for the save");
+    assert!(!owner.brush().pen_down(), "the pen is off it");
+    assert!(!owner.brush().stroking(), "no stroke is open");
+    assert_eq!(owner.brush().landing, Landing::InFrames);
+    assert_eq!(owner.brush().save_asked, None, "no save holds strokes back");
+    assert_eq!(positions(owner.project()), before, "no tile changed");
+    owner.discard().expect("discarded");
+}
+
+#[test]
+fn discard_lands_nothing_and_removes_the_recovery_file() {
+    let dir = TestDir::new();
+    let owner = holding_everything(&dir);
+    let saved = tiles_on_disk(&dir);
+    assert_eq!(recovery_files(&dir), 1, "the session's");
+    owner.discard().expect("discarded");
+    assert_eq!(recovery_files(&dir), 0, "the work is gone, as asked");
+    let reopened = tiles_on_disk(&dir);
+    assert_eq!(reopened, saved, "the project is as it was saved");
+}
+
+#[test]
+fn discard_leaves_the_project_file_as_it_was() {
+    let dir = TestDir::new();
+    let owner = holding_everything(&dir);
+    let before = std::fs::read(path_in(&dir)).expect("the file");
+    owner.discard().expect("discarded");
+    let after = std::fs::read(path_in(&dir)).expect("the file");
+    assert!(before == after, "byte for byte");
+}
+
+/// With a save part written the file is untouched until the save's last step, so Don't save leaves
+/// it as it was then too.
+#[test]
+fn discard_during_a_save_leaves_the_project_file_as_it_was() {
+    let dir = TestDir::new();
+    let mut owner = slow_owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 10_000);
+    let before = std::fs::read(path_in(&dir)).expect("the file");
+    owner.request_save(Instant::now());
+    while owner.save_stage() != Some(Stage::Writing) {
+        owner.save_step();
+    }
+    owner.discard().expect("discarded");
+    let after = std::fs::read(path_in(&dir)).expect("the file");
+    assert!(before == after, "byte for byte");
+    assert_eq!(recovery_files(&dir), 0, "the work is gone, as asked");
+}
+
+#[test]
+fn discard_says_what_a_failed_close_said() {
+    let dir = TestDir::new();
+    let owner = holding_everything(&dir);
+    let found = std::fs::read_dir(dir.path().join("recovery")).expect("the directory");
+    let files = found.map(|entry| entry.expect("an entry").path());
+    files.for_each(|file| std::fs::remove_file(file).expect("removed"));
+    let error = owner
+        .discard()
+        .expect_err("the file it should remove is gone");
+    let said = format!("{error:#}");
+    assert!(said.contains("closing the project"), "{said}");
+}
+
+/// A live run's record is on its way to its file as the run goes: Don't save stops the stream as
+/// any end does, so what it had reaches the file, and the run's own end can write the rest.
+#[test]
+fn discard_keeps_a_live_runs_record() {
+    let dir = TestDir::new();
+    let path = dir.path().join("record.jsonl");
+    let record = RecordSetup {
+        path: Some(path.clone()),
+        project: "p".to_owned(),
+        gpu_timing: false,
+        lod_timing: false,
+        opening: Instant::now(),
+    };
+    let setup = Setup {
+        record: Some(record),
+        ..setup()
+    };
+    let mut owner = owner_of(saved_project(&dir), Sculpting::new, setup);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 10_000);
+    assert!(
+        !owner.record_lines().is_empty(),
+        "the run's end has all of it to write"
+    );
+    owner.discard().expect("discarded");
+    let written = std::fs::read_to_string(&path).expect("the record");
+    assert!(
+        written.contains("\"result\":\"run\""),
+        "the stream reached the file: {written}"
+    );
+}

@@ -535,6 +535,10 @@ pub(crate) trait Brush {
         Ok(())
     }
 
+    /// Forgets everything held and not landed, and lands none of it: the project is closing
+    /// without saving ([`Owner::discard`]). No more steps follow.
+    fn abandon(&mut self) {}
+
     /// Lands a batch of what the brush holds, whether or not a frame can be drawn. Returns whether
     /// any landed.
     ///
@@ -3177,6 +3181,25 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let keep = project.has_unsaved_edits();
         let closed = project.close(keep).context("closing the project");
         said_too(said_too(flushed, saved), closed)
+    }
+
+    /// Closes the project without saving: Don't save. What the brush holds is dropped, not landed,
+    /// a save under way goes with it, the project file stays as it was, and the recovery file is
+    /// removed. Nothing to wait for. A recorded run's stream ends as the owner goes, as in
+    /// [`Owner::close`], and the run's end writes the record over it as ever.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::close`].
+    pub(crate) fn discard(mut self) -> Result<()> {
+        self.brush.abandon();
+        let Self {
+            mut project,
+            cursor,
+            ..
+        } = self;
+        project.store().unsubscribe_stale(cursor);
+        project.close(false).context("closing the project")
     }
 
     /// What a closing project does about its save: says that one failed, finishes one under way

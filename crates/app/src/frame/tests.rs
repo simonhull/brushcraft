@@ -3208,3 +3208,39 @@ fn a_bar_just_asked_cant_be_hit_before_it_can_be_seen() {
     owner.pen(pen_at(input::Phase::Down, Pixel { x: 640.0, y: 750.0 }));
     assert_eq!(owner.take_request(), None, "nothing was pressed");
 }
+
+/// A brush that says when it is told to forget what it holds, and never lands.
+#[derive(Debug, Default)]
+struct Forgets {
+    /// Told by [`Brush::abandon`], and seen after the owner has gone.
+    abandoned: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl Brush for Forgets {
+    fn step(
+        &mut self,
+        _context: BrushContext<'_>,
+        _pen: &PenFrame,
+        _budget: &BrushBudget,
+    ) -> Result<BrushReport> {
+        Ok(BrushReport::default())
+    }
+
+    fn flush(&mut self, _context: BrushContext<'_>) -> Result<()> {
+        bail!("Don't save lands nothing");
+    }
+
+    fn abandon(&mut self) {
+        self.abandoned.set(true);
+    }
+}
+
+#[test]
+fn discard_tells_the_brush_to_forget_and_never_to_land() {
+    let dir = TestDir::new();
+    let brush = Forgets::default();
+    let abandoned = std::rc::Rc::clone(&brush.abandoned);
+    let owner = ui_owner(&dir, brush);
+    owner.discard().expect("discarded");
+    assert!(abandoned.get(), "it was told");
+}

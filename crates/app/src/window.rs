@@ -52,7 +52,7 @@ use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
 use crate::render_thread::{Hooks, RenderThread};
 use crate::saving::SaveStep;
-use crate::{AppOwner, Ended, ProjectToOpen, Summary, describe_adapter, said_too, start};
+use crate::{AppOwner, End, Ended, ProjectToOpen, Summary, describe_adapter, said_too, start};
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -107,6 +107,8 @@ pub(crate) struct WindowApp {
     /// Pen samples drained from the stream, handed on to the frame loop at once; kept for its
     /// allocation.
     pen_samples: Vec<PenSample>,
+    /// What becomes of what isn't saved when the run ends.
+    end: End,
 }
 
 impl WindowApp {
@@ -119,6 +121,7 @@ impl WindowApp {
             done: Some(done),
             wakeup: 0,
             pen_samples: Vec::new(),
+            end: End::Keep,
         }
     }
 
@@ -331,11 +334,13 @@ impl WindowApp {
                 Ended {
                     run: said_too(said_too(result, stopped), pen_stopped).map(|()| summary),
                     owner: Some(owner),
+                    end: self.end,
                 }
             }
             None => Ended {
                 run: result.and_then(|()| Err(anyhow!("the window never opened"))),
                 owner: None,
+                end: self.end,
             },
         };
         // `main` holds the receiver until the loop returns, so the send can't fail.
@@ -693,7 +698,11 @@ impl ApplicationHandler for WindowApp {
         }
         match request {
             Some(WindowRequest::Exit) => self.close_now(event_loop),
-            Some(WindowRequest::ExitDiscarding) | None => {}
+            Some(WindowRequest::ExitDiscarding) => {
+                self.end = End::Discard;
+                self.finish(event_loop, Ok(()));
+            }
+            None => {}
         }
     }
 }

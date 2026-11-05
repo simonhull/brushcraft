@@ -2048,6 +2048,14 @@ impl Brush for Sculpting {
         self.save_asked = None;
     }
 
+    fn abandon(&mut self) {
+        self.stroke = None;
+        self.held.clear();
+        self.deferred.clear();
+        self.landing = Landing::InFrames;
+        self.save_asked = None;
+    }
+
     fn drops(&self) -> u64 {
         self.drops.0
     }

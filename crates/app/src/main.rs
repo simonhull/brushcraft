@@ -155,6 +155,16 @@ impl Summary {
     }
 }
 
+/// What becomes of what isn't saved as a window's run ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum End {
+    /// It lands, and stays in the recovery file: however a run ends unless the user says otherwise.
+    #[default]
+    Keep,
+    /// It goes: Don't save on the close bar, the one way here.
+    Discard,
+}
+
 /// A window's run as it ended: how it went, and its frame loop if it got that far, to close once
 /// the window and the event loop are gone, however the run went.
 #[derive(Debug)]
@@ -163,6 +173,8 @@ pub(crate) struct Ended {
     pub(crate) run: Result<Summary>,
     /// The frame loop, holding the project.
     pub(crate) owner: Option<AppOwner>,
+    /// What becomes of what isn't saved.
+    pub(crate) end: End,
 }
 
 /// A GPU's name and backend, as the overlay and the summary show it.
@@ -227,14 +239,15 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
         ran?;
         bail!("the event loop ended without closing the project");
     };
-    settled(ended.run, ran, ended.owner, AppOwner::close)
+    let closing = (ended.owner, ended.end);
+    settled(ended.run, ran, closing, AppOwner::close, AppOwner::discard)
 }
 
-/// How a window's run ended, once `owner` has closed through `close`, whatever `run` and the
-/// event loop's `ran` say.
+/// How a window's run ended, once its owner has closed, whatever `run` and the event loop's `ran`
+/// say: through `close`, or through `discard` if the run's [`End`] says so.
 ///
-/// So what it holds lands and the project closes after any failure. The first error is the one
-/// returned, with those after it as its context.
+/// So what it holds lands and the project closes after any failure, unless the user said to drop
+/// it. The first error is the one returned, with those after it as its context.
 ///
 /// # Errors
 ///
@@ -242,10 +255,14 @@ fn run_window(options: Options, project: ProjectToOpen) -> Result<Summary> {
 fn settled<O>(
     run: Result<Summary>,
     ran: Result<()>,
-    owner: Option<O>,
+    (owner, end): (Option<O>, End),
     close: impl FnOnce(O) -> Result<()>,
+    discard: impl FnOnce(O) -> Result<()>,
 ) -> Result<Summary> {
-    let closed = owner.map_or(Ok(()), close);
+    let closed = owner.map_or(Ok(()), |owner| match end {
+        End::Keep => close(owner),
+        End::Discard => discard(owner),
+    });
     said_too(said_too(run, ran), closed)
 }
 
@@ -433,7 +450,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use render::surface::Presentation;
 
-    use super::{Summary, settled};
+    use super::{End, Summary, settled};
 
     /// A run's summary, its details aside.
     fn summary() -> Summary {
@@ -463,22 +480,54 @@ mod tests {
         for (run, ran) in cases {
             let failing = run.is_err() || ran.is_err();
             let mut closed = false;
-            let outcome = settled(run, ran, Some(()), |()| {
-                closed = true;
-                Ok(())
-            });
+            let outcome = settled(
+                run,
+                ran,
+                (Some(()), End::Keep),
+                |()| {
+                    closed = true;
+                    Ok(())
+                },
+                |()| panic!("nobody said so"),
+            );
             assert!(closed, "closed all the same");
             assert_eq!(outcome.is_err(), failing);
         }
-        let both = settled(failed(), Ok(()), Some(()), |()| Err(anyhow!("no room")));
+        let keep = (Some(()), End::Keep);
+        let no_room = |()| Err(anyhow!("no room"));
+        let both = settled(failed(), Ok(()), keep, no_room, |()| Ok(()));
         let said = format!("{:#}", both.expect_err("failed"));
         assert!(
             said.contains("the device was lost") && said.contains("no room"),
             "{said}"
         );
-        let closing = settled(Ok(summary()), Ok(()), Some(()), |()| {
-            Err(anyhow!("no room"))
-        });
+        let closing = settled(Ok(summary()), Ok(()), keep, no_room, |()| Ok(()));
         assert!(closing.is_err(), "a close that failed fails the run");
+    }
+
+    #[test]
+    fn settled_discards_when_the_run_says_so() {
+        let mut discarded = false;
+        let outcome = settled(
+            Ok(summary()),
+            Ok(()),
+            (Some(()), End::Discard),
+            |()| panic!("Don't save lands nothing"),
+            |()| {
+                discarded = true;
+                Ok(())
+            },
+        );
+        assert!(discarded, "it went the other way");
+        outcome.expect("it went well");
+
+        let failed = settled(
+            Ok(summary()),
+            Ok(()),
+            (Some(()), End::Discard),
+            |()| Ok(()),
+            |()| Err(anyhow!("no room")),
+        );
+        assert!(failed.is_err(), "a discard that failed fails the run");
     }
 }
