@@ -44,6 +44,21 @@ fn from_file(store: &TileStore, key: &TileKey) -> Option<geom::DisplayTile> {
         .and_then(|record| record.decode(key))
 }
 
+/// Reads ahead the tiles around a dab on the corner of face 0, as a stroke does, and returns them
+/// in the order they came in: more of them than the quarter of the cache kept from drawing.
+fn read_around_a_dab(store: &mut TileStore) -> Vec<TileKey> {
+    let reached = TileKey::display(FaceId::new(0), level(TOP - 1), 0, 0).unwrap();
+    store.read_around(&BTreeSet::from([reached]));
+    settle_reads(store);
+    let around: Vec<TileKey> = store.read_ahead.read.tiles.keys().copied().collect();
+    let kept_from_drawing = store.read_ahead.read.cap() - store.draw_ahead_cap();
+    assert!(
+        around.len() > kept_from_drawing,
+        "past the stroke's quarter"
+    );
+    around
+}
+
 #[test]
 fn records_read_ahead_are_drawn_without_a_read_and_forgotten_once_staged() {
     let dir = TestDir::new();
@@ -97,11 +112,7 @@ fn a_strokes_records_read_around_survive_being_requested_and_drawn() {
     let dir = TestDir::new();
     let mesh = mesh();
     let mut store = reopened(&dir, &mesh);
-    let reached = TileKey::display(FaceId::new(0), level(TOP - 1), 0, 0).unwrap();
-    store.read_around(&BTreeSet::from([reached]));
-    settle_reads(&mut store);
-    let around: Vec<TileKey> = store.read_ahead.read.tiles.keys().copied().collect();
-    assert!(!around.is_empty(), "the tiles around it were read");
+    let around = read_around_a_dab(&mut store);
     assert_eq!(
         store.read_display_ahead(&around),
         0,
@@ -141,6 +152,66 @@ fn a_strokes_records_read_around_survive_being_requested_and_drawn() {
         store.draw_ahead_cap().min(others.len()),
         "the share, all of it for tiles needing a read"
     );
+}
+
+/// Reads of a request gone by the time the owner thread hears of them take no room.
+///
+/// The cache can't hold them beside the stroke's records, and one would go for a record dropped
+/// at once. The answers are all in before the next request, as on a machine that holds the owner
+/// thread up between the two.
+#[test]
+fn reads_of_a_request_gone_displace_no_strokes_record() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = reopened(&dir, &mesh);
+    let around = read_around_a_dab(&mut store);
+    let moved_on = display_at(&mesh, 6..=6);
+    assert!(
+        around.len() + moved_on.len() > store.read_ahead.read.cap(),
+        "they don't fit together"
+    );
+    assert_eq!(store.read_display_ahead(&moved_on), moved_on.len(), "read");
+    store.await_read_ahead();
+    store.read_display_ahead(&[]);
+    settle_reads(&mut store);
+    let held: Vec<TileKey> = store.read_ahead.read.tiles.keys().copied().collect();
+    assert_eq!(
+        held, around,
+        "the stroke's records, and nothing of the request"
+    );
+}
+
+/// Reads still wanted do take room, down to the quarter of the cache that is the stroke's.
+///
+/// What is about to be drawn goes before what the next dabs may reach, the stroke's oldest first.
+/// A record gone is read again if a dab reaches it, so this costs a read, never the record.
+#[test]
+fn reads_still_wanted_leave_a_stroke_its_quarter_of_the_cache() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut store = reopened(&dir, &mesh);
+    let around = read_around_a_dab(&mut store);
+    let wanted: Vec<TileKey> = display_at(&mesh, 6..=7)
+        .into_iter()
+        .filter(|key| !around.contains(key))
+        .collect();
+    let share = store.draw_ahead_cap();
+    assert_eq!(store.read_display_ahead(&wanted), share, "the whole share");
+    settle_reads(&mut store);
+    for key in &wanted[..share] {
+        assert!(!store.display_needs_read(key), "{key:?}: read for drawing");
+    }
+    let kept = store.read_ahead.read.cap() - share;
+    let (gone, newest) = around.split_at(around.len() - kept);
+    for key in newest {
+        assert!(
+            !store.display_needs_read(key),
+            "{key:?}: the stroke's quarter"
+        );
+    }
+    for key in gone {
+        assert!(store.display_needs_read(key), "{key:?}: read if reached");
+    }
 }
 
 #[test]

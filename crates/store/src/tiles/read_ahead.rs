@@ -23,6 +23,13 @@
 //! records read for drawing, so a stroke's read-around records survive the tiles being
 //! requested and drawn (a draw still uses them, as any record in memory).
 //!
+//! The cache drops its oldest record when full, whoever it was read for, so records still wanted
+//! for drawing do take the room of a stroke's older ones, down to the quarter that stays the
+//! stroke's: what is about to be drawn is sure to be used, what the next dabs reach only likely,
+//! and a record gone is read again if a dab reaches it. A record no longer wanted takes no room:
+//! a request's reads are kept only once the next request has said what it wants, however long
+//! the owner thread took to come back to them.
+//!
 //! A record read ahead is used only while it is still the one the store would read: the same
 //! open file, at the same place. Files are append-only while open, so a record superseded since
 //! (by a flush, say) is at another place, and a file swapped since is another file; either way it
@@ -237,11 +244,29 @@ impl TileStore {
     /// Takes in the records the workers have read ahead. One read for drawing a tile no longer
     /// wanted is dropped.
     pub(super) fn take_read_ahead(&mut self) {
+        let reads = self.receive_reads();
+        self.keep_reads(reads);
+    }
+
+    /// The records the workers have sent, not yet kept: their tiles stay among those asked until
+    /// [`TileStore::keep_reads`], so a request made meanwhile takes them as being read. A tile
+    /// answered without a record is no longer being read.
+    fn receive_reads(&mut self) -> Vec<(TileKey, ReadRecord)> {
+        let mut reads = Vec::new();
         while let Ok((key, read)) = self.read_ahead.receiver.try_recv() {
+            match read {
+                Some(read) => reads.push((key, read)),
+                None => drop(self.read_ahead.asked.remove(&key)),
+            }
+        }
+        reads
+    }
+
+    /// Keeps `reads`, from [`TileStore::receive_reads`], but for those read for drawing a tile
+    /// no longer wanted, which take no room from the records held.
+    fn keep_reads(&mut self, reads: Vec<(TileKey, ReadRecord)>) {
+        for (key, read) in reads {
             self.read_ahead.asked.remove(&key);
-            let Some(read) = read else {
-                continue;
-            };
             if read.purpose == Purpose::Draw
                 && !self.read_ahead.drawing(|drawing| drawing.contains(&key))
             {
@@ -274,7 +299,9 @@ impl TileStore {
     /// three quarters of it (12 records at the least budget), the first of `keys` taking it,
     /// the rest left to be read when drawn.
     pub fn read_display_ahead(&mut self, keys: &[TileKey]) -> usize {
-        self.take_read_ahead();
+        // Kept below, once this request has said what it wants: one it no longer wants would
+        // push a record out of a full cache, and then be dropped itself.
+        let received = self.receive_reads();
         let cap = self.draw_ahead_cap();
         let faces = self.mesh.face_count();
         let finest = self.display_finest;
@@ -318,6 +345,7 @@ impl TileStore {
         for key in &gone {
             self.drop_drawn_record(key);
         }
+        self.keep_reads(received);
         let queued = reads.len();
         let mut reads = reads.into_iter().peekable();
         while reads.peek().is_some() {
@@ -335,6 +363,23 @@ impl TileStore {
     #[cfg(test)]
     pub(super) fn read_ahead_pending(&self) -> usize {
         self.read_ahead.asked.len()
+    }
+
+    /// Waits until the workers have answered every read asked of them, and leaves the answers
+    /// waiting to be taken in, as an owner thread held up between two calls finds them.
+    ///
+    /// # Panics
+    ///
+    /// If the workers leave a read unanswered for ten seconds.
+    #[cfg(test)]
+    pub(super) fn await_read_ahead(&self) {
+        let wait = std::time::Duration::from_secs(10);
+        let answers: Vec<Read> = (0..self.read_ahead.asked.len())
+            .map(|_| self.read_ahead.receiver.recv_timeout(wait).unwrap())
+            .collect();
+        for answer in answers {
+            self.read_ahead.sender.send(answer).unwrap();
+        }
     }
 
     /// Forgets the records read ahead for drawing `keys`, which the caller has staged: they
