@@ -100,6 +100,13 @@
 //! each frame's stamp, before the input phase (pointer input is dropped), wants every frame until
 //! the path is over, and records every frame ([`crate::record`]). Its poses are set directly: it
 //! isn't framed at open, and no boundary is fitted around the model for it.
+//!
+//! **Reopening** swaps the project under a running window (Use last save, Open as a copy). It runs
+//! only while nothing has been drawn since opening, so nothing of the project is at stake, and
+//! [`Owner::take_request`] looks again as the window takes it, as a stroke or a save may have
+//! come since it was asked for. One loop ends, [`Owner::close_for_reopen`], and another takes over
+//! ([`Owner::go_on_from`]): what the user has set up and what the run has counted go across
+//! ([`Carried`]), and what belongs to the project stays behind.
 
 pub(crate) mod schedule;
 
@@ -117,7 +124,8 @@ use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
 use render::{DrawTimes, Look, Outcome, SceneView, aa};
 use store::{
-    Drained, JobsReport, Project, SaveAhead, SaveOutcome, SpatialIndex, StaleCursor, TileStore,
+    Drained, JobsReport, Project, RecoveryCandidate, SaveAhead, SaveOutcome, SpatialIndex,
+    StaleCursor, TileStore,
 };
 use ui::{Blend, UiFrame};
 
@@ -130,7 +138,7 @@ use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route
 use crate::pick::Picker;
 use crate::record::{Latency, RecordStream, Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
-use crate::saving::{SAVE_SLICE, SaveStep, Saving, Stage};
+use crate::saving::{self, SAVE_SLICE, SaveStep, Saving, Stage};
 use crate::script::{BrushSize, Script, ScriptPen, Segment};
 use crate::{OpenNote, said_too};
 
@@ -583,6 +591,9 @@ pub(crate) trait Brush {
     /// Sets the brush's radius to `pixels` on the screen: a scripted stroke's size.
     fn set_radius(&mut self, _pixels: f32) {}
 
+    /// Takes on what the user set on `from`, the brush of the project this one's replaces.
+    fn take_settings(&mut self, _from: &Self) {}
+
     /// The overlay's lines about the brush: its settings and keys, its last stroke, its last
     /// error. None by default. Read on the latency path, so made beforehand.
     fn status(&self) -> &[String] {
@@ -919,12 +930,95 @@ pub(crate) enum CloseAnswer {
 }
 
 /// What the window must do for the owner, which can't reach it ([`Owner::take_request`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WindowRequest {
     /// Close: everything is saved.
     Exit,
     /// Close, dropping what isn't saved: the user said so on the close bar.
     ExitDiscarding,
+    /// Swap this project in for the one open.
+    Reopen(Reopen),
+}
+
+/// A project to swap in for the one open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Reopen {
+    /// The project from its last save, the recovery file `kept` left until a stroke or a save, so
+    /// opening the project again undoes the choice.
+    LastSave {
+        /// The recovery file of the work being set aside.
+        kept: PathBuf,
+    },
+    /// A recovery file onto an earlier save, saved beside the project.
+    Copy {
+        /// What was found.
+        candidate: RecoveryCandidate,
+    },
+}
+
+/// What has been done to the project since it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinceOpening {
+    /// Nothing: it can still be swapped for another.
+    Untouched,
+    /// A stroke went to the brush, which reopening would lose.
+    Stroked,
+}
+
+/// A copy of found work the user asked for, waiting for a frame to say so before it holds the
+/// thread.
+#[derive(Debug)]
+struct Copying {
+    /// What to copy.
+    candidate: RecoveryCandidate,
+    /// The frame that says so, once one has been handed off.
+    said_in: Option<u64>,
+}
+
+/// What goes from one frame loop to the next as a project is swapped ([`Owner::close_for_reopen`],
+/// [`Owner::go_on_from`]).
+///
+/// That's what the user has set up, what their hands are doing, and what the run has counted. The
+/// frames go on counting, as the render thread's finished frame and a record both run across the
+/// swap, and a live record is carried whole, stream and all: a new stream would empty the file.
+#[derive(Debug)]
+pub(crate) struct Carried<B> {
+    /// The old brush, for its settings.
+    brush: B,
+    /// The view.
+    camera: Camera,
+    /// When the pivot was last set.
+    pivot_at: Option<Instant>,
+    /// How the scene is shown.
+    look: Look,
+    /// Buttons and modifiers held.
+    navigator: Navigator,
+    /// Pointer input no frame has taken.
+    input: Vec<Input>,
+    /// When each of `input` was queued.
+    input_at: Vec<Instant>,
+    /// Pen samples no frame has taken: none can be a brush's, as [`Owner::may_reopen`] says.
+    pen_queue: Vec<PenSample>,
+    /// The stroke in progress, which can only be navigation's.
+    pen_router: PenRouter,
+    /// The pen's buttons as navigation has heard them.
+    pen_navigation: PenNavigation,
+    /// Whether the pen is down.
+    pen_down: bool,
+    /// The frames counted and the display's pace.
+    scheduler: Scheduler,
+    /// Frames started.
+    started: u64,
+    /// Frames the render thread has finished.
+    finished: u64,
+    /// The frame loop's clock, which the record's times run on.
+    clock: Instant,
+    /// The record so far.
+    recorder: Option<Recorder>,
+    /// The record on its way to its file.
+    record_stream: Option<RecordStream>,
+    /// The record's setting.
+    run_info: Option<RunInfo>,
 }
 
 /// A key the UI may want, before anything else hears it.
@@ -1104,6 +1198,13 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     told_drops: u64,
     /// What the window must do next ([`Owner::take_request`]).
     request: Option<WindowRequest>,
+    /// A copy of found work on its way to [`Owner::request`].
+    copying: Option<Copying>,
+    /// What has been done to the project since it opened.
+    since_opening: SinceOpening,
+    /// A recovery file set aside by Use last save: removed by a stroke or a save, which end the
+    /// way back to it, and only then.
+    kept_recovery: Option<PathBuf>,
     /// What the UI shows.
     dialogs: Dialogs,
 }
@@ -1325,6 +1426,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             after_save: AfterSave::Stay,
             told_drops: 0,
             request: None,
+            copying: None,
+            since_opening: SinceOpening::Untouched,
+            kept_recovery: None,
             dialogs,
         }
     }
@@ -1495,6 +1599,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         } else if self.dialogs.finishing() {
             self.act(Action::Cancel, now);
         } else if self.dialogs.noting() {
+            self.copying = None;
             self.dialogs.clear_prompt(now);
             self.scheduler.want(Reason::Overlay);
         }
@@ -1552,9 +1657,30 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.scheduler.want(Reason::Overlay);
     }
 
-    /// What the window must do next, if anything.
-    pub(crate) const fn take_request(&mut self) -> Option<WindowRequest> {
-        self.request.take()
+    /// What the window must do next, if anything. A reopen asked for is looked at again: a stroke
+    /// or a save may have come since, which it would lose, and they stand.
+    pub(crate) fn take_request(&mut self) -> Option<WindowRequest> {
+        let request = self.request.take();
+        if matches!(request, Some(WindowRequest::Reopen(_))) && !self.may_reopen() {
+            if self.dialogs.copying() {
+                self.dialogs.clear_prompt(Instant::now());
+                self.scheduler.want(Reason::Overlay);
+            }
+            return None;
+        }
+        request
+    }
+
+    /// Whether the project can be swapped for another: nothing has been drawn since opening, or
+    /// is about to be, and no save or close is under way. A note is up only then, as a stroke
+    /// puts it away, but a sample may be waiting for its frame.
+    fn may_reopen(&self) -> bool {
+        let drawing = self.since_opening == SinceOpening::Stroked
+            || self.stroking.queued
+            || self.stroke_open()
+            || self.brush.pen_down()
+            || self.landing() > 0;
+        !drawing && self.saving.stage().is_none() && !self.closing()
     }
 
     /// `key` was pressed at `now`: whether the UI took it, or it goes on as before. A bar the pen
@@ -1612,6 +1738,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 self.dialogs.clear_prompt(now);
             }
             Action::Dismiss | Action::Ignore => self.dialogs.clear_prompt(now),
+            Action::UseLastSave if self.dialogs.says_restored() && self.may_reopen() => {
+                let kept = self.project.recovery_path().map(PathBuf::from);
+                self.request = kept.map(|kept| WindowRequest::Reopen(Reopen::LastSave { kept }));
+            }
+            Action::OpenCopy if self.may_reopen() => {
+                let candidate = self.dialogs.begin_copy(now);
+                self.copying = candidate.map(|candidate| Copying {
+                    candidate,
+                    said_in: None,
+                });
+            }
             Action::DontSave | Action::TryAgain | Action::UseLastSave | Action::OpenCopy => {}
         }
         self.scheduler.want(Reason::Overlay);
@@ -2110,6 +2247,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             ui,
         })?;
         lap.next();
+        self.handed_off();
 
         let preparing = self.after_hand_off(now, (size, deadline), &mut lap, pen)?;
         self.log_phases(self.after_hand_off.into(phases));
@@ -2134,6 +2272,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.scheduler.want(Reason::Converging);
         }
         Ok(())
+    }
+
+    /// The frame is handed off: a copy waiting for it has its frame, and the pen's path is clear
+    /// to remove a recovery file a first stroke has ended the way back to.
+    fn handed_off(&mut self) {
+        if let Some(copying) = &mut self.copying {
+            copying.said_in.get_or_insert(self.started);
+        }
+        if self.since_opening == SinceOpening::Stroked {
+            self.forget_kept_recovery();
+        }
     }
 
     /// What the UI shows in the frame started at `now`, with the project `unsaved` or not.
@@ -2757,8 +2906,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 asked = true;
                 brush.route(context, down)
             });
-            if asked && route == Some(Route::Brush) && self.dialogs.routes() {
-                self.back_to_work();
+            if asked && route == Some(Route::Brush) {
+                self.since_opening = SinceOpening::Stroked;
+                if self.dialogs.routes() {
+                    self.back_to_work();
+                }
             }
             // A `Down` the brush raycast and found nothing under navigates: the surface isn't
             // under it, so its drag keeps the pivot without picking the same ray again.
@@ -2925,6 +3077,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             log.render.push(presented.times);
         }
         self.scheduler.shown(presented.outcome);
+        self.copy_if_said(presented.number);
+    }
+
+    /// Frame `shown` is on screen: a copy waiting for the frame that says "Saving" can go.
+    fn copy_if_said(&mut self, shown: u64) {
+        let said = self.copying.as_ref().and_then(|copying| copying.said_in);
+        if said.is_some_and(|said| said <= shown)
+            && let Some(Copying { candidate, .. }) = self.copying.take()
+        {
+            self.request = Some(WindowRequest::Reopen(Reopen::Copy { candidate }));
+        }
     }
 
     /// GPU times read back as the render thread stopped (`render_thread::Stopped::gpu`): the
@@ -3194,12 +3357,33 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         match saved {
             Ok(outcome) => {
                 let now = Instant::now();
-                self.saving.saved(&outcome, now);
-                self.dialogs.saved(now);
+                self.saved(&outcome, now);
+                // Saved, the work is the last save: there's no other to go back to.
+                if self.dialogs.says_restored() {
+                    self.dialogs.clear_prompt(now);
+                }
             }
             Err(error) => self.saving.failed(&error, self.closing()),
         }
         self.save_over();
+    }
+
+    /// A save went through at `now`, with `outcome`: said, and a recovery file set aside goes.
+    fn saved(&mut self, outcome: &SaveOutcome, now: Instant) {
+        self.saving.saved(outcome, now);
+        self.dialogs.saved(now);
+        self.forget_kept_recovery();
+    }
+
+    /// Removes the recovery file set aside by Use last save: there is no going back to it now. A
+    /// failure is said and forgotten: the file comes back as found work at worst.
+    fn forget_kept_recovery(&mut self) {
+        if let Some(path) = self.kept_recovery.take()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            let path = path.display();
+            saving::log(&format!("brushcraft: removing {path}: {error}"));
+        }
     }
 
     /// The save under way is over: strokes go on.
@@ -3311,7 +3495,113 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         ensure!(landed, "not saved: what the brush held didn't all land");
         let outcome = self.project.save().context("saving the project")?;
         self.saving.saved(&outcome, Instant::now());
+        self.forget_kept_recovery();
         Ok(())
+    }
+
+    /// Closes the project so another can take over, once the render thread has settled: the file
+    /// lock goes with it. Nothing is flushed or landed, as nothing was drawn
+    /// ([`Owner::may_reopen`]), and the recovery file stays if it has edits no save holds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::close`]: the recovery file is kept then.
+    pub(crate) fn close_for_reopen(self) -> Result<Carried<B>> {
+        let pen_down = self.dialogs.pen_is_down();
+        let Self {
+            mut project,
+            cursor,
+            brush,
+            camera,
+            pivot_at,
+            look,
+            navigator,
+            input,
+            input_at,
+            pen_queue,
+            pen_router,
+            pen_navigation,
+            scheduler,
+            started,
+            finished,
+            clock,
+            recorder,
+            record_stream,
+            run_info,
+            ..
+        } = self;
+        project.store().unsubscribe_stale(cursor);
+        let keep = project.has_unsaved_edits();
+        project.close(keep).context("closing the project")?;
+        Ok(Carried {
+            brush,
+            camera,
+            pivot_at,
+            look,
+            navigator,
+            input,
+            input_at,
+            pen_queue,
+            pen_router,
+            pen_navigation,
+            pen_down,
+            scheduler,
+            started,
+            finished,
+            clock,
+            recorder,
+            record_stream,
+            run_info,
+        })
+    }
+
+    /// This frame loop taking over from the one that left `carried`, on the same render thread:
+    /// the view stays where the user had it, rather than framing the model again.
+    #[must_use]
+    pub(crate) fn go_on_from(mut self, carried: Carried<B>) -> Self {
+        self.brush.take_settings(&carried.brush);
+        self.camera = carried.camera;
+        self.pivot_at = carried.pivot_at;
+        self.fitting = Fitting {
+            frame: false,
+            bounds: true,
+        };
+        self.look = carried.look;
+        self.navigator = carried.navigator;
+        self.input = carried.input;
+        self.input_at = carried.input_at;
+        self.pen_queue = carried.pen_queue;
+        self.pen_router = carried.pen_router;
+        self.pen_navigation = carried.pen_navigation;
+        if carried.pen_down {
+            self.dialogs.pen_down(Instant::now());
+        }
+        self.scheduler.go_on_from(&carried.scheduler);
+        self.started = carried.started;
+        self.finished = carried.finished;
+        self.clock = carried.clock;
+        self.recorder = carried.recorder;
+        self.record_stream = carried.record_stream;
+        self.run_info = carried.run_info;
+        self
+    }
+
+    /// This frame loop leaving the recovery file at `kept` until a stroke or a save.
+    #[must_use]
+    pub(crate) fn keeping_recovery(mut self, kept: PathBuf) -> Self {
+        self.kept_recovery = Some(kept);
+        self
+    }
+
+    /// A copy of found work was saved with `outcome`: said as any save is.
+    pub(crate) fn copied(&mut self, outcome: &SaveOutcome) {
+        self.saved(outcome, Instant::now());
+        self.scheduler.want(Reason::Overlay);
+    }
+
+    /// A copy of found work failed for `error`: the log and the title say so, as for a save.
+    pub(crate) fn copy_failed(&mut self, error: &anyhow::Error) {
+        self.saving.failed(error, false);
     }
 
     /// Whether the stale-tile feed holds epochs this loop hasn't drained (or a resync): work

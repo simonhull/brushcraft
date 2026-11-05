@@ -14,7 +14,9 @@
 //! pointer, picked by the spatial index ([`pick`]). Keys change how the scene is shown (M the
 //! MatCap, W the wireframe, C the debug view of a colour per cluster), each a shading pass alone,
 //! and the brush (`[` and `]` its size, `-` and `=` its strength); F frames the model, as opening
-//! the project does; Ctrl+S saves ([`saving`]).
+//! the project does; Ctrl+S saves ([`saving`]). A window opens a project with what a crash left of
+//! it ([`ProjectToOpen::open_restoring`]), saying so on a note the user can answer by going back
+//! to the last save, which swaps the project under the running window ([`swap`]).
 //!
 //! In a window ([`window`]) the main thread runs winit's event loop. With `--offscreen
 //! --frames N` there is no window: frames are drawn into a texture, so the gate opens and
@@ -55,14 +57,14 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use render::gpu::{Gpu, GpuError};
 use render::surface::{Offscreen, Presentation, Target};
 use store::{
-    CandidateStatus, Project, ProjectConfig, ProjectError, RecoveryCandidate, StoreConfig,
-    default_recovery_dir, find_recoveries,
+    CandidateStatus, Project, ProjectConfig, ProjectError, RecoveryCandidate, SaveOutcome,
+    StoreConfig, default_recovery_dir, find_recoveries,
 };
 use winit::event_loop::EventLoop;
 
 use crate::cli::Options;
 use crate::frame::schedule::Next;
-use crate::frame::{Brush, GpuWait, NoPen, Owner, Setup, Uploads as _};
+use crate::frame::{Brush, GpuWait, NoPen, Owner, Reopen, Setup, Uploads as _};
 use crate::pace::{Pacer, SystemTimer};
 use crate::pick::Picker;
 use crate::render_thread::{Hooks, RenderThread};
@@ -218,6 +220,42 @@ fn same_file(one: &Path, other: &Path) -> bool {
     }
 }
 
+/// Where a copy of `project` goes: beside it as `<stem>-recovered.bcrf`, then `-recovered-2` and so
+/// on, whichever name nothing has, a dangling link counting as something, as for
+/// [`Project::save_as`].
+fn copy_path(project: &Path) -> PathBuf {
+    let stem = project.file_stem().unwrap_or_default();
+    let named = |suffix: &str| {
+        let mut name = stem.to_os_string();
+        name.push(suffix);
+        name.push(".bcrf");
+        project.with_file_name(name)
+    };
+    let free = |path: &PathBuf| std::fs::symlink_metadata(path).is_err();
+    let first = named("-recovered");
+    if free(&first) {
+        return first;
+    }
+    let mut numbered = (2_u64..).map(|number| named(&format!("-recovered-{number}")));
+    // Every number taken: the first name then, which `save_as` refuses.
+    numbered.find(free).unwrap_or(first)
+}
+
+/// What a reopen came to.
+#[derive(Debug)]
+pub(crate) struct Reopened {
+    /// The project now open.
+    project: Project,
+    /// A recovery file set aside, until a stroke or a save.
+    kept: Option<PathBuf>,
+    /// The save that made a copy.
+    copied: Option<SaveOutcome>,
+    /// Why a copy couldn't be made, the project then open as before and `note` asking again.
+    failed: Option<anyhow::Error>,
+    /// What to say about the project.
+    note: Option<OpenNote>,
+}
+
 /// A project checked and ready to open, opened only once the GPU (and the window) are.
 ///
 /// Opening a project makes a recovery file, so a launch that fails before the project opens
@@ -325,6 +363,55 @@ impl ProjectToOpen {
         Ok((self.open()?, note))
     }
 
+    /// Opens the project `reopen` asks for, the one before it having closed.
+    ///
+    /// A copy that can't be made leaves everything as it was: the recovery file is kept, the
+    /// project opens as ever with the note asking again, and [`Reopened::failed`] says why.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProjectToOpen::open`]. A copy failing isn't an error.
+    pub(crate) fn reopen(&self, reopen: Reopen) -> Result<Reopened> {
+        let (project, kept, copied, failed, note) = match reopen {
+            Reopen::LastSave { kept } => (self.clone().open()?, Some(kept), None, None, None),
+            Reopen::Copy { candidate } => match self.open_copy(&candidate) {
+                Ok((project, saved)) => (project, None, Some(saved), None, None),
+                Err(error) => {
+                    let note = OpenNote::EarlierVersion { candidate };
+                    (self.clone().open()?, None, None, Some(error), Some(note))
+                }
+            },
+        };
+        Ok(Reopened {
+            project,
+            kept,
+            copied,
+            failed,
+            note,
+        })
+    }
+
+    /// Restores `candidate` and saves it beside the project, which goes unwritten: the copy is
+    /// the project from then on, and its recovery file gives way to one of the copy's. On an error
+    /// the restored project closes again, keeping the recovery file.
+    ///
+    /// # Errors
+    ///
+    /// If it can't be restored, or saved.
+    fn open_copy(&self, candidate: &RecoveryCandidate) -> Result<(Project, SaveOutcome)> {
+        let restoring = Project::restore(candidate, self.config.clone());
+        let mut project = restoring.context("restoring the work found")?;
+        let path = copy_path(&self.path);
+        match project.save_as(&path) {
+            Ok(saved) => Ok((project, saved)),
+            Err(error) => {
+                let failed = anyhow::Error::new(error);
+                let failed = failed.context(format!("saving {}", path.display()));
+                said_too(Err(failed), project.close(true).map_err(Into::into))
+            }
+        }
+    }
+
     /// Whether `candidate` has work of this project: it has edits, and the file it extends is the
     /// one being opened, whichever way either path spells it. A copy of the project is another
     /// file, and its project id and save points say nothing of that, so they aren't asked. A
@@ -333,6 +420,40 @@ impl ProjectToOpen {
         let extends = candidate.base_path.as_deref();
         candidate.last_edit.is_some() && extends.is_some_and(|base| same_file(base, &self.path))
     }
+}
+
+/// Swaps `old`'s project for the one `reopen` asks for on the same `gpu`, as `setup` says.
+///
+/// The old one closes first, for its file lock. The render thread must have settled
+/// ([`RenderThread::settle`]), so none of the old loop's frames reach the new one.
+///
+/// # Errors
+///
+/// If the old project doesn't close, or the new one doesn't open or start. A copy failing isn't
+/// an error: the project goes on as before, and the title says so.
+pub(crate) fn swap(
+    old: AppOwner,
+    project: &ProjectToOpen,
+    reopen: Reopen,
+    gpu: Arc<Gpu>,
+    setup: Setup,
+) -> Result<AppOwner> {
+    let carried = old.close_for_reopen()?;
+    let reopened = project.reopen(reopen)?;
+    let mut owner = start(reopened.project, gpu, setup)?.go_on_from(carried);
+    if let Some(kept) = reopened.kept {
+        owner = owner.keeping_recovery(kept);
+    }
+    if let Some(saved) = &reopened.copied {
+        owner.copied(saved);
+    }
+    if let Some(error) = &reopened.failed {
+        owner.copy_failed(error);
+    }
+    if let Some(note) = &reopened.note {
+        owner.note(note, Instant::now());
+    }
+    Ok(owner)
 }
 
 /// Runs the app in a window until it closes (or has drawn a scripted run's frames).
@@ -581,7 +702,8 @@ mod tests {
         ProjectToOpen {
             path: path.to_owned(),
             config: ProjectConfig {
-                store: StoreConfig::new(512 << 20, SITE),
+                store: StoreConfig::new(512 << 20, SITE)
+                    .with_display(Level::new(FINEST).expect("a level")),
                 recovery_dir: dir.path().join("recovery"),
             },
         }
@@ -597,14 +719,29 @@ mod tests {
         opening
     }
 
+    /// The tile the tests edit.
+    fn edited_tile() -> TileKey {
+        let level = Level::new(FINEST).expect("a level");
+        TileKey::displacement(FaceId::new(0), level, 0, 0).expect("a tile")
+    }
+
+    /// The surface of the tile the tests edit, in `project`.
+    fn surface(project: &mut Project) -> Vec<Vec3> {
+        let tile = project.store().evaluate(edited_tile());
+        tile.expect("evaluated").to_vec()
+    }
+
     /// Makes one edit of `project`, as a stroke does.
     fn edit(project: &mut Project) {
-        let level = Level::new(FINEST).expect("a level");
-        let key = TileKey::displacement(FaceId::new(0), level, 0, 0).expect("a tile");
+        edit_by(project, 0.01);
+    }
+
+    /// Makes one edit of `project` as a stroke does, moving a vertex by `lift`.
+    fn edit_by(project: &mut Project, lift: f32) {
         project.begin_stroke().expect("begun");
-        let edited = project
-            .store()
-            .edit_tile(key, |tile| tile.set(1, 1, Vec3::new(0.0, 0.0, 0.01)));
+        let edited = project.store().edit_tile(edited_tile(), |tile| {
+            tile.set(1, 1, Vec3::new(0.0, 0.0, lift))
+        });
         edited.expect("the tile").expect("edited");
         project.store().close_epoch().expect("closed");
         project.end_unrecorded_stroke().expect("ended");
@@ -894,6 +1031,224 @@ mod tests {
             assert!(matches!(note, Some(OpenNote::Restored { .. })), "{args:?}");
             close(project);
         }
+    }
+
+    #[test]
+    fn the_copys_name_is_beside_the_project_and_never_taken() {
+        let dir = TestDir::new();
+        let project = dir.path().join("first-sculpt.bcrf");
+        let first = dir.path().join("first-sculpt-recovered.bcrf");
+        let second = dir.path().join("first-sculpt-recovered-2.bcrf");
+        let third = dir.path().join("first-sculpt-recovered-3.bcrf");
+        assert_eq!(copy_path(&project), first);
+        std::fs::write(&first, b"taken").expect("written");
+        assert_eq!(copy_path(&project), second);
+        std::fs::write(&second, b"taken").expect("written");
+        assert_eq!(copy_path(&project), third);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_takes_a_name_too() {
+        // Following it would call the name free, and writing there would land somewhere else.
+        let dir = TestDir::new();
+        let project = dir.path().join("first-sculpt.bcrf");
+        let first = dir.path().join("first-sculpt-recovered.bcrf");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &first).expect("a link");
+        let second = dir.path().join("first-sculpt-recovered-2.bcrf");
+        assert_eq!(copy_path(&project), second);
+    }
+
+    /// The candidate of the recovery file at `file`.
+    fn candidate(project: &ProjectToOpen, file: &Path) -> RecoveryCandidate {
+        let mut found = listed(project).into_iter();
+        found.find(|found| found.path == file).expect("listed")
+    }
+
+    #[test]
+    fn open_as_a_copy_saves_beside_the_project_and_leaves_the_project_alone() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let mut crashed = opening.clone().open().expect("opened");
+        edit_by(&mut crashed, 0.25);
+        let file = crashed.recovery_path().expect("protected").to_owned();
+        let found = surface(&mut crashed);
+        crashed.close(true).expect("closed, the file kept");
+        let mut later = opening.clone().open().expect("opened");
+        edit_by(&mut later, 0.5);
+        let latest = surface(&mut later);
+        drop(later.save().expect("saved"));
+        later.close(false).expect("closed");
+        assert_ne!(found, latest, "two different surfaces");
+        let before = std::fs::read(&opening.path).expect("read");
+        let taken = dir.path().join("first-sculpt-recovered.bcrf");
+        std::fs::write(&taken, b"somebody's").expect("written");
+
+        let copy = Reopen::Copy {
+            candidate: candidate(&opening, &file),
+        };
+        let reopened = opening.reopen(copy).expect("reopened");
+        assert!(reopened.failed.is_none(), "{:?}", reopened.failed);
+        assert_eq!(reopened.note, None);
+        assert!(reopened.copied.is_some(), "said as a save");
+        let mut project = reopened.project;
+        let beside = dir.path().join("first-sculpt-recovered-2.bcrf");
+        assert_eq!(
+            project.path(),
+            Some(beside.as_path()),
+            "goes on as the copy"
+        );
+        assert!(!project.has_unsaved_edits(), "it's saved");
+        assert_eq!(surface(&mut project), found, "the work found");
+        project.close(false).expect("closed");
+
+        assert!(!file.exists(), "in the copy, so no longer found");
+        assert_eq!(std::fs::read(&taken).expect("read"), b"somebody's");
+        assert_eq!(std::fs::read(&opening.path).expect("read"), before);
+        let (mut original, note) = opening.open_restoring().expect("opened");
+        assert_eq!(note, None, "nothing more to find");
+        assert_eq!(surface(&mut original), latest, "as it was saved");
+        original.close(false).expect("closed");
+        let (mut kept, _) = to_open(&dir, &beside).open_restoring().expect("opened");
+        assert_eq!(surface(&mut kept), found, "and it stays in the file");
+        kept.close(false).expect("closed");
+    }
+
+    /// Makes `dir`'s directory read-only, or writable again.
+    #[cfg(unix)]
+    fn writable(dir: &TestDir, writable: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if writable { 0o755 } else { 0o555 };
+        let permissions = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(dir.path().join("sculpts"), permissions).expect("set");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_that_cant_be_written_keeps_the_work_and_the_project_as_they_were() {
+        let dir = TestDir::new();
+        let folder = dir.path().join("sculpts");
+        std::fs::create_dir_all(&folder).expect("a directory");
+        let opening = saved(&dir, "sculpts/first-sculpt.bcrf");
+        let file = left_on_an_earlier_save(&opening);
+        let found = candidate(&opening, &file);
+        let before = std::fs::read(&file).expect("read");
+
+        writable(&dir, false);
+        let copy = Reopen::Copy {
+            candidate: found.clone(),
+        };
+        let reopened = opening.reopen(copy).expect("the project still opens");
+        writable(&dir, true);
+
+        let failed = reopened.failed.expect("it says why");
+        assert!(format!("{failed:#}").contains("-recovered"), "{failed:#}");
+        let again = OpenNote::EarlierVersion { candidate: found };
+        assert_eq!(reopened.note, Some(again), "and asks again");
+        assert!(reopened.copied.is_none());
+        let project = reopened.project;
+        assert_eq!(project.path(), Some(opening.path.as_path()), "as it was");
+        assert!(!project.has_unsaved_edits());
+        project.close(false).expect("closed");
+        assert_eq!(left(&opening), vec![file.clone()], "still found");
+        assert_eq!(std::fs::read(&file).expect("read"), before, "and whole");
+        let leftovers = std::fs::read_dir(&folder).expect("listed").count();
+        assert_eq!(leftovers, 1, "nothing beside the project");
+    }
+
+    #[test]
+    fn work_that_cant_be_restored_for_a_copy_keeps_the_file_and_opens_the_project() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_on_an_earlier_save(&opening);
+        let stale = RecoveryCandidate {
+            base: None,
+            ..candidate(&opening, &file)
+        };
+        let copy = Reopen::Copy { candidate: stale };
+        let reopened = opening.reopen(copy).expect("the project still opens");
+        assert!(reopened.failed.is_some(), "it says why");
+        assert!(reopened.note.is_some(), "and asks again");
+        reopened.project.close(false).expect("closed");
+        assert_eq!(left(&opening), vec![file]);
+    }
+
+    #[test]
+    fn use_last_save_opens_the_save_and_reopening_undoes_the_choice() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let kept = file.clone();
+        let reopened = opening.reopen(Reopen::LastSave { kept }).expect("reopened");
+        assert_eq!(reopened.kept.as_deref(), Some(file.as_path()));
+        assert_eq!(reopened.note, None);
+        let last_save = reopened.project;
+        assert!(!last_save.has_unsaved_edits(), "the last save");
+        assert_ne!(last_save.recovery_path(), Some(file.as_path()), "a new one");
+        last_save.close(false).expect("closed");
+        assert!(file.exists(), "the way back");
+        let (project, note) = opening.open_restoring().expect("opened");
+        assert!(project.has_unsaved_edits(), "and there it is");
+        assert!(matches!(note, Some(OpenNote::Restored { path, .. }) if path == file));
+        close(project);
+    }
+
+    /// The setup of an offscreen run of `frames` frames on `render`.
+    fn offscreen_setup(render: &RenderThread, frames: u64) -> Setup {
+        Setup {
+            size: render::surface::Size::new(64, 48),
+            interval: window::DEFAULT_INTERVAL,
+            presentation: render.presentation(),
+            blend: render.blend(),
+            adapter: "test".to_owned(),
+            frames: Some(frames),
+            script: None,
+            record: None,
+        }
+    }
+
+    #[test]
+    fn a_frame_loop_taking_over_draws_on_on_the_same_gpu_and_render_thread() {
+        let dir = TestDir::new();
+        let opening = saved(&dir, "first-sculpt.bcrf");
+        let file = left_work(&opening);
+        let adapter = render::gpu::AdapterRequest::Software;
+        let gpu = Arc::new(Gpu::open(&adapter).expect("GPU tests need lavapipe"));
+        let size = render::surface::Size::new(64, 48).expect("non-zero");
+        let target = Target::Offscreen(Offscreen::new(&gpu, size).expect("a target"));
+        let hooks = Hooks::none();
+        let spawned = RenderThread::spawn(Arc::clone(&gpu), target, hooks, false);
+        let mut render = spawned.expect("a render thread");
+
+        let (project, note) = opening.clone().open_restoring().expect("opened");
+        assert!(matches!(note, Some(OpenNote::Restored { .. })));
+        let first = offscreen_setup(&render, 5);
+        let mut old = start(project, Arc::clone(&gpu), first).expect("started");
+        drive_offscreen(&mut old, &mut render).expect("drawn");
+        assert_eq!(old.finished(), 5);
+
+        // One still on its way as the swap begins.
+        old.expose();
+        let now = Instant::now();
+        let sent = old.frame(now, now, |frame| render.send(frame));
+        sent.expect("sent");
+        render.settle(|frame| old.shown(frame)).expect("settled");
+        assert_eq!(old.finished(), 6, "every frame came back to its own loop");
+
+        let second = offscreen_setup(&render, 12);
+        let kept = file.clone();
+        let reopen = Reopen::LastSave { kept };
+        let swapped = swap(old, &opening, reopen, Arc::clone(&gpu), second);
+        let mut owner = swapped.expect("swapped");
+        assert_eq!(owner.finished(), 6, "the run's frames go on counting");
+        assert!(!owner.project().has_unsaved_edits(), "the last save");
+        drive_offscreen(&mut owner, &mut render).expect("and it draws");
+        assert_eq!(owner.finished(), 12, "to the end");
+        let resident = owner.uploads().stats().resident;
+        assert!(resident > 0, "its tiles reached the GPU");
+        render.stop().expect("stopped");
+        owner.close().expect("closed");
+        assert!(file.exists(), "no stroke, so the way back stays");
     }
 
     /// A run's summary, its details aside.

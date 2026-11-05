@@ -16,6 +16,9 @@
 //! stopped first on the way out ([`WindowApp::finish`]), so our backend never outlives the
 //! window's surface. The mouse's events stay winit's.
 //!
+//! **Reopening** ([`WindowApp::reopen`]) swaps the frame loop for one on another project, on the
+//! same window, pen, GPU and render thread.
+//!
 //! **Order between the two:** within the pen stream, and within the mouse's input, everything
 //! keeps the order it happened in. Across them it doesn't: a frame's input phase applies all the
 //! mouse input queued since the last frame first, then routes the pen samples drained after each
@@ -29,6 +32,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
+use render::gpu::Gpu;
 use render::surface::{Size, Target, WindowSurface};
 use ui::Theme;
 use winit::application::ApplicationHandler;
@@ -45,14 +49,17 @@ use crate::camera::Pixel;
 use crate::cli::Options;
 use crate::frame::schedule::Next;
 use crate::frame::{
-    BrushChange, CloseAnswer, GPU_POLL, GpuWait, LookChange, Setup, UiKey, WindowRequest,
+    BrushChange, CloseAnswer, GPU_POLL, GpuWait, LookChange, RecordSetup, Reopen, Setup, UiKey,
+    WindowRequest,
 };
 use crate::navigate::{Button, Input, Modifiers};
 use crate::pace::{Pacer, Step, SystemTimer};
 use crate::pen::{AppPen, PenSample, ToolData, WinitEvent};
 use crate::render_thread::{Hooks, RenderThread};
 use crate::saving::SaveStep;
-use crate::{AppOwner, End, Ended, ProjectToOpen, Summary, describe_adapter, said_too, start};
+use crate::{
+    AppOwner, End, Ended, ProjectToOpen, Summary, describe_adapter, said_too, start, swap,
+};
 
 /// The refresh interval assumed when the display doesn't report its rate: 60 Hz.
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -74,6 +81,8 @@ struct Running {
     render: RenderThread,
     /// The window.
     window: Arc<dyn Window>,
+    /// The GPU, for a frame loop taking over.
+    gpu: Arc<Gpu>,
     /// The GPU's description, for the summary.
     adapter: String,
     /// Waits for the next frame precisely: the event loop's timer wakes the loop just before
@@ -93,9 +102,9 @@ struct Running {
 pub(crate) struct WindowApp {
     /// The command line.
     options: Options,
-    /// The project to open, until the window, its surface and the render thread are up and
-    /// the frame loop opens it.
-    project: Option<ProjectToOpen>,
+    /// The project to open once the window, its surface and the render thread are up, and to
+    /// open again for a reopen.
+    project: ProjectToOpen,
     /// The running app, once the window exists.
     running: Option<Running>,
     /// Where the run's outcome goes when the loop exits.
@@ -116,7 +125,7 @@ impl WindowApp {
     pub(crate) const fn new(options: Options, project: ProjectToOpen, done: Sender<Ended>) -> Self {
         Self {
             options,
-            project: Some(project),
+            project,
             running: None,
             done: Some(done),
             wakeup: 0,
@@ -133,11 +142,7 @@ impl WindowApp {
     ///
     /// If the window, the surface, the GPU or the render thread can't be made, or the project
     /// doesn't open.
-    fn open(&mut self, event_loop: &dyn ActiveEventLoop) -> Result<Running> {
-        let project = self
-            .project
-            .take()
-            .ok_or_else(|| anyhow!("the project was already taken"))?;
+    fn open(&self, event_loop: &dyn ActiveEventLoop) -> Result<Running> {
         let requested = PhysicalSize::new(self.options.size.width(), self.options.size.height());
         let (least_width, least_height) = Theme::GLASS.window_min;
         let attributes = WindowAttributes::default()
@@ -161,18 +166,10 @@ impl WindowApp {
         let timing = self.options.times_gpu();
         let render = RenderThread::spawn(Arc::clone(&gpu), Target::Window(surface), hooks, timing)?;
         let opening = Instant::now();
-        let (project, note) = project.open_as(&self.options)?;
-        let setup = Setup {
-            size: frame_size(window.surface_size()),
-            interval: refresh_interval(window.as_ref()),
-            presentation: render.presentation(),
-            blend: render.blend(),
-            adapter: adapter.clone(),
-            frames: self.options.frames(),
-            script: self.options.script(),
-            record: self.options.record_setup(render.timing(), opening),
-        };
-        let mut owner = start(project, gpu, setup)?;
+        let (project, note) = self.project.clone().open_as(&self.options)?;
+        let record = self.options.record_setup(render.timing(), opening);
+        let setup = self.setup(window.as_ref(), &render, &adapter, record);
+        let mut owner = start(project, Arc::clone(&gpu), setup)?;
         owner.set_scale(window.scale_factor());
         owner.set_pen_status(pen.status());
         if let Some(note) = &note {
@@ -183,12 +180,102 @@ impl WindowApp {
             owner,
             render,
             window,
+            gpu,
             adapter,
             pacer: Pacer::default(),
             asked: None,
             closing: false,
             modifiers: ModifiersState::default(),
         })
+    }
+
+    /// How a frame loop in `window` is set up, drawing through `render` on the GPU `adapter` says,
+    /// its run recorded as `record` says.
+    fn setup(
+        &self,
+        window: &dyn Window,
+        render: &RenderThread,
+        adapter: &str,
+        record: Option<RecordSetup>,
+    ) -> Setup {
+        Setup {
+            size: frame_size(window.surface_size()),
+            interval: refresh_interval(window),
+            presentation: render.presentation(),
+            blend: render.blend(),
+            adapter: adapter.to_owned(),
+            frames: self.options.frames(),
+            script: self.options.script(),
+            record,
+        }
+    }
+
+    /// Swaps the frame loop for one on the project `reopen` asks for, on the same window, pen, GPU
+    /// and render thread.
+    ///
+    /// The render thread settles first, so no frame of the old loop reaches the new one, and the
+    /// old project closes before the new one opens, for its file lock ([`swap`]). The window's
+    /// scale and the pen's status are told again; its size and the display's interval come
+    /// through the setup. A live record goes across whole ([`crate::frame::Carried`]), so the
+    /// setup records nothing of its own: a stream of its own would empty the file. Only a window's
+    /// open run gets here, whose GPU isn't timed.
+    ///
+    /// Any failure ends the run with that error: the old project is closed by then, what it held
+    /// stays in its recovery file, and with no frame loop left the window goes too.
+    fn reopen(&mut self, event_loop: &dyn ActiveEventLoop, reopen: Reopen) {
+        let settled = self.running.as_mut().map_or(Ok(()), |running| {
+            let Running { owner, render, .. } = running;
+            render.settle(|presented| owner.shown(presented))
+        });
+        if let Err(error) = settled {
+            self.finish(event_loop, Err(error));
+            return;
+        }
+        let Some(running) = self.running.take() else {
+            return;
+        };
+        let setup = self.setup(
+            running.window.as_ref(),
+            &running.render,
+            &running.adapter,
+            None,
+        );
+        let Running {
+            pen,
+            owner,
+            render,
+            window,
+            gpu,
+            adapter,
+            pacer,
+            asked,
+            closing,
+            modifiers,
+        } = running;
+        match swap(owner, &self.project, reopen, Arc::clone(&gpu), setup) {
+            Ok(mut owner) => {
+                owner.set_scale(window.scale_factor());
+                owner.set_pen_status(pen.status());
+                self.running = Some(Running {
+                    pen,
+                    owner,
+                    render,
+                    window,
+                    gpu,
+                    adapter,
+                    pacer,
+                    asked,
+                    closing,
+                    modifiers,
+                });
+                // The new loop wants its first frame now, whatever the old one told winit.
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+            Err(error) => {
+                event_loop.exit();
+                self.wind_up_without_owner(pen, render, window, error);
+            }
+        }
     }
 
     /// Runs the frame loop until it has to wait, and tells winit how long.
@@ -348,6 +435,31 @@ impl WindowApp {
         };
         // `main` holds the receiver until the loop returns, so the send can't fail.
         drop(done.send(outcome));
+    }
+
+    /// Ends a run whose frame loop is gone, for `error`: a reopen that couldn't start a new one.
+    /// The pen, then the render thread, then the window, as [`WindowApp::wind_up`] has them.
+    fn wind_up_without_owner(
+        &mut self,
+        pen: AppPen,
+        render: RenderThread,
+        window: Arc<dyn Window>,
+        error: anyhow::Error,
+    ) {
+        let Some(done) = self.done.take() else {
+            return;
+        };
+        let (pen_window, pen_stopped) = pen.stop(&mut Vec::new());
+        drop(pen_window);
+        let stopped = render.stop().map(drop);
+        drop(window);
+        let failed: Result<Summary> = Err(error);
+        // `main` holds the receiver until the loop returns, so the send can't fail.
+        drop(done.send(Ended {
+            run: said_too(said_too(failed, stopped), pen_stopped),
+            owner: None,
+            end: self.end,
+        }));
     }
 
     /// The window was asked to close. The owner decides whether that can happen yet
@@ -705,6 +817,7 @@ impl ApplicationHandler for WindowApp {
                 self.end = End::Discard;
                 self.finish(event_loop, Ok(()));
             }
+            Some(WindowRequest::Reopen(reopen)) => self.reopen(event_loop, reopen),
             None => {}
         }
     }

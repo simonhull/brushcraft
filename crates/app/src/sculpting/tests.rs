@@ -1398,3 +1398,20 @@ fn a_frame_that_fits_none_of_its_dabs_shows_them_on_display_tiles_in_that_frame(
     assert!(moved > 0, "the dabs moved the display tiles drawn");
     assert!(held > 0, "held while their dabs are to land");
 }
+
+#[test]
+fn a_new_projects_brush_takes_on_what_the_keys_set() {
+    let dir = TestDir::new();
+    let mut project = project(&dir);
+    let mut old = Sculpting::new(&mut project);
+    assert!(old.change(BrushChange::Larger), "the radius moved");
+    assert!(old.change(BrushChange::Stronger), "and the strength");
+    let mut new = Sculpting::new(&mut project);
+    assert_ne!(new.settings, old.settings, "they start as ever");
+    new.take_settings(&old);
+    assert_eq!(new.settings, old.settings, "and go on as the user had them");
+    assert!(
+        (new.strength_factor - old.strength_factor).abs() < f32::EPSILON,
+        "the next key goes on from there"
+    );
+}

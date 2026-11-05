@@ -3955,3 +3955,440 @@ fn dont_save_on_a_restored_project_removes_its_recovery_file() {
     owner.discard().expect("discarded");
     assert!(!file.exists(), "what the user dropped doesn't come back");
 }
+
+/// A file standing for a recovery file set aside, in `dir`.
+fn set_aside(dir: &TestDir) -> PathBuf {
+    let kept = dir.path().join("kept.bcrf");
+    std::fs::write(&kept, b"the work set aside").expect("written");
+    kept
+}
+
+/// An owner of `dir`'s saved project, a recovery file set aside, as Use last save leaves it.
+fn last_save_owner(dir: &TestDir, claims: bool) -> (Owner<PenLog, NoUploads>, PathBuf) {
+    let mut project = project(dir);
+    let path = dir.path().join("saved.bcrf");
+    drop(project.save_as(&path).expect("saved"));
+    let brush = PenLog {
+        claims,
+        ..PenLog::default()
+    };
+    let owner = Owner::new(project, brush, NoUploads, big_setup(), Instant::now());
+    let kept = set_aside(dir);
+    let mut owner = owner.keeping_recovery(kept.clone());
+    run(&mut owner, 10_000);
+    (owner, kept)
+}
+
+/// A project of `dir` with work found on an earlier save, the note up asking about it: the owner,
+/// on the project as opened, and the recovery file.
+fn asking_owner(dir: &TestDir) -> (Owner<PenLog, NoUploads>, PathBuf) {
+    let (path, config) = left_work(dir);
+    let mut later = Project::open(&path, config.clone()).expect("opened");
+    edit_one_tile(&mut later);
+    drop(later.save().expect("saved"));
+    later.close(false).expect("closed");
+    let found = store::find_recoveries(&config.recovery_dir).expect("listed");
+    let candidate = found.first().expect("the file").clone();
+    let file = candidate.path.clone();
+    let project = Project::open(&path, config).expect("opened");
+    let brush = PenLog {
+        claims: true,
+        ..PenLog::default()
+    };
+    let mut owner = Owner::new(project, brush, NoUploads, big_setup(), Instant::now());
+    run(&mut owner, 10_000);
+    owner.note(&OpenNote::EarlierVersion { candidate }, seen_now());
+    run(&mut owner, 10_000);
+    (owner, file)
+}
+
+/// A restored project of `dir` with its note up: the owner and its recovery file.
+fn restored_noted(dir: &TestDir) -> (Owner<PenLog, NoUploads>, PathBuf) {
+    let (_, config) = left_work(dir);
+    let found = store::find_recoveries(&config.recovery_dir).expect("listed");
+    let candidate = found.first().expect("the file");
+    let project = Project::restore(candidate, config).expect("restored");
+    let brush = PenLog {
+        claims: true,
+        ..PenLog::default()
+    };
+    let mut owner = Owner::new(project, brush, NoUploads, big_setup(), Instant::now());
+    run(&mut owner, 10_000);
+    let note = OpenNote::Restored {
+        path: candidate.path.clone(),
+        when: candidate.modified,
+    };
+    owner.note(&note, seen_now());
+    run(&mut owner, 10_000);
+    (owner, candidate.path.clone())
+}
+
+#[test]
+fn closing_for_a_reopen_keeps_the_recovery_file() {
+    let dir = TestDir::new();
+    let (owner, file) = restored_noted(&dir);
+    let before = std::fs::read(&file).expect("read");
+    drop(owner.close_for_reopen().expect("closed"));
+    assert_eq!(std::fs::read(&file).expect("read"), before, "as it was");
+}
+
+#[test]
+fn closing_for_a_reopen_lets_go_of_the_project_file() {
+    let dir = TestDir::new();
+    let (owner, _) = restored_noted(&dir);
+    let path = owner.saving.name().to_owned();
+    drop(owner.close_for_reopen().expect("closed"));
+    let config = ProjectConfig {
+        store: StoreConfig::new(512 << 20, 1),
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let file = dir.path().join(format!("{path}.bcrf"));
+    let opened = Project::open(&file, config).expect("its lock went with it");
+    opened.close(false).expect("closed");
+}
+
+#[test]
+fn use_last_save_asks_the_window_for_the_last_save_and_the_way_back() {
+    let dir = TestDir::new();
+    let (mut owner, file) = restored_noted(&dir);
+    let on = owner.dialogs.control(Action::UseLastSave);
+    owner.pen(pen_at(input::Phase::Down, on));
+    owner.pen(pen_at(input::Phase::Up, on));
+    let asked = WindowRequest::Reopen(Reopen::LastSave { kept: file });
+    assert_eq!(owner.take_request(), Some(asked));
+    assert_eq!(owner.take_request(), None, "once");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn use_last_save_is_refused_with_a_stroke_waiting_for_its_frame() {
+    let dir = TestDir::new();
+    let (mut owner, _) = restored_noted(&dir);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    owner.act(Action::UseLastSave, Instant::now());
+    assert_eq!(owner.take_request(), None, "that stroke would be lost");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn use_last_save_is_refused_once_a_stroke_went_to_the_brush() {
+    let dir = TestDir::new();
+    let (mut owner, _) = restored_noted(&dir);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    owner.expose();
+    run(&mut owner, 100);
+    // Nothing shows it now: a press in flight as the note went, say.
+    owner.act(Action::UseLastSave, Instant::now());
+    assert_eq!(owner.take_request(), None, "the stroke is on this project");
+    let later = OpenNote::Restored {
+        path: "recovery.bcrf".into(),
+        when: std::time::SystemTime::now(),
+    };
+    owner.note(&later, Instant::now());
+    owner.act(Action::UseLastSave, Instant::now());
+    assert_eq!(owner.take_request(), None, "however the bar came back");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn use_last_save_is_refused_during_a_save() {
+    let dir = TestDir::new();
+    let (mut owner, _) = restored_noted(&dir);
+    owner.request_save(Instant::now());
+    owner.act(Action::UseLastSave, Instant::now());
+    assert_eq!(owner.take_request(), None, "the save goes on");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn use_last_save_needs_its_note() {
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    owner.act(Action::UseLastSave, Instant::now());
+    assert_eq!(owner.take_request(), None);
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_stroke_after_the_click_stands_and_the_reopen_goes() {
+    let dir = TestDir::new();
+    let (mut owner, _) = restored_noted(&dir);
+    owner.act(Action::UseLastSave, Instant::now());
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(owner.take_request(), None, "swapping now would lose it");
+    assert!(!owner.dialogs.noting(), "and the stroke answered the note");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_save_after_the_click_stands_and_the_reopen_goes() {
+    let dir = TestDir::new();
+    let (mut owner, _) = restored_noted(&dir);
+    owner.act(Action::UseLastSave, Instant::now());
+    owner.request_save(Instant::now());
+    assert_eq!(
+        owner.take_request(),
+        None,
+        "closing now would drop the save"
+    );
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_save_puts_the_restored_note_away() {
+    let dir = TestDir::new();
+    let (mut owner, _) = restored_noted(&dir);
+    owner.request_save(Instant::now());
+    for _ in 0..100_000 {
+        if owner.save_stage().is_none() {
+            break;
+        }
+        owner.save_step();
+        owner.upkeep(Instant::now()).expect("upkeep");
+    }
+    assert!(!owner.unsaved(), "saved");
+    assert!(!owner.dialogs.noting(), "the last save is the work now");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn open_as_a_copy_says_saving_in_a_frame_before_it_asks() {
+    let dir = TestDir::new();
+    let (mut owner, file) = asking_owner(&dir);
+    owner.act(Action::OpenCopy, Instant::now());
+    assert!(owner.dialogs.copying(), "the bar says so");
+    assert_eq!(owner.take_request(), None, "no frame has shown it yet");
+    let deadline = loop {
+        let now = Instant::now();
+        match owner.next(now) {
+            Next::Frame { deadline } => break deadline,
+            Next::Wait { until } => std::thread::sleep(until.saturating_duration_since(now)),
+            next @ (Next::Render | Next::Gpu | Next::Idle { .. }) => {
+                panic!("a frame is wanted to show it: {next:?}");
+            }
+        }
+    };
+    let mut handed = None;
+    let now = Instant::now();
+    let sent = owner.frame(now, deadline, |request| {
+        handed = Some(request);
+        Ok(())
+    });
+    sent.expect("a frame");
+    let handed = handed.expect("handed off");
+    assert!(handed.ui.is_some(), "it carries the bar");
+    assert_eq!(owner.take_request(), None, "handed off isn't on screen");
+    owner.shown(presented(handed.number));
+    let Some(WindowRequest::Reopen(Reopen::Copy { candidate })) = owner.take_request() else {
+        panic!("shown, the copy can start");
+    };
+    assert_eq!(candidate.path, file);
+    owner.close().expect("closed");
+}
+
+#[test]
+fn a_stroke_before_the_copy_starts_stops_it() {
+    let dir = TestDir::new();
+    let (mut owner, _) = asking_owner(&dir);
+    owner.act(Action::OpenCopy, Instant::now());
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(owner.take_request(), None, "the stroke is on this project");
+    assert!(!owner.dialogs.noting(), "no bar left saying \"Saving\"");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn open_as_a_copy_is_refused_with_a_stroke_waiting_for_its_frame() {
+    let dir = TestDir::new();
+    let (mut owner, _) = asking_owner(&dir);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    owner.act(Action::OpenCopy, Instant::now());
+    assert!(!owner.dialogs.copying(), "nothing starts");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn ignore_leaves_the_recovery_file() {
+    let dir = TestDir::new();
+    let (mut owner, file) = asking_owner(&dir);
+    owner.act(Action::Ignore, Instant::now());
+    assert!(!owner.dialogs.noting(), "the bar goes");
+    assert_eq!(owner.take_request(), None);
+    owner.close().expect("closed");
+    assert!(file.exists(), "it's found again next time");
+}
+
+#[test]
+fn the_kept_recovery_file_goes_on_the_first_stroke() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let (mut owner, kept) = last_save_owner(&dir, true);
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    assert!(kept.exists(), "queued is no stroke yet");
+    owner.expose();
+    run(&mut owner, 100);
+    assert!(!kept.exists(), "the first stroke ends the way back");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn the_kept_recovery_file_goes_on_the_next_save() {
+    let dir = TestDir::new();
+    let (mut owner, kept) = last_save_owner(&dir, true);
+    edit_one_tile(owner.project());
+    owner.request_save(Instant::now());
+    assert!(kept.exists(), "asked for is no save yet");
+    for _ in 0..100_000 {
+        if owner.save_stage().is_none() {
+            break;
+        }
+        owner.save_step();
+        owner.upkeep(Instant::now()).expect("upkeep");
+    }
+    assert!(!owner.unsaved(), "saved");
+    assert!(!kept.exists(), "the save ends it");
+    owner.close().expect("closed");
+}
+
+#[test]
+fn with_neither_it_stays_so_reopening_undoes_the_choice() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let (mut owner, kept) = last_save_owner(&dir, false);
+    owner.request_save(Instant::now());
+    run(&mut owner, 100);
+    owner.save_step();
+    assert!(kept.exists(), "there was nothing to save");
+    owner.pen(pen_at(Phase::Hover, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    owner.pen(pen_at(Phase::Up, ON_THE_MODEL));
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(owner.pen_router.stroke(), None, "orbiting's over");
+    assert!(kept.exists(), "looking at the model is no stroke");
+    owner.close().expect("closed");
+    assert!(kept.exists(), "closing is neither");
+}
+
+#[test]
+fn a_kept_file_gone_already_is_no_trouble() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let (mut owner, kept) = last_save_owner(&dir, true);
+    std::fs::remove_file(&kept).expect("removed");
+    owner.pen(pen_at(Phase::Down, ON_THE_MODEL));
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(owner.kept_recovery, None, "said and forgotten");
+    owner.close().expect("closed");
+}
+
+/// A brush with one setting the keys change.
+#[derive(Debug, Default)]
+struct Sized(u32);
+
+impl Brush for Sized {
+    fn step(
+        &mut self,
+        _context: BrushContext<'_>,
+        _pen: &PenFrame,
+        _budget: &BrushBudget,
+    ) -> Result<BrushReport> {
+        Ok(BrushReport::default())
+    }
+
+    fn change(&mut self, _change: BrushChange) -> bool {
+        self.0 += 1;
+        true
+    }
+
+    fn take_settings(&mut self, from: &Self) {
+        self.0 = from.0;
+    }
+}
+
+#[test]
+fn a_frame_loop_taking_over_goes_on_where_the_last_left_off() {
+    let dir = TestDir::new();
+    let setup = Setup {
+        record: Some(RecordSetup {
+            path: None,
+            project: "test".to_owned(),
+            gpu_timing: false,
+            lod_timing: false,
+            opening: Instant::now(),
+        }),
+        ..big_setup()
+    };
+    let mut project_now = project(&dir);
+    let path = dir.path().join("saved.bcrf");
+    drop(project_now.save_as(&path).expect("saved"));
+    let mut old = Owner::new(
+        project_now,
+        Sized::default(),
+        NoUploads,
+        setup,
+        Instant::now(),
+    );
+    run(&mut old, 10_000);
+    old.change_brush(BrushChange::Larger);
+    old.change_look(LookChange::Wireframe);
+    old.input(Input::Modifiers(crate::navigate::Modifiers {
+        shift: true,
+        ctrl: false,
+    }));
+    old.input(Input::Wheel { notches: 3.0 });
+    run(&mut old, 10_000);
+    old.pen(pen_at(input::Phase::Hover, ON_THE_MODEL));
+    let (camera, look, made, clock) = (*old.camera(), old.look(), old.finished(), old.clock);
+    let lines = old.record_lines().len();
+    assert!(made > 0 && lines > 1, "{made} frames, {lines} lines");
+    assert_ne!(camera, Camera::default(), "the wheel moved it");
+
+    let carried = old.close_for_reopen().expect("closed");
+    let config = ProjectConfig {
+        store: StoreConfig::new(512 << 20, 1),
+        recovery_dir: dir.path().join("recovery"),
+    };
+    let project = Project::open(&path, config).expect("its lock went");
+    let new = Owner::new(
+        project,
+        Sized::default(),
+        NoUploads,
+        big_setup(),
+        Instant::now(),
+    );
+    let mut new = new.go_on_from(carried);
+    assert_eq!(*new.camera(), camera, "the view stays");
+    assert_eq!(new.look(), look, "and the look");
+    assert_eq!(new.brush().0, 1, "and the brush as the user set it");
+    assert_eq!(new.finished(), made, "the run's frames go on counting");
+    assert_eq!(new.clock, clock, "on the run's clock");
+    assert_eq!(new.pen_queue.len(), 1, "a sample no frame took");
+    assert_eq!(new.record_lines().len(), lines, "the record so far");
+    assert!(!new.fitting.frame, "no framing again");
+    let title = new.title_change().expect("the new loop says its title");
+    assert_eq!(title, "saved - BrushCraft");
+
+    assert_eq!(run(&mut new, 1), 1, "a frame is wanted");
+    assert_eq!(new.started, made + 1, "the next frame's number");
+    assert_eq!(new.record_lines().len(), lines + 1, "the record goes on");
+    assert_eq!(*new.camera(), camera, "and that frame didn't move the view");
+    new.close().expect("closed");
+}
+
+#[test]
+fn a_copy_that_failed_says_so_in_the_title_and_the_chip_stays_quiet() {
+    let dir = TestDir::new();
+    let mut owner = bar_owner(&dir, true);
+    owner.copy_failed(&anyhow!("no room"));
+    let title = owner.title_change().expect("a title");
+    assert!(title.contains("no room"), "{title}");
+    assert!(!owner.unsaved(), "nothing is lost, or unsaved");
+    owner.close().expect("closed");
+}

@@ -254,6 +254,8 @@ pub(crate) struct RenderThread {
     gpu: Arc<Gpu>,
     /// The newest frame the GPU has finished, as its completion callbacks say.
     finished: Arc<AtomicU64>,
+    /// Frames sent that haven't come back as a [`Presented`] yet.
+    in_flight: u64,
 }
 
 impl RenderThread {
@@ -317,6 +319,7 @@ impl RenderThread {
             timing,
             gpu: polled,
             finished,
+            in_flight: 0,
         })
     }
 
@@ -368,9 +371,31 @@ impl RenderThread {
             .ok_or_else(|| anyhow!("the render thread is stopping"))?
             .send(frame);
         match sent {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.in_flight += 1;
+                Ok(())
+            }
             Err(_) => Err(self.failure()),
         }
+    }
+
+    /// Waits until every frame sent has come back, handing each to `shown`, so a frame loop can
+    /// give way to another with none of its frames left to reach the new one.
+    ///
+    /// # Errors
+    ///
+    /// The error that stopped the thread, if it stops instead.
+    pub(crate) fn settle(&mut self, mut shown: impl FnMut(Presented)) -> Result<()> {
+        while self.in_flight > 0 {
+            shown(self.wait()?);
+        }
+        Ok(())
+    }
+
+    /// `presented` came back: one fewer on its way.
+    fn came_back(&mut self, presented: Presented) -> Presented {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        presented
     }
 
     /// Every frame the thread has finished since the last call, without waiting.
@@ -383,7 +408,7 @@ impl RenderThread {
         let mut done = Vec::new();
         loop {
             match self.presented.try_recv() {
-                Ok(presented) => done.push(presented),
+                Ok(presented) => done.push(self.came_back(presented)),
                 // A thread that stopped is reported once what it finished has been taken.
                 Err(TryRecvError::Disconnected) if done.is_empty() => return Err(self.failure()),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(done),
@@ -398,7 +423,7 @@ impl RenderThread {
     /// The error that stopped the thread, if it stops instead.
     pub(crate) fn wait(&mut self) -> Result<Presented> {
         match self.presented.recv() {
-            Ok(presented) => Ok(presented),
+            Ok(presented) => Ok(self.came_back(presented)),
             Err(_) => Err(self.failure()),
         }
     }
@@ -412,7 +437,7 @@ impl RenderThread {
     pub(crate) fn wait_until(&mut self, deadline: Instant) -> Result<Option<Presented>> {
         let timeout = deadline.saturating_duration_since(Instant::now());
         match self.presented.recv_timeout(timeout) {
-            Ok(presented) => Ok(Some(presented)),
+            Ok(presented) => Ok(Some(self.came_back(presented))),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => Err(self.failure()),
         }
@@ -663,6 +688,45 @@ mod tests {
         assert!(ink[0] > 200, "ink is bright: {ink:?}");
         let blank = pixels[corner * 160 + corner];
         assert!(blank[0] < 100, "its first column is backing: {blank:?}");
+    }
+
+    #[test]
+    fn settling_returns_once_every_frame_sent_was_presented() {
+        let size = Size::new(8, 8).expect("non-zero");
+        let (gpu, target) = offscreen(size);
+        let mut hooks = Hooks::none();
+        // Slow enough that nothing has come back by the time the last is sent.
+        hooks.before_draw = Box::new(|_| thread::sleep(Duration::from_millis(20)));
+        let mut thread = RenderThread::spawn(gpu, target, hooks, false).expect("render thread");
+        for number in 1..=3 {
+            let frame = FrameRequest {
+                number,
+                ..request(size, &[])
+            };
+            thread.send(frame).expect("sent");
+        }
+        let first = thread.wait().expect("drawn");
+        let mut rest = Vec::new();
+        thread
+            .settle(|presented| rest.push(presented.number))
+            .expect("settled");
+        assert_eq!((first.number, rest), (1, vec![2, 3]), "in order, the rest");
+        thread
+            .settle(|_| panic!("nothing is left"))
+            .expect("settled");
+        thread.stop().expect("stopped cleanly");
+    }
+
+    #[test]
+    fn settling_a_stopped_thread_says_why() {
+        let size = Size::new(8, 8).expect("non-zero");
+        let (gpu, target) = offscreen(size);
+        let mut hooks = Hooks::none();
+        hooks.before_draw = Box::new(|_| panic!("a bug in a pass"));
+        let mut thread = RenderThread::spawn(gpu, target, hooks, false).expect("render thread");
+        thread.send(request(size, &[])).expect("sent");
+        let error = thread.settle(|_| {}).expect_err("the thread is gone");
+        assert!(format!("{error:#}").contains("panicked"), "{error:#}");
     }
 
     #[test]

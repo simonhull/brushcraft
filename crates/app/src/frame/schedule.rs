@@ -311,6 +311,15 @@ impl Scheduler {
         Self { morph, ..self }
     }
 
+    /// Goes on from `old`, as a frame loop taking over from another on the same render thread:
+    /// the frames counted so far, what the GPU has finished of them, and the display's pace.
+    pub(crate) const fn go_on_from(&mut self, old: &Self) {
+        self.started = old.started;
+        self.gpu_finished = old.gpu_finished;
+        self.last_start = old.last_start;
+        self.hidden = old.hidden;
+    }
+
     /// The GPU has finished frame `frame` and every one before it (frames are numbered from 1,
     /// as they start). An older frame than one heard of already changes nothing.
     pub(crate) fn gpu_finished(&mut self, frame: u64) {

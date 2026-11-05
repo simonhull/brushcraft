@@ -161,6 +161,8 @@ enum Prompt {
         /// What was found.
         candidate: RecoveryCandidate,
     },
+    /// "Saving": found work on its way to a copy, which holds the thread once it starts.
+    Copying,
 }
 
 impl Prompt {
@@ -214,6 +216,7 @@ impl Prompt {
                     said.as_deref(),
                 ))
             }
+            Self::Copying => Some(Bar::new("Saving", Vec::new())),
         }
     }
 }
@@ -457,16 +460,39 @@ impl Dialogs {
             Prompt::None
             | Prompt::AskClose { .. }
             | Prompt::Finishing { .. }
-            | Prompt::EarlierVersion { .. } => None,
+            | Prompt::EarlierVersion { .. }
+            | Prompt::Copying => None,
         }
     }
 
-    /// Whether the bar says what opening found.
+    /// Whether the bar says what opening found, or a copy of it is on its way.
     pub(crate) const fn noting(&self) -> bool {
         matches!(
             self.prompt,
-            Prompt::Restored { .. } | Prompt::EarlierVersion { .. }
+            Prompt::Restored { .. } | Prompt::EarlierVersion { .. } | Prompt::Copying
         )
+    }
+
+    /// Whether the bar says unsaved work was restored.
+    pub(crate) const fn says_restored(&self) -> bool {
+        matches!(self.prompt, Prompt::Restored { .. })
+    }
+
+    /// Whether the bar says a copy is on its way.
+    pub(crate) const fn copying(&self) -> bool {
+        matches!(self.prompt, Prompt::Copying)
+    }
+
+    /// The bar goes from offering a copy of found work to saying it's saving: that work, if it
+    /// offered one.
+    pub(crate) fn begin_copy(&mut self, now: Instant) -> Option<RecoveryCandidate> {
+        let Prompt::EarlierVersion { candidate, .. } = &self.prompt else {
+            return None;
+        };
+        let candidate = candidate.clone();
+        self.prompt = Prompt::Copying;
+        self.show_prompt(now);
+        Some(candidate)
     }
 
     /// Takes the bar away.
@@ -1154,6 +1180,62 @@ mod tests {
         assert!(dialogs.asking_close(), "the question stays");
     }
 
+    /// The note of work found on an earlier save, written at `when`.
+    fn earlier(when: SystemTime) -> OpenNote {
+        let candidate = RecoveryCandidate {
+            path: "recovery.bcrf".into(),
+            project: store::ProjectId::from_bits(1),
+            base: None,
+            base_path: None,
+            last_edit: None,
+            modified: when,
+            status: store::CandidateStatus::RestorableOnEarlierSave,
+        };
+        OpenNote::EarlierVersion { candidate }
+    }
+
+    #[test]
+    fn the_earlier_version_note_asks_and_waits_for_as_long_as_it_takes() {
+        let now = Instant::now();
+        let when = SystemTime::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&earlier(when), now);
+        let ignore = Control {
+            label: "Ignore".to_owned(),
+            action: Action::Ignore,
+            emphasis: Emphasis::Quiet,
+        };
+        let copy = Control {
+            label: "Open as a copy".to_owned(),
+            action: Action::OpenCopy,
+            emphasis: Emphasis::Filled,
+        };
+        let said = said_now(when).expect("a time the clock can say");
+        let title = "Unsaved work found from an earlier version";
+        let bar = Bar::new(title, vec![ignore, copy]).with_detail(said);
+        assert_eq!(dialogs.bar(), Some(bar));
+        assert_eq!(dialogs.next_change(), None, "it asks a question");
+        dialogs.update(CLEAN, now + Duration::from_secs(3600));
+        assert!(dialogs.noting(), "still asking");
+    }
+
+    #[test]
+    fn beginning_a_copy_says_saving_and_hands_over_what_was_found() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        assert_eq!(dialogs.begin_copy(now), None, "nothing to copy");
+        dialogs.note(&restored(SystemTime::now()), now);
+        assert_eq!(dialogs.begin_copy(now), None, "nor with this note");
+        assert!(dialogs.says_restored(), "which stays");
+
+        dialogs.note(&earlier(SystemTime::now()), now);
+        let found = dialogs.begin_copy(now).expect("what was found");
+        assert_eq!(found.path, std::path::Path::new("recovery.bcrf"));
+        assert_eq!(dialogs.bar(), Some(Bar::new("Saving", Vec::new())));
+        assert!(dialogs.copying() && dialogs.noting());
+        assert!(dialogs.frame(now).is_some(), "and it draws");
+    }
+
     #[test]
     fn a_note_under_the_pen_waits_for_the_up() {
         let now = Instant::now();
@@ -1187,6 +1269,10 @@ mod tests {
 
             dialogs.note(&restored(SystemTime::now()), now);
             assert_controls_found(&dialogs, &[Action::UseLastSave], seen, scale);
+
+            dialogs.note(&earlier(SystemTime::now()), now);
+            let found = [Action::Ignore, Action::OpenCopy];
+            assert_controls_found(&dialogs, &found, seen, scale);
         }
     }
 

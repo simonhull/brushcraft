@@ -2125,6 +2125,11 @@ impl Brush for Sculpting {
         self.set_radius_pixels(pixels);
     }
 
+    fn take_settings(&mut self, from: &Self) {
+        self.settings = from.settings.clone();
+        self.strength_factor = from.strength_factor;
+    }
+
     fn status(&self) -> &[String] {
         &self.status.0
     }
