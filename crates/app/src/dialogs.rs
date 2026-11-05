@@ -456,6 +456,12 @@ impl Dialogs {
         }
     }
 
+    /// Whether `at` is on the bar's glass.
+    pub(crate) fn on_bar(&self, at: Pixel, now: Instant) -> bool {
+        let (x, y) = ui_point(at);
+        self.ui.on_bar(x, y, now)
+    }
+
     /// Who the pen's `Down` at `at` belongs to. If it is the UI, so is the stroke, until
     /// [`Dialogs::release`] or [`Dialogs::drop_pen_press`] ends it.
     pub(crate) fn claim(&mut self, at: Pixel, now: Instant) -> Claim {

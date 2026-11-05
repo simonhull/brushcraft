@@ -1437,7 +1437,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             Phase::Down => self.dialogs.claim(sample.at, now) == Claim::Ui,
             Phase::Enter | Phase::Hover => {
                 self.ui_hover(Some(sample.at));
-                false
+                self.new_button_on_the_bar(sample, now)
             }
             Phase::Leave => {
                 self.ui_hover(None);
@@ -1452,6 +1452,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             }
             Phase::Up => false,
         }
+    }
+
+    /// Whether `sample` presses a barrel button navigation hasn't heard, over the bar: it goes no
+    /// further, as a press on the bar never reaches navigation. Off the bar the same button goes on
+    /// as ever, and it stays new until it does.
+    fn new_button_on_the_bar(&self, sample: &PenSample, now: Instant) -> bool {
+        let last = self.pen_queue.last();
+        let heard = last.map_or_else(|| self.pen_navigation.buttons(), |queued| queued.buttons);
+        let new = sample.buttons.with(heard, false) != input::Buttons::default();
+        new && self.dialogs.on_bar(sample.at, now)
     }
 
     /// When a pen holding a prompt back counts as lifted: [`STROKE_QUIET`] after its last sample.

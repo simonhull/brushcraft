@@ -3698,3 +3698,57 @@ fn a_double_tap_on_save_stays_a_save() {
     assert!(owner.dialogs.finishing(), "the second tap undid the first");
     assert_eq!(owner.brush.strokes, 0, "and no stroke began");
 }
+
+/// A pen hovering over a control's barrel press stays off navigation: the bar is under it.
+#[test]
+fn a_barrel_press_hovering_the_bar_stays_off_navigation() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    let keep = owner.dialogs.control(Action::KeepSculpting);
+    let glass = owner.dialogs.bare_glass();
+    for over in [keep, glass] {
+        let hover = pen_at(Phase::Hover, over);
+        owner.pen(hover);
+        run(&mut owner, 100);
+        owner.pen(PenSample {
+            buttons: input::Buttons::PRIMARY,
+            ..hover
+        });
+        owner.expose();
+        run(&mut owner, 100);
+        assert_eq!(
+            owner.pen_navigation,
+            PenNavigation::default(),
+            "navigation heard the barrel"
+        );
+    }
+}
+
+/// Off the bar, the barrel is navigation's as ever, a barrel held before reaching the bar too.
+#[test]
+fn a_barrel_off_the_bar_or_brought_to_it_is_navigations() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    let keep = owner.dialogs.control(Action::KeepSculpting);
+    let barrel = |at| PenSample {
+        buttons: input::Buttons::PRIMARY,
+        ..pen_at(Phase::Hover, at)
+    };
+    owner.pen(barrel(ON_THE_MODEL));
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(owner.pen_navigation.buttons(), input::Buttons::PRIMARY);
+    owner.pen(barrel(keep));
+    assert_eq!(owner.pen_queue.len(), 1, "nothing new: it goes on");
+    let released = pen_at(Phase::Hover, keep);
+    owner.pen(released);
+    owner.expose();
+    run(&mut owner, 100);
+    assert_eq!(
+        owner.pen_navigation.buttons(),
+        input::Buttons::default(),
+        "and so does its release"
+    );
+}

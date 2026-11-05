@@ -37,6 +37,11 @@ pub(crate) struct PenNavigation {
 }
 
 impl PenNavigation {
+    /// The barrel buttons navigation has heard pressed.
+    pub(crate) const fn buttons(self) -> Buttons {
+        self.buttons
+    }
+
     /// Hands `emit` navigation's input for `sample`, in order: barrel buttons changed first,
     /// then the motion, then the tip.
     pub(crate) fn inputs(&mut self, sample: &PenSample, mut emit: impl FnMut(Input)) {
