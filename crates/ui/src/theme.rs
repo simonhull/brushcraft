@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use crate::text::Weight;
+
 /// A colour in display (sRGB-encoded) values, straight alpha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Colour {
@@ -19,6 +21,9 @@ pub struct Colour {
 }
 
 impl Colour {
+    /// No colour at all: an unfilled shape.
+    pub const CLEAR: Self = Self::rgba(0, 0, 0, 0);
+
     /// Opaque.
     #[must_use]
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
@@ -29,6 +34,15 @@ impl Colour {
     #[must_use]
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
+    }
+
+    /// This with its alpha scaled by `opacity`, 0 to 1.
+    #[must_use]
+    pub fn faded(self, opacity: f32) -> Self {
+        Self {
+            a: to_channel(f64::from(self.a) * f64::from(opacity)),
+            ..self
+        }
     }
 
     /// This over an opaque `ground`, blended in display values, as the UI pass does. The result is
@@ -97,16 +111,26 @@ pub struct Theme {
     pub accent_text: Colour,
     /// This needs the user.
     pub needs_you: Colour,
+    /// The line around glass that needs the user.
+    pub needs_you_hairline: Colour,
+    /// The groove a progress line runs in.
+    pub progress_track: Colour,
     /// Text on glass.
     pub text: Colour,
     /// Secondary text on glass.
     pub quiet_text: Colour,
+    /// The width of the line around glass.
+    pub hairline_width: f32,
     /// The corners of a bar.
     pub radius: f32,
     /// The corners of a control.
     pub control_radius: f32,
     /// The height of a control: a pen's target.
     pub control_height: f32,
+    /// A quiet control's label in from its sides.
+    pub control_padding: f32,
+    /// The filled control's label in from its sides.
+    pub filled_padding: f32,
     /// Between neighbouring controls.
     pub gap: f32,
     /// A bar's padding around its controls.
@@ -115,14 +139,38 @@ pub struct Theme {
     pub bar_text_inset: f32,
     /// A bar up from the window's bottom edge.
     pub bar_bottom: f32,
+    /// A bar's narrowest, in any window that has the room.
+    pub bar_min_width: f32,
+    /// The least between a bar and the window's sides.
+    pub bar_margin: f32,
+    /// A progress line's thickness.
+    pub progress_height: f32,
+    /// A progress line's end in from a bar's padding.
+    pub progress_end_inset: f32,
     /// The height of a chip, whose corners are fully round.
     pub chip_height: f32,
     /// A chip in from the window's top and right edges.
     pub chip_inset: f32,
+    /// A chip's content in from its sides.
+    pub chip_padding: f32,
+    /// The side of a dot or ring.
+    pub mark_size: f32,
+    /// The width of a ring's line.
+    pub ring_width: f32,
+    /// From a bar's needs-you mark to its text.
+    pub needs_you_gap: f32,
     /// Body text: size and line height.
     pub body: (f32, f32),
     /// Status text: size and line height.
     pub status: (f32, f32),
+    /// A bar's title.
+    pub title_weight: Weight,
+    /// A quiet control's label.
+    pub control_weight: Weight,
+    /// The filled control's label.
+    pub filled_weight: Weight,
+    /// A bar's detail and a chip's text.
+    pub status_weight: Weight,
     /// How long anything takes to appear or leave.
     pub fade: Duration,
     /// A chip's opacity while the pen is down.
@@ -142,19 +190,36 @@ impl Theme {
         accent: Colour::rgb(0xF0, 0x8A, 0x3C),
         accent_text: Colour::rgb(0x1C, 0x12, 0x08),
         needs_you: Colour::rgb(0xFF, 0x6F, 0x61),
+        needs_you_hairline: Colour::rgba(0xFF, 0x6F, 0x61, 153),
+        progress_track: Colour::rgba(255, 255, 255, 41),
         text: Colour::rgb(0xF4, 0xF5, 0xF6),
         quiet_text: Colour::rgb(0xDC, 0xDE, 0xE1),
+        hairline_width: 1.0,
         radius: 14.0,
         control_radius: 10.0,
         control_height: 44.0,
+        control_padding: 16.0,
+        filled_padding: 24.0,
         gap: 8.0,
         bar_inset: 12.0,
         bar_text_inset: 22.0,
         bar_bottom: 28.0,
+        bar_min_width: 480.0,
+        bar_margin: 20.0,
+        progress_height: 3.0,
+        progress_end_inset: 10.0,
         chip_height: 32.0,
         chip_inset: 20.0,
+        chip_padding: 12.0,
+        mark_size: 8.0,
+        ring_width: 1.5,
+        needs_you_gap: 14.0,
         body: (15.0, 22.0),
         status: (13.0, 18.0),
+        title_weight: Weight::Medium,
+        control_weight: Weight::Medium,
+        filled_weight: Weight::SemiBold,
+        status_weight: Weight::Regular,
         fade: Duration::from_millis(120),
         chip_pen_down: 0.25,
         saved_alpha: 0.6,
@@ -196,6 +261,14 @@ mod tests {
             Colour::rgb(88, 88, 89),
             "blended in display values"
         );
+    }
+
+    #[test]
+    fn fading_scales_alpha_alone() {
+        let colour = Colour::rgba(10, 20, 30, 200);
+        assert_eq!(colour.faded(0.5), Colour::rgba(10, 20, 30, 100), "half");
+        assert_eq!(colour.faded(0.0).a, 0, "none");
+        assert_eq!(colour.faded(1.0), colour, "all");
     }
 
     #[test]
