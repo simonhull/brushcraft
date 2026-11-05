@@ -88,6 +88,18 @@ impl<A> Bar<A> {
         }
     }
 
+    /// What it says.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// What it says under that, if anything.
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
     /// Its controls, left to right, at most one of them filled.
     #[must_use]
     pub fn controls(&self) -> &[Control<A>] {

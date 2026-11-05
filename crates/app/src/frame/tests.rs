@@ -21,6 +21,7 @@ use store::{Epoch, ProjectConfig, StoreConfig};
 use ui::{Bar, Control, Emphasis, Theme, UiFrame};
 
 use super::*;
+use crate::OpenNote;
 use crate::camera::Pixel;
 use crate::dialogs::Action;
 use crate::navigate::Button;
@@ -2767,11 +2768,11 @@ impl Brush for Lands {
         self.drops
     }
 
-    fn dropped_since(&self, before: u64) -> Result<()> {
+    fn dropped_since(&self, before: u64) -> Result<(), DabsDropped> {
         if self.drops == before {
             Ok(())
         } else {
-            bail!("no room for the dabs");
+            Err(DabsDropped("no room for the dabs".to_owned()))
         }
     }
 }
@@ -3349,7 +3350,10 @@ fn dabs_dropped_under_the_bar_keep_the_window_and_the_title_says_so() {
     drop(owner.title_change());
     finish_saving(&mut owner);
     assert_eq!(owner.take_request(), None, "the window stays");
-    assert!(!owner.dialogs.bar_showing(), "the bar goes");
+    assert_eq!(
+        bar_says(&owner),
+        "Couldn't save: a stroke didn't finish / Your other work is safe and still open."
+    );
     let title = owner.title_change().expect("it says so");
     assert!(title.contains("no room for the dabs"), "{title}");
 
@@ -3393,6 +3397,326 @@ fn dabs_dropped_while_a_failed_save_keeps_the_window_count_as_told() {
         Some(WindowRequest::Exit),
         "said already"
     );
+}
+
+/// What the bar says: its title and detail, as a test can read them whichever bar it is.
+fn bar_says<B: Brush, U: Uploads>(owner: &Owner<B, U>) -> String {
+    let bar = owner.dialogs.bar().expect("a bar");
+    format!("{} / {}", bar.title(), bar.detail().unwrap_or_default())
+}
+
+/// A full disk's error, as a save gets it.
+fn disk_full() -> anyhow::Error {
+    let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+    anyhow::Error::new(full).context("saving the project")
+}
+
+/// [`closing_owner`], a Ctrl+S having failed for a full disk, its bar seen.
+fn failed_owner(dir: &TestDir) -> Owner<Lands, NoUploads> {
+    let mut owner = closing_owner(dir, 0);
+    let now = Instant::now();
+    owner.request_save(now);
+    owner.end_save(Err(disk_full()));
+    see_the_bar(&mut owner);
+    assert!(owner.dialogs.failure_seen(), "the bar is up");
+    owner
+}
+
+#[test]
+fn a_failed_ctrl_s_says_so_on_the_bar() {
+    let dir = TestDir::new();
+    let owner = failed_owner(&dir);
+    assert_eq!(
+        bar_says(&owner),
+        "Couldn't save: the disk is full / Your work is safe and still open."
+    );
+    let title = owner.saving.line(true, 0, false);
+    assert!(title.contains("save failed"), "the overlay too: {title}");
+}
+
+/// The bar must be asked for a frame, or it waits for the next thing to want one.
+#[test]
+fn a_failure_with_the_loop_idle_wants_the_frame_that_shows_it() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.request_save(Instant::now());
+    run(&mut owner, 10_000);
+    owner.end_save(Err(disk_full()));
+    assert!(run(&mut owner, 10_000) > 0, "a frame shows it");
+}
+
+#[test]
+fn dropped_dabs_fail_a_ctrl_s_on_the_bar() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    owner.request_save(Instant::now());
+    owner.brush.drops = 1;
+    finish_saving(&mut owner);
+    assert_eq!(
+        bar_says(&owner),
+        "Couldn't save: a stroke didn't finish / Your other work is safe and still open."
+    );
+}
+
+/// The user has heard of those dabs: a later Save on the close bar doesn't stop for them again.
+#[test]
+fn dabs_a_failed_ctrl_s_said_count_as_told() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    owner.request_save(Instant::now());
+    owner.brush.drops = 1;
+    finish_saving(&mut owner);
+
+    owner.brush.held = 2;
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close(), "over the failure");
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), Some(WindowRequest::Exit), "told once");
+}
+
+/// Dabs dropped before the save began, and the save failing for its own reason: its title stands,
+/// and its detail can't claim the stroke.
+#[test]
+fn a_failed_save_says_a_stroke_was_lost_before_it() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    owner.brush.drops = 1;
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    owner.end_save(Err(disk_full()));
+    owner.save_step();
+    assert_eq!(
+        bar_says(&owner),
+        "Couldn't save: the disk is full / Your other work is safe and still open."
+    );
+}
+
+#[test]
+fn a_failed_save_after_the_close_bar_shows_the_failure_and_keeps_the_window() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    assert!(owner.dialogs.finishing());
+    owner.end_save(Err(disk_full()));
+    owner.save_step();
+    assert_eq!(owner.take_request(), None, "the window stays");
+    assert!(owner.dialogs.failing(), "the bar says so");
+    assert!(!owner.dialogs.finishing());
+}
+
+/// The failure bar has no Don't save: a close must lead back to the bar that does.
+#[test]
+fn a_further_close_over_the_failure_bar_asks_again_and_dont_save_is_there() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    owner.end_save(Err(disk_full()));
+    owner.save_step();
+    see_the_bar(&mut owner);
+    assert!(owner.dialogs.failing());
+
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close(), "the close bar is back");
+    assert!(!owner.dialogs.failing());
+    see_the_bar(&mut owner);
+    let dont = owner.dialogs.control(Action::DontSave);
+    tap(&mut owner, dont);
+    assert_eq!(
+        owner.take_request(),
+        Some(WindowRequest::ExitDiscarding),
+        "the way out"
+    );
+}
+
+#[test]
+fn try_again_saves_and_the_bar_goes() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    let again = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, again);
+    assert!(owner.save_stage().is_some(), "a save is under way");
+    assert!(!owner.dialogs.bar_showing(), "the failure is out of date");
+    finish_saving(&mut owner);
+    assert_eq!(owner.saving.last_succeeded(), Some(true));
+    assert!(!owner.unsaved(), "saved");
+    assert!(!owner.dialogs.bar_showing());
+}
+
+#[test]
+fn a_try_that_fails_again_says_so_again() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    let again = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, again);
+    owner.end_save(Err(disk_full()));
+    assert!(owner.dialogs.failing());
+}
+
+#[test]
+fn dismiss_keeps_sculpting_and_saves_nothing() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    let dismiss = owner.dialogs.control(Action::Dismiss);
+    tap(&mut owner, dismiss);
+    assert!(!owner.dialogs.bar_showing());
+    assert_eq!(owner.save_stage(), None, "no save");
+    assert!(owner.unsaved(), "the edits stay unsaved");
+    run(&mut owner, 100);
+    assert!(owner.dialogs.chip_says_unsaved());
+    assert_eq!(owner.take_request(), None);
+}
+
+/// Ctrl+S is what Try again does, and leaves no failure saying what is out of date.
+#[test]
+fn the_save_key_over_the_failure_bar_tries_again() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    owner.save_key(Instant::now());
+    assert!(owner.save_stage().is_some());
+    assert!(!owner.dialogs.failing());
+}
+
+#[test]
+fn a_stroke_clears_it_and_the_chip_still_says_unsaved() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert!(!owner.dialogs.bar_showing(), "the stroke is the answer");
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert_eq!(owner.brush.strokes, 1, "the brush had it");
+    assert!(!owner.dialogs.bar_showing(), "and it doesn't come back");
+    assert!(owner.dialogs.chip_says_unsaved());
+}
+
+/// Orbiting isn't going back to work: the failure stays to be read.
+#[test]
+fn navigating_leaves_the_failure_bar() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    owner.brush.routes_to = Some(Route::Navigate);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert!(owner.dialogs.failing());
+}
+
+#[test]
+fn a_failure_under_a_stroke_waits_for_the_up_and_the_stroke_doesnt_answer_it() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.request_save(Instant::now());
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    owner.end_save(Err(disk_full()));
+    assert!(owner.dialogs.failing(), "it is on its way");
+    assert!(!owner.dialogs.failure_seen(), "and can't be seen");
+    let drag = pen_at(input::Phase::Drag, ON_THE_MODEL);
+    owner.pen(drag);
+    run(&mut owner, 100);
+    assert!(!owner.dialogs.failure_seen(), "nothing shows under the pen");
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert!(owner.dialogs.failure_seen(), "the Up brings it");
+}
+
+/// The `Down` that the failure beat to the brush was made before anyone could see the bar, so it
+/// can't have answered it.
+#[test]
+fn a_stroke_queued_before_the_failure_doesnt_answer_it_unseen() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.request_save(Instant::now());
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    owner.end_save(Err(disk_full()));
+    run(&mut owner, 100);
+    assert_eq!(owner.brush.strokes, 1, "the brush has the stroke");
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert!(owner.dialogs.failure_seen(), "and the bar still comes");
+}
+
+/// `Project::save` never says crash protection paused: the project has to be asked.
+#[cfg(unix)]
+#[test]
+fn a_failure_with_protection_paused_doesnt_say_safe() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    let recovery = owner.project().recovery_path().expect("a recovery file");
+    let folder = recovery.parent().expect("a folder").to_path_buf();
+    let set = |mode| {
+        let mode = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(&folder, mode).expect("set");
+    };
+    set(0o500);
+    let outcome = owner.project().save().expect("a save goes through");
+    set(0o700);
+    assert!(!outcome.protection.is_active(), "paused");
+
+    owner.request_save(Instant::now());
+    owner.saving.start(Instant::now(), 0);
+    owner.end_save(Err(disk_full()));
+    assert_eq!(
+        bar_says(&owner),
+        "Couldn't save: the disk is full / Your work is still open, but a crash could lose it."
+    );
+}
+
+/// A note of work found on an earlier save.
+fn found_note() -> OpenNote {
+    let candidate = RecoveryCandidate {
+        path: "recovery.bcrf".into(),
+        project: store::ProjectId::from_bits(1),
+        base: None,
+        base_path: None,
+        last_edit: None,
+        modified: std::time::SystemTime::now(),
+        status: store::CandidateStatus::RestorableOnEarlierSave,
+    };
+    OpenNote::EarlierVersion { candidate }
+}
+
+/// As a reopen tells a new loop of a copy that failed, in this order.
+fn copy_failed_owner(dir: &TestDir) -> Owner<NoBrush, NoUploads> {
+    let mut owner = ui_owner(dir, NoBrush);
+    run(&mut owner, 10_000);
+    owner.copy_failed(&disk_full());
+    owner.note(&found_note(), Instant::now());
+    see_the_bar(&mut owner);
+    owner
+}
+
+#[test]
+fn a_failed_copy_shows_the_failure_first_and_the_note_asks_again() {
+    let dir = TestDir::new();
+    let mut owner = copy_failed_owner(&dir);
+    assert_eq!(
+        bar_says(&owner),
+        "Couldn't save: the disk is full / Your unsaved work is safe where it was found."
+    );
+    let dismiss = owner.dialogs.control(Action::Dismiss);
+    tap(&mut owner, dismiss);
+    assert!(owner.dialogs.noting(), "the note is back");
+    assert!(!owner.dialogs.failing());
+    let bar = bar_says(&owner);
+    assert!(bar.contains("earlier version"), "{bar}");
+    owner.close().expect("closed");
+}
+
+/// What failed was the copy, and there is nothing of the open project to save.
+#[test]
+fn try_again_on_a_failed_copy_tries_the_copy() {
+    let dir = TestDir::new();
+    let mut owner = copy_failed_owner(&dir);
+    let again = owner.dialogs.control(Action::TryAgain);
+    tap(&mut owner, again);
+    assert!(owner.dialogs.copying(), "the copy is on its way");
+    assert_eq!(owner.save_stage(), None, "not a save of the project");
+    owner.close().expect("closed");
 }
 
 /// The mouse's release goes by the mouse's place alone: a pen in the other hand steers nothing.

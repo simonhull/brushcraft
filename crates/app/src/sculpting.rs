@@ -151,6 +151,7 @@ use crate::frame::{
     Landing, STROKE_QUIET, SampleTimes,
 };
 use crate::pen::{ForBrush, PenFrame, PenSample, Route};
+use crate::saving::DabsDropped;
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
@@ -2060,9 +2061,9 @@ impl Brush for Sculpting {
         self.drops.0
     }
 
-    fn dropped_since(&self, before: u64) -> Result<()> {
+    fn dropped_since(&self, before: u64) -> Result<(), DabsDropped> {
         match &self.drops {
-            (count, Some(error)) if *count != before => Err(anyhow!("{error}")),
+            (count, Some(error)) if *count != before => Err(DabsDropped(error.clone())),
             _ => Ok(()),
         }
     }

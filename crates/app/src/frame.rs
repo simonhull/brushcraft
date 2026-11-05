@@ -138,7 +138,7 @@ use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route
 use crate::pick::Picker;
 use crate::record::{Latency, RecordStream, Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
-use crate::saving::{self, SAVE_SLICE, SaveStep, Saving, Stage};
+use crate::saving::{self, DabsDropped, SAVE_SLICE, SaveFailure, SaveStep, Saving, Stage, Work};
 use crate::script::{BrushSize, Script, ScriptPen, Segment};
 use crate::{OpenNote, said_too};
 
@@ -539,7 +539,7 @@ pub(crate) trait Brush {
     /// # Errors
     ///
     /// That error: a save since then can't hold everything drawn.
-    fn dropped_since(&self, _before: u64) -> Result<()> {
+    fn dropped_since(&self, _before: u64) -> Result<(), DabsDropped> {
         Ok(())
     }
 
@@ -1590,7 +1590,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// A stroke went to the brush: going back to work answers the bar. On the close bar that's
     /// Keep sculpting, while finishing, Cancel, the stroke waiting for the save as any does, and a
-    /// note goes, what it found staying where it is. Navigating is no answer: the user may be
+    /// note goes, what it found staying where it is, and so does a failure the user could see: one
+    /// waiting for this stroke's `Up` is yet to be read. Navigating is no answer: the user may be
     /// looking at the model before deciding.
     fn back_to_work(&mut self) {
         let now = Instant::now();
@@ -1600,6 +1601,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.act(Action::Cancel, now);
         } else if self.dialogs.noting() {
             self.copying = None;
+            self.dialogs.clear_prompt(now);
+            self.scheduler.want(Reason::Overlay);
+        } else if self.dialogs.failure_seen() {
             self.dialogs.clear_prompt(now);
             self.scheduler.want(Reason::Overlay);
         }
@@ -1737,7 +1741,18 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 self.request = None;
                 self.dialogs.clear_prompt(now);
             }
-            Action::Dismiss | Action::Ignore => self.dialogs.clear_prompt(now),
+            Action::Dismiss => self.dialogs.dismiss(now),
+            Action::Ignore => self.dialogs.clear_prompt(now),
+            // What failed is what goes again: a copy of found work, which the note it took the
+            // place of offers, or a save. The bar goes either way, out of date.
+            Action::TryAgain => {
+                let failure = self.dialogs.answer_failure(now);
+                if failure.is_some_and(SaveFailure::of_found_work) {
+                    self.act(Action::OpenCopy, now);
+                } else {
+                    self.request_save(now);
+                }
+            }
             Action::UseLastSave if self.dialogs.says_restored() && self.may_reopen() => {
                 let kept = self.project.recovery_path().map(PathBuf::from);
                 self.request = kept.map(|kept| WindowRequest::Reopen(Reopen::LastSave { kept }));
@@ -1749,7 +1764,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                     said_in: None,
                 });
             }
-            Action::DontSave | Action::TryAgain | Action::UseLastSave | Action::OpenCopy => {}
+            Action::DontSave | Action::UseLastSave | Action::OpenCopy => {}
         }
         self.scheduler.want(Reason::Overlay);
     }
@@ -3192,6 +3207,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             return;
         }
         self.scheduler.want(Reason::Input);
+        // Out of date from here on, whatever comes of this.
+        if self.dialogs.failing() {
+            self.dialogs.dismiss(now);
+        }
         if !self.unsaved() && !self.pen_queued(now) {
             self.saving.nothing_to_save();
             return;
@@ -3205,7 +3224,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// A step of the save under way, if one is, whether or not a frame can be drawn; the caller's
     /// events come between steps. A failure doesn't reach the caller: the app goes on, and the
-    /// title and overlay say it ([`crate::saving`]).
+    /// failure bar, the title and the overlay say it ([`crate::saving`]).
     ///
     /// A save the window exits after ends in the window's going, if it succeeded
     /// ([`Owner::exit_step`]).
@@ -3230,8 +3249,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// With the window to exit after the save, at `now`: the bar's progress while it goes on, with
     /// or without frames, and the outcome once it ends. Only a save that succeeded lets the window
     /// go, and only if it holds all that was drawn: one that failed, or that dabs were dropped
-    /// from before it began, leaves the window and the user's work. The title says so, and then
-    /// the user has been told, so a further close can leave.
+    /// from before it began, leaves the window and the user's work. The failure bar says so, and
+    /// then the user has been told, so a further close can leave.
     ///
     /// The save fixed what it holds as it began, so a stroke that waited for it isn't in it. Save
     /// on the bar means all of it: another save follows, under the same bar.
@@ -3256,12 +3275,27 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             return;
         }
         if let (true, Err(error)) = (saved, lost) {
-            self.saving
-                .failed(&error.context("dabs were dropped"), self.closing());
+            self.save_failed(&dabs_dropped(error), now);
         }
-        self.told_drops = self.brush.drops();
         self.after_save = AfterSave::Stay;
-        self.dialogs.clear_prompt(now);
+        if self.dialogs.finishing() {
+            self.dialogs.clear_prompt(now);
+        }
+        self.scheduler.want(Reason::Overlay);
+    }
+
+    /// A save failed at `now` for `error`: the log, the title and the failure bar say so. Whatever
+    /// the error, the bar owns up to any dabs the user hasn't heard of, and then they have been
+    /// told.
+    fn save_failed(&mut self, error: &anyhow::Error, now: Instant) {
+        self.saving.failed(error, self.closing());
+        let work = match self.brush.dropped_since(self.told_drops) {
+            Ok(()) => Work::Whole,
+            Err(_) => Work::LessAStroke,
+        };
+        self.told_drops = self.brush.drops();
+        let failure = SaveFailure::of(error, work, &self.project.protection());
+        self.dialogs.failed(failure, now);
         self.scheduler.want(Reason::Overlay);
     }
 
@@ -3326,7 +3360,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             return SaveStep::Worked;
         }
         if let Err(error) = self.brush.dropped_since(self.saving.drops_at()) {
-            self.end_save(Err(error.context("dabs were dropped")));
+            self.end_save(Err(dabs_dropped(error)));
             return SaveStep::Worked;
         }
         if !self.project.has_unsaved_edits() {
@@ -3363,7 +3397,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                     self.dialogs.clear_prompt(now);
                 }
             }
-            Err(error) => self.saving.failed(&error, self.closing()),
+            Err(error) => self.save_failed(&error, Instant::now()),
         }
         self.save_over();
     }
@@ -3599,9 +3633,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.scheduler.want(Reason::Overlay);
     }
 
-    /// A copy of found work failed for `error`: the log and the title say so, as for a save.
+    /// A copy of found work failed for `error`: the log, the title and the failure bar say so, as
+    /// for a save. A note that follows asks again once the bar is answered.
     pub(crate) fn copy_failed(&mut self, error: &anyhow::Error) {
         self.saving.failed(error, false);
+        self.dialogs
+            .failed(SaveFailure::of_copy(error), Instant::now());
+        self.scheduler.want(Reason::Overlay);
     }
 
     /// Whether the stale-tile feed holds epochs this loop hasn't drained (or a resync): work
@@ -3656,6 +3694,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) const fn project(&mut self) -> &mut Project {
         &mut self.project
     }
+}
+
+/// `dropped` as the error of a save it failed.
+fn dabs_dropped(dropped: DabsDropped) -> anyhow::Error {
+    anyhow::Error::new(dropped).context("dabs were dropped")
 }
 
 /// Adds `ran`, a later run of the store's jobs, to `report`: the counts summed, the longest

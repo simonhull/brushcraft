@@ -16,6 +16,10 @@
 //! **Notes** say what opening found ([`Dialogs::note`]). They answer to the same rule as the close
 //! bar: a stroke routed to the brush puts one away, and anything else, navigation included, leaves
 //! it. The one that only tells also goes by itself after [`Theme::note_hold`].
+//!
+//! **The failure bar** says a save failed ([`Dialogs::failed`]) and answers to that rule too, but
+//! only once it can have been seen: one that arrived under a stroke waits for its `Up`, and that
+//! stroke isn't an answer to it. It takes a note's place, and the note asks again after it.
 
 use std::time::{Instant, SystemTime};
 
@@ -27,6 +31,7 @@ use ui::{Bar, Blend, Chip, Control, Emphasis, Mark, Theme, Ui, UiFrame};
 use crate::OpenNote;
 use crate::camera::Pixel;
 use crate::navigate::Button;
+use crate::saving::SaveFailure;
 
 /// What a control on a bar does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +44,9 @@ pub(crate) enum Action {
     KeepSculpting,
     /// Stop what's under way.
     Cancel,
-    /// Try a failed save again.
-    #[expect(dead_code, reason = "the failure bar will offer it")]
+    /// Try again what failed.
     TryAgain,
     /// Put the bar away.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the failure bar will offer it"))]
     Dismiss,
     /// Open the project from its last save.
     UseLastSave,
@@ -163,6 +166,9 @@ enum Prompt {
     },
     /// "Saving": found work on its way to a copy, which holds the thread once it starts.
     Copying,
+    /// "Couldn't save: …": what failed and what that leaves, until the user answers or goes back
+    /// to work.
+    Failed(SaveFailure),
 }
 
 impl Prompt {
@@ -217,6 +223,16 @@ impl Prompt {
                 ))
             }
             Self::Copying => Some(Bar::new("Saving", Vec::new())),
+            Self::Failed(failure) => {
+                let again = Control {
+                    label: "Try again".to_owned(),
+                    action: Action::TryAgain,
+                    emphasis: Emphasis::Filled,
+                };
+                let controls = vec![quiet("Dismiss", Action::Dismiss), again];
+                let bar = Bar::new(failure.title(), controls).with_detail(failure.detail());
+                Some(bar.needing_you())
+            }
         }
     }
 }
@@ -307,6 +323,8 @@ pub(crate) struct Dialogs {
     prompt: Prompt,
     /// The bar isn't saying what `prompt` does, for the pen is down.
     prompt_waiting: bool,
+    /// A note the failure bar took the place of: it asks again when the failure is answered.
+    behind: Option<Prompt>,
     /// Input on its way to the bar.
     routing: Routing,
     /// How many hit tests were made.
@@ -353,6 +371,7 @@ impl Dialogs {
             waiting: false,
             prompt: Prompt::None,
             prompt_waiting: false,
+            behind: None,
             routing: Routing::default(),
             #[cfg(test)]
             hit_tests: std::cell::Cell::new(0),
@@ -438,9 +457,9 @@ impl Dialogs {
         self.show_prompt(now);
     }
 
-    /// Says what opening found.
+    /// Says what opening found; with the bar saying a failure, once that is answered.
     pub(crate) fn note(&mut self, note: &OpenNote, now: Instant) {
-        self.prompt = match note {
+        let prompt = match note {
             OpenNote::Restored { when, .. } => Prompt::Restored {
                 said: said_now(*when),
                 until: now + Theme::GLASS.note_hold,
@@ -450,7 +469,12 @@ impl Dialogs {
                 candidate: candidate.clone(),
             },
         };
-        self.show_prompt(now);
+        if self.failing() {
+            self.behind = Some(prompt);
+        } else {
+            self.prompt = prompt;
+            self.show_prompt(now);
+        }
     }
 
     /// When the note goes by itself, if one showing does.
@@ -461,7 +485,8 @@ impl Dialogs {
             | Prompt::AskClose { .. }
             | Prompt::Finishing { .. }
             | Prompt::EarlierVersion { .. }
-            | Prompt::Copying => None,
+            | Prompt::Copying
+            | Prompt::Failed(_) => None,
         }
     }
 
@@ -495,10 +520,47 @@ impl Dialogs {
         Some(candidate)
     }
 
-    /// Takes the bar away.
+    /// Takes the bar away, and any note behind it.
     pub(crate) fn clear_prompt(&mut self, now: Instant) {
         self.prompt = Prompt::None;
+        self.behind = None;
         self.show_prompt(now);
+    }
+
+    /// Says a save failed, in place of whatever the bar said; a note comes back once that is
+    /// answered, as what it offers still stands.
+    pub(crate) fn failed(&mut self, failure: SaveFailure, now: Instant) {
+        let was = std::mem::replace(&mut self.prompt, Prompt::Failed(failure));
+        if matches!(was, Prompt::Restored { .. } | Prompt::EarlierVersion { .. }) {
+            self.behind = Some(was);
+        }
+        self.show_prompt(now);
+    }
+
+    /// Whether the bar says a save failed.
+    pub(crate) const fn failing(&self) -> bool {
+        matches!(self.prompt, Prompt::Failed(_))
+    }
+
+    /// Whether the bar says a save failed and the user has had the chance to see it: it didn't
+    /// arrive under the pen, to wait for the `Up`.
+    pub(crate) const fn failure_seen(&self) -> bool {
+        self.failing() && !self.prompt_waiting
+    }
+
+    /// Puts the bar away, a note it took the place of asking again.
+    pub(crate) fn dismiss(&mut self, now: Instant) {
+        self.prompt = self.behind.take().unwrap_or(Prompt::None);
+        self.show_prompt(now);
+    }
+
+    /// Answers the failure the bar says, if it does: [`Dialogs::dismiss`], and what failed.
+    pub(crate) fn answer_failure(&mut self, now: Instant) -> Option<SaveFailure> {
+        let Prompt::Failed(failure) = self.prompt else {
+            return None;
+        };
+        self.dismiss(now);
+        Some(failure)
     }
 
     /// Whether the bar asks about closing.
@@ -705,6 +767,11 @@ impl Dialogs {
         self.prompt.bar()
     }
 
+    /// Whether the chip says there are unsaved edits.
+    pub(crate) fn chip_says_unsaved(&self) -> bool {
+        self.status == Status::Unsaved
+    }
+
     /// How many hit tests were made.
     pub(crate) fn hit_tests(&self) -> u32 {
         self.hit_tests.get()
@@ -751,6 +818,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::saving::{DabsDropped, Work};
 
     /// No edits, no save.
     const CLEAN: Facts = Facts {
@@ -781,6 +849,140 @@ mod tests {
     /// How long "Saved" stays.
     const fn hold() -> Duration {
         Theme::GLASS.saved_hold
+    }
+
+    /// A disk gone full, the work whole and protected.
+    fn full_disk() -> SaveFailure {
+        let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let error = anyhow::Error::new(full);
+        SaveFailure::of(&error, Work::Whole, &store::Protection::Active)
+    }
+
+    /// What `dialogs` shows on the bar: its controls' actions.
+    fn actions(dialogs: &Dialogs) -> Vec<Action> {
+        let bar = dialogs.bar().expect("a bar");
+        bar.controls().iter().map(|c| c.action).collect()
+    }
+
+    #[test]
+    fn the_bar_says_your_work_is_safe_and_offers_try_again() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.failed(full_disk(), now);
+        assert!(dialogs.failing());
+        let bar = dialogs.bar().expect("a bar");
+        let expected = Bar::new("Couldn't save: the disk is full", bar.controls().to_vec())
+            .with_detail("Your work is safe and still open.")
+            .needing_you();
+        assert_eq!(bar, expected, "its words and coral hairline");
+        assert_eq!(actions(&dialogs), [Action::Dismiss, Action::TryAgain]);
+        let filled = bar
+            .controls()
+            .iter()
+            .filter(|c| c.emphasis == Emphasis::Filled);
+        let filled: Vec<&Control<Action>> = filled.collect();
+        assert_eq!(
+            filled.first().map(|c| c.action),
+            Some(Action::TryAgain),
+            "the one action"
+        );
+        assert!(dialogs.routes(), "input comes here first");
+        assert!(dialogs.frame(now).is_some(), "it draws");
+    }
+
+    /// The longest words at the smallest window lose no letter: every glyph of the bar draws. An
+    /// ellipsis takes more letters than it adds, and a space draws none.
+    #[test]
+    fn every_failure_fits_the_smallest_window() {
+        let now = Instant::now();
+        let dropped = anyhow::Error::new(DabsDropped(String::new()));
+        let locked = anyhow::Error::new(store::FileError::Locked);
+        let cause = store::ProjectError::NoPath;
+        let paused = store::Protection::Paused(Arc::new(cause));
+        let active = store::Protection::Active;
+        let failures = [
+            SaveFailure::of(&locked, Work::LessAStroke, &paused),
+            SaveFailure::of(&dropped, Work::Whole, &paused),
+            SaveFailure::of(&locked, Work::Whole, &active),
+            SaveFailure::of_copy(&locked),
+        ];
+        for failure in failures {
+            let mut dialogs = Dialogs::new(Size::new(640, 400), 1.0, Blend::Display, now);
+            dialogs.failed(failure, now);
+            let frame = dialogs.frame(now).expect("it draws");
+            let bar = dialogs.bar().expect("a bar");
+            let labels = bar.controls().iter().map(|c| c.label.as_str());
+            let said = [bar.title(), bar.detail().unwrap_or_default()];
+            let letters = said.into_iter().chain(labels).flat_map(str::chars);
+            let letters = letters.filter(|letter| !letter.is_whitespace()).count();
+            assert_eq!(frame.list.glyphs.len(), letters, "{}", failure.detail());
+        }
+    }
+
+    #[test]
+    fn it_waits_for_the_up_if_the_pen_is_down() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.pen_down(now);
+        dialogs.failed(full_disk(), now);
+        assert!(dialogs.failing(), "it is meant to show");
+        assert!(!dialogs.failure_seen(), "and hasn't been");
+        assert!(dialogs.frame(now).is_none(), "nothing draws under the pen");
+        dialogs.pen_up(now);
+        assert!(dialogs.failure_seen(), "the Up brings it");
+        let frame = dialogs.frame(now).expect("it draws");
+        assert!(!frame.list.is_empty());
+    }
+
+    #[test]
+    fn a_note_behind_a_failure_asks_again_once_it_is_answered() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        let error = anyhow::anyhow!("no room");
+        dialogs.failed(SaveFailure::of_copy(&error), now);
+        dialogs.note(&earlier(SystemTime::now()), now);
+        assert!(dialogs.failing(), "the failure comes first");
+        assert!(!dialogs.noting());
+        dialogs.dismiss(now);
+        assert!(!dialogs.failing());
+        assert!(dialogs.noting(), "and the note asks again");
+        assert_eq!(actions(&dialogs), [Action::Ignore, Action::OpenCopy]);
+    }
+
+    #[test]
+    fn a_failure_over_a_note_gives_it_back() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&earlier(SystemTime::now()), now);
+        dialogs.failed(full_disk(), now);
+        assert!(dialogs.failing());
+        assert_eq!(dialogs.answer_failure(now), Some(full_disk()));
+        assert!(dialogs.noting());
+        assert_eq!(dialogs.answer_failure(now), None, "no failure says so");
+    }
+
+    #[test]
+    fn clearing_the_bar_takes_a_note_behind_it_too() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&earlier(SystemTime::now()), now);
+        dialogs.failed(full_disk(), now);
+        dialogs.clear_prompt(now);
+        assert!(!dialogs.routes(), "no bar");
+        dialogs.dismiss(now);
+        assert!(!dialogs.noting(), "and none comes back");
+    }
+
+    /// A failure says what it says for as long as it takes: unlike a note, it never goes by itself.
+    #[test]
+    fn a_failure_stays_until_it_is_answered() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.failed(full_disk(), now);
+        assert_eq!(dialogs.next_change(), None, "nothing to wait for");
+        let later = now + Theme::GLASS.note_hold * 10;
+        dialogs.update(EDITED, later);
+        assert!(dialogs.failing());
     }
 
     #[test]

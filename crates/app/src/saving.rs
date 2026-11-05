@@ -33,10 +33,14 @@
 //!
 //! # Failing
 //!
-//! A failed save loses nothing: the edits stay, unsaved, in the recovery file. The title and the
-//! overlay say so until the next Ctrl+S, the log (stderr) says why, and Ctrl+S tries again. Dabs
-//! dropped by a store error since Ctrl+S, in any stage, fail the save too, as it can't hold
-//! everything drawn.
+//! A failed save loses nothing: the edits stay, unsaved, in the recovery file. The failure bar
+//! ([`crate::dialogs`]) says why in the user's words ([`SaveFailure`]) until it is answered or a
+//! stroke puts it away, the title and the overlay say so until the next Ctrl+S, the log (stderr)
+//! has the whole error, and Ctrl+S or the bar's Try again tries again. Dabs dropped by a store
+//! error since Ctrl+S, in any stage, fail the save too, as it can't hold everything drawn.
+//!
+//! The bar's second line says only what is true: not "safe" with crash protection paused, when
+//! the edits may be in memory alone, and "other work" with a stroke's dabs gone.
 //!
 //! # Closing meanwhile
 //!
@@ -51,14 +55,17 @@
 //! That close is a scripted run's. With a person at the window a close never lands anything: it
 //! asks, on a bar ([`crate::dialogs`]), and Save on the bar is an ordinary save that can still be
 //! cancelled, the window exiting once it has succeeded ([`crate::frame::Owner::ask_close`]). If it
-//! fails the window stays, the bar goes, and the title says so.
+//! fails the window stays and the failure bar takes the close bar's place. A further close asks
+//! again, so Don't save stays in reach.
 
-use std::io::Write as _;
+use std::error::Error as StdError;
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Error;
-use store::{Protection, SaveOutcome};
+use store::{FileError, ProjectError, Protection, SaveOutcome};
+use thiserror::Error;
 
 /// How long a slice of a save's writing runs, between frames and the window's events: about a
 /// 60 Hz frame's, as a catch-up's batch ([`crate::sculpting::CATCH_UP_BATCH`]).
@@ -129,6 +136,173 @@ enum Doing {
     Writing(Option<usize>),
     /// The window is closing, this many dabs left to land.
     Closing(usize),
+}
+
+/// Dabs a store error dropped ([`crate::frame::Brush::dropped_since`]): what was drawn didn't all
+/// land, so a save can't hold it. Its text is the store's error, for the log.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{0}")]
+pub(crate) struct DabsDropped(pub(crate) String);
+
+/// Why a save failed, as the user can act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveTrouble {
+    /// There is no room on the disk, or in the user's share of it.
+    DiskFull,
+    /// The system won't let the file be written.
+    NoPermission,
+    /// Another open of the file holds its lock.
+    InUse,
+    /// Dabs were dropped, so the stroke they belong to isn't whole.
+    StrokeLost,
+    /// Anything else: the log says what.
+    Other,
+}
+
+impl SaveTrouble {
+    /// Reads the cause from `error`'s chain: the first link that says one, outermost first.
+    pub(crate) fn of(error: &Error) -> Self {
+        let mut causes = error.chain().filter_map(Self::of_cause);
+        causes.next().unwrap_or(Self::Other)
+    }
+
+    /// What `cause`, a link of an error's chain, says by itself.
+    fn of_cause(cause: &(dyn StdError + 'static)) -> Option<Self> {
+        if cause.is::<DabsDropped>() {
+            return Some(Self::StrokeLost);
+        }
+        match cause.downcast_ref() {
+            Some(FileError::Locked) => return Some(Self::InUse),
+            Some(FileError::ReadOnly) => return Some(Self::NoPermission),
+            Some(_) | None => {}
+        }
+        let kind = cause.downcast_ref::<io::Error>()?.kind();
+        if matches!(
+            kind,
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+        ) {
+            return Some(Self::DiskFull);
+        }
+        let denied = matches!(
+            kind,
+            io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+        );
+        denied.then_some(Self::NoPermission)
+    }
+
+    /// What follows "Couldn't save: ".
+    pub(crate) const fn said(self) -> &'static str {
+        match self {
+            Self::DiskFull => "the disk is full",
+            Self::NoPermission => "this file can't be written",
+            Self::InUse => "another app has this file open",
+            Self::StrokeLost => "a stroke didn't finish",
+            Self::Other => "something went wrong",
+        }
+    }
+}
+
+/// What a failed save leaves of the work it was to hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Work {
+    /// All of it, in the project still open.
+    Whole,
+    /// All but a stroke that didn't all land, in the project still open.
+    LessAStroke,
+    /// Found work a copy was to hold: it stays in its recovery file, and isn't what is open.
+    Found,
+}
+
+/// Whether a crash would spare what a failed save left unsaved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cover {
+    /// The recovery file holds it.
+    Protected,
+    /// It may be in memory alone: crash protection is paused, or the recovery writer failed.
+    Exposed,
+}
+
+/// A failed save as the user hears of it: why, and what that leaves. Only what is true of the work
+/// is said, so the bar's second line depends on all of this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SaveFailure {
+    /// Why it failed.
+    trouble: SaveTrouble,
+    /// What it leaves.
+    work: Work,
+    /// Whether that would outlive a crash.
+    cover: Cover,
+}
+
+impl SaveFailure {
+    /// The failure `error`, of a save of a project with `protection`, which leaves `work`.
+    ///
+    /// **Crash protection** decides "safe". A failed [`store::Project::save`] never says it was
+    /// paused, as protection never stops a save, so `protection` is what tells;
+    /// [`ProjectError::ProtectionPaused`], [`ProjectError::Recovery`] and
+    /// [`ProjectError::Unprotected`] in the chain say the same of edits the recovery file doesn't
+    /// hold, whatever `protection` came to since.
+    pub(crate) fn of(error: &Error, work: Work, protection: &Protection) -> Self {
+        let trouble = SaveTrouble::of(error);
+        let exposed = !protection.is_active() || error.chain().any(says_edits_arent_covered);
+        Self {
+            trouble,
+            work: if trouble == SaveTrouble::StrokeLost {
+                Work::LessAStroke
+            } else {
+                work
+            },
+            cover: if exposed {
+                Cover::Exposed
+            } else {
+                Cover::Protected
+            },
+        }
+    }
+
+    /// The failure `error` of a copy of found work.
+    pub(crate) fn of_copy(error: &Error) -> Self {
+        Self {
+            trouble: SaveTrouble::of(error),
+            work: Work::Found,
+            cover: Cover::Protected,
+        }
+    }
+
+    /// Whether it was a copy of found work that failed, not a save of the project.
+    pub(crate) const fn of_found_work(self) -> bool {
+        matches!(self.work, Work::Found)
+    }
+
+    /// What the bar's title says.
+    pub(crate) fn title(self) -> String {
+        format!("Couldn't save: {}", self.trouble.said())
+    }
+
+    /// What the bar says under it, of the work.
+    pub(crate) const fn detail(self) -> &'static str {
+        match (self.work, self.cover) {
+            (Work::Found, _) => "Your unsaved work is safe where it was found.",
+            (Work::Whole, Cover::Protected) => "Your work is safe and still open.",
+            (Work::LessAStroke, Cover::Protected) => "Your other work is safe and still open.",
+            (Work::Whole, Cover::Exposed) => "Your work is still open, but a crash could lose it.",
+            (Work::LessAStroke, Cover::Exposed) => {
+                "Your other work is still open, but a crash could lose it."
+            }
+        }
+    }
+}
+
+/// Whether `cause`, a link of an error's chain, says the recovery file may not hold the edits.
+fn says_edits_arent_covered(cause: &(dyn StdError + 'static)) -> bool {
+    matches!(
+        cause.downcast_ref(),
+        Some(
+            ProjectError::ProtectionPaused(_)
+                | ProjectError::Recovery(_)
+                | ProjectError::Unprotected(_)
+        )
+    )
 }
 
 /// A project's saves, as the frame loop keeps them.
@@ -361,15 +535,183 @@ fn said_of(outcome: &SaveOutcome, took: f64) -> String {
 /// Says `line` in the log, which is stderr.
 pub(crate) fn log(line: &str) {
     // Nothing more to do if stderr is gone.
-    drop(writeln!(std::io::stderr(), "{line}"));
+    drop(writeln!(io::stderr(), "{line}"));
 }
 
 #[cfg(test)]
 #[expect(clippy::missing_panics_doc, reason = "tests panic to fail")]
 mod tests {
     use anyhow::anyhow;
+    use store::{CacheError, RecoveryError};
 
     use super::*;
+
+    /// `kind` as a store's failed write gives it: under a save's context, through the file and the
+    /// project.
+    fn failed_write(kind: io::ErrorKind) -> Error {
+        let file = FileError::Io(io::Error::from(kind));
+        Error::new(ProjectError::Store(file)).context("saving the project")
+    }
+
+    /// What `error` says as the failure of a save of work whole, under working protection.
+    fn failure(error: &Error) -> SaveFailure {
+        SaveFailure::of(error, Work::Whole, &Protection::Active)
+    }
+
+    /// Protection paused for a recovery file that couldn't be made.
+    fn paused() -> Protection {
+        let cause = ProjectError::Io(io::Error::from(io::ErrorKind::PermissionDenied));
+        Protection::Paused(std::sync::Arc::new(cause))
+    }
+
+    #[test]
+    fn a_full_disk_says_so() {
+        let full = failed_write(io::ErrorKind::StorageFull);
+        assert_eq!(SaveTrouble::of(&full), SaveTrouble::DiskFull);
+        assert_eq!(failure(&full).title(), "Couldn't save: the disk is full");
+        let quota = failed_write(io::ErrorKind::QuotaExceeded);
+        assert_eq!(
+            SaveTrouble::of(&quota),
+            SaveTrouble::DiskFull,
+            "the user's share"
+        );
+    }
+
+    /// A failed write of tiles comes to a save through the store's tile cache.
+    #[test]
+    fn a_full_disk_says_so_from_as_deep_as_a_save_goes() {
+        let write = FileError::Io(io::Error::from(io::ErrorKind::StorageFull));
+        let deep = ProjectError::Cache(CacheError::Save(write));
+        let error = Error::new(deep).context("saving the project");
+        assert_eq!(SaveTrouble::of(&error), SaveTrouble::DiskFull);
+    }
+
+    #[test]
+    fn no_permission_says_so() {
+        let denied = failed_write(io::ErrorKind::PermissionDenied);
+        assert_eq!(SaveTrouble::of(&denied), SaveTrouble::NoPermission);
+        let read_only = failed_write(io::ErrorKind::ReadOnlyFilesystem);
+        assert_eq!(SaveTrouble::of(&read_only), SaveTrouble::NoPermission);
+        let opened_so = Error::new(ProjectError::Store(FileError::ReadOnly));
+        assert_eq!(SaveTrouble::of(&opened_so), SaveTrouble::NoPermission);
+        assert_eq!(
+            failure(&denied).title(),
+            "Couldn't save: this file can't be written"
+        );
+    }
+
+    #[test]
+    fn a_locked_project_says_so() {
+        let locked = Error::new(ProjectError::Store(FileError::Locked)).context("saving");
+        assert_eq!(SaveTrouble::of(&locked), SaveTrouble::InUse);
+        assert_eq!(
+            failure(&locked).title(),
+            "Couldn't save: another app has this file open"
+        );
+    }
+
+    #[test]
+    fn dropped_dabs_say_so_in_user_words() {
+        let dropped = Error::new(DabsDropped("no room for tile 7".to_owned()));
+        let error = dropped.context("dabs were dropped");
+        assert_eq!(SaveTrouble::of(&error), SaveTrouble::StrokeLost);
+        let failure = failure(&error);
+        assert_eq!(failure.title(), "Couldn't save: a stroke didn't finish");
+        assert_eq!(failure.detail(), "Your other work is safe and still open.");
+    }
+
+    #[test]
+    fn anything_else_says_the_project_couldnt_be_saved() {
+        let other = failed_write(io::ErrorKind::TimedOut);
+        assert_eq!(SaveTrouble::of(&other), SaveTrouble::Other);
+        let plain = anyhow!("the disk is full, says a message nobody should read");
+        assert_eq!(
+            SaveTrouble::of(&plain),
+            SaveTrouble::Other,
+            "kinds, not text"
+        );
+        let no_path = Error::new(ProjectError::NoPath);
+        assert_eq!(
+            failure(&no_path).title(),
+            "Couldn't save: something went wrong"
+        );
+    }
+
+    #[test]
+    fn work_whole_and_protected_is_safe_and_still_open() {
+        let full = failed_write(io::ErrorKind::StorageFull);
+        assert_eq!(failure(&full).detail(), "Your work is safe and still open.");
+    }
+
+    /// The dabs may be gone for a reason of their own, under another failure's title.
+    #[test]
+    fn a_stroke_lost_beside_another_failure_is_still_said() {
+        let full = failed_write(io::ErrorKind::StorageFull);
+        let failure = SaveFailure::of(&full, Work::LessAStroke, &Protection::Active);
+        assert_eq!(failure.title(), "Couldn't save: the disk is full");
+        assert_eq!(failure.detail(), "Your other work is safe and still open.");
+    }
+
+    /// What a failed [`store::Project::save`] looks like with protection paused: the error doesn't
+    /// say, and only the project does.
+    #[test]
+    fn paused_protection_never_says_safe() {
+        let full = failed_write(io::ErrorKind::StorageFull);
+        let failure = SaveFailure::of(&full, Work::Whole, &paused());
+        assert_eq!(failure.title(), "Couldn't save: the disk is full");
+        assert_eq!(
+            failure.detail(),
+            "Your work is still open, but a crash could lose it."
+        );
+        let lost = SaveFailure::of(&full, Work::LessAStroke, &paused());
+        assert_eq!(
+            lost.detail(),
+            "Your other work is still open, but a crash could lose it."
+        );
+    }
+
+    /// Links that say the recovery file doesn't hold the edits, whatever the project says now.
+    #[test]
+    fn a_failed_recovery_writer_never_says_safe() {
+        let paused_cause = ProjectError::Store(FileError::Locked);
+        let paused = ProjectError::ProtectionPaused(std::sync::Arc::new(paused_cause));
+        let writer = ProjectError::Recovery(RecoveryError::Stopped);
+        let tiles = ProjectError::Unprotected(Vec::new());
+        for error in [paused, writer, tiles] {
+            let said = format!("{error}");
+            let error = Error::new(error).context("saving the project");
+            assert!(
+                failure(&error).detail().contains("a crash could lose it"),
+                "{said}"
+            );
+        }
+    }
+
+    /// The cause under a pause goes through an `Arc`, which hides the type of the link it is.
+    #[test]
+    fn a_pauses_cause_still_says_why() {
+        let locked = ProjectError::Store(FileError::Locked);
+        let paused = ProjectError::ProtectionPaused(std::sync::Arc::new(locked));
+        let error = Error::new(paused).context("saving the project");
+        assert_eq!(SaveTrouble::of(&error), SaveTrouble::InUse);
+        let full = ProjectError::Io(io::Error::from(io::ErrorKind::StorageFull));
+        let full = ProjectError::ProtectionPaused(std::sync::Arc::new(full));
+        assert_eq!(SaveTrouble::of(&Error::new(full)), SaveTrouble::DiskFull);
+    }
+
+    /// Found work isn't open, whatever the open project's state: "still open" would be false.
+    #[test]
+    fn a_failed_copy_says_the_work_is_where_it_was_found() {
+        let full = failed_write(io::ErrorKind::StorageFull);
+        let failure = SaveFailure::of_copy(&full);
+        assert_eq!(failure.title(), "Couldn't save: the disk is full");
+        assert_eq!(
+            failure.detail(),
+            "Your unsaved work is safe where it was found."
+        );
+        assert!(failure.of_found_work());
+        assert!(!self::failure(&full).of_found_work());
+    }
 
     /// A project called `sphere`.
     fn saving() -> Saving {
@@ -519,7 +861,7 @@ mod tests {
         };
         assert_eq!(said_of(&outcome, 1.25), "saved in 1.2 s");
         let paused = SaveOutcome {
-            protection: Protection::Paused(std::sync::Arc::new(store::ProjectError::NoPath)),
+            protection: Protection::Paused(std::sync::Arc::new(ProjectError::NoPath)),
             ..outcome
         };
         assert!(said_of(&paused, 1.0).contains("crash protection paused"));
