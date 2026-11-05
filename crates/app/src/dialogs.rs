@@ -64,18 +64,17 @@ enum Status {
 impl Status {
     /// The chip that says it.
     fn chip(self) -> Option<Chip> {
-        let chip = |text: &str, mark, dimmed| {
+        let chip = |text: &str, mark| {
             Some(Chip {
                 text: text.to_owned(),
                 mark,
-                dimmed,
             })
         };
         match self {
             Self::Quiet => None,
-            Self::Unsaved => chip("Unsaved", Mark::Dot, false),
-            Self::Saving => chip("Saving", Mark::Ring, false),
-            Self::Saved => chip("Saved", Mark::None, true),
+            Self::Unsaved => chip("Unsaved", Mark::Dot),
+            Self::Saving => chip("Saving", Mark::Ring),
+            Self::Saved => chip("Saved", Mark::None),
         }
     }
 }
@@ -266,13 +265,12 @@ mod tests {
         let chip = dialogs.status.chip().expect("a chip");
         assert_eq!(chip.text, "Unsaved", "in the user's words");
         assert_eq!(chip.mark, Mark::Dot, "an orange dot");
-        assert!(!chip.dimmed, "at full strength");
         assert!(dialogs.frame(now).is_some(), "it draws");
         assert!(dialogs.needs_frame(now), "fading in");
     }
 
     #[test]
-    fn a_save_shows_saving_with_a_ring_then_saved_dimmed_then_nothing_after_two_seconds() {
+    fn a_save_shows_saving_with_a_ring_then_saved_then_nothing_after_two_seconds() {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
         dialogs.update(EDITED, now);
@@ -286,7 +284,6 @@ mod tests {
         dialogs.update(CLEAN, saved_at);
         let saved = dialogs.status.chip().expect("a chip");
         assert_eq!((saved.text.as_str(), saved.mark), ("Saved", Mark::None));
-        assert!(saved.dimmed, "at the theme's alpha for it");
         assert_eq!(dialogs.next_change(), Some(saved_at + hold()), "it will go");
 
         let almost = saved_at + hold().mul_f32(0.99);

@@ -383,7 +383,6 @@ mod tests {
         Chip {
             text: "Unsaved".to_owned(),
             mark: Mark::Dot,
-            dimmed: false,
         }
     }
 
@@ -975,7 +974,6 @@ mod tests {
         let chip = |mark| Chip {
             text: "Saving".to_owned(),
             mark,
-            dimmed: false,
         };
 
         let mut ui = new_ui(now);
@@ -998,33 +996,32 @@ mod tests {
         assert_eq!(rects_of(&bare.list, Layer::Chip).len(), 1, "glass alone");
     }
 
+    /// Every chip the app shows, as it draws: its glass over the brightest clay, its text on that.
     #[test]
-    fn a_dimmed_chip_is_all_at_saved_alpha() {
+    fn a_chip_as_drawn_meets_contrast_over_the_brightest_clay() {
         let now = Instant::now();
-        let theme = Theme::GLASS;
-        let mut ui = new_ui(now);
-        let saved = Chip {
-            text: "Saved".to_owned(),
-            mark: Mark::Dot,
-            dimmed: true,
-        };
-        ui.set_chip(Some(saved), now);
-        let frame = ui.frame(now).expect("a chip shows");
-        let glass = frame.list.rects[0];
-        assert_eq!(
-            glass.fill,
-            theme.glass.faded(theme.saved_alpha),
-            "the glass"
-        );
-        assert_eq!(
-            glass.stroke,
-            theme.hairline.faded(theme.saved_alpha),
-            "its line"
-        );
-        let dot = frame.list.rects[1];
-        assert_eq!(dot.fill, theme.accent.faded(theme.saved_alpha), "its mark");
-        let text = glyphs_in(&frame.list, theme.text.faded(theme.saved_alpha));
-        assert_eq!(text.len(), frame.list.glyphs.len(), "its text");
+        let clay = Colour::rgb(0xD6, 0xD6, 0xD2);
+        let chips = [
+            ("Unsaved", Mark::Dot),
+            ("Saving", Mark::Ring),
+            ("Saved", Mark::None),
+        ];
+        for (text, mark) in chips {
+            let mut ui = new_ui(now);
+            let chip = Chip {
+                text: text.to_owned(),
+                mark,
+            };
+            ui.set_chip(Some(chip), now);
+            let frame = ui.frame(now).expect("a chip shows");
+            let ground = frame.list.rects[0].fill.over(clay);
+            let glyph = frame.list.glyphs[0].colour;
+            let drawn = glyph.over(ground);
+            assert!(
+                drawn.contrast(ground) >= 4.5,
+                "{text}: {drawn:?} on {ground:?}"
+            );
+        }
     }
 
     #[test]

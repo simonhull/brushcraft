@@ -206,7 +206,6 @@ fn golden_frame() -> UiFrame {
     let chip = Chip {
         text: "Saving".to_owned(),
         mark: Mark::Ring,
-        dimmed: false,
     };
     ui.set_chip(Some(chip), now);
     let seen = now + THEME.fade;

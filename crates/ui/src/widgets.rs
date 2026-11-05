@@ -113,8 +113,6 @@ pub struct Chip {
     pub text: String,
     /// The mark before the text.
     pub mark: Mark,
-    /// All of it at the theme's `saved_alpha`: nothing left to do.
-    pub dimmed: bool,
 }
 
 /// The window being laid out for.
@@ -538,7 +536,6 @@ pub(crate) struct ChipLayout {
 impl ChipLayout {
     /// Places `chip` in `view`.
     pub(crate) fn new(chip: &Chip, view: View, theme: &Theme, text: &mut Text) -> Self {
-        let opacity = if chip.dimmed { theme.saved_alpha } else { 1.0 };
         let px = theme.status.0 * view.scale;
         let line_height = view.whole(theme.status.1);
         let line = text.line(&chip.text, theme.status_weight, px);
@@ -564,10 +561,9 @@ impl ChipLayout {
             w: mark_size,
             h: mark_size,
         };
-        let accent = theme.accent.faded(opacity);
         let mark = match chip.mark {
-            Mark::Dot => Some((accent, Colour::CLEAR, 0.0)),
-            Mark::Ring => Some((Colour::CLEAR, accent, theme.ring_width * view.scale)),
+            Mark::Dot => Some((theme.accent, Colour::CLEAR, 0.0)),
+            Mark::Ring => Some((Colour::CLEAR, theme.accent, theme.ring_width * view.scale)),
             Mark::None => None,
         };
         let mark = mark.map(|(fill, stroke, stroke_width)| RoundedRect {
@@ -582,8 +578,8 @@ impl ChipLayout {
             glass: RoundedRect {
                 rect,
                 radius: height * 0.5,
-                fill: theme.glass.faded(opacity),
-                stroke: theme.hairline.faded(opacity),
+                fill: theme.glass,
+                stroke: theme.hairline,
                 stroke_width: view.whole(theme.hairline_width).max(1.0),
                 layer: Layer::Chip,
             },
@@ -594,7 +590,7 @@ impl ChipLayout {
                     + ((height - line_height) * 0.5).round()
                     + text.baseline(theme.status_weight, px, line_height),
                 line,
-                colour: theme.text.faded(opacity),
+                colour: theme.text,
             },
         }
     }
