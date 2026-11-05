@@ -29,8 +29,9 @@
 //!    epochs and stages the frame's tiles from the store, until half the way to the frame's
 //!    deadline;
 //! 5. **hand-off**: the frame goes to the render thread, as a [`FrameRequest`] carrying the staged
-//!    uploads and the scene (residency's buffers, the camera's view, the frame's time and whether
-//!    the camera moves), which it starts encoding at once (the uploads first, then the passes);
+//!    uploads, the scene (residency's buffers, the camera's view, the frame's time and whether the
+//!    camera moves) and what the UI shows, worked out here, after the pen's work; it starts
+//!    encoding at once (the uploads first, then the passes);
 //! 6. **upkeep**: meanwhile the project's recovery writer is ticked and polled;
 //! 7. **prepare**: the brush's work off the latency path ([`Brush::prepare`]: a big brush's
 //!    catch-up, the finest work of the dabs shown ahead of it, while there is one, else warming the
@@ -114,9 +115,11 @@ use render::{DrawTimes, Look, Outcome, SceneView, aa};
 use store::{
     Drained, JobsReport, Project, SaveAhead, SaveOutcome, SpatialIndex, StaleCursor, TileStore,
 };
+use ui::{Blend, UiFrame};
 
 use self::schedule::{Next, Reason, Reasons, Scheduler, StrokePacing, UPKEEP_INTERVAL};
 use crate::camera::{Arcball, Boundary, Camera, Pixel};
+use crate::dialogs::{Dialogs, Facts};
 use crate::navigate::{Button, Input, Navigator};
 use crate::overlay::{self, Snapshot};
 use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route};
@@ -864,6 +867,8 @@ pub(crate) struct Setup {
     pub(crate) interval: Duration,
     /// How frames reach the screen, for the overlay.
     pub(crate) presentation: Presentation,
+    /// How the target blends the UI, which the UI is made for.
+    pub(crate) blend: Blend,
     /// The GPU's name and backend, for the overlay.
     pub(crate) adapter: String,
     /// A scripted run's frame count (`--frames`): every frame is wanted until that many have
@@ -1044,6 +1049,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     close: Close,
     /// The project's saves ([`Owner::request_save`]).
     saving: Saving,
+    /// What the UI shows.
+    dialogs: Dialogs,
 }
 
 /// What the camera is still to be fitted to the model by: framing it, and growing its boundary
@@ -1179,6 +1186,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ) -> Self {
         let cursor = project.store().subscribe_stale();
         let saving = Saving::new(project.path(), now);
+        let dialogs = Dialogs::new(setup.size, 1.0, setup.blend, now);
         let mut scheduler = Scheduler::new(setup.interval, now)
             .with_morph(uploads.morph())
             .with_stroke_pacing(StrokePacing::of(setup.presentation));
@@ -1258,6 +1266,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             pivot_at: None,
             close: Close::NotAsked,
             saving,
+            dialogs,
         }
     }
 
@@ -1332,6 +1341,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     fn queue_pen(&mut self, sample: PenSample, want: bool) {
         if self.closing() {
             return;
+        }
+        if sample.phase == input::Phase::Down {
+            self.dialogs.pen_down(Instant::now());
+        } else if sample.phase == input::Phase::Up {
+            self.dialogs.pen_up(Instant::now());
         }
         self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
         if sample.phase.in_stroke() {
@@ -1511,11 +1525,13 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) fn resize(&mut self, size: Option<Size>) {
         if size != self.size {
             self.size = size;
+            self.dialogs.resize(size);
             self.expose();
         }
     }
 
-    /// The window's scale factor is `scale`: the overlay is drawn at it, rounded, at least 1.
+    /// The window's scale factor is `scale`: the overlay is drawn at it, rounded, at least 1, and
+    /// the UI at it as it is.
     pub(crate) fn set_scale(&mut self, scale: f64) {
         #[expect(
             clippy::cast_possible_truncation,
@@ -1523,7 +1539,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             reason = "a scale factor is a small positive number, clamped to 1..=8"
         )]
         let overlay_scale = scale.round().clamp(1.0, 8.0) as u32;
-        if overlay_scale != self.overlay_scale {
+        let rescaled = self.dialogs.set_scale(scale);
+        if rescaled || overlay_scale != self.overlay_scale {
             self.overlay_scale = overlay_scale;
             self.expose();
         }
@@ -1549,13 +1566,22 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// In a scripted run the script's pen samples taken by `now` are queued first, as a pen's
     /// arrive between frames, and a wait ends early for its next sample ([`Owner::pen_due`]).
+    ///
+    /// An idle wait ends early too for what the UI changes by itself, which then wants a frame.
     pub(crate) fn next(&mut self, now: Instant) -> Next {
         self.queue_script_pen(now.saturating_duration_since(self.clock), true);
+        let change = self.dialogs.next_change();
+        if change.is_some_and(|change| change <= now) {
+            self.scheduler.want(Reason::Overlay);
+        }
         let next = match self.scheduler.next(now) {
             Next::Wait { until } => Next::Wait {
                 until: self.pen_due().map_or(until, |due| due.min(until)),
             },
-            next @ (Next::Idle { .. } | Next::Frame { .. } | Next::Render | Next::Gpu) => next,
+            Next::Idle { upkeep } => Next::Idle {
+                upkeep: change.map_or(upkeep, |change| change.min(upkeep)),
+            },
+            next @ (Next::Frame { .. } | Next::Render | Next::Gpu) => next,
         };
         let no_frames = self.size.is_none()
             || self.limit.is_some_and(|limit| self.started >= limit)
@@ -1744,7 +1770,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         });
         self.want_accumulation(reasons, &uploads, (scene.is_some() || reshade, moved));
 
-        let overlay = self.overlay(size, phases, uploads.summary.as_deref());
+        // After the pen's work, and asked once: the chip and the overlay say the same.
+        let unsaved = self.unsaved();
+        let ui = self.ui_frame(unsaved, now);
+        let overlay = self.overlay(size, phases, uploads.summary.as_deref(), unsaved);
         hand_off(FrameRequest {
             number: self.started,
             size,
@@ -1755,6 +1784,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             reshade,
             look: self.look,
             passes: uploads.passes.take(),
+            ui,
         })?;
         lap.next();
 
@@ -1783,13 +1813,26 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         Ok(())
     }
 
+    /// What the UI shows in the frame started at `now`, with the project `unsaved` or not.
+    fn ui_frame(&mut self, unsaved: bool, now: Instant) -> Option<UiFrame> {
+        let saving = self.saving.stage().is_some();
+        self.dialogs.update(Facts { unsaved, saving }, now);
+        self.dialogs.frame(now)
+    }
+
     /// The overlay's lines for the frame being made, of `size`, its owner thread's `phases` so
-    /// far, with the uploads' `tiles` line.
-    fn overlay(&self, size: Size, phases: OwnerPhases, tiles: Option<&str>) -> Vec<String> {
+    /// far, with the uploads' `tiles` line, the project `unsaved` or not.
+    fn overlay(
+        &self,
+        size: Size,
+        phases: OwnerPhases,
+        tiles: Option<&str>,
+        unsaved: bool,
+    ) -> Vec<String> {
         let brush = self.brush.status();
         let save = self
             .saving
-            .line(self.unsaved(), self.save_counts(), self.closing());
+            .line(unsaved, self.save_counts(), self.closing());
         let snapshot = Snapshot {
             frame: self.started,
             refresh_hz: self.scheduler.interval().as_secs_f64().recip(),
@@ -2487,6 +2530,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             || (self.script.is_some() && !self.script_over);
         if scripted {
             self.scheduler.want(Reason::Scripted);
+        }
+        if self.dialogs.needs_frame(Instant::now()) {
+            self.scheduler.want(Reason::Overlay);
         }
     }
 

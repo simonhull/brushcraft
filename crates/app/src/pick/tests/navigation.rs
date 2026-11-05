@@ -20,6 +20,7 @@ fn owner(dir: &TestDir) -> Owner<NoBrush, NoUploads> {
         size: Some(size()),
         interval: Duration::from_millis(1),
         presentation: Presentation::Offscreen,
+        blend: ui::Blend::Display,
         adapter: "test".to_owned(),
         frames: None,
         script: None,

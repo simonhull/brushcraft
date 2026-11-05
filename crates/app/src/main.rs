@@ -26,6 +26,7 @@
 
 mod camera;
 mod cli;
+mod dialogs;
 mod frame;
 mod navigate;
 mod overlay;
@@ -285,6 +286,7 @@ fn run_offscreen(options: &Options, project: ProjectToOpen) -> Result<Summary> {
         size: Some(options.size),
         interval: window::DEFAULT_INTERVAL,
         presentation,
+        blend: render.blend(),
         adapter: adapter.clone(),
         frames: options.frames(),
         script: options.script(),

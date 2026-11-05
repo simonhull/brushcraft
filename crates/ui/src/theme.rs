@@ -215,6 +215,8 @@ pub struct Theme {
     pub chip_pen_down: f32,
     /// The opacity of a chip with nothing left to do ("Saved").
     pub saved_alpha: f32,
+    /// How long "Saved" stays before it fades.
+    pub saved_hold: Duration,
     /// Glass alpha where the pass can only blend in linear light, which lightens glass.
     pub glass_alpha_linear: f32,
 }
@@ -261,6 +263,7 @@ impl Theme {
         fade: Duration::from_millis(120),
         chip_pen_down: 0.25,
         saved_alpha: 0.6,
+        saved_hold: Duration::from_secs(2),
         glass_alpha_linear: 0.9,
     };
 

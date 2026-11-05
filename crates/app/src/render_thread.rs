@@ -40,6 +40,7 @@ use render::surface::{Presentation, Size, Target};
 use render::timing::GpuTimes;
 use render::upload::FrameUploads;
 use render::{DrawTimes, DroppedReadbacks, FrameInputs, Look, Outcome, Renderer, Scene};
+use ui::{Blend, UiFrame};
 use wgpu::{Buffer, Color, PollType};
 
 use crate::overlay::TextLayout;
@@ -80,6 +81,9 @@ pub(crate) struct FrameRequest {
     /// The scene's passes, with the first frame only, whether or not it has a scene: the render
     /// thread keeps them.
     pub(crate) passes: Option<FramePasses>,
+    /// The UI to draw over everything, its fades worked out from the time as it's drawn; `None`
+    /// with nothing showing.
+    pub(crate) ui: Option<UiFrame>,
 }
 
 /// What residency gives a frame's scene: the buffers the scene's passes read, owned (a
@@ -242,6 +246,8 @@ pub(crate) struct RenderThread {
     handle: Option<JoinHandle<Result<Stopped>>>,
     /// How the target presents.
     presentation: Presentation,
+    /// How the target blends the UI.
+    blend: Blend,
     /// Whether it times each frame's phases on the GPU.
     timing: bool,
     /// The GPU, polled for finished frames.
@@ -260,6 +266,7 @@ impl RenderThread {
     /// started.
     pub(crate) fn spawn(gpu: Arc<Gpu>, target: Target, hooks: Hooks, timing: bool) -> Result<Self> {
         let presentation = target.presentation();
+        let blend = Renderer::ui_blend(&target);
         let mut renderer =
             Renderer::new(&gpu, target.format()).context("building the renderer's passes")?;
         let timing = timing
@@ -306,6 +313,7 @@ impl RenderThread {
             presented,
             handle: Some(handle),
             presentation,
+            blend,
             timing,
             gpu: polled,
             finished,
@@ -335,6 +343,11 @@ impl RenderThread {
     /// How the target presents.
     pub(crate) const fn presentation(&self) -> Presentation {
         self.presentation
+    }
+
+    /// How the target blends the UI, which the UI is made for.
+    pub(crate) const fn blend(&self) -> Blend {
+        self.blend
     }
 
     /// Whether it times each frame's phases on the GPU: asked to, on a device with timestamp
@@ -570,7 +583,7 @@ pub(crate) fn draw_frame(
         clear: CLEAR,
         overlay: image.as_ref(),
         overlay_scale: frame.overlay_scale,
-        ui: None,
+        ui: frame.ui.as_ref(),
         scene,
         look: frame.look,
         frame: frame.number,
@@ -625,6 +638,7 @@ mod tests {
             reshade: false,
             look: Look::default(),
             passes: None,
+            ui: None,
         }
     }
 

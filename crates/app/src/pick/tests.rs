@@ -321,6 +321,7 @@ fn the_frame_loop_picks_only_when_the_pointer_or_the_view_changed() {
         size: Some(size()),
         interval: Duration::from_millis(1),
         presentation: Presentation::Offscreen,
+        blend: ui::Blend::Display,
         adapter: "test".to_owned(),
         frames: None,
         script: None,

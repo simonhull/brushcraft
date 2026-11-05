@@ -37,6 +37,7 @@ fn setup() -> Setup {
         size: Some(size()),
         interval: Duration::from_micros(16_667),
         presentation: Presentation::Offscreen,
+        blend: ui::Blend::Display,
         adapter: "test".to_owned(),
         frames: None,
         script: None,

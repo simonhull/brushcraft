@@ -18,6 +18,7 @@ use render::surface::{Offscreen, Target};
 use render::tree::Place;
 use render::{DroppedReadbacks, Outcome, Renderer};
 use store::{Epoch, ProjectConfig, StoreConfig};
+use ui::Theme;
 
 use super::*;
 use crate::camera::Pixel;
@@ -58,6 +59,7 @@ fn setup(frames: Option<u64>) -> Setup {
         size: Size::new(320, 200),
         interval: INTERVAL,
         presentation: Presentation::Offscreen,
+        blend: Blend::Display,
         adapter: "test".to_owned(),
         frames,
         script: None,
@@ -571,7 +573,7 @@ fn a_brush_strokes_samples_start_a_frame_at_once_and_with_fifo_wait_for_the_slot
         "paced to the refresh"
     );
     let size = Size::new(320, 200).expect("non-zero");
-    let overlay = fallback.overlay(size, OwnerPhases::default(), None);
+    let overlay = fallback.overlay(size, OwnerPhases::default(), None, false);
     assert!(
         overlay.join("\n").contains("no mailbox"),
         "and the overlay says why"
@@ -1813,6 +1815,7 @@ fn residency_frame(
         reshade: false,
         look: Look::default(),
         passes: status.passes.take(),
+        ui: None,
     };
     let presented = screen.draw(gpu, request);
     residency.shown(presented.scene);
@@ -2091,4 +2094,150 @@ fn a_dab_shows_in_the_visibility_buffer_of_its_own_frame() {
     let changed = before.iter().zip(&after).filter(|(a, b)| a != b).count();
     assert!(changed > 0, "the dab's frame drew the moved surface");
     owner.close().expect("closed");
+}
+
+/// A brush that holds a dab from its first step on, as a stroke does: the project is unsaved from
+/// that frame, and not before.
+#[derive(Debug, Default)]
+struct HoldsADab {
+    /// Whether it has stepped.
+    stepped: bool,
+}
+
+impl Brush for HoldsADab {
+    fn step(
+        &mut self,
+        _context: BrushContext<'_>,
+        _pen: &PenFrame,
+        _budget: &BrushBudget,
+    ) -> Result<BrushReport> {
+        self.stepped = true;
+        Ok(BrushReport::default())
+    }
+
+    fn landing(&self) -> usize {
+        usize::from(self.stepped)
+    }
+}
+
+/// An owner of a small project with `brush`, its frames on demand.
+fn ui_owner<B: Brush>(dir: &TestDir, brush: B) -> Owner<B, NoUploads> {
+    Owner::new(project(dir), brush, NoUploads, setup(None), Instant::now())
+}
+
+#[test]
+fn a_frame_with_nothing_to_show_carries_no_ui() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, NoBrush);
+    let deadline = first_deadline(&mut owner);
+    let request = frame(&mut owner, deadline);
+    assert!(request.ui.is_none(), "nothing to say");
+}
+
+#[test]
+fn the_chip_is_worked_out_after_the_brush_in_the_frame_it_stepped() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, HoldsADab::default());
+    assert_eq!(owner.landing(), 0, "nothing yet");
+    let deadline = first_deadline(&mut owner);
+    let request = frame(&mut owner, deadline);
+    assert!(owner.brush().stepped, "the brush phase ran");
+    assert!(
+        request.ui.is_some(),
+        "this frame's chip knows what this frame's brush did, so it came after it"
+    );
+}
+
+#[test]
+fn a_chip_fading_wants_frames_until_it_settles_then_none() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, HoldsADab::default());
+    let deadline = first_deadline(&mut owner);
+    frame(&mut owner, deadline);
+    let fading = owner.next(Instant::now());
+    assert!(
+        matches!(fading, Next::Frame { .. } | Next::Wait { .. }),
+        "the fade wants a frame: {fading:?}"
+    );
+
+    let started = Instant::now();
+    let made = run(&mut owner, 200);
+    assert!(made >= 2, "frames while it fades: {made}");
+    let fade = Theme::GLASS.fade;
+    assert!(started.elapsed() >= fade / 2, "they lasted the fade");
+    let settled = owner.next(Instant::now());
+    assert!(matches!(settled, Next::Idle { .. }), "{settled:?}");
+}
+
+#[test]
+fn a_pen_down_touches_the_fades_and_rebuilds_nothing() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, HoldsADab::default());
+    let deadline = first_deadline(&mut owner);
+    let before = frame(&mut owner, deadline).ui.expect("the chip");
+    owner.pen(pen_sample(input::Phase::Down, (10.0, 10.0)));
+    let during = frame(&mut owner, Instant::now() + INTERVAL).ui;
+    let during = during.expect("the chip");
+    assert!(Arc::ptr_eq(&before.list, &during.list), "no rebuild");
+    let dimmed = Theme::GLASS.chip_pen_down;
+    assert!((during.fades[1].to - dimmed).abs() < 1e-6, "dimming");
+
+    owner.pen(pen_sample(input::Phase::Up, (10.0, 10.0)));
+    let after = frame(&mut owner, Instant::now() + INTERVAL).ui;
+    let after = after.expect("the chip");
+    assert!(
+        Arc::ptr_eq(&before.list, &after.list),
+        "no rebuild on the up"
+    );
+    assert!((after.fades[1].to - 1.0).abs() < 1e-6, "coming back");
+}
+
+#[test]
+fn a_saved_chip_wakes_the_idle_loop_to_leave() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, NoBrush);
+    let now = Instant::now();
+    let saving = Facts {
+        unsaved: true,
+        saving: true,
+    };
+    let done = Facts {
+        unsaved: false,
+        saving: false,
+    };
+    owner.dialogs.update(saving, now);
+    owner.dialogs.update(done, now);
+    let leaves = owner.dialogs.next_change().expect("\"Saved\" will go");
+    let deadline = first_deadline(&mut owner);
+    frame(&mut owner, deadline);
+    assert!(run(&mut owner, 200) < 200, "the fade ends");
+
+    // The upkeep just done, so only the chip is left to wake for.
+    let just_before = now + Theme::GLASS.saved_hold.mul_f32(0.99);
+    owner.upkeep(just_before).expect("upkeep");
+    let Next::Idle { upkeep: wake } = owner.next(just_before) else {
+        panic!("settled, with nothing wanted");
+    };
+    assert_eq!(wake, leaves, "it wakes for the chip, before the upkeep");
+    let after = owner.next(leaves);
+    assert!(
+        matches!(after, Next::Frame { .. } | Next::Wait { .. }),
+        "{after:?}"
+    );
+}
+
+#[test]
+fn a_window_moved_to_a_fractional_scale_is_drawn_again() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, NoBrush);
+    let deadline = first_deadline(&mut owner);
+    frame(&mut owner, deadline);
+    assert!(run(&mut owner, 10) < 10, "settled");
+    owner.set_scale(1.25);
+    assert_eq!(owner.overlay_scale, 1, "the overlay rounds it away");
+    let next = owner.next(Instant::now());
+    assert!(
+        matches!(next, Next::Frame { .. } | Next::Wait { .. }),
+        "{next:?}"
+    );
 }

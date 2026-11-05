@@ -24,6 +24,7 @@ sculpt.workspace = true
 store.workspace = true
 stroke.workspace = true
 thiserror.workspace = true
+ui.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 

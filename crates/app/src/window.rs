@@ -158,6 +158,7 @@ impl WindowApp {
             size: frame_size(window.surface_size()),
             interval: refresh_interval(window.as_ref()),
             presentation: render.presentation(),
+            blend: render.blend(),
             adapter: adapter.clone(),
             frames: self.options.frames(),
             script: self.options.script(),
