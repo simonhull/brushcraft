@@ -923,7 +923,8 @@ enum AfterSave {
 /// What a request to close the window does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseAnswer {
-    /// The window can go: nothing is unsaved, or nobody can be asked.
+    /// The window can go: nothing is unsaved, nobody can be asked, or the user has heard a save
+    /// failed and the recovery file keeps the work.
     Now,
     /// A bar is showing: it stays until that is answered.
     Asked,
@@ -1626,7 +1627,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// The window was asked to close at `now`. It goes at once with nothing unsaved. With a save
     /// under way that save decides, and otherwise the close bar asks, a close while it shows
-    /// changing nothing; either way nothing lands or lifts for it. A scripted run never asks, so
+    /// changing nothing; either way nothing lands or lifts for it. After a failed save the user has
+    /// been told of it goes at once too, its recovery file kept and the failure an error of the run
+    /// ([`Owner::leaves_on_failure`]). A scripted run never asks, so
     /// `close_held` and the save's failure hold it instead, and nor does a window with no size,
     /// where no bar could show: what isn't saved stays in the recovery file.
     pub(crate) fn ask_close(&mut self, now: Instant) -> CloseAnswer {
@@ -1641,6 +1644,10 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             true
         } else if self.dialogs.asking_close() || self.dialogs.finishing() {
             true
+        } else if self.leaves_on_failure(now) {
+            self.saving.leave_on_failure();
+            self.dialogs.clear_prompt(now);
+            false
         } else if self.unsaved() || self.pen_queued(now) {
             self.dialogs.ask_close(self.saving.name(), now);
             true
@@ -1653,6 +1660,18 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         self.lift_quiet_pen(now);
         self.scheduler.want(Reason::Overlay);
         CloseAnswer::Asked
+    }
+
+    /// Whether a close at `now` leaves on a failed save, asking nothing: the user has had the
+    /// chance to read it, no stroke has overtaken it, and the recovery file guards the work, as far
+    /// as the failure and the project say. Without that guard leaving could lose it, so a close
+    /// asks, however often.
+    fn leaves_on_failure(&self, now: Instant) -> bool {
+        let readable = !self.dialogs.failing() || self.dialogs.failure_seen();
+        let told = self.saving.told().filter(|_| readable);
+        told.is_some_and(SaveFailure::covered)
+            && self.project.protection().is_active()
+            && !self.pen_queued(now)
     }
 
     /// Says at `now` what opening found.
@@ -2923,6 +2942,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             });
             if asked && route == Some(Route::Brush) {
                 self.since_opening = SinceOpening::Stroked;
+                self.saving.told_is_stale();
                 if self.dialogs.routes() {
                     self.back_to_work();
                 }
@@ -3250,7 +3270,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// or without frames, and the outcome once it ends. Only a save that succeeded lets the window
     /// go, and only if it holds all that was drawn: one that failed, or that dabs were dropped
     /// from before it began, leaves the window and the user's work. The failure bar says so, and
-    /// then the user has been told, so a further close can leave.
+    /// then the user has been told, so a further close can leave, the recovery file kept
+    /// ([`Owner::leaves_on_failure`]).
     ///
     /// The save fixed what it holds as it began, so a stroke that waited for it isn't in it. Save
     /// on the bar means all of it: another save follows, under the same bar.
@@ -3295,6 +3316,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         };
         self.told_drops = self.brush.drops();
         let failure = SaveFailure::of(error, work, &self.project.protection());
+        self.saving.tell(failure);
         self.dialogs.failed(failure, now);
         self.scheduler.want(Reason::Overlay);
     }
@@ -3511,14 +3533,15 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         project.discard().context("discarding the project")
     }
 
-    /// What a closing project does about its save: says that one failed, finishes one under way
+    /// What a closing project does about its save: says that one failed and the window held for it
+    /// or left on it, finishes one under way
     /// if everything `landed` and no dabs were dropped since it was asked for.
     ///
     /// # Errors
     ///
     /// The failure, or why the save wasn't made: its edits stay unsaved, in the recovery file.
     fn last_save(&mut self, landed: bool) -> Result<()> {
-        if let Some(why) = self.saving.failed_closing() {
+        if let Some(why) = self.saving.run_failed_on() {
             return Err(anyhow!("saving the project: {why}"));
         }
         if self.saving.stage().is_none() {

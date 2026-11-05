@@ -55,8 +55,14 @@
 //! That close is a scripted run's. With a person at the window a close never lands anything: it
 //! asks, on a bar ([`crate::dialogs`]), and Save on the bar is an ordinary save that can still be
 //! cancelled, the window exiting once it has succeeded ([`crate::frame::Owner::ask_close`]). If it
-//! fails the window stays and the failure bar takes the close bar's place. A further close asks
-//! again, so Don't save stays in reach.
+//! fails the window stays and the failure bar takes the close bar's place.
+//!
+//! **Leaving on a failure:** with any failed save told, Ctrl+S's too, a further close asks nothing
+//! and leaves ([`crate::frame::Owner::ask_close`]), as above: the recovery file is kept, opening
+//! the project brings the work back, and the failure is an error of the run. A save that works, or
+//! a new stroke, overtakes what was told, and a close asks again. So does every close while nothing
+//! guards the work, crash protection paused or the recovery writer failed: leaving would lose it
+//! unasked, so the way out is the close bar, its Save or its Don't save.
 
 use std::error::Error as StdError;
 use std::io::{self, Write as _};
@@ -269,6 +275,11 @@ impl SaveFailure {
         }
     }
 
+    /// Whether the recovery file holds what this left unsaved, as far as the failure says.
+    pub(crate) const fn covered(self) -> bool {
+        matches!(self.cover, Cover::Protected)
+    }
+
     /// Whether it was a copy of found work that failed, not a save of the project.
     pub(crate) const fn of_found_work(self) -> bool {
         matches!(self.work, Work::Found)
@@ -318,6 +329,10 @@ pub(crate) struct Saving {
     drops_at: u64,
     /// Why a save failed with the window closing: it stays until a further close.
     failed_closing: Option<String>,
+    /// The failed save the user may leave on, until a save or a new stroke overtakes it.
+    told: Option<SaveFailure>,
+    /// Why a save failed that the window left on, which makes the run fail.
+    left_on: Option<String>,
     /// The tiles still to copy, once the copying has begun.
     tiles_left: Option<usize>,
     /// How the last save ended, until the next is asked for.
@@ -339,6 +354,8 @@ impl Saving {
             asked: now,
             drops_at: 0,
             failed_closing: None,
+            told: None,
+            left_on: None,
             tiles_left: None,
             outcome: None,
             title_says: None,
@@ -385,6 +402,7 @@ impl Saving {
         self.asked = now;
         self.drops_at = drops;
         self.failed_closing = None;
+        self.told = None;
         self.tiles_left = None;
         self.outcome = None;
     }
@@ -410,6 +428,7 @@ impl Saving {
     pub(crate) fn nothing_to_save(&mut self) {
         self.stage = None;
         self.failed_closing = None;
+        self.told = None;
         self.outcome = Some(Outcome::Done("nothing to save".to_owned()));
     }
 
@@ -419,6 +438,7 @@ impl Saving {
         let said = said_of(outcome, took);
         log(&format!("brushcraft: {}: {said}", self.name));
         self.stage = None;
+        self.told = None;
         self.outcome = Some(Outcome::Done(said));
     }
 
@@ -430,6 +450,33 @@ impl Saving {
         self.stage = None;
         self.failed_closing = closing.then(|| why.clone());
         self.outcome = Some(Outcome::Failed(why));
+    }
+
+    /// The user is being told of `failure`, the save under way's.
+    pub(crate) const fn tell(&mut self, failure: SaveFailure) {
+        self.told = Some(failure);
+    }
+
+    /// The failed save the user may leave on, if none has overtaken it.
+    pub(crate) const fn told(&self) -> Option<SaveFailure> {
+        self.told
+    }
+
+    /// A new stroke overtook what the user was told: there is new work, and a save may work now.
+    pub(crate) const fn told_is_stale(&mut self) {
+        self.told = None;
+    }
+
+    /// The window is leaving on the failure the user was told of: an error of the run.
+    pub(crate) fn leave_on_failure(&mut self) {
+        if let Some(Outcome::Failed(why)) = &self.outcome {
+            self.left_on = Some(why.clone());
+        }
+    }
+
+    /// Why a failed save ended the run: the window held for it, or left on it.
+    pub(crate) fn run_failed_on(&self) -> Option<&str> {
+        self.failed_closing().or(self.left_on.as_deref())
     }
 
     /// The title, if it no longer says what it should: `unsaved`, `landing` dabs left to land,

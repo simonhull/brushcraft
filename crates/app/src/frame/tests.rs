@@ -2816,6 +2816,13 @@ fn tap<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, at: Pixel) {
     owner.pen(pen_at(input::Phase::Up, at));
 }
 
+/// A stroke on the model, routed to the brush and over.
+fn new_stroke<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) {
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(owner, 100);
+}
+
 /// Passes of the window's loop until the save under way is over, frames among them.
 fn finish_saving<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) {
     for _ in 0..100_000 {
@@ -3373,6 +3380,7 @@ fn a_further_save_leaves_once_the_drop_was_said() {
     finish_saving(&mut owner);
     assert_eq!(owner.take_request(), None, "the first time, it stays");
 
+    new_stroke(&mut owner);
     owner.brush.held = 2;
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
     assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
@@ -3389,6 +3397,7 @@ fn dabs_dropped_while_a_failed_save_keeps_the_window_count_as_told() {
     finish_saving(&mut owner);
     assert_eq!(owner.take_request(), None, "that save failed");
 
+    new_stroke(&mut owner);
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
     assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
     finish_saving(&mut owner);
@@ -3467,6 +3476,7 @@ fn dabs_a_failed_ctrl_s_said_count_as_told() {
     owner.brush.drops = 1;
     finish_saving(&mut owner);
 
+    new_stroke(&mut owner);
     owner.brush.held = 2;
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
     assert!(owner.dialogs.asking_close(), "over the failure");
@@ -3504,28 +3514,169 @@ fn a_failed_save_after_the_close_bar_shows_the_failure_and_keeps_the_window() {
     assert!(!owner.dialogs.finishing());
 }
 
-/// The failure bar has no Don't save: a close must lead back to the bar that does.
-#[test]
-fn a_further_close_over_the_failure_bar_asks_again_and_dont_save_is_there() {
-    let dir = TestDir::new();
-    let mut owner = asked_owner(&dir, 2);
+/// The bar's Save failed, and the failure bar has been seen.
+fn close_failed_owner(dir: &TestDir) -> Owner<Lands, NoUploads> {
+    let mut owner = asked_owner(dir, 2);
     assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
     owner.end_save(Err(disk_full()));
     owner.save_step();
     see_the_bar(&mut owner);
-    assert!(owner.dialogs.failing());
+    assert!(owner.dialogs.failure_seen());
+    owner
+}
 
+/// Where `owner`'s work is kept.
+fn recovery_of<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) -> PathBuf {
+    let path = owner.project().recovery_path().expect("a recovery file");
+    path.to_path_buf()
+}
+
+/// `owner` closes as a run that failed: the error is the save's, and the recovery file stays.
+fn closes_with_the_work_kept<B: Brush, U: Uploads>(mut owner: Owner<B, U>) {
+    let file = recovery_of(&mut owner);
+    let said = owner.close().expect_err("the run failed").to_string();
+    assert!(said.contains("saving the project"), "{said}");
+    assert!(file.exists(), "automatic restore brings it back");
+}
+
+/// Save can't work and the user has heard so: Don't save, which deletes the recovery file, must not
+/// be the only way out.
+#[test]
+fn a_further_close_after_a_failed_close_bar_save_leaves_with_the_work_kept() {
+    let dir = TestDir::new();
+    let mut owner = close_failed_owner(&dir);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+    assert!(!owner.dialogs.bar_showing(), "nothing more to ask or say");
+    closes_with_the_work_kept(owner);
+}
+
+#[test]
+fn a_further_close_after_a_failed_ctrl_s_leaves_with_the_work_kept() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+    closes_with_the_work_kept(owner);
+}
+
+#[test]
+fn a_failure_dismissed_was_told_all_the_same() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    let dismiss = owner.dialogs.control(Action::Dismiss);
+    tap(&mut owner, dismiss);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+    closes_with_the_work_kept(owner);
+}
+
+/// A plain close with a failure behind it isn't a leaving on it: only the close that left says so.
+#[test]
+fn a_failure_nobody_left_on_is_no_error_of_the_run() {
+    let dir = TestDir::new();
+    let owner = failed_owner(&dir);
+    owner.close().expect("the run went on past it");
+}
+
+/// Waiting for the `Up`, the failure hasn't been told: the close bar asks.
+#[test]
+fn a_close_before_the_failure_could_be_seen_asks() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.request_save(Instant::now());
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    owner.end_save(Err(disk_full()));
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
-    assert!(owner.dialogs.asking_close(), "the close bar is back");
-    assert!(!owner.dialogs.failing());
-    see_the_bar(&mut owner);
+    assert!(owner.dialogs.asking_close());
+}
+
+/// There is new work, and Save may work now.
+#[test]
+fn a_new_stroke_makes_the_failure_stale_and_a_close_asks() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    new_stroke(&mut owner);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close());
+    owner.close().expect("nothing failed that this run left on");
+}
+
+/// A stroke on its way to the brush as the close comes is new work too.
+#[test]
+fn a_stroke_not_yet_routed_makes_a_close_ask() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close());
+}
+
+/// Navigating adds no work, so the failure stands.
+#[test]
+fn navigating_leaves_the_failure_told() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    owner.brush.routes_to = Some(Route::Navigate);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+}
+
+#[test]
+fn a_save_that_works_ends_the_failure() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    owner.request_save(Instant::now());
+    finish_saving(&mut owner);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+    owner.close().expect("nothing failed");
+}
+
+/// Trying again leaves the failure behind; if that try is let go of, nothing has been told of it.
+#[test]
+fn a_try_cancelled_under_the_pen_leaves_nothing_told() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    owner.brush.pen = true;
+    owner.save_key(Instant::now());
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.finishing(), "that save decides");
+    owner.key(UiKey::Escape, Instant::now());
+    assert_eq!(owner.save_stage(), None, "let go of");
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close());
+}
+
+/// The failure bar has no Don't save: with nothing guarding the work, a close leads back to the bar
+/// that has, however often, for leaving would lose it unasked.
+fn keeps_asking<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) {
+    for _ in 0..3 {
+        assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+        assert!(owner.dialogs.asking_close(), "the close bar is back");
+        see_the_bar(owner);
+        owner.act(Action::KeepSculpting, Instant::now());
+    }
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    see_the_bar(owner);
     let dont = owner.dialogs.control(Action::DontSave);
-    tap(&mut owner, dont);
+    tap(owner, dont);
     assert_eq!(
         owner.take_request(),
         Some(WindowRequest::ExitDiscarding),
-        "the way out"
+        "the choice is the user's"
     );
+}
+
+#[test]
+fn a_failure_of_the_recovery_writer_keeps_a_close_asking() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    let writer = store::ProjectError::Recovery(store::RecoveryError::Stopped);
+    owner.end_save(Err(anyhow::Error::new(writer)));
+    owner.save_step();
+    see_the_bar(&mut owner);
+    keeps_asking(&mut owner);
 }
 
 #[test]
@@ -3638,32 +3789,51 @@ fn a_stroke_queued_before_the_failure_doesnt_answer_it_unseen() {
     assert!(owner.dialogs.failure_seen(), "and the bar still comes");
 }
 
-/// `Project::save` never says crash protection paused: the project has to be asked.
+/// Pauses `owner`'s crash protection by a save it can't make a recovery file for, and leaves it
+/// with an edit no save holds.
 #[cfg(unix)]
-#[test]
-fn a_failure_with_protection_paused_doesnt_say_safe() {
+fn pause_protection<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let dir = TestDir::new();
-    let mut owner = closing_owner(&dir, 0);
-    let recovery = owner.project().recovery_path().expect("a recovery file");
-    let folder = recovery.parent().expect("a folder").to_path_buf();
+    let recovery = recovery_of(owner);
+    let folder = recovery.parent().expect("a folder");
     let set = |mode| {
         let mode = std::fs::Permissions::from_mode(mode);
-        std::fs::set_permissions(&folder, mode).expect("set");
+        std::fs::set_permissions(folder, mode).expect("set");
     };
     set(0o500);
     let outcome = owner.project().save().expect("a save goes through");
     set(0o700);
     assert!(!outcome.protection.is_active(), "paused");
+    edit_one_tile(owner.project());
+}
 
-    owner.request_save(Instant::now());
+/// `Project::save` never says crash protection paused: the project has to be asked.
+#[cfg(unix)]
+#[test]
+fn a_failure_with_protection_paused_doesnt_say_safe() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    pause_protection(&mut owner);
     owner.saving.start(Instant::now(), 0);
     owner.end_save(Err(disk_full()));
     assert_eq!(
         bar_says(&owner),
         "Couldn't save: the disk is full / Your work is still open, but a crash could lose it."
     );
+    see_the_bar(&mut owner);
+    keeps_asking(&mut owner);
+}
+
+/// What guards the work is asked as the close comes: told it was safe, the user may be out of date.
+#[cfg(unix)]
+#[test]
+fn protection_paused_since_the_failure_keeps_a_close_asking() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    pause_protection(&mut owner);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close());
 }
 
 /// A note of work found on an earlier save.
@@ -4278,6 +4448,38 @@ fn dont_save_on_a_restored_project_removes_its_recovery_file() {
     assert!(file.exists());
     owner.discard().expect("discarded");
     assert!(!file.exists(), "what the user dropped doesn't come back");
+}
+
+/// A restored project with no path, as a save by another instance leaves one: Save can't work, and
+/// the user who has heard so needn't drop the work to leave.
+#[test]
+fn a_project_with_no_path_is_not_stranded() {
+    let dir = TestDir::new();
+    let (path, config) = left_work(&dir);
+    let found = store::find_recoveries(&config.recovery_dir).expect("listed");
+    let candidate = found.first().expect("the file").clone();
+    let mut other = Project::open(&path, config.clone()).expect("opened");
+    edit_one_tile(&mut other);
+    drop(other.save().expect("saved"));
+    other.close(false).expect("closed");
+    let project = Project::restore(&candidate, config).expect("restored");
+    assert_eq!(project.path(), None);
+    let mut owner = Owner::new(project, NoBrush, NoUploads, big_setup(), Instant::now());
+    run(&mut owner, 10_000);
+    assert_eq!(owner.ask_close(seen_now()), CloseAnswer::Asked);
+    run(&mut owner, 10_000);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "the bar's Save");
+    for _ in 0..1000 {
+        owner.save_step();
+        if owner.save_stage().is_none() {
+            break;
+        }
+    }
+    assert_eq!(owner.save_stage(), None, "it failed");
+    assert_eq!(owner.take_request(), None, "the window stays");
+    see_the_bar(&mut owner);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+    closes_with_the_work_kept(owner);
 }
 
 /// A file standing for a recovery file set aside, in `dir`.
