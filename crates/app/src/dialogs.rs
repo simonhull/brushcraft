@@ -200,8 +200,9 @@ struct Routing {
     pen: Option<Press>,
     /// The mouse press the UI took, while it lasts, and its button.
     mouse: Option<(Button, Press)>,
-    /// Where the pointer last was, while input is routed here: a release doesn't say.
-    pointer: Option<Pixel>,
+    /// Where the mouse last was, while input is routed here: a release doesn't say. The mouse's
+    /// alone, so a pen in the other hand steers no click.
+    mouse_at: Option<Pixel>,
     /// Whether input goes through here first: a bar is up, or a press it took is still down.
     on: bool,
 }
@@ -486,7 +487,7 @@ impl Dialogs {
     /// [`Dialogs::release_mouse`] or [`Dialogs::drop_mouse_press`], and only the left button acts.
     /// Another button pressed meanwhile is swallowed if it is on the bar, and held by nothing.
     pub(crate) fn claim_mouse(&mut self, button: Button, at: Pixel, now: Instant) -> Claim {
-        self.routing.pointer = Some(at);
+        self.routing.mouse_at = Some(at);
         let Some(press) = self.press_at(at, now) else {
             return Claim::Elsewhere;
         };
@@ -507,12 +508,12 @@ impl Dialogs {
         self.routing.mouse.is_some_and(|(held, _)| held == button)
     }
 
-    /// The press the UI held came up, with the pointer where it last was: what to do, if that's on
+    /// The press the UI held came up, with the mouse where it last was: what to do, if that's on
     /// the control it began on.
     pub(crate) fn release_mouse(&mut self, now: Instant) -> Option<Action> {
         let press = self.routing.mouse.take();
         self.routing.update();
-        let (x, y) = ui_point(self.routing.pointer?);
+        let (x, y) = ui_point(self.routing.mouse_at?);
         press.and_then(|(_, press)| press.ends_over(self.ui.hit(x, y, now)))
     }
 
@@ -522,10 +523,15 @@ impl Dialogs {
         self.routing.update();
     }
 
-    /// The pointer is at `at` (`None`: gone): whether that changed what draws.
+    /// The pointer, the pen's or the mouse's, is at `at` (`None`: gone): whether that changed what
+    /// draws.
     pub(crate) fn hover(&mut self, at: Option<Pixel>) -> bool {
-        self.routing.pointer = at;
         self.ui.hover(at.map(ui_point))
+    }
+
+    /// The mouse is at `at` (`None`: out of the window, where it presses nothing).
+    pub(crate) const fn mouse_at(&mut self, at: Option<Pixel>) {
+        self.routing.mouse_at = at;
     }
 }
 

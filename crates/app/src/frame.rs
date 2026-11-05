@@ -1391,6 +1391,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 true
             }
             Input::Move { at } => {
+                self.dialogs.mouse_at(Some(at));
                 self.ui_hover(Some(at));
                 false
             }
@@ -1641,6 +1642,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// The pointer left the window: nothing is under it to pick.
     pub(crate) fn pointer_left(&mut self) {
         if self.dialogs.routes() {
+            self.dialogs.mouse_at(None);
             self.ui_hover(None);
         }
         self.point(None);

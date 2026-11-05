@@ -3315,3 +3315,32 @@ fn dabs_dropped_while_a_failed_save_keeps_the_window_count_as_told() {
         "said already"
     );
 }
+
+/// The mouse's release goes by the mouse's place alone: a pen in the other hand steers nothing.
+#[test]
+fn a_pen_hover_doesnt_steer_a_mouse_release() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    let dont = owner.dialogs.control(Action::DontSave);
+    owner.input(Input::Press {
+        button: LEFT,
+        at: dont,
+    });
+    owner.input(Input::Move { at: ON_THE_MODEL });
+    owner.pen(pen_at(input::Phase::Hover, dont));
+    owner.input(Input::Release { button: LEFT });
+    assert_eq!(owner.take_request(), None, "released off the control");
+    assert!(owner.dialogs.asking_close(), "still asking");
+}
+
+/// And the other way about: a pen's hover going elsewhere doesn't take a click away.
+#[test]
+fn a_pen_hover_doesnt_spoil_a_mouse_click() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    let at = owner.dialogs.control(Action::KeepSculpting);
+    owner.input(Input::Press { button: LEFT, at });
+    owner.pen(pen_at(input::Phase::Leave, ON_THE_MODEL));
+    owner.input(Input::Release { button: LEFT });
+    assert!(!owner.dialogs.bar_showing(), "the click stands");
+}
