@@ -886,11 +886,12 @@ fn holding_everything(dir: &TestDir) -> Owner<Sculpting, NoUploads> {
     owner
 }
 
+/// Frames go on after it here, though none do in the app, for what is held to land if it can.
 #[test]
 fn abandoning_forgets_what_is_held_and_lands_nothing() {
     let dir = TestDir::new();
     let mut owner = holding_everything(&dir);
-    owner.request_save(Instant::now());
+    owner.brush_mut().begin_saving(Instant::now());
     let before = positions(owner.project());
     owner.brush_mut().abandon();
     assert_eq!(owner.landing(), 0, "nothing is held");
@@ -899,12 +900,17 @@ fn abandoning_forgets_what_is_held_and_lands_nothing() {
     assert!(!owner.brush().stroking(), "no stroke is open");
     assert_eq!(owner.brush().landing, Landing::InFrames);
     assert_eq!(owner.brush().save_asked, None, "no save holds strokes back");
+    owner.expose();
+    run(&mut owner, 10_000);
     assert_eq!(positions(owner.project()), before, "no tile changed");
+    assert_eq!(owner.landing(), 0, "and nothing came back");
     owner.discard().expect("discarded");
 }
 
+/// The file's readers see the last save. That nothing landed can't be read here, with the store
+/// gone: `frame::tests::discard_tells_the_brush_to_forget_and_never_to_land` says so.
 #[test]
-fn discard_lands_nothing_and_removes_the_recovery_file() {
+fn discard_leaves_the_saved_tiles_and_removes_the_recovery_file() {
     let dir = TestDir::new();
     let owner = holding_everything(&dir);
     let saved = tiles_on_disk(&dir);
@@ -925,24 +931,82 @@ fn discard_leaves_the_project_file_as_it_was() {
     assert!(before == after, "byte for byte");
 }
 
-/// With a save part written the file is untouched until the save's last step, so Don't save leaves
-/// it as it was then too.
+/// Don't save with a save written ahead leaves what a reader sees as it was.
+///
+/// A save's writing copies records into the file ahead of its save point, so the file grows, but
+/// no save point reaches them until the save's last step.
 #[test]
-fn discard_during_a_save_leaves_the_project_file_as_it_was() {
+fn discard_during_a_save_leaves_what_the_project_file_holds() {
     let dir = TestDir::new();
     let mut owner = slow_owner(&dir);
     run(&mut owner, 10_000);
     queue(&mut owner, stroke(ACROSS, 12));
     run(&mut owner, 10_000);
-    let before = std::fs::read(path_in(&dir)).expect("the file");
+    let file = path_in(&dir);
+    let length = || std::fs::metadata(&file).expect("the file").len();
+    let (tiles, points, before) = (tiles_on_disk(&dir), save_points(&dir), length());
     owner.request_save(Instant::now());
     while owner.save_stage() != Some(Stage::Writing) {
         owner.save_step();
     }
+    let mut steps = 0;
+    loop {
+        let slice = Instant::now() + Duration::from_millis(5);
+        match owner.project().save_ahead(slice).expect("written ahead") {
+            store::SaveAhead::Ready => break,
+            store::SaveAhead::Flushing => std::thread::sleep(Duration::from_millis(1)),
+            store::SaveAhead::Copying(_) => {}
+        }
+        steps += 1;
+        assert!(steps < 100_000, "it gets there");
+    }
+    assert_eq!(
+        owner.save_stage(),
+        Some(Stage::Writing),
+        "the save isn't over"
+    );
+    assert!(length() > before, "the file holds what it copied");
     owner.discard().expect("discarded");
-    let after = std::fs::read(path_in(&dir)).expect("the file");
-    assert!(before == after, "byte for byte");
+    assert_eq!(tiles_on_disk(&dir), tiles, "what a reader sees");
+    assert_eq!(save_points(&dir), points, "no save point more");
+    assert_eq!(records_on_disk(&dir), 0, "no stroke of it");
     assert_eq!(recovery_files(&dir), 0, "the work is gone, as asked");
+}
+
+/// In the landing, the stroke's op open and dabs shown ahead: all of it just goes.
+#[test]
+fn discard_in_a_saves_landing_with_an_op_open() {
+    let dir = TestDir::new();
+    let mut owner = holding_everything(&dir);
+    let open = owner
+        .brush()
+        .stroke
+        .as_ref()
+        .is_some_and(|stroke| stroke.op.is_some());
+    assert!(open, "an op is open");
+    owner.request_save(Instant::now());
+    let saved = tiles_on_disk(&dir);
+    owner.discard().expect("discarded");
+    assert_eq!(recovery_files(&dir), 0);
+    assert_eq!(tiles_on_disk(&dir), saved);
+}
+
+#[test]
+fn discard_with_a_save_landing_leaves_the_file_as_it_was() {
+    let dir = TestDir::new();
+    let mut owner = slow_owner(&dir);
+    run(&mut owner, 10_000);
+    queue(&mut owner, stroke(ACROSS, 12));
+    run(&mut owner, 1);
+    owner.request_save(Instant::now());
+    owner.save_step();
+    owner.save_step();
+    owner.save_step();
+    assert_eq!(owner.save_stage(), Some(Stage::Landing), "under way");
+    let saved = tiles_on_disk(&dir);
+    owner.discard().expect("discarded");
+    assert_eq!(recovery_files(&dir), 0);
+    assert_eq!(tiles_on_disk(&dir), saved);
 }
 
 /// The recovery files in `dir`.

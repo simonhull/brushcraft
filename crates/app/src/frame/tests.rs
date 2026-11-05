@@ -3279,14 +3279,27 @@ fn a_mouse_click_answers_the_bar_too() {
     assert!(owner.dialogs.finishing());
 }
 
+/// The whole tap, on the very place Don't save will be: shown by tapping it on a bar seen.
 #[test]
 fn a_bar_just_asked_cant_be_hit_before_it_can_be_seen() {
+    let seen_dir = TestDir::new();
+    let mut seen = asked_owner(&seen_dir, 0);
+    let dont = seen.dialogs.control(Action::DontSave);
+    tap(&mut seen, dont);
+    assert_eq!(
+        seen.take_request(),
+        Some(WindowRequest::ExitDiscarding),
+        "this is the place"
+    );
+
     let dir = TestDir::new();
     let mut owner = closing_owner(&dir, 0);
-    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
-    // Where Don't save will be, in the first instant of the fade: the Down is the stroke's.
-    owner.pen(pen_at(input::Phase::Down, Pixel { x: 640.0, y: 750.0 }));
+    // Its fade begins a minute from now: at nothing, however this test is paced.
+    let later = Instant::now() + Duration::from_secs(60);
+    assert_eq!(owner.ask_close(later), CloseAnswer::Asked);
+    tap(&mut owner, dont);
     assert_eq!(owner.take_request(), None, "nothing was pressed");
+    assert!(owner.dialogs.asking_close(), "and the question stands");
 }
 
 /// A brush that says when it is told to forget what it holds, and never lands.
@@ -3751,4 +3764,23 @@ fn a_barrel_off_the_bar_or_brought_to_it_is_navigations() {
         input::Buttons::default(),
         "and so does its release"
     );
+}
+
+/// A minimised window goes on saving: its steps need no frames, and no size.
+#[test]
+fn finishing_needs_no_frames_or_size() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 5);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    owner.resize(None);
+    let mut steps = 0;
+    while owner.request.is_none() {
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        owner.upkeep(Instant::now()).expect("upkeep");
+        steps += 1;
+        assert!(steps < 200_000, "stuck at {:?}", owner.save_stage());
+    }
+    assert_eq!(owner.take_request(), Some(WindowRequest::Exit));
 }
