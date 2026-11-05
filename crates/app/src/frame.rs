@@ -124,8 +124,8 @@ use render::surface::{Presentation, Size};
 use render::upload::FrameUploads;
 use render::{DrawTimes, Look, Outcome, SceneView, aa};
 use store::{
-    Drained, JobsReport, Project, RecoveryCandidate, SaveAhead, SaveOutcome, SpatialIndex,
-    StaleCursor, TileStore,
+    CacheError, Drained, JobsReport, Project, ProjectError, Protection, RecoveryCandidate,
+    RecoveryError, SaveAhead, SaveOutcome, SpatialIndex, StaleCursor, TileStore,
 };
 use ui::{Blend, UiFrame};
 
@@ -138,7 +138,10 @@ use crate::pen::{PenFrame, PenNavigation, PenRouter, PenSample, PenStatus, Route
 use crate::pick::Picker;
 use crate::record::{Latency, RecordStream, Recorder, RunInfo, SceneRecord};
 use crate::render_thread::{FrameRequest, Presented, ResidentScene, SceneRequest};
-use crate::saving::{self, DabsDropped, SAVE_SLICE, SaveFailure, SaveStep, Saving, Stage, Work};
+use crate::saving::{
+    self, DabsDropped, SAVE_SLICE, SaveFailure, SaveStep, SaveTrouble, Saving, Stage, TilesLost,
+    Work,
+};
 use crate::script::{BrushSize, Script, ScriptPen, Segment};
 use crate::{OpenNote, said_too};
 
@@ -925,6 +928,26 @@ enum AfterSave {
     Exit,
 }
 
+/// How the recovery file came to fall short of the edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Shortfall {
+    /// Crash protection is paused: it says so itself, and may come back by itself.
+    Paused,
+    /// A flush failed, or left tiles out. Nothing says when that is over, so a save has to be.
+    Lacking,
+}
+
+/// What the frame loop knows of a recovery file not guarding the edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Exposed {
+    /// How it came about.
+    shortfall: Shortfall,
+    /// Why, as the user hears it.
+    trouble: SaveTrouble,
+    /// Whether the bar has said so: once, however long it lasts.
+    told: bool,
+}
+
 /// What a request to close the window does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseAnswer {
@@ -1202,6 +1225,8 @@ pub(crate) struct Owner<B: Brush, U: Uploads> {
     /// How many of the brush's drops of dabs the user has been told of: a save counts only those
     /// since it began, so dabs dropped before it, under the close bar say, would go unsaid.
     told_drops: u64,
+    /// The recovery file not guarding the edits, if so ([`Owner::heard`]).
+    exposed: Option<Exposed>,
     /// What the window must do next ([`Owner::take_request`]).
     request: Option<WindowRequest>,
     /// A copy of found work on its way to [`Owner::request`].
@@ -1434,6 +1459,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             saving,
             after_save: AfterSave::Stay,
             told_drops: 0,
+            exposed: None,
             request: None,
             copying: None,
             since_opening: SinceOpening::Untouched,
@@ -1599,9 +1625,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// A stroke went to the brush: going back to work answers the bar. On the close bar that's
     /// Keep sculpting, while finishing, Cancel, the stroke waiting for the save as any does, and a
-    /// note goes, what it found staying where it is, and so does a failure the user could see: one
-    /// waiting for this stroke's `Up` is yet to be read. Navigating is no answer: the user may be
-    /// looking at the model before deciding.
+    /// note goes, what it found staying where it is, and so does a failure, or word of crash
+    /// protection stopping, the user could see: one waiting for this stroke's `Up` is yet to be
+    /// read. Navigating is no answer: the user may be looking at the model before deciding.
     fn back_to_work(&mut self) {
         let now = Instant::now();
         if self.dialogs.asking_close() {
@@ -1612,7 +1638,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.copying = None;
             self.dialogs.clear_prompt(now);
             self.scheduler.want(Reason::Overlay);
-        } else if self.dialogs.failure_seen() {
+        } else if self.dialogs.failure_seen() || self.dialogs.stopping_seen() {
             self.dialogs.clear_prompt(now);
             self.scheduler.want(Reason::Overlay);
         }
@@ -1672,14 +1698,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
 
     /// Whether a close at `now` leaves on a failed save, asking nothing: the user has had the
     /// chance to read it, no stroke has overtaken it, and the recovery file guards the work, as far
-    /// as the failure and the project say. Without that guard leaving could lose it, so a close
-    /// asks, however often.
+    /// as the failure, the project and what upkeep heard say. Without that guard leaving could lose
+    /// it, so a close asks, however often, unless nothing is left unsaved to lose.
     fn leaves_on_failure(&self, now: Instant) -> bool {
         let readable = !self.dialogs.failing() || self.dialogs.failure_seen();
-        let told = self.saving.told().filter(|_| readable);
-        told.is_some_and(SaveFailure::covered)
-            && self.project.protection().is_active()
-            && !self.pen_queued(now)
+        let Some(told) = self.saving.told().filter(|_| readable) else {
+            return false;
+        };
+        let guarded =
+            told.covered() && self.project.protection().is_active() && self.exposed.is_none();
+        !self.pen_queued(now) && (guarded || !self.unsaved())
     }
 
     /// Says at `now` what opening found.
@@ -1769,6 +1797,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 self.dialogs.clear_prompt(now);
             }
             Action::Dismiss => self.dialogs.dismiss(now),
+            Action::SaveWork => self.request_save(now),
             Action::Ignore => self.dialogs.clear_prompt(now),
             // What failed is what goes again: a copy of found work, which the note it took the
             // place of offers, or a save. The bar goes either way, out of date.
@@ -2405,8 +2434,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         // must keep a long stroke's edits.
         let waiting = self.pull_pen(pen, Instant::now(), true);
         if !waiting || self.upkeep_due(Instant::now()) {
-            self.project.tick(now).context("ticking the project")?;
-            self.project.poll().context("polling the project")?;
+            self.tend_recovery(now)?;
             self.upkept_at = Instant::now();
         }
         self.after_hand_off.upkeep = lap.next();
@@ -3154,10 +3182,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     ///
     /// # Errors
     ///
-    /// As [`Project::tick`] and [`Project::poll`].
+    /// As [`Owner::tend_recovery`].
     pub(crate) fn upkeep(&mut self, now: Instant) -> Result<()> {
-        self.project.tick(now).context("ticking the project")?;
-        self.project.poll().context("polling the project")?;
+        self.tend_recovery(now)?;
         self.scheduler.upkept(now);
         self.upkept_at = now;
         // A poll can install prefetched tiles, closing epochs: the next frame takes them.
@@ -3165,6 +3192,114 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             self.scheduler.want(Reason::Converging);
         }
         Ok(())
+    }
+
+    /// Ticks and polls the project at `now`, and hears what that says of crash protection.
+    ///
+    /// # Errors
+    ///
+    /// As [`Project::tick`] and [`Project::poll`], but for what a run can go on after
+    /// ([`Owner::heard`]).
+    fn tend_recovery(&mut self, now: Instant) -> Result<()> {
+        let ticked = self.project.tick(now);
+        self.heard(ticked, "ticking the project", now)?;
+        let polled = self.project.poll();
+        self.heard(polled, "polling the project", now)?;
+        self.watch_protection(now);
+        Ok(())
+    }
+
+    /// `result` came of `doing`, at `now`. A recovery file that can't keep up is no reason to stop
+    /// sculpting: it is the user's to hear of, and the edits are still in memory. So those errors
+    /// end here ([`recovery_trouble`]), and an old file left undeleted, which guards as ever, is
+    /// said in the log alone.
+    ///
+    /// # Errors
+    ///
+    /// Any other, the tile store's above all: without it nothing can be drawn or saved.
+    fn heard(&mut self, result: Result<(), ProjectError>, doing: &str, now: Instant) -> Result<()> {
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if matches!(error, ProjectError::OldRecoveryKept { .. }) {
+            let why = anyhow::Error::new(error);
+            saving::log(&format!("brushcraft: {doing}: {why:#}"));
+            return Ok(());
+        }
+        if !recovery_trouble(&error) {
+            return Err(anyhow::Error::new(error).context(doing.to_owned()));
+        }
+        // A pause is the project's to say, and how it ends: watching takes it from there.
+        if !matches!(error, ProjectError::ProtectionPaused(_)) {
+            let trouble = SaveTrouble::of_source(&error);
+            self.falls_short(Shortfall::Lacking, trouble, &error, doing);
+        }
+        self.tell_of_stopping(now);
+        Ok(())
+    }
+
+    /// The recovery file isn't guarding the edits, for `shortfall`: said in the log the first time,
+    /// as `error` of `doing`. A pause giving way to a shortfall of its own lasts until a save.
+    fn falls_short(
+        &mut self,
+        shortfall: Shortfall,
+        trouble: SaveTrouble,
+        error: &(dyn std::error::Error + 'static),
+        doing: &str,
+    ) {
+        if let Some(exposed) = &mut self.exposed {
+            exposed.shortfall = exposed.shortfall.max(shortfall);
+            return;
+        }
+        self.exposed = Some(Exposed {
+            shortfall,
+            trouble,
+            told: false,
+        });
+        let mut why = error.to_string();
+        let mut link = error.source();
+        while let Some(cause) = link {
+            why = format!("{why}: {cause}");
+            link = cause.source();
+        }
+        saving::log(&format!("brushcraft: {doing}: {why}"));
+    }
+
+    /// Brings what is known of crash protection up to date with the project at `now`: however it
+    /// paused, a stroke's end or a save included, and it comes back by itself, which ends all this.
+    fn watch_protection(&mut self, now: Instant) {
+        if let Protection::Paused(cause) = self.project.protection() {
+            let trouble = SaveTrouble::of_source(&*cause);
+            self.falls_short(
+                Shortfall::Paused,
+                trouble,
+                &*cause,
+                "crash protection paused",
+            );
+        } else if self
+            .exposed
+            .is_some_and(|known| known.shortfall == Shortfall::Paused)
+        {
+            self.exposed = None;
+            saving::log("brushcraft: crash protection is back");
+            if self.dialogs.says_stopped() {
+                self.dialogs.dismiss(now);
+                self.scheduler.want(Reason::Overlay);
+            }
+        }
+        self.tell_of_stopping(now);
+    }
+
+    /// Tells the user of the recovery file falling short, if they haven't been and the bar is free.
+    fn tell_of_stopping(&mut self, now: Instant) {
+        if let Some(exposed) = &mut self.exposed
+            && !exposed.told
+            && self.dialogs.can_tell_of_stopping()
+        {
+            exposed.told = true;
+            self.dialogs.protection_stopped(exposed.trouble, now);
+            self.scheduler.want(Reason::Overlay);
+        }
     }
 
     /// The window was asked to close: the pen's samples are no longer taken, and the brush lands
@@ -3238,9 +3373,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
         self.scheduler.want(Reason::Input);
         // Out of date from here on, whatever comes of this.
-        if self.dialogs.failing() {
-            self.dialogs.dismiss(now);
-        }
+        self.dialogs.save_asked(now);
         if !self.unsaved() && !self.pen_queued(now) {
             self.saving.nothing_to_save();
             return;
@@ -3326,6 +3459,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         };
         self.told_drops = self.brush.drops();
         let failure = SaveFailure::of(error, work, &self.project.protection());
+        let failure = if self.exposed.is_some() {
+            failure.exposed()
+        } else {
+            failure
+        };
         self.saving.tell(failure);
         self.dialogs.failed(failure, now);
         self.scheduler.want(Reason::Overlay);
@@ -3423,22 +3561,34 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         match saved {
             Ok(outcome) => {
                 let now = Instant::now();
-                self.saved(&outcome, now);
                 // Saved, the work is the last save: there's no other to go back to.
                 if self.dialogs.says_restored() {
                     self.dialogs.clear_prompt(now);
                 }
+                self.saved(&outcome, now);
             }
             Err(error) => self.save_failed(&error, Instant::now()),
         }
         self.save_over();
     }
 
-    /// A save went through at `now`, with `outcome`: said, and a recovery file set aside goes.
+    /// A save went through at `now`, with `outcome`: said, and a recovery file set aside goes. One
+    /// without some tiles' latest edits is a failed save for the user ([`crate::saving`]).
     fn saved(&mut self, outcome: &SaveOutcome, now: Instant) {
         self.saving.saved(outcome, now);
-        self.dialogs.saved(now);
         self.forget_kept_recovery();
+        if outcome.unprotected.is_empty() {
+            self.dialogs.saved(now);
+            if self
+                .exposed
+                .is_some_and(|exposed| exposed.shortfall == Shortfall::Lacking)
+            {
+                self.exposed = None;
+            }
+        } else {
+            let lost = TilesLost(outcome.unprotected.len());
+            self.save_failed(&anyhow::Error::new(lost), now);
+        }
     }
 
     /// Removes the recovery file set aside by Use last save: there is no going back to it now. A
@@ -3563,6 +3713,8 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let outcome = self.project.save().context("saving the project")?;
         self.saving.saved(&outcome, Instant::now());
         self.forget_kept_recovery();
+        let lost = outcome.unprotected.len();
+        ensure!(lost == 0, TilesLost(lost));
         Ok(())
     }
 
@@ -3727,6 +3879,26 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     pub(crate) const fn project(&mut self) -> &mut Project {
         &mut self.project
     }
+}
+
+/// Whether `error`, of a tick or a poll, is the recovery file's alone, so a run can go on after it.
+///
+/// A store that has found itself broken can't: a flush failing on its invariants, or the writer's
+/// replies out of step, are bugs, and what they have written is in doubt.
+fn recovery_trouble(error: &ProjectError) -> bool {
+    let bug = matches!(
+        error,
+        ProjectError::Recovery(
+            RecoveryError::OutOfStep | RecoveryError::Store(CacheError::Internal(_))
+        )
+    );
+    let recovery = matches!(
+        error,
+        ProjectError::ProtectionPaused(_)
+            | ProjectError::Unprotected(_)
+            | ProjectError::Recovery(_)
+    );
+    recovery && !bug
 }
 
 /// `dropped` as the error of a save it failed.

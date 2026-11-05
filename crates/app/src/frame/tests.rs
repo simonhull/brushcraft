@@ -17,7 +17,7 @@ use render::raster::{BACKGROUND, VisibilityId};
 use render::surface::{Offscreen, Target};
 use render::tree::Place;
 use render::{DroppedReadbacks, Outcome, Renderer};
-use store::{Epoch, ProjectConfig, StoreConfig};
+use store::{Epoch, FileError, Invariant, KeptRecovery, ProjectConfig, StoreConfig};
 use ui::{Bar, Control, Emphasis, Theme, UiFrame};
 
 use super::*;
@@ -3673,7 +3673,7 @@ fn a_failure_of_the_recovery_writer_keeps_a_close_asking() {
     let dir = TestDir::new();
     let mut owner = asked_owner(&dir, 2);
     assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
-    let writer = store::ProjectError::Recovery(store::RecoveryError::Stopped);
+    let writer = ProjectError::Recovery(RecoveryError::Stopped);
     owner.end_save(Err(anyhow::Error::new(writer)));
     owner.save_step();
     see_the_bar(&mut owner);
@@ -3835,6 +3835,262 @@ fn protection_paused_since_the_failure_keeps_a_close_asking() {
     pause_protection(&mut owner);
     assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
     assert!(owner.dialogs.asking_close());
+}
+
+/// Crash protection failing to come back, as on a disk with no room for a recovery file: the run
+/// goes on.
+#[cfg(unix)]
+#[test]
+fn a_recovery_file_that_cant_be_made_doesnt_end_the_run() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    pause_protection(&mut owner);
+    let recovery = dir.path().join("recovery");
+    let set = |mode| {
+        let mode = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(&recovery, mode).expect("set");
+    };
+    set(0o500);
+    let later = Instant::now() + Duration::from_secs(3600);
+    let went_on = owner.upkeep(later);
+    set(0o700);
+    went_on.expect("sculpting goes on");
+}
+
+/// A flush that failed for a full disk, as a tick gives it.
+fn flush_failed() -> ProjectError {
+    let write = FileError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+    let store = CacheError::WriteBack(write);
+    ProjectError::Recovery(RecoveryError::Store(store))
+}
+
+/// What an upkeep hears of `error`.
+///
+/// # Errors
+///
+/// As [`Owner::heard`].
+fn hears<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, error: ProjectError) -> Result<()> {
+    owner.heard(Err(error), "ticking the project", Instant::now())
+}
+
+#[test]
+fn a_flush_on_a_full_disk_says_so_once_and_sculpting_goes_on() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    hears(&mut owner, flush_failed()).expect("the run goes on");
+    assert_eq!(
+        bar_says(&owner),
+        "Crash protection has stopped: the disk is full / Save your work when you can."
+    );
+    see_the_bar(&mut owner);
+    let dismiss = owner.dialogs.control(Action::Dismiss);
+    tap(&mut owner, dismiss);
+    assert!(!owner.dialogs.bar_showing());
+    hears(&mut owner, flush_failed()).expect("again");
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(!owner.dialogs.bar_showing(), "told once");
+}
+
+/// The tiles a flush left out are reported once: the frame loop has to remember.
+#[test]
+fn tiles_left_out_of_a_flush_keep_a_close_asking_until_a_save() {
+    let dir = TestDir::new();
+    let mut owner = failed_owner(&dir);
+    let dismiss = owner.dialogs.control(Action::Dismiss);
+    tap(&mut owner, dismiss);
+    hears(&mut owner, ProjectError::Unprotected(Vec::new())).expect("the run goes on");
+    assert!(owner.dialogs.says_stopped());
+    see_the_bar(&mut owner);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    assert!(owner.dialogs.asking_close(), "nothing guards it");
+    owner.act(Action::KeepSculpting, Instant::now());
+    owner.request_save(Instant::now());
+    finish_saving(&mut owner);
+    assert_eq!(owner.exposed, None, "that save put it right");
+}
+
+/// A failure after word of it can't say safe, though nothing in the error or the project says.
+#[test]
+fn a_failure_after_tiles_were_left_out_doesnt_say_safe() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    hears(&mut owner, ProjectError::Unprotected(Vec::new())).expect("the run goes on");
+    owner.saving.start(Instant::now(), 0);
+    owner.end_save(Err(disk_full()));
+    let said = bar_says(&owner);
+    assert!(said.contains("a crash could lose it"), "{said}");
+}
+
+/// Written into the log and nothing more: it guards as it did.
+#[test]
+fn an_old_recovery_file_left_behind_says_nothing_on_the_bar() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    let kept = ProjectError::OldRecoveryKept {
+        path: "old.bcrf".into(),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    };
+    hears(&mut owner, kept).expect("the run goes on");
+    assert!(!owner.dialogs.bar_showing());
+    assert_eq!(owner.exposed, None);
+}
+
+#[test]
+fn a_store_that_cant_go_on_still_ends_the_run() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    let broken = CacheError::Full;
+    assert!(hears(&mut owner, ProjectError::Cache(broken)).is_err());
+    let step = ProjectError::Recovery(RecoveryError::OutOfStep);
+    assert!(hears(&mut owner, step).is_err());
+    let invariant = CacheError::Internal(Invariant::StaleHandle);
+    let bug = ProjectError::Recovery(RecoveryError::Store(invariant));
+    assert!(hears(&mut owner, bug).is_err());
+    assert_eq!(owner.exposed, None);
+}
+
+/// Crash protection pausing and coming back: the save it paused in went through, the bar comes at
+/// the next upkeep, and goes by itself.
+#[cfg(unix)]
+#[test]
+fn crash_protection_coming_back_ends_the_word_of_it() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    pause_protection(&mut owner);
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(owner.dialogs.says_stopped(), "said without any error");
+    let said = bar_says(&owner);
+    assert!(said.contains("this file can't be written"), "{said}");
+
+    let later = Instant::now() + Duration::from_secs(3600);
+    owner.upkeep(later).expect("upkeep");
+    assert!(owner.project().protection().is_active(), "it came back");
+    assert!(!owner.dialogs.bar_showing(), "the word of it goes");
+    assert_eq!(owner.exposed, None);
+}
+
+/// The bar's Save saves and stays: this isn't the close bar's.
+#[test]
+fn save_on_the_stopped_bar_saves_and_the_window_stays() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    hears(&mut owner, flush_failed()).expect("the run goes on");
+    see_the_bar(&mut owner);
+    let save = owner.dialogs.control(Action::SaveWork);
+    tap(&mut owner, save);
+    assert!(owner.save_stage().is_some(), "a save");
+    assert!(!owner.dialogs.bar_showing());
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), None, "the window stays");
+    assert!(!owner.unsaved());
+}
+
+#[test]
+fn a_stroke_puts_the_stopped_bar_away_and_one_under_way_waits_for_it() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 100);
+    hears(&mut owner, flush_failed()).expect("the run goes on");
+    assert!(!owner.dialogs.stopping_seen(), "under the pen");
+    owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
+    run(&mut owner, 100);
+    assert!(owner.dialogs.stopping_seen(), "the Up brings it");
+    see_the_bar(&mut owner);
+    new_stroke(&mut owner);
+    assert!(!owner.dialogs.bar_showing(), "a stroke is the answer");
+}
+
+/// A question comes first, and the word of it comes after, once.
+#[test]
+fn the_stopped_bar_waits_for_the_close_bar() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    hears(&mut owner, flush_failed()).expect("the run goes on");
+    assert!(owner.dialogs.asking_close(), "the question stands");
+    owner.act(Action::KeepSculpting, Instant::now());
+    owner.upkeep(Instant::now()).expect("upkeep");
+    assert!(owner.dialogs.says_stopped());
+}
+
+/// What a save reports of tiles it went through without.
+fn lost_a_tile() -> SaveOutcome {
+    let key = TileKey::displacement(FaceId::new(0), Level::new(FINEST).expect("a level"), 0, 0);
+    SaveOutcome {
+        protection: Protection::Active,
+        unprotected: vec![key.expect("a tile")],
+        kept: Vec::new(),
+    }
+}
+
+#[test]
+fn a_save_without_some_tiles_edits_shows_no_saved_and_says_they_are_gone() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    owner.end_save(Ok(lost_a_tile()));
+    owner.save_step();
+    assert_eq!(owner.take_request(), None, "the window stays");
+    assert_eq!(
+        bar_says(&owner),
+        "Couldn't save: part of a stroke is gone / The rest of your work was saved."
+    );
+    assert!(!owner.dialogs.says_saved(), "no Saved");
+    assert_eq!(owner.saving.last_succeeded(), Some(false));
+    let controls = owner.dialogs.bar().expect("a bar").controls().len();
+    assert_eq!(controls, 1, "nothing to try");
+}
+
+/// Nothing unsaved or not, the run says what it lost.
+#[test]
+fn a_close_after_edits_went_leaves_as_a_failed_run() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.saving.start(Instant::now(), 0);
+    owner.end_save(Ok(lost_a_tile()));
+    see_the_bar(&mut owner);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+    let said = owner.close().expect_err("the run failed").to_string();
+    assert!(said.contains("in no file"), "{said}");
+}
+
+/// With nothing unsaved there is nothing for a close to guard, so it leaves on the failure, and
+/// says so, whatever has become of crash protection.
+#[test]
+fn a_close_with_nothing_left_to_lose_leaves_on_the_failure_all_the_same() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    drop(owner.project().save().expect("saved"));
+    hears(&mut owner, ProjectError::Unprotected(Vec::new())).expect("the run goes on");
+    owner.saving.start(Instant::now(), 0);
+    owner.end_save(Ok(lost_a_tile()));
+    see_the_bar(&mut owner);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Now);
+    let said = owner.close().expect_err("the run failed").to_string();
+    assert!(said.contains("in no file"), "{said}");
+}
+
+/// An old recovery file left undeleted costs the save nothing.
+#[test]
+fn a_save_that_only_kept_an_old_file_is_a_save() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 0);
+    owner.saving.start(Instant::now(), 0);
+    let kept = KeptRecovery {
+        path: "old.bcrf".into(),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    };
+    let outcome = SaveOutcome {
+        protection: Protection::Active,
+        unprotected: Vec::new(),
+        kept: vec![kept],
+    };
+    owner.end_save(Ok(outcome));
+    assert_eq!(owner.saving.last_succeeded(), Some(true));
+    assert!(owner.dialogs.says_saved());
+    assert!(!owner.dialogs.failing());
 }
 
 /// A note of work found on an earlier save.

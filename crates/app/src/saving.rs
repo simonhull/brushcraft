@@ -42,6 +42,16 @@
 //! The bar's second line says only what is true: not "safe" with crash protection paused, when
 //! the edits may be in memory alone, and "other work" with a stroke's dabs gone.
 //!
+//! **A save that went through without some tiles' latest edits** ([`SaveOutcome::unprotected`]) is
+//! a failed save too: it shows no "Saved", the window stays, and the bar says the edits are gone,
+//! as they are ([`TilesLost`]). It offers no Try again: nothing is left to save, and nothing brings
+//! them back. Old recovery files it couldn't delete fail nothing.
+//!
+//! **A recovery file that can't keep up** stops no one sculpting
+//! ([`crate::frame::Owner::upkeep`]): the log says why, and a bar tells the user once, offering a
+//! save. Word of a pause goes by itself if protection comes back; a flush that failed or left tiles
+//! out can't say when it is over, so that lasts until a save.
+//!
 //! # Closing meanwhile
 //!
 //! A close asked for during a save lets the save finish: the close lands everything held, a
@@ -150,6 +160,16 @@ enum Doing {
 #[error("{0}")]
 pub(crate) struct DabsDropped(pub(crate) String);
 
+/// A save went through without the latest edits of this many tiles
+/// ([`SaveOutcome::unprotected`]): for the user, a failed save.
+///
+/// Those edits are gone. A tile lands here because its slot held no valid tile, so the store drops
+/// the slot and reads the tile's last record from then on: memory no longer holds them, and with
+/// the rest saved there is nothing for another save to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("the latest edits of {0} tiles are in no file")]
+pub(crate) struct TilesLost(pub(crate) usize);
+
 /// Why a save failed, as the user can act on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SaveTrouble {
@@ -161,6 +181,8 @@ pub(crate) enum SaveTrouble {
     InUse,
     /// Dabs were dropped, so the stroke they belong to isn't whole.
     StrokeLost,
+    /// The save went through, but edits of some tiles are in no file, nor in memory.
+    EditsLost,
     /// Anything else: the log says what.
     Other,
 }
@@ -172,10 +194,26 @@ impl SaveTrouble {
         causes.next().unwrap_or(Self::Other)
     }
 
+    /// Reads the cause from `error` and what lies under it, as [`SaveTrouble::of`] does: for an
+    /// error no [`anyhow::Error`] holds, as a pause's cause.
+    pub(crate) fn of_source(error: &(dyn StdError + 'static)) -> Self {
+        let mut link = Some(error);
+        while let Some(cause) = link {
+            if let Some(trouble) = Self::of_cause(cause) {
+                return trouble;
+            }
+            link = cause.source();
+        }
+        Self::Other
+    }
+
     /// What `cause`, a link of an error's chain, says by itself.
     fn of_cause(cause: &(dyn StdError + 'static)) -> Option<Self> {
         if cause.is::<DabsDropped>() {
             return Some(Self::StrokeLost);
+        }
+        if cause.is::<TilesLost>() {
+            return Some(Self::EditsLost);
         }
         match cause.downcast_ref() {
             Some(FileError::Locked) => return Some(Self::InUse),
@@ -203,6 +241,7 @@ impl SaveTrouble {
             Self::NoPermission => "this file can't be written",
             Self::InUse => "another app has this file open",
             Self::StrokeLost => "a stroke didn't finish",
+            Self::EditsLost => "part of a stroke is gone",
             Self::Other => "something went wrong",
         }
     }
@@ -217,6 +256,8 @@ pub(crate) enum Work {
     LessAStroke,
     /// Found work a copy was to hold: it stays in its recovery file, and isn't what is open.
     Found,
+    /// All but edits that are gone, and that is saved: a save that went through without them.
+    SavedLessEdits,
 }
 
 /// Whether a crash would spare what a failed save left unsaved.
@@ -253,10 +294,13 @@ impl SaveFailure {
         let exposed = !protection.is_active() || error.chain().any(says_edits_arent_covered);
         Self {
             trouble,
-            work: if trouble == SaveTrouble::StrokeLost {
-                Work::LessAStroke
-            } else {
-                work
+            work: match trouble {
+                SaveTrouble::StrokeLost => Work::LessAStroke,
+                SaveTrouble::EditsLost => Work::SavedLessEdits,
+                SaveTrouble::DiskFull
+                | SaveTrouble::NoPermission
+                | SaveTrouble::InUse
+                | SaveTrouble::Other => work,
             },
             cover: if exposed {
                 Cover::Exposed
@@ -273,6 +317,21 @@ impl SaveFailure {
             work: Work::Found,
             cover: Cover::Protected,
         }
+    }
+
+    /// This failure, with the frame loop knowing the recovery file lacks edits, as a failure can't
+    /// say: the tiles a flush left out are told of once, and may be long past.
+    pub(crate) const fn exposed(self) -> Self {
+        Self {
+            cover: Cover::Exposed,
+            ..self
+        }
+    }
+
+    /// Whether another try can come to anything. With edits gone and the rest saved there is
+    /// nothing left for a save to do: it would find no edits, and say nothing.
+    pub(crate) const fn can_be_tried_again(self) -> bool {
+        !matches!(self.work, Work::SavedLessEdits)
     }
 
     /// Whether the recovery file holds what this left unsaved, as far as the failure says.
@@ -294,6 +353,7 @@ impl SaveFailure {
     pub(crate) const fn detail(self) -> &'static str {
         match (self.work, self.cover) {
             (Work::Found, _) => "Your unsaved work is safe where it was found.",
+            (Work::SavedLessEdits, _) => "The rest of your work was saved.",
             (Work::Whole, Cover::Protected) => "Your work is safe and still open.",
             (Work::LessAStroke, Cover::Protected) => "Your other work is safe and still open.",
             (Work::Whole, Cover::Exposed) => "Your work is still open, but a crash could lose it.",
@@ -744,6 +804,42 @@ mod tests {
         let full = ProjectError::Io(io::Error::from(io::ErrorKind::StorageFull));
         let full = ProjectError::ProtectionPaused(std::sync::Arc::new(full));
         assert_eq!(SaveTrouble::of(&Error::new(full)), SaveTrouble::DiskFull);
+    }
+
+    /// Edits gone are said plainly, and no try can bring them back.
+    #[test]
+    fn tiles_lost_by_a_save_say_so_and_offer_no_try() {
+        let lost = Error::new(TilesLost(3));
+        let failure = failure(&lost);
+        assert_eq!(failure.title(), "Couldn't save: part of a stroke is gone");
+        assert_eq!(failure.detail(), "The rest of your work was saved.");
+        assert!(!failure.can_be_tried_again());
+        let full = failed_write(io::ErrorKind::StorageFull);
+        assert!(self::failure(&full).can_be_tried_again());
+    }
+
+    /// A pause's cause reaches here with no [`Error`] round it.
+    #[test]
+    fn a_cause_with_no_context_says_why_too() {
+        let full = ProjectError::Io(io::Error::from(io::ErrorKind::StorageFull));
+        assert_eq!(SaveTrouble::of_source(&full), SaveTrouble::DiskFull);
+        let locked = ProjectError::Store(FileError::Locked);
+        assert_eq!(SaveTrouble::of_source(&locked), SaveTrouble::InUse);
+        assert_eq!(
+            SaveTrouble::of_source(&ProjectError::NoPath),
+            SaveTrouble::Other
+        );
+    }
+
+    #[test]
+    fn a_failure_the_frame_loop_knows_is_exposed_never_says_safe() {
+        let full = failed_write(io::ErrorKind::StorageFull);
+        let exposed = failure(&full).exposed();
+        assert_eq!(
+            exposed.detail(),
+            "Your work is still open, but a crash could lose it."
+        );
+        assert!(!exposed.covered());
     }
 
     /// Found work isn't open, whatever the open project's state: "still open" would be false.

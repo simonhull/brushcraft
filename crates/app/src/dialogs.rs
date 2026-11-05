@@ -19,7 +19,9 @@
 //!
 //! **The failure bar** says a save failed ([`Dialogs::failed`]) and answers to that rule too, but
 //! only once it can have been seen: one that arrived under a stroke waits for its `Up`, and that
-//! stroke isn't an answer to it. It takes a note's place, and the note asks again after it.
+//! stroke isn't an answer to it. It takes a note's place, and the note asks again after it. So
+//! does the bar saying crash protection has stopped ([`Dialogs::protection_stopped`]), which waits
+//! for a bar already asking something, and goes by itself if protection comes back.
 
 use std::time::{Instant, SystemTime};
 
@@ -31,7 +33,7 @@ use ui::{Bar, Blend, Chip, Control, Emphasis, Mark, Theme, Ui, UiFrame};
 use crate::OpenNote;
 use crate::camera::Pixel;
 use crate::navigate::Button;
-use crate::saving::SaveFailure;
+use crate::saving::{SaveFailure, SaveTrouble};
 
 /// What a control on a bar does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +48,8 @@ pub(crate) enum Action {
     Cancel,
     /// Try again what failed.
     TryAgain,
+    /// Save and stay, with nothing failed yet: crash protection has stopped.
+    SaveWork,
     /// Put the bar away.
     Dismiss,
     /// Open the project from its last save.
@@ -169,6 +173,9 @@ enum Prompt {
     /// "Couldn't save: …": what failed and what that leaves, until the user answers or goes back
     /// to work.
     Failed(SaveFailure),
+    /// "Crash protection has stopped: …": why, until the user answers, goes back to work, or
+    /// protection comes back.
+    Stopped(SaveTrouble),
 }
 
 impl Prompt {
@@ -229,8 +236,20 @@ impl Prompt {
                     action: Action::TryAgain,
                     emphasis: Emphasis::Filled,
                 };
-                let controls = vec![quiet("Dismiss", Action::Dismiss), again];
+                let mut controls = vec![quiet("Dismiss", Action::Dismiss)];
+                controls.extend(failure.can_be_tried_again().then_some(again));
                 let bar = Bar::new(failure.title(), controls).with_detail(failure.detail());
+                Some(bar.needing_you())
+            }
+            Self::Stopped(trouble) => {
+                let save = Control {
+                    label: "Save".to_owned(),
+                    action: Action::SaveWork,
+                    emphasis: Emphasis::Filled,
+                };
+                let controls = vec![quiet("Dismiss", Action::Dismiss), save];
+                let title = format!("Crash protection has stopped: {}", trouble.said());
+                let bar = Bar::new(title, controls).with_detail("Save your work when you can.");
                 Some(bar.needing_you())
             }
         }
@@ -495,7 +514,7 @@ impl Dialogs {
                 candidate: candidate.clone(),
             },
         };
-        if self.failing() {
+        if self.failing() || self.says_stopped() {
             self.behind = Some(prompt);
         } else {
             self.prompt = prompt;
@@ -512,7 +531,8 @@ impl Dialogs {
             | Prompt::Finishing { .. }
             | Prompt::EarlierVersion { .. }
             | Prompt::Copying
-            | Prompt::Failed(_) => None,
+            | Prompt::Failed(_)
+            | Prompt::Stopped(_) => None,
         }
     }
 
@@ -556,11 +576,48 @@ impl Dialogs {
     /// Says a save failed, in place of whatever the bar said; a note comes back once that is
     /// answered, as what it offers still stands.
     pub(crate) fn failed(&mut self, failure: SaveFailure, now: Instant) {
-        let was = std::mem::replace(&mut self.prompt, Prompt::Failed(failure));
+        self.say_over_a_note(Prompt::Failed(failure), now);
+    }
+
+    /// Puts `prompt` on the bar, a note it replaces coming back after it.
+    fn say_over_a_note(&mut self, prompt: Prompt, now: Instant) {
+        let was = std::mem::replace(&mut self.prompt, prompt);
         if matches!(was, Prompt::Restored { .. } | Prompt::EarlierVersion { .. }) {
             self.behind = Some(was);
         }
         self.show_prompt(now);
+    }
+
+    /// Says crash protection has stopped, for `trouble`. Only with
+    /// [`Dialogs::can_tell_of_stopping`].
+    pub(crate) fn protection_stopped(&mut self, trouble: SaveTrouble, now: Instant) {
+        self.say_over_a_note(Prompt::Stopped(trouble), now);
+    }
+
+    /// Whether the bar is free to say crash protection has stopped: a question or a failure comes
+    /// first, and this can wait for it.
+    pub(crate) const fn can_tell_of_stopping(&self) -> bool {
+        matches!(
+            self.prompt,
+            Prompt::None | Prompt::Restored { .. } | Prompt::EarlierVersion { .. }
+        )
+    }
+
+    /// Whether the bar says crash protection has stopped.
+    pub(crate) const fn says_stopped(&self) -> bool {
+        matches!(self.prompt, Prompt::Stopped(_))
+    }
+
+    /// Whether the bar says crash protection has stopped and the user has had the chance to see it.
+    pub(crate) const fn stopping_seen(&self) -> bool {
+        self.says_stopped() && !self.prompt_waiting
+    }
+
+    /// A save was asked for: a bar saying what one is the answer to is out of date.
+    pub(crate) fn save_asked(&mut self, now: Instant) {
+        if self.failing() || self.says_stopped() {
+            self.dismiss(now);
+        }
     }
 
     /// Whether the bar says a save failed.
@@ -799,6 +856,11 @@ impl Dialogs {
         self.prompt.bar()
     }
 
+    /// Whether a save's "Saved" is on its way or showing.
+    pub(crate) const fn says_saved(&self) -> bool {
+        self.saved_at.is_some()
+    }
+
     /// Whether the chip says there are unsaved edits.
     pub(crate) fn chip_says_unsaved(&self) -> bool {
         self.status == Status::Unsaved
@@ -850,7 +912,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::saving::{DabsDropped, Work};
+    use crate::saving::{DabsDropped, TilesLost, Work};
 
     /// No edits, no save.
     const CLEAN: Facts = Facts {
@@ -976,6 +1038,82 @@ mod tests {
             let letters = letters.filter(|letter| !letter.is_whitespace()).count();
             assert_eq!(frame.list.glyphs.len(), letters, "{}", failure.detail());
         }
+        assert_stopped_fits(SaveTrouble::DiskFull, (640, 400));
+        let longest = [SaveTrouble::NoPermission, SaveTrouble::InUse];
+        for trouble in longest {
+            assert_stopped_fits(trouble, (1280, 800));
+        }
+    }
+
+    /// Word of crash protection stopping for `trouble` loses no letter in a window of `size`.
+    fn assert_stopped_fits(trouble: SaveTrouble, (width, height): (u32, u32)) {
+        let now = Instant::now();
+        let mut dialogs = Dialogs::new(Size::new(width, height), 1.0, Blend::Display, now);
+        dialogs.protection_stopped(trouble, now);
+        let frame = dialogs.frame(now).expect("it draws");
+        let bar = dialogs.bar().expect("a bar");
+        let labels = bar.controls().iter().map(|c| c.label.as_str());
+        let said = [bar.title(), bar.detail().unwrap_or_default()];
+        let letters = said.into_iter().chain(labels).flat_map(str::chars);
+        let letters = letters.filter(|letter| !letter.is_whitespace()).count();
+        assert_eq!(frame.list.glyphs.len(), letters, "{}", bar.title());
+    }
+
+    #[test]
+    fn crash_protection_stopping_says_so_and_offers_save() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        assert!(dialogs.can_tell_of_stopping());
+        dialogs.protection_stopped(SaveTrouble::DiskFull, now);
+        let bar = dialogs.bar().expect("a bar");
+        let expected = Bar::new(
+            "Crash protection has stopped: the disk is full",
+            bar.controls().to_vec(),
+        )
+        .with_detail("Save your work when you can.")
+        .needing_you();
+        assert_eq!(bar, expected, "its words and coral hairline");
+        assert_eq!(actions(&dialogs), [Action::Dismiss, Action::SaveWork]);
+        let filled = bar.controls().iter().find(|c| c.action == Action::SaveWork);
+        assert_eq!(filled.map(|c| c.emphasis), Some(Emphasis::Filled));
+        assert!(!dialogs.can_tell_of_stopping(), "once is enough");
+        dialogs.save_asked(now);
+        assert!(!dialogs.says_stopped(), "a save is the answer");
+    }
+
+    /// A question stays: it is the user's, and this can wait for it.
+    #[test]
+    fn crash_protection_stopping_waits_for_a_question_or_a_failure() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.ask_close("first-sculpt", now);
+        assert!(!dialogs.can_tell_of_stopping());
+        dialogs.clear_prompt(now);
+        dialogs.failed(full_disk(), now);
+        assert!(!dialogs.can_tell_of_stopping());
+    }
+
+    #[test]
+    fn a_note_comes_back_after_crash_protection_stopping() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.note(&earlier(SystemTime::now()), now);
+        assert!(dialogs.can_tell_of_stopping(), "a note only tells");
+        dialogs.protection_stopped(SaveTrouble::Other, now);
+        assert!(dialogs.says_stopped());
+        dialogs.dismiss(now);
+        assert!(dialogs.noting());
+    }
+
+    /// With nothing to try, the bar offers nothing to try.
+    #[test]
+    fn edits_gone_are_only_dismissed() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        let lost = anyhow::Error::new(TilesLost(2));
+        let failure = SaveFailure::of(&lost, Work::Whole, &store::Protection::Active);
+        dialogs.failed(failure, now);
+        assert_eq!(actions(&dialogs), [Action::Dismiss]);
     }
 
     #[test]
