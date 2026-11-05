@@ -2906,8 +2906,9 @@ fn a_down_off_the_bar_dismisses_it_and_sculpts() {
     let dir = TestDir::new();
     let mut owner = asked_owner(&dir, 0);
     owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
-    assert!(!owner.dialogs.bar_showing(), "gone at the Down");
     assert!(owner.dialogs.pen_is_down(), "the stroke goes on");
+    run(&mut owner, 100);
+    assert!(!owner.dialogs.bar_showing(), "gone once it is the brush's");
     owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
     run(&mut owner, 100);
     assert_eq!(owner.brush.strokes, 1, "the brush had it");
@@ -2915,16 +2916,59 @@ fn a_down_off_the_bar_dismisses_it_and_sculpts() {
     assert_eq!(owner.take_request(), None, "the window stays");
 }
 
+/// Orbiting to look at the model before deciding keeps the question.
 #[test]
-fn a_mouse_press_off_the_bar_dismisses_it_too() {
+fn a_mouse_press_off_the_bar_navigates_and_leaves_it() {
     let dir = TestDir::new();
     let mut owner = asked_owner(&dir, 0);
     owner.input(Input::Press {
         button: LEFT,
         at: ON_THE_MODEL,
     });
-    assert!(!owner.dialogs.bar_showing(), "gone");
-    assert_eq!(owner.input.len(), 1, "and the press navigates");
+    assert_eq!(owner.input.len(), 1, "the press navigates");
+    run(&mut owner, 100);
+    assert!(owner.dialogs.asking_close(), "and the question stands");
+}
+
+/// A pen's navigation is no answer either: a barrel held, the stroke is the camera's.
+#[test]
+fn a_barrel_stroke_off_the_bar_navigates_and_leaves_it() {
+    use input::Phase;
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    let barrel = |phase| PenSample {
+        buttons: input::Buttons::PRIMARY,
+        ..pen_at(phase, ON_THE_MODEL)
+    };
+    owner.pen(barrel(Phase::Hover));
+    owner.pen(barrel(Phase::Down));
+    run(&mut owner, 100);
+    assert!(owner.dialogs.asking_close(), "still asking");
+    owner.pen(barrel(Phase::Up));
+    run(&mut owner, 100);
+    assert!(owner.dialogs.asking_close(), "and after the Up");
+    assert_eq!(owner.brush.strokes, 0, "the brush saw none of it");
+    let frame = ui_of(&mut owner).expect("the bar");
+    assert!((frame.fades[0].to - 1.0).abs() < 1e-6, "back on the Up");
+}
+
+#[test]
+fn navigating_while_finishing_keeps_the_exit() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 3);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    see_the_bar(&mut owner);
+    owner.input(Input::Press {
+        button: LEFT,
+        at: ON_THE_MODEL,
+    });
+    owner.input(Input::Release { button: LEFT });
+    finish_saving(&mut owner);
+    assert_eq!(
+        owner.take_request(),
+        Some(WindowRequest::Exit),
+        "not cancelled"
+    );
 }
 
 #[test]
@@ -2993,15 +3037,19 @@ fn a_down_while_finishing_is_a_cancel_and_the_stroke_waits_for_the_save() {
     tap(&mut owner, save);
     see_the_bar(&mut owner);
     owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
-    assert!(!owner.dialogs.bar_showing(), "cancelled");
-    assert!(
-        owner.brush.saving.is_some(),
-        "the save still holds strokes back"
-    );
     assert_eq!(
         owner.pen_queue.len(),
         1,
         "the stroke goes to the brush to wait"
+    );
+    run(&mut owner, 1);
+    assert!(
+        !owner.dialogs.bar_showing(),
+        "cancelled, once it is the brush's"
+    );
+    assert!(
+        owner.brush.saving.is_some(),
+        "the save still holds strokes back"
     );
     owner.pen(pen_at(input::Phase::Up, ON_THE_MODEL));
     finish_saving(&mut owner);
@@ -3343,4 +3391,46 @@ fn a_pen_hover_doesnt_spoil_a_mouse_click() {
     owner.pen(pen_at(input::Phase::Leave, ON_THE_MODEL));
     owner.input(Input::Release { button: LEFT });
     assert!(!owner.dialogs.bar_showing(), "the click stands");
+}
+
+/// `save_step` sets the Exit, then the same pass's `drive` hears a stroke, a Cancel: the window
+/// takes its request only after that.
+#[test]
+fn a_cancel_in_the_same_pass_as_the_exit_keeps_the_window() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 0);
+    assert!(owner.key(UiKey::Enter, Instant::now()), "Save");
+    see_the_bar(&mut owner);
+    let mut steps = 0;
+    while owner.request.is_none() {
+        if owner.save_step() == SaveStep::Waiting {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        owner.upkeep(Instant::now()).expect("upkeep");
+        steps += 1;
+        assert!(steps < 100_000, "the save ends");
+    }
+    assert_eq!(owner.request, Some(WindowRequest::Exit), "the save is over");
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 1);
+    assert!(!owner.dialogs.bar_showing(), "cancelled");
+    assert_eq!(owner.take_request(), None, "and that takes the exit back");
+}
+
+/// A stroke after Don't save, in one batch: the bar is answered twice, and the last answer stands.
+#[test]
+fn a_stroke_after_dont_save_in_one_batch_keeps_the_window() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    let dont = owner.dialogs.control(Action::DontSave);
+    tap(&mut owner, dont);
+    assert_eq!(owner.request, Some(WindowRequest::ExitDiscarding));
+    owner.pen(pen_at(input::Phase::Down, ON_THE_MODEL));
+    run(&mut owner, 1);
+    assert!(!owner.dialogs.bar_showing(), "dismissed");
+    assert_eq!(
+        owner.take_request(),
+        None,
+        "bar gone, and the discard with it"
+    );
 }

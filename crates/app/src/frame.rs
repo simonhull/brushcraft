@@ -1383,7 +1383,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         let took = match input {
             Input::Press { button, at } => {
                 let claim = self.dialogs.claim_mouse(button, at, now);
-                self.claim(claim, now)
+                claim == Claim::Ui
             }
             Input::Release { button } if self.dialogs.mouse_holds(button) => {
                 let action = self.dialogs.release_mouse(now);
@@ -1430,10 +1430,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             }
         }
         match sample.phase {
-            Phase::Down => {
-                let claim = self.dialogs.claim(sample.at, now);
-                self.claim(claim, now)
-            }
+            Phase::Down => self.dialogs.claim(sample.at, now) == Claim::Ui,
             Phase::Enter | Phase::Hover => {
                 self.ui_hover(Some(sample.at));
                 false
@@ -1446,18 +1443,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
     }
 
-    /// Whether `claim` leaves its stroke to the UI. Going back to work off the bar answers it: on
-    /// the close bar that's Keep sculpting, and while finishing, Cancel, the stroke waiting for the
-    /// save as any does.
-    fn claim(&mut self, claim: Claim, now: Instant) -> bool {
-        if claim == Claim::Elsewhere {
-            if self.dialogs.asking_close() {
-                self.act(Action::KeepSculpting, now);
-            } else if self.dialogs.finishing() {
-                self.act(Action::Cancel, now);
-            }
+    /// A stroke went to the brush: going back to work answers the bar. On the close bar that's
+    /// Keep sculpting, and while finishing, Cancel, the stroke waiting for the save as any does.
+    /// Navigating is no answer: the user may be looking at the model before deciding.
+    fn back_to_work(&mut self) {
+        let now = Instant::now();
+        if self.dialogs.asking_close() {
+            self.act(Action::KeepSculpting, now);
+        } else if self.dialogs.finishing() {
+            self.act(Action::Cancel, now);
         }
-        claim == Claim::Ui
     }
 
     /// The pointer is at `at` as far as the UI goes, and a frame is wanted if that changes what
@@ -1538,11 +1533,17 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             Action::DontSave if self.dialogs.asking_close() => {
                 self.request = Some(WindowRequest::ExitDiscarding);
             }
+            // Whatever an earlier answer in the same pass asked of the window, this one stands.
             Action::Cancel => {
                 self.after_save = AfterSave::Stay;
+                self.request = None;
                 self.dialogs.clear_prompt(now);
             }
-            Action::KeepSculpting | Action::Dismiss => self.dialogs.clear_prompt(now),
+            Action::KeepSculpting => {
+                self.request = None;
+                self.dialogs.clear_prompt(now);
+            }
+            Action::Dismiss => self.dialogs.clear_prompt(now),
             Action::DontSave
             | Action::TryAgain
             | Action::UseLastSave
@@ -2685,6 +2686,9 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
                 asked = true;
                 brush.route(context, down)
             });
+            if asked && route == Some(Route::Brush) && self.dialogs.routes() {
+                self.back_to_work();
+            }
             // A `Down` the brush raycast and found nothing under navigates: the surface isn't
             // under it, so its drag keeps the pivot without picking the same ray again.
             let missed = asked && route == Some(Route::Navigate) && self.brush.routed_off_surface();
