@@ -1344,8 +1344,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         }
         if sample.phase == input::Phase::Down {
             self.dialogs.pen_down(Instant::now());
-        } else if sample.phase == input::Phase::Up {
-            self.dialogs.pen_up(Instant::now());
+        } else if sample.phase != input::Phase::Drag && self.dialogs.pen_is_down() {
+            // As `PenRouter::route`: any sample out of a stroke ends it, an `Up` or not, and one
+            // out of a stroke wants no frame of its own.
+            let now = Instant::now();
+            self.dialogs.pen_up(now);
+            if want && self.dialogs.needs_frame(now) {
+                self.scheduler.want(Reason::Overlay);
+            }
         }
         self.point((sample.phase != input::Phase::Leave).then_some(sample.at));
         if sample.phase.in_stroke() {
@@ -2813,7 +2819,11 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     /// The save under way ended in `saved`: said, and strokes go on.
     fn end_save(&mut self, saved: Result<SaveOutcome>) {
         match saved {
-            Ok(outcome) => self.saving.saved(&outcome, Instant::now()),
+            Ok(outcome) => {
+                let now = Instant::now();
+                self.saving.saved(&outcome, now);
+                self.dialogs.saved(now);
+            }
             Err(error) => self.saving.failed(&error, self.closing()),
         }
         self.save_over();

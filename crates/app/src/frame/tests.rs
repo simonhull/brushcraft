@@ -18,7 +18,7 @@ use render::surface::{Offscreen, Target};
 use render::tree::Place;
 use render::{DroppedReadbacks, Outcome, Renderer};
 use store::{Epoch, ProjectConfig, StoreConfig};
-use ui::Theme;
+use ui::{Theme, UiFrame};
 
 use super::*;
 use crate::camera::Pixel;
@@ -2197,16 +2197,7 @@ fn a_saved_chip_wakes_the_idle_loop_to_leave() {
     let dir = TestDir::new();
     let mut owner = ui_owner(&dir, NoBrush);
     let now = Instant::now();
-    let saving = Facts {
-        unsaved: true,
-        saving: true,
-    };
-    let done = Facts {
-        unsaved: false,
-        saving: false,
-    };
-    owner.dialogs.update(saving, now);
-    owner.dialogs.update(done, now);
+    owner.dialogs.saved(now);
     let leaves = owner.dialogs.next_change().expect("\"Saved\" will go");
     let deadline = first_deadline(&mut owner);
     frame(&mut owner, deadline);
@@ -2240,4 +2231,117 @@ fn a_window_moved_to_a_fractional_scale_is_drawn_again() {
         matches!(next, Next::Frame { .. } | Next::Wait { .. }),
         "{next:?}"
     );
+}
+
+/// A frame of `owner`'s, wanted or not; what it hands over of the UI.
+fn ui_of<B: Brush, U: Uploads>(owner: &mut Owner<B, U>) -> Option<UiFrame> {
+    frame(owner, Instant::now() + INTERVAL).ui
+}
+
+/// Asserts `owner` wants a frame.
+fn wants_a_frame<B: Brush, U: Uploads>(owner: &mut Owner<B, U>, what: &str) {
+    let next = owner.next(Instant::now());
+    assert!(
+        matches!(next, Next::Frame { .. } | Next::Wait { .. }),
+        "{what}: {next:?}"
+    );
+}
+
+#[test]
+fn a_stroke_ended_by_a_leave_brings_the_chip_back() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, HoldsADab::default());
+    let deadline = first_deadline(&mut owner);
+    frame(&mut owner, deadline);
+    assert!(run(&mut owner, 200) < 200, "the chip settles");
+
+    owner.pen(pen_sample(input::Phase::Down, (10.0, 10.0)));
+    let down = ui_of(&mut owner).expect("the chip");
+    let dimmed = Theme::GLASS.chip_pen_down;
+    assert!((down.fades[1].to - dimmed).abs() < 1e-6, "dimmed");
+    assert!(run(&mut owner, 200) < 200, "dim, and settled");
+
+    owner.pen(pen_sample(input::Phase::Leave, (10.0, 10.0)));
+    wants_a_frame(&mut owner, "the fade back needs drawing");
+    let after = ui_of(&mut owner).expect("the chip");
+    assert!((after.fades[1].to - 1.0).abs() < 1e-6, "the pen is up");
+}
+
+#[test]
+fn a_leave_with_no_stroke_changes_nothing() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, HoldsADab::default());
+    let deadline = first_deadline(&mut owner);
+    frame(&mut owner, deadline);
+    assert!(run(&mut owner, 200) < 200, "the chip settles");
+    owner.pen(pen_sample(input::Phase::Leave, (10.0, 10.0)));
+    let next = owner.next(Instant::now());
+    assert!(matches!(next, Next::Idle { .. }), "{next:?}");
+}
+
+#[test]
+fn a_save_that_ends_between_frames_still_says_saved() {
+    let dir = TestDir::new();
+    let mut project = project(&dir);
+    let path = dir.path().join("saved.bcrf");
+    drop(project.save_as(&path).expect("saved"));
+    let mut owner = Owner::new(
+        project,
+        OneEdit::default(),
+        NoUploads,
+        setup(None),
+        Instant::now(),
+    );
+    let deadline = first_deadline(&mut owner);
+    frame(&mut owner, deadline);
+    assert!(owner.unsaved(), "the edit");
+
+    owner.request_save(Instant::now());
+    for _ in 0..100_000 {
+        if owner.save_stage().is_none() {
+            break;
+        }
+        owner.save_step();
+        owner.upkeep(Instant::now()).expect("upkeep");
+    }
+    assert_eq!(owner.save_stage(), None, "saved, and no frame saw it");
+    assert!(!owner.unsaved(), "nothing left");
+
+    wants_a_frame(&mut owner, "to say so");
+    assert!(ui_of(&mut owner).is_some(), "a chip");
+    assert!(owner.dialogs.next_change().is_some(), "that will leave");
+}
+
+#[test]
+fn the_first_chip_waits_for_the_up() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, HoldsADab::default());
+    owner.pen(pen_sample(input::Phase::Down, (10.0, 10.0)));
+    let deadline = first_deadline(&mut owner);
+    let first = frame(&mut owner, deadline);
+    assert!(owner.unsaved(), "the first dab");
+    assert!(first.ui.is_none(), "no chip, and no atlas, under the pen");
+    owner.pen(pen_sample(input::Phase::Drag, (11.0, 10.0)));
+    assert!(ui_of(&mut owner).is_none(), "nor on the next frame");
+
+    owner.pen(pen_sample(input::Phase::Up, (11.0, 10.0)));
+    let up = ui_of(&mut owner).expect("the chip, on the up");
+    let now = Instant::now();
+    assert!((up.fades[1].from).abs() < 1e-6, "it fades in");
+    assert!((up.fades[1].to - 1.0).abs() < 1e-6, "to full");
+    assert!(owner.dialogs.needs_frame(now), "over frames");
+}
+
+#[test]
+fn a_first_chip_waiting_comes_on_a_leave_too() {
+    let dir = TestDir::new();
+    let mut owner = ui_owner(&dir, HoldsADab::default());
+    owner.pen(pen_sample(input::Phase::Down, (10.0, 10.0)));
+    let deadline = first_deadline(&mut owner);
+    assert!(frame(&mut owner, deadline).ui.is_none(), "held back");
+    assert!(run(&mut owner, 200) < 200, "nothing wants a frame for it");
+
+    owner.pen(pen_sample(input::Phase::Leave, (11.0, 10.0)));
+    wants_a_frame(&mut owner, "the chip that waited");
+    assert!(ui_of(&mut owner).is_some(), "the chip");
 }

@@ -3,7 +3,9 @@
 //! `ui` knows widgets and nothing of projects; this says which ones the project's state calls for,
 //! in the user's words. For now that is the save chip. The owner thread brings it up to date once
 //! a frame, after the pen's work ([`Dialogs::update`]), and what it shows goes to the render thread
-//! with the frame. The pen touches only the fades ([`Dialogs::pen_down`], [`Dialogs::pen_up`]).
+//! with the frame. The pen touches only the fades ([`Dialogs::pen_down`], [`Dialogs::pen_up`]), and
+//! a chip where there was none waits for it to lift, so nothing appears, and no atlas uploads,
+//! during a stroke.
 
 use std::time::Instant;
 
@@ -91,6 +93,10 @@ pub(crate) struct Dialogs {
     status: Status,
     /// When the last save finished, while "Saved" still shows.
     saved_at: Option<Instant>,
+    /// Whether the pen is down.
+    pen_is_down: bool,
+    /// Whether a chip is waiting for the pen to lift.
+    waiting: bool,
 }
 
 /// `size` as the UI takes it; a window with none draws nothing, so any will do.
@@ -118,6 +124,8 @@ impl Dialogs {
             scale,
             status: Status::Quiet,
             saved_at: None,
+            pen_is_down: false,
+            waiting: false,
         }
     }
 
@@ -138,16 +146,24 @@ impl Dialogs {
         changed
     }
 
-    /// Brings the chip up to date; cheap when nothing changed, as nearly always.
+    /// Brings the chip up to date; cheap when nothing changed, as nearly always. A chip where there
+    /// was none waits for the pen to lift; one already showing changes at once.
     pub(crate) fn update(&mut self, facts: Facts, now: Instant) {
         let status = self.next_status(facts, now);
-        if status != self.status {
+        let arriving = self.status == Status::Quiet && status != Status::Quiet;
+        self.waiting = arriving && self.pen_is_down;
+        if status != self.status && !self.waiting {
             self.status = status;
             self.ui.set_chip(status.chip(), now);
         }
     }
 
-    /// What the chip should say now, keeping when "Saved" began.
+    /// A save finished at `now`: "Saved" shows for its while, whether or not a frame saw the save.
+    pub(crate) fn saved(&mut self, now: Instant) {
+        self.saved_at = Some(now);
+    }
+
+    /// What the chip should say now, forgetting a "Saved" that is over.
     fn next_status(&mut self, facts: Facts, now: Instant) -> Status {
         if facts.saving {
             self.saved_at = None;
@@ -156,9 +172,6 @@ impl Dialogs {
         if facts.unsaved {
             self.saved_at = None;
             return Status::Unsaved;
-        }
-        if self.status == Status::Saving {
-            self.saved_at = Some(now);
         }
         let over = |at: Instant| now.saturating_duration_since(at) >= Theme::GLASS.saved_hold;
         self.saved_at = self.saved_at.filter(|&at| !over(at));
@@ -170,9 +183,10 @@ impl Dialogs {
         self.ui.frame(now)
     }
 
-    /// Whether a frame is wanted at `now`: something is fading, or changed.
+    /// Whether a frame is wanted at `now`: something is fading, or changed, or a chip that waited
+    /// for the pen can come.
     pub(crate) fn needs_frame(&self, now: Instant) -> bool {
-        self.ui.needs_frame(now)
+        self.ui.needs_frame(now) || (self.waiting && !self.pen_is_down)
     }
 
     /// When something next changes by itself: the chip's "Saved" leaving.
@@ -182,12 +196,19 @@ impl Dialogs {
 
     /// The pen touched down: bars fade out and the chip dims. Touches the fades only.
     pub(crate) fn pen_down(&mut self, now: Instant) {
+        self.pen_is_down = true;
         self.ui.pen_down(now);
     }
 
     /// The pen lifted: everything comes back.
     pub(crate) fn pen_up(&mut self, now: Instant) {
+        self.pen_is_down = false;
         self.ui.pen_up(now);
+    }
+
+    /// Whether the pen is down.
+    pub(crate) const fn pen_is_down(&self) -> bool {
+        self.pen_is_down
     }
 }
 
@@ -261,6 +282,7 @@ mod tests {
         assert_eq!(dialogs.next_change(), None, "it stays until the save ends");
 
         let saved_at = now + Duration::from_secs(1);
+        dialogs.saved(saved_at);
         dialogs.update(CLEAN, saved_at);
         let saved = dialogs.status.chip().expect("a chip");
         assert_eq!((saved.text.as_str(), saved.mark), ("Saved", Mark::None));
@@ -294,10 +316,67 @@ mod tests {
         let now = Instant::now();
         let mut dialogs = dialogs(now);
         dialogs.update(SAVING, now);
+        dialogs.saved(now);
         dialogs.update(CLEAN, now);
         dialogs.update(EDITED, now);
         assert_eq!(dialogs.status, Status::Unsaved, "new edits");
         assert_eq!(dialogs.next_change(), None, "\"Saved\" won't come back");
+    }
+
+    #[test]
+    fn a_save_no_frame_saw_still_says_saved() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.update(EDITED, now);
+        dialogs.saved(now);
+        dialogs.update(CLEAN, now);
+        assert_eq!(dialogs.status, Status::Saved, "straight from unsaved");
+    }
+
+    #[test]
+    fn a_save_with_nothing_to_save_says_nothing() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.update(SAVING, now);
+        dialogs.update(CLEAN, now);
+        assert_eq!(dialogs.status, Status::Quiet, "no save was made");
+    }
+
+    #[test]
+    fn a_first_chip_waits_for_the_pen_and_wants_a_frame_when_it_lifts() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.pen_down(now);
+        dialogs.update(EDITED, now);
+        assert_eq!(dialogs.status, Status::Quiet, "held back");
+        assert!(dialogs.frame(now).is_none(), "nothing to draw");
+        assert!(!dialogs.needs_frame(now), "and no frame for it");
+
+        dialogs.pen_up(now);
+        assert!(dialogs.needs_frame(now), "its frame");
+        dialogs.update(EDITED, now);
+        assert_eq!(dialogs.status, Status::Unsaved, "here it comes");
+        assert!(dialogs.frame(now).is_some(), "it draws");
+    }
+
+    #[test]
+    fn a_chip_already_showing_changes_under_the_pen() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.update(EDITED, now);
+        dialogs.pen_down(now);
+        dialogs.update(SAVING, now);
+        assert_eq!(dialogs.status, Status::Saving, "at once");
+    }
+
+    #[test]
+    fn a_chip_can_go_under_the_pen() {
+        let now = Instant::now();
+        let mut dialogs = dialogs(now);
+        dialogs.update(EDITED, now);
+        dialogs.pen_down(now);
+        dialogs.update(CLEAN, now);
+        assert_eq!(dialogs.status, Status::Quiet, "gone");
     }
 
     #[test]
