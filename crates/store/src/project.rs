@@ -925,6 +925,37 @@ impl Project {
         self.report()
     }
 
+    /// Closes the project, dropping what no save holds: the user's choice, which a full disk
+    /// mustn't overrule. So unlike [`Project::close`], which finishes the recovery writer's flushes
+    /// first and keeps the recovery file if it can't, this stops the writer where it is, with no
+    /// flush or roll-over, and removes the recovery file and any old one still held whatever state
+    /// they are in. A file already gone is what was wanted.
+    ///
+    /// Otherwise the file would be found at the next open, and bring back work the user dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectError::OldRecoveryKept`] if a recovery file can't be removed, or its removal made
+    /// durable: the first that couldn't, the others tried all the same.
+    pub fn discard(mut self) -> Result<(), ProjectError> {
+        if let Some(writer) = self.writer.take() {
+            writer.abandon(&mut self.store);
+        }
+        // Nothing is kept to lack them.
+        self.unreported.clear();
+        let held = std::mem::take(&mut self.held);
+        let held = held.into_iter().map(|(path, _file)| path);
+        let files = self.recovery_path.take().into_iter().chain(held);
+        let mut first_failure = Ok(());
+        for path in files {
+            let removed = retire(&path);
+            if first_failure.is_ok() {
+                first_failure = removed;
+            }
+        }
+        first_failure.map_err(ProjectError::from)
+    }
+
     /// Whether the project has edits no save holds: any edit since the last save, or, for a
     /// project never saved, any edit at all.
     #[must_use]

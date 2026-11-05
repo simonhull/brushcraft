@@ -592,6 +592,99 @@ fn close_keeps_the_recovery_file_only_when_asked() {
     assert!(kept.exists(), "another project's file is left alone");
 }
 
+/// Discarding keeps nothing: the recovery file goes, the project file stays as it was saved.
+#[test]
+fn discard_removes_the_recovery_file_and_leaves_the_project_file() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let path = dir.path("p.bcrf");
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 80, 171);
+    assert_saved(project.save_as(&path));
+    let saved = map.clone();
+    let bytes = fs::read(&path).unwrap();
+    stroke(&mut project, &mut map, 80, 172);
+    project.discard().unwrap();
+    assert_eq!(recovery_files(&dir), Vec::<String>::new(), "gone");
+    assert!(fs::read(&path).unwrap() == bytes, "byte for byte");
+    assert_project_file(&path, &saved, "the save, and not the stroke after it");
+}
+
+/// The file `close` keeps when it can't finish its flushes, on a full disk say, must go all the
+/// same: discarding it is what the user asked, and restoring it would bring back work they dropped.
+#[test]
+fn discard_removes_the_recovery_file_a_close_would_keep() {
+    let out_of_space = |dir: &TestDir, map: &mut CorrectionMap, seed| {
+        let mesh = mesh();
+        let mut project = Project::new((*mesh).clone(), config(dir)).unwrap();
+        stroke(&mut project, map, 80, seed);
+        assert_saved(project.save_as(&dir.path("p.bcrf")));
+        let kind = io::ErrorKind::StorageFull;
+        let paused = fail_and_pause(&mut project, map, seed + 1, kind);
+        assert!(paused_by_io(&paused), "{paused:?}");
+        project.fail_next_recovery_with(kind);
+        project
+    };
+
+    let closing = TestDir::new();
+    let closed = out_of_space(&closing, &mut CorrectionMap::new(), 173);
+    assert!(closed.close(false).is_err(), "it can't finish");
+    let kept = find_recoveries(&closing.path("recovery")).unwrap();
+    assert!(
+        !kept.is_empty(),
+        "and keeps the file, for the next open to find"
+    );
+
+    let discarding = TestDir::new();
+    let discarded = out_of_space(&discarding, &mut CorrectionMap::new(), 175);
+    discarded.discard().expect("it doesn't try to");
+    let left = find_recoveries(&discarding.path("recovery")).unwrap();
+    assert!(left.is_empty(), "nothing to bring back: {left:?}");
+}
+
+/// A flush in flight is abandoned, not waited for, and a sync that would fail fails nobody.
+#[test]
+fn discard_doesnt_wait_for_or_mind_the_last_flush() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let mut map = CorrectionMap::new();
+    let mut project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    stroke(&mut project, &mut map, 80, 177);
+    project.finish_flushes().unwrap();
+    project.writer.as_ref().unwrap().fail_syncs(0, 1);
+    stroke(&mut project, &mut map, 80, 178);
+    project.discard().unwrap();
+    assert_eq!(recovery_files(&dir), Vec::<String>::new(), "gone");
+}
+
+/// Someone else removing the file is no failure: it is what was wanted.
+#[test]
+fn discard_is_content_with_a_recovery_file_already_gone() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    fs::remove_file(project.recovery_path().unwrap()).unwrap();
+    project.discard().unwrap();
+}
+
+/// What can't be removed is said, for the run to fail with: the user's choice didn't happen.
+#[test]
+fn discard_says_when_the_recovery_file_cant_be_removed() {
+    let dir = TestDir::new();
+    let mesh = mesh();
+    let project = Project::new((*mesh).clone(), config(&dir)).unwrap();
+    let path = project.recovery_path().unwrap().to_path_buf();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("in the way"), b"").unwrap();
+    let error = project.discard().expect_err("a directory isn't a file");
+    assert!(
+        matches!(error, ProjectError::OldRecoveryKept { .. }),
+        "{error:?}"
+    );
+}
+
 /// Recovery files and their directory are the user's alone, whatever the umask.
 ///
 /// They hold the user's unsaved work: the recovery file a new project starts, the one a save

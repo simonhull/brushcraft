@@ -944,18 +944,35 @@ fn discard_during_a_save_leaves_the_project_file_as_it_was() {
     assert_eq!(recovery_files(&dir), 0, "the work is gone, as asked");
 }
 
+/// The recovery files in `dir`.
+fn recovery_paths(dir: &TestDir) -> Vec<PathBuf> {
+    let found = std::fs::read_dir(dir.path().join("recovery")).expect("the directory");
+    found.map(|entry| entry.expect("an entry").path()).collect()
+}
+
 #[test]
-fn discard_says_what_a_failed_close_said() {
+fn discard_says_when_it_cant_remove_the_recovery_file() {
     let dir = TestDir::new();
     let owner = holding_everything(&dir);
-    let found = std::fs::read_dir(dir.path().join("recovery")).expect("the directory");
-    let files = found.map(|entry| entry.expect("an entry").path());
-    files.for_each(|file| std::fs::remove_file(file).expect("removed"));
-    let error = owner
-        .discard()
-        .expect_err("the file it should remove is gone");
+    for file in recovery_paths(&dir) {
+        std::fs::remove_file(&file).expect("removed");
+        std::fs::create_dir_all(&file).expect("a directory in its place");
+        std::fs::write(file.join("in the way"), b"").expect("written");
+    }
+    let error = owner.discard().expect_err("it can't be removed");
     let said = format!("{error:#}");
-    assert!(said.contains("closing the project"), "{said}");
+    assert!(said.contains("discarding the project"), "{said}");
+}
+
+/// A close would fail on this, and a close's failure is no reason to fail what the user asked.
+#[test]
+fn discard_is_content_with_a_recovery_file_already_gone() {
+    let dir = TestDir::new();
+    let owner = holding_everything(&dir);
+    for file in recovery_paths(&dir) {
+        std::fs::remove_file(&file).expect("removed");
+    }
+    owner.discard().expect("what was wanted");
 }
 
 /// A live run's record is on its way to its file as the run goes: Don't save stops the stream as

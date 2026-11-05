@@ -3184,13 +3184,14 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
     }
 
     /// Closes the project without saving: Don't save. What the brush holds is dropped, not landed,
-    /// a save under way goes with it, the project file stays as it was, and the recovery file is
-    /// removed. Nothing to wait for. A recorded run's stream ends as the owner goes, as in
-    /// [`Owner::close`], and the run's end writes the record over it as ever.
+    /// a save under way goes with it, what the project file's readers see stays as it was, and
+    /// the recovery file is removed, even on a disk too full to finish a flush. Nothing to wait
+    /// for. A recorded run's stream ends as the owner goes, as in [`Owner::close`], and the run's
+    /// end writes the record over it as ever.
     ///
     /// # Errors
     ///
-    /// As [`Project::close`].
+    /// As [`Project::discard`].
     pub(crate) fn discard(mut self) -> Result<()> {
         self.brush.abandon();
         let Self {
@@ -3199,7 +3200,7 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
             ..
         } = self;
         project.store().unsubscribe_stale(cursor);
-        project.close(false).context("closing the project")
+        project.discard().context("discarding the project")
     }
 
     /// What a closing project does about its save: says that one failed, finishes one under way

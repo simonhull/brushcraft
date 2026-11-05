@@ -448,6 +448,12 @@ impl RecoveryWriter {
         finished
     }
 
+    /// Unsubscribes from the store's change feed and stops the writer thread at once, leaving
+    /// whatever isn't flushed: for a recovery file about to be removed, which nothing need reach.
+    pub(crate) fn abandon(self, store: &mut TileStore) {
+        store.unsubscribe_stream(self.consumer);
+    }
+
     /// Whether no flush is in flight or queued: true once failed, too, as no flush will be.
     #[must_use]
     pub const fn is_idle(&self) -> bool {
