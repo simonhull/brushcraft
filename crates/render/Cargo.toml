@@ -21,6 +21,7 @@ geom.workspace = true
 pollster.workspace = true
 store.workspace = true
 thiserror.workspace = true
+ui.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]

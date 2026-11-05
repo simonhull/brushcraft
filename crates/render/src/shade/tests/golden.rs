@@ -26,7 +26,7 @@ use crate::residency::REQUEST_HEADER;
 use crate::surface::{Offscreen, Size, Target};
 
 /// The environment variable that writes the golden files instead of checking them.
-const WRITE: &str = "BRUSHCRAFT_WRITE_GOLDEN";
+pub(crate) const WRITE: &str = "BRUSHCRAFT_WRITE_GOLDEN";
 
 /// The golden images' side, pixels: small files (a PNG of stored blocks, ~28 KB).
 const GOLDEN_SIDE: u32 = 96;
@@ -40,7 +40,7 @@ const CLEAR: Color = Color {
 };
 
 /// Where the golden files live.
-fn golden_dir() -> PathBuf {
+pub(crate) fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/golden")
 }
 
@@ -72,7 +72,7 @@ fn decode_srgb(b: u8) -> f32 {
 }
 
 /// `image` (sRGB bytes) as linear RGB.
-fn linear_of(image: &Rgb) -> Linear {
+pub(crate) fn linear_of(image: &Rgb) -> Linear {
     Linear {
         width: usize::try_from(image.width).expect("small"),
         height: usize::try_from(image.height).expect("small"),
@@ -127,6 +127,7 @@ fn render(gpu: &Gpu, world: &World, size: Size, eye: Vec3, look: Look) -> Rgb {
         clear: CLEAR,
         overlay: None,
         overlay_scale: 1,
+        ui: None,
         scene: Scene::Draw(&scene),
         look,
         frame: 1,
@@ -166,10 +167,10 @@ fn goldens() -> [(&'static str, Look); 3] {
 }
 
 /// A golden frame matches its file if its FLIP-style error is at most this on average...
-const GOLDEN_MEAN: f32 = 0.005;
+pub(crate) const GOLDEN_MEAN: f32 = 0.005;
 
 /// ... and at most this at the 99th percentile.
-const GOLDEN_P99: f32 = 0.05;
+pub(crate) const GOLDEN_P99: f32 = 0.05;
 
 /// Where the goldens' camera is: in front, a little above and to the right, the whole sphere in
 /// view.

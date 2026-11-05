@@ -570,6 +570,7 @@ pub(crate) fn draw_frame(
         clear: CLEAR,
         overlay: image.as_ref(),
         overlay_scale: frame.overlay_scale,
+        ui: None,
         scene,
         look: frame.look,
         frame: frame.number,

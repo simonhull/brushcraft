@@ -19,10 +19,10 @@ use wgpu::rwh::HasDisplayHandle;
 use wgpu::{
     Adapter, BufferDescriptor, BufferUsages, COPY_BYTES_PER_ROW_ALIGNMENT,
     CommandEncoderDescriptor, CompositeAlphaMode, CreateSurfaceError, CurrentSurfaceTexture,
-    Extent3d, Instance, PresentMode, SurfaceColorSpace, SurfaceConfiguration, SurfaceTarget,
-    SurfaceTexture, TexelCopyBufferInfo, TexelCopyBufferLayout, Texture, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
-    WindowHandle,
+    DownlevelFlags, Extent3d, Instance, PresentMode, SurfaceColorSpace, SurfaceConfiguration,
+    SurfaceTarget, SurfaceTexture, TexelCopyBufferInfo, TexelCopyBufferLayout, Texture,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, WindowHandle,
 };
 
 use crate::gpu::{self, AdapterRequest, Gpu, GpuError};
@@ -166,6 +166,8 @@ pub struct WindowSurface {
     size: Size,
     /// The present mode chosen, as reported.
     presentation: Presentation,
+    /// The format of a view of its images that isn't sRGB, if it has one.
+    display_format: Option<TextureFormat>,
     /// Whether the last image acquired was suboptimal: drawn and presented as it was, the
     /// surface is configured again before the next is acquired.
     suboptimal: bool,
@@ -228,6 +230,12 @@ impl WindowSurface {
         } else {
             CompositeAlphaMode::Auto
         };
+        let reinterprets = adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(DownlevelFlags::SURFACE_VIEW_FORMATS);
+        let display_format = display_format(format, reinterprets);
+        let view_formats = display_format.filter(|&display| display != format);
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -237,7 +245,7 @@ impl WindowSurface {
             present_mode: presentation.present_mode().unwrap_or(PresentMode::Fifo),
             desired_maximum_frame_latency: 2,
             alpha_mode,
-            view_formats: Vec::new(),
+            view_formats: view_formats.into_iter().collect(),
         };
         let this = Self {
             instance,
@@ -247,6 +255,7 @@ impl WindowSurface {
             config,
             size,
             presentation,
+            display_format,
             suboptimal: false,
         };
         this.configure(&gpu)?;
@@ -303,13 +312,17 @@ impl WindowSurface {
             self.configure(gpu)?;
         }
         match self.surface.get_current_texture() {
-            CurrentSurfaceTexture::Success(texture) => {
-                Ok(Acquired::Frame(Frame::swapchain(texture)))
-            }
+            CurrentSurfaceTexture::Success(texture) => Ok(Acquired::Frame(Frame::swapchain(
+                texture,
+                self.display_format.is_some(),
+            ))),
             CurrentSurfaceTexture::Suboptimal(texture) => {
                 // Configuring while the image is held is refused: it is done before the next.
                 self.suboptimal = true;
-                Ok(Acquired::Frame(Frame::swapchain(texture)))
+                Ok(Acquired::Frame(Frame::swapchain(
+                    texture,
+                    self.display_format.is_some(),
+                )))
             }
             CurrentSurfaceTexture::Outdated => {
                 self.configure(gpu)?;
@@ -349,35 +362,49 @@ fn preferred_format(offered: &[TextureFormat]) -> Option<TextureFormat> {
         .copied()
 }
 
+/// The format of a view that blends in display values, of a target of `format`: the target's own if
+/// it isn't sRGB, otherwise the same without the encoding if the target can be `reinterpreted` so.
+fn display_format(format: TextureFormat, reinterpreted: bool) -> Option<TextureFormat> {
+    (!format.is_srgb() || reinterpreted).then(|| format.remove_srgb_suffix())
+}
+
 /// One frame of a [`Target`], acquired: draw into [`Frame::view`], then [`Frame::present`] it.
 /// A window's frame dropped unpresented is discarded.
 #[derive(Debug)]
 pub struct Frame<'target> {
     /// A window's swapchain image; `None` offscreen.
     image: Option<SurfaceTexture>,
+    /// The offscreen texture drawn into; `None` for a window's.
+    offscreen: Option<&'target Offscreen>,
     /// A view of the whole image, to draw into.
     view: TextureView,
+    /// Whether it can be viewed without sRGB encoding.
+    has_display_view: bool,
     /// Ties the frame to the target it came from, which must not be configured or resized
     /// while the frame is held.
     target: std::marker::PhantomData<&'target mut Target>,
 }
 
-impl Frame<'_> {
+impl<'target> Frame<'target> {
     /// A frame of an acquired swapchain image, with a view of it.
-    fn swapchain(image: SurfaceTexture) -> Self {
+    fn swapchain(image: SurfaceTexture, has_display_view: bool) -> Self {
         let view = image.texture.create_view(&TextureViewDescriptor::default());
         Self {
             image: Some(image),
+            offscreen: None,
             view,
+            has_display_view,
             target: std::marker::PhantomData,
         }
     }
 
-    /// A frame of an offscreen texture, through `view`.
-    fn offscreen(view: &TextureView) -> Self {
+    /// A frame of an offscreen texture.
+    fn offscreen(offscreen: &'target Offscreen) -> Self {
         Self {
             image: None,
-            view: view.clone(),
+            offscreen: Some(offscreen),
+            view: offscreen.view.clone(),
+            has_display_view: offscreen.display_format.is_some(),
             target: std::marker::PhantomData,
         }
     }
@@ -386,6 +413,21 @@ impl Frame<'_> {
     #[must_use]
     pub const fn view(&self) -> &TextureView {
         &self.view
+    }
+
+    /// A view of the image that blends in display values rather than in linear light; `None` if
+    /// the target can't offer one. Made on asking, so a frame with no UI makes none.
+    #[must_use]
+    pub fn display_view(&self) -> Option<TextureView> {
+        if !self.has_display_view {
+            return None;
+        }
+        let window = self.image.as_ref().map(|image| &image.texture);
+        let texture = window.or_else(|| self.offscreen.map(|offscreen| &offscreen.texture))?;
+        Some(texture.create_view(&TextureViewDescriptor {
+            format: Some(texture.format().remove_srgb_suffix()),
+            ..TextureViewDescriptor::default()
+        }))
     }
 
     /// Shows the frame: queues a window's image for the display on `gpu`'s queue, once the
@@ -405,6 +447,8 @@ pub struct Offscreen {
     texture: Texture,
     /// A view of the whole texture.
     view: TextureView,
+    /// The format of a view of it that isn't sRGB, if it can have one.
+    display_format: Option<TextureFormat>,
     /// Its size.
     size: Size,
 }
@@ -419,6 +463,30 @@ impl Offscreen {
     ///
     /// As [`Gpu::scoped`], if the texture can't be created (larger than the device allows).
     pub fn new(gpu: &Gpu, size: Size) -> Result<Self, GpuError> {
+        Self::with_display_format(gpu, size, display_format(Self::FORMAT, true))
+    }
+
+    /// As [`Offscreen::new`], with no view that isn't sRGB, as some surfaces have none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::scoped`], if the texture can't be created.
+    #[cfg(test)]
+    pub(crate) fn without_display_view(gpu: &Gpu, size: Size) -> Result<Self, GpuError> {
+        Self::with_display_format(gpu, size, None)
+    }
+
+    /// A texture of `size` that can be viewed as `display_format`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Gpu::scoped`], if the texture can't be created.
+    fn with_display_format(
+        gpu: &Gpu,
+        size: Size,
+        display_format: Option<TextureFormat>,
+    ) -> Result<Self, GpuError> {
+        let view_formats: Vec<TextureFormat> = display_format.into_iter().collect();
         let texture = gpu.scoped("offscreen target", || {
             gpu.device().create_texture(&TextureDescriptor {
                 label: Some("offscreen target"),
@@ -428,13 +496,14 @@ impl Offscreen {
                 dimension: TextureDimension::D2,
                 format: Self::FORMAT,
                 usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-                view_formats: &[],
+                view_formats: &view_formats,
             })
         })?;
         let view = texture.create_view(&TextureViewDescriptor::default());
         Ok(Self {
             texture,
             view,
+            display_format,
             size,
         })
     }
@@ -554,6 +623,15 @@ impl Target {
         }
     }
 
+    /// Whether its frames have a view that blends in display values ([`Frame::display_view`]).
+    #[must_use]
+    pub const fn has_display_view(&self) -> bool {
+        match self {
+            Self::Window(surface) => surface.display_format.is_some(),
+            Self::Offscreen(offscreen) => offscreen.display_format.is_some(),
+        }
+    }
+
     /// The next frame to draw into: a window's as [`WindowSurface::acquire`] gives it, the
     /// offscreen texture every time.
     ///
@@ -563,7 +641,7 @@ impl Target {
     pub fn acquire(&mut self, gpu: &Gpu) -> Result<Acquired<'_>, SurfaceError> {
         match self {
             Self::Window(surface) => surface.acquire(gpu),
-            Self::Offscreen(offscreen) => Ok(Acquired::Frame(Frame::offscreen(offscreen.view()))),
+            Self::Offscreen(offscreen) => Ok(Acquired::Frame(Frame::offscreen(offscreen))),
         }
     }
 }

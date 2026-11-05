@@ -4,7 +4,8 @@
 //! adapter, creates its device, and gives tests a harness ([`gpu::Gpu`] on a software adapter)
 //! so every GPU test runs on lavapipe in the gate. [`surface`] is where frames go: a window's
 //! swapchain, opened with an adapter that can present to it, or an offscreen texture.
-//! [`Renderer::draw`] draws a frame there: its passes in order, the [`overlay`] last.
+//! [`Renderer::draw`] draws a frame there: its passes in order, then the [`overlay`], and last
+//! the `ui` module's pass, which draws the `ui` crate's shapes in display colour.
 //! [`residency`] keeps tiles on the GPU within a budget, uploaded through [`upload`]'s staging
 //! ring an epoch at a time (a finest tile as its positions with the one-vertex ring, whose
 //! normals the `normals` module computes on the GPU), and [`tree`] is the tree of resident tiles
@@ -59,6 +60,7 @@ pub mod surface;
 pub mod timing;
 pub(crate) mod tone;
 pub mod tree;
+mod ui;
 pub mod upload;
 mod visibility_view;
 

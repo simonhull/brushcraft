@@ -25,8 +25,8 @@ use crate::raster::tests::{
 };
 use crate::raster::{RasterConfig, RasterFrame};
 
-mod flip;
-mod golden;
+pub(crate) mod flip;
+pub(crate) mod golden;
 pub(crate) mod png;
 
 /// The probe, appended to the pass's shader in tests only: for each pixel, the rebuilt point

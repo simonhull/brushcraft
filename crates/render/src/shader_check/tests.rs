@@ -65,6 +65,7 @@ fn the_standalone_per_pixel_shaders_index_no_local_array_at_run_time() {
     let shaders = [
         ("tone", include_str!("../tone.wgsl")),
         ("overlay", include_str!("../overlay.wgsl")),
+        ("ui", include_str!("../ui.wgsl")),
         ("visibility_view", include_str!("../visibility_view.wgsl")),
     ];
     for (name, source) in shaders {

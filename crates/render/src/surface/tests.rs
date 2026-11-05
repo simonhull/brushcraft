@@ -120,3 +120,13 @@ fn resizing_an_offscreen_target_replaces_its_texture() {
         assert_eq!(offscreen.read_pixels(gpu).expect("read back").len(), 16);
     });
 }
+
+#[test]
+fn a_display_view_strips_srgb_where_it_can_and_needs_nothing_otherwise() {
+    let srgb = TextureFormat::Bgra8UnormSrgb;
+    let plain = TextureFormat::Bgra8Unorm;
+    assert_eq!(display_format(srgb, true), Some(plain), "reinterpreted");
+    assert_eq!(display_format(srgb, false), None, "no view to be had");
+    assert_eq!(display_format(plain, false), Some(plain), "already display");
+    assert_eq!(display_format(plain, true), Some(plain), "either way");
+}

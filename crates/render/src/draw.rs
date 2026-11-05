@@ -16,7 +16,9 @@
 //!    (still) or the shaded image filtered (moving), tone mapped ([`crate::tone`]), or, as a debug
 //!    view ([`SceneView::Clusters`]), the visibility buffer as a colour per cluster
 //!    ([`crate::visibility_view`]), neither jittered nor accumulated;
-//! 5. the overlay ([`crate::overlay`]), always last.
+//! 5. the overlay ([`crate::overlay`]);
+//! 6. the UI (`crate::ui`), always last, in a pass of its own on the frame's display view, and only
+//!    with something to draw. The debug overlay ends up under it.
 //!
 //! A frame shading the last scene again with the look the histories already hold (one wanted for
 //! the overlay alone, such as a pick line) shades nothing: it shows the histories as they are, so
@@ -24,10 +26,11 @@
 
 use std::time::{Duration, Instant};
 
+use ::ui::{Blend, UiFrame};
 use thiserror::Error;
 use wgpu::{
     Buffer, Color, CommandEncoder, CommandEncoderDescriptor, LoadOp, Operations,
-    RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureFormat,
+    RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureFormat, TextureView,
 };
 
 use crate::aa::{AaFrame, AaReport, AaState, Shown};
@@ -39,9 +42,10 @@ use crate::material::MatCapStyle;
 use crate::overlay::{OverlayPass, TextImage};
 use crate::raster::{FrameError, FramePasses, SceneInputs};
 use crate::shade::ShadeSettings;
-use crate::surface::{Acquired, Size, SurfaceError, Target};
+use crate::surface::{Acquired, Frame, Size, SurfaceError, Target};
 use crate::timing::{GpuPhase, GpuTimer, GpuTimes, Stamps, TimedFrame};
 use crate::tone::{ToneMap, ToneSource};
+use crate::ui::UiPass;
 use crate::upload::FrameUploads;
 use crate::visibility_view::VisibilityView;
 
@@ -61,6 +65,8 @@ pub struct FrameInputs<'a> {
     /// Frame pixels per overlay texel: the window's scale factor, rounded, at least 1. The
     /// wireframe's lines are as many pixels a point.
     pub overlay_scale: u32,
+    /// The UI, drawn over everything; `None`, or an empty list, encodes no pass.
+    pub ui: Option<&'a UiFrame>,
     /// The scene: drawn, shaded again as it was, or none. A renderer without [`FramePasses`]
     /// draws none.
     pub scene: Scene<'a>,
@@ -208,6 +214,8 @@ struct ImagePasses {
     tone: ToneMap,
     /// The overlay pass.
     overlay: OverlayPass,
+    /// The UI's pass.
+    ui: UiPass,
 }
 
 impl ImagePasses {
@@ -222,6 +230,7 @@ impl ImagePasses {
             view: VisibilityView::new(gpu, format)?,
             tone: ToneMap::new(gpu, format)?,
             overlay: OverlayPass::new(gpu, format)?,
+            ui: UiPass::new(gpu, format)?,
         })
     }
 }
@@ -330,6 +339,19 @@ impl Renderer {
         self.passes.as_ref()
     }
 
+    /// How the UI blends on `target`: what its `ui::Ui` must be made with, so its list holds the
+    /// theme for that blend.
+    #[must_use]
+    pub const fn ui_blend(target: &Target) -> Blend {
+        UiPass::blend_on(target)
+    }
+
+    /// What the UI's pass has done.
+    #[cfg(test)]
+    pub(crate) fn ui_counts(&self) -> crate::ui::UiCounts {
+        self.image.ui.counts()
+    }
+
     /// The scene's passes, once given, to change in the tests.
     #[cfg(test)]
     pub(crate) const fn passes_mut(&mut self) -> Option<&mut FramePasses> {
@@ -381,6 +403,7 @@ impl Renderer {
                     view,
                     tone,
                     overlay,
+                    ui,
                     ..
                 },
             passes: scene_passes,
@@ -388,6 +411,7 @@ impl Renderer {
             timer,
         } = self;
         overlay.prepare(gpu, inputs.overlay, inputs.size, inputs.overlay_scale)?;
+        let ui_view = prepare_ui(gpu, ui, inputs, &image)?;
         if let Some(passes) = scene_passes.as_mut() {
             passes.set_shading(gpu, inputs.look, inputs.overlay_scale);
         }
@@ -397,13 +421,7 @@ impl Renderer {
         let to_draw = scene_passes.as_mut().map(|passes| (inputs.scene, passes));
         let drawing = matches!(to_draw, Some((Scene::Draw(_), _)));
         let uploads = uploads.map(|uploads| for_frame(uploads, drawing));
-        let showing = Showing {
-            look: inputs.look,
-            size: inputs.size,
-            staged: uploads.as_ref().is_some_and(|uploads| !uploads.is_empty()),
-            clear: inputs.clear,
-            scale: inputs.overlay_scale,
-        };
+        let showing = Showing::of(inputs, uploads.as_ref());
         let outcome = gpu.scoped("encoding a frame", || {
             let mut commands = gpu
                 .device()
@@ -437,9 +455,10 @@ impl Renderer {
                         SceneView::Clusters => view.draw(&mut pass),
                     }
                 }
-                // The last pass: the overlay over everything.
+                // Over the scene, under the UI.
                 overlay.draw(&mut pass);
                 drop(pass);
+                encode_ui(frame, ui, ui_view.as_ref());
                 tick_readback = finish_stamps(timer.as_mut(), frame, &mut stamps);
             };
             submit(gpu, uploads, commands, passes);
@@ -463,6 +482,49 @@ impl Renderer {
             aa: report,
         })
     }
+}
+
+/// Gets the frame's UI ready to draw: the view it draws on, `None` with nothing to draw, so such a
+/// frame makes no view and encodes no pass.
+///
+/// # Errors
+///
+/// As [`UiPass::prepare`].
+fn prepare_ui(
+    gpu: &Gpu,
+    ui: &mut UiPass,
+    inputs: &FrameInputs<'_>,
+    image: &Frame<'_>,
+) -> Result<Option<TextureView>, GpuError> {
+    let Some(frame) = inputs.ui.filter(|frame| !frame.list.is_empty()) else {
+        return Ok(None);
+    };
+    let display = image.display_view();
+    let blend = display.as_ref().map_or(Blend::Linear, |_| Blend::Display);
+    ui.prepare(gpu, frame, Instant::now(), inputs.size, blend)?;
+    Ok(Some(display.unwrap_or_else(|| image.view().clone())))
+}
+
+/// Encodes the UI's pass of its own on `view`, over what the frame has drawn; with no view,
+/// nothing.
+fn encode_ui(frame: &mut CommandEncoder, ui: &UiPass, view: Option<&TextureView>) {
+    let Some(view) = view else {
+        return;
+    };
+    let mut pass = frame.begin_render_pass(&RenderPassDescriptor {
+        label: Some("ui"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations {
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            },
+        })],
+        ..RenderPassDescriptor::default()
+    });
+    ui.draw(&mut pass);
 }
 
 /// A frame's `uploads`, as a frame `drawing` its scene or not submits them: a frame drawing no
@@ -504,6 +566,17 @@ struct Showing {
 }
 
 impl Showing {
+    /// How the frame of `inputs`, bringing `uploads`, shows its scene.
+    fn of(inputs: &FrameInputs<'_>, uploads: Option<&FrameUploads>) -> Self {
+        Self {
+            look: inputs.look,
+            size: inputs.size,
+            staged: uploads.is_some_and(|uploads| !uploads.is_empty()),
+            clear: inputs.clear,
+            scale: inputs.overlay_scale,
+        }
+    }
+
     /// What the shaded image depends on beside the scene.
     const fn shown(&self) -> Shown {
         Shown {

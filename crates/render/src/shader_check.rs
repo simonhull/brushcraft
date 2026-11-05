@@ -9,7 +9,7 @@
 //!
 //! The shaders' own tests call [`run_time_indexed_locals`] on each per-pixel and per-vertex
 //! shader the crate builds, as the pipelines get it (`shade`, `raster`, `aa`'s pixel pass), and
-//! this module's tests on the standalone ones (`tone`, `overlay`, `visibility_view`).
+//! this module's tests on the standalone ones (`tone`, `overlay`, `ui`, `visibility_view`).
 
 use wgpu::naga::valid::{Capabilities, FunctionInfo, ValidationFlags, Validator};
 use wgpu::naga::{AddressSpace, Expression, Function, Module, TypeInner};
