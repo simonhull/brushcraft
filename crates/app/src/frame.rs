@@ -1553,6 +1553,16 @@ impl<B: Brush, U: Uploads> Owner<B, U> {
         true
     }
 
+    /// The save key, at `now`: a save, which answers the close bar if it can be seen, as the key
+    /// says what the bar's Save does.
+    pub(crate) fn save_key(&mut self, now: Instant) {
+        if self.dialogs.asking_close() && !self.dialogs.pen_is_down() {
+            self.act(Action::Save, now);
+        } else {
+            self.request_save(now);
+        }
+    }
+
     /// Does what a control on a bar says, and wants the frame that shows it.
     fn act(&mut self, action: Action, now: Instant) {
         match action {

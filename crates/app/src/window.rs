@@ -454,7 +454,7 @@ impl WindowApp {
                     return;
                 }
                 if saves(event.physical_key, running.modifiers, event.repeat) {
-                    owner.request_save(Instant::now());
+                    owner.save_key(Instant::now());
                 } else if let Some(change) = brush_change(event.physical_key) {
                     // Held, a brush key repeats: the size or strength keeps changing.
                     owner.change_brush(change);

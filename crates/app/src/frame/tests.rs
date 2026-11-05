@@ -3632,3 +3632,38 @@ fn cancel_lets_go_of_a_save_still_waiting_for_the_pen() {
     tap(&mut owner, dont);
     assert_eq!(owner.take_request(), Some(WindowRequest::ExitDiscarding));
 }
+
+/// The question was about saving: the save key answers it.
+#[test]
+fn the_save_key_under_the_close_bar_is_its_save() {
+    let dir = TestDir::new();
+    let mut owner = asked_owner(&dir, 2);
+    owner.save_key(Instant::now());
+    assert!(owner.dialogs.finishing(), "the bar's Save");
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), Some(WindowRequest::Exit));
+}
+
+#[test]
+fn the_save_key_with_no_bar_is_a_save_and_the_window_stays() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    owner.save_key(Instant::now());
+    assert!(!owner.dialogs.bar_showing(), "nothing asked");
+    finish_saving(&mut owner);
+    assert_eq!(owner.take_request(), None, "it stays");
+}
+
+/// A bar the pen holds back hasn't been asked yet: the key saves, as it would with none.
+#[test]
+fn the_save_key_doesnt_answer_a_bar_it_cant_see() {
+    let dir = TestDir::new();
+    let mut owner = closing_owner(&dir, 2);
+    let reporting = Instant::now() + Duration::from_secs(60);
+    owner.pen(pen_received(input::Phase::Down, reporting));
+    run(&mut owner, 100);
+    assert_eq!(owner.ask_close(Instant::now()), CloseAnswer::Asked);
+    owner.save_key(Instant::now());
+    assert!(owner.save_stage().is_some(), "a save");
+    assert!(owner.dialogs.asking_close(), "and the question stands");
+}
